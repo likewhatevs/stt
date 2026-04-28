@@ -96,6 +96,18 @@ pub struct TestTopology {
 /// Returns an error if any element is not a valid integer or range.
 /// For lenient parsing that skips invalid entries, use
 /// [`parse_cpu_list_lenient`].
+///
+/// # Why this is NOT [`crate::cpu_util::parse_cpu_list`]
+///
+/// `cpu_util` carries an `Option<Vec<u32>>`-returning variant
+/// with a range-expansion cap and dedup, intended for the
+/// per-task `/proc/<tid>/status:Cpus_allowed_list` capture path
+/// where the input is untrusted and a hostile range like
+/// `0-4294967295` would OOM the process. This parser ingests
+/// operator-supplied VM topology config (`anyhow::Error`
+/// propagation, `usize` interop with sysfs APIs, no DoS cap
+/// needed). See the module doc on [`crate::cpu_util`] for the
+/// full split rationale.
 pub fn parse_cpu_list(s: &str) -> Result<Vec<usize>> {
     let mut cpus = Vec::new();
     for part in s.trim().split(',') {

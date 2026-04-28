@@ -18,6 +18,7 @@
 //! no-label principle for the broader stats comparison pipeline
 //! (see the `stats.rs` module doc).
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::Path;
@@ -111,8 +112,9 @@ pub struct CompareOptions {
     /// Multi-key sort spec for the diff rows. When non-empty,
     /// overrides the default `delta_pct desc` sort. Each
     /// [`SortKey`] names one metric from
-    /// [`HOST_STATE_METRICS`] and a direction; groups rank by the
-    /// tuple (`metric_1_delta`, `metric_2_delta`, ...) under
+    /// [`HOST_STATE_METRICS`] or [`HOST_STATE_DERIVED_METRICS`]
+    /// and a direction; groups rank by the tuple
+    /// (`metric_1_delta`, `metric_2_delta`, ...) under
     /// lexicographic order with per-key direction. Within a
     /// group, rows appear in registry order. The sort
     /// composes with [`Self::group_by`]: groups are formed under
@@ -124,18 +126,25 @@ pub struct CompareOptions {
 }
 
 /// One key in a multi-key `--sort-by` spec. Names a metric from
-/// [`HOST_STATE_METRICS`] and the sort direction for that key.
-/// Direction defaults to descending (largest delta first) so the
-/// common operator request — "show me the biggest regressions
-/// first" — is the unmarked form.
+/// [`HOST_STATE_METRICS`] or [`HOST_STATE_DERIVED_METRICS`] and
+/// the sort direction for that key. Direction defaults to
+/// descending (largest delta first) so the common operator
+/// request — "show me the biggest regressions first" — is the
+/// unmarked form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SortKey {
-    /// Metric name. Holds one of the [`HOST_STATE_METRICS`]
-    /// entries' `name` fields verbatim — [`parse_sort_by`]
-    /// looks up the input string in the registry and stores the
-    /// matched `&'static str`, so this never carries an
-    /// allocation and equality with a registry name is a pointer
-    /// comparison.
+    /// Metric name. Holds one of the [`HOST_STATE_METRICS`] or
+    /// [`HOST_STATE_DERIVED_METRICS`] entries' `name` fields
+    /// verbatim — [`parse_sort_by`] looks up the input string in
+    /// either registry and stores the matched `&'static str`, so
+    /// this never carries an allocation. Equality against a
+    /// registry `name` is by content (`str::eq`); both sides
+    /// reference the same `&'static str` from the registry, so
+    /// the byte-by-byte comparison succeeds in O(name.len())
+    /// without any heap access. The two registries are disjoint
+    /// (the `registry_and_derived_names_disjoint` test pins
+    /// this) so a `metric` value resolves unambiguously to one
+    /// or the other.
     pub metric: &'static str,
     /// True for descending (largest first), false for ascending
     /// (smallest first).
@@ -241,6 +250,76 @@ pub struct HostStateMetricDef {
     /// cells. Empty string means "unitless count".
     pub unit: &'static str,
     pub rule: AggRule,
+    /// Scheduler-class scope for the metric. `None` means
+    /// class-agnostic — every task class accumulates the value
+    /// (e.g. `nr_migrations`). Concrete spellings:
+    /// - `"cfs-only"` — incremented strictly inside CFS-class
+    ///   call paths (`kernel/sched/fair.c`), zero under
+    ///   SCHED_EXT / SCHED_FIFO / SCHED_RR / SCHED_DEADLINE /
+    ///   SCHED_IDLE. Examples: `nr_wakeups_affine`,
+    ///   `nr_wakeups_affine_attempts`, `nr_failed_migrations_*`,
+    ///   `nr_forced_migrations`, `slice_max`.
+    /// - `"fair-policy"` — emitted only when
+    ///   `fair_policy(p->policy)` returns true. Per
+    ///   `kernel/sched/sched.h:194,203`, that admits
+    ///   SCHED_NORMAL, SCHED_BATCH, AND SCHED_EXT (under
+    ///   CONFIG_SCHED_CLASS_EXT). Zero under SCHED_FIFO/RR/DL/IDLE.
+    ///   Example: `fair_slice_ns`.
+    /// - `"non-ext"` — written by the schedstats sleep/wait
+    ///   family wrappers `__update_stats_enqueue_sleeper`
+    ///   (kernel/sched/stats.c:48) and `__update_stats_wait_end`
+    ///   (kernel/sched/stats.c:21), called from fair.c, rt.c,
+    ///   deadline.c but NOT ext.c — i.e. CFS/RT/DL accumulate,
+    ///   sched_ext bypasses. Examples: `wait_sum`, `wait_count`,
+    ///   `wait_max`, `sleep_sum`, `sleep_max`, `block_sum`,
+    ///   `block_max`, `iowait_sum`, `iowait_count`.
+    pub sched_class: Option<&'static str>,
+    /// Kernel CONFIG options that gate the metric. `&[]` means
+    /// no gating (always populated when the source path runs).
+    /// One element typically; multi-element when more than one
+    /// gate is required (e.g. `core_forceidle_sum` requires
+    /// CONFIG_SCHED_CORE AND CONFIG_SCHEDSTATS). Concrete
+    /// spellings match the literal `Kconfig` symbol so an
+    /// operator can `grep CONFIG_X /boot/config-$(uname -r)` to
+    /// confirm. Verified gates:
+    /// - `"CONFIG_SCHEDSTATS"` — gates every `__schedstat_*` /
+    ///   `schedstat_*` macro call. Off → the macro is
+    ///   `do { } while (0)` per `kernel/sched/stats.h:75-82`.
+    /// - `"CONFIG_SCHED_INFO"` — gates the lighter-weight
+    ///   `sched_info_*` accounting (`run_time_ns`,
+    ///   `wait_time_ns`, `timeslices`); the schedstat file is
+    ///   gated by `sched_info_on()` at
+    ///   `proc_pid_schedstat` (fs/proc/base.c:511-523).
+    /// - `"CONFIG_SCHED_CORE"` — gates the core-scheduling
+    ///   subsystem (`__account_forceidle_time`).
+    /// - `"CONFIG_SCHED_CLASS_EXT"` — gates the sched_ext
+    ///   class. When off, no task can land on ext, so
+    ///   `ext_enabled` reads false uniformly.
+    /// - `"CONFIG_TASK_DELAY_ACCT"` — gates the delayacct
+    ///   accounting path that populates
+    ///   `delayacct_blkio_ticks`.
+    /// - `"CONFIG_TASK_IO_ACCOUNTING"` — gates the per-task
+    ///   I/O accounting fields exposed by `/proc/<tid>/io`
+    ///   (`rchar`, `wchar`, `syscr`, `syscw`, `read_bytes`,
+    ///   `write_bytes`).
+    pub config_gates: &'static [&'static str],
+    /// True for kernel counters that are exposed in `/proc`
+    /// but never incremented anywhere in the kernel tree —
+    /// always reads zero. Operators reading the rendered table
+    /// see the `[dead]` flag and stop chasing the always-zero
+    /// cell. Examples: `nr_wakeups_idle`, `nr_wakeups_passive`,
+    /// `nr_migrations_cold`.
+    pub is_dead: bool,
+    /// One-line operator-facing description of what this metric
+    /// counts. Surfaced by the `host-state metric-list`
+    /// subcommand alongside the bracketed tag suffix so an
+    /// operator scanning a rendered table can map an unfamiliar
+    /// metric name to its semantics without leaving the CLI.
+    /// Plain ASCII. "Cumulative" is load-bearing — use it to
+    /// distinguish counters from gauges; the [`AggRule`] only
+    /// names the per-group reduction, not the per-thread
+    /// counter shape.
+    pub description: &'static str,
 }
 
 /// Registry of per-thread metrics. Order here is the default
@@ -263,11 +342,19 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         name: "policy",
         unit: "",
         rule: AggRule::Mode(|t| t.policy.clone()),
+        sched_class: None,
+        config_gates: &[],
+        is_dead: false,
+        description: "Scheduling policy (SCHED_OTHER, SCHED_FIFO, SCHED_RR, SCHED_BATCH, SCHED_IDLE, SCHED_DEADLINE, SCHED_EXT).",
     },
     HostStateMetricDef {
         name: "nice",
         unit: "",
         rule: AggRule::OrdinalRange(|t| t.nice as i64),
+        sched_class: None,
+        config_gates: &[],
+        is_dead: false,
+        description: "Nice value (-20..19); CFS priority knob.",
     },
     // `task_prio()` value from `/proc/<tid>/stat` field 18.
     // Per-thread ordinal — aggregate as OrdinalRange (mirrors
@@ -279,6 +366,10 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         name: "priority",
         unit: "",
         rule: AggRule::OrdinalRange(|t| t.priority as i64),
+        sched_class: None,
+        config_gates: &[],
+        is_dead: false,
+        description: "Kernel task priority from /proc/<tid>/stat field 18 (CFS=[0..39], RT=[-2..-100], DL=-101).",
     },
     // Real-time scheduler priority from `/proc/<tid>/stat`
     // field 40. Bounded 0..99 in practice (SCHED_FIFO /
@@ -289,26 +380,50 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         name: "rt_priority",
         unit: "",
         rule: AggRule::OrdinalRange(|t| t.rt_priority as i64),
+        sched_class: None,
+        config_gates: &[],
+        is_dead: false,
+        description: "Real-time scheduler priority (0..99); 0 for non-RT tasks.",
     },
     HostStateMetricDef {
         name: "cpu_affinity",
         unit: "",
         rule: AggRule::Affinity(|t| t.cpu_affinity.clone()),
+        sched_class: None,
+        config_gates: &[],
+        is_dead: false,
+        description: "Set of CPUs the task is allowed to run on (sched_getaffinity result).",
     },
     HostStateMetricDef {
         name: "processor",
         unit: "",
         rule: AggRule::OrdinalRange(|t| t.processor as i64),
+        sched_class: None,
+        config_gates: &[],
+        is_dead: false,
+        description: "Last CPU the task ran on.",
     },
     HostStateMetricDef {
         name: "state",
         unit: "",
         rule: AggRule::Mode(|t| t.state.to_string()),
+        sched_class: None,
+        config_gates: &[],
+        is_dead: false,
+        description: "Task state letter (R running, S sleeping, D uninterruptible, Z zombie, T stopped).",
     },
+    // `ext_enabled` reflects whether the task is currently on
+    // the sched_ext class. Gated by CONFIG_SCHED_CLASS_EXT —
+    // when off, no task can land on ext, so the field reads
+    // `false` uniformly across every thread.
     HostStateMetricDef {
         name: "ext_enabled",
         unit: "",
         rule: AggRule::Mode(|t| t.ext_enabled.to_string()),
+        sched_class: None,
+        config_gates: &["CONFIG_SCHED_CLASS_EXT"],
+        is_dead: false,
+        description: "Whether the task is currently dispatched on the sched_ext class.",
     },
     // Process-wide thread count (`signal_struct->nr_threads`)
     // from `/proc/<tid>/status` `Threads:`. Capture-side
@@ -325,62 +440,129 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         name: "nr_threads",
         unit: "",
         rule: AggRule::Max(|t| t.nr_threads),
+        sched_class: None,
+        config_gates: &[],
+        is_dead: false,
+        description: "Process-wide thread count (signal_struct->nr_threads); leader-only.",
     },
     // scheduling
+    // `run_time_ns` from `/proc/<tid>/schedstat` field 1 —
+    // gated by CONFIG_SCHED_INFO via `sched_info_on()` at
+    // `proc_pid_schedstat` (fs/proc/base.c:511-523).
     HostStateMetricDef {
         name: "run_time_ns",
         unit: "ns",
         rule: AggRule::Sum(|t| t.run_time_ns),
+        sched_class: None,
+        config_gates: &["CONFIG_SCHED_INFO"],
+        is_dead: false,
+        description: "Cumulative on-CPU time, ns; /proc/<tid>/schedstat field 1.",
     },
+    // `wait_time_ns` from `/proc/<tid>/schedstat` field 2 —
+    // gated by CONFIG_SCHED_INFO via `sched_info_on()` at
+    // `proc_pid_schedstat` (fs/proc/base.c:511-523).
     HostStateMetricDef {
         name: "wait_time_ns",
         unit: "ns",
         rule: AggRule::Sum(|t| t.wait_time_ns),
+        sched_class: None,
+        config_gates: &["CONFIG_SCHED_INFO"],
+        is_dead: false,
+        description: "Cumulative time waiting on the runqueue, ns; schedstat field 2.",
     },
+    // `timeslices` from `/proc/<tid>/schedstat` field 3 —
+    // same gate as `wait_time_ns`.
     HostStateMetricDef {
         name: "timeslices",
         unit: "",
         rule: AggRule::Sum(|t| t.timeslices),
+        sched_class: None,
+        config_gates: &["CONFIG_SCHED_INFO"],
+        is_dead: false,
+        description: "Number of times the task was run on a CPU; schedstat field 3.",
     },
     HostStateMetricDef {
         name: "voluntary_csw",
         unit: "",
         rule: AggRule::Sum(|t| t.voluntary_csw),
+        sched_class: None,
+        config_gates: &[],
+        is_dead: false,
+        description: "Voluntary context switches (task gave up the CPU itself).",
     },
     HostStateMetricDef {
         name: "nonvoluntary_csw",
         unit: "",
         rule: AggRule::Sum(|t| t.nonvoluntary_csw),
+        sched_class: None,
+        config_gates: &[],
+        is_dead: false,
+        description: "Involuntary context switches (task was preempted).",
     },
+    // `nr_wakeups`, `_local`, `_remote`, `_sync`, `_migrate`
+    // are class-agnostic — `__schedstat_inc` from
+    // `kernel/sched/core.c::ttwu_stat` (e.g. line 3614 for the
+    // base counter) fires for every task class. The macro
+    // expands to `do { } while (0)` under !CONFIG_SCHEDSTATS
+    // per `kernel/sched/stats.h:75-82`.
     HostStateMetricDef {
         name: "nr_wakeups",
         unit: "",
         rule: AggRule::Sum(|t| t.nr_wakeups),
+        sched_class: None,
+        config_gates: &["CONFIG_SCHEDSTATS"],
+        is_dead: false,
+        description: "Total wakeups via try_to_wake_up().",
     },
     HostStateMetricDef {
         name: "nr_wakeups_local",
         unit: "",
         rule: AggRule::Sum(|t| t.nr_wakeups_local),
+        sched_class: None,
+        config_gates: &["CONFIG_SCHEDSTATS"],
+        is_dead: false,
+        description: "Wakeups landed on the same CPU as the waker.",
     },
     HostStateMetricDef {
         name: "nr_wakeups_remote",
         unit: "",
         rule: AggRule::Sum(|t| t.nr_wakeups_remote),
+        sched_class: None,
+        config_gates: &["CONFIG_SCHEDSTATS"],
+        is_dead: false,
+        description: "Wakeups landed on a different CPU than the waker.",
     },
     HostStateMetricDef {
         name: "nr_wakeups_sync",
         unit: "",
         rule: AggRule::Sum(|t| t.nr_wakeups_sync),
+        sched_class: None,
+        config_gates: &["CONFIG_SCHEDSTATS"],
+        is_dead: false,
+        description: "WF_SYNC wakeups (synchronous wakeup hint to scheduler).",
     },
     HostStateMetricDef {
         name: "nr_wakeups_migrate",
         unit: "",
         rule: AggRule::Sum(|t| t.nr_wakeups_migrate),
+        sched_class: None,
+        config_gates: &["CONFIG_SCHEDSTATS"],
+        is_dead: false,
+        description: "Wakeups where the task migrated to a different CPU than its prior one (WF_MIGRATED); distinct from nr_wakeups_remote (waker CPU != target CPU).",
     },
+    // `nr_wakeups_idle` is exposed by `kernel/sched/debug.c:1315`
+    // (`P_SCHEDSTAT(nr_wakeups_idle)`) but is NEVER incremented
+    // anywhere in the kernel tree — see the kernel-field-
+    // semantics audit. Marked `is_dead` so operators don't waste
+    // time interpreting the always-zero cell.
     HostStateMetricDef {
         name: "nr_wakeups_idle",
         unit: "",
         rule: AggRule::Sum(|t| t.nr_wakeups_idle),
+        sched_class: None,
+        config_gates: &["CONFIG_SCHEDSTATS"],
+        is_dead: true,
+        description: "Wakeups attributed to the idle path; never incremented in mainline.",
     },
     // Wakeups via the passive fast-path. Mainline kernel never
     // increments — captured for forward compatibility per the
@@ -392,71 +574,171 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         name: "nr_wakeups_passive",
         unit: "",
         rule: AggRule::Sum(|t| t.nr_wakeups_passive),
+        sched_class: None,
+        config_gates: &["CONFIG_SCHEDSTATS"],
+        is_dead: true,
+        description: "Wakeups via the passive fast-path; never incremented in mainline.",
     },
+    // `nr_wakeups_affine`, `_attempts` are CFS-only —
+    // `kernel/sched/fair.c::wake_affine` calls
+    // `schedstat_inc(p->stats.nr_wakeups_affine_attempts)` at
+    // line 7604 and the matching `_affine` increment at line
+    // 7609. Both expand only under CFS task lifetime, so a
+    // task on SCHED_EXT / SCHED_FIFO / SCHED_RR / SCHED_DL
+    // never accumulates them.
     HostStateMetricDef {
         name: "nr_wakeups_affine",
         unit: "",
         rule: AggRule::Sum(|t| t.nr_wakeups_affine),
+        sched_class: Some("cfs-only"),
+        config_gates: &["CONFIG_SCHEDSTATS"],
+        is_dead: false,
+        description: "Wakeups that succeeded under the wake_affine() heuristic.",
     },
     HostStateMetricDef {
         name: "nr_wakeups_affine_attempts",
         unit: "",
         rule: AggRule::Sum(|t| t.nr_wakeups_affine_attempts),
+        sched_class: Some("cfs-only"),
+        config_gates: &["CONFIG_SCHEDSTATS"],
+        is_dead: false,
+        description: "wake_affine() attempts; success rate = nr_wakeups_affine / attempts.",
     },
+    // `nr_migrations` is incremented unconditionally at
+    // `kernel/sched/core.c:3283` (`p->se.nr_migrations++`) — no
+    // schedstat macro, no class gating. Always populated.
     HostStateMetricDef {
         name: "nr_migrations",
         unit: "",
         rule: AggRule::Sum(|t| t.nr_migrations),
+        sched_class: None,
+        config_gates: &[],
+        is_dead: false,
+        description: "Cumulative cross-CPU migrations of the task.",
     },
+    // `nr_migrations_cold` is exposed by
+    // `kernel/sched/debug.c:1302` but NEVER incremented anywhere
+    // in mainline — dead counter, always zero. Marked `is_dead`
+    // so operators don't read meaning into the zero cell.
     HostStateMetricDef {
         name: "nr_migrations_cold",
         unit: "",
         rule: AggRule::Sum(|t| t.nr_migrations_cold),
+        sched_class: None,
+        config_gates: &["CONFIG_SCHEDSTATS"],
+        is_dead: true,
+        description: "Migrations attributed to a cold cache; never incremented in mainline.",
     },
+    // `nr_forced_migrations` is set by
+    // `kernel/sched/fair.c:9775` (`schedstat_inc`) inside
+    // CFS-only load-balancing.
     HostStateMetricDef {
         name: "nr_forced_migrations",
         unit: "",
         rule: AggRule::Sum(|t| t.nr_forced_migrations),
+        sched_class: Some("cfs-only"),
+        config_gates: &["CONFIG_SCHEDSTATS"],
+        is_dead: false,
+        description: "Migrations forced by the CFS load balancer.",
     },
+    // `nr_failed_migrations_*` family — all CFS-only,
+    // incremented in `kernel/sched/fair.c::can_migrate_task`
+    // (lines 9701, 9735, 9761, 9942).
     HostStateMetricDef {
         name: "nr_failed_migrations_affine",
         unit: "",
         rule: AggRule::Sum(|t| t.nr_failed_migrations_affine),
+        sched_class: Some("cfs-only"),
+        config_gates: &["CONFIG_SCHEDSTATS"],
+        is_dead: false,
+        description: "Load-balancer migrations rejected for cpu-affinity reasons.",
     },
     HostStateMetricDef {
         name: "nr_failed_migrations_running",
         unit: "",
         rule: AggRule::Sum(|t| t.nr_failed_migrations_running),
+        sched_class: Some("cfs-only"),
+        config_gates: &["CONFIG_SCHEDSTATS"],
+        is_dead: false,
+        description: "Load-balancer migrations rejected because the task was running.",
     },
     HostStateMetricDef {
         name: "nr_failed_migrations_hot",
         unit: "",
         rule: AggRule::Sum(|t| t.nr_failed_migrations_hot),
+        sched_class: Some("cfs-only"),
+        config_gates: &["CONFIG_SCHEDSTATS"],
+        is_dead: false,
+        description: "Load-balancer migrations rejected because the task was cache-hot.",
     },
+    // `wait_sum` / `wait_count` / `wait_max` — written by
+    // `__update_stats_wait_end` (`kernel/sched/stats.c:21`),
+    // which is called from `update_stats_wait_end_fair`
+    // (kernel/sched/fair.c:1426), `update_stats_wait_end_dl`
+    // (kernel/sched/deadline.c:2114), and
+    // `update_stats_wait_end_rt` (kernel/sched/rt.c:1282) —
+    // i.e. CFS, RT, AND DL classes accumulate. Sched_ext bypasses
+    // these wrappers, so the counters stay at zero for SCHED_EXT
+    // tasks. Tagged `non-ext`. Expanded to a no-op under
+    // !CONFIG_SCHEDSTATS via the schedstat macros at
+    // `kernel/sched/stats.h:75-82`.
     HostStateMetricDef {
         name: "wait_sum",
         unit: "ns",
         rule: AggRule::Sum(|t| t.wait_sum),
+        sched_class: Some("non-ext"),
+        config_gates: &["CONFIG_SCHEDSTATS"],
+        is_dead: false,
+        description: "Cumulative time the task waited on the runqueue, ns.",
     },
     HostStateMetricDef {
         name: "wait_count",
         unit: "",
         rule: AggRule::Sum(|t| t.wait_count),
+        sched_class: Some("non-ext"),
+        config_gates: &["CONFIG_SCHEDSTATS"],
+        is_dead: false,
+        description: "Number of distinct runqueue-wait intervals the task accumulated.",
     },
     HostStateMetricDef {
         name: "wait_max",
         unit: "ns",
         rule: AggRule::Max(|t| t.wait_max),
+        sched_class: Some("non-ext"),
+        config_gates: &["CONFIG_SCHEDSTATS"],
+        is_dead: false,
+        description: "Longest single runqueue-wait interval observed, ns.",
     },
+    // `sleep_sum` / `sleep_max` / `block_sum` / `block_max` /
+    // `iowait_sum` / `iowait_count` — written by
+    // `__update_stats_enqueue_sleeper` (kernel/sched/stats.c:48),
+    // which is called from `update_stats_enqueue_sleeper_fair`
+    // (kernel/sched/fair.c:1452),
+    // `update_stats_enqueue_sleeper_dl`
+    // (kernel/sched/deadline.c:2122), and
+    // `update_stats_enqueue_sleeper_rt`
+    // (kernel/sched/rt.c:1252). Same shape as the wait_* family
+    // above: CFS+RT+DL accumulate, sched_ext bypasses, so the
+    // counters stay at zero for SCHED_EXT tasks. Tagged `non-ext`.
+    // Expanded to a no-op under !CONFIG_SCHEDSTATS via the
+    // schedstat macros at `kernel/sched/stats.h:75-82`.
     HostStateMetricDef {
         name: "sleep_sum",
         unit: "ns",
         rule: AggRule::Sum(|t| t.sleep_sum),
+        sched_class: Some("non-ext"),
+        config_gates: &["CONFIG_SCHEDSTATS"],
+        is_dead: false,
+        description: "Time off-CPU: voluntary sleep (TASK_INTERRUPTIBLE) PLUS involuntary block (TASK_UNINTERRUPTIBLE), ns; pure voluntary sleep = sleep_sum - block_sum.",
     },
     HostStateMetricDef {
         name: "sleep_max",
         unit: "ns",
         rule: AggRule::Max(|t| t.sleep_max),
+        sched_class: Some("non-ext"),
+        config_gates: &["CONFIG_SCHEDSTATS"],
+        is_dead: false,
+        description: "Longest single sleep interval observed, ns.",
     },
     // No `sleep_count` metric: the kernel does not emit that
     // counter — the wake-side tally is captured by `nr_wakeups`
@@ -465,11 +747,19 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         name: "block_sum",
         unit: "ns",
         rule: AggRule::Sum(|t| t.block_sum),
+        sched_class: Some("non-ext"),
+        config_gates: &["CONFIG_SCHEDSTATS"],
+        is_dead: false,
+        description: "Cumulative time the task spent blocked (TASK_UNINTERRUPTIBLE), ns.",
     },
     HostStateMetricDef {
         name: "block_max",
         unit: "ns",
         rule: AggRule::Max(|t| t.block_max),
+        sched_class: Some("non-ext"),
+        config_gates: &["CONFIG_SCHEDSTATS"],
+        is_dead: false,
+        description: "Longest single uninterruptible-block interval observed, ns.",
     },
     // No `block_count` metric: the kernel emits no per-event
     // counter for `sum_block_runtime` (unlike `wait_sum/wait_count`
@@ -478,11 +768,19 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         name: "iowait_sum",
         unit: "ns",
         rule: AggRule::Sum(|t| t.iowait_sum),
+        sched_class: Some("non-ext"),
+        config_gates: &["CONFIG_SCHEDSTATS"],
+        is_dead: false,
+        description: "Cumulative time the task spent in iowait, ns.",
     },
     HostStateMetricDef {
         name: "iowait_count",
         unit: "",
         rule: AggRule::Sum(|t| t.iowait_count),
+        sched_class: Some("non-ext"),
+        config_gates: &["CONFIG_SCHEDSTATS"],
+        is_dead: false,
+        description: "Number of distinct iowait intervals the task accumulated.",
     },
     // Cumulative blkio delay in USER_HZ ticks from
     // `/proc/<tid>/stat` field 42. Plain counter, matches
@@ -500,16 +798,37 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         name: "delayacct_blkio_ticks",
         unit: "ticks",
         rule: AggRule::Sum(|t| t.delayacct_blkio_ticks),
+        sched_class: None,
+        config_gates: &["CONFIG_TASK_DELAY_ACCT"],
+        is_dead: false,
+        description: "Cumulative blkio delay in USER_HZ ticks; needs delayacct=on at boot.",
     },
+    // `exec_max` is set inside `update_se`
+    // (`kernel/sched/fair.c:1335`), guarded by
+    // `if (schedstat_enabled())`. Reachable from sched_ext via
+    // `update_curr_common` (`kernel/sched/ext.c:1355`), so
+    // class-agnostic at runtime, gated only by CONFIG_SCHEDSTATS.
     HostStateMetricDef {
         name: "exec_max",
         unit: "ns",
         rule: AggRule::Max(|t| t.exec_max),
+        sched_class: None,
+        config_gates: &["CONFIG_SCHEDSTATS"],
+        is_dead: false,
+        description: "Longest single uninterrupted on-CPU run observed, ns.",
     },
+    // `slice_max` is part of the CFS-class statistics struct.
+    // Per the kernel-field-semantics audit, zero under
+    // sched_ext / RT / DL because the populating call sites
+    // live in CFS-class entry points.
     HostStateMetricDef {
         name: "slice_max",
         unit: "ns",
         rule: AggRule::Max(|t| t.slice_max),
+        sched_class: Some("cfs-only"),
+        config_gates: &["CONFIG_SCHEDSTATS"],
+        is_dead: false,
+        description: "Longest CFS slice the task was granted, ns.",
     },
     // Cumulative core-scheduling forced-idle time, ns. Counter
     // (Sum). Increment is class-agnostic: `__account_forceidle_time()`
@@ -528,6 +847,10 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         name: "core_forceidle_sum",
         unit: "ns",
         rule: AggRule::Sum(|t| t.core_forceidle_sum),
+        sched_class: None,
+        config_gates: &["CONFIG_SCHED_CORE", "CONFIG_SCHEDSTATS"],
+        is_dead: false,
+        description: "Cumulative time this task forced its SMT sibling idle, ns (core scheduling).",
     },
     // Current scheduler slice in ns (stale under SCHED_EXT —
     // see field doc) from `/proc/<tid>/sched`'s `slice` line.
@@ -545,70 +868,386 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         name: "fair_slice_ns",
         unit: "ns",
         rule: AggRule::Max(|t| t.fair_slice_ns),
+        sched_class: Some("fair-policy"),
+        config_gates: &[],
+        is_dead: false,
+        description: "Current scheduler slice, ns; snapshot from /proc/<tid>/sched (stale under sched_ext).",
     },
     // memory
     HostStateMetricDef {
         name: "allocated_bytes",
         unit: "B",
         rule: AggRule::Sum(|t| t.allocated_bytes),
+        sched_class: None,
+        config_gates: &[],
+        is_dead: false,
+        description: "jemalloc per-thread allocated bytes (TSD thread_allocated counter).",
     },
     HostStateMetricDef {
         name: "deallocated_bytes",
         unit: "B",
         rule: AggRule::Sum(|t| t.deallocated_bytes),
+        sched_class: None,
+        config_gates: &[],
+        is_dead: false,
+        description: "jemalloc per-thread deallocated bytes (TSD thread_deallocated counter).",
     },
     HostStateMetricDef {
         name: "minflt",
         unit: "",
         rule: AggRule::Sum(|t| t.minflt),
+        sched_class: None,
+        config_gates: &[],
+        is_dead: false,
+        description: "Minor page faults (resolved without I/O).",
     },
     HostStateMetricDef {
         name: "majflt",
         unit: "",
         rule: AggRule::Sum(|t| t.majflt),
+        sched_class: None,
+        config_gates: &[],
+        is_dead: false,
+        description: "Major page faults (required disk I/O to resolve).",
     },
     HostStateMetricDef {
         name: "utime_clock_ticks",
         unit: "ticks",
         rule: AggRule::Sum(|t| t.utime_clock_ticks),
+        sched_class: None,
+        config_gates: &[],
+        is_dead: false,
+        description: "User-mode CPU time, USER_HZ ticks; /proc/<tid>/stat field 14.",
     },
     HostStateMetricDef {
         name: "stime_clock_ticks",
         unit: "ticks",
         rule: AggRule::Sum(|t| t.stime_clock_ticks),
+        sched_class: None,
+        config_gates: &[],
+        is_dead: false,
+        description: "Kernel-mode CPU time, USER_HZ ticks; /proc/<tid>/stat field 15.",
     },
-    // I/O
+    // I/O — every per-task IO field exposed via
+    // `/proc/<tid>/io` is gated by CONFIG_TASK_IO_ACCOUNTING.
     HostStateMetricDef {
         name: "rchar",
         unit: "B",
         rule: AggRule::Sum(|t| t.rchar),
+        sched_class: None,
+        config_gates: &["CONFIG_TASK_IO_ACCOUNTING"],
+        is_dead: false,
+        description: "Bytes read at the read syscall layer (incl. cached / pagecache hits).",
     },
     HostStateMetricDef {
         name: "wchar",
         unit: "B",
         rule: AggRule::Sum(|t| t.wchar),
+        sched_class: None,
+        config_gates: &["CONFIG_TASK_IO_ACCOUNTING"],
+        is_dead: false,
+        description: "Bytes written at the write syscall layer (incl. pagecache / writeback).",
     },
     HostStateMetricDef {
         name: "syscr",
         unit: "",
         rule: AggRule::Sum(|t| t.syscr),
+        sched_class: None,
+        config_gates: &["CONFIG_TASK_IO_ACCOUNTING"],
+        is_dead: false,
+        description: "Number of read syscalls.",
     },
     HostStateMetricDef {
         name: "syscw",
         unit: "",
         rule: AggRule::Sum(|t| t.syscw),
+        sched_class: None,
+        config_gates: &["CONFIG_TASK_IO_ACCOUNTING"],
+        is_dead: false,
+        description: "Number of write syscalls.",
     },
     HostStateMetricDef {
         name: "read_bytes",
         unit: "B",
         rule: AggRule::Sum(|t| t.read_bytes),
+        sched_class: None,
+        config_gates: &["CONFIG_TASK_IO_ACCOUNTING"],
+        is_dead: false,
+        description: "Bytes that hit the storage device on read (excludes pagecache hits).",
     },
     HostStateMetricDef {
         name: "write_bytes",
         unit: "B",
         rule: AggRule::Sum(|t| t.write_bytes),
+        sched_class: None,
+        config_gates: &["CONFIG_TASK_IO_ACCOUNTING"],
+        is_dead: false,
+        description: "Bytes that hit the storage device on write (post-writeback).",
     },
 ];
+
+// ---------------------------------------------------------------------------
+// Derived metrics
+// ---------------------------------------------------------------------------
+
+/// Output value of a derived metric.
+///
+/// Derived metrics carry an `f64` scalar — ratios fall in `[0, 1]`
+/// or `[0, ∞)`, averages can hit any positive value, and signed
+/// differences (e.g. `live_heap_estimate = allocated_bytes -
+/// deallocated_bytes`) can go negative when a freelist drains
+/// memory allocated before capture began. `f64` is the natural
+/// shape for all three; specific units come from the
+/// [`DerivedMetricDef::unit`] tag at the carry site, not the
+/// value type.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
+pub enum DerivedValue {
+    /// Floating-point value. Render via the unit-aware path:
+    /// ratios (unit `""`) format with three decimals (`0.873`);
+    /// `"ns"` and `"B"` route through the same auto-scale
+    /// ladders the main table uses.
+    Scalar(f64),
+}
+
+impl DerivedValue {
+    /// Return the underlying `f64`. Helper for delta math
+    /// downstream of [`DerivedRow`] consumers.
+    pub fn as_f64(&self) -> f64 {
+        match self {
+            DerivedValue::Scalar(v) => *v,
+        }
+    }
+}
+
+/// Definition of a derived metric: a function that consumes the
+/// already-aggregated input metrics for a group and produces a
+/// single scalar (with its own unit and operator-facing
+/// description).
+///
+/// The compute fn returns `None` when an input metric is missing
+/// from the group's metrics map (capture-side gated by a kernel
+/// CONFIG that wasn't enabled, or jemalloc not linked) OR when
+/// the formula would divide by zero. The renderer surfaces a
+/// `None` cell as `-` so the operator can distinguish "not
+/// computable" from "computed as zero".
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct DerivedMetricDef {
+    pub name: &'static str,
+    /// Display unit for the cell (`""` for ratios, `"ns"` for
+    /// time, `"B"` for bytes). Routes through the same
+    /// auto-scale ladder as the main table.
+    pub unit: &'static str,
+    /// Operator-facing one-line description; surfaced by the
+    /// `host-state metric-list` subcommand.
+    pub description: &'static str,
+    /// Names of input metrics from [`HOST_STATE_METRICS`]. Pure
+    /// documentation — surfaces in the `metric-list` output so
+    /// the operator sees what each derivation depends on.
+    pub inputs: &'static [&'static str],
+    /// True when the unit of this derivation is a ratio (`[0, 1]`
+    /// or `[0, ∞)`); the renderer suppresses the `%` column for
+    /// ratio rows because absolute delta on a `[0, 1]` ratio is
+    /// already in percentage points (0.5 → 0.6 = +0.100 = +10pp).
+    /// `delta_pct` of a ratio is potentially confusing so we
+    /// drop it entirely.
+    pub is_ratio: bool,
+    /// The computation. Pulls input scalars from the group's
+    /// metrics map via `Aggregated::numeric()` and produces the
+    /// derived scalar.
+    pub compute: fn(&BTreeMap<String, Aggregated>) -> Option<DerivedValue>,
+}
+
+/// Helper: pull an input metric's `Aggregated::numeric()`
+/// projection out of the group's metrics map.
+fn input_scalar(metrics: &BTreeMap<String, Aggregated>, name: &str) -> Option<f64> {
+    metrics.get(name).and_then(|a| a.numeric())
+}
+
+/// Helper: compute `num / den` for a simple ratio. Returns
+/// `None` when either input is missing OR `den == 0` (so the
+/// renderer surfaces `-` rather than NaN/inf). Used by the
+/// majority of derived metrics whose formula is a plain
+/// quotient over two registry inputs.
+fn ratio_compute(
+    metrics: &BTreeMap<String, Aggregated>,
+    numerator: &str,
+    denominator: &str,
+) -> Option<DerivedValue> {
+    let num = input_scalar(metrics, numerator)?;
+    let den = input_scalar(metrics, denominator)?;
+    if den == 0.0 {
+        return None;
+    }
+    Some(DerivedValue::Scalar(num / den))
+}
+
+/// Helper: compute `num / (num + addend)` for ratios whose
+/// denominator is a sum of two registry inputs. Returns `None`
+/// when either input is missing OR the synthesized denominator
+/// is zero. Used by `cpu_efficiency` (run / (run + wait)) and
+/// `involuntary_csw_ratio` (nvcsw / (vcsw + nvcsw)).
+fn ratio_of_sum_compute(
+    metrics: &BTreeMap<String, Aggregated>,
+    numerator: &str,
+    addend: &str,
+) -> Option<DerivedValue> {
+    let num = input_scalar(metrics, numerator)?;
+    let other = input_scalar(metrics, addend)?;
+    let den = num + other;
+    if den == 0.0 {
+        return None;
+    }
+    Some(DerivedValue::Scalar(num / den))
+}
+
+/// Registry of derived metrics. Each entry consumes one or more
+/// already-aggregated input metrics from
+/// [`HOST_STATE_METRICS`] and produces a single scalar with its
+/// own unit. See the per-entry doc strings for the formula and
+/// kernel-source rationale.
+pub static HOST_STATE_DERIVED_METRICS: &[DerivedMetricDef] = &[
+    DerivedMetricDef {
+        name: "affine_success_ratio",
+        unit: "",
+        description: "wake_affine() success ratio: nr_wakeups_affine / nr_wakeups_affine_attempts.",
+        inputs: &["nr_wakeups_affine", "nr_wakeups_affine_attempts"],
+        is_ratio: true,
+        compute: |m| ratio_compute(m, "nr_wakeups_affine", "nr_wakeups_affine_attempts"),
+    },
+    DerivedMetricDef {
+        name: "avg_wait_ns",
+        unit: "ns",
+        description: "Average runqueue-wait duration: wait_sum / wait_count.",
+        inputs: &["wait_sum", "wait_count"],
+        is_ratio: false,
+        compute: |m| ratio_compute(m, "wait_sum", "wait_count"),
+    },
+    DerivedMetricDef {
+        name: "voluntary_sleep_sum",
+        unit: "ns",
+        description: "Pure voluntary sleep time: sleep_sum - block_sum (kernel double-counts block under sleep_sum).",
+        inputs: &["sleep_sum", "block_sum"],
+        is_ratio: false,
+        compute: |m| {
+            let total_sleep = input_scalar(m, "sleep_sum")?;
+            let block = input_scalar(m, "block_sum")?;
+            // sleep_sum >= block_sum invariant from the kernel's
+            // __update_stats_enqueue_sleeper double-add. A
+            // capture-side race (different read instants for the
+            // two fields) can produce sleep < block by a few ns;
+            // clamp at zero rather than surface negative.
+            Some(DerivedValue::Scalar((total_sleep - block).max(0.0)))
+        },
+    },
+    DerivedMetricDef {
+        name: "cpu_efficiency",
+        unit: "",
+        description: "Fraction of total scheduler-tracked time spent on-CPU: run_time_ns / (run_time_ns + wait_time_ns).",
+        inputs: &["run_time_ns", "wait_time_ns"],
+        is_ratio: true,
+        compute: |m| ratio_of_sum_compute(m, "run_time_ns", "wait_time_ns"),
+    },
+    DerivedMetricDef {
+        name: "avg_slice_ns",
+        unit: "ns",
+        description: "Average on-CPU slice length: run_time_ns / timeslices.",
+        inputs: &["run_time_ns", "timeslices"],
+        is_ratio: false,
+        compute: |m| ratio_compute(m, "run_time_ns", "timeslices"),
+    },
+    DerivedMetricDef {
+        name: "involuntary_csw_ratio",
+        unit: "",
+        description: "Fraction of context switches that were preemptions: nonvoluntary_csw / (voluntary_csw + nonvoluntary_csw).",
+        inputs: &["nonvoluntary_csw", "voluntary_csw"],
+        is_ratio: true,
+        compute: |m| ratio_of_sum_compute(m, "nonvoluntary_csw", "voluntary_csw"),
+    },
+    DerivedMetricDef {
+        name: "disk_io_fraction",
+        unit: "",
+        description: "Fraction of read syscall bytes that hit storage: read_bytes / rchar. Typically <= 1.0 but can exceed when readahead pulls more block-device bytes than the syscall requested.",
+        inputs: &["read_bytes", "rchar"],
+        is_ratio: true,
+        compute: |m| ratio_compute(m, "read_bytes", "rchar"),
+    },
+    DerivedMetricDef {
+        name: "live_heap_estimate",
+        unit: "B",
+        description: "jemalloc live-heap estimate: allocated_bytes - deallocated_bytes (signed).",
+        inputs: &["allocated_bytes", "deallocated_bytes"],
+        is_ratio: false,
+        compute: |m| {
+            let alloc = input_scalar(m, "allocated_bytes")?;
+            let dealloc = input_scalar(m, "deallocated_bytes")?;
+            Some(DerivedValue::Scalar(alloc - dealloc))
+        },
+    },
+    DerivedMetricDef {
+        name: "avg_iowait_ns",
+        unit: "ns",
+        description: "Average iowait interval: iowait_sum / iowait_count.",
+        inputs: &["iowait_sum", "iowait_count"],
+        is_ratio: false,
+        compute: |m| ratio_compute(m, "iowait_sum", "iowait_count"),
+    },
+];
+
+/// Render a metric's display name with gating tags appended.
+/// Format: `<name> [<tag1>] [<tag2>] ...` when sched_class is
+/// `Some` OR config_gates is non-empty OR is_dead is true; or
+/// just `<name>` when none of those conditions hold. Tags emit
+/// in stable order: `sched_class` first (one slot), then
+/// `[dead]` if `is_dead`, then each `config_gate` in
+/// registry-declared order.
+///
+/// Compact rendering: each `config_gate` is stripped of its
+/// `CONFIG_` prefix before emission so the rendered cell stays
+/// scannable in narrow tables. The data field
+/// [`HostStateMetricDef::config_gates`] keeps the full
+/// `CONFIG_X` spelling so an operator can grep their kconfig
+/// directly. Examples:
+/// - `wait_sum [CONFIG_SCHEDSTATS]` → `wait_sum [SCHEDSTATS]`
+/// - `core_forceidle_sum [CONFIG_SCHED_CORE] [CONFIG_SCHEDSTATS]`
+///   → `core_forceidle_sum [SCHED_CORE] [SCHEDSTATS]`
+///
+/// `sched_class` tags are rendered as-is (already short, e.g.
+/// `[cfs-only]`, `[fair-policy]`, `[non-ext]`).
+///
+/// Returns `Cow::Borrowed(metric.name)` on the no-decoration
+/// short-circuit so the typical-case path skips a heap
+/// allocation; tagged metrics return `Cow::Owned(String)`.
+///
+/// Pure formatting layer — does not interpret tag values; the
+/// metric's own [`HostStateMetricDef::sched_class`] /
+/// [`HostStateMetricDef::config_gates`] / [`HostStateMetricDef::is_dead`]
+/// docs are the source of truth for what each spelling means.
+pub fn metric_display_name(metric: &HostStateMetricDef) -> Cow<'static, str> {
+    if metric.sched_class.is_none() && metric.config_gates.is_empty() && !metric.is_dead {
+        return Cow::Borrowed(metric.name);
+    }
+    let mut out = String::from(metric.name);
+    if let Some(class) = metric.sched_class {
+        out.push_str(" [");
+        out.push_str(class);
+        out.push(']');
+    }
+    if metric.is_dead {
+        out.push_str(" [dead]");
+    }
+    for gate in metric.config_gates {
+        out.push_str(" [");
+        // Strip the `CONFIG_` prefix from the data field for
+        // display; full spelling is preserved in `config_gates`
+        // so the operator can grep kconfig directly.
+        let short = gate.strip_prefix("CONFIG_").unwrap_or(gate);
+        out.push_str(short);
+        out.push(']');
+    }
+    Cow::Owned(out)
+}
 
 /// Aggregated metric value for a single [`ThreadGroup`].
 ///
@@ -812,7 +1451,11 @@ impl DiffRow {
 /// programming error (the empty-spec case is handled at the
 /// caller via the `sort_by.is_empty()` branch in
 /// [`compare`] / `write_show`).
-fn sort_diff_rows_by_keys(rows: &mut [DiffRow], sort_keys: &[SortKey]) {
+fn sort_diff_rows_by_keys(
+    rows: &mut [DiffRow],
+    derived_rows: &mut [DerivedRow],
+    sort_keys: &[SortKey],
+) {
     debug_assert!(
         !sort_keys.is_empty(),
         "sort_diff_rows_by_keys called with empty sort_keys; \
@@ -828,12 +1471,28 @@ fn sort_diff_rows_by_keys(rows: &mut [DiffRow], sort_keys: &[SortKey]) {
         .enumerate()
         .map(|(i, m)| (m.name, i))
         .collect();
+    let derived_idx: BTreeMap<&'static str, usize> = HOST_STATE_DERIVED_METRICS
+        .iter()
+        .enumerate()
+        .map(|(i, m)| (m.name, i))
+        .collect();
     // group_key → (metric_name → delta). The inner key is
     // `&'static str` borrowed from `row.metric_name` (itself a
-    // `&'static str` pointing into `HOST_STATE_METRICS.name`),
-    // so no per-row allocation is needed for the metric axis.
+    // `&'static str` pointing into `HOST_STATE_METRICS.name` or
+    // `HOST_STATE_DERIVED_METRICS.name`), so no per-row
+    // allocation is needed for the metric axis. Derived deltas
+    // populate the same map; sort_by treats primary and derived
+    // names uniformly for ranking.
     let mut group_metrics: BTreeMap<String, BTreeMap<&'static str, f64>> = BTreeMap::new();
     for row in rows.iter() {
+        if let Some(d) = row.delta {
+            group_metrics
+                .entry(row.group_key.clone())
+                .or_default()
+                .insert(row.metric_name, d);
+        }
+    }
+    for row in derived_rows.iter() {
         if let Some(d) = row.delta {
             group_metrics
                 .entry(row.group_key.clone())
@@ -847,6 +1506,9 @@ fn sort_diff_rows_by_keys(rows: &mut [DiffRow], sort_keys: &[SortKey]) {
     // separate sort+dedup pass.
     let mut unique_groups: BTreeSet<String> = group_metrics.keys().cloned().collect();
     for row in rows.iter() {
+        unique_groups.insert(row.group_key.clone());
+    }
+    for row in derived_rows.iter() {
         unique_groups.insert(row.group_key.clone());
     }
     // Precompute (group_key, sort_tuple) pairs once. Avoids
@@ -904,6 +1566,21 @@ fn sort_diff_rows_by_keys(rows: &mut [DiffRow], sort_keys: &[SortKey]) {
             ia.cmp(&ib)
         })
     });
+    derived_rows.sort_by(|a, b| {
+        let ra = group_ranks.get(&a.group_key).copied().unwrap_or(usize::MAX);
+        let rb = group_ranks.get(&b.group_key).copied().unwrap_or(usize::MAX);
+        ra.cmp(&rb).then_with(|| {
+            let ia = derived_idx
+                .get(a.metric_name)
+                .copied()
+                .unwrap_or(usize::MAX);
+            let ib = derived_idx
+                .get(b.metric_name)
+                .copied()
+                .unwrap_or(usize::MAX);
+            ia.cmp(&ib)
+        })
+    });
 }
 
 /// Full comparison result.
@@ -946,6 +1623,120 @@ pub struct HostStateDiff {
     pub sched_ext_a: Option<crate::host_state::SchedExtSysfs>,
     /// Candidate global sched_ext sysfs snapshot, same shape.
     pub sched_ext_b: Option<crate::host_state::SchedExtSysfs>,
+    /// One row per `(matched group, derived metric)` pair. Each
+    /// derivation in [`HOST_STATE_DERIVED_METRICS`] consumes
+    /// already-aggregated input metrics from the group's
+    /// metrics map (see [`ThreadGroup::metrics`]) and produces a
+    /// scalar `f64` with its own unit. `None`-valued sides
+    /// signal "not computable" — either the input metric was
+    /// missing on that side (capture-time CONFIG gate not set,
+    /// jemalloc not linked) or the formula's denominator was
+    /// zero. Surfaced by [`write_diff`] in the dedicated
+    /// `## Derived metrics` section after the main table.
+    pub derived_rows: Vec<DerivedRow>,
+}
+
+/// One row in the derived-metrics table: `(matched group,
+/// derivation)` with the computed scalar from both sides.
+///
+/// Mirrors [`DiffRow`] in shape so the renderer can reuse the
+/// same `(group | threads | metric | baseline | candidate |
+/// delta | %)` column layout. The `%` column is suppressed for
+/// rows whose derivation is a ratio
+/// ([`DerivedMetricDef::is_ratio`] true) — absolute delta on a
+/// `[0, 1]` ratio is already in percentage points so a delta_pct
+/// readout would be confusing.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct DerivedRow {
+    pub group_key: String,
+    pub display_key: String,
+    pub thread_count_a: usize,
+    pub thread_count_b: usize,
+    pub metric_name: &'static str,
+    pub metric_unit: &'static str,
+    /// True when the derivation produces a ratio. Renderer
+    /// suppresses the `%` column for ratio rows.
+    pub is_ratio: bool,
+    /// `None` when the input metric was missing on this side or
+    /// the formula divides by zero.
+    pub baseline: Option<DerivedValue>,
+    /// `None` with the same semantics as [`Self::baseline`].
+    pub candidate: Option<DerivedValue>,
+    /// Signed candidate − baseline; `None` when either side is
+    /// `None`.
+    pub delta: Option<f64>,
+    /// `delta / baseline`; `None` when baseline is zero, either
+    /// side is `None`, OR the row is a ratio (suppressed for
+    /// ratios so a `0.5 → 0.6` row doesn't render as
+    /// `+20%` when the natural read is `+10pp`).
+    pub delta_pct: Option<f64>,
+}
+
+impl DerivedRow {
+    /// Sort key mirroring [`DiffRow::sort_key`] for default
+    /// `|delta_pct|`-descending ordering. Ratio rows have
+    /// `delta_pct == None` by design so they sort by their
+    /// absolute delta, scaled by `1e9` so a non-zero ratio
+    /// movement dominates a percent-based row whose baseline
+    /// happens to be zero.
+    fn sort_key(&self) -> f64 {
+        if let Some(p) = self.delta_pct {
+            p.abs()
+        } else if let Some(d) = self.delta {
+            d.abs() * 1e9
+        } else {
+            f64::NEG_INFINITY
+        }
+    }
+}
+
+/// Compute one [`DerivedRow`] for a matched group. Called per
+/// derivation in [`compare`]; the produced row carries `None`
+/// values when the formula's inputs are missing or the
+/// denominator is zero on either side.
+fn build_derived_row(
+    key: &str,
+    display_key: &str,
+    n_a: usize,
+    n_b: usize,
+    def: &DerivedMetricDef,
+    metrics_a: &BTreeMap<String, Aggregated>,
+    metrics_b: &BTreeMap<String, Aggregated>,
+) -> DerivedRow {
+    let baseline = (def.compute)(metrics_a);
+    let candidate = (def.compute)(metrics_b);
+    let (delta, delta_pct) = match (baseline, candidate) {
+        (Some(a), Some(b)) => {
+            let va = a.as_f64();
+            let vb = b.as_f64();
+            let d = vb - va;
+            // Suppress delta_pct for ratio rows per the design
+            // call: `+20%` on a `[0, 1]` ratio is misleading.
+            let pct = if def.is_ratio {
+                None
+            } else if va.abs() > f64::EPSILON {
+                Some(d / va)
+            } else {
+                None
+            };
+            (Some(d), pct)
+        }
+        _ => (None, None),
+    };
+    DerivedRow {
+        group_key: key.to_string(),
+        display_key: display_key.to_string(),
+        thread_count_a: n_a,
+        thread_count_b: n_b,
+        metric_name: def.name,
+        metric_unit: def.unit,
+        is_ratio: def.is_ratio,
+        baseline,
+        candidate,
+        delta,
+        delta_pct,
+    }
 }
 
 /// Compare two snapshots and produce a [`HostStateDiff`].
@@ -1046,6 +1837,22 @@ pub fn compare(
                 b,
             ));
         }
+        // Derived metrics: one row per derivation per matched
+        // group. Each row carries `None`-valued sides when the
+        // formula's inputs are missing or the denominator is
+        // zero — operator sees `-` rather than a synthesized
+        // zero or NaN.
+        for def in HOST_STATE_DERIVED_METRICS {
+            diff.derived_rows.push(build_derived_row(
+                key,
+                &display_key,
+                group_a.thread_count,
+                group_b.thread_count,
+                def,
+                &group_a.metrics,
+                &group_b.metrics,
+            ));
+        }
     }
     for key in groups_b.keys() {
         if !groups_a.contains_key(key) {
@@ -1058,8 +1865,18 @@ pub fn compare(
     if opts.sort_by.is_empty() {
         // Default: stable-sort by descending |delta_pct|, ties
         // broken by ascending group_key + registry order of
-        // metric.
+        // metric. Apply the same shape to derived_rows so the
+        // `## Derived metrics` section ranks by salient delta
+        // rather than registry order — matches the operator's
+        // expectation that the most-changed row sits at the
+        // top of every section.
         diff.rows.sort_by(|a, b| {
+            b.sort_key()
+                .partial_cmp(&a.sort_key())
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.group_key.cmp(&b.group_key))
+        });
+        diff.derived_rows.sort_by(|a, b| {
             b.sort_key()
                 .partial_cmp(&a.sort_key())
                 .unwrap_or(std::cmp::Ordering::Equal)
@@ -1068,7 +1885,7 @@ pub fn compare(
     } else {
         // Multi-key sort: rank groups by tuple of named-metric
         // deltas, sort rows by (group_rank, metric_registry_idx).
-        sort_diff_rows_by_keys(&mut diff.rows, &opts.sort_by);
+        sort_diff_rows_by_keys(&mut diff.rows, &mut diff.derived_rows, &opts.sort_by);
     }
 
     if group_by == GroupBy::Cgroup {
@@ -1777,10 +2594,11 @@ pub fn compile_flatten_patterns(raw: &[String]) -> Vec<glob::Pattern> {
 
 /// Parse a `--sort-by` CLI value into a list of [`SortKey`]s.
 /// Spec format: `metric1[:dir1],metric2[:dir2],...` where each
-/// `metric` is a name from [`HOST_STATE_METRICS`] and `dir` is
-/// `asc` or `desc` (case-insensitive — `:DESC`, `:Asc`, `:asc`
-/// all work). Direction defaults to `desc` (largest delta first
-/// — operator "show me the largest changes" default).
+/// `metric` is a name from [`HOST_STATE_METRICS`] or
+/// [`HOST_STATE_DERIVED_METRICS`] and `dir` is `asc` or `desc`
+/// (case-insensitive — `:DESC`, `:Asc`, `:asc` all work).
+/// Direction defaults to `desc` (largest delta first — operator
+/// "show me the largest changes" default).
 ///
 /// Whitespace around the metric name and around the direction
 /// is trimmed independently, so `wait_sum : desc` and
@@ -1788,24 +2606,33 @@ pub fn compile_flatten_patterns(raw: &[String]) -> Vec<glob::Pattern> {
 ///
 /// Each parsed [`SortKey`] stores the matched registry name as
 /// `&'static str` (not a copy of the user's input), so downstream
-/// equality with [`HostStateMetricDef::name`] is a pointer
-/// comparison and no per-key allocation outlives this call.
+/// equality with [`HostStateMetricDef::name`] or
+/// [`DerivedMetricDef::name`] is a content-equality check
+/// (`str::eq`) over the same registry-owned bytes — no per-key
+/// allocation outlives this call. The two registries are
+/// disjoint, so a name resolves unambiguously to one or the
+/// other.
 ///
 /// Sorts groups by their aggregated metric values under whatever
 /// `--group-by` axis is in effect. The same spec works under
 /// every grouping (pcomm / cgroup / comm / comm-exact) — group
 /// rank reflects the per-group aggregate (sum, max, etc. per
-/// the metric's [`AggRule`]) of the named metric.
+/// the metric's [`AggRule`]) of the named metric, OR the
+/// per-group derived value for entries from
+/// [`HOST_STATE_DERIVED_METRICS`].
 ///
 /// Examples:
 /// - `"wait_sum"` → one key, descending.
 /// - `"wait_sum:asc"` → one key, ascending.
 /// - `"wait_sum:desc,run_time_ns:desc"` → two keys, both
 ///   descending; lexicographic.
+/// - `"avg_wait_ns:desc"` → one key referencing a derived
+///   metric, descending.
 /// - `""` → empty Vec (caller falls back to default sort).
 ///
 /// Errors:
-/// - Unknown metric name (not in [`HOST_STATE_METRICS`]).
+/// - Unknown metric name (not in [`HOST_STATE_METRICS`] AND not
+///   in [`HOST_STATE_DERIVED_METRICS`]).
 /// - Categorical metric name (one whose [`AggRule`] is
 ///   [`AggRule::Mode`] — string-valued, no scalar to sort by).
 ///   The default sort already places mode rows last under the
@@ -1859,31 +2686,57 @@ pub fn parse_sort_by(spec: &str) -> anyhow::Result<Vec<SortKey>> {
             None => (entry, true),
         };
         let metric = metric.trim();
-        let Some(def) = registry.get(metric).copied() else {
+        // Resolve the input name against either the primary
+        // registry or the derived registry. The two namespaces
+        // are disjoint (the registry_and_derived_names_disjoint
+        // test pins this), so a name resolves unambiguously.
+        // The categorical-reject check applies only to primary
+        // metrics (derived metrics never go through AggRule).
+        let resolved_name: Option<&'static str> = if let Some(def) = registry.get(metric).copied() {
+            if matches!(def.rule, AggRule::Mode(_)) {
+                anyhow::bail!(
+                    "metric {metric:?} is categorical (no numeric value to sort by); \
+                     --sort-by accepts only metrics whose AggRule yields a scalar \
+                     (Sum, Max, OrdinalRange, or Affinity)"
+                );
+            }
+            Some(def.name)
+        } else {
+            HOST_STATE_DERIVED_METRICS
+                .iter()
+                .find(|d| d.name == metric)
+                .map(|d| d.name)
+        };
+        let Some(canonical) = resolved_name else {
             // Sorted comma-separated list keeps the diagnostic
             // copy-pasteable — operator can grep the names
-            // without parsing BTreeSet debug syntax.
-            let valid = registry.keys().copied().collect::<Vec<_>>().join(", ");
+            // without parsing BTreeSet debug syntax. The
+            // rendered table cells append `[tag]` suffixes (e.g.
+            // `wait_sum [non-ext] [SCHEDSTATS]`), but
+            // `--sort-by` accepts only the bare metric name; if
+            // the operator pasted the rendered cell verbatim
+            // the trailing bracket would land here, hence the
+            // explicit hint.
+            let mut valid: Vec<&'static str> = registry.keys().copied().collect();
+            for d in HOST_STATE_DERIVED_METRICS {
+                valid.push(d.name);
+            }
+            valid.sort();
+            let valid = valid.join(", ");
             anyhow::bail!(
                 "unknown metric {metric:?} in --sort-by spec {spec:?}; \
-                 must be one of: {valid}",
+                 use the bare metric name, not the rendered cell with \
+                 [tag] suffixes; must be one of: {valid}",
             );
         };
-        if matches!(def.rule, AggRule::Mode(_)) {
-            anyhow::bail!(
-                "metric {metric:?} is categorical (no numeric value to sort by); \
-                 --sort-by accepts only metrics whose AggRule yields a scalar \
-                 (Sum, Max, OrdinalRange, or Affinity)"
-            );
-        }
-        if !seen.insert(def.name) {
+        if !seen.insert(canonical) {
             anyhow::bail!(
                 "duplicate metric {metric:?} in --sort-by spec {spec:?}; \
                  each metric may appear at most once across all sort keys"
             );
         }
         out.push(SortKey {
-            metric: def.name,
+            metric: canonical,
             descending,
         });
     }
@@ -1935,6 +2788,18 @@ pub fn flatten_cgroup_stats(
     // the same labels as thread groups. When absent, the
     // post-flatten path itself is the key (matches the legacy
     // behavior with glob-only flatten).
+    // First-iteration-replace semantics: the first contributor
+    // for a key is inserted verbatim (clone). Subsequent
+    // contributors are merged in via the per-domain merge fns.
+    // Using `or_default()` + merge here would synthesize a
+    // CgroupStats whose `Option<u64>` limits are all None and
+    // None-poison every `merge_max_option`/`merge_min_option`
+    // call against the first real contributor — yielding `None`
+    // for limits/floors even when every contributor has a
+    // concrete value. The replace-on-first / merge-on-rest split
+    // ensures None-poisoning fires only when contributors
+    // genuinely disagree (one None, one Some), never when
+    // merging the synthetic seed.
     let mut out: BTreeMap<String, CgroupStats> = BTreeMap::new();
     for (path, cs) in stats {
         let post_flatten = flatten_cgroup_path(path, patterns);
@@ -1942,11 +2807,17 @@ pub fn flatten_cgroup_stats(
             Some(k) => k.clone(),
             None => post_flatten,
         };
-        let agg = out.entry(key).or_default();
-        merge_cgroup_cpu(&mut agg.cpu, &cs.cpu);
-        merge_cgroup_memory(&mut agg.memory, &cs.memory);
-        merge_cgroup_pids(&mut agg.pids, &cs.pids);
-        agg.psi = merge_psi(agg.psi, cs.psi);
+        match out.get_mut(&key) {
+            None => {
+                out.insert(key, cs.clone());
+            }
+            Some(agg) => {
+                merge_cgroup_cpu(&mut agg.cpu, &cs.cpu);
+                merge_cgroup_memory(&mut agg.memory, &cs.memory);
+                merge_cgroup_pids(&mut agg.pids, &cs.pids);
+                agg.psi = merge_psi(agg.psi, cs.psi);
+            }
+        }
     }
     out
 }
@@ -1999,10 +2870,11 @@ fn merge_cgroup_cpu(agg: &mut CgroupCpuStats, src: &CgroupCpuStats) {
     // `weight` and `weight_nice` are aliases of the same kernel
     // knob (`kernel/sched/core.c::sched_weight_to_nice` /
     // `nice_to_weight`). Apply the SAME merge policy to both —
-    // earlier asymmetry between them was a phd-stats finding
-    // (F3). Use `merge_max_option` (None-poisons) for both:
-    // the merged bucket is "no weight configured" if any
-    // contributor is unconfigured.
+    // asymmetric merging would render a `weight=10, weight_nice=None`
+    // bucket as if its contributors disagreed when they cannot
+    // (the kernel writes both atomically). Use `merge_max_option`
+    // (None-poisons) for both: the merged bucket is "no weight
+    // configured" if any contributor is unconfigured.
     agg.weight = merge_max_option(agg.weight, src.weight);
     agg.weight_nice = match (agg.weight_nice, src.weight_nice) {
         (Some(a), Some(b)) => Some(a.max(b)),
@@ -2331,6 +3203,50 @@ pub fn format_scaled_u64(v: u64, unit: &'static str) -> String {
     }
 }
 
+/// Format a derived-metric value cell for the `## Derived metrics`
+/// table. Ratio rows (`is_ratio: true`, unit `""`) render with
+/// three decimals (`0.873`); ns / B / ticks units route through
+/// the same auto-scale ladder as the main table. Negative values
+/// (e.g. a negative `live_heap_estimate`) carry their explicit
+/// minus sign through the format.
+pub fn format_derived_value_cell(v: DerivedValue, unit: &'static str, is_ratio: bool) -> String {
+    let value = v.as_f64();
+    if is_ratio {
+        return format!("{value:.3}");
+    }
+    let (scaled, scaled_unit) = auto_scale(value, unit);
+    if scaled_unit == unit {
+        // No ladder step-up — render two decimals to preserve
+        // the fractional precision derived averages carry (e.g.
+        // wait_sum=1234 ns / wait_count=10 = 123.40 ns). The
+        // primary-table integer formatter (format_scaled_u64)
+        // strips fractions because its inputs ARE integers; the
+        // derived path's inputs are `f64` divisions, so two
+        // decimals keep the signal intact.
+        format!("{value:.2}{unit}")
+    } else {
+        format!("{scaled:.3}{scaled_unit}")
+    }
+}
+
+/// Format the signed delta cell for a derived row. Mirrors
+/// [`format_derived_value_cell`] but always carries an explicit
+/// `+`/`-` sign so the operator can read directionality at a
+/// glance. Ratios render with three decimals (`+0.100` is +10pp);
+/// other units route through `auto_scale` and pick up the
+/// scaled unit suffix.
+pub fn format_derived_delta_cell(d: f64, unit: &'static str, is_ratio: bool) -> String {
+    if is_ratio {
+        return format!("{d:+.3}");
+    }
+    let (scaled, scaled_unit) = auto_scale(d, unit);
+    if scaled_unit == unit {
+        format!("{d:+.2}{unit}")
+    } else {
+        format!("{scaled:+.3}{scaled_unit}")
+    }
+}
+
 /// Render an `Option<u64>` cgroup limit as either `max` (no
 /// limit / kernel emitted the literal `max` token) or the
 /// auto-scaled value. Used for `memory.max`, `memory.high`,
@@ -2465,11 +3381,12 @@ pub struct HostStateCompareArgs {
     pub no_cg_normalize: bool,
     /// Multi-key sort spec for the diff rows. Format:
     /// `metric1[:dir1],metric2[:dir2],...` where each `metric` is
-    /// one of the registered metric names and `dir` is `asc` or
-    /// `desc` (default `desc`). Groups rank by the tuple
-    /// (`metric1_delta`, `metric2_delta`, ...) under lexicographic
-    /// order with per-key direction; rows within a group keep
-    /// registry order. Empty (the default) keeps the
+    /// one of the primary or derived metric names (run
+    /// `host-state metric-list` for the full vocabulary) and
+    /// `dir` is `asc` or `desc` (default `desc`). Groups rank by
+    /// the tuple (`metric1_delta`, `metric2_delta`, ...) under
+    /// lexicographic order with per-key direction; rows within a
+    /// group keep registry order. Empty (the default) keeps the
     /// "biggest |delta_pct|" sort. Example:
     /// `--sort-by wait_sum:desc,run_time_ns:desc`.
     ///
@@ -2511,6 +3428,159 @@ pub fn run_compare(args: &HostStateCompareArgs) -> anyhow::Result<i32> {
     };
     let diff = compare(&baseline, &candidate, &opts);
     print_diff(&diff, &args.baseline, &args.candidate, args.group_by);
+    Ok(0)
+}
+
+/// Render the metric-list discovery output: a tag legend
+/// (sched_class / config_gates / `[dead]`) followed by a per-metric
+/// table whose rows show `name | tags | description`. Tag legend
+/// is keyed off the closed-set vocabulary the registry pin test
+/// guards (`registry_tag_vocabulary_is_closed`), so adding a new
+/// allowed class or gate fails the test until both the legend
+/// and the closed-set table are updated together.
+///
+/// Splits rendering from I/O so tests can drive the formatter
+/// into a `String` buffer; the public [`run_metric_list`] entry
+/// point is the print wrapper.
+pub fn write_metric_list<W: fmt::Write>(w: &mut W) -> fmt::Result {
+    writeln!(w, "## Tag legend")?;
+    writeln!(w)?;
+    writeln!(w, "sched_class:")?;
+    writeln!(
+        w,
+        "  [cfs-only]    metric increments only inside CFS-class call paths (kernel/sched/fair.c);"
+    )?;
+    writeln!(w, "                zero under sched_ext / RT / DL / IDLE.")?;
+    writeln!(
+        w,
+        "  [non-ext]     metric is written by the schedstat sleep/wait family wrappers"
+    )?;
+    writeln!(
+        w,
+        "                (kernel/sched/stats.c); CFS / RT / DL accumulate, sched_ext bypasses."
+    )?;
+    writeln!(
+        w,
+        "  [fair-policy] metric emits only when fair_policy(p->policy) is true:"
+    )?;
+    writeln!(
+        w,
+        "                SCHED_NORMAL, SCHED_BATCH, AND SCHED_EXT under CONFIG_SCHED_CLASS_EXT."
+    )?;
+    writeln!(w)?;
+    writeln!(
+        w,
+        "config_gates (compact form; full kconfig symbol prefixed with CONFIG_):"
+    )?;
+    writeln!(
+        w,
+        "  [SCHED_INFO]            requires CONFIG_SCHED_INFO; gates the sched_info_* counters"
+    )?;
+    writeln!(
+        w,
+        "                          surfaced via /proc/<tid>/schedstat (run_time_ns, wait_time_ns,"
+    )?;
+    writeln!(w, "                          timeslices).")?;
+    writeln!(
+        w,
+        "  [SCHEDSTATS]            requires CONFIG_SCHEDSTATS; gates every __schedstat_* /"
+    )?;
+    writeln!(
+        w,
+        "                          schedstat_* macro call (kernel/sched/stats.h:75-82)."
+    )?;
+    writeln!(
+        w,
+        "  [SCHED_CORE]            requires CONFIG_SCHED_CORE; gates the core-scheduling"
+    )?;
+    writeln!(
+        w,
+        "                          subsystem (core_forceidle_sum)."
+    )?;
+    writeln!(
+        w,
+        "  [SCHED_CLASS_EXT]       requires CONFIG_SCHED_CLASS_EXT; without it no task can"
+    )?;
+    writeln!(w, "                          land on the sched_ext class.")?;
+    writeln!(
+        w,
+        "  [TASK_DELAY_ACCT]       requires CONFIG_TASK_DELAY_ACCT AND runtime delayacct=on"
+    )?;
+    writeln!(
+        w,
+        "                          (boot param or kernel.task_delayacct sysctl)."
+    )?;
+    writeln!(
+        w,
+        "  [TASK_IO_ACCOUNTING]    requires CONFIG_TASK_IO_ACCOUNTING; gates /proc/<tid>/io."
+    )?;
+    writeln!(w)?;
+    writeln!(w, "status:")?;
+    writeln!(
+        w,
+        "  [dead]        kernel exposes the counter via /proc but never increments it; always"
+    )?;
+    writeln!(
+        w,
+        "                reads zero. Surfaced for forward-compat parity with the kernel's"
+    )?;
+    writeln!(w, "                exposure surface.")?;
+    writeln!(w)?;
+    writeln!(w, "## Metrics")?;
+    writeln!(w)?;
+    let mut table = crate::cli::new_table();
+    table.set_header(vec!["metric", "tags", "description"]);
+    for m in HOST_STATE_METRICS {
+        // Strip the bare metric name off the rendered display
+        // form so the `tags` column carries only the bracketed
+        // suffixes — keeps the table scannable. When the metric
+        // has no tags, the cell is empty.
+        let rendered = metric_display_name(m);
+        let tags = match rendered.strip_prefix(m.name) {
+            Some(rest) => rest.trim_start().to_string(),
+            None => String::new(),
+        };
+        table.add_row(vec![m.name.to_string(), tags, m.description.to_string()]);
+    }
+    writeln!(w, "{table}")?;
+    writeln!(w)?;
+    writeln!(w, "## Derived metrics")?;
+    writeln!(w)?;
+    let mut dt = crate::cli::new_table();
+    dt.set_header(vec!["metric", "unit", "inputs", "description"]);
+    for d in HOST_STATE_DERIVED_METRICS {
+        let unit_cell = if d.unit.is_empty() {
+            "ratio".to_string()
+        } else {
+            d.unit.to_string()
+        };
+        dt.add_row(vec![
+            d.name.to_string(),
+            unit_cell,
+            d.inputs.join(", "),
+            d.description.to_string(),
+        ]);
+    }
+    writeln!(w, "{dt}")?;
+    Ok(())
+}
+
+/// Print the metric-list discovery output to stdout. Thin
+/// wrapper over [`write_metric_list`] so the CLI keeps the
+/// one-line call ergonomics; tests drive the writer into a
+/// `String` buffer.
+pub fn print_metric_list() {
+    let mut out = String::new();
+    // Infallible: writing into a String cannot fail.
+    let _ = write_metric_list(&mut out);
+    print!("{out}");
+}
+
+/// Entry point for the `host-state metric-list` subcommand.
+/// Always returns `Ok(0)` — discovery output is informational
+/// and never fails.
+pub fn run_metric_list() -> anyhow::Result<i32> {
+    print_metric_list();
     Ok(0)
 }
 
@@ -2582,10 +3652,20 @@ pub fn write_diff<W: fmt::Write>(
         } else {
             format!("{}\u{2192}{}", row.thread_count_a, row.thread_count_b)
         };
+        // Look up the metric def by name to render gating tags
+        // alongside the bare name. Every `DiffRow` is constructed
+        // by [`build_row`] from a `&'static HostStateMetricDef`,
+        // so the registry lookup always succeeds.
+        let metric_cell = metric_display_name(
+            HOST_STATE_METRICS
+                .iter()
+                .find(|m| m.name == row.metric_name)
+                .expect("metric_name comes from HOST_STATE_METRICS via build_row"),
+        );
         table.add_row(vec![
             row.display_key.clone(),
             threads_cell,
-            row.metric_name.to_string(),
+            metric_cell.into_owned(),
             format_value_cell(&row.baseline, row.metric_unit),
             format_value_cell(&row.candidate, row.metric_unit),
             delta_cell,
@@ -2593,6 +3673,54 @@ pub fn write_diff<W: fmt::Write>(
         ]);
     }
     writeln!(w, "{table}")?;
+
+    if !diff.derived_rows.is_empty() {
+        writeln!(w)?;
+        writeln!(w, "## Derived metrics")?;
+        let mut dt = crate::cli::new_table();
+        dt.set_header(vec![
+            group_header,
+            "threads",
+            "metric",
+            "baseline",
+            "candidate",
+            "delta",
+            "%",
+        ]);
+        for row in &diff.derived_rows {
+            let threads_cell = if row.thread_count_a == row.thread_count_b {
+                row.thread_count_a.to_string()
+            } else {
+                format!("{}\u{2192}{}", row.thread_count_a, row.thread_count_b)
+            };
+            let baseline_cell = match row.baseline {
+                Some(v) => format_derived_value_cell(v, row.metric_unit, row.is_ratio),
+                None => "-".to_string(),
+            };
+            let candidate_cell = match row.candidate {
+                Some(v) => format_derived_value_cell(v, row.metric_unit, row.is_ratio),
+                None => "-".to_string(),
+            };
+            let delta_cell = match row.delta {
+                Some(d) => format_derived_delta_cell(d, row.metric_unit, row.is_ratio),
+                None => "-".to_string(),
+            };
+            let pct_cell = match row.delta_pct {
+                Some(p) => format!("{:+.1}%", p * 100.0),
+                None => "-".to_string(),
+            };
+            dt.add_row(vec![
+                row.display_key.clone(),
+                threads_cell,
+                row.metric_name.to_string(),
+                baseline_cell,
+                candidate_cell,
+                delta_cell,
+                pct_cell,
+            ]);
+        }
+        writeln!(w, "{dt}")?;
+    }
 
     if group_by == GroupBy::Cgroup
         && (!diff.cgroup_stats_a.is_empty() || !diff.cgroup_stats_b.is_empty())
@@ -3514,7 +4642,7 @@ mod tests {
         assert!(row.delta_pct.is_none());
     }
 
-    // -- Additional coverage per team-lead directive --
+    // -- Additional coverage --
 
     /// Two empty snapshots (no threads, no cgroup enrichment)
     /// produce an empty diff with zero rows and zero unmatched
@@ -3889,6 +5017,54 @@ mod tests {
         assert_eq!(agg.pids.max, Some(2048));
     }
 
+    /// Single-contributor flatten: ONE cgroup with concrete
+    /// `Some`-valued limits passes through `flatten_cgroup_stats`
+    /// unchanged. Pin the regression for the
+    /// first-iteration-replace fix: under the prior
+    /// `or_default()` + `merge_max_option` flow, the synthetic
+    /// `CgroupStats::default()` would seed every `Option<u64>`
+    /// limit at None, then `merge_max_option(None, Some(N))`
+    /// would None-poison the lone real contributor, erasing
+    /// every concrete cap to None.
+    #[test]
+    fn flatten_cgroup_stats_single_contributor_preserves_concrete_limits() {
+        let mut a = CgroupStats::default();
+        a.cpu.usage_usec = 12_345;
+        a.cpu.max_quota_us = Some(50_000);
+        a.cpu.max_period_us = 100_000;
+        a.cpu.weight = Some(150);
+        a.cpu.weight_nice = Some(0);
+        a.memory.current = 1_500_000;
+        a.memory.max = Some(2 << 30);
+        a.memory.high = Some(1 << 30);
+        a.memory.low = Some(1 << 28);
+        a.memory.min = Some(1 << 27);
+        a.pids.current = Some(42);
+        a.pids.max = Some(2048);
+        let mut stats = BTreeMap::new();
+        stats.insert("/lone".into(), a);
+        // No flatten patterns and no key map — the path passes
+        // through verbatim, so /lone is the only contributor for
+        // its key.
+        let out = flatten_cgroup_stats(&stats, &[], None);
+        let agg = &out["/lone"];
+        // Every concrete `Option<u64>` survives the flatten layer
+        // verbatim. Under the buggy code, every assertion below
+        // would fail with `Some(_) != None`.
+        assert_eq!(agg.cpu.usage_usec, 12_345);
+        assert_eq!(agg.cpu.max_quota_us, Some(50_000));
+        assert_eq!(agg.cpu.max_period_us, 100_000);
+        assert_eq!(agg.cpu.weight, Some(150));
+        assert_eq!(agg.cpu.weight_nice, Some(0));
+        assert_eq!(agg.memory.current, 1_500_000);
+        assert_eq!(agg.memory.max, Some(2 << 30));
+        assert_eq!(agg.memory.high, Some(1 << 30));
+        assert_eq!(agg.memory.low, Some(1 << 28));
+        assert_eq!(agg.memory.min, Some(1 << 27));
+        assert_eq!(agg.pids.current, Some(42));
+        assert_eq!(agg.pids.max, Some(2048));
+    }
+
     /// Limit + floor No-limit propagation through flatten: when
     /// one cgroup has memory.max=None (no cap) and another has
     /// a concrete cap, the merged bucket inherits None.
@@ -4173,6 +5349,1123 @@ mod tests {
             assert!(
                 seen.insert(m.name),
                 "duplicate metric name in registry: {}",
+                m.name,
+            );
+        }
+    }
+
+    /// Test-only helper: look up a registry entry by name and
+    /// return a static reference. Reduces fixture duplication
+    /// across the metric_display_name + tag tests below.
+    fn lookup_metric(name: &str) -> &'static HostStateMetricDef {
+        HOST_STATE_METRICS
+            .iter()
+            .find(|m| m.name == name)
+            .unwrap_or_else(|| panic!("metric {name} registered"))
+    }
+
+    /// `metric_display_name` of a fully-ungated metric returns
+    /// the bare name with no trailing tags. Pins the
+    /// no-decoration short-circuit for the typical case, and
+    /// verifies that the borrowed-Cow path is taken (no
+    /// allocation when nothing decorates).
+    #[test]
+    fn metric_display_name_no_gates_returns_bare_name() {
+        let policy = lookup_metric("policy");
+        assert_eq!(metric_display_name(policy).as_ref(), "policy");
+        assert!(matches!(metric_display_name(policy), Cow::Borrowed(_)));
+        let cpu_aff = lookup_metric("cpu_affinity");
+        assert_eq!(metric_display_name(cpu_aff).as_ref(), "cpu_affinity");
+        assert!(matches!(metric_display_name(cpu_aff), Cow::Borrowed(_)));
+    }
+
+    /// CFS-only + CONFIG_SCHEDSTATS metric renders BOTH tags in
+    /// stable order: sched_class first, then each config gate.
+    /// `nr_wakeups_affine` is the load-bearing example here —
+    /// `kernel/sched/fair.c::wake_affine` is the only call site
+    /// for the underlying `__schedstat_inc`. The config gate
+    /// renders compact (`[SCHEDSTATS]` not `[CONFIG_SCHEDSTATS]`)
+    /// per the strip rule on `metric_display_name`. Pins both
+    /// decoration paths against drift.
+    #[test]
+    fn metric_display_name_renders_class_and_config_tags() {
+        let m = lookup_metric("nr_wakeups_affine");
+        assert_eq!(
+            metric_display_name(m).as_ref(),
+            "nr_wakeups_affine [cfs-only] [SCHEDSTATS]"
+        );
+    }
+
+    /// Multi-gate metric (`core_forceidle_sum` requires both
+    /// CONFIG_SCHED_CORE and CONFIG_SCHEDSTATS) renders every
+    /// gate in registry-declared order. Class is `None` here so
+    /// no class tag emits — only the two config tags. Compact
+    /// rendering strips the `CONFIG_` prefix from each gate.
+    #[test]
+    fn metric_display_name_emits_each_config_gate_in_order() {
+        let core = lookup_metric("core_forceidle_sum");
+        assert_eq!(
+            metric_display_name(core).as_ref(),
+            "core_forceidle_sum [SCHED_CORE] [SCHEDSTATS]"
+        );
+    }
+
+    /// `fair_slice_ns` is fair-policy-only with no config gate.
+    /// Pins that the class tag emits without any trailing
+    /// config-gate tag — the for-loop must not produce a
+    /// trailing `[]` or trailing whitespace when
+    /// `config_gates` is empty.
+    #[test]
+    fn metric_display_name_class_only_no_config_gate() {
+        let fair = lookup_metric("fair_slice_ns");
+        assert_eq!(
+            metric_display_name(fair).as_ref(),
+            "fair_slice_ns [fair-policy]"
+        );
+    }
+
+    /// Compact rendering: `metric_display_name` strips the
+    /// `CONFIG_` prefix from each `config_gate` before emission.
+    /// The data field stays full so an operator can grep their
+    /// kconfig directly. Pin the rule explicitly so a refactor
+    /// of `metric_display_name` does not silently regress the
+    /// strip behavior.
+    #[test]
+    fn metric_display_name_strips_config_prefix() {
+        // Walk every registered metric. Every config gate must
+        // start with `CONFIG_` (Kconfig convention for the
+        // literal symbol the operator types into menuconfig);
+        // the rendered display must contain the post-strip
+        // form bracketed and must NOT contain the full `[CONFIG_X]`
+        // form anywhere in the rendered string. This guards
+        // against partial-strip regressions where one gate
+        // strips but a sibling does not.
+        for m in HOST_STATE_METRICS {
+            for gate in m.config_gates {
+                assert!(
+                    gate.starts_with("CONFIG_"),
+                    "registry config_gate {gate:?} on metric {} \
+                     must spell the literal CONFIG_X kconfig symbol",
+                    m.name,
+                );
+                let rendered = metric_display_name(m);
+                let expected_short = gate.strip_prefix("CONFIG_").unwrap();
+                assert!(
+                    rendered.contains(&format!("[{expected_short}]")),
+                    "metric {} rendered as {rendered:?} but expected \
+                     to contain bracketed [{expected_short}] \
+                     (post-strip form of {gate:?})",
+                    m.name,
+                );
+                assert!(
+                    !rendered.contains(&format!("[{gate}]")),
+                    "metric {} rendered as {rendered:?} but the \
+                     full [{gate}] spelling must not appear — \
+                     the strip rule was violated",
+                    m.name,
+                );
+            }
+        }
+    }
+
+    /// `[dead]` tag surfaces on every metric whose `is_dead`
+    /// flag is true — kernel-side never increments these.
+    /// Operators reading the rendered table see the `[dead]`
+    /// flag and stop chasing the always-zero cell. The tag
+    /// renders AFTER the sched_class slot and BEFORE the
+    /// config_gates run, so a fully-decorated dead counter reads
+    /// `nr_wakeups_idle [dead] [SCHEDSTATS]` (no sched_class on
+    /// these metrics post-refactor).
+    #[test]
+    fn metric_display_name_marks_dead_counters() {
+        for name in [
+            "nr_wakeups_idle",
+            "nr_migrations_cold",
+            "nr_wakeups_passive",
+        ] {
+            let m = lookup_metric(name);
+            assert!(m.is_dead, "{name} must have is_dead=true in registry");
+            let rendered = metric_display_name(m);
+            assert!(
+                rendered.contains("[dead]"),
+                "{name} must carry the [dead] tag, got {rendered:?}",
+            );
+        }
+        // Pin the exact rendered form for nr_wakeups_idle so a
+        // future change to the tag-emission order produces a
+        // failing assertion (rather than a silent text drift).
+        assert_eq!(
+            metric_display_name(lookup_metric("nr_wakeups_idle")).as_ref(),
+            "nr_wakeups_idle [dead] [SCHEDSTATS]",
+        );
+    }
+
+    /// `non-ext` rendering: the schedstat sleep/wait family is
+    /// tagged `non-ext` because it accumulates under CFS / RT /
+    /// DL but not sched_ext. Pin a representative example:
+    /// `wait_sum [non-ext] [SCHEDSTATS]`. Guards against the
+    /// matrix regression that previously left these tagged
+    /// `None`.
+    #[test]
+    fn metric_display_name_renders_non_ext_class() {
+        let m = lookup_metric("wait_sum");
+        assert_eq!(
+            metric_display_name(m).as_ref(),
+            "wait_sum [non-ext] [SCHEDSTATS]",
+        );
+    }
+
+    /// Exhaustive tag pin: every metric in HOST_STATE_METRICS
+    /// gets its (sched_class, config_gates, is_dead) triple
+    /// asserted against the locked matrix. Set-equality on the
+    /// keys: every registry name must appear in the matrix
+    /// table, and vice versa. Drift on either side fails the
+    /// test before reaching the rendered output.
+    #[test]
+    fn registry_tag_matrix_is_pinned() {
+        // Locked matrix: (name → (sched_class, config_gates, is_dead)).
+        // Order matches HOST_STATE_METRICS for ease of audit.
+        let matrix: &[(&str, Option<&str>, &[&str], bool)] = &[
+            // identity / structural
+            ("policy", None, &[], false),
+            ("nice", None, &[], false),
+            ("priority", None, &[], false),
+            ("rt_priority", None, &[], false),
+            ("cpu_affinity", None, &[], false),
+            ("processor", None, &[], false),
+            ("state", None, &[], false),
+            ("ext_enabled", None, &["CONFIG_SCHED_CLASS_EXT"], false),
+            ("nr_threads", None, &[], false),
+            // scheduling / schedstat
+            ("run_time_ns", None, &["CONFIG_SCHED_INFO"], false),
+            ("wait_time_ns", None, &["CONFIG_SCHED_INFO"], false),
+            ("timeslices", None, &["CONFIG_SCHED_INFO"], false),
+            ("voluntary_csw", None, &[], false),
+            ("nonvoluntary_csw", None, &[], false),
+            ("nr_wakeups", None, &["CONFIG_SCHEDSTATS"], false),
+            ("nr_wakeups_local", None, &["CONFIG_SCHEDSTATS"], false),
+            ("nr_wakeups_remote", None, &["CONFIG_SCHEDSTATS"], false),
+            ("nr_wakeups_sync", None, &["CONFIG_SCHEDSTATS"], false),
+            ("nr_wakeups_migrate", None, &["CONFIG_SCHEDSTATS"], false),
+            ("nr_wakeups_idle", None, &["CONFIG_SCHEDSTATS"], true),
+            ("nr_wakeups_passive", None, &["CONFIG_SCHEDSTATS"], true),
+            (
+                "nr_wakeups_affine",
+                Some("cfs-only"),
+                &["CONFIG_SCHEDSTATS"],
+                false,
+            ),
+            (
+                "nr_wakeups_affine_attempts",
+                Some("cfs-only"),
+                &["CONFIG_SCHEDSTATS"],
+                false,
+            ),
+            ("nr_migrations", None, &[], false),
+            ("nr_migrations_cold", None, &["CONFIG_SCHEDSTATS"], true),
+            (
+                "nr_forced_migrations",
+                Some("cfs-only"),
+                &["CONFIG_SCHEDSTATS"],
+                false,
+            ),
+            (
+                "nr_failed_migrations_affine",
+                Some("cfs-only"),
+                &["CONFIG_SCHEDSTATS"],
+                false,
+            ),
+            (
+                "nr_failed_migrations_running",
+                Some("cfs-only"),
+                &["CONFIG_SCHEDSTATS"],
+                false,
+            ),
+            (
+                "nr_failed_migrations_hot",
+                Some("cfs-only"),
+                &["CONFIG_SCHEDSTATS"],
+                false,
+            ),
+            ("wait_sum", Some("non-ext"), &["CONFIG_SCHEDSTATS"], false),
+            ("wait_count", Some("non-ext"), &["CONFIG_SCHEDSTATS"], false),
+            ("wait_max", Some("non-ext"), &["CONFIG_SCHEDSTATS"], false),
+            ("sleep_sum", Some("non-ext"), &["CONFIG_SCHEDSTATS"], false),
+            ("sleep_max", Some("non-ext"), &["CONFIG_SCHEDSTATS"], false),
+            ("block_sum", Some("non-ext"), &["CONFIG_SCHEDSTATS"], false),
+            ("block_max", Some("non-ext"), &["CONFIG_SCHEDSTATS"], false),
+            ("iowait_sum", Some("non-ext"), &["CONFIG_SCHEDSTATS"], false),
+            (
+                "iowait_count",
+                Some("non-ext"),
+                &["CONFIG_SCHEDSTATS"],
+                false,
+            ),
+            (
+                "delayacct_blkio_ticks",
+                None,
+                &["CONFIG_TASK_DELAY_ACCT"],
+                false,
+            ),
+            ("exec_max", None, &["CONFIG_SCHEDSTATS"], false),
+            ("slice_max", Some("cfs-only"), &["CONFIG_SCHEDSTATS"], false),
+            (
+                "core_forceidle_sum",
+                None,
+                &["CONFIG_SCHED_CORE", "CONFIG_SCHEDSTATS"],
+                false,
+            ),
+            ("fair_slice_ns", Some("fair-policy"), &[], false),
+            // memory
+            ("allocated_bytes", None, &[], false),
+            ("deallocated_bytes", None, &[], false),
+            ("minflt", None, &[], false),
+            ("majflt", None, &[], false),
+            ("utime_clock_ticks", None, &[], false),
+            ("stime_clock_ticks", None, &[], false),
+            // I/O
+            ("rchar", None, &["CONFIG_TASK_IO_ACCOUNTING"], false),
+            ("wchar", None, &["CONFIG_TASK_IO_ACCOUNTING"], false),
+            ("syscr", None, &["CONFIG_TASK_IO_ACCOUNTING"], false),
+            ("syscw", None, &["CONFIG_TASK_IO_ACCOUNTING"], false),
+            ("read_bytes", None, &["CONFIG_TASK_IO_ACCOUNTING"], false),
+            ("write_bytes", None, &["CONFIG_TASK_IO_ACCOUNTING"], false),
+        ];
+        // Set-equality: registry keys vs matrix keys.
+        let registry_names: std::collections::BTreeSet<&str> =
+            HOST_STATE_METRICS.iter().map(|m| m.name).collect();
+        let matrix_names: std::collections::BTreeSet<&str> =
+            matrix.iter().map(|(n, _, _, _)| *n).collect();
+        assert_eq!(
+            registry_names, matrix_names,
+            "registry vs matrix key mismatch — every metric must be \
+             pinned in the locked matrix and the matrix must not name \
+             metrics that aren't registered",
+        );
+        // Per-entry pin: each tuple matches the registry exactly.
+        for (name, expected_class, expected_gates, expected_dead) in matrix {
+            let m = lookup_metric(name);
+            assert_eq!(m.sched_class, *expected_class, "{name}: sched_class drift",);
+            assert_eq!(
+                m.config_gates, *expected_gates,
+                "{name}: config_gates drift",
+            );
+            assert_eq!(m.is_dead, *expected_dead, "{name}: is_dead drift");
+        }
+    }
+
+    /// Closed-set vocabulary: the registry's tag values must
+    /// stay inside the documented vocabulary. sched_class is
+    /// one of {None, "non-ext", "cfs-only", "fair-policy"};
+    /// config_gates is a subset of the documented kconfig set.
+    /// Defends against a future entry that tags a metric with a
+    /// freshly-invented label that the doc / display layers
+    /// don't yet handle.
+    #[test]
+    fn registry_tag_vocabulary_is_closed() {
+        let allowed_classes: std::collections::BTreeSet<&str> =
+            ["non-ext", "cfs-only", "fair-policy"].into_iter().collect();
+        let allowed_gates: std::collections::BTreeSet<&str> = [
+            "CONFIG_SCHED_INFO",
+            "CONFIG_SCHEDSTATS",
+            "CONFIG_SCHED_CORE",
+            "CONFIG_TASK_DELAY_ACCT",
+            "CONFIG_TASK_IO_ACCOUNTING",
+            "CONFIG_SCHED_CLASS_EXT",
+        ]
+        .into_iter()
+        .collect();
+        for m in HOST_STATE_METRICS {
+            if let Some(class) = m.sched_class {
+                assert!(
+                    allowed_classes.contains(class),
+                    "{}: sched_class {class:?} outside the closed set \
+                     {{None, \"non-ext\", \"cfs-only\", \"fair-policy\"}}",
+                    m.name,
+                );
+            }
+            for gate in m.config_gates {
+                assert!(
+                    gate.starts_with("CONFIG_"),
+                    "{}: config_gate {gate:?} must start with CONFIG_",
+                    m.name,
+                );
+                assert!(
+                    allowed_gates.contains(gate),
+                    "{}: config_gate {gate:?} outside the closed set \
+                     {allowed_gates:?}",
+                    m.name,
+                );
+            }
+        }
+    }
+
+    /// Integration test for `write_diff`: a tagged metric row
+    /// (`nr_wakeups_affine`) renders the bracketed tag suffix on
+    /// the `metric` cell in the produced table. Pins that the
+    /// registry tag → cell rendering plumbing stays connected
+    /// end-to-end; refactoring `metric_display_name`'s callers
+    /// without rerouting the bracketed tag would silently strip
+    /// the cell back to bare metric names.
+    #[test]
+    fn write_diff_renders_tagged_metric_cell() {
+        let mut a = make_thread("p", "w");
+        a.nr_wakeups_affine = 5;
+        let mut b = make_thread("p", "w");
+        b.nr_wakeups_affine = 9;
+        let diff = compare(
+            &snap_with(vec![a]),
+            &snap_with(vec![b]),
+            &CompareOptions::default(),
+        );
+        let mut out = String::new();
+        write_diff(
+            &mut out,
+            &diff,
+            Path::new("a"),
+            Path::new("b"),
+            GroupBy::Pcomm,
+        )
+        .unwrap();
+        assert!(
+            out.contains("nr_wakeups_affine [cfs-only] [SCHEDSTATS]"),
+            "tagged metric cell missing from rendered table:\n{out}",
+        );
+    }
+
+    /// Integration test for `write_diff`: a `non-ext` metric
+    /// (`wait_sum`) renders with the new tag in the produced
+    /// table. Pins the matrix change end-to-end so a future
+    /// regression that rolls the class back to `None` fails
+    /// here as well as in the unit test.
+    #[test]
+    fn write_diff_renders_non_ext_metric_cell() {
+        let mut a = make_thread("p", "w");
+        a.wait_sum = 100;
+        let mut b = make_thread("p", "w");
+        b.wait_sum = 200;
+        let diff = compare(
+            &snap_with(vec![a]),
+            &snap_with(vec![b]),
+            &CompareOptions::default(),
+        );
+        let mut out = String::new();
+        write_diff(
+            &mut out,
+            &diff,
+            Path::new("a"),
+            Path::new("b"),
+            GroupBy::Pcomm,
+        )
+        .unwrap();
+        assert!(
+            out.contains("wait_sum [non-ext] [SCHEDSTATS]"),
+            "non-ext metric cell missing from rendered table:\n{out}",
+        );
+    }
+
+    /// Integration test for `write_diff`: a dead-counter row
+    /// renders the `[dead]` tag in the metric cell. Pins the
+    /// is_dead → cell rendering plumbing.
+    #[test]
+    fn write_diff_renders_is_dead_metric_cell() {
+        let mut a = make_thread("p", "w");
+        a.nr_wakeups_idle = 0;
+        let mut b = make_thread("p", "w");
+        b.nr_wakeups_idle = 0;
+        let diff = compare(
+            &snap_with(vec![a]),
+            &snap_with(vec![b]),
+            &CompareOptions::default(),
+        );
+        let mut out = String::new();
+        write_diff(
+            &mut out,
+            &diff,
+            Path::new("a"),
+            Path::new("b"),
+            GroupBy::Pcomm,
+        )
+        .unwrap();
+        assert!(
+            out.contains("nr_wakeups_idle [dead] [SCHEDSTATS]"),
+            "dead-counter cell missing from rendered table:\n{out}",
+        );
+    }
+
+    // ------------------------------------------------------------
+    // Derived metrics (#53)
+    // ------------------------------------------------------------
+
+    /// `affine_success_ratio` = nr_wakeups_affine /
+    /// nr_wakeups_affine_attempts. Pin the formula on a
+    /// deterministic 7/10 input.
+    #[test]
+    fn derived_affine_success_ratio_formula() {
+        let mut t = make_thread("p", "w");
+        t.nr_wakeups_affine = 7;
+        t.nr_wakeups_affine_attempts = 10;
+        let diff = compare(
+            &snap_with(vec![t.clone()]),
+            &snap_with(vec![t]),
+            &CompareOptions::default(),
+        );
+        let row = diff
+            .derived_rows
+            .iter()
+            .find(|r| r.metric_name == "affine_success_ratio")
+            .expect("affine_success_ratio row present");
+        assert_eq!(row.baseline, Some(DerivedValue::Scalar(0.7)));
+        assert_eq!(row.candidate, Some(DerivedValue::Scalar(0.7)));
+        assert!(row.is_ratio, "affine_success_ratio is a ratio");
+    }
+
+    /// `avg_wait_ns` = wait_sum / wait_count. Pin formula on
+    /// 1000ns / 4 events = 250ns.
+    #[test]
+    fn derived_avg_wait_ns_formula() {
+        let mut t = make_thread("p", "w");
+        t.wait_sum = 1000;
+        t.wait_count = 4;
+        let diff = compare(
+            &snap_with(vec![t.clone()]),
+            &snap_with(vec![t]),
+            &CompareOptions::default(),
+        );
+        let row = diff
+            .derived_rows
+            .iter()
+            .find(|r| r.metric_name == "avg_wait_ns")
+            .expect("avg_wait_ns row present");
+        assert_eq!(row.baseline, Some(DerivedValue::Scalar(250.0)));
+    }
+
+    /// `voluntary_sleep_sum` = sleep_sum - block_sum (kernel
+    /// double-counts block under sleep). Pin on 1000-300 = 700.
+    #[test]
+    fn derived_voluntary_sleep_sum_subtracts_block() {
+        let mut t = make_thread("p", "w");
+        t.sleep_sum = 1000;
+        t.block_sum = 300;
+        let diff = compare(
+            &snap_with(vec![t.clone()]),
+            &snap_with(vec![t]),
+            &CompareOptions::default(),
+        );
+        let row = diff
+            .derived_rows
+            .iter()
+            .find(|r| r.metric_name == "voluntary_sleep_sum")
+            .expect("voluntary_sleep_sum row present");
+        assert_eq!(row.baseline, Some(DerivedValue::Scalar(700.0)));
+    }
+
+    /// `voluntary_sleep_sum` clamps to zero when sleep < block
+    /// (capture-time race between two distinct /proc reads).
+    #[test]
+    fn derived_voluntary_sleep_clamps_negative_to_zero() {
+        let mut t = make_thread("p", "w");
+        t.sleep_sum = 100;
+        t.block_sum = 200;
+        let diff = compare(
+            &snap_with(vec![t.clone()]),
+            &snap_with(vec![t]),
+            &CompareOptions::default(),
+        );
+        let row = diff
+            .derived_rows
+            .iter()
+            .find(|r| r.metric_name == "voluntary_sleep_sum")
+            .expect("voluntary_sleep_sum row present");
+        assert_eq!(row.baseline, Some(DerivedValue::Scalar(0.0)));
+    }
+
+    /// `cpu_efficiency` = run / (run + wait). Pin on
+    /// 100 / (100 + 100) = 0.5.
+    #[test]
+    fn derived_cpu_efficiency_formula() {
+        let mut t = make_thread("p", "w");
+        t.run_time_ns = 100;
+        t.wait_time_ns = 100;
+        let diff = compare(
+            &snap_with(vec![t.clone()]),
+            &snap_with(vec![t]),
+            &CompareOptions::default(),
+        );
+        let row = diff
+            .derived_rows
+            .iter()
+            .find(|r| r.metric_name == "cpu_efficiency")
+            .expect("cpu_efficiency row present");
+        assert_eq!(row.baseline, Some(DerivedValue::Scalar(0.5)));
+        assert!(row.is_ratio);
+    }
+
+    /// `avg_slice_ns` = run_time_ns / timeslices.
+    #[test]
+    fn derived_avg_slice_ns_formula() {
+        let mut t = make_thread("p", "w");
+        t.run_time_ns = 4000;
+        t.timeslices = 8;
+        let diff = compare(
+            &snap_with(vec![t.clone()]),
+            &snap_with(vec![t]),
+            &CompareOptions::default(),
+        );
+        let row = diff
+            .derived_rows
+            .iter()
+            .find(|r| r.metric_name == "avg_slice_ns")
+            .expect("avg_slice_ns row present");
+        assert_eq!(row.baseline, Some(DerivedValue::Scalar(500.0)));
+    }
+
+    /// `involuntary_csw_ratio` = nvcsw / (vcsw + nvcsw).
+    #[test]
+    fn derived_involuntary_csw_ratio_formula() {
+        let mut t = make_thread("p", "w");
+        t.voluntary_csw = 75;
+        t.nonvoluntary_csw = 25;
+        let diff = compare(
+            &snap_with(vec![t.clone()]),
+            &snap_with(vec![t]),
+            &CompareOptions::default(),
+        );
+        let row = diff
+            .derived_rows
+            .iter()
+            .find(|r| r.metric_name == "involuntary_csw_ratio")
+            .expect("involuntary_csw_ratio row present");
+        assert_eq!(row.baseline, Some(DerivedValue::Scalar(0.25)));
+        assert!(row.is_ratio);
+    }
+
+    /// `disk_io_fraction` = read_bytes / rchar.
+    #[test]
+    fn derived_disk_io_fraction_formula() {
+        let mut t = make_thread("p", "w");
+        t.rchar = 10_000;
+        t.read_bytes = 2_500;
+        let diff = compare(
+            &snap_with(vec![t.clone()]),
+            &snap_with(vec![t]),
+            &CompareOptions::default(),
+        );
+        let row = diff
+            .derived_rows
+            .iter()
+            .find(|r| r.metric_name == "disk_io_fraction")
+            .expect("disk_io_fraction row present");
+        assert_eq!(row.baseline, Some(DerivedValue::Scalar(0.25)));
+        assert!(row.is_ratio);
+    }
+
+    /// `live_heap_estimate` = allocated - deallocated. Pin
+    /// signed: 1000 alloc - 1500 dealloc = -500 (drained).
+    #[test]
+    fn derived_live_heap_estimate_signed() {
+        let mut t = make_thread("p", "w");
+        t.allocated_bytes = 1000;
+        t.deallocated_bytes = 1500;
+        let diff = compare(
+            &snap_with(vec![t.clone()]),
+            &snap_with(vec![t]),
+            &CompareOptions::default(),
+        );
+        let row = diff
+            .derived_rows
+            .iter()
+            .find(|r| r.metric_name == "live_heap_estimate")
+            .expect("live_heap_estimate row present");
+        assert_eq!(row.baseline, Some(DerivedValue::Scalar(-500.0)));
+        assert!(!row.is_ratio, "live_heap_estimate is a B-unit, not ratio");
+    }
+
+    /// `avg_iowait_ns` = iowait_sum / iowait_count.
+    #[test]
+    fn derived_avg_iowait_ns_formula() {
+        let mut t = make_thread("p", "w");
+        t.iowait_sum = 9000;
+        t.iowait_count = 3;
+        let diff = compare(
+            &snap_with(vec![t.clone()]),
+            &snap_with(vec![t]),
+            &CompareOptions::default(),
+        );
+        let row = diff
+            .derived_rows
+            .iter()
+            .find(|r| r.metric_name == "avg_iowait_ns")
+            .expect("avg_iowait_ns row present");
+        assert_eq!(row.baseline, Some(DerivedValue::Scalar(3000.0)));
+    }
+
+    /// Division by zero in any ratio derivation produces `None`,
+    /// not NaN or zero. Operator-actionable as `-` in the
+    /// rendered cell.
+    #[test]
+    fn derived_division_by_zero_returns_none() {
+        let mut t = make_thread("p", "w");
+        // affine_attempts == 0 → ratio is None
+        t.nr_wakeups_affine = 0;
+        t.nr_wakeups_affine_attempts = 0;
+        // wait_count == 0 → avg_wait_ns is None
+        t.wait_sum = 0;
+        t.wait_count = 0;
+        // run + wait == 0 → cpu_efficiency is None
+        t.run_time_ns = 0;
+        t.wait_time_ns = 0;
+        // timeslices == 0 → avg_slice_ns is None
+        t.timeslices = 0;
+        // vcsw + nvcsw == 0 → involuntary_csw_ratio is None
+        t.voluntary_csw = 0;
+        t.nonvoluntary_csw = 0;
+        // rchar == 0 → disk_io_fraction is None
+        t.rchar = 0;
+        t.read_bytes = 0;
+        // iowait_count == 0 → avg_iowait_ns is None
+        t.iowait_sum = 0;
+        t.iowait_count = 0;
+        let diff = compare(
+            &snap_with(vec![t.clone()]),
+            &snap_with(vec![t]),
+            &CompareOptions::default(),
+        );
+        for name in [
+            "affine_success_ratio",
+            "avg_wait_ns",
+            "cpu_efficiency",
+            "avg_slice_ns",
+            "involuntary_csw_ratio",
+            "disk_io_fraction",
+            "avg_iowait_ns",
+        ] {
+            let row = diff
+                .derived_rows
+                .iter()
+                .find(|r| r.metric_name == name)
+                .unwrap_or_else(|| panic!("{name} row present"));
+            assert!(
+                row.baseline.is_none(),
+                "{name} divides by zero — baseline must be None, got {:?}",
+                row.baseline
+            );
+            assert!(
+                row.delta.is_none(),
+                "{name} delta must be None when inputs are zero"
+            );
+        }
+    }
+
+    /// Ratio rows render with absolute delta in the delta column
+    /// and `-` in the % column (suppressed for ratios per design
+    /// call: 0.5 → 0.6 reads as +0.100 absolute = +10pp; the
+    /// fraction +0.2 = +20% of baseline is misleading).
+    #[test]
+    fn write_diff_derived_ratio_suppresses_pct() {
+        let mut a = make_thread("p", "w");
+        a.nr_wakeups_affine = 50;
+        a.nr_wakeups_affine_attempts = 100; // ratio = 0.5
+        let mut b = make_thread("p", "w");
+        b.nr_wakeups_affine = 60;
+        b.nr_wakeups_affine_attempts = 100; // ratio = 0.6
+        let diff = compare(
+            &snap_with(vec![a]),
+            &snap_with(vec![b]),
+            &CompareOptions::default(),
+        );
+        let row = diff
+            .derived_rows
+            .iter()
+            .find(|r| r.metric_name == "affine_success_ratio")
+            .expect("affine_success_ratio present");
+        assert_eq!(row.delta, Some(0.1));
+        assert!(
+            row.delta_pct.is_none(),
+            "ratio row must suppress delta_pct, got {:?}",
+            row.delta_pct
+        );
+    }
+
+    /// Non-ratio (ns/B) derivations keep delta_pct populated.
+    #[test]
+    fn write_diff_derived_ns_keeps_pct() {
+        let mut a = make_thread("p", "w");
+        a.wait_sum = 1000;
+        a.wait_count = 10; // avg = 100ns
+        let mut b = make_thread("p", "w");
+        b.wait_sum = 1500;
+        b.wait_count = 10; // avg = 150ns
+        let diff = compare(
+            &snap_with(vec![a]),
+            &snap_with(vec![b]),
+            &CompareOptions::default(),
+        );
+        let row = diff
+            .derived_rows
+            .iter()
+            .find(|r| r.metric_name == "avg_wait_ns")
+            .expect("avg_wait_ns present");
+        assert_eq!(row.baseline, Some(DerivedValue::Scalar(100.0)));
+        assert_eq!(row.candidate, Some(DerivedValue::Scalar(150.0)));
+        assert_eq!(row.delta, Some(50.0));
+        // delta_pct = 50/100 = 0.5
+        assert!(row.delta_pct.is_some());
+        let pct = row.delta_pct.unwrap();
+        assert!(
+            (pct - 0.5).abs() < 1e-9,
+            "expected delta_pct ~0.5, got {pct}"
+        );
+    }
+
+    /// Render integration: write_diff emits the `## Derived
+    /// metrics` section with one row per derivation per matched
+    /// group. Pin the section header and a representative row.
+    #[test]
+    fn write_diff_emits_derived_section() {
+        let mut t = make_thread("p", "w");
+        t.run_time_ns = 1000;
+        t.timeslices = 4;
+        let diff = compare(
+            &snap_with(vec![t.clone()]),
+            &snap_with(vec![t]),
+            &CompareOptions::default(),
+        );
+        let mut out = String::new();
+        write_diff(
+            &mut out,
+            &diff,
+            Path::new("a"),
+            Path::new("b"),
+            GroupBy::Pcomm,
+        )
+        .unwrap();
+        assert!(
+            out.contains("## Derived metrics"),
+            "missing derived section header:\n{out}",
+        );
+        assert!(
+            out.contains("avg_slice_ns"),
+            "missing avg_slice_ns row in derived section:\n{out}",
+        );
+    }
+
+    /// `--sort-by` accepts derived metric names. Three groups
+    /// with distinct cpu_efficiency values: sort descending puts
+    /// the highest first.
+    #[test]
+    fn parse_sort_by_accepts_derived_metric_name() {
+        let keys = parse_sort_by("cpu_efficiency").expect("derived name parses");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].metric, "cpu_efficiency");
+        assert!(keys[0].descending);
+    }
+
+    /// `--sort-by` rejects unknown names with a hint that lists
+    /// derived names alongside primary registry names.
+    #[test]
+    fn parse_sort_by_unknown_lists_derived_names() {
+        let err = parse_sort_by("not_a_real_metric").unwrap_err();
+        let msg = format!("{err:#}");
+        // Lists at least one derived metric name.
+        assert!(
+            msg.contains("affine_success_ratio")
+                || msg.contains("cpu_efficiency")
+                || msg.contains("avg_wait_ns"),
+            "error must list derived metric names alongside primary; got: {msg}",
+        );
+    }
+
+    /// Primary and derived metric namespaces are disjoint — a
+    /// derived metric may NOT shadow a primary metric name. Pin
+    /// the disjoint invariant so a future addition that
+    /// accidentally collides surfaces here.
+    #[test]
+    fn registry_and_derived_names_disjoint() {
+        let primary: std::collections::BTreeSet<&str> =
+            HOST_STATE_METRICS.iter().map(|m| m.name).collect();
+        for d in HOST_STATE_DERIVED_METRICS {
+            assert!(
+                !primary.contains(d.name),
+                "derived metric {} shadows primary registry name",
+                d.name,
+            );
+        }
+    }
+
+    /// Every derived metric has a non-empty description and a
+    /// non-empty inputs list. Defends against a future addition
+    /// that forgets to fill either field.
+    #[test]
+    fn registry_derived_metrics_well_formed() {
+        for d in HOST_STATE_DERIVED_METRICS {
+            assert!(
+                !d.description.is_empty(),
+                "derived metric {} has empty description",
+                d.name,
+            );
+            assert!(
+                !d.inputs.is_empty(),
+                "derived metric {} has empty inputs list",
+                d.name,
+            );
+            // Every input must be a real registered metric name.
+            let primary: std::collections::BTreeSet<&str> =
+                HOST_STATE_METRICS.iter().map(|m| m.name).collect();
+            for input in d.inputs {
+                assert!(
+                    primary.contains(input),
+                    "derived metric {} cites unknown input {input}",
+                    d.name,
+                );
+            }
+        }
+    }
+
+    /// `metric-list` emits the `## Derived metrics` section
+    /// with every registered derivation listed. Pin set-equality
+    /// on names so a registry addition automatically surfaces.
+    #[test]
+    fn write_metric_list_emits_derived_section() {
+        let mut out = String::new();
+        write_metric_list(&mut out).unwrap();
+        assert!(
+            out.contains("## Derived metrics"),
+            "metric-list must emit a Derived metrics header:\n{out}",
+        );
+        for d in HOST_STATE_DERIVED_METRICS {
+            assert!(
+                out.contains(d.name),
+                "derived metric {} missing from metric-list:\n{out}",
+                d.name,
+            );
+        }
+    }
+
+    /// `format_derived_value_cell` renders a ratio with three
+    /// decimals (`0.873`); ns/B values route through auto-scale.
+    #[test]
+    fn format_derived_value_cell_ratio_three_decimals() {
+        let v = DerivedValue::Scalar(0.873_5);
+        let cell = format_derived_value_cell(v, "", true);
+        assert_eq!(cell, "0.874");
+    }
+
+    /// `format_derived_value_cell` auto-scales ns to ms above
+    /// the threshold.
+    #[test]
+    fn format_derived_value_cell_ns_auto_scales() {
+        let v = DerivedValue::Scalar(2_500_000.0);
+        let cell = format_derived_value_cell(v, "ns", false);
+        // 2.5e6 ns → 2.500ms via the existing auto_scale ladder.
+        assert_eq!(cell, "2.500ms");
+    }
+
+    /// `format_derived_value_cell` preserves fractional precision
+    /// for derived averages below the auto-scale threshold.
+    /// avg_wait_ns = 1234 ns / 10 events = 123.4 ns; the
+    /// formatter renders 123.40ns (two decimals). Without the
+    /// fractional precision, this would round to "123ns" and
+    /// the operator would lose the post-decimal signal.
+    #[test]
+    fn format_derived_value_cell_ns_preserves_fractional_precision() {
+        let v = DerivedValue::Scalar(123.4);
+        let cell = format_derived_value_cell(v, "ns", false);
+        assert_eq!(cell, "123.40ns");
+    }
+
+    /// `format_derived_value_cell` renders a negative B value
+    /// with the explicit minus sign (live_heap_estimate that
+    /// went negative).
+    #[test]
+    fn format_derived_value_cell_negative_bytes_signed() {
+        let two_kib_neg = -(2.0 * 1024.0);
+        let v = DerivedValue::Scalar(two_kib_neg);
+        let cell = format_derived_value_cell(v, "B", false);
+        assert_eq!(cell, "-2.000KiB");
+    }
+
+    /// `format_derived_delta_cell` carries explicit `+` for
+    /// positive deltas (mirrors format_delta_cell). Pin the
+    /// sign carry on a ratio delta of +0.100 = +10pp.
+    #[test]
+    fn format_derived_delta_cell_ratio_carries_sign() {
+        let cell = format_derived_delta_cell(0.1, "", true);
+        assert_eq!(cell, "+0.100");
+    }
+
+    /// `--sort-by avg_wait_ns` ranks groups by the derived
+    /// metric's delta. End-to-end pin: three pcomm buckets with
+    /// distinct avg_wait_ns deltas; descending sort puts the
+    /// largest delta's group first in the rendered table.
+    #[test]
+    fn write_diff_sort_by_derived_metric_ranks_groups() {
+        // bucket "high": avg_wait grew from 100ns to 300ns (+200ns)
+        // bucket "low": avg_wait grew from 100ns to 150ns (+50ns)
+        // Descending sort puts "high" first.
+        let mut high_a = make_thread("p", "w");
+        high_a.pcomm = "high".to_string();
+        high_a.wait_sum = 100;
+        high_a.wait_count = 1;
+        let mut high_b = make_thread("p", "w");
+        high_b.pcomm = "high".to_string();
+        high_b.wait_sum = 300;
+        high_b.wait_count = 1;
+        let mut low_a = make_thread("p", "w");
+        low_a.pcomm = "low".to_string();
+        low_a.wait_sum = 100;
+        low_a.wait_count = 1;
+        let mut low_b = make_thread("p", "w");
+        low_b.pcomm = "low".to_string();
+        low_b.wait_sum = 150;
+        low_b.wait_count = 1;
+        let opts = CompareOptions {
+            sort_by: vec![SortKey {
+                metric: "avg_wait_ns",
+                descending: true,
+            }],
+            ..CompareOptions::default()
+        };
+        let diff = compare(
+            &snap_with(vec![high_a, low_a]),
+            &snap_with(vec![high_b, low_b]),
+            &opts,
+        );
+        // Find the first derived row (post-sort) — the group with
+        // the largest avg_wait_ns delta.
+        let first = &diff.derived_rows[0];
+        assert_eq!(
+            first.group_key, "high",
+            "descending sort by avg_wait_ns must put `high` first; \
+             got {:?}",
+            first.group_key,
+        );
+    }
+
+    /// `write_metric_list` emits the tag legend section with
+    /// every closed-set tag value documented. Ties the legend
+    /// content to the closed-set vocabulary the registry pin
+    /// guards (`registry_tag_vocabulary_is_closed`); a future
+    /// allowed-class or allowed-gate addition that doesn't
+    /// extend the legend fails this test.
+    #[test]
+    fn write_metric_list_emits_full_tag_legend() {
+        let mut out = String::new();
+        write_metric_list(&mut out).unwrap();
+        // sched_class vocabulary
+        assert!(
+            out.contains("[cfs-only]"),
+            "missing [cfs-only] in legend:\n{out}"
+        );
+        assert!(
+            out.contains("[non-ext]"),
+            "missing [non-ext] in legend:\n{out}"
+        );
+        assert!(
+            out.contains("[fair-policy]"),
+            "missing [fair-policy] in legend:\n{out}",
+        );
+        // config_gates vocabulary (compact form)
+        assert!(
+            out.contains("[SCHED_INFO]"),
+            "missing [SCHED_INFO] in legend:\n{out}"
+        );
+        assert!(
+            out.contains("[SCHEDSTATS]"),
+            "missing [SCHEDSTATS] in legend:\n{out}",
+        );
+        assert!(
+            out.contains("[SCHED_CORE]"),
+            "missing [SCHED_CORE] in legend:\n{out}"
+        );
+        assert!(
+            out.contains("[SCHED_CLASS_EXT]"),
+            "missing [SCHED_CLASS_EXT] in legend:\n{out}",
+        );
+        assert!(
+            out.contains("[TASK_DELAY_ACCT]"),
+            "missing [TASK_DELAY_ACCT] in legend:\n{out}",
+        );
+        assert!(
+            out.contains("[TASK_IO_ACCOUNTING]"),
+            "missing [TASK_IO_ACCOUNTING] in legend:\n{out}",
+        );
+        // status vocabulary
+        assert!(out.contains("[dead]"), "missing [dead] in legend:\n{out}");
+        // Section headers
+        assert!(
+            out.contains("## Tag legend"),
+            "missing Tag legend section header:\n{out}",
+        );
+        assert!(
+            out.contains("## Metrics"),
+            "missing Metrics section header:\n{out}",
+        );
+    }
+
+    /// `write_metric_list` covers every metric in the registry.
+    /// Pin set-equality on the names so a registry addition
+    /// fails the test until the description is added (which
+    /// happens automatically — `write_metric_list` iterates the
+    /// registry).
+    #[test]
+    fn write_metric_list_covers_every_registered_metric() {
+        let mut out = String::new();
+        write_metric_list(&mut out).unwrap();
+        for m in HOST_STATE_METRICS {
+            assert!(
+                out.contains(m.name),
+                "metric {} missing from metric-list output:\n{out}",
+                m.name,
+            );
+            assert!(
+                out.contains(m.description),
+                "description for {} missing from metric-list output:\n{out}",
+                m.name,
+            );
+        }
+    }
+
+    /// `write_metric_list` puts the tags into their own column —
+    /// no metric name leaks into the tags cell. Pin a
+    /// representative example: `nr_wakeups_affine` carries
+    /// `[cfs-only] [SCHEDSTATS]`, and that exact substring (with
+    /// a leading space gap before the bracket) is present in the
+    /// output but the rendered display form
+    /// `nr_wakeups_affine [cfs-only] [SCHEDSTATS]` is NOT (which
+    /// would mean the name leaked into the tags cell).
+    #[test]
+    fn write_metric_list_tags_column_excludes_metric_name() {
+        let mut out = String::new();
+        write_metric_list(&mut out).unwrap();
+        assert!(
+            out.contains("[cfs-only] [SCHEDSTATS]"),
+            "expected bare tag pair `[cfs-only] [SCHEDSTATS]` in tags column:\n{out}",
+        );
+        assert!(
+            !out.contains("nr_wakeups_affine [cfs-only]"),
+            "metric name must not leak into tags column:\n{out}",
+        );
+    }
+
+    /// Every metric carries a non-empty description string.
+    /// Defends against a future metric addition that forgets to
+    /// fill the field — leaving an empty cell in the discovery
+    /// output that defeats the entire purpose of `metric-list`.
+    #[test]
+    fn registry_descriptions_are_non_empty() {
+        for m in HOST_STATE_METRICS {
+            assert!(
+                !m.description.is_empty(),
+                "metric {} has empty description",
+                m.name,
+            );
+            // No trailing whitespace, no leading whitespace —
+            // the table cell carries the description verbatim.
+            assert_eq!(
+                m.description.trim(),
+                m.description,
+                "metric {} description has leading/trailing whitespace",
                 m.name,
             );
         }
@@ -6676,6 +8969,29 @@ mod tests {
             msg.contains("run_time_ns"),
             "error must list at least one canonical metric name from the registry, got: {msg}"
         );
+        // Pin the bare-metric-name hint: rendered cells now carry
+        // `[tag]` suffixes (e.g. `wait_sum [non-ext] [SCHEDSTATS]`),
+        // and an operator pasting the rendered cell verbatim into
+        // `--sort-by` would land here. The error must redirect them
+        // to the bare name.
+        assert!(
+            msg.contains("bare metric name"),
+            "error must hint at bare-metric-name usage, got: {msg}"
+        );
+    }
+
+    /// Pasting a tagged cell verbatim into --sort-by produces an
+    /// error that carries the bare-metric-name hint. Pins the
+    /// hint as actionable for the most likely operator failure
+    /// mode after the tag-suffix change.
+    #[test]
+    fn parse_sort_by_unknown_with_tag_suffix_carries_hint() {
+        let err = parse_sort_by("wait_sum [non-ext] [SCHEDSTATS]").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("bare metric name"),
+            "tagged-cell paste must produce the bare-name hint, got: {msg}",
+        );
     }
 
     /// Invalid direction string (anything other than `asc` /
@@ -6923,6 +9239,7 @@ mod tests {
         ];
         sort_diff_rows_by_keys(
             &mut rows,
+            &mut Vec::new(),
             &[SortKey {
                 metric: "run_time_ns",
                 descending: true,
@@ -6973,6 +9290,7 @@ mod tests {
         ];
         sort_diff_rows_by_keys(
             &mut rows,
+            &mut Vec::new(),
             &[
                 SortKey {
                     metric: "run_time_ns",
@@ -7011,6 +9329,7 @@ mod tests {
         ];
         sort_diff_rows_by_keys(
             &mut rows,
+            &mut Vec::new(),
             &[SortKey {
                 metric: "run_time_ns",
                 descending: false, // asc
@@ -7098,6 +9417,7 @@ mod tests {
         ];
         sort_diff_rows_by_keys(
             &mut rows,
+            &mut Vec::new(),
             &[SortKey {
                 metric: "run_time_ns",
                 descending: true,
@@ -7141,6 +9461,7 @@ mod tests {
         ];
         sort_diff_rows_by_keys(
             &mut rows,
+            &mut Vec::new(),
             &[SortKey {
                 metric: "run_time_ns",
                 descending: true,
@@ -7189,6 +9510,7 @@ mod tests {
         ];
         sort_diff_rows_by_keys(
             &mut rows,
+            &mut Vec::new(),
             &[SortKey {
                 metric: "run_time_ns",
                 descending: false,
@@ -7246,6 +9568,7 @@ mod tests {
         // (`a.cmp(b)`) breaks the tie ascending.
         sort_diff_rows_by_keys(
             &mut rows,
+            &mut Vec::new(),
             &[SortKey {
                 metric: "run_time_ns",
                 descending: true,
@@ -7294,6 +9617,7 @@ mod tests {
         ];
         sort_diff_rows_by_keys(
             &mut rows,
+            &mut Vec::new(),
             &[SortKey {
                 // Sort by wait_time_ns to verify the metric
                 // rows still emerge in REGISTRY order, not
@@ -7343,6 +9667,7 @@ mod tests {
         // survive the sort.
         sort_diff_rows_by_keys(
             &mut rows,
+            &mut Vec::new(),
             &[SortKey {
                 metric: "run_time_ns",
                 descending: true,

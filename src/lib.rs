@@ -347,6 +347,7 @@ pub mod host_state;
 pub mod host_state_compare;
 pub(crate) mod host_thread_probe;
 pub mod kernel_path;
+pub mod metric_types;
 pub(crate) mod monitor;
 pub(crate) mod probe;
 pub(crate) mod report;

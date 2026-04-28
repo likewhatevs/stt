@@ -15,6 +15,37 @@
 //! (vmm::host_topology) — the function shape is generic enough that
 //! either subsystem could have owned it; keeping the impls here so
 //! neither has to depend on the other for a CPU-list helper.
+//!
+//! # Why this is NOT [`crate::topology::parse_cpu_list`]
+//!
+//! [`crate::topology`] carries its own `parse_cpu_list` (returns
+//! `Result<Vec<usize>>`) and `parse_cpu_list_lenient` (returns
+//! `Vec<usize>`, never fails). The split is deliberate, not a
+//! duplicate to consolidate:
+//!
+//! - **Threat model.** This module's parser ingests `/proc/<tid>/status`
+//!   data captured from arbitrary tasks on the host. A hostile or
+//!   corrupt `Cpus_allowed_list:` value like `0-4294967295` would
+//!   allocate 16 GiB without the `MAX_CPU_RANGE_EXPANSION` cap.
+//!   The topology parser ingests operator-supplied VM config —
+//!   no untrusted-input concerns, no cap needed.
+//! - **Return shape.** `Option<Vec<u32>>` here vs
+//!   `Result<Vec<usize>>` / `Vec<usize>` in topology. The capture
+//!   path needs to distinguish "no data" (None) from "data but
+//!   garbled" (also None for now, with an explicit comment); the
+//!   topology path needs `anyhow::Error` for upstream `?`
+//!   propagation and `Vec<usize>` to interop with sysfs APIs that
+//!   speak `usize`.
+//! - **Dedup semantics.** This module dedups duplicates produced
+//!   by overlapping ranges (`0-2,1` → `[0,1,2]`); the topology
+//!   parser preserves duplicates so callers detecting operator
+//!   config errors (e.g. accidentally listing the same CPU
+//!   twice) can surface them.
+//!
+//! Unifying the two behind a generic helper would require either
+//! collapsing one set of invariants into the other or carrying
+//! both behaviors through a config struct — neither produces a
+//! cleaner end result than the current cohabitation.
 
 use libc;
 

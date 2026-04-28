@@ -409,6 +409,24 @@ enum HostStateCommand {
     /// `--no-cg-normalize` disable each axis. `--cgroup-flatten`
     /// glob patterns also apply unchanged.
     Show(HostStateShowArgs),
+    /// Print every registered metric with its tags and a
+    /// one-line description.
+    ///
+    /// Discovery companion to `compare` and `show`: rendered
+    /// table cells carry `[cfs-only]`, `[non-ext]`,
+    /// `[fair-policy]`, `[SCHEDSTATS]`, `[SCHED_INFO]`,
+    /// `[SCHED_CORE]`, `[SCHED_CLASS_EXT]`, `[TASK_DELAY_ACCT]`,
+    /// `[TASK_IO_ACCOUNTING]`, and `[dead]` suffixes — this
+    /// subcommand is the CLI-discoverable place to learn what
+    /// each tag means and which kernel counter each metric
+    /// surfaces.
+    ///
+    /// Output is two sections: a tag legend explaining each
+    /// vocabulary element, then a `metric | tags | description`
+    /// table covering every entry in the registry. Pure
+    /// informational output — no snapshot is loaded; always
+    /// returns 0.
+    MetricList,
 }
 
 /// Arguments for the `ktstr host-state show` subcommand. Field
@@ -449,13 +467,15 @@ pub struct HostStateShowArgs {
     /// Multi-key sort spec for the rendered groups. Format mirrors
     /// `ktstr host-state compare --sort-by`:
     /// `metric1[:dir1],metric2[:dir2],...` where each `metric` is
-    /// one of the registered metric names and `dir` is `asc` or
-    /// `desc` (default `desc`). Show ranks groups by the tuple
-    /// of the named metric's *absolute aggregated value* (not a
-    /// delta — there is only one snapshot to inspect), descending
-    /// by default; rows within a group keep registry order. Empty
-    /// (the default) keeps the alphabetical group-key iteration.
-    /// Example: `--sort-by run_time_ns,wait_sum:asc`.
+    /// one of the primary or derived metric names (run
+    /// `host-state metric-list` for the full vocabulary) and
+    /// `dir` is `asc` or `desc` (default `desc`). Show ranks
+    /// groups by the tuple of the named metric's *absolute
+    /// aggregated value* (not a delta — there is only one
+    /// snapshot to inspect), descending by default; rows within
+    /// a group keep registry order. Empty (the default) keeps
+    /// the alphabetical group-key iteration. Example:
+    /// `--sort-by run_time_ns,wait_sum:asc`.
     #[arg(long, default_value = "")]
     pub sort_by: String,
 }
@@ -799,15 +819,15 @@ fn write_show<W: std::fmt::Write>(
         keys
     };
 
-    for key in group_order {
-        let group = &groups[key];
+    for key in &group_order {
+        let group = &groups[*key];
         // Display key: pattern grouping under Comm uses grex to
         // turn the join-key skeleton into a regex label; every
         // other grouping renders the join key directly.
         let display_key = if group_by == host_state_compare::GroupBy::Comm && !no_thread_normalize {
             host_state_compare::pattern_display_label(key, &group.member_comms)
         } else {
-            key.clone()
+            (*key).clone()
         };
         for metric in host_state_compare::HOST_STATE_METRICS {
             let Some(agg) = group.metrics.get(metric.name) else {
@@ -816,12 +836,49 @@ fn write_show<W: std::fmt::Write>(
             table.add_row(vec![
                 display_key.clone(),
                 group.thread_count.to_string(),
-                metric.name.to_string(),
+                host_state_compare::metric_display_name(metric).into_owned(),
                 host_state_compare::format_value_cell(agg, metric.unit),
             ]);
         }
     }
     writeln!(w, "{table}")?;
+
+    // Derived metrics: one row per (group, derivation) pair.
+    // Mirrors the `## Derived metrics` section emitted by
+    // host_state_compare::write_diff but adapted for the
+    // single-snapshot show layout (no baseline/candidate split,
+    // one value cell per row).
+    if !groups.is_empty() {
+        let mut dt = cli::new_table();
+        dt.set_header(vec![group_header, "threads", "metric", "value"]);
+        // Iterate groups in the same order as the main table —
+        // group_order has been computed once and applies to
+        // every section emitted afterwards.
+        for key in &group_order {
+            let group = &groups[*key];
+            let display_key =
+                if group_by == host_state_compare::GroupBy::Comm && !no_thread_normalize {
+                    host_state_compare::pattern_display_label(key, &group.member_comms)
+                } else {
+                    (*key).clone()
+                };
+            for d in host_state_compare::HOST_STATE_DERIVED_METRICS {
+                let cell = match (d.compute)(&group.metrics) {
+                    Some(v) => host_state_compare::format_derived_value_cell(v, d.unit, d.is_ratio),
+                    None => "-".to_string(),
+                };
+                dt.add_row(vec![
+                    display_key.clone(),
+                    group.thread_count.to_string(),
+                    d.name.to_string(),
+                    cell,
+                ]);
+            }
+        }
+        writeln!(w)?;
+        writeln!(w, "## Derived metrics")?;
+        writeln!(w, "{dt}")?;
+    }
 
     // Cgroup grouping carries cgroup_stats enrichment alongside
     // the per-thread aggregates. Render a second table when
@@ -1580,6 +1637,12 @@ fn main() -> Result<()> {
                     std::process::exit(code);
                 }
             }
+            HostStateCommand::MetricList => {
+                let code = host_state_compare::run_metric_list()?;
+                if code != 0 {
+                    std::process::exit(code);
+                }
+            }
         },
 
         Command::Completions { shell, binary } => {
@@ -2163,6 +2226,74 @@ mod tests {
             !out.contains("(+0"),
             "show cgroup-stats must not carry a `(+0…)` zero-delta tail; \
              got:\n{out}",
+        );
+    }
+
+    /// `write_show` renders the metric column with the
+    /// registry's full tag suffix. Pins that show plumbs
+    /// `metric_display_name` correctly through `Cow::into_owned`
+    /// and that the rendered cell carries the bracketed tag.
+    /// Mirrors the compare-side `write_diff_renders_tagged_metric_cell`
+    /// integration test on the show path.
+    #[test]
+    fn write_show_renders_tagged_metric_cell() {
+        let mut snap = ktstr::host_state::HostStateSnapshot::default();
+        let mut t = ktstr::host_state::ThreadState::default();
+        t.pcomm = "worker".to_string();
+        t.comm = "w".to_string();
+        t.nr_wakeups_affine = 7;
+        snap.threads.push(t);
+        let mut out = String::new();
+        write_show(
+            &mut out,
+            &snap,
+            host_state_compare::GroupBy::Pcomm,
+            &[],
+            false,
+            false,
+            &[],
+        )
+        .expect("write_show into String must not fail");
+        assert!(
+            out.contains("nr_wakeups_affine [cfs-only] [SCHEDSTATS]"),
+            "tagged metric cell missing from rendered show table:\n{out}",
+        );
+    }
+
+    /// `write_show` emits the `## Derived metrics` section
+    /// after the main per-group table. Mirrors the compare-side
+    /// `write_diff_emits_derived_section` integration test.
+    /// Sets the inputs for `avg_slice_ns` (run_time_ns /
+    /// timeslices) on a single thread so the derivation
+    /// resolves to a non-`-` cell, and asserts both the section
+    /// header and the metric name surface in the output.
+    #[test]
+    fn write_show_emits_derived_section() {
+        let mut snap = ktstr::host_state::HostStateSnapshot::default();
+        let mut t = ktstr::host_state::ThreadState::default();
+        t.pcomm = "worker".to_string();
+        t.comm = "w".to_string();
+        t.run_time_ns = 4_000;
+        t.timeslices = 8;
+        snap.threads.push(t);
+        let mut out = String::new();
+        write_show(
+            &mut out,
+            &snap,
+            host_state_compare::GroupBy::Pcomm,
+            &[],
+            false,
+            false,
+            &[],
+        )
+        .expect("write_show into String must not fail");
+        assert!(
+            out.contains("## Derived metrics"),
+            "missing derived section header from show output:\n{out}",
+        );
+        assert!(
+            out.contains("avg_slice_ns"),
+            "missing avg_slice_ns row in derived section of show output:\n{out}",
         );
     }
 
