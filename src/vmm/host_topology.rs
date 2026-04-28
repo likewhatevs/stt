@@ -796,13 +796,13 @@ pub(crate) fn host_allowed_cpus() -> Vec<usize> {
             return override_set;
         }
     }
-    if let Some(cpus) = crate::host_state::read_affinity(0) {
+    if let Some(cpus) = crate::cpu_util::read_affinity(0) {
         return cpus.into_iter().map(|c| c as usize).collect();
     }
     if let Ok(raw) = std::fs::read_to_string("/proc/self/status") {
         for line in raw.lines() {
             if let Some(v) = line.strip_prefix("Cpus_allowed_list:")
-                && let Some(parsed) = crate::host_state::parse_cpu_list(v.trim())
+                && let Some(parsed) = crate::cpu_util::parse_cpu_list(v.trim())
             {
                 return parsed.into_iter().map(|c| c as usize).collect();
             }
