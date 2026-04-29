@@ -1019,6 +1019,7 @@ fn write_show<W: std::fmt::Write>(
                         ctprof_compare::Column::Metric => metric_name.clone(),
                         ctprof_compare::Column::Value => value_cell.clone(),
                         ctprof_compare::Column::Tags => tags_cell.clone(),
+                        ctprof_compare::Column::Uptime => "-".to_string(),
                         _ => "-".to_string(),
                     })
                     .collect();
@@ -1084,6 +1085,7 @@ fn write_show<W: std::fmt::Write>(
                         ctprof_compare::Column::Metric => d.name.to_string(),
                         ctprof_compare::Column::Value => value_cell.clone(),
                         ctprof_compare::Column::Tags => String::new(),
+                        ctprof_compare::Column::Uptime => "-".to_string(),
                         _ => "-".to_string(),
                     })
                     .collect();

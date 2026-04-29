@@ -2172,6 +2172,9 @@ pub struct ThreadGroup {
     /// IS the literal name and there is nothing to expand into a
     /// regex.
     pub members: Vec<String>,
+    /// Average start_time_clock_ticks across group members.
+    /// Lower = older = the group has been alive longer on average.
+    pub avg_start_ticks: u64,
 }
 
 /// One row in the comparison table: `(group, metric)` pair with
@@ -2192,6 +2195,9 @@ pub struct DiffRow {
     pub group_key: String,
     pub thread_count_a: usize,
     pub thread_count_b: usize,
+    /// Relative uptime % for this group (candidate side).
+    /// 100% = as long-lived as the oldest group, 0% = just spawned.
+    pub uptime_pct: Option<f64>,
     pub metric_name: &'static str,
     /// Auto-scale ladder for the row's value/delta cells. Sourced
     /// from `metric.rule.ladder()` at build time so the format
@@ -2649,6 +2655,15 @@ pub fn compare(
 
     let mut diff = CtprofDiff::default();
 
+    // Compute per-snapshot "now" for lifetime calculation:
+    // newest thread's start_time approximates capture time in ticks.
+    let now_b = candidate
+        .threads
+        .iter()
+        .map(|t| t.start_time_clock_ticks)
+        .max()
+        .unwrap_or(0);
+
     for (key, group_a) in &groups_a {
         let Some(group_b) = groups_b.get(key) else {
             diff.only_baseline.push(key.clone());
@@ -2670,6 +2685,8 @@ pub fn compare(
         } else {
             key.clone()
         };
+        // uptime_pct filled in second pass after all groups processed
+
         for metric in CTPROF_METRICS {
             let Some(a) = group_a.metrics.get(metric.name).cloned() else {
                 continue;
@@ -2685,6 +2702,7 @@ pub fn compare(
                 metric,
                 a,
                 b,
+                None, // uptime_pct filled in second pass
             ));
         }
         // Derived metrics: one row per derivation per matched
@@ -2711,6 +2729,24 @@ pub fn compare(
     }
     diff.only_baseline.sort();
     diff.only_candidate.sort();
+
+    // Second pass: fill in uptime_pct. Compute each group's
+    // average thread lifetime (candidate side), then express as
+    // % of the longest-lived group.
+    {
+        let mut group_lifetime: BTreeMap<&str, u64> = BTreeMap::new();
+        for (key, group_b) in &groups_b {
+            if groups_a.contains_key(key) {
+                group_lifetime.insert(key, now_b.saturating_sub(group_b.avg_start_ticks));
+            }
+        }
+        let max_lifetime = group_lifetime.values().copied().max().unwrap_or(1).max(1);
+        for row in &mut diff.rows {
+            if let Some(&lt) = group_lifetime.get(row.group_key.as_str()) {
+                row.uptime_pct = Some(lt as f64 / max_lifetime as f64 * 100.0);
+            }
+        }
+    }
 
     if opts.sort_by.is_empty() {
         // Default: stable-sort by descending |delta_pct|, ties
@@ -2911,6 +2947,7 @@ pub fn build_cgroup_key_map(
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_row(
     key: &str,
     display_key: &str,
@@ -2919,6 +2956,7 @@ fn build_row(
     metric: &'static CtprofMetricDef,
     a: Aggregated,
     b: Aggregated,
+    uptime_pct: Option<f64>,
 ) -> DiffRow {
     let (delta, delta_pct) = match (a.numeric(), b.numeric()) {
         (Some(va), Some(vb)) => {
@@ -2936,6 +2974,7 @@ fn build_row(
         group_key: key.to_string(),
         thread_count_a: n_a,
         thread_count_b: n_b,
+        uptime_pct,
         metric_name: metric.name,
         metric_ladder: metric.rule.ladder(),
         baseline: a,
@@ -3434,6 +3473,16 @@ pub fn build_groups(
             }
             None => Vec::new(),
         };
+        let valid_starts: Vec<u64> = threads
+            .iter()
+            .map(|t| t.start_time_clock_ticks)
+            .filter(|&t| t > 0)
+            .collect();
+        let avg_start_ticks = if valid_starts.is_empty() {
+            0
+        } else {
+            valid_starts.iter().sum::<u64>() / valid_starts.len() as u64
+        };
         out.insert(
             key.clone(),
             ThreadGroup {
@@ -3442,6 +3491,7 @@ pub fn build_groups(
                 metrics,
                 cgroup_stats,
                 members,
+                avg_start_ticks,
             },
         );
     }
@@ -4611,6 +4661,11 @@ pub enum Column {
     /// Bracketed tag suffix (sched_class + config_gates + dead).
     /// Off by default — opt in with `--columns ...,tags`.
     Tags,
+    /// Relative uptime: group age as a percentage of the oldest
+    /// thread in the snapshot. 100% = as old as the oldest
+    /// thread, 0% = just spawned. Color gradient: green ≥50%,
+    /// red <50% (>2x younger than the oldest).
+    Uptime,
 }
 
 impl Column {
@@ -4628,6 +4683,7 @@ impl Column {
             Column::Arrow => "arrow",
             Column::Value => "value",
             Column::Tags => "tags",
+            Column::Uptime => "uptime",
         }
     }
 
@@ -4646,6 +4702,7 @@ impl Column {
             Column::Arrow => "value",
             Column::Value => "value",
             Column::Tags => "tags",
+            Column::Uptime => "%uptime",
         }
     }
 }
@@ -4664,7 +4721,7 @@ fn compare_columns_for(format: DisplayFormat) -> Vec<Column> {
         ],
         DisplayFormat::DeltaOnly => &[Column::Delta, Column::Pct],
         DisplayFormat::NoPct => &[Column::Baseline, Column::Candidate, Column::Delta],
-        DisplayFormat::Arrow => &[Column::Arrow, Column::Delta, Column::Pct],
+        DisplayFormat::Arrow => &[Column::Arrow, Column::Delta, Column::Pct, Column::Uptime],
         DisplayFormat::PctOnly => &[Column::Pct],
     };
     cols.extend_from_slice(trailing);
@@ -4719,6 +4776,7 @@ pub fn parse_columns(spec: &str, compare_side: bool) -> anyhow::Result<Vec<Colum
             Column::Pct,
             Column::Arrow,
             Column::Tags,
+            Column::Uptime,
         ]
     } else {
         &[
@@ -4727,6 +4785,7 @@ pub fn parse_columns(spec: &str, compare_side: bool) -> anyhow::Result<Vec<Colum
             Column::Metric,
             Column::Value,
             Column::Tags,
+            Column::Uptime,
         ]
     };
     let valid_names = allowed
@@ -5294,10 +5353,27 @@ fn render_diff_row_cells(row: &DiffRow, columns: &[Column]) -> Vec<String> {
             // rather than panic.
             Column::Value => "-".to_string(),
             Column::Tags => metric_tags(metric_def),
+            Column::Uptime => match row.uptime_pct {
+                Some(pct) => format!("{pct:.0}%"),
+                None => "-".to_string(),
+            },
         };
         cells.push(cell);
     }
     cells
+}
+
+/// Format an uptime % cell with ANSI color: green ≥75%, yellow
+/// 50-75%, red <50%.
+pub fn color_uptime_cell(cell: String, pct: Option<f64>) -> comfy_table::Cell {
+    use comfy_table::Color;
+    let color = match pct {
+        Some(p) if p >= 75.0 => Color::Green,
+        Some(p) if p >= 50.0 => Color::Yellow,
+        Some(_) => Color::Red,
+        None => Color::White,
+    };
+    comfy_table::Cell::new(cell).fg(color)
 }
 
 /// Wrap a string-cell row in [`comfy_table::Cell`]s with blue
@@ -5355,6 +5431,7 @@ fn render_derived_row_cells(row: &DerivedRow, columns: &[Column]) -> Vec<String>
             Column::Arrow => format_arrow_cell_derived(row),
             Column::Value => "-".to_string(),
             Column::Tags => String::new(),
+            Column::Uptime => "-".to_string(),
         };
         cells.push(cell);
     }
@@ -5975,7 +6052,18 @@ pub fn write_diff<W: fmt::Write>(
             if !display.is_section_enabled(metric.section) {
                 continue;
             }
-            let cells = render_diff_row_cells(row, &columns);
+            let string_cells = render_diff_row_cells(row, &columns);
+            let cells: Vec<comfy_table::Cell> = string_cells
+                .into_iter()
+                .zip(columns.iter())
+                .map(|(s, col)| {
+                    if *col == Column::Uptime {
+                        color_uptime_cell(s, row.uptime_pct)
+                    } else {
+                        comfy_table::Cell::new(s)
+                    }
+                })
+                .collect();
             table.add_row(cells);
         }
         writeln!(w, "{table}")?;
@@ -13220,6 +13308,7 @@ mod tests {
             delta: Some(delta),
             delta_pct: None,
             display_key: group.into(),
+            uptime_pct: None,
         };
         let mut rows = vec![
             mk_row("A", "run_time_ns", 1000.0),
@@ -13270,6 +13359,7 @@ mod tests {
             delta: Some(delta),
             delta_pct: None,
             display_key: group.into(),
+            uptime_pct: None,
         };
         let mut rows = vec![
             // A and B tie on run_time_ns (both 500). Use wait_sum
@@ -13313,6 +13403,7 @@ mod tests {
             delta: Some(delta),
             delta_pct: None,
             display_key: group.into(),
+            uptime_pct: None,
         };
         let mut rows = vec![
             mk_row("A", "run_time_ns", 1000.0),
@@ -13395,6 +13486,7 @@ mod tests {
             delta: Some(delta),
             delta_pct: None,
             display_key: group.into(),
+            uptime_pct: None,
         };
         // Three groups with IDENTICAL deltas — only the
         // group_key tie-break can deterministically order them.
@@ -13443,6 +13535,7 @@ mod tests {
             delta,
             delta_pct: None,
             display_key: group.into(),
+            uptime_pct: None,
         };
         let mut rows = vec![
             // alpha has a real run_time_ns delta.
@@ -13492,6 +13585,7 @@ mod tests {
             delta,
             delta_pct: None,
             display_key: group.into(),
+            uptime_pct: None,
         };
         let mut rows = vec![
             // alpha has a real (positive) run_time_ns delta.
@@ -13553,6 +13647,7 @@ mod tests {
             delta: None,
             delta_pct: None,
             display_key: group.into(),
+            uptime_pct: None,
         };
         let mut rows = vec![mk_row("alpha", "policy"), mk_row("bravo", "policy")];
         // Sort by run_time_ns — neither group has it, both fall
@@ -13594,6 +13689,7 @@ mod tests {
             delta: Some(delta),
             delta_pct: None,
             display_key: group.into(),
+            uptime_pct: None,
         };
         // Use four metrics from the scheduling block in their
         // registry order: run_time_ns (idx 6), wait_time_ns (7),
@@ -13647,6 +13743,7 @@ mod tests {
             delta: Some(delta),
             delta_pct: None,
             display_key: group.into(),
+            uptime_pct: None,
         };
         let mut rows = vec![
             mk_row("alpha", "run_time_ns", f64::NAN),
