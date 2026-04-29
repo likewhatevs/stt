@@ -3434,18 +3434,10 @@ pub fn build_groups(
                     Some(k) => k.clone(),
                     None => cg,
                 };
-                let pcomm_key = match pattern_field {
-                    Some(field) => {
-                        let name = field(t);
-                        let pk = pattern_key(name);
-                        let counts = counts_ref.expect("pattern_counts seeded for All");
-                        if counts.get(&pk).copied().unwrap_or(0) >= 2 {
-                            pk
-                        } else {
-                            name.to_string()
-                        }
-                    }
-                    None => t.pcomm.clone(),
+                let pcomm_key = if no_thread_normalize {
+                    t.pcomm.clone()
+                } else {
+                    pattern_key(&t.pcomm)
                 };
                 format!("{cg_key}\x00{pcomm_key}")
             }
