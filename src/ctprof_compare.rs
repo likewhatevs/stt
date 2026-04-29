@@ -6547,14 +6547,14 @@ pub fn write_diff<W: fmt::Write>(
             }
 
             let mut last_segs: Vec<&str> = Vec::new();
-            let depth_ansi = |d: usize| -> &str {
+            let mut last_pcomm_s = "";
+            let depth_color = |d: usize| -> comfy_table::Color {
                 match d {
-                    0 => "\x1b[1;32m",
-                    1 => "\x1b[36m",
-                    _ => "\x1b[90m",
+                    0 => comfy_table::Color::Green,
+                    1 => comfy_table::Color::Cyan,
+                    _ => comfy_table::Color::DarkGrey,
                 }
             };
-            let mut has_rows = false;
 
             for pkey in &sorted_keys {
                 let (cg_part, display_process) = if is_compound {
@@ -6571,18 +6571,44 @@ pub fn write_diff<W: fmt::Write>(
                         .take_while(|(a, b)| a == b)
                         .count();
                     if common < last_segs.len() || segs.len() > last_segs.len() {
-                        if has_rows {
-                            writeln!(w, "{st}")?;
-                            st = display.new_table();
-                            st.set_header(colored_header(&columns, "process"));
-                            has_rows = false;
-                        }
                         for (depth, seg) in segs.iter().enumerate().skip(common) {
                             let indent = "  ".repeat(depth);
-                            let color = depth_ansi(depth);
-                            writeln!(w, "{color}{indent}{seg}\x1b[0m")?;
+                            let label = format!("{indent}{seg}");
+                            let hcells: Vec<comfy_table::Cell> = columns
+                                .iter()
+                                .map(|c| {
+                                    if *c == Column::Group {
+                                        comfy_table::Cell::new(&label)
+                                            .fg(depth_color(depth))
+                                            .add_attribute(comfy_table::Attribute::Bold)
+                                    } else {
+                                        comfy_table::Cell::new("")
+                                    }
+                                })
+                                .collect();
+                            st.add_row(hcells);
                         }
                         last_segs = segs;
+                        last_pcomm_s = "";
+                    }
+                    if display_process != last_pcomm_s {
+                        let cg_depth = last_segs.len();
+                        let indent = "  ".repeat(cg_depth);
+                        let label = format!("{indent}{display_process}");
+                        let hcells: Vec<comfy_table::Cell> = columns
+                            .iter()
+                            .map(|c| {
+                                if *c == Column::Group {
+                                    comfy_table::Cell::new(&label)
+                                        .fg(comfy_table::Color::White)
+                                        .add_attribute(comfy_table::Attribute::Bold)
+                                } else {
+                                    comfy_table::Cell::new("")
+                                }
+                            })
+                            .collect();
+                        st.add_row(hcells);
+                        last_pcomm_s = display_process;
                     }
                 }
 
@@ -6663,12 +6689,9 @@ pub fn write_diff<W: fmt::Write>(
                         })
                         .collect();
                     st.add_row(row_cells);
-                    has_rows = true;
                 }
             }
-            if has_rows {
-                writeln!(w, "{st}")?;
-            }
+            writeln!(w, "{st}")?;
         }
     }
 
