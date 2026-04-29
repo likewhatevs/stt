@@ -6543,6 +6543,9 @@ pub fn write_diff<W: fmt::Write>(
                 .then_with(|| max_field_for(b, "Rss").cmp(&max_field_for(a, "Rss")))
                 .then_with(|| a.cmp(b))
         });
+        if display.section_line_limit > 0 {
+            sorted_process_keys.truncate(display.section_line_limit);
+        }
 
         // Pre-pass: any (process, key) pair with a non-equal
         // delta? Suppresses the section header when nothing
