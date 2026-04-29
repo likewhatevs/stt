@@ -6553,10 +6553,22 @@ pub fn write_diff<W: fmt::Write>(
                     }
                 })
                 .collect();
+            let mut leaf_score: BTreeMap<(&str, &str), f64> = BTreeMap::new();
+            for h in &hier {
+                let score = h.row.sort_key().abs();
+                let entry = leaf_score.entry((h.cgroup, h.pcomm)).or_insert(0.0_f64);
+                if score > *entry {
+                    *entry = score;
+                }
+            }
             hier.sort_by(|a, b| {
                 a.cgroup
                     .cmp(b.cgroup)
-                    .then_with(|| a.pcomm.cmp(b.pcomm))
+                    .then_with(|| {
+                        let sa = leaf_score.get(&(a.cgroup, a.pcomm)).copied().unwrap_or(0.0);
+                        let sb = leaf_score.get(&(b.cgroup, b.pcomm)).copied().unwrap_or(0.0);
+                        sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+                    })
                     .then_with(|| {
                         b.row
                             .sort_key()
@@ -6769,10 +6781,22 @@ pub fn write_diff<W: fmt::Write>(
                     }
                 })
                 .collect();
+            let mut leaf_score: BTreeMap<(&str, &str), f64> = BTreeMap::new();
+            for h in &hier {
+                let score = h.row.sort_key().abs();
+                let entry = leaf_score.entry((h.cgroup, h.pcomm)).or_insert(0.0_f64);
+                if score > *entry {
+                    *entry = score;
+                }
+            }
             hier.sort_by(|a, b| {
                 a.cgroup
                     .cmp(b.cgroup)
-                    .then_with(|| a.pcomm.cmp(b.pcomm))
+                    .then_with(|| {
+                        let sa = leaf_score.get(&(a.cgroup, a.pcomm)).copied().unwrap_or(0.0);
+                        let sb = leaf_score.get(&(b.cgroup, b.pcomm)).copied().unwrap_or(0.0);
+                        sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+                    })
                     .then_with(|| {
                         b.row
                             .sort_key()
