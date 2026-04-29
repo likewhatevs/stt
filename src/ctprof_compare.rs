@@ -5395,6 +5395,17 @@ pub fn color_diff_cell(
     }
 }
 
+/// Extract the parent directory and leaf segment of a cgroup path.
+/// `/system.slice/foo.service` → (`/system.slice`, `foo.service`).
+/// `/` → (`/`, `/`). Empty → (``, ``).
+fn cgroup_parent_leaf(path: &str) -> (&str, &str) {
+    match path.rfind('/') {
+        Some(0) => ("/", &path[1..]),
+        Some(i) => (&path[..i], &path[i + 1..]),
+        None => ("", path),
+    }
+}
+
 /// Build a colored header row — cyan foreground so headers are
 /// visually distinct from data rows.
 pub fn colored_header(columns: &[Column], group_header: &'static str) -> Vec<comfy_table::Cell> {
@@ -6053,41 +6064,67 @@ pub fn write_diff<W: fmt::Write>(
     if display.is_section_enabled(Section::Primary)
         || display.is_section_enabled(Section::TaskstatsDelay)
     {
-        writeln!(w, "## Primary metrics")?;
-        let mut table = display.new_table();
-        table.set_header(colored_header(&columns, group_header));
-        for row in &diff.rows {
-            // `--metrics` filter: skip rows whose metric is not
-            // on the requested allowlist. Empty allowlist = no
-            // filter (every row renders) per
-            // `is_metric_enabled`'s default-empty contract.
-            if !display.is_metric_enabled(row.metric_name) {
-                continue;
+        // Filter rows first.
+        let primary_rows: Vec<&DiffRow> = diff
+            .rows
+            .iter()
+            .filter(|row| {
+                if !display.is_metric_enabled(row.metric_name) {
+                    return false;
+                }
+                let metric = CTPROF_METRICS
+                    .iter()
+                    .find(|m| m.name == row.metric_name)
+                    .expect("metric_name comes from CTPROF_METRICS via build_row");
+                display.is_section_enabled(metric.section)
+            })
+            .collect();
+
+        if group_by == GroupBy::Cgroup {
+            // Hierarchical cgroup rendering: group rows by parent
+            // path, emit a sub-heading per parent, show only the
+            // leaf segment in the group column.
+            let mut by_parent: BTreeMap<&str, Vec<&DiffRow>> = BTreeMap::new();
+            for row in &primary_rows {
+                let (parent, _) = cgroup_parent_leaf(&row.display_key);
+                by_parent.entry(parent).or_default().push(row);
             }
-            // Per-row section gate: skip rows whose
-            // `metric.section` is not enabled by the
-            // `--sections` filter. Mirrors the pattern used by
-            // the outer per-section gates below; the metric
-            // lookup returns `&'static CtprofMetricDef` from
-            // `CTPROF_METRICS` (cheap pointer indirection — no
-            // allocation per row) using the same name-keyed
-            // search `render_diff_row_cells` already performs.
-            let metric = CTPROF_METRICS
-                .iter()
-                .find(|m| m.name == row.metric_name)
-                .expect("metric_name comes from CTPROF_METRICS via build_row");
-            if !display.is_section_enabled(metric.section) {
-                continue;
+            for (parent, rows) in &by_parent {
+                writeln!(w)?;
+                writeln!(w, "\x1b[1;32m## {parent}\x1b[0m")?;
+                let mut table = display.new_table();
+                table.set_header(colored_header(&columns, "cgroup"));
+                for row in rows {
+                    let (_, leaf) = cgroup_parent_leaf(&row.display_key);
+                    let mut string_cells = render_diff_row_cells(row, &columns);
+                    // Replace group cell with leaf segment.
+                    if let Some(pos) = columns.iter().position(|c| *c == Column::Group) {
+                        string_cells[pos] = leaf.to_string();
+                    }
+                    let cells: Vec<comfy_table::Cell> = string_cells
+                        .into_iter()
+                        .zip(columns.iter())
+                        .map(|(s, col)| color_diff_cell(s, *col, row.delta, row.uptime_pct))
+                        .collect();
+                    table.add_row(cells);
+                }
+                writeln!(w, "{table}")?;
             }
-            let string_cells = render_diff_row_cells(row, &columns);
-            let cells: Vec<comfy_table::Cell> = string_cells
-                .into_iter()
-                .zip(columns.iter())
-                .map(|(s, col)| color_diff_cell(s, *col, row.delta, row.uptime_pct))
-                .collect();
-            table.add_row(cells);
+        } else {
+            writeln!(w, "## Primary metrics")?;
+            let mut table = display.new_table();
+            table.set_header(colored_header(&columns, group_header));
+            for row in &primary_rows {
+                let string_cells = render_diff_row_cells(row, &columns);
+                let cells: Vec<comfy_table::Cell> = string_cells
+                    .into_iter()
+                    .zip(columns.iter())
+                    .map(|(s, col)| color_diff_cell(s, *col, row.delta, row.uptime_pct))
+                    .collect();
+                table.add_row(cells);
+            }
+            writeln!(w, "{table}")?;
         }
-        writeln!(w, "{table}")?;
     }
 
     // Derived-table outer gate mirrors the primary-table pattern:
