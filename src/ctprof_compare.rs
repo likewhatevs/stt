@@ -7005,39 +7005,47 @@ pub fn write_diff<W: fmt::Write>(
         writeln!(w, "{at}")?;
     }
 
-    let format_only_key = |k: &str| -> String {
+    let write_only_list = |w: &mut W, label: &str, path: &Path, keys: &[String]| -> fmt::Result {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        writeln!(
+            w,
+            "\n{} group(s) only in {label} ({}):",
+            keys.len(),
+            path.display()
+        )?;
         if group_by == GroupBy::All {
-            if let Some((cg, pc)) = k.split_once('\x00') {
-                format!("{cg} :: {pc}")
-            } else {
-                k.to_string()
+            let mut sorted: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+            sorted.sort();
+            let mut last_segs: Vec<&str> = Vec::new();
+            for k in &sorted {
+                let (cg, pc) = k.split_once('\x00').unwrap_or(("", k));
+                let segs: Vec<&str> = cg.split('/').filter(|s| !s.is_empty()).collect();
+                let common = segs
+                    .iter()
+                    .zip(last_segs.iter())
+                    .take_while(|(a, b)| a == b)
+                    .count();
+                if common < last_segs.len() || segs.len() > last_segs.len() {
+                    for (depth, seg) in segs.iter().enumerate().skip(common) {
+                        let indent = "  ".repeat(depth + 1);
+                        writeln!(w, "{indent}{seg}")?;
+                    }
+                    last_segs = segs;
+                }
+                let indent = "  ".repeat(last_segs.len() + 1);
+                writeln!(w, "{indent}{pc}")?;
             }
         } else {
-            k.to_string()
+            for k in keys {
+                writeln!(w, "  {k}")?;
+            }
         }
+        Ok(())
     };
-    if !diff.only_baseline.is_empty() {
-        writeln!(
-            w,
-            "\n{} group(s) only in baseline ({}):",
-            diff.only_baseline.len(),
-            baseline_path.display()
-        )?;
-        for k in &diff.only_baseline {
-            writeln!(w, "  {}", format_only_key(k))?;
-        }
-    }
-    if !diff.only_candidate.is_empty() {
-        writeln!(
-            w,
-            "\n{} group(s) only in candidate ({}):",
-            diff.only_candidate.len(),
-            candidate_path.display()
-        )?;
-        for k in &diff.only_candidate {
-            writeln!(w, "  {}", format_only_key(k))?;
-        }
-    }
+    write_only_list(w, "baseline", baseline_path, &diff.only_baseline)?;
+    write_only_list(w, "candidate", candidate_path, &diff.only_candidate)?;
     Ok(())
 }
 
