@@ -6177,7 +6177,12 @@ pub fn write_diff<W: fmt::Write>(
                 a.cgroup
                     .cmp(b.cgroup)
                     .then_with(|| a.pcomm.cmp(b.pcomm))
-                    .then_with(|| a.comm.cmp(b.comm))
+                    .then_with(|| {
+                        b.row
+                            .sort_key()
+                            .partial_cmp(&a.row.sort_key())
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
             });
 
             // Single table with separator rows for cgroup headings.
@@ -6369,7 +6374,12 @@ pub fn write_diff<W: fmt::Write>(
                 a.cgroup
                     .cmp(b.cgroup)
                     .then_with(|| a.pcomm.cmp(b.pcomm))
-                    .then_with(|| a.comm.cmp(b.comm))
+                    .then_with(|| {
+                        b.row
+                            .sort_key()
+                            .partial_cmp(&a.row.sort_key())
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
             });
 
             writeln!(w)?;
