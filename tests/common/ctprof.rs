@@ -57,8 +57,8 @@ pub fn snapshot(
 /// Build a `CgroupStats` entry from raw counter values. Same
 /// `#[non_exhaustive]` constraint as `snapshot` — populate via
 /// `Default::default()` + per-field assignment. Reaches into
-/// the nested-controller shape introduced in #61: cpu counters
-/// land on the `cpu` sub-struct, memory.current on `memory`.
+/// the nested-controller shape: cpu counters land on the `cpu`
+/// sub-struct, memory.current on `memory`.
 #[allow(dead_code)]
 pub fn cgroup_stats_entry(
     cpu_usage_usec: u64,

@@ -2687,7 +2687,7 @@ Hugepagesize:       2048 kB
     /// test's window are its own five `collect_host_context()`
     /// calls. Under `cargo test` (shared-process, thread-parallel)
     /// a sibling test calling `collect_host_context()` in parallel
-    /// would skew the deltas. The CLAUDE.md rule "always use
+    /// would skew the deltas. The project rule "always use
     /// `cargo nextest run`, never `cargo test`" is what keeps this
     /// assumption load-bearing; a future migration away from
     /// nextest would need to re-assess this test's atomic-delta

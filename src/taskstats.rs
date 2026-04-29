@@ -37,7 +37,7 @@
 //! parser handles short-payload cases by treating absent bytes as
 //! zero.
 //!
-//! # Adversarial caveats from #28's research
+//! # Per-bucket caveats from kernel-source research
 //!
 //! - `cpu_delay` is RACY: count + delay_total are not updated
 //!   atomically (sched_info path, no lock). The other seven

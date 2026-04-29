@@ -2808,9 +2808,8 @@ static TOKEN_RULE_DIGITS_ALPHA_SUFFIX: LazyLock<Regex> =
 /// ([`pattern_key`]) walks segments produced by
 /// [`split_into_segments`] and applies the first rule that
 /// matches each token. Rules are checked in order; the first
-/// match wins. Rule patterns mirror the spec's regex syntax
-/// verbatim ([`/tmp/threadnormspec.md`]) so the implementation
-/// reads as a direct translation of the spec.
+/// match wins. Rule patterns are direct regex translations of
+/// the thread-name normalization rules.
 fn classify_token(t: &str) -> String {
     if t.is_empty() {
         return String::new();
@@ -3723,10 +3722,10 @@ fn merge_psi_half(a: PsiHalf, b: PsiHalf) -> PsiHalf {
 }
 
 /// Merge two [`CgroupCpuStats`]: counters use `saturating_add`,
-/// limits/knobs use the max-for-limits / max-for-weights rule
-/// from #61's Q4 ruling. Floors don't apply here (none in this
-/// domain). `period` takes the larger value as a stable
-/// fallback when contributors set different periods.
+/// limits/knobs use the max-for-limits / max-for-weights rule.
+/// Floors don't apply here (none in this domain). `period`
+/// takes the larger value as a stable fallback when
+/// contributors set different periods.
 fn merge_cgroup_cpu(agg: &mut CgroupCpuStats, src: &CgroupCpuStats) {
     agg.usage_usec = agg.usage_usec.saturating_add(src.usage_usec);
     agg.nr_throttled = agg.nr_throttled.saturating_add(src.nr_throttled);
@@ -6030,7 +6029,7 @@ pub fn write_diff<W: fmt::Write>(
     // neither side has any smaps_rollup data; per-row gate
     // skips rows where baseline equals candidate (treats
     // absent and 0 as equal). Mirrors the memory.stat compare
-    // layout from #61.
+    // layout.
     if display.is_section_enabled(Section::Smaps)
         && (!diff.smaps_rollup_a.is_empty() || !diff.smaps_rollup_b.is_empty())
     {
@@ -6934,9 +6933,9 @@ mod tests {
 
     /// `merge_memory_stat` per-key dispatch: gauge keys (per
     /// [`MEMORY_STAT_GAUGE_KEYS`]) take max; counter keys take
-    /// saturating_add. Pins the BLOCKER fix from #61's
-    /// fix-round-1 — summing instantaneous pool sizes
-    /// (anon, file, slab) overstates the merged-bucket gauge.
+    /// saturating_add. Summing instantaneous pool sizes
+    /// (anon, file, slab) overstates the merged-bucket gauge,
+    /// so the gauge keys take max instead.
     #[test]
     fn merge_memory_stat_dispatches_gauge_vs_counter() {
         let mut agg: BTreeMap<String, u64> = BTreeMap::new();
@@ -7104,7 +7103,7 @@ mod tests {
         assert_eq!(agg.memory.low, None, "any no-floor → bucket unprotected");
     }
 
-    /// F14 per-row gate: a cgroup with counter data but no
+    /// Per-row gate: a cgroup with counter data but no
     /// caps / weight / pids accounting must NOT contribute a
     /// row to the "## Cgroup limits / knobs" sub-table. The
     /// cgroup-stats primary table still mentions it, but the
@@ -7171,7 +7170,7 @@ mod tests {
         );
     }
 
-    /// F13 memory.stat unchanged-row suppression: a key that
+    /// memory.stat unchanged-row suppression: a key that
     /// carries the same value on both sides must NOT appear in
     /// the rendered memory.stat sub-table; a key that changed
     /// MUST appear. Pins the baseline-vs-candidate equality
@@ -7218,8 +7217,8 @@ mod tests {
         );
     }
 
-    /// F13 memory.events unchanged-row suppression: same
-    /// pattern as memory.stat — only changed events surface.
+    /// memory.events unchanged-row suppression: same pattern
+    /// as memory.stat — only changed events surface.
     #[test]
     fn write_diff_memory_events_skips_unchanged_rows() {
         let mut diff = CtprofDiff::default();
@@ -8044,7 +8043,7 @@ mod tests {
     // depending on a live registered metric).
 
     // ------------------------------------------------------------
-    // DisplayFormat / Column / parse_columns (#55/#18)
+    // DisplayFormat / Column / parse_columns
     // ------------------------------------------------------------
 
     /// Build a one-thread snapshot pair where every column has
@@ -8882,7 +8881,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------
-    // Derived metrics (#53)
+    // Derived metrics
     // ------------------------------------------------------------
 
     /// `affine_success_ratio` = nr_wakeups_affine /
@@ -9095,7 +9094,7 @@ mod tests {
         assert_eq!(row.baseline, Some(DerivedValue::Scalar(3000.0)));
     }
 
-    /// T-S1: every per-category `avg_<bucket>_delay_ns` row
+    /// Every per-category `avg_<bucket>_delay_ns` row
     /// computes `total / count` correctly. One thread, distinct
     /// (count, total) pair per bucket so a row that mixed up
     /// numerator and denominator (or pulled from the wrong
@@ -9152,7 +9151,7 @@ mod tests {
         }
     }
 
-    /// T-S2: `total_offcpu_delay_ns` sums every bucket and OR's
+    /// `total_offcpu_delay_ns` sums every bucket and OR's
     /// (swapin, thrashing) via `.max()`. Two test cases to pin
     /// the .max() behavior in both directions:
     ///
@@ -9223,7 +9222,7 @@ mod tests {
         );
     }
 
-    /// T-S4: each `avg_<bucket>_delay_ns` compute closure
+    /// Each `avg_<bucket>_delay_ns` compute closure
     /// returns `None` when EITHER input is missing from the
     /// metrics map. Pulls the closure directly out of
     /// `CTPROF_DERIVED_METRICS` and exercises it with a
@@ -11131,12 +11130,11 @@ mod tests {
     }
 
     /// AlphaPrefix grouping (no separator before trailing digits)
-    /// clusters CamelCase names that share a prefix. This is the
-    /// gap-1 fix: 176 `CamelCaseWord{0..175}` threads (one per CPU)
-    /// previously stayed literal under the separator gate; now they
-    /// collapse into one bucket. Pin the bucket count and exact
-    /// member count to defend against a regression that
-    /// reintroduces the separator gate.
+    /// clusters CamelCase names that share a prefix. 176
+    /// `CamelCaseWord{0..175}` threads (one per CPU) collapse
+    /// into one bucket — pin the bucket count and exact member
+    /// count to defend against a regression that reintroduces
+    /// the separator gate.
     #[test]
     fn build_groups_comm_alpha_prefix_clusters_camelcase() {
         let mut threads = Vec::new();
@@ -11418,9 +11416,10 @@ mod tests {
     }
 
     // ------------------------------------------------------------
-    // Token-based normalizer tests (per /tmp/threadnormspec.md
-    // and /tmp/cgroupingspec.md). The expected groupings below
-    // are taken verbatim from the spec test data.
+    // Token-based normalizer tests for thread-name and cgroup-path
+    // grouping. Each test pins one expected (input, normalized
+    // bucket key) pair so a regression in `pattern_key` /
+    // `flatten_cgroup_path` surfaces as a localized failure.
     // ------------------------------------------------------------
 
     /// Token classifier: pure digits → `{N}` (rule 1).
@@ -11578,8 +11577,8 @@ mod tests {
         assert_eq!(pattern_key("kworker/0:1-events"), "kworker/{N}:{N}-events",);
     }
 
-    /// Spec test data verbatim: 14 multi-member buckets and 13
-    /// singletons from `/tmp/threadnormspec.md`. Every input
+    /// Reference test data: 14 multi-member buckets and 13
+    /// singletons covering every classifier rule. Every input
     /// thread name produces the exact expected normalized form;
     /// every bucket has the exact expected member count.
     #[test]
@@ -11849,7 +11848,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------
-    // Cgroup normalization tests (per /tmp/cgroupingspec.md).
+    // Cgroup normalization tests.
     // ------------------------------------------------------------
 
     /// Layer 1: systemd template normalization. Instances without
@@ -12110,7 +12109,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------
-    // auto_scale + render-cell tests (#22): unit-aware magnitude
+    // auto_scale + render-cell tests: unit-aware magnitude
     // scaling for ns / B / ticks / unitless cells.
     // ------------------------------------------------------------
 
@@ -12380,7 +12379,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------
-    // parse_sort_by + multi-key sort tests (#17)
+    // parse_sort_by + multi-key sort tests
     // ------------------------------------------------------------
 
     /// Empty `--sort-by` value parses to an empty Vec — caller

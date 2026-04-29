@@ -1709,7 +1709,7 @@ impl ThreadState {
 /// per-domain (max for limits, min for floors, saturating_add
 /// for counters) without conflating across domains.
 ///
-/// **Schema break (#61):** the previous flat shape (4 fields:
+/// Schema note: the previous flat shape (4 fields:
 /// `cpu_usage_usec`, `nr_throttled`, `throttled_usec`,
 /// `memory_current`) is gone. Snapshots written by older
 /// versions deserialize via serde's defaulting — old fields
@@ -5711,9 +5711,9 @@ mod tests {
     /// [`parse_max_or_u64`]: literal "max" means "maximum
     /// protection" → `Some(u64::MAX)` (NOT `None`). `None` is
     /// reserved for absent-file / malformed input. The
-    /// asymmetry vs. limits is the BLOCKER fix from #61's
-    /// fix-round-1: `merge_min_option(Some(u64::MAX), Some(5G))`
-    /// then yields 5G instead of None — preserving the lower
+    /// asymmetry vs. limits is load-bearing for the merge
+    /// step: `merge_min_option(Some(u64::MAX), Some(5G))`
+    /// yields 5G instead of None — preserving the lower
     /// concrete floor when one contributor has full protection.
     #[test]
     fn parse_floor_value_treats_max_as_full_protection() {
@@ -5750,10 +5750,10 @@ mod tests {
         assert_eq!(parse_cpu_max("max 100000\n"), (None, 100_000));
     }
 
-    /// Stage a synthetic cgroup tree with every #61 file present
-    /// and verify [`read_cgroup_stats_at`] populates the nested
-    /// struct end-to-end. Pins file-naming, parse-routing, and
-    /// the absent-vs-no-limit distinction.
+    /// Stage a synthetic cgroup tree with every captured cgroup v2
+    /// file present and verify [`read_cgroup_stats_at`] populates
+    /// the nested struct end-to-end. Pins file-naming, parse-routing,
+    /// and the absent-vs-no-limit distinction.
     #[test]
     fn read_cgroup_stats_at_populates_nested_controllers_end_to_end() {
         let cgroup_root = tempfile::TempDir::new().unwrap();
