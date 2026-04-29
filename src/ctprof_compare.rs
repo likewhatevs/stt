@@ -6659,8 +6659,8 @@ pub fn write_diff<W: fmt::Write>(
                     };
                     let cg_depth = last_segs.len();
                     let group_label = format!("{}  {}", "  ".repeat(cg_depth + 1), display_process);
-                    let delta_opt: Option<f64> = if av.is_some() && bv.is_some() {
-                        Some(delta as f64)
+                    let delta_pct_opt: Option<f64> = if a_val > 0 && av.is_some() && bv.is_some() {
+                        Some(delta as f64 / a_val as f64)
                     } else {
                         None
                     };
@@ -6680,7 +6680,7 @@ pub fn write_diff<W: fmt::Write>(
                     let cells: Vec<comfy_table::Cell> = string_cells
                         .into_iter()
                         .zip(columns.iter())
-                        .map(|(s, col)| color_diff_cell(s, *col, delta_opt, None))
+                        .map(|(s, col)| color_diff_cell(s, *col, delta_pct_opt, None))
                         .collect();
                     st.add_row(cells);
                 }
