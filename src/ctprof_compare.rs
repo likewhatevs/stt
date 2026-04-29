@@ -5495,7 +5495,7 @@ pub struct CtprofCompareArgs {
     /// `--no-thread-normalize` to disable that collapse and group
     /// by literal `comm` / `pcomm` instead. `comm-exact` is a
     /// synonym for `comm --no-thread-normalize`.
-    #[arg(long, value_enum, default_value_t = GroupBy::Pcomm, help_heading = "Grouping")]
+    #[arg(long, value_enum, default_value_t = GroupBy::All, help_heading = "Grouping")]
     pub group_by: GroupBy,
     /// Glob patterns that collapse dynamic cgroup path segments
     /// so structurally-equivalent cgroups across runs group
