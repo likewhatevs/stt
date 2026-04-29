@@ -6875,6 +6875,7 @@ pub fn write_diff<W: fmt::Write>(
                 if let Some(m) = b {
                     keys_union.extend(m.keys());
                 }
+                let mut first_row_for_process = true;
                 for sk in keys_union {
                     let av = a.and_then(|m| m.get(sk).copied());
                     let bv = b.and_then(|m| m.get(sk).copied());
@@ -6909,10 +6910,15 @@ pub fn write_diff<W: fmt::Write>(
                     } else {
                         comfy_table::Color::White
                     };
-                    let proc_label = if is_compound {
-                        format!("  {display_process}")
+                    let proc_label = if first_row_for_process {
+                        first_row_for_process = false;
+                        if is_compound {
+                            format!("  {display_process}")
+                        } else {
+                            display_process.to_string()
+                        }
                     } else {
-                        display_process.to_string()
+                        String::new()
                     };
                     st.add_row(vec![
                         comfy_table::Cell::new(proc_label),
