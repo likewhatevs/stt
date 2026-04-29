@@ -2746,16 +2746,31 @@ pub fn compare(
         let mut cg_types_a: BTreeMap<String, TypeSet> = BTreeMap::new();
         let mut cg_types_b: BTreeMap<String, TypeSet> = BTreeMap::new();
 
-        // Collect unique cgroup prefixes from one-sided keys.
+        // Collect cgroup prefixes that appear in BOTH groups (already matched).
+        // These must be excluded from fudging.
+        let matched_prefixes: std::collections::BTreeSet<String> = groups_a
+            .keys()
+            .filter(|k| groups_b.contains_key(*k))
+            .map(|k| cg_prefix(k).to_string())
+            .collect();
+
+        // Collect unique cgroup prefixes from one-sided keys,
+        // skipping any prefix that already has matched keys.
         let mut cg_prefixes_a: std::collections::BTreeSet<String> =
             std::collections::BTreeSet::new();
         let mut cg_prefixes_b: std::collections::BTreeSet<String> =
             std::collections::BTreeSet::new();
         for key in &diff.only_baseline {
-            cg_prefixes_a.insert(cg_prefix(key).to_string());
+            let pfx = cg_prefix(key).to_string();
+            if !matched_prefixes.contains(&pfx) {
+                cg_prefixes_a.insert(pfx);
+            }
         }
         for key in &diff.only_candidate {
-            cg_prefixes_b.insert(cg_prefix(key).to_string());
+            let pfx = cg_prefix(key).to_string();
+            if !matched_prefixes.contains(&pfx) {
+                cg_prefixes_b.insert(pfx);
+            }
         }
 
         // Populate thread types per cgroup prefix from snapshots.
