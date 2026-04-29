@@ -3163,6 +3163,25 @@ pub fn compare(
         diff.smaps_rollup_b = collect_smaps_rollup(candidate, opts.no_thread_normalize);
     }
 
+    // Remap fudged smaps keys so baseline and candidate join.
+    // Fudge paired cg_A (baseline) with cg_B (candidate), but
+    // smaps keys are cg_key\x00pcomm — different cg = no join.
+    // Rename candidate keys from cg_B prefix to cg_A prefix.
+    for fp in &diff.fudged_pairs {
+        let keys_to_remap: Vec<String> = diff
+            .smaps_rollup_b
+            .keys()
+            .filter(|k| k.starts_with(&fp.candidate_key))
+            .cloned()
+            .collect();
+        for old_key in keys_to_remap {
+            if let Some(val) = diff.smaps_rollup_b.remove(&old_key) {
+                let new_key = format!("{}{}", fp.baseline_key, &old_key[fp.candidate_key.len()..]);
+                diff.smaps_rollup_b.insert(new_key, val);
+            }
+        }
+    }
+
     diff.sched_ext_a = baseline.sched_ext.clone();
     diff.sched_ext_b = candidate.sched_ext.clone();
 
