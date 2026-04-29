@@ -1251,6 +1251,205 @@ pub struct ThreadState {
     /// = write_bytes - cancelled_write_bytes` is NOT defined for
     /// that reason — the two counters track different parties.
     pub cancelled_write_bytes: crate::metric_types::Bytes,
+
+    // -- taskstats delay accounting + memory watermarks (genetlink TASKSTATS family) --
+    //
+    // Per-tid records captured via the kernel's taskstats
+    // genetlink interface (NOT exposed in /proc/<tid>/sched or
+    // /proc/<tid>/stat). Two field families:
+    //
+    //   1. Delay accounting — eight categories (cpu/blkio/swapin/
+    //      freepages/thrashing/compact/wpcopy/irq), each carrying
+    //      count (number of events), delay_total_ns (cumulative
+    //      ns of delay), delay_max_ns (longest single window),
+    //      delay_min_ns (shortest non-zero window observed;
+    //      sentinel 0 means "no events"). Gated on
+    //      `CONFIG_TASKSTATS` + `CONFIG_TASK_DELAY_ACCT` plus the
+    //      runtime `delayacct=on` toggle (sysctl
+    //      `kernel.task_delayacct` or boot param `delayacct`).
+    //
+    //   2. Memory watermarks — `hiwater_rss_bytes` and
+    //      `hiwater_vm_bytes`. Gated on `CONFIG_TASKSTATS` +
+    //      `CONFIG_TASK_XACCT` (NOT `CONFIG_TASK_DELAY_ACCT`).
+    //      Populated from the shared `mm_struct` so sibling tgid
+    //      threads report identical values, and kernel threads
+    //      (mm == NULL) leave the field at zero — see the
+    //      per-field doc on `hiwater_rss_bytes`.
+    //
+    // Capture path is the [`crate::taskstats`] module —
+    // best-effort, all fields collapse to zero when:
+    //   - the kernel was built without `CONFIG_TASKSTATS`,
+    //   - the relevant per-family kconfig is off (DELAY_ACCT or
+    //     XACCT, depending on the field),
+    //   - the runtime `delayacct=on` toggle is off (delay-family
+    //     fields only — XACCT does not gate on the toggle),
+    //   - the calling process lacks `CAP_NET_ADMIN`,
+    //   - the per-tid query races a task exit (ESRCH).
+    //
+    // CAVEATS:
+    //   - cpu_delay is RACY (sched_info path, no lock) — count and
+    //     delay_total are not updated atomically.
+    //   - swapin and thrashing OVERLAP — a thrashing event is also
+    //     a swapin event from the syscall layer; do not sum.
+    //   - delay_min == 0 means "no events observed", NOT "saw a
+    //     zero-ns event". Compare against the matching count.
+    //   - hiwater_* values are per-mm, not per-thread; sibling
+    //     tgid threads report identical values, kernel threads
+    //     (mm == NULL) report zero. See the per-field doc.
+    /// Number of off-CPU windows the task waited for the runqueue
+    /// to schedule it. Source: taskstats `cpu_count`, populated at
+    /// query time from `tsk->sched_info.pcount` (incremented by
+    /// `sched_info_arrive` in `kernel/sched/stats.h`, line 282).
+    /// `delayacct_add_tsk` (`kernel/delayacct.c::delayacct_add_tsk`,
+    /// line 175) snapshots the value into the reply via
+    /// `d->cpu_count += t1` where `t1 = tsk->sched_info.pcount`.
+    pub cpu_delay_count: crate::metric_types::MonotonicCount,
+    /// Cumulative ns the task spent waiting on the runqueue.
+    /// Source: taskstats `cpu_delay_total`. RACY: count and total
+    /// are not updated atomically (sched_info path, no lock); a
+    /// concurrent reader may observe count or total advance ahead
+    /// of the other.
+    pub cpu_delay_total_ns: crate::metric_types::MonotonicNs,
+    /// Longest single CPU-wait window, ns. Source: taskstats
+    /// `cpu_delay_max`. Same lifetime-watermark semantics as
+    /// `wait_max` / `block_max` — `MaxPeak` aggregation surfaces
+    /// the worst single window any thread in the group ever
+    /// experienced.
+    pub cpu_delay_max_ns: crate::metric_types::PeakNs,
+    /// Shortest non-zero CPU-wait window, ns. Source: taskstats
+    /// `cpu_delay_min`. Sentinel 0 means "no events observed":
+    /// the kernel writes the field on every event, so 0 is
+    /// distinguishable from a genuine zero-ns event by checking
+    /// `cpu_delay_count == 0`. `PeakNs` aggregation surfaces "the
+    /// largest minimum any thread reported" across the group.
+    pub cpu_delay_min_ns: crate::metric_types::PeakNs,
+    /// Number of block-I/O wait windows. Source: taskstats
+    /// `blkio_count`. Updates from `delayacct_blkio_start/end` in
+    /// `kernel/delayacct.c`.
+    pub blkio_delay_count: crate::metric_types::MonotonicCount,
+    /// Cumulative ns the task waited on synchronous block I/O.
+    /// Source: taskstats `blkio_delay_total`. Distinct from
+    /// `iowait_sum` (schedstat) which counts a different bucket;
+    /// the delayacct path is the canonical block-I/O delay
+    /// accounting.
+    pub blkio_delay_total_ns: crate::metric_types::MonotonicNs,
+    /// Longest single block-I/O wait window, ns. Source: taskstats
+    /// `blkio_delay_max`.
+    pub blkio_delay_max_ns: crate::metric_types::PeakNs,
+    /// Shortest non-zero block-I/O wait window, ns. Source:
+    /// taskstats `blkio_delay_min`. Sentinel-0 caveat per
+    /// `cpu_delay_min_ns`.
+    pub blkio_delay_min_ns: crate::metric_types::PeakNs,
+    /// Number of swap-in wait windows. Source: taskstats
+    /// `swapin_count`. NOTE: overlaps with `thrashing_count` —
+    /// every thrashing event is also a swapin event from the
+    /// syscall layer; do not sum.
+    pub swapin_delay_count: crate::metric_types::MonotonicCount,
+    /// Cumulative ns waiting for swap-in to complete. Source:
+    /// taskstats `swapin_delay_total`.
+    pub swapin_delay_total_ns: crate::metric_types::MonotonicNs,
+    /// Longest single swap-in wait, ns. Source: taskstats
+    /// `swapin_delay_max`.
+    pub swapin_delay_max_ns: crate::metric_types::PeakNs,
+    /// Shortest non-zero swap-in wait, ns. Sentinel-0 caveat per
+    /// `cpu_delay_min_ns`.
+    pub swapin_delay_min_ns: crate::metric_types::PeakNs,
+    /// Number of direct-reclaim (free-pages) wait windows. Source:
+    /// taskstats `freepages_count`. Updates from
+    /// `delayacct_freepages_start/end` (mm/page_alloc.c).
+    pub freepages_delay_count: crate::metric_types::MonotonicCount,
+    /// Cumulative ns waiting in direct memory reclaim. Source:
+    /// taskstats `freepages_delay_total`.
+    pub freepages_delay_total_ns: crate::metric_types::MonotonicNs,
+    /// Longest single direct-reclaim wait, ns. Source: taskstats
+    /// `freepages_delay_max`.
+    pub freepages_delay_max_ns: crate::metric_types::PeakNs,
+    /// Shortest non-zero direct-reclaim wait, ns. Sentinel-0 caveat
+    /// per `cpu_delay_min_ns`.
+    pub freepages_delay_min_ns: crate::metric_types::PeakNs,
+    /// Number of thrashing wait windows. Source: taskstats
+    /// `thrashing_count`. OVERLAPS with `swapin_*`: thrashing
+    /// detection is a refinement of swapin tracking
+    /// (mm/workingset.c).
+    pub thrashing_delay_count: crate::metric_types::MonotonicCount,
+    /// Cumulative ns waiting under thrashing pressure. Source:
+    /// taskstats `thrashing_delay_total`.
+    pub thrashing_delay_total_ns: crate::metric_types::MonotonicNs,
+    /// Longest single thrashing wait, ns. Source: taskstats
+    /// `thrashing_delay_max`.
+    pub thrashing_delay_max_ns: crate::metric_types::PeakNs,
+    /// Shortest non-zero thrashing wait, ns. Sentinel-0 caveat per
+    /// `cpu_delay_min_ns`.
+    pub thrashing_delay_min_ns: crate::metric_types::PeakNs,
+    /// Number of memory-compaction wait windows. Source: taskstats
+    /// `compact_count`. Updates from `delayacct_compact_start/end`
+    /// (mm/compaction.c).
+    pub compact_delay_count: crate::metric_types::MonotonicCount,
+    /// Cumulative ns waiting on memory compaction. Source:
+    /// taskstats `compact_delay_total`.
+    pub compact_delay_total_ns: crate::metric_types::MonotonicNs,
+    /// Longest single compaction wait, ns. Source: taskstats
+    /// `compact_delay_max`.
+    pub compact_delay_max_ns: crate::metric_types::PeakNs,
+    /// Shortest non-zero compaction wait, ns. Sentinel-0 caveat
+    /// per `cpu_delay_min_ns`.
+    pub compact_delay_min_ns: crate::metric_types::PeakNs,
+    /// Number of write-protect-copy (CoW) fault wait windows.
+    /// Source: taskstats `wpcopy_count`. Updates from
+    /// `delayacct_wpcopy_start/end` (mm/memory.c).
+    pub wpcopy_delay_count: crate::metric_types::MonotonicCount,
+    /// Cumulative ns waiting on write-protect-copy faults. Source:
+    /// taskstats `wpcopy_delay_total`.
+    pub wpcopy_delay_total_ns: crate::metric_types::MonotonicNs,
+    /// Longest single wpcopy wait, ns. Source: taskstats
+    /// `wpcopy_delay_max`.
+    pub wpcopy_delay_max_ns: crate::metric_types::PeakNs,
+    /// Shortest non-zero wpcopy wait, ns. Sentinel-0 caveat per
+    /// `cpu_delay_min_ns`.
+    pub wpcopy_delay_min_ns: crate::metric_types::PeakNs,
+    /// Number of IRQ-handler windows the task delegated. Source:
+    /// taskstats `irq_count`. Updates from `delayacct_irq` in
+    /// `kernel/delayacct.c` — counts kernel-IRQ time charged to
+    /// the task by the IRQ accounting subsystem.
+    pub irq_delay_count: crate::metric_types::MonotonicCount,
+    /// Cumulative ns of IRQ handling time charged to the task.
+    /// Source: taskstats `irq_delay_total`.
+    pub irq_delay_total_ns: crate::metric_types::MonotonicNs,
+    /// Longest single IRQ-handler window, ns. Source: taskstats
+    /// `irq_delay_max`.
+    pub irq_delay_max_ns: crate::metric_types::PeakNs,
+    /// Shortest non-zero IRQ-handler window, ns. Sentinel-0 caveat
+    /// per `cpu_delay_min_ns`.
+    pub irq_delay_min_ns: crate::metric_types::PeakNs,
+    /// Lifetime high-watermark of resident-set size, bytes. Source:
+    /// taskstats `hiwater_rss` (kB), converted at parse time via
+    /// `saturating_mul(1024)`. Updates from `xacct_add_tsk` in
+    /// `kernel/tsacct.c::xacct_add_tsk`. Distinct from
+    /// `smaps_rollup_kb["Rss"]` which is the CURRENT RSS —
+    /// this field is the lifetime peak.
+    ///
+    /// **Kernel threads read zero**: `xacct_add_tsk` at
+    /// `kernel/tsacct.c:99` calls `mm = get_task_mm(p)` and the
+    /// hiwater assignments at lines 100-104 are guarded by
+    /// `if (mm)`. Kernel threads (`PF_KTHREAD`, `tsk->mm == NULL`)
+    /// skip the assignment entirely, so the field stays at the
+    /// kernel-side zero default.
+    ///
+    /// **Sibling threads of the same tgid see the same value**:
+    /// `get_mm_hiwater_rss(mm)` reads from the shared
+    /// `mm_struct`, so every thread of a process reports the same
+    /// hiwater value. The registry's `MaxPeakBytes` aggregation
+    /// behaves as a per-process selector when buckets span
+    /// multiple tgids: cross-tgid Max picks the largest
+    /// per-process watermark in the bucket; intra-tgid Max is a
+    /// no-op (every sibling reports the same number).
+    pub hiwater_rss_bytes: crate::metric_types::PeakBytes,
+    /// Lifetime high-watermark of virtual-memory size, bytes.
+    /// Source: taskstats `hiwater_vm` (kB), converted at parse
+    /// time. Same kernel write path as `hiwater_rss_bytes` —
+    /// inherits the same kernel-thread zero and same sibling-tid
+    /// shared-mm caveats; see [`Self::hiwater_rss_bytes`].
+    pub hiwater_vm_bytes: crate::metric_types::PeakBytes,
 }
 
 impl Default for ThreadState {
@@ -1318,11 +1517,89 @@ impl Default for ThreadState {
             read_bytes: Default::default(),
             write_bytes: Default::default(),
             cancelled_write_bytes: Default::default(),
+            cpu_delay_count: Default::default(),
+            cpu_delay_total_ns: Default::default(),
+            cpu_delay_max_ns: Default::default(),
+            cpu_delay_min_ns: Default::default(),
+            blkio_delay_count: Default::default(),
+            blkio_delay_total_ns: Default::default(),
+            blkio_delay_max_ns: Default::default(),
+            blkio_delay_min_ns: Default::default(),
+            swapin_delay_count: Default::default(),
+            swapin_delay_total_ns: Default::default(),
+            swapin_delay_max_ns: Default::default(),
+            swapin_delay_min_ns: Default::default(),
+            freepages_delay_count: Default::default(),
+            freepages_delay_total_ns: Default::default(),
+            freepages_delay_max_ns: Default::default(),
+            freepages_delay_min_ns: Default::default(),
+            thrashing_delay_count: Default::default(),
+            thrashing_delay_total_ns: Default::default(),
+            thrashing_delay_max_ns: Default::default(),
+            thrashing_delay_min_ns: Default::default(),
+            compact_delay_count: Default::default(),
+            compact_delay_total_ns: Default::default(),
+            compact_delay_max_ns: Default::default(),
+            compact_delay_min_ns: Default::default(),
+            wpcopy_delay_count: Default::default(),
+            wpcopy_delay_total_ns: Default::default(),
+            wpcopy_delay_max_ns: Default::default(),
+            wpcopy_delay_min_ns: Default::default(),
+            irq_delay_count: Default::default(),
+            irq_delay_total_ns: Default::default(),
+            irq_delay_max_ns: Default::default(),
+            irq_delay_min_ns: Default::default(),
+            hiwater_rss_bytes: Default::default(),
+            hiwater_vm_bytes: Default::default(),
         }
     }
 }
 
 impl ThreadState {
+    /// Overwrite the taskstats-sourced delay-accounting fields
+    /// from a `DelayStats` payload. Called by `capture_with` /
+    /// `capture_pid_with` after a successful per-tid
+    /// [`crate::taskstats::TaskstatsClient::query_tid`] call;
+    /// query failures leave the fields at the absent-counter
+    /// default of zero installed in `capture_thread_at_with_tally`.
+    pub(crate) fn apply_delay_stats(&mut self, ds: &crate::taskstats::DelayStats) {
+        use crate::metric_types::{MonotonicCount, MonotonicNs, PeakBytes, PeakNs};
+        self.cpu_delay_count = MonotonicCount(ds.cpu_count);
+        self.cpu_delay_total_ns = MonotonicNs(ds.cpu_delay_total_ns);
+        self.cpu_delay_max_ns = PeakNs(ds.cpu_delay_max_ns);
+        self.cpu_delay_min_ns = PeakNs(ds.cpu_delay_min_ns);
+        self.blkio_delay_count = MonotonicCount(ds.blkio_count);
+        self.blkio_delay_total_ns = MonotonicNs(ds.blkio_delay_total_ns);
+        self.blkio_delay_max_ns = PeakNs(ds.blkio_delay_max_ns);
+        self.blkio_delay_min_ns = PeakNs(ds.blkio_delay_min_ns);
+        self.swapin_delay_count = MonotonicCount(ds.swapin_count);
+        self.swapin_delay_total_ns = MonotonicNs(ds.swapin_delay_total_ns);
+        self.swapin_delay_max_ns = PeakNs(ds.swapin_delay_max_ns);
+        self.swapin_delay_min_ns = PeakNs(ds.swapin_delay_min_ns);
+        self.freepages_delay_count = MonotonicCount(ds.freepages_count);
+        self.freepages_delay_total_ns = MonotonicNs(ds.freepages_delay_total_ns);
+        self.freepages_delay_max_ns = PeakNs(ds.freepages_delay_max_ns);
+        self.freepages_delay_min_ns = PeakNs(ds.freepages_delay_min_ns);
+        self.thrashing_delay_count = MonotonicCount(ds.thrashing_count);
+        self.thrashing_delay_total_ns = MonotonicNs(ds.thrashing_delay_total_ns);
+        self.thrashing_delay_max_ns = PeakNs(ds.thrashing_delay_max_ns);
+        self.thrashing_delay_min_ns = PeakNs(ds.thrashing_delay_min_ns);
+        self.compact_delay_count = MonotonicCount(ds.compact_count);
+        self.compact_delay_total_ns = MonotonicNs(ds.compact_delay_total_ns);
+        self.compact_delay_max_ns = PeakNs(ds.compact_delay_max_ns);
+        self.compact_delay_min_ns = PeakNs(ds.compact_delay_min_ns);
+        self.wpcopy_delay_count = MonotonicCount(ds.wpcopy_count);
+        self.wpcopy_delay_total_ns = MonotonicNs(ds.wpcopy_delay_total_ns);
+        self.wpcopy_delay_max_ns = PeakNs(ds.wpcopy_delay_max_ns);
+        self.wpcopy_delay_min_ns = PeakNs(ds.wpcopy_delay_min_ns);
+        self.irq_delay_count = MonotonicCount(ds.irq_count);
+        self.irq_delay_total_ns = MonotonicNs(ds.irq_delay_total_ns);
+        self.irq_delay_max_ns = PeakNs(ds.irq_delay_max_ns);
+        self.irq_delay_min_ns = PeakNs(ds.irq_delay_min_ns);
+        self.hiwater_rss_bytes = PeakBytes(ds.hiwater_rss_bytes);
+        self.hiwater_vm_bytes = PeakBytes(ds.hiwater_vm_bytes);
+    }
+
     /// Iterate over [`Self::smaps_rollup_kb`] with values
     /// converted from kilobytes to bytes via `saturating_mul(1024)`.
     /// The kernel emits smaps_rollup values in kB; the
@@ -3144,6 +3421,51 @@ fn capture_thread_at_with_tally(
         read_bytes: Bytes(io.read_bytes.unwrap_or(0)),
         write_bytes: Bytes(io.write_bytes.unwrap_or(0)),
         cancelled_write_bytes: Bytes(io.cancelled_write_bytes.unwrap_or(0)),
+        // Taskstats fields land here at zero defaults; the caller
+        // (`capture_with` / `capture_pid_with`) overwrites them
+        // after the per-tid `TaskstatsClient::query_tid` call,
+        // mirroring how `allocated_bytes` / `deallocated_bytes`
+        // are placeholdered above and then filled by the jemalloc
+        // probe path. Zero defaults are correct for the
+        // best-effort contract: a kernel without `CONFIG_TASKSTATS`
+        // / `CONFIG_TASK_DELAY_ACCT`, a host with `delayacct=off`
+        // at runtime, a process without `CAP_NET_ADMIN`, or a tid
+        // that exited before `query_tid` succeeded all collapse
+        // to zero per-field.
+        cpu_delay_count: MonotonicCount(0),
+        cpu_delay_total_ns: MonotonicNs(0),
+        cpu_delay_max_ns: PeakNs(0),
+        cpu_delay_min_ns: PeakNs(0),
+        blkio_delay_count: MonotonicCount(0),
+        blkio_delay_total_ns: MonotonicNs(0),
+        blkio_delay_max_ns: PeakNs(0),
+        blkio_delay_min_ns: PeakNs(0),
+        swapin_delay_count: MonotonicCount(0),
+        swapin_delay_total_ns: MonotonicNs(0),
+        swapin_delay_max_ns: PeakNs(0),
+        swapin_delay_min_ns: PeakNs(0),
+        freepages_delay_count: MonotonicCount(0),
+        freepages_delay_total_ns: MonotonicNs(0),
+        freepages_delay_max_ns: PeakNs(0),
+        freepages_delay_min_ns: PeakNs(0),
+        thrashing_delay_count: MonotonicCount(0),
+        thrashing_delay_total_ns: MonotonicNs(0),
+        thrashing_delay_max_ns: PeakNs(0),
+        thrashing_delay_min_ns: PeakNs(0),
+        compact_delay_count: MonotonicCount(0),
+        compact_delay_total_ns: MonotonicNs(0),
+        compact_delay_max_ns: PeakNs(0),
+        compact_delay_min_ns: PeakNs(0),
+        wpcopy_delay_count: MonotonicCount(0),
+        wpcopy_delay_total_ns: MonotonicNs(0),
+        wpcopy_delay_max_ns: PeakNs(0),
+        wpcopy_delay_min_ns: PeakNs(0),
+        irq_delay_count: MonotonicCount(0),
+        irq_delay_total_ns: MonotonicNs(0),
+        irq_delay_max_ns: PeakNs(0),
+        irq_delay_min_ns: PeakNs(0),
+        hiwater_rss_bytes: crate::metric_types::PeakBytes(0),
+        hiwater_vm_bytes: crate::metric_types::PeakBytes(0),
     }
 }
 
@@ -3860,6 +4182,33 @@ fn capture_with(
         None
     };
 
+    // Open a single taskstats genetlink socket for the snapshot.
+    // Best-effort: a kernel without `CONFIG_TASKSTATS`, a process
+    // without `CAP_NET_ADMIN`, or any other open failure collapses
+    // to `None` and every per-tid `query_tid` call short-circuits
+    // through the absent-default zeros installed in
+    // `capture_thread_at_with_tally`. Synthetic-tree tests pass
+    // `use_syscall_affinity=false`, so the socket is never opened
+    // — same discipline as the host-context / probe pass.
+    let taskstats_client = if use_syscall_affinity {
+        match crate::taskstats::TaskstatsClient::open() {
+            Ok(c) => Some(c),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "host-state taskstats: open failed; delay-accounting and memory-watermark \
+                     fields will be zero. Ensure the kernel was built with CONFIG_TASKSTATS \
+                     (plus CONFIG_TASK_DELAY_ACCT for delay fields and CONFIG_TASK_XACCT for \
+                     hiwater fields), the process holds CAP_NET_ADMIN, and the kernel was \
+                     booted with `delayacct=on` (or sysctl `kernel.task_delayacct=1`)"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Phase 2: sequential per-tid walk + ptrace reads.
     for tgid in &tgids {
         let tgid = *tgid;
@@ -3896,6 +4245,19 @@ fn capture_with(
             );
             t.allocated_bytes = crate::metric_types::Bytes(allocated_bytes);
             t.deallocated_bytes = crate::metric_types::Bytes(deallocated_bytes);
+            // Best-effort taskstats query for delay-accounting +
+            // hiwater memory watermarks. tid > 0 invariant is
+            // guaranteed by `iter_task_ids_at`'s `> 0` filter; the
+            // u32 cast is therefore safe. Failures (the kernel
+            // doesn't support taskstats, the tid raced exit, the
+            // socket was never opened) fall through to the zero
+            // defaults already installed in
+            // `capture_thread_at_with_tally`.
+            if let Some(client) = taskstats_client.as_ref()
+                && let Ok(ds) = client.query_tid(tid as u32)
+            {
+                t.apply_delay_stats(&ds);
+            }
             // Ghost-thread filter: a tid that exited between the
             // `iter_task_ids_at` readdir and our per-file reads
             // produces an all-Default `ThreadState` — empty comm
@@ -4067,6 +4429,25 @@ fn capture_pid_with(
     } else {
         None
     };
+    // Best-effort taskstats client — same discipline as `capture_with`.
+    let taskstats_client = if use_syscall_affinity {
+        match crate::taskstats::TaskstatsClient::open() {
+            Ok(c) => Some(c),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "host-state taskstats: open failed; delay-accounting and memory-watermark \
+                     fields will be zero. Ensure the kernel was built with CONFIG_TASKSTATS \
+                     (plus CONFIG_TASK_DELAY_ACCT for delay fields and CONFIG_TASK_XACCT for \
+                     hiwater fields), the process holds CAP_NET_ADMIN, and the kernel was \
+                     booted with `delayacct=on` (or sysctl `kernel.task_delayacct=1`)"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
     for tid in iter_task_ids_at(proc_root, pid) {
         if let Some(t) = tally_opt.as_mut() {
             t.tids_walked += 1;
@@ -4097,6 +4478,11 @@ fn capture_pid_with(
         );
         t.allocated_bytes = crate::metric_types::Bytes(allocated_bytes);
         t.deallocated_bytes = crate::metric_types::Bytes(deallocated_bytes);
+        if let Some(client) = taskstats_client.as_ref()
+            && let Ok(ds) = client.query_tid(tid as u32)
+        {
+            t.apply_delay_stats(&ds);
+        }
         if t.comm.is_empty() && t.start_time_clock_ticks == 0 {
             if let Some(t) = tally_opt.as_mut() {
                 t.discard_pending();
@@ -4315,7 +4701,41 @@ mod tests {
             "syscw": 20,
             "read_bytes": 4096,
             "write_bytes": 8192,
-            "cancelled_write_bytes": 1024
+            "cancelled_write_bytes": 1024,
+            "cpu_delay_count": 0,
+            "cpu_delay_total_ns": 0,
+            "cpu_delay_max_ns": 0,
+            "cpu_delay_min_ns": 0,
+            "blkio_delay_count": 0,
+            "blkio_delay_total_ns": 0,
+            "blkio_delay_max_ns": 0,
+            "blkio_delay_min_ns": 0,
+            "swapin_delay_count": 0,
+            "swapin_delay_total_ns": 0,
+            "swapin_delay_max_ns": 0,
+            "swapin_delay_min_ns": 0,
+            "freepages_delay_count": 0,
+            "freepages_delay_total_ns": 0,
+            "freepages_delay_max_ns": 0,
+            "freepages_delay_min_ns": 0,
+            "thrashing_delay_count": 0,
+            "thrashing_delay_total_ns": 0,
+            "thrashing_delay_max_ns": 0,
+            "thrashing_delay_min_ns": 0,
+            "compact_delay_count": 0,
+            "compact_delay_total_ns": 0,
+            "compact_delay_max_ns": 0,
+            "compact_delay_min_ns": 0,
+            "wpcopy_delay_count": 0,
+            "wpcopy_delay_total_ns": 0,
+            "wpcopy_delay_max_ns": 0,
+            "wpcopy_delay_min_ns": 0,
+            "irq_delay_count": 0,
+            "irq_delay_total_ns": 0,
+            "irq_delay_max_ns": 0,
+            "irq_delay_min_ns": 0,
+            "hiwater_rss_bytes": 0,
+            "hiwater_vm_bytes": 0
         }"#;
         let t: ThreadState = serde_json::from_str(json).expect("deserialize");
         // One representative field per newtype family proves

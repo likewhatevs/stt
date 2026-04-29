@@ -354,6 +354,7 @@ pub(crate) mod report;
 pub mod runner;
 pub mod scenario;
 pub(crate) mod stats;
+pub(crate) mod taskstats;
 pub mod test_support;
 pub(crate) mod timeline;
 pub mod topology;

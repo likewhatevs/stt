@@ -446,6 +446,66 @@ pub struct DeadCounter(pub u64);
 #[serde(transparent)]
 pub struct PeakNs(pub u64);
 
+/// Lifetime high-water mark, bytes. Same Maxable-only contract
+/// as [`PeakNs`] but Bytes-typed so the renderer routes through
+/// the IEC binary auto-scale ladder
+/// (`B → KiB → MiB → GiB → TiB`) instead of the ns ladder.
+///
+/// The kernel's taskstats interface (`/proc/<tid>/stat` does NOT
+/// expose these — they require the genetlink TASKSTATS_CMD_GET
+/// path; see [`crate::taskstats::TaskstatsClient`]) carries
+/// `hiwater_rss` and `hiwater_vm` as KB-truncated lifetime
+/// watermarks. The capture pipeline multiplies by 1024 at the
+/// boundary so the wire-format value is in bytes, matching the
+/// existing `Bytes` newtype unit.
+///
+/// # Cross-thread vs cross-snapshot semantics
+///
+/// **Sibling threads of the same tgid see the same value**:
+/// `xacct_add_tsk` (`kernel/tsacct.c::xacct_add_tsk`, lines 99-104)
+/// fills `hiwater_rss` and `hiwater_vm` from
+/// `get_mm_hiwater_rss(mm)` / `get_mm_hiwater_vm(mm)` — both read
+/// from the shared `mm_struct`, so every thread of a given tgid
+/// reports the same lifetime watermark. A Max reduction across
+/// sibling threads of the same process is therefore a no-op on
+/// the watermark itself; the meaningful Max is the one across
+/// DIFFERENT processes, where each tgid carries its own
+/// mm_struct and an independent watermark history. Use Max
+/// expecting "the biggest process's watermark in the bucket",
+/// not "the worst-behaving thread of any process".
+///
+/// **Kernel threads (`mm == NULL`) report zero**: the same
+/// `xacct_add_tsk` path guards the assignments behind
+/// `if (mm)` (line 100), so kernel threads (PF_KTHREAD) leave
+/// the field at the kernel-side zero.
+///
+/// In COMPARE mode the per-thread `PeakBytes` delta between two
+/// snapshots is `peak_after - peak_before` — the kernel only
+/// ever raises the field, so the delta is non-negative and
+/// represents the AMOUNT BY WHICH THE LIFETIME WATERMARK GREW
+/// during the (capture-A, capture-B) interval, NOT the
+/// allocation size during that interval. A new allocation only
+/// moves the watermark if its peak RSS exceeds the prior
+/// lifetime maximum; an interval full of small allocations that
+/// stayed under `peak_before` shows a zero delta.
+///
+/// Summing watermarks across threads is a category error — does
+/// not implement [`Summable`]. Implements [`Maxable`].
+///
+/// # u64 backing
+///
+/// Bytes are non-negative by definition; the kernel-side
+/// `__u64 hiwater_rss` / `__u64 hiwater_vm` in `struct taskstats`
+/// (`include/uapi/linux/taskstats.h`) are u64 KB counts, and the
+/// post-multiply byte count fits comfortably in u64 across any
+/// realistic per-process memory footprint.
+#[repr(transparent)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
+)]
+#[serde(transparent)]
+pub struct PeakBytes(pub u64);
+
 /// Instantaneous gauge sampled at capture time, nanoseconds.
 /// Distinct from [`PeakNs`]: a gauge is a snapshot of the
 /// CURRENT value of a kernel field, not a lifetime maximum.
@@ -605,6 +665,7 @@ impl_u64_newtype_from!(ClockTicks);
 impl_u64_newtype_from!(Bytes);
 impl_u64_newtype_from!(DeadCounter);
 impl_u64_newtype_from!(PeakNs);
+impl_u64_newtype_from!(PeakBytes);
 impl_u64_newtype_from!(GaugeNs);
 impl_u64_newtype_from!(GaugeCount);
 
@@ -695,6 +756,7 @@ impl_display_passthrough!(ClockTicks);
 impl_display_passthrough!(Bytes);
 impl_display_passthrough!(DeadCounter);
 impl_display_passthrough!(PeakNs);
+impl_display_passthrough!(PeakBytes);
 impl_display_passthrough!(GaugeNs);
 impl_display_passthrough!(GaugeCount);
 impl_display_passthrough!(OrdinalI32);
@@ -814,11 +876,13 @@ pub trait Summable: sealed::SummableSealed + Sized + Copy {
 ///
 /// Implemented by [`PeakNs`] (max-of-peak is the worst
 /// high-water mark any contributor saw across its lifetime),
-/// [`GaugeNs`] (max-of-gauge is the longest current value in
-/// the bucket — distinct temporal window: each gauge is a
-/// fresh sample at capture time, not a lifetime accumulator),
-/// and [`GaugeCount`] (max-of-count is the biggest current
-/// value in the bucket — same gauge-window caveat).
+/// [`PeakBytes`] (the byte-typed twin of [`PeakNs`]; max of
+/// per-task hiwater_rss / hiwater_vm), [`GaugeNs`]
+/// (max-of-gauge is the longest current value in the bucket —
+/// distinct temporal window: each gauge is a fresh sample at
+/// capture time, not a lifetime accumulator), and
+/// [`GaugeCount`] (max-of-count is the biggest current value
+/// in the bucket — same gauge-window caveat).
 ///
 /// Deliberately NOT implemented by [`Summable`] cumulative
 /// counters ([`MonotonicCount`] / [`MonotonicNs`] /
@@ -1098,6 +1162,7 @@ macro_rules! impl_maxable_only_u64 {
 }
 
 impl_maxable_only_u64!(PeakNs);
+impl_maxable_only_u64!(PeakBytes);
 impl_maxable_only_u64!(GaugeNs);
 impl_maxable_only_u64!(GaugeCount);
 
@@ -1368,9 +1433,9 @@ mod tests {
     }
 
     /// Compile-time gate: Maxable is implemented by exactly the
-    /// peak / gauge family — `PeakNs`, `GaugeNs`, `GaugeCount`.
-    /// The four Summable cumulative counter newtypes are
-    /// deliberately NOT Maxable: a static `assert_maxable<T>()`
+    /// peak / gauge family — `PeakNs`, `PeakBytes`, `GaugeNs`,
+    /// `GaugeCount`. The four Summable cumulative counter newtypes
+    /// are deliberately NOT Maxable: a static `assert_maxable<T>()`
     /// helper would refuse to compile against `MonotonicCount` /
     /// `MonotonicNs` / `ClockTicks` / `Bytes`. The
     /// `compile_fail_*` tests under `tests/compile_fail/` pin the
@@ -1380,6 +1445,7 @@ mod tests {
     fn maxable_implemented_for_peaks_and_gauges() {
         fn assert_maxable<T: Maxable>() {}
         assert_maxable::<PeakNs>();
+        assert_maxable::<PeakBytes>();
         assert_maxable::<GaugeNs>();
         assert_maxable::<GaugeCount>();
     }
@@ -1607,6 +1673,10 @@ mod tests {
         let raw_peak_json = serde_json::to_string(&raw_peak).expect("serialize");
         assert_eq!(raw_peak_json, "99");
 
+        let raw_peak_bytes = PeakBytes(2_097_152);
+        let raw_peak_bytes_json = serde_json::to_string(&raw_peak_bytes).expect("serialize");
+        assert_eq!(raw_peak_bytes_json, "2097152");
+
         let raw_gauge = GaugeNs(7_500_000);
         let raw_gauge_json = serde_json::to_string(&raw_gauge).expect("serialize");
         assert_eq!(raw_gauge_json, "7500000");
@@ -1666,6 +1736,7 @@ mod tests {
         assert_eq!(size_of::<Bytes>(), size_of::<u64>());
         assert_eq!(size_of::<DeadCounter>(), size_of::<u64>());
         assert_eq!(size_of::<PeakNs>(), size_of::<u64>());
+        assert_eq!(size_of::<PeakBytes>(), size_of::<u64>());
         assert_eq!(size_of::<GaugeNs>(), size_of::<u64>());
         assert_eq!(size_of::<GaugeCount>(), size_of::<u64>());
         assert_eq!(size_of::<OrdinalI32>(), size_of::<i32>());
@@ -1684,6 +1755,7 @@ mod tests {
         assert_eq!(Bytes::default(), Bytes(0));
         assert_eq!(DeadCounter::default(), DeadCounter(0));
         assert_eq!(PeakNs::default(), PeakNs(0));
+        assert_eq!(PeakBytes::default(), PeakBytes(0));
         assert_eq!(GaugeNs::default(), GaugeNs(0));
         assert_eq!(GaugeCount::default(), GaugeCount(0));
         assert_eq!(OrdinalI32::default(), OrdinalI32(0));

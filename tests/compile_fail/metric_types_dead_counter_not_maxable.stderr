@@ -14,10 +14,13 @@ help: the following other types implement trait `Maxable`
    |         |
    |         `GaugeCount`
    |         `GaugeNs`
+   |         `PeakBytes`
    |         `PeakNs`
 ...
    | impl_maxable_only_u64!(PeakNs);
    | ------------------------------ in this macro invocation
+   | impl_maxable_only_u64!(PeakBytes);
+   | --------------------------------- in this macro invocation
    | impl_maxable_only_u64!(GaugeNs);
    | ------------------------------- in this macro invocation
    | impl_maxable_only_u64!(GaugeCount);

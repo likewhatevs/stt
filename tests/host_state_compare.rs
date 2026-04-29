@@ -33,7 +33,7 @@ use ktstr::host_state_compare::{
 };
 use ktstr::metric_types::{
     Bytes, ClockTicks, CpuSet, GaugeCount, GaugeNs, MonotonicCount, MonotonicNs, OrdinalI32,
-    OrdinalU32, PeakNs,
+    OrdinalU32, PeakBytes, PeakNs,
 };
 
 use common::host_state::{cgroup_stats_entry, make_thread, snapshot};
@@ -613,6 +613,99 @@ fn host_state_metrics_accessors_read_every_variant() {
         // surfaces "the largest process represented in this
         // bucket"; the row count already covers thread totals.
         ("nr_threads", |t| t.nr_threads = GaugeCount(140)),
+        // taskstats delay accounting (genetlink TASKSTATS family).
+        // Each of 8 categories carries 4 fields (count, total_ns,
+        // max_ns, min_ns); plus 2 hiwater watermarks.
+        // count → SumCount, total_ns → SumNs, max_ns / min_ns →
+        // MaxPeak (PeakNs), hiwater_*_bytes → MaxPeakBytes.
+        ("cpu_delay_count", |t| {
+            t.cpu_delay_count = MonotonicCount(300)
+        }),
+        ("cpu_delay_total_ns", |t| {
+            t.cpu_delay_total_ns = MonotonicNs(301)
+        }),
+        ("cpu_delay_max_ns", |t| t.cpu_delay_max_ns = PeakNs(302)),
+        ("cpu_delay_min_ns", |t| t.cpu_delay_min_ns = PeakNs(303)),
+        ("blkio_delay_count", |t| {
+            t.blkio_delay_count = MonotonicCount(304)
+        }),
+        ("blkio_delay_total_ns", |t| {
+            t.blkio_delay_total_ns = MonotonicNs(305)
+        }),
+        ("blkio_delay_max_ns", |t| t.blkio_delay_max_ns = PeakNs(306)),
+        ("blkio_delay_min_ns", |t| t.blkio_delay_min_ns = PeakNs(307)),
+        ("swapin_delay_count", |t| {
+            t.swapin_delay_count = MonotonicCount(308)
+        }),
+        ("swapin_delay_total_ns", |t| {
+            t.swapin_delay_total_ns = MonotonicNs(309)
+        }),
+        ("swapin_delay_max_ns", |t| {
+            t.swapin_delay_max_ns = PeakNs(310)
+        }),
+        ("swapin_delay_min_ns", |t| {
+            t.swapin_delay_min_ns = PeakNs(311)
+        }),
+        ("freepages_delay_count", |t| {
+            t.freepages_delay_count = MonotonicCount(312)
+        }),
+        ("freepages_delay_total_ns", |t| {
+            t.freepages_delay_total_ns = MonotonicNs(313)
+        }),
+        ("freepages_delay_max_ns", |t| {
+            t.freepages_delay_max_ns = PeakNs(314)
+        }),
+        ("freepages_delay_min_ns", |t| {
+            t.freepages_delay_min_ns = PeakNs(315)
+        }),
+        ("thrashing_delay_count", |t| {
+            t.thrashing_delay_count = MonotonicCount(316)
+        }),
+        ("thrashing_delay_total_ns", |t| {
+            t.thrashing_delay_total_ns = MonotonicNs(317)
+        }),
+        ("thrashing_delay_max_ns", |t| {
+            t.thrashing_delay_max_ns = PeakNs(318)
+        }),
+        ("thrashing_delay_min_ns", |t| {
+            t.thrashing_delay_min_ns = PeakNs(319)
+        }),
+        ("compact_delay_count", |t| {
+            t.compact_delay_count = MonotonicCount(320)
+        }),
+        ("compact_delay_total_ns", |t| {
+            t.compact_delay_total_ns = MonotonicNs(321)
+        }),
+        ("compact_delay_max_ns", |t| {
+            t.compact_delay_max_ns = PeakNs(322)
+        }),
+        ("compact_delay_min_ns", |t| {
+            t.compact_delay_min_ns = PeakNs(323)
+        }),
+        ("wpcopy_delay_count", |t| {
+            t.wpcopy_delay_count = MonotonicCount(324)
+        }),
+        ("wpcopy_delay_total_ns", |t| {
+            t.wpcopy_delay_total_ns = MonotonicNs(325)
+        }),
+        ("wpcopy_delay_max_ns", |t| {
+            t.wpcopy_delay_max_ns = PeakNs(326)
+        }),
+        ("wpcopy_delay_min_ns", |t| {
+            t.wpcopy_delay_min_ns = PeakNs(327)
+        }),
+        ("irq_delay_count", |t| {
+            t.irq_delay_count = MonotonicCount(328)
+        }),
+        ("irq_delay_total_ns", |t| {
+            t.irq_delay_total_ns = MonotonicNs(329)
+        }),
+        ("irq_delay_max_ns", |t| t.irq_delay_max_ns = PeakNs(330)),
+        ("irq_delay_min_ns", |t| t.irq_delay_min_ns = PeakNs(331)),
+        ("hiwater_rss_bytes", |t| {
+            t.hiwater_rss_bytes = PeakBytes(332)
+        }),
+        ("hiwater_vm_bytes", |t| t.hiwater_vm_bytes = PeakBytes(333)),
     ];
 
     // Hand-paired expected scalar value for each Sum/Max
@@ -667,6 +760,46 @@ fn host_state_metrics_accessors_read_every_variant() {
         ("slice_max", 204),
         ("fair_slice_ns", 250),
         ("nr_threads", 140),
+        // taskstats delay accounting (8 categories × 4 fields
+        // each = 32) + 2 hiwater watermarks. Sum entries (count,
+        // total_ns) and Max entries (max_ns, min_ns) for each
+        // category share a contiguous 4-value block so a
+        // cross-wired accessor surfaces as a wrong-value
+        // assertion citing the offending metric.
+        ("cpu_delay_count", 300),
+        ("cpu_delay_total_ns", 301),
+        ("cpu_delay_max_ns", 302),
+        ("cpu_delay_min_ns", 303),
+        ("blkio_delay_count", 304),
+        ("blkio_delay_total_ns", 305),
+        ("blkio_delay_max_ns", 306),
+        ("blkio_delay_min_ns", 307),
+        ("swapin_delay_count", 308),
+        ("swapin_delay_total_ns", 309),
+        ("swapin_delay_max_ns", 310),
+        ("swapin_delay_min_ns", 311),
+        ("freepages_delay_count", 312),
+        ("freepages_delay_total_ns", 313),
+        ("freepages_delay_max_ns", 314),
+        ("freepages_delay_min_ns", 315),
+        ("thrashing_delay_count", 316),
+        ("thrashing_delay_total_ns", 317),
+        ("thrashing_delay_max_ns", 318),
+        ("thrashing_delay_min_ns", 319),
+        ("compact_delay_count", 320),
+        ("compact_delay_total_ns", 321),
+        ("compact_delay_max_ns", 322),
+        ("compact_delay_min_ns", 323),
+        ("wpcopy_delay_count", 324),
+        ("wpcopy_delay_total_ns", 325),
+        ("wpcopy_delay_max_ns", 326),
+        ("wpcopy_delay_min_ns", 327),
+        ("irq_delay_count", 328),
+        ("irq_delay_total_ns", 329),
+        ("irq_delay_max_ns", 330),
+        ("irq_delay_min_ns", 331),
+        ("hiwater_rss_bytes", 332),
+        ("hiwater_vm_bytes", 333),
     ]
     .into_iter()
     .collect();
@@ -688,7 +821,7 @@ fn host_state_metrics_accessors_read_every_variant() {
             // The phase-3 typed dispatch splits the historical
             // `Sum`/`Max`/`OrdinalRange`/`Mode` into per-newtype
             // variants (`SumCount`/`SumNs`/`SumTicks`/`SumBytes`,
-            // `MaxPeak`/`MaxGaugeNs`/`MaxGaugeCount`,
+            // `MaxPeak`/`MaxPeakBytes`/`MaxGaugeNs`/`MaxGaugeCount`,
             // `RangeI32`/`RangeU32`,
             // `Mode`/`ModeChar`/`ModeBool`); the rule-side
             // dispatch unwraps to the same `Aggregated` family
@@ -711,7 +844,10 @@ fn host_state_metrics_accessors_read_every_variant() {
                 );
             }
             (
-                AggRule::MaxPeak(_) | AggRule::MaxGaugeNs(_) | AggRule::MaxGaugeCount(_),
+                AggRule::MaxPeak(_)
+                | AggRule::MaxPeakBytes(_)
+                | AggRule::MaxGaugeNs(_)
+                | AggRule::MaxGaugeCount(_),
                 Aggregated::Max(v),
             ) => {
                 let expected = *expected_scalar.get(name).unwrap_or_else(|| {

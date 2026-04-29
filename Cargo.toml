@@ -206,6 +206,21 @@ thiserror = "2"
 # promoted to a direct dep so the import sites are explicit.
 regex = "1"
 
+# Netlink stack for the taskstats genetlink capture path
+# (`src/taskstats.rs`). The three crates layer cleanly:
+#   `netlink-sys`             — AF_NETLINK socket + sendto/recv.
+#   `netlink-packet-core`     — `NetlinkMessage<T>` envelope, ALIGN handling,
+#                                multipart-reply assembly.
+#   `netlink-packet-generic`  — generic-netlink (genetlink): `GenlMessage<T>`
+#                                wrapper, CTRL_CMD_GETFAMILY family-id lookup.
+# Hand-rolled genetlink against raw libc would be ~300 lines of
+# protocol parsing (NLA alignment, multipart NLM_F_MULTI handshake,
+# CTRL family lookup) — established crate stack avoids that
+# correctness risk.
+netlink-sys = "0.8"
+netlink-packet-core = "0.7"
+netlink-packet-generic = "0.3"
+
 [profile.release]
 lto = "thin"
 panic = "abort"

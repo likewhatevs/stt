@@ -245,6 +245,27 @@ pub enum AggRule {
     ///
     /// [`PeakNs`]: crate::metric_types::PeakNs
     MaxPeak(fn(&ThreadState) -> crate::metric_types::PeakNs),
+    /// Maximum across the group of a [`PeakBytes`] field — the
+    /// byte-typed twin of [`MaxPeak`]. Used for taskstats-sourced
+    /// lifetime memory watermarks (`hiwater_rss`, `hiwater_vm`).
+    /// `xacct_add_tsk` (`kernel/tsacct.c::xacct_add_tsk`, lines
+    /// 99-104) reads the watermark out of the SHARED `mm_struct`
+    /// via `get_mm_hiwater_rss(mm)` / `get_mm_hiwater_vm(mm)`, so
+    /// sibling threads of the same tgid all report the same
+    /// value; cross-thread Max within a single process is a no-op.
+    /// Cross-PROCESS Max (e.g. under `--group-by pcomm` when the
+    /// bucket spans multiple parent processes) is the meaningful
+    /// reduction: it picks the largest watermark any tgid in the
+    /// bucket reported. Routes through the IEC binary auto-scale
+    /// ladder ([`crate::metric_types::ScaleLadder::Bytes`]) so a
+    /// 7.5 GiB watermark renders as `7.500GiB` instead of
+    /// dominating the table with raw byte counts. Summing
+    /// watermarks would over-count shared address-space mappings
+    /// across sibling threads N-fold — `PeakBytes` does NOT
+    /// implement `Summable`.
+    ///
+    /// [`PeakBytes`]: crate::metric_types::PeakBytes
+    MaxPeakBytes(fn(&ThreadState) -> crate::metric_types::PeakBytes),
     /// Maximum across the group of a [`GaugeNs`] field —
     /// instantaneous-time gauges where summing is meaningless.
     /// `fair_slice_ns` is the per-thread CURRENT scheduler slice
@@ -1067,6 +1088,329 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         config_gates: &["CONFIG_TASK_IO_ACCOUNTING"],
         is_dead: false,
         description: "Bytes the kernel deaccounted from a prior dirty-write because the page was reclaimed without writeback (truncate / inode invalidation); recorded on the truncating task, not the writer. Per-thread `write_bytes - cancelled_write_bytes` is NOT a valid derivation — see field doc.",
+    },
+    // taskstats — captured via the kernel's genetlink TASKSTATS
+    // family ([`crate::taskstats`]). Two field families share the
+    // CONFIG_TASKSTATS netlink-family gate but differ in the
+    // per-family kconfig:
+    //
+    //   - delay-accounting fields (cpu/blkio/swapin/freepages/
+    //     thrashing/compact/wpcopy/irq × count/total/max/min,
+    //     32 entries) are gated on CONFIG_TASKSTATS +
+    //     CONFIG_TASK_DELAY_ACCT (the per-task counters in
+    //     `kernel/delayacct.c`); the runtime `delayacct=on` toggle
+    //     (sysctl `kernel.task_delayacct` or boot param
+    //     `delayacct`) is a separate condition that must hold for
+    //     the counters to actually update.
+    //   - memory-watermark fields (hiwater_rss_bytes,
+    //     hiwater_vm_bytes) are gated on CONFIG_TASKSTATS +
+    //     CONFIG_TASK_XACCT (the extended-accounting path in
+    //     `kernel/tsacct.c::xacct_add_tsk`); they do NOT respond
+    //     to the `delayacct=on` toggle.
+    //
+    // Calling the netlink family additionally requires
+    // `CAP_NET_ADMIN`. Any failed gate / missing cap collapses
+    // the affected fields to zero per the best-effort capture
+    // contract.
+    //
+    // CPU-delay block: cpu_count + cpu_delay_total are RACY —
+    // updated by the sched_info path without a lock, so a reader
+    // may observe count or total advance ahead of the other.
+    // (cpu_delay_max / cpu_delay_min are PeakNs lifetime
+    // watermarks updated at delayacct path entries; same race
+    // window in principle, but the watermark semantics already
+    // mask brief skew.)
+    HostStateMetricDef {
+        name: "cpu_delay_count",
+        rule: AggRule::SumCount(|t| t.cpu_delay_count),
+        sched_class: None,
+        config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
+        is_dead: false,
+        description: "Number of off-CPU windows the task waited for the runqueue to schedule it (taskstats cpu_count). RACY: count + total are not updated atomically.",
+    },
+    HostStateMetricDef {
+        name: "cpu_delay_total_ns",
+        rule: AggRule::SumNs(|t| t.cpu_delay_total_ns),
+        sched_class: None,
+        config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
+        is_dead: false,
+        description: "Cumulative ns the task waited on the runqueue (taskstats cpu_delay_total). Distinct from `wait_sum` (schedstat) which captures the same wait-for-CPU bucket via a different code path. RACY (see cpu_delay_count).",
+    },
+    HostStateMetricDef {
+        name: "cpu_delay_max_ns",
+        rule: AggRule::MaxPeak(|t| t.cpu_delay_max_ns),
+        sched_class: None,
+        config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
+        is_dead: false,
+        description: "Longest single CPU-wait window observed, ns (taskstats cpu_delay_max).",
+    },
+    HostStateMetricDef {
+        name: "cpu_delay_min_ns",
+        rule: AggRule::MaxPeak(|t| t.cpu_delay_min_ns),
+        sched_class: None,
+        config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
+        is_dead: false,
+        description: "Shortest non-zero CPU-wait window observed, ns (taskstats cpu_delay_min). Sentinel 0 means \"no events observed\" — compare against cpu_delay_count.",
+    },
+    // Block-I/O delay block: serializes through `task->delays->lock`
+    // so count + total are atomic (unlike cpu_*).
+    HostStateMetricDef {
+        name: "blkio_delay_count",
+        rule: AggRule::SumCount(|t| t.blkio_delay_count),
+        sched_class: None,
+        config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
+        is_dead: false,
+        description: "Number of synchronous block-I/O wait windows (taskstats blkio_count).",
+    },
+    HostStateMetricDef {
+        name: "blkio_delay_total_ns",
+        rule: AggRule::SumNs(|t| t.blkio_delay_total_ns),
+        sched_class: None,
+        config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
+        is_dead: false,
+        description: "Cumulative ns waiting on synchronous block I/O (taskstats blkio_delay_total). Distinct from `iowait_sum` (schedstat) and `delayacct_blkio_ticks` (USER_HZ-scaled twin via /proc/<tid>/stat).",
+    },
+    HostStateMetricDef {
+        name: "blkio_delay_max_ns",
+        rule: AggRule::MaxPeak(|t| t.blkio_delay_max_ns),
+        sched_class: None,
+        config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
+        is_dead: false,
+        description: "Longest single block-I/O wait observed, ns (taskstats blkio_delay_max).",
+    },
+    HostStateMetricDef {
+        name: "blkio_delay_min_ns",
+        rule: AggRule::MaxPeak(|t| t.blkio_delay_min_ns),
+        sched_class: None,
+        config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
+        is_dead: false,
+        description: "Shortest non-zero block-I/O wait observed, ns (taskstats blkio_delay_min). Sentinel 0 means \"no events observed\".",
+    },
+    // Swap-in delay block: OVERLAPS with thrashing_* — every
+    // thrashing event is also a swapin event from the syscall
+    // layer. Do not sum swapin and thrashing.
+    HostStateMetricDef {
+        name: "swapin_delay_count",
+        rule: AggRule::SumCount(|t| t.swapin_delay_count),
+        sched_class: None,
+        config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
+        is_dead: false,
+        description: "Number of swap-in wait windows (taskstats swapin_count). OVERLAPS with thrashing_delay_count — do not sum.",
+    },
+    HostStateMetricDef {
+        name: "swapin_delay_total_ns",
+        rule: AggRule::SumNs(|t| t.swapin_delay_total_ns),
+        sched_class: None,
+        config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
+        is_dead: false,
+        description: "Cumulative ns waiting for swap-in to complete (taskstats swapin_delay_total).",
+    },
+    HostStateMetricDef {
+        name: "swapin_delay_max_ns",
+        rule: AggRule::MaxPeak(|t| t.swapin_delay_max_ns),
+        sched_class: None,
+        config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
+        is_dead: false,
+        description: "Longest single swap-in wait observed, ns (taskstats swapin_delay_max).",
+    },
+    HostStateMetricDef {
+        name: "swapin_delay_min_ns",
+        rule: AggRule::MaxPeak(|t| t.swapin_delay_min_ns),
+        sched_class: None,
+        config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
+        is_dead: false,
+        description: "Shortest non-zero swap-in wait observed, ns (taskstats swapin_delay_min). Sentinel 0 means \"no events observed\".",
+    },
+    // Direct memory reclaim (free-pages) block.
+    HostStateMetricDef {
+        name: "freepages_delay_count",
+        rule: AggRule::SumCount(|t| t.freepages_delay_count),
+        sched_class: None,
+        config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
+        is_dead: false,
+        description: "Number of direct-reclaim wait windows (taskstats freepages_count).",
+    },
+    HostStateMetricDef {
+        name: "freepages_delay_total_ns",
+        rule: AggRule::SumNs(|t| t.freepages_delay_total_ns),
+        sched_class: None,
+        config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
+        is_dead: false,
+        description: "Cumulative ns waiting in direct memory reclaim (taskstats freepages_delay_total).",
+    },
+    HostStateMetricDef {
+        name: "freepages_delay_max_ns",
+        rule: AggRule::MaxPeak(|t| t.freepages_delay_max_ns),
+        sched_class: None,
+        config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
+        is_dead: false,
+        description: "Longest single direct-reclaim wait observed, ns (taskstats freepages_delay_max).",
+    },
+    HostStateMetricDef {
+        name: "freepages_delay_min_ns",
+        rule: AggRule::MaxPeak(|t| t.freepages_delay_min_ns),
+        sched_class: None,
+        config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
+        is_dead: false,
+        description: "Shortest non-zero direct-reclaim wait observed, ns (taskstats freepages_delay_min). Sentinel 0 means \"no events observed\".",
+    },
+    // Thrashing block: OVERLAPS with swapin_* (see above).
+    HostStateMetricDef {
+        name: "thrashing_delay_count",
+        rule: AggRule::SumCount(|t| t.thrashing_delay_count),
+        sched_class: None,
+        config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
+        is_dead: false,
+        description: "Number of thrashing wait windows (taskstats thrashing_count). OVERLAPS with swapin_delay_count — do not sum.",
+    },
+    HostStateMetricDef {
+        name: "thrashing_delay_total_ns",
+        rule: AggRule::SumNs(|t| t.thrashing_delay_total_ns),
+        sched_class: None,
+        config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
+        is_dead: false,
+        description: "Cumulative ns waiting under thrashing pressure (taskstats thrashing_delay_total).",
+    },
+    HostStateMetricDef {
+        name: "thrashing_delay_max_ns",
+        rule: AggRule::MaxPeak(|t| t.thrashing_delay_max_ns),
+        sched_class: None,
+        config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
+        is_dead: false,
+        description: "Longest single thrashing wait observed, ns (taskstats thrashing_delay_max).",
+    },
+    HostStateMetricDef {
+        name: "thrashing_delay_min_ns",
+        rule: AggRule::MaxPeak(|t| t.thrashing_delay_min_ns),
+        sched_class: None,
+        config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
+        is_dead: false,
+        description: "Shortest non-zero thrashing wait observed, ns (taskstats thrashing_delay_min). Sentinel 0 means \"no events observed\".",
+    },
+    // Memory compaction block.
+    HostStateMetricDef {
+        name: "compact_delay_count",
+        rule: AggRule::SumCount(|t| t.compact_delay_count),
+        sched_class: None,
+        config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
+        is_dead: false,
+        description: "Number of memory-compaction wait windows (taskstats compact_count).",
+    },
+    HostStateMetricDef {
+        name: "compact_delay_total_ns",
+        rule: AggRule::SumNs(|t| t.compact_delay_total_ns),
+        sched_class: None,
+        config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
+        is_dead: false,
+        description: "Cumulative ns waiting on memory compaction (taskstats compact_delay_total).",
+    },
+    HostStateMetricDef {
+        name: "compact_delay_max_ns",
+        rule: AggRule::MaxPeak(|t| t.compact_delay_max_ns),
+        sched_class: None,
+        config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
+        is_dead: false,
+        description: "Longest single compaction wait observed, ns (taskstats compact_delay_max).",
+    },
+    HostStateMetricDef {
+        name: "compact_delay_min_ns",
+        rule: AggRule::MaxPeak(|t| t.compact_delay_min_ns),
+        sched_class: None,
+        config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
+        is_dead: false,
+        description: "Shortest non-zero compaction wait observed, ns (taskstats compact_delay_min). Sentinel 0 means \"no events observed\".",
+    },
+    // Write-protect-copy (CoW) fault block.
+    HostStateMetricDef {
+        name: "wpcopy_delay_count",
+        rule: AggRule::SumCount(|t| t.wpcopy_delay_count),
+        sched_class: None,
+        config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
+        is_dead: false,
+        description: "Number of write-protect-copy (CoW) fault wait windows (taskstats wpcopy_count).",
+    },
+    HostStateMetricDef {
+        name: "wpcopy_delay_total_ns",
+        rule: AggRule::SumNs(|t| t.wpcopy_delay_total_ns),
+        sched_class: None,
+        config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
+        is_dead: false,
+        description: "Cumulative ns waiting on write-protect-copy faults (taskstats wpcopy_delay_total).",
+    },
+    HostStateMetricDef {
+        name: "wpcopy_delay_max_ns",
+        rule: AggRule::MaxPeak(|t| t.wpcopy_delay_max_ns),
+        sched_class: None,
+        config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
+        is_dead: false,
+        description: "Longest single write-protect-copy fault wait observed, ns (taskstats wpcopy_delay_max).",
+    },
+    HostStateMetricDef {
+        name: "wpcopy_delay_min_ns",
+        rule: AggRule::MaxPeak(|t| t.wpcopy_delay_min_ns),
+        sched_class: None,
+        config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
+        is_dead: false,
+        description: "Shortest non-zero write-protect-copy fault wait observed, ns (taskstats wpcopy_delay_min). Sentinel 0 means \"no events observed\".",
+    },
+    // IRQ-handler delay block. Updates from `delayacct_irq` in
+    // `kernel/delayacct.c` — counts kernel-IRQ time charged to
+    // the task.
+    HostStateMetricDef {
+        name: "irq_delay_count",
+        rule: AggRule::SumCount(|t| t.irq_delay_count),
+        sched_class: None,
+        config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
+        is_dead: false,
+        description: "Number of IRQ-handler windows charged to the task (taskstats irq_count).",
+    },
+    HostStateMetricDef {
+        name: "irq_delay_total_ns",
+        rule: AggRule::SumNs(|t| t.irq_delay_total_ns),
+        sched_class: None,
+        config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
+        is_dead: false,
+        description: "Cumulative ns of IRQ handling charged to the task (taskstats irq_delay_total).",
+    },
+    HostStateMetricDef {
+        name: "irq_delay_max_ns",
+        rule: AggRule::MaxPeak(|t| t.irq_delay_max_ns),
+        sched_class: None,
+        config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
+        is_dead: false,
+        description: "Longest single IRQ-handler window observed, ns (taskstats irq_delay_max).",
+    },
+    HostStateMetricDef {
+        name: "irq_delay_min_ns",
+        rule: AggRule::MaxPeak(|t| t.irq_delay_min_ns),
+        sched_class: None,
+        config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
+        is_dead: false,
+        description: "Shortest non-zero IRQ-handler window observed, ns (taskstats irq_delay_min). Sentinel 0 means \"no events observed\".",
+    },
+    // Lifetime memory watermarks. Updates from `xacct_add_tsk` in
+    // `kernel/tsacct.c` — kB → bytes conversion happens at parse
+    // time in `crate::taskstats::parse_taskstats_payload`. Gated
+    // on CONFIG_TASK_XACCT (the "extended accounting" path), NOT
+    // CONFIG_TASK_DELAY_ACCT — `xacct_add_tsk` lives behind
+    // `CONFIG_TASK_XACCT` while delayacct is the parallel
+    // `CONFIG_TASK_DELAY_ACCT` subsystem; the two are
+    // independently selectable.
+    HostStateMetricDef {
+        name: "hiwater_rss_bytes",
+        rule: AggRule::MaxPeakBytes(|t| t.hiwater_rss_bytes),
+        sched_class: None,
+        config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_XACCT"],
+        is_dead: false,
+        description: "Lifetime high-watermark of resident-set size, bytes (taskstats hiwater_rss). Distinct from smaps_rollup_kb[\"Rss\"] which is the CURRENT RSS.",
+    },
+    HostStateMetricDef {
+        name: "hiwater_vm_bytes",
+        rule: AggRule::MaxPeakBytes(|t| t.hiwater_vm_bytes),
+        sched_class: None,
+        config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_XACCT"],
+        is_dead: false,
+        description: "Lifetime high-watermark of virtual-memory size, bytes (taskstats hiwater_vm).",
     },
 ];
 
@@ -2753,6 +3097,16 @@ pub fn aggregate(rule: AggRule, threads: &[&ThreadState]) -> Aggregated {
             let m = crate::metric_types::PeakNs::max_across(threads.iter().map(|t| f(t)));
             Aggregated::Max(m.map(|v| v.0).unwrap_or(0))
         }
+        AggRule::MaxPeakBytes(f) => {
+            // Same Option<Self> + None → Aggregated::Max(0)
+            // collapse as MaxPeak; the difference is only the
+            // typed accessor's unit family — Bytes vs Ns. The
+            // ladder() match maps this variant to
+            // ScaleLadder::Bytes so the renderer auto-scales
+            // with KiB/MiB/GiB/TiB suffixes.
+            let m = crate::metric_types::PeakBytes::max_across(threads.iter().map(|t| f(t)));
+            Aggregated::Max(m.map(|v| v.0).unwrap_or(0))
+        }
         AggRule::MaxGaugeNs(f) => {
             let m = crate::metric_types::GaugeNs::max_across(threads.iter().map(|t| f(t)));
             Aggregated::Max(m.map(|v| v.0).unwrap_or(0))
@@ -3442,12 +3796,13 @@ impl AggRule {
             // accessor. SumCount and MaxGaugeCount both produce a
             // unitless count; SumNs / MaxPeak / MaxGaugeNs all
             // produce a ns value; SumTicks produces ticks;
-            // SumBytes produces bytes.
+            // SumBytes / MaxPeakBytes produce bytes.
             AggRule::SumCount(_) => ScaleLadder::Unitless,
             AggRule::SumNs(_) => ScaleLadder::Ns,
             AggRule::SumTicks(_) => ScaleLadder::Ticks,
             AggRule::SumBytes(_) => ScaleLadder::Bytes,
             AggRule::MaxPeak(_) => ScaleLadder::Ns,
+            AggRule::MaxPeakBytes(_) => ScaleLadder::Bytes,
             AggRule::MaxGaugeNs(_) => ScaleLadder::Ns,
             AggRule::MaxGaugeCount(_) => ScaleLadder::Unitless,
             // Range / Mode / Affinity carry no ladder — the
@@ -4753,6 +5108,27 @@ pub fn write_metric_list<W: fmt::Write>(w: &mut W) -> fmt::Result {
     writeln!(
         w,
         "  [TASK_IO_ACCOUNTING]    requires CONFIG_TASK_IO_ACCOUNTING; gates /proc/<tid>/io."
+    )?;
+    writeln!(
+        w,
+        "  [TASKSTATS]             requires CONFIG_TASKSTATS; gates the netlink TASKSTATS family"
+    )?;
+    writeln!(
+        w,
+        "                          (kernel/taskstats.c) used by the taskstats delay-accounting"
+    )?;
+    writeln!(
+        w,
+        "                          and hiwater_rss/hiwater_vm capture path. Calls also need"
+    )?;
+    writeln!(w, "                          CAP_NET_ADMIN.")?;
+    writeln!(
+        w,
+        "  [TASK_XACCT]            requires CONFIG_TASK_XACCT; gates extended accounting fields"
+    )?;
+    writeln!(
+        w,
+        "                          (hiwater_rss, hiwater_vm) populated by xacct_add_tsk."
     )?;
     writeln!(w)?;
     writeln!(w, "status:")?;
@@ -6976,6 +7352,216 @@ mod tests {
                 &["CONFIG_TASK_IO_ACCOUNTING"],
                 false,
             ),
+            // taskstats delay accounting — every entry is
+            // double-gated on CONFIG_TASKSTATS (the netlink family
+            // registration in `kernel/taskstats.c`) and
+            // CONFIG_TASK_DELAY_ACCT (the per-task counters in
+            // `kernel/delayacct.c`). Operator-visible behavior:
+            // missing either gate collapses every field to zero.
+            (
+                "cpu_delay_count",
+                None,
+                &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
+                false,
+            ),
+            (
+                "cpu_delay_total_ns",
+                None,
+                &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
+                false,
+            ),
+            (
+                "cpu_delay_max_ns",
+                None,
+                &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
+                false,
+            ),
+            (
+                "cpu_delay_min_ns",
+                None,
+                &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
+                false,
+            ),
+            (
+                "blkio_delay_count",
+                None,
+                &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
+                false,
+            ),
+            (
+                "blkio_delay_total_ns",
+                None,
+                &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
+                false,
+            ),
+            (
+                "blkio_delay_max_ns",
+                None,
+                &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
+                false,
+            ),
+            (
+                "blkio_delay_min_ns",
+                None,
+                &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
+                false,
+            ),
+            (
+                "swapin_delay_count",
+                None,
+                &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
+                false,
+            ),
+            (
+                "swapin_delay_total_ns",
+                None,
+                &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
+                false,
+            ),
+            (
+                "swapin_delay_max_ns",
+                None,
+                &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
+                false,
+            ),
+            (
+                "swapin_delay_min_ns",
+                None,
+                &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
+                false,
+            ),
+            (
+                "freepages_delay_count",
+                None,
+                &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
+                false,
+            ),
+            (
+                "freepages_delay_total_ns",
+                None,
+                &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
+                false,
+            ),
+            (
+                "freepages_delay_max_ns",
+                None,
+                &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
+                false,
+            ),
+            (
+                "freepages_delay_min_ns",
+                None,
+                &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
+                false,
+            ),
+            (
+                "thrashing_delay_count",
+                None,
+                &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
+                false,
+            ),
+            (
+                "thrashing_delay_total_ns",
+                None,
+                &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
+                false,
+            ),
+            (
+                "thrashing_delay_max_ns",
+                None,
+                &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
+                false,
+            ),
+            (
+                "thrashing_delay_min_ns",
+                None,
+                &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
+                false,
+            ),
+            (
+                "compact_delay_count",
+                None,
+                &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
+                false,
+            ),
+            (
+                "compact_delay_total_ns",
+                None,
+                &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
+                false,
+            ),
+            (
+                "compact_delay_max_ns",
+                None,
+                &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
+                false,
+            ),
+            (
+                "compact_delay_min_ns",
+                None,
+                &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
+                false,
+            ),
+            (
+                "wpcopy_delay_count",
+                None,
+                &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
+                false,
+            ),
+            (
+                "wpcopy_delay_total_ns",
+                None,
+                &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
+                false,
+            ),
+            (
+                "wpcopy_delay_max_ns",
+                None,
+                &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
+                false,
+            ),
+            (
+                "wpcopy_delay_min_ns",
+                None,
+                &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
+                false,
+            ),
+            (
+                "irq_delay_count",
+                None,
+                &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
+                false,
+            ),
+            (
+                "irq_delay_total_ns",
+                None,
+                &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
+                false,
+            ),
+            (
+                "irq_delay_max_ns",
+                None,
+                &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
+                false,
+            ),
+            (
+                "irq_delay_min_ns",
+                None,
+                &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
+                false,
+            ),
+            (
+                "hiwater_rss_bytes",
+                None,
+                &["CONFIG_TASKSTATS", "CONFIG_TASK_XACCT"],
+                false,
+            ),
+            (
+                "hiwater_vm_bytes",
+                None,
+                &["CONFIG_TASKSTATS", "CONFIG_TASK_XACCT"],
+                false,
+            ),
         ];
         // Set-equality: registry keys vs matrix keys.
         let registry_names: std::collections::BTreeSet<&str> =
@@ -7017,7 +7603,9 @@ mod tests {
             "CONFIG_SCHED_CORE",
             "CONFIG_TASK_DELAY_ACCT",
             "CONFIG_TASK_IO_ACCOUNTING",
+            "CONFIG_TASK_XACCT",
             "CONFIG_SCHED_CLASS_EXT",
+            "CONFIG_TASKSTATS",
         ]
         .into_iter()
         .collect();
@@ -8643,6 +9231,14 @@ mod tests {
         assert!(
             out.contains("[TASK_IO_ACCOUNTING]"),
             "missing [TASK_IO_ACCOUNTING] in legend:\n{out}",
+        );
+        assert!(
+            out.contains("[TASKSTATS]"),
+            "missing [TASKSTATS] in legend:\n{out}",
+        );
+        assert!(
+            out.contains("[TASK_XACCT]"),
+            "missing [TASK_XACCT] in legend:\n{out}",
         );
         // status vocabulary
         assert!(out.contains("[dead]"), "missing [dead] in legend:\n{out}");
