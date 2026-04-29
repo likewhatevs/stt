@@ -6619,7 +6619,6 @@ pub fn write_diff<W: fmt::Write>(
                 if let Some(m) = b {
                     keys_union.extend(m.keys());
                 }
-                let mut first_row_for_process = true;
                 for sk in keys_union {
                     let av = a.and_then(|m| m.get(sk).copied());
                     let bv = b.and_then(|m| m.get(sk).copied());
@@ -6647,48 +6646,32 @@ pub fn write_diff<W: fmt::Write>(
                         let pct = (delta as f64 / a_val as f64) * 100.0;
                         format!("{pct:+.1}%")
                     };
-                    let dc = if delta > 0 {
-                        comfy_table::Color::Yellow
-                    } else if delta < 0 {
-                        comfy_table::Color::Magenta
-                    } else {
-                        comfy_table::Color::White
-                    };
-                    let proc_label = if first_row_for_process {
-                        first_row_for_process = false;
-                        if is_compound {
-                            format!("  {display_process}")
-                        } else {
-                            display_process.to_string()
-                        }
-                    } else {
-                        String::new()
-                    };
-                    let delta_f = if av.is_some() && bv.is_some() {
+                    let cg_depth = last_segs.len();
+                    let group_label = format!("{}  {}", "  ".repeat(cg_depth + 1), sk);
+                    let delta_opt: Option<f64> = if av.is_some() && bv.is_some() {
                         Some(delta as f64)
                     } else {
                         None
                     };
-                    let row_cells: Vec<comfy_table::Cell> = columns
+                    let string_cells: Vec<String> = columns
                         .iter()
                         .map(|c| match c {
-                            Column::Group => comfy_table::Cell::new(&proc_label),
-                            Column::Threads => comfy_table::Cell::new(""),
-                            Column::Metric => comfy_table::Cell::new(sk.clone()),
-                            Column::Arrow => comfy_table::Cell::new(&value_cell),
-                            Column::Delta => comfy_table::Cell::new(&delta_cell).fg(dc),
-                            Column::Pct => {
-                                let mut cell = comfy_table::Cell::new(&pct_cell).fg(dc);
-                                if matches!(delta_f, Some(d) if d.abs() > 0.5) {
-                                    cell = cell.add_attribute(comfy_table::Attribute::Bold);
-                                }
-                                cell
-                            }
-                            Column::Uptime => comfy_table::Cell::new(""),
-                            _ => comfy_table::Cell::new(""),
+                            Column::Group => group_label.clone(),
+                            Column::Threads => String::new(),
+                            Column::Metric => display_process.to_string(),
+                            Column::Arrow => value_cell.clone(),
+                            Column::Delta => delta_cell.clone(),
+                            Column::Pct => pct_cell.clone(),
+                            Column::Uptime => String::new(),
+                            _ => String::new(),
                         })
                         .collect();
-                    st.add_row(row_cells);
+                    let cells: Vec<comfy_table::Cell> = string_cells
+                        .into_iter()
+                        .zip(columns.iter())
+                        .map(|(s, col)| color_diff_cell(s, *col, delta_opt, None))
+                        .collect();
+                    st.add_row(cells);
                 }
             }
             writeln!(w, "{st}")?;
