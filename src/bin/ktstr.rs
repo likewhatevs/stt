@@ -403,11 +403,14 @@ enum CtprofCommand {
     /// pattern has the highest run-time without comparing two
     /// runs.
     ///
-    /// Pattern normalization (`comm` token-based clustering and
-    /// `cgroup` Layer-1/2/3 path tightening) applies the same way
-    /// it does in `compare`; `--no-thread-normalize` and
-    /// `--no-cg-normalize` disable each axis. `--cgroup-flatten`
-    /// glob patterns also apply unchanged.
+    /// Pattern normalization (`comm` and `pcomm` token-based
+    /// clustering, `cgroup` Layer-1/2/3 path tightening, and
+    /// `## smaps_rollup` per-process pcomm-pattern aggregation)
+    /// applies the same way it does in `compare`;
+    /// `--no-thread-normalize` disables the name-family axes
+    /// (comm, pcomm, smaps) and `--no-cg-normalize` disables the
+    /// cgroup axis. `--cgroup-flatten` glob patterns also apply
+    /// unchanged.
     Show(CtprofShowArgs),
     /// Print every registered metric with its tags and a
     /// one-line description.
@@ -455,20 +458,18 @@ pub struct CtprofShowArgs {
     /// `ktstr ctprof compare --cgroup-flatten`. Repeatable.
     #[arg(long, help_heading = "Grouping")]
     pub cgroup_flatten: Vec<String>,
-    /// Disable token-based pattern normalization across the
-    /// name-family axes: `--group-by comm` and
-    /// `--group-by pcomm`. Threads / processes group by their
-    /// literal name; the digit/hex/alpha-prefix placeholders are
-    /// bypassed. Has no effect under `--group-by comm-exact`
-    /// (already literal) or `--group-by cgroup`.
-    ///
-    /// Note: `smaps_rollup` normalization on `ktstr ctprof show`
-    /// is unaffected — the show-side renders one row per
-    /// captured leader thread directly off the per-PID
-    /// `pcomm[tgid]` shape regardless of this flag. Pcomm /
-    /// smaps normalization gating via `--no-thread-normalize`
-    /// applies on the compare side only (see
-    /// `ktstr ctprof compare --help`).
+    /// Disable token-based pattern normalization across every
+    /// name-family axis: `--group-by comm`, `--group-by pcomm`,
+    /// AND the `## smaps_rollup` per-process keying (which
+    /// normalizes by the pcomm pattern by default — see
+    /// `ctprof_compare::collect_smaps_rollup`). With this flag
+    /// set, threads / processes group by their literal name and
+    /// smaps rows preserve their per-PID identity
+    /// (`pcomm[tgid]`) instead of collapsing to the normalized
+    /// pcomm pattern. The digit/hex/alpha-prefix placeholders
+    /// are bypassed on every axis. Has no effect under
+    /// `--group-by comm-exact` (already literal) or
+    /// `--group-by cgroup`.
     #[arg(long, help_heading = "Grouping")]
     pub no_thread_normalize: bool,
     /// Disable token-based pattern normalization for the cgroup
@@ -489,6 +490,12 @@ pub struct CtprofShowArgs {
     /// a group keep registry order. Empty (the default) keeps
     /// the alphabetical group-key iteration. Example:
     /// `--sort-by run_time_ns,wait_sum:asc`.
+    ///
+    /// Affects only the per-thread metric table and the derived-
+    /// metrics section. The `## smaps_rollup` sub-table sorts
+    /// process rows independently by total Rss descending (its
+    /// own built-in default); `--sort-by` does not propagate to
+    /// it.
     #[arg(long, default_value = "", help_heading = "Display")]
     pub sort_by: String,
     /// Comma-separated column names to render. Empty (the
@@ -1395,45 +1402,88 @@ fn write_show<W: std::fmt::Write>(
         }
     }
 
-    // Per-process smaps_rollup sub-table — one row per
-    // (process, key) pair across the captured threads. Per-MM
-    // (process-wide), so each leader thread (tid == tgid)
-    // contributes a complete map; non-leader threads contribute
-    // an empty map (leader-dedup at capture). Renders as a
-    // long-table with `pcomm[tgid] | key | value` so the same
-    // process at different points in time is distinguishable
-    // from different processes sharing a pcomm. Suppressed when
-    // every captured thread has an empty map (older kernels,
-    // stripped permissions, synthetic fixtures). Skip
-    // zero-valued entries to keep output bounded — Pss for an
-    // unmapped process is meaningfully zero, but
-    // ShmemPmdMapped=0 etc. are noise rows. kB→B conversion
-    // for the auto_scale "B" ladder lives in
-    // [`ThreadState::smaps_rollup_bytes`].
+    // Per-process smaps_rollup sub-table. Routes through the
+    // shared [`ctprof_compare::collect_smaps_rollup`] so the
+    // show-side keying and aggregation match the compare-side
+    // exactly: under default normalization the key is
+    // `pattern_key(&t.pcomm)` (tgid dropped) and per-PID rows
+    // sharing the same pcomm pattern have their byte counts
+    // field-summed; under `--no-thread-normalize` the literal
+    // `pcomm[tgid]` shape is preserved so each PID stays
+    // attributable. Process iteration order: descending by Rss,
+    // tiebreak descending Pss, final tiebreak alphabetical
+    // (mirrors the compare-side sort). Skip zero-valued entries
+    // per-row to keep output bounded — Pss for an unmapped
+    // process is meaningfully zero, but ShmemPmdMapped=0 etc.
+    // are noise rows. Suppressed when no captured thread has a
+    // populated map (older kernels, stripped permissions,
+    // synthetic fixtures).
+    //
+    // Smaps keys can differ from primary-table Pcomm group
+    // keys for singleton digit pcomms — smaps always normalizes
+    // (`worker-{N}` even when only one PID matches), while the
+    // primary table reverts singletons to the literal pcomm
+    // (`worker-7`); see [`ctprof_compare::collect_smaps_rollup`]
+    // for the asymmetry and its rationale (cross-snapshot diff
+    // joining vs. intra-snapshot fleet aggregation).
+    //
+    // Smaps keying is independent of `--group-by`: the keys
+    // reflect the per-process pcomm pattern regardless of
+    // whether the operator selected `cgroup`, `comm`, `pcomm`,
+    // or `comm-exact` for the primary table. The smaps section
+    // reads pcomm directly off each leader thread, not the
+    // post-grouping bucket key.
     if display_options.is_section_enabled(ctprof_compare::Section::Smaps) {
-        let smaps_rows: Vec<(&ctprof::ThreadState, &String, ktstr::metric_types::Bytes)> = snap
-            .threads
-            .iter()
-            .filter(|t| !t.smaps_rollup_kb.is_empty())
-            .flat_map(|t| {
-                t.smaps_rollup_bytes()
-                    .filter(|(_, b)| b.0 != 0)
-                    .map(move |(k, b)| (t, k, b))
-            })
-            .collect();
-        if !smaps_rows.is_empty() {
-            writeln!(w)?;
-            writeln!(w, "## smaps_rollup")?;
-            let mut st = display_options.new_table();
-            st.set_header(vec!["process", "key", "value"]);
-            for (t, key, bytes) in &smaps_rows {
-                st.add_row(vec![
-                    format!("{}[{}]", t.pcomm, t.tgid),
-                    (*key).clone(),
-                    ctprof_compare::format_scaled_u64(bytes.0, ctprof_compare::ScaleLadder::Bytes),
-                ]);
+        let smaps = ctprof_compare::collect_smaps_rollup(snap, no_thread_normalize);
+        if !smaps.is_empty() {
+            let mut process_keys: Vec<&String> = smaps.keys().collect();
+            process_keys.sort_by(|a, b| {
+                let max_for = |pkey: &&String, field: &str| -> u64 {
+                    smaps
+                        .get(*pkey)
+                        .and_then(|m| m.get(field).copied())
+                        .unwrap_or(0)
+                };
+                max_for(b, "Rss")
+                    .cmp(&max_for(a, "Rss"))
+                    .then_with(|| max_for(b, "Pss").cmp(&max_for(a, "Pss")))
+                    .then_with(|| a.cmp(b))
+            });
+            // Pre-pass: every (process, key) pair with non-zero
+            // value emits a row. Suppress the section header when
+            // no rows would render (e.g. every value is zero).
+            let any_row = process_keys.iter().any(|pkey| {
+                smaps
+                    .get(*pkey)
+                    .map(|m| m.values().any(|v| *v != 0))
+                    .unwrap_or(false)
+            });
+            if any_row {
+                writeln!(w)?;
+                writeln!(w, "## smaps_rollup")?;
+                let mut st = display_options.new_table();
+                st.set_header(vec!["process", "key", "value"]);
+                for pkey in &process_keys {
+                    // `process_keys` is built from `smaps.keys()`,
+                    // so every entry resolves — index directly to
+                    // make the invariant explicit.
+                    let m = &smaps[*pkey];
+                    for (key, bytes) in m {
+                        if *bytes == 0 {
+                            continue;
+                        }
+                        st.add_row(vec![
+                            (*pkey).clone(),
+                            key.clone(),
+                            ctprof_compare::format_scaled_u64(
+                                *bytes,
+                                ctprof_compare::ScaleLadder::Bytes,
+                            ),
+                        ]);
+                    }
+                }
+                writeln!(w, "{st}")?;
             }
-            writeln!(w, "{st}")?;
         }
     }
 
@@ -2707,6 +2757,188 @@ mod tests {
             alpha_at < zulu_at,
             "empty sort_by must keep alphabetical order \
              (alpha before zulu); alpha={alpha_at} zulu={zulu_at}\nout:\n{out}",
+        );
+    }
+
+    /// `write_show` smaps section under default normalization
+    /// keys by `pattern_key(&t.pcomm)` (drops the tgid) and
+    /// field-sums byte counts across PIDs sharing the same
+    /// pcomm pattern. Three `worker-{0,1,2}` leaders (each with
+    /// its own ephemeral tgid) collapse into one `worker-{N}`
+    /// row per smaps_rollup field, with values summed.
+    #[test]
+    fn write_show_smaps_default_normalization_collapses_pids() {
+        let mut snap = ktstr::ctprof::CtprofSnapshot::default();
+        for (pcomm, tgid, rss) in [
+            ("worker-0", 100, 1024_u64),
+            ("worker-1", 200, 2048),
+            ("worker-2", 300, 4096),
+        ] {
+            let mut t = ktstr::ctprof::ThreadState::default();
+            t.tid = tgid;
+            t.tgid = tgid;
+            t.pcomm = pcomm.to_string();
+            t.comm = pcomm.to_string();
+            t.smaps_rollup_kb.insert("Rss".into(), rss);
+            t.smaps_rollup_kb.insert("Pss".into(), rss / 2);
+            snap.threads.push(t);
+        }
+
+        let mut out = String::new();
+        write_show(
+            &mut out,
+            &snap,
+            ctprof_compare::GroupBy::Pcomm,
+            &[],
+            false, // no_thread_normalize: false → normalize
+            false,
+            &[],
+            &[],
+            &[],
+            &[],
+            false,
+        )
+        .expect("write_show must not fail");
+
+        // Find the smaps section.
+        let smaps_at = out
+            .find("## smaps_rollup")
+            .expect("smaps section must render");
+        let after = &out[smaps_at..];
+        // Normalized key surfaces; literal per-PID keys do not.
+        assert!(
+            after.contains("worker-{N}"),
+            "show smaps must collapse to `worker-{{N}}` under default normalization:\n{after}",
+        );
+        for literal in &["worker-0[100]", "worker-1[200]", "worker-2[300]"] {
+            assert!(
+                !after.contains(literal),
+                "literal per-PID key {literal:?} must NOT appear under default \
+                 normalization:\n{after}",
+            );
+        }
+        // Summed Rss = (1024 + 2048 + 4096) * 1024 = 7168 KiB =
+        // 7168*1024 bytes = 7340032 B → step-up to MiB
+        // (1024*1024 = 1048576), so 7340032 / 1048576 ≈ 7.000 MiB.
+        assert!(
+            after.contains("7.000MiB"),
+            "summed Rss must render as `7.000MiB` (3-PID collapse via field-sum):\n{after}",
+        );
+    }
+
+    /// `write_show` smaps section under `--no-thread-normalize`
+    /// preserves the literal `pcomm[tgid]` key shape so each
+    /// PID stays attributable. Same fixture as the default-mode
+    /// test, but with `no_thread_normalize: true` — the section
+    /// emits three rows (one per PID), not one collapsed row.
+    #[test]
+    fn write_show_smaps_literal_mode_preserves_per_pid_keys() {
+        let mut snap = ktstr::ctprof::CtprofSnapshot::default();
+        for (pcomm, tgid, rss) in [
+            ("worker-0", 100, 1024_u64),
+            ("worker-1", 200, 2048),
+            ("worker-2", 300, 4096),
+        ] {
+            let mut t = ktstr::ctprof::ThreadState::default();
+            t.tid = tgid;
+            t.tgid = tgid;
+            t.pcomm = pcomm.to_string();
+            t.comm = pcomm.to_string();
+            t.smaps_rollup_kb.insert("Rss".into(), rss);
+            snap.threads.push(t);
+        }
+
+        let mut out = String::new();
+        write_show(
+            &mut out,
+            &snap,
+            ctprof_compare::GroupBy::Pcomm,
+            &[],
+            true, // no_thread_normalize: true → literal
+            false,
+            &[],
+            &[],
+            &[],
+            &[],
+            false,
+        )
+        .expect("write_show must not fail");
+
+        let smaps_at = out
+            .find("## smaps_rollup")
+            .expect("smaps section must render");
+        let after = &out[smaps_at..];
+        // Literal per-PID keys surface; normalized form does not.
+        for literal in &["worker-0[100]", "worker-1[200]", "worker-2[300]"] {
+            assert!(
+                after.contains(literal),
+                "literal per-PID key {literal:?} must surface under \
+                 --no-thread-normalize:\n{after}",
+            );
+        }
+        assert!(
+            !after.contains("worker-{N}"),
+            "normalized `worker-{{N}}` key must NOT surface under \
+             --no-thread-normalize:\n{after}",
+        );
+    }
+
+    /// `write_show` smaps section sorts process rows by Rss
+    /// descending, mirroring the compare-side sort. Two
+    /// processes — `bash` (literal pcomm, large Rss) and
+    /// `worker-{N}` collapsed bucket (small per-thread Rss but
+    /// summed across PIDs). The heavier process must render
+    /// first regardless of alphabetical key order.
+    #[test]
+    fn write_show_smaps_orders_by_rss_descending() {
+        let mut snap = ktstr::ctprof::CtprofSnapshot::default();
+        // bash: 100 MiB Rss.
+        let mut bash = ktstr::ctprof::ThreadState::default();
+        bash.tid = 1;
+        bash.tgid = 1;
+        bash.pcomm = "bash".to_string();
+        bash.comm = "bash".to_string();
+        bash.smaps_rollup_kb.insert("Rss".into(), 100 * 1024);
+        bash.smaps_rollup_kb.insert("Pss".into(), 50 * 1024);
+        snap.threads.push(bash);
+        // zulu: 1 MiB Rss only — much smaller, but
+        // alphabetically AFTER bash.
+        let mut zulu = ktstr::ctprof::ThreadState::default();
+        zulu.tid = 2;
+        zulu.tgid = 2;
+        zulu.pcomm = "zulu".to_string();
+        zulu.comm = "zulu".to_string();
+        zulu.smaps_rollup_kb.insert("Rss".into(), 1024);
+        zulu.smaps_rollup_kb.insert("Pss".into(), 512);
+        snap.threads.push(zulu);
+
+        let mut out = String::new();
+        write_show(
+            &mut out,
+            &snap,
+            ctprof_compare::GroupBy::Pcomm,
+            &[],
+            false,
+            false,
+            &[],
+            &[],
+            &[],
+            &[],
+            false,
+        )
+        .expect("write_show must not fail");
+
+        let smaps_at = out
+            .find("## smaps_rollup")
+            .expect("smaps section must render");
+        let after = &out[smaps_at..];
+        let bash_pos = after.find("bash").expect("bash key must surface");
+        let zulu_pos = after.find("zulu").expect("zulu key must surface");
+        assert!(
+            bash_pos < zulu_pos,
+            "smaps must sort by Rss desc — bash (100 MiB) ahead of \
+             zulu (1 MiB) regardless of alphabetical order; \
+             bash@{bash_pos} zulu@{zulu_pos}\nafter:\n{after}",
         );
     }
 }
