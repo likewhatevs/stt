@@ -6436,7 +6436,14 @@ pub fn write_diff<W: fmt::Write>(
             writeln!(w)?;
             writeln!(w, "## smaps_rollup")?;
             let mut st = display.new_table();
-            st.set_header(vec!["process", "key", "value"]);
+            st.set_header(vec![
+                "process",
+                "key",
+                "baseline",
+                "candidate",
+                "delta",
+                "%",
+            ]);
             for pkey in &sorted_process_keys {
                 let a = diff.smaps_rollup_a.get(*pkey);
                 let b = diff.smaps_rollup_b.get(*pkey);
@@ -6446,29 +6453,38 @@ pub fn write_diff<W: fmt::Write>(
                     keys_union.extend(m.keys());
                 }
                 for sk in keys_union {
-                    // Values are already bytes (per
-                    // collect_smaps_rollup) so the auto_scale
-                    // "B" ladder applies directly.
                     let av = a.and_then(|m| m.get(sk).copied());
                     let bv = b.and_then(|m| m.get(sk).copied());
-                    // Per-row gate: skip rows where the
-                    // `Option<u64>` baseline equals the
-                    // `Option<u64>` candidate. Two `None`s
-                    // (process or key absent on both sides) and
-                    // two equal `Some`s both compare equal under
-                    // `Option`'s derived `PartialEq`. A `None`
-                    // vs `Some` mismatch surfaces — reflects a
-                    // process that gained/lost smaps_rollup
-                    // visibility across the two snapshots,
-                    // which IS the kind of change the user
-                    // wants to see.
                     if av == bv {
                         continue;
                     }
+                    let a_val = av.unwrap_or(0);
+                    let b_val = bv.unwrap_or(0);
+                    let baseline_cell = av
+                        .map(|v| format_scaled_u64(v, ScaleLadder::Bytes))
+                        .unwrap_or_else(|| "-".to_string());
+                    let candidate_cell = bv
+                        .map(|v| format_scaled_u64(v, ScaleLadder::Bytes))
+                        .unwrap_or_else(|| "-".to_string());
+                    let delta = b_val as i128 - a_val as i128;
+                    let delta_cell = if av.is_none() || bv.is_none() {
+                        "-".to_string()
+                    } else {
+                        format_delta_cell(delta as f64, ScaleLadder::Bytes)
+                    };
+                    let pct_cell = if a_val == 0 {
+                        "-".to_string()
+                    } else {
+                        let pct = (delta as f64 / a_val as f64) * 100.0;
+                        format!("{pct:+.1}%")
+                    };
                     st.add_row(vec![
                         pkey.to_string(),
                         sk.clone(),
-                        cgroup_cell(av, bv, ScaleLadder::Bytes),
+                        baseline_cell,
+                        candidate_cell,
+                        delta_cell,
+                        pct_cell,
                     ]);
                 }
             }
