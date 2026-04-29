@@ -164,20 +164,126 @@ assigned different UUIDs.
 ### Aggregation rules
 
 Each metric declares its own aggregation rule
-([`HOST_STATE_METRICS`] in `src/host_state_compare.rs`):
+([`HOST_STATE_METRICS`] in `src/host_state_compare.rs`). The
+`AggRule` enum is **typed**: each variant binds an accessor of a
+specific [`metric_types`] newtype (`MonotonicCount`,
+`MonotonicNs`, `PeakNs`, `Bytes`, etc.) so a registry entry that
+pairs a peak field with a sum reduction (e.g. `t.wait_max`
+([`PeakNs`]) bound to a `Sum*` rule) fails to compile rather
+than producing a meaningless `1×1s ⊕ 1000×1ms` aggregate. The
+13 variants split into four families:
 
-- **Sum** (most counters) — cumulative values add. Delta is the
-  signed difference; percent delta is relative to the before-
-  side.
-- **OrdinalRange** (`nice`) — min / max across the group; the
-  renderer shows `[min, max]` and the delta uses the midpoint
-  so a shift on either end is visible.
-- **Mode** (`policy`) — the most-common policy name and its
-  share of the group. No scalar, so rows sort to the bottom of
-  the default sort.
-- **Affinity** (`cpu_affinity`) — aggregates into an
-  `AffinitySummary` with `min_cpus` / `max_cpus` and a `uniform`
-  flag. Heterogeneous groups render as `"N-M cpus (mixed)"`.
+#### Sum reductions (cumulative counters)
+
+| Variant | Newtype | Output unit | Examples |
+|---|---|---|---|
+| `SumCount` | `MonotonicCount` | unitless | `nr_wakeups`, `voluntary_csw`, `minflt`, `wait_count`, `iowait_count`, `timeslices` |
+| `SumNs` | `MonotonicNs` | ns | `run_time_ns`, `wait_time_ns`, `wait_sum`, `voluntary_sleep_ns`, `block_sum`, `iowait_sum`, `core_forceidle_sum` |
+| `SumTicks` | `ClockTicks` | USER\_HZ ticks | `utime_clock_ticks`, `stime_clock_ticks`, `delayacct_blkio_ticks` |
+| `SumBytes` | `Bytes` | bytes (IEC) | `allocated_bytes`, `deallocated_bytes`, `rchar`, `wchar`, `read_bytes`, `write_bytes`, `cancelled_write_bytes` |
+
+Group reduction: `saturating_add` per the no-wraparound contract.
+Delta is the signed difference; percent delta is relative to the
+before-side. Auto-scale ladder is decimal SI for ns / count,
+USER\_HZ for ticks, IEC binary for bytes.
+
+#### Max reductions (peaks and gauges)
+
+| Variant | Newtype | Output unit | Examples |
+|---|---|---|---|
+| `MaxPeak` | `PeakNs` | ns | `wait_max`, `sleep_max`, `block_max`, `exec_max`, `slice_max` |
+| `MaxGaugeNs` | `GaugeNs` | ns | `fair_slice_ns` (current scheduler slice) |
+| `MaxGaugeCount` | `GaugeCount` | unitless | `nr_threads` (process-wide thread count) |
+
+`MaxPeak` rows surface the worst single window any thread in the
+group has ever observed — summing per-thread maxes would
+conflate "one thread with a 1s spike" with "1000 threads with
+1ms spikes each". `MaxGaugeNs` / `MaxGaugeCount` apply to
+instantaneous gauges (read at capture time) where summing has no
+physical meaning. `nr_threads` specifically is leader-only
+(populated on `tid == tgid`, zero elsewhere); `Max` reads through
+the leader so a comm-bucketed group still surfaces the largest
+process represented in the bucket.
+
+#### Range reductions (bounded ordinals)
+
+| Variant | Newtype | Output | Examples |
+|---|---|---|---|
+| `RangeI32` | `OrdinalI32` | `[min, max]` (i64-widened) | `nice`, `priority`, `processor` |
+| `RangeU32` | `OrdinalU32` | `[min, max]` (i64-widened) | `rt_priority` |
+
+The renderer shows `[min, max]` and the delta uses the midpoint
+so a shift on either end is visible.
+
+#### Mode reductions (categorical)
+
+| Variant | Newtype | Output | Examples |
+|---|---|---|---|
+| `Mode` | `CategoricalString` | most-frequent value + count/total | `policy` |
+| `ModeChar` | `char` (coerced) | most-frequent char + count/total | `state` |
+| `ModeBool` | `bool` (coerced) | most-frequent bool + count/total | `ext_enabled` |
+
+Mode is textual: delta is `"same"` if both modes agree,
+`"differs"` otherwise — there is no arithmetic on a categorical
+value. `ModeChar` and `ModeBool` coerce to `String` via
+`to_string()` before reducing because the underlying types are
+not themselves `Modeable`. A 50/50 bool tie resolves
+lex-smallest-wins (so `"false"` wins over `"true"`); operators
+reading a `false` mode in a heterogeneous bucket should check
+the `count/total` fraction.
+
+#### Affinity reduction (CPU sets)
+
+| Variant | Newtype | Output | Example |
+|---|---|---|---|
+| `Affinity` | `CpuSet` | `AffinitySummary { min_cpus, max_cpus, uniform }` | `cpu_affinity` |
+
+Heterogeneous groups render as `"N-M cpus (mixed)"`. Unlike the
+other rules, `Affinity` does not route through a
+[`metric_types`] trait — its reduction produces a structured
+summary, not a homogeneous newtype.
+
+[`metric_types`]: https://likewhatevs.github.io/ktstr/api/ktstr/metric_types/index.html
+[`PeakNs`]: https://likewhatevs.github.io/ktstr/api/ktstr/metric_types/struct.PeakNs.html
+
+### Derived metrics
+
+Derived metrics consume one or more already-aggregated input
+metrics from `HOST_STATE_METRICS` and produce a single scalar
+with its own auto-scale ladder. They render in a separate
+`## Derived metrics` table below the per-thread table on both
+`compare` and `show`. Registered in `HOST_STATE_DERIVED_METRICS`
+in `src/host_state_compare.rs`.
+
+The full registry as of this writing is eight entries. Every
+formula is implemented as a closure over the group's metrics
+map (`BTreeMap<String, Aggregated>`); a missing input or a
+zero denominator yields `None`, which the renderer surfaces as
+`-` so the operator can distinguish "not computable" from
+"computed as zero".
+
+| Metric | Formula | Inputs | Unit | Notes |
+|---|---|---|---|---|
+| `affine_success_ratio` | `nr_wakeups_affine / nr_wakeups_affine_attempts` | `nr_wakeups_affine`, `nr_wakeups_affine_attempts` | ratio (0..1) | `wake_affine()` success ratio. CFS-only signal — sched_ext does not increment the wakeup counters. Bare three-decimal scalar; the renderer suppresses the `%` column for ratio rows because absolute delta on a `[0, 1]` ratio is already in percentage points. |
+| `avg_wait_ns` | `wait_sum / wait_count` | `wait_sum`, `wait_count` | ns | Average runqueue-wait duration per scheduling event. Rendered with the ns auto-scale ladder (ns → µs → ms → s). Schedstat-gated (see `wait_sum` and `wait_count`); zero across sched\_ext threads. |
+| `cpu_efficiency` | `run_time_ns / (run_time_ns + wait_time_ns)` | `run_time_ns`, `wait_time_ns` | ratio (0..1) | Fraction of total scheduler-tracked time spent on-CPU. Higher = less time stuck on the runqueue. Both inputs gated by `CONFIG_SCHED_INFO`. |
+| `avg_slice_ns` | `run_time_ns / timeslices` | `run_time_ns`, `timeslices` | ns | Average on-CPU slice length. Useful for spotting timeslice-tuning regressions (e.g. an `sched_min_granularity_ns` change that shrinks slices). Both inputs gated by `CONFIG_SCHED_INFO`. |
+| `involuntary_csw_ratio` | `nonvoluntary_csw / (voluntary_csw + nonvoluntary_csw)` | `nonvoluntary_csw`, `voluntary_csw` | ratio (0..1) | Fraction of context switches that were preemptions (kernel pulled the task off-CPU) vs. voluntary blocks. High values indicate preemption pressure; low values indicate cooperative blocking. |
+| `disk_io_fraction` | `read_bytes / rchar` | `read_bytes`, `rchar` | ratio (≥ 0) | Fraction of read syscall bytes that traveled past the pagecache layer (cache miss rate; covers local block devices and network filesystems alike). Typically ≤ 1.0, but **can exceed 1** when readahead pulls more bytes past the pagecache layer than the syscall requested. Both inputs gated by `CONFIG_TASK_IO_ACCOUNTING`. |
+| `live_heap_estimate` | `allocated_bytes - deallocated_bytes` (signed) | `allocated_bytes`, `deallocated_bytes` | bytes (IEC, signed) | jemalloc-only live-heap estimate. Glibc and other allocators feed both inputs zero so the derived metric reads zero too — `-` would imply non-computable but here zero is the genuine reading. Renders on the IEC binary ladder (B → KiB → MiB → GiB → TiB). Per-thread reading carries cross-thread noise: a thread that purely frees objects allocated by other threads reads large negative values; group-level Sum across all threads of the process eliminates the asymmetry. |
+| `avg_iowait_ns` | `iowait_sum / iowait_count` | `iowait_sum`, `iowait_count` | ns | Average iowait interval per blocking event. Schedstat-gated; zero across sched\_ext threads. |
+
+The `is_ratio` column on the registry is load-bearing for the
+renderer: ratio rows skip the `%` column entirely (the absolute
+delta already carries percentage-point semantics for a `[0, 1]`
+quantity), and the auto-scale ladder is `None` (bare three-
+decimal scalar). Non-ratio derived metrics reuse the same
+ladders as their unit family — `Ns` for nanosecond derivations,
+`Bytes` for byte derivations.
+
+Derived metrics are surfaced by `host-state metric-list`
+alongside the primary registry, and are valid `--sort-by` keys
+on both `compare` and `show`.
 
 ### Output and interpretation
 
@@ -219,6 +325,129 @@ Compression level `3` (matching the ktstr remote-cache
 convention): adequate ratio at fast speed, and host-state
 captures are small enough that further compression produces
 diminishing returns on I/O.
+
+## Adding a metric
+
+Adding a per-thread metric to the registry is a three-step
+mechanical process. The type system enforces the wiring so a
+mismatch between the kernel-source semantic and the aggregation
+rule fails to compile rather than producing a silently-wrong
+group reduction.
+
+### 1. Add a `ThreadState` field with the right newtype
+
+Pick the [`metric_types`] newtype that matches the kernel-source
+semantic of the field — the per-newtype docs name the kernel
+call sites that update each category. The shape determines what
+aggregation rules are legal in step 3:
+
+| Newtype | When to use |
+|---|---|
+| `MonotonicCount` | Pure counter — only goes up across the thread's lifetime. Examples: `nr_wakeups`, syscall counts. |
+| `DeadCounter` | Same shape as `MonotonicCount` but tagged for kernel counters with no live writer (always reads zero). Captured for parser parity but does NOT implement any reduction trait — register with `is_dead: true` and the renderer flags it `[dead]`. |
+| `MonotonicNs` | Cumulative-time counter in ns. Examples: `run_time_ns`, `wait_sum`. |
+| `PeakNs` | Lifetime high-water mark in ns. Kernel updates via `if (delta > stat->max) stat->max = delta`. Summing peaks is a category error. Examples: `wait_max`, `slice_max`. |
+| `GaugeNs` | Instantaneous gauge sampled at capture time (ns). Cannot sum — N near-identical samples collapse to N×gauge with no meaning. Example: `fair_slice_ns`. |
+| `GaugeCount` | Instantaneous unitless count that goes up AND down. Example: `nr_threads`. |
+| `ClockTicks` | USER_HZ-scaled time. Examples: `utime_clock_ticks`, `delayacct_blkio_ticks`. |
+| `Bytes` | Byte counts. IEC binary auto-scale ladder. Examples: `read_bytes`, `wchar`. |
+| `OrdinalI32` / `OrdinalU32` / `OrdinalU64` | Bounded scalar — range-aggregated, not summable. Examples: `nice` (i32), `rt_priority` (u32). |
+| `CategoricalString` | Categorical value — mode-aggregated. Examples: `policy`. |
+| `CpuSet` | CPU affinity mask — affinity-aggregated. Example: `cpu_affinity`. |
+
+Add the field to `ThreadState` in `src/host_state.rs`:
+
+```rust,ignore
+// In ThreadState struct definition.
+/// Description: what the field counts, what kernel call site
+/// writes it, and what scheduler classes increment it. Cite
+/// `kernel/sched/...` line numbers for the writer.
+pub my_new_metric: crate::metric_types::MonotonicCount,
+```
+
+### 2. Wire the capture path
+
+`capture_thread_at_with_tally` in `src/host_state.rs` is the
+single per-thread procfs walk. Add the per-source reader (or
+extend an existing one) and stamp the field in the
+`ThreadState { ... }` construction:
+
+```rust,ignore
+// Inside capture_thread_at_with_tally, after the existing
+// per-source reads. Wrap in the newtype constructor; never use
+// `.into()` (the typed-newtype style is explicit).
+my_new_metric: MonotonicCount(sched.my_new_metric.unwrap_or(0)),
+```
+
+The `Option::unwrap_or(0)` collapse is load-bearing: the
+profiler's contract is "never fail the snapshot," so a missing
+reading lands at the newtype's `Default::default()` (zero). The
+absent reading is indistinguishable from a genuine zero in the
+output — see the *Capture is best-effort* section.
+
+### 3. Register the metric
+
+Append a `HostStateMetricDef` entry to `HOST_STATE_METRICS` in
+`src/host_state_compare.rs`. The `AggRule` variant must match the
+newtype chosen in step 1 — the type system enforces this.
+
+```rust,ignore
+HostStateMetricDef {
+    name: "my_new_metric",
+    rule: AggRule::SumCount(|t| t.my_new_metric),
+    sched_class: None, // or Some("cfs-only") / Some("non-ext") / Some("fair-policy")
+    config_gates: &[], // or &["CONFIG_SCHEDSTATS"], etc.
+    is_dead: false,    // true for kernel-side dead pointers
+    description: "One-line operator-facing description; surfaces in `host-state metric-list`.",
+},
+```
+
+The `name` field is the canonical metric identifier — used by
+`--sort-by`, `--columns`, and the `metric-list` output. Names
+are ASCII short-form (matching the capture-side field name where
+possible). `sched_class` and `config_gates` render as bracketed
+suffixes in `metric-list` output (`[cfs-only]`, `[SCHEDSTATS]`)
+so operators reading a row know which kernels populate the
+counter.
+
+### Compile-time guards
+
+The type system catches the four most common mistakes:
+
+- **Wrong reduction family**: pairing a `PeakNs` accessor with
+  `AggRule::SumNs` fails with a type error — `PeakNs` does not
+  implement `Summable` (only `Maxable`), and the closure's
+  return type does not match the variant's expected newtype.
+- **Wrong unit family**: pairing a `Bytes` accessor with
+  `AggRule::SumNs` fails the same way.
+- **Dead counter with live reduction**: `DeadCounter` does not
+  implement `Summable` / `Maxable` / `Rangeable` / `Modeable`,
+  so any `AggRule::Sum*` / `Max*` / `Range*` / `Mode*` variant
+  bound to a dead-counter accessor fails to compile. Register
+  the metric only via the `is_dead: true` flag with whichever
+  variant matches its shape — the rendering layer surfaces it
+  as `[dead]` and skips numeric reduction.
+- **Categorical with numeric reduction**: pairing a
+  `CategoricalString` accessor with `AggRule::SumCount` fails
+  because `CategoricalString` does not implement `Summable`.
+
+The closure body cannot be type-checked beyond the variant
+boundary, so a body that actively miswraps a field — e.g.
+`SumNs(|t| MonotonicNs(t.wait_max.0))` laundering a peak through
+the sum wrapper — type-checks. Don't do that. The wrapper
+category is load-bearing; the type system catches the variant
+mismatch but not the lying inside.
+
+### Optional: derived metric
+
+If the new metric has a useful ratio or sum-of-ratios pairing
+with existing inputs, register a `DerivedMetricDef` in
+`HOST_STATE_DERIVED_METRICS` (same file). The `compute` closure
+reads inputs via `input_scalar(metrics, name)?` and returns
+`Option<DerivedValue>`; the `ratio_compute` and
+`ratio_of_sum_compute` helpers cover the two most common
+shapes. Set `is_ratio: true` when the output is in `[0, 1]` so
+the renderer suppresses the `%` column.
 
 ## Related
 

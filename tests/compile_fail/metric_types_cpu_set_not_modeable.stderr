@@ -1,0 +1,18 @@
+error[E0277]: `CpuSet` is not Modeable — Modeable is reserved for CategoricalString in this codebase
+  --> tests/compile_fail/metric_types_cpu_set_not_modeable.rs:15:24
+   |
+15 |     require_modeable::<ktstr::metric_types::CpuSet>();
+   |                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^ this metric type does not support mode-across
+   |
+   = help: the trait `Modeable` is not implemented for `CpuSet`
+   = note: CategoricalString is the only Modeable type today. Numeric types use Summable / Maxable / Rangeable depending on category. If a new categorical newtype needs mode-aggregation, add the impl in metric_types.rs.
+help: the trait `Modeable` is implemented for `CategoricalString`
+  --> src/metric_types.rs
+   |
+   | impl Modeable for CategoricalString {}
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+note: required by a bound in `require_modeable`
+  --> tests/compile_fail/metric_types_cpu_set_not_modeable.rs:12:24
+   |
+12 | fn require_modeable<T: ktstr::metric_types::Modeable>() {}
+   |                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `require_modeable`

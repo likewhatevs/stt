@@ -1076,21 +1076,49 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
 
 /// Output value of a derived metric.
 ///
-/// Derived metrics carry an `f64` scalar — ratios fall in `[0, 1]`
-/// or `[0, ∞)`, averages can hit any positive value, and signed
-/// differences (e.g. `live_heap_estimate = allocated_bytes -
-/// deallocated_bytes`) can go negative when a freelist drains
-/// memory allocated before capture began. `f64` is the natural
-/// shape for all three; specific units come from the
-/// [`DerivedMetricDef::unit`] tag at the carry site, not the
-/// value type.
+/// Derived metrics carry an `f64` scalar. The `f64` carrier is
+/// chosen because the value range varies across derivations:
+/// - `[0, 1]` ratios: `cpu_efficiency`, `affine_success_ratio`,
+///   `involuntary_csw_ratio`.
+/// - `[0, ∞)` ratios: `disk_io_fraction` (readahead can pull more
+///   block-device bytes than the syscall requested, so the ratio
+///   exceeds 1.0 in practice).
+/// - `[0, ∞)` per-event means: `avg_wait_ns`, `avg_slice_ns`,
+///   `avg_iowait_ns` — sum over count, both non-negative.
+/// - `(-∞, ∞)` signed differences: `live_heap_estimate` =
+///   `allocated_bytes - deallocated_bytes` can go negative when
+///   the deallocation total exceeds the allocation total (a
+///   freelist drains memory allocated before capture began, or
+///   the per-thread TSD counters were sampled mid-update on a
+///   thread that has just released a large arena).
+///
+/// All four shapes flow through the same `f64` carrier. The
+/// per-derivation auto-scale ladder lives on
+/// [`DerivedMetricDef::ladder`] (not on the value type) so the
+/// renderer picks the right magnitude (ns / Bytes / unitless)
+/// per row regardless of whether the value is positive, zero,
+/// negative, fractional, or in the millions. The `is_ratio`
+/// flag on [`DerivedMetricDef`] toggles between the auto-scaled
+/// path (e.g. `1.500ms`, `7.500GiB`) and the raw three-decimal
+/// path (`0.873` for ratios).
+///
+/// Sign preservation: the [`auto_scale`] step uses `abs()` for
+/// the threshold check but propagates the original signed value
+/// through the scaled output, and [`format_derived_value_cell`]
+/// / [`format_derived_delta_cell`] both render with `{value:.2}`
+/// or `{value:.3}` formatters that preserve the explicit `-` for
+/// negatives. The [`auto_scale_preserves_sign_on_negative_input`]
+/// regression test pins this for the Bytes and ns ladders.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[non_exhaustive]
 pub enum DerivedValue {
-    /// Floating-point value. Render via the unit-aware path:
-    /// ratios (unit `""`) format with three decimals (`0.873`);
-    /// `"ns"` and `"B"` route through the same auto-scale
-    /// ladders the main table uses.
+    /// Floating-point value. Render via the
+    /// [`DerivedMetricDef::ladder`] + [`DerivedMetricDef::is_ratio`]
+    /// pair: ratios format with three decimals (`0.873`,
+    /// `+0.100`); ladder-bearing values
+    /// ([`ScaleLadder::Ns`] / [`ScaleLadder::Bytes`] / etc.)
+    /// route through the same auto-scale ladders the main table
+    /// uses.
     Scalar(f64),
 }
 
@@ -1132,12 +1160,32 @@ pub struct DerivedMetricDef {
     /// documentation — surfaces in the `metric-list` output so
     /// the operator sees what each derivation depends on.
     pub inputs: &'static [&'static str],
-    /// True when the unit of this derivation is a ratio (`[0, 1]`
-    /// or `[0, ∞)`); the renderer suppresses the `%` column for
-    /// ratio rows because absolute delta on a `[0, 1]` ratio is
-    /// already in percentage points (0.5 → 0.6 = +0.100 = +10pp).
-    /// `delta_pct` of a ratio is potentially confusing so we
-    /// drop it entirely.
+    /// Render-shape flag for dimensionless quantities. When true,
+    /// the renderer (1) suppresses the `%` (delta_pct) column,
+    /// (2) renders the value as `N.NNN` with three decimals
+    /// instead of routing through the auto-scale ladder, and
+    /// (3) renders the delta as `+/-N.NNN` (no scaled unit
+    /// suffix).
+    ///
+    /// The `[0, 1]` interval is the common case where this flag
+    /// applies: `cpu_efficiency`, `affine_success_ratio`, and
+    /// `involuntary_csw_ratio` all live in `[0, 1]`. Delta on a
+    /// `[0, 1]` ratio reads as percentage points
+    /// (0.5 → 0.6 = +0.100 = +10pp), and `delta / baseline` as
+    /// a fraction (the `%` column) becomes confusing — `+20%` on
+    /// a `[0, 1]` ratio is already in percentage points, so a
+    /// percentage-of-percentage readout double-encodes the
+    /// signal.
+    ///
+    /// `disk_io_fraction` (range `[0, ∞)`) carries `is_ratio: true`
+    /// for the rendering shape but does NOT satisfy the
+    /// percentage-points interpretation: a value of 1.5 is
+    /// possible (readahead pulls more block-device bytes than
+    /// the syscall requested), so a delta of +0.100 reads as
+    /// "ratio rose by 0.1" rather than "ratio rose by 10
+    /// percentage points." The render shape is still correct
+    /// (suppress `%`, three decimals, no auto-scale) — only the
+    /// pp interpretation is invalid.
     pub is_ratio: bool,
     /// The computation. Pulls input scalars from the group's
     /// metrics map via `Aggregated::numeric()` and produces the
@@ -1205,7 +1253,7 @@ pub static HOST_STATE_DERIVED_METRICS: &[DerivedMetricDef] = &[
     DerivedMetricDef {
         name: "avg_wait_ns",
         ladder: ScaleLadder::Ns,
-        description: "Average runqueue-wait duration: wait_sum / wait_count.",
+        description: "Average runqueue-wait duration per scheduling event: wait_sum / wait_count (ns/event).",
         inputs: &["wait_sum", "wait_count"],
         is_ratio: false,
         compute: |m| ratio_compute(m, "wait_sum", "wait_count"),
@@ -1227,7 +1275,7 @@ pub static HOST_STATE_DERIVED_METRICS: &[DerivedMetricDef] = &[
     DerivedMetricDef {
         name: "avg_slice_ns",
         ladder: ScaleLadder::Ns,
-        description: "Average on-CPU slice length: run_time_ns / timeslices.",
+        description: "Average on-CPU slice length per timeslice: run_time_ns / timeslices (ns/timeslice).",
         inputs: &["run_time_ns", "timeslices"],
         is_ratio: false,
         compute: |m| ratio_compute(m, "run_time_ns", "timeslices"),
@@ -1251,7 +1299,7 @@ pub static HOST_STATE_DERIVED_METRICS: &[DerivedMetricDef] = &[
     DerivedMetricDef {
         name: "live_heap_estimate",
         ladder: ScaleLadder::Bytes,
-        description: "jemalloc live-heap estimate: allocated_bytes - deallocated_bytes (signed).",
+        description: "jemalloc live-heap estimate: allocated_bytes - deallocated_bytes. Signed: negative when deallocations dominate (freelist drains memory allocated before capture, or sampled mid-update on a thread that just released a large arena). Renders with explicit `-` and the IEC binary suffix (e.g. `-1.907MiB`).",
         inputs: &["allocated_bytes", "deallocated_bytes"],
         is_ratio: false,
         compute: |m| {
@@ -1263,7 +1311,7 @@ pub static HOST_STATE_DERIVED_METRICS: &[DerivedMetricDef] = &[
     DerivedMetricDef {
         name: "avg_iowait_ns",
         ladder: ScaleLadder::Ns,
-        description: "Average iowait interval: iowait_sum / iowait_count.",
+        description: "Average iowait interval per iowait event: iowait_sum / iowait_count (ns/event).",
         inputs: &["iowait_sum", "iowait_count"],
         is_ratio: false,
         compute: |m| ratio_compute(m, "iowait_sum", "iowait_count"),
@@ -4122,13 +4170,78 @@ pub fn parse_sections(spec: &str) -> anyhow::Result<Vec<Section>> {
     Ok(out)
 }
 
+/// Parse a CLI `--metrics` spec into a typed
+/// `Vec<&'static str>` of registry names. Format:
+/// comma-separated names that must each match a `name` field
+/// from either [`HOST_STATE_METRICS`] or
+/// [`HOST_STATE_DERIVED_METRICS`]. Whitespace around each name
+/// is trimmed. Empty input parses to an empty `Vec` — caller
+/// treats that as "every metric renders" via
+/// [`DisplayOptions::is_metric_enabled`], mirroring
+/// [`parse_sections`]'s empty-input semantic.
+///
+/// The returned `&'static str`s point into the registry's own
+/// `name` fields (not into the input `spec`), so the parsed
+/// vector survives the input string going out of scope and
+/// equality checks against registry names are pointer-stable.
+///
+/// Errors (mirrored from [`parse_sections`] / [`parse_columns`]
+/// so the three CLI surfaces report drift identically):
+/// - Unknown name (cite the offending token).
+/// - Duplicate name across two entries.
+/// - Empty token between commas.
+pub fn parse_metrics(spec: &str) -> anyhow::Result<Vec<&'static str>> {
+    if spec.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut out: Vec<&'static str> = Vec::new();
+    let mut seen: std::collections::BTreeSet<&'static str> = std::collections::BTreeSet::new();
+    for entry in spec.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            anyhow::bail!(
+                "empty entry in --metrics spec {spec:?}; \
+                 entries are comma-separated and must be non-empty"
+            );
+        }
+        // Linear scan over both registries — name lookup is
+        // not on a hot path. Returns the registry's own
+        // `&'static str` so the parsed vec is pointer-stable
+        // and survives the input string's lifetime.
+        let primary = HOST_STATE_METRICS
+            .iter()
+            .find(|m| m.name == entry)
+            .map(|m| m.name);
+        let derived = HOST_STATE_DERIVED_METRICS
+            .iter()
+            .find(|d| d.name == entry)
+            .map(|d| d.name);
+        let Some(name) = primary.or(derived) else {
+            anyhow::bail!(
+                "unknown metric {entry:?} in --metrics spec {spec:?}; \
+                 must be one of the names from `host-state metric-list` \
+                 (HOST_STATE_METRICS or HOST_STATE_DERIVED_METRICS)",
+            );
+        };
+        if !seen.insert(name) {
+            anyhow::bail!(
+                "duplicate metric {entry:?} in --metrics spec {spec:?}; \
+                 each metric may appear at most once"
+            );
+        }
+        out.push(name);
+    }
+    Ok(out)
+}
+
 /// Aggregate display options for the renderer. Plumbed as a
 /// single struct through [`write_diff`] so a future addition
 /// lands in one place without growing every signature. The
 /// show-side entry (`write_show` in `src/bin/ktstr.rs`) keeps
 /// a flatter signature for historical reasons but mirrors the
-/// same field semantics — `--wrap` and `--sections` reach show
-/// via `wrap` / `sections` parameters that share the same
+/// same field semantics — `--wrap`, `--sections`, `--metrics`
+/// reach show via `wrap` / `sections` / `metrics` parameters
+/// that share the same
 /// helpers (`new_wrapped_table`, [`Section::cli_name`]).
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
@@ -4151,6 +4264,21 @@ pub struct DisplayOptions {
     /// Non-empty restricts the rendered output to the listed
     /// sections only. Set via [`parse_sections`].
     pub sections: Vec<Section>,
+    /// User-supplied per-metric row filter; empty Vec means
+    /// "render every metric in the primary + derived sections"
+    /// — the unfiltered default. Non-empty restricts the
+    /// rendered rows to the listed metric names (which must
+    /// be in [`HOST_STATE_METRICS`] or
+    /// [`HOST_STATE_DERIVED_METRICS`]). Set via
+    /// [`parse_metrics`].
+    ///
+    /// Distinct from [`Self::sections`]: sections gate whole
+    /// sub-tables (primary, derived, cgroup-stats, …);
+    /// metrics gate individual ROWS within the primary and
+    /// derived sub-tables. The two compose — naming
+    /// `--sections primary` and `--metrics run_time_ns` shows
+    /// a single primary row.
+    pub metrics: Vec<&'static str>,
 }
 
 impl DisplayOptions {
@@ -4183,6 +4311,18 @@ impl DisplayOptions {
     /// `sections` restricts rendering to the named entries.
     pub fn is_section_enabled(&self, section: Section) -> bool {
         self.sections.is_empty() || self.sections.contains(&section)
+    }
+
+    /// Returns `true` when the metric named `name` should
+    /// render under the current row-level filter. Empty
+    /// `metrics` means "every metric renders" — the
+    /// unfiltered default mirroring
+    /// [`Self::is_section_enabled`]. Non-empty restricts
+    /// rendering to the listed names. The comparison is on
+    /// the metric's `&'static str` name (so a registry-name
+    /// pointer or any byte-equal string both match).
+    pub fn is_metric_enabled(&self, name: &str) -> bool {
+        self.metrics.is_empty() || self.metrics.contains(&name)
     }
 
     /// Construct a comfy-table builder honouring the
@@ -4364,7 +4504,7 @@ pub struct HostStateCompareArgs {
     /// `--no-thread-normalize` to disable that collapse and group
     /// by literal `comm` instead. `comm-exact` is a synonym for
     /// `comm --no-thread-normalize`.
-    #[arg(long, value_enum, default_value_t = GroupBy::Pcomm)]
+    #[arg(long, value_enum, default_value_t = GroupBy::Pcomm, help_heading = "Grouping")]
     pub group_by: GroupBy,
     /// Glob patterns that collapse dynamic cgroup path segments
     /// so structurally-equivalent cgroups across runs group
@@ -4373,14 +4513,14 @@ pub struct HostStateCompareArgs {
     /// pod IDs as the same group. Repeatable. Independent of
     /// `--no-cg-normalize`: explicit globs apply first, then
     /// auto-normalize runs unless disabled.
-    #[arg(long)]
+    #[arg(long, help_heading = "Grouping")]
     pub cgroup_flatten: Vec<String>,
     /// Disable token-based pattern normalization for the thread
     /// axis (`--group-by comm`). Threads group by literal `comm`
     /// — the digit/hex/alpha-prefix placeholders are bypassed.
     /// Has no effect under any other grouping. Mirror of
     /// `--no-cg-normalize` for the cgroup axis.
-    #[arg(long)]
+    #[arg(long, help_heading = "Grouping")]
     pub no_thread_normalize: bool,
     /// Disable token-based pattern normalization for the cgroup
     /// axis (`--group-by cgroup`). Cgroup paths group by literal
@@ -4388,7 +4528,7 @@ pub struct HostStateCompareArgs {
     /// `@<id>.service` → `@{I}.service`), Layer 2 (token
     /// normalization), and Layer 3 (tighten) are all bypassed.
     /// Has no effect under any other grouping.
-    #[arg(long)]
+    #[arg(long, help_heading = "Grouping")]
     pub no_cg_normalize: bool,
     /// Multi-key sort spec for the diff rows. Format:
     /// `metric1[:dir1],metric2[:dir2],...` where each `metric` is
@@ -4402,7 +4542,7 @@ pub struct HostStateCompareArgs {
     /// `--sort-by wait_sum:desc,run_time_ns:desc`.
     ///
     /// Parsed by [`parse_sort_by`] into [`CompareOptions::sort_by`].
-    #[arg(long, default_value = "")]
+    #[arg(long, default_value = "", help_heading = "Display")]
     pub sort_by: String,
     /// Per-row column layout. `full` (default) emits the
     /// seven-column form; `delta-only` drops baseline +
@@ -4411,7 +4551,7 @@ pub struct HostStateCompareArgs {
     /// single cell; `pct-only` keeps just the percentage.
     /// `--columns` (below) overrides the format's default
     /// column set when both are present.
-    #[arg(long, value_enum, default_value_t = DisplayFormat::Full)]
+    #[arg(long, value_enum, default_value_t = DisplayFormat::Full, help_heading = "Display")]
     pub display_format: DisplayFormat,
     /// Comma-separated column names to render. Empty (the
     /// default) means "use the column set selected by
@@ -4422,7 +4562,7 @@ pub struct HostStateCompareArgs {
     /// `primary` section's per-metric table only; secondary
     /// tables (cgroup-stats, smaps-rollup, etc.) have fixed
     /// column shapes and ignore this flag.
-    #[arg(long, default_value = "")]
+    #[arg(long, default_value = "", help_heading = "Display")]
     pub columns: String,
     /// Comma-separated section names to render. Empty (the
     /// default) renders every section that has data. When
@@ -4434,8 +4574,21 @@ pub struct HostStateCompareArgs {
     /// `host-pressure`, `smaps-rollup`, `sched-ext`. Useful for
     /// narrowing a wide compare to one area of interest.
     /// Example: `--sections primary,host-pressure`.
-    #[arg(long, default_value = "")]
+    #[arg(long, default_value = "", help_heading = "Filter")]
     pub sections: String,
+    /// Comma-separated metric names to render. Empty (the
+    /// default) renders every metric in the primary and
+    /// derived sub-tables. When non-empty, restricts the
+    /// rendered ROWS to the listed names — names must come
+    /// from the `host-state metric-list` vocabulary
+    /// (HOST_STATE_METRICS or HOST_STATE_DERIVED_METRICS).
+    /// Useful for zooming on a specific counter family
+    /// without computing every metric: `--metrics
+    /// run_time_ns,wait_sum,affine_success_ratio`. Composes
+    /// with `--sections` — naming `--sections primary
+    /// --metrics run_time_ns` shows a single primary row.
+    #[arg(long, default_value = "", help_heading = "Filter")]
+    pub metrics: String,
     /// Wrap table cells to fit the terminal width. Off by
     /// default — wide tables can spill past the terminal edge,
     /// matching the prior shell-pipeline-friendly layout. When
@@ -4446,7 +4599,7 @@ pub struct HostStateCompareArgs {
     /// file or another command, the flag is silently dropped
     /// and output stays unwrapped so awk/grep pipelines see
     /// the same byte sequence as without the flag.
-    #[arg(long)]
+    #[arg(long, help_heading = "Display")]
     pub wrap: bool,
 }
 
@@ -4470,13 +4623,15 @@ pub fn run_compare(args: &HostStateCompareArgs) -> anyhow::Result<i32> {
         .with_context(|| format!("parse --sort-by {:?}", args.sort_by))?;
     // Parse --columns alongside --sort-by so a malformed spec
     // surfaces before the snapshot loads. compare_side: true
-    // for the diff renderer. --sections shares the same
-    // fail-fast contract — an unknown section name should not
-    // pay for two snapshot loads before failing.
+    // for the diff renderer. --sections / --metrics share the
+    // same fail-fast contract — an unknown name should not pay
+    // for two snapshot loads before failing.
     let columns = parse_columns(&args.columns, true)
         .with_context(|| format!("parse --columns {:?}", args.columns))?;
     let sections = parse_sections(&args.sections)
         .with_context(|| format!("parse --sections {:?}", args.sections))?;
+    let metrics = parse_metrics(&args.metrics)
+        .with_context(|| format!("parse --metrics {:?}", args.metrics))?;
 
     // Warn the operator if any explicitly-named section is
     // cgroup-only but the requested grouping isn't cgroup —
@@ -4503,6 +4658,7 @@ pub fn run_compare(args: &HostStateCompareArgs) -> anyhow::Result<i32> {
         columns,
         wrap: args.wrap,
         sections,
+        metrics,
     };
     let diff = compare(&baseline, &candidate, &opts);
     print_diff(
@@ -4610,6 +4766,71 @@ pub fn write_metric_list<W: fmt::Write>(w: &mut W) -> fmt::Result {
     )?;
     writeln!(w, "                exposure surface.")?;
     writeln!(w)?;
+
+    // Sections vocabulary table — discovery companion to the
+    // `--sections` CLI flag. Lists every Section variant in
+    // rendering order with its CLI name and a short description
+    // of what it renders. Operators reading the rendered table
+    // see `--sections primary,host-pressure` (or whatever) in
+    // their compare/show invocation and need a way to learn
+    // which sub-tables those tokens correspond to without
+    // jumping to source. This section closes that loop.
+    writeln!(w, "## Sections")?;
+    writeln!(w)?;
+    let mut sections_table = crate::cli::new_table();
+    sections_table.set_header(vec!["section", "rendered heading", "description"]);
+    for section in Section::ALL {
+        let (heading, desc) = match section {
+            Section::Primary => (
+                "(no heading; first table)",
+                "Per-thread metric table — the primary aggregated rows.",
+            ),
+            Section::Derived => (
+                "## Derived metrics",
+                "Computed metrics derived from the primary registry (ratios, averages, signed differences).",
+            ),
+            Section::CgroupStats => (
+                "(no heading; cgroup-stats table)",
+                "Per-cgroup CPU + memory enrichment from cpu.stat / memory.current. Requires --group-by cgroup.",
+            ),
+            Section::Limits => (
+                "## Cgroup limits / knobs",
+                "Operator-set cgroup configuration — cpu.max, cpu.weight, memory.max, memory.high, pids.*. Requires --group-by cgroup.",
+            ),
+            Section::MemoryStat => (
+                "## memory.stat",
+                "Kernel-emitted memory.stat counters per cgroup. Requires --group-by cgroup.",
+            ),
+            Section::MemoryEvents => (
+                "## memory.events",
+                "Pressure-event counters from memory.events per cgroup. Requires --group-by cgroup.",
+            ),
+            Section::Pressure => (
+                "## Pressure / <resource>",
+                "Per-cgroup PSI sub-tables — one per resource (cpu / memory / io / irq). Requires --group-by cgroup.",
+            ),
+            Section::HostPressure => (
+                "## Host pressure / <resource>",
+                "System-level PSI sub-tables from /proc/pressure/<resource>.",
+            ),
+            Section::Smaps => (
+                "## smaps_rollup",
+                "Per-process memory-mapping summary from /proc/<pid>/smaps_rollup (Rss / Pss / private / shared / swap).",
+            ),
+            Section::SchedExt => (
+                "## sched_ext",
+                "Global sched_ext sysfs state — state, switch_all, nr_rejected, hotplug_seq, enable_seq.",
+            ),
+        };
+        sections_table.add_row(vec![
+            section.cli_name().to_string(),
+            heading.to_string(),
+            desc.to_string(),
+        ]);
+    }
+    writeln!(w, "{sections_table}")?;
+    writeln!(w)?;
+
     writeln!(w, "## Metrics")?;
     writeln!(w)?;
     let mut table = crate::cli::new_table();
@@ -4730,6 +4951,13 @@ pub fn write_diff<W: fmt::Write>(
         let header_row: Vec<&str> = columns.iter().map(|c| c.header(group_header)).collect();
         table.set_header(header_row);
         for row in &diff.rows {
+            // `--metrics` filter: skip rows whose metric is not
+            // on the requested allowlist. Empty allowlist = no
+            // filter (every row renders) per
+            // `is_metric_enabled`'s default-empty contract.
+            if !display.is_metric_enabled(row.metric_name) {
+                continue;
+            }
             let cells = render_diff_row_cells(row, &columns);
             table.add_row(cells);
         }
@@ -4743,6 +4971,9 @@ pub fn write_diff<W: fmt::Write>(
         let header_row: Vec<&str> = columns.iter().map(|c| c.header(group_header)).collect();
         dt.set_header(header_row);
         for row in &diff.derived_rows {
+            if !display.is_metric_enabled(row.metric_name) {
+                continue;
+            }
             let cells = render_derived_row_cells(row, &columns);
             dt.add_row(cells);
         }
@@ -7318,6 +7549,153 @@ mod tests {
         }
     }
 
+    // ------------------------------------------------------------
+    // parse_metrics + is_metric_enabled tests
+    //
+    // Mirror the parse_sections / is_section_enabled coverage —
+    // the row-level filter is structurally analogous to the
+    // section filter, so the test shapes match.
+    // ------------------------------------------------------------
+
+    /// Empty / whitespace-only `--metrics` parses to an empty
+    /// `Vec<&str>` — caller treats that as "every metric
+    /// renders" via [`DisplayOptions::is_metric_enabled`]'s
+    /// empty-input short-circuit.
+    #[test]
+    fn parse_metrics_empty_returns_empty_vec() {
+        assert!(parse_metrics("").expect("empty parses").is_empty());
+        assert!(
+            parse_metrics("   ")
+                .expect("whitespace-only parses as empty")
+                .is_empty()
+        );
+    }
+
+    /// Every primary registry name round-trips through
+    /// `parse_metrics`. Walks `HOST_STATE_METRICS` exhaustively
+    /// — adding a new metric to the registry without re-running
+    /// its name through this parser would surface here only if
+    /// the parser silently dropped it; the linear-scan match in
+    /// `parse_metrics` accepts any `name` field, so the test
+    /// is a sanity rail rather than a drift detector.
+    #[test]
+    fn parse_metrics_round_trips_every_primary_registry_name() {
+        for m in HOST_STATE_METRICS {
+            let parsed = parse_metrics(m.name)
+                .unwrap_or_else(|e| panic!("metric name {} failed parse: {e:#}", m.name));
+            assert_eq!(parsed, vec![m.name]);
+        }
+    }
+
+    /// Derived metric names round-trip identically to primary
+    /// metric names — the parser accepts both registries and
+    /// returns the registry's `&'static str` either way. Pins
+    /// the union-of-registries lookup contract.
+    #[test]
+    fn parse_metrics_round_trips_every_derived_registry_name() {
+        for d in HOST_STATE_DERIVED_METRICS {
+            let parsed = parse_metrics(d.name)
+                .unwrap_or_else(|e| panic!("derived name {} failed parse: {e:#}", d.name));
+            assert_eq!(parsed, vec![d.name]);
+        }
+    }
+
+    /// Mixed primary + derived metrics in one spec parse in
+    /// input order. Pins that the parser does not stealthily
+    /// segregate by registry, and that the input-order contract
+    /// matches `parse_sections`.
+    #[test]
+    fn parse_metrics_accepts_primary_and_derived_in_input_order() {
+        // `run_time_ns` is a primary metric, `cpu_efficiency`
+        // is a derived metric — both well-known names that
+        // exist in the live registry.
+        let parsed = parse_metrics("cpu_efficiency,run_time_ns")
+            .expect("mixed primary+derived spec must parse");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0], "cpu_efficiency");
+        assert_eq!(parsed[1], "run_time_ns");
+    }
+
+    /// Unknown metric name surfaces a diagnostic that names the
+    /// offending token and points at `host-state metric-list`.
+    /// The error must mention BOTH registries so the operator
+    /// knows the lookup spans primary + derived.
+    #[test]
+    fn parse_metrics_rejects_unknown_name() {
+        let err = parse_metrics("not_a_real_metric").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("not_a_real_metric"),
+            "error must cite the offending name: {msg}"
+        );
+        assert!(
+            msg.contains("metric-list"),
+            "error must point operator at the discovery command: {msg}"
+        );
+    }
+
+    /// Duplicate metric across two entries rejects.
+    #[test]
+    fn parse_metrics_rejects_duplicate() {
+        let err = parse_metrics("run_time_ns,wait_sum,run_time_ns").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("duplicate"),
+            "error must mention duplicates: {msg}"
+        );
+    }
+
+    /// Empty token between commas (`run_time_ns,,wait_sum`)
+    /// rejects.
+    #[test]
+    fn parse_metrics_rejects_empty_entry() {
+        let err = parse_metrics("run_time_ns,,wait_sum").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("empty"), "error must mention empty: {msg}");
+    }
+
+    /// Whitespace around each entry is trimmed before lookup.
+    #[test]
+    fn parse_metrics_trims_whitespace_around_entries() {
+        let parsed =
+            parse_metrics("  run_time_ns , wait_sum  ").expect("whitespace-tolerant spec parses");
+        assert_eq!(parsed, vec!["run_time_ns", "wait_sum"]);
+    }
+
+    /// Empty `metrics` Vec on [`DisplayOptions`] means "every
+    /// metric is enabled" — the no-filter default. Pins the
+    /// short-circuit in `is_metric_enabled` so a regression
+    /// that flipped the empty case to "no metric enabled"
+    /// surfaces here.
+    #[test]
+    fn is_metric_enabled_empty_treats_all_as_on() {
+        let opts = DisplayOptions::default();
+        // Sample a primary and a derived metric — both must
+        // be enabled under the empty default.
+        assert!(opts.is_metric_enabled("run_time_ns"));
+        assert!(opts.is_metric_enabled("cpu_efficiency"));
+        // Even a name not in any registry returns true under
+        // the empty filter. is_metric_enabled is the gate at
+        // render time; parse_metrics enforces validity at CLI
+        // parse time, so these two checks compose to "filter
+        // restricts only when populated."
+        assert!(opts.is_metric_enabled("anything_under_empty_filter"));
+    }
+
+    /// Non-empty `metrics` Vec restricts rendering to the
+    /// listed names — names IN the filter return true, names
+    /// NOT in the filter return false. Pins the contains
+    /// membership check.
+    #[test]
+    fn is_metric_enabled_non_empty_restricts_to_listed() {
+        let mut opts = DisplayOptions::default();
+        opts.metrics = vec!["run_time_ns", "wait_sum"];
+        assert!(opts.is_metric_enabled("run_time_ns"));
+        assert!(opts.is_metric_enabled("wait_sum"));
+        assert!(!opts.is_metric_enabled("nr_wakeups"));
+        assert!(!opts.is_metric_enabled("cpu_efficiency"));
+    }
+
     /// [`format_cgroup_only_section_warning`] renders a
     /// diagnostic that names the offending section, the
     /// `--group-by cgroup` requirement, AND the operator's
@@ -8042,6 +8420,51 @@ mod tests {
         }
     }
 
+    /// `metric-list` emits the `## Sections` table listing
+    /// every Section variant by its CLI name. Discovery
+    /// companion to the `--sections` flag — operators reading
+    /// the rendered metric-list output should see the full
+    /// vocabulary for `--sections` without needing to read
+    /// source. Pin every cli_name from `Section::ALL`.
+    #[test]
+    fn write_metric_list_emits_sections_vocabulary() {
+        let mut out = String::new();
+        write_metric_list(&mut out).unwrap();
+        assert!(
+            out.contains("## Sections"),
+            "metric-list must emit the Sections vocabulary heading:\n{out}",
+        );
+        for section in Section::ALL {
+            assert!(
+                out.contains(section.cli_name()),
+                "section cli_name {} missing from Sections \
+                 vocabulary table:\n{out}",
+                section.cli_name(),
+            );
+        }
+    }
+
+    /// The Sections vocabulary appears BEFORE the Metrics
+    /// table in the rendered output. Pins the layout order
+    /// so a future refactor that moves Sections after Metrics
+    /// (or drops the heading entirely) surfaces here.
+    #[test]
+    fn write_metric_list_sections_precedes_metrics() {
+        let mut out = String::new();
+        write_metric_list(&mut out).unwrap();
+        let sections_at = out
+            .find("## Sections")
+            .expect("Sections heading must be present");
+        let metrics_at = out
+            .find("## Metrics")
+            .expect("Metrics heading must be present");
+        assert!(
+            sections_at < metrics_at,
+            "Sections heading must precede Metrics heading; \
+             got Sections@{sections_at} Metrics@{metrics_at}\n{out}",
+        );
+    }
+
     /// `format_derived_value_cell` renders a ratio with three
     /// decimals (`0.873`); ns/B values route through auto-scale.
     #[test]
@@ -8092,6 +8515,37 @@ mod tests {
     fn format_derived_delta_cell_ratio_carries_sign() {
         let cell = format_derived_delta_cell(0.1, ScaleLadder::None, true);
         assert_eq!(cell, "+0.100");
+    }
+
+    /// `live_heap_estimate` can go negative when deallocations
+    /// dominate — the renderer must preserve the sign through
+    /// the auto-scale ladder step (here: MiB step-up). Pins the
+    /// signed-Bytes path that f64 carries. Mirrors the
+    /// existing KiB-scale test but exercises the MiB threshold
+    /// so a future regression that drops the sign at a
+    /// higher rung of the ladder still fails.
+    #[test]
+    fn format_derived_value_cell_negative_bytes_at_mib_step() {
+        // -2_000_000 bytes: |abs| = 2_000_000 ≥ 1 MiB (1_048_576),
+        // < 1 GiB (1_073_741_824) → step to MiB.
+        // -2_000_000 / 1_048_576 ≈ -1.907.
+        let v = DerivedValue::Scalar(-2_000_000.0);
+        let cell = format_derived_value_cell(v, ScaleLadder::Bytes, false);
+        assert_eq!(cell, "-1.907MiB");
+    }
+
+    /// `disk_io_fraction` is `is_ratio: true` for the rendering
+    /// shape (three decimals, no `%` column, no auto-scale) but
+    /// can exceed 1.0 in practice — readahead pulls more
+    /// block-device bytes than the syscall requested, pushing
+    /// `read_bytes / rchar` above 1. Pin that the renderer
+    /// emits the value verbatim with three decimals when it
+    /// crosses 1.0 — no clamp, no truncation, no exponent.
+    #[test]
+    fn format_derived_value_cell_ratio_above_one_renders_verbatim() {
+        let v = DerivedValue::Scalar(1.5);
+        let cell = format_derived_value_cell(v, ScaleLadder::None, true);
+        assert_eq!(cell, "1.500");
     }
 
     /// `--sort-by avg_wait_ns` ranks groups by the derived

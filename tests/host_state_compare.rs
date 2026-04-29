@@ -326,6 +326,7 @@ fn run_compare_returns_ok_zero_regardless_of_diff_emptiness() {
         display_format: ktstr::host_state_compare::DisplayFormat::Full,
         columns: String::new(),
         sections: String::new(),
+        metrics: String::new(),
         wrap: false,
     };
     // `run_compare` returns `anyhow::Result<i32>`. The contract
@@ -387,6 +388,7 @@ fn run_compare_with_valid_sort_by_succeeds() {
         display_format: ktstr::host_state_compare::DisplayFormat::Full,
         columns: String::new(),
         sections: String::new(),
+        metrics: String::new(),
         wrap: false,
     };
     let rc = run_compare(&args).expect("run_compare must accept a valid --sort-by spec end-to-end");
@@ -427,6 +429,7 @@ fn run_compare_with_invalid_sort_by_returns_err() {
         display_format: ktstr::host_state_compare::DisplayFormat::Full,
         columns: String::new(),
         sections: String::new(),
+        metrics: String::new(),
         wrap: false,
     };
     let err = run_compare(&args).expect_err("invalid --sort-by must produce Err");

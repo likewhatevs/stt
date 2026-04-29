@@ -1,0 +1,30 @@
+error[E0277]: `MonotonicNs` is not Maxable — `max` is undefined for this category
+  --> tests/compile_fail/metric_types_monotonic_ns_not_maxable.rs:15:23
+   |
+15 |     require_maxable::<ktstr::metric_types::MonotonicNs>();
+   |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this metric type does not support max-across
+   |
+   = help: the trait `Maxable` is not implemented for `MonotonicNs`
+   = note: MonotonicCount/MonotonicNs/ClockTicks/Bytes (Summable cumulative counters): use Summable::sum_across; max-across-snapshots on a lifetime accumulator reduces to the most-recent reading, not a worst window; OrdinalI32/OrdinalU32/OrdinalU64: use Rangeable::range_across; CategoricalString: use Modeable::mode_across; CpuSet: use the AffinitySummary reduction in host_state_compare; DeadCounter: kernel-side dead pointer — value is structurally zero; the registry must use a no-op aggregation arm (or omit the field) rather than max across structural zeros
+help: the following other types implement trait `Maxable`
+  --> src/metric_types.rs
+   |
+   |         impl Maxable for $t {
+   |         ^^^^^^^^^^^^^^^^^^^
+   |         |
+   |         `GaugeCount`
+   |         `GaugeNs`
+   |         `PeakNs`
+...
+   | impl_maxable_only_u64!(PeakNs);
+   | ------------------------------ in this macro invocation
+   | impl_maxable_only_u64!(GaugeNs);
+   | ------------------------------- in this macro invocation
+   | impl_maxable_only_u64!(GaugeCount);
+   | ---------------------------------- in this macro invocation
+note: required by a bound in `require_maxable`
+  --> tests/compile_fail/metric_types_monotonic_ns_not_maxable.rs:12:23
+   |
+12 | fn require_maxable<T: ktstr::metric_types::Maxable>() {}
+   |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `require_maxable`
+   = note: this error originates in the macro `impl_maxable_only_u64` (in Nightly builds, run with -Z macro-backtrace for more info)

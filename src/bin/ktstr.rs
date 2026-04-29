@@ -446,23 +446,23 @@ pub struct HostStateShowArgs {
     /// `comm` aggregates threads by NAME PATTERN under the
     /// token-based normalizer; `comm-exact` is a synonym for
     /// `comm --no-thread-normalize`.
-    #[arg(long, value_enum, default_value_t = host_state_compare::GroupBy::Pcomm)]
+    #[arg(long, value_enum, default_value_t = host_state_compare::GroupBy::Pcomm, help_heading = "Grouping")]
     pub group_by: host_state_compare::GroupBy,
     /// Glob patterns that collapse dynamic cgroup path segments —
     /// same shape as
     /// `ktstr host-state compare --cgroup-flatten`. Repeatable.
-    #[arg(long)]
+    #[arg(long, help_heading = "Grouping")]
     pub cgroup_flatten: Vec<String>,
     /// Disable token-based pattern normalization for the thread
     /// axis (`--group-by comm`). Threads group by literal `comm`.
     /// Has no effect under any other grouping.
-    #[arg(long)]
+    #[arg(long, help_heading = "Grouping")]
     pub no_thread_normalize: bool,
     /// Disable token-based pattern normalization for the cgroup
     /// axis (`--group-by cgroup`). Cgroup paths group by literal
     /// post-`--cgroup-flatten` path. Has no effect under any
     /// other grouping.
-    #[arg(long)]
+    #[arg(long, help_heading = "Grouping")]
     pub no_cg_normalize: bool,
     /// Multi-key sort spec for the rendered groups. Format mirrors
     /// `ktstr host-state compare --sort-by`:
@@ -476,7 +476,7 @@ pub struct HostStateShowArgs {
     /// a group keep registry order. Empty (the default) keeps
     /// the alphabetical group-key iteration. Example:
     /// `--sort-by run_time_ns,wait_sum:asc`.
-    #[arg(long, default_value = "")]
+    #[arg(long, default_value = "", help_heading = "Display")]
     pub sort_by: String,
     /// Comma-separated column names to render. Empty (the
     /// default) emits the full `(group | threads | metric |
@@ -486,7 +486,7 @@ pub struct HostStateShowArgs {
     /// `baseline`/`candidate`/`delta`/`%`/`arrow` columns
     /// (compare-only) are rejected at parse time. Example:
     /// `--columns metric,value`.
-    #[arg(long, default_value = "")]
+    #[arg(long, default_value = "", help_heading = "Display")]
     pub columns: String,
     /// Comma-separated section names to render. Empty (the
     /// default) renders every section that has data. When
@@ -498,8 +498,20 @@ pub struct HostStateShowArgs {
     /// `host-pressure`, `smaps-rollup`, `sched-ext`. Useful
     /// for narrowing a wide show to one area of interest.
     /// Example: `--sections primary,host-pressure`.
-    #[arg(long, default_value = "")]
+    #[arg(long, default_value = "", help_heading = "Filter")]
     pub sections: String,
+    /// Comma-separated metric names to render. Empty (the
+    /// default) renders every metric in the primary and
+    /// derived sub-tables. When non-empty, restricts the
+    /// rendered ROWS to the listed names — names must come
+    /// from the `host-state metric-list` vocabulary. Useful
+    /// for zooming on a specific counter family without
+    /// computing every metric: `--metrics
+    /// run_time_ns,wait_sum,affine_success_ratio`. Composes
+    /// with `--sections` — naming `--sections primary
+    /// --metrics run_time_ns` shows a single primary row.
+    #[arg(long, default_value = "", help_heading = "Filter")]
+    pub metrics: String,
     /// Wrap table cells to fit the terminal width. Off by
     /// default — wide tables can spill past the terminal edge,
     /// matching the prior shell-pipeline-friendly layout. When
@@ -510,7 +522,7 @@ pub struct HostStateShowArgs {
     /// file or another command, the flag is silently dropped
     /// and output stays unwrapped so awk/grep pipelines see
     /// the same byte sequence as without the flag.
-    #[arg(long)]
+    #[arg(long, help_heading = "Display")]
     pub wrap: bool,
 }
 
@@ -736,6 +748,8 @@ fn run_show(args: &HostStateShowArgs) -> Result<i32> {
         .with_context(|| format!("parse --columns {:?}", args.columns))?;
     let sections = host_state_compare::parse_sections(&args.sections)
         .with_context(|| format!("parse --sections {:?}", args.sections))?;
+    let metrics = host_state_compare::parse_metrics(&args.metrics)
+        .with_context(|| format!("parse --metrics {:?}", args.metrics))?;
 
     // Mirror run_compare's pre-load warning: explicit
     // `--sections cgroup-stats` (or any other cgroup-only
@@ -759,6 +773,7 @@ fn run_show(args: &HostStateShowArgs) -> Result<i32> {
         &sort_by,
         &columns,
         &sections,
+        &metrics,
         args.wrap,
     );
     print!("{out}");
@@ -775,8 +790,11 @@ fn run_show(args: &HostStateShowArgs) -> Result<i32> {
 /// `sections` is a [`host_state_compare::Section`] filter — empty
 /// renders every section that has data, non-empty restricts to
 /// the named entries (mirrors `--sections` on `write_diff`).
-/// `wrap` chooses between `Disabled` (fixed-width, default) and
-/// `Dynamic` (terminal-width-aware) comfy-table arrangement.
+/// `metrics` is a row-level filter — empty renders every metric
+/// in the primary and derived sub-tables, non-empty restricts
+/// the rendered rows to the listed names. `wrap` chooses between
+/// `Disabled` (fixed-width, default) and `Dynamic`
+/// (terminal-width-aware) comfy-table arrangement.
 #[allow(clippy::too_many_arguments)]
 fn write_show<W: std::fmt::Write>(
     w: &mut W,
@@ -788,6 +806,7 @@ fn write_show<W: std::fmt::Write>(
     sort_by: &[host_state_compare::SortKey],
     columns: &[host_state_compare::Column],
     sections: &[host_state_compare::Section],
+    metrics: &[&'static str],
     wrap: bool,
 ) -> std::fmt::Result {
     let flatten = host_state_compare::compile_flatten_patterns(cgroup_flatten);
@@ -839,6 +858,7 @@ fn write_show<W: std::fmt::Write>(
     let mut display_options = host_state_compare::DisplayOptions::default();
     display_options.columns = columns.to_vec();
     display_options.sections = sections.to_vec();
+    display_options.metrics = metrics.to_vec();
     display_options.wrap = wrap;
     let resolved_columns = display_options.resolved_show_columns();
 
@@ -924,6 +944,13 @@ fn write_show<W: std::fmt::Write>(
                     (*key).clone()
                 };
             for metric in host_state_compare::HOST_STATE_METRICS {
+                // `--metrics` filter: skip metrics not on the
+                // operator-supplied allowlist. Empty allowlist
+                // = no filter (default) per
+                // `is_metric_enabled`'s default-empty contract.
+                if !display_options.is_metric_enabled(metric.name) {
+                    continue;
+                }
                 let Some(agg) = group.metrics.get(metric.name) else {
                     continue;
                 };
@@ -976,6 +1003,9 @@ fn write_show<W: std::fmt::Write>(
                     (*key).clone()
                 };
             for d in host_state_compare::HOST_STATE_DERIVED_METRICS {
+                if !display_options.is_metric_enabled(d.name) {
+                    continue;
+                }
                 let value_cell = match (d.compute)(&group.metrics) {
                     Some(v) => {
                         host_state_compare::format_derived_value_cell(v, d.ladder, d.is_ratio)
@@ -2198,6 +2228,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             false,
         )
         .expect("write_show into String must not fail");
@@ -2260,6 +2291,7 @@ mod tests {
                 &[],
                 &[],
                 &[],
+                &[],
                 false,
             )
             .expect("write_show into String must not fail");
@@ -2286,6 +2318,7 @@ mod tests {
             &[],
             false,
             false,
+            &[],
             &[],
             &[],
             &[],
@@ -2346,6 +2379,7 @@ mod tests {
             false,
             false,
             &sort_by,
+            &[],
             &[],
             &[],
             false,
@@ -2423,6 +2457,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             false,
         )
         .expect("write_show into String must not fail");
@@ -2483,6 +2518,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             false,
         )
         .expect("write_show into String must not fail");
@@ -2516,6 +2552,7 @@ mod tests {
             &[],
             false,
             false,
+            &[],
             &[],
             &[],
             &[],
@@ -2561,6 +2598,7 @@ mod tests {
             false,
             &[],
             &columns,
+            &[],
             &[],
             false,
         )
@@ -2609,6 +2647,7 @@ mod tests {
             &[],
             false,
             false,
+            &[],
             &[],
             &[],
             &[],
