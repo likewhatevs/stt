@@ -2249,18 +2249,36 @@ impl KtstrVm {
         //   lockdown=none        — permit /dev/mem and unrestricted BPF needed by the test runtime.
         //   sysctl.kernel.unprivileged_bpf_disabled=0 — allow BPF load from the test runtime.
         //   sysctl.kernel.sched_schedstats=1          — enable /proc/schedstat for workload reports.
-        //   sysctl.kernel.task_delayacct=1            — flip the delayacct runtime toggle on at
-        //                                              boot. CONFIG_TASK_DELAY_ACCT only enables
-        //                                              the build path; the increment paths
-        //                                              (delayacct_blkio_start/_end) are gated by
-        //                                              static_branch_unlikely(&delayacct_key) at
-        //                                              kernel/delayacct.c. Without this sysctl,
-        //                                              /proc/<tid>/stat field 42 stays zero on
-        //                                              every kernel built with delayacct=y but
-        //                                              boot-time off (the upstream default since
-        //                                              v5.14). Setting it on the cmdline removes
-        //                                              the runtime gate so capture's
-        //                                              delayacct_blkio_ticks reads the live value.
+        //   delayacct                                 — bare boot param consumed by the
+        //                                              kernel's `__setup("delayacct", ...)`
+        //                                              handler at kernel/delayacct.c:43-48.
+        //                                              The handler sets `delayacct_on = 1`
+        //                                              during EARLY boot, BEFORE
+        //                                              `delayacct_init()` (line 50-55) reads
+        //                                              the variable to decide whether to
+        //                                              enable the static branch. This is the
+        //                                              authoritative way to turn the
+        //                                              delayacct subsystem on at boot.
+        //   sysctl.kernel.task_delayacct=1            — backup runtime toggle that flips the
+        //                                              delayacct_key static_branch via the
+        //                                              `kernel.task_delayacct` sysctl declared
+        //                                              at kernel/delayacct.c:80. This path
+        //                                              fires later via deferred sysctl
+        //                                              registration + proc_handler invocation,
+        //                                              which has timing fragility relative to
+        //                                              the early-boot increment paths
+        //                                              (delayacct_blkio_start/_end gated by
+        //                                              static_branch_unlikely(&delayacct_key)
+        //                                              at kernel/delayacct.c). Both forms are
+        //                                              specified — belt and suspenders — so
+        //                                              the runtime toggle is on regardless of
+        //                                              whether the early-boot or the deferred
+        //                                              sysctl path runs first. Without either,
+        //                                              /proc/<tid>/stat field 42 and the
+        //                                              taskstats delay-accounting fields stay
+        //                                              zero on every kernel built with
+        //                                              CONFIG_TASK_DELAY_ACCT=y but boot-time
+        //                                              off (the upstream default since v5.14).
         let mut cmdline = concat!(
             "console=ttyS0 nomodules mitigations=off ",
             "no_timer_check clocksource=kvm-clock ",
@@ -2269,6 +2287,7 @@ impl KtstrVm {
             "pci=off reboot=k panic=-1 iomem=relaxed nokaslr lockdown=none ",
             "sysctl.kernel.unprivileged_bpf_disabled=0 ",
             "sysctl.kernel.sched_schedstats=1 ",
+            "delayacct ",
             "sysctl.kernel.task_delayacct=1",
         )
         .to_string();
@@ -3507,7 +3526,7 @@ impl KtstrVm {
             "panic=-1 iomem=relaxed nokaslr lockdown=none ",
             "sysctl.kernel.unprivileged_bpf_disabled=0 ",
             "sysctl.kernel.sched_schedstats=1 ",
-            "sysctl.kernel.task_delayacct=1 ",
+            "delayacct sysctl.kernel.task_delayacct=1 ",
             "kfence.sample_interval=0",
         )
         .to_string();
