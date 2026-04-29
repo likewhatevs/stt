@@ -578,6 +578,16 @@ pub struct CtprofMetricDef {
 /// rather than via [`AggRule`]. See [`Psi`] / [`PsiResource`] /
 /// [`PsiHalf`] for the data model.
 pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
+    // structural: group population count
+    CtprofMetricDef {
+        name: "thread_count",
+        rule: AggRule::SumCount(|_| crate::metric_types::MonotonicCount(1)),
+        sched_class: None,
+        config_gates: &[],
+        is_dead: false,
+        description: "Number of threads in this group. Each thread contributes 1; the sum is the group population. Useful for --sort-by thread_count:desc to find groups where thread count changed the most.",
+        section: Section::Primary,
+    },
     // identity / structural (non-numeric aggregation)
     CtprofMetricDef {
         name: "policy",
