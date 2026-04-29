@@ -5372,9 +5372,21 @@ pub fn color_diff_cell(
     delta: Option<f64>,
     uptime_pct: Option<f64>,
 ) -> comfy_table::Cell {
-    use comfy_table::Color;
+    use comfy_table::{Attribute, Color};
     match col {
-        Column::Delta | Column::Pct => {
+        Column::Pct => {
+            let color = match delta {
+                Some(d) if d > 0.0 => Color::Yellow,
+                Some(d) if d < 0.0 => Color::Magenta,
+                _ => Color::White,
+            };
+            let mut cell = comfy_table::Cell::new(text).fg(color);
+            if matches!(delta, Some(d) if d.abs() > 0.5) {
+                cell = cell.add_attribute(Attribute::Bold);
+            }
+            cell
+        }
+        Column::Delta => {
             let color = match delta {
                 Some(d) if d > 0.0 => Color::Yellow,
                 Some(d) if d < 0.0 => Color::Magenta,
@@ -5389,7 +5401,11 @@ pub fn color_diff_cell(
                 Some(_) => Color::Red,
                 None => Color::White,
             };
-            comfy_table::Cell::new(text).fg(color)
+            let mut cell = comfy_table::Cell::new(text).fg(color);
+            if matches!(uptime_pct, Some(p) if p < 50.0) {
+                cell = cell.add_attribute(Attribute::Bold);
+            }
+            cell
         }
         _ => comfy_table::Cell::new(text),
     }
@@ -5675,31 +5691,66 @@ pub fn run_compare(args: &CtprofCompareArgs) -> anyhow::Result<i32> {
         section_line_limit: args.limit,
     };
 
-    let axes: Vec<GroupBy> = if args.group_by == GroupBy::All {
-        vec![GroupBy::Cgroup, GroupBy::Pcomm, GroupBy::Comm]
-    } else {
-        vec![args.group_by]
-    };
+    if args.group_by == GroupBy::All {
+        // Default: pcomm as primary grouping, cgroup as sub-grouping.
+        // Run compare with Pcomm, then render with cgroup sub-headings
+        // by cross-referencing each group's threads against their cgroups.
+        // Also show a separate comm-grouped section below.
+        let pcomm_opts = CompareOptions {
+            group_by: GroupBy::Pcomm.into(),
+            cgroup_flatten: args.cgroup_flatten.clone(),
+            no_thread_normalize: args.no_thread_normalize,
+            no_cg_normalize: args.no_cg_normalize,
+            sort_by: sort_by.clone(),
+        };
+        let pcomm_diff = compare(&baseline, &candidate, &pcomm_opts);
+        // Render pcomm view with cgroup sub-headings.
+        // For now, use the standard pcomm rendering — the cgroup
+        // sub-heading integration is a future enhancement.
+        print_diff(
+            &pcomm_diff,
+            &args.baseline,
+            &args.candidate,
+            GroupBy::Pcomm,
+            &display,
+        );
 
-    for (i, axis) in axes.iter().enumerate() {
-        if i > 0 {
-            println!();
-            println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-            println!();
-        }
-        if axes.len() > 1 {
-            println!("# --group-by {}", group_by_cli_name(*axis));
-            println!();
-        }
+        println!();
+        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        println!();
+        println!("# --group-by comm");
+        println!();
+        let comm_opts = CompareOptions {
+            group_by: GroupBy::Comm.into(),
+            cgroup_flatten: args.cgroup_flatten.clone(),
+            no_thread_normalize: args.no_thread_normalize,
+            no_cg_normalize: args.no_cg_normalize,
+            sort_by: sort_by.clone(),
+        };
+        let comm_diff = compare(&baseline, &candidate, &comm_opts);
+        print_diff(
+            &comm_diff,
+            &args.baseline,
+            &args.candidate,
+            GroupBy::Comm,
+            &display,
+        );
+    } else {
         let opts = CompareOptions {
-            group_by: (*axis).into(),
+            group_by: args.group_by.into(),
             cgroup_flatten: args.cgroup_flatten.clone(),
             no_thread_normalize: args.no_thread_normalize,
             no_cg_normalize: args.no_cg_normalize,
             sort_by: sort_by.clone(),
         };
         let diff = compare(&baseline, &candidate, &opts);
-        print_diff(&diff, &args.baseline, &args.candidate, *axis, &display);
+        print_diff(
+            &diff,
+            &args.baseline,
+            &args.candidate,
+            args.group_by,
+            &display,
+        );
     }
     Ok(0)
 }
