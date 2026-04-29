@@ -7005,6 +7005,17 @@ pub fn write_diff<W: fmt::Write>(
         writeln!(w, "{at}")?;
     }
 
+    let format_only_key = |k: &str| -> String {
+        if group_by == GroupBy::All {
+            if let Some((cg, pc)) = k.split_once('\x00') {
+                format!("{cg} :: {pc}")
+            } else {
+                k.to_string()
+            }
+        } else {
+            k.to_string()
+        }
+    };
     if !diff.only_baseline.is_empty() {
         writeln!(
             w,
@@ -7013,7 +7024,7 @@ pub fn write_diff<W: fmt::Write>(
             baseline_path.display()
         )?;
         for k in &diff.only_baseline {
-            writeln!(w, "  {k}")?;
+            writeln!(w, "  {}", format_only_key(k))?;
         }
     }
     if !diff.only_candidate.is_empty() {
@@ -7024,7 +7035,7 @@ pub fn write_diff<W: fmt::Write>(
             candidate_path.display()
         )?;
         for k in &diff.only_candidate {
-            writeln!(w, "  {k}")?;
+            writeln!(w, "  {}", format_only_key(k))?;
         }
     }
     Ok(())
