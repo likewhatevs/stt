@@ -2908,6 +2908,72 @@ pub fn compare(
             }
         }
 
+        // Cascade: for each fudged cgroup pair, match remaining
+        // one-sided child paths by structure (no overlap gate).
+        for (bcg, ccg) in &fudged_cg {
+            let remaining_b: Vec<String> = diff
+                .only_baseline
+                .iter()
+                .filter(|k| !remove_baseline.contains(*k) && cg_prefix(k).starts_with(bcg.as_str()))
+                .cloned()
+                .collect();
+            let remaining_c: Vec<String> = diff
+                .only_candidate
+                .iter()
+                .filter(|k| {
+                    !remove_candidate.contains(*k) && cg_prefix(k).starts_with(ccg.as_str())
+                })
+                .cloned()
+                .collect();
+            let c_by_suffix: BTreeMap<String, &String> = remaining_c
+                .iter()
+                .map(|k| {
+                    let child_cg = cg_prefix(k);
+                    let rewritten = format!("{bcg}{}", &child_cg[ccg.len()..]);
+                    let suffix = k.split_once('\x00').map_or("", |(_, s)| s);
+                    (format!("{rewritten}\x00{suffix}"), k)
+                })
+                .collect();
+            for bkey in &remaining_b {
+                if let Some(ckey) = c_by_suffix.get(bkey) {
+                    remove_baseline.insert(bkey.clone());
+                    remove_candidate.insert((*ckey).clone());
+                    if let (Some(ga), Some(gb)) = (groups_a.get(bkey), groups_b.get(*ckey)) {
+                        let display_key = format!("{bcg} ~> {ccg}");
+                        for metric in CTPROF_METRICS {
+                            let Some(a) = ga.metrics.get(metric.name).cloned() else {
+                                continue;
+                            };
+                            let Some(b) = gb.metrics.get(metric.name).cloned() else {
+                                continue;
+                            };
+                            diff.rows.push(build_row(
+                                bkey,
+                                &display_key,
+                                ga.thread_count,
+                                gb.thread_count,
+                                metric,
+                                a,
+                                b,
+                                None,
+                            ));
+                        }
+                        for def in CTPROF_DERIVED_METRICS {
+                            diff.derived_rows.push(build_derived_row(
+                                bkey,
+                                &display_key,
+                                ga.thread_count,
+                                gb.thread_count,
+                                def,
+                                &ga.metrics,
+                                &gb.metrics,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
         diff.only_baseline.retain(|k| !remove_baseline.contains(k));
         diff.only_candidate
             .retain(|k| !remove_candidate.contains(k));
