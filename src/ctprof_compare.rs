@@ -1,11 +1,11 @@
 //! Group, aggregate, and render the comparison between two
-//! [`HostStateSnapshot`]s.
+//! [`CtprofSnapshot`]s.
 //!
 //! Design summary: the per-thread profiler emits
 //! one snapshot per run. Comparison groups threads within each
 //! snapshot by a single axis (pcomm, cgroup, comm, or
 //! comm-exact — see [`GroupBy`]), aggregates every metric per
-//! the rule on its [`HostStateMetricDef`], then matches groups
+//! the rule on its [`CtprofMetricDef`], then matches groups
 //! across the two snapshots and emits one row per
 //! `(group, metric)` pair. Groups present on only one side
 //! surface as unmatched entries rather than imaginary
@@ -27,12 +27,12 @@ use std::sync::LazyLock;
 use anyhow::Context;
 use regex::Regex;
 
-use crate::host_state::{
-    CgroupCpuStats, CgroupMemoryStats, CgroupPidsStats, CgroupStats, HostStateSnapshot, Psi,
+use crate::ctprof::{
+    CgroupCpuStats, CgroupMemoryStats, CgroupPidsStats, CgroupStats, CtprofSnapshot, Psi,
     PsiHalf, PsiResource, ThreadState,
 };
 
-/// Grouping key for the host-state compare.
+/// Grouping key for the ctprof compare.
 ///
 /// The default is [`GroupBy::Pcomm`] — aggregate every thread
 /// belonging to the same process name together. The other
@@ -112,7 +112,7 @@ pub struct CompareOptions {
     /// Multi-key sort spec for the diff rows. When non-empty,
     /// overrides the default `delta_pct desc` sort. Each
     /// [`SortKey`] names one metric from
-    /// [`HOST_STATE_METRICS`] or [`HOST_STATE_DERIVED_METRICS`]
+    /// [`CTPROF_METRICS`] or [`CTPROF_DERIVED_METRICS`]
     /// and a direction; groups rank by the tuple
     /// (`metric_1_delta`, `metric_2_delta`, ...) under
     /// lexicographic order with per-key direction. Within a
@@ -126,15 +126,15 @@ pub struct CompareOptions {
 }
 
 /// One key in a multi-key `--sort-by` spec. Names a metric from
-/// [`HOST_STATE_METRICS`] or [`HOST_STATE_DERIVED_METRICS`] and
+/// [`CTPROF_METRICS`] or [`CTPROF_DERIVED_METRICS`] and
 /// the sort direction for that key. Direction defaults to
 /// descending (largest delta first) so the common operator
 /// request — "show me the biggest regressions first" — is the
 /// unmarked form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SortKey {
-    /// Metric name. Holds one of the [`HOST_STATE_METRICS`] or
-    /// [`HOST_STATE_DERIVED_METRICS`] entries' `name` fields
+    /// Metric name. Holds one of the [`CTPROF_METRICS`] or
+    /// [`CTPROF_DERIVED_METRICS`] entries' `name` fields
     /// verbatim — [`parse_sort_by`] looks up the input string in
     /// either registry and stores the matched `&'static str`, so
     /// this never carries an allocation. Equality against a
@@ -172,7 +172,7 @@ impl From<GroupBy> for GroupByOrDefault {
 /// Aggregation rule for a single metric.
 ///
 /// Encoded as an enum rather than a trait object so the registry
-/// table ([`HOST_STATE_METRICS`]) can live in static memory. Each
+/// table ([`CTPROF_METRICS`]) can live in static memory. Each
 /// variant's accessor returns the typed
 /// [`crate::metric_types`] newtype that matches the reduction
 /// — the reader and rule are paired by construction so a new
@@ -400,7 +400,7 @@ pub enum AggRule {
 /// variant, not a free-form string).
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
-pub struct HostStateMetricDef {
+pub struct CtprofMetricDef {
     pub name: &'static str,
     pub rule: AggRule,
     /// Scheduler-class scope for the metric. `None` means
@@ -477,7 +477,7 @@ pub struct HostStateMetricDef {
     /// fires.
     pub is_dead: bool,
     /// One-line operator-facing description of what this metric
-    /// counts. Surfaced by the `host-state metric-list`
+    /// counts. Surfaced by the `ctprof metric-list`
     /// subcommand alongside the bracketed tag suffix so an
     /// operator scanning a rendered table can map an unfamiliar
     /// metric name to its semantics without leaving the CLI.
@@ -505,9 +505,9 @@ pub struct HostStateMetricDef {
 /// headers, rendered by [`write_diff`] / `write_show` directly
 /// rather than via [`AggRule`]. See [`Psi`] / [`PsiResource`] /
 /// [`PsiHalf`] for the data model.
-pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
+pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
     // identity / structural (non-numeric aggregation)
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "policy",
         rule: AggRule::Mode(|t| t.policy.clone()),
         sched_class: None,
@@ -515,7 +515,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         is_dead: false,
         description: "Scheduling policy (SCHED_OTHER, SCHED_FIFO, SCHED_RR, SCHED_BATCH, SCHED_IDLE, SCHED_DEADLINE, SCHED_EXT).",
     },
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "nice",
         rule: AggRule::RangeI32(|t| t.nice),
         sched_class: None,
@@ -529,7 +529,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     // `task_prio()` at `kernel/sched/syscalls.c:170`:
     // CFS=[0..39], RT=[-2..-100], DL=-101 — see the field
     // doc on [`ThreadState::priority`].
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "priority",
         rule: AggRule::RangeI32(|t| t.priority),
         sched_class: None,
@@ -542,7 +542,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     // SCHED_RR range); zero for CFS tasks. OrdinalRange to
     // surface the spread across a group, like `nice` and
     // `priority`.
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "rt_priority",
         rule: AggRule::RangeU32(|t| t.rt_priority),
         sched_class: None,
@@ -550,7 +550,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         is_dead: false,
         description: "Real-time scheduler priority (0..99); 0 for non-RT tasks.",
     },
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "cpu_affinity",
         rule: AggRule::Affinity(|t| t.cpu_affinity.clone()),
         sched_class: None,
@@ -558,7 +558,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         is_dead: false,
         description: "Set of CPUs the task is allowed to run on (sched_getaffinity result).",
     },
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "processor",
         rule: AggRule::RangeI32(|t| t.processor),
         sched_class: None,
@@ -566,7 +566,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         is_dead: false,
         description: "Last CPU the task ran on.",
     },
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "state",
         rule: AggRule::ModeChar(|t| t.state),
         sched_class: None,
@@ -578,7 +578,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     // the sched_ext class. Gated by CONFIG_SCHED_CLASS_EXT —
     // when off, no task can land on ext, so the field reads
     // `false` uniformly across every thread.
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "ext_enabled",
         rule: AggRule::ModeBool(|t| t.ext_enabled),
         sched_class: None,
@@ -597,7 +597,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     // "how many threads are here". Identity/structural rather
     // than counter — placement here mirrors `state` and
     // `ext_enabled` (per-thread snapshots, not deltas).
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "nr_threads",
         rule: AggRule::MaxGaugeCount(|t| t.nr_threads),
         sched_class: None,
@@ -609,7 +609,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     // `run_time_ns` from `/proc/<tid>/schedstat` field 1 —
     // gated by CONFIG_SCHED_INFO via `sched_info_on()` at
     // `proc_pid_schedstat` (fs/proc/base.c:511-523).
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "run_time_ns",
         rule: AggRule::SumNs(|t| t.run_time_ns),
         sched_class: None,
@@ -620,7 +620,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     // `wait_time_ns` from `/proc/<tid>/schedstat` field 2 —
     // gated by CONFIG_SCHED_INFO via `sched_info_on()` at
     // `proc_pid_schedstat` (fs/proc/base.c:511-523).
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "wait_time_ns",
         rule: AggRule::SumNs(|t| t.wait_time_ns),
         sched_class: None,
@@ -630,7 +630,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     },
     // `timeslices` from `/proc/<tid>/schedstat` field 3 —
     // same gate as `wait_time_ns`.
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "timeslices",
         rule: AggRule::SumCount(|t| t.timeslices),
         sched_class: None,
@@ -638,7 +638,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         is_dead: false,
         description: "Number of times the task was run on a CPU; schedstat field 3.",
     },
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "voluntary_csw",
         rule: AggRule::SumCount(|t| t.voluntary_csw),
         sched_class: None,
@@ -646,7 +646,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         is_dead: false,
         description: "Voluntary context switches (task gave up the CPU itself).",
     },
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "nonvoluntary_csw",
         rule: AggRule::SumCount(|t| t.nonvoluntary_csw),
         sched_class: None,
@@ -660,7 +660,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     // base counter) fires for every task class. The macro
     // expands to `do { } while (0)` under !CONFIG_SCHEDSTATS
     // per `kernel/sched/stats.h:75-82`.
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "nr_wakeups",
         rule: AggRule::SumCount(|t| t.nr_wakeups),
         sched_class: None,
@@ -668,7 +668,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         is_dead: false,
         description: "Total wakeups via try_to_wake_up().",
     },
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "nr_wakeups_local",
         rule: AggRule::SumCount(|t| t.nr_wakeups_local),
         sched_class: None,
@@ -676,7 +676,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         is_dead: false,
         description: "Wakeups landed on the same CPU as the waker.",
     },
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "nr_wakeups_remote",
         rule: AggRule::SumCount(|t| t.nr_wakeups_remote),
         sched_class: None,
@@ -684,7 +684,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         is_dead: false,
         description: "Wakeups landed on a different CPU than the waker.",
     },
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "nr_wakeups_sync",
         rule: AggRule::SumCount(|t| t.nr_wakeups_sync),
         sched_class: None,
@@ -692,7 +692,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         is_dead: false,
         description: "WF_SYNC wakeups (synchronous wakeup hint to scheduler).",
     },
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "nr_wakeups_migrate",
         rule: AggRule::SumCount(|t| t.nr_wakeups_migrate),
         sched_class: None,
@@ -707,7 +707,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     // 7609. Both expand only under CFS task lifetime, so a
     // task on SCHED_EXT / SCHED_FIFO / SCHED_RR / SCHED_DL
     // never accumulates them.
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "nr_wakeups_affine",
         rule: AggRule::SumCount(|t| t.nr_wakeups_affine),
         sched_class: Some("cfs-only"),
@@ -715,7 +715,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         is_dead: false,
         description: "Wakeups that succeeded under the wake_affine() heuristic.",
     },
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "nr_wakeups_affine_attempts",
         rule: AggRule::SumCount(|t| t.nr_wakeups_affine_attempts),
         sched_class: Some("cfs-only"),
@@ -726,7 +726,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     // `nr_migrations` is incremented unconditionally at
     // `kernel/sched/core.c:3283` (`p->se.nr_migrations++`) — no
     // schedstat macro, no class gating. Always populated.
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "nr_migrations",
         rule: AggRule::SumCount(|t| t.nr_migrations),
         sched_class: None,
@@ -737,7 +737,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     // `nr_forced_migrations` is set by
     // `kernel/sched/fair.c:9775` (`schedstat_inc`) inside
     // CFS-only load-balancing.
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "nr_forced_migrations",
         rule: AggRule::SumCount(|t| t.nr_forced_migrations),
         sched_class: Some("cfs-only"),
@@ -748,7 +748,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     // `nr_failed_migrations_*` family — all CFS-only,
     // incremented in `kernel/sched/fair.c::can_migrate_task`
     // (lines 9701, 9735, 9761, 9942).
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "nr_failed_migrations_affine",
         rule: AggRule::SumCount(|t| t.nr_failed_migrations_affine),
         sched_class: Some("cfs-only"),
@@ -756,7 +756,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         is_dead: false,
         description: "Load-balancer migrations rejected for cpu-affinity reasons.",
     },
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "nr_failed_migrations_running",
         rule: AggRule::SumCount(|t| t.nr_failed_migrations_running),
         sched_class: Some("cfs-only"),
@@ -764,7 +764,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         is_dead: false,
         description: "Load-balancer migrations rejected because the task was running.",
     },
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "nr_failed_migrations_hot",
         rule: AggRule::SumCount(|t| t.nr_failed_migrations_hot),
         sched_class: Some("cfs-only"),
@@ -783,7 +783,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     // tasks. Tagged `non-ext`. Expanded to a no-op under
     // !CONFIG_SCHEDSTATS via the schedstat macros at
     // `kernel/sched/stats.h:75-82`.
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "wait_sum",
         rule: AggRule::SumNs(|t| t.wait_sum),
         sched_class: Some("non-ext"),
@@ -791,7 +791,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         is_dead: false,
         description: "Cumulative time the task waited on the runqueue, ns.",
     },
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "wait_count",
         rule: AggRule::SumCount(|t| t.wait_count),
         sched_class: Some("non-ext"),
@@ -799,7 +799,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         is_dead: false,
         description: "Number of distinct runqueue-wait intervals the task accumulated.",
     },
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "wait_max",
         rule: AggRule::MaxPeak(|t| t.wait_max),
         sched_class: Some("non-ext"),
@@ -824,7 +824,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     // the kernel's `sum_sleep_runtime` — the raw value
     // double-counts block under sleep, so capture subtracts
     // `sum_block_runtime` before storing.
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "voluntary_sleep_ns",
         rule: AggRule::SumNs(|t| t.voluntary_sleep_ns),
         sched_class: Some("non-ext"),
@@ -832,7 +832,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         is_dead: false,
         description: "Pure voluntary sleep time (TASK_INTERRUPTIBLE only), ns; capture-side normalized as sum_sleep_runtime - sum_block_runtime so the kernel's sleep/block double-count is stripped before delta math.",
     },
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "sleep_max",
         rule: AggRule::MaxPeak(|t| t.sleep_max),
         sched_class: Some("non-ext"),
@@ -843,7 +843,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     // No `sleep_count` metric: the kernel does not emit that
     // counter — the wake-side tally is captured by `nr_wakeups`
     // already.
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "block_sum",
         rule: AggRule::SumNs(|t| t.block_sum),
         sched_class: Some("non-ext"),
@@ -851,7 +851,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         is_dead: false,
         description: "Cumulative time the task spent blocked (TASK_UNINTERRUPTIBLE), ns.",
     },
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "block_max",
         rule: AggRule::MaxPeak(|t| t.block_max),
         sched_class: Some("non-ext"),
@@ -862,7 +862,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     // No `block_count` metric: the kernel emits no per-event
     // counter for `sum_block_runtime` (unlike `wait_sum/wait_count`
     // and `iowait_sum/iowait_count` pairs).
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "iowait_sum",
         rule: AggRule::SumNs(|t| t.iowait_sum),
         sched_class: Some("non-ext"),
@@ -870,7 +870,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         is_dead: false,
         description: "Cumulative time the task spent in iowait, ns.",
     },
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "iowait_count",
         rule: AggRule::SumCount(|t| t.iowait_count),
         sched_class: Some("non-ext"),
@@ -892,7 +892,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     // `if (schedstat_enabled())`. Reachable from sched_ext via
     // `update_curr_common` (`kernel/sched/ext.c:1355`), so
     // class-agnostic at runtime, gated only by CONFIG_SCHEDSTATS.
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "exec_max",
         rule: AggRule::MaxPeak(|t| t.exec_max),
         sched_class: None,
@@ -904,7 +904,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     // Per the kernel-field-semantics audit, zero under
     // sched_ext / RT / DL because the populating call sites
     // live in CFS-class entry points.
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "slice_max",
         rule: AggRule::MaxPeak(|t| t.slice_max),
         sched_class: Some("cfs-only"),
@@ -925,7 +925,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     // Auto_scale ns ladder takes ns → µs → ms → s. Lives next
     // to `slice_max` because both relate to scheduler-decision
     // moments rather than wait/sleep accumulation.
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "core_forceidle_sum",
         rule: AggRule::SumNs(|t| t.core_forceidle_sum),
         sched_class: None,
@@ -945,7 +945,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     // `kernel/sched/debug.c:1363`, which (per
     // `kernel/sched/sched.h:194,203`) accepts SCHED_NORMAL,
     // SCHED_BATCH, AND SCHED_EXT under CONFIG_SCHED_CLASS_EXT.
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "fair_slice_ns",
         rule: AggRule::MaxGaugeNs(|t| t.fair_slice_ns),
         sched_class: Some("fair-policy"),
@@ -954,7 +954,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         description: "Current scheduler slice, ns; snapshot from /proc/<tid>/sched (stale under sched_ext).",
     },
     // memory
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "allocated_bytes",
         rule: AggRule::SumBytes(|t| t.allocated_bytes),
         sched_class: None,
@@ -962,7 +962,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         is_dead: false,
         description: "jemalloc per-thread allocated bytes (TSD thread_allocated counter).",
     },
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "deallocated_bytes",
         rule: AggRule::SumBytes(|t| t.deallocated_bytes),
         sched_class: None,
@@ -970,7 +970,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         is_dead: false,
         description: "jemalloc per-thread deallocated bytes (TSD thread_deallocated counter).",
     },
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "minflt",
         rule: AggRule::SumCount(|t| t.minflt),
         sched_class: None,
@@ -978,7 +978,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         is_dead: false,
         description: "Minor page faults (resolved without I/O).",
     },
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "majflt",
         rule: AggRule::SumCount(|t| t.majflt),
         sched_class: None,
@@ -986,7 +986,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         is_dead: false,
         description: "Major page faults (required disk I/O to resolve).",
     },
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "utime_clock_ticks",
         rule: AggRule::SumTicks(|t| t.utime_clock_ticks),
         sched_class: None,
@@ -994,7 +994,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         is_dead: false,
         description: "User-mode CPU time, USER_HZ ticks; /proc/<tid>/stat field 14.",
     },
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "stime_clock_ticks",
         rule: AggRule::SumTicks(|t| t.stime_clock_ticks),
         sched_class: None,
@@ -1009,7 +1009,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     // the capture-pipeline perspective the file is
     // all-or-nothing. All 6 fields share the same
     // `CONFIG_TASK_IO_ACCOUNTING` gate.
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "rchar",
         rule: AggRule::SumBytes(|t| t.rchar),
         sched_class: None,
@@ -1017,7 +1017,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         is_dead: false,
         description: "Bytes read at the read syscall layer (incl. cached / pagecache hits).",
     },
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "wchar",
         rule: AggRule::SumBytes(|t| t.wchar),
         sched_class: None,
@@ -1025,7 +1025,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         is_dead: false,
         description: "Bytes written at the write syscall layer (incl. pagecache / writeback).",
     },
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "syscr",
         rule: AggRule::SumCount(|t| t.syscr),
         sched_class: None,
@@ -1033,7 +1033,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         is_dead: false,
         description: "Number of read syscalls.",
     },
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "syscw",
         rule: AggRule::SumCount(|t| t.syscw),
         sched_class: None,
@@ -1041,7 +1041,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         is_dead: false,
         description: "Number of write syscalls.",
     },
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "read_bytes",
         rule: AggRule::SumBytes(|t| t.read_bytes),
         sched_class: None,
@@ -1049,7 +1049,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         is_dead: false,
         description: "Bytes that hit the storage device on read (excludes pagecache hits).",
     },
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "write_bytes",
         rule: AggRule::SumBytes(|t| t.write_bytes),
         sched_class: None,
@@ -1070,7 +1070,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     // cancelled_write_bytes` is NOT a derived metric because
     // the two counters track distinct parties — see the field
     // doc on ThreadState::cancelled_write_bytes.
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "cancelled_write_bytes",
         rule: AggRule::SumBytes(|t| t.cancelled_write_bytes),
         sched_class: None,
@@ -1109,7 +1109,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     // watermarks updated at delayacct path entries; same race
     // window in principle, but the watermark semantics already
     // mask brief skew.)
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "cpu_delay_count",
         rule: AggRule::SumCount(|t| t.cpu_delay_count),
         sched_class: None,
@@ -1117,7 +1117,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         is_dead: false,
         description: "Number of off-CPU windows the task waited for the runqueue to schedule it (taskstats cpu_count). RACY: count + total are not updated atomically.",
     },
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "cpu_delay_total_ns",
         rule: AggRule::SumNs(|t| t.cpu_delay_total_ns),
         sched_class: None,
@@ -1125,7 +1125,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         is_dead: false,
         description: "Cumulative ns the task waited on the runqueue (taskstats cpu_delay_total). Distinct from `wait_sum` (schedstat) which captures the same wait-for-CPU bucket via a different code path. RACY (see cpu_delay_count).",
     },
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "cpu_delay_max_ns",
         rule: AggRule::MaxPeak(|t| t.cpu_delay_max_ns),
         sched_class: None,
@@ -1133,7 +1133,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         is_dead: false,
         description: "Longest single CPU-wait window observed, ns (taskstats cpu_delay_max).",
     },
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "cpu_delay_min_ns",
         rule: AggRule::MaxPeak(|t| t.cpu_delay_min_ns),
         sched_class: None,
@@ -1143,7 +1143,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     },
     // Block-I/O delay block: serializes through `task->delays->lock`
     // so count + total are atomic (unlike cpu_*).
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "blkio_delay_count",
         rule: AggRule::SumCount(|t| t.blkio_delay_count),
         sched_class: None,
@@ -1151,7 +1151,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         is_dead: false,
         description: "Number of synchronous block-I/O wait windows (taskstats blkio_count).",
     },
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "blkio_delay_total_ns",
         rule: AggRule::SumNs(|t| t.blkio_delay_total_ns),
         sched_class: None,
@@ -1159,7 +1159,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         is_dead: false,
         description: "Cumulative ns waiting on synchronous block I/O (taskstats blkio_delay_total). Distinct from `iowait_sum` (schedstat).",
     },
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "blkio_delay_max_ns",
         rule: AggRule::MaxPeak(|t| t.blkio_delay_max_ns),
         sched_class: None,
@@ -1167,7 +1167,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         is_dead: false,
         description: "Longest single block-I/O wait observed, ns (taskstats blkio_delay_max).",
     },
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "blkio_delay_min_ns",
         rule: AggRule::MaxPeak(|t| t.blkio_delay_min_ns),
         sched_class: None,
@@ -1178,7 +1178,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     // Swap-in delay block: OVERLAPS with thrashing_* — every
     // thrashing event is also a swapin event from the syscall
     // layer. Do not sum swapin and thrashing.
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "swapin_delay_count",
         rule: AggRule::SumCount(|t| t.swapin_delay_count),
         sched_class: None,
@@ -1186,7 +1186,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         is_dead: false,
         description: "Number of swap-in wait windows (taskstats swapin_count). OVERLAPS with thrashing_delay_count — do not sum.",
     },
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "swapin_delay_total_ns",
         rule: AggRule::SumNs(|t| t.swapin_delay_total_ns),
         sched_class: None,
@@ -1194,7 +1194,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         is_dead: false,
         description: "Cumulative ns waiting for swap-in to complete (taskstats swapin_delay_total).",
     },
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "swapin_delay_max_ns",
         rule: AggRule::MaxPeak(|t| t.swapin_delay_max_ns),
         sched_class: None,
@@ -1202,7 +1202,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         is_dead: false,
         description: "Longest single swap-in wait observed, ns (taskstats swapin_delay_max).",
     },
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "swapin_delay_min_ns",
         rule: AggRule::MaxPeak(|t| t.swapin_delay_min_ns),
         sched_class: None,
@@ -1211,7 +1211,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         description: "Shortest non-zero swap-in wait observed, ns (taskstats swapin_delay_min). Sentinel 0 means \"no events observed\".",
     },
     // Direct memory reclaim (free-pages) block.
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "freepages_delay_count",
         rule: AggRule::SumCount(|t| t.freepages_delay_count),
         sched_class: None,
@@ -1219,7 +1219,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         is_dead: false,
         description: "Number of direct-reclaim wait windows (taskstats freepages_count).",
     },
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "freepages_delay_total_ns",
         rule: AggRule::SumNs(|t| t.freepages_delay_total_ns),
         sched_class: None,
@@ -1227,7 +1227,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         is_dead: false,
         description: "Cumulative ns waiting in direct memory reclaim (taskstats freepages_delay_total).",
     },
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "freepages_delay_max_ns",
         rule: AggRule::MaxPeak(|t| t.freepages_delay_max_ns),
         sched_class: None,
@@ -1235,7 +1235,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         is_dead: false,
         description: "Longest single direct-reclaim wait observed, ns (taskstats freepages_delay_max).",
     },
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "freepages_delay_min_ns",
         rule: AggRule::MaxPeak(|t| t.freepages_delay_min_ns),
         sched_class: None,
@@ -1244,7 +1244,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         description: "Shortest non-zero direct-reclaim wait observed, ns (taskstats freepages_delay_min). Sentinel 0 means \"no events observed\".",
     },
     // Thrashing block: OVERLAPS with swapin_* (see above).
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "thrashing_delay_count",
         rule: AggRule::SumCount(|t| t.thrashing_delay_count),
         sched_class: None,
@@ -1252,7 +1252,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         is_dead: false,
         description: "Number of thrashing wait windows (taskstats thrashing_count). OVERLAPS with swapin_delay_count — do not sum.",
     },
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "thrashing_delay_total_ns",
         rule: AggRule::SumNs(|t| t.thrashing_delay_total_ns),
         sched_class: None,
@@ -1260,7 +1260,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         is_dead: false,
         description: "Cumulative ns waiting under thrashing pressure (taskstats thrashing_delay_total).",
     },
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "thrashing_delay_max_ns",
         rule: AggRule::MaxPeak(|t| t.thrashing_delay_max_ns),
         sched_class: None,
@@ -1268,7 +1268,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         is_dead: false,
         description: "Longest single thrashing wait observed, ns (taskstats thrashing_delay_max).",
     },
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "thrashing_delay_min_ns",
         rule: AggRule::MaxPeak(|t| t.thrashing_delay_min_ns),
         sched_class: None,
@@ -1277,7 +1277,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         description: "Shortest non-zero thrashing wait observed, ns (taskstats thrashing_delay_min). Sentinel 0 means \"no events observed\".",
     },
     // Memory compaction block.
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "compact_delay_count",
         rule: AggRule::SumCount(|t| t.compact_delay_count),
         sched_class: None,
@@ -1285,7 +1285,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         is_dead: false,
         description: "Number of memory-compaction wait windows (taskstats compact_count).",
     },
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "compact_delay_total_ns",
         rule: AggRule::SumNs(|t| t.compact_delay_total_ns),
         sched_class: None,
@@ -1293,7 +1293,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         is_dead: false,
         description: "Cumulative ns waiting on memory compaction (taskstats compact_delay_total).",
     },
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "compact_delay_max_ns",
         rule: AggRule::MaxPeak(|t| t.compact_delay_max_ns),
         sched_class: None,
@@ -1301,7 +1301,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         is_dead: false,
         description: "Longest single compaction wait observed, ns (taskstats compact_delay_max).",
     },
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "compact_delay_min_ns",
         rule: AggRule::MaxPeak(|t| t.compact_delay_min_ns),
         sched_class: None,
@@ -1310,7 +1310,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         description: "Shortest non-zero compaction wait observed, ns (taskstats compact_delay_min). Sentinel 0 means \"no events observed\".",
     },
     // Write-protect-copy (CoW) fault block.
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "wpcopy_delay_count",
         rule: AggRule::SumCount(|t| t.wpcopy_delay_count),
         sched_class: None,
@@ -1318,7 +1318,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         is_dead: false,
         description: "Number of write-protect-copy (CoW) fault wait windows (taskstats wpcopy_count).",
     },
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "wpcopy_delay_total_ns",
         rule: AggRule::SumNs(|t| t.wpcopy_delay_total_ns),
         sched_class: None,
@@ -1326,7 +1326,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         is_dead: false,
         description: "Cumulative ns waiting on write-protect-copy faults (taskstats wpcopy_delay_total).",
     },
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "wpcopy_delay_max_ns",
         rule: AggRule::MaxPeak(|t| t.wpcopy_delay_max_ns),
         sched_class: None,
@@ -1334,7 +1334,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         is_dead: false,
         description: "Longest single write-protect-copy fault wait observed, ns (taskstats wpcopy_delay_max).",
     },
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "wpcopy_delay_min_ns",
         rule: AggRule::MaxPeak(|t| t.wpcopy_delay_min_ns),
         sched_class: None,
@@ -1345,7 +1345,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     // IRQ-handler delay block. Updates from `delayacct_irq` in
     // `kernel/delayacct.c` — counts kernel-IRQ time charged to
     // the task.
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "irq_delay_count",
         rule: AggRule::SumCount(|t| t.irq_delay_count),
         sched_class: None,
@@ -1353,7 +1353,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         is_dead: false,
         description: "Number of IRQ-handler windows charged to the task (taskstats irq_count).",
     },
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "irq_delay_total_ns",
         rule: AggRule::SumNs(|t| t.irq_delay_total_ns),
         sched_class: None,
@@ -1361,7 +1361,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         is_dead: false,
         description: "Cumulative ns of IRQ handling charged to the task (taskstats irq_delay_total).",
     },
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "irq_delay_max_ns",
         rule: AggRule::MaxPeak(|t| t.irq_delay_max_ns),
         sched_class: None,
@@ -1369,7 +1369,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         is_dead: false,
         description: "Longest single IRQ-handler window observed, ns (taskstats irq_delay_max).",
     },
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "irq_delay_min_ns",
         rule: AggRule::MaxPeak(|t| t.irq_delay_min_ns),
         sched_class: None,
@@ -1385,7 +1385,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     // `CONFIG_TASK_XACCT` while delayacct is the parallel
     // `CONFIG_TASK_DELAY_ACCT` subsystem; the two are
     // independently selectable.
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "hiwater_rss_bytes",
         rule: AggRule::MaxPeakBytes(|t| t.hiwater_rss_bytes),
         sched_class: None,
@@ -1393,7 +1393,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         is_dead: false,
         description: "Lifetime high-watermark of resident-set size, bytes (taskstats hiwater_rss). Distinct from smaps_rollup_kb[\"Rss\"] which is the CURRENT RSS.",
     },
-    HostStateMetricDef {
+    CtprofMetricDef {
         name: "hiwater_vm_bytes",
         rule: AggRule::MaxPeakBytes(|t| t.hiwater_vm_bytes),
         sched_class: None,
@@ -1487,9 +1487,9 @@ pub struct DerivedMetricDef {
     /// dispatch [`AggRule::ladder`] feeds.
     pub ladder: ScaleLadder,
     /// Operator-facing one-line description; surfaced by the
-    /// `host-state metric-list` subcommand.
+    /// `ctprof metric-list` subcommand.
     pub description: &'static str,
-    /// Names of input metrics from [`HOST_STATE_METRICS`]. Pure
+    /// Names of input metrics from [`CTPROF_METRICS`]. Pure
     /// documentation — surfaces in the `metric-list` output so
     /// the operator sees what each derivation depends on.
     pub inputs: &'static [&'static str],
@@ -1571,10 +1571,10 @@ fn ratio_of_sum_compute(
 
 /// Registry of derived metrics. Each entry consumes one or more
 /// already-aggregated input metrics from
-/// [`HOST_STATE_METRICS`] and produces a single scalar with its
+/// [`CTPROF_METRICS`] and produces a single scalar with its
 /// own unit. See the per-entry doc strings for the formula and
 /// kernel-source rationale.
-pub static HOST_STATE_DERIVED_METRICS: &[DerivedMetricDef] = &[
+pub static CTPROF_DERIVED_METRICS: &[DerivedMetricDef] = &[
     DerivedMetricDef {
         name: "affine_success_ratio",
         ladder: ScaleLadder::None,
@@ -1776,7 +1776,7 @@ pub static HOST_STATE_DERIVED_METRICS: &[DerivedMetricDef] = &[
 /// Compact rendering: each `config_gate` is stripped of its
 /// `CONFIG_` prefix before emission so the rendered cell stays
 /// scannable in narrow tables. The data field
-/// [`HostStateMetricDef::config_gates`] keeps the full
+/// [`CtprofMetricDef::config_gates`] keeps the full
 /// `CONFIG_X` spelling so an operator can grep their kconfig
 /// directly. Examples:
 /// - `wait_sum [CONFIG_SCHEDSTATS]` → `wait_sum [SCHEDSTATS]`
@@ -1791,10 +1791,10 @@ pub static HOST_STATE_DERIVED_METRICS: &[DerivedMetricDef] = &[
 /// allocation; tagged metrics return `Cow::Owned(String)`.
 ///
 /// Pure formatting layer — does not interpret tag values; the
-/// metric's own [`HostStateMetricDef::sched_class`] /
-/// [`HostStateMetricDef::config_gates`] / [`HostStateMetricDef::is_dead`]
+/// metric's own [`CtprofMetricDef::sched_class`] /
+/// [`CtprofMetricDef::config_gates`] / [`CtprofMetricDef::is_dead`]
 /// docs are the source of truth for what each spelling means.
-pub fn metric_display_name(metric: &HostStateMetricDef) -> Cow<'static, str> {
+pub fn metric_display_name(metric: &CtprofMetricDef) -> Cow<'static, str> {
     if metric.sched_class.is_none() && metric.config_gates.is_empty() && !metric.is_dead {
         return Cow::Borrowed(metric.name);
     }
@@ -2066,20 +2066,20 @@ fn sort_diff_rows_by_keys(
     // metric name → registry index (for stable within-group
     // ordering after sort). Both sides are `&'static str` so this
     // map is allocation-free at the key layer.
-    let metric_idx: BTreeMap<&'static str, usize> = HOST_STATE_METRICS
+    let metric_idx: BTreeMap<&'static str, usize> = CTPROF_METRICS
         .iter()
         .enumerate()
         .map(|(i, m)| (m.name, i))
         .collect();
-    let derived_idx: BTreeMap<&'static str, usize> = HOST_STATE_DERIVED_METRICS
+    let derived_idx: BTreeMap<&'static str, usize> = CTPROF_DERIVED_METRICS
         .iter()
         .enumerate()
         .map(|(i, m)| (m.name, i))
         .collect();
     // group_key → (metric_name → delta). The inner key is
     // `&'static str` borrowed from `row.metric_name` (itself a
-    // `&'static str` pointing into `HOST_STATE_METRICS.name` or
-    // `HOST_STATE_DERIVED_METRICS.name`), so no per-row
+    // `&'static str` pointing into `CTPROF_METRICS.name` or
+    // `CTPROF_DERIVED_METRICS.name`), so no per-row
     // allocation is needed for the metric axis. Derived deltas
     // populate the same map; sort_by treats primary and derived
     // names uniformly for ranking.
@@ -2186,7 +2186,7 @@ fn sort_diff_rows_by_keys(
 /// Full comparison result.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
-pub struct HostStateDiff {
+pub struct CtprofDiff {
     pub rows: Vec<DiffRow>,
     /// Group keys that appeared in the baseline snapshot but not
     /// in the candidate.
@@ -2220,11 +2220,11 @@ pub struct HostStateDiff {
     /// Baseline global sched_ext sysfs snapshot. `None` when
     /// the baseline kernel had no `/sys/kernel/sched_ext/`
     /// directory (CONFIG_SCHED_CLASS_EXT=n build).
-    pub sched_ext_a: Option<crate::host_state::SchedExtSysfs>,
+    pub sched_ext_a: Option<crate::ctprof::SchedExtSysfs>,
     /// Candidate global sched_ext sysfs snapshot, same shape.
-    pub sched_ext_b: Option<crate::host_state::SchedExtSysfs>,
+    pub sched_ext_b: Option<crate::ctprof::SchedExtSysfs>,
     /// One row per `(matched group, derived metric)` pair. Each
-    /// derivation in [`HOST_STATE_DERIVED_METRICS`] consumes
+    /// derivation in [`CTPROF_DERIVED_METRICS`] consumes
     /// already-aggregated input metrics from the group's
     /// metrics map (see [`ThreadGroup::metrics`]) and produces a
     /// scalar `f64` with its own unit. `None`-valued sides
@@ -2342,12 +2342,12 @@ fn build_derived_row(
     }
 }
 
-/// Compare two snapshots and produce a [`HostStateDiff`].
+/// Compare two snapshots and produce a [`CtprofDiff`].
 pub fn compare(
-    baseline: &HostStateSnapshot,
-    candidate: &HostStateSnapshot,
+    baseline: &CtprofSnapshot,
+    candidate: &CtprofSnapshot,
     opts: &CompareOptions,
-) -> HostStateDiff {
+) -> CtprofDiff {
     let flatten = compile_flatten_patterns(&opts.cgroup_flatten);
     let group_by = opts.group_by.0;
     // For `GroupBy::Comm`, the frequency gate that promotes a
@@ -2403,7 +2403,7 @@ pub fn compare(
         opts.no_thread_normalize,
     );
 
-    let mut diff = HostStateDiff::default();
+    let mut diff = CtprofDiff::default();
 
     for (key, group_a) in &groups_a {
         let Some(group_b) = groups_b.get(key) else {
@@ -2423,7 +2423,7 @@ pub fn compare(
         } else {
             key.clone()
         };
-        for metric in HOST_STATE_METRICS {
+        for metric in CTPROF_METRICS {
             let Some(a) = group_a.metrics.get(metric.name).cloned() else {
                 continue;
             };
@@ -2445,7 +2445,7 @@ pub fn compare(
         // formula's inputs are missing or the denominator is
         // zero — operator sees `-` rather than a synthesized
         // zero or NaN.
-        for def in HOST_STATE_DERIVED_METRICS {
+        for def in CTPROF_DERIVED_METRICS {
             diff.derived_rows.push(build_derived_row(
                 key,
                 &display_key,
@@ -2519,7 +2519,7 @@ pub fn compare(
 /// [`ThreadState::smaps_rollup_bytes`] up-front, so the
 /// downstream renderer can pass cell values directly into the
 /// auto_scale "B" ladder without further unit math.
-fn collect_smaps_rollup(snap: &HostStateSnapshot) -> BTreeMap<String, BTreeMap<String, u64>> {
+fn collect_smaps_rollup(snap: &CtprofSnapshot) -> BTreeMap<String, BTreeMap<String, u64>> {
     let mut out = BTreeMap::new();
     for t in &snap.threads {
         if t.smaps_rollup_kb.is_empty() {
@@ -2543,8 +2543,8 @@ fn collect_smaps_rollup(snap: &HostStateSnapshot) -> BTreeMap<String, BTreeMap<S
 /// path; consumers ([`build_groups`], [`flatten_cgroup_stats`])
 /// look up the final key for any path they see.
 pub fn build_cgroup_key_map(
-    baseline: &HostStateSnapshot,
-    candidate: &HostStateSnapshot,
+    baseline: &CtprofSnapshot,
+    candidate: &CtprofSnapshot,
     flatten: &[glob::Pattern],
 ) -> BTreeMap<String, String> {
     use std::collections::BTreeSet;
@@ -2602,7 +2602,7 @@ fn build_row(
     display_key: &str,
     n_a: usize,
     n_b: usize,
-    metric: &'static HostStateMetricDef,
+    metric: &'static CtprofMetricDef,
     a: Aggregated,
     b: Aggregated,
 ) -> DiffRow {
@@ -2961,8 +2961,8 @@ pub fn pattern_display_label(key: &str, members: &[String]) -> String {
 /// only-in-candidate. Computing the count from the union ensures
 /// the same key is used on both sides.
 fn pattern_counts_union(
-    baseline: &HostStateSnapshot,
-    candidate: &HostStateSnapshot,
+    baseline: &CtprofSnapshot,
+    candidate: &CtprofSnapshot,
 ) -> BTreeMap<String, usize> {
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     for t in baseline.threads.iter().chain(candidate.threads.iter()) {
@@ -2972,7 +2972,7 @@ fn pattern_counts_union(
 }
 
 pub fn build_groups(
-    snap: &HostStateSnapshot,
+    snap: &CtprofSnapshot,
     group_by: GroupBy,
     flatten: &[glob::Pattern],
     pattern_counts: Option<&BTreeMap<String, usize>>,
@@ -3043,7 +3043,7 @@ pub fn build_groups(
     let mut out = BTreeMap::new();
     for (key, threads) in buckets {
         let mut metrics = BTreeMap::new();
-        for m in HOST_STATE_METRICS {
+        for m in CTPROF_METRICS {
             metrics.insert(m.name.to_string(), aggregate(m.rule, &threads));
         }
         let cgroup_stats = if group_by == GroupBy::Cgroup {
@@ -3325,8 +3325,8 @@ pub fn compile_flatten_patterns(raw: &[String]) -> Vec<glob::Pattern> {
 
 /// Parse a `--sort-by` CLI value into a list of [`SortKey`]s.
 /// Spec format: `metric1[:dir1],metric2[:dir2],...` where each
-/// `metric` is a name from [`HOST_STATE_METRICS`] or
-/// [`HOST_STATE_DERIVED_METRICS`] and `dir` is `asc` or `desc`
+/// `metric` is a name from [`CTPROF_METRICS`] or
+/// [`CTPROF_DERIVED_METRICS`] and `dir` is `asc` or `desc`
 /// (case-insensitive — `:DESC`, `:Asc`, `:asc` all work).
 /// Direction defaults to `desc` (largest delta first — operator
 /// "show me the largest changes" default).
@@ -3337,7 +3337,7 @@ pub fn compile_flatten_patterns(raw: &[String]) -> Vec<glob::Pattern> {
 ///
 /// Each parsed [`SortKey`] stores the matched registry name as
 /// `&'static str` (not a copy of the user's input), so downstream
-/// equality with [`HostStateMetricDef::name`] or
+/// equality with [`CtprofMetricDef::name`] or
 /// [`DerivedMetricDef::name`] is a content-equality check
 /// (`str::eq`) over the same registry-owned bytes — no per-key
 /// allocation outlives this call. The two registries are
@@ -3350,7 +3350,7 @@ pub fn compile_flatten_patterns(raw: &[String]) -> Vec<glob::Pattern> {
 /// rank reflects the per-group aggregate (sum, max, etc. per
 /// the metric's [`AggRule`]) of the named metric, OR the
 /// per-group derived value for entries from
-/// [`HOST_STATE_DERIVED_METRICS`].
+/// [`CTPROF_DERIVED_METRICS`].
 ///
 /// Examples:
 /// - `"wait_sum"` → one key, descending.
@@ -3362,8 +3362,8 @@ pub fn compile_flatten_patterns(raw: &[String]) -> Vec<glob::Pattern> {
 /// - `""` → empty Vec (caller falls back to default sort).
 ///
 /// Errors:
-/// - Unknown metric name (not in [`HOST_STATE_METRICS`] AND not
-///   in [`HOST_STATE_DERIVED_METRICS`]).
+/// - Unknown metric name (not in [`CTPROF_METRICS`] AND not
+///   in [`CTPROF_DERIVED_METRICS`]).
 /// - Categorical metric name (one whose [`AggRule`] is
 ///   [`AggRule::Mode`] / [`AggRule::ModeChar`] /
 ///   [`AggRule::ModeBool`] — string- / char- / bool-valued, no
@@ -3380,12 +3380,12 @@ pub fn parse_sort_by(spec: &str) -> anyhow::Result<Vec<SortKey>> {
     if spec.is_empty() {
         return Ok(Vec::new());
     }
-    // Build a `name → &'static HostStateMetricDef` index so the
+    // Build a `name → &'static CtprofMetricDef` index so the
     // lookup returns the canonical registry pointer (for storing
     // in SortKey) AND the AggRule (for the categorical-reject
     // check).
-    let registry: std::collections::BTreeMap<&'static str, &'static HostStateMetricDef> =
-        HOST_STATE_METRICS.iter().map(|m| (m.name, m)).collect();
+    let registry: std::collections::BTreeMap<&'static str, &'static CtprofMetricDef> =
+        CTPROF_METRICS.iter().map(|m| (m.name, m)).collect();
     let mut out: Vec<SortKey> = Vec::new();
     let mut seen: std::collections::BTreeSet<&'static str> = std::collections::BTreeSet::new();
     for entry in spec.split(',') {
@@ -3437,7 +3437,7 @@ pub fn parse_sort_by(spec: &str) -> anyhow::Result<Vec<SortKey>> {
             }
             Some(def.name)
         } else {
-            HOST_STATE_DERIVED_METRICS
+            CTPROF_DERIVED_METRICS
                 .iter()
                 .find(|d| d.name == metric)
                 .map(|d| d.name)
@@ -3453,7 +3453,7 @@ pub fn parse_sort_by(spec: &str) -> anyhow::Result<Vec<SortKey>> {
             // the trailing bracket would land here, hence the
             // explicit hint.
             let mut valid: Vec<&'static str> = registry.keys().copied().collect();
-            for d in HOST_STATE_DERIVED_METRICS {
+            for d in CTPROF_DERIVED_METRICS {
                 valid.push(d.name);
             }
             valid.sort();
@@ -4019,7 +4019,7 @@ pub fn format_value_cell(agg: &Aggregated, ladder: ScaleLadder) -> String {
 
 /// Auto-scale a `u64` value at the given ladder and render it as
 /// a cell. Helper for [`format_value_cell`] — the Sum and Max
-/// arms share this exact logic. Also used by the `host-state
+/// arms share this exact logic. Also used by the `ctprof
 /// show` renderer for the cgroup-stats secondary table, where
 /// each scalar stands alone (no baseline/candidate pair to fold
 /// into a delta cell).
@@ -4427,7 +4427,7 @@ pub enum Section {
     /// `build_row` / `aggregate`. Always rendered first.
     Primary,
     /// `## Derived metrics` section emitted from
-    /// [`HOST_STATE_DERIVED_METRICS`].
+    /// [`CTPROF_DERIVED_METRICS`].
     Derived,
     /// Cgroup-enrichment table (`cpu_usage_usec`,
     /// `nr_throttled`, `throttled_usec`, `memory_current`).
@@ -4631,8 +4631,8 @@ pub fn parse_sections(spec: &str) -> anyhow::Result<Vec<Section>> {
 /// Parse a CLI `--metrics` spec into a typed
 /// `Vec<&'static str>` of registry names. Format:
 /// comma-separated names that must each match a `name` field
-/// from either [`HOST_STATE_METRICS`] or
-/// [`HOST_STATE_DERIVED_METRICS`]. Whitespace around each name
+/// from either [`CTPROF_METRICS`] or
+/// [`CTPROF_DERIVED_METRICS`]. Whitespace around each name
 /// is trimmed. Empty input parses to an empty `Vec` — caller
 /// treats that as "every metric renders" via
 /// [`DisplayOptions::is_metric_enabled`], mirroring
@@ -4666,19 +4666,19 @@ pub fn parse_metrics(spec: &str) -> anyhow::Result<Vec<&'static str>> {
         // not on a hot path. Returns the registry's own
         // `&'static str` so the parsed vec is pointer-stable
         // and survives the input string's lifetime.
-        let primary = HOST_STATE_METRICS
+        let primary = CTPROF_METRICS
             .iter()
             .find(|m| m.name == entry)
             .map(|m| m.name);
-        let derived = HOST_STATE_DERIVED_METRICS
+        let derived = CTPROF_DERIVED_METRICS
             .iter()
             .find(|d| d.name == entry)
             .map(|d| d.name);
         let Some(name) = primary.or(derived) else {
             anyhow::bail!(
                 "unknown metric {entry:?} in --metrics spec {spec:?}; \
-                 must be one of the names from `host-state metric-list` \
-                 (HOST_STATE_METRICS or HOST_STATE_DERIVED_METRICS)",
+                 must be one of the names from `ctprof metric-list` \
+                 (CTPROF_METRICS or CTPROF_DERIVED_METRICS)",
             );
         };
         if !seen.insert(name) {
@@ -4726,8 +4726,8 @@ pub struct DisplayOptions {
     /// "render every metric in the primary + derived sections"
     /// — the unfiltered default. Non-empty restricts the
     /// rendered rows to the listed metric names (which must
-    /// be in [`HOST_STATE_METRICS`] or
-    /// [`HOST_STATE_DERIVED_METRICS`]). Set via
+    /// be in [`CTPROF_METRICS`] or
+    /// [`CTPROF_DERIVED_METRICS`]). Set via
     /// [`parse_metrics`].
     ///
     /// Distinct from [`Self::sections`]: sections gate whole
@@ -4867,10 +4867,10 @@ fn render_threads_cell(a: usize, b: usize) -> String {
 /// `Vec<String>` straight into a comfy_table row.
 fn render_diff_row_cells(row: &DiffRow, columns: &[Column]) -> Vec<String> {
     let metric_cell = metric_display_name(
-        HOST_STATE_METRICS
+        CTPROF_METRICS
             .iter()
             .find(|m| m.name == row.metric_name)
-            .expect("metric_name comes from HOST_STATE_METRICS via build_row"),
+            .expect("metric_name comes from CTPROF_METRICS via build_row"),
     )
     .into_owned();
     let mut cells = Vec::with_capacity(columns.len());
@@ -4947,12 +4947,12 @@ fn render_derived_row_cells(row: &DerivedRow, columns: &[Column]) -> Vec<String>
     cells
 }
 
-/// Arguments for the `ktstr host-state compare` subcommand.
+/// Arguments for the `ktstr ctprof compare` subcommand.
 #[derive(Debug, clap::Args)]
-pub struct HostStateCompareArgs {
-    /// Baseline snapshot (`.hst.zst`) from `ktstr host-state capture -o`.
+pub struct CtprofCompareArgs {
+    /// Baseline snapshot (`.ctprof.zst`) from `ktstr ctprof capture -o`.
     pub baseline: std::path::PathBuf,
-    /// Candidate snapshot (`.hst.zst`) from `ktstr host-state capture -o`.
+    /// Candidate snapshot (`.ctprof.zst`) from `ktstr ctprof capture -o`.
     pub candidate: std::path::PathBuf,
     /// Grouping key. `pcomm` (default) aggregates per process
     /// name; `cgroup` per cgroup path; `comm` aggregates threads
@@ -4991,7 +4991,7 @@ pub struct HostStateCompareArgs {
     /// Multi-key sort spec for the diff rows. Format:
     /// `metric1[:dir1],metric2[:dir2],...` where each `metric` is
     /// one of the primary or derived metric names (run
-    /// `host-state metric-list` for the full vocabulary) and
+    /// `ctprof metric-list` for the full vocabulary) and
     /// `dir` is `asc` or `desc` (default `desc`). Groups rank by
     /// the tuple (`metric1_delta`, `metric2_delta`, ...) under
     /// lexicographic order with per-key direction; rows within a
@@ -5038,8 +5038,8 @@ pub struct HostStateCompareArgs {
     /// default) renders every metric in the primary and
     /// derived sub-tables. When non-empty, restricts the
     /// rendered ROWS to the listed names — names must come
-    /// from the `host-state metric-list` vocabulary
-    /// (HOST_STATE_METRICS or HOST_STATE_DERIVED_METRICS).
+    /// from the `ctprof metric-list` vocabulary
+    /// (CTPROF_METRICS or CTPROF_DERIVED_METRICS).
     /// Useful for zooming on a specific counter family
     /// without computing every metric: `--metrics
     /// run_time_ns,wait_sum,affine_success_ratio`. Composes
@@ -5076,7 +5076,7 @@ pub struct HostStateCompareArgs {
 /// non-existent snapshot paths would surface the load failure
 /// instead of the parser failure (the path the test actually
 /// pins).
-pub fn run_compare(args: &HostStateCompareArgs) -> anyhow::Result<i32> {
+pub fn run_compare(args: &CtprofCompareArgs) -> anyhow::Result<i32> {
     let sort_by = parse_sort_by(&args.sort_by)
         .with_context(|| format!("parse --sort-by {:?}", args.sort_by))?;
     // Parse --columns alongside --sort-by so a malformed spec
@@ -5099,9 +5099,9 @@ pub fn run_compare(args: &HostStateCompareArgs) -> anyhow::Result<i32> {
     // sees it immediately, not after a long disk-I/O wait.
     warn_cgroup_only_sections_under_non_cgroup(&sections, args.group_by);
 
-    let baseline = HostStateSnapshot::load(&args.baseline)
+    let baseline = CtprofSnapshot::load(&args.baseline)
         .with_context(|| format!("load baseline {}", args.baseline.display()))?;
-    let candidate = HostStateSnapshot::load(&args.candidate)
+    let candidate = CtprofSnapshot::load(&args.candidate)
         .with_context(|| format!("load candidate {}", args.candidate.display()))?;
 
     let opts = CompareOptions {
@@ -5314,7 +5314,7 @@ pub fn write_metric_list<W: fmt::Write>(w: &mut W) -> fmt::Result {
     writeln!(w)?;
     let mut table = crate::cli::new_table();
     table.set_header(vec!["metric", "tags", "description"]);
-    for m in HOST_STATE_METRICS {
+    for m in CTPROF_METRICS {
         // Strip the bare metric name off the rendered display
         // form so the `tags` column carries only the bracketed
         // suffixes — keeps the table scannable. When the metric
@@ -5332,7 +5332,7 @@ pub fn write_metric_list<W: fmt::Write>(w: &mut W) -> fmt::Result {
     writeln!(w)?;
     let mut dt = crate::cli::new_table();
     dt.set_header(vec!["metric", "unit", "inputs", "description"]);
-    for d in HOST_STATE_DERIVED_METRICS {
+    for d in CTPROF_DERIVED_METRICS {
         // Phase 4: ladder is the source of truth — `ratio` and
         // unit suffixes both fall out of `ScaleLadder::base_unit`
         // (with an explicit override for ratio rows where
@@ -5364,7 +5364,7 @@ pub fn print_metric_list() {
     print!("{out}");
 }
 
-/// Entry point for the `host-state metric-list` subcommand.
+/// Entry point for the `ctprof metric-list` subcommand.
 /// Always returns `Ok(0)` — discovery output is informational
 /// and never fails.
 pub fn run_metric_list() -> anyhow::Result<i32> {
@@ -5372,12 +5372,12 @@ pub fn run_metric_list() -> anyhow::Result<i32> {
     Ok(0)
 }
 
-/// Render [`HostStateDiff`] as a table on stdout. Thin wrapper
+/// Render [`CtprofDiff`] as a table on stdout. Thin wrapper
 /// over [`write_diff`] so the non-test caller keeps the
 /// ergonomics of a one-line call; tests drive [`write_diff`]
 /// into a `String` buffer.
 pub fn print_diff(
-    diff: &HostStateDiff,
+    diff: &CtprofDiff,
     baseline_path: &Path,
     candidate_path: &Path,
     group_by: GroupBy,
@@ -5396,7 +5396,7 @@ pub fn print_diff(
     print!("{out}");
 }
 
-/// Render [`HostStateDiff`] into `w`. The formatter layer lives
+/// Render [`CtprofDiff`] into `w`. The formatter layer lives
 /// here so tests can inspect exactly what `print_diff` would
 /// emit without shelling through stdout capture. Write errors
 /// propagate as [`std::fmt::Error`] — callers that write into an
@@ -5411,7 +5411,7 @@ pub fn print_diff(
 /// the per-section zero-suppression heuristic.
 pub fn write_diff<W: fmt::Write>(
     w: &mut W,
-    diff: &HostStateDiff,
+    diff: &CtprofDiff,
     baseline_path: &Path,
     candidate_path: &Path,
     group_by: GroupBy,
@@ -5892,7 +5892,7 @@ pub fn write_diff<W: fmt::Write>(
         // unreadable but directory present). The "-" placeholder
         // makes "no observation" visually distinct from a real
         // sched_ext_state_str[] value.
-        fn state_cell_for(s: Option<&crate::host_state::SchedExtSysfs>) -> String {
+        fn state_cell_for(s: Option<&crate::ctprof::SchedExtSysfs>) -> String {
             match s {
                 None => "-".to_string(),
                 Some(scx) if scx.state.is_empty() => "-".to_string(),
@@ -6101,15 +6101,15 @@ mod tests {
         }
     }
 
-    fn snap_with(threads: Vec<ThreadState>) -> HostStateSnapshot {
-        HostStateSnapshot {
+    fn snap_with(threads: Vec<ThreadState>) -> CtprofSnapshot {
+        CtprofSnapshot {
             captured_at_unix_ns: 0,
             host: None,
             threads,
             cgroup_stats: BTreeMap::new(),
             probe_summary: None,
             parse_summary: None,
-            psi: crate::host_state::Psi::default(),
+            psi: crate::ctprof::Psi::default(),
             sched_ext: None,
         }
     }
@@ -6465,13 +6465,13 @@ mod tests {
         // `Aggregated::Mode { .. } => None` (line ~465) gates the
         // delta — every metric registered with any `AggRule::Mode*`
         // variant (`Mode` for policy, `ModeChar` for state,
-        // `ModeBool` for ext_enabled — see HOST_STATE_METRICS)
+        // `ModeBool` for ext_enabled — see CTPROF_METRICS)
         // surfaces as None-delta even when both sides are
         // identical, because Mode-family rules are categorical
         // and have no numeric delta concept. Build the closed
         // set from the registry so a future Mode*-rule addition
         // lands in this assertion automatically.
-        let mode_metrics: std::collections::BTreeSet<&str> = HOST_STATE_METRICS
+        let mode_metrics: std::collections::BTreeSet<&str> = CTPROF_METRICS
             .iter()
             .filter(|m| {
                 matches!(
@@ -6512,7 +6512,7 @@ mod tests {
             &CompareOptions::default(),
         );
         let solo_rows: Vec<&DiffRow> = diff.rows.iter().filter(|r| r.group_key == "solo").collect();
-        assert_eq!(solo_rows.len(), HOST_STATE_METRICS.len());
+        assert_eq!(solo_rows.len(), CTPROF_METRICS.len());
     }
 
     /// All-zero cumulative counters on both sides still produce
@@ -6876,7 +6876,7 @@ mod tests {
     /// knobs.
     #[test]
     fn write_diff_limits_table_skips_cgroups_without_caps() {
-        let mut diff = HostStateDiff::default();
+        let mut diff = CtprofDiff::default();
         // /counters-only carries pure counter data — no
         // cpu.max/weight, no memory.max/high, no pids.
         diff.cgroup_stats_a.insert(
@@ -6942,7 +6942,7 @@ mod tests {
     /// gate that cuts output ~10x for typical runs.
     #[test]
     fn write_diff_memory_stat_skips_unchanged_rows() {
-        let mut diff = HostStateDiff::default();
+        let mut diff = CtprofDiff::default();
         let mut a = CgroupStats::default();
         a.memory.stat.insert("pgfault".into(), 100);
         a.memory.stat.insert("anon".into(), 1_000_000);
@@ -6986,7 +6986,7 @@ mod tests {
     /// pattern as memory.stat — only changed events surface.
     #[test]
     fn write_diff_memory_events_skips_unchanged_rows() {
-        let mut diff = HostStateDiff::default();
+        let mut diff = CtprofDiff::default();
         let mut a = CgroupStats::default();
         a.memory.events.insert("low".into(), 5);
         a.memory.events.insert("oom_kill".into(), 0);
@@ -7123,7 +7123,7 @@ mod tests {
         for (name, set) in cases {
             let mut t = make_thread("p", "w");
             set(&mut t);
-            let def = HOST_STATE_METRICS
+            let def = CTPROF_METRICS
                 .iter()
                 .find(|m| m.name == *name)
                 .unwrap_or_else(|| panic!("metric {name} not in registry"));
@@ -7142,9 +7142,9 @@ mod tests {
     /// lookups and still "work" for fields that happen to
     /// match — a slow-burn correctness bug.
     #[test]
-    fn host_state_metric_names_are_unique() {
+    fn ctprof_metric_names_are_unique() {
         let mut seen = std::collections::BTreeSet::new();
-        for m in HOST_STATE_METRICS {
+        for m in CTPROF_METRICS {
             assert!(
                 seen.insert(m.name),
                 "duplicate metric name in registry: {}",
@@ -7156,8 +7156,8 @@ mod tests {
     /// Test-only helper: look up a registry entry by name and
     /// return a static reference. Reduces fixture duplication
     /// across the metric_display_name + tag tests below.
-    fn lookup_metric(name: &str) -> &'static HostStateMetricDef {
-        HOST_STATE_METRICS
+    fn lookup_metric(name: &str) -> &'static CtprofMetricDef {
+        CTPROF_METRICS
             .iter()
             .find(|m| m.name == name)
             .unwrap_or_else(|| panic!("metric {name} registered"))
@@ -7239,7 +7239,7 @@ mod tests {
         // form anywhere in the rendered string. This guards
         // against partial-strip regressions where one gate
         // strips but a sibling does not.
-        for m in HOST_STATE_METRICS {
+        for m in CTPROF_METRICS {
             for gate in m.config_gates {
                 assert!(
                     gate.starts_with("CONFIG_"),
@@ -7271,7 +7271,7 @@ mod tests {
     /// machinery even though the registry currently has no
     /// `is_dead: true` entries (the previously-registered dead
     /// counters were dropped). Pin the rendering on a synthetic
-    /// `HostStateMetricDef` so a regression that drops the
+    /// `CtprofMetricDef` so a regression that drops the
     /// `[dead]` clause from `metric_display_name` surfaces here
     /// rather than waiting for a future kernel quirk that
     /// resurrects the tag.
@@ -7280,7 +7280,7 @@ mod tests {
         // Synthetic registry entry with is_dead: true to drive
         // the [dead] rendering branch. Not added to the live
         // registry — the test owns the value.
-        let m = HostStateMetricDef {
+        let m = CtprofMetricDef {
             name: "synthetic_dead",
             rule: AggRule::SumCount(|_| crate::metric_types::MonotonicCount(0)),
             sched_class: None,
@@ -7302,7 +7302,7 @@ mod tests {
         // until a kernel resurrects a dead counter or a new
         // always-zero counter is captured. Detects accidental
         // re-introduction.
-        for m in HOST_STATE_METRICS {
+        for m in CTPROF_METRICS {
             assert!(
                 !m.is_dead,
                 "{} unexpectedly carries is_dead: true — the \
@@ -7329,7 +7329,7 @@ mod tests {
         );
     }
 
-    /// Exhaustive tag pin: every metric in HOST_STATE_METRICS
+    /// Exhaustive tag pin: every metric in CTPROF_METRICS
     /// gets its (sched_class, config_gates, is_dead) triple
     /// asserted against the locked matrix. Set-equality on the
     /// keys: every registry name must appear in the matrix
@@ -7338,7 +7338,7 @@ mod tests {
     #[test]
     fn registry_tag_matrix_is_pinned() {
         // Locked matrix: (name → (sched_class, config_gates, is_dead)).
-        // Order matches HOST_STATE_METRICS for ease of audit.
+        // Order matches CTPROF_METRICS for ease of audit.
         let matrix: &[(&str, Option<&str>, &[&str], bool)] = &[
             // identity / structural
             ("policy", None, &[], false),
@@ -7662,7 +7662,7 @@ mod tests {
         ];
         // Set-equality: registry keys vs matrix keys.
         let registry_names: std::collections::BTreeSet<&str> =
-            HOST_STATE_METRICS.iter().map(|m| m.name).collect();
+            CTPROF_METRICS.iter().map(|m| m.name).collect();
         let matrix_names: std::collections::BTreeSet<&str> =
             matrix.iter().map(|(n, _, _, _)| *n).collect();
         assert_eq!(
@@ -7706,7 +7706,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        for m in HOST_STATE_METRICS {
+        for m in CTPROF_METRICS {
             if let Some(class) = m.sched_class {
                 assert!(
                     allowed_classes.contains(class),
@@ -7813,7 +7813,7 @@ mod tests {
     /// Build a one-thread snapshot pair where every column has
     /// a meaningful value. Used by the display-format /
     /// column-set tests below.
-    fn snap_pair_for_display() -> (HostStateSnapshot, HostStateSnapshot) {
+    fn snap_pair_for_display() -> (CtprofSnapshot, CtprofSnapshot) {
         let mut a = make_thread("p", "w");
         a.run_time_ns = MonotonicNs(100);
         a.wait_count = MonotonicCount(4);
@@ -8257,7 +8257,7 @@ mod tests {
     }
 
     /// Every primary registry name round-trips through
-    /// `parse_metrics`. Walks `HOST_STATE_METRICS` exhaustively
+    /// `parse_metrics`. Walks `CTPROF_METRICS` exhaustively
     /// — adding a new metric to the registry without re-running
     /// its name through this parser would surface here only if
     /// the parser silently dropped it; the linear-scan match in
@@ -8265,7 +8265,7 @@ mod tests {
     /// is a sanity rail rather than a drift detector.
     #[test]
     fn parse_metrics_round_trips_every_primary_registry_name() {
-        for m in HOST_STATE_METRICS {
+        for m in CTPROF_METRICS {
             let parsed = parse_metrics(m.name)
                 .unwrap_or_else(|e| panic!("metric name {} failed parse: {e:#}", m.name));
             assert_eq!(parsed, vec![m.name]);
@@ -8278,7 +8278,7 @@ mod tests {
     /// the union-of-registries lookup contract.
     #[test]
     fn parse_metrics_round_trips_every_derived_registry_name() {
-        for d in HOST_STATE_DERIVED_METRICS {
+        for d in CTPROF_DERIVED_METRICS {
             let parsed = parse_metrics(d.name)
                 .unwrap_or_else(|e| panic!("derived name {} failed parse: {e:#}", d.name));
             assert_eq!(parsed, vec![d.name]);
@@ -8302,7 +8302,7 @@ mod tests {
     }
 
     /// Unknown metric name surfaces a diagnostic that names the
-    /// offending token and points at `host-state metric-list`.
+    /// offending token and points at `ctprof metric-list`.
     /// The error must mention BOTH registries so the operator
     /// knows the lookup spans primary + derived.
     #[test]
@@ -8728,7 +8728,7 @@ mod tests {
     #[test]
     fn voluntary_sleep_sum_derived_metric_is_removed() {
         let names: std::collections::BTreeSet<&'static str> =
-            HOST_STATE_DERIVED_METRICS.iter().map(|m| m.name).collect();
+            CTPROF_DERIVED_METRICS.iter().map(|m| m.name).collect();
         assert!(
             !names.contains("voluntary_sleep_sum"),
             "voluntary_sleep_sum derived metric must not exist — \
@@ -8989,7 +8989,7 @@ mod tests {
     /// T-S4: each `avg_<bucket>_delay_ns` compute closure
     /// returns `None` when EITHER input is missing from the
     /// metrics map. Pulls the closure directly out of
-    /// `HOST_STATE_DERIVED_METRICS` and exercises it with a
+    /// `CTPROF_DERIVED_METRICS` and exercises it with a
     /// partial `BTreeMap` (only the numerator side present, no
     /// denominator). The compute path must short-circuit via
     /// `input_scalar`'s `?` rather than panicking or returning
@@ -9003,7 +9003,7 @@ mod tests {
     #[test]
     fn derived_avg_delay_ns_returns_none_on_missing_input() {
         let lookup = |name: &str| -> &DerivedMetricDef {
-            HOST_STATE_DERIVED_METRICS
+            CTPROF_DERIVED_METRICS
                 .iter()
                 .find(|d| d.name == name)
                 .unwrap_or_else(|| panic!("{name} present in registry"))
@@ -9280,8 +9280,8 @@ mod tests {
     #[test]
     fn registry_and_derived_names_disjoint() {
         let primary: std::collections::BTreeSet<&str> =
-            HOST_STATE_METRICS.iter().map(|m| m.name).collect();
-        for d in HOST_STATE_DERIVED_METRICS {
+            CTPROF_METRICS.iter().map(|m| m.name).collect();
+        for d in CTPROF_DERIVED_METRICS {
             assert!(
                 !primary.contains(d.name),
                 "derived metric {} shadows primary registry name",
@@ -9295,7 +9295,7 @@ mod tests {
     /// that forgets to fill either field.
     #[test]
     fn registry_derived_metrics_well_formed() {
-        for d in HOST_STATE_DERIVED_METRICS {
+        for d in CTPROF_DERIVED_METRICS {
             assert!(
                 !d.description.is_empty(),
                 "derived metric {} has empty description",
@@ -9308,7 +9308,7 @@ mod tests {
             );
             // Every input must be a real registered metric name.
             let primary: std::collections::BTreeSet<&str> =
-                HOST_STATE_METRICS.iter().map(|m| m.name).collect();
+                CTPROF_METRICS.iter().map(|m| m.name).collect();
             for input in d.inputs {
                 assert!(
                     primary.contains(input),
@@ -9330,7 +9330,7 @@ mod tests {
             out.contains("## Derived metrics"),
             "metric-list must emit a Derived metrics header:\n{out}",
         );
-        for d in HOST_STATE_DERIVED_METRICS {
+        for d in CTPROF_DERIVED_METRICS {
             assert!(
                 out.contains(d.name),
                 "derived metric {} missing from metric-list:\n{out}",
@@ -9593,7 +9593,7 @@ mod tests {
     fn write_metric_list_covers_every_registered_metric() {
         let mut out = String::new();
         write_metric_list(&mut out).unwrap();
-        for m in HOST_STATE_METRICS {
+        for m in CTPROF_METRICS {
             assert!(
                 out.contains(m.name),
                 "metric {} missing from metric-list output:\n{out}",
@@ -9635,7 +9635,7 @@ mod tests {
     /// output that defeats the entire purpose of `metric-list`.
     #[test]
     fn registry_descriptions_are_non_empty() {
-        for m in HOST_STATE_METRICS {
+        for m in CTPROF_METRICS {
             assert!(
                 !m.description.is_empty(),
                 "metric {} has empty description",
@@ -9755,7 +9755,7 @@ mod tests {
 
     #[test]
     fn write_diff_header_switches_on_group_by() {
-        let empty = HostStateDiff::default();
+        let empty = CtprofDiff::default();
         let mut out = String::new();
         write_diff(
             &mut out,
@@ -9785,49 +9785,49 @@ mod tests {
 
     #[test]
     fn write_diff_prints_only_baseline_section() {
-        let diff = HostStateDiff {
+        let diff = CtprofDiff {
             only_baseline: vec!["missing_proc".into()],
-            ..HostStateDiff::default()
+            ..CtprofDiff::default()
         };
         let mut out = String::new();
         write_diff(
             &mut out,
             &diff,
-            Path::new("/tmp/a.hst.zst"),
-            Path::new("/tmp/b.hst.zst"),
+            Path::new("/tmp/a.ctprof.zst"),
+            Path::new("/tmp/b.ctprof.zst"),
             GroupBy::Pcomm,
             &DisplayOptions::default(),
         )
         .unwrap();
         assert!(out.contains("only in baseline"));
         assert!(out.contains("missing_proc"));
-        assert!(out.contains("/tmp/a.hst.zst"));
+        assert!(out.contains("/tmp/a.ctprof.zst"));
     }
 
     #[test]
     fn write_diff_prints_only_candidate_section() {
-        let diff = HostStateDiff {
+        let diff = CtprofDiff {
             only_candidate: vec!["new_proc".into()],
-            ..HostStateDiff::default()
+            ..CtprofDiff::default()
         };
         let mut out = String::new();
         write_diff(
             &mut out,
             &diff,
-            Path::new("/tmp/a.hst.zst"),
-            Path::new("/tmp/b.hst.zst"),
+            Path::new("/tmp/a.ctprof.zst"),
+            Path::new("/tmp/b.ctprof.zst"),
             GroupBy::Pcomm,
             &DisplayOptions::default(),
         )
         .unwrap();
         assert!(out.contains("only in candidate"));
         assert!(out.contains("new_proc"));
-        assert!(out.contains("/tmp/b.hst.zst"));
+        assert!(out.contains("/tmp/b.ctprof.zst"));
     }
 
     #[test]
     fn write_diff_cgroup_enrichment_section_for_cgroup_mode() {
-        let mut diff = HostStateDiff::default();
+        let mut diff = CtprofDiff::default();
         diff.cgroup_stats_a
             .insert("/app".into(), simple_cgroup_stats(10, 0, 0, 100));
         diff.cgroup_stats_b
@@ -9872,7 +9872,7 @@ mod tests {
 
     #[test]
     fn write_diff_enrichment_section_absent_when_group_by_pcomm() {
-        let mut diff = HostStateDiff::default();
+        let mut diff = CtprofDiff::default();
         // Populate enrichment; renderer must ignore it under
         // GroupBy::Pcomm.
         diff.cgroup_stats_a
@@ -9946,8 +9946,8 @@ mod tests {
     }
 
     /// Full round-trip via the public loader: two snapshots
-    /// written to disk via `HostStateSnapshot::write`, loaded
-    /// via `HostStateSnapshot::load`, compared, and the
+    /// written to disk via `CtprofSnapshot::write`, loaded
+    /// via `CtprofSnapshot::load`, compared, and the
     /// rendered output inspected. This stitches together the
     /// serialization layer, the comparison engine, and the
     /// formatter — the components `run_compare` composes in
@@ -9969,8 +9969,8 @@ mod tests {
         let tmp_b = tempfile::NamedTempFile::new().unwrap();
         snap_a.write(tmp_a.path()).unwrap();
         snap_b.write(tmp_b.path()).unwrap();
-        let loaded_a = HostStateSnapshot::load(tmp_a.path()).unwrap();
-        let loaded_b = HostStateSnapshot::load(tmp_b.path()).unwrap();
+        let loaded_a = CtprofSnapshot::load(tmp_a.path()).unwrap();
+        let loaded_b = CtprofSnapshot::load(tmp_b.path()).unwrap();
 
         let diff = compare(&loaded_a, &loaded_b, &CompareOptions::default());
         let mut out = String::new();
@@ -10183,7 +10183,7 @@ mod tests {
     /// carries the `"X → -"` / `"- → Y"` strings.
     #[test]
     fn write_diff_enrichment_handles_one_sided_cgroup_keys() {
-        let mut diff = HostStateDiff::default();
+        let mut diff = CtprofDiff::default();
         diff.cgroup_stats_a
             .insert("/only-baseline".into(), simple_cgroup_stats(111, 0, 0, 0));
         diff.cgroup_stats_b
@@ -10548,7 +10548,7 @@ mod tests {
         for (name, set) in cases {
             let mut t = make_thread("p", "w");
             set(&mut t);
-            let def = HOST_STATE_METRICS
+            let def = CTPROF_METRICS
                 .iter()
                 .find(|m| m.name == *name)
                 .unwrap_or_else(|| panic!("metric {name} not in registry"));
@@ -12130,11 +12130,11 @@ mod tests {
     /// `G`-prefix cells).
     #[test]
     fn registry_utime_stime_carry_ticks_unit() {
-        let utime = HOST_STATE_METRICS
+        let utime = CTPROF_METRICS
             .iter()
             .find(|m| m.name == "utime_clock_ticks")
             .expect("utime_clock_ticks in registry");
-        let stime = HOST_STATE_METRICS
+        let stime = CTPROF_METRICS
             .iter()
             .find(|m| m.name == "stime_clock_ticks")
             .expect("stime_clock_ticks in registry");
@@ -12390,10 +12390,10 @@ mod tests {
         // Sanity: policy is currently registered with AggRule::Mode
         // (the CategoricalString variant — distinct from
         // ModeChar/ModeBool).
-        let policy_def = HOST_STATE_METRICS
+        let policy_def = CTPROF_METRICS
             .iter()
             .find(|m| m.name == "policy")
-            .expect("policy must be in HOST_STATE_METRICS");
+            .expect("policy must be in CTPROF_METRICS");
         assert!(
             matches!(policy_def.rule, AggRule::Mode(_)),
             "test premise drift: policy is no longer Mode-aggregated; \
@@ -12885,7 +12885,7 @@ mod tests {
         );
     }
 
-    /// Within a group, rows appear in `HOST_STATE_METRICS`
+    /// Within a group, rows appear in `CTPROF_METRICS`
     /// registry order regardless of input order or sort spec.
     /// Pins the documented "rows within a group keep registry
     /// order" contract — a regression that ordered metric rows

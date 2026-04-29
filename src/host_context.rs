@@ -1448,7 +1448,7 @@ mod tests {
     /// regression that drops a specific `Some` into `None` (or
     /// coerces `Some(empty map)` into `None` on deserialize) would
     /// pass both existing tests while breaking real sidecars where
-    /// partial host-state captures are the norm (first `/proc`
+    /// partial ctprof captures are the norm (first `/proc`
     /// entry unreadable, sched_* dir readable but filtered to
     /// empty, etc.). Struct-level `PartialEq` catches the whole
     /// shape in one assertion.

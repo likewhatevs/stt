@@ -8,5 +8,5 @@
 //! This module is itself test-only — nothing here is shipped as part
 //! of the `ktstr` crate's public API.
 
+pub mod ctprof;
 pub mod fixtures;
-pub mod host_state;

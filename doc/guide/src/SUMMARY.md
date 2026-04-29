@@ -56,4 +56,4 @@
 - [CI](ci.md)
 - [Troubleshooting](troubleshooting.md)
 - [Environment Variables](reference/environment-variables.md)
-- [Host-State Profiler](reference/host-state-profiler.md)
+- [ctprof](reference/ctprof.md)

@@ -11,7 +11,7 @@
 //!
 //! Both produce sorted-deduped `Vec<u32>` of CPU ids and route
 //! garbled / over-cap input to `None`. Used by the per-thread
-//! profiler (host_state) AND the VM topology planner
+//! profiler (ctprof) AND the VM topology planner
 //! (vmm::host_topology) — the function shape is generic enough that
 //! either subsystem could have owned it; keeping the impls here so
 //! neither has to depend on the other for a CPU-list helper.
@@ -479,7 +479,7 @@ mod tests {
     /// loop / errno classification.
     ///
     /// Distinct from the per-thread capture-path test in
-    /// host_state — this test focuses on `read_affinity` in
+    /// ctprof — this test focuses on `read_affinity` in
     /// isolation so a failure localizes to the fn's own logic
     /// rather than a capture-path wiring issue.
     #[test]

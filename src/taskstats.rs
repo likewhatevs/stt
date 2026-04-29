@@ -18,7 +18,7 @@
 //! The kernel registers `TASKSTATS_CMD_GET` with `GENL_ADMIN_PERM`
 //! (`kernel/taskstats.c::taskstats_ops`), so the calling process
 //! must hold `CAP_NET_ADMIN` to issue the per-tid query. The
-//! host-state capture pipeline runs as root in production, so the
+//! ctprof capture pipeline runs as root in production, so the
 //! cap is normally present. [`TaskstatsClient::open`] does NOT
 //! gate on `CAP_NET_ADMIN`: socket creation and the
 //! `CTRL_CMD_GETFAMILY` family-id resolution succeed without it,

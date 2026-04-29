@@ -20,7 +20,7 @@
 //!   and bloat the initramfs image used by integration tests). The
 //!   compiled bytes match exactly; the bin invokes
 //!   [`attach_jemalloc`] + [`probe_thread_with_cache`] directly.
-//! - The host-state capture pipeline at [`crate::host_state`]
+//! - The ctprof capture pipeline at [`crate::ctprof`]
 //!   consumes the engine through the in-crate `pub` API, calling
 //!   [`attach_jemalloc_at`] for each probed tgid and
 //!   [`probe_thread`] for each tid behind the
@@ -195,7 +195,7 @@ pub enum ProbeError {
     /// privilege (EPERM), or another tracer is already attached
     /// (EBUSY).
     ///
-    /// In the host-state capture pipeline, ESRCH from a
+    /// In the ctprof capture pipeline, ESRCH from a
     /// race-with-thread-death is the dominant production case:
     /// `iter_task_ids_at` enumerates the tgid's task directory
     /// upfront, then capture probes each tid in turn. Threads
@@ -1510,7 +1510,7 @@ fn find_jemalloc_via_maps_at(
                         Err(e) => {
                             tracing::debug!(
                                 pid, ?dwp_path, err = %e,
-                                "host-state probe: DWP not readable",
+                                "ctprof probe: DWP not readable",
                             );
                             continue;
                         }
@@ -1519,7 +1519,7 @@ fn find_jemalloc_via_maps_at(
                         pid,
                         ?dwp_path,
                         bytes = dwp_mmap.len(),
-                        "host-state probe: trying DWP (mmap)",
+                        "ctprof probe: trying DWP (mmap)",
                     );
                     // Try main binary as parent first.
                     if let Ok(offsets) = resolve_field_offsets_from_dwp(data, &dwp_mmap, dwp_path) {
@@ -1539,7 +1539,7 @@ fn find_jemalloc_via_maps_at(
                             pid,
                             ?dbg_parent_path,
                             bytes = dbg_parent.len(),
-                            "host-state probe: trying DWP with debuginfo parent",
+                            "ctprof probe: trying DWP with debuginfo parent",
                         );
                         if let Ok(offsets) =
                             resolve_field_offsets_from_dwp(&dbg_parent, &dwp_mmap, dwp_path)
@@ -1550,7 +1550,7 @@ fn find_jemalloc_via_maps_at(
                     tracing::debug!(
                         pid,
                         ?dwp_path,
-                        "host-state probe: DWP found but no parent had skeleton units",
+                        "ctprof probe: DWP found but no parent had skeleton units",
                     );
                 }
 
@@ -1582,7 +1582,7 @@ fn find_jemalloc_via_maps_at(
                             pid,
                             ?candidate,
                             bytes = dbg_data.len(),
-                            "host-state probe: trying debuginfo (mmap)",
+                            "ctprof probe: trying debuginfo (mmap)",
                         );
                         if let Ok(r) = resolve_field_offsets_from_bytes(dbg_data, candidate) {
                             return Ok((symbol, r));

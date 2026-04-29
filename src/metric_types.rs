@@ -1,6 +1,6 @@
 //! Type-safe wrappers for per-thread metric values.
 //!
-//! Each registered metric in [`crate::host_state_compare::HOST_STATE_METRICS`]
+//! Each registered metric in [`crate::ctprof_compare::CTPROF_METRICS`]
 //! has a kernel-source-grounded semantic category — counter,
 //! cumulative-time, peak high-water, instantaneous gauge, byte
 //! count, ordinal scalar, categorical, or cpuset. The aggregation
@@ -37,7 +37,7 @@
 //! a group total even if its individual reads are skewed by
 //! 100 µs).
 //!
-//! [`crate::host_state_compare`] runs in two modes that both
+//! [`crate::ctprof_compare`] runs in two modes that both
 //! preserve the shared-window property: SHOW renders one
 //! snapshot's lifetime totals; COMPARE subtracts two snapshots
 //! captured at different wall-clock instants to scope the values
@@ -55,7 +55,7 @@
 //!
 //! Encoding the category into the type system surfaces
 //! category-mismatched aggregation as a compile error. The
-//! [`crate::host_state_compare::AggRule`] dispatch routes each
+//! [`crate::ctprof_compare::AggRule`] dispatch routes each
 //! variant through the typed newtype's reduction trait — `Sum*`
 //! through [`Summable::sum_across`], `Max*` through
 //! [`Maxable::max_across`], `Range*` through
@@ -143,8 +143,8 @@
 //! - [`CategoricalString`] — string-valued, mode-aggregated.
 //!   `policy` is the only example after phase 2. The `state` char
 //!   and `ext_enabled` bool fields stay unwrapped on
-//!   [`crate::host_state::ThreadState`]; the
-//!   [`crate::host_state_compare::AggRule::Mode`] accessor coerces
+//!   [`crate::ctprof::ThreadState`]; the
+//!   [`crate::ctprof_compare::AggRule::Mode`] accessor coerces
 //!   them through `String` via `to_string()`/`Display` at the call
 //!   site. If a second bool field appears, promote both to a
 //!   dedicated `CategoricalBool` wrapper rather than continuing the
@@ -210,9 +210,9 @@
 //!
 //! Every wrapper carries `#[serde(transparent)]` so the JSON
 //! representation matches the unwrapped primitive. The
-//! [`crate::host_state::ThreadState`] migration to these
+//! [`crate::ctprof::ThreadState`] migration to these
 //! newtypes (phase 2) preserves wire format — existing
-//! snapshot files (`.hst.zst`) deserialize unchanged.
+//! snapshot files (`.ctprof.zst`) deserialize unchanged.
 //!
 //! # What this module is NOT
 //!
@@ -220,7 +220,7 @@
 //!   `MonotonicNs * MonotonicNs = MonotonicNs²` — these wrappers
 //!   carry semantic category, not algebraic dimensionality.
 //! - It is NOT a runtime-typed value enum (that lives next to
-//!   the [`crate::host_state_compare::AggRule`] dispatch). This
+//!   the [`crate::ctprof_compare::AggRule`] dispatch). This
 //!   module only defines the building-block newtypes.
 
 use serde::{Deserialize, Serialize};
@@ -234,7 +234,7 @@ use serde::{Deserialize, Serialize};
 /// moment of the procfs read. Sum across a group; delta across
 /// snapshots scopes the value to the inter-capture interval.
 ///
-/// Examples in [`crate::host_state_compare::HOST_STATE_METRICS`]:
+/// Examples in [`crate::ctprof_compare::CTPROF_METRICS`]:
 /// `nr_wakeups`, `nr_migrations`, `voluntary_csw`,
 /// `nonvoluntary_csw`, `wait_count`, `iowait_count`,
 /// `timeslices`, `minflt`, `majflt`, `syscr`, `syscw`.
@@ -261,7 +261,7 @@ pub struct MonotonicCount(pub u64);
 /// Cross-field ratios (e.g.
 /// `run_time_ns / (run_time_ns + wait_time_ns)`) are valid
 /// because every [`MonotonicNs`] field on
-/// [`crate::host_state::ThreadState`] is integrated over the
+/// [`crate::ctprof::ThreadState`] is integrated over the
 /// same thread-lifetime window.
 ///
 /// # u64 backing vs kernel s64
@@ -270,7 +270,7 @@ pub struct MonotonicCount(pub u64);
 /// `sum_sleep_runtime` and `sum_block_runtime` live in
 /// `struct sched_statistics` (`include/linux/sched.h`) as
 /// `s64`. The capture pipeline parses these via
-/// `parsed_ns_from_dotted` in [`crate::host_state`], which
+/// `parsed_ns_from_dotted` in [`crate::ctprof`], which
 /// returns `None` on negative dotted values; the capture-site
 /// `unwrap_or(0)` then collapses `None` to zero before the
 /// wrapper is constructed. The `u64` backing here is therefore
@@ -329,7 +329,7 @@ pub struct Bytes(pub u64);
 /// Examples that historically motivated this newtype:
 /// `nr_wakeups_idle`, `nr_migrations_cold`, `nr_wakeups_passive`
 /// — these fields were removed from
-/// [`crate::host_state::ThreadState`] because no kernel code
+/// [`crate::ctprof::ThreadState`] because no kernel code
 /// path increments them on 6.16 or 7.1 (no
 /// `schedstat_inc(p->stats.nr_wakeups_idle)` /
 /// `nr_migrations_cold` / `nr_wakeups_passive` call site exists
@@ -351,7 +351,7 @@ pub struct Bytes(pub u64);
 /// # Migration affordance
 ///
 /// A field can be flipped from [`MonotonicCount`] to
-/// [`DeadCounter`] without regenerating any `.hst.zst` snapshot
+/// [`DeadCounter`] without regenerating any `.ctprof.zst` snapshot
 /// files: the `repr(transparent)` + `serde(transparent)` wire
 /// format is structurally identical (a bare `u64`). Existing
 /// snapshots deserialize unchanged. The flip changes only the
@@ -431,7 +431,7 @@ pub struct DeadCounter(pub u64);
 /// (`include/linux/sched.h`); `wait_max`, `sleep_max`,
 /// `block_max`, and `slice_max` are `u64`. The capture pipeline
 /// parses every dotted-ms.ns value via `parsed_ns_from_dotted`
-/// in [`crate::host_state`], which returns `None` on negative
+/// in [`crate::ctprof`], which returns `None` on negative
 /// dotted values; the capture-site `unwrap_or(0)` then collapses
 /// `None` to zero before the wrapper is constructed. The `u64`
 /// backing here is therefore safe even for `exec_max` because
@@ -615,7 +615,7 @@ pub struct OrdinalU64(pub u64);
 /// `policy` (SCHED_OTHER, SCHED_FIFO, SCHED_RR, SCHED_BATCH,
 /// SCHED_IDLE, SCHED_DEADLINE, SCHED_EXT) is the only
 /// [`CategoricalString`] field on
-/// [`crate::host_state::ThreadState`] after phase 2. The
+/// [`crate::ctprof::ThreadState`] after phase 2. The
 /// `state: char` and `ext_enabled: bool` fields stay unwrapped
 /// — the `AggRule::Mode` accessor coerces them through `String`
 /// via `to_string()`/`Display` at the call site. If a second
@@ -627,7 +627,7 @@ pub struct OrdinalU64(pub u64);
 pub struct CategoricalString(pub String);
 
 /// CPU affinity set. Group reduction produces an
-/// [`crate::host_state_compare::AffinitySummary`] carrying the
+/// [`crate::ctprof_compare::AffinitySummary`] carrying the
 /// num_cpus range plus a uniform-cpuset flag.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -809,7 +809,7 @@ mod sealed {
 /// supertrait is private to this module.
 ///
 /// `sum_across` uses `saturating_add` to mirror the existing
-/// [`crate::host_state_compare::aggregate`] contract: per-thread
+/// [`crate::ctprof_compare::aggregate`] contract: per-thread
 /// counters are non-negative u64s, the group total cannot exceed
 /// `u64::MAX`, and a hostile or corrupt reading that would push
 /// the sum past `u64::MAX` saturates rather than wrapping.
@@ -837,7 +837,7 @@ mod sealed {
             lifetime accumulators): use Maxable::max_across; \
             OrdinalI32/OrdinalU32/OrdinalU64 (bounded scalars): use Rangeable::range_across; \
             CategoricalString: use Modeable::mode_across; CpuSet: use the \
-            AffinitySummary reduction in host_state_compare; \
+            AffinitySummary reduction in ctprof_compare; \
             DeadCounter: kernel-side dead pointer — value is structurally zero; the \
             registry must use a no-op aggregation arm (or omit the field) rather than \
             sum across structural zeros"
@@ -922,7 +922,7 @@ pub trait Summable: sealed::SummableSealed + Sized + Copy {
             reduces to the most-recent reading, not a worst window; \
             OrdinalI32/OrdinalU32/OrdinalU64: use Rangeable::range_across; \
             CategoricalString: use Modeable::mode_across; CpuSet: use the \
-            AffinitySummary reduction in host_state_compare; \
+            AffinitySummary reduction in ctprof_compare; \
             DeadCounter: kernel-side dead pointer — value is structurally zero; the \
             registry must use a no-op aggregation arm (or omit the field) rather than \
             max across structural zeros"
@@ -937,8 +937,8 @@ pub trait Maxable: sealed::MaxableSealed + Sized + Copy + Ord {
 /// `mode_across` returns `None` when the input iterator is
 /// empty. Ties break by ascending sort order on the value type
 /// to match the existing
-/// [`crate::host_state_compare::aggregate`]
-/// [`crate::host_state_compare::AggRule::Mode`] contract:
+/// [`crate::ctprof_compare::aggregate`]
+/// [`crate::ctprof_compare::AggRule::Mode`] contract:
 /// "lexicographically smaller wins" for equal-frequency strings.
 ///
 /// Sealed via [`sealed::ModeableSealed`]: a downstream crate
@@ -1008,7 +1008,7 @@ pub trait Modeable: sealed::ModeableSealed + Sized + Clone + Eq + Ord {
 /// - It is an in-memory aggregation result, not a wire-format
 ///   boundary; the `aggregate()` dispatch destructures `Range`
 ///   into the existing
-///   [`crate::host_state_compare::Aggregated::OrdinalRange`]
+///   [`crate::ctprof_compare::Aggregated::OrdinalRange`]
 ///   variant (which carries `min: i64, max: i64`), so the typed
 ///   invariant is enforced at the reduction boundary and the
 ///   untyped tuple shape continues to cross every serialized
@@ -1060,7 +1060,7 @@ impl<T: PartialOrd> Range<T> {
     /// Consume the range and return the `(min, max)` tuple.
     /// Useful at boundaries where the caller has its own
     /// pair-shaped representation (e.g. the
-    /// [`crate::host_state_compare::Aggregated::OrdinalRange`]
+    /// [`crate::ctprof_compare::Aggregated::OrdinalRange`]
     /// variant).
     pub fn into_tuple(self) -> (T, T) {
         (self.min, self.max)
@@ -1088,7 +1088,7 @@ impl<T: PartialOrd> Range<T> {
     label = "this metric type does not support range-across",
     note = "Counters/peaks/gauges: use Summable::sum_across or Maxable::max_across; \
             CategoricalString: use Modeable::mode_across; CpuSet: use the AffinitySummary \
-            reduction in host_state_compare"
+            reduction in ctprof_compare"
 )]
 pub trait Rangeable: sealed::RangeableSealed + Sized + Copy + Ord {
     fn range_across(items: impl IntoIterator<Item = Self>) -> Option<Range<Self>> {
@@ -1608,7 +1608,7 @@ mod tests {
     }
 
     /// Tie-break: equal counts → lex-smallest wins. Mirrors the
-    /// host_state_compare::aggregate(AggRule::Mode) rule (see
+    /// ctprof_compare::aggregate(AggRule::Mode) rule (see
     /// `mode_rule_tie_break_is_lexicographic` over there).
     #[test]
     fn modeable_tie_break_is_lex_smallest() {

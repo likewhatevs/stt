@@ -148,7 +148,7 @@ tikv-jemallocator = { version = "0.6", features = ["stats"] }
 # time. `arenas::narenas` is exposed unconditionally.
 tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
 # Regex synthesis from a list of literal strings — used by
-# `host_state_compare` to render human-readable display labels for
+# `ctprof_compare` to render human-readable display labels for
 # pattern-aggregated thread-name groups (e.g. 4 threads named
 # `tokio-runtime-worker-0..3` collapse to a regex showing the
 # shared prefix + alternation). The internal join key stays as the
@@ -198,7 +198,7 @@ encoding_rs = "0.8"
 thiserror = "2"
 
 # Compiled regex patterns for the token-based pattern_key
-# normalizer in `host_state_compare.rs`. Used to express the
+# normalizer in `ctprof_compare.rs`. Used to express the
 # spec rules in `classify_token` (`^\d+$`, `^[0-9a-f]+$`,
 # `^[A-Za-z]+\d+$`, `^\d+[A-Za-z]+$`) literally rather than as
 # hand-rolled char loops, so the rules read identically to the

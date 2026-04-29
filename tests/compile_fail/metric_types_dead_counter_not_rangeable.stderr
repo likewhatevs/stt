@@ -5,7 +5,7 @@ error[E0277]: `DeadCounter` is not Rangeable — Rangeable is reserved for bound
    |                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this metric type does not support range-across
    |
    = help: the trait `Rangeable` is not implemented for `DeadCounter`
-   = note: Counters/peaks/gauges: use Summable::sum_across or Maxable::max_across; CategoricalString: use Modeable::mode_across; CpuSet: use the AffinitySummary reduction in host_state_compare
+   = note: Counters/peaks/gauges: use Summable::sum_across or Maxable::max_across; CategoricalString: use Modeable::mode_across; CpuSet: use the AffinitySummary reduction in ctprof_compare
 help: the following other types implement trait `Rangeable`
   --> src/metric_types.rs
    |

@@ -1,4 +1,4 @@
-//! VM-backed integration test for [`ktstr::host_state::capture`].
+//! VM-backed integration test for [`ktstr::ctprof::capture`].
 //!
 //! Boots a minimal KVM guest via the `#[ktstr_test]` harness,
 //! runs a short CPU-spinning workload, then invokes `capture()`
@@ -8,11 +8,11 @@
 //! end-to-end signal that proves the capture layer's
 //! procfs/cgroup walk is wired through to the harness.
 //!
-//! Distinct from `tests/host_state_compare.rs`, which exercises
+//! Distinct from `tests/ctprof_compare.rs`, which exercises
 //! the compare pipeline against SYNTHETIC snapshots (no VM, no
 //! real procfs). This file is the counterpart: real capture,
 //! real procfs, VM-booted guest kernel — the two tests together
-//! cover the full "host-state capture → compare" end-to-end
+//! cover the full "ctprof capture → compare" end-to-end
 //! surface once both sides are in place.
 
 use anyhow::Result;
@@ -22,7 +22,7 @@ use ktstr::scenario::Ctx;
 use ktstr::scenario::ops::{CgroupDef, HoldSpec, Step, execute_steps};
 
 /// Run a short CPU-spinning workload inside the guest, then call
-/// [`ktstr::host_state::capture`] against the guest's `/proc` and
+/// [`ktstr::ctprof::capture`] against the guest's `/proc` and
 /// cgroup v2 mount. The assertion proves that at least one
 /// thread in the snapshot has observable scheduling activity —
 /// the cross-kernel-config signal that survives whether
@@ -50,7 +50,7 @@ use ktstr::scenario::ops::{CgroupDef, HoldSpec, Step, execute_steps};
 /// fires. Shorter windows (< 1 s) risk the workers not having
 /// faulted their stacks yet on slow CI runners.
 #[ktstr_test(llcs = 1, cores = 2, threads = 1, duration_s = 3)]
-fn host_state_capture_returns_threads_with_nonzero_counters(ctx: &Ctx) -> Result<AssertResult> {
+fn ctprof_capture_returns_threads_with_nonzero_counters(ctx: &Ctx) -> Result<AssertResult> {
     // Simple CpuSpin workload — workers hit the dispatcher,
     // accrue run_time_ns / voluntary_csw / minflt. One cgroup,
     // default workers_per_cgroup so the test doesn't need to
@@ -62,12 +62,12 @@ fn host_state_capture_returns_threads_with_nonzero_counters(ctx: &Ctx) -> Result
     }];
     let workload_result = execute_steps(ctx, steps)?;
 
-    // Capture the guest's host-state after the workload has had
+    // Capture the guest's ctprof after the workload has had
     // a chance to generate activity. `capture()` walks `/proc`
     // and `/sys/fs/cgroup` against the guest's own mount points
     // — inside the VM, those resolve to the guest kernel's live
     // procfs, not the outer host's.
-    let snap = ktstr::host_state::capture();
+    let snap = ktstr::ctprof::capture();
 
     // First-level sanity: the walk visited SOMETHING. An empty
     // snapshot would mean `iter_tgids_at(/proc)` returned no
@@ -76,7 +76,7 @@ fn host_state_capture_returns_threads_with_nonzero_counters(ctx: &Ctx) -> Result
     if snap.threads.is_empty() {
         return Ok(AssertResult::fail(AssertDetail::new(
             DetailKind::Other,
-            "host_state::capture() returned zero threads — procfs \
+            "ctprof::capture() returned zero threads — procfs \
              walk produced no entries, indicating the capture layer \
              is not reading /proc successfully inside the guest",
         )));
@@ -110,7 +110,7 @@ fn host_state_capture_returns_threads_with_nonzero_counters(ctx: &Ctx) -> Result
         return Ok(AssertResult::fail(AssertDetail::new(
             DetailKind::Other,
             format!(
-                "host_state::capture() returned {} threads but NONE \
+                "ctprof::capture() returned {} threads but NONE \
                  had a non-zero scheduling or page-fault counter; \
                  any_comm_nonempty={any_comm_nonempty}, \
                  any_tgid_nonzero={any_tgid_nonzero}. Suggests the \
@@ -124,7 +124,7 @@ fn host_state_capture_returns_threads_with_nonzero_counters(ctx: &Ctx) -> Result
 
     // Capture itself works and saw activity. Return the
     // scenario's own AssertResult so any scheduling failure
-    // surfaces alongside the host-state check — the two signals
+    // surfaces alongside the ctprof check — the two signals
     // are orthogonal.
     Ok(workload_result)
 }

@@ -378,7 +378,7 @@ mod tests {
     /// would slip past the order-blind `.contains(...)` checks in
     /// the sibling tests. This test fails the moment the sequence
     /// drifts; updating it forces the author to acknowledge the
-    /// reorder and double-check the HostContext host_state sub-block
+    /// reorder and double-check the HostContext ctprof sub-block
     /// still reads coherently.
     #[test]
     fn format_human_field_order_is_stable() {

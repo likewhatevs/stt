@@ -1,6 +1,6 @@
-# Host-State Profiler
+# ctprof
 
-The host-state profiler captures a host-wide per-thread snapshot
+The ctprof profiler captures a host-wide per-thread snapshot
 of scheduling counters, memory / I/O accounting, CPU affinity,
 cgroup state, and thread identity, then compares two snapshots to
 surface what changed. It is a manually-invoked CLI companion to
@@ -30,20 +30,20 @@ thread-level diff.
 
 The profiler is **not** invoked automatically by scenarios or the
 gauntlet. It is opt-in and operator-driven via the
-`ktstr host-state` subcommand.
+`ktstr ctprof` subcommand.
 
 ## Capture
 
 ```sh
-ktstr host-state capture --output baseline.hst.zst
+ktstr ctprof capture --output baseline.ctprof.zst
 # ... run workload, change a tunable, reboot a kernel, etc. ...
-ktstr host-state capture --output after.hst.zst
+ktstr ctprof capture --output after.ctprof.zst
 ```
 
 `capture` walks `/proc` for every live thread group, enumerates
 each thread, and reads a handful of procfs sources for each one.
 The output is a zstd-compressed JSON snapshot (conventional
-extension: `.hst.zst`).
+extension: `.ctprof.zst`).
 
 ### What is captured per thread
 
@@ -105,7 +105,7 @@ values.
 
 ### Snapshot identity
 
-The top-level `HostStateSnapshot` also embeds a `HostContext`
+The top-level `CtprofSnapshot` also embeds a `HostContext`
 (the same structure `show-host` prints — kernel, CPU, memory,
 sched_\* tunables, cmdline). Older tools or synthetic fixtures
 that omit the context render `(host context unavailable)` rather
@@ -126,7 +126,7 @@ and namespace visibility).
 ## Compare
 
 ```sh
-ktstr host-state compare before.hst.zst after.hst.zst
+ktstr ctprof compare before.ctprof.zst after.ctprof.zst
 ```
 
 `compare` joins the two snapshots on `(pcomm, comm)` by default
@@ -149,7 +149,7 @@ because the process did not exist, not because it did zero work.
 ### Cgroup-path flattening
 
 ```sh
-ktstr host-state compare before.hst.zst after.hst.zst \
+ktstr ctprof compare before.ctprof.zst after.ctprof.zst \
     --group-by cgroup \
     --cgroup-flatten '/kubepods/*/pod-*/container' \
     --cgroup-flatten '/system.slice/*.scope'
@@ -164,7 +164,7 @@ assigned different UUIDs.
 ### Aggregation rules
 
 Each metric declares its own aggregation rule
-([`HOST_STATE_METRICS`] in `src/host_state_compare.rs`). The
+([`CTPROF_METRICS`] in `src/ctprof_compare.rs`). The
 `AggRule` enum is **typed**: each variant binds an accessor of a
 specific [`metric_types`] newtype (`MonotonicCount`,
 `MonotonicNs`, `PeakNs`, `Bytes`, etc.) so a registry entry that
@@ -249,11 +249,11 @@ summary, not a homogeneous newtype.
 ### Derived metrics
 
 Derived metrics consume one or more already-aggregated input
-metrics from `HOST_STATE_METRICS` and produce a single scalar
+metrics from `CTPROF_METRICS` and produce a single scalar
 with its own auto-scale ladder. They render in a separate
 `## Derived metrics` table below the per-thread table on both
-`compare` and `show`. Registered in `HOST_STATE_DERIVED_METRICS`
-in `src/host_state_compare.rs`.
+`compare` and `show`. Registered in `CTPROF_DERIVED_METRICS`
+in `src/ctprof_compare.rs`.
 
 The full registry as of this writing is eight entries. Every
 formula is implemented as a closure over the group's metrics
@@ -281,7 +281,7 @@ decimal scalar). Non-ratio derived metrics reuse the same
 ladders as their unit family — `Ns` for nanosecond derivations,
 `Bytes` for byte derivations.
 
-Derived metrics are surfaced by `host-state metric-list`
+Derived metrics are surfaced by `ctprof metric-list`
 alongside the primary registry, and are valid `--sort-by` keys
 on both `compare` and `show`.
 
@@ -301,12 +301,12 @@ affinity) fall to the bottom.
 
 ## File format
 
-`.hst.zst` is zstd-compressed JSON of `HostStateSnapshot`. The
+`.ctprof.zst` is zstd-compressed JSON of `CtprofSnapshot`. The
 schema is `#[non_exhaustive]` so field additions do not break
 existing snapshots:
 
 ```
-HostStateSnapshot
+CtprofSnapshot
 ├── captured_at_unix_ns: u64
 ├── host: Option<HostContext>
 ├── threads: Vec<ThreadState>
@@ -322,7 +322,7 @@ at capture time; the capture layer currently targets x86_64 and
 aarch64 only.
 
 Compression level `3` (matching the ktstr remote-cache
-convention): adequate ratio at fast speed, and host-state
+convention): adequate ratio at fast speed, and ctprof
 captures are small enough that further compression produces
 diminishing returns on I/O.
 
@@ -355,7 +355,7 @@ aggregation rules are legal in step 3:
 | `CategoricalString` | Categorical value — mode-aggregated. Examples: `policy`. |
 | `CpuSet` | CPU affinity mask — affinity-aggregated. Example: `cpu_affinity`. |
 
-Add the field to `ThreadState` in `src/host_state.rs`:
+Add the field to `ThreadState` in `src/ctprof.rs`:
 
 ```rust,ignore
 // In ThreadState struct definition.
@@ -367,7 +367,7 @@ pub my_new_metric: crate::metric_types::MonotonicCount,
 
 ### 2. Wire the capture path
 
-`capture_thread_at_with_tally` in `src/host_state.rs` is the
+`capture_thread_at_with_tally` in `src/ctprof.rs` is the
 single per-thread procfs walk. Add the per-source reader (or
 extend an existing one) and stamp the field in the
 `ThreadState { ... }` construction:
@@ -387,18 +387,18 @@ output — see the *Capture is best-effort* section.
 
 ### 3. Register the metric
 
-Append a `HostStateMetricDef` entry to `HOST_STATE_METRICS` in
-`src/host_state_compare.rs`. The `AggRule` variant must match the
+Append a `CtprofMetricDef` entry to `CTPROF_METRICS` in
+`src/ctprof_compare.rs`. The `AggRule` variant must match the
 newtype chosen in step 1 — the type system enforces this.
 
 ```rust,ignore
-HostStateMetricDef {
+CtprofMetricDef {
     name: "my_new_metric",
     rule: AggRule::SumCount(|t| t.my_new_metric),
     sched_class: None, // or Some("cfs-only") / Some("non-ext") / Some("fair-policy")
     config_gates: &[], // or &["CONFIG_SCHEDSTATS"], etc.
     is_dead: false,    // true for kernel-side dead pointers
-    description: "One-line operator-facing description; surfaces in `host-state metric-list`.",
+    description: "One-line operator-facing description; surfaces in `ctprof metric-list`.",
 },
 ```
 
@@ -442,7 +442,7 @@ mismatch but not the lying inside.
 
 If the new metric has a useful ratio or sum-of-ratios pairing
 with existing inputs, register a `DerivedMetricDef` in
-`HOST_STATE_DERIVED_METRICS` (same file). The `compute` closure
+`CTPROF_DERIVED_METRICS` (same file). The `compute` closure
 reads inputs via `input_scalar(metrics, name)?` and returns
 `Option<DerivedValue>`; the `ratio_compute` and
 `ratio_of_sum_compute` helpers cover the two most common

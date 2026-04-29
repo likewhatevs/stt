@@ -151,7 +151,7 @@ respect: it accepts raw image file paths for `--kernel` (e.g.
 `bzImage`, `Image`). Source-tree directories auto-build and no-kernel
 invocations auto-download — same as `ktstr shell`.
 
-### host-state
+### ctprof
 
 Capture or compare a host-wide per-thread state snapshot. Useful
 for diagnosing "the scheduler looks fine but something on the
@@ -161,17 +161,17 @@ counters — a superset of what any single test's sidecar
 captures.
 
 ```sh
-ktstr host-state capture --output baseline.hst.zst
+ktstr ctprof capture --output baseline.ctprof.zst
 # ... run workload of interest ...
-ktstr host-state capture --output candidate.hst.zst
-ktstr host-state compare baseline.hst.zst candidate.hst.zst
+ktstr ctprof capture --output candidate.ctprof.zst
+ktstr ctprof compare baseline.ctprof.zst candidate.ctprof.zst
 ```
 
 **`capture`** walks `/proc` at capture time and writes every
 visible thread's cumulative counters (schedstat, sched,
 status CSW, page faults, I/O bytes, CPU affinity, cgroup,
 identity) as zstd-compressed JSON (conventional extension
-`.hst.zst`). Every recorded field is cumulative-from-birth so
+`.ctprof.zst`). Every recorded field is cumulative-from-birth so
 probe attachment time does not bias the reading — a diff
 between two snapshots measures exactly the activity over the
 window. Per-cgroup aggregates (`cpu.stat`, `memory.current`)
@@ -180,7 +180,7 @@ nothing is attached, no kprobes, no tracing.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-o`, `--output PATH` | required | Destination path (convention: `.hst.zst`). Existing files are overwritten. |
+| `-o`, `--output PATH` | required | Destination path (convention: `.ctprof.zst`). Existing files are overwritten. |
 
 **`compare`** joins two snapshots on `(pcomm, comm)` and
 renders a per-metric baseline/candidate/delta table. The join
@@ -194,8 +194,8 @@ time.
 
 | Arg / Flag | Description |
 |------|-------------|
-| `BASELINE` | Path to the baseline `.hst.zst` snapshot. |
-| `CANDIDATE` | Path to the candidate `.hst.zst` snapshot. |
+| `BASELINE` | Path to the baseline `.ctprof.zst` snapshot. |
+| `CANDIDATE` | Path to the candidate `.ctprof.zst` snapshot. |
 
 ### locks
 

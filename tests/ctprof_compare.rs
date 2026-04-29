@@ -1,14 +1,14 @@
-//! Integration tests for the host-state comparison pipeline.
+//! Integration tests for the ctprof comparison pipeline.
 //!
 //! These tests exercise the public surface of
-//! [`ktstr::host_state`] and [`ktstr::host_state_compare`] as a
-//! single unit: write two `HostStateSnapshot`s to disk, load
+//! [`ktstr::ctprof`] and [`ktstr::ctprof_compare`] as a
+//! single unit: write two `CtprofSnapshot`s to disk, load
 //! them back, run the compare, render the result, and verify
 //! that the rendered output contains the expected columns and
 //! non-zero deltas.
 //!
 //! The fixtures are synthetic (no VM) because the capture-side
-//! implementation lands in parallel. Once `ktstr host-state capture -o`
+//! implementation lands in parallel. Once `ktstr ctprof capture -o`
 //! is wired end-to-end, a VM-backed integration test will run
 //! the same toy workload twice through real capture and
 //! compare the real snapshots; that test is tracked separately.
@@ -16,9 +16,9 @@
 //! downstream addition is a drop-in extension rather than a
 //! rewrite.
 
-// Shared host-state test helpers live under `tests/common/`
+// Shared ctprof test helpers live under `tests/common/`
 // so the same `make_thread` / `snapshot` / `cgroup_stats_entry`
-// builders feed both this file and `tests/host_state_show.rs`
+// builders feed both this file and `tests/ctprof_show.rs`
 // without duplicating bodies. The `mod common;` declaration
 // pulls the subdirectory in as a non-test module.
 mod common;
@@ -26,17 +26,17 @@ mod common;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use ktstr::host_state::{HostStateSnapshot, ThreadState};
-use ktstr::host_state_compare::{
-    AggRule, Aggregated, CompareOptions, DisplayOptions, GroupBy, HOST_STATE_METRICS,
-    HostStateCompareArgs, aggregate, compare, run_compare, write_diff,
+use ktstr::ctprof::{CtprofSnapshot, ThreadState};
+use ktstr::ctprof_compare::{
+    AggRule, Aggregated, CompareOptions, CTPROF_METRICS, CtprofCompareArgs, DisplayOptions,
+    GroupBy, aggregate, compare, run_compare, write_diff,
 };
 use ktstr::metric_types::{
     Bytes, ClockTicks, CpuSet, GaugeCount, GaugeNs, MonotonicCount, MonotonicNs, OrdinalI32,
     OrdinalU32, PeakBytes, PeakNs,
 };
 
-use common::host_state::{cgroup_stats_entry, make_thread, snapshot};
+use common::ctprof::{cgroup_stats_entry, make_thread, snapshot};
 
 fn compare_options(group_by: GroupBy, flatten: Vec<String>) -> CompareOptions {
     let mut opts = CompareOptions::default();
@@ -56,8 +56,8 @@ fn compare_options(group_by: GroupBy, flatten: Vec<String>) -> CompareOptions {
 #[test]
 fn full_pipeline_with_disk_roundtrip() {
     let tmp = tempfile::tempdir().unwrap();
-    let baseline_path = tmp.path().join("baseline.hst.zst");
-    let candidate_path = tmp.path().join("candidate.hst.zst");
+    let baseline_path = tmp.path().join("baseline.ctprof.zst");
+    let candidate_path = tmp.path().join("candidate.ctprof.zst");
 
     let mut ta = make_thread("integration_proc", "worker");
     ta.run_time_ns = MonotonicNs(1_000_000);
@@ -75,8 +75,8 @@ fn full_pipeline_with_disk_roundtrip() {
         .write(&candidate_path)
         .unwrap();
 
-    let loaded_a = HostStateSnapshot::load(&baseline_path).unwrap();
-    let loaded_b = HostStateSnapshot::load(&candidate_path).unwrap();
+    let loaded_a = CtprofSnapshot::load(&baseline_path).unwrap();
+    let loaded_b = CtprofSnapshot::load(&candidate_path).unwrap();
     assert_eq!(loaded_a.threads.len(), 1);
     assert_eq!(loaded_b.threads.len(), 1);
 
@@ -90,7 +90,7 @@ fn full_pipeline_with_disk_roundtrip() {
         .iter()
         .filter(|r| r.group_key == "integration_proc")
         .collect();
-    assert_eq!(proc_rows.len(), HOST_STATE_METRICS.len());
+    assert_eq!(proc_rows.len(), CTPROF_METRICS.len());
 
     // Non-zero deltas survive the full pipeline.
     let run_time = proc_rows
@@ -153,8 +153,8 @@ fn full_pipeline_with_disk_roundtrip() {
 #[test]
 fn cgroup_flatten_joins_pods_with_different_ids() {
     let tmp = tempfile::tempdir().unwrap();
-    let a_path = tmp.path().join("a.hst.zst");
-    let b_path = tmp.path().join("b.hst.zst");
+    let a_path = tmp.path().join("a.ctprof.zst");
+    let b_path = tmp.path().join("b.ctprof.zst");
 
     let mut ta = make_thread("app", "worker");
     ta.cgroup = "/kubepods/burstable/pod-AAA/container".into();
@@ -177,8 +177,8 @@ fn cgroup_flatten_joins_pods_with_different_ids() {
     snapshot(vec![ta], cgroup_stats_a).write(&a_path).unwrap();
     snapshot(vec![tb], cgroup_stats_b).write(&b_path).unwrap();
 
-    let loaded_a = HostStateSnapshot::load(&a_path).unwrap();
-    let loaded_b = HostStateSnapshot::load(&b_path).unwrap();
+    let loaded_a = CtprofSnapshot::load(&a_path).unwrap();
+    let loaded_b = CtprofSnapshot::load(&b_path).unwrap();
 
     let opts = compare_options(
         GroupBy::Cgroup,
@@ -235,8 +235,8 @@ fn cgroup_flatten_joins_pods_with_different_ids() {
 #[test]
 fn unmatched_groups_render_with_source_path() {
     let tmp = tempfile::tempdir().unwrap();
-    let a_path = tmp.path().join("a.hst.zst");
-    let b_path = tmp.path().join("b.hst.zst");
+    let a_path = tmp.path().join("a.ctprof.zst");
+    let b_path = tmp.path().join("b.ctprof.zst");
 
     snapshot(vec![make_thread("only_a", "w")], BTreeMap::new())
         .write(&a_path)
@@ -245,8 +245,8 @@ fn unmatched_groups_render_with_source_path() {
         .write(&b_path)
         .unwrap();
 
-    let loaded_a = HostStateSnapshot::load(&a_path).unwrap();
-    let loaded_b = HostStateSnapshot::load(&b_path).unwrap();
+    let loaded_a = CtprofSnapshot::load(&a_path).unwrap();
+    let loaded_b = CtprofSnapshot::load(&b_path).unwrap();
     let diff = compare(&loaded_a, &loaded_b, &CompareOptions::default());
     assert_eq!(diff.only_baseline, vec!["only_a".to_string()]);
     assert_eq!(diff.only_candidate, vec!["only_b".to_string()]);
@@ -275,12 +275,12 @@ fn unmatched_groups_render_with_source_path() {
 #[test]
 fn load_surfaces_error_on_malformed_snapshot() {
     let tmp = tempfile::tempdir().unwrap();
-    let path = tmp.path().join("bad.hst.zst");
+    let path = tmp.path().join("bad.ctprof.zst");
     std::fs::write(&path, b"not even zstd").unwrap();
-    let err = HostStateSnapshot::load(&path).unwrap_err();
+    let err = CtprofSnapshot::load(&path).unwrap_err();
     let msg = format!("{err:?}");
     assert!(
-        msg.contains("host-state") || msg.contains("zstd"),
+        msg.contains("ctprof") || msg.contains("zstd"),
         "error context missing source hint:\n{msg}",
     );
 }
@@ -300,8 +300,8 @@ fn load_surfaces_error_on_malformed_snapshot() {
 #[test]
 fn run_compare_returns_ok_zero_regardless_of_diff_emptiness() {
     let tmp = tempfile::tempdir().unwrap();
-    let baseline_path = tmp.path().join("baseline.hst.zst");
-    let candidate_path = tmp.path().join("candidate.hst.zst");
+    let baseline_path = tmp.path().join("baseline.ctprof.zst");
+    let candidate_path = tmp.path().join("candidate.ctprof.zst");
 
     let mut ta = make_thread("run_compare_proc", "w");
     ta.run_time_ns = MonotonicNs(10_000);
@@ -315,7 +315,7 @@ fn run_compare_returns_ok_zero_regardless_of_diff_emptiness() {
         .write(&candidate_path)
         .unwrap();
 
-    let args = HostStateCompareArgs {
+    let args = CtprofCompareArgs {
         baseline: baseline_path,
         candidate: candidate_path,
         group_by: GroupBy::Pcomm,
@@ -323,7 +323,7 @@ fn run_compare_returns_ok_zero_regardless_of_diff_emptiness() {
         no_thread_normalize: false,
         no_cg_normalize: false,
         sort_by: String::new(),
-        display_format: ktstr::host_state_compare::DisplayFormat::Full,
+        display_format: ktstr::ctprof_compare::DisplayFormat::Full,
         columns: String::new(),
         sections: String::new(),
         metrics: String::new(),
@@ -351,8 +351,8 @@ fn run_compare_returns_ok_zero_regardless_of_diff_emptiness() {
 #[test]
 fn run_compare_with_valid_sort_by_succeeds() {
     let tmp = tempfile::tempdir().unwrap();
-    let baseline_path = tmp.path().join("baseline.hst.zst");
-    let candidate_path = tmp.path().join("candidate.hst.zst");
+    let baseline_path = tmp.path().join("baseline.ctprof.zst");
+    let candidate_path = tmp.path().join("candidate.ctprof.zst");
 
     // Two distinct buckets so the multi-key sort actually has
     // groups to rank — single-bucket would short-circuit
@@ -373,7 +373,7 @@ fn run_compare_with_valid_sort_by_succeeds() {
         .write(&candidate_path)
         .unwrap();
 
-    let args = HostStateCompareArgs {
+    let args = CtprofCompareArgs {
         baseline: baseline_path,
         candidate: candidate_path,
         group_by: GroupBy::Pcomm,
@@ -385,7 +385,7 @@ fn run_compare_with_valid_sort_by_succeeds() {
         // mixed asc/desc) so a regression in any of those
         // reaches the integration boundary.
         sort_by: "run_time_ns:DESC, wait_time_ns:asc".into(),
-        display_format: ktstr::host_state_compare::DisplayFormat::Full,
+        display_format: ktstr::ctprof_compare::DisplayFormat::Full,
         columns: String::new(),
         sections: String::new(),
         metrics: String::new(),
@@ -404,8 +404,8 @@ fn run_compare_with_valid_sort_by_succeeds() {
 #[test]
 fn run_compare_with_invalid_sort_by_returns_err() {
     let tmp = tempfile::tempdir().unwrap();
-    let baseline_path = tmp.path().join("baseline.hst.zst");
-    let candidate_path = tmp.path().join("candidate.hst.zst");
+    let baseline_path = tmp.path().join("baseline.ctprof.zst");
+    let candidate_path = tmp.path().join("candidate.ctprof.zst");
 
     let ta = make_thread("p", "w");
     let tb = make_thread("p", "w");
@@ -416,7 +416,7 @@ fn run_compare_with_invalid_sort_by_returns_err() {
         .write(&candidate_path)
         .unwrap();
 
-    let args = HostStateCompareArgs {
+    let args = CtprofCompareArgs {
         baseline: baseline_path,
         candidate: candidate_path,
         group_by: GroupBy::Pcomm,
@@ -426,7 +426,7 @@ fn run_compare_with_invalid_sort_by_returns_err() {
         // Unknown metric name — must surface the parser error,
         // not a silent best-effort sort.
         sort_by: "not_a_real_metric".into(),
-        display_format: ktstr::host_state_compare::DisplayFormat::Full,
+        display_format: ktstr::ctprof_compare::DisplayFormat::Full,
         columns: String::new(),
         sections: String::new(),
         metrics: String::new(),
@@ -448,14 +448,14 @@ fn run_compare_with_invalid_sort_by_returns_err() {
     );
 }
 
-/// Exhaustive accessor pin for the entire HOST_STATE_METRICS
+/// Exhaustive accessor pin for the entire CTPROF_METRICS
 /// registry: every entry, regardless of its [`AggRule`] variant
 /// (Sum, Max, OrdinalRange, Mode, Affinity), must read back
 /// the exact field its accessor closure names.
 ///
 /// The unit-level test
 /// `sum_metric_accessors_read_expected_field` (in
-/// src/host_state_compare.rs) only covers Sum metrics. This
+/// src/ctprof_compare.rs) only covers Sum metrics. This
 /// integration-level pin extends the same idea to every variant
 /// AND verifies (via set-equality against the registry below)
 /// that no metric is missing from the local case table — the
@@ -482,7 +482,7 @@ fn run_compare_with_invalid_sort_by_returns_err() {
 /// set the field to a unique u64 and assert the returned
 /// scalar equals it.
 #[test]
-fn host_state_metrics_accessors_read_every_variant() {
+fn ctprof_metrics_accessors_read_every_variant() {
     // Every registry name in this list paired with a setter
     // closure that populates the field the accessor reads.
     // Each Sum/Max setter writes a UNIQUE value so an accessor
@@ -807,7 +807,7 @@ fn host_state_metrics_accessors_read_every_variant() {
     for (name, set) in cases {
         let mut t = make_thread("p", "w");
         set(&mut t);
-        let def = HOST_STATE_METRICS
+        let def = CTPROF_METRICS
             .iter()
             .find(|m| m.name == *name)
             .unwrap_or_else(|| panic!("metric {name} not in registry"));
@@ -928,7 +928,7 @@ fn host_state_metrics_accessors_read_every_variant() {
     }
 
     // Exhaustiveness pin via SET-equality. count-equality
-    // (cases.len() == HOST_STATE_METRICS.len()) would silently
+    // (cases.len() == CTPROF_METRICS.len()) would silently
     // pass on a duplicate test entry that displaced a missing
     // metric. Building name sets and asserting equality
     // catches both directions: a registry-added metric without
@@ -937,7 +937,7 @@ fn host_state_metrics_accessors_read_every_variant() {
     let case_names: std::collections::BTreeSet<&str> =
         cases.iter().map(|(name, _)| *name).collect();
     let registry_names: std::collections::BTreeSet<&str> =
-        HOST_STATE_METRICS.iter().map(|m| m.name).collect();
+        CTPROF_METRICS.iter().map(|m| m.name).collect();
     assert_eq!(
         case_names.len(),
         cases.len(),
@@ -945,7 +945,7 @@ fn host_state_metrics_accessors_read_every_variant() {
     );
     assert_eq!(
         case_names, registry_names,
-        "test cases must mirror HOST_STATE_METRICS exactly; \
+        "test cases must mirror CTPROF_METRICS exactly; \
          missing-from-cases or extra-in-cases delta surfaces here",
     );
 }
@@ -1001,10 +1001,10 @@ fn nr_threads_leader_dedup_aggregates_via_max_on_leader_value() {
     follower_b.tgid = 4242;
     follower_b.nr_threads = GaugeCount(0);
 
-    let def = HOST_STATE_METRICS
+    let def = CTPROF_METRICS
         .iter()
         .find(|m| m.name == "nr_threads")
-        .expect("nr_threads metric must be in HOST_STATE_METRICS");
+        .expect("nr_threads metric must be in CTPROF_METRICS");
 
     // Sanity-pin the registry rule shape itself — a regression
     // that flipped Max → Sum would surface here BEFORE the
@@ -1052,7 +1052,7 @@ fn nr_threads_leader_dedup_aggregates_via_max_on_leader_value() {
 /// auto-scale → baseline → candidate cell rendering.
 #[test]
 fn compare_smaps_rollup_renders_header_and_scaled_byte_values() {
-    use ktstr::host_state_compare::{CompareOptions, DisplayOptions, GroupBy, compare, write_diff};
+    use ktstr::ctprof_compare::{CompareOptions, DisplayOptions, GroupBy, compare, write_diff};
     use std::path::Path;
 
     // Baseline thread carries Pss = 1024 kB (= 1 MiB);
@@ -1142,7 +1142,7 @@ fn compare_smaps_rollup_renders_header_and_scaled_byte_values() {
 /// rows). Pins the `any_delta` precheck.
 #[test]
 fn compare_smaps_rollup_suppresses_section_when_all_unchanged() {
-    use ktstr::host_state_compare::{CompareOptions, DisplayOptions, GroupBy, compare, write_diff};
+    use ktstr::ctprof_compare::{CompareOptions, DisplayOptions, GroupBy, compare, write_diff};
     use std::path::Path;
 
     let mut leader = make_thread("worker", "worker");
@@ -1183,8 +1183,8 @@ fn compare_smaps_rollup_suppresses_section_when_all_unchanged() {
 /// (disabled → enabled).
 #[test]
 fn compare_sched_ext_renders_section_with_state_and_counter_deltas() {
-    use ktstr::host_state::SchedExtSysfs;
-    use ktstr::host_state_compare::{CompareOptions, DisplayOptions, GroupBy, compare, write_diff};
+    use ktstr::ctprof::SchedExtSysfs;
+    use ktstr::ctprof_compare::{CompareOptions, DisplayOptions, GroupBy, compare, write_diff};
     use std::path::Path;
 
     // Distinct values per field so the substring assertions on
@@ -1269,7 +1269,7 @@ fn compare_sched_ext_renders_section_with_state_and_counter_deltas() {
 /// CONFIG_SCHED_CLASS_EXT=n-on-both-kernels path.
 #[test]
 fn compare_sched_ext_suppresses_section_when_both_sides_none() {
-    use ktstr::host_state_compare::{CompareOptions, DisplayOptions, GroupBy, compare, write_diff};
+    use ktstr::ctprof_compare::{CompareOptions, DisplayOptions, GroupBy, compare, write_diff};
     use std::path::Path;
 
     let baseline = snapshot(vec![], BTreeMap::new());

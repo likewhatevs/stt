@@ -354,10 +354,10 @@ ktstr kernel build 6.14.2
 ktstr kernel build --source ../linux
 ktstr kernel build --git URL --ref v6.14
 ktstr kernel clean --keep 3
-ktstr host-state capture --output baseline.hst.zst         # snapshot every live thread's counters
-# host-state capture pulls per-thread jemalloc counters via ptrace; needs root,
+ktstr ctprof capture --output baseline.ctprof.zst         # snapshot every live thread's counters
+# ctprof capture pulls per-thread jemalloc counters via ptrace; needs root,
 # `sudo setcap cap_sys_ptrace+eip $(which ktstr)`, or `kernel.yama.ptrace_scope=0`
-ktstr host-state compare baseline.hst.zst candidate.hst.zst # diff two snapshots on the selected grouping axis
+ktstr ctprof compare baseline.ctprof.zst candidate.ctprof.zst # diff two snapshots on the selected grouping axis
 ktstr completions bash
 ```
 

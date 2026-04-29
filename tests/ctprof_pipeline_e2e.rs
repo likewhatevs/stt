@@ -1,16 +1,16 @@
-//! End-to-end integration test for the host-state capture ↔
+//! End-to-end integration test for the ctprof capture ↔
 //! compare pipeline.
 //!
 //! Fills in the missing half of the coverage noted on
-//! `tests/host_state_compare.rs` (docstring lines 10-17): the
+//! `tests/ctprof_compare.rs` (docstring lines 10-17): the
 //! compare-side file exercises `compare` and `write_diff` against
 //! SYNTHETIC snapshots (no VM, no real procfs); the capture-side
-//! file (`tests/host_state_capture.rs`) exercises ONE real
+//! file (`tests/ctprof_capture.rs`) exercises ONE real
 //! capture inside a guest. This file stitches the two halves
 //! together: inside a VM-booted guest, drive a CPU-spinning
 //! workload twice with a capture + disk-write between and after
 //! each round, then load both snapshots back from disk and run
-//! [`ktstr::host_state_compare::compare`] on the pair.
+//! [`ktstr::ctprof_compare::compare`] on the pair.
 //!
 //! The assertion verifies that real schedstat + page-fault deltas
 //! survive the full pipeline — capture → zstd-serialize → write →
@@ -30,8 +30,8 @@
 
 use anyhow::{Result, anyhow};
 use ktstr::assert::{AssertDetail, AssertResult, DetailKind};
-use ktstr::host_state::{self, HostStateSnapshot};
-use ktstr::host_state_compare::{CompareOptions, compare};
+use ktstr::ctprof::{self, CtprofSnapshot};
+use ktstr::ctprof_compare::{CompareOptions, compare};
 use ktstr::ktstr_test;
 use ktstr::scenario::Ctx;
 use ktstr::scenario::ops::{CgroupDef, HoldSpec, Step, execute_steps};
@@ -44,7 +44,7 @@ use ktstr::worker_ready_wait::wait_for_worker_ready;
 // `ktstr-jemalloc-alloc-worker` inside the guest twice, between two
 // captures, to grow `allocated_bytes` across the round-trip. Same
 // ctor pattern as `tests/jemalloc_probe_tests.rs` and
-// `tests/host_state_capture_jemalloc_e2e.rs`; each integration-test
+// `tests/ctprof_capture_jemalloc_e2e.rs`; each integration-test
 // crate compiles its own ctor list.
 // ---------------------------------------------------------------------------
 
@@ -74,11 +74,11 @@ static JEMALLOC_ALLOC_WORKER: Payload = Payload::new(
 /// Drive the pipeline inside the guest:
 ///
 /// 1. Capture `baseline` after a short workload.
-/// 2. Write `baseline` to `/tmp/baseline.hst.zst`.
+/// 2. Write `baseline` to `/tmp/baseline.ctprof.zst`.
 /// 3. Run a second workload window so counters advance.
-/// 4. Capture `candidate`; write to `/tmp/candidate.hst.zst`.
+/// 4. Capture `candidate`; write to `/tmp/candidate.ctprof.zst`.
 /// 5. Load both snapshots back from disk via
-///    [`HostStateSnapshot::load`].
+///    [`CtprofSnapshot::load`].
 /// 6. Run [`compare`] against the loaded pair with default
 ///    options (GroupBy::Pcomm, no flatten).
 /// 7. Verify at least one metric row carries a non-zero delta.
@@ -91,7 +91,7 @@ static JEMALLOC_ALLOC_WORKER: Payload = Payload::new(
 /// (compare-side regression).
 ///
 /// Topology: 1 LLC / 2 cores / 1 thread mirrors the sibling
-/// `host_state_capture` test — minimal guest, focused on the
+/// `ctprof_capture` test — minimal guest, focused on the
 /// pipeline surface, not on scheduler behavior. Two cores matter
 /// because the workers need to genuinely move through the
 /// scheduler rather than all pile onto a single runqueue that
@@ -102,9 +102,9 @@ static JEMALLOC_ALLOC_WORKER: Payload = Payload::new(
 /// doubling keeps the per-window activity at the same floor
 /// rather than halving it.
 #[ktstr_test(llcs = 1, cores = 2, threads = 1, duration_s = 6)]
-fn host_state_pipeline_e2e_capture_write_load_compare(ctx: &Ctx) -> Result<AssertResult> {
-    let baseline_path = std::path::PathBuf::from("/tmp/baseline.hst.zst");
-    let candidate_path = std::path::PathBuf::from("/tmp/candidate.hst.zst");
+fn ctprof_pipeline_e2e_capture_write_load_compare(ctx: &Ctx) -> Result<AssertResult> {
+    let baseline_path = std::path::PathBuf::from("/tmp/baseline.ctprof.zst");
+    let candidate_path = std::path::PathBuf::from("/tmp/candidate.ctprof.zst");
 
     // First workload window: default HoldSpec::FULL occupies the
     // full step duration. `execute_steps` with one Step carrying
@@ -119,10 +119,10 @@ fn host_state_pipeline_e2e_capture_write_load_compare(ctx: &Ctx) -> Result<Asser
 
     // Capture snapshot #1 — activity accumulated during the
     // first window. `write` already threads full context chains
-    // via `.with_context(|| format!("write host-state snapshot
+    // via `.with_context(|| format!("write ctprof snapshot
     // to {}", path.display()))` so the bare `?` surfaces an
     // actionable error without re-wrapping.
-    let baseline_snap = host_state::capture();
+    let baseline_snap = ctprof::capture();
     baseline_snap.write(&baseline_path)?;
 
     // Second workload window under its own cgroup so the
@@ -143,18 +143,18 @@ fn host_state_pipeline_e2e_capture_write_load_compare(ctx: &Ctx) -> Result<Asser
     // capture time have now accumulated activity from BOTH
     // workload windows; the candidate totals should therefore
     // exceed the baseline totals for the pcomm group.
-    let candidate_snap = host_state::capture();
+    let candidate_snap = ctprof::capture();
     candidate_snap.write(&candidate_path)?;
 
     // Load both snapshots back — exercises the full
     // disk-read + zstd-decode + serde-deserialize path that the
-    // host-side `ktstr host-state compare` CLI invocation would
+    // host-side `ktstr ctprof compare` CLI invocation would
     // run. A regression in the serialize-deserialize round trip
     // surfaces here as a deserialization error, not as a
     // silent field collapse. `load` threads its own anyhow
     // context chain so `?` surfaces an actionable error.
-    let loaded_baseline = HostStateSnapshot::load(&baseline_path)?;
-    let loaded_candidate = HostStateSnapshot::load(&candidate_path)?;
+    let loaded_baseline = CtprofSnapshot::load(&baseline_path)?;
+    let loaded_candidate = CtprofSnapshot::load(&candidate_path)?;
 
     // First-level sanity: the round-trip preserved thread counts
     // on both sides. An empty snapshot after load would mean the
@@ -206,7 +206,7 @@ fn host_state_pipeline_e2e_capture_write_load_compare(ctx: &Ctx) -> Result<Asser
     // A non-zero delta on AT LEAST ONE metric proves real
     // counter growth survived the full pipeline. The OR across
     // scheduling-activity fields follows the same robustness
-    // pattern as the sibling `host_state_capture_returns_threads_with_nonzero_counters`
+    // pattern as the sibling `ctprof_capture_returns_threads_with_nonzero_counters`
     // test: `CONFIG_SCHEDSTATS` may be runtime-off (every
     // schedstat row is zero), so page-fault counters are the
     // fallback signal that does not depend on sysctl state.
@@ -268,7 +268,7 @@ const T3_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// the full capture → write → load → compare pipeline against a
 /// jemalloc-linked target.
 ///
-/// The sibling `host_state_pipeline_e2e_capture_write_load_compare`
+/// The sibling `ctprof_pipeline_e2e_capture_write_load_compare`
 /// test above proves the SCHEDSTAT / page-fault metric family
 /// survives the pipeline. T3 is the jemalloc-counter complement:
 /// drive two alloc-worker invocations between captures so the
@@ -295,11 +295,11 @@ const T3_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// to 10s so each alloc-worker invocation has slack to allocate +
 /// signal ready before the next capture fires.
 #[ktstr_test(llcs = 1, cores = 2, threads = 1, duration_s = 10)]
-fn host_state_pipeline_e2e_allocated_bytes_delta_survives_round_trip(
+fn ctprof_pipeline_e2e_allocated_bytes_delta_survives_round_trip(
     ctx: &Ctx,
 ) -> Result<AssertResult> {
-    let baseline_path = std::path::PathBuf::from("/tmp/baseline_alloc.hst.zst");
-    let candidate_path = std::path::PathBuf::from("/tmp/candidate_alloc.hst.zst");
+    let baseline_path = std::path::PathBuf::from("/tmp/baseline_alloc.ctprof.zst");
+    let candidate_path = std::path::PathBuf::from("/tmp/candidate_alloc.ctprof.zst");
 
     // First alloc-worker invocation — runs before the baseline
     // capture so the baseline DOES include its tgid (the worker
@@ -324,7 +324,7 @@ fn host_state_pipeline_e2e_allocated_bytes_delta_survives_round_trip(
 
     // Capture #1: the alloc-worker is alive with KNOWN_BYTES
     // planted. Its allocated_bytes carries the planted value.
-    let baseline_snap = host_state::capture();
+    let baseline_snap = ctprof::capture();
     baseline_snap.write(&baseline_path)?;
     let _ = worker1.kill();
 
@@ -347,14 +347,14 @@ fn host_state_pipeline_e2e_allocated_bytes_delta_survives_round_trip(
         "see jemalloc_alloc_worker exit-code legend",
     )?;
 
-    let candidate_snap = host_state::capture();
+    let candidate_snap = ctprof::capture();
     candidate_snap.write(&candidate_path)?;
     let _ = worker2.kill();
 
     // Round-trip both captures through the disk + zstd + serde
     // pipeline.
-    let loaded_baseline = HostStateSnapshot::load(&baseline_path)?;
-    let loaded_candidate = HostStateSnapshot::load(&candidate_path)?;
+    let loaded_baseline = CtprofSnapshot::load(&baseline_path)?;
+    let loaded_candidate = CtprofSnapshot::load(&candidate_path)?;
 
     // Sanity: both loads carry the alloc-worker's tgid (one
     // per snapshot — different pids, but they share pcomm
@@ -493,11 +493,11 @@ fn host_state_pipeline_e2e_allocated_bytes_delta_survives_round_trip(
     }
     let any_loaded = alloc_worker_rows.iter().any(|r| {
         let baseline_sum = match r.baseline {
-            ktstr::host_state_compare::Aggregated::Sum(n) => n,
+            ktstr::ctprof_compare::Aggregated::Sum(n) => n,
             _ => 0,
         };
         let candidate_sum = match r.candidate {
-            ktstr::host_state_compare::Aggregated::Sum(n) => n,
+            ktstr::ctprof_compare::Aggregated::Sum(n) => n,
             _ => 0,
         };
         baseline_sum >= T3_KNOWN_BYTES && candidate_sum >= T3_KNOWN_BYTES
@@ -507,11 +507,11 @@ fn host_state_pipeline_e2e_allocated_bytes_delta_survives_round_trip(
             .iter()
             .map(|r| {
                 let b = match r.baseline {
-                    ktstr::host_state_compare::Aggregated::Sum(n) => n,
+                    ktstr::ctprof_compare::Aggregated::Sum(n) => n,
                     _ => 0,
                 };
                 let c = match r.candidate {
-                    ktstr::host_state_compare::Aggregated::Sum(n) => n,
+                    ktstr::ctprof_compare::Aggregated::Sum(n) => n,
                     _ => 0,
                 };
                 (r.group_key.clone(), b, c, r.delta)
@@ -530,11 +530,11 @@ fn host_state_pipeline_e2e_allocated_bytes_delta_survives_round_trip(
         .iter()
         .map(|r| {
             let b = match r.baseline {
-                ktstr::host_state_compare::Aggregated::Sum(n) => n,
+                ktstr::ctprof_compare::Aggregated::Sum(n) => n,
                 _ => 0,
             };
             let c = match r.candidate {
-                ktstr::host_state_compare::Aggregated::Sum(n) => n,
+                ktstr::ctprof_compare::Aggregated::Sum(n) => n,
                 _ => 0,
             };
             (r.group_key.clone(), b, c, r.delta)
@@ -543,7 +543,7 @@ fn host_state_pipeline_e2e_allocated_bytes_delta_survives_round_trip(
     result.details.push(AssertDetail::new(
         DetailKind::Other,
         format!(
-            "host_state_pipeline_e2e_allocated_bytes_delta: \
+            "ctprof_pipeline_e2e_allocated_bytes_delta: \
              baseline_alloc={baseline_alloc}, candidate_alloc={candidate_alloc}, \
              alloc_worker_rows={summary:?}",
         ),
@@ -572,7 +572,7 @@ fn host_state_pipeline_e2e_allocated_bytes_delta_survives_round_trip(
 /// e2e tests.
 #[test]
 fn compare_options_default_groups_by_pcomm() {
-    use ktstr::host_state_compare::GroupBy;
+    use ktstr::ctprof_compare::GroupBy;
     assert_eq!(
         CompareOptions::default().group_by.0,
         GroupBy::Pcomm,

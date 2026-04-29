@@ -5,7 +5,7 @@
 //! meaning is "the most common cpuset" — useless when the
 //! operator wants to see the affinity distribution across a
 //! group. The bespoke `AffinitySummary` reduction in
-//! `host_state_compare` is the right path. Pin the type-system
+//! `ctprof_compare` is the right path. Pin the type-system
 //! rejection: a generic site bound on `T: Modeable` must
 //! refuse `CpuSet`.
 

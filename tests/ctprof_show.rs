@@ -1,22 +1,22 @@
-//! Integration tests for the `ktstr host-state show` CLI
+//! Integration tests for the `ktstr ctprof show` CLI
 //! subcommand. Drives the binary entry point end-to-end:
 //! write a synthetic snapshot to disk, invoke
-//! `ktstr host-state show <path> [--group-by ...]` via
+//! `ktstr ctprof show <path> [--group-by ...]` via
 //! `assert_cmd`, and assert the rendered stdout carries the
 //! expected columns / scaled values.
 //!
 //! The unit-level `write_show_*` tests in `src/bin/ktstr.rs`
 //! exercise the renderer in isolation against an in-memory
-//! `HostStateSnapshot`. This file covers the missing
+//! `CtprofSnapshot`. This file covers the missing
 //! disk-roundtrip + binary-spawn boundary: clap parses the argv,
 //! `run_show` loads the snapshot from disk, the renderer emits
 //! the table to stdout. A regression in any layer (clap shape,
 //! load path, render path) surfaces here without requiring a
 //! VM-backed capture.
 
-// Shared host-state test helpers (`make_thread`, `snapshot`,
+// Shared ctprof test helpers (`make_thread`, `snapshot`,
 // `cgroup_stats_entry`) live under `tests/common/` so this
-// file and `tests/host_state_compare.rs` share a single
+// file and `tests/ctprof_compare.rs` share a single
 // definition. The `mod common;` declaration pulls the
 // subdirectory in as a non-test module.
 mod common;
@@ -25,21 +25,21 @@ use std::collections::BTreeMap;
 
 use assert_cmd::Command;
 
-use common::host_state::{cgroup_stats_entry, make_thread, snapshot};
+use common::ctprof::{cgroup_stats_entry, make_thread, snapshot};
 use ktstr::metric_types::{MonotonicCount, MonotonicNs};
 
 fn ktstr() -> Command {
     Command::cargo_bin("ktstr").unwrap()
 }
 
-/// `ktstr host-state show <path>` with default flags renders
+/// `ktstr ctprof show <path>` with default flags renders
 /// the standard `pcomm | threads | metric | value` columns and
 /// surfaces the populated group key. Pins the binary entry
 /// point's happy path through clap → run_show → write_show.
 #[test]
 fn show_default_renders_pcomm_grouping_columns() {
     let tmp = tempfile::tempdir().unwrap();
-    let snap_path = tmp.path().join("snap.hst.zst");
+    let snap_path = tmp.path().join("snap.ctprof.zst");
 
     let mut t = make_thread("integration_proc", "worker");
     t.run_time_ns = MonotonicNs(5_000_000);
@@ -50,7 +50,7 @@ fn show_default_renders_pcomm_grouping_columns() {
 
     let assert = ktstr()
         .args([
-            "host-state",
+            "ctprof",
             "show",
             snap_path.to_str().expect("ascii temp path"),
         ])
@@ -76,7 +76,7 @@ fn show_default_renders_pcomm_grouping_columns() {
     );
 }
 
-/// `ktstr host-state show <path> --group-by cgroup` renders the
+/// `ktstr ctprof show <path> --group-by cgroup` renders the
 /// secondary cgroup-stats enrichment table with auto-scaled
 /// single-value cells (no `→` arrow, no `(+0)` zero-delta tail
 /// — distinguishing show from compare). Pins both the show
@@ -86,7 +86,7 @@ fn show_default_renders_pcomm_grouping_columns() {
 #[test]
 fn show_cgroup_grouping_renders_scaled_cgroup_stats() {
     let tmp = tempfile::tempdir().unwrap();
-    let snap_path = tmp.path().join("snap.hst.zst");
+    let snap_path = tmp.path().join("snap.ctprof.zst");
 
     // Single thread under `/app` so the primary table has a
     // bucket; cgroup_stats populates the secondary table.
@@ -106,7 +106,7 @@ fn show_cgroup_grouping_renders_scaled_cgroup_stats() {
 
     let assert = ktstr()
         .args([
-            "host-state",
+            "ctprof",
             "show",
             snap_path.to_str().expect("ascii temp path"),
             "--group-by",
@@ -149,7 +149,7 @@ fn show_cgroup_grouping_renders_scaled_cgroup_stats() {
     );
 }
 
-/// `ktstr host-state show <path> --sort-by run_time_ns` ranks
+/// `ktstr ctprof show <path> --sort-by run_time_ns` ranks
 /// groups by absolute aggregated value, descending. With three
 /// pcomm buckets carrying different run_time_ns values, the
 /// largest-value bucket appears first in stdout — distinct from
@@ -158,7 +158,7 @@ fn show_cgroup_grouping_renders_scaled_cgroup_stats() {
 #[test]
 fn show_sort_by_orders_groups_by_metric_descending() {
     let tmp = tempfile::tempdir().unwrap();
-    let snap_path = tmp.path().join("snap.hst.zst");
+    let snap_path = tmp.path().join("snap.ctprof.zst");
 
     let mut t_alpha = make_thread("alpha", "alpha-w");
     t_alpha.run_time_ns = MonotonicNs(100);
@@ -172,7 +172,7 @@ fn show_sort_by_orders_groups_by_metric_descending() {
 
     let assert = ktstr()
         .args([
-            "host-state",
+            "ctprof",
             "show",
             snap_path.to_str().expect("ascii temp path"),
             "--sort-by",
@@ -200,7 +200,7 @@ fn show_sort_by_orders_groups_by_metric_descending() {
     );
 }
 
-/// `ktstr host-state show <path> --sort-by <bad>` exits non-zero
+/// `ktstr ctprof show <path> --sort-by <bad>` exits non-zero
 /// with a diagnostic naming the bad metric. Pins that
 /// `parse_sort_by`'s rejection bubbles all the way out through
 /// the binary's exit code — operator typos surface, not silent
@@ -208,14 +208,14 @@ fn show_sort_by_orders_groups_by_metric_descending() {
 #[test]
 fn show_invalid_sort_by_returns_error() {
     let tmp = tempfile::tempdir().unwrap();
-    let snap_path = tmp.path().join("snap.hst.zst");
+    let snap_path = tmp.path().join("snap.ctprof.zst");
     snapshot(vec![make_thread("p", "w")], BTreeMap::new())
         .write(&snap_path)
         .unwrap();
 
     let assert = ktstr()
         .args([
-            "host-state",
+            "ctprof",
             "show",
             snap_path.to_str().expect("ascii temp path"),
             "--sort-by",
@@ -239,7 +239,7 @@ fn show_invalid_sort_by_returns_error() {
 #[test]
 fn show_sections_primary_suppresses_derived_subtable() {
     let tmp = tempfile::tempdir().unwrap();
-    let snap_path = tmp.path().join("snap.hst.zst");
+    let snap_path = tmp.path().join("snap.ctprof.zst");
 
     let mut t = make_thread("integration_proc", "worker");
     t.run_time_ns = MonotonicNs(5_000_000);
@@ -252,7 +252,7 @@ fn show_sections_primary_suppresses_derived_subtable() {
     // Default rendering carries `## Derived metrics`.
     let default_assert = ktstr()
         .args([
-            "host-state",
+            "ctprof",
             "show",
             snap_path.to_str().expect("ascii temp path"),
         ])
@@ -269,7 +269,7 @@ fn show_sections_primary_suppresses_derived_subtable() {
     // sub-table.
     let filtered_assert = ktstr()
         .args([
-            "host-state",
+            "ctprof",
             "show",
             snap_path.to_str().expect("ascii temp path"),
             "--sections",
@@ -301,7 +301,7 @@ fn show_sections_primary_suppresses_derived_subtable() {
 #[test]
 fn show_sections_derived_suppresses_primary_subtable() {
     let tmp = tempfile::tempdir().unwrap();
-    let snap_path = tmp.path().join("snap.hst.zst");
+    let snap_path = tmp.path().join("snap.ctprof.zst");
 
     let mut t = make_thread("integration_proc", "worker");
     t.run_time_ns = MonotonicNs(5_000_000);
@@ -314,7 +314,7 @@ fn show_sections_derived_suppresses_primary_subtable() {
 
     let assert = ktstr()
         .args([
-            "host-state",
+            "ctprof",
             "show",
             snap_path.to_str().expect("ascii temp path"),
             "--sections",
@@ -363,14 +363,14 @@ fn show_sections_derived_suppresses_primary_subtable() {
 #[test]
 fn show_invalid_sections_returns_error() {
     let tmp = tempfile::tempdir().unwrap();
-    let snap_path = tmp.path().join("snap.hst.zst");
+    let snap_path = tmp.path().join("snap.ctprof.zst");
     snapshot(vec![make_thread("p", "w")], BTreeMap::new())
         .write(&snap_path)
         .unwrap();
 
     let assert = ktstr()
         .args([
-            "host-state",
+            "ctprof",
             "show",
             snap_path.to_str().expect("ascii temp path"),
             "--sections",
@@ -398,7 +398,7 @@ fn show_invalid_sections_returns_error() {
 #[test]
 fn show_wrap_does_not_change_byte_output_when_not_tty() {
     let tmp = tempfile::tempdir().unwrap();
-    let snap_path = tmp.path().join("snap.hst.zst");
+    let snap_path = tmp.path().join("snap.ctprof.zst");
 
     let mut t = make_thread("integration_proc", "worker");
     t.run_time_ns = MonotonicNs(5_000_000);
@@ -408,7 +408,7 @@ fn show_wrap_does_not_change_byte_output_when_not_tty() {
 
     let no_wrap_out = ktstr()
         .args([
-            "host-state",
+            "ctprof",
             "show",
             snap_path.to_str().expect("ascii temp path"),
         ])
@@ -416,7 +416,7 @@ fn show_wrap_does_not_change_byte_output_when_not_tty() {
         .expect("show without --wrap must execute");
     let with_wrap_out = ktstr()
         .args([
-            "host-state",
+            "ctprof",
             "show",
             snap_path.to_str().expect("ascii temp path"),
             "--wrap",
@@ -454,14 +454,14 @@ fn show_wrap_does_not_change_byte_output_when_not_tty() {
 #[test]
 fn show_sections_cgroup_stats_under_pcomm_warns() {
     let tmp = tempfile::tempdir().unwrap();
-    let snap_path = tmp.path().join("snap.hst.zst");
+    let snap_path = tmp.path().join("snap.ctprof.zst");
     snapshot(vec![make_thread("p", "w")], BTreeMap::new())
         .write(&snap_path)
         .unwrap();
 
     let assert = ktstr()
         .args([
-            "host-state",
+            "ctprof",
             "show",
             snap_path.to_str().expect("ascii temp path"),
             "--sections",
@@ -492,7 +492,7 @@ fn show_sections_cgroup_stats_under_pcomm_warns() {
 #[test]
 fn show_metrics_filter_keeps_named_row() {
     let tmp = tempfile::tempdir().unwrap();
-    let snap_path = tmp.path().join("snap.hst.zst");
+    let snap_path = tmp.path().join("snap.ctprof.zst");
 
     let mut t = make_thread("integration_proc", "worker");
     t.run_time_ns = MonotonicNs(5_000_000);
@@ -507,7 +507,7 @@ fn show_metrics_filter_keeps_named_row() {
     // — including the named one and several others.
     let default_assert = ktstr()
         .args([
-            "host-state",
+            "ctprof",
             "show",
             snap_path.to_str().expect("ascii temp path"),
         ])
@@ -532,7 +532,7 @@ fn show_metrics_filter_keeps_named_row() {
     // every other primary row.
     let filtered_assert = ktstr()
         .args([
-            "host-state",
+            "ctprof",
             "show",
             snap_path.to_str().expect("ascii temp path"),
             "--metrics",
@@ -569,14 +569,14 @@ fn show_metrics_filter_keeps_named_row() {
 #[test]
 fn show_invalid_metrics_returns_error() {
     let tmp = tempfile::tempdir().unwrap();
-    let snap_path = tmp.path().join("snap.hst.zst");
+    let snap_path = tmp.path().join("snap.ctprof.zst");
     snapshot(vec![make_thread("p", "w")], BTreeMap::new())
         .write(&snap_path)
         .unwrap();
 
     let assert = ktstr()
         .args([
-            "host-state",
+            "ctprof",
             "show",
             snap_path.to_str().expect("ascii temp path"),
             "--metrics",

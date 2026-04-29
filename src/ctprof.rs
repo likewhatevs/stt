@@ -1,8 +1,8 @@
-//! Per-thread host-state profiler data model + capture layer.
+//! Per-thread ctprof (cgroup/thread profiler) data model + capture layer.
 //!
-//! [`HostStateSnapshot`] is the serialized container for a single
+//! [`CtprofSnapshot`] is the serialized container for a single
 //! host-wide per-thread profile. Capture produces one via the
-//! `ktstr host-state capture -o snapshot.hst.zst` subcommand;
+//! `ktstr ctprof capture -o snapshot.ctprof.zst` subcommand;
 //! comparison reads two and joins them on the selected grouping
 //! axis (pcomm, cgroup, or comm).
 //!
@@ -143,15 +143,15 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-/// Top-level serialized artifact produced by `ktstr host-state`.
+/// Top-level serialized artifact produced by `ktstr ctprof`.
 ///
 /// The file layout on disk is zstd-compressed JSON of this struct.
-/// Extension `.hst.zst` is conventional; nothing in the loader
+/// Extension `.ctprof.zst` is conventional; nothing in the loader
 /// depends on the extension beyond being passed a path that
 /// resolves to a readable file.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
-pub struct HostStateSnapshot {
+pub struct CtprofSnapshot {
     /// Wall-clock time at capture, nanoseconds since the Unix
     /// epoch. Useful as a tie-breaker when comparing two snapshots
     /// that originate from the same host — the newer one is
@@ -185,16 +185,16 @@ pub struct HostStateSnapshot {
     /// without the per-tgid jemalloc probe walk (synthetic-tree
     /// tests pass `use_syscall_affinity=false` to skip it).
     /// `Some(_)` carries the per-snapshot tally — see
-    /// [`HostStateProbeSummary`] for the curated field set.
-    pub probe_summary: Option<HostStateProbeSummary>,
+    /// [`CtprofProbeSummary`] for the curated field set.
+    pub probe_summary: Option<CtprofProbeSummary>,
 
     /// Procfs-read failure statistics for the snapshot, when the
     /// capture pass ran in production mode. Mirrors the
     /// `probe_summary` discipline: `None` indicates synthetic-tree
     /// tests skipped it (`use_syscall_affinity=false`); `Some(_)`
     /// carries the per-snapshot read-level failure tally — see
-    /// [`HostStateParseSummary`].
-    pub parse_summary: Option<HostStateParseSummary>,
+    /// [`CtprofParseSummary`].
+    pub parse_summary: Option<CtprofParseSummary>,
 
     /// Host-level Pressure Stall Information, populated from
     /// `<proc_root>/pressure/{cpu,memory,io,irq}`. Captures
@@ -229,7 +229,7 @@ pub struct HostStateSnapshot {
 /// `dominant_failure` carries the operator-facing tag string
 /// (e.g. `"ptrace-seize"`, `"dwarf-parse-failure"`) that the
 /// capture pipeline already surfaces in its tracing summary; the
-/// stable token format is documented in the `ktstr host-state
+/// stable token format is documented in the `ktstr ctprof
 /// capture` CLI help. `privilege_dominant` mirrors the same gate
 /// that prints the EPERM remediation hint — true when ≥ 50% of
 /// `failed` is `ptrace-seize` or `ptrace-interrupt`.
@@ -244,7 +244,7 @@ pub struct HostStateSnapshot {
 /// # Examples
 ///
 /// ```no_run
-/// let snap = ktstr::host_state::capture();
+/// let snap = ktstr::ctprof::capture();
 /// if let Some(ps) = &snap.probe_summary {
 ///     if let Some(hint) = ps.remediation_hint() {
 ///         eprintln!("{hint}");
@@ -256,7 +256,7 @@ pub struct HostStateSnapshot {
 /// ```
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
-pub struct HostStateProbeSummary {
+pub struct CtprofProbeSummary {
     /// Total tgids the probe pass walked. Equals the number of
     /// `/proc/<pid>` directories the capture saw, minus the
     /// calling process's own tgid (which is skipped because
@@ -274,7 +274,7 @@ pub struct HostStateProbeSummary {
     /// below the upper bound.
     pub probed_ok: u64,
     /// Attach-or-probe failures whose tag is classified
-    /// ACTIONABLE — see the `ktstr host-state capture` CLI help
+    /// ACTIONABLE — see the `ktstr ctprof capture` CLI help
     /// for the full filter rule and tag taxonomy. Routine
     /// non-actionable outcomes (target not jemalloc-linked,
     /// `readlink` race-with-exit) do NOT contribute to this
@@ -284,7 +284,7 @@ pub struct HostStateProbeSummary {
     /// all attach-and-probe failures. `None` when `failed == 0`.
     /// Stable single-word identifiers — the wire contract that
     /// downstream consumers match against. The full taxonomy is
-    /// documented in the `ktstr host-state capture` CLI help.
+    /// documented in the `ktstr ctprof capture` CLI help.
     /// Examples: `"ptrace-seize"`, `"dwarf-parse-failure"`,
     /// `"jemalloc-in-dso"`.
     pub dominant_failure: Option<String>,
@@ -316,7 +316,7 @@ pub struct HostStateProbeSummary {
     pub privilege_dominant: bool,
 }
 
-impl HostStateProbeSummary {
+impl CtprofProbeSummary {
     /// Operator-facing remediation hint when ptrace failures
     /// dominate the snapshot. Returns `Some(&'static str)` —
     /// the same `PTRACE_EPERM_HINT` constant the capture
@@ -389,7 +389,7 @@ impl HostStateProbeSummary {
 /// # Examples
 ///
 /// ```no_run
-/// let snap = ktstr::host_state::capture();
+/// let snap = ktstr::ctprof::capture();
 /// if let Some(ps) = &snap.parse_summary
 ///     && let Some(hint) = ps.kernel_config_hint()
 /// {
@@ -398,7 +398,7 @@ impl HostStateProbeSummary {
 /// ```
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
-pub struct HostStateParseSummary {
+pub struct CtprofParseSummary {
     /// Total tids the capture pass attempted to read across every
     /// tgid. Non-zero whenever the capture walked any tid; the
     /// denominator a downstream consumer uses to compute "what
@@ -464,7 +464,7 @@ pub struct HostStateParseSummary {
     ///
     /// Ghost-filter discipline: per-tid bumps are held pending
     /// (alongside the read-failure bumps in
-    /// [`crate::host_state`]'s capture-side `ParseTally`), and
+    /// [`crate::ctprof`]'s capture-side `ParseTally`), and
     /// unwound via `discard_pending` when the surrounding tid is
     /// rejected by the empty-comm + zero-start ghost filter so a
     /// busy host with mid-capture exits doesn't inflate this
@@ -473,7 +473,7 @@ pub struct HostStateParseSummary {
     pub negative_dotted_values: u64,
 }
 
-impl HostStateParseSummary {
+impl CtprofParseSummary {
     /// Operator-facing hint when kernel-config-gated file failures
     /// dominate the snapshot. Returns `Some(&'static str)` naming
     /// the two `CONFIG_*` knobs that gate the affected files
@@ -481,7 +481,7 @@ impl HostStateParseSummary {
     /// for `io`), or `None` when [`Self::kernel_config_dominant`]
     /// is `false`. Lets a downstream consumer surface a remediation
     /// pointer without parsing the log line or hand-rolling the
-    /// gate, mirroring the [`HostStateProbeSummary::remediation_hint`]
+    /// gate, mirroring the [`CtprofProbeSummary::remediation_hint`]
     /// pattern.
     pub fn kernel_config_hint(&self) -> Option<&'static str> {
         if self.kernel_config_dominant {
@@ -510,11 +510,11 @@ const PARSE_KCONFIG_HINT: &str = "hint: schedstat / io read failures dominate �
 /// strictly AFTER every entry in `fs/proc/array.c::task_state_array`
 /// — `R` (82), `S` (83), `D` (68), `T` (84), `t` (116), `X`
 /// (88), `Z` (90), `P` (80), `I` (73) all have lower codepoints.
-/// [`crate::host_state_compare::aggregate`] breaks the
+/// [`crate::ctprof_compare::aggregate`] breaks the
 /// categorical-mode count-ties (rules
-/// [`crate::host_state_compare::AggRule::Mode`] /
-/// [`crate::host_state_compare::AggRule::ModeChar`] /
-/// [`crate::host_state_compare::AggRule::ModeBool`]) toward the
+/// [`crate::ctprof_compare::AggRule::Mode`] /
+/// [`crate::ctprof_compare::AggRule::ModeChar`] /
+/// [`crate::ctprof_compare::AggRule::ModeBool`]) toward the
 /// LEX-SMALLEST candidate (the closure
 /// `a.1.cmp(&b.1).then(b.0.cmp(&a.0))` inside the
 /// `Modeable::mode_across` reduction), so a sentinel smaller
@@ -581,14 +581,14 @@ fn default_state_char() -> char {
 /// "category-mismatched aggregation is a compile error"
 /// invariant load-bearing.
 ///
-/// [`AggRule`]: crate::host_state_compare::AggRule
+/// [`AggRule`]: crate::ctprof_compare::AggRule
 ///
 /// `Default` is implemented manually rather than derived because
 /// the [`Self::state`] field needs `'~'` (the absent-value
 /// sentinel) instead of `'\0'` (the `char` Default). See the
 /// field doc on [`Self::state`] for why: `'\0'` lex-compares
 /// SMALLER than every real kernel state letter, which would
-/// poison [`crate::host_state_compare::AggRule::ModeChar`]
+/// poison [`crate::ctprof_compare::AggRule::ModeChar`]
 /// tie-breaks toward "absent" whenever a default-constructed
 /// thread sat alongside a real one in a group.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -684,7 +684,7 @@ pub struct ThreadState {
     /// Allowed CPU set from `sched_getaffinity`. Sorted ascending.
     /// Comparison aggregates via union across the group and
     /// renders as "N cpus (range)" or "mixed" for heterogeneous
-    /// sets — see [`crate::host_state_compare::AffinitySummary`].
+    /// sets — see [`crate::ctprof_compare::AffinitySummary`].
     /// Wrapped in [`crate::metric_types::CpuSet`] so the
     /// aggregation pipeline routes through the dedicated
     /// affinity-summary reduction rather than a numeric path.
@@ -727,7 +727,7 @@ pub struct ThreadState {
     /// `'~'` (U+007E = 126) is chosen so it sorts AFTER every
     /// real kernel state letter — `R` (82), `S` (83), `D` (68),
     /// `T` (84), `t` (116), `X` (88), `Z` (90), `P` (80), `I`
-    /// (73). [`crate::host_state_compare::AggRule::ModeChar`]
+    /// (73). [`crate::ctprof_compare::AggRule::ModeChar`]
     /// breaks count-ties toward the LEX-SMALLEST candidate, so
     /// a sentinel smaller than the real letters would silently
     /// elect "absent" whenever a default-built thread sat
@@ -753,7 +753,7 @@ pub struct ThreadState {
     /// Stays a bare `bool` — not wrapped in a categorical newtype
     /// — because it is the only bool-valued metric in the
     /// registry. The
-    /// [`crate::host_state_compare::AggRule::ModeBool`] dispatch
+    /// [`crate::ctprof_compare::AggRule::ModeBool`] dispatch
     /// coerces it to a `String` via `to_string()`/`Display` at
     /// the call site (see the
     /// [`crate::metric_types::CategoricalString`] doc note: if a
@@ -1011,13 +1011,13 @@ pub struct ThreadState {
     /// (PTRACE_SEIZE rejects self-attach). All four collapse to
     /// zero per the best-effort "absent = 0" capture contract.
     /// Snapshot-level diagnosis lives on
-    /// [`HostStateProbeSummary::dominant_failure`] (the per-tag
+    /// [`CtprofProbeSummary::dominant_failure`] (the per-tag
     /// plurality) and
-    /// [`HostStateProbeSummary::privilege_dominant`] (the EPERM
+    /// [`CtprofProbeSummary::privilege_dominant`] (the EPERM
     /// remediation gate, true when ptrace tags account for ≥ 50%
     /// of `failed`), reachable via
-    /// [`HostStateSnapshot::probe_summary`]; the per-tag taxonomy
-    /// is documented in the `ktstr host-state capture` CLI help.
+    /// [`CtprofSnapshot::probe_summary`]; the per-tag taxonomy
+    /// is documented in the `ktstr ctprof capture` CLI help.
     pub allocated_bytes: crate::metric_types::Bytes,
     /// Bytes freed by this thread over its lifetime — read from
     /// jemalloc's per-thread TSD u64 counter
@@ -1189,7 +1189,7 @@ pub struct ThreadState {
     /// Total threads in this task's tgid (process-wide thread
     /// count, the `signal_struct->nr_threads` snapshot). Field
     /// name mirrors the kernel struct member to avoid collision
-    /// with [`HostStateSnapshot::threads`] (the snapshot's own
+    /// with [`CtprofSnapshot::threads`] (the snapshot's own
     /// `Vec<ThreadState>`). `/proc/<pid>/status` `Threads:` line
     /// emitted at `fs/proc/array.c:290` via
     /// `seq_put_decimal_ull(m, "Threads:\t", num_threads)`.
@@ -1198,7 +1198,7 @@ pub struct ThreadState {
     /// Capture-side dedup: the field is populated ONLY on the
     /// thread leader (tid == tgid) and zero for non-leader
     /// threads of the same process. The registry pairs this with
-    /// [`crate::host_state_compare::AggRule::MaxGaugeCount`] (not
+    /// [`crate::ctprof_compare::AggRule::MaxGaugeCount`] (not
     /// Sum) so the rendered cell surfaces "the largest process
     /// represented in this bucket" regardless of grouping axis.
     /// Sum would be wrong under `--group-by comm` and
@@ -1674,7 +1674,7 @@ impl ThreadState {
     }
 }
 
-/// Per-cgroup enrichment record attached to [`HostStateSnapshot`].
+/// Per-cgroup enrichment record attached to [`CtprofSnapshot`].
 ///
 /// Populated from the cgroup v2 filesystem at capture time. The
 /// shape mirrors the kernel's per-controller file layout:
@@ -1690,7 +1690,7 @@ impl ThreadState {
 /// mirrors the kernel's controller-by-controller exposure: a
 /// reader who knows the kernel layout can map directly between
 /// cgroupfs files and Rust fields, and the merge policy in
-/// [`crate::host_state_compare::flatten_cgroup_stats`] applies
+/// [`crate::ctprof_compare::flatten_cgroup_stats`] applies
 /// per-domain (max for limits, min for floors, saturating_add
 /// for counters) without conflating across domains.
 ///
@@ -1909,7 +1909,7 @@ pub struct PsiResource {
 
 /// Bundle of [`PsiResource`] for the four kernel-exposed
 /// resources. Same shape used at both system level
-/// ([`HostStateSnapshot::psi`]) and per-cgroup
+/// ([`CtprofSnapshot::psi`]) and per-cgroup
 /// ([`CgroupStats::psi`]) — the data source differs but the
 /// kernel emits the same format and field set in both places.
 #[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
@@ -2167,7 +2167,7 @@ fn read_psi_file_at(path: &Path) -> PsiResource {
         .unwrap_or_default()
 }
 
-impl HostStateSnapshot {
+impl CtprofSnapshot {
     /// Load a snapshot from a zstd-compressed JSON file.
     ///
     /// Errors propagate via [`anyhow`] with the source path in the
@@ -2187,12 +2187,12 @@ impl HostStateSnapshot {
     pub fn load(path: &std::path::Path) -> anyhow::Result<Self> {
         use anyhow::Context;
         let bytes = std::fs::read(path)
-            .with_context(|| format!("read host-state snapshot from {}", path.display()))?;
+            .with_context(|| format!("read ctprof snapshot from {}", path.display()))?;
         let json = decompress_capped(&bytes, MAX_DECOMPRESSED_SNAPSHOT_BYTES)
-            .with_context(|| format!("zstd decompress host-state snapshot {}", path.display()))?;
-        let snap: HostStateSnapshot = serde_json::from_slice(&json).with_context(|| {
+            .with_context(|| format!("zstd decompress ctprof snapshot {}", path.display()))?;
+        let snap: CtprofSnapshot = serde_json::from_slice(&json).with_context(|| {
             format!(
-                "parse host-state snapshot JSON from {} (did the capture format change?)",
+                "parse ctprof snapshot JSON from {} (did the capture format change?)",
                 path.display(),
             )
         })?;
@@ -2205,16 +2205,16 @@ impl HostStateSnapshot {
     /// both compare-side tests and the capture binary share one
     /// on-disk shape. Compression level `3` mirrors the ktstr
     /// remote-cache convention — adequate ratio at fast speed —
-    /// and is not tunable because host-state captures are small
+    /// and is not tunable because ctprof captures are small
     /// enough that further compression produces diminishing
     /// returns on I/O.
     pub fn write(&self, path: &std::path::Path) -> anyhow::Result<()> {
         use anyhow::Context;
-        let json = serde_json::to_vec(self).context("serialize host-state snapshot to JSON")?;
+        let json = serde_json::to_vec(self).context("serialize ctprof snapshot to JSON")?;
         let compressed =
-            zstd::encode_all(json.as_slice(), 3).context("zstd compress host-state snapshot")?;
+            zstd::encode_all(json.as_slice(), 3).context("zstd compress ctprof snapshot")?;
         std::fs::write(path, compressed)
-            .with_context(|| format!("write host-state snapshot to {}", path.display()))?;
+            .with_context(|| format!("write ctprof snapshot to {}", path.display()))?;
         Ok(())
     }
 }
@@ -2250,7 +2250,7 @@ fn decompress_capped(bytes: &[u8], max_decompressed: u64) -> anyhow::Result<Vec<
 /// Canonical file extension for a serialized snapshot.
 pub const SNAPSHOT_EXTENSION: &str = "hst.zst";
 
-/// Decompressed-size ceiling for [`HostStateSnapshot::load`].
+/// Decompressed-size ceiling for [`CtprofSnapshot::load`].
 /// Bounds the allocation a malicious or corrupted zstd payload
 /// can force, since zstd compresses pathologically well on
 /// repeated bytes (a few-KiB compressed blob can decompress to
@@ -2448,7 +2448,7 @@ fn parse_stat(raw: &str) -> StatFields {
 
 /// Read `<proc_root>/<tgid>/task/<tid>/stat` and parse fields.
 /// Records a `"stat"` failure into `tally` on read error so the
-/// per-snapshot [`HostStateParseSummary`] surfaces the dominant
+/// per-snapshot [`CtprofParseSummary`] surfaces the dominant
 /// procfs read-failure category. `tally: &mut None` skips the
 /// recording (the synthetic-tree test pattern).
 fn read_stat_at_with_tally(
@@ -2567,7 +2567,7 @@ struct StatusFields {
     /// `None` when the line is absent or blank — the capture site
     /// collapses to `'~'` (via `default_state_char`) which sorts
     /// strictly after every real kernel char in lex order, so
-    /// the [`crate::host_state_compare::AggRule::ModeChar`]
+    /// the [`crate::ctprof_compare::AggRule::ModeChar`]
     /// lex-smallest-wins tiebreak picks a real letter when one
     /// is present.
     state: Option<char>,
@@ -2754,7 +2754,7 @@ struct SchedFields {
 /// failure modes the caller may want to treat separately:
 /// [`Self::Negative`] (kernel emitted a value with a leading
 /// `-`, observable on clock-skew / suspend-resume hosts) is
-/// counted into [`HostStateParseSummary::negative_dotted_values`]
+/// counted into [`CtprofParseSummary::negative_dotted_values`]
 /// so an operator can see that the snapshot's schedstat values
 /// are routinely negative-and-zeroed; [`Self::Malformed`]
 /// (non-numeric, empty, overflow) is the every-other failure
@@ -2813,7 +2813,7 @@ enum ParseDottedNs {
 ///   negatives.
 ///
 /// The caller records the bump in the per-snapshot
-/// [`HostStateParseSummary::negative_dotted_values`] before
+/// [`CtprofParseSummary::negative_dotted_values`] before
 /// folding to zero. Returns [`Err(ParseDottedNs::Malformed)`]
 /// for any other parse failure (non-numeric, empty, overflow);
 /// the caller folds to zero silently per the best-effort capture
@@ -3342,7 +3342,7 @@ fn capture_thread_at(
 
 /// Per-tid procfs walk. Threads a `&mut ParseTally` through every
 /// per-file reader so per-tid read failures land in the
-/// per-snapshot [`HostStateParseSummary`] when the capture
+/// per-snapshot [`CtprofParseSummary`] when the capture
 /// pipeline runs in production mode (`use_syscall_affinity=true`).
 /// Synthetic-tree tests typically pass `&mut None` for the tally,
 /// matching the pre-tally shape.
@@ -3601,8 +3601,8 @@ impl ProbeSummary {
     /// [`Self::ptrace_dominates`] so a downstream consumer can
     /// reproduce the EPERM-hint trigger condition without
     /// parsing the operator-facing tracing line.
-    fn to_public(&self) -> HostStateProbeSummary {
-        HostStateProbeSummary {
+    fn to_public(&self) -> CtprofProbeSummary {
+        CtprofProbeSummary {
             tgids_walked: self.tgids_walked,
             jemalloc_detected: self.jemalloc_detected,
             probed_ok: self.probed_ok,
@@ -3616,7 +3616,7 @@ impl ProbeSummary {
 /// Internal tally of procfs read-level failures, threaded through
 /// [`capture_thread_at_with_tally`] and projected to the public
 /// surface via [`Self::to_public`]. Mirrors the [`ProbeSummary`] /
-/// [`HostStateProbeSummary`] split: tracks per-tid context plus a
+/// [`CtprofProbeSummary`] split: tracks per-tid context plus a
 /// per-file-kind failure map, then drops the implementation-detail
 /// shape (here the `&'static str` keys vs the public surface's
 /// `String` keys, which serde-derive cleanly).
@@ -3724,13 +3724,13 @@ impl ParseTally {
     }
 
     /// Project the internal tally to the curated public surface.
-    fn to_public(&self) -> HostStateParseSummary {
+    fn to_public(&self) -> CtprofParseSummary {
         let read_failures = self.total_failures();
         let mut by_file = BTreeMap::new();
         for (k, v) in &self.failures_by_file {
             by_file.insert((*k).to_string(), *v);
         }
-        HostStateParseSummary {
+        CtprofParseSummary {
             tids_walked: self.tids_walked,
             read_failures,
             read_failures_by_file: by_file,
@@ -3824,17 +3824,17 @@ fn record_attach_outcome(
     match result {
         Ok(probe) => {
             summary.jemalloc_detected += 1;
-            tracing::debug!(tgid, %pcomm, "host-state probe: jemalloc detected");
+            tracing::debug!(tgid, %pcomm, "ctprof probe: jemalloc detected");
             Some(probe)
         }
         Err(err) => {
             let tag = err.tag();
             *summary.attach_tag_counts.entry(tag).or_insert(0) += 1;
             if matches!(tag, "jemalloc-not-found" | "readlink-failure") {
-                tracing::debug!(tgid, %pcomm, tag, err = %err, "host-state probe: attach skipped");
+                tracing::debug!(tgid, %pcomm, tag, err = %err, "ctprof probe: attach skipped");
             } else {
                 summary.failed += 1;
-                tracing::warn!(tgid, %pcomm, tag, err = %err, "host-state probe: attach failed");
+                tracing::warn!(tgid, %pcomm, tag, err = %err, "ctprof probe: attach failed");
             }
             None
         }
@@ -3887,7 +3887,7 @@ fn probe_thread_recording(
                     %comm,
                     tag,
                     err = %err,
-                    "host-state probe: probe_thread failed",
+                    "ctprof probe: probe_thread failed",
                 );
             }
             (0, 0)
@@ -3923,7 +3923,7 @@ fn emit_parse_summary(tally: &ParseTally) {
         String::new()
     };
     tracing::info!(
-        "host-state parse: {tids_walked} tids walked, \
+        "ctprof parse: {tids_walked} tids walked, \
          {read_failures} read failures{negative_clause}\
          {dominant_clause}{kconfig_clause}",
     );
@@ -3941,7 +3941,7 @@ fn emit_probe_summary(summary: &ProbeSummary) {
         let dominant = summary.dominant_tag().unwrap_or("?");
         if summary.ptrace_dominates() {
             tracing::info!(
-                "host-state probe: {tgids_walked} tgids walked, \
+                "ctprof probe: {tgids_walked} tgids walked, \
                  {jemalloc_detected} jemalloc detected, \
                  {probed_ok} probed OK, {failed} failed \
                  (dominant: {dominant}; {})",
@@ -3949,7 +3949,7 @@ fn emit_probe_summary(summary: &ProbeSummary) {
             );
         } else {
             tracing::info!(
-                "host-state probe: {tgids_walked} tgids walked, \
+                "ctprof probe: {tgids_walked} tgids walked, \
                  {jemalloc_detected} jemalloc detected, \
                  {probed_ok} probed OK, {failed} failed \
                  (dominant: {dominant})",
@@ -3957,7 +3957,7 @@ fn emit_probe_summary(summary: &ProbeSummary) {
         }
     } else {
         tracing::info!(
-            "host-state probe: {tgids_walked} tgids walked, \
+            "ctprof probe: {tgids_walked} tgids walked, \
              {jemalloc_detected} jemalloc detected, \
              {probed_ok} probed OK, {failed} failed",
         );
@@ -3966,7 +3966,7 @@ fn emit_probe_summary(summary: &ProbeSummary) {
 
 /// Capture a complete host-wide snapshot under arbitrary procfs
 /// and cgroup roots. Walks `<proc_root>` for every live tgid,
-/// enumerates its threads, and assembles a [`HostStateSnapshot`]
+/// enumerates its threads, and assembles a [`CtprofSnapshot`]
 /// with per-cgroup enrichment populated once per distinct cgroup
 /// path (many threads share a cgroup; keep the walk
 /// O(cgroups) rather than O(threads)). The default-roots
@@ -3980,7 +3980,7 @@ fn emit_probe_summary(summary: &ProbeSummary) {
 /// every tgid's `/proc/<pid>/exe` for ELF + DWARF metadata; (c)
 /// `sched_getaffinity(2)` inside per-thread capture, with
 /// fall-back to `Cpus_allowed_list:` on syscall failure;
-/// (d) `emit_probe_summary` plus the [`HostStateProbeSummary`]
+/// (d) `emit_probe_summary` plus the [`CtprofProbeSummary`]
 /// surfaced on the snapshot, both of which are skipped when
 /// `use_syscall_affinity` is `false`: `emit_probe_summary` is
 /// not called and `probe_summary` is `None`. Synthetic-tree
@@ -4005,7 +4005,7 @@ fn capture_with(
     cgroup_root: &Path,
     sys_root: &Path,
     use_syscall_affinity: bool,
-) -> HostStateSnapshot {
+) -> CtprofSnapshot {
     let captured_at_unix_ns = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
@@ -4116,9 +4116,9 @@ fn capture_with(
                                 s.tgids_walked += 1;
                                 if cached_result.is_some() {
                                     s.jemalloc_detected += 1;
-                                    tracing::debug!(tgid, "host-state probe: cache hit (jemalloc)");
+                                    tracing::debug!(tgid, "ctprof probe: cache hit (jemalloc)");
                                 } else {
-                                    tracing::debug!(tgid, "host-state probe: cache hit (not jemalloc or prior failure)");
+                                    tracing::debug!(tgid, "ctprof probe: cache hit (not jemalloc or prior failure)");
                                 }
                                 cached_result
                             } else {
@@ -4204,7 +4204,7 @@ fn capture_with(
                             tracing::error!(
                                 tgid,
                                 panic_msg,
-                                "host-state probe: attach worker panicked; tgid skipped",
+                                "ctprof probe: attach worker panicked; tgid skipped",
                             );
                             None
                         }
@@ -4246,7 +4246,7 @@ fn capture_with(
             Err(e) => {
                 tracing::warn!(
                     error = %e,
-                    "host-state taskstats: open failed; delay-accounting and memory-watermark \
+                    "ctprof taskstats: open failed; delay-accounting and memory-watermark \
                      fields will be zero. Ensure the kernel was built with CONFIG_TASKSTATS \
                      (plus CONFIG_TASK_DELAY_ACCT for delay fields and CONFIG_TASK_XACCT for \
                      hiwater fields), the process holds CAP_NET_ADMIN, and the kernel was \
@@ -4360,7 +4360,7 @@ fn capture_with(
     }
     let psi = read_host_psi_at(proc_root);
     let sched_ext = read_sched_ext_sysfs_at(sys_root);
-    HostStateSnapshot {
+    CtprofSnapshot {
         captured_at_unix_ns,
         host,
         threads,
@@ -4391,7 +4391,7 @@ fn capture_with(
 /// processes) the probe path dominates the wall-clock cost.
 /// Callers that need only one tgid's data should use
 /// [`capture_pid`] to scope the walk.
-pub fn capture() -> HostStateSnapshot {
+pub fn capture() -> CtprofSnapshot {
     capture_with(
         Path::new(DEFAULT_PROC_ROOT),
         Path::new(DEFAULT_CGROUP_ROOT),
@@ -4400,7 +4400,7 @@ pub fn capture() -> HostStateSnapshot {
     )
 }
 
-/// Capture a host-state snapshot scoped to a single tgid.
+/// Capture a ctprof snapshot scoped to a single tgid.
 ///
 /// Walks `/proc/<pid>/task` for thread enumeration but skips every
 /// other tgid on the host, sidestepping the wall-clock cost (and
@@ -4415,7 +4415,7 @@ pub fn capture() -> HostStateSnapshot {
 /// entries for `pid`'s tgid (one entry per thread of that process).
 /// `host` and `cgroup_stats` populate normally so the snapshot
 /// stays self-describing.
-pub fn capture_pid(pid: i32) -> HostStateSnapshot {
+pub fn capture_pid(pid: i32) -> CtprofSnapshot {
     capture_pid_with(
         Path::new(DEFAULT_PROC_ROOT),
         Path::new(DEFAULT_CGROUP_ROOT),
@@ -4434,7 +4434,7 @@ pub fn capture_pid(pid: i32) -> HostStateSnapshot {
 /// the jemalloc probe attach (here scoped to the single target
 /// `pid` rather than a phase-1 sweep across every tgid),
 /// `sched_getaffinity(2)` inside per-thread capture, and
-/// `emit_probe_summary` plus the [`HostStateProbeSummary`] on the
+/// `emit_probe_summary` plus the [`CtprofProbeSummary`] on the
 /// snapshot. Synthetic-tree tests pass `false` because the
 /// staged procfs has no real ELF behind `/proc/<pid>/exe`;
 /// production passes `true`. Self-skip parallels the global path:
@@ -4449,7 +4449,7 @@ fn capture_pid_with(
     sys_root: &Path,
     pid: i32,
     use_syscall_affinity: bool,
-) -> HostStateSnapshot {
+) -> CtprofSnapshot {
     let captured_at_unix_ns = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
@@ -4486,7 +4486,7 @@ fn capture_pid_with(
             Err(e) => {
                 tracing::warn!(
                     error = %e,
-                    "host-state taskstats: open failed; delay-accounting and memory-watermark \
+                    "ctprof taskstats: open failed; delay-accounting and memory-watermark \
                      fields will be zero. Ensure the kernel was built with CONFIG_TASKSTATS \
                      (plus CONFIG_TASK_DELAY_ACCT for delay fields and CONFIG_TASK_XACCT for \
                      hiwater fields), the process holds CAP_NET_ADMIN, and the kernel was \
@@ -4567,7 +4567,7 @@ fn capture_pid_with(
     }
     let psi = read_host_psi_at(proc_root);
     let sched_ext = read_sched_ext_sysfs_at(sys_root);
-    HostStateSnapshot {
+    CtprofSnapshot {
         captured_at_unix_ns,
         host,
         threads,
@@ -4581,12 +4581,12 @@ fn capture_pid_with(
 
 /// Capture a snapshot and write it to `path` in the canonical
 /// zstd+JSON format. Wrapper over [`capture`] +
-/// [`HostStateSnapshot::write`] so CLI code can stay a single
+/// [`CtprofSnapshot::write`] so CLI code can stay a single
 /// call.
 pub fn capture_to(path: &Path) -> Result<()> {
     let snap = capture();
     snap.write(path)
-        .with_context(|| format!("write host-state snapshot to {}", path.display()))
+        .with_context(|| format!("write ctprof snapshot to {}", path.display()))
 }
 
 #[cfg(test)]
@@ -4643,7 +4643,7 @@ mod tests {
     /// `ThreadState` must NOT lex-beat a real kernel state
     /// letter when both contribute to the same Mode aggregation
     /// at equal frequency. The kernel's
-    /// [`crate::host_state_compare::aggregate`] closure
+    /// [`crate::ctprof_compare::aggregate`] closure
     /// `a.1.cmp(&b.1).then(b.0.cmp(&a.0))` selects
     /// LEX-SMALLEST on count-ties, so the sentinel must be
     /// LARGER than every real letter to keep the real letter
@@ -4655,7 +4655,7 @@ mod tests {
     /// would have made this test fail.
     #[test]
     fn mode_tiebreak_against_default_state_picks_real_letter() {
-        use crate::host_state_compare::{AggRule, Aggregated, aggregate};
+        use crate::ctprof_compare::{AggRule, Aggregated, aggregate};
         let default_thread = ThreadState::default();
         let real_thread = ThreadState {
             state: 'R',
@@ -4685,7 +4685,7 @@ mod tests {
     /// Bytes, PeakNs, GaugeNs, GaugeCount, OrdinalI32,
     /// OrdinalU32, CategoricalString, CpuSet — so a regression
     /// that breaks `serde(transparent)` on any wrapper would
-    /// surface here without needing a real .hst.zst file from
+    /// surface here without needing a real .ctprof.zst file from
     /// pre-phase-2 capture. Pre-phase-2 snapshot files (raw
     /// `u64`/`i32`/`String`/`Vec<u32>` at every position)
     /// continue to deserialize identically.
@@ -4841,7 +4841,7 @@ mod tests {
 
     #[test]
     fn snapshot_roundtrip_through_zstd_json() {
-        let snap = HostStateSnapshot {
+        let snap = CtprofSnapshot {
             captured_at_unix_ns: 42,
             host: None,
             threads: vec![
@@ -4861,7 +4861,7 @@ mod tests {
         };
         let tmp = tempfile::NamedTempFile::new().unwrap();
         snap.write(tmp.path()).unwrap();
-        let back = HostStateSnapshot::load(tmp.path()).unwrap();
+        let back = CtprofSnapshot::load(tmp.path()).unwrap();
         assert_eq!(back.captured_at_unix_ns, 42);
         assert_eq!(back.threads.len(), 2);
         assert_eq!(
@@ -4875,7 +4875,7 @@ mod tests {
     fn load_rejects_non_zstd_payload() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), b"{\"not\": \"zstd\"}").unwrap();
-        let err = HostStateSnapshot::load(tmp.path()).unwrap_err();
+        let err = CtprofSnapshot::load(tmp.path()).unwrap_err();
         let msg = format!("{err:?}");
         assert!(
             msg.contains("zstd"),
@@ -4888,10 +4888,10 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let compressed = zstd::encode_all(&b"not json"[..], 3).unwrap();
         std::fs::write(tmp.path(), compressed).unwrap();
-        let err = HostStateSnapshot::load(tmp.path()).unwrap_err();
+        let err = CtprofSnapshot::load(tmp.path()).unwrap_err();
         let msg = format!("{err:?}");
         assert!(
-            msg.contains("parse host-state"),
+            msg.contains("parse ctprof"),
             "expected parse error in context chain, got: {msg}",
         );
     }
@@ -5891,7 +5891,7 @@ mod tests {
         // linked tgid on the host — orders of magnitude slower in a
         // unit-test context, and not what this test is asserting on.
         // The wiring-end-to-end test path lives in
-        // `tests/host_state_capture_jemalloc_wiring.rs`, which spawns
+        // `tests/ctprof_capture_jemalloc_wiring.rs`, which spawns
         // a real jemalloc target.
         let pid = std::process::id() as i32;
         let snap = capture_pid(pid);
@@ -6137,7 +6137,7 @@ mod tests {
     // task/<tid>/{stat,schedstat,status,io,sched,comm,cgroup}}`
     // so every capture helper can be driven without touching the
     // real procfs. Mirrors the compare-side pattern in
-    // tests/host_state_compare.rs but against the capture side.
+    // tests/ctprof_compare.rs but against the capture side.
     // ------------------------------------------------------------
 
     /// Build a synthetic `/proc` under `root` carrying exactly one
@@ -7326,7 +7326,7 @@ mod tests {
         // returns ENOENT for the parent; capture_to's with_context
         // wraps it with the destination path.
         let scratch = tempfile::TempDir::new().unwrap();
-        let unwritable = scratch.path().join("missing-dir").join("snap.hst.zst");
+        let unwritable = scratch.path().join("missing-dir").join("snap.ctprof.zst");
         let err = capture_to(&unwritable).unwrap_err();
         let chain = format!("{err:#}");
         assert!(
@@ -7730,7 +7730,7 @@ mod tests {
     /// tid whose pending bumps are unwound via
     /// [`ParseTally::discard_pending`] must not contribute to
     /// the per-snapshot
-    /// [`HostStateParseSummary::negative_dotted_values`]. Mirrors
+    /// [`CtprofParseSummary::negative_dotted_values`]. Mirrors
     /// the read-failure tally's discard semantics so the two
     /// tally families stay symmetric under the ghost-filter
     /// path.
@@ -8235,9 +8235,9 @@ mod tests {
     ///    input that keeps the gate false (0*2 < 1) — pins that
     ///    `total_ptrace == 0` keeps the gate false even when
     ///    `failed > 0`.
-    /// 5. `HostStateProbeSummary::default()` has
+    /// 5. `CtprofProbeSummary::default()` has
     ///    `privilege_dominant: false` — pins
-    ///    `HostStateProbeSummary::default()` for callers that may
+    ///    `CtprofProbeSummary::default()` for callers that may
     ///    use struct-update syntax.
     /// 6. ptrace wins the single-tag plurality but stays below the
     ///    50% threshold — the converse of bullet 2: `dominant_failure`
@@ -8302,8 +8302,8 @@ mod tests {
         // 5. default invariant: a freshly-defaulted summary must
         //    not claim privilege dominance.
         assert!(
-            !HostStateProbeSummary::default().privilege_dominant,
-            "HostStateProbeSummary::default().privilege_dominant \
+            !CtprofProbeSummary::default().privilege_dominant,
+            "CtprofProbeSummary::default().privilege_dominant \
              must be false",
         );
 
@@ -8337,7 +8337,7 @@ mod tests {
     #[test]
     fn remediation_hint_returns_some_iff_privilege_dominant() {
         // privilege_dominant=true → Some(PTRACE_EPERM_HINT).
-        let ps = HostStateProbeSummary {
+        let ps = CtprofProbeSummary {
             privilege_dominant: true,
             ..Default::default()
         };
@@ -8349,7 +8349,7 @@ mod tests {
         );
 
         // privilege_dominant=false → None.
-        let ps = HostStateProbeSummary::default();
+        let ps = CtprofProbeSummary::default();
         assert!(
             !ps.privilege_dominant,
             "default privilege_dominant must be false (sanity)",
@@ -8392,7 +8392,7 @@ mod tests {
     fn summary_emits_clean_line_when_no_failures() {
         let summary = make_summary(0, &[("jemalloc-not-found", 12)], &[]);
         emit_probe_summary(&summary);
-        assert!(logs_contain("host-state probe:"));
+        assert!(logs_contain("ctprof probe:"));
         assert!(logs_contain("0 tgids walked"));
         assert!(logs_contain("0 failed"));
         assert!(
@@ -8500,7 +8500,7 @@ mod tests {
     fn parse_summary_emits_clean_line_when_no_failures() {
         let tally = ParseTally::default();
         emit_parse_summary(&tally);
-        assert!(logs_contain("host-state parse:"));
+        assert!(logs_contain("ctprof parse:"));
         assert!(logs_contain("0 tids walked"));
         assert!(logs_contain("0 read failures"));
         assert!(
@@ -8687,7 +8687,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------
-    // T28 — HostStateParseSummary: per-file read-failure tally
+    // T28 — CtprofParseSummary: per-file read-failure tally
     // ------------------------------------------------------------
 
     /// Stage a synthetic procfs tree for parse-summary tests:
@@ -8887,14 +8887,14 @@ mod tests {
         assert_eq!(summary.tids_walked, 1);
     }
 
-    /// Serde round-trip: a populated `HostStateParseSummary`
+    /// Serde round-trip: a populated `CtprofParseSummary`
     /// preserves every field through JSON.
     #[test]
     fn parse_summary_serde_round_trip() {
         let mut by_file = BTreeMap::new();
         by_file.insert("schedstat".to_string(), 100);
         by_file.insert("io".to_string(), 50);
-        let summary = HostStateParseSummary {
+        let summary = CtprofParseSummary {
             tids_walked: 1000,
             read_failures: 150,
             read_failures_by_file: by_file,
@@ -8903,7 +8903,7 @@ mod tests {
             negative_dotted_values: 7,
         };
         let json = serde_json::to_string(&summary).unwrap();
-        let back: HostStateParseSummary = serde_json::from_str(&json).unwrap();
+        let back: CtprofParseSummary = serde_json::from_str(&json).unwrap();
         assert_eq!(back.tids_walked, 1000);
         assert_eq!(back.read_failures, 150);
         assert_eq!(back.read_failures_by_file.get("schedstat"), Some(&100));

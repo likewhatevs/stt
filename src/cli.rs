@@ -4772,7 +4772,7 @@ pub fn stdout_color() -> bool {
 /// `ContentArrangement::Disabled` is the default arrangement: columns
 /// expand to whatever each cell needs, even when the result spills
 /// past the terminal edge. Callers that want terminal-width-aware
-/// cell wrapping use [`new_wrapped_table`] (host-state compare/show
+/// cell wrapping use [`new_wrapped_table`] (ctprof compare/show
 /// reaches it via `--wrap`).
 pub fn new_table() -> comfy_table::Table {
     use comfy_table::{ContentArrangement, Table, presets::NOTHING};
@@ -4789,8 +4789,8 @@ pub fn new_table() -> comfy_table::Table {
 /// terminal-width-aware [`comfy_table::ContentArrangement::Dynamic`]
 /// layout. Cells too wide for the available terminal width wrap
 /// inside the cell rather than pushing later columns past the edge,
-/// at the cost of taller rows. Used by `host-state compare` /
-/// `host-state show` under the `--wrap` flag; the existing
+/// at the cost of taller rows. Used by `ctprof compare` /
+/// `ctprof show` under the `--wrap` flag; the existing
 /// fixed-column [`new_table`] stays the default for every other
 /// caller (locks, verifier, stats) so their output stays
 /// byte-stable for shell-pipeline consumers.

@@ -3,7 +3,7 @@
 //! well-defined meaning (lexicographic Vec<u32> ordering would
 //! technically work but would render as gibberish). The
 //! aggregation contract for affinity is the bespoke
-//! `AffinitySummary` reduction in `host_state_compare`, not a
+//! `AffinitySummary` reduction in `ctprof_compare`, not a
 //! generic Maxable trait method. Pin the type-system rejection:
 //! a generic site bound on `T: Maxable` must refuse `CpuSet`.
 

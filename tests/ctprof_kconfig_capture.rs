@@ -6,7 +6,7 @@
 //! boots a minimal KVM guest via the `#[ktstr_test]` harness,
 //! drives a synthetic load that exercises the kernel path the
 //! kconfig flag gates, then invokes
-//! [`ktstr::host_state::capture`] inside the guest and asserts
+//! [`ktstr::ctprof::capture`] inside the guest and asserts
 //! the corresponding field on the snapshot lands non-zero.
 //!
 //! The flags are all set to `=y` in `ktstr.kconfig` (the
@@ -50,7 +50,7 @@
 //!   favor of `blkio_delay_total_ns` (taskstats, ns
 //!   precision).
 //!
-//! Distinct from `tests/host_state_capture.rs`, which proves
+//! Distinct from `tests/ctprof_capture.rs`, which proves
 //! the capture pipeline reaches procfs end-to-end via a
 //! schedstat/minflt OR-clause that survives every kconfig
 //! permutation. This file pins the per-flag wiring: each test
@@ -84,7 +84,7 @@ use ktstr::workload::WorkType;
 /// is non-zero. `wchar` is the canonical write-side signal;
 /// it accumulates regardless of whether the underlying fs is
 /// a real disk or tmpfs (per the doc on
-/// `host_state::ThreadState::wchar` cited in the registry).
+/// `ctprof::ThreadState::wchar` cited in the registry).
 /// Reading-side `rchar` is more permissive (mere `read(2)`
 /// from /proc / /sys / vdso increments it), but the write
 /// path is what `IoSync` actively drives so pin on `wchar`
@@ -104,7 +104,7 @@ use ktstr::workload::WorkType;
 /// windows (< 1 s) risk the workers not having issued any
 /// writes yet on slow CI runners.
 #[ktstr_test(llcs = 1, cores = 2, threads = 1, duration_s = 3)]
-fn host_state_capture_records_wchar_under_iosync(ctx: &Ctx) -> Result<AssertResult> {
+fn ctprof_capture_records_wchar_under_iosync(ctx: &Ctx) -> Result<AssertResult> {
     // IoSync workers write 64 KB to a temp file then sleep
     // 100 µs to simulate I/O completion latency. On the
     // guest's tmpfs the write is a page-cache memcpy, but
@@ -122,12 +122,12 @@ fn host_state_capture_records_wchar_under_iosync(ctx: &Ctx) -> Result<AssertResu
     }];
     let workload_result = execute_steps(ctx, steps)?;
 
-    let snap = ktstr::host_state::capture();
+    let snap = ktstr::ctprof::capture();
 
     if snap.threads.is_empty() {
         return Ok(AssertResult::fail(AssertDetail::new(
             DetailKind::Other,
-            "host_state::capture() returned zero threads — procfs walk \
+            "ctprof::capture() returned zero threads — procfs walk \
              produced no entries, indicating the capture layer is not \
              reading /proc successfully inside the guest",
         )));
@@ -145,7 +145,7 @@ fn host_state_capture_records_wchar_under_iosync(ctx: &Ctx) -> Result<AssertResu
         return Ok(AssertResult::fail(AssertDetail::new(
             DetailKind::Other,
             format!(
-                "host_state::capture() returned {total} threads but NONE \
+                "ctprof::capture() returned {total} threads but NONE \
                  had wchar > 0 after an IoSync workload; threads with \
                  rchar > 0 = {nonzero_rchar}. Suggests either \
                  CONFIG_TASK_IO_ACCOUNTING is missing from the kconfig \
@@ -158,7 +158,7 @@ fn host_state_capture_records_wchar_under_iosync(ctx: &Ctx) -> Result<AssertResu
     let mut result = workload_result;
     result.details.push(AssertDetail::new(
         DetailKind::Other,
-        format!("host_state_capture_records_wchar: max_wchar={max_wchar}"),
+        format!("ctprof_capture_records_wchar: max_wchar={max_wchar}"),
     ));
     Ok(result)
 }
@@ -166,7 +166,7 @@ fn host_state_capture_records_wchar_under_iosync(ctx: &Ctx) -> Result<AssertResu
 // CONFIG_TASK_DELAY_ACCT coverage moved to the
 // CONFIG_TASKSTATS+TASK_DELAY_ACCT+TASK_XACCT triple-gate test
 // at the bottom of this file
-// (host_state_capture_records_taskstats_cpu_delay_and_hiwater_under_oversubscription).
+// (ctprof_capture_records_taskstats_cpu_delay_and_hiwater_under_oversubscription).
 // The previous procfs-side test pinned `delayacct_blkio_ticks`
 // (USER_HZ ticks via /proc/<tid>/stat field 42); that field was
 // removed because `blkio_delay_total_ns` from the taskstats
@@ -206,7 +206,7 @@ fn host_state_capture_records_wchar_under_iosync(ctx: &Ctx) -> Result<AssertResu
 /// kernel observes it, and the snapshot's PSI struct is
 /// populated either way.
 #[ktstr_test(llcs = 1, cores = 2, threads = 1, duration_s = 3)]
-fn host_state_capture_reaches_host_psi_cpu_under_oversubscription(
+fn ctprof_capture_reaches_host_psi_cpu_under_oversubscription(
     ctx: &Ctx,
 ) -> Result<AssertResult> {
     let steps = vec![Step {
@@ -221,12 +221,12 @@ fn host_state_capture_reaches_host_psi_cpu_under_oversubscription(
     }];
     let workload_result = execute_steps(ctx, steps)?;
 
-    let snap = ktstr::host_state::capture();
+    let snap = ktstr::ctprof::capture();
 
     if snap.threads.is_empty() {
         return Ok(AssertResult::fail(AssertDetail::new(
             DetailKind::Other,
-            "host_state::capture() returned zero threads — procfs walk \
+            "ctprof::capture() returned zero threads — procfs walk \
              produced no entries, indicating the capture layer is not \
              reading /proc successfully inside the guest",
         )));
@@ -249,7 +249,7 @@ fn host_state_capture_reaches_host_psi_cpu_under_oversubscription(
     result.details.push(AssertDetail::new(
         DetailKind::Other,
         format!(
-            "host_state_capture_reaches_host_psi_cpu: threads={}, \
+            "ctprof_capture_reaches_host_psi_cpu: threads={}, \
              cpu.some.total_usec={cpu_some_total}, \
              cpu.some.avg10={cpu_some_avg10}, \
              memory.some.total_usec={mem_some_total}, \
@@ -354,7 +354,7 @@ fn host_state_capture_reaches_host_psi_cpu_under_oversubscription(
     workers_per_cgroup = 4,
     duration_s = 3
 )]
-fn host_state_capture_records_taskstats_cpu_delay_and_hiwater_under_oversubscription(
+fn ctprof_capture_records_taskstats_cpu_delay_and_hiwater_under_oversubscription(
     ctx: &Ctx,
 ) -> Result<AssertResult> {
     let steps = vec![Step {
@@ -369,12 +369,12 @@ fn host_state_capture_records_taskstats_cpu_delay_and_hiwater_under_oversubscrip
     }];
     let workload_result = execute_steps(ctx, steps)?;
 
-    let snap = ktstr::host_state::capture();
+    let snap = ktstr::ctprof::capture();
 
     if snap.threads.is_empty() {
         return Ok(AssertResult::fail(AssertDetail::new(
             DetailKind::Other,
-            "host_state::capture() returned zero threads — procfs walk \
+            "ctprof::capture() returned zero threads — procfs walk \
              produced no entries, indicating the capture layer is not \
              reading /proc successfully inside the guest",
         )));
@@ -418,7 +418,7 @@ fn host_state_capture_records_taskstats_cpu_delay_and_hiwater_under_oversubscrip
         return Ok(AssertResult::fail(AssertDetail::new(
             DetailKind::Other,
             format!(
-                "host_state::capture() returned {total} threads but NONE \
+                "ctprof::capture() returned {total} threads but NONE \
                  had hiwater_rss_bytes > 0. Every user-space tgid has an \
                  mm_struct so xacct_add_tsk should populate the field; a \
                  zero-everywhere snapshot suggests CONFIG_TASKSTATS / \
@@ -440,7 +440,7 @@ fn host_state_capture_records_taskstats_cpu_delay_and_hiwater_under_oversubscrip
     result.details.push(AssertDetail::new(
         DetailKind::Other,
         format!(
-            "host_state_capture_records_taskstats: threads={total}, \
+            "ctprof_capture_records_taskstats: threads={total}, \
              max_cpu_delay_count={max_cpu_delay_count}, \
              max_cpu_delay_total_ns={max_cpu_delay_total_ns}, \
              max_hiwater_rss_bytes={max_hiwater_rss_bytes}"

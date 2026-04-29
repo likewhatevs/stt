@@ -1,12 +1,12 @@
 //! Host-side end-to-end test for the jemalloc-counter wiring in
-//! [`ktstr::host_state::capture_pid`].
+//! [`ktstr::ctprof::capture_pid`].
 //!
 //! Spawns `ktstr-jemalloc-alloc-worker` as a child process on the
 //! host with a known allocation size, waits for the worker's
 //! pid-scoped ready marker, then runs `capture_pid` against the
 //! host's real `/proc` and confirms the worker's tid carries a
 //! populated `allocated_bytes` field. Distinct from the VM-backed
-//! `tests/host_state_capture.rs`, which only proves the procfs
+//! `tests/ctprof_capture.rs`, which only proves the procfs
 //! walk reaches non-jemalloc counters: this test specifically
 //! exercises the ELF/DWARF + ptrace + process_vm_readv path that
 //! the wiring lifted out of the standalone probe binary into the
@@ -178,7 +178,7 @@ fn capture_populates_jemalloc_counters_for_alloc_worker() {
     // through capture's "absent = 0" contract.
     if !ptrace_attach_allowed() {
         eprintln!(
-            "host_state_capture_jemalloc_wiring: skipping — \
+            "ctprof_capture_jemalloc_wiring: skipping — \
              ptrace attach is denied by the kernel policy (likely \
              yama.ptrace_scope >= 1 with no parent relationship). \
              Set kernel.yama.ptrace_scope=0 or run the test from \
@@ -200,7 +200,7 @@ fn capture_populates_jemalloc_counters_for_alloc_worker() {
         panic!("worker did not signal ready: {}", msg);
     }
 
-    // Capture the host-state snapshot scoped to the worker's
+    // Capture the ctprof snapshot scoped to the worker's
     // tgid. `capture_pid` walks `/proc/<pid>/task` only and runs
     // the jemalloc probe attach against the single tgid — much
     // tighter than the global `capture()` walk, which would also
@@ -210,7 +210,7 @@ fn capture_populates_jemalloc_counters_for_alloc_worker() {
     // probe-attach + per-tid probe_thread call that `capture` runs
     // for every jemalloc tgid, so the scoped capture proves
     // exactly the path under test.
-    let snap = ktstr::host_state::capture_pid(worker_pid);
+    let snap = ktstr::ctprof::capture_pid(worker_pid);
 
     // Find the worker's main thread in the snapshot. The worker
     // is single-threaded (its own self-check enforces it via
@@ -294,7 +294,7 @@ fn capture_pid_skips_self_attach_and_keeps_counters_zero() {
     // The self-skip gate makes that detail moot — the probe is
     // never even attempted against self.)
     let self_pid = std::process::id() as i32;
-    let snap = ktstr::host_state::capture_pid(self_pid);
+    let snap = ktstr::ctprof::capture_pid(self_pid);
     let self_threads: Vec<_> = snap
         .threads
         .iter()
@@ -358,7 +358,7 @@ fn capture_pid_against_non_jemalloc_target_keeps_counters_zero_but_populates_pro
     std::thread::sleep(Duration::from_millis(50));
     let pid = child.id() as i32;
 
-    let snap = ktstr::host_state::capture_pid(pid);
+    let snap = ktstr::ctprof::capture_pid(pid);
 
     let _ = child.kill();
     let _ = child.wait();

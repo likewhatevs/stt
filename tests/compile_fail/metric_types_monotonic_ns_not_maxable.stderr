@@ -5,7 +5,7 @@ error[E0277]: `MonotonicNs` is not Maxable — `max` is undefined for this categ
    |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this metric type does not support max-across
    |
    = help: the trait `Maxable` is not implemented for `MonotonicNs`
-   = note: MonotonicCount/MonotonicNs/ClockTicks/Bytes (Summable cumulative counters): use Summable::sum_across; max-across-snapshots on a lifetime accumulator reduces to the most-recent reading, not a worst window; OrdinalI32/OrdinalU32/OrdinalU64: use Rangeable::range_across; CategoricalString: use Modeable::mode_across; CpuSet: use the AffinitySummary reduction in host_state_compare; DeadCounter: kernel-side dead pointer — value is structurally zero; the registry must use a no-op aggregation arm (or omit the field) rather than max across structural zeros
+   = note: MonotonicCount/MonotonicNs/ClockTicks/Bytes (Summable cumulative counters): use Summable::sum_across; max-across-snapshots on a lifetime accumulator reduces to the most-recent reading, not a worst window; OrdinalI32/OrdinalU32/OrdinalU64: use Rangeable::range_across; CategoricalString: use Modeable::mode_across; CpuSet: use the AffinitySummary reduction in ctprof_compare; DeadCounter: kernel-side dead pointer — value is structurally zero; the registry must use a no-op aggregation arm (or omit the field) rather than max across structural zeros
 help: the following other types implement trait `Maxable`
   --> src/metric_types.rs
    |

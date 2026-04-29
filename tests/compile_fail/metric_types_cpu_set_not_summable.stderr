@@ -5,7 +5,7 @@ error[E0277]: `CpuSet` is not Summable — summing it would conflate semantic ca
    |                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^ this metric type cannot be summed across a group
    |
    = help: the trait `Summable` is not implemented for `CpuSet`
-   = note: PeakNs (lifetime high-water): use Maxable::max_across; GaugeNs/GaugeCount (instantaneous samples — different temporal window than the lifetime accumulators): use Maxable::max_across; OrdinalI32/OrdinalU32/OrdinalU64 (bounded scalars): use Rangeable::range_across; CategoricalString: use Modeable::mode_across; CpuSet: use the AffinitySummary reduction in host_state_compare; DeadCounter: kernel-side dead pointer — value is structurally zero; the registry must use a no-op aggregation arm (or omit the field) rather than sum across structural zeros
+   = note: PeakNs (lifetime high-water): use Maxable::max_across; GaugeNs/GaugeCount (instantaneous samples — different temporal window than the lifetime accumulators): use Maxable::max_across; OrdinalI32/OrdinalU32/OrdinalU64 (bounded scalars): use Rangeable::range_across; CategoricalString: use Modeable::mode_across; CpuSet: use the AffinitySummary reduction in ctprof_compare; DeadCounter: kernel-side dead pointer — value is structurally zero; the registry must use a no-op aggregation arm (or omit the field) rather than sum across structural zeros
 help: the following other types implement trait `Summable`
   --> src/metric_types.rs
    |

@@ -138,24 +138,24 @@
 //! - [`worker_ready`] / [`worker_ready_wait`] -- pid-scoped marker file the alloc/test workers write before the parent samples them
 //! - [`workload`] -- worker process types and telemetry collection
 //!
-//! ## Host-state subsystem
+//! ## ctprof subsystem
 //!
 //! Per-thread + per-process runtime profile, captured via
-//! `ktstr host-state capture` and compared via
-//! `ktstr host-state compare`:
+//! `ktstr ctprof capture` and compared via
+//! `ktstr ctprof compare`:
 //!
 //! - [`host_context`] -- one-shot host snapshot (kernel, CPU, memory, tunables)
 //! - [`host_heap`] -- jemalloc global heap counters (mallctl)
-//! - [`host_state`] -- per-thread procfs walk + cumulative scheduling, I/O, page-fault, jemalloc TSD counters
-//! - [`host_state_compare`] -- two-snapshot diff engine (group-by + delta tables)
+//! - [`ctprof`] -- per-thread procfs walk + cumulative scheduling, I/O, page-fault, jemalloc TSD counters
+//! - [`ctprof_compare`] -- two-snapshot diff engine (group-by + delta tables)
 //!
 //! `host_thread_probe` (the ELF/DWARF + ptrace + `process_vm_readv`
 //! engine that pulls per-thread jemalloc TSD counters) is
-//! `pub(crate)`-only and consumed exclusively by `host_state` plus
+//! `pub(crate)`-only and consumed exclusively by `ctprof` plus
 //! the source-shared standalone `ktstr-jemalloc-probe` binary.
 //! Direct probe access from downstream is intentionally not part
 //! of the surface — scheduler authors get the captured counters
-//! through `host_state::ThreadState`.
+//! through `ctprof::ThreadState`.
 //!
 //! Internal modules (not re-exported): `host_thread_probe` reads
 //! per-thread jemalloc TSD counters via ptrace, `monitor` reads
@@ -339,12 +339,12 @@ pub mod assert;
 pub(crate) mod budget;
 pub mod cli;
 pub mod cpu_util;
+pub mod ctprof;
+pub mod ctprof_compare;
 pub(crate) mod elf_strip;
 pub mod fetch;
 pub mod host_context;
 pub mod host_heap;
-pub mod host_state;
-pub mod host_state_compare;
 pub(crate) mod host_thread_probe;
 pub mod kernel_path;
 pub mod metric_types;

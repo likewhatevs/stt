@@ -9,8 +9,8 @@ use clap::{ArgAction, CommandFactory, Parser, Subcommand};
 use ktstr::cgroup::CgroupManager;
 use ktstr::cli;
 use ktstr::cli::KernelCommand;
-use ktstr::host_state;
-use ktstr::host_state_compare;
+use ktstr::ctprof;
+use ktstr::ctprof_compare;
 use ktstr::runner::Runner;
 use ktstr::scenario;
 use ktstr::topology::TestTopology;
@@ -198,7 +198,7 @@ enum Command {
     ///
     /// `capture` walks `/proc` at capture time and writes every
     /// visible thread's cumulative scheduling, memory, and I/O
-    /// counters as zstd-compressed JSON (`.hst.zst`). Every
+    /// counters as zstd-compressed JSON (`.ctprof.zst`). Every
     /// field is cumulative-from-birth so probe attachment time
     /// does not bias the reading — a diff between two captures
     /// measures exactly the activity over the window.
@@ -227,9 +227,9 @@ enum Command {
     /// `compare` joins two snapshots on the selected grouping
     /// axis (pcomm, cgroup, or comm — see `--group-by`) and
     /// renders a per-metric baseline/candidate/delta table.
-    HostState {
+    Ctprof {
         #[command(subcommand)]
-        command: HostStateCommand,
+        command: CtprofCommand,
     },
     /// Generate shell completions for ktstr.
     Completions {
@@ -265,7 +265,7 @@ enum Command {
 }
 
 #[derive(Subcommand)]
-enum HostStateCommand {
+enum CtprofCommand {
     /// Capture a host-wide per-thread snapshot to `<output>` as
     /// zstd-compressed JSON. Walks `/proc` for every live tgid,
     /// enumerates threads, records schedstat / sched / status
@@ -292,7 +292,7 @@ enum HostStateCommand {
     /// Format depends on whether any per-tgid failures landed:
     ///
     /// 1. No failures —
-    ///    `host-state probe: <N> tgids walked, <N> jemalloc detected,
+    ///    `ctprof probe: <N> tgids walked, <N> jemalloc detected,
     ///    <N> probed OK, 0 failed`
     /// 2. Failures, ptrace not dominant —
     ///    `... <N> failed (dominant: <tag>)`
@@ -384,17 +384,17 @@ enum HostStateCommand {
     /// non-jemalloc tgids on the host, that is correct: the noise
     /// floor was filtered.
     Capture {
-        /// Destination path (convention: `.hst.zst`).
+        /// Destination path (convention: `.ctprof.zst`).
         #[arg(short, long)]
         output: PathBuf,
     },
     /// Compare two snapshots and render a per-metric diff table.
-    Compare(host_state_compare::HostStateCompareArgs),
+    Compare(ctprof_compare::CtprofCompareArgs),
     /// Render one snapshot as a per-group, per-metric table.
     ///
     /// Same grouping axis as `compare` (`pcomm` default, `cgroup`,
     /// `comm`, `comm-exact`) and the same per-metric aggregation
-    /// rules from [`host_state_compare::HOST_STATE_METRICS`], but
+    /// rules from [`ctprof_compare::CTPROF_METRICS`], but
     /// with no baseline/candidate split — every metric renders one
     /// aggregated value per group rather than a delta against a
     /// reference snapshot. Useful for inspecting a capture in
@@ -408,7 +408,7 @@ enum HostStateCommand {
     /// it does in `compare`; `--no-thread-normalize` and
     /// `--no-cg-normalize` disable each axis. `--cgroup-flatten`
     /// glob patterns also apply unchanged.
-    Show(HostStateShowArgs),
+    Show(CtprofShowArgs),
     /// Print every registered metric with its tags and a
     /// one-line description.
     ///
@@ -429,28 +429,28 @@ enum HostStateCommand {
     MetricList,
 }
 
-/// Arguments for the `ktstr host-state show` subcommand. Field
-/// shapes mirror [`host_state_compare::HostStateCompareArgs`] so a
+/// Arguments for the `ktstr ctprof show` subcommand. Field
+/// shapes mirror [`ctprof_compare::CtprofCompareArgs`] so a
 /// caller switching from compare to show keeps the same flag
 /// vocabulary; the only structural difference is the single
 /// positional path (one snapshot rather than baseline+candidate)
 /// and the absence of any delta/percentage flags — show renders
 /// one value per (group, metric) cell, no diff math.
 #[derive(Debug, clap::Args)]
-pub struct HostStateShowArgs {
-    /// Snapshot path (`.hst.zst`) from `ktstr host-state capture -o`.
+pub struct CtprofShowArgs {
+    /// Snapshot path (`.ctprof.zst`) from `ktstr ctprof capture -o`.
     pub snapshot: std::path::PathBuf,
     /// Grouping key. Same semantics as
-    /// `ktstr host-state compare --group-by`. `pcomm` (default)
+    /// `ktstr ctprof compare --group-by`. `pcomm` (default)
     /// aggregates per process name; `cgroup` per cgroup path;
     /// `comm` aggregates threads by NAME PATTERN under the
     /// token-based normalizer; `comm-exact` is a synonym for
     /// `comm --no-thread-normalize`.
-    #[arg(long, value_enum, default_value_t = host_state_compare::GroupBy::Pcomm, help_heading = "Grouping")]
-    pub group_by: host_state_compare::GroupBy,
+    #[arg(long, value_enum, default_value_t = ctprof_compare::GroupBy::Pcomm, help_heading = "Grouping")]
+    pub group_by: ctprof_compare::GroupBy,
     /// Glob patterns that collapse dynamic cgroup path segments —
     /// same shape as
-    /// `ktstr host-state compare --cgroup-flatten`. Repeatable.
+    /// `ktstr ctprof compare --cgroup-flatten`. Repeatable.
     #[arg(long, help_heading = "Grouping")]
     pub cgroup_flatten: Vec<String>,
     /// Disable token-based pattern normalization for the thread
@@ -465,10 +465,10 @@ pub struct HostStateShowArgs {
     #[arg(long, help_heading = "Grouping")]
     pub no_cg_normalize: bool,
     /// Multi-key sort spec for the rendered groups. Format mirrors
-    /// `ktstr host-state compare --sort-by`:
+    /// `ktstr ctprof compare --sort-by`:
     /// `metric1[:dir1],metric2[:dir2],...` where each `metric` is
     /// one of the primary or derived metric names (run
-    /// `host-state metric-list` for the full vocabulary) and
+    /// `ctprof metric-list` for the full vocabulary) and
     /// `dir` is `asc` or `desc` (default `desc`). Show ranks
     /// groups by the tuple of the named metric's *absolute
     /// aggregated value* (not a delta — there is only one
@@ -504,7 +504,7 @@ pub struct HostStateShowArgs {
     /// default) renders every metric in the primary and
     /// derived sub-tables. When non-empty, restricts the
     /// rendered ROWS to the listed names — names must come
-    /// from the `host-state metric-list` vocabulary. Useful
+    /// from the `ctprof metric-list` vocabulary. Useful
     /// for zooming on a specific counter family without
     /// computing every metric: `--metrics
     /// run_time_ns,wait_sum,affine_success_ratio`. Composes
@@ -719,36 +719,36 @@ fn run_completions(shell: clap_complete::Shell, binary: &str) {
     clap_complete::generate(shell, &mut cmd, binary, &mut std::io::stdout());
 }
 
-/// Entry point for `ktstr host-state show <snapshot>`. Loads one
+/// Entry point for `ktstr ctprof show <snapshot>`. Loads one
 /// snapshot, builds groups along the requested axis, aggregates
 /// every metric per
-/// [`host_state_compare::HOST_STATE_METRICS`], and renders the
+/// [`ctprof_compare::CTPROF_METRICS`], and renders the
 /// result as a `(group_key, threads, metric, value)` table on
 /// stdout. Exits non-zero only on I/O / parse errors; the
 /// rendered table is always considered successful output.
 ///
 /// Reuses the grouping pipeline from
-/// [`host_state_compare`] so pattern normalization (`comm` Layer-2
+/// [`ctprof_compare`] so pattern normalization (`comm` Layer-2
 /// token clustering, `cgroup` Layer-1/2/3 tightening) and
 /// `--cgroup-flatten` glob handling stay identical to the compare
 /// path.
-fn run_show(args: &HostStateShowArgs) -> Result<i32> {
+fn run_show(args: &CtprofShowArgs) -> Result<i32> {
     use anyhow::Context;
     // Parse `--sort-by` BEFORE the snapshot load so an operator
     // typo fails fast without paying for disk I/O. Mirrors
     // run_compare's ordering for the same reason. `--columns`
     // and `--sections` share the fail-fast contract — an invalid
     // spec must surface before the snapshot read.
-    let sort_by = host_state_compare::parse_sort_by(&args.sort_by)
+    let sort_by = ctprof_compare::parse_sort_by(&args.sort_by)
         .with_context(|| format!("parse --sort-by {:?}", args.sort_by))?;
     // `--columns` parses with compare_side=false so the
     // baseline/candidate/delta/% columns (compare-only) are
     // rejected before any snapshot work begins.
-    let columns = host_state_compare::parse_columns(&args.columns, false)
+    let columns = ctprof_compare::parse_columns(&args.columns, false)
         .with_context(|| format!("parse --columns {:?}", args.columns))?;
-    let sections = host_state_compare::parse_sections(&args.sections)
+    let sections = ctprof_compare::parse_sections(&args.sections)
         .with_context(|| format!("parse --sections {:?}", args.sections))?;
-    let metrics = host_state_compare::parse_metrics(&args.metrics)
+    let metrics = ctprof_compare::parse_metrics(&args.metrics)
         .with_context(|| format!("parse --metrics {:?}", args.metrics))?;
 
     // Mirror run_compare's pre-load warning: explicit
@@ -757,9 +757,9 @@ fn run_show(args: &HostStateShowArgs) -> Result<i32> {
     // zero rows for that section silently. Surface a
     // diagnostic before the snapshot load so the operator sees
     // it immediately.
-    host_state_compare::warn_cgroup_only_sections_under_non_cgroup(&sections, args.group_by);
+    ctprof_compare::warn_cgroup_only_sections_under_non_cgroup(&sections, args.group_by);
 
-    let snap = ktstr::host_state::HostStateSnapshot::load(&args.snapshot)
+    let snap = ktstr::ctprof::CtprofSnapshot::load(&args.snapshot)
         .with_context(|| format!("load snapshot {}", args.snapshot.display()))?;
     let mut out = String::new();
     // Infallible: writing into a String cannot fail.
@@ -781,13 +781,13 @@ fn run_show(args: &HostStateShowArgs) -> Result<i32> {
 }
 
 /// Render the per-group / per-metric show table into `w`. Mirrors
-/// [`host_state_compare::write_diff`]'s shape — the formatter
+/// [`ctprof_compare::write_diff`]'s shape — the formatter
 /// layer is split from the I/O wrapper so unit tests can drive
 /// rendering into a `String` buffer without shelling through
 /// stdout. Write errors propagate as [`std::fmt::Error`]; callers
 /// that write into an infallible sink (`String`) can ignore.
 ///
-/// `sections` is a [`host_state_compare::Section`] filter — empty
+/// `sections` is a [`ctprof_compare::Section`] filter — empty
 /// renders every section that has data, non-empty restricts to
 /// the named entries (mirrors `--sections` on `write_diff`).
 /// `metrics` is a row-level filter — empty renders every metric
@@ -798,18 +798,18 @@ fn run_show(args: &HostStateShowArgs) -> Result<i32> {
 #[allow(clippy::too_many_arguments)]
 fn write_show<W: std::fmt::Write>(
     w: &mut W,
-    snap: &ktstr::host_state::HostStateSnapshot,
-    group_by: host_state_compare::GroupBy,
+    snap: &ktstr::ctprof::CtprofSnapshot,
+    group_by: ctprof_compare::GroupBy,
     cgroup_flatten: &[String],
     no_thread_normalize: bool,
     no_cg_normalize: bool,
-    sort_by: &[host_state_compare::SortKey],
-    columns: &[host_state_compare::Column],
-    sections: &[host_state_compare::Section],
+    sort_by: &[ctprof_compare::SortKey],
+    columns: &[ctprof_compare::Column],
+    sections: &[ctprof_compare::Section],
     metrics: &[&'static str],
     wrap: bool,
 ) -> std::fmt::Result {
-    let flatten = host_state_compare::compile_flatten_patterns(cgroup_flatten);
+    let flatten = ctprof_compare::compile_flatten_patterns(cgroup_flatten);
     // Single-snapshot cgroup key map. compare()'s
     // `build_cgroup_key_map` walks the union of paths from two
     // snapshots; for show we feed the same snap on both arguments
@@ -817,10 +817,8 @@ fn write_show<W: std::fmt::Write>(
     // single-snap pass (the inner BTreeSet of paths dedups the
     // duplicate insertions). Skipped under `--no-cg-normalize`
     // and under any grouping other than Cgroup.
-    let cgroup_key_map = if group_by == host_state_compare::GroupBy::Cgroup && !no_cg_normalize {
-        Some(host_state_compare::build_cgroup_key_map(
-            snap, snap, &flatten,
-        ))
+    let cgroup_key_map = if group_by == ctprof_compare::GroupBy::Cgroup && !no_cg_normalize {
+        Some(ctprof_compare::build_cgroup_key_map(snap, snap, &flatten))
     } else {
         None
     };
@@ -829,7 +827,7 @@ fn write_show<W: std::fmt::Write>(
     // for a single-snapshot view (compare()'s union-over-baseline-
     // and-candidate gate doesn't apply when there's only one
     // snapshot to inspect).
-    let groups = host_state_compare::build_groups(
+    let groups = ctprof_compare::build_groups(
         snap,
         group_by,
         &flatten,
@@ -839,10 +837,10 @@ fn write_show<W: std::fmt::Write>(
     );
 
     let group_header = match group_by {
-        host_state_compare::GroupBy::Pcomm => "pcomm",
-        host_state_compare::GroupBy::Cgroup => "cgroup",
-        host_state_compare::GroupBy::Comm => "comm-pattern",
-        host_state_compare::GroupBy::CommExact => "comm",
+        ctprof_compare::GroupBy::Pcomm => "pcomm",
+        ctprof_compare::GroupBy::Cgroup => "cgroup",
+        ctprof_compare::GroupBy::Comm => "comm-pattern",
+        ctprof_compare::GroupBy::CommExact => "comm",
     };
 
     // Resolve the column set: caller-supplied override wins,
@@ -855,7 +853,7 @@ fn write_show<W: std::fmt::Write>(
     // through `display_options.new_table()` (the wrap-aware
     // helper) and every section emission gates on
     // `display_options.is_section_enabled(...)`.
-    let mut display_options = host_state_compare::DisplayOptions::default();
+    let mut display_options = ctprof_compare::DisplayOptions::default();
     display_options.columns = columns.to_vec();
     display_options.sections = sections.to_vec();
     display_options.metrics = metrics.to_vec();
@@ -870,7 +868,7 @@ fn write_show<W: std::fmt::Write>(
     // `sort_diff_rows_by_keys` shape (per-key direction, lex order
     // on the tuple, deterministic group_key tie-break) but on
     // `Aggregated::numeric()` rather than `DiffRow.delta`. Within a
-    // group, metrics still iterate `HOST_STATE_METRICS` so the
+    // group, metrics still iterate `CTPROF_METRICS` so the
     // metric column lands in registry order regardless of sort.
     //
     // Computed once outside the section gates because every
@@ -924,7 +922,7 @@ fn write_show<W: std::fmt::Write>(
         keys
     };
 
-    if display_options.is_section_enabled(host_state_compare::Section::Primary) {
+    if display_options.is_section_enabled(ctprof_compare::Section::Primary) {
         let mut table = display_options.new_table();
         let header_row: Vec<&str> = resolved_columns
             .iter()
@@ -937,13 +935,12 @@ fn write_show<W: std::fmt::Write>(
             // Display key: pattern grouping under Comm uses grex to
             // turn the join-key skeleton into a regex label; every
             // other grouping renders the join key directly.
-            let display_key =
-                if group_by == host_state_compare::GroupBy::Comm && !no_thread_normalize {
-                    host_state_compare::pattern_display_label(key, &group.member_comms)
-                } else {
-                    (*key).clone()
-                };
-            for metric in host_state_compare::HOST_STATE_METRICS {
+            let display_key = if group_by == ctprof_compare::GroupBy::Comm && !no_thread_normalize {
+                ctprof_compare::pattern_display_label(key, &group.member_comms)
+            } else {
+                (*key).clone()
+            };
+            for metric in ctprof_compare::CTPROF_METRICS {
                 // `--metrics` filter: skip metrics not on the
                 // operator-supplied allowlist. Empty allowlist
                 // = no filter (default) per
@@ -954,15 +951,15 @@ fn write_show<W: std::fmt::Write>(
                 let Some(agg) = group.metrics.get(metric.name) else {
                     continue;
                 };
-                let metric_name = host_state_compare::metric_display_name(metric).into_owned();
-                let value_cell = host_state_compare::format_value_cell(agg, metric.rule.ladder());
+                let metric_name = ctprof_compare::metric_display_name(metric).into_owned();
+                let value_cell = ctprof_compare::format_value_cell(agg, metric.rule.ladder());
                 let cells: Vec<String> = resolved_columns
                     .iter()
                     .map(|c| match c {
-                        host_state_compare::Column::Group => display_key.clone(),
-                        host_state_compare::Column::Threads => group.thread_count.to_string(),
-                        host_state_compare::Column::Metric => metric_name.clone(),
-                        host_state_compare::Column::Value => value_cell.clone(),
+                        ctprof_compare::Column::Group => display_key.clone(),
+                        ctprof_compare::Column::Threads => group.thread_count.to_string(),
+                        ctprof_compare::Column::Metric => metric_name.clone(),
+                        ctprof_compare::Column::Value => value_cell.clone(),
                         // Compare-only columns never reach here under
                         // run_show: parse_columns(compare_side=false)
                         // rejects them at CLI parse time. Surface a
@@ -979,12 +976,10 @@ fn write_show<W: std::fmt::Write>(
 
     // Derived metrics: one row per (group, derivation) pair.
     // Mirrors the `## Derived metrics` section emitted by
-    // host_state_compare::write_diff but adapted for the
+    // ctprof_compare::write_diff but adapted for the
     // single-snapshot show layout (no baseline/candidate split,
     // one value cell per row).
-    if display_options.is_section_enabled(host_state_compare::Section::Derived)
-        && !groups.is_empty()
-    {
+    if display_options.is_section_enabled(ctprof_compare::Section::Derived) && !groups.is_empty() {
         let mut dt = display_options.new_table();
         let header_row: Vec<&str> = resolved_columns
             .iter()
@@ -996,29 +991,26 @@ fn write_show<W: std::fmt::Write>(
         // every section emitted afterwards.
         for key in &group_order {
             let group = &groups[*key];
-            let display_key =
-                if group_by == host_state_compare::GroupBy::Comm && !no_thread_normalize {
-                    host_state_compare::pattern_display_label(key, &group.member_comms)
-                } else {
-                    (*key).clone()
-                };
-            for d in host_state_compare::HOST_STATE_DERIVED_METRICS {
+            let display_key = if group_by == ctprof_compare::GroupBy::Comm && !no_thread_normalize {
+                ctprof_compare::pattern_display_label(key, &group.member_comms)
+            } else {
+                (*key).clone()
+            };
+            for d in ctprof_compare::CTPROF_DERIVED_METRICS {
                 if !display_options.is_metric_enabled(d.name) {
                     continue;
                 }
                 let value_cell = match (d.compute)(&group.metrics) {
-                    Some(v) => {
-                        host_state_compare::format_derived_value_cell(v, d.ladder, d.is_ratio)
-                    }
+                    Some(v) => ctprof_compare::format_derived_value_cell(v, d.ladder, d.is_ratio),
                     None => "-".to_string(),
                 };
                 let cells: Vec<String> = resolved_columns
                     .iter()
                     .map(|c| match c {
-                        host_state_compare::Column::Group => display_key.clone(),
-                        host_state_compare::Column::Threads => group.thread_count.to_string(),
-                        host_state_compare::Column::Metric => d.name.to_string(),
-                        host_state_compare::Column::Value => value_cell.clone(),
+                        ctprof_compare::Column::Group => display_key.clone(),
+                        ctprof_compare::Column::Threads => group.thread_count.to_string(),
+                        ctprof_compare::Column::Metric => d.name.to_string(),
+                        ctprof_compare::Column::Value => value_cell.clone(),
                         _ => "-".to_string(),
                     })
                     .collect();
@@ -1037,14 +1029,14 @@ fn write_show<W: std::fmt::Write>(
     // re-checked per sub-table below so a user can request
     // `--sections pressure` and get only the PSI rollups even
     // though the cgroup-stats prefix is present in the snapshot.
-    if group_by == host_state_compare::GroupBy::Cgroup && !snap.cgroup_stats.is_empty() {
-        let stats = host_state_compare::flatten_cgroup_stats(
+    if group_by == ctprof_compare::GroupBy::Cgroup && !snap.cgroup_stats.is_empty() {
+        let stats = ctprof_compare::flatten_cgroup_stats(
             &snap.cgroup_stats,
             &flatten,
             cgroup_key_map.as_ref(),
         );
         if !stats.is_empty() {
-            if display_options.is_section_enabled(host_state_compare::Section::CgroupStats) {
+            if display_options.is_section_enabled(ctprof_compare::Section::CgroupStats) {
                 writeln!(w)?;
                 let mut ct = display_options.new_table();
                 ct.set_header(vec![
@@ -1070,21 +1062,21 @@ fn write_show<W: std::fmt::Write>(
                 for (key, s) in &stats {
                     ct.add_row(vec![
                         key.clone(),
-                        host_state_compare::format_scaled_u64(
+                        ctprof_compare::format_scaled_u64(
                             s.cpu.usage_usec,
-                            host_state_compare::ScaleLadder::Us,
+                            ctprof_compare::ScaleLadder::Us,
                         ),
-                        host_state_compare::format_scaled_u64(
+                        ctprof_compare::format_scaled_u64(
                             s.cpu.nr_throttled,
-                            host_state_compare::ScaleLadder::Unitless,
+                            ctprof_compare::ScaleLadder::Unitless,
                         ),
-                        host_state_compare::format_scaled_u64(
+                        ctprof_compare::format_scaled_u64(
                             s.cpu.throttled_usec,
-                            host_state_compare::ScaleLadder::Us,
+                            ctprof_compare::ScaleLadder::Us,
                         ),
-                        host_state_compare::format_scaled_u64(
+                        ctprof_compare::format_scaled_u64(
                             s.memory.current,
-                            host_state_compare::ScaleLadder::Bytes,
+                            ctprof_compare::ScaleLadder::Bytes,
                         ),
                     ]);
                 }
@@ -1101,7 +1093,7 @@ fn write_show<W: std::fmt::Write>(
             // cgroup in the bucket exposes any of these (root
             // cgroup, or a host without pids/memory controllers
             // enabled).
-            if display_options.is_section_enabled(host_state_compare::Section::Limits)
+            if display_options.is_section_enabled(ctprof_compare::Section::Limits)
                 && stats.values().any(|s| {
                     s.cpu.max_quota_us.is_some()
                         || s.cpu.weight.is_some()
@@ -1141,36 +1133,36 @@ fn write_show<W: std::fmt::Write>(
                     }
                     lt.add_row(vec![
                         key.clone(),
-                        host_state_compare::format_cpu_max(s.cpu.max_quota_us, s.cpu.max_period_us),
+                        ctprof_compare::format_cpu_max(s.cpu.max_quota_us, s.cpu.max_period_us),
                         s.cpu
                             .weight
                             .map(|v| {
-                                host_state_compare::format_scaled_u64(
+                                ctprof_compare::format_scaled_u64(
                                     v,
-                                    host_state_compare::ScaleLadder::Unitless,
+                                    ctprof_compare::ScaleLadder::Unitless,
                                 )
                             })
                             .unwrap_or_else(|| "-".to_string()),
-                        host_state_compare::format_optional_limit(
+                        ctprof_compare::format_optional_limit(
                             s.memory.max,
-                            host_state_compare::ScaleLadder::Bytes,
+                            ctprof_compare::ScaleLadder::Bytes,
                         ),
-                        host_state_compare::format_optional_limit(
+                        ctprof_compare::format_optional_limit(
                             s.memory.high,
-                            host_state_compare::ScaleLadder::Bytes,
+                            ctprof_compare::ScaleLadder::Bytes,
                         ),
                         s.pids
                             .current
                             .map(|v| {
-                                host_state_compare::format_scaled_u64(
+                                ctprof_compare::format_scaled_u64(
                                     v,
-                                    host_state_compare::ScaleLadder::Unitless,
+                                    ctprof_compare::ScaleLadder::Unitless,
                                 )
                             })
                             .unwrap_or_else(|| "-".to_string()),
-                        host_state_compare::format_optional_limit(
+                        ctprof_compare::format_optional_limit(
                             s.pids.max,
-                            host_state_compare::ScaleLadder::Unitless,
+                            ctprof_compare::ScaleLadder::Unitless,
                         ),
                     ]);
                 }
@@ -1192,7 +1184,7 @@ fn write_show<W: std::fmt::Write>(
             // section still renders if any cgroup has any
             // non-zero key. This trims output ~10x for typical
             // runs.
-            if display_options.is_section_enabled(host_state_compare::Section::MemoryStat)
+            if display_options.is_section_enabled(ctprof_compare::Section::MemoryStat)
                 && stats
                     .values()
                     .any(|s| s.memory.stat.values().any(|v| *v != 0))
@@ -1209,9 +1201,9 @@ fn write_show<W: std::fmt::Write>(
                         mt.add_row(vec![
                             key.clone(),
                             stat_key.clone(),
-                            host_state_compare::format_scaled_u64(
+                            ctprof_compare::format_scaled_u64(
                                 *stat_value,
-                                host_state_compare::ScaleLadder::Unitless,
+                                ctprof_compare::ScaleLadder::Unitless,
                             ),
                         ]);
                     }
@@ -1223,7 +1215,7 @@ fn write_show<W: std::fmt::Write>(
             // counters (low / high / max / oom / oom_kill etc.).
             // Same long-table layout as memory.stat with the
             // same zero-row suppression.
-            if display_options.is_section_enabled(host_state_compare::Section::MemoryEvents)
+            if display_options.is_section_enabled(ctprof_compare::Section::MemoryEvents)
                 && stats
                     .values()
                     .any(|s| s.memory.events.values().any(|v| *v != 0))
@@ -1240,9 +1232,9 @@ fn write_show<W: std::fmt::Write>(
                         et.add_row(vec![
                             key.clone(),
                             event_key.clone(),
-                            host_state_compare::format_scaled_u64(
+                            ctprof_compare::format_scaled_u64(
                                 *event_value,
-                                host_state_compare::ScaleLadder::Unitless,
+                                ctprof_compare::ScaleLadder::Unitless,
                             ),
                         ]);
                     }
@@ -1263,7 +1255,7 @@ fn write_show<W: std::fmt::Write>(
             // mirrors the compare-side write_diff path: skip a
             // resource sub-table when no cgroup in the bucket
             // has any non-zero data for it.
-            if display_options.is_section_enabled(host_state_compare::Section::Pressure) {
+            if display_options.is_section_enabled(ctprof_compare::Section::Pressure) {
                 for (resource_name, accessor) in psi_resources() {
                     let any_data = stats.values().any(|s| {
                         let r = accessor(&s.psi);
@@ -1284,9 +1276,9 @@ fn write_show<W: std::fmt::Write>(
                             format_psi_avg(r.some.avg10),
                             format_psi_avg(r.some.avg60),
                             format_psi_avg(r.some.avg300),
-                            host_state_compare::format_scaled_u64(
+                            ctprof_compare::format_scaled_u64(
                                 r.some.total_usec,
-                                host_state_compare::ScaleLadder::Us,
+                                ctprof_compare::ScaleLadder::Us,
                             ),
                         ]);
                         pt.add_row(vec![
@@ -1295,9 +1287,9 @@ fn write_show<W: std::fmt::Write>(
                             format_psi_avg(r.full.avg10),
                             format_psi_avg(r.full.avg60),
                             format_psi_avg(r.full.avg300),
-                            host_state_compare::format_scaled_u64(
+                            ctprof_compare::format_scaled_u64(
                                 r.full.total_usec,
-                                host_state_compare::ScaleLadder::Us,
+                                ctprof_compare::ScaleLadder::Us,
                             ),
                         ]);
                     }
@@ -1311,7 +1303,7 @@ fn write_show<W: std::fmt::Write>(
     // any resource has nonzero data. Renders as four per-resource
     // sub-tables (cpu / memory / io / irq) with a `some`+`full`
     // row each, matching the per-cgroup layout above.
-    if display_options.is_section_enabled(host_state_compare::Section::HostPressure)
+    if display_options.is_section_enabled(ctprof_compare::Section::HostPressure)
         && host_psi_has_data(&snap.psi)
     {
         for (resource_name, accessor) in psi_resources() {
@@ -1328,9 +1320,9 @@ fn write_show<W: std::fmt::Write>(
                 format_psi_avg(r.some.avg10),
                 format_psi_avg(r.some.avg60),
                 format_psi_avg(r.some.avg300),
-                host_state_compare::format_scaled_u64(
+                ctprof_compare::format_scaled_u64(
                     r.some.total_usec,
-                    host_state_compare::ScaleLadder::Us,
+                    ctprof_compare::ScaleLadder::Us,
                 ),
             ]);
             pt.add_row(vec![
@@ -1338,9 +1330,9 @@ fn write_show<W: std::fmt::Write>(
                 format_psi_avg(r.full.avg10),
                 format_psi_avg(r.full.avg60),
                 format_psi_avg(r.full.avg300),
-                host_state_compare::format_scaled_u64(
+                ctprof_compare::format_scaled_u64(
                     r.full.total_usec,
-                    host_state_compare::ScaleLadder::Us,
+                    ctprof_compare::ScaleLadder::Us,
                 ),
             ]);
             writeln!(w, "{pt}")?;
@@ -1362,12 +1354,8 @@ fn write_show<W: std::fmt::Write>(
     // ShmemPmdMapped=0 etc. are noise rows. kB→B conversion
     // for the auto_scale "B" ladder lives in
     // [`ThreadState::smaps_rollup_bytes`].
-    if display_options.is_section_enabled(host_state_compare::Section::Smaps) {
-        let smaps_rows: Vec<(
-            &host_state::ThreadState,
-            &String,
-            ktstr::metric_types::Bytes,
-        )> = snap
+    if display_options.is_section_enabled(ctprof_compare::Section::Smaps) {
+        let smaps_rows: Vec<(&ctprof::ThreadState, &String, ktstr::metric_types::Bytes)> = snap
             .threads
             .iter()
             .filter(|t| !t.smaps_rollup_kb.is_empty())
@@ -1386,10 +1374,7 @@ fn write_show<W: std::fmt::Write>(
                 st.add_row(vec![
                     format!("{}[{}]", t.pcomm, t.tgid),
                     (*key).clone(),
-                    host_state_compare::format_scaled_u64(
-                        bytes.0,
-                        host_state_compare::ScaleLadder::Bytes,
-                    ),
+                    ctprof_compare::format_scaled_u64(bytes.0, ctprof_compare::ScaleLadder::Bytes),
                 ]);
             }
             writeln!(w, "{st}")?;
@@ -1400,7 +1385,7 @@ fn write_show<W: std::fmt::Write>(
     // snapshot's `sched_ext` field is None (CONFIG_SCHED_CLASS_EXT=n
     // build, or sysfs directory absent). Single 5-row table
     // mirroring the kernel's exposed scx_global_attrs[] surface.
-    if display_options.is_section_enabled(host_state_compare::Section::SchedExt)
+    if display_options.is_section_enabled(ctprof_compare::Section::SchedExt)
         && let Some(scx) = &snap.sched_ext
     {
         writeln!(w)?;
@@ -1419,30 +1404,30 @@ fn write_show<W: std::fmt::Write>(
         at.add_row(vec!["state".into(), state_cell]);
         at.add_row(vec![
             "switch_all".into(),
-            host_state_compare::format_scaled_u64(
+            ctprof_compare::format_scaled_u64(
                 scx.switch_all,
-                host_state_compare::ScaleLadder::Unitless,
+                ctprof_compare::ScaleLadder::Unitless,
             ),
         ]);
         at.add_row(vec![
             "nr_rejected".into(),
-            host_state_compare::format_scaled_u64(
+            ctprof_compare::format_scaled_u64(
                 scx.nr_rejected,
-                host_state_compare::ScaleLadder::Unitless,
+                ctprof_compare::ScaleLadder::Unitless,
             ),
         ]);
         at.add_row(vec![
             "hotplug_seq".into(),
-            host_state_compare::format_scaled_u64(
+            ctprof_compare::format_scaled_u64(
                 scx.hotplug_seq,
-                host_state_compare::ScaleLadder::Unitless,
+                ctprof_compare::ScaleLadder::Unitless,
             ),
         ]);
         at.add_row(vec![
             "enable_seq".into(),
-            host_state_compare::format_scaled_u64(
+            ctprof_compare::format_scaled_u64(
                 scx.enable_seq,
-                host_state_compare::ScaleLadder::Unitless,
+                ctprof_compare::ScaleLadder::Unitless,
             ),
         ]);
         writeln!(w, "{at}")?;
@@ -1453,12 +1438,9 @@ fn write_show<W: std::fmt::Write>(
 
 /// One entry in the [`psi_resources`] table — a display name
 /// paired with the accessor that pulls one
-/// [`host_state::PsiResource`] out of a [`host_state::Psi`]
+/// [`ctprof::PsiResource`] out of a [`ctprof::Psi`]
 /// bundle.
-type PsiAccessor = (
-    &'static str,
-    fn(&host_state::Psi) -> host_state::PsiResource,
-);
+type PsiAccessor = (&'static str, fn(&ctprof::Psi) -> ctprof::PsiResource);
 
 /// Returns the four PSI resource accessors paired with their
 /// display names. Centralizing the resource list keeps the
@@ -1487,16 +1469,15 @@ fn format_psi_avg(centi_percent: u16) -> String {
 /// avg or total reading. Used to suppress the host pressure
 /// section when the kernel returned all zeros (CONFIG_PSI off,
 /// PSI not yet warmed up, or synthetic test fixture).
-fn host_psi_has_data(psi: &host_state::Psi) -> bool {
+fn host_psi_has_data(psi: &ctprof::Psi) -> bool {
     [psi.cpu, psi.memory, psi.io, psi.irq]
         .iter()
         .any(psi_resource_has_data)
 }
 
-fn psi_resource_has_data(r: &host_state::PsiResource) -> bool {
-    let h = |h: &host_state::PsiHalf| {
-        h.avg10 != 0 || h.avg60 != 0 || h.avg300 != 0 || h.total_usec != 0
-    };
+fn psi_resource_has_data(r: &ctprof::PsiResource) -> bool {
+    let h =
+        |h: &ctprof::PsiHalf| h.avg10 != 0 || h.avg60 != 0 || h.avg300 != 0 || h.total_usec != 0;
     h(&r.some) || h(&r.full)
 }
 
@@ -1513,7 +1494,7 @@ mod psi_show_tests {
     //! pinpointed assertion rather than a rendered-output
     //! diff.
     use super::*;
-    use ktstr::host_state::{Psi, PsiHalf, PsiResource};
+    use ktstr::ctprof::{Psi, PsiHalf, PsiResource};
 
     #[test]
     fn format_psi_avg_renders_centi_percent_with_two_decimal_digits() {
@@ -1540,7 +1521,7 @@ mod psi_show_tests {
     /// distinct compilation unit from the lib, so the
     /// `#[non_exhaustive]` markers on `Psi` / `PsiResource` /
     /// `PsiHalf` block struct-literal construction here — same
-    /// constraint that drives `tests/common/host_state.rs`'s
+    /// constraint that drives `tests/common/ctprof.rs`'s
     /// Default + per-field assignment pattern.
     fn psi_resource_with_some_avg10(v: u16) -> PsiResource {
         let mut half = PsiHalf::default();
@@ -1855,25 +1836,25 @@ fn main() -> Result<()> {
             )?;
         }
 
-        Command::HostState { command } => match command {
-            HostStateCommand::Capture { output } => {
-                host_state::capture_to(&output)?;
-                eprintln!("ktstr: wrote host-state snapshot to {}", output.display());
+        Command::Ctprof { command } => match command {
+            CtprofCommand::Capture { output } => {
+                ctprof::capture_to(&output)?;
+                eprintln!("ktstr: wrote ctprof snapshot to {}", output.display());
             }
-            HostStateCommand::Compare(args) => {
-                let code = host_state_compare::run_compare(&args)?;
+            CtprofCommand::Compare(args) => {
+                let code = ctprof_compare::run_compare(&args)?;
                 if code != 0 {
                     std::process::exit(code);
                 }
             }
-            HostStateCommand::Show(args) => {
+            CtprofCommand::Show(args) => {
                 let code = run_show(&args)?;
                 if code != 0 {
                     std::process::exit(code);
                 }
             }
-            HostStateCommand::MetricList => {
-                let code = host_state_compare::run_metric_list()?;
+            CtprofCommand::MetricList => {
+                let code = ctprof_compare::run_metric_list()?;
                 if code != 0 {
                     std::process::exit(code);
                 }
@@ -1969,7 +1950,7 @@ mod tests {
         }
     }
 
-    // -- host-state show CLI tests
+    // -- ctprof show CLI tests
     //
     // Pin clap-parse shape on the `Show` variant + the rendered
     // output of `write_show` against a synthetic snapshot. The
@@ -1978,19 +1959,22 @@ mod tests {
     // write_show tests guard the rendered table against
     // regressions in column count, header, and group-axis routing.
 
-    /// `ktstr host-state show <path>` with no flags must parse
+    /// `ktstr ctprof show <path>` with no flags must parse
     /// into a Show variant carrying the positional path and
     /// default GroupBy::Pcomm. Positive-path pin for argv shape.
     #[test]
-    fn parse_host_state_show_positional_only_succeeds() {
-        let parsed = Cli::try_parse_from(["ktstr", "host-state", "show", "/tmp/snap.hst.zst"])
+    fn parse_ctprof_show_positional_only_succeeds() {
+        let parsed = Cli::try_parse_from(["ktstr", "ctprof", "show", "/tmp/snap.ctprof.zst"])
             .unwrap_or_else(|e| panic!("{e}"));
         match parsed.command {
-            Command::HostState {
-                command: HostStateCommand::Show(args),
+            Command::Ctprof {
+                command: CtprofCommand::Show(args),
             } => {
-                assert_eq!(args.snapshot, std::path::PathBuf::from("/tmp/snap.hst.zst"));
-                assert_eq!(args.group_by, host_state_compare::GroupBy::Pcomm);
+                assert_eq!(
+                    args.snapshot,
+                    std::path::PathBuf::from("/tmp/snap.ctprof.zst")
+                );
+                assert_eq!(args.group_by, ctprof_compare::GroupBy::Pcomm);
                 assert!(args.cgroup_flatten.is_empty());
                 assert!(!args.no_thread_normalize);
                 assert!(!args.no_cg_normalize);
@@ -1999,21 +1983,21 @@ mod tests {
                 // alphabetical iteration".
                 assert!(args.sort_by.is_empty());
             }
-            _ => panic!("expected HostState/Show"),
+            _ => panic!("expected Ctprof/Show"),
         }
     }
 
     /// `--group-by`, `--cgroup-flatten`, `--no-thread-normalize`,
     /// `--no-cg-normalize`, and `--sort-by` propagate from clap
-    /// into the `HostStateShowArgs` struct unchanged. Pins the
+    /// into the `CtprofShowArgs` struct unchanged. Pins the
     /// parse shape for every flag the show subcommand surfaces.
     #[test]
-    fn parse_host_state_show_with_every_flag_succeeds() {
+    fn parse_ctprof_show_with_every_flag_succeeds() {
         let parsed = Cli::try_parse_from([
             "ktstr",
-            "host-state",
+            "ctprof",
             "show",
-            "/tmp/snap.hst.zst",
+            "/tmp/snap.ctprof.zst",
             "--group-by",
             "comm",
             "--cgroup-flatten",
@@ -2025,10 +2009,10 @@ mod tests {
         ])
         .unwrap_or_else(|e| panic!("{e}"));
         match parsed.command {
-            Command::HostState {
-                command: HostStateCommand::Show(args),
+            Command::Ctprof {
+                command: CtprofCommand::Show(args),
             } => {
-                assert_eq!(args.group_by, host_state_compare::GroupBy::Comm);
+                assert_eq!(args.group_by, ctprof_compare::GroupBy::Comm);
                 assert_eq!(
                     args.cgroup_flatten,
                     vec!["/kubepods/*/workload".to_string()]
@@ -2040,119 +2024,122 @@ mod tests {
                 // and runs in `run_show`, not at clap parse time.
                 assert_eq!(args.sort_by, "run_time_ns:desc,wait_sum:asc");
             }
-            _ => panic!("expected HostState/Show"),
+            _ => panic!("expected Ctprof/Show"),
         }
     }
 
-    /// `ktstr host-state show <path> --sort-by run_time_ns` parses
+    /// `ktstr ctprof show <path> --sort-by run_time_ns` parses
     /// successfully with the spec stored verbatim on
-    /// `HostStateShowArgs::sort_by`. Single-key, default-direction
+    /// `CtprofShowArgs::sort_by`. Single-key, default-direction
     /// pin — the unmarked form ("--sort-by metric" without a `:dir`
     /// suffix) routes through `parse_sort_by`'s `None` arm in
     /// `run_show` and ranks descending.
     #[test]
-    fn parse_host_state_show_sort_by_single_key_succeeds() {
+    fn parse_ctprof_show_sort_by_single_key_succeeds() {
         let parsed = Cli::try_parse_from([
             "ktstr",
-            "host-state",
+            "ctprof",
             "show",
-            "/tmp/snap.hst.zst",
+            "/tmp/snap.ctprof.zst",
             "--sort-by",
             "run_time_ns",
         ])
         .unwrap_or_else(|e| panic!("{e}"));
         match parsed.command {
-            Command::HostState {
-                command: HostStateCommand::Show(args),
+            Command::Ctprof {
+                command: CtprofCommand::Show(args),
             } => {
                 assert_eq!(args.sort_by, "run_time_ns");
             }
-            _ => panic!("expected HostState/Show"),
+            _ => panic!("expected Ctprof/Show"),
         }
     }
 
-    // -- host-state compare CLI --sort-by clap-parse pins
+    // -- ctprof compare CLI --sort-by clap-parse pins
     //
     // Mirror of the show-side parse tests above for the compare
     // subcommand. Pins that the `--sort-by` flag clap-parses
-    // into `HostStateCompareArgs::sort_by` as a raw String
+    // into `CtprofCompareArgs::sort_by` as a raw String
     // (parsing through `parse_sort_by` happens later, in
     // `run_compare`). A regression that drops the field or
     // re-types it as `Vec<String>` (e.g. a misguided "make it
     // repeatable" refactor) would surface here at parse time.
-    /// `ktstr host-state compare <a> <b>` with no `--sort-by`
+    /// `ktstr ctprof compare <a> <b>` with no `--sort-by`
     /// must parse with `sort_by` defaulting to the empty string.
     /// Positive-path pin for the default-sentinel contract.
     #[test]
-    fn parse_host_state_compare_sort_by_defaults_to_empty() {
+    fn parse_ctprof_compare_sort_by_defaults_to_empty() {
         let parsed = Cli::try_parse_from([
             "ktstr",
-            "host-state",
+            "ctprof",
             "compare",
-            "/tmp/a.hst.zst",
-            "/tmp/b.hst.zst",
+            "/tmp/a.ctprof.zst",
+            "/tmp/b.ctprof.zst",
         ])
         .unwrap_or_else(|e| panic!("{e}"));
         match parsed.command {
-            Command::HostState {
-                command: HostStateCommand::Compare(args),
+            Command::Ctprof {
+                command: CtprofCommand::Compare(args),
             } => {
-                assert_eq!(args.baseline, std::path::PathBuf::from("/tmp/a.hst.zst"));
-                assert_eq!(args.candidate, std::path::PathBuf::from("/tmp/b.hst.zst"));
+                assert_eq!(args.baseline, std::path::PathBuf::from("/tmp/a.ctprof.zst"));
+                assert_eq!(
+                    args.candidate,
+                    std::path::PathBuf::from("/tmp/b.ctprof.zst")
+                );
                 // `--sort-by` defaults to the empty string —
                 // parse_sort_by treats this as the "fall through
                 // to default delta_pct sort" sentinel.
                 assert!(args.sort_by.is_empty());
             }
-            _ => panic!("expected HostState/Compare"),
+            _ => panic!("expected Ctprof/Compare"),
         }
     }
 
-    /// `ktstr host-state compare <a> <b> --sort-by <spec>` parses
-    /// the spec verbatim into `HostStateCompareArgs::sort_by`.
+    /// `ktstr ctprof compare <a> <b> --sort-by <spec>` parses
+    /// the spec verbatim into `CtprofCompareArgs::sort_by`.
     /// Pins that clap stores the raw string — `parse_sort_by`'s
     /// validation is deferred to `run_compare`, not parse time.
     /// Use a multi-key spec with mixed directions to exercise
     /// every parser feature reachable through clap.
     #[test]
-    fn parse_host_state_compare_with_sort_by_succeeds() {
+    fn parse_ctprof_compare_with_sort_by_succeeds() {
         let parsed = Cli::try_parse_from([
             "ktstr",
-            "host-state",
+            "ctprof",
             "compare",
-            "/tmp/a.hst.zst",
-            "/tmp/b.hst.zst",
+            "/tmp/a.ctprof.zst",
+            "/tmp/b.ctprof.zst",
             "--sort-by",
             "run_time_ns:desc,wait_time_ns:asc",
         ])
         .unwrap_or_else(|e| panic!("{e}"));
         match parsed.command {
-            Command::HostState {
-                command: HostStateCommand::Compare(args),
+            Command::Ctprof {
+                command: CtprofCommand::Compare(args),
             } => {
                 assert_eq!(args.sort_by, "run_time_ns:desc,wait_time_ns:asc");
             }
-            _ => panic!("expected HostState/Compare"),
+            _ => panic!("expected Ctprof/Compare"),
         }
     }
 
     /// `--group-by`, `--cgroup-flatten`, `--no-thread-normalize`,
     /// `--no-cg-normalize`, and `--sort-by` propagate from clap
-    /// into the `HostStateCompareArgs` struct unchanged. Mirror
-    /// of `parse_host_state_show_with_every_flag_succeeds` for
+    /// into the `CtprofCompareArgs` struct unchanged. Mirror
+    /// of `parse_ctprof_show_with_every_flag_succeeds` for
     /// the compare subcommand — pins the parse shape for every
     /// flag the compare subcommand surfaces. A regression that
     /// drops a flag from the clap struct or re-types a field
     /// (e.g. `--sort-by` to `Vec<String>`) would surface here at
     /// parse time before reaching `run_compare`.
     #[test]
-    fn parse_host_state_compare_with_every_flag() {
+    fn parse_ctprof_compare_with_every_flag() {
         let parsed = Cli::try_parse_from([
             "ktstr",
-            "host-state",
+            "ctprof",
             "compare",
-            "/tmp/a.hst.zst",
-            "/tmp/b.hst.zst",
+            "/tmp/a.ctprof.zst",
+            "/tmp/b.ctprof.zst",
             "--group-by",
             "comm",
             "--cgroup-flatten",
@@ -2164,12 +2151,15 @@ mod tests {
         ])
         .unwrap_or_else(|e| panic!("{e}"));
         match parsed.command {
-            Command::HostState {
-                command: HostStateCommand::Compare(args),
+            Command::Ctprof {
+                command: CtprofCommand::Compare(args),
             } => {
-                assert_eq!(args.baseline, std::path::PathBuf::from("/tmp/a.hst.zst"));
-                assert_eq!(args.candidate, std::path::PathBuf::from("/tmp/b.hst.zst"));
-                assert_eq!(args.group_by, host_state_compare::GroupBy::Comm);
+                assert_eq!(args.baseline, std::path::PathBuf::from("/tmp/a.ctprof.zst"));
+                assert_eq!(
+                    args.candidate,
+                    std::path::PathBuf::from("/tmp/b.ctprof.zst")
+                );
+                assert_eq!(args.group_by, ctprof_compare::GroupBy::Comm);
                 assert_eq!(
                     args.cgroup_flatten,
                     vec!["/kubepods/*/workload".to_string()]
@@ -2181,7 +2171,7 @@ mod tests {
                 // and runs in `run_compare`, not at clap parse time.
                 assert_eq!(args.sort_by, "run_time_ns:desc,wait_sum:asc");
             }
-            _ => panic!("expected HostState/Compare"),
+            _ => panic!("expected Ctprof/Compare"),
         }
     }
 
@@ -2194,7 +2184,7 @@ mod tests {
     /// metric would surface here.
     #[test]
     fn write_show_renders_pcomm_grouping_with_expected_columns() {
-        let mut snap = ktstr::host_state::HostStateSnapshot::default();
+        let mut snap = ktstr::ctprof::CtprofSnapshot::default();
         // Two threads under the same pcomm so the bucket has
         // size 2 — verifies the threads column reflects bucket
         // size, not snapshot total. Use a unitless cumulative
@@ -2206,11 +2196,11 @@ mod tests {
         // (""→K→M→G) only steps up at 1e3, so `3000` (>= 1e3)
         // would also scale to `3.000K`. Pick small values
         // (1+2=3) so no scaling fires regardless of unit.
-        let mut t1 = ktstr::host_state::ThreadState::default();
+        let mut t1 = ktstr::ctprof::ThreadState::default();
         t1.pcomm = "worker-proc".to_string();
         t1.comm = "worker-0".to_string();
         t1.nr_wakeups = MonotonicCount(1);
-        let mut t2 = ktstr::host_state::ThreadState::default();
+        let mut t2 = ktstr::ctprof::ThreadState::default();
         t2.pcomm = "worker-proc".to_string();
         t2.comm = "worker-1".to_string();
         t2.nr_wakeups = MonotonicCount(2);
@@ -2221,7 +2211,7 @@ mod tests {
         write_show(
             &mut out,
             &snap,
-            host_state_compare::GroupBy::Pcomm,
+            ctprof_compare::GroupBy::Pcomm,
             &[],
             false,
             false,
@@ -2270,15 +2260,15 @@ mod tests {
     /// for `GroupBy::Comm`, `comm` for `GroupBy::CommExact`,
     /// `cgroup` for `GroupBy::Cgroup`, `pcomm` for the default.
     /// Pins the routing in `write_show`'s match arm against
-    /// vocabulary drift between this and `host_state_compare`.
+    /// vocabulary drift between this and `ctprof_compare`.
     #[test]
     fn write_show_header_switches_on_group_by() {
-        let snap = ktstr::host_state::HostStateSnapshot::default();
+        let snap = ktstr::ctprof::CtprofSnapshot::default();
         for (axis, expected_header) in [
-            (host_state_compare::GroupBy::Pcomm, "pcomm"),
-            (host_state_compare::GroupBy::Cgroup, "cgroup"),
-            (host_state_compare::GroupBy::Comm, "comm-pattern"),
-            (host_state_compare::GroupBy::CommExact, "comm"),
+            (ctprof_compare::GroupBy::Pcomm, "pcomm"),
+            (ctprof_compare::GroupBy::Cgroup, "cgroup"),
+            (ctprof_compare::GroupBy::Comm, "comm-pattern"),
+            (ctprof_compare::GroupBy::CommExact, "comm"),
         ] {
             let mut out = String::new();
             write_show(
@@ -2309,12 +2299,12 @@ mod tests {
     /// path is the single-snap one).
     #[test]
     fn write_show_empty_snapshot_renders_header_only() {
-        let snap = ktstr::host_state::HostStateSnapshot::default();
+        let snap = ktstr::ctprof::CtprofSnapshot::default();
         let mut out = String::new();
         write_show(
             &mut out,
             &snap,
-            host_state_compare::GroupBy::Pcomm,
+            ctprof_compare::GroupBy::Pcomm,
             &[],
             false,
             false,
@@ -2330,7 +2320,7 @@ mod tests {
             "empty snapshot must still emit the header, got: {out}",
         );
         // Run-time metric does not appear because no thread
-        // contributed it — the `for metric in HOST_STATE_METRICS`
+        // contributed it — the `for metric in CTPROF_METRICS`
         // loop emits no rows when `groups` is empty.
         assert!(
             !out.contains("run_time_ns"),
@@ -2349,16 +2339,16 @@ mod tests {
     /// first-group cell.
     #[test]
     fn write_show_sort_by_orders_groups_by_metric_descending() {
-        let mut snap = ktstr::host_state::HostStateSnapshot::default();
-        let mut t_alpha = ktstr::host_state::ThreadState::default();
+        let mut snap = ktstr::ctprof::CtprofSnapshot::default();
+        let mut t_alpha = ktstr::ctprof::ThreadState::default();
         t_alpha.pcomm = "alpha".to_string();
         t_alpha.comm = "alpha-w".to_string();
         t_alpha.run_time_ns = MonotonicNs(100);
-        let mut t_bravo = ktstr::host_state::ThreadState::default();
+        let mut t_bravo = ktstr::ctprof::ThreadState::default();
         t_bravo.pcomm = "bravo".to_string();
         t_bravo.comm = "bravo-w".to_string();
         t_bravo.run_time_ns = MonotonicNs(500);
-        let mut t_charlie = ktstr::host_state::ThreadState::default();
+        let mut t_charlie = ktstr::ctprof::ThreadState::default();
         t_charlie.pcomm = "charlie".to_string();
         t_charlie.comm = "charlie-w".to_string();
         t_charlie.run_time_ns = MonotonicNs(250);
@@ -2366,7 +2356,7 @@ mod tests {
         snap.threads.push(t_bravo);
         snap.threads.push(t_charlie);
 
-        let sort_by = vec![host_state_compare::SortKey {
+        let sort_by = vec![ctprof_compare::SortKey {
             metric: "run_time_ns",
             descending: true,
         }];
@@ -2374,7 +2364,7 @@ mod tests {
         write_show(
             &mut out,
             &snap,
-            host_state_compare::GroupBy::Pcomm,
+            ctprof_compare::GroupBy::Pcomm,
             &[],
             false,
             false,
@@ -2414,14 +2404,14 @@ mod tests {
     /// row reads `7.500GiB`, not `7.500GiB → 7.500GiB (+0B)`.
     #[test]
     fn write_show_cgroup_stats_renders_single_value_no_delta() {
-        let mut snap = ktstr::host_state::HostStateSnapshot::default();
+        let mut snap = ktstr::ctprof::CtprofSnapshot::default();
         // Cgroup grouping requires at least one thread carrying
         // the cgroup path so build_groups produces a bucket; the
         // secondary table renders for every cgroup_stats key
         // regardless, but the primary table needs a row to
         // surround it (write_show returns Ok early only for an
         // empty cgroup_stats map, not an empty groups map).
-        let mut t = ktstr::host_state::ThreadState::default();
+        let mut t = ktstr::ctprof::ThreadState::default();
         t.pcomm = "worker".to_string();
         t.comm = "w".to_string();
         t.cgroup = "/app".to_string();
@@ -2437,9 +2427,9 @@ mod tests {
         // `CgroupStats` is `#[non_exhaustive]`, so direct struct
         // construction is rejected outside its defining module
         // (the `ktstr` binary is a separate translation unit
-        // from `host_state`). Build via Default + per-field
+        // from `ctprof`). Build via Default + per-field
         // assignment instead.
-        let mut cgs = ktstr::host_state::CgroupStats::default();
+        let mut cgs = ktstr::ctprof::CgroupStats::default();
         cgs.cpu.usage_usec = 1_500_000;
         cgs.cpu.nr_throttled = 50;
         cgs.cpu.throttled_usec = 200;
@@ -2450,7 +2440,7 @@ mod tests {
         write_show(
             &mut out,
             &snap,
-            host_state_compare::GroupBy::Cgroup,
+            ctprof_compare::GroupBy::Cgroup,
             &[],
             false,
             false,
@@ -2501,8 +2491,8 @@ mod tests {
     /// integration test on the show path.
     #[test]
     fn write_show_renders_tagged_metric_cell() {
-        let mut snap = ktstr::host_state::HostStateSnapshot::default();
-        let mut t = ktstr::host_state::ThreadState::default();
+        let mut snap = ktstr::ctprof::CtprofSnapshot::default();
+        let mut t = ktstr::ctprof::ThreadState::default();
         t.pcomm = "worker".to_string();
         t.comm = "w".to_string();
         t.nr_wakeups_affine = MonotonicCount(7);
@@ -2511,7 +2501,7 @@ mod tests {
         write_show(
             &mut out,
             &snap,
-            host_state_compare::GroupBy::Pcomm,
+            ctprof_compare::GroupBy::Pcomm,
             &[],
             false,
             false,
@@ -2537,8 +2527,8 @@ mod tests {
     /// header and the metric name surface in the output.
     #[test]
     fn write_show_emits_derived_section() {
-        let mut snap = ktstr::host_state::HostStateSnapshot::default();
-        let mut t = ktstr::host_state::ThreadState::default();
+        let mut snap = ktstr::ctprof::CtprofSnapshot::default();
+        let mut t = ktstr::ctprof::ThreadState::default();
         t.pcomm = "worker".to_string();
         t.comm = "w".to_string();
         t.run_time_ns = MonotonicNs(4_000);
@@ -2548,7 +2538,7 @@ mod tests {
         write_show(
             &mut out,
             &snap,
-            host_state_compare::GroupBy::Pcomm,
+            ctprof_compare::GroupBy::Pcomm,
             &[],
             false,
             false,
@@ -2577,22 +2567,22 @@ mod tests {
     /// `(group, threads, metric, value)` set.
     #[test]
     fn write_show_columns_override_emits_only_selected_columns() {
-        let mut snap = ktstr::host_state::HostStateSnapshot::default();
-        let mut t = ktstr::host_state::ThreadState::default();
+        let mut snap = ktstr::ctprof::CtprofSnapshot::default();
+        let mut t = ktstr::ctprof::ThreadState::default();
         t.pcomm = "worker".to_string();
         t.comm = "w".to_string();
         t.nr_wakeups = MonotonicCount(1);
         snap.threads.push(t);
 
         let columns = vec![
-            host_state_compare::Column::Metric,
-            host_state_compare::Column::Value,
+            ctprof_compare::Column::Metric,
+            ctprof_compare::Column::Value,
         ];
         let mut out = String::new();
         write_show(
             &mut out,
             &snap,
-            host_state_compare::GroupBy::Pcomm,
+            ctprof_compare::GroupBy::Pcomm,
             &[],
             false,
             false,
@@ -2627,12 +2617,12 @@ mod tests {
     /// "fall-through to default" branch of `write_show`.
     #[test]
     fn write_show_empty_sort_by_keeps_alphabetical_default() {
-        let mut snap = ktstr::host_state::HostStateSnapshot::default();
-        let mut t_zulu = ktstr::host_state::ThreadState::default();
+        let mut snap = ktstr::ctprof::CtprofSnapshot::default();
+        let mut t_zulu = ktstr::ctprof::ThreadState::default();
         t_zulu.pcomm = "zulu".to_string();
         t_zulu.comm = "zulu-w".to_string();
         t_zulu.run_time_ns = MonotonicNs(999);
-        let mut t_alpha = ktstr::host_state::ThreadState::default();
+        let mut t_alpha = ktstr::ctprof::ThreadState::default();
         t_alpha.pcomm = "alpha".to_string();
         t_alpha.comm = "alpha-w".to_string();
         t_alpha.run_time_ns = MonotonicNs(1);
@@ -2643,7 +2633,7 @@ mod tests {
         write_show(
             &mut out,
             &snap,
-            host_state_compare::GroupBy::Pcomm,
+            ctprof_compare::GroupBy::Pcomm,
             &[],
             false,
             false,

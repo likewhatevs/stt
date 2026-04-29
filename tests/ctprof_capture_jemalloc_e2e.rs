@@ -1,13 +1,13 @@
-//! VM-backed end-to-end coverage of the host-state capture
+//! VM-backed end-to-end coverage of the ctprof capture
 //! pipeline's per-thread jemalloc TSD counter wiring.
 //!
 //! The host-side wiring tests in
-//! `tests/host_state_capture_jemalloc_wiring.rs` exercise the
+//! `tests/ctprof_capture_jemalloc_wiring.rs` exercise the
 //! probe attach + `process_vm_readv` path against a real spawned
 //! `ktstr-jemalloc-alloc-worker` on the OUTER host's /proc. This
 //! file flips the perspective: the alloc-worker (and its
 //! companion churn variant) run INSIDE a ktstr VM, and
-//! [`ktstr::host_state::capture`] walks the GUEST's /proc + cgroup
+//! [`ktstr::ctprof::capture`] walks the GUEST's /proc + cgroup
 //! v2 mount, runs `attach_jemalloc` against the worker's tgid, and
 //! pulls counters via ptrace from inside the guest kernel. The two
 //! files together prove the wiring lands correctly on both sides
@@ -126,7 +126,7 @@ const KTHREADD_TGID: u32 = 2;
 // ---------------------------------------------------------------------------
 
 /// Spawn the alloc-worker with a known size inside the guest, wait
-/// for its ready marker, then run `host_state::capture()` against
+/// for its ready marker, then run `ctprof::capture()` against
 /// the guest's /proc. Find the worker's tgid in the snapshot and
 /// assert `allocated_bytes >= KNOWN_BYTES` and within slop. The
 /// worker is single-threaded (default mode enforces it), so any
@@ -136,7 +136,7 @@ const KTHREADD_TGID: u32 = 2;
 /// test cares about the capture wiring, not scheduler behavior — a
 /// larger topology adds wall-clock time without raising signal.
 #[ktstr_test(llcs = 1, cores = 1, threads = 1)]
-fn host_state_capture_records_allocated_bytes_for_jemalloc_alloc_worker(
+fn ctprof_capture_records_allocated_bytes_for_jemalloc_alloc_worker(
     ctx: &Ctx,
 ) -> Result<AssertResult> {
     let mut worker: PayloadHandle = ctx
@@ -157,12 +157,12 @@ fn host_state_capture_records_allocated_bytes_for_jemalloc_alloc_worker(
          negative=killed by signal",
     )?;
 
-    // Capture the guest's host-state. `capture()` walks
+    // Capture the guest's ctprof. `capture()` walks
     // /proc and /sys/fs/cgroup, runs `attach_jemalloc` against
     // every non-self tgid (the alloc-worker is non-self, the
     // calling test process is self), and pulls per-thread
     // counters from the worker via ptrace + process_vm_readv.
-    let snap = ktstr::host_state::capture();
+    let snap = ktstr::ctprof::capture();
 
     // Release the worker before any assertion can short-circuit
     // the function — keeps a test failure from orphaning the
@@ -172,14 +172,14 @@ fn host_state_capture_records_allocated_bytes_for_jemalloc_alloc_worker(
     // Locate the worker's threads in the snapshot. The capture
     // walks every live tgid; we filter on the worker's tgid to
     // avoid mis-counting other guest processes.
-    let worker_threads: Vec<&ktstr::host_state::ThreadState> = snap
+    let worker_threads: Vec<&ktstr::ctprof::ThreadState> = snap
         .threads
         .iter()
         .filter(|t| t.tgid == worker_pid)
         .collect();
     if worker_threads.is_empty() {
         return Ok(AssertResult::fail_msg(format!(
-            "host_state::capture() did not see worker tgid={worker_pid} in \
+            "ctprof::capture() did not see worker tgid={worker_pid} in \
              its /proc walk; total threads in snapshot: {}",
             snap.threads.len(),
         )));
@@ -237,7 +237,7 @@ fn host_state_capture_records_allocated_bytes_for_jemalloc_alloc_worker(
     result.details.push(AssertDetail::new(
         DetailKind::Other,
         format!(
-            "host_state_capture_records_allocated_bytes: tgid={worker_pid}, \
+            "ctprof_capture_records_allocated_bytes: tgid={worker_pid}, \
              threads_in_tgid={}, allocated={allocated}, deallocated={deallocated}",
             worker_threads.len(),
         ),
@@ -250,7 +250,7 @@ fn host_state_capture_records_allocated_bytes_for_jemalloc_alloc_worker(
 // ---------------------------------------------------------------------------
 
 /// Boot a minimal guest with NO payload, run
-/// `host_state::capture()`, and assert that kthreadd (tgid=2)
+/// `ctprof::capture()`, and assert that kthreadd (tgid=2)
 /// carries `allocated_bytes==0` AND `deallocated_bytes==0`.
 /// Kthreadd is a kernel thread; it has no userspace ELF behind
 /// `/proc/2/exe` and therefore `attach_jemalloc` returns a
@@ -264,20 +264,20 @@ fn host_state_capture_records_allocated_bytes_for_jemalloc_alloc_worker(
 /// non-jemalloc targets stay at zero — together they pin the
 /// "absent = 0" capture contract on both sides of the boundary.
 #[ktstr_test(llcs = 1, cores = 1, threads = 1)]
-fn host_state_capture_completes_against_bare_guest(_ctx: &Ctx) -> Result<AssertResult> {
+fn ctprof_capture_completes_against_bare_guest(_ctx: &Ctx) -> Result<AssertResult> {
     // No payload — capture runs against whatever processes the
     // guest has after boot. Init (pid 1), kthreadd (pid 2), and
     // any other kernel threads are guaranteed; userspace activity
     // is bounded to the test binary itself plus whatever ktstr's
     // init brings up.
-    let snap = ktstr::host_state::capture();
+    let snap = ktstr::ctprof::capture();
 
     // First-level sanity: the walk visited SOMETHING. An empty
     // snapshot here would mean iter_tgids_at(/proc) returned no
     // entries, i.e. /proc is unreadable from inside the guest.
     if snap.threads.is_empty() {
         return Ok(AssertResult::fail_msg(
-            "host_state::capture() returned zero threads on a bare guest — \
+            "ctprof::capture() returned zero threads on a bare guest — \
              /proc walk produced no entries, indicating the capture layer \
              is not reading the guest's procfs successfully",
         ));
@@ -287,7 +287,7 @@ fn host_state_capture_completes_against_bare_guest(_ctx: &Ctx) -> Result<AssertR
     // not there, either the guest kernel is wedged or the
     // capture-layer tgid filter rejected it. Distinct error
     // path from "found but counters non-zero".
-    let kthreadd_threads: Vec<&ktstr::host_state::ThreadState> = snap
+    let kthreadd_threads: Vec<&ktstr::ctprof::ThreadState> = snap
         .threads
         .iter()
         .filter(|t| t.tgid == KTHREADD_TGID)
@@ -330,7 +330,7 @@ fn host_state_capture_completes_against_bare_guest(_ctx: &Ctx) -> Result<AssertR
     result.details.push(AssertDetail::new(
         DetailKind::Other,
         format!(
-            "host_state_capture_completes_against_bare_guest: \
+            "ctprof_capture_completes_against_bare_guest: \
              kthreadd_threads={}, total_threads={}",
             kthreadd_threads.len(),
             snap.threads.len(),
@@ -345,7 +345,7 @@ fn host_state_capture_completes_against_bare_guest(_ctx: &Ctx) -> Result<AssertR
 /// genuinely missing or just filtered out by the capture-layer
 /// ghost-thread logic. Caps the preview at 16 entries so a guest
 /// with many tgids does not blow up the failure message.
-fn tgids_dump(snap: &ktstr::host_state::HostStateSnapshot) -> String {
+fn tgids_dump(snap: &ktstr::ctprof::CtprofSnapshot) -> String {
     let tgids: std::collections::BTreeSet<u32> = snap.threads.iter().map(|t| t.tgid).collect();
     let total = tgids.len();
     let preview: Vec<u32> = tgids.into_iter().take(16).collect();
@@ -358,7 +358,7 @@ fn tgids_dump(snap: &ktstr::host_state::HostStateSnapshot) -> String {
 
 /// Boot a guest, spawn the alloc-worker in `--churn` mode (tight
 /// spawn+join loop on helper threads after the main allocation),
-/// then run `host_state::capture()` against the guest's /proc.
+/// then run `ctprof::capture()` against the guest's /proc.
 /// The capture's per-tgid attach + per-tid probe must survive
 /// every helper tid that exits between `iter_task_ids_at`
 /// enumeration and the per-tid ptrace step (the dominant
@@ -368,7 +368,7 @@ fn tgids_dump(snap: &ktstr::host_state::HostStateSnapshot) -> String {
 /// non-empty — the race-with-thread-death case must NOT crash
 /// the capture.
 #[ktstr_test(llcs = 1, cores = 2, threads = 2)]
-fn host_state_capture_against_churn_worker_does_not_panic(ctx: &Ctx) -> Result<AssertResult> {
+fn ctprof_capture_against_churn_worker_does_not_panic(ctx: &Ctx) -> Result<AssertResult> {
     let mut worker: PayloadHandle = ctx
         .payload(&JEMALLOC_ALLOC_WORKER_CHURN)
         .arg(CHURN_KNOWN_BYTES.to_string())
@@ -395,7 +395,7 @@ fn host_state_capture_against_churn_worker_does_not_panic(ctx: &Ctx) -> Result<A
     // of `capture()` proves implicitly — a panic in the probe
     // engine would propagate out and the test would never
     // reach the post-capture code.
-    let snap = ktstr::host_state::capture();
+    let snap = ktstr::ctprof::capture();
 
     // Release the churn worker before assertions short-circuit.
     let _ = worker.kill();
@@ -446,7 +446,7 @@ fn host_state_capture_against_churn_worker_does_not_panic(ctx: &Ctx) -> Result<A
     result.details.push(AssertDetail::new(
         DetailKind::Other,
         format!(
-            "host_state_capture_against_churn_worker: tgid={worker_pid}, \
+            "ctprof_capture_against_churn_worker: tgid={worker_pid}, \
              total_threads={}, main_allocated_bytes={main_alloc}",
             snap.threads.len(),
         ),

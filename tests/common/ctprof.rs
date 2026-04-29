@@ -1,22 +1,22 @@
-//! Shared test helpers for the host-state integration suite
+//! Shared test helpers for the ctprof integration suite
 //! (compare + show pipelines).
 //!
 //! `make_thread`, `snapshot`, and `cgroup_stats_entry` are
 //! synthetic-fixture builders that both
-//! `tests/host_state_compare.rs` and
-//! `tests/host_state_show.rs` use to drive the public surface
-//! (HostStateSnapshot / write/load roundtrip / run_compare /
+//! `tests/ctprof_compare.rs` and
+//! `tests/ctprof_show.rs` use to drive the public surface
+//! (CtprofSnapshot / write/load roundtrip / run_compare /
 //! run_show via the binary). Living here under `common/`
 //! keeps the integration-test harness from picking the file up
 //! as its own test binary AND avoids the duplicated copies of
 //! these helpers across the two integration files.
 //!
 //! All functions return concrete public types from
-//! [`ktstr::host_state`]; no test-only API is exposed.
+//! [`ktstr::ctprof`]; no test-only API is exposed.
 
 use std::collections::BTreeMap;
 
-use ktstr::host_state::{CgroupStats, HostStateSnapshot, ThreadState};
+use ktstr::ctprof::{CgroupStats, CtprofSnapshot, ThreadState};
 use ktstr::metric_types::{CategoricalString, CpuSet};
 
 /// Build a `ThreadState` populated with sane defaults for
@@ -39,16 +39,16 @@ pub fn make_thread(pcomm: &str, comm: &str) -> ThreadState {
 }
 
 /// Wrap a thread vector + cgroup-stats map into a
-/// `HostStateSnapshot`. Uses `Default::default()` + per-field
-/// assignment because `HostStateSnapshot` is `#[non_exhaustive]`
+/// `CtprofSnapshot`. Uses `Default::default()` + per-field
+/// assignment because `CtprofSnapshot` is `#[non_exhaustive]`
 /// — direct struct-literal construction is rejected outside
 /// the defining crate's module.
 #[allow(dead_code)]
 pub fn snapshot(
     threads: Vec<ThreadState>,
     cgroup_stats: BTreeMap<String, CgroupStats>,
-) -> HostStateSnapshot {
-    let mut snap = HostStateSnapshot::default();
+) -> CtprofSnapshot {
+    let mut snap = CtprofSnapshot::default();
     snap.threads = threads;
     snap.cgroup_stats = cgroup_stats;
     snap
