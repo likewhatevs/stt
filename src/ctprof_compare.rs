@@ -6116,35 +6116,46 @@ pub fn write_diff<W: fmt::Write>(
                 .collect();
             hier.sort_by(|a, b| a.cgroup.cmp(b.cgroup).then_with(|| a.pcomm.cmp(b.pcomm)));
 
-            let mut last_cg_parent = "";
-            let mut last_cg_leaf = "";
+            // Split each cgroup into path segments for tree rendering.
+            // Track current segments — only emit a heading when a
+            // segment diverges from the previous row.
+            let mut last_segments: Vec<&str> = Vec::new();
             let mut table = display.new_table();
             table.set_header(colored_header(&columns, "pcomm"));
             let mut table_has_rows = false;
 
-            for h in &hier {
-                let (cg_parent, cg_leaf) = cgroup_parent_leaf(h.cgroup);
-
-                if cg_parent != last_cg_parent {
-                    if table_has_rows {
-                        writeln!(w, "{table}")?;
-                        table = display.new_table();
-                        table.set_header(colored_header(&columns, "pcomm"));
-                        table_has_rows = false;
-                    }
-                    writeln!(w)?;
-                    writeln!(w, "\x1b[1;32m## {}\x1b[0m", cg_parent)?;
-                    last_cg_parent = cg_parent;
-                    last_cg_leaf = "";
+            // Color per depth: green for top, cyan deeper, white deepest.
+            let depth_color = |depth: usize| -> &str {
+                match depth {
+                    0 => "\x1b[1;32m",
+                    1 => "\x1b[36m",
+                    _ => "\x1b[90m",
                 }
-                if cg_leaf != last_cg_leaf {
+            };
+
+            for h in &hier {
+                let segments: Vec<&str> = h.cgroup.split('/').filter(|s| !s.is_empty()).collect();
+
+                // Find where current path diverges from last.
+                let common = segments
+                    .iter()
+                    .zip(last_segments.iter())
+                    .take_while(|(a, b)| a == b)
+                    .count();
+
+                if common < last_segments.len() || segments.len() > last_segments.len() {
+                    // Path changed — flush table, emit new headings.
                     if table_has_rows {
                         writeln!(w, "{table}")?;
                         table = display.new_table();
                         table.set_header(colored_header(&columns, "pcomm"));
                     }
-                    writeln!(w, "\x1b[36m  {cg_leaf}\x1b[0m")?;
-                    last_cg_leaf = cg_leaf;
+                    for (depth, seg) in segments.iter().enumerate().skip(common) {
+                        let indent = "  ".repeat(depth);
+                        let color = depth_color(depth);
+                        writeln!(w, "{color}{indent}{seg}\x1b[0m")?;
+                    }
+                    last_segments = segments;
                 }
 
                 let mut string_cells = render_diff_row_cells(h.row, &columns);
