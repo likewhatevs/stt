@@ -2815,7 +2815,7 @@ pub fn compare(
 /// [`ThreadState::smaps_rollup_bytes`] up-front, so the
 /// downstream renderer can pass cell values directly into the
 /// auto_scale "B" ladder without further unit math.
-fn collect_smaps_rollup(
+pub fn collect_smaps_rollup(
     snap: &CtprofSnapshot,
     no_thread_normalize: bool,
 ) -> BTreeMap<String, BTreeMap<String, u64>> {
@@ -3268,7 +3268,12 @@ pub fn pattern_display_label(key: &str, members: &[String]) -> String {
     if members.len() < 2 {
         return key.to_string();
     }
-    grex::RegExpBuilder::from(members).build()
+    let regex = grex::RegExpBuilder::from(members).build();
+    if regex.len() <= key.len() {
+        regex
+    } else {
+        key.to_string()
+    }
 }
 
 /// Build the union frequency map for pattern-aware grouping
