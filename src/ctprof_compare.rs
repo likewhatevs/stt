@@ -7076,7 +7076,11 @@ pub fn write_diff<W: fmt::Write>(
         if any_delta {
             writeln!(w)?;
             writeln!(w, "## smaps_rollup")?;
-            let mut st = display.new_constrained_table(&global_max_widths);
+            let mut st = if global_max_widths.is_empty() {
+                display.new_table()
+            } else {
+                display.new_constrained_table(&global_max_widths)
+            };
             st.set_header(colored_header(&columns, "pcomm"));
 
             // For All mode, re-sort by cgroup hierarchy (keys are
