@@ -442,10 +442,12 @@ pub struct CtprofShowArgs {
     pub snapshot: std::path::PathBuf,
     /// Grouping key. Same semantics as
     /// `ktstr ctprof compare --group-by`. `pcomm` (default)
-    /// aggregates per process name; `cgroup` per cgroup path;
-    /// `comm` aggregates threads by NAME PATTERN under the
+    /// aggregates per process name with token-based pattern
+    /// normalization (so `worker-{0..N}` parents collapse into
+    /// one `worker-{N}` bucket); `cgroup` per cgroup path; `comm`
+    /// aggregates threads by NAME PATTERN under the same
     /// token-based normalizer; `comm-exact` is a synonym for
-    /// `comm --no-thread-normalize`.
+    /// `comm --no-thread-normalize` on the thread axis only.
     #[arg(long, value_enum, default_value_t = ctprof_compare::GroupBy::Pcomm, help_heading = "Grouping")]
     pub group_by: ctprof_compare::GroupBy,
     /// Glob patterns that collapse dynamic cgroup path segments —
@@ -453,9 +455,20 @@ pub struct CtprofShowArgs {
     /// `ktstr ctprof compare --cgroup-flatten`. Repeatable.
     #[arg(long, help_heading = "Grouping")]
     pub cgroup_flatten: Vec<String>,
-    /// Disable token-based pattern normalization for the thread
-    /// axis (`--group-by comm`). Threads group by literal `comm`.
-    /// Has no effect under any other grouping.
+    /// Disable token-based pattern normalization across the
+    /// name-family axes: `--group-by comm` and
+    /// `--group-by pcomm`. Threads / processes group by their
+    /// literal name; the digit/hex/alpha-prefix placeholders are
+    /// bypassed. Has no effect under `--group-by comm-exact`
+    /// (already literal) or `--group-by cgroup`.
+    ///
+    /// Note: `smaps_rollup` normalization on `ktstr ctprof show`
+    /// is unaffected — the show-side renders one row per
+    /// captured leader thread directly off the per-PID
+    /// `pcomm[tgid]` shape regardless of this flag. Pcomm /
+    /// smaps normalization gating via `--no-thread-normalize`
+    /// applies on the compare side only (see
+    /// `ktstr ctprof compare --help`).
     #[arg(long, help_heading = "Grouping")]
     pub no_thread_normalize: bool,
     /// Disable token-based pattern normalization for the cgroup
@@ -943,11 +956,17 @@ fn write_show<W: std::fmt::Write>(
 
         for key in &group_order {
             let group = &groups[*key];
-            // Display key: pattern grouping under Comm uses grex to
-            // turn the join-key skeleton into a regex label; every
-            // other grouping renders the join key directly.
-            let display_key = if group_by == ctprof_compare::GroupBy::Comm && !no_thread_normalize {
-                ctprof_compare::pattern_display_label(key, &group.member_comms)
+            // Display key: pattern grouping under Comm or Pcomm
+            // uses grex to turn the join-key skeleton into a regex
+            // label; every other grouping (CommExact, Cgroup, or
+            // either pattern axis under `--no-thread-normalize`)
+            // renders the join key directly.
+            let display_key = if matches!(
+                group_by,
+                ctprof_compare::GroupBy::Comm | ctprof_compare::GroupBy::Pcomm
+            ) && !no_thread_normalize
+            {
+                ctprof_compare::pattern_display_label(key, &group.members)
             } else {
                 (*key).clone()
             };
@@ -1018,8 +1037,12 @@ fn write_show<W: std::fmt::Write>(
         // every section emitted afterwards.
         for key in &group_order {
             let group = &groups[*key];
-            let display_key = if group_by == ctprof_compare::GroupBy::Comm && !no_thread_normalize {
-                ctprof_compare::pattern_display_label(key, &group.member_comms)
+            let display_key = if matches!(
+                group_by,
+                ctprof_compare::GroupBy::Comm | ctprof_compare::GroupBy::Pcomm
+            ) && !no_thread_normalize
+            {
+                ctprof_compare::pattern_display_label(key, &group.members)
             } else {
                 (*key).clone()
             };

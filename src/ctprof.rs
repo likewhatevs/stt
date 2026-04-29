@@ -616,12 +616,24 @@ pub struct ThreadState {
     /// Thread group id (process id). Ephemeral across runs.
     pub tgid: u32,
     /// Process name, read from `/proc/<tgid>/comm`. Stable across
-    /// runs on the same build; the grouping key under
-    /// `--group-by pcomm`.
+    /// runs on the same build. Feeds the grouping key under
+    /// `--group-by pcomm` (default), where it flows through the
+    /// token-based [`crate::ctprof_compare::pattern_key`]
+    /// normalizer so ephemeral worker pools (`worker-0`,
+    /// `worker-1`, ...) collapse into a single `worker-{N}`
+    /// bucket; pass `--no-thread-normalize` to group by literal
+    /// pcomm. Also feeds the smaps_rollup join key (with the same
+    /// normalization rules) so per-process memory rows survive
+    /// PID churn across snapshots.
     pub pcomm: String,
     /// Thread name, read from `/proc/<tid>/comm`. Stable when the
     /// runtime assigns deterministic names (worker pools, async
-    /// runtimes); the grouping key under `--group-by comm`.
+    /// runtimes). Feeds the grouping key under `--group-by comm`,
+    /// where it flows through the token-based
+    /// [`crate::ctprof_compare::pattern_key`] normalizer (same
+    /// rules as pcomm). Pass `--no-thread-normalize` to group by
+    /// literal comm, or `--group-by comm-exact` for the same
+    /// effect on this axis only (smaps still normalizes).
     pub comm: String,
     /// Cgroup v2 path.
     ///

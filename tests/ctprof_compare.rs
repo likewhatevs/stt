@@ -1048,17 +1048,21 @@ fn nr_threads_leader_dedup_aggregates_via_max_on_leader_value() {
 /// scaled-byte values for the keys that changed.
 ///
 /// Pins the full pipeline: per-thread map → diff struct via
-/// `collect_smaps_rollup` → `pcomm[tgid]` keying → kB→B
-/// auto-scale → baseline → candidate cell rendering.
+/// `collect_smaps_rollup` → pcomm-only keying → kB→B
+/// auto-scale → baseline → candidate cell rendering. Default
+/// normalization keys by `pattern_key(&t.pcomm)` (the `[tgid]`
+/// suffix is dropped) so the rendered process key matches the
+/// primary-table Pcomm group key exactly. For a pure-alpha pcomm
+/// like `worker`, `pattern_key` returns the literal — the key is
+/// just `worker`.
 #[test]
 fn compare_smaps_rollup_renders_header_and_scaled_byte_values() {
     use ktstr::ctprof_compare::{CompareOptions, DisplayOptions, GroupBy, compare, write_diff};
     use std::path::Path;
 
     // Baseline thread carries Pss = 1024 kB (= 1 MiB);
-    // candidate carries Pss = 2048 kB (= 2 MiB). Same tgid +
-    // pcomm so the row collapses to ONE process key
-    // `worker[4242]`.
+    // candidate carries Pss = 2048 kB (= 2 MiB). Default
+    // normalization keys by `pattern_key("worker")` = `worker`.
     let mut baseline_leader = make_thread("worker", "worker");
     baseline_leader.tid = 4242;
     baseline_leader.tgid = 4242;
@@ -1080,16 +1084,18 @@ fn compare_smaps_rollup_renders_header_and_scaled_byte_values() {
     // Diff struct carries the per-process maps in BYTES (not kB
     // — the bytes conversion happens up-front in
     // collect_smaps_rollup so the renderer gets to skip it).
+    // Key is `pattern_key("worker")` = `worker` (pure-alpha pcomm
+    // is literal under the normalizer); the tgid is dropped.
     assert_eq!(
         diff.smaps_rollup_a
-            .get("worker[4242]")
+            .get("worker")
             .and_then(|m| m.get("Pss").copied()),
         Some(1024 * 1024),
         "baseline Pss kB-to-bytes conversion landed in diff",
     );
     assert_eq!(
         diff.smaps_rollup_b
-            .get("worker[4242]")
+            .get("worker")
             .and_then(|m| m.get("Pss").copied()),
         Some(2048 * 1024),
         "candidate Pss kB-to-bytes conversion landed in diff",
@@ -1110,9 +1116,21 @@ fn compare_smaps_rollup_renders_header_and_scaled_byte_values() {
         out.contains("## smaps_rollup"),
         "smaps_rollup section header missing:\n{out}",
     );
+    // The smaps section's process column shows the rendered
+    // Pcomm group key — `worker` for this fixture. Locate the
+    // section bounds and check inside it.
+    let smaps_at = out
+        .find("## smaps_rollup")
+        .expect("smaps_rollup header located above");
+    let after_smaps = &out[smaps_at..];
+    let next_section_in_smaps = after_smaps
+        .find("\n## ")
+        .map(|p| p + 1)
+        .unwrap_or(after_smaps.len());
+    let smaps_section = &after_smaps[..next_section_in_smaps];
     assert!(
-        out.contains("worker[4242]"),
-        "process key missing from rendered table:\n{out}",
+        smaps_section.contains("worker"),
+        "rendered smaps section missing process key `worker`:\n{smaps_section}",
     );
     assert!(
         out.contains("Pss"),
