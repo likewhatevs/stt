@@ -6338,6 +6338,13 @@ pub fn write_diff<W: fmt::Write>(
             })
             .collect();
 
+        // Build uptime lookup from primary rows for derived rendering.
+        let uptime_map: BTreeMap<&str, Option<f64>> = diff
+            .rows
+            .iter()
+            .map(|r| (r.group_key.as_str(), r.uptime_pct))
+            .collect();
+
         if group_by == GroupBy::All {
             // Hierarchical derived rendering — same tree as primary.
             let limited: Vec<&DerivedRow> = if display.section_line_limit > 0 {
@@ -6450,7 +6457,18 @@ pub fn write_diff<W: fmt::Write>(
                 let colored: Vec<comfy_table::Cell> = cells
                     .into_iter()
                     .zip(columns.iter())
-                    .map(|(s, col)| color_diff_cell(s, *col, h.row.delta, None))
+                    .map(|(s, col)| {
+                        let up = uptime_map.get(h.row.group_key.as_str()).copied().flatten();
+                        if *col == Column::Uptime {
+                            let text = match up {
+                                Some(pct) => format!("{pct:.0}%"),
+                                None => "-".to_string(),
+                            };
+                            color_diff_cell(text, *col, h.row.delta, up)
+                        } else {
+                            color_diff_cell(s, *col, h.row.delta, up)
+                        }
+                    })
                     .collect();
                 dt.add_row(colored);
             }
@@ -6465,7 +6483,18 @@ pub fn write_diff<W: fmt::Write>(
                 let cells: Vec<comfy_table::Cell> = string_cells
                     .into_iter()
                     .zip(columns.iter())
-                    .map(|(s, col)| color_diff_cell(s, *col, row.delta, None))
+                    .map(|(s, col)| {
+                        let up = uptime_map.get(row.group_key.as_str()).copied().flatten();
+                        if *col == Column::Uptime {
+                            let text = match up {
+                                Some(pct) => format!("{pct:.0}%"),
+                                None => "-".to_string(),
+                            };
+                            color_diff_cell(text, *col, row.delta, up)
+                        } else {
+                            color_diff_cell(s, *col, row.delta, up)
+                        }
+                    })
                     .collect();
                 dt.add_row(cells);
             }
