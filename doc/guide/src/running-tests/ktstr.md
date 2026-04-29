@@ -168,34 +168,86 @@ ktstr ctprof compare baseline.ctprof.zst candidate.ctprof.zst
 ```
 
 **`capture`** walks `/proc` at capture time and writes every
-visible thread's cumulative counters (schedstat, sched,
-status CSW, page faults, I/O bytes, CPU affinity, cgroup,
-identity) as zstd-compressed JSON (conventional extension
-`.ctprof.zst`). Every recorded field is cumulative-from-birth so
-probe attachment time does not bias the reading — a diff
-between two snapshots measures exactly the activity over the
-window. Per-cgroup aggregates (`cpu.stat`, `memory.current`)
-are captured once per distinct path. Capture is read-only;
-nothing is attached, no kprobes, no tracing.
+visible thread's metric values (cumulative counters from
+schedstat / sched / status CSW / page faults / I/O bytes /
+taskstats; lifetime peaks from schedstat `*_max` and
+`hiwater_*`; instantaneous gauges sampled at capture time
+including `nr_threads`, `fair_slice_ns`, `state`; categorical /
+ordinal scalars including `policy`, `nice`, `cpu_affinity`,
+identity strings) as zstd-compressed JSON (conventional
+extension `.ctprof.zst`). Cumulative counters and lifetime
+peaks are probe-timing-invariant — sampled twice, the value
+either monotonically increased or stayed at its high-water mark
+— so a diff between two snapshots measures exactly the
+activity over the window. Instantaneous gauges and categorical
+scalars are point-in-time readings that can legitimately differ
+between two probes of the same thread. Per-cgroup aggregates
+(`cpu.stat`, `memory.current`) are captured once per distinct
+path. Capture is read-only; nothing is attached, no kprobes, no
+tracing.
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-o`, `--output PATH` | required | Destination path (convention: `.ctprof.zst`). Existing files are overwritten. |
 
-**`compare`** joins two snapshots on `(pcomm, comm)` and
-renders a per-metric baseline/candidate/delta table. The join
-key survives across captures taken on different hosts or
-after process restarts, so deltas reflect the behavior of the
-named workload rather than a specific pid. Metrics with
-cumulative semantics (CPU time, page faults, wait time) show
-the candidate-minus-baseline delta; instantaneous metrics
-(affinity, cgroup path) show the value at candidate capture
-time.
+**`compare`** joins two snapshots on `(pcomm, comm)` (or other
+selected grouping axis) and renders a per-metric
+baseline/candidate/delta table. The join key survives across
+captures taken on different hosts or after process restarts, so
+deltas reflect the behavior of the named workload rather than a
+specific pid. Metrics with cumulative semantics (CPU time, page
+faults, wait time) show the candidate-minus-baseline delta;
+instantaneous metrics (affinity, cgroup path) show the value at
+candidate capture time. See the
+[ctprof reference](../reference/ctprof.md) for the full metric
+registry, aggregation rules, derived-metric formulas, and
+taskstats kconfig gating.
 
-| Arg / Flag | Description |
-|------|-------------|
-| `BASELINE` | Path to the baseline `.ctprof.zst` snapshot. |
-| `CANDIDATE` | Path to the candidate `.ctprof.zst` snapshot. |
+| Arg / Flag | Default | Description |
+|------|---------|-------------|
+| `BASELINE` | required | Path to the baseline `.ctprof.zst` snapshot. |
+| `CANDIDATE` | required | Path to the candidate `.ctprof.zst` snapshot. |
+| `--group-by AXIS` | `pcomm` | Grouping axis: `pcomm` (process name), `cgroup` (cgroup v2 path), `comm` (thread-name pattern, token-normalized), or `comm-exact` (synonym for `comm --no-thread-normalize`). |
+| `--cgroup-flatten GLOB` | -- | Glob pattern that collapses dynamic cgroup path segments before grouping (e.g. `'/kubepods/*/workload'`). Repeatable; explicit globs apply before auto-normalize. |
+| `--no-thread-normalize` | off | Disable token-based pattern normalization for `--group-by comm`. Threads group by literal `comm`. |
+| `--no-cg-normalize` | off | Disable token-based normalization for `--group-by cgroup`. Cgroup paths group by literal post-flatten path. |
+| `--sort-by SPEC` | by largest `\|delta_pct\|` | Multi-key sort spec: `metric1[:dir1],metric2[:dir2],...`. Each `metric` is a name from `ctprof metric-list`; each `dir` is `asc` or `desc` (default `desc`). |
+| `--display-format FORMAT` | `full` | Per-row column layout. `full` (default 7 columns), `delta-only` (drop baseline+candidate), `no-pct`, `arrow` (collapse baseline/candidate/delta into one cell), or `pct-only`. |
+| `--columns NAMES` | -- | Comma-separated column list overriding `--display-format`. Valid names: `group`, `threads`, `metric`, `baseline`, `candidate`, `delta`, `%`, `arrow`. Order is the rendered order. |
+| `--sections NAMES` | every | Comma-separated sub-table list. Valid names: `primary`, `taskstats-delay`, `derived`, `cgroup-stats`, `cgroup-limits`, `memory-stat`, `memory-events`, `pressure`, `host-pressure`, `smaps-rollup`, `sched-ext`. Empty renders every section that has data. |
+| `--metrics NAMES` | every | Comma-separated metric-name allowlist for primary + derived rows. Names must come from `ctprof metric-list`. Composes multiplicatively with `--sections`. |
+| `--wrap` | off | Wrap table cells to fit terminal width. Only fires when stdout is a TTY; piped output stays unwrapped so awk/grep pipelines see the same byte sequence. |
+
+**`show`** renders a single snapshot's per-(group, metric)
+values without diff math. Same flag vocabulary as `compare`,
+minus the baseline/candidate/delta/pct columns:
+
+```sh
+ktstr ctprof show snapshot.ctprof.zst --group-by cgroup
+ktstr ctprof show snapshot.ctprof.zst --sections taskstats-delay
+```
+
+| Arg / Flag | Default | Description |
+|------|---------|-------------|
+| `SNAPSHOT` | required | Path to the `.ctprof.zst` snapshot. |
+| `--group-by AXIS` | `pcomm` | Same as `compare`. |
+| `--cgroup-flatten GLOB` | -- | Same as `compare`. Repeatable. |
+| `--no-thread-normalize` | off | Same as `compare`. |
+| `--no-cg-normalize` | off | Same as `compare`. |
+| `--sort-by SPEC` | alphabetical | Sort spec; ranks groups by absolute aggregated value (no delta — single snapshot). |
+| `--columns NAMES` | -- | Comma-separated column list. Show-only valid names: `group`, `threads`, `metric`, `value`. The compare-only column names are rejected at parse time. |
+| `--sections NAMES` | every | Same as `compare`. |
+| `--metrics NAMES` | every | Same as `compare`. |
+| `--wrap` | off | Same as `compare`. |
+
+**`metric-list`** prints every registered metric (primary +
+derived) with its description, unit, kconfig gate, and
+sched_class scope. Use this to discover the vocabulary
+`--sort-by` and `--metrics` accept.
+
+```sh
+ktstr ctprof metric-list
+```
 
 ### locks
 
