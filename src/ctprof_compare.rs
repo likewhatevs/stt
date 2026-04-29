@@ -3302,15 +3302,15 @@ fn tighten_group(post_l1_paths: &[String], member_tokens: &[Vec<String>]) -> Str
     for seg in segments {
         match seg {
             Segment::Token(_) => {
-                // Compare position `token_pos` across every member.
                 let first = &member_tokens[0][token_pos];
+                let classified = classify_token(first);
                 let all_equal = member_tokens
                     .iter()
                     .all(|tokens| &tokens[token_pos] == first);
-                if all_equal {
+                if all_equal && classified == *first {
                     out.push_str(first);
                 } else {
-                    out.push_str(&classify_token(first));
+                    out.push_str(&classified);
                 }
                 token_pos += 1;
             }
