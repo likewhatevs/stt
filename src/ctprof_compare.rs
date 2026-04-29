@@ -28,8 +28,8 @@ use anyhow::Context;
 use regex::Regex;
 
 use crate::ctprof::{
-    CgroupCpuStats, CgroupMemoryStats, CgroupPidsStats, CgroupStats, CtprofSnapshot, Psi,
-    PsiHalf, PsiResource, ThreadState,
+    CgroupCpuStats, CgroupMemoryStats, CgroupPidsStats, CgroupStats, CtprofSnapshot, Psi, PsiHalf,
+    PsiResource, ThreadState,
 };
 
 /// Grouping key for the ctprof compare.
@@ -486,6 +486,19 @@ pub struct CtprofMetricDef {
     /// names the per-group reduction, not the per-thread
     /// counter shape.
     pub description: &'static str,
+    /// Section this metric belongs to for the `--sections`
+    /// per-row filter. Most rows tag [`Section::Primary`];
+    /// taskstats-sourced rows (the eight delay-accounting
+    /// categories plus the two memory watermarks) carry
+    /// [`Section::TaskstatsDelay`] so an operator can scope
+    /// the rendered table down to (or away from) the taskstats
+    /// rows. The primary-table emitter checks
+    /// [`DisplayOptions::is_section_enabled`] per row before
+    /// rendering — `--sections taskstats-delay` keeps only
+    /// taskstats rows, `--sections primary` excludes them, and
+    /// either alone keeps the primary table open. The default
+    /// (empty filter) renders every row regardless of section.
+    pub section: Section,
 }
 
 /// Registry of per-thread metrics. Order here is the default
@@ -514,6 +527,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &[],
         is_dead: false,
         description: "Scheduling policy (SCHED_OTHER, SCHED_FIFO, SCHED_RR, SCHED_BATCH, SCHED_IDLE, SCHED_DEADLINE, SCHED_EXT).",
+        section: Section::Primary,
     },
     CtprofMetricDef {
         name: "nice",
@@ -522,6 +536,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &[],
         is_dead: false,
         description: "Nice value (-20..19); CFS priority knob.",
+        section: Section::Primary,
     },
     // `task_prio()` value from `/proc/<tid>/stat` field 18.
     // Per-thread ordinal — aggregate as OrdinalRange (mirrors
@@ -536,6 +551,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &[],
         is_dead: false,
         description: "Kernel task priority from /proc/<tid>/stat field 18 (CFS=[0..39], RT=[-2..-100], DL=-101).",
+        section: Section::Primary,
     },
     // Real-time scheduler priority from `/proc/<tid>/stat`
     // field 40. Bounded 0..99 in practice (SCHED_FIFO /
@@ -549,6 +565,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &[],
         is_dead: false,
         description: "Real-time scheduler priority (0..99); 0 for non-RT tasks.",
+        section: Section::Primary,
     },
     CtprofMetricDef {
         name: "cpu_affinity",
@@ -557,6 +574,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &[],
         is_dead: false,
         description: "Set of CPUs the task is allowed to run on (sched_getaffinity result).",
+        section: Section::Primary,
     },
     CtprofMetricDef {
         name: "processor",
@@ -565,6 +583,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &[],
         is_dead: false,
         description: "Last CPU the task ran on.",
+        section: Section::Primary,
     },
     CtprofMetricDef {
         name: "state",
@@ -573,6 +592,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &[],
         is_dead: false,
         description: "Task state letter (R running, S sleeping, D uninterruptible, Z zombie, T stopped).",
+        section: Section::Primary,
     },
     // `ext_enabled` reflects whether the task is currently on
     // the sched_ext class. Gated by CONFIG_SCHED_CLASS_EXT —
@@ -585,6 +605,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_SCHED_CLASS_EXT"],
         is_dead: false,
         description: "Whether the task is currently dispatched on the sched_ext class.",
+        section: Section::Primary,
     },
     // Process-wide thread count (`signal_struct->nr_threads`)
     // from `/proc/<tid>/status` `Threads:`. Capture-side
@@ -604,6 +625,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &[],
         is_dead: false,
         description: "Process-wide thread count (signal_struct->nr_threads); leader-only.",
+        section: Section::Primary,
     },
     // scheduling
     // `run_time_ns` from `/proc/<tid>/schedstat` field 1 —
@@ -616,6 +638,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_SCHED_INFO"],
         is_dead: false,
         description: "Cumulative on-CPU time, ns; /proc/<tid>/schedstat field 1.",
+        section: Section::Primary,
     },
     // `wait_time_ns` from `/proc/<tid>/schedstat` field 2 —
     // gated by CONFIG_SCHED_INFO via `sched_info_on()` at
@@ -627,6 +650,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_SCHED_INFO"],
         is_dead: false,
         description: "Cumulative time waiting on the runqueue, ns; schedstat field 2.",
+        section: Section::Primary,
     },
     // `timeslices` from `/proc/<tid>/schedstat` field 3 —
     // same gate as `wait_time_ns`.
@@ -637,6 +661,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_SCHED_INFO"],
         is_dead: false,
         description: "Number of times the task was run on a CPU; schedstat field 3.",
+        section: Section::Primary,
     },
     CtprofMetricDef {
         name: "voluntary_csw",
@@ -645,6 +670,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &[],
         is_dead: false,
         description: "Voluntary context switches (task gave up the CPU itself).",
+        section: Section::Primary,
     },
     CtprofMetricDef {
         name: "nonvoluntary_csw",
@@ -653,6 +679,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &[],
         is_dead: false,
         description: "Involuntary context switches (task was preempted).",
+        section: Section::Primary,
     },
     // `nr_wakeups`, `_local`, `_remote`, `_sync`, `_migrate`
     // are class-agnostic — `__schedstat_inc` from
@@ -667,6 +694,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
         description: "Total wakeups via try_to_wake_up().",
+        section: Section::Primary,
     },
     CtprofMetricDef {
         name: "nr_wakeups_local",
@@ -675,6 +703,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
         description: "Wakeups landed on the same CPU as the waker.",
+        section: Section::Primary,
     },
     CtprofMetricDef {
         name: "nr_wakeups_remote",
@@ -683,6 +712,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
         description: "Wakeups landed on a different CPU than the waker.",
+        section: Section::Primary,
     },
     CtprofMetricDef {
         name: "nr_wakeups_sync",
@@ -691,6 +721,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
         description: "WF_SYNC wakeups (synchronous wakeup hint to scheduler).",
+        section: Section::Primary,
     },
     CtprofMetricDef {
         name: "nr_wakeups_migrate",
@@ -699,6 +730,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
         description: "Wakeups where the task migrated to a different CPU than its prior one (WF_MIGRATED); distinct from nr_wakeups_remote (waker CPU != target CPU).",
+        section: Section::Primary,
     },
     // `nr_wakeups_affine`, `_attempts` are CFS-only —
     // `kernel/sched/fair.c::wake_affine` calls
@@ -714,6 +746,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
         description: "Wakeups that succeeded under the wake_affine() heuristic.",
+        section: Section::Primary,
     },
     CtprofMetricDef {
         name: "nr_wakeups_affine_attempts",
@@ -722,6 +755,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
         description: "wake_affine() attempts; success rate = nr_wakeups_affine / attempts.",
+        section: Section::Primary,
     },
     // `nr_migrations` is incremented unconditionally at
     // `kernel/sched/core.c:3283` (`p->se.nr_migrations++`) — no
@@ -733,6 +767,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &[],
         is_dead: false,
         description: "Cumulative cross-CPU migrations of the task.",
+        section: Section::Primary,
     },
     // `nr_forced_migrations` is set by
     // `kernel/sched/fair.c:9775` (`schedstat_inc`) inside
@@ -744,6 +779,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
         description: "Migrations forced by the CFS load balancer.",
+        section: Section::Primary,
     },
     // `nr_failed_migrations_*` family — all CFS-only,
     // incremented in `kernel/sched/fair.c::can_migrate_task`
@@ -755,6 +791,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
         description: "Load-balancer migrations rejected for cpu-affinity reasons.",
+        section: Section::Primary,
     },
     CtprofMetricDef {
         name: "nr_failed_migrations_running",
@@ -763,6 +800,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
         description: "Load-balancer migrations rejected because the task was running.",
+        section: Section::Primary,
     },
     CtprofMetricDef {
         name: "nr_failed_migrations_hot",
@@ -771,6 +809,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
         description: "Load-balancer migrations rejected because the task was cache-hot.",
+        section: Section::Primary,
     },
     // `wait_sum` / `wait_count` / `wait_max` — written by
     // `__update_stats_wait_end` (`kernel/sched/stats.c:21`),
@@ -790,6 +829,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
         description: "Cumulative time the task waited on the runqueue, ns.",
+        section: Section::Primary,
     },
     CtprofMetricDef {
         name: "wait_count",
@@ -798,6 +838,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
         description: "Number of distinct runqueue-wait intervals the task accumulated.",
+        section: Section::Primary,
     },
     CtprofMetricDef {
         name: "wait_max",
@@ -806,6 +847,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
         description: "Longest single runqueue-wait interval observed, ns.",
+        section: Section::Primary,
     },
     // `voluntary_sleep_ns` / `sleep_max` / `block_sum` /
     // `block_max` / `iowait_sum` / `iowait_count` — written by
@@ -831,6 +873,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
         description: "Pure voluntary sleep time (TASK_INTERRUPTIBLE only), ns; capture-side normalized as sum_sleep_runtime - sum_block_runtime so the kernel's sleep/block double-count is stripped before delta math.",
+        section: Section::Primary,
     },
     CtprofMetricDef {
         name: "sleep_max",
@@ -839,6 +882,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
         description: "Longest single sleep interval observed, ns.",
+        section: Section::Primary,
     },
     // No `sleep_count` metric: the kernel does not emit that
     // counter — the wake-side tally is captured by `nr_wakeups`
@@ -850,6 +894,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
         description: "Cumulative time the task spent blocked (TASK_UNINTERRUPTIBLE), ns.",
+        section: Section::Primary,
     },
     CtprofMetricDef {
         name: "block_max",
@@ -858,6 +903,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
         description: "Longest single uninterruptible-block interval observed, ns.",
+        section: Section::Primary,
     },
     // No `block_count` metric: the kernel emits no per-event
     // counter for `sum_block_runtime` (unlike `wait_sum/wait_count`
@@ -869,6 +915,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
         description: "Cumulative time the task spent in iowait, ns.",
+        section: Section::Primary,
     },
     CtprofMetricDef {
         name: "iowait_count",
@@ -877,6 +924,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
         description: "Number of distinct iowait intervals the task accumulated.",
+        section: Section::Primary,
     },
     // delayacct_blkio_ticks (the procfs USER_HZ-ticks delivery
     // of the same delay-accounting block-I/O bucket) was removed
@@ -899,6 +947,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
         description: "Longest single uninterrupted on-CPU run observed, ns.",
+        section: Section::Primary,
     },
     // `slice_max` is part of the CFS-class statistics struct.
     // Per the kernel-field-semantics audit, zero under
@@ -911,6 +960,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
         description: "Longest CFS slice the task was granted, ns.",
+        section: Section::Primary,
     },
     // Cumulative core-scheduling forced-idle time, ns. Counter
     // (Sum). Increment is class-agnostic: `__account_forceidle_time()`
@@ -932,6 +982,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_SCHED_CORE", "CONFIG_SCHEDSTATS"],
         is_dead: false,
         description: "Cumulative time this task forced its SMT sibling idle, ns (core scheduling).",
+        section: Section::Primary,
     },
     // Current scheduler slice in ns (stale under SCHED_EXT —
     // see field doc) from `/proc/<tid>/sched`'s `slice` line.
@@ -952,6 +1003,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &[],
         is_dead: false,
         description: "Current scheduler slice, ns; snapshot from /proc/<tid>/sched (stale under sched_ext).",
+        section: Section::Primary,
     },
     // memory
     CtprofMetricDef {
@@ -961,6 +1013,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &[],
         is_dead: false,
         description: "jemalloc per-thread allocated bytes (TSD thread_allocated counter).",
+        section: Section::Primary,
     },
     CtprofMetricDef {
         name: "deallocated_bytes",
@@ -969,6 +1022,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &[],
         is_dead: false,
         description: "jemalloc per-thread deallocated bytes (TSD thread_deallocated counter).",
+        section: Section::Primary,
     },
     CtprofMetricDef {
         name: "minflt",
@@ -977,6 +1031,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &[],
         is_dead: false,
         description: "Minor page faults (resolved without I/O).",
+        section: Section::Primary,
     },
     CtprofMetricDef {
         name: "majflt",
@@ -985,6 +1040,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &[],
         is_dead: false,
         description: "Major page faults (required disk I/O to resolve).",
+        section: Section::Primary,
     },
     CtprofMetricDef {
         name: "utime_clock_ticks",
@@ -993,6 +1049,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &[],
         is_dead: false,
         description: "User-mode CPU time, USER_HZ ticks; /proc/<tid>/stat field 14.",
+        section: Section::Primary,
     },
     CtprofMetricDef {
         name: "stime_clock_ticks",
@@ -1001,6 +1058,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &[],
         is_dead: false,
         description: "Kernel-mode CPU time, USER_HZ ticks; /proc/<tid>/stat field 15.",
+        section: Section::Primary,
     },
     // I/O — `/proc/<tid>/io` is emitted by
     // `do_io_accounting` (`fs/proc/base.c`) under a single
@@ -1016,6 +1074,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_TASK_IO_ACCOUNTING"],
         is_dead: false,
         description: "Bytes read at the read syscall layer (incl. cached / pagecache hits).",
+        section: Section::Primary,
     },
     CtprofMetricDef {
         name: "wchar",
@@ -1024,6 +1083,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_TASK_IO_ACCOUNTING"],
         is_dead: false,
         description: "Bytes written at the write syscall layer (incl. pagecache / writeback).",
+        section: Section::Primary,
     },
     CtprofMetricDef {
         name: "syscr",
@@ -1032,6 +1092,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_TASK_IO_ACCOUNTING"],
         is_dead: false,
         description: "Number of read syscalls.",
+        section: Section::Primary,
     },
     CtprofMetricDef {
         name: "syscw",
@@ -1040,6 +1101,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_TASK_IO_ACCOUNTING"],
         is_dead: false,
         description: "Number of write syscalls.",
+        section: Section::Primary,
     },
     CtprofMetricDef {
         name: "read_bytes",
@@ -1048,6 +1110,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_TASK_IO_ACCOUNTING"],
         is_dead: false,
         description: "Bytes that hit the storage device on read (excludes pagecache hits).",
+        section: Section::Primary,
     },
     CtprofMetricDef {
         name: "write_bytes",
@@ -1056,6 +1119,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_TASK_IO_ACCOUNTING"],
         is_dead: false,
         description: "Bytes that hit the storage device on write (post-writeback).",
+        section: Section::Primary,
     },
     // `cancelled_write_bytes` from `/proc/<tid>/io` 7th line.
     // `task_io_account_cancelled_write` (kernel
@@ -1077,6 +1141,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_TASK_IO_ACCOUNTING"],
         is_dead: false,
         description: "Bytes the kernel deaccounted from a prior dirty-write because the page was reclaimed without writeback (truncate / inode invalidation); recorded on the truncating task, not the writer. Per-thread `write_bytes - cancelled_write_bytes` is NOT a valid derivation — see field doc.",
+        section: Section::Primary,
     },
     // taskstats — captured via the kernel's genetlink TASKSTATS
     // family ([`crate::taskstats`]). Two field families share the
@@ -1116,6 +1181,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
         is_dead: false,
         description: "Number of off-CPU windows the task waited for the runqueue to schedule it (taskstats cpu_count). RACY: count + total are not updated atomically.",
+        section: Section::TaskstatsDelay,
     },
     CtprofMetricDef {
         name: "cpu_delay_total_ns",
@@ -1124,6 +1190,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
         is_dead: false,
         description: "Cumulative ns the task waited on the runqueue (taskstats cpu_delay_total). Distinct from `wait_sum` (schedstat) which captures the same wait-for-CPU bucket via a different code path. RACY (see cpu_delay_count).",
+        section: Section::TaskstatsDelay,
     },
     CtprofMetricDef {
         name: "cpu_delay_max_ns",
@@ -1132,6 +1199,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
         is_dead: false,
         description: "Longest single CPU-wait window observed, ns (taskstats cpu_delay_max).",
+        section: Section::TaskstatsDelay,
     },
     CtprofMetricDef {
         name: "cpu_delay_min_ns",
@@ -1140,6 +1208,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
         is_dead: false,
         description: "Shortest non-zero CPU-wait window observed, ns (taskstats cpu_delay_min). Sentinel 0 means \"no events observed\" — compare against cpu_delay_count.",
+        section: Section::TaskstatsDelay,
     },
     // Block-I/O delay block: serializes through `task->delays->lock`
     // so count + total are atomic (unlike cpu_*).
@@ -1150,6 +1219,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
         is_dead: false,
         description: "Number of synchronous block-I/O wait windows (taskstats blkio_count).",
+        section: Section::TaskstatsDelay,
     },
     CtprofMetricDef {
         name: "blkio_delay_total_ns",
@@ -1158,6 +1228,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
         is_dead: false,
         description: "Cumulative ns waiting on synchronous block I/O (taskstats blkio_delay_total). Distinct from `iowait_sum` (schedstat).",
+        section: Section::TaskstatsDelay,
     },
     CtprofMetricDef {
         name: "blkio_delay_max_ns",
@@ -1166,6 +1237,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
         is_dead: false,
         description: "Longest single block-I/O wait observed, ns (taskstats blkio_delay_max).",
+        section: Section::TaskstatsDelay,
     },
     CtprofMetricDef {
         name: "blkio_delay_min_ns",
@@ -1174,6 +1246,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
         is_dead: false,
         description: "Shortest non-zero block-I/O wait observed, ns (taskstats blkio_delay_min). Sentinel 0 means \"no events observed\".",
+        section: Section::TaskstatsDelay,
     },
     // Swap-in delay block: OVERLAPS with thrashing_* — every
     // thrashing event is also a swapin event from the syscall
@@ -1185,6 +1258,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
         is_dead: false,
         description: "Number of swap-in wait windows (taskstats swapin_count). OVERLAPS with thrashing_delay_count — do not sum.",
+        section: Section::TaskstatsDelay,
     },
     CtprofMetricDef {
         name: "swapin_delay_total_ns",
@@ -1193,6 +1267,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
         is_dead: false,
         description: "Cumulative ns waiting for swap-in to complete (taskstats swapin_delay_total).",
+        section: Section::TaskstatsDelay,
     },
     CtprofMetricDef {
         name: "swapin_delay_max_ns",
@@ -1201,6 +1276,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
         is_dead: false,
         description: "Longest single swap-in wait observed, ns (taskstats swapin_delay_max).",
+        section: Section::TaskstatsDelay,
     },
     CtprofMetricDef {
         name: "swapin_delay_min_ns",
@@ -1209,6 +1285,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
         is_dead: false,
         description: "Shortest non-zero swap-in wait observed, ns (taskstats swapin_delay_min). Sentinel 0 means \"no events observed\".",
+        section: Section::TaskstatsDelay,
     },
     // Direct memory reclaim (free-pages) block.
     CtprofMetricDef {
@@ -1218,6 +1295,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
         is_dead: false,
         description: "Number of direct-reclaim wait windows (taskstats freepages_count).",
+        section: Section::TaskstatsDelay,
     },
     CtprofMetricDef {
         name: "freepages_delay_total_ns",
@@ -1226,6 +1304,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
         is_dead: false,
         description: "Cumulative ns waiting in direct memory reclaim (taskstats freepages_delay_total).",
+        section: Section::TaskstatsDelay,
     },
     CtprofMetricDef {
         name: "freepages_delay_max_ns",
@@ -1234,6 +1313,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
         is_dead: false,
         description: "Longest single direct-reclaim wait observed, ns (taskstats freepages_delay_max).",
+        section: Section::TaskstatsDelay,
     },
     CtprofMetricDef {
         name: "freepages_delay_min_ns",
@@ -1242,6 +1322,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
         is_dead: false,
         description: "Shortest non-zero direct-reclaim wait observed, ns (taskstats freepages_delay_min). Sentinel 0 means \"no events observed\".",
+        section: Section::TaskstatsDelay,
     },
     // Thrashing block: OVERLAPS with swapin_* (see above).
     CtprofMetricDef {
@@ -1251,6 +1332,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
         is_dead: false,
         description: "Number of thrashing wait windows (taskstats thrashing_count). OVERLAPS with swapin_delay_count — do not sum.",
+        section: Section::TaskstatsDelay,
     },
     CtprofMetricDef {
         name: "thrashing_delay_total_ns",
@@ -1259,6 +1341,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
         is_dead: false,
         description: "Cumulative ns waiting under thrashing pressure (taskstats thrashing_delay_total).",
+        section: Section::TaskstatsDelay,
     },
     CtprofMetricDef {
         name: "thrashing_delay_max_ns",
@@ -1267,6 +1350,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
         is_dead: false,
         description: "Longest single thrashing wait observed, ns (taskstats thrashing_delay_max).",
+        section: Section::TaskstatsDelay,
     },
     CtprofMetricDef {
         name: "thrashing_delay_min_ns",
@@ -1275,6 +1359,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
         is_dead: false,
         description: "Shortest non-zero thrashing wait observed, ns (taskstats thrashing_delay_min). Sentinel 0 means \"no events observed\".",
+        section: Section::TaskstatsDelay,
     },
     // Memory compaction block.
     CtprofMetricDef {
@@ -1284,6 +1369,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
         is_dead: false,
         description: "Number of memory-compaction wait windows (taskstats compact_count).",
+        section: Section::TaskstatsDelay,
     },
     CtprofMetricDef {
         name: "compact_delay_total_ns",
@@ -1292,6 +1378,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
         is_dead: false,
         description: "Cumulative ns waiting on memory compaction (taskstats compact_delay_total).",
+        section: Section::TaskstatsDelay,
     },
     CtprofMetricDef {
         name: "compact_delay_max_ns",
@@ -1300,6 +1387,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
         is_dead: false,
         description: "Longest single compaction wait observed, ns (taskstats compact_delay_max).",
+        section: Section::TaskstatsDelay,
     },
     CtprofMetricDef {
         name: "compact_delay_min_ns",
@@ -1308,6 +1396,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
         is_dead: false,
         description: "Shortest non-zero compaction wait observed, ns (taskstats compact_delay_min). Sentinel 0 means \"no events observed\".",
+        section: Section::TaskstatsDelay,
     },
     // Write-protect-copy (CoW) fault block.
     CtprofMetricDef {
@@ -1317,6 +1406,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
         is_dead: false,
         description: "Number of write-protect-copy (CoW) fault wait windows (taskstats wpcopy_count).",
+        section: Section::TaskstatsDelay,
     },
     CtprofMetricDef {
         name: "wpcopy_delay_total_ns",
@@ -1325,6 +1415,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
         is_dead: false,
         description: "Cumulative ns waiting on write-protect-copy faults (taskstats wpcopy_delay_total).",
+        section: Section::TaskstatsDelay,
     },
     CtprofMetricDef {
         name: "wpcopy_delay_max_ns",
@@ -1333,6 +1424,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
         is_dead: false,
         description: "Longest single write-protect-copy fault wait observed, ns (taskstats wpcopy_delay_max).",
+        section: Section::TaskstatsDelay,
     },
     CtprofMetricDef {
         name: "wpcopy_delay_min_ns",
@@ -1341,6 +1433,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
         is_dead: false,
         description: "Shortest non-zero write-protect-copy fault wait observed, ns (taskstats wpcopy_delay_min). Sentinel 0 means \"no events observed\".",
+        section: Section::TaskstatsDelay,
     },
     // IRQ-handler delay block. Updates from `delayacct_irq` in
     // `kernel/delayacct.c` — counts kernel-IRQ time charged to
@@ -1352,6 +1445,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
         is_dead: false,
         description: "Number of IRQ-handler windows charged to the task (taskstats irq_count).",
+        section: Section::TaskstatsDelay,
     },
     CtprofMetricDef {
         name: "irq_delay_total_ns",
@@ -1360,6 +1454,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
         is_dead: false,
         description: "Cumulative ns of IRQ handling charged to the task (taskstats irq_delay_total).",
+        section: Section::TaskstatsDelay,
     },
     CtprofMetricDef {
         name: "irq_delay_max_ns",
@@ -1368,6 +1463,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
         is_dead: false,
         description: "Longest single IRQ-handler window observed, ns (taskstats irq_delay_max).",
+        section: Section::TaskstatsDelay,
     },
     CtprofMetricDef {
         name: "irq_delay_min_ns",
@@ -1376,6 +1472,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
         is_dead: false,
         description: "Shortest non-zero IRQ-handler window observed, ns (taskstats irq_delay_min). Sentinel 0 means \"no events observed\".",
+        section: Section::TaskstatsDelay,
     },
     // Lifetime memory watermarks. Updates from `xacct_add_tsk` in
     // `kernel/tsacct.c` — kB → bytes conversion happens at parse
@@ -1392,6 +1489,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_XACCT"],
         is_dead: false,
         description: "Lifetime high-watermark of resident-set size, bytes (taskstats hiwater_rss). Distinct from smaps_rollup_kb[\"Rss\"] which is the CURRENT RSS.",
+        section: Section::TaskstatsDelay,
     },
     CtprofMetricDef {
         name: "hiwater_vm_bytes",
@@ -1400,6 +1498,7 @@ pub static CTPROF_METRICS: &[CtprofMetricDef] = &[
         config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_XACCT"],
         is_dead: false,
         description: "Lifetime high-watermark of virtual-memory size, bytes (taskstats hiwater_vm).",
+        section: Section::TaskstatsDelay,
     },
 ];
 
@@ -1524,6 +1623,21 @@ pub struct DerivedMetricDef {
     /// metrics map via `Aggregated::numeric()` and produces the
     /// derived scalar.
     pub compute: fn(&BTreeMap<String, Aggregated>) -> Option<DerivedValue>,
+    /// Section this derived metric belongs to for the
+    /// `--sections` per-row filter, mirroring
+    /// [`CtprofMetricDef::section`]. Most derivations tag
+    /// [`Section::Derived`]; the 9 derivations whose inputs are
+    /// taskstats fields (the eight `avg_*_delay_ns` averages
+    /// plus `total_offcpu_delay_ns`) tag
+    /// [`Section::TaskstatsDelay`] so an operator running
+    /// `--sections taskstats-delay` gets a full taskstats view
+    /// — the 34 raw rows AND the 9 derivations that depend on
+    /// them — without dragging in unrelated derived metrics.
+    /// The `## Derived metrics` table emitter checks
+    /// [`DisplayOptions::is_section_enabled`] per row before
+    /// rendering, and the outer-table gate opens whenever EITHER
+    /// section in the rendered set is enabled.
+    pub section: Section,
 }
 
 /// Helper: pull an input metric's `Aggregated::numeric()`
@@ -1582,6 +1696,7 @@ pub static CTPROF_DERIVED_METRICS: &[DerivedMetricDef] = &[
         inputs: &["nr_wakeups_affine", "nr_wakeups_affine_attempts"],
         is_ratio: true,
         compute: |m| ratio_compute(m, "nr_wakeups_affine", "nr_wakeups_affine_attempts"),
+        section: Section::Derived,
     },
     DerivedMetricDef {
         name: "avg_wait_ns",
@@ -1590,6 +1705,7 @@ pub static CTPROF_DERIVED_METRICS: &[DerivedMetricDef] = &[
         inputs: &["wait_sum", "wait_count"],
         is_ratio: false,
         compute: |m| ratio_compute(m, "wait_sum", "wait_count"),
+        section: Section::Derived,
     },
     // `voluntary_sleep_sum` derived metric was removed when
     // `voluntary_sleep_ns` became a first-class capture field.
@@ -1604,6 +1720,7 @@ pub static CTPROF_DERIVED_METRICS: &[DerivedMetricDef] = &[
         inputs: &["run_time_ns", "wait_time_ns"],
         is_ratio: true,
         compute: |m| ratio_of_sum_compute(m, "run_time_ns", "wait_time_ns"),
+        section: Section::Derived,
     },
     DerivedMetricDef {
         name: "avg_slice_ns",
@@ -1612,6 +1729,7 @@ pub static CTPROF_DERIVED_METRICS: &[DerivedMetricDef] = &[
         inputs: &["run_time_ns", "timeslices"],
         is_ratio: false,
         compute: |m| ratio_compute(m, "run_time_ns", "timeslices"),
+        section: Section::Derived,
     },
     DerivedMetricDef {
         name: "involuntary_csw_ratio",
@@ -1620,6 +1738,7 @@ pub static CTPROF_DERIVED_METRICS: &[DerivedMetricDef] = &[
         inputs: &["nonvoluntary_csw", "voluntary_csw"],
         is_ratio: true,
         compute: |m| ratio_of_sum_compute(m, "nonvoluntary_csw", "voluntary_csw"),
+        section: Section::Derived,
     },
     DerivedMetricDef {
         name: "disk_io_fraction",
@@ -1628,6 +1747,7 @@ pub static CTPROF_DERIVED_METRICS: &[DerivedMetricDef] = &[
         inputs: &["read_bytes", "rchar"],
         is_ratio: true,
         compute: |m| ratio_compute(m, "read_bytes", "rchar"),
+        section: Section::Derived,
     },
     DerivedMetricDef {
         name: "live_heap_estimate",
@@ -1640,6 +1760,7 @@ pub static CTPROF_DERIVED_METRICS: &[DerivedMetricDef] = &[
             let dealloc = input_scalar(m, "deallocated_bytes")?;
             Some(DerivedValue::Scalar(alloc - dealloc))
         },
+        section: Section::Derived,
     },
     DerivedMetricDef {
         name: "avg_iowait_ns",
@@ -1648,6 +1769,7 @@ pub static CTPROF_DERIVED_METRICS: &[DerivedMetricDef] = &[
         inputs: &["iowait_sum", "iowait_count"],
         is_ratio: false,
         compute: |m| ratio_compute(m, "iowait_sum", "iowait_count"),
+        section: Section::Derived,
     },
     // -- taskstats per-category averages (delay_total / count) --
     //
@@ -1665,6 +1787,7 @@ pub static CTPROF_DERIVED_METRICS: &[DerivedMetricDef] = &[
         inputs: &["cpu_delay_total_ns", "cpu_delay_count"],
         is_ratio: false,
         compute: |m| ratio_compute(m, "cpu_delay_total_ns", "cpu_delay_count"),
+        section: Section::TaskstatsDelay,
     },
     DerivedMetricDef {
         name: "avg_blkio_delay_ns",
@@ -1673,6 +1796,7 @@ pub static CTPROF_DERIVED_METRICS: &[DerivedMetricDef] = &[
         inputs: &["blkio_delay_total_ns", "blkio_delay_count"],
         is_ratio: false,
         compute: |m| ratio_compute(m, "blkio_delay_total_ns", "blkio_delay_count"),
+        section: Section::TaskstatsDelay,
     },
     DerivedMetricDef {
         name: "avg_swapin_delay_ns",
@@ -1681,6 +1805,7 @@ pub static CTPROF_DERIVED_METRICS: &[DerivedMetricDef] = &[
         inputs: &["swapin_delay_total_ns", "swapin_delay_count"],
         is_ratio: false,
         compute: |m| ratio_compute(m, "swapin_delay_total_ns", "swapin_delay_count"),
+        section: Section::TaskstatsDelay,
     },
     DerivedMetricDef {
         name: "avg_freepages_delay_ns",
@@ -1689,6 +1814,7 @@ pub static CTPROF_DERIVED_METRICS: &[DerivedMetricDef] = &[
         inputs: &["freepages_delay_total_ns", "freepages_delay_count"],
         is_ratio: false,
         compute: |m| ratio_compute(m, "freepages_delay_total_ns", "freepages_delay_count"),
+        section: Section::TaskstatsDelay,
     },
     DerivedMetricDef {
         name: "avg_thrashing_delay_ns",
@@ -1697,6 +1823,7 @@ pub static CTPROF_DERIVED_METRICS: &[DerivedMetricDef] = &[
         inputs: &["thrashing_delay_total_ns", "thrashing_delay_count"],
         is_ratio: false,
         compute: |m| ratio_compute(m, "thrashing_delay_total_ns", "thrashing_delay_count"),
+        section: Section::TaskstatsDelay,
     },
     DerivedMetricDef {
         name: "avg_compact_delay_ns",
@@ -1705,6 +1832,7 @@ pub static CTPROF_DERIVED_METRICS: &[DerivedMetricDef] = &[
         inputs: &["compact_delay_total_ns", "compact_delay_count"],
         is_ratio: false,
         compute: |m| ratio_compute(m, "compact_delay_total_ns", "compact_delay_count"),
+        section: Section::TaskstatsDelay,
     },
     DerivedMetricDef {
         name: "avg_wpcopy_delay_ns",
@@ -1713,6 +1841,7 @@ pub static CTPROF_DERIVED_METRICS: &[DerivedMetricDef] = &[
         inputs: &["wpcopy_delay_total_ns", "wpcopy_delay_count"],
         is_ratio: false,
         compute: |m| ratio_compute(m, "wpcopy_delay_total_ns", "wpcopy_delay_count"),
+        section: Section::TaskstatsDelay,
     },
     DerivedMetricDef {
         name: "avg_irq_delay_ns",
@@ -1721,6 +1850,7 @@ pub static CTPROF_DERIVED_METRICS: &[DerivedMetricDef] = &[
         inputs: &["irq_delay_total_ns", "irq_delay_count"],
         is_ratio: false,
         compute: |m| ratio_compute(m, "irq_delay_total_ns", "irq_delay_count"),
+        section: Section::TaskstatsDelay,
     },
     // -- taskstats off-CPU rollup --
     //
@@ -1762,6 +1892,7 @@ pub static CTPROF_DERIVED_METRICS: &[DerivedMetricDef] = &[
                 cpu + blkio + freepages + compact + wpcopy + irq + mem_overlap,
             ))
         },
+        section: Section::TaskstatsDelay,
     },
 ];
 
@@ -4424,7 +4555,10 @@ pub fn parse_columns(spec: &str, compare_side: bool) -> anyhow::Result<Vec<Colum
 #[non_exhaustive]
 pub enum Section {
     /// Per-thread metric table — the primary rows produced by
-    /// `build_row` / `aggregate`. Always rendered first.
+    /// `build_row` / `aggregate`, EXCLUDING the taskstats
+    /// genetlink-sourced rows which carry their own
+    /// [`Section::TaskstatsDelay`] tag for separate filtering.
+    /// Always rendered first.
     Primary,
     /// `## Derived metrics` section emitted from
     /// [`CTPROF_DERIVED_METRICS`].
@@ -4457,6 +4591,23 @@ pub enum Section {
     /// `switch_all`, `nr_rejected`, `hotplug_seq`,
     /// `enable_seq`).
     SchedExt,
+    /// Taskstats genetlink-sourced rows in the primary table —
+    /// the 34 fields covering the eight delay-accounting
+    /// categories (`cpu_delay_*`, `blkio_delay_*`,
+    /// `swapin_delay_*`, `freepages_delay_*`,
+    /// `thrashing_delay_*`, `compact_delay_*`, `wpcopy_delay_*`,
+    /// `irq_delay_*`) plus the two memory watermarks
+    /// (`hiwater_rss_bytes`, `hiwater_vm_bytes`). Renders inside
+    /// the primary table alongside [`Section::Primary`] rows;
+    /// each [`CtprofMetricDef`] carries a [`Self`] tag in its
+    /// [`CtprofMetricDef::section`] field, and the primary
+    /// table emitter checks
+    /// [`DisplayOptions::is_section_enabled`] per row so
+    /// `--sections taskstats-delay` shows only the taskstats
+    /// rows, `--sections primary` excludes them, and either
+    /// alone keeps the primary table open. Captured via the
+    /// kernel's TASKSTATS family in [`crate::taskstats`].
+    TaskstatsDelay,
 }
 
 impl Section {
@@ -4466,6 +4617,7 @@ impl Section {
     /// default-empty case treats it as "all on."
     pub const ALL: &'static [Section] = &[
         Section::Primary,
+        Section::TaskstatsDelay,
         Section::Derived,
         Section::CgroupStats,
         Section::Limits,
@@ -4482,6 +4634,7 @@ impl Section {
     pub fn cli_name(self) -> &'static str {
         match self {
             Section::Primary => "primary",
+            Section::TaskstatsDelay => "taskstats-delay",
             Section::Derived => "derived",
             Section::CgroupStats => "cgroup-stats",
             Section::Limits => "cgroup-limits",
@@ -4913,6 +5066,32 @@ fn render_diff_row_cells(row: &DiffRow, columns: &[Column]) -> Vec<String> {
     cells
 }
 
+/// Wrap a string-cell row in [`comfy_table::Cell`]s with blue
+/// foreground so derived-metric rows render visually distinct
+/// from the per-thread primary table when stdout is a TTY.
+/// Operators scanning a long compare or show output can locate
+/// the `## Derived metrics` rows at a glance instead of relying
+/// on the section header alone.
+///
+/// On a non-TTY stdout the comfy-table builder calls
+/// [`comfy_table::Table::force_no_tty`] (see
+/// [`crate::cli::new_table`]) which strips the ANSI escape
+/// sequences; the rendered output is byte-identical to the
+/// pre-color baseline for shell-pipeline consumers.
+///
+/// Color choice: blue contrasts with both the unstyled primary
+/// table and the stats compare verdict palette
+/// (`Color::Red` / `Color::Green` for REGRESSION /
+/// improvement) — derived rows do not carry a regression
+/// verdict of their own, so reusing the verdict colors here
+/// would conflict with the established convention.
+pub fn color_derived_cells(cells: Vec<String>) -> Vec<comfy_table::Cell> {
+    cells
+        .into_iter()
+        .map(|c| comfy_table::Cell::new(c).fg(comfy_table::Color::Blue))
+        .collect()
+}
+
 /// Render a [`DerivedRow`] into the column-by-column cell
 /// vector. Mirrors [`render_diff_row_cells`] but routes
 /// numeric cells through the typed-derived formatters.
@@ -5262,7 +5441,11 @@ pub fn write_metric_list<W: fmt::Write>(w: &mut W) -> fmt::Result {
         let (heading, desc) = match section {
             Section::Primary => (
                 "(no heading; first table)",
-                "Per-thread metric table — the primary aggregated rows.",
+                "Per-thread metric table — the primary aggregated rows EXCLUDING the taskstats genetlink rows (those carry the `taskstats-delay` tag).",
+            ),
+            Section::TaskstatsDelay => (
+                "(rendered inside the primary table)",
+                "Taskstats genetlink-sourced rows — eight delay-accounting categories (cpu/blkio/swapin/freepages/thrashing/compact/wpcopy/irq × count/total/max/min) plus hiwater_rss_bytes / hiwater_vm_bytes. Per-row filter inside the primary table.",
             ),
             Section::Derived => (
                 "## Derived metrics",
@@ -5425,7 +5608,19 @@ pub fn write_diff<W: fmt::Write>(
     };
 
     let columns = display.resolved_compare_columns();
-    if display.is_section_enabled(Section::Primary) {
+    // The primary table renders rows whose metric.section is
+    // enabled. Two sections share the table:
+    //   - Section::Primary: the 52 non-taskstats rows.
+    //   - Section::TaskstatsDelay: the 34 taskstats genetlink rows.
+    // The outer gate keeps the table open while EITHER section
+    // is enabled — `--sections taskstats-delay` alone still emits
+    // the table containing only the 34 taskstats rows;
+    // `--sections primary` alone emits the table containing only
+    // the 52 non-taskstats rows; either combined or the empty
+    // default ("all on") emits all rows.
+    if display.is_section_enabled(Section::Primary)
+        || display.is_section_enabled(Section::TaskstatsDelay)
+    {
         let mut table = display.new_table();
         let header_row: Vec<&str> = columns.iter().map(|c| c.header(group_header)).collect();
         table.set_header(header_row);
@@ -5437,13 +5632,37 @@ pub fn write_diff<W: fmt::Write>(
             if !display.is_metric_enabled(row.metric_name) {
                 continue;
             }
+            // Per-row section gate: skip rows whose
+            // `metric.section` is not enabled by the
+            // `--sections` filter. Mirrors the pattern used by
+            // the outer per-section gates below; the metric
+            // lookup returns `&'static CtprofMetricDef` from
+            // `CTPROF_METRICS` (cheap pointer indirection — no
+            // allocation per row) using the same name-keyed
+            // search `render_diff_row_cells` already performs.
+            let metric = CTPROF_METRICS
+                .iter()
+                .find(|m| m.name == row.metric_name)
+                .expect("metric_name comes from CTPROF_METRICS via build_row");
+            if !display.is_section_enabled(metric.section) {
+                continue;
+            }
             let cells = render_diff_row_cells(row, &columns);
             table.add_row(cells);
         }
         writeln!(w, "{table}")?;
     }
 
-    if display.is_section_enabled(Section::Derived) && !diff.derived_rows.is_empty() {
+    // Derived-table outer gate mirrors the primary-table pattern:
+    // open the table when EITHER `Section::Derived` (the eight
+    // pre-existing derivations) OR `Section::TaskstatsDelay` (the
+    // nine taskstats-derived rollups) is enabled. Per-row gating
+    // below keeps `--sections taskstats-delay` from leaking
+    // unrelated derivations into the table.
+    if (display.is_section_enabled(Section::Derived)
+        || display.is_section_enabled(Section::TaskstatsDelay))
+        && !diff.derived_rows.is_empty()
+    {
         writeln!(w)?;
         writeln!(w, "## Derived metrics")?;
         let mut dt = display.new_table();
@@ -5453,8 +5672,23 @@ pub fn write_diff<W: fmt::Write>(
             if !display.is_metric_enabled(row.metric_name) {
                 continue;
             }
+            // Per-row section gate: skip rows whose derivation's
+            // `section` is not enabled by the `--sections` filter.
+            // Mirrors the per-row gate in the primary table —
+            // taskstats-derived rows tag `Section::TaskstatsDelay`
+            // so `--sections taskstats-delay` sees them, while the
+            // eight pre-existing derivations tag `Section::Derived`.
+            let metric = CTPROF_DERIVED_METRICS
+                .iter()
+                .find(|d| d.name == row.metric_name)
+                .expect(
+                    "derived metric_name comes from CTPROF_DERIVED_METRICS via build_derived_row",
+                );
+            if !display.is_section_enabled(metric.section) {
+                continue;
+            }
             let cells = render_derived_row_cells(row, &columns);
-            dt.add_row(cells);
+            dt.add_row(color_derived_cells(cells));
         }
         writeln!(w, "{dt}")?;
     }
@@ -6109,6 +6343,7 @@ mod tests {
             cgroup_stats: BTreeMap::new(),
             probe_summary: None,
             parse_summary: None,
+            taskstats_summary: None,
             psi: crate::ctprof::Psi::default(),
             sched_ext: None,
         }
@@ -7287,6 +7522,7 @@ mod tests {
             config_gates: &["CONFIG_SCHEDSTATS"],
             is_dead: true,
             description: "synthetic dead-counter test fixture.",
+            section: Section::Primary,
         };
         let rendered = metric_display_name(&m);
         assert_eq!(

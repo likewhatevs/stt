@@ -196,6 +196,21 @@ pub struct CtprofSnapshot {
     /// [`CtprofParseSummary`].
     pub parse_summary: Option<CtprofParseSummary>,
 
+    /// Per-snapshot taskstats genetlink query outcome tally,
+    /// populated when the capture pass ran in production mode.
+    /// `None` mirrors `probe_summary` / `parse_summary`:
+    /// synthetic-tree tests pass `use_syscall_affinity=false`
+    /// which skips the netlink path entirely. `Some(_)` carries
+    /// the per-snapshot ok/eperm/esrch/other counts so an operator
+    /// can distinguish "no taskstats data because every tid raced
+    /// exit" (high `esrch_count`) from "no taskstats data because
+    /// the kernel was built without `CONFIG_TASKSTATS`" (the
+    /// netlink open failed up-front so every counter is zero)
+    /// from "no taskstats data because `CAP_NET_ADMIN` is missing"
+    /// (high `eperm_count`). See [`crate::taskstats::TaskstatsSummary`]
+    /// for the per-counter semantics and remediation guidance.
+    pub taskstats_summary: Option<crate::taskstats::TaskstatsSummary>,
+
     /// Host-level Pressure Stall Information, populated from
     /// `<proc_root>/pressure/{cpu,memory,io,irq}`. Captures
     /// system-wide stall pressure across the four kernel-exposed
@@ -4258,6 +4273,20 @@ fn capture_with(
     } else {
         None
     };
+    // Per-snapshot tally of `query_tid` outcomes. Allocated only
+    // when the production-mode capture path runs (`use_syscall_affinity`
+    // is true) — synthetic-tree tests skip it the same way they
+    // skip `parse_summary` and `probe_summary`. Counters bump
+    // even when `taskstats_client.is_none()` happened (open
+    // failed) — the per-tid loop simply never reaches
+    // `record_result` in that case, so every counter stays zero
+    // and the operator sees a tally of all-zeros pointing at the
+    // open-time tracing warning.
+    let mut taskstats_tally: Option<crate::taskstats::TaskstatsSummary> = if use_syscall_affinity {
+        Some(crate::taskstats::TaskstatsSummary::default())
+    } else {
+        None
+    };
 
     // Phase 2: sequential per-tid walk + ptrace reads.
     for tgid in &tgids {
@@ -4302,11 +4331,20 @@ fn capture_with(
             // doesn't support taskstats, the tid raced exit, the
             // socket was never opened) fall through to the zero
             // defaults already installed in
-            // `capture_thread_at_with_tally`.
-            if let Some(client) = taskstats_client.as_ref()
-                && let Ok(ds) = client.query_tid(tid as u32)
-            {
-                t.apply_delay_stats(&ds);
+            // `capture_thread_at_with_tally`. Each query result —
+            // success or failure — feeds the per-snapshot tally
+            // so the operator can distinguish "every tid raced
+            // exit" from "CAP_NET_ADMIN missing" from "kernel
+            // built without CONFIG_TASKSTATS" without parsing the
+            // tracing log.
+            if let Some(client) = taskstats_client.as_ref() {
+                let result = client.query_tid(tid as u32);
+                if let Some(tally) = taskstats_tally.as_mut() {
+                    tally.record_result(&result);
+                }
+                if let Ok(ds) = result {
+                    t.apply_delay_stats(&ds);
+                }
             }
             // Ghost-thread filter: a tid that exited between the
             // `iter_task_ids_at` readdir and our per-file reads
@@ -4367,6 +4405,7 @@ fn capture_with(
         cgroup_stats,
         probe_summary,
         parse_summary,
+        taskstats_summary: taskstats_tally,
         psi,
         sched_ext,
     }
@@ -4498,6 +4537,16 @@ fn capture_pid_with(
     } else {
         None
     };
+    // Per-snapshot tally — mirrors the `capture_with` discipline.
+    // Allocated only under `use_syscall_affinity` so the
+    // synthetic-tree code path keeps `taskstats_summary: None` on
+    // the resulting snapshot, identical to `parse_summary` /
+    // `probe_summary`.
+    let mut taskstats_tally: Option<crate::taskstats::TaskstatsSummary> = if use_syscall_affinity {
+        Some(crate::taskstats::TaskstatsSummary::default())
+    } else {
+        None
+    };
     for tid in iter_task_ids_at(proc_root, pid) {
         if let Some(t) = tally_opt.as_mut() {
             t.tids_walked += 1;
@@ -4528,10 +4577,14 @@ fn capture_pid_with(
         );
         t.allocated_bytes = crate::metric_types::Bytes(allocated_bytes);
         t.deallocated_bytes = crate::metric_types::Bytes(deallocated_bytes);
-        if let Some(client) = taskstats_client.as_ref()
-            && let Ok(ds) = client.query_tid(tid as u32)
-        {
-            t.apply_delay_stats(&ds);
+        if let Some(client) = taskstats_client.as_ref() {
+            let result = client.query_tid(tid as u32);
+            if let Some(tally) = taskstats_tally.as_mut() {
+                tally.record_result(&result);
+            }
+            if let Ok(ds) = result {
+                t.apply_delay_stats(&ds);
+            }
         }
         if t.comm.is_empty() && t.start_time_clock_ticks == 0 {
             if let Some(t) = tally_opt.as_mut() {
@@ -4574,6 +4627,7 @@ fn capture_pid_with(
         cgroup_stats,
         probe_summary,
         parse_summary,
+        taskstats_summary: taskstats_tally,
         psi,
         sched_ext,
     }
@@ -4856,6 +4910,7 @@ mod tests {
             })]),
             probe_summary: None,
             parse_summary: None,
+            taskstats_summary: None,
             psi: Psi::default(),
             sched_ext: None,
         };

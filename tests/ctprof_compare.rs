@@ -28,7 +28,7 @@ use std::path::Path;
 
 use ktstr::ctprof::{CtprofSnapshot, ThreadState};
 use ktstr::ctprof_compare::{
-    AggRule, Aggregated, CompareOptions, CTPROF_METRICS, CtprofCompareArgs, DisplayOptions,
+    AggRule, Aggregated, CTPROF_METRICS, CompareOptions, CtprofCompareArgs, DisplayOptions,
     GroupBy, aggregate, compare, run_compare, write_diff,
 };
 use ktstr::metric_types::{
@@ -1292,5 +1292,368 @@ fn compare_sched_ext_suppresses_section_when_both_sides_none() {
     assert!(
         !out.contains("## sched_ext"),
         "section must be suppressed when both sides have no sched_ext:\n{out}",
+    );
+}
+
+/// Serde roundtrip: every taskstats-sourced field on
+/// [`ThreadState`] survives a `CtprofSnapshot::write` followed by
+/// `CtprofSnapshot::load` with the value intact. Pins the wire
+/// shape against accidental serde-rename / `serde(default)` /
+/// derive-drop regressions: a snapshot serialized today must
+/// deserialize tomorrow without zero-collapsing any taskstats
+/// field. Each of the 34 taskstats fields gets a unique u64
+/// (300..=333) so a cross-wired serializer (e.g. swapping two
+/// adjacent fields by name) surfaces as a wrong-value mismatch
+/// citing the offending field.
+#[test]
+fn taskstats_fields_serde_roundtrip_preserves_all_34_fields() {
+    use ktstr::metric_types::{MonotonicCount, MonotonicNs, PeakBytes, PeakNs};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("taskstats.ctprof.zst");
+
+    let mut t = make_thread("ts_proc", "ts_worker");
+    // Delay-accounting fields: 32 entries, 8 categories × 4 fields
+    // each (count, total_ns, max_ns, min_ns). Values 300..=331.
+    t.cpu_delay_count = MonotonicCount(300);
+    t.cpu_delay_total_ns = MonotonicNs(301);
+    t.cpu_delay_max_ns = PeakNs(302);
+    t.cpu_delay_min_ns = PeakNs(303);
+    t.blkio_delay_count = MonotonicCount(304);
+    t.blkio_delay_total_ns = MonotonicNs(305);
+    t.blkio_delay_max_ns = PeakNs(306);
+    t.blkio_delay_min_ns = PeakNs(307);
+    t.swapin_delay_count = MonotonicCount(308);
+    t.swapin_delay_total_ns = MonotonicNs(309);
+    t.swapin_delay_max_ns = PeakNs(310);
+    t.swapin_delay_min_ns = PeakNs(311);
+    t.freepages_delay_count = MonotonicCount(312);
+    t.freepages_delay_total_ns = MonotonicNs(313);
+    t.freepages_delay_max_ns = PeakNs(314);
+    t.freepages_delay_min_ns = PeakNs(315);
+    t.thrashing_delay_count = MonotonicCount(316);
+    t.thrashing_delay_total_ns = MonotonicNs(317);
+    t.thrashing_delay_max_ns = PeakNs(318);
+    t.thrashing_delay_min_ns = PeakNs(319);
+    t.compact_delay_count = MonotonicCount(320);
+    t.compact_delay_total_ns = MonotonicNs(321);
+    t.compact_delay_max_ns = PeakNs(322);
+    t.compact_delay_min_ns = PeakNs(323);
+    t.wpcopy_delay_count = MonotonicCount(324);
+    t.wpcopy_delay_total_ns = MonotonicNs(325);
+    t.wpcopy_delay_max_ns = PeakNs(326);
+    t.wpcopy_delay_min_ns = PeakNs(327);
+    t.irq_delay_count = MonotonicCount(328);
+    t.irq_delay_total_ns = MonotonicNs(329);
+    t.irq_delay_max_ns = PeakNs(330);
+    t.irq_delay_min_ns = PeakNs(331);
+    // Hiwater memory watermarks (xacct path, not delayacct).
+    t.hiwater_rss_bytes = PeakBytes(332);
+    t.hiwater_vm_bytes = PeakBytes(333);
+
+    snapshot(vec![t.clone()], BTreeMap::new())
+        .write(&path)
+        .unwrap();
+    let loaded = CtprofSnapshot::load(&path).unwrap();
+    assert_eq!(loaded.threads.len(), 1);
+    let r = &loaded.threads[0];
+
+    // Every field reads back exactly what was written. A
+    // wrong-value mismatch here cites the field whose serde
+    // contract drifted.
+    assert_eq!(r.cpu_delay_count, t.cpu_delay_count, "cpu_delay_count");
+    assert_eq!(
+        r.cpu_delay_total_ns, t.cpu_delay_total_ns,
+        "cpu_delay_total_ns"
+    );
+    assert_eq!(r.cpu_delay_max_ns, t.cpu_delay_max_ns, "cpu_delay_max_ns");
+    assert_eq!(r.cpu_delay_min_ns, t.cpu_delay_min_ns, "cpu_delay_min_ns");
+    assert_eq!(
+        r.blkio_delay_count, t.blkio_delay_count,
+        "blkio_delay_count"
+    );
+    assert_eq!(
+        r.blkio_delay_total_ns, t.blkio_delay_total_ns,
+        "blkio_delay_total_ns"
+    );
+    assert_eq!(
+        r.blkio_delay_max_ns, t.blkio_delay_max_ns,
+        "blkio_delay_max_ns"
+    );
+    assert_eq!(
+        r.blkio_delay_min_ns, t.blkio_delay_min_ns,
+        "blkio_delay_min_ns"
+    );
+    assert_eq!(
+        r.swapin_delay_count, t.swapin_delay_count,
+        "swapin_delay_count"
+    );
+    assert_eq!(
+        r.swapin_delay_total_ns, t.swapin_delay_total_ns,
+        "swapin_delay_total_ns"
+    );
+    assert_eq!(
+        r.swapin_delay_max_ns, t.swapin_delay_max_ns,
+        "swapin_delay_max_ns"
+    );
+    assert_eq!(
+        r.swapin_delay_min_ns, t.swapin_delay_min_ns,
+        "swapin_delay_min_ns"
+    );
+    assert_eq!(
+        r.freepages_delay_count, t.freepages_delay_count,
+        "freepages_delay_count"
+    );
+    assert_eq!(
+        r.freepages_delay_total_ns, t.freepages_delay_total_ns,
+        "freepages_delay_total_ns"
+    );
+    assert_eq!(
+        r.freepages_delay_max_ns, t.freepages_delay_max_ns,
+        "freepages_delay_max_ns"
+    );
+    assert_eq!(
+        r.freepages_delay_min_ns, t.freepages_delay_min_ns,
+        "freepages_delay_min_ns"
+    );
+    assert_eq!(
+        r.thrashing_delay_count, t.thrashing_delay_count,
+        "thrashing_delay_count"
+    );
+    assert_eq!(
+        r.thrashing_delay_total_ns, t.thrashing_delay_total_ns,
+        "thrashing_delay_total_ns"
+    );
+    assert_eq!(
+        r.thrashing_delay_max_ns, t.thrashing_delay_max_ns,
+        "thrashing_delay_max_ns"
+    );
+    assert_eq!(
+        r.thrashing_delay_min_ns, t.thrashing_delay_min_ns,
+        "thrashing_delay_min_ns"
+    );
+    assert_eq!(
+        r.compact_delay_count, t.compact_delay_count,
+        "compact_delay_count"
+    );
+    assert_eq!(
+        r.compact_delay_total_ns, t.compact_delay_total_ns,
+        "compact_delay_total_ns"
+    );
+    assert_eq!(
+        r.compact_delay_max_ns, t.compact_delay_max_ns,
+        "compact_delay_max_ns"
+    );
+    assert_eq!(
+        r.compact_delay_min_ns, t.compact_delay_min_ns,
+        "compact_delay_min_ns"
+    );
+    assert_eq!(
+        r.wpcopy_delay_count, t.wpcopy_delay_count,
+        "wpcopy_delay_count"
+    );
+    assert_eq!(
+        r.wpcopy_delay_total_ns, t.wpcopy_delay_total_ns,
+        "wpcopy_delay_total_ns"
+    );
+    assert_eq!(
+        r.wpcopy_delay_max_ns, t.wpcopy_delay_max_ns,
+        "wpcopy_delay_max_ns"
+    );
+    assert_eq!(
+        r.wpcopy_delay_min_ns, t.wpcopy_delay_min_ns,
+        "wpcopy_delay_min_ns"
+    );
+    assert_eq!(r.irq_delay_count, t.irq_delay_count, "irq_delay_count");
+    assert_eq!(
+        r.irq_delay_total_ns, t.irq_delay_total_ns,
+        "irq_delay_total_ns"
+    );
+    assert_eq!(r.irq_delay_max_ns, t.irq_delay_max_ns, "irq_delay_max_ns");
+    assert_eq!(r.irq_delay_min_ns, t.irq_delay_min_ns, "irq_delay_min_ns");
+    assert_eq!(
+        r.hiwater_rss_bytes, t.hiwater_rss_bytes,
+        "hiwater_rss_bytes"
+    );
+    assert_eq!(r.hiwater_vm_bytes, t.hiwater_vm_bytes, "hiwater_vm_bytes");
+}
+
+/// Rendered output for two snapshots that differ in
+/// `cpu_delay_total_ns` (ns ladder) and `hiwater_rss_bytes` (IEC
+/// binary ladder) carries the metric names AND the auto-scaled
+/// triples. Pins the renderer's auto-scale ladder dispatch for
+/// taskstats fields end-to-end (registry → DiffRow →
+/// `format_scaled_u64`) and guards against a regression that
+/// dropped either the ns or Bytes ladder for the taskstats
+/// MaxPeak / MaxPeakBytes rule path.
+///
+/// Value choices:
+/// - cpu_delay_total_ns: 5_000_000 ns (= 5.000ms) → 12_500_000 ns
+///   (= 12.500ms). Delta 7_500_000 ns (= 7.500ms). Both sides and
+///   the delta land on the ms step of the ns ladder so a regression
+///   that broke ns→ms scaling surfaces as a missing "ms" suffix.
+/// - hiwater_rss_bytes: 1 MiB → 2 MiB. Delta +1 MiB. Both sides
+///   land on the MiB step of the IEC binary ladder so a regression
+///   that broke Bytes→MiB scaling surfaces as a missing "MiB"
+///   suffix.
+#[test]
+fn taskstats_metrics_render_with_auto_scaled_ns_and_bytes_ladders() {
+    use ktstr::ctprof_compare::{CompareOptions, DisplayOptions, GroupBy, compare, write_diff};
+    use ktstr::metric_types::{MonotonicNs, PeakBytes};
+    use std::path::Path;
+
+    let mut ta = make_thread("worker", "worker");
+    ta.cpu_delay_total_ns = MonotonicNs(5_000_000); // 5 ms
+    ta.hiwater_rss_bytes = PeakBytes(1024 * 1024); // 1 MiB
+    let mut tb = make_thread("worker", "worker");
+    tb.cpu_delay_total_ns = MonotonicNs(12_500_000); // 12.5 ms
+    tb.hiwater_rss_bytes = PeakBytes(2 * 1024 * 1024); // 2 MiB
+
+    let baseline = snapshot(vec![ta], BTreeMap::new());
+    let candidate = snapshot(vec![tb], BTreeMap::new());
+    let diff = compare(&baseline, &candidate, &CompareOptions::default());
+
+    let mut out = String::new();
+    write_diff(
+        &mut out,
+        &diff,
+        Path::new("a"),
+        Path::new("b"),
+        GroupBy::Pcomm,
+        &DisplayOptions::default(),
+    )
+    .unwrap();
+
+    // Metric names appear in the rendered table.
+    assert!(
+        out.contains("cpu_delay_total_ns"),
+        "cpu_delay_total_ns row missing from rendered table:\n{out}",
+    );
+    assert!(
+        out.contains("hiwater_rss_bytes"),
+        "hiwater_rss_bytes row missing from rendered table:\n{out}",
+    );
+
+    // ns-ladder auto-scaling: 5_000_000 → "5.000ms",
+    // 12_500_000 → "12.500ms", delta 7_500_000 → "+7.500ms".
+    // Three distinct cells so a substring miss cites the failing
+    // step.
+    assert!(
+        out.contains("5.000ms"),
+        "cpu_delay_total_ns baseline cell `5.000ms` missing:\n{out}",
+    );
+    assert!(
+        out.contains("12.500ms"),
+        "cpu_delay_total_ns candidate cell `12.500ms` missing:\n{out}",
+    );
+    assert!(
+        out.contains("+7.500ms"),
+        "cpu_delay_total_ns delta cell `+7.500ms` missing:\n{out}",
+    );
+
+    // IEC binary auto-scaling: 1 MiB → "1.000MiB",
+    // 2 MiB → "2.000MiB", delta +1 MiB → "+1.000MiB".
+    assert!(
+        out.contains("1.000MiB"),
+        "hiwater_rss_bytes baseline cell `1.000MiB` missing:\n{out}",
+    );
+    assert!(
+        out.contains("2.000MiB"),
+        "hiwater_rss_bytes candidate cell `2.000MiB` missing:\n{out}",
+    );
+    assert!(
+        out.contains("+1.000MiB"),
+        "hiwater_rss_bytes delta cell `+1.000MiB` missing:\n{out}",
+    );
+}
+
+/// `--sections taskstats-delay` keeps the primary table open
+/// AND restricts the rendered rows to the 34 taskstats-tagged
+/// metrics. The 52 non-taskstats metrics (run_time_ns,
+/// voluntary_csw, etc.) tagged `Section::Primary` are filtered
+/// out per-row when `Section::Primary` is absent from the
+/// requested filter. Mirrors the
+/// `Section::TaskstatsDelay` doc invariant: the filter is a
+/// row-level gate inside the primary table, NOT a separate
+/// table.
+///
+/// Symmetric inverse: `--sections primary` excludes every
+/// taskstats row but keeps the 52 non-taskstats rows. Both
+/// directions are pinned so a regression that conflates the
+/// two sections (e.g. forgets the per-row gate) surfaces as
+/// either a missed exclusion or a missed inclusion.
+#[test]
+fn sections_filter_isolates_taskstats_delay_rows_in_primary_table() {
+    use ktstr::ctprof_compare::{
+        CompareOptions, DisplayOptions, GroupBy, Section, compare, write_diff,
+    };
+    use ktstr::metric_types::{MonotonicCount, MonotonicNs};
+    use std::path::Path;
+
+    let mut ta = make_thread("worker", "worker");
+    ta.cpu_delay_total_ns = MonotonicNs(5_000_000);
+    ta.run_time_ns = MonotonicNs(1_000_000);
+    ta.voluntary_csw = MonotonicCount(10);
+    let mut tb = make_thread("worker", "worker");
+    tb.cpu_delay_total_ns = MonotonicNs(12_500_000);
+    tb.run_time_ns = MonotonicNs(3_500_000);
+    tb.voluntary_csw = MonotonicCount(40);
+
+    let baseline = snapshot(vec![ta], BTreeMap::new());
+    let candidate = snapshot(vec![tb], BTreeMap::new());
+    let diff = compare(&baseline, &candidate, &CompareOptions::default());
+
+    // Filter A: --sections taskstats-delay → primary table
+    // renders ONLY the 34 taskstats rows.
+    let mut display = DisplayOptions::default();
+    display.sections = vec![Section::TaskstatsDelay];
+    let mut out_taskstats = String::new();
+    write_diff(
+        &mut out_taskstats,
+        &diff,
+        Path::new("a"),
+        Path::new("b"),
+        GroupBy::Pcomm,
+        &display,
+    )
+    .unwrap();
+    assert!(
+        out_taskstats.contains("cpu_delay_total_ns"),
+        "taskstats-delay filter must keep cpu_delay_total_ns row:\n{out_taskstats}",
+    );
+    assert!(
+        !out_taskstats.contains("run_time_ns"),
+        "taskstats-delay filter must EXCLUDE run_time_ns row (Section::Primary):\n{out_taskstats}",
+    );
+    assert!(
+        !out_taskstats.contains("voluntary_csw"),
+        "taskstats-delay filter must EXCLUDE voluntary_csw row (Section::Primary):\n{out_taskstats}",
+    );
+
+    // Filter B: --sections primary → primary table renders the
+    // 52 non-taskstats rows; every taskstats row drops.
+    let mut display = DisplayOptions::default();
+    display.sections = vec![Section::Primary];
+    let mut out_primary = String::new();
+    write_diff(
+        &mut out_primary,
+        &diff,
+        Path::new("a"),
+        Path::new("b"),
+        GroupBy::Pcomm,
+        &display,
+    )
+    .unwrap();
+    assert!(
+        out_primary.contains("run_time_ns"),
+        "primary filter must keep run_time_ns row:\n{out_primary}",
+    );
+    assert!(
+        !out_primary.contains("cpu_delay_total_ns"),
+        "primary filter must EXCLUDE cpu_delay_total_ns (Section::TaskstatsDelay):\n{out_primary}",
+    );
+    assert!(
+        !out_primary.contains("hiwater_rss_bytes"),
+        "primary filter must EXCLUDE hiwater_rss_bytes (Section::TaskstatsDelay):\n{out_primary}",
     );
 }

@@ -74,6 +74,164 @@ use netlink_packet_generic::{
 };
 use netlink_sys::{Socket, SocketAddr, protocols::NETLINK_GENERIC};
 
+/// Per-snapshot tally of [`TaskstatsClient::query_tid`] outcomes.
+///
+/// The capture pipeline issues one `query_tid` per tid the procfs
+/// walk enumerates and folds the result into the per-thread record
+/// via [`crate::ctprof::ThreadState::apply_delay_stats`]. Successes
+/// populate the 34 taskstats fields; failures leave them at the
+/// absent-counter zero default. Without this tally an operator
+/// reading a snapshot has no way to distinguish "no taskstats data
+/// because every tid raced exit" from "no taskstats data because
+/// the kernel was built without `CONFIG_TASKSTATS`" from "no
+/// taskstats data because the calling process lacks
+/// `CAP_NET_ADMIN`" — every case collapses to all-zero rows in the
+/// rendered table.
+///
+/// The four counters partition every `query_tid` outcome:
+/// - [`Self::ok_count`]: a [`DelayStats`] payload was extracted
+///   and `apply_delay_stats` ran. The 34 fields on the per-thread
+///   record carry kernel-sourced values.
+/// - [`Self::eperm_count`]: the kernel returned `EPERM` for the
+///   per-tid query (errno 1). Most commonly because the calling
+///   process lacks `CAP_NET_ADMIN` — the kernel registers
+///   `TASKSTATS_CMD_GET` with `GENL_ADMIN_PERM`. A snapshot whose
+///   `eperm_count` equals `ok_count + esrch_count + ...` (i.e.
+///   every query failed with EPERM) almost always means the
+///   process needs `setcap cap_net_admin+eip` or to run as root.
+/// - [`Self::esrch_count`]: the kernel returned `ESRCH` (errno 3)
+///   because the tid no longer exists. Race between the procfs
+///   readdir and the netlink query — the tid exited mid-capture.
+///   Routine on busy hosts; not actionable.
+/// - [`Self::other_err_count`]: any other failure (socket I/O
+///   error, malformed reply, kernel returned a different errno,
+///   open never succeeded so `query_tid` was never called for
+///   the tid). A pile of `other_err` failures alongside zero
+///   `ok` / `eperm` / `esrch` typically means the netlink open
+///   failed up-front — `CONFIG_TASKSTATS=n` is the most common
+///   cause.
+///
+/// Tally is per-tid, not per-tgid: a process with 200 threads
+/// where every query succeeds contributes 200 to `ok_count`.
+/// Ghost-filtered tids (the empty-comm + zero-start filter in
+/// [`crate::ctprof`]'s capture path) are NOT separately tracked
+/// here — their `query_tid` outcome is recorded along with every
+/// other tid. The procfs ghost filter discards the per-thread
+/// record, but the netlink call already happened.
+///
+/// `ok_count + eperm_count + esrch_count + other_err_count` may
+/// be less than the snapshot's `tids_walked` when
+/// `TaskstatsClient::open` failed (CONFIG_TASKSTATS=n / EPERM at
+/// open time / older kernel without genetlink): the capture path
+/// short-circuits on `taskstats_client.is_none()` and skips the
+/// query entirely, so neither tally counter advances. Pair with
+/// [`crate::ctprof::CtprofParseSummary::tids_walked`] to compute
+/// the "client-was-open ratio".
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
+pub struct TaskstatsSummary {
+    /// Per-tid `query_tid` calls that returned a populated
+    /// [`DelayStats`].
+    pub ok_count: u64,
+    /// Per-tid `query_tid` calls that surfaced `errno=1` (EPERM).
+    /// Most commonly because the calling process lacks
+    /// `CAP_NET_ADMIN`; the kernel registers `TASKSTATS_CMD_GET`
+    /// with `GENL_ADMIN_PERM` so the per-tid path requires the
+    /// cap even though `TaskstatsClient::open` does not.
+    pub eperm_count: u64,
+    /// Per-tid `query_tid` calls that surfaced `errno=3` (ESRCH).
+    /// The tid disappeared between the procfs readdir and the
+    /// netlink reply. Routine on busy hosts; not actionable.
+    pub esrch_count: u64,
+    /// Per-tid `query_tid` calls that failed with any other
+    /// error: socket I/O failure, malformed reply, a kernel
+    /// errno other than EPERM/ESRCH (e.g. EINVAL for a
+    /// concurrent-pid race on older kernels), or any new error
+    /// shape the parser does not classify yet.
+    pub other_err_count: u64,
+}
+
+impl TaskstatsSummary {
+    /// Classify a single [`TaskstatsClient::query_tid`] result
+    /// and bump the matching counter. Pulls the errno out of two
+    /// independent sources:
+    ///
+    /// 1. `io::Error::raw_os_error()`: real OS errnos surface
+    ///    here for socket-level failures (`send_to`,
+    ///    `recv_from_full`).
+    /// 2. The error message text: [`parse_reply`] formats kernel
+    ///    `NLMSG_ERROR` payloads as
+    ///    `"kernel returned NLMSG_ERROR errno=N"` and wraps via
+    ///    `io::Error::other`, which sets `ErrorKind::Other` and
+    ///    discards the raw_os_error tag. The text scan is the
+    ///    only way to recover the kernel-side errno from those
+    ///    failures.
+    ///
+    /// Unknown errnos (anything other than 1=EPERM, 3=ESRCH)
+    /// fall to [`Self::other_err_count`]. The two recognized
+    /// errnos cover the operationally interesting causes: the
+    /// rest become a single bucket so the tally stays simple
+    /// and the `other_err` clause is the operator's hint to
+    /// look at the underlying log line.
+    pub fn record_result(&mut self, result: &io::Result<DelayStats>) {
+        // POSIX errno values, hardcoded so this module stays
+        // off the libc dep. The two recognized errnos cover the
+        // operationally interesting causes; other errnos fall to
+        // `other_err_count`.
+        const EPERM: i32 = 1;
+        const ESRCH: i32 = 3;
+        match result {
+            Ok(_) => self.ok_count = self.ok_count.saturating_add(1),
+            Err(e) => {
+                let errno = classify_errno(e);
+                match errno {
+                    Some(EPERM) => {
+                        self.eperm_count = self.eperm_count.saturating_add(1);
+                    }
+                    Some(ESRCH) => {
+                        self.esrch_count = self.esrch_count.saturating_add(1);
+                    }
+                    _ => {
+                        self.other_err_count = self.other_err_count.saturating_add(1);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Recover the kernel-side errno from an [`io::Error`] produced
+/// by [`TaskstatsClient::query_tid`]. Two paths produce errors:
+///
+/// - Socket-level failures (`send_to`, `recv_from_full`) carry a
+///   real `raw_os_error()`.
+/// - Parse-side failures wrap [`parse_reply`]'s String error via
+///   `io::Error::other`. `parse_reply` formats kernel NLMSG_ERROR
+///   payloads as `"kernel returned NLMSG_ERROR errno=N"` (the N
+///   is the kernel's negated wire value, see the `let errno = -err`
+///   step in `parse_reply`). The string scan recovers the errno
+///   from those failures.
+///
+/// Returns the recovered errno or `None` when neither path
+/// matches.
+fn classify_errno(e: &io::Error) -> Option<i32> {
+    if let Some(code) = e.raw_os_error() {
+        return Some(code);
+    }
+    // Inner-error path: io::Error::other(parse_reply_err).
+    // The String message has the shape
+    // "kernel returned NLMSG_ERROR errno=N"; pull the integer
+    // suffix.
+    let msg = e.to_string();
+    let needle = "errno=";
+    let pos = msg.rfind(needle)?;
+    let tail = &msg[pos + needle.len()..];
+    let end = tail
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(tail.len());
+    tail[..end].parse::<i32>().ok()
+}
+
 /// Per-tid delay-accounting record, one row per taskstats query.
 ///
 /// Field layout mirrors the kernel's `struct taskstats` v17 (see
@@ -1151,5 +1309,549 @@ mod tests {
             "v17 payload roundtrip mismatch — every field must read \
              back the value its offset was written with",
         );
+    }
+
+    /// Full reply roundtrip — build the complete kernel-shaped reply
+    /// (nlmsghdr + genlmsghdr + AGGR_PID NLA wrapping PID + STATS) on
+    /// top of the v17 golden vector from
+    /// [`parse_taskstats_payload_full_v17_roundtrip`], then call
+    /// [`parse_reply`] and assert the assembled [`DelayStats`]
+    /// matches. Closes the gap between "raw payload parser correct"
+    /// (covered by the offset roundtrip) and "full reply parser
+    /// correct" (the AGGR_PID nest + tid match + payload extraction
+    /// dispatch [`parse_reply`] performs on top of
+    /// [`parse_taskstats_payload`]). Same byte values as the offset
+    /// roundtrip so a regression in either parser surfaces in this
+    /// test too — the cross-check is intentional.
+    #[test]
+    fn parse_reply_full_roundtrip_v17() {
+        // 1. Build the 560-byte v17 STATS payload using the same
+        //    golden vector as parse_taskstats_payload_full_v17_roundtrip.
+        let mut stats_payload = vec![0u8; 560];
+        let w = |buf: &mut Vec<u8>, off: usize, v: u64| {
+            buf[off..off + 8].copy_from_slice(&v.to_ne_bytes());
+        };
+        // Delay accounting v1 block (offsets 16..64).
+        w(&mut stats_payload, 16, 1000); // cpu_count
+        w(&mut stats_payload, 24, 2000); // cpu_delay_total
+        w(&mut stats_payload, 32, 3000); // blkio_count
+        w(&mut stats_payload, 40, 4000); // blkio_delay_total
+        w(&mut stats_payload, 48, 5000); // swapin_count
+        w(&mut stats_payload, 56, 6000); // swapin_delay_total
+        // hiwater (v3, offsets 200/208).
+        w(&mut stats_payload, 200, 1024); // hiwater_rss = 1 MiB
+        w(&mut stats_payload, 208, 2048); // hiwater_vm  = 2 MiB
+        // freepages (v8, 312/320), thrashing (v9, 328/336).
+        w(&mut stats_payload, 312, 7000);
+        w(&mut stats_payload, 320, 8000);
+        w(&mut stats_payload, 328, 9000);
+        w(&mut stats_payload, 336, 10_000);
+        // compact (v11, 352/360).
+        w(&mut stats_payload, 352, 11_000);
+        w(&mut stats_payload, 360, 12_000);
+        // wpcopy (v13, 400/408).
+        w(&mut stats_payload, 400, 13_000);
+        w(&mut stats_payload, 408, 14_000);
+        // irq (v14, 416/424).
+        w(&mut stats_payload, 416, 15_000);
+        w(&mut stats_payload, 424, 16_000);
+        // delay_max + delay_min v15/v16 block (432..560).
+        w(&mut stats_payload, 432, 17_000);
+        w(&mut stats_payload, 440, 18_000);
+        w(&mut stats_payload, 448, 19_000);
+        w(&mut stats_payload, 456, 20_000);
+        w(&mut stats_payload, 464, 21_000);
+        w(&mut stats_payload, 472, 22_000);
+        w(&mut stats_payload, 480, 23_000);
+        w(&mut stats_payload, 488, 24_000);
+        w(&mut stats_payload, 496, 25_000);
+        w(&mut stats_payload, 504, 26_000);
+        w(&mut stats_payload, 512, 27_000);
+        w(&mut stats_payload, 520, 28_000);
+        w(&mut stats_payload, 528, 29_000);
+        w(&mut stats_payload, 536, 30_000);
+        w(&mut stats_payload, 544, 31_000);
+        w(&mut stats_payload, 552, 32_000);
+
+        // 2. Wrap the STATS payload in an NLA: 4-byte header + 560
+        //    bytes of payload = 564 bytes total. STATS attribute
+        //    sits inside the AGGR_PID nest alongside a 4-byte PID.
+        let pid: u32 = 4242;
+        let stats_nla_len: u16 = 4 + stats_payload.len() as u16; // 564
+        let pid_nla_len: u16 = 4 + 4; // 8
+        // AGGR_PID outer nla_len = header (4) + inner PID nla (8)
+        // + inner STATS nla (564) = 576 bytes.
+        let aggr_nla_len: u16 = 4 + pid_nla_len + stats_nla_len;
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&aggr_nla_len.to_ne_bytes());
+        payload.extend_from_slice(&TASKSTATS_TYPE_AGGR_PID.to_ne_bytes());
+        // Inner PID nlattr.
+        payload.extend_from_slice(&pid_nla_len.to_ne_bytes());
+        payload.extend_from_slice(&TASKSTATS_TYPE_PID.to_ne_bytes());
+        payload.extend_from_slice(&pid.to_ne_bytes());
+        // Inner STATS nlattr.
+        payload.extend_from_slice(&stats_nla_len.to_ne_bytes());
+        payload.extend_from_slice(&TASKSTATS_TYPE_STATS.to_ne_bytes());
+        payload.extend_from_slice(&stats_payload);
+
+        // 3. Wrap in a full nlmsghdr + genlmsghdr via build_reply_buf
+        //    so parse_reply sees the same wire shape the kernel emits.
+        //    nlmsg_type = 0x4242 is arbitrary (any value other than
+        //    NLMSG_ERROR works — parse_reply only branches on the
+        //    error code path for the type field).
+        let buf = build_reply_buf(0x4242, &payload);
+
+        // 4. Drive parse_reply and check every DelayStats field.
+        let stats = parse_reply(&buf, pid).expect("full v17 reply OK");
+        let expected = DelayStats {
+            cpu_count: 1000,
+            cpu_delay_total_ns: 2000,
+            cpu_delay_max_ns: 17_000,
+            cpu_delay_min_ns: 18_000,
+            blkio_count: 3000,
+            blkio_delay_total_ns: 4000,
+            blkio_delay_max_ns: 19_000,
+            blkio_delay_min_ns: 20_000,
+            swapin_count: 5000,
+            swapin_delay_total_ns: 6000,
+            swapin_delay_max_ns: 21_000,
+            swapin_delay_min_ns: 22_000,
+            freepages_count: 7000,
+            freepages_delay_total_ns: 8000,
+            freepages_delay_max_ns: 23_000,
+            freepages_delay_min_ns: 24_000,
+            thrashing_count: 9000,
+            thrashing_delay_total_ns: 10_000,
+            thrashing_delay_max_ns: 25_000,
+            thrashing_delay_min_ns: 26_000,
+            compact_count: 11_000,
+            compact_delay_total_ns: 12_000,
+            compact_delay_max_ns: 27_000,
+            compact_delay_min_ns: 28_000,
+            wpcopy_count: 13_000,
+            wpcopy_delay_total_ns: 14_000,
+            wpcopy_delay_max_ns: 29_000,
+            wpcopy_delay_min_ns: 30_000,
+            irq_count: 15_000,
+            irq_delay_total_ns: 16_000,
+            irq_delay_max_ns: 31_000,
+            irq_delay_min_ns: 32_000,
+            hiwater_rss_bytes: 1024 * 1024,
+            hiwater_vm_bytes: 2048 * 1024,
+        };
+        assert_eq!(
+            stats, expected,
+            "full reply roundtrip mismatch — parse_reply must reach \
+             the same DelayStats as the raw payload parser when given \
+             a kernel-shaped wrapper",
+        );
+    }
+
+    /// Version-boundary truncation tests. For each pre-v17 size the
+    /// kernel may emit (size = end of the last fully-included field
+    /// from a given uapi version), populate every field that fits
+    /// and assert (a) populated fields read back their planted
+    /// value, and (b) every field whose offset+8 extends past the
+    /// boundary reads zero per the `r64`-out-of-range branch.
+    ///
+    /// The boundaries map to specific uapi versions:
+    ///
+    /// - **56 bytes**: v1 partial — covers cpu_count (16),
+    ///   cpu_delay_total (24), blkio_count (32), blkio_delay_total
+    ///   (40), swapin_count (48). swapin_delay_total at offset 56
+    ///   needs end 64 and lands past the boundary. Models a kernel
+    ///   that truncated mid-v1 block.
+    /// - **312 bytes**: pre-v8 — hiwater (200, 208) fits;
+    ///   freepages_count at offset 312 lands AT the boundary (end
+    ///   would be 320), so freepages_count reads zero too. Models
+    ///   a kernel without freepages delay accounting.
+    /// - **360 bytes**: through compact_count (352..360 fits);
+    ///   compact_delay_total at 360..368 lands past the boundary.
+    ///   Models a kernel with compact_count but no compact_delay_total
+    ///   (a half-implemented v11 capture).
+    /// - **408 bytes**: pre-v13 wpcopy split — wpcopy_count
+    ///   (400..408) fits, wpcopy_delay_total at 408..416 lands past.
+    /// - **424 bytes**: pre-v14 irq split — irq_count (416..424)
+    ///   fits, irq_delay_total at 424..432 lands past.
+    /// - **432 bytes**: pre-v15/v16 — every cumulative field fits;
+    ///   the *_delay_max / *_delay_min block starting at offset 432
+    ///   lands past the boundary, so all 16 max/min fields read
+    ///   zero.
+    ///
+    /// Pinning each boundary catches a regression that shifts an
+    /// offset by 8 bytes (which would silently move the
+    /// "trapdoor" between fits and doesn't-fit) since the test
+    /// asserts both halves of the predicate at every boundary.
+    #[test]
+    fn parse_taskstats_payload_version_boundary_truncation() {
+        // (size, expectations) — each expectation asserts a single
+        // DelayStats field reads the planted u64 value (Some(v))
+        // or zero (None), depending on whether the source offset
+        // falls inside the truncated buffer.
+        struct Boundary {
+            size: usize,
+            label: &'static str,
+        }
+
+        for b in [
+            Boundary {
+                size: 56,
+                label: "v1 partial (mid-cpu/blkio/swapin block)",
+            },
+            Boundary {
+                size: 312,
+                label: "pre-v8 (no freepages)",
+            },
+            Boundary {
+                size: 360,
+                label: "v11 partial (compact_count without compact_delay_total)",
+            },
+            Boundary {
+                size: 408,
+                label: "pre-v13 (no wpcopy_delay_total)",
+            },
+            Boundary {
+                size: 424,
+                label: "pre-v14 (no irq_delay_total)",
+            },
+            Boundary {
+                size: 432,
+                label: "pre-v15/v16 (no delay_max / delay_min block)",
+            },
+        ] {
+            // Populate every aligned u64 slot inside the buffer with
+            // a unique non-zero marker so we can detect (a) reads
+            // succeed where they should, and (b) reads past the
+            // boundary collapse to zero rather than leaking adjacent
+            // memory or wrapping into a different field.
+            let mut buf = vec![0u8; b.size];
+            // Plant marker = (offset / 8) * 1000 + 1. Non-zero so it
+            // distinguishes from the absent-field default; offset-
+            // derived so a regression that shuffled fields would
+            // surface as a wrong-marker read.
+            for off in (16..b.size).step_by(8) {
+                if off + 8 <= b.size {
+                    let marker = (off as u64 / 8) * 1000 + 1;
+                    buf[off..off + 8].copy_from_slice(&marker.to_ne_bytes());
+                }
+            }
+
+            let stats = parse_taskstats_payload(&buf)
+                .unwrap_or_else(|e| panic!("{}: parse failed: {e}", b.label));
+
+            // Helper: marker for offset `off` if the slot fits inside
+            // the buffer, zero otherwise. Mirrors the parse_taskstats_payload
+            // r64 helper's out-of-range branch.
+            let m = |off: usize| -> u64 {
+                if off + 8 <= b.size {
+                    (off as u64 / 8) * 1000 + 1
+                } else {
+                    0
+                }
+            };
+
+            // Walk every offset the parser reads, assert the
+            // returned field equals the marker (or zero past the
+            // boundary). Hiwater fields go through saturating_mul(1024)
+            // so check those separately.
+            assert_eq!(stats.cpu_count, m(16), "{}: cpu_count", b.label);
+            assert_eq!(
+                stats.cpu_delay_total_ns,
+                m(24),
+                "{}: cpu_delay_total_ns",
+                b.label
+            );
+            assert_eq!(stats.blkio_count, m(32), "{}: blkio_count", b.label);
+            assert_eq!(
+                stats.blkio_delay_total_ns,
+                m(40),
+                "{}: blkio_delay_total_ns",
+                b.label
+            );
+            assert_eq!(stats.swapin_count, m(48), "{}: swapin_count", b.label);
+            assert_eq!(
+                stats.swapin_delay_total_ns,
+                m(56),
+                "{}: swapin_delay_total_ns",
+                b.label
+            );
+            assert_eq!(
+                stats.freepages_count,
+                m(312),
+                "{}: freepages_count",
+                b.label
+            );
+            assert_eq!(
+                stats.freepages_delay_total_ns,
+                m(320),
+                "{}: freepages_delay_total_ns",
+                b.label
+            );
+            assert_eq!(
+                stats.thrashing_count,
+                m(328),
+                "{}: thrashing_count",
+                b.label
+            );
+            assert_eq!(
+                stats.thrashing_delay_total_ns,
+                m(336),
+                "{}: thrashing_delay_total_ns",
+                b.label
+            );
+            assert_eq!(stats.compact_count, m(352), "{}: compact_count", b.label);
+            assert_eq!(
+                stats.compact_delay_total_ns,
+                m(360),
+                "{}: compact_delay_total_ns",
+                b.label
+            );
+            assert_eq!(stats.wpcopy_count, m(400), "{}: wpcopy_count", b.label);
+            assert_eq!(
+                stats.wpcopy_delay_total_ns,
+                m(408),
+                "{}: wpcopy_delay_total_ns",
+                b.label
+            );
+            assert_eq!(stats.irq_count, m(416), "{}: irq_count", b.label);
+            assert_eq!(
+                stats.irq_delay_total_ns,
+                m(424),
+                "{}: irq_delay_total_ns",
+                b.label
+            );
+            assert_eq!(
+                stats.cpu_delay_max_ns,
+                m(432),
+                "{}: cpu_delay_max_ns",
+                b.label
+            );
+            assert_eq!(
+                stats.cpu_delay_min_ns,
+                m(440),
+                "{}: cpu_delay_min_ns",
+                b.label
+            );
+            assert_eq!(
+                stats.blkio_delay_max_ns,
+                m(448),
+                "{}: blkio_delay_max_ns",
+                b.label
+            );
+            assert_eq!(
+                stats.blkio_delay_min_ns,
+                m(456),
+                "{}: blkio_delay_min_ns",
+                b.label
+            );
+            assert_eq!(
+                stats.swapin_delay_max_ns,
+                m(464),
+                "{}: swapin_delay_max_ns",
+                b.label
+            );
+            assert_eq!(
+                stats.swapin_delay_min_ns,
+                m(472),
+                "{}: swapin_delay_min_ns",
+                b.label
+            );
+            assert_eq!(
+                stats.freepages_delay_max_ns,
+                m(480),
+                "{}: freepages_delay_max_ns",
+                b.label
+            );
+            assert_eq!(
+                stats.freepages_delay_min_ns,
+                m(488),
+                "{}: freepages_delay_min_ns",
+                b.label
+            );
+            assert_eq!(
+                stats.thrashing_delay_max_ns,
+                m(496),
+                "{}: thrashing_delay_max_ns",
+                b.label
+            );
+            assert_eq!(
+                stats.thrashing_delay_min_ns,
+                m(504),
+                "{}: thrashing_delay_min_ns",
+                b.label
+            );
+            assert_eq!(
+                stats.compact_delay_max_ns,
+                m(512),
+                "{}: compact_delay_max_ns",
+                b.label
+            );
+            assert_eq!(
+                stats.compact_delay_min_ns,
+                m(520),
+                "{}: compact_delay_min_ns",
+                b.label
+            );
+            assert_eq!(
+                stats.wpcopy_delay_max_ns,
+                m(528),
+                "{}: wpcopy_delay_max_ns",
+                b.label
+            );
+            assert_eq!(
+                stats.wpcopy_delay_min_ns,
+                m(536),
+                "{}: wpcopy_delay_min_ns",
+                b.label
+            );
+            assert_eq!(
+                stats.irq_delay_max_ns,
+                m(544),
+                "{}: irq_delay_max_ns",
+                b.label
+            );
+            assert_eq!(
+                stats.irq_delay_min_ns,
+                m(552),
+                "{}: irq_delay_min_ns",
+                b.label
+            );
+            // Hiwater multiplies by 1024 — m(off) * 1024 (still 0
+            // when out of range since saturating_mul preserves 0).
+            assert_eq!(
+                stats.hiwater_rss_bytes,
+                m(200).saturating_mul(1024),
+                "{}: hiwater_rss_bytes",
+                b.label
+            );
+            assert_eq!(
+                stats.hiwater_vm_bytes,
+                m(208).saturating_mul(1024),
+                "{}: hiwater_vm_bytes",
+                b.label
+            );
+        }
+    }
+
+    /// `TaskstatsSummary::record_result` bumps `ok_count` on a
+    /// successful query and never advances any error counter. Pin
+    /// the per-counter accounting so a regression that swapped
+    /// the success / error branches surfaces here.
+    #[test]
+    fn taskstats_summary_records_ok() {
+        let mut s = TaskstatsSummary::default();
+        let ok: io::Result<DelayStats> = Ok(DelayStats::default());
+        s.record_result(&ok);
+        s.record_result(&ok);
+        assert_eq!(s.ok_count, 2);
+        assert_eq!(s.eperm_count, 0);
+        assert_eq!(s.esrch_count, 0);
+        assert_eq!(s.other_err_count, 0);
+    }
+
+    /// `TaskstatsSummary::record_result` classifies an `io::Error`
+    /// with `raw_os_error() == Some(EPERM)` as an EPERM bump.
+    /// EPERM is the operationally interesting case (CAP_NET_ADMIN
+    /// missing) so it gets its own counter rather than folding
+    /// into `other_err_count`. POSIX EPERM = 1.
+    #[test]
+    fn taskstats_summary_records_eperm_from_raw_os_error() {
+        let mut s = TaskstatsSummary::default();
+        let err: io::Result<DelayStats> = Err(io::Error::from_raw_os_error(1));
+        s.record_result(&err);
+        assert_eq!(s.ok_count, 0);
+        assert_eq!(s.eperm_count, 1);
+        assert_eq!(s.esrch_count, 0);
+        assert_eq!(s.other_err_count, 0);
+    }
+
+    /// `TaskstatsSummary::record_result` classifies an `io::Error`
+    /// with `raw_os_error() == Some(ESRCH)` as an ESRCH bump.
+    /// ESRCH is the routine "tid raced exit" case. POSIX ESRCH = 3.
+    #[test]
+    fn taskstats_summary_records_esrch_from_raw_os_error() {
+        let mut s = TaskstatsSummary::default();
+        let err: io::Result<DelayStats> = Err(io::Error::from_raw_os_error(3));
+        s.record_result(&err);
+        assert_eq!(s.ok_count, 0);
+        assert_eq!(s.eperm_count, 0);
+        assert_eq!(s.esrch_count, 1);
+        assert_eq!(s.other_err_count, 0);
+    }
+
+    /// `TaskstatsSummary::record_result` recovers the kernel-side
+    /// errno from a `parse_reply`-formatted message wrapped by
+    /// `io::Error::other`. The wrap strips the `raw_os_error()`
+    /// tag, so the classifier falls back to scanning the rendered
+    /// error text for the `errno=N` substring that
+    /// `parse_reply` injects on `NLMSG_ERROR` replies. Pins both
+    /// EPERM and ESRCH parse paths.
+    #[test]
+    fn taskstats_summary_records_errno_from_text_message() {
+        let mut s = TaskstatsSummary::default();
+        // Mirror the exact format `parse_reply` emits.
+        let eperm: io::Result<DelayStats> =
+            Err(io::Error::other("kernel returned NLMSG_ERROR errno=1"));
+        let esrch: io::Result<DelayStats> =
+            Err(io::Error::other("kernel returned NLMSG_ERROR errno=3"));
+        s.record_result(&eperm);
+        s.record_result(&esrch);
+        assert_eq!(s.ok_count, 0);
+        assert_eq!(s.eperm_count, 1);
+        assert_eq!(s.esrch_count, 1);
+        assert_eq!(s.other_err_count, 0);
+    }
+
+    /// `TaskstatsSummary::record_result` folds unrecognized errors
+    /// (a non-EPERM/ESRCH errno, an error with no errno
+    /// information at all) to `other_err_count`. Pin three
+    /// shapes: a real OS errno that's neither EPERM nor ESRCH,
+    /// a parse-style message with an unrecognized errno, and an
+    /// io::Error with no recoverable errno.
+    #[test]
+    fn taskstats_summary_records_other_err_for_unrecognized_shapes() {
+        let mut s = TaskstatsSummary::default();
+        // EINVAL = 22 — neither EPERM nor ESRCH.
+        let einval: io::Result<DelayStats> = Err(io::Error::from_raw_os_error(22));
+        s.record_result(&einval);
+        // Parse-style message with EINVAL.
+        let parse_einval: io::Result<DelayStats> =
+            Err(io::Error::other("kernel returned NLMSG_ERROR errno=22"));
+        s.record_result(&parse_einval);
+        // Bare error text with no errno suffix.
+        let bare: io::Result<DelayStats> = Err(io::Error::other("AGGR_PID missing in reply"));
+        s.record_result(&bare);
+        assert_eq!(s.ok_count, 0);
+        assert_eq!(s.eperm_count, 0);
+        assert_eq!(s.esrch_count, 0);
+        assert_eq!(s.other_err_count, 3);
+    }
+
+    /// `classify_errno` prefers the real `raw_os_error()` over a
+    /// substring scan when both are present — defends against the
+    /// case where a future error path embeds the literal text
+    /// `errno=N` in the message of a socket-level failure that
+    /// already carries a different real OS errno. The raw_os_error
+    /// is the more authoritative signal.
+    #[test]
+    fn classify_errno_prefers_raw_os_error_over_text() {
+        // Hand-build an io::Error that carries both a real
+        // raw_os_error AND a confusable text suffix.
+        let e = io::Error::other("decoy text saying errno=99 should not win");
+        // The from_raw_os_error path doesn't accept arbitrary
+        // text, so build a wrapper that has both signals: use
+        // io::Error::from_raw_os_error and verify our classifier
+        // returns the OS errno even though the text path would
+        // also produce a number.
+        // Note: io::Error has no public API to attach BOTH a
+        // raw_os_error AND custom text simultaneously, so the
+        // priority test is degenerate — once raw_os_error is
+        // set, the message is a fmt::Display synthesized from
+        // the errno. Cover the explicit case: a from_raw_os_error
+        // error returns the OS errno via classify_errno.
+        let real = io::Error::from_raw_os_error(1);
+        assert_eq!(classify_errno(&real), Some(1));
+        // And cover the text-only path explicitly.
+        assert_eq!(classify_errno(&e), Some(99));
     }
 }

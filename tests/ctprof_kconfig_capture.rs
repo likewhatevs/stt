@@ -206,9 +206,7 @@ fn ctprof_capture_records_wchar_under_iosync(ctx: &Ctx) -> Result<AssertResult> 
 /// kernel observes it, and the snapshot's PSI struct is
 /// populated either way.
 #[ktstr_test(llcs = 1, cores = 2, threads = 1, duration_s = 3)]
-fn ctprof_capture_reaches_host_psi_cpu_under_oversubscription(
-    ctx: &Ctx,
-) -> Result<AssertResult> {
+fn ctprof_capture_reaches_host_psi_cpu_under_oversubscription(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![Step {
         setup: vec![
             CgroupDef::named("cg_0")

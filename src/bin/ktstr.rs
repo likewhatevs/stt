@@ -922,7 +922,17 @@ fn write_show<W: std::fmt::Write>(
         keys
     };
 
-    if display_options.is_section_enabled(ctprof_compare::Section::Primary) {
+    // Primary table renders rows whose metric.section is
+    // enabled. Two sections share the table — Section::Primary
+    // (52 non-taskstats rows) and Section::TaskstatsDelay (34
+    // taskstats genetlink rows). The outer gate keeps the table
+    // open while EITHER section is enabled. Mirrors the
+    // ctprof_compare::write_diff outer-gate semantics so
+    // `--sections taskstats-delay` works identically across
+    // compare and show.
+    if display_options.is_section_enabled(ctprof_compare::Section::Primary)
+        || display_options.is_section_enabled(ctprof_compare::Section::TaskstatsDelay)
+    {
         let mut table = display_options.new_table();
         let header_row: Vec<&str> = resolved_columns
             .iter()
@@ -946,6 +956,14 @@ fn write_show<W: std::fmt::Write>(
                 // = no filter (default) per
                 // `is_metric_enabled`'s default-empty contract.
                 if !display_options.is_metric_enabled(metric.name) {
+                    continue;
+                }
+                // Per-row section gate: skip metrics whose
+                // `section` is not enabled by `--sections`. The
+                // outer gate above keeps the table open while
+                // either section is enabled; this inner gate
+                // restricts which rows appear inside the table.
+                if !display_options.is_section_enabled(metric.section) {
                     continue;
                 }
                 let Some(agg) = group.metrics.get(metric.name) else {
@@ -979,7 +997,15 @@ fn write_show<W: std::fmt::Write>(
     // ctprof_compare::write_diff but adapted for the
     // single-snapshot show layout (no baseline/candidate split,
     // one value cell per row).
-    if display_options.is_section_enabled(ctprof_compare::Section::Derived) && !groups.is_empty() {
+    // Derived-table outer gate mirrors write_diff: open the
+    // table when EITHER `Section::Derived` OR
+    // `Section::TaskstatsDelay` is enabled. Per-row gating below
+    // keeps `--sections taskstats-delay` from leaking
+    // non-taskstats derivations.
+    if (display_options.is_section_enabled(ctprof_compare::Section::Derived)
+        || display_options.is_section_enabled(ctprof_compare::Section::TaskstatsDelay))
+        && !groups.is_empty()
+    {
         let mut dt = display_options.new_table();
         let header_row: Vec<&str> = resolved_columns
             .iter()
@@ -1000,6 +1026,12 @@ fn write_show<W: std::fmt::Write>(
                 if !display_options.is_metric_enabled(d.name) {
                     continue;
                 }
+                // Per-row section gate: same shape as the primary
+                // table loop. Skip derivations whose section is
+                // not enabled.
+                if !display_options.is_section_enabled(d.section) {
+                    continue;
+                }
                 let value_cell = match (d.compute)(&group.metrics) {
                     Some(v) => ctprof_compare::format_derived_value_cell(v, d.ladder, d.is_ratio),
                     None => "-".to_string(),
@@ -1014,7 +1046,7 @@ fn write_show<W: std::fmt::Write>(
                         _ => "-".to_string(),
                     })
                     .collect();
-                dt.add_row(cells);
+                dt.add_row(ctprof_compare::color_derived_cells(cells));
             }
         }
         writeln!(w)?;
