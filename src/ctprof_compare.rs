@@ -6565,7 +6565,7 @@ pub fn write_diff<W: fmt::Write>(
             writeln!(w)?;
             writeln!(w, "## smaps_rollup")?;
             let mut st = display.new_table();
-            st.set_header(colored_header(&columns, "process"));
+            st.set_header(colored_header(&columns, "comm"));
 
             // For All mode, re-sort by cgroup hierarchy (keys are
             // compound cgroup\x00pcomm). Track segments for tree headings.
@@ -6676,7 +6676,7 @@ pub fn write_diff<W: fmt::Write>(
                         format!("{pct:+.1}%")
                     };
                     let cg_depth = last_segs.len();
-                    let group_label = format!("{}  {}", "  ".repeat(cg_depth + 1), sk);
+                    let group_label = format!("{}  {}", "  ".repeat(cg_depth + 1), display_process);
                     let delta_opt: Option<f64> = if av.is_some() && bv.is_some() {
                         Some(delta as f64)
                     } else {
@@ -6687,7 +6687,7 @@ pub fn write_diff<W: fmt::Write>(
                         .map(|c| match c {
                             Column::Group => group_label.clone(),
                             Column::Threads => String::new(),
-                            Column::Metric => display_process.to_string(),
+                            Column::Metric => sk.clone(),
                             Column::Arrow => value_cell.clone(),
                             Column::Delta => delta_cell.clone(),
                             Column::Pct => pct_cell.clone(),
