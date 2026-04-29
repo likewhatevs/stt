@@ -5643,11 +5643,20 @@ impl DisplayOptions {
     /// (`write_show` in `src/bin/ktstr.rs`) calls the underlying
     /// helpers directly through the same branch.
     pub fn new_table(&self) -> comfy_table::Table {
-        if self.wrap {
+        use comfy_table::ColumnConstraint;
+        let mut t = if self.wrap {
             crate::cli::new_wrapped_table()
         } else {
             crate::cli::new_table()
+        };
+        // Cap the first column (Group) so long names don't
+        // inflate the entire table width.
+        if let Some(col) = t.column_mut(0) {
+            col.set_constraint(ColumnConstraint::UpperBoundary(comfy_table::Width::Fixed(
+                40,
+            )));
         }
+        t
     }
 }
 
