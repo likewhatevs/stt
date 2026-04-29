@@ -6097,14 +6097,26 @@ pub fn write_diff<W: fmt::Write>(
             .collect();
 
         if group_by == GroupBy::All {
-            // Hierarchical: cgroup path → pcomm → metrics.
-            // Compound keys are `cgroup\x00pcomm`.
+            // Sort + truncate BEFORE organizing into the cgroup
+            // tree. primary_rows are already delta-sorted from
+            // compare(). Apply the line limit here so the tree
+            // only contains the top movers.
+            let limited_rows: Vec<&DiffRow> = if display.section_line_limit > 0 {
+                primary_rows
+                    .iter()
+                    .copied()
+                    .take(display.section_line_limit)
+                    .collect()
+            } else {
+                primary_rows.clone()
+            };
+
             struct HierRow<'a> {
                 cgroup: &'a str,
                 pcomm: &'a str,
                 row: &'a DiffRow,
             }
-            let mut hier: Vec<HierRow<'_>> = primary_rows
+            let mut hier: Vec<HierRow<'_>> = limited_rows
                 .iter()
                 .map(|row| {
                     let (cgroup, pcomm) = row
