@@ -1008,8 +1008,9 @@ fn write_show<W: std::fmt::Write>(
                 let Some(agg) = group.metrics.get(metric.name) else {
                     continue;
                 };
-                let metric_name = ctprof_compare::metric_display_name(metric).into_owned();
+                let metric_name = ctprof_compare::metric_display_name(metric).to_string();
                 let value_cell = ctprof_compare::format_value_cell(agg, metric.rule.ladder());
+                let tags_cell = ctprof_compare::metric_tags(metric);
                 let cells: Vec<String> = resolved_columns
                     .iter()
                     .map(|c| match c {
@@ -1017,11 +1018,7 @@ fn write_show<W: std::fmt::Write>(
                         ctprof_compare::Column::Threads => group.thread_count.to_string(),
                         ctprof_compare::Column::Metric => metric_name.clone(),
                         ctprof_compare::Column::Value => value_cell.clone(),
-                        // Compare-only columns never reach here under
-                        // run_show: parse_columns(compare_side=false)
-                        // rejects them at CLI parse time. Surface a
-                        // `-` for direct API callers that hand-build a
-                        // mismatched column set.
+                        ctprof_compare::Column::Tags => tags_cell.clone(),
                         _ => "-".to_string(),
                     })
                     .collect();
@@ -1086,6 +1083,7 @@ fn write_show<W: std::fmt::Write>(
                         ctprof_compare::Column::Threads => group.thread_count.to_string(),
                         ctprof_compare::Column::Metric => d.name.to_string(),
                         ctprof_compare::Column::Value => value_cell.clone(),
+                        ctprof_compare::Column::Tags => String::new(),
                         _ => "-".to_string(),
                     })
                     .collect();

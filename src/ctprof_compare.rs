@@ -18,7 +18,6 @@
 //! no-label principle for the broader stats comparison pipeline
 //! (see the `stats.rs` module doc).
 
-use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::Path;
@@ -1985,29 +1984,33 @@ pub static CTPROF_DERIVED_METRICS: &[DerivedMetricDef] = &[
 /// metric's own [`CtprofMetricDef::sched_class`] /
 /// [`CtprofMetricDef::config_gates`] / [`CtprofMetricDef::is_dead`]
 /// docs are the source of truth for what each spelling means.
-pub fn metric_display_name(metric: &CtprofMetricDef) -> Cow<'static, str> {
-    if metric.sched_class.is_none() && metric.config_gates.is_empty() && !metric.is_dead {
-        return Cow::Borrowed(metric.name);
-    }
-    let mut out = String::from(metric.name);
+pub fn metric_display_name(metric: &CtprofMetricDef) -> &'static str {
+    metric.name
+}
+
+pub fn metric_tags(metric: &CtprofMetricDef) -> String {
+    let mut out = String::new();
     if let Some(class) = metric.sched_class {
-        out.push_str(" [");
+        out.push('[');
         out.push_str(class);
         out.push(']');
     }
     if metric.is_dead {
-        out.push_str(" [dead]");
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str("[dead]");
     }
     for gate in metric.config_gates {
-        out.push_str(" [");
-        // Strip the `CONFIG_` prefix from the data field for
-        // display; full spelling is preserved in `config_gates`
-        // so the operator can grep kconfig directly.
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push('[');
         let short = gate.strip_prefix("CONFIG_").unwrap_or(gate);
         out.push_str(short);
         out.push(']');
     }
-    Cow::Owned(out)
+    out
 }
 
 /// Aggregated metric value for a single [`ThreadGroup`].
@@ -4605,6 +4608,9 @@ pub enum Column {
     Arrow,
     /// Aggregated value cell (show only).
     Value,
+    /// Bracketed tag suffix (sched_class + config_gates + dead).
+    /// Off by default — opt in with `--columns ...,tags`.
+    Tags,
 }
 
 impl Column {
@@ -4621,6 +4627,7 @@ impl Column {
             Column::Pct => "%",
             Column::Arrow => "arrow",
             Column::Value => "value",
+            Column::Tags => "tags",
         }
     }
 
@@ -4638,6 +4645,7 @@ impl Column {
             Column::Pct => "%",
             Column::Arrow => "value",
             Column::Value => "value",
+            Column::Tags => "tags",
         }
     }
 }
@@ -4710,6 +4718,7 @@ pub fn parse_columns(spec: &str, compare_side: bool) -> anyhow::Result<Vec<Colum
             Column::Delta,
             Column::Pct,
             Column::Arrow,
+            Column::Tags,
         ]
     } else {
         &[
@@ -4717,6 +4726,7 @@ pub fn parse_columns(spec: &str, compare_side: bool) -> anyhow::Result<Vec<Colum
             Column::Threads,
             Column::Metric,
             Column::Value,
+            Column::Tags,
         ]
     };
     let valid_names = allowed
@@ -5244,13 +5254,11 @@ fn render_threads_cell(a: usize, b: usize) -> String {
 /// per the resolved [`Column`] set. Caller emits the resulting
 /// `Vec<String>` straight into a comfy_table row.
 fn render_diff_row_cells(row: &DiffRow, columns: &[Column]) -> Vec<String> {
-    let metric_cell = metric_display_name(
-        CTPROF_METRICS
-            .iter()
-            .find(|m| m.name == row.metric_name)
-            .expect("metric_name comes from CTPROF_METRICS via build_row"),
-    )
-    .into_owned();
+    let metric_def = CTPROF_METRICS
+        .iter()
+        .find(|m| m.name == row.metric_name)
+        .expect("metric_name comes from CTPROF_METRICS via build_row");
+    let metric_cell = metric_display_name(metric_def).to_string();
     let mut cells = Vec::with_capacity(columns.len());
     for col in columns {
         let cell = match col {
@@ -5285,6 +5293,7 @@ fn render_diff_row_cells(row: &DiffRow, columns: &[Column]) -> Vec<String> {
             // directly through the Rust API. Surface a `-`
             // rather than panic.
             Column::Value => "-".to_string(),
+            Column::Tags => metric_tags(metric_def),
         };
         cells.push(cell);
     }
@@ -5345,6 +5354,7 @@ fn render_derived_row_cells(row: &DerivedRow, columns: &[Column]) -> Vec<String>
             },
             Column::Arrow => format_arrow_cell_derived(row),
             Column::Value => "-".to_string(),
+            Column::Tags => String::new(),
         };
         cells.push(cell);
     }
@@ -5772,11 +5782,7 @@ pub fn write_metric_list<W: fmt::Write>(w: &mut W) -> fmt::Result {
         // form so the `tags` column carries only the bracketed
         // suffixes — keeps the table scannable. When the metric
         // has no tags, the cell is empty.
-        let rendered = metric_display_name(m);
-        let tags = match rendered.strip_prefix(m.name) {
-            Some(rest) => rest.trim_start().to_string(),
-            None => String::new(),
-        };
+        let tags = metric_tags(m);
         table.add_row(vec![m.name.to_string(), tags, m.description.to_string()]);
     }
     writeln!(w, "{table}")?;
@@ -7785,11 +7791,11 @@ mod tests {
     #[test]
     fn metric_display_name_no_gates_returns_bare_name() {
         let policy = lookup_metric("policy");
-        assert_eq!(metric_display_name(policy).as_ref(), "policy");
-        assert!(matches!(metric_display_name(policy), Cow::Borrowed(_)));
+        assert_eq!(metric_display_name(policy), "policy");
+        assert!(metric_tags(policy).is_empty());
         let cpu_aff = lookup_metric("cpu_affinity");
-        assert_eq!(metric_display_name(cpu_aff).as_ref(), "cpu_affinity");
-        assert!(matches!(metric_display_name(cpu_aff), Cow::Borrowed(_)));
+        assert_eq!(metric_display_name(cpu_aff), "cpu_affinity");
+        assert!(metric_tags(cpu_aff).is_empty());
     }
 
     /// CFS-only + CONFIG_SCHEDSTATS metric renders BOTH tags in
@@ -7801,12 +7807,10 @@ mod tests {
     /// per the strip rule on `metric_display_name`. Pins both
     /// decoration paths against drift.
     #[test]
-    fn metric_display_name_renders_class_and_config_tags() {
+    fn metric_tags_renders_class_and_config_tags() {
         let m = lookup_metric("nr_wakeups_affine");
-        assert_eq!(
-            metric_display_name(m).as_ref(),
-            "nr_wakeups_affine [cfs-only] [SCHEDSTATS]"
-        );
+        assert_eq!(metric_display_name(m), "nr_wakeups_affine");
+        assert_eq!(metric_tags(m), "[cfs-only] [SCHEDSTATS]");
     }
 
     /// Multi-gate metric (`core_forceidle_sum` requires both
@@ -7815,12 +7819,10 @@ mod tests {
     /// no class tag emits — only the two config tags. Compact
     /// rendering strips the `CONFIG_` prefix from each gate.
     #[test]
-    fn metric_display_name_emits_each_config_gate_in_order() {
+    fn metric_tags_emits_each_config_gate_in_order() {
         let core = lookup_metric("core_forceidle_sum");
-        assert_eq!(
-            metric_display_name(core).as_ref(),
-            "core_forceidle_sum [SCHED_CORE] [SCHEDSTATS]"
-        );
+        assert_eq!(metric_display_name(core), "core_forceidle_sum");
+        assert_eq!(metric_tags(core), "[SCHED_CORE] [SCHEDSTATS]");
     }
 
     /// `fair_slice_ns` is fair-policy-only with no config gate.
@@ -7829,12 +7831,10 @@ mod tests {
     /// trailing `[]` or trailing whitespace when
     /// `config_gates` is empty.
     #[test]
-    fn metric_display_name_class_only_no_config_gate() {
+    fn metric_tags_class_only_no_config_gate() {
         let fair = lookup_metric("fair_slice_ns");
-        assert_eq!(
-            metric_display_name(fair).as_ref(),
-            "fair_slice_ns [fair-policy]"
-        );
+        assert_eq!(metric_display_name(fair), "fair_slice_ns");
+        assert_eq!(metric_tags(fair), "[fair-policy]");
     }
 
     /// Compact rendering: `metric_display_name` strips the
@@ -7844,15 +7844,7 @@ mod tests {
     /// of `metric_display_name` does not silently regress the
     /// strip behavior.
     #[test]
-    fn metric_display_name_strips_config_prefix() {
-        // Walk every registered metric. Every config gate must
-        // start with `CONFIG_` (Kconfig convention for the
-        // literal symbol the operator types into menuconfig);
-        // the rendered display must contain the post-strip
-        // form bracketed and must NOT contain the full `[CONFIG_X]`
-        // form anywhere in the rendered string. This guards
-        // against partial-strip regressions where one gate
-        // strips but a sibling does not.
+    fn metric_tags_strips_config_prefix() {
         for m in CTPROF_METRICS {
             for gate in m.config_gates {
                 assert!(
@@ -7861,20 +7853,16 @@ mod tests {
                      must spell the literal CONFIG_X kconfig symbol",
                     m.name,
                 );
-                let rendered = metric_display_name(m);
+                let tags = metric_tags(m);
                 let expected_short = gate.strip_prefix("CONFIG_").unwrap();
                 assert!(
-                    rendered.contains(&format!("[{expected_short}]")),
-                    "metric {} rendered as {rendered:?} but expected \
-                     to contain bracketed [{expected_short}] \
-                     (post-strip form of {gate:?})",
+                    tags.contains(&format!("[{expected_short}]")),
+                    "metric {} tags {tags:?} must contain [{expected_short}]",
                     m.name,
                 );
                 assert!(
-                    !rendered.contains(&format!("[{gate}]")),
-                    "metric {} rendered as {rendered:?} but the \
-                     full [{gate}] spelling must not appear — \
-                     the strip rule was violated",
+                    !tags.contains(&format!("[{gate}]")),
+                    "metric {} tags {tags:?} must not contain full [{gate}]",
                     m.name,
                 );
             }
@@ -7890,10 +7878,7 @@ mod tests {
     /// rather than waiting for a future kernel quirk that
     /// resurrects the tag.
     #[test]
-    fn metric_display_name_marks_synthetic_dead_counter() {
-        // Synthetic registry entry with is_dead: true to drive
-        // the [dead] rendering branch. Not added to the live
-        // registry — the test owns the value.
+    fn metric_tags_marks_synthetic_dead_counter() {
         let m = CtprofMetricDef {
             name: "synthetic_dead",
             rule: AggRule::SumCount(|_| crate::metric_types::MonotonicCount(0)),
@@ -7903,16 +7888,8 @@ mod tests {
             description: "synthetic dead-counter test fixture.",
             section: Section::Primary,
         };
-        let rendered = metric_display_name(&m);
-        assert_eq!(
-            rendered.as_ref(),
-            "synthetic_dead [dead] [SCHEDSTATS]",
-            "[dead] tag must render after sched_class slot and \
-             before the config_gates list — pinned at the \
-             synthetic-fixture level so a future registry add \
-             of an is_dead metric does not need to be edited \
-             here too",
-        );
+        assert_eq!(metric_display_name(&m), "synthetic_dead");
+        assert_eq!(metric_tags(&m), "[dead] [SCHEDSTATS]",);
         // Live registry must NOT carry any is_dead: true entries
         // until a kernel resurrects a dead counter or a new
         // always-zero counter is captured. Detects accidental
@@ -7936,12 +7913,10 @@ mod tests {
     /// matrix regression that previously left these tagged
     /// `None`.
     #[test]
-    fn metric_display_name_renders_non_ext_class() {
+    fn metric_tags_renders_non_ext_class() {
         let m = lookup_metric("wait_sum");
-        assert_eq!(
-            metric_display_name(m).as_ref(),
-            "wait_sum [non-ext] [SCHEDSTATS]",
-        );
+        assert_eq!(metric_display_name(m), "wait_sum");
+        assert_eq!(metric_tags(m), "[non-ext] [SCHEDSTATS]",);
     }
 
     /// Exhaustive tag pin: every metric in CTPROF_METRICS
