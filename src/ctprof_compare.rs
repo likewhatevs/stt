@@ -2775,8 +2775,23 @@ pub fn compare(
     diff.host_psi_a = baseline.psi;
     diff.host_psi_b = candidate.psi;
 
-    diff.smaps_rollup_a = collect_smaps_rollup(baseline, opts.no_thread_normalize);
-    diff.smaps_rollup_b = collect_smaps_rollup(candidate, opts.no_thread_normalize);
+    if group_by == GroupBy::All {
+        diff.smaps_rollup_a = collect_smaps_rollup_hierarchical(
+            baseline,
+            opts.no_thread_normalize,
+            &flatten,
+            cgroup_key_map.as_ref(),
+        );
+        diff.smaps_rollup_b = collect_smaps_rollup_hierarchical(
+            candidate,
+            opts.no_thread_normalize,
+            &flatten,
+            cgroup_key_map.as_ref(),
+        );
+    } else {
+        diff.smaps_rollup_a = collect_smaps_rollup(baseline, opts.no_thread_normalize);
+        diff.smaps_rollup_b = collect_smaps_rollup(candidate, opts.no_thread_normalize);
+    }
 
     diff.sched_ext_a = baseline.sched_ext.clone();
     diff.sched_ext_b = candidate.sched_ext.clone();
@@ -2855,15 +2870,44 @@ pub fn collect_smaps_rollup(
     snap: &CtprofSnapshot,
     no_thread_normalize: bool,
 ) -> BTreeMap<String, BTreeMap<String, u64>> {
+    collect_smaps_rollup_inner(snap, no_thread_normalize, false, &[], None)
+}
+
+pub fn collect_smaps_rollup_hierarchical(
+    snap: &CtprofSnapshot,
+    no_thread_normalize: bool,
+    flatten: &[glob::Pattern],
+    cgroup_key_map: Option<&BTreeMap<String, String>>,
+) -> BTreeMap<String, BTreeMap<String, u64>> {
+    collect_smaps_rollup_inner(snap, no_thread_normalize, true, flatten, cgroup_key_map)
+}
+
+fn collect_smaps_rollup_inner(
+    snap: &CtprofSnapshot,
+    no_thread_normalize: bool,
+    compound_cgroup: bool,
+    flatten: &[glob::Pattern],
+    cgroup_key_map: Option<&BTreeMap<String, String>>,
+) -> BTreeMap<String, BTreeMap<String, u64>> {
     let mut out: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::new();
     for t in &snap.threads {
         if t.smaps_rollup_kb.is_empty() {
             continue;
         }
-        let key = if no_thread_normalize {
+        let pcomm_key = if no_thread_normalize {
             format!("{}[{}]", t.pcomm, t.tgid)
         } else {
             pattern_key(&t.pcomm)
+        };
+        let key = if compound_cgroup {
+            let cg = flatten_cgroup_path(&t.cgroup, flatten);
+            let cg_key = match cgroup_key_map.and_then(|m| m.get(&cg)) {
+                Some(k) => k.clone(),
+                None => cg,
+            };
+            format!("{cg_key}\x00{pcomm_key}")
+        } else {
+            pcomm_key
         };
         let entry = out.entry(key).or_default();
         for (k, b) in t.smaps_rollup_bytes() {
@@ -6241,38 +6285,120 @@ pub fn write_diff<W: fmt::Write>(
         || display.is_section_enabled(Section::TaskstatsDelay))
         && !diff.derived_rows.is_empty()
     {
-        writeln!(w)?;
-        writeln!(w, "## Derived metrics")?;
-        let mut dt = display.new_table();
-        dt.set_header(colored_header(&columns, group_header));
-        for row in &diff.derived_rows {
-            if !display.is_metric_enabled(row.metric_name) {
-                continue;
+        let derived_rows: Vec<&DerivedRow> = diff
+            .derived_rows
+            .iter()
+            .filter(|row| {
+                if !display.is_metric_enabled(row.metric_name) {
+                    return false;
+                }
+                let metric = CTPROF_DERIVED_METRICS
+                    .iter()
+                    .find(|d| d.name == row.metric_name)
+                    .expect("derived metric_name from CTPROF_DERIVED_METRICS");
+                display.is_section_enabled(metric.section)
+            })
+            .collect();
+
+        if group_by == GroupBy::All {
+            // Hierarchical derived rendering — same tree as primary.
+            let limited: Vec<&DerivedRow> = if display.section_line_limit > 0 {
+                derived_rows
+                    .iter()
+                    .copied()
+                    .take(display.section_line_limit)
+                    .collect()
+            } else {
+                derived_rows
+            };
+            struct DHier<'a> {
+                cgroup: &'a str,
+                pcomm: &'a str,
+                row: &'a DerivedRow,
             }
-            // Per-row section gate: skip rows whose derivation's
-            // `section` is not enabled by the `--sections` filter.
-            // Mirrors the per-row gate in the primary table —
-            // taskstats-derived rows tag `Section::TaskstatsDelay`
-            // so `--sections taskstats-delay` sees them, while the
-            // eight pre-existing derivations tag `Section::Derived`.
-            let metric = CTPROF_DERIVED_METRICS
+            let mut hier: Vec<DHier<'_>> = limited
                 .iter()
-                .find(|d| d.name == row.metric_name)
-                .expect(
-                    "derived metric_name comes from CTPROF_DERIVED_METRICS via build_derived_row",
-                );
-            if !display.is_section_enabled(metric.section) {
-                continue;
-            }
-            let string_cells = render_derived_row_cells(row, &columns);
-            let cells: Vec<comfy_table::Cell> = string_cells
-                .into_iter()
-                .zip(columns.iter())
-                .map(|(s, col)| color_diff_cell(s, *col, row.delta, None))
+                .map(|row| {
+                    let (cg, pc) = row
+                        .group_key
+                        .split_once('\x00')
+                        .unwrap_or(("", &row.group_key));
+                    DHier {
+                        cgroup: cg,
+                        pcomm: pc,
+                        row,
+                    }
+                })
                 .collect();
-            dt.add_row(cells);
+            hier.sort_by(|a, b| a.cgroup.cmp(b.cgroup).then_with(|| a.pcomm.cmp(b.pcomm)));
+
+            writeln!(w)?;
+            writeln!(w, "## Derived metrics")?;
+            let mut dt = display.new_table();
+            dt.set_header(colored_header(&columns, "pcomm"));
+            let mut last_segs: Vec<&str> = Vec::new();
+            let depth_color = |d: usize| -> comfy_table::Color {
+                match d {
+                    0 => comfy_table::Color::Green,
+                    1 => comfy_table::Color::Cyan,
+                    _ => comfy_table::Color::DarkGrey,
+                }
+            };
+            for h in &hier {
+                let segs: Vec<&str> = h.cgroup.split('/').filter(|s| !s.is_empty()).collect();
+                let common = segs
+                    .iter()
+                    .zip(last_segs.iter())
+                    .take_while(|(a, b)| a == b)
+                    .count();
+                if common < last_segs.len() || segs.len() > last_segs.len() {
+                    for (depth, seg) in segs.iter().enumerate().skip(common) {
+                        let indent = "  ".repeat(depth);
+                        let label = format!("{indent}{seg}");
+                        let hcells: Vec<comfy_table::Cell> = columns
+                            .iter()
+                            .map(|c| {
+                                if *c == Column::Group {
+                                    comfy_table::Cell::new(&label)
+                                        .fg(depth_color(depth))
+                                        .add_attribute(comfy_table::Attribute::Bold)
+                                } else {
+                                    comfy_table::Cell::new("")
+                                }
+                            })
+                            .collect();
+                        dt.add_row(hcells);
+                    }
+                    last_segs = segs;
+                }
+                let mut cells = render_derived_row_cells(h.row, &columns);
+                if let Some(pos) = columns.iter().position(|c| *c == Column::Group) {
+                    cells[pos] = format!("  {}", h.pcomm);
+                }
+                let colored: Vec<comfy_table::Cell> = cells
+                    .into_iter()
+                    .zip(columns.iter())
+                    .map(|(s, col)| color_diff_cell(s, *col, h.row.delta, None))
+                    .collect();
+                dt.add_row(colored);
+            }
+            writeln!(w, "{dt}")?;
+        } else {
+            writeln!(w)?;
+            writeln!(w, "## Derived metrics")?;
+            let mut dt = display.new_table();
+            dt.set_header(colored_header(&columns, group_header));
+            for row in &derived_rows {
+                let string_cells = render_derived_row_cells(row, &columns);
+                let cells: Vec<comfy_table::Cell> = string_cells
+                    .into_iter()
+                    .zip(columns.iter())
+                    .map(|(s, col)| color_diff_cell(s, *col, row.delta, None))
+                    .collect();
+                dt.add_row(cells);
+            }
+            writeln!(w, "{dt}")?;
         }
-        writeln!(w, "{dt}")?;
     }
 
     if group_by == GroupBy::Cgroup
@@ -6687,15 +6813,69 @@ pub fn write_diff<W: fmt::Write>(
         if any_delta {
             writeln!(w)?;
             writeln!(w, "## smaps_rollup")?;
+            let smaps_cols = ["process", "key", "value", "delta", "%"];
             let mut st = display.new_table();
-            st.set_header(vec![
-                comfy_table::Cell::new("process").fg(comfy_table::Color::Cyan),
-                comfy_table::Cell::new("key").fg(comfy_table::Color::Cyan),
-                comfy_table::Cell::new("value").fg(comfy_table::Color::Cyan),
-                comfy_table::Cell::new("delta").fg(comfy_table::Color::Cyan),
-                comfy_table::Cell::new("%").fg(comfy_table::Color::Cyan),
-            ]);
-            for pkey in &sorted_process_keys {
+            st.set_header(
+                smaps_cols
+                    .iter()
+                    .map(|h| comfy_table::Cell::new(*h).fg(comfy_table::Color::Cyan))
+                    .collect::<Vec<_>>(),
+            );
+
+            // For All mode, re-sort by cgroup hierarchy (keys are
+            // compound cgroup\x00pcomm). Track segments for tree headings.
+            let is_compound = group_by == GroupBy::All;
+            let mut sorted_keys = sorted_process_keys.clone();
+            if is_compound {
+                sorted_keys.sort();
+            }
+
+            let mut last_segs: Vec<&str> = Vec::new();
+            let depth_color = |d: usize| -> comfy_table::Color {
+                match d {
+                    0 => comfy_table::Color::Green,
+                    1 => comfy_table::Color::Cyan,
+                    _ => comfy_table::Color::DarkGrey,
+                }
+            };
+
+            for pkey in &sorted_keys {
+                let (cg_part, display_process) = if is_compound {
+                    pkey.split_once('\x00').unwrap_or(("", pkey))
+                } else {
+                    ("", pkey.as_str())
+                };
+
+                if is_compound {
+                    let segs: Vec<&str> = cg_part.split('/').filter(|s| !s.is_empty()).collect();
+                    let common = segs
+                        .iter()
+                        .zip(last_segs.iter())
+                        .take_while(|(a, b)| a == b)
+                        .count();
+                    if common < last_segs.len() || segs.len() > last_segs.len() {
+                        for (depth, seg) in segs.iter().enumerate().skip(common) {
+                            let indent = "  ".repeat(depth);
+                            let label = format!("{indent}{seg}");
+                            let hcells: Vec<comfy_table::Cell> = smaps_cols
+                                .iter()
+                                .enumerate()
+                                .map(|(i, _)| {
+                                    if i == 0 {
+                                        comfy_table::Cell::new(&label)
+                                            .fg(depth_color(depth))
+                                            .add_attribute(comfy_table::Attribute::Bold)
+                                    } else {
+                                        comfy_table::Cell::new("")
+                                    }
+                                })
+                                .collect();
+                            st.add_row(hcells);
+                        }
+                        last_segs = segs;
+                    }
+                }
+
                 let a = diff.smaps_rollup_a.get(*pkey);
                 let b = diff.smaps_rollup_b.get(*pkey);
                 let mut keys_union: std::collections::BTreeSet<&String> =
@@ -6730,19 +6910,24 @@ pub fn write_diff<W: fmt::Write>(
                         let pct = (delta as f64 / a_val as f64) * 100.0;
                         format!("{pct:+.1}%")
                     };
-                    let delta_color = if delta > 0 {
+                    let dc = if delta > 0 {
                         comfy_table::Color::Yellow
                     } else if delta < 0 {
                         comfy_table::Color::Magenta
                     } else {
                         comfy_table::Color::White
                     };
+                    let proc_label = if is_compound {
+                        format!("  {display_process}")
+                    } else {
+                        display_process.to_string()
+                    };
                     st.add_row(vec![
-                        comfy_table::Cell::new(pkey.to_string()),
+                        comfy_table::Cell::new(proc_label),
                         comfy_table::Cell::new(sk.clone()),
                         comfy_table::Cell::new(value_cell),
-                        comfy_table::Cell::new(delta_cell).fg(delta_color),
-                        comfy_table::Cell::new(pct_cell).fg(delta_color),
+                        comfy_table::Cell::new(delta_cell).fg(dc),
+                        comfy_table::Cell::new(pct_cell).fg(dc),
                     ]);
                 }
             }
