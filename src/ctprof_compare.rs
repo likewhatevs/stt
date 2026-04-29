@@ -3409,8 +3409,8 @@ pub fn build_groups(
     // Suppressed when `no_thread_normalize` is set — the gate is
     // meaningless once each thread groups by its literal name.
     let pattern_field: Option<fn(&ThreadState) -> &str> = match (group_by, no_thread_normalize) {
-        (GroupBy::Comm, false) => Some(|t: &ThreadState| t.comm.as_str()),
-        (GroupBy::Pcomm | GroupBy::All, false) => Some(|t: &ThreadState| t.pcomm.as_str()),
+        (GroupBy::Comm | GroupBy::All, false) => Some(|t: &ThreadState| t.comm.as_str()),
+        (GroupBy::Pcomm, false) => Some(|t: &ThreadState| t.pcomm.as_str()),
         _ => None,
     };
     let local_counts: Option<BTreeMap<String, usize>> = match (pattern_field, pattern_counts) {
@@ -3439,7 +3439,12 @@ pub fn build_groups(
                 } else {
                     pattern_key(&t.pcomm)
                 };
-                format!("{cg_key}\x00{pcomm_key}")
+                let comm_key = if no_thread_normalize {
+                    t.comm.clone()
+                } else {
+                    pattern_key(&t.comm)
+                };
+                format!("{cg_key}\x00{pcomm_key}\x00{comm_key}")
             }
             // Pcomm and Comm share the same shape: when
             // normalization is enabled, route the chosen field
@@ -6099,7 +6104,7 @@ pub fn write_diff<W: fmt::Write>(
         GroupBy::Cgroup => "cgroup",
         GroupBy::Comm => "comm-pattern",
         GroupBy::CommExact => "comm",
-        GroupBy::All => "pcomm",
+        GroupBy::All => "comm",
     };
 
     let columns = display.resolved_compare_columns();
@@ -6150,25 +6155,36 @@ pub fn write_diff<W: fmt::Write>(
             struct HierRow<'a> {
                 cgroup: &'a str,
                 pcomm: &'a str,
+                comm: &'a str,
                 row: &'a DiffRow,
             }
             let mut hier: Vec<HierRow<'_>> = limited_rows
                 .iter()
                 .map(|row| {
-                    let (cgroup, pcomm) = row
-                        .group_key
-                        .split_once('\x00')
-                        .unwrap_or(("", &row.group_key));
-                    HierRow { cgroup, pcomm, row }
+                    let mut parts = row.group_key.splitn(3, '\x00');
+                    let cgroup = parts.next().unwrap_or("");
+                    let pcomm = parts.next().unwrap_or("");
+                    let comm = parts.next().unwrap_or(pcomm);
+                    HierRow {
+                        cgroup,
+                        pcomm,
+                        comm,
+                        row,
+                    }
                 })
                 .collect();
-            hier.sort_by(|a, b| a.cgroup.cmp(b.cgroup).then_with(|| a.pcomm.cmp(b.pcomm)));
+            hier.sort_by(|a, b| {
+                a.cgroup
+                    .cmp(b.cgroup)
+                    .then_with(|| a.pcomm.cmp(b.pcomm))
+                    .then_with(|| a.comm.cmp(b.comm))
+            });
 
             // Single table with separator rows for cgroup headings.
             // Keeps column widths consistent across the entire view.
             let mut last_segments: Vec<&str> = Vec::new();
             let mut table = display.new_table();
-            table.set_header(colored_header(&columns, "pcomm"));
+            table.set_header(colored_header(&columns, "comm"));
 
             let depth_color = |depth: usize| -> comfy_table::Color {
                 match depth {
@@ -6178,6 +6194,7 @@ pub fn write_diff<W: fmt::Write>(
                 }
             };
 
+            let mut last_pcomm = "";
             for h in &hier {
                 let segments: Vec<&str> = h.cgroup.split('/').filter(|s| !s.is_empty()).collect();
 
@@ -6187,7 +6204,9 @@ pub fn write_diff<W: fmt::Write>(
                     .take_while(|(a, b)| a == b)
                     .count();
 
-                if common < last_segments.len() || segments.len() > last_segments.len() {
+                let cg_changed =
+                    common < last_segments.len() || segments.len() > last_segments.len();
+                if cg_changed {
                     for (depth, seg) in segments.iter().enumerate().skip(common) {
                         let indent = "  ".repeat(depth);
                         let label = format!("{indent}{seg}");
@@ -6206,11 +6225,33 @@ pub fn write_diff<W: fmt::Write>(
                         table.add_row(heading_cells);
                     }
                     last_segments = segments;
+                    last_pcomm = "";
+                }
+
+                if h.pcomm != last_pcomm {
+                    let cg_depth = last_segments.len();
+                    let indent = "  ".repeat(cg_depth);
+                    let label = format!("{indent}{}", h.pcomm);
+                    let heading_cells: Vec<comfy_table::Cell> = columns
+                        .iter()
+                        .map(|c| {
+                            if *c == Column::Group {
+                                comfy_table::Cell::new(&label)
+                                    .fg(comfy_table::Color::White)
+                                    .add_attribute(comfy_table::Attribute::Bold)
+                            } else {
+                                comfy_table::Cell::new("")
+                            }
+                        })
+                        .collect();
+                    table.add_row(heading_cells);
+                    last_pcomm = h.pcomm;
                 }
 
                 let mut string_cells = render_diff_row_cells(h.row, &columns);
                 if let Some(pos) = columns.iter().position(|c| *c == Column::Group) {
-                    string_cells[pos] = format!("  {}", h.pcomm);
+                    let cg_depth = last_segments.len();
+                    string_cells[pos] = format!("{}  {}", "  ".repeat(cg_depth), h.comm);
                 }
                 let cells: Vec<comfy_table::Cell> = string_cells
                     .into_iter()
@@ -6327,7 +6368,7 @@ pub fn write_diff<W: fmt::Write>(
             writeln!(w)?;
             writeln!(w, "## Derived metrics")?;
             let mut dt = display.new_table();
-            dt.set_header(colored_header(&columns, "pcomm"));
+            dt.set_header(colored_header(&columns, "comm"));
             let mut last_segs: Vec<&str> = Vec::new();
             let depth_color = |d: usize| -> comfy_table::Color {
                 match d {
