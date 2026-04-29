@@ -6194,7 +6194,6 @@ pub fn write_diff<W: fmt::Write>(
                 }
             };
 
-            let mut last_pcomm = "";
             for h in &hier {
                 let segments: Vec<&str> = h.cgroup.split('/').filter(|s| !s.is_empty()).collect();
 
@@ -6225,33 +6224,16 @@ pub fn write_diff<W: fmt::Write>(
                         table.add_row(heading_cells);
                     }
                     last_segments = segments;
-                    last_pcomm = "";
-                }
-
-                if h.pcomm != last_pcomm {
-                    let cg_depth = last_segments.len();
-                    let indent = "  ".repeat(cg_depth);
-                    let label = format!("{indent}{}", h.pcomm);
-                    let heading_cells: Vec<comfy_table::Cell> = columns
-                        .iter()
-                        .map(|c| {
-                            if *c == Column::Group {
-                                comfy_table::Cell::new(&label)
-                                    .fg(comfy_table::Color::White)
-                                    .add_attribute(comfy_table::Attribute::Bold)
-                            } else {
-                                comfy_table::Cell::new("")
-                            }
-                        })
-                        .collect();
-                    table.add_row(heading_cells);
-                    last_pcomm = h.pcomm;
                 }
 
                 let mut string_cells = render_diff_row_cells(h.row, &columns);
                 if let Some(pos) = columns.iter().position(|c| *c == Column::Group) {
-                    let cg_depth = last_segments.len();
-                    string_cells[pos] = format!("{}  {}", "  ".repeat(cg_depth), h.comm);
+                    let label = if h.pcomm == h.comm {
+                        h.comm.to_string()
+                    } else {
+                        format!("{}:{}", h.pcomm, h.comm)
+                    };
+                    string_cells[pos] = format!("  {label}");
                 }
                 let cells: Vec<comfy_table::Cell> = string_cells
                     .into_iter()
