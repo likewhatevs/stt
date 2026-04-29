@@ -6521,7 +6521,7 @@ pub fn write_diff<W: fmt::Write>(
             });
 
             // Single table with separator rows for cgroup headings.
-            // Keeps column widths consistent across the entire view.
+            writeln!(w, "## Primary metrics")?;
             let mut last_segments: Vec<&str> = Vec::new();
             let mut last_pcomm = "";
             let mut table = display.new_table();
