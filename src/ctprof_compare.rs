@@ -5119,6 +5119,10 @@ pub struct DisplayOptions {
     /// `--sections primary` and `--metrics run_time_ns` shows
     /// a single primary row.
     pub metrics: Vec<&'static str>,
+    /// Maximum rendered lines per section. Sections whose table
+    /// output exceeds this limit are truncated with a notice.
+    /// `0` means unlimited (no truncation). Default `750`.
+    pub section_line_limit: usize,
 }
 
 impl DisplayOptions {
@@ -5492,6 +5496,13 @@ pub struct CtprofCompareArgs {
     /// the same byte sequence as without the flag.
     #[arg(long, help_heading = "Display")]
     pub wrap: bool,
+    /// Maximum rendered lines per section. Sections whose table
+    /// output exceeds this limit are truncated with a notice
+    /// showing the number of hidden lines. Applies independently
+    /// to each sub-table (primary, derived, smaps-rollup, etc.).
+    /// `0` disables truncation entirely. Default `500`.
+    #[arg(long, default_value_t = 500, help_heading = "Display")]
+    pub limit: usize,
 }
 
 /// Entry point for the compare CLI. Parses `--sort-by` first,
@@ -5550,6 +5561,7 @@ pub fn run_compare(args: &CtprofCompareArgs) -> anyhow::Result<i32> {
         wrap: args.wrap,
         sections,
         metrics,
+        section_line_limit: args.limit,
     };
     let diff = compare(&baseline, &candidate, &opts);
     print_diff(
@@ -5830,7 +5842,57 @@ pub fn print_diff(
         group_by,
         display,
     );
-    print!("{out}");
+    if display.section_line_limit > 0 {
+        print!("{}", limit_sections(&out, display.section_line_limit));
+    } else {
+        print!("{out}");
+    }
+}
+
+/// Truncate each `## <heading>` section to at most `limit` lines.
+/// Sections are delimited by lines starting with `## `. Content
+/// before the first section header passes through untruncated
+/// (typically the file-path header row).
+pub fn limit_sections(output: &str, limit: usize) -> String {
+    let mut result = String::with_capacity(output.len());
+    let mut section_lines: Vec<&str> = Vec::new();
+    let mut section_header: Option<&str> = None;
+
+    for line in output.lines() {
+        if line.starts_with("## ") {
+            flush_section(&mut result, section_header, &section_lines, limit);
+            section_lines.clear();
+            section_header = Some(line);
+        } else if section_header.is_some() {
+            section_lines.push(line);
+        } else {
+            result.push_str(line);
+            result.push('\n');
+        }
+    }
+    flush_section(&mut result, section_header, &section_lines, limit);
+    result
+}
+
+fn flush_section(result: &mut String, header: Option<&str>, lines: &[&str], limit: usize) {
+    let Some(header) = header else { return };
+    result.push_str(header);
+    result.push('\n');
+    if lines.len() <= limit {
+        for line in lines {
+            result.push_str(line);
+            result.push('\n');
+        }
+    } else {
+        for line in &lines[..limit] {
+            result.push_str(line);
+            result.push('\n');
+        }
+        result.push_str(&format!(
+            "... {} more lines truncated (use --limit 0 for unlimited)\n",
+            lines.len() - limit,
+        ));
+    }
 }
 
 /// Render [`CtprofDiff`] into `w`. The formatter layer lives
@@ -5875,6 +5937,7 @@ pub fn write_diff<W: fmt::Write>(
     if display.is_section_enabled(Section::Primary)
         || display.is_section_enabled(Section::TaskstatsDelay)
     {
+        writeln!(w, "## Primary metrics")?;
         let mut table = display.new_table();
         let header_row: Vec<&str> = columns.iter().map(|c| c.header(group_header)).collect();
         table.set_header(header_row);

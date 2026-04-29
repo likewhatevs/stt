@@ -545,6 +545,12 @@ pub struct CtprofShowArgs {
     /// the same byte sequence as without the flag.
     #[arg(long, help_heading = "Display")]
     pub wrap: bool,
+    /// Maximum rendered lines per section. Sections whose table
+    /// output exceeds this limit are truncated with a notice.
+    /// Applies independently to each `## <heading>` sub-table.
+    /// `0` disables truncation entirely. Default `500`.
+    #[arg(long, default_value_t = 500, help_heading = "Display")]
+    pub limit: usize,
 }
 
 /// RAII guard that cleans up an auto-generated cgroup directory on drop.
@@ -797,7 +803,11 @@ fn run_show(args: &CtprofShowArgs) -> Result<i32> {
         &metrics,
         args.wrap,
     );
-    print!("{out}");
+    if args.limit > 0 {
+        print!("{}", ctprof_compare::limit_sections(&out, args.limit));
+    } else {
+        print!("{out}");
+    }
     Ok(0)
 }
 
@@ -954,6 +964,7 @@ fn write_show<W: std::fmt::Write>(
     if display_options.is_section_enabled(ctprof_compare::Section::Primary)
         || display_options.is_section_enabled(ctprof_compare::Section::TaskstatsDelay)
     {
+        writeln!(w, "## Primary metrics")?;
         let mut table = display_options.new_table();
         let header_row: Vec<&str> = resolved_columns
             .iter()

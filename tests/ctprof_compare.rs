@@ -328,6 +328,7 @@ fn run_compare_returns_ok_zero_regardless_of_diff_emptiness() {
         sections: String::new(),
         metrics: String::new(),
         wrap: false,
+        limit: 0,
     };
     // `run_compare` returns `anyhow::Result<i32>`. The contract
     // says the `i32` is always 0 for a successful load+compare,
@@ -390,6 +391,7 @@ fn run_compare_with_valid_sort_by_succeeds() {
         sections: String::new(),
         metrics: String::new(),
         wrap: false,
+        limit: 0,
     };
     let rc = run_compare(&args).expect("run_compare must accept a valid --sort-by spec end-to-end");
     assert_eq!(rc, 0, "run_compare must return Ok(0) on success");
@@ -431,6 +433,7 @@ fn run_compare_with_invalid_sort_by_returns_err() {
         sections: String::new(),
         metrics: String::new(),
         wrap: false,
+        limit: 0,
     };
     let err = run_compare(&args).expect_err("invalid --sort-by must produce Err");
     let msg = format!("{err:#}");
