@@ -6402,16 +6402,24 @@ pub fn write_diff<W: fmt::Write>(
                 .unwrap_or(0);
             a.max(b)
         };
+        let abs_rss_delta = |pkey: &&String| -> u64 {
+            let a = diff
+                .smaps_rollup_a
+                .get(*pkey)
+                .and_then(|m| m.get("Rss").copied())
+                .unwrap_or(0);
+            let b = diff
+                .smaps_rollup_b
+                .get(*pkey)
+                .and_then(|m| m.get("Rss").copied())
+                .unwrap_or(0);
+            (b as i128 - a as i128).unsigned_abs() as u64
+        };
         let mut sorted_process_keys: Vec<&String> = process_keys.iter().copied().collect();
         sorted_process_keys.sort_by(|a, b| {
-            // Descending Rss → descending Pss → alphabetical.
-            // Pss tie-break catches equal-Rss processes that
-            // differ in shared-page accounting; the alpha
-            // fallback keeps identically-zero rows
-            // deterministically ordered for stable output.
-            max_field_for(b, "Rss")
-                .cmp(&max_field_for(a, "Rss"))
-                .then_with(|| max_field_for(b, "Pss").cmp(&max_field_for(a, "Pss")))
+            abs_rss_delta(b)
+                .cmp(&abs_rss_delta(a))
+                .then_with(|| max_field_for(b, "Rss").cmp(&max_field_for(a, "Rss")))
                 .then_with(|| a.cmp(b))
         });
 
