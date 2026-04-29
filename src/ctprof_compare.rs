@@ -2198,6 +2198,10 @@ pub struct DiffRow {
     /// Relative uptime % for this group (candidate side).
     /// 100% = as long-lived as the oldest group, 0% = just spawned.
     pub uptime_pct: Option<f64>,
+    /// Sort-by metric cell: "baseline → candidate (delta%)" for
+    /// the metric specified by --sort-by. Same value for every
+    /// row in a group. None when no --sort-by is set.
+    pub sort_by_cell: Option<String>,
     pub metric_name: &'static str,
     /// Auto-scale ladder for the row's value/delta cells. Sourced
     /// from `metric.rule.ladder()` at build time so the format
@@ -3098,6 +3102,27 @@ pub fn compare(
         // Multi-key sort: rank groups by tuple of named-metric
         // deltas, sort rows by (group_rank, metric_registry_idx).
         sort_diff_rows_by_keys(&mut diff.rows, &mut diff.derived_rows, &opts.sort_by);
+
+        // Fill sort_by_cell: for each group, find the sort metric's
+        // row and format its baseline→candidate (delta%).
+        let sort_metric = opts.sort_by.first().map(|sk| sk.metric);
+        if let Some(metric_name) = sort_metric {
+            let mut group_cells: BTreeMap<String, String> = BTreeMap::new();
+            for row in &diff.rows {
+                if row.metric_name == metric_name && !group_cells.contains_key(&row.group_key) {
+                    let b = format_value_cell(&row.baseline, row.metric_ladder);
+                    let c = format_value_cell(&row.candidate, row.metric_ladder);
+                    let pct = match row.delta_pct {
+                        Some(p) => format!(" ({:+.1}%)", p * 100.0),
+                        None => String::new(),
+                    };
+                    group_cells.insert(row.group_key.clone(), format!("{b}\u{2192}{c}{pct}"));
+                }
+            }
+            for row in &mut diff.rows {
+                row.sort_by_cell = group_cells.get(&row.group_key).cloned();
+            }
+        }
     }
 
     if group_by == GroupBy::Cgroup {
@@ -3352,6 +3377,7 @@ fn build_row(
         delta,
         delta_pct,
         display_key: display_key.to_string(),
+        sort_by_cell: None,
     }
 }
 
@@ -5053,6 +5079,10 @@ pub enum Column {
     /// thread, 0% = just spawned. Color gradient: green ≥50%,
     /// red <50% (>2x younger than the oldest).
     Uptime,
+    /// Sort-by metric summary column. Shows the --sort-by metric's
+    /// baseline→candidate (delta%) per group. Only present when
+    /// --sort-by is set.
+    SortBy,
 }
 
 impl Column {
@@ -5071,6 +5101,7 @@ impl Column {
             Column::Value => "value",
             Column::Tags => "tags",
             Column::Uptime => "uptime",
+            Column::SortBy => "sort-by", // overridden dynamically in colored_header
         }
     }
 
@@ -5090,6 +5121,7 @@ impl Column {
             Column::Value => "value",
             Column::Tags => "tags",
             Column::Uptime => "%uptime",
+            Column::SortBy => "sort-by", // overridden dynamically in colored_header
         }
     }
 }
@@ -5764,6 +5796,7 @@ fn render_diff_row_cells(row: &DiffRow, columns: &[Column]) -> Vec<String> {
                 Some(pct) => format!("{pct:.0}%"),
                 None => "-".to_string(),
             },
+            Column::SortBy => row.sort_by_cell.clone().unwrap_or_else(|| "-".to_string()),
         };
         cells.push(cell);
     }
@@ -5813,6 +5846,14 @@ pub fn color_diff_cell(
                 cell = cell.add_attribute(Attribute::Bold);
             }
             cell
+        }
+        Column::SortBy => {
+            let color = match delta {
+                Some(d) if d > 0.0 => Color::Yellow,
+                Some(d) if d < 0.0 => Color::Magenta,
+                _ => Color::White,
+            };
+            comfy_table::Cell::new(text).fg(color)
         }
         _ => comfy_table::Cell::new(text),
     }
@@ -5894,6 +5935,7 @@ fn render_derived_row_cells(row: &DerivedRow, columns: &[Column]) -> Vec<String>
             Column::Value => "-".to_string(),
             Column::Tags => String::new(),
             Column::Uptime => "-".to_string(),
+            Column::SortBy => "-".to_string(),
         };
         cells.push(cell);
     }
@@ -6462,7 +6504,11 @@ pub fn write_diff<W: fmt::Write>(
         GroupBy::All => "comm",
     };
 
-    let columns = display.resolved_compare_columns();
+    let mut columns = display.resolved_compare_columns();
+    let has_sort_col = diff.rows.first().is_some_and(|r| r.sort_by_cell.is_some());
+    if has_sort_col {
+        columns.push(Column::SortBy);
+    }
 
     // Compute column widths from ALL data rows (primary + derived)
     // so every table in every section shares the same widths.
@@ -14293,6 +14339,7 @@ mod tests {
             delta_pct: None,
             display_key: group.into(),
             uptime_pct: None,
+            sort_by_cell: None,
         };
         let mut rows = vec![
             mk_row("A", "run_time_ns", 1000.0),
@@ -14344,6 +14391,7 @@ mod tests {
             delta_pct: None,
             display_key: group.into(),
             uptime_pct: None,
+            sort_by_cell: None,
         };
         let mut rows = vec![
             // A and B tie on run_time_ns (both 500). Use wait_sum
@@ -14388,6 +14436,7 @@ mod tests {
             delta_pct: None,
             display_key: group.into(),
             uptime_pct: None,
+            sort_by_cell: None,
         };
         let mut rows = vec![
             mk_row("A", "run_time_ns", 1000.0),
@@ -14471,6 +14520,7 @@ mod tests {
             delta_pct: None,
             display_key: group.into(),
             uptime_pct: None,
+            sort_by_cell: None,
         };
         // Three groups with IDENTICAL deltas — only the
         // group_key tie-break can deterministically order them.
@@ -14520,6 +14570,7 @@ mod tests {
             delta_pct: None,
             display_key: group.into(),
             uptime_pct: None,
+            sort_by_cell: None,
         };
         let mut rows = vec![
             // alpha has a real run_time_ns delta.
@@ -14570,6 +14621,7 @@ mod tests {
             delta_pct: None,
             display_key: group.into(),
             uptime_pct: None,
+            sort_by_cell: None,
         };
         let mut rows = vec![
             // alpha has a real (positive) run_time_ns delta.
@@ -14632,6 +14684,7 @@ mod tests {
             delta_pct: None,
             display_key: group.into(),
             uptime_pct: None,
+            sort_by_cell: None,
         };
         let mut rows = vec![mk_row("alpha", "policy"), mk_row("bravo", "policy")];
         // Sort by run_time_ns — neither group has it, both fall
@@ -14674,6 +14727,7 @@ mod tests {
             delta_pct: None,
             display_key: group.into(),
             uptime_pct: None,
+            sort_by_cell: None,
         };
         // Use four metrics from the scheduling block in their
         // registry order: run_time_ns (idx 6), wait_time_ns (7),
@@ -14728,6 +14782,7 @@ mod tests {
             delta_pct: None,
             display_key: group.into(),
             uptime_pct: None,
+            sort_by_cell: None,
         };
         let mut rows = vec![
             mk_row("alpha", "run_time_ns", f64::NAN),
