@@ -6565,7 +6565,7 @@ pub fn write_diff<W: fmt::Write>(
             writeln!(w)?;
             writeln!(w, "## smaps_rollup")?;
             let mut st = display.new_table();
-            st.set_header(colored_header(&columns, "pcomm"));
+            st.set_header(colored_header(&columns, "comm"));
 
             // For All mode, re-sort by cgroup hierarchy (keys are
             // compound cgroup\x00pcomm). Track segments for tree headings.
@@ -6576,7 +6576,6 @@ pub fn write_diff<W: fmt::Write>(
             }
 
             let mut last_segs: Vec<&str> = Vec::new();
-            let mut last_pcomm_s = "";
             let depth_color = |d: usize| -> comfy_table::Color {
                 match d {
                     0 => comfy_table::Color::Green,
@@ -6618,26 +6617,6 @@ pub fn write_diff<W: fmt::Write>(
                             st.add_row(hcells);
                         }
                         last_segs = segs;
-                        last_pcomm_s = "";
-                    }
-                    if display_process != last_pcomm_s {
-                        let cg_depth = last_segs.len();
-                        let indent = "  ".repeat(cg_depth);
-                        let label = format!("{indent}{display_process}");
-                        let hcells: Vec<comfy_table::Cell> = columns
-                            .iter()
-                            .map(|c| {
-                                if *c == Column::Group {
-                                    comfy_table::Cell::new(&label)
-                                        .fg(comfy_table::Color::White)
-                                        .add_attribute(comfy_table::Attribute::Bold)
-                                } else {
-                                    comfy_table::Cell::new("")
-                                }
-                            })
-                            .collect();
-                        st.add_row(hcells);
-                        last_pcomm_s = display_process;
                     }
                 }
 
