@@ -2403,6 +2403,7 @@ pub struct FudgedPair {
     pub jaccard: f64,
     pub residual_baseline: Vec<String>,
     pub residual_candidate: Vec<String>,
+    pub cascaded_children: usize,
 }
 
 /// Full comparison result.
@@ -2735,7 +2736,8 @@ pub fn compare(
     // thread population overlap when cgroup paths differ but
     // the workload is the same (e.g. service re-deployed to a
     // new cgroup path between snapshots).
-    if !diff.only_baseline.is_empty() && !diff.only_candidate.is_empty() {
+    if group_by == GroupBy::All && !diff.only_baseline.is_empty() && !diff.only_candidate.is_empty()
+    {
         // Extract cgroup prefix from compound keys.
         fn cg_prefix(key: &str) -> &str {
             key.split_once('\x00').map_or(key, |(cg, _)| cg)
@@ -2912,6 +2914,7 @@ pub fn compare(
         // roots by stripping the longest common suffix (by /
         // segments) from the pair. Use those shorter roots for
         // starts_with matching, not the full fudged paths.
+        let mut cascade_counts: BTreeMap<String, usize> = BTreeMap::new();
         for (bcg, ccg) in &fudged_cg {
             let b_segs: Vec<&str> = bcg.split('/').collect();
             let c_segs: Vec<&str> = ccg.split('/').collect();
@@ -2954,7 +2957,11 @@ pub fn compare(
                 .iter()
                 .map(|k| {
                     let child_cg = cg_prefix(k);
-                    let rewritten = format!("{b_root}{}", &child_cg[c_root.len()..]);
+                    let tail = &child_cg[c_root.len()..];
+                    if !tail.is_empty() && !tail.starts_with('/') {
+                        return (String::new(), k);
+                    }
+                    let rewritten = format!("{b_root}{tail}");
                     let suffix = k.split_once('\x00').map_or("", |(_, s)| s);
                     (format!("{rewritten}\x00{suffix}"), k)
                 })
@@ -2963,6 +2970,7 @@ pub fn compare(
                 if let Some(ckey) = c_by_suffix.get(bkey) {
                     remove_baseline.insert(bkey.clone());
                     remove_candidate.insert((*ckey).clone());
+                    *cascade_counts.entry(bcg.clone()).or_insert(0) += 1;
                     if let (Some(ga), Some(gb)) = (groups_a.get(bkey), groups_b.get(*ckey)) {
                         let display_key = format!("{bcg} ~> {ccg}");
                         for metric in CTPROF_METRICS {
@@ -3030,6 +3038,7 @@ pub fn compare(
                     },
                     residual_baseline: residual_a,
                     residual_candidate: residual_b,
+                    cascaded_children: cascade_counts.get(bcg).copied().unwrap_or(0),
                 }
             })
             .collect();
@@ -3042,15 +3051,24 @@ pub fn compare(
     // average thread lifetime (candidate side), then express as
     // % of the longest-lived group.
     {
-        let mut group_lifetime: BTreeMap<&str, u64> = BTreeMap::new();
+        let mut group_lifetime: BTreeMap<String, u64> = BTreeMap::new();
         for (key, group_b) in &groups_b {
             if groups_a.contains_key(key) {
-                group_lifetime.insert(key, now_b.saturating_sub(group_b.avg_start_ticks));
+                group_lifetime.insert(key.clone(), now_b.saturating_sub(group_b.avg_start_ticks));
+            }
+        }
+        // Add fudged pairs: use baseline key as lookup, candidate group for lifetime.
+        for fp in &diff.fudged_pairs {
+            if let Some(gb) = groups_b.get(&fp.candidate_key) {
+                group_lifetime.insert(
+                    fp.baseline_key.clone(),
+                    now_b.saturating_sub(gb.avg_start_ticks),
+                );
             }
         }
         let max_lifetime = group_lifetime.values().copied().max().unwrap_or(1).max(1);
         for row in &mut diff.rows {
-            if let Some(&lt) = group_lifetime.get(row.group_key.as_str()) {
+            if let Some(&lt) = group_lifetime.get(&row.group_key) {
                 row.uptime_pct = Some(lt as f64 / max_lifetime as f64 * 100.0);
             }
         }
@@ -7487,9 +7505,10 @@ pub fn write_diff<W: fmt::Write>(
             writeln!(w, "  \x1b[36mcandidate:\x1b[0m {}", fp.candidate_key)?;
             writeln!(
                 w,
-                "  overlap: {} thread types, Jaccard: {:.1}%",
+                "  overlap: {} thread types, Jaccard: {:.1}%, cascaded children: {}",
                 fp.overlap,
-                fp.jaccard * 100.0
+                fp.jaccard * 100.0,
+                fp.cascaded_children
             )?;
             if !fp.residual_baseline.is_empty() {
                 writeln!(
