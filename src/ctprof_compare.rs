@@ -6550,6 +6550,11 @@ pub fn write_diff<W: fmt::Write>(
                     for (depth, seg) in segments.iter().enumerate().skip(common) {
                         let indent = "  ".repeat(depth);
                         let label = format!("{indent}{seg}");
+                        let label = if label.len() > 30 {
+                            format!("{}...", &label[..27])
+                        } else {
+                            label
+                        };
                         let heading_cells: Vec<comfy_table::Cell> = columns
                             .iter()
                             .map(|c| {
@@ -6572,6 +6577,11 @@ pub fn write_diff<W: fmt::Write>(
                     let cg_depth = last_segments.len();
                     let indent = "  ".repeat(cg_depth);
                     let label = format!("{indent}{}", h.pcomm);
+                    let label = if label.len() > 30 {
+                        format!("{}...", &label[..27])
+                    } else {
+                        label
+                    };
                     let heading_cells: Vec<comfy_table::Cell> = columns
                         .iter()
                         .map(|c| {
@@ -6758,6 +6768,11 @@ pub fn write_diff<W: fmt::Write>(
                     for (depth, seg) in segs.iter().enumerate().skip(common) {
                         let indent = "  ".repeat(depth);
                         let label = format!("{indent}{seg}");
+                        let label = if label.len() > 30 {
+                            format!("{}...", &label[..27])
+                        } else {
+                            label
+                        };
                         let hcells: Vec<comfy_table::Cell> = columns
                             .iter()
                             .map(|c| {
@@ -6779,6 +6794,11 @@ pub fn write_diff<W: fmt::Write>(
                     let cg_depth = last_segs.len();
                     let indent = "  ".repeat(cg_depth);
                     let label = format!("{indent}{}", h.pcomm);
+                    let label = if label.len() > 30 {
+                        format!("{}...", &label[..27])
+                    } else {
+                        label
+                    };
                     let hcells: Vec<comfy_table::Cell> = columns
                         .iter()
                         .map(|c| {
@@ -6955,6 +6975,11 @@ pub fn write_diff<W: fmt::Write>(
                         for (depth, seg) in segs.iter().enumerate().skip(common) {
                             let indent = "  ".repeat(depth);
                             let label = format!("{indent}{seg}");
+                            let label = if label.len() > 30 {
+                                format!("{}...", &label[..27])
+                            } else {
+                                label
+                            };
                             let hcells: Vec<comfy_table::Cell> = columns
                                 .iter()
                                 .map(|c| {
