@@ -6558,16 +6558,23 @@ pub fn write_diff<W: fmt::Write>(
                 })
                 .collect();
             let mut leaf_score: BTreeMap<(&str, &str), f64> = BTreeMap::new();
+            let mut cg_score: BTreeMap<&str, f64> = BTreeMap::new();
             for h in &hier {
                 let score = h.row.sort_key().abs();
-                let entry = leaf_score.entry((h.cgroup, h.pcomm)).or_insert(0.0_f64);
-                if score > *entry {
-                    *entry = score;
+                let le = leaf_score.entry((h.cgroup, h.pcomm)).or_insert(0.0_f64);
+                if score > *le {
+                    *le = score;
+                }
+                let ce = cg_score.entry(h.cgroup).or_insert(0.0_f64);
+                if score > *ce {
+                    *ce = score;
                 }
             }
             hier.sort_by(|a, b| {
-                a.cgroup
-                    .cmp(b.cgroup)
+                let cga = cg_score.get(a.cgroup).copied().unwrap_or(0.0);
+                let cgb = cg_score.get(b.cgroup).copied().unwrap_or(0.0);
+                cgb.partial_cmp(&cga)
+                    .unwrap_or(std::cmp::Ordering::Equal)
                     .then_with(|| {
                         let sa = leaf_score.get(&(a.cgroup, a.pcomm)).copied().unwrap_or(0.0);
                         let sb = leaf_score.get(&(b.cgroup, b.pcomm)).copied().unwrap_or(0.0);
@@ -6786,16 +6793,23 @@ pub fn write_diff<W: fmt::Write>(
                 })
                 .collect();
             let mut leaf_score: BTreeMap<(&str, &str), f64> = BTreeMap::new();
+            let mut cg_score: BTreeMap<&str, f64> = BTreeMap::new();
             for h in &hier {
                 let score = h.row.sort_key().abs();
-                let entry = leaf_score.entry((h.cgroup, h.pcomm)).or_insert(0.0_f64);
-                if score > *entry {
-                    *entry = score;
+                let le = leaf_score.entry((h.cgroup, h.pcomm)).or_insert(0.0_f64);
+                if score > *le {
+                    *le = score;
+                }
+                let ce = cg_score.entry(h.cgroup).or_insert(0.0_f64);
+                if score > *ce {
+                    *ce = score;
                 }
             }
             hier.sort_by(|a, b| {
-                a.cgroup
-                    .cmp(b.cgroup)
+                let cga = cg_score.get(a.cgroup).copied().unwrap_or(0.0);
+                let cgb = cg_score.get(b.cgroup).copied().unwrap_or(0.0);
+                cgb.partial_cmp(&cga)
+                    .unwrap_or(std::cmp::Ordering::Equal)
                     .then_with(|| {
                         let sa = leaf_score.get(&(a.cgroup, a.pcomm)).copied().unwrap_or(0.0);
                         let sb = leaf_score.get(&(b.cgroup, b.pcomm)).copied().unwrap_or(0.0);
