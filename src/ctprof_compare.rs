@@ -3168,36 +3168,33 @@ pub fn compare(
     // smaps keys are cg_key\x00pcomm — different cg = no join.
     // Rename candidate keys from cg_B prefix to cg_A prefix.
     for fp in &diff.fudged_pairs {
-        let cand_prefix = format!("{}\x00", fp.candidate_key);
-        let base_prefix = format!("{}\x00", fp.baseline_key);
-        let keys_to_remap: Vec<String> = diff
+        // Smaps keys are `full_cgroup_path\x00pcomm`. The fudge
+        // pair's cgroup might be a PARENT — children have more
+        // path segments after it (separated by /). Match on both
+        // `cg/` (children) and `cg\x00` (direct members).
+        let cand_slash = format!("{}/", fp.candidate_key);
+        let cand_nul = format!("{}\x00", fp.candidate_key);
+        let matches_cand = |k: &str| -> bool {
+            k.starts_with(&cand_slash) || k.starts_with(&cand_nul) || k == fp.candidate_key
+        };
+        let remap_key = |old: &str| -> String {
+            if old.starts_with(&cand_slash) {
+                format!("{}/{}", fp.baseline_key, &old[cand_slash.len()..])
+            } else if old.starts_with(&cand_nul) {
+                format!("{}\x00{}", fp.baseline_key, &old[cand_nul.len()..])
+            } else {
+                fp.baseline_key.clone()
+            }
+        };
+        let keys_b: Vec<String> = diff
             .smaps_rollup_b
             .keys()
-            .filter(|k| k.starts_with(&cand_prefix) || k.as_str() == fp.candidate_key)
+            .filter(|k| matches_cand(k))
             .cloned()
             .collect();
-        for old_key in keys_to_remap {
+        for old_key in keys_b {
             if let Some(val) = diff.smaps_rollup_b.remove(&old_key) {
-                let new_key = if old_key.starts_with(&cand_prefix) {
-                    format!("{base_prefix}{}", &old_key[cand_prefix.len()..])
-                } else {
-                    fp.baseline_key.clone()
-                };
-                diff.smaps_rollup_b.insert(new_key, val);
-            }
-        }
-        // Also remap baseline keys that have the candidate prefix
-        // (from cascade children).
-        let keys_a: Vec<String> = diff
-            .smaps_rollup_a
-            .keys()
-            .filter(|k| k.starts_with(&cand_prefix))
-            .cloned()
-            .collect();
-        for old_key in keys_a {
-            if let Some(val) = diff.smaps_rollup_a.remove(&old_key) {
-                let new_key = format!("{base_prefix}{}", &old_key[cand_prefix.len()..]);
-                diff.smaps_rollup_a.insert(new_key, val);
+                diff.smaps_rollup_b.insert(remap_key(&old_key), val);
             }
         }
     }
