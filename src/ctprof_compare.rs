@@ -2212,6 +2212,8 @@ pub struct DiffRow {
     /// the metric specified by --sort-by. Same value for every
     /// row in a group. None when no --sort-by is set.
     pub sort_by_cell: Option<String>,
+    /// Sort metric's delta for this group (for coloring the SortBy column).
+    pub sort_by_delta: Option<f64>,
     pub metric_name: &'static str,
     /// Auto-scale ladder for the row's value/delta cells. Sourced
     /// from `metric.rule.ladder()` at build time so the format
@@ -2862,8 +2864,11 @@ pub fn compare(
         let mut remove_candidate: std::collections::BTreeSet<String> =
             std::collections::BTreeSet::new();
 
+        // Collect all (baseline_key, candidate_key) pairs across
+        // all fudge pairs. Multiple candidate keys can map to the
+        // same baseline key (N:1).
+        let mut fudge_matches: BTreeMap<String, Vec<String>> = BTreeMap::new(); // bkey → [ckeys]
         for (bcg, ccg) in &fudged_cg {
-            // Collect all compound keys with this cgroup prefix.
             let b_keys: Vec<&String> = diff
                 .only_baseline
                 .iter()
@@ -2874,8 +2879,6 @@ pub fn compare(
                 .iter()
                 .filter(|k| cg_prefix(k) == ccg.as_str())
                 .collect();
-
-            // Build suffix → candidate_key map for matching.
             let c_suffix_map: BTreeMap<&str, &String> = c_keys
                 .iter()
                 .map(|k| {
@@ -2883,47 +2886,111 @@ pub fn compare(
                     (suffix, *k)
                 })
                 .collect();
-
             for bkey in &b_keys {
                 let b_suffix = bkey.split_once('\x00').map_or("", |(_, s)| s);
                 if let Some(ckey) = c_suffix_map.get(b_suffix) {
-                    // Suffix matches — fudge this compound key pair.
                     remove_baseline.insert((*bkey).clone());
                     remove_candidate.insert((*ckey).clone());
                     fudged_key_pairs.push(((*bkey).clone(), (*ckey).clone()));
-                    if let (Some(ga), Some(gb)) = (groups_a.get(*bkey), groups_b.get(*ckey)) {
-                        let display_key = "[fudged]".to_string();
-                        for metric in CTPROF_METRICS {
-                            let Some(a) = ga.metrics.get(metric.name).cloned() else {
-                                continue;
-                            };
-                            let Some(b) = gb.metrics.get(metric.name).cloned() else {
-                                continue;
-                            };
-                            diff.rows.push(build_row(
-                                bkey,
-                                &display_key,
-                                ga.thread_count,
-                                gb.thread_count,
-                                metric,
-                                a,
-                                b,
-                                None,
-                            ));
+                    fudge_matches
+                        .entry((*bkey).clone())
+                        .or_default()
+                        .push((*ckey).clone());
+                }
+            }
+        }
+        // Emit one row per baseline key with candidate values
+        // aggregated across all N matched candidate groups.
+        for (bkey, ckeys) in &fudge_matches {
+            let Some(ga) = groups_a.get(bkey) else {
+                continue;
+            };
+            // Merge candidate groups: sum Sum, max Max, union Range.
+            let mut merged_metrics: BTreeMap<String, Aggregated> = BTreeMap::new();
+            let mut merged_thread_count: usize = 0;
+            for ckey in ckeys {
+                let Some(gb) = groups_b.get(ckey) else {
+                    continue;
+                };
+                merged_thread_count += gb.thread_count;
+                for (name, val) in &gb.metrics {
+                    let entry = merged_metrics.entry(name.clone());
+                    match entry {
+                        std::collections::btree_map::Entry::Vacant(e) => {
+                            e.insert(val.clone());
                         }
-                        for def in CTPROF_DERIVED_METRICS {
-                            diff.derived_rows.push(build_derived_row(
-                                bkey,
-                                &display_key,
-                                ga.thread_count,
-                                gb.thread_count,
-                                def,
-                                &ga.metrics,
-                                &gb.metrics,
-                            ));
+                        std::collections::btree_map::Entry::Occupied(mut e) => {
+                            let existing = e.get_mut();
+                            match (existing, val) {
+                                (Aggregated::Sum(s), Aggregated::Sum(v)) => {
+                                    *s += v;
+                                }
+                                (Aggregated::Max(m), Aggregated::Max(v)) => {
+                                    *m += v;
+                                }
+                                (
+                                    Aggregated::OrdinalRange { min, max },
+                                    Aggregated::OrdinalRange {
+                                        min: vmin,
+                                        max: vmax,
+                                    },
+                                ) => {
+                                    *min = (*min).min(*vmin);
+                                    *max = (*max).max(*vmax);
+                                }
+                                (
+                                    Aggregated::Mode {
+                                        value,
+                                        count,
+                                        total,
+                                    },
+                                    Aggregated::Mode {
+                                        value: vv,
+                                        count: vc,
+                                        total: vt,
+                                    },
+                                ) => {
+                                    *total += vt;
+                                    if *vc > *count {
+                                        *value = vv.clone();
+                                        *count = *vc;
+                                    }
+                                }
+                                _ => {}
+                            }
                         }
                     }
                 }
+            }
+            let display_key = "[fudged]".to_string();
+            for metric in CTPROF_METRICS {
+                let Some(a) = ga.metrics.get(metric.name).cloned() else {
+                    continue;
+                };
+                let Some(b) = merged_metrics.get(metric.name).cloned() else {
+                    continue;
+                };
+                diff.rows.push(build_row(
+                    bkey,
+                    &display_key,
+                    ga.thread_count,
+                    merged_thread_count,
+                    metric,
+                    a,
+                    b,
+                    None,
+                ));
+            }
+            for def in CTPROF_DERIVED_METRICS {
+                diff.derived_rows.push(build_derived_row(
+                    bkey,
+                    &display_key,
+                    ga.thread_count,
+                    merged_thread_count,
+                    def,
+                    &ga.metrics,
+                    &merged_metrics,
+                ));
             }
         }
 
@@ -2933,6 +3000,7 @@ pub fn compare(
         // starts_with matching, not the full fudged paths.
         let mut cascade_counts: BTreeMap<String, usize> = BTreeMap::new();
         let mut cascade_roots: BTreeMap<(String, String), (String, String)> = BTreeMap::new();
+        let mut cascade_matches: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for (bcg, ccg) in &fudged_cg {
             let b_segs: Vec<&str> = bcg.split('/').collect();
             let c_segs: Vec<&str> = ccg.split('/').collect();
@@ -2992,39 +3060,104 @@ pub fn compare(
                     remove_candidate.insert((*ckey).clone());
                     fudged_key_pairs.push((bkey.clone(), (*ckey).clone()));
                     *cascade_counts.entry(bcg.clone()).or_insert(0) += 1;
-                    if let (Some(ga), Some(gb)) = (groups_a.get(bkey), groups_b.get(*ckey)) {
-                        let display_key = "[fudged]".to_string();
-                        for metric in CTPROF_METRICS {
-                            let Some(a) = ga.metrics.get(metric.name).cloned() else {
-                                continue;
-                            };
-                            let Some(b) = gb.metrics.get(metric.name).cloned() else {
-                                continue;
-                            };
-                            diff.rows.push(build_row(
-                                bkey,
-                                &display_key,
-                                ga.thread_count,
-                                gb.thread_count,
-                                metric,
-                                a,
-                                b,
-                                None,
-                            ));
+                    cascade_matches
+                        .entry(bkey.clone())
+                        .or_default()
+                        .push((*ckey).clone());
+                }
+            }
+        }
+
+        // Emit aggregated rows for cascaded children (same N:1 merge).
+        for (bkey, ckeys) in &cascade_matches {
+            let Some(ga) = groups_a.get(bkey) else {
+                continue;
+            };
+            let mut merged_metrics: BTreeMap<String, Aggregated> = BTreeMap::new();
+            let mut merged_thread_count: usize = 0;
+            for ckey in ckeys {
+                let Some(gb) = groups_b.get(ckey) else {
+                    continue;
+                };
+                merged_thread_count += gb.thread_count;
+                for (name, val) in &gb.metrics {
+                    let entry = merged_metrics.entry(name.clone());
+                    match entry {
+                        std::collections::btree_map::Entry::Vacant(e) => {
+                            e.insert(val.clone());
                         }
-                        for def in CTPROF_DERIVED_METRICS {
-                            diff.derived_rows.push(build_derived_row(
-                                bkey,
-                                &display_key,
-                                ga.thread_count,
-                                gb.thread_count,
-                                def,
-                                &ga.metrics,
-                                &gb.metrics,
-                            ));
+                        std::collections::btree_map::Entry::Occupied(mut e) => {
+                            let existing = e.get_mut();
+                            match (existing, val) {
+                                (Aggregated::Sum(s), Aggregated::Sum(v)) => {
+                                    *s += v;
+                                }
+                                (Aggregated::Max(m), Aggregated::Max(v)) => {
+                                    *m += v;
+                                }
+                                (
+                                    Aggregated::OrdinalRange { min, max },
+                                    Aggregated::OrdinalRange {
+                                        min: vmin,
+                                        max: vmax,
+                                    },
+                                ) => {
+                                    *min = (*min).min(*vmin);
+                                    *max = (*max).max(*vmax);
+                                }
+                                (
+                                    Aggregated::Mode {
+                                        value,
+                                        count,
+                                        total,
+                                    },
+                                    Aggregated::Mode {
+                                        value: vv,
+                                        count: vc,
+                                        total: vt,
+                                    },
+                                ) => {
+                                    *total += vt;
+                                    if *vc > *count {
+                                        *value = vv.clone();
+                                        *count = *vc;
+                                    }
+                                }
+                                _ => {}
+                            }
                         }
                     }
                 }
+            }
+            let display_key = "[fudged]".to_string();
+            for metric in CTPROF_METRICS {
+                let Some(a) = ga.metrics.get(metric.name).cloned() else {
+                    continue;
+                };
+                let Some(b) = merged_metrics.get(metric.name).cloned() else {
+                    continue;
+                };
+                diff.rows.push(build_row(
+                    bkey,
+                    &display_key,
+                    ga.thread_count,
+                    merged_thread_count,
+                    metric,
+                    a,
+                    b,
+                    None,
+                ));
+            }
+            for def in CTPROF_DERIVED_METRICS {
+                diff.derived_rows.push(build_derived_row(
+                    bkey,
+                    &display_key,
+                    ga.thread_count,
+                    merged_thread_count,
+                    def,
+                    &ga.metrics,
+                    &merged_metrics,
+                ));
             }
         }
 
@@ -3086,9 +3219,18 @@ pub fn compare(
                 group_lifetime.insert(key.clone(), now_b.saturating_sub(group_b.avg_start_ticks));
             }
         }
+        let mut fudge_lt_sum: BTreeMap<String, (u64, u64)> = BTreeMap::new();
         for (bkey, ckey) in &fudged_key_pairs {
             if let Some(gb) = groups_b.get(ckey) {
-                group_lifetime.insert(bkey.clone(), now_b.saturating_sub(gb.avg_start_ticks));
+                let lt = now_b.saturating_sub(gb.avg_start_ticks);
+                let entry = fudge_lt_sum.entry(bkey.clone()).or_insert((0, 0));
+                entry.0 += lt;
+                entry.1 += 1;
+            }
+        }
+        for (bkey, (sum, count)) in &fudge_lt_sum {
+            if *count > 0 {
+                group_lifetime.insert(bkey.clone(), sum / count);
             }
         }
         let max_lifetime = group_lifetime.values().copied().max().unwrap_or(1).max(1);
@@ -3129,7 +3271,7 @@ pub fn compare(
         let sort_metric = opts.sort_by.first().map(|sk| sk.metric);
         diff.sort_metric_name = sort_metric;
         if let Some(metric_name) = sort_metric {
-            let mut group_cells: BTreeMap<String, String> = BTreeMap::new();
+            let mut group_cells: BTreeMap<String, (String, Option<f64>)> = BTreeMap::new();
             for row in &diff.rows {
                 if row.metric_name == metric_name && !group_cells.contains_key(&row.group_key) {
                     let b = format_value_cell(&row.baseline, row.metric_ladder);
@@ -3138,11 +3280,17 @@ pub fn compare(
                         Some(p) => format!(" ({:+.1}%)", p * 100.0),
                         None => String::new(),
                     };
-                    group_cells.insert(row.group_key.clone(), format!("{b}\u{2192}{c}{pct}"));
+                    group_cells.insert(
+                        row.group_key.clone(),
+                        (format!("{b}\u{2192}{c}{pct}"), row.delta),
+                    );
                 }
             }
             for row in &mut diff.rows {
-                row.sort_by_cell = group_cells.get(&row.group_key).cloned();
+                if let Some((cell, delta)) = group_cells.get(&row.group_key) {
+                    row.sort_by_cell = Some(cell.clone());
+                    row.sort_by_delta = *delta;
+                }
             }
         }
     }
@@ -3459,6 +3607,7 @@ fn build_row(
         delta_pct,
         display_key: display_key.to_string(),
         sort_by_cell: None,
+        sort_by_delta: None,
     }
 }
 
@@ -5894,6 +6043,7 @@ pub fn color_diff_cell(
     col: Column,
     delta: Option<f64>,
     uptime_pct: Option<f64>,
+    sort_by_delta: Option<f64>,
 ) -> comfy_table::Cell {
     use comfy_table::{Attribute, Color};
     match col {
@@ -5930,7 +6080,14 @@ pub fn color_diff_cell(
             }
             cell
         }
-        Column::SortBy => comfy_table::Cell::new(text).fg(Color::Cyan),
+        Column::SortBy => {
+            let color = match sort_by_delta {
+                Some(d) if d > 0.0 => Color::Yellow,
+                Some(d) if d < 0.0 => Color::Magenta,
+                _ => Color::Cyan,
+            };
+            comfy_table::Cell::new(text).fg(color)
+        }
         _ => comfy_table::Cell::new(text),
     }
 }
@@ -6823,7 +6980,9 @@ pub fn write_diff<W: fmt::Write>(
                 let cells: Vec<comfy_table::Cell> = string_cells
                     .into_iter()
                     .zip(columns.iter())
-                    .map(|(s, col)| color_diff_cell(s, *col, h.row.delta, h.row.uptime_pct))
+                    .map(|(s, col)| {
+                        color_diff_cell(s, *col, h.row.delta, h.row.uptime_pct, h.row.sort_by_delta)
+                    })
                     .collect();
                 table.add_row(cells);
             }
@@ -6861,7 +7020,9 @@ pub fn write_diff<W: fmt::Write>(
                     let cells: Vec<comfy_table::Cell> = string_cells
                         .into_iter()
                         .zip(columns.iter())
-                        .map(|(s, col)| color_diff_cell(s, *col, row.delta, row.uptime_pct))
+                        .map(|(s, col)| {
+                            color_diff_cell(s, *col, row.delta, row.uptime_pct, row.sort_by_delta)
+                        })
                         .collect();
                     table.add_row(cells);
                 }
@@ -6885,7 +7046,9 @@ pub fn write_diff<W: fmt::Write>(
                 let cells: Vec<comfy_table::Cell> = string_cells
                     .into_iter()
                     .zip(columns.iter())
-                    .map(|(s, col)| color_diff_cell(s, *col, row.delta, row.uptime_pct))
+                    .map(|(s, col)| {
+                        color_diff_cell(s, *col, row.delta, row.uptime_pct, row.sort_by_delta)
+                    })
                     .collect();
                 table.add_row(cells);
             }
@@ -7079,9 +7242,9 @@ pub fn write_diff<W: fmt::Write>(
                                 Some(pct) => format!("{pct:.0}%"),
                                 None => "-".to_string(),
                             };
-                            color_diff_cell(text, *col, h.row.delta, up)
+                            color_diff_cell(text, *col, h.row.delta, up, None)
                         } else {
-                            color_diff_cell(s, *col, h.row.delta, up)
+                            color_diff_cell(s, *col, h.row.delta, up, None)
                         }
                     })
                     .collect();
@@ -7114,9 +7277,9 @@ pub fn write_diff<W: fmt::Write>(
                                 Some(pct) => format!("{pct:.0}%"),
                                 None => "-".to_string(),
                             };
-                            color_diff_cell(text, *col, row.delta, up)
+                            color_diff_cell(text, *col, row.delta, up, None)
                         } else {
-                            color_diff_cell(s, *col, row.delta, up)
+                            color_diff_cell(s, *col, row.delta, up, None)
                         }
                     })
                     .collect();
@@ -7312,7 +7475,7 @@ pub fn write_diff<W: fmt::Write>(
                     let cells: Vec<comfy_table::Cell> = string_cells
                         .into_iter()
                         .zip(columns.iter())
-                        .map(|(s, col)| color_diff_cell(s, *col, delta_pct_opt, None))
+                        .map(|(s, col)| color_diff_cell(s, *col, delta_pct_opt, None, None))
                         .collect();
                     st.add_row(cells);
                 }
@@ -14463,6 +14626,7 @@ mod tests {
             display_key: group.into(),
             uptime_pct: None,
             sort_by_cell: None,
+            sort_by_delta: None,
         };
         let mut rows = vec![
             mk_row("A", "run_time_ns", 1000.0),
@@ -14515,6 +14679,7 @@ mod tests {
             display_key: group.into(),
             uptime_pct: None,
             sort_by_cell: None,
+            sort_by_delta: None,
         };
         let mut rows = vec![
             // A and B tie on run_time_ns (both 500). Use wait_sum
@@ -14560,6 +14725,7 @@ mod tests {
             display_key: group.into(),
             uptime_pct: None,
             sort_by_cell: None,
+            sort_by_delta: None,
         };
         let mut rows = vec![
             mk_row("A", "run_time_ns", 1000.0),
@@ -14644,6 +14810,7 @@ mod tests {
             display_key: group.into(),
             uptime_pct: None,
             sort_by_cell: None,
+            sort_by_delta: None,
         };
         // Three groups with IDENTICAL deltas — only the
         // group_key tie-break can deterministically order them.
@@ -14694,6 +14861,7 @@ mod tests {
             display_key: group.into(),
             uptime_pct: None,
             sort_by_cell: None,
+            sort_by_delta: None,
         };
         let mut rows = vec![
             // alpha has a real run_time_ns delta.
@@ -14745,6 +14913,7 @@ mod tests {
             display_key: group.into(),
             uptime_pct: None,
             sort_by_cell: None,
+            sort_by_delta: None,
         };
         let mut rows = vec![
             // alpha has a real (positive) run_time_ns delta.
@@ -14808,6 +14977,7 @@ mod tests {
             display_key: group.into(),
             uptime_pct: None,
             sort_by_cell: None,
+            sort_by_delta: None,
         };
         let mut rows = vec![mk_row("alpha", "policy"), mk_row("bravo", "policy")];
         // Sort by run_time_ns — neither group has it, both fall
@@ -14851,6 +15021,7 @@ mod tests {
             display_key: group.into(),
             uptime_pct: None,
             sort_by_cell: None,
+            sort_by_delta: None,
         };
         // Use four metrics from the scheduling block in their
         // registry order: run_time_ns (idx 6), wait_time_ns (7),
@@ -14906,6 +15077,7 @@ mod tests {
             display_key: group.into(),
             uptime_pct: None,
             sort_by_cell: None,
+            sort_by_delta: None,
         };
         let mut rows = vec![
             mk_row("alpha", "run_time_ns", f64::NAN),
