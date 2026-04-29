@@ -2394,6 +2394,17 @@ fn sort_diff_rows_by_keys(
     });
 }
 
+/// A pair of cgroup groups fudged together by thread population overlap.
+#[derive(Debug, Clone, Default)]
+pub struct FudgedPair {
+    pub baseline_key: String,
+    pub candidate_key: String,
+    pub overlap: usize,
+    pub jaccard: f64,
+    pub residual_baseline: Vec<String>,
+    pub residual_candidate: Vec<String>,
+}
+
 /// Full comparison result.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
@@ -2405,6 +2416,8 @@ pub struct CtprofDiff {
     /// Group keys that appeared in the candidate snapshot but not
     /// in the baseline.
     pub only_candidate: Vec<String>,
+    /// Cgroup groups fudged together by thread population overlap.
+    pub fudged_pairs: Vec<FudgedPair>,
     /// Baseline-only cgroup-level enrichment rows, keyed by the
     /// cgroup path (after flatten). Populated only for
     /// [`GroupBy::Cgroup`].
@@ -2718,6 +2731,159 @@ pub fn compare(
             diff.only_candidate.push(key.clone());
         }
     }
+    // Content-based cgroup fudging: match one-sided groups by
+    // thread population overlap when cgroup paths differ but
+    // the workload is the same (e.g. service re-deployed to a
+    // new cgroup path between snapshots).
+    if !diff.only_baseline.is_empty() && !diff.only_candidate.is_empty() {
+        type TypeSet = std::collections::BTreeSet<(String, String)>;
+        let mut types_a: BTreeMap<String, TypeSet> = BTreeMap::new();
+        let mut types_b: BTreeMap<String, TypeSet> = BTreeMap::new();
+        let only_b_snapshot: Vec<String> = diff.only_baseline.clone();
+        let only_c_snapshot: Vec<String> = diff.only_candidate.clone();
+        for t in &baseline.threads {
+            let cg = flatten_cgroup_path(&t.cgroup, &flatten);
+            let cg_key = match cgroup_key_map.as_ref().and_then(|m| m.get(&cg)) {
+                Some(k) => k.as_str(),
+                None => continue,
+            };
+            for key in &only_b_snapshot {
+                if key.starts_with(cg_key) {
+                    types_a
+                        .entry(key.clone())
+                        .or_default()
+                        .insert((pattern_key(&t.pcomm), pattern_key(&t.comm)));
+                }
+            }
+        }
+        for t in &candidate.threads {
+            let cg = flatten_cgroup_path(&t.cgroup, &flatten);
+            let cg_key = match cgroup_key_map.as_ref().and_then(|m| m.get(&cg)) {
+                Some(k) => k.as_str(),
+                None => continue,
+            };
+            for key in &only_c_snapshot {
+                if key.starts_with(cg_key) {
+                    types_b
+                        .entry(key.clone())
+                        .or_default()
+                        .insert((pattern_key(&t.pcomm), pattern_key(&t.comm)));
+                }
+            }
+        }
+
+        let mut fudged: Vec<(String, String)> = Vec::new(); // (baseline_key, candidate_key)
+        let mut used_b: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+
+        for bkey in &diff.only_baseline {
+            let Some(set_a) = types_a.get(bkey.as_str()) else {
+                continue;
+            };
+            if set_a.len() < 10 {
+                continue;
+            }
+            let mut best: Option<(&str, f64, usize)> = None;
+            for ckey in &diff.only_candidate {
+                if used_b.contains(ckey.as_str()) {
+                    continue;
+                }
+                let Some(set_b) = types_b.get(ckey.as_str()) else {
+                    continue;
+                };
+                let intersection = set_a.intersection(set_b).count();
+                if intersection < 10 {
+                    continue;
+                }
+                let union = set_a.union(set_b).count();
+                let jaccard = intersection as f64 / union as f64;
+                if jaccard >= 0.90 && best.is_none_or(|(_, bj, _)| jaccard > bj) {
+                    best = Some((ckey.as_str(), jaccard, intersection));
+                }
+            }
+            if let Some((ckey, _jaccard, _overlap)) = best {
+                fudged.push((bkey.clone(), ckey.to_string()));
+                used_b.insert(ckey);
+            }
+        }
+
+        // Collect keys to remove and build fudge report.
+        let mut remove_baseline: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        let mut remove_candidate: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        for (bkey, ckey) in &fudged {
+            remove_baseline.insert(bkey.clone());
+            remove_candidate.insert(ckey.clone());
+            if let (Some(group_a), Some(group_b)) = (groups_a.get(bkey), groups_b.get(ckey)) {
+                let display_key = format!("{bkey} ~> {ckey}");
+                for metric in CTPROF_METRICS {
+                    let Some(a) = group_a.metrics.get(metric.name).cloned() else {
+                        continue;
+                    };
+                    let Some(b) = group_b.metrics.get(metric.name).cloned() else {
+                        continue;
+                    };
+                    diff.rows.push(build_row(
+                        bkey,
+                        &display_key,
+                        group_a.thread_count,
+                        group_b.thread_count,
+                        metric,
+                        a,
+                        b,
+                        None,
+                    ));
+                }
+                for def in CTPROF_DERIVED_METRICS {
+                    diff.derived_rows.push(build_derived_row(
+                        bkey,
+                        &display_key,
+                        group_a.thread_count,
+                        group_b.thread_count,
+                        def,
+                        &group_a.metrics,
+                        &group_b.metrics,
+                    ));
+                }
+            }
+        }
+        diff.only_baseline.retain(|k| !remove_baseline.contains(k));
+        diff.only_candidate
+            .retain(|k| !remove_candidate.contains(k));
+
+        // Store fudge report for rendering.
+        diff.fudged_pairs = fudged
+            .iter()
+            .map(|(b, c)| {
+                let set_a = types_a.get(b.as_str()).cloned().unwrap_or_default();
+                let set_b = types_b.get(c.as_str()).cloned().unwrap_or_default();
+                let residual_a: Vec<String> = set_a
+                    .difference(&set_b)
+                    .map(|(p, c)| format!("{p}:{c}"))
+                    .collect();
+                let residual_b: Vec<String> = set_b
+                    .difference(&set_a)
+                    .map(|(p, c)| format!("{p}:{c}"))
+                    .collect();
+                FudgedPair {
+                    baseline_key: b.clone(),
+                    candidate_key: c.clone(),
+                    overlap: set_a.intersection(&set_b).count(),
+                    jaccard: {
+                        let u = set_a.union(&set_b).count();
+                        if u > 0 {
+                            set_a.intersection(&set_b).count() as f64 / u as f64
+                        } else {
+                            0.0
+                        }
+                    },
+                    residual_baseline: residual_a,
+                    residual_candidate: residual_b,
+                }
+            })
+            .collect();
+    }
+
     diff.only_baseline.sort();
     diff.only_candidate.sort();
 
@@ -7158,6 +7324,39 @@ pub fn write_diff<W: fmt::Write>(
     };
     write_only_list(w, "baseline", baseline_path, &diff.only_baseline)?;
     write_only_list(w, "candidate", candidate_path, &diff.only_candidate)?;
+
+    if !diff.fudged_pairs.is_empty() {
+        writeln!(
+            w,
+            "\n\x1b[1;33m## Fudged cgroup matches ({} pair(s))\x1b[0m",
+            diff.fudged_pairs.len()
+        )?;
+        for fp in &diff.fudged_pairs {
+            writeln!(w, "\n  \x1b[36mbaseline:\x1b[0m {}", fp.baseline_key)?;
+            writeln!(w, "  \x1b[36mcandidate:\x1b[0m {}", fp.candidate_key)?;
+            writeln!(
+                w,
+                "  overlap: {} thread types, Jaccard: {:.1}%",
+                fp.overlap,
+                fp.jaccard * 100.0
+            )?;
+            if !fp.residual_baseline.is_empty() {
+                writeln!(
+                    w,
+                    "  residual (baseline only): {}",
+                    fp.residual_baseline.join(", ")
+                )?;
+            }
+            if !fp.residual_candidate.is_empty() {
+                writeln!(
+                    w,
+                    "  residual (candidate only): {}",
+                    fp.residual_candidate.join(", ")
+                )?;
+            }
+        }
+    }
+
     Ok(())
 }
 
