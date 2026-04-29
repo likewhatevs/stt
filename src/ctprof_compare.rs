@@ -2736,58 +2736,73 @@ pub fn compare(
     // the workload is the same (e.g. service re-deployed to a
     // new cgroup path between snapshots).
     if !diff.only_baseline.is_empty() && !diff.only_candidate.is_empty() {
+        // Extract cgroup prefix from compound keys.
+        fn cg_prefix(key: &str) -> &str {
+            key.split_once('\x00').map_or(key, |(cg, _)| cg)
+        }
+
+        // Collect thread types per CGROUP PREFIX (not per compound key).
         type TypeSet = std::collections::BTreeSet<(String, String)>;
-        let mut types_a: BTreeMap<String, TypeSet> = BTreeMap::new();
-        let mut types_b: BTreeMap<String, TypeSet> = BTreeMap::new();
-        let only_b_snapshot: Vec<String> = diff.only_baseline.clone();
-        let only_c_snapshot: Vec<String> = diff.only_candidate.clone();
+        let mut cg_types_a: BTreeMap<String, TypeSet> = BTreeMap::new();
+        let mut cg_types_b: BTreeMap<String, TypeSet> = BTreeMap::new();
+
+        // Collect unique cgroup prefixes from one-sided keys.
+        let mut cg_prefixes_a: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        let mut cg_prefixes_b: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        for key in &diff.only_baseline {
+            cg_prefixes_a.insert(cg_prefix(key).to_string());
+        }
+        for key in &diff.only_candidate {
+            cg_prefixes_b.insert(cg_prefix(key).to_string());
+        }
+
+        // Populate thread types per cgroup prefix from snapshots.
         for t in &baseline.threads {
             let cg = flatten_cgroup_path(&t.cgroup, &flatten);
             let cg_key = match cgroup_key_map.as_ref().and_then(|m| m.get(&cg)) {
-                Some(k) => k.as_str(),
-                None => continue,
+                Some(k) => k.clone(),
+                None => cg,
             };
-            for key in &only_b_snapshot {
-                if key.starts_with(cg_key) {
-                    types_a
-                        .entry(key.clone())
-                        .or_default()
-                        .insert((pattern_key(&t.pcomm), pattern_key(&t.comm)));
-                }
+            if cg_prefixes_a.contains(&cg_key) {
+                cg_types_a
+                    .entry(cg_key)
+                    .or_default()
+                    .insert((pattern_key(&t.pcomm), pattern_key(&t.comm)));
             }
         }
         for t in &candidate.threads {
             let cg = flatten_cgroup_path(&t.cgroup, &flatten);
             let cg_key = match cgroup_key_map.as_ref().and_then(|m| m.get(&cg)) {
-                Some(k) => k.as_str(),
-                None => continue,
+                Some(k) => k.clone(),
+                None => cg,
             };
-            for key in &only_c_snapshot {
-                if key.starts_with(cg_key) {
-                    types_b
-                        .entry(key.clone())
-                        .or_default()
-                        .insert((pattern_key(&t.pcomm), pattern_key(&t.comm)));
-                }
+            if cg_prefixes_b.contains(&cg_key) {
+                cg_types_b
+                    .entry(cg_key)
+                    .or_default()
+                    .insert((pattern_key(&t.pcomm), pattern_key(&t.comm)));
             }
         }
 
-        let mut fudged: Vec<(String, String)> = Vec::new(); // (baseline_key, candidate_key)
-        let mut used_b: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        // Match cgroup prefixes by Jaccard similarity.
+        let mut fudged_cg: Vec<(String, String)> = Vec::new(); // (baseline_cg, candidate_cg)
+        let mut used_cg: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
 
-        for bkey in &diff.only_baseline {
-            let Some(set_a) = types_a.get(bkey.as_str()) else {
+        for bcg in &cg_prefixes_a {
+            let Some(set_a) = cg_types_a.get(bcg) else {
                 continue;
             };
             if set_a.len() < 10 {
                 continue;
             }
             let mut best: Option<(&str, f64, usize)> = None;
-            for ckey in &diff.only_candidate {
-                if used_b.contains(ckey.as_str()) {
+            for ccg in &cg_prefixes_b {
+                if used_cg.contains(ccg.as_str()) {
                     continue;
                 }
-                let Some(set_b) = types_b.get(ckey.as_str()) else {
+                let Some(set_b) = cg_types_b.get(ccg) else {
                     continue;
                 };
                 let intersection = set_a.intersection(set_b).count();
@@ -2797,66 +2812,97 @@ pub fn compare(
                 let union = set_a.union(set_b).count();
                 let jaccard = intersection as f64 / union as f64;
                 if jaccard >= 0.90 && best.is_none_or(|(_, bj, _)| jaccard > bj) {
-                    best = Some((ckey.as_str(), jaccard, intersection));
+                    best = Some((ccg.as_str(), jaccard, intersection));
                 }
             }
-            if let Some((ckey, _jaccard, _overlap)) = best {
-                fudged.push((bkey.clone(), ckey.to_string()));
-                used_b.insert(ckey);
+            if let Some((ccg, _jaccard, _overlap)) = best {
+                fudged_cg.push((bcg.clone(), ccg.to_string()));
+                used_cg.insert(ccg);
             }
         }
 
-        // Collect keys to remove and build fudge report.
+        // For each fudged cgroup pair, remap ALL compound keys sharing
+        // that prefix. Match baseline keys to candidate keys by their
+        // pcomm\x00comm suffix.
         let mut remove_baseline: std::collections::BTreeSet<String> =
             std::collections::BTreeSet::new();
         let mut remove_candidate: std::collections::BTreeSet<String> =
             std::collections::BTreeSet::new();
-        for (bkey, ckey) in &fudged {
-            remove_baseline.insert(bkey.clone());
-            remove_candidate.insert(ckey.clone());
-            if let (Some(group_a), Some(group_b)) = (groups_a.get(bkey), groups_b.get(ckey)) {
-                let display_key = format!("{bkey} ~> {ckey}");
-                for metric in CTPROF_METRICS {
-                    let Some(a) = group_a.metrics.get(metric.name).cloned() else {
-                        continue;
-                    };
-                    let Some(b) = group_b.metrics.get(metric.name).cloned() else {
-                        continue;
-                    };
-                    diff.rows.push(build_row(
-                        bkey,
-                        &display_key,
-                        group_a.thread_count,
-                        group_b.thread_count,
-                        metric,
-                        a,
-                        b,
-                        None,
-                    ));
-                }
-                for def in CTPROF_DERIVED_METRICS {
-                    diff.derived_rows.push(build_derived_row(
-                        bkey,
-                        &display_key,
-                        group_a.thread_count,
-                        group_b.thread_count,
-                        def,
-                        &group_a.metrics,
-                        &group_b.metrics,
-                    ));
+
+        for (bcg, ccg) in &fudged_cg {
+            // Collect all compound keys with this cgroup prefix.
+            let b_keys: Vec<&String> = diff
+                .only_baseline
+                .iter()
+                .filter(|k| cg_prefix(k) == bcg.as_str())
+                .collect();
+            let c_keys: Vec<&String> = diff
+                .only_candidate
+                .iter()
+                .filter(|k| cg_prefix(k) == ccg.as_str())
+                .collect();
+
+            // Build suffix → candidate_key map for matching.
+            let c_suffix_map: BTreeMap<&str, &String> = c_keys
+                .iter()
+                .map(|k| {
+                    let suffix = k.split_once('\x00').map_or("", |(_, s)| s);
+                    (suffix, *k)
+                })
+                .collect();
+
+            for bkey in &b_keys {
+                let b_suffix = bkey.split_once('\x00').map_or("", |(_, s)| s);
+                if let Some(ckey) = c_suffix_map.get(b_suffix) {
+                    // Suffix matches — fudge this compound key pair.
+                    remove_baseline.insert((*bkey).clone());
+                    remove_candidate.insert((*ckey).clone());
+                    if let (Some(ga), Some(gb)) = (groups_a.get(*bkey), groups_b.get(*ckey)) {
+                        let display_key = format!("{bcg} ~> {ccg}");
+                        for metric in CTPROF_METRICS {
+                            let Some(a) = ga.metrics.get(metric.name).cloned() else {
+                                continue;
+                            };
+                            let Some(b) = gb.metrics.get(metric.name).cloned() else {
+                                continue;
+                            };
+                            diff.rows.push(build_row(
+                                bkey,
+                                &display_key,
+                                ga.thread_count,
+                                gb.thread_count,
+                                metric,
+                                a,
+                                b,
+                                None,
+                            ));
+                        }
+                        for def in CTPROF_DERIVED_METRICS {
+                            diff.derived_rows.push(build_derived_row(
+                                bkey,
+                                &display_key,
+                                ga.thread_count,
+                                gb.thread_count,
+                                def,
+                                &ga.metrics,
+                                &gb.metrics,
+                            ));
+                        }
+                    }
                 }
             }
         }
+
         diff.only_baseline.retain(|k| !remove_baseline.contains(k));
         diff.only_candidate
             .retain(|k| !remove_candidate.contains(k));
 
-        // Store fudge report for rendering.
-        diff.fudged_pairs = fudged
+        // Store fudge report per cgroup pair.
+        diff.fudged_pairs = fudged_cg
             .iter()
-            .map(|(b, c)| {
-                let set_a = types_a.get(b.as_str()).cloned().unwrap_or_default();
-                let set_b = types_b.get(c.as_str()).cloned().unwrap_or_default();
+            .map(|(bcg, ccg)| {
+                let set_a = cg_types_a.get(bcg).cloned().unwrap_or_default();
+                let set_b = cg_types_b.get(ccg).cloned().unwrap_or_default();
                 let residual_a: Vec<String> = set_a
                     .difference(&set_b)
                     .map(|(p, c)| format!("{p}:{c}"))
@@ -2865,17 +2911,16 @@ pub fn compare(
                     .difference(&set_a)
                     .map(|(p, c)| format!("{p}:{c}"))
                     .collect();
+                let intersection = set_a.intersection(&set_b).count();
+                let union = set_a.union(&set_b).count();
                 FudgedPair {
-                    baseline_key: b.clone(),
-                    candidate_key: c.clone(),
-                    overlap: set_a.intersection(&set_b).count(),
-                    jaccard: {
-                        let u = set_a.union(&set_b).count();
-                        if u > 0 {
-                            set_a.intersection(&set_b).count() as f64 / u as f64
-                        } else {
-                            0.0
-                        }
+                    baseline_key: bcg.clone(),
+                    candidate_key: ccg.clone(),
+                    overlap: intersection,
+                    jaccard: if union > 0 {
+                        intersection as f64 / union as f64
+                    } else {
+                        0.0
                     },
                     residual_baseline: residual_a,
                     residual_candidate: residual_b,
