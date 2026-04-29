@@ -6565,7 +6565,7 @@ pub fn write_diff<W: fmt::Write>(
             writeln!(w)?;
             writeln!(w, "## smaps_rollup")?;
             let mut st = display.new_table();
-            st.set_header(colored_header(&columns, "comm"));
+            st.set_header(colored_header(&columns, "pcomm"));
 
             // For All mode, re-sort by cgroup hierarchy (keys are
             // compound cgroup\x00pcomm). Track segments for tree headings.
