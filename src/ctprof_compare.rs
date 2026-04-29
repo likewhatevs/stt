@@ -6603,7 +6603,12 @@ pub fn write_diff<W: fmt::Write>(
                 writeln!(w, "\x1b[1;32m## {parent}\x1b[0m")?;
                 let mut table = display.new_table();
                 table.set_header(colored_header(&columns, "cgroup"));
-                for row in rows {
+                let cg_limit = if display.section_line_limit > 0 {
+                    &rows[..rows.len().min(display.section_line_limit)]
+                } else {
+                    &rows[..]
+                };
+                for row in cg_limit {
                     let (_, leaf) = cgroup_parent_leaf(&row.display_key);
                     let mut string_cells = render_diff_row_cells(row, &columns);
                     // Replace group cell with leaf segment.
@@ -6623,7 +6628,12 @@ pub fn write_diff<W: fmt::Write>(
             writeln!(w, "## Primary metrics")?;
             let mut table = display.new_table();
             table.set_header(colored_header(&columns, group_header));
-            for row in &primary_rows {
+            let limit_iter = if display.section_line_limit > 0 {
+                &primary_rows[..primary_rows.len().min(display.section_line_limit)]
+            } else {
+                &primary_rows[..]
+            };
+            for row in limit_iter {
                 let string_cells = render_diff_row_cells(row, &columns);
                 let cells: Vec<comfy_table::Cell> = string_cells
                     .into_iter()
@@ -6790,7 +6800,12 @@ pub fn write_diff<W: fmt::Write>(
             writeln!(w, "## Derived metrics")?;
             let mut dt = display.new_table();
             dt.set_header(colored_header(&columns, group_header));
-            for row in &derived_rows {
+            let d_limit = if display.section_line_limit > 0 {
+                &derived_rows[..derived_rows.len().min(display.section_line_limit)]
+            } else {
+                &derived_rows[..]
+            };
+            for row in d_limit {
                 let string_cells = render_derived_row_cells(row, &columns);
                 let cells: Vec<comfy_table::Cell> = string_cells
                     .into_iter()
