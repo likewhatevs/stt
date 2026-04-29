@@ -6535,14 +6535,8 @@ pub fn write_diff<W: fmt::Write>(
         if any_delta {
             writeln!(w)?;
             writeln!(w, "## smaps_rollup")?;
-            let smaps_cols = ["process", "key", "value", "delta", "%"];
             let mut st = display.new_table();
-            st.set_header(
-                smaps_cols
-                    .iter()
-                    .map(|h| comfy_table::Cell::new(*h).fg(comfy_table::Color::Cyan))
-                    .collect::<Vec<_>>(),
-            );
+            st.set_header(colored_header(&columns, "process"));
 
             // For All mode, re-sort by cgroup hierarchy (keys are
             // compound cgroup\x00pcomm). Track segments for tree headings.
@@ -6580,14 +6574,7 @@ pub fn write_diff<W: fmt::Write>(
                         if has_rows {
                             writeln!(w, "{st}")?;
                             st = display.new_table();
-                            st.set_header(
-                                smaps_cols
-                                    .iter()
-                                    .map(|h| {
-                                        comfy_table::Cell::new(*h).fg(comfy_table::Color::Cyan)
-                                    })
-                                    .collect::<Vec<_>>(),
-                            );
+                            st.set_header(colored_header(&columns, "process"));
                             has_rows = false;
                         }
                         for (depth, seg) in segs.iter().enumerate().skip(common) {
@@ -6651,13 +6638,31 @@ pub fn write_diff<W: fmt::Write>(
                     } else {
                         String::new()
                     };
-                    st.add_row(vec![
-                        comfy_table::Cell::new(proc_label),
-                        comfy_table::Cell::new(sk.clone()),
-                        comfy_table::Cell::new(value_cell),
-                        comfy_table::Cell::new(delta_cell).fg(dc),
-                        comfy_table::Cell::new(pct_cell).fg(dc),
-                    ]);
+                    let delta_f = if av.is_some() && bv.is_some() {
+                        Some(delta as f64)
+                    } else {
+                        None
+                    };
+                    let row_cells: Vec<comfy_table::Cell> = columns
+                        .iter()
+                        .map(|c| match c {
+                            Column::Group => comfy_table::Cell::new(&proc_label),
+                            Column::Threads => comfy_table::Cell::new(""),
+                            Column::Metric => comfy_table::Cell::new(sk.clone()),
+                            Column::Arrow => comfy_table::Cell::new(&value_cell),
+                            Column::Delta => comfy_table::Cell::new(&delta_cell).fg(dc),
+                            Column::Pct => {
+                                let mut cell = comfy_table::Cell::new(&pct_cell).fg(dc);
+                                if matches!(delta_f, Some(d) if d.abs() > 0.5) {
+                                    cell = cell.add_attribute(comfy_table::Attribute::Bold);
+                                }
+                                cell
+                            }
+                            Column::Uptime => comfy_table::Cell::new(""),
+                            _ => comfy_table::Cell::new(""),
+                        })
+                        .collect();
+                    st.add_row(row_cells);
                     has_rows = true;
                 }
             }
