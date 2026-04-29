@@ -5697,11 +5697,13 @@ impl DisplayOptions {
     /// with its built-in "..." indicator.
     pub fn new_constrained_table(&self, max_widths: &[u16]) -> comfy_table::Table {
         let mut t = self.new_table();
-        t.set_content_arrangement(comfy_table::ContentArrangement::Dynamic);
-        let total: u16 = max_widths.iter().sum::<u16>()
-            + (max_widths.len() as u16 * 2)  // padding
-            + 10; // slack
-        t.set_width(total);
+        // Create dummy columns so constraints can be set.
+        // Columns are auto-created when the header is added later,
+        // but we need them NOW for set_constraint. Adding a dummy
+        // header row with the right column count, then replacing
+        // it when the real header is set.
+        let dummy: Vec<&str> = (0..max_widths.len()).map(|_| "").collect();
+        t.set_header(dummy);
         for (i, &w) in max_widths.iter().enumerate() {
             if let Some(col) = t.column_mut(i) {
                 col.set_constraint(comfy_table::ColumnConstraint::UpperBoundary(
