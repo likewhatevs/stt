@@ -6183,6 +6183,7 @@ pub fn write_diff<W: fmt::Write>(
             // Single table with separator rows for cgroup headings.
             // Keeps column widths consistent across the entire view.
             let mut last_segments: Vec<&str> = Vec::new();
+            let mut last_pcomm = "";
             let mut table = display.new_table();
             table.set_header(colored_header(&columns, "comm"));
 
@@ -6224,16 +6225,33 @@ pub fn write_diff<W: fmt::Write>(
                         table.add_row(heading_cells);
                     }
                     last_segments = segments;
+                    last_pcomm = "";
+                }
+
+                if h.pcomm != last_pcomm {
+                    let cg_depth = last_segments.len();
+                    let indent = "  ".repeat(cg_depth);
+                    let label = format!("{indent}{}", h.pcomm);
+                    let heading_cells: Vec<comfy_table::Cell> = columns
+                        .iter()
+                        .map(|c| {
+                            if *c == Column::Group {
+                                comfy_table::Cell::new(&label)
+                                    .fg(comfy_table::Color::White)
+                                    .add_attribute(comfy_table::Attribute::Bold)
+                            } else {
+                                comfy_table::Cell::new("")
+                            }
+                        })
+                        .collect();
+                    table.add_row(heading_cells);
+                    last_pcomm = h.pcomm;
                 }
 
                 let mut string_cells = render_diff_row_cells(h.row, &columns);
                 if let Some(pos) = columns.iter().position(|c| *c == Column::Group) {
-                    let label = if h.pcomm == h.comm {
-                        h.comm.to_string()
-                    } else {
-                        format!("{}:{}", h.pcomm, h.comm)
-                    };
-                    string_cells[pos] = format!("  {label}");
+                    let cg_depth = last_segments.len();
+                    string_cells[pos] = format!("{}  {}", "  ".repeat(cg_depth + 1), h.comm);
                 }
                 let cells: Vec<comfy_table::Cell> = string_cells
                     .into_iter()
@@ -6329,29 +6347,37 @@ pub fn write_diff<W: fmt::Write>(
             struct DHier<'a> {
                 cgroup: &'a str,
                 pcomm: &'a str,
+                comm: &'a str,
                 row: &'a DerivedRow,
             }
             let mut hier: Vec<DHier<'_>> = limited
                 .iter()
                 .map(|row| {
-                    let (cg, pc) = row
-                        .group_key
-                        .split_once('\x00')
-                        .unwrap_or(("", &row.group_key));
+                    let mut parts = row.group_key.splitn(3, '\x00');
+                    let cg = parts.next().unwrap_or("");
+                    let pc = parts.next().unwrap_or("");
+                    let cm = parts.next().unwrap_or(pc);
                     DHier {
                         cgroup: cg,
                         pcomm: pc,
+                        comm: cm,
                         row,
                     }
                 })
                 .collect();
-            hier.sort_by(|a, b| a.cgroup.cmp(b.cgroup).then_with(|| a.pcomm.cmp(b.pcomm)));
+            hier.sort_by(|a, b| {
+                a.cgroup
+                    .cmp(b.cgroup)
+                    .then_with(|| a.pcomm.cmp(b.pcomm))
+                    .then_with(|| a.comm.cmp(b.comm))
+            });
 
             writeln!(w)?;
             writeln!(w, "## Derived metrics")?;
             let mut dt = display.new_table();
             dt.set_header(colored_header(&columns, "comm"));
             let mut last_segs: Vec<&str> = Vec::new();
+            let mut last_pc = "";
             let depth_color = |d: usize| -> comfy_table::Color {
                 match d {
                     0 => comfy_table::Color::Green,
@@ -6385,10 +6411,31 @@ pub fn write_diff<W: fmt::Write>(
                         dt.add_row(hcells);
                     }
                     last_segs = segs;
+                    last_pc = "";
+                }
+                if h.pcomm != last_pc {
+                    let cg_depth = last_segs.len();
+                    let indent = "  ".repeat(cg_depth);
+                    let label = format!("{indent}{}", h.pcomm);
+                    let hcells: Vec<comfy_table::Cell> = columns
+                        .iter()
+                        .map(|c| {
+                            if *c == Column::Group {
+                                comfy_table::Cell::new(&label)
+                                    .fg(comfy_table::Color::White)
+                                    .add_attribute(comfy_table::Attribute::Bold)
+                            } else {
+                                comfy_table::Cell::new("")
+                            }
+                        })
+                        .collect();
+                    dt.add_row(hcells);
+                    last_pc = h.pcomm;
                 }
                 let mut cells = render_derived_row_cells(h.row, &columns);
                 if let Some(pos) = columns.iter().position(|c| *c == Column::Group) {
-                    cells[pos] = format!("  {}", h.pcomm);
+                    let cg_depth = last_segs.len();
+                    cells[pos] = format!("{}  {}", "  ".repeat(cg_depth + 1), h.comm);
                 }
                 let colored: Vec<comfy_table::Cell> = cells
                     .into_iter()
