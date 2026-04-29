@@ -2418,12 +2418,15 @@ pub struct FudgedPair {
     pub residual_baseline: Vec<String>,
     pub residual_candidate: Vec<String>,
     pub cascaded_children: usize,
+    pub baseline_root: String,
+    pub candidate_root: String,
 }
 
 /// Full comparison result.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct CtprofDiff {
+    pub sort_metric_name: Option<&'static str>,
     pub rows: Vec<DiffRow>,
     /// Group keys that appeared in the baseline snapshot but not
     /// in the candidate.
@@ -2750,6 +2753,7 @@ pub fn compare(
     // thread population overlap when cgroup paths differ but
     // the workload is the same (e.g. service re-deployed to a
     // new cgroup path between snapshots).
+    let mut fudged_key_pairs: Vec<(String, String)> = Vec::new();
     if group_by == GroupBy::All && !diff.only_baseline.is_empty() && !diff.only_candidate.is_empty()
     {
         // Extract cgroup prefix from compound keys.
@@ -2817,23 +2821,22 @@ pub fn compare(
             }
         }
 
-        // Match cgroup prefixes by Jaccard similarity.
+        // Match cgroup prefixes by Jaccard similarity. Each
+        // candidate finds its best baseline match independently —
+        // multiple candidates can match the same baseline (N
+        // stacked tenants vs 1 unstacked baseline).
         let mut fudged_cg: Vec<(String, String)> = Vec::new(); // (baseline_cg, candidate_cg)
-        let mut used_cg: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
 
-        for bcg in &cg_prefixes_a {
-            let Some(set_a) = cg_types_a.get(bcg) else {
+        for ccg in &cg_prefixes_b {
+            let Some(set_b) = cg_types_b.get(ccg) else {
                 continue;
             };
-            if set_a.len() < 10 {
+            if set_b.len() < 10 {
                 continue;
             }
             let mut best: Option<(&str, f64, usize)> = None;
-            for ccg in &cg_prefixes_b {
-                if used_cg.contains(ccg.as_str()) {
-                    continue;
-                }
-                let Some(set_b) = cg_types_b.get(ccg) else {
+            for bcg in &cg_prefixes_a {
+                let Some(set_a) = cg_types_a.get(bcg) else {
                     continue;
                 };
                 let intersection = set_a.intersection(set_b).count();
@@ -2843,12 +2846,11 @@ pub fn compare(
                 let union = set_a.union(set_b).count();
                 let jaccard = intersection as f64 / union as f64;
                 if jaccard >= 0.90 && best.is_none_or(|(_, bj, _)| jaccard > bj) {
-                    best = Some((ccg.as_str(), jaccard, intersection));
+                    best = Some((bcg.as_str(), jaccard, intersection));
                 }
             }
-            if let Some((ccg, _jaccard, _overlap)) = best {
-                fudged_cg.push((bcg.clone(), ccg.to_string()));
-                used_cg.insert(ccg);
+            if let Some((bcg, _jaccard, _overlap)) = best {
+                fudged_cg.push((bcg.to_string(), ccg.clone()));
             }
         }
 
@@ -2888,6 +2890,7 @@ pub fn compare(
                     // Suffix matches — fudge this compound key pair.
                     remove_baseline.insert((*bkey).clone());
                     remove_candidate.insert((*ckey).clone());
+                    fudged_key_pairs.push(((*bkey).clone(), (*ckey).clone()));
                     if let (Some(ga), Some(gb)) = (groups_a.get(*bkey), groups_b.get(*ckey)) {
                         let display_key = "[fudged]".to_string();
                         for metric in CTPROF_METRICS {
@@ -2929,6 +2932,7 @@ pub fn compare(
         // segments) from the pair. Use those shorter roots for
         // starts_with matching, not the full fudged paths.
         let mut cascade_counts: BTreeMap<String, usize> = BTreeMap::new();
+        let mut cascade_roots: BTreeMap<(String, String), (String, String)> = BTreeMap::new();
         for (bcg, ccg) in &fudged_cg {
             let b_segs: Vec<&str> = bcg.split('/').collect();
             let c_segs: Vec<&str> = ccg.split('/').collect();
@@ -2950,6 +2954,8 @@ pub fn compare(
             } else {
                 c_root
             };
+
+            cascade_roots.insert((bcg.clone(), ccg.clone()), (b_root.clone(), c_root.clone()));
 
             let remaining_b: Vec<String> = diff
                 .only_baseline
@@ -2984,6 +2990,7 @@ pub fn compare(
                 if let Some(ckey) = c_by_suffix.get(bkey) {
                     remove_baseline.insert(bkey.clone());
                     remove_candidate.insert((*ckey).clone());
+                    fudged_key_pairs.push((bkey.clone(), (*ckey).clone()));
                     *cascade_counts.entry(bcg.clone()).or_insert(0) += 1;
                     if let (Some(ga), Some(gb)) = (groups_a.get(bkey), groups_b.get(*ckey)) {
                         let display_key = "[fudged]".to_string();
@@ -3053,6 +3060,14 @@ pub fn compare(
                     residual_baseline: residual_a,
                     residual_candidate: residual_b,
                     cascaded_children: cascade_counts.get(bcg).copied().unwrap_or(0),
+                    baseline_root: cascade_roots
+                        .get(&(bcg.clone(), ccg.clone()))
+                        .map(|(b, _)| b.clone())
+                        .unwrap_or_else(|| bcg.clone()),
+                    candidate_root: cascade_roots
+                        .get(&(bcg.clone(), ccg.clone()))
+                        .map(|(_, c)| c.clone())
+                        .unwrap_or_else(|| ccg.clone()),
                 }
             })
             .collect();
@@ -3071,13 +3086,9 @@ pub fn compare(
                 group_lifetime.insert(key.clone(), now_b.saturating_sub(group_b.avg_start_ticks));
             }
         }
-        // Add fudged pairs: use baseline key as lookup, candidate group for lifetime.
-        for fp in &diff.fudged_pairs {
-            if let Some(gb) = groups_b.get(&fp.candidate_key) {
-                group_lifetime.insert(
-                    fp.baseline_key.clone(),
-                    now_b.saturating_sub(gb.avg_start_ticks),
-                );
+        for (bkey, ckey) in &fudged_key_pairs {
+            if let Some(gb) = groups_b.get(ckey) {
+                group_lifetime.insert(bkey.clone(), now_b.saturating_sub(gb.avg_start_ticks));
             }
         }
         let max_lifetime = group_lifetime.values().copied().max().unwrap_or(1).max(1);
@@ -3116,6 +3127,7 @@ pub fn compare(
         // Fill sort_by_cell: for each group, find the sort metric's
         // row and format its baseline→candidate (delta%).
         let sort_metric = opts.sort_by.first().map(|sk| sk.metric);
+        diff.sort_metric_name = sort_metric;
         if let Some(metric_name) = sort_metric {
             let mut group_cells: BTreeMap<String, String> = BTreeMap::new();
             for row in &diff.rows {
@@ -3167,38 +3179,61 @@ pub fn compare(
     // Fudge paired cg_A (baseline) with cg_B (candidate), but
     // smaps keys are cg_key\x00pcomm — different cg = no join.
     // Rename candidate keys from cg_B prefix to cg_A prefix.
-    for fp in &diff.fudged_pairs {
-        // Smaps keys are `full_cgroup_path\x00pcomm`. The fudge
-        // pair's cgroup might be a PARENT — children have more
-        // path segments after it (separated by /). Match on both
-        // `cg/` (children) and `cg\x00` (direct members).
-        let cand_slash = format!("{}/", fp.candidate_key);
-        let cand_nul = format!("{}\x00", fp.candidate_key);
-        let matches_cand = |k: &str| -> bool {
-            k.starts_with(&cand_slash) || k.starts_with(&cand_nul) || k == fp.candidate_key
-        };
-        let remap_key = |old: &str| -> String {
-            if old.starts_with(&cand_slash) {
-                format!("{}/{}", fp.baseline_key, &old[cand_slash.len()..])
-            } else if old.starts_with(&cand_nul) {
-                format!("{}\x00{}", fp.baseline_key, &old[cand_nul.len()..])
-            } else {
-                fp.baseline_key.clone()
+    // Smaps fudge remap: for each fudge pair, find candidate smaps
+    // keys under the candidate root, split into (cg_path, pcomm),
+    // strip the candidate root from cg_path to get the relative
+    // child path, rebuild as baseline_root + child + \x00 + pcomm.
+    // Sum values when multiple candidates map to the same baseline
+    // key (N containers → total candidate footprint).
+    {
+        // (relative_child_path + \x00 + pcomm) → summed values
+        let mut summed_by_rel: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::new();
+        for fp in &diff.fudged_pairs {
+            let cr = &fp.candidate_root;
+            let cr_slash = format!("{cr}/");
+            let cr_nul = format!("{cr}\x00");
+            let keys: Vec<String> = diff
+                .smaps_rollup_b
+                .keys()
+                .filter(|k| {
+                    k.starts_with(&cr_slash) || k.starts_with(&cr_nul) || k.as_str() == cr.as_str()
+                })
+                .cloned()
+                .collect();
+            for k in keys {
+                if let Some(val) = diff.smaps_rollup_b.remove(&k) {
+                    // Split smaps key: cg_path \x00 pcomm
+                    let (cg_path, pcomm) = k.split_once('\x00').unwrap_or((&k, ""));
+                    // Strip candidate root to get relative child path.
+                    let child = if cg_path == cr.as_str() {
+                        ""
+                    } else if let Some(rest) = cg_path.strip_prefix(&cr_slash) {
+                        rest
+                    } else {
+                        continue;
+                    };
+                    let rel_key = format!("{child}\x00{pcomm}");
+                    let entry = summed_by_rel.entry(rel_key).or_default();
+                    for (field, v) in &val {
+                        *entry.entry(field.clone()).or_insert(0) += v;
+                    }
+                }
             }
-        };
-        let keys_b: Vec<String> = diff
-            .smaps_rollup_b
-            .keys()
-            .filter(|k| matches_cand(k))
-            .cloned()
-            .collect();
-        for old_key in keys_b {
-            if let Some(val) = diff.smaps_rollup_b.remove(&old_key) {
-                diff.smaps_rollup_b.insert(remap_key(&old_key), val);
+        }
+        // Rebuild baseline-side keys and insert summed data.
+        if let Some(fp0) = diff.fudged_pairs.first() {
+            let br = &fp0.baseline_root;
+            for (rel_key, summed) in summed_by_rel {
+                let (child, pcomm) = rel_key.split_once('\x00').unwrap_or((&rel_key, ""));
+                let base_key = if child.is_empty() {
+                    format!("{br}\x00{pcomm}")
+                } else {
+                    format!("{br}/{child}\x00{pcomm}")
+                };
+                diff.smaps_rollup_b.insert(base_key, summed);
             }
         }
     }
-
     diff.sched_ext_a = baseline.sched_ext.clone();
     diff.sched_ext_b = candidate.sched_ext.clone();
 
@@ -5921,9 +5956,24 @@ fn cgroup_parent_leaf(path: &str) -> (&str, &str) {
 /// Build a colored header row — cyan foreground so headers are
 /// visually distinct from data rows.
 pub fn colored_header(columns: &[Column], group_header: &'static str) -> Vec<comfy_table::Cell> {
+    colored_header_with_sort(columns, group_header, None)
+}
+
+pub fn colored_header_with_sort(
+    columns: &[Column],
+    group_header: &'static str,
+    sort_metric: Option<&str>,
+) -> Vec<comfy_table::Cell> {
     columns
         .iter()
-        .map(|c| comfy_table::Cell::new(c.header(group_header)).fg(comfy_table::Color::Cyan))
+        .map(|c| {
+            let label = if *c == Column::SortBy {
+                sort_metric.unwrap_or("sort-by")
+            } else {
+                c.header(group_header)
+            };
+            comfy_table::Cell::new(label).fg(comfy_table::Color::Cyan)
+        })
         .collect()
 }
 
@@ -6564,7 +6614,11 @@ pub fn write_diff<W: fmt::Write>(
     // new_constrained_table so they can't inflate columns.
     let global_max_widths: Vec<u16> = if group_by == GroupBy::All {
         let mut measure = display.new_table();
-        measure.set_header(colored_header(&columns, group_header));
+        measure.set_header(colored_header_with_sort(
+            &columns,
+            group_header,
+            diff.sort_metric_name,
+        ));
         for row in &diff.rows {
             let mut cells = render_diff_row_cells(row, &columns);
             if let Some(pos) = columns.iter().position(|c| *c == Column::Group) {
@@ -6701,7 +6755,11 @@ pub fn write_diff<W: fmt::Write>(
             let mut last_segments: Vec<&str> = Vec::new();
             let mut last_pcomm = "";
             let mut table = display.new_constrained_table(&global_max_widths);
-            table.set_header(colored_header(&columns, "comm"));
+            table.set_header(colored_header_with_sort(
+                &columns,
+                "comm",
+                diff.sort_metric_name,
+            ));
 
             let depth_color = |depth: usize| -> comfy_table::Color {
                 match depth {
@@ -6790,7 +6848,11 @@ pub fn write_diff<W: fmt::Write>(
                 writeln!(w)?;
                 writeln!(w, "\x1b[1;32m## {parent}\x1b[0m")?;
                 let mut table = display.new_table();
-                table.set_header(colored_header(&columns, "cgroup"));
+                table.set_header(colored_header_with_sort(
+                    &columns,
+                    "cgroup",
+                    diff.sort_metric_name,
+                ));
                 let cg_limit = if display.section_line_limit > 0 {
                     &rows[..rows.len().min(display.section_line_limit)]
                 } else {
@@ -6815,7 +6877,11 @@ pub fn write_diff<W: fmt::Write>(
         } else {
             writeln!(w, "## Primary metrics")?;
             let mut table = display.new_table();
-            table.set_header(colored_header(&columns, group_header));
+            table.set_header(colored_header_with_sort(
+                &columns,
+                group_header,
+                diff.sort_metric_name,
+            ));
             let limit_iter = if display.section_line_limit > 0 {
                 &primary_rows[..primary_rows.len().min(display.section_line_limit)]
             } else {
@@ -6944,7 +7010,11 @@ pub fn write_diff<W: fmt::Write>(
             writeln!(w)?;
             writeln!(w, "## Derived metrics")?;
             let mut dt = display.new_constrained_table(&global_max_widths);
-            dt.set_header(colored_header(&columns, "comm"));
+            dt.set_header(colored_header_with_sort(
+                &columns,
+                "comm",
+                diff.sort_metric_name,
+            ));
             let mut last_segs: Vec<&str> = Vec::new();
             let mut last_pc = "";
             let depth_color = |d: usize| -> comfy_table::Color {
@@ -7029,7 +7099,11 @@ pub fn write_diff<W: fmt::Write>(
             writeln!(w)?;
             writeln!(w, "## Derived metrics")?;
             let mut dt = display.new_table();
-            dt.set_header(colored_header(&columns, group_header));
+            dt.set_header(colored_header_with_sort(
+                &columns,
+                group_header,
+                diff.sort_metric_name,
+            ));
             let d_limit = if display.section_line_limit > 0 {
                 &derived_rows[..derived_rows.len().min(display.section_line_limit)]
             } else {
@@ -7129,7 +7203,11 @@ pub fn write_diff<W: fmt::Write>(
             } else {
                 display.new_constrained_table(&global_max_widths)
             };
-            st.set_header(colored_header(&columns, "pcomm"));
+            st.set_header(colored_header_with_sort(
+                &columns,
+                "pcomm",
+                diff.sort_metric_name,
+            ));
 
             // For All mode, re-sort by cgroup hierarchy (keys are
             // compound cgroup\x00pcomm). Track segments for tree headings.
