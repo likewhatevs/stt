@@ -6557,34 +6557,46 @@ pub fn write_diff<W: fmt::Write>(
                     }
                 })
                 .collect();
-            let mut leaf_score: BTreeMap<(&str, &str), f64> = BTreeMap::new();
-            let mut cg_score: BTreeMap<&str, f64> = BTreeMap::new();
+            // Use pre-sorted row index as score so hierarchy honors
+            // --sort-by. Rows arrive sorted by the chosen metric.
+            // Lower index = higher priority (biggest mover first).
+            let row_rank: BTreeMap<*const DiffRow, usize> = hier
+                .iter()
+                .enumerate()
+                .map(|(i, h)| (h.row as *const DiffRow, i))
+                .collect();
+            let mut leaf_rank: BTreeMap<(&str, &str), usize> = BTreeMap::new();
+            let mut cg_rank: BTreeMap<&str, usize> = BTreeMap::new();
             for h in &hier {
-                let score = h.row.sort_key().abs();
-                let le = leaf_score.entry((h.cgroup, h.pcomm)).or_insert(0.0_f64);
-                if score > *le {
-                    *le = score;
+                let rank = row_rank[&(h.row as *const DiffRow)];
+                let le = leaf_rank.entry((h.cgroup, h.pcomm)).or_insert(usize::MAX);
+                if rank < *le {
+                    *le = rank;
                 }
-                let ce = cg_score.entry(h.cgroup).or_insert(0.0_f64);
-                if score > *ce {
-                    *ce = score;
+                let ce = cg_rank.entry(h.cgroup).or_insert(usize::MAX);
+                if rank < *ce {
+                    *ce = rank;
                 }
             }
             hier.sort_by(|a, b| {
-                let cga = cg_score.get(a.cgroup).copied().unwrap_or(0.0);
-                let cgb = cg_score.get(b.cgroup).copied().unwrap_or(0.0);
-                cgb.partial_cmp(&cga)
-                    .unwrap_or(std::cmp::Ordering::Equal)
+                let cga = cg_rank.get(a.cgroup).copied().unwrap_or(usize::MAX);
+                let cgb = cg_rank.get(b.cgroup).copied().unwrap_or(usize::MAX);
+                cga.cmp(&cgb)
                     .then_with(|| {
-                        let sa = leaf_score.get(&(a.cgroup, a.pcomm)).copied().unwrap_or(0.0);
-                        let sb = leaf_score.get(&(b.cgroup, b.pcomm)).copied().unwrap_or(0.0);
-                        sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+                        let sa = leaf_rank
+                            .get(&(a.cgroup, a.pcomm))
+                            .copied()
+                            .unwrap_or(usize::MAX);
+                        let sb = leaf_rank
+                            .get(&(b.cgroup, b.pcomm))
+                            .copied()
+                            .unwrap_or(usize::MAX);
+                        sa.cmp(&sb)
                     })
                     .then_with(|| {
-                        b.row
-                            .sort_key()
-                            .partial_cmp(&a.row.sort_key())
-                            .unwrap_or(std::cmp::Ordering::Equal)
+                        let ra = row_rank[&(a.row as *const DiffRow)];
+                        let rb = row_rank[&(b.row as *const DiffRow)];
+                        ra.cmp(&rb)
                     })
             });
 
@@ -6792,34 +6804,46 @@ pub fn write_diff<W: fmt::Write>(
                     }
                 })
                 .collect();
-            let mut leaf_score: BTreeMap<(&str, &str), f64> = BTreeMap::new();
-            let mut cg_score: BTreeMap<&str, f64> = BTreeMap::new();
+            // Use pre-sorted row index as score so hierarchy honors
+            // --sort-by. Rows arrive sorted by the chosen metric.
+            // Lower index = higher priority (biggest mover first).
+            let row_rank: BTreeMap<*const DerivedRow, usize> = hier
+                .iter()
+                .enumerate()
+                .map(|(i, h)| (h.row as *const DerivedRow, i))
+                .collect();
+            let mut leaf_rank: BTreeMap<(&str, &str), usize> = BTreeMap::new();
+            let mut cg_rank: BTreeMap<&str, usize> = BTreeMap::new();
             for h in &hier {
-                let score = h.row.sort_key().abs();
-                let le = leaf_score.entry((h.cgroup, h.pcomm)).or_insert(0.0_f64);
-                if score > *le {
-                    *le = score;
+                let rank = row_rank[&(h.row as *const DerivedRow)];
+                let le = leaf_rank.entry((h.cgroup, h.pcomm)).or_insert(usize::MAX);
+                if rank < *le {
+                    *le = rank;
                 }
-                let ce = cg_score.entry(h.cgroup).or_insert(0.0_f64);
-                if score > *ce {
-                    *ce = score;
+                let ce = cg_rank.entry(h.cgroup).or_insert(usize::MAX);
+                if rank < *ce {
+                    *ce = rank;
                 }
             }
             hier.sort_by(|a, b| {
-                let cga = cg_score.get(a.cgroup).copied().unwrap_or(0.0);
-                let cgb = cg_score.get(b.cgroup).copied().unwrap_or(0.0);
-                cgb.partial_cmp(&cga)
-                    .unwrap_or(std::cmp::Ordering::Equal)
+                let cga = cg_rank.get(a.cgroup).copied().unwrap_or(usize::MAX);
+                let cgb = cg_rank.get(b.cgroup).copied().unwrap_or(usize::MAX);
+                cga.cmp(&cgb)
                     .then_with(|| {
-                        let sa = leaf_score.get(&(a.cgroup, a.pcomm)).copied().unwrap_or(0.0);
-                        let sb = leaf_score.get(&(b.cgroup, b.pcomm)).copied().unwrap_or(0.0);
-                        sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+                        let sa = leaf_rank
+                            .get(&(a.cgroup, a.pcomm))
+                            .copied()
+                            .unwrap_or(usize::MAX);
+                        let sb = leaf_rank
+                            .get(&(b.cgroup, b.pcomm))
+                            .copied()
+                            .unwrap_or(usize::MAX);
+                        sa.cmp(&sb)
                     })
                     .then_with(|| {
-                        b.row
-                            .sort_key()
-                            .partial_cmp(&a.row.sort_key())
-                            .unwrap_or(std::cmp::Ordering::Equal)
+                        let ra = row_rank[&(a.row as *const DerivedRow)];
+                        let rb = row_rank[&(b.row as *const DerivedRow)];
+                        ra.cmp(&rb)
                     })
             });
 
