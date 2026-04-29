@@ -117,10 +117,10 @@
 //!   share a unit; routing nr_threads through GaugeNs would
 //!   render it on the ns auto-scale ladder, which is a unit lie.
 //! - [`ClockTicks`] — USER_HZ-scaled time. Examples:
-//!   `utime_clock_ticks`, `stime_clock_ticks`,
-//!   `delayacct_blkio_ticks`. Auto-scale ladder is
-//!   `ticks → Kticks → Mticks` (decimal SI), distinct from ns
-//!   (also decimal SI, different unit) and bytes (IEC binary).
+//!   `utime_clock_ticks`, `stime_clock_ticks`. Auto-scale
+//!   ladder is `ticks → Kticks → Mticks` (decimal SI),
+//!   distinct from ns (also decimal SI, different unit) and
+//!   bytes (IEC binary).
 //! - [`Bytes`] — byte counts. Examples: `allocated_bytes`,
 //!   `read_bytes`, `wchar`. Auto-scale ladder is IEC binary
 //!   (`B → KiB → MiB → GiB → TiB`).
@@ -295,9 +295,9 @@ pub struct MonotonicNs(pub u64);
 /// ns and bytes so the rendered cell carries the correct unit
 /// suffix.
 ///
-/// Examples: `utime_clock_ticks`, `stime_clock_ticks`,
-/// `delayacct_blkio_ticks`. Same lifetime-window contract as
-/// [`MonotonicNs`]; sum across a group, delta across snapshots.
+/// Examples: `utime_clock_ticks`, `stime_clock_ticks`. Same
+/// lifetime-window contract as [`MonotonicNs`]; sum across a
+/// group, delta across snapshots.
 #[repr(transparent)]
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,

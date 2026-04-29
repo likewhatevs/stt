@@ -179,7 +179,7 @@ than producing a meaningless `1×1s ⊕ 1000×1ms` aggregate. The
 |---|---|---|---|
 | `SumCount` | `MonotonicCount` | unitless | `nr_wakeups`, `voluntary_csw`, `minflt`, `wait_count`, `iowait_count`, `timeslices` |
 | `SumNs` | `MonotonicNs` | ns | `run_time_ns`, `wait_time_ns`, `wait_sum`, `voluntary_sleep_ns`, `block_sum`, `iowait_sum`, `core_forceidle_sum` |
-| `SumTicks` | `ClockTicks` | USER\_HZ ticks | `utime_clock_ticks`, `stime_clock_ticks`, `delayacct_blkio_ticks` |
+| `SumTicks` | `ClockTicks` | USER\_HZ ticks | `utime_clock_ticks`, `stime_clock_ticks` |
 | `SumBytes` | `Bytes` | bytes (IEC) | `allocated_bytes`, `deallocated_bytes`, `rchar`, `wchar`, `read_bytes`, `write_bytes`, `cancelled_write_bytes` |
 
 Group reduction: `saturating_add` per the no-wraparound contract.
@@ -349,7 +349,7 @@ aggregation rules are legal in step 3:
 | `PeakNs` | Lifetime high-water mark in ns. Kernel updates via `if (delta > stat->max) stat->max = delta`. Summing peaks is a category error. Examples: `wait_max`, `slice_max`. |
 | `GaugeNs` | Instantaneous gauge sampled at capture time (ns). Cannot sum — N near-identical samples collapse to N×gauge with no meaning. Example: `fair_slice_ns`. |
 | `GaugeCount` | Instantaneous unitless count that goes up AND down. Example: `nr_threads`. |
-| `ClockTicks` | USER_HZ-scaled time. Examples: `utime_clock_ticks`, `delayacct_blkio_ticks`. |
+| `ClockTicks` | USER_HZ-scaled time. Examples: `utime_clock_ticks`, `stime_clock_ticks`. |
 | `Bytes` | Byte counts. IEC binary auto-scale ladder. Examples: `read_bytes`, `wchar`. |
 | `OrdinalI32` / `OrdinalU32` / `OrdinalU64` | Bounded scalar — range-aggregated, not summable. Examples: `nice` (i32), `rt_priority` (u32). |
 | `CategoricalString` | Categorical value — mode-aggregated. Examples: `policy`. |

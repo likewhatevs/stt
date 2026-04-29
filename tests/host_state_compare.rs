@@ -594,10 +594,6 @@ fn host_state_metrics_accessors_read_every_variant() {
         // — non-Sum because it's a bounded ordinal, not a
         // counter).
         ("rt_priority", |t| t.rt_priority = OrdinalU32(50)),
-        // delayacct_blkio_ticks: cumulative counter (Sum).
-        ("delayacct_blkio_ticks", |t| {
-            t.delayacct_blkio_ticks = ClockTicks(137)
-        }),
         // /proc/<tid>/sched additions (parse_sched).
         // core_forceidle_sum: counter (Sum, ns).
         ("core_forceidle_sum", |t| {
@@ -750,7 +746,6 @@ fn host_state_metrics_accessors_read_every_variant() {
         ("read_bytes", 135),
         ("write_bytes", 136),
         ("cancelled_write_bytes", 141),
-        ("delayacct_blkio_ticks", 137),
         ("core_forceidle_sum", 139),
         // Max
         ("wait_max", 200),

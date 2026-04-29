@@ -18,26 +18,20 @@
 //!   sufficient — `/proc/<tid>/io` exists unconditionally
 //!   inside the guest as soon as the kernel is built with the
 //!   flag, no boot param or sysctl needed.
-//! - `CONFIG_TASK_DELAY_ACCT`: requires BOTH the build flag
-//!   AND a runtime toggle. The increment paths
-//!   (`delayacct_blkio_start` / `_end`) are gated behind
-//!   `static_branch_unlikely(&delayacct_key)` and stay
-//!   no-ops until the toggle fires. The toggle is set on the
-//!   guest cmdline via `sysctl.kernel.task_delayacct=1` (see
-//!   `vmm/mod.rs`), which kicks in before user space starts so
-//!   the ktstr workload's blkio waits are accounted from the
-//!   first scheduling tick.
 //! - `CONFIG_PSI`: build flag alone is sufficient under the
 //!   default `PSI_DEFAULT_DISABLED=n`. `/proc/pressure/cpu` is
 //!   created at psi_proc_init and starts accumulating from
 //!   boot — no runtime toggle needed.
-//! - `CONFIG_TASKSTATS` + `CONFIG_TASK_XACCT`: assert
-//!   `hiwater_rss_bytes > 0` for at least one user-space
-//!   thread. Pins the genetlink taskstats path end-to-end —
-//!   netlink socket open, family-id resolve, per-tid query,
-//!   reply parser. The XACCT family does not gate on the
-//!   `delayacct=on` runtime toggle; `xacct_add_tsk` is
-//!   unconditional once `CONFIG_TASK_XACCT` is built. The
+//! - `CONFIG_TASKSTATS` + `CONFIG_TASK_DELAY_ACCT` +
+//!   `CONFIG_TASK_XACCT`: assert `hiwater_rss_bytes > 0` for
+//!   at least one user-space thread. Pins the genetlink
+//!   taskstats path end-to-end — netlink socket open,
+//!   family-id resolve, per-tid query, reply parser. The
+//!   XACCT family does not gate on the `delayacct=on` runtime
+//!   toggle (set on the guest cmdline via the bare `delayacct`
+//!   boot param + `sysctl.kernel.task_delayacct=1` in
+//!   `vmm/mod.rs`); `xacct_add_tsk` is unconditional once
+//!   `CONFIG_TASK_XACCT` is built. The
 //!   `CONFIG_TASK_DELAY_ACCT` delay-family fields
 //!   (cpu_delay / blkio_delay / etc) travel through the same
 //!   netlink path but their accumulation depends on the
@@ -49,11 +43,12 @@
 //!   `parse_taskstats_payload_handles_truncation` already
 //!   pins delay-family parser correctness; this VM test
 //!   provides the live-network-path counterpart for the
-//!   XACCT half. Distinct from the existing
-//!   `delayacct_blkio_ticks` test that travels through
-//!   `/proc/<tid>/stat` field 42 — that's the procfs
-//!   delivery channel; this test is the genetlink delivery
-//!   channel.
+//!   XACCT half. The CONFIG_TASK_DELAY_ACCT runtime-toggle
+//!   coverage previously delivered through a procfs-side
+//!   `delayacct_blkio_ticks` test was folded into this one
+//!   when the procfs USER_HZ-truncated field was retired in
+//!   favor of `blkio_delay_total_ns` (taskstats, ns
+//!   precision).
 //!
 //! Distinct from `tests/host_state_capture.rs`, which proves
 //! the capture pipeline reaches procfs end-to-end via a
@@ -168,93 +163,17 @@ fn host_state_capture_records_wchar_under_iosync(ctx: &Ctx) -> Result<AssertResu
     Ok(result)
 }
 
-// ---------------------------------------------------------------------------
-// CONFIG_TASK_DELAY_ACCT — assert delayacct_blkio_ticks field reachable
-// ---------------------------------------------------------------------------
-
-/// Run a basic CPU workload inside the guest, then call
-/// `capture()` and assert the snapshot's
-/// `delayacct_blkio_ticks` field is reachable — i.e. the
-/// `/proc/<tid>/stat` parser pulled field 42 successfully.
-/// On a kernel built with `CONFIG_TASK_DELAY_ACCT=y` AND
-/// boot-time `sysctl.kernel.task_delayacct=1` (set on the
-/// guest cmdline at `vmm/mod.rs`), the field exists in
-/// `/proc/<tid>/stat` and the parser populates it.
-///
-/// The runtime toggle is what this test guards against most
-/// directly: without `sysctl.kernel.task_delayacct=1` on the
-/// cmdline, the `static_branch_unlikely(&delayacct_key)` gate
-/// keeps the increment paths as no-ops, but the field IS still
-/// printed in `/proc/<tid>/stat` (always at field 42 — the
-/// unconditional `seq_put_decimal_ull(m, " ",
-/// delayacct_blkio_ticks(task))` call at
-/// `fs/proc/array.c:639` returns 0 via the
-/// `static inline delayacct_blkio_ticks` definition when the
-/// kconfig is off, but is real when on with toggle off — see
-/// kernel/delayacct.c:48). What we ARE pinning here is the
-/// REACHABILITY of the field through the capture's parser:
-/// any thread observed in the snapshot must have a
-/// `delayacct_blkio_ticks` value (zero or non-zero), not a
-/// parse failure that drops the field. The cross-environment
-/// signal is "snapshot has threads AND every thread carries
-/// the field" — a regression that breaks the field-42 parser
-/// surfaces as `delayacct_blkio_ticks` collapsing to default
-/// across the entire snapshot.
-///
-/// We don't pin "non-zero" because a CPU-bound workload may
-/// rack up zero blkio waits — that would make this test
-/// dependent on disk-backed I/O, defeating the point of a
-/// smoke test for the kconfig wiring.
-#[ktstr_test(llcs = 1, cores = 2, threads = 1, duration_s = 3)]
-fn host_state_capture_reaches_delayacct_blkio_ticks_field(ctx: &Ctx) -> Result<AssertResult> {
-    let steps = vec![Step {
-        setup: vec![
-            CgroupDef::named("cg_0")
-                .workers(ctx.workers_per_cgroup)
-                .work_type(WorkType::CpuSpin),
-        ]
-        .into(),
-        ops: vec![],
-        hold: HoldSpec::FULL,
-    }];
-    let workload_result = execute_steps(ctx, steps)?;
-
-    let snap = ktstr::host_state::capture();
-
-    if snap.threads.is_empty() {
-        return Ok(AssertResult::fail(AssertDetail::new(
-            DetailKind::Other,
-            "host_state::capture() returned zero threads — procfs walk \
-             produced no entries, indicating the capture layer is not \
-             reading /proc successfully inside the guest",
-        )));
-    }
-
-    // Surface the observed range so a CI run that flips the
-    // sysctl toggle off (or builds with the kconfig off)
-    // produces a visible diff in the test details. The
-    // empty-threads early-return above is the only runtime
-    // gate this smoke test needs; a parser regression on
-    // `delayacct_blkio_ticks` surfaces as a compile error
-    // (typed wrapper) rather than a runtime check here.
-    let max_blkio = snap
-        .threads
-        .iter()
-        .map(|t| t.delayacct_blkio_ticks.0)
-        .max()
-        .unwrap_or(0);
-    let mut result = workload_result;
-    result.details.push(AssertDetail::new(
-        DetailKind::Other,
-        format!(
-            "host_state_capture_reaches_delayacct_blkio_ticks: \
-             threads={}, max_blkio_ticks={max_blkio}",
-            snap.threads.len(),
-        ),
-    ));
-    Ok(result)
-}
-
+// CONFIG_TASK_DELAY_ACCT coverage moved to the
+// CONFIG_TASKSTATS+TASK_DELAY_ACCT+TASK_XACCT triple-gate test
+// at the bottom of this file
+// (host_state_capture_records_taskstats_cpu_delay_and_hiwater_under_oversubscription).
+// The previous procfs-side test pinned `delayacct_blkio_ticks`
+// (USER_HZ ticks via /proc/<tid>/stat field 42); that field was
+// removed because `blkio_delay_total_ns` from the taskstats
+// genetlink path delivers the same kernel data with ns
+// precision and one row in the rendered registry. The taskstats
+// test below covers the same DELAY_ACCT runtime toggle via the
+// netlink delivery channel.
 // ---------------------------------------------------------------------------
 // CONFIG_PSI — assert host PSI cpu.some.total_usec > 0 after CPU pressure
 // ---------------------------------------------------------------------------
@@ -276,10 +195,10 @@ fn host_state_capture_reaches_delayacct_blkio_ticks_field(ctx: &Ctx) -> Result<A
 /// runnable task actually waits in the runqueue — which inside
 /// a 2-core / N-worker VM scheduled by the host hypervisor is
 /// not always observable in a 3 s window. Mirrors the
-/// reachability-only stance of
-/// `host_state_capture_reaches_delayacct_blkio_ticks_field`:
-/// pin "the parser is wired and the kconfig is on" without
-/// requiring the workload to drive the counter past zero.
+/// reachability-only stance of the IO_ACCOUNTING and taskstats
+/// tests: pin "the parser is wired and the kconfig is on"
+/// without requiring the workload to drive the counter past
+/// zero.
 ///
 /// Topology: 1 LLC / 2 cores / 1 thread, with
 /// `workers_per_cgroup` workers running CpuSpin — the

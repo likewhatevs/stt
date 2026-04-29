@@ -216,8 +216,7 @@ pub enum AggRule {
     SumNs(fn(&ThreadState) -> crate::metric_types::MonotonicNs),
     /// Sum across the group of a [`ClockTicks`] field. Used for
     /// USER_HZ-scaled cumulative time counters
-    /// (`utime_clock_ticks`, `stime_clock_ticks`,
-    /// `delayacct_blkio_ticks`).
+    /// (`utime_clock_ticks`, `stime_clock_ticks`).
     ///
     /// [`ClockTicks`]: crate::metric_types::ClockTicks
     SumTicks(fn(&ThreadState) -> crate::metric_types::ClockTicks),
@@ -450,8 +449,9 @@ pub struct HostStateMetricDef {
     ///   class. When off, no task can land on ext, so
     ///   `ext_enabled` reads false uniformly.
     /// - `"CONFIG_TASK_DELAY_ACCT"` — gates the delayacct
-    ///   accounting path that populates
-    ///   `delayacct_blkio_ticks`.
+    ///   accounting path that populates the taskstats genetlink
+    ///   delay-family fields (`cpu_delay_*`, `blkio_delay_*`,
+    ///   etc.).
     /// - `"CONFIG_TASK_IO_ACCOUNTING"` — gates the per-task
     ///   I/O accounting fields exposed by `/proc/<tid>/io`
     ///   (`rchar`, `wchar`, `syscr`, `syscw`, `read_bytes`,
@@ -878,26 +878,15 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         is_dead: false,
         description: "Number of distinct iowait intervals the task accumulated.",
     },
-    // Cumulative blkio delay in USER_HZ ticks from
-    // `/proc/<tid>/stat` field 42. Plain counter, matches
-    // `utime_clock_ticks` / `stime_clock_ticks` in unit and
-    // aggregation but lives next to `iowait_sum` /
-    // `iowait_count` because the `delayacct` path is the same
-    // wait-for-block-IO accounting, just expressed in ticks
-    // rather than ns. Two-stage gating (CONFIG_TASK_DELAY_ACCT
-    // build-time + `delayacct_on` runtime via `delayacct=` boot
-    // param or `kernel.task_delayacct` sysctl) — see
-    // [`ThreadState::delayacct_blkio_ticks`] for the call-graph
-    // detail. Sum with the "ticks" unit drives the
-    // ticks → Kticks → Mticks ladder under auto_scale.
-    HostStateMetricDef {
-        name: "delayacct_blkio_ticks",
-        rule: AggRule::SumTicks(|t| t.delayacct_blkio_ticks),
-        sched_class: None,
-        config_gates: &["CONFIG_TASK_DELAY_ACCT"],
-        is_dead: false,
-        description: "Cumulative blkio delay in USER_HZ ticks; needs delayacct=on at boot.",
-    },
+    // delayacct_blkio_ticks (the procfs USER_HZ-ticks delivery
+    // of the same delay-accounting block-I/O bucket) was removed
+    // because `blkio_delay_total_ns` from the taskstats genetlink
+    // path supersedes it: same kernel data via the same
+    // CONFIG_TASK_DELAY_ACCT gate, but ns precision instead of
+    // USER_HZ truncation, no procfs round-trip, and one row in
+    // the rendered registry instead of two. ktstr always runs as
+    // root (CAP_NET_ADMIN is implicit), so the procfs fallback
+    // bought no extra coverage.
     // `exec_max` is set inside `update_se`
     // (`kernel/sched/fair.c:1335`), guarded by
     // `if (schedstat_enabled())`. Reachable from sched_ext via
@@ -1168,7 +1157,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         sched_class: None,
         config_gates: &["CONFIG_TASKSTATS", "CONFIG_TASK_DELAY_ACCT"],
         is_dead: false,
-        description: "Cumulative ns waiting on synchronous block I/O (taskstats blkio_delay_total). Distinct from `iowait_sum` (schedstat) and `delayacct_blkio_ticks` (USER_HZ-scaled twin via /proc/<tid>/stat).",
+        description: "Cumulative ns waiting on synchronous block I/O (taskstats blkio_delay_total). Distinct from `iowait_sum` (schedstat).",
     },
     HostStateMetricDef {
         name: "blkio_delay_max_ns",
@@ -1659,6 +1648,120 @@ pub static HOST_STATE_DERIVED_METRICS: &[DerivedMetricDef] = &[
         inputs: &["iowait_sum", "iowait_count"],
         is_ratio: false,
         compute: |m| ratio_compute(m, "iowait_sum", "iowait_count"),
+    },
+    // -- taskstats per-category averages (delay_total / count) --
+    //
+    // One average per delay-accounting category. Same shape as
+    // avg_wait_ns / avg_iowait_ns above (sum-over-count quotient,
+    // ns ladder, non-ratio). The category-specific caveats from
+    // the registry (cpu RACY, swapin/thrashing OVERLAP, sentinel
+    // semantics) carry forward into the description so an operator
+    // reading `metric-list` for the derived row sees the same
+    // gating discipline they get for the raw count/total fields.
+    DerivedMetricDef {
+        name: "avg_cpu_delay_ns",
+        ladder: ScaleLadder::Ns,
+        description: "Average CPU-wait per scheduling event: cpu_delay_total_ns / cpu_delay_count (ns/event). RACY: the kernel updates count + total via the lockless sched_info path, so a concurrent reader may observe one ahead of the other; the quotient is approximate at the sub-event scale and stable at the integrated scale.",
+        inputs: &["cpu_delay_total_ns", "cpu_delay_count"],
+        is_ratio: false,
+        compute: |m| ratio_compute(m, "cpu_delay_total_ns", "cpu_delay_count"),
+    },
+    DerivedMetricDef {
+        name: "avg_blkio_delay_ns",
+        ladder: ScaleLadder::Ns,
+        description: "Average synchronous block-I/O wait per event: blkio_delay_total_ns / blkio_delay_count (ns/event). Distinct from avg_iowait_ns (schedstat) — this travels through the delayacct path and is the canonical delay-accounting block-I/O reading.",
+        inputs: &["blkio_delay_total_ns", "blkio_delay_count"],
+        is_ratio: false,
+        compute: |m| ratio_compute(m, "blkio_delay_total_ns", "blkio_delay_count"),
+    },
+    DerivedMetricDef {
+        name: "avg_swapin_delay_ns",
+        ladder: ScaleLadder::Ns,
+        description: "Average swap-in wait per event: swapin_delay_total_ns / swapin_delay_count (ns/event). OVERLAPS with thrashing — every thrashing event is also a swapin event from the syscall layer; do not sum the two averages or the underlying totals directly.",
+        inputs: &["swapin_delay_total_ns", "swapin_delay_count"],
+        is_ratio: false,
+        compute: |m| ratio_compute(m, "swapin_delay_total_ns", "swapin_delay_count"),
+    },
+    DerivedMetricDef {
+        name: "avg_freepages_delay_ns",
+        ladder: ScaleLadder::Ns,
+        description: "Average direct-reclaim wait per event: freepages_delay_total_ns / freepages_delay_count (ns/event).",
+        inputs: &["freepages_delay_total_ns", "freepages_delay_count"],
+        is_ratio: false,
+        compute: |m| ratio_compute(m, "freepages_delay_total_ns", "freepages_delay_count"),
+    },
+    DerivedMetricDef {
+        name: "avg_thrashing_delay_ns",
+        ladder: ScaleLadder::Ns,
+        description: "Average thrashing wait per event: thrashing_delay_total_ns / thrashing_delay_count (ns/event). OVERLAPS with swapin (see avg_swapin_delay_ns).",
+        inputs: &["thrashing_delay_total_ns", "thrashing_delay_count"],
+        is_ratio: false,
+        compute: |m| ratio_compute(m, "thrashing_delay_total_ns", "thrashing_delay_count"),
+    },
+    DerivedMetricDef {
+        name: "avg_compact_delay_ns",
+        ladder: ScaleLadder::Ns,
+        description: "Average memory-compaction wait per event: compact_delay_total_ns / compact_delay_count (ns/event).",
+        inputs: &["compact_delay_total_ns", "compact_delay_count"],
+        is_ratio: false,
+        compute: |m| ratio_compute(m, "compact_delay_total_ns", "compact_delay_count"),
+    },
+    DerivedMetricDef {
+        name: "avg_wpcopy_delay_ns",
+        ladder: ScaleLadder::Ns,
+        description: "Average write-protect-copy fault wait per event: wpcopy_delay_total_ns / wpcopy_delay_count (ns/event).",
+        inputs: &["wpcopy_delay_total_ns", "wpcopy_delay_count"],
+        is_ratio: false,
+        compute: |m| ratio_compute(m, "wpcopy_delay_total_ns", "wpcopy_delay_count"),
+    },
+    DerivedMetricDef {
+        name: "avg_irq_delay_ns",
+        ladder: ScaleLadder::Ns,
+        description: "Average IRQ-handler window per event: irq_delay_total_ns / irq_delay_count (ns/event).",
+        inputs: &["irq_delay_total_ns", "irq_delay_count"],
+        is_ratio: false,
+        compute: |m| ratio_compute(m, "irq_delay_total_ns", "irq_delay_count"),
+    },
+    // -- taskstats off-CPU rollup --
+    //
+    // Sum of every meaningful off-CPU delay category. Combines
+    // cpu (runqueue wait), blkio (sync I/O wait), freepages
+    // (direct reclaim), compact (compaction), wpcopy (CoW fault),
+    // irq (IRQ-handler windows), and the LARGER of (swapin,
+    // thrashing) — the two share the same syscall-layer event,
+    // so summing both would double-count a thrashing-induced
+    // swapin. `?` propagates None when any input is missing
+    // (gating off, kernel pre-v14, etc.); `.max()` over the
+    // overlap pair picks the dominant signal.
+    DerivedMetricDef {
+        name: "total_offcpu_delay_ns",
+        ladder: ScaleLadder::Ns,
+        description: "Sum of all off-CPU delay-accounting buckets, ns: cpu + blkio + freepages + compact + wpcopy + irq + max(swapin, thrashing). The swapin/thrashing pair is OR'd with .max() rather than summed because the two share syscall-layer events (every thrashing event is also a swapin). Returns `-` when any input is missing (CONFIG_TASK_DELAY_ACCT off, runtime toggle off, or kernel older than the bucket's introduction version).",
+        inputs: &[
+            "cpu_delay_total_ns",
+            "blkio_delay_total_ns",
+            "swapin_delay_total_ns",
+            "freepages_delay_total_ns",
+            "thrashing_delay_total_ns",
+            "compact_delay_total_ns",
+            "wpcopy_delay_total_ns",
+            "irq_delay_total_ns",
+        ],
+        is_ratio: false,
+        compute: |m| {
+            let cpu = input_scalar(m, "cpu_delay_total_ns")?;
+            let blkio = input_scalar(m, "blkio_delay_total_ns")?;
+            let swapin = input_scalar(m, "swapin_delay_total_ns")?;
+            let freepages = input_scalar(m, "freepages_delay_total_ns")?;
+            let thrashing = input_scalar(m, "thrashing_delay_total_ns")?;
+            let compact = input_scalar(m, "compact_delay_total_ns")?;
+            let wpcopy = input_scalar(m, "wpcopy_delay_total_ns")?;
+            let irq = input_scalar(m, "irq_delay_total_ns")?;
+            let mem_overlap = swapin.max(thrashing);
+            Some(DerivedValue::Scalar(
+                cpu + blkio + freepages + compact + wpcopy + irq + mem_overlap,
+            ))
+        },
     },
 ];
 
@@ -3732,10 +3835,10 @@ fn format_cpu_range(cpus: &[u32]) -> String {
 ///   [`AggRule::SumBytes`] and any byte-typed derived metric.
 /// - [`Ticks`](Self::Ticks): ticks → Kticks (×1e3) → Mticks (×1e6).
 ///   Decimal prefixes for clock-tick counts
-///   (`utime_clock_ticks`, `stime_clock_ticks`,
-///   `delayacct_blkio_ticks`); the unit itself is opaque (the
-///   kernel's `USER_HZ` rate is host-dependent), so an SI prefix
-///   is the most we can promise.
+///   (`utime_clock_ticks`, `stime_clock_ticks`); the unit
+///   itself is opaque (the kernel's `USER_HZ` rate is
+///   host-dependent), so an SI prefix is the most we can
+///   promise.
 /// - [`Unitless`](Self::Unitless): "" → K → M → G. Decimal
 ///   prefixes for non-dimensional counters (wakeups, migrations,
 ///   csw, syscall counts). Used for [`AggRule::SumCount`] and
@@ -7314,12 +7417,6 @@ mod tests {
                 &["CONFIG_SCHEDSTATS"],
                 false,
             ),
-            (
-                "delayacct_blkio_ticks",
-                None,
-                &["CONFIG_TASK_DELAY_ACCT"],
-                false,
-            ),
             ("exec_max", None, &["CONFIG_SCHEDSTATS"], false),
             ("slice_max", Some("cfs-only"), &["CONFIG_SCHEDSTATS"], false),
             (
@@ -8761,6 +8858,203 @@ mod tests {
         assert_eq!(row.baseline, Some(DerivedValue::Scalar(3000.0)));
     }
 
+    /// T-S1: every per-category `avg_<bucket>_delay_ns` row
+    /// computes `total / count` correctly. One thread, distinct
+    /// (count, total) pair per bucket so a row that mixed up
+    /// numerator and denominator (or pulled from the wrong
+    /// bucket's count) would surface as an off-by-bucket
+    /// equality failure here.
+    #[test]
+    fn derived_avg_delay_ns_formulas_match_manual_division() {
+        let mut t = make_thread("p", "w");
+        // Distinct (count, total) per bucket so a wrong-bucket
+        // crosswire produces a wrong quotient rather than a
+        // collision that hides the bug.
+        t.cpu_delay_count = MonotonicCount(3);
+        t.cpu_delay_total_ns = MonotonicNs(9_000);
+        t.blkio_delay_count = MonotonicCount(4);
+        t.blkio_delay_total_ns = MonotonicNs(20_000);
+        t.swapin_delay_count = MonotonicCount(5);
+        t.swapin_delay_total_ns = MonotonicNs(35_000);
+        t.freepages_delay_count = MonotonicCount(6);
+        t.freepages_delay_total_ns = MonotonicNs(54_000);
+        t.thrashing_delay_count = MonotonicCount(7);
+        t.thrashing_delay_total_ns = MonotonicNs(77_000);
+        t.compact_delay_count = MonotonicCount(8);
+        t.compact_delay_total_ns = MonotonicNs(104_000);
+        t.wpcopy_delay_count = MonotonicCount(9);
+        t.wpcopy_delay_total_ns = MonotonicNs(135_000);
+        t.irq_delay_count = MonotonicCount(10);
+        t.irq_delay_total_ns = MonotonicNs(170_000);
+        let diff = compare(
+            &snap_with(vec![t.clone()]),
+            &snap_with(vec![t]),
+            &CompareOptions::default(),
+        );
+        // (name, expected_avg)
+        for (name, expected) in [
+            ("avg_cpu_delay_ns", 3_000.0),
+            ("avg_blkio_delay_ns", 5_000.0),
+            ("avg_swapin_delay_ns", 7_000.0),
+            ("avg_freepages_delay_ns", 9_000.0),
+            ("avg_thrashing_delay_ns", 11_000.0),
+            ("avg_compact_delay_ns", 13_000.0),
+            ("avg_wpcopy_delay_ns", 15_000.0),
+            ("avg_irq_delay_ns", 17_000.0),
+        ] {
+            let row = diff
+                .derived_rows
+                .iter()
+                .find(|r| r.metric_name == name)
+                .unwrap_or_else(|| panic!("{name} row present"));
+            assert_eq!(
+                row.baseline,
+                Some(DerivedValue::Scalar(expected)),
+                "{name} formula mismatch — expected {expected}",
+            );
+        }
+    }
+
+    /// T-S2: `total_offcpu_delay_ns` sums every bucket and OR's
+    /// (swapin, thrashing) via `.max()`. Two test cases to pin
+    /// the .max() behavior in both directions:
+    ///
+    /// (a) swapin > thrashing → swapin contributes.
+    /// (b) thrashing > swapin → thrashing contributes.
+    ///
+    /// A regression that summed swapin + thrashing (instead of
+    /// max-ing) would double-count the overlap and the rollup
+    /// would be off by `min(swapin, thrashing)` in both cases.
+    #[test]
+    fn derived_total_offcpu_delay_ns_sums_with_max_overlap() {
+        // Case (a): swapin (200) > thrashing (50). Rollup picks
+        // swapin via .max().
+        let mut t_a = make_thread("p", "w");
+        t_a.cpu_delay_total_ns = MonotonicNs(10);
+        t_a.blkio_delay_total_ns = MonotonicNs(20);
+        t_a.swapin_delay_total_ns = MonotonicNs(200);
+        t_a.freepages_delay_total_ns = MonotonicNs(30);
+        t_a.thrashing_delay_total_ns = MonotonicNs(50);
+        t_a.compact_delay_total_ns = MonotonicNs(40);
+        t_a.wpcopy_delay_total_ns = MonotonicNs(60);
+        t_a.irq_delay_total_ns = MonotonicNs(70);
+        // Expected: 10 + 20 + 30 + 40 + 60 + 70 + max(200,50) = 430
+        let diff_a = compare(
+            &snap_with(vec![t_a.clone()]),
+            &snap_with(vec![t_a]),
+            &CompareOptions::default(),
+        );
+        let row_a = diff_a
+            .derived_rows
+            .iter()
+            .find(|r| r.metric_name == "total_offcpu_delay_ns")
+            .expect("total_offcpu_delay_ns row present (case a)");
+        assert_eq!(
+            row_a.baseline,
+            Some(DerivedValue::Scalar(430.0)),
+            "case (a) swapin>thrashing: expected 430, got {:?}",
+            row_a.baseline,
+        );
+
+        // Case (b): thrashing (300) > swapin (75). Rollup picks
+        // thrashing via .max().
+        let mut t_b = make_thread("p", "w");
+        t_b.cpu_delay_total_ns = MonotonicNs(10);
+        t_b.blkio_delay_total_ns = MonotonicNs(20);
+        t_b.swapin_delay_total_ns = MonotonicNs(75);
+        t_b.freepages_delay_total_ns = MonotonicNs(30);
+        t_b.thrashing_delay_total_ns = MonotonicNs(300);
+        t_b.compact_delay_total_ns = MonotonicNs(40);
+        t_b.wpcopy_delay_total_ns = MonotonicNs(60);
+        t_b.irq_delay_total_ns = MonotonicNs(70);
+        // Expected: 10 + 20 + 30 + 40 + 60 + 70 + max(75,300) = 530
+        let diff_b = compare(
+            &snap_with(vec![t_b.clone()]),
+            &snap_with(vec![t_b]),
+            &CompareOptions::default(),
+        );
+        let row_b = diff_b
+            .derived_rows
+            .iter()
+            .find(|r| r.metric_name == "total_offcpu_delay_ns")
+            .expect("total_offcpu_delay_ns row present (case b)");
+        assert_eq!(
+            row_b.baseline,
+            Some(DerivedValue::Scalar(530.0)),
+            "case (b) thrashing>swapin: expected 530, got {:?}",
+            row_b.baseline,
+        );
+    }
+
+    /// T-S4: each `avg_<bucket>_delay_ns` compute closure
+    /// returns `None` when EITHER input is missing from the
+    /// metrics map. Pulls the closure directly out of
+    /// `HOST_STATE_DERIVED_METRICS` and exercises it with a
+    /// partial `BTreeMap` (only the numerator side present, no
+    /// denominator). The compute path must short-circuit via
+    /// `input_scalar`'s `?` rather than panicking or returning
+    /// `Some(NaN)`.
+    ///
+    /// `total_offcpu_delay_ns` follows the same pattern: every
+    /// input must be present; missing any one returns `None`.
+    /// The all-inputs-present-but-zero case is covered by the
+    /// extension to `derived_division_by_zero_returns_none`
+    /// below.
+    #[test]
+    fn derived_avg_delay_ns_returns_none_on_missing_input() {
+        let lookup = |name: &str| -> &DerivedMetricDef {
+            HOST_STATE_DERIVED_METRICS
+                .iter()
+                .find(|d| d.name == name)
+                .unwrap_or_else(|| panic!("{name} present in registry"))
+        };
+
+        // For each avg_*: insert ONLY the numerator, not the
+        // denominator. The compute closure should return None.
+        for (name, numerator) in [
+            ("avg_cpu_delay_ns", "cpu_delay_total_ns"),
+            ("avg_blkio_delay_ns", "blkio_delay_total_ns"),
+            ("avg_swapin_delay_ns", "swapin_delay_total_ns"),
+            ("avg_freepages_delay_ns", "freepages_delay_total_ns"),
+            ("avg_thrashing_delay_ns", "thrashing_delay_total_ns"),
+            ("avg_compact_delay_ns", "compact_delay_total_ns"),
+            ("avg_wpcopy_delay_ns", "wpcopy_delay_total_ns"),
+            ("avg_irq_delay_ns", "irq_delay_total_ns"),
+        ] {
+            let mut metrics: BTreeMap<String, Aggregated> = BTreeMap::new();
+            metrics.insert(numerator.to_string(), Aggregated::Sum(123));
+            let def = lookup(name);
+            assert!(
+                (def.compute)(&metrics).is_none(),
+                "{name}: compute must return None when denominator is \
+                 missing from metrics map (only {numerator} present)",
+            );
+        }
+
+        // total_offcpu_delay_ns: insert all but ONE input
+        // (`compact_delay_total_ns`). Verify None.
+        let mut partial: BTreeMap<String, Aggregated> = BTreeMap::new();
+        for name in [
+            "cpu_delay_total_ns",
+            "blkio_delay_total_ns",
+            "swapin_delay_total_ns",
+            "freepages_delay_total_ns",
+            "thrashing_delay_total_ns",
+            // compact_delay_total_ns INTENTIONALLY OMITTED
+            "wpcopy_delay_total_ns",
+            "irq_delay_total_ns",
+        ] {
+            partial.insert(name.to_string(), Aggregated::Sum(100));
+        }
+        let total_def = lookup("total_offcpu_delay_ns");
+        assert!(
+            (total_def.compute)(&partial).is_none(),
+            "total_offcpu_delay_ns: compute must return None when ANY \
+             input is missing — exercised here with compact_delay_total_ns \
+             omitted from the metrics map",
+        );
+    }
+
     /// Division by zero in any ratio derivation produces `None`,
     /// not NaN or zero. Operator-actionable as `-` in the
     /// rendered cell.
@@ -8787,6 +9081,13 @@ mod tests {
         // iowait_count == 0 → avg_iowait_ns is None
         t.iowait_sum = MonotonicNs(0);
         t.iowait_count = MonotonicCount(0);
+        // Every taskstats avg_*_delay_ns: count == 0 → None
+        // (all default to MonotonicCount(0) / MonotonicNs(0)
+        // from `..ThreadState::default()` so no explicit
+        // assignment is needed; pinning the assertion below is
+        // the load-bearing check). The 8 buckets follow the
+        // ratio_compute pattern of avg_wait_ns / avg_iowait_ns,
+        // so the same division-by-zero contract applies.
         let diff = compare(
             &snap_with(vec![t.clone()]),
             &snap_with(vec![t]),
@@ -8800,6 +9101,14 @@ mod tests {
             "involuntary_csw_ratio",
             "disk_io_fraction",
             "avg_iowait_ns",
+            "avg_cpu_delay_ns",
+            "avg_blkio_delay_ns",
+            "avg_swapin_delay_ns",
+            "avg_freepages_delay_ns",
+            "avg_thrashing_delay_ns",
+            "avg_compact_delay_ns",
+            "avg_wpcopy_delay_ns",
+            "avg_irq_delay_ns",
         ] {
             let row = diff
                 .derived_rows
@@ -8816,6 +9125,28 @@ mod tests {
                 "{name} delta must be None when inputs are zero"
             );
         }
+
+        // total_offcpu_delay_ns is a SUM, not a quotient. With
+        // every input present and all-zero, the formula evaluates
+        // cleanly to 0.0 — `Some(Scalar(0.0))`, not `None`.
+        // Genuine zero is meaningful here (the task accumulated
+        // zero off-CPU delay across every bucket, which is a
+        // real signal — e.g. an idle-since-fork bookkeeping
+        // thread); collapsing it to None would conflate "no
+        // delay observed" with "missing input". The
+        // missing-input case is covered separately by
+        // `derived_avg_delay_ns_returns_none_on_missing_input`.
+        let total_row = diff
+            .derived_rows
+            .iter()
+            .find(|r| r.metric_name == "total_offcpu_delay_ns")
+            .expect("total_offcpu_delay_ns row present");
+        assert_eq!(
+            total_row.baseline,
+            Some(DerivedValue::Scalar(0.0)),
+            "total_offcpu_delay_ns with all-zero inputs must be \
+             Some(0.0), not None — genuine zero is meaningful for a sum",
+        );
     }
 
     /// Ratio rows render with absolute delta in the delta column

@@ -6,18 +6,54 @@
 //! comparison reads two and joins them on the selected grouping
 //! axis (pcomm, cgroup, or comm).
 //!
-//! Every field is cumulative-from-birth so probe timing does not
-//! alter the output: the design principle is that a thread sampled
-//! twice at different wall-clock instants produces the same numbers
-//! so long as its cumulative counters have not rolled over. The
-//! jemalloc per-thread TSD counters
+//! Field families and probe-timing invariance:
+//!
+//! - **Cumulative counters and totals** (the majority): wakeups,
+//!   migrations, csw, run/wait/sleep/block/iowait time, schedstat
+//!   counts, page-fault counters, syscall counters, byte counters,
+//!   the taskstats per-bucket `*_count` and `*_delay_total_ns`,
+//!   the jemalloc per-thread allocated/deallocated TSD counters,
+//!   etc. Sampled twice at different instants the value increases
+//!   monotonically; probe-attach latency does not alter the
+//!   reading.
+//! - **Lifetime high-water peaks**: schedstat `*_max` family
+//!   (`wait_max`, `sleep_max`, `block_max`, `exec_max`,
+//!   `slice_max`), every taskstats `*_delay_max_ns` /
+//!   `*_delay_min_ns`, and the memory watermarks
+//!   (`hiwater_rss_bytes`, `hiwater_vm_bytes`). These are
+//!   non-decreasing-over-time but per-event extrema rather than
+//!   sums, so they are non-summable across threads (the registry
+//!   reduces them via `MaxPeak` / `MaxPeakBytes`). Same
+//!   probe-timing invariance as the cumulative counters.
+//! - **Instantaneous gauges** (sensitive to probe timing):
+//!   [`ThreadState::nr_threads`] (signal_struct->nr_threads
+//!   snapshot), [`ThreadState::fair_slice_ns`] (instantaneous
+//!   `p->se.slice`), and [`ThreadState::state`]
+//!   (task_state_array letter). Sampled at capture time and can
+//!   genuinely differ between two probes of the same thread.
+//!   The registry pairs them with `MaxGaugeCount` /
+//!   `MaxGaugeNs` / `ModeChar` reductions rather than the
+//!   `Sum*` rules used for cumulative counters.
+//! - **Categorical / ordinal scalars** (point-in-time
+//!   snapshots): `policy`, `nice`, `priority`, `processor`,
+//!   `rt_priority`, plus the identity strings (`pcomm`, `comm`,
+//!   `cgroup`) and the [`crate::metric_types::CpuSet`]
+//!   `cpu_affinity`. These are sampled at capture time and can
+//!   change at runtime (e.g. `sched_setaffinity` mid-run flips
+//!   `processor` and `cpu_affinity`), so they share the
+//!   gauge family's probe-timing sensitivity. The registry
+//!   reduces them via `Mode*` / `Range*` / `Affinity` rather
+//!   than `Sum*`.
+//!
+//! The jemalloc per-thread TSD counters
 //! (`tsd_s.thread_allocated` / `thread_deallocated`) jemalloc
 //! maintains unconditionally on its alloc/dalloc fast and slow
-//! paths, so the ptrace-based attach this layer performs does not
-//! perturb them; counters previously accumulated remain valid
-//! across the brief stop the attach induces. Metrics not derivable
-//! from cumulative state (e.g. perf_event_open counters that reset
-//! on attachment) are intentionally absent from this capture layer.
+//! paths, so the ptrace-based attach this layer performs does
+//! not perturb them; counters previously accumulated remain
+//! valid across the brief stop the attach induces. Metrics not
+//! derivable from cumulative state (e.g. perf_event_open
+//! counters that reset on attachment) are intentionally absent
+//! from this capture layer.
 //!
 //! # Capture model
 //!
@@ -495,14 +531,57 @@ fn default_state_char() -> char {
     '~'
 }
 
-/// Per-thread cumulative resource profile.
+/// Per-thread resource profile.
 ///
 /// Populated by the capture layer from `/proc/<tid>/{sched,status,
-/// io,stat,comm,cgroup}`, `sched_getaffinity`, and (for jemalloc-
-/// linked processes only, via ptrace + `process_vm_readv`) the
-/// per-thread `tsd_s.thread_allocated` / `thread_deallocated` TLS
-/// counters. All numeric fields are cumulative since thread birth
-/// so the value is insensitive to probe-attach latency.
+/// io,stat,comm,cgroup}`, `sched_getaffinity`, the taskstats
+/// genetlink path (delay-accounting + memory-watermark fields),
+/// and (for jemalloc-linked processes only, via ptrace +
+/// `process_vm_readv`) the per-thread `tsd_s.thread_allocated` /
+/// `thread_deallocated` TLS counters.
+///
+/// Field families (mirrors the module-level breakdown, with
+/// the registry-pairing reductions named):
+///
+/// - **Cumulative counters and totals** (the majority): wakeups,
+///   migrations, csw, run/wait/sleep/block/iowait time,
+///   schedstat counts, page-fault counters, syscall counters,
+///   byte counters, the taskstats per-bucket `*_count` and
+///   `*_delay_total_ns`, and the jemalloc per-thread
+///   allocated/deallocated TSD counters. Probe-timing invariant
+///   modulo monotonic forward progress; reduced via the
+///   `Sum*` rules.
+/// - **Lifetime high-water peaks**: schedstat `*_max` family,
+///   every taskstats `*_delay_max_ns` / `*_delay_min_ns`, and
+///   the memory watermarks ([`Self::hiwater_rss_bytes`],
+///   [`Self::hiwater_vm_bytes`]). Non-decreasing-over-time but
+///   per-event extrema, so non-summable across threads; the
+///   registry reduces them via `MaxPeak` / `MaxPeakBytes`.
+/// - **Instantaneous gauges** (sensitive to probe timing):
+///   [`Self::nr_threads`] (signal_struct->nr_threads snapshot),
+///   [`Self::fair_slice_ns`] (instantaneous `p->se.slice`),
+///   and [`Self::state`] (task_state_array letter). Two probes
+///   of the same thread at different instants can legitimately
+///   produce different values. Reduced via `MaxGaugeCount` /
+///   `MaxGaugeNs` / `ModeChar`.
+/// - **Categorical / ordinal scalars** (point-in-time
+///   snapshots): [`Self::policy`], [`Self::nice`],
+///   [`Self::priority`], [`Self::processor`],
+///   [`Self::rt_priority`], plus the identity strings
+///   ([`Self::pcomm`], [`Self::comm`], [`Self::cgroup`]) and
+///   the [`crate::metric_types::CpuSet`]
+///   [`Self::cpu_affinity`]. Sampled at capture time and can
+///   change at runtime (e.g. `sched_setaffinity` mid-run flips
+///   `processor` and `cpu_affinity`); reduced via `Mode*` /
+///   `Range*` / `Affinity`.
+///
+/// Same family taxonomy as the module-level block at the top of
+/// the file; the per-field docs flag the family on each entry
+/// and the registry's [`AggRule`] pairing makes the
+/// "category-mismatched aggregation is a compile error"
+/// invariant load-bearing.
+///
+/// [`AggRule`]: crate::host_state_compare::AggRule
 ///
 /// `Default` is implemented manually rather than derived because
 /// the [`Self::state`] field needs `'~'` (the absent-value
@@ -660,7 +739,7 @@ pub struct ThreadState {
     #[serde(default = "default_state_char")]
     pub state: char,
 
-    // -- scheduling (cumulative; /proc/<tid>/sched, needs CONFIG_SCHED_DEBUG) --
+    // -- scheduling (cumulative + lifetime peaks; /proc/<tid>/sched, needs CONFIG_SCHED_DEBUG) --
     // -- (sched_ext gate: ext.enabled requires CONFIG_SCHED_CLASS_EXT) --
     /// `true` when the task is currently scheduled by sched_ext —
     /// `/proc/<tid>/sched` `ext.enabled` line. The kernel emits
@@ -1003,31 +1082,6 @@ pub struct ThreadState {
     /// (`include/linux/sched.h`) exactly. Practical range is
     /// bounded `0..99` regardless of the type width.
     pub rt_priority: crate::metric_types::OrdinalU32,
-    /// Cumulative blkio delay accrued by this thread, in
-    /// USER_HZ clock ticks. `/proc/<tid>/stat` field 42, emitted
-    /// via `seq_put_decimal_ull(m, " ", delayacct_blkio_ticks(task))`
-    /// at `fs/proc/array.c:639`. Counts wall-clock time the task
-    /// was blocked waiting on disk I/O — distinct from
-    /// [`Self::iowait_sum`] (which the kernel maintains under
-    /// schedstat) because this counter is the delayacct subsystem's
-    /// blkio bucket.
-    ///
-    /// Two-stage gating: (1) build-time
-    /// `CONFIG_TASK_DELAY_ACCT` — when not built, the
-    /// `static inline delayacct_blkio_ticks()` at
-    /// `include/linux/delayacct.h` returns 0 unconditionally;
-    /// (2) runtime toggle `delayacct_on` in `kernel/delayacct.c`
-    /// driven by either the `delayacct` boot param
-    /// (`__setup("delayacct", ...)` at `kernel/delayacct.c:48`)
-    /// or the `kernel.task_delayacct` sysctl (declared at
-    /// `kernel/delayacct.c:80`). When the runtime toggle is
-    /// off, the increment paths
-    /// (`delayacct_blkio_start`/`_end`) are gated behind
-    /// `static_branch_unlikely(&delayacct_key)` and become
-    /// no-ops, so the counter stays at zero even on a kernel
-    /// built with `CONFIG_TASK_DELAY_ACCT=y`. Same USER_HZ
-    /// scaling as [`Self::utime_clock_ticks`].
-    pub delayacct_blkio_ticks: crate::metric_types::ClockTicks,
 
     // -- /proc/<tid>/sched additions (counters + ordinal + slice gauge) --
     /// Cumulative time this task forced its SMT sibling idle for
@@ -1505,7 +1559,6 @@ impl Default for ThreadState {
             stime_clock_ticks: Default::default(),
             priority: Default::default(),
             rt_priority: Default::default(),
-            delayacct_blkio_ticks: Default::default(),
             core_forceidle_sum: Default::default(),
             fair_slice_ns: Default::default(),
             nr_threads: Default::default(),
@@ -2336,12 +2389,6 @@ struct StatFields {
     /// non-zero only when the task runs SCHED_FIFO / SCHED_RR.
     rt_priority: Option<u32>,
     policy: Option<i32>,
-    /// Field 42: cumulative blkio delay in USER_HZ clock ticks.
-    /// `seq_put_decimal_ull(m, " ", delayacct_blkio_ticks(task))`
-    /// at `fs/proc/array.c:639`. Counts time the task was blocked
-    /// on disk I/O — non-zero only when CONFIG_TASK_DELAY_ACCT
-    /// is enabled and the task accrued blkio time.
-    delayacct_blkio_ticks: Option<u64>,
 }
 
 /// Pure parser for `/proc/<tgid>/task/<tid>/stat`. Per `proc(5)`,
@@ -2362,7 +2409,12 @@ struct StatFields {
 /// | 39    | processor             | 36         |
 /// | 40    | rt_priority           | 37         |
 /// | 41    | policy                | 38         |
-/// | 42    | delayacct_blkio_ticks | 39         |
+///
+/// Field 42 (`delayacct_blkio_ticks`) is intentionally NOT
+/// parsed — `blkio_delay_total_ns` from the taskstats genetlink
+/// path supersedes it (ns precision vs USER_HZ ticks; both gated
+/// by `CONFIG_TASK_DELAY_ACCT`, but the netlink path delivers
+/// the same data without the procfs USER_HZ truncation).
 ///
 /// Missing fields return `None` individually so a short line
 /// (tid exited mid-read, stat truncated) degrades gracefully.
@@ -2391,7 +2443,6 @@ fn parse_stat(raw: &str) -> StatFields {
         processor: get_i32(36),
         rt_priority: get_u32(37),
         policy: get_i32(38),
-        delayacct_blkio_ticks: get_u64(39),
     }
 }
 
@@ -3395,7 +3446,6 @@ fn capture_thread_at_with_tally(
         stime_clock_ticks: ClockTicks(stat.stime_clock_ticks.unwrap_or(0)),
         priority: OrdinalI32(stat.priority.unwrap_or(0)),
         rt_priority: OrdinalU32(stat.rt_priority.unwrap_or(0)),
-        delayacct_blkio_ticks: ClockTicks(stat.delayacct_blkio_ticks.unwrap_or(0)),
         core_forceidle_sum: MonotonicNs(sched.core_forceidle_sum.unwrap_or(0)),
         fair_slice_ns: GaugeNs(sched.fair_slice_ns.unwrap_or(0)),
         // Dedup `nr_threads` to only the thread leader. Every
@@ -4690,7 +4740,6 @@ mod tests {
             "stime_clock_ticks": 11,
             "priority": 25,
             "rt_priority": 99,
-            "delayacct_blkio_ticks": 137,
             "core_forceidle_sum": 0,
             "fair_slice_ns": 250000,
             "nr_threads": 4,
