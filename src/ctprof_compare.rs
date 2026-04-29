@@ -6520,18 +6520,18 @@ pub fn write_diff<W: fmt::Write>(
                     })
             });
 
+            // Single table with separator rows for cgroup headings.
             writeln!(w, "## Primary metrics")?;
             let mut last_segments: Vec<&str> = Vec::new();
             let mut last_pcomm = "";
             let mut table = display.new_table();
             table.set_header(colored_header(&columns, "comm"));
-            let mut has_rows = false;
 
-            let depth_ansi = |d: usize| -> &str {
-                match d {
-                    0 => "\x1b[1;32m",
-                    1 => "\x1b[36m",
-                    _ => "\x1b[90m",
+            let depth_color = |depth: usize| -> comfy_table::Color {
+                match depth {
+                    0 => comfy_table::Color::Green,
+                    1 => comfy_table::Color::Cyan,
+                    _ => comfy_table::Color::DarkGrey,
                 }
             };
 
@@ -6547,36 +6547,51 @@ pub fn write_diff<W: fmt::Write>(
                 let cg_changed =
                     common < last_segments.len() || segments.len() > last_segments.len();
                 if cg_changed {
-                    if has_rows {
-                        writeln!(w, "{table}")?;
-                        table = display.new_table();
-                        table.set_header(colored_header(&columns, "comm"));
-                        has_rows = false;
-                    }
                     for (depth, seg) in segments.iter().enumerate().skip(common) {
                         let indent = "  ".repeat(depth);
-                        let color = depth_ansi(depth);
-                        writeln!(w, "{color}{indent}{seg}\x1b[0m")?;
+                        let label = format!("{indent}{seg}");
+                        let heading_cells: Vec<comfy_table::Cell> = columns
+                            .iter()
+                            .map(|c| {
+                                if *c == Column::Group {
+                                    comfy_table::Cell::new(&label)
+                                        .fg(depth_color(depth))
+                                        .add_attribute(comfy_table::Attribute::Bold)
+                                } else {
+                                    comfy_table::Cell::new("")
+                                }
+                            })
+                            .collect();
+                        table.add_row(heading_cells);
                     }
                     last_segments = segments;
                     last_pcomm = "";
                 }
 
                 if h.pcomm != last_pcomm {
-                    if has_rows {
-                        writeln!(w, "{table}")?;
-                        table = display.new_table();
-                        table.set_header(colored_header(&columns, "comm"));
-                    }
                     let cg_depth = last_segments.len();
                     let indent = "  ".repeat(cg_depth);
-                    writeln!(w, "\x1b[1m{indent}{}\x1b[0m", h.pcomm)?;
+                    let label = format!("{indent}{}", h.pcomm);
+                    let heading_cells: Vec<comfy_table::Cell> = columns
+                        .iter()
+                        .map(|c| {
+                            if *c == Column::Group {
+                                comfy_table::Cell::new(&label)
+                                    .fg(comfy_table::Color::White)
+                                    .add_attribute(comfy_table::Attribute::Bold)
+                            } else {
+                                comfy_table::Cell::new("")
+                            }
+                        })
+                        .collect();
+                    table.add_row(heading_cells);
                     last_pcomm = h.pcomm;
                 }
 
                 let mut string_cells = render_diff_row_cells(h.row, &columns);
                 if let Some(pos) = columns.iter().position(|c| *c == Column::Group) {
-                    string_cells[pos] = h.comm.to_string();
+                    let cg_depth = last_segments.len();
+                    string_cells[pos] = format!("{}  {}", "  ".repeat(cg_depth + 1), h.comm);
                 }
                 let cells: Vec<comfy_table::Cell> = string_cells
                     .into_iter()
@@ -6584,11 +6599,8 @@ pub fn write_diff<W: fmt::Write>(
                     .map(|(s, col)| color_diff_cell(s, *col, h.row.delta, h.row.uptime_pct))
                     .collect();
                 table.add_row(cells);
-                has_rows = true;
             }
-            if has_rows {
-                writeln!(w, "{table}")?;
-            }
+            writeln!(w, "{table}")?;
         } else if group_by == GroupBy::Cgroup {
             // Hierarchical cgroup rendering: group rows by parent
             // path, emit a sub-heading per parent, show only the
@@ -6728,12 +6740,11 @@ pub fn write_diff<W: fmt::Write>(
             dt.set_header(colored_header(&columns, "comm"));
             let mut last_segs: Vec<&str> = Vec::new();
             let mut last_pc = "";
-            let mut dt_has_rows = false;
-            let depth_ansi_d = |d: usize| -> &str {
+            let depth_color = |d: usize| -> comfy_table::Color {
                 match d {
-                    0 => "\x1b[1;32m",
-                    1 => "\x1b[36m",
-                    _ => "\x1b[90m",
+                    0 => comfy_table::Color::Green,
+                    1 => comfy_table::Color::Cyan,
+                    _ => comfy_table::Color::DarkGrey,
                 }
             };
             for h in &hier {
@@ -6743,35 +6754,50 @@ pub fn write_diff<W: fmt::Write>(
                     .zip(last_segs.iter())
                     .take_while(|(a, b)| a == b)
                     .count();
-                let cg_changed = common < last_segs.len() || segs.len() > last_segs.len();
-                if cg_changed {
-                    if dt_has_rows {
-                        writeln!(w, "{dt}")?;
-                        dt = display.new_table();
-                        dt.set_header(colored_header(&columns, "comm"));
-                        dt_has_rows = false;
-                    }
+                if common < last_segs.len() || segs.len() > last_segs.len() {
                     for (depth, seg) in segs.iter().enumerate().skip(common) {
                         let indent = "  ".repeat(depth);
-                        writeln!(w, "{}{indent}{seg}\x1b[0m", depth_ansi_d(depth))?;
+                        let label = format!("{indent}{seg}");
+                        let hcells: Vec<comfy_table::Cell> = columns
+                            .iter()
+                            .map(|c| {
+                                if *c == Column::Group {
+                                    comfy_table::Cell::new(&label)
+                                        .fg(depth_color(depth))
+                                        .add_attribute(comfy_table::Attribute::Bold)
+                                } else {
+                                    comfy_table::Cell::new("")
+                                }
+                            })
+                            .collect();
+                        dt.add_row(hcells);
                     }
                     last_segs = segs;
                     last_pc = "";
                 }
                 if h.pcomm != last_pc {
-                    if dt_has_rows {
-                        writeln!(w, "{dt}")?;
-                        dt = display.new_table();
-                        dt.set_header(colored_header(&columns, "comm"));
-                    }
                     let cg_depth = last_segs.len();
                     let indent = "  ".repeat(cg_depth);
-                    writeln!(w, "\x1b[1m{indent}{}\x1b[0m", h.pcomm)?;
+                    let label = format!("{indent}{}", h.pcomm);
+                    let hcells: Vec<comfy_table::Cell> = columns
+                        .iter()
+                        .map(|c| {
+                            if *c == Column::Group {
+                                comfy_table::Cell::new(&label)
+                                    .fg(comfy_table::Color::White)
+                                    .add_attribute(comfy_table::Attribute::Bold)
+                            } else {
+                                comfy_table::Cell::new("")
+                            }
+                        })
+                        .collect();
+                    dt.add_row(hcells);
                     last_pc = h.pcomm;
                 }
                 let mut cells = render_derived_row_cells(h.row, &columns);
                 if let Some(pos) = columns.iter().position(|c| *c == Column::Group) {
-                    cells[pos] = h.comm.to_string();
+                    let cg_depth = last_segs.len();
+                    cells[pos] = format!("{}  {}", "  ".repeat(cg_depth + 1), h.comm);
                 }
                 let colored: Vec<comfy_table::Cell> = cells
                     .into_iter()
@@ -6790,11 +6816,8 @@ pub fn write_diff<W: fmt::Write>(
                     })
                     .collect();
                 dt.add_row(colored);
-                dt_has_rows = true;
             }
-            if dt_has_rows {
-                writeln!(w, "{dt}")?;
-            }
+            writeln!(w, "{dt}")?;
         } else {
             writeln!(w)?;
             writeln!(w, "## Derived metrics")?;
