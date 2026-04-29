@@ -2875,7 +2875,7 @@ pub fn compare(
                     remove_baseline.insert((*bkey).clone());
                     remove_candidate.insert((*ckey).clone());
                     if let (Some(ga), Some(gb)) = (groups_a.get(*bkey), groups_b.get(*ckey)) {
-                        let display_key = format!("{bcg} ~> {ccg}");
+                        let display_key = "[fudged]".to_string();
                         for metric in CTPROF_METRICS {
                             let Some(a) = ga.metrics.get(metric.name).cloned() else {
                                 continue;
@@ -2972,7 +2972,7 @@ pub fn compare(
                     remove_candidate.insert((*ckey).clone());
                     *cascade_counts.entry(bcg.clone()).or_insert(0) += 1;
                     if let (Some(ga), Some(gb)) = (groups_a.get(bkey), groups_b.get(*ckey)) {
-                        let display_key = format!("{bcg} ~> {ccg}");
+                        let display_key = "[fudged]".to_string();
                         for metric in CTPROF_METRICS {
                             let Some(a) = ga.metrics.get(metric.name).cloned() else {
                                 continue;
