@@ -123,6 +123,12 @@ pub enum GroupBy {
     /// snapshots; pick `Comm + no_thread_normalize` when you
     /// also want literal smaps PID identity.
     CommExact,
+    /// Run all three pattern-aware axes (Cgroup → Pcomm → Comm)
+    /// and render each as a labeled block. Gives a comprehensive
+    /// at-a-glance summary without re-running with different
+    /// `--group-by` flags. Each axis gets its own `## Primary
+    /// metrics` section, independently truncated by `--limit`.
+    All,
 }
 
 /// Options controlling [`compare`].
@@ -3345,6 +3351,7 @@ pub fn build_groups(
     let mut buckets: BTreeMap<String, Vec<&ThreadState>> = BTreeMap::new();
     for t in &snap.threads {
         let key = match group_by {
+            GroupBy::All => unreachable!("All is decomposed before build_groups"),
             // Pcomm and Comm share the same shape: when
             // normalization is enabled, route the chosen field
             // through `pattern_key` and revert singletons to the
@@ -4955,6 +4962,7 @@ fn group_by_cli_name(group_by: GroupBy) -> &'static str {
         GroupBy::Cgroup => "cgroup",
         GroupBy::Comm => "comm",
         GroupBy::CommExact => "comm-exact",
+        GroupBy::All => "all",
     }
 }
 
@@ -5548,13 +5556,6 @@ pub fn run_compare(args: &CtprofCompareArgs) -> anyhow::Result<i32> {
     let candidate = CtprofSnapshot::load(&args.candidate)
         .with_context(|| format!("load candidate {}", args.candidate.display()))?;
 
-    let opts = CompareOptions {
-        group_by: args.group_by.into(),
-        cgroup_flatten: args.cgroup_flatten.clone(),
-        no_thread_normalize: args.no_thread_normalize,
-        no_cg_normalize: args.no_cg_normalize,
-        sort_by,
-    };
     let display = DisplayOptions {
         format: args.display_format,
         columns,
@@ -5563,14 +5564,33 @@ pub fn run_compare(args: &CtprofCompareArgs) -> anyhow::Result<i32> {
         metrics,
         section_line_limit: args.limit,
     };
-    let diff = compare(&baseline, &candidate, &opts);
-    print_diff(
-        &diff,
-        &args.baseline,
-        &args.candidate,
-        args.group_by,
-        &display,
-    );
+
+    let axes: Vec<GroupBy> = if args.group_by == GroupBy::All {
+        vec![GroupBy::Cgroup, GroupBy::Pcomm, GroupBy::Comm]
+    } else {
+        vec![args.group_by]
+    };
+
+    for (i, axis) in axes.iter().enumerate() {
+        if i > 0 {
+            println!();
+            println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+            println!();
+        }
+        if axes.len() > 1 {
+            println!("# --group-by {}", group_by_cli_name(*axis));
+            println!();
+        }
+        let opts = CompareOptions {
+            group_by: (*axis).into(),
+            cgroup_flatten: args.cgroup_flatten.clone(),
+            no_thread_normalize: args.no_thread_normalize,
+            no_cg_normalize: args.no_cg_normalize,
+            sort_by: sort_by.clone(),
+        };
+        let diff = compare(&baseline, &candidate, &opts);
+        print_diff(&diff, &args.baseline, &args.candidate, *axis, &display);
+    }
     Ok(0)
 }
 
@@ -5921,6 +5941,7 @@ pub fn write_diff<W: fmt::Write>(
         GroupBy::Cgroup => "cgroup",
         GroupBy::Comm => "comm-pattern",
         GroupBy::CommExact => "comm",
+        GroupBy::All => unreachable!("All is decomposed before write_diff"),
     };
 
     let columns = display.resolved_compare_columns();

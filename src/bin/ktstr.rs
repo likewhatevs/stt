@@ -872,6 +872,7 @@ fn write_show<W: std::fmt::Write>(
         ctprof_compare::GroupBy::Cgroup => "cgroup",
         ctprof_compare::GroupBy::Comm => "comm-pattern",
         ctprof_compare::GroupBy::CommExact => "comm",
+        ctprof_compare::GroupBy::All => unreachable!("All is decomposed before write_show"),
     };
 
     // Resolve the column set: caller-supplied override wins,
