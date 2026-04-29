@@ -6473,6 +6473,200 @@ pub fn write_diff<W: fmt::Write>(
         }
     }
 
+    // within the equal cluster.
+    if display.is_section_enabled(Section::Smaps)
+        && (!diff.smaps_rollup_a.is_empty() || !diff.smaps_rollup_b.is_empty())
+    {
+        let mut process_keys: std::collections::BTreeSet<&String> =
+            diff.smaps_rollup_a.keys().collect();
+        process_keys.extend(diff.smaps_rollup_b.keys());
+
+        let max_field_for = |pkey: &&String, field: &str| -> u64 {
+            let a = diff
+                .smaps_rollup_a
+                .get(*pkey)
+                .and_then(|m| m.get(field).copied())
+                .unwrap_or(0);
+            let b = diff
+                .smaps_rollup_b
+                .get(*pkey)
+                .and_then(|m| m.get(field).copied())
+                .unwrap_or(0);
+            a.max(b)
+        };
+        let abs_rss_delta = |pkey: &&String| -> u64 {
+            let a = diff
+                .smaps_rollup_a
+                .get(*pkey)
+                .and_then(|m| m.get("Rss").copied())
+                .unwrap_or(0);
+            let b = diff
+                .smaps_rollup_b
+                .get(*pkey)
+                .and_then(|m| m.get("Rss").copied())
+                .unwrap_or(0);
+            (b as i128 - a as i128).unsigned_abs() as u64
+        };
+        let mut sorted_process_keys: Vec<&String> = process_keys.iter().copied().collect();
+        sorted_process_keys.sort_by(|a, b| {
+            abs_rss_delta(b)
+                .cmp(&abs_rss_delta(a))
+                .then_with(|| max_field_for(b, "Rss").cmp(&max_field_for(a, "Rss")))
+                .then_with(|| a.cmp(b))
+        });
+
+        // Pre-pass: any (process, key) pair with a non-equal
+        // delta? Suppresses the section header when nothing
+        // moved, even if both maps are populated.
+        let any_delta = sorted_process_keys.iter().any(|pkey| {
+            let a = diff.smaps_rollup_a.get(*pkey);
+            let b = diff.smaps_rollup_b.get(*pkey);
+            let mut keys: std::collections::BTreeSet<&String> =
+                a.map(|m| m.keys().collect()).unwrap_or_default();
+            if let Some(m) = b {
+                keys.extend(m.keys());
+            }
+            keys.iter().any(|k| {
+                let av = a.and_then(|m| m.get(*k).copied());
+                let bv = b.and_then(|m| m.get(*k).copied());
+                av != bv
+            })
+        });
+        if any_delta {
+            writeln!(w)?;
+            writeln!(w, "## smaps_rollup")?;
+            let smaps_cols = ["process", "key", "value", "delta", "%"];
+            let mut st = display.new_table();
+            st.set_header(
+                smaps_cols
+                    .iter()
+                    .map(|h| comfy_table::Cell::new(*h).fg(comfy_table::Color::Cyan))
+                    .collect::<Vec<_>>(),
+            );
+
+            // For All mode, re-sort by cgroup hierarchy (keys are
+            // compound cgroup\x00pcomm). Track segments for tree headings.
+            let is_compound = group_by == GroupBy::All;
+            let mut sorted_keys = sorted_process_keys.clone();
+            if is_compound {
+                sorted_keys.sort();
+            }
+
+            let mut last_segs: Vec<&str> = Vec::new();
+            let depth_ansi = |d: usize| -> &str {
+                match d {
+                    0 => "\x1b[1;32m",
+                    1 => "\x1b[36m",
+                    _ => "\x1b[90m",
+                }
+            };
+            let mut has_rows = false;
+
+            for pkey in &sorted_keys {
+                let (cg_part, display_process) = if is_compound {
+                    pkey.split_once('\x00').unwrap_or(("", pkey))
+                } else {
+                    ("", pkey.as_str())
+                };
+
+                if is_compound {
+                    let segs: Vec<&str> = cg_part.split('/').filter(|s| !s.is_empty()).collect();
+                    let common = segs
+                        .iter()
+                        .zip(last_segs.iter())
+                        .take_while(|(a, b)| a == b)
+                        .count();
+                    if common < last_segs.len() || segs.len() > last_segs.len() {
+                        if has_rows {
+                            writeln!(w, "{st}")?;
+                            st = display.new_table();
+                            st.set_header(
+                                smaps_cols
+                                    .iter()
+                                    .map(|h| {
+                                        comfy_table::Cell::new(*h).fg(comfy_table::Color::Cyan)
+                                    })
+                                    .collect::<Vec<_>>(),
+                            );
+                            has_rows = false;
+                        }
+                        for (depth, seg) in segs.iter().enumerate().skip(common) {
+                            let indent = "  ".repeat(depth);
+                            let color = depth_ansi(depth);
+                            writeln!(w, "{color}{indent}{seg}\x1b[0m")?;
+                        }
+                        last_segs = segs;
+                    }
+                }
+
+                let a = diff.smaps_rollup_a.get(*pkey);
+                let b = diff.smaps_rollup_b.get(*pkey);
+                let mut keys_union: std::collections::BTreeSet<&String> =
+                    a.map(|m| m.keys().collect()).unwrap_or_default();
+                if let Some(m) = b {
+                    keys_union.extend(m.keys());
+                }
+                let mut first_row_for_process = true;
+                for sk in keys_union {
+                    let av = a.and_then(|m| m.get(sk).copied());
+                    let bv = b.and_then(|m| m.get(sk).copied());
+                    if av == bv {
+                        continue;
+                    }
+                    let a_cell = av
+                        .map(|v| format_scaled_u64(v, ScaleLadder::Bytes))
+                        .unwrap_or_else(|| "-".to_string());
+                    let b_cell = bv
+                        .map(|v| format_scaled_u64(v, ScaleLadder::Bytes))
+                        .unwrap_or_else(|| "-".to_string());
+                    let value_cell = format!("{a_cell} \u{2192} {b_cell}");
+                    let a_val = av.unwrap_or(0);
+                    let b_val = bv.unwrap_or(0);
+                    let delta = b_val as i128 - a_val as i128;
+                    let delta_cell = if av.is_none() || bv.is_none() {
+                        "-".to_string()
+                    } else {
+                        format_delta_cell(delta as f64, ScaleLadder::Bytes)
+                    };
+                    let pct_cell = if a_val == 0 || av.is_none() || bv.is_none() {
+                        "-".to_string()
+                    } else {
+                        let pct = (delta as f64 / a_val as f64) * 100.0;
+                        format!("{pct:+.1}%")
+                    };
+                    let dc = if delta > 0 {
+                        comfy_table::Color::Yellow
+                    } else if delta < 0 {
+                        comfy_table::Color::Magenta
+                    } else {
+                        comfy_table::Color::White
+                    };
+                    let proc_label = if first_row_for_process {
+                        first_row_for_process = false;
+                        if is_compound {
+                            format!("  {display_process}")
+                        } else {
+                            display_process.to_string()
+                        }
+                    } else {
+                        String::new()
+                    };
+                    st.add_row(vec![
+                        comfy_table::Cell::new(proc_label),
+                        comfy_table::Cell::new(sk.clone()),
+                        comfy_table::Cell::new(value_cell),
+                        comfy_table::Cell::new(delta_cell).fg(dc),
+                        comfy_table::Cell::new(pct_cell).fg(dc),
+                    ]);
+                    has_rows = true;
+                }
+            }
+            if has_rows {
+                writeln!(w, "{st}")?;
+            }
+        }
+    }
+
     if group_by == GroupBy::Cgroup
         && (!diff.cgroup_stats_a.is_empty() || !diff.cgroup_stats_b.is_empty())
     {
@@ -6823,200 +7017,6 @@ pub fn write_diff<W: fmt::Write>(
     // ties when two processes report equal Rss but differ in
     // shared-page accounting. Processes missing both keys sort
     // last under `unwrap_or(0)` and preserve alphabetical order
-    // within the equal cluster.
-    if display.is_section_enabled(Section::Smaps)
-        && (!diff.smaps_rollup_a.is_empty() || !diff.smaps_rollup_b.is_empty())
-    {
-        let mut process_keys: std::collections::BTreeSet<&String> =
-            diff.smaps_rollup_a.keys().collect();
-        process_keys.extend(diff.smaps_rollup_b.keys());
-
-        let max_field_for = |pkey: &&String, field: &str| -> u64 {
-            let a = diff
-                .smaps_rollup_a
-                .get(*pkey)
-                .and_then(|m| m.get(field).copied())
-                .unwrap_or(0);
-            let b = diff
-                .smaps_rollup_b
-                .get(*pkey)
-                .and_then(|m| m.get(field).copied())
-                .unwrap_or(0);
-            a.max(b)
-        };
-        let abs_rss_delta = |pkey: &&String| -> u64 {
-            let a = diff
-                .smaps_rollup_a
-                .get(*pkey)
-                .and_then(|m| m.get("Rss").copied())
-                .unwrap_or(0);
-            let b = diff
-                .smaps_rollup_b
-                .get(*pkey)
-                .and_then(|m| m.get("Rss").copied())
-                .unwrap_or(0);
-            (b as i128 - a as i128).unsigned_abs() as u64
-        };
-        let mut sorted_process_keys: Vec<&String> = process_keys.iter().copied().collect();
-        sorted_process_keys.sort_by(|a, b| {
-            abs_rss_delta(b)
-                .cmp(&abs_rss_delta(a))
-                .then_with(|| max_field_for(b, "Rss").cmp(&max_field_for(a, "Rss")))
-                .then_with(|| a.cmp(b))
-        });
-
-        // Pre-pass: any (process, key) pair with a non-equal
-        // delta? Suppresses the section header when nothing
-        // moved, even if both maps are populated.
-        let any_delta = sorted_process_keys.iter().any(|pkey| {
-            let a = diff.smaps_rollup_a.get(*pkey);
-            let b = diff.smaps_rollup_b.get(*pkey);
-            let mut keys: std::collections::BTreeSet<&String> =
-                a.map(|m| m.keys().collect()).unwrap_or_default();
-            if let Some(m) = b {
-                keys.extend(m.keys());
-            }
-            keys.iter().any(|k| {
-                let av = a.and_then(|m| m.get(*k).copied());
-                let bv = b.and_then(|m| m.get(*k).copied());
-                av != bv
-            })
-        });
-        if any_delta {
-            writeln!(w)?;
-            writeln!(w, "## smaps_rollup")?;
-            let smaps_cols = ["process", "key", "value", "delta", "%"];
-            let mut st = display.new_table();
-            st.set_header(
-                smaps_cols
-                    .iter()
-                    .map(|h| comfy_table::Cell::new(*h).fg(comfy_table::Color::Cyan))
-                    .collect::<Vec<_>>(),
-            );
-
-            // For All mode, re-sort by cgroup hierarchy (keys are
-            // compound cgroup\x00pcomm). Track segments for tree headings.
-            let is_compound = group_by == GroupBy::All;
-            let mut sorted_keys = sorted_process_keys.clone();
-            if is_compound {
-                sorted_keys.sort();
-            }
-
-            let mut last_segs: Vec<&str> = Vec::new();
-            let depth_ansi = |d: usize| -> &str {
-                match d {
-                    0 => "\x1b[1;32m",
-                    1 => "\x1b[36m",
-                    _ => "\x1b[90m",
-                }
-            };
-            let mut has_rows = false;
-
-            for pkey in &sorted_keys {
-                let (cg_part, display_process) = if is_compound {
-                    pkey.split_once('\x00').unwrap_or(("", pkey))
-                } else {
-                    ("", pkey.as_str())
-                };
-
-                if is_compound {
-                    let segs: Vec<&str> = cg_part.split('/').filter(|s| !s.is_empty()).collect();
-                    let common = segs
-                        .iter()
-                        .zip(last_segs.iter())
-                        .take_while(|(a, b)| a == b)
-                        .count();
-                    if common < last_segs.len() || segs.len() > last_segs.len() {
-                        if has_rows {
-                            writeln!(w, "{st}")?;
-                            st = display.new_table();
-                            st.set_header(
-                                smaps_cols
-                                    .iter()
-                                    .map(|h| {
-                                        comfy_table::Cell::new(*h).fg(comfy_table::Color::Cyan)
-                                    })
-                                    .collect::<Vec<_>>(),
-                            );
-                            has_rows = false;
-                        }
-                        for (depth, seg) in segs.iter().enumerate().skip(common) {
-                            let indent = "  ".repeat(depth);
-                            let color = depth_ansi(depth);
-                            writeln!(w, "{color}{indent}{seg}\x1b[0m")?;
-                        }
-                        last_segs = segs;
-                    }
-                }
-
-                let a = diff.smaps_rollup_a.get(*pkey);
-                let b = diff.smaps_rollup_b.get(*pkey);
-                let mut keys_union: std::collections::BTreeSet<&String> =
-                    a.map(|m| m.keys().collect()).unwrap_or_default();
-                if let Some(m) = b {
-                    keys_union.extend(m.keys());
-                }
-                let mut first_row_for_process = true;
-                for sk in keys_union {
-                    let av = a.and_then(|m| m.get(sk).copied());
-                    let bv = b.and_then(|m| m.get(sk).copied());
-                    if av == bv {
-                        continue;
-                    }
-                    let a_cell = av
-                        .map(|v| format_scaled_u64(v, ScaleLadder::Bytes))
-                        .unwrap_or_else(|| "-".to_string());
-                    let b_cell = bv
-                        .map(|v| format_scaled_u64(v, ScaleLadder::Bytes))
-                        .unwrap_or_else(|| "-".to_string());
-                    let value_cell = format!("{a_cell} \u{2192} {b_cell}");
-                    let a_val = av.unwrap_or(0);
-                    let b_val = bv.unwrap_or(0);
-                    let delta = b_val as i128 - a_val as i128;
-                    let delta_cell = if av.is_none() || bv.is_none() {
-                        "-".to_string()
-                    } else {
-                        format_delta_cell(delta as f64, ScaleLadder::Bytes)
-                    };
-                    let pct_cell = if a_val == 0 || av.is_none() || bv.is_none() {
-                        "-".to_string()
-                    } else {
-                        let pct = (delta as f64 / a_val as f64) * 100.0;
-                        format!("{pct:+.1}%")
-                    };
-                    let dc = if delta > 0 {
-                        comfy_table::Color::Yellow
-                    } else if delta < 0 {
-                        comfy_table::Color::Magenta
-                    } else {
-                        comfy_table::Color::White
-                    };
-                    let proc_label = if first_row_for_process {
-                        first_row_for_process = false;
-                        if is_compound {
-                            format!("  {display_process}")
-                        } else {
-                            display_process.to_string()
-                        }
-                    } else {
-                        String::new()
-                    };
-                    st.add_row(vec![
-                        comfy_table::Cell::new(proc_label),
-                        comfy_table::Cell::new(sk.clone()),
-                        comfy_table::Cell::new(value_cell),
-                        comfy_table::Cell::new(delta_cell).fg(dc),
-                        comfy_table::Cell::new(pct_cell).fg(dc),
-                    ]);
-                    has_rows = true;
-                }
-            }
-            if has_rows {
-                writeln!(w, "{st}")?;
-            }
-        }
-    }
-
     // Global sched_ext sysfs compare. Suppressed when both
     // sides are None (CONFIG_SCHED_CLASS_EXT=n on both kernels)
     // OR when both sides are Some and every field is identical
