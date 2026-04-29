@@ -5363,17 +5363,45 @@ fn render_diff_row_cells(row: &DiffRow, columns: &[Column]) -> Vec<String> {
     cells
 }
 
-/// Format an uptime % cell with ANSI color: green ≥75%, yellow
-/// 50-75%, red <50%.
-pub fn color_uptime_cell(cell: String, pct: Option<f64>) -> comfy_table::Cell {
+/// Color a diff-table cell based on its column type and the row's delta.
+/// Delta/% cells: yellow for positive (increase), magenta for negative
+/// (decrease). Uptime: green/yellow/red gradient. Other columns: default.
+pub fn color_diff_cell(
+    text: String,
+    col: Column,
+    delta: Option<f64>,
+    uptime_pct: Option<f64>,
+) -> comfy_table::Cell {
     use comfy_table::Color;
-    let color = match pct {
-        Some(p) if p >= 75.0 => Color::Green,
-        Some(p) if p >= 50.0 => Color::Yellow,
-        Some(_) => Color::Red,
-        None => Color::White,
-    };
-    comfy_table::Cell::new(cell).fg(color)
+    match col {
+        Column::Delta | Column::Pct => {
+            let color = match delta {
+                Some(d) if d > 0.0 => Color::Yellow,
+                Some(d) if d < 0.0 => Color::Magenta,
+                _ => Color::White,
+            };
+            comfy_table::Cell::new(text).fg(color)
+        }
+        Column::Uptime => {
+            let color = match uptime_pct {
+                Some(p) if p >= 75.0 => Color::Green,
+                Some(p) if p >= 50.0 => Color::Yellow,
+                Some(_) => Color::Red,
+                None => Color::White,
+            };
+            comfy_table::Cell::new(text).fg(color)
+        }
+        _ => comfy_table::Cell::new(text),
+    }
+}
+
+/// Build a colored header row — cyan foreground so headers are
+/// visually distinct from data rows.
+pub fn colored_header(columns: &[Column], group_header: &'static str) -> Vec<comfy_table::Cell> {
+    columns
+        .iter()
+        .map(|c| comfy_table::Cell::new(c.header(group_header)).fg(comfy_table::Color::Cyan))
+        .collect()
 }
 
 /// Wrap a string-cell row in [`comfy_table::Cell`]s with blue
@@ -6027,8 +6055,7 @@ pub fn write_diff<W: fmt::Write>(
     {
         writeln!(w, "## Primary metrics")?;
         let mut table = display.new_table();
-        let header_row: Vec<&str> = columns.iter().map(|c| c.header(group_header)).collect();
-        table.set_header(header_row);
+        table.set_header(colored_header(&columns, group_header));
         for row in &diff.rows {
             // `--metrics` filter: skip rows whose metric is not
             // on the requested allowlist. Empty allowlist = no
@@ -6056,13 +6083,7 @@ pub fn write_diff<W: fmt::Write>(
             let cells: Vec<comfy_table::Cell> = string_cells
                 .into_iter()
                 .zip(columns.iter())
-                .map(|(s, col)| {
-                    if *col == Column::Uptime {
-                        color_uptime_cell(s, row.uptime_pct)
-                    } else {
-                        comfy_table::Cell::new(s)
-                    }
-                })
+                .map(|(s, col)| color_diff_cell(s, *col, row.delta, row.uptime_pct))
                 .collect();
             table.add_row(cells);
         }
@@ -6082,8 +6103,7 @@ pub fn write_diff<W: fmt::Write>(
         writeln!(w)?;
         writeln!(w, "## Derived metrics")?;
         let mut dt = display.new_table();
-        let header_row: Vec<&str> = columns.iter().map(|c| c.header(group_header)).collect();
-        dt.set_header(header_row);
+        dt.set_header(colored_header(&columns, group_header));
         for row in &diff.derived_rows {
             if !display.is_metric_enabled(row.metric_name) {
                 continue;
@@ -6103,8 +6123,13 @@ pub fn write_diff<W: fmt::Write>(
             if !display.is_section_enabled(metric.section) {
                 continue;
             }
-            let cells = render_derived_row_cells(row, &columns);
-            dt.add_row(color_derived_cells(cells));
+            let string_cells = render_derived_row_cells(row, &columns);
+            let cells: Vec<comfy_table::Cell> = string_cells
+                .into_iter()
+                .zip(columns.iter())
+                .map(|(s, col)| color_diff_cell(s, *col, row.delta, None))
+                .collect();
+            dt.add_row(cells);
         }
         writeln!(w, "{dt}")?;
     }
@@ -6522,7 +6547,13 @@ pub fn write_diff<W: fmt::Write>(
             writeln!(w)?;
             writeln!(w, "## smaps_rollup")?;
             let mut st = display.new_table();
-            st.set_header(vec!["process", "key", "value", "delta", "%"]);
+            st.set_header(vec![
+                comfy_table::Cell::new("process").fg(comfy_table::Color::Cyan),
+                comfy_table::Cell::new("key").fg(comfy_table::Color::Cyan),
+                comfy_table::Cell::new("value").fg(comfy_table::Color::Cyan),
+                comfy_table::Cell::new("delta").fg(comfy_table::Color::Cyan),
+                comfy_table::Cell::new("%").fg(comfy_table::Color::Cyan),
+            ]);
             for pkey in &sorted_process_keys {
                 let a = diff.smaps_rollup_a.get(*pkey);
                 let b = diff.smaps_rollup_b.get(*pkey);
@@ -6558,12 +6589,19 @@ pub fn write_diff<W: fmt::Write>(
                         let pct = (delta as f64 / a_val as f64) * 100.0;
                         format!("{pct:+.1}%")
                     };
+                    let delta_color = if delta > 0 {
+                        comfy_table::Color::Yellow
+                    } else if delta < 0 {
+                        comfy_table::Color::Magenta
+                    } else {
+                        comfy_table::Color::White
+                    };
                     st.add_row(vec![
-                        pkey.to_string(),
-                        sk.clone(),
-                        value_cell,
-                        delta_cell,
-                        pct_cell,
+                        comfy_table::Cell::new(pkey.to_string()),
+                        comfy_table::Cell::new(sk.clone()),
+                        comfy_table::Cell::new(value_cell),
+                        comfy_table::Cell::new(delta_cell).fg(delta_color),
+                        comfy_table::Cell::new(pct_cell).fg(delta_color),
                     ]);
                 }
             }
