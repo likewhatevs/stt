@@ -2908,20 +2908,45 @@ pub fn compare(
             }
         }
 
-        // Cascade: for each fudged cgroup pair, match remaining
-        // one-sided child paths by structure (no overlap gate).
+        // Cascade: for each fudged cgroup pair, compute cascade
+        // roots by stripping the longest common suffix (by /
+        // segments) from the pair. Use those shorter roots for
+        // starts_with matching, not the full fudged paths.
         for (bcg, ccg) in &fudged_cg {
+            let b_segs: Vec<&str> = bcg.split('/').collect();
+            let c_segs: Vec<&str> = ccg.split('/').collect();
+            let common_suffix_len = b_segs
+                .iter()
+                .rev()
+                .zip(c_segs.iter().rev())
+                .take_while(|(a, b)| a == b)
+                .count();
+            let b_root: String = b_segs[..b_segs.len().saturating_sub(common_suffix_len)].join("/");
+            let c_root: String = c_segs[..c_segs.len().saturating_sub(common_suffix_len)].join("/");
+            let b_root = if b_root.is_empty() {
+                bcg.clone()
+            } else {
+                b_root
+            };
+            let c_root = if c_root.is_empty() {
+                ccg.clone()
+            } else {
+                c_root
+            };
+
             let remaining_b: Vec<String> = diff
                 .only_baseline
                 .iter()
-                .filter(|k| !remove_baseline.contains(*k) && cg_prefix(k).starts_with(bcg.as_str()))
+                .filter(|k| {
+                    !remove_baseline.contains(*k) && cg_prefix(k).starts_with(b_root.as_str())
+                })
                 .cloned()
                 .collect();
             let remaining_c: Vec<String> = diff
                 .only_candidate
                 .iter()
                 .filter(|k| {
-                    !remove_candidate.contains(*k) && cg_prefix(k).starts_with(ccg.as_str())
+                    !remove_candidate.contains(*k) && cg_prefix(k).starts_with(c_root.as_str())
                 })
                 .cloned()
                 .collect();
@@ -2929,7 +2954,7 @@ pub fn compare(
                 .iter()
                 .map(|k| {
                     let child_cg = cg_prefix(k);
-                    let rewritten = format!("{bcg}{}", &child_cg[ccg.len()..]);
+                    let rewritten = format!("{b_root}{}", &child_cg[c_root.len()..]);
                     let suffix = k.split_once('\x00').map_or("", |(_, s)| s);
                     (format!("{rewritten}\x00{suffix}"), k)
                 })
