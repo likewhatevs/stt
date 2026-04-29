@@ -264,8 +264,8 @@ Tests that need a different topology (e.g. SMT) override individual
 dimensions. Unset dimensions still inherit from the scheduler:
 
 ```rust,ignore
-// Inherits llcs=2, cores=4 from MITOSIS; overrides threads to 2
-#[ktstr_test(scheduler = MITOSIS, threads = 2)]
+// Inherits llcs=2, cores=4 from MITOSIS_PAYLOAD; overrides threads to 2
+#[ktstr_test(scheduler = MITOSIS_PAYLOAD, threads = 2)]
 fn smt_test(ctx: &Ctx) -> Result<AssertResult> { /* ... */ }
 ```
 
@@ -348,7 +348,7 @@ not as a license to hand-roll literals. Each is populated by
 - `output: OutputFormat` — how to interpret the payload's stdout/stderr.
   `ExitCode` (status code only), `Json` (parse numeric leaves), or
   `LlmExtract(Option<&'static str>)` (route through a local LLM with
-  an optional hint — see [concepts/metrics](../concepts/work-types.md)).
+  an optional hint).
 - `default_args: &'static [&'static str]` — CLI args prepended to
   every invocation. Per-test `ctx.payload(...).args(...)` appends
   after these.

@@ -51,7 +51,7 @@ running ktstr.
 | `--json` | off | Output results as JSON. |
 | `--repro` | off | Attach BPF probes for crash capture while running. |
 | `--probe-stack` | -- | Crash stack for auto-probe: a file path or comma-separated function names. |
-| `--auto-repro` | off | Rerun a crashing scenario with probes attached. |
+| `--auto-repro` | off | **No-op on `ktstr run`** — this command executes scenarios on the host without spawning a VM, so there is no second boot to perform. The flag applies only to VM-based runs through the `#[ktstr_test]` harness (invoked via `cargo nextest run` / `cargo ktstr test`), where a crashing scenario reruns with probes attached. |
 | `--kernel-dir PATH` | -- | Kernel build directory; used for DWARF source location lookup in probe output (requires `--repro` or `--auto-repro`). |
 | `--work-type NAME` | per-scenario | Override the work type for all cgroups. Case-sensitive; see list below. |
 | `--no-perf-mode` | off | Disable all performance mode features (flock, pinning, RT scheduling, hugepages, NUMA mbind, KVM exit suppression). Also settable via `KTSTR_NO_PERF_MODE` env var. |
@@ -190,8 +190,8 @@ tracing.
 |------|---------|-------------|
 | `-o`, `--output PATH` | required | Destination path (convention: `.ctprof.zst`). Existing files are overwritten. |
 
-**`compare`** joins two snapshots on `(pcomm, comm)` (or other
-selected grouping axis) and renders a per-metric
+**`compare`** joins two snapshots on the selected grouping
+axis (`pcomm` by default) and renders a per-metric
 baseline/candidate/delta table. The join key survives across
 captures taken on different hosts or after process restarts, so
 deltas reflect the behavior of the named workload rather than a
@@ -300,9 +300,11 @@ ktstr completions zsh
 ktstr completions fish
 ```
 
-| Arg | Description |
-|------|-------------|
-| `SHELL` | Shell to generate completions for (`bash`, `zsh`, `fish`, `elvish`, `powershell`). |
+| Arg / Flag | Default | Description |
+|------|---------|-------------|
+| `SHELL` | required | Shell to generate completions for (`bash`, `zsh`, `fish`, `elvish`, `powershell`). |
+| `--binary NAME` | `ktstr` | Binary name to register the completion under. Override when invoking ktstr through a symlink with a different name (the shell looks up completions by argv[0]). |
 
-The same subcommand is available as `cargo ktstr completions` (which
-also accepts `--binary` to set the binary name for completions).
+The same subcommand is available as `cargo ktstr completions`
+with identical flag semantics (`--binary` accepted on both;
+defaults to the respective binary name).

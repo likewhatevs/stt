@@ -113,12 +113,14 @@ scenario with BPF probes attached to the crash-path functions. See
 | `scx-ktstr` | Minimal BPF scheduler for testing |
 
 `ktstr` and `cargo-ktstr` are the two user-facing `[[bin]]`
-targets in the crate; `cargo install --locked ktstr` installs
-both. The crate also defines two test-fixture `[[bin]]`
-targets — `ktstr-jemalloc-probe` and
-`ktstr-jemalloc-alloc-worker` — used by the
-`tests/jemalloc_probe_tests.rs` integration tests; those are
-not surfaced as operator-facing commands.
+targets in the crate; install them with
+`cargo install --locked ktstr --bin ktstr --bin cargo-ktstr`.
+The crate also defines two test-fixture `[[bin]]` targets —
+`ktstr-jemalloc-probe` and `ktstr-jemalloc-alloc-worker` —
+used by the `tests/jemalloc_probe_tests.rs` integration tests.
+The explicit `--bin` flags scope the install to just the two
+operator-facing entry points; without them, `cargo install`
+would also place the test-fixture binaries on `$PATH`.
 
 ## Kernel config
 

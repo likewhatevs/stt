@@ -44,6 +44,11 @@ automates this:
   scheduler flag profiles, filtered by per-test constraints.
 - **Host-side introspection** -- reads kernel state and BPF maps
   from guest memory without guest-side instrumentation.
+- **Per-thread profile diff** -- `ktstr ctprof capture` walks
+  every live thread's scheduling, memory, I/O, and taskstats
+  delay counters into a snapshot; `ktstr ctprof compare` diffs
+  two snapshots for thread-level scheduling/memory/I/O
+  regression hunting.
 - **Auto-repro** -- on failure, reruns the scenario with BPF probes
   on the crash call chain, capturing arguments and struct state at
   each call site.
@@ -64,8 +69,13 @@ This is all test authors need -- run with
 The `anyhow::Result` referenced in examples below is re-exported
 through `ktstr::prelude`; no separate `anyhow` dev-dependency needed.
 
-**Optional CLI tools** (`cargo install --locked ktstr`) installs
-the two user-facing binaries:
+**Optional CLI tools**:
+
+```sh
+cargo install --locked ktstr --bin ktstr --bin cargo-ktstr
+```
+
+This installs the two user-facing binaries:
 
 - `ktstr` -- host-side CLI for running scenarios outside VMs and
   managing cached kernel images
@@ -76,8 +86,9 @@ The workspace defines two additional `[[bin]]` targets —
 `ktstr-jemalloc-probe` and `ktstr-jemalloc-alloc-worker` — but
 these are test-fixture binaries spawned by integration tests
 (`tests/jemalloc_probe_tests.rs`), not commands operators run
-directly; the `cargo install` flow does not surface them as
-user-facing entry points.
+directly. The `--bin` flags above scope the install to just the
+two user-facing entry points; without them, `cargo install`
+would also place the test-fixture binaries on `$PATH`.
 
 `scx-ktstr` (the test fixture scheduler) is built automatically
 by the workspace and does not need a separate install.
@@ -266,8 +277,14 @@ for the `#[derive(Payload)]` macro and the full field surface
 ### Run
 
 ```sh
-cargo nextest run
+cargo ktstr test --kernel ../linux
 ```
+
+`cargo ktstr test` wraps `cargo nextest run` with kernel
+resolution (source tree, version, or cache key), kconfig
+fragment merging, and shell access. Bare `cargo nextest run`
+works only when the kernel image is already on the cache key
+the test binary expects.
 
 Requires `/dev/kvm`.
 
@@ -358,6 +375,8 @@ ktstr ctprof capture --output baseline.ctprof.zst         # snapshot every live 
 # ctprof capture pulls per-thread jemalloc counters via ptrace; needs root,
 # `sudo setcap cap_sys_ptrace+eip $(which ktstr)`, or `kernel.yama.ptrace_scope=0`
 ktstr ctprof compare baseline.ctprof.zst candidate.ctprof.zst # diff two snapshots on the selected grouping axis
+ktstr ctprof show baseline.ctprof.zst                     # render one snapshot, no diff math
+ktstr ctprof metric-list                                  # discover the metric vocabulary (--sort-by / --metrics)
 ktstr completions bash
 ```
 
@@ -396,7 +415,17 @@ tested for unwind-safety directly.
 **[Guide](https://likewhatevs.github.io/ktstr/guide/)** -- getting started, concepts,
 writing tests, recipes, architecture.
 
+**[ctprof reference](https://likewhatevs.github.io/ktstr/guide/reference/ctprof.html)** --
+metric registry, aggregation rules, taskstats kconfig gating,
+adding-a-metric guide.
+
 **[API docs](https://likewhatevs.github.io/ktstr/api/ktstr/)** -- rustdoc for all workspace crates.
+
+## Contributing
+
+Pull requests welcome. See [CONTRIBUTING.md](CONTRIBUTING.md)
+for the workflow, coding conventions, and how to run the test
+suite locally.
 
 ## License
 

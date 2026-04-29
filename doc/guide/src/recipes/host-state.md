@@ -1,5 +1,14 @@
 # Capture and Compare Host State
 
+> **Disambiguation**: this recipe covers **host context**
+> (kernel build, CPU model, sched_\* tunables, NUMA layout)
+> via `cargo ktstr show-host`. For **per-thread profiling**
+> (scheduling counters, memory / I/O accounting, taskstats
+> delay accounting per thread), see the
+> [ctprof reference](../reference/ctprof.md) and the
+> [Diagnose a Slow Scheduler with ctprof](diagnose-slow-scheduler.md)
+> recipe.
+
 When a gauntlet run passes on one machine and fails on another —
 or passes on Monday and fails on Wednesday — the first thing to
 check is whether the host itself changed. `cargo ktstr show-host`

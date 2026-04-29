@@ -1206,8 +1206,13 @@ semantics.
 ## Install
 
 ```sh
-cargo install --locked ktstr          # installs both ktstr and cargo-ktstr
+cargo install --locked ktstr --bin ktstr --bin cargo-ktstr   # the two user-facing binaries
 ```
+
+The explicit `--bin` flags scope the install to just `ktstr` and
+`cargo-ktstr`; without them, `cargo install` would also place the
+test-fixture binaries (`ktstr-jemalloc-probe`,
+`ktstr-jemalloc-alloc-worker`) on `$PATH`.
 
 Or build from the workspace:
 

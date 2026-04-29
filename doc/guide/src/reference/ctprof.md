@@ -8,13 +8,12 @@ the automated scheduler tests — useful when a run passes on one
 machine and fails on another, or for A/B comparing host behaviour
 across kernel / sysctl / workload changes.
 
-This is a **different tool** from `ktstr show-host` /
-`cargo ktstr show-host`, which captures the host *context*
-(kernel, CPU model, sched_\* tunables, NUMA layout, kernel
-cmdline) — aggregate state that does not change between
-scenarios. The profiler captures *per-thread* cumulative counters
-that do change, and its comparison surface is designed for the
-thread-level diff.
+This is a **different tool** from `cargo ktstr show-host`,
+which captures the host *context* (kernel, CPU model, sched_\*
+tunables, NUMA layout, kernel cmdline) — aggregate state that
+does not change between scenarios. The profiler captures
+*per-thread* cumulative counters that do change, and its
+comparison surface is designed for the thread-level diff.
 
 ## When to use it
 
@@ -49,8 +48,10 @@ extension: `.ctprof.zst`).
 
 - **Identity** — tid, tgid, `pcomm` (process name from
   `/proc/<tgid>/comm`), `comm` (thread name from
-  `/proc/<tid>/comm`), cgroup v2 path, `start_time` in USER_HZ
-  clock ticks, scheduling policy name, nice, CPU affinity mask.
+  `/proc/<tid>/comm`), cgroup v2 path,
+  `start_time_clock_ticks` (from `/proc/<tid>/stat` field 22,
+  in USER_HZ clock ticks), scheduling policy name, nice, CPU
+  affinity mask.
 - **Scheduling counters** (cumulative, from `/proc/<tid>/sched`;
   schedstat fields gated by `CONFIG_SCHEDSTATS`,
   `run_time_ns`/`wait_time_ns`/`timeslices` gated by
@@ -108,13 +109,17 @@ Field families and probe-timing invariance:
   the jemalloc per-thread TSD counters. Sampled twice at
   different instants the value increases monotonically; probe
   attachment time does not alter the reading.
-- **Lifetime high-water peaks**: schedstat `*_max` family
+- **Lifetime extrema**: schedstat `*_max` family
   (`wait_max`, `sleep_max`, `block_max`, `exec_max`,
   `slice_max`), every taskstats `*_delay_max_ns` /
   `*_delay_min_ns`, and the memory watermarks
-  (`hiwater_rss_bytes`, `hiwater_vm_bytes`). These are
-  non-decreasing over time but per-event extrema rather than
-  sums.
+  (`hiwater_rss_bytes`, `hiwater_vm_bytes`). Per-event
+  extrema rather than sums. The `*_max` and `hiwater_*`
+  fields are non-DECREASING over time (kernel keeps the
+  largest); the `*_delay_min_ns` fields are non-INCREASING
+  (kernel keeps the smallest non-zero observation, so
+  sentinel 0 means "no events observed" — compare against
+  the matching `*_count`).
 - **Instantaneous gauges** (sensitive to probe timing):
   `nr_threads` (signal_struct->nr_threads snapshot),
   `fair_slice_ns` (current `p->se.slice`), and `state`
@@ -150,10 +155,27 @@ guarantees inspect the underlying readers directly (they remain
 ### Per-cgroup enrichment
 
 Every cgroup at least one sampled thread resides in gets a
-`CgroupStats` entry: `cpu_usage_usec`, `nr_throttled`,
-`throttled_usec`, `memory_current` — read directly from
-cgroup v2 files (`cpu.stat`, `memory.current`), NOT derived from
-per-thread data, because those are aggregate-over-the-cgroup
+`CgroupStats` entry. Fields nest under per-controller
+sub-structs:
+
+- `cpu: CgroupCpuStats` — `usage_usec`, `nr_throttled`,
+  `throttled_usec` (from `cpu.stat`); `max_quota_us`,
+  `max_period_us` (from `cpu.max`); `weight`, `weight_nice`
+  (from `cpu.weight` / `cpu.weight.nice`).
+- `memory: CgroupMemoryStats` — `current` (from
+  `memory.current`); `max`, `high`, `low`, `min` (from the
+  matching `memory.*` files; `low` and `min` are protection
+  floors, `max` and `high` are limits); `stat` and `events` as
+  flat key-value maps mirroring `memory.stat` and
+  `memory.events`.
+- `pids: CgroupPidsStats` — `current` and `max` from the
+  optional `pids` controller.
+- `psi: Psi` — per-cgroup Pressure Stall Information from
+  `<cgroup>/cpu.pressure` / `memory.pressure` / `io.pressure`
+  / `irq.pressure` (gated on `CONFIG_PSI`).
+
+All fields are read directly from cgroup v2 files, NOT derived
+from per-thread data, because those are aggregate-over-the-cgroup
 values.
 
 ### Snapshot identity
@@ -223,9 +245,12 @@ Per-family kconfig gates and runtime toggles:
 
 Any failed gate or missing cap collapses the affected fields
 to zero. ktstr's capture pipeline emits an info-level tracing
-line per snapshot summarizing taskstats outcomes so an operator
-can distinguish "kernel doesn't expose this" from "all reads
-returned zero."
+line per snapshot summarizing taskstats outcomes AND attaches
+the structured tally to [`CtprofSnapshot::taskstats_summary`]
+(`ok_count` / `eperm_count` / `esrch_count` /
+`other_err_count`), so an operator can distinguish "kernel
+doesn't expose this" from "every tid raced exit" from
+"`CAP_NET_ADMIN` missing" without scraping log lines.
 
 #### Eight delay categories
 
@@ -233,7 +258,7 @@ returned zero."
 |---|---|---|
 | `cpu_delay_*` | `tsk->sched_info.{pcount,run_delay}` via `delayacct_add_tsk` (`kernel/delayacct.c`) | Time waiting on the runqueue. **RACY**: count + total are not updated atomically (lockless `sched_info` path); a concurrent reader may observe one ahead of the other. Captures the same wait-for-CPU bucket as schedstat `wait_*` via a different code path. |
 | `blkio_delay_*` | `delayacct_blkio_start` / `_end` (`kernel/delayacct.c`) | Synchronous block I/O wait. Updates serialize through `task->delays->lock` so count + total are atomic (unlike `cpu_*`). The canonical delay-accounting block-I/O reading; distinct from schedstat `iowait_sum`. |
-| `swapin_delay_*` | `delayacct_swapin_start` / `_end` (`mm/page_io.c`, etc.) | Swap-in wait. **OVERLAPS** with `thrashing_*` — every thrashing event is also a swapin event from the syscall layer; do not sum the two. |
+| `swapin_delay_*` | `delayacct_swapin_start` / `_end` (`include/linux/delayacct.h`) | Swap-in wait. **OVERLAPS** with `thrashing_*` — every thrashing event is also a swapin event from the syscall layer; do not sum the two. |
 | `freepages_delay_*` | `delayacct_freepages_start` / `_end` (`mm/page_alloc.c`) | Direct memory reclaim wait. |
 | `thrashing_delay_*` | `delayacct_thrashing_start` / `_end` (`mm/workingset.c`) | Thrashing wait. Refines swapin tracking — see `swapin_*`. |
 | `compact_delay_*` | `delayacct_compact_start` / `_end` (`mm/compaction.c`) | Memory-compaction wait. |
@@ -265,9 +290,10 @@ shared-mm semantics.
 ktstr ctprof compare before.ctprof.zst after.ctprof.zst
 ```
 
-`compare` joins the two snapshots on `(pcomm, comm)` by default
-and emits one row per `(group, metric)` pair. Groups present on
-only one side surface as **unmatched** — a row is missing
+`compare` joins the two snapshots on `pcomm` (process name) by
+default — see [Grouping](#grouping) for the other axes —
+and emits one row per `(group, metric)` pair. Groups present
+on only one side surface as **unmatched** — a row is missing
 because the process did not exist, not because it did zero work.
 
 ### Grouping
@@ -338,13 +364,18 @@ sub-table and nothing else. `--sections primary` alone keeps
 every primary row; `--metrics run_time_ns` alone keeps the
 single row across every section that displays it.
 
-The `taskstats-delay` section overlaps with `primary` for the
-34 taskstats-sourced rows and with `derived` for the 9
-taskstats-derived rows. `--sections taskstats-delay` renders
-the full taskstats view (the 34 raw rows + 9 derivations)
-without dragging in unrelated primary or derived rows.
-`--sections primary` excludes taskstats from the primary
-table.
+Each metric carries exactly one [`Section`] tag in its
+registry entry — the 34 taskstats-sourced primary rows and
+the 9 taskstats-derived rows tag `Section::TaskstatsDelay`
+rather than `Section::Primary` / `Section::Derived`. They
+render inside the same primary / derived outer tables but
+match a distinct section name, so `--sections taskstats-delay`
+selects exactly the 34 + 9 taskstats rows alone, while
+`--sections primary` excludes them and `--sections derived`
+excludes the 9 taskstats derivations. The three-way split
+lets an operator scope to non-taskstats only, taskstats
+only, or any combination, without losing the visual grouping
+under the same outer headers.
 
 ### Aggregation rules
 
@@ -356,7 +387,9 @@ specific [`metric_types`] newtype (`MonotonicCount`,
 pairs a peak field with a sum reduction (e.g. `t.wait_max`
 ([`PeakNs`]) bound to a `Sum*` rule) fails to compile rather
 than producing a meaningless `1×1s ⊕ 1000×1ms` aggregate. The
-14 variants split into four families:
+14 variants split into five families: Sum reductions, Max
+reductions, Range reductions, Mode reductions, and the
+Affinity reduction.
 
 #### Sum reductions (cumulative counters)
 
@@ -484,7 +517,7 @@ computable" from "computed as zero".
 | `avg_compact_delay_ns` | `compact_delay_total_ns / compact_delay_count` | `compact_delay_total_ns`, `compact_delay_count` | ns | Average memory-compaction wait per event. |
 | `avg_wpcopy_delay_ns` | `wpcopy_delay_total_ns / wpcopy_delay_count` | `wpcopy_delay_total_ns`, `wpcopy_delay_count` | ns | Average write-protect-copy (CoW) fault wait per event. |
 | `avg_irq_delay_ns` | `irq_delay_total_ns / irq_delay_count` | `irq_delay_total_ns`, `irq_delay_count` | ns | Average IRQ-handler window per event. |
-| `total_offcpu_delay_ns` | `cpu + blkio + freepages + compact + wpcopy + irq + max(swapin, thrashing)` | every `*_delay_total_ns` | ns | Sum of every meaningful off-CPU delay-accounting bucket. The swapin/thrashing pair is OR'd with `.max()` rather than summed because the two share syscall-layer events (every thrashing event is also a swapin from the syscall perspective); summing both would double-count thrashing-induced swapins. Returns `-` when any input is missing — `?` propagates `None` when `CONFIG_TASK_DELAY_ACCT` is off, the runtime toggle is off, or the kernel predates a bucket's introduction (e.g. `wpcopy_*` lands in v13, `irq_*` in v14). |
+| `total_offcpu_delay_ns` | `cpu + blkio + freepages + compact + wpcopy + irq + max(swapin, thrashing)` | every `*_delay_total_ns` | ns | Sum of every meaningful off-CPU delay-accounting bucket. The swapin/thrashing pair is OR'd with `.max()` rather than summed because the two share syscall-layer events (every thrashing event is also a swapin from the syscall perspective); summing both would double-count thrashing-induced swapins. When `CONFIG_TASK_DELAY_ACCT` is off, the runtime toggle is off, or the kernel predates a bucket's introduction (e.g. `wpcopy_*` lands in v13, `irq_*` in v14), the missing buckets read zero from the truncated taskstats payload — the rollup degrades to the sum of the populated buckets rather than returning `-`. The structured taskstats outcome lives on [`CtprofSnapshot::taskstats_summary`] for the operator to disambiguate "no data" from "zero data." |
 
 The `is_ratio` column on the registry is load-bearing for the
 renderer: ratio rows skip the `%` column entirely (the absolute
@@ -533,9 +566,19 @@ CtprofSnapshot
 ├── cgroup_stats: BTreeMap<String, CgroupStats>
 ├── probe_summary: Option<CtprofProbeSummary>
 ├── parse_summary: Option<CtprofParseSummary>
+├── taskstats_summary: Option<TaskstatsSummary>
 ├── psi: Psi
 └── sched_ext: Option<SchedExtSysfs>
 ```
+
+`TaskstatsSummary` carries per-snapshot taskstats genetlink
+query outcomes — `ok_count`, `eperm_count`, `esrch_count`,
+`other_err_count` — so an operator can distinguish "no
+taskstats data because every tid raced exit" (high
+`esrch_count`) from "no taskstats data because the kernel was
+built without `CONFIG_TASKSTATS`" (the netlink open failed
+up-front, every counter zero) from "no taskstats data because
+`CAP_NET_ADMIN` is missing" (high `eperm_count`).
 
 `ThreadState::start_time_clock_ticks` is in USER_HZ (100 on
 x86_64 and aarch64), NOT the kernel-internal CONFIG_HZ — so
@@ -576,7 +619,7 @@ aggregation rules are legal in step 3:
 | `GaugeCount` | Instantaneous unitless count that goes up AND down. Example: `nr_threads`. |
 | `ClockTicks` | USER_HZ-scaled time. Examples: `utime_clock_ticks`, `stime_clock_ticks`. |
 | `Bytes` | Byte counts. IEC binary auto-scale ladder. Examples: `read_bytes`, `wchar`. |
-| `OrdinalI32` / `OrdinalU32` / `OrdinalU64` | Bounded scalar — range-aggregated, not summable. Examples: `nice` (i32), `rt_priority` (u32). The `Rangeable::range_across` reduction returns `Option<Range<Self>>` — see `Range<T>` below. |
+| `OrdinalI32` / `OrdinalU32` / `OrdinalU64` | Bounded scalar — range-aggregated, not summable. Examples: `nice` (i32), `rt_priority` (u32). The `Rangeable::range_across` reduction returns `Option<Range<Self>>` — see `Range<T>` below. `OrdinalU64` implements `Rangeable` but is currently unused in the registry; a metric that picks `OrdinalU64` requires adding `AggRule::RangeU64` alongside the existing `RangeI32` and `RangeU32` variants. |
 | `CategoricalString` | Categorical value — mode-aggregated. Examples: `policy`. |
 | `CpuSet` | CPU affinity mask — affinity-aggregated. Example: `cpu_affinity`. |
 | `Range<T>` | Output type of the `Rangeable::range_across` reduction. Carries `min` and `max` of the same `T` with the `min <= max` invariant enforced at construction (`debug_assert!` in `Range::new`). Not stored on `ThreadState` — the `Aggregated::OrdinalRange` boundary unwraps it via `into_tuple()` to a `(i64, i64)` pair widened from the underlying `OrdinalI32` / `OrdinalU32` / `OrdinalU64`. |
@@ -630,15 +673,17 @@ CtprofMetricDef {
 ```
 
 The `name` field is the canonical metric identifier — used by
-`--sort-by`, `--columns`, `--metrics`, and the `metric-list`
-output. Names are ASCII short-form (matching the capture-side
-field name where possible). `sched_class` and `config_gates`
-render as bracketed suffixes in `metric-list` output
-(`[cfs-only]`, `[SCHEDSTATS]`) so operators reading a row know
-which kernels populate the counter. The `section` tag drives
-the `--sections` per-row filter — most rows take
-`Section::Primary`; taskstats-sourced rows take
-`Section::TaskstatsDelay`.
+`--sort-by`, `--metrics`, and the `metric-list` output. (The
+`--columns` flag accepts layout names — `group`, `threads`,
+`metric`, `baseline`, `candidate`, `delta`, `%`, `arrow`,
+`value` — not metric names.) Names are ASCII short-form
+(matching the capture-side field name where possible).
+`sched_class` and `config_gates` render as bracketed suffixes
+in `metric-list` output (`[cfs-only]`, `[SCHEDSTATS]`) so
+operators reading a row know which kernels populate the
+counter. The `section` tag drives the `--sections` per-row
+filter — most rows take `Section::Primary`; taskstats-sourced
+rows take `Section::TaskstatsDelay`.
 
 ### Compile-time guards
 

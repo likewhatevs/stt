@@ -40,9 +40,14 @@ The derive macro generates:
   CLI args, and dependency references.
 - `impl MySchedFlag { pub const LLC: &'static str = "llc"; pub const BORROW: &'static str = "borrow"; ... }`
   -- typed string constants for each variant.
-- `const MY_SCHED: Scheduler` -- a `Scheduler` const derived from the
-  enum name (strip `Flag`/`Flags` suffix, convert to
+- `const MY_SCHED: Scheduler` -- the `Scheduler` const derived from
+  the enum name (strip `Flag`/`Flags` suffix, convert to
   `SCREAMING_SNAKE_CASE`).
+- `const MY_SCHED_PAYLOAD: Payload` -- the `Payload` wrapper around
+  `MY_SCHED`, generated via `Payload::from_scheduler(&MY_SCHED)`.
+  This is what `#[ktstr_test(scheduler = ...)]` accepts: the
+  `scheduler =` attribute takes a path to a `&'static Payload`,
+  not a `Scheduler` directly.
 
 Variant names are converted to kebab-case: `Llc` becomes `"llc"`,
 `RejectPin` becomes `"reject-pin"`.
@@ -56,14 +61,14 @@ and string literals work:
 ```rust,ignore
 // Path expressions -- typos are compile errors
 #[ktstr_test(
-    scheduler = MY_SCHED,
+    scheduler = MY_SCHED_PAYLOAD,
     required_flags = [MySchedFlag::LLC],
     excluded_flags = [MySchedFlag::BORROW],
 )]
 fn needs_llc(ctx: &Ctx) -> Result<AssertResult> { /* ... */ }
 
 // String literals -- also work
-#[ktstr_test(scheduler = MY_SCHED, required_flags = ["llc"])]
+#[ktstr_test(scheduler = MY_SCHED_PAYLOAD, required_flags = ["llc"])]
 fn also_needs_llc(ctx: &Ctx) -> Result<AssertResult> { /* ... */ }
 ```
 

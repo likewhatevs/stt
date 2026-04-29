@@ -5206,11 +5206,12 @@ pub struct CtprofCompareArgs {
     /// non-empty, restricts output to the listed sub-tables —
     /// every section not named is suppressed before its
     /// data-availability gate runs. Valid names: `primary`,
-    /// `derived`, `cgroup-stats`, `cgroup-limits`,
-    /// `memory-stat`, `memory-events`, `pressure`,
-    /// `host-pressure`, `smaps-rollup`, `sched-ext`. Useful for
-    /// narrowing a wide compare to one area of interest.
-    /// Example: `--sections primary,host-pressure`.
+    /// `taskstats-delay`, `derived`, `cgroup-stats`,
+    /// `cgroup-limits`, `memory-stat`, `memory-events`,
+    /// `pressure`, `host-pressure`, `smaps-rollup`,
+    /// `sched-ext`. Useful for narrowing a wide compare to one
+    /// area of interest. Example:
+    /// `--sections primary,host-pressure`.
     #[arg(long, default_value = "", help_heading = "Filter")]
     pub sections: String,
     /// Comma-separated metric names to render. Empty (the

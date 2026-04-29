@@ -41,14 +41,14 @@ overrides in the merge chain.
 
 ```rust,ignore
 #[ktstr_test(
-    scheduler = RELAXED,
+    scheduler = RELAXED_PAYLOAD,
     not_starved = true,
     max_gap_ms = 5000,
     max_imbalance_ratio = 10.0,
     sustained_samples = 10,
 )]
 fn high_imbalance_test(ctx: &Ctx) -> Result<AssertResult> {
-    // Inherits topology from RELAXED
+    // Inherits topology from RELAXED_PAYLOAD
     Ok(AssertResult::pass())
 }
 ```

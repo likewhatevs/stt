@@ -35,14 +35,14 @@ Tests inherit the scheduler's topology. Override with explicit
 ```rust,ignore
 use ktstr::prelude::*;
 
-#[ktstr_test(scheduler = MY_SCHED)]
+#[ktstr_test(scheduler = MY_SCHED_PAYLOAD)]
 fn basic_steady(ctx: &Ctx) -> Result<AssertResult> {
-    // Inherits 1n2l4c1t from MY_SCHED
+    // Inherits 1n2l4c1t from MY_SCHED_PAYLOAD
     scenarios::steady(ctx)
 }
 
 #[ktstr_test(
-    scheduler = MY_SCHED,
+    scheduler = MY_SCHED_PAYLOAD,
     required_flags = [MySchedFlag::LLC],
 )]
 fn llc_aware_test(ctx: &Ctx) -> Result<AssertResult> {

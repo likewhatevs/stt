@@ -31,7 +31,8 @@ follows `sd->parent` pointers up to the root. Each domain level
 provides topology metadata (level, name, flags, span_weight) and
 runtime fields (balance_interval, nr_balance_failed,
 max_newidle_lb_cost) and optional fields (newidle_call,
-newidle_success, newidle_ratio — removed in 6.16). When
+newidle_success, newidle_ratio — added in 7.0, backported to
+6.18.5+ and 6.12.65+; absent on 6.16-6.18.4). When
 `CONFIG_SCHEDSTATS` is also enabled, each
 domain additionally provides load balancing stats: `lb_count`,
 `lb_failed`, `lb_balanced`, `alb_pushed`, `ttwu_wake_remote`, and

@@ -2263,7 +2263,7 @@ fn decompress_capped(bytes: &[u8], max_decompressed: u64) -> anyhow::Result<Vec<
 // ---------------------------------------------------------------
 
 /// Canonical file extension for a serialized snapshot.
-pub const SNAPSHOT_EXTENSION: &str = "hst.zst";
+pub const SNAPSHOT_EXTENSION: &str = "ctprof.zst";
 
 /// Decompressed-size ceiling for [`CtprofSnapshot::load`].
 /// Bounds the allocation a malicious or corrupted zstd payload
@@ -5962,7 +5962,7 @@ mod tests {
     #[test]
     fn snapshot_extension_is_stable() {
         // Guard against accidental rename of the canonical extension.
-        assert_eq!(SNAPSHOT_EXTENSION, "hst.zst");
+        assert_eq!(SNAPSHOT_EXTENSION, "ctprof.zst");
     }
 
     // ------------------------------------------------------------

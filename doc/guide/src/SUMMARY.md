@@ -37,6 +37,7 @@
   - [Investigate a Crash](recipes/investigate-crash.md)
   - [A/B Compare Branches](recipes/ab-compare.md)
   - [Capture and Compare Host State](recipes/host-state.md)
+  - [Diagnose a Slow Scheduler with ctprof](recipes/diagnose-slow-scheduler.md)
   - [Write a Dynamic Scenario](recipes/dynamic-scenario.md)
   - [Customize Checking](recipes/custom-checking.md)
   - [Benchmarking and Negative Tests](recipes/benchmarking-tests.md)

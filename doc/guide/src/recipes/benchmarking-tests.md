@@ -34,7 +34,7 @@ const MY_SCHED: Scheduler = Scheduler::new("my_sched")
     .topology(1, 1, 2, 1);
 
 #[ktstr_test(
-    scheduler = MY_SCHED,
+    scheduler = MY_SCHED_PAYLOAD,
     performance_mode = true,
     duration_s = 3,
     workers_per_cgroup = 2,
@@ -78,7 +78,7 @@ const MY_SCHED: Scheduler = Scheduler::new("my_sched")
     .topology(1, 1, 2, 1);
 
 #[ktstr_test(
-    scheduler = MY_SCHED,
+    scheduler = MY_SCHED_PAYLOAD,
     performance_mode = true,
     duration_s = 5,
     workers_per_cgroup = 4,
@@ -235,7 +235,7 @@ struct BenchDriver;
 // `#[ktstr_test]` attributes and from `ctx.payload(&...)` inside the body.
 
 #[ktstr_test(
-    scheduler = MY_SCHED,
+    scheduler = MY_SCHED_PAYLOAD,
     payload = BENCH_DRIVER,
     duration_s = 5,
 )]
@@ -266,7 +266,7 @@ the `#[ktstr_test]` attribute directly:
 
 ```rust,ignore
 #[ktstr_test(
-    scheduler = MY_SCHED,
+    scheduler = MY_SCHED_PAYLOAD,
     payload = FIO,
     extra_include_files = ["test-fixtures/workload.json"],
 )]
