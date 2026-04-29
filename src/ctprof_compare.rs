@@ -5930,14 +5930,7 @@ pub fn color_diff_cell(
             }
             cell
         }
-        Column::SortBy => {
-            let color = match delta {
-                Some(d) if d > 0.0 => Color::Yellow,
-                Some(d) if d < 0.0 => Color::Magenta,
-                _ => Color::White,
-            };
-            comfy_table::Cell::new(text).fg(color)
-        }
+        Column::SortBy => comfy_table::Cell::new(text).fg(Color::Cyan),
         _ => comfy_table::Cell::new(text),
     }
 }
