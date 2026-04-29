@@ -6128,27 +6128,23 @@ pub fn write_diff<W: fmt::Write>(
                 .collect();
             hier.sort_by(|a, b| a.cgroup.cmp(b.cgroup).then_with(|| a.pcomm.cmp(b.pcomm)));
 
-            // Split each cgroup into path segments for tree rendering.
-            // Track current segments — only emit a heading when a
-            // segment diverges from the previous row.
+            // Single table with separator rows for cgroup headings.
+            // Keeps column widths consistent across the entire view.
             let mut last_segments: Vec<&str> = Vec::new();
             let mut table = display.new_table();
             table.set_header(colored_header(&columns, "pcomm"));
-            let mut table_has_rows = false;
 
-            // Color per depth: green for top, cyan deeper, white deepest.
-            let depth_color = |depth: usize| -> &str {
+            let depth_color = |depth: usize| -> comfy_table::Color {
                 match depth {
-                    0 => "\x1b[1;32m",
-                    1 => "\x1b[36m",
-                    _ => "\x1b[90m",
+                    0 => comfy_table::Color::Green,
+                    1 => comfy_table::Color::Cyan,
+                    _ => comfy_table::Color::DarkGrey,
                 }
             };
 
             for h in &hier {
                 let segments: Vec<&str> = h.cgroup.split('/').filter(|s| !s.is_empty()).collect();
 
-                // Find where current path diverges from last.
                 let common = segments
                     .iter()
                     .zip(last_segments.iter())
@@ -6156,23 +6152,29 @@ pub fn write_diff<W: fmt::Write>(
                     .count();
 
                 if common < last_segments.len() || segments.len() > last_segments.len() {
-                    // Path changed — flush table, emit new headings.
-                    if table_has_rows {
-                        writeln!(w, "{table}")?;
-                        table = display.new_table();
-                        table.set_header(colored_header(&columns, "pcomm"));
-                    }
                     for (depth, seg) in segments.iter().enumerate().skip(common) {
                         let indent = "  ".repeat(depth);
-                        let color = depth_color(depth);
-                        writeln!(w, "{color}{indent}{seg}\x1b[0m")?;
+                        let label = format!("{indent}{seg}");
+                        let heading_cells: Vec<comfy_table::Cell> = columns
+                            .iter()
+                            .map(|c| {
+                                if *c == Column::Group {
+                                    comfy_table::Cell::new(&label)
+                                        .fg(depth_color(depth))
+                                        .add_attribute(comfy_table::Attribute::Bold)
+                                } else {
+                                    comfy_table::Cell::new("")
+                                }
+                            })
+                            .collect();
+                        table.add_row(heading_cells);
                     }
                     last_segments = segments;
                 }
 
                 let mut string_cells = render_diff_row_cells(h.row, &columns);
                 if let Some(pos) = columns.iter().position(|c| *c == Column::Group) {
-                    string_cells[pos] = h.pcomm.to_string();
+                    string_cells[pos] = format!("  {}", h.pcomm);
                 }
                 let cells: Vec<comfy_table::Cell> = string_cells
                     .into_iter()
@@ -6180,11 +6182,8 @@ pub fn write_diff<W: fmt::Write>(
                     .map(|(s, col)| color_diff_cell(s, *col, h.row.delta, h.row.uptime_pct))
                     .collect();
                 table.add_row(cells);
-                table_has_rows = true;
             }
-            if table_has_rows {
-                writeln!(w, "{table}")?;
-            }
+            writeln!(w, "{table}")?;
         } else if group_by == GroupBy::Cgroup {
             // Hierarchical cgroup rendering: group rows by parent
             // path, emit a sub-heading per parent, show only the
