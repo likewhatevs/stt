@@ -4636,7 +4636,7 @@ impl Column {
             Column::Candidate => "candidate",
             Column::Delta => "delta",
             Column::Pct => "%",
-            Column::Arrow => "baseline \u{2192} candidate (delta)",
+            Column::Arrow => "value",
             Column::Value => "value",
         }
     }
@@ -4656,7 +4656,7 @@ fn compare_columns_for(format: DisplayFormat) -> Vec<Column> {
         ],
         DisplayFormat::DeltaOnly => &[Column::Delta, Column::Pct],
         DisplayFormat::NoPct => &[Column::Baseline, Column::Candidate, Column::Delta],
-        DisplayFormat::Arrow => &[Column::Arrow],
+        DisplayFormat::Arrow => &[Column::Arrow, Column::Delta, Column::Pct],
         DisplayFormat::PctOnly => &[Column::Pct],
     };
     cols.extend_from_slice(trailing);
@@ -5209,20 +5209,8 @@ fn format_arrow_cell(
 ) -> String {
     let baseline_cell = format_value_cell(baseline, ladder);
     let candidate_cell = format_value_cell(candidate, ladder);
-    let delta_clause = match delta {
-        Some(d) => format_delta_cell(d, ladder),
-        None => match (baseline, candidate) {
-            (Aggregated::Mode { value: a, .. }, Aggregated::Mode { value: b, .. }) => {
-                if a == b {
-                    "same".to_string()
-                } else {
-                    "differs".to_string()
-                }
-            }
-            _ => "-".to_string(),
-        },
-    };
-    format!("{baseline_cell} \u{2192} {candidate_cell} ({delta_clause})")
+    let _ = delta;
+    format!("{baseline_cell} \u{2192} {candidate_cell}")
 }
 
 /// Format the arrow cell for derived rows. Same shape as
@@ -5239,11 +5227,7 @@ fn format_arrow_cell_derived(row: &DerivedRow) -> String {
         Some(v) => format_derived_value_cell(v, row.metric_ladder, row.is_ratio),
         None => "-".to_string(),
     };
-    let delta_clause = match row.delta {
-        Some(d) => format_derived_delta_cell(d, row.metric_ladder, row.is_ratio),
-        None => "-".to_string(),
-    };
-    format!("{baseline_cell} \u{2192} {candidate_cell} ({delta_clause})")
+    format!("{baseline_cell} \u{2192} {candidate_cell}")
 }
 
 /// Helper: shared threads-cell rendering — the `N` form when
@@ -5453,7 +5437,7 @@ pub struct CtprofCompareArgs {
     /// single cell; `pct-only` keeps just the percentage.
     /// `--columns` (below) overrides the format's default
     /// column set when both are present.
-    #[arg(long, value_enum, default_value_t = DisplayFormat::Full, help_heading = "Display")]
+    #[arg(long, value_enum, default_value_t = DisplayFormat::Arrow, help_heading = "Display")]
     pub display_format: DisplayFormat,
     /// Comma-separated column names to render. Empty (the
     /// default) means "use the column set selected by
@@ -6444,14 +6428,7 @@ pub fn write_diff<W: fmt::Write>(
             writeln!(w)?;
             writeln!(w, "## smaps_rollup")?;
             let mut st = display.new_table();
-            st.set_header(vec![
-                "process",
-                "key",
-                "baseline",
-                "candidate",
-                "delta",
-                "%",
-            ]);
+            st.set_header(vec!["process", "key", "value", "delta", "%"]);
             for pkey in &sorted_process_keys {
                 let a = diff.smaps_rollup_a.get(*pkey);
                 let b = diff.smaps_rollup_b.get(*pkey);
@@ -6466,21 +6443,22 @@ pub fn write_diff<W: fmt::Write>(
                     if av == bv {
                         continue;
                     }
+                    let a_cell = av
+                        .map(|v| format_scaled_u64(v, ScaleLadder::Bytes))
+                        .unwrap_or_else(|| "-".to_string());
+                    let b_cell = bv
+                        .map(|v| format_scaled_u64(v, ScaleLadder::Bytes))
+                        .unwrap_or_else(|| "-".to_string());
+                    let value_cell = format!("{a_cell} \u{2192} {b_cell}");
                     let a_val = av.unwrap_or(0);
                     let b_val = bv.unwrap_or(0);
-                    let baseline_cell = av
-                        .map(|v| format_scaled_u64(v, ScaleLadder::Bytes))
-                        .unwrap_or_else(|| "-".to_string());
-                    let candidate_cell = bv
-                        .map(|v| format_scaled_u64(v, ScaleLadder::Bytes))
-                        .unwrap_or_else(|| "-".to_string());
                     let delta = b_val as i128 - a_val as i128;
                     let delta_cell = if av.is_none() || bv.is_none() {
                         "-".to_string()
                     } else {
                         format_delta_cell(delta as f64, ScaleLadder::Bytes)
                     };
-                    let pct_cell = if a_val == 0 {
+                    let pct_cell = if a_val == 0 || av.is_none() || bv.is_none() {
                         "-".to_string()
                     } else {
                         let pct = (delta as f64 / a_val as f64) * 100.0;
@@ -6489,8 +6467,7 @@ pub fn write_diff<W: fmt::Write>(
                     st.add_row(vec![
                         pkey.to_string(),
                         sk.clone(),
-                        baseline_cell,
-                        candidate_cell,
+                        value_cell,
                         delta_cell,
                         pct_cell,
                     ]);
