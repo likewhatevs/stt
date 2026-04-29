@@ -5649,6 +5649,26 @@ impl DisplayOptions {
             crate::cli::new_table()
         }
     }
+
+    /// Create a table constrained to the given max content widths.
+    /// Heading rows wider than data get auto-truncated by comfy_table
+    /// with its built-in "..." indicator.
+    pub fn new_constrained_table(&self, max_widths: &[u16]) -> comfy_table::Table {
+        let mut t = self.new_table();
+        t.set_content_arrangement(comfy_table::ContentArrangement::Dynamic);
+        let total: u16 = max_widths.iter().sum::<u16>()
+            + (max_widths.len() as u16 * 2)  // padding
+            + 10; // slack
+        t.set_width(total);
+        for (i, &w) in max_widths.iter().enumerate() {
+            if let Some(col) = t.column_mut(i) {
+                col.set_constraint(comfy_table::ColumnConstraint::UpperBoundary(
+                    comfy_table::Width::Fixed(w),
+                ));
+            }
+        }
+        t
+    }
 }
 
 /// Format the arrow cell `<baseline> -> <candidate> (<delta>)`
@@ -6520,11 +6540,25 @@ pub fn write_diff<W: fmt::Write>(
                     })
             });
 
-            // Single table with separator rows for cgroup headings.
+            // Two-pass: first measure data-only widths, then build
+            // the real table with heading rows constrained to those
+            // widths so headings can't inflate columns.
             writeln!(w, "## Primary metrics")?;
+            let max_widths = {
+                let mut measure = display.new_table();
+                measure.set_header(colored_header(&columns, "comm"));
+                for h in &hier {
+                    let mut cells = render_diff_row_cells(h.row, &columns);
+                    if let Some(pos) = columns.iter().position(|c| *c == Column::Group) {
+                        cells[pos] = h.comm.to_string();
+                    }
+                    measure.add_row(cells);
+                }
+                measure.column_max_content_widths()
+            };
             let mut last_segments: Vec<&str> = Vec::new();
             let mut last_pcomm = "";
-            let mut table = display.new_table();
+            let mut table = display.new_constrained_table(&max_widths);
             table.set_header(colored_header(&columns, "comm"));
 
             let depth_color = |depth: usize| -> comfy_table::Color {
