@@ -2614,24 +2614,15 @@ pub fn compare(
         (GroupBy::Comm, false) => Some(pattern_counts_union(baseline, candidate, |t| {
             t.comm.as_str()
         })),
-        (GroupBy::Pcomm, false) => Some(pattern_counts_union(baseline, candidate, |t| {
-            t.pcomm.as_str()
-        })),
+        (GroupBy::Pcomm | GroupBy::All, false) => {
+            Some(pattern_counts_union(baseline, candidate, |t| {
+                t.pcomm.as_str()
+            }))
+        }
         _ => None,
     };
-    // For `GroupBy::Cgroup`, the Layer-3 tighten step needs to see
-    // every path that contributes to a Layer-2 skeleton group.
-    // Build a key_map (post-flatten path → final tightened key)
-    // from the union of baseline + candidate thread cgroup paths +
-    // baseline + candidate cgroup_stats keys. The same map keys
-    // both thread-grouping and the cgroup_stats enrichment table
-    // so the two render against identical labels.
-    //
-    // Skipped when `no_cg_normalize` is set — under literal
-    // grouping, the post-flatten path IS the key (no L1/L2/L3
-    // substitution).
     let cgroup_key_map: Option<BTreeMap<String, String>> =
-        if group_by == GroupBy::Cgroup && !opts.no_cg_normalize {
+        if matches!(group_by, GroupBy::Cgroup | GroupBy::All) && !opts.no_cg_normalize {
             Some(build_cgroup_key_map(baseline, candidate, &flatten))
         } else {
             None
@@ -3375,7 +3366,7 @@ pub fn build_groups(
     // meaningless once each thread groups by its literal name.
     let pattern_field: Option<fn(&ThreadState) -> &str> = match (group_by, no_thread_normalize) {
         (GroupBy::Comm, false) => Some(|t: &ThreadState| t.comm.as_str()),
-        (GroupBy::Pcomm, false) => Some(|t: &ThreadState| t.pcomm.as_str()),
+        (GroupBy::Pcomm | GroupBy::All, false) => Some(|t: &ThreadState| t.pcomm.as_str()),
         _ => None,
     };
     let local_counts: Option<BTreeMap<String, usize>> = match (pattern_field, pattern_counts) {
@@ -3393,7 +3384,27 @@ pub fn build_groups(
     let mut buckets: BTreeMap<String, Vec<&ThreadState>> = BTreeMap::new();
     for t in &snap.threads {
         let key = match group_by {
-            GroupBy::All => unreachable!("All is decomposed before build_groups"),
+            GroupBy::All => {
+                let cg = flatten_cgroup_path(&t.cgroup, flatten);
+                let cg_key = match cgroup_key_map.and_then(|m| m.get(&cg)) {
+                    Some(k) => k.clone(),
+                    None => cg,
+                };
+                let pcomm_key = match pattern_field {
+                    Some(field) => {
+                        let name = field(t);
+                        let pk = pattern_key(name);
+                        let counts = counts_ref.expect("pattern_counts seeded for All");
+                        if counts.get(&pk).copied().unwrap_or(0) >= 2 {
+                            pk
+                        } else {
+                            name.to_string()
+                        }
+                    }
+                    None => t.pcomm.clone(),
+                };
+                format!("{cg_key}\x00{pcomm_key}")
+            }
             // Pcomm and Comm share the same shape: when
             // normalization is enabled, route the chosen field
             // through `pattern_key` and revert singletons to the
@@ -5691,67 +5702,21 @@ pub fn run_compare(args: &CtprofCompareArgs) -> anyhow::Result<i32> {
         section_line_limit: args.limit,
     };
 
-    if args.group_by == GroupBy::All {
-        // Default: pcomm as primary grouping, cgroup as sub-grouping.
-        // Run compare with Pcomm, then render with cgroup sub-headings
-        // by cross-referencing each group's threads against their cgroups.
-        // Also show a separate comm-grouped section below.
-        let pcomm_opts = CompareOptions {
-            group_by: GroupBy::Pcomm.into(),
-            cgroup_flatten: args.cgroup_flatten.clone(),
-            no_thread_normalize: args.no_thread_normalize,
-            no_cg_normalize: args.no_cg_normalize,
-            sort_by: sort_by.clone(),
-        };
-        let pcomm_diff = compare(&baseline, &candidate, &pcomm_opts);
-        // Render pcomm view with cgroup sub-headings.
-        // For now, use the standard pcomm rendering — the cgroup
-        // sub-heading integration is a future enhancement.
-        print_diff(
-            &pcomm_diff,
-            &args.baseline,
-            &args.candidate,
-            GroupBy::Pcomm,
-            &display,
-        );
-
-        println!();
-        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-        println!();
-        println!("# --group-by comm");
-        println!();
-        let comm_opts = CompareOptions {
-            group_by: GroupBy::Comm.into(),
-            cgroup_flatten: args.cgroup_flatten.clone(),
-            no_thread_normalize: args.no_thread_normalize,
-            no_cg_normalize: args.no_cg_normalize,
-            sort_by: sort_by.clone(),
-        };
-        let comm_diff = compare(&baseline, &candidate, &comm_opts);
-        print_diff(
-            &comm_diff,
-            &args.baseline,
-            &args.candidate,
-            GroupBy::Comm,
-            &display,
-        );
-    } else {
-        let opts = CompareOptions {
-            group_by: args.group_by.into(),
-            cgroup_flatten: args.cgroup_flatten.clone(),
-            no_thread_normalize: args.no_thread_normalize,
-            no_cg_normalize: args.no_cg_normalize,
-            sort_by: sort_by.clone(),
-        };
-        let diff = compare(&baseline, &candidate, &opts);
-        print_diff(
-            &diff,
-            &args.baseline,
-            &args.candidate,
-            args.group_by,
-            &display,
-        );
-    }
+    let opts = CompareOptions {
+        group_by: args.group_by.into(),
+        cgroup_flatten: args.cgroup_flatten.clone(),
+        no_thread_normalize: args.no_thread_normalize,
+        no_cg_normalize: args.no_cg_normalize,
+        sort_by,
+    };
+    let diff = compare(&baseline, &candidate, &opts);
+    print_diff(
+        &diff,
+        &args.baseline,
+        &args.candidate,
+        args.group_by,
+        &display,
+    );
     Ok(0)
 }
 
@@ -6098,7 +6063,7 @@ pub fn write_diff<W: fmt::Write>(
         GroupBy::Cgroup => "cgroup",
         GroupBy::Comm => "comm-pattern",
         GroupBy::CommExact => "comm",
-        GroupBy::All => unreachable!("All is decomposed before write_diff"),
+        GroupBy::All => "pcomm",
     };
 
     let columns = display.resolved_compare_columns();
@@ -6131,7 +6096,73 @@ pub fn write_diff<W: fmt::Write>(
             })
             .collect();
 
-        if group_by == GroupBy::Cgroup {
+        if group_by == GroupBy::All {
+            // Hierarchical: cgroup path → pcomm → metrics.
+            // Compound keys are `cgroup\x00pcomm`.
+            struct HierRow<'a> {
+                cgroup: &'a str,
+                pcomm: &'a str,
+                row: &'a DiffRow,
+            }
+            let mut hier: Vec<HierRow<'_>> = primary_rows
+                .iter()
+                .map(|row| {
+                    let (cgroup, pcomm) = row
+                        .group_key
+                        .split_once('\x00')
+                        .unwrap_or(("", &row.group_key));
+                    HierRow { cgroup, pcomm, row }
+                })
+                .collect();
+            hier.sort_by(|a, b| a.cgroup.cmp(b.cgroup).then_with(|| a.pcomm.cmp(b.pcomm)));
+
+            let mut last_cg_parent = "";
+            let mut last_cg_leaf = "";
+            let mut table = display.new_table();
+            table.set_header(colored_header(&columns, "pcomm"));
+            let mut table_has_rows = false;
+
+            for h in &hier {
+                let (cg_parent, cg_leaf) = cgroup_parent_leaf(h.cgroup);
+
+                if cg_parent != last_cg_parent {
+                    if table_has_rows {
+                        writeln!(w, "{table}")?;
+                        table = display.new_table();
+                        table.set_header(colored_header(&columns, "pcomm"));
+                        table_has_rows = false;
+                    }
+                    writeln!(w)?;
+                    writeln!(w, "\x1b[1;32m## {}\x1b[0m", cg_parent)?;
+                    last_cg_parent = cg_parent;
+                    last_cg_leaf = "";
+                }
+                if cg_leaf != last_cg_leaf {
+                    if table_has_rows {
+                        writeln!(w, "{table}")?;
+                        table = display.new_table();
+                        table.set_header(colored_header(&columns, "pcomm"));
+                    }
+                    writeln!(w, "\x1b[36m  {cg_leaf}\x1b[0m")?;
+                    last_cg_leaf = cg_leaf;
+                }
+
+                let mut string_cells = render_diff_row_cells(h.row, &columns);
+                if let Some(pos) = columns.iter().position(|c| *c == Column::Group) {
+                    string_cells[pos] = h.pcomm.to_string();
+                }
+                let cells: Vec<comfy_table::Cell> = string_cells
+                    .into_iter()
+                    .zip(columns.iter())
+                    .map(|(s, col)| color_diff_cell(s, *col, h.row.delta, h.row.uptime_pct))
+                    .collect();
+                table.add_row(cells);
+                table_has_rows = true;
+            }
+            if table_has_rows {
+                writeln!(w, "{table}")?;
+            }
+        } else if group_by == GroupBy::Cgroup {
             // Hierarchical cgroup rendering: group rows by parent
             // path, emit a sub-heading per parent, show only the
             // leaf segment in the group column.
