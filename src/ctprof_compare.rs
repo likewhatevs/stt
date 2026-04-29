@@ -6463,6 +6463,31 @@ pub fn write_diff<W: fmt::Write>(
     };
 
     let columns = display.resolved_compare_columns();
+
+    // Compute column widths from ALL data rows (primary + derived)
+    // so every table in every section shares the same widths.
+    // Heading rows are constrained to these widths via
+    // new_constrained_table so they can't inflate columns.
+    let global_max_widths: Vec<u16> = if group_by == GroupBy::All {
+        let mut measure = display.new_table();
+        measure.set_header(colored_header(&columns, group_header));
+        for row in &diff.rows {
+            let mut cells = render_diff_row_cells(row, &columns);
+            if let Some(pos) = columns.iter().position(|c| *c == Column::Group) {
+                let comm = row.group_key.splitn(3, '\x00').nth(2).unwrap_or("");
+                cells[pos] = comm.to_string();
+            }
+            measure.add_row(cells);
+        }
+        for row in &diff.derived_rows {
+            let cells = render_derived_row_cells(row, &columns);
+            measure.add_row(cells);
+        }
+        measure.column_max_content_widths()
+    } else {
+        Vec::new()
+    };
+
     // The primary table renders rows whose metric.section is
     // enabled. Two sections share the table:
     //   - Section::Primary: the 52 non-taskstats rows.
@@ -6544,21 +6569,9 @@ pub fn write_diff<W: fmt::Write>(
             // the real table with heading rows constrained to those
             // widths so headings can't inflate columns.
             writeln!(w, "## Primary metrics")?;
-            let max_widths = {
-                let mut measure = display.new_table();
-                measure.set_header(colored_header(&columns, "comm"));
-                for h in &hier {
-                    let mut cells = render_diff_row_cells(h.row, &columns);
-                    if let Some(pos) = columns.iter().position(|c| *c == Column::Group) {
-                        cells[pos] = h.comm.to_string();
-                    }
-                    measure.add_row(cells);
-                }
-                measure.column_max_content_widths()
-            };
             let mut last_segments: Vec<&str> = Vec::new();
             let mut last_pcomm = "";
-            let mut table = display.new_constrained_table(&max_widths);
+            let mut table = display.new_constrained_table(&global_max_widths);
             table.set_header(colored_header(&columns, "comm"));
 
             let depth_color = |depth: usize| -> comfy_table::Color {
@@ -6770,7 +6783,7 @@ pub fn write_diff<W: fmt::Write>(
 
             writeln!(w)?;
             writeln!(w, "## Derived metrics")?;
-            let mut dt = display.new_table();
+            let mut dt = display.new_constrained_table(&global_max_widths);
             dt.set_header(colored_header(&columns, "comm"));
             let mut last_segs: Vec<&str> = Vec::new();
             let mut last_pc = "";
@@ -6951,7 +6964,7 @@ pub fn write_diff<W: fmt::Write>(
         if any_delta {
             writeln!(w)?;
             writeln!(w, "## smaps_rollup")?;
-            let mut st = display.new_table();
+            let mut st = display.new_constrained_table(&global_max_widths);
             st.set_header(colored_header(&columns, "pcomm"));
 
             // For All mode, re-sort by cgroup hierarchy (keys are
