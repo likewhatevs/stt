@@ -6480,7 +6480,11 @@ pub fn write_diff<W: fmt::Write>(
             measure.add_row(cells);
         }
         for row in &diff.derived_rows {
-            let cells = render_derived_row_cells(row, &columns);
+            let mut cells = render_derived_row_cells(row, &columns);
+            if let Some(pos) = columns.iter().position(|c| *c == Column::Group) {
+                let comm = row.group_key.splitn(3, '\x00').nth(2).unwrap_or("");
+                cells[pos] = comm.to_string();
+            }
             measure.add_row(cells);
         }
         measure.column_max_content_widths()
