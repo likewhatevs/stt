@@ -278,8 +278,75 @@ pub fn init_shm_ptr(base: *mut u8, size: usize) {
     let _ = SHM_PTR.set(ShmPtr { ptr: base, size });
 }
 
-/// Guest-side: write a TLV message to the SHM ring using the cached
-/// mmap pointer. No-op if SHM is not initialized.
+/// Detect whether the current process is running inside a ktstr guest
+/// VM, by looking for `KTSTR_SHM_BASE`/`KTSTR_SHM_SIZE` on
+/// `/proc/cmdline`.
+///
+/// PID is NOT a reliable signal: the guest test code runs as forked
+/// children of init (PID 1), not as PID 1 itself. The guest kernel
+/// command line, populated by the host VMM, is the unique fingerprint.
+///
+/// The result is cached in a `OnceLock` — `/proc/cmdline` is read at
+/// most once per process. False on the host (no cmdline match) and
+/// false on any non-Linux platform that lacks `/proc/cmdline` (read
+/// fails).
+pub fn is_guest() -> bool {
+    #[cfg(test)]
+    {
+        // Test-only override: tests run on the host but need to
+        // exercise the guest-only path (write_msg). The override is
+        // thread-local so parallel tests don't fight over it.
+        if let Some(v) = IS_GUEST_TEST_OVERRIDE.with(|c| c.get()) {
+            return v;
+        }
+    }
+    static IS_GUEST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *IS_GUEST.get_or_init(|| {
+        std::fs::read_to_string("/proc/cmdline")
+            .ok()
+            .and_then(|c| parse_shm_params_from_str(&c))
+            .is_some()
+    })
+}
+
+// Test-only thread-local override for `is_guest`. `None` means
+// "consult /proc/cmdline"; `Some(b)` pins the result for the
+// current thread. Per-thread so parallel tests cannot interfere.
+#[cfg(test)]
+thread_local! {
+    static IS_GUEST_TEST_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// RAII guard that overrides [`is_guest`] for the duration of its
+/// scope on the current thread, and restores the previous value on
+/// drop. Avoids leaking override state across tests sharing a thread
+/// (e.g. via test-runner thread pools).
+#[cfg(test)]
+struct IsGuestOverrideGuard {
+    prev: Option<bool>,
+}
+
+#[cfg(test)]
+impl IsGuestOverrideGuard {
+    fn new(value: bool) -> Self {
+        let prev = IS_GUEST_TEST_OVERRIDE.with(|c| c.replace(Some(value)));
+        Self { prev }
+    }
+}
+
+#[cfg(test)]
+impl Drop for IsGuestOverrideGuard {
+    fn drop(&mut self) {
+        let prev = self.prev;
+        IS_GUEST_TEST_OVERRIDE.with(|c| c.set(prev));
+    }
+}
+
+/// Guest-only. Host-side code must use `GuestMem::write_*` instead.
+///
+/// Write a TLV message to the SHM ring using the cached mmap pointer.
+/// No-op (with a tracing warning) if invoked from a host context, and a
+/// silent no-op if SHM is not yet initialized inside the guest.
 ///
 /// Acquires `SHM_WRITE_LOCK` to serialize against concurrent writers
 /// (sched-exit-mon thread and step executor). Operates on the raw
@@ -289,6 +356,13 @@ pub fn init_shm_ptr(base: *mut u8, size: usize) {
 /// would alias the host's `&` view and violate Rust's reference
 /// rules, even though the lock serializes guest-side writers.
 pub fn write_msg(msg_type: u32, payload: &[u8]) {
+    if !is_guest() {
+        tracing::warn!(
+            msg_type = msg_type,
+            "shm_ring::write_msg called from host context; use GuestMem::write_* instead"
+        );
+        return;
+    }
     let Ok((ptr, size)) = shm_ptr() else { return };
     // Safe to re-enter: write_ptr advances only after header + payload
     // land, so a mid-write panic cannot corrupt committed messages.
@@ -298,13 +372,23 @@ pub fn write_msg(msg_type: u32, payload: &[u8]) {
     unsafe { shm_write_raw(ptr, size, msg_type, payload) };
 }
 
-/// Guest-side: try to write a TLV message without blocking.
+/// Guest-only. Host-side code must use `GuestMem::write_*` instead.
+///
+/// Try to write a TLV message without blocking.
 ///
 /// Uses `try_lock()` on `SHM_WRITE_LOCK`. If the lock is held (e.g.,
 /// the panic occurred on the thread that holds it), silently returns
-/// false so the caller can fall back to serial. No-op if SHM is not
-/// initialized.
+/// false so the caller can fall back to serial. Returns false (with
+/// a tracing warning) if invoked from a host context, and false (no
+/// log) if SHM is not yet initialized inside the guest.
 pub fn write_msg_nonblocking(msg_type: u32, payload: &[u8]) -> bool {
+    if !is_guest() {
+        tracing::warn!(
+            msg_type = msg_type,
+            "shm_ring::write_msg_nonblocking called from host context; use GuestMem::write_* instead"
+        );
+        return false;
+    }
     let Ok((ptr, size)) = shm_ptr() else {
         return false;
     };
@@ -2292,5 +2376,211 @@ mod tests {
         let result = shm_drain(&buf, 0);
         assert_eq!(result.entries.len(), 1);
         assert_eq!(result.entries[0].payload, payload);
+    }
+
+    // ---- IS_GUEST guard + write_msg round-trip ---------------------
+    //
+    // `write_msg` and `write_msg_nonblocking` are guest-only entry
+    // points. The `is_guest()` guard rejects host-context invocations
+    // before `shm_ptr()` would silently no-op anyway — distinguishing
+    // a coding mistake (host caller) from a benign early-boot race
+    // (guest caller before SHM init) at the call site.
+    //
+    // Two test fixtures pin the guard's behavior:
+    //   1. host-context — `IsGuestOverrideGuard::new(false)` forces
+    //      `is_guest() == false`. `write_msg_nonblocking` must return
+    //      false; the global `SHM_PTR` must remain whatever it was.
+    //   2. guest-context round-trip — `IsGuestOverrideGuard::new(true)`
+    //      forces `is_guest() == true`, then a leaked, mutex-guarded
+    //      ring buffer is wired into `SHM_PTR` (or used directly) and
+    //      the message is round-tripped back via `shm_drain`.
+
+    /// Test-only: serialize tests that depend on the global
+    /// `SHM_PTR`. The OnceLock can only be initialized once, so all
+    /// tests touching it share a single leaked buffer; the mutex
+    /// ensures one test at a time observes a deterministic ring
+    /// state.
+    static SHM_PTR_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Test-only: leak a fresh ring buffer and install it into the
+    /// global `SHM_PTR`. Idempotent — if `SHM_PTR` is already set
+    /// (e.g. installed by an earlier test), the existing pointer is
+    /// returned unchanged. Caller holds `SHM_PTR_TEST_LOCK` for the
+    /// duration of the test to prevent interleaved writes.
+    fn ensure_test_shm_ptr(shm_size: usize) -> (*mut u8, usize) {
+        // Leak the buffer so it outlives the OnceLock for the
+        // duration of the process — `init_shm_ptr` stores the raw
+        // pointer indefinitely.
+        let buf: Box<[u8]> = vec![0u8; shm_size].into_boxed_slice();
+        let len = buf.len();
+        let ptr = Box::leak(buf).as_mut_ptr();
+        // `init_shm_ptr` is a no-op if SHM_PTR is already set, so
+        // subsequent calls in the same process re-use the original
+        // installed buffer. We never free leaked buffers.
+        init_shm_ptr(ptr, len);
+        let p = SHM_PTR.get().expect("SHM_PTR set above");
+        (p.ptr, p.size)
+    }
+
+    #[test]
+    fn is_guest_override_round_trips_through_thread_local() {
+        // The override is a fixture for write_msg tests. Verify
+        // that toggling it from false -> true -> back works on the
+        // current thread, and that drop restores the previous
+        // value. No process-global state is mutated.
+        // Initial (no override): on the host, is_guest() reads
+        // /proc/cmdline. We don't assert its value (test env may
+        // vary); we only verify that overrides take effect.
+        {
+            let _g = IsGuestOverrideGuard::new(false);
+            assert!(!is_guest());
+        }
+        {
+            let _g = IsGuestOverrideGuard::new(true);
+            assert!(is_guest());
+        }
+        // After dropping both guards, override is None. The
+        // OnceLock-backed default is consulted; we don't assert
+        // its value here since the test env's /proc/cmdline is
+        // not under our control.
+    }
+
+    #[test]
+    fn is_guest_override_guards_nest_correctly() {
+        // Outer guard sets true; inner guard overrides to false;
+        // dropping inner restores true; dropping outer restores
+        // None. Ensures tests that nest contexts don't leak.
+        let _outer = IsGuestOverrideGuard::new(true);
+        assert!(is_guest());
+        {
+            let _inner = IsGuestOverrideGuard::new(false);
+            assert!(!is_guest());
+        }
+        // Inner dropped — outer's value is restored.
+        assert!(is_guest());
+    }
+
+    #[test]
+    fn write_msg_nonblocking_rejects_host_context() {
+        // With is_guest() forced false, write_msg_nonblocking must
+        // return false WITHOUT touching SHM_PTR or attempting any
+        // shm_write_raw work. Without the guard, the function
+        // would still return false (because shm_ptr() fails on
+        // host), but it would try to read /proc/cmdline first;
+        // the guard short-circuits that.
+        let _guard = IsGuestOverrideGuard::new(false);
+        let result = write_msg_nonblocking(MSG_TYPE_STIMULUS, b"should-not-write");
+        assert!(
+            !result,
+            "write_msg_nonblocking from host context must return false"
+        );
+    }
+
+    #[test]
+    fn write_msg_does_not_panic_from_host_context() {
+        // write_msg returns (); the only externally observable
+        // signal of the guard is the absence of a panic and the
+        // absence of any modification to a SHM region we did not
+        // wire up. Verify it returns cleanly.
+        let _guard = IsGuestOverrideGuard::new(false);
+        write_msg(MSG_TYPE_STIMULUS, b"should-not-write");
+        // No panic — pass.
+    }
+
+    #[test]
+    fn write_msg_nonblocking_accepts_guest_context_and_round_trips() {
+        // With is_guest() forced true and SHM_PTR wired to a
+        // freshly-initialized ring, write_msg_nonblocking must
+        // return true and the message must be drainable via
+        // shm_drain (the slice-based reader).
+        let _ptr_lock = SHM_PTR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guest = IsGuestOverrideGuard::new(true);
+        let shm_size = 1024usize;
+        let (ptr, size) = ensure_test_shm_ptr(shm_size);
+        // Re-init the leaked buffer for this test: clear and
+        // initialize the header. Subsequent tests will repeat.
+        // SAFETY: lock held; no other test touches this buffer
+        // while we hold the mutex.
+        unsafe {
+            std::ptr::write_bytes(ptr, 0, size);
+        }
+        let buf_slice = unsafe { std::slice::from_raw_parts_mut(ptr, size) };
+        shm_init(buf_slice, 0, size);
+
+        let payload = b"guest-context round-trip";
+        let ok = write_msg_nonblocking(MSG_TYPE_TEST_RESULT, payload);
+        assert!(ok, "write_msg_nonblocking from guest context must succeed");
+
+        // Drain via the slice reader. We borrow the leaked buffer
+        // immutably; the mutex serializes all SHM_PTR-touching
+        // tests so no concurrent writer aliases this view.
+        let buf_slice_ro = unsafe { std::slice::from_raw_parts(ptr, size) };
+        let result = shm_drain(buf_slice_ro, 0);
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.entries[0].msg_type, MSG_TYPE_TEST_RESULT);
+        assert_eq!(result.entries[0].payload, payload);
+        assert!(result.entries[0].crc_ok);
+    }
+
+    #[test]
+    fn write_msg_accepts_guest_context_and_round_trips() {
+        // Mirror of the nonblocking test for the blocking
+        // `write_msg` entry point. write_msg returns (); its
+        // success is observable only via the resulting ring state.
+        let _ptr_lock = SHM_PTR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guest = IsGuestOverrideGuard::new(true);
+        let shm_size = 1024usize;
+        let (ptr, size) = ensure_test_shm_ptr(shm_size);
+        // SAFETY: see write_msg_nonblocking_accepts_guest_context_and_round_trips.
+        unsafe {
+            std::ptr::write_bytes(ptr, 0, size);
+        }
+        let buf_slice = unsafe { std::slice::from_raw_parts_mut(ptr, size) };
+        shm_init(buf_slice, 0, size);
+
+        let payload = b"blocking round-trip";
+        write_msg(MSG_TYPE_PAYLOAD_METRICS, payload);
+
+        let buf_slice_ro = unsafe { std::slice::from_raw_parts(ptr, size) };
+        let result = shm_drain(buf_slice_ro, 0);
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.entries[0].msg_type, MSG_TYPE_PAYLOAD_METRICS);
+        assert_eq!(result.entries[0].payload, payload);
+        assert!(result.entries[0].crc_ok);
+    }
+
+    #[test]
+    fn write_msg_round_trips_multiple_messages_in_guest_context() {
+        // Three consecutive write_msg calls from guest context
+        // must all land in the ring in order. Pins the SHM_PTR-
+        // backed write path against the multi-write semantics
+        // already verified for shm_write_raw.
+        let _ptr_lock = SHM_PTR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guest = IsGuestOverrideGuard::new(true);
+        let shm_size = 1024usize;
+        let (ptr, size) = ensure_test_shm_ptr(shm_size);
+        // SAFETY: see write_msg_nonblocking_accepts_guest_context_and_round_trips.
+        unsafe {
+            std::ptr::write_bytes(ptr, 0, size);
+        }
+        let buf_slice = unsafe { std::slice::from_raw_parts_mut(ptr, size) };
+        shm_init(buf_slice, 0, size);
+
+        write_msg(MSG_TYPE_SCENARIO_START, b"start");
+        write_msg(MSG_TYPE_STIMULUS, b"middle");
+        write_msg(MSG_TYPE_SCENARIO_END, b"end");
+
+        let buf_slice_ro = unsafe { std::slice::from_raw_parts(ptr, size) };
+        let result = shm_drain(buf_slice_ro, 0);
+        assert_eq!(result.entries.len(), 3);
+        assert_eq!(result.entries[0].msg_type, MSG_TYPE_SCENARIO_START);
+        assert_eq!(result.entries[0].payload, b"start");
+        assert_eq!(result.entries[1].msg_type, MSG_TYPE_STIMULUS);
+        assert_eq!(result.entries[1].payload, b"middle");
+        assert_eq!(result.entries[2].msg_type, MSG_TYPE_SCENARIO_END);
+        assert_eq!(result.entries[2].payload, b"end");
+        for e in &result.entries {
+            assert!(e.crc_ok);
+        }
     }
 }

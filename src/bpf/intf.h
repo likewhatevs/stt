@@ -64,11 +64,14 @@ struct func_meta {
 
 /* Event type for ring buffer. */
 enum event_type {
-	EVENT_PROBE_HIT = 1,
 	EVENT_TRIGGER   = 2,
 };
 
-/* Ring buffer event sent from BPF to userspace on trigger. */
+/* Ring buffer event sent from BPF to userspace on trigger.
+ *
+ * For EVENT_TRIGGER: args[0] = bpf_get_current_task() ptr,
+ * args[1] = exit kind (scx_exit_kind enum value).
+ */
 struct probe_event {
 	unsigned int type;
 	unsigned int tid;

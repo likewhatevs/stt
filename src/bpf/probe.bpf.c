@@ -44,7 +44,11 @@ struct {
 	__uint(max_entries, 256 * 1024);
 } events SEC(".maps");
 
-/* Global enable flag. Set by userspace after all probes attached. */
+/* Global enable flag. Set by userspace after all probes attached.
+ *
+ * Gates kprobe execution only — the tp_btf/sched_ext_exit trigger
+ * fires regardless of this flag.
+ */
 volatile const bool ktstr_enabled = false;
 
 /*
