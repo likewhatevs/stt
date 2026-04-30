@@ -16,29 +16,18 @@
 //! - Other types — recorded as [`StallDumpMap::error`] so the operator
 //!   sees the gap rather than a silent omission.
 //!
-//! # BTF source — known limitation
+//! # BTF source — per-map program BTF loading
 //!
-//! Today the renderer uses the host's vmlinux BTF (passed in as `&Btf`
-//! by the caller). This resolves kernel-defined primitives — `int`,
-//! `__u64`, `task_struct` and friends — but does **not** resolve
-//! scheduler-defined types like `task_ctx` or any custom struct the
-//! BPF program declares: those type IDs index the program's *own*
-//! BTF blob, which lives in guest memory at the kernel KVA captured
-//! in [`BpfMapInfo::btf_kva`]. Renders against unknown type IDs land
-//! as [`RenderedValue::Unsupported`] rather than crashing, but the
-//! operator only sees a hex dump for the value bytes.
-//!
-//! Loading the per-map program BTF — read the `struct btf` at
-//! `btf_kva`, follow its `data`/`data_size` fields, translate via the
-//! guest page tables, and feed the bytes to [`Btf::from_bytes`] — is
-//! the path forward for full scheduler-defined-type rendering.
-//! Tracked as task #49.
-//!
-//! Practical impact today:
-//! - scx-ktstr (the test fixture) exercises only kernel primitives, so
-//!   its scheduler state renders fully.
-//! - Real schedulers under test will see scheduler-private types fall
-//!   back to hex until #49 lands.
+//! The renderer loads each map's program BTF from guest memory at
+//! [`BpfMapInfo::btf_kva`], following the kernel `struct btf`'s
+//! `data`/`data_size`/`base_btf` fields. Split BTF (program types
+//! extending vmlinux) is parsed via [`Btf::from_split_bytes`] with
+//! the host's vmlinux BTF as the base (correct when host kernel ==
+//! guest kernel — ktstr's default and the common CI configuration).
+//! A per-`btf_kva` cache dedupes parses across maps sharing a
+//! program's BTF object. When per-map load fails (still-booting
+//! guest, untranslatable page, corrupted blob), the renderer falls
+//! back to the caller-supplied vmlinux BTF.
 
 use serde::{Deserialize, Serialize};
 
@@ -156,6 +145,16 @@ const MAX_PERCPU_KEYS: u32 = 256;
 /// dropped — recording it would itself require unbounded memory.
 const MAX_HASH_ENTRIES: usize = 4096;
 
+/// Sanity cap on a single BTF blob read.
+///
+/// BPF program BTF is normally <100 KB; vmlinux BTF caps around
+/// ~10 MB. A bogus `data_size` (corrupted `struct btf`) shouldn't
+/// pull megabytes of unrelated guest memory into the renderer or the
+/// freeze coordinator. Shared between [`load_program_btf`] and
+/// `vmm::load_probe_bss_offset`; defining it here keeps the bound
+/// in one place so a future tightening doesn't drift between sites.
+pub(crate) const MAX_BTF_BLOB: usize = 32 * 1024 * 1024;
+
 /// Bare-named ktstr framework maps to skip during enumeration.
 ///
 /// These are declared in `src/bpf/probe.bpf.c` without a libbpf
@@ -195,6 +194,15 @@ pub fn dump_state(
         maps: Vec::with_capacity(maps.len()),
     };
 
+    // Per-map program-BTF cache, keyed by `btf_kva`. Each unique
+    // `struct btf *` lives in the kernel BTF IDR — multiple maps from
+    // the same BPF program point at the same KVA, so caching dedupes
+    // the heavy `Btf::from_bytes`/`from_split_bytes` parse across them
+    // (a scheduler with N maps backed by one BPF object pays one
+    // parse, not N). Lookups go through this cache before falling
+    // back to the caller-supplied vmlinux `btf`.
+    let mut program_btfs: std::collections::HashMap<u64, Btf> = std::collections::HashMap::new();
+
     for info in maps {
         // Skip ktstr's own framework maps so the report only shows
         // the scheduler-under-test's state. Three distinct shapes
@@ -227,17 +235,113 @@ pub fn dump_state(
         {
             continue;
         }
-        report
-            .maps
-            .push(render_map(accessor, btf, &info, num_cpus, arena_offsets));
+
+        // Resolve the per-map BTF.
+        //
+        // The map's `btf_value_type_id` / `btf_key_type_id` index
+        // the *map's own* BTF, NOT the kernel vmlinux BTF — when
+        // `btf_kva != 0` the type IDs are program-local and using
+        // vmlinux BTF with them would resolve to unrelated kernel
+        // types (or out-of-range nonsense). So:
+        //
+        //   - `btf_kva != 0` AND program BTF loads     → use it.
+        //   - `btf_kva != 0` AND program BTF fails     → render
+        //     hex-only (None map_btf), no fallback.
+        //   - `btf_kva == 0` (kernel-builtin map)      → use the
+        //     caller-supplied vmlinux BTF; the type IDs (if any)
+        //     genuinely index vmlinux BTF in this case.
+        if info.btf_kva != 0
+            && !program_btfs.contains_key(&info.btf_kva)
+            && let Some(loaded) = load_program_btf(accessor, info.btf_kva, btf)
+        {
+            program_btfs.insert(info.btf_kva, loaded);
+        }
+        let map_btf: Option<&Btf> = if info.btf_kva != 0 {
+            program_btfs.get(&info.btf_kva)
+        } else {
+            Some(btf)
+        };
+
+        report.maps.push(render_map(
+            accessor,
+            map_btf,
+            &info,
+            num_cpus,
+            arena_offsets,
+        ));
     }
 
     report
 }
 
+/// Load a BPF program's `struct btf` from guest memory.
+///
+/// Reads the kernel `struct btf` at `btf_kva`, follows its `data` /
+/// `data_size` / `base_btf` fields, fetches the raw BTF blob via
+/// page-walked vmalloc reads, and parses it. When `base_btf` is
+/// non-NULL the program's BTF is split atop the vmlinux BTF (the
+/// kernel's own base BTF) — pass the host's already-parsed vmlinux
+/// `Btf` as the split base so type IDs resolve correctly.
+///
+/// Returns `None` when any step fails: missing offsets, untranslatable
+/// pages, or `Btf::from_bytes` rejection (truncated / corrupted blob).
+/// Failure is silent and the caller falls back to the host vmlinux
+/// BTF — the dump is best-effort, a partial render still beats no
+/// render.
+fn load_program_btf(accessor: &BpfMapAccessor<'_>, btf_kva: u64, base_btf: &Btf) -> Option<Btf> {
+    let kernel = accessor.kernel();
+    let offsets = accessor.offsets();
+    let mem = kernel.mem();
+
+    // `struct btf` may be kmalloc'd (direct map) or vmalloc'd; use
+    // translate_any_kva.
+    let btf_pa = super::idr::translate_any_kva(
+        mem,
+        kernel.cr3_pa(),
+        kernel.page_offset(),
+        btf_kva,
+        kernel.l5(),
+    )?;
+    let data_kva = mem.read_u64(btf_pa, offsets.btf_data);
+    let data_size = mem.read_u32(btf_pa, offsets.btf_data_size) as usize;
+    let base_kva = mem.read_u64(btf_pa, offsets.btf_base_btf);
+
+    if data_kva == 0 || data_size == 0 {
+        return None;
+    }
+
+    if data_size > MAX_BTF_BLOB {
+        return None;
+    }
+
+    // The BTF blob is vmalloc-backed — `btf->data` is allocated via
+    // vmalloc / kvmalloc inside `kernel/bpf/btf.c`'s
+    // `btf_parse_*` paths. Use the chunked vmalloc reader so a
+    // 100 KB blob doesn't pay 100K syscalls of byte-wise translate.
+    // The chunked reader honours all-or-nothing semantics, so a
+    // short read returns None directly; no extra length check needed.
+    let blob = kernel.read_kva_bytes_chunked(data_kva, data_size)?;
+
+    if base_kva != 0 {
+        // Split BTF: the program's types extend the kernel's
+        // vmlinux BTF. Pass the host's parsed vmlinux Btf as the
+        // base so cross-base type IDs (e.g. `task_struct`) resolve.
+        //
+        // Uses host vmlinux BTF as split base — correct when host
+        // kernel == guest kernel (ktstr's default and the common
+        // CI configuration). A guest running a different kernel
+        // version would silently mis-render cross-base type
+        // references; flagged as a known limitation in the module
+        // doc above.
+        Btf::from_split_bytes(&blob, base_btf).ok()
+    } else {
+        Btf::from_bytes(&blob).ok()
+    }
+}
+
 fn render_map(
     accessor: &BpfMapAccessor<'_>,
-    btf: &Btf,
+    btf: Option<&Btf>,
     info: &BpfMapInfo,
     num_cpus: u32,
     arena_offsets: Option<&BpfArenaOffsets>,
@@ -272,14 +376,18 @@ fn render_map(
             // only. The truncation is recorded in `error` and
             // `max_entries` so the consumer sees the partial render.
             match accessor.read_value(info, 0, info.value_size as usize) {
-                Some(bytes) if info.btf_value_type_id != 0 => {
-                    out.value = Some(render_value(btf, info.btf_value_type_id, &bytes));
-                }
                 Some(bytes) => {
-                    // No BTF type — emit a hex fallback.
-                    out.value = Some(RenderedValue::Bytes {
-                        hex: hex_dump(&bytes),
-                    });
+                    // BTF-driven render only when both a BTF object
+                    // is available AND the map declares a value type
+                    // id — `info.btf_value_type_id` indexes the
+                    // map's program BTF, so without that BTF the id
+                    // resolves to nothing meaningful.
+                    out.value = match (btf, info.btf_value_type_id) {
+                        (Some(b), id) if id != 0 => Some(render_value(b, id, &bytes)),
+                        _ => Some(RenderedValue::Bytes {
+                            hex: hex_dump(&bytes),
+                        }),
+                    };
                 }
                 None => {
                     out.error = Some("ARRAY value region unreadable (unmapped page?)".into());
@@ -298,11 +406,12 @@ fn render_map(
             }
         }
         BPF_MAP_TYPE_HASH => {
-            // BpfMapInfo currently captures only `btf_value_type_id`,
-            // not a key type id, so hash-map keys surface as hex bytes
-            // here. Values render with the value type id when one is
-            // present; otherwise keys-and-values both fall through to
-            // hex.
+            // Both key and value render via BTF when their type IDs
+            // are present (`btf_key_type_id` / `btf_value_type_id`
+            // captured during map enumeration). Either side falls
+            // through to a hex dump alongside the rendered counterpart
+            // when its type id is 0 — so an operator always sees the
+            // raw bytes, even if BTF didn't help.
             //
             // Hard-cap at MAX_HASH_ENTRIES to keep a million-entry
             // hash from OOMing the host renderer. `iter_hash_map`
@@ -314,13 +423,18 @@ fn render_map(
             let raw_entries = accessor.iter_hash_map(info);
             let truncated = raw_entries.len() > MAX_HASH_ENTRIES;
             for (k, v) in raw_entries.into_iter().take(MAX_HASH_ENTRIES) {
-                let value = if info.btf_value_type_id != 0 {
-                    Some(render_value(btf, info.btf_value_type_id, &v))
-                } else {
-                    None
+                // Both render gates require BTF presence AND
+                // non-zero type id; same reasoning as the ARRAY arm.
+                let key = match (btf, info.btf_key_type_id) {
+                    (Some(b), id) if id != 0 => Some(render_value(b, id, &k)),
+                    _ => None,
+                };
+                let value = match (btf, info.btf_value_type_id) {
+                    (Some(b), id) if id != 0 => Some(render_value(b, id, &v)),
+                    _ => None,
                 };
                 out.entries.push(StallDumpEntry {
-                    key: None,
+                    key,
                     key_hex: hex_dump(&k),
                     value,
                     value_hex: hex_dump(&v),
@@ -337,12 +451,9 @@ fn render_map(
                 let per_cpu = per_cpu_bytes
                     .into_iter()
                     .map(|maybe_bytes| {
-                        maybe_bytes.map(|b| {
-                            if info.btf_value_type_id != 0 {
-                                render_value(btf, info.btf_value_type_id, &b)
-                            } else {
-                                RenderedValue::Bytes { hex: hex_dump(&b) }
-                            }
+                        maybe_bytes.map(|b| match (btf, info.btf_value_type_id) {
+                            (Some(b_btf), id) if id != 0 => render_value(b_btf, id, &b),
+                            _ => RenderedValue::Bytes { hex: hex_dump(&b) },
                         })
                     })
                     .collect();

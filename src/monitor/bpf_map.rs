@@ -59,7 +59,7 @@ pub const BPF_MAP_TYPE_ARENA: u32 = 33;
 const BPF_OBJ_NAME_LEN: usize = 16;
 
 /// Discovered BPF map metadata and value location.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 #[allow(dead_code)]
 pub struct BpfMapInfo {
     /// Guest physical address of the `struct bpf_map`.
@@ -89,6 +89,12 @@ pub struct BpfMapInfo {
     pub btf_kva: u64,
     /// BTF type ID for the map's value type. 0 if the map has no BTF.
     pub btf_value_type_id: u32,
+    /// BTF type ID for the map's key type. 0 when the map's BTF is
+    /// missing or the map type does not record a key type id (most
+    /// ARRAY-family maps store a synthetic `__u32` key implicitly).
+    /// HASH maps populate this so the dump path can render keys via
+    /// BTF instead of falling back to hex.
+    pub btf_key_type_id: u32,
 }
 
 /// Enumerate all BPF maps in the kernel's `map_idr` xarray.
@@ -159,6 +165,7 @@ pub(crate) fn find_all_bpf_maps(ctx: &AccessorCtx<'_>, map_idr_kva: u64) -> Vec<
 
         let btf_kva = ctx.mem.read_u64(map_pa, offsets.map_btf);
         let btf_value_type_id = ctx.mem.read_u32(map_pa, offsets.map_btf_value_type_id);
+        let btf_key_type_id = ctx.mem.read_u32(map_pa, offsets.map_btf_key_type_id);
 
         maps.push(BpfMapInfo {
             map_pa,
@@ -172,6 +179,7 @@ pub(crate) fn find_all_bpf_maps(ctx: &AccessorCtx<'_>, map_idr_kva: u64) -> Vec<
             value_kva,
             btf_kva,
             btf_value_type_id,
+            btf_key_type_id,
         });
     }
 
@@ -611,6 +619,14 @@ impl<'a> BpfMapAccessor<'a> {
     /// No filtering by type or name.
     pub fn maps(&self) -> Vec<BpfMapInfo> {
         find_all_bpf_maps(&self.ctx(), self.map_idr_kva)
+    }
+
+    /// Borrow the resolved BPF map field offsets. Used by callers
+    /// that need to read kernel struct fields (e.g. `struct btf` for
+    /// the program-BTF loader) without going through the
+    /// `BpfMapAccessor` map-access surface.
+    pub fn offsets(&self) -> &BpfMapOffsets {
+        self.offsets
     }
 
     /// Borrow the underlying [`super::guest::GuestKernel`] for callers
@@ -1145,6 +1161,7 @@ mod tests {
             value_kva: Some(kva),
             btf_kva: 0,
             btf_value_type_id: 0,
+            btf_key_type_id: 0,
         };
 
         // Write u32 at offset 4 within the value region.
@@ -1366,8 +1383,10 @@ mod tests {
             idr_next: 20,
             map_btf: 0,
             map_btf_value_type_id: 0,
+            map_btf_key_type_id: 0,
             btf_data: 0,
             btf_data_size: 0,
+            btf_base_btf: 0,
             htab_offsets: None,
         };
 
@@ -1513,8 +1532,10 @@ mod tests {
             idr_next: 20,
             map_btf: 0,
             map_btf_value_type_id: 0,
+            map_btf_key_type_id: 0,
             btf_data: 0,
             btf_data_size: 0,
+            btf_base_btf: 0,
             htab_offsets: None,
         };
         let idr_pa: u64 = 0x1000;
@@ -1657,6 +1678,7 @@ mod tests {
             value_kva: Some(kva),
             btf_kva: 0,
             btf_value_type_id: 0,
+            btf_key_type_id: 0,
         };
 
         let payload = [0xDE, 0xAD, 0xBE, 0xEF];
@@ -1693,6 +1715,7 @@ mod tests {
             value_kva: Some(0xFFFF_FFFF_8000_0000), // Unmapped KVA.
             btf_kva: 0,
             btf_value_type_id: 0,
+            btf_key_type_id: 0,
         };
 
         assert!(!write_bpf_map_value(
@@ -1851,8 +1874,10 @@ mod tests {
             idr_next: 20,
             map_btf: 0,
             map_btf_value_type_id: 0,
+            map_btf_key_type_id: 0,
             btf_data: 0,
             btf_data_size: 0,
+            btf_base_btf: 0,
             htab_offsets: None,
         };
 
@@ -2052,6 +2077,7 @@ mod tests {
             value_kva: Some(kva),
             btf_kva: 0,
             btf_value_type_id: 0,
+            btf_key_type_id: 0,
         };
 
         // Write at offset 8 within the value region.
@@ -2092,6 +2118,7 @@ mod tests {
             value_kva: Some(kva),
             btf_kva: 0,
             btf_value_type_id: 0,
+            btf_key_type_id: 0,
         };
 
         // Zero-length write should succeed without doing anything.
@@ -2125,6 +2152,7 @@ mod tests {
             value_kva: Some(kva),
             btf_kva: 0,
             btf_value_type_id: 0,
+            btf_key_type_id: 0,
         };
 
         assert!(write_bpf_map_value_u32(
@@ -2270,8 +2298,10 @@ mod tests {
             idr_next: 20,
             map_btf: 0,
             map_btf_value_type_id: 0,
+            map_btf_key_type_id: 0,
             btf_data: 0,
             btf_data_size: 0,
+            btf_base_btf: 0,
             htab_offsets: None,
         };
 
@@ -2326,8 +2356,10 @@ mod tests {
             idr_next: 20,
             map_btf: 0,
             map_btf_value_type_id: 0,
+            map_btf_key_type_id: 0,
             btf_data: 0,
             btf_data_size: 0,
+            btf_base_btf: 0,
             htab_offsets: None,
         };
 
@@ -2459,6 +2491,7 @@ mod tests {
             value_kva: Some(kva),
             btf_kva: 0,
             btf_value_type_id: 0,
+            btf_key_type_id: 0,
         };
 
         // Write a u32 at offset 0xFFE within the value region.
@@ -2501,6 +2534,7 @@ mod tests {
             value_kva: Some(kva),
             btf_kva: 0,
             btf_value_type_id: 0,
+            btf_key_type_id: 0,
         };
 
         // Write exactly at offset 0x1000 — first byte of page 2.
@@ -2532,8 +2566,10 @@ mod tests {
             idr_next: 20,
             map_btf: 0,
             map_btf_value_type_id: 0,
+            map_btf_key_type_id: 0,
             btf_data: 0,
             btf_data_size: 0,
+            btf_base_btf: 0,
             htab_offsets: None,
         };
 
@@ -2662,6 +2698,7 @@ mod tests {
             value_kva: Some(kva),
             btf_kva: 0,
             btf_value_type_id: 0,
+            btf_key_type_id: 0,
         };
 
         let val = read_bpf_map_value_u32(&value_ctx(&mem, cr3_pa, false), &info, 4);
@@ -2689,6 +2726,7 @@ mod tests {
             value_kva: Some(kva),
             btf_kva: 0,
             btf_value_type_id: 0,
+            btf_key_type_id: 0,
         };
 
         let bytes = read_bpf_map_value(&value_ctx(&mem, cr3_pa, false), &info, 0, 4);
@@ -2715,6 +2753,7 @@ mod tests {
             value_kva: Some(kva),
             btf_kva: 0,
             btf_value_type_id: 0,
+            btf_key_type_id: 0,
         };
 
         let bytes = read_bpf_map_value(&value_ctx(&mem, cr3_pa, false), &info, 0, 0);
@@ -2741,6 +2780,7 @@ mod tests {
             value_kva: Some(0xFFFF_FFFF_8000_0000), // Unmapped KVA.
             btf_kva: 0,
             btf_value_type_id: 0,
+            btf_key_type_id: 0,
         };
 
         assert_eq!(
@@ -2773,6 +2813,7 @@ mod tests {
             value_kva: Some(kva),
             btf_kva: 0,
             btf_value_type_id: 0,
+            btf_key_type_id: 0,
         };
 
         // Write then read u32.
@@ -2827,6 +2868,7 @@ mod tests {
             value_kva: Some(kva),
             btf_kva: 0,
             btf_value_type_id: 0,
+            btf_key_type_id: 0,
         };
 
         let bytes = read_bpf_map_value(&value_ctx(&mem, cr3_pa, false), &info, 0xFFE, 4);
@@ -2854,6 +2896,7 @@ mod tests {
             value_kva: Some(kva),
             btf_kva: 0,
             btf_value_type_id: 0,
+            btf_key_type_id: 0,
         };
 
         assert_eq!(
@@ -2929,8 +2972,10 @@ mod tests {
             idr_next: 20,
             map_btf: 0,
             map_btf_value_type_id: 0,
+            map_btf_key_type_id: 0,
             btf_data: 0,
             btf_data_size: 0,
+            btf_base_btf: 0,
             htab_offsets: None,
         };
         let buf = vec![0u8; 0x2000];
@@ -2969,6 +3014,7 @@ mod tests {
             value_kva: None,
             btf_kva: 0,
             btf_value_type_id: 0,
+            btf_key_type_id: 0,
         };
 
         assert!(read_bpf_map_value(&value_ctx(&mem, cr3_pa, false), &info, 0, 4).is_none());
@@ -2995,6 +3041,7 @@ mod tests {
             value_kva: None,
             btf_kva: 0,
             btf_value_type_id: 0,
+            btf_key_type_id: 0,
         };
 
         assert!(!write_bpf_map_value(
@@ -3079,8 +3126,10 @@ mod tests {
             idr_next: 20,
             map_btf: 0,
             map_btf_value_type_id: 0,
+            map_btf_key_type_id: 0,
             btf_data: 0,
             btf_data_size: 0,
+            btf_base_btf: 0,
             htab_offsets: None,
         };
 
@@ -3193,6 +3242,7 @@ mod tests {
             value_kva: Some(kva),
             btf_kva: 0,
             btf_value_type_id: 0,
+            btf_key_type_id: 0,
         };
 
         // Exactly at boundary: offset=4, len=4 -> 4+4=8 == value_size, ok.
@@ -3225,6 +3275,7 @@ mod tests {
             value_kva: Some(kva),
             btf_kva: 0,
             btf_value_type_id: 0,
+            btf_key_type_id: 0,
         };
 
         // Within bounds: offset=0, len=8.
@@ -3273,6 +3324,7 @@ mod tests {
             value_kva: None,
             btf_kva: 0,
             btf_value_type_id: 0,
+            btf_key_type_id: 0,
         };
         assert_eq!(info.btf_kva, 0);
         assert_eq!(info.btf_value_type_id, 0);
@@ -3292,6 +3344,7 @@ mod tests {
             value_kva: None,
             btf_kva: 0xFFFF_8880_0001_0000,
             btf_value_type_id: 42,
+            btf_key_type_id: 0,
         };
         assert_eq!(info.btf_kva, 0xFFFF_8880_0001_0000);
         assert_eq!(info.btf_value_type_id, 42);
@@ -3360,8 +3413,10 @@ mod tests {
             idr_next: 20,
             map_btf: 0,
             map_btf_value_type_id: 0,
+            map_btf_key_type_id: 0,
             btf_data: 0,
             btf_data_size: 0,
+            btf_base_btf: 0,
             htab_offsets: None,
         };
 
@@ -3661,8 +3716,10 @@ mod tests {
             idr_next: 20,
             map_btf: 0,
             map_btf_value_type_id: 0,
+            map_btf_key_type_id: 0,
             btf_data: 0,
             btf_data_size: 0,
+            btf_base_btf: 0,
             htab_offsets: Some(test_htab_offsets()),
         }
     }
@@ -3686,6 +3743,7 @@ mod tests {
             value_kva: None,
             btf_kva: 0,
             btf_value_type_id: 0,
+            btf_key_type_id: 0,
         };
         let entries = iter_htab_entries(&lookup_ctx(&mem, 0, 0, &offsets, false), &map);
         assert!(entries.is_empty());
@@ -3711,6 +3769,7 @@ mod tests {
             value_kva: None,
             btf_kva: 0,
             btf_value_type_id: 0,
+            btf_key_type_id: 0,
         };
         let entries = iter_htab_entries(&lookup_ctx(&mem, 0, 0, &offsets, false), &map);
         assert!(entries.is_empty());
@@ -3835,6 +3894,7 @@ mod tests {
             value_kva: None,
             btf_kva: 0,
             btf_value_type_id: 0,
+            btf_key_type_id: 0,
         };
 
         (buf, page_offset, map, offsets)
@@ -4000,6 +4060,7 @@ mod tests {
             value_kva: None,
             btf_kva: 0,
             btf_value_type_id: 0,
+            btf_key_type_id: 0,
         };
 
         // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
@@ -4044,8 +4105,10 @@ mod tests {
             idr_next: 20,
             map_btf: 0,
             map_btf_value_type_id: 0,
+            map_btf_key_type_id: 0,
             btf_data: 0,
             btf_data_size: 0,
+            btf_base_btf: 0,
             htab_offsets: None,
         };
 
@@ -4114,6 +4177,7 @@ mod tests {
             value_kva: None,
             btf_kva: 0,
             btf_value_type_id: 0,
+            btf_key_type_id: 0,
         };
 
         (buf, pgd_pa, page_offset, info, offsets, per_cpu_offsets)
@@ -4371,8 +4435,10 @@ mod tests {
             idr_next: 20,
             map_btf: 0,
             map_btf_value_type_id: 0,
+            map_btf_key_type_id: 0,
             btf_data: 0,
             btf_data_size: 0,
+            btf_base_btf: 0,
             htab_offsets: None,
         };
 
@@ -4390,6 +4456,7 @@ mod tests {
             value_kva: None,
             btf_kva: 0,
             btf_value_type_id: 0,
+            btf_key_type_id: 0,
         };
 
         let per_cpu_offsets = vec![0u64, 0x1000];
@@ -4460,8 +4527,10 @@ mod tests {
             idr_next: 20,
             map_btf: 0,
             map_btf_value_type_id: 0,
+            map_btf_key_type_id: 0,
             btf_data: 0,
             btf_data_size: 0,
+            btf_base_btf: 0,
             htab_offsets: None,
         };
 
@@ -4503,6 +4572,7 @@ mod tests {
             value_kva: None,
             btf_kva: 0,
             btf_value_type_id: 0,
+            btf_key_type_id: 0,
         };
 
         // Direct-mapping math for the percpu KVA would yield

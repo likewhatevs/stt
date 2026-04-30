@@ -463,7 +463,18 @@ fn render_bitfield(
             reason: "bitfield type modifiers unresolvable".to_string(),
         };
     };
-    let signed = matches!(&member_ty, Type::Int(i) if i.is_signed());
+    // BTF bitfields can carry signed Int *or* signed Enum / Enum64
+    // bases (e.g. `enum scx_exit_kind` declared with negative
+    // members). Treat all three as signed for the sign-extension
+    // step so a negative-valued bitfield rendered through any of
+    // them comes back as a correctly-signed `Int` rather than a
+    // raw-bits `Uint`.
+    let signed = match &member_ty {
+        Type::Int(i) => i.is_signed(),
+        Type::Enum(e) => e.is_signed(),
+        Type::Enum64(e) => e.is_signed(),
+        _ => false,
+    };
     if signed {
         let value = sign_extend(raw, width) as i64;
         RenderedValue::Int {

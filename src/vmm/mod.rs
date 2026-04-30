@@ -587,6 +587,54 @@ fn vcpu_signal() -> libc::c_int {
     libc::SIGRTMIN()
 }
 
+/// Resolve the byte offset of `ktstr_err_exit_detected` within the
+/// probe BPF program's `.bss` section by walking the program's BTF
+/// Datasec. Returns `None` when any step fails (program BTF not yet
+/// loaded, struct btf untranslatable, blob short-read, BTF parse
+/// reject, no matching VarSecinfo).
+///
+/// `btf_kva` is the kernel KVA of the probe map's `struct btf`;
+/// `base` is the host's parsed vmlinux BTF used as the split-BTF
+/// base when the program BTF is split. Lives next to
+/// [`vcpu_signal`] because the freeze coordinator is the sole
+/// consumer.
+fn load_probe_bss_offset(
+    kernel: &crate::monitor::guest::GuestKernel<'_>,
+    btf_kva: u64,
+    base: &btf_rs::Btf,
+    offsets: &crate::monitor::btf_offsets::BpfMapOffsets,
+) -> Option<u32> {
+    let mem = kernel.mem();
+    let cr3_pa = kernel.cr3_pa();
+    let page_offset = kernel.page_offset();
+    let l5 = kernel.l5();
+    let btf_pa = crate::monitor::idr::translate_any_kva(mem, cr3_pa, page_offset, btf_kva, l5)?;
+    let data_kva = mem.read_u64(btf_pa, offsets.btf_data);
+    let data_size = mem.read_u32(btf_pa, offsets.btf_data_size) as usize;
+    let base_kva = mem.read_u64(btf_pa, offsets.btf_base_btf);
+    if data_kva == 0 || data_size == 0 {
+        return None;
+    }
+    if data_size > crate::monitor::dump::MAX_BTF_BLOB {
+        return None;
+    }
+    // The chunked vmalloc reader handles per-page translate + bulk
+    // copy and honours all-or-nothing on short reads — the previous
+    // hand-rolled loop here duplicated `GuestKernel::read_kva_bytes_chunked`
+    // for no benefit.
+    let blob = kernel.read_kva_bytes_chunked(data_kva, data_size)?;
+    let prog_btf = if base_kva != 0 {
+        btf_rs::Btf::from_split_bytes(&blob, base).ok()?
+    } else {
+        btf_rs::Btf::from_bytes(&blob).ok()?
+    };
+    crate::monitor::btf_offsets::resolve_var_offset_in_section(
+        &prog_btf,
+        ".bss",
+        "ktstr_err_exit_detected",
+    )
+}
+
 /// Signal handler — Firecracker pattern.
 /// The handler itself is a no-op; its sole purpose is to cause KVM_RUN
 /// to return with EINTR. The fence ensures that a write to
@@ -2758,6 +2806,18 @@ impl KtstrVm {
                 // the probe loads into map_idr (rust_init phase 2b);
                 // discovery retries each iteration until success.
                 let mut cached_bss_pa: Option<u64> = None;
+                // Cache the BTF-resolved offset of the field within
+                // the .bss section. The Datasec walk parses the
+                // probe's BTF (a few-KB blob copy + parse) every
+                // call — caching keeps that work to once-per-coord-
+                // lifetime instead of once-per-discovery-iteration.
+                // Resolution can fail two ways:
+                //   - guest still booting → retry (offset stays None)
+                //   - BTF parse / Datasec walk broken → fall back
+                //     to offset 0 once, log a warn, and stop retrying
+                //     (warn_logged is the latch).
+                let mut cached_bss_offset: Option<u32> = None;
+                let mut bss_offset_warn_logged = false;
                 let mut latched = false;
                 while !freeze_coord_kill.load(Ordering::Acquire) {
                     if freeze_coord_bsp_done.load(Ordering::Acquire) {
@@ -2789,18 +2849,25 @@ impl KtstrVm {
                     // generated probe_skel.rs match arm
                     // `"probe_bp.bss" => bss = Some(map)`).
                     //
-                    // TODO: byte offset of ktstr_err_exit_detected
-                    // within .bss is hardcoded to 0 below. This
-                    // depends on declaration order in
-                    // src/bpf/probe.bpf.c (the field is the first
-                    // writable global, preceded only by
-                    // `volatile const bool ktstr_enabled` which lives
-                    // in .rodata). Stable today; future BPF additions
-                    // that reorder globals would silently break
-                    // detection. Replace with BTF Datasec resolution
-                    // (find the VarSecinfo whose Var name resolves to
-                    // "ktstr_err_exit_detected" and use its `offset()`)
-                    // for belt-and-suspenders correctness.
+                    // Resolve the byte offset of
+                    // `ktstr_err_exit_detected` within the probe's
+                    // `.bss` section via BTF Datasec rather than
+                    // hardcoding 0. The probe BPF program ships its
+                    // own split BTF; its Datasec for `.bss` carries
+                    // a VarSecinfo per writable global with the
+                    // exact byte offset the BPF JIT places it at. A
+                    // hardcoded 0 worked while the field was the
+                    // sole writable global in `probe.bpf.c`, but a
+                    // future addition that reorders globals (or that
+                    // adds another writable global before this one)
+                    // would silently shift the offset and break the
+                    // freeze trigger. The BTF lookup keeps the
+                    // detection robust across declaration changes.
+                    //
+                    // Falls back to offset 0 when the program BTF
+                    // can't be loaded yet (guest still booting) or
+                    // the Datasec walk fails — same recovery
+                    // behaviour as the previous always-zero path.
                     if cached_bss_pa.is_none()
                         && let Some(ref owned) = owned_accessor
                         && let Some(ref mem) = freeze_coord_mem
@@ -2819,6 +2886,55 @@ impl KtstrVm {
                             let cr3_pa = owned.guest_kernel().cr3_pa();
                             let page_offset = owned.guest_kernel().page_offset();
                             let l5 = owned.guest_kernel().l5();
+                            // BTF-driven offset: load the probe's
+                            // program BTF and walk its `.bss`
+                            // Datasec for the named global. The
+                            // result is cached in `cached_bss_offset`
+                            // — only the first successful resolution
+                            // pays the BTF parse cost. A None here
+                            // before the cache is populated means
+                            // either the program BTF isn't loaded
+                            // yet (still-booting guest, retry
+                            // silently) or the BTF walk is broken
+                            // (warn once, fall back to offset 0).
+                            if cached_bss_offset.is_none()
+                                && map.btf_kva != 0
+                                && let Some(ref base) = dump_btf
+                            {
+                                match load_probe_bss_offset(
+                                    owned.guest_kernel(),
+                                    map.btf_kva,
+                                    base,
+                                    accessor.offsets(),
+                                ) {
+                                    Some(off) => {
+                                        cached_bss_offset = Some(off);
+                                    }
+                                    None => {
+                                        // map.btf_kva is non-zero
+                                        // and dump_btf is loaded,
+                                        // so the probe IS loaded
+                                        // — a None now means the
+                                        // BTF parse / Datasec
+                                        // walk failed. Fall back
+                                        // to 0 and stop retrying.
+                                        if !bss_offset_warn_logged {
+                                            tracing::warn!(
+                                                "freeze-coord: BTF Datasec resolution \
+                                                     failed, falling back to offset 0"
+                                            );
+                                            bss_offset_warn_logged = true;
+                                        }
+                                        cached_bss_offset = Some(0);
+                                    }
+                                }
+                                // else: probe not loaded yet
+                                // (map.btf_kva == 0 or dump_btf
+                                // missing). Leave cached_bss_offset
+                                // None so the next iteration retries
+                                // without the warn fallback.
+                            }
+                            let bss_field_offset = cached_bss_offset.unwrap_or(0);
                             if let Some(translated) = crate::monitor::idr::translate_any_kva(
                                 mem,
                                 cr3_pa,
@@ -2826,7 +2942,8 @@ impl KtstrVm {
                                 value_kva,
                                 l5,
                             ) {
-                                cached_bss_pa = Some(translated);
+                                cached_bss_pa =
+                                    Some(translated.wrapping_add(bss_field_offset as u64));
                             }
                         }
                     }

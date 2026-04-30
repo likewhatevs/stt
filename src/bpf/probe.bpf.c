@@ -60,11 +60,14 @@ volatile const bool ktstr_enabled = false;
  * version"). The publishing site uses __sync_val_compare_and_swap
  * for cross-core-ordered publication on weakly-ordered architectures.
  *
- * MUST be the first writable .bss global — byte offset hardcoded to 0
- * in src/vmm/mod.rs freeze coordinator. Reordering this declaration
- * (or inserting another writable global before it) breaks the host's
- * .bss-poll path; replace the hardcoded offset with BTF Datasec
- * resolution before relaxing the ordering requirement.
+ * Byte offset within .bss is resolved via BTF Datasec lookup at
+ * freeze-coordinator startup (`vmm::load_probe_bss_offset` ->
+ * `monitor::btf_offsets::resolve_var_offset_in_section` walks the
+ * probe's BTF for the VarSecinfo named "ktstr_err_exit_detected").
+ * Falls back to 0 during early boot before the program BTF is
+ * loadable. This declaration's position relative to other globals
+ * therefore no longer matters; reordering or adding more writable
+ * globals is safe.
  */
 volatile u32 ktstr_err_exit_detected = 0;
 

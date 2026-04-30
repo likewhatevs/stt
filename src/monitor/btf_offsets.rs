@@ -526,6 +526,46 @@ pub(crate) fn find_struct(btf: &Btf, name: &str) -> Result<(btf_rs::Struct, Stri
     bail!("btf: '{name}' exists but is not a struct");
 }
 
+/// Resolve the byte offset of a named global within a BTF section.
+///
+/// Walks every `BTF_KIND_DATASEC` whose name matches `section_name`
+/// (e.g. `".bss"`, `".data"`, `".rodata"`) and returns the
+/// `VarSecinfo.offset()` whose chained `Var` resolves to a name
+/// matching `var_name`. Returns `None` when the section, the var, or
+/// the chained type chain is missing — the caller should then fall
+/// back to a known offset (the freeze coordinator falls back to 0
+/// during early boot before program BTF is loadable).
+///
+/// Lives next to [`find_struct`] / [`member_byte_offset`] because
+/// it's a generic BTF helper, not specific to the dump path. Both
+/// the dump renderer and the freeze coordinator consume it.
+pub(crate) fn resolve_var_offset_in_section(
+    btf: &Btf,
+    section_name: &str,
+    var_name: &str,
+) -> Option<u32> {
+    // Iterate every type by name to find the Datasec for the
+    // requested section. `resolve_types_by_name` returns Err on no
+    // hit — propagate that as None.
+    let candidates = btf.resolve_types_by_name(section_name).ok()?;
+    for ty in candidates {
+        let Type::Datasec(ds) = ty else { continue };
+        for var_info in &ds.variables {
+            let Ok(chained) = btf.resolve_chained_type(var_info) else {
+                continue;
+            };
+            let Type::Var(var) = chained else { continue };
+            let Ok(name) = btf.resolve_name(&var) else {
+                continue;
+            };
+            if name == var_name {
+                return Some(var_info.offset());
+            }
+        }
+    }
+    None
+}
+
 /// Find a member by name in a struct and return its byte offset.
 ///
 /// Searches through anonymous struct/union members recursively to
@@ -955,10 +995,22 @@ pub struct BpfMapOffsets {
     pub map_btf: usize,
     /// Offset of `btf_value_type_id` (u32) within `struct bpf_map`.
     pub map_btf_value_type_id: usize,
+    /// Offset of `btf_key_type_id` (u32) within `struct bpf_map`.
+    /// Hash maps render their keys via this type id when present;
+    /// ARRAY/PERCPU_ARRAY use it only for the (synthetic) `__u32 key`
+    /// that BPF imposes on those map types.
+    pub map_btf_key_type_id: usize,
     /// Offset of `data` pointer within `struct btf`.
     pub btf_data: usize,
     /// Offset of `data_size` (u32) within `struct btf`.
     pub btf_data_size: usize,
+    /// Offset of `base_btf` (`struct btf *`) within `struct btf`.
+    /// `NULL` for a base BTF (e.g. vmlinux's own); non-null for split
+    /// BTF (e.g. a BPF program's BTF whose types extend the kernel
+    /// vmlinux BTF). Drives the `Btf::from_bytes` vs
+    /// `Btf::from_split_bytes(blob, &base)` choice in the
+    /// program-BTF loader.
+    pub btf_base_btf: usize,
     /// Offsets for hash table structures. None if BTF lacks the
     /// required types (e.g. `bpf_htab` is not in vmlinux BTF).
     pub htab_offsets: Option<HtabOffsets>,
@@ -986,8 +1038,10 @@ impl BpfMapOffsets {
         idr_next: 0,
         map_btf: 0,
         map_btf_value_type_id: 0,
+        map_btf_key_type_id: 0,
         btf_data: 0,
         btf_data_size: 0,
+        btf_base_btf: 0,
         htab_offsets: None,
     };
 
@@ -1015,10 +1069,12 @@ impl BpfMapOffsets {
 
         let map_btf = member_byte_offset(btf, &bpf_map, "btf")?;
         let map_btf_value_type_id = member_byte_offset(btf, &bpf_map, "btf_value_type_id")?;
+        let map_btf_key_type_id = member_byte_offset(btf, &bpf_map, "btf_key_type_id")?;
 
         let (btf_struct, _) = find_struct(btf, "btf")?;
         let btf_data = member_byte_offset(btf, &btf_struct, "data")?;
         let btf_data_size = member_byte_offset(btf, &btf_struct, "data_size")?;
+        let btf_base_btf = member_byte_offset(btf, &btf_struct, "base_btf")?;
 
         let htab_offsets = resolve_htab_offsets(btf).ok();
 
@@ -1036,8 +1092,10 @@ impl BpfMapOffsets {
             idr_next: idr.idr_next,
             map_btf,
             map_btf_value_type_id,
+            map_btf_key_type_id,
             btf_data,
             btf_data_size,
+            btf_base_btf,
             htab_offsets,
         })
     }

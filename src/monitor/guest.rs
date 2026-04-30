@@ -203,6 +203,51 @@ impl<'a> GuestKernel<'a> {
         Some(buf)
     }
 
+    /// Read bytes from a vmalloc'd kernel virtual address range,
+    /// chunking at page boundaries.
+    ///
+    /// Pays one [`super::reader::GuestMem::translate_kva`] call plus
+    /// one bulk [`super::reader::GuestMem::read_bytes`] per 4 KiB
+    /// page rather than per byte; required for reads above ~hundreds
+    /// of bytes (e.g. a BPF program's BTF blob is typically tens of
+    /// KB, vmlinux BTF up to several MB) where the byte-wise variant
+    /// in [`Self::read_kva_bytes`] is prohibitively slow.
+    ///
+    /// Returns `None` when any page in the requested range fails to
+    /// translate **or** when a chunk's bulk read returns fewer bytes
+    /// than the chunk's expected length (DRAM end before the chunk
+    /// completes); that's the all-or-nothing semantics
+    /// [`Self::read_kva_bytes`] also follows so callers don't need to
+    /// special-case the chunked path.
+    pub fn read_kva_bytes_chunked(&self, kva: u64, len: usize) -> Option<Vec<u8>> {
+        let mut buf = vec![0u8; len];
+        const PAGE: u64 = 4096;
+        let mut consumed: u64 = 0;
+        let total = len as u64;
+        while consumed < total {
+            let cur_kva = kva.wrapping_add(consumed);
+            let pa = self.mem.translate_kva(self.cr3_pa, Kva(cur_kva), self.l5)?;
+            // Advance to the next page boundary so the next translate
+            // lands on a fresh resolved page.
+            let page_end = (cur_kva & !(PAGE - 1)).wrapping_add(PAGE);
+            let chunk_len = (page_end - cur_kva).min(total - consumed) as usize;
+            let dst = &mut buf[consumed as usize..consumed as usize + chunk_len];
+            // `read_bytes` returns the actual count copied; a short
+            // read means the page crosses end-of-DRAM. Honour the
+            // doc's all-or-nothing contract: callers (e.g. the
+            // BTF-blob loader) can't make sense of a partial buffer
+            // — a short BTF blob would simply fail `Btf::from_bytes`
+            // anyway, so collapse the partial-success case into None
+            // up front.
+            let n = self.mem.read_bytes(pa, dst);
+            if n != chunk_len {
+                return None;
+            }
+            consumed += chunk_len as u64;
+        }
+        Some(buf)
+    }
+
     /// Write a u8 to a vmalloc'd kernel virtual address.
     /// Returns false if the address is unmapped.
     pub fn write_kva_u8(&self, kva: u64, val: u8) -> bool {
