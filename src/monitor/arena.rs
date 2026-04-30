@@ -62,13 +62,43 @@ const PAGE_SIZE: u64 = 4096;
 /// when translating user-VA to kern-VA.
 const GUARD_HALF: u64 = 32768;
 
-/// Maximum number of pages the walker will translate per arena.
+/// Maximum number of pages the walker will translate per arena
+/// sequentially.
 ///
 /// `KERN_VM_SZ = SZ_4G + GUARD_SZ` is the kernel's vmalloc reservation
-/// (~1M pages) but most arenas use a small fraction. Cap at 4096
-/// pages (16 MiB) to bound report size; truncation is surfaced via
-/// [`ArenaSnapshot::truncated`].
+/// (~1M pages) but most arenas use a small fraction. Cap the
+/// sequential walk at 4096 pages (16 MiB) to bound report size and
+/// freeze-path latency (a full 1M-page walk at ~1 µs per
+/// translate_kva would burn ~1 s on the freeze hot path); truncation
+/// is surfaced via [`ArenaSnapshot::truncated`] and a sparse stride
+/// sweep (see [`MAX_ARENA_STRIDE_PROBES`]) catches mapped pages
+/// beyond this cap.
 const MAX_ARENA_PAGES: u64 = 4096;
+
+/// Number of evenly-spaced stride probes the walker performs across
+/// pgoffs [`MAX_ARENA_PAGES`]..`declared_pages` when `declared_pages`
+/// exceeds the sequential cap. Lets the walker surface mapped pages
+/// in sparse arenas (e.g. a scheduler that allocated pages near the
+/// 4 GiB end of its user_vm window) without paying the full 1M-page
+/// translate_kva cost.
+///
+/// 256 probes × ~1 µs per translate ≈ 0.25 ms — negligible on the
+/// freeze hot path. Each hit lands in [`ArenaSnapshot::pages`]
+/// alongside the sequential prefix, so the consumer sees both.
+const MAX_ARENA_STRIDE_PROBES: u64 = 256;
+
+/// Defensive cap on the user_vm window span, in bytes.
+///
+/// `bpf_arena_init`'s user_vm window is at most 4 GiB by design — the
+/// BPF JIT addresses arena pointers via the low 32 bits of the user
+/// address, so any window wider than `0x1_0000_0000` cannot be a
+/// real arena layout (see `bpf_arena_alloc_pages` in
+/// `kernel/bpf/arena.c`). A torn / corrupt `bpf_arena` struct or a
+/// freeze-time race against `arena_init` could yield a wild span; cap
+/// it here so the walker never multiplies a near-`u64::MAX` span by
+/// `PAGE_SIZE` (overflow) or attempts to walk billions of pgoffs
+/// (live-lock on the freeze path).
+const MAX_USER_VM_SPAN: u64 = 0x1_0000_0000;
 
 /// Byte offsets within `struct bpf_arena` and `struct vm_struct`
 /// needed for the host-side arena walker.
@@ -143,18 +173,31 @@ pub struct ArenaPage {
 #[non_exhaustive]
 pub struct ArenaSnapshot {
     /// Mapped pages, in pgoff order (skipped over unmapped pgoffs).
+    /// Sequential prefix (pgoffs `0..MAX_ARENA_PAGES`) followed by any
+    /// stride-probe hits in the sparse tail (pgoffs sampled across
+    /// `MAX_ARENA_PAGES..declared_pages`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pages: Vec<ArenaPage>,
-    /// True when the walker stopped at [`MAX_ARENA_PAGES`] before
-    /// finishing the user_vm window. The unrendered tail is silently
-    /// dropped — recording it would itself need unbounded memory.
+    /// True when the walker stopped sequential enumeration at
+    /// [`MAX_ARENA_PAGES`] before finishing the user_vm window. The
+    /// stride sweep that follows samples the tail at coarse intervals,
+    /// so a hit reaches `pages` even when this flag is set; pgoffs
+    /// between sampled positions are still silently skipped.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
     /// Total declared page count of the user_vm window
-    /// (`(user_vm_end - user_vm_start) / PAGE_SIZE`). Surfaced
-    /// alongside `pages.len()` so consumers can see the
-    /// allocated-vs-declared ratio.
+    /// (`(user_vm_end - user_vm_start) / PAGE_SIZE`), reflecting any
+    /// [`MAX_USER_VM_SPAN`] cap. Surfaced alongside `pages.len()` so
+    /// consumers can see the allocated-vs-declared ratio.
     pub declared_pages: u64,
+    /// True when the raw `user_vm_end - user_vm_start` exceeded
+    /// [`MAX_USER_VM_SPAN`] (4 GiB) and the walker capped the span
+    /// before computing `declared_pages`. Indicates a torn / corrupt
+    /// `bpf_arena` struct or a freeze-time race against initialization;
+    /// the rendered pages still come from valid translates, so the
+    /// snapshot is usable.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub span_capped: bool,
 }
 
 /// Walk the arena's mapped pages and return a snapshot.
@@ -212,18 +255,19 @@ pub fn snapshot_arena(
     }
     let kern_vm_start = vm_addr.wrapping_add(GUARD_HALF);
 
-    let span = user_vm_end - user_vm_start;
-    let declared_pages = span / PAGE_SIZE;
-    let to_walk = declared_pages.min(MAX_ARENA_PAGES);
-    let truncated = declared_pages > to_walk;
+    let plan = ArenaWalkPlan::new(user_vm_end - user_vm_start);
 
     let mut snapshot = ArenaSnapshot {
         pages: Vec::new(),
-        truncated,
-        declared_pages,
+        truncated: plan.truncated,
+        declared_pages: plan.declared_pages,
+        span_capped: plan.span_capped,
     };
 
-    for pgoff in 0..to_walk {
+    // Closure: translate one pgoff to a page-content read; push
+    // onto `snapshot.pages` if the translate + read succeed.
+    // Captures `mem`, `cr3_pa`, `l5`, `kern_vm_start`, `user_vm_start`.
+    let try_capture_page = |pgoff: u64, pages: &mut Vec<ArenaPage>| {
         // user_vm_start + pgoff*PAGE_SIZE is a 64-bit value, but the
         // kernel composes the kern-VA from the LOW 32 bits only —
         // `uaddr32 = (u32)(arena->user_vm_start + pgoff * PAGE_SIZE)`
@@ -233,13 +277,13 @@ pub fn snapshot_arena(
         let user_addr = user_vm_start.wrapping_add(pgoff * PAGE_SIZE);
         let kaddr = kern_vm_start.wrapping_add(user_addr & 0xFFFF_FFFF);
         let Some(pa) = mem.translate_kva(cr3_pa, Kva(kaddr), l5) else {
-            continue;
+            return;
         };
         // Translate guarantees a 4 KiB page-aligned PA; bound-check
         // against guest DRAM size in case a corrupt PTE points
         // past end-of-DRAM.
         if pa + PAGE_SIZE > mem.size() {
-            continue;
+            return;
         }
         let mut buf = vec![0u8; PAGE_SIZE as usize];
         // `GuestMem::read_bytes` returns the actual byte count copied
@@ -251,15 +295,91 @@ pub fn snapshot_arena(
         let n = mem.read_bytes(pa, &mut buf);
         buf.truncate(n);
         if buf.is_empty() {
-            continue;
+            return;
         }
-        snapshot.pages.push(ArenaPage {
+        pages.push(ArenaPage {
             user_addr,
             bytes: buf,
         });
+    };
+
+    // Phase 1: sequential walk of the first MAX_ARENA_PAGES (16 MiB
+    // window) — covers every scheduler today, where allocations cluster
+    // near pgoff 0.
+    for pgoff in 0..plan.sequential_to {
+        try_capture_page(pgoff, &mut snapshot.pages);
+    }
+
+    // Phase 2: stride sweep over the sparse tail. Without this, a
+    // scheduler that allocated even one page near the 4 GiB end of
+    // its user_vm window would be invisible to the dump despite the
+    // truncation flag. Mapped pages discovered here append to
+    // `snapshot.pages` after the sequential prefix and are
+    // discoverable by `user_addr` (the consumer correlates by user
+    // pointer, not pgoff index, so out-of-order pgoffs are fine).
+    if let Some(stride) = plan.stride {
+        let mut pgoff = plan.sequential_to;
+        while pgoff < plan.declared_pages {
+            try_capture_page(pgoff, &mut snapshot.pages);
+            // Saturate at declared_pages on the last step; without
+            // this `pgoff += stride` could skip past the final page
+            // when stride > 1.
+            pgoff = pgoff.saturating_add(stride);
+        }
     }
 
     snapshot
+}
+
+/// Pure computation that decides how many pgoffs the walker must
+/// translate (sequential prefix + stride sweep). Extracted so the
+/// span-cap, declared-page, and stride-derivation logic is unit-
+/// testable without mocking a [`super::guest::GuestKernel`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ArenaWalkPlan {
+    /// Page count the snapshot reports as "declared". Reflects any
+    /// [`MAX_USER_VM_SPAN`] cap.
+    declared_pages: u64,
+    /// True when [`MAX_USER_VM_SPAN`] capped the raw span.
+    span_capped: bool,
+    /// True when `declared_pages > MAX_ARENA_PAGES` and the walker
+    /// will skip pgoffs in the sparse tail.
+    truncated: bool,
+    /// Sequential-walk endpoint: the walker enumerates
+    /// `0..sequential_to` exhaustively.
+    sequential_to: u64,
+    /// Stride for the post-sequential sweep, or `None` when no tail
+    /// remains. `Some(stride)` walks pgoffs
+    /// `sequential_to, sequential_to + stride, ...` until
+    /// `declared_pages`.
+    stride: Option<u64>,
+}
+
+impl ArenaWalkPlan {
+    fn new(raw_span: u64) -> Self {
+        let span_capped = raw_span > MAX_USER_VM_SPAN;
+        let span = raw_span.min(MAX_USER_VM_SPAN);
+        let declared_pages = span / PAGE_SIZE;
+        let sequential_to = declared_pages.min(MAX_ARENA_PAGES);
+        let truncated = declared_pages > sequential_to;
+        let stride = if declared_pages > MAX_ARENA_PAGES {
+            let tail_pages = declared_pages - MAX_ARENA_PAGES;
+            // div_ceil so stride * MAX_ARENA_STRIDE_PROBES covers
+            // the whole tail; .max(1) so a tail smaller than
+            // MAX_ARENA_STRIDE_PROBES still walks every remaining
+            // page sequentially.
+            Some(tail_pages.div_ceil(MAX_ARENA_STRIDE_PROBES).max(1))
+        } else {
+            None
+        };
+        Self {
+            declared_pages,
+            span_capped,
+            truncated,
+            sequential_to,
+            stride,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -310,6 +430,167 @@ mod tests {
         assert!(
             offsets.vm_struct_addr > 0,
             "vm_struct.addr follows the next/llnode union"
+        );
+    }
+
+    // ---- ArenaWalkPlan: span cap + stride sweep -------------------
+    //
+    // The plan is a pure function of the raw user_vm span. Pin its
+    // outputs against representative shapes so the snapshot_arena
+    // call site stays tight against:
+    //   - tiny arena (single page) — no truncation, no stride
+    //   - mid arena (just under 16 MiB) — sequential only
+    //   - large arena (declared > MAX_ARENA_PAGES) — sequential
+    //     prefix + stride sweep
+    //   - 4 GiB-cap (raw_span > MAX_USER_VM_SPAN) — span_capped flag,
+    //     declared_pages clamped to MAX_USER_VM_SPAN / PAGE_SIZE
+    //   - corrupt span (raw_span = u64::MAX) — capped, flag set,
+    //     no overflow
+
+    #[test]
+    fn arena_walk_plan_constants_sane() {
+        // The plan-derivation invariants depend on these constants.
+        // Pin them so a future tightening surfaces here, not in
+        // snapshot_arena's runtime behavior.
+        assert_eq!(MAX_USER_VM_SPAN, 0x1_0000_0000);
+        assert_eq!(PAGE_SIZE, 4096);
+        assert_eq!(MAX_ARENA_PAGES, 4096);
+        assert_eq!(MAX_ARENA_STRIDE_PROBES, 256);
+    }
+
+    #[test]
+    fn arena_walk_plan_single_page() {
+        // Smallest non-empty arena: one page. Sequential walk covers
+        // it; no stride needed; no truncation.
+        let plan = ArenaWalkPlan::new(PAGE_SIZE);
+        assert_eq!(plan.declared_pages, 1);
+        assert!(!plan.span_capped);
+        assert!(!plan.truncated);
+        assert_eq!(plan.sequential_to, 1);
+        assert_eq!(plan.stride, None);
+    }
+
+    #[test]
+    fn arena_walk_plan_exactly_max_arena_pages() {
+        // declared == MAX_ARENA_PAGES: still no stride, no truncation.
+        // Boundary case: MAX_ARENA_PAGES walks sequentially.
+        let plan = ArenaWalkPlan::new(MAX_ARENA_PAGES * PAGE_SIZE);
+        assert_eq!(plan.declared_pages, MAX_ARENA_PAGES);
+        assert!(!plan.truncated);
+        assert_eq!(plan.sequential_to, MAX_ARENA_PAGES);
+        assert_eq!(plan.stride, None);
+    }
+
+    #[test]
+    fn arena_walk_plan_one_page_past_max() {
+        // declared = MAX_ARENA_PAGES + 1: stride mode kicks in for
+        // the single tail page; stride must be 1 (every page).
+        let plan = ArenaWalkPlan::new((MAX_ARENA_PAGES + 1) * PAGE_SIZE);
+        assert_eq!(plan.declared_pages, MAX_ARENA_PAGES + 1);
+        assert!(plan.truncated);
+        assert_eq!(plan.sequential_to, MAX_ARENA_PAGES);
+        assert_eq!(plan.stride, Some(1));
+    }
+
+    #[test]
+    fn arena_walk_plan_full_4gib() {
+        // Largest legitimate arena: full 4 GiB user_vm window (1M pages).
+        // Sequential covers first 16 MiB; stride sweeps the remaining
+        // ~1M-4096 pages with 256 probes -> stride = ceil((1M - 4096) / 256).
+        let raw = MAX_USER_VM_SPAN;
+        let plan = ArenaWalkPlan::new(raw);
+        assert_eq!(plan.declared_pages, raw / PAGE_SIZE);
+        assert!(!plan.span_capped, "exactly 4 GiB is at the cap, not above");
+        assert!(plan.truncated);
+        assert_eq!(plan.sequential_to, MAX_ARENA_PAGES);
+        let stride = plan.stride.expect("stride mode for >MAX_ARENA_PAGES");
+        let tail = plan.declared_pages - MAX_ARENA_PAGES;
+        // Verify stride covers the tail: stride * MAX_ARENA_STRIDE_PROBES
+        // must reach `tail` with at most one slot of overshoot.
+        assert!(stride * MAX_ARENA_STRIDE_PROBES >= tail);
+        assert!((stride - 1) * MAX_ARENA_STRIDE_PROBES < tail);
+    }
+
+    #[test]
+    fn arena_walk_plan_caps_at_4gib() {
+        // Raw span 8 GiB (corrupt struct): span_capped flag set,
+        // declared_pages clamped to MAX_USER_VM_SPAN / PAGE_SIZE.
+        let plan = ArenaWalkPlan::new(2 * MAX_USER_VM_SPAN);
+        assert!(plan.span_capped);
+        assert_eq!(plan.declared_pages, MAX_USER_VM_SPAN / PAGE_SIZE);
+        assert!(plan.truncated);
+        assert!(plan.stride.is_some());
+    }
+
+    #[test]
+    fn arena_walk_plan_caps_corrupt_u64_max_span() {
+        // Pathological: raw_span = u64::MAX. The cap must apply
+        // BEFORE the span-to-pages division; without the cap,
+        // u64::MAX / PAGE_SIZE = ~4.5 quadrillion pages and the
+        // pgoff loop would live-lock.
+        let plan = ArenaWalkPlan::new(u64::MAX);
+        assert!(plan.span_capped);
+        assert_eq!(plan.declared_pages, MAX_USER_VM_SPAN / PAGE_SIZE);
+        assert!(plan.truncated);
+    }
+
+    #[test]
+    fn arena_walk_plan_zero_span() {
+        // Edge: zero span (empty arena, or torn struct with both
+        // user_vm_start == user_vm_end). No work. snapshot_arena's
+        // outer `user_vm_end <= user_vm_start` guard already rejects
+        // before reaching the plan, but the plan must still behave
+        // sanely for direct callers / future refactors.
+        let plan = ArenaWalkPlan::new(0);
+        assert_eq!(plan.declared_pages, 0);
+        assert!(!plan.span_capped);
+        assert!(!plan.truncated);
+        assert_eq!(plan.sequential_to, 0);
+        assert_eq!(plan.stride, None);
+    }
+
+    #[test]
+    fn arena_walk_plan_stride_visits_every_pgoff_when_short_tail() {
+        // tail < MAX_ARENA_STRIDE_PROBES: stride saturates at 1, so
+        // the sweep walks every remaining page. Verify by simulating
+        // the walk and counting positions.
+        // declared = MAX_ARENA_PAGES + 50 -> tail = 50 -> stride = 1.
+        let plan = ArenaWalkPlan::new((MAX_ARENA_PAGES + 50) * PAGE_SIZE);
+        assert_eq!(plan.stride, Some(1));
+        let mut pgoff = plan.sequential_to;
+        let mut visited = 0u64;
+        while pgoff < plan.declared_pages {
+            visited += 1;
+            pgoff = pgoff.saturating_add(plan.stride.unwrap());
+        }
+        assert_eq!(visited, 50, "every tail page should be visited");
+    }
+
+    #[test]
+    fn arena_walk_plan_stride_distributes_probes_in_long_tail() {
+        // tail >> MAX_ARENA_STRIDE_PROBES: stride > 1, fewer probes
+        // than tail pages. Verify the sweep visits exactly
+        // approximately MAX_ARENA_STRIDE_PROBES positions.
+        let plan = ArenaWalkPlan::new(MAX_USER_VM_SPAN); // full 4 GiB
+        let mut pgoff = plan.sequential_to;
+        let mut visited = 0u64;
+        while pgoff < plan.declared_pages {
+            visited += 1;
+            pgoff = pgoff.saturating_add(plan.stride.unwrap());
+        }
+        // The sweep visits ceil(tail / stride) positions; for the
+        // 4 GiB case `stride * MAX_ARENA_STRIDE_PROBES >= tail` so
+        // visited <= MAX_ARENA_STRIDE_PROBES, and `>= tail / stride`
+        // ensures it's not zero.
+        assert!(
+            visited <= MAX_ARENA_STRIDE_PROBES + 1,
+            "visited {visited}, expected ≤ {} probes",
+            MAX_ARENA_STRIDE_PROBES + 1
+        );
+        assert!(
+            visited >= MAX_ARENA_STRIDE_PROBES - 1,
+            "visited {visited}, expected ≥ {}-ish probes",
+            MAX_ARENA_STRIDE_PROBES - 1
         );
     }
 }

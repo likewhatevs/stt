@@ -456,6 +456,21 @@ impl GuestMem {
     /// Page table entries contain guest physical addresses (GPAs). Since
     /// GuestMem is mapped at DRAM_START, all GPAs are adjusted by
     /// subtracting DRAM_START to produce offsets into the memory region.
+    ///
+    /// # 52-bit VA (`CONFIG_ARM64_VA_BITS_52`) is unsupported.
+    ///
+    /// Pinning to 48-bit VA: with 52-bit VA the kernel uses extended
+    /// addressing where the PGD index spans bits [51:42] (10 bits, 1024
+    /// entries) AND the OA in each descriptor splices the high VA bits
+    /// [51:48] into bits [15:12] of the descriptor word — the address
+    /// mask `0x0000_FFFF_FFFF_0000` would silently lose those bits and
+    /// the walker would produce wrong PAs without crashing. ktstr's
+    /// kconfig fragment (`ktstr.kconfig`) does not enable
+    /// `CONFIG_ARM64_VA_BITS_52`, and `CONFIG_ARM64_64K_PAGES` is also
+    /// not enabled — so the practical assumption is 48-bit VA. If a
+    /// future user pins `CONFIG_ARM64_VA_BITS_52=y`, this walker must
+    /// be replaced with a 52-bit-aware variant before the monitor
+    /// reads guest page tables on that kernel.
     #[cfg(target_arch = "aarch64")]
     fn walk_3level_aarch64_64k(&self, ttbr_pa: u64, kva: Kva) -> Option<u64> {
         use crate::vmm::kvm::DRAM_START;
