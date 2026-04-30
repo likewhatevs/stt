@@ -321,14 +321,17 @@ thread_local! {
 /// scope on the current thread, and restores the previous value on
 /// drop. Avoids leaking override state across tests sharing a thread
 /// (e.g. via test-runner thread pools).
+///
+/// `pub(crate)` so other test modules in the crate can use the
+/// fixture when they need to exercise guest-only paths.
 #[cfg(test)]
-struct IsGuestOverrideGuard {
+pub(crate) struct IsGuestOverrideGuard {
     prev: Option<bool>,
 }
 
 #[cfg(test)]
 impl IsGuestOverrideGuard {
-    fn new(value: bool) -> Self {
+    pub(crate) fn new(value: bool) -> Self {
         let prev = IS_GUEST_TEST_OVERRIDE.with(|c| c.replace(Some(value)));
         Self { prev }
     }
@@ -340,6 +343,25 @@ impl Drop for IsGuestOverrideGuard {
         let prev = self.prev;
         IS_GUEST_TEST_OVERRIDE.with(|c| c.set(prev));
     }
+}
+
+/// Reject a call to a guest-only entry point when invoked from host
+/// context. Returns `true` if the caller may proceed (we're inside a
+/// guest VM); `false` after emitting a `tracing::warn!` that names the
+/// caller and the message type, so a host-side caller surfaces in the
+/// log instead of silently no-op'ing.
+///
+/// `fn_name` is the calling function's name (e.g. `"write_msg"`) and
+/// is interpolated into the log message text.
+fn assert_guest_context(fn_name: &str, msg_type: u32) -> bool {
+    if !is_guest() {
+        tracing::warn!(
+            msg_type = msg_type,
+            "shm_ring::{fn_name} called from host context; use GuestMem::write_* instead"
+        );
+        return false;
+    }
+    true
 }
 
 /// Guest-only. Host-side code must use `GuestMem::write_*` instead.
@@ -356,11 +378,7 @@ impl Drop for IsGuestOverrideGuard {
 /// would alias the host's `&` view and violate Rust's reference
 /// rules, even though the lock serializes guest-side writers.
 pub fn write_msg(msg_type: u32, payload: &[u8]) {
-    if !is_guest() {
-        tracing::warn!(
-            msg_type = msg_type,
-            "shm_ring::write_msg called from host context; use GuestMem::write_* instead"
-        );
+    if !assert_guest_context("write_msg", msg_type) {
         return;
     }
     let Ok((ptr, size)) = shm_ptr() else { return };
@@ -382,11 +400,7 @@ pub fn write_msg(msg_type: u32, payload: &[u8]) {
 /// a tracing warning) if invoked from a host context, and false (no
 /// log) if SHM is not yet initialized inside the guest.
 pub fn write_msg_nonblocking(msg_type: u32, payload: &[u8]) -> bool {
-    if !is_guest() {
-        tracing::warn!(
-            msg_type = msg_type,
-            "shm_ring::write_msg_nonblocking called from host context; use GuestMem::write_* instead"
-        );
+    if !assert_guest_context("write_msg_nonblocking", msg_type) {
         return false;
     }
     let Ok((ptr, size)) = shm_ptr() else {
@@ -2462,29 +2476,75 @@ mod tests {
 
     #[test]
     fn write_msg_nonblocking_rejects_host_context() {
-        // With is_guest() forced false, write_msg_nonblocking must
-        // return false WITHOUT touching SHM_PTR or attempting any
-        // shm_write_raw work. Without the guard, the function
-        // would still return false (because shm_ptr() fails on
-        // host), but it would try to read /proc/cmdline first;
-        // the guard short-circuits that.
+        // Wire up SHM_PTR with a freshly-initialized ring BEFORE
+        // forcing host context, so the guard is the ONLY thing that
+        // can prevent the write. Without this setup, the test would
+        // pass trivially: shm_ptr() would fail, and `assert_guest_context`
+        // never gets exercised. This way, if the guard were removed,
+        // shm_write_raw would advance write_ptr and the assertion
+        // below would catch it.
+        let _ptr_lock = SHM_PTR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let shm_size = 1024usize;
+        let (ptr, size) = ensure_test_shm_ptr(shm_size);
+        // SAFETY: lock held; no other test mutates this buffer
+        // while we hold the mutex. `ptr` outlives the call (leaked).
+        unsafe {
+            std::ptr::write_bytes(ptr, 0, size);
+        }
+        let buf_slice = unsafe { std::slice::from_raw_parts_mut(ptr, size) };
+        shm_init(buf_slice, 0, size);
+
+        // Now force host context and call.
         let _guard = IsGuestOverrideGuard::new(false);
         let result = write_msg_nonblocking(MSG_TYPE_STIMULUS, b"should-not-write");
         assert!(
             !result,
             "write_msg_nonblocking from host context must return false"
         );
+
+        // Ring header MUST be untouched: the guard rejected the call
+        // before any write reached shm_write_raw. write_ptr at offset
+        // 16 is the canonical "did anything land?" signal — a
+        // successful write would have advanced it past 0.
+        let buf_slice_ro = unsafe { std::slice::from_raw_parts(ptr, size) };
+        let write_ptr_after = u64::from_ne_bytes(buf_slice_ro[16..24].try_into().unwrap());
+        assert_eq!(
+            write_ptr_after, 0,
+            "guard must prevent any write to the ring; write_ptr should remain 0"
+        );
+        let drops_after = u64::from_ne_bytes(buf_slice_ro[32..40].try_into().unwrap());
+        assert_eq!(
+            drops_after, 0,
+            "guard must short-circuit before drop accounting"
+        );
     }
 
     #[test]
     fn write_msg_does_not_panic_from_host_context() {
-        // write_msg returns (); the only externally observable
-        // signal of the guard is the absence of a panic and the
-        // absence of any modification to a SHM region we did not
-        // wire up. Verify it returns cleanly.
+        // Mirror of the nonblocking test for the blocking entry
+        // point. Wire up SHM_PTR + initialize so the guard is the
+        // only thing that can stop the write. Verify (a) no panic,
+        // (b) ring header unchanged after the call.
+        let _ptr_lock = SHM_PTR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let shm_size = 1024usize;
+        let (ptr, size) = ensure_test_shm_ptr(shm_size);
+        // SAFETY: see write_msg_nonblocking_rejects_host_context.
+        unsafe {
+            std::ptr::write_bytes(ptr, 0, size);
+        }
+        let buf_slice = unsafe { std::slice::from_raw_parts_mut(ptr, size) };
+        shm_init(buf_slice, 0, size);
+
         let _guard = IsGuestOverrideGuard::new(false);
         write_msg(MSG_TYPE_STIMULUS, b"should-not-write");
-        // No panic — pass.
+        // No panic above — first half of the assertion. Now check
+        // the ring header is unchanged.
+        let buf_slice_ro = unsafe { std::slice::from_raw_parts(ptr, size) };
+        let write_ptr_after = u64::from_ne_bytes(buf_slice_ro[16..24].try_into().unwrap());
+        assert_eq!(
+            write_ptr_after, 0,
+            "guard must prevent any write to the ring; write_ptr should remain 0"
+        );
     }
 
     #[test]

@@ -126,6 +126,89 @@ pub struct StallDumpPercpuEntry {
     pub per_cpu: Vec<Option<RenderedValue>>,
 }
 
+impl std::fmt::Display for StallDumpReport {
+    /// Human-readable rendering of every map. JSON remains the
+    /// programmatic form via `serde_json`; this Display is the
+    /// default presentation used in test-failure output.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.maps.is_empty() {
+            return f.write_str("(empty stall dump)");
+        }
+        for (i, m) in self.maps.iter().enumerate() {
+            if i > 0 {
+                f.write_str("\n\n")?;
+            }
+            std::fmt::Display::fmt(m, f)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Display for StallDumpMap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "map {} (type={}, value_size={}, max_entries={})",
+            self.name, self.map_type, self.value_size, self.max_entries
+        )?;
+        if let Some(err) = &self.error {
+            write!(f, " [error: {err}]")?;
+        }
+        if let Some(value) = &self.value {
+            f.write_str("\n")?;
+            std::fmt::Display::fmt(value, f)?;
+        }
+        for entry in &self.entries {
+            f.write_str("\n")?;
+            std::fmt::Display::fmt(entry, f)?;
+        }
+        for entry in &self.percpu_entries {
+            f.write_str("\n")?;
+            std::fmt::Display::fmt(entry, f)?;
+        }
+        if let Some(arena) = &self.arena {
+            // Arena snapshots have their own Debug-derived shape; use
+            // the debug representation for now (one line per page).
+            // The full structured render is in the JSON serialization.
+            write!(f, "\narena: {arena:?}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Display for StallDumpEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("entry {\n  key: ")?;
+        match &self.key {
+            Some(k) => std::fmt::Display::fmt(k, f)?,
+            None => write!(f, "{} (raw)", self.key_hex)?,
+        }
+        f.write_str("\n  value: ")?;
+        match &self.value {
+            Some(v) => std::fmt::Display::fmt(v, f)?,
+            None => write!(f, "{} (raw)", self.value_hex)?,
+        }
+        f.write_str("\n}")
+    }
+}
+
+impl std::fmt::Display for StallDumpPercpuEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "key {}:", self.key)?;
+        for (cpu, slot) in self.per_cpu.iter().enumerate() {
+            f.write_str("\n")?;
+            match slot {
+                Some(v) => {
+                    write!(f, "  cpu {cpu}: ")?;
+                    std::fmt::Display::fmt(v, f)?;
+                }
+                None => write!(f, "  cpu {cpu}: <unmapped>")?,
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Maximum per-CPU array key span the dump path will iterate.
 ///
 /// `BPF_MAP_TYPE_PERCPU_ARRAY` declares `max_entries` at create-time;
@@ -555,5 +638,129 @@ mod tests {
         let json = serde_json::to_string(&report).unwrap();
         let parsed: StallDumpReport = serde_json::from_str(&json).unwrap();
         assert!(parsed.maps.is_empty());
+    }
+
+    // ---- Display impl coverage --------------------------------------
+    //
+    // The Display impl is the human-readable form used in test
+    // failure output. Pin its layout against representative shapes.
+
+    fn make_simple_map() -> StallDumpMap {
+        StallDumpMap {
+            name: "scx_demo.bss".into(),
+            map_type: BPF_MAP_TYPE_ARRAY,
+            value_size: 8,
+            max_entries: 1,
+            value: Some(RenderedValue::Struct {
+                type_name: Some("task_ctx".into()),
+                members: vec![super::super::btf_render::RenderedMember {
+                    name: "weight".into(),
+                    value: RenderedValue::Uint {
+                        bits: 32,
+                        value: 1024,
+                    },
+                }],
+            }),
+            entries: Vec::new(),
+            percpu_entries: Vec::new(),
+            arena: None,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn report_display_empty() {
+        let report = StallDumpReport::default();
+        assert_eq!(format!("{report}"), "(empty stall dump)");
+    }
+
+    #[test]
+    fn report_display_one_map_with_value() {
+        let report = StallDumpReport {
+            maps: vec![make_simple_map()],
+        };
+        let out = format!("{report}");
+        // Map header line.
+        assert!(
+            out.starts_with("map scx_demo.bss (type="),
+            "missing header: {out}"
+        );
+        // Struct rendering with one indented member.
+        assert!(out.contains("struct task_ctx {"), "missing struct: {out}");
+        assert!(out.contains("  weight: 1024"), "missing member: {out}");
+        assert!(out.ends_with('}'), "missing closing brace: {out}");
+    }
+
+    #[test]
+    fn report_display_multiple_maps_separated() {
+        let report = StallDumpReport {
+            maps: vec![make_simple_map(), make_simple_map()],
+        };
+        let out = format!("{report}");
+        // Maps separated by a blank line (\n\n).
+        let blank_line_count = out.matches("\n\n").count();
+        assert_eq!(
+            blank_line_count, 1,
+            "expected one blank-line separator between two maps: {out}"
+        );
+    }
+
+    #[test]
+    fn map_display_includes_error_marker() {
+        let mut m = make_simple_map();
+        m.value = None;
+        m.error = Some("ARRAY value region unreadable".into());
+        let out = format!("{m}");
+        assert!(
+            out.contains("[error: ARRAY value region unreadable]"),
+            "missing error marker: {out}"
+        );
+    }
+
+    #[test]
+    fn entry_display_renders_key_and_value() {
+        let entry = StallDumpEntry {
+            key: Some(RenderedValue::Uint { bits: 32, value: 7 }),
+            key_hex: "07 00 00 00".into(),
+            value: Some(RenderedValue::Uint {
+                bits: 32,
+                value: 99,
+            }),
+            value_hex: "63 00 00 00".into(),
+        };
+        let out = format!("{entry}");
+        assert!(out.contains("key: 7"), "missing key: {out}");
+        assert!(out.contains("value: 99"), "missing value: {out}");
+    }
+
+    #[test]
+    fn entry_display_falls_back_to_hex_when_no_btf() {
+        // No BTF → key/value are None; Display surfaces the hex.
+        let entry = StallDumpEntry {
+            key: None,
+            key_hex: "ab cd".into(),
+            value: None,
+            value_hex: "ef".into(),
+        };
+        let out = format!("{entry}");
+        assert!(out.contains("ab cd (raw)"), "missing key hex: {out}");
+        assert!(out.contains("ef (raw)"), "missing value hex: {out}");
+    }
+
+    #[test]
+    fn percpu_entry_display_shows_each_cpu() {
+        let entry = StallDumpPercpuEntry {
+            key: 0,
+            per_cpu: vec![
+                Some(RenderedValue::Uint { bits: 32, value: 1 }),
+                None,
+                Some(RenderedValue::Uint { bits: 32, value: 3 }),
+            ],
+        };
+        let out = format!("{entry}");
+        assert!(out.contains("key 0:"));
+        assert!(out.contains("cpu 0: 1"));
+        assert!(out.contains("cpu 1: <unmapped>"));
+        assert!(out.contains("cpu 2: 3"));
     }
 }

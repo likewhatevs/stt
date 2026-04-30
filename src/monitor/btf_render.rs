@@ -90,7 +90,17 @@ pub enum RenderedValue {
     Bytes { hex: String },
     /// The byte slice ended before the type's declared size. `needed`
     /// is the required byte count; `had` is what was supplied.
-    Truncated { needed: usize, had: usize },
+    /// `partial` carries whatever decoded successfully before the
+    /// truncation: a `Struct` with the members that fit (further
+    /// truncated members nest as their own [`Truncated`]), an
+    /// `Array` with the elements that fit, or a `Bytes` hex dump of
+    /// the raw bytes that were available when no structured partial
+    /// applied (e.g. a 2-byte slice for a 4-byte int).
+    Truncated {
+        needed: usize,
+        had: usize,
+        partial: Box<RenderedValue>,
+    },
     /// BTF type kind the renderer does not handle (Func, FuncProto,
     /// Datasec, Var, Void, or a kind beyond the qualifier-peel cap).
     /// `reason` carries the human-readable cause.
@@ -104,6 +114,157 @@ pub enum RenderedValue {
 pub struct RenderedMember {
     pub name: String,
     pub value: RenderedValue,
+}
+
+impl std::fmt::Display for RenderedValue {
+    /// Human-readable rendering for test-failure output. JSON remains
+    /// the programmatic form (via `serde_json`); this Display emits
+    /// pretty-printed text suitable for assertion failure messages,
+    /// e.g.
+    ///
+    /// ```text
+    /// struct task_ctx {
+    ///   weight: 1024
+    ///   last_runnable_at: 12345678901234
+    /// }
+    /// ```
+    ///
+    /// Nested structs and arrays indent by two spaces per level.
+    /// Scalar-only arrays render inline (`[1, 2, 3]`); arrays
+    /// containing structs / nested arrays render block-style with
+    /// one element per line.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write_rendered_value(f, self, 0)
+    }
+}
+
+/// Indentation prefix. Two-space steps match the example in the
+/// module-level Display doc.
+const INDENT: &str = "  ";
+
+/// Recursive Display helper. Tracks current indentation `depth` so
+/// nested structs / block-style arrays line up correctly. Direct
+/// `Display::fmt` cannot pass extra state, so this is the entry
+/// point for every recursive call.
+fn write_rendered_value(
+    f: &mut std::fmt::Formatter<'_>,
+    v: &RenderedValue,
+    depth: usize,
+) -> std::fmt::Result {
+    match v {
+        RenderedValue::Int { value, .. } => write!(f, "{value}"),
+        RenderedValue::Uint { value, .. } => write!(f, "{value}"),
+        RenderedValue::Bool { value } => write!(f, "{value}"),
+        RenderedValue::Char { value } => {
+            // Printable ASCII is shown as `'x'` (matches C char-literal
+            // notation an operator would write in source); other bytes
+            // fall back to `0xNN` so the raw value is unambiguous.
+            if (0x20..=0x7e).contains(value) {
+                write!(f, "'{}'", *value as char)
+            } else {
+                write!(f, "0x{value:02x}")
+            }
+        }
+        RenderedValue::Float { value, .. } => write!(f, "{value}"),
+        RenderedValue::Enum { value, variant, .. } => match variant {
+            Some(name) => write!(f, "{name} ({value})"),
+            None => write!(f, "{value}"),
+        },
+        RenderedValue::Ptr { value } => write!(f, "0x{value:x}"),
+        RenderedValue::Bytes { hex } => write!(f, "{hex}"),
+        RenderedValue::Truncated {
+            needed,
+            had,
+            partial,
+        } => {
+            write!(f, "<truncated needed={needed} had={had}> ")?;
+            write_rendered_value(f, partial, depth)
+        }
+        RenderedValue::Unsupported { reason } => write!(f, "<unsupported: {reason}>"),
+        RenderedValue::Array { len, elements } => {
+            if elements.is_empty() {
+                return write!(f, "[]");
+            }
+            // Inline if every element is scalar (no struct, no array,
+            // no truncated-with-struct-partial). Block-style otherwise
+            // so nested structs stay readable.
+            let inline = elements.iter().all(is_inline_scalar);
+            if inline {
+                f.write_str("[")?;
+                for (i, e) in elements.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write_rendered_value(f, e, depth)?;
+                }
+                f.write_str("]")?;
+                if elements.len() < *len {
+                    write!(f, " /* {} of {len} shown */", elements.len())?;
+                }
+                Ok(())
+            } else {
+                f.write_str("[")?;
+                for e in elements {
+                    f.write_str("\n")?;
+                    write_indent(f, depth + 1)?;
+                    write_rendered_value(f, e, depth + 1)?;
+                }
+                f.write_str("\n")?;
+                write_indent(f, depth)?;
+                f.write_str("]")?;
+                if elements.len() < *len {
+                    write!(f, " /* {} of {len} shown */", elements.len())?;
+                }
+                Ok(())
+            }
+        }
+        RenderedValue::Struct { type_name, members } => {
+            match type_name {
+                Some(name) => write!(f, "struct {name} {{")?,
+                None => f.write_str("struct {")?,
+            }
+            if members.is_empty() {
+                return f.write_str("}");
+            }
+            for m in members {
+                f.write_str("\n")?;
+                write_indent(f, depth + 1)?;
+                if m.name.is_empty() {
+                    f.write_str("<anon>: ")?;
+                } else {
+                    write!(f, "{}: ", m.name)?;
+                }
+                write_rendered_value(f, &m.value, depth + 1)?;
+            }
+            f.write_str("\n")?;
+            write_indent(f, depth)?;
+            f.write_str("}")
+        }
+    }
+}
+
+/// Whether a value renders as a single line under Display. Used by
+/// the array case to pick inline vs block layout.
+fn is_inline_scalar(v: &RenderedValue) -> bool {
+    matches!(
+        v,
+        RenderedValue::Int { .. }
+            | RenderedValue::Uint { .. }
+            | RenderedValue::Bool { .. }
+            | RenderedValue::Char { .. }
+            | RenderedValue::Float { .. }
+            | RenderedValue::Enum { .. }
+            | RenderedValue::Ptr { .. }
+            | RenderedValue::Bytes { .. }
+            | RenderedValue::Unsupported { .. }
+    )
+}
+
+fn write_indent(f: &mut std::fmt::Formatter<'_>, depth: usize) -> std::fmt::Result {
+    for _ in 0..depth {
+        f.write_str(INDENT)?;
+    }
+    Ok(())
 }
 
 /// Render `bytes` according to BTF type `type_id`.
@@ -141,6 +302,9 @@ fn render_value_inner(btf: &Btf, type_id: u32, bytes: &[u8], depth: u32) -> Rend
                 return RenderedValue::Truncated {
                     needed,
                     had: bytes.len(),
+                    partial: Box::new(RenderedValue::Bytes {
+                        hex: hex_dump(bytes),
+                    }),
                 };
             }
             let raw = read_uint_le(&bytes[..needed]);
@@ -176,6 +340,9 @@ fn render_value_inner(btf: &Btf, type_id: u32, bytes: &[u8], depth: u32) -> Rend
                 return RenderedValue::Truncated {
                     needed,
                     had: bytes.len(),
+                    partial: Box::new(RenderedValue::Bytes {
+                        hex: hex_dump(bytes),
+                    }),
                 };
             }
             let raw = read_uint_le(&bytes[..needed]);
@@ -207,6 +374,9 @@ fn render_value_inner(btf: &Btf, type_id: u32, bytes: &[u8], depth: u32) -> Rend
                 return RenderedValue::Truncated {
                     needed: 8,
                     had: bytes.len(),
+                    partial: Box::new(RenderedValue::Bytes {
+                        hex: hex_dump(bytes),
+                    }),
                 };
             }
             let val = u64::from_le_bytes(bytes[..8].try_into().unwrap());
@@ -241,9 +411,13 @@ fn render_value_inner(btf: &Btf, type_id: u32, bytes: &[u8], depth: u32) -> Rend
                 let start = i * elem_size;
                 let end = start + elem_size;
                 if end > bytes.len() {
+                    let avail = &bytes[start.min(bytes.len())..];
                     elements.push(RenderedValue::Truncated {
                         needed: elem_size,
-                        had: bytes.len().saturating_sub(start),
+                        had: avail.len(),
+                        partial: Box::new(RenderedValue::Bytes {
+                            hex: hex_dump(avail),
+                        }),
                     });
                     break;
                 }
@@ -288,6 +462,9 @@ fn render_int(int: &btf_rs::Int, bytes: &[u8]) -> RenderedValue {
         return RenderedValue::Truncated {
             needed,
             had: bytes.len(),
+            partial: Box::new(RenderedValue::Bytes {
+                hex: hex_dump(bytes),
+            }),
         };
     }
     if int.is_bool() && needed >= 1 {
@@ -347,6 +524,9 @@ fn render_float(size: usize, bytes: &[u8]) -> RenderedValue {
         return RenderedValue::Truncated {
             needed: size,
             had: bytes.len(),
+            partial: Box::new(RenderedValue::Bytes {
+                hex: hex_dump(bytes),
+            }),
         };
     }
     let value = match size {
@@ -366,19 +546,30 @@ fn render_float(size: usize, bytes: &[u8]) -> RenderedValue {
 
 fn render_struct(btf: &Btf, s: &Struct, bytes: &[u8], depth: u32) -> RenderedValue {
     let type_name = btf.resolve_name(s).ok().filter(|n| !n.is_empty());
-    if bytes.len() < s.size() {
-        return RenderedValue::Truncated {
-            needed: s.size(),
-            had: bytes.len(),
-        };
-    }
+    let truncated = bytes.len() < s.size();
+    // Render every member regardless of whether the full struct
+    // fits: `render_member` already emits a per-member
+    // [`RenderedValue::Truncated`] for members that extend past
+    // the supplied bytes. This way, the outer Truncated's
+    // `partial` field carries the members that DID decode, instead
+    // of discarding the whole render. See [`RenderedValue::Truncated`]
+    // doc for the partial-render contract.
     let mut members = Vec::with_capacity(s.members.len());
     for m in &s.members {
         let name = btf.resolve_name(m).unwrap_or_default();
         let value = render_member(btf, m, bytes, depth);
         members.push(RenderedMember { name, value });
     }
-    RenderedValue::Struct { type_name, members }
+    let rendered = RenderedValue::Struct { type_name, members };
+    if truncated {
+        RenderedValue::Truncated {
+            needed: s.size(),
+            had: bytes.len(),
+            partial: Box::new(rendered),
+        }
+    } else {
+        rendered
+    }
 }
 
 fn render_member(btf: &Btf, m: &Member, parent_bytes: &[u8], depth: u32) -> RenderedValue {
@@ -412,9 +603,19 @@ fn render_member(btf: &Btf, m: &Member, parent_bytes: &[u8], depth: u32) -> Rend
         };
     };
     if byte_off + size > parent_bytes.len() {
+        // Attempt a partial decode from whatever bytes ARE available
+        // for this member: the inner renderer will itself emit a
+        // Truncated/Bytes/etc. that carries the recoverable subset.
+        // Wrapping that subset in this outer Truncated tells the
+        // consumer "the full member needed N bytes, only M survived,
+        // here's what we got".
+        let avail_start = byte_off.min(parent_bytes.len());
+        let avail = &parent_bytes[avail_start..];
+        let partial = render_value_inner(btf, member_type_id, avail, depth + 1);
         return RenderedValue::Truncated {
             needed: size,
-            had: parent_bytes.len().saturating_sub(byte_off),
+            had: avail.len(),
+            partial: Box::new(partial),
         };
     }
     render_value_inner(
@@ -442,9 +643,14 @@ fn render_bitfield(
     let bits_needed = bit_shift + width;
     let bytes_needed = bits_needed.div_ceil(8);
     if byte_start + bytes_needed > parent_bytes.len() {
+        let avail_start = byte_start.min(parent_bytes.len());
+        let avail = &parent_bytes[avail_start..];
         return RenderedValue::Truncated {
             needed: bytes_needed,
-            had: parent_bytes.len().saturating_sub(byte_start),
+            had: avail.len(),
+            partial: Box::new(RenderedValue::Bytes {
+                hex: hex_dump(avail),
+            }),
         };
     }
     // Pull up to 16 bytes (max bitfield is 64 bits + 7 bit shift = 71
@@ -617,7 +823,14 @@ mod tests {
         };
         // Empty bytes for a 4-byte int -> Truncated.
         let v = render_value(&btf, id, &[]);
-        assert!(matches!(v, RenderedValue::Truncated { needed: 4, had: 0 }));
+        assert!(matches!(
+            v,
+            RenderedValue::Truncated {
+                needed: 4,
+                had: 0,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -639,6 +852,463 @@ mod tests {
         };
         // 2 bytes for a 4-byte u32 should yield Truncated.
         let v = render_value(&btf, id, &[0xff, 0xff]);
-        assert!(matches!(v, RenderedValue::Truncated { needed: 4, had: 2 }));
+        assert!(matches!(
+            v,
+            RenderedValue::Truncated {
+                needed: 4,
+                had: 2,
+                ..
+            }
+        ));
+    }
+
+    // ---- Display impl coverage --------------------------------------
+    //
+    // Display is the human-readable form used in test failure output.
+    // Variant matrix tests:
+    //   - scalars (Int / Uint / Bool / Char / Float / Enum / Ptr)
+    //   - Bytes / Unsupported
+    //   - Truncated (with various partial shapes)
+    //   - Array (inline scalar vs block-style nested)
+    //   - Struct (named, unnamed, empty, nested)
+
+    #[test]
+    fn display_int_uint_bool() {
+        assert_eq!(
+            format!(
+                "{}",
+                RenderedValue::Int {
+                    bits: 32,
+                    value: -7
+                }
+            ),
+            "-7"
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                RenderedValue::Uint {
+                    bits: 64,
+                    value: 42
+                }
+            ),
+            "42"
+        );
+        assert_eq!(format!("{}", RenderedValue::Bool { value: true }), "true");
+        assert_eq!(format!("{}", RenderedValue::Bool { value: false }), "false");
+    }
+
+    #[test]
+    fn display_char_printable_and_nonprintable() {
+        // Printable ASCII renders as 'x'.
+        assert_eq!(format!("{}", RenderedValue::Char { value: b'A' }), "'A'");
+        // Non-printable (NUL, control, high-bit) renders as 0xNN.
+        assert_eq!(format!("{}", RenderedValue::Char { value: 0x00 }), "0x00");
+        assert_eq!(format!("{}", RenderedValue::Char { value: 0x7f }), "0x7f");
+        assert_eq!(format!("{}", RenderedValue::Char { value: 0xab }), "0xab");
+    }
+
+    #[test]
+    fn display_float() {
+        assert_eq!(
+            format!(
+                "{}",
+                RenderedValue::Float {
+                    bits: 64,
+                    value: 1.5
+                }
+            ),
+            "1.5"
+        );
+    }
+
+    #[test]
+    fn display_enum_with_and_without_variant() {
+        assert_eq!(
+            format!(
+                "{}",
+                RenderedValue::Enum {
+                    bits: 32,
+                    value: 1,
+                    variant: Some("RUNNING".into()),
+                }
+            ),
+            "RUNNING (1)"
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                RenderedValue::Enum {
+                    bits: 32,
+                    value: 99,
+                    variant: None,
+                }
+            ),
+            "99"
+        );
+    }
+
+    #[test]
+    fn display_ptr_is_lowercase_hex() {
+        assert_eq!(
+            format!(
+                "{}",
+                RenderedValue::Ptr {
+                    value: 0xffff_8000_1234_5678
+                }
+            ),
+            "0xffff800012345678"
+        );
+        assert_eq!(format!("{}", RenderedValue::Ptr { value: 0 }), "0x0");
+    }
+
+    #[test]
+    fn display_bytes_passes_through() {
+        assert_eq!(
+            format!(
+                "{}",
+                RenderedValue::Bytes {
+                    hex: "12 34 ab".into()
+                }
+            ),
+            "12 34 ab"
+        );
+    }
+
+    #[test]
+    fn display_unsupported_includes_reason() {
+        assert_eq!(
+            format!(
+                "{}",
+                RenderedValue::Unsupported {
+                    reason: "void".into()
+                }
+            ),
+            "<unsupported: void>"
+        );
+    }
+
+    #[test]
+    fn display_truncated_with_bytes_partial() {
+        let v = RenderedValue::Truncated {
+            needed: 4,
+            had: 2,
+            partial: Box::new(RenderedValue::Bytes {
+                hex: "12 34".into(),
+            }),
+        };
+        assert_eq!(format!("{v}"), "<truncated needed=4 had=2> 12 34");
+    }
+
+    #[test]
+    fn display_struct_with_named_members() {
+        // Mirror the team-lead's example.
+        let v = RenderedValue::Struct {
+            type_name: Some("task_ctx".into()),
+            members: vec![
+                RenderedMember {
+                    name: "weight".into(),
+                    value: RenderedValue::Uint {
+                        bits: 32,
+                        value: 1024,
+                    },
+                },
+                RenderedMember {
+                    name: "last_runnable_at".into(),
+                    value: RenderedValue::Uint {
+                        bits: 64,
+                        value: 12_345_678_901_234,
+                    },
+                },
+            ],
+        };
+        assert_eq!(
+            format!("{v}"),
+            "struct task_ctx {\n  weight: 1024\n  last_runnable_at: 12345678901234\n}"
+        );
+    }
+
+    #[test]
+    fn display_struct_anonymous_uses_struct_brace() {
+        let v = RenderedValue::Struct {
+            type_name: None,
+            members: vec![RenderedMember {
+                name: "x".into(),
+                value: RenderedValue::Int { bits: 32, value: 7 },
+            }],
+        };
+        assert_eq!(format!("{v}"), "struct {\n  x: 7\n}");
+    }
+
+    #[test]
+    fn display_empty_struct_is_one_line() {
+        let v = RenderedValue::Struct {
+            type_name: Some("empty".into()),
+            members: vec![],
+        };
+        assert_eq!(format!("{v}"), "struct empty {}");
+    }
+
+    #[test]
+    fn display_anonymous_member_uses_anon_marker() {
+        // BTF anonymous union/struct members surface with empty name;
+        // Display marks them so the operator knows the position
+        // without seeing a `:` with no preceding identifier.
+        let v = RenderedValue::Struct {
+            type_name: Some("u".into()),
+            members: vec![RenderedMember {
+                name: String::new(),
+                value: RenderedValue::Uint { bits: 32, value: 5 },
+            }],
+        };
+        assert_eq!(format!("{v}"), "struct u {\n  <anon>: 5\n}");
+    }
+
+    #[test]
+    fn display_nested_struct_indents_correctly() {
+        let inner = RenderedValue::Struct {
+            type_name: Some("inner".into()),
+            members: vec![RenderedMember {
+                name: "a".into(),
+                value: RenderedValue::Uint { bits: 32, value: 1 },
+            }],
+        };
+        let outer = RenderedValue::Struct {
+            type_name: Some("outer".into()),
+            members: vec![RenderedMember {
+                name: "child".into(),
+                value: inner,
+            }],
+        };
+        assert_eq!(
+            format!("{outer}"),
+            "struct outer {\n  child: struct inner {\n    a: 1\n  }\n}"
+        );
+    }
+
+    #[test]
+    fn display_array_scalars_inline() {
+        let v = RenderedValue::Array {
+            len: 3,
+            elements: vec![
+                RenderedValue::Uint { bits: 8, value: 1 },
+                RenderedValue::Uint { bits: 8, value: 2 },
+                RenderedValue::Uint { bits: 8, value: 3 },
+            ],
+        };
+        assert_eq!(format!("{v}"), "[1, 2, 3]");
+    }
+
+    #[test]
+    fn display_array_empty() {
+        let v = RenderedValue::Array {
+            len: 0,
+            elements: vec![],
+        };
+        assert_eq!(format!("{v}"), "[]");
+    }
+
+    #[test]
+    fn display_array_truncated_marker() {
+        // Element list shorter than declared `len` surfaces the
+        // truncation in a comment.
+        let v = RenderedValue::Array {
+            len: 5,
+            elements: vec![
+                RenderedValue::Uint { bits: 8, value: 1 },
+                RenderedValue::Uint { bits: 8, value: 2 },
+            ],
+        };
+        assert_eq!(format!("{v}"), "[1, 2] /* 2 of 5 shown */");
+    }
+
+    #[test]
+    fn display_array_of_structs_block_style() {
+        let elem = RenderedValue::Struct {
+            type_name: Some("e".into()),
+            members: vec![RenderedMember {
+                name: "v".into(),
+                value: RenderedValue::Uint {
+                    bits: 32,
+                    value: 10,
+                },
+            }],
+        };
+        let v = RenderedValue::Array {
+            len: 1,
+            elements: vec![elem],
+        };
+        assert_eq!(format!("{v}"), "[\n  struct e {\n    v: 10\n  }\n]");
+    }
+
+    #[test]
+    fn display_truncated_with_struct_partial_shows_decoded_members() {
+        // The whole point of #48: decoded members survive when the
+        // struct's byte slice was short. Display surfaces the partial
+        // so test failure output points the operator at the fields
+        // that DID decode.
+        let partial = RenderedValue::Struct {
+            type_name: Some("partial_struct".into()),
+            members: vec![
+                RenderedMember {
+                    name: "a".into(),
+                    value: RenderedValue::Uint { bits: 32, value: 7 },
+                },
+                RenderedMember {
+                    name: "b".into(),
+                    value: RenderedValue::Truncated {
+                        needed: 4,
+                        had: 0,
+                        partial: Box::new(RenderedValue::Bytes { hex: "".into() }),
+                    },
+                },
+            ],
+        };
+        let v = RenderedValue::Truncated {
+            needed: 8,
+            had: 4,
+            partial: Box::new(partial),
+        };
+        let out = format!("{v}");
+        // Outer truncation marker + partial struct block on the
+        // same line (the leading marker is one-line, then the
+        // struct's own line breaks follow).
+        assert!(out.starts_with("<truncated needed=8 had=4> struct partial_struct {"));
+        assert!(out.contains("a: 7"));
+        assert!(out.contains("b: <truncated needed=4 had=0>"));
+    }
+
+    // ---- #48: partial-render contract --------------------------------
+    //
+    // Truncated must carry a `partial: Box<RenderedValue>` rather than
+    // discarding decoded members. Two fixtures:
+    //   1. struct truncation -> partial is Struct with decoded
+    //      members (one of which may itself be Truncated for the
+    //      member that overran).
+    //   2. scalar truncation -> partial is Bytes hex of available bytes.
+
+    #[test]
+    fn truncated_int_carries_bytes_partial() {
+        let Some(btf) = test_btf() else {
+            crate::report::test_skip("test_btf returned None");
+            return;
+        };
+        let Ok(ids) = btf.resolve_ids_by_name("u32") else {
+            crate::report::test_skip("BTF missing 'u32'");
+            return;
+        };
+        let Some(&id) = ids.first() else {
+            crate::report::test_skip("BTF resolved 'u32' to empty id list");
+            return;
+        };
+        let v = render_value(&btf, id, &[0x12, 0x34]);
+        match v {
+            RenderedValue::Truncated {
+                needed,
+                had,
+                partial,
+            } => {
+                assert_eq!(needed, 4);
+                assert_eq!(had, 2);
+                match *partial {
+                    RenderedValue::Bytes { hex } => {
+                        assert_eq!(hex, "12 34");
+                    }
+                    other => panic!("expected Bytes partial, got {other:?}"),
+                }
+            }
+            other => panic!("expected Truncated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn truncated_struct_carries_struct_partial_with_decoded_members() {
+        let Some(btf) = test_btf() else {
+            crate::report::test_skip("test_btf returned None");
+            return;
+        };
+        // `task_struct` is the canonical large struct in vmlinux BTF.
+        let Ok(ids) = btf.resolve_ids_by_name("task_struct") else {
+            crate::report::test_skip("BTF missing 'task_struct'");
+            return;
+        };
+        let Some(&id) = ids.first() else {
+            crate::report::test_skip("BTF resolved 'task_struct' to empty id list");
+            return;
+        };
+        // Feed only 16 bytes — task_struct is multi-KB. Expect
+        // Truncated with a Struct partial whose first members
+        // decoded (or are themselves Truncated for any member that
+        // straddled the cutoff).
+        let v = render_value(&btf, id, &[0u8; 16]);
+        match v {
+            RenderedValue::Truncated {
+                needed,
+                had,
+                partial,
+            } => {
+                assert!(needed > 16, "expected struct size > 16, got {needed}");
+                assert_eq!(had, 16);
+                match *partial {
+                    RenderedValue::Struct { type_name, members } => {
+                        assert_eq!(type_name.as_deref(), Some("task_struct"));
+                        assert!(
+                            !members.is_empty(),
+                            "partial struct must carry SOME decoded members"
+                        );
+                    }
+                    other => panic!("expected Struct partial, got {other:?}"),
+                }
+            }
+            other => panic!("expected Truncated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn truncated_array_element_carries_bytes_partial() {
+        // Synthesize a struct containing an array whose backing
+        // bytes are short. Use BTF if available; otherwise skip.
+        let Some(btf) = test_btf() else {
+            crate::report::test_skip("test_btf returned None");
+            return;
+        };
+        // Find a type that ends in `[]` of int — `cpumask_t.bits`
+        // is unsigned long array; struct cpumask exists in vmlinux.
+        let Ok(ids) = btf.resolve_ids_by_name("cpumask") else {
+            crate::report::test_skip("BTF missing 'cpumask'");
+            return;
+        };
+        let Some(&id) = ids.first() else {
+            crate::report::test_skip("BTF resolved 'cpumask' to empty id list");
+            return;
+        };
+        // Render with a 1-byte buffer; `bits` is u64[NR_CPUS/64],
+        // so the array's first element won't fit, producing a
+        // Truncated element somewhere in the partial.
+        let v = render_value(&btf, id, &[0u8]);
+        // Either the outer struct is Truncated (size > 1) or, if
+        // cpumask happens to be 0-byte (kernels with NR_CPUS=0 —
+        // not realistic), it would render as Struct. Assert either
+        // outcome carries a usable partial / member chain.
+        match v {
+            RenderedValue::Truncated { partial, .. } => {
+                // Partial must be the outer Struct (cpumask), which
+                // carries `bits` as either a Truncated array or an
+                // array with Truncated elements. Either is correct
+                // partial render.
+                match *partial {
+                    RenderedValue::Struct { members, .. } => {
+                        // At least one member surfaces partial info.
+                        assert!(!members.is_empty());
+                    }
+                    other => panic!("expected Struct partial, got {other:?}"),
+                }
+            }
+            // Acceptable fallback: cpumask happens to fit in 1 byte
+            // somehow (unlikely in real kernels but not a renderer
+            // failure if it does).
+            RenderedValue::Struct { .. } => {}
+            other => panic!("expected Truncated or Struct, got {other:?}"),
+        }
     }
 }
