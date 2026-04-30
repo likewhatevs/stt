@@ -16,7 +16,7 @@
 
 pub mod cgroup_sandbox;
 pub mod console;
-mod exit_dispatch;
+pub(crate) mod exit_dispatch;
 pub mod host_topology;
 pub mod initramfs;
 mod memory_budget;
@@ -1012,6 +1012,14 @@ struct VcpuThread {
     /// host-side guest-memory reads consistent on weakly-ordered
     /// architectures.
     parked: Arc<AtomicBool>,
+    /// Per-vCPU register snapshot captured at freeze time (RIP/RSP/CR3
+    /// on x86_64, PC/SP/TTBR1 on aarch64). Written by the vCPU thread
+    /// on its own thread (KVM_GET_REGS is fd-bound and not safe
+    /// cross-thread) just before the `parked` Release store; read by
+    /// the freeze coordinator after the rendezvous Acquire. `None`
+    /// until the first freeze fires; reset to `None` on thaw is NOT
+    /// done — a successive freeze overwrites with the new capture.
+    regs: Arc<std::sync::Mutex<Option<exit_dispatch::VcpuRegSnapshot>>>,
     /// Handle to set `kvm_run.immediate_exit` from outside the vCPU thread.
     /// `None` when KVM_CAP_IMMEDIATE_EXIT is not available.
     immediate_exit: Option<ImmediateExitHandle>,
@@ -1342,6 +1350,8 @@ impl KtstrVm {
         // path.
         let freeze = Arc::new(AtomicBool::new(false));
         let bsp_parked = Arc::new(AtomicBool::new(false));
+        let bsp_regs: Arc<std::sync::Mutex<Option<exit_dispatch::VcpuRegSnapshot>>> =
+            Arc::new(std::sync::Mutex::new(None));
         let has_immediate_exit = vm.has_immediate_exit;
         let mut vcpus = std::mem::take(&mut vm.vcpus);
         let mut bsp = vcpus.remove(0);
@@ -1645,6 +1655,7 @@ impl KtstrVm {
             &kill,
             &freeze,
             &bsp_parked,
+            &bsp_regs,
             has_immediate_exit,
             start,
             interactive_timeout,
@@ -2543,6 +2554,8 @@ impl KtstrVm {
         // in this batch), and then clears `freeze` to thaw.
         let freeze = Arc::new(AtomicBool::new(false));
         let bsp_parked = Arc::new(AtomicBool::new(false));
+        let bsp_regs: Arc<std::sync::Mutex<Option<exit_dispatch::VcpuRegSnapshot>>> =
+            Arc::new(std::sync::Mutex::new(None));
 
         let has_immediate_exit = vm.has_immediate_exit;
         let mut vcpus = std::mem::take(&mut vm.vcpus);
@@ -2700,6 +2713,7 @@ impl KtstrVm {
         let freeze_coord_freeze = freeze.clone();
         let freeze_coord_kill = kill.clone();
         let freeze_coord_bsp_parked = bsp_parked.clone();
+        let freeze_coord_bsp_regs = bsp_regs.clone();
         let freeze_coord_bsp_done = bsp_done.clone();
         let freeze_coord_vmlinux = find_vmlinux(&self.kernel);
         // GuestMem for the coordinator's .bss-poll path. Built from
@@ -2743,6 +2757,9 @@ impl KtstrVm {
         // to VmRunState. The coordinator needs cross-thread access.
         let freeze_coord_ap_parked: Vec<Arc<AtomicBool>> =
             ap_threads.iter().map(|vt| vt.parked.clone()).collect();
+        let freeze_coord_ap_regs: Vec<
+            Arc<std::sync::Mutex<Option<exit_dispatch::VcpuRegSnapshot>>>,
+        > = ap_threads.iter().map(|vt| vt.regs.clone()).collect();
         let freeze_coord_ap_pthreads: Vec<libc::pthread_t> = ap_threads
             .iter()
             .map(|vt| vt.handle.as_pthread_t() as libc::pthread_t)
@@ -3051,12 +3068,34 @@ impl KtstrVm {
                         && let Some(ref owned) = owned_accessor
                         && let Some(ref btf) = dump_btf
                     {
-                        let report = crate::monitor::dump::dump_state(
+                        let mut report = crate::monitor::dump::dump_state(
                             &owned.as_accessor(),
                             btf,
                             freeze_coord_num_cpus,
                             dump_arena_offsets.as_ref(),
                         );
+                        // Attach per-vCPU register snapshots. Reads
+                        // are happens-after the rendezvous Acquire on
+                        // each vCPU's `parked` flag (loaded in the
+                        // wait loop above), which synchronizes-with
+                        // the vCPU thread's Release store after its
+                        // capture_vcpu_regs / regs_slot write — so
+                        // these Mutex reads see the captured values
+                        // even on weakly-ordered architectures.
+                        // Index 0 = BSP, 1..N = APs (mirroring the
+                        // VcpuFd ordering inside KtstrKvm.vcpus that
+                        // run_vm splits into bsp + ap_threads).
+                        let mut regs: Vec<Option<exit_dispatch::VcpuRegSnapshot>> =
+                            Vec::with_capacity(1 + freeze_coord_ap_regs.len());
+                        regs.push(
+                            *freeze_coord_bsp_regs
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner()),
+                        );
+                        for ap in &freeze_coord_ap_regs {
+                            regs.push(*ap.lock().unwrap_or_else(|e| e.into_inner()));
+                        }
+                        report.vcpu_regs = regs;
                         match serde_json::to_string_pretty(&report) {
                             Ok(json) => {
                                 tracing::error!(
@@ -3214,6 +3253,7 @@ impl KtstrVm {
                     &kill,
                     &freeze,
                     &bsp_parked,
+                    &bsp_regs,
                     has_immediate_exit,
                     run_start,
                     timeout,
@@ -3302,6 +3342,8 @@ impl KtstrVm {
             let exited_clone = exited.clone();
             let parked = Arc::new(AtomicBool::new(false));
             let parked_clone = parked.clone();
+            let regs = Arc::new(std::sync::Mutex::new(None));
+            let regs_clone = regs.clone();
             let has_immediate_exit_clone = has_immediate_exit;
             let pin_cpu = pin_targets.get(i).copied().flatten();
             let mask_for_thread: Option<Vec<usize>> = no_perf_mask.map(|m| m.to_vec());
@@ -3332,6 +3374,7 @@ impl KtstrVm {
                             &kill_clone,
                             &freeze_clone,
                             &parked_clone,
+                            &regs_clone,
                             has_immediate_exit_clone,
                         );
                     });
@@ -3344,6 +3387,7 @@ impl KtstrVm {
                 handle,
                 exited,
                 parked,
+                regs,
                 immediate_exit: ie_handle,
             });
         }
@@ -3772,6 +3816,7 @@ impl KtstrVm {
         kill: &Arc<AtomicBool>,
         freeze: &Arc<AtomicBool>,
         bsp_parked: &Arc<AtomicBool>,
+        bsp_regs: &Arc<std::sync::Mutex<Option<exit_dispatch::VcpuRegSnapshot>>>,
         has_immediate_exit: bool,
         run_start: Instant,
         timeout: Duration,
@@ -3790,7 +3835,14 @@ impl KtstrVm {
             // delegated to the shared `exit_dispatch::handle_freeze`
             // so the two paths cannot drift.
             if freeze.load(Ordering::Acquire) {
-                exit_dispatch::handle_freeze(bsp, has_immediate_exit, kill, freeze, bsp_parked);
+                exit_dispatch::handle_freeze(
+                    bsp,
+                    has_immediate_exit,
+                    kill,
+                    freeze,
+                    bsp_parked,
+                    bsp_regs,
+                );
                 if kill.load(Ordering::Acquire) {
                     break;
                 }

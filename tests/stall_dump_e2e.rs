@@ -211,14 +211,68 @@ fn scenario_stall_dump_renders_bss_fields(ctx: &ktstr::scenario::Ctx) -> Result<
         );
     }
 
+    // Per-vCPU register snapshots: the freeze coordinator
+    // attaches a `vcpu_regs` array (BSP at index 0, APs at
+    // 1..N). Each entry is `null` when capture failed for that
+    // vCPU OR a `{instruction_pointer, stack_pointer,
+    // page_table_root}` object otherwise. The test asserts the
+    // array exists, has at least one populated entry, and that
+    // entry's `instruction_pointer` is non-zero (a zero RIP/PC
+    // would mean the snapshot was captured but holds garbage —
+    // possibly indicating the vCPU thread crashed before the
+    // capture or the kernel/userspace VA was uninitialized).
+    //
+    // `vcpu_regs` is opt-out via serde's `skip_serializing_if =
+    // "Vec::is_empty"`, so its absence here would mean the
+    // freeze coordinator's regs-attach path didn't fire — a
+    // genuine regression on the host-side capture wiring.
+    let vcpu_regs = value
+        .get("vcpu_regs")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "dump JSON missing top-level `vcpu_regs` array — \
+                 freeze coordinator did not attach per-vCPU register \
+                 snapshots after rendezvous"
+            )
+        })?;
+    if vcpu_regs.is_empty() {
+        anyhow::bail!(
+            "dump JSON `vcpu_regs` array is empty — expected at least \
+             one entry (BSP idx 0 plus N APs)"
+        );
+    }
+    let populated_with_ip: Vec<&serde_json::Value> = vcpu_regs
+        .iter()
+        .filter(|slot| {
+            slot.is_object()
+                && slot
+                    .get("instruction_pointer")
+                    .and_then(|ip| ip.as_u64())
+                    .is_some_and(|ip| ip != 0)
+        })
+        .collect();
+    if populated_with_ip.is_empty() {
+        anyhow::bail!(
+            "dump JSON `vcpu_regs` has no entry with non-zero \
+             instruction_pointer — every slot is null or has zero IP. \
+             Capture-on-vCPU-thread path may be broken or rendezvous \
+             timed out before any vCPU completed handle_freeze. \
+             Full vcpu_regs: {vcpu_regs:?}"
+        );
+    }
+
     // Confirming detail so the test log shows the captured value.
     result.details.push(ktstr::assert::AssertDetail::new(
         ktstr::assert::DetailKind::Other,
         format!(
             "stall-dump file at {} contains scheduler .bss render with \
-             stall={stall_int}, member count={}",
+             stall={stall_int}, member count={}, vcpu_regs entries={} \
+             ({} populated with non-zero IP)",
             dump_path.display(),
             members.len(),
+            vcpu_regs.len(),
+            populated_with_ip.len(),
         ),
     ));
 

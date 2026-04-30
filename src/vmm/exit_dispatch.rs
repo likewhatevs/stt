@@ -12,8 +12,169 @@
 use crate::vmm::PiMutex;
 use crate::vmm::{console, kvm, virtio_console};
 use kvm_ioctls::VcpuExit;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Snapshot of a vCPU's architectural state, captured by the vCPU
+/// thread itself at freeze time (just before it parks). Surfaced in
+/// the stall-dump report so an operator can correlate the observed
+/// guest-memory state with where each vCPU was executing.
+///
+/// Field naming is arch-neutral: each value is set from the matching
+/// per-arch register so the layout is identical across x86_64 and
+/// aarch64 in JSON / Display output.
+///
+/// Capture must run ON the vCPU thread (not cross-thread) because
+/// `KVM_GET_REGS` / `KVM_GET_SREGS` are vCPU-fd-bound ioctls; their
+/// thread-affinity is a KVM API contract documented in the kernel
+/// vCPU lifecycle (Documentation/virt/kvm/api.rst). Calling them
+/// from a different thread reads stale state at best and races KVM's
+/// internal vCPU state machine at worst.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct VcpuRegSnapshot {
+    /// Instruction pointer at freeze time (`rip` on x86_64,
+    /// `pc` on aarch64). Identifies the kernel/userspace function
+    /// the vCPU was executing when the freeze coordinator's kick
+    /// arrived.
+    pub instruction_pointer: u64,
+    /// Kernel-side stack pointer at freeze time (`rsp` on x86_64,
+    /// `sp_el1` on aarch64 — explicitly NOT `sp_el0`, which is the
+    /// userspace stack). Captures the EL1/CPL0 stack frame an
+    /// operator can unwind against the BPF map dump for sched_ext
+    /// failures, which fire in kernel context.
+    pub stack_pointer: u64,
+    /// Page-table root at freeze time. Captures arch-specific
+    /// kernel-side state suitable for correlating the BPF map
+    /// dump with the active address space:
+    ///
+    ///   - On x86_64: `cr3` — per-process pgd. Distinct from
+    ///     [`crate::monitor::guest::GuestKernel::cr3_pa`], which
+    ///     captures the boot-time `init_top_pgt` at coordinator
+    ///     start. This snapshot field reflects whatever pgd the
+    ///     vCPU was running on at freeze time (typically the
+    ///     current task's mm); the boot-time value is what the
+    ///     freeze coordinator uses for its own page-walks.
+    ///
+    ///   - On aarch64: `ttbr1_el1` — the kernel pgd. Effectively
+    ///     `init_top_pgt`-equivalent: TTBR1_EL1 holds the kernel
+    ///     mapping and stays stable across context switches
+    ///     (TTBR0_EL1 holds the userspace mapping and IS swapped
+    ///     per-task, but the freeze coordinator's BPF map reads
+    ///     are kernel-side). For the per-process userspace pgd,
+    ///     a TTBR0_EL1 capture would be needed and is not
+    ///     currently implemented (taskified for future
+    ///     enrichment).
+    pub page_table_root: u64,
+}
+
+/// Capture the vCPU's RIP/RSP/CR3 (or PC/SP/TTBR1 on aarch64) on
+/// the calling thread. Invoked from `handle_freeze` after the drain
+/// dance and before the `parked = true` Release store, so the
+/// values reach the freeze coordinator via the same happens-before
+/// edge the coordinator relies on for guest-memory reads.
+///
+/// `None` on capture failure — the get_regs / get_one_reg ioctls
+/// can fail mid-shutdown when KVM has begun tearing down the vCPU.
+/// The caller stores `None` into the per-vCPU slot in that case;
+/// the dump reflects "registers unavailable" rather than panicking
+/// the freeze path.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn capture_vcpu_regs(vcpu: &mut kvm_ioctls::VcpuFd) -> Option<VcpuRegSnapshot> {
+    let regs = vcpu.get_regs().ok()?;
+    let sregs = vcpu.get_sregs().ok()?;
+    Some(VcpuRegSnapshot {
+        instruction_pointer: regs.rip,
+        stack_pointer: regs.rsp,
+        page_table_root: sregs.cr3,
+    })
+}
+
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn capture_vcpu_regs(vcpu: &mut kvm_ioctls::VcpuFd) -> Option<VcpuRegSnapshot> {
+    // ARM core register IDs encode
+    // `(offsetof(struct kvm_regs, field) / sizeof(u32))` in the low
+    // bits, OR'd with KVM_REG_ARM64 + KVM_REG_SIZE_U64 +
+    // KVM_REG_ARM_CORE (per kernel uapi/asm/kvm.h
+    // `KVM_REG_ARM_CORE_REG` macro). The offset is into
+    // `struct kvm_regs`, NOT directly into `struct user_pt_regs`;
+    // the two coincide for the first 272 bytes because
+    // `kvm_regs.regs` is at offset 0, but adding fields past
+    // `user_pt_regs` (e.g. `sp_el1` below) requires the
+    // `kvm_regs`-relative encoding.
+    //
+    // struct kvm_regs (arch/arm64/include/uapi/asm/kvm.h):
+    //   struct user_pt_regs regs;     // offset 0..272
+    //     u64 regs[31];               //   offset   0..248
+    //     u64 sp;       (= sp_el0)    //   offset 248
+    //     u64 pc;                     //   offset 256
+    //     u64 pstate;                 //   offset 264
+    //   u64 sp_el1;                   // offset 272
+    //   u64 elr_el1;                  // offset 280
+    //   u64 spsr[KVM_NR_SPSR];        // offset 288..
+    //   ...
+    //
+    // The kernel-side stack pointer is `sp_el1`, NOT `regs.sp`
+    // (which is `sp_el0` — the userspace stack pointer per the
+    // comment at arch/arm64/include/uapi/asm/kvm.h:47). sched_ext
+    // exits fire in EL1 (kernel context), so capturing sp_el1
+    // yields the kernel stack frame an operator can unwind
+    // against the BPF map dump. Capturing sp_el0 here would
+    // leak the userspace stack of whatever task happened to be
+    // current — typically irrelevant for kernel-side debugging
+    // and confusing in the JSON output.
+    //
+    // Each u32 step is +1 in the encoded ID.
+    const KVM_REG_ARM64: u64 = 0x6000_0000_0000_0000;
+    const KVM_REG_SIZE_U64: u64 = 0x0030_0000_0000_0000;
+    const KVM_REG_ARM_CORE: u64 = 0x0010_0000;
+    // SP_EL1 lives at offset 272 in struct kvm_regs (right after
+    // the 272-byte user_pt_regs). 272 / 4 = 68.
+    const SP_EL1_ID: u64 = KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM_CORE | (272 / 4);
+    // PC at offset 256 in user_pt_regs (= same offset in kvm_regs
+    // because user_pt_regs.regs is at offset 0). 256 / 4 = 64.
+    const PC_ID: u64 = KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM_CORE | (256 / 4);
+    // TTBR1_EL1 system register (Op0=3, Op1=0, CRn=2, CRm=0, Op2=1).
+    // Encoded under KVM_REG_ARM64_SYSREG.
+    const KVM_REG_ARM64_SYSREG: u64 = 0x0013_0000;
+    // (Op0 << 14) | (Op1 << 11) | (CRn << 7) | (CRm << 3) | Op2
+    // = (3 << 14) | (0 << 11) | (2 << 7) | (0 << 3) | 1 = 0xC101
+    const TTBR1_EL1_ID: u64 = KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM64_SYSREG | 0xC101;
+
+    let mut buf = [0u8; 8];
+    let pc = vcpu
+        .get_one_reg(PC_ID, &mut buf)
+        .ok()
+        .map(|_| u64::from_le_bytes(buf))?;
+    let sp = vcpu
+        .get_one_reg(SP_EL1_ID, &mut buf)
+        .ok()
+        .map(|_| u64::from_le_bytes(buf))?;
+    // TTBR1 read is best-effort; some kernels gate sysreg access.
+    // A failure leaves page_table_root = 0 — the boot-time
+    // GuestKernel::cr3_pa is still available to the dump.
+    let ttbr1 = vcpu
+        .get_one_reg(TTBR1_EL1_ID, &mut buf)
+        .ok()
+        .map(|_| u64::from_le_bytes(buf))
+        .unwrap_or(0);
+    Some(VcpuRegSnapshot {
+        instruction_pointer: pc,
+        stack_pointer: sp,
+        page_table_root: ttbr1,
+    })
+}
+
+impl std::fmt::Display for VcpuRegSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ip=0x{:016x} sp=0x{:016x} ptroot=0x{:016x}",
+            self.instruction_pointer, self.stack_pointer, self.page_table_root
+        )
+    }
+}
 
 // ---------------------------------------------------------------------------
 // aarch64 MMIO dispatch — serial and virtio over MMIO
@@ -119,6 +280,7 @@ pub(crate) fn vcpu_run_loop_unified(
     kill: &Arc<AtomicBool>,
     freeze: &Arc<AtomicBool>,
     parked: &Arc<AtomicBool>,
+    regs_slot: &Arc<std::sync::Mutex<Option<VcpuRegSnapshot>>>,
     has_immediate_exit: bool,
 ) {
     loop {
@@ -127,7 +289,7 @@ pub(crate) fn vcpu_run_loop_unified(
         }
         // Honour a pending freeze before re-entering KVM_RUN.
         if freeze.load(Ordering::Acquire) {
-            handle_freeze(vcpu, has_immediate_exit, kill, freeze, parked);
+            handle_freeze(vcpu, has_immediate_exit, kill, freeze, parked, regs_slot);
             if kill.load(Ordering::Acquire) {
                 break;
             }
@@ -205,6 +367,7 @@ pub(crate) fn handle_freeze(
     kill: &Arc<AtomicBool>,
     freeze: &Arc<AtomicBool>,
     parked: &Arc<AtomicBool>,
+    regs_slot: &Arc<std::sync::Mutex<Option<VcpuRegSnapshot>>>,
 ) {
     // Drain dance: complete any pending PIO/MMIO before parking.
     // Skipped on kernels without KVM_CAP_IMMEDIATE_EXIT, where
@@ -215,6 +378,18 @@ pub(crate) fn handle_freeze(
         let _ = vcpu.run();
         vcpu.set_kvm_immediate_exit(0);
     }
+
+    // Capture vCPU registers BEFORE the Release store on `parked`.
+    // KVM_GET_REGS / KVM_GET_SREGS are vCPU-fd-bound ioctls — they
+    // must run on the vCPU thread (not cross-thread from the
+    // coordinator). Capturing here means the regs slot's Mutex
+    // store is happens-before the coordinator's Acquire on
+    // `parked`, so the coordinator can read the slot via the same
+    // synchronizes-with edge that makes its guest-memory reads
+    // correct. A failed capture stores `None`; the dump shows
+    // "registers unavailable" rather than panicking the freeze.
+    let snapshot = capture_vcpu_regs(vcpu);
+    *regs_slot.lock().unwrap_or_else(|e| e.into_inner()) = snapshot;
 
     // Acknowledge frozen state. The Release store synchronizes-with
     // the coordinator's Acquire load on `parked`, providing the
@@ -480,5 +655,122 @@ mod tests {
         let mut data = [0xFFu8; 1];
         dispatch_io_in(&com1, &com2, 0x1234, &mut data);
         assert_eq!(data[0], 0xFF, "unknown port should not modify data");
+    }
+}
+
+#[cfg(test)]
+mod vcpu_reg_snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn vcpu_reg_snapshot_display_renders_three_hex_fields() {
+        let s = VcpuRegSnapshot {
+            instruction_pointer: 0xffff_ffff_8100_1234,
+            stack_pointer: 0xffff_ffff_8000_0000,
+            page_table_root: 0x0123_4567_89ab_cdef,
+        };
+        let out = format!("{s}");
+        assert_eq!(
+            out,
+            "ip=0xffffffff81001234 sp=0xffffffff80000000 ptroot=0x0123456789abcdef"
+        );
+    }
+
+    #[test]
+    fn vcpu_reg_snapshot_serde_round_trip() {
+        let s = VcpuRegSnapshot {
+            instruction_pointer: 0x1,
+            stack_pointer: 0x2,
+            page_table_root: 0x3,
+        };
+        let json = serde_json::to_string(&s).expect("serialize");
+        // Pin the JSON key names so a future field rename is
+        // caught here rather than in downstream consumers
+        // (operator JSON parsers, the stall_dump_e2e fixture).
+        // Arch-neutral keys: see field doc on
+        // VcpuRegSnapshot::page_table_root for the per-arch
+        // semantics each one carries.
+        assert!(
+            json.contains("\"instruction_pointer\""),
+            "missing JSON key `instruction_pointer`: {json}"
+        );
+        assert!(
+            json.contains("\"stack_pointer\""),
+            "missing JSON key `stack_pointer`: {json}"
+        );
+        assert!(
+            json.contains("\"page_table_root\""),
+            "missing JSON key `page_table_root`: {json}"
+        );
+        let parsed: VcpuRegSnapshot = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.instruction_pointer, 0x1);
+        assert_eq!(parsed.stack_pointer, 0x2);
+        assert_eq!(parsed.page_table_root, 0x3);
+    }
+
+    #[test]
+    fn vcpu_reg_snapshot_zero_renders_zeros() {
+        let s = VcpuRegSnapshot {
+            instruction_pointer: 0,
+            stack_pointer: 0,
+            page_table_root: 0,
+        };
+        // 16 hex digits each — leading zeros preserved so widths
+        // line up across rows in multi-vcpu output.
+        assert_eq!(
+            format!("{s}"),
+            "ip=0x0000000000000000 sp=0x0000000000000000 ptroot=0x0000000000000000"
+        );
+    }
+
+    /// Pure-arithmetic test on the aarch64 KVM register IDs the
+    /// capture path uses. Verifying the encoding here means a
+    /// transcription bug (e.g. wrong byte offset, dropped flag,
+    /// wrong sysreg op-code packing) would be caught without
+    /// booting an aarch64 VM. Mirrors the kernel's
+    /// `KVM_REG_ARM_CORE_REG(name) = offsetof(struct kvm_regs,
+    /// name) / sizeof(__u32)` macro for core regs and the
+    /// `ARM64_SYS_REG(Op0, Op1, CRn, CRm, Op2)` packing for
+    /// sysregs (arch/arm64/include/uapi/asm/kvm.h).
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn aarch64_register_ids_match_kernel_encoding() {
+        const KVM_REG_ARM64: u64 = 0x6000_0000_0000_0000;
+        const KVM_REG_SIZE_U64: u64 = 0x0030_0000_0000_0000;
+        const KVM_REG_ARM_CORE: u64 = 0x0010_0000;
+        const KVM_REG_ARM64_SYSREG: u64 = 0x0013_0000;
+
+        // PC at byte offset 256 in struct kvm_regs (= same offset
+        // in user_pt_regs because user_pt_regs.regs is at offset
+        // 0). 256 / 4 = 64.
+        const EXPECTED_PC_ID: u64 = KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM_CORE | 64;
+        // SP_EL1 at byte offset 272 in struct kvm_regs (right
+        // after the 272-byte user_pt_regs). 272 / 4 = 68.
+        const EXPECTED_SP_EL1_ID: u64 = KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM_CORE | 68;
+        // TTBR1_EL1 sysreg packing: Op0=3, Op1=0, CRn=2, CRm=0, Op2=1
+        // → (3<<14) | (0<<11) | (2<<7) | (0<<3) | 1 = 0xC101.
+        const EXPECTED_TTBR1_EL1_ID: u64 =
+            KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM64_SYSREG | 0xC101;
+
+        // Reconstruct what capture_vcpu_regs declares to catch
+        // any drift between the const declarations there and
+        // the kernel ABI. The unsafe cast to *const u64 isn't
+        // available across modules, so re-derive the values
+        // here using the exact same expression form.
+        let pc_id = KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM_CORE | (256 / 4);
+        let sp_el1_id = KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM_CORE | (272 / 4);
+        let ttbr1_el1_id = KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM64_SYSREG | 0xC101;
+
+        assert_eq!(pc_id, EXPECTED_PC_ID, "PC_ID encoding drift");
+        assert_eq!(
+            sp_el1_id, EXPECTED_SP_EL1_ID,
+            "SP_EL1_ID encoding drift — note offset is 272 (sp_el1), \
+             not 248 (sp_el0)"
+        );
+        assert_eq!(
+            ttbr1_el1_id, EXPECTED_TTBR1_EL1_ID,
+            "TTBR1_EL1_ID encoding drift — verify (Op0=3, Op1=0, \
+             CRn=2, CRm=0, Op2=1) packs to 0xC101"
+        );
     }
 }

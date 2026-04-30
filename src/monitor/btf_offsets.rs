@@ -2363,4 +2363,128 @@ mod tests {
             );
         }
     }
+
+    // ---- probe.bpf.o atomic-op verification -----------------------
+    //
+    // The probe BPF program publishes the error-exit latch via
+    // `__sync_val_compare_and_swap(&ktstr_err_exit_detected, 0u, 1u)`.
+    // Cross-core ordering on weakly-ordered architectures (aarch64)
+    // depends on the BPF backend lowering this to a real
+    // `BPF_STX | BPF_ATOMIC | BPF_W` instruction with `BPF_CMPXCHG`
+    // in the imm field — NOT a plain store.
+    //
+    // A toolchain regression that silently degraded the cmpxchg to a
+    // non-atomic store would leave the latch's publication
+    // unsynchronized, causing the freeze coordinator on a different
+    // core to miss the transition under TSO-violating reorder. This
+    // test pins the BPF bytecode against that regression by parsing
+    // the compiled `probe.o` and asserting at least one atomic op is
+    // present in the `tp_btf/sched_ext_exit` program section.
+    //
+    // BPF instruction encoding (uapi/linux/bpf.h):
+    //   - opcode byte: bits[2:0] = class (BPF_STX = 0x03),
+    //     bits[4:3] = size (BPF_W = 0x00, BPF_DW = 0x18),
+    //     bits[7:5] = mode (BPF_ATOMIC = 0xc0).
+    //     STX | ATOMIC | W = 0xc3.
+    //   - imm field (4 bytes, little-endian): atomic op type.
+    //     BPF_CMPXCHG = 0xf1 (= 0xf0 | BPF_FETCH).
+    #[test]
+    fn probe_bpf_object_emits_atomic_for_err_exit_latch() {
+        // probe.o is produced by build.rs at OUT_DIR/probe.o. A
+        // missing or unparseable file is a HARD FAIL, not a skip —
+        // the whole point of the test is catching silent
+        // regressions in the BPF backend lowering, and a silent
+        // skip when the artifact is gone defeats that. build.rs
+        // produces probe.o on every cargo build of the lib, so a
+        // missing artifact here means the build pipeline is
+        // broken and the test should surface that loudly.
+        //
+        // Limitation: this test counts ANY BPF_CMPXCHG instruction
+        // in the `tp_btf/sched_ext_exit` section, not specifically
+        // the cmpxchg targeting `ktstr_err_exit_detected`. Today
+        // the section contains exactly one
+        // `__sync_val_compare_and_swap` call (against the latch),
+        // so any cmpxchg present must be the latch's; if a future
+        // change adds a second atomic in the same handler, the
+        // assert still passes but stops being a tight check on
+        // the latch specifically. A future refinement could parse
+        // the ELF relocation entries to constrain by symbol name
+        // (look for a relocation referencing
+        // `ktstr_err_exit_detected` adjacent to the cmpxchg
+        // instruction).
+        let probe_obj_path = std::path::PathBuf::from(env!("OUT_DIR")).join("probe.o");
+        let bytes = std::fs::read(&probe_obj_path).unwrap_or_else(|e| {
+            panic!(
+                "probe.o missing or unreadable at {}: {e}. \
+                 build.rs failed to produce the BPF skeleton — fix the \
+                 build pipeline before re-running this test.",
+                probe_obj_path.display()
+            )
+        });
+        let elf = goblin::elf::Elf::parse(&bytes).unwrap_or_else(|e| {
+            panic!(
+                "probe.o at {} is not a valid ELF: {e}. \
+                 The BPF skeleton emitter changed format or the file is \
+                 corrupted — re-run the build to regenerate.",
+                probe_obj_path.display()
+            )
+        });
+        // Locate the program section. libbpf names sections after
+        // the SEC() macro argument; tp_btf programs land in
+        // `tp_btf/sched_ext_exit`. Match exact name; a future
+        // restructure that splits the program into a different
+        // section would surface as a clear test failure with the
+        // expected name.
+        const TARGET_SECTION: &str = "tp_btf/sched_ext_exit";
+        let mut found_section = false;
+        let mut atomic_count: usize = 0;
+        for sh in &elf.section_headers {
+            let Some(name) = elf.shdr_strtab.get_at(sh.sh_name) else {
+                continue;
+            };
+            if name != TARGET_SECTION {
+                continue;
+            }
+            found_section = true;
+            // BPF programs are SHT_PROGBITS sections of `n` 8-byte
+            // instructions. Read the section bytes via offset/size.
+            let off = sh.sh_offset as usize;
+            let sz = sh.sh_size as usize;
+            assert!(
+                sz.is_multiple_of(8),
+                "BPF section size {sz} must be a multiple of 8 (instruction width)"
+            );
+            let prog = &bytes[off..off + sz];
+            // BPF_STX | BPF_ATOMIC | BPF_W = 0xc3
+            // BPF_STX | BPF_ATOMIC | BPF_DW = 0xc3 | 0x18 = 0xdb
+            // The latch is u32, so we expect 0xc3 specifically — but
+            // accept either width to keep the test robust against
+            // a future widening to u64.
+            const STX_ATOMIC_W: u8 = 0xc3;
+            const STX_ATOMIC_DW: u8 = 0xdb;
+            // BPF_CMPXCHG = 0xf0 | BPF_FETCH(0x01) = 0xf1
+            const BPF_CMPXCHG_IMM: i32 = 0xf1;
+            for chunk in prog.chunks_exact(8) {
+                let opcode = chunk[0];
+                if opcode == STX_ATOMIC_W || opcode == STX_ATOMIC_DW {
+                    let imm = i32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
+                    if imm == BPF_CMPXCHG_IMM {
+                        atomic_count += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            found_section,
+            "probe.o is missing the expected `{TARGET_SECTION}` section — \
+             SEC() macro changed?"
+        );
+        assert!(
+            atomic_count >= 1,
+            "probe.o `{TARGET_SECTION}` section has no BPF_STX|BPF_ATOMIC|cmpxchg \
+             instruction — `__sync_val_compare_and_swap` was silently \
+             lowered to a non-atomic store. Cross-core ordering on aarch64 \
+             would be broken by this regression."
+        );
+    }
 }

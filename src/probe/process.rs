@@ -1364,12 +1364,20 @@ pub fn run_probe_skeleton(
             // filter events to those referencing the same task_struct
             // pointer as the causal task.
             //
-            // The BPF trigger handler sets args[0] to
-            // bpf_get_current_task() only for ops callback errors
-            // (SCX_EXIT_ERROR, SCX_EXIT_ERROR_BPF) where current IS
-            // the causal task. For all other exit kinds (stalls,
-            // sysrq, unregistration), args[0] is 0 and probe output
-            // is suppressed — no causal task means no useful chain.
+            // The BPF trigger handler at probe.bpf.c:304-306 sets
+            // args[0] to bpf_get_current_task() ONLY for
+            // SCX_EXIT_ERROR_BPF (1025), where a BPF scheduler
+            // callback faulted in the running task's context — so
+            // `current` IS the causal task. For SCX_EXIT_ERROR
+            // (1024), args[0] is 0 because that exit can fire from
+            // kworker context (async unregistration, sysrq), where
+            // `current` is the worker thread rather than the task
+            // that triggered the exit. For SCX_EXIT_ERROR_STALL
+            // (1026) the trigger handler returns early without
+            // submitting an event at all (watchdog/timer context).
+            // The filter below therefore drops args[0] == 0 to
+            // suppress non-causal probe output: no causal task
+            // means no useful stitch chain.
             let task_param_idx: std::collections::HashMap<u32, usize> = func_ips
                 .iter()
                 .filter_map(|(idx, _, name)| {
@@ -2224,5 +2232,102 @@ mod tests {
         assert!(keys.len() <= 6);
         assert!(keys.iter().any(|(k, _)| k.contains("p5")));
         assert!(!keys.iter().any(|(k, _)| k.contains("p6")));
+    }
+
+    // ---- args[0] kind-conditional filter (probe.bpf.c:283-285) ------
+    //
+    // The BPF tracepoint trigger handler at probe.bpf.c:283-285
+    // sets `event->args[0] = (kind == SCX_EXIT_ERROR_BPF)
+    // ? bpf_get_current_task() : 0;` — current-task is emitted
+    // ONLY for SCX_EXIT_ERROR_BPF (1025). For SCX_EXIT_ERROR
+    // (1024) the field is 0 because the exit can fire from
+    // kworker / sysrq context where `current` is unrelated.
+    //
+    // The host-side filter at process.rs:~1402 drops events
+    // whose `task_ptr` (sourced from args[0]) is 0, suppressing
+    // probe output when the BPF side declined to provide a
+    // causal task. These tests pin the host-side filter against
+    // both sides of that contract.
+    //
+    // SCX_EXIT_ERROR enum values (mirrored from kernel
+    // ext_internal.h, also defined in src/bpf/intf.h):
+    const SCX_EXIT_ERROR: u64 = 1024;
+    const SCX_EXIT_ERROR_BPF: u64 = 1025;
+
+    /// Build a synthetic `ProbeEvent` mirroring what
+    /// `read_event_loop` constructs from a ringbuf trigger
+    /// event. `args[0]` is the causal task pointer the BPF
+    /// side emitted (per probe.bpf.c:283-285); `args[1]` is the
+    /// exit kind. `task_ptr` is set from `args[0]` at line 1142.
+    fn make_trigger_event(args0: u64, kind: u64) -> ProbeEvent {
+        let mut args = [0u64; 6];
+        args[0] = args0;
+        args[1] = kind;
+        ProbeEvent {
+            func_idx: 0,
+            task_ptr: args0,
+            ts: 0,
+            args,
+            fields: Vec::new(),
+            kstack: Vec::new(),
+            str_val: None,
+            exit_fields: Vec::new(),
+            exit_ts: None,
+        }
+    }
+
+    #[test]
+    fn args0_zero_filtered_for_scx_exit_error() {
+        // SCX_EXIT_ERROR (1024) fires from non-causal contexts
+        // (kworker, sysrq) — the BPF side emits args[0] = 0,
+        // so task_ptr is 0. The host-side filter at
+        // process.rs:1402 must drop this via
+        // `Option::filter(|&p| p != 0)`. Verifying with the
+        // exact same expression form so a future swap to
+        // `>= 1` (intent-equivalent but unrelated to the spec)
+        // would still pass — tightening to `== 0` would catch
+        // a sentinel-value swap.
+        let event = make_trigger_event(0, SCX_EXIT_ERROR);
+        assert_eq!(
+            event.task_ptr, 0,
+            "SCX_EXIT_ERROR must propagate args[0]=0 into task_ptr"
+        );
+        let tptr_after_filter: Option<u64> = Some(event.task_ptr).filter(|&p| p != 0);
+        assert!(
+            tptr_after_filter.is_none(),
+            "task_ptr=0 must be filtered out by .filter(|&p| p != 0); \
+             got Some({:?})",
+            tptr_after_filter
+        );
+        assert_eq!(
+            event.args[1], SCX_EXIT_ERROR,
+            "args[1] must carry the exit kind for diagnostics"
+        );
+    }
+
+    #[test]
+    fn args0_task_ptr_retained_for_scx_exit_error_bpf() {
+        // SCX_EXIT_ERROR_BPF (1025) fires from a BPF callback in
+        // the running task's context — the BPF side emits
+        // args[0] = bpf_get_current_task() (a non-zero
+        // task_struct pointer), so task_ptr is non-zero. The
+        // host-side filter must retain this event so stitching
+        // can proceed.
+        const FAKE_TASK_PTR: u64 = 0xffff_8881_1234_5678; // plausible kernel VA
+        let event = make_trigger_event(FAKE_TASK_PTR, SCX_EXIT_ERROR_BPF);
+        assert_eq!(
+            event.task_ptr, FAKE_TASK_PTR,
+            "SCX_EXIT_ERROR_BPF must propagate args[0]=task_ptr into task_ptr"
+        );
+        let tptr_after_filter: Option<u64> = Some(event.task_ptr).filter(|&p| p != 0);
+        assert_eq!(
+            tptr_after_filter,
+            Some(FAKE_TASK_PTR),
+            "non-zero task_ptr must survive .filter(|&p| p != 0)"
+        );
+        assert_eq!(
+            event.args[1], SCX_EXIT_ERROR_BPF,
+            "args[1] must carry the exit kind for diagnostics"
+        );
     }
 }

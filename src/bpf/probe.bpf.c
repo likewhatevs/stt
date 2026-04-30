@@ -72,6 +72,66 @@ volatile const bool ktstr_enabled = false;
  * loadable. This declaration's position relative to other globals
  * therefore no longer matters; reordering or adding more writable
  * globals is safe.
+ *
+ * Lifecycle (one-shot per VM run):
+ *  - Initial value: `0` at probe load. libbpf zeroes .bss when the
+ *    BPF program is loaded; the freeze coordinator sees `0` until
+ *    the latch fires.
+ *  - Set: the tp_btf handler above CAS's `0 -> 1` on the first
+ *    error-class exit. Sticky: subsequent fires no-op.
+ *  - Read: the freeze coordinator polls this value via host-side
+ *    guest-memory access (`vmm::mod.rs` lazy `BpfMapAccessor`
+ *    discovery + `mem.read_u32`), then triggers a single freeze on
+ *    `!= 0`.
+ *  - Clear: the freeze coordinator NEVER clears this byte. The
+ *    latch is intentionally one-shot per VM run — the
+ *    coordinator triggers at most one stall dump, and a re-armed
+ *    latch would only matter if the VM kept running past the
+ *    first error, which it does not (the dump is followed by VM
+ *    teardown).
+ *  - Reload-within-run contract: the probe BPF program stays
+ *    loaded for the VM's lifetime; only the *scheduler under test*
+ *    reloads when a test exercises multiple schedulers in one VM
+ *    run. Because the latch is sticky and the freeze coordinator
+ *    never resets it, a second scheduler's error-class exit
+ *    cannot trigger a second freeze on its own — the first
+ *    scheduler's transition already drove `0 -> 1`, and the
+ *    second sched_ext_exit's CAS no-ops. To get a per-reload
+ *    dump, the host MUST zero this `.bss` byte (at the BTF-
+ *    resolved offset above) BEFORE the new scheduler is
+ *    permitted to attach. Two distinct call paths, with
+ *    different scopes:
+ *      * Guest-context (libbpf API, INSIDE the VM) —
+ *        `bpf_map__update_elem(probe_bp__bss_map, &zero_key,
+ *        &zero_val, BPF_ANY)` issues a kernel-side update via
+ *        the bpf() syscall, lowering to the same .bss page the
+ *        BPF program reads. Available only to code running
+ *        inside the guest with a libbpf handle on the probe
+ *        skeleton.
+ *      * Host-side (direct guest-memory write, OUTSIDE the VM) —
+ *        translate the .bss map's `value_kva` plus the BTF-
+ *        resolved field offset to a guest physical address (the
+ *        same translation the freeze coordinator does at
+ *        vmm/mod.rs:`load_probe_bss_offset` +
+ *        `translate_any_kva`), then zero the byte at that PA in
+ *        the host-mapped `GuestMem`. The libbpf API is NOT
+ *        available from host code outside the guest — only the
+ *        direct PA write works there.
+ *    Skipping the clear leaves the latch at `1`; the very first
+ *    poll iteration after reload would observe the flipped flag
+ *    and trigger a stall dump for state belonging to the
+ *    *previous* scheduler — a stale and misleading dump.
+ *  - Reset: across VM runs, the BPF program is reloaded; libbpf
+ *    re-zeroes .bss. There is no "clear and resume" path inside
+ *    the framework. If a future caller reuses the same BPF
+ *    program object across multiple VM runs without reload, that
+ *    caller MUST zero this `.bss` byte before reuse (otherwise
+ *    the second run would see a pre-set latch and trigger a
+ *    spurious freeze immediately). For guest-context callers
+ *    `bpf_map__update_elem` against the `.bss` map at the
+ *    resolved offset with `value=0` works on libbpf master; for
+ *    host-side reset use the same translated-PA write described
+ *    in the Reload-within-run contract above.
  */
 volatile u32 ktstr_err_exit_detected = 0;
 
@@ -242,7 +302,23 @@ int BPF_PROG(ktstr_trigger_tp, unsigned int kind)
 	event->func_idx = 0;
 	event->ts = bpf_ktime_get_ns();
 	event->nr_fields = 0;
-	event->args[0] = (u64)bpf_get_current_task();
+	/*
+	 * args[0] = causal task pointer. Only SCX_EXIT_ERROR_BPF is
+	 * unambiguously caused by the currently-running task (a BPF
+	 * scheduler callback faulted in the task's context, so
+	 * `current` IS the task that hit the bug). SCX_EXIT_ERROR can
+	 * fire from kworker context — e.g. async unregistration or
+	 * sysrq — where `current` is the worker thread, not the task
+	 * that triggered the exit; emitting that as args[0] would
+	 * splatter the probe output with unstitched kworker frames.
+	 * Userspace process.rs:~1402 drops events with args[0] == 0,
+	 * so emitting 0 here suppresses the probe output for these
+	 * non-causal kinds. The error-exit latch above still records
+	 * the exit, so the failure remains observable in the dump.
+	 */
+	event->args[0] = (kind == SCX_EXIT_ERROR_BPF)
+		? (u64)bpf_get_current_task()
+		: 0;
 
 	/* Capture kernel stack. */
 	int stack_sz = bpf_get_stack(ctx, event->kstack,

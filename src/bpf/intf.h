@@ -69,8 +69,14 @@ enum event_type {
 
 /* Ring buffer event sent from BPF to userspace on trigger.
  *
- * For EVENT_TRIGGER: args[0] = bpf_get_current_task() ptr,
- * args[1] = exit kind (scx_exit_kind enum value).
+ * For EVENT_TRIGGER:
+ *   args[0] = causal task pointer when the kind is unambiguously
+ *             caused by the currently-running task
+ *             (`SCX_EXIT_ERROR_BPF`), else `0`. Userspace drops
+ *             events with `args[0] == 0` to suppress noise from
+ *             non-causal exit contexts (e.g. kworker-driven
+ *             `SCX_EXIT_ERROR`).
+ *   args[1] = exit kind (scx_exit_kind enum value).
  */
 struct probe_event {
 	unsigned int type;

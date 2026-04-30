@@ -40,6 +40,12 @@ use super::bpf_map::{
 };
 use super::btf_render::{RenderedValue, render_value};
 
+/// Snapshot of one vCPU's instruction-pointer / stack-pointer / page-
+/// table-root at freeze time. Re-export of the freeze-side type so
+/// dump consumers don't have to depend on `vmm::exit_dispatch`
+/// internals.
+pub use crate::vmm::exit_dispatch::VcpuRegSnapshot;
+
 /// Top-level stall-dump report. One per freeze trigger.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[non_exhaustive]
@@ -48,6 +54,13 @@ pub struct StallDumpReport {
     /// (i.e. allocation order); the report is otherwise unsorted so
     /// callers that want a stable view should sort by name.
     pub maps: Vec<StallDumpMap>,
+    /// Per-vCPU register snapshots captured on each vCPU thread at
+    /// freeze time. Index matches vCPU id (BSP at 0, APs at 1..N).
+    /// `None` when a vCPU never parked (rendezvous timeout) or its
+    /// `KVM_GET_REGS` failed mid-shutdown. Attached to the report by
+    /// the freeze coordinator after `dump_state` returns.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub vcpu_regs: Vec<Option<VcpuRegSnapshot>>,
 }
 
 /// Rendering of one BPF map's contents.
@@ -127,18 +140,34 @@ pub struct StallDumpPercpuEntry {
 }
 
 impl std::fmt::Display for StallDumpReport {
-    /// Human-readable rendering of every map. JSON remains the
-    /// programmatic form via `serde_json`; this Display is the
-    /// default presentation used in test-failure output.
+    /// Human-readable rendering of every map plus per-vCPU register
+    /// snapshots. JSON remains the programmatic form via
+    /// `serde_json`; this Display is the default presentation used
+    /// in test-failure output.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.maps.is_empty() {
+        if self.maps.is_empty() && self.vcpu_regs.is_empty() {
             return f.write_str("(empty stall dump)");
         }
-        for (i, m) in self.maps.iter().enumerate() {
-            if i > 0 {
+        let mut first = true;
+        for m in &self.maps {
+            if !first {
                 f.write_str("\n\n")?;
             }
+            first = false;
             std::fmt::Display::fmt(m, f)?;
+        }
+        if !self.vcpu_regs.is_empty() {
+            if !first {
+                f.write_str("\n\n")?;
+            }
+            f.write_str("vcpu_regs:")?;
+            for (i, slot) in self.vcpu_regs.iter().enumerate() {
+                f.write_str("\n  ")?;
+                match slot {
+                    Some(s) => write!(f, "vcpu {i}: {s}")?,
+                    None => write!(f, "vcpu {i}: <unavailable>")?,
+                }
+            }
         }
         Ok(())
     }
@@ -275,6 +304,7 @@ pub fn dump_state(
     let maps = accessor.maps();
     let mut report = StallDumpReport {
         maps: Vec::with_capacity(maps.len()),
+        vcpu_regs: Vec::new(),
     };
 
     // Per-map program-BTF cache, keyed by `btf_kva`. Each unique
@@ -624,6 +654,7 @@ mod tests {
                 arena: None,
                 error: None,
             }],
+            vcpu_regs: Vec::new(),
         };
         let json = serde_json::to_string(&report).unwrap();
         let parsed: StallDumpReport = serde_json::from_str(&json).unwrap();
@@ -678,6 +709,7 @@ mod tests {
     fn report_display_one_map_with_value() {
         let report = StallDumpReport {
             maps: vec![make_simple_map()],
+            vcpu_regs: Vec::new(),
         };
         let out = format!("{report}");
         // Map header line.
@@ -695,6 +727,7 @@ mod tests {
     fn report_display_multiple_maps_separated() {
         let report = StallDumpReport {
             maps: vec![make_simple_map(), make_simple_map()],
+            vcpu_regs: Vec::new(),
         };
         let out = format!("{report}");
         // Maps separated by a blank line (\n\n).
@@ -762,5 +795,64 @@ mod tests {
         assert!(out.contains("cpu 0: 1"));
         assert!(out.contains("cpu 1: <unmapped>"));
         assert!(out.contains("cpu 2: 3"));
+    }
+
+    // ---- vcpu_regs Display coverage ---------------------------------
+
+    #[test]
+    fn report_display_includes_vcpu_regs_section() {
+        let report = StallDumpReport {
+            maps: Vec::new(),
+            vcpu_regs: vec![
+                Some(VcpuRegSnapshot {
+                    instruction_pointer: 0x1,
+                    stack_pointer: 0x2,
+                    page_table_root: 0x3,
+                }),
+                None,
+                Some(VcpuRegSnapshot {
+                    instruction_pointer: 0xa,
+                    stack_pointer: 0xb,
+                    page_table_root: 0xc,
+                }),
+            ],
+        };
+        let out = format!("{report}");
+        // Section header.
+        assert!(out.starts_with("vcpu_regs:"), "missing header: {out}");
+        // Three vCPU rows: 0 with values, 1 unavailable, 2 with values.
+        assert!(out.contains("vcpu 0: ip=0x"), "missing vcpu 0: {out}");
+        assert!(
+            out.contains("vcpu 1: <unavailable>"),
+            "missing vcpu 1 marker: {out}"
+        );
+        assert!(out.contains("vcpu 2: ip=0x"), "missing vcpu 2: {out}");
+    }
+
+    #[test]
+    fn report_display_pairs_maps_and_vcpu_regs_with_blank_line() {
+        let report = StallDumpReport {
+            maps: vec![make_simple_map()],
+            vcpu_regs: vec![Some(VcpuRegSnapshot {
+                instruction_pointer: 0x1,
+                stack_pointer: 0x2,
+                page_table_root: 0x3,
+            })],
+        };
+        let out = format!("{report}");
+        // Map block, blank line, vcpu_regs section.
+        assert!(out.contains("\n\nvcpu_regs:"));
+    }
+
+    #[test]
+    fn report_display_empty_with_only_vcpu_regs_does_not_say_empty_dump() {
+        // An all-empty maps Vec but populated vcpu_regs must still
+        // render rather than fall through to "(empty stall dump)".
+        let report = StallDumpReport {
+            maps: Vec::new(),
+            vcpu_regs: vec![None],
+        };
+        let out = format!("{report}");
+        assert_eq!(out, "vcpu_regs:\n  vcpu 0: <unavailable>");
     }
 }
