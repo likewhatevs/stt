@@ -1,0 +1,250 @@
+//! End-to-end test for the stall-dump pipeline.
+//!
+//! Boots scx-ktstr with `--stall-after=1`, lets the BPF probe latch
+//! the resulting `SCX_EXIT_ERROR_STALL` exit, and asserts that the
+//! freeze coordinator's host-side dump captures BTF-rendered fields
+//! from the scheduler's `.bss` section.
+//!
+//! The dump path is gated on the `KTSTR_STALL_DUMP_PATH` env var:
+//! when set, the freeze coordinator also writes the JSON-pretty
+//! `StallDumpReport` to that path. This test sets the env var to a
+//! tempfile-derived path before invoking `execute_steps`, then reads
+//! the file after the VM tears down.
+//!
+//! User-facing test bar (per project memory): "I see variable names
+//! and values in the logs when a scheduler stalls." This test
+//! enforces the host-side half of that bar — the file at
+//! `KTSTR_STALL_DUMP_PATH` must contain `stall`, `crash` and other
+//! BTF-resolved field names from `scx-ktstr`'s global section, not
+//! hex offsets, after a triggered stall.
+
+use anyhow::Result;
+use ktstr::assert::AssertResult;
+use ktstr::scenario::ops::{CgroupDef, HoldSpec, Step, execute_steps};
+use ktstr::test_support::{Payload, Scheduler, SchedulerSpec};
+
+const KTSTR_SCHED: Scheduler =
+    Scheduler::new("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
+const KTSTR_SCHED_PAYLOAD: Payload = Payload::from_scheduler(&KTSTR_SCHED);
+
+/// Per-test path for the stall dump JSON. Each scenario function
+/// computes its own unique path so parallel tests do not clobber
+/// each other (nextest runs tests in parallel). The path lives under
+/// `std::env::temp_dir()` so it cleans up via the OS tmp policy on
+/// host reboot; tests do not actively unlink because the file is
+/// useful debugging evidence on failure.
+fn stall_dump_path(test_name: &str) -> std::path::PathBuf {
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!("ktstr-stall-dump-{test_name}-{pid}-{nanos}.json"))
+}
+
+fn scenario_stall_dump_renders_bss_fields(ctx: &ktstr::scenario::Ctx) -> Result<AssertResult> {
+    // Compute the dump path FIRST and set the env var BEFORE
+    // `execute_steps` spawns the VMM thread. The freeze coordinator
+    // reads `KTSTR_STALL_DUMP_PATH` inside its own closure when the
+    // stall latch fires, so the env var must be visible before the
+    // coord thread is born.
+    //
+    // SAFETY: set_var is unsafe in 2024 edition because env state is
+    // shared across threads. This test sets a path that's unique to
+    // the test (process-id + nanos) before any scheduler-affecting
+    // work, so concurrent tests do not race for the same path.
+    let dump_path = stall_dump_path("renders_bss_fields");
+    unsafe {
+        std::env::set_var("KTSTR_STALL_DUMP_PATH", &dump_path);
+    }
+
+    let steps = vec![Step {
+        setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
+        ops: vec![],
+        hold: HoldSpec::FULL,
+    }];
+    let mut result = execute_steps(ctx, steps)?;
+
+    // Read the dump file written by the freeze coordinator. The
+    // file must exist when the scenario reaches here because:
+    //   1. `--stall-after=1` triggers an SCX_EXIT_ERROR_STALL inside
+    //      the guest within ~1 second.
+    //   2. The probe BPF tracepoint fires on the error-class exit.
+    //   3. The freeze coordinator's .bss-poll observes the latch,
+    //      runs `dump_state`, and writes the JSON to the env-var
+    //      path before clearing `freeze`.
+    //   4. The watchdog tears the VM down, `execute_steps` returns,
+    //      and we land here on the host side of the same process.
+    //
+    // If the file is missing, surface the failure in the
+    // AssertResult details rather than panicking — `expect_err: true`
+    // would otherwise mask a missing-dump regression as a pass.
+    let json = match std::fs::read_to_string(&dump_path) {
+        Ok(s) => s,
+        Err(e) => {
+            result.passed = false;
+            result.details.push(ktstr::assert::AssertDetail::new(
+                ktstr::assert::DetailKind::Other,
+                format!(
+                    "stall dump file missing at {}: {e} (freeze coordinator did \
+                     not write — either the SCX_EXIT_ERROR_STALL latch did not \
+                     fire, owned_accessor / dump_btf was None, or the file \
+                     write failed silently)",
+                    dump_path.display()
+                ),
+            ));
+            anyhow::bail!(
+                "stall dump file missing at {} — freeze coordinator did not \
+                 write the JSON dump",
+                dump_path.display()
+            );
+        }
+    };
+
+    // Parse as a generic JSON value to avoid an unbounded
+    // dependency on the (pub(crate)) `StallDumpReport` type from
+    // outside the crate.
+    let value: serde_json::Value = serde_json::from_str(&json)
+        .map_err(|e| anyhow::anyhow!("dump file is not valid JSON: {e}"))?;
+
+    // Top-level shape: {"maps": [...]}. `non_exhaustive` does not
+    // affect serde output, so the field name is stable.
+    let maps = value
+        .get("maps")
+        .and_then(|m| m.as_array())
+        .ok_or_else(|| anyhow::anyhow!("dump JSON missing top-level `maps` array"))?;
+
+    // Find the scx-ktstr `.bss` map. libbpf composes
+    // `<obj_name>.bss` for the global-section map, and scx-ktstr's
+    // BPF object is `main_bpf` (per scx-ktstr/src/bpf/main.bpf.c
+    // libbpf object naming), so the dump should carry an entry
+    // whose name ends with `.bss` and is NOT one of the framework
+    // probes filtered by `KTSTR_INTERNAL_MAPS`.
+    let bss_map = maps
+        .iter()
+        .find(|m| {
+            m.get("name")
+                .and_then(|n| n.as_str())
+                .map(|n| {
+                    n.ends_with(".bss")
+                        && !n.starts_with("probe_bp.")
+                        && !n.starts_with("fentry_p.")
+                })
+                .unwrap_or(false)
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "dump has no scheduler `.bss` map (got {} maps): {json}",
+                maps.len()
+            )
+        })?;
+
+    // The rendered value is a Struct whose members enumerate the
+    // BTF-resolved global names. Serde tags the variant via
+    // `kind = "struct"`; members are at `.value.members[]`. Each
+    // member is `{ "name": "<field>", "value": {...} }`.
+    let value_field = bss_map
+        .get("value")
+        .ok_or_else(|| anyhow::anyhow!(".bss map has no `value` field"))?;
+    let kind = value_field
+        .get("kind")
+        .and_then(|k| k.as_str())
+        .unwrap_or("");
+    if kind != "struct" {
+        anyhow::bail!(
+            "expected .bss value to render as a Struct (kind=\"struct\"), got kind={kind:?}: \
+             {value_field}"
+        );
+    }
+    let members = value_field
+        .get("members")
+        .and_then(|m| m.as_array())
+        .ok_or_else(|| anyhow::anyhow!(".bss Struct has no `members` array"))?;
+
+    // The user-facing test bar: BTF field names must appear in the
+    // rendered output, NOT hex offsets. scx-ktstr's main.bpf.c
+    // declares `stall`, `crash`, `degrade_rt`, `degrade_cnt`,
+    // `slow_cnt` (and others) at file scope. At minimum the trigger
+    // field `stall` and the headline error fields must be visible —
+    // the others may shift across scx-ktstr versions, so don't
+    // pin the full set.
+    let names: std::collections::HashSet<&str> = members
+        .iter()
+        .filter_map(|m| m.get("name").and_then(|n| n.as_str()))
+        .collect();
+    for required in ["stall", "crash"] {
+        if !names.contains(required) {
+            anyhow::bail!(
+                "BTF-rendered .bss missing required field `{required}` — \
+                 either the field was renamed in scx-ktstr's main.bpf.c \
+                 or the renderer fell through to an Unsupported branch \
+                 instead of recursing into the Struct. members: {names:?}"
+            );
+        }
+    }
+
+    // Stall flag must be a non-zero unsigned integer — proves the
+    // dump captured the LIVE state at error-exit time, not a
+    // pre-init zero. scx-ktstr writes `stall = 1` from
+    // `--stall-after=1` before the watchdog fires.
+    let stall_value = members
+        .iter()
+        .find(|m| m.get("name").and_then(|n| n.as_str()) == Some("stall"))
+        .and_then(|m| m.get("value"))
+        .ok_or_else(|| anyhow::anyhow!("`stall` member found but has no `value`"))?;
+    let stall_kind = stall_value
+        .get("kind")
+        .and_then(|k| k.as_str())
+        .unwrap_or("");
+    let stall_int = stall_value
+        .get("value")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "`stall` value is not a numeric u64 (kind={stall_kind:?}): {stall_value}"
+            )
+        })?;
+    if stall_int == 0 {
+        anyhow::bail!(
+            "`stall` rendered as 0 — the scheduler-side stall flag never flipped, \
+             or the freeze coordinator captured pre-stall state. Full value: {stall_value}"
+        );
+    }
+
+    // Confirming detail so the test log shows the captured value.
+    result.details.push(ktstr::assert::AssertDetail::new(
+        ktstr::assert::DetailKind::Other,
+        format!(
+            "stall-dump file at {} contains scheduler .bss render with \
+             stall={stall_int}, member count={}",
+            dump_path.display(),
+            members.len(),
+        ),
+    ));
+
+    Ok(result)
+}
+
+#[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+#[linkme(crate = ktstr::__private::linkme)]
+static __KTSTR_ENTRY_STALL_DUMP_BSS: ktstr::test_support::KtstrTestEntry =
+    ktstr::test_support::KtstrTestEntry {
+        name: "stall_dump_renders_bss_fields",
+        func: scenario_stall_dump_renders_bss_fields,
+        scheduler: &KTSTR_SCHED_PAYLOAD,
+        // --stall-after=1 makes the scheduler return early from
+        // dispatch after 1 second of operation, triggering
+        // SCX_EXIT_ERROR_STALL via the kernel watchdog.
+        extra_sched_args: &["--stall-after=1"],
+        // Watchdog timeout snug to the stall budget so the run
+        // teardown stays under the test duration.
+        watchdog_timeout: std::time::Duration::from_secs(3),
+        duration: std::time::Duration::from_secs(10),
+        workers_per_cgroup: 2,
+        // The scenario itself returns Err to surface a missing-dump
+        // regression as a real failure. Successful rendering returns
+        // a failed AssertResult (the stall is the expected behaviour);
+        // expect_err inverts that to PASS.
+        expect_err: true,
+        ..ktstr::test_support::KtstrTestEntry::DEFAULT
+    };

@@ -291,6 +291,9 @@ path = "src/bin/jemalloc_alloc_worker.rs"
 name = "ktstr_sched_tests"
 
 [[test]]
+name = "stall_dump_e2e"
+
+[[test]]
 name = "scenario_coverage"
 
 [[test]]
