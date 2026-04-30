@@ -40,14 +40,12 @@ pub(crate) struct AccessorCtx<'a> {
 }
 
 /// BPF_MAP_TYPE_HASH from include/uapi/linux/bpf.h.
-#[allow(dead_code)]
 pub const BPF_MAP_TYPE_HASH: u32 = 1;
 
 /// BPF_MAP_TYPE_ARRAY from include/uapi/linux/bpf.h.
 pub const BPF_MAP_TYPE_ARRAY: u32 = 2;
 
 /// BPF_MAP_TYPE_PERCPU_ARRAY from include/uapi/linux/bpf.h.
-#[allow(dead_code)]
 pub const BPF_MAP_TYPE_PERCPU_ARRAY: u32 = 6;
 
 /// BPF_OBJ_NAME_LEN from include/linux/bpf.h.
