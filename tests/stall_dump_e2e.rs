@@ -262,6 +262,29 @@ fn scenario_stall_dump_renders_bss_fields(ctx: &ktstr::scenario::Ctx) -> Result<
         );
     }
 
+    // user_page_table_root is arch-conditional:
+    //   x86_64: always None → JSON key absent
+    //     (skip_serializing_if = "Option::is_none").
+    //   aarch64: best-effort Some(ttbr0_el1) when the TTBR0_EL1
+    //     KVM_GET_ONE_REG read succeeds; otherwise still absent.
+    //
+    // Pin per-arch behaviour so a future field rename or a regression
+    // (e.g. accidentally always populating on x86_64) is caught.
+    #[cfg(target_arch = "x86_64")]
+    {
+        for slot in &populated_with_ip {
+            assert!(
+                slot.get("user_page_table_root").is_none(),
+                "x86_64 vcpu_regs entry must NOT carry user_page_table_root \
+                 (CR3 alone identifies the active mm); got: {slot}"
+            );
+        }
+    }
+    // (aarch64 doesn't get a hard requirement here because the
+    // sysreg read can be gated by the host kernel — best-effort
+    // capture per the design. The serde test inside exit_dispatch
+    // already pins the JSON-key contract for both states.)
+
     // Confirming detail so the test log shows the captured value.
     result.details.push(ktstr::assert::AssertDetail::new(
         ktstr::assert::DetailKind::Other,

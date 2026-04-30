@@ -808,12 +808,14 @@ mod tests {
                     instruction_pointer: 0x1,
                     stack_pointer: 0x2,
                     page_table_root: 0x3,
+                    user_page_table_root: None,
                 }),
                 None,
                 Some(VcpuRegSnapshot {
                     instruction_pointer: 0xa,
                     stack_pointer: 0xb,
                     page_table_root: 0xc,
+                    user_page_table_root: None,
                 }),
             ],
         };
@@ -837,6 +839,7 @@ mod tests {
                 instruction_pointer: 0x1,
                 stack_pointer: 0x2,
                 page_table_root: 0x3,
+                user_page_table_root: None,
             })],
         };
         let out = format!("{report}");
@@ -854,5 +857,60 @@ mod tests {
         };
         let out = format!("{report}");
         assert_eq!(out, "vcpu_regs:\n  vcpu 0: <unavailable>");
+    }
+
+    /// Pin the wire shape of a partial dump — the
+    /// "all_parked but dump prerequisites unavailable" branch in
+    /// `vmm::run_vm`'s freeze coordinator builds exactly this
+    /// shape: empty `maps`, populated `vcpu_regs`. Operators
+    /// reading the JSON / Display output rely on:
+    ///   - Display NOT rendering the "(empty stall dump)"
+    ///     fallback (which would mask the partial),
+    ///   - Display starting with the `vcpu_regs:` section,
+    ///   - JSON serialising `"maps":[]` (NOT skipped, since
+    ///     `Vec::is_empty` is the skip condition only for
+    ///     `vcpu_regs` and a few `Option`/`Vec` fields inside
+    ///     `StallDumpMap`, not for the top-level `maps` field).
+    #[test]
+    fn report_display_partial_with_populated_regs_and_empty_maps() {
+        let report = StallDumpReport {
+            maps: Vec::new(),
+            vcpu_regs: vec![Some(VcpuRegSnapshot {
+                instruction_pointer: 0xdead,
+                stack_pointer: 0xbeef,
+                page_table_root: 0xcafe,
+                user_page_table_root: None,
+            })],
+        };
+
+        // (a) Display: vcpu_regs section present, no fallback.
+        let out = format!("{report}");
+        assert!(
+            out.contains("vcpu_regs:"),
+            "Display must contain the vcpu_regs section: {out}"
+        );
+        assert!(
+            out.contains("vcpu 0: ip=0x"),
+            "Display must render the BSP register row: {out}"
+        );
+        assert!(
+            !out.contains("(empty stall dump)"),
+            "Display must NOT fall through to empty fallback when \
+             vcpu_regs is populated: {out}"
+        );
+
+        // (b) JSON: maps key present as empty array, NOT
+        // skipped — operators downstream reliably distinguish
+        // "no maps captured (partial)" from "maps key absent
+        // (regression / older schema)".
+        let json = serde_json::to_string(&report).expect("serialize");
+        assert!(
+            json.contains("\"maps\":[]"),
+            "JSON must carry empty `maps` array (not skip): {json}"
+        );
+        assert!(
+            json.contains("\"vcpu_regs\""),
+            "JSON must carry vcpu_regs key: {json}"
+        );
     }
 }

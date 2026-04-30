@@ -57,16 +57,36 @@ pub struct VcpuRegSnapshot {
     ///     current task's mm); the boot-time value is what the
     ///     freeze coordinator uses for its own page-walks.
     ///
-    ///   - On aarch64: `ttbr1_el1` — the kernel pgd. Effectively
-    ///     `init_top_pgt`-equivalent: TTBR1_EL1 holds the kernel
-    ///     mapping and stays stable across context switches
-    ///     (TTBR0_EL1 holds the userspace mapping and IS swapped
-    ///     per-task, but the freeze coordinator's BPF map reads
-    ///     are kernel-side). For the per-process userspace pgd,
-    ///     a TTBR0_EL1 capture would be needed and is not
-    ///     currently implemented (taskified for future
-    ///     enrichment).
+    ///   - On aarch64: `ttbr1_el1` — the kernel pgd. Stays
+    ///     stable across context switches (TTBR0_EL1 swaps
+    ///     per-task; see [`Self::user_page_table_root`] for the
+    ///     userspace half).
+    ///
+    /// Raw register value with arch-specific flag bits intact
+    /// (PCID/PCD/PWT on x86_64 CR3, ASID on aarch64 TTBR);
+    /// consumers must mask before walking as a physical address.
     pub page_table_root: u64,
+    /// Userspace page-table root at freeze time. arch-specific:
+    ///
+    ///   - On x86_64: always `None`. CR3 already covers both the
+    ///     kernel and userspace halves of the address space —
+    ///     [`Self::page_table_root`] alone identifies the active
+    ///     mm.
+    ///
+    ///   - On aarch64: `Some(ttbr0_el1)` when capture succeeds,
+    ///     `None` when KVM_GET_ONE_REG fails (mid-shutdown vCPU,
+    ///     sysreg gated by the host kernel). TTBR0_EL1 holds the
+    ///     userspace pgd that switches per-task, so it
+    ///     identifies which task's userspace was active at
+    ///     freeze time — useful for diagnosing user-context
+    ///     traps. For sched_ext failures (kernel context),
+    ///     TTBR1_EL1 in `page_table_root` is the primary signal.
+    ///
+    /// Raw register value with arch-specific flag bits intact
+    /// (PCID/PCD/PWT on x86_64 CR3, ASID on aarch64 TTBR);
+    /// consumers must mask before walking as a physical address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_page_table_root: Option<u64>,
 }
 
 /// Capture the vCPU's RIP/RSP/CR3 (or PC/SP/TTBR1 on aarch64) on
@@ -88,6 +108,9 @@ pub(crate) fn capture_vcpu_regs(vcpu: &mut kvm_ioctls::VcpuFd) -> Option<VcpuReg
         instruction_pointer: regs.rip,
         stack_pointer: regs.rsp,
         page_table_root: sregs.cr3,
+        // x86_64 has a single CR3 covering both halves of the
+        // address space; no separate userspace pgd to capture.
+        user_page_table_root: None,
     })
 }
 
@@ -135,10 +158,15 @@ pub(crate) fn capture_vcpu_regs(vcpu: &mut kvm_ioctls::VcpuFd) -> Option<VcpuReg
     // PC at offset 256 in user_pt_regs (= same offset in kvm_regs
     // because user_pt_regs.regs is at offset 0). 256 / 4 = 64.
     const PC_ID: u64 = KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM_CORE | (256 / 4);
-    // TTBR1_EL1 system register (Op0=3, Op1=0, CRn=2, CRm=0, Op2=1).
-    // Encoded under KVM_REG_ARM64_SYSREG.
+    // ARM64 system registers encoded under KVM_REG_ARM64_SYSREG.
+    // The 16-bit packing is
+    //   (Op0 << 14) | (Op1 << 11) | (CRn << 7) | (CRm << 3) | Op2
+    // per arch/arm64/include/uapi/asm/kvm.h `ARM64_SYS_REG` macro.
     const KVM_REG_ARM64_SYSREG: u64 = 0x0013_0000;
-    // (Op0 << 14) | (Op1 << 11) | (CRn << 7) | (CRm << 3) | Op2
+    // TTBR0_EL1: Op0=3, Op1=0, CRn=2, CRm=0, Op2=0
+    // = (3 << 14) | (0 << 11) | (2 << 7) | (0 << 3) | 0 = 0xC100
+    const TTBR0_EL1_ID: u64 = KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM64_SYSREG | 0xC100;
+    // TTBR1_EL1: Op0=3, Op1=0, CRn=2, CRm=0, Op2=1
     // = (3 << 14) | (0 << 11) | (2 << 7) | (0 << 3) | 1 = 0xC101
     const TTBR1_EL1_ID: u64 = KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM64_SYSREG | 0xC101;
 
@@ -159,10 +187,19 @@ pub(crate) fn capture_vcpu_regs(vcpu: &mut kvm_ioctls::VcpuFd) -> Option<VcpuReg
         .ok()
         .map(|_| u64::from_le_bytes(buf))
         .unwrap_or(0);
+    // TTBR0 read is best-effort. Stored in user_page_table_root
+    // so a failure surfaces as None — distinct from a successful
+    // read of 0, which means "no userspace mapping active at
+    // freeze time" (e.g. the vCPU was running pure kernel code).
+    let ttbr0 = vcpu
+        .get_one_reg(TTBR0_EL1_ID, &mut buf)
+        .ok()
+        .map(|_| u64::from_le_bytes(buf));
     Some(VcpuRegSnapshot {
         instruction_pointer: pc,
         stack_pointer: sp,
         page_table_root: ttbr1,
+        user_page_table_root: ttbr0,
     })
 }
 
@@ -172,7 +209,14 @@ impl std::fmt::Display for VcpuRegSnapshot {
             f,
             "ip=0x{:016x} sp=0x{:016x} ptroot=0x{:016x}",
             self.instruction_pointer, self.stack_pointer, self.page_table_root
-        )
+        )?;
+        // user_page_table_root is x86_64-None / aarch64-Optional;
+        // when present, render it inline so an aarch64 stall
+        // dump shows both halves of the address space.
+        if let Some(uptr) = self.user_page_table_root {
+            write!(f, " uptroot=0x{uptr:016x}")?;
+        }
+        Ok(())
     }
 }
 
@@ -664,10 +708,13 @@ mod vcpu_reg_snapshot_tests {
 
     #[test]
     fn vcpu_reg_snapshot_display_renders_three_hex_fields() {
+        // x86_64-shape snapshot (user_page_table_root=None): only
+        // the three core hex fields render; no `uptroot=` suffix.
         let s = VcpuRegSnapshot {
             instruction_pointer: 0xffff_ffff_8100_1234,
             stack_pointer: 0xffff_ffff_8000_0000,
             page_table_root: 0x0123_4567_89ab_cdef,
+            user_page_table_root: None,
         };
         let out = format!("{s}");
         assert_eq!(
@@ -677,11 +724,31 @@ mod vcpu_reg_snapshot_tests {
     }
 
     #[test]
+    fn vcpu_reg_snapshot_display_appends_user_pt_root_when_present() {
+        // aarch64-shape snapshot: user_page_table_root populated
+        // → Display appends ` uptroot=0x...`. Pinning here so a
+        // future Display tweak (e.g. swapping " " for "\n  ")
+        // is caught.
+        let s = VcpuRegSnapshot {
+            instruction_pointer: 0xffff_8000_8100_1234,
+            stack_pointer: 0xffff_8000_8000_0000,
+            page_table_root: 0x0000_4000_8000_0000,
+            user_page_table_root: Some(0x0000_0000_aaaa_bbbb),
+        };
+        let out = format!("{s}");
+        assert_eq!(
+            out,
+            "ip=0xffff800081001234 sp=0xffff800080000000 ptroot=0x0000400080000000 uptroot=0x00000000aaaabbbb"
+        );
+    }
+
+    #[test]
     fn vcpu_reg_snapshot_serde_round_trip() {
         let s = VcpuRegSnapshot {
             instruction_pointer: 0x1,
             stack_pointer: 0x2,
             page_table_root: 0x3,
+            user_page_table_root: None,
         };
         let json = serde_json::to_string(&s).expect("serialize");
         // Pin the JSON key names so a future field rename is
@@ -702,10 +769,40 @@ mod vcpu_reg_snapshot_tests {
             json.contains("\"page_table_root\""),
             "missing JSON key `page_table_root`: {json}"
         );
+        // user_page_table_root is None → serde-skipped via
+        // skip_serializing_if = "Option::is_none"; assert it does
+        // NOT appear in the JSON.
+        assert!(
+            !json.contains("\"user_page_table_root\""),
+            "user_page_table_root must skip-serialize when None: {json}"
+        );
         let parsed: VcpuRegSnapshot = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed.instruction_pointer, 0x1);
         assert_eq!(parsed.stack_pointer, 0x2);
         assert_eq!(parsed.page_table_root, 0x3);
+        assert!(
+            parsed.user_page_table_root.is_none(),
+            "missing field must deserialize as None"
+        );
+    }
+
+    #[test]
+    fn vcpu_reg_snapshot_serde_round_trip_with_user_pt_root() {
+        // aarch64-shape: user_page_table_root populated → JSON
+        // carries the key, deserialize round-trips the value.
+        let s = VcpuRegSnapshot {
+            instruction_pointer: 0x1,
+            stack_pointer: 0x2,
+            page_table_root: 0x3,
+            user_page_table_root: Some(0xdead_beef_cafe_d00d),
+        };
+        let json = serde_json::to_string(&s).expect("serialize");
+        assert!(
+            json.contains("\"user_page_table_root\""),
+            "user_page_table_root must serialize when Some: {json}"
+        );
+        let parsed: VcpuRegSnapshot = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.user_page_table_root, Some(0xdead_beef_cafe_d00d));
     }
 
     #[test]
@@ -714,6 +811,7 @@ mod vcpu_reg_snapshot_tests {
             instruction_pointer: 0,
             stack_pointer: 0,
             page_table_root: 0,
+            user_page_table_root: None,
         };
         // 16 hex digits each — leading zeros preserved so widths
         // line up across rows in multi-vcpu output.
@@ -747,6 +845,10 @@ mod vcpu_reg_snapshot_tests {
         // SP_EL1 at byte offset 272 in struct kvm_regs (right
         // after the 272-byte user_pt_regs). 272 / 4 = 68.
         const EXPECTED_SP_EL1_ID: u64 = KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM_CORE | 68;
+        // TTBR0_EL1 sysreg packing: Op0=3, Op1=0, CRn=2, CRm=0, Op2=0
+        // → (3<<14) | (0<<11) | (2<<7) | (0<<3) | 0 = 0xC100.
+        const EXPECTED_TTBR0_EL1_ID: u64 =
+            KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM64_SYSREG | 0xC100;
         // TTBR1_EL1 sysreg packing: Op0=3, Op1=0, CRn=2, CRm=0, Op2=1
         // → (3<<14) | (0<<11) | (2<<7) | (0<<3) | 1 = 0xC101.
         const EXPECTED_TTBR1_EL1_ID: u64 =
@@ -759,6 +861,7 @@ mod vcpu_reg_snapshot_tests {
         // here using the exact same expression form.
         let pc_id = KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM_CORE | (256 / 4);
         let sp_el1_id = KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM_CORE | (272 / 4);
+        let ttbr0_el1_id = KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM64_SYSREG | 0xC100;
         let ttbr1_el1_id = KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM64_SYSREG | 0xC101;
 
         assert_eq!(pc_id, EXPECTED_PC_ID, "PC_ID encoding drift");
@@ -768,9 +871,22 @@ mod vcpu_reg_snapshot_tests {
              not 248 (sp_el0)"
         );
         assert_eq!(
+            ttbr0_el1_id, EXPECTED_TTBR0_EL1_ID,
+            "TTBR0_EL1_ID encoding drift — verify (Op0=3, Op1=0, \
+             CRn=2, CRm=0, Op2=0) packs to 0xC100"
+        );
+        assert_eq!(
             ttbr1_el1_id, EXPECTED_TTBR1_EL1_ID,
             "TTBR1_EL1_ID encoding drift — verify (Op0=3, Op1=0, \
              CRn=2, CRm=0, Op2=1) packs to 0xC101"
+        );
+        // Adjacency check: TTBR0 and TTBR1 differ only in Op2,
+        // so the encoding must differ by exactly 1. Catches a
+        // typo where one constant gets the other's value.
+        assert_eq!(
+            ttbr1_el1_id - ttbr0_el1_id,
+            1,
+            "TTBR0/TTBR1 encodings should differ by exactly 1 (Op2 bit)"
         );
     }
 }

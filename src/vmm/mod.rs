@@ -1004,25 +1004,34 @@ struct VcpuThread {
     handle: JoinHandle<kvm_ioctls::VcpuFd>,
     /// Set by the thread after it exits the KVM_RUN loop.
     exited: Arc<AtomicBool>,
-    /// Set by the thread when it has completed the freeze drain dance
-    /// and is parked, awaiting clearance to resume. The freeze
-    /// coordinator polls this with Acquire ordering before reading
-    /// guest memory; the thread's prior Release store synchronizes-with
-    /// that load, providing the happens-before edge that makes
-    /// host-side guest-memory reads consistent on weakly-ordered
-    /// architectures.
-    parked: Arc<AtomicBool>,
-    /// Per-vCPU register snapshot captured at freeze time (RIP/RSP/CR3
-    /// on x86_64, PC/SP/TTBR1 on aarch64). Written by the vCPU thread
-    /// on its own thread (KVM_GET_REGS is fd-bound and not safe
-    /// cross-thread) just before the `parked` Release store; read by
-    /// the freeze coordinator after the rendezvous Acquire. `None`
-    /// until the first freeze fires; reset to `None` on thaw is NOT
-    /// done — a successive freeze overwrites with the new capture.
-    regs: Arc<std::sync::Mutex<Option<exit_dispatch::VcpuRegSnapshot>>>,
     /// Handle to set `kvm_run.immediate_exit` from outside the vCPU thread.
     /// `None` when KVM_CAP_IMMEDIATE_EXIT is not available.
     immediate_exit: Option<ImmediateExitHandle>,
+}
+
+/// Per-AP freeze-rendezvous state held outside `VcpuThread`. Cloned
+/// out of `spawn_ap_threads` and into the freeze coordinator at run
+/// startup; not needed for teardown (kick/join), so it lives apart
+/// from `VcpuThread` to keep that struct minimal.
+struct ApFreezeHandles {
+    /// Per-AP `parked` ack flags. Set by the AP thread when it has
+    /// completed the freeze drain dance and is parked, awaiting
+    /// clearance to resume. The freeze coordinator polls each entry
+    /// with Acquire ordering before reading guest memory; the
+    /// thread's prior Release store synchronizes-with that load,
+    /// providing the happens-before edge that makes host-side
+    /// guest-memory reads consistent on weakly-ordered
+    /// architectures.
+    parked: Vec<Arc<AtomicBool>>,
+    /// Per-AP register-snapshot slots captured at freeze time
+    /// (RIP/RSP/CR3 on x86_64, PC/SP/TTBR1+TTBR0 on aarch64). Written
+    /// by the AP thread on its own thread (KVM_GET_REGS is fd-bound
+    /// and not safe cross-thread) just before the `parked` Release
+    /// store; read by the freeze coordinator after the rendezvous
+    /// Acquire. `None` until the first freeze fires; reset to
+    /// `None` on thaw is NOT done — a successive freeze overwrites
+    /// with the new capture.
+    regs: Vec<Arc<std::sync::Mutex<Option<exit_dispatch::VcpuRegSnapshot>>>>,
 }
 
 impl VcpuThread {
@@ -1363,7 +1372,9 @@ impl KtstrVm {
         // apply here — interactive shell runs under no-perf by
         // convention, and `pin_targets` is empty in this branch.
         let no_perf_mask: Option<&[usize]> = self.no_perf_plan.as_ref().map(|p| p.cpus.as_slice());
-        let ap_threads = self.spawn_ap_threads(
+        // Interactive shell does not run a freeze coordinator, so
+        // discard the freeze-handle Vecs.
+        let (ap_threads, _ap_freeze) = self.spawn_ap_threads(
             vcpus,
             has_immediate_exit,
             &com1,
@@ -2588,7 +2599,7 @@ impl KtstrVm {
         // hard pin). Mutually exclusive with perf-mode's pin_targets.
         let no_perf_mask: Option<&[usize]> = self.no_perf_plan.as_ref().map(|p| p.cpus.as_slice());
 
-        let ap_threads = self.spawn_ap_threads(
+        let (ap_threads, ap_freeze_handles) = self.spawn_ap_threads(
             vcpus,
             has_immediate_exit,
             &com1,
@@ -2752,14 +2763,19 @@ impl KtstrVm {
             None
         };
         let freeze_coord_bsp_tid = unsafe { libc::pthread_self() };
-        // Snapshot the AP-side freeze handles (immediate_exit + parked
-        // + thread handle for unpark) before run_vm hands ap_threads
-        // to VmRunState. The coordinator needs cross-thread access.
-        let freeze_coord_ap_parked: Vec<Arc<AtomicBool>> =
-            ap_threads.iter().map(|vt| vt.parked.clone()).collect();
-        let freeze_coord_ap_regs: Vec<
-            Arc<std::sync::Mutex<Option<exit_dispatch::VcpuRegSnapshot>>>,
-        > = ap_threads.iter().map(|vt| vt.regs.clone()).collect();
+        // Snapshot the AP-side freeze handles. `parked` flags and
+        // register-snapshot slots come from `ap_freeze_handles` —
+        // populated alongside the threads inside `spawn_ap_threads`,
+        // kept out of `VcpuThread` so that struct stays minimal
+        // (only `handle` + `exited` + `immediate_exit` are needed
+        // for teardown). The freeze coordinator owns these Vecs
+        // for the rest of run_vm. `pthread_t`s and immediate-exit
+        // handles still come from `ap_threads` because those are
+        // teardown-relevant too.
+        let ApFreezeHandles {
+            parked: freeze_coord_ap_parked,
+            regs: freeze_coord_ap_regs,
+        } = ap_freeze_handles;
         let freeze_coord_ap_pthreads: Vec<libc::pthread_t> = ap_threads
             .iter()
             .map(|vt| vt.handle.as_pthread_t() as libc::pthread_t)
@@ -3064,43 +3080,22 @@ impl KtstrVm {
                     // error-class scheduler exit fired in the guest;
                     // the dump is post-mortem evidence, not routine
                     // observation.
-                    if all_parked
-                        && let Some(ref owned) = owned_accessor
-                        && let Some(ref btf) = dump_btf
-                    {
-                        let mut report = crate::monitor::dump::dump_state(
-                            &owned.as_accessor(),
-                            btf,
-                            freeze_coord_num_cpus,
-                            dump_arena_offsets.as_ref(),
-                        );
-                        // Attach per-vCPU register snapshots. Reads
-                        // are happens-after the rendezvous Acquire on
-                        // each vCPU's `parked` flag (loaded in the
-                        // wait loop above), which synchronizes-with
-                        // the vCPU thread's Release store after its
-                        // capture_vcpu_regs / regs_slot write — so
-                        // these Mutex reads see the captured values
-                        // even on weakly-ordered architectures.
-                        // Index 0 = BSP, 1..N = APs (mirroring the
-                        // VcpuFd ordering inside KtstrKvm.vcpus that
-                        // run_vm splits into bsp + ap_threads).
-                        let mut regs: Vec<Option<exit_dispatch::VcpuRegSnapshot>> =
-                            Vec::with_capacity(1 + freeze_coord_ap_regs.len());
-                        regs.push(
-                            *freeze_coord_bsp_regs
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner()),
-                        );
-                        for ap in &freeze_coord_ap_regs {
-                            regs.push(*ap.lock().unwrap_or_else(|e| e.into_inner()));
-                        }
-                        report.vcpu_regs = regs;
-                        match serde_json::to_string_pretty(&report) {
+                    // Helper: emit a fully-built StallDumpReport via
+                    // tracing + the optional KTSTR_STALL_DUMP_PATH
+                    // file sink. Used by both the full-dump branch
+                    // and the partial (vcpu_regs-only) branch below
+                    // so the formatting / file-write contract stays
+                    // identical across the two paths — operators
+                    // see the same JSON shape and log target
+                    // regardless of whether BTF/accessor were
+                    // available.
+                    let emit_report = |report: &crate::monitor::dump::StallDumpReport| {
+                        match serde_json::to_string_pretty(report) {
                             Ok(json) => {
                                 tracing::error!(
                                     target: "ktstr::stall_dump",
                                     map_count = report.maps.len(),
+                                    vcpu_regs_count = report.vcpu_regs.len(),
                                     "freeze-coord: stall dump\n{json}"
                                 );
                                 // Optional file sink for E2E tests:
@@ -3129,17 +3124,75 @@ impl KtstrVm {
                                 tracing::error!(
                                     error = %e,
                                     map_count = report.maps.len(),
+                                    vcpu_regs_count = report.vcpu_regs.len(),
                                     "freeze-coord: stall dump (JSON serialization failed)"
                                 );
                             }
                         }
-                    } else if all_parked {
-                        tracing::debug!(
-                            "freeze-coord: all vCPUs parked but dump prerequisites \
-                             unavailable (owned_accessor={}, dump_btf={})",
-                            owned_accessor.is_some(),
-                            dump_btf.is_some(),
+                    };
+                    // Collect per-vCPU register snapshots once. Reads
+                    // are happens-after the rendezvous Acquire on
+                    // each vCPU's `parked` flag (loaded in the wait
+                    // loop above), which synchronizes-with the vCPU
+                    // thread's Release store after its
+                    // capture_vcpu_regs / regs_slot write — so these
+                    // Mutex reads see the captured values even on
+                    // weakly-ordered architectures. Index 0 = BSP,
+                    // 1..N = APs (mirroring the VcpuFd ordering
+                    // inside KtstrKvm.vcpus that run_vm splits into
+                    // bsp + ap_threads). Computed once because both
+                    // branches below (full dump, partial dump) need
+                    // the same Vec.
+                    let collect_vcpu_regs = || -> Vec<Option<exit_dispatch::VcpuRegSnapshot>> {
+                        let mut regs: Vec<Option<exit_dispatch::VcpuRegSnapshot>> =
+                            Vec::with_capacity(1 + freeze_coord_ap_regs.len());
+                        regs.push(
+                            *freeze_coord_bsp_regs
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner()),
                         );
+                        for ap in &freeze_coord_ap_regs {
+                            regs.push(*ap.lock().unwrap_or_else(|e| e.into_inner()));
+                        }
+                        regs
+                    };
+                    if all_parked
+                        && let Some(ref owned) = owned_accessor
+                        && let Some(ref btf) = dump_btf
+                    {
+                        let mut report = crate::monitor::dump::dump_state(
+                            &owned.as_accessor(),
+                            btf,
+                            freeze_coord_num_cpus,
+                            dump_arena_offsets.as_ref(),
+                        );
+                        report.vcpu_regs = collect_vcpu_regs();
+                        emit_report(&report);
+                    } else if all_parked {
+                        // Rendezvous succeeded but BPF map
+                        // enumeration prerequisites are missing
+                        // (vmlinux unreadable, BTF parse failed,
+                        // BpfMapAccessor never reached the
+                        // guest-kernel handshake). The captured
+                        // vCPU registers are still valid because the
+                        // rendezvous Acquire fence saw them — emit a
+                        // partial report carrying only `vcpu_regs`
+                        // so the operator at least sees per-vCPU
+                        // RIP/RSP/CR3 (or PC/SP/TTBR1+TTBR0). The
+                        // empty `maps` Vec serialises to `"maps": []`
+                        // (no skip_serializing_if on the Vec),
+                        // signalling unambiguously "no map dump".
+                        let report = crate::monitor::dump::StallDumpReport {
+                            maps: Vec::new(),
+                            vcpu_regs: collect_vcpu_regs(),
+                        };
+                        tracing::warn!(
+                            owned_accessor = owned_accessor.is_some(),
+                            dump_btf = dump_btf.is_some(),
+                            "freeze-coord: dump prerequisites unavailable; \
+                             emitting partial report with vcpu_regs only"
+                        );
+                        emit_report(&report);
                     } else {
                         // Rendezvous timed out — at least one vCPU
                         // never set its parked flag, so we cannot
@@ -3308,6 +3361,14 @@ impl KtstrVm {
     /// `--cpu-cap` path is active. The two are mutually exclusive —
     /// perf-mode produces `pin_targets` via the PinningPlan;
     /// `--cpu-cap` no-perf produces `no_perf_mask` via the LlcPlan.
+    ///
+    /// Returns `(threads, freeze_handles)`. The freeze handles
+    /// (per-AP `parked` flags + register-snapshot slots) are the
+    /// freeze coordinator's view of each AP; they live separately
+    /// from `VcpuThread` so the thread struct stays minimal —
+    /// `VcpuThread` carries only what teardown (kick + join) needs.
+    /// Callers that don't run a freeze coordinator (e.g. interactive
+    /// shell) discard `freeze_handles`.
     #[allow(clippy::too_many_arguments)]
     fn spawn_ap_threads(
         &self,
@@ -3320,13 +3381,17 @@ impl KtstrVm {
         freeze: &Arc<AtomicBool>,
         pin_targets: &[Option<usize>],
         no_perf_mask: Option<&[usize]>,
-    ) -> Result<Vec<VcpuThread>> {
+    ) -> Result<(Vec<VcpuThread>, ApFreezeHandles)> {
         // Register the process-wide panic hook that flips `kill` +
         // `exited` on a panicking vCPU thread before the
         // panic=abort-induced process teardown. Idempotent via
         // `Once`; safe to call on every VM spawn.
         vcpu_panic::install_once();
-        let mut ap_threads: Vec<VcpuThread> = Vec::new();
+        let n = vcpus.len();
+        let mut ap_threads: Vec<VcpuThread> = Vec::with_capacity(n);
+        let mut freeze_parked: Vec<Arc<AtomicBool>> = Vec::with_capacity(n);
+        let mut freeze_regs: Vec<Arc<std::sync::Mutex<Option<exit_dispatch::VcpuRegSnapshot>>>> =
+            Vec::with_capacity(n);
         for (i, mut vcpu) in vcpus.into_iter().enumerate() {
             let ie_handle = if has_immediate_exit {
                 Some(ImmediateExitHandle::from_vcpu(&mut vcpu))
@@ -3386,12 +3451,18 @@ impl KtstrVm {
             ap_threads.push(VcpuThread {
                 handle,
                 exited,
-                parked,
-                regs,
                 immediate_exit: ie_handle,
             });
+            freeze_parked.push(parked);
+            freeze_regs.push(regs);
         }
-        Ok(ap_threads)
+        Ok((
+            ap_threads,
+            ApFreezeHandles {
+                parked: freeze_parked,
+                regs: freeze_regs,
+            },
+        ))
     }
 
     /// Start the monitor thread if vmlinux is available.
