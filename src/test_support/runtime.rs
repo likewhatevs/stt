@@ -142,20 +142,14 @@ pub(crate) fn build_vm_builder_base(
 ) -> crate::vmm::KtstrVmBuilder {
     // The base builder deliberately does NOT set
     // `failure_dump_path` — the per-VM target is caller-specific
-    // (primary vs auto-repro), and the setter pre-clears its
-    // target on every call. If this base were to set the primary
-    // path, the auto-repro path's later override (also through
-    // `build_vm_builder_base`) would re-call the setter on the
-    // primary path and erase the primary dump that just landed
-    // before swapping in the repro path. Instead:
-    //   - primary dispatch (`test_support::eval`) attaches
-    //     `{name}.failure-dump.json` after this builder returns;
-    //   - auto-repro (`test_support::probe::attempt_auto_repro`)
-    //     attaches `{name}.repro.failure-dump.json` after this
-    //     builder returns.
-    // Each path therefore pre-clears only its own target via the
-    // setter, leaving the sibling path's file intact for
-    // primary-vs-repro comparison.
+    // (primary vs auto-repro). Stale-file pre-clear lives at the
+    // dispatch sites (`test_support::eval` for primary;
+    // `test_support::probe::attempt_auto_repro` for repro), not
+    // inside the setter or this base call. The setter is pure
+    // (no FS side effects); placing the pre-clear in the dispatch
+    // layer prevents the auto-repro path's reuse of this base
+    // builder from accidentally erasing the primary dump that
+    // just landed.
     let mut builder = crate::vmm::KtstrVm::builder()
         .kernel(kernel)
         .init_binary(ktstr_bin)

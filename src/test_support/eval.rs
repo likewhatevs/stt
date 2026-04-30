@@ -752,14 +752,47 @@ pub(crate) fn run_ktstr_test_inner(
 
     let no_perf_mode = std::env::var("KTSTR_NO_PERF_MODE").is_ok();
 
+    // Pre-clear stale failure-dump files before the primary VM
+    // boots. A passing rerun after a prior failed invocation must
+    // not be masked by the prior failure's leftovers — the E2E
+    // test (`tests/failure_dump_e2e.rs`) reads from the primary
+    // path and an operator inspecting the sidecar dir looks at
+    // both. Both files are scoped per-test (`{name}.failure-
+    // dump.json` and `{name}.repro.failure-dump.json`), so we can
+    // safely unlink both from this single primary-dispatch
+    // entry — auto-repro fires only after a primary failure
+    // emits a dump, so any repro file present here is stale by
+    // construction. NotFound is silenced; other unlink errors
+    // emit `tracing::warn!` and dispatch proceeds (the freeze
+    // coord's own write would overwrite a stale file in
+    // practice; the warn flags permission / fs anomalies for the
+    // operator).
+    let primary_dump_path =
+        super::sidecar::sidecar_dir().join(format!("{}.failure-dump.json", entry.name));
+    let repro_dump_path =
+        super::sidecar::sidecar_dir().join(format!("{}.repro.failure-dump.json", entry.name));
+    for stale in [&primary_dump_path, &repro_dump_path] {
+        match std::fs::remove_file(stale) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(
+                path = %stale.display(),
+                error = %e,
+                "eval: failed to pre-clear stale failure-dump file"
+            ),
+        }
+    }
+
     // Attach the primary failure-dump JSON sink at this dispatch
     // site, NOT inside `build_vm_builder_base` — auto-repro calls
-    // the same base builder, so setting the path there would have
-    // the setter (which pre-clears) erase the primary dump on the
-    // auto-repro re-build. The setter handles stale-file pre-
-    // clear, so a prior failed invocation's leftover at the same
-    // path is unlinked here before the freeze coord could write a
-    // misleading "stale dump" on a passing rerun.
+    // the same base builder, so attaching the primary path there
+    // and re-attaching for the auto-repro VM would let
+    // `attempt_auto_repro`'s `.failure_dump_path(repro)` override
+    // chain after a phantom primary attachment, which only
+    // matters if the setter is later changed to be impure;
+    // keeping the primary attachment here keeps the contract
+    // robust against that change. The setter is currently pure;
+    // pre-clear above handles stale-file removal.
     let mut builder = super::runtime::build_vm_builder_base(
         entry,
         &kernel,
@@ -771,9 +804,7 @@ pub(crate) fn run_ktstr_test_inner(
         &guest_args,
         no_perf_mode,
     )
-    .failure_dump_path(
-        super::sidecar::sidecar_dir().join(format!("{}.failure-dump.json", entry.name)),
-    )
+    .failure_dump_path(primary_dump_path)
     .performance_mode(entry.performance_mode);
 
     // Merge order: default_checks -> scheduler.assert -> per-test assert.

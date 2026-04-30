@@ -4655,35 +4655,16 @@ impl KtstrVmBuilder {
     /// `.repro.failure-dump.json` sibling; CLI / library callers
     /// that want the dump on disk set it explicitly here.
     ///
-    /// Pre-clears the supplied path on each call: a leftover dump
-    /// from a prior invocation at the same path would otherwise
-    /// mask a passing rerun's "no failure" outcome
-    /// (`tests/failure_dump_e2e.rs` reads from this path; if the
-    /// file pre-exists, the rerun looks like a failure even when
-    /// the freeze coord never wrote). Each setter call pre-clears
-    /// only ITS supplied target — auto-repro's
-    /// `.repro.failure-dump.json` override does not erase the
-    /// primary `.failure-dump.json` written by the just-failed
-    /// run because the auto-repro base builder
-    /// (`build_vm_builder_base`) deliberately does NOT call this
-    /// setter; only the explicit override in
-    /// `attempt_auto_repro` does, with the repro path. NotFound
-    /// is silenced; other unlink errors emit `tracing::warn!`
-    /// and the path is still set (the freeze coord's own write
-    /// would overwrite a stale file in practice; the warn flags
-    /// permission / fs anomalies for the operator).
+    /// Pure setter — no filesystem side effects. Stale-file
+    /// pre-clear is the dispatch layer's responsibility (primary:
+    /// `test_support::eval`, which clears BOTH the primary path
+    /// AND the repro path on every dispatch so a passing rerun
+    /// is not masked by either of the prior failure's leftovers;
+    /// auto-repro: `test_support::probe::attempt_auto_repro`
+    /// implicitly relies on the primary dispatch's pre-clear of
+    /// the repro path before falling into the repro VM build).
     pub fn failure_dump_path(mut self, path: impl Into<PathBuf>) -> Self {
-        let path = path.into();
-        match std::fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => tracing::warn!(
-                path = %path.display(),
-                error = %e,
-                "KtstrVmBuilder::failure_dump_path: failed to pre-clear stale dump file"
-            ),
-        }
-        self.failure_dump_path = Some(path);
+        self.failure_dump_path = Some(path.into());
         self
     }
 
