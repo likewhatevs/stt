@@ -1173,6 +1173,16 @@ pub struct KtstrVm {
     /// `tests/jemalloc_probe_tests.rs` spawns it as a background
     /// payload and probes its pid.
     jemalloc_alloc_worker_binary: Option<PathBuf>,
+    /// Where the freeze coordinator writes the JSON-pretty
+    /// [`monitor::dump::FailureDumpReport`] when an error-class
+    /// SCX exit fires. `None` disables the file sink (the dump
+    /// still goes to `tracing::error` regardless). The test
+    /// framework sets this to a per-test path under the run's
+    /// sidecar directory so operators find the structured JSON
+    /// alongside `*.ktstr.json` without needing an env var; CLI /
+    /// library callers that want the dump on disk set the path
+    /// explicitly via [`KtstrVmBuilder::failure_dump_path`].
+    failure_dump_path: Option<PathBuf>,
 }
 
 /// Parameters for a host-side BPF map write during VM execution.
@@ -2727,6 +2737,11 @@ impl KtstrVm {
         let freeze_coord_bsp_regs = bsp_regs.clone();
         let freeze_coord_bsp_done = bsp_done.clone();
         let freeze_coord_vmlinux = find_vmlinux(&self.kernel);
+        // Optional file sink for the failure-dump JSON. Cloned out
+        // of the builder field so the closure owns a copy and the
+        // freeze coord can write the file without touching the env
+        // or the parent `KtstrVm`.
+        let freeze_coord_dump_path = self.failure_dump_path.clone();
         // GuestMem for the coordinator's .bss-poll path. Built from
         // the same guest_mem the monitor uses; lifetime tied to the
         // VM run.
@@ -3081,10 +3096,13 @@ impl KtstrVm {
                     // the dump is post-mortem evidence, not routine
                     // observation.
                     // Helper: emit a fully-built FailureDumpReport via
-                    // tracing + the optional KTSTR_FAILURE_DUMP_PATH
-                    // file sink. Used by both the full-dump branch
-                    // and the partial (vcpu_regs-only) branch below
-                    // so the formatting / file-write contract stays
+                    // tracing + an optional file sink at
+                    // `freeze_coord_dump_path` (set by the test
+                    // framework / library callers via
+                    // `KtstrVmBuilder::failure_dump_path`). Used by
+                    // both the full-dump branch and the partial
+                    // (vcpu_regs-only) branch below so the
+                    // formatting / file-write contract stays
                     // identical across the two paths — operators
                     // see the same JSON shape and log target
                     // regardless of whether BTF/accessor were
@@ -3098,26 +3116,34 @@ impl KtstrVm {
                                     vcpu_regs_count = report.vcpu_regs.len(),
                                     "freeze-coord: failure dump\n{json}"
                                 );
-                                // Optional file sink for E2E tests:
-                                // `KTSTR_FAILURE_DUMP_PATH` lets a test
-                                // pin the rendered JSON to a known
-                                // path, parse it as a
-                                // `FailureDumpReport`, and run
-                                // structured assertions. The env-var
-                                // gate matches existing ktstr
-                                // conventions (KTSTR_KERNEL,
-                                // KTSTR_CACHE_DIR). Best-effort: a
-                                // write failure logs a warning and
-                                // does not affect the freeze/thaw
-                                // path.
-                                if let Ok(path) = std::env::var("KTSTR_FAILURE_DUMP_PATH")
-                                    && let Err(e) = std::fs::write(&path, &json)
-                                {
-                                    tracing::warn!(
-                                        path = %path,
-                                        error = %e,
-                                        "freeze-coord: KTSTR_FAILURE_DUMP_PATH write failed"
-                                    );
+                                // Best-effort file sink: a write
+                                // failure logs a warning and does
+                                // not affect the freeze/thaw path.
+                                // `freeze_coord_dump_path == None`
+                                // means the caller did not request
+                                // a file copy — the tracing emit
+                                // above is the sole record.
+                                if let Some(ref path) = freeze_coord_dump_path {
+                                    // The sidecar dir
+                                    // (`{runs_root}/{kernel}-{commit}`)
+                                    // may not exist on the first run
+                                    // of a fresh invocation; create
+                                    // it eagerly so the write below
+                                    // does not silently fail with
+                                    // ENOENT. Best-effort — the
+                                    // write's own error handling
+                                    // surfaces the failure if the
+                                    // mkdir fails too.
+                                    if let Some(parent) = path.parent() {
+                                        let _ = std::fs::create_dir_all(parent);
+                                    }
+                                    if let Err(e) = std::fs::write(path, &json) {
+                                        tracing::warn!(
+                                            path = %path.display(),
+                                            error = %e,
+                                            "freeze-coord: failure-dump file write failed"
+                                        );
+                                    }
                                 }
                             }
                             Err(e) => {
@@ -4435,6 +4461,11 @@ pub struct KtstrVmBuilder {
     /// alloc-worker`. Used together with `jemalloc_probe_binary` for the
     /// cross-process closed-loop test.
     jemalloc_alloc_worker_binary: Option<PathBuf>,
+    /// File path where the freeze coordinator writes the
+    /// JSON-pretty failure-dump report. `None` disables the file
+    /// sink — the dump still emits via `tracing::error`. See
+    /// [`Self::failure_dump_path`].
+    failure_dump_path: Option<PathBuf>,
 }
 
 impl Default for KtstrVmBuilder {
@@ -4471,6 +4502,7 @@ impl Default for KtstrVmBuilder {
             exec_cmd: None,
             jemalloc_probe_binary: None,
             jemalloc_alloc_worker_binary: None,
+            failure_dump_path: None,
         }
     }
 }
@@ -4608,6 +4640,20 @@ impl KtstrVmBuilder {
     #[allow(dead_code)]
     pub fn monitor_thresholds(mut self, thresholds: crate::monitor::MonitorThresholds) -> Self {
         self.monitor_thresholds = Some(thresholds);
+        self
+    }
+
+    /// File path where the freeze coordinator writes the JSON-pretty
+    /// [`crate::monitor::dump::FailureDumpReport`] when an
+    /// error-class SCX exit fires. `None` (the default) disables
+    /// the file sink — the dump still emits via `tracing::error`
+    /// regardless. The test framework's
+    /// `test_support::runtime::build_vm_builder_base` sets this
+    /// per-test under the run's sidecar directory so structured
+    /// failure data sits alongside `*.ktstr.json`; CLI / library
+    /// callers that want the dump on disk set it explicitly here.
+    pub fn failure_dump_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.failure_dump_path = Some(path.into());
         self
     }
 
@@ -4919,6 +4965,7 @@ impl KtstrVmBuilder {
             exec_cmd: self.exec_cmd,
             jemalloc_probe_binary: self.jemalloc_probe_binary,
             jemalloc_alloc_worker_binary: self.jemalloc_alloc_worker_binary,
+            failure_dump_path: self.failure_dump_path,
         })
     }
 

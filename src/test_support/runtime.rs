@@ -149,7 +149,17 @@ pub(crate) fn build_vm_builder_base(
         .shm_size(KTSTR_TEST_SHM_SIZE)
         .run_args(guest_args)
         .timeout(KTSTR_VM_TIMEOUT)
-        .no_perf_mode(no_perf_mode);
+        .no_perf_mode(no_perf_mode)
+        // Per-test failure-dump JSON sink. The freeze coordinator
+        // writes here only when an error-class SCX exit fires;
+        // healthy runs leave the path untouched. Same directory
+        // the `*.ktstr.json` sidecars land in (`sidecar_dir()`),
+        // keyed by test name, so an operator inspecting a run
+        // finds structured failure data alongside the run-level
+        // sidecar without setting any env var.
+        .failure_dump_path(
+            super::sidecar::sidecar_dir().join(format!("{}.failure-dump.json", entry.name)),
+        );
 
     if let Some(sched_path) = scheduler {
         builder = builder.scheduler_binary(sched_path);

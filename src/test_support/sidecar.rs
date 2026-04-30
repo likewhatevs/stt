@@ -970,7 +970,7 @@ pub(crate) fn format_kvm_stats(sidecars: &[SidecarResult]) -> String {
 /// [`pre_clear_run_dir_once`] — the directory is a last-writer-wins
 /// snapshot keyed on (kernel, project commit), not an append-only
 /// archive of every invocation.
-pub(crate) fn sidecar_dir() -> PathBuf {
+pub fn sidecar_dir() -> PathBuf {
     sidecar_dir_override().unwrap_or_else(resolve_default_sidecar_dir)
 }
 

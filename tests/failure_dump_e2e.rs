@@ -5,58 +5,46 @@
 //! freeze coordinator's host-side dump captures BTF-rendered fields
 //! from the scheduler's `.bss` section.
 //!
-//! The dump path is gated on the `KTSTR_FAILURE_DUMP_PATH` env var:
-//! when set, the freeze coordinator also writes the JSON-pretty
-//! `FailureDumpReport` to that path. This test sets the env var to a
-//! tempfile-derived path before invoking `execute_steps`, then reads
-//! the file after the VM tears down.
+//! The freeze coordinator writes the JSON-pretty `FailureDumpReport`
+//! to a per-test path inside the run's sidecar directory
+//! (`{sidecar_dir()}/{test_name}.failure-dump.json`). The test
+//! framework configures this automatically via
+//! `test_support::runtime::build_vm_builder_base` when each VM
+//! builder is constructed — no env var required, no per-scenario
+//! setup beyond reading the path back here after the run.
 //!
 //! User-facing test bar (per project memory): "I see variable names
 //! and values in the logs when a scheduler stalls." This test
-//! enforces the host-side half of that bar — the file at
-//! `KTSTR_FAILURE_DUMP_PATH` must contain `stall`, `crash` and other
+//! enforces the host-side half of that bar — the file at the
+//! sidecar-dir path must contain `stall`, `crash` and other
 //! BTF-resolved field names from `scx-ktstr`'s global section, not
 //! hex offsets, after a triggered stall.
 
 use anyhow::Result;
 use ktstr::assert::AssertResult;
 use ktstr::scenario::ops::{CgroupDef, HoldSpec, Step, execute_steps};
-use ktstr::test_support::{Payload, Scheduler, SchedulerSpec};
+use ktstr::test_support::{Payload, Scheduler, SchedulerSpec, sidecar_dir};
 
 const KTSTR_SCHED: Scheduler =
     Scheduler::new("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
 const KTSTR_SCHED_PAYLOAD: Payload = Payload::from_scheduler(&KTSTR_SCHED);
 
-/// Per-test path for the failure dump JSON. Each scenario function
-/// computes its own unique path so parallel tests do not clobber
-/// each other (nextest runs tests in parallel). The path lives under
-/// `std::env::temp_dir()` so it cleans up via the OS tmp policy on
-/// host reboot; tests do not actively unlink because the file is
-/// useful debugging evidence on failure.
+/// Compute the per-test failure-dump path. Mirrors the path
+/// `test_support::runtime::build_vm_builder_base` configures on the
+/// VM builder for every test: `{sidecar_dir()}/{test_name}.failure-
+/// dump.json`. Both sites must agree — if `build_vm_builder_base`
+/// changes the naming convention, this helper must follow.
 fn failure_dump_path(test_name: &str) -> std::path::PathBuf {
-    let pid = std::process::id();
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    std::env::temp_dir().join(format!("ktstr-failure-dump-{test_name}-{pid}-{nanos}.json"))
+    sidecar_dir().join(format!("{test_name}.failure-dump.json"))
 }
 
 fn scenario_failure_dump_renders_bss_fields(ctx: &ktstr::scenario::Ctx) -> Result<AssertResult> {
-    // Compute the dump path FIRST and set the env var BEFORE
-    // `execute_steps` spawns the VMM thread. The freeze coordinator
-    // reads `KTSTR_FAILURE_DUMP_PATH` inside its own closure when the
-    // stall latch fires, so the env var must be visible before the
-    // coord thread is born.
-    //
-    // SAFETY: set_var is unsafe in 2024 edition because env state is
-    // shared across threads. This test sets a path that's unique to
-    // the test (process-id + nanos) before any scheduler-affecting
-    // work, so concurrent tests do not race for the same path.
-    let dump_path = failure_dump_path("renders_bss_fields");
-    unsafe {
-        std::env::set_var("KTSTR_FAILURE_DUMP_PATH", &dump_path);
-    }
+    // The freeze coordinator's file sink is wired by the test
+    // framework (see `test_support::runtime::build_vm_builder_base`)
+    // — no env-var dance, no `set_var` race against parallel tests.
+    // This scenario just reads the file back from the same sidecar
+    // dir keyed by `test_name`.
+    let dump_path = failure_dump_path("failure_dump_renders_bss_fields");
 
     let steps = vec![Step {
         setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
@@ -71,8 +59,8 @@ fn scenario_failure_dump_renders_bss_fields(ctx: &ktstr::scenario::Ctx) -> Resul
     //      the guest within ~1 second.
     //   2. The probe BPF tracepoint fires on the error-class exit.
     //   3. The freeze coordinator's .bss-poll observes the latch,
-    //      runs `dump_state`, and writes the JSON to the env-var
-    //      path before clearing `freeze`.
+    //      runs `dump_state`, and writes the JSON to the
+    //      builder-configured path before clearing `freeze`.
     //   4. The watchdog tears the VM down, `execute_steps` returns,
     //      and we land here on the host side of the same process.
     //

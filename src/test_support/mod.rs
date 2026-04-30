@@ -76,9 +76,11 @@ pub(crate) use sidecar::enriched_parse_error_message_for_test;
 pub(crate) use sidecar::{
     SidecarIoError, SidecarParseError, apply_archive_source_override, collect_sidecars,
     collect_sidecars_with_errors, format_callback_profile, format_kvm_stats, format_verifier_stats,
-    is_run_directory, is_sidecar_filename, sidecar_dir,
+    is_run_directory, is_sidecar_filename,
 };
-pub use sidecar::{SidecarResult, collect_pool, newest_run_dir, repo_is_dirty, runs_root};
+pub use sidecar::{
+    SidecarResult, collect_pool, newest_run_dir, repo_is_dirty, runs_root, sidecar_dir,
+};
 
 pub use dispatch::{
     analyze_sidecars, is_resource_contention, ktstr_main, ktstr_test_early_dispatch,
