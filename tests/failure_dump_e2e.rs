@@ -31,22 +31,23 @@ const KTSTR_SCHED: Scheduler =
 const KTSTR_SCHED_PAYLOAD: Payload = Payload::from_scheduler(&KTSTR_SCHED);
 
 /// Compute the per-test failure-dump path. Mirrors the path
-/// `test_support::eval` configures on the VM builder for every
-/// test (the primary dispatch attaches this path before booting):
+/// `test_support::eval::run_ktstr_test_inner` configures on the
+/// VM builder for every test (the primary dispatch attaches this
+/// path before booting):
 /// `{sidecar_dir()}/{test_name}.failure-dump.json`. Both sites
-/// must agree — if `eval` changes the naming convention, this
-/// helper must follow.
+/// must agree — if `run_ktstr_test_inner` changes the naming
+/// convention, this helper must follow.
 fn failure_dump_path(test_name: &str) -> std::path::PathBuf {
     sidecar_dir().join(format!("{test_name}.failure-dump.json"))
 }
 
 fn scenario_failure_dump_renders_bss_fields(ctx: &ktstr::scenario::Ctx) -> Result<AssertResult> {
     // The freeze coordinator's file sink is wired by the test
-    // framework (see `test_support::eval`, which attaches the
-    // primary dump path on every VM builder it constructs) — no
-    // env-var dance, no `set_var` race against parallel tests.
-    // This scenario just reads the file back from the same sidecar
-    // dir keyed by `test_name`.
+    // framework (see `test_support::eval::run_ktstr_test_inner`,
+    // which attaches the primary dump path on every VM builder
+    // it constructs) — no env-var dance, no `set_var` race
+    // against parallel tests. This scenario just reads the file
+    // back from the same sidecar dir keyed by `test_name`.
     let dump_path = failure_dump_path("failure_dump_renders_bss_fields");
 
     let steps = vec![Step {
