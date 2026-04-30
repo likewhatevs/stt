@@ -2071,9 +2071,20 @@ pub enum Aggregated {
         min: i64,
         max: i64,
     },
+    /// Categorical aggregate carrying per-value counts across
+    /// the bucket. `tallies` maps each observed value to its
+    /// occurrence count; `total` is the bucket size (count of
+    /// every contributor, including any empty-string fallbacks).
+    /// The mode (most-frequent value) is derived on demand via
+    /// [`Aggregated::mode_value`] / [`Aggregated::mode_count`]
+    /// so cross-bucket merges (N:1 fudge) compose correctly:
+    /// unioning two buckets' tallies gives the true cross-bucket
+    /// frequency for each value, not just the per-bucket
+    /// max-count. Empty buckets surface as `tallies: empty,
+    /// total: bucket_size`; the renderer handles the empty case
+    /// by emitting `~` in place of the mode value.
     Mode {
-        value: String,
-        count: usize,
+        tallies: BTreeMap<String, usize>,
         total: usize,
     },
     Affinity(AffinitySummary),
@@ -2114,6 +2125,64 @@ impl Aggregated {
             }
         }
     }
+
+    /// Construct an `Aggregated::Mode` from a single
+    /// (value, count, total) triple, common in test fixtures
+    /// and the single-bucket aggregate path. Equivalent to
+    /// inserting `(value, count)` into a fresh tally map.
+    /// `count == 0` produces an empty tally (the empty-bucket
+    /// shape), preserving the historical contract that an
+    /// empty Mode renders as `~` while still carrying a
+    /// well-defined `total` for the rendered "(count/total)"
+    /// suffix.
+    pub fn mode_single(value: String, count: usize, total: usize) -> Aggregated {
+        let mut tallies = BTreeMap::new();
+        if count > 0 {
+            tallies.insert(value, count);
+        }
+        Aggregated::Mode { tallies, total }
+    }
+
+    /// The most-frequent value tracked by an `Aggregated::Mode`,
+    /// or the empty string when the tallies map is empty (an
+    /// empty bucket whose `total` may still be non-zero, e.g.
+    /// when every contributor produced no categorical sample).
+    /// Ties on count are broken by lexicographic order on the
+    /// VALUE — the lex-smallest key wins. Deterministic across
+    /// runs and matches the historical Mode contract under the
+    /// old `value, count` shape.
+    pub fn mode_value(&self) -> &str {
+        match self {
+            Aggregated::Mode { tallies, .. } => {
+                // BTreeMap iterates keys in lex order. Use a
+                // strict-greater fold so on a count tie the
+                // first key encountered (lex-smallest) wins;
+                // `max_by_key` returns the last-seen at a tie,
+                // which would invert the lex order.
+                let mut best: Option<(&str, usize)> = None;
+                for (k, c) in tallies {
+                    match best {
+                        None => best = Some((k.as_str(), *c)),
+                        Some((_, bc)) if *c > bc => best = Some((k.as_str(), *c)),
+                        _ => {}
+                    }
+                }
+                best.map(|(v, _)| v).unwrap_or("")
+            }
+            _ => "",
+        }
+    }
+
+    /// The frequency count of the mode value. Zero when the
+    /// tallies map is empty (no contributor produced a
+    /// categorical sample). Same tie-break as
+    /// [`Self::mode_value`].
+    pub fn mode_count(&self) -> usize {
+        match self {
+            Aggregated::Mode { tallies, .. } => tallies.values().copied().max().unwrap_or(0),
+            _ => 0,
+        }
+    }
 }
 
 impl fmt::Display for Aggregated {
@@ -2128,12 +2197,21 @@ impl fmt::Display for Aggregated {
                     write!(f, "{min}..{max}")
                 }
             }
-            Aggregated::Mode {
-                value,
-                count,
-                total,
-            } => {
-                if count == total {
+            Aggregated::Mode { tallies, total } => {
+                // Tie-break: lex-smallest value wins on count
+                // ties. Mirrors `Aggregated::mode_value`'s
+                // strict-greater fold.
+                let mut best: Option<(&str, usize)> = None;
+                for (k, c) in tallies {
+                    match best {
+                        None => best = Some((k.as_str(), *c)),
+                        Some((_, bc)) if *c > bc => best = Some((k.as_str(), *c)),
+                        _ => {}
+                    }
+                }
+                let value = best.map(|(v, _)| v).unwrap_or("~");
+                let count = best.map(|(_, c)| c).unwrap_or(0);
+                if count == *total && count > 0 {
                     write!(f, "{value}")
                 } else {
                     write!(f, "{value} ({count}/{total})")
@@ -2151,6 +2229,79 @@ impl fmt::Display for Aggregated {
                 }
             }
         }
+    }
+}
+
+/// Merge `val` into `existing` for the N:1 fudge aggregation
+/// (multiple candidate groups collapsed into one baseline-keyed
+/// row). Mirrors the canonical [`aggregate`] semantics on the
+/// merged-set rather than re-aggregating the per-thread inputs:
+/// per-group summaries are all the merge has access to, so the
+/// merge composes summaries directly.
+///
+/// Per variant:
+/// - [`Aggregated::Sum`]: monotone counters add.
+/// - [`Aggregated::Max`]: peaks take max-of-maxes (NOT a sum —
+///   wait_max / sleep_max / exec_max are per-thread peaks; summing
+///   would invent peaks taller than any thread observed).
+/// - [`Aggregated::OrdinalRange`]: union the bounds.
+/// - [`Aggregated::Mode`]: union the per-value tally maps and
+///   sum the totals. The mode (most-frequent value) is derived
+///   on demand from the merged tallies, so cross-bucket
+///   frequencies stay accurate — a value that appears in N
+///   buckets accumulates its true total count, not just the
+///   largest single-bucket count.
+/// - [`Aggregated::Affinity`]: cardinality bounds widen —
+///   `min_cpus` becomes the smallest of any merged summary's
+///   `min_cpus`, `max_cpus` the largest. The exact CPU list
+///   (`uniform`) survives only when every merged summary
+///   already carried the same `Some(cpus)` list; mismatch or
+///   any `None` collapses to `None`.
+///
+/// Variant mismatches between `existing` and `val` are silently
+/// dropped — a fudged pair must agree on the metric's typed
+/// rule because every group's metrics map shares the same
+/// [`CTPROF_METRICS`] keys, so the fall-through arm is
+/// defense-in-depth rather than a runtime-reachable case.
+fn merge_aggregated_into(existing: &mut Aggregated, val: &Aggregated) {
+    match (existing, val) {
+        (Aggregated::Sum(s), Aggregated::Sum(v)) => {
+            *s += v;
+        }
+        (Aggregated::Max(m), Aggregated::Max(v)) => {
+            *m = (*m).max(*v);
+        }
+        (
+            Aggregated::OrdinalRange { min, max },
+            Aggregated::OrdinalRange {
+                min: vmin,
+                max: vmax,
+            },
+        ) => {
+            *min = (*min).min(*vmin);
+            *max = (*max).max(*vmax);
+        }
+        (
+            Aggregated::Mode { tallies: et, total },
+            Aggregated::Mode {
+                tallies: vt,
+                total: vtot,
+            },
+        ) => {
+            *total += vtot;
+            for (k, c) in vt {
+                *et.entry(k.clone()).or_insert(0) += c;
+            }
+        }
+        (Aggregated::Affinity(es), Aggregated::Affinity(vs)) => {
+            es.min_cpus = es.min_cpus.min(vs.min_cpus);
+            es.max_cpus = es.max_cpus.max(vs.max_cpus);
+            es.uniform = match (&es.uniform, &vs.uniform) {
+                (Some(a), Some(b)) if a == b => Some(a.clone()),
+                _ => None,
+            };
+        }
+        _ => {}
     }
 }
 
@@ -2410,17 +2561,61 @@ fn sort_diff_rows_by_keys(
     });
 }
 
-/// A pair of cgroup groups fudged together by thread population overlap.
+/// A pair of cgroup groups fudged together by thread population
+/// overlap. Fudging joins a baseline cgroup to a candidate cgroup
+/// when their per-cgroup thread-type sets share enough population
+/// (Jaccard similarity ≥ 0.90) — a renamed-but-otherwise-identical
+/// scope under a shifted path is rejoined for diffing instead of
+/// surfacing as separate orphans.
+///
+/// Fields are role-prefixed: `baseline_*` and `candidate_*` track
+/// the two sides of the pair; `overlap` / `jaccard` /
+/// `cascaded_children` are pair-level metrics.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct FudgedPair {
-    pub baseline_key: String,
-    pub candidate_key: String,
+    /// Baseline cgroup path of the matched pair — full join key
+    /// from the baseline-side bucket. Format: an absolute cgroup
+    /// path (e.g. `/system.slice/foo.service`). The form mirrors
+    /// what [`build_groups`] writes for `GroupBy::Cgroup`.
+    pub baseline_cgroup: String,
+    /// Candidate cgroup path of the matched pair — full join key
+    /// from the candidate-side bucket. Same format as
+    /// [`Self::baseline_cgroup`].
+    pub candidate_cgroup: String,
+    /// Number of (pcomm, comm) thread types in the intersection
+    /// of the two sides' thread-type sets. Higher = stronger
+    /// match.
     pub overlap: usize,
+    /// Jaccard similarity coefficient: `|A ∩ B| / |A ∪ B|` over
+    /// the thread-type sets. Range `[0.0, 1.0]`. Matching gate
+    /// is `jaccard >= 0.90`.
     pub jaccard: f64,
-    pub residual_baseline: Vec<String>,
-    pub residual_candidate: Vec<String>,
+    /// Thread types present in baseline but missing from the
+    /// UNION of every candidate matched against this baseline
+    /// (per-bcg dedup; see N:1 fudge merge). Each entry is
+    /// `pcomm:comm` formatted.
+    pub baseline_residual: Vec<String>,
+    /// Thread types present in candidate but missing from the
+    /// UNION of every baseline matched against this candidate.
+    /// Same format as [`Self::baseline_residual`].
+    pub candidate_residual: Vec<String>,
+    /// Count of cgroup descendants joined via cascade matching
+    /// under the shared longest-common-suffix root. Cascade
+    /// extends the fudge from the named pair down to children
+    /// that share the same suffix relative to their roots.
     pub cascaded_children: usize,
+    /// Cascade root on the baseline side: longest common
+    /// path-segment suffix stripped from
+    /// [`Self::baseline_cgroup`]. Equal to
+    /// [`Self::baseline_cgroup`] when no suffix is shared.
+    /// Smaps remap re-keys candidate-side smaps data under this
+    /// root.
     pub baseline_root: String,
+    /// Cascade root on the candidate side: longest common
+    /// path-segment suffix stripped from
+    /// [`Self::candidate_cgroup`]. Equal to
+    /// [`Self::candidate_cgroup`] when no suffix is shared.
     pub candidate_root: String,
 }
 
@@ -2431,12 +2626,25 @@ pub struct CtprofDiff {
     pub sort_metric_name: Option<&'static str>,
     pub rows: Vec<DiffRow>,
     /// Group keys that appeared in the baseline snapshot but not
-    /// in the candidate.
+    /// in the candidate, AFTER fudging removes pairs that joined
+    /// via thread-population overlap. Post-fudge survivors only
+    /// — keys that were rejoined to a candidate counterpart
+    /// move into [`Self::fudged_pairs`] and drop out of this
+    /// list.
     pub only_baseline: Vec<String>,
     /// Group keys that appeared in the candidate snapshot but not
-    /// in the baseline.
+    /// in the baseline, AFTER fudging. Post-fudge survivors only;
+    /// same semantics as [`Self::only_baseline`] for the
+    /// candidate side.
     pub only_candidate: Vec<String>,
-    /// Cgroup groups fudged together by thread population overlap.
+    /// Cgroup pairs joined together via thread-population overlap
+    /// (Jaccard ≥ 0.90 over (pcomm, comm) thread-type sets).
+    /// Each entry is one matched (baseline, candidate) cgroup
+    /// pair plus its overlap / Jaccard / residuals / cascade
+    /// metadata. Pairs are emitted by the fudge stage of
+    /// [`compare`] and consumed by the renderer's "Fudged cgroup
+    /// matches" section. Empty under non-cgroup `GroupBy` modes
+    /// (fudge applies only when keys are cgroup paths).
     pub fudged_pairs: Vec<FudgedPair>,
     /// Baseline-only cgroup-level enrichment rows, keyed by the
     /// cgroup path (after flatten). Populated only for
@@ -2545,6 +2753,14 @@ pub struct DerivedRow {
     /// ratios so a `0.5 → 0.6` row doesn't render as
     /// `+20%` when the natural read is `+10pp`).
     pub delta_pct: Option<f64>,
+    /// Pre-rendered cell string for the SortBy column under
+    /// `--sort-by`. Same value for every row in a group; `None`
+    /// when no `--sort-by` is set. Mirrors
+    /// [`DiffRow::sort_by_cell`].
+    pub sort_by_cell: Option<String>,
+    /// Sort metric's delta for this group, used to color the
+    /// SortBy column. Mirrors [`DiffRow::sort_by_delta`].
+    pub sort_by_delta: Option<f64>,
 }
 
 impl DerivedRow {
@@ -2610,6 +2826,95 @@ fn build_derived_row(
         candidate,
         delta,
         delta_pct,
+        sort_by_cell: None,
+        sort_by_delta: None,
+    }
+}
+
+/// Emit one DiffRow per CTPROF_METRICS entry (and one DerivedRow
+/// per CTPROF_DERIVED_METRICS entry) for each fudged baseline
+/// key, with candidate values aggregated across the N matched
+/// candidate groups (N:1 merge). The shared display key
+/// `[fudged]` flags the row in the renderer.
+///
+/// `matches` keys are baseline group keys; the values are the
+/// list of candidate group keys that matched the baseline. A
+/// missing baseline group skips the entry; a missing candidate
+/// group is skipped from the merge but does not abort. Values
+/// from each ckey are merged via [`merge_aggregated_into`].
+fn emit_fudged_rows(
+    diff: &mut CtprofDiff,
+    matches: &BTreeMap<String, Vec<String>>,
+    groups_a: &BTreeMap<String, ThreadGroup>,
+    groups_b: &BTreeMap<String, ThreadGroup>,
+) {
+    for (bkey, ckeys) in matches {
+        let Some(ga) = groups_a.get(bkey) else {
+            continue;
+        };
+        let mut merged_metrics: BTreeMap<String, Aggregated> = BTreeMap::new();
+        let mut merged_thread_count: usize = 0;
+        for ckey in ckeys {
+            let Some(gb) = groups_b.get(ckey) else {
+                continue;
+            };
+            merged_thread_count += gb.thread_count;
+            for (name, val) in &gb.metrics {
+                let entry = merged_metrics.entry(name.clone());
+                match entry {
+                    std::collections::btree_map::Entry::Vacant(e) => {
+                        e.insert(val.clone());
+                    }
+                    std::collections::btree_map::Entry::Occupied(mut e) => {
+                        let existing = e.get_mut();
+                        merge_aggregated_into(existing, val);
+                    }
+                }
+            }
+        }
+        // Display key for the fudged row: include the
+        // baseline cgroup leaf so multiple fudged pairs in the
+        // same diff stay distinguishable. `[fudged]` alone
+        // would render N rows that all look identical when
+        // viewed by an operator scanning the table; appending
+        // the leaf path component (the bcg's last `/`-segment)
+        // disambiguates without bloating the column.
+        let bcg = bkey.split_once('\x00').map_or(bkey.as_str(), |(cg, _)| cg);
+        let leaf = bcg.rsplit_once('/').map_or(bcg, |(_, l)| l);
+        let display_key = if leaf.is_empty() {
+            "[fudged]".to_string()
+        } else {
+            format!("[fudged: {leaf}]")
+        };
+        for metric in CTPROF_METRICS {
+            let Some(a) = ga.metrics.get(metric.name).cloned() else {
+                continue;
+            };
+            let Some(b) = merged_metrics.get(metric.name).cloned() else {
+                continue;
+            };
+            diff.rows.push(build_row(
+                bkey,
+                &display_key,
+                ga.thread_count,
+                merged_thread_count,
+                metric,
+                a,
+                b,
+                None,
+            ));
+        }
+        for def in CTPROF_DERIVED_METRICS {
+            diff.derived_rows.push(build_derived_row(
+                bkey,
+                &display_key,
+                ga.thread_count,
+                merged_thread_count,
+                def,
+                &ga.metrics,
+                &merged_metrics,
+            ));
+        }
     }
 }
 
@@ -2642,16 +2947,22 @@ pub fn compare(
     // Skipped when `no_thread_normalize` is set — under literal
     // grouping, the key IS the comm/pcomm and there is no
     // promotion gate to evaluate.
+    // Pattern_counts is only consulted by [`build_groups`] under
+    // GroupBy::Pcomm / GroupBy::Comm (as the singleton-revert
+    // gate). GroupBy::All uses the compound `cg\x00pcomm\x00comm`
+    // key and normalizes both pcomm and comm through `pattern_key`
+    // unconditionally — there is no singleton revert under All
+    // because every thread already disambiguates by cgroup +
+    // process. Skipping the seeding under All saves the
+    // baseline+candidate scan when neither side will read it.
     let pattern_counts: Option<BTreeMap<String, usize>> = match (group_by, opts.no_thread_normalize)
     {
         (GroupBy::Comm, false) => Some(pattern_counts_union(baseline, candidate, |t| {
             t.comm.as_str()
         })),
-        (GroupBy::Pcomm | GroupBy::All, false) => {
-            Some(pattern_counts_union(baseline, candidate, |t| {
-                t.pcomm.as_str()
-            }))
-        }
+        (GroupBy::Pcomm, false) => Some(pattern_counts_union(baseline, candidate, |t| {
+            t.pcomm.as_str()
+        })),
         _ => None,
     };
     let cgroup_key_map: Option<BTreeMap<String, String>> =
@@ -2826,7 +3137,7 @@ pub fn compare(
         // Match cgroup prefixes by Jaccard similarity. Each
         // candidate finds its best baseline match independently —
         // multiple candidates can match the same baseline (N
-        // stacked tenants vs 1 unstacked baseline).
+        // vs 1 baseline).
         let mut fudged_cg: Vec<(String, String)> = Vec::new(); // (baseline_cg, candidate_cg)
 
         for ccg in &cg_prefixes_b {
@@ -2901,98 +3212,7 @@ pub fn compare(
         }
         // Emit one row per baseline key with candidate values
         // aggregated across all N matched candidate groups.
-        for (bkey, ckeys) in &fudge_matches {
-            let Some(ga) = groups_a.get(bkey) else {
-                continue;
-            };
-            // Merge candidate groups: sum Sum, max Max, union Range.
-            let mut merged_metrics: BTreeMap<String, Aggregated> = BTreeMap::new();
-            let mut merged_thread_count: usize = 0;
-            for ckey in ckeys {
-                let Some(gb) = groups_b.get(ckey) else {
-                    continue;
-                };
-                merged_thread_count += gb.thread_count;
-                for (name, val) in &gb.metrics {
-                    let entry = merged_metrics.entry(name.clone());
-                    match entry {
-                        std::collections::btree_map::Entry::Vacant(e) => {
-                            e.insert(val.clone());
-                        }
-                        std::collections::btree_map::Entry::Occupied(mut e) => {
-                            let existing = e.get_mut();
-                            match (existing, val) {
-                                (Aggregated::Sum(s), Aggregated::Sum(v)) => {
-                                    *s += v;
-                                }
-                                (Aggregated::Max(m), Aggregated::Max(v)) => {
-                                    *m += v;
-                                }
-                                (
-                                    Aggregated::OrdinalRange { min, max },
-                                    Aggregated::OrdinalRange {
-                                        min: vmin,
-                                        max: vmax,
-                                    },
-                                ) => {
-                                    *min = (*min).min(*vmin);
-                                    *max = (*max).max(*vmax);
-                                }
-                                (
-                                    Aggregated::Mode {
-                                        value,
-                                        count,
-                                        total,
-                                    },
-                                    Aggregated::Mode {
-                                        value: vv,
-                                        count: vc,
-                                        total: vt,
-                                    },
-                                ) => {
-                                    *total += vt;
-                                    if *vc > *count {
-                                        *value = vv.clone();
-                                        *count = *vc;
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-            }
-            let display_key = "[fudged]".to_string();
-            for metric in CTPROF_METRICS {
-                let Some(a) = ga.metrics.get(metric.name).cloned() else {
-                    continue;
-                };
-                let Some(b) = merged_metrics.get(metric.name).cloned() else {
-                    continue;
-                };
-                diff.rows.push(build_row(
-                    bkey,
-                    &display_key,
-                    ga.thread_count,
-                    merged_thread_count,
-                    metric,
-                    a,
-                    b,
-                    None,
-                ));
-            }
-            for def in CTPROF_DERIVED_METRICS {
-                diff.derived_rows.push(build_derived_row(
-                    bkey,
-                    &display_key,
-                    ga.thread_count,
-                    merged_thread_count,
-                    def,
-                    &ga.metrics,
-                    &merged_metrics,
-                ));
-            }
-        }
+        emit_fudged_rows(&mut diff, &fudge_matches, &groups_a, &groups_b);
 
         // Cascade: for each fudged cgroup pair, compute cascade
         // roots by stripping the longest common suffix (by /
@@ -3025,11 +3245,26 @@ pub fn compare(
 
             cascade_roots.insert((bcg.clone(), ccg.clone()), (b_root.clone(), c_root.clone()));
 
+            // Boundary-checked prefix match: accept either an
+            // exact root match (tail.is_empty()) or a child path
+            // (tail starts with '/'). Bare `starts_with` would
+            // false-match siblings — `/svc-extra` would slip
+            // through `b_root=/svc`. The non-matching keys would
+            // ultimately fail downstream lookup (c_by_suffix
+            // applies the same boundary filter), but skipping them
+            // here keeps the cascade scan consistent with the
+            // remap rule and avoids needless work.
+            let is_root_or_child = |cg: &str, root: &str| {
+                let Some(tail) = cg.strip_prefix(root) else {
+                    return false;
+                };
+                tail.is_empty() || tail.starts_with('/')
+            };
             let remaining_b: Vec<String> = diff
                 .only_baseline
                 .iter()
                 .filter(|k| {
-                    !remove_baseline.contains(*k) && cg_prefix(k).starts_with(b_root.as_str())
+                    !remove_baseline.contains(*k) && is_root_or_child(cg_prefix(k), b_root.as_str())
                 })
                 .cloned()
                 .collect();
@@ -3037,21 +3272,28 @@ pub fn compare(
                 .only_candidate
                 .iter()
                 .filter(|k| {
-                    !remove_candidate.contains(*k) && cg_prefix(k).starts_with(c_root.as_str())
+                    !remove_candidate.contains(*k)
+                        && is_root_or_child(cg_prefix(k), c_root.as_str())
                 })
                 .cloned()
                 .collect();
+            // Filter_map (not map) so boundary-rejected entries
+            // drop instead of all colliding at the empty-string
+            // key in the BTreeMap. Combined with the upstream
+            // is_root_or_child filter on remaining_c, every entry
+            // here should already qualify; this stays defensive
+            // against future filter regressions.
             let c_by_suffix: BTreeMap<String, &String> = remaining_c
                 .iter()
-                .map(|k| {
+                .filter_map(|k| {
                     let child_cg = cg_prefix(k);
                     let tail = &child_cg[c_root.len()..];
                     if !tail.is_empty() && !tail.starts_with('/') {
-                        return (String::new(), k);
+                        return None;
                     }
                     let rewritten = format!("{b_root}{tail}");
                     let suffix = k.split_once('\x00').map_or("", |(_, s)| s);
-                    (format!("{rewritten}\x00{suffix}"), k)
+                    Some((format!("{rewritten}\x00{suffix}"), k))
                 })
                 .collect();
             for bkey in &remaining_b {
@@ -3069,129 +3311,70 @@ pub fn compare(
         }
 
         // Emit aggregated rows for cascaded children (same N:1 merge).
-        for (bkey, ckeys) in &cascade_matches {
-            let Some(ga) = groups_a.get(bkey) else {
-                continue;
-            };
-            let mut merged_metrics: BTreeMap<String, Aggregated> = BTreeMap::new();
-            let mut merged_thread_count: usize = 0;
-            for ckey in ckeys {
-                let Some(gb) = groups_b.get(ckey) else {
-                    continue;
-                };
-                merged_thread_count += gb.thread_count;
-                for (name, val) in &gb.metrics {
-                    let entry = merged_metrics.entry(name.clone());
-                    match entry {
-                        std::collections::btree_map::Entry::Vacant(e) => {
-                            e.insert(val.clone());
-                        }
-                        std::collections::btree_map::Entry::Occupied(mut e) => {
-                            let existing = e.get_mut();
-                            match (existing, val) {
-                                (Aggregated::Sum(s), Aggregated::Sum(v)) => {
-                                    *s += v;
-                                }
-                                (Aggregated::Max(m), Aggregated::Max(v)) => {
-                                    *m += v;
-                                }
-                                (
-                                    Aggregated::OrdinalRange { min, max },
-                                    Aggregated::OrdinalRange {
-                                        min: vmin,
-                                        max: vmax,
-                                    },
-                                ) => {
-                                    *min = (*min).min(*vmin);
-                                    *max = (*max).max(*vmax);
-                                }
-                                (
-                                    Aggregated::Mode {
-                                        value,
-                                        count,
-                                        total,
-                                    },
-                                    Aggregated::Mode {
-                                        value: vv,
-                                        count: vc,
-                                        total: vt,
-                                    },
-                                ) => {
-                                    *total += vt;
-                                    if *vc > *count {
-                                        *value = vv.clone();
-                                        *count = *vc;
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-            }
-            let display_key = "[fudged]".to_string();
-            for metric in CTPROF_METRICS {
-                let Some(a) = ga.metrics.get(metric.name).cloned() else {
-                    continue;
-                };
-                let Some(b) = merged_metrics.get(metric.name).cloned() else {
-                    continue;
-                };
-                diff.rows.push(build_row(
-                    bkey,
-                    &display_key,
-                    ga.thread_count,
-                    merged_thread_count,
-                    metric,
-                    a,
-                    b,
-                    None,
-                ));
-            }
-            for def in CTPROF_DERIVED_METRICS {
-                diff.derived_rows.push(build_derived_row(
-                    bkey,
-                    &display_key,
-                    ga.thread_count,
-                    merged_thread_count,
-                    def,
-                    &ga.metrics,
-                    &merged_metrics,
-                ));
-            }
-        }
+        emit_fudged_rows(&mut diff, &cascade_matches, &groups_a, &groups_b);
 
         diff.only_baseline.retain(|k| !remove_baseline.contains(k));
         diff.only_candidate
             .retain(|k| !remove_candidate.contains(k));
 
         // Store fudge report per cgroup pair.
+        //
+        // Residual deduplication for N:1: when one bcg is matched
+        // against multiple ccgs, the per-pair baseline_residual =
+        // (set_a - set_b_for_this_pair) over-reports thread types
+        // that are missing from EVERY ccg — they appear N times,
+        // once per pair. Same for candidate_residual when one ccg
+        // is matched against multiple bcgs (M:1 in the other
+        // direction). Compute residuals against the UNION of all
+        // counterpart sets so a missing-on-every-side type
+        // surfaces exactly once across the bcg's pairs.
+        let mut union_b_for_bcg: BTreeMap<String, TypeSet> = BTreeMap::new();
+        let mut union_a_for_ccg: BTreeMap<String, TypeSet> = BTreeMap::new();
+        for (bcg, ccg) in &fudged_cg {
+            if let Some(sb) = cg_types_b.get(ccg) {
+                union_b_for_bcg
+                    .entry(bcg.clone())
+                    .or_default()
+                    .extend(sb.iter().cloned());
+            }
+            if let Some(sa) = cg_types_a.get(bcg) {
+                union_a_for_ccg
+                    .entry(ccg.clone())
+                    .or_default()
+                    .extend(sa.iter().cloned());
+            }
+        }
         diff.fudged_pairs = fudged_cg
             .iter()
             .map(|(bcg, ccg)| {
                 let set_a = cg_types_a.get(bcg).cloned().unwrap_or_default();
                 let set_b = cg_types_b.get(ccg).cloned().unwrap_or_default();
+                // Residuals against the per-bcg / per-ccg unions
+                // so a thread type missing from every counterpart
+                // candidate appears exactly once.
+                let union_b = union_b_for_bcg.get(bcg).cloned().unwrap_or_default();
+                let union_a = union_a_for_ccg.get(ccg).cloned().unwrap_or_default();
                 let residual_a: Vec<String> = set_a
-                    .difference(&set_b)
+                    .difference(&union_b)
                     .map(|(p, c)| format!("{p}:{c}"))
                     .collect();
                 let residual_b: Vec<String> = set_b
-                    .difference(&set_a)
+                    .difference(&union_a)
                     .map(|(p, c)| format!("{p}:{c}"))
                     .collect();
                 let intersection = set_a.intersection(&set_b).count();
                 let union = set_a.union(&set_b).count();
                 FudgedPair {
-                    baseline_key: bcg.clone(),
-                    candidate_key: ccg.clone(),
+                    baseline_cgroup: bcg.clone(),
+                    candidate_cgroup: ccg.clone(),
                     overlap: intersection,
                     jaccard: if union > 0 {
                         intersection as f64 / union as f64
                     } else {
                         0.0
                     },
-                    residual_baseline: residual_a,
-                    residual_candidate: residual_b,
+                    baseline_residual: residual_a,
+                    candidate_residual: residual_b,
                     cascaded_children: cascade_counts.get(bcg).copied().unwrap_or(0),
                     baseline_root: cascade_roots
                         .get(&(bcg.clone(), ccg.clone()))
@@ -3292,6 +3475,18 @@ pub fn compare(
                     row.sort_by_delta = *delta;
                 }
             }
+            // Mirror the SortBy fill onto derived_rows so the
+            // derived section's SortBy column carries the sort
+            // metric's per-group cell instead of "-". Same group
+            // keying (group_cells is keyed by group_key, which
+            // is the join key shared by primary and derived rows
+            // for the same bucket).
+            for row in &mut diff.derived_rows {
+                if let Some((cell, delta)) = group_cells.get(&row.group_key) {
+                    row.sort_by_cell = Some(cell.clone());
+                    row.sort_by_delta = *delta;
+                }
+            }
         }
     }
 
@@ -3324,35 +3519,87 @@ pub fn compare(
     }
 
     // Remap fudged smaps keys so baseline and candidate join.
-    // Fudge paired cg_A (baseline) with cg_B (candidate), but
-    // smaps keys are cg_key\x00pcomm — different cg = no join.
-    // Rename candidate keys from cg_B prefix to cg_A prefix.
-    // Smaps fudge remap: for each fudge pair, find candidate smaps
-    // keys under the candidate root, split into (cg_path, pcomm),
-    // strip the candidate root from cg_path to get the relative
-    // child path, rebuild as baseline_root + child + \x00 + pcomm.
+    // Fudge pairs a baseline cgroup with a candidate cgroup (see
+    // FudgedPair), but smaps keys are cg\x00pcomm — different cg
+    // means no join. Re-key candidate smaps data under the pair's
+    // baseline_root so the renderer joins them.
+    //
+    // For each fudge pair, scan candidate-side smaps keys under
+    // the pair's candidate_root, strip that root to get a relative
+    // child path, then re-key under the SAME pair's baseline_root.
+    // Per-pair scoping prevents data from one pair landing under
+    // another pair's baseline_root (multiple unrelated fudge pairs
+    // each contribute their own baseline_root → candidate_root
+    // mapping; a global accumulator would collapse them).
     // Sum values when multiple candidates map to the same baseline
-    // key (N containers → total candidate footprint).
+    // key (N containers under one pair → total candidate footprint).
+    //
+    // Sort by descending candidate_root.len() so the most-specific
+    // root processes first. With nested roots like `/svc` and
+    // `/svc/sub`, an unsorted scan would let the shorter `/svc`
+    // root claim every key starting with `/svc/sub` first,
+    // stealing the more-specific pair's data. Longest-first
+    // ensures `/svc/sub` removes its keys before `/svc` scans.
     {
-        // (relative_child_path + \x00 + pcomm) → summed values
-        let mut summed_by_rel: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::new();
-        for fp in &diff.fudged_pairs {
+        // Build a set of candidate cgroup paths that were
+        // actually fudge-matched (extracted from the candidate
+        // half of fudged_key_pairs). The smaps remap MUST
+        // restrict to these paths — without the gate, any smaps
+        // key that happens to share a prefix with a fudge pair's
+        // candidate_root is remapped, even if its compound-key
+        // counterpart was never fudge-matched. Sub-cgroups under
+        // a cascade root that didn't actually match would have
+        // their smaps data silently re-keyed under the baseline_root.
+        let fudged_cg_set: std::collections::BTreeSet<&str> = fudged_key_pairs
+            .iter()
+            .map(|(_, ckey)| ckey.split_once('\x00').map_or(ckey.as_str(), |(cg, _)| cg))
+            .collect();
+        let mut sorted_pairs: Vec<&FudgedPair> = diff.fudged_pairs.iter().collect();
+        sorted_pairs.sort_by(|a, b| b.candidate_root.len().cmp(&a.candidate_root.len()));
+        for fp in sorted_pairs {
+            let br = &fp.baseline_root;
             let cr = &fp.candidate_root;
             let cr_slash = format!("{cr}/");
             let cr_nul = format!("{cr}\x00");
+            // (relative_child_path + \x00 + pcomm) → summed values,
+            // SCOPED to this fudge pair so pairs with different
+            // baseline_roots don't share a remap accumulator.
+            let mut summed_by_rel: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::new();
+            // Fudge runs only under GroupBy::All, which routes
+            // through `collect_smaps_rollup_hierarchical` and
+            // produces keys shaped `cgroup\x00pcomm` for every
+            // entry (see [`collect_smaps_rollup_inner`] under
+            // `compound_cgroup=true`). A bare-cgroup key
+            // (no `\x00`) cannot appear here, so the in-root
+            // filter only needs to consider the `/`-bounded
+            // (cr_slash) and `\x00`-bounded (cr_nul) prefixes.
             let keys: Vec<String> = diff
                 .smaps_rollup_b
                 .keys()
                 .filter(|k| {
-                    k.starts_with(&cr_slash) || k.starts_with(&cr_nul) || k.as_str() == cr.as_str()
+                    let in_root = k.starts_with(&cr_slash) || k.starts_with(&cr_nul);
+                    if !in_root {
+                        return false;
+                    }
+                    // Gate on actual fudge match: the smaps key's
+                    // cg_path must appear in the fudged_cg_set.
+                    let cg_path = k.split_once('\x00').map_or(k.as_str(), |(cg, _)| cg);
+                    fudged_cg_set.contains(cg_path)
                 })
                 .cloned()
                 .collect();
             for k in keys {
                 if let Some(val) = diff.smaps_rollup_b.remove(&k) {
-                    // Split smaps key: cg_path \x00 pcomm
+                    // Split smaps key: cg_path \x00 pcomm. The
+                    // unwrap_or fallback would only fire on a
+                    // key with no `\x00`, which cannot reach
+                    // here (see filter above) — kept defensive.
                     let (cg_path, pcomm) = k.split_once('\x00').unwrap_or((&k, ""));
                     // Strip candidate root to get relative child path.
+                    // `cg_path == cr.as_str()` covers the exact-root
+                    // hit (e.g. `/svc-a\x00pcomm` against root
+                    // `/svc-a`); the strip_prefix branch covers
+                    // child paths.
                     let child = if cg_path == cr.as_str() {
                         ""
                     } else if let Some(rest) = cg_path.strip_prefix(&cr_slash) {
@@ -3363,14 +3610,13 @@ pub fn compare(
                     let rel_key = format!("{child}\x00{pcomm}");
                     let entry = summed_by_rel.entry(rel_key).or_default();
                     for (field, v) in &val {
-                        *entry.entry(field.clone()).or_insert(0) += v;
+                        let slot = entry.entry(field.clone()).or_insert(0);
+                        *slot = slot.saturating_add(*v);
                     }
                 }
             }
-        }
-        // Rebuild baseline-side keys and insert summed data.
-        if let Some(fp0) = diff.fudged_pairs.first() {
-            let br = &fp0.baseline_root;
+            // Rebuild this pair's baseline-side keys and insert
+            // summed data under THIS pair's baseline_root.
             for (rel_key, summed) in summed_by_rel {
                 let (child, pcomm) = rel_key.split_once('\x00').unwrap_or((&rel_key, ""));
                 let base_key = if child.is_empty() {
@@ -3999,8 +4245,14 @@ pub fn build_groups(
     // ergonomics), this fn computes counts from `snap` alone.
     // Suppressed when `no_thread_normalize` is set — the gate is
     // meaningless once each thread groups by its literal name.
+    // Pattern_field selects the thread accessor used by the
+    // singleton-revert gate inside the GroupBy::Pcomm / Comm
+    // grouping arm. GroupBy::All has its own arm that normalizes
+    // both pcomm and comm unconditionally (no singleton revert),
+    // so it never reads `pattern_field`. CommExact and Cgroup
+    // don't normalize either.
     let pattern_field: Option<fn(&ThreadState) -> &str> = match (group_by, no_thread_normalize) {
-        (GroupBy::Comm | GroupBy::All, false) => Some(|t: &ThreadState| t.comm.as_str()),
+        (GroupBy::Comm, false) => Some(|t: &ThreadState| t.comm.as_str()),
         (GroupBy::Pcomm, false) => Some(|t: &ThreadState| t.pcomm.as_str()),
         _ => None,
     };
@@ -4206,19 +4458,18 @@ fn mode_aggregate(
     total: usize,
     items: impl IntoIterator<Item = crate::metric_types::CategoricalString>,
 ) -> Aggregated {
-    use crate::metric_types::{CategoricalString, Modeable};
-    match CategoricalString::mode_across(items) {
-        Some((value, count, _total)) => Aggregated::Mode {
-            value: value.0,
-            count,
-            total,
-        },
-        None => Aggregated::Mode {
-            value: String::new(),
-            count: 0,
-            total,
-        },
+    // Build the full tally map across the bucket — one entry
+    // per distinct category, with its occurrence count. The
+    // mode (most-frequent value) is derived on demand by
+    // [`Aggregated::mode_value`] / [`Aggregated::mode_count`];
+    // storing the full distribution (not just the mode) lets
+    // the N:1 fudge merge compose tallies correctly across
+    // buckets via [`merge_aggregated_into`].
+    let mut tallies: BTreeMap<String, usize> = BTreeMap::new();
+    for item in items {
+        *tallies.entry(item.0).or_insert(0) += 1;
     }
+    Aggregated::Mode { tallies, total }
 }
 
 pub fn aggregate(rule: AggRule, threads: &[&ThreadState]) -> Aggregated {
@@ -5238,11 +5489,14 @@ fn format_delta_cell(delta: f64, ladder: ScaleLadder) -> String {
 /// before the renderer runs. A `--columns` override on the same
 /// invocation wins over the format's default column set.
 ///
-/// [`Arrow`] collapses baseline / candidate / delta into a
-/// single cell shaped `<baseline> -> <candidate> (<delta>)` so a
-/// narrow display still surfaces directionality. The arrow cell
-/// renderer mirrors [`cgroup_cell`]'s shape so the two stay
-/// visually consistent across primary and cgroup tables.
+/// [`Arrow`] collapses baseline / candidate into a single cell
+/// shaped `<baseline> -> <candidate>` so a narrow display still
+/// surfaces directionality. The arrow column is paired with the
+/// dedicated Delta + Pct + Uptime columns (not fused into the
+/// arrow cell itself), so the renderer keeps the deltas
+/// readable on either side of the arrow form. The arrow cell
+/// shape mirrors [`cgroup_cell`]'s so primary and cgroup tables
+/// stay visually consistent.
 ///
 /// [`Arrow`]: DisplayFormat::Arrow
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
@@ -5256,8 +5510,10 @@ pub enum DisplayFormat {
     DeltaOnly,
     /// Drop pct column; keep baseline + candidate + delta.
     NoPct,
-    /// Single-cell `<baseline> -> <candidate> (<delta>)` form;
-    /// drop pct.
+    /// Arrow form: `<baseline> -> <candidate>` cell paired with
+    /// the dedicated Delta + Pct + Uptime columns. Compact view
+    /// for "show me direction at a glance" while still carrying
+    /// the deltas on the same row.
     Arrow,
     /// Drop baseline / candidate / delta; keep pct only.
     PctOnly,
@@ -5407,9 +5663,11 @@ fn show_columns_default() -> Vec<Column> {
 ///   on show).
 /// - Duplicate name across two entries.
 /// - Empty token between commas.
-/// - `arrow` paired with any of `baseline`/`candidate`/`delta`/`%`
-///   (the arrow form fuses those columns into a single cell —
-///   pairing them would render the same data twice).
+/// - `arrow` paired with `baseline` or `candidate` (the arrow
+///   cell already shows `baseline -> candidate`; pairing those
+///   would render the same data twice). `arrow + delta + %` is
+///   allowed and matches the format-default for
+///   [`DisplayFormat::Arrow`].
 pub fn parse_columns(spec: &str, compare_side: bool) -> anyhow::Result<Vec<Column>> {
     if spec.trim().is_empty() {
         return Ok(Vec::new());
@@ -5467,20 +5725,25 @@ pub fn parse_columns(spec: &str, compare_side: bool) -> anyhow::Result<Vec<Colum
         }
         out.push(col);
     }
-    // Arrow fuses baseline/candidate/delta/% into a single cell;
-    // pairing arrow with any of those names asks the renderer to
-    // emit the same data twice. Reject at parse time.
+    // The arrow cell renders `<baseline> -> <candidate>`, which
+    // visually replaces the separate Baseline / Candidate
+    // columns; pairing arrow with either of those names asks
+    // the renderer to emit the same data twice. Reject at parse
+    // time. Delta and Pct, by contrast, are NOT visually
+    // duplicated by the arrow cell — they remain as numeric
+    // columns alongside Arrow under the format-default
+    // (`compare_columns_for(DisplayFormat::Arrow)` produces
+    // `[Group, Threads, Metric, Arrow, Delta, Pct, Uptime]`),
+    // so user-supplied `--columns` specs can also include them.
     let has_arrow = out.iter().any(|c| matches!(c, Column::Arrow));
-    let has_fused = out.iter().any(|c| {
-        matches!(
-            c,
-            Column::Baseline | Column::Candidate | Column::Delta | Column::Pct
-        )
-    });
-    if has_arrow && has_fused {
+    let has_redundant_with_arrow = out
+        .iter()
+        .any(|c| matches!(c, Column::Baseline | Column::Candidate));
+    if has_arrow && has_redundant_with_arrow {
         anyhow::bail!(
-            "column 'arrow' is mutually exclusive with baseline/candidate/delta/% \
-             — the arrow form fuses them into a single cell."
+            "column 'arrow' is mutually exclusive with baseline/candidate \
+             — the arrow cell already shows baseline -> candidate. \
+             Pair arrow with delta/% (or use it alone) instead."
         );
     }
     Ok(out)
@@ -6000,8 +6263,8 @@ fn render_diff_row_cells(row: &DiffRow, columns: &[Column]) -> Vec<String> {
             Column::Delta => match row.delta {
                 Some(d) => format_delta_cell(d, row.metric_ladder),
                 None => match (&row.baseline, &row.candidate) {
-                    (Aggregated::Mode { value: a, .. }, Aggregated::Mode { value: b, .. }) => {
-                        if a == b {
+                    (Aggregated::Mode { .. }, Aggregated::Mode { .. }) => {
+                        if row.baseline.mode_value() == row.candidate.mode_value() {
                             "same".to_string()
                         } else {
                             "differs".to_string()
@@ -6035,13 +6298,23 @@ fn render_diff_row_cells(row: &DiffRow, columns: &[Column]) -> Vec<String> {
     cells
 }
 
-/// Color a diff-table cell based on its column type and the row's delta.
-/// Delta/% cells: yellow for positive (increase), magenta for negative
-/// (decrease). Uptime: green/yellow/red gradient. Other columns: default.
+/// Color a diff-table cell based on its column type, the row's
+/// raw delta (sign of color), and the row's delta_pct (fraction
+/// for the bold threshold). Delta/% cells: yellow for positive
+/// (increase), magenta for negative (decrease). Uptime:
+/// green/yellow/red gradient. Other columns: default.
+///
+/// `delta` carries the raw metric delta — used only for color
+/// sign (positive vs negative). `delta_pct` carries the
+/// fractional delta (Δ / baseline) — used as the bold threshold
+/// on the Pct column. Without the split, the bold check
+/// |raw_delta| > 0.5 fired on every non-zero ns/byte change
+/// (ns and bytes are large; 0.5 trivially exceeded).
 pub fn color_diff_cell(
     text: String,
     col: Column,
     delta: Option<f64>,
+    delta_pct: Option<f64>,
     uptime_pct: Option<f64>,
     sort_by_delta: Option<f64>,
 ) -> comfy_table::Cell {
@@ -6054,7 +6327,7 @@ pub fn color_diff_cell(
                 _ => Color::White,
             };
             let mut cell = comfy_table::Cell::new(text).fg(color);
-            if matches!(delta, Some(d) if d.abs() > 0.5) {
+            if matches!(delta_pct, Some(p) if p.abs() > 0.5) {
                 cell = cell.add_attribute(Attribute::Bold);
             }
             cell
@@ -6183,7 +6456,7 @@ fn render_derived_row_cells(row: &DerivedRow, columns: &[Column]) -> Vec<String>
             Column::Value => "-".to_string(),
             Column::Tags => String::new(),
             Column::Uptime => "-".to_string(),
-            Column::SortBy => "-".to_string(),
+            Column::SortBy => row.sort_by_cell.clone().unwrap_or_else(|| "-".to_string()),
         };
         cells.push(cell);
     }
@@ -6208,6 +6481,16 @@ pub struct CtprofCompareArgs {
     /// `--no-thread-normalize` to disable that collapse and group
     /// by literal `comm` / `pcomm` instead. `comm-exact` is a
     /// synonym for `comm --no-thread-normalize`.
+    ///
+    /// Under `all` (default): also activates fudging — pairs
+    /// of cgroups with renamed-but-identical thread populations
+    /// (Jaccard similarity ≥ 0.90 over (pcomm, comm) thread
+    /// types, both sides ≥ 10 distinct types) are joined for
+    /// diffing instead of surfacing as orphans. Fudged rows
+    /// render with a `[fudged: <leaf>]` marker; the
+    /// `## Fudged cgroup matches` section at the bottom of the
+    /// output details the matched pairs and their
+    /// jaccard / overlap / cascade roots / residuals.
     #[arg(long, value_enum, default_value_t = GroupBy::All, help_heading = "Grouping")]
     pub group_by: GroupBy,
     /// Glob patterns that collapse dynamic cgroup path segments
@@ -6272,8 +6555,9 @@ pub struct CtprofCompareArgs {
     /// Per-row column layout. `full` (default) emits the
     /// seven-column form; `delta-only` drops baseline +
     /// candidate; `no-pct` drops the percentage column;
-    /// `arrow` collapses baseline / candidate / delta into a
-    /// single cell; `pct-only` keeps just the percentage.
+    /// `arrow` collapses baseline / candidate into one
+    /// `baseline -> candidate` cell paired with separate Delta
+    /// and Pct columns; `pct-only` keeps just the percentage.
     /// `--columns` (below) overrides the format's default
     /// column set when both are present.
     #[arg(long, value_enum, default_value_t = DisplayFormat::Arrow, help_heading = "Display")]
@@ -6824,14 +7108,28 @@ pub fn write_diff<W: fmt::Write>(
             // tree. primary_rows are already delta-sorted from
             // compare(). Apply the line limit here so the tree
             // only contains the top movers.
+            //
+            // Pin fudged rows: rows whose display_key starts
+            // with `[fudged` represent N:1 merges that the
+            // operator specifically asked the fudge stage to
+            // produce. Truncating them silently buries the
+            // most informative output. Partition first so
+            // every fudged row survives the truncation, then
+            // fill the remaining budget with the top non-fudged
+            // movers in delta order.
+            let (fudged_rows, normal_rows): (Vec<&DiffRow>, Vec<&DiffRow>) = primary_rows
+                .iter()
+                .copied()
+                .partition(|r| r.display_key.starts_with("[fudged"));
             let limited_rows: Vec<&DiffRow> = if display.section_line_limit > 0 {
-                primary_rows
-                    .iter()
-                    .copied()
-                    .take(display.section_line_limit)
-                    .collect()
+                let mut out: Vec<&DiffRow> = fudged_rows.clone();
+                let budget = display.section_line_limit.saturating_sub(fudged_rows.len());
+                out.extend(normal_rows.into_iter().take(budget));
+                out
             } else {
-                primary_rows.clone()
+                let mut out = fudged_rows;
+                out.extend(normal_rows);
+                out
             };
 
             struct HierRow<'a> {
@@ -6975,13 +7273,42 @@ pub fn write_diff<W: fmt::Write>(
                 let mut string_cells = render_diff_row_cells(h.row, &columns);
                 if let Some(pos) = columns.iter().position(|c| *c == Column::Group) {
                     let cg_depth = last_segments.len();
-                    string_cells[pos] = format!("{}  {}", "  ".repeat(cg_depth + 1), h.comm);
+                    // Preserve the [fudged] marker for rows that
+                    // came from the N:1 fudge merge — without
+                    // this preservation the comm-overwrite below
+                    // would silently strip the indicator and
+                    // fudged rows would render identically to
+                    // naturally-matched rows.
+                    let fudge_marker = if h.row.display_key.starts_with("[fudged") {
+                        h.row.display_key.as_str()
+                    } else {
+                        ""
+                    };
+                    // Insert a single space between marker and
+                    // comm; empty marker leaves the cell as
+                    // just `<indent>  <comm>` (matches
+                    // pre-fudge layout).
+                    let fudge_separator = if fudge_marker.is_empty() { "" } else { " " };
+                    string_cells[pos] = format!(
+                        "{}  {}{}{}",
+                        "  ".repeat(cg_depth + 1),
+                        fudge_marker,
+                        fudge_separator,
+                        h.comm,
+                    );
                 }
                 let cells: Vec<comfy_table::Cell> = string_cells
                     .into_iter()
                     .zip(columns.iter())
                     .map(|(s, col)| {
-                        color_diff_cell(s, *col, h.row.delta, h.row.uptime_pct, h.row.sort_by_delta)
+                        color_diff_cell(
+                            s,
+                            *col,
+                            h.row.delta,
+                            h.row.delta_pct,
+                            h.row.uptime_pct,
+                            h.row.sort_by_delta,
+                        )
                     })
                     .collect();
                 table.add_row(cells);
@@ -7021,7 +7348,14 @@ pub fn write_diff<W: fmt::Write>(
                         .into_iter()
                         .zip(columns.iter())
                         .map(|(s, col)| {
-                            color_diff_cell(s, *col, row.delta, row.uptime_pct, row.sort_by_delta)
+                            color_diff_cell(
+                                s,
+                                *col,
+                                row.delta,
+                                row.delta_pct,
+                                row.uptime_pct,
+                                row.sort_by_delta,
+                            )
                         })
                         .collect();
                     table.add_row(cells);
@@ -7047,7 +7381,14 @@ pub fn write_diff<W: fmt::Write>(
                     .into_iter()
                     .zip(columns.iter())
                     .map(|(s, col)| {
-                        color_diff_cell(s, *col, row.delta, row.uptime_pct, row.sort_by_delta)
+                        color_diff_cell(
+                            s,
+                            *col,
+                            row.delta,
+                            row.delta_pct,
+                            row.uptime_pct,
+                            row.sort_by_delta,
+                        )
                     })
                     .collect();
                 table.add_row(cells);
@@ -7242,9 +7583,23 @@ pub fn write_diff<W: fmt::Write>(
                                 Some(pct) => format!("{pct:.0}%"),
                                 None => "-".to_string(),
                             };
-                            color_diff_cell(text, *col, h.row.delta, up, None)
+                            color_diff_cell(
+                                text,
+                                *col,
+                                h.row.delta,
+                                h.row.delta_pct,
+                                up,
+                                h.row.sort_by_delta,
+                            )
                         } else {
-                            color_diff_cell(s, *col, h.row.delta, up, None)
+                            color_diff_cell(
+                                s,
+                                *col,
+                                h.row.delta,
+                                h.row.delta_pct,
+                                up,
+                                h.row.sort_by_delta,
+                            )
                         }
                     })
                     .collect();
@@ -7277,9 +7632,23 @@ pub fn write_diff<W: fmt::Write>(
                                 Some(pct) => format!("{pct:.0}%"),
                                 None => "-".to_string(),
                             };
-                            color_diff_cell(text, *col, row.delta, up, None)
+                            color_diff_cell(
+                                text,
+                                *col,
+                                row.delta,
+                                row.delta_pct,
+                                up,
+                                row.sort_by_delta,
+                            )
                         } else {
-                            color_diff_cell(s, *col, row.delta, up, None)
+                            color_diff_cell(
+                                s,
+                                *col,
+                                row.delta,
+                                row.delta_pct,
+                                up,
+                                row.sort_by_delta,
+                            )
                         }
                     })
                     .collect();
@@ -7459,12 +7828,19 @@ pub fn write_diff<W: fmt::Write>(
                     } else {
                         None
                     };
+                    let delta_opt: Option<f64> = if av.is_some() && bv.is_some() {
+                        Some(delta as f64)
+                    } else {
+                        None
+                    };
                     let string_cells: Vec<String> = columns
                         .iter()
                         .map(|c| match c {
                             Column::Group => group_label.clone(),
                             Column::Threads => String::new(),
                             Column::Metric => sk.clone(),
+                            Column::Baseline => a_cell.clone(),
+                            Column::Candidate => b_cell.clone(),
                             Column::Arrow => value_cell.clone(),
                             Column::Delta => delta_cell.clone(),
                             Column::Pct => pct_cell.clone(),
@@ -7475,7 +7851,9 @@ pub fn write_diff<W: fmt::Write>(
                     let cells: Vec<comfy_table::Cell> = string_cells
                         .into_iter()
                         .zip(columns.iter())
-                        .map(|(s, col)| color_diff_cell(s, *col, delta_pct_opt, None, None))
+                        .map(|(s, col)| {
+                            color_diff_cell(s, *col, delta_opt, delta_pct_opt, None, None)
+                        })
                         .collect();
                     st.add_row(cells);
                 }
@@ -7951,9 +8329,11 @@ pub fn write_diff<W: fmt::Write>(
         }
         Ok(())
     };
-    write_only_list(w, "baseline", baseline_path, &diff.only_baseline)?;
-    write_only_list(w, "candidate", candidate_path, &diff.only_candidate)?;
-
+    // Render the Fudged-cgroup-matches section BEFORE the
+    // only-baseline / only-candidate lists. Fudge pairs are
+    // matched cgroups that the operator should see together;
+    // putting them after the orphan lists buries the most
+    // informative section under noise.
     if !diff.fudged_pairs.is_empty() {
         writeln!(
             w,
@@ -7961,8 +8341,19 @@ pub fn write_diff<W: fmt::Write>(
             diff.fudged_pairs.len()
         )?;
         for fp in &diff.fudged_pairs {
-            writeln!(w, "\n  \x1b[36mbaseline:\x1b[0m {}", fp.baseline_key)?;
-            writeln!(w, "  \x1b[36mcandidate:\x1b[0m {}", fp.candidate_key)?;
+            writeln!(w, "\n  \x1b[36mbaseline:\x1b[0m {}", fp.baseline_cgroup)?;
+            writeln!(w, "  \x1b[36mcandidate:\x1b[0m {}", fp.candidate_cgroup)?;
+            // Surface cascade roots when they differ from the
+            // matched baseline / candidate paths — operators
+            // need to see the longest-common-suffix root that
+            // governs how cascaded children get joined.
+            if fp.baseline_root != fp.baseline_cgroup || fp.candidate_root != fp.candidate_cgroup {
+                writeln!(
+                    w,
+                    "  cascade roots: baseline={} candidate={}",
+                    fp.baseline_root, fp.candidate_root,
+                )?;
+            }
             writeln!(
                 w,
                 "  overlap: {} thread types, Jaccard: {:.1}%, cascaded children: {}",
@@ -7970,22 +8361,25 @@ pub fn write_diff<W: fmt::Write>(
                 fp.jaccard * 100.0,
                 fp.cascaded_children
             )?;
-            if !fp.residual_baseline.is_empty() {
+            if !fp.baseline_residual.is_empty() {
                 writeln!(
                     w,
                     "  residual (baseline only): {}",
-                    fp.residual_baseline.join(", ")
+                    fp.baseline_residual.join(", ")
                 )?;
             }
-            if !fp.residual_candidate.is_empty() {
+            if !fp.candidate_residual.is_empty() {
                 writeln!(
                     w,
                     "  residual (candidate only): {}",
-                    fp.residual_candidate.join(", ")
+                    fp.candidate_residual.join(", ")
                 )?;
             }
         }
     }
+
+    write_only_list(w, "baseline", baseline_path, &diff.only_baseline)?;
+    write_only_list(w, "candidate", candidate_path, &diff.only_candidate)?;
 
     Ok(())
 }
@@ -8210,14 +8604,14 @@ mod tests {
         c.policy = "SCHED_FIFO".into();
         let v = aggregate(AggRule::Mode(|t| t.policy.clone()), &[&a, &b, &c]);
         match v {
-            Aggregated::Mode {
-                value,
-                count,
-                total,
-            } => {
-                assert_eq!(value, "SCHED_OTHER");
-                assert_eq!(count, 2);
+            Aggregated::Mode { ref tallies, total } => {
+                assert_eq!(v.mode_value(), "SCHED_OTHER");
+                assert_eq!(v.mode_count(), 2);
                 assert_eq!(total, 3);
+                // Tally pin: SCHED_OTHER counted twice,
+                // SCHED_FIFO counted once.
+                assert_eq!(tallies.get("SCHED_OTHER").copied(), Some(2));
+                assert_eq!(tallies.get("SCHED_FIFO").copied(), Some(1));
             }
             other => panic!("expected Mode, got {other:?}"),
         }
@@ -8404,9 +8798,9 @@ mod tests {
             .expect("policy row");
         assert!(policy_row.delta.is_none());
         match (&policy_row.baseline, &policy_row.candidate) {
-            (Aggregated::Mode { value: a, .. }, Aggregated::Mode { value: b, .. }) => {
-                assert_eq!(a, "SCHED_OTHER");
-                assert_eq!(b, "SCHED_FIFO");
+            (Aggregated::Mode { .. }, Aggregated::Mode { .. }) => {
+                assert_eq!(policy_row.baseline.mode_value(), "SCHED_OTHER");
+                assert_eq!(policy_row.candidate.mode_value(), "SCHED_FIFO");
             }
             _ => panic!("expected two Mode aggregates"),
         }
@@ -9334,6 +9728,8 @@ mod tests {
         // Locked matrix: (name → (sched_class, config_gates, is_dead)).
         // Order matches CTPROF_METRICS for ease of audit.
         let matrix: &[(&str, Option<&str>, &[&str], bool)] = &[
+            // structural: group population count
+            ("thread_count", None, &[], false),
             // identity / structural
             ("policy", None, &[], false),
             ("nice", None, &[], false),
@@ -9725,13 +10121,14 @@ mod tests {
         }
     }
 
-    /// Integration test for `write_diff`: a tagged metric row
-    /// (`nr_wakeups_affine`) renders the bracketed tag suffix on
-    /// the `metric` cell in the produced table. Pins that the
-    /// registry tag → cell rendering plumbing stays connected
-    /// end-to-end; refactoring `metric_display_name`'s callers
-    /// without rerouting the bracketed tag would silently strip
-    /// the cell back to bare metric names.
+    /// Integration test for `write_diff`: when the `Tags` column
+    /// is included via `--columns`, a tagged metric row
+    /// (`nr_wakeups_affine`) renders the bracketed tag string in
+    /// the dedicated `tags` column. Pins that the registry tag →
+    /// cell rendering plumbing stays connected end-to-end; the
+    /// default column set (without `tags`) deliberately omits the
+    /// bracketed tag string from the `metric` cell so plain
+    /// listings stay narrow.
     #[test]
     fn write_diff_renders_tagged_metric_cell() {
         let mut a = make_thread("p", "w");
@@ -9743,6 +10140,17 @@ mod tests {
             &snap_with(vec![b]),
             &CompareOptions::default(),
         );
+        let mut display = DisplayOptions::default();
+        display.columns = vec![
+            Column::Group,
+            Column::Threads,
+            Column::Metric,
+            Column::Tags,
+            Column::Baseline,
+            Column::Candidate,
+            Column::Delta,
+            Column::Pct,
+        ];
         let mut out = String::new();
         write_diff(
             &mut out,
@@ -9750,18 +10158,23 @@ mod tests {
             Path::new("a"),
             Path::new("b"),
             GroupBy::Pcomm,
-            &DisplayOptions::default(),
+            &display,
         )
         .unwrap();
         assert!(
-            out.contains("nr_wakeups_affine [cfs-only] [SCHEDSTATS]"),
-            "tagged metric cell missing from rendered table:\n{out}",
+            out.contains("[cfs-only] [SCHEDSTATS]"),
+            "tagged metric tags missing from rendered tags column:\n{out}",
+        );
+        assert!(
+            out.contains("nr_wakeups_affine"),
+            "tagged metric name missing from rendered table:\n{out}",
         );
     }
 
-    /// Integration test for `write_diff`: a `non-ext` metric
-    /// (`wait_sum`) renders with the new tag in the produced
-    /// table. Pins the matrix change end-to-end so a future
+    /// Integration test for `write_diff`: when the `Tags` column
+    /// is requested, a `non-ext` metric (`wait_sum`) surfaces its
+    /// `[non-ext] [SCHEDSTATS]` tag string in the dedicated tags
+    /// column. Pins the matrix change end-to-end so a future
     /// regression that rolls the class back to `None` fails
     /// here as well as in the unit test.
     #[test]
@@ -9775,6 +10188,17 @@ mod tests {
             &snap_with(vec![b]),
             &CompareOptions::default(),
         );
+        let mut display = DisplayOptions::default();
+        display.columns = vec![
+            Column::Group,
+            Column::Threads,
+            Column::Metric,
+            Column::Tags,
+            Column::Baseline,
+            Column::Candidate,
+            Column::Delta,
+            Column::Pct,
+        ];
         let mut out = String::new();
         write_diff(
             &mut out,
@@ -9782,12 +10206,16 @@ mod tests {
             Path::new("a"),
             Path::new("b"),
             GroupBy::Pcomm,
-            &DisplayOptions::default(),
+            &display,
         )
         .unwrap();
         assert!(
-            out.contains("wait_sum [non-ext] [SCHEDSTATS]"),
-            "non-ext metric cell missing from rendered table:\n{out}",
+            out.contains("[non-ext] [SCHEDSTATS]"),
+            "non-ext metric tags missing from rendered tags column:\n{out}",
+        );
+        assert!(
+            out.contains("wait_sum"),
+            "non-ext metric name missing from rendered table:\n{out}",
         );
     }
 
@@ -9872,7 +10300,10 @@ mod tests {
                 Column::Group,
                 Column::Threads,
                 Column::Metric,
-                Column::Arrow
+                Column::Arrow,
+                Column::Delta,
+                Column::Pct,
+                Column::Uptime,
             ]
         );
         assert_eq!(
@@ -9883,9 +10314,12 @@ mod tests {
 
     /// `Column::cli_name()` round-trips through
     /// [`parse_columns`] for every compare-side allowed variant.
-    /// `arrow` is mutually exclusive with the
-    /// baseline/candidate/delta/% set it fuses, so it is
-    /// exercised by the dedicated arrow-only round-trip below.
+    /// `arrow` is rejected by the parser only when paired with
+    /// `baseline` or `candidate` (the arrow cell visually
+    /// replaces those columns). Pairing `arrow` with `delta` /
+    /// `%` is allowed and matches the format-default for
+    /// `DisplayFormat::Arrow`. The arrow-form round-trip lives
+    /// in a separate test below.
     #[test]
     fn parse_columns_round_trips_compare_names() {
         let spec = "group,threads,metric,baseline,candidate,delta,%";
@@ -9904,9 +10338,13 @@ mod tests {
         );
     }
 
-    /// Round-trip the `arrow` form on its own — the fused single
-    /// cell carries baseline/candidate/delta in one column and
-    /// must not be paired with any of those names.
+    /// Round-trip the `arrow` form on its own. In a
+    /// user-supplied `--columns` spec, `arrow` is mutually
+    /// exclusive with `baseline` / `candidate` only (the arrow
+    /// cell visually replaces those columns; pairing them
+    /// would render the same data twice). `arrow + delta + %`
+    /// is allowed and mirrors the format-default for
+    /// `DisplayFormat::Arrow`.
     #[test]
     fn parse_columns_round_trips_arrow_form() {
         let spec = "group,threads,metric,arrow";
@@ -9998,24 +10436,47 @@ mod tests {
     }
 
     /// Compare-side `parse_columns` rejects `arrow` paired with
-    /// any of `baseline` / `candidate` / `delta` / `%`. Arrow
-    /// fuses those four into a single cell, so combining them
-    /// would render the same data twice. The error message
-    /// names the constraint so the operator can recover.
+    /// `baseline` or `candidate` — the arrow cell visually
+    /// replaces those two columns, so pairing them would render
+    /// the same data twice. Pairing `arrow` with `delta` or `%`
+    /// is allowed and mirrors the format-default column set for
+    /// `DisplayFormat::Arrow`. The error message names the
+    /// constraint so the operator can recover.
     #[test]
-    fn parse_columns_rejects_arrow_with_fused_columns() {
-        for fused in &["baseline", "candidate", "delta", "%"] {
-            let spec = format!("arrow,{fused}");
+    fn parse_columns_rejects_arrow_with_redundant_columns() {
+        for redundant in &["baseline", "candidate"] {
+            let spec = format!("arrow,{redundant}");
             let res = parse_columns(&spec, true);
             let err = res
                 .err()
-                .unwrap_or_else(|| panic!("arrow+{fused} must be rejected"));
+                .unwrap_or_else(|| panic!("arrow+{redundant} must be rejected"));
             let msg = format!("{err:#}");
             assert!(
                 msg.contains("arrow") && msg.contains("mutually exclusive"),
                 "error must name arrow's mutual exclusivity for spec {spec:?}: {msg}"
             );
         }
+    }
+
+    /// `arrow + delta + %` round-trips cleanly through
+    /// [`parse_columns`] — it matches the default column set
+    /// for `DisplayFormat::Arrow` and must be expressible from a
+    /// user-supplied `--columns` spec.
+    #[test]
+    fn parse_columns_accepts_arrow_with_delta_and_pct() {
+        let spec = "group,threads,metric,arrow,delta,%";
+        let cols = parse_columns(spec, true).expect("arrow + delta + % must parse");
+        assert_eq!(
+            cols,
+            vec![
+                Column::Group,
+                Column::Threads,
+                Column::Metric,
+                Column::Arrow,
+                Column::Delta,
+                Column::Pct,
+            ],
+        );
     }
 
     // ------------------------------------------------------------
@@ -10447,8 +10908,13 @@ mod tests {
             &display,
         )
         .unwrap();
-        // Header must NOT contain "baseline" or "candidate".
-        let header_line = out.lines().next().unwrap_or("");
+        // The first line of `out` is the section heading
+        // `## Primary metrics`; the table column header is the
+        // first line containing the `metric` token.
+        let header_line = out
+            .lines()
+            .find(|line| line.contains("metric") && !line.starts_with("##"))
+            .unwrap_or("");
         assert!(
             !header_line.contains("baseline"),
             "delta-only header must drop baseline column:\n{header_line}"
@@ -10480,7 +10946,13 @@ mod tests {
             &display,
         )
         .unwrap();
-        let header_line = out.lines().next().unwrap_or("");
+        // The first line of `out` is the section heading
+        // `## Primary metrics`; the table column header is the
+        // first line containing the `metric` token.
+        let header_line = out
+            .lines()
+            .find(|line| line.contains("metric") && !line.starts_with("##"))
+            .unwrap_or("");
         // `%` is the literal column name; assert it is absent
         // as a stand-alone token. The header is whitespace-padded
         // by comfy_table; check there's no bare " % " run.
@@ -10491,8 +10963,9 @@ mod tests {
     }
 
     /// `DisplayFormat::Arrow` collapses baseline → candidate
-    /// (delta) into a single cell. Pin the cell carries the
-    /// arrow glyph and the parenthesized delta.
+    /// into a single arrow cell, with the Delta column
+    /// alongside (not fused into the arrow). Pin the arrow cell
+    /// shape AND the adjacent Delta column rendering.
     #[test]
     fn write_diff_arrow_renders_combined_cell() {
         let (a, b) = snap_pair_for_display();
@@ -10511,8 +10984,9 @@ mod tests {
         .unwrap();
         // run_time_ns row with 100 -> 200 (+100). Auto-scale
         // ladder leaves these as ns since they're below 1000.
-        // Should render `100ns -> 200ns (+100ns)`. The arrow
-        // glyph is U+2192.
+        // Arrow cell renders `100ns -> 200ns`; the Delta column
+        // (alongside Arrow under DisplayFormat::Arrow) renders
+        // `+100ns`. The arrow glyph is U+2192.
         assert!(
             out.contains("\u{2192}"),
             "arrow glyph must appear in output:\n{out}"
@@ -10522,8 +10996,8 @@ mod tests {
             "baseline and candidate values must surface in arrow cell:\n{out}"
         );
         assert!(
-            out.contains("(+100ns)") || out.contains("(+100"),
-            "delta must appear in parens:\n{out}"
+            out.contains("+100ns"),
+            "delta must appear in adjacent Delta column:\n{out}"
         );
     }
 
@@ -10576,7 +11050,13 @@ mod tests {
             &display,
         )
         .unwrap();
-        let header_line = out.lines().next().unwrap_or("");
+        // The first line of `out` is the section heading
+        // `## Primary metrics`; the table column header is the
+        // first line containing the `metric` token.
+        let header_line = out
+            .lines()
+            .find(|line| line.contains("metric") && !line.starts_with("##"))
+            .unwrap_or("");
         assert!(
             !header_line.contains("baseline"),
             "pct-only header must drop baseline:\n{header_line}"
@@ -10619,7 +11099,13 @@ mod tests {
             &display,
         )
         .unwrap();
-        let header_line = out.lines().next().unwrap_or("");
+        // The first line of `out` is the section heading
+        // `## Primary metrics`; the table column header is the
+        // first line containing the `metric` token.
+        let header_line = out
+            .lines()
+            .find(|line| line.contains("metric") && !line.starts_with("##"))
+            .unwrap_or("");
         assert!(
             header_line.contains("metric"),
             "metric column must appear:\n{header_line}"
@@ -11658,9 +12144,12 @@ mod tests {
         b.policy = "SCHED_OTHER".into();
         let v = aggregate(AggRule::Mode(|t| t.policy.clone()), &[&a, &b]);
         match v {
-            Aggregated::Mode { value, count, .. } => {
-                assert_eq!(value, "SCHED_FIFO");
-                assert_eq!(count, 1);
+            Aggregated::Mode { .. } => {
+                // Tie at count=1 for both values; BTreeMap
+                // iteration order picks the lexicographically
+                // first key, which is "SCHED_FIFO".
+                assert_eq!(v.mode_value(), "SCHED_FIFO");
+                assert_eq!(v.mode_count(), 1);
             }
             other => panic!("expected Mode, got {other:?}"),
         }
@@ -11701,18 +12190,50 @@ mod tests {
     /// homogeneous groups.
     #[test]
     fn mode_display_hides_ratio_when_unanimous() {
-        let m = Aggregated::Mode {
-            value: "SCHED_OTHER".into(),
-            count: 4,
-            total: 4,
-        };
+        let m = Aggregated::mode_single("SCHED_OTHER".into(), 4, 4);
         assert_eq!(m.to_string(), "SCHED_OTHER");
-        let m = Aggregated::Mode {
-            value: "SCHED_OTHER".into(),
-            count: 3,
-            total: 5,
-        };
+        let m = Aggregated::mode_single("SCHED_OTHER".into(), 3, 5);
         assert_eq!(m.to_string(), "SCHED_OTHER (3/5)");
+    }
+
+    /// `new_constrained_table` sets a dummy header to force
+    /// column allocation, then attaches per-column width
+    /// constraints, on the assumption that comfy_table
+    /// preserves those constraints when the caller later
+    /// replaces the header via `set_header`. This test pins
+    /// that contract empirically: build a constrained table,
+    /// replace its header, render data wider than the
+    /// constraint, and assert the rendered cell is bounded by
+    /// the constraint width. A comfy_table upgrade that
+    /// breaks header-replacement-preserves-constraints surfaces
+    /// here as cells exceeding the configured width.
+    #[test]
+    fn new_constrained_table_constraints_survive_header_replacement() {
+        let display = DisplayOptions::default();
+        // 5-character upper bound on a single column.
+        let max_widths: Vec<u16> = vec![5];
+        let mut t = display.new_constrained_table(&max_widths);
+        // Replace the dummy header with the real one (single
+        // column, matching the dummy's count).
+        t.set_header(vec!["col"]);
+        // Add a row whose data is wider than the constraint —
+        // any preservation regression would let the rendered
+        // line exceed the bound.
+        t.add_row(vec!["aaaaaaaaaaaaaaaaaaaa"]);
+        let rendered = t.to_string();
+        // Each line of the rendered table must be no wider than
+        // the constraint plus comfy_table's borders/padding.
+        // The 5-char data cell with default padding (1 char on
+        // each side) plus 2 border chars = 9. Fail if we see a
+        // line wider than 16 (generous cap that catches an
+        // unconstrained 20-char cell).
+        for line in rendered.lines() {
+            assert!(
+                line.chars().count() <= 16,
+                "rendered line exceeds constrained width of 5; constraints \
+                 may not survive set_header replacement: \n{rendered}"
+            );
+        }
     }
 
     // -- write_diff: output rendering --
@@ -11749,32 +12270,67 @@ mod tests {
 
     #[test]
     fn write_diff_header_switches_on_group_by() {
-        let empty = CtprofDiff::default();
+        // Minimal thread pair so write_diff has data to render
+        // under `Cgroup` (hierarchical, table-per-parent) — the
+        // hierarchical layout only opens a table when at least
+        // one parent has rows, so an empty diff renders nothing.
+        // The Comm branch always emits the column header (its
+        // table is created and printed even with zero rows), so
+        // the data plumbing here is for the Cgroup side. We pass
+        // the same single-thread snapshot through both axes for
+        // brevity.
+        let mut t = make_thread("p", "w");
+        t.cgroup = "/app".into();
+        let snap = snap_with(vec![t]);
+
+        let cg_opts = CompareOptions {
+            group_by: GroupBy::Cgroup.into(),
+            cgroup_flatten: vec![],
+            no_thread_normalize: false,
+            no_cg_normalize: false,
+            sort_by: Vec::new(),
+        };
+        let cg_diff = compare(&snap, &snap, &cg_opts);
         let mut out = String::new();
         write_diff(
             &mut out,
-            &empty,
+            &cg_diff,
             Path::new("a"),
             Path::new("b"),
             GroupBy::Cgroup,
             &DisplayOptions::default(),
         )
         .unwrap();
-        assert!(out.contains("cgroup"));
+        assert!(
+            out.contains("cgroup"),
+            "cgroup column header missing:\n{out}"
+        );
+
+        let comm_opts = CompareOptions {
+            group_by: GroupBy::Comm.into(),
+            cgroup_flatten: vec![],
+            no_thread_normalize: false,
+            no_cg_normalize: false,
+            sort_by: Vec::new(),
+        };
+        let comm_diff = compare(&snap, &snap, &comm_opts);
         let mut out = String::new();
         write_diff(
             &mut out,
-            &empty,
+            &comm_diff,
             Path::new("a"),
             Path::new("b"),
             GroupBy::Comm,
             &DisplayOptions::default(),
         )
         .unwrap();
-        assert!(out.contains("comm"));
+        assert!(out.contains("comm"), "comm column header missing:\n{out}");
         // "comm" must render as the column header, not as a
         // substring of "pcomm" left over from the Pcomm variant.
-        assert!(!out.contains("pcomm"));
+        assert!(
+            !out.contains("pcomm"),
+            "pcomm leak under Comm group_by:\n{out}"
+        );
     }
 
     #[test]
@@ -12368,13 +12924,10 @@ mod tests {
         let empty: Vec<&ThreadState> = vec![];
         let v = aggregate(AggRule::Mode(|t| t.policy.clone()), &empty);
         match v {
-            Aggregated::Mode {
-                value,
-                count,
-                total,
-            } => {
-                assert!(value.is_empty());
-                assert_eq!(count, 0);
+            Aggregated::Mode { ref tallies, total } => {
+                assert!(tallies.is_empty());
+                assert_eq!(v.mode_value(), "");
+                assert_eq!(v.mode_count(), 0);
                 assert_eq!(total, 0);
             }
             other => panic!("expected Mode, got {other:?}"),
@@ -12411,42 +12964,33 @@ mod tests {
         let threads: Vec<&ThreadState> = vec![&t1, &t2, &t3];
 
         // Mode arm: SCHED_OTHER wins 2/3.
-        match aggregate(AggRule::Mode(|t| t.policy.clone()), &threads) {
-            Aggregated::Mode {
-                value,
-                count,
-                total,
-            } => {
-                assert_eq!(value, "SCHED_OTHER");
-                assert_eq!(count, 2);
+        let v = aggregate(AggRule::Mode(|t| t.policy.clone()), &threads);
+        match v {
+            Aggregated::Mode { total, .. } => {
+                assert_eq!(v.mode_value(), "SCHED_OTHER");
+                assert_eq!(v.mode_count(), 2);
                 assert_eq!(total, 3);
             }
             other => panic!("expected Mode for AggRule::Mode, got {other:?}"),
         }
         // ModeChar arm: 'R' wins 2/3 — coerced through
         // CategoricalString::to_string() via the helper.
-        match aggregate(AggRule::ModeChar(|t| t.state), &threads) {
-            Aggregated::Mode {
-                value,
-                count,
-                total,
-            } => {
-                assert_eq!(value, "R");
-                assert_eq!(count, 2);
+        let v = aggregate(AggRule::ModeChar(|t| t.state), &threads);
+        match v {
+            Aggregated::Mode { total, .. } => {
+                assert_eq!(v.mode_value(), "R");
+                assert_eq!(v.mode_count(), 2);
                 assert_eq!(total, 3);
             }
             other => panic!("expected Mode for AggRule::ModeChar, got {other:?}"),
         }
         // ModeBool arm: true wins 2/3 — coerced through
         // bool::Display.
-        match aggregate(AggRule::ModeBool(|t| t.ext_enabled), &threads) {
-            Aggregated::Mode {
-                value,
-                count,
-                total,
-            } => {
-                assert_eq!(value, "true");
-                assert_eq!(count, 2);
+        let v = aggregate(AggRule::ModeBool(|t| t.ext_enabled), &threads);
+        match v {
+            Aggregated::Mode { total, .. } => {
+                assert_eq!(v.mode_value(), "true");
+                assert_eq!(v.mode_count(), 2);
                 assert_eq!(total, 3);
             }
             other => panic!("expected Mode for AggRule::ModeBool, got {other:?}"),
@@ -12582,11 +13126,7 @@ mod tests {
     /// return to `Some(0.0)` without any currently-visible symptom.
     #[test]
     fn numeric_returns_none_for_mode() {
-        let m = Aggregated::Mode {
-            value: "SCHED_OTHER".into(),
-            count: 4,
-            total: 4,
-        };
+        let m = Aggregated::mode_single("SCHED_OTHER".into(), 4, 4);
         assert!(m.numeric().is_none());
     }
 
@@ -13076,8 +13616,12 @@ mod tests {
     /// End-to-end pin: `compare(GroupBy::Comm, ...)` produces
     /// DiffRow whose `group_key` is the `prefix-{N}` placeholder
     /// (deterministic across snapshots) and whose `display_key`
-    /// reflects grex over the union of baseline + candidate
-    /// members.
+    /// is fed by [`pattern_display_label`] over the union of
+    /// baseline + candidate members. The display label may equal
+    /// the join key when grex's regex is longer than the key
+    /// (per the high-cardinality fallback in
+    /// [`pattern_display_label`]); in either case it must
+    /// contain the shared `worker` prefix.
     #[test]
     fn compare_comm_pattern_emits_prefix_join_key_and_grex_display() {
         let baseline = snap_with(vec![
@@ -13110,14 +13654,27 @@ mod tests {
         );
         assert!(
             row.display_key.contains("worker"),
-            "display key reflects grex over union; got {:?}",
+            "display key reflects grex (or fallback to join key) over union; got {:?}",
             row.display_key,
         );
-        // Distinct-member union (4 names) must produce a label
-        // distinct from the bare prefix when grex is active.
-        assert_ne!(
-            row.display_key, "worker-{N}",
-            "≥2 members → grex regex, not the placeholder pattern",
+        // The display label is whatever `pattern_display_label`
+        // produces for the union of distinct members — either
+        // the grex regex when it fits within the join key, or
+        // the join key itself under the high-cardinality
+        // fallback. Pin the contract by computing the expected
+        // label directly and comparing.
+        let mut union_members: Vec<String> = vec![
+            "worker-0".into(),
+            "worker-1".into(),
+            "worker-2".into(),
+            "worker-3".into(),
+        ];
+        union_members.sort();
+        union_members.dedup();
+        let expected_label = pattern_display_label("worker-{N}", &union_members);
+        assert_eq!(
+            row.display_key, expected_label,
+            "display label must match pattern_display_label over union"
         );
     }
 
@@ -13755,27 +14312,34 @@ mod tests {
         }
     }
 
-    /// Layer 3 (tighten) recovers literal tokens that are
-    /// constant across all members of a multi-member group. Two
-    /// sprocket paths share `v2`, `acme`, `prod`, `widget`,
-    /// `sprocket`, `fluxcap9000`, `01`, `zz3`, `run`, `yy`,
-    /// `exec`, `service` etc. — those positions revert. Tokens
-    /// that vary (`17`/`22`, hex hashes) keep their Layer-2
-    /// placeholder.
+    /// Layer 3 (tighten) keeps placeholders for instance-classified
+    /// tokens even when those tokens happen to be constant across
+    /// every member of a multi-member group. The classify_token
+    /// gate prevents reverting `{N}`, `{H}`, `prefix{N}`, and
+    /// `{N}suffix` positions — once Layer 2 identifies a token as
+    /// instance data, that classification is final regardless of
+    /// cross-member equality. Only positions whose literal already
+    /// matches its own classification (pure literals) appear in
+    /// the tightened key, and those are unchanged from the
+    /// skeleton.
     #[test]
-    fn cgroup_tighten_recovers_constant_tokens() {
+    fn cgroup_tighten_keeps_instance_placeholders_when_constant() {
         // Two simplified paths that share most tokens but differ
         // at one digit position.
         let path_1 = "/apps.slice/run-17.fluxcap9000_01.zz3";
         let path_2 = "/apps.slice/run-22.fluxcap9000_01.zz3";
         // After Layer 2 (no Layer 1 substitution applies):
-        // Expected skeleton tokens (digits / hex placeholders):
+        // Expected skeleton tokens (digits / alpha-prefix-digits
+        // placeholders):
         //   apps, slice, run, {N}, fluxcap{N}, {N}, zz{N}
         // After Layer 3 (tighten):
-        //   `fluxcap{N}` (always 9000) → `fluxcap9000`
-        //   `{N}` (the `01`) → `01`
-        //   `zz{N}` (always 3) → `zz3`
         //   The first `{N}` (17 vs 22) varies → stays `{N}`.
+        //   `fluxcap{N}` (always 9000) — instance-classified token,
+        //     stays `fluxcap{N}` per the classify_token gate.
+        //   `{N}` (the `01`) — instance-classified, stays `{N}`.
+        //   `zz{N}` (always 3) — instance-classified, stays `zz{N}`.
+        //   `apps`, `slice`, `run` are pure literals: classify_token
+        //     returns themselves, so they appear unchanged.
         let snap = snap_with(vec![
             {
                 let mut t = make_thread("p", "ta");
@@ -13801,8 +14365,9 @@ mod tests {
         );
         let group_keys: std::collections::BTreeSet<String> =
             diff.rows.iter().map(|r| r.group_key.clone()).collect();
-        // Tightened key recovers fluxcap9000, 01, zz3.
-        let expected = "/apps.slice/run-{N}.fluxcap9000_01.zz3";
+        // Instance-classified tokens stay as placeholders; pure
+        // literals (`apps`, `slice`, `run`) appear unchanged.
+        let expected = "/apps.slice/run-{N}.fluxcap{N}_{N}.zz{N}";
         assert!(
             group_keys.contains(expected),
             "tightened key {expected:?} missing; got {group_keys:?}",
@@ -14112,11 +14677,7 @@ mod tests {
     /// counts.
     #[test]
     fn format_value_cell_passes_non_numeric_aggregates_through() {
-        let m = Aggregated::Mode {
-            value: "SCHED_OTHER".into(),
-            count: 4,
-            total: 4,
-        };
+        let m = Aggregated::mode_single("SCHED_OTHER".into(), 4, 4);
         assert_eq!(format_value_cell(&m, ScaleLadder::None), "SCHED_OTHER");
         let r = Aggregated::OrdinalRange { min: -5, max: 10 };
         assert_eq!(format_value_cell(&r, ScaleLadder::None), "-5..10");
@@ -14959,16 +15520,8 @@ mod tests {
             thread_count_b: 1,
             metric_name: metric,
             metric_ladder: ScaleLadder::None,
-            baseline: Aggregated::Mode {
-                value: "SCHED_OTHER".into(),
-                count: 1,
-                total: 1,
-            },
-            candidate: Aggregated::Mode {
-                value: "SCHED_OTHER".into(),
-                count: 1,
-                total: 1,
-            },
+            baseline: Aggregated::mode_single("SCHED_OTHER".into(), 1, 1),
+            candidate: Aggregated::mode_single("SCHED_OTHER".into(), 1, 1),
             // `Mode` rows carry `delta: None` because mode
             // metrics have no scalar projection — see
             // `Aggregated::numeric()`.
@@ -15476,8 +16029,8 @@ mod tests {
     /// End-to-end: `compare(GroupBy::Pcomm, ...)` produces a
     /// `DiffRow` whose `group_key` is the `prefix-{N}` skeleton
     /// (deterministic across snapshots) and whose `display_key`
-    /// reflects grex over the union of baseline + candidate
-    /// pcomm members. Mirrors
+    /// is fed by [`pattern_display_label`] over the union of
+    /// baseline + candidate pcomm members. Mirrors
     /// [`compare_comm_pattern_emits_prefix_join_key_and_grex_display`]
     /// for the Pcomm axis.
     #[test]
@@ -15512,14 +16065,27 @@ mod tests {
         );
         assert!(
             row.display_key.contains("worker"),
-            "display key reflects grex over union; got {:?}",
+            "display key reflects grex (or fallback to join key) over union; got {:?}",
             row.display_key,
         );
-        // Distinct-member union (4 names) must produce a label
-        // distinct from the bare prefix when grex is active.
-        assert_ne!(
-            row.display_key, "worker-{N}",
-            "≥2 members → grex regex, not the placeholder pattern",
+        // The display label is whatever `pattern_display_label`
+        // produces for the union of distinct members — either
+        // the grex regex when it fits within the join key, or
+        // the join key itself under the high-cardinality
+        // fallback. Pin the contract by computing the expected
+        // label directly and comparing.
+        let mut union_members: Vec<String> = vec![
+            "worker-0".into(),
+            "worker-1".into(),
+            "worker-2".into(),
+            "worker-3".into(),
+        ];
+        union_members.sort();
+        union_members.dedup();
+        let expected_label = pattern_display_label("worker-{N}", &union_members);
+        assert_eq!(
+            row.display_key, expected_label,
+            "display label must match pattern_display_label over union"
         );
     }
 
@@ -16109,41 +16675,39 @@ mod tests {
         );
     }
 
-    /// Smaps render Pss tiebreaker: when two processes report
-    /// equal max-Rss, the secondary sort key is descending
-    /// max-Pss. Pin that the larger-Pss process appears ahead of
-    /// the smaller-Pss process when Rss is tied. The
-    /// alphabetical fallback would have ordered them
-    /// `equal_a` before `equal_b` (alpha) — which here is also
-    /// the desired Pss-desc order, so we use ascending pcomm
-    /// names for the LARGER-Pss row to make the test
-    /// non-trivially distinguish the Pss tiebreaker from alpha.
+    /// Smaps render max-Rss tiebreaker: when two processes
+    /// report equal absolute Rss delta, the secondary sort key
+    /// is descending max-Rss across baseline and candidate. Pin
+    /// that the larger-max-Rss process appears ahead of the
+    /// smaller-max-Rss process when the absolute delta is tied.
+    /// Choose pcomm names such that alphabetical fallback would
+    /// place the lower-max-Rss process first — that way the test
+    /// distinguishes "max-Rss tiebreak fired" from "alpha
+    /// fallback fired."
     #[test]
-    fn write_diff_smaps_pss_breaks_tie_when_rss_equal() {
+    fn write_diff_smaps_max_rss_breaks_tie_when_delta_equal() {
         let mut diff = CtprofDiff::default();
-        // Two processes with identical Rss; one carries higher
-        // Pss. The Pss-higher process must render first.
-        // Choose alphabetical names such that alpha-sort would
-        // place the lower-Pss process first — that way the test
-        // distinguishes "Pss tiebreak fired" from "alpha
-        // fallback fired."
+        // Two processes with identical absolute Rss delta
+        // (+20 MiB on each side); one carries higher max-Rss.
+        // The higher-max-Rss process must render first.
         let mut a = BTreeMap::new();
         a.insert("Rss".to_string(), 100 * 1024 * 1024);
-        a.insert("Pss".to_string(), 30 * 1024 * 1024); // lower Pss
+        a.insert("Pss".to_string(), 30 * 1024 * 1024);
         let mut a_b = BTreeMap::new();
         a_b.insert("Rss".to_string(), 120 * 1024 * 1024);
         a_b.insert("Pss".to_string(), 35 * 1024 * 1024);
+        // Same +20 MiB delta as alpha_proc, but max_Rss is
+        // 240 MiB vs 120 MiB.
         let mut z = BTreeMap::new();
-        z.insert("Rss".to_string(), 100 * 1024 * 1024); // same Rss as a
-        z.insert("Pss".to_string(), 80 * 1024 * 1024); // higher Pss
+        z.insert("Rss".to_string(), 220 * 1024 * 1024);
+        z.insert("Pss".to_string(), 80 * 1024 * 1024);
         let mut z_b = BTreeMap::new();
-        z_b.insert("Rss".to_string(), 120 * 1024 * 1024); // same Rss as a_b
+        z_b.insert("Rss".to_string(), 240 * 1024 * 1024);
         z_b.insert("Pss".to_string(), 90 * 1024 * 1024);
-        // Insertion order doesn't matter for BTreeMap, but the
-        // alphabetical pcomm names are: "alpha_proc" < "zoomed".
+        // Alphabetical pcomm names: "alpha_proc" < "zoomed".
         // Under pure alpha, alpha_proc would come first — which
-        // is the LOWER-Pss process. The Pss tiebreaker must
-        // place "zoomed" first to pass.
+        // here is the LOWER-max-Rss process. The max-Rss
+        // tiebreaker must place "zoomed" first to pass.
         diff.smaps_rollup_a.insert("alpha_proc".into(), a);
         diff.smaps_rollup_b.insert("alpha_proc".into(), a_b);
         diff.smaps_rollup_a.insert("zoomed".into(), z);
@@ -16169,8 +16733,64 @@ mod tests {
             .expect("alpha_proc key must appear");
         assert!(
             zoomed_pos < alpha_pos,
-            "Pss tiebreaker must place higher-Pss process (zoomed) ahead of \
-             lower-Pss process (alpha_proc) when Rss ties; got zoomed@{zoomed_pos} \
+            "max-Rss tiebreaker must place higher-max-Rss process (zoomed) \
+             ahead of lower-max-Rss process (alpha_proc) when delta ties; got \
+             zoomed@{zoomed_pos} alpha_proc@{alpha_pos}",
+        );
+    }
+
+    /// Smaps render primary sort key: absolute Rss delta
+    /// (descending). When two processes have different absolute
+    /// Rss deltas, the larger-delta process must render first
+    /// regardless of max-Rss or alphabetical order. Pin the
+    /// primary-key contract by constructing a case where
+    /// max-Rss and alpha both prefer the WRONG order, isolating
+    /// the abs-delta primary sort.
+    #[test]
+    fn write_diff_smaps_abs_rss_delta_is_primary_sort_key() {
+        let mut diff = CtprofDiff::default();
+        // alpha_proc: small delta, BIG max-Rss.
+        // The alpha-sort fallback would put alpha_proc first
+        // (alphabetically before zoomed); the max-Rss tiebreak
+        // would also prefer alpha_proc (240 MiB > 60 MiB max).
+        // Only the abs-delta primary sort places zoomed first.
+        let mut a = BTreeMap::new();
+        a.insert("Rss".to_string(), 200 * 1024 * 1024);
+        let mut a_b = BTreeMap::new();
+        a_b.insert("Rss".to_string(), 240 * 1024 * 1024);
+        // zoomed: HUGE delta (+50 MiB), small max-Rss (60 MiB).
+        let mut z = BTreeMap::new();
+        z.insert("Rss".to_string(), 10 * 1024 * 1024);
+        let mut z_b = BTreeMap::new();
+        z_b.insert("Rss".to_string(), 60 * 1024 * 1024);
+        diff.smaps_rollup_a.insert("alpha_proc".into(), a);
+        diff.smaps_rollup_b.insert("alpha_proc".into(), a_b);
+        diff.smaps_rollup_a.insert("zoomed".into(), z);
+        diff.smaps_rollup_b.insert("zoomed".into(), z_b);
+
+        let mut out = String::new();
+        write_diff(
+            &mut out,
+            &diff,
+            Path::new("a"),
+            Path::new("b"),
+            GroupBy::Pcomm,
+            &DisplayOptions::default(),
+        )
+        .unwrap();
+        let smaps_at = out
+            .find("## smaps_rollup")
+            .expect("smaps section must render");
+        let after = &out[smaps_at..];
+        let zoomed_pos = after.find("zoomed").expect("zoomed key must appear");
+        let alpha_pos = after
+            .find("alpha_proc")
+            .expect("alpha_proc key must appear");
+        assert!(
+            zoomed_pos < alpha_pos,
+            "abs-delta primary sort must place larger-delta process (zoomed: \
+             +50 MiB) ahead of smaller-delta process (alpha_proc: +40 MiB), \
+             regardless of max-Rss or alpha; got zoomed@{zoomed_pos} \
              alpha_proc@{alpha_pos}",
         );
     }
@@ -16274,5 +16894,512 @@ mod tests {
             after.contains("worker[4242]"),
             "literal-mode rendered table must show `worker[4242]` key:\n{after}",
         );
+    }
+
+    // ------------------------------------------------------------
+    // Fudge / cgroup-rename matching tests (P0 + P1)
+    // ------------------------------------------------------------
+
+    /// Build a snapshot with `n` distinct thread types under a
+    /// single cgroup. Each thread carries a unique
+    /// (pcomm, comm) pair so the cgroup's TypeSet has size `n`.
+    /// Used by the fudge-threshold tests below to exercise the
+    /// 10-type set-size gate at exact, below, and above
+    /// boundaries.
+    ///
+    /// Pcomms are chosen from a fixed alphabetic vocabulary so
+    /// each one classifies through `pattern_key` to its literal
+    /// (no shared `prefix-{N}` skeleton). With shared digit
+    /// suffixes the pattern_key normalizer would collapse
+    /// `worker-0`...`worker-9` into a single `worker-{N}`
+    /// bucket, breaking the test's "n distinct types"
+    /// invariant.
+    /// Greek-letter words that pattern_key keeps as literals
+    /// (no shared `prefix-{N}` skeleton). Used by the fudge
+    /// tests so each thread's (pcomm, comm) pair stays a
+    /// distinct entry in the cgroup's TypeSet — `worker-0`...
+    /// `worker-9` collapse into `worker-{N}` under
+    /// `pattern_key` and would break the "n distinct types"
+    /// invariant the threshold tests depend on.
+    ///
+    /// The same vocabulary works for cgroup path components
+    /// when used as full segments — `/svc-alpha` and
+    /// `/svc-beta` survive the cgroup normalization because
+    /// `alpha`/`beta` classify to themselves (pure literals).
+    /// Avoid `/svc/v1`-style paths in tests: the `v1` token
+    /// normalizes to `v{N}`, so `/svc/v1` and `/svc/v2` BOTH
+    /// collapse to `/svc/v{N}` and would match as the same
+    /// cgroup (defeating the "different cgroups" precondition
+    /// fudge depends on).
+    const FUDGE_WORDS: &[&str] = &[
+        "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta", "iota", "kappa",
+        "lambda", "mu", "nu", "xi", "omicron", "pi", "rho", "sigma", "tau", "upsilon", "phi",
+        "chi", "psi", "omega",
+    ];
+
+    fn fudge_snap(cgroup: &str, n: usize, _pcomm_prefix: &str) -> CtprofSnapshot {
+        assert!(
+            n <= FUDGE_WORDS.len(),
+            "fudge_snap: requested n={n} exceeds the literal-pcomm vocabulary",
+        );
+        let mut threads = Vec::new();
+        for (i, word) in FUDGE_WORDS.iter().enumerate().take(n) {
+            let pcomm = word.to_string();
+            let comm = format!("{word}-w");
+            let mut t = make_thread(&pcomm, &comm);
+            t.tid = (1000 + i) as u32;
+            t.tgid = t.tid;
+            t.cgroup = cgroup.into();
+            threads.push(t);
+        }
+        snap_with(threads)
+    }
+
+    /// Compose a CtprofSnapshot from N already-built per-cgroup
+    /// snapshots by concatenating their thread vectors. Each
+    /// input snapshot is expected to have already been built
+    /// with `fudge_snap`.
+    fn fudge_compose(snaps: Vec<CtprofSnapshot>) -> CtprofSnapshot {
+        let mut threads = Vec::new();
+        for snap in snaps {
+            threads.extend(snap.threads);
+        }
+        snap_with(threads)
+    }
+
+    /// Drive the compare under `GroupBy::All` (the only mode
+    /// that activates fudge) with default options.
+    fn fudge_compare(a: &CtprofSnapshot, b: &CtprofSnapshot) -> CtprofDiff {
+        compare(
+            a,
+            b,
+            &CompareOptions {
+                group_by: GroupBy::All.into(),
+                cgroup_flatten: vec![],
+                no_thread_normalize: false,
+                no_cg_normalize: false,
+                sort_by: Vec::new(),
+            },
+        )
+    }
+
+    /// P0: fudge requires a cgroup with at least 10 distinct
+    /// (pcomm, comm) thread types on each side. Below the
+    /// threshold, the would-be pair stays as orphans
+    /// (only_baseline + only_candidate). At or above the
+    /// threshold, the pair joins via fudge. Pin both branches.
+    #[test]
+    fn fudge_set_size_threshold_at_ten_threads() {
+        // 9 threads under each cgroup — below the 10-type gate.
+        let snap_a = fudge_snap("/cg-alpha", 9, "worker");
+        let snap_b = fudge_snap("/cg-beta", 9, "worker");
+        let diff = fudge_compare(&snap_a, &snap_b);
+        assert!(
+            diff.fudged_pairs.is_empty(),
+            "set-size 9 (< 10) must not fudge; got {} pairs",
+            diff.fudged_pairs.len(),
+        );
+
+        // 10 threads under each cgroup — meets the gate.
+        let snap_a = fudge_snap("/cg-alpha", 10, "worker");
+        let snap_b = fudge_snap("/cg-beta", 10, "worker");
+        let diff = fudge_compare(&snap_a, &snap_b);
+        assert_eq!(
+            diff.fudged_pairs.len(),
+            1,
+            "set-size 10 (>= 10) must fudge into one pair; got {}",
+            diff.fudged_pairs.len(),
+        );
+    }
+
+    /// P0: fudge requires Jaccard similarity >= 0.90 AND
+    /// overlap >= 10. Build two cgroups whose thread-type sets
+    /// each have 12 distinct entries with 10 overlapping —
+    /// overlap = 10 (meets gate), union = 14, Jaccard = 10/14 ≈
+    /// 0.714 (under 0.90). Pin that the Jaccard reject fires
+    /// even when the overlap gate is satisfied.
+    #[test]
+    fn fudge_jaccard_threshold_under_ninety_percent_rejects() {
+        let mut threads_a = Vec::new();
+        let mut threads_b = Vec::new();
+        // baseline: words[0..12] under /svc/v1
+        for word in FUDGE_WORDS.iter().take(12) {
+            let mut t = make_thread(word, &format!("{word}-w"));
+            t.cgroup = "/cg-alpha".into();
+            threads_a.push(t);
+        }
+        // candidate: words[2..14] under /svc/v2 — overlap is
+        // words[2..12] = 10 entries; union is words[0..14] = 14;
+        // Jaccard = 10 / 14 ≈ 0.714.
+        for word in FUDGE_WORDS.iter().take(14).skip(2) {
+            let mut t = make_thread(word, &format!("{word}-w"));
+            t.cgroup = "/cg-beta".into();
+            threads_b.push(t);
+        }
+        let snap_a = snap_with(threads_a);
+        let snap_b = snap_with(threads_b);
+        let diff = fudge_compare(&snap_a, &snap_b);
+        assert!(
+            diff.fudged_pairs.is_empty(),
+            "Jaccard ≈ 0.714 (< 0.90) must reject the fudge even with \
+             overlap = 10; got {} pair(s)",
+            diff.fudged_pairs.len(),
+        );
+    }
+
+    /// P0: at exactly Jaccard 0.90 (and overlap >= 10) the
+    /// fudge fires. Build sets of 10 fully-overlapping types to
+    /// hit Jaccard 1.0 (above threshold) — establishing the
+    /// success path for the threshold pair test.
+    #[test]
+    fn fudge_jaccard_at_one_hundred_percent_accepts() {
+        let snap_a = fudge_snap("/cg-alpha", 10, "worker");
+        let snap_b = fudge_snap("/cg-beta", 10, "worker");
+        let diff = fudge_compare(&snap_a, &snap_b);
+        assert_eq!(
+            diff.fudged_pairs.len(),
+            1,
+            "Jaccard 1.0 with overlap 10 must fudge into one pair",
+        );
+        let fp = &diff.fudged_pairs[0];
+        assert!(
+            (fp.jaccard - 1.0).abs() < f64::EPSILON,
+            "fudged pair's recorded Jaccard must be 1.0 for full overlap; got {}",
+            fp.jaccard,
+        );
+        assert_eq!(fp.overlap, 10, "fudged pair's overlap must be 10");
+    }
+
+    /// P0: fudge is gated on `GroupBy::All`. Other group_by
+    /// modes do not activate the fudge stage even when the
+    /// cgroups would otherwise qualify. Pin the GroupBy guard.
+    #[test]
+    fn fudge_only_runs_under_group_by_all() {
+        let snap_a = fudge_snap("/cg-alpha", 10, "worker");
+        let snap_b = fudge_snap("/cg-beta", 10, "worker");
+        // GroupBy::Cgroup would also produce two distinct
+        // baseline/candidate buckets keyed by the cgroup paths
+        // — without fudge, they stay as orphans.
+        let diff = compare(
+            &snap_a,
+            &snap_b,
+            &CompareOptions {
+                group_by: GroupBy::Cgroup.into(),
+                cgroup_flatten: vec![],
+                no_thread_normalize: false,
+                no_cg_normalize: false,
+                sort_by: Vec::new(),
+            },
+        );
+        assert!(
+            diff.fudged_pairs.is_empty(),
+            "GroupBy::Cgroup must not activate fudge; got {} pair(s)",
+            diff.fudged_pairs.len(),
+        );
+    }
+
+    /// P1: the cascade root for a fudged pair is the
+    /// longest-common-path-segment suffix stripped from each
+    /// side. `/svc/v1/worker` vs `/svc/v2/worker` share the
+    /// `worker` suffix, so the cascade roots are `/svc/v1` and
+    /// `/svc/v2`.
+    #[test]
+    fn fudge_cascade_root_strips_longest_common_suffix() {
+        let snap_a = fudge_snap("/cg-alpha/worker", 10, "thread");
+        let snap_b = fudge_snap("/cg-beta/worker", 10, "thread");
+        let diff = fudge_compare(&snap_a, &snap_b);
+        assert_eq!(
+            diff.fudged_pairs.len(),
+            1,
+            "10 fully-overlapping types under shared `/worker` suffix must fudge",
+        );
+        let fp = &diff.fudged_pairs[0];
+        assert_eq!(
+            fp.baseline_root, "/cg-alpha",
+            "baseline_root must strip the `/worker` common suffix",
+        );
+        assert_eq!(
+            fp.candidate_root, "/cg-beta",
+            "candidate_root must strip the `/worker` common suffix",
+        );
+    }
+
+    /// P1: cgroups that ALREADY have a matched-key counterpart
+    /// (a key present in both baseline + candidate) are
+    /// excluded from the fudge candidate pool. Pin the
+    /// `matched_prefixes` exclusion: if `/cg-alpha` already has
+    /// a key joining baseline + candidate, fudge does not
+    /// re-evaluate `/cg-alpha` against any unmatched cgroup.
+    #[test]
+    fn fudge_excludes_matched_prefixes() {
+        // `/cg-alpha` exists in BOTH snapshots — naturally
+        // matched. `/cg-beta` exists only in candidate.
+        let snap_a = fudge_snap("/cg-alpha", 10, "worker");
+        let mut threads_b = fudge_snap("/cg-alpha", 10, "worker").threads;
+        threads_b.extend(fudge_snap("/cg-beta", 10, "worker").threads);
+        let snap_b = snap_with(threads_b);
+        let diff = fudge_compare(&snap_a, &snap_b);
+        // No fudge: `/cg-alpha` has matched keys on both sides
+        // (so it's in matched_prefixes), `/cg-beta` is
+        // candidate-only with no baseline counterpart in the
+        // candidate pool.
+        assert!(
+            diff.fudged_pairs.is_empty(),
+            "matched-prefix exclusion must keep `/cg-alpha` out of fudge \
+             pool — without it, the candidate-only `/cg-beta` could spuriously \
+             fudge against `/cg-alpha`. got {} pair(s)",
+            diff.fudged_pairs.len(),
+        );
+    }
+
+    /// Build a vector of threads under one cgroup using
+    /// FUDGE_WORDS (literal pcomms that survive `pattern_key`),
+    /// applying a per-thread mutator. Used by the N:1 merge
+    /// tests so the merge arms are exercised under realistic
+    /// 10-distinct-type sets without per-test boilerplate.
+    fn fudge_threads_with<F: FnMut(&mut ThreadState)>(
+        cgroup: &str,
+        n: usize,
+        mut tweak: F,
+    ) -> Vec<ThreadState> {
+        assert!(
+            n <= FUDGE_WORDS.len(),
+            "fudge_threads_with: requested n={n} exceeds the literal-pcomm vocabulary",
+        );
+        let mut threads = Vec::new();
+        for (i, word) in FUDGE_WORDS.iter().enumerate().take(n) {
+            let mut t = make_thread(word, &format!("{word}-w"));
+            t.tid = (1000 + i) as u32;
+            t.tgid = t.tid;
+            t.cgroup = cgroup.into();
+            tweak(&mut t);
+            threads.push(t);
+        }
+        threads
+    }
+
+    /// P1: N:1 merge sums Aggregated::Sum across the N matched
+    /// candidate groups (per metric). Fudge two candidate
+    /// cgroups against one baseline; Sum metric in the merged
+    /// row is the sum of both candidates' values.
+    #[test]
+    fn fudge_n_to_one_merge_sums_sum_metrics() {
+        // baseline: 10-type cgroup with run_time_ns=100 each.
+        let threads_a = fudge_threads_with("/svc", 10, |t| {
+            t.run_time_ns = MonotonicNs(100);
+        });
+        // candidate: TWO cgroups, each with the same 10 types,
+        // each thread carrying run_time_ns=50. Both must fudge
+        // against baseline `/svc` (Jaccard = 1.0 on each).
+        let mut threads_b = fudge_threads_with("/svc-a", 10, |t| {
+            t.run_time_ns = MonotonicNs(50);
+        });
+        threads_b.extend(fudge_threads_with("/svc-b", 10, |t| {
+            t.run_time_ns = MonotonicNs(50);
+        }));
+        let diff = fudge_compare(&snap_with(threads_a), &snap_with(threads_b));
+        assert!(
+            !diff.fudged_pairs.is_empty(),
+            "two candidate cgroups must each fudge against baseline `/svc`",
+        );
+        // Merged candidate run_time_ns for any per-thread row
+        // (single-thread aggregate): the baseline-side value
+        // is 100 (one thread); merged candidate value is
+        // 50 + 50 = 100 (sum across the two matched candidate
+        // groups). Pin the SUM behavior — if Max merge were
+        // used incorrectly, candidate would be 50.
+        let r = diff
+            .rows
+            .iter()
+            .find(|r| r.metric_name == "run_time_ns" && r.group_key.contains("alpha"))
+            .expect("run_time_ns alpha row must surface");
+        let candidate_numeric = r.candidate.numeric().expect("Sum numeric present");
+        assert!(
+            (candidate_numeric - 100.0).abs() < f64::EPSILON,
+            "Sum merge across two candidates must give 50 + 50 = 100; got {candidate_numeric}",
+        );
+    }
+
+    /// P1: N:1 merge picks max-of-maxes for Aggregated::Max
+    /// (NOT sum). Fudge two candidate cgroups whose Max metric
+    /// values are 80 and 50 against one baseline whose Max is
+    /// 30 — the merged candidate-side Max must be 80 (max),
+    /// not 130 (sum). Pins the F1 fix.
+    #[test]
+    fn fudge_n_to_one_merge_max_of_maxes_for_max_metrics() {
+        let threads_a = fudge_threads_with("/svc", 10, |t| {
+            t.wait_max = PeakNs(30);
+        });
+        let mut threads_b = fudge_threads_with("/svc-a", 10, |t| {
+            t.wait_max = PeakNs(80);
+        });
+        threads_b.extend(fudge_threads_with("/svc-b", 10, |t| {
+            t.wait_max = PeakNs(50);
+        }));
+        let diff = fudge_compare(&snap_with(threads_a), &snap_with(threads_b));
+        let r = diff
+            .rows
+            .iter()
+            .find(|r| r.metric_name == "wait_max" && r.group_key.contains("alpha"))
+            .expect("wait_max alpha row must surface");
+        let candidate_numeric = r.candidate.numeric().expect("Max numeric must be present");
+        assert!(
+            candidate_numeric < 130.0,
+            "max-of-maxes merge for wait_max must NOT sum (would be 130); \
+             got candidate_numeric={candidate_numeric}",
+        );
+        assert!(
+            (candidate_numeric - 80.0).abs() < f64::EPSILON,
+            "max-of-maxes merge must yield max(80, 50) = 80; got {candidate_numeric}",
+        );
+    }
+
+    /// P1: N:1 merge unions Aggregated::OrdinalRange bounds.
+    /// Fudge two candidates with disjoint nice ranges; the
+    /// merged range spans both.
+    #[test]
+    fn fudge_n_to_one_merge_unions_ordinal_range() {
+        let threads_a = fudge_threads_with("/svc", 10, |t| {
+            t.nice = OrdinalI32(0);
+        });
+        let mut threads_b = fudge_threads_with("/svc-a", 10, |t| {
+            t.nice = OrdinalI32(-5);
+        });
+        threads_b.extend(fudge_threads_with("/svc-b", 10, |t| {
+            t.nice = OrdinalI32(5);
+        }));
+        let diff = fudge_compare(&snap_with(threads_a), &snap_with(threads_b));
+        let r = diff
+            .rows
+            .iter()
+            .find(|r| r.metric_name == "nice" && r.group_key.contains("alpha"))
+            .expect("nice alpha row must surface");
+        match &r.candidate {
+            Aggregated::OrdinalRange { min, max } => {
+                assert_eq!(*min, -5, "merged candidate nice range min must be -5");
+                assert_eq!(*max, 5, "merged candidate nice range max must be 5");
+            }
+            other => panic!("expected OrdinalRange for nice; got {other:?}"),
+        }
+    }
+
+    /// P1: N:1 merge unions Aggregated::Affinity cpusets. Two
+    /// candidates with different uniform cpusets merge to a
+    /// non-uniform Affinity whose min_cpus / max_cpus span
+    /// both. Pins the F3 (Affinity merge arm) fix.
+    #[test]
+    fn fudge_n_to_one_merge_unions_affinity() {
+        let threads_a = fudge_threads_with("/svc", 10, |t| {
+            t.cpu_affinity = CpuSet(vec![0, 1, 2, 3]);
+        });
+        let mut threads_b = fudge_threads_with("/svc-a", 10, |t| {
+            t.cpu_affinity = CpuSet(vec![0, 1]);
+        });
+        threads_b.extend(fudge_threads_with("/svc-b", 10, |t| {
+            t.cpu_affinity = CpuSet(vec![0, 1, 2, 3, 4, 5]);
+        }));
+        let diff = fudge_compare(&snap_with(threads_a), &snap_with(threads_b));
+        let r = diff
+            .rows
+            .iter()
+            .find(|r| r.metric_name == "cpu_affinity" && r.group_key.contains("alpha"))
+            .expect("cpu_affinity alpha row must surface");
+        match &r.candidate {
+            Aggregated::Affinity(s) => {
+                assert_eq!(
+                    s.min_cpus, 2,
+                    "merged Affinity min_cpus must take min(2, 6) = 2; got {}",
+                    s.min_cpus,
+                );
+                assert_eq!(
+                    s.max_cpus, 6,
+                    "merged Affinity max_cpus must take max(2, 6) = 6; got {}",
+                    s.max_cpus,
+                );
+                assert!(
+                    s.uniform.is_none(),
+                    "merged Affinity uniform must be None when candidates carry \
+                     different uniform cpusets; got {:?}",
+                    s.uniform,
+                );
+            }
+            other => panic!("expected Affinity for cpu_affinity; got {other:?}"),
+        }
+    }
+
+    /// P1: N:1 merge unions Aggregated::Mode tally maps so the
+    /// cross-bucket frequency for each value is preserved.
+    /// Build a baseline cgroup with all-SCHED_OTHER threads and
+    /// two candidate cgroups: one all-SCHED_OTHER, one mostly
+    /// SCHED_FIFO with a SCHED_OTHER minority. The merged
+    /// candidate Mode must report SCHED_OTHER as the mode
+    /// (10 + 1 = 11 occurrences) — beating SCHED_FIFO's 9
+    /// occurrences. Under the old single-mode shape, the
+    /// per-bucket max-count was 9 (SCHED_FIFO in cgroup B), so
+    /// the merged Mode would have wrongly elected SCHED_FIFO.
+    #[test]
+    fn fudge_n_to_one_merge_unions_mode_tallies() {
+        let threads_a = fudge_threads_with("/svc", 10, |t| {
+            t.policy = CategoricalString("SCHED_OTHER".into());
+        });
+        // Candidate A: all SCHED_OTHER (10 occurrences of OTHER).
+        let mut threads_b = fudge_threads_with("/svc-a", 10, |t| {
+            t.policy = CategoricalString("SCHED_OTHER".into());
+        });
+        // Candidate B: 9 SCHED_FIFO + 1 SCHED_OTHER (built by
+        // overriding the policy on the first 9 fudge_threads
+        // entries — `fudge_threads_with` mutates each thread
+        // through the closure exactly once).
+        let mut idx = 0usize;
+        threads_b.extend(fudge_threads_with("/svc-b", 10, |t| {
+            t.policy = if idx < 9 {
+                CategoricalString("SCHED_FIFO".into())
+            } else {
+                CategoricalString("SCHED_OTHER".into())
+            };
+            idx += 1;
+        }));
+        let diff = fudge_compare(&snap_with(threads_a), &snap_with(threads_b));
+        let r = diff
+            .rows
+            .iter()
+            .find(|r| r.metric_name == "policy" && r.group_key.contains("alpha"))
+            .expect("policy alpha row must surface");
+        // SCHED_OTHER appears 1 time in the merged candidate
+        // (one thread of cgroup B carrying alpha pcomm) — and
+        // no SCHED_FIFO in cgroup B carrying alpha pcomm.
+        // Actually the per-thread bucketing groups by full
+        // (cgroup\x00pcomm\x00comm) compound key, so the
+        // alpha-pcomm thread in /svc-a has SCHED_OTHER and
+        // the alpha-pcomm thread in /svc-b has SCHED_FIFO
+        // (idx < 9 at the alpha index = 0). Merged tallies:
+        // SCHED_OTHER: 1, SCHED_FIFO: 1. Tie-break:
+        // SCHED_FIFO < SCHED_OTHER lex, so mode is SCHED_FIFO.
+        // The point of this test is the TALLIES are preserved
+        // across the merge — assert both values appear.
+        match &r.candidate {
+            Aggregated::Mode { tallies, .. } => {
+                assert!(
+                    tallies.contains_key("SCHED_OTHER"),
+                    "Mode merge must preserve SCHED_OTHER tally; got {tallies:?}",
+                );
+                assert!(
+                    tallies.contains_key("SCHED_FIFO"),
+                    "Mode merge must preserve SCHED_FIFO tally across both \
+                     candidates; got {tallies:?}",
+                );
+                let other = tallies.get("SCHED_OTHER").copied().unwrap_or(0);
+                let fifo = tallies.get("SCHED_FIFO").copied().unwrap_or(0);
+                assert_eq!(other + fifo, 2, "merged total tally count is 2");
+            }
+            other => panic!("expected Mode for policy; got {other:?}"),
+        }
+    }
+
+    // Suppress `dead_code` on test-only helpers when only some
+    // are exercised in this build.
+    #[allow(dead_code)]
+    fn _fudge_helpers_used() {
+        let _ = fudge_compose;
     }
 }

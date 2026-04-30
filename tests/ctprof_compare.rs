@@ -501,6 +501,10 @@ fn ctprof_metrics_accessors_read_every_variant() {
     // rather than a false pass.
     type MetricSetter = fn(&mut ThreadState);
     let cases: &[(&str, MetricSetter)] = &[
+        // thread_count is a structural counter: the SumCount rule
+        // ignores the thread state and contributes 1 per thread.
+        // No field to set — single-thread aggregate sums to 1.
+        ("thread_count", |_| {}),
         // Mode rules — distinct strings per metric.
         ("policy", |t| t.policy = "SCHED_RR".into()),
         ("state", |t| t.state = 'R'),
@@ -712,6 +716,10 @@ fn ctprof_metrics_accessors_read_every_variant() {
     // between this map and the setter table surfaces as a
     // wrong-value assertion failure naming the metric.
     let expected_scalar: std::collections::BTreeMap<&str, u64> = [
+        // thread_count is the structural population counter:
+        // SumCount rule contributes 1 per thread, so a
+        // single-thread aggregate sums to 1.
+        ("thread_count", 1),
         // Sum
         ("run_time_ns", 100),
         ("wait_time_ns", 101),
@@ -879,11 +887,7 @@ fn ctprof_metrics_accessors_read_every_variant() {
             }
             (
                 AggRule::Mode(_) | AggRule::ModeChar(_) | AggRule::ModeBool(_),
-                Aggregated::Mode {
-                    value,
-                    count,
-                    total,
-                },
+                Aggregated::Mode { total, .. },
             ) => {
                 let expected: &str = match *name {
                     "policy" => "SCHED_RR",
@@ -892,11 +896,13 @@ fn ctprof_metrics_accessors_read_every_variant() {
                     _ => panic!("unexpected Mode metric {name}"),
                 };
                 assert_eq!(
-                    value, expected,
+                    agg.mode_value(),
+                    expected,
                     "Mode accessor for {name} did not read the populated value",
                 );
                 assert_eq!(
-                    *count, 1,
+                    agg.mode_count(),
+                    1,
                     "Mode count for single-thread aggregate must be 1"
                 );
                 assert_eq!(

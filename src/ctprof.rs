@@ -4731,12 +4731,14 @@ mod tests {
             AggRule::ModeChar(|t| t.state),
             &[&default_thread, &real_thread],
         );
-        match agg {
-            Aggregated::Mode { value, .. } => assert_eq!(
-                value, "R",
+        match &agg {
+            Aggregated::Mode { .. } => assert_eq!(
+                agg.mode_value(),
+                "R",
                 "Mode tiebreak between '~' (default sentinel) \
                  and 'R' (real kernel state) must elect 'R'; \
-                 got {value:?}"
+                 got {:?}",
+                agg.mode_value(),
             ),
             other => panic!("expected Mode, got {other:?}"),
         }

@@ -2601,12 +2601,15 @@ mod tests {
         );
     }
 
-    /// `write_show` renders the metric column with the
-    /// registry's full tag suffix. Pins that show plumbs
-    /// `metric_display_name` correctly through `Cow::into_owned`
-    /// and that the rendered cell carries the bracketed tag.
-    /// Mirrors the compare-side `write_diff_renders_tagged_metric_cell`
-    /// integration test on the show path.
+    /// `write_show` with the `Tags` column included surfaces the
+    /// registry's bracketed tag string in the dedicated tags
+    /// column. Pins that the show plumbs `metric_tags` correctly
+    /// through the column dispatch and that the rendered cell
+    /// carries the bracketed tag. Mirrors the compare-side
+    /// `write_diff_renders_tagged_metric_cell` integration test on
+    /// the show path. The default column set deliberately omits
+    /// the bracketed tag string from the `metric` cell so plain
+    /// listings stay narrow.
     #[test]
     fn write_show_renders_tagged_metric_cell() {
         let mut snap = ktstr::ctprof::CtprofSnapshot::default();
@@ -2615,6 +2618,13 @@ mod tests {
         t.comm = "w".to_string();
         t.nr_wakeups_affine = MonotonicCount(7);
         snap.threads.push(t);
+        let columns = vec![
+            ctprof_compare::Column::Group,
+            ctprof_compare::Column::Threads,
+            ctprof_compare::Column::Metric,
+            ctprof_compare::Column::Tags,
+            ctprof_compare::Column::Value,
+        ];
         let mut out = String::new();
         write_show(
             &mut out,
@@ -2624,15 +2634,19 @@ mod tests {
             false,
             false,
             &[],
-            &[],
+            &columns,
             &[],
             &[],
             false,
         )
         .expect("write_show into String must not fail");
         assert!(
-            out.contains("nr_wakeups_affine [cfs-only] [SCHEDSTATS]"),
-            "tagged metric cell missing from rendered show table:\n{out}",
+            out.contains("[cfs-only] [SCHEDSTATS]"),
+            "tagged metric tags missing from rendered tags column:\n{out}",
+        );
+        assert!(
+            out.contains("nr_wakeups_affine"),
+            "tagged metric name missing from rendered show table:\n{out}",
         );
     }
 
@@ -2712,7 +2726,13 @@ mod tests {
         )
         .expect("write_show into String must not fail");
 
-        let header_line = out.lines().next().unwrap_or("");
+        // The first line of `out` is the section heading
+        // `## Primary metrics`; the table column header is the
+        // first line containing the `metric` token.
+        let header_line = out
+            .lines()
+            .find(|line| line.contains("metric") && !line.starts_with("##"))
+            .unwrap_or("");
         assert!(
             header_line.contains("metric"),
             "metric column must appear in header: {header_line}",
