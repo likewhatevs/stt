@@ -287,6 +287,20 @@ pub(crate) fn attempt_auto_repro(
         no_perf_mode,
     );
 
+    // Set the auto-repro failure-dump sink to a `.repro` sibling
+    // of the primary's `{name}.failure-dump.json` so the auto-repro
+    // VM's dump (if it fires again) lands alongside, not on top of,
+    // the just-failed primary's dump. Both files survive in the
+    // sidecar dir for primary-vs-repro comparison. The setter
+    // pre-clears any stale `.repro.failure-dump.json` from a prior
+    // auto-repro pass; it does NOT touch the primary
+    // `.failure-dump.json` because `build_vm_builder_base` does
+    // not set the path on the base builder, so this is the only
+    // setter call on the auto-repro path.
+    builder = builder.failure_dump_path(
+        super::sidecar::sidecar_dir().join(format!("{}.repro.failure-dump.json", entry.name)),
+    );
+
     {
         let mut args: Vec<String> = Vec::new();
         if let Some((archive_path, host_path, guest_path)) = config_file_parts(entry) {

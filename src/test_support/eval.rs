@@ -751,6 +751,15 @@ pub(crate) fn run_ktstr_test_inner(
     let (vm_topology, memory_mb) = super::runtime::resolve_vm_topology(entry, topo);
 
     let no_perf_mode = std::env::var("KTSTR_NO_PERF_MODE").is_ok();
+
+    // Attach the primary failure-dump JSON sink at this dispatch
+    // site, NOT inside `build_vm_builder_base` — auto-repro calls
+    // the same base builder, so setting the path there would have
+    // the setter (which pre-clears) erase the primary dump on the
+    // auto-repro re-build. The setter handles stale-file pre-
+    // clear, so a prior failed invocation's leftover at the same
+    // path is unlinked here before the freeze coord could write a
+    // misleading "stale dump" on a passing rerun.
     let mut builder = super::runtime::build_vm_builder_base(
         entry,
         &kernel,
@@ -761,6 +770,9 @@ pub(crate) fn run_ktstr_test_inner(
         &cmdline_extra,
         &guest_args,
         no_perf_mode,
+    )
+    .failure_dump_path(
+        super::sidecar::sidecar_dir().join(format!("{}.failure-dump.json", entry.name)),
     )
     .performance_mode(entry.performance_mode);
 

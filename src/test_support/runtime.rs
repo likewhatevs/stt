@@ -140,6 +140,22 @@ pub(crate) fn build_vm_builder_base(
     guest_args: &[String],
     no_perf_mode: bool,
 ) -> crate::vmm::KtstrVmBuilder {
+    // The base builder deliberately does NOT set
+    // `failure_dump_path` — the per-VM target is caller-specific
+    // (primary vs auto-repro), and the setter pre-clears its
+    // target on every call. If this base were to set the primary
+    // path, the auto-repro path's later override (also through
+    // `build_vm_builder_base`) would re-call the setter on the
+    // primary path and erase the primary dump that just landed
+    // before swapping in the repro path. Instead:
+    //   - primary dispatch (`test_support::eval`) attaches
+    //     `{name}.failure-dump.json` after this builder returns;
+    //   - auto-repro (`test_support::probe::attempt_auto_repro`)
+    //     attaches `{name}.repro.failure-dump.json` after this
+    //     builder returns.
+    // Each path therefore pre-clears only its own target via the
+    // setter, leaving the sibling path's file intact for
+    // primary-vs-repro comparison.
     let mut builder = crate::vmm::KtstrVm::builder()
         .kernel(kernel)
         .init_binary(ktstr_bin)
@@ -149,17 +165,7 @@ pub(crate) fn build_vm_builder_base(
         .shm_size(KTSTR_TEST_SHM_SIZE)
         .run_args(guest_args)
         .timeout(KTSTR_VM_TIMEOUT)
-        .no_perf_mode(no_perf_mode)
-        // Per-test failure-dump JSON sink. The freeze coordinator
-        // writes here only when an error-class SCX exit fires;
-        // healthy runs leave the path untouched. Same directory
-        // the `*.ktstr.json` sidecars land in (`sidecar_dir()`),
-        // keyed by test name, so an operator inspecting a run
-        // finds structured failure data alongside the run-level
-        // sidecar without setting any env var.
-        .failure_dump_path(
-            super::sidecar::sidecar_dir().join(format!("{}.failure-dump.json", entry.name)),
-        );
+        .no_perf_mode(no_perf_mode);
 
     if let Some(sched_path) = scheduler {
         builder = builder.scheduler_binary(sched_path);

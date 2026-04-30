@@ -58,13 +58,26 @@ const PAGE_SIZE: u64 = 4096;
 
 /// `GUARD_SZ / 2` from `kernel/bpf/arena.c`.
 ///
-/// `GUARD_SZ = round_up(1ull << sizeof_field(struct bpf_insn, off) * 8, PAGE_SIZE << 1)`
-/// = `round_up(65536, 8192)` = 65536 (64 KiB).
+/// Kernel formula:
+///   `GUARD_SZ = round_up(1ull << sizeof_field(struct bpf_insn, off) * 8,
+///                        PAGE_SIZE << 1)`
+/// where `sizeof_field(struct bpf_insn, off) * 8 = 16` so the lower
+/// term is `1 << 16 = 65536`. Result depends on the kernel's page
+/// granule (`PAGE_SIZE << 1`):
+///   - 4 KiB pages: `round_up(65536, 8192)` = 65536, GUARD_HALF = 32768.
+///   - 16 KiB pages: `round_up(65536, 32768)` = 65536, GUARD_HALF = 32768.
+///   - 64 KiB pages: `round_up(65536, 131072)` = 131072, GUARD_HALF = 65536.
+///
 /// `bpf_arena_get_kern_vm_start` returns `arena->kern_vm->addr +
-/// GUARD_SZ/2`, so the kernel-side accessible region starts 32 KiB
-/// past the raw `vm_struct.addr`. The walker must add this offset
-/// when translating user-VA to kern-VA.
-const GUARD_HALF: u64 = 32768;
+/// GUARD_SZ/2`, so the kernel-side accessible region starts
+/// `GUARD_HALF` past the raw `vm_struct.addr`. The walker must add
+/// this offset when translating user-VA to kern-VA.
+///
+/// Computed from [`PAGE_SIZE`] so a future granule change at the
+/// constant declaration above propagates without a second edit. Today
+/// ktstr pins PAGE_SIZE = 4 KiB (see the [`PAGE_SIZE`] doc), but the
+/// expression is granule-agnostic for forward compatibility.
+const GUARD_HALF: u64 = (1u64 << 16).next_multiple_of(PAGE_SIZE << 1) / 2;
 
 /// Maximum number of pages the walker will translate per arena
 /// sequentially.

@@ -541,6 +541,7 @@ impl GuestMem {
     #[cfg(target_arch = "x86_64")]
     fn walk_5level(&self, cr3_pa: u64, kva: Kva) -> Option<u64> {
         const PRESENT: u64 = 1;
+        const PS: u64 = 1 << 7;
         const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 
         // PML5 index: bits 56:48.
@@ -550,6 +551,20 @@ impl GuestMem {
         let pml5e = self.read_u64(pml5_pa, 0);
         if pml5e & PRESENT == 0 {
             return None;
+        }
+        // PML5 PS-bit huge page: 256 TiB region. Intel SDM Vol 3A
+        // currently reserves PS=0 at this level, but the bit is
+        // architecturally placed where future / non-Intel
+        // implementations could enable it. Mirror the PUD/PMD
+        // PS-bit handling in `walk_4level` so a future toolchain
+        // running on extended-spec hardware doesn't silently mis-
+        // descend into walk_4level on a leaf entry.
+        //
+        // Base mask clears the low 48 bits (256 TiB alignment); kva
+        // splices in the low 48 bits as the page offset.
+        if pml5e & PS != 0 {
+            let base = pml5e & 0x000F_0000_0000_0000;
+            return Some(base | (kva.0 & 0x0000_FFFF_FFFF_FFFF));
         }
 
         // P4D is the next level; continue with 4-level walk from there.
