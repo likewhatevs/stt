@@ -8,10 +8,21 @@
 //! [`btf_rs::Type::TypeTag`]) are peeled before dispatch.
 //!
 //! The renderer is total: any type kind it cannot decode (Func, FuncProto,
-//! Datasec, Var, Fwd, Void, or a bytes slice shorter than the type's
-//! declared size) yields a [`RenderedValue::Unsupported`] or
-//! [`RenderedValue::Truncated`] node so the caller always gets a
-//! well-formed tree it can serialize.
+//! Fwd, Void, or a bytes slice shorter than the type's declared size)
+//! yields a [`RenderedValue::Unsupported`] or [`RenderedValue::Truncated`]
+//! node so the caller always gets a well-formed tree it can serialize.
+//!
+//! `BTF_KIND_DATASEC` (the type libbpf assigns as the value type of a
+//! global-section ARRAY map like `.bss` / `.data` / `.rodata`) is
+//! rendered by walking its `VarSecinfo` entries. Each VarSecinfo points
+//! at a `BTF_KIND_VAR`, which in turn references the variable's actual
+//! type. The renderer slices the section bytes at
+//! `[var_secinfo.offset()..var_secinfo.offset() + var_secinfo.size()]`
+//! and recursively renders the variable's type into that slice. The
+//! result is a [`RenderedValue::Struct`] whose `type_name` is the
+//! section name and whose `members` enumerate the section's variables
+//! by their declared names, so a stall dump's `.bss` map shows
+//! `stall=1, crash=0, ...` instead of an opaque hex dump.
 //!
 //! Bitfield handling: when [`btf_rs::Member::bitfield_size`] is `Some(w)`,
 //! the renderer reads enough bytes to cover the bitfield's bit range,
@@ -102,7 +113,7 @@ pub enum RenderedValue {
         partial: Box<RenderedValue>,
     },
     /// BTF type kind the renderer does not handle (Func, FuncProto,
-    /// Datasec, Var, Void, or a kind beyond the qualifier-peel cap).
+    /// Void, or a kind beyond the qualifier-peel cap).
     /// `reason` carries the human-readable cause.
     Unsupported { reason: String },
 }
@@ -436,9 +447,21 @@ fn render_value_inner(btf: &Btf, type_id: u32, bytes: &[u8], depth: u32) -> Rend
         Type::Func(_) | Type::FuncProto(_) => RenderedValue::Unsupported {
             reason: "function type: no value bytes to render".to_string(),
         },
-        Type::Datasec(_) | Type::Var(_) => RenderedValue::Unsupported {
-            reason: "datasec/var meta-type: not a value".to_string(),
-        },
+        Type::Datasec(ds) => render_datasec(btf, &ds, bytes, depth),
+        Type::Var(var) => {
+            // Standalone Var (i.e. asked to render a Var type id
+            // outside a Datasec walk): forward to its underlying
+            // type. The Var node carries a name but no storage of
+            // its own — render its referent against the supplied
+            // bytes. A failed type-id lookup falls back to
+            // Unsupported rather than panicking.
+            let Ok(inner_id) = var.get_type_id() else {
+                return RenderedValue::Unsupported {
+                    reason: "var type id not resolvable".to_string(),
+                };
+            };
+            render_value_inner(btf, inner_id, bytes, depth + 1)
+        }
         Type::Void => RenderedValue::Unsupported {
             reason: "void: no value bytes to render".to_string(),
         },
@@ -570,6 +593,109 @@ fn render_struct(btf: &Btf, s: &Struct, bytes: &[u8], depth: u32) -> RenderedVal
     } else {
         rendered
     }
+}
+
+/// Render a `BTF_KIND_DATASEC` (e.g. `.bss`, `.data`, `.rodata`) by
+/// walking its `VarSecinfo` entries and rendering each variable into
+/// the slice of section bytes its `offset()` and `size()` describe.
+///
+/// Each VarSecinfo's `get_type_id()` returns a `BTF_KIND_VAR` id; the
+/// Var carries the variable's name and its underlying type's id. The
+/// renderer slices `bytes[offset..offset+size]` and recursively
+/// renders the underlying type into that slice. The result is a
+/// [`RenderedValue::Struct`] whose `type_name` is the section name
+/// (e.g. `.bss`) and whose `members` are the section's variables —
+/// reusing `RenderedValue::Struct` rather than introducing a new
+/// variant keeps the existing serde shape (`kind: "struct"`) and
+/// Display layout intact, so a stall dump's `.bss` map renders
+/// alongside ordinary structs and JSON consumers (the
+/// `stall_dump_e2e.rs` fixture among them) iterate the variables via
+/// `value.members[]` exactly as they iterate struct members today.
+///
+/// Truncation: an out-of-range `(offset, size)` for the supplied
+/// `bytes` slice surfaces as a per-variable
+/// [`RenderedValue::Truncated`] — the variable's name is still
+/// recorded under [`RenderedMember::name`], so an operator sees
+/// "variable X needed N bytes, had M" rather than the entire
+/// section disappearing. Variables with malformed BTF (Var type id
+/// fails to resolve, chained type isn't a Var) fall through to
+/// [`RenderedValue::Unsupported`] with the reason recorded.
+fn render_datasec(btf: &Btf, ds: &btf_rs::Datasec, bytes: &[u8], depth: u32) -> RenderedValue {
+    // Section name lives on the Datasec itself
+    // (BTF_KIND_DATASEC.name_off via `BtfType::get_name_offset`). An
+    // empty / unresolvable name maps to `None`, matching
+    // [`RenderedValue::Struct::type_name`]'s contract for anonymous
+    // aggregates.
+    let type_name = btf.resolve_name(ds).ok().filter(|n| !n.is_empty());
+    let mut members = Vec::with_capacity(ds.variables.len());
+    for var_info in &ds.variables {
+        let offset = var_info.offset() as usize;
+        let size = var_info.size();
+        // Resolve the chained Var so we can pull the variable's
+        // name and its underlying type id. A non-Var here indicates
+        // malformed BTF (libbpf always emits Var per VarSecinfo);
+        // record the failure as an Unsupported member rather than
+        // dropping the slot.
+        let chained = match btf.resolve_chained_type(var_info) {
+            Ok(t) => t,
+            Err(_) => {
+                members.push(RenderedMember {
+                    name: String::new(),
+                    value: RenderedValue::Unsupported {
+                        reason: "datasec var type not resolvable".to_string(),
+                    },
+                });
+                continue;
+            }
+        };
+        let var = match chained {
+            Type::Var(v) => v,
+            other => {
+                members.push(RenderedMember {
+                    name: String::new(),
+                    value: RenderedValue::Unsupported {
+                        reason: format!("datasec entry resolved to non-Var ({})", other.name()),
+                    },
+                });
+                continue;
+            }
+        };
+        let var_name = btf.resolve_name(&var).unwrap_or_default();
+        let inner_id = match var.get_type_id() {
+            Ok(id) => id,
+            Err(_) => {
+                members.push(RenderedMember {
+                    name: var_name,
+                    value: RenderedValue::Unsupported {
+                        reason: "var underlying type id not resolvable".to_string(),
+                    },
+                });
+                continue;
+            }
+        };
+        // Slice the section bytes for this variable. If the section
+        // bytes are shorter than offset+size, emit a per-member
+        // Truncated whose `partial` is whatever the inner renderer
+        // can decode from the available subset (mirrors
+        // `render_member`'s short-bytes behaviour).
+        let value = if offset + size <= bytes.len() {
+            render_value_inner(btf, inner_id, &bytes[offset..offset + size], depth + 1)
+        } else {
+            let avail_start = offset.min(bytes.len());
+            let avail = &bytes[avail_start..];
+            let partial = render_value_inner(btf, inner_id, avail, depth + 1);
+            RenderedValue::Truncated {
+                needed: size,
+                had: avail.len(),
+                partial: Box::new(partial),
+            }
+        };
+        members.push(RenderedMember {
+            name: var_name,
+            value,
+        });
+    }
+    RenderedValue::Struct { type_name, members }
 }
 
 fn render_member(btf: &Btf, m: &Member, parent_bytes: &[u8], depth: u32) -> RenderedValue {
@@ -1309,6 +1435,228 @@ mod tests {
             // failure if it does).
             RenderedValue::Struct { .. } => {}
             other => panic!("expected Truncated or Struct, got {other:?}"),
+        }
+    }
+
+    // ---- Datasec rendering (#67) ------------------------------------
+    //
+    // The fix for #67 is the renderer recognising
+    // `BTF_KIND_DATASEC` (the value type libbpf assigns to a
+    // global-section ARRAY map like `.bss`) and walking its
+    // `VarSecinfo` entries to render each variable. Before the fix
+    // the renderer returned `Unsupported`, so a stall dump's `.bss`
+    // map showed an opaque hex dump instead of `stall=1, crash=0,
+    // ...`.
+    //
+    // The probe BPF object built by `build.rs` contains a known
+    // `.bss` Datasec (declared via the `volatile u32
+    // ktstr_err_exit_detected = 0;` and the diagnostic-counter
+    // globals `ktstr_trigger_count`, `ktstr_probe_count`,
+    // `ktstr_meta_miss`, `ktstr_miss_log_idx` in
+    // `src/bpf/probe.bpf.c`). The tests below load that BTF
+    // directly via `load_btf_from_path` (which falls back to
+    // goblin's `.BTF` ELF section parse for non-vmlinux files) and
+    // exercise the Datasec render path against it. Hard-fail on a
+    // missing probe.o because build.rs always produces it; a silent
+    // skip would hide the regression the test is designed to catch.
+
+    /// Locate the `.bss` Datasec type id in the probe BTF.
+    /// `resolve_types_by_name(".bss")` returns a list of types named
+    /// `.bss`; libbpf normally emits exactly one `BTF_KIND_DATASEC`,
+    /// but the resolver returns Vec<Type> so we scan for the
+    /// Datasec variant. Returns `(btf, ds_id)` or panics if the
+    /// build fixture is missing.
+    fn load_probe_btf_and_bss_id() -> (Btf, u32) {
+        let probe_obj = std::path::PathBuf::from(env!("OUT_DIR")).join("probe.o");
+        let btf = crate::monitor::btf_offsets::load_btf_from_path(&probe_obj).unwrap_or_else(|e| {
+            panic!(
+                "load_btf_from_path({}) failed: {e}. \
+                     build.rs always produces probe.o; a missing or \
+                     unparseable artifact means the build pipeline is \
+                     broken.",
+                probe_obj.display()
+            )
+        });
+        let ids = btf
+            .resolve_ids_by_name(".bss")
+            .expect("probe BTF must carry a `.bss` BTF_KIND_DATASEC");
+        // Pick the first id that resolves to a Datasec — there
+        // should be exactly one, but we don't blow up if libbpf
+        // ever emits something else under the `.bss` name.
+        for &id in &ids {
+            if let Ok(Type::Datasec(_)) = btf.resolve_type_by_id(id) {
+                return (btf, id);
+            }
+        }
+        panic!("probe BTF has `.bss` ids {ids:?} but none resolve to BTF_KIND_DATASEC");
+    }
+
+    #[test]
+    fn render_datasec_emits_struct_with_named_variables() {
+        let (btf, bss_id) = load_probe_btf_and_bss_id();
+        // Compute the section size by summing each VarSecinfo's
+        // (offset + size) — libbpf-emitted Datasecs aren't laid out
+        // contiguously (alignment + ordering), so the section's
+        // total size is `max(offset + size)` across all entries.
+        // Allocate a zeroed buffer of that size so every variable's
+        // slice fits.
+        let Type::Datasec(ds) = btf.resolve_type_by_id(bss_id).unwrap() else {
+            panic!(".bss id did not resolve to Datasec");
+        };
+        let section_size = ds
+            .variables
+            .iter()
+            .map(|v| v.offset() as usize + v.size())
+            .max()
+            .expect("`.bss` Datasec must have at least one variable");
+        let bytes = vec![0u8; section_size];
+        let rendered = render_value(&btf, bss_id, &bytes);
+
+        // Datasec must render as a Struct (not Unsupported, not
+        // Truncated — section_size matches the actual section
+        // extent so no variable should overrun).
+        let RenderedValue::Struct { type_name, members } = rendered else {
+            panic!(
+                "expected RenderedValue::Struct for Datasec, got something else \
+                 — Datasec dispatch in render_value_inner must be reachable"
+            );
+        };
+        assert_eq!(
+            type_name.as_deref(),
+            Some(".bss"),
+            "section name must surface as type_name"
+        );
+        // Variable names: probe.bpf.c declares
+        // `ktstr_err_exit_detected` as a writable global. It MUST
+        // appear in the rendered .bss members; the freeze
+        // coordinator depends on this exact name being resolvable.
+        let names: std::collections::HashSet<&str> =
+            members.iter().map(|m| m.name.as_str()).collect();
+        assert!(
+            names.contains("ktstr_err_exit_detected"),
+            "rendered .bss must contain `ktstr_err_exit_detected` \
+             (the freeze latch). Found names: {names:?}"
+        );
+        // Diagnostic counters are also writable globals → expected
+        // in .bss too. Pin one as a smoke test that multiple
+        // variables decode (not just the one the freeze coord
+        // cares about).
+        assert!(
+            names.contains("ktstr_trigger_count"),
+            "rendered .bss must contain `ktstr_trigger_count` \
+             diagnostic counter. Found names: {names:?}"
+        );
+        // Each member's `value` must be a concrete renderable
+        // type (Uint, Int, Array of int, etc.) — NOT Unsupported.
+        // A zero byte buffer can't be Truncated for variables that
+        // fit within section_size, so any Truncated result here
+        // would indicate a slicing bug.
+        for m in &members {
+            assert!(
+                !matches!(m.value, RenderedValue::Unsupported { .. }),
+                "member {:?} rendered as Unsupported: {:?}",
+                m.name,
+                m.value
+            );
+            assert!(
+                !matches!(m.value, RenderedValue::Truncated { .. }),
+                "member {:?} rendered as Truncated despite section_size \
+                 buffer: {:?}",
+                m.name,
+                m.value
+            );
+        }
+        // ktstr_err_exit_detected is `volatile u32 = 0;` — must
+        // decode to Uint{bits:32, value:0} given a zero buffer.
+        let latch = members
+            .iter()
+            .find(|m| m.name == "ktstr_err_exit_detected")
+            .expect("latch member must be present (asserted above)");
+        match &latch.value {
+            RenderedValue::Uint { bits, value } => {
+                assert_eq!(*bits, 32, "latch is u32 (32 bits)");
+                assert_eq!(*value, 0, "latch was zeroed in the buffer");
+            }
+            other => panic!("expected Uint{{32,0}} for latch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn render_datasec_truncates_overrunning_variables() {
+        // Feed a byte buffer that's too small to cover every
+        // variable in the .bss Datasec. Variables whose
+        // (offset + size) extends past the buffer must surface as
+        // Truncated members, while variables that fit must render
+        // normally. The Struct itself is NOT wrapped in Truncated
+        // — the section name and the per-variable partial render
+        // both stay intact.
+        let (btf, bss_id) = load_probe_btf_and_bss_id();
+        let Type::Datasec(ds) = btf.resolve_type_by_id(bss_id).unwrap() else {
+            panic!(".bss id did not resolve to Datasec");
+        };
+        // Buffer that holds only the first variable (smallest
+        // offset). Variables with higher offsets become Truncated.
+        let min_var = ds
+            .variables
+            .iter()
+            .min_by_key(|v| v.offset())
+            .expect("`.bss` must have at least one variable");
+        let buf_size = (min_var.offset() as usize) + min_var.size();
+        let bytes = vec![0u8; buf_size];
+        let rendered = render_value(&btf, bss_id, &bytes);
+
+        let RenderedValue::Struct { type_name, members } = rendered else {
+            panic!("expected RenderedValue::Struct even with short buffer");
+        };
+        assert_eq!(type_name.as_deref(), Some(".bss"));
+        // At least one member must be Truncated (one of the
+        // higher-offset variables). At least one member must be
+        // non-Truncated (the variable at min_var's offset).
+        let truncated_count = members
+            .iter()
+            .filter(|m| matches!(m.value, RenderedValue::Truncated { .. }))
+            .count();
+        let decoded_count = members.len() - truncated_count;
+        assert!(
+            decoded_count >= 1,
+            "at least one member must decode (the variable at the smallest offset, \
+             which fits in buf_size={buf_size})"
+        );
+        // If there is more than one variable in .bss (probe.bpf.c
+        // declares several), the short buffer must produce at
+        // least one Truncated. A single-variable .bss would have
+        // truncated_count == 0, but our probe has multiple — so
+        // assert > 0.
+        if members.len() > 1 {
+            assert!(
+                truncated_count >= 1,
+                "multi-variable .bss with short buffer must produce >= 1 \
+                 Truncated member; got 0 from {members:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn render_datasec_empty_buffer_yields_struct_with_truncated_members() {
+        // Edge case: zero-byte buffer for a non-empty Datasec.
+        // Every variable must surface as Truncated rather than
+        // crashing the renderer or returning the legacy
+        // Unsupported.
+        let (btf, bss_id) = load_probe_btf_and_bss_id();
+        let rendered = render_value(&btf, bss_id, &[]);
+        let RenderedValue::Struct { members, .. } = rendered else {
+            panic!("expected Struct render even with empty buffer");
+        };
+        assert!(!members.is_empty(), "probe `.bss` Datasec is non-empty");
+        for m in &members {
+            // Every variable should report Truncated{ needed: var
+            // size, had: 0, partial: ... }.
+            assert!(
+                matches!(m.value, RenderedValue::Truncated { had: 0, .. }),
+                "member {:?} should be Truncated{{had:0}} for empty buffer, got {:?}",
+                m.name,
+                m.value
+            );
         }
     }
 }

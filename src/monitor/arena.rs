@@ -18,10 +18,14 @@
 //!
 //! The host-side walker mirrors this: read the arena's `kern_vm`
 //! pointer, dereference to get `vm_struct.addr`, add `GUARD_SZ/2`,
-//! then for each pgoff in `0..N` compute `kaddr` and run
+//! then for each pgoff in `0..max_entries` compute `kaddr` and run
 //! [`GuestMem::translate_kva`] (the existing PTE walker against
-//! `init_mm`'s page table). Pages whose translate fails are simply
-//! "not faulted in" — arena maps are sparse by design.
+//! `init_mm`'s page table). `max_entries` is the BPF map's declared
+//! page capacity from `bpf_map_create()` — it is the source of truth
+//! for "how many pages this arena could hold", regardless of whether
+//! the scheduler exposes a userspace mmap (some don't, leaving
+//! `user_vm_start == user_vm_end == 0`). Pages whose translate fails
+//! are simply "not faulted in" — arena maps are sparse by design.
 //!
 //! The walker does NOT consult `arena->rt` (the range_tree of free
 //! pgoffs) — `range_tree` polarity is "set = free" / "clear =
@@ -111,8 +115,6 @@ pub struct BpfArenaOffsets {
     pub arena_kern_vm: usize,
     /// Offset of `user_vm_start` (u64) within `struct bpf_arena`.
     pub arena_user_vm_start: usize,
-    /// Offset of `user_vm_end` (u64) within `struct bpf_arena`.
-    pub arena_user_vm_end: usize,
     /// Offset of `addr` (`void *`) within `struct vm_struct`.
     pub vm_struct_addr: usize,
 }
@@ -141,7 +143,6 @@ impl BpfArenaOffsets {
             .context("btf: struct bpf_arena not found (arena unsupported on this kernel?)")?;
         let arena_kern_vm = member_byte_offset(btf, &bpf_arena, "kern_vm")?;
         let arena_user_vm_start = member_byte_offset(btf, &bpf_arena, "user_vm_start")?;
-        let arena_user_vm_end = member_byte_offset(btf, &bpf_arena, "user_vm_end")?;
 
         let (vm_struct, _) =
             find_struct(btf, "vm_struct").context("btf: struct vm_struct not found")?;
@@ -150,7 +151,6 @@ impl BpfArenaOffsets {
         Ok(Self {
             arena_kern_vm,
             arena_user_vm_start,
-            arena_user_vm_end,
             vm_struct_addr,
         })
     }
@@ -185,12 +185,13 @@ pub struct ArenaSnapshot {
     /// between sampled positions are still silently skipped.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
-    /// Total declared page count of the user_vm window
-    /// (`(user_vm_end - user_vm_start) / PAGE_SIZE`), reflecting any
+    /// Total declared page count. Derived from
+    /// `max_entries * PAGE_SIZE` (the BPF map's declared page
+    /// capacity), not the user_vm window. Reflects any
     /// [`MAX_USER_VM_SPAN`] cap. Surfaced alongside `pages.len()` so
     /// consumers can see the allocated-vs-declared ratio.
     pub declared_pages: u64,
-    /// True when the raw `user_vm_end - user_vm_start` exceeded
+    /// True when `max_entries * PAGE_SIZE` exceeded
     /// [`MAX_USER_VM_SPAN`] (4 GiB) and the walker capped the span
     /// before computing `declared_pages`. Indicates a torn / corrupt
     /// `bpf_arena` struct or a freeze-time race against initialization;
@@ -236,9 +237,8 @@ pub fn snapshot_arena(
     };
 
     let user_vm_start = mem.read_u64(arena_pa, offsets.arena_user_vm_start);
-    let user_vm_end = mem.read_u64(arena_pa, offsets.arena_user_vm_end);
     let kern_vm_kva = mem.read_u64(arena_pa, offsets.arena_kern_vm);
-    if kern_vm_kva == 0 || user_vm_end <= user_vm_start {
+    if kern_vm_kva == 0 {
         return ArenaSnapshot::default();
     }
 
@@ -255,7 +255,9 @@ pub fn snapshot_arena(
     }
     let kern_vm_start = vm_addr.wrapping_add(GUARD_HALF);
 
-    let plan = ArenaWalkPlan::new(user_vm_end - user_vm_start);
+    // max_entries is the create-time page capacity; user_vm_end may
+    // be 0 for arenas without userspace mmap.
+    let plan = ArenaWalkPlan::new((info.max_entries as u64) * PAGE_SIZE);
 
     let mut snapshot = ArenaSnapshot {
         pages: Vec::new(),
@@ -417,10 +419,6 @@ mod tests {
             offsets.arena_user_vm_start > 0,
             "user_vm_start follows embedded bpf_map"
         );
-        assert!(
-            offsets.arena_user_vm_end > offsets.arena_user_vm_start,
-            "user_vm_end follows user_vm_start"
-        );
         assert_ne!(
             offsets.arena_kern_vm, offsets.arena_user_vm_start,
             "kern_vm distinct from user_vm_start"
@@ -536,11 +534,9 @@ mod tests {
 
     #[test]
     fn arena_walk_plan_zero_span() {
-        // Edge: zero span (empty arena, or torn struct with both
-        // user_vm_start == user_vm_end). No work. snapshot_arena's
-        // outer `user_vm_end <= user_vm_start` guard already rejects
-        // before reaching the plan, but the plan must still behave
-        // sanely for direct callers / future refactors.
+        // Edge: zero span. snapshot_arena can reach this with
+        // max_entries=0; the plan must handle zero spans without
+        // panicking or computing nonsense bounds.
         let plan = ArenaWalkPlan::new(0);
         assert_eq!(plan.declared_pages, 0);
         assert!(!plan.span_capped);
