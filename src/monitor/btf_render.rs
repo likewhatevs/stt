@@ -113,7 +113,7 @@ pub enum RenderedValue {
         partial: Box<RenderedValue>,
     },
     /// BTF type kind the renderer does not handle (Func, FuncProto,
-    /// Void, or a kind beyond the qualifier-peel cap).
+    /// Fwd, Void, or a kind beyond the qualifier-peel cap).
     /// `reason` carries the human-readable cause.
     Unsupported { reason: String },
 }
@@ -677,17 +677,26 @@ fn render_datasec(btf: &Btf, ds: &btf_rs::Datasec, bytes: &[u8], depth: u32) -> 
         // bytes are shorter than offset+size, emit a per-member
         // Truncated whose `partial` is whatever the inner renderer
         // can decode from the available subset (mirrors
-        // `render_member`'s short-bytes behaviour).
-        let value = if offset + size <= bytes.len() {
-            render_value_inner(btf, inner_id, &bytes[offset..offset + size], depth + 1)
-        } else {
-            let avail_start = offset.min(bytes.len());
-            let avail = &bytes[avail_start..];
-            let partial = render_value_inner(btf, inner_id, avail, depth + 1);
-            RenderedValue::Truncated {
-                needed: size,
-                had: avail.len(),
-                partial: Box::new(partial),
+        // `render_member`'s short-bytes behaviour). `checked_add`
+        // guards against pathological BTF where `offset + size`
+        // would overflow `usize` — without it, a torn VarSecinfo
+        // could wrap past `usize::MAX` and the `<= bytes.len()`
+        // comparison would silently become true, indexing out of
+        // bounds.
+        let end = offset.checked_add(size);
+        let value = match end {
+            Some(end) if end <= bytes.len() => {
+                render_value_inner(btf, inner_id, &bytes[offset..end], depth + 1)
+            }
+            _ => {
+                let avail_start = offset.min(bytes.len());
+                let avail = &bytes[avail_start..];
+                let partial = render_value_inner(btf, inner_id, avail, depth + 1);
+                RenderedValue::Truncated {
+                    needed: size,
+                    had: avail.len(),
+                    partial: Box::new(partial),
+                }
             }
         };
         members.push(RenderedMember {
@@ -728,28 +737,33 @@ fn render_member(btf: &Btf, m: &Member, parent_bytes: &[u8], depth: u32) -> Rend
             reason: "member type size unresolvable".to_string(),
         };
     };
-    if byte_off + size > parent_bytes.len() {
-        // Attempt a partial decode from whatever bytes ARE available
-        // for this member: the inner renderer will itself emit a
-        // Truncated/Bytes/etc. that carries the recoverable subset.
-        // Wrapping that subset in this outer Truncated tells the
-        // consumer "the full member needed N bytes, only M survived,
-        // here's what we got".
-        let avail_start = byte_off.min(parent_bytes.len());
-        let avail = &parent_bytes[avail_start..];
-        let partial = render_value_inner(btf, member_type_id, avail, depth + 1);
-        return RenderedValue::Truncated {
-            needed: size,
-            had: avail.len(),
-            partial: Box::new(partial),
-        };
+    // `checked_add` guards against pathological BTF where
+    // `byte_off + size` would overflow `usize` (a torn member with
+    // a wild bit_offset / size pair). Without the check, the wrap
+    // would silently make the `> parent_bytes.len()` test false
+    // and the slice would index out of bounds.
+    let end = byte_off.checked_add(size);
+    match end {
+        Some(end) if end <= parent_bytes.len() => {
+            render_value_inner(btf, member_type_id, &parent_bytes[byte_off..end], depth + 1)
+        }
+        _ => {
+            // Attempt a partial decode from whatever bytes ARE available
+            // for this member: the inner renderer will itself emit a
+            // Truncated/Bytes/etc. that carries the recoverable subset.
+            // Wrapping that subset in this outer Truncated tells the
+            // consumer "the full member needed N bytes, only M survived,
+            // here's what we got".
+            let avail_start = byte_off.min(parent_bytes.len());
+            let avail = &parent_bytes[avail_start..];
+            let partial = render_value_inner(btf, member_type_id, avail, depth + 1);
+            RenderedValue::Truncated {
+                needed: size,
+                had: avail.len(),
+                partial: Box::new(partial),
+            }
+        }
     }
-    render_value_inner(
-        btf,
-        member_type_id,
-        &parent_bytes[byte_off..byte_off + size],
-        depth + 1,
-    )
 }
 
 fn render_bitfield(

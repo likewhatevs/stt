@@ -91,18 +91,20 @@ const MAX_ARENA_PAGES: u64 = 4096;
 /// alongside the sequential prefix, so the consumer sees both.
 const MAX_ARENA_STRIDE_PROBES: u64 = 256;
 
-/// Defensive cap on the user_vm window span, in bytes.
+/// Defensive cap on the arena's address-range span, in bytes.
 ///
-/// `bpf_arena_init`'s user_vm window is at most 4 GiB by design — the
-/// BPF JIT addresses arena pointers via the low 32 bits of the user
-/// address, so any window wider than `0x1_0000_0000` cannot be a
+/// The walker computes its span from `info.max_entries * PAGE_SIZE`
+/// (the BPF map's declared page capacity, see [`snapshot_arena`]).
+/// `bpf_arena_init` allows at most 4 GiB worth of pages by design —
+/// the BPF JIT addresses arena pointers via the low 32 bits of the
+/// user address, so anything wider than `0x1_0000_0000` cannot be a
 /// real arena layout (see `bpf_arena_alloc_pages` in
-/// `kernel/bpf/arena.c`). A torn / corrupt `bpf_arena` struct or a
-/// freeze-time race against `arena_init` could yield a wild span; cap
-/// it here so the walker never multiplies a near-`u64::MAX` span by
-/// `PAGE_SIZE` (overflow) or attempts to walk billions of pgoffs
-/// (live-lock on the freeze path).
-const MAX_USER_VM_SPAN: u64 = 0x1_0000_0000;
+/// `kernel/bpf/arena.c`). A torn / corrupt `bpf_map.max_entries` or
+/// a freeze-time race against `arena_init` could yield a wild value;
+/// cap it here so the walker never multiplies a near-`u64::MAX` page
+/// count by `PAGE_SIZE` (overflow) or attempts to walk billions of
+/// pgoffs (live-lock on the freeze path).
+const MAX_VM_RANGE_BYTES: u64 = 0x1_0000_0000;
 
 /// Byte offsets within `struct bpf_arena` and `struct vm_struct`
 /// needed for the host-side arena walker.
@@ -188,11 +190,11 @@ pub struct ArenaSnapshot {
     /// Total declared page count. Derived from
     /// `max_entries * PAGE_SIZE` (the BPF map's declared page
     /// capacity), not the user_vm window. Reflects any
-    /// [`MAX_USER_VM_SPAN`] cap. Surfaced alongside `pages.len()` so
+    /// [`MAX_VM_RANGE_BYTES`] cap. Surfaced alongside `pages.len()` so
     /// consumers can see the allocated-vs-declared ratio.
     pub declared_pages: u64,
     /// True when `max_entries * PAGE_SIZE` exceeded
-    /// [`MAX_USER_VM_SPAN`] (4 GiB) and the walker capped the span
+    /// [`MAX_VM_RANGE_BYTES`] (4 GiB) and the walker capped the span
     /// before computing `declared_pages`. Indicates a torn / corrupt
     /// `bpf_arena` struct or a freeze-time race against initialization;
     /// the rendered pages still come from valid translates, so the
@@ -340,9 +342,9 @@ pub fn snapshot_arena(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ArenaWalkPlan {
     /// Page count the snapshot reports as "declared". Reflects any
-    /// [`MAX_USER_VM_SPAN`] cap.
+    /// [`MAX_VM_RANGE_BYTES`] cap.
     declared_pages: u64,
-    /// True when [`MAX_USER_VM_SPAN`] capped the raw span.
+    /// True when [`MAX_VM_RANGE_BYTES`] capped the raw span.
     span_capped: bool,
     /// True when `declared_pages > MAX_ARENA_PAGES` and the walker
     /// will skip pgoffs in the sparse tail.
@@ -359,8 +361,8 @@ struct ArenaWalkPlan {
 
 impl ArenaWalkPlan {
     fn new(raw_span: u64) -> Self {
-        let span_capped = raw_span > MAX_USER_VM_SPAN;
-        let span = raw_span.min(MAX_USER_VM_SPAN);
+        let span_capped = raw_span > MAX_VM_RANGE_BYTES;
+        let span = raw_span.min(MAX_VM_RANGE_BYTES);
         let declared_pages = span / PAGE_SIZE;
         let sequential_to = declared_pages.min(MAX_ARENA_PAGES);
         let truncated = declared_pages > sequential_to;
@@ -440,8 +442,8 @@ mod tests {
     //   - mid arena (just under 16 MiB) — sequential only
     //   - large arena (declared > MAX_ARENA_PAGES) — sequential
     //     prefix + stride sweep
-    //   - 4 GiB-cap (raw_span > MAX_USER_VM_SPAN) — span_capped flag,
-    //     declared_pages clamped to MAX_USER_VM_SPAN / PAGE_SIZE
+    //   - 4 GiB-cap (raw_span > MAX_VM_RANGE_BYTES) — span_capped flag,
+    //     declared_pages clamped to MAX_VM_RANGE_BYTES / PAGE_SIZE
     //   - corrupt span (raw_span = u64::MAX) — capped, flag set,
     //     no overflow
 
@@ -450,7 +452,7 @@ mod tests {
         // The plan-derivation invariants depend on these constants.
         // Pin them so a future tightening surfaces here, not in
         // snapshot_arena's runtime behavior.
-        assert_eq!(MAX_USER_VM_SPAN, 0x1_0000_0000);
+        assert_eq!(MAX_VM_RANGE_BYTES, 0x1_0000_0000);
         assert_eq!(PAGE_SIZE, 4096);
         assert_eq!(MAX_ARENA_PAGES, 4096);
         assert_eq!(MAX_ARENA_STRIDE_PROBES, 256);
@@ -495,7 +497,7 @@ mod tests {
         // Largest legitimate arena: full 4 GiB user_vm window (1M pages).
         // Sequential covers first 16 MiB; stride sweeps the remaining
         // ~1M-4096 pages with 256 probes -> stride = ceil((1M - 4096) / 256).
-        let raw = MAX_USER_VM_SPAN;
+        let raw = MAX_VM_RANGE_BYTES;
         let plan = ArenaWalkPlan::new(raw);
         assert_eq!(plan.declared_pages, raw / PAGE_SIZE);
         assert!(!plan.span_capped, "exactly 4 GiB is at the cap, not above");
@@ -512,10 +514,10 @@ mod tests {
     #[test]
     fn arena_walk_plan_caps_at_4gib() {
         // Raw span 8 GiB (corrupt struct): span_capped flag set,
-        // declared_pages clamped to MAX_USER_VM_SPAN / PAGE_SIZE.
-        let plan = ArenaWalkPlan::new(2 * MAX_USER_VM_SPAN);
+        // declared_pages clamped to MAX_VM_RANGE_BYTES / PAGE_SIZE.
+        let plan = ArenaWalkPlan::new(2 * MAX_VM_RANGE_BYTES);
         assert!(plan.span_capped);
-        assert_eq!(plan.declared_pages, MAX_USER_VM_SPAN / PAGE_SIZE);
+        assert_eq!(plan.declared_pages, MAX_VM_RANGE_BYTES / PAGE_SIZE);
         assert!(plan.truncated);
         assert!(plan.stride.is_some());
     }
@@ -528,7 +530,7 @@ mod tests {
         // pgoff loop would live-lock.
         let plan = ArenaWalkPlan::new(u64::MAX);
         assert!(plan.span_capped);
-        assert_eq!(plan.declared_pages, MAX_USER_VM_SPAN / PAGE_SIZE);
+        assert_eq!(plan.declared_pages, MAX_VM_RANGE_BYTES / PAGE_SIZE);
         assert!(plan.truncated);
     }
 
@@ -567,7 +569,7 @@ mod tests {
         // tail >> MAX_ARENA_STRIDE_PROBES: stride > 1, fewer probes
         // than tail pages. Verify the sweep visits exactly
         // approximately MAX_ARENA_STRIDE_PROBES positions.
-        let plan = ArenaWalkPlan::new(MAX_USER_VM_SPAN); // full 4 GiB
+        let plan = ArenaWalkPlan::new(MAX_VM_RANGE_BYTES); // full 4 GiB
         let mut pgoff = plan.sequential_to;
         let mut visited = 0u64;
         while pgoff < plan.declared_pages {
