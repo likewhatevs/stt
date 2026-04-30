@@ -536,6 +536,12 @@ pub(crate) fn find_struct(btf: &Btf, name: &str) -> Result<(btf_rs::Struct, Stri
 /// back to a known offset (the freeze coordinator falls back to 0
 /// during early boot before program BTF is loadable).
 ///
+/// First-match-by-var-name across Datasecs: the walk visits all
+/// Datasecs whose name matches `section_name` (libbpf normally emits
+/// at most one) and returns on the first matching var, so callers
+/// see one offset even if a future libbpf change splits a section
+/// into multiple Datasecs.
+///
 /// Lives next to [`find_struct`] / [`member_byte_offset`] because
 /// it's a generic BTF helper, not specific to the dump path. Both
 /// the dump renderer and the freeze coordinator consume it.

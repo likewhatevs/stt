@@ -1364,8 +1364,9 @@ pub fn run_probe_skeleton(
             // filter events to those referencing the same task_struct
             // pointer as the causal task.
             //
-            // The BPF trigger handler at probe.bpf.c:304-306 sets
-            // args[0] to bpf_get_current_task() ONLY for
+            // The args[0] assignment in ktstr_trigger_tp (the BPF
+            // trigger handler) sets args[0] to
+            // bpf_get_current_task() ONLY for
             // SCX_EXIT_ERROR_BPF (1025), where a BPF scheduler
             // callback faulted in the running task's context — so
             // `current` IS the causal task. For SCX_EXIT_ERROR
@@ -2234,16 +2235,17 @@ mod tests {
         assert!(!keys.iter().any(|(k, _)| k.contains("p6")));
     }
 
-    // ---- args[0] kind-conditional filter (probe.bpf.c:283-285) ------
+    // ---- args[0] kind-conditional filter ----------------------------
     //
-    // The BPF tracepoint trigger handler at probe.bpf.c:283-285
-    // sets `event->args[0] = (kind == SCX_EXIT_ERROR_BPF)
+    // The args[0] conditional in ktstr_trigger_tp (the BPF
+    // tracepoint trigger handler) sets
+    // `event->args[0] = (kind == SCX_EXIT_ERROR_BPF)
     // ? bpf_get_current_task() : 0;` — current-task is emitted
     // ONLY for SCX_EXIT_ERROR_BPF (1025). For SCX_EXIT_ERROR
     // (1024) the field is 0 because the exit can fire from
     // kworker / sysrq context where `current` is unrelated.
     //
-    // The host-side filter at process.rs:~1402 drops events
+    // The target_tptr filter in run_probe_skeleton drops events
     // whose `task_ptr` (sourced from args[0]) is 0, suppressing
     // probe output when the BPF side declined to provide a
     // causal task. These tests pin the host-side filter against
@@ -2254,11 +2256,13 @@ mod tests {
     const SCX_EXIT_ERROR: u64 = 1024;
     const SCX_EXIT_ERROR_BPF: u64 = 1025;
 
-    /// Build a synthetic `ProbeEvent` mirroring what
-    /// `read_event_loop` constructs from a ringbuf trigger
-    /// event. `args[0]` is the causal task pointer the BPF
-    /// side emitted (per probe.bpf.c:283-285); `args[1]` is the
-    /// exit kind. `task_ptr` is set from `args[0]` at line 1142.
+    /// Build a synthetic `ProbeEvent` mirroring what the
+    /// ringbuf callback inside `run_probe_skeleton` constructs
+    /// from a trigger event. `args[0]` is the causal task
+    /// pointer the BPF side emitted (per the args[0] conditional
+    /// in ktstr_trigger_tp); `args[1]` is the exit kind.
+    /// `task_ptr` is set from `args[0]` in the trigger event
+    /// constructor in run_probe_skeleton.
     fn make_trigger_event(args0: u64, kind: u64) -> ProbeEvent {
         let mut args = [0u64; 6];
         args[0] = args0;
@@ -2280,8 +2284,8 @@ mod tests {
     fn args0_zero_filtered_for_scx_exit_error() {
         // SCX_EXIT_ERROR (1024) fires from non-causal contexts
         // (kworker, sysrq) — the BPF side emits args[0] = 0,
-        // so task_ptr is 0. The host-side filter at
-        // process.rs:1402 must drop this via
+        // so task_ptr is 0. The `target_tptr` filter in
+        // `run_probe_skeleton` must drop this via
         // `Option::filter(|&p| p != 0)`. Verifying with the
         // exact same expression form so a future swap to
         // `>= 1` (intent-equivalent but unrelated to the spec)

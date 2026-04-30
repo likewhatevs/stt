@@ -290,6 +290,11 @@ pub fn init_shm_ptr(base: *mut u8, size: usize) {
 /// most once per process. False on the host (no cmdline match) and
 /// false on any non-Linux platform that lacks `/proc/cmdline` (read
 /// fails).
+///
+/// In test builds, the `IS_GUEST_TEST_OVERRIDE` thread-local takes
+/// precedence over the `OnceLock`-cached natural detection; the
+/// `OnceLock` is consulted only when no override is set on the
+/// calling thread.
 pub fn is_guest() -> bool {
     #[cfg(test)]
     {

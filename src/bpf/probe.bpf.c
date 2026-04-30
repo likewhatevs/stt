@@ -311,10 +311,11 @@ int BPF_PROG(ktstr_trigger_tp, unsigned int kind)
 	 * sysrq — where `current` is the worker thread, not the task
 	 * that triggered the exit; emitting that as args[0] would
 	 * splatter the probe output with unstitched kworker frames.
-	 * Userspace process.rs:~1402 drops events with args[0] == 0,
-	 * so emitting 0 here suppresses the probe output for these
-	 * non-causal kinds. The error-exit latch above still records
-	 * the exit, so the failure remains observable in the dump.
+	 * The target_tptr filter in run_probe_skeleton drops events
+	 * with args[0] == 0, so emitting 0 here suppresses the probe
+	 * output for these non-causal kinds. The error-exit latch
+	 * above still records the exit, so the failure remains
+	 * observable in the dump.
 	 */
 	event->args[0] = (kind == SCX_EXIT_ERROR_BPF)
 		? (u64)bpf_get_current_task()
