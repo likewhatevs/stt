@@ -540,6 +540,13 @@ fn shm_write_and_release(fd: std::os::fd::OwnedFd, data: &[u8], seg_name: &str) 
 /// `immediate_exit` field is a single byte read by KVM atomically before
 /// entering `KVM_RUN`. Setting it to 1 causes the next `KVM_RUN` to return
 /// immediately with `EINTR`.
+///
+/// Clone+Copy so multiple threads (vCPU loop, watchdog, freeze coordinator)
+/// can each carry a handle pointing at the same MAP_SHARED `kvm_run` page.
+/// All writes go through `set` (single-byte `write_volatile`), so a value
+/// copy of `Self` is exactly equivalent to a borrowed reference for the
+/// access pattern KVM cares about.
+#[derive(Clone, Copy)]
 struct ImmediateExitHandle {
     ptr: *mut u8,
 }
@@ -879,9 +886,18 @@ struct VmRunState {
     ap_threads: Vec<VcpuThread>,
     monitor_handle: Option<JoinHandle<monitor::reader::MonitorLoopResult>>,
     bpf_write_handle: Option<JoinHandle<()>>,
+    freeze_coordinator: Option<JoinHandle<()>>,
     com1: Arc<PiMutex<console::Serial>>,
     com2: Arc<PiMutex<console::Serial>>,
     kill: Arc<AtomicBool>,
+    /// Broadcast freeze flag for the stall-dump coordinator. When the
+    /// coordinator receives a guest-side error-exit signal it sets this
+    /// to true, kicks every vCPU, waits for all `parked` flags to flip
+    /// true, and then reads guest BPF map state. Released to false to
+    /// resume normal execution. Lives alongside `kill` so the same Arc
+    /// pattern (broadcast + per-vCPU ACK) covers both shutdown and
+    /// freeze rendezvous.
+    freeze: Arc<AtomicBool>,
     vm: kvm::KtstrKvm,
     /// Captured immediately after the BSP exits its run loop. Subtracted
     /// from `Instant::now()` in [`KtstrVm::collect_results`] right before
@@ -899,6 +915,14 @@ struct VmRunState {
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
+
+/// Maximum wall-clock duration the freeze coordinator will wait for
+/// every vCPU to acknowledge parked state before logging a timeout
+/// and giving up on the dump. Well above the worst-case drain-dance
+/// and single-iteration park latency on healthy guests; a real
+/// timeout indicates a vCPU stuck in KVM_RUN that the
+/// `immediate_exit` kick failed to interrupt.
+const FREEZE_RENDEZVOUS_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Start of the guest physical address space used for RAM.
 /// x86_64: PA 0 (sub-1MB legacy regions share the same PA space).
@@ -932,6 +956,14 @@ struct VcpuThread {
     handle: JoinHandle<kvm_ioctls::VcpuFd>,
     /// Set by the thread after it exits the KVM_RUN loop.
     exited: Arc<AtomicBool>,
+    /// Set by the thread when it has completed the freeze drain dance
+    /// and is parked, awaiting clearance to resume. The freeze
+    /// coordinator polls this with Acquire ordering before reading
+    /// guest memory; the thread's prior Release store synchronizes-with
+    /// that load, providing the happens-before edge that makes
+    /// host-side guest-memory reads consistent on weakly-ordered
+    /// architectures.
+    parked: Arc<AtomicBool>,
     /// Handle to set `kvm_run.immediate_exit` from outside the vCPU thread.
     /// `None` when KVM_CAP_IMMEDIATE_EXIT is not available.
     immediate_exit: Option<ImmediateExitHandle>,
@@ -1254,6 +1286,14 @@ impl KtstrVm {
         let (wakeup_r, wakeup_w) = nix::unistd::pipe().context("create stdin wakeup pipe")?;
 
         let kill = Arc::new(AtomicBool::new(false));
+        // Interactive shell does not arm the stall-dump freeze
+        // pipeline (no monitor thread requesting freezes). Construct
+        // sentinel flags that stay false for the lifetime of the
+        // session so vcpu_run_loop_unified / run_bsp_loop see a stable
+        // freeze=false on every iteration and never enter the park
+        // path.
+        let freeze = Arc::new(AtomicBool::new(false));
+        let bsp_parked = Arc::new(AtomicBool::new(false));
         let has_immediate_exit = vm.has_immediate_exit;
         let mut vcpus = std::mem::take(&mut vm.vcpus);
         let mut bsp = vcpus.remove(0);
@@ -1272,6 +1312,7 @@ impl KtstrVm {
             &com2,
             Some(&virtio_con),
             &kill,
+            &freeze,
             &ap_pins,
             no_perf_mask,
         )?;
@@ -1554,6 +1595,8 @@ impl KtstrVm {
             &com2,
             Some(&virtio_con),
             &kill,
+            &freeze,
+            &bsp_parked,
             has_immediate_exit,
             start,
             interactive_timeout,
@@ -2405,6 +2448,18 @@ impl KtstrVm {
 
     /// Spawn threads and run the BSP. Returns all state needed for
     /// `collect_results`.
+    ///
+    /// # Stall-dump freeze
+    ///
+    /// When the BPF probe latches a sched_ext error-class exit
+    /// (SCX_EXIT_ERROR / _BPF / _STALL), a host-side coordinator
+    /// thread freezes every vCPU long enough to read BPF map state
+    /// for post-mortem analysis. The freeze is transparent to test
+    /// authors — the test still observes the same failure verdict
+    /// and exit path — but adds up to ~10 ms of thaw latency to the
+    /// failure path (the parked-vCPU poll cadence). Healthy runs
+    /// never enter the freeze path; the latch only fires on an
+    /// error-class scheduler exit.
     fn run_vm(&self, run_start: Instant, mut vm: kvm::KtstrKvm) -> Result<VmRunState> {
         let com1 = Arc::new(PiMutex::new(console::Serial::new(console::COM1_BASE)));
         let com2 = Arc::new(PiMutex::new(console::Serial::new(console::COM2_BASE)));
@@ -2430,6 +2485,16 @@ impl KtstrVm {
         }
 
         let kill = Arc::new(AtomicBool::new(false));
+        // Stall-dump freeze rendezvous: broadcast `freeze` flag plus a
+        // per-vCPU `parked` ACK, parallel to the existing `kill` +
+        // `exited` shutdown rendezvous. The freeze coordinator
+        // (spawned below alongside the watchdog) polls the BPF probe's
+        // `ktstr_err_exit_detected` .bss flag via `BpfMapAccessor`;
+        // when the flag flips it sets `freeze`, kicks every vCPU,
+        // awaits N-of-N parked confirmations, runs the dump (placeholder
+        // in this batch), and then clears `freeze` to thaw.
+        let freeze = Arc::new(AtomicBool::new(false));
+        let bsp_parked = Arc::new(AtomicBool::new(false));
 
         let has_immediate_exit = vm.has_immediate_exit;
         let mut vcpus = std::mem::take(&mut vm.vcpus);
@@ -2469,6 +2534,7 @@ impl KtstrVm {
             &com2,
             None,
             &kill,
+            &freeze,
             &ap_pins,
             no_perf_mask,
         )?;
@@ -2549,6 +2615,274 @@ impl KtstrVm {
         } else {
             None
         };
+
+        // Freeze coordinator thread: triggers a stall-dump freeze when
+        // the BPF probe's `ktstr_err_exit_detected` .bss latch fires
+        // (sched_ext error-class exit observed by tp_btf inside
+        // probe.bpf.c). The flag lives in the probe BPF program's
+        // .bss map — the coordinator polls it via host-side guest
+        // physical memory access, NOT via SHM TLV. Discovery is
+        // lazy: each iteration tries `BpfMapAccessor::find_map(".bss")`
+        // until the probe is loaded into map_idr, caches the
+        // value-region PA, then polls `mem.read_u32(pa, 0)` until
+        // non-zero.
+        //
+        // Sequencing combines Cloud Hypervisor's pause/snapshot
+        // pattern (drain dance + N-of-N rendezvous on parked acks)
+        // with Firecracker's SIGRTMIN+immediate_exit kick:
+        //   1. observe `ktstr_err_exit_detected != 0` via .bss read
+        //   2. set `freeze=true`
+        //   3. set every vCPU's immediate_exit=1 (two-pass kick: all
+        //      flags first, then signal all)
+        //   4. signal every vCPU thread (pthread_kill SIGRTMIN)
+        //   5. wait for N-of-N parked acks (Acquire-load on each
+        //      `parked` flag — synchronizes-with the vCPU's Release
+        //      store after the drain dance, providing the happens-
+        //      before edge that makes guest-memory reads correct on
+        //      weakly-ordered architectures)
+        //   6. (follow-up batch) call dump_state to read BPF map state
+        //   7. clear freeze=false; each parked vCPU polling on
+        //      park_timeout(10ms) observes the clear within 10 ms
+        //      and resumes — no explicit unpark needed
+        //
+        // DMA caveat: a guest with active DMA continues to mutate
+        // memory after vCPUs park. This is irrelevant for sched_ext
+        // BPF map reads (CPU-only) but a future feature reading
+        // DMA-affected pages should drain the device path first.
+        let freeze_coord_freeze = freeze.clone();
+        let freeze_coord_kill = kill.clone();
+        let freeze_coord_bsp_parked = bsp_parked.clone();
+        let freeze_coord_bsp_done = bsp_done.clone();
+        let freeze_coord_vmlinux = find_vmlinux(&self.kernel);
+        // GuestMem for the coordinator's .bss-poll path. Built from
+        // the same guest_mem the monitor uses; lifetime tied to the
+        // VM run.
+        let freeze_coord_mem = match vm.numa_layout.as_ref() {
+            Some(layout) => Some(monitor::reader::GuestMem::from_layout(
+                layout,
+                &vm.guest_mem,
+            )),
+            None => {
+                use vm_memory::GuestMemoryRegion;
+                if let Ok(host_base) = vm.guest_mem.get_host_address(GuestAddress(DRAM_BASE))
+                    && let Some(r) = vm.guest_mem.iter().next()
+                {
+                    let mem_size = r.len();
+                    // SAFETY: host_base came from GuestMemoryMmap's
+                    // get_host_address; mapping outlives this GuestMem
+                    // (vm.guest_mem outlives the coordinator thread —
+                    // collect_results joins the coordinator before vm
+                    // is dropped).
+                    Some(unsafe { monitor::reader::GuestMem::new(host_base, mem_size) })
+                } else {
+                    None
+                }
+            }
+        };
+        // Extract a fresh ImmediateExitHandle for the freeze coord —
+        // the watchdog grabs another one below for its own kick path.
+        // Both views address the same kvm_run.immediate_exit byte
+        // (single-byte volatile writes), distinct from the BSP's own
+        // owned handle inside its run loop.
+        let freeze_coord_bsp_ie_handle = if has_immediate_exit {
+            Some(ImmediateExitHandle::from_vcpu(&mut bsp))
+        } else {
+            None
+        };
+        let freeze_coord_bsp_tid = unsafe { libc::pthread_self() };
+        // Snapshot the AP-side freeze handles (immediate_exit + parked
+        // + thread handle for unpark) before run_vm hands ap_threads
+        // to VmRunState. The coordinator needs cross-thread access.
+        let freeze_coord_ap_parked: Vec<Arc<AtomicBool>> =
+            ap_threads.iter().map(|vt| vt.parked.clone()).collect();
+        let freeze_coord_ap_pthreads: Vec<libc::pthread_t> = ap_threads
+            .iter()
+            .map(|vt| vt.handle.as_pthread_t() as libc::pthread_t)
+            .collect();
+        // ImmediateExitHandle is Copy+Send+Sync, so the coordinator
+        // captures a Vec of them by move. The kvm_run mmap is shared
+        // between the spawned vCPU thread (which owns its handle
+        // inside VcpuThread) and the coordinator's copy — single-byte
+        // volatile writes through `set` from either side address the
+        // same MAP_SHARED page.
+        let freeze_coord_ap_ies: Vec<Option<ImmediateExitHandle>> =
+            ap_threads.iter().map(|vt| vt.immediate_exit).collect();
+        let freeze_coord_handle = std::thread::Builder::new()
+            .name("vmm-freeze-coord".into())
+            .spawn(move || {
+                // Build BpfMapAccessorOwned ONCE outside the poll loop.
+                // The constructor parses vmlinux ELF (goblin) and BTF
+                // (~MB-scale work); doing it per-iteration would be a
+                // ~300x waste over a typical 30 s VM run at 100 ms
+                // poll cadence. Construction may fail before the guest
+                // kernel finishes booting (probe BPF skeleton not yet
+                // loaded, BTF not yet readable from guest memory) —
+                // that's expected and we simply leave owned_accessor
+                // None and skip discovery this run. The freeze path
+                // is best-effort: a missing accessor disables stall-
+                // dump detection but doesn't break the VM run.
+                let owned_accessor =
+                    match (freeze_coord_mem.as_ref(), freeze_coord_vmlinux.as_ref()) {
+                        (Some(mem), Some(vmlinux)) => {
+                            crate::monitor::bpf_map::BpfMapAccessorOwned::new(mem, vmlinux).ok()
+                        }
+                        _ => None,
+                    };
+                // Lazy-discovered cached PA of `ktstr_err_exit_detected`
+                // within the probe BPF program's .bss map. None until
+                // the probe loads into map_idr (rust_init phase 2b);
+                // discovery retries each iteration until success.
+                let mut cached_bss_pa: Option<u64> = None;
+                let mut latched = false;
+                while !freeze_coord_kill.load(Ordering::Acquire) {
+                    if freeze_coord_bsp_done.load(Ordering::Acquire) {
+                        return;
+                    }
+                    // Try to discover the probe .bss map and cache the
+                    // PA of ktstr_err_exit_detected. Match by suffix
+                    // "probe_bp.bss" rather than ".bss" so we don't
+                    // race a scheduler-under-test's own .bss map when
+                    // multiple BPF programs are loaded — libbpf names
+                    // BPF program .bss maps as "<obj_short_name>.bss",
+                    // and the probe object's name is "probe_bp" (per
+                    // build.rs probe-skel generation, see the
+                    // generated probe_skel.rs match arm
+                    // `"probe_bp.bss" => bss = Some(map)`).
+                    //
+                    // TODO: byte offset of ktstr_err_exit_detected
+                    // within .bss is hardcoded to 0 below. This
+                    // depends on declaration order in
+                    // src/bpf/probe.bpf.c (the field is the first
+                    // writable global, preceded only by
+                    // `volatile const bool ktstr_enabled` which lives
+                    // in .rodata). Stable today; future BPF additions
+                    // that reorder globals would silently break
+                    // detection. Replace with BTF Datasec resolution
+                    // (find the VarSecinfo whose Var name resolves to
+                    // "ktstr_err_exit_detected" and use its `offset()`)
+                    // for belt-and-suspenders correctness.
+                    if cached_bss_pa.is_none()
+                        && let Some(ref owned) = owned_accessor
+                        && let Some(ref mem) = freeze_coord_mem
+                    {
+                        let accessor = owned.as_accessor();
+                        // Single map_idr walk per discovery attempt.
+                        // value_kva is Some for ARRAY maps (the .bss
+                        // map is a single-key ARRAY whose flex array
+                        // holds the section's bytes); translate it
+                        // (vmalloc-backed) to PA via the existing
+                        // GuestMem page-walk and cache the result so
+                        // subsequent polls are pure DRAM reads.
+                        if let Some(map) = accessor.find_map("probe_bp.bss")
+                            && let Some(value_kva) = map.value_kva
+                        {
+                            let cr3_pa = owned.guest_kernel().cr3_pa();
+                            let page_offset = owned.guest_kernel().page_offset();
+                            let l5 = owned.guest_kernel().l5();
+                            if let Some(translated) = crate::monitor::idr::translate_any_kva(
+                                mem,
+                                cr3_pa,
+                                page_offset,
+                                value_kva,
+                                l5,
+                            ) {
+                                cached_bss_pa = Some(translated);
+                            }
+                        }
+                    }
+                    // Poll the cached PA for the latch flip.
+                    let triggered =
+                        if let (Some(pa), Some(mem)) = (cached_bss_pa, freeze_coord_mem.as_ref()) {
+                            mem.read_u32(pa, 0) != 0
+                        } else {
+                            false
+                        };
+                    if !triggered || latched {
+                        std::thread::sleep(Duration::from_millis(100));
+                        continue;
+                    }
+                    // Latch so subsequent iterations don't re-fire even
+                    // though the BPF flag stays sticky on. One freeze
+                    // per VM run.
+                    latched = true;
+                    tracing::info!("freeze-coord: ktstr_err_exit_detected latched, freezing vCPUs");
+                    freeze_coord_freeze.store(true, Ordering::Release);
+                    // Pass 1: set every immediate_exit=1. Each
+                    // ImmediateExitHandle::set is a single-byte
+                    // write_volatile into the corresponding kvm_run
+                    // mmap (MAP_SHARED, lifetime tied to the running
+                    // VcpuFd that owns it).
+                    for ie in freeze_coord_ap_ies.iter().flatten() {
+                        ie.set(1);
+                    }
+                    if let Some(ref ie) = freeze_coord_bsp_ie_handle {
+                        ie.set(1);
+                    }
+                    // Release fence between pass 1 and pass 2 so all
+                    // immediate_exit writes are observable before any
+                    // vCPU thread receives the kick signal — without
+                    // this, a thread could process its signal, enter
+                    // KVM_RUN, and miss the immediate_exit byte that
+                    // is supposed to short-circuit guest entry.
+                    std::sync::atomic::fence(Ordering::Release);
+                    // Pass 2: signal every vCPU.
+                    for &tid in &freeze_coord_ap_pthreads {
+                        unsafe {
+                            libc::pthread_kill(tid, vcpu_signal());
+                        }
+                    }
+                    unsafe {
+                        libc::pthread_kill(freeze_coord_bsp_tid, vcpu_signal());
+                    }
+                    // Wait for N-of-N parked acks. The Acquire load
+                    // synchronizes-with the vCPU's Release store after
+                    // the drain dance — this rendezvous IS the memory
+                    // barrier that makes the future host-side
+                    // guest-memory reads correct.
+                    let deadline = Instant::now() + FREEZE_RENDEZVOUS_TIMEOUT;
+                    let mut all_parked = false;
+                    loop {
+                        if freeze_coord_kill.load(Ordering::Acquire)
+                            || freeze_coord_bsp_done.load(Ordering::Acquire)
+                        {
+                            break;
+                        }
+                        let aps_parked = freeze_coord_ap_parked
+                            .iter()
+                            .all(|p| p.load(Ordering::Acquire));
+                        let bsp_p = freeze_coord_bsp_parked.load(Ordering::Acquire);
+                        if aps_parked && bsp_p {
+                            all_parked = true;
+                            break;
+                        }
+                        if Instant::now() > deadline {
+                            // Per-vCPU parked status so the operator
+                            // can see which threads stalled.
+                            let ap_states: Vec<bool> = freeze_coord_ap_parked
+                                .iter()
+                                .map(|p| p.load(Ordering::Acquire))
+                                .collect();
+                            tracing::error!(
+                                ?ap_states,
+                                bsp_parked = bsp_p,
+                                "freeze-coord: timed out waiting for vCPUs to park"
+                            );
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_micros(100));
+                    }
+                    if all_parked {
+                        tracing::debug!("freeze-coord: all vCPUs parked, ready for state read");
+                    }
+                    // Dump-state hook lands here in a follow-up.
+                    // Thaw. Each parked vCPU is polling on
+                    // park_timeout(10ms), so the cleared freeze flag
+                    // is observed within at most 10 ms — no explicit
+                    // unpark needed for either APs or BSP.
+                    freeze_coord_freeze.store(false, Ordering::Release);
+                }
+            })
+            .context("spawn freeze coordinator thread")?;
 
         let watchdog = std::thread::Builder::new()
             .name("vmm-watchdog".into())
@@ -2642,6 +2976,8 @@ impl KtstrVm {
                     &com2,
                     None,
                     &kill,
+                    &freeze,
+                    &bsp_parked,
                     has_immediate_exit,
                     run_start,
                     timeout,
@@ -2665,15 +3001,26 @@ impl KtstrVm {
         // dropped first, the watchdog may write to unmapped memory.
         let _ = watchdog.join();
 
+        // Make sure freeze is cleared before vCPU teardown so the
+        // freeze coordinator sees `kill || bsp_done` and exits its
+        // loop, and APs don't park-loop after we kick them. The
+        // coordinator joins below.
+        freeze.store(false, Ordering::Release);
+        // Wake the coordinator if it's sleeping; it will observe
+        // bsp_done and return.
+        freeze_coord_handle.thread().unpark();
+
         Ok(VmRunState {
             exit_code,
             timed_out,
             ap_threads,
             monitor_handle,
             bpf_write_handle,
+            freeze_coordinator: Some(freeze_coord_handle),
             com1,
             com2,
             kill,
+            freeze,
             vm,
             cleanup_start,
         })
@@ -2694,6 +3041,7 @@ impl KtstrVm {
         com2: &Arc<PiMutex<console::Serial>>,
         virtio_con: Option<&Arc<PiMutex<virtio_console::VirtioConsole>>>,
         kill: &Arc<AtomicBool>,
+        freeze: &Arc<AtomicBool>,
         pin_targets: &[Option<usize>],
         no_perf_mask: Option<&[usize]>,
     ) -> Result<Vec<VcpuThread>> {
@@ -2710,11 +3058,15 @@ impl KtstrVm {
                 None
             };
             let kill_clone = kill.clone();
+            let freeze_clone = freeze.clone();
             let com1_clone = com1.clone();
             let com2_clone = com2.clone();
             let vc_clone = virtio_con.cloned();
             let exited = Arc::new(AtomicBool::new(false));
             let exited_clone = exited.clone();
+            let parked = Arc::new(AtomicBool::new(false));
+            let parked_clone = parked.clone();
+            let has_immediate_exit_clone = has_immediate_exit;
             let pin_cpu = pin_targets.get(i).copied().flatten();
             let mask_for_thread: Option<Vec<usize>> = no_perf_mask.map(|m| m.to_vec());
 
@@ -2742,6 +3094,9 @@ impl KtstrVm {
                             &com2_clone,
                             vc_clone.as_ref(),
                             &kill_clone,
+                            &freeze_clone,
+                            &parked_clone,
+                            has_immediate_exit_clone,
                         );
                     });
                     exited_clone.store(true, Ordering::Release);
@@ -2752,6 +3107,7 @@ impl KtstrVm {
             ap_threads.push(VcpuThread {
                 handle,
                 exited,
+                parked,
                 immediate_exit: ie_handle,
             });
         }
@@ -3162,6 +3518,14 @@ impl KtstrVm {
     /// Handles arch-specific I/O dispatch (port I/O on x86_64, MMIO on
     /// aarch64). HLT/WFI checks the kill flag and continues (both arches).
     /// Shutdown is via PSCI SystemEvent (aarch64) or VcpuExit::Shutdown (x86_64).
+    ///
+    /// `freeze` and `bsp_parked` plumb the BSP into the stall-dump
+    /// rendezvous: when the freeze coordinator latches `freeze=true`
+    /// and kicks the BSP out of KVM_RUN, the loop performs the
+    /// drain dance (set_immediate_exit(1)→run→set_immediate_exit(0)),
+    /// stores `bsp_parked=true` (Release), then polls `freeze` on
+    /// `park_timeout(10ms)` until the coordinator clears it. Same
+    /// pattern as [`exit_dispatch::vcpu_run_loop_unified`] for APs.
     #[allow(clippy::too_many_arguments)]
     fn run_bsp_loop(
         &self,
@@ -3170,6 +3534,8 @@ impl KtstrVm {
         com2: &Arc<PiMutex<console::Serial>>,
         virtio_con: Option<&Arc<PiMutex<virtio_console::VirtioConsole>>>,
         kill: &Arc<AtomicBool>,
+        freeze: &Arc<AtomicBool>,
+        bsp_parked: &Arc<AtomicBool>,
         has_immediate_exit: bool,
         run_start: Instant,
         timeout: Duration,
@@ -3182,6 +3548,16 @@ impl KtstrVm {
             }
             if kill.load(Ordering::Acquire) {
                 break;
+            }
+            // Honour a pending freeze before re-entering KVM_RUN.
+            // Same drain-dance + park pattern as the AP run loop —
+            // delegated to the shared `exit_dispatch::handle_freeze`
+            // so the two paths cannot drift.
+            if freeze.load(Ordering::Acquire) {
+                exit_dispatch::handle_freeze(bsp, has_immediate_exit, kill, freeze, bsp_parked);
+                if kill.load(Ordering::Acquire) {
+                    break;
+                }
             }
 
             match bsp.run() {
@@ -3231,14 +3607,35 @@ impl KtstrVm {
         let mut exit_code = run.exit_code;
         let timed_out = run.timed_out;
         run.kill.store(true, Ordering::Release);
+        // Clear freeze before kicking APs so any vCPU still in the
+        // park loop observes `freeze=false` next iteration and exits
+        // toward kill. Without this, an AP parked at the moment the
+        // BSP exited would stay parked through the kill check, since
+        // park_loop holds park_timeout(10ms) ignoring kill until
+        // freeze clears.
+        run.freeze.store(false, Ordering::Release);
 
-        // Kick APs still in KVM_RUN, then join. Skip APs that already
-        // exited — their VcpuFd (and kvm_run mmap) may be dropped, so
-        // writing to ImmediateExitHandle would hit unmapped memory.
+        // Kick APs out of KVM_RUN. Skip APs that already exited —
+        // their VcpuFd (and kvm_run mmap) may be dropped, so writing
+        // to ImmediateExitHandle would hit unmapped memory. Unpark
+        // each so a parked AP observes the cleared freeze flag
+        // promptly without waiting for the 10ms park_timeout.
         for vt in &run.ap_threads {
             if !vt.exited.load(Ordering::Acquire) {
                 vt.kick();
             }
+            vt.handle.thread().unpark();
+        }
+        // Join the freeze coordinator BEFORE the AP join loop. The
+        // coordinator owns ImmediateExitHandles into AP kvm_run mmaps;
+        // joining APs first would drop the VcpuFds (and unmap the
+        // pages) while the coordinator is still alive and could write
+        // to a stale immediate_exit pointer (use-after-free). Setting
+        // run.kill=true and run.freeze=false above guarantees the
+        // coordinator's outer loop and inner park-rendezvous exit on
+        // the next iteration, so this join doesn't deadlock.
+        if let Some(h) = run.freeze_coordinator {
+            let _ = h.join();
         }
         for vt in run.ap_threads {
             vt.wait_for_exit(Duration::from_secs(5));

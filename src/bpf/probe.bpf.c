@@ -59,6 +59,12 @@ volatile const bool ktstr_enabled = false;
  * 8-bit slots ("unsupported atomic operation, please use 32/64 bit
  * version"). The publishing site uses __sync_val_compare_and_swap
  * for cross-core-ordered publication on weakly-ordered architectures.
+ *
+ * MUST be the first writable .bss global — byte offset hardcoded to 0
+ * in src/vmm/mod.rs freeze coordinator. Reordering this declaration
+ * (or inserting another writable global before it) breaks the host's
+ * .bss-poll path; replace the hardcoded offset with BTF Datasec
+ * resolution before relaxing the ordering requirement.
  */
 volatile u32 ktstr_err_exit_detected = 0;
 

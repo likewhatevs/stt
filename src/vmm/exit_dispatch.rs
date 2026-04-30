@@ -93,16 +93,44 @@ fn mmio_serial_offset(addr: u64, base: u64) -> Option<u8> {
 /// HLT on APs: check kill + continue on both arches (KVM delivers
 /// interrupts to wake the vCPU). Shutdown sets the kill flag so all
 /// other vCPUs exit.
+///
+/// Freeze handling: when the freeze flag is set, the vCPU thread
+/// performs the Cloud Hypervisor pause/snapshot drain dance
+/// (set_immediate_exit(1) → vcpu.run() → set_immediate_exit(0)) so
+/// any in-flight PIO/MMIO operation completes inside the KVM_RUN
+/// ioctl before the thread parks. The drain is necessary because
+/// KVM_EXIT_IO/MMIO leave the operation only partially complete on
+/// the kernel side; userspace must re-enter KVM_RUN to commit it.
+/// After draining, the thread sets `parked=true` (Release-ordered so
+/// the host's subsequent guest-memory reads happen-after the
+/// drain), then polls freeze on park_timeout. The Acquire load on
+/// `parked` from the freeze coordinator IS the memory barrier that
+/// makes external-thread guest-memory reads correct on weakly
+/// ordered architectures (matches Cloud Hypervisor's pause
+/// pattern). The kick that triggers freeze observation uses
+/// Firecracker's SIGRTMIN+immediate_exit pattern, but the drain
+/// dance itself is Cloud Hypervisor-specific.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn vcpu_run_loop_unified(
     vcpu: &mut kvm_ioctls::VcpuFd,
     com1: &Arc<PiMutex<console::Serial>>,
     com2: &Arc<PiMutex<console::Serial>>,
     virtio_con: Option<&Arc<PiMutex<virtio_console::VirtioConsole>>>,
     kill: &Arc<AtomicBool>,
+    freeze: &Arc<AtomicBool>,
+    parked: &Arc<AtomicBool>,
+    has_immediate_exit: bool,
 ) {
     loop {
         if kill.load(Ordering::Acquire) {
             break;
+        }
+        // Honour a pending freeze before re-entering KVM_RUN.
+        if freeze.load(Ordering::Acquire) {
+            handle_freeze(vcpu, has_immediate_exit, kill, freeze, parked);
+            if kill.load(Ordering::Acquire) {
+                break;
+            }
         }
 
         match vcpu.run() {
@@ -140,6 +168,72 @@ pub(crate) fn vcpu_run_loop_unified(
             break;
         }
     }
+}
+
+/// Drain pending PIO/MMIO state and park the vCPU until freeze
+/// clears. Called from the run loop when the freeze flag is observed,
+/// and from `mod.rs::run_bsp_loop` for the same purpose on the BSP
+/// thread.
+///
+/// The drain dance — `set_immediate_exit(1) → vcpu.run() →
+/// set_immediate_exit(0)` — is the Cloud Hypervisor pause/snapshot
+/// pattern for completing in-flight I/O before pausing. KVM_RUN with
+/// immediate_exit=1 returns -EINTR without entering the guest but
+/// still commits any pending PIO/MMIO state from the previous exit
+/// (per the KVM API contract: pending I/O is committed at the start
+/// of KVM_RUN even when immediate_exit prevents guest entry).
+/// `has_immediate_exit` gates the dance — without
+/// KVM_CAP_IMMEDIATE_EXIT, calling `vcpu.run()` here would re-enter
+/// the guest instead of returning EINTR, so the drain step is
+/// skipped on kernels that lack the cap. The freeze rendezvous
+/// itself still works (set parked, await thaw); only the I/O drain
+/// is skipped.
+///
+/// After the drain, the thread sets `parked=true` with Release
+/// ordering and polls freeze on `park_timeout(10ms)` until the
+/// coordinator clears it. The thaw path uses no explicit unpark —
+/// the 10ms park_timeout cadence picks up the cleared freeze flag
+/// within at most 10 ms, which is well below the dump latency
+/// budget.
+///
+/// `kill` is honoured throughout: a shutdown signal during the park
+/// loop wins over freeze and the function returns to the caller's
+/// kill-check at the top of the loop.
+pub(crate) fn handle_freeze(
+    vcpu: &mut kvm_ioctls::VcpuFd,
+    has_immediate_exit: bool,
+    kill: &Arc<AtomicBool>,
+    freeze: &Arc<AtomicBool>,
+    parked: &Arc<AtomicBool>,
+) {
+    // Drain dance: complete any pending PIO/MMIO before parking.
+    // Skipped on kernels without KVM_CAP_IMMEDIATE_EXIT, where
+    // calling vcpu.run() with the cap absent would re-enter the
+    // guest instead of returning EINTR.
+    if has_immediate_exit {
+        vcpu.set_kvm_immediate_exit(1);
+        let _ = vcpu.run();
+        vcpu.set_kvm_immediate_exit(0);
+    }
+
+    // Acknowledge frozen state. The Release store synchronizes-with
+    // the coordinator's Acquire load on `parked`, providing the
+    // happens-before edge that makes the coordinator's subsequent
+    // guest-memory reads correct.
+    parked.store(true, Ordering::Release);
+
+    // Park until freeze clears or shutdown wins. park_timeout(10ms)
+    // bounds thaw latency so the coordinator's freeze=false store
+    // is observed within at most 10 ms — no explicit unpark needed.
+    while freeze.load(Ordering::Acquire) {
+        if kill.load(Ordering::Acquire) {
+            break;
+        }
+        std::thread::park_timeout(std::time::Duration::from_millis(10));
+    }
+
+    // Resume: clear parked so subsequent freeze cycles are observable.
+    parked.store(false, Ordering::Release);
 }
 
 // ---------------------------------------------------------------------------
