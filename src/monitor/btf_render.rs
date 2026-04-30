@@ -21,7 +21,7 @@
 //! and recursively renders the variable's type into that slice. The
 //! result is a [`RenderedValue::Struct`] whose `type_name` is the
 //! section name and whose `members` enumerate the section's variables
-//! by their declared names, so a stall dump's `.bss` map shows
+//! by their declared names, so a failure dump's `.bss` map shows
 //! `stall=1, crash=0, ...` instead of an opaque hex dump.
 //!
 //! Bitfield handling: when [`btf_rs::Member::bitfield_size`] is `Some(w)`,
@@ -607,9 +607,9 @@ fn render_struct(btf: &Btf, s: &Struct, bytes: &[u8], depth: u32) -> RenderedVal
 /// (e.g. `.bss`) and whose `members` are the section's variables —
 /// reusing `RenderedValue::Struct` rather than introducing a new
 /// variant keeps the existing serde shape (`kind: "struct"`) and
-/// Display layout intact, so a stall dump's `.bss` map renders
+/// Display layout intact, so a failure dump's `.bss` map renders
 /// alongside ordinary structs and JSON consumers (the
-/// `stall_dump_e2e.rs` fixture among them) iterate the variables via
+/// `failure_dump_e2e.rs` fixture among them) iterate the variables via
 /// `value.members[]` exactly as they iterate struct members today.
 ///
 /// Truncation: an out-of-range `(offset, size)` for the supplied
@@ -1458,7 +1458,7 @@ mod tests {
     // `BTF_KIND_DATASEC` (the value type libbpf assigns to a
     // global-section ARRAY map like `.bss`) and walking its
     // `VarSecinfo` entries to render each variable. Before the fix
-    // the renderer returned `Unsupported`, so a stall dump's `.bss`
+    // the renderer returned `Unsupported`, so a failure dump's `.bss`
     // map showed an opaque hex dump instead of `stall=1, crash=0,
     // ...`.
     //

@@ -938,7 +938,7 @@ struct VmRunState {
     com1: Arc<PiMutex<console::Serial>>,
     com2: Arc<PiMutex<console::Serial>>,
     kill: Arc<AtomicBool>,
-    /// Broadcast freeze flag for the stall-dump coordinator. When the
+    /// Broadcast freeze flag for the failure-dump coordinator. When the
     /// coordinator receives a guest-side error-exit signal it sets this
     /// to true, kicks every vCPU, waits for all `parked` flags to flip
     /// true, and then reads guest BPF map state. Released to false to
@@ -1351,7 +1351,7 @@ impl KtstrVm {
         let (wakeup_r, wakeup_w) = nix::unistd::pipe().context("create stdin wakeup pipe")?;
 
         let kill = Arc::new(AtomicBool::new(false));
-        // Interactive shell does not arm the stall-dump freeze
+        // Interactive shell does not arm the failure-dump freeze
         // pipeline (no monitor thread requesting freezes). Construct
         // sentinel flags that stay false for the lifetime of the
         // session so vcpu_run_loop_unified / run_bsp_loop see a stable
@@ -2519,7 +2519,7 @@ impl KtstrVm {
     /// Spawn threads and run the BSP. Returns all state needed for
     /// `collect_results`.
     ///
-    /// # Stall-dump freeze
+    /// # Failure-dump freeze
     ///
     /// When the BPF probe latches a sched_ext error-class exit
     /// (SCX_EXIT_ERROR / _BPF / _STALL), a host-side coordinator
@@ -2555,7 +2555,7 @@ impl KtstrVm {
         }
 
         let kill = Arc::new(AtomicBool::new(false));
-        // Stall-dump freeze rendezvous: broadcast `freeze` flag plus a
+        // Failure-dump freeze rendezvous: broadcast `freeze` flag plus a
         // per-vCPU `parked` ACK, parallel to the existing `kill` +
         // `exited` shutdown rendezvous. The freeze coordinator
         // (spawned below alongside the watchdog) polls the BPF probe's
@@ -2688,7 +2688,7 @@ impl KtstrVm {
             None
         };
 
-        // Freeze coordinator thread: triggers a stall-dump freeze when
+        // Freeze coordinator thread: triggers a failure-dump freeze when
         // the BPF probe's `ktstr_err_exit_detected` .bss latch fires
         // (sched_ext error-class exit observed by tp_btf inside
         // probe.bpf.c). The flag lives in the probe BPF program's
@@ -3080,8 +3080,8 @@ impl KtstrVm {
                     // error-class scheduler exit fired in the guest;
                     // the dump is post-mortem evidence, not routine
                     // observation.
-                    // Helper: emit a fully-built StallDumpReport via
-                    // tracing + the optional KTSTR_STALL_DUMP_PATH
+                    // Helper: emit a fully-built FailureDumpReport via
+                    // tracing + the optional KTSTR_FAILURE_DUMP_PATH
                     // file sink. Used by both the full-dump branch
                     // and the partial (vcpu_regs-only) branch below
                     // so the formatting / file-write contract stays
@@ -3089,20 +3089,20 @@ impl KtstrVm {
                     // see the same JSON shape and log target
                     // regardless of whether BTF/accessor were
                     // available.
-                    let emit_report = |report: &crate::monitor::dump::StallDumpReport| {
+                    let emit_report = |report: &crate::monitor::dump::FailureDumpReport| {
                         match serde_json::to_string_pretty(report) {
                             Ok(json) => {
                                 tracing::error!(
-                                    target: "ktstr::stall_dump",
+                                    target: "ktstr::failure_dump",
                                     map_count = report.maps.len(),
                                     vcpu_regs_count = report.vcpu_regs.len(),
-                                    "freeze-coord: stall dump\n{json}"
+                                    "freeze-coord: failure dump\n{json}"
                                 );
                                 // Optional file sink for E2E tests:
-                                // `KTSTR_STALL_DUMP_PATH` lets a test
+                                // `KTSTR_FAILURE_DUMP_PATH` lets a test
                                 // pin the rendered JSON to a known
                                 // path, parse it as a
-                                // `StallDumpReport`, and run
+                                // `FailureDumpReport`, and run
                                 // structured assertions. The env-var
                                 // gate matches existing ktstr
                                 // conventions (KTSTR_KERNEL,
@@ -3110,13 +3110,13 @@ impl KtstrVm {
                                 // write failure logs a warning and
                                 // does not affect the freeze/thaw
                                 // path.
-                                if let Ok(path) = std::env::var("KTSTR_STALL_DUMP_PATH")
+                                if let Ok(path) = std::env::var("KTSTR_FAILURE_DUMP_PATH")
                                     && let Err(e) = std::fs::write(&path, &json)
                                 {
                                     tracing::warn!(
                                         path = %path,
                                         error = %e,
-                                        "freeze-coord: KTSTR_STALL_DUMP_PATH write failed"
+                                        "freeze-coord: KTSTR_FAILURE_DUMP_PATH write failed"
                                     );
                                 }
                             }
@@ -3125,7 +3125,7 @@ impl KtstrVm {
                                     error = %e,
                                     map_count = report.maps.len(),
                                     vcpu_regs_count = report.vcpu_regs.len(),
-                                    "freeze-coord: stall dump (JSON serialization failed)"
+                                    "freeze-coord: failure dump (JSON serialization failed)"
                                 );
                             }
                         }
@@ -3182,7 +3182,7 @@ impl KtstrVm {
                         // empty `maps` Vec serialises to `"maps": []`
                         // (no skip_serializing_if on the Vec),
                         // signalling unambiguously "no map dump".
-                        let report = crate::monitor::dump::StallDumpReport {
+                        let report = crate::monitor::dump::FailureDumpReport {
                             maps: Vec::new(),
                             vcpu_regs: collect_vcpu_regs(),
                         };
@@ -3870,7 +3870,7 @@ impl KtstrVm {
     /// aarch64). HLT/WFI checks the kill flag and continues (both arches).
     /// Shutdown is via PSCI SystemEvent (aarch64) or VcpuExit::Shutdown (x86_64).
     ///
-    /// `freeze` and `bsp_parked` plumb the BSP into the stall-dump
+    /// `freeze` and `bsp_parked` plumb the BSP into the failure-dump
     /// rendezvous: when the freeze coordinator latches `freeze=true`
     /// and kicks the BSP out of KVM_RUN, the loop performs the
     /// drain dance (set_immediate_exit(1)→run→set_immediate_exit(0)),

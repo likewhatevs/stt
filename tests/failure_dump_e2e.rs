@@ -1,20 +1,20 @@
-//! End-to-end test for the stall-dump pipeline.
+//! End-to-end test for the failure-dump pipeline.
 //!
 //! Boots scx-ktstr with `--stall-after=1`, lets the BPF probe latch
 //! the resulting `SCX_EXIT_ERROR_STALL` exit, and asserts that the
 //! freeze coordinator's host-side dump captures BTF-rendered fields
 //! from the scheduler's `.bss` section.
 //!
-//! The dump path is gated on the `KTSTR_STALL_DUMP_PATH` env var:
+//! The dump path is gated on the `KTSTR_FAILURE_DUMP_PATH` env var:
 //! when set, the freeze coordinator also writes the JSON-pretty
-//! `StallDumpReport` to that path. This test sets the env var to a
+//! `FailureDumpReport` to that path. This test sets the env var to a
 //! tempfile-derived path before invoking `execute_steps`, then reads
 //! the file after the VM tears down.
 //!
 //! User-facing test bar (per project memory): "I see variable names
 //! and values in the logs when a scheduler stalls." This test
 //! enforces the host-side half of that bar — the file at
-//! `KTSTR_STALL_DUMP_PATH` must contain `stall`, `crash` and other
+//! `KTSTR_FAILURE_DUMP_PATH` must contain `stall`, `crash` and other
 //! BTF-resolved field names from `scx-ktstr`'s global section, not
 //! hex offsets, after a triggered stall.
 
@@ -27,25 +27,25 @@ const KTSTR_SCHED: Scheduler =
     Scheduler::new("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
 const KTSTR_SCHED_PAYLOAD: Payload = Payload::from_scheduler(&KTSTR_SCHED);
 
-/// Per-test path for the stall dump JSON. Each scenario function
+/// Per-test path for the failure dump JSON. Each scenario function
 /// computes its own unique path so parallel tests do not clobber
 /// each other (nextest runs tests in parallel). The path lives under
 /// `std::env::temp_dir()` so it cleans up via the OS tmp policy on
 /// host reboot; tests do not actively unlink because the file is
 /// useful debugging evidence on failure.
-fn stall_dump_path(test_name: &str) -> std::path::PathBuf {
+fn failure_dump_path(test_name: &str) -> std::path::PathBuf {
     let pid = std::process::id();
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.subsec_nanos())
         .unwrap_or(0);
-    std::env::temp_dir().join(format!("ktstr-stall-dump-{test_name}-{pid}-{nanos}.json"))
+    std::env::temp_dir().join(format!("ktstr-failure-dump-{test_name}-{pid}-{nanos}.json"))
 }
 
-fn scenario_stall_dump_renders_bss_fields(ctx: &ktstr::scenario::Ctx) -> Result<AssertResult> {
+fn scenario_failure_dump_renders_bss_fields(ctx: &ktstr::scenario::Ctx) -> Result<AssertResult> {
     // Compute the dump path FIRST and set the env var BEFORE
     // `execute_steps` spawns the VMM thread. The freeze coordinator
-    // reads `KTSTR_STALL_DUMP_PATH` inside its own closure when the
+    // reads `KTSTR_FAILURE_DUMP_PATH` inside its own closure when the
     // stall latch fires, so the env var must be visible before the
     // coord thread is born.
     //
@@ -53,9 +53,9 @@ fn scenario_stall_dump_renders_bss_fields(ctx: &ktstr::scenario::Ctx) -> Result<
     // shared across threads. This test sets a path that's unique to
     // the test (process-id + nanos) before any scheduler-affecting
     // work, so concurrent tests do not race for the same path.
-    let dump_path = stall_dump_path("renders_bss_fields");
+    let dump_path = failure_dump_path("renders_bss_fields");
     unsafe {
-        std::env::set_var("KTSTR_STALL_DUMP_PATH", &dump_path);
+        std::env::set_var("KTSTR_FAILURE_DUMP_PATH", &dump_path);
     }
 
     let steps = vec![Step {
@@ -86,7 +86,7 @@ fn scenario_stall_dump_renders_bss_fields(ctx: &ktstr::scenario::Ctx) -> Result<
             result.details.push(ktstr::assert::AssertDetail::new(
                 ktstr::assert::DetailKind::Other,
                 format!(
-                    "stall dump file missing at {}: {e} (freeze coordinator did \
+                    "failure dump file missing at {}: {e} (freeze coordinator did \
                      not write — either the SCX_EXIT_ERROR_STALL latch did not \
                      fire, owned_accessor / dump_btf was None, or the file \
                      write failed silently)",
@@ -94,7 +94,7 @@ fn scenario_stall_dump_renders_bss_fields(ctx: &ktstr::scenario::Ctx) -> Result<
                 ),
             ));
             anyhow::bail!(
-                "stall dump file missing at {} — freeze coordinator did not \
+                "failure dump file missing at {} — freeze coordinator did not \
                  write the JSON dump",
                 dump_path.display()
             );
@@ -102,7 +102,7 @@ fn scenario_stall_dump_renders_bss_fields(ctx: &ktstr::scenario::Ctx) -> Result<
     };
 
     // Parse as a generic JSON value to avoid an unbounded
-    // dependency on the (pub(crate)) `StallDumpReport` type from
+    // dependency on the (pub(crate)) `FailureDumpReport` type from
     // outside the crate.
     let value: serde_json::Value = serde_json::from_str(&json)
         .map_err(|e| anyhow::anyhow!("dump file is not valid JSON: {e}"))?;
@@ -289,7 +289,7 @@ fn scenario_stall_dump_renders_bss_fields(ctx: &ktstr::scenario::Ctx) -> Result<
     result.details.push(ktstr::assert::AssertDetail::new(
         ktstr::assert::DetailKind::Other,
         format!(
-            "stall-dump file at {} contains scheduler .bss render with \
+            "failure-dump file at {} contains scheduler .bss render with \
              stall={stall_int}, member count={}, vcpu_regs entries={} \
              ({} populated with non-zero IP)",
             dump_path.display(),
@@ -304,10 +304,10 @@ fn scenario_stall_dump_renders_bss_fields(ctx: &ktstr::scenario::Ctx) -> Result<
 
 #[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
 #[linkme(crate = ktstr::__private::linkme)]
-static __KTSTR_ENTRY_STALL_DUMP_BSS: ktstr::test_support::KtstrTestEntry =
+static __KTSTR_ENTRY_FAILURE_DUMP_BSS: ktstr::test_support::KtstrTestEntry =
     ktstr::test_support::KtstrTestEntry {
-        name: "stall_dump_renders_bss_fields",
-        func: scenario_stall_dump_renders_bss_fields,
+        name: "failure_dump_renders_bss_fields",
+        func: scenario_failure_dump_renders_bss_fields,
         scheduler: &KTSTR_SCHED_PAYLOAD,
         // --stall-after=1 makes the scheduler return early from
         // dispatch after 1 second of operation, triggering

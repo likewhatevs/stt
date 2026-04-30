@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Snapshot of a vCPU's architectural state, captured by the vCPU
 /// thread itself at freeze time (just before it parks). Surfaced in
-/// the stall-dump report so an operator can correlate the observed
+/// the failure-dump report so an operator can correlate the observed
 /// guest-memory state with where each vCPU was executing.
 ///
 /// Field naming is arch-neutral: each value is set from the matching
@@ -211,7 +211,7 @@ impl std::fmt::Display for VcpuRegSnapshot {
             self.instruction_pointer, self.stack_pointer, self.page_table_root
         )?;
         // user_page_table_root is x86_64-None / aarch64-Optional;
-        // when present, render it inline so an aarch64 stall
+        // when present, render it inline so an aarch64 failure
         // dump shows both halves of the address space.
         if let Some(uptr) = self.user_page_table_root {
             write!(f, " uptroot=0x{uptr:016x}")?;
@@ -753,7 +753,7 @@ mod vcpu_reg_snapshot_tests {
         let json = serde_json::to_string(&s).expect("serialize");
         // Pin the JSON key names so a future field rename is
         // caught here rather than in downstream consumers
-        // (operator JSON parsers, the stall_dump_e2e fixture).
+        // (operator JSON parsers, the failure_dump_e2e fixture).
         // Arch-neutral keys: see field doc on
         // VcpuRegSnapshot::page_table_root for the per-arch
         // semantics each one carries.

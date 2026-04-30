@@ -214,7 +214,7 @@ pub struct ArenaSnapshot {
 ///
 /// The walker is best-effort: any read failure on `bpf_arena` /
 /// `vm_struct` itself yields an empty snapshot rather than an error,
-/// so a corrupt arena can't break the broader stall dump.
+/// so a corrupt arena can't break the broader failure dump.
 pub fn snapshot_arena(
     kernel: &GuestKernel<'_>,
     info: &BpfMapInfo,

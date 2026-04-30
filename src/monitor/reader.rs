@@ -2407,7 +2407,7 @@ mod tests {
         );
         // Dump should NOT have fired — idle CPU is exempt.
         let dump_byte = combined[shm_pa as usize + crate::vmm::shm_ring::DUMP_REQ_OFFSET];
-        assert_eq!(dump_byte, 0, "idle CPU should not trigger stall dump");
+        assert_eq!(dump_byte, 0, "idle CPU should not trigger dump");
     }
 
     #[test]
@@ -2485,7 +2485,7 @@ mod tests {
             samples.len()
         );
         let dump_byte = combined[shm_pa as usize + crate::vmm::shm_ring::DUMP_REQ_OFFSET];
-        assert_eq!(dump_byte, 0, "preempted vCPU should not trigger stall dump");
+        assert_eq!(dump_byte, 0, "preempted vCPU should not trigger dump");
     }
 
     #[test]
@@ -2723,10 +2723,7 @@ mod tests {
 
         // Reactive: dump should NOT fire.
         let dump_byte = combined[shm_pa as usize + crate::vmm::shm_ring::DUMP_REQ_OFFSET];
-        assert_eq!(
-            dump_byte, 0,
-            "reactive: idle CPU should not trigger stall dump"
-        );
+        assert_eq!(dump_byte, 0, "reactive: idle CPU should not trigger dump");
 
         // Evaluate: from_samples should not detect stall.
         let summary = super::super::MonitorSummary::from_samples(&samples);

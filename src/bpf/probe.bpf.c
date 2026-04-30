@@ -85,7 +85,7 @@ volatile const bool ktstr_enabled = false;
  *    `!= 0`.
  *  - Clear: the freeze coordinator NEVER clears this byte. The
  *    latch is intentionally one-shot per VM run — the
- *    coordinator triggers at most one stall dump, and a re-armed
+ *    coordinator triggers at most one failure dump, and a re-armed
  *    latch would only matter if the VM kept running past the
  *    first error, which it does not (the dump is followed by VM
  *    teardown).
@@ -119,7 +119,7 @@ volatile const bool ktstr_enabled = false;
  *        direct PA write works there.
  *    Skipping the clear leaves the latch at `1`; the very first
  *    poll iteration after reload would observe the flipped flag
- *    and trigger a stall dump for state belonging to the
+ *    and trigger a failure dump for state belonging to the
  *    *previous* scheduler — a stale and misleading dump.
  *  - Reset: across VM runs, the BPF program is reloaded; libbpf
  *    re-zeroes .bss. There is no "clear and resume" path inside

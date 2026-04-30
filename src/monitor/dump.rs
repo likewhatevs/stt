@@ -1,4 +1,4 @@
-//! BPF map state dump for stall-trigger post-mortem.
+//! BPF map state dump for scheduler-failure post-mortem.
 //!
 //! [`dump_state`] is invoked by the freeze coordinator after the vCPU
 //! rendezvous succeeds (see `src/vmm/mod.rs`). It enumerates every
@@ -13,7 +13,7 @@
 //!   [`MAX_HASH_ENTRIES`].
 //! - `BPF_MAP_TYPE_PERCPU_ARRAY` — read each CPU's slot for keys
 //!   `0..min(max_entries, MAX_PERCPU_KEYS)`.
-//! - Other types — recorded as [`StallDumpMap::error`] so the operator
+//! - Other types — recorded as [`FailureDumpMap::error`] so the operator
 //!   sees the gap rather than a silent omission.
 //!
 //! # BTF source — per-map program BTF loading
@@ -46,14 +46,14 @@ use super::btf_render::{RenderedValue, render_value};
 /// internals.
 pub use crate::vmm::exit_dispatch::VcpuRegSnapshot;
 
-/// Top-level stall-dump report. One per freeze trigger.
+/// Top-level failure-dump report. One per freeze trigger.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[non_exhaustive]
-pub struct StallDumpReport {
+pub struct FailureDumpReport {
     /// One entry per BPF map enumerated. Order matches the IDR walk
     /// (i.e. allocation order); the report is otherwise unsorted so
     /// callers that want a stable view should sort by name.
-    pub maps: Vec<StallDumpMap>,
+    pub maps: Vec<FailureDumpMap>,
     /// Per-vCPU register snapshots captured on each vCPU thread at
     /// freeze time. Index matches vCPU id (BSP at 0, APs at 1..N).
     /// `None` when a vCPU never parked (rendezvous timeout) or its
@@ -72,7 +72,7 @@ pub struct StallDumpReport {
 /// successful render; on failure `error` is set and the rest empty.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
-pub struct StallDumpMap {
+pub struct FailureDumpMap {
     /// Map name as registered with the kernel. Truncated to
     /// `BPF_OBJ_NAME_LEN` (16) by the kernel; libbpf composes
     /// "<obj_name>.<section>" for global-section maps.
@@ -96,11 +96,11 @@ pub struct StallDumpMap {
     pub value: Option<RenderedValue>,
     /// (key, value) entries for HASH maps.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub entries: Vec<StallDumpEntry>,
+    pub entries: Vec<FailureDumpEntry>,
     /// Per-CPU slots for PERCPU_ARRAY maps. Outer Vec indexed by key,
     /// inner Vec indexed by CPU id.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub percpu_entries: Vec<StallDumpPercpuEntry>,
+    pub percpu_entries: Vec<FailureDumpPercpuEntry>,
     /// Page snapshot for `BPF_MAP_TYPE_ARENA` maps. `None` for all
     /// other map types.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -116,7 +116,7 @@ pub struct StallDumpMap {
 /// preserves the raw bytes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
-pub struct StallDumpEntry {
+pub struct FailureDumpEntry {
     /// Rendered key. `None` when no BTF type is available for the key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<RenderedValue>,
@@ -134,19 +134,19 @@ pub struct StallDumpEntry {
 /// (None for CPUs whose per-CPU page was unmapped or out-of-range).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
-pub struct StallDumpPercpuEntry {
+pub struct FailureDumpPercpuEntry {
     pub key: u32,
     pub per_cpu: Vec<Option<RenderedValue>>,
 }
 
-impl std::fmt::Display for StallDumpReport {
+impl std::fmt::Display for FailureDumpReport {
     /// Human-readable rendering of every map plus per-vCPU register
     /// snapshots. JSON remains the programmatic form via
     /// `serde_json`; this Display is the default presentation used
     /// in test-failure output.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.maps.is_empty() && self.vcpu_regs.is_empty() {
-            return f.write_str("(empty stall dump)");
+            return f.write_str("(empty failure dump)");
         }
         let mut first = true;
         for m in &self.maps {
@@ -173,7 +173,7 @@ impl std::fmt::Display for StallDumpReport {
     }
 }
 
-impl std::fmt::Display for StallDumpMap {
+impl std::fmt::Display for FailureDumpMap {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
@@ -205,7 +205,7 @@ impl std::fmt::Display for StallDumpMap {
     }
 }
 
-impl std::fmt::Display for StallDumpEntry {
+impl std::fmt::Display for FailureDumpEntry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("entry {\n  key: ")?;
         match &self.key {
@@ -221,7 +221,7 @@ impl std::fmt::Display for StallDumpEntry {
     }
 }
 
-impl std::fmt::Display for StallDumpPercpuEntry {
+impl std::fmt::Display for FailureDumpPercpuEntry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "key {}:", self.key)?;
         for (cpu, slot) in self.per_cpu.iter().enumerate() {
@@ -273,7 +273,7 @@ pub(crate) const MAX_BTF_BLOB: usize = 32 * 1024 * 1024;
 /// `<obj>.<section>` prefix (`SEC(".maps")` declarations like
 /// `func_meta_map`, `probe_data`, `probe_scratch`, `events`); the
 /// kernel registers them under the bare names listed here. They're
-/// framework-internal — the user looking at a stall dump for their
+/// framework-internal — the user looking at a failure dump for their
 /// scheduler doesn't care about ktstr's own kprobe scratch — so the
 /// dump path drops them.
 ///
@@ -300,9 +300,9 @@ pub fn dump_state(
     btf: &Btf,
     num_cpus: u32,
     arena_offsets: Option<&BpfArenaOffsets>,
-) -> StallDumpReport {
+) -> FailureDumpReport {
     let maps = accessor.maps();
-    let mut report = StallDumpReport {
+    let mut report = FailureDumpReport {
         maps: Vec::with_capacity(maps.len()),
         vcpu_regs: Vec::new(),
     };
@@ -458,8 +458,8 @@ fn render_map(
     info: &BpfMapInfo,
     num_cpus: u32,
     arena_offsets: Option<&BpfArenaOffsets>,
-) -> StallDumpMap {
-    let mut out = StallDumpMap {
+) -> FailureDumpMap {
+    let mut out = FailureDumpMap {
         name: info.name.clone(),
         map_type: info.map_type,
         value_size: info.value_size,
@@ -546,7 +546,7 @@ fn render_map(
                     (Some(b), id) if id != 0 => Some(render_value(b, id, &v)),
                     _ => None,
                 };
-                out.entries.push(StallDumpEntry {
+                out.entries.push(FailureDumpEntry {
                     key,
                     key_hex: hex_dump(&k),
                     value,
@@ -571,7 +571,7 @@ fn render_map(
                     })
                     .collect();
                 out.percpu_entries
-                    .push(StallDumpPercpuEntry { key, per_cpu });
+                    .push(FailureDumpPercpuEntry { key, per_cpu });
             }
             // Surface PERCPU_ARRAY key truncation, mirroring the
             // ARRAY (key 0 of N) and HASH (entries cap) patterns:
@@ -606,7 +606,9 @@ fn render_map(
             }
         }
         other => {
-            out.error = Some(format!("map_type {other} not yet supported by stall dump"));
+            out.error = Some(format!(
+                "map_type {other} not yet supported by failure dump"
+            ));
         }
     }
 
@@ -639,8 +641,8 @@ mod tests {
 
     #[test]
     fn report_serde_roundtrip() {
-        let report = StallDumpReport {
-            maps: vec![StallDumpMap {
+        let report = FailureDumpReport {
+            maps: vec![FailureDumpMap {
                 name: "scx_demo.bss".into(),
                 map_type: BPF_MAP_TYPE_ARRAY,
                 value_size: 8,
@@ -657,7 +659,7 @@ mod tests {
             vcpu_regs: Vec::new(),
         };
         let json = serde_json::to_string(&report).unwrap();
-        let parsed: StallDumpReport = serde_json::from_str(&json).unwrap();
+        let parsed: FailureDumpReport = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.maps.len(), 1);
         assert_eq!(parsed.maps[0].name, "scx_demo.bss");
         assert_eq!(parsed.maps[0].max_entries, 1);
@@ -665,9 +667,9 @@ mod tests {
 
     #[test]
     fn empty_report_serde() {
-        let report = StallDumpReport::default();
+        let report = FailureDumpReport::default();
         let json = serde_json::to_string(&report).unwrap();
-        let parsed: StallDumpReport = serde_json::from_str(&json).unwrap();
+        let parsed: FailureDumpReport = serde_json::from_str(&json).unwrap();
         assert!(parsed.maps.is_empty());
     }
 
@@ -676,8 +678,8 @@ mod tests {
     // The Display impl is the human-readable form used in test
     // failure output. Pin its layout against representative shapes.
 
-    fn make_simple_map() -> StallDumpMap {
-        StallDumpMap {
+    fn make_simple_map() -> FailureDumpMap {
+        FailureDumpMap {
             name: "scx_demo.bss".into(),
             map_type: BPF_MAP_TYPE_ARRAY,
             value_size: 8,
@@ -701,13 +703,13 @@ mod tests {
 
     #[test]
     fn report_display_empty() {
-        let report = StallDumpReport::default();
-        assert_eq!(format!("{report}"), "(empty stall dump)");
+        let report = FailureDumpReport::default();
+        assert_eq!(format!("{report}"), "(empty failure dump)");
     }
 
     #[test]
     fn report_display_one_map_with_value() {
-        let report = StallDumpReport {
+        let report = FailureDumpReport {
             maps: vec![make_simple_map()],
             vcpu_regs: Vec::new(),
         };
@@ -725,7 +727,7 @@ mod tests {
 
     #[test]
     fn report_display_multiple_maps_separated() {
-        let report = StallDumpReport {
+        let report = FailureDumpReport {
             maps: vec![make_simple_map(), make_simple_map()],
             vcpu_regs: Vec::new(),
         };
@@ -752,7 +754,7 @@ mod tests {
 
     #[test]
     fn entry_display_renders_key_and_value() {
-        let entry = StallDumpEntry {
+        let entry = FailureDumpEntry {
             key: Some(RenderedValue::Uint { bits: 32, value: 7 }),
             key_hex: "07 00 00 00".into(),
             value: Some(RenderedValue::Uint {
@@ -769,7 +771,7 @@ mod tests {
     #[test]
     fn entry_display_falls_back_to_hex_when_no_btf() {
         // No BTF → key/value are None; Display surfaces the hex.
-        let entry = StallDumpEntry {
+        let entry = FailureDumpEntry {
             key: None,
             key_hex: "ab cd".into(),
             value: None,
@@ -782,7 +784,7 @@ mod tests {
 
     #[test]
     fn percpu_entry_display_shows_each_cpu() {
-        let entry = StallDumpPercpuEntry {
+        let entry = FailureDumpPercpuEntry {
             key: 0,
             per_cpu: vec![
                 Some(RenderedValue::Uint { bits: 32, value: 1 }),
@@ -801,7 +803,7 @@ mod tests {
 
     #[test]
     fn report_display_includes_vcpu_regs_section() {
-        let report = StallDumpReport {
+        let report = FailureDumpReport {
             maps: Vec::new(),
             vcpu_regs: vec![
                 Some(VcpuRegSnapshot {
@@ -833,7 +835,7 @@ mod tests {
 
     #[test]
     fn report_display_pairs_maps_and_vcpu_regs_with_blank_line() {
-        let report = StallDumpReport {
+        let report = FailureDumpReport {
             maps: vec![make_simple_map()],
             vcpu_regs: vec![Some(VcpuRegSnapshot {
                 instruction_pointer: 0x1,
@@ -850,8 +852,8 @@ mod tests {
     #[test]
     fn report_display_empty_with_only_vcpu_regs_does_not_say_empty_dump() {
         // An all-empty maps Vec but populated vcpu_regs must still
-        // render rather than fall through to "(empty stall dump)".
-        let report = StallDumpReport {
+        // render rather than fall through to "(empty failure dump)".
+        let report = FailureDumpReport {
             maps: Vec::new(),
             vcpu_regs: vec![None],
         };
@@ -864,16 +866,16 @@ mod tests {
     /// `vmm::run_vm`'s freeze coordinator builds exactly this
     /// shape: empty `maps`, populated `vcpu_regs`. Operators
     /// reading the JSON / Display output rely on:
-    ///   - Display NOT rendering the "(empty stall dump)"
+    ///   - Display NOT rendering the "(empty failure dump)"
     ///     fallback (which would mask the partial),
     ///   - Display starting with the `vcpu_regs:` section,
     ///   - JSON serialising `"maps":[]` (NOT skipped, since
     ///     `Vec::is_empty` is the skip condition only for
     ///     `vcpu_regs` and a few `Option`/`Vec` fields inside
-    ///     `StallDumpMap`, not for the top-level `maps` field).
+    ///     `FailureDumpMap`, not for the top-level `maps` field).
     #[test]
     fn report_display_partial_with_populated_regs_and_empty_maps() {
-        let report = StallDumpReport {
+        let report = FailureDumpReport {
             maps: Vec::new(),
             vcpu_regs: vec![Some(VcpuRegSnapshot {
                 instruction_pointer: 0xdead,
@@ -894,7 +896,7 @@ mod tests {
             "Display must render the BSP register row: {out}"
         );
         assert!(
-            !out.contains("(empty stall dump)"),
+            !out.contains("(empty failure dump)"),
             "Display must NOT fall through to empty fallback when \
              vcpu_regs is populated: {out}"
         );
