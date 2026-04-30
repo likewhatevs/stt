@@ -48,6 +48,13 @@ pub const BPF_MAP_TYPE_ARRAY: u32 = 2;
 /// BPF_MAP_TYPE_PERCPU_ARRAY from include/uapi/linux/bpf.h.
 pub const BPF_MAP_TYPE_PERCPU_ARRAY: u32 = 6;
 
+/// BPF_MAP_TYPE_ARENA from include/uapi/linux/bpf.h.
+///
+/// Sparse, page-granular memory region shared between BPF programs
+/// and userspace. The host-side walker for arena pages lives in
+/// [`super::arena`].
+pub const BPF_MAP_TYPE_ARENA: u32 = 33;
+
 /// BPF_OBJ_NAME_LEN from include/linux/bpf.h.
 const BPF_OBJ_NAME_LEN: usize = 16;
 
@@ -604,6 +611,14 @@ impl<'a> BpfMapAccessor<'a> {
     /// No filtering by type or name.
     pub fn maps(&self) -> Vec<BpfMapInfo> {
         find_all_bpf_maps(&self.ctx(), self.map_idr_kva)
+    }
+
+    /// Borrow the underlying [`super::guest::GuestKernel`] for callers
+    /// that need direct access to symbol resolution / page-walk
+    /// primitives outside the map-discovery surface (e.g. arena page
+    /// enumeration in [`super::arena`]).
+    pub fn kernel(&self) -> &'a super::guest::GuestKernel<'a> {
+        self.kernel
     }
 
     /// Find the first BPF ARRAY map whose name ends with `name_suffix`.

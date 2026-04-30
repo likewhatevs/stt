@@ -14,17 +14,11 @@
 //! See the [Monitor](https://likewhatevs.github.io/ktstr/guide/architecture/monitor.html)
 //! chapter of the guide.
 
+pub mod arena;
 pub mod bpf_map;
 pub mod bpf_prog;
 pub mod btf_offsets;
-// `btf_render` and `dump` are not yet wired into the freeze
-// coordinator in `vmm::run_vm`; the dump-state hook there is a
-// follow-up. Until that hook lands, no host call sites reach the
-// public surface, so mark the modules `allow(dead_code)` to keep the
-// unused-warning sweep clean.
-#[allow(dead_code)]
 pub mod btf_render;
-#[allow(dead_code)]
 pub mod dump;
 pub mod guest;
 pub mod idr;

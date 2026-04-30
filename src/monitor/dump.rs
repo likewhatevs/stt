@@ -44,8 +44,10 @@ use serde::{Deserialize, Serialize};
 
 use btf_rs::Btf;
 
+use super::arena::{ArenaSnapshot, BpfArenaOffsets, snapshot_arena};
 use super::bpf_map::{
-    BPF_MAP_TYPE_ARRAY, BPF_MAP_TYPE_HASH, BPF_MAP_TYPE_PERCPU_ARRAY, BpfMapAccessor, BpfMapInfo,
+    BPF_MAP_TYPE_ARENA, BPF_MAP_TYPE_ARRAY, BPF_MAP_TYPE_HASH, BPF_MAP_TYPE_PERCPU_ARRAY,
+    BpfMapAccessor, BpfMapInfo,
 };
 use super::btf_render::{RenderedValue, render_value};
 
@@ -97,6 +99,10 @@ pub struct StallDumpMap {
     /// inner Vec indexed by CPU id.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub percpu_entries: Vec<StallDumpPercpuEntry>,
+    /// Page snapshot for `BPF_MAP_TYPE_ARENA` maps. `None` for all
+    /// other map types.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arena: Option<ArenaSnapshot>,
     /// Reason this map's contents are missing or partial. Empty on
     /// successful render.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -170,11 +176,20 @@ const KTSTR_INTERNAL_MAPS: &[&str] = &["func_meta_map", "probe_data", "probe_scr
 /// `num_cpus` is the guest's `nr_cpu_ids`; pass `1` for non-percpu-only
 /// dumps if the caller doesn't have the value handy.
 ///
+/// `arena_offsets` enables `BPF_MAP_TYPE_ARENA` page snapshotting.
+/// `None` skips arena rendering (e.g. older kernel without arena
+/// support, or BTF that lacks `struct bpf_arena`).
+///
 /// The dump is best-effort: a map that fails to render lands in the
 /// report with `error: Some(...)` rather than aborting the whole walk,
 /// so a single corrupt map can't blind the operator to the rest of
 /// the scheduler's state.
-pub fn dump_state(accessor: &BpfMapAccessor<'_>, btf: &Btf, num_cpus: u32) -> StallDumpReport {
+pub fn dump_state(
+    accessor: &BpfMapAccessor<'_>,
+    btf: &Btf,
+    num_cpus: u32,
+    arena_offsets: Option<&BpfArenaOffsets>,
+) -> StallDumpReport {
     let maps = accessor.maps();
     let mut report = StallDumpReport {
         maps: Vec::with_capacity(maps.len()),
@@ -212,7 +227,9 @@ pub fn dump_state(accessor: &BpfMapAccessor<'_>, btf: &Btf, num_cpus: u32) -> St
         {
             continue;
         }
-        report.maps.push(render_map(accessor, btf, &info, num_cpus));
+        report
+            .maps
+            .push(render_map(accessor, btf, &info, num_cpus, arena_offsets));
     }
 
     report
@@ -223,6 +240,7 @@ fn render_map(
     btf: &Btf,
     info: &BpfMapInfo,
     num_cpus: u32,
+    arena_offsets: Option<&BpfArenaOffsets>,
 ) -> StallDumpMap {
     let mut out = StallDumpMap {
         name: info.name.clone(),
@@ -232,6 +250,7 @@ fn render_map(
         value: None,
         entries: Vec::new(),
         percpu_entries: Vec::new(),
+        arena: None,
         error: None,
     };
 
@@ -330,6 +349,37 @@ fn render_map(
                 out.percpu_entries
                     .push(StallDumpPercpuEntry { key, per_cpu });
             }
+            // Surface PERCPU_ARRAY key truncation, mirroring the
+            // ARRAY (key 0 of N) and HASH (entries cap) patterns:
+            // when the map declares more keys than [`MAX_PERCPU_KEYS`],
+            // the dump only walks the first MAX_PERCPU_KEYS slots and
+            // the consumer needs to know the rest are dropped.
+            if info.max_entries > MAX_PERCPU_KEYS {
+                out.error = Some(format!(
+                    "PERCPU_ARRAY truncated at {MAX_PERCPU_KEYS} keys (max_entries={})",
+                    info.max_entries,
+                ));
+            }
+        }
+        BPF_MAP_TYPE_ARENA => {
+            // Arena pages live in vmalloc space and are translated
+            // via the existing PTE walker; rendering is page-granular
+            // (4 KiB per ArenaPage) rather than struct-granular
+            // because arena memory has no canonical type schema —
+            // BPF programs allocate raw memory regions and impose
+            // their own layouts. Operators can post-process the page
+            // bytes against the program's data structure docs.
+            match arena_offsets {
+                Some(off) => {
+                    let snap = snapshot_arena(accessor.kernel(), info, off);
+                    out.arena = Some(snap);
+                }
+                None => {
+                    out.error = Some(
+                        "arena BTF offsets unavailable (kernel lacks struct bpf_arena?)".into(),
+                    );
+                }
+            }
         }
         other => {
             out.error = Some(format!("map_type {other} not yet supported by stall dump"));
@@ -377,6 +427,7 @@ mod tests {
                 }),
                 entries: Vec::new(),
                 percpu_entries: Vec::new(),
+                arena: None,
                 error: None,
             }],
         };

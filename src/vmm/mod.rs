@@ -2707,27 +2707,52 @@ impl KtstrVm {
         // same MAP_SHARED page.
         let freeze_coord_ap_ies: Vec<Option<ImmediateExitHandle>> =
             ap_threads.iter().map(|vt| vt.immediate_exit).collect();
+        // Total vCPU count (BSP + APs). Forwarded into dump_state so
+        // PERCPU_ARRAY map rendering knows how many per-CPU slots to
+        // read — `bpf_array.pptrs[k]` is a `void __percpu *` whose
+        // per-CPU expansion needs `__per_cpu_offset[0..nr_cpu_ids]`.
+        let freeze_coord_num_cpus = (ap_threads.len() + 1) as u32;
         let freeze_coord_handle = std::thread::Builder::new()
             .name("vmm-freeze-coord".into())
             .spawn(move || {
-                // Build BpfMapAccessorOwned ONCE outside the poll loop.
-                // The constructor parses vmlinux ELF (goblin) and BTF
-                // (~MB-scale work); doing it per-iteration would be a
-                // ~300x waste over a typical 30 s VM run at 100 ms
-                // poll cadence. Construction may fail before the guest
-                // kernel finishes booting (probe BPF skeleton not yet
-                // loaded, BTF not yet readable from guest memory) —
-                // that's expected and we simply leave owned_accessor
-                // None and skip discovery this run. The freeze path
-                // is best-effort: a missing accessor disables stall-
-                // dump detection but doesn't break the VM run.
-                let owned_accessor =
-                    match (freeze_coord_mem.as_ref(), freeze_coord_vmlinux.as_ref()) {
-                        (Some(mem), Some(vmlinux)) => {
-                            crate::monitor::bpf_map::BpfMapAccessorOwned::new(mem, vmlinux).ok()
-                        }
-                        _ => None,
-                    };
+                // Lazy-construct BpfMapAccessorOwned. The constructor
+                // parses vmlinux ELF (goblin) and BTF (~MB-scale
+                // work) and reads guest-memory bootstrap symbols
+                // (`page_offset_base`, `pgtable_l5_enabled`,
+                // `init_top_pgt`); the latter aren't readable until
+                // the guest kernel has populated them, so a
+                // construction attempt at coord-start can fail with
+                // a still-booting guest. The fix is the same lazy-
+                // discovery pattern that `cached_bss_pa` uses below:
+                // try each iteration until success, then cache —
+                // gated on `owned_accessor.is_none()` so the heavy
+                // parse runs at most once per coordinator (only the
+                // failed attempts re-pay it, and only until the
+                // first success). A single one-shot construct at
+                // coord-start would have left the accessor None
+                // permanently if the guest hadn't booted yet,
+                // disabling freeze detection AND the dump for the
+                // entire run.
+                let mut owned_accessor: Option<crate::monitor::bpf_map::BpfMapAccessorOwned> = None;
+                // BTF + arena offsets resolved once at coordinator
+                // start. Used by `dump_state` after the rendezvous
+                // succeeds to render every BPF map's contents. None
+                // values disable rendering for the relevant code path
+                // (no BTF → no BTF-driven rendering at all; no arena
+                // offsets → arena maps fall back to an explanatory
+                // error string in the report).
+                //
+                // Arena offsets derive from the same parsed `Btf`
+                // handle (`from_btf`, not `from_vmlinux`) so the
+                // ELF-to-BTF parse runs exactly once per coordinator
+                // — a second `from_vmlinux` would re-read and
+                // re-parse the same file.
+                let dump_btf = freeze_coord_vmlinux
+                    .as_ref()
+                    .and_then(|v| crate::monitor::btf_offsets::load_btf_from_path(v).ok());
+                let dump_arena_offsets = dump_btf
+                    .as_ref()
+                    .and_then(|btf| crate::monitor::arena::BpfArenaOffsets::from_btf(btf).ok());
                 // Lazy-discovered cached PA of `ktstr_err_exit_detected`
                 // within the probe BPF program's .bss map. None until
                 // the probe loads into map_idr (rust_init phase 2b);
@@ -2737,6 +2762,21 @@ impl KtstrVm {
                 while !freeze_coord_kill.load(Ordering::Acquire) {
                     if freeze_coord_bsp_done.load(Ordering::Acquire) {
                         return;
+                    }
+                    // Lazy retry: the accessor's GuestKernel walk
+                    // depends on guest-memory bootstrap symbols
+                    // populated by the guest kernel during boot, so
+                    // an attempt at coord-start can fail. Retry each
+                    // iteration until success; gated on
+                    // `owned_accessor.is_none()` so the heavy
+                    // ELF/BTF parse runs at most once after the
+                    // first successful attempt.
+                    if owned_accessor.is_none()
+                        && let (Some(mem), Some(vmlinux)) =
+                            (freeze_coord_mem.as_ref(), freeze_coord_vmlinux.as_ref())
+                    {
+                        owned_accessor =
+                            crate::monitor::bpf_map::BpfMapAccessorOwned::new(mem, vmlinux).ok();
                     }
                     // Try to discover the probe .bss map and cache the
                     // PA of ktstr_err_exit_detected. Match by suffix
@@ -2871,10 +2911,89 @@ impl KtstrVm {
                         }
                         std::thread::sleep(Duration::from_micros(100));
                     }
-                    if all_parked {
-                        tracing::debug!("freeze-coord: all vCPUs parked, ready for state read");
+                    // Dump BPF map state while every vCPU is parked.
+                    // Only run when the rendezvous succeeded (no
+                    // timeout) AND every prerequisite is in place:
+                    //   - owned_accessor: BPF map walker (vmlinux ELF
+                    //     parse + BTF + map_idr symbol)
+                    //   - dump_btf: BTF for type-driven rendering
+                    //
+                    // A timeout reaching here without all_parked means
+                    // some vCPU is still inside KVM_RUN; reading guest
+                    // memory before that vCPU has Released its
+                    // `parked` flag would race writes. Skip the dump
+                    // in that case so the operator gets an empty
+                    // section with the timeout already logged above.
+                    //
+                    // Output goes through tracing::error (rather than
+                    // info) because reaching this branch means an
+                    // error-class scheduler exit fired in the guest;
+                    // the dump is post-mortem evidence, not routine
+                    // observation.
+                    if all_parked
+                        && let Some(ref owned) = owned_accessor
+                        && let Some(ref btf) = dump_btf
+                    {
+                        let report = crate::monitor::dump::dump_state(
+                            &owned.as_accessor(),
+                            btf,
+                            freeze_coord_num_cpus,
+                            dump_arena_offsets.as_ref(),
+                        );
+                        match serde_json::to_string_pretty(&report) {
+                            Ok(json) => {
+                                tracing::error!(
+                                    target: "ktstr::stall_dump",
+                                    map_count = report.maps.len(),
+                                    "freeze-coord: stall dump\n{json}"
+                                );
+                                // Optional file sink for E2E tests:
+                                // `KTSTR_STALL_DUMP_PATH` lets a test
+                                // pin the rendered JSON to a known
+                                // path, parse it as a
+                                // `StallDumpReport`, and run
+                                // structured assertions. The env-var
+                                // gate matches existing ktstr
+                                // conventions (KTSTR_KERNEL,
+                                // KTSTR_CACHE_DIR). Best-effort: a
+                                // write failure logs a warning and
+                                // does not affect the freeze/thaw
+                                // path.
+                                if let Ok(path) = std::env::var("KTSTR_STALL_DUMP_PATH")
+                                    && let Err(e) = std::fs::write(&path, &json)
+                                {
+                                    tracing::warn!(
+                                        path = %path,
+                                        error = %e,
+                                        "freeze-coord: KTSTR_STALL_DUMP_PATH write failed"
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    error = %e,
+                                    map_count = report.maps.len(),
+                                    "freeze-coord: stall dump (JSON serialization failed)"
+                                );
+                            }
+                        }
+                    } else if all_parked {
+                        tracing::debug!(
+                            "freeze-coord: all vCPUs parked but dump prerequisites \
+                             unavailable (owned_accessor={}, dump_btf={})",
+                            owned_accessor.is_some(),
+                            dump_btf.is_some(),
+                        );
+                    } else {
+                        // Rendezvous timed out — at least one vCPU
+                        // never set its parked flag, so we cannot
+                        // safely read guest memory. Surface the
+                        // causal link so an operator reading the
+                        // log doesn't have to infer "no dump =
+                        // timeout" from the absence of a dump
+                        // record.
+                        tracing::debug!("freeze-coord: dump skipped: rendezvous timed out");
                     }
-                    // Dump-state hook lands here in a follow-up.
                     // Thaw. Each parked vCPU is polling on
                     // park_timeout(10ms), so the cleared freeze flag
                     // is observed within at most 10 ms — no explicit
