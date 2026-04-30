@@ -209,13 +209,21 @@ pub(crate) fn discover_struct_ops_stats(
 /// `bpf_prog_stats` and sums across CPUs. Uses pre-resolved
 /// `__per_cpu_offset` array for address resolution.
 ///
-/// Uses direct-mapping translation only (kva_to_pa); percpu arenas
-/// are always in the direct mapping.
+/// Address translation uses [`translate_any_kva`], which tries the
+/// direct mapping first and falls through to a page-table walk when
+/// the percpu KVA lives in vmalloc'd memory (large dynamic per-CPU
+/// allocations served by `pcpu_get_vm_areas`). The pre-fix path
+/// assumed `bpf_prog_stats` always lived in the direct mapping —
+/// which is true for static percpu and small kmalloc'd percpu, but
+/// not for vmalloc-backed percpu — and silently dropped per-CPU
+/// readings whose PA fell outside the direct mapping.
 pub(crate) fn read_prog_runtime_stats(
     mem: &GuestMem,
     cached: &[CachedProgInfo],
     per_cpu_offsets: &[u64],
+    cr3_pa: u64,
     page_offset: u64,
+    l5: bool,
     offsets: &BpfProgOffsets,
 ) -> Vec<ProgRuntimeStats> {
     cached
@@ -225,8 +233,9 @@ pub(crate) fn read_prog_runtime_stats(
             let mut nsecs: u64 = 0;
             for &cpu_off in per_cpu_offsets {
                 let stats_kva = prog.stats_percpu_kva.wrapping_add(cpu_off);
-                let stats_pa = super::symbols::kva_to_pa(stats_kva, page_offset);
-                if stats_pa < mem.size() {
+                if let Some(stats_pa) = translate_any_kva(mem, cr3_pa, page_offset, stats_kva, l5)
+                    && stats_pa < mem.size()
+                {
                     cnt += mem.read_u64(stats_pa, offsets.stats_cnt);
                     nsecs += mem.read_u64(stats_pa, offsets.stats_nsecs);
                 }

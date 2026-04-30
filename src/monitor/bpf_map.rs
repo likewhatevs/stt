@@ -450,8 +450,14 @@ fn iter_htab_entries(ctx: &AccessorCtx<'_>, map: &BpfMapInfo) -> Vec<(Vec<u8>, V
 /// Read the per-CPU values for a single key in a `BPF_MAP_TYPE_PERCPU_ARRAY` map.
 ///
 /// `bpf_array.pptrs[key]` holds a `__percpu` pointer. Adding
-/// `__per_cpu_offset[cpu]` yields the per-CPU KVA, which resides in
-/// the direct mapping.
+/// `__per_cpu_offset[cpu]` yields the per-CPU KVA, which may live
+/// either in the direct mapping (static percpu, kmalloc'd percpu)
+/// or in vmalloc'd memory (large dynamic per-CPU allocations).
+/// Address translation goes through [`translate_any_kva`], which
+/// tries direct mapping first and falls through to a page-table
+/// walk for vmalloc'd percpu — so a per-CPU value that misses the
+/// direct mapping no longer reads as `None` simply because the
+/// underlying allocation lives in vmalloc.
 ///
 /// Returns one entry per CPU, indexed by CPU number. `Some(bytes)`
 /// when the per-CPU PA falls within guest memory; `None` when it
@@ -493,13 +499,20 @@ fn read_percpu_array_value(
 
     for &cpu_off in per_cpu_offsets {
         let cpu_kva = percpu_base.wrapping_add(cpu_off);
-        let cpu_pa = super::symbols::kva_to_pa(cpu_kva, ctx.page_offset.0);
-        if cpu_pa + value_size as u64 <= ctx.mem.size() {
-            let mut buf = vec![0u8; value_size];
-            ctx.mem.read_bytes(cpu_pa, &mut buf);
-            result.push(Some(buf));
-        } else {
-            result.push(None);
+        // The percpu base + cpu_off may land in either the direct
+        // mapping (per-CPU __percpu allocations from the static
+        // percpu region or kmalloc'd percpu blocks) or vmalloc'd
+        // percpu memory (large dynamic per-CPU allocations served
+        // from pcpu_get_vm_areas). `translate_any_kva` tries direct
+        // mapping first and falls through to a page-table walk for
+        // vmalloc'd percpu, so it covers both.
+        match translate_any_kva(ctx.mem, ctx.cr3_pa.0, ctx.page_offset.0, cpu_kva, ctx.l5) {
+            Some(cpu_pa) if cpu_pa + value_size as u64 <= ctx.mem.size() => {
+                let mut buf = vec![0u8; value_size];
+                ctx.mem.read_bytes(cpu_pa, &mut buf);
+                result.push(Some(buf));
+            }
+            _ => result.push(None),
         }
     }
 
@@ -4377,5 +4390,129 @@ mod tests {
             result.is_empty(),
             "unmapped bpf_array should return empty vec"
         );
+    }
+
+    /// Regression for the #16 fix: when the per-CPU value lives in
+    /// vmalloc'd percpu memory (outside the direct mapping), the
+    /// pre-fix `kva_to_pa` math produced an out-of-bounds PA and the
+    /// CPU read fell through to `None`. Post-fix `translate_any_kva`
+    /// falls through to a page-table walk and resolves the value.
+    ///
+    /// Constructs a single-CPU percpu map whose percpu_base KVA is
+    /// only reachable via page table entries — `kva_to_pa(kva,
+    /// page_offset)` would yield a PA past the mapped GuestMem
+    /// region, so the pre-fix path emitted `None`. The buffer wires
+    /// PGD -> PUD -> PMD -> PTE for the percpu KVA so the new
+    /// `translate_any_kva` path translates and reads the planted
+    /// marker bytes.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn read_percpu_array_kva_via_page_table() {
+        // Percpu base lives in vmalloc range (well above PAGE_OFFSET +
+        // buf.len(), so direct-mapping math falls off the end of mem).
+        let percpu_base_kva: u64 = 0xFFFF_C900_0010_0000;
+        let pgd_idx = (percpu_base_kva >> 39) & 0x1FF;
+        let pud_idx = (percpu_base_kva >> 30) & 0x1FF;
+        let pmd_idx = (percpu_base_kva >> 21) & 0x1FF;
+        let pte_idx = (percpu_base_kva >> 12) & 0x1FF;
+
+        // Layout:
+        //   0x10000: PGD
+        //   0x11000: PUD
+        //   0x12000: PMD
+        //   0x13000: PTE -> percpu_base_pa
+        //   0x14000: bpf_array (pptrs at array_value offset)
+        //   0x15000: PTE -> percpu_base_pa (planted percpu value)
+        let pgd_pa: u64 = 0x10000;
+        let pud_pa: u64 = 0x11000;
+        let pmd_pa: u64 = 0x12000;
+        let pte_pa: u64 = 0x13000;
+        let array_pa: u64 = 0x14000;
+        let percpu_base_pa: u64 = 0x15000;
+
+        // bpf_array KVA still uses direct mapping for simplicity.
+        let map_kva: u64 = 0xFFFF_8880_0001_4000; // PAGE_OFFSET + 0x14000.
+
+        let offsets = BpfMapOffsets {
+            map_name: 32,
+            map_type: 24,
+            map_flags: 28,
+            key_size: 44,
+            value_size: 48,
+            max_entries: 52,
+            array_value: 256,
+            xa_node_slots: 16,
+            xa_node_shift: 0,
+            idr_xa_head: 8,
+            idr_next: 20,
+            map_btf: 0,
+            map_btf_value_type_id: 0,
+            btf_data: 0,
+            btf_data_size: 0,
+            htab_offsets: None,
+        };
+
+        let size = 0x16000;
+        let mut buf = vec![0u8; size];
+
+        let write_u64 = |buf: &mut Vec<u8>, pa: u64, val: u64| {
+            let off = pa as usize;
+            buf[off..off + 8].copy_from_slice(&val.to_ne_bytes());
+        };
+
+        // Page table: PGD -> PUD -> PMD -> PTE -> percpu_base_pa.
+        write_u64(&mut buf, pgd_pa + pgd_idx * 8, (pud_pa + PTE_BASE) | 0x63);
+        write_u64(&mut buf, pud_pa + pud_idx * 8, (pmd_pa + PTE_BASE) | 0x63);
+        write_u64(&mut buf, pmd_pa + pmd_idx * 8, (pte_pa + PTE_BASE) | 0x63);
+        write_u64(
+            &mut buf,
+            pte_pa + pte_idx * 8,
+            (percpu_base_pa + PTE_BASE) | 0x63,
+        );
+
+        // pptrs[0] at array_value offset = percpu_base_kva.
+        let pptrs_pa = array_pa + offsets.array_value as u64;
+        write_u64(&mut buf, pptrs_pa, percpu_base_kva);
+
+        // Plant a marker at the percpu_base_pa for CPU 0 (cpu_off=0).
+        let marker: u64 = 0xDEAD_BEEF_F00D_CAFE;
+        write_u64(&mut buf, percpu_base_pa, marker);
+
+        let info = BpfMapInfo {
+            map_pa: array_pa,
+            map_kva,
+            name: "vmalloc_percpu".into(),
+            map_type: BPF_MAP_TYPE_PERCPU_ARRAY,
+            map_flags: 0,
+            key_size: 4,
+            value_size: 8,
+            max_entries: 1,
+            value_kva: None,
+            btf_kva: 0,
+            btf_value_type_id: 0,
+        };
+
+        // Direct-mapping math for the percpu KVA would yield
+        // percpu_base_kva - page_offset = 0x4900_0010_0000 — well
+        // past the 0x16000 buffer end. The pre-fix path read this
+        // out-of-bounds PA and emitted `None`.
+        let page_offset: u64 = 0xFFFF_8880_0000_0000;
+
+        // SAFETY: buf is a live local buffer whose backing storage
+        // outlives the GuestMem use.
+        let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
+        let per_cpu_offsets = vec![0u64];
+        let result = read_percpu_array_value(
+            &lookup_ctx(&mem, pgd_pa, page_offset, &offsets, false),
+            &info,
+            0,
+            &per_cpu_offsets,
+        );
+
+        assert_eq!(result.len(), 1);
+        let bytes = result[0]
+            .as_ref()
+            .expect("post-fix: vmalloc percpu KVA must resolve via page-table walk");
+        assert_eq!(u64::from_ne_bytes(bytes[..8].try_into().unwrap()), marker);
     }
 }

@@ -1029,8 +1029,18 @@ pub(crate) struct ProgStatsCtx {
     /// Per-CPU offset table (`__per_cpu_offset[]`) used to translate
     /// each program's percpu stats pointer into a concrete KVA.
     pub per_cpu_offsets: Vec<u64>,
+    /// Guest physical address of the top-level page table. Threaded
+    /// through to [`super::bpf_prog::read_prog_runtime_stats`] so
+    /// per-CPU `bpf_prog_stats` allocations that fall outside the
+    /// direct mapping (vmalloc-backed percpu) translate via a
+    /// page-table walk instead of being silently dropped.
+    pub cr3_pa: u64,
     /// Runtime `PAGE_OFFSET` used for direct-mapping KVA translation.
     pub page_offset: u64,
+    /// 5-level paging flag — true when the guest uses 5-level page
+    /// tables (LA57). Threaded into `translate_kva` calls along with
+    /// `cr3_pa`.
+    pub l5: bool,
     /// BTF offsets for the `bpf_prog` + related struct fields read
     /// while summing stats.
     pub offsets: super::btf_offsets::BpfProgOffsets,
@@ -1272,7 +1282,9 @@ pub(crate) fn monitor_loop(
                 mem,
                 &ctx.cached,
                 &ctx.per_cpu_offsets,
+                ctx.cr3_pa,
                 ctx.page_offset,
+                ctx.l5,
                 &ctx.offsets,
             )
         });

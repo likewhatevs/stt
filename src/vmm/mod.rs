@@ -2915,6 +2915,12 @@ impl KtstrVm {
                 }
 
                 // Discover struct_ops programs for per-cycle stats.
+                // `cr3_pa` and `l5` are shared with `discover_struct_ops_stats`
+                // and `ProgStatsCtx` so per-CPU `bpf_prog_stats` reads can
+                // page-walk vmalloc-backed percpu (see #20).
+                let cr3_pa =
+                    monitor::symbols::text_kva_to_pa(symbols.init_top_pgt.unwrap_or(0));
+                let l5 = monitor::symbols::resolve_pgtable_l5(&mem, &symbols);
                 let prog_stats_ctx =
                     monitor::btf_offsets::BpfProgOffsets::from_vmlinux(&vmlinux_clone)
                         .ok()
@@ -2922,11 +2928,11 @@ impl KtstrVm {
                             let prog_idr_kva = symbols.prog_idr?;
                             let cached = monitor::bpf_prog::discover_struct_ops_stats(
                                 &mem,
-                                monitor::symbols::text_kva_to_pa(symbols.init_top_pgt.unwrap_or(0)),
+                                cr3_pa,
                                 page_offset,
                                 prog_idr_kva,
                                 &prog_offsets,
-                                monitor::symbols::resolve_pgtable_l5(&mem, &symbols),
+                                l5,
                             );
                             if cached.is_empty() {
                                 return None;
@@ -2934,7 +2940,9 @@ impl KtstrVm {
                             Some(monitor::reader::ProgStatsCtx {
                                 cached,
                                 per_cpu_offsets: offsets_arr.clone(),
+                                cr3_pa,
                                 page_offset,
+                                l5,
                                 offsets: prog_offsets,
                             })
                         });
