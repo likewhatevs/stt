@@ -54,6 +54,8 @@ pub const EXIT_UNREG: u64 = 64;
 pub const EXIT_UNREG_BPF: u64 = 65;
 pub const EXIT_UNREG_KERN: u64 = 66;
 pub const EXIT_SYSRQ: u64 = 67;
+// Values must stay in sync with SCX_EXIT_ERROR_* in src/bpf/intf.h
+// and kernel/sched/ext_internal.h enum scx_exit_kind.
 pub const EXIT_ERROR: u64 = 1024;
 pub const EXIT_ERROR_BPF: u64 = 1025;
 pub const EXIT_ERROR_STALL: u64 = 1026;

@@ -10,6 +10,17 @@
 #define FENTRY_BATCH 4
 #define MAX_STR_LEN 64
 
+/* sched_ext exit-kind values mirrored from kernel/sched/ext_internal.h
+ * enum scx_exit_kind. The error-class kinds (>= SCX_EXIT_ERROR) are the
+ * values the probe filters on; mirrored here so probe.bpf.c can use
+ * named constants instead of magic numbers and so userspace can match
+ * the same wire values when consuming the .bss latch and ringbuf
+ * events. Values must stay in sync with the kernel enum.
+ */
+#define SCX_EXIT_ERROR       1024
+#define SCX_EXIT_ERROR_BPF   1025
+#define SCX_EXIT_ERROR_STALL 1026
+
 /* Per-probe-hit captured data, stored in hash map keyed by (func_ip, task_ptr).
  * Entry fields are written by fentry/kprobe at function entry.
  * Exit fields are written in-place by fexit at function exit

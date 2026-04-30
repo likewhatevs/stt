@@ -47,7 +47,24 @@ struct {
 /* Global enable flag. Set by userspace after all probes attached. */
 volatile const bool ktstr_enabled = false;
 
-/* Diagnostic counters — readable from userspace after drain. */
+/*
+ * Sticky error-exit latch. Set to non-zero by the tp_btf/sched_ext_exit
+ * handler when an error-class exit (kind >= SCX_EXIT_ERROR) fires.
+ * Lives in writable .bss so an external observer with read access
+ * to guest memory can detect the transition. Sticky: re-firing the
+ * tracepoint does not unset it. volatile so the BPF verifier does
+ * not optimize the store away.
+ *
+ * u32 width (not bool) because the BPF backend rejects atomic ops on
+ * 8-bit slots ("unsupported atomic operation, please use 32/64 bit
+ * version"). The publishing site uses __sync_val_compare_and_swap
+ * for cross-core-ordered publication on weakly-ordered architectures.
+ */
+volatile u32 ktstr_err_exit_detected = 0;
+
+/* Diagnostic counters — readable from userspace after drain.
+ * ktstr_trigger_count counts ALL sched_ext_exit fires (including
+ * non-error kinds like DONE/UNREG), not just error-class exits. */
 u64 ktstr_trigger_count = 0;
 u64 ktstr_probe_count = 0;
 u64 ktstr_meta_miss = 0;
@@ -151,9 +168,11 @@ int ktstr_probe(struct pt_regs *ctx)
 }
 
 /*
- * Tracepoint trigger. Fires on sched_ext_exit inside scx_claim_exit()
- * after the atomic cmpxchg succeeds — exactly once per scheduler
- * lifetime, in the context of the current task at exit time.
+ * Tracepoint trigger. Fires from inside scx_claim_exit() after the
+ * per-scx_sched atomic cmpxchg succeeds. Each scx_sched (top-level
+ * scheduler and any sub-scheds reached via PARENT propagation) fires
+ * its own tracepoint instance, in the context of the current task at
+ * exit time.
  *
  * Typed arg gives the exit kind directly.
  */
@@ -163,13 +182,39 @@ int BPF_PROG(ktstr_trigger_tp, unsigned int kind)
 	__sync_fetch_and_add(&ktstr_trigger_count, 1);
 
 	/*
-	 * Only fire for ops callback errors (SCX_EXIT_ERROR,
-	 * SCX_EXIT_ERROR_BPF) where bpf_get_current_task() is the
-	 * causal task. For stalls, sysrq, unregistration, current is
-	 * unrelated — skip the trigger so no misleading probe output
-	 * is produced.
+	 * Skip non-error exits (kind < SCX_EXIT_ERROR). The error-exit
+	 * latch and auto-repro both trigger only on error-class exits.
 	 */
-	if (kind < 1024 || kind > 1025)
+	if (kind < SCX_EXIT_ERROR)
+		return 0;
+
+	/*
+	 * Latch the error-exit flag for any error-class exit
+	 * (SCX_EXIT_ERROR, SCX_EXIT_ERROR_BPF, SCX_EXIT_ERROR_STALL).
+	 * Sticky: re-firing the tracepoint does not unset it.
+	 *
+	 * Use __sync_val_compare_and_swap() rather than a plain store so
+	 * the publication has full-barrier semantics: the BPF backend
+	 * lowers it to a BPF atomic compare-exchange which carries an
+	 * implicit memory barrier. A plain store would not provide the
+	 * cross-core ordering an external observer needs on
+	 * weakly-ordered architectures (aarch64). __sync_synchronize()
+	 * cannot be used because the BPF LLVM backend cannot select an
+	 * AtomicFence node.
+	 */
+	__sync_val_compare_and_swap(&ktstr_err_exit_detected, 0u, 1u);
+
+	/*
+	 * Skip the auto-repro ringbuf path for SCX_EXIT_ERROR_STALL: the
+	 * watchdog kthread or scheduler tick fires the tracepoint, so
+	 * bpf_get_current_task() is unrelated to the cause and would
+	 * produce misleading probe output. The error-exit latch above
+	 * still records the exit, so the stall is still observable.
+	 * Other error-class kinds (current and any future additions)
+	 * default to getting auto-repro data unless their causal-task
+	 * semantics turn out to be misleading.
+	 */
+	if (kind == SCX_EXIT_ERROR_STALL)
 		return 0;
 
 	u32 tid = (u32)bpf_get_current_pid_tgid();
