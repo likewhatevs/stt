@@ -3211,6 +3211,7 @@ impl KtstrVm {
                         let report = crate::monitor::dump::FailureDumpReport {
                             maps: Vec::new(),
                             vcpu_regs: collect_vcpu_regs(),
+                            sdt_allocations: Vec::new(),
                         };
                         tracing::warn!(
                             owned_accessor = owned_accessor.is_some(),

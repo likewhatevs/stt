@@ -214,6 +214,19 @@ pub struct ArenaSnapshot {
     /// snapshot is usable.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub span_capped: bool,
+    /// Kernel-side base of the arena's user_vm window:
+    /// `bpf_arena.kern_vm->addr + GUARD_HALF`. Surfaces here so
+    /// downstream consumers (notably the [`super::sdt_alloc`] tree
+    /// walker) can translate `__arena` pointers without re-reading
+    /// `struct bpf_arena` themselves. `0` when the snapshot bailed
+    /// before computing the value (kern_vm_kva NULL, vm_addr NULL,
+    /// or any of the upstream translates failed).
+    ///
+    /// Always serialized — the zero value carries diagnostic
+    /// information ("walker reached this point but couldn't compute
+    /// the base"), so suppressing it would mask the failure. Mirrors
+    /// the policy used for the sibling `declared_pages` field.
+    pub kern_vm_start: u64,
 }
 
 /// Walk the arena's mapped pages and return a snapshot.
@@ -279,6 +292,7 @@ pub fn snapshot_arena(
         truncated: plan.truncated,
         declared_pages: plan.declared_pages,
         span_capped: plan.span_capped,
+        kern_vm_start,
     };
 
     // Closure: translate one pgoff to a page-content read; push

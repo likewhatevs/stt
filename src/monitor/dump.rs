@@ -28,6 +28,29 @@
 //! program's BTF object. When per-map load fails (still-booting
 //! guest, untranslatable page, corrupted blob), the renderer falls
 //! back to the caller-supplied vmlinux BTF.
+//!
+//! # sdt_alloc post-pass
+//!
+//! After the per-map walk completes, [`dump_state`] runs a post-pass
+//! that locates `sdt_alloc`-backed allocator instances inside the
+//! scheduler's `.bss` and surfaces every live per-task / per-cgroup
+//! allocation as structured records under
+//! [`FailureDumpReport::sdt_allocations`]. The walk runs only when
+//! every prerequisite is present:
+//!   - the scheduler exposes a `.bss` ARRAY map with non-zero
+//!     `btf_kva` (so we can read its raw bytes and have a program
+//!     BTF to resolve types against),
+//!   - at least one `BPF_MAP_TYPE_ARENA` map snapshot succeeded
+//!     (so we have `kern_vm_start` for arena pointer translation),
+//!   - the program BTF carries `struct scx_allocator` (the scheduler
+//!     links `lib/sdt_alloc.bpf.c`).
+//!
+//! When any prerequisite is missing, the post-pass leaves
+//! `sdt_allocations` empty rather than failing the dump — the
+//! per-map page-granular [`super::arena::ArenaSnapshot`] still
+//! captures raw arena content for callers that don't need
+//! structured rendering. See [`super::sdt_alloc`] for the walker
+//! design.
 
 use serde::{Deserialize, Serialize};
 
@@ -39,6 +62,9 @@ use super::bpf_map::{
     BpfMapAccessor, BpfMapInfo,
 };
 use super::btf_render::{RenderedValue, render_value};
+use super::sdt_alloc::{
+    SdtAllocOffsets, SdtAllocatorSnapshot, discover_payload_btf_id, walk_sdt_allocator,
+};
 
 /// Snapshot of one vCPU's instruction-pointer / stack-pointer / page-
 /// table-root at freeze time. Re-export of the freeze-side type so
@@ -61,6 +87,20 @@ pub struct FailureDumpReport {
     /// the freeze coordinator after `dump_state` returns.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub vcpu_regs: Vec<Option<VcpuRegSnapshot>>,
+    /// Structured per-allocation views from sdt_alloc-backed
+    /// allocators. One entry per discovered allocator; each carries
+    /// every live leaf slot (capped at
+    /// [`super::sdt_alloc::MAX_SDT_ALLOC_ENTRIES`]) BTF-rendered to
+    /// named field views. Empty when no scheduler-side allocator
+    /// could be located, when arena offsets / sdt_alloc offsets are
+    /// absent, or when the program BTF lacks the `scx_allocator`
+    /// type (scheduler doesn't link `lib/sdt_alloc.bpf.c`).
+    ///
+    /// Populated alongside the page-granular [`ArenaSnapshot`] in
+    /// each map: a consumer can read either representation depending
+    /// on whether they want raw bytes or named-field allocations.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sdt_allocations: Vec<SdtAllocatorSnapshot>,
 }
 
 /// Rendering of one BPF map's contents.
@@ -145,7 +185,7 @@ impl std::fmt::Display for FailureDumpReport {
     /// `serde_json`; this Display is the default presentation used
     /// in test-failure output.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.maps.is_empty() && self.vcpu_regs.is_empty() {
+        if self.maps.is_empty() && self.vcpu_regs.is_empty() && self.sdt_allocations.is_empty() {
             return f.write_str("(empty failure dump)");
         }
         let mut first = true;
@@ -160,6 +200,7 @@ impl std::fmt::Display for FailureDumpReport {
             if !first {
                 f.write_str("\n\n")?;
             }
+            first = false;
             f.write_str("vcpu_regs:")?;
             for (i, slot) in self.vcpu_regs.iter().enumerate() {
                 f.write_str("\n  ")?;
@@ -168,6 +209,13 @@ impl std::fmt::Display for FailureDumpReport {
                     None => write!(f, "vcpu {i}: <unavailable>")?,
                 }
             }
+        }
+        for snap in &self.sdt_allocations {
+            if !first {
+                f.write_str("\n\n")?;
+            }
+            first = false;
+            std::fmt::Display::fmt(snap, f)?;
         }
         Ok(())
     }
@@ -305,6 +353,7 @@ pub fn dump_state(
     let mut report = FailureDumpReport {
         maps: Vec::with_capacity(maps.len()),
         vcpu_regs: Vec::new(),
+        sdt_allocations: Vec::new(),
     };
 
     // Per-map program-BTF cache, keyed by `btf_kva`. Each unique
@@ -315,6 +364,15 @@ pub fn dump_state(
     // parse, not N). Lookups go through this cache before falling
     // back to the caller-supplied vmlinux `btf`.
     let mut program_btfs: std::collections::HashMap<u64, Btf> = std::collections::HashMap::new();
+
+    // Bookkeeping for the sdt_alloc walker that runs after the map
+    // loop. We need: (1) the raw .bss bytes from the scheduler's
+    // global-section ARRAY map, (2) the kern_vm_start from any arena
+    // map that snapshot_arena populated, (3) one program BTF
+    // (`btf_kva` of the scheduler's BPF object) so we can resolve
+    // sdt_alloc struct offsets and the allocator's .bss byte offset.
+    let mut sched_bss_bytes: Option<(Vec<u8>, u64)> = None; // (bytes, btf_kva)
+    let mut arena_kern_vm_start: u64 = 0;
 
     for info in maps {
         // Skip ktstr's own framework maps so the report only shows
@@ -375,16 +433,185 @@ pub fn dump_state(
             Some(btf)
         };
 
-        report.maps.push(render_map(
-            accessor,
-            map_btf,
-            &info,
-            num_cpus,
-            arena_offsets,
-        ));
+        let rendered = render_map(accessor, map_btf, &info, num_cpus, arena_offsets);
+
+        // Cache the scheduler's `.bss` raw bytes for the post-pass
+        // sdt_alloc walker. libbpf composes `<obj>.bss` for the
+        // scheduler's global-section map and the framework probes
+        // were already filtered above, so the first ARRAY map ending
+        // in `.bss` with a non-zero `btf_kva` is the right one. Cap
+        // at one — multiple BPF objects in one scheduler is theoretical
+        // for ktstr's surface today.
+        if sched_bss_bytes.is_none()
+            && info.map_type == BPF_MAP_TYPE_ARRAY
+            && info.btf_kva != 0
+            && info.name.ends_with(".bss")
+            && let Some(bytes) = accessor.read_value(&info, 0, info.value_size as usize)
+        {
+            sched_bss_bytes = Some((bytes, info.btf_kva));
+        }
+
+        // Cache kern_vm_start from the first arena map whose
+        // snapshot succeeded — sdt_alloc's `__arena` pointers all
+        // index this same window, regardless of which map declared
+        // it. (lib/arena_map.h declares one __weak arena per BPF
+        // object; multiple linked objects would each see their own.)
+        if arena_kern_vm_start == 0
+            && let Some(snap) = rendered.arena.as_ref()
+            && snap.kern_vm_start != 0
+        {
+            arena_kern_vm_start = snap.kern_vm_start;
+        }
+
+        report.maps.push(rendered);
+    }
+
+    // Post-pass: walk sdt_alloc trees if all prerequisites lined up.
+    // The walk is best-effort and silent: any missing prerequisite
+    // (no scheduler .bss, no arena window, no program BTF, no
+    // `scx_allocator` type) leaves `sdt_allocations` empty rather
+    // than failing the dump.
+    if let Some((bss_bytes, btf_kva)) = sched_bss_bytes
+        && arena_kern_vm_start != 0
+        && let Some(prog_btf) = program_btfs.get(&btf_kva)
+        && let Ok(sdt_offsets) = SdtAllocOffsets::from_btf(prog_btf)
+    {
+        // Locate every sdt_alloc allocator instance declared in
+        // `.bss`. The Datasec walk gives us each variable's name and
+        // offset; we filter to types matching `struct scx_allocator`
+        // by re-resolving the var's chained type. A scheduler may
+        // declare more than one allocator (e.g. one per-task, one
+        // per-cgroup) so we iterate all of them.
+        for (var_name, var_offset, var_type_id) in iter_bss_vars_with_type(prog_btf, ".bss") {
+            // Only walk vars whose type is `struct scx_allocator`.
+            if !is_scx_allocator_type(prog_btf, var_type_id) {
+                continue;
+            }
+            // Slice the in-bss bytes for one full `struct scx_allocator`.
+            // The size comes from BTF (resolved into `allocator_size`
+            // by `SdtAllocOffsets::from_btf`); using the BTF-reported
+            // size means a future field appended to scx_allocator
+            // doesn't silently slip past the slice end.
+            let Some(slice_end) = var_offset.checked_add(sdt_offsets.allocator_size) else {
+                continue;
+            };
+            let slice = match bss_bytes.get(var_offset..slice_end) {
+                Some(s) => s,
+                None => continue,
+            };
+
+            // Discover the payload BTF type id from the elem_size
+            // we'd read in the walker. We do a small read here just
+            // to drive the heuristic; the walker re-reads it.
+            let pool_off = sdt_offsets.allocator_pool + sdt_offsets.pool_elem_size;
+            let elem_size = if pool_off + 8 <= slice.len() {
+                let mut buf = [0u8; 8];
+                buf.copy_from_slice(&slice[pool_off..pool_off + 8]);
+                u64::from_le_bytes(buf)
+            } else {
+                0
+            };
+            let payload_size =
+                elem_size.saturating_sub(sdt_offsets.data_header_size as u64) as usize;
+            let choice = discover_payload_btf_id(prog_btf, payload_size);
+
+            let snap = walk_sdt_allocator(
+                accessor.kernel(),
+                arena_kern_vm_start,
+                slice,
+                &sdt_offsets,
+                prog_btf,
+                choice.btf_type_id,
+                choice.reason,
+                var_name,
+            );
+            // Surface only allocators with a non-empty result OR a
+            // diagnostic elem_size; an all-zero snapshot from a
+            // never-initialized allocator is just noise.
+            if !snap.entries.is_empty() || snap.elem_size != 0 {
+                report.sdt_allocations.push(snap);
+            }
+        }
     }
 
     report
+}
+
+/// Walk a Datasec section by name, yielding `(var_name, byte_offset,
+/// type_id)` for every variable declared in it.
+///
+/// Used by [`dump_state`] to enumerate `.bss` variables when looking
+/// for `scx_allocator` instances. Returns an empty iterator when the
+/// Datasec doesn't exist or any chained Var resolution fails — the
+/// caller treats that as "no sdt_alloc state to surface" rather than
+/// a hard error.
+fn iter_bss_vars_with_type(btf: &Btf, section_name: &str) -> Vec<(String, usize, u32)> {
+    use btf_rs::BtfType;
+    let mut out = Vec::new();
+    let Ok(candidates) = btf.resolve_types_by_name(section_name) else {
+        return out;
+    };
+    for ty in candidates {
+        let btf_rs::Type::Datasec(ds) = ty else {
+            continue;
+        };
+        for var_info in &ds.variables {
+            let Ok(chained) = btf.resolve_chained_type(var_info) else {
+                continue;
+            };
+            let btf_rs::Type::Var(var) = chained else {
+                continue;
+            };
+            let Ok(name) = btf.resolve_name(&var) else {
+                continue;
+            };
+            // The Var's type_id points to the variable's actual
+            // type (e.g. struct scx_allocator). var_info.offset() is
+            // the byte offset within the Datasec.
+            let Ok(type_id) = var.get_type_id() else {
+                continue;
+            };
+            out.push((name, var_info.offset() as usize, type_id));
+        }
+    }
+    out
+}
+
+/// True iff `type_id` resolves to a struct named `scx_allocator`,
+/// stripping the BTF modifier chain en route. The five modifier
+/// kinds the loop unwraps — `Const`, `Volatile`, `Typedef`,
+/// `Restrict`, `TypeTag` — are the complete set the kernel BPF
+/// pipeline emits for global variable types in `.bss`. Any other
+/// kind in the chain (Ptr, Array, etc.) terminates the lookup with
+/// a non-match.
+fn is_scx_allocator_type(btf: &Btf, type_id: u32) -> bool {
+    use btf_rs::Type as T;
+    // Mirror the modifier-chain pattern in
+    // `btf_offsets::resolve_member_composite` — resolve the
+    // chained type via the BtfType trait object so the type
+    // aliases (Const = Volatile, TypeTag = Typedef) all share the
+    // same path through the loop.
+    let Ok(mut t) = btf.resolve_type_by_id(type_id) else {
+        return false;
+    };
+    for _ in 0..20 {
+        match t {
+            T::Struct(s) => {
+                return btf.resolve_name(&s).is_ok_and(|n| n == "scx_allocator");
+            }
+            T::Const(_) | T::Volatile(_) | T::Typedef(_) | T::Restrict(_) | T::TypeTag(_) => {
+                let Some(btf_ty) = t.as_btf_type() else {
+                    return false;
+                };
+                let Ok(next) = btf.resolve_chained_type(btf_ty) else {
+                    return false;
+                };
+                t = next;
+            }
+            _ => return false,
+        }
+    }
+    false
 }
 
 /// Load a BPF program's `struct btf` from guest memory.
@@ -586,13 +813,29 @@ fn render_map(
             }
         }
         BPF_MAP_TYPE_ARENA => {
-            // Arena pages live in vmalloc space and are translated
-            // via the existing PTE walker; rendering is page-granular
-            // (4 KiB per ArenaPage) rather than struct-granular
-            // because arena memory has no canonical type schema —
-            // BPF programs allocate raw memory regions and impose
-            // their own layouts. Operators can post-process the page
-            // bytes against the program's data structure docs.
+            // Arena maps render in two phases:
+            //
+            //   1. Page-granular: arena pages live in vmalloc space
+            //      and translate via the existing PTE walker. Each
+            //      mapped page surfaces here as a 4 KiB ArenaPage —
+            //      raw bytes the operator can post-process against
+            //      the program's own layout documentation.
+            //
+            //   2. Structured (sdt_alloc post-pass): when the
+            //      scheduler links `lib/sdt_alloc.bpf.c`, the
+            //      `dump_state` post-pass walks `scx_allocator`'s
+            //      radix tree and produces named-field
+            //      [`super::sdt_alloc::SdtAllocEntry`] records under
+            //      [`FailureDumpReport::sdt_allocations`]. That phase
+            //      is gated on the program BTF carrying
+            //      `struct scx_allocator` — schedulers that don't use
+            //      sdt_alloc still get the page-granular fallback
+            //      from this arm.
+            //
+            // Both representations land in the same dump so a
+            // consumer can pick whichever fits — raw bytes for ad
+            // hoc post-processing, structured records for typed
+            // field views.
             match arena_offsets {
                 Some(off) => {
                     let snap = snapshot_arena(accessor.kernel(), info, off);
@@ -615,7 +858,12 @@ fn render_map(
     out
 }
 
-fn hex_dump(bytes: &[u8]) -> String {
+/// Render a byte slice as space-separated hex pairs.
+///
+/// `pub(crate)` so [`super::sdt_alloc`] can reuse the same wire shape
+/// for its hex-fallback payload renderings — keeps the dump's hex
+/// output consistent across both renderers.
+pub(crate) fn hex_dump(bytes: &[u8]) -> String {
     use std::fmt::Write;
     let mut s = String::with_capacity(bytes.len() * 3);
     for (i, b) in bytes.iter().enumerate() {
@@ -657,6 +905,7 @@ mod tests {
                 error: None,
             }],
             vcpu_regs: Vec::new(),
+            sdt_allocations: Vec::new(),
         };
         let json = serde_json::to_string(&report).unwrap();
         let parsed: FailureDumpReport = serde_json::from_str(&json).unwrap();
@@ -712,6 +961,7 @@ mod tests {
         let report = FailureDumpReport {
             maps: vec![make_simple_map()],
             vcpu_regs: Vec::new(),
+            sdt_allocations: Vec::new(),
         };
         let out = format!("{report}");
         // Map header line.
@@ -730,6 +980,7 @@ mod tests {
         let report = FailureDumpReport {
             maps: vec![make_simple_map(), make_simple_map()],
             vcpu_regs: Vec::new(),
+            sdt_allocations: Vec::new(),
         };
         let out = format!("{report}");
         // Maps separated by a blank line (\n\n).
@@ -820,6 +1071,7 @@ mod tests {
                     user_page_table_root: None,
                 }),
             ],
+            sdt_allocations: Vec::new(),
         };
         let out = format!("{report}");
         // Section header.
@@ -843,6 +1095,7 @@ mod tests {
                 page_table_root: 0x3,
                 user_page_table_root: None,
             })],
+            sdt_allocations: Vec::new(),
         };
         let out = format!("{report}");
         // Map block, blank line, vcpu_regs section.
@@ -856,6 +1109,7 @@ mod tests {
         let report = FailureDumpReport {
             maps: Vec::new(),
             vcpu_regs: vec![None],
+            sdt_allocations: Vec::new(),
         };
         let out = format!("{report}");
         assert_eq!(out, "vcpu_regs:\n  vcpu 0: <unavailable>");
@@ -883,6 +1137,7 @@ mod tests {
                 page_table_root: 0xcafe,
                 user_page_table_root: None,
             })],
+            sdt_allocations: Vec::new(),
         };
 
         // (a) Display: vcpu_regs section present, no fallback.

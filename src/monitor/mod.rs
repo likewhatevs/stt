@@ -23,6 +23,7 @@ pub mod dump;
 pub mod guest;
 pub mod idr;
 pub mod reader;
+pub mod sdt_alloc;
 pub mod symbols;
 
 /// Guest physical address of the top-level page-table page (CR3 on x86,
