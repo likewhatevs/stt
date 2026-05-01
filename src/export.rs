@@ -729,16 +729,26 @@ exit $EXIT_CODE
 /// `"unknown"` when not in a git checkout. Stamped into the
 /// preamble's banner so an operator running an old `.run` can tell
 /// what code was packaged.
+///
+/// Uses gix in-process rather than shelling out to `git rev-parse`.
+/// Same shape as [`crate::fetch::inspect_local_source_state`]: walk
+/// up from the current directory with `gix::discover`, read the head
+/// id, format and truncate. No process fork, no PATH dependency —
+/// the export pipeline never depends on a `git` binary being
+/// installed on the host running `cargo ktstr export`.
 fn git_provenance() -> String {
-    use std::process::Command;
-    Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .output()
+    std::env::current_dir()
         .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+        .and_then(|cwd| gix::discover(&cwd).ok())
+        .and_then(|repo| {
+            // `head_id()` returns an Id<'_> borrowing `repo`, so format
+            // and truncate to an owned String inside the same scope as
+            // `repo` to satisfy the borrow checker. Mirrors the
+            // pattern at fetch.rs:1016-1017.
+            repo.head_id()
+                .ok()
+                .map(|id| format!("{id}").chars().take(7).collect::<String>())
+        })
         .unwrap_or_else(|| "unknown".to_string())
 }
 

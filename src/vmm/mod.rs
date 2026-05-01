@@ -580,6 +580,36 @@ impl ImmediateExitHandle {
 // Signal handling — Firecracker/libkrun pattern: SIGRTMIN + immediate_exit
 // ---------------------------------------------------------------------------
 
+/// Convert a host-side `Duration` to guest jiffies, using the
+/// guest kernel's CONFIG_HZ.
+///
+/// Computed as `(d.as_millis() * hz) / 1000` rather than
+/// `d.as_secs() * hz` so sub-second durations don't truncate to 0
+/// — a 500 ms watchdog with HZ=1000 should land at 500 jiffies, not
+/// at 0 (the bug that masked the early-trigger path before this
+/// helper existed). Truncation is to the jiffies tick boundary
+/// (1000/HZ ms), which is the kernel's own arithmetic precision.
+///
+/// Two call sites today: the freeze coordinator's
+/// `half_threshold_jiffies` (compares against scanned per-task
+/// runnable-age in jiffies) and the `watchdog_override` setup
+/// (writes a jiffies count into `scx_sched.watchdog_timeout` in
+/// guest memory). Both pre-existed scattered as inline expressions;
+/// centralising the conversion keeps the precision rule in one
+/// place and eliminates drift opportunities.
+fn duration_to_jiffies(d: Duration, hz: u64) -> u64 {
+    // saturating_mul guards against the theoretical overflow of
+    // pathologically-large `Duration` * pathologically-large `hz`.
+    // Real ktstr inputs (watchdog_timeout in seconds, HZ in 100..1000)
+    // never approach the u64 boundary, but a `Duration::MAX` /
+    // `u64::MAX` HZ pair would otherwise wrap and silently produce a
+    // garbage jiffies value. Saturating to u64::MAX (then `/ 1000`)
+    // at least keeps the threshold check semantics "this jiffies
+    // count is unreachable" rather than "this jiffies count is small,
+    // so the trigger fires immediately".
+    (d.as_millis() as u64).saturating_mul(hz) / 1000
+}
+
 /// Signal used to kick vCPU threads out of KVM_RUN.
 /// All three Rust reference VMMs (Firecracker, Cloud Hypervisor, libkrun)
 /// use SIGRTMIN. SIGUSR1/SIGUSR2 conflict with application-level signals.
@@ -2970,23 +3000,31 @@ impl KtstrVm {
                 // Some once every prerequisite resolves; cached for
                 // the rest of the run.
                 let mut scan_ctx: Option<RunnableScanCtx> = None;
+                // Retry counter and one-shot warn latch for the
+                // scan_ctx resolve. The resolve runs once per 100 ms
+                // poll iteration until it succeeds; without a
+                // diagnostic an operator who built ktstr against a
+                // kernel lacking sched_ext_entity (or stripped of
+                // jiffies_64) gets a silent dual-snapshot disable.
+                // Wait `SCAN_CTX_WARN_AFTER_ITERS` iterations
+                // (~3 s at 100 ms cadence) before warning so legit
+                // boot-time delays (owned_accessor not yet ready,
+                // GuestKernel handshake mid-flight) don't trigger
+                // false alarms. The latch ensures the warn fires at
+                // most once per VM run.
+                let mut scan_ctx_retries: u32 = 0;
+                let mut scan_ctx_warned: bool = false;
+                const SCAN_CTX_WARN_AFTER_ITERS: u32 = 30;
                 // Half of the configured watchdog timeout, expressed
                 // in guest jiffies. Computed once from
                 // freeze_coord_watchdog_half + freeze_coord_hz so each
                 // poll's comparison is a cheap u64 compare against
                 // the scan's max age.
                 //
-                // Use millisecond precision (`as_millis() * hz / 1000`)
-                // rather than `as_secs() * hz`. The seconds-based form
-                // truncated any sub-second watchdog timeout to 0,
-                // silently disabling the early-trigger path for any
-                // caller setting `watchdog_timeout(Duration::from_millis(N))`
-                // with `N < 1000`. The ms-based form preserves the
-                // exact half-watchdog jiffies count to the jiffies
-                // tick boundary (1000/HZ ms).
-                let half_threshold_jiffies = (freeze_coord_watchdog_half.as_millis() as u64)
-                    * freeze_coord_hz
-                    / 1000;
+                // ms-precision conversion lives in [`duration_to_jiffies`];
+                // see its doc for why the seconds-based form is wrong.
+                let half_threshold_jiffies =
+                    duration_to_jiffies(freeze_coord_watchdog_half, freeze_coord_hz);
                 while !freeze_coord_kill.load(Ordering::Acquire) {
                     if freeze_coord_bsp_done.load(Ordering::Acquire) {
                         return;
@@ -3186,6 +3224,31 @@ impl KtstrVm {
                                 page_offset,
                                 l5,
                             });
+                        }
+                    }
+                    // Single-shot warn when the resolve has been
+                    // failing long enough that "still booting" is no
+                    // longer a plausible explanation. Without this
+                    // an operator running ktstr against a kernel that
+                    // lacks `sched_ext_entity` BTF (sched_ext disabled)
+                    // or `jiffies_64` (stripped vmlinux) gets the
+                    // dual-snapshot path silently disabled; the late
+                    // dump still works, but the early snapshot would
+                    // never fire and the missing wrapper could be
+                    // mistaken for "stall fired before half-way
+                    // threshold". Counting iterations under the
+                    // dual-snapshot gate ensures the message only
+                    // surfaces in runs where the path was requested.
+                    if freeze_coord_dual_snapshot && scan_ctx.is_none() {
+                        scan_ctx_retries += 1;
+                        if !scan_ctx_warned && scan_ctx_retries >= SCAN_CTX_WARN_AFTER_ITERS {
+                            tracing::warn!(
+                                "freeze-coord: runnable_at scan prerequisites unavailable \
+                                 (most commonly: guest still booting; or BTF lacks \
+                                 sched_ext_entity, jiffies_64 symbol missing) — \
+                                 early-trigger path delayed — will continue retrying"
+                            );
+                            scan_ctx_warned = true;
                         }
                     }
                     // Poll the cached PA for the err_exit latch flip.
@@ -3821,16 +3884,9 @@ impl KtstrVm {
                 });
 
         let hz = monitor::guest_kernel_hz(Some(&self.kernel));
-        // Use millisecond precision (`as_millis() * hz / 1000`) rather
-        // than `as_secs() * hz`. The seconds-based form silently
-        // truncates any sub-second watchdog timeout to 0, disabling
-        // the freeze-coord watchdog jiffies value for any caller
-        // setting `watchdog_timeout(Duration::from_millis(N))` with
-        // `N < 1000`. Mirrors the same fix at the
-        // `freeze_coord_watchdog_half` derivation site upstream.
-        let watchdog_jiffies = self
-            .watchdog_timeout
-            .map(|d| (d.as_millis() as u64) * hz / 1000);
+        // ms-precision conversion lives in [`duration_to_jiffies`];
+        // see its doc for why the seconds-based form is wrong.
+        let watchdog_jiffies = self.watchdog_timeout.map(|d| duration_to_jiffies(d, hz));
         let preemption_threshold_ns = monitor::vcpu_preemption_threshold_ns(Some(&self.kernel));
         let rt_monitor = self.performance_mode;
         let service_cpu = self.pinning_plan.as_ref().and_then(|p| p.service_cpu);
@@ -5451,6 +5507,36 @@ mod tests {
         let b = KtstrVmBuilder::default();
         assert_eq!(b.memory_mb, Some(256));
         assert_eq!(b.topology.total_cpus(), 1);
+    }
+
+    /// Pin the millisecond-precision Duration→jiffies conversion.
+    /// Sub-second inputs must NOT truncate to 0 (the bug that masked
+    /// the freeze-coord early trigger before this helper existed),
+    /// whole-second inputs must scale by HZ, and HZ != 1000 must
+    /// scale correctly down to the jiffies tick boundary.
+    #[test]
+    fn duration_to_jiffies_basic() {
+        // 500 ms at HZ=1000 → 500 jiffies (the bug case: as_secs()
+        // would yield 0 here).
+        assert_eq!(duration_to_jiffies(Duration::from_millis(500), 1000), 500);
+        // 1500 ms at HZ=1000 → 1500 jiffies (the fractional-second
+        // input path must not truncate the integer-seconds component
+        // either).
+        assert_eq!(duration_to_jiffies(Duration::from_millis(1500), 1000), 1500);
+        // 4 s at HZ=250 → 1000 jiffies (lower HZ tick rate; the
+        // ms→jiffies arithmetic should land on the same answer as
+        // the as_secs()*hz form for whole seconds).
+        assert_eq!(duration_to_jiffies(Duration::from_secs(4), 250), 1000);
+        // Zero duration → zero jiffies (no UB, no spurious tick).
+        assert_eq!(duration_to_jiffies(Duration::from_millis(0), 1000), 0);
+        // Degenerate HZ=0 → zero jiffies. Guards against an
+        // unresolvable guest-side CONFIG_HZ where
+        // `monitor::guest_kernel_hz` falls back to 0; the resulting
+        // `half_threshold_jiffies` of 0 means "early-trigger threshold
+        // never fires," which is the right degradation — better than
+        // a divide-by-zero or an unbounded sentinel that would fire
+        // on every iteration.
+        assert_eq!(duration_to_jiffies(Duration::from_secs(1), 0), 0);
     }
 
     /// Explicit `memory_mb(0)` must be rejected at build time rather
