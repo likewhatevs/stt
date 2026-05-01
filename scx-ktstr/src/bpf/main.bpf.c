@@ -270,16 +270,26 @@ void BPF_STRUCT_OPS(ktstr_dump, struct scx_dump_ctx *dctx)
 
 /*
  * ops.dump_cpu callback. Invoked by `scx_dump_state()` for every
- * online CPU between `ops.dump` and the per-task pass. ktstr-fixture
+ * possible CPU between `ops.dump` and the per-task pass. ktstr-fixture
  * carries no per-CPU scheduler state (no cpuctx struct, no per-CPU
- * scratch maps), so the callback just emits a one-line marker so the
- * dump reader sees per-CPU coverage didn't silently drop. The line
+ * scratch maps), so on a non-idle CPU we emit a one-line marker
+ * confirming the callback fired, and on idle CPUs we emit nothing.
+ *
+ * Skipping idle CPUs piggybacks on `scx_dump_state`'s
+ * "if (idle && used == seq_buf_used(&ns)) goto next;" gate
+ * (kernel/sched/ext.c:6127-6283): when ops.dump_cpu writes zero
+ * bytes for an idle CPU, the kernel suppresses the entire per-CPU
+ * section for that CPU. Emitting a marker on every idle CPU instead
+ * defeats that gate and floods the failure dump with N copies of the
+ * same "no per-cpu state" line on otherwise-idle systems. The line
  * keeps the same prefix scheme as `ops.dump`/`ops.dump_task` so the
- * three layers render uniformly.
+ * three layers render uniformly when surfaced.
  */
 void BPF_STRUCT_OPS(ktstr_dump_cpu, struct scx_dump_ctx *dctx,
 		    s32 cpu, bool idle)
 {
+	if (idle)
+		return;
 	scx_bpf_dump("ktstr cpu %d: no per-cpu state\n", cpu);
 }
 

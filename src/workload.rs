@@ -653,7 +653,7 @@ pub(crate) fn resolve_work_type(
 /// Linux scheduling policy for a worker process.
 ///
 /// `Fifo`, `RoundRobin`, and `Deadline` all require `CAP_SYS_NICE`
-/// (kernel/sched/syscalls.c:406, `user_check_sched_setscheduler`
+/// (`user_check_sched_setscheduler` in `kernel/sched/syscalls.c`
 /// routes rt_policy and dl_policy through `req_priv`). `Normal`,
 /// `Batch`, and (entering) `Idle` are unprivileged transitions for
 /// fair-policy tasks. Priority values for `Fifo`/`RoundRobin` are
@@ -671,18 +671,27 @@ pub enum SchedPolicy {
     /// `SCHED_RR` with the given priority (1-99).
     RoundRobin(u32),
     /// `SCHED_DEADLINE` with explicit `runtime`, `deadline`, and
-    /// `period` in nanoseconds. Applied via `sched_setattr(2)`.
+    /// `period`. Applied via `sched_setattr(2)`.
+    ///
+    /// Each field is a [`Duration`] — the nanosecond representation
+    /// the kernel requires is materialised at the syscall site, so
+    /// callers express intent in idiomatic Rust units
+    /// (`Duration::from_micros(100)`, `Duration::from_millis(1)`,
+    /// etc.) and don't have to thread integer-nanosecond literals
+    /// through their test fixtures.
     ///
     /// Constraints (from `__checkparam_dl` in
     /// `kernel/sched/deadline.c`):
-    /// - `deadline_ns != 0`.
-    /// - `runtime_ns >= 1024` (the kernel's `DL_SCALE` floor).
-    /// - `runtime_ns <= deadline_ns`.
-    /// - `period_ns == 0` is legal — the kernel substitutes
-    ///   `deadline_ns` for the period when zero. When non-zero,
-    ///   `deadline_ns <= period_ns`.
-    /// - The effective period (`period_ns` if non-zero, else
-    ///   `deadline_ns`) is checked against
+    /// - `deadline != Duration::ZERO`.
+    /// - `runtime` must be at least 1024 ns (the kernel's
+    ///   `DL_SCALE` floor); shorter runtimes are silently truncated
+    ///   inside the kernel and break bandwidth accounting.
+    /// - `runtime <= deadline`.
+    /// - `period == Duration::ZERO` is legal — the kernel
+    ///   substitutes `deadline` for the period when zero. When
+    ///   non-zero, `deadline <= period`.
+    /// - The effective period (`period` if non-zero, else
+    ///   `deadline`) is checked against
     ///   `/proc/sys/kernel/sched_deadline_period_min_us` (default
     ///   100us = 100_000 ns) and
     ///   `/proc/sys/kernel/sched_deadline_period_max_us` (default
@@ -690,14 +699,15 @@ pub enum SchedPolicy {
     ///   are runtime-tunable; this crate does not pre-validate the
     ///   sysctl range and lets the kernel surface out-of-range
     ///   values as `EINVAL`.
-    /// - Top bit of `deadline_ns` and `period_ns` must each be clear
-    ///   (kernel uses bit 63 internally).
+    /// - The nanosecond count of `deadline` and `period` must each
+    ///   fit in 63 bits (`< 1 << 63`, i.e. `<= i64::MAX` ns ≈ 292
+    ///   years) — the kernel uses bit 63 internally. Any longer
+    ///   `Duration` is rejected at the syscall site.
     ///
     /// Transitions to/from `Deadline` always require `CAP_SYS_NICE`.
     /// Tasks set to `Deadline` get exclusive bandwidth on the
     /// admission-controlled root domain; oversubscription returns
-    /// `EBUSY` (see `sched_dl_overflow` in
-    /// kernel/sched/deadline.c:3542-3598).
+    /// `EBUSY` (see `sched_dl_overflow` in `kernel/sched/deadline.c`).
     ///
     /// `set_sched_policy` validates the structural constraints
     /// (zero-deadline, DL_SCALE floor, ordering, top-bit) before
@@ -705,12 +715,13 @@ pub enum SchedPolicy {
     /// fast in user space rather than tunneling an `EINVAL`
     /// through the syscall.
     Deadline {
-        /// Runtime budget per period (ns).
-        runtime_ns: u64,
-        /// Relative deadline from period start (ns).
-        deadline_ns: u64,
-        /// Period (ns).
-        period_ns: u64,
+        /// Runtime budget per period.
+        runtime: Duration,
+        /// Relative deadline from period start.
+        deadline: Duration,
+        /// Period. `Duration::ZERO` means "use `deadline` as the
+        /// period" per the kernel's `__checkparam_dl` substitution.
+        period: Duration,
     },
 }
 
@@ -725,14 +736,41 @@ impl SchedPolicy {
         SchedPolicy::RoundRobin(priority)
     }
 
-    /// `SCHED_DEADLINE` with the given runtime / deadline / period
-    /// in nanoseconds. See [`SchedPolicy::Deadline`] for parameter
-    /// constraints.
-    pub fn deadline(runtime_ns: u64, deadline_ns: u64, period_ns: u64) -> Self {
+    /// `SCHED_DEADLINE` with the given runtime / deadline / period.
+    /// See [`SchedPolicy::Deadline`] for parameter constraints.
+    ///
+    /// All three arguments share the same [`Duration`] type. The
+    /// canonical order is `(runtime, deadline, period)` — runtime
+    /// budget first, then the relative deadline, then the period.
+    /// For tests that need to make the order obvious at the call
+    /// site, prefer the struct-literal form
+    /// `SchedPolicy::Deadline { runtime: ..., deadline: ...,
+    /// period: ... }` which carries the field names through the
+    /// reader's eye.
+    ///
+    /// ```
+    /// # use std::time::Duration;
+    /// # use ktstr::workload::SchedPolicy;
+    /// // Convenience constructor — canonical (runtime, deadline, period) order.
+    /// let p = SchedPolicy::deadline(
+    ///     Duration::from_micros(500), // runtime
+    ///     Duration::from_millis(1),   // deadline
+    ///     Duration::from_millis(10),  // period
+    /// );
+    /// // Struct-literal form — names elide positional confusion.
+    /// let q = SchedPolicy::Deadline {
+    ///     runtime: Duration::from_micros(500),
+    ///     deadline: Duration::from_millis(1),
+    ///     period: Duration::from_millis(10),
+    /// };
+    /// assert!(matches!(p, SchedPolicy::Deadline { .. }));
+    /// assert!(matches!(q, SchedPolicy::Deadline { .. }));
+    /// ```
+    pub fn deadline(runtime: Duration, deadline: Duration, period: Duration) -> Self {
         SchedPolicy::Deadline {
-            runtime_ns,
-            deadline_ns,
-            period_ns,
+            runtime,
+            deadline,
+            period,
         }
     }
 }
@@ -837,6 +875,280 @@ impl std::ops::BitOr for MpolFlags {
     fn bitor(self, rhs: Self) -> Self {
         self.union(rhs)
     }
+}
+
+/// Raw clone(2) / clone3(2) flag bits the caller can opt into via
+/// [`CloneMode::Raw`].
+///
+/// Only the user-relevant subset of `CLONE_*` is exposed here. The
+/// runtime sets bookkeeping flags itself ([`CLONE_PIDFD`],
+/// [`CLONE_PARENT_SETTID`], [`CLONE_CHILD_SETTID`],
+/// [`CLONE_CHILD_CLEARTID`]) so callers MUST NOT pass them; the
+/// validator rejects any of those bits as runtime-reserved.
+///
+/// Bit values come from `include/uapi/linux/sched.h` and match the
+/// `libc::CLONE_*` constants. `u64` because `clone_args.flags` is
+/// `__aligned_u64`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CloneFlags(u64);
+
+impl CloneFlags {
+    /// No flags — equivalent to plain `fork(2)` semantics.
+    pub const NONE: Self = Self(0);
+    /// `CLONE_VM` (0x100): share the address space with the parent.
+    /// Required to be set whenever [`SIGHAND`](Self::SIGHAND) is set
+    /// (kernel rule 2 in `copy_process`).
+    pub const VM: Self = Self(0x100);
+    /// `CLONE_FS` (0x200): share the filesystem context (cwd, umask,
+    /// root). Mutually exclusive with [`NEWNS`](Self::NEWNS) and
+    /// [`NEWUSER`](Self::NEWUSER).
+    pub const FS: Self = Self(0x200);
+    /// `CLONE_FILES` (0x400): share the open-file descriptor table.
+    pub const FILES: Self = Self(0x400);
+    /// `CLONE_SIGHAND` (0x800): share signal handlers with the
+    /// parent. Implies the worker cannot install per-task signal
+    /// dispositions — the whole process sees the same handlers.
+    /// The kernel rejects `SIGHAND` without [`VM`](Self::VM).
+    pub const SIGHAND: Self = Self(0x800);
+    /// `CLONE_THREAD` (0x10000): place the new task into the
+    /// caller's thread group (same `tgid`, `exit_signal == -1`).
+    /// The kernel rejects `THREAD` without
+    /// [`SIGHAND`](Self::SIGHAND), and rejects the combination with
+    /// [`NEWUSER`](Self::NEWUSER) or [`NEWPID`](Self::NEWPID).
+    /// Reaping requires `pidfd` or `pthread_join` — `waitpid` does
+    /// not see thread-group siblings.
+    pub const THREAD: Self = Self(0x10000);
+    /// `CLONE_PARENT` (0x8000): the new task's parent is set to the
+    /// caller's parent (sibling rather than child). The kernel
+    /// rejects this when the caller is `SIGNAL_UNKILLABLE` (init /
+    /// container-init).
+    pub const PARENT: Self = Self(0x8000);
+    /// `CLONE_NEWNS` (0x20000): give the new task a fresh mount
+    /// namespace. Mutually exclusive with [`FS`](Self::FS).
+    pub const NEWNS: Self = Self(0x20000);
+    /// `CLONE_NEWUSER` (0x10000000): give the new task a fresh user
+    /// namespace. Mutually exclusive with [`FS`](Self::FS) and
+    /// [`THREAD`](Self::THREAD).
+    pub const NEWUSER: Self = Self(0x10000000);
+    /// `CLONE_NEWPID` (0x20000000): give the new task a fresh PID
+    /// namespace. Mutually exclusive with [`THREAD`](Self::THREAD).
+    pub const NEWPID: Self = Self(0x20000000);
+    /// `CLONE_NEWNET` (0x40000000): give the new task a fresh
+    /// network namespace.
+    pub const NEWNET: Self = Self(0x40000000);
+    /// `CLONE_NEWIPC` (0x08000000): give the new task a fresh SysV
+    /// IPC namespace.
+    pub const NEWIPC: Self = Self(0x08000000);
+    /// `CLONE_NEWUTS` (0x04000000): give the new task a fresh UTS
+    /// (hostname / domainname) namespace.
+    pub const NEWUTS: Self = Self(0x04000000);
+    /// `CLONE_NEWCGROUP` (0x02000000): give the new task a fresh
+    /// cgroup namespace.
+    pub const NEWCGROUP: Self = Self(0x02000000);
+    /// `CLONE_IO` (0x80000000): share the I/O context with the
+    /// parent.
+    pub const IO: Self = Self(0x80000000);
+    /// `CLONE_SYSVSEM` (0x40000): share SysV semaphore undo state.
+    pub const SYSVSEM: Self = Self(0x40000);
+
+    /// Bits the runtime sets internally — callers MUST NOT include
+    /// any of these. Listed here so the validator can reject them
+    /// as a single mask check.
+    ///
+    /// Includes:
+    /// - `CLONE_PIDFD` (0x1000): the runtime uses pidfd for reaping.
+    /// - `CLONE_PARENT_SETTID` (0x100000) and `CLONE_CHILD_SETTID`
+    ///   (0x01000000): the runtime fills in tid out-params itself.
+    /// - `CLONE_CHILD_CLEARTID` (0x200000): the runtime owns
+    ///   tid-cleared-on-exit semantics for thread-join coordination.
+    /// - `CLONE_DETACHED` (0x400000): the kernel rejects this with
+    ///   `CLONE_PIDFD` (rule 7 in `copy_process`); since the runtime
+    ///   always sets `CLONE_PIDFD` for non-fork dispatch, callers
+    ///   must not set `CLONE_DETACHED`.
+    /// - `CLONE_SETTLS` (0x80000): TLS setup is the runtime's job
+    ///   when it issues clone3 itself.
+    /// - `CLONE_VFORK` (0x4000): the runtime never wants the
+    ///   parent-blocking semantics of vfork.
+    /// - `CLONE_PTRACE` (0x2000) / `CLONE_UNTRACED` (0x800000):
+    ///   ptrace inheritance is the runtime's call.
+    pub const RUNTIME_RESERVED: Self = Self(
+        0x1000        // CLONE_PIDFD
+        | 0x100000    // CLONE_PARENT_SETTID
+        | 0x01000000  // CLONE_CHILD_SETTID
+        | 0x200000    // CLONE_CHILD_CLEARTID
+        | 0x400000    // CLONE_DETACHED
+        | 0x80000     // CLONE_SETTLS
+        | 0x4000      // CLONE_VFORK
+        | 0x2000      // CLONE_PTRACE
+        | 0x800000,   // CLONE_UNTRACED
+    );
+
+    /// Test-only raw-bit constructor. Lets the flag-validator
+    /// reject patterns that the public constants do not expose
+    /// (e.g. unknown high bits, exact runtime-reserved bits).
+    /// Production callers must use the named constants +
+    /// [`union`](Self::union) / `BitOr` so the model stays in sync
+    /// with the validator.
+    #[cfg(test)]
+    pub(crate) const fn from_bits_for_test(bits: u64) -> Self {
+        Self(bits)
+    }
+
+    /// Combine two flag sets.
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// Raw flag bits for `clone_args.flags`.
+    pub const fn bits(self) -> u64 {
+        self.0
+    }
+
+    /// Whether every bit in `other` is set in `self`. Set-theoretic
+    /// (matches [`MpolFlags::contains`]'s convention): `contains(NONE)`
+    /// returns `true` for any `self`.
+    pub const fn contains(self, other: Self) -> bool {
+        (self.0 & other.0) == other.0
+    }
+}
+
+impl std::ops::BitOr for CloneFlags {
+    type Output = Self;
+    /// Delegates to [`CloneFlags::union`] so the bitwise-OR logic
+    /// lives in one place. Same const-fn vs trait-fn split as
+    /// [`MpolFlags`].
+    fn bitor(self, rhs: Self) -> Self {
+        self.union(rhs)
+    }
+}
+
+/// How [`WorkloadHandle::spawn`] creates worker tasks.
+///
+/// `Fork` is the default — the existing [`fork(2)`] path with
+/// separate address space, separate thread group, and `waitpid`
+/// reaping. The other variants opt into different clone(2) /
+/// clone3(2) flag configurations to exercise scheduler code paths
+/// that depend on shared VM, shared thread group, or fully custom
+/// flags.
+///
+/// All variants except `Fork` produce workers that cannot be
+/// reaped via `waitpid` for thread-group members — the runtime
+/// uses `pthread_join` ([`Thread`](Self::Thread)) or `pidfd` polling
+/// ([`SharedVm`](Self::SharedVm) / [`Raw`](Self::Raw)) instead. See
+/// the per-variant docs for the dispatch path each takes.
+///
+/// **Stream-3 status:** only [`Fork`](Self::Fork) is currently
+/// dispatched by [`WorkloadHandle::spawn`] —
+/// [`Thread`](Self::Thread), [`SharedVm`](Self::SharedVm), and
+/// [`Raw`](Self::Raw) cause spawn to bail until #19b/#19c land. The
+/// flag validator below is fully implemented because future
+/// dispatch needs it; the variant constructors are exposed so
+/// callers can write tests that pin the planned API surface ahead
+/// of dispatch.
+#[derive(Clone, Debug, Default)]
+pub enum CloneMode {
+    /// Plain `fork(2)`: separate address space, separate thread
+    /// group (`p->tgid = p->pid`), reaped via `waitpid`. The default
+    /// — preserves existing [`WorkloadHandle::spawn`] behavior.
+    #[default]
+    Fork,
+    /// Same thread group as the spawning process. Implementation
+    /// uses [`std::thread::spawn`], which sets `CLONE_THREAD |
+    /// CLONE_SIGHAND | CLONE_VM | CLONE_FS | CLONE_FILES |
+    /// CLONE_SYSVSEM | CLONE_SETTLS | CLONE_PARENT_SETTID |
+    /// CLONE_CHILD_CLEARTID` under the hood (glibc/musl pthread
+    /// internals). Reaped via [`std::thread::JoinHandle`]. Workers
+    /// share `tgid`, signal-handler table, and address space with
+    /// the parent — observers like `task_struct->group_leader`,
+    /// `tgid`, `real_parent` all match the parent's.
+    Thread,
+    /// Shared VM but a *different* `tgid`. Issued via raw
+    /// [`clone3(2)`](https://man7.org/linux/man-pages/man2/clone3.2.html)
+    /// with `CLONE_VM | CLONE_PIDFD` (no `CLONE_THREAD`,
+    /// `CLONE_SIGHAND`, etc.). Workers see the parent's address
+    /// space but appear as separate processes to PID-keyed
+    /// observers. Reaped via the runtime's pidfd. Useful for
+    /// scheduler code paths that key on `tgid` distinction while
+    /// requiring shared memory.
+    SharedVm,
+    /// Caller-supplied flag set. The runtime adds `CLONE_PIDFD`
+    /// internally for reaping; everything else comes from the
+    /// caller. The flag set is validated against the kernel's
+    /// `copy_process` rejection rules at spawn time —
+    /// [`validate_clone_flags`] for the exhaustive list.
+    Raw(CloneFlags),
+}
+
+/// Validate a [`CloneFlags`] set against the rejection rules in
+/// `copy_process` (kernel/fork.c). Returns `Ok(())` on a flag set
+/// the kernel will accept, or `Err` with a named-rule diagnostic
+/// otherwise.
+///
+/// The runtime calls this before ever issuing the syscall so
+/// callers see a structural rejection (with the rule name) rather
+/// than tunneling an `EINVAL` through the syscall return.
+///
+/// Rules implemented (1:1 with the kernel checks at the top of
+/// `copy_process`):
+///
+/// 1. `THREAD` requires `SIGHAND`.
+/// 2. `SIGHAND` requires `VM` (also implied by rule 1 transitively).
+/// 3. `NEWNS` and `FS` are mutually exclusive.
+/// 4. `NEWUSER` and `FS` are mutually exclusive.
+/// 5. `THREAD` excludes `NEWUSER` and `NEWPID`.
+/// 6. Caller-set bits in [`CloneFlags::RUNTIME_RESERVED`] are
+///    rejected — those flags belong to the runtime.
+///
+/// `CLONE_PARENT && SIGNAL_UNKILLABLE` (init/container-init only)
+/// is NOT pre-checked here — ktstr never runs as init, so the rule
+/// is unreachable; the kernel still enforces it on the unlikely
+/// off-path.
+pub(crate) fn validate_clone_flags(flags: CloneFlags) -> Result<()> {
+    if flags.contains(CloneFlags::THREAD) && !flags.contains(CloneFlags::SIGHAND) {
+        anyhow::bail!(
+            "clone3: CLONE_THREAD requires CLONE_SIGHAND (kernel `copy_process` \
+             rejects detached threads outside a thread group)"
+        );
+    }
+    if flags.contains(CloneFlags::SIGHAND) && !flags.contains(CloneFlags::VM) {
+        anyhow::bail!(
+            "clone3: CLONE_SIGHAND requires CLONE_VM (kernel `copy_process` \
+             rejects shared signal handlers without shared address space)"
+        );
+    }
+    if flags.contains(CloneFlags::NEWNS) && flags.contains(CloneFlags::FS) {
+        anyhow::bail!(
+            "clone3: CLONE_NEWNS and CLONE_FS are mutually exclusive (kernel \
+             `copy_process` rejects sharing the root directory across mount \
+             namespaces)"
+        );
+    }
+    if flags.contains(CloneFlags::NEWUSER) && flags.contains(CloneFlags::FS) {
+        anyhow::bail!(
+            "clone3: CLONE_NEWUSER and CLONE_FS are mutually exclusive (kernel \
+             `copy_process` rejects sharing FS state across user namespaces)"
+        );
+    }
+    if flags.contains(CloneFlags::THREAD)
+        && (flags.contains(CloneFlags::NEWUSER) || flags.contains(CloneFlags::NEWPID))
+    {
+        anyhow::bail!(
+            "clone3: CLONE_THREAD with CLONE_NEWUSER or CLONE_NEWPID rejected \
+             (kernel `copy_process` requires thread-group siblings to share \
+             user/pid namespaces)"
+        );
+    }
+    let reserved = flags.bits() & CloneFlags::RUNTIME_RESERVED.bits();
+    if reserved != 0 {
+        anyhow::bail!(
+            "clone3: caller-set runtime-reserved flags 0x{reserved:x} not allowed \
+             (CLONE_PIDFD, CLONE_PARENT_SETTID, CLONE_CHILD_SETTID, \
+             CLONE_CHILD_CLEARTID, CLONE_DETACHED, CLONE_SETTLS, CLONE_VFORK, \
+             CLONE_PTRACE, CLONE_UNTRACED are runtime-managed; see \
+             `CloneFlags::RUNTIME_RESERVED`)"
+        );
+    }
+    Ok(())
 }
 
 impl MemPolicy {
@@ -1020,6 +1332,45 @@ fn apply_mempolicy_with_flags(policy: &MemPolicy, flags: MpolFlags) {
     }
 }
 
+/// Apply `nice` to the calling worker via `setpriority(2)`.
+///
+/// `nice == 0` is a fast-path skip — the worker inherits the
+/// parent's nice value. The kernel clamps `niceval` to
+/// `[MIN_NICE, MAX_NICE]` (-20..19) inside `setpriority`, so any
+/// out-of-range input is normalised by the syscall itself rather
+/// than rejected.
+///
+/// Failures are logged once via stderr and do not abort the
+/// worker — matches the [`apply_mempolicy_with_flags`] /
+/// [`set_thread_affinity`] / [`set_sched_policy`] error idiom in
+/// `worker_main`. The expected failure mode is `EACCES` from
+/// `set_one_prio` → `can_nice` when an unprivileged worker tries
+/// to lower nice (negative niceval) without `CAP_SYS_NICE`.
+fn apply_nice(nice: i32) {
+    if nice == 0 {
+        return;
+    }
+    let rc = unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, nice) };
+    if rc != 0 {
+        warn_setpriority_failed_once();
+    }
+}
+
+/// Print a single `setpriority` failure warning for the lifetime
+/// of the process. Same rationale as
+/// `warn_schedstat_unavailable_once`: dozens of workers will fail
+/// once each on an unprivileged host that requested negative nice,
+/// and a per-worker line floods the test log.
+fn warn_setpriority_failed_once() {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        let errno = std::io::Error::last_os_error();
+        eprintln!(
+            "workload: setpriority(PRIO_PROCESS) failed: {errno}; nice value not applied (CAP_SYS_NICE may be required for negative nice)"
+        );
+    });
+}
+
 /// Configuration for spawning a group of worker processes.
 #[derive(Debug, Clone)]
 pub struct WorkloadConfig {
@@ -1035,6 +1386,24 @@ pub struct WorkloadConfig {
     pub mem_policy: MemPolicy,
     /// Optional mode flags for `set_mempolicy(2)`.
     pub mpol_flags: MpolFlags,
+    /// Per-worker nice value applied via `setpriority(2)` after
+    /// fork, before the work loop. Range `-20..=19` per `MIN_NICE`
+    /// / `MAX_NICE` in `kernel/sys.c`'s `setpriority` syscall;
+    /// values outside this window are clamped kernel-side. `0` (the
+    /// default) skips the syscall entirely so the worker inherits
+    /// the parent's nice value.
+    ///
+    /// Negative values require `CAP_SYS_NICE` (the `set_one_prio`
+    /// → `can_nice` path returns `EACCES` to unprivileged callers
+    /// trying to lower nice below the parent's). Failures are
+    /// logged once via stderr and do not abort the worker — the
+    /// scheduling-policy and affinity sites use the same idiom.
+    pub nice: i32,
+    /// How to create each worker. Defaults to [`CloneMode::Fork`]
+    /// — the historical fork-based path. Other variants exercise
+    /// shared-VM / thread-group / custom-flag clone3 paths;
+    /// dispatch for those is staged across #19b and #19c.
+    pub clone_mode: CloneMode,
 }
 
 impl Default for WorkloadConfig {
@@ -1046,6 +1415,8 @@ impl Default for WorkloadConfig {
             sched_policy: SchedPolicy::Normal,
             mem_policy: MemPolicy::Default,
             mpol_flags: MpolFlags::NONE,
+            nice: 0,
+            clone_mode: CloneMode::Fork,
         }
     }
 }
@@ -1086,6 +1457,25 @@ impl WorkloadConfig {
         self.mpol_flags = f;
         self
     }
+
+    /// Set the per-worker nice value applied via `setpriority(2)`.
+    ///
+    /// `0` (the default) skips the syscall and inherits the
+    /// parent's nice. Negative values require `CAP_SYS_NICE`.
+    pub fn nice(mut self, n: i32) -> Self {
+        self.nice = n;
+        self
+    }
+
+    /// Set the clone mode used when spawning each worker.
+    ///
+    /// [`CloneMode::Fork`] (the default) preserves historical
+    /// behavior. See [`CloneMode`] for the full menu and dispatch
+    /// status.
+    pub fn clone_mode(mut self, m: CloneMode) -> Self {
+        self.clone_mode = m;
+        self
+    }
 }
 
 /// Workload definition for a single group of workers within a cgroup.
@@ -1119,6 +1509,14 @@ pub struct Work {
     pub mem_policy: MemPolicy,
     /// Optional mode flags for `set_mempolicy(2)`.
     pub mpol_flags: MpolFlags,
+    /// Per-worker nice value applied via `setpriority(2)` after
+    /// fork, before the work loop. See [`WorkloadConfig::nice`]
+    /// for range, default-zero skip semantics, and `CAP_SYS_NICE`
+    /// rules.
+    pub nice: i32,
+    /// Clone mode for spawning each worker. See [`CloneMode`] for
+    /// the variant menu and dispatch status.
+    pub clone_mode: CloneMode,
 }
 
 impl Default for Work {
@@ -1130,6 +1528,8 @@ impl Default for Work {
             affinity: AffinityKind::Inherit,
             mem_policy: MemPolicy::Default,
             mpol_flags: MpolFlags::NONE,
+            nice: 0,
+            clone_mode: CloneMode::Fork,
         }
     }
 }
@@ -1168,6 +1568,21 @@ impl Work {
     /// Set the NUMA memory policy mode flags.
     pub fn mpol_flags(mut self, f: MpolFlags) -> Self {
         self.mpol_flags = f;
+        self
+    }
+
+    /// Set the per-worker nice value applied via `setpriority(2)`.
+    ///
+    /// `0` (the default) skips the syscall and inherits the
+    /// parent's nice. Negative values require `CAP_SYS_NICE`.
+    pub fn nice(mut self, n: i32) -> Self {
+        self.nice = n;
+        self
+    }
+
+    /// Set the clone mode used when spawning each worker.
+    pub fn clone_mode(mut self, m: CloneMode) -> Self {
+        self.clone_mode = m;
         self
     }
 }
@@ -1217,7 +1632,7 @@ pub struct Migration {
 /// Callers building a sentinel report should spread
 /// `..WorkerReport::default()` rather than listing every field by hand
 /// -- the sentinel drifts silently when a field is added.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, crate::Claim)]
 pub struct WorkerReport {
     /// Worker process ID (from `getpid()` in the forked child).
     /// Stored as `pid_t` (i32) to match the kernel's native type and
@@ -1593,6 +2008,40 @@ impl WorkloadHandle {
     /// Fork worker processes. Workers block on a pipe until [`start()`](Self::start)
     /// is called, allowing the caller to move them into cgroups first.
     pub fn spawn(config: &WorkloadConfig) -> Result<Self> {
+        // Dispatch on `clone_mode`. Stream-3 (#19a) lands the type
+        // surface and validator only — Thread / SharedVm / Raw
+        // dispatch is staged in #19b / #19c. Until those land,
+        // anything other than Fork bails with an actionable
+        // diagnostic. Raw still runs the validator so callers can
+        // pin the kernel-rule shape of their flag set ahead of
+        // dispatch.
+        match &config.clone_mode {
+            CloneMode::Fork => { /* fall through to the existing path below */ }
+            CloneMode::Thread => {
+                anyhow::bail!(
+                    "WorkloadHandle::spawn: CloneMode::Thread dispatch is not yet \
+                     implemented (staged in #19b — std::thread + JoinHandle reaping). \
+                     Use CloneMode::Fork until then."
+                );
+            }
+            CloneMode::SharedVm => {
+                anyhow::bail!(
+                    "WorkloadHandle::spawn: CloneMode::SharedVm dispatch is not yet \
+                     implemented (staged in #19c — clone3 + pidfd reaping). \
+                     Use CloneMode::Fork until then."
+                );
+            }
+            CloneMode::Raw(flags) => {
+                validate_clone_flags(*flags)?;
+                anyhow::bail!(
+                    "WorkloadHandle::spawn: CloneMode::Raw dispatch is not yet \
+                     implemented (staged in #19c — clone3 + pidfd reaping). \
+                     Flag set is structurally valid; dispatch coming. \
+                     Use CloneMode::Fork until then."
+                );
+            }
+        }
+
         let needs_pipes = matches!(
             config.work_type,
             WorkType::PipeIo { .. } | WorkType::CachePipe { .. }
@@ -2061,6 +2510,7 @@ impl WorkloadHandle {
                                 config.sched_policy,
                                 config.mem_policy.clone(),
                                 config.mpol_flags,
+                                config.nice,
                                 worker_pipe_fds,
                                 worker_futex,
                                 iter_slot,
@@ -2535,6 +2985,7 @@ fn worker_main(
     sched_policy: SchedPolicy,
     mem_policy: MemPolicy,
     mpol_flags: MpolFlags,
+    nice: i32,
     pipe_fds: Option<(i32, i32)>,
     futex: Option<(*mut u32, bool)>,
     iter_slot: *mut AtomicU64,
@@ -2548,6 +2999,7 @@ fn worker_main(
     }
     let _ = set_sched_policy(tid, sched_policy);
     apply_mempolicy_with_flags(&mem_policy, mpol_flags);
+    apply_nice(nice);
 
     let start = Instant::now();
     let mut work_units: u64 = 0;
@@ -3982,6 +4434,32 @@ fn thread_cpu_time_ns() -> u64 {
     clock_gettime_ns(libc::CLOCK_THREAD_CPUTIME_ID).unwrap_or(0)
 }
 
+/// Convert a [`Duration`] to the kernel's `u64` nanosecond
+/// representation for `sched_setattr(2)` while enforcing the
+/// bit-63-clear constraint `__checkparam_dl` imposes on
+/// `sched_deadline` and `sched_period`.
+///
+/// `Duration::as_nanos()` returns `u128`; the kernel's UAPI struct
+/// fields are `u64`. Any duration longer than `i64::MAX` ns
+/// (~292 years) either flips bit 63 of the truncated `u64` (kernel
+/// reserved) or wraps on the cast entirely. Both outcomes are
+/// rejected here so the user sees a named-field error rather than
+/// a kernel `EINVAL` after a silent truncation.
+///
+/// `field` is the human-readable field label embedded in the
+/// error message ("runtime", "deadline", "period") so a
+/// rejection points at the offending input.
+fn duration_to_kernel_ns(d: Duration, field: &str) -> Result<u64> {
+    let ns_u128 = d.as_nanos();
+    if ns_u128 > i64::MAX as u128 {
+        anyhow::bail!(
+            "sched_setattr: {field} duration ({ns_u128} ns) exceeds i64::MAX — \
+             nanosecond count must fit in 63 bits (kernel reserves bit 63)"
+        );
+    }
+    Ok(ns_u128 as u64)
+}
+
 fn set_sched_policy(pid: libc::pid_t, policy: SchedPolicy) -> Result<()> {
     // Reject pid <= 0: pid 0 means "calling process" to the syscall,
     // pid -1 means "every process in the session," and pid < -1
@@ -3998,9 +4476,9 @@ fn set_sched_policy(pid: libc::pid_t, policy: SchedPolicy) -> Result<()> {
         SchedPolicy::Fifo(p) => (libc::SCHED_FIFO, p.clamp(1, 99) as i32),
         SchedPolicy::RoundRobin(p) => (libc::SCHED_RR, p.clamp(1, 99) as i32),
         SchedPolicy::Deadline {
-            runtime_ns,
-            deadline_ns,
-            period_ns,
+            runtime,
+            deadline,
+            period,
         } => {
             // SCHED_DEADLINE has no `sched_param` representation —
             // the kernel only accepts it through `sched_setattr(2)`.
@@ -4009,7 +4487,7 @@ fn set_sched_policy(pid: libc::pid_t, policy: SchedPolicy) -> Result<()> {
             //
             // `__checkparam_dl` (kernel/sched/deadline.c) rejects
             // anything that violates `sched_deadline != 0`,
-            // `runtime_ns >= 1024`, the bit-63-clear requirement on
+            // `runtime >= 1024 ns`, the bit-63-clear requirement on
             // `deadline`/`period`, the `runtime <= deadline <=
             // effective_period` ordering (where `effective_period`
             // is `sched_deadline` when `sched_period == 0`), and
@@ -4020,39 +4498,41 @@ fn set_sched_policy(pid: libc::pid_t, policy: SchedPolicy) -> Result<()> {
             // checks (zero-deadline, ordering, top-bit, DL_SCALE
             // floor) — the sysctl bound check happens kernel-side
             // and surfaces as a syscall EINVAL.
-            if deadline_ns == 0 {
+            //
+            // The Duration → u64 ns conversions ALSO enforce the
+            // kernel's bit-63-clear constraint as a single
+            // i64::MAX overflow check in `duration_to_kernel_ns`:
+            // `Duration::as_nanos()` returns `u128`, and a value
+            // exceeding `i64::MAX` would either flip bit 63 of the
+            // truncated u64 (kernel reserved) or wrap on the cast
+            // entirely. Doing the conversion here keeps the
+            // top-bit check and the syscall arg in lockstep.
+            if deadline.is_zero() {
                 anyhow::bail!(
-                    "sched_setattr: deadline_ns must be > 0 (kernel `__checkparam_dl` rejects zero deadline)"
+                    "sched_setattr: deadline must be > 0 (kernel `__checkparam_dl` rejects zero deadline)"
                 );
             }
+            let runtime_ns = duration_to_kernel_ns(runtime, "runtime")?;
+            let deadline_ns = duration_to_kernel_ns(deadline, "deadline")?;
+            let period_ns = duration_to_kernel_ns(period, "period")?;
             if runtime_ns < 1024 {
                 anyhow::bail!(
-                    "sched_setattr: runtime_ns ({runtime_ns}) below kernel DL_SCALE floor (1024)"
+                    "sched_setattr: runtime ({runtime_ns} ns) below kernel DL_SCALE floor (1024 ns)"
                 );
             }
             if runtime_ns > deadline_ns {
                 anyhow::bail!(
-                    "sched_setattr: runtime_ns ({runtime_ns}) > deadline_ns ({deadline_ns})"
+                    "sched_setattr: runtime ({runtime_ns} ns) > deadline ({deadline_ns} ns)"
                 );
             }
-            // `period_ns == 0` is legal: the kernel substitutes
-            // `sched_deadline` for the period in that case (see
-            // `if (!period) period = attr->sched_deadline;` in
-            // `__checkparam_dl`). Only enforce `deadline <=
+            // `period == Duration::ZERO` is legal: the kernel
+            // substitutes `sched_deadline` for the period in that
+            // case (see `if (!period) period = attr->sched_deadline;`
+            // in `__checkparam_dl`). Only enforce `deadline <=
             // period` when period is non-zero.
             if period_ns != 0 && deadline_ns > period_ns {
                 anyhow::bail!(
-                    "sched_setattr: deadline_ns ({deadline_ns}) > period_ns ({period_ns})"
-                );
-            }
-            if deadline_ns & (1u64 << 63) != 0 {
-                anyhow::bail!(
-                    "sched_setattr: deadline_ns top bit must be clear (kernel reserved)"
-                );
-            }
-            if period_ns & (1u64 << 63) != 0 {
-                anyhow::bail!(
-                    "sched_setattr: period_ns top bit must be clear (kernel reserved)"
+                    "sched_setattr: deadline ({deadline_ns} ns) > period ({period_ns} ns)"
                 );
             }
             // SAFETY: `sched_attr` is a UAPI struct of plain
@@ -4634,6 +5114,9 @@ mod tests {
         assert!(matches!(c.work_type, WorkType::CpuSpin));
         assert!(matches!(c.sched_policy, SchedPolicy::Normal));
         assert!(matches!(c.affinity, AffinityMode::None));
+        // Default nice is 0 — `apply_nice(0)` short-circuits before
+        // the syscall, preserving inherit-from-parent semantics.
+        assert_eq!(c.nice, 0);
     }
 
     #[test]
@@ -4641,10 +5124,133 @@ mod tests {
         let cfg = WorkloadConfig::default()
             .workers(7)
             .work_type(WorkType::CpuSpin)
-            .sched_policy(SchedPolicy::Batch);
+            .sched_policy(SchedPolicy::Batch)
+            .nice(5);
         assert_eq!(cfg.num_workers, 7);
         assert!(matches!(cfg.work_type, WorkType::CpuSpin));
         assert!(matches!(cfg.sched_policy, SchedPolicy::Batch));
+        assert_eq!(cfg.nice, 5);
+    }
+
+    /// `apply_nice(0)` is a documented short-circuit — when the
+    /// caller leaves the field at its default, the worker MUST
+    /// inherit the parent's nice value rather than have
+    /// `setpriority(PRIO_PROCESS, 0, 0)` reset it to zero. The
+    /// distinction matters when scenario-level code already
+    /// elevated the parent to a non-default nice (e.g. via a
+    /// wrapper that wants every worker to inherit) — a
+    /// non-skipping `apply_nice(0)` would silently clobber that.
+    /// Test by setting the calling thread's nice via direct
+    /// syscall, calling `apply_nice(0)`, and asserting the nice
+    /// did not change.
+    #[test]
+    fn apply_nice_zero_is_noop() {
+        // Set nice to 5 directly (positive — works without
+        // CAP_SYS_NICE because raising nice is always permitted
+        // for own task).
+        let rc = unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, 5) };
+        if rc != 0 {
+            // setpriority should not fail for a positive nice on
+            // self; if it does, the host environment is unusual
+            // — skip rather than fake-pass.
+            eprintln!(
+                "skipping: setpriority(0, 0, 5) failed: {}",
+                std::io::Error::last_os_error()
+            );
+            return;
+        }
+        // getpriority returns 20 - nice (per glibc convention),
+        // so a nice of 5 reads back as 15. errno-clear before
+        // call because getpriority can legitimately return -1
+        // for nice=20.
+        unsafe {
+            *libc::__errno_location() = 0;
+        }
+        let read_back = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
+        let errno_before = unsafe { *libc::__errno_location() };
+        assert_eq!(
+            errno_before, 0,
+            "getpriority must succeed before apply_nice; rc={read_back}"
+        );
+        let nice_before = 20 - read_back;
+        assert_eq!(
+            nice_before, 5,
+            "setpriority must have stuck before apply_nice runs"
+        );
+
+        // Now invoke apply_nice(0) — should NOT touch priority.
+        apply_nice(0);
+
+        unsafe {
+            *libc::__errno_location() = 0;
+        }
+        let read_back2 = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
+        let errno_after = unsafe { *libc::__errno_location() };
+        assert_eq!(errno_after, 0, "getpriority must succeed after apply_nice");
+        let nice_after = 20 - read_back2;
+        assert_eq!(
+            nice_after, 5,
+            "apply_nice(0) must not touch nice — observed change \
+             from {nice_before} to {nice_after}",
+        );
+
+        // Restore default (rare-path cleanup).
+        let _ = unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, 0) };
+    }
+
+    /// Positive-nice end-to-end: spawn one worker with `nice = 10`,
+    /// verify the worker process actually has nice 10 by reading
+    /// `/proc/<pid>/stat` field 19 (priority field) before
+    /// `stop_and_collect`. Positive nice never requires
+    /// `CAP_SYS_NICE` — `set_one_prio` only checks `can_nice` for
+    /// `niceval < task_nice(p)`.
+    ///
+    /// Reading via /proc rather than `getpriority` because the
+    /// worker is in a child process; `getpriority(PRIO_PROCESS, pid)`
+    /// would also work but /proc/stat field 19 is the canonical
+    /// observation point used elsewhere in the crate's tests.
+    #[test]
+    fn worker_nice_applied_via_setpriority() {
+        let config = WorkloadConfig {
+            num_workers: 1,
+            affinity: AffinityMode::None,
+            work_type: WorkType::CpuSpin,
+            sched_policy: SchedPolicy::Normal,
+            nice: 10,
+            ..Default::default()
+        };
+        let mut h = WorkloadHandle::spawn(&config).unwrap();
+        let pid = h.worker_pids()[0];
+        h.start();
+        // Brief sleep so the worker has actually executed
+        // `apply_nice` post-fork and post-start before we read
+        // /proc.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        // /proc/<pid>/stat field 19 is "nice" per `proc(5)` —
+        // tokenize after the comm field's closing paren to avoid
+        // splitting names containing spaces.
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("/proc/stat read");
+        let after_paren = stat
+            .rsplit_once(") ")
+            .expect("/proc/stat has comm in parens")
+            .1;
+        // After the closing paren, fields are 1-indexed starting
+        // at "state" (field 3 of the original layout). nice is
+        // field 19; minus the 2 fields before the paren that's
+        // index 16 in the post-paren token list.
+        let tokens: Vec<&str> = after_paren.split_whitespace().collect();
+        let nice_str = tokens
+            .get(16)
+            .expect("/proc/stat must have at least 17 fields after comm");
+        let nice_observed: i32 = nice_str.parse().expect("nice field must be i32");
+        // Stop before assertion so a failure doesn't leak a
+        // non-default-nice worker.
+        let _reports = h.stop_and_collect();
+        assert_eq!(
+            nice_observed, 10,
+            "worker /proc/<pid>/stat field 19 must reflect the \
+             configured nice value; got {nice_observed}, expected 10"
+        );
     }
 
     #[test]
@@ -5529,20 +6135,27 @@ mod tests {
     fn set_sched_policy_batch_returns_valid_result() {
         let pid: libc::pid_t = unsafe { libc::getpid() };
         let result = set_sched_policy(pid, SchedPolicy::Batch);
-        // SCHED_BATCH may fail when sched_ext rejects the transition
-        // (`scx_check_setscheduler` in `__sched_setscheduler` at
-        // kernel/sched/syscalls.c:464). It does NOT require
-        // CAP_SYS_NICE: `user_check_sched_setscheduler`
-        // (kernel/sched/syscalls.c:406) routes only rt_policy /
-        // dl_policy / negative-nice / leaving-IDLE through req_priv;
-        // a fair-policy → fair-policy transition that does not
-        // reduce nice never reaches the capable() check.
+        // SCHED_BATCH does NOT require CAP_SYS_NICE:
+        // `user_check_sched_setscheduler` routes only rt_policy /
+        // dl_policy / negative-nice / leaving-IDLE through
+        // req_priv; a fair-policy → fair-policy transition that
+        // does not reduce nice never reaches the capable() check.
+        // `scx_check_setscheduler` (kernel/sched/ext.c) does not
+        // reject BATCH either — it only rejects transitions INTO
+        // SCHED_EXT when `p->scx.disallow` is set, which BATCH is
+        // not. Failure is therefore expected only on environments
+        // that introduce extra LSM / security-module gates; the
+        // test tolerates both outcomes.
         match result {
             Ok(()) => {
                 let pol = unsafe { libc::sched_getscheduler(pid) };
-                // sched_ext may override the effective policy, so the
-                // kernel can report a different value than SCHED_BATCH
-                // even after a successful sched_setscheduler.
+                // Under sched_ext switch-all (`task_should_scx`
+                // returns true for any policy when
+                // `scx_switching_all` is set), `__setscheduler_class`
+                // routes BATCH to `ext_sched_class`. Reading back
+                // via `sched_getscheduler` returns the requested
+                // policy regardless — this just sanity-checks the
+                // syscall returned a non-negative policy id.
                 assert!(
                     pol >= 0,
                     "sched_getscheduler must return a valid policy, got {pol}",
@@ -5563,22 +6176,22 @@ mod tests {
     fn set_sched_policy_idle_returns_valid_result() {
         let pid: libc::pid_t = unsafe { libc::getpid() };
         let result = set_sched_policy(pid, SchedPolicy::Idle);
-        // SCHED_IDLE may fail when sched_ext rejects the transition
-        // (`scx_check_setscheduler` in `__sched_setscheduler` at
-        // kernel/sched/syscalls.c:464). It does NOT require
-        // CAP_SYS_NICE for *entering* IDLE:
-        // `user_check_sched_setscheduler`
-        // (kernel/sched/syscalls.c:406) routes the IDLE-related
-        // capability check through `task_has_idle_policy(p) &&
-        // !idle_policy(policy)` — i.e. CAP_SYS_NICE is required
+        // SCHED_IDLE does NOT require CAP_SYS_NICE for *entering*
+        // IDLE: `user_check_sched_setscheduler` gates the
+        // IDLE-related capability check on `task_has_idle_policy(p)
+        // && !idle_policy(policy)` — i.e. CAP_SYS_NICE is required
         // only when *leaving* SCHED_IDLE for a non-idle class
         // without RLIMIT_NICE permission, not when entering it.
+        // `scx_check_setscheduler` (kernel/sched/ext.c) does not
+        // reject IDLE either — same reasoning as the BATCH test
+        // above. Failure is expected only on environments with
+        // extra LSM / security-module gates.
         match result {
             Ok(()) => {
                 let pol = unsafe { libc::sched_getscheduler(pid) };
-                // sched_ext may override the effective policy, so the
-                // kernel can report a different value than SCHED_IDLE
-                // even after a successful sched_setscheduler.
+                // Same switch-all reasoning as the BATCH test —
+                // IDLE routes to `ext_sched_class` under switch-all
+                // but the syscall return is the requested policy id.
                 assert!(
                     pol >= 0,
                     "sched_getscheduler must return a valid policy, got {pol}",
@@ -5606,26 +6219,26 @@ mod tests {
     // `EINVAL`. None of these tests require `CAP_SYS_NICE`
     // because the bail!s fire before the syscall.
 
-    /// `deadline_ns == 0` must be rejected: `__checkparam_dl`
-    /// returns false on `attr->sched_deadline == 0`. The runtime
-    /// floor is satisfied here so the failure pins the
-    /// zero-deadline check, not the DL_SCALE check.
+    /// `deadline == Duration::ZERO` must be rejected:
+    /// `__checkparam_dl` returns false on `attr->sched_deadline ==
+    /// 0`. The runtime floor is satisfied here so the failure
+    /// pins the zero-deadline check, not the DL_SCALE check.
     #[test]
     fn set_sched_policy_deadline_zero_deadline_rejected() {
         let pid: libc::pid_t = unsafe { libc::getpid() };
         let result = set_sched_policy(
             pid,
             SchedPolicy::Deadline {
-                runtime_ns: 1024,
-                deadline_ns: 0,
-                period_ns: 1_000_000,
+                runtime: Duration::from_nanos(1024),
+                deadline: Duration::ZERO,
+                period: Duration::from_nanos(1_000_000),
             },
         );
         let err = result.expect_err("zero deadline must be rejected");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("deadline_ns"),
-            "error must name deadline_ns: {msg}"
+            msg.contains("deadline"),
+            "error must name deadline field: {msg}"
         );
         assert!(
             msg.contains("must be > 0") || msg.contains("zero"),
@@ -5633,24 +6246,24 @@ mod tests {
         );
     }
 
-    /// `runtime_ns < 1024` must be rejected per the `DL_SCALE`
-    /// floor in `__checkparam_dl`.
+    /// `runtime` shorter than 1024 ns must be rejected per the
+    /// `DL_SCALE` floor in `__checkparam_dl`.
     #[test]
     fn set_sched_policy_deadline_runtime_below_dl_scale_rejected() {
         let pid: libc::pid_t = unsafe { libc::getpid() };
         let result = set_sched_policy(
             pid,
             SchedPolicy::Deadline {
-                runtime_ns: 1023,
-                deadline_ns: 100_000,
-                period_ns: 1_000_000,
+                runtime: Duration::from_nanos(1023),
+                deadline: Duration::from_nanos(100_000),
+                period: Duration::from_nanos(1_000_000),
             },
         );
         let err = result.expect_err("runtime below DL_SCALE must be rejected");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("runtime_ns"),
-            "error must name runtime_ns: {msg}"
+            msg.contains("runtime"),
+            "error must name runtime field: {msg}"
         );
         assert!(
             msg.contains("DL_SCALE") || msg.contains("1024"),
@@ -5658,7 +6271,7 @@ mod tests {
         );
     }
 
-    /// `runtime_ns > deadline_ns` must be rejected per the
+    /// `runtime > deadline` must be rejected per the
     /// `runtime <= deadline` clause of `__checkparam_dl`.
     #[test]
     fn set_sched_policy_deadline_runtime_exceeds_deadline_rejected() {
@@ -5666,22 +6279,22 @@ mod tests {
         let result = set_sched_policy(
             pid,
             SchedPolicy::Deadline {
-                runtime_ns: 200_000,
-                deadline_ns: 100_000,
-                period_ns: 1_000_000,
+                runtime: Duration::from_nanos(200_000),
+                deadline: Duration::from_nanos(100_000),
+                period: Duration::from_nanos(1_000_000),
             },
         );
         let err = result.expect_err("runtime > deadline must be rejected");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("runtime_ns") && msg.contains("deadline_ns"),
+            msg.contains("runtime") && msg.contains("deadline"),
             "error must name both fields: {msg}"
         );
     }
 
-    /// `deadline_ns > period_ns` must be rejected when `period_ns
-    /// != 0`. Pairs with
-    /// `set_sched_policy_deadline_period_zero_skips_period_check`
+    /// `deadline > period` must be rejected when `period` is
+    /// non-zero. Pairs with
+    /// `set_sched_policy_deadline_period_zero_passes_validation`
     /// which proves the gate is conditional on a non-zero period.
     #[test]
     fn set_sched_policy_deadline_deadline_exceeds_period_rejected() {
@@ -5689,56 +6302,63 @@ mod tests {
         let result = set_sched_policy(
             pid,
             SchedPolicy::Deadline {
-                runtime_ns: 1024,
-                deadline_ns: 2_000_000,
-                period_ns: 1_000_000,
+                runtime: Duration::from_nanos(1024),
+                deadline: Duration::from_nanos(2_000_000),
+                period: Duration::from_nanos(1_000_000),
             },
         );
         let err = result.expect_err("deadline > period must be rejected");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("deadline_ns") && msg.contains("period_ns"),
+            msg.contains("deadline") && msg.contains("period"),
             "error must name both fields: {msg}"
         );
     }
 
-    /// Bit 63 set on `deadline_ns` must be rejected per
-    /// `__checkparam_dl`'s `if (attr->sched_deadline & (1ULL <<
-    /// 63))` clause. Splitting the per-field message means the
-    /// diagnostic names the offending field rather than the
-    /// pair.
+    /// A `deadline` whose nanosecond count exceeds `i64::MAX` must
+    /// be rejected. The kernel's `__checkparam_dl` clause `if
+    /// (attr->sched_deadline & (1ULL << 63)) return false;`
+    /// requires bit 63 to be clear; `duration_to_kernel_ns`
+    /// enforces this as a single i64::MAX overflow check on
+    /// `Duration::as_nanos()` (u128). The error message names the
+    /// offending field via the `field` argument so the diagnostic
+    /// points at `deadline` and not `runtime`/`period`.
     #[test]
     fn set_sched_policy_deadline_top_bit_set_rejected() {
         let pid: libc::pid_t = unsafe { libc::getpid() };
         let result = set_sched_policy(
             pid,
             SchedPolicy::Deadline {
-                runtime_ns: 1024,
-                // Bit 63 set; the surrounding bits keep
-                // `runtime <= deadline` so the rejection pins
-                // the top-bit check.
-                deadline_ns: 1u64 << 63 | 100_000,
-                period_ns: 1_000_000,
+                runtime: Duration::from_nanos(1024),
+                // 1e12 seconds = 1e21 ns >> i64::MAX (≈ 9.2e18 ns)
+                // — guaranteed to trip the overflow guard. Picked
+                // far above the threshold so any future tweak to
+                // the constraint still fires this test.
+                deadline: Duration::from_secs(1_000_000_000_000),
+                period: Duration::from_nanos(1_000_000),
             },
         );
-        let err = result.expect_err("deadline top bit must be rejected");
+        let err = result.expect_err("deadline exceeding i64::MAX must be rejected");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("deadline_ns") && msg.contains("top bit"),
-            "error must name deadline_ns and top bit: {msg}"
+            msg.contains("deadline") && (msg.contains("i64::MAX") || msg.contains("63 bits")),
+            "error must name deadline field and the bit-63 / i64::MAX bound: {msg}"
         );
-        // Per-field message: must NOT name period_ns since only
-        // deadline_ns has the top bit set.
+        // Per-field message: must NOT name `period` since only
+        // `deadline` overflowed. `period` ordering matters —
+        // `duration_to_kernel_ns` is called runtime → deadline →
+        // period, so a deadline overflow short-circuits before
+        // period is touched.
         assert!(
-            !msg.contains("period_ns"),
-            "deadline-only top-bit error must not mention period_ns: {msg}"
+            !msg.contains("period"),
+            "deadline-only overflow error must not mention period: {msg}"
         );
     }
 
     /// Happy-path: a structurally valid `Deadline` with
-    /// `period_ns == 0` reaches the `sched_setattr` syscall. The
-    /// kernel substitutes `deadline_ns` for the period in this
-    /// case (see `if (!period) period = attr->sched_deadline;`
+    /// `period == Duration::ZERO` reaches the `sched_setattr`
+    /// syscall. The kernel substitutes `deadline` for the period
+    /// in this case (see `if (!period) period = attr->sched_deadline;`
     /// in `__checkparam_dl`). Without `CAP_SYS_NICE` the syscall
     /// fails with EPERM at the kernel-side capability check;
     /// either Ok(()) or an Err whose message names
@@ -5753,9 +6373,9 @@ mod tests {
         let result = set_sched_policy(
             pid,
             SchedPolicy::Deadline {
-                runtime_ns: 1024,
-                deadline_ns: 200_000,
-                period_ns: 0,
+                runtime: Duration::from_nanos(1024),
+                deadline: Duration::from_nanos(200_000),
+                period: Duration::ZERO,
             },
         );
         match result {
@@ -6498,7 +7118,8 @@ mod tests {
             .workers(8)
             .work_type(WorkType::bursty(10, 20))
             .sched_policy(SchedPolicy::Batch)
-            .affinity(AffinityKind::SingleCpu);
+            .affinity(AffinityKind::SingleCpu)
+            .nice(7);
         assert_eq!(w.num_workers, Some(8));
         assert!(matches!(
             w.work_type,
@@ -6509,6 +7130,7 @@ mod tests {
         ));
         assert!(matches!(w.sched_policy, SchedPolicy::Batch));
         assert!(matches!(w.affinity, AffinityKind::SingleCpu));
+        assert_eq!(w.nice, 7);
     }
 
     #[test]
@@ -6518,6 +7140,9 @@ mod tests {
         assert!(matches!(w.work_type, WorkType::CpuSpin));
         assert!(matches!(w.sched_policy, SchedPolicy::Normal));
         assert!(matches!(w.affinity, AffinityKind::Inherit));
+        // Default nice is 0 — same skip semantics as
+        // [`WorkloadConfig::nice`].
+        assert_eq!(w.nice, 0);
     }
 
     // -- SchedPolicy constructors --
@@ -8087,6 +8712,383 @@ mod tests {
         let b = MpolFlags::RELATIVE_NODES | MpolFlags::NUMA_BALANCING;
         assert!(!a.contains(b));
         assert!(!b.contains(a));
+    }
+
+    // -- CloneMode + CloneFlags + validate_clone_flags tests --
+
+    #[test]
+    fn clone_mode_default_is_fork() {
+        // Preserves historical fork-based behavior — anything else
+        // would silently change every existing caller's spawn path.
+        assert!(matches!(CloneMode::default(), CloneMode::Fork));
+    }
+
+    #[test]
+    fn workload_config_default_clone_mode_is_fork() {
+        let c = WorkloadConfig::default();
+        assert!(matches!(c.clone_mode, CloneMode::Fork));
+    }
+
+    #[test]
+    fn work_default_clone_mode_is_fork() {
+        let w = Work::default();
+        assert!(matches!(w.clone_mode, CloneMode::Fork));
+    }
+
+    #[test]
+    fn workload_config_clone_mode_builder() {
+        let cfg = WorkloadConfig::default().clone_mode(CloneMode::Thread);
+        assert!(matches!(cfg.clone_mode, CloneMode::Thread));
+    }
+
+    #[test]
+    fn work_clone_mode_builder() {
+        let w = Work::default().clone_mode(CloneMode::SharedVm);
+        assert!(matches!(w.clone_mode, CloneMode::SharedVm));
+    }
+
+    #[test]
+    fn clone_flags_constants_match_libc() {
+        // Bit values must match libc::CLONE_* exactly — the kernel
+        // syscall ABI is what these flags ultimately feed.
+        assert_eq!(CloneFlags::VM.bits(), libc::CLONE_VM as u64);
+        assert_eq!(CloneFlags::FS.bits(), libc::CLONE_FS as u64);
+        assert_eq!(CloneFlags::FILES.bits(), libc::CLONE_FILES as u64);
+        assert_eq!(CloneFlags::SIGHAND.bits(), libc::CLONE_SIGHAND as u64);
+        assert_eq!(CloneFlags::THREAD.bits(), libc::CLONE_THREAD as u64);
+        assert_eq!(CloneFlags::PARENT.bits(), libc::CLONE_PARENT as u64);
+        assert_eq!(CloneFlags::NEWNS.bits(), libc::CLONE_NEWNS as u64);
+        assert_eq!(CloneFlags::NEWUSER.bits(), libc::CLONE_NEWUSER as u64);
+        assert_eq!(CloneFlags::NEWPID.bits(), libc::CLONE_NEWPID as u64);
+        assert_eq!(CloneFlags::NEWNET.bits(), libc::CLONE_NEWNET as u64);
+        assert_eq!(CloneFlags::NEWIPC.bits(), libc::CLONE_NEWIPC as u64);
+        assert_eq!(CloneFlags::NEWUTS.bits(), libc::CLONE_NEWUTS as u64);
+        assert_eq!(CloneFlags::NEWCGROUP.bits(), libc::CLONE_NEWCGROUP as u64);
+        // CLONE_IO has bit 31 set — `as u64` would sign-extend if
+        // the libc constant were i32 with bit 31. Verify the cast
+        // produces the expected pattern (no sign extension).
+        assert_eq!(CloneFlags::IO.bits(), libc::CLONE_IO as u64);
+        assert_eq!(CloneFlags::SYSVSEM.bits(), libc::CLONE_SYSVSEM as u64);
+    }
+
+    #[test]
+    fn clone_flags_runtime_reserved_covers_runtime_managed_bits() {
+        // RUNTIME_RESERVED must include every flag the runtime sets
+        // internally — pidfd / parent_settid / child_settid /
+        // child_cleartid / detached / settls / vfork / ptrace /
+        // untraced. Each bit listed in the doc must be present.
+        let reserved = CloneFlags::RUNTIME_RESERVED.bits();
+        assert_eq!(reserved & libc::CLONE_PIDFD as u64, libc::CLONE_PIDFD as u64);
+        assert_eq!(
+            reserved & libc::CLONE_PARENT_SETTID as u64,
+            libc::CLONE_PARENT_SETTID as u64,
+        );
+        assert_eq!(
+            reserved & libc::CLONE_CHILD_SETTID as u64,
+            libc::CLONE_CHILD_SETTID as u64,
+        );
+        assert_eq!(
+            reserved & libc::CLONE_CHILD_CLEARTID as u64,
+            libc::CLONE_CHILD_CLEARTID as u64,
+        );
+        assert_eq!(
+            reserved & libc::CLONE_DETACHED as u64,
+            libc::CLONE_DETACHED as u64,
+        );
+        assert_eq!(
+            reserved & libc::CLONE_SETTLS as u64,
+            libc::CLONE_SETTLS as u64,
+        );
+        assert_eq!(
+            reserved & libc::CLONE_VFORK as u64,
+            libc::CLONE_VFORK as u64,
+        );
+        assert_eq!(
+            reserved & libc::CLONE_PTRACE as u64,
+            libc::CLONE_PTRACE as u64,
+        );
+        assert_eq!(
+            reserved & libc::CLONE_UNTRACED as u64,
+            libc::CLONE_UNTRACED as u64,
+        );
+    }
+
+    #[test]
+    fn clone_flags_runtime_reserved_excludes_user_relevant_bits() {
+        // The user-facing constants must NOT be in
+        // RUNTIME_RESERVED — otherwise the validator would reject
+        // them and the variant types would be unusable.
+        let reserved = CloneFlags::RUNTIME_RESERVED.bits();
+        for f in [
+            CloneFlags::VM,
+            CloneFlags::FS,
+            CloneFlags::FILES,
+            CloneFlags::SIGHAND,
+            CloneFlags::THREAD,
+            CloneFlags::PARENT,
+            CloneFlags::NEWNS,
+            CloneFlags::NEWUSER,
+            CloneFlags::NEWPID,
+            CloneFlags::NEWNET,
+            CloneFlags::NEWIPC,
+            CloneFlags::NEWUTS,
+            CloneFlags::NEWCGROUP,
+            CloneFlags::IO,
+            CloneFlags::SYSVSEM,
+        ] {
+            assert_eq!(
+                reserved & f.bits(),
+                0,
+                "user-relevant flag {:#x} overlaps RUNTIME_RESERVED",
+                f.bits()
+            );
+        }
+    }
+
+    #[test]
+    fn clone_flags_union_combines() {
+        let f = CloneFlags::VM | CloneFlags::SIGHAND;
+        assert_eq!(
+            f.bits(),
+            (libc::CLONE_VM as u64) | (libc::CLONE_SIGHAND as u64)
+        );
+    }
+
+    #[test]
+    fn clone_flags_contains_subset() {
+        let composite = CloneFlags::VM | CloneFlags::SIGHAND | CloneFlags::THREAD;
+        assert!(composite.contains(CloneFlags::VM));
+        assert!(composite.contains(CloneFlags::SIGHAND));
+        assert!(composite.contains(CloneFlags::THREAD));
+        // Set-theoretic identity (matches MpolFlags::contains
+        // convention): every set is a superset of NONE.
+        assert!(composite.contains(CloneFlags::NONE));
+        assert!(CloneFlags::NONE.contains(CloneFlags::NONE));
+        // Single flag is NOT a superset of the composite.
+        assert!(!CloneFlags::VM.contains(composite));
+    }
+
+    // -- validate_clone_flags rule-by-rule --
+    //
+    // Each kernel rejection rule from `copy_process` (kernel/fork.c)
+    // is exercised as a separate test so a regression names the
+    // offending rule.
+
+    #[test]
+    fn validate_clone_flags_thread_without_sighand_rejected() {
+        // Rule 1: CLONE_THREAD requires CLONE_SIGHAND.
+        // Use from_bits_for_test to express the invalid combination
+        // — the public consts make this hard to express via the
+        // bitor path because the user would normally pair them.
+        let f = CloneFlags::from_bits_for_test(libc::CLONE_THREAD as u64);
+        let err = validate_clone_flags(f).expect_err("THREAD without SIGHAND must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("CLONE_THREAD") && msg.contains("CLONE_SIGHAND"),
+            "error must name both flags: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_clone_flags_sighand_without_vm_rejected() {
+        // Rule 2: CLONE_SIGHAND requires CLONE_VM.
+        let f = CloneFlags::from_bits_for_test(libc::CLONE_SIGHAND as u64);
+        let err = validate_clone_flags(f).expect_err("SIGHAND without VM must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("CLONE_SIGHAND") && msg.contains("CLONE_VM"),
+            "error must name both flags: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_clone_flags_newns_with_fs_rejected() {
+        // Rule 3: NEWNS and FS are mutually exclusive.
+        let f = CloneFlags::NEWNS | CloneFlags::FS;
+        let err = validate_clone_flags(f).expect_err("NEWNS|FS must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("CLONE_NEWNS") && msg.contains("CLONE_FS"),
+            "error must name both flags: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_clone_flags_newuser_with_fs_rejected() {
+        // Rule 4: NEWUSER and FS are mutually exclusive.
+        let f = CloneFlags::NEWUSER | CloneFlags::FS;
+        let err = validate_clone_flags(f).expect_err("NEWUSER|FS must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("CLONE_NEWUSER") && msg.contains("CLONE_FS"),
+            "error must name both flags: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_clone_flags_thread_with_newuser_rejected() {
+        // Rule 5a: THREAD with NEWUSER is rejected.
+        let f =
+            CloneFlags::THREAD | CloneFlags::SIGHAND | CloneFlags::VM | CloneFlags::NEWUSER;
+        let err = validate_clone_flags(f).expect_err("THREAD|NEWUSER must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("CLONE_THREAD") && msg.contains("CLONE_NEWUSER"),
+            "error must name THREAD and NEWUSER: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_clone_flags_thread_with_newpid_rejected() {
+        // Rule 5b: THREAD with NEWPID is rejected.
+        let f =
+            CloneFlags::THREAD | CloneFlags::SIGHAND | CloneFlags::VM | CloneFlags::NEWPID;
+        let err = validate_clone_flags(f).expect_err("THREAD|NEWPID must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("CLONE_THREAD") && msg.contains("CLONE_NEWPID"),
+            "error must name THREAD and NEWPID: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_clone_flags_runtime_reserved_rejected() {
+        // Rule 6: caller cannot set runtime-managed bits.
+        let f = CloneFlags::from_bits_for_test(libc::CLONE_PIDFD as u64);
+        let err = validate_clone_flags(f).expect_err("CLONE_PIDFD from caller must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("runtime-reserved"),
+            "error must name the runtime-reserved category: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_clone_flags_thread_chain_accepted() {
+        // Sanity: the valid CLONE_THREAD chain
+        // (THREAD ⇒ SIGHAND ⇒ VM, no excluded namespaces) must
+        // pass. Without this the whole rule set could be silently
+        // over-rejecting.
+        let f = CloneFlags::THREAD | CloneFlags::SIGHAND | CloneFlags::VM;
+        validate_clone_flags(f).expect("valid THREAD-chain must be accepted");
+    }
+
+    #[test]
+    fn validate_clone_flags_empty_accepted() {
+        // The empty flag set is the fork-equivalent (no sharing
+        // beyond the fork defaults). Must validate cleanly.
+        validate_clone_flags(CloneFlags::NONE)
+            .expect("empty flag set must be accepted");
+    }
+
+    #[test]
+    fn validate_clone_flags_shared_vm_only_accepted() {
+        // SharedVm dispatch (#19c) will use CLONE_VM only — pin
+        // that this passes the validator now, before dispatch
+        // lands.
+        validate_clone_flags(CloneFlags::VM)
+            .expect("CLONE_VM alone must be accepted (SharedVm uses this)");
+    }
+
+    // -- spawn dispatch staging tests --
+    //
+    // Until #19b/#19c land, spawn() must reject Thread/SharedVm/Raw
+    // with an actionable diagnostic — silent fall-through to the
+    // fork path would silently mis-implement the user's intent.
+
+    #[test]
+    fn spawn_thread_clone_mode_bails() {
+        let config = WorkloadConfig {
+            num_workers: 1,
+            clone_mode: CloneMode::Thread,
+            ..Default::default()
+        };
+        // `expect_err` requires `T: Debug` on the Ok variant, but
+        // `WorkloadHandle` doesn't impl Debug (process resources
+        // are not safely Debug-able). Match the Result explicitly.
+        let result = WorkloadHandle::spawn(&config);
+        let err = match result {
+            Ok(_) => panic!("Thread mode must bail until #19b"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Thread") && msg.contains("#19b"),
+            "error must name Thread variant + #19b reference: {msg}"
+        );
+    }
+
+    #[test]
+    fn spawn_shared_vm_clone_mode_bails() {
+        let config = WorkloadConfig {
+            num_workers: 1,
+            clone_mode: CloneMode::SharedVm,
+            ..Default::default()
+        };
+        let result = WorkloadHandle::spawn(&config);
+        let err = match result {
+            Ok(_) => panic!("SharedVm mode must bail until #19c"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("SharedVm") && msg.contains("#19c"),
+            "error must name SharedVm variant + #19c reference: {msg}"
+        );
+    }
+
+    #[test]
+    fn spawn_raw_clone_mode_validates_then_bails() {
+        // Valid flags should validate then bail with the
+        // dispatch-staged message — proving the validator is
+        // wired but dispatch is intentionally absent.
+        let config = WorkloadConfig {
+            num_workers: 1,
+            clone_mode: CloneMode::Raw(CloneFlags::VM),
+            ..Default::default()
+        };
+        let result = WorkloadHandle::spawn(&config);
+        let err = match result {
+            Ok(_) => panic!("Raw must bail until #19c"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Raw") && msg.contains("#19c"),
+            "error must name Raw + #19c: {msg}"
+        );
+        assert!(
+            msg.contains("structurally valid"),
+            "valid flags must say flag set passed validation: {msg}"
+        );
+    }
+
+    #[test]
+    fn spawn_raw_clone_mode_invalid_flags_rejected_before_dispatch() {
+        // Invalid flags must hit the validator FIRST, before the
+        // dispatch-staged bail. The error must name the kernel
+        // rule, not the staging message.
+        let config = WorkloadConfig {
+            num_workers: 1,
+            clone_mode: CloneMode::Raw(CloneFlags::from_bits_for_test(
+                libc::CLONE_THREAD as u64,
+            )),
+            ..Default::default()
+        };
+        let result = WorkloadHandle::spawn(&config);
+        let err = match result {
+            Ok(_) => panic!("Raw with invalid flags must bail"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("CLONE_THREAD") && msg.contains("CLONE_SIGHAND"),
+            "error must surface the validator's rule, not the staging message: {msg}"
+        );
+        assert!(
+            !msg.contains("structurally valid"),
+            "validator failure must NOT mention staged dispatch: {msg}"
+        );
     }
 
     #[test]

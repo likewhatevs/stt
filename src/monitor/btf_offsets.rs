@@ -1260,6 +1260,461 @@ impl BpfProgOffsets {
     }
 }
 
+// ===========================================================================
+// Per-struct offset sub-groups
+//
+// Each group below resolves the field offsets for ONE kernel struct from
+// BTF. Higher-level offset structs (RunnableScanOffsets,
+// TaskEnrichmentOffsets, ScxWalkerOffsets) compose these groups so:
+//
+//   1. Each kernel field is resolved exactly once across the codebase
+//      (deduplicated source of truth — task #45).
+//   2. Higher-level structs that need only some groups can degrade
+//      gracefully: a missing `scx_sched_pnode` group blinds the global
+//      DSQ walk pass but leaves rq->scx + per-CPU local DSQ walks
+//      working (graceful degradation — task #43).
+//
+// Convention: each sub-group's `from_btf` is all-or-nothing for ITS
+// struct (one field missing -> `Err`). Composers store the result as
+// `Result<Sub, String>` (or `Option<Sub>`) so a per-struct failure
+// doesn't poison unrelated walks.
+// ===========================================================================
+
+/// Field offsets within `struct rq` (`kernel/sched/sched.h`).
+///
+/// Captures the two fields the host-side scx walker dereferences off a
+/// `struct rq` pointer: `scx` (the embedded `struct scx_rq`) and
+/// `curr` (the currently-running `struct task_struct *`).
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)] // wired via ScxWalkerOffsets; stays alive once the
+                    // freeze coordinator populates ScxWalkerCapture.
+pub struct RqStructOffsets {
+    /// Offset of `scx` (struct scx_rq) within `struct rq`.
+    /// Same value as [`KernelOffsets::rq_scx`]; resolved here so the
+    /// scx walker doesn't have to depend on `KernelOffsets`.
+    pub scx: usize,
+    /// Offset of `curr` (`struct task_struct *`) within `struct rq`.
+    pub curr: usize,
+}
+
+impl RqStructOffsets {
+    pub fn from_btf(btf: &Btf) -> Result<Self> {
+        let (rq, _) = find_struct(btf, "rq")?;
+        Ok(Self {
+            scx: member_byte_offset(btf, &rq, "scx")?,
+            curr: member_byte_offset(btf, &rq, "curr")?,
+        })
+    }
+}
+
+/// Field offsets within `struct scx_rq` (`kernel/sched/sched.h`).
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+pub struct ScxRqOffsets {
+    /// Offset of `local_dsq` (struct scx_dispatch_q).
+    pub local_dsq: usize,
+    /// Offset of `runnable_list` (struct list_head) — head of the
+    /// per-CPU runnable task list followed by the runnable_at scanner
+    /// and the rq->scx walker.
+    pub runnable_list: usize,
+    /// Offset of `nr_running` (u32).
+    pub nr_running: usize,
+    /// Offset of `flags` (u32).
+    pub flags: usize,
+    /// Offset of `cpu_released` (bool).
+    pub cpu_released: usize,
+    /// Offset of `ops_qseq` (unsigned long).
+    pub ops_qseq: usize,
+    /// Offset of `kick_sync` (unsigned long).
+    pub kick_sync: usize,
+    /// Offset of `nr_immed` (u32).
+    pub nr_immed: usize,
+    /// Offset of `clock` (u64).
+    pub clock: usize,
+}
+
+impl ScxRqOffsets {
+    pub fn from_btf(btf: &Btf) -> Result<Self> {
+        let (scx_rq, _) = find_struct(btf, "scx_rq")?;
+        Ok(Self {
+            local_dsq: member_byte_offset(btf, &scx_rq, "local_dsq")?,
+            runnable_list: member_byte_offset(btf, &scx_rq, "runnable_list")?,
+            nr_running: member_byte_offset(btf, &scx_rq, "nr_running")?,
+            flags: member_byte_offset(btf, &scx_rq, "flags")?,
+            cpu_released: member_byte_offset(btf, &scx_rq, "cpu_released")?,
+            ops_qseq: member_byte_offset(btf, &scx_rq, "ops_qseq")?,
+            kick_sync: member_byte_offset(btf, &scx_rq, "kick_sync")?,
+            nr_immed: member_byte_offset(btf, &scx_rq, "nr_immed")?,
+            clock: member_byte_offset(btf, &scx_rq, "clock")?,
+        })
+    }
+}
+
+/// Universal-subset field offsets within `struct task_struct`. The
+/// fields here are read by every walker that touches a task — the
+/// runnable scanner, the rq->scx walker, the DSQ walker, and the
+/// task_enrichment walker. Resolved once and shared so
+/// `task_struct.scx` etc. exist as a single source of truth (task #45).
+///
+/// Walkers that need additional task_struct fields (priority, signal,
+/// stack...) compose [`TaskStructEnrichmentOffsets`] alongside this.
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+pub struct TaskStructCoreOffsets {
+    /// Offset of `comm` (char[16]).
+    pub comm: usize,
+    /// Offset of `pid` (pid_t == int).
+    pub pid: usize,
+    /// Offset of `scx` (struct sched_ext_entity).
+    pub scx: usize,
+}
+
+impl TaskStructCoreOffsets {
+    pub fn from_btf(btf: &Btf) -> Result<Self> {
+        let (task_struct, _) = find_struct(btf, "task_struct")?;
+        Ok(Self {
+            comm: member_byte_offset(btf, &task_struct, "comm")?,
+            pid: member_byte_offset(btf, &task_struct, "pid")?,
+            scx: member_byte_offset(btf, &task_struct, "scx")?,
+        })
+    }
+}
+
+/// Extended `struct task_struct` field offsets used by the
+/// task_enrichment walker. Composed alongside [`TaskStructCoreOffsets`]
+/// in [`TaskEnrichmentOffsets`] — the universal three (`comm`, `pid`,
+/// `scx`) live in the core struct; everything below here is
+/// enrichment-specific.
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+pub struct TaskStructEnrichmentOffsets {
+    /// Offset of `tgid` (pid_t == int).
+    pub tgid: usize,
+    /// Offset of `prio` (int).
+    pub prio: usize,
+    /// Offset of `static_prio` (int).
+    pub static_prio: usize,
+    /// Offset of `normal_prio` (int).
+    pub normal_prio: usize,
+    /// Offset of `rt_priority` (unsigned int).
+    pub rt_priority: usize,
+    /// Offset of `sched_class` (`const struct sched_class *`).
+    pub sched_class: usize,
+    /// Offset of `core_cookie` (unsigned long). `None` when the kernel
+    /// was built without `CONFIG_SCHED_CORE` (BTF omits the field).
+    pub core_cookie: Option<usize>,
+    /// Offset of `real_parent` (`struct task_struct __rcu *`).
+    pub real_parent: usize,
+    /// Offset of `group_leader` (`struct task_struct *`).
+    pub group_leader: usize,
+    /// Offset of `signal` (`struct signal_struct *`).
+    pub signal: usize,
+    /// Offset of `stack` (`void *`).
+    pub stack: usize,
+    /// Offset of `nvcsw` (unsigned long).
+    pub nvcsw: usize,
+    /// Offset of `nivcsw` (unsigned long).
+    pub nivcsw: usize,
+}
+
+impl TaskStructEnrichmentOffsets {
+    pub fn from_btf(btf: &Btf) -> Result<Self> {
+        let (task_struct, _) = find_struct(btf, "task_struct")?;
+        Ok(Self {
+            tgid: member_byte_offset(btf, &task_struct, "tgid")?,
+            prio: member_byte_offset(btf, &task_struct, "prio")?,
+            static_prio: member_byte_offset(btf, &task_struct, "static_prio")?,
+            normal_prio: member_byte_offset(btf, &task_struct, "normal_prio")?,
+            rt_priority: member_byte_offset(btf, &task_struct, "rt_priority")?,
+            sched_class: member_byte_offset(btf, &task_struct, "sched_class")?,
+            core_cookie: member_byte_offset(btf, &task_struct, "core_cookie").ok(),
+            real_parent: member_byte_offset(btf, &task_struct, "real_parent")?,
+            group_leader: member_byte_offset(btf, &task_struct, "group_leader")?,
+            signal: member_byte_offset(btf, &task_struct, "signal")?,
+            stack: member_byte_offset(btf, &task_struct, "stack")?,
+            nvcsw: member_byte_offset(btf, &task_struct, "nvcsw")?,
+            nivcsw: member_byte_offset(btf, &task_struct, "nivcsw")?,
+        })
+    }
+}
+
+/// Field offsets within `struct sched_ext_entity` (`include/linux/sched/ext.h`).
+/// Offsets here are relative to the `sched_ext_entity` base; the full
+/// offset within `task_struct` is
+/// `TaskStructCoreOffsets::scx + <field>`.
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+pub struct SchedExtEntityOffsets {
+    pub runnable_node: usize,
+    pub runnable_at: usize,
+    pub weight: usize,
+    pub slice: usize,
+    pub dsq_vtime: usize,
+    pub dsq: usize,
+    pub dsq_list: usize,
+    pub flags: usize,
+    pub dsq_flags: usize,
+    pub sticky_cpu: usize,
+    pub holding_cpu: usize,
+}
+
+impl SchedExtEntityOffsets {
+    pub fn from_btf(btf: &Btf) -> Result<Self> {
+        let (see, _) = find_struct(btf, "sched_ext_entity")?;
+        Ok(Self {
+            runnable_node: member_byte_offset(btf, &see, "runnable_node")?,
+            runnable_at: member_byte_offset(btf, &see, "runnable_at")?,
+            weight: member_byte_offset(btf, &see, "weight")?,
+            slice: member_byte_offset(btf, &see, "slice")?,
+            dsq_vtime: member_byte_offset(btf, &see, "dsq_vtime")?,
+            dsq: member_byte_offset(btf, &see, "dsq")?,
+            dsq_list: member_byte_offset(btf, &see, "dsq_list")?,
+            flags: member_byte_offset(btf, &see, "flags")?,
+            dsq_flags: member_byte_offset(btf, &see, "dsq_flags")?,
+            sticky_cpu: member_byte_offset(btf, &see, "sticky_cpu")?,
+            holding_cpu: member_byte_offset(btf, &see, "holding_cpu")?,
+        })
+    }
+}
+
+/// Field offsets within `struct scx_dsq_list_node`.
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+pub struct ScxDsqListNodeOffsets {
+    /// Offset of `node` (struct list_head). Fixed at 0 in current
+    /// kernels; resolved via BTF for forward compat.
+    pub node: usize,
+    /// Offset of `flags` (u32). Tested against
+    /// `SCX_DSQ_LNODE_ITER_CURSOR` to skip cursor entries.
+    pub flags: usize,
+}
+
+impl ScxDsqListNodeOffsets {
+    pub fn from_btf(btf: &Btf) -> Result<Self> {
+        let (lnode, _) = find_struct(btf, "scx_dsq_list_node")?;
+        Ok(Self {
+            node: member_byte_offset(btf, &lnode, "node")?,
+            flags: member_byte_offset(btf, &lnode, "flags")?,
+        })
+    }
+}
+
+/// Field offsets within `struct scx_dispatch_q`.
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+pub struct ScxDispatchQOffsets {
+    /// Offset of `list` (struct list_head). Head of the FIFO task list.
+    pub list: usize,
+    /// Offset of `nr` (u32). Number of tasks queued.
+    pub nr: usize,
+    /// Offset of `seq` (u32). BPF-iter sequence counter.
+    pub seq: usize,
+    /// Offset of `id` (u64). Synthetic for built-in DSQs;
+    /// BPF-allocated for user DSQs.
+    pub id: usize,
+    /// Offset of `hash_node` (struct rhash_head) — used by the user
+    /// DSQ rhashtable walker for container_of.
+    pub hash_node: usize,
+}
+
+impl ScxDispatchQOffsets {
+    pub fn from_btf(btf: &Btf) -> Result<Self> {
+        let (dsq, _) = find_struct(btf, "scx_dispatch_q")?;
+        Ok(Self {
+            list: member_byte_offset(btf, &dsq, "list")?,
+            nr: member_byte_offset(btf, &dsq, "nr")?,
+            seq: member_byte_offset(btf, &dsq, "seq")?,
+            id: member_byte_offset(btf, &dsq, "id")?,
+            hash_node: member_byte_offset(btf, &dsq, "hash_node")?,
+        })
+    }
+}
+
+/// Field offsets within `struct scx_sched`. Walker reaches a
+/// `scx_sched` KVA by dereferencing `*scx_root`.
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+pub struct ScxSchedOffsets {
+    /// Offset of `dsq_hash` (struct rhashtable). User-allocated DSQs.
+    pub dsq_hash: usize,
+    /// Offset of `pnode` (`struct scx_sched_pnode **`). Per-NUMA-node.
+    pub pnode: usize,
+    /// Offset of `pcpu` (`struct scx_sched_pcpu __percpu *`). Per-CPU.
+    pub pcpu: usize,
+    /// Offset of `aborting` (bool).
+    pub aborting: usize,
+    /// Offset of `bypass_depth` (s32).
+    pub bypass_depth: usize,
+    /// Offset of `exit_kind` (atomic_t). Read raw; the SCX_EXIT_*
+    /// value lives in the atomic's `counter` field.
+    pub exit_kind: usize,
+}
+
+impl ScxSchedOffsets {
+    pub fn from_btf(btf: &Btf) -> Result<Self> {
+        let (sched, _) = find_struct(btf, "scx_sched")?;
+        Ok(Self {
+            dsq_hash: member_byte_offset(btf, &sched, "dsq_hash")?,
+            pnode: member_byte_offset(btf, &sched, "pnode")?,
+            pcpu: member_byte_offset(btf, &sched, "pcpu")?,
+            aborting: member_byte_offset(btf, &sched, "aborting")?,
+            bypass_depth: member_byte_offset(btf, &sched, "bypass_depth")?,
+            exit_kind: member_byte_offset(btf, &sched, "exit_kind")?,
+        })
+    }
+}
+
+/// Field offsets within `struct scx_sched_pnode`.
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+pub struct ScxSchedPnodeOffsets {
+    /// Offset of `global_dsq` (struct scx_dispatch_q). Per-NUMA-node
+    /// global DSQ.
+    pub global_dsq: usize,
+}
+
+impl ScxSchedPnodeOffsets {
+    pub fn from_btf(btf: &Btf) -> Result<Self> {
+        let (pnode, _) = find_struct(btf, "scx_sched_pnode")?;
+        Ok(Self {
+            global_dsq: member_byte_offset(btf, &pnode, "global_dsq")?,
+        })
+    }
+}
+
+/// Field offsets within `struct scx_sched_pcpu`.
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+pub struct ScxSchedPcpuOffsets {
+    /// Offset of `bypass_dsq` (struct scx_dispatch_q). Per-CPU bypass DSQ.
+    pub bypass_dsq: usize,
+}
+
+impl ScxSchedPcpuOffsets {
+    pub fn from_btf(btf: &Btf) -> Result<Self> {
+        let (pcpu, _) = find_struct(btf, "scx_sched_pcpu")?;
+        Ok(Self {
+            bypass_dsq: member_byte_offset(btf, &pcpu, "bypass_dsq")?,
+        })
+    }
+}
+
+/// Field offsets within `struct rhashtable`, `struct bucket_table`,
+/// and `struct rhash_head`. Bundled together since the user DSQ walk
+/// needs all three to traverse a single rhashtable.
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+pub struct RhashtableOffsets {
+    /// `rhashtable.tbl` — `struct bucket_table __rcu *`.
+    pub tbl: usize,
+    /// `rhashtable.nelems` — `atomic_t`.
+    pub nelems: usize,
+    /// `bucket_table.size` — `unsigned int`.
+    pub bucket_table_size: usize,
+    /// `bucket_table.buckets` — flex array of
+    /// `struct rhash_lock_head __rcu *`. After the bit-flag mask
+    /// (RHT_PTR_LOCK_BIT) the entry points at the first chained
+    /// `rhash_head`.
+    pub bucket_table_buckets: usize,
+    /// `rhash_head.next` — always 0 in current kernels but resolved
+    /// via BTF.
+    pub rhash_head_next: usize,
+}
+
+impl RhashtableOffsets {
+    pub fn from_btf(btf: &Btf) -> Result<Self> {
+        let (rht, _) = find_struct(btf, "rhashtable")?;
+        let tbl = member_byte_offset(btf, &rht, "tbl")?;
+        let nelems = member_byte_offset(btf, &rht, "nelems")?;
+
+        let (btab, _) = find_struct(btf, "bucket_table")?;
+        let bucket_table_size = member_byte_offset(btf, &btab, "size")?;
+        let bucket_table_buckets = member_byte_offset(btf, &btab, "buckets")?;
+
+        let (rhead, _) = find_struct(btf, "rhash_head")?;
+        let rhash_head_next = member_byte_offset(btf, &rhead, "next")?;
+
+        Ok(Self {
+            tbl,
+            nelems,
+            bucket_table_size,
+            bucket_table_buckets,
+            rhash_head_next,
+        })
+    }
+}
+
+/// Field offsets within `struct signal_struct`.
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+pub struct SignalStructOffsets {
+    pub nr_threads: usize,
+    pub pids: usize,
+    pub nvcsw: usize,
+    pub nivcsw: usize,
+}
+
+impl SignalStructOffsets {
+    pub fn from_btf(btf: &Btf) -> Result<Self> {
+        let (signal, _) = find_struct(btf, "signal_struct")?;
+        Ok(Self {
+            nr_threads: member_byte_offset(btf, &signal, "nr_threads")?,
+            pids: member_byte_offset(btf, &signal, "pids")?,
+            nvcsw: member_byte_offset(btf, &signal, "nvcsw")?,
+            nivcsw: member_byte_offset(btf, &signal, "nivcsw")?,
+        })
+    }
+}
+
+/// Field offsets within `struct pid` (and the size of the fixed
+/// prefix before the `numbers[]` flex array).
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+pub struct PidStructOffsets {
+    /// Offset of `numbers` (flex array of `struct upid`).
+    pub numbers: usize,
+    /// Size of the fixed prefix; equal to `numbers` (the flex array
+    /// starts where the prefix ends). Tracked separately for
+    /// self-documentation against future BTF-format changes that
+    /// decouple the two.
+    pub size: usize,
+}
+
+impl PidStructOffsets {
+    pub fn from_btf(btf: &Btf) -> Result<Self> {
+        let (pid, _) = find_struct(btf, "pid")?;
+        let numbers = member_byte_offset(btf, &pid, "numbers")?;
+        Ok(Self {
+            numbers,
+            size: numbers,
+        })
+    }
+}
+
+/// Field offsets within `struct upid` plus the struct's full size.
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+pub struct UpidStructOffsets {
+    /// Offset of `nr` (int).
+    pub nr: usize,
+    /// Total size of `struct upid` — 16 bytes on x86_64 / aarch64
+    /// (the only architectures ktstr currently supports). Hardcoded
+    /// because btf-rs doesn't expose `Btf::resolve_type_by_id` for
+    /// raw struct sizes; cited to `include/linux/pid.h::struct upid`
+    /// which has been unchanged since 2.6.x.
+    pub size: usize,
+}
+
+impl UpidStructOffsets {
+    pub fn from_btf(btf: &Btf) -> Result<Self> {
+        let (upid, _) = find_struct(btf, "upid")?;
+        Ok(Self {
+            nr: member_byte_offset(btf, &upid, "nr")?,
+            size: 16,
+        })
+    }
+}
+
 /// Byte offsets needed by the dual-snapshot freeze coordinator's
 /// per-CPU `runnable_at` scanner.
 ///
@@ -1316,25 +1771,529 @@ impl RunnableScanOffsets {
     /// object. Returns Err on a kernel without sched_ext (the
     /// `sched_ext_entity` struct is missing) or one whose layout has
     /// dropped any of the four fields.
+    ///
+    /// Composed from [`ScxRqOffsets`], [`TaskStructCoreOffsets`], and
+    /// [`SchedExtEntityOffsets`] so `task_struct.scx` and the scx_rq /
+    /// sched_ext_entity field offsets resolve from a single source of
+    /// truth shared with [`ScxWalkerOffsets`] and
+    /// [`TaskEnrichmentOffsets`] (task #45).
     pub fn from_btf(btf: &Btf) -> Result<Self> {
-        let (scx_rq, _) = find_struct(btf, "scx_rq")?;
-        let scx_rq_runnable_list = member_byte_offset(btf, &scx_rq, "runnable_list")?;
-
-        let (task_struct, _) = find_struct(btf, "task_struct")?;
-        let task_struct_scx = member_byte_offset(btf, &task_struct, "scx")?;
-
-        let (see, _) = find_struct(btf, "sched_ext_entity")?;
-        let sched_ext_entity_runnable_node = member_byte_offset(btf, &see, "runnable_node")?;
-        let sched_ext_entity_runnable_at = member_byte_offset(btf, &see, "runnable_at")?;
+        let scx_rq = ScxRqOffsets::from_btf(btf)?;
+        let task_core = TaskStructCoreOffsets::from_btf(btf)?;
+        let see = SchedExtEntityOffsets::from_btf(btf)?;
 
         Ok(Self {
-            scx_rq_runnable_list,
-            task_struct_scx,
-            sched_ext_entity_runnable_node,
-            sched_ext_entity_runnable_at,
+            scx_rq_runnable_list: scx_rq.runnable_list,
+            task_struct_scx: task_core.scx,
+            sched_ext_entity_runnable_node: see.runnable_node,
+            sched_ext_entity_runnable_at: see.runnable_at,
         })
     }
 }
+
+/// Stable indices of `kernel_cpustat::cpustat[NR_STATS]` from
+/// `enum cpu_usage_stat` (`include/linux/kernel_stat.h`). The kernel
+/// pins the order so external readers — `/proc/stat` formatting,
+/// `account_user_time` / `account_system_index_time` accumulation,
+/// every userspace tool that reads `kernel_cpustat` — depend on it.
+/// Hard-code the indices the failure dump captures instead of
+/// resolving them via BTF: BTF only encodes the array length, not the
+/// enum-to-position mapping, so a BTF-driven read would have to
+/// resolve the enum separately. The cited header values are the
+/// authoritative source; mismatching kernels would be a UAPI break,
+/// not a layout drift this code can adapt to.
+pub const CPUTIME_USER: usize = 0;
+/// Index of `cpustat[CPUTIME_NICE]` (CPU time spent on nice'd user
+/// processes). See [`CPUTIME_USER`].
+pub const CPUTIME_NICE: usize = 1;
+/// Index of `cpustat[CPUTIME_SYSTEM]` (CPU time spent in kernel).
+/// See [`CPUTIME_USER`].
+pub const CPUTIME_SYSTEM: usize = 2;
+/// Index of `cpustat[CPUTIME_SOFTIRQ]` (CPU time servicing softirqs).
+/// See [`CPUTIME_USER`].
+pub const CPUTIME_SOFTIRQ: usize = 3;
+/// Index of `cpustat[CPUTIME_IRQ]` (CPU time servicing hardirqs).
+/// See [`CPUTIME_USER`].
+pub const CPUTIME_IRQ: usize = 4;
+/// Index of `cpustat[CPUTIME_IDLE]` (CPU time spent idle).
+/// See [`CPUTIME_USER`].
+pub const CPUTIME_IDLE: usize = 5;
+/// Index of `cpustat[CPUTIME_IOWAIT]` (CPU time waiting on
+/// outstanding block IO). See [`CPUTIME_USER`].
+pub const CPUTIME_IOWAIT: usize = 6;
+/// Index of `cpustat[CPUTIME_STEAL]` (CPU time stolen by the
+/// hypervisor — virt only). See [`CPUTIME_USER`].
+pub const CPUTIME_STEAL: usize = 7;
+
+/// Number of softirq vectors per `enum` in `include/linux/interrupt.h`
+/// (HI/TIMER/NET_TX/NET_RX/BLOCK/IRQ_POLL/TASKLET/SCHED/HRTIMER/RCU,
+/// in that order). The order is enum-stable, mirroring
+/// [`CPUTIME_USER`]'s rationale: external consumers (`/proc/softirqs`
+/// formatting, `softirq_to_name[]`) depend on the layout, so a
+/// reordering would be a UAPI break and resolving each name via BTF
+/// would buy nothing.
+pub const NR_SOFTIRQS: usize = 10;
+
+/// Names of every softirq vector, indexed by the enum order shared
+/// with the kernel's `softirq_to_name[]` (kernel/softirq.c). Surfaced
+/// in failure-dump JSON so a downstream consumer reading
+/// `softirqs[i]` knows which vector each slot represents without
+/// chasing the kernel header.
+pub const SOFTIRQ_NAMES: [&str; NR_SOFTIRQS] = [
+    "HI", "TIMER", "NET_TX", "NET_RX", "BLOCK", "IRQ_POLL", "TASKLET", "SCHED", "HRTIMER", "RCU",
+];
+
+/// Byte offsets used to read per-CPU CPU-time and softirq/IRQ
+/// counters from guest memory.
+///
+/// Three structs participate:
+///   - `struct kernel_cpustat` (`include/linux/kernel_stat.h`):
+///     a per-CPU `u64 cpustat[NR_STATS]` table indexed by
+///     `enum cpu_usage_stat`. Hand-rolled accumulators in the
+///     kernel's CPU-time accounting (`account_idle_time`,
+///     `account_user_time`, etc.) bump these in nanoseconds (or
+///     jiffies pre-NO_HZ_FULL — the field is `u64 nsecs` regardless;
+///     `cputime64_to_clock_t` does the conversion at `/proc/stat`
+///     read).
+///   - `struct kernel_stat` (`include/linux/kernel_stat.h`): a
+///     per-CPU `unsigned long irqs_sum` plus
+///     `unsigned int softirqs[NR_SOFTIRQS]` table (10 counters in
+///     2026-04-30 mainline). `kstat_incr_softirqs_this_cpu` and
+///     `kstat_incr_irq_this_cpu` are the producers.
+///   - `struct tick_sched` (`kernel/time/tick-sched.h`): per-CPU
+///     `iowait_sleeptime` (`ktime_t` aka `s64` ns) accumulated only
+///     under NO_HZ when the CPU enters idle with `nr_iowait > 0`.
+///
+/// All three structs sit in `.data..percpu` symbols
+/// (`kernel_cpustat`, `kstat`, `tick_cpu_sched`). Per-CPU symbols
+/// carry section-relative offsets in vmlinux's symtab; the per-CPU
+/// KVA for CPU `n` is `<symbol> + __per_cpu_offset[n]` —
+/// [`super::symbols::KernelSymbols::cpu_time_symbols`] resolves the
+/// symbols and the dump path adds `__per_cpu_offset[cpu]` per CPU.
+///
+/// Field-presence semantics: a kernel without sched_ext omits no
+/// field captured here, but a kernel built without
+/// `CONFIG_NO_HZ_COMMON` drops `tick_sched`. The offset resolver
+/// reports `tick_sched_iowait_sleeptime` as `Some` only when the
+/// type is present. Callers that observe `None` skip the
+/// `iowait_sleeptime` capture and surface `nr_iowait` (an atomic
+/// counter on `struct rq` that the existing scx walker already
+/// reads) instead.
+#[derive(Debug, Clone, Copy)]
+pub struct CpuTimeOffsets {
+    /// Offset of `cpustat[]` (the `u64[NR_STATS]` array) within
+    /// `struct kernel_cpustat`. Always zero on every kernel since
+    /// the introduction of the struct, but resolved via BTF rather
+    /// than hard-coded so a future addition of a leading field
+    /// surfaces here without silent miscalculation.
+    pub kernel_cpustat_cpustat: usize,
+    /// Offset of `irqs_sum` (`unsigned long`) within `struct kernel_stat`.
+    pub kstat_irqs_sum: usize,
+    /// Offset of `softirqs[]` (the `unsigned int[NR_SOFTIRQS]`
+    /// array) within `struct kernel_stat`.
+    pub kstat_softirqs: usize,
+    /// Offset of `iowait_sleeptime` (`ktime_t` / `s64` ns) within
+    /// `struct tick_sched`. `None` when the kernel was built
+    /// without `CONFIG_NO_HZ_COMMON` (the type is absent from BTF).
+    pub tick_sched_iowait_sleeptime: Option<usize>,
+}
+
+impl CpuTimeOffsets {
+    /// Resolve CPU-time / softirq / IRQ offsets from a pre-loaded BTF
+    /// object. Returns Err when `kernel_cpustat` or `kernel_stat` are
+    /// missing — these are universal, so their absence indicates a
+    /// stripped vmlinux. `tick_sched` is best-effort: a kernel
+    /// without `CONFIG_NO_HZ_COMMON` has no such type, and the
+    /// resolver returns `Ok` with `tick_sched_iowait_sleeptime: None`.
+    pub fn from_btf(btf: &Btf) -> Result<Self> {
+        let (kernel_cpustat, _) = find_struct(btf, "kernel_cpustat")?;
+        let kernel_cpustat_cpustat = member_byte_offset(btf, &kernel_cpustat, "cpustat")?;
+
+        let (kernel_stat, _) = find_struct(btf, "kernel_stat")?;
+        let kstat_irqs_sum = member_byte_offset(btf, &kernel_stat, "irqs_sum")?;
+        let kstat_softirqs = member_byte_offset(btf, &kernel_stat, "softirqs")?;
+
+        // tick_sched is CONFIG_NO_HZ_COMMON-gated; report None
+        // rather than Err so the caller can capture the rest of the
+        // struct's fields without forcing every kernel to enable
+        // dynticks for failure-dump support.
+        let tick_sched_iowait_sleeptime = match find_struct(btf, "tick_sched") {
+            Ok((tick_sched, _)) => member_byte_offset(btf, &tick_sched, "iowait_sleeptime").ok(),
+            Err(_) => None,
+        };
+
+        Ok(Self {
+            kernel_cpustat_cpustat,
+            kstat_irqs_sum,
+            kstat_softirqs,
+            tick_sched_iowait_sleeptime,
+        })
+    }
+}
+
+/// Byte offsets for the per-task enrichment walker (`task_enrichment`
+/// module). Resolved from BTF once at coordinator start; reused for
+/// every task the dump path reaches.
+///
+/// Captures every field path the failure-dump enrichment surfaces:
+/// task_struct's directly-accessed fields, plus the chained
+/// signal_struct / pid / upid struct offsets needed to recover
+/// pgid/sid via the kernel's standard
+/// `signal->pids[PIDTYPE_*]->numbers[0].nr` traversal (see
+/// `kernel/pid.c::pid_nr` for the canonical traversal pattern).
+///
+/// `TASK_COMM_LEN` is fixed at 16 by the kernel uapi
+/// (`include/linux/sched.h::TASK_COMM_LEN`); the walker reads a
+/// fixed-size 16-byte buffer at `task_struct_comm`.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct TaskEnrichmentOffsets {
+    // -- struct task_struct fields --
+    /// Offset of `comm` (char[TASK_COMM_LEN=16]).
+    pub task_struct_comm: usize,
+    /// Offset of `pid` (pid_t == int).
+    pub task_struct_pid: usize,
+    /// Offset of `tgid` (pid_t == int).
+    pub task_struct_tgid: usize,
+    /// Offset of `prio` (int). Effective scheduling priority,
+    /// adjusted for PI boost.
+    pub task_struct_prio: usize,
+    /// Offset of `static_prio` (int). User-set priority before
+    /// PI boost.
+    pub task_struct_static_prio: usize,
+    /// Offset of `normal_prio` (int). Normal priority for the
+    /// task's scheduling class.
+    pub task_struct_normal_prio: usize,
+    /// Offset of `rt_priority` (unsigned int). Real-time priority
+    /// (1-99) for SCHED_FIFO/RR; 0 for non-RT tasks.
+    pub task_struct_rt_priority: usize,
+    /// Offset of `sched_class` (`const struct sched_class *`).
+    /// Compared against the cached sched_class symbol KVAs to
+    /// decode to a name (CFS / RT / DL / IDLE / STOP / EXT) and
+    /// to flag PI-boost-out-of-SCX.
+    pub task_struct_sched_class: usize,
+    /// Offset of `scx` (struct sched_ext_entity).
+    pub task_struct_scx: usize,
+    /// Offset of `core_cookie` (unsigned long). Core scheduling
+    /// cookie (`CONFIG_SCHED_CORE`-gated; field is conditional).
+    /// `None` when the kernel was built without core scheduling
+    /// — the walker skips the read and surfaces `core_cookie` as
+    /// `None` in the enrichment.
+    pub task_struct_core_cookie: Option<usize>,
+    /// Offset of `real_parent` (`struct task_struct __rcu *`).
+    /// RCU-protected pointer to the real parent (process that
+    /// fork()ed this one); the walker does a single deref to
+    /// read the parent's pid + comm.
+    pub task_struct_real_parent: usize,
+    /// Offset of `group_leader` (`struct task_struct *`).
+    /// Pointer to the thread group leader.
+    pub task_struct_group_leader: usize,
+    /// Offset of `signal` (`struct signal_struct *`). Shared
+    /// signal_struct gives access to nr_threads + pgid/sid via
+    /// the pids[] array.
+    pub task_struct_signal: usize,
+    /// Offset of `stack` (`void *`). Kernel stack base for the
+    /// stack-trace lock-detection walker. Tasks share a kernel
+    /// stack of `THREAD_SIZE`; a successful translate of `stack`
+    /// + walking up `THREAD_SIZE` covers the active stack frames.
+    pub task_struct_stack: usize,
+
+    // -- struct sched_ext_entity fields (relative to scx base; the
+    //    full offset inside task_struct is `task_struct_scx + ...`) --
+    /// Offset of `weight` (u32) within `struct sched_ext_entity`.
+    /// scx-domain CFS-equivalent weight; 100 default, scaled by
+    /// scx_group_set_weight on cgroup writes.
+    pub see_weight: usize,
+
+    // -- struct signal_struct fields --
+    /// Offset of `nr_threads` (int). Live thread count for the
+    /// thread group.
+    pub signal_struct_nr_threads: usize,
+    /// Offset of `pids` (`struct pid *pids[PIDTYPE_MAX]`). The
+    /// walker indexes this array by `PIDTYPE_*` constants
+    /// (PID=0, TGID=1, PGID=2, SID=3) per
+    /// `include/linux/pid_types.h::enum pid_type` to reach
+    /// per-type pid pointers.
+    pub signal_struct_pids: usize,
+    /// Offset of `nvcsw` (unsigned long). Voluntary context
+    /// switches accumulated for the thread group's dead threads;
+    /// per-thread `task_struct_nvcsw` accumulates the live count.
+    pub signal_struct_nvcsw: usize,
+    /// Offset of `nivcsw` (unsigned long). Involuntary context
+    /// switches; mirror of `nvcsw`.
+    pub signal_struct_nivcsw: usize,
+
+    // -- per-task voluntary/involuntary context-switch counters
+    //    on task_struct itself (live thread count). The dump
+    //    surfaces these directly from each task; the
+    //    signal_struct totals are surfaced separately. --
+    /// Offset of `nvcsw` (unsigned long) within `struct task_struct`.
+    pub task_struct_nvcsw: usize,
+    /// Offset of `nivcsw` (unsigned long) within `struct task_struct`.
+    pub task_struct_nivcsw: usize,
+
+    // -- struct pid fields --
+    /// Offset of `numbers` (struct upid[]) flex array within
+    /// `struct pid`. Index 0 is the global pid namespace's upid
+    /// (the canonical, root-ns pid number).
+    pub pid_numbers: usize,
+    /// Total size of `struct pid`'s fixed prefix before the
+    /// `numbers[]` flex array. Equal to `pid_numbers` — kept as
+    /// a separate field for self-documentation against future
+    /// kernel additions that move the flex array.
+    pub pid_size: usize,
+
+    // -- struct upid fields --
+    /// Offset of `nr` (int) within `struct upid`. The canonical
+    /// pid number for the namespace.
+    pub upid_nr: usize,
+    /// Total size of `struct upid` (8 + 8 = 16 bytes on x86_64
+    /// per `include/linux/pid.h::struct upid`). The walker
+    /// computes `pid_numbers + level * upid_size` to index the
+    /// flex array; we always use level 0 (root ns) but capture
+    /// the stride so future per-ns walking is straightforward.
+    pub upid_size: usize,
+}
+
+#[allow(dead_code)] // wired into DumpContext + walk_task_enrichment;
+                    // freeze coordinator passes None until #50 (rq->scx
+                    // walker) lands a producer that builds
+                    // TaskEnrichmentCapture.
+impl TaskEnrichmentOffsets {
+    /// Resolve all per-task / signal_struct / pid / upid offsets
+    /// from a pre-loaded BTF object. Returns Err on a stripped
+    /// vmlinux missing any required field. `core_cookie` is the
+    /// only optional field — kernels built without
+    /// CONFIG_SCHED_CORE drop it from `task_struct` BTF and the
+    /// walker correspondingly skips that capture.
+    ///
+    /// Composed from per-struct sub-groups
+    /// ([`TaskStructCoreOffsets`], [`TaskStructEnrichmentOffsets`],
+    /// [`SchedExtEntityOffsets`], [`SignalStructOffsets`],
+    /// [`PidStructOffsets`], [`UpidStructOffsets`]) so each kernel
+    /// field is resolved exactly once across the codebase
+    /// (deduplicated source of truth — task #45).
+    pub fn from_btf(btf: &Btf) -> Result<Self> {
+        let task_core = TaskStructCoreOffsets::from_btf(btf)?;
+        let task_ext = TaskStructEnrichmentOffsets::from_btf(btf)?;
+        let see = SchedExtEntityOffsets::from_btf(btf)?;
+        let signal = SignalStructOffsets::from_btf(btf)?;
+        let pid_offs = PidStructOffsets::from_btf(btf)?;
+        let upid = UpidStructOffsets::from_btf(btf)?;
+
+        Ok(Self {
+            task_struct_comm: task_core.comm,
+            task_struct_pid: task_core.pid,
+            task_struct_tgid: task_ext.tgid,
+            task_struct_prio: task_ext.prio,
+            task_struct_static_prio: task_ext.static_prio,
+            task_struct_normal_prio: task_ext.normal_prio,
+            task_struct_rt_priority: task_ext.rt_priority,
+            task_struct_sched_class: task_ext.sched_class,
+            task_struct_scx: task_core.scx,
+            task_struct_core_cookie: task_ext.core_cookie,
+            task_struct_real_parent: task_ext.real_parent,
+            task_struct_group_leader: task_ext.group_leader,
+            task_struct_signal: task_ext.signal,
+            task_struct_stack: task_ext.stack,
+            see_weight: see.weight,
+            signal_struct_nr_threads: signal.nr_threads,
+            signal_struct_pids: signal.pids,
+            signal_struct_nvcsw: signal.nvcsw,
+            signal_struct_nivcsw: signal.nivcsw,
+            task_struct_nvcsw: task_ext.nvcsw,
+            task_struct_nivcsw: task_ext.nivcsw,
+            pid_numbers: pid_offs.numbers,
+            pid_size: pid_offs.size,
+            upid_nr: upid.nr,
+            upid_size: upid.size,
+        })
+    }
+}
+
+/// Stable indices into `signal_struct.pids[PIDTYPE_MAX]` for the four
+/// pid types ktstr reads (per `include/linux/pid_types.h::enum pid_type`).
+/// Re-exported here so the task_enrichment walker doesn't have to
+/// duplicate the enum values inline.
+#[allow(dead_code)]
+pub mod pid_type {
+    /// `PIDTYPE_PID` — the task's own pid number.
+    pub const PID: usize = 0;
+    /// `PIDTYPE_TGID` — thread-group leader pid.
+    pub const TGID: usize = 1;
+    /// `PIDTYPE_PGID` — process group id.
+    pub const PGID: usize = 2;
+    /// `PIDTYPE_SID` — session id.
+    pub const SID: usize = 3;
+}
+
+/// Composite of per-struct offset sub-groups used by the host-side
+/// scx walker (`scx_walker.rs`) to enumerate per-CPU `rq->scx` state
+/// and per-DSQ depth/queue state.
+///
+/// Each kernel struct is resolved as an `Option<SubGroup>`: a
+/// stripped vmlinux that drops one struct (e.g. a kernel built without
+/// `CONFIG_NUMA` lacking `scx_sched_pnode`) doesn't blind the whole
+/// walker — the walker's per-pass code (per-CPU local DSQ, per-CPU
+/// bypass DSQ, per-node global DSQ, user dsq_hash, per-CPU
+/// runnable_list) checks the relevant sub-group(s) and skips its pass
+/// when missing. The `missing_groups()` helper surfaces the list of
+/// absent sub-groups for the `scx_walker_unavailable` reason in the
+/// failure dump.
+///
+/// Composes the per-struct sub-groups defined above:
+/// [`RqStructOffsets`], [`ScxRqOffsets`], [`TaskStructCoreOffsets`],
+/// [`SchedExtEntityOffsets`], [`ScxDsqListNodeOffsets`],
+/// [`ScxDispatchQOffsets`], [`ScxSchedOffsets`],
+/// [`ScxSchedPnodeOffsets`], [`ScxSchedPcpuOffsets`],
+/// [`RhashtableOffsets`].
+///
+/// Kernel sources verified:
+/// - `struct scx_rq`: kernel/sched/sched.h
+/// - `struct scx_sched` / `struct scx_sched_pnode` /
+///   `struct scx_sched_pcpu`: kernel/sched/ext_internal.h
+/// - `struct scx_dispatch_q`: include/linux/sched/ext.h
+/// - `struct scx_dsq_list_node`: include/linux/sched/ext.h
+/// - `struct sched_ext_entity`: include/linux/sched/ext.h
+/// - `struct rhashtable` / `struct bucket_table`: include/linux/rhashtable.h
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // wired into ScxWalkerCapture; freeze coordinator
+                    // populates the capture once the producer-side
+                    // wiring lands.
+pub struct ScxWalkerOffsets {
+    /// `struct rq` field offsets (`scx`, `curr`). Required for every
+    /// per-CPU read; `None` blinds the walker entirely.
+    pub rq: Option<RqStructOffsets>,
+    /// `struct scx_rq` field offsets. Required by the rq->scx walker
+    /// (per-CPU runnable_list head, scalar state) and the per-CPU
+    /// local DSQ walk (`scx_rq.local_dsq`).
+    pub scx_rq: Option<ScxRqOffsets>,
+    /// `struct task_struct` core offsets — `comm`, `pid`, `scx`.
+    /// Required for both the runnable_list container_of walk and the
+    /// DSQ list_head container_of walk. Shared single-source-of-truth
+    /// with [`RunnableScanOffsets`] and [`TaskEnrichmentOffsets`]
+    /// (task #45).
+    pub task: Option<TaskStructCoreOffsets>,
+    /// `struct sched_ext_entity` field offsets. Required for
+    /// container_of math (`runnable_node`, `dsq_list`) and for
+    /// scx-domain task fields (`weight`, `slice`, `dsq_vtime`,
+    /// `flags`, etc.).
+    pub see: Option<SchedExtEntityOffsets>,
+    /// `struct scx_dsq_list_node` offsets. Required to detect and
+    /// skip iterator cursor entries during DSQ walks.
+    pub dsq_lnode: Option<ScxDsqListNodeOffsets>,
+    /// `struct scx_dispatch_q` offsets. Required for every DSQ scalar
+    /// read and the user-DSQ rhashtable container_of step.
+    pub dsq: Option<ScxDispatchQOffsets>,
+    /// `struct scx_sched` offsets. Required to read top-level
+    /// scheduler scalar state (`aborting`, `bypass_depth`,
+    /// `exit_kind`) and to reach `dsq_hash` / `pnode` / `pcpu`.
+    pub sched: Option<ScxSchedOffsets>,
+    /// `struct scx_sched_pnode` offsets. Required for the per-NUMA-
+    /// node global DSQ pass; `None` blinds only that pass (kernels
+    /// built without `CONFIG_NUMA` may lack the type).
+    pub sched_pnode: Option<ScxSchedPnodeOffsets>,
+    /// `struct scx_sched_pcpu` offsets. Required for the per-CPU
+    /// bypass DSQ pass; `None` blinds only that pass.
+    pub sched_pcpu: Option<ScxSchedPcpuOffsets>,
+    /// `struct rhashtable` / `struct bucket_table` / `struct rhash_head`
+    /// offsets. Required for the user DSQ hash walk; `None` blinds
+    /// only that pass.
+    pub rht: Option<RhashtableOffsets>,
+}
+
+#[allow(dead_code)] // wired into DumpContext::ScxWalkerCapture; the
+                    // freeze coordinator passes None until the
+                    // producer-side wiring (resolve offsets +
+                    // build rq arrays) lands.
+impl ScxWalkerOffsets {
+    /// Resolve every scx walker sub-group from a pre-loaded BTF
+    /// object. Each sub-group resolves independently — a missing
+    /// kernel struct surfaces as the corresponding `Option` being
+    /// `None`, NOT as an `Err`. Callers (the walker) check each
+    /// sub-group before dereferencing and skip the relevant pass on
+    /// `None`. The `missing_groups()` helper produces a list of
+    /// absent sub-groups suitable for the failure dump's
+    /// `scx_walker_unavailable` reason.
+    ///
+    /// This signature returns `Result` only because the BTF parse
+    /// itself is fallible; per-sub-group BTF lookup failures are
+    /// stored as `None`, not propagated.
+    pub fn from_btf(btf: &Btf) -> Result<Self> {
+        Ok(Self {
+            rq: RqStructOffsets::from_btf(btf).ok(),
+            scx_rq: ScxRqOffsets::from_btf(btf).ok(),
+            task: TaskStructCoreOffsets::from_btf(btf).ok(),
+            see: SchedExtEntityOffsets::from_btf(btf).ok(),
+            dsq_lnode: ScxDsqListNodeOffsets::from_btf(btf).ok(),
+            dsq: ScxDispatchQOffsets::from_btf(btf).ok(),
+            sched: ScxSchedOffsets::from_btf(btf).ok(),
+            sched_pnode: ScxSchedPnodeOffsets::from_btf(btf).ok(),
+            sched_pcpu: ScxSchedPcpuOffsets::from_btf(btf).ok(),
+            rht: RhashtableOffsets::from_btf(btf).ok(),
+        })
+    }
+
+    /// Returns the names of sub-groups that failed to resolve. Empty
+    /// when every kernel struct the walker touches was present in
+    /// BTF. Surfaced in the failure dump's `scx_walker_unavailable`
+    /// field so a partially-degraded walk announces which passes
+    /// were skipped.
+    pub fn missing_groups(&self) -> Vec<&'static str> {
+        let mut missing = Vec::new();
+        if self.rq.is_none() {
+            missing.push("rq");
+        }
+        if self.scx_rq.is_none() {
+            missing.push("scx_rq");
+        }
+        if self.task.is_none() {
+            missing.push("task_struct");
+        }
+        if self.see.is_none() {
+            missing.push("sched_ext_entity");
+        }
+        if self.dsq_lnode.is_none() {
+            missing.push("scx_dsq_list_node");
+        }
+        if self.dsq.is_none() {
+            missing.push("scx_dispatch_q");
+        }
+        if self.sched.is_none() {
+            missing.push("scx_sched");
+        }
+        if self.sched_pnode.is_none() {
+            missing.push("scx_sched_pnode");
+        }
+        if self.sched_pcpu.is_none() {
+            missing.push("scx_sched_pcpu");
+        }
+        if self.rht.is_none() {
+            missing.push("rhashtable/bucket_table/rhash_head");
+        }
+        missing
+    }
+}
+
+/// `SCX_DSQ_LNODE_ITER_CURSOR` flag value tested against
+/// `scx_dsq_list_node.flags` to skip iterator cursor entries during
+/// a DSQ walk.
+///
+/// Pinned per `include/linux/sched/ext.h::SCX_DSQ_LNODE_ITER_CURSOR`
+/// (= 1u32). Defining it here keeps the constant out of the walker
+/// module's public surface — the walker imports this and applies the
+/// mask at every list iteration.
+#[allow(dead_code)]
+pub const SCX_DSQ_LNODE_ITER_CURSOR: u32 = 1;
+
+/// Bit mask the rhashtable bucket-pointer encoding uses to mark a
+/// "lock" pointer (`BIT(0)`). Pointers stored in
+/// `bucket_table.buckets[i]` have bit 0 set as a tagged-pointer
+/// indicator; the host walker masks bit 0 off before chasing the
+/// chain. See `include/linux/rhashtable.h::rht_ptr` for the kernel's
+/// own bit-stripping helper.
+#[allow(dead_code)]
+pub const RHT_PTR_LOCK_BIT: u64 = 1;
 
 #[cfg(test)]
 mod tests {
@@ -1563,6 +2522,47 @@ mod tests {
         assert!(offsets.prog_aux > 0);
         assert!(offsets.aux_verified_insns > 0);
         assert!(offsets.aux_name > 0);
+    }
+
+    /// Resolve [`CpuTimeOffsets`] against the test vmlinux. Pins the
+    /// offsets the per-CPU CPU-time / softirq / IRQ failure-dump
+    /// capture path consumes:
+    ///   - `kernel_cpustat::cpustat[]` is at offset 0 (single-field
+    ///     struct).
+    ///   - `kstat.irqs_sum` and `kstat.softirqs[]` are distinct.
+    ///   - `tick_sched::iowait_sleeptime` is best-effort (Some only
+    ///     under CONFIG_NO_HZ_COMMON).
+    #[test]
+    fn parse_cpu_time_offsets_from_vmlinux() {
+        let path = match crate::monitor::find_test_vmlinux() {
+            Some(p) => p,
+            None => return,
+        };
+        let btf = match load_btf_from_path(&path) {
+            Ok(b) => b,
+            Err(e) => skip!("vmlinux BTF load failed: {e}"),
+        };
+        let offsets = match CpuTimeOffsets::from_btf(&btf) {
+            Ok(o) => o,
+            Err(e) => skip!("CpuTimeOffsets::from_btf failed: {e}"),
+        };
+        assert_eq!(
+            offsets.kernel_cpustat_cpustat, 0,
+            "kernel_cpustat::cpustat[] must live at offset 0 \
+             (single-field struct in include/linux/kernel_stat.h)"
+        );
+        assert_ne!(
+            offsets.kstat_irqs_sum, offsets.kstat_softirqs,
+            "kstat irqs_sum and softirqs must be at distinct offsets"
+        );
+        // tick_sched is CONFIG_NO_HZ_COMMON-gated. None is a valid
+        // outcome on dynticks-disabled kernels; just don't crash.
+        if let Some(off) = offsets.tick_sched_iowait_sleeptime {
+            assert!(
+                off > 0,
+                "tick_sched::iowait_sleeptime must be nonzero when present"
+            );
+        }
     }
 
     /// Validate that optional BTF offsets (watchdog, event) are

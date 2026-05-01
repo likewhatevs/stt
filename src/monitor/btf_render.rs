@@ -1466,13 +1466,15 @@ mod tests {
     // `.bss` Datasec (declared via the `volatile u32
     // ktstr_err_exit_detected = 0;` and the diagnostic-counter
     // globals `ktstr_trigger_count`, `ktstr_probe_count`,
-    // `ktstr_meta_miss`, `ktstr_miss_log_idx` in
-    // `src/bpf/probe.bpf.c`). The tests below load that BTF
-    // directly via `load_btf_from_path` (which falls back to
-    // goblin's `.BTF` ELF section parse for non-vmlinux files) and
-    // exercise the Datasec render path against it. Hard-fail on a
-    // missing probe.o because build.rs always produces it; a silent
-    // skip would hide the regression the test is designed to catch.
+    // `ktstr_meta_miss`, `ktstr_kprobe_returns`,
+    // `ktstr_ringbuf_drops`, `ktstr_last_trigger_ts`,
+    // `ktstr_miss_log_idx` in `src/bpf/probe.bpf.c`). The tests
+    // below load that BTF directly via `load_btf_from_path` (which
+    // falls back to goblin's `.BTF` ELF section parse for non-vmlinux
+    // files) and exercise the Datasec render path against it.
+    // Hard-fail on a missing probe.o because build.rs always
+    // produces it; a silent skip would hide the regression the test
+    // is designed to catch.
 
     /// Locate the `.bss` Datasec type id in the probe BTF.
     /// `resolve_types_by_name(".bss")` returns a list of types named
@@ -1552,14 +1554,33 @@ mod tests {
              (the freeze latch). Found names: {names:?}"
         );
         // Diagnostic counters are also writable globals → expected
-        // in .bss too. Pin one as a smoke test that multiple
-        // variables decode (not just the one the freeze coord
-        // cares about).
-        assert!(
-            names.contains("ktstr_trigger_count"),
-            "rendered .bss must contain `ktstr_trigger_count` \
-             diagnostic counter. Found names: {names:?}"
-        );
+        // in .bss too. Pin every counter declared in probe.bpf.c so
+        // a future addition that lands in .bss without renderer
+        // coverage surfaces here. Each name corresponds to a
+        // `u64`-typed global in src/bpf/probe.bpf.c whose value is
+        // surfaced in the failure-dump renderer's Datasec walk
+        // (FailureDumpReport's .bss map render).
+        for required in [
+            "ktstr_trigger_count",
+            "ktstr_probe_count",
+            "ktstr_meta_miss",
+            "ktstr_kprobe_returns",
+            "ktstr_ringbuf_drops",
+            "ktstr_last_trigger_ts",
+            // SCX_EV_* counter snapshot taken by `scx_bpf_events`
+            // at the first error-class exit. Surfaces the
+            // system-wide event totals at fault time.
+            "ktstr_exit_event_stats",
+            // tp_btf/sched_ext_event diagnostics.
+            "ktstr_event_tp_count",
+            "ktstr_event_ringbuf_drops",
+        ] {
+            assert!(
+                names.contains(required),
+                "rendered .bss must contain `{required}` \
+                 diagnostic counter. Found names: {names:?}"
+            );
+        }
         // Each member's `value` must be a concrete renderable
         // type (Uint, Int, Array of int, etc.) — NOT Unsupported.
         // A zero byte buffer can't be Truncated for variables that

@@ -113,6 +113,26 @@ pub(crate) struct KernelSymbols {
     /// (CONFIG_64BIT=n on a host that emits only the legacy `jiffies`
     /// alias, or a stripped vmlinux that lost the symbol).
     pub jiffies_64: Option<u64>,
+    /// `.data..percpu` section-relative offset of the
+    /// `kernel_cpustat` per-CPU variable. The per-CPU KVA for CPU
+    /// `n` is `kernel_cpustat + __per_cpu_offset[n]`; same percpu-
+    /// addressing rule as [`Self::runqueues`]. Used by the failure
+    /// dump to read each CPU's `cpustat[CPUTIME_*]` counters.
+    /// `None` when the symbol is absent from a stripped vmlinux —
+    /// per-CPU CPU-time capture is then skipped.
+    pub kernel_cpustat: Option<u64>,
+    /// `.data..percpu` section-relative offset of the `kstat`
+    /// per-CPU variable (`struct kernel_stat`). Used by the failure
+    /// dump to read each CPU's `irqs_sum` and `softirqs[]`. `None`
+    /// when absent.
+    pub kstat: Option<u64>,
+    /// `.data..percpu` section-relative offset of the `tick_cpu_sched`
+    /// per-CPU variable (`struct tick_sched`). Used by the failure
+    /// dump to read each CPU's `iowait_sleeptime`. `None` when
+    /// absent — kernels without `CONFIG_NO_HZ_COMMON` omit this
+    /// symbol; the dump path then skips that field per
+    /// [`super::btf_offsets::CpuTimeOffsets::tick_sched_iowait_sleeptime`].
+    pub tick_cpu_sched: Option<u64>,
 }
 
 impl KernelSymbols {
@@ -153,6 +173,19 @@ impl KernelSymbols {
 
         let jiffies_64 = sym_addr("jiffies_64");
 
+        // Per-CPU CPU-time / softirq / IRQ / iowait_sleeptime
+        // symbols. All three are `.data..percpu` (section-relative
+        // offsets, NOT KVAs); resolution per CPU adds
+        // `__per_cpu_offset[cpu]` like every other percpu read.
+        // Each is optional: a stripped vmlinux without
+        // `kernel_cpustat`/`kstat` skips the corresponding capture
+        // leg without failing the dump (CPU-time is best-effort
+        // diagnostics, not a precondition for the rest of the
+        // freeze-coordinator output).
+        let kernel_cpustat = sym_addr("kernel_cpustat");
+        let kstat = sym_addr("kstat");
+        let tick_cpu_sched = sym_addr("tick_cpu_sched");
+
         Ok(Self {
             runqueues,
             per_cpu_offset,
@@ -163,6 +196,9 @@ impl KernelSymbols {
             prog_idr,
             scx_watchdog_timeout,
             jiffies_64,
+            kernel_cpustat,
+            kstat,
+            tick_cpu_sched,
         })
     }
 }
@@ -464,6 +500,9 @@ mod tests {
             prog_idr: None,
             scx_watchdog_timeout: None,
             jiffies_64: None,
+            kernel_cpustat: None,
+            kstat: None,
+            tick_cpu_sched: None,
         };
 
         assert_eq!(resolve_page_offset(&mem, &symbols), expected_page_offset);
@@ -487,6 +526,9 @@ mod tests {
             prog_idr: None,
             scx_watchdog_timeout: None,
             jiffies_64: None,
+            kernel_cpustat: None,
+            kstat: None,
+            tick_cpu_sched: None,
         };
 
         assert_eq!(resolve_page_offset(&mem, &symbols), DEFAULT_PAGE_OFFSET);
@@ -512,6 +554,9 @@ mod tests {
             prog_idr: None,
             scx_watchdog_timeout: None,
             jiffies_64: None,
+            kernel_cpustat: None,
+            kstat: None,
+            tick_cpu_sched: None,
         };
 
         assert_eq!(resolve_page_offset(&mem, &symbols), DEFAULT_PAGE_OFFSET);
@@ -540,6 +585,9 @@ mod tests {
             prog_idr: None,
             scx_watchdog_timeout: None,
             jiffies_64: None,
+            kernel_cpustat: None,
+            kstat: None,
+            tick_cpu_sched: None,
         };
 
         assert_eq!(resolve_page_offset(&mem, &symbols), DEFAULT_PAGE_OFFSET);
@@ -571,6 +619,9 @@ mod tests {
             prog_idr: None,
             scx_watchdog_timeout: None,
             jiffies_64: None,
+            kernel_cpustat: None,
+            kstat: None,
+            tick_cpu_sched: None,
         };
 
         assert_eq!(resolve_page_offset(&mem, &symbols), randomized_page_offset);
@@ -598,6 +649,9 @@ mod tests {
             prog_idr: None,
             scx_watchdog_timeout: None,
             jiffies_64: None,
+            kernel_cpustat: None,
+            kstat: None,
+            tick_cpu_sched: None,
         };
 
         assert!(resolve_pgtable_l5(&mem, &symbols));
@@ -625,6 +679,9 @@ mod tests {
             prog_idr: None,
             scx_watchdog_timeout: None,
             jiffies_64: None,
+            kernel_cpustat: None,
+            kstat: None,
+            tick_cpu_sched: None,
         };
 
         assert!(!resolve_pgtable_l5(&mem, &symbols));
@@ -648,6 +705,9 @@ mod tests {
             prog_idr: None,
             scx_watchdog_timeout: None,
             jiffies_64: None,
+            kernel_cpustat: None,
+            kstat: None,
+            tick_cpu_sched: None,
         };
 
         assert!(!resolve_pgtable_l5(&mem, &symbols));

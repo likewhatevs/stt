@@ -582,10 +582,10 @@ impl GuestMem {
 ///
 /// Populates the core rq fields: `nr_running`, `scx_nr_running`,
 /// `local_dsq_depth`, `rq_clock`, `scx_flags`. Leaves `event_counters`,
-/// `schedstat`, `vcpu_cpu_time_ns`, and `sched_domains` as `None` —
-/// those are filled in separately by `read_event_stats`,
-/// `read_rq_schedstat`, vCPU stats collection, and sched_domain
-/// traversal respectively.
+/// `schedstat`, `vcpu_cpu_time_ns`, `vcpu_perf`, and `sched_domains`
+/// as `None` — those are filled in separately by `read_event_stats`,
+/// `read_rq_schedstat`, vCPU stats collection, perf counter reads,
+/// and sched_domain traversal respectively.
 pub(crate) fn read_rq_stats(mem: &GuestMem, rq_pa: u64, offsets: &KernelOffsets) -> CpuSnapshot {
     CpuSnapshot {
         nr_running: mem.read_u32(rq_pa, offsets.rq_nr_running),
@@ -599,6 +599,7 @@ pub(crate) fn read_rq_stats(mem: &GuestMem, rq_pa: u64, offsets: &KernelOffsets)
         event_counters: None,
         schedstat: None,
         vcpu_cpu_time_ns: None,
+        vcpu_perf: None,
         sched_domains: None,
     }
 }
@@ -1051,17 +1052,21 @@ pub(crate) enum WatchdogOverride {
     },
 }
 
-/// Pre-resolved BPF program stats context for the monitor loop.
+/// BPF program stats context for the monitor loop.
+///
+/// Holds the static parameters [`super::bpf_prog::walk_struct_ops_runtime_stats`]
+/// needs each sample. The IDR walk re-runs every cycle, which is cheap
+/// (`idr_next` is in the dozens for ktstr workloads) and removes the
+/// staleness window the prior cached-discovery design opened — newly
+/// loaded struct_ops programs surface immediately rather than waiting
+/// for a context rebuild.
 pub(crate) struct ProgStatsCtx {
-    /// Cached per-program info (name + stats_percpu_kva) resolved
-    /// once at startup to avoid re-walking `prog_idr` each sample.
-    pub cached: Vec<super::bpf_prog::CachedProgInfo>,
     /// Per-CPU offset table (`__per_cpu_offset[]`) used to translate
     /// each program's percpu stats pointer into a concrete KVA.
     pub per_cpu_offsets: Vec<u64>,
     /// Guest physical address of the top-level page table. Threaded
-    /// through to [`super::bpf_prog::read_prog_runtime_stats`] so
-    /// per-CPU `bpf_prog_stats` allocations that fall outside the
+    /// through to [`super::bpf_prog::walk_struct_ops_runtime_stats`]
+    /// so per-CPU `bpf_prog_stats` allocations that fall outside the
     /// direct mapping (vmalloc-backed percpu) translate via a
     /// page-table walk instead of being silently dropped.
     pub cr3_pa: u64,
@@ -1071,6 +1076,9 @@ pub(crate) struct ProgStatsCtx {
     /// tables (LA57). Threaded into `translate_kva` calls along with
     /// `cr3_pa`.
     pub l5: bool,
+    /// `prog_idr` symbol KVA (kernel BSS). Read each sample to walk
+    /// all loaded BPF programs.
+    pub prog_idr_kva: u64,
     /// BTF offsets for the `bpf_prog` + related struct fields read
     /// while summing stats.
     pub offsets: super::btf_offsets::BpfProgOffsets,
@@ -1105,6 +1113,11 @@ pub(crate) struct MonitorConfig<'a> {
     pub watchdog_override: Option<&'a WatchdogOverride>,
     /// Optional per-vCPU timing context for preemption accounting.
     pub vcpu_timing: Option<&'a VcpuTiming>,
+    /// Optional host-side perf-counter capture. When present, every
+    /// monitor sample reads `cycles`/`instructions`/`cache_misses`/
+    /// `branch_misses` per vCPU into [`super::CpuSnapshot::vcpu_perf`]
+    /// (#26). `None` skips the per-vCPU PMU capture.
+    pub perf_capture: Option<&'a super::perf_counters::PerfCountersCapture>,
     /// Preemption threshold in nanoseconds used for stall detection.
     /// Pass 0 to derive it from the guest kernel's CONFIG_HZ.
     pub preemption_threshold_ns: u64,
@@ -1138,6 +1151,7 @@ pub(crate) fn monitor_loop(
     let dump_trigger = cfg.dump_trigger;
     let watchdog_override = cfg.watchdog_override;
     let vcpu_timing = cfg.vcpu_timing;
+    let perf_capture = cfg.perf_capture;
     let preemption_threshold_ns = cfg.preemption_threshold_ns;
     let shm_base_pa = cfg.shm_base_pa;
     let prog_stats_ctx = cfg.prog_stats_ctx;
@@ -1158,6 +1172,7 @@ pub(crate) fn monitor_loop(
         vec![super::SustainedViolationTracker::default(); rq_pas.len()];
     let mut dump_requested = false;
     let mut cpus: Vec<CpuSnapshot> = Vec::with_capacity(rq_pas.len());
+    let mut perf_read_err_reported = false;
     let mut vcpu_timing_err_reported: Vec<bool> = vcpu_timing
         .map(|vt| vec![false; vt.pthreads.len()])
         .unwrap_or_default();
@@ -1244,6 +1259,31 @@ pub(crate) fn monitor_loop(
             }
         }
 
+        // Read per-vCPU PMU counters (cycles / instructions /
+        // cache-misses / branch-misses) into each snapshot. Errors
+        // here are surfaced as `vcpu_perf = None` for that sample;
+        // we don't fail the monitor over a transient read error.
+        if let Some(pc) = perf_capture {
+            match pc.read_all() {
+                Ok(samples) => {
+                    for (i, cpu) in cpus.iter_mut().enumerate() {
+                        if let Some(s) = samples.get(i) {
+                            cpu.vcpu_perf = Some(*s);
+                        }
+                    }
+                }
+                Err(e) => {
+                    if !perf_read_err_reported {
+                        tracing::warn!(
+                            err = %e,
+                            "perf counter read failed; vcpu_perf will be None until next successful sample"
+                        );
+                        perf_read_err_reported = true;
+                    }
+                }
+            }
+        }
+
         // Inline threshold evaluation for reactive dump. Each check
         // mirrors `MonitorThresholds::evaluate`: the same
         // `SustainedViolationTracker`, the same `is_cpu_stalled`
@@ -1308,14 +1348,14 @@ pub(crate) fn monitor_loop(
         }
 
         let prog_stats = prog_stats_ctx.map(|ctx| {
-            super::bpf_prog::read_prog_runtime_stats(
+            super::bpf_prog::walk_struct_ops_runtime_stats(
                 mem,
-                &ctx.cached,
-                &ctx.per_cpu_offsets,
                 ctx.cr3_pa,
                 ctx.page_offset,
-                ctx.l5,
+                ctx.prog_idr_kva,
                 &ctx.offsets,
+                ctx.l5,
+                &ctx.per_cpu_offsets,
             )
         });
 
@@ -1444,6 +1484,7 @@ mod tests {
             dump_trigger: None,
             watchdog_override: None,
             vcpu_timing: None,
+            perf_capture: None,
             preemption_threshold_ns: 0,
             shm_base_pa: None,
             prog_stats_ctx: None,

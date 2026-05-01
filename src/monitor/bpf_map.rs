@@ -25,7 +25,7 @@ use super::{Cr3Pa, Kva, PageOffset};
 /// Every free function in this module previously took the same four-
 /// to eight-argument fan of `mem`, `cr3_pa`, `page_offset`, `offsets`,
 /// `l5` (some also took `map_idr_kva`); callers invariably forwarded
-/// the same fields from their [`GuestMemAccessor`] because all six
+/// the same fields from their [`GuestMemMapAccessor`] because all six
 /// originate on the accessor. Grouping them here drops the duplication
 /// and lets additional shared context (per-CPU offset cache, BTF
 /// cache, etc.) ride the same lifetime without touching every
@@ -510,7 +510,25 @@ fn read_percpu_array_value(
     let value_size = map.value_size as usize;
     let mut result = Vec::with_capacity(per_cpu_offsets.len());
 
-    for &cpu_off in per_cpu_offsets {
+    for (cpu_index, &cpu_off) in per_cpu_offsets.iter().enumerate() {
+        // Out-of-range CPU detection: kernel `setup_per_cpu_areas`
+        // (e.g. arch/x86/kernel/setup_percpu.c) only writes
+        // `__per_cpu_offset[cpu]` for cpus in `for_each_possible_cpu`,
+        // leaving slots beyond `nr_cpu_ids` at the BSS-initialized
+        // value of 0. Real SMP kernels assign each possible CPU a
+        // strictly-positive offset (`delta + unit_offsets[cpu]`) for
+        // cpu > 0 because `unit_offsets[cpu]` is a positive multiple
+        // of the per-CPU unit size — only the BSP (cpu_index == 0)
+        // can legitimately observe a zero offset on systems where
+        // the delta term is zero. Treating `cpu_off == 0 &&
+        // cpu_index > 0` as out-of-range prevents the prior aliasing
+        // bug where every out-of-range slot returned CPU 0's bytes
+        // (because `percpu_base + 0` translated successfully to
+        // whatever the bare percpu_base pointed at).
+        if cpu_off == 0 && cpu_index > 0 {
+            result.push(None);
+            continue;
+        }
         let cpu_kva = percpu_base.wrapping_add(cpu_off);
         // The percpu base + cpu_off may land in either the direct
         // mapping (per-CPU __percpu allocations from the static
@@ -557,58 +575,100 @@ pub(crate) fn resolve_to_struct(btf: &btf_rs::Btf, type_id: u32) -> Option<btf_r
     None
 }
 
-/// Trait abstracting BPF map enumeration and value reads across data
-/// sources. One implementation lives in this crate today; a second
-/// backend is planned (live-host introspection via the `bpf()`
-/// syscall — see the live-host introspection task in the project
-/// queue) and will plug into the same trait surface.
+/// Read-only abstraction over BPF map enumeration and value reads
+/// across data sources. Mutating operations (write_value etc.) are
+/// inherent on each backend, NOT exposed here — the trait surface is
+/// a snapshot-style read API used by the failure-dump renderer and
+/// any future read-only consumer.
 ///
-/// - [`GuestMemAccessor`] — reads from a frozen guest VM's physical
-///   memory via PTE walks. Used by the freeze-coordinator path
-///   ([`super::dump::dump_state`]) on the in-VM scheduler test runs.
+/// One implementation lives in this crate today; a second backend is
+/// planned (live-host introspection via the `bpf()` syscall — see
+/// the live-host introspection task in the project queue) and will
+/// plug into the same trait surface.
+///
+/// - [`GuestMemMapAccessor`] — reads from a frozen guest VM's physical
+///   memory via PTE walks against the frozen `init_mm`. Used by the
+///   freeze-coordinator path ([`super::dump::dump_state`]) on the
+///   in-VM scheduler test runs. Hash map iteration walks
+///   `bpf_htab.buckets` directly without RCU; the freeze rendezvous
+///   IS the ordering primitive (every CPU is parked at a known KVM
+///   exit before the host begins reading memory). Per-CPU value
+///   reads use the cached `__per_cpu_offset[cpu]` array; out-of-range
+///   CPUs surface as `None` rather than aliasing CPU 0 (see
+///   [`read_percpu_array_value`]).
 ///
 /// The planned live-host backend will produce identical
 /// [`BpfMapInfo`] / byte buffers, so the rendering pipeline
 /// ([`super::btf_render::render_value`]) stays data-source-agnostic
-/// and will consume either accessor through this trait.
+/// and will consume either accessor through this trait. The
+/// live-host backend's failure modes are different (e.g. hash reads
+/// will rely on the kernel's RCU read-side critical section,
+/// `bpf_map_lookup_elem` rejection for non-readable types) and
+/// individual method docs spell those out where they matter.
 ///
-/// `dump_state` takes `&dyn BpfMapAccessor` so the same call site
-/// dispatches at runtime; generic call sites can also bound on it
-/// directly without paying virtual dispatch.
+/// `dump_state` currently takes a concrete
+/// [`GuestMemMapAccessor`] because its sdt_alloc post-pass walks
+/// the underlying [`super::guest::GuestKernel`] — that handle is
+/// not part of the trait surface. When the live-host backend lands
+/// (and sdt_alloc walking moves into a backend-specific path),
+/// `dump_state` will switch to `&dyn BpfMapAccessor`. Other call
+/// sites that need only the trait surface can already bind on
+/// `&dyn BpfMapAccessor` (or `<A: BpfMapAccessor>`) without paying
+/// virtual dispatch.
 #[allow(dead_code)]
 pub trait BpfMapAccessor {
     /// Enumerate every BPF map visible to this accessor.
     ///
     /// Order is implementation-defined: the guest-memory backend walks
-    /// `map_idr` (allocation order); the bpf-syscall backend walks the
-    /// kernel's id space via `BPF_MAP_GET_NEXT_ID` (also allocation
-    /// order, modulo concurrent destruction races on the live host).
-    /// Callers that want a stable view should sort by name.
+    /// `map_idr` (allocation order); the planned bpf-syscall backend
+    /// will walk the kernel's id space via `BPF_MAP_GET_NEXT_ID` (also
+    /// allocation order, modulo concurrent destruction races on the
+    /// live host). Callers that want a stable view should sort by name.
     fn maps(&self) -> Vec<BpfMapInfo>;
+
+    /// Find the first BPF map whose name ends with `name_suffix`.
+    ///
+    /// Default impl walks [`Self::maps`]. Backends with cheaper
+    /// targeted lookups can override (e.g. a libbpf-handle-backed
+    /// accessor that already holds a name index).
+    fn find_map(&self, name_suffix: &str) -> Option<BpfMapInfo> {
+        self.maps().into_iter().find(|m| m.name.ends_with(name_suffix))
+    }
 
     /// Read a contiguous byte range from a map's value region.
     ///
     /// Returns `None` for non-readable map types (e.g. ARENA — use
     /// [`Self::read_arena_pages`]; HASH — use [`Self::iter_hash_map`])
-    /// or when the underlying read fails (unmapped guest page,
-    /// `bpf_map_lookup_elem` rejection).
+    /// or when the backing read fails. The guest-memory backend's
+    /// failure modes are unmapped guest pages and out-of-range value
+    /// regions; the planned bpf-syscall backend will additionally
+    /// surface `bpf_map_lookup_elem` rejection (e.g. `-EINVAL` on
+    /// arena maps, kernel-side ACL denials).
     fn read_value(&self, map: &BpfMapInfo, offset: usize, len: usize) -> Option<Vec<u8>>;
 
     /// Iterate every entry in a `BPF_MAP_TYPE_HASH` map.
     ///
-    /// Returns an empty vec for non-HASH maps. Each `(key, value)` pair
-    /// is captured at the moment of read; a concurrently-mutating BPF
-    /// program may produce torn states, but per-element atomicity holds
-    /// (the kernel's hash bucket reads are RCU-protected on both paths).
+    /// Returns an empty vec for non-HASH maps. Per-element atomicity
+    /// is backend-specific: the guest-memory backend reads raw bytes
+    /// at the freeze instant (the freeze rendezvous IS the
+    /// synchronization — no concurrent writers exist while parked vCPUs
+    /// stay parked); the planned bpf-syscall backend will read under
+    /// the kernel's RCU read-side critical section
+    /// (`bpf_map_lookup_elem` -> `htab_map_lookup_elem`). Both can
+    /// produce torn views relative to a multi-element transaction the
+    /// scheduler intended to commit atomically — that's a feature of
+    /// reading without locking the whole table.
     fn iter_hash_map(&self, map: &BpfMapInfo) -> Vec<(Vec<u8>, Vec<u8>)>;
 
     /// Read every CPU's value for a key in a `BPF_MAP_TYPE_PERCPU_ARRAY` map.
     ///
     /// Returns one entry per CPU, indexed by CPU number. `Some(bytes)`
-    /// when the per-CPU slot is readable; `None` when it isn't (e.g. an
-    /// out-of-range CPU on the live host, or an unmapped page on the
-    /// guest-memory path). Returns an empty vec for non-PERCPU_ARRAY
-    /// maps or `key >= max_entries`.
+    /// when the per-CPU slot is readable; `None` when it isn't (e.g.
+    /// an out-of-range CPU index — `__per_cpu_offset[cpu]` reads as
+    /// the BSS-zero sentinel — or an unmapped page on the
+    /// guest-memory path; the planned bpf-syscall backend surfaces
+    /// out-of-range CPU on `bpf_map_lookup_elem` failure). Returns an
+    /// empty vec for non-PERCPU_ARRAY maps or `key >= max_entries`.
     fn read_percpu_array(
         &self,
         map: &BpfMapInfo,
@@ -618,13 +678,19 @@ pub trait BpfMapAccessor {
 
     /// Snapshot every mapped page of a `BPF_MAP_TYPE_ARENA` map.
     ///
-    /// The default implementation returns an empty snapshot; backends
-    /// that can dump arena content override this. The guest-memory
-    /// backend walks the arena's PTEs against the frozen `init_mm`;
-    /// the bpf-syscall backend `mmap()`s the arena fd and copies the
-    /// pages out (the only data path the kernel exposes — arena's
-    /// `lookup_elem` returns `-EINVAL`, see `kernel/bpf/arena.c`).
-    fn read_arena_pages(&self, _map: &BpfMapInfo) -> super::arena::ArenaSnapshot {
+    /// `arena_offsets` resolves kernel struct field offsets the
+    /// guest-memory backend uses to walk `bpf_arena -> kern_vm ->
+    /// vm_struct.addr`; the planned bpf-syscall backend will mmap the
+    /// arena fd directly (the only data path the kernel exposes —
+    /// arena's `lookup_elem` returns `-EINVAL`, see
+    /// `kernel/bpf/arena.c`) and ignore `arena_offsets`. The default
+    /// implementation returns an empty snapshot; backends override to
+    /// produce real content.
+    fn read_arena_pages(
+        &self,
+        _map: &BpfMapInfo,
+        _arena_offsets: &super::arena::BpfArenaOffsets,
+    ) -> super::arena::ArenaSnapshot {
         super::arena::ArenaSnapshot::default()
     }
 
@@ -656,10 +722,10 @@ pub trait BpfMapAccessor {
 /// site.
 ///
 /// [`GuestKernel`]: super::guest::GuestKernel
-pub struct GuestMemAccessor<'a> {
+pub struct GuestMemMapAccessor<'a> {
     kernel: &'a super::guest::GuestKernel<'a>,
     map_idr_kva: u64,
-    /// Borrowed from the `GuestMemAccessorOwned` that produced this
+    /// Borrowed from the `GuestMemMapAccessorOwned` that produced this
     /// accessor via `as_accessor`, or provided by the caller to
     /// `from_guest_kernel`. Borrowing avoids the ~160-byte
     /// `BpfMapOffsets` clone that the old owned-field design paid
@@ -668,12 +734,12 @@ pub struct GuestMemAccessor<'a> {
 }
 
 #[allow(dead_code)]
-impl<'a> GuestMemAccessor<'a> {
+impl<'a> GuestMemMapAccessor<'a> {
     /// Create from an existing [`GuestKernel`] and a caller-owned
     /// [`BpfMapOffsets`].
     ///
     /// The accessor borrows the offsets for its lifetime, so callers
-    /// typically stash them in a `GuestMemAccessorOwned` (or another
+    /// typically stash them in a `GuestMemMapAccessorOwned` (or another
     /// stable location) before calling this. Build `offsets` once via
     /// [`BpfMapOffsets::from_vmlinux`] and reuse — they're per-kernel,
     /// not per-call.
@@ -748,7 +814,7 @@ impl<'a> GuestMemAccessor<'a> {
     }
 }
 
-impl BpfMapAccessor for GuestMemAccessor<'_> {
+impl BpfMapAccessor for GuestMemMapAccessor<'_> {
     fn maps(&self) -> Vec<BpfMapInfo> {
         find_all_bpf_maps(&self.ctx(), self.map_idr_kva)
     }
@@ -764,16 +830,11 @@ impl BpfMapAccessor for GuestMemAccessor<'_> {
     /// Read per-CPU values for a key in a `BPF_MAP_TYPE_PERCPU_ARRAY` map.
     ///
     /// Resolves `__per_cpu_offset` from the guest kernel and reads each
-    /// CPU's slot via [`translate_any_kva`].
-    ///
-    /// When the `__per_cpu_offset` array straddles the end of guest
-    /// memory, the former pre-check returned an empty vec; the current
-    /// path delegates bounds-checking to [`super::symbols::read_per_cpu_offsets`]
-    /// (which reads one u64 at a time via [`super::reader::GuestMem::read_u64`]
-    /// and yields `0` for any out-of-range slot). Out-of-range CPUs
-    /// therefore pick up a zero offset, which aliases CPU 0's per-CPU
-    /// base and yields `Some(bytes)` copies of CPU 0's value rather
-    /// than `None`.
+    /// CPU's slot via [`translate_any_kva`]. Out-of-range CPUs (those
+    /// whose `__per_cpu_offset` slot reads as zero — including reads
+    /// past the end of guest memory and BSS-zero slots beyond
+    /// `nr_cpu_ids`) return `None` rather than aliasing CPU 0's bytes;
+    /// see the cpu_off==0 guard in [`read_percpu_array_value`].
     fn read_percpu_array(
         &self,
         map: &BpfMapInfo,
@@ -789,35 +850,42 @@ impl BpfMapAccessor for GuestMemAccessor<'_> {
         read_percpu_array_value(&self.ctx(), map, key, &per_cpu_offsets)
     }
 
-    fn read_arena_pages(&self, map: &BpfMapInfo) -> super::arena::ArenaSnapshot {
-        // The arena snapshot path needs the BTF-resolved arena offsets
-        // separately from `BpfMapOffsets`, so it lives in [`super::arena`]
-        // and runs out of [`super::dump::dump_state`] directly. Returning
-        // the default here keeps the trait's arena entry point a single
-        // call site for backends that DO have everything they need at
-        // accessor scope (the bpf-syscall backend mmap's arena fds and
-        // owns its own snapshot path).
-        let _ = map;
-        super::arena::ArenaSnapshot::default()
+    fn read_arena_pages(
+        &self,
+        map: &BpfMapInfo,
+        arena_offsets: &super::arena::BpfArenaOffsets,
+    ) -> super::arena::ArenaSnapshot {
+        super::arena::snapshot_arena(self.kernel, map, arena_offsets)
+    }
+
+    fn load_program_btf(
+        &self,
+        map: &BpfMapInfo,
+        base_btf: &btf_rs::Btf,
+    ) -> Option<btf_rs::Btf> {
+        if map.btf_kva == 0 {
+            return None;
+        }
+        super::dump::load_program_btf_kva(self, map.btf_kva, base_btf)
     }
 }
 
 /// Owns a [`GuestKernel`] and provides BPF map access through the
-/// [`GuestMemAccessor`] borrow.
+/// [`GuestMemMapAccessor`] borrow.
 ///
-/// Returned by [`GuestMemAccessorOwned::new`] which builds the
-/// `GuestKernel` internally. Borrow as [`GuestMemAccessor`] via
+/// Returned by [`GuestMemMapAccessorOwned::new`] which builds the
+/// `GuestKernel` internally. Borrow as [`GuestMemMapAccessor`] via
 /// [`as_accessor`](Self::as_accessor) for map operations.
 ///
 /// [`GuestKernel`]: super::guest::GuestKernel
-pub struct GuestMemAccessorOwned<'a> {
+pub struct GuestMemMapAccessorOwned<'a> {
     kernel: super::guest::GuestKernel<'a>,
     map_idr_kva: u64,
     offsets: BpfMapOffsets,
 }
 
 #[allow(dead_code)]
-impl<'a> GuestMemAccessorOwned<'a> {
+impl<'a> GuestMemMapAccessorOwned<'a> {
     /// Create from GuestMem and vmlinux path.
     ///
     /// One-shot constructor: builds a [`GuestKernel`] from `vmlinux`,
@@ -825,7 +893,7 @@ impl<'a> GuestMemAccessorOwned<'a> {
     /// locates the `map_idr` symbol. The resulting handle owns both
     /// the `GuestKernel` and the `BpfMapOffsets`.
     ///
-    /// Prefer [`GuestMemAccessor::from_guest_kernel`] when you already
+    /// Prefer [`GuestMemMapAccessor::from_guest_kernel`] when you already
     /// hold a `GuestKernel` **and** a pre-built `&BpfMapOffsets` — it
     /// builds a borrowed accessor without taking ownership of either,
     /// so callers that maintain their own offsets cache (e.g. across
@@ -849,12 +917,12 @@ impl<'a> GuestMemAccessorOwned<'a> {
         })
     }
 
-    /// Borrow as a [`GuestMemAccessor`] for map operations.
+    /// Borrow as a [`GuestMemMapAccessor`] for map operations.
     ///
     /// The returned accessor borrows `self.offsets`; no clone on
     /// the hot path.
-    pub fn as_accessor(&self) -> GuestMemAccessor<'_> {
-        GuestMemAccessor {
+    pub fn as_accessor(&self) -> GuestMemMapAccessor<'_> {
+        GuestMemMapAccessor {
             kernel: &self.kernel,
             map_idr_kva: self.map_idr_kva,
             offsets: &self.offsets,
@@ -868,7 +936,7 @@ impl<'a> GuestMemAccessorOwned<'a> {
         &self.kernel
     }
 
-    // Map operations live on [`GuestMemAccessor`]. Borrow via
+    // Map operations live on [`GuestMemMapAccessor`]. Borrow via
     // [`as_accessor`] to call them: `owned.as_accessor().find_map(...)`.
     // The wrapper type exists only to own the `GuestKernel` and
     // `BpfMapOffsets`; it does not duplicate the accessor's surface.
@@ -4499,6 +4567,93 @@ mod tests {
         assert_eq!(u64::from_ne_bytes(v2[..8].try_into().unwrap()), 0xCCCC);
         // CPU 3: out of bounds.
         assert!(result[3].is_none(), "CPU 3 should be None");
+    }
+
+    /// Pin the out-of-range-CPU aliasing fix: when callers pass a
+    /// `per_cpu_offsets` array whose tail slots read as zero (because
+    /// the underlying `__per_cpu_offset[N]` for N >= nr_cpu_ids is
+    /// BSS-zero in the kernel's static array), `read_percpu_array_value`
+    /// must return `None` for those slots rather than silently aliasing
+    /// to whichever CPU happens to live at `percpu_base + 0`.
+    ///
+    /// Setup: 4-element `per_cpu_offsets` with [non-zero, non-zero,
+    /// 0, 0]. The first two slots represent real CPUs (with offsets
+    /// produced by `setup_per_cpu_areas`), the last two simulate the
+    /// out-of-range tail. Each real CPU has distinct bytes at
+    /// `percpu_base + offset`. The bytes at `percpu_base + 0` are
+    /// also distinct (a marker value) so the test can distinguish
+    /// "returned None correctly" from "returned the aliased CPU 0
+    /// bytes incorrectly". Only the first two slots should be Some;
+    /// the last two must be None.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn read_percpu_array_out_of_range_returns_none_not_alias() {
+        let num_cpus = 4u32;
+        let value_size = 8u32;
+        // setup_percpu_array seeds offsets [0, stride, 2*stride, 3*stride].
+        // We override per_cpu_offsets below to model the out-of-range
+        // tail; the zero-valued tail must NOT alias to whatever lives
+        // at `percpu_base + 0`.
+        let (mut buf, cr3_pa, page_offset, info, offsets, _) =
+            setup_percpu_array(num_cpus, 1, value_size);
+        let percpu_base_pa: u64 = 0x20000;
+        let stride: u64 = 0x1000;
+        // Write a marker at `percpu_base + 0`. If the buggy
+        // implementation aliases out-of-range slots to this region,
+        // the test will see the marker bytes and fail the None check.
+        buf[percpu_base_pa as usize..percpu_base_pa as usize + 8]
+            .copy_from_slice(&0xDEAD_BEEFu64.to_ne_bytes());
+        // Write distinct values at the real CPUs' regions.
+        let cpu1_pa = percpu_base_pa + stride;
+        buf[cpu1_pa as usize..cpu1_pa as usize + 8]
+            .copy_from_slice(&0x1111u64.to_ne_bytes());
+
+        // Per-CPU offset layout used for this test:
+        // - CPU 0 (cpu_index==0): offset 0 — legitimate per the
+        //   UP/identity-relocation case; reads the marker at
+        //   percpu_base+0.
+        // - CPU 1 (cpu_index>0, non-zero offset): real CPU at
+        //   percpu_base+stride; reads the 0x1111 value.
+        // - CPU 2/3 (cpu_index>0, zero offset): out-of-range tail —
+        //   BSS-zero `__per_cpu_offset[N]` for N >= nr_cpu_ids. The
+        //   fix returns None here; the buggy implementation would
+        //   alias to percpu_base+0 and read the 0xDEAD_BEEF marker.
+        let per_cpu_offsets = vec![0u64, stride, 0, 0];
+
+        // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
+        // whose backing storage outlives the GuestMem use.
+        let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
+        let result = read_percpu_array_value(
+            &lookup_ctx(&mem, cr3_pa, page_offset, &offsets, false),
+            &info,
+            0,
+            &per_cpu_offsets,
+        );
+
+        assert_eq!(result.len(), 4);
+        // CPU 0 (cpu_index==0): zero offset is legitimate; reads
+        // the marker bytes at percpu_base+0.
+        let v0 = result[0].as_ref().expect("CPU 0 should be Some");
+        assert_eq!(
+            u64::from_ne_bytes(v0[..8].try_into().unwrap()),
+            0xDEAD_BEEF,
+        );
+        // CPU 1 (cpu_index>0, non-zero offset): real CPU.
+        let v1 = result[1].as_ref().expect("CPU 1 should be Some");
+        assert_eq!(u64::from_ne_bytes(v1[..8].try_into().unwrap()), 0x1111);
+        // CPU 2 (cpu_index>0, zero offset): out-of-range, must NOT
+        // alias to CPU 0's marker bytes.
+        assert!(
+            result[2].is_none(),
+            "CPU 2 (out-of-range, cpu_off==0) must be None, not aliased to CPU 0; got {:?}",
+            result[2],
+        );
+        // CPU 3 (cpu_index>0, zero offset): out-of-range, ditto.
+        assert!(
+            result[3].is_none(),
+            "CPU 3 (out-of-range, cpu_off==0) must be None, not aliased to CPU 0; got {:?}",
+            result[3],
+        );
     }
 
     #[test]

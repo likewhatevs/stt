@@ -3057,6 +3057,7 @@ mod tests {
                             event_counters: None,
                             schedstat: None,
                             vcpu_cpu_time_ns: None,
+                            vcpu_perf: None,
                             sched_domains: None,
                         },
                         crate::monitor::CpuSnapshot {
@@ -3068,6 +3069,7 @@ mod tests {
                             event_counters: None,
                             schedstat: None,
                             vcpu_cpu_time_ns: None,
+                            vcpu_perf: None,
                             sched_domains: None,
                         },
                     ],
@@ -3446,6 +3448,7 @@ mod tests {
                             event_counters: None,
                             schedstat: None,
                             vcpu_cpu_time_ns: None,
+                            vcpu_perf: None,
                             sched_domains: None,
                         },
                         crate::monitor::CpuSnapshot {
@@ -3457,6 +3460,7 @@ mod tests {
                             event_counters: None,
                             schedstat: None,
                             vcpu_cpu_time_ns: None,
+                            vcpu_perf: None,
                             sched_domains: None,
                         },
                     ],

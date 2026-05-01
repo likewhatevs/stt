@@ -22,10 +22,13 @@ pub mod btf_render;
 pub mod dump;
 pub mod guest;
 pub mod idr;
+pub mod perf_counters;
 pub mod reader;
 pub mod runnable_scan;
+pub mod scx_walker;
 pub mod sdt_alloc;
 pub mod symbols;
+pub mod task_enrichment;
 
 /// Guest physical address of the top-level page-table page (CR3 on x86,
 /// TTBR1 on aarch64). Newtype around `u64` so address kinds can't
@@ -428,6 +431,16 @@ pub struct CpuSnapshot {
     /// Used by evaluate() to distinguish real stalls from host preemption.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vcpu_cpu_time_ns: Option<u64>,
+    /// Host-side hardware perf counters for the vCPU thread that owns
+    /// this guest CPU. Captured via `perf_event_open(2)` with
+    /// `exclude_host=1` so the PMU only ticks while the vCPU is
+    /// running guest code. `None` when perf is unavailable on the
+    /// host (paranoid policy, missing CAP_PERFMON, hardware lacks
+    /// the requested counter), when no TID is registered for this
+    /// vCPU, or before the per-vCPU counter set was opened on the
+    /// first sample. See [`perf_counters`](crate::monitor::perf_counters).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vcpu_perf: Option<perf_counters::VcpuPerfSample>,
     /// Sched domain tree for this CPU. Each entry is one domain level,
     /// ordered from lowest (e.g. SMT) to highest (e.g. NUMA). None when
     /// sched_domain offsets are unavailable or `rq->sd` is null.
@@ -3115,6 +3128,7 @@ mod tests {
                         }),
                         schedstat: None,
                         vcpu_cpu_time_ns: None,
+                        vcpu_perf: None,
                         sched_domains: None,
                     },
                     CpuSnapshot {
@@ -3130,6 +3144,7 @@ mod tests {
                         }),
                         schedstat: None,
                         vcpu_cpu_time_ns: None,
+                        vcpu_perf: None,
                         sched_domains: None,
                     },
                 ],

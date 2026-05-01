@@ -5,8 +5,9 @@
 //! - [`Assert`] -- composable assertion config (worker + monitor checks)
 //! - [`ScenarioStats`] / [`CgroupStats`] -- aggregated telemetry
 //! - [`NumaMapsEntry`] -- parsed `/proc/self/numa_maps` VMA entry
-//! - [`Expect`] / [`Checks`] -- rich pointwise assertion primitives
-//!   (see "Rich assertion primitives" section below)
+//! - [`Verdict`] -- pointwise-claim accumulator (built via
+//!   [`Assert::verdict`] / [`Verdict::new`]; comparators routed through
+//!   [`ClaimBuilder`] / [`SetClaim`] / [`SeqClaim`])
 //!
 //! NUMA assertion functions:
 //! - [`parse_numa_maps`] -- parse numa_maps content into per-VMA entries
@@ -304,6 +305,48 @@ impl AssertDetail {
             message: message.into(),
         }
     }
+
+    /// Borrow this detail as a kind-prefixed [`std::fmt::Display`]
+    /// adapter. The default [`Display`](std::fmt::Display) impl on
+    /// `AssertDetail` writes only `message` so terminal output reads
+    /// as bare prose; structured-log consumers that want to bucket
+    /// failures by category without re-checking [`Self::kind`] reach
+    /// for this helper instead.
+    ///
+    /// Renders as `[<DetailKind variant name>] <message>` — debug-form
+    /// for the kind so the variant token is grep-stable across renames
+    /// (a regression that drops a `DetailKind` variant breaks the
+    /// match arms that produce it; the rendered token follows). Zero-
+    /// allocation: the wrapper holds a `&AssertDetail` and writes
+    /// straight into the formatter.
+    ///
+    /// ```
+    /// # use ktstr::assert::{AssertDetail, DetailKind};
+    /// let d = AssertDetail::new(DetailKind::Stuck, "tid 7 stuck 1500ms on cpu3");
+    /// assert_eq!(d.to_string(), "tid 7 stuck 1500ms on cpu3");
+    /// assert_eq!(
+    ///     d.display_with_kind().to_string(),
+    ///     "[Stuck] tid 7 stuck 1500ms on cpu3",
+    /// );
+    /// ```
+    pub fn display_with_kind(&self) -> AssertDetailWithKind<'_> {
+        AssertDetailWithKind { detail: self }
+    }
+}
+
+/// `Display` adapter returned by [`AssertDetail::display_with_kind`].
+/// Renders the detail as `[<kind>] <message>`. Held by reference so
+/// the helper allocates nothing on the formatting path; the lifetime
+/// is the borrow of the source `AssertDetail`.
+#[must_use = "AssertDetailWithKind only renders when formatted"]
+pub struct AssertDetailWithKind<'a> {
+    detail: &'a AssertDetail,
+}
+
+impl std::fmt::Display for AssertDetailWithKind<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[{:?}] {}", self.detail.kind, self.detail.message)
+    }
 }
 
 impl From<String> for AssertDetail {
@@ -417,32 +460,21 @@ pub struct AssertResult {
 /// behavior should scope their assertions to per-worker data
 /// rather than this aggregate.
 ///
-/// # Stored-vs-computed ratio drift
+/// # Derived ratios
 ///
-/// Two fields are DERIVED rather than measured:
-/// [`Self::wake_latency_tail_ratio`] and
-/// [`Self::iterations_per_worker`]. Both are stored on the struct
-/// AND available through computed accessors
-/// ([`Self::computed_wake_latency_tail_ratio`],
-/// [`Self::computed_iterations_per_worker`]). The two sources can
-/// drift:
-///
-/// - Producers (`assert_not_starved` et al.) populate the raw
-///   fields, then call [`Self::derive_ratios`] to stamp the
-///   stored values.
-/// - `serde::Deserialize` restores whatever the on-disk sidecar
-///   recorded — potentially stale values from an older ktstr
-///   build whose `derive_ratios` convention differed.
-/// - Test fixtures that construct `CgroupStats { .. }` literals
-///   typically skip the `derive_ratios` call.
-///
-/// Read rule: consumers holding a `CgroupStats` from an uncertain
-/// origin (deserialized sidecar, hand-built fixture) MUST prefer
-/// the `computed_*` accessors. Consumers that populate via
-/// `assert_not_starved` → `derive_ratios` can read the stored
-/// field directly. The stored values exist for sidecar wire
-/// format compatibility, not as the canonical read path.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+/// Two metrics are DERIVED rather than measured and live as
+/// `&self` methods, NOT as serde-serialized fields:
+/// [`Self::wake_latency_tail_ratio`] (= p99/median) and
+/// [`Self::iterations_per_worker`] (= total_iterations/num_workers).
+/// Pre-1.0 cleanup eliminated the prior stored-field shadow and
+/// `derive_ratios` stamper. Consumers always recompute on read,
+/// so a hand-constructed fixture or a deserialized sidecar from an
+/// older build cannot silently carry a stale ratio. The roll-up
+/// fields on [`ScenarioStats::worst_wake_latency_tail_ratio`] /
+/// [`ScenarioStats::worst_iterations_per_worker`] aggregate these
+/// methods over per-cgroup [`Self`] entries during
+/// [`AssertResult::merge`].
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, crate::Claim)]
 pub struct CgroupStats {
     /// Number of workers in this cgroup.
     pub num_workers: usize,
@@ -491,88 +523,26 @@ pub struct CgroupStats {
     /// Cross-node page migration ratio from `/proc/vmstat`
     /// `numa_pages_migrated` delta divided by total allocated pages.
     pub cross_node_migration_ratio: f64,
-    /// Wake-latency tail amplification:
-    /// `p99_wake_latency_us / median_wake_latency_us`.
-    ///
-    /// Unitless; ≥1.0 by definition of order statistics (p99
-    /// cannot undershoot the median on the same sample set).
-    /// Values far above 1.0 signal a long tail — the scheduler
-    /// wakes most workers promptly but occasionally stalls some,
-    /// a regression axis that neither `median_*` nor `p99_*`
-    /// exposes in isolation: a scenario can regress either by
-    /// lifting the whole distribution (both fields climb in
-    /// lock-step, tail ratio stays put) or by stretching just
-    /// the tail (only p99 climbs, ratio balloons).
-    ///
-    /// Routed through `GauntletRow` and the `METRICS` registry;
-    /// `stats compare` surfaces this axis in its comparison rows.
-    ///
-    /// `0.0` when `median_wake_latency_us` is `0.0` to avoid
-    /// producing `NaN` / `Infinity` that would trip the
-    /// `finite_or_zero` downstream filter. Callers that need to
-    /// distinguish "no samples" from "zero-latency case" consult
-    /// the raw fields directly.
-    pub wake_latency_tail_ratio: f64,
-    /// Throughput per parallel degree:
-    /// `total_iterations / num_workers`. Units: iterations per
-    /// worker over the scenario's wall time.
-    ///
-    /// Normalizes raw iteration counts against the cgroup's
-    /// worker count so a run that achieves the same total work
-    /// with more workers (lower per-worker throughput, possibly
-    /// from CPU contention) surfaces as a regression.
-    ///
-    /// Only meaningful across runs of the SAME variant (equal
-    /// scenario duration): cross-variant comparison is
-    /// misleading because this metric is NOT rate-normalized —
-    /// a longer-running scenario racks up more iterations per
-    /// worker even if the scheduler is identical. `stats
-    /// compare`-style comparisons should hold scenario,
-    /// topology, and work_type constant before reading this
-    /// field.
-    ///
-    /// Routed through `GauntletRow` and the `METRICS` registry;
-    /// `stats compare` surfaces this axis in its comparison rows.
-    ///
-    /// `0.0` when `num_workers` is zero (empty cgroup — a
-    /// constructed edge case, not expected in production runs).
-    pub iterations_per_worker: f64,
     /// Extensible metrics for the generic comparison pipeline.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub ext_metrics: BTreeMap<String, f64>,
 }
 
 impl CgroupStats {
-    /// Stamp the two derived ratios ([`Self::wake_latency_tail_ratio`],
-    /// [`Self::iterations_per_worker`]) into the struct so the sidecar
-    /// wire format carries them without every reader re-running the
-    /// divide. Kept as a method (rather than typestate or
-    /// computed-only accessors) because the struct is the sidecar
-    /// serde format — splitting into raw/finalized types would
-    /// break wire compat, and dropping the fields would make every
-    /// downstream `GauntletRow` / stats reader recompute. See the
-    /// sibling [`Self::computed_wake_latency_tail_ratio`] /
-    /// [`Self::computed_iterations_per_worker`] accessors for the
-    /// drift-safe reader path.
-    pub fn derive_ratios(&mut self) {
-        self.wake_latency_tail_ratio = self.computed_wake_latency_tail_ratio();
-        self.iterations_per_worker = self.computed_iterations_per_worker();
-    }
-
-    /// Computed `p99_wake_latency_us / median_wake_latency_us`
-    /// (worst-case tail amplification), returning `0.0` when
-    /// `median_wake_latency_us <= 0.0` to avoid producing
-    /// `NaN` / `Infinity`. Mirrors the stored-field semantics
-    /// documented on [`Self::wake_latency_tail_ratio`].
+    /// Wake-latency tail amplification:
+    /// `p99_wake_latency_us / median_wake_latency_us`. Returns `0.0`
+    /// when `median_wake_latency_us <= 0.0` so the result never
+    /// propagates `NaN` / `Infinity` into downstream
+    /// `finite_or_zero` filters. Method-only access (no stored
+    /// shadow) — recomputed every call from the raw fields.
     ///
-    /// Prefer this accessor over a direct read of
-    /// [`Self::wake_latency_tail_ratio`] when you hold a
-    /// `CgroupStats` that may not have been finalized via
-    /// [`Self::derive_ratios`] — e.g. a deserialized sidecar from
-    /// a pre-derive build, or a hand-constructed test fixture.
-    /// The accessor recomputes from raw fields every call and
-    /// cannot be out of sync.
-    pub fn computed_wake_latency_tail_ratio(&self) -> f64 {
+    /// Unitless; ≥1.0 by definition of order statistics (p99 cannot
+    /// undershoot the median on the same sample set). Values far
+    /// above 1.0 signal a long tail — the scheduler wakes most
+    /// workers promptly but occasionally stalls some, a regression
+    /// axis that neither `median_*` nor `p99_*` exposes in
+    /// isolation.
+    pub fn wake_latency_tail_ratio(&self) -> f64 {
         if self.median_wake_latency_us > 0.0 {
             self.p99_wake_latency_us / self.median_wake_latency_us
         } else {
@@ -580,18 +550,20 @@ impl CgroupStats {
         }
     }
 
-    /// Computed `total_iterations / num_workers` (per-worker
-    /// throughput), returning `0.0` when `num_workers == 0` to
-    /// avoid producing `NaN` / `Infinity`. Mirrors the stored-field
-    /// semantics documented on [`Self::iterations_per_worker`].
+    /// Throughput per parallel degree:
+    /// `total_iterations / num_workers`. Returns `0.0` when
+    /// `num_workers == 0` so the result never propagates
+    /// `NaN` / `Infinity`. Method-only access (no stored shadow) —
+    /// recomputed every call from the raw fields.
     ///
-    /// Prefer this accessor over a direct read of
-    /// [`Self::iterations_per_worker`] when you hold a `CgroupStats`
-    /// that may not have been finalized via [`Self::derive_ratios`]
-    /// — e.g. a deserialized sidecar from a pre-derive build or a
-    /// hand-constructed test fixture. The accessor recomputes from
-    /// raw fields every call and cannot be out of sync.
-    pub fn computed_iterations_per_worker(&self) -> f64 {
+    /// Only meaningful across runs of the SAME variant (equal
+    /// scenario duration): cross-variant comparison is misleading
+    /// because this metric is NOT rate-normalized — a longer-
+    /// running scenario racks up more iterations per worker even if
+    /// the scheduler is identical. `stats compare`-style
+    /// comparisons hold scenario, topology, and work_type constant
+    /// before reading this method.
+    pub fn iterations_per_worker(&self) -> f64 {
         if self.num_workers > 0 {
             self.total_iterations as f64 / self.num_workers as f64
         } else {
@@ -601,7 +573,7 @@ impl CgroupStats {
 }
 
 /// Aggregated statistics across all cgroups in a scenario.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, crate::Claim)]
 pub struct ScenarioStats {
     /// Per-cgroup stats, one entry per cgroup.
     pub cgroups: Vec<CgroupStats>,
@@ -958,8 +930,8 @@ impl AssertPlan {
                             cgroup_result.details.push(AssertDetail::new(
                                 DetailKind::Stuck,
                                 format!(
-                                    "stuck {}ms on cpu{} at +{}ms (threshold {}ms)",
-                                    w.max_gap_ms, w.max_gap_cpu, w.max_gap_at_ms, threshold
+                                    "tid {} stuck {}ms on cpu{} at +{}ms (threshold {}ms)",
+                                    w.tid, w.max_gap_ms, w.max_gap_cpu, w.max_gap_at_ms, threshold,
                                 ),
                             ));
                         }
@@ -1100,8 +1072,10 @@ fn assert_slow_tier_ratio(
         r.details.push(AssertDetail::new(
             DetailKind::SlowTier,
             format!(
-                "slow-tier page ratio {ratio:.4} exceeds threshold {max_ratio:.4} \
+                "slow-tier page ratio {ratio:.4} ({pct:.2}%) exceeds threshold {max_ratio:.4} ({thr_pct:.2}%) \
                  ({slow_pages}/{total_pages} pages on non-CPU nodes)",
+                pct = ratio * 100.0,
+                thr_pct = max_ratio * 100.0,
             ),
         ));
     }
@@ -1126,7 +1100,9 @@ pub fn assert_page_locality(
         r.details.push(AssertDetail::new(
             DetailKind::PageLocality,
             format!(
-                "page locality {observed:.4} below threshold {threshold:.4} ({local_pages}/{total_pages} pages local)",
+                "page locality {observed:.4} ({pct:.2}%) below threshold {threshold:.4} ({thr_pct:.2}%) ({local_pages}/{total_pages} pages local)",
+                pct = observed * 100.0,
+                thr_pct = threshold * 100.0,
             ),
         ));
     }
@@ -1155,7 +1131,9 @@ pub fn assert_cross_node_migration(
             r.details.push(AssertDetail::new(
                 DetailKind::CrossNodeMigration,
                 format!(
-                    "cross-node migration ratio {ratio:.4} exceeds threshold {threshold:.4} ({migrated_pages}/{total_pages} pages migrated)",
+                    "cross-node migration ratio {ratio:.4} ({pct:.2}%) exceeds threshold {threshold:.4} ({thr_pct:.2}%) ({migrated_pages}/{total_pages} pages migrated)",
+                    pct = ratio * 100.0,
+                    thr_pct = threshold * 100.0,
                 ),
             ));
         }
@@ -1431,6 +1409,49 @@ impl Assert {
             max_cross_node_migration_ratio: None,
             max_slow_tier_ratio: None,
         }
+    }
+
+    /// Build a fresh [`Verdict`] under this `Assert`'s threshold
+    /// config. The returned accumulator carries no claim records; call
+    /// the typed `claim_<field>` methods generated by
+    /// [`#[derive(Claim)]`](ktstr_macros::Claim) on stats structs as
+    /// `stats.claim_<field>(&mut verdict)`, or use the
+    /// [`claim!`](crate::claim) macro on a local/expression, then
+    /// call [`Verdict::into_result`] to produce the final
+    /// [`AssertResult`].
+    ///
+    /// This is the entry point of the pointwise-claim API. The
+    /// `Assert` itself remains pure threshold config and stays
+    /// `Copy`; per-test claims accumulate on the returned `Verdict`,
+    /// which owns its own buffers (details, stats).
+    ///
+    /// ```
+    /// # use ktstr::assert::Assert;
+    /// let r = Assert::defaults().verdict().into_result();
+    /// assert!(r.passed, "no claims means passing verdict");
+    /// ```
+    pub fn verdict(self) -> Verdict {
+        Verdict::with_assert(self)
+    }
+
+    /// Identity-element constructor (equivalent to [`Self::NO_OVERRIDES`]).
+    ///
+    /// Replaces `NO_OVERRIDES` as the canonical name in the new
+    /// claim-API surface — the constant remains available for
+    /// merge-chain composition; `empty()` is the method-style entry
+    /// point that pairs naturally with `.verdict()` for tests that
+    /// don't want any threshold defaults to fire.
+    pub const fn empty() -> Self {
+        Self::NO_OVERRIDES
+    }
+
+    /// Default-checks constructor (equivalent to [`Self::default_checks`]).
+    ///
+    /// Method-style alias for the existing const fn; pairs with
+    /// `.verdict()` so the canonical entry point reads
+    /// `Assert::defaults().verdict()`.
+    pub const fn defaults() -> Self {
+        Self::default_checks()
     }
 
     pub const fn check_not_starved(mut self) -> Self {
@@ -1731,6 +1752,790 @@ impl Assert {
     }
 }
 
+// ============================================================================
+// Pointwise claim API
+// ----------------------------------------------------------------------------
+//
+// `Verdict` is the pointwise-claim accumulator. `Assert` holds threshold
+// config and stays `Copy`; `Verdict` carries the per-test claim records
+// (which include `Vec`/`String` allocations) and is built via
+// `Assert::defaults().verdict()` or `Verdict::new()`.
+//
+// Test authors reach for one of two compile-mechanical labelers:
+//
+//   1. Typed field accessors generated by `#[derive(Claim)]` on stats
+//      structs — e.g. `stats.claim_max_gap_ms(&mut verdict).at_most(100)`.
+//      The label `"max_gap_ms"` comes from `stringify!(max_gap_ms)` in
+//      the generated method body; renaming the field updates both the
+//      method name AND the rendered label, with the call site failing
+//      to compile if it references the old name. Method dispatch keys
+//      on the stats struct's type, so identical field names across
+//      distinct stats structs (e.g. `total_iterations` on both
+//      [`CgroupStats`] and [`ScenarioStats`]) do not collide.
+//
+//   2. The `claim!` macro on a local binding or expression — e.g.
+//      `claim!(verdict, iter_delta).at_least(100)` or
+//      `claim!(verdict, end - start).at_least(100)`. The label comes
+//      from `stringify!(<token tree>)` over the expression tokens —
+//      every token is a real Rust ident or operator the compiler
+//      validated, so the label cannot drift independent of the
+//      expression it labels.
+//
+// There is NO third "manual string" path. `Verdict` exposes no method
+// that takes a caller-supplied subject string, by design.
+//
+// Comparator surface for [`ClaimBuilder<T>`]:
+//   * `T: PartialOrd + Display` -> `at_least` / `at_most` / `lt` / `gt`
+//     / `between`
+//   * `T: PartialEq + Display`  -> `eq` / `ne`
+//   * `T = f64`                 -> `is_finite` / `near`
+//
+// Container claims (set / sequence) bypass scalar comparators and offer
+// `empty` / `nonempty` / `contains` / `len_eq` / `len_at_most` /
+// `len_at_least` / `subset_of` / `disjoint_from` instead. The
+// `#[derive(Claim)]` field-type detector emits `claim_<field>` returning
+// `SetClaim` / `SeqClaim` for `BTreeSet` / `Vec` fields and
+// `ClaimBuilder` for everything else. Map fields skip the derive; users
+// who need a map claim reach for `claim!(verdict, map.len())` or
+// `claim!(verdict, map.contains_key(&k))`.
+//
+// Comparators consume the builder and return `&mut Verdict`, so chains
+// look like `verdict.claim_a(s).at_most(N).claim_b(s).at_least(M)`. To
+// re-claim the same value with a different bound, write a fresh
+// `claim_a(s)` rather than chaining onto the prior comparator.
+
+/// Pointwise-claim accumulator.
+///
+/// Carries an [`AssertResult`] under the hood and exposes the same
+/// `passed` / `details` / `stats` shape on completion. Build via
+/// [`Verdict::new`] or [`Assert::verdict`]; finish with
+/// [`Verdict::into_result`].
+///
+/// ```
+/// # use ktstr::assert::{Assert, Verdict};
+/// // Empty verdict — no claims, passes.
+/// let v = Assert::defaults().verdict();
+/// let r = v.into_result();
+/// assert!(r.passed);
+/// ```
+#[must_use = "Verdict accumulates claims; call into_result() to consume"]
+#[derive(Debug, Clone)]
+pub struct Verdict {
+    /// Threshold config the verdict was opened against. Carried so
+    /// downstream merge sites (e.g. retrofitted `assert_not_starved`)
+    /// can read thresholds out of the verdict directly without an
+    /// extra parameter. Optional because [`Verdict::new`] does not
+    /// require an `Assert`; tests that only run pointwise claims
+    /// don't need a threshold layer attached.
+    assert: Option<Assert>,
+    /// Underlying [`AssertResult`] envelope — claim records and merged
+    /// upstream results write into this. Initialized as a passing
+    /// result at `new`; mutates as comparators record outcomes.
+    result: AssertResult,
+}
+
+impl Default for Verdict {
+    /// Equivalent to [`Verdict::new`]: no threshold config attached, no
+    /// claims accumulated.
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Verdict {
+    /// Empty accumulator with no [`Assert`] attached. Use when a test
+    /// is composing pointwise claims and does not care about the
+    /// scheduler-level threshold layer.
+    pub fn new() -> Self {
+        Self {
+            assert: None,
+            result: AssertResult::pass(),
+        }
+    }
+
+    /// Empty accumulator carrying `assert` for downstream lookup.
+    /// Reached via [`Assert::verdict`]; not part of the test author's
+    /// usual entry point.
+    pub fn with_assert(assert: Assert) -> Self {
+        Self {
+            assert: Some(assert),
+            result: AssertResult::pass(),
+        }
+    }
+
+    /// Open a per-claim builder for the named `(subject, value)` pair.
+    /// `name` is `&'static str` because the only legitimate sources for
+    /// a claim label are `stringify!(field)` (from the
+    /// [`#[derive(Claim)]`](ktstr_macros::Claim) generator) and
+    /// `stringify!(expr)` (from the [`claim!`](crate::claim) macro) —
+    /// both produce static string slices.
+    ///
+    /// Public so the `#[derive(Claim)]` generator and the `claim!`
+    /// macro can dispatch through it; not the recommended user-facing
+    /// entry point. Hand-typing `verdict.claim("subject", value)` is a
+    /// design violation — the team rejected manual labels because they
+    /// drift independent of the value they label. Use the derive or
+    /// the macro instead.
+    #[doc(hidden)]
+    pub fn claim<T>(&mut self, name: &'static str, value: T) -> ClaimBuilder<'_, T> {
+        ClaimBuilder {
+            verdict: self,
+            name,
+            value,
+            kind: DetailKind::Other,
+            reason: None,
+        }
+    }
+
+    /// Open a per-claim builder for a set-typed value. Same naming
+    /// rules as [`Self::claim`]; the [`#[derive(Claim)]`](ktstr_macros::Claim)
+    /// generator emits accessors that route through this dispatch
+    /// helper for `BTreeSet<T>` fields.
+    #[doc(hidden)]
+    pub fn claim_set<'a, T: Ord + std::fmt::Debug>(
+        &'a mut self,
+        name: &'static str,
+        set: &'a BTreeSet<T>,
+    ) -> SetClaim<'a, T> {
+        SetClaim {
+            verdict: self,
+            name,
+            value: set,
+            kind: DetailKind::Other,
+            reason: None,
+        }
+    }
+
+    /// Open a per-claim builder for a sequence-typed value. Same naming
+    /// rules as [`Self::claim`]; the [`#[derive(Claim)]`](ktstr_macros::Claim)
+    /// generator emits accessors that route through this dispatch
+    /// helper for `Vec<T>` and slice fields.
+    #[doc(hidden)]
+    pub fn claim_seq<'a, T: std::fmt::Debug>(
+        &'a mut self,
+        name: &'static str,
+        seq: &'a [T],
+    ) -> SeqClaim<'a, T> {
+        SeqClaim {
+            verdict: self,
+            name,
+            value: seq,
+            kind: DetailKind::Other,
+            reason: None,
+        }
+    }
+
+    /// Append an informational note to the underlying [`AssertResult`]
+    /// without altering the verdict. Mirrors [`AssertResult::note`].
+    pub fn note(&mut self, msg: impl Into<String>) -> &mut Self {
+        self.result.note(msg);
+        self
+    }
+
+    /// Mark the verdict as skipped with the supplied reason. Mirrors
+    /// [`AssertResult::skip`] semantics: `passed` stays `true`, the
+    /// skip reason is recorded as a [`DetailKind::Skip`] detail. Use
+    /// when a precondition is missing and the scenario cannot run.
+    pub fn skip(&mut self, reason: &'static str) -> &mut Self {
+        self.result.skipped = true;
+        self.result.details.push(AssertDetail::new(DetailKind::Skip, reason));
+        self
+    }
+
+    /// Conditional skip: skip with `reason` when `cond` is true; no-op
+    /// otherwise. Convenience over `if cond { v.skip(reason); }`.
+    pub fn skip_if(&mut self, cond: bool, reason: &'static str) -> &mut Self {
+        if cond {
+            self.skip(reason);
+        }
+        self
+    }
+
+    /// Fold an external [`AssertResult`] into this verdict. Useful when
+    /// a test combines pointwise claims with the result of an upstream
+    /// `assert_*` call (e.g. `assert_not_starved`). Mirrors
+    /// [`AssertResult::merge`] semantics — `passed` is conjoined,
+    /// `details` concatenate, aggregate stats adopt the worst per
+    /// dimension.
+    pub fn merge(&mut self, other: AssertResult) -> &mut Self {
+        self.result.merge(other);
+        self
+    }
+
+    /// True iff every claim recorded so far passed and no merged
+    /// upstream result reported a failure. Read-only.
+    pub fn passed(&self) -> bool {
+        self.result.passed
+    }
+
+    /// Number of details (failures, notes, skips) recorded so far.
+    pub fn detail_count(&self) -> usize {
+        self.result.details.len()
+    }
+
+    /// Read the [`Assert`] threshold config attached at construction
+    /// time, if any. `None` when the verdict was built via
+    /// [`Verdict::new`] (no threshold layer).
+    pub fn assert(&self) -> Option<&Assert> {
+        self.assert.as_ref()
+    }
+
+    /// Consume the accumulator and return the merged [`AssertResult`].
+    /// Terminal — chain `.into_result()` at the end of a fluent claim
+    /// sequence to feed the result into the test return value.
+    pub fn into_result(self) -> AssertResult {
+        self.result
+    }
+
+    /// Internal: record one claim outcome (pass = no detail, fail =
+    /// push detail with `kind` and conjoin `passed`). Shared by every
+    /// comparator on every builder type.
+    fn record(&mut self, outcome: ClaimOutcome) {
+        if let ClaimOutcome::Fail { kind, message } = outcome {
+            self.result.passed = false;
+            self.result
+                .details
+                .push(AssertDetail::new(kind, message));
+        }
+    }
+}
+
+/// Outcome of a single comparator. `Pass` is the no-allocation arm;
+/// `Fail` carries the formatted failure message and its [`DetailKind`].
+enum ClaimOutcome {
+    Pass,
+    Fail { kind: DetailKind, message: String },
+}
+
+/// Per-claim builder for scalar values. Produced by [`Verdict::claim`]
+/// (and the typed `claim_<field>` accessors generated by
+/// [`#[derive(Claim)]`](ktstr_macros::Claim)). Chain a comparator
+/// (`at_least`, `at_most`, `lt`, `gt`, `between`, `eq`, `ne`,
+/// `is_finite`, `near`) to record the outcome.
+#[must_use = "ClaimBuilder records nothing until a comparator is invoked"]
+pub struct ClaimBuilder<'a, T> {
+    verdict: &'a mut Verdict,
+    name: &'static str,
+    value: T,
+    kind: DetailKind,
+    reason: Option<&'a str>,
+}
+
+impl<'a, T> ClaimBuilder<'a, T> {
+    /// Override the [`DetailKind`] used on failure. Defaults to
+    /// [`DetailKind::Other`]; tests with a structural category set it
+    /// here so downstream `kind`-based filters route the failure
+    /// correctly.
+    pub fn kind(mut self, kind: DetailKind) -> Self {
+        self.kind = kind;
+        self
+    }
+
+    /// Attach a human-readable rationale appended to the failure
+    /// message as `(reason)`. No effect on the pass path. Use to
+    /// record *why* the bound matters so a regression two months
+    /// later carries original intent in its diagnostic.
+    pub fn because(mut self, reason: &'a str) -> Self {
+        self.reason = Some(reason);
+        self
+    }
+}
+
+/// Append the optional `reason` to a failure message, returning the
+/// final formatted string. Centralized so every comparator's failure
+/// arm shares one definition of "( reason )" appendix formatting.
+fn append_reason(msg: String, reason: Option<&str>) -> String {
+    match reason {
+        Some(r) => format!("{msg} ({r})"),
+        None => msg,
+    }
+}
+
+impl<'a, T> ClaimBuilder<'a, T>
+where
+    T: PartialEq + std::fmt::Display,
+{
+    /// Pass when `value == expected`; fail with
+    /// `<name>: expected <expected>, was <value>` otherwise.
+    ///
+    /// **NaN gotcha** (only relevant for `T = f64`): IEEE 754 says
+    /// `NaN == NaN` is `false`. Use `is_finite` or
+    /// [`claim!`](crate::claim) on `value.is_nan()` instead.
+    pub fn eq(self, expected: T) -> &'a mut Verdict {
+        let ClaimBuilder { verdict, name, value, kind, reason } = self;
+        let outcome = if value == expected {
+            ClaimOutcome::Pass
+        } else {
+            let msg = append_reason(
+                format!("{name}: expected {expected}, was {value}"),
+                reason,
+            );
+            ClaimOutcome::Fail { kind, message: msg }
+        };
+        verdict.record(outcome);
+        verdict
+    }
+
+    /// Pass when `value != forbidden`; fail with
+    /// `<name>: expected != <forbidden>, was <value>` otherwise.
+    pub fn ne(self, forbidden: T) -> &'a mut Verdict {
+        let ClaimBuilder { verdict, name, value, kind, reason } = self;
+        let outcome = if value != forbidden {
+            ClaimOutcome::Pass
+        } else {
+            let msg = append_reason(
+                format!("{name}: expected != {forbidden}, was {value}"),
+                reason,
+            );
+            ClaimOutcome::Fail { kind, message: msg }
+        };
+        verdict.record(outcome);
+        verdict
+    }
+}
+
+impl<'a, T> ClaimBuilder<'a, T>
+where
+    T: PartialOrd + std::fmt::Display,
+{
+    /// Pass when `value >= floor`; fail with `<name>: expected at
+    /// least <floor>, was <value>` otherwise.
+    pub fn at_least(self, floor: T) -> &'a mut Verdict {
+        let ClaimBuilder { verdict, name, value, kind, reason } = self;
+        let outcome = if value >= floor {
+            ClaimOutcome::Pass
+        } else {
+            let msg = append_reason(
+                format!("{name}: expected at least {floor}, was {value}"),
+                reason,
+            );
+            ClaimOutcome::Fail { kind, message: msg }
+        };
+        verdict.record(outcome);
+        verdict
+    }
+
+    /// Pass when `value <= ceiling`; fail with `<name>: expected at
+    /// most <ceiling>, was <value>` otherwise.
+    pub fn at_most(self, ceiling: T) -> &'a mut Verdict {
+        let ClaimBuilder { verdict, name, value, kind, reason } = self;
+        let outcome = if value <= ceiling {
+            ClaimOutcome::Pass
+        } else {
+            let msg = append_reason(
+                format!("{name}: expected at most {ceiling}, was {value}"),
+                reason,
+            );
+            ClaimOutcome::Fail { kind, message: msg }
+        };
+        verdict.record(outcome);
+        verdict
+    }
+
+    /// Pass when `value < ceiling`; fail otherwise.
+    pub fn lt(self, ceiling: T) -> &'a mut Verdict {
+        let ClaimBuilder { verdict, name, value, kind, reason } = self;
+        let outcome = if value < ceiling {
+            ClaimOutcome::Pass
+        } else {
+            let msg = append_reason(
+                format!("{name}: expected less than {ceiling}, was {value}"),
+                reason,
+            );
+            ClaimOutcome::Fail { kind, message: msg }
+        };
+        verdict.record(outcome);
+        verdict
+    }
+
+    /// Pass when `value > floor`; fail otherwise.
+    pub fn gt(self, floor: T) -> &'a mut Verdict {
+        let ClaimBuilder { verdict, name, value, kind, reason } = self;
+        let outcome = if value > floor {
+            ClaimOutcome::Pass
+        } else {
+            let msg = append_reason(
+                format!("{name}: expected greater than {floor}, was {value}"),
+                reason,
+            );
+            ClaimOutcome::Fail { kind, message: msg }
+        };
+        verdict.record(outcome);
+        verdict
+    }
+
+    /// Pass when `lo <= value <= hi` (inclusive on both ends). Fails
+    /// with caller-error message when `lo > hi`.
+    pub fn between(self, lo: T, hi: T) -> &'a mut Verdict {
+        let ClaimBuilder { verdict, name, value, kind, reason } = self;
+        let outcome = if lo > hi {
+            let msg = append_reason(
+                format!("{name}: caller error: interval inverted (lo={lo} > hi={hi})"),
+                reason,
+            );
+            ClaimOutcome::Fail { kind, message: msg }
+        } else if value >= lo && value <= hi {
+            ClaimOutcome::Pass
+        } else {
+            let msg = append_reason(
+                format!("{name}: expected in [{lo}, {hi}], was {value}"),
+                reason,
+            );
+            ClaimOutcome::Fail { kind, message: msg }
+        };
+        verdict.record(outcome);
+        verdict
+    }
+}
+
+impl<'a> ClaimBuilder<'a, f64> {
+    /// Pass when the value is finite (neither NaN nor ±Infinity).
+    pub fn is_finite(self) -> &'a mut Verdict {
+        let ClaimBuilder { verdict, name, value, kind, reason } = self;
+        let outcome = if value.is_finite() {
+            ClaimOutcome::Pass
+        } else {
+            let msg = append_reason(
+                format!("{name}: expected finite, was {value}"),
+                reason,
+            );
+            ClaimOutcome::Fail { kind, message: msg }
+        };
+        verdict.record(outcome);
+        verdict
+    }
+
+    /// Pass when `(value - target).abs() <= tolerance`. `value ==
+    /// target` short-circuits as a pass before the subtraction so
+    /// `±inf == ±inf` reads as a match. Negative `tolerance` is a
+    /// caller bug — the failure message names it.
+    pub fn near(self, target: f64, tolerance: f64) -> &'a mut Verdict {
+        let ClaimBuilder { verdict, name, value, kind, reason } = self;
+        let outcome = if tolerance < 0.0 {
+            let msg = append_reason(
+                format!("{name}: caller error: tolerance negative (={tolerance})"),
+                reason,
+            );
+            ClaimOutcome::Fail { kind, message: msg }
+        } else if value == target || (value - target).abs() <= tolerance {
+            ClaimOutcome::Pass
+        } else {
+            let msg = append_reason(
+                format!("{name}: expected near {target} (±{tolerance}), was {value}"),
+                reason,
+            );
+            ClaimOutcome::Fail { kind, message: msg }
+        };
+        verdict.record(outcome);
+        verdict
+    }
+}
+
+/// Per-claim builder for `BTreeSet<T>` values. Same `kind` / `because`
+/// modifiers as [`ClaimBuilder`]; comparator surface is set-specific.
+#[must_use = "SetClaim records nothing until a comparator is invoked"]
+pub struct SetClaim<'a, T: Ord + std::fmt::Debug> {
+    verdict: &'a mut Verdict,
+    name: &'static str,
+    value: &'a BTreeSet<T>,
+    kind: DetailKind,
+    reason: Option<&'a str>,
+}
+
+impl<'a, T: Ord + std::fmt::Debug> SetClaim<'a, T> {
+    pub fn kind(mut self, kind: DetailKind) -> Self {
+        self.kind = kind;
+        self
+    }
+    pub fn because(mut self, reason: &'a str) -> Self {
+        self.reason = Some(reason);
+        self
+    }
+
+    /// Pass iff the set is empty.
+    pub fn empty(self) -> &'a mut Verdict {
+        let SetClaim { verdict, name, value, kind, reason } = self;
+        let outcome = if value.is_empty() {
+            ClaimOutcome::Pass
+        } else {
+            let msg = append_reason(format!("{name}: expected empty, was {value:?}"), reason);
+            ClaimOutcome::Fail { kind, message: msg }
+        };
+        verdict.record(outcome);
+        verdict
+    }
+
+    /// Pass iff the set is non-empty.
+    pub fn nonempty(self) -> &'a mut Verdict {
+        let SetClaim { verdict, name, value, kind, reason } = self;
+        let outcome = if !value.is_empty() {
+            ClaimOutcome::Pass
+        } else {
+            let msg = append_reason(format!("{name}: expected non-empty, was empty"), reason);
+            ClaimOutcome::Fail { kind, message: msg }
+        };
+        verdict.record(outcome);
+        verdict
+    }
+
+    /// Pass iff the set contains `needle`.
+    pub fn contains(self, needle: &T) -> &'a mut Verdict {
+        let SetClaim { verdict, name, value, kind, reason } = self;
+        let outcome = if value.contains(needle) {
+            ClaimOutcome::Pass
+        } else {
+            let msg = append_reason(
+                format!("{name}: expected to contain {needle:?}, set was {value:?}"),
+                reason,
+            );
+            ClaimOutcome::Fail { kind, message: msg }
+        };
+        verdict.record(outcome);
+        verdict
+    }
+
+    /// Pass iff `set.len() == n`.
+    pub fn len_eq(self, n: usize) -> &'a mut Verdict {
+        let SetClaim { verdict, name, value, kind, reason } = self;
+        let actual = value.len();
+        let outcome = if actual == n {
+            ClaimOutcome::Pass
+        } else {
+            let msg = append_reason(
+                format!("{name}: expected len == {n}, was {actual}"),
+                reason,
+            );
+            ClaimOutcome::Fail { kind, message: msg }
+        };
+        verdict.record(outcome);
+        verdict
+    }
+
+    /// Pass iff `set.len() <= n`.
+    pub fn len_at_most(self, n: usize) -> &'a mut Verdict {
+        let SetClaim { verdict, name, value, kind, reason } = self;
+        let actual = value.len();
+        let outcome = if actual <= n {
+            ClaimOutcome::Pass
+        } else {
+            let msg = append_reason(
+                format!("{name}: expected len <= {n}, was {actual}"),
+                reason,
+            );
+            ClaimOutcome::Fail { kind, message: msg }
+        };
+        verdict.record(outcome);
+        verdict
+    }
+
+    /// Pass iff `set.len() >= n`.
+    pub fn len_at_least(self, n: usize) -> &'a mut Verdict {
+        let SetClaim { verdict, name, value, kind, reason } = self;
+        let actual = value.len();
+        let outcome = if actual >= n {
+            ClaimOutcome::Pass
+        } else {
+            let msg = append_reason(
+                format!("{name}: expected len >= {n}, was {actual}"),
+                reason,
+            );
+            ClaimOutcome::Fail { kind, message: msg }
+        };
+        verdict.record(outcome);
+        verdict
+    }
+
+    /// Pass iff every element of `value` is in `whitelist`. Fails with
+    /// the offending elements listed.
+    pub fn subset_of(self, whitelist: &BTreeSet<T>) -> &'a mut Verdict {
+        let SetClaim { verdict, name, value, kind, reason } = self;
+        let bad: Vec<&T> = value.iter().filter(|x| !whitelist.contains(x)).collect();
+        let outcome = if bad.is_empty() {
+            ClaimOutcome::Pass
+        } else {
+            let msg = append_reason(
+                format!(
+                    "{name}: expected subset of {whitelist:?}, but {bad:?} are not in the set"
+                ),
+                reason,
+            );
+            ClaimOutcome::Fail { kind, message: msg }
+        };
+        verdict.record(outcome);
+        verdict
+    }
+
+    /// Pass iff `value` shares no element with `forbidden`. Fails with
+    /// the offending elements listed.
+    pub fn disjoint_from(self, forbidden: &BTreeSet<T>) -> &'a mut Verdict {
+        let SetClaim { verdict, name, value, kind, reason } = self;
+        let bad: Vec<&T> = value.iter().filter(|x| forbidden.contains(x)).collect();
+        let outcome = if bad.is_empty() {
+            ClaimOutcome::Pass
+        } else {
+            let msg = append_reason(
+                format!(
+                    "{name}: expected disjoint from {forbidden:?}, but {bad:?} are present in both"
+                ),
+                reason,
+            );
+            ClaimOutcome::Fail { kind, message: msg }
+        };
+        verdict.record(outcome);
+        verdict
+    }
+}
+
+/// Per-claim builder for slice / `Vec<T>` values. Same modifier
+/// surface as [`SetClaim`]; comparator surface is sequence-specific.
+#[must_use = "SeqClaim records nothing until a comparator is invoked"]
+pub struct SeqClaim<'a, T: std::fmt::Debug> {
+    verdict: &'a mut Verdict,
+    name: &'static str,
+    value: &'a [T],
+    kind: DetailKind,
+    reason: Option<&'a str>,
+}
+
+impl<'a, T: std::fmt::Debug> SeqClaim<'a, T> {
+    pub fn kind(mut self, kind: DetailKind) -> Self {
+        self.kind = kind;
+        self
+    }
+    pub fn because(mut self, reason: &'a str) -> Self {
+        self.reason = Some(reason);
+        self
+    }
+
+    /// Pass iff the sequence is empty.
+    pub fn empty(self) -> &'a mut Verdict {
+        let SeqClaim { verdict, name, value, kind, reason } = self;
+        let outcome = if value.is_empty() {
+            ClaimOutcome::Pass
+        } else {
+            let msg = append_reason(format!("{name}: expected empty, was {value:?}"), reason);
+            ClaimOutcome::Fail { kind, message: msg }
+        };
+        verdict.record(outcome);
+        verdict
+    }
+
+    /// Pass iff the sequence is non-empty.
+    pub fn nonempty(self) -> &'a mut Verdict {
+        let SeqClaim { verdict, name, value, kind, reason } = self;
+        let outcome = if !value.is_empty() {
+            ClaimOutcome::Pass
+        } else {
+            let msg = append_reason(format!("{name}: expected non-empty, was empty"), reason);
+            ClaimOutcome::Fail { kind, message: msg }
+        };
+        verdict.record(outcome);
+        verdict
+    }
+
+    /// Pass iff the sequence contains an element equal to `needle`.
+    pub fn contains(self, needle: &T) -> &'a mut Verdict
+    where
+        T: PartialEq,
+    {
+        let SeqClaim { verdict, name, value, kind, reason } = self;
+        let outcome = if value.iter().any(|x| x == needle) {
+            ClaimOutcome::Pass
+        } else {
+            let msg = append_reason(
+                format!("{name}: expected to contain {needle:?}, sequence was {value:?}"),
+                reason,
+            );
+            ClaimOutcome::Fail { kind, message: msg }
+        };
+        verdict.record(outcome);
+        verdict
+    }
+
+    /// Pass iff `seq.len() == n`.
+    pub fn len_eq(self, n: usize) -> &'a mut Verdict {
+        let SeqClaim { verdict, name, value, kind, reason } = self;
+        let actual = value.len();
+        let outcome = if actual == n {
+            ClaimOutcome::Pass
+        } else {
+            let msg = append_reason(
+                format!("{name}: expected len == {n}, was {actual}"),
+                reason,
+            );
+            ClaimOutcome::Fail { kind, message: msg }
+        };
+        verdict.record(outcome);
+        verdict
+    }
+
+    /// Pass iff `seq.len() <= n`.
+    pub fn len_at_most(self, n: usize) -> &'a mut Verdict {
+        let SeqClaim { verdict, name, value, kind, reason } = self;
+        let actual = value.len();
+        let outcome = if actual <= n {
+            ClaimOutcome::Pass
+        } else {
+            let msg = append_reason(
+                format!("{name}: expected len <= {n}, was {actual}"),
+                reason,
+            );
+            ClaimOutcome::Fail { kind, message: msg }
+        };
+        verdict.record(outcome);
+        verdict
+    }
+
+    /// Pass iff `seq.len() >= n`.
+    pub fn len_at_least(self, n: usize) -> &'a mut Verdict {
+        let SeqClaim { verdict, name, value, kind, reason } = self;
+        let actual = value.len();
+        let outcome = if actual >= n {
+            ClaimOutcome::Pass
+        } else {
+            let msg = append_reason(
+                format!("{name}: expected len >= {n}, was {actual}"),
+                reason,
+            );
+            ClaimOutcome::Fail { kind, message: msg }
+        };
+        verdict.record(outcome);
+        verdict
+    }
+}
+
+/// Open a [`Verdict`] claim from a local binding or expression. The
+/// label is `stringify!(<expr-tokens>)` so a regression that renames
+/// the binding or alters the expression updates the rendered failure
+/// message in lock-step.
+///
+/// Use as `claim!(verdict, my_local).at_most(N)` or
+/// `claim!(verdict, end - start).at_least(N)`. For struct fields under
+/// a `#[derive(Claim)]`, prefer the typed accessor
+/// (`verdict.claim_<field>(s)`) — the macro is the escape hatch when
+/// no derived accessor exists.
+///
+/// Expanded form: `verdict.claim(stringify!(expr), expr)`. The macro
+/// is a thin wrapper so `Verdict::claim`'s `'static` label invariant
+/// holds (string literals from `stringify!` always have `'static`
+/// lifetime).
+///
+/// ```
+/// # use ktstr::{assert::Verdict, claim};
+/// let mut v = Verdict::new();
+/// let answer = 42u64;
+/// claim!(v, answer).at_least(40);
+/// claim!(v, answer * 2).at_most(100);
+/// let r = v.into_result();
+/// assert!(r.passed);
+/// ```
+#[macro_export]
+macro_rules! claim {
+    ($verdict:expr, $value:expr) => {
+        $verdict.claim(stringify!($value), $value)
+    };
+}
+
 /// Check that workers only ran on CPUs in `expected`.
 ///
 /// Any worker that used a CPU outside the expected set produces a
@@ -1803,12 +2608,27 @@ pub fn assert_isolation(reports: &[WorkerReport], expected: &BTreeSet<usize>) ->
 /// previous formulation, `ceil(n * 0.99)` without the `-1`, was
 /// off-by-one and returned the max for `n = 100`.
 ///
-/// Callers must pass a sorted non-empty slice; an empty slice yields
-/// `0` (the caller should short-circuit before invoking).
+/// # Preconditions
+///
+/// `sorted` must be non-decreasing. The function indexes by rank
+/// without checking order, so an unsorted input silently returns
+/// the value at the computed index — a meaningless number. A
+/// `debug_assert!` enforces this in debug builds; release builds
+/// skip the check (the production callers sort immediately upstream
+/// — `assert_not_starved` and `assert_benchmarks` both
+/// `sorted.sort_unstable()` before this call — so the runtime
+/// guard is unnecessary in production paths).
+///
+/// An empty slice yields `0` (the caller should short-circuit
+/// before invoking).
 fn percentile(sorted: &[u64], p: f64) -> u64 {
     if sorted.is_empty() {
         return 0;
     }
+    debug_assert!(
+        sorted.windows(2).all(|w| w[0] <= w[1]),
+        "percentile() requires sorted input; got slice with out-of-order pair",
+    );
     let n = sorted.len();
     let idx = ((n as f64 * p).ceil() as usize)
         .saturating_sub(1)
@@ -1901,7 +2721,7 @@ pub fn assert_not_starved(reports: &[WorkerReport]) -> AssertResult {
         0.0
     };
 
-    let mut cg = CgroupStats {
+    let cg = CgroupStats {
         num_workers: reports.len(),
         num_cpus: cpus.len(),
         avg_off_cpu_pct: avg,
@@ -1920,34 +2740,35 @@ pub fn assert_not_starved(reports: &[WorkerReport]) -> AssertResult {
         worst_run_delay_us: worst_run_delay,
         page_locality: 0.0,
         cross_node_migration_ratio: 0.0,
-        wake_latency_tail_ratio: 0.0,
-        iterations_per_worker: 0.0,
         ext_metrics: BTreeMap::new(),
     };
-    // Centralize derived-ratio computation so both production and
-    // future test-fixture construction paths share one definition
-    // of "no samples yet" vs "zero latency" (the divide-by-zero
-    // guard lives in `derive_ratios`).
-    cg.derive_ratios();
 
-    // Per-cgroup fairness: spread above threshold means unequal scheduling within a cgroup
+    // Per-cgroup fairness: spread above threshold means unequal scheduling within a cgroup.
+    // Threshold is appended to the message so the detail carries the exact bound the
+    // observed spread crossed, matching the AssertPlan custom-spread path's format
+    // and giving the operator the gate value without re-grepping `show-thresholds`.
     let spread_limit = spread_threshold_pct();
     if spread > spread_limit && pcts.len() >= 2 {
         r.passed = false;
         r.details.push(AssertDetail::new(
             DetailKind::Unfair,
             format!(
-                "unfair cgroup: spread={:.0}% ({:.0}-{:.0}%) {} workers on {} cpus",
+                "unfair cgroup: spread={:.0}% ({:.0}-{:.0}%) {} workers on {} cpus (threshold {:.0}%)",
                 spread,
                 min,
                 max,
                 reports.len(),
                 cpus.len(),
+                spread_limit,
             ),
         ));
     }
 
-    // Scheduling gap: >threshold = dispatch failure
+    // Scheduling gap: >threshold = dispatch failure. The tid is included so an
+    // operator triaging a multi-worker cgroup can identify the affected worker
+    // without cross-referencing CPU placement; matches the `tid X starved` /
+    // `tid X ran on unexpected CPUs` shape used by the sibling diagnostics.
+    // Threshold is appended for parity with the AssertPlan custom-gap path.
     let gap_limit = gap_threshold_ms();
     for w in reports {
         if w.max_gap_ms > gap_limit {
@@ -1955,8 +2776,8 @@ pub fn assert_not_starved(reports: &[WorkerReport]) -> AssertResult {
             r.details.push(AssertDetail::new(
                 DetailKind::Stuck,
                 format!(
-                    "stuck {}ms on cpu{} at +{}ms",
-                    w.max_gap_ms, w.max_gap_cpu, w.max_gap_at_ms
+                    "tid {} stuck {}ms on cpu{} at +{}ms (threshold {}ms)",
+                    w.tid, w.max_gap_ms, w.max_gap_cpu, w.max_gap_at_ms, gap_limit,
                 ),
             ));
         }
@@ -1979,8 +2800,8 @@ pub fn assert_not_starved(reports: &[WorkerReport]) -> AssertResult {
         worst_run_delay_us: cg.worst_run_delay_us,
         worst_page_locality: 0.0,
         worst_cross_node_migration_ratio: 0.0,
-        worst_wake_latency_tail_ratio: cg.wake_latency_tail_ratio,
-        worst_iterations_per_worker: cg.iterations_per_worker,
+        worst_wake_latency_tail_ratio: cg.wake_latency_tail_ratio(),
+        worst_iterations_per_worker: cg.iterations_per_worker(),
         ext_metrics: cg.ext_metrics.clone(),
         cgroups: vec![cg],
     };
@@ -2190,590 +3011,21 @@ pub fn assert_benchmarks(
     r
 }
 
-// ===========================================================================
-// Rich assertion primitives: `Expect` + `Checks`
-// ===========================================================================
-//
-// `assert_not_starved`, `assert_isolation`, and the other free functions
-// above own scenario-level pass/fail evaluation across worker reports —
-// they consume entire `&[WorkerReport]` slices and roll up many
-// individual signals into a single `AssertResult`. They are not the
-// right tool when a test wants to make a handful of pointwise claims:
-// "this counter is at least N, this rate is between A and B, this
-// metric is finite". The ad-hoc pattern at every call site that needs
-// this — manually constructing `AssertResult::pass()`, mutating
-// `passed = false`, pushing a `format!`-built `AssertDetail`, repeating
-// for the next claim — is verbose and drops the subject name from
-// the failure message unless the author hand-types it twice.
-//
-// `Expect` and `Checks` provide an alternative API for the
-// pointwise-comparison case. Both produce `AssertResult` (the
-// existing verdict envelope) so they compose with `merge` and
-// flow through every existing consumer unchanged. `Expect::that(name,
-// value)` is the standalone form for a single comparison; `Checks`
-// is the accumulator for multiple comparisons against one snapshot.
-// `AssertResult::passed` remains pub and direct mutation remains
-// possible — these helpers do not seal that surface, they just
-// make the comparator path less repetitive.
-//
-// Design choices, and why:
-//
-// * **Subject name is mandatory.** Every comparison takes a `name:
-//   &str` so the failure message ALWAYS reads "<name>: expected …,
-//   was …" without the author retyping the subject. A nameless
-//   comparator would let a test fail with "expected 100, was 42"
-//   and leave the operator guessing which counter was 42.
-//
-// * **`AssertResult` is the output type, not a parallel verdict
-//   shape.** Every comparator either returns `AssertResult` directly
-//   (`Expect`) or mutates an `AssertResult` accumulator (`Checks`).
-//   No new pass/fail envelope. This keeps `merge`, `skipped`,
-//   `details`, `stats`, and the `serde` wire format as the single
-//   source of truth.
-//
-// * **`DetailKind::Other` is the default.** Pointwise comparisons
-//   are not categorized failures — they're "this specific claim
-//   was false". Callers that DO have a kind (Benchmark, Migration,
-//   etc.) override via `.kind(DetailKind::Benchmark)` on the per-
-//   check builder. Defaulting to `Other` matches the
-//   `AssertResult::fail_msg` short-cut and avoids forcing every
-//   call site to pick a kind for a generic claim.
-//
-// * **Generic over `T: PartialOrd + Display`** for the core
-//   comparators. Float-specific predicates (`is_finite`, `near`)
-//   live on a `where T = f64` impl block so they're discoverable
-//   without polluting the integer-comparator surface.
-//
-// * **No early-return / panic.** Every failed comparator records a
-//   `Detail` and continues — the test author runs ALL claims and
-//   sees every diagnostic at once, not just the first failure.
-//   Tests that genuinely want short-circuit branch on
-//   [`AssertResult::passed`] (or [`AssertResult::is_failed`]) and
-//   skip subsequent claims explicitly; `AssertResult` does not
-//   implement [`std::ops::Try`], so the `?` operator is not
-//   available.
-//
-// * **No allocation on the pass path.** A passing comparator does
-//   not push a detail and does not format any string — the
-//   `format!` in the failure arm is the only allocation, and it
-//   only fires when the comparison actually fails. Verified by
-//   `expect_eq_pass_returns_passing_result` and
-//   `checks_single_passing_claim_remains_passing` below.
-
-/// Subject under test, paired with the value it produced.
-///
-/// Chain a comparator (`eq`, `lt`, `between`, `is_finite`, …) to
-/// produce an [`AssertResult`]. Subject `name` is included in the
-/// failure message so a regression reads "<name>: expected …, was
-/// …" without the author retyping the subject.
-///
-/// ```
-/// # use ktstr::assert::Expect;
-/// // Pass — counter is at or above the floor.
-/// let r = Expect::that("worker.iterations", 100u64).at_least(100);
-/// assert!(r.passed);
-///
-/// // Fail — value is below the floor; the detail names the subject.
-/// let r = Expect::that("worker.iterations", 42u64).at_least(100);
-/// assert!(!r.passed);
-/// assert!(r.details[0].message.contains("worker.iterations"));
-/// assert!(r.details[0].message.contains("at least 100"));
-/// ```
-#[must_use = "Expect::that returns a builder; chain a comparator (eq, lt, …) to produce an AssertResult"]
-pub struct Expect<'a, T> {
-    name: &'a str,
-    value: T,
-    kind: DetailKind,
-    /// Optional explanation appended to the failure message as
-    /// "(reason)". `None` is the no-allocation default; populated
-    /// only when the caller invokes [`Self::because`]. Read by
-    /// [`Self::fail`] when formatting the failure message.
-    reason: Option<&'a str>,
-}
-
-impl<'a, T> Expect<'a, T> {
-    /// Open a single-value comparison. `name` identifies the subject
-    /// in any failure message; `value` is the observed value to
-    /// compare against the chained comparator's threshold.
-    pub fn that(name: &'a str, value: T) -> Self {
-        Self {
-            name,
-            value,
-            kind: DetailKind::Other,
-            reason: None,
-        }
-    }
-
-    /// Override the [`DetailKind`] used on failure. Defaults to
-    /// [`DetailKind::Other`]; tests that have a structural category
-    /// (e.g. `DetailKind::Benchmark`) set it here so downstream
-    /// `kind`-based filters route the failure correctly.
-    pub fn kind(mut self, kind: DetailKind) -> Self {
-        self.kind = kind;
-        self
-    }
-
-    /// Attach a human-readable rationale that gets appended to
-    /// the failure message as "<comparator-message> (<reason>)".
-    /// Use to record *why* the threshold matters so a regression
-    /// gate hit two months later has the original intent in the
-    /// diagnostic, not just the comparator's mechanical text.
-    /// `reason` is borrowed; pass a `&str` literal or a borrow
-    /// from a stable buffer.
-    ///
-    /// Has no effect on the pass path — `because` only changes
-    /// what the failure message looks like; a passing comparator
-    /// still returns `AssertResult::pass()` with no allocation.
-    pub fn because(mut self, reason: &'a str) -> Self {
-        self.reason = Some(reason);
-        self
-    }
-
-    fn fail(&self, msg: String) -> AssertResult {
-        let final_msg = match self.reason {
-            Some(reason) => format!("{msg} ({reason})"),
-            None => msg,
-        };
-        AssertResult::fail(AssertDetail::new(self.kind, final_msg))
-    }
-}
-
-impl<T> Expect<'_, T>
-where
-    T: PartialEq + std::fmt::Display,
-{
-    /// Pass when `self.value == expected`; fail with
-    /// "<name>: expected <expected>, was <value>" otherwise.
-    ///
-    /// **NaN gotcha** (only relevant for `T = f64`): IEEE 754 says
-    /// `NaN == NaN` is `false`, so
-    /// `Expect::that("x", f64::NAN).eq(f64::NAN)` FAILS even though
-    /// both sides are textually identical. Tests asserting "this
-    /// number is NaN" must do `Expect::that("x.is_nan",
-    /// value.is_nan()).eq(true)` rather than `eq(f64::NAN)`. Mirrors
-    /// `==` semantics in plain Rust — `Expect` does not paper over
-    /// the IEEE 754 inequality contract.
-    pub fn eq(self, expected: T) -> AssertResult {
-        if self.value == expected {
-            AssertResult::pass()
-        } else {
-            let msg = format!(
-                "{}: expected {}, was {}",
-                self.name, expected, self.value
-            );
-            self.fail(msg)
-        }
-    }
-
-    /// Pass when `self.value != forbidden`; fail with
-    /// "<name>: expected != <forbidden>, was <value>" otherwise.
-    ///
-    /// **NaN gotcha** (only relevant for `T = f64`): IEEE 754 says
-    /// `NaN != NaN` is `true`, so
-    /// `Expect::that("x", f64::NAN).ne(f64::NAN)` PASSES even though
-    /// both sides are textually identical. The complement of the
-    /// `eq` gotcha — same root cause.
-    pub fn ne(self, forbidden: T) -> AssertResult {
-        if self.value != forbidden {
-            AssertResult::pass()
-        } else {
-            let msg = format!(
-                "{}: expected != {}, was {}",
-                self.name, forbidden, self.value
-            );
-            self.fail(msg)
-        }
-    }
-}
-
-impl<T> Expect<'_, T>
-where
-    T: PartialOrd + std::fmt::Display,
-{
-    /// Pass when `self.value >= floor`; fail with "<name>: expected
-    /// at least <floor>, was <value>" otherwise. Equivalent to a
-    /// "minimum" check; a value exactly equal to the floor passes.
-    pub fn at_least(self, floor: T) -> AssertResult {
-        if self.value >= floor {
-            AssertResult::pass()
-        } else {
-            let msg = format!(
-                "{}: expected at least {}, was {}",
-                self.name, floor, self.value
-            );
-            self.fail(msg)
-        }
-    }
-
-    /// Pass when `self.value <= ceiling`; fail with "<name>: expected
-    /// at most <ceiling>, was <value>" otherwise. Equivalent to a
-    /// "maximum" check; a value exactly equal to the ceiling passes.
-    pub fn at_most(self, ceiling: T) -> AssertResult {
-        if self.value <= ceiling {
-            AssertResult::pass()
-        } else {
-            let msg = format!(
-                "{}: expected at most {}, was {}",
-                self.name, ceiling, self.value
-            );
-            self.fail(msg)
-        }
-    }
-
-    /// Pass when `self.value < ceiling`; fail with "<name>: expected
-    /// less than <ceiling>, was <value>" otherwise.
-    pub fn lt(self, ceiling: T) -> AssertResult {
-        if self.value < ceiling {
-            AssertResult::pass()
-        } else {
-            let msg = format!(
-                "{}: expected less than {}, was {}",
-                self.name, ceiling, self.value
-            );
-            self.fail(msg)
-        }
-    }
-
-    /// Pass when `self.value > floor`; fail with "<name>: expected
-    /// greater than <floor>, was <value>" otherwise.
-    pub fn gt(self, floor: T) -> AssertResult {
-        if self.value > floor {
-            AssertResult::pass()
-        } else {
-            let msg = format!(
-                "{}: expected greater than {}, was {}",
-                self.name, floor, self.value
-            );
-            self.fail(msg)
-        }
-    }
-
-    /// Pass when `lo <= self.value <= hi` (inclusive on both ends).
-    /// Fails with "<name>: expected in [lo, hi], was <value>"
-    /// otherwise.
-    ///
-    /// `lo > hi` is a caller bug — the closed interval is empty so
-    /// every value fails. The comparator does not panic; instead it
-    /// fails with "<name>: caller error: interval inverted (lo=<lo>
-    /// > hi=<hi>)" so a typo surfaces as a named caller-error
-    /// message rather than a misleading "expected in [20, 10]" line
-    /// that reads as a real interval the value missed.
-    pub fn between(self, lo: T, hi: T) -> AssertResult {
-        if lo > hi {
-            let msg = format!(
-                "{}: caller error: interval inverted (lo={} > hi={})",
-                self.name, lo, hi
-            );
-            return self.fail(msg);
-        }
-        if self.value >= lo && self.value <= hi {
-            AssertResult::pass()
-        } else {
-            let msg = format!(
-                "{}: expected in [{}, {}], was {}",
-                self.name, lo, hi, self.value
-            );
-            self.fail(msg)
-        }
-    }
-}
-
-impl Expect<'_, f64> {
-    /// Pass when the value is finite (neither NaN nor ±Infinity).
-    /// Fails with "<name>: expected finite, was <value>" otherwise.
-    /// Useful immediately after a divide that may yield `NaN` (0/0)
-    /// or `Infinity` (x/0) so a regression that propagates a non-
-    /// finite ratio surfaces as a named failure rather than being
-    /// silently masked by downstream `finite_or_zero` filters.
-    pub fn is_finite(self) -> AssertResult {
-        if self.value.is_finite() {
-            AssertResult::pass()
-        } else {
-            let msg = format!(
-                "{}: expected finite, was {}",
-                self.name, self.value
-            );
-            self.fail(msg)
-        }
-    }
-
-    /// Pass when `(self.value - target).abs() <= tolerance`.
-    /// Fails with "<name>: expected near <target> (±<tolerance>),
-    /// was <value>" otherwise. `NaN` on either side fails the
-    /// comparison (the absolute-difference test never holds for
-    /// NaN). `value == target` is short-circuited as a pass before
-    /// the subtraction so `±inf == ±inf` (whose `inf - inf` would
-    /// produce `NaN` and silently fail) reads as a match.
-    /// Negative `tolerance` is a caller bug — the failure message
-    /// names it as "caller error: tolerance negative (=<tolerance>)"
-    /// rather than displaying ±-0.001 which reads as real
-    /// ±-tolerance arithmetic.
-    pub fn near(self, target: f64, tolerance: f64) -> AssertResult {
-        if tolerance < 0.0 {
-            let msg = format!(
-                "{}: caller error: tolerance negative (={})",
-                self.name, tolerance
-            );
-            return self.fail(msg);
-        }
-        if self.value == target || (self.value - target).abs() <= tolerance {
-            AssertResult::pass()
-        } else {
-            let msg = format!(
-                "{}: expected near {} (±{}), was {}",
-                self.name, target, tolerance, self.value
-            );
-            self.fail(msg)
-        }
-    }
-}
-
-/// Accumulator for multiple [`Expect`]-style claims against a single
-/// snapshot.
-///
-/// Use when a test wants to record several pointwise comparisons —
-/// each with its own subject name — and produce one merged
-/// [`AssertResult`] at the end. Replaces the manual pattern of
-/// constructing an `AssertResult::pass()`, hand-flipping
-/// `passed = false`, and pushing `AssertDetail`s in a chain of
-/// `if`s.
-///
-/// Every comparator continues past failure: a test running ten
-/// claims sees all ten diagnostics at once, not just the first.
-///
-/// ```
-/// # use ktstr::assert::{Checks, DetailKind};
-/// let mut checks = Checks::new();
-/// checks.expect("worker.iterations", 100u64).at_least(50);
-/// checks.expect("worker.tid", 42i32).eq(42);
-/// checks.expect("metric.allocated", 5_000_000u64)
-///     .between(1_000_000, 10_000_000);
-/// let r = checks.into_result();
-/// assert!(r.passed);
-///
-/// // A failing claim attaches a detail without short-circuiting
-/// // subsequent claims.
-/// let mut checks = Checks::new();
-/// checks.expect("a", 10u64).at_least(100);  // fails
-/// checks.expect("b", 20u64).at_most(15);    // fails
-/// let r = checks.into_result();
-/// assert!(!r.passed);
-/// assert_eq!(r.details.len(), 2);
-/// ```
-#[must_use = "Checks accumulate claims; call into_result() to consume them"]
-#[derive(Debug, Clone)]
-pub struct Checks {
-    result: AssertResult,
-}
-
-impl Default for Checks {
-    /// Same shape as [`Checks::new`]: an empty, passing accumulator.
-    /// Implemented by hand rather than `#[derive(Default)]` because
-    /// [`AssertResult`] deliberately has no `Default` derive — every
-    /// wire-format field is required at deserialize time per the
-    /// strict-schema policy pinned by
-    /// `assert_result_missing_required_field_rejected_by_deserialize`.
-    /// `Checks::new` knows to construct via `AssertResult::pass()`,
-    /// so the manual `Default` here just delegates to it.
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Checks {
-    /// Empty accumulator — no claims, passing.
-    pub fn new() -> Self {
-        Self {
-            result: AssertResult::pass(),
-        }
-    }
-
-    /// Open a per-claim builder for the named `(subject, value)`
-    /// pair. The builder records its outcome back into this
-    /// accumulator on comparator invocation.
-    ///
-    /// `name` identifies the subject in any failure message; it is
-    /// the same string downstream operators see when triaging the
-    /// merged result.
-    pub fn expect<'a, T>(&'a mut self, name: &'a str, value: T) -> CheckBuilder<'a, T> {
-        CheckBuilder {
-            checks: self,
-            name,
-            value,
-            kind: DetailKind::Other,
-            reason: None,
-        }
-    }
-
-    /// Append an informational note to the underlying
-    /// [`AssertResult`] without altering the verdict. Mirrors
-    /// [`AssertResult::note`] — the kind is [`DetailKind::Note`]
-    /// and `passed` is preserved. Returns `&mut Self` so notes
-    /// chain inline with comparator records.
-    pub fn note(&mut self, msg: impl Into<String>) -> &mut Self {
-        self.result.note(msg);
-        self
-    }
-
-    /// Fold an external [`AssertResult`] into the accumulator. Useful
-    /// when a test combines `Checks` claims with the result of an
-    /// upstream `assert_*` call (e.g. `assert_not_starved` over
-    /// worker reports). Mirrors [`AssertResult::merge`] semantics —
-    /// `passed` is conjoined and details concatenate.
-    pub fn merge(&mut self, other: AssertResult) -> &mut Self {
-        self.result.merge(other);
-        self
-    }
-
-    /// True iff every claim recorded so far passed and no merged
-    /// upstream result reported a failure. Read-only — useful for
-    /// short-circuit logic (e.g. running a conditional follow-up
-    /// check only when everything before it has held).
-    pub fn passed(&self) -> bool {
-        self.result.passed
-    }
-
-    /// Number of failure / informational details recorded so far.
-    /// Includes details from merged upstream results.
-    pub fn detail_count(&self) -> usize {
-        self.result.details.len()
-    }
-
-    /// Consume the accumulator and return the merged [`AssertResult`]
-    /// for return from a test body.
-    pub fn into_result(self) -> AssertResult {
-        self.result
-    }
-}
-
-/// Per-claim builder produced by [`Checks::expect`].
-///
-/// Holds a borrowed reference back to the parent [`Checks`]
-/// accumulator so that calling a comparator records the outcome
-/// without consuming the parent. The builder itself IS consumed by
-/// the comparator (each `expect(...)` opens a fresh builder), so
-/// chaining within one claim is by design impossible — a claim
-/// applies one comparator and ends.
-#[must_use = "CheckBuilder records nothing until a comparator (eq, lt, …) is invoked"]
-pub struct CheckBuilder<'a, T> {
-    checks: &'a mut Checks,
-    name: &'a str,
-    value: T,
-    kind: DetailKind,
-    /// Optional explanation forwarded to the produced [`Expect`]
-    /// at [`Self::into_expect`] time. Mirrors [`Expect::reason`].
-    reason: Option<&'a str>,
-}
-
-impl<'a, T> CheckBuilder<'a, T> {
-    /// Override the [`DetailKind`] used on failure. Defaults to
-    /// [`DetailKind::Other`]; tests that have a structural category
-    /// set it here so downstream `kind`-based filters route the
-    /// failure correctly. Mirrors [`Expect::kind`].
-    pub fn kind(mut self, kind: DetailKind) -> Self {
-        self.kind = kind;
-        self
-    }
-
-    /// Attach a human-readable rationale forwarded to the
-    /// produced [`Expect`]'s failure message. Mirrors
-    /// [`Expect::because`].
-    pub fn because(mut self, reason: &'a str) -> Self {
-        self.reason = Some(reason);
-        self
-    }
-
-    fn into_expect(self) -> (Expect<'a, T>, &'a mut Checks) {
-        let expect = Expect {
-            name: self.name,
-            value: self.value,
-            kind: self.kind,
-            reason: self.reason,
-        };
-        (expect, self.checks)
-    }
-}
-
-impl<'a, T> CheckBuilder<'a, T>
-where
-    T: PartialEq + std::fmt::Display,
-{
-    /// Record an equality claim. See [`Expect::eq`].
-    pub fn eq(self, expected: T) -> &'a mut Checks {
-        let (e, c) = self.into_expect();
-        c.merge(e.eq(expected));
-        c
-    }
-
-    /// Record a not-equal claim. See [`Expect::ne`].
-    pub fn ne(self, forbidden: T) -> &'a mut Checks {
-        let (e, c) = self.into_expect();
-        c.merge(e.ne(forbidden));
-        c
-    }
-}
-
-impl<'a, T> CheckBuilder<'a, T>
-where
-    T: PartialOrd + std::fmt::Display,
-{
-    /// Record a "value >= floor" claim. See [`Expect::at_least`].
-    pub fn at_least(self, floor: T) -> &'a mut Checks {
-        let (e, c) = self.into_expect();
-        c.merge(e.at_least(floor));
-        c
-    }
-
-    /// Record a "value <= ceiling" claim. See [`Expect::at_most`].
-    pub fn at_most(self, ceiling: T) -> &'a mut Checks {
-        let (e, c) = self.into_expect();
-        c.merge(e.at_most(ceiling));
-        c
-    }
-
-    /// Record a "value < ceiling" claim. See [`Expect::lt`].
-    pub fn lt(self, ceiling: T) -> &'a mut Checks {
-        let (e, c) = self.into_expect();
-        c.merge(e.lt(ceiling));
-        c
-    }
-
-    /// Record a "value > floor" claim. See [`Expect::gt`].
-    pub fn gt(self, floor: T) -> &'a mut Checks {
-        let (e, c) = self.into_expect();
-        c.merge(e.gt(floor));
-        c
-    }
-
-    /// Record a "lo <= value <= hi" claim. See [`Expect::between`].
-    pub fn between(self, lo: T, hi: T) -> &'a mut Checks {
-        let (e, c) = self.into_expect();
-        c.merge(e.between(lo, hi));
-        c
-    }
-}
-
-impl<'a> CheckBuilder<'a, f64> {
-    /// Record an "is finite" claim. See [`Expect::is_finite`].
-    pub fn is_finite(self) -> &'a mut Checks {
-        let (e, c) = self.into_expect();
-        c.merge(e.is_finite());
-        c
-    }
-
-    /// Record a "near target within tolerance" claim. See
-    /// [`Expect::near`].
-    pub fn near(self, target: f64, tolerance: f64) -> &'a mut Checks {
-        let (e, c) = self.into_expect();
-        c.merge(e.near(target, tolerance));
-        c
-    }
-}
+// (The legacy `Expect` / `Checks` / `CheckBuilder` types previously
+// living here were replaced by the [`Verdict`]-based claim API
+// (defined further up in this file). The new flow is
+// `Assert::defaults().verdict().claim_<field>(stats).at_most(N)` for
+// stats-struct-derived accessors, or `claim!(verdict, expr)` for
+// expression-labeled claims. Both produce
+// [`ClaimBuilder`]/[`SetClaim`]/[`SeqClaim`] under the hood and
+// record outcomes onto the same [`AssertResult`] envelope that
+// `assert_not_starved` / `assert_isolation` produce, so the two
+// paths compose via [`Verdict::merge`].)
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::workload::WorkerReport;
+    use crate::workload::{WorkerReport, WorkerReportClaim};
 
     fn rpt(
         tid: i32,
@@ -3204,9 +3456,12 @@ mod tests {
             let cg = CgroupStats {
                 total_iterations: cg_total_iters,
                 page_locality,
-                iterations_per_worker: iters_per_worker,
                 ..CgroupStats::default()
             };
+            // `iters_per_worker` flows into the ScenarioStats roll-up
+            // below; the per-cgroup [`CgroupStats::iterations_per_worker`]
+            // is now method-only and recomputed on read from
+            // `total_iterations / num_workers`.
             AssertResult {
                 passed: true,
                 skipped: false,
@@ -3311,189 +3566,134 @@ mod tests {
         assert_eq!(a.stats.worst_cross_node_migration_ratio, 0.25);
     }
 
-    /// `CgroupStats::derive_ratios` computes the two derived fields
-    /// from the already-populated raw fields. Pins both the happy
+    /// `CgroupStats::wake_latency_tail_ratio` and
+    /// `CgroupStats::iterations_per_worker` are method-only and
+    /// recompute from raw fields on every call. Pins both the happy
     /// path (non-zero divisors) and the zero-divisor guards — if
-    /// either guard regressed, the derived fields would produce
+    /// either guard regressed, the methods would produce
     /// `NaN` / `Infinity` that the downstream `finite_or_zero`
     /// filter in `stats::sidecar_to_row` would have to mop up.
     /// Keeping the zero cases pinned at the source means the
-    /// finite_or_zero layer is belt-and-braces, not load-bearing.
+    /// `finite_or_zero` layer is belt-and-braces, not load-bearing.
     #[test]
-    fn derive_ratios_computes_tail_and_throughput() {
+    fn derived_ratio_methods_compute_tail_and_throughput() {
         use crate::assert::CgroupStats;
 
         // Happy path: non-zero divisors, both ratios land.
-        let mut cg = CgroupStats {
+        let cg = CgroupStats {
             num_workers: 4,
             total_iterations: 800,
             p99_wake_latency_us: 50.0,
             median_wake_latency_us: 10.0,
             ..CgroupStats::default()
         };
-        cg.derive_ratios();
         assert_eq!(
-            cg.wake_latency_tail_ratio, 5.0,
+            cg.wake_latency_tail_ratio(),
+            5.0,
             "p99 / median = 50 / 10; got {}",
-            cg.wake_latency_tail_ratio,
+            cg.wake_latency_tail_ratio(),
         );
         assert_eq!(
-            cg.iterations_per_worker, 200.0,
+            cg.iterations_per_worker(),
+            200.0,
             "total_iterations / num_workers = 800 / 4; got {}",
-            cg.iterations_per_worker,
+            cg.iterations_per_worker(),
         );
 
         // Zero-divisor: median == 0 → tail_ratio stays at 0.0, no NaN/Inf.
-        // Cross-check: the OTHER derived field (iterations_per_worker)
+        // Cross-check: the OTHER derived method (iterations_per_worker)
         // must still land at its non-guard value — the median guard
         // must not accidentally zero out an unrelated derived field.
-        let mut cg = CgroupStats {
+        let cg = CgroupStats {
             num_workers: 2,
             total_iterations: 100,
             p99_wake_latency_us: 50.0,
             median_wake_latency_us: 0.0,
             ..CgroupStats::default()
         };
-        cg.derive_ratios();
         assert_eq!(
-            cg.wake_latency_tail_ratio, 0.0,
+            cg.wake_latency_tail_ratio(),
+            0.0,
             "divide-by-zero guard on median must yield 0.0, not NaN; got {}",
-            cg.wake_latency_tail_ratio,
+            cg.wake_latency_tail_ratio(),
         );
         assert!(
-            cg.wake_latency_tail_ratio.is_finite(),
-            "tail_ratio must be finite so `finite_or_zero` downstream \
-             is not load-bearing; got {}",
-            cg.wake_latency_tail_ratio,
+            cg.wake_latency_tail_ratio().is_finite(),
+            "tail_ratio must be finite; got {}",
+            cg.wake_latency_tail_ratio(),
         );
         assert_eq!(
-            cg.iterations_per_worker, 50.0,
+            cg.iterations_per_worker(),
+            50.0,
             "cross-check: median-guard branch must not zero out the \
              independent iterations_per_worker (100 / 2 = 50); got {}",
-            cg.iterations_per_worker,
+            cg.iterations_per_worker(),
         );
 
         // Zero-divisor: num_workers == 0 → iterations_per_worker stays at 0.0.
-        // Cross-check: tail_ratio lands at its non-guard value — the
-        // num_workers guard must not bleed into the latency branch.
-        let mut cg = CgroupStats {
+        // Cross-check: tail_ratio lands at its non-guard value.
+        let cg = CgroupStats {
             num_workers: 0,
             total_iterations: 100,
             p99_wake_latency_us: 50.0,
             median_wake_latency_us: 10.0,
             ..CgroupStats::default()
         };
-        cg.derive_ratios();
         assert_eq!(
-            cg.iterations_per_worker, 0.0,
+            cg.iterations_per_worker(),
+            0.0,
             "divide-by-zero guard on num_workers must yield 0.0, \
              not NaN; got {}",
-            cg.iterations_per_worker,
+            cg.iterations_per_worker(),
         );
         assert!(
-            cg.iterations_per_worker.is_finite(),
+            cg.iterations_per_worker().is_finite(),
             "iterations_per_worker must be finite; got {}",
-            cg.iterations_per_worker,
+            cg.iterations_per_worker(),
         );
         assert_eq!(
-            cg.wake_latency_tail_ratio, 5.0,
+            cg.wake_latency_tail_ratio(),
+            5.0,
             "cross-check: num_workers-guard branch must not zero out \
              the independent tail_ratio (50 / 10 = 5); got {}",
-            cg.wake_latency_tail_ratio,
+            cg.wake_latency_tail_ratio(),
         );
     }
 
-    /// After `derive_ratios()`, the stored fields
-    /// (`wake_latency_tail_ratio` / `iterations_per_worker`) must
-    /// equal the computed accessors (`computed_wake_latency_tail_ratio`
-    /// / `computed_iterations_per_worker`). The store is just a
-    /// memo of the computation; any drift between stored and
-    /// computed values would mean either the populator or an
-    /// accessor has a bug. Pins the equivalence across the happy
-    /// path plus both zero-divisor branches.
-    ///
-    /// Motivation: the computed accessors exist so readers that
-    /// hold a `CgroupStats` from a deserialized pre-derive sidecar
-    /// can still get the ratio without mutating the struct. This
-    /// guarantee only holds if the populator and the accessor
-    /// agree on every branch, including the zero-divisor guards.
+    /// The wire format must NOT serialize the derived ratios — they
+    /// are method-only and recomputed on read. Pins this so a future
+    /// regression that re-introduces a stored-field shadow (e.g.
+    /// folding the methods back into pub fields) trips here.
     #[test]
-    fn computed_accessors_match_stored_fields_after_derive_ratios() {
+    fn wire_format_omits_derived_ratio_keys() {
         use crate::assert::CgroupStats;
 
-        let fixtures: &[(&str, CgroupStats)] = &[
-            (
-                "happy-path",
-                CgroupStats {
-                    num_workers: 4,
-                    total_iterations: 800,
-                    p99_wake_latency_us: 50.0,
-                    median_wake_latency_us: 10.0,
-                    ..CgroupStats::default()
-                },
-            ),
-            (
-                "median-zero-guard",
-                CgroupStats {
-                    num_workers: 2,
-                    total_iterations: 100,
-                    p99_wake_latency_us: 50.0,
-                    median_wake_latency_us: 0.0,
-                    ..CgroupStats::default()
-                },
-            ),
-            (
-                "workers-zero-guard",
-                CgroupStats {
-                    num_workers: 0,
-                    total_iterations: 100,
-                    p99_wake_latency_us: 50.0,
-                    median_wake_latency_us: 10.0,
-                    ..CgroupStats::default()
-                },
-            ),
-        ];
-
-        for (label, cg_template) in fixtures {
-            let mut cg = cg_template.clone();
-            // Before derive_ratios, stored fields are default (0.0)
-            // but the computed accessors ALREADY return the right
-            // answer — that is the whole point of having them for
-            // deserialized-pre-derive sidecars.
-            let pre_tail = cg.computed_wake_latency_tail_ratio();
-            let pre_iter = cg.computed_iterations_per_worker();
-
-            cg.derive_ratios();
-
-            assert_eq!(
-                cg.wake_latency_tail_ratio,
-                cg.computed_wake_latency_tail_ratio(),
-                "[{label}] stored tail ratio must equal computed \
-                 accessor after derive_ratios",
-            );
-            assert_eq!(
-                cg.iterations_per_worker,
-                cg.computed_iterations_per_worker(),
-                "[{label}] stored iterations_per_worker must equal \
-                 computed accessor after derive_ratios",
-            );
-            // The computed accessor must be stable: calling before
-            // and after derive_ratios yields the same value. derive_
-            // ratios is just a memoization of the computation, not a
-            // transformation.
-            assert_eq!(
-                pre_tail,
-                cg.computed_wake_latency_tail_ratio(),
-                "[{label}] computed accessor must not depend on \
-                 derive_ratios having fired",
-            );
-            assert_eq!(
-                pre_iter,
-                cg.computed_iterations_per_worker(),
-                "[{label}] computed accessor must not depend on \
-                 derive_ratios having fired",
-            );
-        }
+        let cg = CgroupStats {
+            num_workers: 2,
+            total_iterations: 1000,
+            p99_wake_latency_us: 50.0,
+            median_wake_latency_us: 10.0,
+            ..CgroupStats::default()
+        };
+        let json = serde_json::to_value(&cg).unwrap();
+        let map = match json {
+            serde_json::Value::Object(m) => m,
+            other => panic!("expected object, got {other:?}"),
+        };
+        assert!(
+            !map.contains_key("wake_latency_tail_ratio"),
+            "derived methods must NOT appear as wire-format fields; \
+             got: {map:#?}",
+        );
+        assert!(
+            !map.contains_key("iterations_per_worker"),
+            "derived methods must NOT appear as wire-format fields; \
+             got: {map:#?}",
+        );
+        // Cross-check: the methods still compute correctly even though
+        // the values aren't stored.
+        assert_eq!(cg.wake_latency_tail_ratio(), 5.0);
+        assert_eq!(cg.iterations_per_worker(), 500.0);
     }
 
     /// Computed accessor edge cases not covered by the main
@@ -3554,7 +3754,7 @@ mod tests {
             median_wake_latency_us: f64::NAN,
             ..CgroupStats::default()
         };
-        assert_finite_eq(cg.computed_wake_latency_tail_ratio(), 0.0, "nan-median");
+        assert_finite_eq(cg.wake_latency_tail_ratio(), 0.0, "nan-median");
 
         // --- NaN p99 with positive median: without an explicit
         // sanitizer on the numerator, `NaN / 10.0 = NaN`. The
@@ -3576,7 +3776,7 @@ mod tests {
             median_wake_latency_us: 10.0,
             ..CgroupStats::default()
         };
-        let got = cg.computed_wake_latency_tail_ratio();
+        let got = cg.wake_latency_tail_ratio();
         assert!(
             got.is_nan() || got == 0.0,
             "[nan-p99] current accessor allows NaN through the \
@@ -3593,7 +3793,7 @@ mod tests {
             median_wake_latency_us: f64::INFINITY,
             ..CgroupStats::default()
         };
-        assert_finite_eq(cg.computed_wake_latency_tail_ratio(), 0.0, "inf-median");
+        assert_finite_eq(cg.wake_latency_tail_ratio(), 0.0, "inf-median");
 
         // --- +Infinity p99 with positive median: `inf / 10 = inf`.
         // Same gap as the NaN-p99 case.
@@ -3602,7 +3802,7 @@ mod tests {
             median_wake_latency_us: 10.0,
             ..CgroupStats::default()
         };
-        let got = cg.computed_wake_latency_tail_ratio();
+        let got = cg.wake_latency_tail_ratio();
         assert!(
             got.is_infinite() || got == 0.0,
             "[inf-p99] current accessor allows Infinity through the \
@@ -3615,7 +3815,7 @@ mod tests {
             median_wake_latency_us: 0.0,
             ..CgroupStats::default()
         };
-        assert_finite_eq(cg.computed_wake_latency_tail_ratio(), 0.0, "both-zero");
+        assert_finite_eq(cg.wake_latency_tail_ratio(), 0.0, "both-zero");
 
         // --- Negative median: `neg > 0.0` is false, guard fires.
         // Pins the comparator direction: a regression to `!= 0.0`
@@ -3627,7 +3827,7 @@ mod tests {
             ..CgroupStats::default()
         };
         assert_finite_eq(
-            cg.computed_wake_latency_tail_ratio(),
+            cg.wake_latency_tail_ratio(),
             0.0,
             "negative-median",
         );
@@ -3641,7 +3841,7 @@ mod tests {
             total_iterations: u64::MAX,
             ..CgroupStats::default()
         };
-        let got = cg.computed_iterations_per_worker();
+        let got = cg.iterations_per_worker();
         assert!(
             got.is_finite(),
             "[u64-max-iters] iterations_per_worker must stay finite \
@@ -3945,6 +4145,29 @@ mod tests {
         assert_eq!(percentile(&sorted, 0.50), 4);
     }
 
+    /// Pins the debug-build precondition that callers pass sorted input.
+    /// Skipped under release because the contract is enforced via
+    /// `debug_assert!` only — production paths sort upstream and the
+    /// release build deliberately omits the linear-scan check.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "percentile() requires sorted input")]
+    fn percentile_unsorted_input_panics_in_debug() {
+        let unsorted: Vec<u64> = vec![5, 1, 3];
+        let _ = percentile(&unsorted, 0.99);
+    }
+
+    /// Two-element non-decreasing slices (equal pair, increasing pair)
+    /// must NOT trip the debug_assert — the precondition is "sorted",
+    /// not "strictly increasing." Pins the correct comparator (`<=`)
+    /// so a regression switching to `<` would fail every cgroup with
+    /// repeated wake-latency samples.
+    #[test]
+    fn percentile_equal_consecutive_values_do_not_panic() {
+        let with_dups: Vec<u64> = vec![1, 1, 1, 2, 2, 3];
+        let _ = percentile(&with_dups, 0.99);
+    }
+
     #[test]
     fn isolation_empty_reports() {
         let expected: BTreeSet<usize> = [0, 1].into_iter().collect();
@@ -4048,9 +4271,11 @@ mod tests {
             "worst_run_delay_us",
             "page_locality",
             "cross_node_migration_ratio",
-            "wake_latency_tail_ratio",
-            "iterations_per_worker",
         ];
+        // `wake_latency_tail_ratio` and `iterations_per_worker` are
+        // method-only on CgroupStats and DO NOT appear in the JSON
+        // wire format; they are recomputed on read from p99/median
+        // and total_iterations/num_workers respectively.
 
         let cg = CgroupStats::default();
         let full = match serde_json::to_value(&cg).unwrap() {
@@ -4848,7 +5073,7 @@ mod tests {
             rpt(2, 5000, 5e9 as u64, 475e7 as u64, &[0, 1], 50), // 95%
         ]);
         assert!(!r.passed, "extreme unfairness must be caught");
-        // Format: "unfair cgroup: spread=90% (5-95%) 2 workers on 2 cpus"
+        // Format: "unfair cgroup: spread=90% (5-95%) 2 workers on 2 cpus (threshold 15%)"
         let detail = r.details.iter().find(|d| d.contains("unfair")).unwrap();
         assert!(
             detail.contains("spread="),
@@ -4859,6 +5084,13 @@ mod tests {
             "must include worker count: {detail}"
         );
         assert!(detail.contains("cpus"), "must include cpu count: {detail}");
+        // Threshold must appear so a regression dropping the bound surfaces here.
+        // The literal value comes from `spread_threshold_pct()` which differs
+        // between debug and release builds; pin only the textual prefix.
+        assert!(
+            detail.contains("threshold "),
+            "must include threshold bound: {detail}"
+        );
         let c = &r.stats.cgroups[0];
         assert!(
             c.spread > 80.0,
@@ -4888,7 +5120,7 @@ mod tests {
             rpt(2, 1000, 5e9 as u64, 5e8 as u64, &[1], gap),
         ]);
         assert!(!r.passed, "scheduling gap must be caught");
-        // Format: "stuck {gap}ms on cpu1 at +1000ms"
+        // Format: "tid 2 stuck {gap}ms on cpu1 at +1000ms (threshold 2000ms)"
         let detail = r.details.iter().find(|d| d.contains("stuck")).unwrap();
         assert!(
             detail.contains(&format!("{}ms", gap)),
@@ -4903,6 +5135,19 @@ mod tests {
             "must include timing offset: {detail}"
         );
         assert!(detail.contains("cpu1"), "gap is on cpu1: {detail}");
+        // tid must be named so an operator triaging a multi-worker cgroup can
+        // identify the offender without reverse-mapping CPU placement.
+        assert!(
+            detail.contains("tid 2"),
+            "must name violating tid (2): {detail}"
+        );
+        // Threshold appears for parity with the AssertPlan custom-threshold path
+        // and so a regression dropping the bound from the default-path message
+        // surfaces here.
+        assert!(
+            detail.contains(&format!("threshold {}ms", threshold)),
+            "must include default-path threshold: {detail}"
+        );
         // Stats must reflect the gap.
         assert_eq!(r.stats.worst_gap_ms, gap);
         assert_eq!(r.stats.worst_gap_cpu, 1);
@@ -4917,7 +5162,7 @@ mod tests {
         ];
         let r = plan.assert_cgroup(&reports, None, None);
         assert!(!r.passed, "custom 500ms threshold must catch 1000ms gap");
-        // Format: "stuck 1000ms on cpu1 at +1000ms (threshold 500ms)"
+        // Format: "tid 2 stuck 1000ms on cpu1 at +1000ms (threshold 500ms)"
         let detail = r.details.iter().find(|d| d.contains("stuck")).unwrap();
         assert!(
             detail.contains("1000ms"),
@@ -4927,6 +5172,11 @@ mod tests {
         assert!(
             detail.contains("threshold 500ms"),
             "must include custom threshold: {detail}"
+        );
+        // tid must be named; pins parity with the bare-path message.
+        assert!(
+            detail.contains("tid 2"),
+            "must name violating tid (2): {detail}"
         );
     }
 
@@ -5862,7 +6112,18 @@ not_hex default N0=10
     fn assert_page_locality_fail() {
         let r = assert_page_locality(0.5, Some(0.8), 100, 50);
         assert!(!r.passed);
-        assert!(r.details.iter().any(|d| d.contains("page locality")));
+        let detail = r
+            .details
+            .iter()
+            .find(|d| d.contains("page locality"))
+            .unwrap();
+        // Percentage form must accompany the fraction so an operator
+        // reading the diagnostic doesn't mentally translate 0.5000 → 50%.
+        assert!(detail.contains("50.00%"), "must include observed %: {detail}");
+        assert!(
+            detail.contains("80.00%"),
+            "must include threshold %: {detail}"
+        );
     }
 
     #[test]
@@ -5897,7 +6158,18 @@ not_hex default N0=10
         let nodes: BTreeSet<usize> = [0].into_iter().collect();
         let r = assert_slow_tier_ratio(&pages, 0.5, 100, Some(&nodes));
         assert!(!r.passed);
-        assert!(r.details.iter().any(|d| d.contains("slow-tier")));
+        let detail = r
+            .details
+            .iter()
+            .find(|d| d.contains("slow-tier"))
+            .unwrap();
+        // 60% slow-tier (node 2 has 60 pages) vs 50% threshold; both
+        // surfaces appear so the operator sees raw ratio AND human %.
+        assert!(detail.contains("60.00%"), "must include observed %: {detail}");
+        assert!(
+            detail.contains("50.00%"),
+            "must include threshold %: {detail}"
+        );
     }
 
     #[test]
@@ -6058,7 +6330,18 @@ numa_miss 5";
     fn assert_cross_node_migration_fail() {
         let r = assert_cross_node_migration(20, 100, Some(0.1));
         assert!(!r.passed);
-        assert!(r.details.iter().any(|d| d.contains("cross-node migration")));
+        let detail = r
+            .details
+            .iter()
+            .find(|d| d.contains("cross-node migration"))
+            .unwrap();
+        // 20% migrated vs 10% threshold; pin both percentage tokens so
+        // dropping either form regresses here.
+        assert!(detail.contains("20.00%"), "must include observed %: {detail}");
+        assert!(
+            detail.contains("10.00%"),
+            "must include threshold %: {detail}"
+        );
     }
 
     #[test]
@@ -6192,610 +6475,12 @@ numa_miss 5";
         }
     }
 
-    // -- Expect / Checks: rich assertion primitives ----------------------
+    // -- Verdict / claim API ---------------------------------------------
     //
-    // The tests below exercise every comparator on every supported
-    // type bound (PartialEq, PartialOrd, f64-special). Each comparator
-    // is paired pass+fail, with the failure case ALSO verifying:
-    //   - the recorded `AssertDetail.kind` (defaults to Other; switches
-    //     to whatever `kind(...)` overrode it to);
-    //   - the failure message names the subject;
-    //   - the failure message names the threshold so the operator can
-    //     triage without reading the test source.
-    // Edge cases are pinned in dedicated tests (NaN, Infinity, empty
-    // accumulator, between with inverted interval, multi-claim
-    // continuation past failure, &str type bound).
-
-    #[test]
-    fn expect_eq_pass_returns_passing_result() {
-        let r = Expect::that("answer", 42u64).eq(42);
-        assert!(r.passed);
-        assert!(
-            r.details.is_empty(),
-            "passing comparator must not push a detail",
-        );
-    }
-
-    #[test]
-    fn expect_eq_fail_names_subject_and_values() {
-        let r = Expect::that("answer", 42u64).eq(7);
-        assert!(!r.passed);
-        assert_eq!(r.details.len(), 1);
-        let d = &r.details[0];
-        assert_eq!(d.kind, DetailKind::Other);
-        assert!(d.message.contains("answer"), "msg: {}", d.message);
-        // Pin the "expected"/"was" labels so the message format
-        // can't drift to a swapped or relabelled shape that still
-        // happens to contain the raw values. A regression that
-        // changed "expected 7, was 42" to "got 42 != 7" would
-        // pass without these label asserts.
-        assert!(d.message.contains("expected"), "msg: {}", d.message);
-        assert!(d.message.contains("was"), "msg: {}", d.message);
-        assert!(d.message.contains("42"), "msg: {}", d.message);
-        assert!(d.message.contains('7'), "msg: {}", d.message);
-    }
-
-    #[test]
-    fn expect_ne_pass_and_fail() {
-        let pass = Expect::that("flag", 0u64).ne(1);
-        assert!(pass.passed);
-
-        let fail = Expect::that("flag", 1u64).ne(1);
-        assert!(!fail.passed);
-        assert!(fail.details[0].message.contains("flag"));
-        assert!(fail.details[0].message.contains("!="));
-        // Same label-pin rationale as eq_fail above.
-        assert!(fail.details[0].message.contains("expected"));
-        assert!(fail.details[0].message.contains("was"));
-    }
-
-    #[test]
-    fn expect_at_least_boundary_is_inclusive() {
-        // value == floor → pass (inclusive lower bound).
-        let r = Expect::that("counter", 100u64).at_least(100);
-        assert!(r.passed, "value at floor must pass: {:?}", r.details);
-
-        // value < floor → fail.
-        let r = Expect::that("counter", 99u64).at_least(100);
-        assert!(!r.passed);
-        assert!(r.details[0].message.contains("at least 100"));
-        assert!(r.details[0].message.contains("counter"));
-    }
-
-    #[test]
-    fn expect_at_most_boundary_is_inclusive() {
-        let r = Expect::that("counter", 100u64).at_most(100);
-        assert!(r.passed);
-
-        let r = Expect::that("counter", 101u64).at_most(100);
-        assert!(!r.passed);
-        assert!(r.details[0].message.contains("at most 100"));
-    }
-
-    #[test]
-    fn expect_lt_strict_upper_bound() {
-        // value strictly less than ceiling → pass.
-        let r = Expect::that("x", 99u64).lt(100);
-        assert!(r.passed);
-
-        // value == ceiling → fail (strict).
-        let r = Expect::that("x", 100u64).lt(100);
-        assert!(!r.passed);
-        assert!(r.details[0].message.contains("less than 100"));
-    }
-
-    #[test]
-    fn expect_gt_strict_lower_bound() {
-        let r = Expect::that("x", 101u64).gt(100);
-        assert!(r.passed);
-
-        // value == floor → fail (strict).
-        let r = Expect::that("x", 100u64).gt(100);
-        assert!(!r.passed);
-        assert!(r.details[0].message.contains("greater than 100"));
-    }
-
-    #[test]
-    fn expect_between_inclusive_on_both_ends() {
-        // boundaries pass.
-        assert!(Expect::that("x", 10u64).between(10, 20).passed);
-        assert!(Expect::that("x", 20u64).between(10, 20).passed);
-        // mid passes.
-        assert!(Expect::that("x", 15u64).between(10, 20).passed);
-        // outside fails.
-        let r = Expect::that("x", 9u64).between(10, 20);
-        assert!(!r.passed);
-        assert!(r.details[0].message.contains("[10, 20]"));
-        let r = Expect::that("x", 21u64).between(10, 20);
-        assert!(!r.passed);
-        assert!(r.details[0].message.contains("[10, 20]"));
-    }
-
-    /// Inverted interval (`lo > hi`) is a typo, not a panic. The
-    /// comparator reports it as a named caller error so the
-    /// failure reads as a real "you wrote the bounds backwards"
-    /// message rather than a misleading "expected in [20, 10]"
-    /// line that looks like the value missed a real range.
-    #[test]
-    fn expect_between_inverted_interval_fails_with_visible_typo() {
-        let r = Expect::that("x", 15u64).between(20, 10);
-        assert!(!r.passed);
-        // The message names "caller error" and the inverted lo/hi
-        // verbatim so a typo is unambiguously identifiable.
-        let msg = &r.details[0].message;
-        assert!(msg.contains("caller error"), "msg: {msg}");
-        assert!(msg.contains("interval inverted"), "msg: {msg}");
-        assert!(msg.contains("lo=20"), "msg: {msg}");
-        assert!(msg.contains("hi=10"), "msg: {msg}");
-    }
-
-    #[test]
-    fn expect_kind_override_is_persisted_to_detail() {
-        let r = Expect::that("p99", 5000u64)
-            .kind(DetailKind::Benchmark)
-            .at_most(1000);
-        assert!(!r.passed);
-        assert_eq!(r.details[0].kind, DetailKind::Benchmark);
-    }
-
-    #[test]
-    fn expect_default_kind_is_other() {
-        let r = Expect::that("anything", 1u64).eq(2);
-        assert!(!r.passed);
-        assert_eq!(r.details[0].kind, DetailKind::Other);
-    }
-
-    /// `Expect` is generic over any `T: PartialEq + Display` (eq/ne)
-    /// or `T: PartialOrd + Display` (ordering comparators). Pin the
-    /// integer types we expect tests to use most: `u64` (counters),
-    /// `i32` (tids and exit codes), and `&str` (named identifiers).
-    /// A regression that overconstrained the bound would surface
-    /// here.
-    #[test]
-    fn expect_works_across_concrete_types() {
-        // u64 — the dominant counter type.
-        assert!(Expect::that("u64", 1u64).eq(1).passed);
-        // i32 — pid_t and exit-code shape.
-        assert!(Expect::that("i32", 42i32).at_least(0).passed);
-        // &str — identifier comparison.
-        assert!(Expect::that("name", "fio").eq("fio").passed);
-        // usize — vector lengths.
-        assert!(Expect::that("len", 3usize).between(1, 5).passed);
-    }
-
-    // -- Expect: f64-only comparators ------------------------------------
-
-    #[test]
-    fn expect_is_finite_passes_for_normal_values() {
-        for v in [0.0_f64, 1.0, -1.0, 1e308, -1e308] {
-            let r = Expect::that("x", v).is_finite();
-            assert!(r.passed, "{} should be finite: {:?}", v, r.details);
-        }
-    }
-
-    #[test]
-    fn expect_is_finite_fails_for_nan_and_infinities() {
-        for v in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-            let r = Expect::that("x", v).is_finite();
-            assert!(!r.passed, "{} must fail is_finite", v);
-            assert!(r.details[0].message.contains("expected finite"));
-        }
-    }
-
-    #[test]
-    fn expect_near_inclusive_at_tolerance_boundary() {
-        // |1.0 - 1.0| == 0 <= 0.001 → pass.
-        assert!(Expect::that("x", 1.0_f64).near(1.0, 0.001).passed);
-        // |1.001 - 1.0| == 0.001 <= 0.001 → pass (boundary inclusive).
-        assert!(Expect::that("x", 1.001_f64).near(1.0, 0.001).passed);
-        // |1.002 - 1.0| == 0.002 > 0.001 → fail.
-        let r = Expect::that("x", 1.002_f64).near(1.0, 0.001);
-        assert!(!r.passed);
-        assert!(r.details[0].message.contains("near 1"));
-    }
-
-    /// `near` against NaN never passes — the abs-difference
-    /// comparison is `NaN <= tolerance`, which is always false, so
-    /// every NaN comparison surfaces as a named failure.
-    #[test]
-    fn expect_near_nan_input_fails() {
-        let r = Expect::that("x", f64::NAN).near(1.0, 0.5);
-        assert!(!r.passed);
-        let r = Expect::that("x", 1.0_f64).near(f64::NAN, 0.5);
-        assert!(!r.passed);
-    }
-
-    /// Negative tolerance is a caller bug — the comparator reports
-    /// it as a named caller error rather than displaying a
-    /// misleading `±-0.001` that reads like real arithmetic. Even
-    /// a value exactly equal to the target fails, because the
-    /// caller-error branch fires first (a negative tolerance is
-    /// always a bug regardless of the value).
-    #[test]
-    fn expect_near_negative_tolerance_is_vacuously_false() {
-        let r = Expect::that("x", 1.0_f64).near(1.0, -0.001);
-        assert!(
-            !r.passed,
-            "negative tolerance must surface as a caller-error fail",
-        );
-        let msg = &r.details[0].message;
-        assert!(msg.contains("caller error"), "msg: {msg}");
-        assert!(msg.contains("tolerance negative"), "msg: {msg}");
-        // The negative tolerance value reaches the message so the
-        // typo is visible in test output.
-        assert!(msg.contains("-0.001"), "msg: {msg}");
-    }
-
-    /// `Expect::near(±inf, tolerance)` short-circuits the
-    /// `value == target` case to a pass before computing
-    /// `value - target`. Without that guard, `inf - inf` produces
-    /// NaN and the abs-difference comparison silently fails — so
-    /// `near(inf, _)` against an actual `inf` value would report
-    /// "not near" despite an exact match.
-    #[test]
-    fn expect_near_handles_infinity_equality() {
-        let r = Expect::that("x", f64::INFINITY).near(f64::INFINITY, 0.001);
-        assert!(
-            r.passed,
-            "infinity == infinity must pass near() despite NaN diff: {:?}",
-            r.details
-        );
-        let r = Expect::that("x", f64::NEG_INFINITY).near(f64::NEG_INFINITY, 0.001);
-        assert!(r.passed, "details: {:?}", r.details);
-        // ±inf vs the opposite ±inf is a real mismatch — must fail.
-        let r = Expect::that("x", f64::INFINITY).near(f64::NEG_INFINITY, 0.001);
-        assert!(!r.passed);
-    }
-
-    // -- Checks: accumulator builder -------------------------------------
-
-    #[test]
-    fn checks_empty_accumulator_passes() {
-        let r = Checks::new().into_result();
-        assert!(r.passed);
-        assert!(r.details.is_empty());
-        assert_eq!(r.stats.total_workers, 0);
-    }
-
-    #[test]
-    fn checks_default_matches_new() {
-        let d = Checks::default();
-        let n = Checks::new();
-        assert_eq!(d.passed(), n.passed());
-        assert_eq!(d.detail_count(), n.detail_count());
-    }
-
-    #[test]
-    fn checks_single_passing_claim_remains_passing() {
-        let mut checks = Checks::new();
-        checks.expect("counter", 100u64).at_least(50);
-        let r = checks.into_result();
-        assert!(r.passed);
-        assert!(r.details.is_empty(), "passing claim must not push detail");
-    }
-
-    #[test]
-    fn checks_single_failing_claim_records_one_detail() {
-        let mut checks = Checks::new();
-        checks.expect("counter", 5u64).at_least(50);
-        assert_eq!(checks.detail_count(), 1);
-        assert!(!checks.passed());
-        let r = checks.into_result();
-        assert!(!r.passed);
-        assert_eq!(r.details.len(), 1);
-        assert!(r.details[0].message.contains("counter"));
-    }
-
-    /// Multiple claims must continue past failure and accumulate
-    /// every detail. Tests that fail on the first claim and stop
-    /// would lose the diagnostics from later claims — exactly the
-    /// pattern this API exists to fix.
-    #[test]
-    fn checks_continue_past_failure_and_accumulate_all_details() {
-        let mut checks = Checks::new();
-        checks.expect("a", 5u64).at_least(50); // fail
-        checks.expect("b", 200u64).at_most(100); // fail
-        checks.expect("c", 42i32).eq(42); // pass
-        checks.expect("d", 7u64).between(10, 20); // fail
-        let r = checks.into_result();
-        assert!(!r.passed);
-        assert_eq!(
-            r.details.len(),
-            3,
-            "exactly the 3 failing claims must record details: {:?}",
-            r.details,
-        );
-        // Each subject name must appear in its own detail.
-        assert!(r.details.iter().any(|d| d.message.contains("a:")));
-        assert!(r.details.iter().any(|d| d.message.contains("b:")));
-        assert!(r.details.iter().any(|d| d.message.contains("d:")));
-        // Passing claim "c" must NOT have produced a detail.
-        assert!(
-            !r.details.iter().any(|d| d.message.contains("c:")),
-            "passing claim must not push a detail: {:?}",
-            r.details,
-        );
-    }
-
-    /// Per-claim `kind` override propagates into the recorded
-    /// detail, just like on `Expect`. A test running mixed-kind
-    /// claims sees per-claim categorization instead of every
-    /// failure landing under `DetailKind::Other`.
-    #[test]
-    fn checks_per_claim_kind_override_routes_to_detail() {
-        let mut checks = Checks::new();
-        checks
-            .expect("p99", 5000u64)
-            .kind(DetailKind::Benchmark)
-            .at_most(1000);
-        checks
-            .expect("locality", 0.5_f64)
-            .kind(DetailKind::PageLocality)
-            .at_least(0.9);
-        let r = checks.into_result();
-        assert!(!r.passed);
-        // One Benchmark and one PageLocality detail.
-        let bench = r
-            .details
-            .iter()
-            .find(|d| d.kind == DetailKind::Benchmark)
-            .expect("Benchmark kind must propagate");
-        assert!(bench.message.contains("p99"));
-        let loc = r
-            .details
-            .iter()
-            .find(|d| d.kind == DetailKind::PageLocality)
-            .expect("PageLocality kind must propagate");
-        assert!(loc.message.contains("locality"));
-    }
-
-    /// `Checks::merge` folds an external `AssertResult` (e.g. from
-    /// `assert_not_starved`) into the accumulator. A test that mixes
-    /// per-claim assertions with worker-roll-up assertions can do
-    /// both with one accumulator.
-    #[test]
-    fn checks_merge_folds_in_external_assert_result() {
-        let mut checks = Checks::new();
-        checks.expect("a", 100u64).at_least(50); // pass
-
-        let mut external = AssertResult::pass();
-        external.passed = false;
-        external
-            .details
-            .push(AssertDetail::new(DetailKind::Starved, "tid 7 starved"));
-        checks.merge(external);
-
-        // Add another claim AFTER merging — claims continue to
-        // accumulate alongside merged results.
-        checks.expect("b", 5u64).at_least(50); // fail
-
-        let r = checks.into_result();
-        assert!(!r.passed);
-        assert_eq!(r.details.len(), 2);
-        assert!(r.details.iter().any(|d| d.kind == DetailKind::Starved));
-        assert!(r.details.iter().any(|d| d.kind == DetailKind::Other));
-    }
-
-    /// `Checks::passed` and `Checks::detail_count` are read-only
-    /// peeks. They must reflect the current state without consuming
-    /// the accumulator — a test that conditionally adds a follow-up
-    /// claim only when the previous claims have all held depends on
-    /// this.
-    #[test]
-    fn checks_passed_and_detail_count_are_non_consuming_reads() {
-        let mut checks = Checks::new();
-        assert!(checks.passed());
-        assert_eq!(checks.detail_count(), 0);
-
-        checks.expect("x", 100u64).at_least(50); // pass
-        assert!(checks.passed());
-        assert_eq!(checks.detail_count(), 0);
-
-        checks.expect("y", 5u64).at_least(50); // fail
-        assert!(!checks.passed());
-        assert_eq!(checks.detail_count(), 1);
-
-        // Read again to confirm peeks are not consuming.
-        assert!(!checks.passed());
-        assert_eq!(checks.detail_count(), 1);
-
-        // The accumulator is still usable after the peeks.
-        checks.expect("z", 200u64).at_most(100); // fail
-        assert_eq!(checks.detail_count(), 2);
-    }
-
-    /// Floating-point comparators reach through `Checks::expect` the
-    /// same way integer comparators do. Pinned because the
-    /// `impl<'a> CheckBuilder<'a, f64>` block is reached only when
-    /// the inferred type of `value` is exactly `f64`. A regression
-    /// that hid `is_finite` / `near` behind a different bound (e.g.
-    /// a sealed trait) would surface here as a compile error in
-    /// the test body.
-    #[test]
-    fn checks_supports_f64_specific_comparators() {
-        let mut checks = Checks::new();
-        checks.expect("ratio", 0.95_f64).is_finite();
-        checks.expect("locality", 0.85_f64).near(0.9, 0.1);
-        let r = checks.into_result();
-        assert!(r.passed, "details: {:?}", r.details);
-
-        let mut checks = Checks::new();
-        checks.expect("nan", f64::NAN).is_finite();
-        checks.expect("far", 0.5_f64).near(0.9, 0.1);
-        let r = checks.into_result();
-        assert!(!r.passed);
-        assert_eq!(r.details.len(), 2);
-    }
-
-    /// End-to-end shape pinning: a representative test body that
-    /// uses `Checks` against a single worker report makes the
-    /// before/after pattern explicit. The "before" pattern (manual
-    /// `if x { return Ok(AssertResult::fail_msg(...)); }` chains)
-    /// lives all over `tests/jemalloc_probe_tests.rs`. This test
-    /// pins the "after" pattern so a regression that breaks the
-    /// fluent surface against a real `WorkerReport` shape surfaces
-    /// here, not in the integration test failure logs.
-    #[test]
-    fn checks_against_worker_report_reads_naturally() {
-        let report = WorkerReport {
-            tid: 4242,
-            work_units: 1_000_000,
-            cpu_time_ns: 2_500_000_000,
-            wall_time_ns: 5_000_000_000,
-            off_cpu_ns: 2_500_000_000,
-            migration_count: 3,
-            cpus_used: [0, 1].into_iter().collect(),
-            migrations: vec![],
-            max_gap_ms: 50,
-            max_gap_cpu: 0,
-            max_gap_at_ms: 1000,
-            resume_latencies_ns: vec![100, 200, 300, 400, 500],
-            wake_sample_total: 5,
-            iterations: 1000,
-            schedstat_run_delay_ns: 0,
-            schedstat_run_count: 0,
-            schedstat_cpu_time_ns: 0,
-            completed: true,
-            numa_pages: BTreeMap::new(),
-            vmstat_numa_pages_migrated: 0,
-            exit_info: None,
-            is_messenger: false,
-        };
-
-        let mut checks = Checks::new();
-        checks.expect("worker.tid", report.tid).eq(4242);
-        checks
-            .expect("worker.iterations", report.iterations)
-            .at_least(100);
-        checks
-            .expect("worker.migration_count", report.migration_count)
-            .at_most(10);
-        checks
-            .expect("worker.completed", report.completed)
-            .eq(true);
-        checks
-            .expect("worker.cpus_used.len", report.cpus_used.len())
-            .between(1, 4);
-        let r = checks.into_result();
-        assert!(r.passed, "details: {:?}", r.details);
-    }
-
-    /// Convenience: the `into_result()` of a passing accumulator is
-    /// observably equivalent to `AssertResult::pass()` in `passed` /
-    /// `skipped` / `details` shape. A regression that smuggled
-    /// extra state into the result via the builder would surface
-    /// here.
-    #[test]
-    fn checks_passing_into_result_matches_assert_result_pass() {
-        let r1 = Checks::new().into_result();
-        let r2 = AssertResult::pass();
-        assert_eq!(r1.passed, r2.passed);
-        assert_eq!(r1.skipped, r2.skipped);
-        assert_eq!(r1.details, r2.details);
-    }
-
-    /// `Expect::that` returns a builder annotated `#[must_use]`. We
-    /// can't directly test the lint fires, but we can pin that the
-    /// produced `AssertResult` is `#[must_use]`-clean: chaining a
-    /// comparator yields the result, and using it (assert! on
-    /// `.passed`) is sufficient. A regression that returned `()`
-    /// from a comparator would break this test body's compile.
-    #[test]
-    fn expect_comparators_return_assert_result() {
-        let r: AssertResult = Expect::that("x", 1u64).eq(1);
-        assert!(r.passed);
-        let r: AssertResult = Expect::that("x", 1.0_f64).is_finite();
-        assert!(r.passed);
-        let r: AssertResult = Expect::that("x", 1.0_f64).near(1.0, 0.0);
-        assert!(r.passed);
-    }
-
-    /// Fluent multi-claim chaining must compose: a comparator
-    /// returns `&mut Checks`, and `&mut Checks` lets the next
-    /// `.expect(...).<comparator>(...)` continue at the same line.
-    /// Pin the chained-expression shape so a regression that changes
-    /// the comparator return type to a non-borrow shape (e.g. owned
-    /// `Checks` by value) breaks here, not in the test code we
-    /// expect downstream authors to write.
-    #[test]
-    fn checks_supports_fluent_chained_expect_calls() {
-        let mut checks = Checks::new();
-        checks
-            .expect("a", 100u64)
-            .at_least(50)
-            .expect("b", 42i32)
-            .eq(42)
-            .expect("c", 0.5_f64)
-            .between(0.0, 1.0);
-        let r = checks.into_result();
-        assert!(r.passed, "details: {:?}", r.details);
-    }
-
-    /// `Checks::new()` followed by `into_result()` produces the same
-    /// observable shape as a direct `AssertResult::pass()` — including
-    /// a successful `serde` round-trip. A regression that smuggled
-    /// extra non-empty state into the accumulator's underlying
-    /// `AssertResult` would surface as a serde shape difference here
-    /// even when the `passed` flag still reads true.
-    #[test]
-    fn checks_passing_into_result_serializes_like_pass() {
-        let r1 = Checks::new().into_result();
-        let r2 = AssertResult::pass();
-        let s1 = serde_json::to_string(&r1).unwrap();
-        let s2 = serde_json::to_string(&r2).unwrap();
-        assert_eq!(
-            s1, s2,
-            "Checks-empty result must serialize identically to AssertResult::pass()",
-        );
-    }
-
-    /// NaN equality is IEEE 754: `NaN == NaN` is `false`, so
-    /// `Expect::that("x", NaN).eq(NaN)` FAILS, and `ne(NaN)` PASSES.
-    /// Pinned with explicit assertion so a future PR that papers
-    /// over the inequality (e.g. by special-casing `NaN.partial_cmp`)
-    /// breaks this test along with its doc comment in `Expect::eq`.
-    #[test]
-    fn expect_eq_ne_against_nan_follows_ieee_754() {
-        let r = Expect::that("x", f64::NAN).eq(f64::NAN);
-        assert!(
-            !r.passed,
-            "NaN == NaN is false per IEEE 754; eq(NaN) must FAIL: {:?}",
-            r.details
-        );
-
-        let r = Expect::that("x", f64::NAN).ne(f64::NAN);
-        assert!(
-            r.passed,
-            "NaN != NaN is true per IEEE 754; ne(NaN) must PASS: {:?}",
-            r.details
-        );
-
-        // The recommended NaN test routes through bool-of-`is_nan`:
-        let value = f64::NAN;
-        let r = Expect::that("x.is_nan", value.is_nan()).eq(true);
-        assert!(r.passed);
-    }
-
-    /// Subject names accepted regardless of underlying ownership.
-    /// Tests building dynamic subject names (`format!("worker.{i}")`)
-    /// rely on this.
-    #[test]
-    fn expect_accepts_owned_and_borrowed_subject_names() {
-        // &'static str.
-        assert!(Expect::that("static", 1u64).eq(1).passed);
-
-        // &String via Deref coercion.
-        let owned = String::from("owned");
-        assert!(Expect::that(&owned, 1u64).eq(1).passed);
-
-        // Inline format (the format! return is dropped at end of
-        // statement; the &str borrow lives just long enough).
-        assert!(
-            Expect::that(&format!("dynamic_{}", 7), 1u64)
-                .eq(1)
-                .passed
-        );
-    }
+    // The Verdict-based pointwise-claim tests live below the
+    // AssertResult helpers so the test source order mirrors the
+    // public API: AssertResult underlies both rolled-up scenario
+    // assertions and the per-claim Verdict accumulator.
 
     /// `AssertResult::note` records a `DetailKind::Note` detail
     /// without flipping `passed` or `skipped`. Tests downstream of
@@ -6852,76 +6537,656 @@ numa_miss 5";
         assert!(r2.details[0].message.contains("snapshot=disabled"));
     }
 
-    /// `Expect::because` adds the reason verbatim to the failure
-    /// message. The reason must be visible to the operator so a
-    /// regression that drops the parenthesized suffix surfaces as
-    /// a missing label.
+    // -- Verdict pointwise-claim API -------------------------------------
+    //
+    // The tests below exercise every comparator on every supported
+    // type bound (PartialEq, PartialOrd, f64-special, container) on
+    // [`Verdict`] / [`ClaimBuilder`] / [`SetClaim`] / [`SeqClaim`].
+    // Coverage mirrors what the previous Expect / Checks tests pinned,
+    // expressed in the new claim-based shape.
+
     #[test]
-    fn expect_because_reason_appears_in_failure_message() {
-        let r = Expect::that("counter", 5u64)
+    fn verdict_empty_is_passing() {
+        let r = Verdict::new().into_result();
+        assert!(r.passed);
+        assert!(r.details.is_empty());
+        assert_eq!(r.stats.total_workers, 0);
+    }
+
+    #[test]
+    fn verdict_default_matches_new() {
+        let d = Verdict::default();
+        let n = Verdict::new();
+        assert_eq!(d.passed(), n.passed());
+        assert_eq!(d.detail_count(), n.detail_count());
+    }
+
+    #[test]
+    fn verdict_assert_verdict_attaches_threshold_config() {
+        let v = Assert::defaults().verdict();
+        assert!(v.passed());
+        assert!(v.assert().is_some());
+
+        let v = Verdict::new();
+        assert!(v.assert().is_none());
+    }
+
+    #[test]
+    fn verdict_passing_into_result_matches_assert_result_pass() {
+        let r1 = Verdict::new().into_result();
+        let r2 = AssertResult::pass();
+        assert_eq!(r1.passed, r2.passed);
+        assert_eq!(r1.skipped, r2.skipped);
+        assert_eq!(r1.details, r2.details);
+    }
+
+    #[test]
+    fn claim_eq_pass_returns_passing_verdict() {
+        let mut v = Verdict::new();
+        let answer = 42u64;
+        claim!(v, answer).eq(42);
+        let r = v.into_result();
+        assert!(r.passed);
+        assert!(
+            r.details.is_empty(),
+            "passing comparator must not push a detail",
+        );
+    }
+
+    #[test]
+    fn claim_eq_fail_names_subject_and_values() {
+        let mut v = Verdict::new();
+        let answer = 42u64;
+        claim!(v, answer).eq(7);
+        let r = v.into_result();
+        assert!(!r.passed);
+        assert_eq!(r.details.len(), 1);
+        let d = &r.details[0];
+        assert_eq!(d.kind, DetailKind::Other);
+        assert!(d.message.contains("answer"), "msg: {}", d.message);
+        assert!(d.message.contains("expected"), "msg: {}", d.message);
+        assert!(d.message.contains("was"), "msg: {}", d.message);
+        assert!(d.message.contains("42"), "msg: {}", d.message);
+        assert!(d.message.contains('7'), "msg: {}", d.message);
+    }
+
+    #[test]
+    fn claim_ne_pass_and_fail() {
+        let mut v = Verdict::new();
+        let flag_pass = 0u64;
+        claim!(v, flag_pass).ne(1);
+        assert!(v.passed());
+
+        let mut v = Verdict::new();
+        let flag_fail = 1u64;
+        claim!(v, flag_fail).ne(1);
+        let r = v.into_result();
+        assert!(!r.passed);
+        assert!(r.details[0].message.contains("flag_fail"));
+        assert!(r.details[0].message.contains("!="));
+    }
+
+    #[test]
+    fn claim_at_least_boundary_is_inclusive() {
+        let mut v = Verdict::new();
+        let counter = 100u64;
+        claim!(v, counter).at_least(100);
+        assert!(v.passed());
+
+        let mut v = Verdict::new();
+        let counter = 99u64;
+        claim!(v, counter).at_least(100);
+        let r = v.into_result();
+        assert!(!r.passed);
+        assert!(r.details[0].message.contains("at least 100"));
+        assert!(r.details[0].message.contains("counter"));
+    }
+
+    #[test]
+    fn claim_at_most_boundary_is_inclusive() {
+        let mut v = Verdict::new();
+        let counter = 100u64;
+        claim!(v, counter).at_most(100);
+        assert!(v.passed());
+
+        let mut v = Verdict::new();
+        let counter = 101u64;
+        claim!(v, counter).at_most(100);
+        let r = v.into_result();
+        assert!(!r.passed);
+        assert!(r.details[0].message.contains("at most 100"));
+    }
+
+    #[test]
+    fn claim_lt_strict_upper_bound() {
+        let mut v = Verdict::new();
+        let x = 99u64;
+        claim!(v, x).lt(100);
+        assert!(v.passed());
+
+        let mut v = Verdict::new();
+        let x = 100u64;
+        claim!(v, x).lt(100);
+        let r = v.into_result();
+        assert!(!r.passed);
+        assert!(r.details[0].message.contains("less than 100"));
+    }
+
+    #[test]
+    fn claim_gt_strict_lower_bound() {
+        let mut v = Verdict::new();
+        let x = 101u64;
+        claim!(v, x).gt(100);
+        assert!(v.passed());
+
+        let mut v = Verdict::new();
+        let x = 100u64;
+        claim!(v, x).gt(100);
+        let r = v.into_result();
+        assert!(!r.passed);
+        assert!(r.details[0].message.contains("greater than 100"));
+    }
+
+    #[test]
+    fn claim_between_inclusive_on_both_ends() {
+        let mut v = Verdict::new();
+        let lo = 10u64;
+        let hi = 20u64;
+        let mid = 15u64;
+        claim!(v, lo).between(10, 20);
+        claim!(v, hi).between(10, 20);
+        claim!(v, mid).between(10, 20);
+        assert!(v.passed());
+
+        let mut v = Verdict::new();
+        let below = 9u64;
+        claim!(v, below).between(10, 20);
+        let r = v.into_result();
+        assert!(!r.passed);
+        assert!(r.details[0].message.contains("[10, 20]"));
+    }
+
+    #[test]
+    fn claim_between_inverted_interval_fails_with_visible_typo() {
+        let mut v = Verdict::new();
+        let x = 15u64;
+        claim!(v, x).between(20, 10);
+        let r = v.into_result();
+        assert!(!r.passed);
+        let msg = &r.details[0].message;
+        assert!(msg.contains("caller error"), "msg: {msg}");
+        assert!(msg.contains("interval inverted"), "msg: {msg}");
+        assert!(msg.contains("lo=20"), "msg: {msg}");
+        assert!(msg.contains("hi=10"), "msg: {msg}");
+    }
+
+    #[test]
+    fn claim_kind_override_is_persisted_to_detail() {
+        let mut v = Verdict::new();
+        let p99 = 5000u64;
+        claim!(v, p99).kind(DetailKind::Benchmark).at_most(1000);
+        let r = v.into_result();
+        assert!(!r.passed);
+        assert_eq!(r.details[0].kind, DetailKind::Benchmark);
+    }
+
+    #[test]
+    fn claim_default_kind_is_other() {
+        let mut v = Verdict::new();
+        let anything = 1u64;
+        claim!(v, anything).eq(2);
+        let r = v.into_result();
+        assert!(!r.passed);
+        assert_eq!(r.details[0].kind, DetailKind::Other);
+    }
+
+    #[test]
+    fn claim_works_across_concrete_types() {
+        let mut v = Verdict::new();
+        let counter = 1u64;
+        let pid = 42i32;
+        let len = 3usize;
+        claim!(v, counter).eq(1);
+        claim!(v, pid).at_least(0);
+        claim!(v, len).between(1, 5);
+        assert!(v.passed());
+    }
+
+    #[test]
+    fn claim_is_finite_passes_for_normal_values() {
+        for v_val in [0.0_f64, 1.0, -1.0, 1e308, -1e308] {
+            let mut v = Verdict::new();
+            let x = v_val;
+            claim!(v, x).is_finite();
+            assert!(v.passed(), "{v_val} should be finite");
+        }
+    }
+
+    #[test]
+    fn claim_is_finite_fails_for_nan_and_infinities() {
+        for v_val in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut v = Verdict::new();
+            let x = v_val;
+            claim!(v, x).is_finite();
+            let r = v.into_result();
+            assert!(!r.passed, "{v_val} must fail is_finite");
+            assert!(r.details[0].message.contains("expected finite"));
+        }
+    }
+
+    #[test]
+    fn claim_near_inclusive_at_tolerance_boundary() {
+        let mut v = Verdict::new();
+        let exact = 1.0_f64;
+        let on_edge = 1.001_f64;
+        claim!(v, exact).near(1.0, 0.001);
+        claim!(v, on_edge).near(1.0, 0.001);
+        assert!(v.passed());
+
+        let mut v = Verdict::new();
+        let outside = 1.002_f64;
+        claim!(v, outside).near(1.0, 0.001);
+        let r = v.into_result();
+        assert!(!r.passed);
+        assert!(r.details[0].message.contains("near 1"));
+    }
+
+    #[test]
+    fn claim_near_nan_input_fails() {
+        let mut v = Verdict::new();
+        let nan = f64::NAN;
+        claim!(v, nan).near(1.0, 0.5);
+        assert!(!v.passed());
+    }
+
+    #[test]
+    fn claim_near_negative_tolerance_is_caller_error() {
+        let mut v = Verdict::new();
+        let exact = 1.0_f64;
+        claim!(v, exact).near(1.0, -0.001);
+        let r = v.into_result();
+        assert!(
+            !r.passed,
+            "negative tolerance must surface as a caller-error fail",
+        );
+        let msg = &r.details[0].message;
+        assert!(msg.contains("caller error"), "msg: {msg}");
+        assert!(msg.contains("tolerance negative"), "msg: {msg}");
+        assert!(msg.contains("-0.001"), "msg: {msg}");
+    }
+
+    #[test]
+    fn claim_near_handles_infinity_equality() {
+        let mut v = Verdict::new();
+        let pos_inf = f64::INFINITY;
+        let neg_inf = f64::NEG_INFINITY;
+        claim!(v, pos_inf).near(f64::INFINITY, 0.001);
+        claim!(v, neg_inf).near(f64::NEG_INFINITY, 0.001);
+        assert!(
+            v.passed(),
+            "infinity == infinity must pass near() despite NaN diff",
+        );
+
+        let mut v = Verdict::new();
+        let pos_inf = f64::INFINITY;
+        claim!(v, pos_inf).near(f64::NEG_INFINITY, 0.001);
+        assert!(!v.passed());
+    }
+
+    #[test]
+    fn verdict_continues_past_failure_and_accumulates_all_details() {
+        let mut v = Verdict::new();
+        let a = 5u64;
+        let b = 200u64;
+        let c = 42i32;
+        let d = 7u64;
+        claim!(v, a).at_least(50); // fail
+        claim!(v, b).at_most(100); // fail
+        claim!(v, c).eq(42); // pass
+        claim!(v, d).between(10, 20); // fail
+        let r = v.into_result();
+        assert!(!r.passed);
+        assert_eq!(
+            r.details.len(),
+            3,
+            "exactly the 3 failing claims must record details: {:?}",
+            r.details,
+        );
+        assert!(r.details.iter().any(|d| d.message.contains("a:")));
+        assert!(r.details.iter().any(|d| d.message.contains("b:")));
+        assert!(r.details.iter().any(|d| d.message.contains("d:")));
+        assert!(
+            !r.details.iter().any(|d| d.message.contains("c:")),
+            "passing claim must not push a detail: {:?}",
+            r.details,
+        );
+    }
+
+    #[test]
+    fn verdict_per_claim_kind_override_routes_to_detail() {
+        let mut v = Verdict::new();
+        let p99 = 5000u64;
+        let locality = 0.5_f64;
+        claim!(v, p99).kind(DetailKind::Benchmark).at_most(1000);
+        claim!(v, locality).kind(DetailKind::PageLocality).at_least(0.9);
+        let r = v.into_result();
+        assert!(!r.passed);
+        let bench = r
+            .details
+            .iter()
+            .find(|d| d.kind == DetailKind::Benchmark)
+            .expect("Benchmark kind must propagate");
+        assert!(bench.message.contains("p99"));
+        let loc = r
+            .details
+            .iter()
+            .find(|d| d.kind == DetailKind::PageLocality)
+            .expect("PageLocality kind must propagate");
+        assert!(loc.message.contains("locality"));
+    }
+
+    #[test]
+    fn verdict_merge_folds_in_external_assert_result() {
+        let mut v = Verdict::new();
+        let a = 100u64;
+        claim!(v, a).at_least(50); // pass
+
+        let mut external = AssertResult::pass();
+        external.passed = false;
+        external
+            .details
+            .push(AssertDetail::new(DetailKind::Starved, "tid 7 starved"));
+        v.merge(external);
+
+        let b = 5u64;
+        claim!(v, b).at_least(50); // fail
+
+        let r = v.into_result();
+        assert!(!r.passed);
+        assert_eq!(r.details.len(), 2);
+        assert!(r.details.iter().any(|d| d.kind == DetailKind::Starved));
+        assert!(r.details.iter().any(|d| d.kind == DetailKind::Other));
+    }
+
+    #[test]
+    fn verdict_passed_and_detail_count_are_non_consuming_reads() {
+        let mut v = Verdict::new();
+        assert!(v.passed());
+        assert_eq!(v.detail_count(), 0);
+
+        let x = 100u64;
+        claim!(v, x).at_least(50);
+        assert!(v.passed());
+        assert_eq!(v.detail_count(), 0);
+
+        let y = 5u64;
+        claim!(v, y).at_least(50);
+        assert!(!v.passed());
+        assert_eq!(v.detail_count(), 1);
+
+        // Re-read to confirm peeks are non-consuming.
+        assert!(!v.passed());
+        assert_eq!(v.detail_count(), 1);
+
+        let z = 200u64;
+        claim!(v, z).at_most(100);
+        assert_eq!(v.detail_count(), 2);
+    }
+
+    #[test]
+    fn claim_against_cgroup_stats_via_derived_accessors() {
+        let cg = CgroupStats {
+            num_workers: 2,
+            num_cpus: 2,
+            max_gap_ms: 50,
+            total_iterations: 1000,
+            ..Default::default()
+        };
+
+        let mut v = Verdict::new();
+        cg.claim_max_gap_ms(&mut v).at_most(100);
+        cg.claim_num_workers(&mut v).between(1, 10);
+        cg.claim_total_iterations(&mut v).at_least(100);
+        let r = v.into_result();
+        assert!(r.passed, "details: {:?}", r.details);
+
+        // Failing claim still names the field.
+        let mut v = Verdict::new();
+        cg.claim_max_gap_ms(&mut v).at_most(10); // 50 > 10 → fail
+        let r = v.into_result();
+        assert!(!r.passed);
+        assert!(r.details[0].message.contains("max_gap_ms"));
+        assert!(r.details[0].message.contains("at most 10"));
+    }
+
+    #[test]
+    fn claim_against_worker_report_via_derived_accessors() {
+        let report = WorkerReport {
+            tid: 4242,
+            work_units: 1_000_000,
+            cpu_time_ns: 2_500_000_000,
+            wall_time_ns: 5_000_000_000,
+            off_cpu_ns: 2_500_000_000,
+            migration_count: 3,
+            cpus_used: [0, 1].into_iter().collect(),
+            migrations: vec![],
+            max_gap_ms: 50,
+            max_gap_cpu: 0,
+            max_gap_at_ms: 1000,
+            resume_latencies_ns: vec![100, 200, 300, 400, 500],
+            wake_sample_total: 5,
+            iterations: 1000,
+            schedstat_run_delay_ns: 0,
+            schedstat_run_count: 0,
+            schedstat_cpu_time_ns: 0,
+            completed: true,
+            numa_pages: BTreeMap::new(),
+            vmstat_numa_pages_migrated: 0,
+            exit_info: None,
+            is_messenger: false,
+        };
+
+        let mut v = Verdict::new();
+        report.claim_tid(&mut v).eq(4242);
+        report.claim_iterations(&mut v).at_least(100);
+        report.claim_migration_count(&mut v).at_most(10);
+        report.claim_completed(&mut v).eq(true);
+        report.claim_cpus_used(&mut v).len_at_most(4);
+        report.claim_resume_latencies_ns(&mut v).len_eq(5);
+        let r = v.into_result();
+        assert!(r.passed, "details: {:?}", r.details);
+    }
+
+    #[test]
+    fn claim_set_comparators_cover_membership_and_size() {
+        let s: BTreeSet<usize> = [1, 2, 3].into_iter().collect();
+        let mut v = Verdict::new();
+        v.claim_set("s", &s).contains(&1);
+        v.claim_set("s", &s).len_eq(3);
+        v.claim_set("s", &s).len_at_most(5);
+        v.claim_set("s", &s).len_at_least(1);
+        v.claim_set("s", &s).nonempty();
+        let allowed: BTreeSet<usize> = [1, 2, 3, 4].into_iter().collect();
+        v.claim_set("s", &s).subset_of(&allowed);
+        let forbidden: BTreeSet<usize> = [10, 11].into_iter().collect();
+        v.claim_set("s", &s).disjoint_from(&forbidden);
+        assert!(v.passed());
+
+        let empty: BTreeSet<usize> = BTreeSet::new();
+        let mut v = Verdict::new();
+        v.claim_set("s", &empty).empty();
+        assert!(v.passed());
+    }
+
+    #[test]
+    fn claim_seq_comparators_cover_membership_and_size() {
+        let v_seq: Vec<u64> = vec![10, 20, 30];
+        let mut verdict = Verdict::new();
+        verdict.claim_seq("seq", &v_seq).contains(&20);
+        verdict.claim_seq("seq", &v_seq).len_eq(3);
+        verdict.claim_seq("seq", &v_seq).len_at_most(10);
+        verdict.claim_seq("seq", &v_seq).len_at_least(1);
+        verdict.claim_seq("seq", &v_seq).nonempty();
+        assert!(verdict.passed());
+
+        let empty: Vec<u64> = vec![];
+        let mut verdict = Verdict::new();
+        verdict.claim_seq("seq", &empty).empty();
+        assert!(verdict.passed());
+    }
+
+    #[test]
+    fn verdict_skip_marks_skipped_without_failing() {
+        let mut v = Verdict::new();
+        v.skip("topology missing");
+        let r = v.into_result();
+        assert!(r.passed);
+        assert!(r.skipped);
+        assert!(r.details.iter().any(|d| {
+            d.kind == DetailKind::Skip && d.message.contains("topology missing")
+        }));
+    }
+
+    #[test]
+    fn verdict_skip_if_is_conditional() {
+        let mut v = Verdict::new();
+        v.skip_if(false, "nope");
+        assert!(!v.into_result().skipped);
+
+        let mut v = Verdict::new();
+        v.skip_if(true, "yep");
+        assert!(v.into_result().skipped);
+    }
+
+    #[test]
+    fn verdict_note_does_not_affect_verdict() {
+        let mut v = Verdict::new();
+        v.note("observed counter=12345");
+        let r = v.into_result();
+        assert!(r.passed);
+        assert!(!r.skipped);
+        assert_eq!(r.details.len(), 1);
+        assert_eq!(r.details[0].kind, DetailKind::Note);
+    }
+
+    #[test]
+    fn claim_eq_against_nan_follows_ieee_754() {
+        let mut v = Verdict::new();
+        let nan = f64::NAN;
+        claim!(v, nan).eq(f64::NAN);
+        assert!(
+            !v.passed(),
+            "NaN == NaN is false per IEEE 754; eq(NaN) must FAIL",
+        );
+
+        let mut v = Verdict::new();
+        let nan = f64::NAN;
+        claim!(v, nan).ne(f64::NAN);
+        assert!(
+            v.passed(),
+            "NaN != NaN is true per IEEE 754; ne(NaN) must PASS",
+        );
+
+        // The recommended NaN test routes through bool-of-`is_nan`:
+        let value = f64::NAN;
+        let mut v = Verdict::new();
+        let is_nan = value.is_nan();
+        claim!(v, is_nan).eq(true);
+        assert!(v.passed());
+    }
+
+    #[test]
+    fn claim_because_reason_appears_in_failure_message() {
+        let mut v = Verdict::new();
+        let counter = 5u64;
+        claim!(v, counter)
             .because("scheduler should have produced more events")
             .at_least(50);
+        let r = v.into_result();
         assert!(!r.passed);
         let msg = &r.details[0].message;
         assert!(
             msg.contains("scheduler should have produced more events"),
             "msg: {msg}"
         );
-        // Still names the subject and the threshold so the reason
-        // is additive context, not a replacement.
         assert!(msg.contains("counter"), "msg: {msg}");
         assert!(msg.contains("at least 50"), "msg: {msg}");
     }
 
-    /// `Checks::clone()` carries every accumulated state field
-    /// (passed flag and details). Tests that snapshot a partially-
-    /// built accumulator depend on the clone being a deep copy of
-    /// the underlying `AssertResult` rather than a shallow alias.
     #[test]
-    fn checks_clone_carries_state() {
-        let mut original = Checks::new();
-        original.expect("counter", 5u64).at_least(50); // fail → push detail
+    fn verdict_clone_carries_state() {
+        let mut original = Verdict::new();
+        let counter = 5u64;
+        claim!(original, counter).at_least(50); // fail → push detail
         let copy = original.clone();
         assert_eq!(original.passed(), copy.passed());
         assert_eq!(original.detail_count(), copy.detail_count());
 
         // Mutating one must not affect the other.
         let mut copy = copy;
-        copy.expect("more", 1u64).eq(1); // pass — no detail
+        let more = 1u64;
+        claim!(copy, more).eq(1); // pass — no detail
         assert_eq!(original.detail_count(), 1);
         assert_eq!(copy.detail_count(), 1);
 
-        // Adding a failing claim to copy keeps original untouched.
-        copy.expect("yet", 0u64).eq(1); // fail
+        let yet = 0u64;
+        claim!(copy, yet).eq(1); // fail
         assert_eq!(original.detail_count(), 1);
         assert_eq!(copy.detail_count(), 2);
     }
 
-    /// Merging `AssertResult::skipped()` into a `Checks` accumulator
-    /// must not flip the accumulator's `passed` bit — a skip is
-    /// neither pass nor fail. Same demote-on-merge rule as
-    /// `merge_skip_plus_pass_demotes_skip` but viewed from the
-    /// Checks API.
     #[test]
-    fn checks_merge_skipped_does_not_fail_accumulator() {
-        let mut checks = Checks::new();
-        checks.expect("counter", 100u64).at_least(50); // pass
-        checks.merge(AssertResult::skip("optional probe"));
+    fn verdict_merge_skipped_does_not_fail_accumulator() {
+        let mut v = Verdict::new();
+        let counter = 100u64;
+        claim!(v, counter).at_least(50); // pass
+        v.merge(AssertResult::skip("optional probe"));
         assert!(
-            checks.passed(),
+            v.passed(),
             "merging a skip must not flip the accumulator to failing",
         );
-        // The skip's note is appended to details, so detail_count
-        // includes the skip rationale even though the accumulator
-        // still passes.
-        let r = checks.into_result();
+        let r = v.into_result();
         assert!(r.passed);
-        // Merge of a skip carries the skip's details forward.
-        // (skip() emits a Note detail with the reason.)
         assert!(
             r.details.iter().any(|d| d.message.contains("optional probe")),
             "skip rationale must reach merged details: {:?}",
             r.details
+        );
+    }
+
+    /// `AssertDetail::display_with_kind` renders `[<variant>] <message>`
+    /// without altering the bare `Display` path. Pins both surfaces so a
+    /// regression that conflates the two (e.g. injecting the kind prefix
+    /// into the default formatter and breaking every consumer that
+    /// expected `format!("{}", d)` to produce just the message) trips
+    /// here.
+    #[test]
+    fn assert_detail_display_with_kind_prefixes_variant_token() {
+        let d = AssertDetail::new(DetailKind::Stuck, "tid 7 stuck 1500ms on cpu3");
+        assert_eq!(
+            d.to_string(),
+            "tid 7 stuck 1500ms on cpu3",
+            "bare Display must remain message-only",
+        );
+        assert_eq!(
+            d.display_with_kind().to_string(),
+            "[Stuck] tid 7 stuck 1500ms on cpu3",
+            "display_with_kind must prepend [<variant>]",
+        );
+    }
+
+    /// `display_with_kind` rendering uses the Debug form of the
+    /// variant (e.g. `SchedulerDied`), not the snake_case rename
+    /// from any future `serde::Serialize` impl. Pinning the spelling
+    /// for a multi-word variant catches a swap from `{:?}` to
+    /// `{:#?}` (which would line-break) or to a serde-driven
+    /// renderer (which could rename the token).
+    #[test]
+    fn assert_detail_display_with_kind_uses_debug_token_for_multiword_variant() {
+        let d = AssertDetail::new(DetailKind::SchedulerDied, "scheduler process died");
+        assert_eq!(
+            d.display_with_kind().to_string(),
+            "[SchedulerDied] scheduler process died",
         );
     }
 }

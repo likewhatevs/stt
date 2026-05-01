@@ -65,7 +65,7 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::os::unix::thread::JoinHandleExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -818,6 +818,64 @@ fn set_rt_priority(priority: i32, label: &str) {
     }
 }
 
+/// Wait for every vCPU thread's TID to publish into its slot, then
+/// open per-vCPU `perf_event_open` counters bound to those TIDs. The
+/// returned [`monitor::perf_counters::PerfCountersCapture`] is shared
+/// (via `Arc`) by the monitor sampling loop and the freeze
+/// coordinator so the per-tick timeline and the freeze-instant
+/// snapshot read through the same fds — opening twice would burn
+/// twice the perf slots and produce two slightly-different time
+/// bases.
+///
+/// `vcpu_tid_slots[i]` is the AP-thread-published TID for vCPU `i`
+/// (0 = BSP, written synchronously before this function runs). AP
+/// slots may still be `0` if an AP hasn't reached its
+/// `tid_slot.store` yet; poll up to 1s. Any slot still `0` at the
+/// deadline is treated as "no perf data for that vCPU"; the whole
+/// capture returns `None` so the timeline + freeze paths consume
+/// `Option::as_ref()` and emit `None` per-CPU.
+///
+/// Failure paths (perf_event_paranoid too high, missing
+/// CAP_PERFMON, hardware lacks the requested counter) log a warning
+/// via `tracing::warn!` and return `None`. The dump pipeline still
+/// runs without per-vCPU perf data.
+fn open_vcpu_perf_capture(
+    vcpu_tid_slots: &[Arc<AtomicI32>],
+) -> Option<monitor::perf_counters::PerfCountersCapture> {
+    let perf_deadline = Instant::now() + Duration::from_secs(1);
+    let mut tids: Vec<libc::pid_t> = Vec::with_capacity(vcpu_tid_slots.len());
+    for slot in vcpu_tid_slots {
+        let mut v = slot.load(Ordering::Acquire);
+        while v == 0 && Instant::now() < perf_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+            v = slot.load(Ordering::Acquire);
+        }
+        tids.push(v);
+    }
+    if !tids.iter().all(|&t| t > 0) {
+        let missing: Vec<usize> = tids
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &t)| (t == 0).then_some(i))
+            .collect();
+        tracing::warn!(
+            ?missing,
+            "vCPU TID slots never published; per-vCPU perf capture disabled"
+        );
+        return None;
+    }
+    match monitor::perf_counters::PerfCountersCapture::open(&tids) {
+        Ok(cap) => Some(cap),
+        Err(e) => {
+            tracing::warn!(
+                err = %e,
+                "perf_event_open failed; per-vCPU IPC/cache-miss capture disabled"
+            );
+            None
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // VmResult
 // ---------------------------------------------------------------------------
@@ -1432,7 +1490,14 @@ impl KtstrVm {
         // convention, and `pin_targets` is empty in this branch.
         let no_perf_mask: Option<&[usize]> = self.no_perf_plan.as_ref().map(|p| p.cpus.as_slice());
         // Interactive shell does not run a freeze coordinator, so
-        // discard the freeze-handle Vecs.
+        // discard the freeze-handle Vecs. Interactive mode also skips
+        // the perf-counter capture path; allocate empty TID slots so
+        // the spawn signature is honored without producing values
+        // anything reads.
+        let n_aps = vcpus.len();
+        let ap_tid_slots: Vec<Arc<AtomicI32>> = (0..n_aps)
+            .map(|_| Arc::new(AtomicI32::new(0)))
+            .collect();
         let (ap_threads, _ap_freeze) = self.spawn_ap_threads(
             vcpus,
             has_immediate_exit,
@@ -1443,6 +1508,7 @@ impl KtstrVm {
             &freeze,
             &ap_pins,
             no_perf_mask,
+            &ap_tid_slots,
         )?;
 
         // BSP kick handles for the stdin escape sequence. The stdin thread
@@ -2658,6 +2724,16 @@ impl KtstrVm {
         // hard pin). Mutually exclusive with perf-mode's pin_targets.
         let no_perf_mask: Option<&[usize]> = self.no_perf_plan.as_ref().map(|p| p.cpus.as_slice());
 
+        // Per-AP TID slots — each AP thread stamps gettid() into its
+        // slot at startup so the monitor can open per-vCPU
+        // perf_event_open counters bound to the right thread (#26).
+        // Index = AP index (0-based among APs); the BSP TID is stamped
+        // into a separate slot below since it runs on the current
+        // thread.
+        let ap_tid_slots: Vec<Arc<AtomicI32>> = (0..vcpus.len())
+            .map(|_| Arc::new(AtomicI32::new(0)))
+            .collect();
+
         let (ap_threads, ap_freeze_handles) = self.spawn_ap_threads(
             vcpus,
             has_immediate_exit,
@@ -2668,6 +2744,7 @@ impl KtstrVm {
             &freeze,
             &ap_pins,
             no_perf_mask,
+            &ap_tid_slots,
         )?;
 
         // Pin / mask BSP (runs on current thread, pid=0 means calling thread).
@@ -2691,7 +2768,43 @@ impl KtstrVm {
             pts
         };
 
-        let monitor_handle = self.start_monitor(&vm, &kill, run_start, vcpu_pthreads)?;
+        // Build the per-vCPU TID vec the monitor needs for
+        // `perf_event_open(2)`. Index 0 is the BSP — running on this
+        // thread, so SYS_gettid here returns the current thread's
+        // TID. Indexes 1..n are AP slots stamped by each AP thread at
+        // startup. Slots may still be 0 here if an AP hasn't reached
+        // its tid_slot.store; the monitor polls them with a deadline
+        // before opening counters and skips per-vCPU perf for any
+        // slot still 0 at the deadline.
+        let bsp_tid_slot = Arc::new(AtomicI32::new(unsafe {
+            libc::syscall(libc::SYS_gettid) as i32
+        }));
+        let vcpu_tid_slots: Vec<Arc<AtomicI32>> = std::iter::once(bsp_tid_slot)
+            .chain(ap_tid_slots.iter().cloned())
+            .collect();
+
+        // Open per-vCPU `perf_event_open` counters once at run-vm
+        // scope so both the monitor thread (per-tick timeline) and
+        // the freeze coordinator (freeze-instant snapshot) can read
+        // through a shared `Arc`. Polling vCPU TIDs here (rather than
+        // inside the monitor closure) lets the freeze coord see a
+        // consistent capture immediately when the latch fires —
+        // before the monitor has even taken its first sample. AP
+        // threads stamp their TID into the slots before they enter
+        // KVM_RUN; BSP slot is stamped synchronously above.
+        // `Arc<Option<...>>` lets a host that lacks
+        // `perf_event_open` permission still run the rest of the
+        // dump pipeline; the inner Option is None and every
+        // consumer's `as_ref()` chain produces None for that field.
+        let perf_capture = Arc::new(open_vcpu_perf_capture(&vcpu_tid_slots));
+
+        let monitor_handle = self.start_monitor(
+            &vm,
+            &kill,
+            run_start,
+            vcpu_pthreads,
+            perf_capture.clone(),
+        )?;
 
         // BPF map write thread: sleeps, discovers a BPF map, writes a value.
         let bpf_write_handle = self.start_bpf_map_write(&vm, &kill)?;
@@ -2785,6 +2898,13 @@ impl KtstrVm {
         let freeze_coord_bsp_parked = bsp_parked.clone();
         let freeze_coord_bsp_regs = bsp_regs.clone();
         let freeze_coord_bsp_done = bsp_done.clone();
+        // Shared per-vCPU perf-counter capture (#26). The Arc lets the
+        // monitor sampling loop (per-tick timeline) and the freeze
+        // coordinator (freeze-instant snapshot) read through the same
+        // fds. Inner `Option` is `None` when `perf_event_open` was
+        // unavailable on the host; both consumers gracefully degrade
+        // to "no perf data" without aborting the run.
+        let freeze_coord_perf_capture = perf_capture.clone();
         let freeze_coord_vmlinux = find_vmlinux(&self.kernel);
         // Optional file sink for the failure-dump JSON. Cloned out
         // of the builder field so the closure owns a copy and the
@@ -2921,9 +3041,9 @@ impl KtstrVm {
                 // permanently if the guest hadn't booted yet,
                 // disabling freeze detection AND the dump for the
                 // entire run.
-                let mut owned_accessor: Option<crate::monitor::bpf_map::GuestMemAccessorOwned> =
+                let mut owned_accessor: Option<crate::monitor::bpf_map::GuestMemMapAccessorOwned> =
                     None;
-                // Lazy-construct BpfProgAccessorOwned for the
+                // Lazy-construct GuestMemProgAccessorOwned for the
                 // failure-dump prog_runtime_stats capture. Same
                 // boot-race rationale as `owned_accessor`: the
                 // GuestKernel handshake depends on guest-memory
@@ -2938,7 +3058,7 @@ impl KtstrVm {
                 // exposes maps but lacks `prog_idr` (theoretical)
                 // still gets map rendering.
                 let mut owned_prog_accessor:
-                    Option<crate::monitor::bpf_prog::BpfProgAccessorOwned> = None;
+                    Option<crate::monitor::bpf_prog::GuestMemProgAccessorOwned> = None;
                 // Per-CPU offset array used by `runtime_stats` to
                 // locate each CPU's `bpf_prog_stats` slot. Resolved
                 // once after `owned_prog_accessor` lands by reading
@@ -2967,6 +3087,22 @@ impl KtstrVm {
                 let dump_arena_offsets = dump_btf
                     .as_ref()
                     .and_then(|btf| crate::monitor::arena::BpfArenaOffsets::from_btf(btf).ok());
+                // Per-CPU CPU-time / softirq / IRQ / iowait offsets
+                // and the matching `.data..percpu` symbol KVAs.
+                // Resolved once at coordinator start, mirroring
+                // `dump_arena_offsets`. Both Option-typed: a stripped
+                // vmlinux without any of `kernel_cpustat` / `kstat` /
+                // `tick_cpu_sched` symbols still resolves the BTF
+                // offsets fine, but the dump path checks both sides
+                // before constructing a `CpuTimeCapture` so the
+                // capture site only fires when the data is actually
+                // readable.
+                let dump_cpu_time_offsets = dump_btf
+                    .as_ref()
+                    .and_then(|btf| crate::monitor::btf_offsets::CpuTimeOffsets::from_btf(btf).ok());
+                let dump_cpu_time_symbols = freeze_coord_vmlinux
+                    .as_ref()
+                    .and_then(|v| crate::monitor::symbols::KernelSymbols::from_vmlinux(v).ok());
                 // Lazy-discovered cached PA of `ktstr_err_exit_detected`
                 // within the probe BPF program's .bss map. None until
                 // the probe loads into map_idr (rust_init phase 2b);
@@ -3068,11 +3204,11 @@ impl KtstrVm {
                             (freeze_coord_mem.as_ref(), freeze_coord_vmlinux.as_ref())
                     {
                         owned_accessor =
-                            crate::monitor::bpf_map::GuestMemAccessorOwned::new(mem, vmlinux).ok();
+                            crate::monitor::bpf_map::GuestMemMapAccessorOwned::new(mem, vmlinux).ok();
                     }
                     // Lazy retry for the prog-side accessor. Same
                     // pattern as `owned_accessor` above: the
-                    // BpfProgAccessorOwned needs the GuestKernel
+                    // GuestMemProgAccessorOwned needs the GuestKernel
                     // handshake (boot-time symbols) AND the BTF
                     // parse to succeed, so coord-start may be too
                     // early. Retry each iteration until success.
@@ -3081,7 +3217,7 @@ impl KtstrVm {
                             (freeze_coord_mem.as_ref(), freeze_coord_vmlinux.as_ref())
                     {
                         owned_prog_accessor =
-                            crate::monitor::bpf_prog::BpfProgAccessorOwned::new(mem, vmlinux).ok();
+                            crate::monitor::bpf_prog::GuestMemProgAccessorOwned::new(mem, vmlinux).ok();
                     }
                     // Resolve the per-CPU offset array once the prog
                     // accessor lands. Reads `__per_cpu_offset` from
@@ -3572,27 +3708,126 @@ impl KtstrVm {
                                 // empty `prog_runtime_stats` vec
                                 // alongside the full map render.
                                 let prog_acc_borrow =
-                                    owned_prog_accessor.as_ref().and_then(
-                                        |o| o.as_accessor().ok(),
-                                    );
+                                    owned_prog_accessor.as_ref().map(|o| o.as_accessor());
                                 let prog_capture = match (
                                     prog_acc_borrow.as_ref(),
                                     prog_per_cpu_offsets.as_deref(),
                                 ) {
                                     (Some(acc), Some(offsets)) => {
                                         Some(crate::monitor::dump::ProgRuntimeCapture {
-                                            prog_accessor: acc,
+                                            accessor: acc,
                                             per_cpu_offsets: offsets,
                                         })
                                     }
                                     _ => None,
                                 };
+                                let map_accessor = owned.as_accessor();
+                                // Per-CPU CPU-time / softirq / IRQ
+                                // capture context. All four prereqs
+                                // must be present to fire: BTF
+                                // offsets (resolved at coord start),
+                                // KernelSymbols carrying the
+                                // `kernel_cpustat`/`kstat`
+                                // per-CPU symbol KVAs (also at coord
+                                // start), the per-CPU offset array
+                                // (lazy-resolved alongside the prog
+                                // accessor), and the freeze-coord
+                                // GuestMem. Either of `kernel_cpustat`
+                                // or `kstat` symbol absent makes the
+                                // capture useless — both backing
+                                // structs are needed for the dump's
+                                // narrative (`tick_cpu_sched` is
+                                // optional and feeds only the
+                                // iowait_sleeptime field). The
+                                // `tick_cpu_sched_kva` is forwarded
+                                // to dump.rs as Option so the per-CPU
+                                // walker can skip iowait_sleeptime
+                                // independently per CPU.
+                                let cpu_time_capture = match (
+                                    freeze_coord_mem.as_ref(),
+                                    dump_cpu_time_offsets.as_ref(),
+                                    dump_cpu_time_symbols.as_ref(),
+                                    prog_per_cpu_offsets.as_deref(),
+                                ) {
+                                    (Some(mem), Some(offsets), Some(syms), Some(pcpu)) => {
+                                        match (syms.kernel_cpustat, syms.kstat) {
+                                            (Some(kcpustat_kva), Some(kstat_kva)) => {
+                                                let page_offset =
+                                                    owned.guest_kernel().page_offset();
+                                                Some(crate::monitor::dump::CpuTimeCapture {
+                                                    mem,
+                                                    offsets,
+                                                    kernel_cpustat_kva: kcpustat_kva,
+                                                    kstat_kva,
+                                                    tick_cpu_sched_kva: syms.tick_cpu_sched,
+                                                    per_cpu_offsets: pcpu,
+                                                    page_offset,
+                                                })
+                                            }
+                                            _ => None,
+                                        }
+                                    }
+                                    _ => None,
+                                };
                                 let mut report = crate::monitor::dump::dump_state(
-                                    &owned.as_accessor(),
-                                    btf,
-                                    freeze_coord_num_cpus,
-                                    dump_arena_offsets.as_ref(),
-                                    prog_capture,
+                                    crate::monitor::dump::DumpContext {
+                                        accessor: &map_accessor,
+                                        btf,
+                                        num_cpus: freeze_coord_num_cpus,
+                                        arena_offsets: dump_arena_offsets.as_ref(),
+                                        prog_capture: prog_capture.as_ref(),
+                                        cpu_time_capture: cpu_time_capture.as_ref(),
+                                        // Per-task enrichment is library-ready
+                                        // but has no walker producer until #50
+                                        // (rq->scx walker) lands. The
+                                        // `task_enrichments_unavailable` field
+                                        // records this state so the dump
+                                        // consumer sees "no task walker
+                                        // available" rather than a silent empty
+                                        // vec.
+                                        task_enrichment_capture: None,
+                                        // Per-sample SCX_EV_* event counter
+                                        // timeline. Today's freeze coordinator
+                                        // does not share the monitor sampler's
+                                        // accumulated samples vec — that
+                                        // would require an Arc<Mutex<...>>
+                                        // hand-off plumbed through
+                                        // `start_monitor` / `monitor_loop`.
+                                        // Leaving None preserves current
+                                        // behavior (event_counter_timeline
+                                        // stays empty in the failure dump
+                                        // JSON); the timeline is still
+                                        // recorded on `VmResult.monitor.samples`
+                                        // for the post-run sidecar consumer.
+                                        // A future task wiring the share
+                                        // populates this with
+                                        // `Some(EventCounterCapture { samples })`.
+                                        event_counter_capture: None,
+                                        // Per-CPU rq->scx + DSQ walker.
+                                        // Library-ready (#49 + #50 LOC); the
+                                        // freeze coordinator hasn't yet
+                                        // resolved ScxWalkerOffsets nor
+                                        // built the rq_kvas/rq_pas arrays
+                                        // outside the dual_snapshot
+                                        // scan_ctx path. A follow-up wires
+                                        // the resolved offsets + rq arrays
+                                        // through. Until then, the dump
+                                        // emits empty rq_scx_states /
+                                        // dsq_states with
+                                        // `scx_walker_unavailable: Some(
+                                        // "no scx walker capture")`.
+                                        scx_walker_capture: None,
+                                        // Per-vCPU PMU capture is shared
+                                        // with the monitor sampler via the
+                                        // `freeze_coord_perf_capture` Arc;
+                                        // dump_state reads it once at the
+                                        // freeze instant into
+                                        // `vcpu_perf_at_freeze`. None when
+                                        // perf was unavailable on this host
+                                        // (paranoid > 2 / no CAP_PERFMON /
+                                        // hardware lacks counters).
+                                        perf_capture: (*freeze_coord_perf_capture).as_ref(),
+                                    },
                                 );
                                 report.vcpu_regs = collect_vcpu_regs();
                                 Some(report)
@@ -3604,6 +3839,22 @@ impl KtstrVm {
                                     vcpu_regs: collect_vcpu_regs(),
                                     sdt_allocations: Vec::new(),
                                     prog_runtime_stats: Vec::new(),
+                                    prog_runtime_stats_unavailable: Some(
+                                        "dump prerequisites unavailable".to_string(),
+                                    ),
+                                    per_cpu_time: Vec::new(),
+                                    task_enrichments: Vec::new(),
+                                    task_enrichments_unavailable: Some(
+                                        "dump prerequisites unavailable".to_string(),
+                                    ),
+                                    event_counter_timeline: Vec::new(),
+                                    rq_scx_states: Vec::new(),
+                                    dsq_states: Vec::new(),
+                                    scx_sched_state: None,
+                                    scx_walker_unavailable: Some(
+                                        "dump prerequisites unavailable".to_string(),
+                                    ),
+                                    vcpu_perf_at_freeze: Vec::new(),
                                 };
                                 tracing::warn!(
                                     owned_accessor = owned_accessor.is_some(),
@@ -3938,6 +4189,7 @@ impl KtstrVm {
         freeze: &Arc<AtomicBool>,
         pin_targets: &[Option<usize>],
         no_perf_mask: Option<&[usize]>,
+        ap_tid_slots: &[Arc<AtomicI32>],
     ) -> Result<(Vec<VcpuThread>, ApFreezeHandles)> {
         // Register the process-wide panic hook that flips `kill` +
         // `exited` on a panicking vCPU thread before the
@@ -3945,6 +4197,7 @@ impl KtstrVm {
         // `Once`; safe to call on every VM spawn.
         vcpu_panic::install_once();
         let n = vcpus.len();
+        debug_assert_eq!(ap_tid_slots.len(), n);
         let mut ap_threads: Vec<VcpuThread> = Vec::with_capacity(n);
         let mut freeze_parked: Vec<Arc<AtomicBool>> = Vec::with_capacity(n);
         let mut freeze_regs: Vec<Arc<std::sync::Mutex<Option<exit_dispatch::VcpuRegSnapshot>>>> =
@@ -3975,10 +4228,21 @@ impl KtstrVm {
                 kill: kill.clone(),
                 exited: exited.clone(),
             };
+            let tid_slot_clone = ap_tid_slots[i].clone();
             let handle = std::thread::Builder::new()
                 .name(format!("vcpu-{}", i + 1))
                 .spawn(move || {
                     register_vcpu_signal_handler();
+                    // Stamp this thread's Linux TID into the per-AP
+                    // slot so the monitor can open `perf_event_open`
+                    // counters bound to the vCPU thread (#26). Done
+                    // BEFORE pinning / RT / KVM_RUN so the value is
+                    // visible to any reader the moment the thread is
+                    // schedulable. SAFETY: SYS_gettid is the
+                    // standard syscall returning this thread's
+                    // pid_t; no inputs.
+                    let tid = unsafe { libc::syscall(libc::SYS_gettid) } as i32;
+                    tid_slot_clone.store(tid, Ordering::Release);
                     if let Some(cpu) = pin_cpu {
                         pin_current_thread(cpu, &format!("vCPU {}", i + 1));
                     } else if let Some(mask) = mask_for_thread.as_deref() {
@@ -4029,6 +4293,7 @@ impl KtstrVm {
         kill: &Arc<AtomicBool>,
         run_start: Instant,
         vcpu_pthreads: Vec<libc::pthread_t>,
+        perf_capture: Arc<Option<monitor::perf_counters::PerfCountersCapture>>,
     ) -> Result<Option<JoinHandle<monitor::reader::MonitorLoopResult>>> {
         let Some(vmlinux) = find_vmlinux(&self.kernel) else {
             return Ok(None);
@@ -4192,23 +4457,23 @@ impl KtstrVm {
                         .ok()
                         .and_then(|prog_offsets| {
                             let prog_idr_kva = symbols.prog_idr?;
-                            let cached = monitor::bpf_prog::discover_struct_ops_stats(
-                                &mem,
-                                cr3_pa,
-                                page_offset,
-                                prog_idr_kva,
-                                &prog_offsets,
-                                l5,
-                            );
-                            if cached.is_empty() {
-                                return None;
-                            }
+                            // The fused walker
+                            // (`walk_struct_ops_runtime_stats`) re-walks
+                            // `prog_idr` each sample, which is cheap on
+                            // ktstr workloads (idr_next is in the
+                            // dozens) and removes the staleness window
+                            // the prior cached-discovery design opened.
+                            // No upfront discovery — the walker
+                            // returns an empty Vec when no struct_ops
+                            // programs are loaded yet, and the monitor
+                            // sample emits an empty `prog_stats` for
+                            // those cycles.
                             Some(monitor::reader::ProgStatsCtx {
-                                cached,
                                 per_cpu_offsets: offsets_arr.clone(),
                                 cr3_pa,
                                 page_offset,
                                 l5,
+                                prog_idr_kva,
                                 offsets: prog_offsets,
                             })
                         });
@@ -4218,6 +4483,12 @@ impl KtstrVm {
                     dump_trigger: dump_trigger.as_ref(),
                     watchdog_override: watchdog_override.as_ref(),
                     vcpu_timing: Some(&vcpu_timing),
+                    // `perf_capture` is `Arc<Option<PerfCountersCapture>>`;
+                    // outer deref through `Arc::as_ref` yields
+                    // `&Option<PerfCountersCapture>`, inner
+                    // `Option::as_ref` yields the
+                    // `Option<&PerfCountersCapture>` MonitorConfig wants.
+                    perf_capture: (*perf_capture).as_ref(),
                     preemption_threshold_ns,
                     shm_base_pa,
                     prog_stats_ctx: prog_stats_ctx.as_ref(),
@@ -4297,7 +4568,7 @@ impl KtstrVm {
                 let phase1_deadline =
                     std::time::Instant::now() + std::time::Duration::from_secs(30);
                 let owned = loop {
-                    match monitor::bpf_map::GuestMemAccessorOwned::new(&mem, &vmlinux) {
+                    match monitor::bpf_map::GuestMemMapAccessorOwned::new(&mem, &vmlinux) {
                         Ok(a) => break a,
                         Err(e) => {
                             if kill_clone.load(Ordering::Acquire) {
@@ -4730,10 +5001,15 @@ impl KtstrVm {
             Err(_) => return Vec::new(),
         };
         let accessor =
-            match monitor::bpf_prog::BpfProgAccessor::from_guest_kernel(&kernel, &offsets) {
+            match monitor::bpf_prog::GuestMemProgAccessor::from_guest_kernel(&kernel, &offsets) {
                 Ok(a) => a,
                 Err(_) => return Vec::new(),
             };
+        // Trait method — `BpfProgAccessor::struct_ops_progs` is in
+        // scope at the call site via the `use monitor::bpf_prog::*`
+        // glob (see top of file); calling it on the concrete type
+        // dispatches statically.
+        use monitor::bpf_prog::BpfProgAccessor;
         accessor.struct_ops_progs()
     }
 }

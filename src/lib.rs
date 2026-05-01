@@ -105,6 +105,47 @@
 //! }
 //! ```
 //!
+//! For pointwise assertions against captured stats — the most direct
+//! way to express "this counter is at least N", "this rate is between
+//! A and B", "this metric is finite" — use [`Verdict`] +
+//! `#[derive(Claim)]` accessors and the [`claim!`] macro:
+//!
+//! ```rust
+//! use ktstr::prelude::*;
+//! use ktstr::workload::WorkerReport;
+//! use std::collections::{BTreeMap, BTreeSet};
+//!
+//! // A test author would obtain `cg` and `report` from `ctx`-driven
+//! // execution; the literal here just illustrates the assertion shape.
+//! let cg = CgroupStats {
+//!     num_workers: 2,
+//!     num_cpus: 2,
+//!     max_gap_ms: 50,
+//!     p99_wake_latency_us: 25.0,
+//!     median_wake_latency_us: 10.0,
+//!     total_iterations: 5_000,
+//!     ..Default::default()
+//! };
+//! let work_units = 10_000u64;
+//! let throughput = work_units as f64 / 5.0;
+//!
+//! let mut v = Assert::defaults().verdict();
+//! cg.claim_max_gap_ms(&mut v).at_most(100);          // typed CgroupStats accessor
+//! cg.claim_p99_wake_latency_us(&mut v).at_most(50.0);
+//! cg.claim_total_iterations(&mut v).at_least(1_000);
+//! claim!(v, work_units).at_least(5_000);             // local-binding label
+//! claim!(v, throughput).is_finite();                  // expression label
+//! claim!(v, cg.wake_latency_tail_ratio()).between(1.0, 5.0);
+//! let r = v.into_result();
+//! assert!(r.passed);
+//! ```
+//!
+//! Every claim is labeled by `stringify!` on either a struct field name
+//! (via the derive) or an identifier/expression (via the macro), so a
+//! rename or refactor updates the failure-message label automatically
+//! and a stale call site fails to compile. There is no manual-string
+//! escape hatch — by design, every label is source-text-grounded.
+//!
 //! Run with `cargo nextest run` (requires `/dev/kvm`).
 //!
 //! See the [`prelude`] module for the full set of re-exports.
@@ -393,6 +434,7 @@ pub fn cache_key_suffix() -> String {
     kconfig_hash()
 }
 
+pub use ktstr_macros::Claim;
 pub use ktstr_macros::Payload;
 pub use ktstr_macros::Scheduler;
 pub use ktstr_macros::ktstr_test;
@@ -439,7 +481,10 @@ pub mod prelude {
     // spelling is intentional: `#[derive(Scheduler)]` generates a
     // `static` of type `Scheduler`, and matching the derive-macro
     // name to its emitted type reads naturally at the call site.
-    pub use crate::assert::{Assert, AssertResult, CheckBuilder, Checks, DetailKind, Expect};
+    pub use crate::assert::{
+        Assert, AssertResult, ClaimBuilder, DetailKind, SeqClaim, SetClaim, Verdict,
+    };
+    pub use crate::claim;
     pub use crate::cgroup::CgroupManager;
     pub use crate::host_context::HostContext;
     pub use crate::host_heap::HostHeapState;

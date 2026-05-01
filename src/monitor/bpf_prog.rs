@@ -135,30 +135,32 @@ impl std::fmt::Display for ProgRuntimeStats {
     }
 }
 
-/// Cached per-program info for repeated stats reads in the monitor loop.
-/// Pre-resolved at startup to avoid IDR walks each cycle.
-#[derive(Debug, Clone)]
-pub struct CachedProgInfo {
-    /// Program name from bpf_prog_aux.
-    pub name: String,
-    /// Per-CPU `bpf_prog_stats` KVA (the __percpu base pointer).
-    pub stats_percpu_kva: u64,
-}
-
-/// Enumerate struct_ops programs and cache their stats pointers.
+/// Walk `prog_idr` and produce per-program runtime stats in a single
+/// IDR pass.
 ///
-/// Walks `prog_idr` once. For each struct_ops program reads
-/// `bpf_prog->stats` (percpu pointer) and `bpf_prog_aux->name` via
-/// the aux pointer on `bpf_prog`. Returns cached info for use by
-/// `read_prog_runtime_stats` in the monitor loop.
-pub(crate) fn discover_struct_ops_stats(
+/// Folds the previous discover-then-read split into one visitor: for
+/// each struct_ops program reached via `xa_load`, read
+/// `bpf_prog->stats` (per-CPU base) and `bpf_prog_aux->name` and then
+/// sum `cnt`/`nsecs`/`misses` across `per_cpu_offsets`. Halves the
+/// per-prog kernel-memory reads relative to the prior split (one
+/// `prog_idr` walk and one `bpf_prog`/`aux` translate per program
+/// instead of two of each).
+///
+/// `cnt`/`nsecs`/`misses` are u64 monotonic counters per the kernel's
+/// `struct bpf_prog_stats` (include/linux/filter.h) — see
+/// [`ProgRuntimeStats`] for provenance and the saturation contract.
+/// Address translation uses [`translate_any_kva`] so per-CPU pages
+/// served from vmalloc'd memory (`pcpu_get_vm_areas`) translate
+/// correctly alongside direct-mapping percpu allocations.
+pub(crate) fn walk_struct_ops_runtime_stats(
     mem: &GuestMem,
     cr3_pa: u64,
     page_offset: u64,
     prog_idr_kva: u64,
     offsets: &BpfProgOffsets,
     l5: bool,
-) -> Vec<CachedProgInfo> {
+    per_cpu_offsets: &[u64],
+) -> Vec<ProgRuntimeStats> {
     let idr_pa = text_kva_to_pa(prog_idr_kva);
 
     let xa_head = mem.read_u64(idr_pa, offsets.idr_xa_head);
@@ -167,7 +169,7 @@ pub(crate) fn discover_struct_ops_stats(
     }
     let idr_next = mem.read_u32(idr_pa, offsets.idr_next);
 
-    let mut cached = Vec::new();
+    let mut stats_out = Vec::new();
 
     for id in 0..idr_next {
         let Some(entry) = xa_load(
@@ -197,7 +199,6 @@ pub(crate) fn discover_struct_ops_stats(
         if aux_kva == 0 {
             continue;
         }
-
         let Some(aux_pa) = translate_any_kva(mem, cr3_pa, page_offset, aux_kva, l5) else {
             continue;
         };
@@ -215,83 +216,67 @@ pub(crate) fn discover_struct_ops_stats(
             continue;
         }
 
-        cached.push(CachedProgInfo {
+        // Per-CPU sum. saturating_add prevents the
+        // `attempt to add with overflow` panic that's been
+        // observed when uninitialized / scrambled per-CPU pages
+        // yield near-u64::MAX values; see `ProgRuntimeStats`.
+        let mut cnt: u64 = 0;
+        let mut nsecs: u64 = 0;
+        let mut misses: u64 = 0;
+        for &cpu_off in per_cpu_offsets {
+            let stats_kva = stats_percpu_kva.wrapping_add(cpu_off);
+            if let Some(stats_pa) = translate_any_kva(mem, cr3_pa, page_offset, stats_kva, l5)
+                && stats_pa < mem.size()
+            {
+                cnt = cnt.saturating_add(mem.read_u64(stats_pa, offsets.stats_cnt));
+                nsecs = nsecs.saturating_add(mem.read_u64(stats_pa, offsets.stats_nsecs));
+                misses = misses.saturating_add(mem.read_u64(stats_pa, offsets.stats_misses));
+            }
+        }
+
+        stats_out.push(ProgRuntimeStats {
             name,
-            stats_percpu_kva,
+            cnt,
+            nsecs,
+            misses,
         });
     }
 
-    cached
+    stats_out
 }
 
-/// Read per-CPU runtime stats for a set of cached programs.
+/// Read-only abstraction over BPF program enumeration and per-program
+/// stats reads across data sources. Mirror of
+/// [`super::bpf_map::BpfMapAccessor`] for the program side.
 ///
-/// For each program, reads `cnt`, `nsecs`, and `misses` from each
-/// CPU's `bpf_prog_stats` and sums across CPUs. Uses pre-resolved
-/// `__per_cpu_offset` array for address resolution.
-///
-/// Address translation uses [`translate_any_kva`], which tries the
-/// direct mapping first and falls through to a page-table walk when
-/// the percpu KVA lives in vmalloc'd memory (large dynamic per-CPU
-/// allocations served by `pcpu_get_vm_areas`). The pre-fix path
-/// assumed `bpf_prog_stats` always lived in the direct mapping —
-/// which is true for static percpu and small kmalloc'd percpu, but
-/// not for vmalloc-backed percpu — and silently dropped per-CPU
-/// readings whose PA fell outside the direct mapping.
-pub(crate) fn read_prog_runtime_stats(
-    mem: &GuestMem,
-    cached: &[CachedProgInfo],
-    per_cpu_offsets: &[u64],
-    cr3_pa: u64,
-    page_offset: u64,
-    l5: bool,
-    offsets: &BpfProgOffsets,
-) -> Vec<ProgRuntimeStats> {
-    cached
-        .iter()
-        .map(|prog| {
-            let mut cnt: u64 = 0;
-            let mut nsecs: u64 = 0;
-            let mut misses: u64 = 0;
-            for &cpu_off in per_cpu_offsets {
-                let stats_kva = prog.stats_percpu_kva.wrapping_add(cpu_off);
-                if let Some(stats_pa) = translate_any_kva(mem, cr3_pa, page_offset, stats_kva, l5)
-                    && stats_pa < mem.size()
-                {
-                    // saturating_add: per-CPU `bpf_prog_stats.{cnt,
-                    // nsecs, misses}` are kernel-side u64 counters
-                    // that monotonically increase on every program
-                    // execution. Summing N CPUs' values can in
-                    // principle overflow on a long-running guest with
-                    // a hot BPF program; observed in nextest runs
-                    // where uninitialized / scrambled per-CPU pages
-                    // yield near-u64::MAX values. Saturating to
-                    // u64::MAX is the right semantics — the consumer
-                    // (`ProgRuntimeStats` viewer) never produces
-                    // signed deltas off this so a saturated sum still
-                    // sorts correctly, and it prevents an `attempt to
-                    // add with overflow` panic in the monitor thread
-                    // that would tear the whole VM down.
-                    cnt = cnt.saturating_add(mem.read_u64(stats_pa, offsets.stats_cnt));
-                    nsecs = nsecs.saturating_add(mem.read_u64(stats_pa, offsets.stats_nsecs));
-                    misses = misses.saturating_add(mem.read_u64(stats_pa, offsets.stats_misses));
-                }
-            }
-            ProgRuntimeStats {
-                name: prog.name.clone(),
-                cnt,
-                nsecs,
-                misses,
-            }
-        })
-        .collect()
+/// Currently one implementation: [`GuestMemProgAccessor`] (PTE-walks a
+/// frozen guest's `prog_idr`). The planned live-host backend (#9)
+/// will walk loaded programs via `BPF_PROG_GET_NEXT_ID` /
+/// `BPF_OBJ_GET_INFO_BY_FD` and produce the same
+/// `Vec<ProgVerifierStats>` / `Vec<ProgRuntimeStats>` shapes, so the
+/// failure-dump renderer stays data-source-agnostic.
+pub trait BpfProgAccessor {
+    /// Enumerate struct_ops BPF programs and collect verifier stats.
+    fn struct_ops_progs(&self) -> Vec<ProgVerifierStats>;
+
+    /// Snapshot per-program runtime stats (`cnt`, `nsecs`, `misses`)
+    /// for every struct_ops BPF program, summed across all CPUs.
+    ///
+    /// `per_cpu_offsets` is the kernel's `__per_cpu_offset[]` array,
+    /// typically obtained via [`super::symbols::read_per_cpu_offsets`].
+    /// The live-host backend will ignore this argument (the kernel
+    /// provides per-CPU sums via `BPF_OBJ_GET_INFO_BY_FD`).
+    fn struct_ops_runtime_stats(&self, per_cpu_offsets: &[u64]) -> Vec<ProgRuntimeStats>;
 }
 
-/// Host-side BPF program accessor for a running guest VM.
-pub struct BpfProgAccessor<'a> {
+/// Host-side BPF program accessor backed by direct guest physical-memory
+/// reads. PTE-walks a frozen guest's `prog_idr` to enumerate loaded
+/// programs and reads `bpf_prog_stats` per-CPU slots inline.
+pub struct GuestMemProgAccessor<'a> {
     kernel: &'a super::guest::GuestKernel<'a>,
     prog_idr_kva: u64,
-    /// Borrowed from the caller. Mirrors the `BpfMapAccessor` pattern:
+    /// Borrowed from the caller. Mirrors the
+    /// [`super::bpf_map::GuestMemMapAccessor`] pattern:
     /// `BpfProgOffsets` is a ~160-byte POD built once from the
     /// vmlinux BTF, and every hot-path method reads it by reference,
     /// so owning it in the accessor would charge a clone that serves
@@ -299,7 +284,7 @@ pub struct BpfProgAccessor<'a> {
     offsets: &'a BpfProgOffsets,
 }
 
-impl<'a> BpfProgAccessor<'a> {
+impl<'a> GuestMemProgAccessor<'a> {
     /// Create from an existing [`GuestKernel`](super::guest::GuestKernel)
     /// and a caller-owned [`BpfProgOffsets`]. The accessor borrows both
     /// for its lifetime — build `offsets` once via
@@ -318,9 +303,10 @@ impl<'a> BpfProgAccessor<'a> {
             offsets,
         })
     }
+}
 
-    /// Enumerate struct_ops BPF programs and collect verifier stats.
-    pub fn struct_ops_progs(&self) -> Vec<ProgVerifierStats> {
+impl BpfProgAccessor for GuestMemProgAccessor<'_> {
+    fn struct_ops_progs(&self) -> Vec<ProgVerifierStats> {
         find_struct_ops_progs(
             self.kernel.mem(),
             self.kernel.cr3_pa(),
@@ -331,16 +317,6 @@ impl<'a> BpfProgAccessor<'a> {
         )
     }
 
-    /// Snapshot per-program runtime stats (`cnt`, `nsecs`, `misses`)
-    /// summed across all CPUs.
-    ///
-    /// One-shot helper for dump-time capture: walks `prog_idr` to
-    /// resolve every struct_ops program's per-CPU `bpf_prog_stats`
-    /// pointer, then reads each CPU slot via the supplied
-    /// `per_cpu_offsets` array (typically obtained from
-    /// [`super::symbols::read_per_cpu_offsets`]). Returns an empty
-    /// vector when the kernel exposes no struct_ops programs.
-    ///
     /// Mirrors the kernel-side per-CPU accumulation: `cnt` is
     /// bumped via `u64_stats_inc` and `nsecs` is bumped via
     /// `u64_stats_add(&stats->nsecs, duration)` inside
@@ -350,52 +326,43 @@ impl<'a> BpfProgAccessor<'a> {
     /// (defined in `kernel/bpf/syscall.c`) called from
     /// `kernel/bpf/trampoline.c::__bpf_prog_enter_recur` when a
     /// program re-enters and the recursion guard rejects it.
-    pub fn runtime_stats(&self, per_cpu_offsets: &[u64]) -> Vec<ProgRuntimeStats> {
-        let cached = discover_struct_ops_stats(
+    fn struct_ops_runtime_stats(&self, per_cpu_offsets: &[u64]) -> Vec<ProgRuntimeStats> {
+        walk_struct_ops_runtime_stats(
             self.kernel.mem(),
             self.kernel.cr3_pa(),
             self.kernel.page_offset(),
             self.prog_idr_kva,
             self.offsets,
             self.kernel.l5(),
-        );
-        if cached.is_empty() {
-            return Vec::new();
-        }
-        read_prog_runtime_stats(
-            self.kernel.mem(),
-            &cached,
             per_cpu_offsets,
-            self.kernel.cr3_pa(),
-            self.kernel.page_offset(),
-            self.kernel.l5(),
-            self.offsets,
         )
     }
 }
 
 /// Owns a [`super::guest::GuestKernel`] and a [`BpfProgOffsets`],
 /// providing BPF program access through a borrowed
-/// [`BpfProgAccessor`].
+/// [`GuestMemProgAccessor`].
 ///
-/// Mirrors [`super::bpf_map::GuestMemAccessorOwned`] for the
+/// Mirrors [`super::bpf_map::GuestMemMapAccessorOwned`] for the
 /// program-side surface: callers that don't already hold a
 /// `GuestKernel` + `BpfProgOffsets` pair (e.g. the freeze
 /// coordinator) construct one of these once at start, retain it
 /// across the run, and borrow [`Self::as_accessor`] for each
 /// read. Owning the offsets here keeps the BTF parse to once per
 /// VM run rather than once per dump.
-pub struct BpfProgAccessorOwned<'a> {
+pub struct GuestMemProgAccessorOwned<'a> {
     kernel: super::guest::GuestKernel<'a>,
+    prog_idr_kva: u64,
     offsets: BpfProgOffsets,
 }
 
-impl<'a> BpfProgAccessorOwned<'a> {
+impl<'a> GuestMemProgAccessorOwned<'a> {
     /// One-shot constructor: builds a [`super::guest::GuestKernel`]
     /// from `vmlinux`, parses BTF to resolve the BPF-program-related
-    /// struct offsets, and verifies the `prog_idr` symbol exists.
-    /// The resulting handle owns both the `GuestKernel` and the
-    /// `BpfProgOffsets`.
+    /// struct offsets, and resolves the `prog_idr` symbol KVA. The
+    /// resulting handle owns both the `GuestKernel` and the
+    /// `BpfProgOffsets`, with `prog_idr_kva` cached so
+    /// [`Self::as_accessor`] is infallible.
     ///
     /// Errors when the vmlinux ELF / BTF parse fails, when the
     /// `GuestKernel` handshake fails (still-booting guest), or
@@ -403,32 +370,33 @@ impl<'a> BpfProgAccessorOwned<'a> {
     pub fn new(mem: &'a super::reader::GuestMem, vmlinux: &std::path::Path) -> anyhow::Result<Self> {
         let kernel = super::guest::GuestKernel::new(mem, vmlinux)?;
         let offsets = BpfProgOffsets::from_vmlinux(vmlinux)?;
-        // Validate prog_idr resolves so a borrowed `as_accessor`
-        // can't fail later — same pre-flight pattern as
-        // `GuestMemAccessorOwned::new`.
-        if kernel.symbol_kva("prog_idr").is_none() {
-            return Err(anyhow::anyhow!(
-                "prog_idr symbol not found in vmlinux"
-            ));
-        }
-        Ok(Self { kernel, offsets })
+        let prog_idr_kva = kernel
+            .symbol_kva("prog_idr")
+            .ok_or_else(|| anyhow::anyhow!("prog_idr symbol not found in vmlinux"))?;
+        Ok(Self {
+            kernel,
+            prog_idr_kva,
+            offsets,
+        })
     }
 
-    /// Borrow as a [`BpfProgAccessor`] for program operations.
+    /// Borrow as a [`GuestMemProgAccessor`] for program operations.
     ///
-    /// The returned accessor borrows `self.offsets`; no clone on
-    /// the hot path. Errors when `prog_idr` cannot be resolved
-    /// (kept for surface symmetry with
-    /// [`BpfProgAccessor::from_guest_kernel`]; in practice `new`
-    /// already validated the symbol so this is infallible).
-    pub fn as_accessor(&self) -> anyhow::Result<BpfProgAccessor<'_>> {
-        BpfProgAccessor::from_guest_kernel(&self.kernel, &self.offsets)
+    /// Infallible — `new` already resolved `prog_idr_kva` and the
+    /// borrow returns the cached KVA directly. Mirrors
+    /// [`super::bpf_map::GuestMemMapAccessorOwned::as_accessor`].
+    pub fn as_accessor(&self) -> GuestMemProgAccessor<'_> {
+        GuestMemProgAccessor {
+            kernel: &self.kernel,
+            prog_idr_kva: self.prog_idr_kva,
+            offsets: &self.offsets,
+        }
     }
 
     /// Access the underlying [`super::guest::GuestKernel`] for
     /// callers that need symbol resolution / page-walk primitives
     /// outside the prog-discovery surface (e.g. resolving
-    /// `__per_cpu_offset` for `runtime_stats`).
+    /// `__per_cpu_offset` for `struct_ops_runtime_stats`).
     #[allow(dead_code)]
     pub fn guest_kernel(&self) -> &super::guest::GuestKernel<'a> {
         &self.kernel

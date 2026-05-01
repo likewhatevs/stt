@@ -227,6 +227,18 @@ netlink-sys = "0.8"
 netlink-packet-core = "0.7"
 netlink-packet-generic = "0.3"
 
+# Bindgen-generated bindings for the `perf_event_open(2)` syscall and
+# its `perf_event_attr` struct. The Linux libc and the Rust libc crate
+# both deliberately omit these — perf-event-open-sys provides the
+# bitfield setters (`set_exclude_host`, `set_disabled`) and the
+# kernel-version-tolerant struct layout (per its top-of-crate docs:
+# old programs run on new kernels and vice versa). Used by
+# `src/monitor/perf_counters.rs` to open one fd per (vCPU, hardware
+# counter) with `exclude_host=1` so the PMU counts only what executes
+# inside the guest. Disambiguates host-thread idle/spin/productive
+# work without any in-guest overhead.
+perf-event-open-sys = "6"
+
 [profile.release]
 lto = "thin"
 panic = "abort"

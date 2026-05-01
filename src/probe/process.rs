@@ -49,6 +49,16 @@ pub struct PhaseBInput {
 /// in `intf.h`).
 const EVENT_TRIGGER: u32 = 2;
 
+/// Ring buffer event type for an SCX_EV_* counter delta event from
+/// the `tp_btf/sched_ext_event` kernel tracepoint (matches
+/// `EVENT_SCX_EVENT` in `intf.h`).
+const EVENT_SCX_EVENT: u32 = 3;
+
+/// Maximum string length carried in a probe_event entry (matches
+/// `MAX_STR_LEN` in `intf.h`). Used to bound the SCX_EV_* counter
+/// name read from `EVENT_SCX_EVENT` ringbuf entries.
+const MAX_STR_LEN: usize = 64;
+
 /// Pipeline diagnostics from a probe run.
 ///
 /// Tracks how many functions/events survived each stage so users can
@@ -86,12 +96,47 @@ pub struct ProbeDiagnostics {
     pub trigger_attach_error: Option<String>,
     /// BPF-side kprobe fire count (from BSS ktstr_probe_count).
     pub bpf_kprobe_fires: u64,
+    /// BPF-side kprobe commit count (from BSS ktstr_kprobe_returns).
+    /// `bpf_kprobe_fires - bpf_kprobe_returns` is the number of
+    /// kprobe fires that bailed before pushing into `probe_data`
+    /// (meta-map miss or scratch-slot miss).
+    #[serde(default)]
+    pub bpf_kprobe_returns: u64,
     /// BPF-side trigger fire count (from BSS ktstr_trigger_count).
     pub bpf_trigger_fires: u64,
     /// BPF-side func_meta_map misses (IP not found in map).
     pub bpf_meta_misses: u64,
     /// IPs that missed func_meta_map lookup (from BSS ktstr_miss_log).
     pub bpf_miss_ips: Vec<u64>,
+    /// BPF-side `bpf_ringbuf_reserve` failures inside the trigger
+    /// handler (from BSS ktstr_ringbuf_drops). Non-zero means the
+    /// userspace consumer fell behind on the events ringbuf, so
+    /// auto-repro will see a missing trigger event even though the
+    /// scheduler did fire.
+    #[serde(default)]
+    pub bpf_ringbuf_drops: u64,
+    /// Nanosecond timestamp captured by the BPF trigger handler on
+    /// the first error-class `sched_ext_exit` (from BSS
+    /// ktstr_last_trigger_ts). 0 when no error-class exit fired.
+    #[serde(default)]
+    pub bpf_first_trigger_ns: u64,
+    /// Cumulative count of `tp_btf/sched_ext_event` tracepoint
+    /// fires observed by the probe BPF program (from BSS
+    /// ktstr_event_tp_count). Zero on a kernel without
+    /// `tp_btf/sched_ext_event` (pre-6.16) or when the tracepoint
+    /// never fired during the run. Distinguishes "tracepoint
+    /// available but quiet" (zero) from "tracepoint missing"
+    /// (attach failure recorded elsewhere).
+    #[serde(default)]
+    pub bpf_scx_event_tp_count: u64,
+    /// `bpf_ringbuf_reserve` failures inside the
+    /// `tp_btf/sched_ext_event` handler (from BSS
+    /// ktstr_event_ringbuf_drops). Non-zero means the userspace
+    /// consumer fell behind on the events ringbuf during a hot
+    /// SCX_EV_* fire — auto-repro will see fewer per-event
+    /// timeline entries than the kernel actually produced.
+    #[serde(default)]
+    pub bpf_scx_event_drops: u64,
 }
 
 /// Structured probe event captured by the BPF skeleton.
@@ -1112,7 +1157,10 @@ pub fn run_probe_skeleton(
     let triggered = std::sync::Arc::new(AtomicBool::new(false));
     let triggered_clone = triggered.clone();
 
-    // Ring buffer event layout matching probe_event in intf.h
+    // Ring buffer event layout matching probe_event in intf.h.
+    // `str_val` + `has_str` + `str_param_idx` carry the counter
+    // name + populated marker for `EVENT_SCX_EVENT` entries; the
+    // EVENT_TRIGGER path leaves them zeroed.
     #[repr(C)]
     struct RbEvent {
         type_: u32,
@@ -1124,6 +1172,9 @@ pub fn run_probe_skeleton(
         nr_fields: u32,
         kstack: [u64; 32],
         kstack_sz: u32,
+        str_val: [u8; MAX_STR_LEN],
+        has_str: u8,
+        str_param_idx: u8,
     }
 
     let mut rb_builder = RingBufferBuilder::new();
@@ -1250,10 +1301,15 @@ pub fn run_probe_skeleton(
             // Read BPF-side diagnostic counters from BSS.
             if let Some(bss) = skel.maps.bss_data.as_ref() {
                 diag.bpf_kprobe_fires = bss.ktstr_probe_count;
+                diag.bpf_kprobe_returns = bss.ktstr_kprobe_returns;
                 diag.bpf_trigger_fires = bss.ktstr_trigger_count;
                 diag.bpf_meta_misses = bss.ktstr_meta_miss;
                 let n = (bss.ktstr_miss_log_idx as usize).min(bss.ktstr_miss_log.len());
                 diag.bpf_miss_ips = bss.ktstr_miss_log[..n].to_vec();
+                diag.bpf_ringbuf_drops = bss.ktstr_ringbuf_drops;
+                diag.bpf_first_trigger_ns = bss.ktstr_last_trigger_ts;
+                diag.bpf_scx_event_tp_count = bss.ktstr_event_tp_count;
+                diag.bpf_scx_event_drops = bss.ktstr_event_ringbuf_drops;
             }
 
             let key_size = std::mem::size_of::<types::probe_key>();

@@ -59,7 +59,7 @@ use btf_rs::Btf;
 use super::arena::{ArenaSnapshot, BpfArenaOffsets, snapshot_arena};
 use super::bpf_map::{
     BPF_MAP_TYPE_ARENA, BPF_MAP_TYPE_ARRAY, BPF_MAP_TYPE_HASH, BPF_MAP_TYPE_PERCPU_ARRAY,
-    BpfMapAccessor, BpfMapInfo, GuestMemAccessor,
+    BpfMapAccessor, BpfMapInfo, GuestMemMapAccessor,
 };
 use super::btf_render::{RenderedValue, render_value};
 use super::sdt_alloc::{
@@ -72,22 +72,408 @@ use super::sdt_alloc::{
 /// Carries a borrowed [`super::bpf_prog::BpfProgAccessor`] plus the
 /// per-CPU offset array obtained from
 /// [`super::symbols::read_per_cpu_offsets`]. [`dump_state`] calls
-/// [`super::bpf_prog::BpfProgAccessor::runtime_stats`] with the
-/// supplied offsets and stores the resulting
+/// [`super::bpf_prog::BpfProgAccessor::struct_ops_runtime_stats`]
+/// with the supplied offsets and stores the resulting
 /// [`super::bpf_prog::ProgRuntimeStats`] vector in
 /// [`FailureDumpReport::prog_runtime_stats`].
 ///
 /// Pass `None` to skip prog-runtime capture (e.g. when the
-/// `BpfProgAccessor` could not be constructed because `prog_idr` is
+/// accessor could not be constructed because `prog_idr` is
 /// missing or the BPF prog offsets did not resolve). The dump still
 /// renders every map the [`super::bpf_map::BpfMapAccessor`] enumerates.
 pub struct ProgRuntimeCapture<'a> {
     /// Accessor for walking `prog_idr` and reading per-program
-    /// `bpf_prog_stats` slots.
-    pub prog_accessor: &'a super::bpf_prog::BpfProgAccessor<'a>,
+    /// `bpf_prog_stats` slots. Trait dispatch lets the same dump
+    /// site consume either the guest-memory backend or the planned
+    /// live-host backend without committing to a concrete type.
+    pub accessor: &'a dyn super::bpf_prog::BpfProgAccessor,
     /// Per-CPU offset array (`__per_cpu_offset[cpu]`) used to address
     /// each CPU's `bpf_prog_stats` slot for summation.
     pub per_cpu_offsets: &'a [u64],
+}
+
+/// Borrow-only capture context for per-CPU CPU-time / softirq / IRQ
+/// counters populated alongside the BPF map dump.
+///
+/// Carries the BTF-resolved field offsets for `kernel_cpustat`,
+/// `kernel_stat`, and `tick_sched`, the resolved `.data..percpu`
+/// section offsets of the three per-CPU symbols, and the
+/// `__per_cpu_offset[cpu]` array used to address each CPU's slot.
+///
+/// [`dump_state`] reads each CPU's slot via direct guest-memory
+/// reads against the supplied [`super::reader::GuestMem`] and
+/// records the result into [`FailureDumpReport::per_cpu_time`].
+/// Mirrors [`ProgRuntimeCapture`]'s "borrowed-only, optional"
+/// shape — when `None`, the dump skips the per-CPU time capture
+/// and leaves the field empty.
+///
+/// Skipped silently when the resolver could not locate any of the
+/// three per-CPU symbols (stripped vmlinux), the BTF offsets are
+/// not present (CPU-time accounting types missing), or
+/// `__per_cpu_offset` resolution returned an empty array. The
+/// capture is best-effort diagnostic data; its absence does not
+/// fail the dump.
+pub struct CpuTimeCapture<'a> {
+    /// Guest memory handle used to read each per-CPU slot.
+    pub mem: &'a super::reader::GuestMem,
+    /// BTF-resolved offsets for `kernel_cpustat::cpustat[]`,
+    /// `kernel_stat::softirqs[]`, `kernel_stat::irqs_sum`, and
+    /// optionally `tick_sched::iowait_sleeptime`.
+    pub offsets: &'a super::btf_offsets::CpuTimeOffsets,
+    /// Section-relative `.data..percpu` offset of the
+    /// `kernel_cpustat` per-CPU symbol. Each CPU's KVA is
+    /// `kernel_cpustat + per_cpu_offsets[cpu]`.
+    pub kernel_cpustat_kva: u64,
+    /// Section-relative `.data..percpu` offset of the `kstat`
+    /// per-CPU symbol.
+    pub kstat_kva: u64,
+    /// Section-relative `.data..percpu` offset of the `tick_cpu_sched`
+    /// per-CPU symbol. `None` when the kernel was built without
+    /// `CONFIG_NO_HZ_COMMON`; iowait_sleeptime capture is skipped.
+    pub tick_cpu_sched_kva: Option<u64>,
+    /// Per-CPU offset array (`__per_cpu_offset[cpu]`) — same array
+    /// the BPF prog-stats walker uses (see
+    /// [`super::symbols::read_per_cpu_offsets`]). Length determines
+    /// how many CPUs the walker visits.
+    pub per_cpu_offsets: &'a [u64],
+    /// Guest's `PAGE_OFFSET` (resolved via
+    /// [`super::symbols::resolve_page_offset`]). Used to translate
+    /// each CPU's per-CPU KVA to a guest physical address for the
+    /// memory read.
+    pub page_offset: u64,
+}
+
+/// Borrow-only capture context for per-task enrichment.
+///
+/// Carries the [`super::guest::GuestKernel`] (guest memory + symbol
+/// table), the BTF-resolved task/signal/pid/upid offsets, the cached
+/// sched_class symbol KVAs (for class-name decode and the
+/// PI-boost-out-of-SCX flag), the lock-slowpath symbol cache (for
+/// stack-trace pattern matching), AND the task list itself — a
+/// pre-collected `&[TaskWalkerEntry]` produced by a task walker
+/// (rq->scx in #50, DSQ in #49, init_task→tasks for an enumeration
+/// path).
+///
+/// Mirrors the [`ProgRuntimeCapture`] / [`CpuTimeCapture`]
+/// borrowed-only-optional shape (#84). When `dump_state` receives
+/// `Some(TaskEnrichmentCapture)`, it iterates `tasks` and calls
+/// [`super::task_enrichment::walk_task_enrichment`] for each entry,
+/// pushing results into [`FailureDumpReport::task_enrichments`]. When
+/// `None`, the field stays empty and
+/// [`FailureDumpReport::task_enrichments_unavailable`] gets a
+/// "no task walker available" diagnostic.
+///
+/// The walker producer (rq->scx walker etc.) is responsible for
+/// building this struct. Until #49/#50 land, no walker exists; the
+/// freeze coordinator passes `None` and the field is plumbed but
+/// empty.
+pub struct TaskEnrichmentCapture<'a> {
+    /// Borrowed GuestKernel — provides memory access, page-table
+    /// translation context, and the vmlinux symbol table.
+    pub kernel: &'a super::guest::GuestKernel<'a>,
+    /// BTF-resolved offsets for the task/signal/pid/upid walk.
+    pub offsets: &'a super::btf_offsets::TaskEnrichmentOffsets,
+    /// Cached sched_class symbol KVAs for class decode + PI-boost
+    /// flag.
+    pub sched_classes: &'a super::task_enrichment::SchedClassRegistry,
+    /// Cached lock-slowpath symbol KVAs for stack-PC pattern
+    /// matching.
+    pub lock_slowpaths: &'a super::task_enrichment::LockSlowpathRegistry,
+    /// Tasks the walker discovered, plus per-task metadata
+    /// `walk_task_enrichment` needs (see [`TaskWalkerEntry`]).
+    pub tasks: &'a [TaskWalkerEntry],
+}
+
+/// One entry produced by a task walker (rq->scx, DSQ, etc.) for the
+/// enrichment capture pipeline.
+///
+/// Each task walker discovers task KVAs by traversing the kernel's
+/// own scheduling data structures; the walker also knows which task
+/// was reachable via `rq->scx.runnable_list` (used for the
+/// PI-boost-out-of-SCX flag) and which vCPU's instruction-pointer
+/// matches the running task (used for the lock-slowpath stack
+/// matcher). Capturing those signals at the walker site keeps the
+/// enrichment surface side-effect free — `walk_task_enrichment` only
+/// reads guest memory; it does not perform discovery itself.
+#[derive(Debug, Clone, Copy)]
+pub struct TaskWalkerEntry {
+    /// Kernel virtual address of the `task_struct`.
+    pub task_kva: u64,
+    /// True iff the task was reached via `rq->scx.runnable_list`.
+    /// Required for the PI-boost-out-of-SCX flag — see
+    /// [`super::task_enrichment::TaskEnrichment::pi_boosted_out_of_scx`].
+    pub is_runnable_in_scx: bool,
+    /// Optional instruction pointer for the lock-slowpath stack
+    /// matcher. Pass the corresponding vCPU's
+    /// [`VcpuRegSnapshot::instruction_pointer`] when this task was
+    /// running on that vCPU at freeze time; pass `None` for tasks
+    /// not actively running.
+    pub running_pc: Option<u64>,
+}
+
+/// Per-CPU CPU-time / softirq / IRQ snapshot captured at freeze
+/// time. One entry per CPU index visible to the host walker.
+///
+/// All counter fields are monotonic in the kernel — the freeze
+/// captures the instantaneous value at the moment the vCPUs
+/// rendezvous-park. Diffing two snapshots (or comparing against a
+/// pre-test baseline) is the consumer's job; this type does not
+/// derive deltas.
+///
+/// Field semantics match the kernel sources verified by PhD:
+///   - `cpustat_*_ns`: ns counter from
+///     `kernel_cpustat::cpustat[CPUTIME_*]`. Updated by
+///     `account_user_time` / `account_system_index_time` and
+///     siblings (`kernel/sched/cputime.c`). The kernel stores
+///     nanoseconds; `/proc/stat` divides by `cputime_to_clock_t`.
+///   - `softirqs[i]`: `kernel_stat::softirqs[i]` cumulative count
+///     incremented by `kstat_incr_softirqs_this_cpu` on every
+///     softirq raise. Indexed by [`super::btf_offsets::SOFTIRQ_NAMES`].
+///   - `irqs_sum`: `kernel_stat::irqs_sum` cumulative count
+///     incremented by `kstat_incr_irq_this_cpu` on every hardirq.
+///   - `iowait_sleeptime_ns`: `tick_sched::iowait_sleeptime`
+///     accumulated only under NO_HZ when the CPU enters idle with
+///     `nr_iowait > 0`. `None` when CONFIG_NO_HZ_COMMON is off or
+///     the resolver couldn't locate `tick_cpu_sched`.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
+pub struct PerCpuTimeStats {
+    /// CPU index (0-based) this entry describes.
+    pub cpu: u32,
+    /// `cpustat[CPUTIME_USER]` (ns).
+    pub cpustat_user_ns: u64,
+    /// `cpustat[CPUTIME_NICE]` (ns).
+    pub cpustat_nice_ns: u64,
+    /// `cpustat[CPUTIME_SYSTEM]` (ns).
+    pub cpustat_system_ns: u64,
+    /// `cpustat[CPUTIME_SOFTIRQ]` (ns).
+    pub cpustat_softirq_ns: u64,
+    /// `cpustat[CPUTIME_IRQ]` (ns).
+    pub cpustat_irq_ns: u64,
+    /// `cpustat[CPUTIME_IDLE]` (ns).
+    pub cpustat_idle_ns: u64,
+    /// `cpustat[CPUTIME_IOWAIT]` (ns).
+    pub cpustat_iowait_ns: u64,
+    /// `cpustat[CPUTIME_STEAL]` (ns).
+    pub cpustat_steal_ns: u64,
+    /// `kernel_stat::softirqs[]` per-vector cumulative counts.
+    /// Indexed by [`super::btf_offsets::SOFTIRQ_NAMES`].
+    pub softirqs: [u64; super::btf_offsets::NR_SOFTIRQS],
+    /// `kernel_stat::irqs_sum` cumulative hardirq count.
+    pub irqs_sum: u64,
+    /// `tick_sched::iowait_sleeptime` accumulated NO_HZ idle time
+    /// with outstanding IO (ns). `None` when NO_HZ disabled or
+    /// `tick_cpu_sched` symbol was absent at resolve time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iowait_sleeptime_ns: Option<u64>,
+}
+
+/// Borrow-only capture context for the per-sample SCX event counter
+/// timeline.
+///
+/// The freeze coordinator forwards the monitor sampler's accumulated
+/// [`super::MonitorSample`] vec via [`Self::samples`]; the dump path
+/// folds each sample's per-CPU [`super::ScxEventCounters`] into a
+/// single cross-CPU sum and produces one [`EventCounterSample`] per
+/// monitor tick.
+///
+/// `None` skips the timeline capture; the dump still renders the
+/// rest of the report. Mirrors [`ProgRuntimeCapture`] /
+/// [`CpuTimeCapture`]'s "borrowed-only, optional" shape.
+pub struct EventCounterCapture<'a> {
+    /// Periodic monitor samples gathered between VM start and the
+    /// freeze trigger. Each sample carries per-CPU
+    /// [`super::ScxEventCounters`] when scx event-stat offsets
+    /// resolved; the dump folder skips samples whose CPUs all
+    /// reported `event_counters: None`.
+    pub samples: &'a [super::MonitorSample],
+}
+
+/// Borrow-only capture context for the rq->scx + DSQ walkers (#49,
+/// #50). Mirrors [`TaskEnrichmentCapture`] / [`CpuTimeCapture`]
+/// shape (#84) — `dump_state` consumes everything by reference.
+///
+/// Carries:
+/// - `kernel`: GuestKernel handle for guest-memory reads
+///   (PTE walks, symbol resolution).
+/// - `offsets`: BTF-resolved
+///   [`super::btf_offsets::ScxWalkerOffsets`] covering scx_rq,
+///   scx_sched, scx_sched_pcpu, scx_sched_pnode, scx_dispatch_q,
+///   sched_ext_entity, scx_dsq_list_node, rhashtable, bucket_table,
+///   rhash_head.
+/// - `scx_root_kva`: kernel-text-mapped pointer the walker
+///   dereferences to find the active `scx_sched`.
+/// - `rq_kvas` / `rq_pas`: per-CPU rq KVA + PA arrays; same vecs
+///   the runnable_at scanner uses.
+/// - `per_cpu_offsets`: `__per_cpu_offset[]` array — needed for
+///   per-CPU bypass DSQ resolution.
+/// - `nr_nodes`: NUMA node count, for the per-node global-DSQ
+///   walk. Pass `1` on UMA / unknown configurations; the walker
+///   gracefully skips slots whose pnode pointers are NULL.
+///
+/// When `None` is passed in [`DumpContext::scx_walker_capture`],
+/// the dump emits empty `rq_scx_states` / `dsq_states` and
+/// records `scx_walker_unavailable` with a diagnostic reason.
+pub struct ScxWalkerCapture<'a> {
+    /// Borrowed GuestKernel — provides memory access, page-table
+    /// translation context, and the vmlinux symbol table.
+    pub kernel: &'a super::guest::GuestKernel<'a>,
+    /// BTF-resolved offsets for the scx walker.
+    pub offsets: &'a super::btf_offsets::ScxWalkerOffsets,
+    /// `scx_root` symbol KVA (resolved via vmlinux ELF symtab).
+    /// The walker reads `*scx_root` to find the active scx_sched.
+    pub scx_root_kva: u64,
+    /// Per-CPU rq kernel virtual addresses (one per CPU).
+    pub rq_kvas: &'a [u64],
+    /// Per-CPU rq guest physical addresses (parallel to rq_kvas).
+    pub rq_pas: &'a [u64],
+    /// `__per_cpu_offset[]` array, used to address each CPU's
+    /// `scx_sched_pcpu.bypass_dsq`.
+    pub per_cpu_offsets: &'a [u64],
+    /// NUMA node count for the per-node global-DSQ walk. Pass `1`
+    /// on UMA / unknown configurations.
+    pub nr_nodes: u32,
+}
+
+/// One per-monitor-tick snapshot of the 13 SCX_EV_* event counters
+/// summed across every CPU at that tick.
+///
+/// The kernel stores per-CPU `s64` counters in `scx_sched_pcpu`
+/// (kernel/sched/ext.c); the monitor sampler reads them at every
+/// tick and stores per-CPU `event_counters` on each
+/// [`super::CpuSnapshot`]. The dump path sums across CPUs into the
+/// fields here so a downstream consumer can render the run's
+/// counter timeline (sparkline, delta plot, ...) without
+/// re-iterating the per-CPU vec.
+///
+/// Field semantics match
+/// [`super::ScxEventCounters`] one-to-one — see that struct's
+/// per-field doc for kernel-source provenance. `total_*` naming
+/// here echoes [`super::ScxEventDeltas`]'s aggregate-across-window
+/// fields but with per-tick (not per-window) granularity.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
+pub struct EventCounterSample {
+    /// Milliseconds since VM start (mirrors
+    /// [`super::MonitorSample::elapsed_ms`]). Zero on the first
+    /// sample.
+    pub elapsed_ms: u64,
+    /// Sum of `select_cpu_fallback` across all CPUs at this tick.
+    pub select_cpu_fallback: i64,
+    /// Sum of `dispatch_local_dsq_offline` across all CPUs.
+    pub dispatch_local_dsq_offline: i64,
+    /// Sum of `dispatch_keep_last` across all CPUs.
+    pub dispatch_keep_last: i64,
+    /// Sum of `enq_skip_exiting` across all CPUs.
+    pub enq_skip_exiting: i64,
+    /// Sum of `enq_skip_migration_disabled` across all CPUs.
+    pub enq_skip_migration_disabled: i64,
+    /// Sum of `reenq_immed` across all CPUs.
+    pub reenq_immed: i64,
+    /// Sum of `reenq_local_repeat` across all CPUs.
+    pub reenq_local_repeat: i64,
+    /// Sum of `refill_slice_dfl` across all CPUs.
+    pub refill_slice_dfl: i64,
+    /// Sum of `bypass_duration` across all CPUs (ns).
+    pub bypass_duration: i64,
+    /// Sum of `bypass_dispatch` across all CPUs.
+    pub bypass_dispatch: i64,
+    /// Sum of `bypass_activate` across all CPUs.
+    pub bypass_activate: i64,
+    /// Sum of `insert_not_owned` across all CPUs.
+    pub insert_not_owned: i64,
+    /// Sum of `sub_bypass_dispatch` across all CPUs.
+    pub sub_bypass_dispatch: i64,
+}
+
+impl EventCounterSample {
+    /// Construct from a [`super::MonitorSample`] by summing every
+    /// CPU's [`super::ScxEventCounters`]. CPUs whose
+    /// `event_counters` is `None` (event-stat offsets unresolved)
+    /// contribute 0 to every field.
+    ///
+    /// Returns `None` when no CPU on the sample reported event
+    /// counters — propagating that to the timeline would emit a
+    /// row of all zeros that's indistinguishable from a real
+    /// "every counter at zero" tick. Callers filter `None` out.
+    pub fn from_monitor_sample(sample: &super::MonitorSample) -> Option<Self> {
+        let mut any = false;
+        let mut out = Self {
+            elapsed_ms: sample.elapsed_ms,
+            ..Self::default()
+        };
+        for cpu in &sample.cpus {
+            if let Some(ev) = &cpu.event_counters {
+                any = true;
+                out.select_cpu_fallback += ev.select_cpu_fallback;
+                out.dispatch_local_dsq_offline += ev.dispatch_local_dsq_offline;
+                out.dispatch_keep_last += ev.dispatch_keep_last;
+                out.enq_skip_exiting += ev.enq_skip_exiting;
+                out.enq_skip_migration_disabled += ev.enq_skip_migration_disabled;
+                out.reenq_immed += ev.reenq_immed;
+                out.reenq_local_repeat += ev.reenq_local_repeat;
+                out.refill_slice_dfl += ev.refill_slice_dfl;
+                out.bypass_duration += ev.bypass_duration;
+                out.bypass_dispatch += ev.bypass_dispatch;
+                out.bypass_activate += ev.bypass_activate;
+                out.insert_not_owned += ev.insert_not_owned;
+                out.sub_bypass_dispatch += ev.sub_bypass_dispatch;
+            }
+        }
+        if any { Some(out) } else { None }
+    }
+}
+
+/// Render a u64 counter series as a 1-line UTF-8 sparkline.
+///
+/// Maps each value into one of 8 unicode block-element glyphs
+/// (`▁▂▃▄▅▆▇█`) by min-max scaling. Empty input renders as the
+/// empty string; a constant non-zero series renders as repeated
+/// mid-tier glyphs (matches the "no variation" reading in the
+/// data, not as misleading monotonic up-bars). A constant zero
+/// series renders as repeated lowest glyphs.
+///
+/// Used by the `Display` impl for the event-counter timeline. Pure
+/// helper — no allocation outside the returned `String`.
+pub fn render_sparkline(values: &[u64]) -> String {
+    const GLYPHS: &[char] = &['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    if values.is_empty() {
+        return String::new();
+    }
+    let min = *values.iter().min().expect("non-empty");
+    let max = *values.iter().max().expect("non-empty");
+    let mut s = String::with_capacity(values.len() * 4);
+    if max == min {
+        let glyph = if max == 0 {
+            GLYPHS[0]
+        } else {
+            GLYPHS[GLYPHS.len() / 2]
+        };
+        for _ in values {
+            s.push(glyph);
+        }
+        return s;
+    }
+    let span = max - min;
+    let last_idx = (GLYPHS.len() - 1) as u64;
+    for &v in values {
+        // Linear scale [min, max] → [0, GLYPHS.len()-1]. Integer
+        // math is sufficient (no rounding artifact at the cost
+        // of one extra glyph step at boundaries).
+        let scaled = ((v - min) * last_idx) / span;
+        let idx = scaled.min(last_idx) as usize;
+        s.push(GLYPHS[idx]);
+    }
+    s
+}
+
+/// Saturating-cast wrapper around [`render_sparkline`] for signed
+/// (i64) counter series. Negative values clamp to 0; the kernel
+/// stores SCX_EV_* as `s64` but every counter is non-negative in
+/// practice, so the saturation only fires on a corrupt read.
+pub fn render_sparkline_i64(values: &[i64]) -> String {
+    let widened: Vec<u64> = values.iter().map(|&v| v.max(0) as u64).collect();
+    render_sparkline(&widened)
 }
 
 /// Snapshot of one vCPU's instruction-pointer / stack-pointer / page-
@@ -158,20 +544,146 @@ pub struct FailureDumpReport {
     /// Per-program BPF runtime stats summed across CPUs at freeze
     /// time (cnt, nsecs, misses). One entry per discovered
     /// struct_ops BPF program. Empty when no struct_ops programs are
-    /// loaded or when the prog accessor was unavailable to
-    /// [`dump_state`].
+    /// loaded OR when the prog accessor was unavailable to
+    /// [`dump_state`] — see [`Self::prog_runtime_stats_unavailable`]
+    /// for the reason.
     ///
     /// Per-CPU offset resolution failure does NOT empty the vec —
     /// each program still contributes one entry, but with
     /// `cnt`/`nsecs`/`misses` summed only over CPUs whose per-CPU
     /// `bpf_prog_stats` slot translated successfully (out-of-range
-    /// CPUs whose `__per_cpu_offset` slot returned 0 alias CPU 0,
-    /// per [`super::symbols::read_per_cpu_offsets`] semantics).
+    /// CPUs return None per [`super::bpf_map::read_percpu_array_value`]
+    /// semantics).
     ///
     /// See [`super::bpf_prog::ProgRuntimeStats`] for field semantics
     /// and the kernel-source-grounded provenance of each counter.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prog_runtime_stats: Vec<super::bpf_prog::ProgRuntimeStats>,
+    /// Diagnostic reason for `prog_runtime_stats` being empty.
+    ///
+    /// Distinguishes the three causes a consumer can't otherwise tell
+    /// apart from an empty vec:
+    /// - `None` (field absent on wire) → vec was populated normally
+    ///   (or the dump path didn't run). Default.
+    /// - `Some("no struct_ops programs loaded")` → walker ran, no
+    ///   struct_ops programs were in `prog_idr` at freeze time.
+    /// - `Some("prog accessor unavailable")` → caller passed
+    ///   `prog_capture: None`. Typical causes: `prog_idr` symbol
+    ///   missing, `BpfProgOffsets` BTF parse failed, or
+    ///   `__per_cpu_offset` resolution didn't yield non-zero offsets
+    ///   yet (still-booting guest).
+    ///
+    /// Set by [`dump_state`] only when prog_runtime_stats ends up
+    /// empty AND a definite cause is identifiable; left None
+    /// otherwise so the field stays absent in the JSON for
+    /// already-populated dumps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prog_runtime_stats_unavailable: Option<String>,
+    /// Per-CPU CPU-time / softirq / IRQ counters captured from
+    /// `kernel_cpustat`, `kernel_stat`, and (under NO_HZ)
+    /// `tick_sched`. One entry per CPU enumerated by the walker.
+    /// Empty when the dump caller passed no [`CpuTimeCapture`] or
+    /// when symbol/BTF resolution failed.
+    ///
+    /// See [`PerCpuTimeStats`] for field semantics. Surfaces the
+    /// per-CPU interrupt and idle-time data the failure dump
+    /// otherwise leaves implicit (the existing scx walker reads
+    /// `rq->nr_iowait` but not the cumulative time accounting).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub per_cpu_time: Vec<PerCpuTimeStats>,
+    /// Per-task failure-dump enrichments — identity (pid, tgid,
+    /// comm), process tree (group_leader, real_parent, pgid, sid,
+    /// nr_threads), scheduling (prio family, sched_class name,
+    /// scx.weight, core_cookie), context-switch counters, watchdog
+    /// disambiguation flag, and lock-slowpath stack matches.
+    ///
+    /// One entry per task the dump path's task walker reaches —
+    /// today's task walkers are the rq->scx walker (#50) and the
+    /// DSQ walker (#49); both produce task KVAs that get enriched
+    /// here. Empty when no task walker ran (typical until #49/#50
+    /// land) or when the [`TaskEnrichmentCapture`] was absent.
+    ///
+    /// See [`super::task_enrichment::TaskEnrichment`] for field
+    /// semantics; see [`Self::task_enrichments_unavailable`] for the
+    /// "why empty" diagnostic.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub task_enrichments: Vec<super::task_enrichment::TaskEnrichment>,
+    /// Diagnostic reason for `task_enrichments` being empty.
+    ///
+    /// - `None` → vec was populated normally (or the dump path
+    ///   didn't run).
+    /// - `Some("no task walker available")` → the
+    ///   [`TaskEnrichmentCapture`] was missing from
+    ///   [`DumpContext`]. Until #49/#50 (DSQ + rq->scx walkers)
+    ///   land, this is the expected steady state for the dump
+    ///   pipeline; the offsets + walker library is wired and
+    ///   ready to populate as soon as a task-list producer hooks
+    ///   in.
+    /// - `Some("task walker yielded zero tasks")` → walker
+    ///   produced no task KVAs (frozen guest with no runnable /
+    ///   queued scx tasks at the dump instant — possible on a
+    ///   completely-idle stall trigger).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_enrichments_unavailable: Option<String>,
+    /// Per-monitor-tick SCX_EV_* event counter timeline. Each entry
+    /// is the cross-CPU sum of the 13 SCX_EV_* counters at one
+    /// monitor sample. Empty when the dump caller passed no
+    /// [`EventCounterCapture`] or no sample reported event counters
+    /// (event-stat offsets unresolved, scx_root unset). Renderers
+    /// build sparklines / per-counter delta plots from this vec.
+    ///
+    /// See [`EventCounterSample`] for field semantics; the kernel-
+    /// source provenance lives on
+    /// [`super::ScxEventCounters`] field doc.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub event_counter_timeline: Vec<EventCounterSample>,
+    /// Per-CPU `rq->scx` snapshots — scalar fields the kernel's
+    /// own `scx_dump_state` reads plus the runnable_list per-task
+    /// KVAs that fed into the per-task enrichment capture (#28).
+    /// One entry per CPU walked. Empty when the
+    /// [`ScxWalkerCapture`] was absent or every CPU's translate
+    /// failed.
+    ///
+    /// See [`super::scx_walker::RqScxState`] for field semantics.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rq_scx_states: Vec<super::scx_walker::RqScxState>,
+    /// Per-DSQ snapshots — local, bypass, global, and user DSQs
+    /// reachable from `*scx_root`. Each entry carries `nr` (depth),
+    /// `seq` (BPF-iter counter), and the queued task KVAs.
+    /// Surfaces data the kernel's own `scx_dump_state` does not
+    /// emit (per-DSQ depth enumeration), so this vec adds value
+    /// even on a kernel that prints its own dump.
+    ///
+    /// Empty when the [`ScxWalkerCapture`] was absent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dsq_states: Vec<super::scx_walker::DsqState>,
+    /// Top-level `scx_sched` state captured from `*scx_root`:
+    /// aborting flag, bypass_depth, exit_kind. `None` when no
+    /// scheduler is attached or `*scx_root` was unreadable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scx_sched_state: Option<super::scx_walker::ScxSchedState>,
+    /// Diagnostic reason for `rq_scx_states` / `dsq_states` /
+    /// `scx_sched_state` being absent. Mirrors the
+    /// `prog_runtime_stats_unavailable` / `task_enrichments_unavailable`
+    /// pattern (#42).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scx_walker_unavailable: Option<String>,
+    /// Per-vCPU hardware perf counter snapshot captured at the
+    /// instant the failure dump fired. One entry per vCPU; index
+    /// matches vCPU id (0 = BSP, 1..N = APs). `None` per-entry when
+    /// the freeze-time `read(2)` failed for that vCPU. Empty vec
+    /// when [`DumpContext::perf_capture`] was None (perf
+    /// unavailable on this host) or the read errored wholesale.
+    ///
+    /// `exclude_host=1` means each counter ticks only during guest
+    /// execution; the values here record the cumulative count from
+    /// the start of the run. Diff against any
+    /// [`super::CpuSnapshot::vcpu_perf`] in the monitor timeline to
+    /// recover the count over a freeze-aligned window. See
+    /// [`super::perf_counters::VcpuPerfSample`] for field semantics
+    /// and the multiplexing math.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub vcpu_perf_at_freeze: Vec<Option<super::perf_counters::VcpuPerfSample>>,
 }
 
 impl Default for FailureDumpReport {
@@ -188,6 +700,16 @@ impl Default for FailureDumpReport {
             vcpu_regs: Vec::new(),
             sdt_allocations: Vec::new(),
             prog_runtime_stats: Vec::new(),
+            prog_runtime_stats_unavailable: None,
+            per_cpu_time: Vec::new(),
+            task_enrichments: Vec::new(),
+            task_enrichments_unavailable: None,
+            event_counter_timeline: Vec::new(),
+            rq_scx_states: Vec::new(),
+            dsq_states: Vec::new(),
+            scx_sched_state: None,
+            scx_walker_unavailable: None,
+            vcpu_perf_at_freeze: Vec::new(),
         }
     }
 }
@@ -464,6 +986,10 @@ impl std::fmt::Display for FailureDumpReport {
             && self.vcpu_regs.is_empty()
             && self.sdt_allocations.is_empty()
             && self.prog_runtime_stats.is_empty()
+            && self.per_cpu_time.is_empty()
+            && self.task_enrichments.is_empty()
+            && self.event_counter_timeline.is_empty()
+            && self.vcpu_perf_at_freeze.is_empty()
         {
             return f.write_str("(empty failure dump)");
         }
@@ -500,12 +1026,98 @@ impl std::fmt::Display for FailureDumpReport {
             if !first {
                 f.write_str("\n\n")?;
             }
-            // Section comes last; no further sibling sections need
-            // to consult `first`, so leave the flag alone here.
+            first = false;
             f.write_str("prog_runtime_stats:")?;
             for stats in &self.prog_runtime_stats {
                 f.write_str("\n  ")?;
                 std::fmt::Display::fmt(stats, f)?;
+            }
+        }
+        if let Some(reason) = &self.prog_runtime_stats_unavailable {
+            if !first {
+                f.write_str("\n\n")?;
+            }
+            first = false;
+            write!(f, "prog_runtime_stats: <unavailable: {reason}>")?;
+        }
+        if !self.event_counter_timeline.is_empty() {
+            if !first {
+                f.write_str("\n\n")?;
+            }
+            // Section comes last; no further sibling sections need
+            // to consult `first`, so leave the flag alone here.
+            write!(
+                f,
+                "event_counter_timeline: {} samples ({}–{}ms)",
+                self.event_counter_timeline.len(),
+                self.event_counter_timeline
+                    .first()
+                    .map(|s| s.elapsed_ms)
+                    .unwrap_or(0),
+                self.event_counter_timeline
+                    .last()
+                    .map(|s| s.elapsed_ms)
+                    .unwrap_or(0),
+            )?;
+            // Per-counter sparkline. Each row is one of the 13
+            // SCX_EV_* counters across all samples in the
+            // timeline. Skips counters that stayed at zero across
+            // every sample to keep the rendering compact (a
+            // counter at zero everywhere has no signal worth
+            // surfacing in the human-readable view).
+            let extract: [(
+                &str,
+                fn(&EventCounterSample) -> i64,
+            ); 13] = [
+                ("select_cpu_fallback", |s| s.select_cpu_fallback),
+                ("dispatch_local_dsq_offline", |s| s.dispatch_local_dsq_offline),
+                ("dispatch_keep_last", |s| s.dispatch_keep_last),
+                ("enq_skip_exiting", |s| s.enq_skip_exiting),
+                ("enq_skip_migration_disabled", |s| s.enq_skip_migration_disabled),
+                ("reenq_immed", |s| s.reenq_immed),
+                ("reenq_local_repeat", |s| s.reenq_local_repeat),
+                ("refill_slice_dfl", |s| s.refill_slice_dfl),
+                ("bypass_duration", |s| s.bypass_duration),
+                ("bypass_dispatch", |s| s.bypass_dispatch),
+                ("bypass_activate", |s| s.bypass_activate),
+                ("insert_not_owned", |s| s.insert_not_owned),
+                ("sub_bypass_dispatch", |s| s.sub_bypass_dispatch),
+            ];
+            for (name, ext) in extract {
+                let series: Vec<i64> =
+                    self.event_counter_timeline.iter().map(ext).collect();
+                if series.iter().all(|&v| v == 0) {
+                    continue;
+                }
+                let line = render_sparkline_i64(&series);
+                let last = series.last().copied().unwrap_or(0);
+                write!(f, "\n  {name:>30}  {line}  (last={last})")?;
+            }
+        }
+        if !self.vcpu_perf_at_freeze.is_empty() {
+            if !first {
+                f.write_str("\n\n")?;
+            }
+            // Trailing section; mirrors the event_counter_timeline
+            // pattern — `first` is no longer consulted after this
+            // block.
+            f.write_str("vcpu_perf_at_freeze:")?;
+            for (i, slot) in self.vcpu_perf_at_freeze.iter().enumerate() {
+                f.write_str("\n  ")?;
+                match slot {
+                    Some(s) => write!(
+                        f,
+                        "vcpu {i}: cycles={} insns={} ipc={:.3} cache_misses={} branch_misses={} (en/ru={}/{} ns)",
+                        s.cycles,
+                        s.instructions,
+                        s.ipc(),
+                        s.cache_misses,
+                        s.branch_misses,
+                        s.time_enabled_ns,
+                        s.time_running_ns,
+                    )?,
+                    None => write!(f, "vcpu {i}: <unavailable>")?,
+                }
             }
         }
         Ok(())
@@ -601,7 +1213,7 @@ const MAX_HASH_ENTRIES: usize = 4096;
 /// BPF program BTF is normally <100 KB; vmlinux BTF caps around
 /// ~10 MB. A bogus `data_size` (corrupted `struct btf`) shouldn't
 /// pull megabytes of unrelated guest memory into the renderer or the
-/// freeze coordinator. Shared between [`load_program_btf`] and
+/// freeze coordinator. Shared between [`load_program_btf_kva`] and
 /// `vmm::load_probe_bss_offset`; defining it here keeps the bound
 /// in one place so a future tightening doesn't drift between sites.
 pub(crate) const MAX_BTF_BLOB: usize = 32 * 1024 * 1024;
@@ -621,37 +1233,304 @@ pub(crate) const MAX_BTF_BLOB: usize = 32 * 1024 * 1024;
 /// [`render_map`-internal] starts_with list (see [`dump_state`]).
 const KTSTR_INTERNAL_MAPS: &[&str] = &["func_meta_map", "probe_data", "probe_scratch", "events"];
 
+/// All inputs the failure-dump renderer needs, bundled so future
+/// capture sites (DSQ walker, rq->scx walker, NUMA stats, ...) can
+/// land as new optional fields without churning every call site.
+///
+/// `accessor` is currently the concrete guest-memory backend. The
+/// trait dispatch claim in [`BpfMapAccessor`]'s module-level doc
+/// is aspirational: `dump_state` reaches through the accessor for
+/// map enumeration AND for the sdt_alloc post-pass walk, which
+/// needs the underlying [`super::guest::GuestKernel`] handle —
+/// only the guest-memory backend exposes that. When the live-host
+/// backend (#9) lands, sdt_alloc walking will move into a
+/// backend-specific path and `accessor` here can become
+/// `&'a dyn BpfMapAccessor`.
+///
+/// `arena_offsets` and `prog_capture` are both optional borrows
+/// (uniform shape — see #84): `None` for either disables that
+/// capture leg without affecting the rest. A scheduler running on
+/// an older kernel without arena support lands here with
+/// `arena_offsets: None` and the failure dump renders maps + regs
+/// without arena pages; a setup where the BpfProgAccessor couldn't
+/// resolve `prog_idr` lands with `prog_capture: None` and
+/// `prog_runtime_stats` stays empty.
+pub struct DumpContext<'a> {
+    /// BPF map accessor. Concrete guest-memory backend today; see
+    /// the type-level doc for why this is not `&dyn BpfMapAccessor`.
+    pub accessor: &'a GuestMemMapAccessor<'a>,
+    /// Host-resolved vmlinux BTF. The renderer uses it as the base
+    /// for split-BTF parsing on programs that ship their own type
+    /// info; it's also the fallback when a map's program BTF can't
+    /// be loaded.
+    pub btf: &'a Btf,
+    /// Guest's `nr_cpu_ids`. Forwarded into per-CPU map rendering
+    /// so PERCPU_ARRAY readers know how many slots to enumerate.
+    /// Pass `1` for non-percpu-only dumps if the caller doesn't
+    /// have the value handy.
+    pub num_cpus: u32,
+    /// BTF-resolved arena field offsets. Enables
+    /// `BPF_MAP_TYPE_ARENA` page snapshotting via the accessor
+    /// trait's `read_arena_pages`. `None` skips arena rendering
+    /// (older kernel without arena support, or BTF lacking
+    /// `struct bpf_arena`).
+    pub arena_offsets: Option<&'a BpfArenaOffsets>,
+    /// Per-program runtime stats capture. `None` skips
+    /// prog-runtime capture; the dump still renders every map the
+    /// accessor enumerates.
+    pub prog_capture: Option<&'a ProgRuntimeCapture<'a>>,
+    /// Per-CPU CPU-time / softirq / IRQ capture. `None` skips the
+    /// per-CPU time walk; the rest of the dump still renders. Same
+    /// "borrowed-only, optional" shape as
+    /// [`Self::prog_capture`] / [`Self::arena_offsets`] (#84) so a
+    /// future capture site lands as another optional field without
+    /// churning the call sites already plumbed through here.
+    pub cpu_time_capture: Option<&'a CpuTimeCapture<'a>>,
+    /// Per-task enrichment capture. `None` skips the per-task walk
+    /// and `task_enrichments` stays empty; the rest of the dump
+    /// still renders.
+    ///
+    /// Today's freeze coordinator passes `None` because no task
+    /// walker has landed yet (#49 DSQ + #50 rq->scx). The
+    /// `TaskEnrichmentOffsets` + `SchedClassRegistry` + the
+    /// `walk_task_enrichment` library are wired and ready —
+    /// the producer side just needs to populate
+    /// [`TaskEnrichmentCapture::tasks`] from the rq->scx walker.
+    pub task_enrichment_capture: Option<&'a TaskEnrichmentCapture<'a>>,
+    /// SCX_EV_* event counter timeline capture. `None` skips
+    /// timeline rendering and `event_counter_timeline` stays
+    /// empty; the rest of the dump still renders. Same
+    /// "borrowed-only, optional" shape as
+    /// [`Self::cpu_time_capture`].
+    pub event_counter_capture: Option<&'a EventCounterCapture<'a>>,
+    /// SCX rq->scx + DSQ walker capture. `None` skips the walk;
+    /// `rq_scx_states` / `dsq_states` / `scx_sched_state` stay
+    /// empty/None and `scx_walker_unavailable` records why.
+    pub scx_walker_capture: Option<&'a ScxWalkerCapture<'a>>,
+    /// Host-side per-vCPU hardware perf counters (cycles,
+    /// instructions, cache-misses, branch-misses) opened with
+    /// `exclude_host=1`, so each counter only ticks during guest
+    /// execution. `None` skips the freeze-time read; the
+    /// [`FailureDumpReport::vcpu_perf_at_freeze`] vec stays empty.
+    /// See [`super::perf_counters`] for the kernel-source-grounded
+    /// rationale and capture semantics.
+    ///
+    /// The same capture is shared (via `Arc` in the freeze
+    /// coordinator) with the per-tick monitor sampler; per-tick
+    /// samples land on each [`super::CpuSnapshot::vcpu_perf`]. The
+    /// freeze-time read here records the absolute counter values at
+    /// the instant the failure dump fired, which lets a consumer
+    /// diff against any earlier sample to compute IPC over a
+    /// freeze-aligned window.
+    pub perf_capture: Option<&'a super::perf_counters::PerfCountersCapture>,
+}
+
 /// Snapshot every BPF map visible to the host accessor.
-///
-/// `num_cpus` is the guest's `nr_cpu_ids`; pass `1` for non-percpu-only
-/// dumps if the caller doesn't have the value handy.
-///
-/// `arena_offsets` enables `BPF_MAP_TYPE_ARENA` page snapshotting.
-/// `None` skips arena rendering (e.g. older kernel without arena
-/// support, or BTF that lacks `struct bpf_arena`).
 ///
 /// The dump is best-effort: a map that fails to render lands in the
 /// report with `error: Some(...)` rather than aborting the whole walk,
 /// so a single corrupt map can't blind the operator to the rest of
 /// the scheduler's state.
-pub fn dump_state(
-    accessor: &GuestMemAccessor<'_>,
-    btf: &Btf,
-    num_cpus: u32,
-    arena_offsets: Option<&BpfArenaOffsets>,
-    prog_capture: Option<ProgRuntimeCapture<'_>>,
-) -> FailureDumpReport {
+pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
+    let DumpContext {
+        accessor,
+        btf,
+        num_cpus,
+        arena_offsets,
+        prog_capture,
+        cpu_time_capture,
+        task_enrichment_capture,
+        event_counter_capture,
+        scx_walker_capture,
+        perf_capture,
+    } = ctx;
     let maps = accessor.maps();
-    let prog_runtime_stats = match prog_capture {
-        Some(cap) => cap.prog_accessor.runtime_stats(cap.per_cpu_offsets),
+    let (prog_runtime_stats, prog_runtime_stats_unavailable) = match prog_capture {
+        Some(cap) => {
+            let stats = cap.accessor.struct_ops_runtime_stats(cap.per_cpu_offsets);
+            let reason = if stats.is_empty() {
+                Some("no struct_ops programs loaded".to_string())
+            } else {
+                None
+            };
+            (stats, reason)
+        }
+        None => (
+            Vec::new(),
+            Some("prog accessor unavailable".to_string()),
+        ),
+    };
+    let per_cpu_time = match cpu_time_capture {
+        Some(cap) => collect_per_cpu_time(cap),
         None => Vec::new(),
     };
+    let (task_enrichments, task_enrichments_unavailable) = match task_enrichment_capture {
+        Some(cap) => {
+            let mut enrichments = Vec::with_capacity(cap.tasks.len());
+            for entry in cap.tasks {
+                if let Some(e) = super::task_enrichment::walk_task_enrichment(
+                    cap.kernel,
+                    entry.task_kva,
+                    cap.offsets,
+                    cap.sched_classes,
+                    cap.lock_slowpaths,
+                    entry.is_runnable_in_scx,
+                    entry.running_pc,
+                ) {
+                    enrichments.push(e);
+                }
+            }
+            let reason = if enrichments.is_empty() {
+                Some("task walker yielded zero tasks".to_string())
+            } else {
+                None
+            };
+            (enrichments, reason)
+        }
+        None => (
+            Vec::new(),
+            Some("no task walker available".to_string()),
+        ),
+    };
+    let event_counter_timeline = match event_counter_capture {
+        Some(cap) => cap
+            .samples
+            .iter()
+            .filter_map(EventCounterSample::from_monitor_sample)
+            .collect(),
+        None => Vec::new(),
+    };
+    let (rq_scx_states, dsq_states, scx_sched_state, scx_walker_unavailable) =
+        match scx_walker_capture {
+            Some(cap) => {
+                // Sub-group offsets resolved per kernel struct (#43);
+                // surface the absent groups in the diagnostic so a
+                // partial walk announces which passes were skipped.
+                let missing = cap.offsets.missing_groups();
+
+                // 1. Read scalar scx_sched state and recover the
+                //    sched_pa for the DSQ walker pass.
+                let (sched_pa_opt, sched_state) = match super::scx_walker::read_scx_sched_state(
+                    cap.kernel,
+                    cap.scx_root_kva,
+                    cap.offsets,
+                ) {
+                    Some((sched_kva, state)) => {
+                        // Translate sched_kva → PA (slab/vmalloc; use
+                        // translate_any_kva via the GuestKernel handle).
+                        let mem = cap.kernel.mem();
+                        let cr3_pa = cap.kernel.cr3_pa();
+                        let po = cap.kernel.page_offset();
+                        let l5 = cap.kernel.l5();
+                        let pa =
+                            super::idr::translate_any_kva(mem, cr3_pa, po, sched_kva, l5);
+                        (pa, Some(state))
+                    }
+                    None => (None, None),
+                };
+
+                // 2. Per-CPU rq->scx walk. Per-CPU runs only when the
+                //    rq + scx_rq + task sub-groups are present;
+                //    walk_rq_scx returns None to skip otherwise.
+                let mut rq_states = Vec::with_capacity(cap.rq_kvas.len());
+                for (cpu, (&rq_kva, &rq_pa)) in
+                    cap.rq_kvas.iter().zip(cap.rq_pas.iter()).enumerate()
+                {
+                    if let Some((state, _entries)) = super::scx_walker::walk_rq_scx(
+                        cap.kernel,
+                        cpu as u32,
+                        rq_kva,
+                        rq_pa,
+                        cap.offsets,
+                    ) {
+                        rq_states.push(state);
+                    }
+                }
+
+                // 3. DSQ walk requires the sched_pa we resolved
+                //    above. If sched_pa is None, only the per-CPU
+                //    local DSQs (which live in rq->scx, not via
+                //    sched->pcpu/pnode) would be reachable —
+                //    skipping the whole DSQ walk in that case is
+                //    consistent with "no scheduler attached".
+                let dsqs = match sched_pa_opt {
+                    Some(sched_pa) => {
+                        let (states, _entries) = super::scx_walker::walk_dsqs(
+                            cap.kernel,
+                            sched_pa,
+                            cap.rq_kvas,
+                            cap.rq_pas,
+                            cap.per_cpu_offsets,
+                            cap.nr_nodes,
+                            cap.offsets,
+                        );
+                        states
+                    }
+                    None => Vec::new(),
+                };
+
+                // Diagnostic priority:
+                //   1. Partial-degradation (sub-group(s) missing) —
+                //      announces exactly which passes were skipped.
+                //   2. Walker reached no state at all — typical when
+                //      scx_root is NULL (no scheduler attached).
+                //   3. None — every pass had data to surface.
+                let unavail = if !missing.is_empty() {
+                    Some(format!(
+                        "scx walker partial: missing offset groups [{}]",
+                        missing.join(", ")
+                    ))
+                } else if rq_states.is_empty()
+                    && dsqs.is_empty()
+                    && sched_state.is_none()
+                {
+                    Some("scx walker reached no state (scx_root NULL?)".to_string())
+                } else {
+                    None
+                };
+                (rq_states, dsqs, sched_state, unavail)
+            }
+            None => (
+                Vec::new(),
+                Vec::new(),
+                None,
+                Some("no scx walker capture".to_string()),
+            ),
+        };
+    // Freeze-time per-vCPU perf-counter snapshot. With `exclude_host=1`
+    // each counter ticks only during guest execution; the freeze
+    // coordinator has parked every vCPU before reaching this site, so
+    // the read returns the cumulative count at the last guest exit
+    // for each vCPU. A single per-vCPU read failure is recorded as
+    // `None` for that entry; a failure on one vCPU does not blank the
+    // others. When `perf_capture` is None the vec stays empty (the
+    // host lacked perf, or `perf_event_open` failed at run start).
+    let vcpu_perf_at_freeze: Vec<Option<super::perf_counters::VcpuPerfSample>> =
+        match perf_capture {
+            Some(cap) => cap
+                .per_vcpu
+                .iter()
+                .map(|p| p.read().ok())
+                .collect(),
+            None => Vec::new(),
+        };
+
     let mut report = FailureDumpReport {
         schema: SCHEMA_SINGLE.to_string(),
         maps: Vec::with_capacity(maps.len()),
         vcpu_regs: Vec::new(),
         sdt_allocations: Vec::new(),
         prog_runtime_stats,
+        prog_runtime_stats_unavailable,
+        per_cpu_time,
+        task_enrichments,
+        task_enrichments_unavailable,
+        event_counter_timeline,
+        rq_scx_states,
+        dsq_states,
+        scx_sched_state,
+        scx_walker_unavailable,
+        vcpu_perf_at_freeze,
     };
 
     // Per-map program-BTF cache, keyed by `btf_kva`. Each unique
@@ -721,7 +1600,7 @@ pub fn dump_state(
         //     genuinely index vmlinux BTF in this case.
         if info.btf_kva != 0
             && !program_btfs.contains_key(&info.btf_kva)
-            && let Some(loaded) = load_program_btf(accessor, info.btf_kva, btf)
+            && let Some(loaded) = accessor.load_program_btf(&info, btf)
         {
             program_btfs.insert(info.btf_kva, loaded);
         }
@@ -835,6 +1714,102 @@ pub fn dump_state(
     report
 }
 
+/// Walk every CPU's `kernel_cpustat`, `kernel_stat`, and (under
+/// NO_HZ) `tick_sched` slots and produce a [`PerCpuTimeStats`]
+/// vector — one entry per CPU index in `cap.per_cpu_offsets`.
+///
+/// Reads against the supplied [`super::reader::GuestMem`]. Each CPU's
+/// per-CPU base for a symbol `S` is `S + per_cpu_offsets[cpu]`,
+/// converted to a guest physical offset via
+/// [`super::symbols::kva_to_pa`] using the supplied `page_offset`
+/// (the standard direct-mapping translation; per-CPU pages always
+/// live in the direct mapping).
+///
+/// `cpustat[]` is read as 8 contiguous u64s starting at the
+/// resolved offset (length matches the indices captured —
+/// CPUTIME_USER through CPUTIME_STEAL — leaving CPUTIME_GUEST /
+/// CPUTIME_GUEST_NICE / CPUTIME_FORCEIDLE unread; the dump
+/// surfaces them as zero in the unread slots, which is acceptable
+/// since they're virt-guest specific or kernel-config gated and
+/// distinct from the failure-dump narrative). `softirqs[]` reads
+/// as `NR_SOFTIRQS` u32s, widened to u64 for the report. `irqs_sum`
+/// is `unsigned long` (read as u64 — 64-bit only kernels are the
+/// supported configuration). `iowait_sleeptime` is `ktime_t` /
+/// `s64`; the value is cast to u64 (the kernel never produces
+/// negative iowait time).
+fn collect_per_cpu_time(cap: &CpuTimeCapture<'_>) -> Vec<PerCpuTimeStats> {
+    use super::btf_offsets::{
+        CPUTIME_IDLE, CPUTIME_IOWAIT, CPUTIME_IRQ, CPUTIME_NICE, CPUTIME_SOFTIRQ, CPUTIME_STEAL,
+        CPUTIME_SYSTEM, CPUTIME_USER, NR_SOFTIRQS,
+    };
+    let mut out = Vec::with_capacity(cap.per_cpu_offsets.len());
+    for (cpu_idx, &per_cpu_off) in cap.per_cpu_offsets.iter().enumerate() {
+        let cpu = cpu_idx as u32;
+
+        // kernel_cpustat::cpustat[N]: each slot is a u64 in nsec.
+        // Read CPUTIME_USER through CPUTIME_STEAL (indices 0..=7).
+        let cpustat_kva = cap.kernel_cpustat_kva.wrapping_add(per_cpu_off);
+        let cpustat_pa = super::symbols::kva_to_pa(cpustat_kva, cap.page_offset);
+        let cpustat_base = cap.offsets.kernel_cpustat_cpustat;
+        let read_cpustat = |idx: usize| -> u64 {
+            // sizeof(u64) == 8.
+            cap.mem
+                .read_u64(cpustat_pa, cpustat_base + idx * 8)
+        };
+        let cpustat_user_ns = read_cpustat(CPUTIME_USER);
+        let cpustat_nice_ns = read_cpustat(CPUTIME_NICE);
+        let cpustat_system_ns = read_cpustat(CPUTIME_SYSTEM);
+        let cpustat_softirq_ns = read_cpustat(CPUTIME_SOFTIRQ);
+        let cpustat_irq_ns = read_cpustat(CPUTIME_IRQ);
+        let cpustat_idle_ns = read_cpustat(CPUTIME_IDLE);
+        let cpustat_iowait_ns = read_cpustat(CPUTIME_IOWAIT);
+        let cpustat_steal_ns = read_cpustat(CPUTIME_STEAL);
+
+        // kernel_stat::softirqs[N]: each slot is a u32 (count).
+        // Widen to u64 for reporting consistency with cpustat.
+        let kstat_kva = cap.kstat_kva.wrapping_add(per_cpu_off);
+        let kstat_pa = super::symbols::kva_to_pa(kstat_kva, cap.page_offset);
+        let mut softirqs = [0u64; NR_SOFTIRQS];
+        for (i, slot) in softirqs.iter_mut().enumerate() {
+            // sizeof(unsigned int) == 4.
+            *slot = cap.mem.read_u32(kstat_pa, cap.offsets.kstat_softirqs + i * 4)
+                as u64;
+        }
+
+        // kernel_stat::irqs_sum: unsigned long. 64-bit only
+        // kernels are supported, so read as u64.
+        let irqs_sum = cap.mem.read_u64(kstat_pa, cap.offsets.kstat_irqs_sum);
+
+        // tick_sched::iowait_sleeptime: ktime_t (s64) ns,
+        // accumulated only under NO_HZ when the CPU enters idle
+        // with nr_iowait > 0. Skip when the symbol or BTF offset
+        // is absent.
+        let iowait_sleeptime_ns = cap.tick_cpu_sched_kva.zip(cap.offsets.tick_sched_iowait_sleeptime).map(
+            |(tick_sym_kva, off)| {
+                let kva = tick_sym_kva.wrapping_add(per_cpu_off);
+                let pa = super::symbols::kva_to_pa(kva, cap.page_offset);
+                cap.mem.read_u64(pa, off)
+            },
+        );
+
+        out.push(PerCpuTimeStats {
+            cpu,
+            cpustat_user_ns,
+            cpustat_nice_ns,
+            cpustat_system_ns,
+            cpustat_softirq_ns,
+            cpustat_irq_ns,
+            cpustat_idle_ns,
+            cpustat_iowait_ns,
+            cpustat_steal_ns,
+            softirqs,
+            irqs_sum,
+            iowait_sleeptime_ns,
+        });
+    }
+    out
+}
+
 /// Walk a Datasec section by name, yielding `(var_name, byte_offset,
 /// type_id)` for every variable declared in it.
 ///
@@ -912,7 +1887,7 @@ fn is_scx_allocator_type(btf: &Btf, type_id: u32) -> bool {
     false
 }
 
-/// Load a BPF program's `struct btf` from guest memory.
+/// Load a BPF program's `struct btf` from guest memory at `btf_kva`.
 ///
 /// Reads the kernel `struct btf` at `btf_kva`, follows its `data` /
 /// `data_size` / `base_btf` fields, fetches the raw BTF blob via
@@ -926,7 +1901,16 @@ fn is_scx_allocator_type(btf: &Btf, type_id: u32) -> bool {
 /// Failure is silent and the caller falls back to the host vmlinux
 /// BTF — the dump is best-effort, a partial render still beats no
 /// render.
-fn load_program_btf(accessor: &GuestMemAccessor<'_>, btf_kva: u64, base_btf: &Btf) -> Option<Btf> {
+///
+/// Distinct from the [`super::bpf_map::BpfMapAccessor::load_program_btf`]
+/// trait method (which dispatches across backends): this free function
+/// is the guest-memory backend's actual KVA-based loader. The trait
+/// method on `GuestMemMapAccessor` just forwards here.
+pub(super) fn load_program_btf_kva(
+    accessor: &GuestMemMapAccessor<'_>,
+    btf_kva: u64,
+    base_btf: &Btf,
+) -> Option<Btf> {
     let kernel = accessor.kernel();
     let offsets = accessor.offsets();
     let mem = kernel.mem();
@@ -978,7 +1962,7 @@ fn load_program_btf(accessor: &GuestMemAccessor<'_>, btf_kva: u64, base_btf: &Bt
 }
 
 fn render_map(
-    accessor: &GuestMemAccessor<'_>,
+    accessor: &GuestMemMapAccessor<'_>,
     btf: Option<&Btf>,
     info: &BpfMapInfo,
     num_cpus: u32,
@@ -1185,6 +2169,123 @@ mod tests {
         assert_eq!(hex_dump(&[0x12, 0x34, 0xab]), "12 34 ab");
     }
 
+    /// Empty input renders as empty string. Single-element input
+    /// renders as one mid-tier glyph (constant non-zero series
+    /// reads as "no variation"). All-zero series renders as the
+    /// lowest glyph repeated.
+    #[test]
+    fn render_sparkline_edge_cases() {
+        assert_eq!(render_sparkline(&[]), "");
+        // Single non-zero element: constant series → mid-tier glyph.
+        assert_eq!(render_sparkline(&[42]), "▅");
+        // All-zero series: lowest glyph for every entry.
+        assert_eq!(render_sparkline(&[0, 0, 0]), "▁▁▁");
+        // All-equal non-zero series: mid-tier glyph for every entry.
+        assert_eq!(render_sparkline(&[5, 5, 5]), "▅▅▅");
+    }
+
+    /// Strictly-increasing series scales linearly across the glyph
+    /// set: first sample at min lands at lowest glyph, last sample
+    /// at max lands at highest. Pin both ends so a future scaling
+    /// regression that broke either bound is caught.
+    #[test]
+    fn render_sparkline_monotonic_scales_to_full_range() {
+        let s = render_sparkline(&[0, 1, 2, 3, 4, 5, 6, 7]);
+        let chars: Vec<char> = s.chars().collect();
+        assert_eq!(chars.len(), 8);
+        assert_eq!(chars[0], '▁', "min must map to lowest glyph: {s}");
+        assert_eq!(chars[7], '█', "max must map to highest glyph: {s}");
+    }
+
+    /// i64 wrapper saturates negative values to 0, then routes
+    /// through u64 sparkline. Verifies a counter that briefly
+    /// dips negative (corrupt read) doesn't crash and produces
+    /// a sane sparkline.
+    #[test]
+    fn render_sparkline_i64_clamps_negatives() {
+        let s = render_sparkline_i64(&[-5, 0, 5, 10]);
+        // After clamp: [0, 0, 5, 10] → first two at lowest, last
+        // two scale up. Just pin length and bounds; exact glyphs
+        // depend on integer rounding.
+        assert_eq!(s.chars().count(), 4);
+    }
+
+    /// Full SCX_EV_* counter timeline construction: build a
+    /// MonitorSample with two CPUs reporting event counters,
+    /// fold to EventCounterSample, verify cross-CPU sums and
+    /// elapsed_ms propagation.
+    #[test]
+    fn event_counter_sample_sums_across_cpus() {
+        use super::super::{CpuSnapshot, MonitorSample, ScxEventCounters};
+        let cpu_a = CpuSnapshot {
+            event_counters: Some(ScxEventCounters {
+                select_cpu_fallback: 5,
+                bypass_dispatch: 100,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let cpu_b = CpuSnapshot {
+            event_counters: Some(ScxEventCounters {
+                select_cpu_fallback: 7,
+                bypass_dispatch: 50,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let sample = MonitorSample {
+            elapsed_ms: 100,
+            cpus: vec![cpu_a, cpu_b],
+            prog_stats: None,
+        };
+        let folded = EventCounterSample::from_monitor_sample(&sample)
+            .expect("at least one CPU has event_counters");
+        assert_eq!(folded.elapsed_ms, 100);
+        assert_eq!(folded.select_cpu_fallback, 12);
+        assert_eq!(folded.bypass_dispatch, 150);
+    }
+
+    /// MonitorSample with no CPU reporting event_counters folds
+    /// to None — propagating an all-zero row would mislead the
+    /// downstream consumer (a real "every counter at 0" tick
+    /// looks identical to "every CPU's offsets unresolved").
+    #[test]
+    fn event_counter_sample_returns_none_when_no_cpu_has_counters() {
+        use super::super::{CpuSnapshot, MonitorSample};
+        let cpu = CpuSnapshot {
+            event_counters: None,
+            ..Default::default()
+        };
+        let sample = MonitorSample {
+            elapsed_ms: 200,
+            cpus: vec![cpu],
+            prog_stats: None,
+        };
+        assert!(EventCounterSample::from_monitor_sample(&sample).is_none());
+    }
+
+    /// EventCounterSample serde round-trips cleanly: every field
+    /// is `i64` (kernel-side `s64`), so a wire-format encode →
+    /// decode preserves bit patterns including the i64::MAX edge.
+    #[test]
+    fn event_counter_sample_serde_roundtrip() {
+        let s = EventCounterSample {
+            elapsed_ms: 123_456,
+            select_cpu_fallback: i64::MAX,
+            insert_not_owned: -1, // kernel never produces this
+                                  // but the wire format must
+                                  // preserve whatever the read
+                                  // captured rather than silently
+                                  // clamp.
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        let loaded: EventCounterSample = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.elapsed_ms, 123_456);
+        assert_eq!(loaded.select_cpu_fallback, i64::MAX);
+        assert_eq!(loaded.insert_not_owned, -1);
+    }
+
     #[test]
     fn report_serde_roundtrip() {
         let report = FailureDumpReport {
@@ -1206,6 +2307,16 @@ mod tests {
             vcpu_regs: Vec::new(),
             sdt_allocations: Vec::new(),
             prog_runtime_stats: Vec::new(),
+            prog_runtime_stats_unavailable: None,
+            per_cpu_time: Vec::new(),
+            task_enrichments: Vec::new(),
+            task_enrichments_unavailable: None,
+            event_counter_timeline: Vec::new(),
+            rq_scx_states: Vec::new(),
+            dsq_states: Vec::new(),
+            scx_sched_state: None,
+            scx_walker_unavailable: None,
+            vcpu_perf_at_freeze: Vec::new(),
         };
         let json = serde_json::to_string(&report).unwrap();
         let parsed: FailureDumpReport = serde_json::from_str(&json).unwrap();
@@ -1264,6 +2375,16 @@ mod tests {
             vcpu_regs: Vec::new(),
             sdt_allocations: Vec::new(),
             prog_runtime_stats: Vec::new(),
+            prog_runtime_stats_unavailable: None,
+            per_cpu_time: Vec::new(),
+            task_enrichments: Vec::new(),
+            task_enrichments_unavailable: None,
+            event_counter_timeline: Vec::new(),
+            rq_scx_states: Vec::new(),
+            dsq_states: Vec::new(),
+            scx_sched_state: None,
+            scx_walker_unavailable: None,
+            vcpu_perf_at_freeze: Vec::new(),
         };
         let out = format!("{report}");
         // Map header line.
@@ -1285,6 +2406,16 @@ mod tests {
             vcpu_regs: Vec::new(),
             sdt_allocations: Vec::new(),
             prog_runtime_stats: Vec::new(),
+            prog_runtime_stats_unavailable: None,
+            per_cpu_time: Vec::new(),
+            task_enrichments: Vec::new(),
+            task_enrichments_unavailable: None,
+            event_counter_timeline: Vec::new(),
+            rq_scx_states: Vec::new(),
+            dsq_states: Vec::new(),
+            scx_sched_state: None,
+            scx_walker_unavailable: None,
+            vcpu_perf_at_freeze: Vec::new(),
         };
         let out = format!("{report}");
         // Maps separated by a blank line (\n\n).
@@ -1378,6 +2509,16 @@ mod tests {
             ],
             sdt_allocations: Vec::new(),
             prog_runtime_stats: Vec::new(),
+            prog_runtime_stats_unavailable: None,
+            per_cpu_time: Vec::new(),
+            task_enrichments: Vec::new(),
+            task_enrichments_unavailable: None,
+            event_counter_timeline: Vec::new(),
+            rq_scx_states: Vec::new(),
+            dsq_states: Vec::new(),
+            scx_sched_state: None,
+            scx_walker_unavailable: None,
+            vcpu_perf_at_freeze: Vec::new(),
         };
         let out = format!("{report}");
         // Section header.
@@ -1404,6 +2545,16 @@ mod tests {
             })],
             sdt_allocations: Vec::new(),
             prog_runtime_stats: Vec::new(),
+            prog_runtime_stats_unavailable: None,
+            per_cpu_time: Vec::new(),
+            task_enrichments: Vec::new(),
+            task_enrichments_unavailable: None,
+            event_counter_timeline: Vec::new(),
+            rq_scx_states: Vec::new(),
+            dsq_states: Vec::new(),
+            scx_sched_state: None,
+            scx_walker_unavailable: None,
+            vcpu_perf_at_freeze: Vec::new(),
         };
         let out = format!("{report}");
         // Map block, blank line, vcpu_regs section.
@@ -1420,6 +2571,16 @@ mod tests {
             vcpu_regs: vec![None],
             sdt_allocations: Vec::new(),
             prog_runtime_stats: Vec::new(),
+            prog_runtime_stats_unavailable: None,
+            per_cpu_time: Vec::new(),
+            task_enrichments: Vec::new(),
+            task_enrichments_unavailable: None,
+            event_counter_timeline: Vec::new(),
+            rq_scx_states: Vec::new(),
+            dsq_states: Vec::new(),
+            scx_sched_state: None,
+            scx_walker_unavailable: None,
+            vcpu_perf_at_freeze: Vec::new(),
         };
         let out = format!("{report}");
         assert_eq!(out, "vcpu_regs:\n  vcpu 0: <unavailable>");
@@ -1450,6 +2611,16 @@ mod tests {
             })],
             sdt_allocations: Vec::new(),
             prog_runtime_stats: Vec::new(),
+            prog_runtime_stats_unavailable: None,
+            per_cpu_time: Vec::new(),
+            task_enrichments: Vec::new(),
+            task_enrichments_unavailable: None,
+            event_counter_timeline: Vec::new(),
+            rq_scx_states: Vec::new(),
+            dsq_states: Vec::new(),
+            scx_sched_state: None,
+            scx_walker_unavailable: None,
+            vcpu_perf_at_freeze: Vec::new(),
         };
 
         // (a) Display: vcpu_regs section present, no fallback.
@@ -1497,6 +2668,16 @@ mod tests {
             vcpu_regs: vec![None],
             sdt_allocations: Vec::new(),
             prog_runtime_stats: Vec::new(),
+            prog_runtime_stats_unavailable: None,
+            per_cpu_time: Vec::new(),
+            task_enrichments: Vec::new(),
+            task_enrichments_unavailable: None,
+            event_counter_timeline: Vec::new(),
+            rq_scx_states: Vec::new(),
+            dsq_states: Vec::new(),
+            scx_sched_state: None,
+            scx_walker_unavailable: None,
+            vcpu_perf_at_freeze: Vec::new(),
         };
         let late = FailureDumpReport {
             schema: SCHEMA_SINGLE.to_string(),
@@ -1504,6 +2685,16 @@ mod tests {
             vcpu_regs: vec![None, None],
             sdt_allocations: Vec::new(),
             prog_runtime_stats: Vec::new(),
+            prog_runtime_stats_unavailable: None,
+            per_cpu_time: Vec::new(),
+            task_enrichments: Vec::new(),
+            task_enrichments_unavailable: None,
+            event_counter_timeline: Vec::new(),
+            rq_scx_states: Vec::new(),
+            dsq_states: Vec::new(),
+            scx_sched_state: None,
+            scx_walker_unavailable: None,
+            vcpu_perf_at_freeze: Vec::new(),
         };
         let dual = DualFailureDumpReport {
             schema: SCHEMA_DUAL.to_string(),
@@ -1829,6 +3020,16 @@ mod tests {
                     misses: u64::MAX,
                 },
             ],
+            prog_runtime_stats_unavailable: None,
+            per_cpu_time: Vec::new(),
+            task_enrichments: Vec::new(),
+            task_enrichments_unavailable: None,
+            event_counter_timeline: Vec::new(),
+            rq_scx_states: Vec::new(),
+            dsq_states: Vec::new(),
+            scx_sched_state: None,
+            scx_walker_unavailable: None,
+            vcpu_perf_at_freeze: Vec::new(),
         };
         let json = serde_json::to_string(&report).expect("serialize");
         let parsed: FailureDumpReport = serde_json::from_str(&json).expect("deserialize");
@@ -1884,6 +3085,16 @@ mod tests {
                     misses: 7,
                 },
             ],
+            prog_runtime_stats_unavailable: None,
+            per_cpu_time: Vec::new(),
+            task_enrichments: Vec::new(),
+            task_enrichments_unavailable: None,
+            event_counter_timeline: Vec::new(),
+            rq_scx_states: Vec::new(),
+            dsq_states: Vec::new(),
+            scx_sched_state: None,
+            scx_walker_unavailable: None,
+            vcpu_perf_at_freeze: Vec::new(),
         };
         let out = format!("{report}");
         assert!(
@@ -1918,6 +3129,16 @@ mod tests {
                 nsecs: 2,
                 misses: 0,
             }],
+            prog_runtime_stats_unavailable: None,
+            per_cpu_time: Vec::new(),
+            task_enrichments: Vec::new(),
+            task_enrichments_unavailable: None,
+            event_counter_timeline: Vec::new(),
+            rq_scx_states: Vec::new(),
+            dsq_states: Vec::new(),
+            scx_sched_state: None,
+            scx_walker_unavailable: None,
+            vcpu_perf_at_freeze: Vec::new(),
         };
         let out = format!("{report}");
         assert!(

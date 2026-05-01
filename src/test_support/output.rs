@@ -364,6 +364,109 @@ mod tests {
         assert!(extract_sched_ext_dump("").is_none());
     }
 
+    /// E2E expectation: when scx-ktstr's ops.dump / dump_cpu /
+    /// dump_task callbacks fire under a real stall, every line they
+    /// emit via `scx_bpf_dump` reaches userspace through the kernel
+    /// `sched_ext_dump` tracepoint (kernel/sched/ext.c:dump_line)
+    /// and lands in the captured trace_pipe stream as
+    /// `<task>  [<cpu>]  <ts>: sched_ext_dump: <ops.dump-line>`.
+    ///
+    /// `scx-ktstr/src/bpf/main.bpf.c` declares three ops callbacks:
+    ///   - `ktstr_dump`: emits `ktstr scheduler state:` and three
+    ///     follow-up lines naming `stall`, `crash`, `degrade_rt`,
+    ///     etc.;
+    ///   - `ktstr_dump_cpu`: emits `ktstr cpu N: no per-cpu state`
+    ///     for every NON-idle CPU (idle CPUs are skipped so the
+    ///     kernel's `if (idle && used == seq_buf_used(&ns))` gate
+    ///     suppresses the per-CPU section, see
+    ///     kernel/sched/ext.c:6127-6283);
+    ///   - `ktstr_dump_task`: emits `ktstr task: magic=0x... counter=N`
+    ///     for every runnable task whose `scx_task_data(p)` is
+    ///     non-null.
+    ///
+    /// This test pins those three string shapes against the
+    /// trace_pipe parser. A regression that renames a marker, drops
+    /// the `\n`, or changes the prefix scheme breaks the host-side
+    /// failure-dump rendering — the parser would silently fall
+    /// through to "no dump lines" and the operator would lose every
+    /// scheduler-author hint that ops.dump exists to surface. The
+    /// fixture is the same wire format the kernel produces; the
+    /// test asserts the parser can slice it cleanly without losing
+    /// any of the three layers.
+    #[test]
+    fn extract_sched_ext_dump_recovers_ktstr_ops_dump_layers() {
+        // Synthetic trace_pipe stream emitted by the kernel's
+        // `dump_line` -> `trace_sched_ext_dump(line_buf)` path when
+        // scx-ktstr's ops.dump callbacks fire. Real lines carry
+        // a leading task/CPU/timestamp prefix and the
+        // `sched_ext_dump:` tag injected by the tracepoint.
+        let trace_pipe = "\
+   scx_-1234  [002]   100.000000: sched_ext_dump: Debug dump triggered by error\n\
+   scx_-1234  [002]   100.000001: sched_ext_dump: ktstr scheduler state:\n\
+   scx_-1234  [002]   100.000002: sched_ext_dump:   stall=1 crash=0 degrade_rt=0\n\
+   scx_-1234  [002]   100.000003: sched_ext_dump:   rodata: degrade=0 slow=0 scattershot=0 verify_loop=0 fail_verify=0\n\
+   scx_-1234  [002]   100.000004: sched_ext_dump:   ktstr_alloc_count=42 degrade_cnt=0 slow_cnt=0\n\
+   scx_-1234  [002]   100.000005: sched_ext_dump: CPU states\n\
+   scx_-1234  [002]   100.000006: sched_ext_dump: ----------\n\
+   scx_-1234  [002]   100.000007: sched_ext_dump: ktstr cpu 1: no per-cpu state\n\
+   scx_-1234  [002]   100.000008: sched_ext_dump: ktstr cpu 3: no per-cpu state\n\
+   scx_-1234  [002]   100.000009: sched_ext_dump:   ktstr task: magic=0xdeadbeefcafebabe counter=42\n\
+   unrelated noise that must NOT match\n";
+
+        let parsed = extract_sched_ext_dump(trace_pipe)
+            .expect("parser must surface every sched_ext_dump line");
+
+        // ops.dump layer.
+        assert!(
+            parsed.contains("ktstr scheduler state:"),
+            "ops.dump header missing; parser dropped the `ktstr scheduler state:` \
+             line emitted by scx-ktstr's ktstr_dump callback. parsed: {parsed}"
+        );
+        assert!(
+            parsed.contains("stall=1 crash=0 degrade_rt=0"),
+            "ops.dump body missing; parser dropped the runtime-flag line. \
+             parsed: {parsed}"
+        );
+        assert!(
+            parsed.contains("ktstr_alloc_count=42"),
+            "ops.dump body missing; parser dropped the alloc-count line. \
+             parsed: {parsed}"
+        );
+
+        // ops.dump_cpu layer (NON-idle CPUs only — idle CPUs emit
+        // nothing per the kernel's idle-suppression gate).
+        assert!(
+            parsed.contains("ktstr cpu 1: no per-cpu state"),
+            "ops.dump_cpu output missing; parser dropped the CPU 1 \
+             marker emitted by ktstr_dump_cpu for non-idle CPUs. \
+             parsed: {parsed}"
+        );
+        assert!(
+            parsed.contains("ktstr cpu 3: no per-cpu state"),
+            "ops.dump_cpu output missing; parser dropped the CPU 3 \
+             marker. parsed: {parsed}"
+        );
+
+        // ops.dump_task layer — magic reads as the LE u64 of
+        // KTSTR_ARENA_MAGIC verbatim (the BPF format string uses
+        // %llx so it appears in the dump as a hex literal).
+        assert!(
+            parsed.contains("ktstr task: magic=0xdeadbeefcafebabe counter=42"),
+            "ops.dump_task output missing; parser dropped the per-task \
+             magic/counter line emitted by ktstr_dump_task. parsed: \
+             {parsed}"
+        );
+
+        // Negative: the non-prefixed noise line MUST NOT slip into
+        // the dump string — extract_sched_ext_dump filters by the
+        // `sched_ext_dump` substring, so unrelated trace_pipe lines
+        // are dropped.
+        assert!(
+            !parsed.contains("unrelated noise"),
+            "parser leaked a non-sched_ext_dump line: {parsed}"
+        );
+    }
+
     // -- extract_kernel_version --
 
     #[test]

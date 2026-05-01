@@ -164,9 +164,60 @@ u64 ktstr_ringbuf_drops = 0;
  * the rest of the sample series. Sticky: stays at the first value. */
 u64 ktstr_last_trigger_ts = 0;
 
+/* System-wide SCX_EV_* event counter snapshot captured at the
+ * first error-class `sched_ext_exit` fire via `scx_bpf_events`
+ * (kernel/sched/ext.c:9417). Mirrors `struct scx_event_stats` from
+ * `kernel/sched/ext_internal.h:867` (13 s64 counters in declaration
+ * order). The Datasec walker on the host side renders this struct
+ * by name in the failure-dump's `.bss` map output, so an operator
+ * sees the system-wide counter values exactly when the scheduler
+ * errored. Cross-CPU aggregation happens kernel-side
+ * (`scx_read_events`); this BPF program just stores the
+ * aggregated snapshot.
+ *
+ * Sticky: written exactly once when the error latch flips
+ * 0 -> 1, so a host-side observer that polls
+ * `ktstr_err_exit_detected` and sees `1` is guaranteed to see a
+ * matching populated `ktstr_exit_event_stats`. Subsequent fires
+ * (which might come from racing `scx_sched` instances) skip the
+ * write to keep the snapshot causally tied to the first error. */
+struct scx_event_stats ktstr_exit_event_stats = {};
+
+/* Cumulative count of `tp_btf/sched_ext_event` tracepoint fires
+ * since probe attach. Each fire bumps a single SCX_EV_* counter
+ * kernel-side; the trigger-side aggregation in
+ * `ktstr_exit_event_stats` shows the totals at exit, but
+ * `ktstr_event_tp_count` lets a host-side observer see whether the
+ * tracepoint is firing at all (vs. a kernel without
+ * `CONFIG_TRACEPOINTS` or with `tp_btf/sched_ext_event` absent —
+ * pre-6.16 kernels). Bumped via `__sync_fetch_and_add` because
+ * the tracepoint fires in arbitrary CPU contexts. */
+u64 ktstr_event_tp_count = 0;
+
+/* Number of times the per-event ringbuf reserve failed inside
+ * `ktstr_event_tp`. Distinguishes "events tracepoint fired but
+ * userspace fell behind" from "events tracepoint never fires". */
+u64 ktstr_event_ringbuf_drops = 0;
+
 /* Log of IPs that missed func_meta_map lookup, for diagnosis. */
 u64 ktstr_miss_log[MAX_MISS_LOG] = {};
 u32 ktstr_miss_log_idx = 0;
+
+/* `scx_bpf_events` kfunc declaration. Kernel definition lives at
+ * `kernel/sched/ext.c:9417`; the kfunc takes a writable pointer
+ * to a `struct scx_event_stats` plus its size (the kernel uses
+ * `min(events__sz, sizeof(*events))` so passing a smaller-or-equal
+ * size is always safe — same vmlinux.h here as the running kernel
+ * means the size match is exact, but the `__sz` suffix is required
+ * by the BPF verifier convention for size-paired kfunc params).
+ *
+ * Declared `extern` so the BPF loader resolves it via kfunc symbol
+ * lookup at attach time; the static assert below catches a vmlinux.h
+ * desync that would land bytes in the wrong fields. */
+extern void scx_bpf_events(struct scx_event_stats *events,
+			   __u64 events__sz) __ksym;
+
+#define EVENT_NAME_MAX 32
 
 /*
  * Generic kprobe handler. Attached at runtime to each target function
@@ -322,6 +373,24 @@ int BPF_PROG(ktstr_trigger_tp, unsigned int kind)
 	 * exists for.
 	 */
 	ktstr_last_trigger_ts = bpf_ktime_get_ns();
+	/*
+	 * Snapshot the system-wide SCX_EV_* counters BEFORE the latch
+	 * CAS publishes the error. Same happens-before ordering as the
+	 * timestamp store above: a host-side observer that polls
+	 * `ktstr_err_exit_detected` and sees `1` is then guaranteed to
+	 * see populated `ktstr_exit_event_stats` because the CAS below
+	 * provides release semantics over the prior plain stores.
+	 *
+	 * Concurrent racing fires (multiple `scx_sched` instances
+	 * exiting in parallel) may overwrite the snapshot with their
+	 * own read; the kernel-side aggregation in `scx_bpf_events`
+	 * folds across the active sched_ext root anyway, so the
+	 * "last writer's view of the system" semantic is what we
+	 * want — every racing fire's snapshot is a valid system-wide
+	 * view at its own ktime.
+	 */
+	scx_bpf_events(&ktstr_exit_event_stats,
+		       sizeof(ktstr_exit_event_stats));
 	__sync_val_compare_and_swap(&ktstr_err_exit_detected, 0u, 1u);
 
 	/*
@@ -377,6 +446,75 @@ int BPF_PROG(ktstr_trigger_tp, unsigned int kind)
 
 	/* Store exit kind in args[1] for diagnostics. */
 	event->args[1] = (u64)kind;
+
+	bpf_ringbuf_submit(event, 0);
+
+	return 0;
+}
+
+/*
+ * tp_btf/sched_ext_event handler. Fires from
+ * `kernel/sched/ext.c::scx_add_event_stats` (and friends) every time
+ * a scheduler-internal SCX_EV_* counter increments. The kernel
+ * tracepoint argument signature is
+ * `TP_PROTO(const char *name, __s64 delta)` (see
+ * `include/trace/events/sched_ext.h`); the BPF prototype here mirrors
+ * it via BPF_PROG's typed args.
+ *
+ * Pushes one EVENT_SCX_EVENT entry into the existing `events`
+ * ringbuf per fire. Each entry carries the ktime, the counter
+ * name (NUL-terminated, capped at MAX_STR_LEN), and the delta as
+ * args[0]. Userspace stitches the sequence into the per-event
+ * timeline that surfaces which counter incremented when.
+ *
+ * Gated on `ktstr_enabled` so the timeline only records once
+ * userspace has finished probe attach (sched_ext_event fires can
+ * start as soon as the scheduler attaches; without the gate we'd
+ * record events from before the test scenario started).
+ */
+SEC("tp_btf/sched_ext_event")
+int BPF_PROG(ktstr_event_tp, const char *name, __s64 delta)
+{
+	if (!ktstr_enabled)
+		return 0;
+
+	__sync_fetch_and_add(&ktstr_event_tp_count, 1);
+
+	struct probe_event *event = bpf_ringbuf_reserve(&events,
+							sizeof(*event), 0);
+	if (!event) {
+		__sync_fetch_and_add(&ktstr_event_ringbuf_drops, 1);
+		return 0;
+	}
+
+	event->type = EVENT_SCX_EVENT;
+	event->tid = (u32)bpf_get_current_pid_tgid();
+	event->func_idx = 0;
+	event->ts = bpf_ktime_get_ns();
+	event->nr_fields = 0;
+	/* args[0] carries the s64 delta cast through u64. The
+	 * tracepoint stores deltas (typically +1) as `__s64` per
+	 * include/trace/events/sched_ext.h's TP_STRUCT__entry, which
+	 * accommodates a future negative-delta case (decrement)
+	 * without changing the wire format. */
+	event->args[0] = (u64)delta;
+	event->kstack_sz = 0;
+
+	/* Counter name. Read via bpf_probe_read_kernel_str so the
+	 * verifier accepts the kernel-side `const char *` argument.
+	 * The name is a static literal in the kernel
+	 * (e.g. "SCX_EV_SELECT_CPU_FALLBACK"), well under
+	 * MAX_STR_LEN — but the BPF API requires the safe-read. */
+	int n = bpf_probe_read_kernel_str(event->str_val,
+					  sizeof(event->str_val),
+					  (const void *)name);
+	if (n > 0) {
+		event->has_str = 1;
+	} else {
+		event->has_str = 0;
+		event->str_val[0] = '\0';
+	}
+	event->str_param_idx = 0xff;
 
 	bpf_ringbuf_submit(event, 0);
 
