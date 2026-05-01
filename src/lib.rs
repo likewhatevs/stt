@@ -482,7 +482,7 @@ pub mod prelude {
     // `static` of type `Scheduler`, and matching the derive-macro
     // name to its emitted type reads naturally at the call site.
     pub use crate::assert::{
-        Assert, AssertResult, ClaimBuilder, DetailKind, SeqClaim, SetClaim, Verdict,
+        Assert, AssertResult, ClaimBuilder, DetailKind, NoteValue, SeqClaim, SetClaim, Verdict,
     };
     pub use crate::claim;
     pub use crate::cgroup::CgroupManager;

@@ -280,6 +280,7 @@ pub(crate) fn build_assert_result_json(passed: bool, details: Vec<AssertDetail>)
         skipped: false,
         details,
         stats: ScenarioStats::default(),
+        measurements: std::collections::BTreeMap::new(),
     };
     serde_json::to_string(&result).expect("AssertResult must always serialize")
 }

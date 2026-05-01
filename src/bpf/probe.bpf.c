@@ -44,6 +44,21 @@ struct {
 	__uint(max_entries, 256 * 1024);
 } events SEC(".maps");
 
+/* Dedicated timeline ringbuf for the sched_switch /
+ * sched_migrate_task / sched_wakeup tracepoint handlers (#27). Sized
+ * for the "drained only on test failure" contract: 1 MiB / 40 B per
+ * record = ~26k events of headroom (~a few seconds of full-tilt
+ * scheduler activity on a small VM). On overflow, the producer's
+ * `bpf_ringbuf_reserve` returns NULL, the new event is dropped, and
+ * `ktstr_timeline_drops` is incremented. The host-side consumer
+ * polls this ringbuf only after the error-exit latch fires (see
+ * `ktstr_err_exit_detected`) — zero syscall traffic / consumer
+ * wakeups during a passing test. */
+struct {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, 1 * 1024 * 1024);
+} timeline_events SEC(".maps");
+
 /* Global enable flag. Set by userspace after all probes attached.
  *
  * Gates kprobe execution only — the tp_btf/sched_ext_exit trigger
@@ -198,6 +213,24 @@ u64 ktstr_event_tp_count = 0;
  * `ktstr_event_tp`. Distinguishes "events tracepoint fired but
  * userspace fell behind" from "events tracepoint never fires". */
 u64 ktstr_event_ringbuf_drops = 0;
+
+/* Cumulative count of timeline events submitted into the
+ * `timeline_events` ringbuf since probe attach (sched_switch +
+ * sched_migrate_task + sched_wakeup combined). Lets a host-side
+ * observer read commit volume even before any drain — a non-zero
+ * count proves the tracepoints are firing and the BPF programs are
+ * attached. */
+u64 ktstr_timeline_count = 0;
+
+/* Cumulative count of timeline-event submissions that failed
+ * because the dedicated `timeline_events` ringbuf was full. Each
+ * drop is a NEW event lost — the ring's existing contents stay
+ * intact (BPF ringbuf reserve does not evict on overflow). The
+ * "drained only on test failure" design implies steady-state fill
+ * during long passing tests; userspace surfaces this counter so an
+ * operator can tell whether a post-failure drain saw the full
+ * window or only the tail. */
+u64 ktstr_timeline_drops = 0;
 
 /* Log of IPs that missed func_meta_map lookup, for diagnosis. */
 u64 ktstr_miss_log[MAX_MISS_LOG] = {};
@@ -518,5 +551,124 @@ int BPF_PROG(ktstr_event_tp, const char *name, __s64 delta)
 
 	bpf_ringbuf_submit(event, 0);
 
+	return 0;
+}
+
+/*
+ * Tracepoint timeline buffer (#27).
+ *
+ * Three tp_btf handlers — sched_switch, sched_migrate_task,
+ * sched_wakeup — write a `struct timeline_event` into the dedicated
+ * `timeline_events` ringbuf. The host-side consumer drains this
+ * ringbuf only after the error-exit latch fires
+ * (`ktstr_err_exit_detected`), so the success path pays only the
+ * tracepoint hit + `bpf_ringbuf_reserve` + 40-byte memcpy + submit
+ * — no syscalls, no consumer wakeups.
+ *
+ * All three are gated on `ktstr_enabled` so timeline recording does
+ * not start until userspace has finished probe attach. The kernel
+ * tp_btf prototypes used here are pinned by
+ * `include/trace/events/sched.h`:
+ *   - sched_switch:        (preempt, prev, next, prev_state)
+ *   - sched_migrate_task:  (p, dest_cpu)
+ *   - sched_wakeup:        (p)  [DECLARE_EVENT_CLASS sched_wakeup_template]
+ *
+ * The handlers do BTF reads (`BPF_CORE_READ`) for `prev->pid`,
+ * `next->pid`, `task_cpu(p)` so a future kernel-internal layout
+ * change rebuilds correctly.
+ *
+ * sched_stat_wait/blocked are deliberately NOT used — per
+ * research_debug_probes.md the schedstat tracepoints do not fire
+ * for sched_ext tasks. The (sched_switch, sched_wakeup) pair lets
+ * userspace reconstruct per-task wait time post-hoc by diffing
+ * wake-time and on-cpu time.
+ */
+
+SEC("tp_btf/sched_switch")
+int BPF_PROG(ktstr_tl_switch, bool preempt, struct task_struct *prev,
+	     struct task_struct *next, unsigned int prev_state)
+{
+	if (!ktstr_enabled)
+		return 0;
+
+	struct timeline_event *e = bpf_ringbuf_reserve(&timeline_events,
+						       sizeof(*e), 0);
+	if (!e) {
+		__sync_fetch_and_add(&ktstr_timeline_drops, 1);
+		return 0;
+	}
+
+	e->type     = TL_EVT_SWITCH;
+	e->cpu      = bpf_get_smp_processor_id();
+	e->ts       = bpf_ktime_get_ns();
+	e->prev_pid = (unsigned int)BPF_CORE_READ(prev, pid);
+	e->next_pid = (unsigned int)BPF_CORE_READ(next, pid);
+	e->a        = (u64)prev_state;
+	e->b        = (u64)preempt;
+
+	bpf_ringbuf_submit(e, 0);
+	__sync_fetch_and_add(&ktstr_timeline_count, 1);
+	return 0;
+}
+
+SEC("tp_btf/sched_migrate_task")
+int BPF_PROG(ktstr_tl_migrate, struct task_struct *p, int dest_cpu)
+{
+	if (!ktstr_enabled)
+		return 0;
+
+	struct timeline_event *e = bpf_ringbuf_reserve(&timeline_events,
+						       sizeof(*e), 0);
+	if (!e) {
+		__sync_fetch_and_add(&ktstr_timeline_drops, 1);
+		return 0;
+	}
+
+	/* `task_cpu(p)` is `p->thread_info.cpu` on x86 / `p->cpu` on
+	 * older arches, so use BPF_CORE_READ on the wrapper field
+	 * `wake_cpu` which the kernel keeps in lockstep with the
+	 * scheduler's last-CPU view (see kernel/sched/core.c
+	 * `set_task_cpu`). `wake_cpu` is on `task_struct` directly,
+	 * so the read is a single dereference regardless of arch. */
+	e->type     = TL_EVT_MIGRATE;
+	e->cpu      = bpf_get_smp_processor_id();
+	e->ts       = bpf_ktime_get_ns();
+	e->prev_pid = (unsigned int)BPF_CORE_READ(p, pid);
+	e->next_pid = 0;
+	e->a        = (u64)(unsigned int)dest_cpu;
+	e->b        = (u64)BPF_CORE_READ(p, wake_cpu);
+
+	bpf_ringbuf_submit(e, 0);
+	__sync_fetch_and_add(&ktstr_timeline_count, 1);
+	return 0;
+}
+
+SEC("tp_btf/sched_wakeup")
+int BPF_PROG(ktstr_tl_wakeup, struct task_struct *p)
+{
+	if (!ktstr_enabled)
+		return 0;
+
+	struct timeline_event *e = bpf_ringbuf_reserve(&timeline_events,
+						       sizeof(*e), 0);
+	if (!e) {
+		__sync_fetch_and_add(&ktstr_timeline_drops, 1);
+		return 0;
+	}
+
+	e->type     = TL_EVT_WAKEUP;
+	e->cpu      = bpf_get_smp_processor_id();
+	e->ts       = bpf_ktime_get_ns();
+	e->prev_pid = (unsigned int)BPF_CORE_READ(p, pid);
+	e->next_pid = 0;
+	/* Target CPU at wakeup time — the scheduler's chosen CPU for
+	 * `p` (set by `try_to_wake_up` -> `select_task_rq` ->
+	 * `set_task_cpu`). For sched_ext tasks this is the CPU the
+	 * scheduler's `ops.select_cpu` returned. */
+	e->a        = (u64)BPF_CORE_READ(p, wake_cpu);
+	e->b        = 0;
+
+	bpf_ringbuf_submit(e, 0);
+	__sync_fetch_and_add(&ktstr_timeline_count, 1);
 	return 0;
 }

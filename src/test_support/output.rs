@@ -607,4 +607,84 @@ mod tests {
     fn extract_panic_message_empty() {
         assert!(extract_panic_message("").is_none());
     }
+
+    // -- Verdict API integration coverage (#97) -------------------------
+    //
+    // The host-side runner parses a guest AssertResult JSON via
+    // `parse_assert_result`, then a scenario's verifier folds that
+    // result into a Verdict via `Verdict::merge`. This integration
+    // shape is the single most important assertion path for any test
+    // running inside a VM — pin it here so a regression that broke
+    // either the parse OR the merge surface trips at the seam.
+
+    /// Round-trip: print_assert_result-equivalent JSON through
+    /// parse_assert_result, then merge into a Verdict that records a
+    /// pointwise claim from the host side. The combined result must
+    /// fail (the parsed AssertResult was failing) AND carry both the
+    /// guest-side detail AND the host-side claim's failure detail —
+    /// pinning that `Verdict::merge` preserves details from both
+    /// sides.
+    #[test]
+    fn parse_assert_result_threads_into_verdict_merge() {
+        use crate::assert::Verdict;
+
+        // Guest produced a failing AssertResult with one Stuck detail
+        // and a wake-latency measurement.
+        let json = build_assert_result_json(
+            false,
+            vec![AssertDetail::new(DetailKind::Stuck, "tid 42 stuck 3000ms")],
+        );
+        let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
+
+        let parsed = parse_assert_result(&output).unwrap();
+        assert!(!parsed.passed, "guest result must be failing");
+
+        // Host-side scenario adds its own claim — say, a deadline
+        // budget the host can verify post-VM (a pseudo-value here
+        // for the test).
+        let observed_runtime_us: u64 = 9000;
+        let mut v = Verdict::new();
+        crate::claim!(v, observed_runtime_us).at_most(5000);
+        v.merge(parsed);
+
+        let r = v.into_result();
+        assert!(
+            !r.passed,
+            "merge of failing parsed result + failing host claim must fail",
+        );
+        // Both failures must be visible in the merged details: the
+        // host-side at_most claim AND the guest-side Stuck.
+        assert!(
+            r.details.iter().any(|d| d.message.contains("at most 5000")),
+            "host claim failure missing: {:?}",
+            r.details,
+        );
+        assert!(
+            r.details.iter().any(|d| d.kind == DetailKind::Stuck),
+            "guest Stuck detail missing: {:?}",
+            r.details,
+        );
+    }
+
+    /// Round-trip: a passing guest AssertResult merged into a
+    /// Verdict with passing host claims keeps the verdict passing.
+    /// Sibling of the failing-merge test — pins the happy path so
+    /// a regression that always-fails on merge (e.g. flipping the
+    /// passed-conjunction direction) trips here.
+    #[test]
+    fn parse_assert_result_passing_merge_keeps_verdict_passing() {
+        use crate::assert::Verdict;
+
+        let json = build_assert_result_json(true, vec![]);
+        let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
+        let parsed = parse_assert_result(&output).unwrap();
+
+        let observed: u64 = 100;
+        let mut v = Verdict::new();
+        crate::claim!(v, observed).at_most(1000);
+        v.merge(parsed);
+
+        let r = v.into_result();
+        assert!(r.passed, "passing merge must keep verdict passing: {:?}", r.details);
+    }
 }

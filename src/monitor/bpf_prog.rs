@@ -529,4 +529,64 @@ mod tests {
             "ktstr_enqueue: cnt=100 nsecs=200 misses=3"
         );
     }
+
+    /// Format chain integration: the `ProgRuntimeStats` Display
+    /// output must appear verbatim inside `FailureDumpReport`'s
+    /// Display output. Pins the chain
+    /// `ProgRuntimeStats::fmt` (bpf_prog.rs) →
+    /// `FailureDumpReport::fmt::std::fmt::Display::fmt(stats, f)`
+    /// (dump.rs `prog_runtime_stats:` arm).
+    ///
+    /// The standalone `prog_runtime_stats_display_format` test pins
+    /// the inner Display in isolation; the dump-side
+    /// `report_display_renders_prog_runtime_stats` test pins the
+    /// outer section header. Neither catches a regression that
+    /// SUBSTITUTED the inner Display call (e.g. introducing a
+    /// custom rendering branch in the outer formatter that bypasses
+    /// `ProgRuntimeStats::fmt`). This test catches that drift by
+    /// asserting BOTH layers render identically and the inner
+    /// string appears as a substring of the outer — a substitution
+    /// would break either equality.
+    #[test]
+    fn prog_runtime_stats_format_chain_inner_appears_in_outer() {
+        use super::dump::{FailureDumpReport, SCHEMA_SINGLE};
+        let info = ProgRuntimeStats {
+            name: "chain_test".to_string(),
+            cnt: 7,
+            nsecs: 42,
+            misses: 1,
+        };
+        let inner = format!("{info}");
+        // Direct Display on ProgRuntimeStats: pinned shape.
+        assert_eq!(inner, "chain_test: cnt=7 nsecs=42 misses=1");
+
+        let report = FailureDumpReport {
+            schema: SCHEMA_SINGLE.to_string(),
+            prog_runtime_stats: vec![info],
+            ..Default::default()
+        };
+        let outer = format!("{report}");
+        // The outer's `prog_runtime_stats:` section calls
+        // `std::fmt::Display::fmt(stats, f)` on each entry; that
+        // call dispatches through THIS module's Display impl. If a
+        // future regression replaced the dispatch with a custom
+        // formatter, the inner string would no longer appear in
+        // the outer output — surfacing as substring failure.
+        assert!(
+            outer.contains(&inner),
+            "FailureDumpReport's Display chain must dispatch through \
+             ProgRuntimeStats::fmt — inner {inner:?} must appear \
+             verbatim inside outer:\n{outer}",
+        );
+        // Sanity: the outer also wraps with the expected section
+        // header, so the substring match is finding the chain
+        // through the correct arm of FailureDumpReport's fmt and
+        // not (e.g.) a coincidence in the schema marker.
+        assert!(
+            outer.contains("prog_runtime_stats:"),
+            "outer Display must carry the prog_runtime_stats section \
+             header; without it the chain test could pass even when the \
+             inner string matched a different format arm:\n{outer}",
+        );
+    }
 }

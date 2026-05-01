@@ -340,4 +340,86 @@ mod tests {
         };
         assert!((s.ipc() - 0.5).abs() < 1e-9);
     }
+
+    // -- Verdict API integration coverage (#97) -------------------------
+    //
+    // The three IPC-band classifications named in the module-level doc
+    // (≈0 = halted, ≈0.5 = spinning, ≥1 = productive) become Verdict
+    // claims when a scenario test asserts on a captured VcpuPerfSample.
+    // Pin the integration shape so a future change to `ipc()`'s
+    // numerator-denominator order or the f64 precision routing does
+    // not silently produce passing claims that should fail.
+
+    /// Authorial claim: a productive vCPU has IPC ≥ 1.0 — pin the
+    /// claim! macro routing through ClaimBuilder<f64>::at_least and
+    /// the Verdict accumulator. Failing-branch siblings cover the
+    /// idle and spinning cases.
+    #[test]
+    fn vcpu_perf_sample_ipc_productive_claim_passes() {
+        use crate::assert::Verdict;
+        let s = VcpuPerfSample {
+            cycles: 1_000,
+            instructions: 1_500,
+            ..Default::default()
+        };
+        let mut v = Verdict::new();
+        let ipc = s.ipc();
+        crate::claim!(v, ipc).at_least(1.0);
+        crate::claim!(v, ipc).is_finite();
+        let r = v.into_result();
+        assert!(
+            r.passed,
+            "productive IPC=1.5 must satisfy at_least(1.0): {:?}",
+            r.details,
+        );
+    }
+
+    /// Idle / halted vCPU: cycles=0 produces ipc()=0.0 by the
+    /// guard. A claim demanding ipc ≥ 1.0 must fail with a labeled
+    /// detail naming the threshold.
+    #[test]
+    fn vcpu_perf_sample_idle_ipc_fails_productive_claim() {
+        use crate::assert::Verdict;
+        let s = VcpuPerfSample::default();
+        let ipc = s.ipc();
+        let mut v = Verdict::new();
+        crate::claim!(v, ipc).at_least(1.0);
+        let r = v.into_result();
+        assert!(!r.passed, "idle vCPU's ipc=0 must fail at_least(1.0)");
+        let msg = &r.details[0].message;
+        assert!(msg.contains("at least 1"), "msg must name threshold: {msg}");
+        assert!(msg.contains("ipc"), "msg must include the label: {msg}");
+    }
+
+    /// Multiplexed counter: time_running < time_enabled means the
+    /// PMU was multiplexed. A scenario test that asserts the
+    /// counter wasn't multiplexed can claim
+    /// `time_enabled == time_running` via `claim!(eq)`. Pin the
+    /// failure path — multiplexing surfaces with the observed and
+    /// expected values both visible.
+    #[test]
+    fn vcpu_perf_sample_multiplex_detect_via_eq_claim() {
+        use crate::assert::Verdict;
+        let s = VcpuPerfSample {
+            cycles: 500,
+            instructions: 800,
+            cache_misses: 10,
+            branch_misses: 2,
+            time_enabled_ns: 1_000_000,
+            time_running_ns: 600_000,
+        };
+        let mut v = Verdict::new();
+        crate::claim!(v, s.time_running_ns).eq(s.time_enabled_ns);
+        let r = v.into_result();
+        assert!(!r.passed, "multiplexed sample must fail eq claim");
+        let msg = &r.details[0].message;
+        assert!(
+            msg.contains("expected 1000000"),
+            "msg must reflect expected value: {msg}",
+        );
+        assert!(
+            msg.contains("was 600000"),
+            "msg must reflect observed value: {msg}",
+        );
+    }
 }

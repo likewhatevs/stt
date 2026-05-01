@@ -1595,6 +1595,24 @@ mod tests {
         fn clear_cpuset_mems(&self, _: &str) -> Result<()> {
             Ok(())
         }
+        fn set_cpu_max(&self, _: &str, _: Option<u64>, _: u64) -> Result<()> {
+            Ok(())
+        }
+        fn set_cpu_weight(&self, _: &str, _: u32) -> Result<()> {
+            Ok(())
+        }
+        fn set_memory_max(&self, _: &str, _: Option<u64>) -> Result<()> {
+            Ok(())
+        }
+        fn set_memory_high(&self, _: &str, _: Option<u64>) -> Result<()> {
+            Ok(())
+        }
+        fn set_memory_low(&self, _: &str, _: Option<u64>) -> Result<()> {
+            Ok(())
+        }
+        fn set_io_weight(&self, _: &str, _: u16) -> Result<()> {
+            Ok(())
+        }
         fn move_task(&self, _: &str, _: libc::pid_t) -> Result<()> {
             Ok(())
         }

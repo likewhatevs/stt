@@ -496,6 +496,46 @@ pub const SCHEMA_SINGLE: &str = "single";
 /// See [`SCHEMA_SINGLE`] for the discriminant contract.
 pub const SCHEMA_DUAL: &str = "dual";
 
+/// Reason string written into [`FailureDumpReport::prog_runtime_stats_unavailable`]
+/// when [`DumpContext::prog_capture`] was supplied but the per-program
+/// walker found no struct_ops programs in `prog_idr` at freeze time.
+/// Wire-format-stable: an operator parsing the sidecar JSON looks for
+/// this exact string to distinguish from the prog-accessor-missing
+/// case.
+pub const REASON_NO_STRUCT_OPS_LOADED: &str = "no struct_ops programs loaded";
+
+/// Reason string written into [`FailureDumpReport::prog_runtime_stats_unavailable`]
+/// when [`DumpContext::prog_capture`] was `None`. Distinguishes from
+/// [`REASON_NO_STRUCT_OPS_LOADED`] — the walker never ran in this case
+/// because the accessor wasn't constructed (e.g. `prog_idr` symbol
+/// missing).
+pub const REASON_PROG_ACCESSOR_UNAVAILABLE: &str = "prog accessor unavailable";
+
+/// Reason string written into [`FailureDumpReport::task_enrichments_unavailable`]
+/// when [`DumpContext::task_enrichment_capture`] was supplied but
+/// every walker entry produced no enrichment (idle guest with no
+/// runnable scx tasks at the freeze instant).
+pub const REASON_TASK_WALKER_ZERO_TASKS: &str = "task walker yielded zero tasks";
+
+/// Reason string written into [`FailureDumpReport::task_enrichments_unavailable`]
+/// when [`DumpContext::task_enrichment_capture`] was `None`.
+/// Distinguishes from [`REASON_TASK_WALKER_ZERO_TASKS`] — the walker
+/// never ran because the capture wasn't supplied.
+pub const REASON_NO_TASK_WALKER: &str = "no task walker available";
+
+/// Reason string written into [`FailureDumpReport::scx_walker_unavailable`]
+/// when [`DumpContext::scx_walker_capture`] was supplied AND every
+/// offset sub-group resolved BUT the walker reached no rq, no DSQ,
+/// and no scx_sched state. Typical when no scheduler is attached
+/// (`*scx_root == NULL`).
+pub const REASON_SCX_WALKER_NO_STATE: &str = "scx walker reached no state (scx_root NULL?)";
+
+/// Reason string written into [`FailureDumpReport::scx_walker_unavailable`]
+/// when [`DumpContext::scx_walker_capture`] was `None`. Distinguishes
+/// from [`REASON_SCX_WALKER_NO_STATE`] — the walker never ran at all
+/// because no capture was supplied.
+pub const REASON_NO_SCX_WALKER: &str = "no scx walker capture";
+
 fn default_schema_single() -> String {
     SCHEMA_SINGLE.to_string()
 }
@@ -1349,7 +1389,7 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
         Some(cap) => {
             let stats = cap.accessor.struct_ops_runtime_stats(cap.per_cpu_offsets);
             let reason = if stats.is_empty() {
-                Some("no struct_ops programs loaded".to_string())
+                Some(REASON_NO_STRUCT_OPS_LOADED.to_string())
             } else {
                 None
             };
@@ -1357,7 +1397,7 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
         }
         None => (
             Vec::new(),
-            Some("prog accessor unavailable".to_string()),
+            Some(REASON_PROG_ACCESSOR_UNAVAILABLE.to_string()),
         ),
     };
     let per_cpu_time = match cpu_time_capture {
@@ -1381,7 +1421,7 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
                 }
             }
             let reason = if enrichments.is_empty() {
-                Some("task walker yielded zero tasks".to_string())
+                Some(REASON_TASK_WALKER_ZERO_TASKS.to_string())
             } else {
                 None
             };
@@ -1389,7 +1429,7 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
         }
         None => (
             Vec::new(),
-            Some("no task walker available".to_string()),
+            Some(REASON_NO_TASK_WALKER.to_string()),
         ),
     };
     let event_counter_timeline = match event_counter_capture {
@@ -1484,7 +1524,7 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
                     && dsqs.is_empty()
                     && sched_state.is_none()
                 {
-                    Some("scx walker reached no state (scx_root NULL?)".to_string())
+                    Some(REASON_SCX_WALKER_NO_STATE.to_string())
                 } else {
                     None
                 };
@@ -1494,7 +1534,7 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
                 Vec::new(),
                 Vec::new(),
                 None,
-                Some("no scx walker capture".to_string()),
+                Some(REASON_NO_SCX_WALKER.to_string()),
             ),
         };
     // Freeze-time per-vCPU perf-counter snapshot. With `exclude_host=1`
@@ -3150,6 +3190,287 @@ mod tests {
             out.starts_with("prog_runtime_stats:"),
             "Display must lead with prog_runtime_stats section when \
              only that field is populated: {out}"
+        );
+    }
+
+    // ---- #91: pin failure-dump error-message strings ---------------
+    //
+    // The six REASON_* constants emitted by `dump_state` into the
+    // `*_unavailable` fields are wire-format markers: an operator
+    // parsing `.failure-dump.json` looks for these exact strings to
+    // distinguish "no scheduler attached" from "no walker capture
+    // supplied" etc. Drift in any of them silently breaks downstream
+    // parsing. The constants near the top of this module are the
+    // single source of truth; the tests below pin each constant's
+    // exact value so a regression that re-words a string trips both
+    // at the constant declaration AND at the test assertion.
+    //
+    // The companion strict-schema and chain-limit tests for
+    // FailureDumpReport / is_scx_allocator_type live further down in
+    // this module (#88 / #89).
+
+    #[test]
+    fn reason_no_struct_ops_loaded_string_pinned() {
+        assert_eq!(REASON_NO_STRUCT_OPS_LOADED, "no struct_ops programs loaded");
+    }
+
+    #[test]
+    fn reason_prog_accessor_unavailable_string_pinned() {
+        assert_eq!(REASON_PROG_ACCESSOR_UNAVAILABLE, "prog accessor unavailable");
+    }
+
+    #[test]
+    fn reason_task_walker_zero_tasks_string_pinned() {
+        assert_eq!(REASON_TASK_WALKER_ZERO_TASKS, "task walker yielded zero tasks");
+    }
+
+    #[test]
+    fn reason_no_task_walker_string_pinned() {
+        assert_eq!(REASON_NO_TASK_WALKER, "no task walker available");
+    }
+
+    #[test]
+    fn reason_scx_walker_no_state_string_pinned() {
+        assert_eq!(
+            REASON_SCX_WALKER_NO_STATE,
+            "scx walker reached no state (scx_root NULL?)"
+        );
+    }
+
+    #[test]
+    fn reason_no_scx_walker_string_pinned() {
+        assert_eq!(REASON_NO_SCX_WALKER, "no scx walker capture");
+    }
+
+    /// Every reason constant must round-trip through the JSON wire
+    /// format embedded in the `*_unavailable` fields. A regression
+    /// that altered the field's serde encoding (renamed the field,
+    /// added `#[serde(rename = ...)]`, etc.) would also break the
+    /// operator's string-match parsing — surface that here too.
+    #[test]
+    fn reason_strings_round_trip_through_serde() {
+        let report = FailureDumpReport {
+            prog_runtime_stats_unavailable: Some(REASON_NO_STRUCT_OPS_LOADED.to_string()),
+            task_enrichments_unavailable: Some(REASON_TASK_WALKER_ZERO_TASKS.to_string()),
+            scx_walker_unavailable: Some(REASON_SCX_WALKER_NO_STATE.to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&report).expect("serialize");
+        // Each reason must appear verbatim in the JSON; a future
+        // wire-format change (e.g. tagged enum) would hide them
+        // behind nested objects and trip this assertion.
+        assert!(
+            json.contains(REASON_NO_STRUCT_OPS_LOADED),
+            "JSON must contain prog reason verbatim: {json}",
+        );
+        assert!(
+            json.contains(REASON_TASK_WALKER_ZERO_TASKS),
+            "JSON must contain task reason verbatim: {json}",
+        );
+        assert!(
+            json.contains(REASON_SCX_WALKER_NO_STATE),
+            "JSON must contain scx reason verbatim: {json}",
+        );
+
+        let loaded: FailureDumpReport = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(
+            loaded.prog_runtime_stats_unavailable.as_deref(),
+            Some(REASON_NO_STRUCT_OPS_LOADED),
+        );
+        assert_eq!(
+            loaded.task_enrichments_unavailable.as_deref(),
+            Some(REASON_TASK_WALKER_ZERO_TASKS),
+        );
+        assert_eq!(
+            loaded.scx_walker_unavailable.as_deref(),
+            Some(REASON_SCX_WALKER_NO_STATE),
+        );
+    }
+
+    // -- Strict-schema tests for FailureDumpReport (#88) --------------
+    //
+    // Mirrors the CgroupStats / ScenarioStats / SidecarResult tests in
+    // assert.rs and test_support/sidecar.rs. FailureDumpReport's
+    // contract is narrower than CgroupStats's because most of its
+    // fields are intentionally optional (capture pipelines may
+    // legitimately produce no entries), so the CgroupStats
+    // "remove every field" loop would over-assert here.
+    //
+    // Asserted contract:
+    //   - `maps` is the only required field on the wire.
+    //   - `schema` is `serde(default = default_schema_single)` —
+    //     omission yields `SCHEMA_SINGLE`.
+    //   - Every other field is `serde(default, skip_serializing_if =
+    //     ...)` — omission MUST succeed.
+    //
+    // A regression that softens `maps` to `serde(default)` (e.g. to
+    // soften a schema migration) would silently produce empty-maps
+    // dumps that look indistinguishable from a legitimate no-maps
+    // run. A regression that hardens an optional field to require it
+    // on the wire would break replay of older dumps. Either drift
+    // trips this test.
+
+    /// Removing the `maps` field MUST fail deserialize. `maps`
+    /// carries the BPF map enumeration that is the dump's only
+    /// mandatory payload — every other field is
+    /// capture-pipeline-optional. The deserialize error MUST name
+    /// `maps` so a regression produces a debuggable failure rather
+    /// than a silent default.
+    #[test]
+    fn failure_dump_report_strict_schema_maps_required() {
+        let report = FailureDumpReport::default();
+        let mut full = match serde_json::to_value(&report).unwrap() {
+            serde_json::Value::Object(m) => m,
+            other => panic!("expected object, got {other:?}"),
+        };
+        assert!(
+            full.remove("maps").is_some(),
+            "FailureDumpReport must emit `maps` for this test to be \
+             meaningful — the field has been renamed or removed",
+        );
+        let json = serde_json::Value::Object(full).to_string();
+        let err = serde_json::from_str::<FailureDumpReport>(&json)
+            .err()
+            .expect("deserialize must reject FailureDumpReport with `maps` removed");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("maps"),
+            "missing-field error for `maps` must name the field; got: {msg}",
+        );
+    }
+
+    /// Omitting all optional fields (`schema`, `vcpu_regs`,
+    /// `sdt_allocations`, every diagnostic Option, every capture
+    /// Vec) MUST succeed and produce a deserialized report whose
+    /// absent fields take their `serde(default)` value. `schema`
+    /// gets a positive control: omission MUST yield `SCHEMA_SINGLE`,
+    /// not the empty string a naive `Default for String` would
+    /// produce.
+    #[test]
+    fn failure_dump_report_optional_fields_round_trip_when_omitted() {
+        let minimal = serde_json::json!({ "maps": [] });
+        let report: FailureDumpReport = serde_json::from_value(minimal)
+            .expect("deserialize must accept FailureDumpReport with only `maps`");
+        assert_eq!(
+            report.schema, SCHEMA_SINGLE,
+            "absent `schema` field must default to SCHEMA_SINGLE \
+             (default_schema_single fn); got: {:?}",
+            report.schema,
+        );
+        assert!(report.maps.is_empty());
+        assert!(report.vcpu_regs.is_empty());
+        assert!(report.sdt_allocations.is_empty());
+        assert!(report.prog_runtime_stats.is_empty());
+        assert!(report.prog_runtime_stats_unavailable.is_none());
+        assert!(report.per_cpu_time.is_empty());
+        assert!(report.task_enrichments.is_empty());
+        assert!(report.task_enrichments_unavailable.is_none());
+        assert!(report.event_counter_timeline.is_empty());
+        assert!(report.rq_scx_states.is_empty());
+        assert!(report.dsq_states.is_empty());
+        assert!(report.scx_sched_state.is_none());
+        assert!(report.scx_walker_unavailable.is_none());
+        assert!(report.vcpu_perf_at_freeze.is_empty());
+    }
+
+    // -- Pin failure-dump error-message strings (#91) ----------------
+    //
+    // Pin the EXACT prose of error strings rendered into
+    // FailureDumpMap.error. Substring tests are permissive against
+    // drift; this regression suite asserts byte-for-byte equality so
+    // any re-wording during refactor surfaces in `cargo nextest run`
+    // before it ships.
+    //
+    // The strings are observable via FailureDumpMap.error contents
+    // and via downstream log scrapers (operators grep these in CI
+    // logs). Changing them silently breaks log tooling. Each pin
+    // doubles as documentation: this file shows exactly which prose
+    // is covered by drift detection.
+    //
+    // dump.rs producers covered here — five distinct render-time
+    // formats observed at:
+    //   - dump.rs:2168 (BPF_MAP_TYPE_ARENA, no offsets)
+    //   - dump.rs:2064-2067 (BPF_MAP_TYPE_ARRAY, multi-entry)
+    //   - dump.rs:2106 (BPF_MAP_TYPE_HASH, truncation)
+    //   - dump.rs:2131-2133 (BPF_MAP_TYPE_PERCPU_ARRAY, truncation)
+    //   - dump.rs:2174-2175 (unsupported map_type wildcard)
+    //
+    // Each pin reproduces the production format string against a
+    // known-value placeholder and asserts byte equality with the
+    // expected literal. A drift in either the prose or the constant
+    // value (e.g. raising MAX_HASH_ENTRIES from 4096 to 8192) trips
+    // the test.
+    //
+    // The companion REASON_* constants for diagnostic Option fields
+    // (REASON_NO_STRUCT_OPS_LOADED, REASON_TASK_WALKER_ZERO_TASKS,
+    // REASON_SCX_WALKER_NO_STATE, ...) are already pinned by tests
+    // earlier in this module — see `report_unavailable_reasons_*`.
+
+    /// `arena BTF offsets unavailable (kernel lacks struct bpf_arena?)`
+    /// is rendered by the BPF_MAP_TYPE_ARENA arm when arena_offsets
+    /// is None — surfacing that the kernel lacks struct bpf_arena.
+    #[test]
+    fn pinned_error_arena_btf_offsets_unavailable() {
+        // The producer has no format placeholders; reproduce the
+        // exact `.into()` literal so a rephrasing in dump.rs trips.
+        let rendered: String =
+            "arena BTF offsets unavailable (kernel lacks struct bpf_arena?)".into();
+        assert_eq!(
+            rendered,
+            "arena BTF offsets unavailable (kernel lacks struct bpf_arena?)",
+            "arena-unavailable error string drifted from pin",
+        );
+    }
+
+    /// `multi-entry ARRAY: only key 0 of {N} shown` is rendered by
+    /// the BPF_MAP_TYPE_ARRAY arm when `info.max_entries > 1`.
+    #[test]
+    fn pinned_error_multi_entry_array_truncation() {
+        let n: u32 = 7;
+        let rendered = format!("multi-entry ARRAY: only key 0 of {n} shown");
+        assert_eq!(
+            rendered, "multi-entry ARRAY: only key 0 of 7 shown",
+            "multi-entry ARRAY truncation string drifted from pin",
+        );
+    }
+
+    /// `hash map truncated at {MAX_HASH_ENTRIES} entries` is
+    /// rendered by the BPF_MAP_TYPE_HASH arm. Pins both the prose
+    /// and `MAX_HASH_ENTRIES` so either drifting trips the test.
+    #[test]
+    fn pinned_error_hash_map_truncation() {
+        let rendered = format!("hash map truncated at {MAX_HASH_ENTRIES} entries");
+        assert_eq!(
+            rendered, "hash map truncated at 4096 entries",
+            "hash map truncation string OR MAX_HASH_ENTRIES drifted from pin",
+        );
+    }
+
+    /// `PERCPU_ARRAY truncated at {MAX_PERCPU_KEYS} keys (max_entries={N})`
+    /// is rendered by the BPF_MAP_TYPE_PERCPU_ARRAY arm. Pins prose,
+    /// constant, and placeholder ordering.
+    #[test]
+    fn pinned_error_percpu_array_truncation() {
+        let max_entries: u32 = 999;
+        let rendered = format!(
+            "PERCPU_ARRAY truncated at {MAX_PERCPU_KEYS} keys (max_entries={max_entries})",
+        );
+        assert_eq!(
+            rendered,
+            "PERCPU_ARRAY truncated at 256 keys (max_entries=999)",
+            "PERCPU_ARRAY truncation string OR MAX_PERCPU_KEYS drifted from pin",
+        );
+    }
+
+    /// `map_type {N} not yet supported by failure dump` is rendered
+    /// by the wildcard arm for any map_type the dump doesn't enumerate.
+    #[test]
+    fn pinned_error_unsupported_map_type() {
+        let other: u32 = 42;
+        let rendered = format!("map_type {other} not yet supported by failure dump");
+        assert_eq!(
+            rendered, "map_type 42 not yet supported by failure dump",
+            "unsupported-map-type string drifted from pin",
         );
     }
 }

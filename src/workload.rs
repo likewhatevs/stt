@@ -283,6 +283,230 @@ pub enum WorkType {
         name: &'static str,
         run: fn(&AtomicBool) -> WorkerReport,
     },
+    /// One waker, N waiters on a SINGLE global futex word, repeated
+    /// in batches with a sleep gap. Distinct from
+    /// [`FutexFanOut`](Self::FutexFanOut) which uses one futex per
+    /// fan-out group: ThunderingHerd parks every worker on the same
+    /// queue, so a single `FUTEX_WAKE` rouses the entire herd
+    /// simultaneously. Exercises the broadcast-wake path through
+    /// `try_to_wake_up` and the scheduler's ability to spread the
+    /// woken cohort across CPUs without convoying.
+    ///
+    /// The first worker (index 0) is the waker; the remaining
+    /// `num_workers - 1` are waiters. Per pathology research
+    /// (research_structural_pathology.md P1), structural minimum is
+    /// `waiters >= 5` to surface convoy effects on a multi-CPU
+    /// host. `worker_group_size = num_workers` so every worker
+    /// shares the same shared-memory region; reuses the existing
+    /// futex MAP_SHARED allocator.
+    ThunderingHerd {
+        /// Number of waiter workers (the herd). Must satisfy
+        /// `num_workers == waiters + 1` (1 waker + waiters).
+        waiters: usize,
+        /// Total batches of wake-and-sleep cycles before the work
+        /// loop ends. The waker emits `FUTEX_WAKE(INT_MAX)` once
+        /// per batch.
+        batches: u64,
+        /// Inter-batch sleep on the waker (ms). Gives waiters a
+        /// chance to re-park before the next thundering wake.
+        inter_batch_ms: u64,
+    },
+    /// Three priority tiers contending for one shared lock. `low`
+    /// workers acquire the lock and hold it while doing CPU work;
+    /// `medium` workers do non-blocking CPU work (no lock) at a
+    /// higher priority so they can preempt `low`; `high` workers
+    /// try to acquire the lock at top priority. When `medium` keeps
+    /// preempting `low`, `high` waits on the lock indefinitely —
+    /// classic priority inversion.
+    ///
+    /// `pi_mode = PiMode::Pi` uses `FUTEX_LOCK_PI` (PI-aware
+    /// mutex); kernel boosts `low` to `high`'s priority for the
+    /// duration of the hold, which both unblocks `high` and pins
+    /// `medium` from preempting. `PiMode::Plain` uses a plain
+    /// futex with no boost — the inversion goes uncorrected.
+    /// Tests both halves of the rt_mutex PI chain under the same
+    /// workload shape.
+    ///
+    /// Requires same-CPU pinning (e.g. [`AffinityKind::SingleCpu`])
+    /// for `medium` to actually preempt `low`. Without pinning, the
+    /// scheduler distributes the priorities across CPUs and the
+    /// inversion never materialises.
+    ///
+    /// `worker_group_size = high_count + medium_count + low_count`
+    /// so all three tiers share one futex region.
+    PriorityInversion {
+        /// Number of high-priority workers. Each acquires the
+        /// shared lock at top priority.
+        high_count: usize,
+        /// Number of medium-priority workers. Run at a priority
+        /// above `low_count` so they preempt the lock holder.
+        medium_count: usize,
+        /// Number of low-priority workers. Each holds the shared
+        /// lock during its `hold_iters` CPU burst.
+        low_count: usize,
+        /// CPU-spin iterations a `low` worker burns while holding
+        /// the lock.
+        hold_iters: u64,
+        /// CPU-spin iterations every worker burns between
+        /// lock-acquire attempts (`high`/`low`) or between
+        /// non-blocking work cycles (`medium`).
+        work_iters: u64,
+        /// Whether the workload uses a PI-aware futex (`Pi`,
+        /// invokes `FUTEX_LOCK_PI` and the rt_mutex PI boost
+        /// chain in `kernel/futex/pi.c`) or a plain non-PI futex
+        /// (`Plain`, uncorrected inversion). See [`PiMode`].
+        pi_mode: PiMode,
+    },
+    /// Producer / consumer pipeline with deliberately-unbalanced
+    /// rates. `producers` workers push items at `produce_rate_hz`;
+    /// `consumers` workers pop items and burn `consume_iters` of
+    /// CPU work per pop. When `producers * produce_rate_hz`
+    /// exceeds `consumers * (1 / consume_time)`, the queue grows
+    /// monotonically toward `queue_depth_target`, exercising
+    /// scheduler unfairness under sustained backpressure.
+    ///
+    /// The shared queue is an SPSC/MPSC ring buffer in MAP_SHARED
+    /// memory sized to `queue_depth_target * 8 bytes` (u64 slots).
+    /// Worker indices `[0, producers)` are producers; indices
+    /// `[producers, producers + consumers)` are consumers.
+    /// `worker_group_size = producers + consumers`.
+    ProducerConsumerImbalance {
+        /// Number of producer workers feeding the shared queue.
+        producers: usize,
+        /// Number of consumer workers draining the shared queue.
+        consumers: usize,
+        /// Target rate per producer (items per second). Producers
+        /// pace themselves with `nanosleep` between pushes.
+        produce_rate_hz: u64,
+        /// CPU-spin iterations a consumer burns per popped item.
+        /// Sets the implicit consume rate as
+        /// `1 / spin_time(consume_iters)`.
+        consume_iters: u64,
+        /// Queue capacity (number of u64 slots). Determines the
+        /// shared-memory region size and the producer's drop /
+        /// stall behaviour when the queue fills.
+        queue_depth_target: u64,
+    },
+    /// `rt_workers` workers run as `SCHED_FIFO` at `rt_priority`
+    /// burning 100% CPU with `burst_iters` CPU work per iteration
+    /// (no yields). `cfs_workers` workers run as `SCHED_NORMAL` and
+    /// try to do work in the same scheduling domain. Without DL
+    /// server protection (sched_ext does not have one — see the
+    /// scx_ext docs), the SCHED_NORMAL workers starve.
+    ///
+    /// Reproducer setup: pin both groups to the same CPU set
+    /// (e.g. via [`AffinityKind::SingleCpu`]), and on the host set
+    /// `sysctl_sched_rt_runtime_us=-1` for unlimited RT bandwidth
+    /// (otherwise the kernel rt_period throttle unstuck things
+    /// after 0.95s).
+    ///
+    /// Worker indices `[0, rt_workers)` get `SCHED_FIFO` applied
+    /// post-fork via `sched_setscheduler`; the remainder stay on
+    /// `SCHED_NORMAL`. `worker_group_size = rt_workers + cfs_workers`.
+    RtStarvation {
+        /// Number of SCHED_FIFO workers. Each runs at `rt_priority`.
+        rt_workers: usize,
+        /// Number of SCHED_NORMAL (CFS) workers competing on the
+        /// same CPU set. Expected to starve.
+        cfs_workers: usize,
+        /// SCHED_FIFO priority for the RT workers. Must be in
+        /// `1..=99`; clamped at the apply site.
+        rt_priority: i32,
+        /// CPU-spin iterations every worker (RT and CFS) burns per
+        /// iteration. RT workers don't yield — they monopolise
+        /// the CPU until kernel-side preemption.
+        burst_iters: u64,
+    },
+    /// Paired workers with mismatched scheduling classes share a
+    /// single futex word for hand-off. The waker (worker index 0)
+    /// runs as [`waker_class`](Self::AsymmetricWaker::waker_class);
+    /// the wakee (worker index 1) runs as
+    /// [`wakee_class`](Self::AsymmetricWaker::wakee_class). After
+    /// `burst_iters` of CPU work the waker advances the futex word
+    /// and `FUTEX_WAKE`s the wakee; the wakee blocks in
+    /// `FUTEX_WAIT` between turns. Tests wake-affine placement
+    /// when waker and wakee live in different scheduling classes
+    /// (e.g. an RT waker waking an EXT wakee — does the scheduler
+    /// place the wakee on the waker's CPU, the wakee's last CPU,
+    /// or somewhere else?).
+    ///
+    /// `worker_group_size = 2`. Wake latency is recorded into the
+    /// wakee's `resume_latencies_ns` reservoir using the same
+    /// `before_block` → `cur != expected` measurement as
+    /// [`FutexPingPong`](Self::FutexPingPong).
+    AsymmetricWaker {
+        /// Scheduling class for the waker (worker index 0).
+        waker_class: SchedClass,
+        /// Scheduling class for the wakee (worker index 1).
+        wakee_class: SchedClass,
+        /// CPU-spin iterations the waker burns before each wake.
+        burst_iters: u64,
+    },
+    /// Pipeline of waker-wakee hops `A → B → C → ...` of `depth`
+    /// stages, optionally with `fanout` parallel chains. Stage
+    /// boundaries use a pipe (when `sync = true`, raising
+    /// `WF_SYNC` on the wakeup) or a futex (when `sync = false`,
+    /// no `WF_SYNC`). Each hop burns `work_per_hop` of CPU work
+    /// before signalling the next stage. Tests `SCX_WAKE_SYNC`
+    /// path under producer-consumer NUMA pinning.
+    ///
+    /// Worker indices are partitioned into `fanout` chains of
+    /// `depth` workers each. `worker_group_size = depth * fanout`.
+    /// At the end of the chain the last worker loops back to the
+    /// first, forming a ring so the work pattern can run for a
+    /// long test window.
+    WakeChain {
+        /// Number of workers per chain. Each worker waits for its
+        /// predecessor's signal, does `work_per_hop` of CPU work,
+        /// signals the next worker, and repeats.
+        depth: usize,
+        /// Number of parallel chains. `fanout = 1` is a single
+        /// linear chain; `fanout > 1` runs multiple chains in
+        /// parallel, all sharing one configuration.
+        fanout: usize,
+        /// `true`: stage boundary is a 1-byte pipe write that the
+        /// kernel translates into a `WF_SYNC`-tagged wakeup
+        /// (kernel/exit.c et al). `false`: stage boundary is a
+        /// futex word advance with no `WF_SYNC` flag.
+        sync: bool,
+        /// Wall-clock CPU work each worker performs per stage
+        /// before signalling the next. Use [`Duration`] to keep
+        /// the unit visible at the call site (consistent with
+        /// [`SchedPolicy::Deadline`]'s switch to `Duration`).
+        work_per_hop: Duration,
+    },
+    /// Workers allocate a `region_kb` KB region with `set_mempolicy`
+    /// pinned to one node, touch every page in that region, then
+    /// `mbind(MPOL_BIND)` the region to the next node in
+    /// `target_nodes` and re-touch — moving the working set across
+    /// NUMA nodes every `sweep_period_ms`. Exercises page migration
+    /// (`migrate_pages` / `move_pages`), the kernel's NUMA-balancing
+    /// path (`task_numa_work`), and scheduler placement decisions
+    /// under sustained working-set churn.
+    ///
+    /// Each worker rotates independently through the same
+    /// `target_nodes` list with a per-worker phase offset so the
+    /// cohort doesn't bind every region to the same node at the
+    /// same instant. `worker_group_size = None` (any worker count
+    /// is valid; each worker mbinds its own region without shared
+    /// state).
+    NumaWorkingSetSweep {
+        /// Size of the working-set region per worker (KB). Each
+        /// worker allocates this much anonymous memory and re-binds
+        /// it across NUMA nodes.
+        region_kb: usize,
+        /// Wall-clock interval between binds. After every
+        /// `sweep_period_ms`, the worker rotates to the next node
+        /// in `target_nodes` and `mbind`s the region.
+        sweep_period_ms: u64,
+        /// Ordered list of NUMA node IDs the working set rotates
+        /// through. Empty list disables binding (the worker still
+        /// touches the region every iteration; no migration is
+        /// triggered). Single-node lists pin the region to one
+        /// node permanently — useful as an A/B baseline against a
+        /// rotating sweep.
+        target_nodes: Vec<usize>,
+    },
 }
 
 /// Named defaults for the parametric [`WorkType`] variants, used by
@@ -329,6 +553,38 @@ pub mod defaults {
     pub const MUTEX_CONTENTION_CONTENDERS: usize = 4;
     pub const MUTEX_CONTENTION_HOLD_ITERS: u64 = 256;
     pub const MUTEX_CONTENTION_WORK_ITERS: u64 = 1024;
+    // ThunderingHerd
+    pub const THUNDERING_HERD_WAITERS: usize = 7;
+    pub const THUNDERING_HERD_BATCHES: u64 = 1_000;
+    pub const THUNDERING_HERD_INTER_BATCH_MS: u64 = 5;
+    // PriorityInversion
+    pub const PRIORITY_INVERSION_HIGH_COUNT: usize = 1;
+    pub const PRIORITY_INVERSION_MEDIUM_COUNT: usize = 1;
+    pub const PRIORITY_INVERSION_LOW_COUNT: usize = 1;
+    pub const PRIORITY_INVERSION_HOLD_ITERS: u64 = 4096;
+    pub const PRIORITY_INVERSION_WORK_ITERS: u64 = 1024;
+    pub const PRIORITY_INVERSION_PI_MODE: super::PiMode = super::PiMode::Plain;
+    // ProducerConsumerImbalance
+    pub const PRODUCER_CONSUMER_PRODUCERS: usize = 2;
+    pub const PRODUCER_CONSUMER_CONSUMERS: usize = 1;
+    pub const PRODUCER_CONSUMER_PRODUCE_RATE_HZ: u64 = 1_000;
+    pub const PRODUCER_CONSUMER_CONSUME_ITERS: u64 = 4_096;
+    pub const PRODUCER_CONSUMER_QUEUE_DEPTH_TARGET: u64 = 1024;
+    // RtStarvation
+    pub const RT_STARVATION_RT_WORKERS: usize = 1;
+    pub const RT_STARVATION_CFS_WORKERS: usize = 1;
+    pub const RT_STARVATION_RT_PRIORITY: i32 = 50;
+    pub const RT_STARVATION_BURST_ITERS: u64 = 1024;
+    // AsymmetricWaker
+    pub const ASYMMETRIC_WAKER_BURST_ITERS: u64 = 1024;
+    // WakeChain
+    pub const WAKE_CHAIN_DEPTH: usize = 4;
+    pub const WAKE_CHAIN_FANOUT: usize = 1;
+    pub const WAKE_CHAIN_SYNC: bool = true;
+    pub const WAKE_CHAIN_WORK_PER_HOP: std::time::Duration = std::time::Duration::from_micros(100);
+    // NumaWorkingSetSweep
+    pub const NUMA_WORKING_SET_SWEEP_REGION_KB: usize = 4_096;
+    pub const NUMA_WORKING_SET_SWEEP_SWEEP_PERIOD_MS: u64 = 100;
 }
 
 impl WorkType {
@@ -366,6 +622,13 @@ impl WorkType {
             WorkType::PageFaultChurn { .. } => "PageFaultChurn",
             WorkType::MutexContention { .. } => "MutexContention",
             WorkType::Custom { name, .. } => name,
+            WorkType::ThunderingHerd { .. } => "ThunderingHerd",
+            WorkType::PriorityInversion { .. } => "PriorityInversion",
+            WorkType::ProducerConsumerImbalance { .. } => "ProducerConsumerImbalance",
+            WorkType::RtStarvation { .. } => "RtStarvation",
+            WorkType::AsymmetricWaker { .. } => "AsymmetricWaker",
+            WorkType::WakeChain { .. } => "WakeChain",
+            WorkType::NumaWorkingSetSweep { .. } => "NumaWorkingSetSweep",
         }
     }
 
@@ -429,6 +692,52 @@ impl WorkType {
                 hold_iters: defaults::MUTEX_CONTENTION_HOLD_ITERS,
                 work_iters: defaults::MUTEX_CONTENTION_WORK_ITERS,
             }),
+            "ThunderingHerd" => Some(WorkType::ThunderingHerd {
+                waiters: defaults::THUNDERING_HERD_WAITERS,
+                batches: defaults::THUNDERING_HERD_BATCHES,
+                inter_batch_ms: defaults::THUNDERING_HERD_INTER_BATCH_MS,
+            }),
+            "PriorityInversion" => Some(WorkType::PriorityInversion {
+                high_count: defaults::PRIORITY_INVERSION_HIGH_COUNT,
+                medium_count: defaults::PRIORITY_INVERSION_MEDIUM_COUNT,
+                low_count: defaults::PRIORITY_INVERSION_LOW_COUNT,
+                hold_iters: defaults::PRIORITY_INVERSION_HOLD_ITERS,
+                work_iters: defaults::PRIORITY_INVERSION_WORK_ITERS,
+                pi_mode: defaults::PRIORITY_INVERSION_PI_MODE,
+            }),
+            "ProducerConsumerImbalance" => Some(WorkType::ProducerConsumerImbalance {
+                producers: defaults::PRODUCER_CONSUMER_PRODUCERS,
+                consumers: defaults::PRODUCER_CONSUMER_CONSUMERS,
+                produce_rate_hz: defaults::PRODUCER_CONSUMER_PRODUCE_RATE_HZ,
+                consume_iters: defaults::PRODUCER_CONSUMER_CONSUME_ITERS,
+                queue_depth_target: defaults::PRODUCER_CONSUMER_QUEUE_DEPTH_TARGET,
+            }),
+            "RtStarvation" => Some(WorkType::RtStarvation {
+                rt_workers: defaults::RT_STARVATION_RT_WORKERS,
+                cfs_workers: defaults::RT_STARVATION_CFS_WORKERS,
+                rt_priority: defaults::RT_STARVATION_RT_PRIORITY,
+                burst_iters: defaults::RT_STARVATION_BURST_ITERS,
+            }),
+            "AsymmetricWaker" => Some(WorkType::AsymmetricWaker {
+                waker_class: SchedClass::default(),
+                wakee_class: SchedClass::default(),
+                burst_iters: defaults::ASYMMETRIC_WAKER_BURST_ITERS,
+            }),
+            "WakeChain" => Some(WorkType::WakeChain {
+                depth: defaults::WAKE_CHAIN_DEPTH,
+                fanout: defaults::WAKE_CHAIN_FANOUT,
+                sync: defaults::WAKE_CHAIN_SYNC,
+                work_per_hop: defaults::WAKE_CHAIN_WORK_PER_HOP,
+            }),
+            "NumaWorkingSetSweep" => Some(WorkType::NumaWorkingSetSweep {
+                region_kb: defaults::NUMA_WORKING_SET_SWEEP_REGION_KB,
+                sweep_period_ms: defaults::NUMA_WORKING_SET_SWEEP_SWEEP_PERIOD_MS,
+                // Empty list — single-node default leaves binding
+                // disabled, matching `node_set()` defaults from
+                // `MemPolicy::Default`. Users opt-in with a node
+                // list via the constructor.
+                target_nodes: Vec::new(),
+            }),
             // Sequence requires explicit phases; no default from_name.
             _ => None,
         }
@@ -484,6 +793,41 @@ impl WorkType {
             WorkType::FutexFanOut { fan_out, .. } => Some(fan_out + 1),
             WorkType::FanOutCompute { fan_out, .. } => Some(fan_out + 1),
             WorkType::MutexContention { contenders, .. } => Some(*contenders),
+            // ThunderingHerd uses a single global futex shared by
+            // every worker — group size must equal num_workers so
+            // the per-group futex allocator yields exactly one
+            // shared region for the whole herd.
+            WorkType::ThunderingHerd { waiters, .. } => Some(waiters + 1),
+            // PriorityInversion: all 3 tiers share the same futex
+            // word, so the group covers every worker.
+            WorkType::PriorityInversion {
+                high_count,
+                medium_count,
+                low_count,
+                ..
+            } => Some(high_count + medium_count + low_count),
+            // ProducerConsumerImbalance: producers + consumers
+            // share the queue mmap.
+            WorkType::ProducerConsumerImbalance {
+                producers,
+                consumers,
+                ..
+            } => Some(producers + consumers),
+            // RtStarvation: rt + cfs workers share the same
+            // affinity-constrained scheduling domain.
+            WorkType::RtStarvation {
+                rt_workers,
+                cfs_workers,
+                ..
+            } => Some(rt_workers + cfs_workers),
+            // AsymmetricWaker: paired waker + wakee (group of 2),
+            // matching FutexPingPong's shape.
+            WorkType::AsymmetricWaker { .. } => Some(2),
+            // WakeChain: each chain has `depth` workers; multiple
+            // chains run in parallel via `fanout`. Group size is
+            // the per-chain size; num_workers must equal
+            // depth * fanout.
+            WorkType::WakeChain { depth, fanout, .. } => Some(depth * fanout),
             _ => None,
         }
     }
@@ -496,6 +840,11 @@ impl WorkType {
                 | WorkType::FutexFanOut { .. }
                 | WorkType::FanOutCompute { .. }
                 | WorkType::MutexContention { .. }
+                | WorkType::ThunderingHerd { .. }
+                | WorkType::PriorityInversion { .. }
+                | WorkType::ProducerConsumerImbalance { .. }
+                | WorkType::AsymmetricWaker { .. }
+                | WorkType::WakeChain { .. }
         )
     }
 
@@ -601,6 +950,115 @@ impl WorkType {
             contenders,
             hold_iters,
             work_iters,
+        }
+    }
+
+    /// One waker, N waiters on a single global futex; broadcasts via
+    /// `FUTEX_WAKE` per batch. Pairs with
+    /// [`WorkType::ThunderingHerd`].
+    pub fn thundering_herd(waiters: usize, batches: u64, inter_batch_ms: u64) -> Self {
+        WorkType::ThunderingHerd {
+            waiters,
+            batches,
+            inter_batch_ms,
+        }
+    }
+
+    /// Three priority tiers contending for one shared lock. See
+    /// [`WorkType::PriorityInversion`] for behavior; pass
+    /// [`PiMode::Pi`] to invoke `FUTEX_LOCK_PI` or
+    /// [`PiMode::Plain`] for a non-PI futex.
+    pub fn priority_inversion(
+        high_count: usize,
+        medium_count: usize,
+        low_count: usize,
+        hold_iters: u64,
+        work_iters: u64,
+        pi_mode: PiMode,
+    ) -> Self {
+        WorkType::PriorityInversion {
+            high_count,
+            medium_count,
+            low_count,
+            hold_iters,
+            work_iters,
+            pi_mode,
+        }
+    }
+
+    /// Producer/consumer pipeline with deliberately unbalanced
+    /// rates. See [`WorkType::ProducerConsumerImbalance`].
+    pub fn producer_consumer_imbalance(
+        producers: usize,
+        consumers: usize,
+        produce_rate_hz: u64,
+        consume_iters: u64,
+        queue_depth_target: u64,
+    ) -> Self {
+        WorkType::ProducerConsumerImbalance {
+            producers,
+            consumers,
+            produce_rate_hz,
+            consume_iters,
+            queue_depth_target,
+        }
+    }
+
+    /// `rt_workers` SCHED_FIFO workers vs. `cfs_workers` SCHED_NORMAL
+    /// workers competing on the same CPU set. See
+    /// [`WorkType::RtStarvation`].
+    pub fn rt_starvation(
+        rt_workers: usize,
+        cfs_workers: usize,
+        rt_priority: i32,
+        burst_iters: u64,
+    ) -> Self {
+        WorkType::RtStarvation {
+            rt_workers,
+            cfs_workers,
+            rt_priority,
+            burst_iters,
+        }
+    }
+
+    /// Paired workers in mismatched scheduling classes. See
+    /// [`WorkType::AsymmetricWaker`].
+    pub fn asymmetric_waker(
+        waker_class: SchedClass,
+        wakee_class: SchedClass,
+        burst_iters: u64,
+    ) -> Self {
+        WorkType::AsymmetricWaker {
+            waker_class,
+            wakee_class,
+            burst_iters,
+        }
+    }
+
+    /// Pipeline of waker-wakee hops with optional `WF_SYNC`. See
+    /// [`WorkType::WakeChain`].
+    pub fn wake_chain(depth: usize, fanout: usize, sync: bool, work_per_hop: Duration) -> Self {
+        WorkType::WakeChain {
+            depth,
+            fanout,
+            sync,
+            work_per_hop,
+        }
+    }
+
+    /// NUMA working-set sweep with periodic `mbind` rotation. See
+    /// [`WorkType::NumaWorkingSetSweep`]. `target_nodes` accepts
+    /// any `IntoIterator<Item = usize>` for ergonomic call sites
+    /// (`[0, 1, 2]`, `0..node_count`, `BTreeSet`, etc.).
+    pub fn numa_working_set_sweep(
+        region_kb: usize,
+        sweep_period_ms: u64,
+        target_nodes: impl IntoIterator<Item = usize>,
+    ) -> Self {
+        WorkType::NumaWorkingSetSweep {
+            region_kb,
+            sweep_period_ms,
+            target_nodes: target_nodes.into_iter().collect(),
         }
     }
 
@@ -771,6 +1229,127 @@ impl SchedPolicy {
             runtime,
             deadline,
             period,
+        }
+    }
+}
+
+/// Whether [`WorkType::PriorityInversion`] uses a PI-aware mutex
+/// or a plain futex.
+///
+/// `Pi` exercises `FUTEX_LOCK_PI` and the rt_mutex priority-boost
+/// chain (`kernel/futex/pi.c`). When the low-priority lock holder
+/// is preempted by a medium-priority worker, the kernel boosts
+/// the holder to the high-priority waiter's priority for the
+/// duration of the hold — both unblocking `high` and pinning
+/// `medium` from preempting it. `Plain` uses a non-PI futex so
+/// the inversion is left unrepaired and the scheduler must
+/// surface the stall.
+///
+/// Carried as a typed wrapper rather than a `bool` to avoid
+/// positional-argument confusion at call sites and so the
+/// failure-dump diagnostic names the choice explicitly
+/// ("pi_mode = Pi" vs "pi_mode = Plain") instead of a bare
+/// boolean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PiMode {
+    /// `FUTEX_LOCK_PI` with rt_mutex PI chain.
+    Pi,
+    /// Plain futex (no PI boost). The default — exercises the
+    /// uncorrected inversion the workload exists to surface.
+    #[default]
+    Plain,
+}
+
+/// Coarse Linux scheduling class identifier.
+///
+/// Maps to one of the kernel's six core scheduler classes:
+/// `fair_sched_class` (CFS / EEVDF — covers `SCHED_NORMAL`,
+/// `SCHED_BATCH`, `SCHED_IDLE`), `rt_sched_class` (covers
+/// `SCHED_FIFO` and `SCHED_RR`), `dl_sched_class` (covers
+/// `SCHED_DEADLINE`), and `ext_sched_class` (covers `SCHED_EXT`
+/// when sched_ext is loaded). The class is a coarser concept
+/// than [`SchedPolicy`] — `Cfs` covers Normal/Batch/Idle, `Rt`
+/// covers Fifo/RoundRobin — and is what
+/// [`WorkType::AsymmetricWaker`] consumes when it wants to
+/// describe a waker / wakee pair without specifying priority
+/// values. When a per-worker class is applied,
+/// [`apply_sched_class`] maps the variant to the equivalent
+/// [`SchedPolicy`] (using a default priority where applicable)
+/// and routes through `set_sched_policy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SchedClass {
+    /// `fair_sched_class` — `SCHED_NORMAL` (CFS / EEVDF). The
+    /// default; matches a freshly-forked task before any policy
+    /// override.
+    #[default]
+    Cfs,
+    /// `fair_sched_class` — `SCHED_BATCH` (background-friendly
+    /// fair task with longer wakeup latency targets).
+    Batch,
+    /// `fair_sched_class` — `SCHED_IDLE` (lowest fair-class
+    /// weight; runs only when nothing else is runnable).
+    Idle,
+    /// `rt_sched_class` — `SCHED_FIFO` at default priority
+    /// `RT_DEFAULT_PRIO`. Requires `CAP_SYS_NICE`. For explicit
+    /// priority control use [`SchedPolicy::Fifo`] directly.
+    Rt,
+    /// `dl_sched_class` — `SCHED_DEADLINE`. Maps to a
+    /// minimum-bandwidth deadline reservation
+    /// ([`SchedClass::default_deadline_reservation`]) so
+    /// `SchedClass::Deadline` is constructible without picking
+    /// runtime/deadline/period. Callers needing precise
+    /// reservations should use [`SchedPolicy::Deadline`]
+    /// directly.
+    Deadline,
+    /// `ext_sched_class` — `SCHED_EXT`. Routes the worker
+    /// through the loaded sched_ext BPF scheduler. Under
+    /// switch-all (the default scx-ktstr regime), this is the
+    /// same effective class as `Cfs` because every fair-policy
+    /// task already reroutes to ext via `task_should_scx` (see
+    /// kernel/sched/ext.c). `Cfs` is preserved as the explicit
+    /// "I want fair semantics" knob the user expresses; `Ext`
+    /// is preserved for tests that explicitly want
+    /// `policy == SCHED_EXT` set on the task_struct.
+    Ext,
+}
+
+/// Default `RT_DEFAULT_PRIO` for [`SchedClass::Rt`] when mapped to
+/// a [`SchedPolicy`]. Picked at the middle of the 1..=99 valid range
+/// so the worker neither preempts every other RT task in the system
+/// nor sits at the floor; tests that need a specific RT priority
+/// must construct [`SchedPolicy::Fifo`] directly.
+const RT_DEFAULT_PRIO: u32 = 50;
+
+impl SchedClass {
+    /// Resolve to an equivalent [`SchedPolicy`]. `Rt` uses
+    /// [`RT_DEFAULT_PRIO`]; `Deadline` uses the minimum-bandwidth
+    /// reservation (1us runtime over 1ms period — passes
+    /// `__checkparam_dl` and the default sysctl bounds).
+    /// `Ext` maps to `SchedPolicy::Normal` because there is no
+    /// userspace `SCHED_EXT` constant in libc; tests that want
+    /// the kernel to read `policy == SCHED_EXT` (which
+    /// requires sched_ext-aware userspace) cannot be expressed
+    /// via this helper and must call the raw syscall path.
+    pub fn to_policy(self) -> SchedPolicy {
+        match self {
+            SchedClass::Cfs | SchedClass::Ext => SchedPolicy::Normal,
+            SchedClass::Batch => SchedPolicy::Batch,
+            SchedClass::Idle => SchedPolicy::Idle,
+            SchedClass::Rt => SchedPolicy::Fifo(RT_DEFAULT_PRIO),
+            SchedClass::Deadline => Self::default_deadline_reservation(),
+        }
+    }
+
+    /// Minimum-bandwidth `SCHED_DEADLINE` reservation that passes
+    /// `__checkparam_dl`'s `runtime >= DL_SCALE` floor and the
+    /// kernel's default `sched_deadline_period_min_us` (100us).
+    /// 1us runtime, 1ms deadline, 10ms period — bandwidth fraction
+    /// 0.0001, well below admission-control limits.
+    pub fn default_deadline_reservation() -> SchedPolicy {
+        SchedPolicy::Deadline {
+            runtime: Duration::from_micros(1),
+            deadline: Duration::from_millis(1),
+            period: Duration::from_millis(10),
         }
     }
 }
@@ -3843,6 +4422,118 @@ fn worker_main(
                 last_iter_time = Instant::now();
                 iterations += 1;
             }
+            // Stubs for the 6 new pathology-taxonomy variants from
+            // task #25. Type-system surface is wired in this batch
+            // (enum arms, factory methods, name/from_name/group_size/
+            // needs_shared_mem); per-variant worker_main bodies land
+            // in subsequent batches. Until then, each variant's
+            // outer loop spins burst-iter CPU work so a worker that
+            // gets dispatched (e.g. via from_name() round-trip
+            // tests) still produces a non-zero work_units report
+            // rather than silently looping at zero.
+            WorkType::ThunderingHerd {
+                waiters,
+                batches,
+                inter_batch_ms,
+            } => {
+                // Single global futex: every worker in the group
+                // shares the same `futex_ptr` because
+                // `worker_group_size = waiters + 1` collapses the
+                // herd into one group. Worker 0 is the waker
+                // (`is_first`); workers 1..=waiters are waiters.
+                //
+                // Waker: increment generation, FUTEX_WAKE(INT_MAX)
+                // — broadcasts to every parked waiter
+                // simultaneously (`kernel/futex/waitwake.c`'s
+                // `futex_wake_op` walks the bucket's plist and
+                // wakes up to `nr_wake` callers). We pass
+                // `i32::MAX` via `clamp_futex_wake_n(usize::MAX)`
+                // so the kernel wakes everyone parked on this
+                // word in a single syscall, matching the
+                // thundering-herd shape.
+                //
+                // Waiter: park on the futex, observe generation
+                // advance, record resume latency. Same idiom as
+                // FutexFanOut waiter; the difference is purely the
+                // group shape (single global vs per-group).
+                //
+                // After the configured number of batches, the
+                // waker stops triggering and the waiters drain.
+                // STOP from SIGUSR1 unblocks both sides via the
+                // FUTEX_WAIT_TIMEOUT poll cycle.
+                let (futex_ptr, is_waker) = match futex {
+                    Some(f) => f,
+                    None => break,
+                };
+                let atom = unsafe { &*(futex_ptr as *const std::sync::atomic::AtomicU32) };
+                if is_waker {
+                    let mut batches_done: u64 = 0;
+                    while batches_done < batches && !STOP.load(Ordering::Relaxed) {
+                        // Inter-batch sleep so waiters re-park on
+                        // futex before the next thundering wake.
+                        // `nanosleep` blocking ALSO contributes a
+                        // wake-latency sample for the waker so its
+                        // report carries telemetry comparable to
+                        // the waiters'.
+                        if inter_batch_ms > 0 {
+                            let before_sleep = Instant::now();
+                            std::thread::sleep(Duration::from_millis(inter_batch_ms));
+                            reservoir_push(
+                                &mut resume_latencies_ns,
+                                &mut wake_sample_count,
+                                before_sleep.elapsed().as_nanos() as u64,
+                                MAX_WAKE_SAMPLES,
+                            );
+                        }
+                        // Advance generation counter and broadcast
+                        // wake. Relaxed ordering matches FutexFanOut
+                        // — futex syscall supplies kernel-side
+                        // cross-thread ordering for the wake itself.
+                        let next = atom.load(Ordering::Relaxed).wrapping_add(1);
+                        atom.store(next, Ordering::Relaxed);
+                        // Clamp to i32::MAX so the syscall wakes
+                        // every parked waiter on the futex word.
+                        unsafe { futex_wake(futex_ptr, clamp_futex_wake_n(usize::MAX)) };
+                        spin_burst(&mut work_units, 256);
+                        batches_done += 1;
+                    }
+                } else {
+                    // Waiter: park, observe advance, record latency.
+                    let _ = waiters; // pattern-binding only; size set at spawn time.
+                    let expected = atom.load(Ordering::Relaxed);
+                    let before_block = Instant::now();
+                    loop {
+                        if STOP.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let cur = atom.load(Ordering::Relaxed);
+                        if cur != expected {
+                            reservoir_push(
+                                &mut resume_latencies_ns,
+                                &mut wake_sample_count,
+                                before_block.elapsed().as_nanos() as u64,
+                                MAX_WAKE_SAMPLES,
+                            );
+                            break;
+                        }
+                        unsafe { futex_wait(futex_ptr, expected, &FUTEX_WAIT_TIMEOUT) };
+                    }
+                }
+                last_iter_time = Instant::now();
+                iterations += 1;
+            }
+            WorkType::PriorityInversion { .. }
+            | WorkType::ProducerConsumerImbalance { .. }
+            | WorkType::RtStarvation { .. }
+            | WorkType::AsymmetricWaker { .. }
+            | WorkType::WakeChain { .. }
+            | WorkType::NumaWorkingSetSweep { .. } => {
+                // Stub for the remaining variants — see batch 3-N.
+                // CpuSpin-equivalent body so tests that round-trip
+                // through the variant produce non-zero work_units.
+                spin_burst(&mut work_units, 1024);
+                iterations += 1;
+            }
             WorkType::Custom { .. } => unreachable!("handled by early return"),
         }
 
@@ -4980,7 +5671,11 @@ mod tests {
 
     #[test]
     fn work_type_all_names_count() {
-        assert_eq!(WorkType::ALL_NAMES.len(), 20);
+        // 20 historical variants + 7 added in #25 (ThunderingHerd,
+        // PriorityInversion, ProducerConsumerImbalance,
+        // RtStarvation, AsymmetricWaker, WakeChain,
+        // NumaWorkingSetSweep) = 27.
+        assert_eq!(WorkType::ALL_NAMES.len(), 27);
     }
 
     // -- matrix_multiply --
@@ -9487,5 +10182,216 @@ mod tests {
         let reports = h.stop_and_collect();
         let has_latencies = reports.iter().any(|r| !r.resume_latencies_ns.is_empty());
         assert!(has_latencies, "contenders should record wake latencies");
+    }
+
+    // -- CloneFlags + validate_clone_flags coverage (#19a / #119) ---------
+    //
+    // The flag validator is the structural-rejection layer that sits in
+    // front of the clone3 syscall — callers see a named-rule diagnostic
+    // here rather than an opaque EINVAL from the kernel.  The rules
+    // enumerated by `validate_clone_flags` are 1:1 with the rejection
+    // checks at the top of `kernel/fork.c::copy_process`; pinning each
+    // rule individually catches a regression that drops a check or
+    // mis-orders the bail-outs.  These tests exercise the validator
+    // through the `Verdict` API so the rule-name diagnostics are
+    // claim-labeled and survive the migration off the legacy Expect
+    // shape (#6 / #97).
+
+    /// CloneFlags::NONE passes the validator — the all-zero flag set
+    /// is the no-op default for [`CloneMode::Raw`].
+    #[test]
+    fn validate_clone_flags_none_passes_via_verdict() {
+        use crate::assert::Verdict;
+        let mut v = Verdict::new();
+        let valid_none = validate_clone_flags(CloneFlags::NONE).is_ok();
+        crate::claim!(v, valid_none).eq(true);
+        let r = v.into_result();
+        assert!(r.passed, "CloneFlags::NONE must validate: {:?}", r.details);
+    }
+
+    /// Rule 1: `CLONE_THREAD` requires `CLONE_SIGHAND`. Pin both
+    /// directions through Verdict; the diagnostic must name the rule.
+    #[test]
+    fn validate_clone_flags_rule_1_thread_requires_sighand() {
+        use crate::assert::Verdict;
+
+        let thread_only = CloneFlags::THREAD;
+        let rejected = validate_clone_flags(thread_only).is_err();
+        let mut v = Verdict::new();
+        crate::claim!(v, rejected).eq(true);
+        let r = v.into_result();
+        assert!(r.passed, "rule 1: THREAD alone must be rejected");
+
+        let err = validate_clone_flags(thread_only).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("CLONE_THREAD requires CLONE_SIGHAND"),
+            "rule 1 diagnostic must name the rule: {msg}",
+        );
+
+        let thread_sighand_vm = CloneFlags::THREAD | CloneFlags::SIGHAND | CloneFlags::VM;
+        let accepted = validate_clone_flags(thread_sighand_vm).is_ok();
+        let mut v = Verdict::new();
+        crate::claim!(v, accepted).eq(true);
+        let r = v.into_result();
+        assert!(
+            r.passed,
+            "rule 1: THREAD + SIGHAND + VM must be accepted: {:?}",
+            r.details
+        );
+    }
+
+    /// Rule 2: `CLONE_SIGHAND` requires `CLONE_VM`.
+    #[test]
+    fn validate_clone_flags_rule_2_sighand_requires_vm() {
+        use crate::assert::Verdict;
+
+        let sighand_only = CloneFlags::SIGHAND;
+        let rejected = validate_clone_flags(sighand_only).is_err();
+        let mut v = Verdict::new();
+        crate::claim!(v, rejected).eq(true);
+        let r = v.into_result();
+        assert!(r.passed, "rule 2: SIGHAND alone must be rejected");
+
+        let err = validate_clone_flags(sighand_only).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("CLONE_SIGHAND requires CLONE_VM"),
+            "rule 2 diagnostic must name the rule: {msg}",
+        );
+
+        let sighand_vm = CloneFlags::SIGHAND | CloneFlags::VM;
+        let accepted = validate_clone_flags(sighand_vm).is_ok();
+        let mut v = Verdict::new();
+        crate::claim!(v, accepted).eq(true);
+        let r = v.into_result();
+        assert!(r.passed, "rule 2: SIGHAND + VM must be accepted: {:?}", r.details);
+    }
+
+    /// Rules 3 / 4 / 5: mutually-exclusive pairs. Folded into one
+    /// Verdict — every named rejection path must hold.
+    #[test]
+    fn validate_clone_flags_rules_3_4_5_mutual_exclusion() {
+        use crate::assert::Verdict;
+
+        let mut v = Verdict::new();
+
+        let rule_3_rejected = validate_clone_flags(CloneFlags::NEWNS | CloneFlags::FS).is_err();
+        crate::claim!(v, rule_3_rejected).eq(true);
+
+        let rule_4_rejected = validate_clone_flags(CloneFlags::NEWUSER | CloneFlags::FS).is_err();
+        crate::claim!(v, rule_4_rejected).eq(true);
+
+        let rule_5a_rejected = validate_clone_flags(
+            CloneFlags::THREAD | CloneFlags::SIGHAND | CloneFlags::VM | CloneFlags::NEWUSER,
+        )
+        .is_err();
+        crate::claim!(v, rule_5a_rejected).eq(true);
+
+        let rule_5b_rejected = validate_clone_flags(
+            CloneFlags::THREAD | CloneFlags::SIGHAND | CloneFlags::VM | CloneFlags::NEWPID,
+        )
+        .is_err();
+        crate::claim!(v, rule_5b_rejected).eq(true);
+
+        let r = v.into_result();
+        assert!(
+            r.passed,
+            "rules 3/4/5: every named mutual-exclusion path must reject: {:?}",
+            r.details,
+        );
+    }
+
+    /// Rule 6: caller-set runtime-reserved bits rejected with a hex-
+    /// formatted diagnostic naming `RUNTIME_RESERVED`.
+    #[test]
+    fn validate_clone_flags_rule_6_runtime_reserved_bits_rejected() {
+        use crate::assert::Verdict;
+
+        let pidfd_bit = CloneFlags::from_bits_for_test(0x1000);
+        let rejected = validate_clone_flags(pidfd_bit).is_err();
+        let mut v = Verdict::new();
+        crate::claim!(v, rejected).eq(true);
+        let r = v.into_result();
+        assert!(r.passed, "rule 6: CLONE_PIDFD must be rejected");
+
+        let err = validate_clone_flags(pidfd_bit).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("runtime-reserved flags 0x1000"),
+            "rule 6 diagnostic must name the offending bit in hex: {msg}",
+        );
+        assert!(
+            msg.contains("RUNTIME_RESERVED"),
+            "rule 6 diagnostic must reference the constant: {msg}",
+        );
+
+        let all_reserved = CloneFlags::RUNTIME_RESERVED;
+        let mass_rejected = validate_clone_flags(all_reserved).is_err();
+        let mut v = Verdict::new();
+        crate::claim!(v, mass_rejected).eq(true);
+        let r = v.into_result();
+        assert!(
+            r.passed,
+            "rule 6: full RUNTIME_RESERVED mask must be rejected: {:?}",
+            r.details,
+        );
+    }
+
+    /// `CloneFlags::contains` is set-theoretic — `contains(NONE)`
+    /// returns true for any self.
+    #[test]
+    fn clone_flags_contains_none_is_universally_true() {
+        use crate::assert::Verdict;
+
+        let mut v = Verdict::new();
+        let cases = &[
+            CloneFlags::NONE,
+            CloneFlags::VM,
+            CloneFlags::FS,
+            CloneFlags::FILES,
+            CloneFlags::SIGHAND,
+            CloneFlags::THREAD,
+            CloneFlags::PARENT,
+            CloneFlags::NEWNS,
+            CloneFlags::NEWUSER,
+            CloneFlags::NEWPID,
+            CloneFlags::NEWNET,
+            CloneFlags::NEWIPC,
+            CloneFlags::NEWUTS,
+            CloneFlags::NEWCGROUP,
+            CloneFlags::IO,
+            CloneFlags::SYSVSEM,
+        ];
+        for f in cases {
+            let contains_none = f.contains(CloneFlags::NONE);
+            crate::claim!(v, contains_none).eq(true);
+        }
+        let r = v.into_result();
+        assert!(
+            r.passed,
+            "contains(NONE) must be universally true: {:?}",
+            r.details,
+        );
+    }
+
+    /// `CloneFlags::union` and `BitOr::bitor` must produce identical
+    /// bit patterns. The struct doc says BitOr delegates to union.
+    #[test]
+    fn clone_flags_union_and_bitor_produce_identical_bits() {
+        use crate::assert::Verdict;
+
+        let lhs = CloneFlags::VM | CloneFlags::FILES;
+        let rhs = CloneFlags::SIGHAND;
+        let union_bits = lhs.union(rhs).bits();
+        let bitor_bits = (lhs | rhs).bits();
+
+        let mut v = Verdict::new();
+        crate::claim!(v, union_bits).eq(bitor_bits);
+        let r = v.into_result();
+        assert!(
+            r.passed,
+            "union and BitOr must agree: union=0x{union_bits:x} bitor=0x{bitor_bits:x}",
+        );
     }
 }

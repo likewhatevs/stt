@@ -137,6 +137,24 @@ pub struct ProbeDiagnostics {
     /// timeline entries than the kernel actually produced.
     #[serde(default)]
     pub bpf_scx_event_drops: u64,
+    /// Cumulative count of `tp_btf/sched_switch +
+    /// sched_migrate_task + sched_wakeup` records committed into
+    /// the dedicated `timeline_events` ringbuf by the timeline
+    /// handlers (#27). Read from BSS `ktstr_timeline_count`. Zero
+    /// before any of those tracepoints fire; otherwise grows
+    /// continuously while the probe runs. Combined with
+    /// `bpf_timeline_drops` it lets an operator tell whether a
+    /// failure-time drain saw the full window or only the tail.
+    #[serde(default)]
+    pub bpf_timeline_count: u64,
+    /// `bpf_ringbuf_reserve` failures across the three timeline
+    /// tracepoint handlers (sched_switch / sched_migrate_task /
+    /// sched_wakeup), aggregated in BSS `ktstr_timeline_drops`.
+    /// Each drop is one new event lost — the ring's existing
+    /// contents are NOT evicted on overflow, so the drain on
+    /// failure recovers the OLDEST captured events first.
+    #[serde(default)]
+    pub bpf_timeline_drops: u64,
 }
 
 /// Structured probe event captured by the BPF skeleton.
@@ -1310,6 +1328,8 @@ pub fn run_probe_skeleton(
                 diag.bpf_first_trigger_ns = bss.ktstr_last_trigger_ts;
                 diag.bpf_scx_event_tp_count = bss.ktstr_event_tp_count;
                 diag.bpf_scx_event_drops = bss.ktstr_event_ringbuf_drops;
+                diag.bpf_timeline_count = bss.ktstr_timeline_count;
+                diag.bpf_timeline_drops = bss.ktstr_timeline_drops;
             }
 
             let key_size = std::mem::size_of::<types::probe_key>();

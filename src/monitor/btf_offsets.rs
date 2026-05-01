@@ -1308,28 +1308,61 @@ impl RqStructOffsets {
 }
 
 /// Field offsets within `struct scx_rq` (`kernel/sched/sched.h`).
+///
+/// The fields are split between two consumers:
+///
+/// - **Read by `scx_dump_state` (kernel/sched/ext.c)** — the
+///   per-CPU "CPU states" section emits these directly:
+///   `runnable_list` (walked via `list_for_each_entry`),
+///   `nr_running`, `flags`, `cpu_released`, `ops_qseq`,
+///   `kick_sync`, plus `local_dsq` indirectly (its `.nr` is
+///   read in the dispatch-decision path elsewhere). The
+///   host-side rq->scx walker mirrors that output and needs
+///   each of these offsets.
+/// - **Read by other ext.c paths, NOT `scx_dump_state`** —
+///   `nr_immed` is incremented / decremented / inspected in
+///   the SCX_ENQ_IMMED enqueue path (`do_enqueue_task` and the
+///   ENQ_IMMED branches) but is NOT rendered by
+///   `scx_dump_state`. ktstr collects the offset because the
+///   host-side dumper exposes the same scalar to operators
+///   for ENQ_IMMED diagnosis even though the kernel's own
+///   debug dump omits it. `clock` is similar — read by
+///   in-kernel scheduling paths but not by `scx_dump_state`;
+///   ktstr surfaces it for cross-CPU clock-skew analysis.
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)]
 pub struct ScxRqOffsets {
-    /// Offset of `local_dsq` (struct scx_dispatch_q).
+    /// Offset of `local_dsq` (struct scx_dispatch_q). Read by
+    /// `scx_dump_state` indirectly via local-DSQ depth queries.
     pub local_dsq: usize,
-    /// Offset of `runnable_list` (struct list_head) — head of the
-    /// per-CPU runnable task list followed by the runnable_at scanner
-    /// and the rq->scx walker.
+    /// Offset of `runnable_list` (struct list_head) — head of
+    /// the per-CPU runnable task list. Walked by the
+    /// runnable_at scanner and the rq->scx walker; rendered
+    /// per-CPU by `scx_dump_state` via `list_for_each_entry`.
     pub runnable_list: usize,
-    /// Offset of `nr_running` (u32).
+    /// Offset of `nr_running` (u32). Rendered by
+    /// `scx_dump_state` ("CPU %d: nr_run=%u …").
     pub nr_running: usize,
-    /// Offset of `flags` (u32).
+    /// Offset of `flags` (u32). Rendered by `scx_dump_state`
+    /// ("flags=0x%x").
     pub flags: usize,
-    /// Offset of `cpu_released` (bool).
+    /// Offset of `cpu_released` (bool). Rendered by
+    /// `scx_dump_state` ("cpu_rel=%d").
     pub cpu_released: usize,
-    /// Offset of `ops_qseq` (unsigned long).
+    /// Offset of `ops_qseq` (unsigned long). Rendered by
+    /// `scx_dump_state` ("ops_qseq=%lu").
     pub ops_qseq: usize,
-    /// Offset of `kick_sync` (unsigned long).
+    /// Offset of `kick_sync` (unsigned long). Rendered by
+    /// `scx_dump_state` ("ksync=%lu").
     pub kick_sync: usize,
-    /// Offset of `nr_immed` (u32).
+    /// Offset of `nr_immed` (u32). NOT read by
+    /// `scx_dump_state`; ktstr collects it for the host-side
+    /// dump's ENQ_IMMED diagnosis path (kernel updates the
+    /// counter in `do_enqueue_task` ENQ_IMMED branches and
+    /// elsewhere in `kernel/sched/ext.c`).
     pub nr_immed: usize,
-    /// Offset of `clock` (u64).
+    /// Offset of `clock` (u64). NOT read by `scx_dump_state`;
+    /// surfaced by ktstr for cross-CPU clock-skew analysis.
     pub clock: usize,
 }
 
@@ -3574,6 +3607,192 @@ mod tests {
              instruction — `__sync_val_compare_and_swap` was silently \
              lowered to a non-atomic store. Cross-core ordering on aarch64 \
              would be broken by this regression."
+        );
+    }
+
+    /// `ScxWalkerOffsets::missing_groups` enumerates exactly the
+    /// sub-groups that failed to resolve, naming each with the kernel
+    /// struct name the freeze coordinator surfaces in the failure
+    /// dump's `scx_walker_unavailable` field. Operators parsing the
+    /// failure-dump JSON look for these exact names — drift in the
+    /// `missing.push("...")` literals here breaks the human-visible
+    /// diagnostic string AND the structural pattern matching in any
+    /// downstream tooling that buckets walker availability by group.
+    ///
+    /// Pin every sub-group's missing-name string by constructing
+    /// `ScxWalkerOffsets` instances with each `Option` field set to
+    /// `None` in isolation, asserting `missing_groups()` returns
+    /// exactly that one name. A regression that renamed any push
+    /// literal trips here. Also pins the empty-vec contract for the
+    /// fully-populated case (no groups missing) and the multi-missing
+    /// case (every group missing — the diagnostic must list all 10).
+    #[test]
+    fn scx_walker_missing_groups_pins_every_group_name() {
+        // Construct a ScxWalkerOffsets with every sub-group resolved
+        // to `Some(...)` placeholder — used as the baseline; tests
+        // override one field at a time to None to exercise each push
+        // arm of `missing_groups()`.
+        fn full() -> ScxWalkerOffsets {
+            ScxWalkerOffsets {
+                rq: Some(RqStructOffsets { scx: 0, curr: 0 }),
+                scx_rq: Some(ScxRqOffsets {
+                    local_dsq: 0,
+                    runnable_list: 0,
+                    nr_running: 0,
+                    flags: 0,
+                    cpu_released: 0,
+                    ops_qseq: 0,
+                    kick_sync: 0,
+                    nr_immed: 0,
+                    clock: 0,
+                }),
+                task: Some(TaskStructCoreOffsets {
+                    comm: 0,
+                    pid: 0,
+                    scx: 0,
+                }),
+                see: Some(SchedExtEntityOffsets {
+                    runnable_node: 0,
+                    runnable_at: 0,
+                    weight: 0,
+                    slice: 0,
+                    dsq_vtime: 0,
+                    dsq: 0,
+                    dsq_list: 0,
+                    flags: 0,
+                    dsq_flags: 0,
+                    sticky_cpu: 0,
+                    holding_cpu: 0,
+                }),
+                dsq_lnode: Some(ScxDsqListNodeOffsets { node: 0, flags: 0 }),
+                dsq: Some(ScxDispatchQOffsets {
+                    list: 0,
+                    nr: 0,
+                    seq: 0,
+                    id: 0,
+                    hash_node: 0,
+                }),
+                sched: Some(ScxSchedOffsets {
+                    dsq_hash: 0,
+                    pnode: 0,
+                    pcpu: 0,
+                    aborting: 0,
+                    bypass_depth: 0,
+                    exit_kind: 0,
+                }),
+                sched_pnode: Some(ScxSchedPnodeOffsets { global_dsq: 0 }),
+                sched_pcpu: Some(ScxSchedPcpuOffsets { bypass_dsq: 0 }),
+                rht: Some(RhashtableOffsets {
+                    tbl: 0,
+                    nelems: 0,
+                    bucket_table_size: 0,
+                    bucket_table_buckets: 0,
+                    rhash_head_next: 0,
+                }),
+            }
+        }
+
+        // Fully-populated: no sub-group missing. Empty vec is the
+        // "every walker pass has data" sentinel — the freeze
+        // coordinator only writes a partial-degradation diagnostic
+        // when this list is non-empty.
+        let all = full();
+        assert!(
+            all.missing_groups().is_empty(),
+            "fully-populated offsets must report no missing groups; got {:?}",
+            all.missing_groups(),
+        );
+
+        // Pin each group's missing-name string in isolation: drop
+        // exactly one field, expect exactly one entry whose string
+        // matches the canonical name. The pairs below enumerate the
+        // 10 sub-groups; a regression adding/removing/renaming a
+        // push arm trips here.
+        let cases: &[(
+            fn(&mut ScxWalkerOffsets),
+            &'static str,
+        )] = &[
+            ((|o: &mut ScxWalkerOffsets| o.rq = None) as fn(&mut ScxWalkerOffsets), "rq"),
+            (|o: &mut ScxWalkerOffsets| o.scx_rq = None, "scx_rq"),
+            (|o: &mut ScxWalkerOffsets| o.task = None, "task_struct"),
+            (
+                |o: &mut ScxWalkerOffsets| o.see = None,
+                "sched_ext_entity",
+            ),
+            (
+                |o: &mut ScxWalkerOffsets| o.dsq_lnode = None,
+                "scx_dsq_list_node",
+            ),
+            (
+                |o: &mut ScxWalkerOffsets| o.dsq = None,
+                "scx_dispatch_q",
+            ),
+            (|o: &mut ScxWalkerOffsets| o.sched = None, "scx_sched"),
+            (
+                |o: &mut ScxWalkerOffsets| o.sched_pnode = None,
+                "scx_sched_pnode",
+            ),
+            (
+                |o: &mut ScxWalkerOffsets| o.sched_pcpu = None,
+                "scx_sched_pcpu",
+            ),
+            (
+                |o: &mut ScxWalkerOffsets| o.rht = None,
+                "rhashtable/bucket_table/rhash_head",
+            ),
+        ];
+        for (drop_fn, expected_name) in cases {
+            let mut o = full();
+            drop_fn(&mut o);
+            let missing = o.missing_groups();
+            assert_eq!(
+                missing.len(),
+                1,
+                "exactly one group should be missing; expected {expected_name:?}, got {missing:?}",
+            );
+            assert_eq!(
+                missing[0], *expected_name,
+                "missing-group name string drifted: expected {expected_name:?}, got {:?}",
+                missing[0],
+            );
+        }
+
+        // Every group missing: the order of the names must match
+        // the order of the `if self.<field>.is_none()` arms in
+        // `missing_groups()` so a downstream consumer reading the
+        // failure dump sees a stable, predictable sequence (rq,
+        // scx_rq, task_struct, sched_ext_entity, scx_dsq_list_node,
+        // scx_dispatch_q, scx_sched, scx_sched_pnode, scx_sched_pcpu,
+        // rhashtable/bucket_table/rhash_head). A regression that
+        // shuffled the arms would silently break that ordering.
+        let empty = ScxWalkerOffsets {
+            rq: None,
+            scx_rq: None,
+            task: None,
+            see: None,
+            dsq_lnode: None,
+            dsq: None,
+            sched: None,
+            sched_pnode: None,
+            sched_pcpu: None,
+            rht: None,
+        };
+        let missing = empty.missing_groups();
+        assert_eq!(
+            missing,
+            vec![
+                "rq",
+                "scx_rq",
+                "task_struct",
+                "sched_ext_entity",
+                "scx_dsq_list_node",
+                "scx_dispatch_q",
+                "scx_sched",
+                "scx_sched_pnode",
+                "scx_sched_pcpu",
+                "rhashtable/bucket_table/rhash_head",
+            ],
+            "all-missing order must match the if-chain order in `missing_groups()`",
         );
     }
 }

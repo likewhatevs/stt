@@ -79,6 +79,56 @@ enum event_type {
 	EVENT_SCX_EVENT = 3,
 };
 
+/* Timeline event types written into the dedicated `timeline_events`
+ * ringbuf by the sched_switch / sched_migrate_task / sched_wakeup
+ * tracepoint handlers. Drained only on test failure to give zero
+ * runtime cost on the success path (host side never wakes the
+ * consumer until the error latch fires). When the ringbuf fills
+ * before drain, `bpf_ringbuf_reserve` returns NULL and the BPF
+ * handler bumps `ktstr_timeline_drops` instead of submitting —
+ * dropping the newest event and surfacing the loss to userspace. */
+#define TL_EVT_SWITCH  1
+#define TL_EVT_MIGRATE 2
+#define TL_EVT_WAKEUP  3
+
+/* Ring-buffer record written by the sched_* tracepoint handlers
+ * into the dedicated `timeline_events` ringbuf. Compact (40 bytes)
+ * so the fixed-size ring holds a useful window of events.
+ *
+ * Field semantics by `type`:
+ *   TL_EVT_SWITCH:
+ *     prev_pid       = `prev->pid`
+ *     next_pid       = `next->pid`
+ *     a              = `prev_state` (raw `__state` bitfield)
+ *     b              = `preempt` (0/1)
+ *   TL_EVT_MIGRATE:
+ *     prev_pid       = `p->pid`
+ *     next_pid       = 0 (unused)
+ *     a              = `dest_cpu`
+ *     b              = `task_cpu(p)` (orig_cpu, BTF-read)
+ *   TL_EVT_WAKEUP:
+ *     prev_pid       = `p->pid`
+ *     next_pid       = 0 (unused)
+ *     a              = `task_cpu(p)` (target CPU at wakeup)
+ *     b              = 0 (unused)
+ *
+ * `cpu` is the host CPU the tracepoint fired on (`bpf_get_smp_processor_id()`).
+ *
+ * Note on type: the kernel tp_btf signature for sched_switch declares
+ * `prev_state` as `unsigned int`; we widen to `u64` here uniformly so
+ * every variant uses the same `a`/`b` slots regardless of source
+ * arity. `dest_cpu` / `task_cpu` are `int` in the kernel but always
+ * fit in u64. */
+struct timeline_event {
+	unsigned int   type;
+	unsigned int   cpu;
+	unsigned long long ts;
+	unsigned int   prev_pid;
+	unsigned int   next_pid;
+	unsigned long long a;
+	unsigned long long b;
+};
+
 /* Ring buffer event sent from BPF to userspace on trigger.
  *
  * For EVENT_TRIGGER:

@@ -411,6 +411,76 @@ impl std::fmt::Display for AssertDetail {
 /// assert!(!a.passed);
 /// assert!(a.details.iter().any(|d| d.kind == DetailKind::Starved));
 /// ```
+/// Structured measurement value attached via
+/// [`AssertResult::note_value`] / [`Verdict::note_value`].
+///
+/// The variants cover every primitive shape stats tooling consumes:
+/// signed and unsigned 64-bit ints, 64-bit floats, booleans, and
+/// owned strings. A test that wants to surface "max_wchar=12345"
+/// alongside a passing IO_ACCOUNTING reachability check writes
+/// `verdict.note_value("max_wchar", 12345i64)` and downstream stats
+/// tooling reads `result.measurements["max_wchar"]` as
+/// `NoteValue::Int(12345)`.
+///
+/// Distinct from [`AssertDetail`]'s free-form `Note` message: the
+/// `Display` impl on `AssertDetail` is for human readers; the
+/// structured map is for programmatic consumption (sidecar parsers,
+/// `stats compare`, regression dashboards). Producers can call BOTH
+/// `note(msg)` and `note_value(key, val)` on the same result — they
+/// occupy independent buffers.
+///
+/// Conversion via the `From` impls below: any
+/// `i64`/`u64`/`f64`/`bool`/`String`/`&str` literal flows into
+/// `note_value` without explicit variant naming. Integer types
+/// narrower than 64-bit (`i32`, `u32`, etc.) need an explicit cast
+/// at the call site rather than a blanket impl, so the call site
+/// reads honestly about the value's resolution.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+pub enum NoteValue {
+    /// 64-bit signed integer — pid_t, exit codes, signed counters.
+    Int(i64),
+    /// 64-bit unsigned integer — work_units, byte counts, durations.
+    Uint(u64),
+    /// 64-bit float — ratios, rates, percentiles in microseconds.
+    Float(f64),
+    /// Boolean — completion flags, feature-detect results.
+    Bool(bool),
+    /// Owned string — categorical labels, environment tokens.
+    Text(String),
+}
+
+impl From<i64> for NoteValue {
+    fn from(v: i64) -> Self {
+        Self::Int(v)
+    }
+}
+impl From<u64> for NoteValue {
+    fn from(v: u64) -> Self {
+        Self::Uint(v)
+    }
+}
+impl From<f64> for NoteValue {
+    fn from(v: f64) -> Self {
+        Self::Float(v)
+    }
+}
+impl From<bool> for NoteValue {
+    fn from(v: bool) -> Self {
+        Self::Bool(v)
+    }
+}
+impl From<String> for NoteValue {
+    fn from(v: String) -> Self {
+        Self::Text(v)
+    }
+}
+impl From<&str> for NoteValue {
+    fn from(v: &str) -> Self {
+        Self::Text(v.to_string())
+    }
+}
+
 #[must_use = "test verdict is lost if not checked"]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AssertResult {
@@ -427,6 +497,23 @@ pub struct AssertResult {
     pub details: Vec<AssertDetail>,
     /// Aggregated stats from all workers in this scenario.
     pub stats: ScenarioStats,
+    /// Structured measurements attached via [`Self::note_value`] /
+    /// [`Verdict::note_value`]. Distinct from [`Self::details`] —
+    /// `details` carries human-readable `String`s for operator
+    /// triage, `measurements` carries typed `(key, NoteValue)` pairs
+    /// for programmatic consumption (sidecar parsers, `stats
+    /// compare`, regression dashboards).
+    ///
+    /// `#[serde(default, skip_serializing_if = ...)]` so old sidecars
+    /// (pre-`note_value`) deserialize cleanly with an empty map and
+    /// the wire format stays compact when nothing was measured.
+    /// Schema-strict policy is intentionally relaxed for this field
+    /// — the strict-schema test pins the four required keys
+    /// (`passed`, `skipped`, `details`, `stats`) and explicitly
+    /// excludes `measurements`, mirroring how `ScenarioStats::ext_metrics`
+    /// is also tolerated.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub measurements: std::collections::BTreeMap<String, NoteValue>,
 }
 
 /// Per-cgroup statistics from worker telemetry.
@@ -652,6 +739,7 @@ impl AssertResult {
             skipped: false,
             details: vec![],
             stats: Default::default(),
+            measurements: std::collections::BTreeMap::new(),
         }
     }
     /// Pass result with a skip reason. Used when a scenario cannot run
@@ -662,6 +750,7 @@ impl AssertResult {
             skipped: true,
             details: vec![AssertDetail::new(DetailKind::Skip, reason)],
             stats: Default::default(),
+            measurements: std::collections::BTreeMap::new(),
         }
     }
     /// Failing result carrying a single [`AssertDetail`]. Mirrors
@@ -675,6 +764,7 @@ impl AssertResult {
             skipped: false,
             details: vec![detail],
             stats: Default::default(),
+            measurements: std::collections::BTreeMap::new(),
         }
     }
     /// Failing result carrying a single diagnostic message with
@@ -823,6 +913,210 @@ impl AssertResult {
         // here consumes `other.stats`, so every scalar/map access
         // above goes through the `&other.stats` reference first.
         self.stats.cgroups.extend(other.stats.cgroups);
+
+        // Fold structured measurements. Keys from `other` overwrite
+        // existing keys from `self` because the merge protocol treats
+        // the right-hand side as a more recent observation; a
+        // duplicate-key write is a producer bug (two cgroups
+        // measuring the same global metric) but the "later wins"
+        // policy keeps the result deterministic for tests pinning
+        // merge order. Producers that need additive accumulation
+        // should use `stats.ext_metrics` (which has explicit polarity
+        // semantics) rather than `measurements`.
+        for (k, v) in other.measurements {
+            self.measurements.insert(k, v);
+        }
+    }
+
+    /// Attach a structured `(key, value)` measurement to the result.
+    /// Writes into [`Self::measurements`] without altering
+    /// [`Self::passed`] / [`Self::skipped`] / [`Self::details`] —
+    /// pure context for stats tooling.
+    ///
+    /// Distinct from [`Self::note`]: `note` carries a free-form
+    /// `String` for operator triage; `note_value` carries a typed
+    /// `(key, NoteValue)` pair for programmatic consumption (sidecar
+    /// parsers, `stats compare` regression dashboards). Producers
+    /// commonly call BOTH — they occupy independent buffers and
+    /// neither overwrites the other.
+    ///
+    /// Key collision policy: a second write with the same `key`
+    /// overwrites the first. The intended call site shape is "one
+    /// producer per key" (one site computes `max_wchar`, one site
+    /// computes `psi_some_total_usec`); accidental key collision
+    /// indicates a producer bug. The test
+    /// `note_value_overwrites_on_duplicate_key` pins this last-
+    /// write-wins semantics.
+    ///
+    /// ```
+    /// # use ktstr::assert::{AssertResult, NoteValue};
+    /// let mut r = AssertResult::pass();
+    /// r.note_value("max_wchar", 12345i64);
+    /// r.note_value("psi_available", true);
+    /// assert_eq!(r.measurements["max_wchar"], NoteValue::Int(12345));
+    /// assert_eq!(r.measurements["psi_available"], NoteValue::Bool(true));
+    /// ```
+    pub fn note_value(&mut self, key: impl Into<String>, value: impl Into<NoteValue>) -> &mut Self {
+        self.measurements.insert(key.into(), value.into());
+        self
+    }
+
+    /// Fold a sequence of [`AssertResult`]s with OR semantics: the
+    /// returned result passes iff at least one branch passes. Use
+    /// when a test author expresses "either of these two checks
+    /// suffices" — a kernel-version-fork case where one path is
+    /// expected on 6.16 and another on 7.1, or a topology probe
+    /// where any of several detection methods landing is enough.
+    ///
+    /// Outcomes:
+    /// - **At least one branch passes**: returned result is passing.
+    ///   `details` carries the [`DetailKind::Note`]-tagged "branch N
+    ///   chosen" annotation pointing at the first passing branch.
+    ///   Failed-branch details are dropped (they would only confuse
+    ///   the operator with messages from the not-taken paths).
+    ///   `stats` adopts the first passing branch's `stats`.
+    ///   `measurements` union all passing branches' measurements
+    ///   (last write wins on key collision, matching `merge`).
+    ///   `skipped` follows the first passing branch.
+    /// - **All branches fail**: returned result is failing. Every
+    ///   branch's `details` are concatenated, with each detail's
+    ///   message prefixed by `"any_of[<branch-idx>]: "` so an
+    ///   operator can identify which branch produced which failure.
+    ///   `stats` and `measurements` adopt the FIRST branch's values
+    ///   (an arbitrary choice but deterministic; a smarter
+    ///   "best-failing-branch" pick would require comparing
+    ///   `details.len()`, which is policy not mechanism).
+    ///   `skipped` is `false`.
+    /// - **Empty input**: returned result is failing with a single
+    ///   detail explaining the empty `any_of`. An empty disjunction
+    ///   is logically false; this surfaces a producer bug as a
+    ///   nameable failure rather than a vacuous pass.
+    ///
+    /// Doc: a trivial two-branch test with the second branch passing
+    /// and the first branch failing — pinning that the verdict
+    /// chooses the passer.
+    ///
+    /// ```
+    /// # use ktstr::assert::{AssertDetail, AssertResult, DetailKind};
+    /// let r = AssertResult::any_of([
+    ///     {
+    ///         let mut a = AssertResult::pass();
+    ///         a.passed = false;
+    ///         a.details.push(AssertDetail::new(DetailKind::Other, "branch 0 boom"));
+    ///         a
+    ///     },
+    ///     AssertResult::pass(),
+    /// ]);
+    /// assert!(r.passed);
+    /// ```
+    pub fn any_of(branches: impl IntoIterator<Item = AssertResult>) -> AssertResult {
+        let mut branches: Vec<AssertResult> = branches.into_iter().collect();
+        if branches.is_empty() {
+            return AssertResult::fail(AssertDetail::new(
+                DetailKind::Other,
+                "any_of: empty branch list — a disjunction of zero alternatives is logically false",
+            ));
+        }
+
+        let first_pass_idx = branches.iter().position(|b| b.passed && !b.skipped);
+        if let Some(idx) = first_pass_idx {
+            // At least one branch passes. Take the first passing
+            // branch's stats / skipped, union measurements across
+            // every passing branch, and drop failed-branch details.
+            let mut chosen = branches.swap_remove(idx);
+            // After swap_remove(idx) we no longer iterate the
+            // original branches in their original order. Use the
+            // remaining `branches` to scoop up `measurements` from
+            // any other passing branches before discarding their
+            // `details`.
+            for b in branches {
+                if b.passed && !b.skipped {
+                    for (k, v) in b.measurements {
+                        chosen.measurements.insert(k, v);
+                    }
+                }
+            }
+            chosen.details.push(AssertDetail::new(
+                DetailKind::Note,
+                format!("any_of: branch {idx} satisfied the disjunction"),
+            ));
+            chosen
+        } else {
+            // All branches failed. Concatenate details with branch-
+            // index prefixes; adopt the first branch's stats /
+            // measurements / skipped (deterministic but arbitrary).
+            let total_branches = branches.len();
+            let mut iter = branches.into_iter().enumerate();
+            let (_, first) = iter.next().expect("non-empty checked above");
+            let mut acc = AssertResult {
+                passed: false,
+                skipped: false,
+                details: Vec::new(),
+                stats: first.stats,
+                measurements: first.measurements,
+            };
+            // Re-prefix the first branch's details and feed in.
+            for d in first.details {
+                acc.details.push(AssertDetail::new(
+                    d.kind,
+                    format!("any_of[0]: {}", d.message),
+                ));
+            }
+            for (idx, b) in iter {
+                for d in b.details {
+                    acc.details.push(AssertDetail::new(
+                        d.kind,
+                        format!("any_of[{idx}]: {}", d.message),
+                    ));
+                }
+            }
+            acc.details.push(AssertDetail::new(
+                DetailKind::Other,
+                format!("any_of: all {total_branches} branches failed"),
+            ));
+            acc
+        }
+    }
+
+    /// Fold a sequence of [`AssertResult`]s with AND semantics:
+    /// equivalent to `branches.into_iter().fold(pass(),
+    /// |acc, b| { acc.merge(b); acc })`. Returns a passing result iff
+    /// every branch passes.
+    ///
+    /// Distinct from [`Self::merge`] in API shape only: `merge`
+    /// folds one external result into an existing accumulator;
+    /// `all_of` folds an iterator of branches into a fresh result.
+    /// Same semantics for `passed` (conjoined), `details`
+    /// (concatenated), `stats` (worst-per-dimension), `measurements`
+    /// (union with last-write-wins). An empty input yields the
+    /// passing identity (`AssertResult::pass()`) — the AND of an
+    /// empty set is logically true, mirroring `Iterator::all`.
+    ///
+    /// Use when the test reads more naturally as "every check
+    /// must hold" than as a merge chain — e.g. when the checks
+    /// are dynamically generated from a slice and the call site
+    /// would otherwise need an explicit `for` loop with `merge`.
+    ///
+    /// ```
+    /// # use ktstr::assert::{AssertDetail, AssertResult, DetailKind};
+    /// let r = AssertResult::all_of([
+    ///     AssertResult::pass(),
+    ///     AssertResult::pass(),
+    /// ]);
+    /// assert!(r.passed);
+    ///
+    /// let r = AssertResult::all_of([
+    ///     AssertResult::pass(),
+    ///     AssertResult::fail(AssertDetail::new(DetailKind::Other, "boom")),
+    /// ]);
+    /// assert!(!r.passed);
+    /// ```
+    pub fn all_of(branches: impl IntoIterator<Item = AssertResult>) -> AssertResult {
+        let mut acc = AssertResult::pass();
+        for b in branches {
+            acc.merge(b);
+        }
+        acc
     }
 }
 
@@ -1929,6 +2223,23 @@ impl Verdict {
     /// without altering the verdict. Mirrors [`AssertResult::note`].
     pub fn note(&mut self, msg: impl Into<String>) -> &mut Self {
         self.result.note(msg);
+        self
+    }
+
+    /// Attach a structured `(key, value)` measurement to the
+    /// underlying [`AssertResult::measurements`] map without
+    /// altering the verdict. Mirrors [`AssertResult::note_value`].
+    /// Use when a test wants to surface a programmatically
+    /// consumable measurement (e.g. `verdict.note_value("max_wchar",
+    /// 12345i64)`) alongside pass/fail claims, so sidecar parsers
+    /// and `stats compare` dashboards can read the typed value
+    /// without re-grepping `details`.
+    pub fn note_value(
+        &mut self,
+        key: impl Into<String>,
+        value: impl Into<NoteValue>,
+    ) -> &mut Self {
+        self.result.note_value(key, value);
         self
     }
 
@@ -3476,6 +3787,7 @@ mod tests {
                     cgroups: vec![cg],
                     ..ScenarioStats::default()
                 },
+                measurements: std::collections::BTreeMap::new(),
             }
         }
 
@@ -4227,6 +4539,7 @@ mod tests {
             skipped: false,
             details: vec!["test".into()],
             stats: Default::default(),
+            measurements: std::collections::BTreeMap::new(),
         };
         let json = serde_json::to_string(&r).unwrap();
         let r2: AssertResult = serde_json::from_str(&json).unwrap();
@@ -4429,12 +4742,19 @@ mod tests {
         // field). Loop over each; each removal must fail deserialize
         // with a missing-field error naming the removed field.
         const REQUIRED_FIELDS: &[&str] = &["passed", "skipped", "details", "stats"];
+        // `measurements` is intentionally NOT in REQUIRED_FIELDS — it
+        // carries `#[serde(default, skip_serializing_if = ...)]` so old
+        // sidecars without the key deserialize cleanly with an empty
+        // map. The companion test
+        // `assert_result_missing_measurements_tolerated_by_deserialize`
+        // pins THAT tolerance.
 
         let r = AssertResult {
             passed: false,
             skipped: false,
             details: vec!["detail".into()],
             stats: ScenarioStats::default(),
+            measurements: std::collections::BTreeMap::new(),
         };
         let full = match serde_json::to_value(&r).unwrap() {
             serde_json::Value::Object(m) => m,
@@ -5368,6 +5688,7 @@ mod tests {
                 worst_gap_cpu: 0,
                 ..Default::default()
             },
+            measurements: std::collections::BTreeMap::new(),
         };
         let b = AssertResult {
             passed: false,
@@ -5383,6 +5704,7 @@ mod tests {
                 worst_gap_cpu: 2,
                 ..Default::default()
             },
+            measurements: std::collections::BTreeMap::new(),
         };
         a.merge(b);
         assert!(!a.passed);
@@ -7188,5 +7510,263 @@ numa_miss 5";
             d.display_with_kind().to_string(),
             "[SchedulerDied] scheduler process died",
         );
+    }
+
+    // -- AssertResult::note_value + NoteValue ---------------------------
+
+    /// Each `From` impl on [`NoteValue`] routes to the matching enum
+    /// variant. Pin every variant so a regression that swapped two
+    /// `From` arms (e.g. `i64` mistakenly producing `NoteValue::Uint`)
+    /// trips here, not at the consumer's run-time mismatch.
+    #[test]
+    fn note_value_from_impls_route_to_correct_variant() {
+        assert_eq!(NoteValue::from(42i64), NoteValue::Int(42));
+        assert_eq!(NoteValue::from(42u64), NoteValue::Uint(42));
+        assert_eq!(NoteValue::from(0.5_f64), NoteValue::Float(0.5));
+        assert_eq!(NoteValue::from(true), NoteValue::Bool(true));
+        assert_eq!(
+            NoteValue::from("hello".to_string()),
+            NoteValue::Text("hello".to_string()),
+        );
+        assert_eq!(
+            NoteValue::from("borrowed"),
+            NoteValue::Text("borrowed".to_string()),
+        );
+    }
+
+    /// `note_value` writes into [`AssertResult::measurements`] without
+    /// altering the verdict. Distinct from [`Self::note`] (which
+    /// writes a `String` to `details`) — a producer commonly calls
+    /// BOTH and they occupy independent buffers.
+    #[test]
+    fn note_value_records_without_altering_verdict() {
+        let mut r = AssertResult::pass();
+        let was_passed = r.passed;
+        let was_skipped = r.skipped;
+        let was_details = r.details.len();
+        r.note_value("max_wchar", 12345i64);
+        r.note_value("psi_available", true);
+        assert_eq!(r.passed, was_passed);
+        assert_eq!(r.skipped, was_skipped);
+        assert_eq!(r.details.len(), was_details);
+        assert_eq!(r.measurements.len(), 2);
+        assert_eq!(r.measurements["max_wchar"], NoteValue::Int(12345));
+        assert_eq!(r.measurements["psi_available"], NoteValue::Bool(true));
+    }
+
+    /// Duplicate-key write overwrites: producers that re-record under
+    /// the same key (a producer bug, but well-defined) get the latest
+    /// value. Pin this so a future "first write wins" refactor surfaces
+    /// here.
+    #[test]
+    fn note_value_overwrites_on_duplicate_key() {
+        let mut r = AssertResult::pass();
+        r.note_value("counter", 1i64);
+        r.note_value("counter", 2i64);
+        assert_eq!(r.measurements["counter"], NoteValue::Int(2));
+        assert_eq!(r.measurements.len(), 1);
+    }
+
+    /// `merge` folds `other.measurements` into `self.measurements`
+    /// with last-write-wins on key collision (matching `note_value`).
+    /// Pins the shape so a regression that union-with-keep-first
+    /// (e.g. `entry.or_insert(v)`) trips here.
+    #[test]
+    fn merge_unions_measurements_last_write_wins() {
+        let mut a = AssertResult::pass();
+        a.note_value("a_only", 1i64);
+        a.note_value("shared", 100i64);
+
+        let mut b = AssertResult::pass();
+        b.note_value("b_only", 2i64);
+        b.note_value("shared", 200i64);
+
+        a.merge(b);
+        assert_eq!(a.measurements.len(), 3);
+        assert_eq!(a.measurements["a_only"], NoteValue::Int(1));
+        assert_eq!(a.measurements["b_only"], NoteValue::Int(2));
+        assert_eq!(
+            a.measurements["shared"],
+            NoteValue::Int(200),
+            "merge must adopt other's value on key collision (last write wins)",
+        );
+    }
+
+    /// `measurements` survives serde round-trip with the `untagged`
+    /// representation flowing into the right variant on deserialize.
+    /// Pins the wire-format invariant so a regression that switched
+    /// to a tagged enum representation (and broke existing parsers)
+    /// trips here.
+    #[test]
+    fn note_value_survives_serde_roundtrip() {
+        let mut r = AssertResult::pass();
+        r.note_value("answer", 42i64);
+        r.note_value("ratio", 0.5_f64);
+        r.note_value("name", "fio");
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(
+            json.contains("\"measurements\""),
+            "measurements key must appear in JSON when populated: {json}",
+        );
+        let r2: AssertResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(r2.measurements["answer"], NoteValue::Int(42));
+        assert_eq!(r2.measurements["ratio"], NoteValue::Float(0.5));
+        assert_eq!(r2.measurements["name"], NoteValue::Text("fio".to_string()));
+    }
+
+    /// Empty `measurements` is omitted from the wire format — the
+    /// `skip_serializing_if` attribute keeps wire size minimal when
+    /// nothing was measured. Pin so a regression that dropped the
+    /// attribute (and started emitting `"measurements":{}` on every
+    /// passing result) trips here.
+    #[test]
+    fn empty_measurements_omitted_from_wire_format() {
+        let r = AssertResult::pass();
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(
+            !json.contains("measurements"),
+            "empty measurements must be skipped from JSON: {json}",
+        );
+    }
+
+    /// Old sidecars without the `measurements` key deserialize cleanly
+    /// with an empty map — the field carries `#[serde(default)]`.
+    #[test]
+    fn assert_result_missing_measurements_tolerated_by_deserialize() {
+        let json = r#"{"passed":true,"skipped":false,"details":[],"stats":{
+            "cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,
+            "worst_spread":0,"worst_gap_ms":0,"worst_gap_cpu":0,
+            "worst_migration_ratio":0,"worst_p99_wake_latency_us":0,
+            "worst_median_wake_latency_us":0,"worst_wake_latency_cv":0,
+            "total_iterations":0,"worst_mean_run_delay_us":0,
+            "worst_run_delay_us":0,"worst_page_locality":0,
+            "worst_cross_node_migration_ratio":0,
+            "worst_wake_latency_tail_ratio":0,"worst_iterations_per_worker":0
+        }}"#;
+        let r: AssertResult =
+            serde_json::from_str(json).expect("missing-measurements must deserialize cleanly");
+        assert!(r.measurements.is_empty());
+    }
+
+    // -- AssertResult::any_of / AssertResult::all_of --------------------
+
+    /// `any_of` with at least one passing branch returns a passing
+    /// result and annotates which branch was chosen. Pin: failed-branch
+    /// details are dropped (they would only confuse the operator with
+    /// messages from not-taken paths).
+    #[test]
+    fn any_of_chooses_passing_branch() {
+        let r = AssertResult::any_of([
+            {
+                let mut a = AssertResult::pass();
+                a.passed = false;
+                a.details.push(AssertDetail::new(DetailKind::Other, "boom"));
+                a
+            },
+            AssertResult::pass(),
+        ]);
+        assert!(r.passed);
+        // The "boom" detail from the failed branch must NOT appear —
+        // the chosen branch's details prevail.
+        assert!(
+            !r.details.iter().any(|d| d.message.contains("boom")),
+            "failed-branch details must be dropped: {:?}",
+            r.details,
+        );
+        // The chosen-branch annotation MUST appear with branch index 1.
+        assert!(
+            r.details
+                .iter()
+                .any(|d| d.kind == DetailKind::Note
+                    && d.message.contains("any_of: branch 1 satisfied")),
+            "chosen-branch annotation missing: {:?}",
+            r.details,
+        );
+    }
+
+    /// `any_of` with all branches failing returns a failing result and
+    /// concatenates every branch's details under a `any_of[<idx>]:`
+    /// prefix so the operator can identify which branch produced
+    /// which failure.
+    #[test]
+    fn any_of_concatenates_branch_failures_with_index_prefixes() {
+        let r = AssertResult::any_of([
+            AssertResult::fail(AssertDetail::new(DetailKind::Other, "first boom")),
+            AssertResult::fail(AssertDetail::new(DetailKind::Other, "second boom")),
+        ]);
+        assert!(!r.passed);
+        assert!(
+            r.details
+                .iter()
+                .any(|d| d.message == "any_of[0]: first boom"),
+            "branch 0 detail must carry index prefix: {:?}",
+            r.details,
+        );
+        assert!(
+            r.details
+                .iter()
+                .any(|d| d.message == "any_of[1]: second boom"),
+            "branch 1 detail must carry index prefix: {:?}",
+            r.details,
+        );
+        // A summary line names how many branches failed.
+        assert!(
+            r.details
+                .iter()
+                .any(|d| d.message.contains("all 2 branches failed")),
+            "summary line missing: {:?}",
+            r.details,
+        );
+    }
+
+    /// `any_of` with empty input fails — an empty disjunction is
+    /// logically false. Pinned to surface a producer bug as a
+    /// nameable failure rather than a vacuous pass.
+    #[test]
+    fn any_of_empty_input_fails() {
+        let r = AssertResult::any_of(std::iter::empty());
+        assert!(!r.passed);
+        assert!(
+            r.details
+                .iter()
+                .any(|d| d.message.contains("empty branch list")),
+            "empty disjunction must surface as named failure: {:?}",
+            r.details,
+        );
+    }
+
+    /// `all_of` is conjunction: passes iff every branch passes.
+    /// Empty input yields the passing identity (matches
+    /// `Iterator::all` semantics).
+    #[test]
+    fn all_of_passes_when_every_branch_passes() {
+        let r = AssertResult::all_of([AssertResult::pass(), AssertResult::pass()]);
+        assert!(r.passed);
+
+        // One failing branch flips the verdict.
+        let r = AssertResult::all_of([
+            AssertResult::pass(),
+            AssertResult::fail(AssertDetail::new(DetailKind::Other, "boom")),
+        ]);
+        assert!(!r.passed);
+
+        // Empty input is the passing identity.
+        let r = AssertResult::all_of(std::iter::empty());
+        assert!(r.passed);
+        assert!(r.details.is_empty());
+    }
+
+    /// `Verdict::note_value` mirrors [`AssertResult::note_value`] —
+    /// records under `measurements` without altering the verdict.
+    #[test]
+    fn verdict_note_value_records_into_underlying_result() {
+        let mut v = Verdict::new();
+        v.note_value("max_wchar", 12345i64);
+        v.note_value("psi_available", false);
+        let r = v.into_result();
+        assert!(r.passed);
+        assert_eq!(r.measurements.len(), 2);
+        assert_eq!(r.measurements["max_wchar"], NoteValue::Int(12345));
+        assert_eq!(r.measurements["psi_available"], NoteValue::Bool(false));
     }
 }

@@ -17,11 +17,15 @@
 pub mod arena;
 pub mod bpf_map;
 pub mod bpf_prog;
+pub mod bpf_syscall;
 pub mod btf_offsets;
 pub mod btf_render;
+pub mod debug_capture;
+pub mod dmesg_scx;
 pub mod dump;
 pub mod guest;
 pub mod idr;
+pub mod live_host_kernel;
 pub mod perf_counters;
 pub mod reader;
 pub mod runnable_scan;

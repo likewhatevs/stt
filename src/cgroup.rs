@@ -252,6 +252,101 @@ impl CgroupManager {
         write_with_timeout(&p, "", CGROUP_WRITE_TIMEOUT)
     }
 
+    /// Write `cpu.max` for a child cgroup. `quota_us = None` writes
+    /// `"max <period_us>"` (no upper bound — same as a freshly
+    /// created cgroup); `Some(q)` writes `"<q> <period_us>"`.
+    ///
+    /// Per the kernel's cgroup v2 docs ("Documentation/admin-guide/
+    /// cgroup-v2.rst", "CPU Interface Files"): each period the
+    /// cgroup gets `quota` microseconds of CPU time across its
+    /// CPUs, and is throttled until the next period boundary once
+    /// the quota is exhausted. `quota` MAY exceed `period` to let
+    /// the cgroup use multiple CPUs concurrently (e.g. quota
+    /// 200_000 / period 100_000 = up to 2 CPUs of throughput).
+    ///
+    /// Requires `+cpu` in the parent's `cgroup.subtree_control`;
+    /// missing controller surfaces as ENOENT on the file (handled
+    /// generically by [`write_with_timeout`]'s error path with the
+    /// errno suffix).
+    pub fn set_cpu_max(&self, name: &str, quota_us: Option<u64>, period_us: u64) -> Result<()> {
+        let p = self.parent.join(name).join("cpu.max");
+        let line = match quota_us {
+            Some(q) => format!("{q} {period_us}"),
+            None => format!("max {period_us}"),
+        };
+        write_with_timeout(&p, &line, CGROUP_WRITE_TIMEOUT)
+    }
+
+    /// Write `cpu.weight` for a child cgroup (cgroup v2 weight,
+    /// range 1..=10000, default 100). Used together with sibling
+    /// cgroups to bias relative CPU share inside the parent's
+    /// quota. Independent from `cpu.max` — weights govern share
+    /// when CPU is contended, max enforces an absolute ceiling.
+    ///
+    /// Per "Documentation/admin-guide/cgroup-v2.rst" the legacy
+    /// "shares" knob is `cpu.weight.nice` (mapped from nice value);
+    /// this method targets the canonical `cpu.weight` knob.
+    pub fn set_cpu_weight(&self, name: &str, weight: u32) -> Result<()> {
+        let p = self.parent.join(name).join("cpu.weight");
+        write_with_timeout(&p, &weight.to_string(), CGROUP_WRITE_TIMEOUT)
+    }
+
+    /// Write `memory.max` for a child cgroup. `bytes = None` writes
+    /// `"max"` (no hard limit). When the cgroup's RSS exceeds the
+    /// limit, the kernel OOM-kills tasks per the documented
+    /// `memory.max` semantics. Requires `+memory` in the parent's
+    /// `cgroup.subtree_control`.
+    pub fn set_memory_max(&self, name: &str, bytes: Option<u64>) -> Result<()> {
+        let p = self.parent.join(name).join("memory.max");
+        let line = match bytes {
+            Some(b) => b.to_string(),
+            None => "max".to_string(),
+        };
+        write_with_timeout(&p, &line, CGROUP_WRITE_TIMEOUT)
+    }
+
+    /// Write `memory.high` for a child cgroup. `bytes = None`
+    /// writes `"max"` (no high-water mark). Crossing the high
+    /// threshold triggers reclaim throttling but NOT OOM-kill,
+    /// distinguishing it from `memory.max`.
+    pub fn set_memory_high(&self, name: &str, bytes: Option<u64>) -> Result<()> {
+        let p = self.parent.join(name).join("memory.high");
+        let line = match bytes {
+            Some(b) => b.to_string(),
+            None => "max".to_string(),
+        };
+        write_with_timeout(&p, &line, CGROUP_WRITE_TIMEOUT)
+    }
+
+    /// Write `memory.low` for a child cgroup. `bytes = None` writes
+    /// `"0"` (no low-water protection). The kernel preferentially
+    /// reclaims FROM other cgroups before reclaiming this cgroup's
+    /// memory below `memory.low`; not a hard reservation.
+    pub fn set_memory_low(&self, name: &str, bytes: Option<u64>) -> Result<()> {
+        let p = self.parent.join(name).join("memory.low");
+        let line = match bytes {
+            Some(b) => b.to_string(),
+            None => "0".to_string(),
+        };
+        write_with_timeout(&p, &line, CGROUP_WRITE_TIMEOUT)
+    }
+
+    /// Write `io.weight` for a child cgroup (cgroup v2 weight,
+    /// range 1..=10000, default 100). Biases relative IO share
+    /// across sibling cgroups when the io controller is enabled
+    /// in the parent's `cgroup.subtree_control`. The kernel's BFQ
+    /// or io.cost backend (whichever is active) applies the
+    /// weight when contending devices are saturated.
+    ///
+    /// `io.max` (per-device throughput cap) is intentionally NOT
+    /// surfaced here — the per-device interface needs major:minor
+    /// device-id lookup which has no in-tree consumer; surface it
+    /// as a follow-up task when a concrete use case lands.
+    pub fn set_io_weight(&self, name: &str, weight: u16) -> Result<()> {
+        let p = self.parent.join(name).join("io.weight");
+        write_with_timeout(&p, &weight.to_string(), CGROUP_WRITE_TIMEOUT)
+    }
+
     /// Move a single task into a child cgroup via `cgroup.procs`.
     pub fn move_task(&self, name: &str, pid: libc::pid_t) -> Result<()> {
         let p = self.parent.join(name).join("cgroup.procs");
@@ -407,6 +502,18 @@ pub trait CgroupOps {
     /// Clear `cpuset.mems` (inherit from parent). See
     /// [`CgroupManager::clear_cpuset_mems`].
     fn clear_cpuset_mems(&self, name: &str) -> Result<()>;
+    /// Write `cpu.max`. See [`CgroupManager::set_cpu_max`].
+    fn set_cpu_max(&self, name: &str, quota_us: Option<u64>, period_us: u64) -> Result<()>;
+    /// Write `cpu.weight`. See [`CgroupManager::set_cpu_weight`].
+    fn set_cpu_weight(&self, name: &str, weight: u32) -> Result<()>;
+    /// Write `memory.max`. See [`CgroupManager::set_memory_max`].
+    fn set_memory_max(&self, name: &str, bytes: Option<u64>) -> Result<()>;
+    /// Write `memory.high`. See [`CgroupManager::set_memory_high`].
+    fn set_memory_high(&self, name: &str, bytes: Option<u64>) -> Result<()>;
+    /// Write `memory.low`. See [`CgroupManager::set_memory_low`].
+    fn set_memory_low(&self, name: &str, bytes: Option<u64>) -> Result<()>;
+    /// Write `io.weight`. See [`CgroupManager::set_io_weight`].
+    fn set_io_weight(&self, name: &str, weight: u16) -> Result<()>;
     /// Move a single task via `cgroup.procs`. See
     /// [`CgroupManager::move_task`].
     fn move_task(&self, name: &str, pid: libc::pid_t) -> Result<()>;
@@ -453,6 +560,24 @@ impl CgroupOps for CgroupManager {
     }
     fn clear_cpuset_mems(&self, name: &str) -> Result<()> {
         CgroupManager::clear_cpuset_mems(self, name)
+    }
+    fn set_cpu_max(&self, name: &str, quota_us: Option<u64>, period_us: u64) -> Result<()> {
+        CgroupManager::set_cpu_max(self, name, quota_us, period_us)
+    }
+    fn set_cpu_weight(&self, name: &str, weight: u32) -> Result<()> {
+        CgroupManager::set_cpu_weight(self, name, weight)
+    }
+    fn set_memory_max(&self, name: &str, bytes: Option<u64>) -> Result<()> {
+        CgroupManager::set_memory_max(self, name, bytes)
+    }
+    fn set_memory_high(&self, name: &str, bytes: Option<u64>) -> Result<()> {
+        CgroupManager::set_memory_high(self, name, bytes)
+    }
+    fn set_memory_low(&self, name: &str, bytes: Option<u64>) -> Result<()> {
+        CgroupManager::set_memory_low(self, name, bytes)
+    }
+    fn set_io_weight(&self, name: &str, weight: u16) -> Result<()> {
+        CgroupManager::set_io_weight(self, name, weight)
     }
     fn move_task(&self, name: &str, pid: libc::pid_t) -> Result<()> {
         CgroupManager::move_task(self, name, pid)
@@ -879,6 +1004,100 @@ mod tests {
         let cg = CgroupManager::new(dir.to_str().unwrap());
         cg.add_parent_subtree_controller("cpuset").unwrap();
         assert_eq!(fs::read_to_string(&sc).unwrap(), "+cpuset");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -- Cgroup v2 resource control writes (#5) ----------------------
+    //
+    // Each new CgroupOps method writes a single cgroupfs file. The
+    // tests below stand up a tmpdir representing the parent cgroup,
+    // pre-create the child + the target file (real cgroupfs creates
+    // these on directory creation; tmpfs needs them touched), invoke
+    // the method, and assert on the resulting file contents.
+
+    fn make_test_cgroup(label: &str) -> (PathBuf, CgroupManager) {
+        let dir = std::env::temp_dir().join(format!("ktstr-cg-{label}-{}", std::process::id()));
+        fs::create_dir_all(dir.join("cg_x")).unwrap();
+        let cg = CgroupManager::new(dir.to_str().unwrap());
+        (dir, cg)
+    }
+
+    #[test]
+    fn set_cpu_max_writes_quota_and_period_when_some() {
+        let (dir, cg) = make_test_cgroup("cpu-max-some");
+        let target = dir.join("cg_x").join("cpu.max");
+        fs::write(&target, "").unwrap();
+        cg.set_cpu_max("cg_x", Some(50_000), 100_000).unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "50000 100000");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_cpu_max_writes_max_keyword_when_none() {
+        let (dir, cg) = make_test_cgroup("cpu-max-none");
+        let target = dir.join("cg_x").join("cpu.max");
+        fs::write(&target, "").unwrap();
+        cg.set_cpu_max("cg_x", None, 100_000).unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "max 100000");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_cpu_weight_writes_decimal_value() {
+        let (dir, cg) = make_test_cgroup("cpu-weight");
+        let target = dir.join("cg_x").join("cpu.weight");
+        fs::write(&target, "").unwrap();
+        cg.set_cpu_weight("cg_x", 250).unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "250");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_memory_max_writes_bytes_or_max_keyword() {
+        let (dir, cg) = make_test_cgroup("mem-max");
+        let target = dir.join("cg_x").join("memory.max");
+        fs::write(&target, "").unwrap();
+        cg.set_memory_max("cg_x", Some(1_048_576)).unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "1048576");
+        cg.set_memory_max("cg_x", None).unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "max");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_memory_high_writes_bytes_or_max_keyword() {
+        let (dir, cg) = make_test_cgroup("mem-high");
+        let target = dir.join("cg_x").join("memory.high");
+        fs::write(&target, "").unwrap();
+        cg.set_memory_high("cg_x", Some(524_288)).unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "524288");
+        cg.set_memory_high("cg_x", None).unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "max");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `memory.low`'s "no protection" wire value is `"0"`, NOT
+    /// `"max"` — the kernel treats `max` as a syntax error on
+    /// `memory.low`. Pin both the bytes-set and the cleared paths.
+    #[test]
+    fn set_memory_low_writes_bytes_or_zero() {
+        let (dir, cg) = make_test_cgroup("mem-low");
+        let target = dir.join("cg_x").join("memory.low");
+        fs::write(&target, "").unwrap();
+        cg.set_memory_low("cg_x", Some(2_048)).unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "2048");
+        cg.set_memory_low("cg_x", None).unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "0");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_io_weight_writes_decimal_value() {
+        let (dir, cg) = make_test_cgroup("io-weight");
+        let target = dir.join("cg_x").join("io.weight");
+        fs::write(&target, "").unwrap();
+        cg.set_io_weight("cg_x", 500).unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "500");
         let _ = fs::remove_dir_all(&dir);
     }
 }

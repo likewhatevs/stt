@@ -1120,4 +1120,176 @@ mod tests {
         };
         assert!(offsets.missing_groups().is_empty());
     }
+
+    // -- Verdict API integration coverage (#97) -------------------------
+    //
+    // The walker emits RqScxState / DsqState / ScxSchedState rows that
+    // scenario authors will claim against via the new pointwise-claim
+    // API. These tests pin the integration shape: walker output flows
+    // into Verdict claims via the claim! macro, scalar fields claim
+    // through ClaimBuilder, runnable_task_kvas / task_kvas claim
+    // through SeqClaim. A regression that breaks the Display impls
+    // those claim messages depend on, or that drops the field types
+    // claim-able comparators expect, surfaces here.
+
+    /// Author-style claim sequence over a populated RqScxState. The
+    /// claims reflect what a scheduler test would actually write —
+    /// nr_running ≥ 0, no truncation under healthy load, runnable
+    /// task KVA list non-empty when the CPU has running work.
+    /// The Verdict accumulates without relying on the legacy Expect
+    /// shape; final pass/fail honors every claim.
+    #[test]
+    fn rq_scx_state_authorial_verdict_claims_compose() {
+        use crate::assert::Verdict;
+
+        let s = RqScxState {
+            cpu: 2,
+            nr_running: 3,
+            flags: 0x1,
+            cpu_released: false,
+            ops_qseq: 4242,
+            kick_sync: 100,
+            nr_immed: 0,
+            rq_clock: 999_999,
+            curr_pid: Some(1234),
+            curr_comm: Some("ktstr-w".into()),
+            runnable_task_kvas: vec![0xffff_ffff_8000_1000, 0xffff_ffff_8000_2000],
+            runnable_truncated: false,
+        };
+
+        let mut v = Verdict::new();
+        // Scalar claims via the claim! macro (label = stringify of expr).
+        crate::claim!(v, s.nr_running).at_least(1);
+        crate::claim!(v, s.nr_running).at_most(64);
+        crate::claim!(v, s.runnable_truncated).eq(false);
+        // Sequence claim via claim_seq.
+        v.claim_seq("runnable_task_kvas", &s.runnable_task_kvas).nonempty();
+        v.claim_seq("runnable_task_kvas", &s.runnable_task_kvas).len_at_most(64);
+
+        let r = v.into_result();
+        assert!(
+            r.passed,
+            "authorial claim sequence on populated RqScxState must pass: {:?}",
+            r.details,
+        );
+    }
+
+    /// Failing claim path: a verdict that calls at_most on
+    /// nr_running with a value BELOW the actual count must record
+    /// a single kind=Other detail with the field-name label and the
+    /// at-most message. Pins the integration of the walker's u32
+    /// field type through ClaimBuilder<u32>::at_most's failure
+    /// formatter.
+    #[test]
+    fn rq_scx_state_failing_at_most_records_labeled_detail() {
+        use crate::assert::Verdict;
+
+        let s = RqScxState {
+            cpu: 0,
+            nr_running: 100,
+            flags: 0,
+            cpu_released: false,
+            ops_qseq: 0,
+            kick_sync: 0,
+            nr_immed: 0,
+            rq_clock: 0,
+            curr_pid: None,
+            curr_comm: None,
+            runnable_task_kvas: vec![],
+            runnable_truncated: false,
+        };
+
+        let mut v = Verdict::new();
+        crate::claim!(v, s.nr_running).at_most(10);
+        let r = v.into_result();
+
+        assert!(!r.passed, "at_most(10) on nr_running=100 must fail");
+        assert_eq!(
+            r.details.len(),
+            1,
+            "exactly one failing detail must record: {:?}",
+            r.details,
+        );
+        let msg = &r.details[0].message;
+        assert!(
+            msg.contains("s.nr_running"),
+            "detail must carry the macro-stringify label: {msg}",
+        );
+        assert!(
+            msg.contains("at most 10"),
+            "detail must name the at_most threshold: {msg}",
+        );
+        assert!(
+            msg.contains("100"),
+            "detail must include the observed value: {msg}",
+        );
+    }
+
+    /// DsqState.task_kvas + DsqState.truncated claims compose like
+    /// RqScxState's. Pins the walker-DSQ-output shape through the
+    /// Verdict surface so a scenario test can write
+    /// `claim!(v, dsq.nr).at_most(LIMIT)` and
+    /// `v.claim_seq("dsq.task_kvas", &dsq.task_kvas).len_at_most(LIMIT)`
+    /// against a real DSQ snapshot.
+    #[test]
+    fn dsq_state_authorial_verdict_claims_compose() {
+        use crate::assert::Verdict;
+
+        let d = DsqState {
+            id: 0xdead_beef,
+            origin: "user".into(),
+            nr: 5,
+            seq: 100,
+            task_kvas: vec![0xffff_8000_8000_1000; 5],
+            truncated: false,
+        };
+
+        let mut v = Verdict::new();
+        crate::claim!(v, d.nr).at_most(MAX_NODES_PER_LIST);
+        crate::claim!(v, d.truncated).eq(false);
+        crate::claim!(v, d.seq).at_least(d.nr);
+        v.claim_seq("d.task_kvas", &d.task_kvas).len_eq(5);
+
+        let r = v.into_result();
+        assert!(
+            r.passed,
+            "authorial claim sequence on populated DsqState must pass: {:?}",
+            r.details,
+        );
+    }
+
+    /// `ScxSchedState.exit_kind == 0` is the no-error sentinel
+    /// (per `enum scx_exit_kind`). Pin via Verdict + claim!(eq) so
+    /// scheduler tests can write
+    /// `claim!(v, sched.exit_kind).eq(0)` for the healthy-exit
+    /// invariant.
+    #[test]
+    fn scx_sched_state_healthy_exit_kind_claim() {
+        use crate::assert::Verdict;
+
+        let healthy = ScxSchedState {
+            aborting: false,
+            bypass_depth: 0,
+            exit_kind: 0,
+        };
+        let mut v = Verdict::new();
+        crate::claim!(v, healthy.aborting).eq(false);
+        crate::claim!(v, healthy.bypass_depth).eq(0);
+        crate::claim!(v, healthy.exit_kind).eq(0u32);
+        let r = v.into_result();
+        assert!(r.passed, "healthy-state claims must pass: {:?}", r.details);
+
+        // Inverse: an aborting scheduler with non-zero exit_kind
+        // must fail the same claim sequence.
+        let aborted = ScxSchedState {
+            aborting: true,
+            bypass_depth: 4,
+            // SCX_EXIT_ERROR_BPF (1027) per include/linux/sched/ext.h.
+            exit_kind: 1027,
+        };
+        let mut v = Verdict::new();
+        crate::claim!(v, aborted.exit_kind).eq(0u32);
+        let r = v.into_result();
+        assert!(!r.passed, "exit_kind=1027 must fail eq(0)");
+    }
 }

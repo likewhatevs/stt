@@ -913,6 +913,7 @@ pub(crate) fn maybe_dispatch_vm_test_with_args(args: &[String]) -> Option<i32> {
                 skipped: false,
                 details: vec![format!("{e:#}").into()],
                 stats: Default::default(),
+                measurements: std::collections::BTreeMap::new(),
             };
             publish_result_and_collect(&r, probe_stop, probe_handle);
             return Some(1);
@@ -1285,6 +1286,7 @@ pub(crate) fn maybe_dispatch_vm_test_with_phase_a(
                 skipped: false,
                 details: vec![format!("{e:#}").into()],
                 stats: Default::default(),
+                measurements: std::collections::BTreeMap::new(),
             };
             publish_result_and_collect(&r, stop, Some(handle));
             return Some(1);

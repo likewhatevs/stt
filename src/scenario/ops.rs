@@ -299,6 +299,88 @@ impl CpusetSpec {
 }
 
 // ---------------------------------------------------------------------------
+// Cgroup v2 resource limits
+// ---------------------------------------------------------------------------
+
+/// CPU controller limits (`cpu.max` + `cpu.weight`) for a cgroup. All
+/// fields default to "inherit from parent" — the framework only writes
+/// each knob when its corresponding field is `Some`.
+///
+/// Set via [`CgroupDef::cpu`]. The kernel allows `quota` and `weight`
+/// to coexist (per `Documentation/admin-guide/cgroup-v2.rst`,
+/// "CPU Interface Files"): `weight` biases relative CPU share inside
+/// `period`, `quota` enforces an absolute ceiling. Surfacing both as
+/// independent options lets a test author express "this cgroup gets
+/// at most 50% of one CPU AND should lose to a heavier sibling under
+/// contention" in a single declaration.
+///
+/// Validation runs at `apply_setup` time — any violation surfaces as
+/// `anyhow::bail!` so a misconfigured CgroupDef fails before any
+/// worker spawns.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CpuLimits {
+    /// `cpu.max` quota and period in microseconds. `quota = None`
+    /// means "max" (no upper bound). `quota = Some(q)` allows the
+    /// cgroup `q` µs of CPU time per `period`. `q > period` is
+    /// legal: it lets the cgroup use multiple CPUs concurrently
+    /// (e.g. quota 200_000 / period 100_000 = up to 2 CPUs of
+    /// throughput).
+    ///
+    /// `period` defaults to 100_000 µs (100 ms) when omitted via
+    /// the [`CgroupDef::cpu_quota_pct`] convenience builder. Set
+    /// via [`CgroupDef::cpu_quota`] when a non-default period is
+    /// needed (e.g. tighter control loops with 10 ms periods for
+    /// latency-sensitive scheduler tests).
+    pub max_quota_us: Option<u64>,
+    /// `cpu.max` period component. Required whenever `max_quota_us`
+    /// is `Some`; ignored when `max_quota_us` is `None` (the
+    /// framework writes `"max <period>"` so the period stays
+    /// recorded for diagnostics).
+    pub max_period_us: u64,
+    /// `cpu.weight` relative-share weight (range 1..=10000, default
+    /// 100). `None` leaves the kernel default in place. Larger
+    /// values get a larger share when the parent cgroup's CPU is
+    /// contended.
+    pub weight: Option<u32>,
+}
+
+/// Memory controller limits (`memory.max` / `memory.high` /
+/// `memory.low`). Each field is `None` by default (inherit from
+/// parent / no limit).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct MemoryLimits {
+    /// `memory.max` hard ceiling in bytes. Crossing this triggers
+    /// the cgroup OOM killer per `Documentation/admin-guide/
+    /// cgroup-v2.rst`'s "Memory Interface Files". `None` writes
+    /// `"max"` (no hard limit).
+    pub max: Option<u64>,
+    /// `memory.high` soft throttle threshold in bytes. Crossing
+    /// this triggers reclaim throttling but NOT OOM-kill. `None`
+    /// writes `"max"`.
+    pub high: Option<u64>,
+    /// `memory.low` soft protection threshold in bytes. The kernel
+    /// preferentially reclaims FROM other cgroups before reclaiming
+    /// this cgroup's memory below `low`. `None` writes `"0"` (no
+    /// protection).
+    pub low: Option<u64>,
+}
+
+/// IO controller limits (`io.weight`). Per-device throughput caps
+/// (`io.max`) are intentionally not surfaced here — the per-device
+/// interface needs major:minor device-id lookup which has no
+/// in-tree consumer; surface it as a follow-up task when a
+/// concrete use case lands.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct IoLimits {
+    /// `io.weight` relative-share weight (range 1..=10000, default
+    /// 100). `None` leaves the kernel default in place.
+    pub weight: Option<u16>,
+}
+
+// ---------------------------------------------------------------------------
 // CgroupDef
 // ---------------------------------------------------------------------------
 
@@ -401,6 +483,23 @@ pub struct CgroupDef {
     /// killed at step-teardown (before cgroup removal) so the cgroup
     /// removal does not fail with EBUSY.
     pub payload: Option<&'static crate::test_support::Payload>,
+    /// Optional cpuset.mems NUMA node binding. `None` inherits the
+    /// parent cgroup's `cpuset.mems`. Set via
+    /// [`Self::with_cpuset_mems`].
+    pub cpuset_mems: Option<BTreeSet<usize>>,
+    /// Optional cpu controller limits (`cpu.max`, `cpu.weight`).
+    /// `None` leaves both kernel defaults in place. Set via
+    /// [`Self::cpu_quota_pct`] / [`Self::cpu_quota`] /
+    /// [`Self::cpu_weight`].
+    pub cpu: Option<CpuLimits>,
+    /// Optional memory controller limits (`memory.max`,
+    /// `memory.high`, `memory.low`). `None` leaves all three at
+    /// the kernel defaults. Set via [`Self::memory_max`] /
+    /// [`Self::memory_high`] / [`Self::memory_low`].
+    pub memory: Option<MemoryLimits>,
+    /// Optional io controller limits (`io.weight`). `None` leaves
+    /// the kernel default in place. Set via [`Self::io_weight`].
+    pub io: Option<IoLimits>,
 }
 
 impl CgroupDef {
@@ -538,6 +637,122 @@ impl CgroupDef {
         self.payload = Some(p);
         self
     }
+
+    /// Bind `cpuset.mems` for this cgroup. Mirrors
+    /// [`Self::with_cpuset`] for NUMA memory placement: the cgroup's
+    /// tasks may only allocate memory on the listed NUMA nodes.
+    /// `None` (default) inherits the parent's `cpuset.mems`.
+    ///
+    /// Required when the cgroup spans CPUs on a NUMA node whose
+    /// memory is NOT in the parent's `cpuset.mems` — without it,
+    /// allocations from the cgroup's tasks fail with `ENOMEM` or
+    /// migrate per the kernel's `cpuset_update_task_spread` path.
+    /// The framework writes `cpuset.mems` immediately after
+    /// `cpuset.cpus` so the binding is in effect before any worker
+    /// is moved into the cgroup.
+    pub fn with_cpuset_mems(mut self, nodes: BTreeSet<usize>) -> Self {
+        self.cpuset_mems = Some(nodes);
+        self
+    }
+
+    /// Set `cpu.max` quota as a percentage of one CPU's
+    /// throughput, with a default 100 ms `period`. `100` means
+    /// "one full CPU" (quota=100_000, period=100_000); `200` means
+    /// "two CPUs". Use [`Self::cpu_quota`] for non-default periods.
+    pub fn cpu_quota_pct(mut self, pct: u32) -> Self {
+        let cpu = self.cpu.get_or_insert_with(default_cpu_limits);
+        cpu.max_period_us = 100_000;
+        cpu.max_quota_us = Some((pct as u64) * 1_000);
+        self
+    }
+
+    /// Set `cpu.max` quota and period directly. `quota` may exceed
+    /// `period` (multi-CPU concurrency, see [`CpuLimits::max_quota_us`]).
+    /// Both arguments are converted to microseconds; sub-microsecond
+    /// fractions in the supplied [`Duration`]s are truncated.
+    pub fn cpu_quota(mut self, quota: Duration, period: Duration) -> Self {
+        let cpu = self.cpu.get_or_insert_with(default_cpu_limits);
+        cpu.max_quota_us = Some(quota.as_micros() as u64);
+        cpu.max_period_us = period.as_micros() as u64;
+        self
+    }
+
+    /// Clear any previously-set `cpu.max` quota (writes `"max"`),
+    /// leaving `cpu.weight` (if set) intact. Useful when a base
+    /// CgroupDef builder applied a default cap and the test wants
+    /// only weight-based bias.
+    pub fn cpu_unlimited(mut self) -> Self {
+        let cpu = self.cpu.get_or_insert_with(default_cpu_limits);
+        cpu.max_quota_us = None;
+        self
+    }
+
+    /// Set `cpu.weight` (range 1..=10000, default 100 in the
+    /// kernel). Larger values get a larger CPU share when the
+    /// parent cgroup is contended. Independent of `cpu.max`.
+    pub fn cpu_weight(mut self, weight: u32) -> Self {
+        let cpu = self.cpu.get_or_insert_with(default_cpu_limits);
+        cpu.weight = Some(weight);
+        self
+    }
+
+    /// Set `memory.max` hard ceiling in bytes. Crossing this
+    /// triggers the cgroup OOM killer.
+    pub fn memory_max(mut self, bytes: u64) -> Self {
+        let m = self.memory.get_or_insert_with(MemoryLimits::default);
+        m.max = Some(bytes);
+        self
+    }
+
+    /// Set `memory.high` soft throttle threshold in bytes.
+    /// Crossing this triggers reclaim throttling but NOT OOM-kill.
+    pub fn memory_high(mut self, bytes: u64) -> Self {
+        let m = self.memory.get_or_insert_with(MemoryLimits::default);
+        m.high = Some(bytes);
+        self
+    }
+
+    /// Set `memory.low` soft protection threshold in bytes.
+    /// Reclaim prefers other cgroups before this one's memory
+    /// drops below `low`.
+    pub fn memory_low(mut self, bytes: u64) -> Self {
+        let m = self.memory.get_or_insert_with(MemoryLimits::default);
+        m.low = Some(bytes);
+        self
+    }
+
+    /// Clear all three memory limits (writes `"max"` for max/high
+    /// and `"0"` for low). Equivalent to leaving `memory` unset
+    /// at construction; provided for symmetry with
+    /// [`Self::cpu_unlimited`].
+    pub fn memory_unlimited(mut self) -> Self {
+        self.memory = Some(MemoryLimits::default());
+        self
+    }
+
+    /// Set `io.weight` (range 1..=10000, default 100 in the
+    /// kernel). Biases relative IO share across sibling cgroups
+    /// when the io controller is enabled. `io.max` per-device caps
+    /// are not surfaced here — see [`IoLimits`] for the rationale.
+    pub fn io_weight(mut self, weight: u16) -> Self {
+        let io = self.io.get_or_insert_with(IoLimits::default);
+        io.weight = Some(weight);
+        self
+    }
+}
+
+/// Constructor for the default [`CpuLimits`] used by the cgroup
+/// builders — `cpu.max` quota off, period 100 ms (the kernel
+/// default for `cpu.max`'s second column), `cpu.weight` unset.
+/// Extracted so the four builders that ensure_cpu_limits share
+/// one initial state and a future change to the default period
+/// (e.g. shorter for latency-sensitive tests) only edits here.
+fn default_cpu_limits() -> CpuLimits {
+    CpuLimits {
+        max_quota_us: None,
+        max_period_us: 100_000,
+        weight: None,
+    }
 }
 
 impl Default for CgroupDef {
@@ -548,6 +763,10 @@ impl Default for CgroupDef {
             works: vec![],
             swappable: false,
             payload: None,
+            cpuset_mems: None,
+            cpu: None,
+            memory: None,
+            io: None,
         }
     }
 }
@@ -2460,6 +2679,75 @@ fn apply_setup(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, defs: &[CgroupDef])
             let resolved = cpuset_spec.resolve(ctx);
             ctx.cgroups.set_cpuset(&def.name, &resolved)?;
             state.record_cpuset(&def.name, resolved);
+        }
+        if let Some(ref nodes) = def.cpuset_mems {
+            // The cpuset.mems write must succeed before any task
+            // moves into the cgroup; cpuset_update_task_spread will
+            // SIGKILL or fail allocations otherwise. Surfacing the
+            // error here (instead of at move_tasks time) lets the
+            // operator see the bad NUMA spec at setup, before the
+            // worker spawn pays its cost.
+            ctx.cgroups.set_cpuset_mems(&def.name, nodes)?;
+        }
+        if let Some(ref cpu) = def.cpu {
+            // cpu.weight: kernel range is 1..=10000 per
+            // Documentation/admin-guide/cgroup-v2.rst. Reject at
+            // setup so a 0 / 12000 from a typo fails fast instead
+            // of returning EINVAL from the kernel write.
+            if let Some(w) = cpu.weight {
+                if !(1..=10_000).contains(&w) {
+                    anyhow::bail!(
+                        "cgroup '{}': cpu.weight {w} out of range 1..=10000",
+                        def.name,
+                    );
+                }
+                ctx.cgroups.set_cpu_weight(&def.name, w)?;
+            }
+            // cpu.max: writing requires `+cpu` in subtree_control;
+            // CgroupManager::setup with enable_cpu_controller=true
+            // turns it on. quota=0 with period>0 would reject every
+            // schedule slice in the kernel; reject here with a
+            // clearer message.
+            if cpu.max_period_us == 0 {
+                anyhow::bail!(
+                    "cgroup '{}': cpu.max period must be > 0 (got 0)",
+                    def.name,
+                );
+            }
+            if let Some(q) = cpu.max_quota_us {
+                if q == 0 {
+                    anyhow::bail!(
+                        "cgroup '{}': cpu.max quota must be > 0 when set; \
+                         use cpu_unlimited() to remove the cap",
+                        def.name,
+                    );
+                }
+            }
+            // Always emit the cpu.max write so the period field is
+            // recorded even when quota is None. Aligns with the
+            // kernel's `"max <period>"` write format.
+            ctx.cgroups
+                .set_cpu_max(&def.name, cpu.max_quota_us, cpu.max_period_us)?;
+        }
+        if let Some(ref mem) = def.memory {
+            // Order: max first, then high (high <= max is the
+            // operator-meaningful constraint per cgroup-v2 docs;
+            // kernel allows any ordering but writing max first
+            // means a high write fails clearly when high>max).
+            ctx.cgroups.set_memory_max(&def.name, mem.max)?;
+            ctx.cgroups.set_memory_high(&def.name, mem.high)?;
+            ctx.cgroups.set_memory_low(&def.name, mem.low)?;
+        }
+        if let Some(ref io) = def.io {
+            if let Some(w) = io.weight {
+                if !(1..=10_000).contains(&w) {
+                    anyhow::bail!(
+                        "cgroup '{}': io.weight {w} out of range 1..=10000",
+                        def.name,
+                    );
+                }
+                ctx.cgroups.set_io_weight(&def.name, w)?;
+            }
         }
         let effective_works: &[Work] = if def.works.is_empty() {
             &default_work
@@ -5058,6 +5346,13 @@ mod tests {
         SetCpusetMems(String, BTreeSet<usize>),
         #[allow(dead_code)] // Emitted by CgroupOps::clear_cpuset_mems; no test asserts on it yet.
         ClearCpusetMems(String),
+        // (name, quota_us, period_us); quota=None means "max".
+        SetCpuMax(String, Option<u64>, u64),
+        SetCpuWeight(String, u32),
+        SetMemoryMax(String, Option<u64>),
+        SetMemoryHigh(String, Option<u64>),
+        SetMemoryLow(String, Option<u64>),
+        SetIoWeight(String, u16),
         MoveTask(String, libc::pid_t),
         MoveTasks(String, usize), // (cgroup name, number of pids)
         ClearSubtreeControl(String),
@@ -5137,6 +5432,24 @@ mod tests {
         }
         fn clear_cpuset_mems(&self, name: &str) -> Result<()> {
             self.record(CgroupCall::ClearCpusetMems(name.to_string()))
+        }
+        fn set_cpu_max(&self, name: &str, quota_us: Option<u64>, period_us: u64) -> Result<()> {
+            self.record(CgroupCall::SetCpuMax(name.to_string(), quota_us, period_us))
+        }
+        fn set_cpu_weight(&self, name: &str, weight: u32) -> Result<()> {
+            self.record(CgroupCall::SetCpuWeight(name.to_string(), weight))
+        }
+        fn set_memory_max(&self, name: &str, bytes: Option<u64>) -> Result<()> {
+            self.record(CgroupCall::SetMemoryMax(name.to_string(), bytes))
+        }
+        fn set_memory_high(&self, name: &str, bytes: Option<u64>) -> Result<()> {
+            self.record(CgroupCall::SetMemoryHigh(name.to_string(), bytes))
+        }
+        fn set_memory_low(&self, name: &str, bytes: Option<u64>) -> Result<()> {
+            self.record(CgroupCall::SetMemoryLow(name.to_string(), bytes))
+        }
+        fn set_io_weight(&self, name: &str, weight: u16) -> Result<()> {
+            self.record(CgroupCall::SetIoWeight(name.to_string(), weight))
         }
         fn move_task(&self, name: &str, pid: libc::pid_t) -> Result<()> {
             self.record(CgroupCall::MoveTask(name.to_string(), pid))
@@ -7122,5 +7435,267 @@ mod tests {
             seen.iter().all(|s| *s),
             "every CpusetSpec variant must have a matching constructor, seen={seen:?}",
         );
+    }
+
+    // -- CgroupDef cgroup-v2 resource builders (#5) ------------------
+
+    /// `.cpu_quota_pct(50)` populates `cpu.max_quota_us = 50_000`
+    /// with the default 100 ms period. Pins the percentage-to-µs
+    /// conversion factor so a future refactor that shifts to
+    /// nanoseconds trips this test.
+    #[test]
+    fn cgroup_def_cpu_quota_pct_uses_100ms_period_and_correct_quota() {
+        let def = CgroupDef::named("cg_a").cpu_quota_pct(50);
+        let cpu = def.cpu.expect("cpu_quota_pct must populate `cpu`");
+        assert_eq!(cpu.max_quota_us, Some(50_000));
+        assert_eq!(cpu.max_period_us, 100_000);
+        assert!(cpu.weight.is_none(), "weight must remain unset");
+    }
+
+    /// `.cpu_quota(quota, period)` accepts arbitrary Durations and
+    /// converts to microseconds.
+    #[test]
+    fn cgroup_def_cpu_quota_accepts_explicit_durations() {
+        let def =
+            CgroupDef::named("cg_a").cpu_quota(Duration::from_micros(7_500), Duration::from_millis(10));
+        let cpu = def.cpu.unwrap();
+        assert_eq!(cpu.max_quota_us, Some(7_500));
+        assert_eq!(cpu.max_period_us, 10_000);
+    }
+
+    /// `.cpu_unlimited()` clears the quota but preserves `weight`.
+    /// Pins the "weight survives clear" guarantee documented on
+    /// the builder.
+    #[test]
+    fn cgroup_def_cpu_unlimited_clears_quota_keeps_weight() {
+        let def = CgroupDef::named("cg_a")
+            .cpu_quota_pct(80)
+            .cpu_weight(200)
+            .cpu_unlimited();
+        let cpu = def.cpu.unwrap();
+        assert!(cpu.max_quota_us.is_none());
+        assert_eq!(cpu.max_period_us, 100_000);
+        assert_eq!(cpu.weight, Some(200));
+    }
+
+    /// All three memory builders compose into a single MemoryLimits.
+    #[test]
+    fn cgroup_def_memory_builders_compose() {
+        let def = CgroupDef::named("cg_a")
+            .memory_max(1_000_000)
+            .memory_high(800_000)
+            .memory_low(400_000);
+        let m = def.memory.unwrap();
+        assert_eq!(m.max, Some(1_000_000));
+        assert_eq!(m.high, Some(800_000));
+        assert_eq!(m.low, Some(400_000));
+    }
+
+    /// `.memory_unlimited()` resets every memory knob to None,
+    /// undoing prior `.memory_max/high/low` calls.
+    #[test]
+    fn cgroup_def_memory_unlimited_clears_all_three() {
+        let def = CgroupDef::named("cg_a")
+            .memory_max(1_000_000)
+            .memory_high(800_000)
+            .memory_low(400_000)
+            .memory_unlimited();
+        let m = def.memory.unwrap();
+        assert!(m.max.is_none());
+        assert!(m.high.is_none());
+        assert!(m.low.is_none());
+    }
+
+    /// `.io_weight(N)` populates the IoLimits.
+    #[test]
+    fn cgroup_def_io_weight_populates() {
+        let def = CgroupDef::named("cg_a").io_weight(750);
+        assert_eq!(def.io.unwrap().weight, Some(750));
+    }
+
+    /// `.with_cpuset_mems(nodes)` populates the new field without
+    /// disturbing the cpuset.cpus side.
+    #[test]
+    fn cgroup_def_with_cpuset_mems_populates_independent_field() {
+        let nodes: BTreeSet<usize> = [0usize, 1].into_iter().collect();
+        let def = CgroupDef::named("cg_a").with_cpuset_mems(nodes.clone());
+        assert_eq!(def.cpuset_mems, Some(nodes));
+        assert!(def.cpuset.is_none());
+    }
+
+    // -- apply_setup wires builder values to CgroupOps calls ----------
+    //
+    // These tests drive `apply_setup` against a `MockCgroupOps` that
+    // records every call into the existing `CgroupCall` enum, then
+    // assert on the recorded sequence. The apply_setup site emits
+    // the new resource-control writes between cpuset assignment and
+    // worker spawn, so the tests pin both presence (the calls fire)
+    // and ordering (cpu/memory/io land BEFORE move_tasks so the
+    // limits are in effect when workers join).
+
+    /// A bare CgroupDef with `.cpu_quota_pct(50)` records exactly
+    /// one SetCpuMax call with the converted u64 quota and the
+    /// default 100 ms period.
+    #[test]
+    fn apply_setup_records_set_cpu_max_for_cpu_quota_pct_builder() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        let defs = vec![CgroupDef::named("cg_cap").cpu_quota_pct(75)];
+        apply_setup_test(&ctx, &mut state, &defs).expect("apply_setup must succeed");
+        let calls = mock.calls();
+        assert!(
+            calls.contains(&CgroupCall::SetCpuMax(
+                "cg_cap".to_string(),
+                Some(75_000),
+                100_000,
+            )),
+            "expected SetCpuMax(cg_cap, Some(75000), 100000); got {calls:?}",
+        );
+        cleanup_state(&mut state);
+    }
+
+    /// `.memory_max(N)` records SetMemoryMax(Some(N)) AND clears
+    /// the unset high/low to None — the apply_setup loop emits all
+    /// three writes whenever the `memory` field is `Some` so a
+    /// prior cgroup's residue can't bleed through.
+    #[test]
+    fn apply_setup_records_three_memory_writes_when_memory_field_set() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        let defs = vec![CgroupDef::named("cg_mem").memory_max(1_000_000)];
+        apply_setup_test(&ctx, &mut state, &defs).expect("apply_setup must succeed");
+        let calls = mock.calls();
+        let max_idx = calls
+            .iter()
+            .position(|c| matches!(c, CgroupCall::SetMemoryMax(n, _) if n == "cg_mem"))
+            .expect("SetMemoryMax must fire");
+        let high_idx = calls
+            .iter()
+            .position(|c| matches!(c, CgroupCall::SetMemoryHigh(n, _) if n == "cg_mem"))
+            .expect("SetMemoryHigh must fire");
+        let low_idx = calls
+            .iter()
+            .position(|c| matches!(c, CgroupCall::SetMemoryLow(n, _) if n == "cg_mem"))
+            .expect("SetMemoryLow must fire");
+        assert!(
+            max_idx < high_idx && high_idx < low_idx,
+            "memory writes must land in (max, high, low) order; got max={max_idx} high={high_idx} low={low_idx}",
+        );
+        // Specific values: max=Some, high=None (writes "max"),
+        // low=None (writes "0") — pin both the SET and the
+        // implicit-clear.
+        assert!(
+            calls.contains(&CgroupCall::SetMemoryMax("cg_mem".to_string(), Some(1_000_000))),
+        );
+        assert!(calls.contains(&CgroupCall::SetMemoryHigh("cg_mem".to_string(), None)));
+        assert!(calls.contains(&CgroupCall::SetMemoryLow("cg_mem".to_string(), None)));
+        cleanup_state(&mut state);
+    }
+
+    /// Ordering pin: every resource-control write MUST land before
+    /// the first MoveTasks for the same cgroup so workers join an
+    /// already-configured environment. Reverse ordering is a kernel
+    /// race per Documentation/admin-guide/cgroup-v2.rst — tasks
+    /// admitted before cpuset.mems is set may fail allocation per
+    /// `cpuset_update_task_spread`.
+    #[test]
+    fn apply_setup_resource_writes_land_before_move_tasks() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        let mems: BTreeSet<usize> = [0usize].into_iter().collect();
+        let defs = vec![
+            CgroupDef::named("cg_full")
+                .with_cpuset_mems(mems)
+                .cpu_quota_pct(40)
+                .cpu_weight(200)
+                .memory_max(2_000_000)
+                .io_weight(150),
+        ];
+        apply_setup_test(&ctx, &mut state, &defs).expect("apply_setup must succeed");
+        let calls = mock.calls();
+        let move_idx = calls
+            .iter()
+            .position(|c| matches!(c, CgroupCall::MoveTasks(n, _) if n == "cg_full"));
+        // No workers here means no MoveTasks — but every resource
+        // write must still appear, in the documented order. Pin
+        // each kind's presence and then assert the inter-kind
+        // ordering relative to the (possibly absent) MoveTasks.
+        let kinds: Vec<usize> = calls
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| match c {
+                CgroupCall::SetCpusetMems(n, _) if n == "cg_full" => Some(i),
+                CgroupCall::SetCpuMax(n, _, _) if n == "cg_full" => Some(i),
+                CgroupCall::SetCpuWeight(n, _) if n == "cg_full" => Some(i),
+                CgroupCall::SetMemoryMax(n, _) if n == "cg_full" => Some(i),
+                CgroupCall::SetMemoryHigh(n, _) if n == "cg_full" => Some(i),
+                CgroupCall::SetMemoryLow(n, _) if n == "cg_full" => Some(i),
+                CgroupCall::SetIoWeight(n, _) if n == "cg_full" => Some(i),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            kinds.len() >= 7,
+            "expected at least 7 resource writes (mems + cpu.max + cpu.weight + 3 memory + io.weight); got {} ({calls:?})",
+            kinds.len(),
+        );
+        if let Some(mi) = move_idx {
+            assert!(
+                kinds.iter().all(|k| *k < mi),
+                "every resource write must precede MoveTasks; kinds={kinds:?} move_idx={mi}",
+            );
+        }
+        cleanup_state(&mut state);
+    }
+
+    /// `cpu.weight = 0` (out of kernel range 1..=10000) MUST be
+    /// rejected at apply_setup with a clear error message naming
+    /// the cgroup and the offending value.
+    #[test]
+    fn apply_setup_rejects_cpu_weight_out_of_range() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        let defs = vec![CgroupDef::named("cg_bad").cpu_weight(0)];
+        let err = apply_setup_test(&ctx, &mut state, &defs)
+            .err()
+            .expect("apply_setup must reject weight=0");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("cg_bad") && msg.contains("cpu.weight"),
+            "error must name cgroup and field; got: {msg}",
+        );
+        cleanup_state(&mut state);
+    }
+
+    /// `cpu.max` with `period_us = 0` MUST be rejected — the
+    /// kernel writes `quota period` and divide-by-zero in the CFS
+    /// scheduler is a guaranteed bug.
+    #[test]
+    fn apply_setup_rejects_cpu_max_period_zero() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        let defs = vec![
+            CgroupDef::named("cg_bad")
+                .cpu_quota(Duration::from_millis(50), Duration::ZERO),
+        ];
+        let err = apply_setup_test(&ctx, &mut state, &defs)
+            .err()
+            .expect("apply_setup must reject period=0");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("cg_bad") && msg.contains("period"),
+            "error must name cgroup and period; got: {msg}",
+        );
+        cleanup_state(&mut state);
     }
 }

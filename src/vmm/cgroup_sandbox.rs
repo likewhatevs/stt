@@ -1286,6 +1286,30 @@ mod tests {
             self.record(&format!("clear_cpuset_mems({name})"));
             Ok(())
         }
+        fn set_cpu_max(&self, name: &str, _: Option<u64>, _: u64) -> Result<()> {
+            self.record(&format!("set_cpu_max({name})"));
+            Ok(())
+        }
+        fn set_cpu_weight(&self, name: &str, _: u32) -> Result<()> {
+            self.record(&format!("set_cpu_weight({name})"));
+            Ok(())
+        }
+        fn set_memory_max(&self, name: &str, _: Option<u64>) -> Result<()> {
+            self.record(&format!("set_memory_max({name})"));
+            Ok(())
+        }
+        fn set_memory_high(&self, name: &str, _: Option<u64>) -> Result<()> {
+            self.record(&format!("set_memory_high({name})"));
+            Ok(())
+        }
+        fn set_memory_low(&self, name: &str, _: Option<u64>) -> Result<()> {
+            self.record(&format!("set_memory_low({name})"));
+            Ok(())
+        }
+        fn set_io_weight(&self, name: &str, _: u16) -> Result<()> {
+            self.record(&format!("set_io_weight({name})"));
+            Ok(())
+        }
         fn move_task(&self, name: &str, pid: libc::pid_t) -> Result<()> {
             self.record(&format!("move_task({name},{pid})"));
             if let Some(msg) = *self.move_task_err.lock().unwrap() {
