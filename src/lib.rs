@@ -400,6 +400,45 @@ pub mod test_support;
 pub(crate) mod timeline;
 pub mod topology;
 
+/// Public surface for the live-host introspection pipeline.
+///
+/// Re-exports from the otherwise-internal `monitor` module so the
+/// live-host capture binary, integration tests, and downstream
+/// consumers can invoke the bpf()-syscall data path, kernel
+/// auto-discovery, kallsyms parser, dmesg-scx parser, and the
+/// reproducer-generator translation layer without the `monitor`
+/// module's frozen-VM internals leaking into the public API.
+///
+/// Tasks #9, #11, #12, #13, #14, #21, #122 build the library
+/// pieces; this module is the entry point for binaries and tests
+/// that consume them.
+pub mod live_host {
+    pub use crate::monitor::bpf_map::{
+        BpfMapAccessor, BpfMapInfo, BPF_MAP_TYPE_ARENA, BPF_MAP_TYPE_ARRAY, BPF_MAP_TYPE_HASH,
+        BPF_MAP_TYPE_PERCPU_ARRAY,
+    };
+    pub use crate::monitor::bpf_syscall::BpfSyscallAccessor;
+    pub use crate::monitor::debug_capture::{
+        AffinityHint, CgroupHint, CtprofSampleRef, DebugCapture, SchedPolicyHint,
+        WorkTypeHint, WorkloadFingerprint, WorkloadGroupHint, project_fingerprint,
+        DEBUG_CAPTURE_SCHEMA,
+    };
+    pub use crate::monitor::dmesg_scx::{
+        ScxExitEvent, ScxExitKind, StackSymbol, extract_stack_symbols, parse_kmsg_window,
+    };
+    pub use crate::monitor::live_host_kernel::{
+        KallsymsTable, LiveHostKernelEnv, uname_release,
+    };
+    pub use crate::monitor::reproducer_gen::{
+        ReproducerSpec, generate_spec, render_ktstr_test_source, render_run_file_source,
+    };
+    pub use crate::monitor::timeline::{
+        DEFAULT_SNAPSHOT_RING_DEPTH, IncrementalCapture, IncrementalSnapshot, SnapshotRing,
+        TimelineCapture, TimelineEvent, TimelineEventRaw, parse_timeline_buf,
+        parse_timeline_record, tl_evt,
+    };
+}
+
 pub mod remote_cache;
 pub(crate) mod sync;
 pub(crate) mod tar_util;

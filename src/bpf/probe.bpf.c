@@ -895,3 +895,118 @@ int BPF_PROG(ktstr_lock_contend, void *lock, unsigned int flags)
 	__sync_fetch_and_add(&ktstr_lock_contend_count, 1);
 	return 0;
 }
+
+/*
+ * Per-CPU preempt-disabled duration tracking (#64).
+ *
+ * Two tp_btf handlers — preempt_disable / preempt_enable — track
+ * the outermost preempt-disable transitions per CPU. The kernel
+ * tracepoints (declared in include/trace/events/preemptirq.h,
+ * implemented in kernel/trace/trace_preemptirq.c) fire only on
+ * preempt_count transitions FROM 0 (outermost disable) and TO 0
+ * (outermost enable) — nested preempt_disable calls do NOT fire
+ * the tracepoint, so the (disable, enable) ts pairing tracks the
+ * full window the CPU was in preempt-disabled context.
+ *
+ * Storage: a per-CPU array map carrying `(enter_ts, max_ns)`. On
+ * disable, write enter_ts. On enable, compute `now - enter_ts`,
+ * update max_ns if greater. The host-side dumper reads each
+ * CPU's max_ns via the existing per-CPU array reader.
+ *
+ * CONFIG dependency: tp_btf/preempt_disable and tp_btf/preempt_enable
+ * are emitted only when CONFIG_TRACE_PREEMPT_TOGGLE is set
+ * (kernel/trace/trace_preemptirq.c). When the option is absent,
+ * libbpf attach gracefully fails for the tp_btf — same pattern as
+ * other optional tp_btf attaches in this probe. ktstr.kconfig
+ * enables CONFIG_TRACE_PREEMPT_TOGGLE so the standard ktstr-built
+ * kernel always carries the tracepoints; out-of-tree kernels that
+ * lack the option drop the metric without breaking probe load.
+ *
+ * Why per-CPU array instead of timeline ringbuf: preempt-disable
+ * fires on every spinlock acquisition — emitting a ringbuf
+ * record per fire would saturate the dedicated `timeline_events`
+ * ring within milliseconds of a busy test. The aggregate "max
+ * duration over the run" is the operationally useful metric;
+ * shipping per-event records would only add noise. The wire
+ * format here mirrors the per-CPU CPU-time stats surfaced via
+ * `kernel_cpustat` reads — one summary-per-CPU aggregate.
+ */
+struct preempt_disabled_state {
+	unsigned long long enter_ts;  /* ktime when the outermost
+				       * preempt_disable fired; 0 when
+				       * the CPU is currently in
+				       * preempt-enabled context. */
+	unsigned long long max_ns;    /* longest observed
+				       * disable->enable interval since
+				       * probe attach. Sticky-monotonic
+				       * over the run; updated only when
+				       * the latest interval exceeds the
+				       * prior max. */
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__type(key, u32);
+	__type(value, struct preempt_disabled_state);
+	__uint(max_entries, 1);
+} preempt_disabled_per_cpu SEC(".maps");
+
+/* Cumulative count of `tp_btf/preempt_disable` fires that
+ * recorded an enter_ts (#64). Sums across all CPUs since the
+ * map is per-CPU. A non-zero count proves the tp_btf attached;
+ * zero means CONFIG_TRACE_PREEMPT_TOGGLE was missing and the
+ * tracepoint never fired. */
+u64 ktstr_preempt_disable_count = 0;
+
+/* Cumulative count of `tp_btf/preempt_enable` fires that
+ * computed a duration (#64). Mirrors `ktstr_preempt_disable_count`;
+ * the difference between disable_count and enable_count surfaces
+ * unmatched fires (e.g. a CPU went offline mid-disable). */
+u64 ktstr_preempt_enable_count = 0;
+
+SEC("tp_btf/preempt_disable")
+int BPF_PROG(ktstr_preempt_disable_tp, unsigned long ip,
+	     unsigned long parent_ip)
+{
+	if (!ktstr_enabled)
+		return 0;
+
+	u32 zero = 0;
+	struct preempt_disabled_state *st =
+		bpf_map_lookup_elem(&preempt_disabled_per_cpu, &zero);
+	if (!st)
+		return 0;
+
+	st->enter_ts = bpf_ktime_get_ns();
+	__sync_fetch_and_add(&ktstr_preempt_disable_count, 1);
+	return 0;
+}
+
+SEC("tp_btf/preempt_enable")
+int BPF_PROG(ktstr_preempt_enable_tp, unsigned long ip,
+	     unsigned long parent_ip)
+{
+	if (!ktstr_enabled)
+		return 0;
+
+	u32 zero = 0;
+	struct preempt_disabled_state *st =
+		bpf_map_lookup_elem(&preempt_disabled_per_cpu, &zero);
+	if (!st)
+		return 0;
+
+	/* Skip if no paired enter_ts was recorded — CONFIG races at
+	 * boot can deliver an enable before its enter on the same
+	 * CPU (e.g. probe attached mid-section). Without a matching
+	 * enter, the duration computation is invalid. */
+	if (st->enter_ts == 0)
+		return 0;
+
+	u64 now = bpf_ktime_get_ns();
+	u64 dur = now - st->enter_ts;
+	st->enter_ts = 0;
+	if (dur > st->max_ns)
+		st->max_ns = dur;
+	__sync_fetch_and_add(&ktstr_preempt_enable_count, 1);
+	return 0;
+}

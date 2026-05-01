@@ -268,6 +268,64 @@ pub struct PerCpuTimeStats {
     pub iowait_sleeptime_ns: Option<u64>,
 }
 
+/// Per-node NUMA event counters captured from
+/// `pglist_data->node_zones[]->vm_numa_event[]` at freeze time
+/// (#66).
+///
+/// Each row is one row of NUMA event counters summed across all
+/// zones on a single node. The six counters mirror the kernel's
+/// `enum numa_stat_item` (see [`super::btf_offsets::NUMA_HIT`]
+/// etc. for the enum-stable indices). All counters are
+/// monotonic-since-boot; consumers diff against a baseline (or
+/// against another node's row) to extract the test-window delta.
+///
+/// Diagnostic value for sched_ext stalls is informational only —
+/// the NUMA balancer is not active for ext tasks (per
+/// research_structural_pathology.md "NUMA" section). The rows
+/// surface here so an operator triaging a NUMA-aware workload
+/// (e.g. a memory-tiering test) can verify the kernel actually
+/// observed the expected node-locality distribution.
+///
+/// **Live walker status:** the wire shape, BTF offsets
+/// ([`super::btf_offsets::NumaStatsOffsets`]), and report field
+/// are wired through. The actual host-side walker that resolves
+/// `node_data[]` and reads per-zone counters is a follow-up task
+/// (#66-walker); until it lands, the report's
+/// [`FailureDumpReport::per_node_numa`] vec stays empty and
+/// [`FailureDumpReport::per_node_numa_unavailable`] carries the
+/// `"no NUMA walker"` reason.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
+pub struct PerNodeNumaStats {
+    /// NUMA node id this row describes.
+    pub node: u32,
+    /// `vm_numa_event[NUMA_HIT]` summed across zones — pages
+    /// allocated on the requested node when local was preferred.
+    pub numa_hit: u64,
+    /// `vm_numa_event[NUMA_MISS]` — local node full, allocation
+    /// landed on a non-local node.
+    pub numa_miss: u64,
+    /// `vm_numa_event[NUMA_FOREIGN]` — process-policy targeted a
+    /// different node, this node honored the policy.
+    pub numa_foreign: u64,
+    /// `vm_numa_event[NUMA_INTERLEAVE_HIT]` — interleave policy
+    /// allocations that landed on this node.
+    pub numa_interleave_hit: u64,
+    /// `vm_numa_event[NUMA_LOCAL]` — allocations on this node by
+    /// processes running on this node.
+    pub numa_local: u64,
+    /// `vm_numa_event[NUMA_OTHER]` — allocations on this node by
+    /// processes running on a different node.
+    pub numa_other: u64,
+}
+
+/// Reason string written into [`FailureDumpReport::per_node_numa_unavailable`]
+/// when the live walker for #66 has not landed yet. Distinct from
+/// other unavailable reasons so a downstream consumer can tell
+/// "walker not implemented" apart from "walker ran and produced
+/// no data" once the live producer ships.
+pub const REASON_NO_NUMA_WALKER: &str = "no NUMA walker (#66 follow-up)";
+
 /// Borrow-only capture context for the per-sample SCX event counter
 /// timeline.
 ///
@@ -631,6 +689,23 @@ pub struct FailureDumpReport {
     /// `rq->nr_iowait` but not the cumulative time accounting).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub per_cpu_time: Vec<PerCpuTimeStats>,
+    /// Per-node NUMA event counters captured from
+    /// `pglist_data->node_zones[]->vm_numa_event[]` (#66). One row
+    /// per NUMA node enumerated by the walker. Empty when the live
+    /// walker has not landed yet (the BTF offsets and wire shape
+    /// are wired; the reader is a follow-up).
+    ///
+    /// See [`PerNodeNumaStats`] for field semantics; see
+    /// [`Self::per_node_numa_unavailable`] for the "why empty"
+    /// diagnostic.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub per_node_numa: Vec<PerNodeNumaStats>,
+    /// Diagnostic reason for `per_node_numa` being empty.
+    /// `None` when the vec was populated normally (or the dump
+    /// path didn't run); `Some(REASON_NO_NUMA_WALKER)` until the
+    /// #66 follow-up walker lands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per_node_numa_unavailable: Option<String>,
     /// Per-task failure-dump enrichments — identity (pid, tgid,
     /// comm), process tree (group_leader, real_parent, pgid, sid,
     /// nr_threads), scheduling (prio family, sched_class name,
@@ -742,6 +817,8 @@ impl Default for FailureDumpReport {
             prog_runtime_stats: Vec::new(),
             prog_runtime_stats_unavailable: None,
             per_cpu_time: Vec::new(),
+            per_node_numa: Vec::new(),
+            per_node_numa_unavailable: None,
             task_enrichments: Vec::new(),
             task_enrichments_unavailable: None,
             event_counter_timeline: Vec::new(),
@@ -1563,6 +1640,10 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
         prog_runtime_stats,
         prog_runtime_stats_unavailable,
         per_cpu_time,
+        // #66 wire fields: empty Vec + the well-defined diagnostic
+        // string until the live walker (#66 follow-up) lands.
+        per_node_numa: Vec::new(),
+        per_node_numa_unavailable: Some(REASON_NO_NUMA_WALKER.to_string()),
         task_enrichments,
         task_enrichments_unavailable,
         event_counter_timeline,
@@ -2349,6 +2430,8 @@ mod tests {
             prog_runtime_stats: Vec::new(),
             prog_runtime_stats_unavailable: None,
             per_cpu_time: Vec::new(),
+            per_node_numa: Vec::new(),
+            per_node_numa_unavailable: None,
             task_enrichments: Vec::new(),
             task_enrichments_unavailable: None,
             event_counter_timeline: Vec::new(),
@@ -2417,6 +2500,8 @@ mod tests {
             prog_runtime_stats: Vec::new(),
             prog_runtime_stats_unavailable: None,
             per_cpu_time: Vec::new(),
+            per_node_numa: Vec::new(),
+            per_node_numa_unavailable: None,
             task_enrichments: Vec::new(),
             task_enrichments_unavailable: None,
             event_counter_timeline: Vec::new(),
@@ -2448,6 +2533,8 @@ mod tests {
             prog_runtime_stats: Vec::new(),
             prog_runtime_stats_unavailable: None,
             per_cpu_time: Vec::new(),
+            per_node_numa: Vec::new(),
+            per_node_numa_unavailable: None,
             task_enrichments: Vec::new(),
             task_enrichments_unavailable: None,
             event_counter_timeline: Vec::new(),
@@ -2551,6 +2638,8 @@ mod tests {
             prog_runtime_stats: Vec::new(),
             prog_runtime_stats_unavailable: None,
             per_cpu_time: Vec::new(),
+            per_node_numa: Vec::new(),
+            per_node_numa_unavailable: None,
             task_enrichments: Vec::new(),
             task_enrichments_unavailable: None,
             event_counter_timeline: Vec::new(),
@@ -2587,6 +2676,8 @@ mod tests {
             prog_runtime_stats: Vec::new(),
             prog_runtime_stats_unavailable: None,
             per_cpu_time: Vec::new(),
+            per_node_numa: Vec::new(),
+            per_node_numa_unavailable: None,
             task_enrichments: Vec::new(),
             task_enrichments_unavailable: None,
             event_counter_timeline: Vec::new(),
@@ -2613,6 +2704,8 @@ mod tests {
             prog_runtime_stats: Vec::new(),
             prog_runtime_stats_unavailable: None,
             per_cpu_time: Vec::new(),
+            per_node_numa: Vec::new(),
+            per_node_numa_unavailable: None,
             task_enrichments: Vec::new(),
             task_enrichments_unavailable: None,
             event_counter_timeline: Vec::new(),
@@ -2653,6 +2746,8 @@ mod tests {
             prog_runtime_stats: Vec::new(),
             prog_runtime_stats_unavailable: None,
             per_cpu_time: Vec::new(),
+            per_node_numa: Vec::new(),
+            per_node_numa_unavailable: None,
             task_enrichments: Vec::new(),
             task_enrichments_unavailable: None,
             event_counter_timeline: Vec::new(),
@@ -2710,6 +2805,8 @@ mod tests {
             prog_runtime_stats: Vec::new(),
             prog_runtime_stats_unavailable: None,
             per_cpu_time: Vec::new(),
+            per_node_numa: Vec::new(),
+            per_node_numa_unavailable: None,
             task_enrichments: Vec::new(),
             task_enrichments_unavailable: None,
             event_counter_timeline: Vec::new(),
@@ -2727,6 +2824,8 @@ mod tests {
             prog_runtime_stats: Vec::new(),
             prog_runtime_stats_unavailable: None,
             per_cpu_time: Vec::new(),
+            per_node_numa: Vec::new(),
+            per_node_numa_unavailable: None,
             task_enrichments: Vec::new(),
             task_enrichments_unavailable: None,
             event_counter_timeline: Vec::new(),
@@ -3062,6 +3161,8 @@ mod tests {
             ],
             prog_runtime_stats_unavailable: None,
             per_cpu_time: Vec::new(),
+            per_node_numa: Vec::new(),
+            per_node_numa_unavailable: None,
             task_enrichments: Vec::new(),
             task_enrichments_unavailable: None,
             event_counter_timeline: Vec::new(),
@@ -3127,6 +3228,8 @@ mod tests {
             ],
             prog_runtime_stats_unavailable: None,
             per_cpu_time: Vec::new(),
+            per_node_numa: Vec::new(),
+            per_node_numa_unavailable: None,
             task_enrichments: Vec::new(),
             task_enrichments_unavailable: None,
             event_counter_timeline: Vec::new(),
@@ -3171,6 +3274,8 @@ mod tests {
             }],
             prog_runtime_stats_unavailable: None,
             per_cpu_time: Vec::new(),
+            per_node_numa: Vec::new(),
+            per_node_numa_unavailable: None,
             task_enrichments: Vec::new(),
             task_enrichments_unavailable: None,
             event_counter_timeline: Vec::new(),
@@ -3363,6 +3468,8 @@ mod tests {
         assert!(report.prog_runtime_stats.is_empty());
         assert!(report.prog_runtime_stats_unavailable.is_none());
         assert!(report.per_cpu_time.is_empty());
+        assert!(report.per_node_numa.is_empty());
+        assert!(report.per_node_numa_unavailable.is_none());
         assert!(report.task_enrichments.is_empty());
         assert!(report.task_enrichments_unavailable.is_none());
         assert!(report.event_counter_timeline.is_empty());
@@ -3472,5 +3579,78 @@ mod tests {
             rendered, "map_type 42 not yet supported by failure dump",
             "unsupported-map-type string drifted from pin",
         );
+    }
+
+    // -- Per-node NUMA stats wire shape (#66) -------------------------
+    //
+    // The live walker is a follow-up; this section pins the wire
+    // contract so the schema is stable before the producer lands.
+    //
+    // Asserted properties:
+    //   - PerNodeNumaStats serde-roundtrips with all fields preserved
+    //   - empty per_node_numa skips serialization (skip_serializing_if)
+    //   - REASON_NO_NUMA_WALKER string is exactly pinned (wire-stable)
+    //   - the dump_state path emits per_node_numa_unavailable until
+    //     the walker lands, so a downstream consumer sees the
+    //     diagnostic even on dumps that complete every other capture
+
+    #[test]
+    fn per_node_numa_stats_serde_roundtrip() {
+        let s = PerNodeNumaStats {
+            node: 1,
+            numa_hit: 1_000_000,
+            numa_miss: 100,
+            numa_foreign: 50,
+            numa_interleave_hit: 200,
+            numa_local: 999_900,
+            numa_other: 100,
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        let parsed: PerNodeNumaStats = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.node, 1);
+        assert_eq!(parsed.numa_hit, 1_000_000);
+        assert_eq!(parsed.numa_miss, 100);
+        assert_eq!(parsed.numa_foreign, 50);
+        assert_eq!(parsed.numa_interleave_hit, 200);
+        assert_eq!(parsed.numa_local, 999_900);
+        assert_eq!(parsed.numa_other, 100);
+    }
+
+    #[test]
+    fn per_node_numa_empty_skips_serialization() {
+        let report = FailureDumpReport::default();
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(
+            !json.contains("per_node_numa"),
+            "empty per_node_numa must be skipped: {json}",
+        );
+    }
+
+    #[test]
+    fn per_node_numa_populated_lands_in_wire() {
+        let mut report = FailureDumpReport::default();
+        report.per_node_numa.push(PerNodeNumaStats {
+            node: 0,
+            numa_hit: 42,
+            ..Default::default()
+        });
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(
+            json.contains("\"per_node_numa\""),
+            "populated per_node_numa must appear on wire: {json}",
+        );
+        assert!(
+            json.contains("\"numa_hit\":42"),
+            "field value must round-trip: {json}",
+        );
+    }
+
+    #[test]
+    fn reason_no_numa_walker_string_pinned() {
+        // Wire-stable diagnostic — operators string-match this in
+        // failure-dump consumers. Drift would silently break that
+        // tooling. The constant is the single source of truth; this
+        // test pins it byte-for-byte.
+        assert_eq!(REASON_NO_NUMA_WALKER, "no NUMA walker (#66 follow-up)");
     }
 }

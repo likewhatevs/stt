@@ -38,6 +38,18 @@ CONFIG_BPF_EVENTS=y
 CONFIG_DEBUG_FS=y
 CONFIG_FUNCTION_TRACER=y
 CONFIG_DYNAMIC_FTRACE=y
+# Preempt-disabled duration capture (#64).
+# tp_btf/preempt_disable + preempt_enable handlers in probe.bpf.c
+# attach to the trace_preempt_off / trace_preempt_on tracepoints
+# defined in include/trace/events/preemptirq.h. These tracepoints
+# are emitted from kernel/trace/trace_preemptirq.c only when
+# CONFIG_TRACE_PREEMPT_TOGGLE is set; the option in turn depends
+# on PREEMPT_TRACER (Kconfig under kernel/trace/Kconfig).
+# Without these, the BPF program loads but the two tp_btf attaches
+# silently fail and per-CPU max_ns stays at 0 — graceful degradation
+# matching other optional tp_btf attaches in the probe.
+CONFIG_PREEMPT_TRACER=y
+CONFIG_TRACE_PREEMPT_TOGGLE=y
 
 # -- Boot/console (required) --
 # Init script mounts /proc (reads /proc/cmdline for SHM_BASE),

@@ -328,3 +328,6 @@ name = "compile_fail"
 
 [[test]]
 name = "jemalloc_probe_tests"
+
+[[test]]
+name = "live_host_pipeline_e2e"

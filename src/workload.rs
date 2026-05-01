@@ -2649,10 +2649,32 @@ impl WorkloadHandle {
         // SIGKILLs+reaps forked children, closes open pipe fds, and
         // munmaps the shared regions — so no leak on a mid-spawn
         // error path.
-        let futex_region_size = if matches!(config.work_type, WorkType::FanOutCompute { .. }) {
-            16
-        } else {
-            std::mem::size_of::<u32>()
+        // Sizing the per-group MAP_SHARED region:
+        //   - FanOutCompute needs 16 bytes (futex u32 @ 0, wake_ns
+        //     u64 @ 8).
+        //   - ProducerConsumerImbalance needs a ring buffer:
+        //     head u64 @ 0, tail u64 @ 8, producer-wake u32 @ 16,
+        //     consumer-wake u32 @ 20, then Q × u64 ring slots
+        //     starting at offset 24. Total bytes = 24 + Q*8.
+        //     queue_depth_target is u64 to match the variant, but
+        //     `as usize` truncation to a sub-page region would
+        //     silently produce a malformed queue — clamp the
+        //     conversion at usize::MAX/8 - 3 to keep the layout
+        //     well-defined. Realistic configs use Q in the
+        //     hundreds-to-thousands; the clamp only triggers on a
+        //     degenerate input that itself fails admission control
+        //     elsewhere (the queue is far larger than RAM).
+        //   - Everything else: u32 (4 bytes).
+        let futex_region_size = match config.work_type {
+            WorkType::FanOutCompute { .. } => 16,
+            WorkType::ProducerConsumerImbalance {
+                queue_depth_target,
+                ..
+            } => {
+                let q = std::cmp::min(queue_depth_target as usize, usize::MAX / 8 - 3);
+                24 + q * 8
+            }
+            _ => std::mem::size_of::<u32>(),
         };
         let mut guard = SpawnGuard::new(futex_region_size);
 
@@ -3638,6 +3660,13 @@ fn worker_main(
     //     doc/guide/src/architecture/workers.md).
     let mut page_fault_region: Option<(*mut libc::c_void, usize)> = None;
     let mut page_fault_rng_state: u64 = 0;
+    // One-shot guard for per-position policy overrides (AsymmetricWaker
+    // applies waker_class to pos == 0 / wakee_class to pos == 1; future
+    // variants like RtStarvation use the same flag). The override must
+    // run AFTER the WorkloadConfig-supplied `set_sched_policy` above so
+    // it's the last word on the worker's class, and ONCE so we don't
+    // hammer sched_setattr/sched_setscheduler every outer iteration.
+    let mut per_pos_policy_applied = false;
     // Benchmarking: per-wakeup latency samples (reservoir-sampled) and iteration counter.
     const MAX_WAKE_SAMPLES: usize = 100_000;
     let mut resume_latencies_ns: Vec<u64> = Vec::with_capacity(MAX_WAKE_SAMPLES);
@@ -4649,14 +4678,459 @@ fn worker_main(
                 last_iter_time = Instant::now();
                 iterations += 1;
             }
-            WorkType::PriorityInversion { .. }
-            | WorkType::ProducerConsumerImbalance { .. }
-            | WorkType::RtStarvation { .. }
-            | WorkType::AsymmetricWaker { .. }
-            | WorkType::NumaWorkingSetSweep { .. } => {
-                // Stub for the remaining variants — see batch 4-8.
-                // CpuSpin-equivalent body so tests that round-trip
-                // through the variant produce non-zero work_units.
+            WorkType::AsymmetricWaker {
+                waker_class,
+                wakee_class,
+                burst_iters,
+            } => {
+                // Paired waker/wakee in different scheduling classes.
+                // `worker_group_size = 2`, so pos ∈ {0, 1}: pos == 0
+                // is the waker, pos == 1 is the wakee. Each holds
+                // its own class for the entire run; transition
+                // happens once on the first iteration.
+                let (futex_ptr, pos) = match futex {
+                    Some(f) => f,
+                    None => break,
+                };
+                if !per_pos_policy_applied {
+                    let class = if pos == 0 { waker_class } else { wakee_class };
+                    // Soft-fail on EPERM (no CAP_SYS_NICE) — same
+                    // policy as the apply_nice / set_thread_affinity
+                    // sites in worker_main: log and continue with
+                    // the inherited class so the test reports
+                    // visible failure mode rather than crashing.
+                    let _ = set_sched_policy(0, class.to_policy());
+                    per_pos_policy_applied = true;
+                }
+                let atom = unsafe { &*(futex_ptr as *const std::sync::atomic::AtomicU32) };
+                if pos == 0 {
+                    // Waker: spin to build CPU runtime, then advance
+                    // the futex word and FUTEX_WAKE the wakee. The
+                    // wakee's resume_latencies_ns reservoir will
+                    // capture the wake-affine placement gap on its
+                    // side; the waker's reservoir is empty (no
+                    // blocking syscall on this side).
+                    spin_burst(&mut work_units, burst_iters);
+                    let next = atom.load(Ordering::Relaxed).wrapping_add(1);
+                    atom.store(next, Ordering::Relaxed);
+                    unsafe { futex_wake(futex_ptr, 1) };
+                } else {
+                    // Wakee: park on the futex word; advance to
+                    // user-space when the waker bumps it. Same
+                    // observe-then-record pattern as FutexFanOut's
+                    // receiver — `before_block` captures the full
+                    // wait→wake→reschedule round trip.
+                    let expected = atom.load(Ordering::Relaxed);
+                    let before_block = Instant::now();
+                    loop {
+                        if STOP.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let cur = atom.load(Ordering::Relaxed);
+                        if cur != expected {
+                            reservoir_push(
+                                &mut resume_latencies_ns,
+                                &mut wake_sample_count,
+                                before_block.elapsed().as_nanos() as u64,
+                                MAX_WAKE_SAMPLES,
+                            );
+                            break;
+                        }
+                        unsafe { futex_wait(futex_ptr, expected, &FUTEX_WAIT_TIMEOUT) };
+                    }
+                    // Wakee also burns CPU after wake to test
+                    // wake-affine placement under load — without
+                    // this the wakee re-parks immediately and the
+                    // scheduler never sees concurrent demand.
+                    spin_burst(&mut work_units, burst_iters);
+                }
+                last_iter_time = Instant::now();
+                iterations += 1;
+            }
+            WorkType::PriorityInversion {
+                high_count,
+                medium_count,
+                low_count,
+                hold_iters,
+                work_iters,
+                pi_mode,
+            } => {
+                // Three priority tiers contend on one shared futex
+                // word in the same group. `pos` selects tier:
+                //   pos < high_count → high (top RT prio)
+                //   pos < high_count + medium_count → medium (mid RT)
+                //   else → low (lowest RT prio)
+                // The classic inversion: `low` holds the lock,
+                // `medium` runs at higher prio and preempts `low`,
+                // `high` waits on the lock indefinitely.
+                //
+                // pi_mode:
+                //   Pi   → FUTEX_LOCK_PI (rt_mutex PI boost via
+                //          kernel/futex/pi.c — kernel boosts the
+                //          lock holder to the waiter's prio for
+                //          the duration of the hold, breaking the
+                //          inversion).
+                //   Plain → plain CAS + FUTEX_WAIT/WAKE — the
+                //           inversion goes uncorrected.
+                //
+                // RT priority assignment:
+                //   high   → 70  (top)
+                //   medium → 50  (middle, between high and low)
+                //   low    → 30  (bottom; still RT so it competes
+                //                  in the rt class but loses to
+                //                  medium under preemption)
+                // Picked inside 1..=99 so even a loaded host with
+                // an existing kernel-RT task at prio 99 (e.g.
+                // migration/N) sees three distinct tiers.
+                let (futex_ptr, pos) = match futex {
+                    Some(f) => f,
+                    None => break,
+                };
+                let high_end = high_count;
+                let medium_end = high_count + medium_count;
+                let total = high_count + medium_count + low_count;
+                if pos >= total {
+                    break;
+                }
+                let (tier_prio, is_low, is_medium) = if pos < high_end {
+                    (70u32, false, false)
+                } else if pos < medium_end {
+                    (50u32, false, true)
+                } else {
+                    (30u32, true, false)
+                };
+                if !per_pos_policy_applied {
+                    let _ = set_sched_policy(0, SchedPolicy::Fifo(tier_prio));
+                    per_pos_policy_applied = true;
+                }
+                let atom = unsafe { &*(futex_ptr as *const std::sync::atomic::AtomicU32) };
+                if is_medium {
+                    // Medium: pure CPU spin (no lock). Higher prio
+                    // than `low` so it preempts the lock holder.
+                    spin_burst(&mut work_units, work_iters);
+                } else {
+                    // High and low both contend on the lock.
+                    spin_burst(&mut work_units, work_iters);
+                    match pi_mode {
+                        PiMode::Pi => {
+                            // FUTEX_LOCK_PI: kernel handles the
+                            // CAS atomically, transfers ownership
+                            // via the futex word's TID encoding,
+                            // and applies PI boost on the holder.
+                            // Returns 0 on lock-acquired, -1 on
+                            // error or signal.
+                            let lock_rc = unsafe {
+                                libc::syscall(
+                                    libc::SYS_futex,
+                                    futex_ptr,
+                                    libc::FUTEX_LOCK_PI,
+                                    0u32, /* unused for LOCK_PI */
+                                    std::ptr::null::<libc::timespec>(),
+                                    std::ptr::null::<u32>(),
+                                    0u32,
+                                )
+                            };
+                            if lock_rc == 0 {
+                                spin_burst(&mut work_units, hold_iters);
+                                unsafe {
+                                    libc::syscall(
+                                        libc::SYS_futex,
+                                        futex_ptr,
+                                        libc::FUTEX_UNLOCK_PI,
+                                        0u32,
+                                        std::ptr::null::<libc::timespec>(),
+                                        std::ptr::null::<u32>(),
+                                        0u32,
+                                    );
+                                }
+                            }
+                        }
+                        PiMode::Plain => {
+                            // Plain spin-then-wait: try CAS 0→1,
+                            // FUTEX_WAIT on contention, hold
+                            // hold_iters of spin, store 0 + wake
+                            // on release. Same idiom as
+                            // MutexContention's body.
+                            loop {
+                                if STOP.load(Ordering::Relaxed) {
+                                    break;
+                                }
+                                if atom
+                                    .compare_exchange_weak(
+                                        0,
+                                        1,
+                                        Ordering::Acquire,
+                                        Ordering::Relaxed,
+                                    )
+                                    .is_ok()
+                                {
+                                    break;
+                                }
+                                let before_block = Instant::now();
+                                unsafe {
+                                    futex_wait(futex_ptr, 1u32, &FUTEX_WAIT_TIMEOUT);
+                                }
+                                reservoir_push(
+                                    &mut resume_latencies_ns,
+                                    &mut wake_sample_count,
+                                    before_block.elapsed().as_nanos() as u64,
+                                    MAX_WAKE_SAMPLES,
+                                );
+                            }
+                            // Hold critical section. `low` does
+                            // hold_iters of spin (the inversion
+                            // window); `high` does work_iters
+                            // (it just wants to acquire+release).
+                            let hold = if is_low { hold_iters } else { work_iters };
+                            spin_burst(&mut work_units, hold);
+                            atom.store(0, Ordering::Release);
+                            unsafe { futex_wake(futex_ptr, 1) };
+                        }
+                    }
+                }
+                last_iter_time = Instant::now();
+                iterations += 1;
+            }
+            WorkType::ProducerConsumerImbalance {
+                producers,
+                consumers,
+                produce_rate_hz,
+                consume_iters,
+                queue_depth_target,
+            } => {
+                // SPMC-ish ring queue in shared memory. Layout:
+                //   offset 0  : head (producer write idx, u64)
+                //   offset 8  : tail (consumer read idx, u64)
+                //   offset 16 : prod_wake (consumers' "queue drained" futex, u32)
+                //   offset 20 : cons_wake (producers' "items available" futex, u32)
+                //   offset 24 : ring[Q] of u64 slots
+                // pos < producers → producer; else consumer.
+                //
+                // Producer paces with nanosleep(1s/produce_rate_hz)
+                // between pushes. On full queue (head - tail == Q):
+                // FUTEX_WAIT on prod_wake (consumers wake it when
+                // tail advances). Producer tags items with
+                // monotonic counter — content opaque to the
+                // workload, only its sequencing matters.
+                //
+                // Consumer pops one item per loop: if head == tail,
+                // FUTEX_WAIT on cons_wake (producers wake it when
+                // head advances). Then spin consume_iters of CPU.
+                //
+                // Imbalance: when producers * rate > consumers * /
+                // (consume_iters work-time), the queue grows toward
+                // Q and producers eventually block — pressure-
+                // testing scheduler fairness under sustained
+                // backpressure (DSQ unbounded growth in scx).
+                //
+                // Atomic ordering: head/tail are accessed via
+                // AtomicU64::{load,store} with Acquire/Release.
+                // The Release on producer's head store pairs with
+                // the consumer's Acquire on head — once consumer
+                // observes head > tail, the slot write is visible.
+                let (futex_ptr, pos) = match futex {
+                    Some(f) => f,
+                    None => break,
+                };
+                let total = producers + consumers;
+                if pos >= total || queue_depth_target == 0 {
+                    break;
+                }
+                let q_target_usize =
+                    std::cmp::min(queue_depth_target as usize, usize::MAX / 8 - 3);
+                let q = q_target_usize as u64;
+                if q == 0 {
+                    break;
+                }
+                let base = futex_ptr as *mut u8;
+                let head_atom =
+                    unsafe { &*(base as *const std::sync::atomic::AtomicU64) };
+                let tail_atom = unsafe {
+                    &*(base.add(8) as *const std::sync::atomic::AtomicU64)
+                };
+                let prod_wake_ptr = unsafe { base.add(16) as *mut u32 };
+                let cons_wake_ptr = unsafe { base.add(20) as *mut u32 };
+                let ring_base = unsafe { base.add(24) as *mut u64 };
+                if pos < producers {
+                    // Producer.
+                    let mut next_seq: u64 = 0;
+                    let pace_ns: u64 = if produce_rate_hz == 0 {
+                        0
+                    } else {
+                        // Per-producer rate; total rate = producers
+                        // × produce_rate_hz. Avoid division by
+                        // zero with the gate above.
+                        1_000_000_000u64 / produce_rate_hz
+                    };
+                    while !STOP.load(Ordering::Relaxed) {
+                        // Block on full queue: FUTEX_WAIT on
+                        // prod_wake until tail advances. The inner
+                        // loop either sets slot_avail and breaks
+                        // with reservation or breaks via STOP — the
+                        // post-loop STOP check below short-circuits
+                        // before reading slot_avail in the latter
+                        // case.
+                        let mut slot_avail: u64 = 0;
+                        let mut got_slot = false;
+                        loop {
+                            if STOP.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            let head = head_atom.load(Ordering::Relaxed);
+                            let tail = tail_atom.load(Ordering::Acquire);
+                            if head.wrapping_sub(tail) < q {
+                                slot_avail = head;
+                                got_slot = true;
+                                break;
+                            }
+                            let prod_wake_atom = unsafe {
+                                &*(prod_wake_ptr as *const std::sync::atomic::AtomicU32)
+                            };
+                            let expected = prod_wake_atom.load(Ordering::Relaxed);
+                            let before_block = Instant::now();
+                            unsafe { futex_wait(prod_wake_ptr, expected, &FUTEX_WAIT_TIMEOUT) };
+                            reservoir_push(
+                                &mut resume_latencies_ns,
+                                &mut wake_sample_count,
+                                before_block.elapsed().as_nanos() as u64,
+                                MAX_WAKE_SAMPLES,
+                            );
+                        }
+                        if !got_slot || STOP.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        // Write slot at head % q. The Release on
+                        // head_atom.store() publishes both the slot
+                        // contents and the head advance to consumers.
+                        let slot_idx = (slot_avail % q) as usize;
+                        unsafe {
+                            std::ptr::write_volatile(ring_base.add(slot_idx), next_seq);
+                        }
+                        head_atom.store(slot_avail.wrapping_add(1), Ordering::Release);
+                        next_seq = next_seq.wrapping_add(1);
+                        // Wake one consumer (advance cons_wake counter).
+                        let cons_wake_atom = unsafe {
+                            &*(cons_wake_ptr as *const std::sync::atomic::AtomicU32)
+                        };
+                        let cur = cons_wake_atom.load(Ordering::Relaxed);
+                        cons_wake_atom.store(cur.wrapping_add(1), Ordering::Relaxed);
+                        unsafe { futex_wake(cons_wake_ptr, 1) };
+                        work_units = std::hint::black_box(work_units.wrapping_add(1));
+                        // Pace.
+                        if pace_ns > 0 {
+                            let ts = libc::timespec {
+                                tv_sec: (pace_ns / 1_000_000_000) as libc::time_t,
+                                tv_nsec: (pace_ns % 1_000_000_000) as libc::c_long,
+                            };
+                            unsafe {
+                                libc::nanosleep(&ts, std::ptr::null_mut());
+                            }
+                        }
+                        iterations += 1;
+                    }
+                } else {
+                    // Consumer.
+                    while !STOP.load(Ordering::Relaxed) {
+                        // Block on empty queue. Same init/got
+                        // pattern as the producer half so the
+                        // borrow checker can prove item_idx is
+                        // initialized when read.
+                        let mut item_idx: u64 = 0;
+                        let mut got_item = false;
+                        loop {
+                            if STOP.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            let tail = tail_atom.load(Ordering::Relaxed);
+                            let head = head_atom.load(Ordering::Acquire);
+                            if head != tail {
+                                item_idx = tail;
+                                got_item = true;
+                                break;
+                            }
+                            let cons_wake_atom = unsafe {
+                                &*(cons_wake_ptr as *const std::sync::atomic::AtomicU32)
+                            };
+                            let expected = cons_wake_atom.load(Ordering::Relaxed);
+                            let before_block = Instant::now();
+                            unsafe { futex_wait(cons_wake_ptr, expected, &FUTEX_WAIT_TIMEOUT) };
+                            reservoir_push(
+                                &mut resume_latencies_ns,
+                                &mut wake_sample_count,
+                                before_block.elapsed().as_nanos() as u64,
+                                MAX_WAKE_SAMPLES,
+                            );
+                        }
+                        if !got_item || STOP.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let slot_idx = (item_idx % q) as usize;
+                        let _val = unsafe { std::ptr::read_volatile(ring_base.add(slot_idx)) };
+                        // Advance tail with Release so producers
+                        // observing tail also see we've finished
+                        // reading the slot.
+                        tail_atom.store(item_idx.wrapping_add(1), Ordering::Release);
+                        // Wake a producer that may be blocked on full queue.
+                        let prod_wake_atom = unsafe {
+                            &*(prod_wake_ptr as *const std::sync::atomic::AtomicU32)
+                        };
+                        let cur = prod_wake_atom.load(Ordering::Relaxed);
+                        prod_wake_atom.store(cur.wrapping_add(1), Ordering::Relaxed);
+                        unsafe { futex_wake(prod_wake_ptr, 1) };
+                        // Burn consume_iters of CPU.
+                        spin_burst(&mut work_units, consume_iters);
+                        iterations += 1;
+                    }
+                }
+                last_iter_time = Instant::now();
+            }
+            WorkType::RtStarvation {
+                rt_workers,
+                cfs_workers: _,
+                rt_priority,
+                burst_iters,
+            } => {
+                // RT workers (pos < rt_workers) run as SCHED_FIFO
+                // at `rt_priority`; CFS workers (pos >= rt_workers)
+                // stay on SCHED_NORMAL. Both groups spin burst_iters
+                // per outer iteration. The pathology: SCHED_FIFO at
+                // any priority preempts SCHED_NORMAL until the kernel's
+                // RT throttling kicks in
+                // (`sched_rt_period_us`/`sched_rt_runtime_us`); under
+                // sched_ext switch-all, ext_sched_class loses to the
+                // RT class on the same CPU because dl_sched_class >
+                // rt_sched_class > ext_sched_class in the class
+                // hierarchy. There is no DL server protecting ext
+                // (in contrast to the DL server that throttles RT
+                // for fair tasks), so an ext-managed task starves
+                // until RT yields. This is the inversion.
+                //
+                // pos for cfs_workers is implicit (anything >=
+                // rt_workers is CFS); _ binds it without warning.
+                let (_, pos) = match futex {
+                    Some(f) => f,
+                    None => break,
+                };
+                if !per_pos_policy_applied {
+                    if pos < rt_workers {
+                        // Clamp at the syscall boundary: kernel
+                        // rejects priorities outside 1..=99 with
+                        // EINVAL, but we soft-clamp to a sane range
+                        // so a programmer typo doesn't kill the
+                        // worker.
+                        let prio = rt_priority.clamp(1, 99) as u32;
+                        let _ = set_sched_policy(0, SchedPolicy::Fifo(prio));
+                    } else {
+                        let _ = set_sched_policy(0, SchedPolicy::Normal);
+                    }
+                    per_pos_policy_applied = true;
+                }
+                spin_burst(&mut work_units, burst_iters);
+                last_iter_time = Instant::now();
+                iterations += 1;
+            }
+            WorkType::NumaWorkingSetSweep { .. } => {
+                // Stub — see batch 8.
                 spin_burst(&mut work_units, 1024);
                 iterations += 1;
             }
@@ -7843,6 +8317,25 @@ mod tests {
     fn worker_group_size_fan_out() {
         assert_eq!(WorkType::futex_fan_out(4, 100).worker_group_size(), Some(5));
         assert_eq!(WorkType::futex_fan_out(1, 100).worker_group_size(), Some(2));
+    }
+
+    #[test]
+    fn worker_group_size_wake_chain() {
+        // WakeChain group_size == depth (per-chain), independent
+        // of fanout. Spawn-side allocates `num_workers / depth =
+        // fanout` futex regions.
+        let wc = WorkType::wake_chain(8, 4, false, Duration::from_micros(100));
+        assert_eq!(wc.worker_group_size(), Some(8));
+        let wc1 = WorkType::wake_chain(3, 1, true, Duration::from_micros(50));
+        assert_eq!(wc1.worker_group_size(), Some(3));
+    }
+
+    #[test]
+    fn worker_group_size_thundering_herd() {
+        // ThunderingHerd collapses every worker into one group:
+        // `waiters + 1` (1 waker + N waiters).
+        let th = WorkType::thundering_herd(7, 1000, 5);
+        assert_eq!(th.worker_group_size(), Some(8));
     }
 
     #[test]

@@ -543,25 +543,46 @@ mod tests {
     fn project_sched_policy_hints_from_dump() {
         use crate::monitor::task_enrichment::TaskEnrichment;
 
+        // TaskEnrichment is non_exhaustive without Default; each
+        // fixture is built explicitly via a helper that highlights
+        // the fields under test.
+        fn make_task(
+            pid: i32,
+            sched_class: &str,
+            rt_priority: u32,
+            static_prio: i32,
+        ) -> TaskEnrichment {
+            TaskEnrichment {
+                pid,
+                tgid: 0,
+                comm: String::new(),
+                group_leader_pid: None,
+                real_parent_pid: None,
+                real_parent_comm: None,
+                pgid: None,
+                sid: None,
+                nr_threads: None,
+                weight: 0,
+                prio: 0,
+                static_prio,
+                normal_prio: 0,
+                rt_priority,
+                sched_class: Some(sched_class.to_string()),
+                core_cookie: None,
+                pi_boosted_out_of_scx: false,
+                nvcsw: 0,
+                nivcsw: 0,
+                signal_nvcsw: None,
+                signal_nivcsw: None,
+                lock_slowpath_match: None,
+            }
+        }
+
         let mut dump = FailureDumpReport::default();
         dump.task_enrichments = vec![
-            TaskEnrichment {
-                pid: 100,
-                sched_class: Some("rt_sched_class".into()),
-                rt_priority: 50,
-                ..Default::default()
-            },
-            TaskEnrichment {
-                pid: 101,
-                sched_class: Some("ext_sched_class".into()),
-                ..Default::default()
-            },
-            TaskEnrichment {
-                pid: 102,
-                sched_class: Some("fair_sched_class".into()),
-                static_prio: 120,
-                ..Default::default()
-            },
+            make_task(100, "rt_sched_class", 50, 0),
+            make_task(101, "ext_sched_class", 0, 0),
+            make_task(102, "fair_sched_class", 0, 120),
         ];
 
         let fp = project_fingerprint(&[], Some(&dump));

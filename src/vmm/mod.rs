@@ -3855,6 +3855,10 @@ impl KtstrVm {
                                         "dump prerequisites unavailable".to_string(),
                                     ),
                                     vcpu_perf_at_freeze: Vec::new(),
+                                    per_node_numa: Vec::new(),
+                                    per_node_numa_unavailable: Some(
+                                        "dump prerequisites unavailable".to_string(),
+                                    ),
                                 };
                                 tracing::warn!(
                                     owned_accessor = owned_accessor.is_some(),
