@@ -1691,7 +1691,7 @@ fn spawn_with_cgroup_sync(handles: CgroupSyncHandles) -> Result<libc::pid_t> {
                 "cgroup-sync notify pipe: no pid written by child within 5s. \
                  The child's pre_exec likely failed before Step 1 (possibly \
                  EBADF on `notify_write_fd` because the fd number was \
-                 recycled by stdlib's internal pipe2). MetricCheck the spawn \
+                 recycled by stdlib's internal pipe2). Check the spawn \
                  thread's error for the underlying cause."
             );
         }

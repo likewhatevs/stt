@@ -194,7 +194,7 @@ pub enum WorkType {
     /// no-op (`noop_fsync`), so the sleep provides the blocking behavior
     /// that real disk fsync would cause.
     IoSync,
-    /// WorkSpec hard for burst_ms, sleep for sleep_ms, repeat. Frees CPUs during sleep for borrowing.
+    /// Work hard for burst_ms, sleep for sleep_ms, repeat. Frees CPUs during sleep for borrowing.
     Bursty { burst_ms: u64, sleep_ms: u64 },
     /// CPU burst then 1-byte pipe exchange with a partner worker. Sleep
     /// duration depends on partner scheduling, exercising cross-CPU wake

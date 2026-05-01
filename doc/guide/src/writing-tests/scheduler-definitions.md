@@ -325,7 +325,7 @@ everyone constructs through the provided associated functions:
   payload. Used internally by the scheduler slot plumbing; test
   authors rarely call this directly.
 
-For richer binary payloads (custom default args, declared `Check`s,
+For richer binary payloads (custom default args, declared `MetricCheck`s,
 `MetricHint`s, `include_files`), use `#[derive(Payload)]` on a
 marker struct — the derive generates the matching `const` via the
 same non-exhaustive-preserving construction path. `tests/common/fixtures.rs`
