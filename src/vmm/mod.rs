@@ -32,6 +32,15 @@ pub(crate) mod virtio_blk;
 pub(crate) mod virtio_console;
 mod vmlinux;
 
+// Re-export `VirtioBlkCounters` for users who hold a [`VmResult`]:
+// `VmResult::virtio_blk_counters` exposes the device-side counter
+// Arc, and the type itself must be reachable from the public path
+// for a user to spell out `Arc<VirtioBlkCounters>` in their own
+// signatures. The defining module stays `pub(crate)` because the
+// device implementation is internal — this is the single public
+// surface for the counters type.
+pub use virtio_blk::VirtioBlkCounters;
+
 pub(crate) use exit_dispatch::{ExitAction, classify_exit, vcpu_run_loop_unified};
 pub(crate) use memory_budget::{MemoryBudget, initramfs_min_memory_mb, read_kernel_init_size};
 pub(crate) use pi_mutex::PiMutex;
@@ -933,6 +942,30 @@ pub struct VmResult {
     /// [`SidecarResult`](crate::test_support::SidecarResult) so stats
     /// tooling can flag cleanup regressions across runs.
     pub cleanup_duration: Option<Duration>,
+    /// Host-side virtio-blk device counters, sampled after the guest
+    /// has exited. `Some(_)` when the builder attached a disk via
+    /// [`KtstrVmBuilder::disk`]; `None` when no disk was configured
+    /// and [`KtstrVm::init_virtio_blk`] returned `None`. The Arc is
+    /// the same handle the device increments on the vCPU thread
+    /// during request processing — by the time `collect_results`
+    /// constructs the [`VmResult`] every vCPU has joined and no
+    /// further mutation occurs, so a single `.load(Ordering::Relaxed)`
+    /// per field on the consumer side observes the final cumulative
+    /// totals.
+    ///
+    /// Test code that wants to assert on disk activity reads the
+    /// fields through the public re-export at
+    /// [`crate::vmm::VirtioBlkCounters`]; see the type docs for the
+    /// counter semantics.
+    ///
+    /// `#[allow(dead_code)]` mirrors `stimulus_events` above: the
+    /// field is part of the public API surface and read by user
+    /// test code outside `lib.rs`, but the lib build doesn't see
+    /// any in-tree readers because no lib code path calls
+    /// `.virtio_blk_counters` on a `VmResult`. The in-tree readers
+    /// live in unit tests.
+    #[allow(dead_code)]
+    pub virtio_blk_counters: Option<Arc<VirtioBlkCounters>>,
 }
 
 impl VmResult {
@@ -972,6 +1005,7 @@ impl VmResult {
             kvm_stats: None,
             crash_message: None,
             cleanup_duration: None,
+            virtio_blk_counters: None,
         }
     }
 }
@@ -1048,6 +1082,14 @@ struct VmRunState {
     /// exit-code/crash-message extraction, and finally the BPF
     /// verifier-stat read inside [`KtstrVm::collect_results`].
     cleanup_start: Instant,
+    /// Cloned counter handle from [`KtstrVm::init_virtio_blk`] when a
+    /// disk was attached, captured before the device-arc is dropped so
+    /// [`KtstrVm::collect_results`] can plumb it onto
+    /// [`VmResult::virtio_blk_counters`]. The device increments these
+    /// counters on the vCPU thread during request processing; by the
+    /// time `collect_results` reads this field every vCPU thread has
+    /// joined, so the Arc holds the final cumulative totals.
+    virtio_blk_counters: Option<Arc<VirtioBlkCounters>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -4264,6 +4306,15 @@ impl KtstrVm {
         // bsp_done and return.
         freeze_coord_handle.thread().unpark();
 
+        // Capture the virtio-blk counter Arc before the device's
+        // outer `Arc<PiMutex<VirtioBlk>>` falls out of scope. The
+        // device's `counters()` accessor clones the inner
+        // `Arc<VirtioBlkCounters>`; this transfers a reader-side
+        // handle onto `VmRunState` so `collect_results` can attach
+        // it to `VmResult` without holding the device alive past
+        // its current ownership.
+        let virtio_blk_counters = virtio_blk.as_ref().map(|d| d.lock().counters());
+
         Ok(VmRunState {
             exit_code,
             timed_out,
@@ -4277,6 +4328,7 @@ impl KtstrVm {
             freeze,
             vm,
             cleanup_start,
+            virtio_blk_counters,
         })
     }
 
@@ -5082,6 +5134,7 @@ impl KtstrVm {
             kvm_stats: None,
             crash_message,
             cleanup_duration,
+            virtio_blk_counters: run.virtio_blk_counters,
         })
     }
 
@@ -6367,6 +6420,7 @@ mod tests {
             kvm_stats: None,
             crash_message: None,
             cleanup_duration: Some(Duration::from_millis(50)),
+            virtio_blk_counters: None,
         };
         assert!(r.success);
         assert_eq!(r.exit_code, 0);
@@ -6378,6 +6432,7 @@ mod tests {
         assert!(r.shm_data.is_none());
         assert!(r.stimulus_events.is_empty());
         assert_eq!(r.cleanup_duration, Some(Duration::from_millis(50)));
+        assert!(r.virtio_blk_counters.is_none());
         // Second construction covers the opposite polarity of
         // every boolean/numeric field so no field is silently
         // dropped by a future refactor that only exercises the
@@ -6396,12 +6451,31 @@ mod tests {
             kvm_stats: None,
             crash_message: None,
             cleanup_duration: None,
+            virtio_blk_counters: Some(Arc::new(VirtioBlkCounters::default())),
         };
         assert!(!r2.success);
         assert_eq!(r2.exit_code, 1);
         assert!(r2.timed_out);
         assert_eq!(r2.duration, Duration::from_millis(500));
         assert!(r2.cleanup_duration.is_none());
+        // Opposite polarity: counters present. Reads must observe
+        // the default-zero values; the Arc handle is the same one
+        // `init_virtio_blk` clones onto `VmRunState`, so test code
+        // that wants to assert on disk activity calls `.load()` on
+        // each counter through this field after the VM exits.
+        let counters = r2.virtio_blk_counters.as_ref().unwrap();
+        assert_eq!(
+            counters
+                .reads_completed
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+        );
+        assert_eq!(
+            counters
+                .writes_completed
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+        );
     }
 
     #[test]
@@ -6702,6 +6776,7 @@ mod tests {
             kvm_stats: None,
             crash_message: None,
             cleanup_duration: None,
+            virtio_blk_counters: None,
         };
         assert!(r.monitor.is_none());
         // Output and exit_code must still be accessible.
@@ -6741,6 +6816,7 @@ mod tests {
             kvm_stats: None,
             crash_message: None,
             cleanup_duration: None,
+            virtio_blk_counters: None,
         };
         let mon = r.monitor.as_ref().unwrap();
         assert_eq!(mon.summary.total_samples, 5);

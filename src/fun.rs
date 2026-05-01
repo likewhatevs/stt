@@ -1,11 +1,12 @@
-//! Fun mode — funify everything in a ktstr dump except recognised
-//! metrics, so an LLM can reason about the structural and relational
-//! shape of a failure dump without dragging real internal identifiers
-//! into its context. Strings and integers under non-metric keys are
-//! replaced with deterministic `adjective-animal` names or hashed
-//! numeric IDs; values under metric-allowlisted keys (counts, rates,
+//! Fun mode — context-hygiene for failure dumps. Funifies every
+//! non-metric value by default so LLM context stays clean: strings
+//! and integers under non-metric keys are replaced with
+//! deterministic `adjective-animal` names or hashed numeric IDs,
+//! while values under metric-allowlisted keys (counts, rates,
 //! ratios, byte/duration units, structural enums) pass through
-//! unchanged.
+//! unchanged. The result lets an LLM reason about the structural
+//! and relational shape of a dump without dragging real internal
+//! identifiers into its context.
 //!
 //! This is a CONTEXT-HYGIENE feature, not a security feature. Real
 //! pids, cpu ids, cgroup names, and process comms are not sensitive

@@ -812,87 +812,10 @@ fn scenario_disk_read_only_rejects_write(
     Ok(result)
 }
 
-/// After performing guest-side read+write IO against `/dev/vda`,
-/// assert that the IO completed without error. Pins the cumulative
-/// device counters at a guest-observable surface: every successful
-/// `pread`/`pwrite`/`fsync` against `/dev/vda` is paired with one
-/// `record_read` / `record_write` / `record_flush` increment in
-/// [`crate::vmm::virtio_blk::VirtioBlkCounters`] (see
-/// `src/vmm/virtio_blk.rs:437-451`).
-///
-/// The host-side counters are not currently surfaced through
-/// [`crate::vmm::VmResult`], so this scenario validates the
-/// counter increments indirectly — it performs a known number of
-/// reads and writes (1+1+1 = 3 ops) and asserts each operation
-/// completes successfully. A failed write or short read would
-/// imply the counters did not advance as expected; a successful
-/// IO necessarily exercised the `record_*` paths in the device.
-///
-/// Direct host-side counter introspection is gated on a follow-up
-/// (the team's `VmResult` lacks a `virtio_blk_counters` field
-/// today; routing the `Arc<VirtioBlkCounters>` from
-/// `init_virtio_blk` to `VmResult` is the next-step framework
-/// change). This scenario is the strongest assertion possible
-/// without that wiring.
-fn scenario_disk_counters_advance_on_io(
-    _ctx: &ktstr::scenario::Ctx,
-) -> Result<AssertResult> {
-    use std::fs::OpenOptions;
-    use std::io::{Read, Seek, SeekFrom, Write};
-
-    const SECTOR_SIZE: usize = 512;
-
-    let path = std::path::Path::new("/dev/vda");
-    let mut file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-        .map_err(|e| anyhow::anyhow!("open /dev/vda for IO: {e}"))?;
-
-    // One write op — exercises VirtioBlk::handle_write +
-    // VirtioBlkCounters::record_write.
-    let write_buf = [0xC3u8; SECTOR_SIZE];
-    file.seek(SeekFrom::Start(0))
-        .map_err(|e| anyhow::anyhow!("seek for write: {e}"))?;
-    file.write_all(&write_buf)
-        .map_err(|e| anyhow::anyhow!("write sector 0: {e}"))?;
-
-    // One flush op — exercises VirtioBlk::handle_flush +
-    // VirtioBlkCounters::record_flush.
-    file.sync_all()
-        .map_err(|e| anyhow::anyhow!("fsync /dev/vda: {e}"))?;
-
-    // One read op — exercises VirtioBlk::handle_read +
-    // VirtioBlkCounters::record_read.
-    let mut read_buf = [0u8; SECTOR_SIZE];
-    file.seek(SeekFrom::Start(0))
-        .map_err(|e| anyhow::anyhow!("seek for read: {e}"))?;
-    file.read_exact(&mut read_buf)
-        .map_err(|e| anyhow::anyhow!("read sector 0: {e}"))?;
-
-    if read_buf != write_buf {
-        anyhow::bail!(
-            "post-write read returned a different pattern than written \
-             (write byte=0x{:02X}, first read byte=0x{:02X}). Either the \
-             device dropped the write, the read short-circuited, or the \
-             counter-paired IO path is broken.",
-            write_buf[0],
-            read_buf[0],
-        );
-    }
-
-    let mut result = AssertResult::pass();
-    result.details.push(AssertDetail::new(
-        DetailKind::Other,
-        "1 write + 1 flush + 1 read completed cleanly against /dev/vda — \
-         host-side VirtioBlkCounters incremented record_write, \
-         record_flush, record_read once each (host-side counter \
-         introspection deferred until VmResult exposes the counter \
-         struct)"
-            .to_string(),
-    ));
-    Ok(result)
-}
+// Counter-introspection scenario lives in follow-up #168 — once
+// `VmResult` exposes `virtio_blk_counters`, a separate test will
+// assert host-side counter values directly. The three scenarios
+// above cover guest-visible behavior end-to-end.
 
 // ----------------------------------------------------------------------------
 // Entry registrations
@@ -1217,22 +1140,6 @@ static __KTSTR_ENTRY_DISK_READ_ONLY: ktstr::test_support::KtstrTestEntry =
         ..ktstr::test_support::KtstrTestEntry::DEFAULT
     };
 
-#[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::__private::linkme)]
-static __KTSTR_ENTRY_DISK_COUNTERS: ktstr::test_support::KtstrTestEntry =
-    ktstr::test_support::KtstrTestEntry {
-        name: "vm_integration_disk_counters_advance_on_io",
-        func: scenario_disk_counters_advance_on_io,
-        scheduler: &KTSTR_SCHED_PAYLOAD,
-        extra_sched_args: &[],
-        watchdog_timeout: std::time::Duration::from_secs(3),
-        duration: std::time::Duration::from_millis(500),
-        workers_per_cgroup: 1,
-        expect_err: false,
-        disk: Some(KTSTR_DISK_DEFAULT),
-        ..ktstr::test_support::KtstrTestEntry::DEFAULT
-    };
-
 /// Disk #1 — `/dev/vda` exists with the configured capacity.
 ///
 /// Boots scx-ktstr with a 256 MB raw virtio-blk disk attached; the
@@ -1287,20 +1194,3 @@ fn vm_integration_disk_read_only_rejects_write() {
     drive_ktstr_test("vm_integration_disk_read_only_rejects_write");
 }
 
-/// Disk #4 — counters advance on guest-side IO.
-///
-/// Performs 1 write + 1 flush + 1 read against `/dev/vda` and
-/// asserts each operation completes successfully. The host-side
-/// `VirtioBlkCounters` increment by exactly one `record_write`,
-/// one `record_flush`, and one `record_read` per the IO; direct
-/// host-side counter introspection awaits a `VmResult` extension
-/// (see test body comment).
-#[test]
-#[ignore = "VM integration test (~10s); requires KVM, ../linux, \
-            CONFIG_VIRTIO_BLK in guest kernel. Run via \
-            `cargo nextest run --run-ignored all` or \
-            `cargo ktstr test --kernel ../linux \
-            --filter vm_integration_disk_counters_advance_on_io`."]
-fn vm_integration_disk_counters_advance_on_io() {
-    drive_ktstr_test("vm_integration_disk_counters_advance_on_io");
-}

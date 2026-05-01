@@ -3,8 +3,9 @@
 //!
 //! Single request virtqueue. Advertised features: `VIRTIO_F_VERSION_1`,
 //! `VIRTIO_BLK_F_BLK_SIZE`, `VIRTIO_BLK_F_SEG_MAX`,
-//! `VIRTIO_BLK_F_SIZE_MAX`, `VIRTIO_BLK_F_FLUSH`, plus the optional
-//! `VIRTIO_BLK_F_RO` when the disk is configured read-only. MMIO
+//! `VIRTIO_BLK_F_SIZE_MAX`, `VIRTIO_BLK_F_FLUSH`,
+//! `VIRTIO_RING_F_EVENT_IDX`, plus the optional `VIRTIO_BLK_F_RO`
+//! when the disk is configured read-only. MMIO
 //! register layout per virtio-v1.2 §4.2.2; block-specific config
 //! space at offsets `0x100..` is served from a [`VirtioBlkConfig`]
 //! struct whose `repr(C, packed)` layout mirrors the kernel uapi
@@ -34,6 +35,42 @@
 //!   byte that's stale from prior blk-mq tag use as `BLK_STS_OK`
 //!   — silent data corruption for reads, silent dropped writes
 //!   for writes. See `publish_completion`.
+//!
+//! # Blocking-IO assumption
+//!
+//! Backend IO is synchronous on the vCPU thread:
+//! `handle_read_impl` / `handle_write_impl` call
+//! `FileExt::read_at` / `write_at` (`pread64` / `pwrite64`) and
+//! `handle_flush_impl` calls `File::sync_data` (`fdatasync`)
+//! inline from `process_requests`. The vCPU thread blocks until
+//! the syscall returns. There is no host worker thread, no
+//! io_uring, no async queue.
+//!
+//! This is acceptable when the backing is **fast** — tmpfs
+//! (the `tempfile()` default) or warm page cache — where pread /
+//! pwrite return in sub-microsecond time and fdatasync is a
+//! no-op (`noop_fsync`). The vCPU continues running guest code
+//! between requests with negligible interruption.
+//!
+//! It is **not** acceptable when the backing could block for
+//! milliseconds — cold page cache on a real spinning disk,
+//! contended file locks, fdatasync forcing real journal writes,
+//! a network-mounted backing file, etc. A blocked syscall on
+//! the vCPU thread delays SIGRTMIN delivery from the
+//! failure-dump freeze coordinator (the same constraint
+//! `TokenBucket` documents for the throttle path); the freeze
+//! rendezvous times out at 30 s and the failure dump arrives
+//! empty for any vCPU still stuck in IO.
+//!
+//! v0 commits to this tradeoff because the test fixture targets
+//! small backing files on tmpfs — every request returns in
+//! microseconds and SIGRTMIN delivery is never delayed in
+//! practice. Operators who point a virtio-blk disk at a slow
+//! backing accept the failure-dump-empties risk; the rule is
+//! "the backing must be fast." Moving IO to a worker thread
+//! would lift this constraint but is not implemented in v0;
+//! see also the per-request request-cap commentary in the
+//! validation pipeline.
 
 use std::fs::File;
 use std::os::unix::fs::FileExt;
@@ -52,6 +89,7 @@ use virtio_bindings::virtio_config::{
     VIRTIO_CONFIG_S_FEATURES_OK, VIRTIO_F_VERSION_1,
 };
 use virtio_bindings::virtio_ids::VIRTIO_ID_BLOCK;
+use virtio_bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 use virtio_bindings::virtio_mmio::{
     VIRTIO_MMIO_CONFIG_GENERATION, VIRTIO_MMIO_DEVICE_FEATURES, VIRTIO_MMIO_DEVICE_FEATURES_SEL,
     VIRTIO_MMIO_DEVICE_ID, VIRTIO_MMIO_DRIVER_FEATURES, VIRTIO_MMIO_DRIVER_FEATURES_SEL,
@@ -767,11 +805,27 @@ impl VirtioBlk {
         //   layer marks the disk read-only via `set_disk_ro` after
         //   F_RO negotiation; the device's defensive T_OUT
         //   rejection guards against uncovered write paths.
+        // VIRTIO_RING_F_EVENT_IDX (transport feature, bit 29): the
+        //   guest can place an "event index" in the avail ring's
+        //   `used_event` field telling the device "do not interrupt
+        //   me until used.idx reaches this value." `virtio_queue`
+        //   tracks that field internally — when this bit is
+        //   negotiated, `Queue::needs_notification` returns false
+        //   while the guest's threshold is not reached and the
+        //   device can suppress the irqfd write. Notification
+        //   suppression on bursty IO (multi-chain queue drains)
+        //   reduces vCPU exits proportional to the burst size and
+        //   is required for high-throughput virtio-blk under
+        //   blk-mq. Wire-up is split: this advertises the bit;
+        //   #161 wires `needs_notification` into the `signal_used`
+        //   call site so the device actually suppresses irqfd
+        //   writes when the guest's event index isn't reached.
         let mut feats = (1u64 << VIRTIO_F_VERSION_1)
             | (1u64 << VIRTIO_BLK_F_BLK_SIZE)
             | (1u64 << VIRTIO_BLK_F_SEG_MAX)
             | (1u64 << VIRTIO_BLK_F_SIZE_MAX)
-            | (1u64 << VIRTIO_BLK_F_FLUSH);
+            | (1u64 << VIRTIO_BLK_F_FLUSH)
+            | (1u64 << VIRTIO_RING_F_EVENT_IDX);
         if self.read_only {
             feats |= 1u64 << VIRTIO_BLK_F_RO;
         }
@@ -2158,6 +2212,22 @@ mod tests {
     }
 
     #[test]
+    fn advertised_features_include_event_idx() {
+        // VIRTIO_RING_F_EVENT_IDX is bit 29, in the low 32-bit half.
+        // The guest needs the bit set during feature negotiation so
+        // it populates `used_event` in the avail ring; without
+        // advertisement the device cannot suppress IRQs even when
+        // the corresponding wire-up lands.
+        let mut dev = make_device(VIRTIO_BLK_DEFAULT_CAPACITY_BYTES, DiskThrottle::default());
+        write_reg(&mut dev, VIRTIO_MMIO_DEVICE_FEATURES_SEL, 0);
+        let lo = read_reg(&dev, VIRTIO_MMIO_DEVICE_FEATURES);
+        write_reg(&mut dev, VIRTIO_MMIO_DEVICE_FEATURES_SEL, 1);
+        let hi = read_reg(&dev, VIRTIO_MMIO_DEVICE_FEATURES);
+        let features = (hi as u64) << 32 | lo as u64;
+        assert_ne!(features & (1u64 << VIRTIO_RING_F_EVENT_IDX), 0);
+    }
+
+    #[test]
     fn capacity_in_config_space() {
         // 256 MB / 512 = 524_288 sectors. The default capacity is
         // 256 MB (mkfs.btrfs minimum).
@@ -2875,6 +2945,30 @@ mod tests {
         let dev = VirtioBlk::with_options(f, cap, DiskThrottle::default(), true);
         let feats = dev.device_features();
         assert_ne!(feats & (1u64 << VIRTIO_BLK_F_RO), 0);
+    }
+
+    /// Pin VIRTIO_RING_F_EVENT_IDX (bit 29) in the advertised
+    /// feature set. The guest's blk-mq layer can then suppress
+    /// notifications by writing an event index into the avail
+    /// ring's `used_event` field; without this bit the guest never
+    /// sets the threshold and every used-ring advance triggers an
+    /// irqfd write. The actual suppression decision lives in
+    /// `Queue::needs_notification` — this test pins the
+    /// advertisement so a future feature-set edit can't silently
+    /// drop notification-suppression support.
+    #[test]
+    fn advertises_event_idx_feature_bit() {
+        let cap = 4096u64;
+        let f = make_backed_file_with_pattern(cap, 0x00);
+        let dev = VirtioBlk::new(f, cap, DiskThrottle::default());
+        let feats = dev.device_features();
+        assert_ne!(
+            feats & (1u64 << VIRTIO_RING_F_EVENT_IDX),
+            0,
+            "VIRTIO_RING_F_EVENT_IDX (bit 29) must be advertised so \
+             the guest can suppress unnecessary interrupts via the \
+             avail ring's used_event field",
+        );
     }
 
     #[test]
@@ -5496,4 +5590,622 @@ mod tests {
             "trailing 4 bytes are NUL padding",
         );
     }
+}
+
+// ----------------------------------------------------------------------------
+// proptest fuzz suite for process_requests.
+//
+// Property-driven coverage of the descriptor-chain parsing path: generate
+// arbitrary sequences of descriptors (random `addr`/`len`/`flags`/`next`)
+// and feed them through `process_requests` via `MockSplitQueue` +
+// QUEUE_NOTIFY. Mirrors the firecracker pattern of systematic chain
+// corruption: every randomly-generated chain element exercises a code
+// path the hand-curated tests don't reach.
+//
+// The harness asserts the device's hostile-input contract:
+//   1. No panic, OOB index, or unwrap-on-None — process_requests must
+//      handle every input without crashing the vCPU thread.
+//   2. Forward progress: for every chain that reaches `process_requests`,
+//      the device either advances `used.idx` (status published) OR
+//      bumps `io_errors` (chain dropped because no observable status
+//      descriptor exists). Silent stalls — used.idx unchanged AND
+//      no counter bump — would let a hostile guest pin the queue
+//      indefinitely.
+//   3. Counter monotonicity: counters never decrement.
+//
+// Counter assertions reference the same `VirtioBlkCounters` fields the
+// production failure-dump renderer reads, so a regression that adds a
+// new code path which neither bumps a counter nor advances used.idx
+// surfaces as a property violation.
+// ----------------------------------------------------------------------------
+#[cfg(test)]
+mod proptest_tests {
+    use super::{
+        ChainDescriptor, DiskThrottle, REQ_QUEUE, VIRTIO_BLK_OUTHDR_SIZE, VIRTIO_BLK_S_IOERR,
+        VIRTIO_BLK_S_OK, VIRTIO_BLK_S_UNSUPP, VIRTIO_MMIO_QUEUE_NOTIFY, VirtioBlk,
+        VirtioBlkOutHdr,
+    };
+    use proptest::prelude::*;
+    use std::os::unix::fs::FileExt;
+    use std::sync::atomic::Ordering;
+    use tempfile::tempfile;
+    use virtio_bindings::bindings::virtio_ring::{
+        VRING_DESC_F_INDIRECT, VRING_DESC_F_NEXT, VRING_DESC_F_WRITE,
+    };
+    use virtio_queue::desc::{RawDescriptor, split::Descriptor as SplitDescriptor};
+    use virtio_queue::mock::MockSplitQueue;
+    use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryMmap};
+
+    /// Shape of one random descriptor. `flags` is restricted to the three
+    /// bits the device cares about (NEXT, WRITE, INDIRECT); higher bits
+    /// would be silently masked by the `virtio-queue` parser anyway, so
+    /// generating them adds no coverage. `next` is a full `u16` because
+    /// out-of-range values are part of the test surface — the queue
+    /// iterator must stop without panicking when `next >= queue_size`.
+    #[derive(Debug, Clone, Copy)]
+    struct FuzzDesc {
+        addr: u64,
+        len: u32,
+        flags: u16,
+        next: u16,
+    }
+
+    /// Strategy for a single descriptor.
+    ///
+    /// `addr` ranges far beyond the 1 MiB guest-memory region so a
+    /// substantial fraction of generated descriptors point at unmapped
+    /// guest physical addresses — the device must reject those via
+    /// `mem.read_slice`/`write_slice` errors rather than panic.
+    /// Specifically we span `0..2^24` which covers the entire 1 MiB
+    /// region (in-range) plus 15 MiB beyond it (unmapped) — a roughly
+    /// 1:15 valid-to-invalid ratio that keeps both happy and sad paths
+    /// well-exercised.
+    ///
+    /// `len` ranges past `VIRTIO_BLK_SIZE_MAX = 1 MiB` so the SIZE_MAX
+    /// gate is exercised. The `0..=8 MiB` range generates enough
+    /// over-cap descriptors to randomly trip the gate without making
+    /// every chain trivially over-cap.
+    ///
+    /// `flags` is `0..8` (3 bits), giving every combination of
+    /// NEXT/WRITE/INDIRECT.
+    fn fuzz_desc_strategy() -> impl Strategy<Value = FuzzDesc> {
+        (
+            0u64..(1u64 << 24),
+            0u32..(8 * 1024 * 1024),
+            0u16..8,
+            any::<u16>(),
+        )
+            .prop_map(|(addr, len, flags, next)| FuzzDesc {
+                addr,
+                len,
+                flags,
+                next,
+            })
+    }
+
+    /// Strategy for a chain of 1..=200 descriptors. Includes an upper
+    /// bound on chain length matching the task's "1-200" requirement;
+    /// the lower bound of 1 ensures the avail ring always has at least
+    /// one chain head so `process_requests` always traverses at least
+    /// one iteration of its drain loop (the test's progress invariant
+    /// presumes drain occurred).
+    fn fuzz_chain_strategy() -> impl Strategy<Value = Vec<FuzzDesc>> {
+        prop::collection::vec(fuzz_desc_strategy(), 1..=200)
+    }
+
+    /// Build the device + 1 MiB guest memory + mock queue with a
+    /// 256-slot descriptor table (`QUEUE_MAX_SIZE`). 256 matches the
+    /// device's advertised maximum and is large enough to hold the
+    /// maximum proptest-generated chain (200 descriptors) with room to
+    /// spare for the rings.
+    fn build_fuzz_fixture() -> (VirtioBlk, GuestMemoryMmap) {
+        let cap = 4096u64;
+        let f = tempfile().expect("create tempfile for fuzz backing");
+        f.set_len(cap)
+            .expect("set tempfile length to fuzz cap");
+        // Write a sentinel pattern so `T_IN` reads see deterministic
+        // backing data; not load-bearing for the test invariants but
+        // useful when debugging counter-exemplar failures.
+        f.write_at(&[0xAB; 4096], 0).expect("seed backing pattern");
+        let dev = VirtioBlk::new(f, cap, DiskThrottle::default());
+        // 1 MiB guest memory at GPA 0 — same sizing as the
+        // hand-curated chain tests' `make_chain_test_mem`. Generated
+        // addresses span 0..2^24, so guest-mem-bound addresses
+        // resolve to in-range reads/writes while the rest hit the
+        // 16 MiB-wide invalid zone.
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 1 << 20)])
+            .expect("create proptest guest mem");
+        (dev, mem)
+    }
+
+    /// Drive the device through the full FSM up to DRIVER_OK with the
+    /// mock queue pinned. Mirrors `wire_device_to_mock` from the
+    /// hand-curated chain tests, but inlined here so the proptest
+    /// module is self-contained (no super-private helper imports).
+    fn wire_fuzz_device(dev: &mut VirtioBlk, mock: &MockSplitQueue<GuestMemoryMmap>) {
+        use super::{
+            QUEUE_MAX_SIZE, S_ACK, S_DRV, S_FEAT, S_OK, VIRTIO_MMIO_DRIVER_FEATURES,
+            VIRTIO_MMIO_DRIVER_FEATURES_SEL, VIRTIO_MMIO_QUEUE_AVAIL_HIGH,
+            VIRTIO_MMIO_QUEUE_AVAIL_LOW, VIRTIO_MMIO_QUEUE_DESC_HIGH, VIRTIO_MMIO_QUEUE_DESC_LOW,
+            VIRTIO_MMIO_QUEUE_NUM, VIRTIO_MMIO_QUEUE_READY, VIRTIO_MMIO_QUEUE_SEL,
+            VIRTIO_MMIO_QUEUE_USED_HIGH, VIRTIO_MMIO_QUEUE_USED_LOW, VIRTIO_MMIO_STATUS,
+        };
+        use virtio_bindings::virtio_config::VIRTIO_F_VERSION_1;
+        let write_reg = |dev: &mut VirtioBlk, offset: u32, val: u32| {
+            dev.mmio_write(offset as u64, &val.to_le_bytes());
+        };
+        write_reg(dev, VIRTIO_MMIO_STATUS, S_ACK);
+        write_reg(dev, VIRTIO_MMIO_STATUS, S_DRV);
+        write_reg(dev, VIRTIO_MMIO_DRIVER_FEATURES_SEL, 1);
+        write_reg(
+            dev,
+            VIRTIO_MMIO_DRIVER_FEATURES,
+            1 << (VIRTIO_F_VERSION_1 - 32),
+        );
+        write_reg(dev, VIRTIO_MMIO_STATUS, S_FEAT);
+        write_reg(dev, VIRTIO_MMIO_QUEUE_SEL, 0);
+        write_reg(dev, VIRTIO_MMIO_QUEUE_NUM, QUEUE_MAX_SIZE as u32);
+        let desc = mock.desc_table_addr().0;
+        let avail = mock.avail_addr().0;
+        let used = mock.used_addr().0;
+        write_reg(dev, VIRTIO_MMIO_QUEUE_DESC_LOW, desc as u32);
+        write_reg(dev, VIRTIO_MMIO_QUEUE_DESC_HIGH, (desc >> 32) as u32);
+        write_reg(dev, VIRTIO_MMIO_QUEUE_AVAIL_LOW, avail as u32);
+        write_reg(dev, VIRTIO_MMIO_QUEUE_AVAIL_HIGH, (avail >> 32) as u32);
+        write_reg(dev, VIRTIO_MMIO_QUEUE_USED_LOW, used as u32);
+        write_reg(dev, VIRTIO_MMIO_QUEUE_USED_HIGH, (used >> 32) as u32);
+        write_reg(dev, VIRTIO_MMIO_QUEUE_READY, 1);
+        write_reg(dev, VIRTIO_MMIO_STATUS, S_OK);
+    }
+
+    /// Read the used-ring `idx` field. Mirrors the inline
+    /// `read_obj(used_addr + 2)` pattern used by hand-curated tests;
+    /// extracted to a helper so the proptest assertions stay
+    /// declarative. `+ 2` skips the 2-byte `flags` field at the head
+    /// of the used ring (`virtq_used.flags`, `virtq_used.idx`).
+    fn read_used_idx(mem: &GuestMemoryMmap, mock: &MockSplitQueue<GuestMemoryMmap>) -> u16 {
+        mem.read_obj::<u16>(mock.used_addr().checked_add(2).unwrap())
+            .expect("read used.idx")
+    }
+
+    /// Snapshot of the counters used as a per-iteration progress
+    /// witness. Captures every counter the device mutates so the
+    /// "something happened" check stays exhaustive.
+    #[derive(Default, Clone, Copy)]
+    struct CounterSnapshot {
+        reads: u64,
+        writes: u64,
+        flushes: u64,
+        bytes_read: u64,
+        bytes_written: u64,
+        throttled: u64,
+        io_errors: u64,
+    }
+
+    fn snapshot_counters(dev: &VirtioBlk) -> CounterSnapshot {
+        let c = dev.counters();
+        CounterSnapshot {
+            reads: c.reads_completed.load(Ordering::Relaxed),
+            writes: c.writes_completed.load(Ordering::Relaxed),
+            flushes: c.flushes_completed.load(Ordering::Relaxed),
+            bytes_read: c.bytes_read.load(Ordering::Relaxed),
+            bytes_written: c.bytes_written.load(Ordering::Relaxed),
+            throttled: c.throttled_count.load(Ordering::Relaxed),
+            io_errors: c.io_errors.load(Ordering::Relaxed),
+        }
+    }
+
+    proptest! {
+        // Set a non-default cases count: 256 is more than the
+        // proptest default (256 already; explicit so a future
+        // PROPTEST_CASES env override is the only knob that changes
+        // behaviour). Disable shrinking timeout to catch slow
+        // pathological chains. `max_shrink_iters` capped at a
+        // moderate value because shrunken cases mostly help debug
+        // failures, not detect them.
+        #![proptest_config(ProptestConfig {
+            cases: 256,
+            max_shrink_iters: 1024,
+            .. ProptestConfig::default()
+        })]
+
+        /// Random descriptor chains via `add_desc_chains` MUST produce
+        /// forward progress: for every notify, at least one of
+        /// `used.idx` advance, `io_errors`, `reads_completed`,
+        /// `writes_completed`, `flushes_completed`, or
+        /// `throttled_count` must show movement. A chain that left
+        /// every counter and used.idx static would represent a silent
+        /// stall — the guest's blk-mq layer would time out at 30s
+        /// without the host having any visibility.
+        ///
+        /// Critically: this also pins panic-freeness. The proptest
+        /// runner catches panics; a panic in process_requests under
+        /// any input crashes the test with the offending shrunken
+        /// case.
+        #[test]
+        fn process_requests_progress_under_random_chains(
+            descs in fuzz_chain_strategy(),
+        ) {
+            let (mut dev, mem) = build_fuzz_fixture();
+            // Mock with 256 slots — exactly QUEUE_MAX_SIZE, larger
+            // than the 200-descriptor chain max.
+            let mock = MockSplitQueue::create(&mem, GuestAddress(0), 256);
+            dev.set_mem(mem.clone());
+            wire_fuzz_device(&mut dev, &mock);
+
+            // Convert FuzzDesc -> RawDescriptor.
+            let raw_descs: Vec<RawDescriptor> = descs
+                .iter()
+                .map(|d| {
+                    RawDescriptor::from(SplitDescriptor::new(
+                        d.addr,
+                        d.len,
+                        d.flags,
+                        d.next,
+                    ))
+                })
+                .collect();
+
+            // Prime the avail ring + descriptor table. Using
+            // add_desc_chains rather than build_desc_chain so the
+            // generated `next`/`flags` fields are preserved verbatim
+            // — `build_desc_chain` would auto-fix links and erase
+            // the test's mutation of those fields.
+            mock.add_desc_chains(&raw_descs, 0)
+                .expect("plant descriptors into avail ring");
+
+            let before_used = read_used_idx(&mem, &mock);
+            let before = snapshot_counters(&dev);
+
+            // Fire QUEUE_NOTIFY. process_requests is the system
+            // under test. A panic here would propagate up and fail
+            // the proptest, with shrinking pinpointing the minimal
+            // offending input. A hang (e.g. infinite chain loop)
+            // would surface as the test runner's wall-clock timeout.
+            dev.mmio_write(
+                VIRTIO_MMIO_QUEUE_NOTIFY as u64,
+                &(REQ_QUEUE as u32).to_le_bytes(),
+            );
+
+            let after_used = read_used_idx(&mem, &mock);
+            let after = snapshot_counters(&dev);
+
+            // Counter monotonicity: every counter only ever
+            // increases. A regression that subtracted from a counter
+            // (e.g. on rollback) would surface here regardless of
+            // whether progress overall happened. used.idx advances
+            // monotonically modulo wrap; with at most 200 chains and
+            // a 256-slot queue the wrap never triggers, so we can
+            // assert plain >=.
+            prop_assert!(after.reads >= before.reads);
+            prop_assert!(after.writes >= before.writes);
+            prop_assert!(after.flushes >= before.flushes);
+            prop_assert!(after.bytes_read >= before.bytes_read);
+            prop_assert!(after.bytes_written >= before.bytes_written);
+            prop_assert!(after.throttled >= before.throttled);
+            prop_assert!(after.io_errors >= before.io_errors);
+            prop_assert!(after_used >= before_used);
+
+            // Forward-progress invariant. With at least one
+            // descriptor in the avail ring (chain length >= 1
+            // guaranteed by fuzz_chain_strategy), process_requests
+            // ALWAYS reaches at least one of:
+            //   (a) `publish_completion` with a successful status
+            //       write → used.idx advances by >= 1
+            //   (b) the no-status-descriptor drop branch →
+            //       io_errors bumps without used.idx advancing
+            //   (c) a successful happy-path completion (read /
+            //       write / flush / throttle / unsupp), each of
+            //       which advances used.idx and bumps a counter
+            //
+            // The `progress` sum captures every visible side effect.
+            // A regression that introduced a fourth code path
+            // (silent drop with no counter and no used.idx advance)
+            // would fail this assertion — exactly the silent-stall
+            // class of bug the property is designed to catch.
+            let used_delta = (after_used - before_used) as u64;
+            let counter_delta = (after.reads - before.reads)
+                + (after.writes - before.writes)
+                + (after.flushes - before.flushes)
+                + (after.throttled - before.throttled)
+                + (after.io_errors - before.io_errors);
+            let progress = used_delta + counter_delta;
+            prop_assert!(
+                progress >= 1,
+                "no visible progress: used_delta={} counter_delta={} \
+                 (chain len={}, first_desc=({:#x},{},{:#x},{}))",
+                used_delta,
+                counter_delta,
+                descs.len(),
+                descs[0].addr,
+                descs[0].len,
+                descs[0].flags,
+                descs[0].next,
+            );
+        }
+
+        /// Random `addr` of the FIRST descriptor (treated as the
+        /// header) — fuzz the header read path. Plants a syntactically
+        /// minimal chain (header + status, header pointed at random
+        /// guest addresses including unmapped regions) and asserts
+        /// that the device either successfully decodes the header (if
+        /// the random bytes happen to deserialize cleanly into a
+        /// `VirtioBlkOutHdr`) OR rejects with S_IOERR. Either way the
+        /// chain must complete (used.idx advances by 1) since the
+        /// status descriptor is well-formed.
+        ///
+        /// This complements the broad chain-mutation property by
+        /// pinning a specific high-risk path: every byte read by
+        /// `mem.read_obj::<VirtioBlkOutHdr>(header_addr)` is
+        /// attacker-controlled; a parser bug (e.g. assuming a valid
+        /// req_type) would surface as a panic.
+        #[test]
+        fn random_header_addr_either_succeeds_or_ioerrs(
+            header_addr_low in 0u64..(1u64 << 24),
+        ) {
+            let (mut dev, mem) = build_fuzz_fixture();
+            let mock = MockSplitQueue::create(&mem, GuestAddress(0), 256);
+            dev.set_mem(mem.clone());
+            wire_fuzz_device(&mut dev, &mock);
+
+            // Status_addr at 0x6000 — well within the 1 MiB region
+            // and clear of the queue rings (which sit at GPA 0..a
+            // few KiB).
+            let status_addr = GuestAddress(0x6000);
+            // Pre-fill status with a sentinel so we can detect
+            // whether the device wrote a status byte. 0xEE is
+            // distinct from S_OK (0), S_IOERR (1), S_UNSUPP (2).
+            mem.write_slice(&[0xEEu8], status_addr).unwrap();
+
+            let descs = [
+                RawDescriptor::from(SplitDescriptor::new(
+                    header_addr_low,
+                    VIRTIO_BLK_OUTHDR_SIZE as u32,
+                    0, // device-readable, no NEXT — actually need NEXT
+                    1,
+                )),
+                RawDescriptor::from(SplitDescriptor::new(
+                    status_addr.0,
+                    1,
+                    VRING_DESC_F_WRITE as u16,
+                    0,
+                )),
+            ];
+            // Use build_desc_chain so the NEXT/next links are
+            // auto-set correctly — for this targeted test we want a
+            // valid chain shape with only the header_addr fuzzed.
+            mock.build_desc_chain(&descs).expect("build chain");
+            dev.mmio_write(
+                VIRTIO_MMIO_QUEUE_NOTIFY as u64,
+                &(REQ_QUEUE as u32).to_le_bytes(),
+            );
+
+            // Status byte must be one of the canonical virtio-blk
+            // status values OR remain the sentinel (the latter only
+            // if status_addr write failed — impossible here since
+            // status_addr = 0x6000 is in-range and writable).
+            let mut s = [0u8; 1];
+            mem.read_slice(&mut s, status_addr).unwrap();
+            prop_assert!(
+                s[0] == VIRTIO_BLK_S_OK as u8
+                    || s[0] == VIRTIO_BLK_S_IOERR as u8
+                    || s[0] == VIRTIO_BLK_S_UNSUPP as u8,
+                "status byte {:#x} is not a valid virtio-blk status",
+                s[0],
+            );
+
+            // used.idx advanced by exactly 1 — exactly one chain in
+            // the avail ring, the device produced exactly one
+            // completion. A chain-drop path (used.idx stays 0)
+            // would mean the device skipped the chain entirely;
+            // for this test shape that's impossible because
+            // status_addr is mapped.
+            let used_idx = read_used_idx(&mem, &mock);
+            prop_assert_eq!(
+                used_idx,
+                1,
+                "well-formed chain shape with random header_addr must \
+                 produce exactly one used-ring entry; got {}",
+                used_idx,
+            );
+        }
+
+        /// Random `len` on a single data descriptor — fuzz the
+        /// SIZE_MAX gate and downstream length-arithmetic paths.
+        /// Builds a valid header + 1 data segment + status chain
+        /// where the data segment's length is randomised across the
+        /// full u32 range (with bias toward the SIZE_MAX boundary).
+        /// Asserts the chain always completes with a defined status
+        /// byte and used.idx advances by 1.
+        ///
+        /// A regression that didn't cap data_len before computing
+        /// `data_len * something` would surface as an integer
+        /// overflow panic in debug builds; this property exercises
+        /// the boundary where SIZE_MAX (1 MiB) is exceeded.
+        #[test]
+        fn random_data_len_either_succeeds_or_ioerrs(
+            data_len in 0u32..(8u32 * 1024 * 1024),
+            req_type in 0u32..=8u32,
+        ) {
+            let (mut dev, mem) = build_fuzz_fixture();
+            let mock = MockSplitQueue::create(&mem, GuestAddress(0), 256);
+            dev.set_mem(mem.clone());
+            wire_fuzz_device(&mut dev, &mock);
+
+            let header_addr = GuestAddress(0x4000);
+            let data_addr = GuestAddress(0x5000);
+            let status_addr = GuestAddress(0x6000);
+
+            // Plant a header with the random req_type. ByteValued
+            // serialisation matches the wire format.
+            let hdr = VirtioBlkOutHdr {
+                type_: req_type,
+                _ioprio: 0,
+                sector: 0,
+            };
+            mem.write_obj(hdr, header_addr).expect("plant header");
+            // Pre-fill status with sentinel so an unwritten-status
+            // case is detectable.
+            mem.write_slice(&[0xEEu8], status_addr).unwrap();
+
+            // Use WRITE flag for data so T_IN succeeds for valid
+            // sector-aligned lengths within capacity. T_OUT requires
+            // device-readable (no WRITE flag); we cover both
+            // directions across the random req_type space.
+            let data_flags = if req_type == 1 /* T_OUT */ {
+                0
+            } else {
+                VRING_DESC_F_WRITE as u16
+            };
+            let descs = [
+                RawDescriptor::from(SplitDescriptor::new(
+                    header_addr.0,
+                    VIRTIO_BLK_OUTHDR_SIZE as u32,
+                    0,
+                    1,
+                )),
+                RawDescriptor::from(SplitDescriptor::new(
+                    data_addr.0,
+                    data_len,
+                    data_flags,
+                    2,
+                )),
+                RawDescriptor::from(SplitDescriptor::new(
+                    status_addr.0,
+                    1,
+                    VRING_DESC_F_WRITE as u16,
+                    0,
+                )),
+            ];
+            mock.build_desc_chain(&descs).expect("build chain");
+            dev.mmio_write(
+                VIRTIO_MMIO_QUEUE_NOTIFY as u64,
+                &(REQ_QUEUE as u32).to_le_bytes(),
+            );
+
+            let mut s = [0u8; 1];
+            mem.read_slice(&mut s, status_addr).unwrap();
+            prop_assert!(
+                s[0] == VIRTIO_BLK_S_OK as u8
+                    || s[0] == VIRTIO_BLK_S_IOERR as u8
+                    || s[0] == VIRTIO_BLK_S_UNSUPP as u8,
+                "status byte {:#x} is not a valid virtio-blk status",
+                s[0],
+            );
+
+            let used_idx = read_used_idx(&mem, &mock);
+            prop_assert_eq!(
+                used_idx,
+                1,
+                "fuzzed data_len chain must produce exactly one \
+                 used-ring entry; got {}",
+                used_idx,
+            );
+        }
+
+        /// Random `flags` on the data descriptor — fuzz the
+        /// direction-violation gate and the INDIRECT path. The
+        /// device must reject INDIRECT chains gracefully (the
+        /// `virtio-queue` parser switches to indirect-table mode
+        /// pointed at `addr`, which for this test is unmapped, so
+        /// `read_obj` fails and the iterator yields no descs →
+        /// chain dropped with io_errors). Direction-mismatch
+        /// flags are caught by the production direction gate.
+        ///
+        /// All paths must produce a defined status byte (S_OK,
+        /// S_IOERR, or S_UNSUPP) OR a chain drop (used.idx
+        /// unchanged + io_errors bumped). The combined invariant:
+        /// progress >= 1.
+        #[test]
+        fn random_flags_either_succeeds_or_ioerrs(
+            data_flags in 0u16..16,
+        ) {
+            let (mut dev, mem) = build_fuzz_fixture();
+            let mock = MockSplitQueue::create(&mem, GuestAddress(0), 256);
+            dev.set_mem(mem.clone());
+            wire_fuzz_device(&mut dev, &mock);
+
+            let header_addr = GuestAddress(0x4000);
+            let data_addr = GuestAddress(0x5000);
+            let status_addr = GuestAddress(0x6000);
+
+            // T_IN header, sector 0, valid 512-byte data length.
+            // The variable is the data segment's `flags`.
+            let hdr = VirtioBlkOutHdr {
+                type_: super::VIRTIO_BLK_T_IN,
+                _ioprio: 0,
+                sector: 0,
+            };
+            mem.write_obj(hdr, header_addr).expect("plant header");
+            mem.write_slice(&[0xEEu8], status_addr).unwrap();
+
+            let descs = [
+                RawDescriptor::from(SplitDescriptor::new(
+                    header_addr.0,
+                    VIRTIO_BLK_OUTHDR_SIZE as u32,
+                    VRING_DESC_F_NEXT as u16,
+                    1,
+                )),
+                RawDescriptor::from(SplitDescriptor::new(
+                    data_addr.0,
+                    512,
+                    data_flags | VRING_DESC_F_NEXT as u16,
+                    2,
+                )),
+                RawDescriptor::from(SplitDescriptor::new(
+                    status_addr.0,
+                    1,
+                    VRING_DESC_F_WRITE as u16,
+                    0,
+                )),
+            ];
+            // add_desc_chains preserves flags verbatim so we can
+            // observe the device's response to arbitrary flag bits
+            // on the data descriptor.
+            mock.add_desc_chains(&descs, 0).expect("plant descriptors");
+
+            let before_used = read_used_idx(&mem, &mock);
+            let before = snapshot_counters(&dev);
+            dev.mmio_write(
+                VIRTIO_MMIO_QUEUE_NOTIFY as u64,
+                &(REQ_QUEUE as u32).to_le_bytes(),
+            );
+            let after_used = read_used_idx(&mem, &mock);
+            let after = snapshot_counters(&dev);
+
+            let used_delta = (after_used - before_used) as u64;
+            let counter_delta = (after.reads - before.reads)
+                + (after.writes - before.writes)
+                + (after.flushes - before.flushes)
+                + (after.throttled - before.throttled)
+                + (after.io_errors - before.io_errors);
+            prop_assert!(
+                used_delta + counter_delta >= 1,
+                "no progress with data_flags={:#x}: \
+                 used_delta={} counter_delta={}",
+                data_flags,
+                used_delta,
+                counter_delta,
+            );
+        }
+    }
+
+    // Reference to ChainDescriptor to suppress dead-import warning
+    // when the type is only used via super:: re-export. ChainDescriptor
+    // is intentionally imported even though no proptest function
+    // names it, because the proptest harness may evolve to call
+    // `handle_*_impl` directly with synthesized ChainDescriptor
+    // slices (mirroring the existing handler-level tests). Keeping
+    // the import documents the intended extension surface.
+    #[allow(dead_code)]
+    fn _chain_descriptor_marker() -> Option<ChainDescriptor> {
+        None
+    }
+
+    // VRING_DESC_F_INDIRECT is referenced in doc comments above to
+    // motivate the random flags strategy; keeping it imported makes
+    // the import list a complete enumeration of the descriptor flags
+    // the device's parser inspects.
+    #[allow(dead_code)]
+    const _INDIRECT_FLAG_MARKER: u32 = VRING_DESC_F_INDIRECT;
 }

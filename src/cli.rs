@@ -2055,6 +2055,80 @@ pub fn parse_topology_string(topology: &str) -> Result<(u32, u32, u32, u32)> {
     Ok((numa_nodes, llcs, cores, threads))
 }
 
+/// Parse a human-readable size string (e.g. `"256mb"`, `"10gib"`, `"1gib"`)
+/// into a count of mebibytes (MiB), rounded down. Returns `Err` when the
+/// suffix is unrecognized, the numeric portion fails to parse, the value
+/// is not a positive integer multiple of one MiB, or the result exceeds
+/// `u32::MAX` MiB (the [`crate::vmm::disk_config::DiskConfig::capacity_mb`]
+/// capacity).
+///
+/// Accepted suffixes (case-insensitive): `b`, `kb`, `kib`, `mb`, `mib`,
+/// `gb`, `gib`. SI variants (`kb`/`mb`/`gb`) use 10^N; IEC variants
+/// (`kib`/`mib`/`gib`) use 2^N. The bare suffix-less form is rejected so
+/// units are never ambiguous.
+///
+/// The output unit is MiB to match
+/// [`crate::vmm::disk_config::DiskConfig::capacity_mb`] (despite the
+/// field name, [`DiskConfig::capacity_bytes`] left-shifts by 20 — i.e.
+/// the field is MiB, not SI MB). A future rename of that field would
+/// land in this function in lockstep.
+pub fn parse_disk_size_mib(s: &str) -> Result<u32> {
+    let lower = s.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        bail!("invalid disk size '{s}': empty");
+    }
+    let (num_str, suffix, unit_bytes): (&str, &str, u64) = if let Some(rest) =
+        lower.strip_suffix("gib")
+    {
+        (rest, "gib", 1u64 << 30)
+    } else if let Some(rest) = lower.strip_suffix("mib") {
+        (rest, "mib", 1u64 << 20)
+    } else if let Some(rest) = lower.strip_suffix("kib") {
+        (rest, "kib", 1u64 << 10)
+    } else if let Some(rest) = lower.strip_suffix("gb") {
+        (rest, "gb", 1_000_000_000u64)
+    } else if let Some(rest) = lower.strip_suffix("mb") {
+        (rest, "mb", 1_000_000u64)
+    } else if let Some(rest) = lower.strip_suffix("kb") {
+        (rest, "kb", 1_000u64)
+    } else if let Some(rest) = lower.strip_suffix('b') {
+        (rest, "b", 1u64)
+    } else {
+        bail!(
+            "invalid disk size '{s}': missing unit suffix. Use one of \
+             b, kb, kib, mb, mib, gb, gib (case-insensitive)."
+        );
+    };
+    let n = num_str.trim().parse::<u64>().map_err(|_| {
+        anyhow::anyhow!(
+            "invalid disk size '{s}': numeric portion '{num_str}' before \
+             '{suffix}' is not an unsigned integer"
+        )
+    })?;
+    let bytes = n.checked_mul(unit_bytes).ok_or_else(|| {
+        anyhow::anyhow!("invalid disk size '{s}': {n}{suffix} overflows u64")
+    })?;
+    if bytes == 0 {
+        bail!("invalid disk size '{s}': must be > 0");
+    }
+    let mib = 1u64 << 20;
+    if bytes % mib != 0 {
+        bail!(
+            "invalid disk size '{s}': {bytes} bytes is not a whole number \
+             of mebibytes (MiB). Round to a multiple of 1 MiB (= 1048576 \
+             bytes)."
+        );
+    }
+    let mib_count = bytes / mib;
+    if mib_count > u32::MAX as u64 {
+        bail!(
+            "invalid disk size '{s}': {mib_count} MiB exceeds u32::MAX \
+             (DiskConfig.capacity_mb is u32)"
+        );
+    }
+    Ok(mib_count as u32)
+}
+
 /// Check if a kernel .config contains CONFIG_SCHED_CLASS_EXT=y.
 pub fn has_sched_ext(kernel_dir: &std::path::Path) -> bool {
     let config = kernel_dir.join(".config");
@@ -6168,6 +6242,117 @@ mod tests {
             format!("{err:#}").contains(&format!("invalid llcs value: '{too_big}'")),
             "overflow must surface field + bad token: {err:#}",
         );
+    }
+
+    // -- parse_disk_size_mib --
+
+    /// IEC suffixes (`mib`, `gib`) round-trip to whole MiB counts. Pins
+    /// the binary-base interpretation of the IEC family.
+    #[test]
+    fn parse_disk_size_mib_iec_suffixes() {
+        assert_eq!(parse_disk_size_mib("256mib").unwrap(), 256);
+        assert_eq!(parse_disk_size_mib("1gib").unwrap(), 1024);
+        assert_eq!(parse_disk_size_mib("10GIB").unwrap(), 10 * 1024);
+        assert_eq!(parse_disk_size_mib("1024kib").unwrap(), 1);
+    }
+
+    /// SI `mb` parses 1 megabyte = 1_000_000 bytes; reject when not a
+    /// whole MiB, accept when it lines up. Pins the SI vs IEC split.
+    #[test]
+    fn parse_disk_size_mib_si_suffixes_must_align_to_mib() {
+        // 1 MB = 1_000_000 bytes; 1 MiB = 1_048_576 bytes; not aligned.
+        let err = parse_disk_size_mib("1mb").expect_err("1MB is not a whole MiB");
+        assert!(format!("{err:#}").contains("not a whole number"));
+
+        // 1 GB = 1_000_000_000 bytes; 1 GB / 1 MiB = 953.6740... — also
+        // not aligned. Reject.
+        let err2 = parse_disk_size_mib("1gb").expect_err("1GB is not a whole MiB");
+        assert!(format!("{err2:#}").contains("not a whole number"));
+
+        // 1 KB * 1024 = 1_024_000 bytes — also not aligned to 1 MiB.
+        let err3 = parse_disk_size_mib("1024kb").expect_err("1024KB != 1 MiB");
+        assert!(format!("{err3:#}").contains("not a whole number"));
+    }
+
+    /// Bare `b` with a value that aligns to a MiB succeeds; a value
+    /// off-by-one fails. Pins the byte-suffix path.
+    #[test]
+    fn parse_disk_size_mib_byte_suffix() {
+        assert_eq!(parse_disk_size_mib("1048576b").unwrap(), 1);
+        let err = parse_disk_size_mib("1048575b").expect_err("off-by-one byte must fail");
+        assert!(format!("{err:#}").contains("not a whole number"));
+    }
+
+    /// Whitespace + mixed case in the input are tolerated by trim +
+    /// to_lowercase.
+    #[test]
+    fn parse_disk_size_mib_normalizes_input() {
+        assert_eq!(parse_disk_size_mib("  256MiB  ").unwrap(), 256);
+        assert_eq!(parse_disk_size_mib("1GiB").unwrap(), 1024);
+    }
+
+    /// Missing suffix is rejected with a unit-list diagnostic so the
+    /// user sees what's accepted.
+    #[test]
+    fn parse_disk_size_mib_rejects_missing_suffix() {
+        let err = parse_disk_size_mib("256").expect_err("bare integer must fail");
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("missing unit suffix"));
+        assert!(rendered.contains("kb"));
+        assert!(rendered.contains("mib"));
+    }
+
+    /// Empty / whitespace-only input is rejected up front.
+    #[test]
+    fn parse_disk_size_mib_rejects_empty() {
+        assert!(parse_disk_size_mib("").is_err());
+        assert!(parse_disk_size_mib("   ").is_err());
+    }
+
+    /// Zero is rejected — a 0-byte disk is a configuration footgun
+    /// (every IO IOERRs per `DiskConfig::with_options`).
+    #[test]
+    fn parse_disk_size_mib_rejects_zero() {
+        let err = parse_disk_size_mib("0mib").expect_err("zero must fail");
+        assert!(format!("{err:#}").contains("must be > 0"));
+    }
+
+    /// Non-numeric prefix is rejected.
+    #[test]
+    fn parse_disk_size_mib_rejects_garbage_number() {
+        assert!(parse_disk_size_mib("abcmib").is_err());
+        assert!(parse_disk_size_mib("-5mib").is_err());
+        assert!(parse_disk_size_mib("3.5mib").is_err());
+    }
+
+    /// Unknown suffix is rejected.
+    #[test]
+    fn parse_disk_size_mib_rejects_unknown_suffix() {
+        let err = parse_disk_size_mib("1tb").expect_err("tb is not currently accepted");
+        let rendered = format!("{err:#}");
+        // Last matching strip_suffix is "b", which leaves "1t" as the
+        // numeric portion and surfaces the parse error there.
+        assert!(rendered.contains("invalid disk size '1tb'"));
+    }
+
+    /// A value that overflows u32::MAX MiB is rejected (capacity_mb is u32).
+    #[test]
+    fn parse_disk_size_mib_rejects_u32_overflow() {
+        // (u32::MAX + 1) MiB
+        let too_big_mib = (u32::MAX as u64) + 1;
+        let input = format!("{too_big_mib}mib");
+        let err = parse_disk_size_mib(&input).expect_err("> u32::MAX MiB must fail");
+        assert!(format!("{err:#}").contains("exceeds u32::MAX"));
+    }
+
+    /// A value whose byte product overflows u64 is rejected before
+    /// the MiB conversion runs.
+    #[test]
+    fn parse_disk_size_mib_rejects_u64_overflow() {
+        // u64::MAX gib is way past u64::MAX bytes.
+        let input = format!("{}gib", u64::MAX);
+        let err = parse_disk_size_mib(&input).expect_err("u64 overflow must fail");
+        assert!(format!("{err:#}").contains("overflows u64"));
     }
 
     // -- show_host smoke --

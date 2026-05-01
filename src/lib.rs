@@ -993,6 +993,13 @@ pub(crate) fn resolve_current_exe() -> anyhow::Result<std::path::PathBuf> {
 ///   include in the guest.
 /// `memory_mb`: explicit guest memory override in MB. When `None`,
 ///   memory is computed from actual initramfs size after build.
+/// `disk`: optional virtio-blk device backing for `/dev/vda`. When
+///   `Some`, the framework calls
+///   [`vmm::KtstrVm::builder`]'s `.disk(..)` so the guest probes a
+///   raw block device sized per `disk.capacity_mb`. The guest cmdline
+///   gains `KTSTR_DISK=<MiB>` so a future auto-mount path in
+///   `vmm::rust_init` can detect the attached disk without re-reading
+///   the device tree.
 #[allow(clippy::too_many_arguments)]
 pub fn run_shell(
     kernel: std::path::PathBuf,
@@ -1004,6 +1011,7 @@ pub fn run_shell(
     memory_mb: Option<u32>,
     dmesg: bool,
     exec: Option<&str>,
+    disk: Option<vmm::disk_config::DiskConfig>,
 ) -> anyhow::Result<()> {
     let payload = resolve_current_exe()?;
 
@@ -1013,6 +1021,16 @@ pub fn run_shell(
         .collect();
 
     let mut cmdline = format!("KTSTR_MODE=shell KTSTR_TOPO={numa_nodes},{llcs},{cores},{threads}");
+    if let Some(ref d) = disk {
+        // Surface the attached disk's MiB count to the guest so a
+        // future auto-mount path in vmm::rust_init can locate the
+        // virtio-blk device without re-walking sysfs / device tree.
+        // The MiB count is a stable identifier today (single-disk
+        // limit per `init_virtio_blk`'s framework reservation of one
+        // MMIO + IRQ pair) and acts as a sentinel ("disk attached")
+        // for absent (== no-disk).
+        cmdline.push_str(&format!(" KTSTR_DISK={}", d.capacity_mb));
+    }
     if dmesg {
         cmdline.push_str(" loglevel=7");
     }
@@ -1055,6 +1073,10 @@ pub fn run_shell(
 
     if let Some(cmd) = exec {
         builder = builder.exec_cmd(cmd.to_string());
+    }
+
+    if let Some(d) = disk {
+        builder = builder.disk(d);
     }
 
     builder = match memory_mb {

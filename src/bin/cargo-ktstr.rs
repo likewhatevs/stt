@@ -213,21 +213,71 @@ enum KtstrCommand {
     /// identifiers into its context. The transformation is
     /// one-way: there is no reverse-mapping file by design.
     ///
-    /// `swift-otter` is just `swift-otter` — fun, terse, and
-    /// recognizable as a placeholder. Two values that share the
-    /// same key AND the same payload (across the same dump) get
-    /// the same fun name so cross-references inside the dump
-    /// survive.
+    /// Since v2 the walker funifies BY DEFAULT — every value
+    /// whose containing key is NOT a recognised metric gets
+    /// replaced. Two values that share the same key AND the
+    /// same payload get the same fun name so cross-references
+    /// inside the dump survive (e.g. "swift-otter migrated
+    /// from CPU 3 to CPU 7" stays consistent).
     ///
+    /// Example. Input:
+    ///
+    ///   {"comm": "scx_simple", "pid": 1234, "nr_running": 7}
+    ///
+    /// Output (with `--seed demo`):
+    ///
+    ///   {"comm": "swift-otter", "pid": 8231..., "nr_running": 7}
+    ///
+    /// `nr_running` is on the metric allowlist so 7 passes
+    /// through; `comm` and `pid` are not, so they get funified.
+    ///
+    /// Metric allowlist categories (key passes through):
+    ///   - structural enums: schema, version, type, kind, status,
+    ///     state, result, verdict, outcome, phase, policy
+    ///   - position / lifecycle: size, len, length, depth, index,
+    ///     idx, level, tier, rank, slot, capacity, epoch,
+    ///     generation
+    ///   - top-level counts: nr_running, nr_queued, nr_failed,
+    ///     nr_switches, runqueue_depth
+    ///   - count suffixes: *_count, *_total, *_completed,
+    ///     *_dropped, *_failed, *_skipped, *_throttled
+    ///   - rates / ratios: *_per_sec, *_per_ms, *_rate, *_hz,
+    ///     *_ratio, *_fraction, *_pct, *_percent
+    ///   - units: *_ns, *_us, *_ms, *_sec, *_seconds, *_bytes,
+    ///     *_kb, *_mb, *_gb, *_pages
+    ///   - statistics: *_min, *_max, *_mean, *_avg, *_stddev,
+    ///     *_p50, *_p90, *_p95, *_p99
+    ///   - I/O counters: bytes_read, bytes_written, io_errors,
+    ///     *_read, *_written, *_errors
+    ///   - scheduling: priority, nice, weight, prio, static_prio,
+    ///     normal_prio, nvcsw, nivcsw, signal_nvcsw,
+    ///     signal_nivcsw, nr_threads
+    ///   - per-rq SCX state: flags, ops_qseq, kick_sync, nr_immed,
+    ///     rq_clock
+    ///   - DSQ state: nr, seq
+    ///   - NUMA event counters: numa_hit, numa_miss, numa_foreign,
+    ///     numa_interleave_hit, numa_local, numa_other
+    ///   - SCX exit-info events: select_cpu_fallback,
+    ///     dispatch_local_dsq_offline, dispatch_keep_last,
+    ///     enq_skip_exiting, enq_skip_migration_disabled,
+    ///     reenq_immed, reenq_local_repeat, refill_slice_dfl,
+    ///     bypass_duration, bypass_dispatch, bypass_activate,
+    ///     insert_not_owned, sub_bypass_dispatch
+    ///   - BPF prog runtime: cnt, nsecs, misses, verified_insns
+    ///   - hardware perf: cycles, instructions, cache_misses,
+    ///     branch_misses
+    ///   - additional structural-enum / position suffixes:
+    ///     *_kind, *_type, *_state, *_status, *_phase,
+    ///     *_verdict, *_outcome, *_version, *_capacity, *_size,
+    ///     *_depth, *_len, *_length, *_weight, *_nice,
+    ///     *_priority, *_index, *_idx, *_offset, *_generation,
+    ///     *_epoch
+    ///
+    /// Floats always pass through. Sentinel u64 values 0 and
+    /// u64::MAX preserve their kthread / "no value" semantics.
     /// Reads JSON from `input` (or stdin when no path is given)
-    /// and writes the funified JSON to stdout. The walker
-    /// funifies every value by default and passes through only
-    /// the values whose containing key is a recognised metric
-    /// per
-    /// [`Funifier::is_metric_passthrough`](ktstr::fun::Funifier::is_metric_passthrough)
-    /// — counts / rates / ratios / byte-and-duration units /
-    /// structural enums. Non-JSON input fails fast with the
-    /// serde_json parse error.
+    /// and writes the funified JSON to stdout. Non-JSON input
+    /// fails fast with the serde_json parse error.
     ///
     /// Visible alias `costume` matches the costume-party theme.
     #[command(visible_alias = "costume")]
@@ -420,6 +470,15 @@ enum KtstrCommand {
         /// full contract.
         #[arg(long, requires = "no_perf_mode", help = ktstr::cli::CPU_CAP_HELP)]
         cpu_cap: Option<usize>,
+
+        /// Attach a raw virtio-blk disk to `/dev/vda`. Accepts a
+        /// human-readable size with a unit suffix (case-insensitive):
+        /// `b`, `kb`, `kib`, `mb`, `mib`, `gb`, `gib`. SI variants
+        /// (`kb`/`mb`/`gb`) use 10^N; IEC variants (`kib`/`mib`/`gib`)
+        /// use 2^N. The size must be a positive whole number of MiB
+        /// (e.g. `256mib`, `1gib`). Omit to boot without a disk.
+        #[arg(long)]
+        disk: Option<String>,
     },
 }
 
@@ -3048,6 +3107,7 @@ fn run_shell(
     exec: Option<String>,
     no_perf_mode: bool,
     cpu_cap: Option<usize>,
+    disk: Option<String>,
 ) -> Result<(), String> {
     if no_perf_mode {
         // SAFETY: single-threaded at this point — no concurrent env readers.
@@ -3071,6 +3131,21 @@ fn run_shell(
         // SAFETY: single-threaded at this point — no concurrent env readers.
         unsafe { std::env::set_var("KTSTR_CPU_CAP", cap.to_string()) };
     }
+    // Parse the human-readable disk size into a DiskConfig before the
+    // KVM probe so a bad string surfaces at CLI-argument time, not
+    // mid-VM-setup. Default-everything except `capacity_mb` so the
+    // shell flow lines up with `DiskConfig::default()` for the
+    // remaining knobs (raw fs, no throttle, read-write).
+    let disk_cfg = match disk.as_deref() {
+        Some(s) => {
+            let mib = cli::parse_disk_size_mib(s).map_err(|e| format!("{e:#}"))?;
+            Some(ktstr::prelude::DiskConfig {
+                capacity_mb: mib,
+                ..ktstr::prelude::DiskConfig::default()
+            })
+        }
+        None => None,
+    };
     cli::check_kvm().map_err(|e| format!("{e:#}"))?;
     let kernel_path = resolve_kernel_image(kernel.as_deref())?;
 
@@ -3095,6 +3170,7 @@ fn run_shell(
         memory_mb,
         dmesg,
         exec.as_deref(),
+        disk_cfg,
     )
     .map_err(|e| format!("{e:#}"))
 }
@@ -3774,6 +3850,7 @@ fn main() {
             exec,
             no_perf_mode,
             cpu_cap,
+            disk,
         } => run_shell(
             kernel,
             topology,
@@ -3783,6 +3860,7 @@ fn main() {
             exec,
             no_perf_mode,
             cpu_cap,
+            disk,
         ),
     };
 
@@ -4180,6 +4258,41 @@ mod tests {
         match k.command {
             KtstrCommand::Shell { include_files, .. } => {
                 assert_eq!(include_files.len(), 2);
+            }
+            _ => panic!("expected Shell"),
+        }
+    }
+
+    /// `cargo ktstr shell --disk 256mib` parses; the disk arg lands as
+    /// `Some("256mib")` on the `Shell` variant. The string is parsed
+    /// into a `DiskConfig` later in `run_shell` via
+    /// [`ktstr::cli::parse_disk_size_mib`]; the clap stage stores the
+    /// raw string so a malformed input surfaces with the consistent
+    /// disk-size diagnostic instead of a generic clap parse error.
+    #[test]
+    fn parse_shell_disk_arg() {
+        let Cargo {
+            command: CargoSub::Ktstr(k),
+        } = Cargo::try_parse_from(["cargo", "ktstr", "shell", "--disk", "256mib"])
+            .unwrap_or_else(|e| panic!("{e}"));
+        match k.command {
+            KtstrCommand::Shell { disk, .. } => {
+                assert_eq!(disk.as_deref(), Some("256mib"));
+            }
+            _ => panic!("expected Shell"),
+        }
+    }
+
+    /// Omitting `--disk` produces `None`, matching the no-disk default
+    /// in `run_shell` and `KtstrVm::builder`.
+    #[test]
+    fn parse_shell_disk_arg_omitted() {
+        let Cargo {
+            command: CargoSub::Ktstr(k),
+        } = Cargo::try_parse_from(["cargo", "ktstr", "shell"]).unwrap_or_else(|e| panic!("{e}"));
+        match k.command {
+            KtstrCommand::Shell { disk, .. } => {
+                assert!(disk.is_none(), "no --disk must produce None");
             }
             _ => panic!("expected Shell"),
         }

@@ -76,6 +76,15 @@ enum Command {
         /// full contract.
         #[arg(long, requires = "no_perf_mode", help = ktstr::cli::CPU_CAP_HELP)]
         cpu_cap: Option<usize>,
+
+        /// Attach a raw virtio-blk disk to `/dev/vda`. Accepts a
+        /// human-readable size with a unit suffix (case-insensitive):
+        /// `b`, `kb`, `kib`, `mb`, `mib`, `gb`, `gib`. SI variants
+        /// (`kb`/`mb`/`gb`) use 10^N; IEC variants (`kib`/`mib`/`gib`)
+        /// use 2^N. The size must be a positive whole number of MiB
+        /// (e.g. `256mib`, `1gib`). Omit to boot without a disk.
+        #[arg(long)]
+        disk: Option<String>,
     },
     /// Capture or compare a host-wide per-thread state snapshot.
     ///
@@ -1720,6 +1729,7 @@ fn main() -> Result<()> {
             exec,
             no_perf_mode,
             cpu_cap,
+            disk,
         } => {
             if no_perf_mode {
                 // SAFETY: single-threaded at this point — no concurrent env readers.
@@ -1749,6 +1759,19 @@ fn main() -> Result<()> {
                 // SAFETY: single-threaded at this point — no concurrent env readers.
                 unsafe { std::env::set_var("KTSTR_CPU_CAP", cap.to_string()) };
             }
+            // Same disk-string parsing path as `cargo-ktstr`'s
+            // `run_shell`. Surface size errors at CLI-argument time
+            // rather than mid-VM-setup.
+            let disk_cfg = match disk.as_deref() {
+                Some(s) => {
+                    let mib = cli::parse_disk_size_mib(s)?;
+                    Some(ktstr::prelude::DiskConfig {
+                        capacity_mb: mib,
+                        ..ktstr::prelude::DiskConfig::default()
+                    })
+                }
+                None => None,
+            };
             cli::check_kvm()?;
             let kernel_path = cli::resolve_kernel_image(
                 kernel.as_deref(),
@@ -1777,6 +1800,7 @@ fn main() -> Result<()> {
                 memory_mb,
                 dmesg,
                 exec.as_deref(),
+                disk_cfg,
             )?;
         }
 
