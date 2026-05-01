@@ -1,11 +1,15 @@
 //! `cargo ktstr export` — package a registered test as a self-extracting
 //! `.run` file that reproduces the scenario on bare metal without a VM.
 //!
-//! [`export_test`] is the entry point invoked from
-//! `cargo-ktstr.rs`. It locates the named test in the [`KTSTR_TESTS`]
-//! distributed slice, gathers the binaries it needs (the running
-//! ktstr binary, the scheduler binary, and per-test include files),
-//! tarballs them with gzip, and emits a single shell script:
+//! [`export_test`] is the entry point invoked from the test binary's
+//! `#[ctor]` dispatch (see
+//! [`crate::test_support::dispatch::maybe_dispatch_export`]) when
+//! `cargo ktstr export` exec's the binary with
+//! `--ktstr-export-test=NAME`. The export pipeline locates the named
+//! test in the [`KTSTR_TESTS`] distributed slice, gathers the
+//! binaries it needs (the running test binary itself via
+//! `current_exe()`, the scheduler binary, and per-test include
+//! files), tarballs them with gzip, and emits a single shell script:
 //!
 //! ```text
 //! #!/bin/bash
@@ -128,15 +132,15 @@ pub fn export_test(test_name: &str, output: Option<PathBuf>) -> Result<()> {
         );
     }
 
-    let ktstr_binary = std::env::current_exe()
-        .context("locate currently running cargo-ktstr binary via /proc/self/exe")?;
+    let test_binary =
+        std::env::current_exe().context("locate the current test binary via /proc/self/exe")?;
 
     let scheduler_path = resolve_scheduler_for_export(entry)?;
     let include_files = resolve_include_files(entry)?;
 
     let output_path = output.unwrap_or_else(|| PathBuf::from(format!("{test_name}.run")));
 
-    let archive = build_archive(&ktstr_binary, scheduler_path.as_deref(), &include_files)
+    let archive = build_archive(&test_binary, scheduler_path.as_deref(), &include_files)
         .context("build embedded gzip tarball")?;
 
     let preamble = generate_preamble(entry, scheduler_path.is_some());

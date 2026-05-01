@@ -98,6 +98,52 @@ fn help_shell() {
         .stdout(predicate::str::contains("--no-perf-mode"));
 }
 
+/// `cargo ktstr export --help` exposes the four flags the router
+/// dispatches on: `<TEST>` positional, `--output`/-o, `--package`/-p
+/// (workspace disambiguation per adv-t A4), and `--release` (profile
+/// pin). Pins the router CLI surface so a future clap regression
+/// that drops one of these flags is caught at the help-text level
+/// before it surfaces as a misleading "test not found" error in the
+/// router.
+#[test]
+fn help_export() {
+    cargo_ktstr()
+        .args(["export", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--output"))
+        .stdout(predicate::str::contains("--package"))
+        .stdout(predicate::str::contains("--release"))
+        .stdout(predicate::str::contains("<TEST>"));
+}
+
+/// `cargo ktstr export <missing>` exits non-zero with a router
+/// diagnostic. Pins the "test not found in any workspace test
+/// binary" error path: the router builds tests, exec's each, sees
+/// every candidate fail with "no registered test named X", and
+/// surfaces a bundled error mentioning the candidate count and the
+/// last per-binary stderr.
+///
+/// `#[ignore]`-d because the router executes a full
+/// `cargo build --tests` over the entire workspace, compiling
+/// every integration test binary — minutes of build time, too
+/// heavy for the default `cargo nextest run` pass. Run via
+/// `cargo nextest run --include-ignored -E 'test(export_unknown_test_errors)'`
+/// to opt in locally.
+#[test]
+#[ignore = "runs cargo build --tests over the full workspace; minutes of compile time"]
+fn export_unknown_test_errors() {
+    cargo_ktstr()
+        .args(["export", "definitely_not_a_real_ktstr_test_xyzzy_987"])
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("not found in any workspace test binary").or(
+                predicate::str::contains("definitely_not_a_real_ktstr_test_xyzzy_987"),
+            ),
+        );
+}
+
 #[test]
 fn help_kernel() {
     cargo_ktstr()

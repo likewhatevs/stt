@@ -81,6 +81,38 @@ pub(crate) fn extract_work_type_arg(args: &[String]) -> Option<String> {
     None
 }
 
+/// Extract `--ktstr-export-test=NAME` from the argument list. Used by
+/// the test binary's ctor to detect a `cargo ktstr export` self-export
+/// dispatch (the binary embeds itself rather than letting cargo-ktstr
+/// embed its own binary, which would package the wrong code).
+///
+/// Empty values resolve to `Some("")` so the ctor can surface an
+/// actionable error rather than silently no-op when the operator
+/// passes `--ktstr-export-test=`.
+pub(crate) fn extract_export_test_arg(args: &[String]) -> Option<&str> {
+    for a in args {
+        if let Some(val) = a.strip_prefix("--ktstr-export-test=") {
+            return Some(val);
+        }
+    }
+    None
+}
+
+/// Extract `--ktstr-export-output=PATH` from the argument list. Pairs
+/// with [`extract_export_test_arg`] to direct the generated `.run`
+/// file at a specific path; absent means "default to `<test>.run` in
+/// cwd."
+pub(crate) fn extract_export_output_arg(args: &[String]) -> Option<&str> {
+    for a in args {
+        if let Some(val) = a.strip_prefix("--ktstr-export-output=")
+            && !val.is_empty()
+        {
+            return Some(val);
+        }
+    }
+    None
+}
+
 /// Derive the CgroupManager root path for guest-side dispatch.
 ///
 /// Reads `/sched_args` to find `--cell-parent-cgroup <path>`. When
@@ -237,5 +269,58 @@ mod tests {
     fn extract_work_type_arg_empty_value() {
         let args = vec!["ktstr".into(), "--ktstr-work-type=".into()];
         assert!(extract_work_type_arg(&args).is_none());
+    }
+
+    // -- extract_export_test_arg --
+
+    #[test]
+    fn extract_export_test_arg_equals() {
+        let args = vec![
+            "test_bin".into(),
+            "--ktstr-export-test=preempt_regression".into(),
+        ];
+        assert_eq!(extract_export_test_arg(&args), Some("preempt_regression"),);
+    }
+
+    #[test]
+    fn extract_export_test_arg_missing() {
+        let args = vec!["test_bin".into(), "--list".into()];
+        assert!(extract_export_test_arg(&args).is_none());
+    }
+
+    /// Empty value resolves to Some("") so the ctor can surface an
+    /// actionable diagnostic rather than silently no-op when the
+    /// router (or operator) accidentally passes the flag without a
+    /// value.
+    #[test]
+    fn extract_export_test_arg_empty_value() {
+        let args = vec!["test_bin".into(), "--ktstr-export-test=".into()];
+        assert_eq!(extract_export_test_arg(&args), Some(""));
+    }
+
+    // -- extract_export_output_arg --
+
+    #[test]
+    fn extract_export_output_arg_equals() {
+        let args = vec![
+            "test_bin".into(),
+            "--ktstr-export-output=/tmp/foo.run".into(),
+        ];
+        assert_eq!(extract_export_output_arg(&args), Some("/tmp/foo.run"),);
+    }
+
+    #[test]
+    fn extract_export_output_arg_missing() {
+        let args = vec!["test_bin".into()];
+        assert!(extract_export_output_arg(&args).is_none());
+    }
+
+    /// Empty value treated as absent — the export path falls back to
+    /// the default `<test>.run` in the current directory rather than
+    /// trying to write to an empty path string.
+    #[test]
+    fn extract_export_output_arg_empty_value() {
+        let args = vec!["test_bin".into(), "--ktstr-export-output=".into()];
+        assert!(extract_export_output_arg(&args).is_none());
     }
 }

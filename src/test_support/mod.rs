@@ -68,8 +68,8 @@ mod topo;
 // uniformly across all CLI arg extractors.
 #[allow(unused_imports)]
 pub(crate) use args::{
-    extract_flags_arg, extract_probe_stack_arg, extract_test_fn_arg, extract_topo_arg,
-    extract_work_type_arg,
+    extract_export_output_arg, extract_export_test_arg, extract_flags_arg, extract_probe_stack_arg,
+    extract_test_fn_arg, extract_topo_arg, extract_work_type_arg,
 };
 #[cfg(test)]
 pub(crate) use sidecar::enriched_parse_error_message_for_test;
