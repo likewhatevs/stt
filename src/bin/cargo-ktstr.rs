@@ -254,6 +254,41 @@ enum KtstrCommand {
         /// invoking this command.
         test: String,
     },
+    /// Export a registered test as a self-extracting `.run` file
+    /// that reproduces the scenario on bare metal without a VM.
+    ///
+    /// Bundles the running ktstr binary, the scheduler binary, and
+    /// every include file the test declares into a gzipped tarball
+    /// embedded in a bash preamble. The preamble validates root
+    /// access, sched_ext support, cgroup2 mount, sched_ext-conflict
+    /// (no other scheduler attached), and topology compatibility
+    /// before extracting and launching. Chmod +x on the output so
+    /// the operator can execute the `.run` directly.
+    ///
+    /// The frozen bits (scheduler choice, scheduler args, topology)
+    /// match the test as registered. Overridable on the target host:
+    /// `--duration`, `--watchdog-timeout`, `--quiet` (suppress
+    /// banner). NOT overridable: `--cpus`, `--topology`, `--affinity`
+    /// — re-export to change those.
+    ///
+    /// Out of scope for v1: `host_only` tests (they orchestrate
+    /// cargo / nested VMs from inside the test body), tests with
+    /// `bpf_map_write` (need the framework's host-side runtime
+    /// probe surface), and `KernelBuiltin` schedulers (need the
+    /// `enable` / `disable` shell commands the preamble doesn't
+    /// emit yet). All three are rejected with actionable errors.
+    Export {
+        /// Function-name-only test identifier as registered in
+        /// `#[ktstr_test]` (e.g. `preempt_regression_fault_under_load`).
+        /// Strip the `<binary>::` prefix that
+        /// `cargo nextest list` prepends — the registry keys on the
+        /// bare function name.
+        test: String,
+        /// Output path for the `.run` file. Defaults to
+        /// `<test>.run` in the current directory.
+        #[arg(short = 'o', long = "output")]
+        output: Option<PathBuf>,
+    },
     /// Clean up leftover ktstr cgroups.
     ///
     /// Without `--parent-cgroup`, scans `/sys/fs/cgroup` for the default
@@ -3345,6 +3380,9 @@ fn main() {
             }
             Err(e) => Err(format!("{e:#}")),
         },
+        KtstrCommand::Export { test, output } => {
+            ktstr::export::export_test(&test, output).map_err(|e| format!("{e:#}"))
+        }
         KtstrCommand::Cleanup { parent_cgroup } => {
             cli::cleanup(parent_cgroup).map_err(|e| format!("{e:#}"))
         }

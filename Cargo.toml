@@ -129,6 +129,12 @@ strum = { version = "0.27", features = ["derive"] }
 # the intent explicit and survives a future clap version that drops
 # the transitive exposure.
 strsim = "0.11"
+# Base64 encoder for `cargo ktstr export`'s self-extracting .run files
+# — embeds a gzip tarball after a `__ARCHIVE__` shell-script marker
+# so the bash preamble can `base64 -d | tar xz` the binaries on the
+# target host. Lightweight crate, well-audited, used only at export
+# time (not on the test hot path).
+base64 = "0.22"
 # jemalloc as global allocator for the ktstr/cargo-ktstr binaries.
 # binary-only — the library stays allocator-agnostic so downstream
 # consumers pick their own allocator. `stats` feature compiles

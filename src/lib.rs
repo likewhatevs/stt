@@ -342,6 +342,7 @@ pub mod cpu_util;
 pub mod ctprof;
 pub mod ctprof_compare;
 pub(crate) mod elf_strip;
+pub mod export;
 pub mod fetch;
 pub mod host_context;
 pub mod host_heap;
