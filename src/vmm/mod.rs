@@ -2921,7 +2921,33 @@ impl KtstrVm {
                 // permanently if the guest hadn't booted yet,
                 // disabling freeze detection AND the dump for the
                 // entire run.
-                let mut owned_accessor: Option<crate::monitor::bpf_map::BpfMapAccessorOwned> = None;
+                let mut owned_accessor: Option<crate::monitor::bpf_map::GuestMemAccessorOwned> =
+                    None;
+                // Lazy-construct BpfProgAccessorOwned for the
+                // failure-dump prog_runtime_stats capture. Same
+                // boot-race rationale as `owned_accessor`: the
+                // GuestKernel handshake depends on guest-memory
+                // bootstrap symbols populated during boot, so an
+                // attempt at coord-start can fail. Retry each
+                // iteration until success; gated on
+                // `owned_prog_accessor.is_none()` so the BTF parse
+                // pays once. Constructed independently from
+                // `owned_accessor` because the prog-side lookups
+                // (`prog_idr`) and offsets (`BpfProgOffsets`) are
+                // disjoint from the map side, so a kernel that
+                // exposes maps but lacks `prog_idr` (theoretical)
+                // still gets map rendering.
+                let mut owned_prog_accessor:
+                    Option<crate::monitor::bpf_prog::BpfProgAccessorOwned> = None;
+                // Per-CPU offset array used by `runtime_stats` to
+                // locate each CPU's `bpf_prog_stats` slot. Resolved
+                // once after `owned_prog_accessor` lands by reading
+                // `__per_cpu_offset` from guest memory; cached so
+                // every dump iteration reuses it. None until either
+                // the prog accessor isn't ready yet or the
+                // `__per_cpu_offset` symbol couldn't be located in
+                // the kernel's symbol table.
+                let mut prog_per_cpu_offsets: Option<Vec<u64>> = None;
                 // BTF + arena offsets resolved once at coordinator
                 // start. Used by `dump_state` after the rendezvous
                 // succeeds to render every BPF map's contents. None
@@ -3042,7 +3068,54 @@ impl KtstrVm {
                             (freeze_coord_mem.as_ref(), freeze_coord_vmlinux.as_ref())
                     {
                         owned_accessor =
-                            crate::monitor::bpf_map::BpfMapAccessorOwned::new(mem, vmlinux).ok();
+                            crate::monitor::bpf_map::GuestMemAccessorOwned::new(mem, vmlinux).ok();
+                    }
+                    // Lazy retry for the prog-side accessor. Same
+                    // pattern as `owned_accessor` above: the
+                    // BpfProgAccessorOwned needs the GuestKernel
+                    // handshake (boot-time symbols) AND the BTF
+                    // parse to succeed, so coord-start may be too
+                    // early. Retry each iteration until success.
+                    if owned_prog_accessor.is_none()
+                        && let (Some(mem), Some(vmlinux)) =
+                            (freeze_coord_mem.as_ref(), freeze_coord_vmlinux.as_ref())
+                    {
+                        owned_prog_accessor =
+                            crate::monitor::bpf_prog::BpfProgAccessorOwned::new(mem, vmlinux).ok();
+                    }
+                    // Resolve the per-CPU offset array once the prog
+                    // accessor lands. Reads `__per_cpu_offset` from
+                    // the kernel's static symbol table and uses it
+                    // to read each CPU's offset slot. Cached for the
+                    // rest of the run — the array is fixed at boot
+                    // (per-CPU areas are allocated at kernel init,
+                    // see `setup_per_cpu_areas`) and the freeze
+                    // coordinator never sees a CPU hot-plug event,
+                    // so a single read is enough.
+                    if prog_per_cpu_offsets.is_none()
+                        && let (Some(mem), Some(vmlinux)) =
+                            (freeze_coord_mem.as_ref(), freeze_coord_vmlinux.as_ref())
+                        && let Ok(syms) =
+                            crate::monitor::symbols::KernelSymbols::from_vmlinux(vmlinux)
+                    {
+                        let pco_pa = crate::monitor::symbols::text_kva_to_pa(
+                            syms.per_cpu_offset,
+                        );
+                        let offsets = crate::monitor::symbols::read_per_cpu_offsets(
+                            mem,
+                            pco_pa,
+                            freeze_coord_num_cpus,
+                        );
+                        // Defer caching until the read returns at
+                        // least one non-zero offset — a guest still
+                        // populating per-CPU areas yields all-zero
+                        // reads, and caching that would alias every
+                        // CPU's stats to CPU 0. Once any CPU's
+                        // offset is non-zero the array is stable
+                        // for the run.
+                        if offsets.iter().any(|&o| o != 0) {
+                            prog_per_cpu_offsets = Some(offsets);
+                        }
                     }
                     // Try to discover the probe .bss map and cache the
                     // PA of ktstr_err_exit_detected. Match by suffix
@@ -3488,11 +3561,38 @@ impl KtstrVm {
                             if let Some(ref owned) = owned_accessor
                                 && let Some(ref btf) = dump_btf
                             {
+                                // Build the prog-runtime capture
+                                // when both prerequisites are ready.
+                                // Each is independent of the other
+                                // (the accessor needs prog_idr +
+                                // BTF; the offsets need __per_cpu_offset),
+                                // so a partial setup yields no
+                                // capture rather than a half-correct
+                                // one — `dump_state` then writes an
+                                // empty `prog_runtime_stats` vec
+                                // alongside the full map render.
+                                let prog_acc_borrow =
+                                    owned_prog_accessor.as_ref().and_then(
+                                        |o| o.as_accessor().ok(),
+                                    );
+                                let prog_capture = match (
+                                    prog_acc_borrow.as_ref(),
+                                    prog_per_cpu_offsets.as_deref(),
+                                ) {
+                                    (Some(acc), Some(offsets)) => {
+                                        Some(crate::monitor::dump::ProgRuntimeCapture {
+                                            prog_accessor: acc,
+                                            per_cpu_offsets: offsets,
+                                        })
+                                    }
+                                    _ => None,
+                                };
                                 let mut report = crate::monitor::dump::dump_state(
                                     &owned.as_accessor(),
                                     btf,
                                     freeze_coord_num_cpus,
                                     dump_arena_offsets.as_ref(),
+                                    prog_capture,
                                 );
                                 report.vcpu_regs = collect_vcpu_regs();
                                 Some(report)
@@ -3503,6 +3603,7 @@ impl KtstrVm {
                                     maps: Vec::new(),
                                     vcpu_regs: collect_vcpu_regs(),
                                     sdt_allocations: Vec::new(),
+                                    prog_runtime_stats: Vec::new(),
                                 };
                                 tracing::warn!(
                                     owned_accessor = owned_accessor.is_some(),
@@ -4187,6 +4288,7 @@ impl KtstrVm {
         let handle = std::thread::Builder::new()
             .name("bpf-map-write".into())
             .spawn(move || {
+                use crate::monitor::bpf_map::BpfMapAccessor;
                 if kill_clone.load(Ordering::Acquire) {
                     return;
                 }
@@ -4195,7 +4297,7 @@ impl KtstrVm {
                 let phase1_deadline =
                     std::time::Instant::now() + std::time::Duration::from_secs(30);
                 let owned = loop {
-                    match monitor::bpf_map::BpfMapAccessorOwned::new(&mem, &vmlinux) {
+                    match monitor::bpf_map::GuestMemAccessorOwned::new(&mem, &vmlinux) {
                         Ok(a) => break a,
                         Err(e) => {
                             if kill_clone.load(Ordering::Acquire) {

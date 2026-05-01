@@ -25,7 +25,7 @@ use super::{Cr3Pa, Kva, PageOffset};
 /// Every free function in this module previously took the same four-
 /// to eight-argument fan of `mem`, `cr3_pa`, `page_offset`, `offsets`,
 /// `l5` (some also took `map_idr_kva`); callers invariably forwarded
-/// the same fields from their [`BpfMapAccessor`] because all six
+/// the same fields from their [`GuestMemAccessor`] because all six
 /// originate on the accessor. Grouping them here drops the duplication
 /// and lets additional shared context (per-CPU offset cache, BTF
 /// cache, etc.) ride the same lifetime without touching every
@@ -557,17 +557,109 @@ pub(crate) fn resolve_to_struct(btf: &btf_rs::Btf, type_id: u32) -> Option<btf_r
     None
 }
 
-/// Host-side BPF map accessor for a running guest VM.
+/// Trait abstracting BPF map enumeration and value reads across data
+/// sources. One implementation lives in this crate today; a second
+/// backend is planned (live-host introspection via the `bpf()`
+/// syscall — see the live-host introspection task in the project
+/// queue) and will plug into the same trait surface.
 ///
-/// Resolves BTF offsets for BPF map structures and provides
-/// map discovery and value read/write. Uses a [`GuestKernel`]
-/// for address translation.
+/// - [`GuestMemAccessor`] — reads from a frozen guest VM's physical
+///   memory via PTE walks. Used by the freeze-coordinator path
+///   ([`super::dump::dump_state`]) on the in-VM scheduler test runs.
+///
+/// The planned live-host backend will produce identical
+/// [`BpfMapInfo`] / byte buffers, so the rendering pipeline
+/// ([`super::btf_render::render_value`]) stays data-source-agnostic
+/// and will consume either accessor through this trait.
+///
+/// `dump_state` takes `&dyn BpfMapAccessor` so the same call site
+/// dispatches at runtime; generic call sites can also bound on it
+/// directly without paying virtual dispatch.
+#[allow(dead_code)]
+pub trait BpfMapAccessor {
+    /// Enumerate every BPF map visible to this accessor.
+    ///
+    /// Order is implementation-defined: the guest-memory backend walks
+    /// `map_idr` (allocation order); the bpf-syscall backend walks the
+    /// kernel's id space via `BPF_MAP_GET_NEXT_ID` (also allocation
+    /// order, modulo concurrent destruction races on the live host).
+    /// Callers that want a stable view should sort by name.
+    fn maps(&self) -> Vec<BpfMapInfo>;
+
+    /// Read a contiguous byte range from a map's value region.
+    ///
+    /// Returns `None` for non-readable map types (e.g. ARENA — use
+    /// [`Self::read_arena_pages`]; HASH — use [`Self::iter_hash_map`])
+    /// or when the underlying read fails (unmapped guest page,
+    /// `bpf_map_lookup_elem` rejection).
+    fn read_value(&self, map: &BpfMapInfo, offset: usize, len: usize) -> Option<Vec<u8>>;
+
+    /// Iterate every entry in a `BPF_MAP_TYPE_HASH` map.
+    ///
+    /// Returns an empty vec for non-HASH maps. Each `(key, value)` pair
+    /// is captured at the moment of read; a concurrently-mutating BPF
+    /// program may produce torn states, but per-element atomicity holds
+    /// (the kernel's hash bucket reads are RCU-protected on both paths).
+    fn iter_hash_map(&self, map: &BpfMapInfo) -> Vec<(Vec<u8>, Vec<u8>)>;
+
+    /// Read every CPU's value for a key in a `BPF_MAP_TYPE_PERCPU_ARRAY` map.
+    ///
+    /// Returns one entry per CPU, indexed by CPU number. `Some(bytes)`
+    /// when the per-CPU slot is readable; `None` when it isn't (e.g. an
+    /// out-of-range CPU on the live host, or an unmapped page on the
+    /// guest-memory path). Returns an empty vec for non-PERCPU_ARRAY
+    /// maps or `key >= max_entries`.
+    fn read_percpu_array(
+        &self,
+        map: &BpfMapInfo,
+        key: u32,
+        num_cpus: u32,
+    ) -> Vec<Option<Vec<u8>>>;
+
+    /// Snapshot every mapped page of a `BPF_MAP_TYPE_ARENA` map.
+    ///
+    /// The default implementation returns an empty snapshot; backends
+    /// that can dump arena content override this. The guest-memory
+    /// backend walks the arena's PTEs against the frozen `init_mm`;
+    /// the bpf-syscall backend `mmap()`s the arena fd and copies the
+    /// pages out (the only data path the kernel exposes — arena's
+    /// `lookup_elem` returns `-EINVAL`, see `kernel/bpf/arena.c`).
+    fn read_arena_pages(&self, _map: &BpfMapInfo) -> super::arena::ArenaSnapshot {
+        super::arena::ArenaSnapshot::default()
+    }
+
+    /// Load the program BTF object referenced by a map.
+    ///
+    /// `base_btf` is the host's vmlinux BTF used as the base for
+    /// split-BTF parsing. Returns `None` when the map carries no
+    /// program BTF (e.g. kernel-builtin maps), when the BTF blob can't
+    /// be loaded, or when [`btf_rs::Btf::from_bytes`] /
+    /// [`btf_rs::Btf::from_split_bytes`] reject the bytes.
+    ///
+    /// The default implementation returns `None`; backends override to
+    /// hand back a parsed [`btf_rs::Btf`].
+    fn load_program_btf(&self, _map: &BpfMapInfo, _base_btf: &btf_rs::Btf) -> Option<btf_rs::Btf> {
+        None
+    }
+}
+
+/// Host-side BPF map accessor backed by direct guest physical-memory
+/// reads.
+///
+/// Resolves BTF offsets for BPF map structures and provides map
+/// discovery, value read/write, hash iteration, and per-CPU reads.
+/// Uses a [`GuestKernel`] for address translation (PTE walks against
+/// the guest's frozen page tables).
+///
+/// Implements the [`BpfMapAccessor`] trait so [`super::dump::dump_state`]
+/// can dispatch through it without committing to a backend at the call
+/// site.
 ///
 /// [`GuestKernel`]: super::guest::GuestKernel
-pub struct BpfMapAccessor<'a> {
+pub struct GuestMemAccessor<'a> {
     kernel: &'a super::guest::GuestKernel<'a>,
     map_idr_kva: u64,
-    /// Borrowed from the `BpfMapAccessorOwned` that produced this
+    /// Borrowed from the `GuestMemAccessorOwned` that produced this
     /// accessor via `as_accessor`, or provided by the caller to
     /// `from_guest_kernel`. Borrowing avoids the ~160-byte
     /// `BpfMapOffsets` clone that the old owned-field design paid
@@ -576,12 +668,12 @@ pub struct BpfMapAccessor<'a> {
 }
 
 #[allow(dead_code)]
-impl<'a> BpfMapAccessor<'a> {
+impl<'a> GuestMemAccessor<'a> {
     /// Create from an existing [`GuestKernel`] and a caller-owned
     /// [`BpfMapOffsets`].
     ///
     /// The accessor borrows the offsets for its lifetime, so callers
-    /// typically stash them in a `BpfMapAccessorOwned` (or another
+    /// typically stash them in a `GuestMemAccessorOwned` (or another
     /// stable location) before calling this. Build `offsets` once via
     /// [`BpfMapOffsets::from_vmlinux`] and reuse — they're per-kernel,
     /// not per-call.
@@ -613,18 +705,10 @@ impl<'a> BpfMapAccessor<'a> {
         }
     }
 
-    /// Enumerate all BPF maps in the kernel's `map_idr`.
-    ///
-    /// Returns metadata for every map whose KVA can be translated.
-    /// No filtering by type or name.
-    pub fn maps(&self) -> Vec<BpfMapInfo> {
-        find_all_bpf_maps(&self.ctx(), self.map_idr_kva)
-    }
-
     /// Borrow the resolved BPF map field offsets. Used by callers
     /// that need to read kernel struct fields (e.g. `struct btf` for
     /// the program-BTF loader) without going through the
-    /// `BpfMapAccessor` map-access surface.
+    /// map-access trait surface.
     pub fn offsets(&self) -> &BpfMapOffsets {
         self.offsets
     }
@@ -632,25 +716,17 @@ impl<'a> BpfMapAccessor<'a> {
     /// Borrow the underlying [`super::guest::GuestKernel`] for callers
     /// that need direct access to symbol resolution / page-walk
     /// primitives outside the map-discovery surface (e.g. arena page
-    /// enumeration in [`super::arena`]).
+    /// enumeration in [`super::arena`], sdt_alloc tree walks).
     pub fn kernel(&self) -> &'a super::guest::GuestKernel<'a> {
         self.kernel
     }
 
     /// Find the first BPF ARRAY map whose name ends with `name_suffix`.
     ///
-    /// Only returns `BPF_MAP_TYPE_ARRAY` maps. Use [`maps`](Self::maps)
-    /// to enumerate maps of all types.
+    /// Only returns `BPF_MAP_TYPE_ARRAY` maps. Use
+    /// [`BpfMapAccessor::maps`] to enumerate maps of all types.
     pub fn find_map(&self, name_suffix: &str) -> Option<BpfMapInfo> {
         find_bpf_map(&self.ctx(), self.map_idr_kva, name_suffix)
-    }
-
-    /// Read bytes from a map's value region.
-    ///
-    /// Returns `None` if the map has no value KVA (non-ARRAY map)
-    /// or any page in the range is unmapped.
-    pub fn read_value(&self, map: &BpfMapInfo, offset: usize, len: usize) -> Option<Vec<u8>> {
-        read_bpf_map_value(&self.ctx(), map, offset, len)
     }
 
     /// Write bytes to a map's value region.
@@ -670,20 +746,25 @@ impl<'a> BpfMapAccessor<'a> {
     pub fn read_value_u32(&self, map: &BpfMapInfo, offset: usize) -> Option<u32> {
         read_bpf_map_value_u32(&self.ctx(), map, offset)
     }
+}
 
-    /// Iterate all entries in a `BPF_MAP_TYPE_HASH` map.
-    pub fn iter_hash_map(&self, map: &BpfMapInfo) -> Vec<(Vec<u8>, Vec<u8>)> {
+impl BpfMapAccessor for GuestMemAccessor<'_> {
+    fn maps(&self) -> Vec<BpfMapInfo> {
+        find_all_bpf_maps(&self.ctx(), self.map_idr_kva)
+    }
+
+    fn read_value(&self, map: &BpfMapInfo, offset: usize, len: usize) -> Option<Vec<u8>> {
+        read_bpf_map_value(&self.ctx(), map, offset, len)
+    }
+
+    fn iter_hash_map(&self, map: &BpfMapInfo) -> Vec<(Vec<u8>, Vec<u8>)> {
         iter_htab_entries(&self.ctx(), map)
     }
 
     /// Read per-CPU values for a key in a `BPF_MAP_TYPE_PERCPU_ARRAY` map.
     ///
-    /// Returns one entry per CPU, indexed by CPU number. `Some(bytes)`
-    /// when the per-CPU PA falls within guest memory; `None` when it
-    /// does not. Resolves `__per_cpu_offset` from the guest kernel.
-    ///
-    /// Returns an empty vec if the map is not `BPF_MAP_TYPE_PERCPU_ARRAY`,
-    /// `key >= max_entries`, or the `__per_cpu_offset` symbol is missing.
+    /// Resolves `__per_cpu_offset` from the guest kernel and reads each
+    /// CPU's slot via [`translate_any_kva`].
     ///
     /// When the `__per_cpu_offset` array straddles the end of guest
     /// memory, the former pre-check returned an empty vec; the current
@@ -692,10 +773,8 @@ impl<'a> BpfMapAccessor<'a> {
     /// and yields `0` for any out-of-range slot). Out-of-range CPUs
     /// therefore pick up a zero offset, which aliases CPU 0's per-CPU
     /// base and yields `Some(bytes)` copies of CPU 0's value rather
-    /// than `None`. Callers that need strict "unreadable=None"
-    /// semantics must compare `__per_cpu_offset[cpu]` against the
-    /// DRAM bound themselves.
-    pub fn read_percpu_array(
+    /// than `None`.
+    fn read_percpu_array(
         &self,
         map: &BpfMapInfo,
         key: u32,
@@ -705,31 +784,40 @@ impl<'a> BpfMapAccessor<'a> {
             return Vec::new();
         };
         let pco_pa = super::symbols::text_kva_to_pa(pco_kva);
-        // read_per_cpu_offsets routes through GuestMem::read_u64 which
-        // bounds-checks each element against the mapped size; out-of-
-        // range PAs yield 0 rather than faulting. No pre-check needed.
         let per_cpu_offsets =
             super::symbols::read_per_cpu_offsets(self.kernel.mem(), pco_pa, num_cpus);
-
         read_percpu_array_value(&self.ctx(), map, key, &per_cpu_offsets)
+    }
+
+    fn read_arena_pages(&self, map: &BpfMapInfo) -> super::arena::ArenaSnapshot {
+        // The arena snapshot path needs the BTF-resolved arena offsets
+        // separately from `BpfMapOffsets`, so it lives in [`super::arena`]
+        // and runs out of [`super::dump::dump_state`] directly. Returning
+        // the default here keeps the trait's arena entry point a single
+        // call site for backends that DO have everything they need at
+        // accessor scope (the bpf-syscall backend mmap's arena fds and
+        // owns its own snapshot path).
+        let _ = map;
+        super::arena::ArenaSnapshot::default()
     }
 }
 
-/// Owns a [`GuestKernel`] and provides BPF map access.
+/// Owns a [`GuestKernel`] and provides BPF map access through the
+/// [`GuestMemAccessor`] borrow.
 ///
-/// Returned by [`BpfMapAccessorOwned::new`] which builds the
-/// `GuestKernel` internally. Borrow as [`BpfMapAccessor`] via
+/// Returned by [`GuestMemAccessorOwned::new`] which builds the
+/// `GuestKernel` internally. Borrow as [`GuestMemAccessor`] via
 /// [`as_accessor`](Self::as_accessor) for map operations.
 ///
 /// [`GuestKernel`]: super::guest::GuestKernel
-pub struct BpfMapAccessorOwned<'a> {
+pub struct GuestMemAccessorOwned<'a> {
     kernel: super::guest::GuestKernel<'a>,
     map_idr_kva: u64,
     offsets: BpfMapOffsets,
 }
 
 #[allow(dead_code)]
-impl<'a> BpfMapAccessorOwned<'a> {
+impl<'a> GuestMemAccessorOwned<'a> {
     /// Create from GuestMem and vmlinux path.
     ///
     /// One-shot constructor: builds a [`GuestKernel`] from `vmlinux`,
@@ -737,7 +825,7 @@ impl<'a> BpfMapAccessorOwned<'a> {
     /// locates the `map_idr` symbol. The resulting handle owns both
     /// the `GuestKernel` and the `BpfMapOffsets`.
     ///
-    /// Prefer [`BpfMapAccessor::from_guest_kernel`] when you already
+    /// Prefer [`GuestMemAccessor::from_guest_kernel`] when you already
     /// hold a `GuestKernel` **and** a pre-built `&BpfMapOffsets` — it
     /// builds a borrowed accessor without taking ownership of either,
     /// so callers that maintain their own offsets cache (e.g. across
@@ -761,12 +849,12 @@ impl<'a> BpfMapAccessorOwned<'a> {
         })
     }
 
-    /// Borrow as a [`BpfMapAccessor`] for map operations.
+    /// Borrow as a [`GuestMemAccessor`] for map operations.
     ///
     /// The returned accessor borrows `self.offsets`; no clone on
     /// the hot path.
-    pub fn as_accessor(&self) -> BpfMapAccessor<'_> {
-        BpfMapAccessor {
+    pub fn as_accessor(&self) -> GuestMemAccessor<'_> {
+        GuestMemAccessor {
             kernel: &self.kernel,
             map_idr_kva: self.map_idr_kva,
             offsets: &self.offsets,
@@ -780,7 +868,7 @@ impl<'a> BpfMapAccessorOwned<'a> {
         &self.kernel
     }
 
-    // Map operations live on [`BpfMapAccessor`]. Borrow via
+    // Map operations live on [`GuestMemAccessor`]. Borrow via
     // [`as_accessor`] to call them: `owned.as_accessor().find_map(...)`.
     // The wrapper type exists only to own the `GuestKernel` and
     // `BpfMapOffsets`; it does not duplicate the accessor's surface.

@@ -1208,6 +1208,12 @@ pub struct BpfProgOffsets {
     pub stats_cnt: usize,
     /// Offset of `nsecs` (u64_stats_t) within `struct bpf_prog_stats`.
     pub stats_nsecs: usize,
+    /// Offset of `misses` (u64_stats_t) within `struct bpf_prog_stats`.
+    /// Incremented from `bpf_prog_inc_misses_counter` (kernel/bpf/syscall.c)
+    /// when a recursion-protected program is re-entered on the same CPU,
+    /// so the runtime profile shows skipped invocations alongside
+    /// `cnt`/`nsecs`.
+    pub stats_misses: usize,
 }
 
 impl BpfProgOffsets {
@@ -1228,6 +1234,7 @@ impl BpfProgOffsets {
         let (bpf_prog_stats, _) = find_struct(btf, "bpf_prog_stats")?;
         let stats_cnt = member_byte_offset(btf, &bpf_prog_stats, "cnt")?;
         let stats_nsecs = member_byte_offset(btf, &bpf_prog_stats, "nsecs")?;
+        let stats_misses = member_byte_offset(btf, &bpf_prog_stats, "misses")?;
 
         Ok(Self {
             prog_type,
@@ -1241,6 +1248,7 @@ impl BpfProgOffsets {
             prog_stats,
             stats_cnt,
             stats_nsecs,
+            stats_misses,
         })
     }
 

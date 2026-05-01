@@ -439,7 +439,7 @@ pub mod prelude {
     // spelling is intentional: `#[derive(Scheduler)]` generates a
     // `static` of type `Scheduler`, and matching the derive-macro
     // name to its emitted type reads naturally at the call site.
-    pub use crate::assert::{Assert, AssertResult};
+    pub use crate::assert::{Assert, AssertResult, CheckBuilder, Checks, DetailKind, Expect};
     pub use crate::cgroup::CgroupManager;
     pub use crate::host_context::HostContext;
     pub use crate::host_heap::HostHeapState;

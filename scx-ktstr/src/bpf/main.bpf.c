@@ -240,11 +240,81 @@ void BPF_STRUCT_OPS(ktstr_exit, struct scx_exit_info *ei)
 	UEI_RECORD(uei, ei);
 }
 
+/*
+ * ops.dump callback. Invoked by `scx_dump_state()` (kernel/sched/ext.c)
+ * inside the SCX_KF_UNLOCKED region. Output goes to the per-`scx_sched`
+ * dump buffer that is rendered into kernel printk on error-class exit
+ * and copied into `scx_exit_info::dump` for userspace consumers.
+ *
+ * Surfaces every runtime-mutable knob the framework injects so an
+ * operator scanning a dump sees exactly what state the test fixture
+ * was driving at the freeze instant: stall/crash/degrade_rt are
+ * ".bss" volatiles flipped from the host; degrade/slow/scattershot/
+ * verify_loop/fail_verify are const_volatile rodata pinned at load
+ * time and surfacing them confirms which test-mode the scheduler was
+ * built for. The cumulative counters distinguish a "configured but
+ * never fired" path (e.g. degrade_rt set, but no enqueue/dispatch
+ * reached the slow path because the test exited first) from one that
+ * was actively shaping behaviour right up to the failure.
+ */
+void BPF_STRUCT_OPS(ktstr_dump, struct scx_dump_ctx *dctx)
+{
+	scx_bpf_dump("ktstr scheduler state:\n");
+	scx_bpf_dump("  stall=%d crash=%d degrade_rt=%d\n",
+		     stall, crash, degrade_rt);
+	scx_bpf_dump("  rodata: degrade=%d slow=%d scattershot=%d verify_loop=%d fail_verify=%d\n",
+		     degrade, slow, scattershot, verify_loop, fail_verify);
+	scx_bpf_dump("  ktstr_alloc_count=%llu degrade_cnt=%u slow_cnt=%u\n",
+		     ktstr_alloc_count, degrade_cnt, slow_cnt);
+}
+
+/*
+ * ops.dump_cpu callback. Invoked by `scx_dump_state()` for every
+ * online CPU between `ops.dump` and the per-task pass. ktstr-fixture
+ * carries no per-CPU scheduler state (no cpuctx struct, no per-CPU
+ * scratch maps), so the callback just emits a one-line marker so the
+ * dump reader sees per-CPU coverage didn't silently drop. The line
+ * keeps the same prefix scheme as `ops.dump`/`ops.dump_task` so the
+ * three layers render uniformly.
+ */
+void BPF_STRUCT_OPS(ktstr_dump_cpu, struct scx_dump_ctx *dctx,
+		    s32 cpu, bool idle)
+{
+	scx_bpf_dump("ktstr cpu %d: no per-cpu state\n", cpu);
+}
+
+/*
+ * ops.dump_task callback. Invoked by `scx_dump_state()` for every
+ * runnable task on every CPU after `ops.dump_cpu`.
+ *
+ * `scx_task_data(p)` returns the per-task arena context allocated in
+ * `ktstr_init_task`. NULL on tasks the allocator never touched (e.g.
+ * pre-existing kthreads enqueued before `init_task` ran). Surface the
+ * magic and counter so an operator can confirm the per-task arena
+ * write actually landed for tasks that were running at freeze time.
+ */
+void BPF_STRUCT_OPS(ktstr_dump_task, struct scx_dump_ctx *dctx,
+		    struct task_struct *p)
+{
+	struct ktstr_arena_ctx __arena *taskc;
+
+	taskc = scx_task_data(p);
+	if (!taskc) {
+		scx_bpf_dump("  ktstr task: <no arena ctx>\n");
+		return;
+	}
+	scx_bpf_dump("  ktstr task: magic=0x%llx counter=%u\n",
+		     taskc->magic, taskc->counter);
+}
+
 SCX_OPS_DEFINE(ktstr_ops,
 	       .enqueue		= (void *)ktstr_enqueue,
 	       .dispatch	= (void *)ktstr_dispatch,
 	       .init_task	= (void *)ktstr_init_task,
 	       .exit_task	= (void *)ktstr_exit_task,
+	       .dump		= (void *)ktstr_dump,
+	       .dump_cpu	= (void *)ktstr_dump_cpu,
+	       .dump_task	= (void *)ktstr_dump_task,
 	       .init		= (void *)ktstr_init,
 	       .exit		= (void *)ktstr_exit,
 	       .timeout_ms	= 20000,

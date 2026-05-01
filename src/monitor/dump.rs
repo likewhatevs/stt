@@ -59,12 +59,36 @@ use btf_rs::Btf;
 use super::arena::{ArenaSnapshot, BpfArenaOffsets, snapshot_arena};
 use super::bpf_map::{
     BPF_MAP_TYPE_ARENA, BPF_MAP_TYPE_ARRAY, BPF_MAP_TYPE_HASH, BPF_MAP_TYPE_PERCPU_ARRAY,
-    BpfMapAccessor, BpfMapInfo,
+    BpfMapAccessor, BpfMapInfo, GuestMemAccessor,
 };
 use super::btf_render::{RenderedValue, render_value};
 use super::sdt_alloc::{
     SdtAllocOffsets, SdtAllocatorSnapshot, discover_payload_btf_id, walk_sdt_allocator,
 };
+
+/// Borrow-only capture context for per-program runtime stats
+/// (cnt/nsecs/misses) populated alongside the BPF map dump.
+///
+/// Carries a borrowed [`super::bpf_prog::BpfProgAccessor`] plus the
+/// per-CPU offset array obtained from
+/// [`super::symbols::read_per_cpu_offsets`]. [`dump_state`] calls
+/// [`super::bpf_prog::BpfProgAccessor::runtime_stats`] with the
+/// supplied offsets and stores the resulting
+/// [`super::bpf_prog::ProgRuntimeStats`] vector in
+/// [`FailureDumpReport::prog_runtime_stats`].
+///
+/// Pass `None` to skip prog-runtime capture (e.g. when the
+/// `BpfProgAccessor` could not be constructed because `prog_idr` is
+/// missing or the BPF prog offsets did not resolve). The dump still
+/// renders every map the [`super::bpf_map::BpfMapAccessor`] enumerates.
+pub struct ProgRuntimeCapture<'a> {
+    /// Accessor for walking `prog_idr` and reading per-program
+    /// `bpf_prog_stats` slots.
+    pub prog_accessor: &'a super::bpf_prog::BpfProgAccessor<'a>,
+    /// Per-CPU offset array (`__per_cpu_offset[cpu]`) used to address
+    /// each CPU's `bpf_prog_stats` slot for summation.
+    pub per_cpu_offsets: &'a [u64],
+}
 
 /// Snapshot of one vCPU's instruction-pointer / stack-pointer / page-
 /// table-root at freeze time. Re-export of the freeze-side type so
@@ -131,6 +155,23 @@ pub struct FailureDumpReport {
     /// on whether they want raw bytes or named-field allocations.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sdt_allocations: Vec<SdtAllocatorSnapshot>,
+    /// Per-program BPF runtime stats summed across CPUs at freeze
+    /// time (cnt, nsecs, misses). One entry per discovered
+    /// struct_ops BPF program. Empty when no struct_ops programs are
+    /// loaded or when the prog accessor was unavailable to
+    /// [`dump_state`].
+    ///
+    /// Per-CPU offset resolution failure does NOT empty the vec —
+    /// each program still contributes one entry, but with
+    /// `cnt`/`nsecs`/`misses` summed only over CPUs whose per-CPU
+    /// `bpf_prog_stats` slot translated successfully (out-of-range
+    /// CPUs whose `__per_cpu_offset` slot returned 0 alias CPU 0,
+    /// per [`super::symbols::read_per_cpu_offsets`] semantics).
+    ///
+    /// See [`super::bpf_prog::ProgRuntimeStats`] for field semantics
+    /// and the kernel-source-grounded provenance of each counter.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prog_runtime_stats: Vec<super::bpf_prog::ProgRuntimeStats>,
 }
 
 impl Default for FailureDumpReport {
@@ -146,6 +187,7 @@ impl Default for FailureDumpReport {
             maps: Vec::new(),
             vcpu_regs: Vec::new(),
             sdt_allocations: Vec::new(),
+            prog_runtime_stats: Vec::new(),
         }
     }
 }
@@ -414,11 +456,15 @@ pub struct FailureDumpPercpuEntry {
 
 impl std::fmt::Display for FailureDumpReport {
     /// Human-readable rendering of every map plus per-vCPU register
-    /// snapshots. JSON remains the programmatic form via
-    /// `serde_json`; this Display is the default presentation used
-    /// in test-failure output.
+    /// snapshots and per-program runtime stats. JSON remains the
+    /// programmatic form via `serde_json`; this Display is the
+    /// default presentation used in test-failure output.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.maps.is_empty() && self.vcpu_regs.is_empty() && self.sdt_allocations.is_empty() {
+        if self.maps.is_empty()
+            && self.vcpu_regs.is_empty()
+            && self.sdt_allocations.is_empty()
+            && self.prog_runtime_stats.is_empty()
+        {
             return f.write_str("(empty failure dump)");
         }
         let mut first = true;
@@ -449,6 +495,18 @@ impl std::fmt::Display for FailureDumpReport {
             }
             first = false;
             std::fmt::Display::fmt(snap, f)?;
+        }
+        if !self.prog_runtime_stats.is_empty() {
+            if !first {
+                f.write_str("\n\n")?;
+            }
+            // Section comes last; no further sibling sections need
+            // to consult `first`, so leave the flag alone here.
+            f.write_str("prog_runtime_stats:")?;
+            for stats in &self.prog_runtime_stats {
+                f.write_str("\n  ")?;
+                std::fmt::Display::fmt(stats, f)?;
+            }
         }
         Ok(())
     }
@@ -577,17 +635,23 @@ const KTSTR_INTERNAL_MAPS: &[&str] = &["func_meta_map", "probe_data", "probe_scr
 /// so a single corrupt map can't blind the operator to the rest of
 /// the scheduler's state.
 pub fn dump_state(
-    accessor: &BpfMapAccessor<'_>,
+    accessor: &GuestMemAccessor<'_>,
     btf: &Btf,
     num_cpus: u32,
     arena_offsets: Option<&BpfArenaOffsets>,
+    prog_capture: Option<ProgRuntimeCapture<'_>>,
 ) -> FailureDumpReport {
     let maps = accessor.maps();
+    let prog_runtime_stats = match prog_capture {
+        Some(cap) => cap.prog_accessor.runtime_stats(cap.per_cpu_offsets),
+        None => Vec::new(),
+    };
     let mut report = FailureDumpReport {
         schema: SCHEMA_SINGLE.to_string(),
         maps: Vec::with_capacity(maps.len()),
         vcpu_regs: Vec::new(),
         sdt_allocations: Vec::new(),
+        prog_runtime_stats,
     };
 
     // Per-map program-BTF cache, keyed by `btf_kva`. Each unique
@@ -862,7 +926,7 @@ fn is_scx_allocator_type(btf: &Btf, type_id: u32) -> bool {
 /// Failure is silent and the caller falls back to the host vmlinux
 /// BTF — the dump is best-effort, a partial render still beats no
 /// render.
-fn load_program_btf(accessor: &BpfMapAccessor<'_>, btf_kva: u64, base_btf: &Btf) -> Option<Btf> {
+fn load_program_btf(accessor: &GuestMemAccessor<'_>, btf_kva: u64, base_btf: &Btf) -> Option<Btf> {
     let kernel = accessor.kernel();
     let offsets = accessor.offsets();
     let mem = kernel.mem();
@@ -914,7 +978,7 @@ fn load_program_btf(accessor: &BpfMapAccessor<'_>, btf_kva: u64, base_btf: &Btf)
 }
 
 fn render_map(
-    accessor: &BpfMapAccessor<'_>,
+    accessor: &GuestMemAccessor<'_>,
     btf: Option<&Btf>,
     info: &BpfMapInfo,
     num_cpus: u32,
@@ -1141,6 +1205,7 @@ mod tests {
             }],
             vcpu_regs: Vec::new(),
             sdt_allocations: Vec::new(),
+            prog_runtime_stats: Vec::new(),
         };
         let json = serde_json::to_string(&report).unwrap();
         let parsed: FailureDumpReport = serde_json::from_str(&json).unwrap();
@@ -1198,6 +1263,7 @@ mod tests {
             maps: vec![make_simple_map()],
             vcpu_regs: Vec::new(),
             sdt_allocations: Vec::new(),
+            prog_runtime_stats: Vec::new(),
         };
         let out = format!("{report}");
         // Map header line.
@@ -1218,6 +1284,7 @@ mod tests {
             maps: vec![make_simple_map(), make_simple_map()],
             vcpu_regs: Vec::new(),
             sdt_allocations: Vec::new(),
+            prog_runtime_stats: Vec::new(),
         };
         let out = format!("{report}");
         // Maps separated by a blank line (\n\n).
@@ -1310,6 +1377,7 @@ mod tests {
                 }),
             ],
             sdt_allocations: Vec::new(),
+            prog_runtime_stats: Vec::new(),
         };
         let out = format!("{report}");
         // Section header.
@@ -1335,6 +1403,7 @@ mod tests {
                 user_page_table_root: None,
             })],
             sdt_allocations: Vec::new(),
+            prog_runtime_stats: Vec::new(),
         };
         let out = format!("{report}");
         // Map block, blank line, vcpu_regs section.
@@ -1350,6 +1419,7 @@ mod tests {
             maps: Vec::new(),
             vcpu_regs: vec![None],
             sdt_allocations: Vec::new(),
+            prog_runtime_stats: Vec::new(),
         };
         let out = format!("{report}");
         assert_eq!(out, "vcpu_regs:\n  vcpu 0: <unavailable>");
@@ -1379,6 +1449,7 @@ mod tests {
                 user_page_table_root: None,
             })],
             sdt_allocations: Vec::new(),
+            prog_runtime_stats: Vec::new(),
         };
 
         // (a) Display: vcpu_regs section present, no fallback.
@@ -1425,12 +1496,14 @@ mod tests {
             maps: Vec::new(),
             vcpu_regs: vec![None],
             sdt_allocations: Vec::new(),
+            prog_runtime_stats: Vec::new(),
         };
         let late = FailureDumpReport {
             schema: SCHEMA_SINGLE.to_string(),
             maps: Vec::new(),
             vcpu_regs: vec![None, None],
             sdt_allocations: Vec::new(),
+            prog_runtime_stats: Vec::new(),
         };
         let dual = DualFailureDumpReport {
             schema: SCHEMA_DUAL.to_string(),
@@ -1658,6 +1731,51 @@ mod tests {
         );
     }
 
+    /// `prog_runtime_stats` populates and round-trips through
+    /// `FailureDumpReportAny::from_json`. The dispatch test above
+    /// covers the empty-stats path; this test pins that the field
+    /// survives wire encoding when populated, mirroring the
+    /// strict-schema concerns CgroupStats covers in assert.rs.
+    #[test]
+    fn report_any_preserves_prog_runtime_stats() {
+        use super::super::bpf_prog::ProgRuntimeStats;
+        let report = FailureDumpReport {
+            prog_runtime_stats: vec![
+                ProgRuntimeStats {
+                    name: "ktstr_enqueue".to_string(),
+                    cnt: 1_500,
+                    nsecs: 7_500_000,
+                    misses: 2,
+                },
+                ProgRuntimeStats {
+                    name: "ktstr_dispatch".to_string(),
+                    cnt: u64::MAX,
+                    nsecs: u64::MAX,
+                    misses: u64::MAX,
+                },
+            ],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&report).expect("serialize");
+        match FailureDumpReportAny::from_json(&json) {
+            Some(FailureDumpReportAny::Single(loaded)) => {
+                assert_eq!(loaded.prog_runtime_stats.len(), 2);
+                assert_eq!(loaded.prog_runtime_stats[0].name, "ktstr_enqueue");
+                assert_eq!(loaded.prog_runtime_stats[0].cnt, 1_500);
+                assert_eq!(loaded.prog_runtime_stats[0].nsecs, 7_500_000);
+                assert_eq!(loaded.prog_runtime_stats[0].misses, 2);
+                assert_eq!(loaded.prog_runtime_stats[1].name, "ktstr_dispatch");
+                assert_eq!(loaded.prog_runtime_stats[1].cnt, u64::MAX);
+                assert_eq!(loaded.prog_runtime_stats[1].nsecs, u64::MAX);
+                assert_eq!(loaded.prog_runtime_stats[1].misses, u64::MAX);
+            }
+            other => panic!(
+                "populated single report must round-trip Single, got {:?}",
+                other.is_some()
+            ),
+        }
+    }
+
     /// Display roundtrip: a Single-wrapped report renders the same
     /// as the underlying `FailureDumpReport`'s own Display, and a
     /// Dual-wrapped report renders the same as
@@ -1680,5 +1798,137 @@ mod tests {
         let dual_direct = format!("{dual}");
         let dual_via_any = format!("{}", FailureDumpReportAny::Dual(dual));
         assert_eq!(dual_direct, dual_via_any);
+    }
+
+    // -- ProgRuntimeStats coverage in FailureDumpReport --
+
+    /// Roundtrip a populated `prog_runtime_stats` vector through
+    /// serde, including `u64::MAX` for every counter to lock in
+    /// the saturation contract documented on
+    /// [`super::bpf_prog::read_prog_runtime_stats`] (per-CPU sums use
+    /// `saturating_add`, so observing `u64::MAX` post-deserialize
+    /// proves the saturation path didn't silently wrap or truncate).
+    #[test]
+    fn prog_runtime_stats_serde_roundtrip_with_saturation() {
+        let report = FailureDumpReport {
+            schema: SCHEMA_SINGLE.to_string(),
+            maps: Vec::new(),
+            vcpu_regs: Vec::new(),
+            sdt_allocations: Vec::new(),
+            prog_runtime_stats: vec![
+                super::super::bpf_prog::ProgRuntimeStats {
+                    name: "dispatch".to_string(),
+                    cnt: 12345,
+                    nsecs: 67890,
+                    misses: 3,
+                },
+                super::super::bpf_prog::ProgRuntimeStats {
+                    name: "saturated".to_string(),
+                    cnt: u64::MAX,
+                    nsecs: u64::MAX,
+                    misses: u64::MAX,
+                },
+            ],
+        };
+        let json = serde_json::to_string(&report).expect("serialize");
+        let parsed: FailureDumpReport = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.prog_runtime_stats.len(), 2);
+        assert_eq!(parsed.prog_runtime_stats[0].name, "dispatch");
+        assert_eq!(parsed.prog_runtime_stats[0].cnt, 12345);
+        assert_eq!(parsed.prog_runtime_stats[0].nsecs, 67890);
+        assert_eq!(parsed.prog_runtime_stats[0].misses, 3);
+        assert_eq!(parsed.prog_runtime_stats[1].cnt, u64::MAX);
+        assert_eq!(parsed.prog_runtime_stats[1].nsecs, u64::MAX);
+        assert_eq!(parsed.prog_runtime_stats[1].misses, u64::MAX);
+    }
+
+    /// Empty `prog_runtime_stats` skips serialization (the
+    /// `skip_serializing_if = "Vec::is_empty"` attribute) — same
+    /// pattern as the other optional vector fields. Pinning this
+    /// keeps the JSON tight for the common no-struct_ops-loaded
+    /// case.
+    #[test]
+    fn prog_runtime_stats_empty_skips_serialization() {
+        let report = FailureDumpReport::default();
+        let json = serde_json::to_string(&report).expect("serialize");
+        assert!(
+            !json.contains("prog_runtime_stats"),
+            "empty prog_runtime_stats must be skipped: {json}"
+        );
+    }
+
+    /// Display impl renders `prog_runtime_stats` under a labelled
+    /// section so an operator scanning failure-dump output sees
+    /// the per-program counters alongside the maps / vcpu_regs /
+    /// sdt_allocations sections. Pinning this prevents the
+    /// "rendered fields silently drop" regression that would mask
+    /// dump enrichment from reaching log readers.
+    #[test]
+    fn report_display_renders_prog_runtime_stats() {
+        let report = FailureDumpReport {
+            schema: SCHEMA_SINGLE.to_string(),
+            maps: Vec::new(),
+            vcpu_regs: Vec::new(),
+            sdt_allocations: Vec::new(),
+            prog_runtime_stats: vec![
+                super::super::bpf_prog::ProgRuntimeStats {
+                    name: "dispatch".to_string(),
+                    cnt: 5,
+                    nsecs: 1234,
+                    misses: 0,
+                },
+                super::super::bpf_prog::ProgRuntimeStats {
+                    name: "enqueue".to_string(),
+                    cnt: 99,
+                    nsecs: 9999,
+                    misses: 7,
+                },
+            ],
+        };
+        let out = format!("{report}");
+        assert!(
+            out.contains("prog_runtime_stats:"),
+            "Display must render the prog_runtime_stats section: {out}"
+        );
+        assert!(
+            out.contains("dispatch: cnt=5 nsecs=1234 misses=0"),
+            "Display must render first program line: {out}"
+        );
+        assert!(
+            out.contains("enqueue: cnt=99 nsecs=9999 misses=7"),
+            "Display must render second program line: {out}"
+        );
+    }
+
+    /// An all-empty maps/vcpu_regs/sdt_allocations report with
+    /// only `prog_runtime_stats` populated must still render
+    /// rather than fall through to the "(empty failure dump)"
+    /// fallback — the empty-check in the Display impl gates on
+    /// every optional vector, including `prog_runtime_stats`.
+    #[test]
+    fn report_display_only_prog_runtime_stats_does_not_say_empty_dump() {
+        let report = FailureDumpReport {
+            schema: SCHEMA_SINGLE.to_string(),
+            maps: Vec::new(),
+            vcpu_regs: Vec::new(),
+            sdt_allocations: Vec::new(),
+            prog_runtime_stats: vec![super::super::bpf_prog::ProgRuntimeStats {
+                name: "lone".to_string(),
+                cnt: 1,
+                nsecs: 2,
+                misses: 0,
+            }],
+        };
+        let out = format!("{report}");
+        assert!(
+            !out.contains("(empty failure dump)"),
+            "Display must NOT fall through to empty fallback when \
+             prog_runtime_stats is populated: {out}"
+        );
+        assert!(
+            out.starts_with("prog_runtime_stats:"),
+            "Display must lead with prog_runtime_stats section when \
+             only that field is populated: {out}"
+        );
     }
 }

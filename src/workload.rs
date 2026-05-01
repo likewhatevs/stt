@@ -652,8 +652,12 @@ pub(crate) fn resolve_work_type(
 
 /// Linux scheduling policy for a worker process.
 ///
-/// `Fifo` and `RoundRobin` require `CAP_SYS_NICE`. Priority values
-/// are clamped to 1-99.
+/// `Fifo`, `RoundRobin`, and `Deadline` all require `CAP_SYS_NICE`
+/// (kernel/sched/syscalls.c:406, `user_check_sched_setscheduler`
+/// routes rt_policy and dl_policy through `req_priv`). `Normal`,
+/// `Batch`, and (entering) `Idle` are unprivileged transitions for
+/// fair-policy tasks. Priority values for `Fifo`/`RoundRobin` are
+/// clamped to 1-99.
 #[derive(Debug, Clone, Copy)]
 pub enum SchedPolicy {
     /// `SCHED_NORMAL` (CFS/EEVDF).
@@ -666,6 +670,48 @@ pub enum SchedPolicy {
     Fifo(u32),
     /// `SCHED_RR` with the given priority (1-99).
     RoundRobin(u32),
+    /// `SCHED_DEADLINE` with explicit `runtime`, `deadline`, and
+    /// `period` in nanoseconds. Applied via `sched_setattr(2)`.
+    ///
+    /// Constraints (from `__checkparam_dl` in
+    /// `kernel/sched/deadline.c`):
+    /// - `deadline_ns != 0`.
+    /// - `runtime_ns >= 1024` (the kernel's `DL_SCALE` floor).
+    /// - `runtime_ns <= deadline_ns`.
+    /// - `period_ns == 0` is legal — the kernel substitutes
+    ///   `deadline_ns` for the period when zero. When non-zero,
+    ///   `deadline_ns <= period_ns`.
+    /// - The effective period (`period_ns` if non-zero, else
+    ///   `deadline_ns`) is checked against
+    ///   `/proc/sys/kernel/sched_deadline_period_min_us` (default
+    ///   100us = 100_000 ns) and
+    ///   `/proc/sys/kernel/sched_deadline_period_max_us` (default
+    ///   `1 << 22` us = 4_194_304_000 ns), inclusive. Both sysctls
+    ///   are runtime-tunable; this crate does not pre-validate the
+    ///   sysctl range and lets the kernel surface out-of-range
+    ///   values as `EINVAL`.
+    /// - Top bit of `deadline_ns` and `period_ns` must each be clear
+    ///   (kernel uses bit 63 internally).
+    ///
+    /// Transitions to/from `Deadline` always require `CAP_SYS_NICE`.
+    /// Tasks set to `Deadline` get exclusive bandwidth on the
+    /// admission-controlled root domain; oversubscription returns
+    /// `EBUSY` (see `sched_dl_overflow` in
+    /// kernel/sched/deadline.c:3542-3598).
+    ///
+    /// `set_sched_policy` validates the structural constraints
+    /// (zero-deadline, DL_SCALE floor, ordering, top-bit) before
+    /// invoking `sched_setattr` so a malformed `Deadline` fails
+    /// fast in user space rather than tunneling an `EINVAL`
+    /// through the syscall.
+    Deadline {
+        /// Runtime budget per period (ns).
+        runtime_ns: u64,
+        /// Relative deadline from period start (ns).
+        deadline_ns: u64,
+        /// Period (ns).
+        period_ns: u64,
+    },
 }
 
 impl SchedPolicy {
@@ -677,6 +723,17 @@ impl SchedPolicy {
     /// `SCHED_RR` with the given priority (1-99).
     pub fn round_robin(priority: u32) -> Self {
         SchedPolicy::RoundRobin(priority)
+    }
+
+    /// `SCHED_DEADLINE` with the given runtime / deadline / period
+    /// in nanoseconds. See [`SchedPolicy::Deadline`] for parameter
+    /// constraints.
+    pub fn deadline(runtime_ns: u64, deadline_ns: u64, period_ns: u64) -> Self {
+        SchedPolicy::Deadline {
+            runtime_ns,
+            deadline_ns,
+            period_ns,
+        }
     }
 }
 
@@ -3940,6 +3997,123 @@ fn set_sched_policy(pid: libc::pid_t, policy: SchedPolicy) -> Result<()> {
         SchedPolicy::Idle => (libc::SCHED_IDLE, 0),
         SchedPolicy::Fifo(p) => (libc::SCHED_FIFO, p.clamp(1, 99) as i32),
         SchedPolicy::RoundRobin(p) => (libc::SCHED_RR, p.clamp(1, 99) as i32),
+        SchedPolicy::Deadline {
+            runtime_ns,
+            deadline_ns,
+            period_ns,
+        } => {
+            // SCHED_DEADLINE has no `sched_param` representation —
+            // the kernel only accepts it through `sched_setattr(2)`.
+            // glibc does not wrap that syscall, so we issue it
+            // directly via `syscall(SYS_sched_setattr, ...)`.
+            //
+            // `__checkparam_dl` (kernel/sched/deadline.c) rejects
+            // anything that violates `sched_deadline != 0`,
+            // `runtime_ns >= 1024`, the bit-63-clear requirement on
+            // `deadline`/`period`, the `runtime <= deadline <=
+            // effective_period` ordering (where `effective_period`
+            // is `sched_deadline` when `sched_period == 0`), and
+            // the sysctl-controlled period bounds. The sysctl
+            // values are runtime-tunable via
+            // `/proc/sys/kernel/sched_deadline_period_{min,max}_us`,
+            // so this pre-validation only mirrors the structural
+            // checks (zero-deadline, ordering, top-bit, DL_SCALE
+            // floor) — the sysctl bound check happens kernel-side
+            // and surfaces as a syscall EINVAL.
+            if deadline_ns == 0 {
+                anyhow::bail!(
+                    "sched_setattr: deadline_ns must be > 0 (kernel `__checkparam_dl` rejects zero deadline)"
+                );
+            }
+            if runtime_ns < 1024 {
+                anyhow::bail!(
+                    "sched_setattr: runtime_ns ({runtime_ns}) below kernel DL_SCALE floor (1024)"
+                );
+            }
+            if runtime_ns > deadline_ns {
+                anyhow::bail!(
+                    "sched_setattr: runtime_ns ({runtime_ns}) > deadline_ns ({deadline_ns})"
+                );
+            }
+            // `period_ns == 0` is legal: the kernel substitutes
+            // `sched_deadline` for the period in that case (see
+            // `if (!period) period = attr->sched_deadline;` in
+            // `__checkparam_dl`). Only enforce `deadline <=
+            // period` when period is non-zero.
+            if period_ns != 0 && deadline_ns > period_ns {
+                anyhow::bail!(
+                    "sched_setattr: deadline_ns ({deadline_ns}) > period_ns ({period_ns})"
+                );
+            }
+            if deadline_ns & (1u64 << 63) != 0 {
+                anyhow::bail!(
+                    "sched_setattr: deadline_ns top bit must be clear (kernel reserved)"
+                );
+            }
+            if period_ns & (1u64 << 63) != 0 {
+                anyhow::bail!(
+                    "sched_setattr: period_ns top bit must be clear (kernel reserved)"
+                );
+            }
+            // SAFETY: `sched_attr` is a UAPI struct of plain
+            // integer fields (no padding bytes affect kernel
+            // behavior; the kernel reads `size` and treats unknown
+            // tail as zero). Zero-initializing is the canonical
+            // way to construct it because libc's `s!` macro
+            // derives only `Clone, Copy, Debug` — no `Default`.
+            let mut attr: libc::sched_attr = unsafe { std::mem::zeroed() };
+            attr.size = std::mem::size_of::<libc::sched_attr>() as u32;
+            attr.sched_policy = libc::SCHED_DEADLINE as u32;
+            attr.sched_runtime = runtime_ns;
+            attr.sched_deadline = deadline_ns;
+            attr.sched_period = period_ns;
+            // sched_setattr(pid_t pid, struct sched_attr *attr,
+            //               unsigned int flags). flags=0 — the
+            // kernel reserves them for future use.
+            //
+            // SAFETY:
+            // - `pid` is validated > 0 at the top of
+            //   `set_sched_policy`, so the kernel cannot interpret
+            //   it as the broadcast / process-group target encoded
+            //   by 0 / negative pid_t values.
+            // - `&attr` is a borrow of a stack local that lives
+            //   for the entire syscall — we do not move or drop
+            //   `attr` between the borrow and the syscall return.
+            //   `libc::sched_attr` is `#[repr(C)]` (UAPI) and was
+            //   zeroed via `std::mem::zeroed()` then field-
+            //   initialized, so the bytes the kernel reads are
+            //   either the values explicitly set above or zero
+            //   (the kernel-defined unset value for every
+            //   remaining field).
+            // - `attr.size` is the actual `size_of::<libc::sched_attr>()`
+            //   the kernel ABI expects for `sched_setattr(2)`'s
+            //   forward-compat protocol: the kernel uses `size`
+            //   to gate which fields it reads and ignores tail
+            //   bytes beyond its own struct definition. Sending
+            //   our struct's size and zeroing the body cleanly
+            //   covers older AND newer kernels.
+            // - `flags = 0u32` is the only currently-defined
+            //   value; the kernel rejects unknown flag bits with
+            //   EINVAL.
+            // - The kernel copies `attr` into kernel space inside
+            //   the syscall (`copy_struct_from_user` in
+            //   kernel/sched/syscalls.c) and does not retain a
+            //   reference to our stack memory after the syscall
+            //   returns, so the borrow only needs to outlive the
+            //   single syscall.
+            let ret = unsafe {
+                libc::syscall(
+                    libc::SYS_sched_setattr,
+                    pid,
+                    &attr as *const libc::sched_attr,
+                    0u32,
+                )
+            };
+            if ret != 0 {
+                anyhow::bail!("sched_setattr: {}", std::io::Error::last_os_error());
+            }
+            return Ok(());
+        }
     };
     let param = libc::sched_param {
         sched_priority: prio,
@@ -5355,7 +5529,14 @@ mod tests {
     fn set_sched_policy_batch_returns_valid_result() {
         let pid: libc::pid_t = unsafe { libc::getpid() };
         let result = set_sched_policy(pid, SchedPolicy::Batch);
-        // SCHED_BATCH may fail under sched_ext or without CAP_SYS_NICE.
+        // SCHED_BATCH may fail when sched_ext rejects the transition
+        // (`scx_check_setscheduler` in `__sched_setscheduler` at
+        // kernel/sched/syscalls.c:464). It does NOT require
+        // CAP_SYS_NICE: `user_check_sched_setscheduler`
+        // (kernel/sched/syscalls.c:406) routes only rt_policy /
+        // dl_policy / negative-nice / leaving-IDLE through req_priv;
+        // a fair-policy → fair-policy transition that does not
+        // reduce nice never reaches the capable() check.
         match result {
             Ok(()) => {
                 let pol = unsafe { libc::sched_getscheduler(pid) };
@@ -5382,7 +5563,16 @@ mod tests {
     fn set_sched_policy_idle_returns_valid_result() {
         let pid: libc::pid_t = unsafe { libc::getpid() };
         let result = set_sched_policy(pid, SchedPolicy::Idle);
-        // SCHED_IDLE may fail under sched_ext or without CAP_SYS_NICE.
+        // SCHED_IDLE may fail when sched_ext rejects the transition
+        // (`scx_check_setscheduler` in `__sched_setscheduler` at
+        // kernel/sched/syscalls.c:464). It does NOT require
+        // CAP_SYS_NICE for *entering* IDLE:
+        // `user_check_sched_setscheduler`
+        // (kernel/sched/syscalls.c:406) routes the IDLE-related
+        // capability check through `task_has_idle_policy(p) &&
+        // !idle_policy(policy)` — i.e. CAP_SYS_NICE is required
+        // only when *leaving* SCHED_IDLE for a non-idle class
+        // without RLIMIT_NICE permission, not when entering it.
         match result {
             Ok(()) => {
                 let pol = unsafe { libc::sched_getscheduler(pid) };
@@ -5400,6 +5590,185 @@ mod tests {
                 assert!(
                     msg.contains("sched_setscheduler"),
                     "error must name the syscall: {msg}"
+                );
+            }
+        }
+    }
+
+    // -- SCHED_DEADLINE validation tests --
+    //
+    // The five rejection tests below exercise the structural
+    // pre-validation that `set_sched_policy` performs before
+    // issuing the `sched_setattr` syscall. Each invariant mirrors
+    // a `__checkparam_dl` clause (`kernel/sched/deadline.c`); the
+    // tests pin user-space rejection so a malformed `Deadline`
+    // surfaces a named field rather than a generic kernel
+    // `EINVAL`. None of these tests require `CAP_SYS_NICE`
+    // because the bail!s fire before the syscall.
+
+    /// `deadline_ns == 0` must be rejected: `__checkparam_dl`
+    /// returns false on `attr->sched_deadline == 0`. The runtime
+    /// floor is satisfied here so the failure pins the
+    /// zero-deadline check, not the DL_SCALE check.
+    #[test]
+    fn set_sched_policy_deadline_zero_deadline_rejected() {
+        let pid: libc::pid_t = unsafe { libc::getpid() };
+        let result = set_sched_policy(
+            pid,
+            SchedPolicy::Deadline {
+                runtime_ns: 1024,
+                deadline_ns: 0,
+                period_ns: 1_000_000,
+            },
+        );
+        let err = result.expect_err("zero deadline must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("deadline_ns"),
+            "error must name deadline_ns: {msg}"
+        );
+        assert!(
+            msg.contains("must be > 0") || msg.contains("zero"),
+            "error must explain zero rejection: {msg}"
+        );
+    }
+
+    /// `runtime_ns < 1024` must be rejected per the `DL_SCALE`
+    /// floor in `__checkparam_dl`.
+    #[test]
+    fn set_sched_policy_deadline_runtime_below_dl_scale_rejected() {
+        let pid: libc::pid_t = unsafe { libc::getpid() };
+        let result = set_sched_policy(
+            pid,
+            SchedPolicy::Deadline {
+                runtime_ns: 1023,
+                deadline_ns: 100_000,
+                period_ns: 1_000_000,
+            },
+        );
+        let err = result.expect_err("runtime below DL_SCALE must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("runtime_ns"),
+            "error must name runtime_ns: {msg}"
+        );
+        assert!(
+            msg.contains("DL_SCALE") || msg.contains("1024"),
+            "error must reference the floor: {msg}"
+        );
+    }
+
+    /// `runtime_ns > deadline_ns` must be rejected per the
+    /// `runtime <= deadline` clause of `__checkparam_dl`.
+    #[test]
+    fn set_sched_policy_deadline_runtime_exceeds_deadline_rejected() {
+        let pid: libc::pid_t = unsafe { libc::getpid() };
+        let result = set_sched_policy(
+            pid,
+            SchedPolicy::Deadline {
+                runtime_ns: 200_000,
+                deadline_ns: 100_000,
+                period_ns: 1_000_000,
+            },
+        );
+        let err = result.expect_err("runtime > deadline must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("runtime_ns") && msg.contains("deadline_ns"),
+            "error must name both fields: {msg}"
+        );
+    }
+
+    /// `deadline_ns > period_ns` must be rejected when `period_ns
+    /// != 0`. Pairs with
+    /// `set_sched_policy_deadline_period_zero_skips_period_check`
+    /// which proves the gate is conditional on a non-zero period.
+    #[test]
+    fn set_sched_policy_deadline_deadline_exceeds_period_rejected() {
+        let pid: libc::pid_t = unsafe { libc::getpid() };
+        let result = set_sched_policy(
+            pid,
+            SchedPolicy::Deadline {
+                runtime_ns: 1024,
+                deadline_ns: 2_000_000,
+                period_ns: 1_000_000,
+            },
+        );
+        let err = result.expect_err("deadline > period must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("deadline_ns") && msg.contains("period_ns"),
+            "error must name both fields: {msg}"
+        );
+    }
+
+    /// Bit 63 set on `deadline_ns` must be rejected per
+    /// `__checkparam_dl`'s `if (attr->sched_deadline & (1ULL <<
+    /// 63))` clause. Splitting the per-field message means the
+    /// diagnostic names the offending field rather than the
+    /// pair.
+    #[test]
+    fn set_sched_policy_deadline_top_bit_set_rejected() {
+        let pid: libc::pid_t = unsafe { libc::getpid() };
+        let result = set_sched_policy(
+            pid,
+            SchedPolicy::Deadline {
+                runtime_ns: 1024,
+                // Bit 63 set; the surrounding bits keep
+                // `runtime <= deadline` so the rejection pins
+                // the top-bit check.
+                deadline_ns: 1u64 << 63 | 100_000,
+                period_ns: 1_000_000,
+            },
+        );
+        let err = result.expect_err("deadline top bit must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("deadline_ns") && msg.contains("top bit"),
+            "error must name deadline_ns and top bit: {msg}"
+        );
+        // Per-field message: must NOT name period_ns since only
+        // deadline_ns has the top bit set.
+        assert!(
+            !msg.contains("period_ns"),
+            "deadline-only top-bit error must not mention period_ns: {msg}"
+        );
+    }
+
+    /// Happy-path: a structurally valid `Deadline` with
+    /// `period_ns == 0` reaches the `sched_setattr` syscall. The
+    /// kernel substitutes `deadline_ns` for the period in this
+    /// case (see `if (!period) period = attr->sched_deadline;`
+    /// in `__checkparam_dl`). Without `CAP_SYS_NICE` the syscall
+    /// fails with EPERM at the kernel-side capability check;
+    /// either Ok(()) or an Err whose message names
+    /// `sched_setattr` confirms we cleared the user-space
+    /// pre-validation. Marked `#[ignore]` so unprivileged CI
+    /// doesn't see EPERM as a hard failure — runners with
+    /// CAP_SYS_NICE can opt in.
+    #[test]
+    #[ignore]
+    fn set_sched_policy_deadline_period_zero_passes_validation() {
+        let pid: libc::pid_t = unsafe { libc::getpid() };
+        let result = set_sched_policy(
+            pid,
+            SchedPolicy::Deadline {
+                runtime_ns: 1024,
+                deadline_ns: 200_000,
+                period_ns: 0,
+            },
+        );
+        match result {
+            Ok(()) => {
+                // Restore SCHED_NORMAL so the test process leaves
+                // its run with default policy.
+                restore_normal(pid);
+            }
+            Err(e) => {
+                let msg = format!("{e:#}");
+                assert!(
+                    msg.contains("sched_setattr"),
+                    "validation must have passed (error from kernel must name sched_setattr): {msg}"
                 );
             }
         }

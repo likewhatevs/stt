@@ -142,6 +142,28 @@ u64 ktstr_trigger_count = 0;
 u64 ktstr_probe_count = 0;
 u64 ktstr_meta_miss = 0;
 
+/* Counts kprobe runs that completed past the meta lookup, scratch
+ * lookup, and arg/field reads, and committed an entry to probe_data.
+ * Pairs with ktstr_probe_count: (probe_count - kprobe_returns) is the
+ * number of kprobe fires that bailed early (meta miss / scratch miss).
+ * The timeline sampler reads this alongside ktstr_probe_count so an
+ * operator sees commit-rate vs fire-rate at every tick. */
+u64 ktstr_kprobe_returns = 0;
+
+/* Number of times the trigger handler's bpf_ringbuf_reserve() failed.
+ * A ringbuf full at error-exit time means the userspace consumer
+ * fell behind, so the auto-repro path will see a missing event;
+ * surfacing the drop count distinguishes "scheduler did not error"
+ * from "scheduler errored but the event never made it to userspace". */
+u64 ktstr_ringbuf_drops = 0;
+
+/* Nanosecond timestamp (bpf_ktime_get_ns) of the first error-class
+ * sched_ext_exit fire — written exactly once when the latch flips
+ * 0 -> 1. Lets the timeline render "first error visible at T+X ms"
+ * and lets a host-side observer correlate the latch transition with
+ * the rest of the sample series. Sticky: stays at the first value. */
+u64 ktstr_last_trigger_ts = 0;
+
 /* Log of IPs that missed func_meta_map lookup, for diagnosis. */
 u64 ktstr_miss_log[MAX_MISS_LOG] = {};
 u32 ktstr_miss_log_idx = 0;
@@ -237,6 +259,7 @@ int ktstr_probe(struct pt_regs *ctx)
 	struct probe_key key = { .func_ip = ip, .task_ptr = task_ptr };
 	bpf_map_update_elem(&probe_data, &key, entry, BPF_ANY);
 
+	__sync_fetch_and_add(&ktstr_kprobe_returns, 1);
 	return 0;
 }
 
@@ -266,6 +289,17 @@ int BPF_PROG(ktstr_trigger_tp, unsigned int kind)
 	 * (SCX_EXIT_ERROR, SCX_EXIT_ERROR_BPF, SCX_EXIT_ERROR_STALL).
 	 * Sticky: re-firing the tracepoint does not unset it.
 	 *
+	 * Capture the timestamp BEFORE the latch CAS so a host-side
+	 * observer that polls `ktstr_err_exit_detected` and sees `1` is
+	 * guaranteed to also see a non-zero `ktstr_last_trigger_ts`.
+	 * The previous order (CAS first, ts after) opened a window where
+	 * the host could observe `latch=1` while `ts` was still the
+	 * initial 0 — surfacing a "first error visible at T+0 ms"
+	 * artifact in the timeline. Storing ts first and then publishing
+	 * the latch transition closes that window: the CAS provides
+	 * release semantics so the ts store happens-before the latch
+	 * write any other CPU sees.
+	 *
 	 * Use __sync_val_compare_and_swap() rather than a plain store so
 	 * the publication has full-barrier semantics: the BPF backend
 	 * lowers it to a BPF atomic compare-exchange which carries an
@@ -274,7 +308,20 @@ int BPF_PROG(ktstr_trigger_tp, unsigned int kind)
 	 * weakly-ordered architectures (aarch64). __sync_synchronize()
 	 * cannot be used because the BPF LLVM backend cannot select an
 	 * AtomicFence node.
+	 *
+	 * Concurrent error-class fires across multiple scx_sched
+	 * instances can race on the ts store — every fire writes its
+	 * own bpf_ktime_get_ns() result before attempting the CAS, so
+	 * the persisted ts is one of the racing fires' timestamps
+	 * (always non-zero by the time any reader sees latch=1). This
+	 * relaxes the older "first writer's ts wins" sticky semantic
+	 * to "any racing fire's ts wins" — the deviations between
+	 * concurrent racing fires are sub-microsecond on modern x86
+	 * (see `bpf_ktime_get_ns` -> `ktime_get_mono_fast_ns`) and
+	 * irrelevant to the timeline-correlation use case the field
+	 * exists for.
 	 */
+	ktstr_last_trigger_ts = bpf_ktime_get_ns();
 	__sync_val_compare_and_swap(&ktstr_err_exit_detected, 0u, 1u);
 
 	/*
@@ -294,8 +341,10 @@ int BPF_PROG(ktstr_trigger_tp, unsigned int kind)
 
 	struct probe_event *event = bpf_ringbuf_reserve(&events,
 							sizeof(*event), 0);
-	if (!event)
+	if (!event) {
+		__sync_fetch_and_add(&ktstr_ringbuf_drops, 1);
 		return 0;
+	}
 
 	event->type = EVENT_TRIGGER;
 	event->tid = tid;
