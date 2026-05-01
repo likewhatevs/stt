@@ -1,5 +1,14 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 #include <scx/common.bpf.h>
+#include <lib/sdt_task.h>
+
+/* The BPF arena map itself is defined `__weak` by `<lib/arena_map.h>`
+ * (pulled in by the fetched `lib/sdt_alloc.bpf.c`, which then defines
+ * the map at file scope). Linking that .bpf.o into the final
+ * `bpf.bpf.o` brings exactly one map definition into scope, so
+ * main.bpf.c does not redeclare it here. The `__arena` qualifier this
+ * file uses on `struct ktstr_arena_ctx __arena *` is provided by
+ * `<bpf_arena_common.bpf.h>`, which `<lib/sdt_task.h>` includes. */
 
 enum {
 	SHARED_DSQ = 0,
@@ -8,6 +17,48 @@ enum {
 char _license[] SEC("license") = "GPL";
 
 UEI_DEFINE(uei);
+
+/* Per-task arena context allocated in `ktstr_init_task` and freed in
+ * `ktstr_exit_task`. Each instance lives in BPF arena memory; the
+ * payload is reached from userspace via `scx_task_data(p)` (see
+ * `lib/sdt_task.bpf.c::scx_task_data`).
+ *
+ * The struct is laid out so the failure-dump renderer can recognize a
+ * captured page in the arena snapshot:
+ *   - `magic` carries `KTSTR_ARENA_MAGIC`, an 8-byte recognizable
+ *     constant the host-side BTF Datasec walker looks for to confirm
+ *     a page belongs to this scheduler.
+ *   - `counter` carries `KTSTR_TASK_COUNTER`, a small u32 set
+ *     unconditionally on every alloc so the renderer sees a non-zero
+ *     value in the captured page contents.
+ *   - `_pad` keeps the struct 16-byte aligned to match
+ *     `SDT_TASK_MIN_ELEM_PER_ALLOC`'s round-up assumption in
+ *     `lib/sdt_alloc.bpf.c::scx_alloc_init` (data_size is rounded
+ *     up to 8 there; 16-byte alignment removes any pool-fragmentation
+ *     question for downstream readers).
+ */
+struct ktstr_arena_ctx {
+	__u64 magic;
+	__u32 counter;
+	__u32 _pad;
+};
+
+/* Sentinel written into `ktstr_arena_ctx::magic` at every alloc.
+ * Recognizable as an 8-byte little-endian pattern in arena page
+ * captures so the host-side renderer can confirm a page belongs to
+ * this scheduler. */
+#define KTSTR_ARENA_MAGIC 0xDEADBEEFCAFEBABEULL
+
+/* Recognizable counter value stamped into `ktstr_arena_ctx::counter`
+ * on every alloc. */
+#define KTSTR_TASK_COUNTER 42U
+
+/* Cumulative count of `ktstr_init_task` allocations that succeeded.
+ * Lives in .bss so the BTF Datasec walker surfaces it under the
+ * .bss section alongside the stall/crash flags. Updated with
+ * `__sync_fetch_and_add` because `ktstr_init_task` is called per
+ * task across all CPUs concurrently. */
+__u64 ktstr_alloc_count;
 
 /* When non-zero, ktstr_dispatch stops moving tasks from the shared DSQ,
  * causing a deliberate stall that triggers the scx watchdog. */
@@ -135,7 +186,53 @@ void BPF_STRUCT_OPS(ktstr_dispatch, s32 cpu, struct task_struct *prev)
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(ktstr_init)
 {
-	return scx_bpf_create_dsq(SHARED_DSQ, -1);
+	int ret;
+
+	ret = scx_bpf_create_dsq(SHARED_DSQ, -1);
+	if (ret)
+		return ret;
+
+	/* Bring the sdt_alloc per-task allocator online so subsequent
+	 * `scx_task_alloc(p)` calls in `ktstr_init_task` succeed. The
+	 * data_size argument is the per-task payload size that the
+	 * allocator's pool will hand out; passing
+	 * `sizeof(struct ktstr_arena_ctx)` matches the struct that
+	 * `ktstr_init_task` writes into. `scx_task_init` rounds this up
+	 * to 8 bytes inside `lib/sdt_alloc.bpf.c::pool_set_size`, so
+	 * the actual pool element size is at least 16 bytes. */
+	return scx_task_init(sizeof(struct ktstr_arena_ctx));
+}
+
+s32 BPF_STRUCT_OPS_SLEEPABLE(ktstr_init_task, struct task_struct *p,
+			     struct scx_init_task_args *args)
+{
+	struct ktstr_arena_ctx __arena *taskc;
+
+	/* `scx_task_alloc` takes the allocator spinlock and calls
+	 * `bpf_arena_alloc_pages` from a sleepable context to back-fill
+	 * the chunk pool when needed; init_task is sleepable so this
+	 * is allowed. */
+	taskc = scx_task_alloc(p);
+	if (!taskc)
+		return -ENOMEM;
+
+	/* Stamp the recognizable values directly through the `__arena`
+	 * pointer. LLVM lowers each store via the BPF arena
+	 * address-space cast emitted from the `__arena` attribute, so
+	 * the verifier sees a normal arena store and the JIT writes
+	 * into the per-page kernel-VM mapping. */
+	taskc->magic = KTSTR_ARENA_MAGIC;
+	taskc->counter = KTSTR_TASK_COUNTER;
+	taskc->_pad = 0;
+
+	__sync_fetch_and_add(&ktstr_alloc_count, 1);
+	return 0;
+}
+
+void BPF_STRUCT_OPS(ktstr_exit_task, struct task_struct *p,
+		    struct scx_exit_task_args *args)
+{
+	scx_task_free(p);
 }
 
 void BPF_STRUCT_OPS(ktstr_exit, struct scx_exit_info *ei)
@@ -146,6 +243,8 @@ void BPF_STRUCT_OPS(ktstr_exit, struct scx_exit_info *ei)
 SCX_OPS_DEFINE(ktstr_ops,
 	       .enqueue		= (void *)ktstr_enqueue,
 	       .dispatch	= (void *)ktstr_dispatch,
+	       .init_task	= (void *)ktstr_init_task,
+	       .exit_task	= (void *)ktstr_exit_task,
 	       .init		= (void *)ktstr_init,
 	       .exit		= (void *)ktstr_exit,
 	       .timeout_ms	= 20000,

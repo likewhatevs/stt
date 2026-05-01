@@ -17,3 +17,7 @@ scx_utils = "1.1.0"
 
 [build-dependencies]
 scx_cargo = "1.1.0"
+flate2 = "1"
+gix = { version = "0.81", default-features = false, features = ["sha1", "blocking-network-client", "blocking-http-transport-reqwest-rust-tls", "worktree-mutation"] }
+reqwest = { version = "0.13", features = ["blocking"] }
+tar = "0.4"

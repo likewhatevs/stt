@@ -4973,9 +4973,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "ctrlc",
+ "flate2",
+ "gix",
  "libbpf-rs",
+ "reqwest 0.13.2",
  "scx_cargo",
  "scx_utils",
+ "tar",
 ]
 
 [[package]]
