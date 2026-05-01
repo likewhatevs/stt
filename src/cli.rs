@@ -323,8 +323,9 @@ pub const EXTRA_KCONFIG_HELP: &str = "Additional kconfig fragment merged on top 
      `make olddefconfig` resolves dependencies. Each unique fragment \
      produces a distinct cache slot via the `kc{baked}-xkc{extra}` \
      key suffix. After build, `validate_kernel_config` rejects \
-     entries that disabled critical baked-in symbols (CONFIG_BPF, \
-     CONFIG_DEBUG_INFO_BTF, CONFIG_FTRACE, CONFIG_SCHED_CLASS_EXT). \
+     entries that disabled critical baked-in symbols \
+     (CONFIG_SCHED_CLASS_EXT, CONFIG_DEBUG_INFO_BTF, CONFIG_BPF_SYSCALL, \
+     CONFIG_FTRACE, CONFIG_KPROBE_EVENTS, CONFIG_BPF_EVENTS). \
      The baked-in fragment lives at `ktstr.kconfig` in the ktstr \
      repository root.";
 

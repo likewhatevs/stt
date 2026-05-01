@@ -19,19 +19,25 @@
 //!
 //! # Naming conventions
 //!
-//! ## "Kind" vs "Mode" suffixes
+//! ## "Intent" vs "Resolved" naming
 //!
-//! Types ending in `Kind` carry **test-author intent** (the input to
-//! the workload pipeline). Types ending in `Mode` carry **runtime-
-//! resolved configuration** (the output of intent + topology +
-//! cgroup state). [`AffinityIntent`] resolves to [`ResolvedAffinity`] at
-//! spawn time via [`resolve_affinity_for_cgroup`](crate::scenario::resolve_affinity_for_cgroup);
+//! Types named with an `Intent` suffix carry **test-author intent**
+//! (the input to the workload pipeline). Types named with a
+//! `Resolved` prefix carry **runtime-resolved configuration** (the
+//! output of intent + topology + cgroup state). [`AffinityIntent`]
+//! resolves to [`ResolvedAffinity`] at spawn time via
+//! [`resolve_affinity_for_cgroup`](crate::scenario::resolve_affinity_for_cgroup).
+//!
 //! [`CloneMode`] is a runtime-resolved value because the test
 //! author writes `CloneMode::Fork` / `CloneMode::Thread` directly
-//! (no resolution layer). [`SchedClass`] and [`SchedPolicy`] follow
-//! the same coarse-intent / concrete-runtime split using legacy
-//! kernel terminology rather than the `Kind`/`Mode` suffixes — see
-//! [`SchedClass`] for the per-class mapping.
+//! (no resolution layer); the `Mode` suffix denotes a single
+//! kernel-facing dispatch decision rather than a two-stage
+//! intent/resolved pipeline.
+//!
+//! [`SchedClass`] and [`SchedPolicy`] follow the same coarse-intent /
+//! concrete-runtime split using legacy kernel terminology rather
+//! than the `Intent`/`Resolved` naming — see [`SchedClass`] for
+//! the per-class mapping.
 //!
 //! ## "Churn" vs "Sweep" suffixes on [`WorkType`] variants
 //!
