@@ -2495,11 +2495,10 @@ pub fn kernel_build_pipeline(
         let configure_result = Spinner::with_progress("Configuring kernel...", "Kernel configured", |_| {
             configure_kernel(source_dir, &merged_fragment)
         });
-        // Per coordinator ruling D3: wrap configure errors with
-        // `--extra-kconfig` context when extras are present so the
-        // user can pinpoint which input is responsible for an
-        // olddefconfig failure (e.g. a malformed `CONFIG_X=` line in
-        // their fragment).
+        // Wrap configure errors with `--extra-kconfig` context when
+        // extras are present so the user can pinpoint which input is
+        // responsible for an olddefconfig failure (e.g. a malformed
+        // `CONFIG_X=` line in their fragment).
         configure_result.with_context(|| {
             if extra_kconfig.is_some() {
                 "kernel configure failed (with --extra-kconfig fragment merged on top of \
@@ -11828,8 +11827,7 @@ mod tests {
     /// surviving versions sort ascending by `(major, minor, patch,
     /// rc)` regardless of input order, so a regression that left
     /// the releases.json order leaking through (newest-first instead
-    /// of oldest-first per the coordinator's ascending ruling) lands
-    /// here.
+    /// of the documented oldest-first ordering) lands here.
     #[test]
     fn filter_and_sort_range_basic() {
         use crate::kernel_path::decompose_version_for_compare;
@@ -11955,8 +11953,8 @@ mod tests {
     }
 
     /// Mainline/linux-next/etc. monikers are dropped even when they
-    /// fall inside the interval. Pins the stable+longterm-only filter
-    /// the coordinator's ruling A specified.
+    /// fall inside the interval. Pins the stable+longterm-only
+    /// filter.
     #[test]
     fn filter_and_sort_range_drops_non_stable_monikers() {
         use crate::kernel_path::decompose_version_for_compare;

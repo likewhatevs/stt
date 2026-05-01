@@ -644,8 +644,8 @@ pub mod prelude {
     // `resolve_scheduler`, `resolve_test_kernel`.
     pub use crate::topology::{LlcInfo, NodeMemInfo, TestTopology};
     pub use crate::workload::{
-        AffinityKind, AffinityMode, CloneFlags, CloneMode, MemPolicy, Migration, MpolFlags, Phase,
-        SchedPolicy, Work, WorkType, WorkerReport, WorkloadConfig, WorkloadHandle, build_nodemask,
+        AffinityIntent, ResolvedAffinity, CloneFlags, CloneMode, MemPolicy, Migration, MpolFlags, Phase,
+        SchedPolicy, WorkSpec, WorkType, WorkerReport, WorkloadConfig, WorkloadHandle, build_nodemask,
     };
 }
 
@@ -1523,8 +1523,8 @@ mod tests {
     fn cache_key_suffix_with_extra_some_differs_from_bare_suffix() {
         let suffix = cache_key_suffix_with_extra(Some("CONFIG_FOO=y\n"));
         assert_ne!(suffix, cache_key_suffix());
-        // Width pin per coordinator item 15: the suffix-shape
-        // contract embeds the same 8-hex-char width on both segments.
+        // Width pin: the suffix-shape contract embeds the same
+        // 8-hex-char width on both segments.
         let baked = kconfig_hash();
         let after = &suffix[baked.len()..];
         assert_eq!(
@@ -1534,13 +1534,13 @@ mod tests {
         );
     }
 
-    /// Production format-string shape assertion (coordinator item
-    /// 16): the suffix `cache_key_suffix_with_extra(Some(...))`
-    /// produces must be exactly the literal
-    /// `format!("{baked}-xkc{extra_hash}")` cargo-ktstr.rs uses to
-    /// build its tarball cache key. Pins the structural mirror so
-    /// a refactor that changed the helper's format would surface
-    /// here as a divergence from the production call site.
+    /// Production format-string shape assertion: the suffix
+    /// `cache_key_suffix_with_extra(Some(...))` produces must be
+    /// exactly the literal `format!("{baked}-xkc{extra_hash}")`
+    /// cargo-ktstr.rs uses to build its tarball cache key. Pins
+    /// the structural mirror so a refactor that changed the
+    /// helper's format would surface here as a divergence from
+    /// the production call site.
     #[test]
     fn cache_key_suffix_with_extra_matches_production_format_string() {
         let extra = "CONFIG_FOO=y\n";
@@ -1612,11 +1612,10 @@ mod tests {
         }
     }
 
-    /// `extra_kconfig_hash` hashes raw bytes — per coordinator
-    /// rulings D1 (no comment stripping) and D2 (no CRLF
-    /// canonicalization). Two semantically-equivalent inputs with
-    /// different comments or line endings produce different hashes
-    /// and therefore land at distinct cache slots.
+    /// `extra_kconfig_hash` hashes raw bytes — no comment stripping,
+    /// no CRLF canonicalization. Two semantically-equivalent inputs
+    /// with different comments or line endings produce different
+    /// hashes and therefore land at distinct cache slots.
     #[test]
     fn extra_kconfig_hash_is_byte_sensitive() {
         let lf = "CONFIG_FOO=y\n";
@@ -1717,10 +1716,10 @@ mod tests {
         );
     }
 
-    /// MERGE-SEMANTICS pin (coordinator item 17 + 20): when the
-    /// user fragment overrides a baked-in symbol, the merged
-    /// content fed to `make olddefconfig` must place the user
-    /// line LAST so kbuild's last-wins rule
+    /// MERGE-SEMANTICS pin: when the user fragment overrides a
+    /// baked-in symbol, the merged content fed to
+    /// `make olddefconfig` must place the user line LAST so
+    /// kbuild's last-wins rule
     /// (`scripts/kconfig/confdata.c::conf_read_simple` — "If
     /// conflicting CONFIG options are given from an input file,
     /// the last one wins.") makes the user value take precedence.
@@ -1779,8 +1778,8 @@ mod tests {
         );
     }
 
-    /// NON-CONFLICT pin (coordinator item 17): when the user
-    /// fragment adds a symbol the baked-in fragment doesn't
+    /// NON-CONFLICT pin: when the user fragment adds a symbol the
+    /// baked-in fragment doesn't
     /// mention, the merged content carries BOTH lines verbatim.
     /// `make olddefconfig` then sees two distinct symbols (one
     /// from each origin) and produces a `.config` containing

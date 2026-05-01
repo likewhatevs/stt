@@ -6,16 +6,59 @@
 //! - [`WorkloadConfig`] -- spawn configuration (count, affinity, work type, policy)
 //! - [`WorkloadHandle`] -- RAII handle to spawned workers
 //! - [`WorkerReport`] -- per-worker telemetry collected after stop
-//! - [`AffinityKind`] -- per-worker affinity intent (Inherit, LlcAligned, Exact, etc.)
-//! - [`AffinityMode`] -- resolved CPU affinity for workers
-//! - [`Work`] -- workload definition for a single group of workers within a cgroup
+//! - [`AffinityIntent`] -- per-worker affinity intent (Inherit, LlcAligned, Exact, etc.)
+//! - [`ResolvedAffinity`] -- resolved CPU affinity for workers
+//! - [`WorkSpec`] -- workload definition for a single group of workers within a cgroup
 //! - [`Phase`] -- a single phase in a [`WorkType::Sequence`] compound work pattern
 //! - [`SchedPolicy`] -- Linux scheduling policy for a worker process
 //! - [`MemPolicy`] -- NUMA memory placement policy for worker processes
 //!
-//! See the [Work Types](https://likewhatevs.github.io/ktstr/guide/concepts/work-types.html)
+//! See the [WorkSpec Types](https://likewhatevs.github.io/ktstr/guide/concepts/work-types.html)
 //! and [Worker Processes](https://likewhatevs.github.io/ktstr/guide/architecture/workers.html)
 //! chapters of the guide.
+//!
+//! # Naming conventions
+//!
+//! ## "Kind" vs "Mode" suffixes
+//!
+//! Types ending in `Kind` carry **test-author intent** (the input to
+//! the workload pipeline). Types ending in `Mode` carry **runtime-
+//! resolved configuration** (the output of intent + topology +
+//! cgroup state). [`AffinityIntent`] resolves to [`ResolvedAffinity`] at
+//! spawn time via [`resolve_affinity_for_cgroup`](crate::scenario::resolve_affinity_for_cgroup);
+//! [`CloneMode`] is a runtime-resolved value because the test
+//! author writes `CloneMode::Fork` / `CloneMode::Thread` directly
+//! (no resolution layer). [`SchedClass`] and [`SchedPolicy`] follow
+//! the same coarse-intent / concrete-runtime split using legacy
+//! kernel terminology rather than the `Kind`/`Mode` suffixes — see
+//! [`SchedClass`] for the per-class mapping.
+//!
+//! ## "Churn" vs "Sweep" suffixes on [`WorkType`] variants
+//!
+//! Variants whose names end in `Churn` cycle their target setting
+//! **without ordering** — each iteration picks a fresh value
+//! independently of the previous one. [`WorkType::AffinityChurn`]
+//! samples a random CPU from the effective cpuset on every
+//! iteration; [`WorkType::PolicyChurn`] cycles through the
+//! supported scheduling policies; [`WorkType::PageFaultChurn`]
+//! touches a fresh random subset of pages each cycle. The intent
+//! is high-frequency randomness — exercise the kernel's per-task
+//! state machines under unpredictable transitions.
+//!
+//! Variants whose names end in `Sweep` rotate their target setting
+//! through an **ordered list or range** — the next value is a
+//! deterministic function of the iteration counter, not a random
+//! pick. [`WorkType::NiceSweep`] cycles nice values from
+//! `effective_min..=19` modulo the range size;
+//! [`WorkType::NumaWorkingSetSweep`] rotates the working-set
+//! binding through `target_nodes` in declaration order. The
+//! intent is to walk a phase space evenly so every value gets
+//! comparable observation time, rather than producing the
+//! unbiased-random transitions Churn produces.
+//!
+//! Choose `Churn` when the workload's value is its
+//! transition-frequency entropy; choose `Sweep` when the workload
+//! must visit every phase deterministically.
 
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
@@ -44,13 +87,13 @@ compile_error!(
 
 /// Scenario-level affinity intent for a group of workers.
 ///
-/// Resolved to a concrete [`AffinityMode`] at runtime based on the
+/// Resolved to a concrete [`ResolvedAffinity`] at runtime based on the
 /// cgroup's effective cpuset and the VM's topology. When attached to
-/// a [`Work`], determines per-worker `sched_setaffinity` masks.
+/// a [`WorkSpec`], determines per-worker `sched_setaffinity` masks.
 ///
 /// Resolution uses [`resolve_affinity_for_cgroup()`](crate::scenario::resolve_affinity_for_cgroup).
 #[derive(Clone, Debug, Default)]
-pub enum AffinityKind {
+pub enum AffinityIntent {
     /// No affinity constraint -- inherit from parent cgroup.
     #[default]
     Inherit,
@@ -67,21 +110,21 @@ pub enum AffinityKind {
     Exact(BTreeSet<usize>),
 }
 
-impl AffinityKind {
+impl AffinityIntent {
     /// Construct an `Exact` affinity from any iterator of CPU indices.
     ///
     /// Accepts arrays, ranges, `Vec`, `BTreeSet`, or any `IntoIterator<Item = usize>`.
     pub fn exact(cpus: impl IntoIterator<Item = usize>) -> Self {
-        AffinityKind::Exact(cpus.into_iter().collect())
+        AffinityIntent::Exact(cpus.into_iter().collect())
     }
 }
 
 /// Resolved CPU affinity for a worker process.
 ///
-/// Created from [`AffinityKind`] at runtime based on topology and
+/// Created from [`AffinityIntent`] at runtime based on topology and
 /// cpuset assignments.
 #[derive(Debug, Clone)]
-pub enum AffinityMode {
+pub enum ResolvedAffinity {
     /// No affinity constraint.
     None,
     /// Pin to a specific set of CPUs.
@@ -151,7 +194,7 @@ pub enum WorkType {
     /// no-op (`noop_fsync`), so the sleep provides the blocking behavior
     /// that real disk fsync would cause.
     IoSync,
-    /// Work hard for burst_ms, sleep for sleep_ms, repeat. Frees CPUs during sleep for borrowing.
+    /// WorkSpec hard for burst_ms, sleep for sleep_ms, repeat. Frees CPUs during sleep for borrowing.
     Bursty { burst_ms: u64, sleep_ms: u64 },
     /// CPU burst then 1-byte pipe exchange with a partner worker. Sleep
     /// duration depends on partner scheduling, exercising cross-CPU wake
@@ -364,7 +407,7 @@ pub enum WorkType {
     /// Tests both halves of the rt_mutex PI chain under the same
     /// workload shape.
     ///
-    /// Requires same-CPU pinning (e.g. [`AffinityKind::SingleCpu`])
+    /// Requires same-CPU pinning (e.g. [`AffinityIntent::SingleCpu`])
     /// for `medium` to actually preempt `low`. Without pinning, the
     /// scheduler distributes the priorities across CPUs and the
     /// inversion never materialises.
@@ -432,7 +475,7 @@ pub enum WorkType {
     /// scx_ext docs), the SCHED_NORMAL workers starve.
     ///
     /// Reproducer setup: pin both groups to the same CPU set
-    /// (e.g. via [`AffinityKind::SingleCpu`]), and on the host set
+    /// (e.g. via [`AffinityIntent::SingleCpu`]), and on the host set
     /// `sysctl_sched_rt_runtime_us=-1` for unlimited RT bandwidth
     /// (otherwise the kernel rt_period throttle unstuck things
     /// after 0.95s).
@@ -1681,6 +1724,42 @@ impl std::ops::BitOr for CloneFlags {
 /// redesign will reuse it; the variant constructors are exposed so
 /// callers can write tests that pin the planned API surface ahead
 /// of dispatch.
+///
+/// # `WorkType` × `CloneMode` compatibility
+///
+/// Most [`WorkType`] variants compose with any [`CloneMode`]. The
+/// exceptions are surfaced at spawn time by [`WorkloadHandle::spawn`]:
+///
+/// | WorkType                        | Fork | Thread | SharedVm/Raw   |
+/// |---------------------------------|------|--------|----------------|
+/// | All variants (default)          | OK   | OK     | bail (status)  |
+/// | [`WorkType::ForkExit`]          | OK   | reject | bail (status)  |
+///
+/// `ForkExit + Thread` is rejected because the worker body calls
+/// `libc::fork()` from inside a thread of the parent's tgid; the
+/// child then calls `_exit(0)`, which the kernel routes through
+/// `do_exit`, tearing down the entire tgid (every sibling thread
+/// dies). Use [`CloneMode::Fork`] for [`WorkType::ForkExit`].
+///
+/// Other Thread-mode interactions worth knowing:
+///
+/// - [`WorkType::NiceSweep`]: `setpriority(PRIO_PROCESS, 0, …)`
+///   targets the calling task only (`kernel/sys.c::sys_setpriority`
+///   `case PRIO_PROCESS: if (who == 0) p = current`), so each
+///   sibling thread independently sweeps its own nice. Allowed.
+/// - [`WorkType::AffinityChurn`]: `sched_setaffinity(0, …)`
+///   addresses the calling thread by kernel rule
+///   (`kernel/sched/syscalls.c::sched_setaffinity`). Allowed; no
+///   cross-thread interference.
+/// - [`WorkType::PolicyChurn`]: `sched_setscheduler(0, …)` is also
+///   per-task. Allowed.
+/// - [`WorkType::AsymmetricWaker`] with an RT class: legal but
+///   the harness still runs as its original (likely SCHED_NORMAL)
+///   policy; only the worker thread is RT.
+///
+/// `SharedVm` and `Raw` currently bail at spawn for any
+/// `WorkType` (see status note above); the table reflects the
+/// post-dispatch landscape.
 #[derive(Clone, Debug, Default)]
 pub enum CloneMode {
     /// Plain `fork(2)`: separate address space, separate thread
@@ -1689,13 +1768,11 @@ pub enum CloneMode {
     #[default]
     Fork,
     /// Same thread group as the spawning process. Implementation
-    /// uses [`std::thread::spawn`], which sets `CLONE_THREAD |
-    /// CLONE_SIGHAND | CLONE_VM | CLONE_FS | CLONE_FILES |
-    /// CLONE_SYSVSEM | CLONE_SETTLS | CLONE_PARENT_SETTID |
-    /// CLONE_CHILD_CLEARTID` under the hood (glibc/musl pthread
-    /// internals). Reaped via [`std::thread::JoinHandle`]. Workers
-    /// share `tgid`, signal-handler table, and address space with
-    /// the parent — observers like `task_struct->group_leader`,
+    /// uses [`std::thread::spawn`]; the Rust thread runtime owns
+    /// all clone-flag selection internally (the user does not pass
+    /// flags via this variant). Reaped via [`std::thread::JoinHandle`].
+    /// Workers share `tgid`, signal-handler table, and address space
+    /// with the parent — observers like `task_struct->group_leader`,
     /// `tgid`, `real_parent` all match the parent's.
     Thread,
     /// Shared VM but a *different* `tgid`. Issued via raw
@@ -1712,6 +1789,14 @@ pub enum CloneMode {
     /// caller. The flag set is validated against the kernel's
     /// `copy_process` rejection rules at spawn time —
     /// [`validate_clone_flags`] for the exhaustive list.
+    ///
+    /// `Raw(CloneFlags::NONE)` is observationally equivalent to
+    /// [`Fork`](Self::Fork) from the kernel's perspective (no clone
+    /// flags = process fork) but goes through the clone3 dispatch
+    /// path, which adds `CLONE_PIDFD`, allocates a child stack
+    /// mmap, and reaps via pidfd polling. Prefer [`Fork`](Self::Fork)
+    /// for that case; reserve `Raw` for flag sets that need at
+    /// least one explicit bit.
     Raw(CloneFlags),
 }
 
@@ -2013,7 +2098,7 @@ pub struct WorkloadConfig {
     /// Number of worker processes to fork.
     pub num_workers: usize,
     /// CPU affinity mode for workers.
-    pub affinity: AffinityMode,
+    pub affinity: ResolvedAffinity,
     /// What each worker does.
     pub work_type: WorkType,
     /// Linux scheduling policy.
@@ -2047,7 +2132,7 @@ impl Default for WorkloadConfig {
     fn default() -> Self {
         Self {
             num_workers: 1,
-            affinity: AffinityMode::None,
+            affinity: ResolvedAffinity::None,
             work_type: WorkType::CpuSpin,
             sched_policy: SchedPolicy::Normal,
             mem_policy: MemPolicy::Default,
@@ -2066,7 +2151,7 @@ impl WorkloadConfig {
     }
 
     /// Set the resolved CPU affinity.
-    pub fn affinity(mut self, a: AffinityMode) -> Self {
+    pub fn affinity(mut self, a: ResolvedAffinity) -> Self {
         self.affinity = a;
         self
     }
@@ -2118,12 +2203,12 @@ impl WorkloadConfig {
 /// Workload definition for a single group of workers within a cgroup.
 ///
 /// Extracted from [`CgroupDef`](crate::scenario::ops::CgroupDef) to allow
-/// multiple concurrent work groups per cgroup. Each `Work` spawns its own
+/// multiple concurrent work groups per cgroup. Each `WorkSpec` spawns its own
 /// set of worker processes.
 ///
 /// ```
-/// # use ktstr::workload::{Work, WorkType, SchedPolicy, MemPolicy};
-/// let w = Work::default()
+/// # use ktstr::workload::{WorkSpec, WorkType, SchedPolicy, MemPolicy};
+/// let w = WorkSpec::default()
 ///     .workers(4)
 ///     .work_type(WorkType::bursty(50, 100))
 ///     .sched_policy(SchedPolicy::Batch)
@@ -2131,16 +2216,16 @@ impl WorkloadConfig {
 /// assert_eq!(w.num_workers, Some(4));
 /// ```
 #[derive(Clone, Debug)]
-pub struct Work {
+pub struct WorkSpec {
     /// What each worker does.
     pub work_type: WorkType,
     /// Linux scheduling policy.
     pub sched_policy: SchedPolicy,
     /// Number of workers. `None` means use `Ctx::workers_per_cgroup`.
     pub num_workers: Option<usize>,
-    /// Per-worker affinity intent. Resolved to [`AffinityMode`] at
+    /// Per-worker affinity intent. Resolved to [`ResolvedAffinity`] at
     /// runtime via [`resolve_affinity_for_cgroup()`](crate::scenario::resolve_affinity_for_cgroup).
-    pub affinity: AffinityKind,
+    pub affinity: AffinityIntent,
     /// NUMA memory placement policy. Applied via `set_mempolicy(2)`
     /// after fork, before the work loop.
     pub mem_policy: MemPolicy,
@@ -2156,13 +2241,13 @@ pub struct Work {
     pub clone_mode: CloneMode,
 }
 
-impl Default for Work {
+impl Default for WorkSpec {
     fn default() -> Self {
         Self {
             work_type: WorkType::CpuSpin,
             sched_policy: SchedPolicy::Normal,
             num_workers: None,
-            affinity: AffinityKind::Inherit,
+            affinity: AffinityIntent::Inherit,
             mem_policy: MemPolicy::Default,
             mpol_flags: MpolFlags::NONE,
             nice: 0,
@@ -2171,7 +2256,7 @@ impl Default for Work {
     }
 }
 
-impl Work {
+impl WorkSpec {
     /// Set the number of workers.
     pub fn workers(mut self, n: usize) -> Self {
         self.num_workers = Some(n);
@@ -2191,7 +2276,7 @@ impl Work {
     }
 
     /// Set the per-worker affinity intent.
-    pub fn affinity(mut self, a: AffinityKind) -> Self {
+    pub fn affinity(mut self, a: AffinityIntent) -> Self {
         self.affinity = a;
         self
     }
@@ -7063,16 +7148,16 @@ extern "C" fn sigusr1_handler(_: libc::c_int) {
     STOP.store(true, Ordering::Relaxed);
 }
 
-fn resolve_affinity(mode: &AffinityMode) -> Result<Option<BTreeSet<usize>>> {
+fn resolve_affinity(mode: &ResolvedAffinity) -> Result<Option<BTreeSet<usize>>> {
     match mode {
-        AffinityMode::None => Ok(None),
-        AffinityMode::Fixed(cpus) => Ok(Some(cpus.clone())),
-        AffinityMode::SingleCpu(cpu) => Ok(Some([*cpu].into_iter().collect())),
-        AffinityMode::Random { from, count } => {
+        ResolvedAffinity::None => Ok(None),
+        ResolvedAffinity::Fixed(cpus) => Ok(Some(cpus.clone())),
+        ResolvedAffinity::SingleCpu(cpu) => Ok(Some([*cpu].into_iter().collect())),
+        ResolvedAffinity::Random { from, count } => {
             use rand::seq::IndexedRandom;
             if *count == 0 {
                 anyhow::bail!(
-                    "AffinityMode::Random.count must be > 0; a zero count \
+                    "ResolvedAffinity::Random.count must be > 0; a zero count \
                      previously silently coerced to 1, masking caller bugs"
                 );
             }
@@ -7518,7 +7603,7 @@ mod tests {
     ) -> Vec<WorkerReport> {
         let config = WorkloadConfig {
             num_workers,
-            affinity: AffinityMode::None,
+            affinity: ResolvedAffinity::None,
             work_type,
             sched_policy: SchedPolicy::Normal,
             ..Default::default()
@@ -8064,27 +8149,27 @@ mod tests {
 
     #[test]
     fn resolve_affinity_none() {
-        let r = resolve_affinity(&AffinityMode::None).unwrap();
+        let r = resolve_affinity(&ResolvedAffinity::None).unwrap();
         assert!(r.is_none());
     }
 
     #[test]
     fn resolve_affinity_fixed() {
         let cpus: BTreeSet<usize> = [0, 1, 2].into_iter().collect();
-        let r = resolve_affinity(&AffinityMode::Fixed(cpus.clone())).unwrap();
+        let r = resolve_affinity(&ResolvedAffinity::Fixed(cpus.clone())).unwrap();
         assert_eq!(r, Some(cpus));
     }
 
     #[test]
     fn resolve_affinity_single_cpu() {
-        let r = resolve_affinity(&AffinityMode::SingleCpu(5)).unwrap();
+        let r = resolve_affinity(&ResolvedAffinity::SingleCpu(5)).unwrap();
         assert_eq!(r, Some([5].into_iter().collect()));
     }
 
     #[test]
     fn resolve_affinity_random() {
         let from: BTreeSet<usize> = (0..8).collect();
-        let r = resolve_affinity(&AffinityMode::Random { from, count: 3 }).unwrap();
+        let r = resolve_affinity(&ResolvedAffinity::Random { from, count: 3 }).unwrap();
         let cpus = r.unwrap();
         assert_eq!(cpus.len(), 3);
         assert!(cpus.iter().all(|c| *c < 8));
@@ -8093,7 +8178,7 @@ mod tests {
     #[test]
     fn resolve_affinity_random_clamps_count() {
         let from: BTreeSet<usize> = [0, 1].into_iter().collect();
-        let r = resolve_affinity(&AffinityMode::Random { from, count: 10 }).unwrap();
+        let r = resolve_affinity(&ResolvedAffinity::Random { from, count: 10 }).unwrap();
         assert_eq!(r.unwrap().len(), 2);
     }
 
@@ -8103,7 +8188,7 @@ mod tests {
         assert_eq!(c.num_workers, 1);
         assert!(matches!(c.work_type, WorkType::CpuSpin));
         assert!(matches!(c.sched_policy, SchedPolicy::Normal));
-        assert!(matches!(c.affinity, AffinityMode::None));
+        assert!(matches!(c.affinity, ResolvedAffinity::None));
         // Default nice is 0 — `apply_nice(0)` short-circuits before
         // the syscall, preserving inherit-from-parent semantics.
         assert_eq!(c.nice, 0);
@@ -8203,7 +8288,7 @@ mod tests {
     fn worker_nice_applied_via_setpriority() {
         let config = WorkloadConfig {
             num_workers: 1,
-            affinity: AffinityMode::None,
+            affinity: ResolvedAffinity::None,
             work_type: WorkType::CpuSpin,
             sched_policy: SchedPolicy::Normal,
             nice: 10,
@@ -8306,7 +8391,7 @@ mod tests {
     fn spawn_start_collect_integration() {
         let config = WorkloadConfig {
             num_workers: 2,
-            affinity: AffinityMode::None,
+            affinity: ResolvedAffinity::None,
             work_type: WorkType::CpuSpin,
             sched_policy: SchedPolicy::Normal,
             ..Default::default()
@@ -8328,7 +8413,7 @@ mod tests {
     fn spawn_auto_start_on_collect() {
         let config = WorkloadConfig {
             num_workers: 1,
-            affinity: AffinityMode::None,
+            affinity: ResolvedAffinity::None,
             work_type: WorkType::CpuSpin,
             sched_policy: SchedPolicy::Normal,
             ..Default::default()
@@ -8365,7 +8450,7 @@ mod tests {
     fn spawn_pids_fit_in_pid_t() {
         let config = WorkloadConfig {
             num_workers: 4,
-            affinity: AffinityMode::None,
+            affinity: ResolvedAffinity::None,
             work_type: WorkType::CpuSpin,
             sched_policy: SchedPolicy::Normal,
             ..Default::default()
@@ -8400,7 +8485,7 @@ mod tests {
     fn handle_drop_reaps_children_and_closes_pipes() {
         let config = WorkloadConfig {
             num_workers: 2,
-            affinity: AffinityMode::None,
+            affinity: ResolvedAffinity::None,
             work_type: WorkType::PipeIo { burst_iters: 4 },
             sched_policy: SchedPolicy::Normal,
             ..Default::default()
@@ -8435,7 +8520,7 @@ mod tests {
     fn spawn_multiple_workers_distinct_pids() {
         let config = WorkloadConfig {
             num_workers: 4,
-            affinity: AffinityMode::None,
+            affinity: ResolvedAffinity::None,
             work_type: WorkType::CpuSpin,
             sched_policy: SchedPolicy::Normal,
             ..Default::default()
@@ -8455,7 +8540,7 @@ mod tests {
     fn spawn_with_fixed_affinity() {
         let config = WorkloadConfig {
             num_workers: 1,
-            affinity: AffinityMode::Fixed([0].into_iter().collect()),
+            affinity: ResolvedAffinity::Fixed([0].into_iter().collect()),
             work_type: WorkType::CpuSpin,
             sched_policy: SchedPolicy::Normal,
             ..Default::default()
@@ -8661,7 +8746,7 @@ mod tests {
             }
             let config = WorkloadConfig {
                 num_workers: 4,
-                affinity: AffinityMode::None,
+                affinity: ResolvedAffinity::None,
                 work_type: WorkType::PipeIo { burst_iters: 1 },
                 sched_policy: SchedPolicy::Normal,
                 ..Default::default()
@@ -8721,7 +8806,7 @@ mod tests {
             }
             let config = WorkloadConfig {
                 num_workers: 1,
-                affinity: AffinityMode::None,
+                affinity: ResolvedAffinity::None,
                 work_type: WorkType::CpuSpin,
                 sched_policy: SchedPolicy::Normal,
                 ..Default::default()
@@ -8787,7 +8872,7 @@ mod tests {
     fn spawn_pipeio_odd_workers_fails() {
         let config = WorkloadConfig {
             num_workers: 3,
-            affinity: AffinityMode::None,
+            affinity: ResolvedAffinity::None,
             work_type: WorkType::PipeIo { burst_iters: 1024 },
             sched_policy: SchedPolicy::Normal,
             ..Default::default()
@@ -8862,7 +8947,7 @@ mod tests {
     fn workload_handle_drop_tolerates_externally_killed_child() {
         let config = WorkloadConfig {
             num_workers: 2,
-            affinity: AffinityMode::None,
+            affinity: ResolvedAffinity::None,
             work_type: WorkType::CpuSpin,
             sched_policy: SchedPolicy::Normal,
             ..Default::default()
@@ -8972,7 +9057,7 @@ mod tests {
     fn io_sync_cleans_up_temp_file() {
         let config = WorkloadConfig {
             num_workers: 1,
-            affinity: AffinityMode::None,
+            affinity: ResolvedAffinity::None,
             work_type: WorkType::IoSync,
             sched_policy: SchedPolicy::Normal,
             ..Default::default()
@@ -9004,7 +9089,7 @@ mod tests {
     fn set_affinity_via_handle() {
         let config = WorkloadConfig {
             num_workers: 1,
-            affinity: AffinityMode::None,
+            affinity: ResolvedAffinity::None,
             work_type: WorkType::CpuSpin,
             sched_policy: SchedPolicy::Normal,
             ..Default::default()
@@ -9044,7 +9129,7 @@ mod tests {
     fn start_idempotent() {
         let config = WorkloadConfig {
             num_workers: 1,
-            affinity: AffinityMode::None,
+            affinity: ResolvedAffinity::None,
             work_type: WorkType::CpuSpin,
             sched_policy: SchedPolicy::Normal,
             ..Default::default()
@@ -9062,7 +9147,7 @@ mod tests {
     fn spawn_pipeio_four_workers() {
         let config = WorkloadConfig {
             num_workers: 4,
-            affinity: AffinityMode::None,
+            affinity: ResolvedAffinity::None,
             work_type: WorkType::PipeIo { burst_iters: 512 },
             sched_policy: SchedPolicy::Normal,
             ..Default::default()
@@ -9108,7 +9193,7 @@ mod tests {
     #[test]
     fn resolve_affinity_random_single_cpu_pool() {
         let from: BTreeSet<usize> = [7].into_iter().collect();
-        let r = resolve_affinity(&AffinityMode::Random { from, count: 1 }).unwrap();
+        let r = resolve_affinity(&ResolvedAffinity::Random { from, count: 1 }).unwrap();
         assert_eq!(r.unwrap(), [7].into_iter().collect());
     }
 
@@ -9430,13 +9515,13 @@ mod tests {
 
     #[test]
     fn affinity_mode_debug_shows_cpus() {
-        let a = AffinityMode::Fixed([0, 1, 7].into_iter().collect());
+        let a = ResolvedAffinity::Fixed([0, 1, 7].into_iter().collect());
         let s = format!("{:?}", a);
         assert!(s.contains("0"), "must show CPU 0");
         assert!(s.contains("1"), "must show CPU 1");
         assert!(s.contains("7"), "must show CPU 7");
         // Different CPU sets produce different output.
-        let b = AffinityMode::Fixed([3, 4].into_iter().collect());
+        let b = ResolvedAffinity::Fixed([3, 4].into_iter().collect());
         let s2 = format!("{:?}", b);
         assert!(s2.contains("3"), "must show CPU 3");
         assert_ne!(
@@ -9448,13 +9533,13 @@ mod tests {
     #[test]
     fn affinity_mode_clone_preserves_cpus() {
         let cpus: BTreeSet<usize> = [2, 5, 7].into_iter().collect();
-        let a = AffinityMode::Random {
+        let a = ResolvedAffinity::Random {
             from: cpus.clone(),
             count: 2,
         };
         let b = a.clone();
         match b {
-            AffinityMode::Random { from, count } => {
+            ResolvedAffinity::Random { from, count } => {
                 assert_eq!(from, cpus, "cloned from set must match original");
                 assert_eq!(count, 2, "cloned count must match original");
             }
@@ -9466,7 +9551,7 @@ mod tests {
     fn workload_config_debug_shows_field_values() {
         let c = WorkloadConfig {
             num_workers: 7,
-            affinity: AffinityMode::SingleCpu(3),
+            affinity: ResolvedAffinity::SingleCpu(3),
             work_type: WorkType::YieldHeavy,
             sched_policy: SchedPolicy::Batch,
             ..Default::default()
@@ -9620,7 +9705,7 @@ mod tests {
         // Regression: count=0 previously coerced silently to 1, masking
         // caller bugs. Now it must return an Err.
         let from: BTreeSet<usize> = (0..4).collect();
-        let err = resolve_affinity(&AffinityMode::Random { from, count: 0 }).unwrap_err();
+        let err = resolve_affinity(&ResolvedAffinity::Random { from, count: 0 }).unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("count") && msg.contains("> 0"),
@@ -9630,11 +9715,11 @@ mod tests {
 
     #[test]
     fn resolve_affinity_random_empty_pool_is_none() {
-        // Regression: AffinityMode::Random { from: empty, count } previously
+        // Regression: ResolvedAffinity::Random { from: empty, count } previously
         // produced an empty affinity mask rejected by sched_setaffinity
         // with EINVAL. Empty pool must short-circuit to Ok(None).
         let from: BTreeSet<usize> = BTreeSet::new();
-        let r = resolve_affinity(&AffinityMode::Random { from, count: 1 }).unwrap();
+        let r = resolve_affinity(&ResolvedAffinity::Random { from, count: 1 }).unwrap();
         assert!(r.is_none(), "empty Random pool must resolve to no affinity");
     }
 
@@ -9839,7 +9924,7 @@ mod tests {
     fn spawn_futex_fan_out_receivers_record_wake_latency() {
         let config = WorkloadConfig {
             num_workers: 5,
-            affinity: AffinityMode::None,
+            affinity: ResolvedAffinity::None,
             work_type: WorkType::FutexFanOut {
                 fan_out: 4,
                 spin_iters: 512,
@@ -9860,7 +9945,7 @@ mod tests {
     fn spawn_futex_fan_out_bad_worker_count_fails() {
         let config = WorkloadConfig {
             num_workers: 3, // not divisible by 5
-            affinity: AffinityMode::None,
+            affinity: ResolvedAffinity::None,
             work_type: WorkType::FutexFanOut {
                 fan_out: 4,
                 spin_iters: 1024,
@@ -9881,7 +9966,7 @@ mod tests {
     fn spawn_futex_fan_out_two_groups() {
         let config = WorkloadConfig {
             num_workers: 10, // 2 groups of (1+4)
-            affinity: AffinityMode::None,
+            affinity: ResolvedAffinity::None,
             work_type: WorkType::FutexFanOut {
                 fan_out: 4,
                 spin_iters: 512,
@@ -9905,7 +9990,7 @@ mod tests {
         // Minimal fan-out: 1 messenger + 1 receiver per group (like ping-pong).
         let config = WorkloadConfig {
             num_workers: 2,
-            affinity: AffinityMode::None,
+            affinity: ResolvedAffinity::None,
             work_type: WorkType::FutexFanOut {
                 fan_out: 1,
                 spin_iters: 1024,
@@ -9973,7 +10058,7 @@ mod tests {
     fn snapshot_iterations_running_workers() {
         let config = WorkloadConfig {
             num_workers: 2,
-            affinity: AffinityMode::None,
+            affinity: ResolvedAffinity::None,
             work_type: WorkType::CpuSpin,
             sched_policy: SchedPolicy::Normal,
             ..Default::default()
@@ -10119,15 +10204,15 @@ mod tests {
         assert!(matches!(fail, WorkType::CpuSpin));
     }
 
-    // -- Work builder --
+    // -- WorkSpec builder --
 
     #[test]
     fn work_builder_chain() {
-        let w = Work::default()
+        let w = WorkSpec::default()
             .workers(8)
             .work_type(WorkType::bursty(10, 20))
             .sched_policy(SchedPolicy::Batch)
-            .affinity(AffinityKind::SingleCpu)
+            .affinity(AffinityIntent::SingleCpu)
             .nice(7);
         assert_eq!(w.num_workers, Some(8));
         assert!(matches!(
@@ -10138,17 +10223,17 @@ mod tests {
             }
         ));
         assert!(matches!(w.sched_policy, SchedPolicy::Batch));
-        assert!(matches!(w.affinity, AffinityKind::SingleCpu));
+        assert!(matches!(w.affinity, AffinityIntent::SingleCpu));
         assert_eq!(w.nice, 7);
     }
 
     #[test]
     fn work_default_values() {
-        let w = Work::default();
+        let w = WorkSpec::default();
         assert_eq!(w.num_workers, None);
         assert!(matches!(w.work_type, WorkType::CpuSpin));
         assert!(matches!(w.sched_policy, SchedPolicy::Normal));
-        assert!(matches!(w.affinity, AffinityKind::Inherit));
+        assert!(matches!(w.affinity, AffinityIntent::Inherit));
         // Default nice is 0 — same skip semantics as
         // [`WorkloadConfig::nice`].
         assert_eq!(w.nice, 0);
@@ -10323,7 +10408,7 @@ mod tests {
     fn spawn_custom_produces_work() {
         let config = WorkloadConfig {
             num_workers: 1,
-            affinity: AffinityMode::None,
+            affinity: ResolvedAffinity::None,
             work_type: WorkType::custom("test_spin", custom_spin_fn),
             sched_policy: SchedPolicy::Normal,
             ..Default::default()
@@ -10481,7 +10566,7 @@ mod tests {
     fn stop_and_collect_sentinel_exits_for_sigusr1_ignoring_worker() {
         let config = WorkloadConfig {
             num_workers: 1,
-            affinity: AffinityMode::None,
+            affinity: ResolvedAffinity::None,
             work_type: WorkType::custom("sigusr1_ignore", ignores_sigusr1_fn),
             sched_policy: SchedPolicy::Normal,
             ..Default::default()
@@ -10890,7 +10975,7 @@ mod tests {
         require_grandchild_sleep_binary();
         let config = WorkloadConfig {
             num_workers: 1,
-            affinity: AffinityMode::None,
+            affinity: ResolvedAffinity::None,
             work_type: WorkType::custom("grandchild_sleep", forks_grandchild_sleep_fn),
             sched_policy: SchedPolicy::Normal,
             ..Default::default()
@@ -10928,7 +11013,7 @@ mod tests {
         const N: usize = 3;
         let config = WorkloadConfig {
             num_workers: N,
-            affinity: AffinityMode::None,
+            affinity: ResolvedAffinity::None,
             work_type: WorkType::custom("grandchild_sleep", forks_grandchild_sleep_fn),
             sched_policy: SchedPolicy::Normal,
             ..Default::default()
@@ -11021,7 +11106,7 @@ mod tests {
         require_grandchild_sleep_binary();
         let config = WorkloadConfig {
             num_workers: 1,
-            affinity: AffinityMode::None,
+            affinity: ResolvedAffinity::None,
             work_type: WorkType::custom("grandchild_panic", forks_grandchild_and_panics_fn),
             sched_policy: SchedPolicy::Normal,
             ..Default::default()
@@ -11102,7 +11187,7 @@ mod tests {
         require_grandchild_sleep_binary();
         let config = WorkloadConfig {
             num_workers: 1,
-            affinity: AffinityMode::None,
+            affinity: ResolvedAffinity::None,
             work_type: WorkType::custom("grandchild_sleep", forks_grandchild_sleep_fn),
             sched_policy: SchedPolicy::Normal,
             ..Default::default()
@@ -11144,7 +11229,7 @@ mod tests {
         require_grandchild_sleep_binary();
         let config = WorkloadConfig {
             num_workers: 1,
-            affinity: AffinityMode::None,
+            affinity: ResolvedAffinity::None,
             work_type: WorkType::custom(
                 "grandchild_graceful",
                 forks_grandchild_and_exits_cleanly_fn,
@@ -11400,7 +11485,7 @@ mod tests {
     fn spawn_fan_out_compute_produces_work() {
         let config = WorkloadConfig {
             num_workers: 5, // 1 messenger + 4 workers
-            affinity: AffinityMode::None,
+            affinity: ResolvedAffinity::None,
             work_type: WorkType::FanOutCompute {
                 fan_out: 4,
                 cache_footprint_kb: 256,
@@ -11480,7 +11565,7 @@ mod tests {
     fn spawn_fan_out_compute_bad_worker_count_fails() {
         let config = WorkloadConfig {
             num_workers: 3,
-            affinity: AffinityMode::None,
+            affinity: ResolvedAffinity::None,
             work_type: WorkType::FanOutCompute {
                 fan_out: 4,
                 cache_footprint_kb: 256,
@@ -11507,7 +11592,7 @@ mod tests {
     fn spawn_fan_out_compute_two_groups() {
         let config = WorkloadConfig {
             num_workers: 10, // 2 groups of (1 messenger + 4 workers)
-            affinity: AffinityMode::None,
+            affinity: ResolvedAffinity::None,
             work_type: WorkType::FanOutCompute {
                 fan_out: 4,
                 cache_footprint_kb: 256,
@@ -11662,7 +11747,7 @@ mod tests {
 
     #[test]
     fn work_mpol_flags_builder() {
-        let w = Work::default().mpol_flags(MpolFlags::STATIC_NODES);
+        let w = WorkSpec::default().mpol_flags(MpolFlags::STATIC_NODES);
         assert_eq!(w.mpol_flags, MpolFlags::STATIC_NODES);
     }
 
@@ -11740,7 +11825,7 @@ mod tests {
 
     #[test]
     fn work_default_clone_mode_is_fork() {
-        let w = Work::default();
+        let w = WorkSpec::default();
         assert!(matches!(w.clone_mode, CloneMode::Fork));
     }
 
@@ -11752,7 +11837,7 @@ mod tests {
 
     #[test]
     fn work_clone_mode_builder() {
-        let w = Work::default().clone_mode(CloneMode::SharedVm);
+        let w = WorkSpec::default().clone_mode(CloneMode::SharedVm);
         assert!(matches!(w.clone_mode, CloneMode::SharedVm));
     }
 
@@ -12337,13 +12422,13 @@ mod tests {
 
     #[test]
     fn work_mem_policy_builder() {
-        let w = Work::default().mem_policy(MemPolicy::Bind([0].into_iter().collect()));
+        let w = WorkSpec::default().mem_policy(MemPolicy::Bind([0].into_iter().collect()));
         assert!(matches!(w.mem_policy, MemPolicy::Bind(_)));
     }
 
     #[test]
     fn work_default_mempolicy_is_default() {
-        let w = Work::default();
+        let w = WorkSpec::default();
         assert!(matches!(w.mem_policy, MemPolicy::Default));
     }
 
@@ -12418,7 +12503,7 @@ mod tests {
     fn page_fault_churn_region_kb_overflow_worker_exits_cleanly() {
         let config = WorkloadConfig {
             num_workers: 1,
-            affinity: AffinityMode::None,
+            affinity: ResolvedAffinity::None,
             // `region_kb = usize::MAX` — `usize::MAX * 1024`
             // overflows on both 32-bit and 64-bit usize, so
             // `checked_mul` returns None and the outer loop
@@ -12507,7 +12592,7 @@ mod tests {
         let num_workers = num_cpus + 1;
         let config = WorkloadConfig {
             num_workers,
-            affinity: AffinityMode::None,
+            affinity: ResolvedAffinity::None,
             work_type: WorkType::PageFaultChurn {
                 region_kb: 64,
                 touches_per_cycle: 16,
@@ -12643,7 +12728,7 @@ mod tests {
     fn spawn_mutex_contention_bad_worker_count_fails() {
         let config = WorkloadConfig {
             num_workers: 3,
-            affinity: AffinityMode::None,
+            affinity: ResolvedAffinity::None,
             work_type: WorkType::MutexContention {
                 contenders: 4,
                 hold_iters: 256,
@@ -12665,7 +12750,7 @@ mod tests {
     fn mutex_contention_records_wake_latency() {
         let config = WorkloadConfig {
             num_workers: 4,
-            affinity: AffinityMode::None,
+            affinity: ResolvedAffinity::None,
             work_type: WorkType::MutexContention {
                 contenders: 4,
                 hold_iters: 64,

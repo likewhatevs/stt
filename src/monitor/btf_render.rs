@@ -1142,7 +1142,7 @@ mod tests {
 
     #[test]
     fn display_struct_with_named_members() {
-        // Mirror the team-lead's example.
+        // Display a typical task-context struct value.
         let v = RenderedValue::Struct {
             type_name: Some("task_ctx".into()),
             members: vec![

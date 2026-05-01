@@ -476,14 +476,14 @@ fn cover_op_move_all_tasks(ctx: &Ctx) -> Result<AssertResult> {
 #[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mb = 2048)]
 fn cover_op_spawn_host(ctx: &Ctx) -> Result<AssertResult> {
     use ktstr::scenario::ops::{CgroupDef, HoldSpec, Op, Step, execute_steps};
-    use ktstr::workload::{Work, WorkType};
+    use ktstr::workload::{WorkSpec, WorkType};
     let steps = vec![
         Step::with_defs(
             vec![CgroupDef::named("cg_0").workers(2)],
             HoldSpec::Fixed(ctx.settle + ctx.duration),
         )
         .set_ops(vec![Op::spawn_host(
-            Work::default().workers(2).work_type(WorkType::CpuSpin),
+            WorkSpec::default().workers(2).work_type(WorkType::CpuSpin),
         )]),
     ];
     execute_steps(ctx, steps)

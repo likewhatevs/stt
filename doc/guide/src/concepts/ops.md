@@ -19,7 +19,7 @@ stay compatible across ktstr version bumps that add new variants:
 | `SwapCpusets` | Swap cpusets between two cgroups |
 | `Spawn` | Fork workers into a cgroup |
 | `StopCgroup` | Stop a cgroup's workers |
-| `SetAffinity` | Set worker affinity via `AffinityKind` |
+| `SetAffinity` | Set worker affinity via `AffinityIntent` |
 | `SpawnHost` | Spawn workers in the parent cgroup |
 | `MoveAllTasks` | Move all tasks from one cgroup to another |
 | `RunPayload` | Spawn a binary-kind [`Payload`](../writing-tests/scheduler-definitions.md#derive-payload) in the background and track its `PayloadHandle` under the step's payload set. Subsequent `WaitPayload` / `KillPayload` address it by `(payload.name, cgroup)`. Scheduler-kind payloads are rejected at apply time. |
@@ -32,9 +32,9 @@ Op constructors accept string literals directly (no `.into()` needed):
 Op::add_cgroup("cg_0")
 Op::set_cpuset("cg_0", CpusetSpec::disjoint(0, 2))
 Op::stop_cgroup("cg_0")
-Op::spawn("cg_0", Work::default().workers(4))
-Op::set_affinity("cg_0", AffinityKind::RandomSubset)
-Op::spawn_host(Work::default().workers(4))
+Op::spawn("cg_0", WorkSpec::default().workers(4))
+Op::set_affinity("cg_0", AffinityIntent::RandomSubset)
+Op::spawn_host(WorkSpec::default().workers(4))
 ```
 
 `SpawnHost` creates workers in the parent cgroup, not in a managed
@@ -104,9 +104,9 @@ let def = CgroupDef::named("cg_0")
 - `.workers(n)` -- set worker count.
 - `.work_type(WorkType)` -- set work type (default: `CpuSpin`).
 - `.sched_policy(SchedPolicy)` -- set Linux scheduling policy
-  (default: `Normal`). See [Work Types](work-types.md#scheduling-policies).
-- `.work(Work)` -- add a work group (multiple calls for concurrent groups).
-- `.affinity(AffinityKind)` -- set per-worker affinity (default: `Inherit`).
+  (default: `Normal`). See [WorkSpec Types](work-types.md#scheduling-policies).
+- `.work(WorkSpec)` -- add a work group (multiple calls for concurrent groups).
+- `.affinity(AffinityIntent)` -- set per-worker affinity (default: `Inherit`).
 - `.mem_policy(MemPolicy)` -- set NUMA memory placement policy
   (default: `Default`). See [MemPolicy](mem-policy.md).
 - `.mpol_flags(MpolFlags)` -- set mode flags for `set_mempolicy(2)`
@@ -121,7 +121,7 @@ node set is covered by the NUMA nodes reachable from that cpuset. A
 node 0 fails at setup time. Policies without a node set (`Default`,
 `Local`) skip validation.
 
-### Work type overrides and swappable
+### WorkSpec type overrides and swappable
 
 `CgroupDef` has a `swappable` flag (default: `false`). When `true`
 and a work type override is active (`Ctx.work_type_override`), the
@@ -131,13 +131,13 @@ In contrast, the `Scenario`-level override (in `run_scenario()`) only
 replaces `CpuSpin` work types. The two mechanisms serve different
 scopes:
 
-- **Scenario-level**: replaces `CpuSpin` in `Work.work_type`
+- **Scenario-level**: replaces `CpuSpin` in `WorkSpec.work_type`
 - **CgroupDef-level**: replaces the work type when `swappable = true`
 
 Both skip overrides to grouped work types when `num_workers` is not
 divisible by the work type's group size.
 
-Work type overrides apply only to `CgroupDef` setup, not to raw
+WorkSpec type overrides apply only to `CgroupDef` setup, not to raw
 `Op::Spawn`. `Op::Spawn` always uses the work type as given. Use
 `CgroupDef` with `.swappable(true)` when the work type should
 participate in gauntlet overrides.

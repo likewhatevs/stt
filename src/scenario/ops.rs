@@ -17,7 +17,7 @@ use anyhow::{Context, Result};
 
 use crate::assert::AssertResult;
 use crate::vmm::shm_ring::{self, StimulusPayload};
-use crate::workload::{AffinityKind, MemPolicy, Work, WorkType, WorkloadConfig, WorkloadHandle};
+use crate::workload::{AffinityIntent, MemPolicy, WorkSpec, WorkType, WorkloadConfig, WorkloadHandle};
 
 use super::{CgroupGroup, Ctx, process_alive};
 
@@ -67,7 +67,7 @@ pub enum Op {
     /// work type should be overridable.
     Spawn {
         cgroup: Cow<'static, str>,
-        work: Work,
+        work: WorkSpec,
     },
     /// Stop all workers in a cgroup (does not remove the cgroup).
     StopCgroup { cgroup: Cow<'static, str> },
@@ -75,13 +75,13 @@ pub enum Op {
     /// [`resolve_affinity_for_cgroup()`](super::resolve_affinity_for_cgroup).
     SetAffinity {
         cgroup: Cow<'static, str>,
-        affinity: AffinityKind,
+        affinity: AffinityIntent,
     },
     /// Spawn workers in the parent cgroup (not in a managed cgroup).
     ///
-    /// `Work` is resolved to a `WorkloadConfig` at apply time, matching
+    /// `WorkSpec` is resolved to a `WorkloadConfig` at apply time, matching
     /// the resolution pattern used by `Op::Spawn`.
-    SpawnHost { work: Work },
+    SpawnHost { work: WorkSpec },
     /// Move all tasks from one cgroup to another.
     ///
     /// Each task is moved via `cgroup.procs`. If any move fails, the
@@ -385,17 +385,17 @@ pub struct IoLimits {
 // ---------------------------------------------------------------------------
 
 /// Declarative cgroup definition: name + cpuset + synthetic
-/// [`Work`] groups + optional userspace [`Payload`](crate::test_support::Payload).
+/// [`WorkSpec`] groups + optional userspace [`Payload`](crate::test_support::Payload).
 ///
 /// Bundles the ops that always go together (AddCgroup + SetCpuset +
 /// Spawn) into a single value. The executor creates the cgroup, optionally
-/// sets its cpuset, spawns workers for each [`Work`] entry, and moves
+/// sets its cpuset, spawns workers for each [`WorkSpec`] entry, and moves
 /// them into the cgroup.
 ///
-/// Multiple [`Work`] entries run in parallel within the cgroup. Each
+/// Multiple [`WorkSpec`] entries run in parallel within the cgroup. Each
 /// entry spawns its own set of worker processes. The optional
 /// [`Self::payload`] slot is a *single* userspace binary that runs
-/// alongside those synthetic [`Work`] groups (hence "plural works,
+/// alongside those synthetic [`WorkSpec`] groups (hence "plural works,
 /// singular payload" — the pluralization in the legacy "workload(s)"
 /// prose elided this distinction).
 ///
@@ -406,7 +406,7 @@ pub struct IoLimits {
 ///
 /// ```
 /// # use ktstr::scenario::ops::{CgroupDef, CpusetSpec};
-/// # use ktstr::workload::{Work, WorkType};
+/// # use ktstr::workload::{WorkSpec, WorkType};
 /// // Single work group via convenience methods.
 /// let def = CgroupDef::named("workers")
 ///     .with_cpuset(CpusetSpec::disjoint(0, 2))
@@ -418,14 +418,14 @@ pub struct IoLimits {
 ///
 /// // Multiple concurrent work groups via .work().
 /// let def = CgroupDef::named("mixed")
-///     .work(Work::default().workers(4).work_type(WorkType::CpuSpin))
-///     .work(Work::default().workers(2).work_type(WorkType::YieldHeavy));
+///     .work(WorkSpec::default().workers(4).work_type(WorkType::CpuSpin))
+///     .work(WorkSpec::default().workers(2).work_type(WorkType::YieldHeavy));
 ///
 /// assert_eq!(def.works.len(), 2);
 ///
 /// // Synthetic work + userspace binary side-by-side via .workload(&X).
-/// // The binary runs inside the same cgroup as the Work handles;
-/// // both spawn in apply_setup, the Work groups first, then the
+/// // The binary runs inside the same cgroup as the WorkSpec handles;
+/// // both spawn in apply_setup, the WorkSpec groups first, then the
 /// // Payload after the cpuset settles.
 /// # use ktstr::test_support::{OutputFormat, Payload, PayloadKind};
 /// # const BENCH: Payload = Payload {
@@ -456,23 +456,23 @@ pub struct CgroupDef {
     /// Optional cpuset assignment. `None` inherits the parent cgroup's
     /// cpuset (typically the scenario's usable CPU set).
     pub cpuset: Option<CpusetSpec>,
-    /// Work groups to spawn. Empty means use a single default Work
+    /// WorkSpec groups to spawn. Empty means use a single default WorkSpec
     /// (CpuSpin, Normal, ctx.workers_per_cgroup workers).
-    pub works: Vec<Work>,
-    /// When true, the gauntlet work_type override replaces each Work's
-    /// work_type (applied per-Work via resolve_work_type).
+    pub works: Vec<WorkSpec>,
+    /// When true, the gauntlet work_type override replaces each WorkSpec's
+    /// work_type (applied per-WorkSpec via resolve_work_type).
     pub swappable: bool,
     /// Optional userspace [`Payload`](crate::test_support::Payload) to
     /// launch inside this cgroup.
     ///
     /// **Spawn order within `apply_setup`**: the cgroup is created
     /// (`add_cgroup_no_cpuset`), its cpuset is resolved + set, then
-    /// each `Work` entry is spawned and moved into the cgroup in
+    /// each `WorkSpec` entry is spawned and moved into the cgroup in
     /// declaration order, and finally — after every synthetic
-    /// `Work` handle has started — the `Payload` is spawned via
+    /// `WorkSpec` handle has started — the `Payload` is spawned via
     /// `PayloadRun::new(ctx, p).in_cgroup(name).spawn()`. This
     /// fixed order lets the cgroup cpuset and mempolicy settle on
-    /// the `Work` handles before the binary inherits placement, so
+    /// the `WorkSpec` handles before the binary inherits placement, so
     /// the binary sees a stable topology. Once spawned, all three
     /// (cgroup, works, payload) run concurrently until teardown.
     ///
@@ -507,7 +507,7 @@ impl CgroupDef {
     ///
     /// **Worker-spawning default:** `CgroupDef::named("cg_0")` alone
     /// still spawns workers at execution time — `apply_setup` fills
-    /// an empty `works` slice with one default [`Work`] (CpuSpin,
+    /// an empty `works` slice with one default [`WorkSpec`] (CpuSpin,
     /// SCHED_NORMAL, `ctx.workers_per_cgroup` workers). To express
     /// an empty move-target cgroup with NO workers, declare it via
     /// [`Op::AddCgroup`] at step or Backdrop level instead of using
@@ -528,68 +528,68 @@ impl CgroupDef {
 
     /// Add a work group. Can be called multiple times for concurrent
     /// work groups within this cgroup.
-    pub fn work(mut self, w: Work) -> Self {
+    pub fn work(mut self, w: WorkSpec) -> Self {
         self.works.push(w);
         self
     }
 
-    /// Ensure works[0] exists for single-Work builder methods.
+    /// Ensure works[0] exists for single-WorkSpec builder methods.
     fn ensure_default_work(&mut self) {
         if self.works.is_empty() {
-            self.works.push(Work::default());
+            self.works.push(WorkSpec::default());
         }
     }
 
-    /// Set the number of workers (convenience for single Work).
+    /// Set the number of workers (convenience for single WorkSpec).
     pub fn workers(mut self, n: usize) -> Self {
         self.ensure_default_work();
         self.works[0].num_workers = Some(n);
         self
     }
 
-    /// Set the work type (convenience for single Work).
+    /// Set the work type (convenience for single WorkSpec).
     pub fn work_type(mut self, wt: WorkType) -> Self {
         self.ensure_default_work();
         self.works[0].work_type = wt;
         self
     }
 
-    /// Set the scheduling policy (convenience for single Work).
+    /// Set the scheduling policy (convenience for single WorkSpec).
     pub fn sched_policy(mut self, p: crate::workload::SchedPolicy) -> Self {
         self.ensure_default_work();
         self.works[0].sched_policy = p;
         self
     }
 
-    /// Set the per-worker affinity (convenience for single Work).
-    pub fn affinity(mut self, a: crate::workload::AffinityKind) -> Self {
+    /// Set the per-worker affinity (convenience for single WorkSpec).
+    pub fn affinity(mut self, a: crate::workload::AffinityIntent) -> Self {
         self.ensure_default_work();
         self.works[0].affinity = a;
         self
     }
 
-    /// Set the NUMA memory placement policy (convenience for single Work).
+    /// Set the NUMA memory placement policy (convenience for single WorkSpec).
     pub fn mem_policy(mut self, p: crate::workload::MemPolicy) -> Self {
         self.ensure_default_work();
         self.works[0].mem_policy = p;
         self
     }
 
-    /// Set the NUMA memory policy mode flags (convenience for single Work).
+    /// Set the NUMA memory policy mode flags (convenience for single WorkSpec).
     pub fn mpol_flags(mut self, f: crate::workload::MpolFlags) -> Self {
         self.ensure_default_work();
         self.works[0].mpol_flags = f;
         self
     }
 
-    /// When true, the gauntlet work_type override replaces each Work's work type.
+    /// When true, the gauntlet work_type override replaces each WorkSpec's work type.
     pub fn swappable(mut self, swappable: bool) -> Self {
         self.swappable = swappable;
         self
     }
 
     /// Attach a userspace payload binary that runs inside this cgroup
-    /// alongside any synthetic [`Work`] groups. The payload spawns
+    /// alongside any synthetic [`WorkSpec`] groups. The payload spawns
     /// when the step enters `apply_setup` and is killed during
     /// step-teardown so the cgroup can be removed cleanly.
     ///
@@ -1036,7 +1036,7 @@ impl Op {
     }
 
     /// Spawn workers in a cgroup.
-    pub fn spawn(cgroup: impl Into<Cow<'static, str>>, work: Work) -> Self {
+    pub fn spawn(cgroup: impl Into<Cow<'static, str>>, work: WorkSpec) -> Self {
         Op::Spawn {
             cgroup: cgroup.into(),
             work,
@@ -1051,7 +1051,7 @@ impl Op {
     }
 
     /// Set worker affinity in a cgroup.
-    pub fn set_affinity(cgroup: impl Into<Cow<'static, str>>, affinity: AffinityKind) -> Self {
+    pub fn set_affinity(cgroup: impl Into<Cow<'static, str>>, affinity: AffinityIntent) -> Self {
         Op::SetAffinity {
             cgroup: cgroup.into(),
             affinity,
@@ -1059,7 +1059,7 @@ impl Op {
     }
 
     /// Spawn workers in the parent cgroup.
-    pub fn spawn_host(work: Work) -> Self {
+    pub fn spawn_host(work: WorkSpec) -> Self {
         Op::SpawnHost { work }
     }
 
@@ -2645,11 +2645,11 @@ fn validate_mempolicy_cpuset(
 }
 
 /// Each CgroupDef's `works` vec is iterated, spawning one WorkloadHandle
-/// per Work entry. Multiple Works for the same cgroup produce multiple
+/// per WorkSpec entry. Multiple Works for the same cgroup produce multiple
 /// handle entries with the same name key; Ops that filter by cgroup name
 /// (StopCgroup, SetAffinity, etc.) naturally apply to all of them.
 ///
-/// When `works` is empty, a single default Work is used (CpuSpin, Normal,
+/// When `works` is empty, a single default WorkSpec is used (CpuSpin, Normal,
 /// ctx.workers_per_cgroup workers).
 ///
 /// Cgroups created here route into step-local or backdrop state per
@@ -2657,7 +2657,7 @@ fn validate_mempolicy_cpuset(
 /// either state) bails — a `CgroupDef` must not silently shadow a
 /// cgroup that another state slot has already created.
 fn apply_setup(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, defs: &[CgroupDef]) -> Result<()> {
-    let default_work = [Work::default()];
+    let default_work = [WorkSpec::default()];
     for def in defs {
         if state.cgroup_name_is_tracked(&def.name) {
             anyhow::bail!(
@@ -2749,7 +2749,7 @@ fn apply_setup(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, defs: &[CgroupDef])
                 ctx.cgroups.set_io_weight(&def.name, w)?;
             }
         }
-        let effective_works: &[Work] = if def.works.is_empty() {
+        let effective_works: &[WorkSpec] = if def.works.is_empty() {
             &default_work
         } else {
             &def.works
@@ -2803,9 +2803,9 @@ fn apply_setup(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, defs: &[CgroupDef])
         }
         // After synthetic workers are in place, spawn the optional
         // userspace payload inside the same cgroup. The payload runs
-        // concurrently with the Work groups; its metrics are recorded
+        // concurrently with the WorkSpec groups; its metrics are recorded
         // to the sidecar via the guest-to-host SHM ring when the
-        // handle is killed at step-teardown. Spawning after the Work
+        // handle is killed at step-teardown. Spawning after the WorkSpec
         // handles lets the cgroup cpuset + mempolicy settle first so
         // the binary inherits a stable placement.
         if let Some(payload) = def.payload {
@@ -3025,13 +3025,13 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                 for (name, handle) in state.all_handles() {
                     if name.as_str() == *cgroup {
                         match &resolved {
-                            crate::workload::AffinityMode::None => {}
-                            crate::workload::AffinityMode::Fixed(cpus) => {
+                            crate::workload::ResolvedAffinity::None => {}
+                            crate::workload::ResolvedAffinity::Fixed(cpus) => {
                                 for idx in 0..handle.worker_pids().len() {
                                     let _ = handle.set_affinity(idx, cpus);
                                 }
                             }
-                            crate::workload::AffinityMode::Random { from, count }
+                            crate::workload::ResolvedAffinity::Random { from, count }
                                 if !from.is_empty() && *count > 0 =>
                             {
                                 use rand::seq::IndexedRandom;
@@ -3054,8 +3054,8 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                             // than bail so a mid-run SetAffinity with
                             // a degenerate Random spec doesn't abort
                             // the whole scenario.
-                            crate::workload::AffinityMode::Random { .. } => {}
-                            crate::workload::AffinityMode::SingleCpu(cpu) => {
+                            crate::workload::ResolvedAffinity::Random { .. } => {}
+                            crate::workload::ResolvedAffinity::SingleCpu(cpu) => {
                                 let cpus: BTreeSet<usize> = [*cpu].into_iter().collect();
                                 for idx in 0..handle.worker_pids().len() {
                                     let _ = handle.set_affinity(idx, &cpus);
@@ -3496,8 +3496,8 @@ mod tests {
         settle: Duration,
         /// Cgroups [0..persistent_cgroups) are created once and never removed.
         persistent_cgroups: usize,
-        /// Work definition per cgroup index. Last entry repeats for higher indices.
-        cgroup_workloads: Vec<Work>,
+        /// WorkSpec definition per cgroup index. Last entry repeats for higher indices.
+        cgroup_workloads: Vec<WorkSpec>,
     }
 
     impl Traverse {
@@ -4449,7 +4449,7 @@ mod tests {
             phase_duration: Duration::from_millis(100),
             settle: Duration::from_millis(50),
             persistent_cgroups: 0,
-            cgroup_workloads: vec![Work::default()],
+            cgroup_workloads: vec![WorkSpec::default()],
         };
         let steps = t.generate(&ctx);
         assert_eq!(steps.len(), 3);
@@ -4470,7 +4470,7 @@ mod tests {
             phase_duration: Duration::from_millis(100),
             settle: Duration::from_millis(50),
             persistent_cgroups: 1,
-            cgroup_workloads: vec![Work::default()],
+            cgroup_workloads: vec![WorkSpec::default()],
         };
         let steps1 = t.generate(&ctx);
         let steps2 = t.generate(&ctx);
@@ -4496,7 +4496,7 @@ mod tests {
             phase_duration: Duration::from_millis(100),
             settle: Duration::from_millis(50),
             persistent_cgroups: 2,
-            cgroup_workloads: vec![Work::default()],
+            cgroup_workloads: vec![WorkSpec::default()],
         };
         let steps = t.generate(&ctx);
         // Every phase should have at least persistent_cgroups worth of SetCpuset ops
@@ -4541,8 +4541,8 @@ mod tests {
     #[test]
     fn cgroup_def_multi_work() {
         let d = CgroupDef::named("multi")
-            .work(Work::default().workers(4).work_type(WorkType::CpuSpin))
-            .work(Work::default().workers(2).work_type(WorkType::YieldHeavy));
+            .work(WorkSpec::default().workers(4).work_type(WorkType::CpuSpin))
+            .work(WorkSpec::default().workers(2).work_type(WorkType::YieldHeavy));
         assert_eq!(d.works.len(), 2);
         assert_eq!(d.works[0].num_workers, Some(4));
         assert_eq!(d.works[1].num_workers, Some(2));
@@ -4552,7 +4552,7 @@ mod tests {
     fn cgroup_def_old_api_then_work() {
         let d = CgroupDef::named("mixed")
             .workers(4)
-            .work(Work::default().workers(2));
+            .work(WorkSpec::default().workers(2));
         assert_eq!(d.works.len(), 2);
         assert_eq!(d.works[0].num_workers, Some(4));
         assert_eq!(d.works[1].num_workers, Some(2));
@@ -4560,7 +4560,7 @@ mod tests {
 
     #[test]
     fn cgroup_def_work_only_no_phantom() {
-        let d = CgroupDef::named("explicit").work(Work::default().workers(3));
+        let d = CgroupDef::named("explicit").work(WorkSpec::default().workers(3));
         assert_eq!(d.works.len(), 1);
         assert_eq!(d.works[0].num_workers, Some(3));
     }
@@ -4887,9 +4887,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&parent);
     }
 
-    /// The SetAffinity dispatcher's `AffinityMode::Random` arm is
+    /// The SetAffinity dispatcher's `ResolvedAffinity::Random` arm is
     /// guarded by `!from.is_empty() && *count > 0` (see the
-    /// `AffinityMode::Random` arm with that same guard in
+    /// `ResolvedAffinity::Random` arm with that same guard in
     /// `apply_ops`). This test mirrors that classification to lock
     /// the contract in place: future refactors that drop either
     /// side of the AND must update this test alongside the dispatch.
@@ -6428,7 +6428,7 @@ mod tests {
     /// does not degrade).
     #[test]
     fn move_all_tasks_transfers_handle_ownership_step_to_backdrop() {
-        use crate::workload::{Work, WorkloadConfig, WorkloadHandle};
+        use crate::workload::{WorkSpec, WorkloadConfig, WorkloadHandle};
 
         let mock = MockCgroupOps::new();
         let topo = mock_topo();
@@ -6443,10 +6443,10 @@ mod tests {
             .add_cgroup_no_cpuset("bd_cg")
             .unwrap();
         step_state.cgroups.add_cgroup_no_cpuset("step_cg").unwrap();
-        let w = Work::default();
+        let w = WorkSpec::default();
         let wl = WorkloadConfig {
             num_workers: 1,
-            affinity: crate::workload::AffinityMode::None,
+            affinity: crate::workload::ResolvedAffinity::None,
             work_type: w.work_type,
             sched_policy: w.sched_policy,
             mem_policy: w.mem_policy,
@@ -6494,7 +6494,7 @@ mod tests {
     /// step→backdrop transfer test above).
     #[test]
     fn move_all_tasks_step_to_step_keeps_step_ownership() {
-        use crate::workload::{Work, WorkloadConfig, WorkloadHandle};
+        use crate::workload::{WorkSpec, WorkloadConfig, WorkloadHandle};
 
         let mock = MockCgroupOps::new();
         let topo = mock_topo();
@@ -6503,10 +6503,10 @@ mod tests {
         let mut backdrop_state = BackdropState::empty(&ctx);
         step_state.cgroups.add_cgroup_no_cpuset("src").unwrap();
         step_state.cgroups.add_cgroup_no_cpuset("dst").unwrap();
-        let w = Work::default();
+        let w = WorkSpec::default();
         let wl = WorkloadConfig {
             num_workers: 1,
-            affinity: crate::workload::AffinityMode::None,
+            affinity: crate::workload::ResolvedAffinity::None,
             work_type: w.work_type,
             sched_policy: w.sched_policy,
             mem_policy: w.mem_policy,
@@ -7081,7 +7081,7 @@ mod tests {
     /// `Op::Spawn` ops on the same cgroup name.
     #[test]
     fn move_all_tasks_renames_every_handle_keyed_under_from() {
-        use crate::workload::{AffinityMode, WorkType, WorkloadConfig, WorkloadHandle};
+        use crate::workload::{ResolvedAffinity, WorkType, WorkloadConfig, WorkloadHandle};
 
         let mock = MockCgroupOps::new();
         let topo = mock_topo();
@@ -7096,7 +7096,7 @@ mod tests {
         for _ in 0..3 {
             let wl = WorkloadConfig {
                 num_workers: 1,
-                affinity: AffinityMode::None,
+                affinity: ResolvedAffinity::None,
                 work_type: WorkType::CpuSpin,
                 ..Default::default()
             };
@@ -7351,7 +7351,7 @@ mod tests {
 
     #[test]
     fn op_constructor_coverage_is_exhaustive() {
-        let w = Work::default();
+        let w = WorkSpec::default();
         let constructed: Vec<Op> = vec![
             Op::add_cgroup("a"),
             Op::remove_cgroup("a"),
@@ -7360,7 +7360,7 @@ mod tests {
             Op::swap_cpusets("a", "b"),
             Op::spawn("a", w.clone()),
             Op::stop_cgroup("a"),
-            Op::set_affinity("a", AffinityKind::Inherit),
+            Op::set_affinity("a", AffinityIntent::Inherit),
             Op::spawn_host(w.clone()),
             Op::move_all_tasks("a", "b"),
             Op::run_payload(&CONSTRUCTOR_TEST_PAYLOAD, Vec::new()),

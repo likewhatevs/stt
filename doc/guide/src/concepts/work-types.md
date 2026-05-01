@@ -1,4 +1,4 @@
-# Work Types
+# WorkSpec Types
 
 `WorkType` controls what each worker process does during a scenario.
 
@@ -288,7 +288,7 @@ the user-provided `name` field.
 ```rust,ignore
 pub struct WorkloadConfig {
     pub num_workers: usize,       // Number of worker processes to fork
-    pub affinity: AffinityMode,   // CPU affinity mode (None, Fixed, Random, SingleCpu)
+    pub affinity: ResolvedAffinity,   // CPU affinity mode (None, Fixed, Random, SingleCpu)
     pub work_type: WorkType,      // What each worker does
     pub sched_policy: SchedPolicy, // Linux scheduling policy
     pub mem_policy: MemPolicy,    // NUMA memory placement policy

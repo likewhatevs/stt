@@ -79,8 +79,8 @@ pub struct Backdrop {
     /// Long-lived cgroups created once and removed at scenario end.
     /// Any Step can reference them by name via `Op::MoveAllTasks`,
     /// `Op::SetCpuset`, etc. Every [`CgroupDef`] here spawns at
-    /// least one worker (declared [`Work`](crate::workload::Work)
-    /// entries, or a single default Work when `works` is empty).
+    /// least one worker (declared [`WorkSpec`](crate::workload::WorkSpec)
+    /// entries, or a single default WorkSpec when `works` is empty).
     /// Declare empty move-target cgroups via [`Self::ops`] /
     /// [`Self::with_op`] using [`Op::AddCgroup`] instead.
     pub cgroups: Vec<CgroupDef>,
@@ -167,7 +167,7 @@ impl Backdrop {
     /// Append a raw [`Op`] to run during Backdrop setup. Typical
     /// use: `Op::AddCgroup { .. }` to create empty move-target
     /// cgroups that persist for the scenario but never spawn
-    /// workers (a [`CgroupDef`] always spawns at least one Work
+    /// workers (a [`CgroupDef`] always spawns at least one WorkSpec
     /// entry, so empty cgroups are only expressible via ops).
     ///
     /// Setup order: CgroupDefs apply first, then ops run, then

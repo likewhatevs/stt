@@ -8059,12 +8059,12 @@ mod tests {
 
     /// A historical commit (HEAD~1 in a 2-commit chain) does NOT
     /// get the `-dirty` suffix even when the worktree is dirty.
-    /// Pins the team-lead's design constraint: only the resolved
-    /// OID equal to current HEAD reflects worktree state; named
-    /// historical commits keep their plain identity. A regression
-    /// that propagated dirt to non-HEAD resolutions would
-    /// fingerprint historical filters with the current local
-    /// state, mis-matching every sidecar in the pool.
+    /// Pins the design constraint: only the resolved OID equal to
+    /// current HEAD reflects worktree state; named historical
+    /// commits keep their plain identity. A regression that
+    /// propagated dirt to non-HEAD resolutions would fingerprint
+    /// historical filters with the current local state,
+    /// mis-matching every sidecar in the pool.
     #[test]
     fn resolve_commit_specs_non_head_does_not_get_dirty_suffix_in_dirty_repo() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -8241,9 +8241,9 @@ mod tests {
     /// `looks_like_literal_hash` rejects revspec-shaped inputs
     /// so the gated rev_parse-Err warning still fires for them.
     /// Pins the negative side of the predicate against every
-    /// shape the team-lead's gating spec calls out: alpha beyond
-    /// hex, ~, .., ^, and out-of-bound lengths. Mixed-case hex
-    /// is now ACCEPTED — see
+    /// shape the gating spec calls out: alpha beyond hex, ~, ..,
+    /// ^, and out-of-bound lengths. Mixed-case hex is now ACCEPTED
+    /// — see
     /// [`looks_like_literal_hash_accepts_uppercase_and_mixed_case`].
     #[test]
     fn looks_like_literal_hash_rejects_revspec_shapes() {

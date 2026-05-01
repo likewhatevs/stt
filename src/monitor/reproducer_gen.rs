@@ -30,10 +30,10 @@
 //! | fingerprint hint              | ktstr type                              |
 //! |-------------------------------|-----------------------------------------|
 //! | WorkloadGroupHint.thread_count| WorkloadConfig::num_workers             |
-//! | AffinityHint::SingleCpu       | AffinityMode::SingleCpu(0)              |
-//! | AffinityHint::Exact{cpus}     | AffinityMode::Fixed(set)                |
-//! | AffinityHint::Inherit         | AffinityMode::None                      |
-//! | AffinityHint::RandomSubset    | AffinityMode::Random { from, count }    |
+//! | AffinityHint::SingleCpu       | ResolvedAffinity::SingleCpu(0)              |
+//! | AffinityHint::Exact{cpus}     | ResolvedAffinity::Fixed(set)                |
+//! | AffinityHint::Inherit         | ResolvedAffinity::None                      |
+//! | AffinityHint::RandomSubset    | ResolvedAffinity::Random { from, count }    |
 //! | WorkTypeHint::CpuSpin         | WorkType::CpuSpin                       |
 //! | WorkTypeHint::YieldHeavy      | WorkType::YieldHeavy                    |
 //! | WorkTypeHint::Mixed           | WorkType::Mixed                         |
@@ -78,7 +78,7 @@ use super::debug_capture::{
     AffinityHint, CgroupHint, DebugCapture, SchedPolicyHint, WorkTypeHint, WorkloadFingerprint,
     WorkloadGroupHint,
 };
-use crate::workload::{AffinityMode, MemPolicy, MpolFlags, SchedPolicy, WorkType, WorkloadConfig, CloneMode};
+use crate::workload::{ResolvedAffinity, MemPolicy, MpolFlags, SchedPolicy, WorkType, WorkloadConfig, CloneMode};
 
 /// One reproducer spec — a `WorkloadConfig` value plus diagnostic
 /// notes about confidence / ambiguity.
@@ -199,36 +199,36 @@ fn map_affinity(fp: &WorkloadFingerprint, spec: &mut ReproducerSpec) {
         return;
     };
     spec.config.affinity = match primary {
-        AffinityHint::Inherit => AffinityMode::None,
-        AffinityHint::SingleCpu => AffinityMode::SingleCpu(0),
+        AffinityHint::Inherit => ResolvedAffinity::None,
+        AffinityHint::SingleCpu => ResolvedAffinity::SingleCpu(0),
         AffinityHint::LlcAligned => {
-            // AffinityMode doesn't carry an LlcAligned variant —
+            // ResolvedAffinity doesn't carry an LlcAligned variant —
             // the topology resolver handles that at framework
-            // level (`AffinityKind::LlcAligned`). Fall back to
+            // level (`AffinityIntent::LlcAligned`). Fall back to
             // `None` and surface the hint as a note.
             spec.notes.push(
                 "AffinityHint::LlcAligned observed; \
-                 AffinityMode lacks an LlcAligned variant — \
-                 framework runs with AffinityMode::None and the \
-                 test harness should use AffinityKind::LlcAligned \
+                 ResolvedAffinity lacks an LlcAligned variant — \
+                 framework runs with ResolvedAffinity::None and the \
+                 test harness should use AffinityIntent::LlcAligned \
                  from the higher-level workload builder"
                     .into(),
             );
-            AffinityMode::None
+            ResolvedAffinity::None
         }
         AffinityHint::CrossCgroup => {
             spec.notes.push(
                 "AffinityHint::CrossCgroup observed; framework runs \
-                 with AffinityMode::None — the cgroup-spanning placement \
+                 with ResolvedAffinity::None — the cgroup-spanning placement \
                  is the harness's responsibility to set up via \
-                 AffinityKind::CrossCgroup at the test-builder level"
+                 AffinityIntent::CrossCgroup at the test-builder level"
                     .into(),
             );
-            AffinityMode::None
+            ResolvedAffinity::None
         }
         AffinityHint::Exact { cpus } => {
             let set: BTreeSet<usize> = cpus.iter().map(|&c| c as usize).collect();
-            AffinityMode::Fixed(set)
+            ResolvedAffinity::Fixed(set)
         }
         AffinityHint::RandomSubset => {
             // Without the source pool, default to single-CPU
@@ -236,12 +236,12 @@ fn map_affinity(fp: &WorkloadFingerprint, spec: &mut ReproducerSpec) {
             // pool when they hand-edit.
             spec.notes.push(
                 "AffinityHint::RandomSubset observed — no source \
-                 pool inferred; emitting AffinityMode::SingleCpu(0). \
-                 Hand-edit to AffinityMode::Random { from, count } \
+                 pool inferred; emitting ResolvedAffinity::SingleCpu(0). \
+                 Hand-edit to ResolvedAffinity::Random { from, count } \
                  with the actual cpuset."
                     .into(),
             );
-            AffinityMode::SingleCpu(0)
+            ResolvedAffinity::SingleCpu(0)
         }
     };
 
@@ -447,21 +447,21 @@ pub fn render_ktstr_test_source(spec: &ReproducerSpec, template_name: &str) -> S
     )
 }
 
-fn render_affinity(a: &AffinityMode) -> String {
+fn render_affinity(a: &ResolvedAffinity) -> String {
     match a {
-        AffinityMode::None => "AffinityMode::None".into(),
-        AffinityMode::SingleCpu(c) => format!("AffinityMode::SingleCpu({c})"),
-        AffinityMode::Fixed(set) => {
+        ResolvedAffinity::None => "ResolvedAffinity::None".into(),
+        ResolvedAffinity::SingleCpu(c) => format!("ResolvedAffinity::SingleCpu({c})"),
+        ResolvedAffinity::Fixed(set) => {
             let cpus: Vec<String> = set.iter().map(|c| c.to_string()).collect();
             format!(
-                "AffinityMode::Fixed(BTreeSet::from([{}]))",
+                "ResolvedAffinity::Fixed(BTreeSet::from([{}]))",
                 cpus.join(", ")
             )
         }
-        AffinityMode::Random { from, count } => {
+        ResolvedAffinity::Random { from, count } => {
             let cpus: Vec<String> = from.iter().map(|c| c.to_string()).collect();
             format!(
-                "AffinityMode::Random {{ from: BTreeSet::from([{}]), count: {} }}",
+                "ResolvedAffinity::Random {{ from: BTreeSet::from([{}]), count: {} }}",
                 cpus.join(", "),
                 count
             )
@@ -521,7 +521,7 @@ mod tests {
         let cap = DebugCapture::default();
         let spec = generate_spec(&cap);
         assert_eq!(spec.config.num_workers, 1);
-        assert!(matches!(spec.config.affinity, AffinityMode::None));
+        assert!(matches!(spec.config.affinity, ResolvedAffinity::None));
         assert!(matches!(spec.config.work_type, WorkType::CpuSpin));
         assert!(spec.notes.iter().any(|n| n.contains("no workload groups")));
         assert!(spec.notes.iter().any(|n| n.contains("no work-type hint")));
@@ -541,7 +541,7 @@ mod tests {
         assert_eq!(spec.config.num_workers, 8);
     }
 
-    /// AffinityHint::Exact{cpus} → AffinityMode::Fixed(set).
+    /// AffinityHint::Exact{cpus} → ResolvedAffinity::Fixed(set).
     #[test]
     fn generate_spec_exact_affinity() {
         let mut cap = DebugCapture::default();
@@ -550,7 +550,7 @@ mod tests {
         }];
         let spec = generate_spec(&cap);
         match spec.config.affinity {
-            AffinityMode::Fixed(set) => {
+            ResolvedAffinity::Fixed(set) => {
                 let v: Vec<usize> = set.into_iter().collect();
                 assert_eq!(v, vec![0, 1, 4, 5]);
             }
@@ -630,13 +630,13 @@ mod tests {
         );
     }
 
-    /// LlcAligned hint surfaces a note (no AffinityMode mapping).
+    /// LlcAligned hint surfaces a note (no ResolvedAffinity mapping).
     #[test]
     fn generate_spec_llc_aligned_note() {
         let mut cap = DebugCapture::default();
         cap.fingerprint.affinity_hints = vec![AffinityHint::LlcAligned];
         let spec = generate_spec(&cap);
-        assert!(matches!(spec.config.affinity, AffinityMode::None));
+        assert!(matches!(spec.config.affinity, ResolvedAffinity::None));
         assert!(
             spec.notes
                 .iter()
@@ -699,26 +699,26 @@ mod tests {
         assert!(src.contains("weight=Some(200)"));
     }
 
-    /// Affinity render handles every AffinityMode variant.
+    /// Affinity render handles every ResolvedAffinity variant.
     #[test]
     fn render_affinity_all_variants() {
-        assert_eq!(render_affinity(&AffinityMode::None), "AffinityMode::None");
+        assert_eq!(render_affinity(&ResolvedAffinity::None), "ResolvedAffinity::None");
         assert_eq!(
-            render_affinity(&AffinityMode::SingleCpu(3)),
-            "AffinityMode::SingleCpu(3)"
+            render_affinity(&ResolvedAffinity::SingleCpu(3)),
+            "ResolvedAffinity::SingleCpu(3)"
         );
-        let fixed = AffinityMode::Fixed(BTreeSet::from([0usize, 1, 2]));
+        let fixed = ResolvedAffinity::Fixed(BTreeSet::from([0usize, 1, 2]));
         assert_eq!(
             render_affinity(&fixed),
-            "AffinityMode::Fixed(BTreeSet::from([0, 1, 2]))"
+            "ResolvedAffinity::Fixed(BTreeSet::from([0, 1, 2]))"
         );
-        let random = AffinityMode::Random {
+        let random = ResolvedAffinity::Random {
             from: BTreeSet::from([0usize, 1]),
             count: 1,
         };
         assert_eq!(
             render_affinity(&random),
-            "AffinityMode::Random { from: BTreeSet::from([0, 1]), count: 1 }"
+            "ResolvedAffinity::Random { from: BTreeSet::from([0, 1]), count: 1 }"
         );
     }
 }

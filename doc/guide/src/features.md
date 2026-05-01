@@ -121,9 +121,9 @@ catalog aggregator.)
 - `Op` — atomic operation (add/remove cgroup, set/swap/clear cpuset, spawn, stop, set affinity, move tasks)
 - `CpusetSpec` — topology-relative cpuset (LLC-aligned, disjoint, overlapping, range, exact)
 - `HoldSpec` — hold duration (fractional, fixed, or looped)
-- `AffinityKind` — per-worker affinity (inherit, random subset, LLC-aligned, cross-cgroup, single CPU, exact)
+- `AffinityIntent` — per-worker affinity (inherit, random subset, LLC-aligned, cross-cgroup, single CPU, exact)
 - `SchedPolicy` — Linux scheduling policy (Normal, Batch, Idle, FIFO, RoundRobin)
-- `Work` — workload definition for a group of workers
+- `WorkSpec` — workload definition for a group of workers
 
 </details>
 
@@ -197,7 +197,7 @@ Workers are `fork()`ed processes placed in cgroups:
 - `MutexContention` — N-way futex mutex contention
 - `Custom` — user-supplied work function
 
-See [Work Types](concepts/work-types.md).
+See [WorkSpec Types](concepts/work-types.md).
 
 </details>
 

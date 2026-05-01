@@ -2689,7 +2689,7 @@ mod tests {
     /// default `je_`, tikv-jemallocator-sys's `_rjem_je_`, the
     /// large-binary `jemalloc_je_` variant. The suffix-match
     /// predicate makes the registry self-extending — a future
-    /// custom prefix will Just Work without code changes.
+    /// custom prefix will Just WorkSpec without code changes.
     #[test]
     fn is_jemalloc_tsd_tls_symbol_accepts_known_prefixes() {
         assert!(is_jemalloc_tsd_tls_symbol("je_tsd_tls"));

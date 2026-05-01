@@ -6,7 +6,7 @@ use super::ops::{
     CgroupDef, CpusetSpec, HoldSpec, Op, Step, execute_scenario, execute_scenario_with,
 };
 use crate::assert::{Assert, AssertResult};
-use crate::workload::AffinityKind;
+use crate::workload::AffinityIntent;
 use anyhow::Result;
 use std::collections::BTreeSet;
 
@@ -27,8 +27,8 @@ pub fn custom_cgroup_affinity_change(ctx: &Ctx) -> Result<AssertResult> {
     for _ in 0..4 {
         steps.push(Step::new(
             vec![
-                Op::set_affinity("cg_0", AffinityKind::RandomSubset),
-                Op::set_affinity("cg_1", AffinityKind::RandomSubset),
+                Op::set_affinity("cg_0", AffinityIntent::RandomSubset),
+                Op::set_affinity("cg_1", AffinityIntent::RandomSubset),
             ],
             HoldSpec::Frac(0.2),
         ));
@@ -59,8 +59,8 @@ pub fn custom_cgroup_multicpu_pin(ctx: &Ctx) -> Result<AssertResult> {
         Step::new(vec![], HoldSpec::Fixed(ctx.settle)),
         Step::new(
             vec![
-                Op::set_affinity("cg_0", AffinityKind::Exact(pin_cpus.clone())),
-                Op::set_affinity("cg_1", AffinityKind::Exact(pin_cpus)),
+                Op::set_affinity("cg_0", AffinityIntent::Exact(pin_cpus.clone())),
+                Op::set_affinity("cg_1", AffinityIntent::Exact(pin_cpus)),
             ],
             HoldSpec::Fixed(ctx.duration),
         ),
@@ -93,8 +93,8 @@ pub fn custom_cgroup_cpuset_multicpu_pin(ctx: &Ctx) -> Result<AssertResult> {
         Step::new(vec![], HoldSpec::Fixed(ctx.settle)),
         Step::new(
             vec![
-                Op::set_affinity("cg_0", AffinityKind::Exact(pin_a)),
-                Op::set_affinity("cg_1", AffinityKind::Exact(pin_b)),
+                Op::set_affinity("cg_0", AffinityIntent::Exact(pin_a)),
+                Op::set_affinity("cg_1", AffinityIntent::Exact(pin_b)),
             ],
             HoldSpec::Fixed(ctx.duration),
         ),

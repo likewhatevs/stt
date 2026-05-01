@@ -229,31 +229,31 @@ pub struct WorkloadGroupHint {
     pub wakeups_per_sec: f64,
 }
 
-/// Affinity placement hint. Maps directly to `crate::workload::AffinityKind`.
+/// Affinity placement hint. Maps directly to `crate::workload::AffinityIntent`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 #[serde(tag = "kind")]
 pub enum AffinityHint {
     /// Default placement — no affinity mask narrower than the
-    /// containing cgroup's cpuset. → `AffinityKind::Inherit`.
+    /// containing cgroup's cpuset. → `AffinityIntent::Inherit`.
     Inherit,
     /// Threads observed pinned to a single CPU each (mask popcount
     /// == 1 across the capture window for the majority of threads
-    /// in the group). → `AffinityKind::SingleCpu`.
+    /// in the group). → `AffinityIntent::SingleCpu`.
     SingleCpu,
     /// Threads observed pinned to LLC-aligned subsets of the
-    /// cgroup's cpuset. → `AffinityKind::LlcAligned`.
+    /// cgroup's cpuset. → `AffinityIntent::LlcAligned`.
     LlcAligned,
     /// Threads observed pinned to cgroup-spanning CPU sets. →
-    /// `AffinityKind::CrossCgroup`.
+    /// `AffinityIntent::CrossCgroup`.
     CrossCgroup,
     /// Threads observed pinned to an explicit CPU set. The capture
     /// records the exact CPUs so the reproducer can reproduce the
-    /// specific placement. → `AffinityKind::Exact`.
+    /// specific placement. → `AffinityIntent::Exact`.
     Exact { cpus: Vec<u32> },
     /// Threads observed pinned to a strict subset of the cgroup's
     /// cpuset, but the subset varies across threads — typical of
-    /// a placement randomizer. → `AffinityKind::RandomSubset`.
+    /// a placement randomizer. → `AffinityIntent::RandomSubset`.
     RandomSubset,
 }
 
@@ -409,7 +409,7 @@ pub fn project_fingerprint(
         );
     }
 
-    // Work-type hints come from CPU-time / wakeup-rate shape across
+    // WorkSpec-type hints come from CPU-time / wakeup-rate shape across
     // the sampling window. Bursty / IoSync are detected by sleep
     // ratio; CpuSpin / Mixed by yield rate vs CPU time.
     fp.work_type_hints = project_work_type_hints(samples);

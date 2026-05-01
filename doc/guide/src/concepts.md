@@ -7,7 +7,7 @@ ktstr tests compose from four layers:
 
 2. **Flags** -- which scheduler features to enable for each run.
 
-3. **Work types** -- what each worker process does: CPU spin, yield,
+3. **WorkSpec types** -- what each worker process does: CPU spin, yield,
    I/O, bursty patterns, pipe-based IPC.
 
 4. **Checking** -- how to evaluate results: starvation, fairness,

@@ -338,9 +338,9 @@ impl FlagProfile {
     }
 }
 
-// Re-export AffinityKind from workload so existing `use super::*` in
+// Re-export AffinityIntent from workload so existing `use super::*` in
 // submodules (affinity.rs, etc.) can find it.
-pub use crate::workload::AffinityKind;
+pub use crate::workload::AffinityIntent;
 
 /// Enumerate flag profiles from a flag-name universe, a
 /// requires-edge resolver, and required/excluded constraints.
@@ -833,26 +833,26 @@ where
     Ok(handles)
 }
 
-/// Resolve an [`AffinityKind`] to a concrete [`AffinityMode`] for workers
+/// Resolve an [`AffinityIntent`] to a concrete [`ResolvedAffinity`] for workers
 /// in a cgroup with the given effective cpuset.
 ///
 /// When a cpuset is active, affinity masks are intersected with it so the
 /// effective `sched_setaffinity` mask matches what the kernel will enforce.
 /// Without a cpuset, the full topology is used.
-/// Resolve a [`Work`]'s `num_workers`, falling back to `default_n` when unset,
+/// Resolve a [`WorkSpec`]'s `num_workers`, falling back to `default_n` when unset,
 /// and reject `num_workers=0`.
 ///
 /// A cgroup with no workers emits no `WorkerReport`s, so every downstream
 /// assertion vacuously passes. Callers that want "no load" on a cgroup
-/// should either drop the `Work` entry entirely (letting the default apply)
+/// should either drop the `WorkSpec` entry entirely (letting the default apply)
 /// or use a single sentinel worker so assertions have something to check.
-pub(crate) fn resolve_num_workers(work: &Work, default_n: usize, label: &str) -> Result<usize> {
+pub(crate) fn resolve_num_workers(work: &WorkSpec, default_n: usize, label: &str) -> Result<usize> {
     let n = work.num_workers.unwrap_or(default_n);
     if n == 0 {
         anyhow::bail!(
             "cgroup '{}': num_workers=0 is not allowed — assertions would \
              vacuously pass with no WorkerReports; use at least 1 worker or \
-             drop this Work entry",
+             drop this WorkSpec entry",
             label,
         );
     }
@@ -860,26 +860,26 @@ pub(crate) fn resolve_num_workers(work: &Work, default_n: usize, label: &str) ->
 }
 
 pub fn resolve_affinity_for_cgroup(
-    kind: &AffinityKind,
+    kind: &AffinityIntent,
     cpuset: Option<&BTreeSet<usize>>,
     topo: &TestTopology,
-) -> AffinityMode {
+) -> ResolvedAffinity {
     match kind {
-        AffinityKind::Inherit => AffinityMode::None,
-        AffinityKind::RandomSubset => {
+        AffinityIntent::Inherit => ResolvedAffinity::None,
+        AffinityIntent::RandomSubset => {
             let pool = cpuset.cloned().unwrap_or_else(|| topo.all_cpuset());
             if pool.is_empty() {
                 tracing::debug!(
                     "RandomSubset: empty cpuset and empty topology pool, \
-                     falling back to AffinityMode::None"
+                     falling back to ResolvedAffinity::None"
                 );
-                AffinityMode::None
+                ResolvedAffinity::None
             } else {
                 let count = (pool.len() / 2).max(1);
-                AffinityMode::Random { from: pool, count }
+                ResolvedAffinity::Random { from: pool, count }
             }
         }
-        AffinityKind::LlcAligned => {
+        AffinityIntent::LlcAligned => {
             let pool = cpuset.cloned().unwrap_or_else(|| topo.all_cpuset());
             // Find the LLC that has the most overlap with the cpuset.
             let mut best_llc = topo.llc_aligned_cpuset(0);
@@ -896,35 +896,35 @@ pub fn resolve_affinity_for_cgroup(
             let effective: BTreeSet<usize> = best_llc.intersection(&pool).copied().collect();
             if effective.is_empty() {
                 // All LLC CPUs outside cpuset -- fall back to inheriting cpuset.
-                AffinityMode::None
+                ResolvedAffinity::None
             } else {
-                AffinityMode::Fixed(effective)
+                ResolvedAffinity::Fixed(effective)
             }
         }
-        AffinityKind::CrossCgroup => {
+        AffinityIntent::CrossCgroup => {
             // When a cpuset is active, crossing cgroup boundaries is the intent,
             // but the kernel will intersect. Use all CPUs -- the kernel enforces
             // the cpuset constraint.
-            AffinityMode::Fixed(topo.all_cpuset())
+            ResolvedAffinity::Fixed(topo.all_cpuset())
         }
-        AffinityKind::SingleCpu => {
+        AffinityIntent::SingleCpu => {
             let pool = cpuset.cloned().unwrap_or_else(|| topo.all_cpuset());
             if let Some(&cpu) = pool.iter().next() {
-                AffinityMode::SingleCpu(cpu)
+                ResolvedAffinity::SingleCpu(cpu)
             } else {
-                AffinityMode::None
+                ResolvedAffinity::None
             }
         }
-        AffinityKind::Exact(cpus) => {
+        AffinityIntent::Exact(cpus) => {
             if let Some(cs) = cpuset {
                 let effective: BTreeSet<usize> = cpus.intersection(cs).copied().collect();
                 if effective.is_empty() {
-                    AffinityMode::None
+                    ResolvedAffinity::None
                 } else {
-                    AffinityMode::Fixed(effective)
+                    ResolvedAffinity::Fixed(effective)
                 }
             } else {
-                AffinityMode::Fixed(cpus.clone())
+                ResolvedAffinity::Fixed(cpus.clone())
             }
         }
     }
@@ -1090,16 +1090,16 @@ mod tests {
     fn resolve_affinity_inherit() {
         let t = crate::topology::TestTopology::synthetic(8, 2);
         assert!(matches!(
-            resolve_affinity_for_cgroup(&AffinityKind::Inherit, None, &t),
-            AffinityMode::None
+            resolve_affinity_for_cgroup(&AffinityIntent::Inherit, None, &t),
+            ResolvedAffinity::None
         ));
     }
 
     #[test]
     fn resolve_affinity_single_cpu() {
         let t = crate::topology::TestTopology::synthetic(8, 2);
-        match resolve_affinity_for_cgroup(&AffinityKind::SingleCpu, None, &t) {
-            AffinityMode::SingleCpu(c) => assert_eq!(c, 0),
+        match resolve_affinity_for_cgroup(&AffinityIntent::SingleCpu, None, &t) {
+            ResolvedAffinity::SingleCpu(c) => assert_eq!(c, 0),
             other => panic!("expected SingleCpu, got {:?}", other),
         }
     }
@@ -1107,8 +1107,8 @@ mod tests {
     #[test]
     fn resolve_affinity_cross_cgroup() {
         let t = crate::topology::TestTopology::synthetic(8, 2);
-        match resolve_affinity_for_cgroup(&AffinityKind::CrossCgroup, None, &t) {
-            AffinityMode::Fixed(cpus) => assert_eq!(cpus.len(), 8),
+        match resolve_affinity_for_cgroup(&AffinityIntent::CrossCgroup, None, &t) {
+            ResolvedAffinity::Fixed(cpus) => assert_eq!(cpus.len(), 8),
             other => panic!("expected Fixed, got {:?}", other),
         }
     }
@@ -1118,8 +1118,8 @@ mod tests {
         let t = crate::topology::TestTopology::synthetic(8, 2);
         // No cpuset: both LLCs cover the full pool equally. LLC 0
         // is found first with max overlap, so result is LLC 0 CPUs.
-        match resolve_affinity_for_cgroup(&AffinityKind::LlcAligned, None, &t) {
-            AffinityMode::Fixed(cpus) => assert_eq!(cpus, [0, 1, 2, 3].into_iter().collect()),
+        match resolve_affinity_for_cgroup(&AffinityIntent::LlcAligned, None, &t) {
+            ResolvedAffinity::Fixed(cpus) => assert_eq!(cpus, [0, 1, 2, 3].into_iter().collect()),
             other => panic!("expected Fixed, got {:?}", other),
         }
     }
@@ -1132,8 +1132,8 @@ mod tests {
             [0, 1, 2, 3].into_iter().collect(),
             [4, 5, 6, 7].into_iter().collect(),
         ];
-        match resolve_affinity_for_cgroup(&AffinityKind::LlcAligned, cpusets.get(1), &t) {
-            AffinityMode::Fixed(cpus) => assert_eq!(cpus, [4, 5, 6, 7].into_iter().collect()),
+        match resolve_affinity_for_cgroup(&AffinityIntent::LlcAligned, cpusets.get(1), &t) {
+            ResolvedAffinity::Fixed(cpus) => assert_eq!(cpus, [4, 5, 6, 7].into_iter().collect()),
             other => panic!("expected Fixed, got {:?}", other),
         }
     }
@@ -1142,8 +1142,8 @@ mod tests {
     fn resolve_affinity_random_subset() {
         let t = crate::topology::TestTopology::synthetic(8, 2);
         let cpusets: Vec<BTreeSet<usize>> = vec![[0, 1, 2, 3].into_iter().collect()];
-        match resolve_affinity_for_cgroup(&AffinityKind::RandomSubset, cpusets.first(), &t) {
-            AffinityMode::Random { from, count } => {
+        match resolve_affinity_for_cgroup(&AffinityIntent::RandomSubset, cpusets.first(), &t) {
+            ResolvedAffinity::Random { from, count } => {
                 assert_eq!(from, cpusets[0]);
                 assert_eq!(count, 2); // half of 4
             }
@@ -1153,19 +1153,19 @@ mod tests {
 
     #[test]
     fn cgroup_work_default() {
-        let cw = Work::default();
+        let cw = WorkSpec::default();
         assert_eq!(cw.num_workers, None);
         assert!(matches!(cw.work_type, WorkType::CpuSpin));
         assert!(matches!(cw.sched_policy, SchedPolicy::Normal));
-        assert!(matches!(cw.affinity, AffinityKind::Inherit));
+        assert!(matches!(cw.affinity, AffinityIntent::Inherit));
         assert!(matches!(cw.mem_policy, MemPolicy::Default));
     }
 
     #[test]
     fn resolve_affinity_random_no_cpusets() {
         let t = crate::topology::TestTopology::synthetic(8, 2);
-        match resolve_affinity_for_cgroup(&AffinityKind::RandomSubset, None, &t) {
-            AffinityMode::Random { from, count } => {
+        match resolve_affinity_for_cgroup(&AffinityIntent::RandomSubset, None, &t) {
+            ResolvedAffinity::Random { from, count } => {
                 assert_eq!(from.len(), 8); // all CPUs
                 assert_eq!(count, 4); // half
             }
@@ -1175,14 +1175,14 @@ mod tests {
 
     #[test]
     fn resolve_affinity_random_subset_empty_pool_is_none() {
-        // Regression: empty cpuset produced AffinityMode::Random { from: empty,
+        // Regression: empty cpuset produced ResolvedAffinity::Random { from: empty,
         // count: 1 }, which previously produced an empty affinity mask
         // rejected by sched_setaffinity with EINVAL. Must short-circuit
-        // to AffinityMode::None here.
+        // to ResolvedAffinity::None here.
         let t = crate::topology::TestTopology::synthetic(4, 1);
         let empty: BTreeSet<usize> = BTreeSet::new();
-        match resolve_affinity_for_cgroup(&AffinityKind::RandomSubset, Some(&empty), &t) {
-            AffinityMode::None => {}
+        match resolve_affinity_for_cgroup(&AffinityIntent::RandomSubset, Some(&empty), &t) {
+            ResolvedAffinity::None => {}
             other => panic!("expected None for empty cpuset, got {:?}", other),
         }
     }
@@ -1201,8 +1201,8 @@ mod tests {
         // Mirror the inlined expression in run_scenario:
         let cpuset = cpusets.get(oob_idx);
         assert!(cpuset.is_none(), "OOB index must yield None cpuset");
-        match resolve_affinity_for_cgroup(&AffinityKind::RandomSubset, cpuset, &t) {
-            AffinityMode::Random { from, count } => {
+        match resolve_affinity_for_cgroup(&AffinityIntent::RandomSubset, cpuset, &t) {
+            ResolvedAffinity::Random { from, count } => {
                 assert_eq!(from.len(), 4, "OOB idx falls back to full topology");
                 assert_eq!(count, 2);
             }
@@ -1467,8 +1467,8 @@ mod tests {
         let t = crate::topology::TestTopology::synthetic(4, 1);
         // Cpuset restricts to CPUs {2,3}: SingleCpu picks first in cpuset.
         let cpusets: Vec<BTreeSet<usize>> = vec![[2, 3].into_iter().collect()];
-        match resolve_affinity_for_cgroup(&AffinityKind::SingleCpu, cpusets.first(), &t) {
-            AffinityMode::SingleCpu(c) => assert_eq!(c, 2),
+        match resolve_affinity_for_cgroup(&AffinityIntent::SingleCpu, cpusets.first(), &t) {
+            ResolvedAffinity::SingleCpu(c) => assert_eq!(c, 2),
             other => panic!("expected SingleCpu, got {:?}", other),
         }
     }
@@ -1480,8 +1480,8 @@ mod tests {
         // LLC 0 = {0,1,2,3}, LLC 1 = {4,5,6,7}.
         // Cpuset = {3, 4, 5, 6, 7}: LLC 1 has 4 CPUs in cpuset, LLC 0 has 1.
         let cpusets: Vec<BTreeSet<usize>> = vec![[3, 4, 5, 6, 7].into_iter().collect()];
-        match resolve_affinity_for_cgroup(&AffinityKind::LlcAligned, cpusets.first(), &t) {
-            AffinityMode::Fixed(cpus) => {
+        match resolve_affinity_for_cgroup(&AffinityIntent::LlcAligned, cpusets.first(), &t) {
+            ResolvedAffinity::Fixed(cpus) => {
                 // LLC 1 has best overlap; result is intersection {4,5,6,7}.
                 assert_eq!(cpus, [4, 5, 6, 7].into_iter().collect());
             }
@@ -1491,7 +1491,7 @@ mod tests {
 
     #[test]
     fn resolve_num_workers_zero_rejected_with_label() {
-        let w = Work {
+        let w = WorkSpec {
             num_workers: Some(0),
             ..Default::default()
         };
@@ -1510,7 +1510,7 @@ mod tests {
     #[test]
     fn resolve_num_workers_zero_default_also_rejected() {
         // When num_workers is unset AND the default is 0, still reject.
-        let w = Work {
+        let w = WorkSpec {
             num_workers: None,
             ..Default::default()
         };
@@ -1519,7 +1519,7 @@ mod tests {
 
     #[test]
     fn resolve_num_workers_falls_back_to_default() {
-        let w = Work {
+        let w = WorkSpec {
             num_workers: None,
             ..Default::default()
         };
@@ -1528,7 +1528,7 @@ mod tests {
 
     #[test]
     fn resolve_num_workers_explicit_wins_over_default() {
-        let w = Work {
+        let w = WorkSpec {
             num_workers: Some(7),
             ..Default::default()
         };

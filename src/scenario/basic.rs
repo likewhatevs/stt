@@ -13,7 +13,7 @@ fn host_cgroup_contention_steps(ctx: &Ctx) -> Vec<Step> {
             HoldSpec::Fixed(ctx.settle + ctx.duration),
         )
         .set_ops(vec![Op::spawn_host(
-            Work::default().workers(ctx.topo.total_cpus()),
+            WorkSpec::default().workers(ctx.topo.total_cpus()),
         )]),
     ]
 }
@@ -38,7 +38,7 @@ fn sched_mixed_steps(ctx: &Ctx) -> Vec<Step> {
         for &(policy, ref wtype) in &configs {
             ops.push(Op::spawn(
                 name,
-                Work::default()
+                WorkSpec::default()
                     .workers(2)
                     .sched_policy(policy)
                     .work_type(wtype.clone()),
@@ -61,13 +61,13 @@ fn cgroup_pipe_io_steps(ctx: &Ctx) -> Vec<Step> {
     for name in ["cg_0", "cg_1"] {
         ops.push(Op::spawn(
             name,
-            Work::default()
+            WorkSpec::default()
                 .workers(2)
                 .work_type(WorkType::pipe_io(1024)),
         ));
         ops.push(Op::spawn(
             name,
-            Work::default().workers(ctx.workers_per_cgroup),
+            WorkSpec::default().workers(ctx.workers_per_cgroup),
         ));
     }
 

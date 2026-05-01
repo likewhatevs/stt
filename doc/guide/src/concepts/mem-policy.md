@@ -77,15 +77,15 @@ Flags combine with `|` or `MpolFlags::union()`:
 let flags = MpolFlags::STATIC_NODES | MpolFlags::NUMA_BALANCING;
 ```
 
-## Usage in Work and CgroupDef
+## Usage in WorkSpec and CgroupDef
 
-`Work` and `CgroupDef` both expose `.mem_policy()` and
+`WorkSpec` and `CgroupDef` both expose `.mem_policy()` and
 `.mpol_flags()` builder methods:
 
 ```rust,ignore
 use ktstr::prelude::*;
 
-let w = Work::default()
+let w = WorkSpec::default()
     .workers(4)
     .mem_policy(MemPolicy::bind([0]))
     .mpol_flags(MpolFlags::STATIC_NODES);

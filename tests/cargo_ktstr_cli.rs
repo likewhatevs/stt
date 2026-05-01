@@ -100,8 +100,8 @@ fn help_shell() {
 
 /// `cargo ktstr export --help` exposes the four flags the router
 /// dispatches on: `<TEST>` positional, `--output`/-o, `--package`/-p
-/// (workspace disambiguation per adv-t A4), and `--release` (profile
-/// pin). Pins the router CLI surface so a future clap regression
+/// (workspace disambiguation), and `--release` (profile pin).
+/// Pins the router CLI surface so a future clap regression
 /// that drops one of these flags is caught at the help-text level
 /// before it surfaces as a misleading "test not found" error in the
 /// router.
@@ -177,11 +177,11 @@ fn help_kernel_build() {
         .stdout(predicate::str::contains("--clean"))
         .stdout(predicate::str::contains("--extra-kconfig"))
         // `--extra-kconfig` doc must explain that `make olddefconfig`
-        // resolves dependencies — per coordinator ruling #7d, the
-        // help is the discoverability surface for the merge
-        // pipeline. A regression that dropped the explanation
-        // would leave operators guessing why a fragment line
-        // silently disappeared from the final `.config`.
+        // resolves dependencies — the help is the discoverability
+        // surface for the merge pipeline. A regression that dropped
+        // the explanation would leave operators guessing why a
+        // fragment line silently disappeared from the final
+        // `.config`.
         .stdout(predicate::str::contains("olddefconfig"));
 }
 

@@ -193,7 +193,7 @@ pub struct SidecarResult {
     /// Ordered stimulus events published by the guest step executor
     /// while the scenario ran.
     pub stimulus_events: Vec<StimulusEvent>,
-    /// Work type label used for post-hoc filtering and A/B comparison
+    /// WorkSpec type label used for post-hoc filtering and A/B comparison
     /// (distinct from the `WorkType` enum — this is the text name).
     pub work_type: String,
     /// Scheduler flag names active for this gauntlet variant. Empty

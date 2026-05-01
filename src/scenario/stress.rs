@@ -121,7 +121,7 @@ pub fn custom_cgroup_dsq_contention(ctx: &Ctx) -> Result<AssertResult> {
     for &cpu in all.iter().take(n_pinned) {
         let h = WorkloadHandle::spawn(&WorkloadConfig {
             num_workers: 1,
-            affinity: AffinityMode::SingleCpu(cpu),
+            affinity: ResolvedAffinity::SingleCpu(cpu),
             work_type: WorkType::bursty(10, 5),
             ..Default::default()
         })?;

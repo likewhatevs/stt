@@ -1576,7 +1576,7 @@ mod tests {
         assert_eq!(t.cpus_in_llc(99), &[] as &[usize]);
     }
 
-    /// Regression for `AffinityKind::LlcAligned` panic when the
+    /// Regression for `AffinityIntent::LlcAligned` panic when the
     /// topology has zero LLCs: construction now asserts non-zero,
     /// so the path that used to hit `self.llcs[0]` on empty is
     /// unreachable.
