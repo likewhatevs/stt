@@ -66,39 +66,56 @@ fn collect_real_reports() -> Vec<WorkerReport> {
     reports
 }
 
-/// Real WorkerReport data + passing claims via both the typed
-/// accessor and the macro routes. Verifies `Verdict::into_result`
-/// returns `passed = true` with no details when every comparator
-/// passes.
+/// End-to-end Verdict pipeline: spawn workload, collect reports,
+/// build Assert with defaults, open Verdict, claim through both the
+/// typed `claim_<field>` accessors and the `claim!` macro, finish
+/// with `into_result`.
+///
+/// Pins the contract that the entry point named in the user-facing
+/// docs (`use ktstr::prelude::*; let mut v = Assert::defaults().verdict();`)
+/// composes with both label sources against real `WorkerReport` data
+/// and produces a passing result with empty details.
 #[test]
 fn verdict_passing_claims_against_real_worker_report() {
     let reports = collect_real_reports();
     let report = &reports[0];
 
-    let mut v = Verdict::new();
+    // Build the Verdict via `Assert::defaults().verdict()` — the
+    // user-facing entry point referenced in the lib.rs Quick Start.
+    // `Assert::defaults()` carries the threshold layer; `.verdict()`
+    // hands it forward so any merge of an `assert_*` result later
+    // sees the same thresholds.
+    let mut v = Assert::defaults().verdict();
+    assert!(
+        v.assert().is_some(),
+        "Assert::defaults().verdict() must attach the threshold layer",
+    );
 
-    // Typed scalar accessor. wall_time_ns is u64; `at_least(1)` is the
-    // weakest non-trivial floor (any worker that ran at all has a
-    // non-zero wall clock).
+    // Typed scalar accessor. wall_time_ns is u64; the workload ran
+    // for 200ms, so wall_time_ns is multiple orders of magnitude
+    // above 1ns. The `at_least(1)` floor would still fail on a
+    // sentinel report (`wall_time_ns = 0`) — that is the intended
+    // discrimination.
     report.claim_wall_time_ns(&mut v).at_least(1);
-    // Typed scalar accessor with `eq` -- `completed` is bool (PartialEq
-    // + Display). Real reports from a graceful stop_and_collect have
-    // `completed = true`; sentinel reports have `false`. We assert the
-    // graceful-stop path executed.
+    // Typed scalar accessor with `eq` — `completed` is bool. Real
+    // reports from a graceful stop_and_collect have `completed =
+    // true`; sentinel reports have `false`. Pins the graceful-stop
+    // path executed.
     report.claim_completed(&mut v).eq(true);
     // Typed set accessor. `cpus_used` is BTreeSet<usize>; SetClaim's
     // `nonempty` covers the "worker actually ran on at least one CPU"
     // baseline.
     report.claim_cpus_used(&mut v).nonempty();
 
-    // Macro on a local binding. The label should be `"work_units"`
-    // (the binding name, not the field name on the report).
+    // Macro on a local binding. The label is `"work_units"` (the
+    // binding name) — the failing-test below proves the binding
+    // ident, not the field name, is what reaches the detail message.
     let work_units = report.work_units;
-    claim!(v, work_units).at_least(0);
+    claim!(v, work_units).at_least(1);
 
-    // Macro on an expression. The label is the full token tree
-    // serialized by stringify!.
-    claim!(v, report.iterations + report.work_units).at_least(0);
+    // Macro on an expression. Label is the full token tree from
+    // stringify!.
+    claim!(v, report.iterations + report.work_units).at_least(1);
 
     let r = v.into_result();
     assert!(
