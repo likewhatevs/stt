@@ -69,8 +69,8 @@ pub struct SchedClassRegistry {
 }
 
 #[allow(dead_code)] // wired through DumpContext::TaskEnrichmentCapture;
-                    // freeze coordinator passes None until #50 lands a
-                    // walker producer.
+                    // freeze coordinator passes None until the rq->scx
+                    // walker lands a walker producer.
 impl SchedClassRegistry {
     /// Resolve all six class symbols via the GuestKernel's vmlinux
     /// symbol table. Each lookup is independent — a missing symbol

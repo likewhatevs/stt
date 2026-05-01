@@ -151,11 +151,10 @@ pub struct CpuTimeCapture<'a> {
 /// PI-boost-out-of-SCX flag), the lock-slowpath symbol cache (for
 /// stack-trace pattern matching), AND the task list itself — a
 /// pre-collected `&[TaskWalkerEntry]` produced by a task walker
-/// (rq->scx in #50, DSQ in #49, init_task→tasks for an enumeration
-/// path).
+/// (rq->scx walk, DSQ walk, init_task→tasks enumeration).
 ///
 /// Mirrors the [`ProgRuntimeCapture`] / [`CpuTimeCapture`]
-/// borrowed-only-optional shape (#84). When `dump_state` receives
+/// borrowed-only-optional shape. When `dump_state` receives
 /// `Some(TaskEnrichmentCapture)`, it iterates `tasks` and calls
 /// [`super::task_enrichment::walk_task_enrichment`] for each entry,
 /// pushing results into [`FailureDumpReport::task_enrichments`]. When
@@ -164,9 +163,9 @@ pub struct CpuTimeCapture<'a> {
 /// "no task walker available" diagnostic.
 ///
 /// The walker producer (rq->scx walker etc.) is responsible for
-/// building this struct. Until #49/#50 land, no walker exists; the
-/// freeze coordinator passes `None` and the field is plumbed but
-/// empty.
+/// building this struct. Until walker dispatch lands, no walker
+/// exists; the freeze coordinator passes `None` and the field is
+/// plumbed but empty.
 pub struct TaskEnrichmentCapture<'a> {
     /// Borrowed GuestKernel — provides memory access, page-table
     /// translation context, and the vmlinux symbol table.
@@ -269,8 +268,7 @@ pub struct PerCpuTimeStats {
 }
 
 /// Per-node NUMA event counters captured from
-/// `pglist_data->node_zones[]->vm_numa_event[]` at freeze time
-/// (#66).
+/// `pglist_data->node_zones[]->vm_numa_event[]` at freeze time.
 ///
 /// Each row is one row of NUMA event counters summed across all
 /// zones on a single node. The six counters mirror the kernel's
@@ -289,9 +287,9 @@ pub struct PerCpuTimeStats {
 /// **Live walker status:** the wire shape, BTF offsets
 /// ([`super::btf_offsets::NumaStatsOffsets`]), and report field
 /// are wired through. The actual host-side walker that resolves
-/// `node_data[]` and reads per-zone counters is a follow-up task
-/// (#66-walker); until it lands, the report's
-/// [`FailureDumpReport::per_node_numa`] vec stays empty and
+/// `node_data[]` and reads per-zone counters is pending; until it
+/// lands, the report's [`FailureDumpReport::per_node_numa`] vec
+/// stays empty and
 /// [`FailureDumpReport::per_node_numa_unavailable`] carries the
 /// `"no NUMA walker"` reason.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -320,11 +318,11 @@ pub struct PerNodeNumaStats {
 }
 
 /// Reason string written into [`FailureDumpReport::per_node_numa_unavailable`]
-/// when the live walker for #66 has not landed yet. Distinct from
+/// when the per-node NUMA walker has not landed yet. Distinct from
 /// other unavailable reasons so a downstream consumer can tell
 /// "walker not implemented" apart from "walker ran and produced
 /// no data" once the live producer ships.
-pub const REASON_NO_NUMA_WALKER: &str = "no NUMA walker (#66 follow-up)";
+pub const REASON_NO_NUMA_WALKER: &str = "no NUMA walker (host-side walker pending)";
 
 /// Borrow-only capture context for the per-sample SCX event counter
 /// timeline.
@@ -347,9 +345,9 @@ pub struct EventCounterCapture<'a> {
     pub samples: &'a [super::MonitorSample],
 }
 
-/// Borrow-only capture context for the rq->scx + DSQ walkers (#49,
-/// #50). Mirrors [`TaskEnrichmentCapture`] / [`CpuTimeCapture`]
-/// shape (#84) — `dump_state` consumes everything by reference.
+/// Borrow-only capture context for the rq->scx + DSQ walkers.
+/// Mirrors [`TaskEnrichmentCapture`] / [`CpuTimeCapture`] shape —
+/// `dump_state` consumes everything by reference.
 ///
 /// Carries:
 /// - `kernel`: GuestKernel handle for guest-memory reads
@@ -690,8 +688,8 @@ pub struct FailureDumpReport {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub per_cpu_time: Vec<PerCpuTimeStats>,
     /// Per-node NUMA event counters captured from
-    /// `pglist_data->node_zones[]->vm_numa_event[]` (#66). One row
-    /// per NUMA node enumerated by the walker. Empty when the live
+    /// `pglist_data->node_zones[]->vm_numa_event[]`. One row per
+    /// NUMA node enumerated by the walker. Empty when the live
     /// walker has not landed yet (the BTF offsets and wire shape
     /// are wired; the reader is a follow-up).
     ///
@@ -703,7 +701,7 @@ pub struct FailureDumpReport {
     /// Diagnostic reason for `per_node_numa` being empty.
     /// `None` when the vec was populated normally (or the dump
     /// path didn't run); `Some(REASON_NO_NUMA_WALKER)` until the
-    /// #66 follow-up walker lands.
+    /// host-side walker lands.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub per_node_numa_unavailable: Option<String>,
     /// Per-task failure-dump enrichments — identity (pid, tgid,
@@ -713,10 +711,11 @@ pub struct FailureDumpReport {
     /// disambiguation flag, and lock-slowpath stack matches.
     ///
     /// One entry per task the dump path's task walker reaches —
-    /// today's task walkers are the rq->scx walker (#50) and the
-    /// DSQ walker (#49); both produce task KVAs that get enriched
-    /// here. Empty when no task walker ran (typical until #49/#50
-    /// land) or when the [`TaskEnrichmentCapture`] was absent.
+    /// today's task walkers are the rq->scx walker and the DSQ
+    /// walker; both produce task KVAs that get enriched here.
+    /// Empty when no task walker ran (typical until walker
+    /// dispatch lands) or when the [`TaskEnrichmentCapture`] was
+    /// absent.
     ///
     /// See [`super::task_enrichment::TaskEnrichment`] for field
     /// semantics; see [`Self::task_enrichments_unavailable`] for the
@@ -729,8 +728,8 @@ pub struct FailureDumpReport {
     ///   didn't run).
     /// - `Some("no task walker available")` → the
     ///   [`TaskEnrichmentCapture`] was missing from
-    ///   [`DumpContext`]. Until #49/#50 (DSQ + rq->scx walkers)
-    ///   land, this is the expected steady state for the dump
+    ///   [`DumpContext`]. Until DSQ + rq->scx walker dispatch
+    ///   lands, this is the expected steady state for the dump
     ///   pipeline; the offsets + walker library is wired and
     ///   ready to populate as soon as a task-list producer hooks
     ///   in.
@@ -754,7 +753,7 @@ pub struct FailureDumpReport {
     pub event_counter_timeline: Vec<EventCounterSample>,
     /// Per-CPU `rq->scx` snapshots — scalar fields the kernel's
     /// own `scx_dump_state` reads plus the runnable_list per-task
-    /// KVAs that fed into the per-task enrichment capture (#28).
+    /// KVAs that fed into the per-task enrichment capture.
     /// One entry per CPU walked. Empty when the
     /// [`ScxWalkerCapture`] was absent or every CPU's translate
     /// failed.
@@ -780,7 +779,7 @@ pub struct FailureDumpReport {
     /// Diagnostic reason for `rq_scx_states` / `dsq_states` /
     /// `scx_sched_state` being absent. Mirrors the
     /// `prog_runtime_stats_unavailable` / `task_enrichments_unavailable`
-    /// pattern (#42).
+    /// pattern.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scx_walker_unavailable: Option<String>,
     /// Per-vCPU hardware perf counter snapshot captured at the
@@ -1360,12 +1359,12 @@ const KTSTR_INTERNAL_MAPS: &[&str] = &["func_meta_map", "probe_data", "probe_scr
 /// map enumeration AND for the sdt_alloc post-pass walk, which
 /// needs the underlying [`super::guest::GuestKernel`] handle —
 /// only the guest-memory backend exposes that. When the live-host
-/// backend (#9) lands, sdt_alloc walking will move into a
+/// backend lands, sdt_alloc walking will move into a
 /// backend-specific path and `accessor` here can become
 /// `&'a dyn BpfMapAccessor`.
 ///
 /// `arena_offsets` and `prog_capture` are both optional borrows
-/// (uniform shape — see #84): `None` for either disables that
+/// (uniform shape): `None` for either disables that
 /// capture leg without affecting the rest. A scheduler running on
 /// an older kernel without arena support lands here with
 /// `arena_offsets: None` and the failure dump renders maps + regs
@@ -1399,7 +1398,7 @@ pub struct DumpContext<'a> {
     /// Per-CPU CPU-time / softirq / IRQ capture. `None` skips the
     /// per-CPU time walk; the rest of the dump still renders. Same
     /// "borrowed-only, optional" shape as
-    /// [`Self::prog_capture`] / [`Self::arena_offsets`] (#84) so a
+    /// [`Self::prog_capture`] / [`Self::arena_offsets`] so a
     /// future capture site lands as another optional field without
     /// churning the call sites already plumbed through here.
     pub cpu_time_capture: Option<&'a CpuTimeCapture<'a>>,
@@ -1407,8 +1406,8 @@ pub struct DumpContext<'a> {
     /// and `task_enrichments` stays empty; the rest of the dump
     /// still renders.
     ///
-    /// Today's freeze coordinator passes `None` because no task
-    /// walker has landed yet (#49 DSQ + #50 rq->scx). The
+    /// Today's freeze coordinator passes `None` because the DSQ
+    /// and rq->scx task walkers have not yet landed dispatch. The
     /// `TaskEnrichmentOffsets` + `SchedClassRegistry` + the
     /// `walk_task_enrichment` library are wired and ready —
     /// the producer side just needs to populate
@@ -1520,7 +1519,7 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
     let (rq_scx_states, dsq_states, scx_sched_state, scx_walker_unavailable) =
         match scx_walker_capture {
             Some(cap) => {
-                // Sub-group offsets resolved per kernel struct (#43);
+                // Sub-group offsets resolved per kernel struct;
                 // surface the absent groups in the diagnostic so a
                 // partial walk announces which passes were skipped.
                 let missing = cap.offsets.missing_groups();
@@ -1640,8 +1639,8 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
         prog_runtime_stats,
         prog_runtime_stats_unavailable,
         per_cpu_time,
-        // #66 wire fields: empty Vec + the well-defined diagnostic
-        // string until the live walker (#66 follow-up) lands.
+        // Per-node NUMA wire fields: empty Vec + the well-defined
+        // diagnostic string until the host-side walker lands.
         per_node_numa: Vec::new(),
         per_node_numa_unavailable: Some(REASON_NO_NUMA_WALKER.to_string()),
         task_enrichments,
@@ -3298,7 +3297,7 @@ mod tests {
         );
     }
 
-    // ---- #91: pin failure-dump error-message strings ---------------
+    // ---- pin failure-dump error-message strings --------------------
     //
     // The six REASON_* constants emitted by `dump_state` into the
     // `*_unavailable` fields are wire-format markers: an operator
@@ -3312,7 +3311,7 @@ mod tests {
     //
     // The companion strict-schema and chain-limit tests for
     // FailureDumpReport / is_scx_allocator_type live further down in
-    // this module (#88 / #89).
+    // this module.
 
     #[test]
     fn reason_no_struct_ops_loaded_string_pinned() {
@@ -3392,7 +3391,7 @@ mod tests {
         );
     }
 
-    // -- Strict-schema tests for FailureDumpReport (#88) --------------
+    // -- Strict-schema tests for FailureDumpReport -------------------
     //
     // Mirrors the CgroupStats / ScenarioStats / SidecarResult tests in
     // assert.rs and test_support/sidecar.rs. FailureDumpReport's
@@ -3480,7 +3479,7 @@ mod tests {
         assert!(report.vcpu_perf_at_freeze.is_empty());
     }
 
-    // -- Pin failure-dump error-message strings (#91) ----------------
+    // -- Pin failure-dump error-message strings ----------------------
     //
     // Pin the EXACT prose of error strings rendered into
     // FailureDumpMap.error. Substring tests are permissive against
@@ -3581,7 +3580,7 @@ mod tests {
         );
     }
 
-    // -- Per-node NUMA stats wire shape (#66) -------------------------
+    // -- Per-node NUMA stats wire shape -------------------------------
     //
     // The live walker is a follow-up; this section pins the wire
     // contract so the schema is stable before the producer lands.
@@ -3651,6 +3650,6 @@ mod tests {
         // failure-dump consumers. Drift would silently break that
         // tooling. The constant is the single source of truth; this
         // test pins it byte-for-byte.
-        assert_eq!(REASON_NO_NUMA_WALKER, "no NUMA walker (#66 follow-up)");
+        assert_eq!(REASON_NO_NUMA_WALKER, "no NUMA walker (host-side walker pending)");
     }
 }

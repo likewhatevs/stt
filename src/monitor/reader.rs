@@ -1115,8 +1115,8 @@ pub(crate) struct MonitorConfig<'a> {
     pub vcpu_timing: Option<&'a VcpuTiming>,
     /// Optional host-side perf-counter capture. When present, every
     /// monitor sample reads `cycles`/`instructions`/`cache_misses`/
-    /// `branch_misses` per vCPU into [`super::CpuSnapshot::vcpu_perf`]
-    /// (#26). `None` skips the per-vCPU PMU capture.
+    /// `branch_misses` per vCPU into [`super::CpuSnapshot::vcpu_perf`].
+    /// `None` skips the per-vCPU PMU capture.
     pub perf_capture: Option<&'a super::perf_counters::PerfCountersCapture>,
     /// Preemption threshold in nanoseconds used for stall detection.
     /// Pass 0 to derive it from the guest kernel's CONFIG_HZ.

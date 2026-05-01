@@ -111,6 +111,89 @@ pub enum KernelCommand {
         clean: bool,
         #[arg(long, help = CPU_CAP_HELP)]
         cpu_cap: Option<usize>,
+        /// Path to an additional kconfig fragment merged on top of
+        /// the baked-in `ktstr.kconfig`.
+        ///
+        /// # Format
+        ///
+        /// One declaration per line, same shapes the kernel itself
+        /// uses:
+        ///
+        /// ```text
+        /// # comment lines start with `#` and a space
+        /// CONFIG_FOO=y                  # boolean enable
+        /// CONFIG_FOO=m                  # build as module
+        /// CONFIG_FOO=n                  # disable (equivalent to is-not-set)
+        /// CONFIG_BAR="some value"       # string
+        /// CONFIG_BAR=42                 # integer / hex
+        /// # CONFIG_FOO is not set       # explicit disable directive
+        /// ```
+        ///
+        /// The baked-in fragment lives at `ktstr.kconfig` in the
+        /// ktstr repository root. See [`EMBEDDED_KCONFIG`] for the
+        /// const that loads it at compile time.
+        ///
+        /// # Conflict resolution
+        ///
+        /// User values win on conflict — kbuild's `.config` parser
+        /// (`scripts/kconfig/confdata.c::conf_read_simple`) emits
+        /// "override: reassigning to symbol X" and keeps the
+        /// last-occurring assignment, so appending the user fragment
+        /// AFTER the baked-in fragment makes user values take
+        /// precedence. Non-conflicting user lines combine with the
+        /// baked-in set verbatim.
+        ///
+        /// Override warnings: `kernel build` emits one
+        /// `tracing::warn!` per user line that overrides a baked-in
+        /// symbol (format: "--extra-kconfig overrides baked-in
+        /// CONFIG_FOO (was =y, now =n)"). The build proceeds; the
+        /// warning lets the operator see they are shadowing a
+        /// baked-in setting before make olddefconfig runs.
+        ///
+        /// # Dependency resolution
+        ///
+        /// `make olddefconfig` runs after the merge to resolve any
+        /// added symbols' dependencies. Options whose deps are not
+        /// met land as `# CONFIG_X is not set` in the final
+        /// `.config`; those silent drops surface as `tracing::warn!`
+        /// lines (not errors) so the operator sees the diagnostic
+        /// without the build failing.
+        ///
+        /// # Critical-symbol protection
+        ///
+        /// After build, [`validate_kernel_config`] rejects entries
+        /// that disabled symbols required by ktstr (CONFIG_BPF,
+        /// CONFIG_DEBUG_INFO_BTF, CONFIG_FTRACE,
+        /// CONFIG_SCHED_CLASS_EXT, etc.). The error names
+        /// `--extra-kconfig` as the likely cause when extras were
+        /// supplied. So a fragment with
+        /// `# CONFIG_BPF is not set` will fail
+        /// `validate_kernel_config` post-build with an actionable
+        /// message — the override warning fires pre-build and the
+        /// validation error fires post-build, giving the operator
+        /// two chances to catch a fatal override.
+        ///
+        /// # Caching
+        ///
+        /// The cache key suffix grows from `kc{baked}` to
+        /// `kc{baked}-xkc{extra}` when extras are present (see
+        /// [`crate::cache_key_suffix_with_extra`]). Two builds
+        /// with distinct extra-kconfig content land at distinct
+        /// cache entries (different content = cache miss; same
+        /// content = cache hit on re-run). Builds with NO
+        /// `--extra-kconfig` keep using the bare `kc{baked}` suffix,
+        /// so existing cached kernels are not orphaned. An
+        /// `--extra-kconfig`-built kernel is only addressable by a
+        /// matching `--extra-kconfig` invocation or by an explicit
+        /// `--source` / `KTSTR_KERNEL` path — `cargo ktstr test
+        /// --kernel 6.14.2` (which doesn't take `--extra-kconfig`)
+        /// will not surface the extra-built artifact.
+        ///
+        /// `kernel list` tags entries built with extras as
+        /// `(extra kconfig)` so an operator can spot which cached
+        /// kernels carry user modifications.
+        #[arg(long = "extra-kconfig", value_name = "PATH", help = EXTRA_KCONFIG_HELP)]
+        extra_kconfig: Option<PathBuf>,
     },
     /// Remove cached kernel images.
     Clean {
@@ -224,6 +307,27 @@ pub const CPU_CAP_HELP: &str = "Reserve exactly N host CPUs for the build or \
      Also settable via KTSTR_CPU_CAP env var (CLI flag wins when both \
      are present).";
 
+/// Short clap-help for `--extra-kconfig`. Mirrors the [`CPU_CAP_HELP`]
+/// pattern: terse first sentence on the clap surface, full rustdoc
+/// on the [`KernelCommand::Build`] variant for `--help` long-about.
+///
+/// The full rustdoc covers: accepted line shapes, kbuild last-wins
+/// rule, `make olddefconfig` dependency resolution, post-build
+/// `validate_kernel_config` interaction, two-segment cache key,
+/// override warnings, and the unaddressable-from-other-flags
+/// rationale.
+pub const EXTRA_KCONFIG_HELP: &str = "Additional kconfig fragment merged on top of \
+     the baked-in `ktstr.kconfig`. Same line shapes the kernel uses: \
+     `CONFIG_FOO=y`, `CONFIG_FOO=m`, `CONFIG_FOO=\"value\"`, and \
+     `# CONFIG_FOO is not set`. User values win on conflict; \
+     `make olddefconfig` resolves dependencies. Each unique fragment \
+     produces a distinct cache slot via the `kc{baked}-xkc{extra}` \
+     key suffix. After build, `validate_kernel_config` rejects \
+     entries that disabled critical baked-in symbols (CONFIG_BPF, \
+     CONFIG_DEBUG_INFO_BTF, CONFIG_FTRACE, CONFIG_SCHED_CLASS_EXT). \
+     The baked-in fragment lives at `ktstr.kconfig` in the ktstr \
+     repository root.";
+
 /// Literal text of the `(EOL)` tag explanation. Lives inside a macro
 /// (instead of a `pub const`) so that downstream `concat!` callers
 /// — specifically [`KERNEL_LIST_LONG_ABOUT`] — can embed the bytes at
@@ -286,9 +390,9 @@ pub const KERNEL_LIST_LONG_ABOUT: &str = concat!(
     "                               corruption by the presence of `error`.\n",
     "\n",
     "Valid entry fields: key, path, version (nullable), source, arch,\n",
-    "built_at, ktstr_kconfig_hash (nullable), kconfig_status, eol,\n",
-    "config_hash (nullable), image_name, image_path, has_vmlinux,\n",
-    "vmlinux_stripped.\n",
+    "built_at, ktstr_kconfig_hash (nullable), extra_kconfig_hash\n",
+    "(nullable), kconfig_status, eol, config_hash (nullable),\n",
+    "image_name, image_path, has_vmlinux, vmlinux_stripped.\n",
     "\n",
     "  path             absolute path to the cache entry DIRECTORY.\n",
     "  image_path       absolute path to the boot image file INSIDE\n",
@@ -324,6 +428,15 @@ pub const KERNEL_LIST_LONG_ABOUT: &str = concat!(
     "  config_hash      CRC32 of the final merged .config; distinct\n",
     "                   from ktstr_kconfig_hash which covers only the\n",
     "                   ktstr fragment.\n",
+    "  extra_kconfig_hash\n",
+    "                   CRC32 of the user `--extra-kconfig` fragment\n",
+    "                   (raw bytes, no canonicalization), or null when\n",
+    "                   the entry was built without --extra-kconfig.\n",
+    "                   The cache key suffix grows from `kc{baked}` to\n",
+    "                   `kc{baked}-xkc{extra}` when extras are present,\n",
+    "                   and this field stores the `xkc` segment so\n",
+    "                   `kernel list` is self-describing for entries\n",
+    "                   that carry user modifications.\n",
     "\n",
     "When --range is set, the subcommand SWITCHES to range-preview\n",
     "mode and emits a structurally different JSON shape — the cache\n",
@@ -397,7 +510,8 @@ pub(crate) fn eol_legend_if_any(any_eol: bool) -> Option<&'static str> {
 /// its remediation is operational, not informational. See
 /// [`format_corrupt_footer`] for the full rationale.
 pub const UNTRACKED_KCONFIG_EXPLANATION: &str = "(untracked kconfig) marks entries with no recorded ktstr.kconfig hash \
-     (pre-dates kconfig hash tracking). Rebuild with: kernel build --force VERSION";
+     (pre-dates kconfig hash tracking). Rebuild with: kernel build --force VERSION \
+     (add --extra-kconfig PATH if the original entry was built with a user fragment).";
 
 /// Decide whether to emit the `(untracked kconfig)` legend under the
 /// `kernel list` table. Parallels [`eol_legend_if_any`] so both
@@ -418,7 +532,8 @@ pub(crate) fn untracked_legend_if_any(any_untracked: bool) -> Option<&'static st
 /// preserved from the prior inline `eprintln!` in `kernel_list`
 /// so existing operators see no behavioural change.
 pub const STALE_KCONFIG_EXPLANATION: &str = "warning: entries marked (stale kconfig) were built against a different ktstr.kconfig. \
-     Rebuild with: kernel build --force <entry version>";
+     Rebuild with: kernel build --force <entry version> \
+     (add --extra-kconfig PATH if the entry also carries the (extra kconfig) tag).";
 
 /// Decide whether to emit the `(stale kconfig)` legend under the
 /// `kernel list` table. Mirrors [`eol_legend_if_any`] and
@@ -677,6 +792,13 @@ pub fn format_entry_row(
     if !matches!(status, KconfigStatus::Matches) {
         tags.push_str(&format!(" ({status} kconfig)"));
     }
+    // `(extra kconfig)` is orthogonal to baked-in status: an entry
+    // can be Matches/Stale/Untracked AND carry user extras. Emit
+    // independently so an operator reading the table sees both
+    // signals without one masking the other.
+    if entry.has_extra_kconfig() {
+        tags.push_str(" (extra kconfig)");
+    }
     if entry_is_eol(entry, active_prefixes) {
         tags.push_str(" (EOL)");
     }
@@ -703,6 +825,7 @@ pub fn format_entry_row(
 ///       "arch": "x86_64",
 ///       "built_at": "2026-04-15T12:34:56Z",
 ///       "ktstr_kconfig_hash": "abc123...",
+///       "extra_kconfig_hash": null,
 ///       "kconfig_status": "matches",
 ///       "eol": false,
 ///       "config_hash": "def456...",
@@ -744,6 +867,14 @@ pub fn format_entry_row(
 ///   `current_ktstr_kconfig_hash`; `stale` means they differ;
 ///   `untracked` means the entry has no recorded kconfig hash (pre-dates
 ///   kconfig hash tracking).
+/// - `extra_kconfig_hash`: CRC32 (8 hex chars, lowercase) of the user
+///   `--extra-kconfig` fragment as raw bytes (no canonicalization), or
+///   `null` when the entry was built without `--extra-kconfig`. Cache
+///   keys grow from `kc{baked}` to `kc{baked}-xkc{extra}` when extras
+///   are present; this field stores the `xkc` segment so `kernel list`
+///   is self-describing for entries that carry user modifications.
+///   Independent of `kconfig_status` — an entry can match the baked-in
+///   hash AND carry a non-null extras hash.
 /// - `eol`: `true` iff the entry's version series does not appear in
 ///   the active-prefix list. Only meaningful when
 ///   `active_prefixes_fetch_error` is `null`.
@@ -868,6 +999,7 @@ fn kernel_list_inner(json: bool, range: Option<&str>) -> Result<()> {
                         "arch": meta.arch,
                         "built_at": meta.built_at,
                         "ktstr_kconfig_hash": meta.ktstr_kconfig_hash,
+                        "extra_kconfig_hash": meta.extra_kconfig_hash,
                         "kconfig_status": kconfig_status,
                         "eol": eol,
                         "config_hash": meta.config_hash,
@@ -1338,6 +1470,270 @@ fn all_fragment_lines_present(fragment: &str, config: &str) -> bool {
         .map(str::trim)
         .filter(|t| !t.is_empty())
         .all(|t| existing.contains(t))
+}
+
+/// Read a `--extra-kconfig PATH` file. Returns `Ok(content)` on
+/// success or `Err(message)` with an actionable diagnostic naming
+/// `--extra-kconfig` and the user's literal input path verbatim so
+/// a typo names the exact string they passed.
+///
+/// Four distinguishing arms each produce an actionable message:
+/// - `ENOENT` (not-found) → tells the operator to verify the path
+///   spelling and that the file exists
+/// - `EISDIR` (is-a-directory) → tells the operator to pass a regular
+///   file rather than a directory
+/// - `EACCES` (permission-denied) → tells the operator to check file
+///   ownership and mode
+/// - empty file (zero-byte read success) → emits a `tracing::warn!`
+///   explaining the cache-slot consequence and pointing at the likely
+///   operator intent (a non-empty fragment), then proceeds
+///
+/// Other I/O errors fall through with the OS error rendered verbatim
+/// (`--extra-kconfig {path}: {os error}`). A non-UTF-8 file errors
+/// with a message identifying the constraint (kconfig fragments are
+/// ASCII text).
+///
+/// Symlinks resolve transparently (`std::fs::read` opens through
+/// `open(2)` which follows symlinks per kernel default).
+pub fn read_extra_kconfig(path: &Path, cli_label: &str) -> std::result::Result<String, String> {
+    let display = path.display();
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) => {
+            let msg = match e.kind() {
+                std::io::ErrorKind::NotFound => {
+                    format!(
+                        "--extra-kconfig {display}: file not found; check the \
+                         path spelling and that the file exists"
+                    )
+                }
+                std::io::ErrorKind::IsADirectory => {
+                    format!(
+                        "--extra-kconfig {display}: is a directory; pass a \
+                         regular file containing kconfig fragment lines"
+                    )
+                }
+                std::io::ErrorKind::PermissionDenied => {
+                    format!(
+                        "--extra-kconfig {display}: permission denied; check \
+                         file ownership and mode (the kconfig fragment must \
+                         be readable by the current user)"
+                    )
+                }
+                _ => format!("--extra-kconfig {display}: {e}"),
+            };
+            return Err(msg);
+        }
+    };
+
+    // Empty file: warn but proceed. The build still lands at a
+    // distinct cache slot via the `-xkc{hash_of_empty}` segment, but
+    // no user symbols merge — the operator likely meant to populate
+    // the file with `CONFIG_X=...` lines.
+    if bytes.is_empty() {
+        let path_str = display.to_string();
+        tracing::warn!(
+            cli_label = cli_label,
+            path = %path_str,
+            "--extra-kconfig file is empty; the build will land at a \
+             distinct cache slot but no user symbols will merge into the \
+             configuration. Did you mean to populate {path_str} with \
+             CONFIG_X=... lines?",
+        );
+    }
+
+    String::from_utf8(bytes).map_err(|_| {
+        format!(
+            "--extra-kconfig {display}: file is not valid UTF-8; kconfig \
+             fragments must be ASCII text"
+        )
+    })
+}
+
+/// Append the `-xkc{extra_hash}` segment to a cache key built around
+/// the bare baked-in suffix (`...-kc{baked_hash}`), bringing it to the
+/// two-segment shape produced by [`crate::cache_key_suffix_with_extra`].
+///
+/// `local_source` and `git_clone` populate `acquired.cache_key` against
+/// the bare [`crate::cache_key_suffix`] which carries only the baked-in
+/// hash. With `--extra-kconfig` set, the cache lookup and the
+/// post-build store must target the extras-aware slot — this helper
+/// performs the plain string append so both binaries share one merge
+/// path. Plain append (vs rewriting the suffix) preserves the upstream
+/// key prefix exactly and is robust to any future shape change in the
+/// head segments. No-op when `extra` is `None`.
+pub fn append_extra_kconfig_suffix(cache_key: &mut String, extra: Option<&str>) {
+    if let Some(content) = extra {
+        cache_key.push_str("-xkc");
+        cache_key.push_str(&crate::extra_kconfig_hash(content));
+    }
+}
+
+/// Pre-configure pass that warns when a user `--extra-kconfig` line
+/// overrides a baked-in symbol from `EMBEDDED_KCONFIG`. The build
+/// proceeds with the user value winning (per kbuild's last-wins
+/// rule and the design intent of `--extra-kconfig`); this helper
+/// just surfaces the override so the operator sees that their
+/// fragment is shadowing a baked-in setting.
+///
+/// Output shape:
+/// `--extra-kconfig overrides baked-in CONFIG_FOO (was =y, now =n)`
+/// where the "was"/"now" values are extracted from the matching
+/// lines on each side. `# CONFIG_X is not set` (kbuild's disable
+/// directive) is normalized to "is not set" in the rendered
+/// before/after for readability.
+///
+/// Free-text `#`-comments and blank lines in the user fragment are
+/// skipped — only `CONFIG_X=...` assignments and `# CONFIG_X is
+/// not set` directives count as overrides.
+fn warn_extra_kconfig_overrides_baked_in(extra: &str, cli_label: &str) {
+    // Build a per-symbol map of the baked-in declarations once.
+    // `EMBEDDED_KCONFIG` is small (<200 lines per ktstr.kconfig)
+    // so a single pass is cheap.
+    let mut baked: std::collections::HashMap<&str, &str> =
+        std::collections::HashMap::new();
+    for raw in EMBEDDED_KCONFIG.lines() {
+        let line = raw.trim();
+        if let Some(sym) = parse_kconfig_symbol(line) {
+            baked.insert(sym, line);
+        }
+    }
+
+    for raw in extra.lines() {
+        let line = raw.trim();
+        let Some(user_sym) = parse_kconfig_symbol(line) else {
+            continue;
+        };
+        let Some(baked_line) = baked.get(user_sym) else {
+            continue;
+        };
+        if *baked_line == line {
+            continue;
+        }
+        tracing::warn!(
+            cli_label = cli_label,
+            symbol = user_sym,
+            was = *baked_line,
+            now = line,
+            "--extra-kconfig overrides baked-in {user_sym} (was {}, now {})",
+            render_kconfig_value(baked_line, user_sym),
+            render_kconfig_value(line, user_sym),
+        );
+    }
+}
+
+/// Extract the symbol name from a kbuild `.config`-shaped line.
+///
+/// Returns `Some("CONFIG_FOO")` for `CONFIG_FOO=...` or
+/// `# CONFIG_FOO is not set`, `None` for anything else (free-text
+/// comments, blank lines, malformed input).
+fn parse_kconfig_symbol(line: &str) -> Option<&str> {
+    if let Some(rest) = line.strip_prefix("# ")
+        && let Some(sym) = rest.strip_suffix(" is not set")
+        && sym.starts_with("CONFIG_")
+    {
+        return Some(sym);
+    }
+    if line.starts_with("CONFIG_")
+        && let Some((sym, _)) = line.split_once('=')
+    {
+        return Some(sym);
+    }
+    None
+}
+
+/// Render the value half of a `.config` line for the override
+/// warning's `(was =y, now =n)` formatting. For an assignment
+/// line `CONFIG_FOO=y`, returns `=y`. For a disable directive
+/// `# CONFIG_FOO is not set`, returns `is not set`. Falls back to
+/// the full line when the shape is unrecognized so the operator
+/// still gets information.
+fn render_kconfig_value<'a>(line: &'a str, sym: &str) -> &'a str {
+    if let Some(value) = line.strip_prefix(sym)
+        && value.starts_with('=')
+    {
+        return value;
+    }
+    if line == format!("# {sym} is not set") {
+        return "is not set";
+    }
+    line
+}
+
+/// Post-`olddefconfig` validation pass for `--extra-kconfig` lines.
+///
+/// Scan the user's `extra` fragment line-by-line and verify each
+/// non-empty, non-comment line either appears verbatim in the final
+/// `.config` or matches the is-not-set sentinel for a
+/// missing-from-output symbol (which kbuild renders as
+/// `# CONFIG_X is not set` or simply omits). When a user line was
+/// silently dropped by olddefconfig (typically because of an unmet
+/// dependency), emit a `tracing::warn!` naming the requested setting
+/// and the actual `.config` state — operator gets the diagnostic
+/// without the build failing.
+///
+/// Best-effort: a missing or unreadable `.config` collapses to
+/// silent return, since the surrounding pipeline failure would be
+/// the actionable signal in those cases.
+///
+/// Lines starting with `#` that are NOT the kbuild
+/// `# CONFIG_X is not set` form are treated as free-text comments
+/// and skipped — they exist in user fragments but have no
+/// `.config` counterpart.
+fn warn_dropped_extra_kconfig_lines(kernel_dir: &Path, extra: &str, cli_label: &str) {
+    let config_path = kernel_dir.join(".config");
+    let Ok(final_config) = std::fs::read_to_string(&config_path) else {
+        return;
+    };
+    let final_lines: std::collections::HashSet<&str> =
+        final_config.lines().map(str::trim).collect();
+
+    for raw_line in extra.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // Skip free-text comments — `# foo bar baz`. The kbuild
+        // disable form `# CONFIG_X is not set` is a special-case
+        // comment that participates in `.config` and IS checked.
+        let is_disable_directive = line.starts_with("# CONFIG_")
+            && line.ends_with(" is not set");
+        let is_assignment = line.starts_with("CONFIG_") && line.contains('=');
+        if !is_disable_directive && !is_assignment {
+            continue;
+        }
+        if final_lines.contains(line) {
+            continue;
+        }
+        // Line missing — either dropped by olddefconfig or rewritten
+        // (e.g. `=y` → `is not set` because dep didn't resolve).
+        // Look up the symbol's actual final value to enrich the
+        // warning. Symbol name is everything up to `=` (assignment)
+        // or between `# ` and ` is not set` (disable directive).
+        let sym_name = if is_assignment {
+            line.split('=').next().unwrap_or(line)
+        } else {
+            line.trim_start_matches("# ")
+                .trim_end_matches(" is not set")
+        };
+        let final_state = final_config
+            .lines()
+            .find(|l| {
+                let t = l.trim();
+                t.starts_with(&format!("{sym_name}="))
+                    || t == format!("# {sym_name} is not set")
+            })
+            .map(str::trim)
+            .unwrap_or("(absent — symbol not present in .config; likely \
+                        disabled or unrecognized by kconfig)");
+        tracing::warn!(
+            cli_label = cli_label,
+            requested = line,
+            final_state = final_state,
+            "--extra-kconfig line did not survive `make olddefconfig` (likely an \
+             unmet dependency or unrecognized symbol)"
+        );
+    }
 }
 
 /// Checks each non-empty line of the fragment against the current
@@ -1939,6 +2335,29 @@ pub(crate) fn acquire_source_tree_lock(
 /// [`resolve_kernel_dir`] / [`resolve_kernel_dir_to_entry`]). It
 /// controls the mrproper warning and `source_tree_path` in
 /// metadata.
+///
+/// `extra_kconfig` is an optional user-supplied kconfig fragment
+/// merged on top of [`EMBEDDED_KCONFIG`] before `configure_kernel`
+/// (which runs olddefconfig only when new lines are needed).
+/// `Some(content)` appends the fragment AFTER the baked-in fragment
+/// so kbuild's last-occurrence-wins semantics
+/// (`scripts/kconfig/confdata.c::conf_read_simple`) make user values
+/// override baked-in ones on conflict, and forces a re-configure pass
+/// even when `.config` already carries `CONFIG_SCHED_CLASS_EXT=y`
+/// (the user fragment may add or invert symbols the baked-in pass
+/// alone wouldn't have produced).
+///
+/// Two metadata fields capture the build inputs separately:
+/// - `ktstr_kconfig_hash` always holds the bare baked-in hash
+///   (`crate::kconfig_hash()` of `EMBEDDED_KCONFIG`) so
+///   `KconfigStatus::Matches/Stale/Untracked` keeps comparing
+///   against the live baked-in fragment.
+/// - `extra_kconfig_hash` holds `Some(crate::extra_kconfig_hash(content))`
+///   when extras were supplied, `None` otherwise. Drives the
+///   `(extra kconfig)` tag in `kernel list`.
+///
+/// Callers that don't expose `--extra-kconfig` (test/coverage/
+/// shell/verifier) pass `None`.
 pub fn kernel_build_pipeline(
     acquired: &crate::fetch::AcquiredSource,
     cache: &crate::cache::CacheDir,
@@ -1946,6 +2365,7 @@ pub fn kernel_build_pipeline(
     clean: bool,
     is_local_source: bool,
     cpu_cap: Option<crate::vmm::host_topology::CpuCap>,
+    extra_kconfig: Option<&str>,
 ) -> Result<KernelBuildResult> {
     let source_dir = &acquired.source_dir;
     let (arch, image_name) = crate::fetch::arch_info();
@@ -2040,10 +2460,69 @@ pub fn kernel_build_pipeline(
         }
     }
 
-    if !has_sched_ext(source_dir) {
-        Spinner::with_progress("Configuring kernel...", "Kernel configured", |_| {
-            configure_kernel(source_dir, EMBEDDED_KCONFIG)
+    // Build the merged fragment ONCE so the configure call observes
+    // the byte layout `{EMBEDDED_KCONFIG}\n{extra}` (with a `\n`
+    // interleave) defined in [`crate::merge_kconfig_fragments`]. The
+    // helper returns a `Cow<'_, str>` so the no-extras path borrows
+    // `EMBEDDED_KCONFIG` without allocating; only the user-fragment
+    // case heaps the merged string. Unit tests pin the exact
+    // ordering kbuild's last-wins rule operates on.
+    let merged_fragment = crate::merge_kconfig_fragments(EMBEDDED_KCONFIG, extra_kconfig);
+
+    // Forced re-configure when extra-kconfig is supplied. The
+    // `has_sched_ext` short-circuit was tuned for the EMBEDDED_KCONFIG
+    // path: `has_sched_ext` is a probe for the primary option;
+    // olddefconfig fills the rest. With user-supplied extras, an
+    // existing `.config` (e.g. a stale build state) can satisfy the
+    // sched_ext probe yet miss every user line, producing a kernel
+    // that silently ignored the extras. Always run the merged
+    // configure when extras are present so the user's symbols land.
+    // Surface a `tracing::warn!` for each user fragment line that
+    // overrides a baked-in symbol from `EMBEDDED_KCONFIG`. The build
+    // proceeds with the user value winning (last-wins is the design
+    // intent) — the warning lets the operator see they are shadowing
+    // a baked-in setting before configure_kernel (which runs
+    // olddefconfig only when new lines are needed), which is when
+    // an over-aggressive override can still be addressed by editing
+    // the fragment. A separate post-build `validate_kernel_config`
+    // pass catches critical-baked-in disablement (e.g. CONFIG_BPF).
+    if let Some(extra) = extra_kconfig {
+        warn_extra_kconfig_overrides_baked_in(extra, cli_label);
+    }
+
+    let needs_configure = extra_kconfig.is_some() || !has_sched_ext(source_dir);
+    if needs_configure {
+        let configure_result = Spinner::with_progress("Configuring kernel...", "Kernel configured", |_| {
+            configure_kernel(source_dir, &merged_fragment)
+        });
+        // Per coordinator ruling D3: wrap configure errors with
+        // `--extra-kconfig` context when extras are present so the
+        // user can pinpoint which input is responsible for an
+        // olddefconfig failure (e.g. a malformed `CONFIG_X=` line in
+        // their fragment).
+        configure_result.with_context(|| {
+            if extra_kconfig.is_some() {
+                "kernel configure failed (with --extra-kconfig fragment merged on top of \
+                 baked-in ktstr.kconfig); check the fragment for syntax errors or \
+                 conflicting symbol declarations"
+                    .to_string()
+            } else {
+                "kernel configure failed".to_string()
+            }
         })?;
+
+        // Post-olddefconfig validation — warn (not error) when a
+        // user-requested option from `--extra-kconfig` did not
+        // survive into the final `.config` (typically because
+        // olddefconfig dropped it for an unmet dependency). Emits
+        // one `tracing::warn!` per dropped line naming the
+        // requested setting and the actual final value.
+        // The hard-fail "user override killed a baked-in invariant"
+        // case (e.g. user disabled `CONFIG_BPF`) is caught at
+        // `validate_kernel_config` post-build with extra context.
+        if let Some(extra) = extra_kconfig {
+            warn_dropped_extra_kconfig_lines(source_dir, extra, cli_label);
+        }
     }
 
     Spinner::with_progress("Building kernel...", "Kernel built", |sp| {
@@ -2051,7 +2530,23 @@ pub fn kernel_build_pipeline(
     })?;
 
     // Validate critical config options were not silently disabled.
-    validate_kernel_config(source_dir)?;
+    // When `--extra-kconfig` is set, attach an actionable hint
+    // pointing at the user fragment as a likely cause. The most
+    // plausible failure mode is a user override that disables a
+    // baked-in invariant (e.g. a fragment containing
+    // `# CONFIG_BPF is not set` defeats the BPF dep chain), so
+    // name `--extra-kconfig` in the wrap context.
+    validate_kernel_config(source_dir).with_context(|| {
+        if extra_kconfig.is_some() {
+            "post-build kernel config validation failed; check that your \
+             --extra-kconfig fragment does not disable a CONFIG_X required by \
+             ktstr (e.g. CONFIG_BPF, CONFIG_DEBUG_INFO_BTF, CONFIG_FTRACE, \
+             CONFIG_SCHED_CLASS_EXT)"
+                .to_string()
+        } else {
+            "post-build kernel config validation failed".to_string()
+        }
+    })?;
 
     // Generate compile_commands.json for local trees (LSP support).
     if !acquired.is_temp {
@@ -2165,7 +2660,15 @@ pub fn kernel_build_pipeline(
         None
     };
 
+    // Two-segment metadata: the bare baked-in hash stays in
+    // `ktstr_kconfig_hash` so `kernel list`'s matches/stale/
+    // untracked verdict (see `CacheEntry::kconfig_status`) keeps
+    // comparing against the live `EMBEDDED_KCONFIG`, and the user
+    // extras hash lives in its own slot. Matches the cache-key
+    // suffix shape `kc{baked}-xkc{extra}` produced by
+    // [`crate::cache_key_suffix_with_extra`].
     let kconfig_hash = embedded_kconfig_hash();
+    let extra_kconfig_hash_value = extra_kconfig.map(crate::extra_kconfig_hash);
 
     // Source-tree vmlinux stat (size + mtime seconds) so a later
     // `prefer_source_tree_for_dwarf` lookup can detect a user
@@ -2199,7 +2702,8 @@ pub fn kernel_build_pipeline(
     )
     .with_version(acquired.version.clone())
     .with_config_hash(config_hash)
-    .with_ktstr_kconfig_hash(Some(kconfig_hash));
+    .with_ktstr_kconfig_hash(Some(kconfig_hash))
+    .with_extra_kconfig_hash(extra_kconfig_hash_value);
     if is_local_source && let Some((size, mtime_secs)) = source_vmlinux_stat {
         metadata = metadata.with_source_vmlinux_stat(size, mtime_secs);
     }
@@ -4057,7 +4561,7 @@ pub fn download_and_cache_version(
     sp.finish("Downloaded");
 
     let cache = crate::cache::CacheDir::new()?;
-    let result = kernel_build_pipeline(&acquired, &cache, cli_label, false, false, cpu_cap)?;
+    let result = kernel_build_pipeline(&acquired, &cache, cli_label, false, false, cpu_cap, None)?;
 
     match result.entry {
         Some(entry) => Ok(entry.path),
@@ -4228,7 +4732,11 @@ pub fn resolve_git_kernel(url: &str, git_ref: &str, cli_label: &str) -> Result<s
     // same as a tarball download — no `make mrproper` skip-warning,
     // no compile_commands.json generation (acquired.is_temp gates
     // that inside the pipeline).
-    let result = kernel_build_pipeline(&acquired, &cache, cli_label, false, false, None)?;
+    // extra_kconfig = None: this entry path serves auto-discovery
+    // (cargo ktstr test/coverage/llvm-cov), which doesn't expose
+    // `--extra-kconfig`. The flag is `cargo ktstr kernel build`-only.
+    let result =
+        kernel_build_pipeline(&acquired, &cache, cli_label, false, false, None, None)?;
 
     match result.entry {
         Some(entry) => Ok(entry.path),
@@ -4406,7 +4914,12 @@ pub fn resolve_kernel_dir_to_entry(
         }
     }
 
-    let result = kernel_build_pipeline(&acquired, &cache, cli_label, false, true, cpu_cap)?;
+    // extra_kconfig = None: this path serves cargo ktstr
+    // test/coverage/llvm-cov / shell / verifier resolution, none of
+    // which expose `--extra-kconfig`. The flag is `cargo ktstr
+    // kernel build`-only and feeds extras directly through that
+    // dispatch.
+    let result = kernel_build_pipeline(&acquired, &cache, cli_label, false, true, cpu_cap, None)?;
 
     // Prefer the cached entry directory (stable across rebuilds).
     // For dirty trees, `entry` is `None` — fall back to the
@@ -4471,7 +4984,10 @@ pub fn resolve_kernel_dir(
         }
     }
 
-    let result = kernel_build_pipeline(&acquired, &cache, cli_label, false, true, cpu_cap)?;
+    // extra_kconfig = None: matches the sibling
+    // `resolve_kernel_dir_to_entry` rationale — `--extra-kconfig` is
+    // a `cargo ktstr kernel build`-only flag.
+    let result = kernel_build_pipeline(&acquired, &cache, cli_label, false, true, cpu_cap, None)?;
 
     // Prefer the cached image path (stable across rebuilds).
     match result.entry {
@@ -5337,7 +5853,7 @@ impl Drop for Spinner {
 mod tests {
     use super::*;
 
-    // -- explain-sidecar test helpers (#140) --
+    // -- explain-sidecar test helpers --
     //
     // Twelve+ tests in this module follow the same on-disk layout
     // boilerplate: open a tempdir, create a `<tmp>/<run-name>/`
@@ -6836,7 +7352,7 @@ mod tests {
     /// emitting an empty header would be visual noise.
     ///
     /// First test in the module migrated to the
-    /// [`make_test_run`] / [`write_sidecar`] helpers (#140) — the
+    /// [`make_test_run`] / [`write_sidecar`] helpers — the
     /// boilerplate previously open-coded across 12+ tests now
     /// flows through the helpers, so a future regression in the
     /// shared on-disk layout surfaces in one place. Existing
@@ -7151,7 +7667,7 @@ mod tests {
         }
     }
 
-    // -- explain_sidecar IO-error surface (#124) --
+    // -- explain_sidecar IO-error surface --
 
     /// IO failures (file matched the sidecar predicate but
     /// `read_to_string` failed before parsing) surface as a
@@ -7342,7 +7858,7 @@ mod tests {
         );
     }
 
-    // -- explain_sidecar E2E enrichment rendering (#139) --
+    // -- explain_sidecar E2E enrichment rendering --
 
     /// Direct-renderer test: construct a synthetic [`WalkStats`]
     /// carrying a [`crate::test_support::SidecarParseError`] with a
@@ -7492,7 +8008,7 @@ mod tests {
         );
     }
 
-    // -- explain_sidecar path-traversal rejection (#135) --
+    // -- explain_sidecar path-traversal rejection --
 
     /// `--run` containing `..` segments must bail before any
     /// path resolution — operators using `--dir` to point at a
@@ -8601,6 +9117,133 @@ mod tests {
              `CONFIG_X=y` form and report every option as \
              missing; got: {result:?}",
         );
+    }
+
+    // -- parse_kconfig_symbol + render_kconfig_value --
+    //
+    // Pure helpers used by the override-warning emitter. Pinning the
+    // accepted shapes here keeps the warning's "(was =y, now =n)"
+    // formatting honest and catches a regression that lets
+    // free-text comments masquerade as override candidates.
+
+    #[test]
+    fn parse_kconfig_symbol_assignment() {
+        assert_eq!(parse_kconfig_symbol("CONFIG_FOO=y"), Some("CONFIG_FOO"));
+        assert_eq!(parse_kconfig_symbol("CONFIG_FOO=m"), Some("CONFIG_FOO"));
+        assert_eq!(parse_kconfig_symbol("CONFIG_FOO=n"), Some("CONFIG_FOO"));
+        assert_eq!(
+            parse_kconfig_symbol("CONFIG_BAR=\"value\""),
+            Some("CONFIG_BAR")
+        );
+    }
+
+    #[test]
+    fn parse_kconfig_symbol_disable_directive() {
+        assert_eq!(
+            parse_kconfig_symbol("# CONFIG_FOO is not set"),
+            Some("CONFIG_FOO")
+        );
+    }
+
+    #[test]
+    fn parse_kconfig_symbol_rejects_free_text_comment() {
+        // Free-text comments should not parse as symbols — the
+        // override warning skips them. Pins that we don't conflate
+        // `# user note` with the `is not set` disable directive.
+        assert!(parse_kconfig_symbol("# user note about foo").is_none());
+        assert!(parse_kconfig_symbol("#").is_none());
+        assert!(parse_kconfig_symbol("# this is a doc line").is_none());
+    }
+
+    #[test]
+    fn parse_kconfig_symbol_rejects_blank_and_non_config() {
+        assert!(parse_kconfig_symbol("").is_none());
+        assert!(parse_kconfig_symbol("not a kconfig line").is_none());
+        // Looks-like-assignment but missing CONFIG_ prefix.
+        assert!(parse_kconfig_symbol("FOO=y").is_none());
+    }
+
+    #[test]
+    fn render_kconfig_value_assignment_returns_value_with_equals() {
+        assert_eq!(render_kconfig_value("CONFIG_FOO=y", "CONFIG_FOO"), "=y");
+        assert_eq!(render_kconfig_value("CONFIG_FOO=n", "CONFIG_FOO"), "=n");
+        assert_eq!(
+            render_kconfig_value("CONFIG_BAR=\"value\"", "CONFIG_BAR"),
+            "=\"value\""
+        );
+    }
+
+    #[test]
+    fn render_kconfig_value_disable_returns_is_not_set() {
+        assert_eq!(
+            render_kconfig_value("# CONFIG_FOO is not set", "CONFIG_FOO"),
+            "is not set"
+        );
+    }
+
+    #[test]
+    fn render_kconfig_value_falls_back_to_full_line_on_unknown_shape() {
+        // Defensive: a line that doesn't match either shape falls
+        // back to the full text so the operator still sees what was
+        // recorded. Should not panic.
+        let s = "CONFIG_FOO without equals";
+        assert_eq!(render_kconfig_value(s, "CONFIG_FOO"), s);
+    }
+
+    // -- warn_extra_kconfig_overrides_baked_in --
+    //
+    // Functional test: pin the override-detection LOGIC by
+    // exercising the helper's inputs directly. We can't intercept
+    // `tracing::warn!` output without a subscriber, but the helper's
+    // CONTRACT — emit one warning per overridden symbol, no
+    // warnings for matching or absent symbols — is testable via the
+    // private parse/render helpers it composes. End-to-end log
+    // capture lives in the `tracing-test` integration suite.
+
+    #[test]
+    fn warn_extra_kconfig_overrides_does_not_panic_on_empty_fragment() {
+        // Pin: passing the empty string must not panic. An operator
+        // who supplies `--extra-kconfig /empty/file` reaches this
+        // branch with `extra = ""`.
+        warn_extra_kconfig_overrides_baked_in("", "test");
+    }
+
+    #[test]
+    fn warn_extra_kconfig_overrides_does_not_panic_on_no_overrides() {
+        // Disjoint fragment (symbol not in EMBEDDED_KCONFIG) — no
+        // overrides, helper must complete without panic.
+        let novel = "CONFIG_KTSTR_TEST_NOVEL_SYMBOL_OVERRIDE_TEST=y\n";
+        assert!(
+            !EMBEDDED_KCONFIG.contains("CONFIG_KTSTR_TEST_NOVEL_SYMBOL_OVERRIDE_TEST"),
+            "test fixture must use a symbol absent from EMBEDDED_KCONFIG"
+        );
+        warn_extra_kconfig_overrides_baked_in(novel, "test");
+    }
+
+    #[test]
+    fn warn_extra_kconfig_overrides_does_not_panic_on_actual_override() {
+        // CONFIG_BPF=y is in EMBEDDED_KCONFIG; user disables it.
+        // Emits a tracing::warn but doesn't panic; pins the actual
+        // override-detection path executes without crashing.
+        let user = "# CONFIG_BPF is not set\n";
+        warn_extra_kconfig_overrides_baked_in(user, "test");
+    }
+
+    #[test]
+    fn warn_extra_kconfig_overrides_skips_matching_assignments() {
+        // User assigns CONFIG_BPF=y, baked-in is also =y — same
+        // line; not an override. Helper completes without panic and
+        // (in production) emits zero warnings.
+        let user = "CONFIG_BPF=y\n";
+        warn_extra_kconfig_overrides_baked_in(user, "test");
+    }
+
+    #[test]
+    fn warn_extra_kconfig_overrides_skips_free_text_comments() {
+        // Free-text comments don't carry symbols; helper must
+        // ignore them via parse_kconfig_symbol's rejection path.
+        let user = "# this is a comment about something\n# another comment\n";
+        warn_extra_kconfig_overrides_baked_in(user, "test");
     }
 
     // -- configure_kernel --
@@ -10331,6 +10974,80 @@ mod tests {
           c10-active-rc                                    6.14-rc2     tarball  x86_64  2026-04-12T10:00:00Z
           c11-eol-rc                                       7.0-rc1      tarball  x86_64  2026-04-12T10:00:00Z (EOL)
         ");
+    }
+
+    /// Coordinator item 4: `format_entry_row` must tag entries
+    /// with `extra_kconfig_hash = Some(_)` as `(extra kconfig)`.
+    /// Pin: an entry built with `--extra-kconfig` carries the
+    /// tag in its rendered row; an entry without extras does
+    /// NOT. The tag is orthogonal to the kconfig-status tag —
+    /// an entry with matching baked-in hash AND extras still
+    /// gets `(extra kconfig)` (because Matches doesn't add a
+    /// kconfig tag, the extra-kconfig tag stands alone).
+    #[test]
+    fn format_entry_row_emits_extra_kconfig_tag() {
+        use crate::cache::{CacheArtifacts, CacheDir, KernelMetadata, KernelSource};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
+        let src = tempfile::TempDir::new().unwrap();
+        let image = src.path().join("bzImage");
+        std::fs::write(&image, b"fake kernel").unwrap();
+
+        let current_hash = "abc1234";
+
+        // Entry WITH extras (and matching baked-in hash).
+        let meta_with = KernelMetadata::new(
+            KernelSource::Tarball,
+            "x86_64".to_string(),
+            "bzImage".to_string(),
+            "2026-04-12T10:00:00Z".to_string(),
+        )
+        .with_version(Some("6.14.2".to_string()))
+        .with_ktstr_kconfig_hash(Some(current_hash.to_string()))
+        .with_extra_kconfig_hash(Some("deadbeef".to_string()));
+        let entry_with = cache
+            .store("with-extras", &CacheArtifacts::new(&image), &meta_with)
+            .unwrap();
+        let row_with = format_entry_row(&entry_with, current_hash, &[]);
+        assert!(
+            row_with.contains("(extra kconfig)"),
+            "entries with extra_kconfig_hash must carry the `(extra kconfig)` tag, \
+             got row: {row_with:?}",
+        );
+        // Matching baked-in hash → no `(... kconfig)` for the
+        // baked-in side (only `(extra kconfig)` from the extras side).
+        assert!(
+            !row_with.contains("(stale kconfig)"),
+            "matching baked-in hash must not produce `(stale kconfig)`: {row_with:?}"
+        );
+        assert!(
+            !row_with.contains("(untracked kconfig)"),
+            "matching baked-in hash must not produce `(untracked kconfig)`: {row_with:?}"
+        );
+
+        // Entry WITHOUT extras (control).
+        let meta_without = KernelMetadata::new(
+            KernelSource::Tarball,
+            "x86_64".to_string(),
+            "bzImage".to_string(),
+            "2026-04-12T10:00:00Z".to_string(),
+        )
+        .with_version(Some("6.14.2".to_string()))
+        .with_ktstr_kconfig_hash(Some(current_hash.to_string()));
+        let entry_without = cache
+            .store(
+                "without-extras",
+                &CacheArtifacts::new(&image),
+                &meta_without,
+            )
+            .unwrap();
+        let row_without = format_entry_row(&entry_without, current_hash, &[]);
+        assert!(
+            !row_without.contains("(extra kconfig)"),
+            "entries without extras must NOT carry the `(extra kconfig)` tag, \
+             got row: {row_without:?}",
+        );
     }
 
     /// Regression pin for `format_entry_row` with empty

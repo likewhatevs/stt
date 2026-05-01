@@ -608,7 +608,7 @@ mod tests {
         assert!(extract_panic_message("").is_none());
     }
 
-    // -- Verdict API integration coverage (#97) -------------------------
+    // -- Verdict API integration coverage -------------------------------
     //
     // The host-side runner parses a guest AssertResult JSON via
     // `parse_assert_result`, then a scenario's verifier folds that

@@ -4715,11 +4715,12 @@ mod tests {
         );
     }
 
-    /// Regression for the #16 fix: when the per-CPU value lives in
-    /// vmalloc'd percpu memory (outside the direct mapping), the
-    /// pre-fix `kva_to_pa` math produced an out-of-bounds PA and the
-    /// CPU read fell through to `None`. Post-fix `translate_any_kva`
-    /// falls through to a page-table walk and resolves the value.
+    /// Regression for the per-CPU aliasing fix: when the per-CPU
+    /// value lives in vmalloc'd percpu memory (outside the direct
+    /// mapping), the pre-fix `kva_to_pa` math produced an
+    /// out-of-bounds PA and the CPU read fell through to `None`.
+    /// Post-fix `translate_any_kva` falls through to a page-table
+    /// walk and resolves the value.
     ///
     /// Constructs a single-CPU percpu map whose percpu_base KVA is
     /// only reachable via page table entries — `kva_to_pa(kva,

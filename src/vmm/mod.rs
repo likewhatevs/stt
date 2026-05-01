@@ -2726,7 +2726,7 @@ impl KtstrVm {
 
         // Per-AP TID slots — each AP thread stamps gettid() into its
         // slot at startup so the monitor can open per-vCPU
-        // perf_event_open counters bound to the right thread (#26).
+        // perf_event_open counters bound to the right thread.
         // Index = AP index (0-based among APs); the BSP TID is stamped
         // into a separate slot below since it runs on the current
         // thread.
@@ -2898,7 +2898,7 @@ impl KtstrVm {
         let freeze_coord_bsp_parked = bsp_parked.clone();
         let freeze_coord_bsp_regs = bsp_regs.clone();
         let freeze_coord_bsp_done = bsp_done.clone();
-        // Shared per-vCPU perf-counter capture (#26). The Arc lets the
+        // Shared per-vCPU perf-counter capture. The Arc lets the
         // monitor sampling loop (per-tick timeline) and the freeze
         // coordinator (freeze-instant snapshot) read through the same
         // fds. Inner `Option` is `None` when `perf_event_open` was
@@ -3778,8 +3778,8 @@ impl KtstrVm {
                                         prog_capture: prog_capture.as_ref(),
                                         cpu_time_capture: cpu_time_capture.as_ref(),
                                         // Per-task enrichment is library-ready
-                                        // but has no walker producer until #50
-                                        // (rq->scx walker) lands. The
+                                        // but has no walker producer until the
+                                        // rq->scx walker lands. The
                                         // `task_enrichments_unavailable` field
                                         // records this state so the dump
                                         // consumer sees "no task walker
@@ -3804,10 +3804,10 @@ impl KtstrVm {
                                         // `Some(EventCounterCapture { samples })`.
                                         event_counter_capture: None,
                                         // Per-CPU rq->scx + DSQ walker.
-                                        // Library-ready (#49 + #50 LOC); the
-                                        // freeze coordinator hasn't yet
-                                        // resolved ScxWalkerOffsets nor
-                                        // built the rq_kvas/rq_pas arrays
+                                        // Library-ready; the freeze
+                                        // coordinator hasn't yet resolved
+                                        // ScxWalkerOffsets nor built the
+                                        // rq_kvas/rq_pas arrays
                                         // outside the dual_snapshot
                                         // scan_ctx path. A follow-up wires
                                         // the resolved offsets + rq arrays
@@ -4239,7 +4239,7 @@ impl KtstrVm {
                     register_vcpu_signal_handler();
                     // Stamp this thread's Linux TID into the per-AP
                     // slot so the monitor can open `perf_event_open`
-                    // counters bound to the vCPU thread (#26). Done
+                    // counters bound to the vCPU thread. Done
                     // BEFORE pinning / RT / KVM_RUN so the value is
                     // visible to any reader the moment the thread is
                     // schedulable. SAFETY: SYS_gettid is the
@@ -4452,7 +4452,7 @@ impl KtstrVm {
                 // Discover struct_ops programs for per-cycle stats.
                 // `cr3_pa` and `l5` are shared with `discover_struct_ops_stats`
                 // and `ProgStatsCtx` so per-CPU `bpf_prog_stats` reads can
-                // page-walk vmalloc-backed percpu (see #20).
+                // page-walk vmalloc-backed percpu.
                 let cr3_pa =
                     monitor::symbols::text_kva_to_pa(symbols.init_top_pgt.unwrap_or(0));
                 let l5 = monitor::symbols::resolve_pgtable_l5(&mem, &symbols);

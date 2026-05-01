@@ -262,23 +262,60 @@ pub enum WorkType {
     /// compute wake-latency percentiles will produce zero/degenerate
     /// numbers against a `Custom` report that did not record them.
     ///
-    /// **Process-group lifecycle:** every worker — including `Custom`
-    /// — calls `setpgid(0, 0)` immediately after fork, giving the
-    /// worker its own process group (`pgid == worker_pid`). Any
-    /// child processes the custom closure forks (a helper binary
-    /// via `execv`, a subshell via `sh -c`, etc.) inherit that
-    /// pgid unless they explicitly change it. On teardown,
-    /// `stop_and_collect` issues `killpg(worker_pid, SIGKILL)`
-    /// unconditionally (on both the graceful-exit and
-    /// StillAlive-escalation paths) and [`WorkloadHandle::drop`]
-    /// issues another `killpg` on handle teardown, so **every
-    /// descendant a `Custom` closure spawns will be SIGKILLed at
-    /// worker teardown** — there is no opt-out. Closures that need
-    /// children to outlive the worker must either detach them from
-    /// the worker's pgid (`setpgid(child_pid, 0)` after fork) or
-    /// wait on them explicitly before returning the
-    /// [`WorkerReport`]. The grandchild reaping tests in this
-    /// module pin this sweep end-to-end.
+    /// **Process-group lifecycle (per [`CloneMode`]):**
+    ///
+    /// _Fork mode_ — every worker calls `setpgid(0, 0)` immediately
+    /// after fork, giving the worker its own process group
+    /// (`pgid == worker_pid`). Any child processes the custom
+    /// closure forks (a helper binary via `execv`, a subshell via
+    /// `sh -c`, etc.) inherit that pgid unless they explicitly
+    /// change it. On teardown, `stop_and_collect` issues
+    /// `killpg(worker_pid, SIGKILL)` unconditionally (on both the
+    /// graceful-exit and StillAlive-escalation paths) and
+    /// [`WorkloadHandle::drop`] issues another `killpg` on handle
+    /// teardown, so **every descendant a `Custom` closure spawns
+    /// will be SIGKILLed at worker teardown** — there is no opt-out.
+    /// Closures that need children to outlive the worker must
+    /// either detach them from the worker's pgid
+    /// (`setpgid(child_pid, 0)` after fork) or wait on them
+    /// explicitly before returning the [`WorkerReport`]. The
+    /// grandchild reaping tests in this module pin this sweep
+    /// end-to-end.
+    ///
+    /// _Thread mode_ — `setpgid(0, 0)` does NOT run; thread workers
+    /// share the test runner's pgid and cannot have one of their
+    /// own (pgid is per-process / per-tgid). `killpg`-based cleanup
+    /// is therefore unavailable: if a Thread-mode `Custom` closure
+    /// forks helpers (e.g. via `Command::spawn`), those helpers
+    /// inherit the test runner's pgid and will not be reaped on
+    /// worker teardown. **You own teardown for any helpers a
+    /// Thread-mode `Custom` closure spawns** — wait on them before
+    /// returning, or arrange explicit kill/wait before returning
+    /// the [`WorkerReport`].
+    ///
+    /// **Thread-mode prohibition on process-scoping syscalls:**
+    /// under Thread mode, the closure runs as a thread inside the
+    /// parent (test-runner) process, sharing pid/tgid, the signal-
+    /// disposition table, the file descriptor table, cwd, and
+    /// every other process-scoped attribute with every sibling
+    /// worker AND with the test harness. Do NOT call
+    /// `_exit()`/`exit()`, `fork()`/`vfork()`/`clone()`,
+    /// `setpgid()`/`setsid()`, `execve()`, `chdir()`/`chroot()`,
+    /// `setresuid()`/`setresgid()`, `prctl(PR_SET_*)` or any other
+    /// process-scoping syscall — these affect the entire process,
+    /// including all sibling workers and the test runner itself,
+    /// and will produce silent cross-worker corruption,
+    /// unexpected test-harness exits, or both. The supported
+    /// shutdown contract is: observe the `&AtomicBool` argument's
+    /// `stop.load()` flag and return the [`WorkerReport`] when it
+    /// flips. This is a runtime contract, not a static check —
+    /// `Custom` closures are arbitrary user code and the framework
+    /// cannot detect violations at spawn time. If your workload
+    /// genuinely needs `_exit`/`fork`/etc., use [`CloneMode::Fork`]
+    /// where each worker IS its own process. The
+    /// [`WorkType::ForkExit`] + [`CloneMode::Thread`] combination
+    /// is rejected at spawn time precisely because of this — see
+    /// [`WorkloadHandle::spawn`].
     Custom {
         name: &'static str,
         run: fn(&AtomicBool) -> WorkerReport,
@@ -1081,10 +1118,13 @@ impl WorkType {
 
     /// User-supplied work function with a display name.
     ///
-    /// `run` receives a reference to the stop flag (set by SIGUSR1) and
-    /// must return a [`WorkerReport`] when the flag becomes `true`. The
-    /// framework handles fork, cgroup placement, affinity, scheduling
-    /// policy, and signal setup; `run` owns only the work loop.
+    /// `run` receives a reference to the stop flag (flipped per-mode:
+    /// the SIGUSR1 handler for [`CloneMode::Fork`], a per-worker
+    /// `AtomicBool` for [`CloneMode::Thread`]) and must return a
+    /// [`WorkerReport`] when the flag becomes `true`. The framework
+    /// handles fork / thread spawn, cgroup placement, affinity,
+    /// scheduling policy, and signal setup (Fork mode only); `run`
+    /// owns only the work loop.
     ///
     /// The per-iteration built-in instrumentation (wake-latency samples,
     /// `iter_slot` publish, gap tracking) runs only for built-in variants
@@ -1633,12 +1673,12 @@ impl std::ops::BitOr for CloneFlags {
 /// ([`SharedVm`](Self::SharedVm) / [`Raw`](Self::Raw)) instead. See
 /// the per-variant docs for the dispatch path each takes.
 ///
-/// **Stream-3 status:** only [`Fork`](Self::Fork) is currently
-/// dispatched by [`WorkloadHandle::spawn`] —
-/// [`Thread`](Self::Thread), [`SharedVm`](Self::SharedVm), and
-/// [`Raw`](Self::Raw) cause spawn to bail until #19b/#19c land. The
-/// flag validator below is fully implemented because future
-/// dispatch needs it; the variant constructors are exposed so
+/// **Status:** [`Fork`](Self::Fork) and [`Thread`](Self::Thread) are
+/// dispatched; [`SharedVm`](Self::SharedVm) and [`Raw`](Self::Raw)
+/// bail with a runtime-constraint diagnostic until the clone3-child
+/// Rust-runtime redesign lands. The flag validator
+/// ([`validate_clone_flags`]) is fully implemented because the
+/// redesign will reuse it; the variant constructors are exposed so
 /// callers can write tests that pin the planned API surface ahead
 /// of dispatch.
 #[derive(Clone, Debug, Default)]
@@ -1998,7 +2038,8 @@ pub struct WorkloadConfig {
     /// How to create each worker. Defaults to [`CloneMode::Fork`]
     /// — the historical fork-based path. Other variants exercise
     /// shared-VM / thread-group / custom-flag clone3 paths;
-    /// dispatch for those is staged across #19b and #19c.
+    /// dispatch for those is staged behind future thread-mode and
+    /// clone3-based dispatch implementations.
     pub clone_mode: CloneMode,
 }
 
@@ -2230,16 +2271,29 @@ pub struct Migration {
 /// -- the sentinel drifts silently when a field is added.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, crate::Claim)]
 pub struct WorkerReport {
-    /// Worker process ID (from `getpid()` in the forked child).
-    /// Stored as `pid_t` (i32) to match the kernel's native type and
-    /// avoid the silent u32→i32 sign-cast wraparound at libc
-    /// boundaries (kill/waitpid/Pid::from_raw).
+    /// Kernel TID from `gettid(2)`. For [`CloneMode::Fork`] each
+    /// worker is its own thread-group leader so `gettid() == getpid()
+    /// == tgid`; the report's tid is interchangeable with the
+    /// worker's pid in libc / cgroup APIs. For [`CloneMode::Thread`]
+    /// every worker shares the parent's tgid and `gettid()` is the
+    /// only identifier that discriminates per-task identity, so the
+    /// report's tid is what feeds `sched_setaffinity(tid, ...)` and
+    /// `cgroup.threads` writes (NOT `cgroup.procs` — see the warning
+    /// on [`WorkloadHandle::worker_pids`]). Stored as `pid_t` (i32)
+    /// to match the kernel's native type and avoid the silent
+    /// u32→i32 sign-cast wraparound at libc boundaries
+    /// (kill/waitpid/Pid::from_raw).
     pub tid: i32,
     /// Cumulative work iterations (incremented by `spin_burst` or I/O loops).
     pub work_units: u64,
     /// Thread CPU time from `CLOCK_THREAD_CPUTIME_ID` (ns).
     pub cpu_time_ns: u64,
-    /// Wall-clock time from fork-start to stop signal (ns).
+    /// Wall-clock time from worker-start to stop flag (ns).
+    /// Measured from the worker's first `Instant::now()` in
+    /// `worker_main` (immediately after the start handshake) to the
+    /// outer-loop exit (when the per-worker `stop` flag is observed
+    /// `true`); covers both Fork-mode workers (signal-driven flag)
+    /// and Thread-mode workers (parent-driven flag).
     pub wall_time_ns: u64,
     /// `wall_time_ns - cpu_time_ns`: total off-CPU time (ns).
     ///
@@ -2398,6 +2452,14 @@ pub enum WorkerExitInfo {
     /// already reaped by an external signal handler or a double-reap
     /// regression) or EINTR. Message is the rendered `errno` string.
     WaitFailed(String),
+    /// Thread-mode worker panicked. `JoinHandle::join()` returned
+    /// `Err`; the inner payload is downcast to a `&str` / `String`
+    /// (the canonical `panic!` payload shapes) and recorded here so
+    /// the operator can triage without scraping the test log. This
+    /// variant is exclusive to [`CloneMode::Thread`] — fork workers
+    /// surface panics via `Exited(1)` or `Signaled(SIGABRT)`
+    /// depending on the panic strategy.
+    Panicked(String),
 }
 
 /// Pure mapping from a `waitpid` outcome to the diagnostic
@@ -2430,22 +2492,223 @@ fn classify_wait_outcome(
     }
 }
 
-/// Handle to spawned worker processes (forked, not threads).
-/// Workers block until [`start()`](Self::start) is called.
-/// Each worker is a separate process so it can be in its own cgroup.
-#[must_use = "dropping a WorkloadHandle immediately kills all worker processes"]
+/// Extract a human-readable panic payload from a
+/// [`std::thread::Result`] `Err` value. The two canonical shapes
+/// are `&'static str` (`panic!("literal")`) and `String`
+/// (`panic!("{x}")` post-formatting); anything else falls back to
+/// a fixed sentinel.
+///
+/// Pure mapping (no IO, no allocation past `String::clone`) so the
+/// stop_and_collect path can call it on every joined-and-panicked
+/// thread without performance cliffs.
+fn extract_panic_payload(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
+}
+
+/// Wall-clock time budget for joining a thread-mode worker after
+/// its per-task `stop` has been flipped. Mirrors the fork-mode
+/// `stop_and_collect` 5s shared deadline so neither dispatch path
+/// can serially exhaust the test runtime by hanging on a single
+/// stuck worker. The 100ms `FUTEX_WAIT_TIMEOUT` inside
+/// `worker_main`'s blocking primitives means a well-behaved worker
+/// observes `stop=true` within 100ms of the parent's flip; the 5s
+/// budget covers IO drain, scheduling delays under contention, and
+/// post-loop cleanup (NUMA stat reads, schedstat snapshots).
+const THREAD_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Poll [`std::thread::JoinHandle::is_finished`] until it returns
+/// `true` or `timeout` elapses. Returns `Some(thread_result)` on
+/// successful join, `None` on timeout.
+///
+/// Std lacks a native timed-join API; the polling-based shape here
+/// is the simplest non-leaking pattern. A side-thread "joiner +
+/// channel" alternative would orphan the joiner on timeout
+/// (joining is non-cancellable in std), which keeps the thread
+/// alive past `WorkloadHandle::drop` and prevents process exit.
+/// Polling avoids that orphan cost at the price of a 10ms wakeup
+/// cadence — fine for the 5s budget this is paired with.
+fn join_thread_with_timeout(
+    join: std::thread::JoinHandle<WorkerReport>,
+    timeout: Duration,
+) -> Option<std::thread::Result<WorkerReport>> {
+    let deadline = Instant::now() + timeout;
+    while !join.is_finished() {
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    Some(join.join())
+}
+
+/// `worker_main`'s loop-check predicate: returns `true` when the
+/// worker should stop iterating. Reads BOTH the per-worker `stop`
+/// flag and the global [`STOP`] flag; either set request causes
+/// exit.
+///
+/// Why both:
+/// - Per-worker `stop` is what `WorkloadHandle::stop_and_collect`
+///   flips for graceful shutdown. For Fork mode the per-worker
+///   `stop` IS the global [`STOP`] (the SIGUSR1 handler flips it).
+///   For Thread mode each worker has its own `Arc<AtomicBool>`
+///   passed via `&AtomicBool`.
+/// - The global [`STOP`] is what the SIGUSR1 handler sets. For
+///   Fork mode the worker's per-process [`STOP`] is the same
+///   AtomicBool the handler writes. For Thread mode every thread
+///   shares the parent process's address space, so a SIGUSR1
+///   delivered to the parent (e.g. Ctrl-C / a test harness signal)
+///   flips the shared global [`STOP`] but NOT the per-worker
+///   `stop` Arcs. Without this disjunction, Thread workers would
+///   silently keep running through a parent-level shutdown
+///   request.
+///
+/// `#[inline]` because the call site is two atomic loads + an OR.
+/// Relaxed ordering on both reads matches every existing site —
+/// no cross-field happens-before edge to establish.
+#[inline]
+fn stop_requested(stop: &AtomicBool) -> bool {
+    stop.load(Ordering::Relaxed) || STOP.load(Ordering::Relaxed)
+}
+
+/// Per-thread worker state for [`CloneMode::Thread`] dispatch.
+///
+/// Thread workers cannot be reaped via `waitpid` (they share a tgid
+/// with the parent), so the lifecycle uses Rust's [`std::thread`]
+/// primitives instead of pid-based syscalls:
+///
+/// - `tid` is published by the worker thread post-spawn via
+///   `gettid()` so the parent can address the kernel task for
+///   `sched_setaffinity(tid, ...)` and report it from
+///   [`WorkloadHandle::worker_pids`]. `Arc<AtomicI32>` because the
+///   thread closure owns the publisher and the parent reads it
+///   without joining.
+/// - `stop` replaces the global [`STOP`] signal-flag for thread
+///   mode: the parent flips it from
+///   [`WorkloadHandle::stop_and_collect`], the worker observes it
+///   inside `worker_main`'s `stop.load(Relaxed)` checks. SIGUSR1 is
+///   process-wide and useless for per-thread stop control.
+/// - `start_tx` is the rendezvous channel: the parent calls
+///   `send(())` from [`WorkloadHandle::start`]; the thread blocks
+///   in `recv()` until then. `Option` so `start` can take it and
+///   drop it (idempotent re-call is a no-op when `None`).
+/// - `join` holds the [`std::thread::JoinHandle`] returned by
+///   `thread::spawn`; `stop_and_collect` joins each handle to
+///   retrieve the [`WorkerReport`]. `Option` so `stop_and_collect`
+///   can take ownership and `Drop` does not double-join.
+struct ThreadWorker {
+    tid: std::sync::Arc<std::sync::atomic::AtomicI32>,
+    stop: std::sync::Arc<AtomicBool>,
+    start_tx: Option<std::sync::mpsc::SyncSender<()>>,
+    join: Option<std::thread::JoinHandle<WorkerReport>>,
+}
+
+/// Defense-in-depth Drop for [`ThreadWorker`]. Rust's
+/// [`std::thread::JoinHandle`] does NOT join its thread on drop —
+/// it detaches, and the thread continues running until completion.
+/// `WorkloadHandle::drop`, `WorkloadHandle::stop_and_collect`, and
+/// `SpawnGuard::drop` already explicitly `take()` the JoinHandle and
+/// route it through [`join_thread_with_timeout`]; this impl exists
+/// for the case where some future refactor lets a `ThreadWorker`
+/// fall out of scope without going through one of those paths.
+///
+/// Behavior: if `join` is still `Some` when this Drop fires, flip
+/// `stop` (so the worker exits cleanly), drop `start_tx` (in case
+/// the worker is still parked on `recv()`), and join with the
+/// shared 5s budget. Errors / timeouts are swallowed because Drop
+/// has nothing to assert against; the upstream paths produce the
+/// auditable diagnostics.
+impl Drop for ThreadWorker {
+    fn drop(&mut self) {
+        if let Some(j) = self.join.take() {
+            self.stop.store(true, Ordering::Relaxed);
+            self.start_tx.take();
+            let _ = join_thread_with_timeout(j, THREAD_JOIN_TIMEOUT);
+        }
+    }
+}
+
+/// Per-clone3 worker state for [`CloneMode::SharedVm`] and
+/// [`CloneMode::Raw`] dispatch.
+///
+/// The clone3 path mirrors the Fork variant's pipe-based start /
+/// report rendezvous because the new task still needs an explicit
+/// "go" signal and a back-channel for the [`WorkerReport`] JSON.
+/// What differs from Fork is the reaping primitive:
+///
+/// - `pidfd` is the file descriptor the kernel writes into the
+///   user-pointer `clone_args.pidfd` field when the `CLONE_PIDFD`
+///   flag is set. `poll(pidfd, POLLIN, ms)` reports the child's
+///   exit; the parent does not need `waitpid` and does not race
+///   the kernel's pid recycling.
+/// - `stack_ptr` / `stack_size` own the child's stack mmap. The
+///   parent must mmap a child stack when `CLONE_VM` is set
+///   (`clone3(2)` does not auto-allocate a stack the way
+///   `fork(2)` implicitly does because the parent and child share
+///   the same VM and the kernel cannot reuse the parent's stack).
+///   The mapping is passed via `clone_args.stack` +
+///   `clone_args.stack_size`. The parent must `munmap` it AFTER
+///   the child exits (poll the pidfd first), otherwise the unmap
+///   rips the stack out from under a still-running child.
+struct PidfdWorker {
+    pid: libc::pid_t,
+    pidfd: std::os::unix::io::RawFd,
+    report_fd: std::os::unix::io::RawFd,
+    start_fd: std::os::unix::io::RawFd,
+    stack_ptr: *mut libc::c_void,
+    stack_size: usize,
+    /// Per-worker stop flag, shared with the clone3 child via the
+    /// CLONE_VM-shared address space. Flipping this from the
+    /// parent reaches the child's `worker_main` `stop.load`
+    /// checks without using the global [`STOP`], so siblings are
+    /// not affected.
+    stop: std::sync::Arc<AtomicBool>,
+}
+
+/// Handle to spawned worker tasks. Workers block until
+/// [`start()`](Self::start) is called.
+///
+/// The [`CloneMode`] in the [`WorkloadConfig`] selects how each
+/// worker is created. Within one [`WorkloadHandle`] every worker
+/// uses the same mode, so exactly one of `children`, `threads`, or
+/// `pidfd_workers` is populated; the other two are empty. This
+/// avoids per-worker mode dispatch on the hot path and keeps each
+/// vec's per-mode invariants (pid-based, JoinHandle-based,
+/// pidfd-based reaping) cohesive.
+///
+/// - [`CloneMode::Fork`] populates `children` — separate process
+///   per worker, reaped via `waitpid`, signaled via SIGUSR1.
+/// - [`CloneMode::Thread`] populates `threads` — separate kernel
+///   task in the parent's thread group via [`std::thread::spawn`],
+///   joined via `JoinHandle`. Workers share the parent's tgid;
+///   per-worker cgroup placement requires `cgroup.threads`
+///   (cgroup v2 thread mode), which ktstr scenarios do not
+///   currently configure — Thread-mode workers inherit the
+///   parent's cgroup.
+/// - [`CloneMode::SharedVm`] / [`CloneMode::Raw`] populate
+///   `pidfd_workers` — `clone3(2)` with explicit flags, reaped via
+///   `poll(pidfd, POLLIN)`. Used by tests that exercise the
+///   kernel's per-flag-combination scheduler code paths.
+#[must_use = "dropping a WorkloadHandle immediately tears down all worker tasks"]
 pub struct WorkloadHandle {
-    /// Per-worker (pid, report_fd, start_fd). Pid is stored as the
-    /// kernel's `pid_t` (i32) rather than u32: Linux `pid_max ≤ 2^22`
-    /// always fits in the positive i32 range, so widening to u32 only
-    /// risks the classic "value > i32::MAX silently becomes a negative
-    /// pid_t, and kill(-1, ...) reaps the whole session" sign-cast bug
-    /// at every boundary that feeds a libc function.
+    /// Fork-mode workers. Each entry is `(pid, report_fd, start_fd)`.
+    /// Empty when `clone_mode` is not [`CloneMode::Fork`].
     children: Vec<(
         libc::pid_t,
         std::os::unix::io::RawFd,
         std::os::unix::io::RawFd,
     )>,
+    /// Thread-mode workers. Empty when `clone_mode` is not
+    /// [`CloneMode::Thread`].
+    threads: Vec<ThreadWorker>,
+    /// clone3-mode workers. Empty when `clone_mode` is not
+    /// [`CloneMode::SharedVm`] or [`CloneMode::Raw`].
+    pidfd_workers: Vec<PidfdWorker>,
     started: bool,
     /// Shared mmap regions for futex-based work types (one per worker group). Unmapped on drop.
     futex_ptrs: Vec<*mut u32>,
@@ -2454,12 +2717,12 @@ pub struct WorkloadHandle {
     /// MAP_SHARED region of per-worker iteration counters. Workers
     /// atomically store their iteration count; parent reads via
     /// `snapshot_iterations()`. Pointer to the first element; length
-    /// is `children.len()`. Typed as `*mut AtomicU64` rather than
-    /// `*mut u64` so the 8-byte alignment guarantee (inherited from
-    /// the page-aligned iter_counters mmap site in
-    /// `WorkloadHandle::spawn`) and the atomic-only-access
-    /// invariant are encoded in the type system instead of prose.
-    /// `AtomicU64` is layout-compatible with `u64`:
+    /// is the active worker collection's len. Typed as
+    /// `*mut AtomicU64` rather than `*mut u64` so the 8-byte
+    /// alignment guarantee (inherited from the page-aligned
+    /// iter_counters mmap site in `WorkloadHandle::spawn`) and the
+    /// atomic-only-access invariant are encoded in the type system
+    /// instead of prose. `AtomicU64` is layout-compatible with `u64`:
     /// `std::mem::size_of::<AtomicU64>() == std::mem::align_of::<AtomicU64>() == 8`
     /// on every supported target, so casting the `*mut c_void`
     /// returned by `mmap` to `*mut AtomicU64` is sound.
@@ -2495,6 +2758,16 @@ struct SpawnGuard {
     /// Already-forked children with their parent-side pipe fds
     /// (transferred to handle on success).
     children: Vec<(libc::pid_t, i32, i32)>,
+    /// Already-spawned thread workers (transferred on success).
+    /// Cleanup on early-exit flips each `stop` and joins each
+    /// thread, since threads share the parent's address space and
+    /// must be drained cooperatively (no `kill` equivalent).
+    threads: Vec<ThreadWorker>,
+    /// Already-cloned pidfd workers with their parent-side state
+    /// (transferred on success). Cleanup on early-exit issues
+    /// `pidfd_send_signal(SIGKILL)` then `poll(pidfd, POLLIN)` to
+    /// drain the exit, then `munmap`s the child stack.
+    pidfd_workers: Vec<PidfdWorker>,
 }
 
 impl SpawnGuard {
@@ -2506,21 +2779,28 @@ impl SpawnGuard {
             iter_counters: std::ptr::null_mut(),
             iter_counter_bytes: 0,
             children: Vec::new(),
+            threads: Vec::new(),
+            pidfd_workers: Vec::new(),
         }
     }
 
     /// Transfer live resources into a [`WorkloadHandle`]. Leaves the
-    /// guard's `children`, `futex_ptrs`, and `iter_counters` empty so
-    /// the guard's subsequent `Drop` only closes the inter-worker
-    /// `pipe_pairs` (which the parent never uses post-fork).
+    /// guard's `children`, `threads`, `pidfd_workers`, `futex_ptrs`,
+    /// and `iter_counters` empty so the guard's subsequent `Drop`
+    /// only closes the inter-worker `pipe_pairs` (which the parent
+    /// never uses post-fork).
     fn into_handle(mut self) -> WorkloadHandle {
         let children = std::mem::take(&mut self.children);
+        let threads = std::mem::take(&mut self.threads);
+        let pidfd_workers = std::mem::take(&mut self.pidfd_workers);
         let futex_ptrs = std::mem::take(&mut self.futex_ptrs);
         let iter_counters = std::mem::replace(&mut self.iter_counters, std::ptr::null_mut());
         let iter_counter_bytes = std::mem::replace(&mut self.iter_counter_bytes, 0);
         let iter_counter_len = iter_counter_bytes / std::mem::size_of::<AtomicU64>();
         WorkloadHandle {
             children,
+            threads,
+            pidfd_workers,
             started: false,
             futex_ptrs,
             futex_region_size: self.futex_region_size,
@@ -2551,6 +2831,76 @@ impl Drop for SpawnGuard {
                 if fd >= 0 {
                     let _ = nix::unistd::close(fd);
                 }
+            }
+        }
+        // Stop and join any partially-spawned threads. Threads
+        // share our address space, so `kill` does not reach them
+        // and the only safe teardown is "flip stop, drop the start
+        // channel (in case worker is still parked on `recv`), then
+        // join". Dropping `start_tx` causes `recv` on the worker
+        // side to return `Err(Disconnected)`, unblocking a thread
+        // that has not yet been signaled. After both signals
+        // (stop=true and start_tx dropped), `worker_main`'s outer
+        // loop exits at the next `stop.load(Relaxed)` check (max
+        // ~100ms latency from the `FUTEX_WAIT_TIMEOUT` poll
+        // cadence) and the thread completes. `join` returns the
+        // partial `WorkerReport` (or `Err` on panic, which we
+        // swallow because mid-spawn cleanup has nothing to assert).
+        for tw in &mut self.threads {
+            tw.stop.store(true, Ordering::Relaxed);
+            // Drop start_tx FIRST so a worker still parked on
+            // recv() unblocks via Disconnected.
+            tw.start_tx.take();
+            if let Some(j) = tw.join.take() {
+                // SpawnGuard cleanup uses the same `THREAD_JOIN_TIMEOUT`
+                // budget as `stop_and_collect` and `WorkloadHandle::drop`
+                // so a stuck worker can't pin mid-spawn error recovery.
+                // Errors (panic / timeout) are silently dropped — the
+                // mid-spawn path has nothing to assert against beyond
+                // not leaking, and the spawn-side bail message has
+                // already named the failure mode that triggered cleanup.
+                let _ = join_thread_with_timeout(j, THREAD_JOIN_TIMEOUT);
+            }
+        }
+        // Drain pidfd workers: send SIGKILL via pidfd_send_signal,
+        // poll the pidfd until it reports the exit, then close
+        // pidfd / fds and munmap the child stack. Each step is
+        // best-effort because the partial-failure path may have
+        // populated this vec without all fds being valid.
+        for w in &self.pidfd_workers {
+            // pidfd_send_signal(pidfd, SIGKILL, NULL, 0).
+            // libc 0.2 lacks a wrapper; use raw syscall. Errors
+            // (ESRCH from already-exited child, EBADF from a
+            // half-set-up entry) are swallowed.
+            unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    w.pidfd,
+                    libc::SIGKILL,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0u32,
+                );
+            }
+            // Wait for exit so the munmap below does not race a
+            // running child. POLLIN on pidfd fires when the child
+            // reaches `exit`. 5s deadline matches stop_and_collect's
+            // shared budget.
+            let mut pfd = libc::pollfd {
+                fd: w.pidfd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            unsafe {
+                libc::poll(&mut pfd, 1, 5_000);
+            }
+            // Close fds (pidfd, report, start) and munmap the stack.
+            for fd in [w.pidfd, w.report_fd, w.start_fd] {
+                if fd >= 0 {
+                    let _ = nix::unistd::close(fd);
+                }
+            }
+            if !w.stack_ptr.is_null() && w.stack_size > 0 {
+                unsafe { libc::munmap(w.stack_ptr, w.stack_size) };
             }
         }
         // Close every inter-worker pipe pair. Children closed their
@@ -2590,52 +2940,696 @@ impl Drop for SpawnGuard {
 // from the `*mut AtomicU64` region pointer); the parent reads
 // all slots via `snapshot_iterations` and is the sole process that
 // munmaps the region, on WorkloadHandle::drop after every child has
-// been reaped. Each process constructs its own process-local
-// `&AtomicU32`/`&AtomicU64` shared reference into the MAP_SHARED
-// page from the inherited raw pointer; no reference ever crosses
-// a process boundary. Interior mutation through a shared atomic
-// reference is permitted by Rust's aliasing model because
-// AtomicU32/AtomicU64 wrap an UnsafeCell, so the inherited alias
-// is not an aliasing-rule violation.
+// been reaped.
+//
+// Per-mode aliasing rationale:
+//
+// - Fork mode: each forked child constructs its own process-local
+//   `&AtomicU32`/`&AtomicU64` shared reference into the MAP_SHARED
+//   page from the inherited raw pointer. No reference value ever
+//   crosses a process boundary — each process synthesises its own
+//   reference from the same underlying kernel object. Interior
+//   mutation through a shared atomic reference is permitted by
+//   Rust's aliasing model because `AtomicU32`/`AtomicU64` wrap an
+//   `UnsafeCell`; the post-fork alias relation is therefore not an
+//   aliasing-rule violation.
+//
+// - Thread mode: under [`CloneMode::Thread`] every worker thread
+//   shares the parent process's single address space — the same
+//   raw `*mut AtomicU32`/`*mut AtomicU64` pointer is dereferenced
+//   from multiple threads concurrently, and the resulting
+//   `&AtomicU32`/`&AtomicU64` shared references coexist for
+//   overlapping lifetimes. This is sound for the same reason
+//   `Arc<AtomicU64>` is sound: atomic types' `UnsafeCell`-wrapped
+//   storage permits concurrent shared-reference access by design,
+//   and the underlying load/store instructions are by construction
+//   non-tearing on every supported target. No `&mut` reference is
+//   ever materialised; every access is via the atomic API. The
+//   MAP_SHARED region is allocated once before any worker spawns
+//   and `munmap`ped after every worker has been joined, so the
+//   underlying kernel object outlives every alias.
+//
+// - Pidfd mode (currently bailed pending the clone3 redesign):
+//   children share the parent's address space via `CLONE_VM`, so
+//   they observe the same VMAs as Thread workers and the same
+//   atomic-aliasing argument applies. The redesign will inherit
+//   this soundness without needing MAP_SHARED.
 unsafe impl Send for WorkloadHandle {}
 unsafe impl Sync for WorkloadHandle {}
 
-impl WorkloadHandle {
-    /// Fork worker processes. Workers block on a pipe until [`start()`](Self::start)
-    /// is called, allowing the caller to move them into cgroups first.
-    pub fn spawn(config: &WorkloadConfig) -> Result<Self> {
-        // Dispatch on `clone_mode`. Stream-3 (#19a) lands the type
-        // surface and validator only — Thread / SharedVm / Raw
-        // dispatch is staged in #19b / #19c. Until those land,
-        // anything other than Fork bails with an actionable
-        // diagnostic. Raw still runs the validator so callers can
-        // pin the kernel-rule shape of their flag set ahead of
-        // dispatch.
-        match &config.clone_mode {
-            CloneMode::Fork => { /* fall through to the existing path below */ }
-            CloneMode::Thread => {
-                anyhow::bail!(
-                    "WorkloadHandle::spawn: CloneMode::Thread dispatch is not yet \
-                     implemented (staged in #19b — std::thread + JoinHandle reaping). \
-                     Use CloneMode::Fork until then."
-                );
+/// Pointer-sized addresses passed across a thread-spawn boundary.
+///
+/// Rust's auto-`Send` inference on closures conservatively treats
+/// `*mut T` as `!Send` even inside a wrapper struct destructured in
+/// the closure body — the destructured field type leaks into the
+/// closure's auto-trait check. The simplest workaround is to round-
+/// trip the pointers through `usize` (Send + Copy) and re-cast on
+/// the receiver side. Soundness is identical: thread-mode workers
+/// share the parent's address space, so the addresses retain
+/// meaning across the thread boundary, and the underlying
+/// MAP_SHARED regions are owned by the guard / handle for the full
+/// duration of every worker.
+///
+/// `SendFutexPtr` carries a (futex_address, pos) tuple wrapped in
+/// `Option`; `None` is the "no futex required" case for work types
+/// that don't need shared memory. `SendIterSlotPtr` carries a single
+/// address (zero ⇒ no iter_slot publish).
+#[derive(Clone, Copy)]
+struct SendFutexPtr(Option<(usize, usize)>);
+
+#[derive(Clone, Copy)]
+struct SendIterSlotPtr(usize);
+
+impl SendFutexPtr {
+    fn new(p: Option<(*mut u32, usize)>) -> Self {
+        SendFutexPtr(p.map(|(ptr, pos)| (ptr as usize, pos)))
+    }
+
+    /// Re-cast back into the `*mut u32` + `pos` tuple `worker_main`
+    /// expects.
+    fn into_raw(self) -> Option<(*mut u32, usize)> {
+        self.0.map(|(addr, pos)| (addr as *mut u32, pos))
+    }
+}
+
+impl SendIterSlotPtr {
+    fn new(p: *mut AtomicU64) -> Self {
+        SendIterSlotPtr(p as usize)
+    }
+
+    fn into_raw(self) -> *mut AtomicU64 {
+        self.0 as *mut AtomicU64
+    }
+}
+
+/// Spawn a single thread-mode worker via [`std::thread::Builder`].
+///
+/// The thread closure runs `worker_main` directly with the same
+/// per-worker arguments the fork dispatch passes, except `stop` is
+/// a per-worker `Arc<AtomicBool>` instead of the global [`STOP`].
+/// Start rendezvous uses an `mpsc::sync_channel(0)` because every
+/// worker needs to block until the parent calls
+/// [`WorkloadHandle::start`]; the parent then sends `()` to each
+/// worker's `start_tx` to unblock them in order.
+///
+/// `tid` is published from inside the closure via `gettid()` after
+/// the start handshake completes, so [`WorkloadHandle::worker_pids`]
+/// reads it post-`start`. A pre-start read returns `0`, which is
+/// the documented sentinel for "not yet running".
+///
+/// SIGUSR1 is process-wide and useless for per-thread stop control,
+/// so this path does not install a signal handler. The parent flips
+/// `stop` directly from [`WorkloadHandle::stop_and_collect`].
+#[allow(clippy::too_many_arguments)]
+fn spawn_thread_worker(
+    guard: &mut SpawnGuard,
+    config: &WorkloadConfig,
+    affinity: Option<BTreeSet<usize>>,
+    worker_pipe_fds: Option<(i32, i32)>,
+    worker_futex: Option<(*mut u32, usize)>,
+    iter_slot: *mut AtomicU64,
+) -> Result<()> {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicI32;
+    use std::sync::mpsc;
+
+    // SyncSender(0) — bounded rendezvous channel. The thread blocks
+    // in `recv()` until the parent sends `()`; if the parent drops
+    // the sender first (mid-spawn cleanup or early bail), `recv()`
+    // returns `Err(Disconnected)` and the closure exits cleanly.
+    let (start_tx, start_rx) = mpsc::sync_channel::<()>(0);
+    let stop = Arc::new(AtomicBool::new(false));
+    let tid = Arc::new(AtomicI32::new(0));
+
+    // Clone Arcs for the closure. The thread takes ownership of the
+    // closure-side handles; the parent retains the originals via
+    // ThreadWorker for stop signaling and tid reading.
+    let stop_thread = Arc::clone(&stop);
+    let tid_thread = Arc::clone(&tid);
+    let work_type = config.work_type.clone();
+    let sched_policy = config.sched_policy;
+    let mem_policy = config.mem_policy.clone();
+    let mpol_flags = config.mpol_flags;
+    let nice = config.nice;
+
+    // The closure must be `Send` to cross the thread boundary.
+    // `worker_pipe_fds` is `Option<(i32, i32)>` (Copy + Send), but
+    // `worker_futex` and `iter_slot` are raw pointers and not
+    // `Send` by default. The module-level `SendFutexPtr` and
+    // `SendIterSlotPtr` newtypes round-trip the addresses through
+    // `usize` so the closure's capture set is genuinely Send (no
+    // raw-pointer field appears in the closure type).
+    let futex_send = SendFutexPtr::new(worker_futex);
+    let iter_slot_send = SendIterSlotPtr::new(iter_slot);
+
+    let join = std::thread::Builder::new()
+        .name(format!("ktstr-worker-{}", guard.threads.len()))
+        .spawn(move || {
+            // Publish gettid() so the parent can address this task
+            // for sched_setaffinity and report it from worker_pids.
+            // gettid() is the kernel TID; getpid() would return the
+            // shared tgid, which collides across threads.
+            let my_tid: libc::pid_t =
+                unsafe { libc::syscall(libc::SYS_gettid) as libc::pid_t };
+            // Release pairs with Acquire on the parent's
+            // `tid.load()` sites so any reader observing a non-zero
+            // tid also sees the worker's post-start state. Cheap on
+            // every supported target (release-store on the Arc's
+            // underlying AtomicI32 is a single instruction).
+            tid_thread.store(my_tid, Ordering::Release);
+
+            // Block on start rendezvous. `Err(_)` means the parent
+            // dropped start_tx before sending — return a sentinel
+            // WorkerReport without doing any work.
+            if start_rx.recv().is_err() {
+                return WorkerReport {
+                    tid: my_tid,
+                    completed: false,
+                    ..WorkerReport::default()
+                };
             }
+
+            // Re-cast usize addresses back into raw pointers for
+            // worker_main. SAFETY: the ownership and lifetime
+            // arguments documented on `SendFutexPtr` /
+            // `SendIterSlotPtr` ensure these pointers are still
+            // live when worker_main dereferences them.
+            let futex = futex_send.into_raw();
+            let slot = iter_slot_send.into_raw();
+
+            worker_main(
+                affinity,
+                work_type,
+                sched_policy,
+                mem_policy,
+                mpol_flags,
+                nice,
+                worker_pipe_fds,
+                futex,
+                slot,
+                &stop_thread,
+            )
+        })
+        .with_context(|| {
+            format!(
+                "thread::spawn for worker {}/{} failed",
+                guard.threads.len() + 1,
+                config.num_workers,
+            )
+        })?;
+
+    guard.threads.push(ThreadWorker {
+        tid,
+        stop,
+        start_tx: Some(start_tx),
+        join: Some(join),
+    });
+    Ok(())
+}
+
+/// Spawn a single clone3-mode worker via raw `clone3(2)`.
+///
+/// Used by [`CloneMode::SharedVm`] (hardcoded `CLONE_VM`) and
+/// [`CloneMode::Raw`] (caller-supplied flags). The runtime adds
+/// `CLONE_PIDFD` internally so the parent can reap via
+/// `poll(pidfd, POLLIN)` instead of `waitpid`.
+///
+/// The child runs the same body as the Fork path's `pid == 0` arm
+/// — pipe-based start rendezvous, `worker_main`, `_exit` — adapted
+/// to use a clone3-allocated stack and the pidfd-reap return path.
+/// Because the child shares the parent's address space when
+/// `CLONE_VM` is set, any access to the parent's stack (locals
+/// captured by the loop) would race the parent — the child's
+/// post-clone3 code path therefore copies every value it needs out
+/// of the loop's locals BEFORE returning to user space.
+///
+/// **Kernel-verified constraints carried forward to the redesign:**
+///
+/// - `kernel/fork.c::copy_process` calls `sas_ss_reset` for any
+///   child cloned with `CLONE_VM` and without `CLONE_VFORK`,
+///   resetting the child's `sas_ss_*` fields (sigaltstack disabled,
+///   size 0). Workers that need a sigaltstack for SIGSEGV recovery
+///   must call `sigaltstack(2)` themselves post-clone3.
+///
+/// - `kernel/fork.c::mm_release` clears `*clear_child_tid` in the
+///   shared mm on exit / exec. Setting `CLONE_CHILD_CLEARTID` from
+///   a `CLONE_VM` clone3 child therefore writes a zero into the
+///   PARENT's address space at exit time — silent memory
+///   corruption. `CLONE_CHILD_CLEARTID` is already in
+///   [`CloneFlags::RUNTIME_RESERVED`] so user-supplied flag sets
+///   for [`CloneMode::Raw`] cannot reach this footgun; the
+///   runtime itself must NOT set it for SharedVm/Raw either.
+///
+/// - The child stack mmap should size `STACK_SIZE + PAGE_SIZE` and
+///   `mprotect` the bottom page `PROT_NONE` so a stack overflow
+///   segfaults predictably instead of corrupting an adjacent
+///   mapping. Implemented below by `CLONE3_STACK_SIZE +
+///   CLONE3_STACK_GUARD` + `mprotect(stack_ptr, CLONE3_STACK_GUARD,
+///   PROT_NONE)`.
+#[allow(clippy::too_many_arguments)]
+fn spawn_clone3_worker(
+    guard: &mut SpawnGuard,
+    config: &WorkloadConfig,
+    flags: CloneFlags,
+    affinity: Option<BTreeSet<usize>>,
+    worker_pipe_fds: Option<(i32, i32)>,
+    worker_futex: Option<(*mut u32, usize)>,
+    iter_slot: *mut AtomicU64,
+    report_fds: [i32; 2],
+    start_fds: [i32; 2],
+    worker_idx: usize,
+) -> Result<()> {
+    // Allocate a child stack via mmap. clone3 does not auto-allocate
+    // a stack the way fork does; the caller must supply one through
+    // clone_args.stack + clone_args.stack_size. The mapping is
+    // ANONYMOUS|PRIVATE so the child's stack writes don't bleed
+    // back into the parent. Sized at CLONE3_STACK_SIZE +
+    // CLONE3_STACK_GUARD; the kernel never touches the guard page
+    // because the child's stack pointer starts at the END (highest
+    // address) of the usable region and grows downward toward the
+    // guard.
+    let total = CLONE3_STACK_SIZE + CLONE3_STACK_GUARD;
+    let stack_ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            total,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_STACK,
+            -1,
+            0,
+        )
+    };
+    if stack_ptr == libc::MAP_FAILED {
+        unsafe {
+            libc::close(report_fds[0]);
+            libc::close(report_fds[1]);
+            libc::close(start_fds[0]);
+            libc::close(start_fds[1]);
+        }
+        anyhow::bail!(
+            "clone3 worker {}/{}: mmap of {} byte child stack failed: {}",
+            worker_idx + 1,
+            config.num_workers,
+            total,
+            std::io::Error::last_os_error(),
+        );
+    }
+    // Mark the bottom page as PROT_NONE so a stack overflow
+    // segfaults predictably instead of corrupting an adjacent
+    // mapping. Failure here is non-fatal (the workload still runs;
+    // the guard page just isn't enforced); fall through with a
+    // tracing::warn.
+    let guard_rc = unsafe {
+        libc::mprotect(stack_ptr, CLONE3_STACK_GUARD, libc::PROT_NONE)
+    };
+    if guard_rc != 0 {
+        tracing::warn!(
+            err = %std::io::Error::last_os_error(),
+            "clone3 stack guard page mprotect(PROT_NONE) failed; \
+             stack overflow will not be caught"
+        );
+    }
+
+    // clone3 stack pointer points to the BASE of the usable region
+    // (kernel computes top from base + size). We pass the
+    // post-guard offset as `stack` and CLONE3_STACK_SIZE as
+    // `stack_size`.
+    let usable_stack = unsafe { (stack_ptr as *mut u8).add(CLONE3_STACK_GUARD) };
+
+    // Heap-allocate the child-args bundle. Under CLONE_VM the
+    // child cannot read the parent's stack frame (the parent
+    // returns from this function and unwinds the locals shortly
+    // after clone3), so every input the child needs lives on the
+    // heap and is reachable via the shared address space. Push
+    // onto the FIFO queue immediately before clone3 so the child
+    // pops it on the next iteration.
+    // Per-worker stop flag, mirroring the Thread-mode design.
+    // The Arc lives in shared address space (CLONE_VM); the parent
+    // flips it from `stop_and_collect`, the child observes it via
+    // `stop.load(Relaxed)` inside `worker_main`. Stored on both
+    // the queued args (for the child to pick up) and on the
+    // `PidfdWorker` (so the parent can flip without re-finding
+    // the queue entry).
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let child_args = Box::new(Clone3ChildArgs {
+        affinity,
+        work_type: config.work_type.clone(),
+        sched_policy: config.sched_policy,
+        mem_policy: config.mem_policy.clone(),
+        mpol_flags: config.mpol_flags,
+        nice: config.nice,
+        worker_pipe_fds,
+        worker_futex: worker_futex.map(|(p, pos)| (p as usize, pos)),
+        iter_slot: iter_slot as usize,
+        report_fd: report_fds[1],
+        start_fd: start_fds[0],
+        stop: std::sync::Arc::clone(&stop),
+    });
+    CLONE3_CHILD_ARGS_QUEUE
+        .lock()
+        .expect("clone3 child-args queue mutex poisoned")
+        .push_back(child_args);
+
+    // Build clone_args. The runtime always sets CLONE_PIDFD so we
+    // can reap via pidfd; the caller's flags must not include any
+    // RUNTIME_RESERVED bits (validate_clone_flags enforces this).
+    // exit_signal stays at 0 — without CLONE_THREAD the kernel
+    // requires either an explicit exit_signal or 0; pidfd reaping
+    // does not need SIGCHLD.
+    let mut pidfd: libc::c_int = -1;
+    let mut clone_args: libc::clone_args = unsafe { std::mem::zeroed() };
+    clone_args.flags = flags.bits() | (libc::CLONE_PIDFD as u64);
+    clone_args.pidfd = (&mut pidfd as *mut libc::c_int) as u64;
+    clone_args.exit_signal = 0;
+    clone_args.stack = usable_stack as u64;
+    clone_args.stack_size = CLONE3_STACK_SIZE as u64;
+
+    // Issue clone3. Returns 0 in the child, child pid in the
+    // parent, -1 on error. SAFETY: clone_args is a zero-initialised
+    // libc UAPI struct with our fields populated; the kernel reads
+    // `size` to gate which fields it touches, and ignores tail
+    // bytes beyond its own definition. pidfd and stack pointers
+    // outlive the syscall.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_clone3,
+            &clone_args as *const libc::clone_args,
+            std::mem::size_of::<libc::clone_args>(),
+        )
+    };
+    if rc < 0 {
+        // clone3 failed — drain the args we pushed, then release
+        // everything we allocated for this worker before bailing.
+        let _ = CLONE3_CHILD_ARGS_QUEUE
+            .lock()
+            .expect("clone3 child-args queue mutex poisoned")
+            .pop_back();
+        unsafe {
+            libc::munmap(stack_ptr, total);
+            libc::close(report_fds[0]);
+            libc::close(report_fds[1]);
+            libc::close(start_fds[0]);
+            libc::close(start_fds[1]);
+        }
+        anyhow::bail!(
+            "clone3 worker {}/{}: syscall failed: {} (flags=0x{:x})",
+            worker_idx + 1,
+            config.num_workers,
+            std::io::Error::last_os_error(),
+            clone_args.flags,
+        );
+    }
+    if rc == 0 {
+        // Child path. The child reads its args from the queue
+        // (pop_front), then runs worker_main on the new stack. All
+        // values come from heap (Box) or static globals; the
+        // parent's stack is NOT accessed.
+        clone3_child_main();
+    }
+    // Parent path. rc is the child pid; pidfd is filled by the
+    // kernel via clone_args.pidfd. Close child-side pipe ends so
+    // the parent retains only the read-side report_fd and
+    // write-side start_fd.
+    unsafe {
+        libc::close(report_fds[1]);
+        libc::close(start_fds[0]);
+    }
+    let pid = rc as libc::pid_t;
+    guard.pidfd_workers.push(PidfdWorker {
+        pid,
+        pidfd,
+        report_fd: report_fds[0],
+        start_fd: start_fds[1],
+        stack_ptr,
+        stack_size: total,
+        stop,
+    });
+    Ok(())
+}
+
+/// Body of the clone3 child. Runs on the child's freshly-mmap'd
+/// stack. Reads its inputs from the heap-allocated
+/// [`Clone3ChildArgs`] box the parent just pushed, runs
+/// [`worker_main`], writes the [`WorkerReport`] JSON to the report
+/// pipe, and `_exit`s. Never returns.
+///
+/// This function does NOT read parent-stack locals — every input
+/// arrives via the shared queue, which lives on the global heap
+/// (also shared under `CLONE_VM`).
+///
+/// Marked `#[inline(never)]` to keep the child's stack frame
+/// distinct from `spawn_clone3_worker`'s and to make a stack-
+/// overflow trace unambiguous.
+#[inline(never)]
+fn clone3_child_main() -> ! {
+    // Pop the args from the front of the queue. FIFO ordering
+    // matches the parent's push-then-clone3 sequence — ktstr only
+    // issues clone3 calls from one thread at a time (the per-worker
+    // spawn loop), so the pop never sees a sibling's args.
+    let args = CLONE3_CHILD_ARGS_QUEUE
+        .lock()
+        .expect("clone3 child-args queue mutex poisoned")
+        .pop_front()
+        .expect("clone3 child reached child_main with empty args queue");
+
+    // Wait for parent to signal start via the start pipe. 30s
+    // ceiling matches the fork-mode child to avoid an indefinite
+    // hang on a parent that crashes between clone3 and start().
+    let mut pfd = libc::pollfd {
+        fd: args.start_fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ret = unsafe { libc::poll(&mut pfd, 1, 30_000) };
+    if ret <= 0 {
+        unsafe { libc::_exit(1) };
+    }
+    let mut buf = [0u8; 1];
+    unsafe {
+        libc::read(args.start_fd, buf.as_mut_ptr() as *mut _, 1);
+        libc::close(args.start_fd);
+    }
+    // Destructure args so the per-worker stop Arc and the other
+    // fields move into local bindings without partial-move
+    // conflicts when worker_main borrows `&stop`.
+    let Clone3ChildArgs {
+        affinity,
+        work_type,
+        sched_policy,
+        mem_policy,
+        mpol_flags,
+        nice,
+        worker_pipe_fds,
+        worker_futex: futex_raw,
+        iter_slot: slot_raw,
+        report_fd,
+        start_fd: _,
+        stop,
+    } = *args;
+    // Reset the per-worker stop flag in case SIGUSR1 raced the
+    // start handshake. Mirrors the Thread-mode pattern: each
+    // SharedVm/Raw worker carries its own `Arc<AtomicBool>` so
+    // stopping one worker does not stop siblings (the global
+    // [`STOP`] would, since SIGUSR1 broadcasts to every task that
+    // shares the parent's signal disposition table).
+    stop.store(false, Ordering::Relaxed);
+
+    let worker_futex = futex_raw.map(|(addr, pos)| (addr as *mut u32, pos));
+    let iter_slot = slot_raw as *mut AtomicU64;
+
+    let report = worker_main(
+        affinity,
+        work_type,
+        sched_policy,
+        mem_policy,
+        mpol_flags,
+        nice,
+        worker_pipe_fds,
+        worker_futex,
+        iter_slot,
+        &stop,
+    );
+
+    // Serialise the report and write it to the parent's end of the
+    // report pipe. Any IO error here is silently dropped — the
+    // parent's read_to_end falls into the sentinel branch and
+    // attaches an exit_info diagnostic.
+    let json = serde_json::to_vec(&report).unwrap_or_default();
+    unsafe {
+        libc::write(
+            report_fd,
+            json.as_ptr() as *const _,
+            json.len(),
+        );
+        libc::close(report_fd);
+        libc::_exit(0);
+    }
+}
+
+/// Internal dispatch shape resolved from
+/// [`WorkloadConfig::clone_mode`] inside [`WorkloadHandle::spawn`].
+///
+/// `Clone3` is wired through the dispatch loop but reaches the
+/// staging bail-out before invoking the syscall — see the
+/// `CloneMode::SharedVm` / `CloneMode::Raw` arms in
+/// [`WorkloadHandle::spawn`]. The variant is kept (and the
+/// `spawn_clone3_worker` helper preserved with `#[allow(dead_code)]`
+/// below) because the redesign tracked under the follow-up clone3
+/// task will turn the bail-out into a real dispatch and reuse this
+/// machinery without re-deriving the ABI surface.
+#[allow(dead_code)]
+enum Dispatch {
+    Fork,
+    Thread,
+    Clone3 { flags: CloneFlags },
+}
+
+/// Default Linux thread stack size for [`CloneMode::SharedVm`] /
+/// [`CloneMode::Raw`] children. `clone3(2)` requires the caller to
+/// allocate the child stack via mmap and pass it through
+/// `clone_args.stack` + `clone_args.stack_size`; pthread on glibc
+/// uses 8 MiB by default for new threads, and matching that figure
+/// keeps worker stack budgets predictable.
+const CLONE3_STACK_SIZE: usize = 8 * 1024 * 1024;
+
+/// Heap-allocated argument bundle handed from a clone3 parent to
+/// the child it just forked.
+///
+/// Under `CLONE_VM` the child shares the parent's address space but
+/// runs on a fresh mmap'd stack — the parent's stack frame for
+/// [`spawn_clone3_worker`] is unwound as soon as the parent returns
+/// past the syscall, so the child cannot safely read locals
+/// captured at clone3 time. Heap-allocating these args via `Box`
+/// (which lands in the shared global heap) and passing the box
+/// through [`CLONE3_CHILD_ARGS_QUEUE`] gives the child a stable
+/// place to find its inputs that survives the parent's unwind.
+struct Clone3ChildArgs {
+    affinity: Option<BTreeSet<usize>>,
+    work_type: WorkType,
+    sched_policy: SchedPolicy,
+    mem_policy: MemPolicy,
+    mpol_flags: MpolFlags,
+    nice: i32,
+    worker_pipe_fds: Option<(i32, i32)>,
+    /// Futex region pointer (raw, address-only). See
+    /// [`SendFutexPtr`] for the lifetime argument; the
+    /// MAP_SHARED region outlives every clone3 child.
+    worker_futex: Option<(usize, usize)>,
+    iter_slot: usize,
+    report_fd: libc::c_int,
+    start_fd: libc::c_int,
+    /// Per-worker stop flag, mirroring [`ThreadWorker::stop`]. The
+    /// shared address space (CLONE_VM) means a single
+    /// `Arc<AtomicBool>` is reachable by both parent and child;
+    /// the parent flips it from `stop_and_collect`, the child
+    /// observes it via `stop.load(Relaxed)` inside `worker_main`.
+    /// Replaces the global [`STOP`] for SharedVm/Raw children so
+    /// stopping one worker does not stop siblings.
+    stop: std::sync::Arc<AtomicBool>,
+}
+
+/// Queue of child-arg boxes pending pickup by clone3 children.
+///
+/// The parent pushes one `Box<Clone3ChildArgs>` immediately before
+/// each `clone3(SYS_clone3, ...)` syscall; the child pops from the
+/// front of the queue right after the syscall returns 0. ktstr
+/// currently only issues clone3 calls from one thread at a time
+/// (the per-worker spawn loop in [`WorkloadHandle::spawn`] is
+/// sequential), so FIFO ordering happens to be sufficient — no
+/// per-call identifier is needed.
+///
+/// `Mutex` is fine even though child and parent are technically
+/// distinct kernel tasks: under `CLONE_VM` they share the address
+/// space including the mutex's underlying futex word, so locking
+/// works the same as for two threads.
+///
+/// FIXME: the FIFO ordering assumption is unsound under concurrent
+/// scheduling. If the kernel schedules child N+1's pop_front BEFORE
+/// child N's, child N+1 picks up child N's args (and vice versa),
+/// silently swapping per-worker state across siblings. Today the
+/// per-worker spawn loop is sequential and the next push always
+/// follows the previous syscall return, but that ordering is a
+/// property of the caller, not the queue. The clone3-child redesign
+/// (per the SharedVm/Raw bail message and the deferred dispatch
+/// task) MUST replace this with per-child keyed delivery — e.g.
+/// hand the child a per-call key via a register the kernel preserves
+/// (clone_args.tls when CLONE_SETTLS is set, or a slot in the
+/// child's stack mmap that the parent populates pre-syscall) and
+/// pop by that key.
+static CLONE3_CHILD_ARGS_QUEUE: std::sync::Mutex<std::collections::VecDeque<Box<Clone3ChildArgs>>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+
+/// Stack guard size below the clone3 child stack mmap. Mirrors
+/// glibc's `pthread_attr_default::guardsize` of one page so a stack
+/// overflow segfaults predictably instead of corrupting an adjacent
+/// allocation. The mmap is sized
+/// `CLONE3_STACK_SIZE + CLONE3_STACK_GUARD`; the kernel never
+/// touches the guard page because the child stack pointer is set to
+/// the END of the usable region (highest address) and grows down
+/// toward the guard.
+const CLONE3_STACK_GUARD: usize = 4096;
+
+impl WorkloadHandle {
+    /// Spawn worker tasks. Workers block until
+    /// [`start()`](Self::start) is called, allowing the caller to
+    /// move fork-mode workers into cgroups first. The worker creation
+    /// primitive (`fork`, `std::thread::spawn`, or `clone3`) is
+    /// selected by [`WorkloadConfig::clone_mode`].
+    pub fn spawn(config: &WorkloadConfig) -> Result<Self> {
+        // Resolve the kernel clone3 flag set for the dispatch shape
+        // up front. Fork and Thread land at full implementations
+        // below; SharedVm and Raw bail with an actionable message
+        // until the clone3-child Rust-runtime initialisation
+        // problem is solved (the child of `clone3(CLONE_VM)` runs
+        // without per-task Rust thread-info, so any allocation /
+        // panic / stack-overflow probe inside `worker_main` aborts
+        // with `the thread info setup logic isn't recursive`).
+        // Raw still runs the validator so callers can pin the
+        // kernel-rule shape of their flag set ahead of dispatch.
+        let dispatch = match &config.clone_mode {
+            CloneMode::Fork => Dispatch::Fork,
+            CloneMode::Thread => Dispatch::Thread,
             CloneMode::SharedVm => {
                 anyhow::bail!(
-                    "WorkloadHandle::spawn: CloneMode::SharedVm dispatch is not yet \
-                     implemented (staged in #19c — clone3 + pidfd reaping). \
-                     Use CloneMode::Fork until then."
+                    "SharedVm/Raw dispatch requires Rust TLS initialization \
+                     in a clone3 child, which is not supported without \
+                     pthread. Use CloneMode::Thread (pthread-backed) or \
+                     CloneMode::Fork."
                 );
             }
             CloneMode::Raw(flags) => {
                 validate_clone_flags(*flags)?;
                 anyhow::bail!(
-                    "WorkloadHandle::spawn: CloneMode::Raw dispatch is not yet \
-                     implemented (staged in #19c — clone3 + pidfd reaping). \
-                     Flag set is structurally valid; dispatch coming. \
-                     Use CloneMode::Fork until then."
+                    "SharedVm/Raw dispatch requires Rust TLS initialization \
+                     in a clone3 child, which is not supported without \
+                     pthread. Flag set is structurally valid. Use \
+                     CloneMode::Thread (pthread-backed) or CloneMode::Fork."
                 );
             }
+        };
+
+        // Thread mode + ForkExit is incompatible. ForkExit's worker
+        // body calls `libc::fork()` from inside `worker_main` to
+        // exercise wake_up_new_task / do_exit / wait_task_zombie;
+        // under [`CloneMode::Thread`] the worker is a thread inside
+        // the parent's tgid, so its `fork()` produces a child that
+        // shares tgid with the parent and every sibling thread. The
+        // child then calls `libc::_exit(0)` which the kernel routes
+        // through `do_exit` — and `do_exit` for a thread-group leader
+        // tears down the whole tgid (every worker thread dies). This
+        // converts the workload into a fratricidal sibling kill on
+        // the very first ForkExit iteration. Reject at spawn time
+        // with an actionable diagnostic; CloneMode::Fork is the
+        // correct choice for ForkExit and will continue to work.
+        if matches!(dispatch, Dispatch::Thread)
+            && matches!(config.work_type, WorkType::ForkExit)
+        {
+            anyhow::bail!(
+                "CloneMode::Thread is incompatible with WorkType::ForkExit — \
+                 ForkExit forks inside the worker, which under a thread-group \
+                 worker tears down every sibling thread on the child's _exit. \
+                 Use CloneMode::Fork for ForkExit workloads."
+            );
         }
 
         let needs_pipes = matches!(
@@ -2838,6 +3832,28 @@ impl WorkloadHandle {
                 std::ptr::null_mut()
             };
 
+            // Per-mode dispatch. Thread-mode workers do not need
+            // pipes — the rendezvous and report channels are
+            // in-process Rust primitives (`mpsc::sync_channel(0)` +
+            // `JoinHandle`). Fork and Clone3 modes both use the
+            // pipe-based scaffolding originally built for fork.
+            match dispatch {
+                Dispatch::Thread => {
+                    spawn_thread_worker(
+                        &mut guard,
+                        config,
+                        affinity,
+                        worker_pipe_fds,
+                        worker_futex,
+                        iter_slot,
+                    )?;
+                    continue;
+                }
+                Dispatch::Fork | Dispatch::Clone3 { .. } => {
+                    // fall through to the pipe-based dispatch below
+                }
+            }
+
             // Create pipe for report and a second pipe for "start" signal.
             // Local cleanup on second-pipe failure: the guard has no
             // per-worker tracking of half-allocated pipes, so the first
@@ -2863,6 +3879,28 @@ impl WorkloadHandle {
                     config.num_workers,
                     std::io::Error::last_os_error(),
                 );
+            }
+
+            // Clone3-mode dispatch: caller-supplied flags (always
+            // including CLONE_VM) plus the runtime-set CLONE_PIDFD
+            // for reaping. The child runs the same body as the
+            // Fork path's `pid == 0` arm — pipe-based start
+            // rendezvous, worker_main, _exit — but is reaped via
+            // pidfd poll instead of waitpid.
+            if let Dispatch::Clone3 { flags } = dispatch {
+                spawn_clone3_worker(
+                    &mut guard,
+                    config,
+                    flags,
+                    affinity,
+                    worker_pipe_fds,
+                    worker_futex,
+                    iter_slot,
+                    report_fds,
+                    start_fds,
+                    i,
+                )?;
+                continue;
             }
 
             let pid = unsafe { libc::fork() };
@@ -3128,9 +4166,16 @@ impl WorkloadHandle {
                             let mut f = unsafe { std::fs::File::from_raw_fd(start_fds[0]) };
                             let _ = f.read_exact(&mut buf);
                             drop(f);
-                            // Reset stop flag in case SIGUSR1 arrived during wait
+                            // Reset stop flag in case SIGUSR1 arrived during wait.
+                            // The forked child has its own (CoW) copy of the
+                            // global STOP, so resetting it here only affects
+                            // this worker, not its siblings.
                             STOP.store(false, Ordering::Relaxed);
-                            // Now run
+                            // Now run. Fork-mode workers thread the global
+                            // STOP through `worker_main` — the SIGUSR1 handler
+                            // is process-wide, so flipping `STOP` from
+                            // `sigusr1_handler` is what reaches the loop's
+                            // `stop.load(Relaxed)` checks.
                             let report = worker_main(
                                 affinity,
                                 config.work_type.clone(),
@@ -3141,6 +4186,7 @@ impl WorkloadHandle {
                                 worker_pipe_fds,
                                 worker_futex,
                                 iter_slot,
+                                &STOP,
                             );
                             let json = serde_json::to_vec(&report).unwrap_or_default();
                             let mut f = unsafe { std::fs::File::from_raw_fd(report_fds[1]) };
@@ -3177,17 +4223,66 @@ impl WorkloadHandle {
         Ok(guard.into_handle())
     }
 
-    /// PIDs of all worker processes, in spawn order.
+    /// Kernel TIDs of all worker tasks, in spawn order.
     ///
     /// Returned as `libc::pid_t` — the kernel's native type — so
     /// callers feed them directly into `kill`, `waitpid`,
-    /// `Pid::from_raw`, and `cgroup.procs` writes without any
+    /// `Pid::from_raw`, and `sched_setaffinity` writes without any
     /// sign-cast at the libc boundary.
+    ///
+    /// # WARNING — `cgroup.procs` for `CloneMode::Thread`
+    ///
+    /// **For `CloneMode::Thread`, passing these TIDs to a
+    /// `cgroup.procs` write migrates the ENTIRE test-runner process
+    /// into that cgroup**: cgroup.procs writes are tgid-scoped, and
+    /// every Thread worker shares the test runner's tgid. The first
+    /// such write moves the test harness, every parent thread, and
+    /// every sibling worker into the destination cgroup; subsequent
+    /// writes are no-ops because they all point at the same tgid.
+    /// Use cgroup v2 threaded-mode cgroups with `cgroup.threads`
+    /// for per-thread placement. `CloneMode::Fork` is the right
+    /// choice when each worker needs its own cgroup.
+    ///
+    /// # Per-mode interpretation
+    ///
+    /// - [`CloneMode::Fork`]: each entry is the worker's pid
+    ///   (== tgid == kernel tid because the worker is its own
+    ///   thread-group leader). Safe to feed into `cgroup.procs`.
+    /// - [`CloneMode::Thread`]: each entry is the worker's
+    ///   `gettid()` value — distinct kernel tasks inside the
+    ///   parent's tgid. Safe for `sched_setaffinity(tid, ...)`;
+    ///   safe for `cgroup.threads` writes under a threaded-mode
+    ///   cgroup; **not** safe for `cgroup.procs` (see warning above).
+    /// - [`CloneMode::SharedVm`] / [`CloneMode::Raw`]: each entry
+    ///   is the pid the kernel returned from `clone3`.
+    ///
+    /// # Thread tid publish ordering
+    ///
+    /// Thread workers publish their `gettid()` via an
+    /// `Arc<AtomicI32>` after the start handshake. The publish uses
+    /// `Release`; this reader uses `Acquire`, pairing release-
+    /// acquire so that any reader who observes a non-zero tid is
+    /// also guaranteed to observe the worker's full post-start
+    /// state. If the caller invokes `worker_pids()` before
+    /// [`start()`](Self::start) returns, the worker may not yet
+    /// have stored its tid and `0` (the `AtomicI32` initial value)
+    /// is reported in those slots. Callers that require post-start
+    /// tids must call `start()` before `worker_pids()`.
     pub fn worker_pids(&self) -> Vec<libc::pid_t> {
-        self.children.iter().map(|(pid, _, _)| *pid).collect()
+        if !self.children.is_empty() {
+            self.children.iter().map(|(pid, _, _)| *pid).collect()
+        } else if !self.threads.is_empty() {
+            self.threads
+                .iter()
+                .map(|tw| tw.tid.load(Ordering::Acquire))
+                .collect()
+        } else {
+            self.pidfd_workers.iter().map(|w| w.pid).collect()
+        }
     }
 
-    /// Signal all children to start working (after they've been moved to cgroups).
+    /// Signal all workers to start working (after they've been
+    /// placed in cgroups, if applicable).
     ///
     /// Idempotent — subsequent calls after the first are no-ops.
     pub fn start(&mut self) {
@@ -3195,19 +4290,62 @@ impl WorkloadHandle {
             return;
         }
         self.started = true;
+        // Fork-mode: write a byte to the start pipe. Pidfd-mode
+        // shares the same pipe-based scaffolding.
         for (_, _, start_fd) in &mut self.children {
             unsafe {
                 libc::write(*start_fd, b"s".as_ptr() as *const _, 1);
                 libc::close(*start_fd);
             }
-            // Mark closed so Drop doesn't double-close.
             *start_fd = -1;
+        }
+        for w in &mut self.pidfd_workers {
+            unsafe {
+                libc::write(w.start_fd, b"s".as_ptr() as *const _, 1);
+                libc::close(w.start_fd);
+            }
+            w.start_fd = -1;
+        }
+        // Thread-mode: send `()` on each worker's start_tx. The
+        // SyncSender(0) rendezvous means each send blocks until the
+        // worker calls recv(); if the worker has been joined or has
+        // panicked before reaching recv, send returns Err which we
+        // swallow (the join in stop_and_collect surfaces the real
+        // exit). Take ownership so a future start() call (illegal
+        // by the idempotence guard above) can't re-send.
+        for tw in &mut self.threads {
+            if let Some(tx) = tw.start_tx.take() {
+                let _ = tx.send(());
+            }
         }
     }
 
     /// Set CPU affinity for worker at `idx`.
+    ///
+    /// For [`CloneMode::Fork`] and clone3 modes the per-worker pid
+    /// addresses a distinct kernel task. For [`CloneMode::Thread`]
+    /// the worker's `gettid()` is what
+    /// `sched_setaffinity(tid, ...)` accepts; this method reads
+    /// the tid from the worker's `Arc<AtomicI32>` (with `Acquire`
+    /// ordering, paired with the `Release` publish on the worker
+    /// thread). Returns an error if the thread has not yet
+    /// published its tid — call [`start()`](Self::start) first so
+    /// the worker reaches its `gettid()` publish before reading.
     pub fn set_affinity(&self, idx: usize, cpus: &BTreeSet<usize>) -> Result<()> {
-        let (pid, _, _) = self.children[idx];
+        let pid = if !self.children.is_empty() {
+            self.children[idx].0
+        } else if !self.threads.is_empty() {
+            let tid = self.threads[idx].tid.load(Ordering::Acquire);
+            if tid == 0 {
+                anyhow::bail!(
+                    "set_affinity: thread worker {idx} has not yet \
+                     published gettid() (call start() first)"
+                );
+            }
+            tid
+        } else {
+            self.pidfd_workers[idx].pid
+        };
         set_thread_affinity(pid, cpus)
     }
 
@@ -3255,7 +4393,7 @@ impl WorkloadHandle {
             .collect()
     }
 
-    /// Send SIGUSR1 to all workers, collect their reports, and wait for exit.
+    /// Stop all workers, collect their reports, and wait for exit.
     ///
     /// Auto-starts workers if [`start()`](Self::start) was not called,
     /// then sleeps 500ms to let them begin before signaling stop.
@@ -3270,17 +4408,30 @@ impl WorkloadHandle {
     ///
     /// Workers spend their steady-state time blocked inside a
     /// `futex_wait` with timeout [`WORKER_STOP_POLL_NS`] (~100 ms).
-    /// On SIGUSR1 the signal handler sets [`STOP`] to `true`, but
-    /// the worker only observes the flag on the NEXT wake of that
-    /// futex — whenever the partner writes its futex word OR the
-    /// 100 ms timeout fires, whichever comes first. Callers that
-    /// budget a graceful-shutdown window against `stop_and_collect`
-    /// should allow at least one [`WORKER_STOP_POLL_NS`] tick
-    /// (~100 ms) between the SIGUSR1 delivery and the final collect
-    /// step, over and above any report-flush / IO latency. Tighter
-    /// windows can race the worker's pre-STOP iteration and surface
-    /// as a missing report, which is then mapped to the sentinel
-    /// path above.
+    /// The "stop signal" is a per-mode flag the worker checks on
+    /// every futex-wait wake; the wake interval bounds shutdown
+    /// latency.
+    ///
+    /// _Fork mode_ — `stop_and_collect` sends SIGUSR1 to each
+    /// worker pid; the per-process `sigusr1_handler` flips the
+    /// global [`STOP`] in that worker's CoW address space, and the
+    /// worker observes it on the NEXT futex wake (partner-writes
+    /// or the 100 ms timeout, whichever comes first). The signal
+    /// handler is process-wide and reaches one worker per kill().
+    ///
+    /// _Thread mode_ — `stop_and_collect` calls
+    /// `worker.stop.store(true, Relaxed)` directly on each
+    /// worker's `Arc<AtomicBool>`. SIGUSR1 is process-wide and
+    /// useless for per-thread stop control, so no signal is sent;
+    /// the worker observes the flag flip on its next futex-wait
+    /// wake at the same 100 ms cadence.
+    ///
+    /// Callers that budget a graceful-shutdown window should
+    /// allow at least one [`WORKER_STOP_POLL_NS`] tick (~100 ms)
+    /// between flag flip and final collect, over and above any
+    /// report-flush / IO latency. Tighter windows can race the
+    /// worker's pre-stop iteration and surface as a missing
+    /// report, which is then mapped to the sentinel path above.
     ///
     /// # Exit-shape invariance
     ///
@@ -3318,8 +4469,12 @@ impl WorkloadHandle {
 
         let mut reports = Vec::new();
         let children = std::mem::take(&mut self.children);
+        let threads = std::mem::take(&mut self.threads);
+        let pidfd_workers = std::mem::take(&mut self.pidfd_workers);
 
-        // Signal all children to stop.
+        // Signal all fork-mode children to stop via SIGUSR1; the
+        // signal handler flips the global STOP that worker_main's
+        // `stop.load(Relaxed)` checks read.
         // `pid` is `libc::pid_t`, so it flows to `Pid::from_raw`
         // without the u32→i32 sign-cast wraparound that produced
         // `kill(-1, ...)` session-wide reaps when the old u32 pid
@@ -3329,6 +4484,30 @@ impl WorkloadHandle {
                 nix::unistd::Pid::from_raw(pid),
                 nix::sys::signal::Signal::SIGUSR1,
             );
+        }
+        // Signal all clone3 workers via pidfd_send_signal(SIGUSR1).
+        // SharedVm/Raw children inherit the signal disposition table
+        // from the parent at clone time when CLONE_SIGHAND is NOT
+        // set, so the parent's `sigusr1_handler` (installed in main)
+        // is also their handler — flipping STOP works.
+        for w in &pidfd_workers {
+            unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    w.pidfd,
+                    libc::SIGUSR1,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0u32,
+                );
+            }
+        }
+        // Signal all thread-mode workers by flipping each worker's
+        // per-task `stop`. SIGUSR1 is process-wide and useless for
+        // per-thread stop; the Arc<AtomicBool> threaded through
+        // worker_main is the only path that reaches an individual
+        // thread without affecting siblings.
+        for tw in &threads {
+            tw.stop.store(true, Ordering::Relaxed);
         }
 
         // Collect reports with a shared 5s deadline across all workers.
@@ -3445,6 +4624,154 @@ impl WorkloadHandle {
             }
         }
 
+        // Pidfd-mode collection: poll(pidfd, POLLIN) reports the
+        // child's exit; read the report fd; close pidfd / report fd
+        // / start fd; munmap the child stack. The shared 5s deadline
+        // is consumed alongside the fork-mode loop above so a
+        // mixed-mode handle (currently impossible — clone_mode is
+        // per-config — but kept symmetric) shares the budget.
+        for w in pidfd_workers {
+            let mut buf = Vec::new();
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let ms = remaining.as_millis().min(i32::MAX as u128) as i32;
+            // Drain the report pipe first (worker may have already
+            // exited and written its JSON before we polled pidfd).
+            if ms > 0 {
+                let mut pfd = libc::pollfd {
+                    fd: w.report_fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let ready = unsafe { libc::poll(&mut pfd, 1, ms) };
+                if ready > 0 {
+                    let mut f = unsafe { std::fs::File::from_raw_fd(w.report_fd) };
+                    let _ = f.read_to_end(&mut buf);
+                    drop(f);
+                } else {
+                    let _ = nix::unistd::close(w.report_fd);
+                }
+            } else {
+                let _ = nix::unistd::close(w.report_fd);
+            }
+            // Send SIGKILL via pidfd to ensure the child exits
+            // before we munmap its stack. ESRCH (already exited) is
+            // the common case for a graceful worker; swallow it.
+            unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    w.pidfd,
+                    libc::SIGKILL,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0u32,
+                );
+            }
+            // Wait for exit before munmap. POLLIN on pidfd fires
+            // when the child reaches `exit`. Up to a 5s ceiling so
+            // a misbehaving child can't pin the test.
+            let mut pfd = libc::pollfd {
+                fd: w.pidfd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            unsafe {
+                libc::poll(&mut pfd, 1, 5_000);
+            }
+            // Close pidfd + start_fd; report_fd was either consumed
+            // by `f.read_to_end` (which closed it via Drop) or
+            // explicitly closed in the timeout branch above.
+            for fd in [w.pidfd, w.start_fd] {
+                if fd >= 0 {
+                    let _ = nix::unistd::close(fd);
+                }
+            }
+            // munmap the child stack now that the child is gone.
+            if !w.stack_ptr.is_null() && w.stack_size > 0 {
+                unsafe { libc::munmap(w.stack_ptr, w.stack_size) };
+            }
+
+            if let Ok(report) = serde_json::from_slice::<WorkerReport>(&buf) {
+                reports.push(report);
+            } else {
+                eprintln!(
+                    "ktstr: clone3 worker pid={} returned no report ({} bytes read)",
+                    w.pid,
+                    buf.len()
+                );
+                reports.push(WorkerReport {
+                    tid: w.pid,
+                    completed: false,
+                    ..WorkerReport::default()
+                });
+            }
+        }
+
+        // Thread-mode collection: join each worker's JoinHandle
+        // (with the [`THREAD_JOIN_TIMEOUT`] budget) and adopt the
+        // returned [`WorkerReport`]. Per-worker `stop` was flipped
+        // above; the worker observes it in worker_main's
+        // `stop.load(Relaxed)` checks (max ~100ms latency from the
+        // FUTEX_WAIT_TIMEOUT poll cadence). Three outcomes:
+        //
+        //   1. Ok(report): join returned the worker's WorkerReport.
+        //      Push as-is.
+        //   2. Err(payload): the thread panicked. Build a sentinel
+        //      report and attach
+        //      `exit_info: Some(WorkerExitInfo::Panicked(msg))`
+        //      where `msg` comes from `extract_panic_payload`.
+        //   3. Timeout (5s elapsed without is_finished): emit a
+        //      tracing::warn and push a sentinel with
+        //      `exit_info: Some(WorkerExitInfo::TimedOut)` —
+        //      `worker_main` should have observed the per-worker
+        //      `stop` within 100ms, so a 5s no-show signals a
+        //      genuinely stuck worker (deadlock, infinite spin,
+        //      blocking syscall the runtime can't interrupt).
+        //      stop_and_collect does NOT process::exit on timeout —
+        //      the orphan thread keeps running until the test
+        //      harness exits, but any subsequent worker uses a
+        //      fresh per-worker `stop` so the orphan can't pollute
+        //      later runs.
+        for mut tw in threads {
+            // Drop start_tx (idempotent — `start()` may have already
+            // taken it). If start() ran first, `start_tx` is
+            // already `None` and the take is a no-op; if the caller
+            // skipped start() entirely, dropping start_tx here
+            // signals the worker via `Disconnected` so it exits
+            // cleanly without the rendezvous send.
+            tw.start_tx.take();
+            let tid = tw.tid.load(Ordering::Acquire);
+            if let Some(j) = tw.join.take() {
+                match join_thread_with_timeout(j, THREAD_JOIN_TIMEOUT) {
+                    Some(Ok(report)) => reports.push(report),
+                    Some(Err(payload)) => {
+                        let msg = extract_panic_payload(payload);
+                        eprintln!(
+                            "ktstr: thread worker tid={tid} panicked: {msg}"
+                        );
+                        reports.push(WorkerReport {
+                            tid,
+                            completed: false,
+                            exit_info: Some(WorkerExitInfo::Panicked(msg)),
+                            ..WorkerReport::default()
+                        });
+                    }
+                    None => {
+                        tracing::warn!(
+                            tid,
+                            timeout_secs = THREAD_JOIN_TIMEOUT.as_secs(),
+                            "thread worker did not join within timeout — leaking the \
+                             thread; sentinel report attached with TimedOut exit_info"
+                        );
+                        reports.push(WorkerReport {
+                            tid,
+                            completed: false,
+                            exit_info: Some(WorkerExitInfo::TimedOut),
+                            ..WorkerReport::default()
+                        });
+                    }
+                }
+            }
+        }
+
         reports
     }
 }
@@ -3455,10 +4782,11 @@ impl Drop for WorkloadHandle {
         use nix::sys::wait::waitpid;
         use nix::unistd::{Pid, close};
 
-        // `pid` is `libc::pid_t` — stored as i32 so `Pid::from_raw`
-        // receives the kernel's native representation directly, not
-        // the sign-cast of a u32 that could alias negative values
-        // (including -1, i.e. every process in the session).
+        // Fork-mode children. `pid` is `libc::pid_t` — stored as i32
+        // so `Pid::from_raw` receives the kernel's native
+        // representation directly, not the sign-cast of a u32 that
+        // could alias negative values (including -1, i.e. every
+        // process in the session).
         for &(pid, rfd, wfd) in &self.children {
             let nix_pid = Pid::from_raw(pid);
             // killpg first: reach descendants the worker may have
@@ -3484,6 +4812,76 @@ impl Drop for WorkloadHandle {
                     && let Err(e) = close(fd)
                 {
                     tracing::warn!(fd, %e, "close failed in WorkloadHandle::drop");
+                }
+            }
+        }
+        // Pidfd-mode workers: pidfd_send_signal(SIGKILL) +
+        // poll(pidfd, POLLIN) for exit, then close fds and munmap
+        // the child stack. pidfd_send_signal(SIGKILL) is the right
+        // primitive because the child does NOT share the parent's
+        // process group (no setpgid contract here), so killpg on
+        // the parent's pgid would not reach it.
+        for w in &self.pidfd_workers {
+            if w.pidfd >= 0 {
+                unsafe {
+                    libc::syscall(
+                        libc::SYS_pidfd_send_signal,
+                        w.pidfd,
+                        libc::SIGKILL,
+                        std::ptr::null::<libc::siginfo_t>(),
+                        0u32,
+                    );
+                }
+                let mut pfd = libc::pollfd {
+                    fd: w.pidfd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                unsafe {
+                    libc::poll(&mut pfd, 1, 5_000);
+                }
+                let _ = close(w.pidfd);
+            }
+            for fd in [w.report_fd, w.start_fd] {
+                if fd >= 0 {
+                    let _ = close(fd);
+                }
+            }
+            if !w.stack_ptr.is_null() && w.stack_size > 0 {
+                unsafe { libc::munmap(w.stack_ptr, w.stack_size) };
+            }
+        }
+        // Thread-mode workers: flip stop, drop start_tx (in case
+        // worker hasn't yet recv'd), join with the same 5s budget
+        // `stop_and_collect` uses. Threads share the parent's
+        // address space — there is no `kill` equivalent and no
+        // MAP_SHARED ownership to give back. Drop still applies
+        // the timeout so a stuck worker doesn't pin
+        // `WorkloadHandle::drop` indefinitely; on timeout we log
+        // the leak via `tracing::warn!` and proceed.
+        let threads = std::mem::take(&mut self.threads);
+        for mut tw in threads {
+            tw.stop.store(true, Ordering::Relaxed);
+            tw.start_tx.take();
+            if let Some(j) = tw.join.take() {
+                let tid = tw.tid.load(Ordering::Acquire);
+                match join_thread_with_timeout(j, THREAD_JOIN_TIMEOUT) {
+                    Some(Ok(_)) => {}
+                    Some(Err(e)) => {
+                        let payload = extract_panic_payload(e);
+                        tracing::warn!(
+                            tid, payload,
+                            "thread worker panicked in WorkloadHandle::drop"
+                        );
+                    }
+                    None => {
+                        tracing::warn!(
+                            tid,
+                            timeout_secs = THREAD_JOIN_TIMEOUT.as_secs(),
+                            "thread worker failed to join within timeout in \
+                             WorkloadHandle::drop — leaking the thread"
+                        );
+                    }
                 }
             }
         }
@@ -3616,10 +5014,18 @@ fn worker_main(
     pipe_fds: Option<(i32, i32)>,
     futex: Option<(*mut u32, usize)>,
     iter_slot: *mut AtomicU64,
+    stop: &AtomicBool,
 ) -> WorkerReport {
-    // `getpid()` returns `pid_t` — keep the native type all the way
-    // through to `WorkerReport.tid`.
-    let tid: libc::pid_t = unsafe { libc::getpid() };
+    // The kernel's per-task identifier is gettid(), not getpid():
+    // - For fork-based workers, getpid() == gettid() because the
+    //   forked child becomes a thread-group leader (tgid == pid == tid).
+    // - For thread-based workers (CloneMode::Thread), every thread shares
+    //   getpid() (== parent's tgid) and gettid() is what discriminates
+    //   the per-task identity. Reporting gettid() in WorkerReport.tid
+    //   keeps the field name accurate across both dispatch paths and
+    //   matches what cgroup.threads / sched_setaffinity(tid, ...)
+    //   accept.
+    let tid: libc::pid_t = unsafe { libc::syscall(libc::SYS_gettid) as libc::pid_t };
 
     if let Some(ref cpus) = affinity {
         let _ = set_thread_affinity(tid, cpus);
@@ -3686,7 +5092,7 @@ fn worker_main(
     // Custom: delegate entirely to the user function. Affinity and
     // sched_policy are already applied above.
     if let WorkType::Custom { run, .. } = &work_type {
-        return run(&STOP);
+        return run(stop);
     }
 
     let affinity_churn_cpus: Vec<usize> = if matches!(work_type, WorkType::AffinityChurn { .. }) {
@@ -3755,9 +5161,17 @@ fn worker_main(
     // and we will emit zero deltas with a one-shot stderr warning —
     // previously we could not distinguish "unavailable" from "worker
     // has run for zero ns".
-    let schedstat_start = read_schedstat();
+    //
+    // Pass `Some(tid)` so the read targets
+    // `/proc/self/task/<tid>/schedstat` rather than
+    // `/proc/self/schedstat`. For fork-mode workers `tid == tgid` so
+    // the two paths return the same data; for thread-mode workers
+    // every sibling shares `/proc/self/schedstat` (the test
+    // runner's leader stats), and the per-task path is the only
+    // way to read a specific thread's `task->sched_info`.
+    let schedstat_start = read_schedstat(Some(tid));
 
-    while !STOP.load(Ordering::Relaxed) {
+    while !stop_requested(stop) {
         match work_type {
             WorkType::CpuSpin => {
                 spin_burst(&mut work_units, 1024);
@@ -3810,10 +5224,10 @@ fn worker_main(
             }
             WorkType::Bursty { burst_ms, sleep_ms } => {
                 let burst_end = Instant::now() + Duration::from_millis(burst_ms);
-                while Instant::now() < burst_end && !STOP.load(Ordering::Relaxed) {
+                while Instant::now() < burst_end && !stop_requested(stop) {
                     spin_burst(&mut work_units, 1024);
                 }
-                if !STOP.load(Ordering::Relaxed) {
+                if !stop_requested(stop) {
                     let before_sleep = Instant::now();
                     std::thread::sleep(Duration::from_millis(sleep_ms));
                     reservoir_push(
@@ -3837,6 +5251,7 @@ fn worker_main(
                     &mut resume_latencies_ns,
                     &mut wake_sample_count,
                     MAX_WAKE_SAMPLES,
+                    stop,
                 );
                 last_iter_time = Instant::now();
                 iterations += 1;
@@ -3865,7 +5280,7 @@ fn worker_main(
                 let before_block = Instant::now();
                 let atom = unsafe { &*(futex_ptr as *const std::sync::atomic::AtomicU32) };
                 loop {
-                    if STOP.load(Ordering::Relaxed) {
+                    if stop_requested(stop) {
                         break;
                     }
                     let cur = atom.load(Ordering::Relaxed);
@@ -3926,6 +5341,7 @@ fn worker_main(
                     &mut resume_latencies_ns,
                     &mut wake_sample_count,
                     MAX_WAKE_SAMPLES,
+                    stop,
                 );
                 // Reset last_iter_time after blocking step
                 last_iter_time = Instant::now();
@@ -3963,7 +5379,7 @@ fn worker_main(
                     let expected = atom.load(Ordering::Relaxed);
                     let before_block = Instant::now();
                     loop {
-                        if STOP.load(Ordering::Relaxed) {
+                        if stop_requested(stop) {
                             break;
                         }
                         let cur = atom.load(Ordering::Relaxed);
@@ -3987,13 +5403,13 @@ fn worker_main(
                 ref rest,
             } => {
                 for phase in std::iter::once(first).chain(rest.iter()) {
-                    if STOP.load(Ordering::Relaxed) {
+                    if stop_requested(stop) {
                         break;
                     }
                     match phase {
                         Phase::Spin(dur) => {
                             let end = Instant::now() + *dur;
-                            while Instant::now() < end && !STOP.load(Ordering::Relaxed) {
+                            while Instant::now() < end && !stop_requested(stop) {
                                 spin_burst(&mut work_units, 1024);
                             }
                         }
@@ -4010,7 +5426,7 @@ fn worker_main(
                         }
                         Phase::Yield(dur) => {
                             let end = Instant::now() + *dur;
-                            while Instant::now() < end && !STOP.load(Ordering::Relaxed) {
+                            while Instant::now() < end && !stop_requested(stop) {
                                 work_units = std::hint::black_box(work_units.wrapping_add(1));
                                 let before_yield = Instant::now();
                                 std::thread::yield_now();
@@ -4038,7 +5454,7 @@ fn worker_main(
                                     .expect("failed to create Phase::Io temp file");
                                 (f, path)
                             });
-                            while Instant::now() < end && !STOP.load(Ordering::Relaxed) {
+                            while Instant::now() < end && !stop_requested(stop) {
                                 let _ = f.set_len(0);
                                 let _ = f.seek(std::io::SeekFrom::Start(0));
                                 let buf = [0u8; 4096];
@@ -4299,7 +5715,7 @@ fn worker_main(
                     let expected = gen_atom.load(Ordering::Relaxed);
                     let expected_low = expected as u32;
                     loop {
-                        if STOP.load(Ordering::Relaxed) {
+                        if stop_requested(stop) {
                             break;
                         }
                         let cur = gen_atom.load(Ordering::Acquire);
@@ -4329,10 +5745,10 @@ fn worker_main(
                         }
                         unsafe { futex_wait(futex_ptr, expected_low, &FUTEX_WAIT_TIMEOUT) };
                     }
-                    if sleep_usec > 0 && !STOP.load(Ordering::Relaxed) {
+                    if sleep_usec > 0 && !stop_requested(stop) {
                         std::thread::sleep(Duration::from_micros(sleep_usec));
                     }
-                    if matrix_size > 0 && !STOP.load(Ordering::Relaxed) {
+                    if matrix_size > 0 && !stop_requested(stop) {
                         let buf = matrix_buf
                             .get_or_insert_with(|| vec![0u64; 3 * matrix_size * matrix_size]);
                         for _ in 0..operations {
@@ -4449,7 +5865,7 @@ fn worker_main(
                 let atom = unsafe { &*(futex_ptr as *const std::sync::atomic::AtomicU32) };
                 // CAS acquire: try to set 0 -> 1. On failure, FUTEX_WAIT.
                 loop {
-                    if STOP.load(Ordering::Relaxed) {
+                    if stop_requested(stop) {
                         break;
                     }
                     if atom
@@ -4482,15 +5898,14 @@ fn worker_main(
                 last_iter_time = Instant::now();
                 iterations += 1;
             }
-            // Stubs for the 6 new pathology-taxonomy variants from
-            // task #25. Type-system surface is wired in this batch
-            // (enum arms, factory methods, name/from_name/group_size/
-            // needs_shared_mem); per-variant worker_main bodies land
-            // in subsequent batches. Until then, each variant's
-            // outer loop spins burst-iter CPU work so a worker that
-            // gets dispatched (e.g. via from_name() round-trip
-            // tests) still produces a non-zero work_units report
-            // rather than silently looping at zero.
+            // Stubs for the 6 new pathology-taxonomy variants. The
+            // type-system surface is wired (enum arms, factory
+            // methods, name/from_name/group_size/needs_shared_mem);
+            // per-variant worker_main bodies land later. Until then,
+            // each variant's outer loop spins burst-iter CPU work so
+            // a worker that gets dispatched (e.g. via from_name()
+            // round-trip tests) still produces a non-zero work_units
+            // report rather than silently looping at zero.
             WorkType::ThunderingHerd {
                 waiters,
                 batches,
@@ -4529,7 +5944,7 @@ fn worker_main(
                 let atom = unsafe { &*(futex_ptr as *const std::sync::atomic::AtomicU32) };
                 if is_waker {
                     let mut batches_done: u64 = 0;
-                    while batches_done < batches && !STOP.load(Ordering::Relaxed) {
+                    while batches_done < batches && !stop_requested(stop) {
                         // Inter-batch sleep so waiters re-park on
                         // futex before the next thundering wake.
                         // `nanosleep` blocking ALSO contributes a
@@ -4564,7 +5979,7 @@ fn worker_main(
                     let expected = atom.load(Ordering::Relaxed);
                     let before_block = Instant::now();
                     loop {
-                        if STOP.load(Ordering::Relaxed) {
+                        if stop_requested(stop) {
                             break;
                         }
                         let cur = atom.load(Ordering::Relaxed);
@@ -4638,7 +6053,7 @@ fn worker_main(
                 let next_stage = ((pos + 1) % depth) as u32;
                 let before_block = Instant::now();
                 loop {
-                    if STOP.load(Ordering::Relaxed) {
+                    if stop_requested(stop) {
                         break;
                     }
                     let cur = atom.load(Ordering::Relaxed);
@@ -4661,7 +6076,7 @@ fn worker_main(
                     }
                     unsafe { futex_wait(futex_ptr, cur, &FUTEX_WAIT_TIMEOUT) };
                 }
-                if STOP.load(Ordering::Relaxed) {
+                if stop_requested(stop) {
                     iterations += 1;
                     continue;
                 }
@@ -4672,10 +6087,10 @@ fn worker_main(
                 // (Duration::from_millis on a per-iteration
                 // deadline).
                 let work_end = Instant::now() + work_per_hop;
-                while Instant::now() < work_end && !STOP.load(Ordering::Relaxed) {
+                while Instant::now() < work_end && !stop_requested(stop) {
                     spin_burst(&mut work_units, 256);
                 }
-                if STOP.load(Ordering::Relaxed) {
+                if stop_requested(stop) {
                     iterations += 1;
                     continue;
                 }
@@ -4733,7 +6148,7 @@ fn worker_main(
                     let expected = atom.load(Ordering::Relaxed);
                     let before_block = Instant::now();
                     loop {
-                        if STOP.load(Ordering::Relaxed) {
+                        if stop_requested(stop) {
                             break;
                         }
                         let cur = atom.load(Ordering::Relaxed);
@@ -4862,7 +6277,7 @@ fn worker_main(
                             // on release. Same idiom as
                             // MutexContention's body.
                             loop {
-                                if STOP.load(Ordering::Relaxed) {
+                                if stop_requested(stop) {
                                     break;
                                 }
                                 if atom
@@ -4972,7 +6387,7 @@ fn worker_main(
                         // zero with the gate above.
                         1_000_000_000u64 / produce_rate_hz
                     };
-                    while !STOP.load(Ordering::Relaxed) {
+                    while !stop_requested(stop) {
                         // Block on full queue: FUTEX_WAIT on
                         // prod_wake until tail advances. The inner
                         // loop either sets slot_avail and breaks
@@ -4983,7 +6398,7 @@ fn worker_main(
                         let mut slot_avail: u64 = 0;
                         let mut got_slot = false;
                         loop {
-                            if STOP.load(Ordering::Relaxed) {
+                            if stop_requested(stop) {
                                 break;
                             }
                             let head = head_atom.load(Ordering::Relaxed);
@@ -5006,7 +6421,7 @@ fn worker_main(
                                 MAX_WAKE_SAMPLES,
                             );
                         }
-                        if !got_slot || STOP.load(Ordering::Relaxed) {
+                        if !got_slot || stop_requested(stop) {
                             break;
                         }
                         // Write slot at head % q. The Release on
@@ -5040,7 +6455,7 @@ fn worker_main(
                     }
                 } else {
                     // Consumer.
-                    while !STOP.load(Ordering::Relaxed) {
+                    while !stop_requested(stop) {
                         // Block on empty queue. Same init/got
                         // pattern as the producer half so the
                         // borrow checker can prove item_idx is
@@ -5048,7 +6463,7 @@ fn worker_main(
                         let mut item_idx: u64 = 0;
                         let mut got_item = false;
                         loop {
-                            if STOP.load(Ordering::Relaxed) {
+                            if stop_requested(stop) {
                                 break;
                             }
                             let tail = tail_atom.load(Ordering::Relaxed);
@@ -5071,7 +6486,7 @@ fn worker_main(
                                 MAX_WAKE_SAMPLES,
                             );
                         }
-                        if !got_item || STOP.load(Ordering::Relaxed) {
+                        if !got_item || stop_requested(stop) {
                             break;
                         }
                         let slot_idx = (item_idx % q) as usize;
@@ -5236,7 +6651,7 @@ fn worker_main(
                     unsafe { std::ptr::write_volatile(page_ptr, 1u8) };
                     work_units = std::hint::black_box(work_units.wrapping_add(1));
                 }
-                if sweep_period_ms > 0 && !STOP.load(Ordering::Relaxed) {
+                if sweep_period_ms > 0 && !stop_requested(stop) {
                     let before_sleep = Instant::now();
                     std::thread::sleep(Duration::from_millis(sweep_period_ms));
                     reservoir_push(
@@ -5325,8 +6740,10 @@ fn worker_main(
 
     // schedstat snapshot at work-loop end; compute deltas if both
     // snapshots succeeded, else zero (the start-of-loop read already
-    // emitted a warning if schedstat is unavailable).
-    let schedstat_end = read_schedstat();
+    // emitted a warning if schedstat is unavailable). Pair the
+    // path with the start snapshot — same `tid` so the delta
+    // measures the same task.
+    let schedstat_end = read_schedstat(Some(tid));
     let (ss_delay_delta, ss_ts_delta, ss_cpu_delta) = match (schedstat_start, schedstat_end) {
         (Some((cpu_s, delay_s, ts_s)), Some((cpu_e, delay_e, ts_e))) => (
             delay_e.saturating_sub(delay_s),
@@ -5611,6 +7028,7 @@ fn pipe_exchange(
     resume_latencies_ns: &mut Vec<u64>,
     wake_sample_count: &mut u64,
     max_wake_samples: usize,
+    stop: &AtomicBool,
 ) {
     unsafe { libc::write(write_fd, b"x".as_ptr() as *const _, 1) };
     let before_block = Instant::now();
@@ -5620,7 +7038,7 @@ fn pipe_exchange(
         revents: 0,
     };
     loop {
-        if STOP.load(Ordering::Relaxed) {
+        if stop_requested(stop) {
             break;
         }
         let ret = unsafe { libc::poll(&mut pfd, 1, 100) };
@@ -5698,7 +7116,22 @@ fn reservoir_push(buf: &mut Vec<u64>, count: &mut u64, sample: u64, cap: usize) 
     }
 }
 
-/// Read /proc/self/schedstat and return (cpu_time_ns, run_delay_ns, timeslices).
+/// Read schedstat for the calling worker and return
+/// `(cpu_time_ns, run_delay_ns, timeslices)`.
+///
+/// `tid` selects which `/proc` path is read:
+/// - `None` → `/proc/self/schedstat`. `/proc/self` resolves to
+///   `/proc/<TGID>` (the thread-group leader's task_struct), which
+///   is correct for [`CloneMode::Fork`] workers because each fork
+///   worker IS its own thread-group leader (`gettid() == getpid()`).
+/// - `Some(tid)` → `/proc/self/task/<tid>/schedstat`. Required for
+///   [`CloneMode::Thread`] workers: every thread in the parent
+///   tgid sees the same `/proc/self/schedstat` (the parent's
+///   leader stats), so reading it from a thread worker reports
+///   the test runner's stats, not the worker's. The
+///   `/proc/self/task/<tid>` path returns the per-task
+///   schedstat stored on `task->sched_info`. Available on Linux
+///   2.6+; ktstr's 6.16 kernel floor guarantees it.
 ///
 /// Returns `None` when the file cannot be opened (kernel built
 /// without `CONFIG_SCHEDSTATS`, or `/proc` unavailable) or when any
@@ -5717,8 +7150,12 @@ fn reservoir_push(buf: &mut Vec<u64>, count: &mut u64, sample: u64, cap: usize) 
 /// but fails `u64::parse` indicates a kernel-ABI drift that should
 /// not occur on any production kernel and warrants investigation by
 /// the maintainer rather than per-run log noise.
-fn read_schedstat() -> Option<(u64, u64, u64)> {
-    let data = match std::fs::read_to_string("/proc/self/schedstat") {
+fn read_schedstat(tid: Option<libc::pid_t>) -> Option<(u64, u64, u64)> {
+    let path: std::borrow::Cow<'static, str> = match tid {
+        None => std::borrow::Cow::Borrowed("/proc/self/schedstat"),
+        Some(t) => std::borrow::Cow::Owned(format!("/proc/self/task/{t}/schedstat")),
+    };
+    let data = match std::fs::read_to_string(&*path) {
         Ok(d) => d,
         Err(_) => {
             warn_schedstat_unavailable_once();
@@ -6273,6 +7710,140 @@ mod tests {
         }
     }
 
+    /// `extract_panic_payload` round-trips both canonical panic
+    /// payload shapes (`&'static str` from `panic!("literal")` and
+    /// `String` from `panic!("{x}")`) and falls back to the named
+    /// sentinel for everything else.
+    #[test]
+    fn extract_panic_payload_handles_all_canonical_shapes() {
+        let str_panic: Box<dyn std::any::Any + Send> = Box::new("literal panic");
+        assert_eq!(extract_panic_payload(str_panic), "literal panic");
+
+        let string_panic: Box<dyn std::any::Any + Send> =
+            Box::new(String::from("formatted panic"));
+        assert_eq!(extract_panic_payload(string_panic), "formatted panic");
+
+        // Anything else — e.g. a custom panic payload type — folds
+        // to the sentinel without crashing the extractor.
+        #[derive(Clone)]
+        struct CustomPayload(u32);
+        let custom: Box<dyn std::any::Any + Send> = Box::new(CustomPayload(42));
+        assert_eq!(extract_panic_payload(custom), "<non-string panic payload>");
+    }
+
+    /// `join_thread_with_timeout` returns the join result when the
+    /// thread completes within the deadline.
+    #[test]
+    fn join_thread_with_timeout_returns_result_on_quick_completion() {
+        let join = std::thread::spawn(|| WorkerReport {
+            tid: 7,
+            ..WorkerReport::default()
+        });
+        let r = join_thread_with_timeout(join, Duration::from_secs(2));
+        match r {
+            Some(Ok(report)) => assert_eq!(report.tid, 7),
+            Some(Err(_)) => panic!("clean thread must not produce join Err"),
+            None => panic!("clean thread must not time out within 2s"),
+        }
+    }
+
+    /// `join_thread_with_timeout` returns `None` when the thread is
+    /// still running past the deadline. The thread itself leaks for
+    /// the rest of the test process — acceptable in a `#[test]`
+    /// because the test harness terminates after the thread's
+    /// upper-bound sleep.
+    #[test]
+    fn join_thread_with_timeout_returns_none_on_timeout() {
+        let join = std::thread::spawn(|| {
+            // Sleep WELL past the 100ms timeout so the polling
+            // helper definitely observes is_finished()==false.
+            std::thread::sleep(Duration::from_millis(800));
+            WorkerReport::default()
+        });
+        let r = join_thread_with_timeout(join, Duration::from_millis(100));
+        assert!(r.is_none(), "100ms timeout vs 800ms thread must time out");
+    }
+
+    /// Defense-in-depth: `ThreadWorker::drop` MUST join its
+    /// `JoinHandle`. Rust's std `JoinHandle::drop` detaches by
+    /// default — the bug class this test exists to catch is a
+    /// future refactor that lets a `ThreadWorker` fall out of
+    /// scope without going through the `WorkloadHandle::drop`
+    /// / `stop_and_collect` / `SpawnGuard::drop` paths that
+    /// already explicitly take + join.
+    ///
+    /// The test constructs a `ThreadWorker` whose worker writes a
+    /// shared flag and waits on a stop signal, drops the
+    /// `ThreadWorker` directly (NOT via any of the explicit Drop
+    /// paths), and verifies the worker observed `stop=true` and
+    /// completed before the drop returned. If `ThreadWorker::drop`
+    /// detached, the worker would still be running when the test
+    /// returns — the spin-loop on the shared flag confirms a
+    /// successful join.
+    #[test]
+    fn thread_worker_drop_joins_handle() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+        use std::sync::mpsc;
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let observed = Arc::new(AtomicBool::new(false));
+        let stop_thread = Arc::clone(&stop);
+        let observed_thread = Arc::clone(&observed);
+        let (start_tx, start_rx) = mpsc::sync_channel::<()>(0);
+        let tid = Arc::new(AtomicI32::new(0));
+        let tid_thread = Arc::clone(&tid);
+
+        let join = std::thread::spawn(move || {
+            tid_thread.store(
+                unsafe { libc::syscall(libc::SYS_gettid) as libc::pid_t },
+                Ordering::Relaxed,
+            );
+            // Block on start so the worker is guaranteed to be
+            // running (not just dispatched) by the time we drop.
+            let _ = start_rx.recv();
+            // Spin on stop with the same 100ms poll cadence the
+            // production worker uses.
+            while !stop_thread.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            observed_thread.store(true, Ordering::Relaxed);
+            WorkerReport::default()
+        });
+
+        let tw = ThreadWorker {
+            tid,
+            stop,
+            start_tx: Some(start_tx),
+            join: Some(join),
+        };
+        // Send the start signal so the worker proceeds to its
+        // stop-check loop. (The Drop will also drop start_tx but
+        // that comes after recv() has consumed our send.)
+        if let Some(ref tx) = tw.start_tx {
+            let _ = tx.send(());
+        }
+        // Tiny sleep so the worker definitely observes the start
+        // and enters the spin loop before Drop runs.
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Drop the ThreadWorker directly — this is the path under
+        // test. ThreadWorker::drop must flip stop and join.
+        drop(tw);
+
+        // Assertion: by the time drop returns, the worker has
+        // observed stop and completed. If drop detached, observed
+        // would still be false because the worker would either
+        // still be sleeping or already gone without a join.
+        assert!(
+            observed.load(Ordering::Relaxed),
+            "ThreadWorker::drop must join its JoinHandle — observed=false \
+             means the drop returned without waiting for the worker, which \
+             would mean the worker was detached (Rust's default for \
+             JoinHandle::drop) instead of explicitly joined"
+        );
+    }
+
     #[test]
     fn work_type_name_roundtrip() {
         for &name in WorkType::ALL_NAMES {
@@ -6395,10 +7966,10 @@ mod tests {
 
     #[test]
     fn work_type_all_names_count() {
-        // 20 historical variants + 7 added in #25 (ThunderingHerd,
-        // PriorityInversion, ProducerConsumerImbalance,
-        // RtStarvation, AsymmetricWaker, WakeChain,
-        // NumaWorkingSetSweep) = 27.
+        // 20 historical variants + 7 pathology-taxonomy variants
+        // (ThunderingHerd, PriorityInversion,
+        // ProducerConsumerImbalance, RtStarvation, AsymmetricWaker,
+        // WakeChain, NumaWorkingSetSweep) = 27.
         assert_eq!(WorkType::ALL_NAMES.len(), 27);
     }
 
@@ -8182,7 +9753,7 @@ mod tests {
         // `None` is a legitimate outcome when the host kernel is
         // built without `CONFIG_SCHEDSTATS` — treat that as a skip
         // rather than a test failure.
-        let Some((cpu_time, _run_delay, timeslices)) = read_schedstat() else {
+        let Some((cpu_time, _run_delay, timeslices)) = read_schedstat(None) else {
             eprintln!("skipping: /proc/self/schedstat not available (CONFIG_SCHEDSTATS off)");
             return;
         };
@@ -8717,7 +10288,7 @@ mod tests {
         let tid: libc::pid_t = unsafe { libc::getpid() };
         let start = Instant::now();
         let mut work_units = 0u64;
-        while !stop.load(Ordering::Relaxed) {
+        while !stop_requested(stop) {
             work_units = std::hint::black_box(work_units.wrapping_add(1));
             std::hint::spin_loop();
         }
@@ -8816,7 +10387,7 @@ mod tests {
     /// strictly better under CI contention.
     fn wait_for_deadline(stop: &AtomicBool, timeout: Duration) {
         let deadline = Instant::now() + timeout;
-        while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
+        while !stop_requested(stop) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
     }
@@ -10202,10 +11773,12 @@ mod tests {
         assert_eq!(CloneFlags::NEWIPC.bits(), libc::CLONE_NEWIPC as u64);
         assert_eq!(CloneFlags::NEWUTS.bits(), libc::CLONE_NEWUTS as u64);
         assert_eq!(CloneFlags::NEWCGROUP.bits(), libc::CLONE_NEWCGROUP as u64);
-        // CLONE_IO has bit 31 set — `as u64` would sign-extend if
-        // the libc constant were i32 with bit 31. Verify the cast
-        // produces the expected pattern (no sign extension).
-        assert_eq!(CloneFlags::IO.bits(), libc::CLONE_IO as u64);
+        // CLONE_IO has bit 31 set and `libc::CLONE_IO` is a c_int
+        // (i32) with the sign bit set, so a plain `as u64` cast
+        // sign-extends to 0xffffffff80000000. Round-trip through u32
+        // first to truncate the sign extension and recover the
+        // 32-bit kernel ABI value.
+        assert_eq!(CloneFlags::IO.bits(), libc::CLONE_IO as u32 as u64);
         assert_eq!(CloneFlags::SYSVSEM.bits(), libc::CLONE_SYSVSEM as u64);
     }
 
@@ -10421,41 +11994,214 @@ mod tests {
 
     #[test]
     fn validate_clone_flags_shared_vm_only_accepted() {
-        // SharedVm dispatch (#19c) will use CLONE_VM only — pin
-        // that this passes the validator now, before dispatch
-        // lands.
+        // SharedVm dispatch will use CLONE_VM only — pin that this
+        // passes the validator now, before dispatch lands.
         validate_clone_flags(CloneFlags::VM)
             .expect("CLONE_VM alone must be accepted (SharedVm uses this)");
     }
 
-    // -- spawn dispatch staging tests --
-    //
-    // Until #19b/#19c land, spawn() must reject Thread/SharedVm/Raw
-    // with an actionable diagnostic — silent fall-through to the
-    // fork path would silently mis-implement the user's intent.
+    // -- spawn dispatch tests (Fork / Thread / SharedVm / Raw) ----
 
+    /// Thread mode: the worker runs in-process via std::thread, the
+    /// JoinHandle returns a real WorkerReport, and worker_pids()
+    /// reports a non-zero gettid() after start.
     #[test]
-    fn spawn_thread_clone_mode_bails() {
+    fn spawn_thread_clone_mode_runs_to_completion() {
+        let config = WorkloadConfig {
+            num_workers: 2,
+            clone_mode: CloneMode::Thread,
+            work_type: WorkType::CpuSpin,
+            ..Default::default()
+        };
+        let mut h = WorkloadHandle::spawn(&config).expect("Thread mode must spawn");
+        h.start();
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let pids = h.worker_pids();
+        assert_eq!(pids.len(), 2, "worker_pids must reflect both threads");
+        for tid in &pids {
+            assert!(*tid > 0, "thread tid must be a real gettid() value: {tid}");
+        }
+        // Sibling threads in the same tgid must report distinct
+        // gettid()s — duplicates would mean the publish step is
+        // broken or only one thread actually ran.
+        assert_ne!(pids[0], pids[1], "sibling thread tids must differ");
+        let reports = h.stop_and_collect();
+        assert_eq!(reports.len(), 2, "thread mode collects one report per worker");
+        for r in &reports {
+            assert!(r.completed, "thread worker must complete: {:?}", r);
+            assert!(r.work_units > 0, "thread worker must do work: {}", r.work_units);
+        }
+    }
+
+    /// `CloneMode::Thread + WorkType::ForkExit` MUST bail at spawn
+    /// time. Pin the diagnostic message names both the variant and
+    /// the structural reason (forked child's `_exit` tears down the
+    /// whole tgid via `do_exit`).
+    #[test]
+    fn spawn_thread_with_forkexit_rejected_at_spawn_time() {
         let config = WorkloadConfig {
             num_workers: 1,
             clone_mode: CloneMode::Thread,
+            work_type: WorkType::ForkExit,
             ..Default::default()
         };
-        // `expect_err` requires `T: Debug` on the Ok variant, but
-        // `WorkloadHandle` doesn't impl Debug (process resources
-        // are not safely Debug-able). Match the Result explicitly.
         let result = WorkloadHandle::spawn(&config);
         let err = match result {
-            Ok(_) => panic!("Thread mode must bail until #19b"),
+            Ok(_) => panic!("Thread + ForkExit must bail at spawn"),
             Err(e) => e,
         };
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("Thread") && msg.contains("#19b"),
-            "error must name Thread variant + #19b reference: {msg}"
+            msg.contains("CloneMode::Thread")
+                && msg.contains("WorkType::ForkExit")
+                && msg.contains("CloneMode::Fork"),
+            "diagnostic must name both incompatible variants and the safe \
+             alternative: {msg}"
         );
     }
 
+    /// `CloneMode::Fork + WorkType::ForkExit` is the well-tested
+    /// pair (existing test
+    /// `stop_and_collect_reaps_grandchild_from_panicking_custom_closure`
+    /// pins the fork mode's panic shape). This regression guard
+    /// proves the new D5 incompatibility check does NOT also reject
+    /// the legitimate Fork+ForkExit combination.
+    #[test]
+    fn spawn_fork_with_forkexit_succeeds() {
+        let config = WorkloadConfig {
+            num_workers: 1,
+            clone_mode: CloneMode::Fork,
+            work_type: WorkType::ForkExit,
+            ..Default::default()
+        };
+        let mut h = WorkloadHandle::spawn(&config)
+            .expect("Fork + ForkExit must remain valid");
+        h.start();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let _ = h.stop_and_collect();
+    }
+
+    /// Thread-mode worker that panics on first iteration must
+    /// surface a [`WorkerExitInfo::Panicked`] sentinel with the
+    /// panic message extracted from the join Err payload. Uses a
+    /// `WorkType::Custom` closure so the panic path is reproducible
+    /// without depending on a buggy work-type implementation.
+    #[test]
+    fn spawn_thread_panic_yields_panicked_exit_info() {
+        // Custom closure that panics immediately. Returns
+        // `WorkerReport` to satisfy the signature; the panic fires
+        // before `return` is reached.
+        fn panic_immediately(_stop: &AtomicBool) -> WorkerReport {
+            panic!("test panic from thread worker");
+        }
+        let config = WorkloadConfig {
+            num_workers: 1,
+            clone_mode: CloneMode::Thread,
+            work_type: WorkType::custom("panic_immediately", panic_immediately),
+            ..Default::default()
+        };
+        let mut h = WorkloadHandle::spawn(&config).expect("Thread spawn must succeed");
+        h.start();
+        // Tight: the panic fires synchronously after the start
+        // rendezvous; no sleep needed beyond the start handshake.
+        let reports = h.stop_and_collect();
+        assert_eq!(reports.len(), 1);
+        let r = &reports[0];
+        assert!(!r.completed, "panicked worker must NOT report completed=true");
+        match &r.exit_info {
+            Some(WorkerExitInfo::Panicked(msg)) => {
+                assert!(
+                    msg.contains("test panic from thread worker"),
+                    "panic message must round-trip from panic!() to exit_info: {msg}"
+                );
+            }
+            other => panic!(
+                "expected Panicked(_) exit_info on thread panic, got {other:?}",
+            ),
+        }
+    }
+
+    /// Thread-mode `Custom` closure that loops on its `stop` arg
+    /// MUST terminate via `stop_and_collect` flipping the per-worker
+    /// flag, AND `stop_and_collect` MUST NOT touch the global
+    /// [`STOP`] (that signal-flag belongs exclusively to Fork mode;
+    /// flipping it from Thread mode would inadvertently reach any
+    /// concurrently-running fork-mode workers and any fork-child of
+    /// the test harness itself). The test snapshots the global
+    /// [`STOP`] before/after `stop_and_collect` and asserts no
+    /// change.
+    #[test]
+    fn spawn_thread_custom_stop_does_not_touch_global_stop() {
+        // Custom closure that spins on the per-worker stop arg.
+        // Returns a non-default WorkerReport with completed=true so
+        // the test can pin "the stop loop saw stop=true and exited
+        // cleanly" instead of "the worker crashed before reading
+        // its arg."
+        fn spin_until_stop(stop: &AtomicBool) -> WorkerReport {
+            let tid: libc::pid_t =
+                unsafe { libc::syscall(libc::SYS_gettid) as libc::pid_t };
+            while !stop_requested(stop) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            WorkerReport {
+                tid,
+                completed: true,
+                ..WorkerReport::default()
+            }
+        }
+
+        // Snapshot the global STOP before spawning. This MUST be
+        // false (no concurrent workload running in the test
+        // harness) and remain false across the whole call sequence.
+        STOP.store(false, Ordering::Relaxed);
+        let stop_before = STOP.load(Ordering::Relaxed);
+        assert!(
+            !stop_before,
+            "global STOP must be false before the test runs — \
+             a stale true from a prior test would mask the assertion"
+        );
+
+        let config = WorkloadConfig {
+            num_workers: 1,
+            clone_mode: CloneMode::Thread,
+            work_type: WorkType::custom("spin_until_stop", spin_until_stop),
+            ..Default::default()
+        };
+        let mut h = WorkloadHandle::spawn(&config).expect("Thread spawn must succeed");
+        h.start();
+        // Brief sleep so the worker definitely enters its spin loop
+        // before we ask stop_and_collect to flip its flag.
+        std::thread::sleep(Duration::from_millis(50));
+
+        let reports = h.stop_and_collect();
+        // Worker observed its per-worker stop and returned a clean
+        // report — proves the stop signal reached the closure.
+        assert_eq!(reports.len(), 1);
+        assert!(
+            reports[0].completed,
+            "Custom thread worker must observe per-worker stop and \
+             return completed=true: got {:?}",
+            reports[0]
+        );
+
+        // Critical assertion: stop_and_collect MUST NOT have flipped
+        // the global STOP. Thread-mode stop is per-worker
+        // Arc<AtomicBool>; the global STOP is reserved for the
+        // SIGUSR1-driven Fork-mode path. Touching it from Thread
+        // mode would leak shutdown signals into unrelated workers.
+        let stop_after = STOP.load(Ordering::Relaxed);
+        assert!(
+            !stop_after,
+            "global STOP must remain false after Thread-mode \
+             stop_and_collect — Thread mode flips per-worker flags \
+             only, never the global signal-handler flag"
+        );
+    }
+
+    /// SharedVm mode: clone3 dispatch is staged behind a Rust
+    /// runtime redesign (clone3(CLONE_VM) children lack per-task
+    /// thread-info, so worker_main aborts). Pin the bail-out
+    /// message until the redesign lands.
     #[test]
     fn spawn_shared_vm_clone_mode_bails() {
         let config = WorkloadConfig {
@@ -10465,21 +12211,25 @@ mod tests {
         };
         let result = WorkloadHandle::spawn(&config);
         let err = match result {
-            Ok(_) => panic!("SharedVm mode must bail until #19c"),
+            Ok(_) => panic!("SharedVm must bail — clone3 child has no Rust TLS"),
             Err(e) => e,
         };
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("SharedVm") && msg.contains("#19c"),
-            "error must name SharedVm variant + #19c reference: {msg}"
+            msg.contains("SharedVm")
+                && msg.contains("Rust TLS")
+                && msg.contains("CloneMode::Thread"),
+            "error must name SharedVm + Rust TLS constraint + Thread alternative: {msg}"
         );
     }
 
+    /// Raw with valid flags: validator passes (flag set is
+    /// well-formed) but dispatch still bails on the same Rust TLS
+    /// constraint as SharedVm. The "Flag set is structurally valid"
+    /// substring proves the validator ran before the dispatch
+    /// rejection.
     #[test]
     fn spawn_raw_clone_mode_validates_then_bails() {
-        // Valid flags should validate then bail with the
-        // dispatch-staged message — proving the validator is
-        // wired but dispatch is intentionally absent.
         let config = WorkloadConfig {
             num_workers: 1,
             clone_mode: CloneMode::Raw(CloneFlags::VM),
@@ -10487,13 +12237,13 @@ mod tests {
         };
         let result = WorkloadHandle::spawn(&config);
         let err = match result {
-            Ok(_) => panic!("Raw must bail until #19c"),
+            Ok(_) => panic!("Raw must bail — clone3 child has no Rust TLS"),
             Err(e) => e,
         };
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("Raw") && msg.contains("#19c"),
-            "error must name Raw + #19c: {msg}"
+            msg.contains("Rust TLS") && msg.contains("CloneMode::Thread"),
+            "error must name Rust TLS constraint + Thread alternative: {msg}"
         );
         assert!(
             msg.contains("structurally valid"),
@@ -10501,11 +12251,12 @@ mod tests {
         );
     }
 
+    /// Invalid flags must hit the validator BEFORE the dispatch
+    /// rejection. The error must name the kernel rule (e.g.
+    /// "CLONE_THREAD requires CLONE_SIGHAND"), NOT the Rust-TLS
+    /// dispatch message — the validator runs first.
     #[test]
     fn spawn_raw_clone_mode_invalid_flags_rejected_before_dispatch() {
-        // Invalid flags must hit the validator FIRST, before the
-        // dispatch-staged bail. The error must name the kernel
-        // rule, not the staging message.
         let config = WorkloadConfig {
             num_workers: 1,
             clone_mode: CloneMode::Raw(CloneFlags::from_bits_for_test(
@@ -10515,17 +12266,21 @@ mod tests {
         };
         let result = WorkloadHandle::spawn(&config);
         let err = match result {
-            Ok(_) => panic!("Raw with invalid flags must bail"),
+            Ok(_) => panic!("Raw with invalid flags must bail at validator"),
             Err(e) => e,
         };
         let msg = format!("{err:#}");
         assert!(
             msg.contains("CLONE_THREAD") && msg.contains("CLONE_SIGHAND"),
-            "error must surface the validator's rule, not the staging message: {msg}"
+            "error must surface the validator's rule, not the dispatch message: {msg}"
         );
         assert!(
             !msg.contains("structurally valid"),
-            "validator failure must NOT mention staged dispatch: {msg}"
+            "validator failure must NOT mention dispatch: {msg}"
+        );
+        assert!(
+            !msg.contains("Rust TLS"),
+            "validator failure must NOT mention the dispatch's Rust TLS reason: {msg}"
         );
     }
 
@@ -10927,7 +12682,7 @@ mod tests {
         assert!(has_latencies, "contenders should record wake latencies");
     }
 
-    // -- CloneFlags + validate_clone_flags coverage (#19a / #119) ---------
+    // -- CloneFlags + validate_clone_flags coverage ----------------------
     //
     // The flag validator is the structural-rejection layer that sits in
     // front of the clone3 syscall — callers see a named-rule diagnostic
@@ -10938,7 +12693,7 @@ mod tests {
     // mis-orders the bail-outs.  These tests exercise the validator
     // through the `Verdict` API so the rule-name diagnostics are
     // claim-labeled and survive the migration off the legacy Expect
-    // shape (#6 / #97).
+    // shape.
 
     /// CloneFlags::NONE passes the validator — the all-zero flag set
     /// is the no-op default for [`CloneMode::Raw`].

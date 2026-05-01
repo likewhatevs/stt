@@ -106,7 +106,12 @@ mod tests {
         crate::claim!(v, path_str).eq(NAME.to_string());
         crate::claim!(v, mode).eq(MODE);
         crate::claim!(v, size).eq(payload.len() as u64);
-        crate::claim!(v, got).eq(payload.to_vec());
+        // ClaimBuilder requires T: Display; Vec<u8> doesn't impl
+        // Display. Compare via hex strings (already a dep) so the
+        // verdict carries a readable diff on mismatch.
+        let got_hex = hex::encode(&got);
+        let want_hex = hex::encode(payload);
+        crate::claim!(v, got_hex).eq(want_hex);
         let r = v.into_result();
         assert!(
             r.passed,

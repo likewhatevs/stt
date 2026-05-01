@@ -1510,12 +1510,13 @@ mod tests {
     /// round-trip self-contained.
     #[test]
     fn higher_is_worse_polarity_round_trip() {
-        use crate::stats::MetricDef;
+        use crate::stats::{MetricDef, MetricKind};
 
         // true (higher-is-worse) → LowerBetter → true.
         let m = MetricDef {
             name: "t",
             polarity: Polarity::from_higher_is_worse(true),
+            kind: MetricKind::Counter,
             default_abs: 0.0,
             default_rel: 0.0,
             display_unit: "",
@@ -1528,6 +1529,7 @@ mod tests {
         let m = MetricDef {
             name: "f",
             polarity: Polarity::from_higher_is_worse(false),
+            kind: MetricKind::Counter,
             default_abs: 0.0,
             default_rel: 0.0,
             display_unit: "",
@@ -1548,11 +1550,12 @@ mod tests {
     /// target metrics.
     #[test]
     fn higher_is_worse_covers_all_polarity_variants() {
-        use crate::stats::MetricDef;
+        use crate::stats::{MetricDef, MetricKind};
         fn make(p: Polarity) -> MetricDef {
             MetricDef {
                 name: "x",
                 polarity: p,
+                kind: MetricKind::Counter,
                 default_abs: 0.0,
                 default_rel: 0.0,
                 display_unit: "",

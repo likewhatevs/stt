@@ -63,8 +63,8 @@ use anyhow::{Context, Result, anyhow};
 /// [`super::bpf_syscall::BpfSyscallAccessor`] for the duration of
 /// the dump.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // wired from #11 (debug capture mode); the freeze-VM
-                    // pipeline doesn't use this struct.
+#[allow(dead_code)] // wired from the debug capture binary; the
+                    // freeze-VM pipeline doesn't use this struct.
 pub struct LiveHostKernelEnv {
     /// Output of `uname -r` — the running kernel's release string
     /// (e.g. "6.16.0-1234-generic"). Used to interpolate paths

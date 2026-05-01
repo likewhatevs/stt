@@ -140,7 +140,7 @@ pub struct ProbeDiagnostics {
     /// Cumulative count of `tp_btf/sched_switch +
     /// sched_migrate_task + sched_wakeup` records committed into
     /// the dedicated `timeline_events` ringbuf by the timeline
-    /// handlers (#27). Read from BSS `ktstr_timeline_count`. Zero
+    /// handlers. Read from BSS `ktstr_timeline_count`. Zero
     /// before any of those tracepoints fire; otherwise grows
     /// continuously while the probe runs. Combined with
     /// `bpf_timeline_drops` it lets an operator tell whether a

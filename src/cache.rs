@@ -209,6 +209,16 @@ pub struct KernelMetadata {
     pub built_at: String,
     /// CRC32 of ktstr.kconfig at build time.
     pub ktstr_kconfig_hash: Option<String>,
+    /// CRC32 of the user-supplied `--extra-kconfig` fragment (raw
+    /// bytes) at build time. `None` for builds without
+    /// `--extra-kconfig` — `Some(hash)` makes `kernel list` self-
+    /// describing for entries that carry user extras and lets the
+    /// cache key suffix (`{baked}-xkc{extra}`) round-trip into the
+    /// stored metadata. Distinct from
+    /// [`KernelMetadata::ktstr_kconfig_hash`] so the bare baked-in
+    /// hash stays in lock-step with `kconfig_hash()` and only the
+    /// extras live in this slot.
+    pub extra_kconfig_hash: Option<String>,
     /// Whether a vmlinux ELF was cached alongside the image. When
     /// true, the entry directory contains a `vmlinux` file; see
     /// [`strip_vmlinux_debug`] for the strip policy and
@@ -306,6 +316,7 @@ impl KernelMetadata {
             config_hash: None,
             built_at,
             ktstr_kconfig_hash: None,
+            extra_kconfig_hash: None,
             has_vmlinux: false,
             vmlinux_stripped: false,
             source_vmlinux_size: None,
@@ -342,6 +353,15 @@ impl KernelMetadata {
     /// Set the ktstr.kconfig CRC32 hash.
     pub fn with_ktstr_kconfig_hash(mut self, hash: Option<String>) -> Self {
         self.ktstr_kconfig_hash = hash;
+        self
+    }
+
+    /// Set the `--extra-kconfig` fragment CRC32 hash. `None` for
+    /// builds without `--extra-kconfig`; `Some(hash)` for builds
+    /// that supplied a user fragment, where the hash matches the
+    /// `xkc{...}` segment of the cache key suffix.
+    pub fn with_extra_kconfig_hash(mut self, hash: Option<String>) -> Self {
+        self.extra_kconfig_hash = hash;
         self
     }
 
@@ -531,6 +551,18 @@ impl CacheEntry {
                 current: current_hash.to_string(),
             },
         }
+    }
+
+    /// Whether this cache entry was built with a user
+    /// `--extra-kconfig` fragment merged on top of the baked-in
+    /// `ktstr.kconfig`. Orthogonal to [`kconfig_status`]: the
+    /// baked-in hash can match / be stale / be untracked
+    /// independently of whether the entry carries user extras.
+    /// Drives the `(extra kconfig)` tag in `kernel list` output so
+    /// an operator can distinguish cache hits that include user
+    /// modifications from pure baked-in builds.
+    pub fn has_extra_kconfig(&self) -> bool {
+        self.metadata.extra_kconfig_hash.is_some()
     }
 }
 
@@ -2439,6 +2471,7 @@ mod tests {
             config_hash: Some("abc123".to_string()),
             built_at: "2026-04-12T10:00:00Z".to_string(),
             ktstr_kconfig_hash: Some("def456".to_string()),
+            extra_kconfig_hash: None,
             has_vmlinux: false,
             vmlinux_stripped: false,
             source_vmlinux_size: None,
@@ -2606,6 +2639,7 @@ mod tests {
             config_hash: None,
             built_at: "2026-04-12T12:00:00Z".to_string(),
             ktstr_kconfig_hash: None,
+            extra_kconfig_hash: None,
             has_vmlinux: false,
             vmlinux_stripped: false,
             source_vmlinux_size: None,
@@ -2636,6 +2670,7 @@ mod tests {
             config_hash: Some("fff000".to_string()),
             built_at: "2026-04-12T14:00:00Z".to_string(),
             ktstr_kconfig_hash: Some("aaa111".to_string()),
+            extra_kconfig_hash: None,
             has_vmlinux: true,
             vmlinux_stripped: true,
             source_vmlinux_size: None,
@@ -5171,6 +5206,7 @@ mod tests {
             config_hash: None,
             built_at: "2026-04-18T10:00:00Z".to_string(),
             ktstr_kconfig_hash: None,
+            extra_kconfig_hash: None,
             has_vmlinux: true,
             vmlinux_stripped: true,
             source_vmlinux_size: Some(stat.len()),
@@ -5211,6 +5247,7 @@ mod tests {
             config_hash: None,
             built_at: "2026-04-18T10:00:00Z".to_string(),
             ktstr_kconfig_hash: None,
+            extra_kconfig_hash: None,
             has_vmlinux: false,
             vmlinux_stripped: false,
             source_vmlinux_size: Some(42),
@@ -5242,6 +5279,7 @@ mod tests {
             config_hash: None,
             built_at: "2026-04-18T10:00:00Z".to_string(),
             ktstr_kconfig_hash: None,
+            extra_kconfig_hash: None,
             has_vmlinux: true,
             vmlinux_stripped: true,
             source_vmlinux_size: None,
@@ -5343,6 +5381,7 @@ mod tests {
             config_hash: None,
             built_at: "2026-04-18T10:00:00Z".to_string(),
             ktstr_kconfig_hash: None,
+            extra_kconfig_hash: None,
             has_vmlinux: true,
             vmlinux_stripped: true,
             source_vmlinux_size: Some(42),
@@ -5395,6 +5434,7 @@ mod tests {
             config_hash: None,
             built_at: "2026-04-18T10:00:00Z".to_string(),
             ktstr_kconfig_hash: None,
+            extra_kconfig_hash: None,
             has_vmlinux: true,
             vmlinux_stripped: true,
             source_vmlinux_size: Some(stat.len()),
@@ -5447,6 +5487,7 @@ mod tests {
             config_hash: None,
             built_at: "2026-04-18T10:00:00Z".to_string(),
             ktstr_kconfig_hash: None,
+            extra_kconfig_hash: None,
             has_vmlinux: true,
             vmlinux_stripped: true,
             source_vmlinux_size: Some(stat.len() + 1),
@@ -5497,6 +5538,7 @@ mod tests {
             config_hash: None,
             built_at: "2026-04-18T10:00:00Z".to_string(),
             ktstr_kconfig_hash: None,
+            extra_kconfig_hash: None,
             has_vmlinux: true,
             vmlinux_stripped: true,
             source_vmlinux_size: Some(stat.len()),
@@ -5554,6 +5596,7 @@ mod tests {
             config_hash: None,
             built_at: "2026-04-18T10:00:00Z".to_string(),
             ktstr_kconfig_hash: None,
+            extra_kconfig_hash: None,
             has_vmlinux: false,
             vmlinux_stripped: false,
             source_vmlinux_size: None,
@@ -5600,6 +5643,7 @@ mod tests {
             config_hash: None,
             built_at: "2026-04-18T10:00:00Z".to_string(),
             ktstr_kconfig_hash: None,
+            extra_kconfig_hash: None,
             has_vmlinux: true,
             vmlinux_stripped: true,
             source_vmlinux_size: None,
@@ -5635,6 +5679,7 @@ mod tests {
             config_hash: None,
             built_at: "2026-04-18T10:00:00Z".to_string(),
             ktstr_kconfig_hash: None,
+            extra_kconfig_hash: None,
             has_vmlinux: true,
             vmlinux_stripped: true,
             source_vmlinux_size: None,

@@ -341,7 +341,7 @@ mod tests {
         assert!((s.ipc() - 0.5).abs() < 1e-9);
     }
 
-    // -- Verdict API integration coverage (#97) -------------------------
+    // -- Verdict API integration coverage -------------------------------
     //
     // The three IPC-band classifications named in the module-level doc
     // (≈0 = halted, ≈0.5 = spinning, ≥1 = productive) become Verdict

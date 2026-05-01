@@ -1283,10 +1283,10 @@ mod tests {
 
     #[test]
     fn display_truncated_with_struct_partial_shows_decoded_members() {
-        // The whole point of #48: decoded members survive when the
-        // struct's byte slice was short. Display surfaces the partial
-        // so test failure output points the operator at the fields
-        // that DID decode.
+        // The partial-render contract: decoded members survive when
+        // the struct's byte slice was short. Display surfaces the
+        // partial so test failure output points the operator at the
+        // fields that DID decode.
         let partial = RenderedValue::Struct {
             type_name: Some("partial_struct".into()),
             members: vec![
@@ -1318,7 +1318,7 @@ mod tests {
         assert!(out.contains("b: <truncated needed=4 had=0>"));
     }
 
-    // ---- #48: partial-render contract --------------------------------
+    // ---- partial-render contract -------------------------------------
     //
     // Truncated must carry a `partial: Box<RenderedValue>` rather than
     // discarding decoded members. Two fixtures:
@@ -1452,15 +1452,14 @@ mod tests {
         }
     }
 
-    // ---- Datasec rendering (#67) ------------------------------------
+    // ---- Datasec rendering ------------------------------------------
     //
-    // The fix for #67 is the renderer recognising
-    // `BTF_KIND_DATASEC` (the value type libbpf assigns to a
-    // global-section ARRAY map like `.bss`) and walking its
-    // `VarSecinfo` entries to render each variable. Before the fix
-    // the renderer returned `Unsupported`, so a failure dump's `.bss`
-    // map showed an opaque hex dump instead of `stall=1, crash=0,
-    // ...`.
+    // The renderer recognises `BTF_KIND_DATASEC` (the value type
+    // libbpf assigns to a global-section ARRAY map like `.bss`) and
+    // walks its `VarSecinfo` entries to render each variable. Before
+    // this support landed the renderer returned `Unsupported`, so a
+    // failure dump's `.bss` map showed an opaque hex dump instead of
+    // `stall=1, crash=0, ...`.
     //
     // The probe BPF object built by `build.rs` contains a known
     // `.bss` Datasec (declared via the `volatile u32

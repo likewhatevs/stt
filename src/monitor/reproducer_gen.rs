@@ -11,7 +11,7 @@
 //! KallsymsTable          ─┼─→ │ DebugCapture      │ →  │ ReproducerSpec   │
 //! dmesg_scx parser       ─┤   │ + Fingerprint     │    │ (this module)    │
 //! ctprof::CtprofSnapshot ──┘   └───────────────────┘    └──────────────────┘
-//!                                  (#11 + #13)              (#12 — here)
+//!                                (capture pipeline)        (this module)
 //! ```
 //!
 //! # The translation contract

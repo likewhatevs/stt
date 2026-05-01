@@ -33,8 +33,8 @@ struct Ktstr {
 
 // Same rationale as `StatsCommand`'s sibling `#[allow]` — clap's
 // derive expands every variant into a struct of `Option<T>` /
-// `Vec<T>` per CLI flag, which after #117's per-side slicing
-// flags pushes the Stats-via-Compare variant past clippy's
+// `Vec<T>` per CLI flag, which after the per-side slicing flags
+// were added pushes the Stats-via-Compare variant past clippy's
 // large-variant heuristic. The enum is constructed once per CLI
 // invocation and dispatched immediately; boxing every variant
 // would distort the match ergonomics without measurable benefit.
@@ -2710,7 +2710,7 @@ impl BuildCompareFilters {
     /// "More-specific replaces": a per-side Vec is applied
     /// verbatim when non-empty, otherwise the shared Vec is
     /// used. Every dimension on `RowFilter` is now a `Vec<String>`
-    /// (after the #13 conversion from `Option<String>` to repeatable
+    /// (after the conversion from `Option<String>` to repeatable
     /// Vec for scheduler/topology/work_type), so a single `pick_vec`
     /// helper handles every dim uniformly — the prior `pick_opt`
     /// branch is no longer reachable.
@@ -2772,7 +2772,20 @@ fn kernel_build(
     force: bool,
     clean: bool,
     cpu_cap: Option<usize>,
+    extra_kconfig: Option<PathBuf>,
 ) -> Result<(), String> {
+    // Read the extra-kconfig fragment ONCE up front so a range
+    // expansion doesn't re-read the same file per version (and so a
+    // bad path surfaces before any download / build work fires).
+    // [`ktstr::cli::read_extra_kconfig`] does the 4-arm error
+    // classification (ENOENT/EISDIR/EACCES/UTF-8) and emits an
+    // empty-file warning so a 0-byte fragment doesn't silently
+    // produce an "extras present but nothing merged" build.
+    let extra_content: Option<String> = match extra_kconfig.as_ref() {
+        Some(p) => Some(cli::read_extra_kconfig(p, "cargo ktstr")?),
+        None => None,
+    };
+
     // Range dispatch only applies to tarball mode. `--source` and
     // `--git` carry their own source-of-truth that ranges don't
     // overlap with: a path identifies one tree, a git ref names one
@@ -2797,9 +2810,16 @@ fn kernel_build(
             let mut failures: Vec<(String, String)> = Vec::new();
             for (i, ver) in versions.iter().enumerate() {
                 eprintln!("cargo ktstr: [{}/{total}] kernel build {ver}", i + 1);
-                if let Err(e) =
-                    kernel_build_one(Some(ver.clone()), None, None, None, force, clean, cpu_cap)
-                {
+                if let Err(e) = kernel_build_one(
+                    Some(ver.clone()),
+                    None,
+                    None,
+                    None,
+                    force,
+                    clean,
+                    cpu_cap,
+                    extra_content.as_deref(),
+                ) {
                     eprintln!("cargo ktstr: {ver}: {e}");
                     failures.push((ver.clone(), e));
                 }
@@ -2828,10 +2848,28 @@ fn kernel_build(
                 ))
             }
         } else {
-            kernel_build_one(version, source, git, git_ref, force, clean, cpu_cap)
+            kernel_build_one(
+                version,
+                source,
+                git,
+                git_ref,
+                force,
+                clean,
+                cpu_cap,
+                extra_content.as_deref(),
+            )
         }
     } else {
-        kernel_build_one(version, source, git, git_ref, force, clean, cpu_cap)
+        kernel_build_one(
+            version,
+            source,
+            git,
+            git_ref,
+            force,
+            clean,
+            cpu_cap,
+            extra_content.as_deref(),
+        )
     }
 }
 
@@ -2841,6 +2879,15 @@ fn kernel_build(
 /// extracted into a helper so the range loop in `kernel_build` can
 /// reuse the same download + cache + build pipeline per resolved
 /// version without duplicating it.
+///
+/// `extra_kconfig` is the pre-loaded user fragment from
+/// `--extra-kconfig PATH` (the file is read once in [`kernel_build`]
+/// before fanning out to per-version invocations). `Some(content)`
+/// folds into the cache key suffix via
+/// [`ktstr::cache_key_suffix_with_extra`] and into the configure
+/// pass via the Cow merge construction in
+/// [`ktstr::cli::kernel_build_pipeline`].
+#[allow(clippy::too_many_arguments)]
 fn kernel_build_one(
     version: Option<String>,
     source: Option<PathBuf>,
@@ -2849,6 +2896,7 @@ fn kernel_build_one(
     force: bool,
     clean: bool,
     cpu_cap: Option<usize>,
+    extra_kconfig: Option<&str>,
 ) -> Result<(), String> {
     // Resolve the CLI --cpu-cap flag against KTSTR_CPU_CAP env
     // and the implicit "no cap" default. Conflict with
@@ -2874,7 +2922,7 @@ fn kernel_build_one(
 
     // Acquire source.
     let client = fetch::shared_client();
-    let acquired = if let Some(ref src_path) = source {
+    let mut acquired = if let Some(ref src_path) = source {
         fetch::local_source(src_path).map_err(|e| format!("{e:#}"))?
     } else if let Some(ref url) = git {
         let ref_name = git_ref.as_deref().expect("clap requires --ref with --git");
@@ -2892,9 +2940,17 @@ fn kernel_build_one(
             None => fetch::fetch_latest_stable_version(client, "cargo ktstr")
                 .map_err(|e| format!("{e:#}"))?,
         };
-        // Check cache before downloading.
+        // Check cache before downloading. Cache key folds in the
+        // merged-kconfig hash so an `--extra-kconfig` build looks up
+        // a distinct slot from a vanilla baked-in-only build —
+        // `cache_key_suffix_with_extra(None)` equals
+        // `cache_key_suffix()` so the no-extra path is byte-identical
+        // to pre-flag behavior.
         let (arch, _) = fetch::arch_info();
-        let cache_key = format!("{ver}-tarball-{arch}-kc{}", ktstr::cache_key_suffix());
+        let cache_key = format!(
+            "{ver}-tarball-{arch}-kc{}",
+            ktstr::cache_key_suffix_with_extra(extra_kconfig),
+        );
         if !force && let Some(entry) = cache_lookup(&cache, &cache_key) {
             eprintln!("cargo ktstr: cached kernel found: {}", entry.path.display());
             eprintln!("cargo ktstr: use --force to rebuild");
@@ -2903,8 +2959,26 @@ fn kernel_build_one(
         let sp = cli::Spinner::start("Downloading kernel...");
         let result = fetch::download_tarball(client, &ver, tmp_dir.path(), "cargo ktstr");
         drop(sp);
-        result.map_err(|e| format!("{e:#}"))?
+        let mut acquired = result.map_err(|e| format!("{e:#}"))?;
+        // `download_tarball` builds its `cache_key` using the bare
+        // `cache_key_suffix()` (see `fetch::download_tarball`).
+        // Override with the merged-suffix key we looked up under so
+        // the post-build cache store lands at the same slot we'd
+        // hit on a re-run.
+        acquired.cache_key = cache_key;
+        acquired
     };
+
+    // For `--source` and `--git` paths, `local_source` and `git_clone`
+    // build `acquired.cache_key` against the bare `cache_key_suffix()`
+    // — already shaped `...-kc{baked_hash}`. With `--extra-kconfig`
+    // set, lift the `-xkc{extra_hash}` append to
+    // [`cli::append_extra_kconfig_suffix`] so both binaries share
+    // one merge path; the cache lookup + post-build store both target
+    // the extras-aware slot.
+    if source.is_some() || git.is_some() {
+        cli::append_extra_kconfig_suffix(&mut acquired.cache_key, extra_kconfig);
+    }
 
     // Check cache for --source and --git (tarball already checked
     // pre-download above).
@@ -2935,6 +3009,7 @@ fn kernel_build_one(
         clean,
         source.is_some(),
         resolved_cap,
+        extra_kconfig,
     )
     .map_err(|e| format!("{e:#}"))?;
 
@@ -3621,7 +3696,17 @@ fn main() {
                 force,
                 clean,
                 cpu_cap,
-            } => kernel_build(version, source, git, git_ref, force, clean, cpu_cap),
+                extra_kconfig,
+            } => kernel_build(
+                version,
+                source,
+                git,
+                git_ref,
+                force,
+                clean,
+                cpu_cap,
+                extra_kconfig,
+            ),
             KernelCommand::Clean {
                 keep,
                 force,
@@ -4511,9 +4596,8 @@ mod tests {
     }
 
     /// Bare `compare` defaults `--no-average` to `false` —
-    /// averaging is the default since #117. `--no-average`
-    /// must be opt-in for "keep each sidecar distinct"
-    /// semantics.
+    /// averaging is the default. `--no-average` must be opt-in
+    /// for "keep each sidecar distinct" semantics.
     #[test]
     fn parse_stats_compare_no_average_default_false() {
         let Cargo {
@@ -4768,8 +4852,8 @@ mod tests {
     /// OR-combined filter the dispatch applies. Mirrors
     /// `parse_stats_compare_with_project_commit_repeatable` for
     /// the scheduler dimension. A regression that reverted
-    /// `scheduler` to `Option<String>` (the pre-#13 shape) would
-    /// fail this test at parse time — clap's `Option` derive
+    /// `scheduler` to `Option<String>` (the pre-conversion shape)
+    /// would fail this test at parse time — clap's `Option` derive
     /// rejects multiple occurrences with a "supplied more than
     /// once" diagnostic.
     #[test]
@@ -5042,7 +5126,7 @@ mod tests {
 
     /// Per-side `--a-scheduler` overrides shared `--scheduler` for
     /// A only. Sibling test for the scheduler dimension after the
-    /// #13 conversion from `Option<String>` to repeatable
+    /// conversion from `Option<String>` to repeatable
     /// `Vec<String>` — the override semantics now mirror every
     /// other Vec dim ("non-empty per-side replaces shared
     /// verbatim"), so this test pins the same shape every other
@@ -5574,6 +5658,289 @@ mod tests {
             "../linux",
         ]);
         assert!(m.is_err());
+    }
+
+    /// `kernel build VERSION --extra-kconfig PATH` round-trips to
+    /// `KernelCommand::Build { version: Some(..), extra_kconfig:
+    /// Some(..), .. }` so the dispatch site forwards the path
+    /// through `kernel_build` → `kernel_build_one` →
+    /// `cli::kernel_build_pipeline` with `Some(content)`. Pins the
+    /// clap binding for the new flag — a regression that dropped
+    /// the field would surface here as a parse rejection or a None
+    /// `extra_kconfig`.
+    #[test]
+    fn parse_kernel_build_with_extra_kconfig() {
+        let Cargo {
+            command: CargoSub::Ktstr(k),
+        } = Cargo::try_parse_from([
+            "cargo",
+            "ktstr",
+            "kernel",
+            "build",
+            "6.14.2",
+            "--extra-kconfig",
+            "/tmp/extra.kconfig",
+        ])
+        .unwrap_or_else(|e| panic!("{e}"));
+        match k.command {
+            KtstrCommand::Kernel {
+                command:
+                    KernelCommand::Build {
+                        version,
+                        extra_kconfig,
+                        ..
+                    },
+            } => {
+                assert_eq!(version.as_deref(), Some("6.14.2"));
+                assert_eq!(
+                    extra_kconfig,
+                    Some(std::path::PathBuf::from("/tmp/extra.kconfig")),
+                    "--extra-kconfig must round-trip the literal path",
+                );
+            }
+            _ => panic!("expected KernelCommand::Build"),
+        }
+    }
+
+    /// Bare `kernel build VERSION` (no `--extra-kconfig`) parses to
+    /// `extra_kconfig: None`. Pins that the flag is OPTIONAL — a
+    /// regression that made it required would fail this test.
+    #[test]
+    fn parse_kernel_build_without_extra_kconfig_is_none() {
+        let Cargo {
+            command: CargoSub::Ktstr(k),
+        } = Cargo::try_parse_from(["cargo", "ktstr", "kernel", "build", "6.14.2"])
+            .unwrap_or_else(|e| panic!("{e}"));
+        match k.command {
+            KtstrCommand::Kernel {
+                command:
+                    KernelCommand::Build {
+                        extra_kconfig, ..
+                    },
+            } => {
+                assert!(
+                    extra_kconfig.is_none(),
+                    "no --extra-kconfig must produce None, got {extra_kconfig:?}",
+                );
+            }
+            _ => panic!("expected KernelCommand::Build"),
+        }
+    }
+
+    /// Coordinator item 21: range expansion + --extra-kconfig
+    /// composes at the parse layer. A range version + an
+    /// extra-kconfig path both round-trip to their fields on
+    /// `KernelCommand::Build`. The dispatch then fans out per
+    /// version inside `kernel_build`, and the `extra_content`
+    /// String is read ONCE up front and threaded as `Option<&str>`
+    /// to every `kernel_build_one` call — so every version in a
+    /// range observes byte-identical extras. Pin the parse-level
+    /// composition; the per-version threading is a code-structure
+    /// invariant of `kernel_build`'s shared read.
+    #[test]
+    fn parse_kernel_build_range_with_extra_kconfig() {
+        let Cargo {
+            command: CargoSub::Ktstr(k),
+        } = Cargo::try_parse_from([
+            "cargo",
+            "ktstr",
+            "kernel",
+            "build",
+            "6.14.2..6.14.4",
+            "--extra-kconfig",
+            "/tmp/range-extra.kconfig",
+        ])
+        .unwrap_or_else(|e| panic!("{e}"));
+        match k.command {
+            KtstrCommand::Kernel {
+                command:
+                    KernelCommand::Build {
+                        version,
+                        extra_kconfig,
+                        ..
+                    },
+            } => {
+                assert_eq!(version.as_deref(), Some("6.14.2..6.14.4"));
+                assert_eq!(
+                    extra_kconfig,
+                    Some(std::path::PathBuf::from("/tmp/range-extra.kconfig")),
+                );
+            }
+            _ => panic!("expected KernelCommand::Build"),
+        }
+    }
+
+    /// Coordinator item 23: --force + --clean + --extra-kconfig
+    /// orthogonality. None of these flags conflict with each
+    /// other; pin that all three can co-exist on a single
+    /// invocation. A regression that introduced a clap
+    /// `conflicts_with` between any pair would surface here.
+    #[test]
+    fn parse_kernel_build_force_clean_and_extra_kconfig_compose() {
+        let Cargo {
+            command: CargoSub::Ktstr(k),
+        } = Cargo::try_parse_from([
+            "cargo",
+            "ktstr",
+            "kernel",
+            "build",
+            "--source",
+            "../linux",
+            "--force",
+            "--clean",
+            "--extra-kconfig",
+            "/tmp/extra.kconfig",
+        ])
+        .unwrap_or_else(|e| panic!("{e}"));
+        match k.command {
+            KtstrCommand::Kernel {
+                command:
+                    KernelCommand::Build {
+                        force,
+                        clean,
+                        extra_kconfig,
+                        ..
+                    },
+            } => {
+                assert!(force, "--force must round-trip alongside --clean and --extra-kconfig");
+                assert!(clean, "--clean must round-trip alongside --force and --extra-kconfig");
+                assert_eq!(
+                    extra_kconfig,
+                    Some(std::path::PathBuf::from("/tmp/extra.kconfig")),
+                    "--extra-kconfig must round-trip when combined with --force + --clean",
+                );
+            }
+            _ => panic!("expected KernelCommand::Build"),
+        }
+    }
+
+    /// Coordinator item 28: non-build subcommands that accept
+    /// `--extra-kconfig` would silently produce wrong cache
+    /// lookups. The flag is `kernel build`-only at the
+    /// configuration layer; this test pins the parse-level
+    /// reject for the subcommands that have CLEAN clap surfaces
+    /// (no `trailing_var_arg` passthrough).
+    ///
+    /// Subcommands and their behavior:
+    /// - `verifier`: REJECTS at parse time (no trailing_var_arg).
+    ///   Pin via `try_parse_from` returning `Err`.
+    /// - `shell`: REJECTS at parse time (no trailing_var_arg).
+    ///   Pin via `try_parse_from` returning `Err`.
+    /// - `test` / `coverage` / `llvm-cov`: PASSTHROUGH via
+    ///   `args: Vec<String>` with `trailing_var_arg = true,
+    ///   allow_hyphen_values = true`. Clap forwards `--extra-kconfig
+    ///   ...` as positional args to `cargo nextest run` (or
+    ///   `cargo llvm-cov`), which then rejects it as an unknown
+    ///   cargo flag — but at the cargo subprocess layer, NOT at
+    ///   parse time. This is a structural property of clap's
+    ///   trailing-var-arg shape and is consistent across every
+    ///   passthrough subcommand on `cargo ktstr`. We do NOT pin
+    ///   these as parse errors because that's not where the
+    ///   rejection actually happens.
+    #[test]
+    fn parse_extra_kconfig_rejected_on_verifier_subcommand() {
+        let m = Cargo::try_parse_from([
+            "cargo",
+            "ktstr",
+            "verifier",
+            "--scheduler",
+            "scx_rustland",
+            "--extra-kconfig",
+            "/tmp/x.kconfig",
+        ]);
+        assert!(
+            m.is_err(),
+            "--extra-kconfig must be rejected on `cargo ktstr verifier` \
+             (verifier has no trailing_var_arg, so unknown flags fail at parse time)",
+        );
+    }
+
+    #[test]
+    fn parse_extra_kconfig_rejected_on_shell_subcommand() {
+        let m = Cargo::try_parse_from([
+            "cargo",
+            "ktstr",
+            "shell",
+            "--extra-kconfig",
+            "/tmp/x.kconfig",
+        ]);
+        assert!(
+            m.is_err(),
+            "--extra-kconfig must be rejected on `cargo ktstr shell` \
+             (shell has no trailing_var_arg, so unknown flags fail at parse time)",
+        );
+    }
+
+    /// Documents the passthrough behavior on `test` /
+    /// `coverage` / `llvm-cov`: clap's `trailing_var_arg = true`
+    /// on `args: Vec<String>` SWALLOWS `--extra-kconfig` as a
+    /// positional argument forwarded to `cargo nextest run` /
+    /// `cargo llvm-cov`. The rejection happens later, at the
+    /// cargo subprocess layer, not at parse time. Pin the
+    /// shape so a future change to the trailing_var_arg shape
+    /// (e.g. removing it) surfaces here as a behavior change.
+    #[test]
+    fn parse_extra_kconfig_passes_through_test_subcommand_to_args_vec() {
+        let Cargo {
+            command: CargoSub::Ktstr(k),
+        } = Cargo::try_parse_from([
+            "cargo",
+            "ktstr",
+            "test",
+            "--extra-kconfig",
+            "/tmp/x.kconfig",
+        ])
+        .unwrap_or_else(|e| panic!("{e}"));
+        match k.command {
+            KtstrCommand::Test { args, .. } => {
+                assert_eq!(
+                    args,
+                    vec!["--extra-kconfig", "/tmp/x.kconfig"],
+                    "--extra-kconfig must passthrough into `args` Vec on test \
+                     subcommand (trailing_var_arg = true). The cargo nextest \
+                     subprocess will reject it as an unknown flag downstream."
+                );
+            }
+            _ => panic!("expected KernelCommand::Test"),
+        }
+    }
+
+    /// `--extra-kconfig` works alongside `--source` (local source
+    /// tree path). Pins that the flag is not mutually exclusive
+    /// with the other source-acquire flags — extra-kconfig is
+    /// orthogonal to where the kernel SOURCE comes from.
+    #[test]
+    fn parse_kernel_build_extra_kconfig_with_source() {
+        let Cargo {
+            command: CargoSub::Ktstr(k),
+        } = Cargo::try_parse_from([
+            "cargo",
+            "ktstr",
+            "kernel",
+            "build",
+            "--source",
+            "../linux",
+            "--extra-kconfig",
+            "/tmp/extra.kconfig",
+        ])
+        .unwrap_or_else(|e| panic!("{e}"));
+        match k.command {
+            KtstrCommand::Kernel {
+                command:
+                    KernelCommand::Build {
+                        source,
+                        extra_kconfig,
+                        ..
+                    },
+            } => {
+                assert_eq!(source, Some(std::path::PathBuf::from("../linux")));
+                assert_eq!(
+                    extra_kconfig,
+                    Some(std::path::PathBuf::from("/tmp/extra.kconfig")),
+                );
+            }
+            _ => panic!("expected KernelCommand::Build"),
+        }
     }
 
     // -- try_get_matches_from: kernel clean --
@@ -7033,10 +7400,9 @@ mod tests {
     #[test]
     fn detect_label_collisions_identical_labels_collide() {
         // De-duplication of identical `--kernel` specs is the
-        // operator's responsibility (or future task #21); this
-        // helper is the LAST line of defense and must surface the
-        // duplicate as a collision rather than silently letting
-        // both entries through.
+        // operator's responsibility; this helper is the LAST line
+        // of defense and must surface the duplicate as a collision
+        // rather than silently letting both entries through.
         let resolved = vec![
             ("6.14.2".to_string(), PathBuf::from("/cache/a")),
             ("6.14.2".to_string(), PathBuf::from("/cache/b")),

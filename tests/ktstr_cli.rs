@@ -348,6 +348,7 @@ fn write_valid_entry(dir: &std::path::Path, ktstr_kconfig_hash: Option<&str>) {
          \"config_hash\":null,\
          \"built_at\":\"2025-01-01T00:00:00Z\",\
          \"ktstr_kconfig_hash\":{kconfig},\
+         \"extra_kconfig_hash\":null,\
          \"has_vmlinux\":false,\
          \"vmlinux_stripped\":false\
          }}",

@@ -2657,8 +2657,7 @@ mod tests {
         );
         // Predicate against a non-singleton client: must hit
         // the `None` early-out and return `false` without
-        // initializing the singleton. This is the optimization
-        // #111 added.
+        // initializing the singleton.
         let local = reqwest::blocking::Client::new();
         assert!(
             !super::is_shared_client(&local),

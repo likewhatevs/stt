@@ -174,7 +174,218 @@ fn help_kernel_build() {
         .stdout(predicate::str::contains("--git"))
         .stdout(predicate::str::contains("--ref"))
         .stdout(predicate::str::contains("--force"))
-        .stdout(predicate::str::contains("--clean"));
+        .stdout(predicate::str::contains("--clean"))
+        .stdout(predicate::str::contains("--extra-kconfig"))
+        // `--extra-kconfig` doc must explain that `make olddefconfig`
+        // resolves dependencies — per coordinator ruling #7d, the
+        // help is the discoverability surface for the merge
+        // pipeline. A regression that dropped the explanation
+        // would leave operators guessing why a fragment line
+        // silently disappeared from the final `.config`.
+        .stdout(predicate::str::contains("olddefconfig"));
+}
+
+/// `kernel build --extra-kconfig <nonexistent>` must surface an
+/// actionable error containing the user's input path verbatim, so a
+/// typo names the exact string they passed. Pin the diagnostic
+/// shape `--extra-kconfig {path}: {fs error}` produced by
+/// `kernel_build`'s up-front file read.
+///
+/// `KTSTR_CACHE_DIR` is pointed at a tempdir so this test does not
+/// touch the developer's real cache root, and `--source` is set to
+/// a clearly-nonexistent path so even if the extra-kconfig check
+/// were skipped (and the source-tree validation fired instead), the
+/// command would still bail before any network or build work.
+#[test]
+fn kernel_build_extra_kconfig_nonexistent_path_errors() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    cargo_ktstr()
+        .env("KTSTR_CACHE_DIR", tmp.path())
+        .args([
+            "kernel",
+            "build",
+            "--source",
+            "/nonexistent/ktstr-extra-kconfig-source-test",
+            "--extra-kconfig",
+            "/definitely/not/a/real/file/ktstr-extra-kconfig-test.kconfig",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--extra-kconfig"))
+        .stderr(predicate::str::contains(
+            "/definitely/not/a/real/file/ktstr-extra-kconfig-test.kconfig",
+        ));
+}
+
+/// Coordinator item 25: a directory passed to `--extra-kconfig`
+/// must surface a clear "is a directory" error. The 4-arm error
+/// classification in [`ktstr::cli::read_extra_kconfig`] maps the
+/// kernel's EISDIR to "is a directory; pass a file" — pin that
+/// the operator-facing message names BOTH `--extra-kconfig` and
+/// the offending path.
+#[test]
+fn kernel_build_extra_kconfig_directory_errors() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dir = tmp.path().join("not-a-file");
+    std::fs::create_dir(&dir).unwrap();
+    cargo_ktstr()
+        .env("KTSTR_CACHE_DIR", tmp.path())
+        .args([
+            "kernel",
+            "build",
+            "--source",
+            "/nonexistent/ktstr-source-test-dir-arg",
+            "--extra-kconfig",
+        ])
+        .arg(&dir)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--extra-kconfig"))
+        .stderr(predicate::str::contains("is a directory"));
+}
+
+/// Coordinator item 24: a non-UTF-8 file passed to
+/// `--extra-kconfig` must surface a clear "not valid UTF-8"
+/// error. `read_extra_kconfig` rejects with a message that names
+/// `--extra-kconfig` + the path so the operator can fix the file.
+/// kconfig fragments are required to be ASCII text per kbuild's
+/// own parser.
+#[test]
+fn kernel_build_extra_kconfig_invalid_utf8_errors() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path = tmp.path().join("invalid.kconfig");
+    // Lone 0xff is invalid UTF-8 — Vec<u8> with a single 0xff byte
+    // fails String::from_utf8 with `Utf8Error`.
+    std::fs::write(&path, [0xffu8]).unwrap();
+    cargo_ktstr()
+        .env("KTSTR_CACHE_DIR", tmp.path())
+        .args([
+            "kernel",
+            "build",
+            "--source",
+            "/nonexistent/ktstr-source-test-utf8-arg",
+            "--extra-kconfig",
+        ])
+        .arg(&path)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--extra-kconfig"))
+        .stderr(predicate::str::contains("not valid UTF-8"));
+}
+
+/// Coordinator item 19: an empty file passed to `--extra-kconfig`
+/// is NOT an error — `read_extra_kconfig` warns but proceeds. The
+/// build then bails when the source-tree check fails (we point
+/// `--source` at a nonexistent path), proving the empty-file
+/// branch passed through without aborting on the fragment read.
+/// stderr carries both the empty-file warning AND the source-tree
+/// failure, confirming sequence: empty fragment → warn → continue
+/// → source-tree fail.
+#[test]
+fn kernel_build_extra_kconfig_empty_file_warns_but_proceeds() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path = tmp.path().join("empty.kconfig");
+    std::fs::write(&path, b"").unwrap();
+    cargo_ktstr()
+        .env("KTSTR_CACHE_DIR", tmp.path())
+        // RUST_LOG ensures the tracing::warn! emission lands on
+        // stderr where the integration test can observe it.
+        .env("RUST_LOG", "warn")
+        .args([
+            "kernel",
+            "build",
+            "--source",
+            "/nonexistent/ktstr-source-test-empty-arg",
+            "--extra-kconfig",
+        ])
+        .arg(&path)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--extra-kconfig file is empty"));
+}
+
+/// Coordinator item 26: symlink chain resolution. A
+/// `--extra-kconfig` argument that points at a symlink chain
+/// (link → link → file) must resolve transparently — the
+/// `read_extra_kconfig` helper uses `std::fs::read` which goes
+/// through `open(2)` and follows symlinks per kernel default
+/// (the same way kbuild reads `KCONFIG_CONFIG`). Pin that a
+/// chain of two symlinks resolves to the underlying file's
+/// contents without manual canonicalization.
+///
+/// Test passes when the build proceeds past the fragment-read
+/// stage (we point `--source` at a nonexistent path so the
+/// command bails on source-tree validation, AFTER the fragment
+/// is successfully read). If symlink resolution were broken,
+/// `read_extra_kconfig` would error before reaching the source
+/// stage and stderr would carry the "--extra-kconfig …" error
+/// instead of the source-tree error.
+#[test]
+fn kernel_build_extra_kconfig_symlink_chain_resolves() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let real = tmp.path().join("real.kconfig");
+    std::fs::write(&real, b"CONFIG_KTSTR_SYMLINK_TEST=y\n").unwrap();
+    let link1 = tmp.path().join("link1.kconfig");
+    let link2 = tmp.path().join("link2.kconfig");
+    // Build link1 → real, link2 → link1 (two-hop chain).
+    std::os::unix::fs::symlink(&real, &link1).unwrap();
+    std::os::unix::fs::symlink(&link1, &link2).unwrap();
+    let assert = cargo_ktstr()
+        .env("KTSTR_CACHE_DIR", tmp.path())
+        .args([
+            "kernel",
+            "build",
+            "--source",
+            "/nonexistent/ktstr-source-symlink-test",
+            "--extra-kconfig",
+        ])
+        .arg(&link2)
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+    // Must NOT carry the `--extra-kconfig` error string — the
+    // fragment was read successfully through the chain. The
+    // failure that surfaces is the source-tree validation
+    // (since --source points at nothing), proving the read
+    // completed before that next stage.
+    assert!(
+        !stderr.contains("--extra-kconfig"),
+        "symlink chain must resolve transparently — read_extra_kconfig \
+         should not surface a `--extra-kconfig` error when the chain \
+         resolves to a readable file. stderr={stderr:?}"
+    );
+}
+
+/// Coordinator item 27: the `--extra-kconfig` validation fires
+/// BEFORE source acquisition. A nonexistent extra-kconfig path
+/// MUST produce the `--extra-kconfig`-named error even when
+/// `--source` is also nonexistent — proving the error precedence.
+/// If the order were reversed the test would see the
+/// source-tree error instead.
+#[test]
+fn kernel_build_extra_kconfig_validation_fires_before_source_acquire() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    cargo_ktstr()
+        .env("KTSTR_CACHE_DIR", tmp.path())
+        .args([
+            "kernel",
+            "build",
+            "--source",
+            "/nonexistent/ktstr-source-precedence-test",
+            "--extra-kconfig",
+            "/nonexistent/ktstr-extra-precedence-test.kconfig",
+        ])
+        .assert()
+        .failure()
+        // The error MUST name --extra-kconfig (not source-tree
+        // failure). `read_extra_kconfig` runs first in
+        // `kernel_build`, so its 4-arm classifier surfaces the
+        // ENOENT before `kernel_build_one`'s source-acquire branch
+        // would have fired.
+        .stderr(predicate::str::contains("--extra-kconfig"))
+        .stderr(predicate::str::contains(
+            "/nonexistent/ktstr-extra-precedence-test.kconfig",
+        ));
 }
 
 #[test]

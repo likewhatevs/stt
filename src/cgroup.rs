@@ -1007,7 +1007,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    // -- Cgroup v2 resource control writes (#5) ----------------------
+    // -- Cgroup v2 resource control writes ----------------------------
     //
     // Each new CgroupOps method writes a single cgroupfs file. The
     // tests below stand up a tmpdir representing the parent cgroup,

@@ -409,9 +409,8 @@ pub mod topology;
 /// reproducer-generator translation layer without the `monitor`
 /// module's frozen-VM internals leaking into the public API.
 ///
-/// Tasks #9, #11, #12, #13, #14, #21, #122 build the library
-/// pieces; this module is the entry point for binaries and tests
-/// that consume them.
+/// This module is the entry point for binaries and tests that
+/// consume the live-host capture pipeline.
 pub mod live_host {
     pub use crate::monitor::bpf_map::{
         BpfMapAccessor, BpfMapInfo, BPF_MAP_TYPE_ARENA, BPF_MAP_TYPE_ARRAY, BPF_MAP_TYPE_HASH,
@@ -466,12 +465,96 @@ pub fn kconfig_hash() -> String {
     format!("{:08x}", crc32fast::hash(EMBEDDED_KCONFIG.as_bytes()))
 }
 
+/// CRC32 hash (8 hex chars) of a user-supplied `--extra-kconfig`
+/// fragment, hashed verbatim.
+///
+/// Coordinator ruling D1/D2: hash raw bytes, no comment stripping or
+/// CRLF canonicalization. Two semantically-equivalent inputs with
+/// different comments or line endings produce different hashes and
+/// therefore land at distinct cache entries — accept the disk waste
+/// in exchange for byte-deterministic cache discrimination.
+pub fn extra_kconfig_hash(extra: &str) -> String {
+    format!("{:08x}", crc32fast::hash(extra.as_bytes()))
+}
+
 /// Cache key suffix derived from the embedded kconfig fragment.
 /// Used in kernel cache keys so a kconfig change produces a distinct
 /// cache entry. The kernel binary is independent of ktstr userspace
 /// source, so no ktstr or consumer build identity feeds this suffix.
 pub fn cache_key_suffix() -> String {
     kconfig_hash()
+}
+
+/// Two-segment cache key suffix accounting for an optional
+/// `--extra-kconfig` fragment.
+///
+/// The suffix uses TWO segments instead of folding both inputs into
+/// one hash:
+///
+/// - `extra = None` → `kconfig_hash()` only — byte-identical to
+///   [`cache_key_suffix`], so paths that don't expose
+///   `--extra-kconfig` (test / coverage / shell / verifier) keep
+///   resolving the existing keyspace and pre-1.0 cached kernels are
+///   not orphaned.
+/// - `extra = Some(content)` → `{kconfig_hash()}-xkc{extra_hash}`,
+///   making `kernel list` self-describing: a reader can see at a
+///   glance which entries carry user extras and which are pure
+///   baked-in builds. Different extra content yields different
+///   `xkc{...}` segments, so cache discrimination across distinct
+///   `--extra-kconfig` invocations is structural rather than
+///   collapsed into a single opaque hash.
+pub fn cache_key_suffix_with_extra(extra: Option<&str>) -> String {
+    match extra {
+        None => kconfig_hash(),
+        Some(content) => format!("{}-xkc{}", kconfig_hash(), extra_kconfig_hash(content)),
+    }
+}
+
+/// Merge the user-supplied `--extra-kconfig` fragment on top of
+/// [`EMBEDDED_KCONFIG`] for the configure pass. Returns a
+/// [`std::borrow::Cow`] so the no-extras branch borrows `baked`
+/// without allocating; only the `Some` branch heaps the merged
+/// String.
+///
+/// The user fragment is appended AFTER the baked-in fragment so
+/// kbuild's last-wins rule
+/// (`scripts/kconfig/confdata.c::conf_read_simple` —
+/// "If conflicting CONFIG options are given from an input file,
+/// the last one wins.") makes user values override baked-in ones
+/// on conflict.
+///
+/// A single `\n` separator is interleaved between the two
+/// fragments. EMBEDDED_KCONFIG ends in a newline today, so the
+/// interleaved `\n` produces a blank line between the segments —
+/// kbuild's `.config` parser ignores blank lines (every
+/// `if (!line[0])` short-circuit in `conf_read_simple`), so the
+/// blank line is harmless. The separator is mandatory for the
+/// adversarial case where the operator hand-crafts an
+/// EMBEDDED_KCONFIG without a trailing newline AND a user
+/// fragment that starts with `CONFIG_X` — without the
+/// interleaved `\n`, the two would concatenate into a single
+/// malformed line. Always emit the separator so the merge is
+/// safe regardless of either side's terminator.
+///
+/// The production configure path in
+/// [`crate::cli::kernel_build_pipeline`] calls this helper to build
+/// the bytes handed to `configure_kernel`. Tests that assert
+/// merge-ordering invariants call it directly so the production
+/// byte sequence is what kbuild's last-wins rule operates on.
+/// (Note: [`cache_key_suffix_with_extra`] hashes `extra` ALONE for
+/// its `xkc{...}` segment — it doesn't pass through this helper —
+/// so the cache-key suffix and the merged-fragment content evolve
+/// independently. The cache-key segment exists to discriminate
+/// extras-vs-no-extras at the cache layer; the merge ordering
+/// exists to give kbuild the right final value.)
+pub fn merge_kconfig_fragments<'a>(
+    baked: &'a str,
+    extra: Option<&str>,
+) -> std::borrow::Cow<'a, str> {
+    match extra {
+        None => std::borrow::Cow::Borrowed(baked),
+        Some(content) => std::borrow::Cow::Owned(format!("{baked}\n{content}")),
+    }
 }
 
 pub use ktstr_macros::Claim;
@@ -522,7 +605,8 @@ pub mod prelude {
     // `static` of type `Scheduler`, and matching the derive-macro
     // name to its emitted type reads naturally at the call site.
     pub use crate::assert::{
-        Assert, AssertResult, ClaimBuilder, DetailKind, NoteValue, SeqClaim, SetClaim, Verdict,
+        Assert, AssertDetail, AssertResult, ClaimBuilder, DetailKind, NoteValue, SeqClaim,
+        SetClaim, Verdict,
     };
     pub use crate::claim;
     pub use crate::cgroup::CgroupManager;
@@ -560,8 +644,8 @@ pub mod prelude {
     // `resolve_scheduler`, `resolve_test_kernel`.
     pub use crate::topology::{LlcInfo, NodeMemInfo, TestTopology};
     pub use crate::workload::{
-        AffinityKind, AffinityMode, MemPolicy, MpolFlags, Phase, SchedPolicy, Work, WorkType,
-        WorkerReport, WorkloadConfig, WorkloadHandle, build_nodemask,
+        AffinityKind, AffinityMode, CloneFlags, CloneMode, MemPolicy, Migration, MpolFlags, Phase,
+        SchedPolicy, Work, WorkType, WorkerReport, WorkloadConfig, WorkloadHandle, build_nodemask,
     };
 }
 
@@ -1366,5 +1450,388 @@ mod tests {
     #[test]
     fn ktstr_kernel_env_constant_is_literal() {
         assert_eq!(KTSTR_KERNEL_ENV, "KTSTR_KERNEL");
+    }
+
+    // -- extra_kconfig_hash + cache_key_suffix_with_extra --
+    //
+    // The two-segment cache-key suffix underpins cargo-ktstr's
+    // `--extra-kconfig` behavior: an extra-kconfig build must land
+    // at a distinct cache slot from a vanilla build (different
+    // content = miss), the same extra content must hit the same
+    // slot on re-run (same content = hit), and `None` (no
+    // `--extra-kconfig`) must produce the byte-identical suffix to
+    // `cache_key_suffix()` so paths that don't expose the flag
+    // continue resolving the existing keyspace.
+    //
+    // Suffix shape is `kc{baked_hash}` (no extra) or
+    // `kc{baked_hash}-xkc{extra_hash}` (with extra). The two-segment
+    // form makes `kernel list` self-describing — a reader can see at
+    // a glance which entries carry user extras.
+
+    /// `cache_key_suffix_with_extra(None)` must equal
+    /// `cache_key_suffix()` byte-for-byte. Pins the
+    /// no-`--extra-kconfig` path's compatibility contract: the
+    /// test/coverage/shell/verifier resolution paths (which never
+    /// pass `Some(extra)`) keep producing the pre-flag cache keys so
+    /// existing cache entries remain addressable across the addition
+    /// of this feature.
+    #[test]
+    fn cache_key_suffix_with_extra_none_matches_bare_suffix() {
+        assert_eq!(cache_key_suffix_with_extra(None), cache_key_suffix());
+    }
+
+    /// `cache_key_suffix_with_extra(Some(content))` must contain
+    /// the bare baked-in hash AS A PREFIX followed by `-xkc{...}`.
+    /// Pins the two-segment shape:
+    /// the leading segment is the existing `kconfig_hash()` so
+    /// `kernel list` can decompose the suffix into baked-in vs
+    /// user-extras components.
+    #[test]
+    fn cache_key_suffix_with_extra_some_has_two_segment_shape() {
+        let suffix = cache_key_suffix_with_extra(Some("CONFIG_FOO=y\n"));
+        let baked = kconfig_hash();
+        assert!(
+            suffix.starts_with(&baked),
+            "Some suffix must start with bare baked-in hash {baked:?}, got {suffix:?}"
+        );
+        let after = &suffix[baked.len()..];
+        assert!(
+            after.starts_with("-xkc"),
+            "after the baked-in segment, the next bytes must be `-xkc`, got {after:?}"
+        );
+        let extra_segment = &after["-xkc".len()..];
+        assert_eq!(
+            extra_segment.len(),
+            8,
+            "extra-hash segment must be 8 hex chars, got {extra_segment:?}"
+        );
+        assert!(
+            extra_segment.chars().all(|c| c.is_ascii_hexdigit()),
+            "extra-hash segment must be lowercase hex, got {extra_segment:?}"
+        );
+    }
+
+    /// `cache_key_suffix_with_extra(Some(...))` must DIFFER from
+    /// `cache_key_suffix()` for any non-empty user fragment. Pins
+    /// the cache-discrimination contract: a build with a user
+    /// fragment lands at a different cache key from a vanilla
+    /// build. Also asserts the 8-hex-char shape of the appended
+    /// xkc segment so a regression that changed the hash width
+    /// (e.g. switched to a longer/shorter hex digest) doesn't
+    /// silently slip past this test.
+    #[test]
+    fn cache_key_suffix_with_extra_some_differs_from_bare_suffix() {
+        let suffix = cache_key_suffix_with_extra(Some("CONFIG_FOO=y\n"));
+        assert_ne!(suffix, cache_key_suffix());
+        // Width pin per coordinator item 15: the suffix-shape
+        // contract embeds the same 8-hex-char width on both segments.
+        let baked = kconfig_hash();
+        let after = &suffix[baked.len()..];
+        assert_eq!(
+            after.len(),
+            "-xkc".len() + 8,
+            "suffix tail must be `-xkc{{8 hex chars}}`, got {after:?}"
+        );
+    }
+
+    /// Production format-string shape assertion (coordinator item
+    /// 16): the suffix `cache_key_suffix_with_extra(Some(...))`
+    /// produces must be exactly the literal
+    /// `format!("{baked}-xkc{extra_hash}")` cargo-ktstr.rs uses to
+    /// build its tarball cache key. Pins the structural mirror so
+    /// a refactor that changed the helper's format would surface
+    /// here as a divergence from the production call site.
+    #[test]
+    fn cache_key_suffix_with_extra_matches_production_format_string() {
+        let extra = "CONFIG_FOO=y\n";
+        let baked = kconfig_hash();
+        let extra_h = extra_kconfig_hash(extra);
+        let helper = cache_key_suffix_with_extra(Some(extra));
+        let expected = format!("{baked}-xkc{extra_h}");
+        assert_eq!(
+            helper, expected,
+            "helper output must match production format `{{baked}}-xkc{{extra}}` \
+             (cargo-ktstr.rs builds the tarball cache key with the same shape \
+             via `{{ver}}-tarball-{{arch}}-kc{{cache_key_suffix_with_extra(...)}}`)"
+        );
+    }
+
+    /// An empty user fragment ALSO differs from `None`: the
+    /// `Some("")` branch always emits `-xkc{empty_hash}` as a
+    /// distinct second segment, while `None` produces only the
+    /// bare baked-in hash. Pins that `--extra-kconfig /empty/file`
+    /// is a deliberate signal — even when no symbols are added,
+    /// the build lands in a distinct cache slot from a no-flag
+    /// build.
+    #[test]
+    fn cache_key_suffix_with_extra_empty_differs_from_none() {
+        let with_empty = cache_key_suffix_with_extra(Some(""));
+        let without = cache_key_suffix_with_extra(None);
+        assert_ne!(with_empty, without);
+    }
+
+    /// Same user fragment must produce the SAME suffix across
+    /// invocations. Pins cache-hit determinism for the
+    /// `--extra-kconfig` repeat-invocation case.
+    #[test]
+    fn cache_key_suffix_with_extra_same_content_same_suffix() {
+        let extra = "CONFIG_FOO=y\nCONFIG_BAR=n\n";
+        let a = cache_key_suffix_with_extra(Some(extra));
+        let b = cache_key_suffix_with_extra(Some(extra));
+        assert_eq!(a, b, "same fragment must produce same suffix");
+    }
+
+    /// Different user fragments must produce DIFFERENT suffixes.
+    /// Pins cache-miss discrimination across distinct extra files.
+    /// The `xkc` segment carries the discriminator while the
+    /// baked-in `kc` segment stays constant.
+    #[test]
+    fn cache_key_suffix_with_extra_different_content_different_suffix() {
+        let a = cache_key_suffix_with_extra(Some("CONFIG_FOO=y\n"));
+        let b = cache_key_suffix_with_extra(Some("CONFIG_FOO=n\n"));
+        assert_ne!(a, b, "distinct fragments must produce distinct suffixes");
+        // The baked-in prefix must match across both — only the
+        // `-xkc{...}` tail differs.
+        let baked = kconfig_hash();
+        assert!(a.starts_with(&baked) && b.starts_with(&baked));
+    }
+
+    /// `extra_kconfig_hash` is 8 hex chars (CRC32 in lowercase
+    /// hex), matching the existing `kconfig_hash` shape so the
+    /// `xkc{...}` segment width is consistent with the baked-in
+    /// `kc{...}` segment.
+    #[test]
+    fn extra_kconfig_hash_is_8_hex_chars() {
+        for content in ["", "CONFIG_X=y\n", "# CONFIG_BPF is not set\n"] {
+            let h = extra_kconfig_hash(content);
+            assert_eq!(h.len(), 8, "expected 8 hex chars, got {h}");
+            assert!(
+                h.chars().all(|c| c.is_ascii_hexdigit()),
+                "expected lowercase hex, got {h}",
+            );
+        }
+    }
+
+    /// `extra_kconfig_hash` hashes raw bytes — per coordinator
+    /// rulings D1 (no comment stripping) and D2 (no CRLF
+    /// canonicalization). Two semantically-equivalent inputs with
+    /// different comments or line endings produce different hashes
+    /// and therefore land at distinct cache slots.
+    #[test]
+    fn extra_kconfig_hash_is_byte_sensitive() {
+        let lf = "CONFIG_FOO=y\n";
+        let crlf = "CONFIG_FOO=y\r\n";
+        assert_ne!(
+            extra_kconfig_hash(lf),
+            extra_kconfig_hash(crlf),
+            "CRLF and LF must hash differently per ruling D2"
+        );
+
+        let with_comment = "# user note\nCONFIG_FOO=y\n";
+        let without_comment = "CONFIG_FOO=y\n";
+        assert_ne!(
+            extra_kconfig_hash(with_comment),
+            extra_kconfig_hash(without_comment),
+            "comments must affect the hash per ruling D1"
+        );
+    }
+
+    /// Coordinator item 18: CRLF cache-key discrimination. A user
+    /// who edits their fragment on a Windows host and saves with
+    /// CRLF line endings must land at a different cache slot from
+    /// a Unix-LF fragment with otherwise-identical content. Per
+    /// ruling D2 (no canonicalization), this is by design — the
+    /// disk waste is the price of byte-deterministic discrimination.
+    #[test]
+    fn cache_key_suffix_with_extra_crlf_differs_from_lf() {
+        let lf = "CONFIG_FOO=y\n";
+        let crlf = "CONFIG_FOO=y\r\n";
+        let lf_suffix = cache_key_suffix_with_extra(Some(lf));
+        let crlf_suffix = cache_key_suffix_with_extra(Some(crlf));
+        assert_ne!(
+            lf_suffix, crlf_suffix,
+            "LF and CRLF user fragments must produce distinct cache \
+             keys per ruling D2 (no CRLF canonicalization). A Windows \
+             operator and a Unix operator who supplied 'the same' \
+             fragment land at distinct cache slots; this is the \
+             documented byte-deterministic cache contract."
+        );
+    }
+
+    /// Coordinator item 22: legacy cache entry must NOT be served
+    /// when `--extra-kconfig` is passed. The cache key shape
+    /// `kc{baked}` (legacy, no extras) and `kc{baked}-xkc{...}`
+    /// (with extras) are STRUCTURALLY distinct strings, so any
+    /// cache lookup that builds its key via
+    /// `cache_key_suffix_with_extra(Some(...))` cannot collide with
+    /// an entry stored under `cache_key_suffix()` only.
+    ///
+    /// Pins this invariant at the suffix level: an extras-aware
+    /// suffix is strictly LONGER than the bare suffix, and the
+    /// bare suffix is a proper prefix of the extras suffix. A
+    /// substring lookup (cache lookup is exact-match by key, not
+    /// substring) therefore cannot serve the legacy slot when the
+    /// caller asks for an extras key. End-to-end roundtrip is
+    /// covered at the integration level; this unit test pins the
+    /// structural property the integration relies on.
+    #[test]
+    fn legacy_bare_suffix_is_proper_prefix_of_extras_suffix() {
+        let bare = cache_key_suffix();
+        let extras = cache_key_suffix_with_extra(Some("CONFIG_FOO=y\n"));
+        assert!(
+            extras.starts_with(&bare),
+            "extras suffix must extend bare suffix — bare={bare:?} extras={extras:?}",
+        );
+        assert!(
+            extras.len() > bare.len(),
+            "extras suffix must be strictly longer than bare suffix",
+        );
+        assert_ne!(
+            bare, extras,
+            "structural distinction: legacy entries (key ending in `kc{{bare}}`) cannot \
+             collide with extras entries (key ending in `kc{{bare}}-xkc{{...}}`) on \
+             exact-match cache lookup."
+        );
+    }
+
+    /// Coordinator item 135 / item 29: pin that
+    /// `extra_kconfig_hash("")` is the legitimate CRC32 of zero
+    /// bytes (`00000000`), NOT a sentinel meaning "no extras".
+    /// `None` is the no-extras signal — `Some("")` means "operator
+    /// supplied an empty fragment file". An empty Some still
+    /// produces a distinct cache key from None, so cache-key
+    /// readers must distinguish "extras absent" (None →
+    /// `kc{baked}` only) from "extras empty" (Some("") →
+    /// `kc{baked}-xkc00000000`) by the presence/absence of the
+    /// `-xkc` segment, NOT by hash content.
+    #[test]
+    fn extra_kconfig_hash_empty_is_crc32_zero_not_sentinel() {
+        let empty = extra_kconfig_hash("");
+        assert_eq!(
+            empty, "00000000",
+            "CRC32 of zero bytes is 0x00000000 by spec. This value is \
+             a legitimate hash output, not a sentinel — readers that \
+             want to detect 'no extras' must check the metadata's \
+             `extra_kconfig_hash: Option<String>` for None, not for \
+             this string."
+        );
+    }
+
+    /// MERGE-SEMANTICS pin (coordinator item 17 + 20): when the
+    /// user fragment overrides a baked-in symbol, the merged
+    /// content fed to `make olddefconfig` must place the user
+    /// line LAST so kbuild's last-wins rule
+    /// (`scripts/kconfig/confdata.c::conf_read_simple` — "If
+    /// conflicting CONFIG options are given from an input file,
+    /// the last one wins.") makes the user value take precedence.
+    ///
+    /// Calls [`merge_kconfig_fragments`] DIRECTLY — the same
+    /// helper [`crate::cli::kernel_build_pipeline`] uses to build
+    /// the configure-pass content. Pinning the production helper
+    /// (rather than reproducing its `format!` shape inline) means
+    /// a regression that swapped the merge order would break this
+    /// test in lock-step with the production path it represents.
+    ///
+    /// `EMBEDDED_KCONFIG` carries `CONFIG_BPF=y` (see
+    /// `ktstr.kconfig`). A user fragment that flips it to
+    /// `# CONFIG_BPF is not set` must appear AFTER the baked-in
+    /// `CONFIG_BPF=y` line in the merged content. We can't drive
+    /// `make olddefconfig` from a pure unit test (no in-tree
+    /// kbuild fixture), so the test directly inspects the merged-
+    /// fragment construction the pipeline uses and verifies the
+    /// ordering invariant kbuild's last-wins rule depends on.
+    #[test]
+    fn merge_user_extra_appears_after_baked_in_for_conflict_resolution() {
+        let user = "# CONFIG_BPF is not set\n";
+        let merged = merge_kconfig_fragments(EMBEDDED_KCONFIG, Some(user));
+        let baked_pos = merged
+            .find("CONFIG_BPF=y")
+            .expect("baked-in CONFIG_BPF=y must be present in merged fragment");
+        let user_pos = merged
+            .find("# CONFIG_BPF is not set")
+            .expect("user override must be present in merged fragment");
+        assert!(
+            baked_pos < user_pos,
+            "baked-in line must appear BEFORE user override so kbuild's \
+             last-wins rule (confdata.c::conf_read_simple) keeps the user \
+             value (baked_pos={baked_pos}, user_pos={user_pos})",
+        );
+        // Item 20: pin that the LAST occurrence of the symbol in
+        // the merged content is the user's override. Walks every
+        // line, tracks the last hit, and asserts it is the user's
+        // disable directive — the kbuild parser walks lines top to
+        // bottom and the last assignment wins, so the LAST
+        // occurrence determines the final value.
+        let mut last = None;
+        for line in merged.lines() {
+            let trimmed = line.trim();
+            if trimmed == "CONFIG_BPF=y" || trimmed == "# CONFIG_BPF is not set" {
+                last = Some(trimmed.to_string());
+            }
+        }
+        assert_eq!(
+            last.as_deref(),
+            Some("# CONFIG_BPF is not set"),
+            "the LAST occurrence of CONFIG_BPF in the merged content must \
+             be the user override; kbuild's `conf_read_simple` walks lines \
+             top-to-bottom and keeps the last assignment, so the user line \
+             determines the final config value",
+        );
+    }
+
+    /// NON-CONFLICT pin (coordinator item 17): when the user
+    /// fragment adds a symbol the baked-in fragment doesn't
+    /// mention, the merged content carries BOTH lines verbatim.
+    /// `make olddefconfig` then sees two distinct symbols (one
+    /// from each origin) and produces a `.config` containing
+    /// both. Calls [`merge_kconfig_fragments`] directly so the
+    /// production path's combine semantics are pinned.
+    #[test]
+    fn merge_user_extra_combines_with_baked_in_for_disjoint_symbols() {
+        // Pick a CONFIG_X name not present in EMBEDDED_KCONFIG.
+        let novel = "CONFIG_KTSTR_TEST_NOVEL_SYMBOL_FOR_MERGE_TEST=y\n";
+        assert!(
+            !EMBEDDED_KCONFIG.contains("CONFIG_KTSTR_TEST_NOVEL_SYMBOL_FOR_MERGE_TEST"),
+            "test fixture must use a symbol absent from EMBEDDED_KCONFIG"
+        );
+        let merged = merge_kconfig_fragments(EMBEDDED_KCONFIG, Some(novel));
+        // Both the user-novel line and at least one canonical
+        // baked-in line must appear in the merged content.
+        assert!(
+            merged.contains("CONFIG_KTSTR_TEST_NOVEL_SYMBOL_FOR_MERGE_TEST=y"),
+            "user-novel line must appear in merged fragment",
+        );
+        assert!(
+            merged.contains("CONFIG_BPF=y"),
+            "baked-in CONFIG_BPF=y must still appear in merged fragment",
+        );
+    }
+
+    /// `merge_kconfig_fragments(baked, None)` returns the baked
+    /// string unchanged — pinning the no-extras short-circuit so
+    /// callers that pass `None` always observe the original
+    /// fragment byte-for-byte.
+    #[test]
+    fn merge_kconfig_fragments_none_returns_baked_unchanged() {
+        let merged = merge_kconfig_fragments(EMBEDDED_KCONFIG, None);
+        assert_eq!(
+            merged, EMBEDDED_KCONFIG,
+            "merge with None must return the baked fragment unchanged"
+        );
+    }
+
+    /// `merge_kconfig_fragments(baked, Some(""))` returns
+    /// `{baked}\n` — the empty string still triggers the
+    /// `format!` branch which appends a separator newline. Pins
+    /// that the helper's branch boundary is `Option::is_some`,
+    /// not `Option::is_some && !is_empty`. Operators reading the
+    /// merged content under an empty fragment see the baked-in
+    /// content followed by a single trailing newline (which kbuild
+    /// ignores).
+    #[test]
+    fn merge_kconfig_fragments_some_empty_appends_separator_newline() {
+        let merged = merge_kconfig_fragments(EMBEDDED_KCONFIG, Some(""));
+        let expected = format!("{EMBEDDED_KCONFIG}\n");
+        assert_eq!(merged, expected);
     }
 }

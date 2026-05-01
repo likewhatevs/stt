@@ -7437,7 +7437,7 @@ mod tests {
         );
     }
 
-    // -- CgroupDef cgroup-v2 resource builders (#5) ------------------
+    // -- CgroupDef cgroup-v2 resource builders -----------------------
 
     /// `.cpu_quota_pct(50)` populates `cpu.max_quota_us = 50_000`
     /// with the default 100 ms period. Pins the percentage-to-µs

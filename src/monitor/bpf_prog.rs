@@ -313,7 +313,7 @@ pub(crate) fn walk_struct_ops_runtime_stats(
 /// [`super::bpf_map::BpfMapAccessor`] for the program side.
 ///
 /// Currently one implementation: [`GuestMemProgAccessor`] (PTE-walks a
-/// frozen guest's `prog_idr`). The planned live-host backend (#9)
+/// frozen guest's `prog_idr`). The planned live-host backend
 /// will walk loaded programs via `BPF_PROG_GET_NEXT_ID` /
 /// `BPF_OBJ_GET_INFO_BY_FD` and produce the same
 /// `Vec<ProgVerifierStats>` / `Vec<ProgRuntimeStats>` shapes, so the
@@ -749,7 +749,7 @@ mod tests {
     /// would break either equality.
     #[test]
     fn prog_runtime_stats_format_chain_inner_appears_in_outer() {
-        use super::dump::{FailureDumpReport, SCHEMA_SINGLE};
+        use crate::monitor::dump::{FailureDumpReport, SCHEMA_SINGLE};
         let info = ProgRuntimeStats {
             name: "chain_test".to_string(),
             cnt: 7,
@@ -758,7 +758,7 @@ mod tests {
         };
         let inner = format!("{info}");
         // Direct Display on ProgRuntimeStats: pinned shape includes
-        // the bpftop-style derived metrics (#22). cnt=7 nsecs=42 →
+        // the bpftop-style derived metrics. cnt=7 nsecs=42 →
         // ns/call=6.000; misses=1 → miss_rate=1/8=0.1250.
         assert_eq!(
             inner,

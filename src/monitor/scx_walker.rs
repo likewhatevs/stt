@@ -9,7 +9,7 @@
 //!    `rq->scx.runnable_list` and emits a list of
 //!    [`super::dump::TaskWalkerEntry`] tuples for each runnable task —
 //!    these feed directly into the per-task enrichment capture
-//!    pipeline (#28).
+//!    pipeline.
 //!
 //! 2. [`walk_dsqs`] — enumerates every dispatch queue reachable from
 //!    `*scx_root`:
@@ -104,7 +104,7 @@ pub struct RqScxState {
     pub curr_comm: Option<String>,
     /// `task_struct` KVAs of every entry walked off
     /// `rq->scx.runnable_list`. The freeze coordinator passes this
-    /// vec into the per-task enrichment capture (#28) so the same
+    /// vec into the per-task enrichment capture so the same
     /// task list drives both rq->scx state AND per-task records.
     pub runnable_task_kvas: Vec<u64>,
     /// True when the runnable_list walk hit the
@@ -1177,7 +1177,7 @@ mod tests {
         assert!(offsets.missing_groups().is_empty());
     }
 
-    // -- Verdict API integration coverage (#97) -------------------------
+    // -- Verdict API integration coverage -------------------------------
     //
     // The walker emits RqScxState / DsqState / ScxSchedState rows that
     // scenario authors will claim against via the new pointwise-claim

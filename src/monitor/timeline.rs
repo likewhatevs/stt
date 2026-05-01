@@ -268,7 +268,7 @@ pub struct TimelineCapture<'a> {
 }
 
 // ---------------------------------------------------------------
-// Incremental capture (#21): periodic VM-freeze ring of raw bytes.
+// Incremental capture: periodic VM-freeze ring of raw bytes.
 // ---------------------------------------------------------------
 
 /// Default snapshot-ring depth from
@@ -381,7 +381,7 @@ impl SnapshotRing {
 }
 
 /// Capture handle the freeze coordinator passes into the dump
-/// pipeline when periodic incremental snapshots are enabled (#21).
+/// pipeline when periodic incremental snapshots are enabled.
 ///
 /// At dump time the renderer drains [`Self::snapshots`] and emits
 /// each snapshot as a [`super::dump::FailureDumpReport`]-shaped

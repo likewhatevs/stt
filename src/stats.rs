@@ -91,8 +91,7 @@ pub struct MetricDef {
 
 /// Temporal aggregation classification for a metric.
 ///
-/// Kernel-source-grounded per the #117 metric-semantics taxonomy
-/// (see `~/.claude/projects/.../memory/research_metric_semantics.md`).
+/// Kernel-source-grounded per the metric-semantics taxonomy.
 /// Drives [`aggregate_samples`] — the function that collapses a
 /// slice of per-sample readings of the SAME metric into one
 /// representative value for downstream regression / display.
@@ -3889,7 +3888,7 @@ pub(crate) fn format_host_delta(
                 // Identical hosts: surface arch when both sides
                 // carry it so the operator sees WHAT is identical
                 // (the two runs share x86_64 vs both being aarch64
-                // is the question that motivated #151). When
+                // is the operator's question). When
                 // either side leaves arch as `None` (pre-host-
                 // context-landing archive, or arch probe failed
                 // on at least one side), fall through to the
@@ -3921,7 +3920,7 @@ mod tests {
     use super::*;
     use crate::assert::ScenarioStats;
 
-    // -- MetricKind temporal aggregation (#118) ---------------------
+    // -- MetricKind temporal aggregation ----------------------------
 
     /// `Counter` reduces by sum-of-finite-samples. NaN drops, empty
     /// returns None.

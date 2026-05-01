@@ -452,6 +452,7 @@ pub struct CtprofShowArgs {
 /// `--source` paths bypass range expansion (clap's
 /// `conflicts_with` already rejects `version + source` and
 /// `version + git` combinations).
+#[allow(clippy::too_many_arguments)]
 fn kernel_build(
     version: Option<String>,
     source: Option<PathBuf>,
@@ -460,7 +461,22 @@ fn kernel_build(
     force: bool,
     clean: bool,
     cpu_cap: Option<usize>,
+    extra_kconfig: Option<PathBuf>,
 ) -> Result<()> {
+    // Read the extra-kconfig fragment ONCE up front so a range
+    // expansion doesn't re-read the same file per version (and so
+    // a bad path surfaces before any download / build work fires).
+    // [`ktstr::cli::read_extra_kconfig`] does the 4-arm error
+    // classification (ENOENT/EISDIR/EACCES/UTF-8) and emits an
+    // empty-file warning so a 0-byte fragment doesn't silently
+    // produce an "extras present but nothing merged" build.
+    let extra_content: Option<String> = match extra_kconfig.as_ref() {
+        Some(p) => Some(
+            ktstr::cli::read_extra_kconfig(p, "ktstr").map_err(|e| anyhow::anyhow!("{e}"))?,
+        ),
+        None => None,
+    };
+
     if source.is_none()
         && git.is_none()
         && let Some(ref v) = version
@@ -477,9 +493,16 @@ fn kernel_build(
             let mut failures: Vec<(String, anyhow::Error)> = Vec::new();
             for (i, ver) in versions.iter().enumerate() {
                 eprintln!("ktstr: [{}/{total}] kernel build {ver}", i + 1);
-                if let Err(e) =
-                    kernel_build_one(Some(ver.clone()), None, None, None, force, clean, cpu_cap)
-                {
+                if let Err(e) = kernel_build_one(
+                    Some(ver.clone()),
+                    None,
+                    None,
+                    None,
+                    force,
+                    clean,
+                    cpu_cap,
+                    extra_content.as_deref(),
+                ) {
                     eprintln!("ktstr: {ver}: {e:#}");
                     failures.push((ver.clone(), e));
                 }
@@ -499,10 +522,28 @@ fn kernel_build(
                 );
             }
         } else {
-            kernel_build_one(version, source, git, git_ref, force, clean, cpu_cap)
+            kernel_build_one(
+                version,
+                source,
+                git,
+                git_ref,
+                force,
+                clean,
+                cpu_cap,
+                extra_content.as_deref(),
+            )
         }
     } else {
-        kernel_build_one(version, source, git, git_ref, force, clean, cpu_cap)
+        kernel_build_one(
+            version,
+            source,
+            git,
+            git_ref,
+            force,
+            clean,
+            cpu_cap,
+            extra_content.as_deref(),
+        )
     }
 }
 
@@ -512,6 +553,15 @@ fn kernel_build(
 /// extracted into a helper so the range loop in `kernel_build` can
 /// reuse the same download + cache + build pipeline per resolved
 /// version without duplicating it.
+///
+/// `extra_kconfig` is the pre-loaded user fragment from
+/// `--extra-kconfig PATH` (read once in [`kernel_build`] before
+/// fanning out to per-version invocations). `Some(content)` folds
+/// into the cache key suffix via
+/// [`ktstr::cache_key_suffix_with_extra`] and into the configure
+/// pass via the Cow merge construction in
+/// [`ktstr::cli::kernel_build_pipeline`].
+#[allow(clippy::too_many_arguments)]
 fn kernel_build_one(
     version: Option<String>,
     source: Option<PathBuf>,
@@ -520,6 +570,7 @@ fn kernel_build_one(
     force: bool,
     clean: bool,
     cpu_cap: Option<usize>,
+    extra_kconfig: Option<&str>,
 ) -> Result<()> {
     use ktstr::cache::CacheDir;
     use ktstr::fetch;
@@ -547,7 +598,7 @@ fn kernel_build_one(
 
     // Acquire source.
     let client = fetch::shared_client();
-    let acquired = if let Some(ref src_path) = source {
+    let mut acquired = if let Some(ref src_path) = source {
         fetch::local_source(src_path)?
     } else if let Some(ref url) = git {
         let ref_name = git_ref.as_deref().expect("clap requires --ref with --git");
@@ -562,9 +613,17 @@ fn kernel_build_one(
             Some(v) => v,
             None => fetch::fetch_latest_stable_version(client, "ktstr")?,
         };
-        // Check cache before downloading.
+        // Check cache before downloading. Cache key folds in the
+        // merged-kconfig hash so an `--extra-kconfig` build looks
+        // up a distinct slot from a vanilla baked-in-only build —
+        // `cache_key_suffix_with_extra(None)` equals
+        // `cache_key_suffix()` so the no-extra path is byte-
+        // identical to pre-flag behavior.
         let (arch, _) = fetch::arch_info();
-        let cache_key = format!("{ver}-tarball-{arch}-kc{}", ktstr::cache_key_suffix());
+        let cache_key = format!(
+            "{ver}-tarball-{arch}-kc{}",
+            ktstr::cache_key_suffix_with_extra(extra_kconfig),
+        );
         if !force && let Some(entry) = cli::cache_lookup(&cache, &cache_key, "ktstr") {
             eprintln!("ktstr: cached kernel found: {}", entry.path.display());
             eprintln!("ktstr: use --force to rebuild");
@@ -573,8 +632,25 @@ fn kernel_build_one(
         let sp = cli::Spinner::start("Downloading kernel...");
         let result = fetch::download_tarball(client, &ver, tmp_dir.path(), "ktstr");
         drop(sp);
-        result?
+        let mut acquired = result?;
+        // `download_tarball` builds its `cache_key` against the bare
+        // `cache_key_suffix()` (see `fetch::download_tarball`).
+        // Override with the merged-suffix key we looked up under so
+        // the post-build cache store lands at the same slot we'd
+        // hit on a re-run with the same `--extra-kconfig`.
+        acquired.cache_key = cache_key;
+        acquired
     };
+
+    // For `--source` and `--git` paths, `local_source` and `git_clone`
+    // build `acquired.cache_key` against the bare `cache_key_suffix()`
+    // — already shaped `...-kc{baked_hash}`. With `--extra-kconfig`
+    // set, lift the `-xkc{extra_hash}` append to
+    // [`cli::append_extra_kconfig_suffix`] so both binaries share
+    // one merge path.
+    if source.is_some() || git.is_some() {
+        cli::append_extra_kconfig_suffix(&mut acquired.cache_key, extra_kconfig);
+    }
 
     // Check cache for --source and --git (tarball already checked above).
     if !force
@@ -606,6 +682,7 @@ fn kernel_build_one(
         clean,
         source.is_some(),
         resolved_cap,
+        extra_kconfig,
     )?;
 
     Ok(())
@@ -1617,7 +1694,17 @@ fn main() -> Result<()> {
                 force,
                 clean,
                 cpu_cap,
-            } => kernel_build(version, source, git, git_ref, force, clean, cpu_cap)?,
+                extra_kconfig,
+            } => kernel_build(
+                version,
+                source,
+                git,
+                git_ref,
+                force,
+                clean,
+                cpu_cap,
+                extra_kconfig,
+            )?,
             KernelCommand::Clean {
                 keep,
                 force,

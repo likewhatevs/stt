@@ -1268,11 +1268,11 @@ impl BpfProgOffsets {
 // TaskEnrichmentOffsets, ScxWalkerOffsets) compose these groups so:
 //
 //   1. Each kernel field is resolved exactly once across the codebase
-//      (deduplicated source of truth — task #45).
+//      (deduplicated source of truth).
 //   2. Higher-level structs that need only some groups can degrade
 //      gracefully: a missing `scx_sched_pnode` group blinds the global
 //      DSQ walk pass but leaves rq->scx + per-CPU local DSQ walks
-//      working (graceful degradation — task #43).
+//      working (graceful degradation).
 //
 // Convention: each sub-group's `from_btf` is all-or-nothing for ITS
 // struct (one field missing -> `Err`). Composers store the result as
@@ -1387,7 +1387,7 @@ impl ScxRqOffsets {
 /// fields here are read by every walker that touches a task — the
 /// runnable scanner, the rq->scx walker, the DSQ walker, and the
 /// task_enrichment walker. Resolved once and shared so
-/// `task_struct.scx` etc. exist as a single source of truth (task #45).
+/// `task_struct.scx` etc. exist as a single source of truth.
 ///
 /// Walkers that need additional task_struct fields (priority, signal,
 /// stack...) compose [`TaskStructEnrichmentOffsets`] alongside this.
@@ -1809,7 +1809,7 @@ impl RunnableScanOffsets {
     /// [`SchedExtEntityOffsets`] so `task_struct.scx` and the scx_rq /
     /// sched_ext_entity field offsets resolve from a single source of
     /// truth shared with [`ScxWalkerOffsets`] and
-    /// [`TaskEnrichmentOffsets`] (task #45).
+    /// [`TaskEnrichmentOffsets`].
     pub fn from_btf(btf: &Btf) -> Result<Self> {
         let scx_rq = ScxRqOffsets::from_btf(btf)?;
         let task_core = TaskStructCoreOffsets::from_btf(btf)?;
@@ -2014,7 +2014,7 @@ pub const NUMA_EVENT_NAMES: [&str; NR_VM_NUMA_EVENT_ITEMS] = [
 /// Byte offsets used to read per-node NUMA-event counters from
 /// guest memory.
 ///
-/// The walk path (#66 follow-up) is:
+/// The walk path is:
 ///   1. Resolve kernel symbol `node_data` — an array of
 ///      `pglist_data *` indexed by node id (declared in
 ///      `arch/x86/mm/numa.c::node_data[]` on x86 / `arch/arm64/mm/numa.c`
@@ -2202,8 +2202,8 @@ pub struct TaskEnrichmentOffsets {
 }
 
 #[allow(dead_code)] // wired into DumpContext + walk_task_enrichment;
-                    // freeze coordinator passes None until #50 (rq->scx
-                    // walker) lands a producer that builds
+                    // freeze coordinator passes None until the
+                    // rq->scx walker lands a producer that builds
                     // TaskEnrichmentCapture.
 impl TaskEnrichmentOffsets {
     /// Resolve all per-task / signal_struct / pid / upid offsets
@@ -2218,7 +2218,7 @@ impl TaskEnrichmentOffsets {
     /// [`SchedExtEntityOffsets`], [`SignalStructOffsets`],
     /// [`PidStructOffsets`], [`UpidStructOffsets`]) so each kernel
     /// field is resolved exactly once across the codebase
-    /// (deduplicated source of truth — task #45).
+    /// (deduplicated source of truth).
     pub fn from_btf(btf: &Btf) -> Result<Self> {
         let task_core = TaskStructCoreOffsets::from_btf(btf)?;
         let task_ext = TaskStructEnrichmentOffsets::from_btf(btf)?;
@@ -2317,8 +2317,7 @@ pub struct ScxWalkerOffsets {
     /// `struct task_struct` core offsets — `comm`, `pid`, `scx`.
     /// Required for both the runnable_list container_of walk and the
     /// DSQ list_head container_of walk. Shared single-source-of-truth
-    /// with [`RunnableScanOffsets`] and [`TaskEnrichmentOffsets`]
-    /// (task #45).
+    /// with [`RunnableScanOffsets`] and [`TaskEnrichmentOffsets`].
     pub task: Option<TaskStructCoreOffsets>,
     /// `struct sched_ext_entity` field offsets. Required for
     /// container_of math (`runnable_node`, `dsq_list`) and for

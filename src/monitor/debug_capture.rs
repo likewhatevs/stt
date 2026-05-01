@@ -22,7 +22,7 @@
 //!
 //! 3. **Workload fingerprint** ([`WorkloadFingerprint`]) — projected
 //!    HINTS in ktstr's test-primitive vocabulary that the reproducer
-//!    generator (#12) translates into a `WorkProgram` spec. NOT a
+//!    generator translates into a `WorkProgram` spec. NOT a
 //!    canonical reproducer; the projection is best-effort and the
 //!    reproducer generator (or human) decides which hints to honor.
 //!
@@ -32,11 +32,12 @@
 //! The actual periodic-loop binary that drives [`ctprof::capture`]
 //! and the failure trigger pipeline (tp_btf/sched_ext_exit fentry,
 //! per `research_live_host.md` phd-host4) are upstream producers
-//! that emit [`DebugCapture`]; the reproducer generator (#12) is
+//! that emit [`DebugCapture`]; the reproducer generator is
 //! the downstream consumer. Splitting at this module boundary keeps
 //! each side free to evolve independently.
 //!
-//! The fingerprint projection lives here (rather than in #12) because
+//! The fingerprint projection lives here (rather than in the reproducer
+//! generator module) because
 //! it's a pure function of capture data — the reproducer generator
 //! consumes the projected hints rather than re-deriving them, and
 //! that boundary is testable without a working producer or generator.
@@ -74,7 +75,7 @@ use super::dump::FailureDumpReport;
 
 /// One end-to-end debug capture record.
 ///
-/// Bundles every observation the reproducer generator (#12) needs to
+/// Bundles every observation the reproducer generator needs to
 /// translate a real-world failure into a ktstr test. Serializable so
 /// the periodic-loop binary can persist captures to disk and the
 /// reproducer generator can consume them offline.
@@ -85,8 +86,9 @@ use super::dump::FailureDumpReport;
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[non_exhaustive]
 #[allow(dead_code)] // wired from the (separate) capture-mode binary;
-                    // the library ships the data shape so #12 can
-                    // build against a stable surface.
+                    // the library ships the data shape so the
+                    // reproducer generator can build against a stable
+                    // surface.
 pub struct DebugCapture {
     /// Capture format schema identifier — pinned at construction so
     /// off-disk records older than the current shape parse via the
@@ -102,7 +104,7 @@ pub struct DebugCapture {
     /// time window.
     pub ended_ns: u64,
     /// Linux kernel release string (`uname -r`) of the captured
-    /// host. Used by the reproducer generator (#12) to choose a
+    /// host. Used by the reproducer generator to choose a
     /// matching ktstr kernel cache entry — without it, the reproducer
     /// might run against a different kernel than the failure
     /// originally occurred on.
@@ -159,7 +161,7 @@ pub struct CtprofSampleRef {
 /// Workload-shaped projection of capture data into ktstr test-
 /// primitive vocabulary.
 ///
-/// Each field is a HINT that the reproducer generator (#12) maps to
+/// Each field is a HINT that the reproducer generator maps to
 /// a corresponding type in `crate::workload`. Multiple hints fire on
 /// rich captures (e.g. a task that pinned itself to one CPU AND ran
 /// CPU-bound work AND lived in a cgroup with `cpu.weight=200` —
@@ -355,7 +357,7 @@ pub const DEBUG_CAPTURE_SCHEMA: &str = "ktstr.debug_capture/v1";
 /// Compute a [`WorkloadFingerprint`] from raw capture inputs.
 ///
 /// Pure function: same inputs always produce the same fingerprint.
-/// The reproducer generator (#12) and offline analysis tools call
+/// The reproducer generator and offline analysis tools call
 /// this directly to re-project hints from a stored capture without
 /// needing the live producer.
 ///
@@ -429,13 +431,13 @@ struct CgroupGroupAcc {
 ///
 /// Real implementation walks `snapshot.cgroup_stats` (or whatever
 /// per-cgroup field ctprof exposes — there are a few candidates;
-/// the actual one is wired up in #11's producer-side companion).
+/// the actual one is wired up in the capture-binary producer).
 /// Library-side this function is a contract: takes a snapshot,
 /// returns per-cgroup fingerprint atoms.
 fn cgroup_thread_groups(
     _snapshot: &crate::ctprof::CtprofSnapshot,
 ) -> Vec<(String, CgroupGroupAcc)> {
-    // The producer wiring is task-#11-binary's responsibility. The
+    // The producer wiring is the capture-binary's responsibility. The
     // library lands the contract: empty vec is "no usable groups
     // found in the snapshot" rather than a failure.
     Vec::new()
@@ -443,7 +445,7 @@ fn cgroup_thread_groups(
 
 fn project_affinity_hints(_dump: &FailureDumpReport) -> Vec<AffinityHint> {
     // Affinity projection reads task_enrichments[*].cpus_allowed_mask
-    // (not yet on the failure dump — follow-up to #28's enrichment
+    // (not yet on the failure dump — follow-up to per-task enrichment
     // expansion). Library lands the slot; producer wiring fills it.
     Vec::new()
 }
