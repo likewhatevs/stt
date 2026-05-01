@@ -90,6 +90,51 @@ enum event_type {
 #define TL_EVT_SWITCH  1
 #define TL_EVT_MIGRATE 2
 #define TL_EVT_WAKEUP  3
+/* Priority-inheritance boost / unboost event from
+ * `fentry/fexit` on `rt_mutex_setprio` (kernel/sched/core.c).
+ * Fires sparsely — only when a real-time mutex chain changes a
+ * task's effective priority. The probe pairs the entry-side
+ * snapshot (oldprio + prev_class kva) with the exit-side
+ * snapshot (newprio + next_class kva) via a per-task scratch
+ * map keyed by `p` (the task being boosted), then emits one
+ * timeline record carrying the prio pair.
+ *
+ * Field semantics by `type`:
+ *   TL_EVT_PI_BOOST:
+ *     prev_pid       = `current->pid` (probe-context tid)
+ *     next_pid       = `p->pid` (the boosted task's pid)
+ *     a              = `oldprio` (s32 widened to u64; kernel's
+ *                      `int` priority on `task_struct.prio`)
+ *     b              = `newprio` (s32 widened to u64)
+ *
+ * Class transitions are tracked separately — the
+ * pi_class_changes counter (ktstr_pi_class_change_count below)
+ * increments whenever fexit observes `next_class != prev_class`,
+ * surfacing the class-flip count without bloating the per-event
+ * wire shape. A future expansion can emit a dedicated
+ * TL_EVT_CLASS_TRANSITION record once the host-side renderer
+ * needs per-event class tracking.
+ */
+#define TL_EVT_PI_BOOST 4
+/* Lock contention begin event from `lock:contention_begin`
+ * tracepoint (always available, no `CONFIG_LOCK_STAT` gate —
+ * kernel/locking/lockdep.c emits it unconditionally on any
+ * waiter-side contention path). Fires whenever a task waits on
+ * a contended mutex / rwsem / spinlock; gives the host-side
+ * timeline a per-lock contention sequence to correlate with
+ * scheduling stalls.
+ *
+ * Field semantics by `type`:
+ *   TL_EVT_LOCK_CONTEND:
+ *     prev_pid       = `current->pid`
+ *     next_pid       = 0 (unused)
+ *     a              = lock pointer (kernel virtual address)
+ *     b              = lock flags (u32 from the tracepoint;
+ *                      LCB_* class bits — F_SPIN, F_READ,
+ *                      F_WRITE, F_RT — see
+ *                      include/trace/events/lock.h).
+ */
+#define TL_EVT_LOCK_CONTEND 5
 
 /* Ring-buffer record written by the sched_* tracepoint handlers
  * into the dedicated `timeline_events` ringbuf. Compact (40 bytes)

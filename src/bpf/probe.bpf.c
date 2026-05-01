@@ -232,6 +232,83 @@ u64 ktstr_timeline_count = 0;
  * window or only the tail. */
 u64 ktstr_timeline_drops = 0;
 
+/* Cumulative count of priority-inheritance transitions captured
+ * via `fentry/fexit` on `rt_mutex_setprio` (#61). Sparse — the
+ * kernel function is called only when an rt_mutex waiter chain
+ * changes a task's effective priority, so a value of 0 is the
+ * common steady state on any test that does not exercise PI.
+ * Bumped on the fexit path after the timeline record commits, so
+ * the count mirrors successful submissions; drops bump
+ * `ktstr_pi_drops` instead. */
+u64 ktstr_pi_count = 0;
+
+/* Cumulative count of fexit fires that lost their entry-side
+ * snapshot — fentry never recorded an entry for the same
+ * task pointer (e.g. an attach-time race where fexit fired before
+ * fentry on the same call, or pi_scratch overflow rejected the
+ * entry). Stays 0 in steady state on any well-formed run. */
+u64 ktstr_pi_orphan_fexits = 0;
+
+/* Cumulative count of priority-inheritance transitions where the
+ * task's `sched_class` changed from fentry to fexit (e.g. PI
+ * promoted a CFS task into the RT class via `rt_mutex_setprio`'s
+ * `__setscheduler_class` call). Bumped on the fexit path BEFORE
+ * the timeline record commits, so the count tracks observed
+ * class-flip events even if a subsequent ringbuf reserve drops
+ * the timeline record. The companion timeline record carries
+ * only the prio pair; this counter is the structural surface for
+ * "did any class transition happen during the test?" without
+ * forcing a per-event wire bump. */
+u64 ktstr_pi_class_change_count = 0;
+
+/* Cumulative count of TL_EVT_PI_BOOST submissions that failed
+ * because the dedicated `timeline_events` ringbuf was full when
+ * the PI fexit handler tried to commit. Distinct from
+ * `ktstr_timeline_drops` so an operator can tell which producer
+ * fell behind on the drain. */
+u64 ktstr_pi_drops = 0;
+
+/* Cumulative count of `lock:contention_begin` tracepoint fires
+ * that committed a TL_EVT_LOCK_CONTEND timeline record (#63).
+ * The tracepoint is unconditionally available in mainline (see
+ * include/trace/events/lock.h); CONFIG_LOCK_STAT is NOT a gate.
+ * A non-zero count proves the tracepoint attached and a real
+ * lock-contention waiter path was hit during the run. */
+u64 ktstr_lock_contend_count = 0;
+
+/* Cumulative count of TL_EVT_LOCK_CONTEND timeline-event
+ * submissions that failed because the ringbuf was full. */
+u64 ktstr_lock_contend_drops = 0;
+
+/* Per-task scratch map for `rt_mutex_setprio` fentry/fexit
+ * pairing (#61). Keyed by `p` (the boosted task's `task_struct *`),
+ * storing the entry-side snapshot the fexit handler needs to
+ * detect a class transition and emit a complete prio-pair record.
+ * Sized at 1024 entries — at most `num_online_cpus`
+ * `rt_mutex_setprio` calls can be in flight simultaneously (the
+ * function holds `p->pi_lock`), but mutex chains can boost many
+ * distinct tasks; 1024 gives ample headroom for any realistic
+ * ktstr scenario.
+ *
+ * BPF_MAP_TYPE_HASH (not LRU) so an orphan entry that fexit never
+ * paired stays around and surfaces as `ktstr_pi_orphan_fexits` on
+ * the next fentry that reuses the slot — LRU silent-eviction
+ * would mask the producer bug. The fexit handler always deletes
+ * the entry after a successful pair, so steady-state map
+ * occupancy stays at the in-flight count. */
+struct pi_entry {
+	unsigned long long ts;
+	int oldprio;
+	unsigned long long prev_class;  /* `p->sched_class` kva at entry */
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, u64);
+	__type(value, struct pi_entry);
+	__uint(max_entries, 1024);
+} pi_scratch SEC(".maps");
+
 /* Log of IPs that missed func_meta_map lookup, for diagnosis. */
 u64 ktstr_miss_log[MAX_MISS_LOG] = {};
 u32 ktstr_miss_log_idx = 0;
@@ -670,5 +747,151 @@ int BPF_PROG(ktstr_tl_wakeup, struct task_struct *p)
 
 	bpf_ringbuf_submit(e, 0);
 	__sync_fetch_and_add(&ktstr_timeline_count, 1);
+	return 0;
+}
+
+/*
+ * Priority-inheritance fentry/fexit on `rt_mutex_setprio` (#61).
+ *
+ * `rt_mutex_setprio(struct task_struct *p, struct task_struct *pi_task)`
+ * (kernel/sched/core.c) is the canonical entry point for PI-driven
+ * priority changes. The function:
+ *   - reads the boosted task's old priority (`p->prio`);
+ *   - if `pi_task != NULL`, sets `p->prio = pi_task->prio` (boost);
+ *   - otherwise resets `p->prio` from `p->normal_prio` (deboost);
+ *   - calls `__setscheduler_class` to flip `p->sched_class` if the
+ *     new prio crosses the RT boundary (e.g. CFS -> RT under boost).
+ *
+ * The fentry/fexit pair captures (oldprio, prev_class) at entry and
+ * (newprio, next_class) at exit, stitched via the `pi_scratch` map
+ * keyed by `p`. The fexit handler emits a TL_EVT_PI_BOOST timeline
+ * record carrying the prio pair; class flips bump
+ * `ktstr_pi_class_change_count` separately so the wire shape stays
+ * compatible with the existing `struct timeline_event`.
+ *
+ * Both probes gate on `ktstr_enabled` so PI events only land once
+ * userspace has finished probe attach — fentry/fexit are
+ * registered before tests start, but rt_mutex_setprio can fire
+ * during early kernel boot (e.g. systemd's PI-using mutexes).
+ *
+ * Sparse by design: `rt_mutex_setprio` is only invoked from the
+ * rt_mutex chain-walk path (kernel/locking/rtmutex.c
+ * `task_blocks_on_rt_mutex` -> `rt_mutex_adjust_prio_chain` ->
+ * `rt_mutex_setprio`) plus a single call from `do_set_cpus_allowed`
+ * for affinity changes, so steady-state fire count is zero on a
+ * test that does not exercise rt_mutex contention. The 1024-entry
+ * `pi_scratch` map is amply sized for realistic concurrency.
+ */
+SEC("fentry/rt_mutex_setprio")
+int BPF_PROG(ktstr_pi_fentry, struct task_struct *p,
+	     struct task_struct *pi_task)
+{
+	if (!ktstr_enabled)
+		return 0;
+
+	struct pi_entry entry = {};
+	entry.ts = bpf_ktime_get_ns();
+	entry.oldprio = BPF_CORE_READ(p, prio);
+	entry.prev_class = (u64)BPF_CORE_READ(p, sched_class);
+
+	u64 key = (u64)p;
+	bpf_map_update_elem(&pi_scratch, &key, &entry, BPF_ANY);
+	return 0;
+}
+
+SEC("fexit/rt_mutex_setprio")
+int BPF_PROG(ktstr_pi_fexit, struct task_struct *p,
+	     struct task_struct *pi_task)
+{
+	if (!ktstr_enabled)
+		return 0;
+
+	u64 key = (u64)p;
+	struct pi_entry *entry = bpf_map_lookup_elem(&pi_scratch, &key);
+	if (!entry) {
+		__sync_fetch_and_add(&ktstr_pi_orphan_fexits, 1);
+		return 0;
+	}
+
+	int newprio = BPF_CORE_READ(p, prio);
+	u64 next_class = (u64)BPF_CORE_READ(p, sched_class);
+
+	/* Class flip count bumps BEFORE the ringbuf reserve so a
+	 * drop on the wire still surfaces the structural class-
+	 * transition fact via the counter. */
+	if (next_class != entry->prev_class) {
+		__sync_fetch_and_add(&ktstr_pi_class_change_count, 1);
+	}
+
+	struct timeline_event *e = bpf_ringbuf_reserve(&timeline_events,
+						       sizeof(*e), 0);
+	if (!e) {
+		__sync_fetch_and_add(&ktstr_pi_drops, 1);
+		bpf_map_delete_elem(&pi_scratch, &key);
+		return 0;
+	}
+
+	e->type     = TL_EVT_PI_BOOST;
+	e->cpu      = bpf_get_smp_processor_id();
+	e->ts       = bpf_ktime_get_ns();
+	e->prev_pid = (unsigned int)bpf_get_current_pid_tgid();
+	e->next_pid = (unsigned int)BPF_CORE_READ(p, pid);
+	/* `prio` is `int` in the kernel (signed -20..139 range plus
+	 * sentinel). Widen to u64 via the s32 conversion so a negative
+	 * value sign-extends predictably; userspace re-narrows to i32
+	 * for display. */
+	e->a        = (u64)(s64)entry->oldprio;
+	e->b        = (u64)(s64)newprio;
+
+	bpf_ringbuf_submit(e, 0);
+	__sync_fetch_and_add(&ktstr_pi_count, 1);
+
+	bpf_map_delete_elem(&pi_scratch, &key);
+	return 0;
+}
+
+/*
+ * Lock contention begin tracepoint (#63).
+ *
+ * `tp_btf/contention_begin` fires from `kernel/locking/lockdep.c`
+ * (`lock_contended` -> `__lock_contended` -> `trace_contention_begin`)
+ * whenever a waiter blocks on a contended lock. The tracepoint is
+ * unconditionally available in mainline — `CONFIG_LOCK_STAT` is NOT
+ * a gate (only the trace_pipe / debugfs surface depends on it; the
+ * tp_btf attach point is always present per
+ * `include/trace/events/lock.h::DECLARE_EVENT_CLASS(contention_begin)`).
+ *
+ * Tracepoint signature: `(void *lock, unsigned int flags)`. The
+ * `flags` field carries `LCB_*` class bits — `F_SPIN`, `F_READ`,
+ * `F_WRITE`, `F_RT`, `F_PERCPU`, `F_MUTEX` — which userspace can
+ * decode to attribute the contention to spinlock vs rwsem vs mutex
+ * vs RT-mutex contention.
+ *
+ * Gated on `ktstr_enabled` so the timeline only records once
+ * userspace has finished probe attach.
+ */
+SEC("tp_btf/contention_begin")
+int BPF_PROG(ktstr_lock_contend, void *lock, unsigned int flags)
+{
+	if (!ktstr_enabled)
+		return 0;
+
+	struct timeline_event *e = bpf_ringbuf_reserve(&timeline_events,
+						       sizeof(*e), 0);
+	if (!e) {
+		__sync_fetch_and_add(&ktstr_lock_contend_drops, 1);
+		return 0;
+	}
+
+	e->type     = TL_EVT_LOCK_CONTEND;
+	e->cpu      = bpf_get_smp_processor_id();
+	e->ts       = bpf_ktime_get_ns();
+	e->prev_pid = (unsigned int)bpf_get_current_pid_tgid();
+	e->next_pid = 0;
+	e->a        = (u64)(unsigned long)lock;
+	e->b        = (u64)flags;
+
+	bpf_ringbuf_submit(e, 0);
+	__sync_fetch_and_add(&ktstr_lock_contend_count, 1);
 	return 0;
 }

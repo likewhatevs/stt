@@ -123,15 +123,78 @@ pub struct ProgRuntimeStats {
     pub misses: u64,
 }
 
+impl ProgRuntimeStats {
+    /// Mean nanoseconds per invocation: `nsecs / cnt`. Returns
+    /// `0.0` when `cnt == 0` (program never ran or counter not
+    /// running) so the result never propagates `NaN` / `Infinity`
+    /// into downstream `finite_or_zero` filters. Method-only access
+    /// (no stored shadow) — recomputed every call from the raw
+    /// fields, matching the [`super::super::assert::CgroupStats::wake_latency_tail_ratio`]
+    /// derived-ratio convention.
+    ///
+    /// Unitless-from-bpftop's perspective: bpftop-style triage
+    /// reads "ns/call" as the primary cost-per-invocation metric;
+    /// surfacing it here lets a failure-dump consumer compare two
+    /// programs' per-call cost without dividing the wire counters
+    /// manually.
+    pub fn ns_per_call(&self) -> f64 {
+        if self.cnt > 0 {
+            self.nsecs as f64 / self.cnt as f64
+        } else {
+            0.0
+        }
+    }
+
+    /// Fraction of invocation attempts blocked by the per-CPU
+    /// recursion guard: `misses / (cnt + misses)`. Returns `0.0`
+    /// when both counters are zero (no signal); never produces
+    /// `NaN` / `Infinity` even on a saturated `cnt + misses`
+    /// overflow because `saturating_add` floors at `u64::MAX` and
+    /// the resulting denominator is non-zero.
+    ///
+    /// A non-trivial miss rate signals lock contention or a
+    /// misconfigured recursion guard — bpftop-style triage flags
+    /// any program with `miss_rate > 0.01` as a hot recursion
+    /// path. Method-only access (no stored shadow); the wire
+    /// format carries `cnt` and `misses` separately so consumers
+    /// who want the raw counts can recover them.
+    pub fn miss_rate(&self) -> f64 {
+        let total = self.cnt.saturating_add(self.misses);
+        if total > 0 {
+            self.misses as f64 / total as f64
+        } else {
+            0.0
+        }
+    }
+}
+
 impl std::fmt::Display for ProgRuntimeStats {
     /// One-line summary used by [`super::dump::FailureDumpReport`]'s
-    /// human-readable rendering: name + the three counter sums.
+    /// human-readable rendering: name + the three counter sums plus
+    /// the bpftop-style derived metrics (ns/call, miss-rate fraction).
+    /// Derived metrics elide when their guards fire (cnt==0 or
+    /// cnt+misses==0) so a program that never ran renders without
+    /// misleading "0.000 ns/call" noise.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
             "{}: cnt={} nsecs={} misses={}",
             self.name, self.cnt, self.nsecs, self.misses
-        )
+        )?;
+        if self.cnt > 0 {
+            // Three decimals on ns/call: bpftop uses two; we add
+            // one for sub-microsecond precision since scheduler
+            // BPF ops typically run in tens of nanoseconds.
+            write!(f, " ns/call={:.3}", self.ns_per_call())?;
+        }
+        if self.cnt.saturating_add(self.misses) > 0 && self.misses > 0 {
+            // Render miss_rate only when there were actual misses
+            // — `0.000` would just be noise on healthy programs.
+            // Four decimals: a 0.0001 (= 1 in 10K) miss rate is
+            // already actionable for a hot scheduler op.
+            write!(f, " miss_rate={:.4}", self.miss_rate())?;
+        }
+        Ok(())
     }
 }
 
@@ -516,6 +579,12 @@ mod tests {
     /// [`super::dump::FailureDumpReport`]'s human-readable rendering;
     /// pin the format so a downstream change to the impl is caught
     /// before the failure-dump output silently changes shape.
+    ///
+    /// Two derived metrics surface on the line when their guards
+    /// pass: `ns/call` whenever `cnt > 0`, and `miss_rate`
+    /// whenever there are any misses. A program that never ran
+    /// (cnt=0) elides both — `prog_runtime_stats_display_zero_counters_elides_derived`
+    /// covers that branch.
     #[test]
     fn prog_runtime_stats_display_format() {
         let info = ProgRuntimeStats {
@@ -524,10 +593,141 @@ mod tests {
             nsecs: 200,
             misses: 3,
         };
+        // cnt=100, nsecs=200 → ns/call = 2.000.
+        // misses=3, cnt+misses=103 → miss_rate = 3/103 ≈ 0.0291.
         assert_eq!(
             format!("{info}"),
-            "ktstr_enqueue: cnt=100 nsecs=200 misses=3"
+            "ktstr_enqueue: cnt=100 nsecs=200 misses=3 ns/call=2.000 miss_rate=0.0291",
         );
+    }
+
+    /// A program that never ran (cnt=0) renders only the four
+    /// raw counters — both derived metrics are guarded out.
+    /// Pin the elision so a regression that strips the guard and
+    /// emits "ns/call=0.000 miss_rate=0.0000" surfaces here.
+    #[test]
+    fn prog_runtime_stats_display_zero_counters_elides_derived() {
+        let info = ProgRuntimeStats {
+            name: "never_ran".to_string(),
+            cnt: 0,
+            nsecs: 0,
+            misses: 0,
+        };
+        let s = format!("{info}");
+        assert_eq!(s, "never_ran: cnt=0 nsecs=0 misses=0");
+        assert!(!s.contains("ns/call"), "ns/call must elide when cnt=0: {s}");
+        assert!(!s.contains("miss_rate"), "miss_rate must elide when total=0: {s}");
+    }
+
+    /// Healthy program with no recursion misses — `ns/call`
+    /// surfaces but `miss_rate` elides (since misses=0).
+    /// A regression that flipped the gate and rendered a
+    /// "miss_rate=0.0000" line on every healthy program would
+    /// trip here.
+    #[test]
+    fn prog_runtime_stats_display_no_misses_elides_miss_rate() {
+        let info = ProgRuntimeStats {
+            name: "healthy".to_string(),
+            cnt: 1000,
+            nsecs: 50_000,
+            misses: 0,
+        };
+        let s = format!("{info}");
+        assert!(s.contains("ns/call=50.000"), "ns/call must render: {s}");
+        assert!(
+            !s.contains("miss_rate"),
+            "miss_rate must elide when misses=0: {s}",
+        );
+    }
+
+    /// `ns_per_call` derived accessor: pin happy-path math + zero-
+    /// divisor guard. Mirrors the `CgroupStats::wake_latency_tail_ratio`
+    /// test pattern from assert.rs.
+    #[test]
+    fn prog_runtime_stats_ns_per_call_derived() {
+        // Happy path: 1000 cnt + 50000 nsecs = 50 ns/call.
+        let info = ProgRuntimeStats {
+            name: "x".to_string(),
+            cnt: 1000,
+            nsecs: 50_000,
+            misses: 0,
+        };
+        assert_eq!(info.ns_per_call(), 50.0);
+        assert!(info.ns_per_call().is_finite());
+
+        // Zero divisor: cnt=0 → 0.0 (not NaN).
+        let info = ProgRuntimeStats {
+            name: "x".to_string(),
+            cnt: 0,
+            nsecs: 999_999,
+            misses: 0,
+        };
+        assert_eq!(info.ns_per_call(), 0.0);
+        assert!(info.ns_per_call().is_finite());
+    }
+
+    /// `miss_rate` derived accessor: pin happy-path math + zero-
+    /// divisor guard + saturating_add edge.
+    #[test]
+    fn prog_runtime_stats_miss_rate_derived() {
+        // Happy path: 9 misses / (1 cnt + 9 misses) = 0.9.
+        let info = ProgRuntimeStats {
+            name: "x".to_string(),
+            cnt: 1,
+            nsecs: 0,
+            misses: 9,
+        };
+        assert!((info.miss_rate() - 0.9).abs() < 1e-12);
+        assert!(info.miss_rate().is_finite());
+
+        // Zero divisor: both counters zero → 0.0 (not NaN).
+        let info = ProgRuntimeStats::default();
+        assert_eq!(info.miss_rate(), 0.0);
+        assert!(info.miss_rate().is_finite());
+
+        // Saturating-add edge: cnt at u64::MAX, misses also non-
+        // trivial — `saturating_add` floors at u64::MAX, so the
+        // denominator stays non-zero and the rate is finite.
+        let info = ProgRuntimeStats {
+            name: "saturated".to_string(),
+            cnt: u64::MAX,
+            nsecs: 0,
+            misses: 1000,
+        };
+        assert!(info.miss_rate().is_finite());
+        // Result is essentially 0 (1000 / u64::MAX) but the
+        // important contract is finiteness — a regression that
+        // overflowed and produced inf/NaN trips here.
+        assert!(info.miss_rate() >= 0.0);
+    }
+
+    /// Wire format must NOT carry the derived ratios — they are
+    /// method-only and recomputed on read. Pin so a regression
+    /// that re-introduces a stored shadow trips here.
+    #[test]
+    fn prog_runtime_stats_wire_format_omits_derived_keys() {
+        let info = ProgRuntimeStats {
+            name: "x".to_string(),
+            cnt: 100,
+            nsecs: 200,
+            misses: 3,
+        };
+        let json = serde_json::to_value(&info).unwrap();
+        let map = match json {
+            serde_json::Value::Object(m) => m,
+            other => panic!("expected object, got {other:?}"),
+        };
+        assert!(
+            !map.contains_key("ns_per_call"),
+            "derived methods must NOT appear as wire fields: {map:#?}",
+        );
+        assert!(
+            !map.contains_key("miss_rate"),
+            "derived methods must NOT appear as wire fields: {map:#?}",
+        );
+        // Cross-check: methods still compute correctly.
+        assert_eq!(info.ns_per_call(), 2.0);
+        assert!((info.miss_rate() - 3.0_f64 / 103.0).abs() < 1e-12);
     }
 
     /// Format chain integration: the `ProgRuntimeStats` Display
@@ -557,8 +757,13 @@ mod tests {
             misses: 1,
         };
         let inner = format!("{info}");
-        // Direct Display on ProgRuntimeStats: pinned shape.
-        assert_eq!(inner, "chain_test: cnt=7 nsecs=42 misses=1");
+        // Direct Display on ProgRuntimeStats: pinned shape includes
+        // the bpftop-style derived metrics (#22). cnt=7 nsecs=42 →
+        // ns/call=6.000; misses=1 → miss_rate=1/8=0.1250.
+        assert_eq!(
+            inner,
+            "chain_test: cnt=7 nsecs=42 misses=1 ns/call=6.000 miss_rate=0.1250",
+        );
 
         let report = FailureDumpReport {
             schema: SCHEMA_SINGLE.to_string(),

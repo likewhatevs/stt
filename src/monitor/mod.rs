@@ -28,11 +28,13 @@ pub mod idr;
 pub mod live_host_kernel;
 pub mod perf_counters;
 pub mod reader;
+pub mod reproducer_gen;
 pub mod runnable_scan;
 pub mod scx_walker;
 pub mod sdt_alloc;
 pub mod symbols;
 pub mod task_enrichment;
+pub mod timeline;
 
 /// Guest physical address of the top-level page-table page (CR3 on x86,
 /// TTBR1 on aarch64). Newtype around `u64` so address kinds can't

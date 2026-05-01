@@ -206,6 +206,47 @@ enum KtstrCommand {
         #[arg(long, value_delimiter = ',')]
         profiles: Vec<String>,
     },
+    /// Throw a costume party for a JSON dump — replaces every
+    /// identifier (pid / tid / cpu / cgroup / comm / scheduler /
+    /// label) with a deterministic `adjective-animal` petname so a
+    /// downstream LLM can reason about the structural shape of
+    /// the dump without dragging real identifiers into its
+    /// context. The transformation is one-way: there is no
+    /// reverse-mapping file by design.
+    ///
+    /// `swift-otter` is just `swift-otter` — fun, terse, and
+    /// recognizable as a placeholder. Two pids that share the
+    /// same numeric value (across the same dump) get the same fun
+    /// name so cross-references inside the dump survive.
+    ///
+    /// Reads JSON from `input` (or stdin when no path is given)
+    /// and writes the funified JSON to stdout. Fields that
+    /// classify as identifiers per
+    /// [`Funifier::classify_key`](ktstr::fun::Funifier::classify_key)
+    /// are funified; everything else passes through. Non-JSON
+    /// input fails fast with the serde_json parse error.
+    ///
+    /// Visible alias `costume` matches the costume-party theme.
+    #[command(visible_alias = "costume")]
+    Funify {
+        /// Path to a JSON file (typically a `failure_dump.json` or
+        /// debug-capture .json artefact). Pass `-` (or omit) to
+        /// read from stdin.
+        #[arg(value_name = "INPUT")]
+        input: Option<PathBuf>,
+        /// Optional seed string. With a fixed seed, the same input
+        /// always produces the same fun output across invocations
+        /// of this binary — useful for cross-dump correlation when
+        /// multiple `funify` runs need to agree on names. Omit for
+        /// a process-fresh ephemeral key (different fun names per
+        /// run).
+        #[arg(long)]
+        seed: Option<String>,
+        /// Pretty-print the output JSON. Default emits compact
+        /// JSON suitable for piping into another tool.
+        #[arg(long)]
+        pretty: bool,
+    },
     /// Generate shell completions for cargo-ktstr.
     Completions {
         /// Shell to generate completions for.
@@ -3342,6 +3383,65 @@ fn run_completions(shell: clap_complete::Shell, binary: &str) {
     clap_complete::generate(shell, &mut cmd, binary, &mut std::io::stdout());
 }
 
+/// `cargo ktstr funify <input>` — read a JSON dump, replace
+/// identifiers (per
+/// [`ktstr::fun::Funifier::classify_key`](ktstr::fun::Funifier::classify_key))
+/// with `adjective-animal` petnames, write the result to stdout.
+///
+/// `seed.is_some()` makes the mapping deterministic across
+/// invocations of this binary so a user running `funify` twice on
+/// the same dump gets identical fun names (and can correlate fun
+/// names across two related dumps). `seed.is_none()` derives a
+/// process-fresh ephemeral key — every invocation produces a
+/// different fun name for the same input.
+///
+/// Errors are returned as `String` (matching the existing
+/// `Result<(), String>` shape every other run_* helper uses), so
+/// the dispatch site's `error: {e:#}` formatter handles them
+/// uniformly.
+fn run_funify(
+    input: Option<PathBuf>,
+    seed: Option<String>,
+    pretty: bool,
+) -> Result<(), String> {
+    use std::io::Read;
+
+    // Read input: stdin when no path is given OR when path is the
+    // explicit "-" sentinel; otherwise read the file at `input`.
+    let from_stdin = match input.as_deref() {
+        None => true,
+        Some(p) => p.as_os_str() == "-",
+    };
+    let raw = if from_stdin {
+        let mut s = String::new();
+        std::io::stdin()
+            .read_to_string(&mut s)
+            .map_err(|e| format!("read stdin: {e}"))?;
+        s
+    } else {
+        let p = input.as_deref().unwrap();
+        std::fs::read_to_string(p).map_err(|e| format!("read {}: {e}", p.display()))?
+    };
+
+    let value: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("parse JSON input: {e}"))?;
+
+    let funifier = match seed {
+        Some(s) => ktstr::fun::Funifier::with_seed(&s),
+        None => ktstr::fun::Funifier::ephemeral(),
+    };
+    let funified = ktstr::fun::funify_json(value, &funifier);
+
+    let out = if pretty {
+        serde_json::to_string_pretty(&funified)
+    } else {
+        serde_json::to_string(&funified)
+    }
+    .map_err(|e| format!("serialize funified JSON: {e}"))?;
+    println!("{out}");
+    Ok(())
+}
+
 /// `cargo ktstr model fetch` — download + SHA-check the default model
 /// into the user's cache. Wraps `ktstr::test_support::ensure` with a
 /// human-readable progress line; the status is printed after so
@@ -3548,6 +3648,11 @@ fn main() {
             all_profiles,
             profiles,
         ),
+        KtstrCommand::Funify {
+            input,
+            seed,
+            pretty,
+        } => run_funify(input, seed, pretty),
         KtstrCommand::Completions { shell, binary } => {
             run_completions(shell, &binary);
             Ok(())

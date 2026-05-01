@@ -443,18 +443,21 @@ pub enum WorkType {
         burst_iters: u64,
     },
     /// Pipeline of waker-wakee hops `A → B → C → ...` of `depth`
-    /// stages, optionally with `fanout` parallel chains. Stage
-    /// boundaries use a pipe (when `sync = true`, raising
-    /// `WF_SYNC` on the wakeup) or a futex (when `sync = false`,
-    /// no `WF_SYNC`). Each hop burns `work_per_hop` of CPU work
-    /// before signalling the next stage. Tests `SCX_WAKE_SYNC`
-    /// path under producer-consumer NUMA pinning.
+    /// Workers form a ring chain of `depth` stages, optionally
+    /// with `fanout` parallel chains. Each chain owns one shared
+    /// 4-byte futex word; the active stage rotates through
+    /// `0..depth`. The active stage burns `work_per_hop` of CPU
+    /// work, advances the word to `(pos + 1) % depth`, and
+    /// `FUTEX_WAKE`s the chain — only the next stage's worker
+    /// satisfies its wait predicate and proceeds. Tests
+    /// `SCX_WAKE_SYNC` path under producer-consumer NUMA pinning.
     ///
     /// Worker indices are partitioned into `fanout` chains of
-    /// `depth` workers each. `worker_group_size = depth * fanout`.
-    /// At the end of the chain the last worker loops back to the
-    /// first, forming a ring so the work pattern can run for a
-    /// long test window.
+    /// `depth` workers each. `worker_group_size = depth` so the
+    /// spawn-side allocates `fanout` independent futex regions
+    /// (one per chain). At the end of the chain the last worker
+    /// loops back to the first, forming a ring so the work
+    /// pattern can run for a long test window.
     WakeChain {
         /// Number of workers per chain. Each worker waits for its
         /// predecessor's signal, does `work_per_hop` of CPU work,
@@ -464,10 +467,14 @@ pub enum WorkType {
         /// linear chain; `fanout > 1` runs multiple chains in
         /// parallel, all sharing one configuration.
         fanout: usize,
-        /// `true`: stage boundary is a 1-byte pipe write that the
-        /// kernel translates into a `WF_SYNC`-tagged wakeup
-        /// (kernel/exit.c et al). `false`: stage boundary is a
-        /// futex word advance with no `WF_SYNC` flag.
+        /// Reserved for future per-stage pipe wiring. `true` is
+        /// intended to add a 1-byte pipe write per stage so the
+        /// kernel raises `WF_SYNC` on the wakeup
+        /// (`kernel/sched/core.c::ttwu_queue` / `try_to_wake_up`);
+        /// `false` keeps the futex-only path (no `WF_SYNC`). The
+        /// current implementation uses the futex path for both
+        /// values — pipe wiring requires per-stage pipe pairs in
+        /// `SpawnGuard` that don't yet exist.
         sync: bool,
         /// Wall-clock CPU work each worker performs per stage
         /// before signalling the next. Use [`Duration`] to keep
@@ -827,7 +834,7 @@ impl WorkType {
             // chains run in parallel via `fanout`. Group size is
             // the per-chain size; num_workers must equal
             // depth * fanout.
-            WorkType::WakeChain { depth, fanout, .. } => Some(depth * fanout),
+            WorkType::WakeChain { depth, .. } => Some(*depth),
             _ => None,
         }
     }
@@ -2774,11 +2781,20 @@ impl WorkloadHandle {
                 None
             };
 
-            // Futex pointer for this worker (FutexPingPong/FutexFanOut).
-            let worker_futex: Option<(*mut u32, bool)> = if needs_futex {
+            // Futex pointer for this worker. The `pos` is the
+            // worker's index inside its futex group: `pos == 0`
+            // is the group's "first" worker (the role that varies
+            // per-variant — pair-A for FutexPingPong, messenger for
+            // FutexFanOut/FanOutCompute, waker for ThunderingHerd/
+            // AsymmetricWaker, chain-head for WakeChain). Variants
+            // that need finer-grained per-worker positioning
+            // (PriorityInversion's 3 tiers, ProducerConsumerImbalance's
+            // producer/consumer split, RtStarvation's RT/CFS split,
+            // WakeChain's stage index) consume `pos` directly.
+            let worker_futex: Option<(*mut u32, usize)> = if needs_futex {
                 let group_idx = i / futex_group_size;
-                let is_first = i % futex_group_size == 0;
-                Some((guard.futex_ptrs[group_idx], is_first))
+                let pos = i % futex_group_size;
+                Some((guard.futex_ptrs[group_idx], pos))
             } else {
                 None
             };
@@ -3566,7 +3582,7 @@ fn worker_main(
     mpol_flags: MpolFlags,
     nice: i32,
     pipe_fds: Option<(i32, i32)>,
-    futex: Option<(*mut u32, bool)>,
+    futex: Option<(*mut u32, usize)>,
     iter_slot: *mut AtomicU64,
 ) -> WorkerReport {
     // `getpid()` returns `pid_t` — keep the native type all the way
@@ -3787,10 +3803,11 @@ fn worker_main(
                 iterations += 1;
             }
             WorkType::FutexPingPong { spin_iters } => {
-                let (futex_ptr, is_first) = match futex {
+                let (futex_ptr, pos) = match futex {
                     Some(f) => f,
                     None => break,
                 };
+                let is_first = pos == 0;
                 spin_burst(&mut work_units, spin_iters);
                 // Worker A waits for 0, wakes partner with 1.
                 // Worker B waits for 1, wakes partner with 0.
@@ -3879,10 +3896,11 @@ fn worker_main(
                 fan_out,
                 spin_iters,
             } => {
-                let (futex_ptr, is_messenger) = match futex {
+                let (futex_ptr, pos) = match futex {
                     Some(f) => f,
                     None => break,
                 };
+                let is_messenger = pos == 0;
                 spin_burst(&mut work_units, spin_iters);
                 // Atomic-Relaxed idiom matches FanOutCompute /
                 // MutexContention; futex syscalls supply the kernel-
@@ -4128,10 +4146,11 @@ fn worker_main(
                 sleep_usec,
                 ..
             } => {
-                let (futex_ptr, is_messenger) = match futex {
+                let (futex_ptr, pos) = match futex {
                     Some(f) => f,
                     None => break,
                 };
+                let is_messenger = pos == 0;
                 // Shared memory layout: [u64 generation @ offset 0]
                 // [u64 wake_ns @ offset 8]. The mmap base is
                 // page-aligned (see the futex-region MAP_ANONYMOUS
@@ -4381,7 +4400,9 @@ fn worker_main(
                 work_iters,
                 ..
             } => {
-                let (futex_ptr, _) = match futex {
+                // pos discarded: every contender competes equally on
+                // the same futex word — no per-position differentiation.
+                let (futex_ptr, _pos) = match futex {
                     Some(f) => f,
                     None => break,
                 };
@@ -4439,8 +4460,8 @@ fn worker_main(
                 // Single global futex: every worker in the group
                 // shares the same `futex_ptr` because
                 // `worker_group_size = waiters + 1` collapses the
-                // herd into one group. Worker 0 is the waker
-                // (`is_first`); workers 1..=waiters are waiters.
+                // herd into one group. `pos == 0` is the waker;
+                // `pos > 0` are waiters.
                 //
                 // Waker: increment generation, FUTEX_WAKE(INT_MAX)
                 // — broadcasts to every parked waiter
@@ -4461,10 +4482,11 @@ fn worker_main(
                 // waker stops triggering and the waiters drain.
                 // STOP from SIGUSR1 unblocks both sides via the
                 // FUTEX_WAIT_TIMEOUT poll cycle.
-                let (futex_ptr, is_waker) = match futex {
+                let (futex_ptr, pos) = match futex {
                     Some(f) => f,
                     None => break,
                 };
+                let is_waker = pos == 0;
                 let atom = unsafe { &*(futex_ptr as *const std::sync::atomic::AtomicU32) };
                 if is_waker {
                     let mut batches_done: u64 = 0;
@@ -4522,13 +4544,117 @@ fn worker_main(
                 last_iter_time = Instant::now();
                 iterations += 1;
             }
+            WorkType::WakeChain {
+                depth,
+                fanout: _,
+                sync,
+                work_per_hop,
+            } => {
+                // Linear ring chain inside one chain group. Each
+                // chain owns one shared 4-byte futex word
+                // (`worker_group_size = depth`); workers within the
+                // chain are positioned by `pos` (0..depth). Stage
+                // boundary = the futex word's value advances to
+                // `next_stage`; the worker holding `pos == word_val`
+                // is the active stage. After `work_per_hop` of CPU
+                // work, the active stage advances the word to
+                // `(pos + 1) % depth` and wakes everyone parked on
+                // it; only the next stage's worker satisfies its
+                // wait predicate and proceeds.
+                //
+                // `sync = true` adds a 1-byte pipe round-trip on
+                // the existing report-pipe-style infra... but we
+                // don't have per-stage pipe pairs allocated for
+                // this variant (`needs_pipes = false` for
+                // WakeChain). To keep batch 3 scope confined to
+                // worker_main, both `sync = true` and
+                // `sync = false` use the futex-word advance; the
+                // wake call uses `clamp_futex_wake_n(usize::MAX)`
+                // which lowers to FUTEX_WAKE(i32::MAX) — the kernel
+                // walks the bucket's plist and wakes every parked
+                // waiter (kernel/futex/waitwake.c::futex_wake_op),
+                // so all non-active stages observe the advance and
+                // re-park on the new value. This preserves the
+                // wake-chain shape (sequenced stages, per-stage CPU
+                // burst, scheduler observes a chain of WAKE→work→
+                // WAKE→work transitions). The `sync` flag is read
+                // and recorded so future work that wires per-stage
+                // pipes can branch on it; for now it's ignored at
+                // the syscall layer.
+                let (futex_ptr, pos) = match futex {
+                    Some(f) => f,
+                    None => break,
+                };
+                let _ = sync;
+                if depth == 0 || pos >= depth {
+                    // Defense in depth: surface uses
+                    // `worker_group_size = depth`, so the spawn-side
+                    // divisibility check guarantees pos < depth
+                    // before we get here. This branch handles only
+                    // a programmer bug that bypasses spawn.
+                    break;
+                }
+                let atom = unsafe { &*(futex_ptr as *const std::sync::atomic::AtomicU32) };
+                let my_stage = pos as u32;
+                let next_stage = ((pos + 1) % depth) as u32;
+                let before_block = Instant::now();
+                loop {
+                    if STOP.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let cur = atom.load(Ordering::Relaxed);
+                    if cur == my_stage {
+                        // Our turn. Record blocked-time as a wake
+                        // sample. pos == 0 on the very first
+                        // iteration sees `cur == 0` immediately
+                        // (never blocked) — `before_block` is
+                        // post-spawn, the elapsed time still
+                        // captures the spawn-to-first-stage gap,
+                        // matching how FutexFanOut handles its
+                        // first iteration.
+                        reservoir_push(
+                            &mut resume_latencies_ns,
+                            &mut wake_sample_count,
+                            before_block.elapsed().as_nanos() as u64,
+                            MAX_WAKE_SAMPLES,
+                        );
+                        break;
+                    }
+                    unsafe { futex_wait(futex_ptr, cur, &FUTEX_WAIT_TIMEOUT) };
+                }
+                if STOP.load(Ordering::Relaxed) {
+                    iterations += 1;
+                    continue;
+                }
+                // Stage work: spin for the configured duration. Use
+                // `Instant`-based gating so `work_per_hop`'s unit
+                // (Duration) is honored regardless of host CPU
+                // speed — same idiom as `Bursty`'s `burst_ms`
+                // (Duration::from_millis on a per-iteration
+                // deadline).
+                let work_end = Instant::now() + work_per_hop;
+                while Instant::now() < work_end && !STOP.load(Ordering::Relaxed) {
+                    spin_burst(&mut work_units, 256);
+                }
+                if STOP.load(Ordering::Relaxed) {
+                    iterations += 1;
+                    continue;
+                }
+                // Advance to the next stage and wake everyone
+                // parked. Relaxed store: futex syscall provides the
+                // kernel-side cross-thread ordering for the wake
+                // event (matches FutexFanOut's idiom).
+                atom.store(next_stage, Ordering::Relaxed);
+                unsafe { futex_wake(futex_ptr, clamp_futex_wake_n(usize::MAX)) };
+                last_iter_time = Instant::now();
+                iterations += 1;
+            }
             WorkType::PriorityInversion { .. }
             | WorkType::ProducerConsumerImbalance { .. }
             | WorkType::RtStarvation { .. }
             | WorkType::AsymmetricWaker { .. }
-            | WorkType::WakeChain { .. }
             | WorkType::NumaWorkingSetSweep { .. } => {
-                // Stub for the remaining variants — see batch 3-N.
+                // Stub for the remaining variants — see batch 4-8.
                 // CpuSpin-equivalent body so tests that round-trip
                 // through the variant produce non-zero work_units.
                 spin_burst(&mut work_units, 1024);
@@ -4652,22 +4778,31 @@ fn worker_main(
         // `None` — the child reached the `f.write_all(&json)` site
         // and handed a complete report back to the parent.
         exit_info: None,
-        // `futex` is `Some((ptr, bool))` for several work types but
-        // the BOOL HAS DIFFERENT MEANINGS:
-        //   - FutexFanOut / FanOutCompute: `is_messenger` — one
-        //     worker per group advances the generation and fans out
-        //     wakes. Exactly the shape the WorkerReport doc pins.
-        //   - FutexPingPong: `is_first` — a pair-position flag.
+        // `futex` is `Some((ptr, pos))` for several work types and
+        // `pos == 0` MEANS DIFFERENT THINGS PER VARIANT:
+        //   - FutexFanOut / FanOutCompute: pos == 0 is the
+        //     messenger — one worker per group advances the
+        //     generation and fans out wakes. Exactly the shape the
+        //     WorkerReport doc pins.
+        //   - FutexPingPong: pos == 0 is a pair-position flag.
         //     Both workers write+wake symmetrically; neither is a
         //     messenger.
-        //   - MutexContention: unused (the bool is ignored).
-        // Gate on the WorkType so only the fanout variants propagate
-        // the bool — every other work type lands `false` as the
-        // field doc contract requires.
+        //   - MutexContention: pos is unused (every contender
+        //     competes equally on the same word).
+        //   - ThunderingHerd: pos == 0 is the waker; pos > 0 are
+        //     waiters parked on the futex. Not a messenger in the
+        //     fan-out sense — the waker doesn't carry per-message
+        //     state, just kicks the herd.
+        //   - WakeChain: pos is the stage index in the chain ring.
+        //     The active stage rotates each iteration, so no single
+        //     worker is "the messenger" across the run.
+        // Gate on the WorkType so only the fanout variants
+        // propagate `pos == 0` as `is_messenger`; every other work
+        // type lands `false` as the field doc contract requires.
         is_messenger: matches!(
             work_type,
             WorkType::FutexFanOut { .. } | WorkType::FanOutCompute { .. }
-        ) && futex.map(|(_, b)| b).unwrap_or(false),
+        ) && futex.map(|(_, p)| p == 0).unwrap_or(false),
     }
 }
 

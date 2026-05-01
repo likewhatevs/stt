@@ -384,6 +384,7 @@ pub mod ctprof_compare;
 pub(crate) mod elf_strip;
 pub mod export;
 pub mod fetch;
+pub mod fun;
 pub mod host_context;
 pub mod host_heap;
 pub(crate) mod host_thread_probe;
