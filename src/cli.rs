@@ -1214,27 +1214,56 @@ fn run_kernel_list_range(json: bool, spec: &str) -> Result<()> {
 ///   disk without being usable, and never consume a `keep` slot).
 /// - `Valid` entries are removal candidates only when
 ///   `corrupt_only = false`; the first `keep.unwrap_or(0)` valid
-///   entries in input order are retained, every subsequent valid
-///   entry is a candidate.
+///   entries PER
+///   `(version, ktstr_kconfig_hash, extra_kconfig_hash)` BUCKET in
+///   input order are retained, every subsequent valid entry in
+///   that bucket is a candidate.
 /// - Input order is preserved in the output — `cache.list()` sorts
-///   `built_at`-descending, so the retained `keep` prefix is the
-///   most recent entries.
+///   `built_at`-descending, so the retained `keep` prefix per
+///   bucket is the most recent entries.
+///
+/// **Bucketing rationale**: a single `--keep N` pool would let a
+/// flurry of builds at one configuration evict useful entries at a
+/// different configuration. Bucketing by the
+/// `(version, baked-in-kconfig, extras)` tuple preserves the N
+/// newest entries in each configuration variant independently, so
+/// users iterating on extras for one kernel don't lose unrelated
+/// cache slots, and a `ktstr.kconfig` bump (changes
+/// `ktstr_kconfig_hash`) doesn't push out the prior baked-in
+/// build's slots before the new one is fully exercised.
+///
+/// `None` participates as its own bucket key value:
+/// - `version: None` (local/untagged builds) is distinct from any
+///   `Some(version)`.
+/// - `ktstr_kconfig_hash: None` (entries that predate the field)
+///   is distinct from any `Some(hash)`.
+/// - `extra_kconfig_hash: None` (no user extras) is distinct from
+///   any `Some(hash)`.
 fn partition_clean_candidates(
     entries: &[crate::cache::ListedEntry],
     keep: Option<usize>,
     corrupt_only: bool,
 ) -> Vec<&crate::cache::ListedEntry> {
     let skip = keep.unwrap_or(0);
-    let mut valid_kept = 0usize;
+    let mut bucket_kept: std::collections::HashMap<
+        (Option<String>, Option<String>, Option<String>),
+        usize,
+    > = std::collections::HashMap::new();
     let mut to_remove: Vec<&crate::cache::ListedEntry> = Vec::new();
     for listed in entries {
         match listed {
-            crate::cache::ListedEntry::Valid(_) => {
+            crate::cache::ListedEntry::Valid(entry) => {
                 if corrupt_only {
                     continue;
                 }
-                if valid_kept < skip {
-                    valid_kept += 1;
+                let bucket_key = (
+                    entry.metadata.version.clone(),
+                    entry.metadata.ktstr_kconfig_hash.clone(),
+                    entry.metadata.extra_kconfig_hash.clone(),
+                );
+                let kept = bucket_kept.entry(bucket_key).or_insert(0);
+                if *kept < skip {
+                    *kept += 1;
                     continue;
                 }
                 to_remove.push(listed);
@@ -1463,14 +1492,52 @@ fn poll_child_with_timeout(
 ///
 /// `# CONFIG_X is not set` comments ARE kconfig semantics (the
 /// canonical way to disable an option), so they participate in the
-/// check; the only lines skipped are genuinely empty ones.
+/// check.
+///
+/// Free-text comments (`#` lines that are NOT the
+/// `# CONFIG_X is not set` form, e.g. `# Build for testing scx`)
+/// are dropped before the probe: kbuild emits its own header into
+/// `.config` and strips user-added free-text comments, so a fragment
+/// containing decorative `#` lines would always fail this check and
+/// trigger a redundant `make olddefconfig` re-resolve on every
+/// configure pass.
+///
+/// Genuinely empty lines are also skipped.
 fn all_fragment_lines_present(fragment: &str, config: &str) -> bool {
     let existing: std::collections::HashSet<&str> = config.lines().map(str::trim).collect();
     fragment
         .lines()
         .map(str::trim)
-        .filter(|t| !t.is_empty())
+        .filter(|t| is_kconfig_semantic_line(t))
         .all(|t| existing.contains(t))
+}
+
+/// True for lines that participate in kconfig semantics — i.e.
+/// `CONFIG_X=...` assignments and the `# CONFIG_X is not set`
+/// disable-directive form. Empty lines and free-text `#` comments
+/// return false.
+///
+/// Drives [`all_fragment_lines_present`]'s filter so a fragment with
+/// decorative comments doesn't churn the configure pass on every
+/// rebuild. The disable-directive form is a kconfig sentinel kbuild
+/// emits into `.config` as the canonical way to record a disabled
+/// `tristate`/`bool` symbol; it survives `make olddefconfig` and
+/// must participate in the present-in-config check.
+fn is_kconfig_semantic_line(trimmed: &str) -> bool {
+    if trimmed.is_empty() {
+        return false;
+    }
+    if let Some(rest) = trimmed.strip_prefix('#') {
+        // `# CONFIG_X is not set` — the disable-directive sentinel
+        // kbuild writes verbatim into .config. Tolerant of internal
+        // whitespace variation by trimming the rest.
+        let rest = rest.trim_start();
+        return rest.starts_with("CONFIG_") && rest.ends_with(" is not set");
+    }
+    // Non-comment, non-empty line: a CONFIG_X=... assignment or
+    // similar. The probe defers semantic validity to the existing
+    // hash-set match against the on-disk `.config`.
+    true
 }
 
 /// Read a `--extra-kconfig PATH` file. Returns `Ok(content)` on
@@ -9246,6 +9313,198 @@ mod tests {
         warn_extra_kconfig_overrides_baked_in(user, "test");
     }
 
+    // -- read_extra_kconfig --
+    //
+    // Pin each error arm of the path-validation pipeline so an
+    // operator passing a bad `--extra-kconfig PATH` value gets a
+    // diagnostic that names the literal path AND the failure mode,
+    // not an opaque OS errno. The 4-arm classification in
+    // `read_extra_kconfig` (NotFound / IsADirectory / PermissionDenied
+    // / non-UTF-8) is the operator-facing contract; each test below
+    // pins one arm.
+
+    #[test]
+    fn read_extra_kconfig_returns_content_for_valid_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("frag.kconfig");
+        let content = "CONFIG_FOO=y\nCONFIG_BAR=m\n";
+        std::fs::write(&path, content).unwrap();
+        let got = read_extra_kconfig(&path, "test").unwrap();
+        assert_eq!(got, content, "content must round-trip byte-for-byte");
+    }
+
+    #[test]
+    fn read_extra_kconfig_not_found_arm_names_path_and_intent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let missing = dir.path().join("does-not-exist.kconfig");
+        let display = missing.display().to_string();
+        let err = read_extra_kconfig(&missing, "cargo ktstr")
+            .expect_err("missing file must Err");
+        assert!(
+            err.contains(&display),
+            "ENOENT message must name the literal path: {err}"
+        );
+        assert!(
+            err.contains("--extra-kconfig"),
+            "ENOENT message must name the flag: {err}"
+        );
+        assert!(
+            err.contains("file not found"),
+            "ENOENT arm must surface a `file not found` token: {err}"
+        );
+    }
+
+    #[test]
+    fn read_extra_kconfig_directory_arm_distinguishes_from_not_found() {
+        // A path that exists AND is a directory must hit the
+        // EISDIR arm, NOT the NotFound arm. Distinct diagnostics
+        // give the operator distinct guidance.
+        let dir = tempfile::TempDir::new().unwrap();
+        let display = dir.path().display().to_string();
+        let err = read_extra_kconfig(dir.path(), "cargo ktstr")
+            .expect_err("directory path must Err");
+        assert!(
+            err.contains(&display),
+            "EISDIR message must name the path: {err}"
+        );
+        assert!(
+            err.contains("is a directory"),
+            "EISDIR arm must surface its specific token, not the catch-all `file not found`: {err}"
+        );
+    }
+
+    #[test]
+    fn read_extra_kconfig_invalid_utf8_arm_names_constraint() {
+        // kconfig fragments are ASCII text. A non-UTF-8 file (e.g.
+        // a binary blob) must Err with the constraint-naming
+        // diagnostic, not silently coerce.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("binary.bin");
+        // 0xFF 0xFE is invalid UTF-8 leading byte sequence.
+        std::fs::write(&path, [0xFFu8, 0xFE, 0x00, 0x42]).unwrap();
+        let err = read_extra_kconfig(&path, "cargo ktstr")
+            .expect_err("non-UTF-8 file must Err");
+        assert!(
+            err.contains("not valid UTF-8"),
+            "UTF-8 arm must surface the constraint name: {err}"
+        );
+        assert!(
+            err.contains("ASCII text"),
+            "UTF-8 arm must mention the kconfig content constraint: {err}"
+        );
+    }
+
+    #[test]
+    fn read_extra_kconfig_empty_file_returns_empty_string() {
+        // Empty file: by contract, Read succeeds with an empty
+        // String AND emits a `tracing::warn!`. The Result side is
+        // testable here; the warning side relies on a tracing
+        // subscriber and lives in the integration suite.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("empty.kconfig");
+        std::fs::write(&path, "").unwrap();
+        let got = read_extra_kconfig(&path, "cargo ktstr").unwrap();
+        assert_eq!(
+            got, "",
+            "empty file must round-trip as empty String, not Err"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn read_extra_kconfig_follows_symlink_chain() {
+        // Symlinks resolve transparently — the `read(2)` open path
+        // follows symlinks per kernel default. An operator who
+        // points `--extra-kconfig` at a symlink (e.g. a tree of
+        // shared kconfig fragments) must see the target's content,
+        // not an Err.
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::TempDir::new().unwrap();
+        let target = dir.path().join("real.kconfig");
+        let link = dir.path().join("link.kconfig");
+        std::fs::write(&target, "CONFIG_BPF=y\n").unwrap();
+        symlink(&target, &link).unwrap();
+        let got = read_extra_kconfig(&link, "test").unwrap();
+        assert_eq!(got, "CONFIG_BPF=y\n", "symlink must resolve to target content");
+    }
+
+    // -- warn_dropped_extra_kconfig_lines --
+    //
+    // Diagnostic-on-failure path: after `make olddefconfig`, walk
+    // the fragment and surface any non-empty `CONFIG_X=` /
+    // `# CONFIG_X is not set` line that did NOT survive into the
+    // final `.config`. Best-effort — missing `.config` is silent.
+
+    #[test]
+    fn warn_dropped_extra_kconfig_lines_silent_when_config_missing() {
+        // No `.config` exists in the kernel dir → helper returns
+        // silently (no panic). This is the "best-effort: collapsed
+        // failure" branch: the caller's outer pipeline produces the
+        // actionable error.
+        let dir = tempfile::TempDir::new().unwrap();
+        let extra = "CONFIG_FOO=y\n";
+        // Should not panic.
+        warn_dropped_extra_kconfig_lines(dir.path(), extra, "test");
+    }
+
+    #[test]
+    fn warn_dropped_extra_kconfig_lines_silent_when_all_present() {
+        // `.config` contains every fragment line → helper has
+        // nothing to warn about. Pin that the present-line happy
+        // path also returns silently.
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join(".config"),
+            "CONFIG_FOO=y\nCONFIG_BAR=m\n",
+        )
+        .unwrap();
+        let extra = "CONFIG_FOO=y\nCONFIG_BAR=m\n";
+        warn_dropped_extra_kconfig_lines(dir.path(), extra, "test");
+    }
+
+    #[test]
+    fn warn_dropped_extra_kconfig_lines_does_not_panic_on_dropped_line() {
+        // `.config` lacks one of the fragment's CONFIG_X=
+        // assignments — helper hits the "look up final state" lookup
+        // and emits a tracing::warn. Pin that the path completes
+        // without panicking even when the symbol is wholly absent
+        // from `.config` (the "(absent — symbol not present...)"
+        // fallback branch).
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join(".config"), "CONFIG_BPF=y\n").unwrap();
+        let extra = "CONFIG_KTSTR_DROPPED_TEST_NOVEL=y\n";
+        warn_dropped_extra_kconfig_lines(dir.path(), extra, "test");
+    }
+
+    #[test]
+    fn warn_dropped_extra_kconfig_lines_does_not_panic_on_rewritten_line() {
+        // `.config` rewrote the fragment's `CONFIG_FOO=y` to
+        // `# CONFIG_FOO is not set` (e.g. dep didn't resolve).
+        // Helper finds the symbol's final-state line via fallback
+        // lookup and emits a warning naming both `requested` and
+        // `final_state`. Pin no-panic.
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join(".config"),
+            "# CONFIG_KTSTR_REWRITE_TEST is not set\n",
+        )
+        .unwrap();
+        let extra = "CONFIG_KTSTR_REWRITE_TEST=y\n";
+        warn_dropped_extra_kconfig_lines(dir.path(), extra, "test");
+    }
+
+    #[test]
+    fn warn_dropped_extra_kconfig_lines_skips_free_text_comments() {
+        // Free-text `# foo` comments are not kbuild semantics; the
+        // helper must skip them so an operator with a decorative
+        // header doesn't see false-positive "did not survive"
+        // warnings.
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join(".config"), "CONFIG_BPF=y\n").unwrap();
+        let extra = "# decorative header\nCONFIG_BPF=y\n";
+        warn_dropped_extra_kconfig_lines(dir.path(), extra, "test");
+    }
+
     // -- configure_kernel --
 
     #[test]
@@ -9341,6 +9600,76 @@ mod tests {
         // Truly empty lines in the fragment carry no kconfig state.
         let config = "CONFIG_FOO=y\n";
         assert!(all_fragment_lines_present("\n\nCONFIG_FOO=y\n\n", config));
+    }
+
+    #[test]
+    fn all_fragment_lines_present_free_text_comment_stripped() {
+        // Free-text `#` comments are kbuild-stripped from .config
+        // (kbuild emits its own header and drops user-added prose).
+        // The probe must skip them so a fragment with decorative
+        // comments doesn't churn the configure pass on every
+        // rebuild.
+        let config = "CONFIG_FOO=y\n";
+        let fragment = "# Build for testing scx schedulers\nCONFIG_FOO=y\n";
+        assert!(
+            all_fragment_lines_present(fragment, config),
+            "free-text comment must not block the present-in-config check"
+        );
+    }
+
+    #[test]
+    fn all_fragment_lines_present_disable_directive_still_participates() {
+        // The `# CONFIG_X is not set` form survives
+        // `make olddefconfig` and IS the canonical way to record a
+        // disabled tristate/bool. It must remain in the check even
+        // though it shares the `#` prefix with free-text comments.
+        let config = "CONFIG_FOO=y\n# CONFIG_BAR is not set\n";
+        let fragment_present = "# CONFIG_BAR is not set\n";
+        assert!(
+            all_fragment_lines_present(fragment_present, config),
+            "disable directive present in config must satisfy probe"
+        );
+        let config_missing = "CONFIG_FOO=y\n";
+        assert!(
+            !all_fragment_lines_present(fragment_present, config_missing),
+            "disable directive missing from config must fail probe"
+        );
+    }
+
+    #[test]
+    fn all_fragment_lines_present_section_header_comment_stripped() {
+        // A common fragment shape is "section header" comments
+        // separating logical groups of CONFIG_X lines. Pin that
+        // these decorative lines drop before the probe.
+        let config = "CONFIG_FOO=y\nCONFIG_BAR=m\n";
+        let fragment = "\
+# == BPF support ==\n\
+CONFIG_FOO=y\n\
+# == Tracing ==\n\
+CONFIG_BAR=m\n";
+        assert!(all_fragment_lines_present(fragment, config));
+    }
+
+    // -- is_kconfig_semantic_line predicate --
+
+    #[test]
+    fn is_kconfig_semantic_line_classifies_assignment_disable_and_comment() {
+        // CONFIG_X=value -> kept (assignment).
+        assert!(is_kconfig_semantic_line("CONFIG_FOO=y"));
+        assert!(is_kconfig_semantic_line("CONFIG_NR_CPUS=128"));
+        // `# CONFIG_X is not set` -> kept (disable directive).
+        assert!(is_kconfig_semantic_line("# CONFIG_BPF is not set"));
+        // Tolerant of extra whitespace after the leading `#`.
+        assert!(is_kconfig_semantic_line("#  CONFIG_BPF is not set"));
+        // Free-text `#` comments -> dropped.
+        assert!(!is_kconfig_semantic_line("# Build for testing"));
+        assert!(!is_kconfig_semantic_line("# == Section header =="));
+        // Empty line -> dropped.
+        assert!(!is_kconfig_semantic_line(""));
+        // Misshapen `# CONFIG_X` without the disable suffix -> dropped
+        // (would not survive olddefconfig as-is).
+        assert!(!is_kconfig_semantic_line("# CONFIG_FOO is enabled"));
+        assert!(!is_kconfig_semantic_line("# CONFIG_FOO"));
     }
 
     // -- resolve_kernel_parallelism --
@@ -11222,6 +11551,47 @@ mod tests {
         }
     }
 
+    /// Variant of [`mk_valid`] that stamps a specific
+    /// `(version, extra_kconfig_hash)` bucket key while leaving
+    /// `ktstr_kconfig_hash` unset. Drives the version /
+    /// extra-kconfig per-bucket retention tests.
+    fn mk_valid_bucketed(
+        key: &str,
+        version: Option<&str>,
+        extra_kconfig_hash: Option<&str>,
+    ) -> crate::cache::ListedEntry {
+        mk_valid_bucketed_full(key, version, None, extra_kconfig_hash)
+    }
+
+    /// Variant of [`mk_valid`] that stamps every axis of the
+    /// retention bucket key:
+    /// `(version, ktstr_kconfig_hash, extra_kconfig_hash)`.
+    /// Drives the baked-in-hash bucket-coverage tests where the
+    /// third axis is the discriminating field.
+    fn mk_valid_bucketed_full(
+        key: &str,
+        version: Option<&str>,
+        ktstr_kconfig_hash: Option<&str>,
+        extra_kconfig_hash: Option<&str>,
+    ) -> crate::cache::ListedEntry {
+        use crate::cache::{CacheEntry, KernelMetadata, KernelSource};
+        let path = std::path::PathBuf::from(format!("/tmp/fixture/{key}"));
+        let metadata = KernelMetadata::new(
+            KernelSource::Tarball,
+            "x86_64".to_string(),
+            "bzImage".to_string(),
+            "2026-04-22T00:00:00Z".to_string(),
+        )
+        .with_version(version.map(String::from))
+        .with_ktstr_kconfig_hash(ktstr_kconfig_hash.map(String::from))
+        .with_extra_kconfig_hash(extra_kconfig_hash.map(String::from));
+        crate::cache::ListedEntry::Valid(Box::new(CacheEntry {
+            key: key.to_string(),
+            path,
+            metadata,
+        }))
+    }
+
     #[test]
     fn partition_clean_candidates_empty_input_yields_empty_output() {
         let out = partition_clean_candidates(&[], None, false);
@@ -11300,6 +11670,145 @@ mod tests {
             keys,
             vec!["c_mid"],
             "corrupt_only=true must make keep inert: valid entries preserved, only corrupt removed",
+        );
+    }
+
+    // -- per-bucket retention: (version, extra_kconfig_hash) -------
+    //
+    // Each `(version, extra_kconfig_hash)` pair is its own keep-N
+    // pool. A user iterating on extras for one kernel version
+    // can't evict cache slots for a different version (or a
+    // different extras hash on the same version) just because the
+    // global pool overflowed.
+
+    #[test]
+    fn partition_clean_candidates_keep_buckets_by_version() {
+        // keep=1 with 4 entries split across two versions retains
+        // the newest from EACH version, removing the older one in
+        // each bucket.
+        //
+        // Input order is built_at-desc per cache.list(), so for
+        // each bucket index 0 is newest.
+        let entries = vec![
+            mk_valid_bucketed("v6_14_new", Some("6.14.2"), None),
+            mk_valid_bucketed("v6_15_new", Some("6.15.0"), None),
+            mk_valid_bucketed("v6_14_old", Some("6.14.2"), None),
+            mk_valid_bucketed("v6_15_old", Some("6.15.0"), None),
+        ];
+        let out = partition_clean_candidates(&entries, Some(1), false);
+        let keys: Vec<&str> = out.iter().map(|e| e.key()).collect();
+        assert_eq!(
+            keys,
+            vec!["v6_14_old", "v6_15_old"],
+            "per-version keep=1 must retain newest in each bucket independently",
+        );
+    }
+
+    #[test]
+    fn partition_clean_candidates_keep_buckets_by_extra_kconfig_hash() {
+        // Same version, different `extra_kconfig_hash` form
+        // independent buckets. keep=1 retains the newest in each.
+        let entries = vec![
+            mk_valid_bucketed("v6_14_xkc_aaaa_new", Some("6.14.2"), Some("aaaa")),
+            mk_valid_bucketed("v6_14_xkc_bbbb_new", Some("6.14.2"), Some("bbbb")),
+            mk_valid_bucketed("v6_14_xkc_aaaa_old", Some("6.14.2"), Some("aaaa")),
+            mk_valid_bucketed("v6_14_xkc_bbbb_old", Some("6.14.2"), Some("bbbb")),
+        ];
+        let out = partition_clean_candidates(&entries, Some(1), false);
+        let keys: Vec<&str> = out.iter().map(|e| e.key()).collect();
+        assert_eq!(
+            keys,
+            vec!["v6_14_xkc_aaaa_old", "v6_14_xkc_bbbb_old"],
+            "per-extras-hash keep=1 must retain newest in each bucket — \
+             user iterating on extras for one bucket must not evict \
+             slots in a sibling bucket",
+        );
+    }
+
+    #[test]
+    fn partition_clean_candidates_keep_distinguishes_none_from_some_extras() {
+        // `extra_kconfig_hash: None` (no user extras) and
+        // `Some("aaaa")` are distinct buckets. A flurry of
+        // `--extra-kconfig`-using builds must not evict the bare
+        // baked-in build, and vice versa.
+        let entries = vec![
+            mk_valid_bucketed("bare_new", Some("6.14.2"), None),
+            mk_valid_bucketed("xkc_new", Some("6.14.2"), Some("aaaa")),
+            mk_valid_bucketed("bare_old", Some("6.14.2"), None),
+            mk_valid_bucketed("xkc_old", Some("6.14.2"), Some("aaaa")),
+        ];
+        let out = partition_clean_candidates(&entries, Some(1), false);
+        let keys: Vec<&str> = out.iter().map(|e| e.key()).collect();
+        assert_eq!(
+            keys,
+            vec!["bare_old", "xkc_old"],
+            "None vs Some extras must form distinct buckets",
+        );
+    }
+
+    #[test]
+    fn partition_clean_candidates_keep_per_bucket_with_corrupt_interleaved() {
+        // Corrupt entries are removed regardless of bucket — they
+        // never consume a keep slot in any bucket. keep=1 retains
+        // exactly one valid entry per bucket; the corrupt entry
+        // surfaces as a removal candidate alongside the older
+        // valid entries in each bucket.
+        let entries = vec![
+            mk_valid_bucketed("v6_14_new", Some("6.14.2"), None),
+            mk_corrupt("c_mid"),
+            mk_valid_bucketed("v6_15_new", Some("6.15.0"), None),
+            mk_valid_bucketed("v6_14_old", Some("6.14.2"), None),
+        ];
+        let out = partition_clean_candidates(&entries, Some(1), false);
+        let keys: Vec<&str> = out.iter().map(|e| e.key()).collect();
+        assert_eq!(
+            keys,
+            vec!["c_mid", "v6_14_old"],
+            "corrupt removed; v6_14_old removed (bucket already kept v6_14_new); \
+             v6_15_new retained (only entry in its bucket)",
+        );
+    }
+
+    #[test]
+    fn partition_clean_candidates_keep_buckets_by_ktstr_kconfig_hash() {
+        // Same `version` and `extra_kconfig_hash`, different
+        // `ktstr_kconfig_hash` (bumped baked-in fragment) form
+        // independent buckets. A `ktstr.kconfig` change must not
+        // evict the prior baked-in build's slots before the new
+        // baked-in build is fully exercised.
+        let entries = vec![
+            mk_valid_bucketed_full("baked_v2_new", Some("6.14.2"), Some("v2hash"), None),
+            mk_valid_bucketed_full("baked_v1_new", Some("6.14.2"), Some("v1hash"), None),
+            mk_valid_bucketed_full("baked_v2_old", Some("6.14.2"), Some("v2hash"), None),
+            mk_valid_bucketed_full("baked_v1_old", Some("6.14.2"), Some("v1hash"), None),
+        ];
+        let out = partition_clean_candidates(&entries, Some(1), false);
+        let keys: Vec<&str> = out.iter().map(|e| e.key()).collect();
+        assert_eq!(
+            keys,
+            vec!["baked_v2_old", "baked_v1_old"],
+            "per-baked-in-hash keep=1 must retain newest in each bucket — \
+             a ktstr.kconfig bump must not evict prior baked-in builds",
+        );
+    }
+
+    #[test]
+    fn partition_clean_candidates_keep_local_untagged_builds_form_own_bucket() {
+        // `version: None` (local/untagged builds — e.g. from a
+        // `--source` checkout without a release tag) form their
+        // own bucket distinct from any `Some(version)` bucket.
+        let entries = vec![
+            mk_valid_bucketed("local_new", None, None),
+            mk_valid_bucketed("v6_14_new", Some("6.14.2"), None),
+            mk_valid_bucketed("local_old", None, None),
+            mk_valid_bucketed("v6_14_old", Some("6.14.2"), None),
+        ];
+        let out = partition_clean_candidates(&entries, Some(1), false);
+        let keys: Vec<&str> = out.iter().map(|e| e.key()).collect();
+        assert_eq!(
+            keys,
+            vec!["local_old", "v6_14_old"],
+            "untagged-version bucket retained independently of tagged-version bucket",
         );
     }
 

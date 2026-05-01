@@ -561,7 +561,6 @@ fn kernel_build(
 /// [`ktstr::cache_key_suffix_with_extra`] and into the configure
 /// pass via the Cow merge construction in
 /// [`ktstr::cli::kernel_build_pipeline`].
-#[allow(clippy::too_many_arguments)]
 fn kernel_build_one(
     version: Option<String>,
     source: Option<PathBuf>,

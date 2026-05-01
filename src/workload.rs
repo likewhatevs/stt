@@ -91,6 +91,31 @@ compile_error!(
      incrementing low 4 bytes."
 );
 
+/// Serde helper for [`std::time::Duration`] using human-readable
+/// strings (`"100ms"`, `"5s"`, `"1h30m"`) instead of the default
+/// `{secs, nanos}` object.
+///
+/// Wire format chosen so persisted [`WorkSpec`] / [`WorkloadConfig`]
+/// values are operator-readable: a test author who exports a config
+/// can edit `"work_per_hop": "100us"` directly without translating
+/// from `{secs: 0, nanos: 100_000}`.
+///
+/// Reuses the [`humantime`] crate already pulled in for CLI flag
+/// parsing — no new dependency. Use via `#[serde(with =
+/// "humantime_serde_helper")]` on `Duration` fields.
+mod humantime_serde_helper {
+    use std::time::Duration;
+
+    pub fn serialize<S: serde::Serializer>(d: &Duration, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&humantime::format_duration(*d).to_string())
+    }
+
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
+        let s = <String as serde::Deserialize>::deserialize(d)?;
+        humantime::parse_duration(&s).map_err(serde::de::Error::custom)
+    }
+}
+
 /// Scenario-level affinity intent for a group of workers.
 ///
 /// Resolved to a concrete [`ResolvedAffinity`] at runtime based on the
@@ -98,7 +123,30 @@ compile_error!(
 /// a [`WorkSpec`], determines per-worker `sched_setaffinity` masks.
 ///
 /// Resolution uses [`resolve_affinity_for_cgroup()`](crate::scenario::resolve_affinity_for_cgroup).
-#[derive(Clone, Debug, Default)]
+///
+/// # Naming pattern (Intent vs Resolved)
+///
+/// [`AffinityIntent`] and [`ResolvedAffinity`] form a pre/post-resolution
+/// pair. Variant names line up where the same shape exists on both
+/// sides; payload differences encode the intent → concrete-CPU-set
+/// distinction:
+///
+/// | [`AffinityIntent`]               | [`ResolvedAffinity`]              |
+/// |----------------------------------|-----------------------------------|
+/// | `Inherit` (no payload)           | `None`                            |
+/// | `Exact(BTreeSet<usize>)`         | `Fixed(BTreeSet<usize>)`          |
+/// | `RandomSubset` (no payload)      | `Random { from, count }`          |
+/// | `SingleCpu` (no payload)         | `SingleCpu(usize)`                |
+/// | `LlcAligned` / `CrossCgroup`     | `Fixed(...)` (resolver expands)   |
+///
+/// The `SingleCpu` pair specifically: [`AffinityIntent::SingleCpu`]
+/// expresses "pin to one CPU; resolver picks which based on cgroup
+/// state and worker index", and [`ResolvedAffinity::SingleCpu`]
+/// records the concrete CPU id chosen. Reusing the variant name keeps
+/// the pre/post mapping lexically obvious — payload presence
+/// distinguishes intent from resolution without renaming the variant.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AffinityIntent {
     /// No affinity constraint -- inherit from parent cgroup.
     #[default]
@@ -128,8 +176,12 @@ impl AffinityIntent {
 /// Resolved CPU affinity for a worker process.
 ///
 /// Created from [`AffinityIntent`] at runtime based on topology and
-/// cpuset assignments.
-#[derive(Debug, Clone)]
+/// cpuset assignments. Variant names track [`AffinityIntent`] where the
+/// same shape exists pre/post-resolution; payload presence
+/// distinguishes intent from concrete CPU id(s). See the
+/// [`AffinityIntent`] type doc for the full pre/post mapping table.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ResolvedAffinity {
     /// No affinity constraint.
     None,
@@ -153,23 +205,30 @@ pub enum ResolvedAffinity {
 ///
 /// Workers loop through all phases in order, then repeat. Each phase
 /// runs for its specified duration before advancing to the next.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Phase {
     /// CPU spin for the given duration.
-    Spin(Duration),
+    Spin(#[serde(with = "humantime_serde_helper")] Duration),
     /// Sleep (thread::sleep) for the given duration.
-    Sleep(Duration),
+    Sleep(#[serde(with = "humantime_serde_helper")] Duration),
     /// Yield (sched_yield) repeatedly for the given duration.
-    Yield(Duration),
+    Yield(#[serde(with = "humantime_serde_helper")] Duration),
     /// Simulated I/O (write 64 KB to tmpfs + 100 us sleep) for the given
     /// duration. See [`WorkType::IoSync`] for details on tmpfs behavior.
-    Io(Duration),
+    Io(#[serde(with = "humantime_serde_helper")] Duration),
 }
 
 /// What each worker process does during a scenario.
 ///
 /// Different work types exercise different scheduler code paths:
 /// CPU-bound, yield-heavy, I/O, bursty, or inter-process communication.
+///
+/// Variants ending in `Churn` cycle their target setting WITHOUT
+/// ordering (random per-iteration); variants ending in `Sweep`
+/// rotate through an ordered list or range deterministically. See
+/// the module-level "Churn vs Sweep" section for the convention's
+/// rationale and the runtime contract for each suffix.
 ///
 /// ```
 /// # use ktstr::workload::WorkType;
@@ -186,7 +245,19 @@ pub enum Phase {
 /// at compile time from the enum arm names, which this module
 /// re-exposes as [`WorkType::ALL_NAMES`] so a new variant is picked
 /// up automatically without editing a parallel list.
-#[derive(Debug, Clone, strum::VariantNames)]
+#[derive(Debug, Clone, strum::VariantNames, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+// `#[serde(bound(...))]` overrides the auto-derived lifetime bound. The
+// `Custom` variant is `#[serde(skip)]` (it carries a non-portable `fn`
+// pointer + a `&'static str` name), but the derive still walks every
+// variant's field types to compute the implied `Deserialize<'de>`
+// bound. Without this override the compiler infers `'de: 'static`
+// from `Custom { name: &'static str }`, which makes the type
+// unusable from any non-`'static` deserializer (i.e. all real
+// deserializers). Explicit empty bounds tell serde to skip the
+// auto-inference; the skipped variant is never deserialized so no
+// `&'static str` ever needs to be reconstructed.
+#[serde(bound(deserialize = ""))]
 pub enum WorkType {
     /// Tight CPU spin loop (1024 iterations per cycle).
     CpuSpin,
@@ -365,8 +436,17 @@ pub enum WorkType {
     /// [`WorkType::ForkExit`] + [`CloneMode::Thread`] combination
     /// is rejected at spawn time precisely because of this — see
     /// [`WorkloadHandle::spawn`].
+    ///
+    /// **Serde:** the `Custom` variant is `#[serde(skip)]` because
+    /// the `run` field is a `fn` pointer that has no portable wire
+    /// format. Serializing a `WorkloadConfig` with `WorkType::Custom`
+    /// emits an error; persisted configs (e.g. captured via
+    /// `cargo ktstr export`) must use a built-in variant. Test
+    /// authors who want a custom worker should keep `WorkType::Custom`
+    /// inline in the test body and not roundtrip the config.
+    #[serde(skip)]
     Custom {
-        name: &'static str,
+        name: String,
         run: fn(&AtomicBool) -> WorkerReport,
     },
     /// One waker, N waiters on a SINGLE global futex word, repeated
@@ -405,10 +485,10 @@ pub enum WorkType {
     /// preempting `low`, `high` waits on the lock indefinitely —
     /// classic priority inversion.
     ///
-    /// `pi_mode = PiMode::Pi` uses `FUTEX_LOCK_PI` (PI-aware
+    /// `pi_mode = FutexLockMode::Pi` uses `FUTEX_LOCK_PI` (PI-aware
     /// mutex); kernel boosts `low` to `high`'s priority for the
     /// duration of the hold, which both unblocks `high` and pins
-    /// `medium` from preempting. `PiMode::Plain` uses a plain
+    /// `medium` from preempting. `FutexLockMode::Plain` uses a plain
     /// futex with no boost — the inversion goes uncorrected.
     /// Tests both halves of the rt_mutex PI chain under the same
     /// workload shape.
@@ -440,8 +520,8 @@ pub enum WorkType {
         /// Whether the workload uses a PI-aware futex (`Pi`,
         /// invokes `FUTEX_LOCK_PI` and the rt_mutex PI boost
         /// chain in `kernel/futex/pi.c`) or a plain non-PI futex
-        /// (`Plain`, uncorrected inversion). See [`PiMode`].
-        pi_mode: PiMode,
+        /// (`Plain`, uncorrected inversion). See [`FutexLockMode`].
+        pi_mode: FutexLockMode,
     },
     /// Producer / consumer pipeline with deliberately-unbalanced
     /// rates. `producers` workers push items at `produce_rate_hz`;
@@ -566,6 +646,7 @@ pub enum WorkType {
         /// before signalling the next. Use [`Duration`] to keep
         /// the unit visible at the call site (consistent with
         /// [`SchedPolicy::Deadline`]'s switch to `Duration`).
+        #[serde(with = "humantime_serde_helper")]
         work_per_hop: Duration,
     },
     /// Workers allocate a `region_kb` KB region with `set_mempolicy`
@@ -656,7 +737,7 @@ pub mod defaults {
     pub const PRIORITY_INVERSION_LOW_COUNT: usize = 1;
     pub const PRIORITY_INVERSION_HOLD_ITERS: u64 = 4096;
     pub const PRIORITY_INVERSION_WORK_ITERS: u64 = 1024;
-    pub const PRIORITY_INVERSION_PI_MODE: super::PiMode = super::PiMode::Plain;
+    pub const PRIORITY_INVERSION_PI_MODE: super::FutexLockMode = super::FutexLockMode::Plain;
     // ProducerConsumerImbalance
     pub const PRODUCER_CONSUMER_PRODUCERS: usize = 2;
     pub const PRODUCER_CONSUMER_CONSUMERS: usize = 1;
@@ -693,7 +774,7 @@ impl WorkType {
     /// PascalCase name of this variant, matching [`ALL_NAMES`](Self::ALL_NAMES).
     /// For [`Custom`](Self::Custom), returns the user-provided `name`
     /// field instead.
-    pub fn name(&self) -> &'static str {
+    pub fn name(&self) -> &str {
         match self {
             WorkType::CpuSpin => "CpuSpin",
             WorkType::YieldHeavy => "YieldHeavy",
@@ -714,7 +795,7 @@ impl WorkType {
             WorkType::FanOutCompute { .. } => "FanOutCompute",
             WorkType::PageFaultChurn { .. } => "PageFaultChurn",
             WorkType::MutexContention { .. } => "MutexContention",
-            WorkType::Custom { name, .. } => name,
+            WorkType::Custom { name, .. } => name.as_str(),
             WorkType::ThunderingHerd { .. } => "ThunderingHerd",
             WorkType::PriorityInversion { .. } => "PriorityInversion",
             WorkType::ProducerConsumerImbalance { .. } => "ProducerConsumerImbalance",
@@ -1069,15 +1150,15 @@ impl WorkType {
 
     /// Three priority tiers contending for one shared lock. See
     /// [`WorkType::PriorityInversion`] for behavior; pass
-    /// [`PiMode::Pi`] to invoke `FUTEX_LOCK_PI` or
-    /// [`PiMode::Plain`] for a non-PI futex.
+    /// [`FutexLockMode::Pi`] to invoke `FUTEX_LOCK_PI` or
+    /// [`FutexLockMode::Plain`] for a non-PI futex.
     pub fn priority_inversion(
         high_count: usize,
         medium_count: usize,
         low_count: usize,
         hold_iters: u64,
         work_iters: u64,
-        pi_mode: PiMode,
+        pi_mode: FutexLockMode,
     ) -> Self {
         WorkType::PriorityInversion {
             high_count,
@@ -1180,8 +1261,11 @@ impl WorkType {
     /// and is bypassed for `Custom`. See the [`Custom`](Self::Custom)
     /// variant doc for the full telemetry contract and what `run` must
     /// populate on [`WorkerReport`] to keep downstream assertions honest.
-    pub fn custom(name: &'static str, run: fn(&AtomicBool) -> WorkerReport) -> Self {
-        WorkType::Custom { name, run }
+    pub fn custom(name: impl Into<String>, run: fn(&AtomicBool) -> WorkerReport) -> Self {
+        WorkType::Custom {
+            name: name.into(),
+            run,
+        }
     }
 }
 
@@ -1222,7 +1306,8 @@ pub(crate) fn resolve_work_type(
 /// `Batch`, and (entering) `Idle` are unprivileged transitions for
 /// fair-policy tasks. Priority values for `Fifo`/`RoundRobin` are
 /// clamped to 1-99.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SchedPolicy {
     /// `SCHED_NORMAL` (CFS/EEVDF).
     Normal,
@@ -1280,11 +1365,14 @@ pub enum SchedPolicy {
     /// through the syscall.
     Deadline {
         /// Runtime budget per period.
+        #[serde(with = "humantime_serde_helper")]
         runtime: Duration,
         /// Relative deadline from period start.
+        #[serde(with = "humantime_serde_helper")]
         deadline: Duration,
         /// Period. `Duration::ZERO` means "use `deadline` as the
         /// period" per the kernel's `__checkparam_dl` substitution.
+        #[serde(with = "humantime_serde_helper")]
         period: Duration,
     },
 }
@@ -1356,8 +1444,9 @@ impl SchedPolicy {
 /// failure-dump diagnostic names the choice explicitly
 /// ("pi_mode = Pi" vs "pi_mode = Plain") instead of a bare
 /// boolean.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum PiMode {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FutexLockMode {
     /// `FUTEX_LOCK_PI` with rt_mutex PI chain.
     Pi,
     /// Plain futex (no PI boost). The default — exercises the
@@ -1382,7 +1471,8 @@ pub enum PiMode {
 /// [`apply_sched_class`] maps the variant to the equivalent
 /// [`SchedPolicy`] (using a default priority where applicable)
 /// and routes through `set_sched_policy`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SchedClass {
     /// `fair_sched_class` — `SCHED_NORMAL` (CFS / EEVDF). The
     /// default; matches a freshly-forked task before any policy
@@ -1468,7 +1558,8 @@ impl SchedClass {
 ///
 /// Optional [`MpolFlags`] modify behavior (e.g. `STATIC_NODES` to
 /// keep the nodemask absolute across cpuset changes).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum MemPolicy {
     /// Inherit the parent process's memory policy (no syscall).
     #[default]
@@ -1499,7 +1590,8 @@ pub enum MemPolicy {
 ///
 /// OR'd into the mode argument. See `MPOL_F_*` in
 /// `include/uapi/linux/mempolicy.h`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
 pub struct MpolFlags(u32);
 
 impl MpolFlags {
@@ -1562,184 +1654,23 @@ impl std::ops::BitOr for MpolFlags {
     }
 }
 
-/// Raw clone(2) / clone3(2) flag bits the caller can opt into via
-/// [`CloneMode::Raw`].
-///
-/// Only the user-relevant subset of `CLONE_*` is exposed here. The
-/// runtime sets bookkeeping flags itself ([`CLONE_PIDFD`],
-/// [`CLONE_PARENT_SETTID`], [`CLONE_CHILD_SETTID`],
-/// [`CLONE_CHILD_CLEARTID`]) so callers MUST NOT pass them; the
-/// validator rejects any of those bits as runtime-reserved.
-///
-/// Bit values come from `include/uapi/linux/sched.h` and match the
-/// `libc::CLONE_*` constants. `u64` because `clone_args.flags` is
-/// `__aligned_u64`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct CloneFlags(u64);
-
-impl CloneFlags {
-    /// No flags — equivalent to plain `fork(2)` semantics.
-    pub const NONE: Self = Self(0);
-    /// `CLONE_VM` (0x100): share the address space with the parent.
-    /// Required to be set whenever [`SIGHAND`](Self::SIGHAND) is set
-    /// (kernel rule 2 in `copy_process`).
-    pub const VM: Self = Self(0x100);
-    /// `CLONE_FS` (0x200): share the filesystem context (cwd, umask,
-    /// root). Mutually exclusive with [`NEWNS`](Self::NEWNS) and
-    /// [`NEWUSER`](Self::NEWUSER).
-    pub const FS: Self = Self(0x200);
-    /// `CLONE_FILES` (0x400): share the open-file descriptor table.
-    pub const FILES: Self = Self(0x400);
-    /// `CLONE_SIGHAND` (0x800): share signal handlers with the
-    /// parent. Implies the worker cannot install per-task signal
-    /// dispositions — the whole process sees the same handlers.
-    /// The kernel rejects `SIGHAND` without [`VM`](Self::VM).
-    pub const SIGHAND: Self = Self(0x800);
-    /// `CLONE_THREAD` (0x10000): place the new task into the
-    /// caller's thread group (same `tgid`, `exit_signal == -1`).
-    /// The kernel rejects `THREAD` without
-    /// [`SIGHAND`](Self::SIGHAND), and rejects the combination with
-    /// [`NEWUSER`](Self::NEWUSER) or [`NEWPID`](Self::NEWPID).
-    /// Reaping requires `pidfd` or `pthread_join` — `waitpid` does
-    /// not see thread-group siblings.
-    pub const THREAD: Self = Self(0x10000);
-    /// `CLONE_PARENT` (0x8000): the new task's parent is set to the
-    /// caller's parent (sibling rather than child). The kernel
-    /// rejects this when the caller is `SIGNAL_UNKILLABLE` (init /
-    /// container-init).
-    pub const PARENT: Self = Self(0x8000);
-    /// `CLONE_NEWNS` (0x20000): give the new task a fresh mount
-    /// namespace. Mutually exclusive with [`FS`](Self::FS).
-    pub const NEWNS: Self = Self(0x20000);
-    /// `CLONE_NEWUSER` (0x10000000): give the new task a fresh user
-    /// namespace. Mutually exclusive with [`FS`](Self::FS) and
-    /// [`THREAD`](Self::THREAD).
-    pub const NEWUSER: Self = Self(0x10000000);
-    /// `CLONE_NEWPID` (0x20000000): give the new task a fresh PID
-    /// namespace. Mutually exclusive with [`THREAD`](Self::THREAD).
-    pub const NEWPID: Self = Self(0x20000000);
-    /// `CLONE_NEWNET` (0x40000000): give the new task a fresh
-    /// network namespace.
-    pub const NEWNET: Self = Self(0x40000000);
-    /// `CLONE_NEWIPC` (0x08000000): give the new task a fresh SysV
-    /// IPC namespace.
-    pub const NEWIPC: Self = Self(0x08000000);
-    /// `CLONE_NEWUTS` (0x04000000): give the new task a fresh UTS
-    /// (hostname / domainname) namespace.
-    pub const NEWUTS: Self = Self(0x04000000);
-    /// `CLONE_NEWCGROUP` (0x02000000): give the new task a fresh
-    /// cgroup namespace.
-    pub const NEWCGROUP: Self = Self(0x02000000);
-    /// `CLONE_IO` (0x80000000): share the I/O context with the
-    /// parent.
-    pub const IO: Self = Self(0x80000000);
-    /// `CLONE_SYSVSEM` (0x40000): share SysV semaphore undo state.
-    pub const SYSVSEM: Self = Self(0x40000);
-
-    /// Bits the runtime sets internally — callers MUST NOT include
-    /// any of these. Listed here so the validator can reject them
-    /// as a single mask check.
-    ///
-    /// Includes:
-    /// - `CLONE_PIDFD` (0x1000): the runtime uses pidfd for reaping.
-    /// - `CLONE_PARENT_SETTID` (0x100000) and `CLONE_CHILD_SETTID`
-    ///   (0x01000000): the runtime fills in tid out-params itself.
-    /// - `CLONE_CHILD_CLEARTID` (0x200000): the runtime owns
-    ///   tid-cleared-on-exit semantics for thread-join coordination.
-    /// - `CLONE_DETACHED` (0x400000): the kernel rejects this with
-    ///   `CLONE_PIDFD` (rule 7 in `copy_process`); since the runtime
-    ///   always sets `CLONE_PIDFD` for non-fork dispatch, callers
-    ///   must not set `CLONE_DETACHED`.
-    /// - `CLONE_SETTLS` (0x80000): TLS setup is the runtime's job
-    ///   when it issues clone3 itself.
-    /// - `CLONE_VFORK` (0x4000): the runtime never wants the
-    ///   parent-blocking semantics of vfork.
-    /// - `CLONE_PTRACE` (0x2000) / `CLONE_UNTRACED` (0x800000):
-    ///   ptrace inheritance is the runtime's call.
-    pub const RUNTIME_RESERVED: Self = Self(
-        0x1000        // CLONE_PIDFD
-        | 0x100000    // CLONE_PARENT_SETTID
-        | 0x01000000  // CLONE_CHILD_SETTID
-        | 0x200000    // CLONE_CHILD_CLEARTID
-        | 0x400000    // CLONE_DETACHED
-        | 0x80000     // CLONE_SETTLS
-        | 0x4000      // CLONE_VFORK
-        | 0x2000      // CLONE_PTRACE
-        | 0x800000,   // CLONE_UNTRACED
-    );
-
-    /// Test-only raw-bit constructor. Lets the flag-validator
-    /// reject patterns that the public constants do not expose
-    /// (e.g. unknown high bits, exact runtime-reserved bits).
-    /// Production callers must use the named constants +
-    /// [`union`](Self::union) / `BitOr` so the model stays in sync
-    /// with the validator.
-    #[cfg(test)]
-    pub(crate) const fn from_bits_for_test(bits: u64) -> Self {
-        Self(bits)
-    }
-
-    /// Combine two flag sets.
-    pub const fn union(self, other: Self) -> Self {
-        Self(self.0 | other.0)
-    }
-
-    /// Raw flag bits for `clone_args.flags`.
-    pub const fn bits(self) -> u64 {
-        self.0
-    }
-
-    /// Whether every bit in `other` is set in `self`. Set-theoretic
-    /// (matches [`MpolFlags::contains`]'s convention): `contains(NONE)`
-    /// returns `true` for any `self`.
-    pub const fn contains(self, other: Self) -> bool {
-        (self.0 & other.0) == other.0
-    }
-}
-
-impl std::ops::BitOr for CloneFlags {
-    type Output = Self;
-    /// Delegates to [`CloneFlags::union`] so the bitwise-OR logic
-    /// lives in one place. Same const-fn vs trait-fn split as
-    /// [`MpolFlags`].
-    fn bitor(self, rhs: Self) -> Self {
-        self.union(rhs)
-    }
-}
-
 /// How [`WorkloadHandle::spawn`] creates worker tasks.
 ///
 /// `Fork` is the default — the existing [`fork(2)`] path with
 /// separate address space, separate thread group, and `waitpid`
-/// reaping. The other variants opt into different clone(2) /
-/// clone3(2) flag configurations to exercise scheduler code paths
-/// that depend on shared VM, shared thread group, or fully custom
-/// flags.
-///
-/// All variants except `Fork` produce workers that cannot be
-/// reaped via `waitpid` for thread-group members — the runtime
-/// uses `pthread_join` ([`Thread`](Self::Thread)) or `pidfd` polling
-/// ([`SharedVm`](Self::SharedVm) / [`Raw`](Self::Raw)) instead. See
-/// the per-variant docs for the dispatch path each takes.
-///
-/// **Status:** [`Fork`](Self::Fork) and [`Thread`](Self::Thread) are
-/// dispatched; [`SharedVm`](Self::SharedVm) and [`Raw`](Self::Raw)
-/// bail with a runtime-constraint diagnostic until the clone3-child
-/// Rust-runtime redesign lands. The flag validator
-/// ([`validate_clone_flags`]) is fully implemented because the
-/// redesign will reuse it; the variant constructors are exposed so
-/// callers can write tests that pin the planned API surface ahead
-/// of dispatch.
+/// reaping. `Thread` switches to [`std::thread::spawn`] for workers
+/// that share the test runner's tgid.
 ///
 /// # `WorkType` × `CloneMode` compatibility
 ///
-/// Most [`WorkType`] variants compose with any [`CloneMode`]. The
-/// exceptions are surfaced at spawn time by [`WorkloadHandle::spawn`]:
+/// Most [`WorkType`] variants compose with both clone modes. The
+/// only exception is surfaced at spawn time by
+/// [`WorkloadHandle::spawn`]:
 ///
-/// | WorkType                        | Fork | Thread | SharedVm/Raw   |
-/// |---------------------------------|------|--------|----------------|
-/// | All variants (default)          | OK   | OK     | bail (status)  |
-/// | [`WorkType::ForkExit`]          | OK   | reject | bail (status)  |
+/// | WorkType                | Fork | Thread |
+/// |-------------------------|------|--------|
+/// | All variants (default)  | OK   | OK     |
+/// | [`WorkType::ForkExit`]  | OK   | reject |
 ///
 /// `ForkExit + Thread` is rejected because the worker body calls
 /// `libc::fork()` from inside a thread of the parent's tgid; the
@@ -1762,11 +1693,8 @@ impl std::ops::BitOr for CloneFlags {
 /// - [`WorkType::AsymmetricWaker`] with an RT class: legal but
 ///   the harness still runs as its original (likely SCHED_NORMAL)
 ///   policy; only the worker thread is RT.
-///
-/// `SharedVm` and `Raw` currently bail at spawn for any
-/// `WorkType` (see status note above); the table reflects the
-/// post-dispatch landscape.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CloneMode {
     /// Plain `fork(2)`: separate address space, separate thread
     /// group (`p->tgid = p->pid`), reaped via `waitpid`. The default
@@ -1775,107 +1703,12 @@ pub enum CloneMode {
     Fork,
     /// Same thread group as the spawning process. Implementation
     /// uses [`std::thread::spawn`]; the Rust thread runtime owns
-    /// all clone-flag selection internally (the user does not pass
-    /// flags via this variant). Reaped via [`std::thread::JoinHandle`].
-    /// Workers share `tgid`, signal-handler table, and address space
-    /// with the parent — observers like `task_struct->group_leader`,
-    /// `tgid`, `real_parent` all match the parent's.
+    /// all clone-flag selection internally. Reaped via
+    /// [`std::thread::JoinHandle`]. Workers share `tgid`,
+    /// signal-handler table, and address space with the parent —
+    /// observers like `task_struct->group_leader`, `tgid`,
+    /// `real_parent` all match the parent's.
     Thread,
-    /// Shared VM but a *different* `tgid`. Issued via raw
-    /// [`clone3(2)`](https://man7.org/linux/man-pages/man2/clone3.2.html)
-    /// with `CLONE_VM | CLONE_PIDFD` (no `CLONE_THREAD`,
-    /// `CLONE_SIGHAND`, etc.). Workers see the parent's address
-    /// space but appear as separate processes to PID-keyed
-    /// observers. Reaped via the runtime's pidfd. Useful for
-    /// scheduler code paths that key on `tgid` distinction while
-    /// requiring shared memory.
-    SharedVm,
-    /// Caller-supplied flag set. The runtime adds `CLONE_PIDFD`
-    /// internally for reaping; everything else comes from the
-    /// caller. The flag set is validated against the kernel's
-    /// `copy_process` rejection rules at spawn time —
-    /// [`validate_clone_flags`] for the exhaustive list.
-    ///
-    /// `Raw(CloneFlags::NONE)` is observationally equivalent to
-    /// [`Fork`](Self::Fork) from the kernel's perspective (no clone
-    /// flags = process fork) but goes through the clone3 dispatch
-    /// path, which adds `CLONE_PIDFD`, allocates a child stack
-    /// mmap, and reaps via pidfd polling. Prefer [`Fork`](Self::Fork)
-    /// for that case; reserve `Raw` for flag sets that need at
-    /// least one explicit bit.
-    Raw(CloneFlags),
-}
-
-/// Validate a [`CloneFlags`] set against the rejection rules in
-/// `copy_process` (kernel/fork.c). Returns `Ok(())` on a flag set
-/// the kernel will accept, or `Err` with a named-rule diagnostic
-/// otherwise.
-///
-/// The runtime calls this before ever issuing the syscall so
-/// callers see a structural rejection (with the rule name) rather
-/// than tunneling an `EINVAL` through the syscall return.
-///
-/// Rules implemented (1:1 with the kernel checks at the top of
-/// `copy_process`):
-///
-/// 1. `THREAD` requires `SIGHAND`.
-/// 2. `SIGHAND` requires `VM` (also implied by rule 1 transitively).
-/// 3. `NEWNS` and `FS` are mutually exclusive.
-/// 4. `NEWUSER` and `FS` are mutually exclusive.
-/// 5. `THREAD` excludes `NEWUSER` and `NEWPID`.
-/// 6. Caller-set bits in [`CloneFlags::RUNTIME_RESERVED`] are
-///    rejected — those flags belong to the runtime.
-///
-/// `CLONE_PARENT && SIGNAL_UNKILLABLE` (init/container-init only)
-/// is NOT pre-checked here — ktstr never runs as init, so the rule
-/// is unreachable; the kernel still enforces it on the unlikely
-/// off-path.
-pub(crate) fn validate_clone_flags(flags: CloneFlags) -> Result<()> {
-    if flags.contains(CloneFlags::THREAD) && !flags.contains(CloneFlags::SIGHAND) {
-        anyhow::bail!(
-            "clone3: CLONE_THREAD requires CLONE_SIGHAND (kernel `copy_process` \
-             rejects detached threads outside a thread group)"
-        );
-    }
-    if flags.contains(CloneFlags::SIGHAND) && !flags.contains(CloneFlags::VM) {
-        anyhow::bail!(
-            "clone3: CLONE_SIGHAND requires CLONE_VM (kernel `copy_process` \
-             rejects shared signal handlers without shared address space)"
-        );
-    }
-    if flags.contains(CloneFlags::NEWNS) && flags.contains(CloneFlags::FS) {
-        anyhow::bail!(
-            "clone3: CLONE_NEWNS and CLONE_FS are mutually exclusive (kernel \
-             `copy_process` rejects sharing the root directory across mount \
-             namespaces)"
-        );
-    }
-    if flags.contains(CloneFlags::NEWUSER) && flags.contains(CloneFlags::FS) {
-        anyhow::bail!(
-            "clone3: CLONE_NEWUSER and CLONE_FS are mutually exclusive (kernel \
-             `copy_process` rejects sharing FS state across user namespaces)"
-        );
-    }
-    if flags.contains(CloneFlags::THREAD)
-        && (flags.contains(CloneFlags::NEWUSER) || flags.contains(CloneFlags::NEWPID))
-    {
-        anyhow::bail!(
-            "clone3: CLONE_THREAD with CLONE_NEWUSER or CLONE_NEWPID rejected \
-             (kernel `copy_process` requires thread-group siblings to share \
-             user/pid namespaces)"
-        );
-    }
-    let reserved = flags.bits() & CloneFlags::RUNTIME_RESERVED.bits();
-    if reserved != 0 {
-        anyhow::bail!(
-            "clone3: caller-set runtime-reserved flags 0x{reserved:x} not allowed \
-             (CLONE_PIDFD, CLONE_PARENT_SETTID, CLONE_CHILD_SETTID, \
-             CLONE_CHILD_CLEARTID, CLONE_DETACHED, CLONE_SETTLS, CLONE_VFORK, \
-             CLONE_PTRACE, CLONE_UNTRACED are runtime-managed; see \
-             `CloneFlags::RUNTIME_RESERVED`)"
-        );
-    }
-    Ok(())
 }
 
 impl MemPolicy {
@@ -2099,7 +1932,11 @@ fn warn_setpriority_failed_once() {
 }
 
 /// Configuration for spawning a group of worker processes.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+// See [`WorkType`]'s `#[serde(bound(...))]` comment — embedding
+// `WorkType` propagates the same lifetime-bound issue, so we pass
+// through the same explicit empty bound.
+#[serde(bound(deserialize = ""))]
 pub struct WorkloadConfig {
     /// Number of worker processes to fork.
     pub num_workers: usize,
@@ -2126,11 +1963,7 @@ pub struct WorkloadConfig {
     /// logged once via stderr and do not abort the worker — the
     /// scheduling-policy and affinity sites use the same idiom.
     pub nice: i32,
-    /// How to create each worker. Defaults to [`CloneMode::Fork`]
-    /// — the historical fork-based path. Other variants exercise
-    /// shared-VM / thread-group / custom-flag clone3 paths;
-    /// dispatch for those is staged behind future thread-mode and
-    /// clone3-based dispatch implementations.
+    /// How to create each worker. Defaults to [`CloneMode::Fork`].
     pub clone_mode: CloneMode,
 }
 
@@ -2221,7 +2054,11 @@ impl WorkloadConfig {
 ///     .mem_policy(MemPolicy::bind([0, 1]));
 /// assert_eq!(w.num_workers, Some(4));
 /// ```
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+// See [`WorkType`]'s `#[serde(bound(...))]` comment — embedding
+// `WorkType` here propagates the same lifetime-bound issue, so we
+// pass through the same explicit empty bound.
+#[serde(bound(deserialize = ""))]
 pub struct WorkSpec {
     /// What each worker does.
     pub work_type: WorkType,
@@ -2724,53 +2561,15 @@ impl Drop for ThreadWorker {
     }
 }
 
-/// Per-clone3 worker state for [`CloneMode::SharedVm`] and
-/// [`CloneMode::Raw`] dispatch.
-///
-/// The clone3 path mirrors the Fork variant's pipe-based start /
-/// report rendezvous because the new task still needs an explicit
-/// "go" signal and a back-channel for the [`WorkerReport`] JSON.
-/// What differs from Fork is the reaping primitive:
-///
-/// - `pidfd` is the file descriptor the kernel writes into the
-///   user-pointer `clone_args.pidfd` field when the `CLONE_PIDFD`
-///   flag is set. `poll(pidfd, POLLIN, ms)` reports the child's
-///   exit; the parent does not need `waitpid` and does not race
-///   the kernel's pid recycling.
-/// - `stack_ptr` / `stack_size` own the child's stack mmap. The
-///   parent must mmap a child stack when `CLONE_VM` is set
-///   (`clone3(2)` does not auto-allocate a stack the way
-///   `fork(2)` implicitly does because the parent and child share
-///   the same VM and the kernel cannot reuse the parent's stack).
-///   The mapping is passed via `clone_args.stack` +
-///   `clone_args.stack_size`. The parent must `munmap` it AFTER
-///   the child exits (poll the pidfd first), otherwise the unmap
-///   rips the stack out from under a still-running child.
-struct PidfdWorker {
-    pid: libc::pid_t,
-    pidfd: std::os::unix::io::RawFd,
-    report_fd: std::os::unix::io::RawFd,
-    start_fd: std::os::unix::io::RawFd,
-    stack_ptr: *mut libc::c_void,
-    stack_size: usize,
-    /// Per-worker stop flag, shared with the clone3 child via the
-    /// CLONE_VM-shared address space. Flipping this from the
-    /// parent reaches the child's `worker_main` `stop.load`
-    /// checks without using the global [`STOP`], so siblings are
-    /// not affected.
-    stop: std::sync::Arc<AtomicBool>,
-}
-
 /// Handle to spawned worker tasks. Workers block until
 /// [`start()`](Self::start) is called.
 ///
 /// The [`CloneMode`] in the [`WorkloadConfig`] selects how each
 /// worker is created. Within one [`WorkloadHandle`] every worker
-/// uses the same mode, so exactly one of `children`, `threads`, or
-/// `pidfd_workers` is populated; the other two are empty. This
-/// avoids per-worker mode dispatch on the hot path and keeps each
-/// vec's per-mode invariants (pid-based, JoinHandle-based,
-/// pidfd-based reaping) cohesive.
+/// uses the same mode, so exactly one of `children` or `threads`
+/// is populated; the other is empty. This avoids per-worker mode
+/// dispatch on the hot path and keeps each vec's per-mode
+/// invariants (pid-based vs JoinHandle-based reaping) cohesive.
 ///
 /// - [`CloneMode::Fork`] populates `children` — separate process
 ///   per worker, reaped via `waitpid`, signaled via SIGUSR1.
@@ -2781,10 +2580,6 @@ struct PidfdWorker {
 ///   (cgroup v2 thread mode), which ktstr scenarios do not
 ///   currently configure — Thread-mode workers inherit the
 ///   parent's cgroup.
-/// - [`CloneMode::SharedVm`] / [`CloneMode::Raw`] populate
-///   `pidfd_workers` — `clone3(2)` with explicit flags, reaped via
-///   `poll(pidfd, POLLIN)`. Used by tests that exercise the
-///   kernel's per-flag-combination scheduler code paths.
 #[must_use = "dropping a WorkloadHandle immediately tears down all worker tasks"]
 pub struct WorkloadHandle {
     /// Fork-mode workers. Each entry is `(pid, report_fd, start_fd)`.
@@ -2797,9 +2592,6 @@ pub struct WorkloadHandle {
     /// Thread-mode workers. Empty when `clone_mode` is not
     /// [`CloneMode::Thread`].
     threads: Vec<ThreadWorker>,
-    /// clone3-mode workers. Empty when `clone_mode` is not
-    /// [`CloneMode::SharedVm`] or [`CloneMode::Raw`].
-    pidfd_workers: Vec<PidfdWorker>,
     started: bool,
     /// Shared mmap regions for futex-based work types (one per worker group). Unmapped on drop.
     futex_ptrs: Vec<*mut u32>,
@@ -2854,11 +2646,6 @@ struct SpawnGuard {
     /// thread, since threads share the parent's address space and
     /// must be drained cooperatively (no `kill` equivalent).
     threads: Vec<ThreadWorker>,
-    /// Already-cloned pidfd workers with their parent-side state
-    /// (transferred on success). Cleanup on early-exit issues
-    /// `pidfd_send_signal(SIGKILL)` then `poll(pidfd, POLLIN)` to
-    /// drain the exit, then `munmap`s the child stack.
-    pidfd_workers: Vec<PidfdWorker>,
 }
 
 impl SpawnGuard {
@@ -2871,19 +2658,17 @@ impl SpawnGuard {
             iter_counter_bytes: 0,
             children: Vec::new(),
             threads: Vec::new(),
-            pidfd_workers: Vec::new(),
         }
     }
 
     /// Transfer live resources into a [`WorkloadHandle`]. Leaves the
-    /// guard's `children`, `threads`, `pidfd_workers`, `futex_ptrs`,
-    /// and `iter_counters` empty so the guard's subsequent `Drop`
-    /// only closes the inter-worker `pipe_pairs` (which the parent
-    /// never uses post-fork).
+    /// guard's `children`, `threads`, `futex_ptrs`, and
+    /// `iter_counters` empty so the guard's subsequent `Drop` only
+    /// closes the inter-worker `pipe_pairs` (which the parent never
+    /// uses post-fork).
     fn into_handle(mut self) -> WorkloadHandle {
         let children = std::mem::take(&mut self.children);
         let threads = std::mem::take(&mut self.threads);
-        let pidfd_workers = std::mem::take(&mut self.pidfd_workers);
         let futex_ptrs = std::mem::take(&mut self.futex_ptrs);
         let iter_counters = std::mem::replace(&mut self.iter_counters, std::ptr::null_mut());
         let iter_counter_bytes = std::mem::replace(&mut self.iter_counter_bytes, 0);
@@ -2891,7 +2676,6 @@ impl SpawnGuard {
         WorkloadHandle {
             children,
             threads,
-            pidfd_workers,
             started: false,
             futex_ptrs,
             futex_region_size: self.futex_region_size,
@@ -2951,47 +2735,6 @@ impl Drop for SpawnGuard {
                 // not leaking, and the spawn-side bail message has
                 // already named the failure mode that triggered cleanup.
                 let _ = join_thread_with_timeout(j, THREAD_JOIN_TIMEOUT);
-            }
-        }
-        // Drain pidfd workers: send SIGKILL via pidfd_send_signal,
-        // poll the pidfd until it reports the exit, then close
-        // pidfd / fds and munmap the child stack. Each step is
-        // best-effort because the partial-failure path may have
-        // populated this vec without all fds being valid.
-        for w in &self.pidfd_workers {
-            // pidfd_send_signal(pidfd, SIGKILL, NULL, 0).
-            // libc 0.2 lacks a wrapper; use raw syscall. Errors
-            // (ESRCH from already-exited child, EBADF from a
-            // half-set-up entry) are swallowed.
-            unsafe {
-                libc::syscall(
-                    libc::SYS_pidfd_send_signal,
-                    w.pidfd,
-                    libc::SIGKILL,
-                    std::ptr::null::<libc::siginfo_t>(),
-                    0u32,
-                );
-            }
-            // Wait for exit so the munmap below does not race a
-            // running child. POLLIN on pidfd fires when the child
-            // reaches `exit`. 5s deadline matches stop_and_collect's
-            // shared budget.
-            let mut pfd = libc::pollfd {
-                fd: w.pidfd,
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            unsafe {
-                libc::poll(&mut pfd, 1, 5_000);
-            }
-            // Close fds (pidfd, report, start) and munmap the stack.
-            for fd in [w.pidfd, w.report_fd, w.start_fd] {
-                if fd >= 0 {
-                    let _ = nix::unistd::close(fd);
-                }
-            }
-            if !w.stack_ptr.is_null() && w.stack_size > 0 {
-                unsafe { libc::munmap(w.stack_ptr, w.stack_size) };
             }
         }
         // Close every inter-worker pipe pair. Children closed their
@@ -3059,12 +2802,6 @@ impl Drop for SpawnGuard {
 //   MAP_SHARED region is allocated once before any worker spawns
 //   and `munmap`ped after every worker has been joined, so the
 //   underlying kernel object outlives every alias.
-//
-// - Pidfd mode (currently bailed pending the clone3 redesign):
-//   children share the parent's address space via `CLONE_VM`, so
-//   they observe the same VMAs as Thread workers and the same
-//   atomic-aliasing argument applies. The redesign will inherit
-//   this soundness without needing MAP_SHARED.
 unsafe impl Send for WorkloadHandle {}
 unsafe impl Sync for WorkloadHandle {}
 
@@ -3238,465 +2975,23 @@ fn spawn_thread_worker(
     Ok(())
 }
 
-/// Spawn a single clone3-mode worker via raw `clone3(2)`.
-///
-/// Used by [`CloneMode::SharedVm`] (hardcoded `CLONE_VM`) and
-/// [`CloneMode::Raw`] (caller-supplied flags). The runtime adds
-/// `CLONE_PIDFD` internally so the parent can reap via
-/// `poll(pidfd, POLLIN)` instead of `waitpid`.
-///
-/// The child runs the same body as the Fork path's `pid == 0` arm
-/// — pipe-based start rendezvous, `worker_main`, `_exit` — adapted
-/// to use a clone3-allocated stack and the pidfd-reap return path.
-/// Because the child shares the parent's address space when
-/// `CLONE_VM` is set, any access to the parent's stack (locals
-/// captured by the loop) would race the parent — the child's
-/// post-clone3 code path therefore copies every value it needs out
-/// of the loop's locals BEFORE returning to user space.
-///
-/// **Kernel-verified constraints carried forward to the redesign:**
-///
-/// - `kernel/fork.c::copy_process` calls `sas_ss_reset` for any
-///   child cloned with `CLONE_VM` and without `CLONE_VFORK`,
-///   resetting the child's `sas_ss_*` fields (sigaltstack disabled,
-///   size 0). Workers that need a sigaltstack for SIGSEGV recovery
-///   must call `sigaltstack(2)` themselves post-clone3.
-///
-/// - `kernel/fork.c::mm_release` clears `*clear_child_tid` in the
-///   shared mm on exit / exec. Setting `CLONE_CHILD_CLEARTID` from
-///   a `CLONE_VM` clone3 child therefore writes a zero into the
-///   PARENT's address space at exit time — silent memory
-///   corruption. `CLONE_CHILD_CLEARTID` is already in
-///   [`CloneFlags::RUNTIME_RESERVED`] so user-supplied flag sets
-///   for [`CloneMode::Raw`] cannot reach this footgun; the
-///   runtime itself must NOT set it for SharedVm/Raw either.
-///
-/// - The child stack mmap should size `STACK_SIZE + PAGE_SIZE` and
-///   `mprotect` the bottom page `PROT_NONE` so a stack overflow
-///   segfaults predictably instead of corrupting an adjacent
-///   mapping. Implemented below by `CLONE3_STACK_SIZE +
-///   CLONE3_STACK_GUARD` + `mprotect(stack_ptr, CLONE3_STACK_GUARD,
-///   PROT_NONE)`.
-#[allow(clippy::too_many_arguments)]
-fn spawn_clone3_worker(
-    guard: &mut SpawnGuard,
-    config: &WorkloadConfig,
-    flags: CloneFlags,
-    affinity: Option<BTreeSet<usize>>,
-    worker_pipe_fds: Option<(i32, i32)>,
-    worker_futex: Option<(*mut u32, usize)>,
-    iter_slot: *mut AtomicU64,
-    report_fds: [i32; 2],
-    start_fds: [i32; 2],
-    worker_idx: usize,
-) -> Result<()> {
-    // Allocate a child stack via mmap. clone3 does not auto-allocate
-    // a stack the way fork does; the caller must supply one through
-    // clone_args.stack + clone_args.stack_size. The mapping is
-    // ANONYMOUS|PRIVATE so the child's stack writes don't bleed
-    // back into the parent. Sized at CLONE3_STACK_SIZE +
-    // CLONE3_STACK_GUARD; the kernel never touches the guard page
-    // because the child's stack pointer starts at the END (highest
-    // address) of the usable region and grows downward toward the
-    // guard.
-    let total = CLONE3_STACK_SIZE + CLONE3_STACK_GUARD;
-    let stack_ptr = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            total,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_STACK,
-            -1,
-            0,
-        )
-    };
-    if stack_ptr == libc::MAP_FAILED {
-        unsafe {
-            libc::close(report_fds[0]);
-            libc::close(report_fds[1]);
-            libc::close(start_fds[0]);
-            libc::close(start_fds[1]);
-        }
-        anyhow::bail!(
-            "clone3 worker {}/{}: mmap of {} byte child stack failed: {}",
-            worker_idx + 1,
-            config.num_workers,
-            total,
-            std::io::Error::last_os_error(),
-        );
-    }
-    // Mark the bottom page as PROT_NONE so a stack overflow
-    // segfaults predictably instead of corrupting an adjacent
-    // mapping. Failure here is non-fatal (the workload still runs;
-    // the guard page just isn't enforced); fall through with a
-    // tracing::warn.
-    let guard_rc = unsafe {
-        libc::mprotect(stack_ptr, CLONE3_STACK_GUARD, libc::PROT_NONE)
-    };
-    if guard_rc != 0 {
-        tracing::warn!(
-            err = %std::io::Error::last_os_error(),
-            "clone3 stack guard page mprotect(PROT_NONE) failed; \
-             stack overflow will not be caught"
-        );
-    }
-
-    // clone3 stack pointer points to the BASE of the usable region
-    // (kernel computes top from base + size). We pass the
-    // post-guard offset as `stack` and CLONE3_STACK_SIZE as
-    // `stack_size`.
-    let usable_stack = unsafe { (stack_ptr as *mut u8).add(CLONE3_STACK_GUARD) };
-
-    // Heap-allocate the child-args bundle. Under CLONE_VM the
-    // child cannot read the parent's stack frame (the parent
-    // returns from this function and unwinds the locals shortly
-    // after clone3), so every input the child needs lives on the
-    // heap and is reachable via the shared address space. Push
-    // onto the FIFO queue immediately before clone3 so the child
-    // pops it on the next iteration.
-    // Per-worker stop flag, mirroring the Thread-mode design.
-    // The Arc lives in shared address space (CLONE_VM); the parent
-    // flips it from `stop_and_collect`, the child observes it via
-    // `stop.load(Relaxed)` inside `worker_main`. Stored on both
-    // the queued args (for the child to pick up) and on the
-    // `PidfdWorker` (so the parent can flip without re-finding
-    // the queue entry).
-    let stop = std::sync::Arc::new(AtomicBool::new(false));
-    let child_args = Box::new(Clone3ChildArgs {
-        affinity,
-        work_type: config.work_type.clone(),
-        sched_policy: config.sched_policy,
-        mem_policy: config.mem_policy.clone(),
-        mpol_flags: config.mpol_flags,
-        nice: config.nice,
-        worker_pipe_fds,
-        worker_futex: worker_futex.map(|(p, pos)| (p as usize, pos)),
-        iter_slot: iter_slot as usize,
-        report_fd: report_fds[1],
-        start_fd: start_fds[0],
-        stop: std::sync::Arc::clone(&stop),
-    });
-    CLONE3_CHILD_ARGS_QUEUE
-        .lock()
-        .expect("clone3 child-args queue mutex poisoned")
-        .push_back(child_args);
-
-    // Build clone_args. The runtime always sets CLONE_PIDFD so we
-    // can reap via pidfd; the caller's flags must not include any
-    // RUNTIME_RESERVED bits (validate_clone_flags enforces this).
-    // exit_signal stays at 0 — without CLONE_THREAD the kernel
-    // requires either an explicit exit_signal or 0; pidfd reaping
-    // does not need SIGCHLD.
-    let mut pidfd: libc::c_int = -1;
-    let mut clone_args: libc::clone_args = unsafe { std::mem::zeroed() };
-    clone_args.flags = flags.bits() | (libc::CLONE_PIDFD as u64);
-    clone_args.pidfd = (&mut pidfd as *mut libc::c_int) as u64;
-    clone_args.exit_signal = 0;
-    clone_args.stack = usable_stack as u64;
-    clone_args.stack_size = CLONE3_STACK_SIZE as u64;
-
-    // Issue clone3. Returns 0 in the child, child pid in the
-    // parent, -1 on error. SAFETY: clone_args is a zero-initialised
-    // libc UAPI struct with our fields populated; the kernel reads
-    // `size` to gate which fields it touches, and ignores tail
-    // bytes beyond its own definition. pidfd and stack pointers
-    // outlive the syscall.
-    let rc = unsafe {
-        libc::syscall(
-            libc::SYS_clone3,
-            &clone_args as *const libc::clone_args,
-            std::mem::size_of::<libc::clone_args>(),
-        )
-    };
-    if rc < 0 {
-        // clone3 failed — drain the args we pushed, then release
-        // everything we allocated for this worker before bailing.
-        let _ = CLONE3_CHILD_ARGS_QUEUE
-            .lock()
-            .expect("clone3 child-args queue mutex poisoned")
-            .pop_back();
-        unsafe {
-            libc::munmap(stack_ptr, total);
-            libc::close(report_fds[0]);
-            libc::close(report_fds[1]);
-            libc::close(start_fds[0]);
-            libc::close(start_fds[1]);
-        }
-        anyhow::bail!(
-            "clone3 worker {}/{}: syscall failed: {} (flags=0x{:x})",
-            worker_idx + 1,
-            config.num_workers,
-            std::io::Error::last_os_error(),
-            clone_args.flags,
-        );
-    }
-    if rc == 0 {
-        // Child path. The child reads its args from the queue
-        // (pop_front), then runs worker_main on the new stack. All
-        // values come from heap (Box) or static globals; the
-        // parent's stack is NOT accessed.
-        clone3_child_main();
-    }
-    // Parent path. rc is the child pid; pidfd is filled by the
-    // kernel via clone_args.pidfd. Close child-side pipe ends so
-    // the parent retains only the read-side report_fd and
-    // write-side start_fd.
-    unsafe {
-        libc::close(report_fds[1]);
-        libc::close(start_fds[0]);
-    }
-    let pid = rc as libc::pid_t;
-    guard.pidfd_workers.push(PidfdWorker {
-        pid,
-        pidfd,
-        report_fd: report_fds[0],
-        start_fd: start_fds[1],
-        stack_ptr,
-        stack_size: total,
-        stop,
-    });
-    Ok(())
-}
-
-/// Body of the clone3 child. Runs on the child's freshly-mmap'd
-/// stack. Reads its inputs from the heap-allocated
-/// [`Clone3ChildArgs`] box the parent just pushed, runs
-/// [`worker_main`], writes the [`WorkerReport`] JSON to the report
-/// pipe, and `_exit`s. Never returns.
-///
-/// This function does NOT read parent-stack locals — every input
-/// arrives via the shared queue, which lives on the global heap
-/// (also shared under `CLONE_VM`).
-///
-/// Marked `#[inline(never)]` to keep the child's stack frame
-/// distinct from `spawn_clone3_worker`'s and to make a stack-
-/// overflow trace unambiguous.
-#[inline(never)]
-fn clone3_child_main() -> ! {
-    // Pop the args from the front of the queue. FIFO ordering
-    // matches the parent's push-then-clone3 sequence — ktstr only
-    // issues clone3 calls from one thread at a time (the per-worker
-    // spawn loop), so the pop never sees a sibling's args.
-    let args = CLONE3_CHILD_ARGS_QUEUE
-        .lock()
-        .expect("clone3 child-args queue mutex poisoned")
-        .pop_front()
-        .expect("clone3 child reached child_main with empty args queue");
-
-    // Wait for parent to signal start via the start pipe. 30s
-    // ceiling matches the fork-mode child to avoid an indefinite
-    // hang on a parent that crashes between clone3 and start().
-    let mut pfd = libc::pollfd {
-        fd: args.start_fd,
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    let ret = unsafe { libc::poll(&mut pfd, 1, 30_000) };
-    if ret <= 0 {
-        unsafe { libc::_exit(1) };
-    }
-    let mut buf = [0u8; 1];
-    unsafe {
-        libc::read(args.start_fd, buf.as_mut_ptr() as *mut _, 1);
-        libc::close(args.start_fd);
-    }
-    // Destructure args so the per-worker stop Arc and the other
-    // fields move into local bindings without partial-move
-    // conflicts when worker_main borrows `&stop`.
-    let Clone3ChildArgs {
-        affinity,
-        work_type,
-        sched_policy,
-        mem_policy,
-        mpol_flags,
-        nice,
-        worker_pipe_fds,
-        worker_futex: futex_raw,
-        iter_slot: slot_raw,
-        report_fd,
-        start_fd: _,
-        stop,
-    } = *args;
-    // Reset the per-worker stop flag in case SIGUSR1 raced the
-    // start handshake. Mirrors the Thread-mode pattern: each
-    // SharedVm/Raw worker carries its own `Arc<AtomicBool>` so
-    // stopping one worker does not stop siblings (the global
-    // [`STOP`] would, since SIGUSR1 broadcasts to every task that
-    // shares the parent's signal disposition table).
-    stop.store(false, Ordering::Relaxed);
-
-    let worker_futex = futex_raw.map(|(addr, pos)| (addr as *mut u32, pos));
-    let iter_slot = slot_raw as *mut AtomicU64;
-
-    let report = worker_main(
-        affinity,
-        work_type,
-        sched_policy,
-        mem_policy,
-        mpol_flags,
-        nice,
-        worker_pipe_fds,
-        worker_futex,
-        iter_slot,
-        &stop,
-    );
-
-    // Serialise the report and write it to the parent's end of the
-    // report pipe. Any IO error here is silently dropped — the
-    // parent's read_to_end falls into the sentinel branch and
-    // attaches an exit_info diagnostic.
-    let json = serde_json::to_vec(&report).unwrap_or_default();
-    unsafe {
-        libc::write(
-            report_fd,
-            json.as_ptr() as *const _,
-            json.len(),
-        );
-        libc::close(report_fd);
-        libc::_exit(0);
-    }
-}
-
 /// Internal dispatch shape resolved from
 /// [`WorkloadConfig::clone_mode`] inside [`WorkloadHandle::spawn`].
-///
-/// `Clone3` is wired through the dispatch loop but reaches the
-/// staging bail-out before invoking the syscall — see the
-/// `CloneMode::SharedVm` / `CloneMode::Raw` arms in
-/// [`WorkloadHandle::spawn`]. The variant is kept (and the
-/// `spawn_clone3_worker` helper preserved with `#[allow(dead_code)]`
-/// below) because the redesign tracked under the follow-up clone3
-/// task will turn the bail-out into a real dispatch and reuse this
-/// machinery without re-deriving the ABI surface.
-#[allow(dead_code)]
 enum Dispatch {
     Fork,
     Thread,
-    Clone3 { flags: CloneFlags },
 }
-
-/// Default Linux thread stack size for [`CloneMode::SharedVm`] /
-/// [`CloneMode::Raw`] children. `clone3(2)` requires the caller to
-/// allocate the child stack via mmap and pass it through
-/// `clone_args.stack` + `clone_args.stack_size`; pthread on glibc
-/// uses 8 MiB by default for new threads, and matching that figure
-/// keeps worker stack budgets predictable.
-const CLONE3_STACK_SIZE: usize = 8 * 1024 * 1024;
-
-/// Heap-allocated argument bundle handed from a clone3 parent to
-/// the child it just forked.
-///
-/// Under `CLONE_VM` the child shares the parent's address space but
-/// runs on a fresh mmap'd stack — the parent's stack frame for
-/// [`spawn_clone3_worker`] is unwound as soon as the parent returns
-/// past the syscall, so the child cannot safely read locals
-/// captured at clone3 time. Heap-allocating these args via `Box`
-/// (which lands in the shared global heap) and passing the box
-/// through [`CLONE3_CHILD_ARGS_QUEUE`] gives the child a stable
-/// place to find its inputs that survives the parent's unwind.
-struct Clone3ChildArgs {
-    affinity: Option<BTreeSet<usize>>,
-    work_type: WorkType,
-    sched_policy: SchedPolicy,
-    mem_policy: MemPolicy,
-    mpol_flags: MpolFlags,
-    nice: i32,
-    worker_pipe_fds: Option<(i32, i32)>,
-    /// Futex region pointer (raw, address-only). See
-    /// [`SendFutexPtr`] for the lifetime argument; the
-    /// MAP_SHARED region outlives every clone3 child.
-    worker_futex: Option<(usize, usize)>,
-    iter_slot: usize,
-    report_fd: libc::c_int,
-    start_fd: libc::c_int,
-    /// Per-worker stop flag, mirroring [`ThreadWorker::stop`]. The
-    /// shared address space (CLONE_VM) means a single
-    /// `Arc<AtomicBool>` is reachable by both parent and child;
-    /// the parent flips it from `stop_and_collect`, the child
-    /// observes it via `stop.load(Relaxed)` inside `worker_main`.
-    /// Replaces the global [`STOP`] for SharedVm/Raw children so
-    /// stopping one worker does not stop siblings.
-    stop: std::sync::Arc<AtomicBool>,
-}
-
-/// Queue of child-arg boxes pending pickup by clone3 children.
-///
-/// The parent pushes one `Box<Clone3ChildArgs>` immediately before
-/// each `clone3(SYS_clone3, ...)` syscall; the child pops from the
-/// front of the queue right after the syscall returns 0. ktstr
-/// currently only issues clone3 calls from one thread at a time
-/// (the per-worker spawn loop in [`WorkloadHandle::spawn`] is
-/// sequential), so FIFO ordering happens to be sufficient — no
-/// per-call identifier is needed.
-///
-/// `Mutex` is fine even though child and parent are technically
-/// distinct kernel tasks: under `CLONE_VM` they share the address
-/// space including the mutex's underlying futex word, so locking
-/// works the same as for two threads.
-///
-/// FIXME: the FIFO ordering assumption is unsound under concurrent
-/// scheduling. If the kernel schedules child N+1's pop_front BEFORE
-/// child N's, child N+1 picks up child N's args (and vice versa),
-/// silently swapping per-worker state across siblings. Today the
-/// per-worker spawn loop is sequential and the next push always
-/// follows the previous syscall return, but that ordering is a
-/// property of the caller, not the queue. The clone3-child redesign
-/// (per the SharedVm/Raw bail message and the deferred dispatch
-/// task) MUST replace this with per-child keyed delivery — e.g.
-/// hand the child a per-call key via a register the kernel preserves
-/// (clone_args.tls when CLONE_SETTLS is set, or a slot in the
-/// child's stack mmap that the parent populates pre-syscall) and
-/// pop by that key.
-static CLONE3_CHILD_ARGS_QUEUE: std::sync::Mutex<std::collections::VecDeque<Box<Clone3ChildArgs>>> =
-    std::sync::Mutex::new(std::collections::VecDeque::new());
-
-/// Stack guard size below the clone3 child stack mmap. Mirrors
-/// glibc's `pthread_attr_default::guardsize` of one page so a stack
-/// overflow segfaults predictably instead of corrupting an adjacent
-/// allocation. The mmap is sized
-/// `CLONE3_STACK_SIZE + CLONE3_STACK_GUARD`; the kernel never
-/// touches the guard page because the child stack pointer is set to
-/// the END of the usable region (highest address) and grows down
-/// toward the guard.
-const CLONE3_STACK_GUARD: usize = 4096;
 
 impl WorkloadHandle {
     /// Spawn worker tasks. Workers block until
     /// [`start()`](Self::start) is called, allowing the caller to
     /// move fork-mode workers into cgroups first. The worker creation
-    /// primitive (`fork`, `std::thread::spawn`, or `clone3`) is
-    /// selected by [`WorkloadConfig::clone_mode`].
+    /// primitive (`fork` or `std::thread::spawn`) is selected by
+    /// [`WorkloadConfig::clone_mode`].
     pub fn spawn(config: &WorkloadConfig) -> Result<Self> {
-        // Resolve the kernel clone3 flag set for the dispatch shape
-        // up front. Fork and Thread land at full implementations
-        // below; SharedVm and Raw bail with an actionable message
-        // until the clone3-child Rust-runtime initialisation
-        // problem is solved (the child of `clone3(CLONE_VM)` runs
-        // without per-task Rust thread-info, so any allocation /
-        // panic / stack-overflow probe inside `worker_main` aborts
-        // with `the thread info setup logic isn't recursive`).
-        // Raw still runs the validator so callers can pin the
-        // kernel-rule shape of their flag set ahead of dispatch.
         let dispatch = match &config.clone_mode {
             CloneMode::Fork => Dispatch::Fork,
             CloneMode::Thread => Dispatch::Thread,
-            CloneMode::SharedVm => {
-                anyhow::bail!(
-                    "SharedVm/Raw dispatch requires Rust TLS initialization \
-                     in a clone3 child, which is not supported without \
-                     pthread. Use CloneMode::Thread (pthread-backed) or \
-                     CloneMode::Fork."
-                );
-            }
-            CloneMode::Raw(flags) => {
-                validate_clone_flags(*flags)?;
-                anyhow::bail!(
-                    "SharedVm/Raw dispatch requires Rust TLS initialization \
-                     in a clone3 child, which is not supported without \
-                     pthread. Flag set is structurally valid. Use \
-                     CloneMode::Thread (pthread-backed) or CloneMode::Fork."
-                );
-            }
         };
 
         // Thread mode + ForkExit is incompatible. ForkExit's worker
@@ -3926,8 +3221,8 @@ impl WorkloadHandle {
             // Per-mode dispatch. Thread-mode workers do not need
             // pipes — the rendezvous and report channels are
             // in-process Rust primitives (`mpsc::sync_channel(0)` +
-            // `JoinHandle`). Fork and Clone3 modes both use the
-            // pipe-based scaffolding originally built for fork.
+            // `JoinHandle`). Fork mode uses the pipe-based
+            // scaffolding below.
             match dispatch {
                 Dispatch::Thread => {
                     spawn_thread_worker(
@@ -3940,7 +3235,7 @@ impl WorkloadHandle {
                     )?;
                     continue;
                 }
-                Dispatch::Fork | Dispatch::Clone3 { .. } => {
+                Dispatch::Fork => {
                     // fall through to the pipe-based dispatch below
                 }
             }
@@ -3970,28 +3265,6 @@ impl WorkloadHandle {
                     config.num_workers,
                     std::io::Error::last_os_error(),
                 );
-            }
-
-            // Clone3-mode dispatch: caller-supplied flags (always
-            // including CLONE_VM) plus the runtime-set CLONE_PIDFD
-            // for reaping. The child runs the same body as the
-            // Fork path's `pid == 0` arm — pipe-based start
-            // rendezvous, worker_main, _exit — but is reaped via
-            // pidfd poll instead of waitpid.
-            if let Dispatch::Clone3 { flags } = dispatch {
-                spawn_clone3_worker(
-                    &mut guard,
-                    config,
-                    flags,
-                    affinity,
-                    worker_pipe_fds,
-                    worker_futex,
-                    iter_slot,
-                    report_fds,
-                    start_fds,
-                    i,
-                )?;
-                continue;
             }
 
             let pid = unsafe { libc::fork() };
@@ -4344,8 +3617,6 @@ impl WorkloadHandle {
     ///   parent's tgid. Safe for `sched_setaffinity(tid, ...)`;
     ///   safe for `cgroup.threads` writes under a threaded-mode
     ///   cgroup; **not** safe for `cgroup.procs` (see warning above).
-    /// - [`CloneMode::SharedVm`] / [`CloneMode::Raw`]: each entry
-    ///   is the pid the kernel returned from `clone3`.
     ///
     /// # Thread tid publish ordering
     ///
@@ -4362,14 +3633,47 @@ impl WorkloadHandle {
     pub fn worker_pids(&self) -> Vec<libc::pid_t> {
         if !self.children.is_empty() {
             self.children.iter().map(|(pid, _, _)| *pid).collect()
-        } else if !self.threads.is_empty() {
+        } else {
             self.threads
                 .iter()
                 .map(|tw| tw.tid.load(Ordering::Acquire))
                 .collect()
-        } else {
-            self.pidfd_workers.iter().map(|w| w.pid).collect()
         }
+    }
+
+    /// Worker pids suitable for `cgroup.procs` migration.
+    ///
+    /// `cgroup.procs` is **tgid-scoped** in the kernel: writing a
+    /// tid migrates the entire thread group containing that tid
+    /// (`kernel/cgroup/cgroup.c::__cgroup_procs_write` resolves the
+    /// passed pid to its leader via `find_lock_task_mm` /
+    /// `cgroup_procs_write_start`). Under [`CloneMode::Thread`]
+    /// every worker shares the test harness's tgid, so feeding
+    /// [`Self::worker_pids`] to `cgroup.procs` would migrate the
+    /// harness itself — catastrophic.
+    ///
+    /// Returns the per-worker pids when the spawn used
+    /// [`CloneMode::Fork`] (each worker has its own tgid). Bails
+    /// for [`CloneMode::Thread`] with an actionable diagnostic
+    /// pointing at `cgroup.threads` (the thread-scoped sibling) as
+    /// the right migration sink for thread workers.
+    ///
+    /// Callers that integrate with `cgroup.procs` writes — e.g.
+    /// [`crate::cgroup::CgroupManager::move_tasks`] — should call
+    /// this in place of [`Self::worker_pids`] so a misconfigured
+    /// Thread-mode test fails at the migration step rather than
+    /// silently moving the harness into the per-test cgroup.
+    pub fn worker_pids_for_cgroup_procs(&self) -> Result<Vec<libc::pid_t>> {
+        if !self.threads.is_empty() {
+            anyhow::bail!(
+                "WorkloadHandle::worker_pids_for_cgroup_procs: workers were \
+                 spawned with CloneMode::Thread; their pids share the test \
+                 harness's tgid and a `cgroup.procs` write would migrate the \
+                 harness. Use `cgroup.threads` (thread-scoped) for Thread-mode \
+                 workers, or switch to CloneMode::Fork."
+            );
+        }
+        Ok(self.worker_pids())
     }
 
     /// Signal all workers to start working (after they've been
@@ -4381,21 +3685,13 @@ impl WorkloadHandle {
             return;
         }
         self.started = true;
-        // Fork-mode: write a byte to the start pipe. Pidfd-mode
-        // shares the same pipe-based scaffolding.
+        // Fork-mode: write a byte to the start pipe.
         for (_, _, start_fd) in &mut self.children {
             unsafe {
                 libc::write(*start_fd, b"s".as_ptr() as *const _, 1);
                 libc::close(*start_fd);
             }
             *start_fd = -1;
-        }
-        for w in &mut self.pidfd_workers {
-            unsafe {
-                libc::write(w.start_fd, b"s".as_ptr() as *const _, 1);
-                libc::close(w.start_fd);
-            }
-            w.start_fd = -1;
         }
         // Thread-mode: send `()` on each worker's start_tx. The
         // SyncSender(0) rendezvous means each send blocks until the
@@ -4413,19 +3709,19 @@ impl WorkloadHandle {
 
     /// Set CPU affinity for worker at `idx`.
     ///
-    /// For [`CloneMode::Fork`] and clone3 modes the per-worker pid
-    /// addresses a distinct kernel task. For [`CloneMode::Thread`]
-    /// the worker's `gettid()` is what
-    /// `sched_setaffinity(tid, ...)` accepts; this method reads
-    /// the tid from the worker's `Arc<AtomicI32>` (with `Acquire`
-    /// ordering, paired with the `Release` publish on the worker
-    /// thread). Returns an error if the thread has not yet
-    /// published its tid — call [`start()`](Self::start) first so
-    /// the worker reaches its `gettid()` publish before reading.
+    /// For [`CloneMode::Fork`] the per-worker pid addresses a
+    /// distinct kernel task. For [`CloneMode::Thread`] the worker's
+    /// `gettid()` is what `sched_setaffinity(tid, ...)` accepts;
+    /// this method reads the tid from the worker's
+    /// `Arc<AtomicI32>` (with `Acquire` ordering, paired with the
+    /// `Release` publish on the worker thread). Returns an error
+    /// if the thread has not yet published its tid — call
+    /// [`start()`](Self::start) first so the worker reaches its
+    /// `gettid()` publish before reading.
     pub fn set_affinity(&self, idx: usize, cpus: &BTreeSet<usize>) -> Result<()> {
         let pid = if !self.children.is_empty() {
             self.children[idx].0
-        } else if !self.threads.is_empty() {
+        } else {
             let tid = self.threads[idx].tid.load(Ordering::Acquire);
             if tid == 0 {
                 anyhow::bail!(
@@ -4434,8 +3730,6 @@ impl WorkloadHandle {
                 );
             }
             tid
-        } else {
-            self.pidfd_workers[idx].pid
         };
         set_thread_affinity(pid, cpus)
     }
@@ -4561,7 +3855,6 @@ impl WorkloadHandle {
         let mut reports = Vec::new();
         let children = std::mem::take(&mut self.children);
         let threads = std::mem::take(&mut self.threads);
-        let pidfd_workers = std::mem::take(&mut self.pidfd_workers);
 
         // Signal all fork-mode children to stop via SIGUSR1; the
         // signal handler flips the global STOP that worker_main's
@@ -4575,22 +3868,6 @@ impl WorkloadHandle {
                 nix::unistd::Pid::from_raw(pid),
                 nix::sys::signal::Signal::SIGUSR1,
             );
-        }
-        // Signal all clone3 workers via pidfd_send_signal(SIGUSR1).
-        // SharedVm/Raw children inherit the signal disposition table
-        // from the parent at clone time when CLONE_SIGHAND is NOT
-        // set, so the parent's `sigusr1_handler` (installed in main)
-        // is also their handler — flipping STOP works.
-        for w in &pidfd_workers {
-            unsafe {
-                libc::syscall(
-                    libc::SYS_pidfd_send_signal,
-                    w.pidfd,
-                    libc::SIGUSR1,
-                    std::ptr::null::<libc::siginfo_t>(),
-                    0u32,
-                );
-            }
         }
         // Signal all thread-mode workers by flipping each worker's
         // per-task `stop`. SIGUSR1 is process-wide and useless for
@@ -4715,87 +3992,6 @@ impl WorkloadHandle {
             }
         }
 
-        // Pidfd-mode collection: poll(pidfd, POLLIN) reports the
-        // child's exit; read the report fd; close pidfd / report fd
-        // / start fd; munmap the child stack. The shared 5s deadline
-        // is consumed alongside the fork-mode loop above so a
-        // mixed-mode handle (currently impossible — clone_mode is
-        // per-config — but kept symmetric) shares the budget.
-        for w in pidfd_workers {
-            let mut buf = Vec::new();
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            let ms = remaining.as_millis().min(i32::MAX as u128) as i32;
-            // Drain the report pipe first (worker may have already
-            // exited and written its JSON before we polled pidfd).
-            if ms > 0 {
-                let mut pfd = libc::pollfd {
-                    fd: w.report_fd,
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                let ready = unsafe { libc::poll(&mut pfd, 1, ms) };
-                if ready > 0 {
-                    let mut f = unsafe { std::fs::File::from_raw_fd(w.report_fd) };
-                    let _ = f.read_to_end(&mut buf);
-                    drop(f);
-                } else {
-                    let _ = nix::unistd::close(w.report_fd);
-                }
-            } else {
-                let _ = nix::unistd::close(w.report_fd);
-            }
-            // Send SIGKILL via pidfd to ensure the child exits
-            // before we munmap its stack. ESRCH (already exited) is
-            // the common case for a graceful worker; swallow it.
-            unsafe {
-                libc::syscall(
-                    libc::SYS_pidfd_send_signal,
-                    w.pidfd,
-                    libc::SIGKILL,
-                    std::ptr::null::<libc::siginfo_t>(),
-                    0u32,
-                );
-            }
-            // Wait for exit before munmap. POLLIN on pidfd fires
-            // when the child reaches `exit`. Up to a 5s ceiling so
-            // a misbehaving child can't pin the test.
-            let mut pfd = libc::pollfd {
-                fd: w.pidfd,
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            unsafe {
-                libc::poll(&mut pfd, 1, 5_000);
-            }
-            // Close pidfd + start_fd; report_fd was either consumed
-            // by `f.read_to_end` (which closed it via Drop) or
-            // explicitly closed in the timeout branch above.
-            for fd in [w.pidfd, w.start_fd] {
-                if fd >= 0 {
-                    let _ = nix::unistd::close(fd);
-                }
-            }
-            // munmap the child stack now that the child is gone.
-            if !w.stack_ptr.is_null() && w.stack_size > 0 {
-                unsafe { libc::munmap(w.stack_ptr, w.stack_size) };
-            }
-
-            if let Ok(report) = serde_json::from_slice::<WorkerReport>(&buf) {
-                reports.push(report);
-            } else {
-                eprintln!(
-                    "ktstr: clone3 worker pid={} returned no report ({} bytes read)",
-                    w.pid,
-                    buf.len()
-                );
-                reports.push(WorkerReport {
-                    tid: w.pid,
-                    completed: false,
-                    ..WorkerReport::default()
-                });
-            }
-        }
-
         // Thread-mode collection: join each worker's JoinHandle
         // (with the [`THREAD_JOIN_TIMEOUT`] budget) and adopt the
         // returned [`WorkerReport`]. Per-worker `stop` was flipped
@@ -4904,42 +4100,6 @@ impl Drop for WorkloadHandle {
                 {
                     tracing::warn!(fd, %e, "close failed in WorkloadHandle::drop");
                 }
-            }
-        }
-        // Pidfd-mode workers: pidfd_send_signal(SIGKILL) +
-        // poll(pidfd, POLLIN) for exit, then close fds and munmap
-        // the child stack. pidfd_send_signal(SIGKILL) is the right
-        // primitive because the child does NOT share the parent's
-        // process group (no setpgid contract here), so killpg on
-        // the parent's pgid would not reach it.
-        for w in &self.pidfd_workers {
-            if w.pidfd >= 0 {
-                unsafe {
-                    libc::syscall(
-                        libc::SYS_pidfd_send_signal,
-                        w.pidfd,
-                        libc::SIGKILL,
-                        std::ptr::null::<libc::siginfo_t>(),
-                        0u32,
-                    );
-                }
-                let mut pfd = libc::pollfd {
-                    fd: w.pidfd,
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                unsafe {
-                    libc::poll(&mut pfd, 1, 5_000);
-                }
-                let _ = close(w.pidfd);
-            }
-            for fd in [w.report_fd, w.start_fd] {
-                if fd >= 0 {
-                    let _ = close(fd);
-                }
-            }
-            if !w.stack_ptr.is_null() && w.stack_size > 0 {
-                unsafe { libc::munmap(w.stack_ptr, w.stack_size) };
             }
         }
         // Thread-mode workers: flip stop, drop start_tx (in case
@@ -6328,7 +5488,7 @@ fn worker_main(
                     // High and low both contend on the lock.
                     spin_burst(&mut work_units, work_iters);
                     match pi_mode {
-                        PiMode::Pi => {
+                        FutexLockMode::Pi => {
                             // FUTEX_LOCK_PI: kernel handles the
                             // CAS atomically, transfers ownership
                             // via the futex word's TID encoding,
@@ -6361,7 +5521,7 @@ fn worker_main(
                                 }
                             }
                         }
-                        PiMode::Plain => {
+                        FutexLockMode::Plain => {
                             // Plain spin-then-wait: try CAS 0→1,
                             // FUTEX_WAIT on contention, hold
                             // hold_iters of spin, store 0 + wake
@@ -11814,7 +10974,7 @@ mod tests {
         assert!(!b.contains(a));
     }
 
-    // -- CloneMode + CloneFlags + validate_clone_flags tests --
+    // -- CloneMode tests --
 
     #[test]
     fn clone_mode_default_is_fork() {
@@ -11843,255 +11003,12 @@ mod tests {
 
     #[test]
     fn work_clone_mode_builder() {
-        let w = WorkSpec::default().clone_mode(CloneMode::SharedVm);
-        assert!(matches!(w.clone_mode, CloneMode::SharedVm));
+        let w = WorkSpec::default().clone_mode(CloneMode::Thread);
+        assert!(matches!(w.clone_mode, CloneMode::Thread));
     }
 
-    #[test]
-    fn clone_flags_constants_match_libc() {
-        // Bit values must match libc::CLONE_* exactly — the kernel
-        // syscall ABI is what these flags ultimately feed.
-        assert_eq!(CloneFlags::VM.bits(), libc::CLONE_VM as u64);
-        assert_eq!(CloneFlags::FS.bits(), libc::CLONE_FS as u64);
-        assert_eq!(CloneFlags::FILES.bits(), libc::CLONE_FILES as u64);
-        assert_eq!(CloneFlags::SIGHAND.bits(), libc::CLONE_SIGHAND as u64);
-        assert_eq!(CloneFlags::THREAD.bits(), libc::CLONE_THREAD as u64);
-        assert_eq!(CloneFlags::PARENT.bits(), libc::CLONE_PARENT as u64);
-        assert_eq!(CloneFlags::NEWNS.bits(), libc::CLONE_NEWNS as u64);
-        assert_eq!(CloneFlags::NEWUSER.bits(), libc::CLONE_NEWUSER as u64);
-        assert_eq!(CloneFlags::NEWPID.bits(), libc::CLONE_NEWPID as u64);
-        assert_eq!(CloneFlags::NEWNET.bits(), libc::CLONE_NEWNET as u64);
-        assert_eq!(CloneFlags::NEWIPC.bits(), libc::CLONE_NEWIPC as u64);
-        assert_eq!(CloneFlags::NEWUTS.bits(), libc::CLONE_NEWUTS as u64);
-        assert_eq!(CloneFlags::NEWCGROUP.bits(), libc::CLONE_NEWCGROUP as u64);
-        // CLONE_IO has bit 31 set and `libc::CLONE_IO` is a c_int
-        // (i32) with the sign bit set, so a plain `as u64` cast
-        // sign-extends to 0xffffffff80000000. Round-trip through u32
-        // first to truncate the sign extension and recover the
-        // 32-bit kernel ABI value.
-        assert_eq!(CloneFlags::IO.bits(), libc::CLONE_IO as u32 as u64);
-        assert_eq!(CloneFlags::SYSVSEM.bits(), libc::CLONE_SYSVSEM as u64);
-    }
 
-    #[test]
-    fn clone_flags_runtime_reserved_covers_runtime_managed_bits() {
-        // RUNTIME_RESERVED must include every flag the runtime sets
-        // internally — pidfd / parent_settid / child_settid /
-        // child_cleartid / detached / settls / vfork / ptrace /
-        // untraced. Each bit listed in the doc must be present.
-        let reserved = CloneFlags::RUNTIME_RESERVED.bits();
-        assert_eq!(reserved & libc::CLONE_PIDFD as u64, libc::CLONE_PIDFD as u64);
-        assert_eq!(
-            reserved & libc::CLONE_PARENT_SETTID as u64,
-            libc::CLONE_PARENT_SETTID as u64,
-        );
-        assert_eq!(
-            reserved & libc::CLONE_CHILD_SETTID as u64,
-            libc::CLONE_CHILD_SETTID as u64,
-        );
-        assert_eq!(
-            reserved & libc::CLONE_CHILD_CLEARTID as u64,
-            libc::CLONE_CHILD_CLEARTID as u64,
-        );
-        assert_eq!(
-            reserved & libc::CLONE_DETACHED as u64,
-            libc::CLONE_DETACHED as u64,
-        );
-        assert_eq!(
-            reserved & libc::CLONE_SETTLS as u64,
-            libc::CLONE_SETTLS as u64,
-        );
-        assert_eq!(
-            reserved & libc::CLONE_VFORK as u64,
-            libc::CLONE_VFORK as u64,
-        );
-        assert_eq!(
-            reserved & libc::CLONE_PTRACE as u64,
-            libc::CLONE_PTRACE as u64,
-        );
-        assert_eq!(
-            reserved & libc::CLONE_UNTRACED as u64,
-            libc::CLONE_UNTRACED as u64,
-        );
-    }
-
-    #[test]
-    fn clone_flags_runtime_reserved_excludes_user_relevant_bits() {
-        // The user-facing constants must NOT be in
-        // RUNTIME_RESERVED — otherwise the validator would reject
-        // them and the variant types would be unusable.
-        let reserved = CloneFlags::RUNTIME_RESERVED.bits();
-        for f in [
-            CloneFlags::VM,
-            CloneFlags::FS,
-            CloneFlags::FILES,
-            CloneFlags::SIGHAND,
-            CloneFlags::THREAD,
-            CloneFlags::PARENT,
-            CloneFlags::NEWNS,
-            CloneFlags::NEWUSER,
-            CloneFlags::NEWPID,
-            CloneFlags::NEWNET,
-            CloneFlags::NEWIPC,
-            CloneFlags::NEWUTS,
-            CloneFlags::NEWCGROUP,
-            CloneFlags::IO,
-            CloneFlags::SYSVSEM,
-        ] {
-            assert_eq!(
-                reserved & f.bits(),
-                0,
-                "user-relevant flag {:#x} overlaps RUNTIME_RESERVED",
-                f.bits()
-            );
-        }
-    }
-
-    #[test]
-    fn clone_flags_union_combines() {
-        let f = CloneFlags::VM | CloneFlags::SIGHAND;
-        assert_eq!(
-            f.bits(),
-            (libc::CLONE_VM as u64) | (libc::CLONE_SIGHAND as u64)
-        );
-    }
-
-    #[test]
-    fn clone_flags_contains_subset() {
-        let composite = CloneFlags::VM | CloneFlags::SIGHAND | CloneFlags::THREAD;
-        assert!(composite.contains(CloneFlags::VM));
-        assert!(composite.contains(CloneFlags::SIGHAND));
-        assert!(composite.contains(CloneFlags::THREAD));
-        // Set-theoretic identity (matches MpolFlags::contains
-        // convention): every set is a superset of NONE.
-        assert!(composite.contains(CloneFlags::NONE));
-        assert!(CloneFlags::NONE.contains(CloneFlags::NONE));
-        // Single flag is NOT a superset of the composite.
-        assert!(!CloneFlags::VM.contains(composite));
-    }
-
-    // -- validate_clone_flags rule-by-rule --
-    //
-    // Each kernel rejection rule from `copy_process` (kernel/fork.c)
-    // is exercised as a separate test so a regression names the
-    // offending rule.
-
-    #[test]
-    fn validate_clone_flags_thread_without_sighand_rejected() {
-        // Rule 1: CLONE_THREAD requires CLONE_SIGHAND.
-        // Use from_bits_for_test to express the invalid combination
-        // — the public consts make this hard to express via the
-        // bitor path because the user would normally pair them.
-        let f = CloneFlags::from_bits_for_test(libc::CLONE_THREAD as u64);
-        let err = validate_clone_flags(f).expect_err("THREAD without SIGHAND must be rejected");
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("CLONE_THREAD") && msg.contains("CLONE_SIGHAND"),
-            "error must name both flags: {msg}"
-        );
-    }
-
-    #[test]
-    fn validate_clone_flags_sighand_without_vm_rejected() {
-        // Rule 2: CLONE_SIGHAND requires CLONE_VM.
-        let f = CloneFlags::from_bits_for_test(libc::CLONE_SIGHAND as u64);
-        let err = validate_clone_flags(f).expect_err("SIGHAND without VM must be rejected");
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("CLONE_SIGHAND") && msg.contains("CLONE_VM"),
-            "error must name both flags: {msg}"
-        );
-    }
-
-    #[test]
-    fn validate_clone_flags_newns_with_fs_rejected() {
-        // Rule 3: NEWNS and FS are mutually exclusive.
-        let f = CloneFlags::NEWNS | CloneFlags::FS;
-        let err = validate_clone_flags(f).expect_err("NEWNS|FS must be rejected");
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("CLONE_NEWNS") && msg.contains("CLONE_FS"),
-            "error must name both flags: {msg}"
-        );
-    }
-
-    #[test]
-    fn validate_clone_flags_newuser_with_fs_rejected() {
-        // Rule 4: NEWUSER and FS are mutually exclusive.
-        let f = CloneFlags::NEWUSER | CloneFlags::FS;
-        let err = validate_clone_flags(f).expect_err("NEWUSER|FS must be rejected");
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("CLONE_NEWUSER") && msg.contains("CLONE_FS"),
-            "error must name both flags: {msg}"
-        );
-    }
-
-    #[test]
-    fn validate_clone_flags_thread_with_newuser_rejected() {
-        // Rule 5a: THREAD with NEWUSER is rejected.
-        let f =
-            CloneFlags::THREAD | CloneFlags::SIGHAND | CloneFlags::VM | CloneFlags::NEWUSER;
-        let err = validate_clone_flags(f).expect_err("THREAD|NEWUSER must be rejected");
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("CLONE_THREAD") && msg.contains("CLONE_NEWUSER"),
-            "error must name THREAD and NEWUSER: {msg}"
-        );
-    }
-
-    #[test]
-    fn validate_clone_flags_thread_with_newpid_rejected() {
-        // Rule 5b: THREAD with NEWPID is rejected.
-        let f =
-            CloneFlags::THREAD | CloneFlags::SIGHAND | CloneFlags::VM | CloneFlags::NEWPID;
-        let err = validate_clone_flags(f).expect_err("THREAD|NEWPID must be rejected");
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("CLONE_THREAD") && msg.contains("CLONE_NEWPID"),
-            "error must name THREAD and NEWPID: {msg}"
-        );
-    }
-
-    #[test]
-    fn validate_clone_flags_runtime_reserved_rejected() {
-        // Rule 6: caller cannot set runtime-managed bits.
-        let f = CloneFlags::from_bits_for_test(libc::CLONE_PIDFD as u64);
-        let err = validate_clone_flags(f).expect_err("CLONE_PIDFD from caller must be rejected");
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("runtime-reserved"),
-            "error must name the runtime-reserved category: {msg}"
-        );
-    }
-
-    #[test]
-    fn validate_clone_flags_thread_chain_accepted() {
-        // Sanity: the valid CLONE_THREAD chain
-        // (THREAD ⇒ SIGHAND ⇒ VM, no excluded namespaces) must
-        // pass. Without this the whole rule set could be silently
-        // over-rejecting.
-        let f = CloneFlags::THREAD | CloneFlags::SIGHAND | CloneFlags::VM;
-        validate_clone_flags(f).expect("valid THREAD-chain must be accepted");
-    }
-
-    #[test]
-    fn validate_clone_flags_empty_accepted() {
-        // The empty flag set is the fork-equivalent (no sharing
-        // beyond the fork defaults). Must validate cleanly.
-        validate_clone_flags(CloneFlags::NONE)
-            .expect("empty flag set must be accepted");
-    }
-
-    #[test]
-    fn validate_clone_flags_shared_vm_only_accepted() {
-        // SharedVm dispatch will use CLONE_VM only — pin that this
-        // passes the validator now, before dispatch lands.
-        validate_clone_flags(CloneFlags::VM)
-            .expect("CLONE_VM alone must be accepted (SharedVm uses this)");
-    }
-
-    // -- spawn dispatch tests (Fork / Thread / SharedVm / Raw) ----
+    // -- spawn dispatch tests (Fork / Thread) --
 
     /// Thread mode: the worker runs in-process via std::thread, the
     /// JoinHandle returns a real WorkerReport, and worker_pids()
@@ -12289,91 +11206,284 @@ mod tests {
         );
     }
 
-    /// SharedVm mode: clone3 dispatch is staged behind a Rust
-    /// runtime redesign (clone3(CLONE_VM) children lack per-task
-    /// thread-info, so worker_main aborts). Pin the bail-out
-    /// message until the redesign lands.
+    /// Thread-mode workers MUST share the parent's tgid (kernel
+    /// `getpid()` returns the tgid because `SYS_getpid` is
+    /// `task_tgid_vnr`) while reporting distinct kernel TIDs from
+    /// `gettid()`. Pin both halves: every worker's `getpid()` matches
+    /// the parent's, AND every worker's `gettid()` differs from the
+    /// parent's. Sibling-distinct gettids are pinned by
+    /// `spawn_thread_clone_mode_runs_to_completion`; this test pins
+    /// the parent-vs-worker relationship that flows from
+    /// `std::thread::spawn` reusing the parent's mm/files/sighand
+    /// (no new tgid created). A regression to a fork-like dispatch
+    /// for `CloneMode::Thread` would surface here as worker
+    /// `getpid() != parent_getpid()`.
     #[test]
-    fn spawn_shared_vm_clone_mode_bails() {
+    fn spawn_thread_workers_share_tgid() {
+        use std::sync::Mutex;
+        // Static collector: each worker pushes its (getpid, gettid)
+        // pair before spinning. nextest runs each #[test] in its own
+        // process so the static is fresh per-test.
+        static WORKER_PIDTIDS: Mutex<Vec<(libc::pid_t, libc::pid_t)>> =
+            Mutex::new(Vec::new());
+
+        fn record_pid_tid_then_spin(stop: &AtomicBool) -> WorkerReport {
+            let pid: libc::pid_t = unsafe { libc::getpid() };
+            let tid: libc::pid_t =
+                unsafe { libc::syscall(libc::SYS_gettid) as libc::pid_t };
+            WORKER_PIDTIDS.lock().unwrap().push((pid, tid));
+            while !stop_requested(stop) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            WorkerReport {
+                tid,
+                completed: true,
+                ..WorkerReport::default()
+            }
+        }
+
+        let parent_pid: libc::pid_t = unsafe { libc::getpid() };
+        let parent_tid: libc::pid_t =
+            unsafe { libc::syscall(libc::SYS_gettid) as libc::pid_t };
+
         let config = WorkloadConfig {
-            num_workers: 1,
-            clone_mode: CloneMode::SharedVm,
+            num_workers: 2,
+            clone_mode: CloneMode::Thread,
+            work_type: WorkType::custom("record_pid_tid_then_spin", record_pid_tid_then_spin),
             ..Default::default()
         };
-        let result = WorkloadHandle::spawn(&config);
-        let err = match result {
-            Ok(_) => panic!("SharedVm must bail — clone3 child has no Rust TLS"),
-            Err(e) => e,
+        let mut h = WorkloadHandle::spawn(&config).expect("Thread spawn must succeed");
+        h.start();
+        // Brief sleep so both workers reach the record-and-spin point
+        // before stop_and_collect flips their stop flags.
+        std::thread::sleep(Duration::from_millis(50));
+        let _reports = h.stop_and_collect();
+
+        let captured = WORKER_PIDTIDS.lock().unwrap().clone();
+        assert_eq!(
+            captured.len(),
+            2,
+            "both workers must record their (pid, tid) before stop: got {captured:?}"
+        );
+        for (worker_pid, worker_tid) in &captured {
+            assert_eq!(
+                *worker_pid, parent_pid,
+                "Thread worker getpid()={worker_pid} must match parent \
+                 getpid()={parent_pid} — std::thread shares the tgid",
+            );
+            assert_ne!(
+                *worker_tid, parent_tid,
+                "Thread worker gettid()={worker_tid} must differ from parent \
+                 gettid()={parent_tid} — each std::thread is a distinct \
+                 kernel task",
+            );
+        }
+    }
+
+    /// `CloneMode::Thread + WorkType::NiceSweep` MUST spawn cleanly.
+    /// NiceSweep cycles `setpriority(PRIO_PROCESS, 0, niceval)` per
+    /// iteration (see `kernel/sys.c::sys_setpriority` /
+    /// `set_one_prio`); under Thread mode `0` resolves to the
+    /// calling task's tid (per-thread credential tweak), not the
+    /// whole tgid, so it is safe to share with the harness. Pin
+    /// that the spawn succeeds and the worker produces a
+    /// non-default report — a regression that bails on Thread +
+    /// NiceSweep at spawn time, or one that crashes the worker
+    /// before it returns, would trip this guard.
+    #[test]
+    fn spawn_thread_with_nicesweep_succeeds() {
+        let config = WorkloadConfig {
+            num_workers: 1,
+            clone_mode: CloneMode::Thread,
+            work_type: WorkType::NiceSweep,
+            ..Default::default()
         };
-        let msg = format!("{err:#}");
+        let mut h = WorkloadHandle::spawn(&config)
+            .expect("Thread + NiceSweep spawn must succeed (no incompatibility)");
+        h.start();
+        std::thread::sleep(Duration::from_millis(150));
+        let reports = h.stop_and_collect();
+        assert_eq!(reports.len(), 1, "Thread + NiceSweep must collect one report");
         assert!(
-            msg.contains("SharedVm")
-                && msg.contains("Rust TLS")
-                && msg.contains("CloneMode::Thread"),
-            "error must name SharedVm + Rust TLS constraint + Thread alternative: {msg}"
+            reports[0].completed,
+            "Thread + NiceSweep worker must complete cleanly: {:?}",
+            reports[0]
         );
     }
 
-    /// Raw with valid flags: validator passes (flag set is
-    /// well-formed) but dispatch still bails on the same Rust TLS
-    /// constraint as SharedVm. The "Flag set is structurally valid"
-    /// substring proves the validator ran before the dispatch
-    /// rejection.
+    /// `WorkloadHandle` dropped without `stop_and_collect` MUST
+    /// drive every Thread worker to completion via Drop's
+    /// stop-flag-then-join path
+    /// (`WorkloadHandle::drop`'s `tw.stop.store(true)` →
+    /// `join_thread_with_timeout`). Pin via a static counter the
+    /// closures bump just before returning: post-`drop(h)` the
+    /// counter MUST equal the worker count, proving every worker
+    /// exited inside the join window — not abandoned, not timed
+    /// out (5s `THREAD_JOIN_TIMEOUT` would surface as a missing
+    /// increment).
     #[test]
-    fn spawn_raw_clone_mode_validates_then_bails() {
+    fn spawn_thread_drop_cleanup() {
+        use std::sync::atomic::AtomicUsize;
+        static EXITED_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+        fn spin_then_record_exit(stop: &AtomicBool) -> WorkerReport {
+            let tid: libc::pid_t =
+                unsafe { libc::syscall(libc::SYS_gettid) as libc::pid_t };
+            while !stop_requested(stop) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            // Bump AFTER the spin loop so the count grows only on
+            // a genuine clean exit. SeqCst because the post-Drop
+            // load on the parent must observe every increment that
+            // happened-before the join — Release/Acquire on the
+            // JoinHandle's join already provides the cross-thread
+            // edge, but SeqCst keeps the audit trail trivial.
+            EXITED_COUNT.fetch_add(1, Ordering::SeqCst);
+            WorkerReport {
+                tid,
+                completed: true,
+                ..WorkerReport::default()
+            }
+        }
+
         let config = WorkloadConfig {
-            num_workers: 1,
-            clone_mode: CloneMode::Raw(CloneFlags::VM),
+            num_workers: 2,
+            clone_mode: CloneMode::Thread,
+            work_type: WorkType::custom("spin_then_record_exit", spin_then_record_exit),
             ..Default::default()
         };
-        let result = WorkloadHandle::spawn(&config);
-        let err = match result {
-            Ok(_) => panic!("Raw must bail — clone3 child has no Rust TLS"),
-            Err(e) => e,
-        };
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("Rust TLS") && msg.contains("CloneMode::Thread"),
-            "error must name Rust TLS constraint + Thread alternative: {msg}"
-        );
-        assert!(
-            msg.contains("structurally valid"),
-            "valid flags must say flag set passed validation: {msg}"
+        let mut h = WorkloadHandle::spawn(&config).expect("Thread spawn must succeed");
+        h.start();
+        // Brief sleep so workers definitely enter the spin loop
+        // before drop flips their stop flags. Without this, drop
+        // could race the first stop_requested check and exercise
+        // a degenerate "exit before any work" path that doesn't
+        // pin the join semantics.
+        std::thread::sleep(Duration::from_millis(50));
+        // Drop without stop_and_collect — the Drop impl is the
+        // sole teardown path under test here.
+        drop(h);
+        // Drop blocks on join_thread_with_timeout (5s budget); by
+        // the time it returns, every joined worker's exit
+        // happens-before this load (Release on the JoinHandle's
+        // store-pair-with-thread-exit, Acquire on join()).
+        let count = EXITED_COUNT.load(Ordering::SeqCst);
+        assert_eq!(
+            count, 2,
+            "both Thread workers must run to completion under \
+             WorkloadHandle::drop's join path (got {count}); a count \
+             below 2 indicates Drop timed out or abandoned a thread \
+             instead of joining it",
         );
     }
 
-    /// Invalid flags must hit the validator BEFORE the dispatch
-    /// rejection. The error must name the kernel rule (e.g.
-    /// "CLONE_THREAD requires CLONE_SIGHAND"), NOT the Rust-TLS
-    /// dispatch message — the validator runs first.
+    /// `CloneMode::Thread + WorkType::PipeIo` MUST run to
+    /// completion. PipeIo allocates a per-pair `pipe2(O_DIRECT)`
+    /// in shared memory (host-resident under Thread because every
+    /// worker shares the harness's mm) and exchanges 1-byte
+    /// messages — pinning that the existing pair-pipe plumbing
+    /// works under Thread mode without the per-worker
+    /// `MAP_SHARED` allocation that Fork mode relies on. Both
+    /// workers in the (0,1) pair must produce work_units > 0;
+    /// either reporting zero would mean the pipe pair-up didn't
+    /// route correctly under thread-shared mm.
     #[test]
-    fn spawn_raw_clone_mode_invalid_flags_rejected_before_dispatch() {
+    fn spawn_thread_with_pipe_io() {
         let config = WorkloadConfig {
-            num_workers: 1,
-            clone_mode: CloneMode::Raw(CloneFlags::from_bits_for_test(
-                libc::CLONE_THREAD as u64,
-            )),
+            num_workers: 2,
+            clone_mode: CloneMode::Thread,
+            work_type: WorkType::PipeIo { burst_iters: 1024 },
             ..Default::default()
         };
-        let result = WorkloadHandle::spawn(&config);
-        let err = match result {
-            Ok(_) => panic!("Raw with invalid flags must bail at validator"),
-            Err(e) => e,
-        };
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("CLONE_THREAD") && msg.contains("CLONE_SIGHAND"),
-            "error must surface the validator's rule, not the dispatch message: {msg}"
-        );
-        assert!(
-            !msg.contains("structurally valid"),
-            "validator failure must NOT mention dispatch: {msg}"
-        );
-        assert!(
-            !msg.contains("Rust TLS"),
-            "validator failure must NOT mention the dispatch's Rust TLS reason: {msg}"
-        );
+        let mut h = WorkloadHandle::spawn(&config)
+            .expect("Thread + PipeIo spawn must succeed");
+        h.start();
+        std::thread::sleep(Duration::from_millis(200));
+        let reports = h.stop_and_collect();
+        assert_eq!(reports.len(), 2, "Thread + PipeIo collects one report per worker");
+        for r in &reports {
+            assert!(
+                r.work_units > 0,
+                "Thread + PipeIo worker tid={} did no work: {:?}",
+                r.tid, r,
+            );
+        }
     }
+
+    /// `CloneMode::Thread + WorkType::FutexPingPong` MUST run to
+    /// completion. FutexPingPong allocates a per-pair shared
+    /// `u32` futex word and exchanges `FUTEX_WAKE` / `FUTEX_WAIT`
+    /// across the pair — under Thread mode every worker shares
+    /// the harness's address space, so the existing per-pair
+    /// futex plumbing must still pair (0,1) correctly. Both
+    /// workers must produce work_units > 0; a regression that
+    /// binds the futex word to a fork-only allocation site would
+    /// surface as one or both workers reporting zero work.
+    #[test]
+    fn spawn_thread_with_futex_ping_pong() {
+        let config = WorkloadConfig {
+            num_workers: 2,
+            clone_mode: CloneMode::Thread,
+            work_type: WorkType::FutexPingPong { spin_iters: 1024 },
+            ..Default::default()
+        };
+        let mut h = WorkloadHandle::spawn(&config)
+            .expect("Thread + FutexPingPong spawn must succeed");
+        h.start();
+        std::thread::sleep(Duration::from_millis(200));
+        let reports = h.stop_and_collect();
+        assert_eq!(
+            reports.len(),
+            2,
+            "Thread + FutexPingPong collects one report per worker",
+        );
+        for r in &reports {
+            assert!(
+                r.work_units > 0,
+                "Thread + FutexPingPong worker tid={} did no work: {:?}",
+                r.tid, r,
+            );
+        }
+    }
+
+    /// `WorkloadHandle::set_affinity` MUST succeed for a Thread
+    /// worker once the worker has published its `gettid()` — the
+    /// `Acquire` load on `tw.tid` returns a non-zero kernel task
+    /// id, and `sched_setaffinity(tid, ...)` accepts the per-task
+    /// pid_t. The publish happens on the worker thread's first
+    /// instructions (see `spawn_thread_worker`'s `tid_thread.store`
+    /// before the start rendezvous); calling `start()` plus a
+    /// brief sleep guarantees the publish is observable, matching
+    /// the doc's "call start() first" guidance. Pinning the
+    /// Ok-on-CPU-0 path here guards the post-start affinity
+    /// surface against a regression that re-introduces the
+    /// pre-publish bail (`tid == 0`) for live threads.
+    #[test]
+    fn spawn_thread_set_affinity_works_post_start() {
+        let config = WorkloadConfig {
+            num_workers: 1,
+            clone_mode: CloneMode::Thread,
+            work_type: WorkType::CpuSpin,
+            ..Default::default()
+        };
+        let mut h = WorkloadHandle::spawn(&config).expect("Thread spawn must succeed");
+        h.start();
+        // Give the worker a moment to publish its tid past the
+        // Release store. Without this the Acquire load races the
+        // store and could observe the AtomicI32's initial 0 — the
+        // bail branch we explicitly do not want to test here.
+        std::thread::sleep(Duration::from_millis(50));
+        let cpus: BTreeSet<usize> = [0].into_iter().collect();
+        let result = h.set_affinity(0, &cpus);
+        assert!(
+            result.is_ok(),
+            "set_affinity(0, {{0}}) on a started Thread worker must succeed; \
+             got {:?}",
+            result.err(),
+        );
+        let _reports = h.stop_and_collect();
+    }
+
 
     #[test]
     fn build_nodemask_empty() {
@@ -12773,214 +11883,607 @@ mod tests {
         assert!(has_latencies, "contenders should record wake latencies");
     }
 
-    // -- CloneFlags + validate_clone_flags coverage ----------------------
-    //
-    // The flag validator is the structural-rejection layer that sits in
-    // front of the clone3 syscall — callers see a named-rule diagnostic
-    // here rather than an opaque EINVAL from the kernel.  The rules
-    // enumerated by `validate_clone_flags` are 1:1 with the rejection
-    // checks at the top of `kernel/fork.c::copy_process`; pinning each
-    // rule individually catches a regression that drops a check or
-    // mis-orders the bail-outs.  These tests exercise the validator
-    // through the `Verdict` API so the rule-name diagnostics are
-    // claim-labeled and survive the migration off the legacy Expect
-    // shape.
-
-    /// CloneFlags::NONE passes the validator — the all-zero flag set
-    /// is the no-op default for [`CloneMode::Raw`].
+    /// Per-enum `serde(rename_all = "snake_case")` discipline check
+    /// — a representative variant from each enum serializes to the
+    /// snake_case form. A regression that drops the `rename_all` on
+    /// any enum surfaces here.
     #[test]
-    fn validate_clone_flags_none_passes_via_verdict() {
-        use crate::assert::Verdict;
-        let mut v = Verdict::new();
-        let valid_none = validate_clone_flags(CloneFlags::NONE).is_ok();
-        crate::claim!(v, valid_none).eq(true);
-        let r = v.into_result();
-        assert!(r.passed, "CloneFlags::NONE must validate: {:?}", r.details);
+    fn workload_enums_use_snake_case_wire_format() {
+        // CloneMode variants
+        let json = serde_json::to_string(&CloneMode::Fork).unwrap();
+        assert_eq!(json, r#""fork""#);
+        let json = serde_json::to_string(&CloneMode::Thread).unwrap();
+        assert_eq!(json, r#""thread""#);
+
+        // SchedPolicy variants
+        let json = serde_json::to_string(&SchedPolicy::Normal).unwrap();
+        assert_eq!(json, r#""normal""#);
+        let json = serde_json::to_string(&SchedPolicy::RoundRobin(50)).unwrap();
+        assert_eq!(json, r#"{"round_robin":50}"#);
+
+        // FutexLockMode
+        let json = serde_json::to_string(&FutexLockMode::Plain).unwrap();
+        assert_eq!(json, r#""plain""#);
+
+        // SchedClass
+        let json = serde_json::to_string(&SchedClass::Cfs).unwrap();
+        assert_eq!(json, r#""cfs""#);
+
+        // MemPolicy
+        let json = serde_json::to_string(&MemPolicy::Default).unwrap();
+        assert_eq!(json, r#""default""#);
+
+        // AffinityIntent
+        let json = serde_json::to_string(&AffinityIntent::Inherit).unwrap();
+        assert_eq!(json, r#""inherit""#);
+        let json = serde_json::to_string(&AffinityIntent::LlcAligned).unwrap();
+        assert_eq!(json, r#""llc_aligned""#);
+
+        // ResolvedAffinity
+        let json = serde_json::to_string(&ResolvedAffinity::None).unwrap();
+        assert_eq!(json, r#""none""#);
+
+        // WorkType variants
+        let json = serde_json::to_string(&WorkType::CpuSpin).unwrap();
+        assert_eq!(json, r#""cpu_spin""#);
+        let json = serde_json::to_string(&WorkType::ForkExit).unwrap();
+        assert_eq!(json, r#""fork_exit""#);
     }
 
-    /// Rule 1: `CLONE_THREAD` requires `CLONE_SIGHAND`. Pin both
-    /// directions through Verdict; the diagnostic must name the rule.
+    /// `Phase` Duration fields serialize as humantime strings, not
+    /// `{secs, nanos}` objects. Pins the readable wire format that
+    /// makes captured `WorkSpec` configs operator-editable.
     #[test]
-    fn validate_clone_flags_rule_1_thread_requires_sighand() {
-        use crate::assert::Verdict;
-
-        let thread_only = CloneFlags::THREAD;
-        let rejected = validate_clone_flags(thread_only).is_err();
-        let mut v = Verdict::new();
-        crate::claim!(v, rejected).eq(true);
-        let r = v.into_result();
-        assert!(r.passed, "rule 1: THREAD alone must be rejected");
-
-        let err = validate_clone_flags(thread_only).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("CLONE_THREAD requires CLONE_SIGHAND"),
-            "rule 1 diagnostic must name the rule: {msg}",
-        );
-
-        let thread_sighand_vm = CloneFlags::THREAD | CloneFlags::SIGHAND | CloneFlags::VM;
-        let accepted = validate_clone_flags(thread_sighand_vm).is_ok();
-        let mut v = Verdict::new();
-        crate::claim!(v, accepted).eq(true);
-        let r = v.into_result();
-        assert!(
-            r.passed,
-            "rule 1: THREAD + SIGHAND + VM must be accepted: {:?}",
-            r.details
-        );
-    }
-
-    /// Rule 2: `CLONE_SIGHAND` requires `CLONE_VM`.
-    #[test]
-    fn validate_clone_flags_rule_2_sighand_requires_vm() {
-        use crate::assert::Verdict;
-
-        let sighand_only = CloneFlags::SIGHAND;
-        let rejected = validate_clone_flags(sighand_only).is_err();
-        let mut v = Verdict::new();
-        crate::claim!(v, rejected).eq(true);
-        let r = v.into_result();
-        assert!(r.passed, "rule 2: SIGHAND alone must be rejected");
-
-        let err = validate_clone_flags(sighand_only).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("CLONE_SIGHAND requires CLONE_VM"),
-            "rule 2 diagnostic must name the rule: {msg}",
-        );
-
-        let sighand_vm = CloneFlags::SIGHAND | CloneFlags::VM;
-        let accepted = validate_clone_flags(sighand_vm).is_ok();
-        let mut v = Verdict::new();
-        crate::claim!(v, accepted).eq(true);
-        let r = v.into_result();
-        assert!(r.passed, "rule 2: SIGHAND + VM must be accepted: {:?}", r.details);
-    }
-
-    /// Rules 3 / 4 / 5: mutually-exclusive pairs. Folded into one
-    /// Verdict — every named rejection path must hold.
-    #[test]
-    fn validate_clone_flags_rules_3_4_5_mutual_exclusion() {
-        use crate::assert::Verdict;
-
-        let mut v = Verdict::new();
-
-        let rule_3_rejected = validate_clone_flags(CloneFlags::NEWNS | CloneFlags::FS).is_err();
-        crate::claim!(v, rule_3_rejected).eq(true);
-
-        let rule_4_rejected = validate_clone_flags(CloneFlags::NEWUSER | CloneFlags::FS).is_err();
-        crate::claim!(v, rule_4_rejected).eq(true);
-
-        let rule_5a_rejected = validate_clone_flags(
-            CloneFlags::THREAD | CloneFlags::SIGHAND | CloneFlags::VM | CloneFlags::NEWUSER,
-        )
-        .is_err();
-        crate::claim!(v, rule_5a_rejected).eq(true);
-
-        let rule_5b_rejected = validate_clone_flags(
-            CloneFlags::THREAD | CloneFlags::SIGHAND | CloneFlags::VM | CloneFlags::NEWPID,
-        )
-        .is_err();
-        crate::claim!(v, rule_5b_rejected).eq(true);
-
-        let r = v.into_result();
-        assert!(
-            r.passed,
-            "rules 3/4/5: every named mutual-exclusion path must reject: {:?}",
-            r.details,
-        );
-    }
-
-    /// Rule 6: caller-set runtime-reserved bits rejected with a hex-
-    /// formatted diagnostic naming `RUNTIME_RESERVED`.
-    #[test]
-    fn validate_clone_flags_rule_6_runtime_reserved_bits_rejected() {
-        use crate::assert::Verdict;
-
-        let pidfd_bit = CloneFlags::from_bits_for_test(0x1000);
-        let rejected = validate_clone_flags(pidfd_bit).is_err();
-        let mut v = Verdict::new();
-        crate::claim!(v, rejected).eq(true);
-        let r = v.into_result();
-        assert!(r.passed, "rule 6: CLONE_PIDFD must be rejected");
-
-        let err = validate_clone_flags(pidfd_bit).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("runtime-reserved flags 0x1000"),
-            "rule 6 diagnostic must name the offending bit in hex: {msg}",
-        );
-        assert!(
-            msg.contains("RUNTIME_RESERVED"),
-            "rule 6 diagnostic must reference the constant: {msg}",
-        );
-
-        let all_reserved = CloneFlags::RUNTIME_RESERVED;
-        let mass_rejected = validate_clone_flags(all_reserved).is_err();
-        let mut v = Verdict::new();
-        crate::claim!(v, mass_rejected).eq(true);
-        let r = v.into_result();
-        assert!(
-            r.passed,
-            "rule 6: full RUNTIME_RESERVED mask must be rejected: {:?}",
-            r.details,
-        );
-    }
-
-    /// `CloneFlags::contains` is set-theoretic — `contains(NONE)`
-    /// returns true for any self.
-    #[test]
-    fn clone_flags_contains_none_is_universally_true() {
-        use crate::assert::Verdict;
-
-        let mut v = Verdict::new();
-        let cases = &[
-            CloneFlags::NONE,
-            CloneFlags::VM,
-            CloneFlags::FS,
-            CloneFlags::FILES,
-            CloneFlags::SIGHAND,
-            CloneFlags::THREAD,
-            CloneFlags::PARENT,
-            CloneFlags::NEWNS,
-            CloneFlags::NEWUSER,
-            CloneFlags::NEWPID,
-            CloneFlags::NEWNET,
-            CloneFlags::NEWIPC,
-            CloneFlags::NEWUTS,
-            CloneFlags::NEWCGROUP,
-            CloneFlags::IO,
-            CloneFlags::SYSVSEM,
-        ];
-        for f in cases {
-            let contains_none = f.contains(CloneFlags::NONE);
-            crate::claim!(v, contains_none).eq(true);
+    fn phase_duration_serializes_as_humantime() {
+        let p = Phase::Spin(Duration::from_millis(100));
+        let json = serde_json::to_string(&p).unwrap();
+        assert_eq!(json, r#"{"spin":"100ms"}"#);
+        let back: Phase = serde_json::from_str(&json).unwrap();
+        match back {
+            Phase::Spin(d) => assert_eq!(d, Duration::from_millis(100)),
+            _ => panic!("roundtrip lost Spin variant"),
         }
-        let r = v.into_result();
+    }
+
+    /// `WorkType::Custom` is `#[serde(skip)]` because its `run` field
+    /// is a `fn` pointer with no portable wire format. Serializing
+    /// fails with a serde error pointing at the skipped variant.
+    #[test]
+    fn worktype_custom_serialize_errors_skipped_variant() {
+        fn noop(_: &AtomicBool) -> WorkerReport {
+            WorkerReport::default()
+        }
+        let custom = WorkType::custom("my_custom", noop);
+        let r = serde_json::to_string(&custom);
         assert!(
-            r.passed,
-            "contains(NONE) must be universally true: {:?}",
-            r.details,
+            r.is_err(),
+            "Custom variant must error on serialize (it's #[serde(skip)])"
         );
     }
 
-    /// `CloneFlags::union` and `BitOr::bitor` must produce identical
-    /// bit patterns. The struct doc says BitOr delegates to union.
+    /// Full `WorkloadConfig` round-trip with `Default` ensures every
+    /// field handles serde correctly together — no field is silently
+    /// missing a derive.
     #[test]
-    fn clone_flags_union_and_bitor_produce_identical_bits() {
-        use crate::assert::Verdict;
+    fn workload_config_default_roundtrips() {
+        let cfg = WorkloadConfig::default();
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: WorkloadConfig = serde_json::from_str(&json).unwrap();
+        // Compare via re-serialization since WorkloadConfig has no PartialEq.
+        let json2 = serde_json::to_string(&back).unwrap();
+        assert_eq!(json, json2);
+    }
 
-        let lhs = CloneFlags::VM | CloneFlags::FILES;
-        let rhs = CloneFlags::SIGHAND;
-        let union_bits = lhs.union(rhs).bits();
-        let bitor_bits = (lhs | rhs).bits();
+    // -- pathology WorkType smoke tests --
+    //
+    // Each pathology variant added in #25 was implemented and
+    // wired into name registries but had no runtime call site.
+    // These smoke tests exercise the worker body of every variant
+    // for ~200ms with the minimum legal worker count and assert
+    // that workers actually iterated. Catches MAP_SHARED layout
+    // regressions, futex-word offset mistakes, and worker-group
+    // partitioning bugs that would surface as zero-iteration
+    // reports or panics inside `worker_main`.
 
-        let mut v = Verdict::new();
-        crate::claim!(v, union_bits).eq(bitor_bits);
-        let r = v.into_result();
+    /// `WorkType::PageFaultChurn` smoke test. Per-iteration cycle:
+    /// mmap → touch random pages → MADV_DONTNEED → repeat.
+    #[test]
+    fn pathology_page_fault_churn_iterates() {
+        let cfg = WorkloadConfig {
+            num_workers: 2,
+            work_type: WorkType::PageFaultChurn {
+                region_kb: 256,
+                touches_per_cycle: 16,
+                spin_iters: 32,
+            },
+            ..Default::default()
+        };
+        let mut h = WorkloadHandle::spawn(&cfg).expect("PageFaultChurn must spawn");
+        h.start();
+        std::thread::sleep(Duration::from_millis(200));
+        let reports = h.stop_and_collect();
+        assert_eq!(reports.len(), 2);
+        for r in &reports {
+            assert!(r.iterations > 0, "PageFaultChurn worker must iterate: {r:?}");
+        }
+    }
+
+    /// `WorkType::MutexContention` smoke test. 2 contenders share a
+    /// MAP_SHARED region; group_size=2 so num_workers=2 fits.
+    #[test]
+    fn pathology_mutex_contention_iterates() {
+        let cfg = WorkloadConfig {
+            num_workers: 2,
+            work_type: WorkType::MutexContention {
+                contenders: 2,
+                hold_iters: 64,
+                work_iters: 128,
+            },
+            ..Default::default()
+        };
+        let mut h = WorkloadHandle::spawn(&cfg).expect("MutexContention must spawn");
+        h.start();
+        std::thread::sleep(Duration::from_millis(200));
+        let reports = h.stop_and_collect();
+        assert_eq!(reports.len(), 2);
+        for r in &reports {
+            assert!(r.iterations > 0, "MutexContention worker must iterate: {r:?}");
+        }
+    }
+
+    /// `WorkType::ThunderingHerd` smoke test. Minimal herd:
+    /// waiters=1 → group_size=2, num_workers=2.
+    #[test]
+    fn pathology_thundering_herd_iterates() {
+        let cfg = WorkloadConfig {
+            num_workers: 2,
+            work_type: WorkType::ThunderingHerd {
+                waiters: 1,
+                batches: 50,
+                inter_batch_ms: 1,
+            },
+            ..Default::default()
+        };
+        let mut h = WorkloadHandle::spawn(&cfg).expect("ThunderingHerd must spawn");
+        h.start();
+        std::thread::sleep(Duration::from_millis(200));
+        let reports = h.stop_and_collect();
+        assert_eq!(reports.len(), 2);
+        // Waker iterates per batch; waiters iterate per wake. At
+        // least one worker should have done some iterations within
+        // 200ms even on a contended host.
+        let total: u64 = reports.iter().map(|r| r.iterations).sum();
+        assert!(total > 0, "ThunderingHerd cohort must iterate: {reports:?}");
+    }
+
+    /// `WorkType::PriorityInversion` smoke test. 1+1+1 = 3 workers
+    /// (smallest group satisfying high+medium+low constraint).
+    #[test]
+    fn pathology_priority_inversion_iterates() {
+        let cfg = WorkloadConfig {
+            num_workers: 3,
+            work_type: WorkType::PriorityInversion {
+                high_count: 1,
+                medium_count: 1,
+                low_count: 1,
+                hold_iters: 256,
+                work_iters: 128,
+                pi_mode: FutexLockMode::Plain,
+            },
+            ..Default::default()
+        };
+        let mut h = WorkloadHandle::spawn(&cfg).expect("PriorityInversion must spawn");
+        h.start();
+        std::thread::sleep(Duration::from_millis(200));
+        let reports = h.stop_and_collect();
+        assert_eq!(reports.len(), 3);
+        let total: u64 = reports.iter().map(|r| r.iterations).sum();
+        assert!(total > 0, "PriorityInversion cohort must iterate: {reports:?}");
+    }
+
+    /// `WorkType::ProducerConsumerImbalance` smoke test. Minimal
+    /// 1+1 producers/consumers, low rate so the queue doesn't
+    /// instantly saturate.
+    #[test]
+    fn pathology_producer_consumer_imbalance_iterates() {
+        let cfg = WorkloadConfig {
+            num_workers: 2,
+            work_type: WorkType::ProducerConsumerImbalance {
+                producers: 1,
+                consumers: 1,
+                produce_rate_hz: 200,
+                consume_iters: 64,
+                queue_depth_target: 16,
+            },
+            ..Default::default()
+        };
+        let mut h =
+            WorkloadHandle::spawn(&cfg).expect("ProducerConsumerImbalance must spawn");
+        h.start();
+        std::thread::sleep(Duration::from_millis(200));
+        let reports = h.stop_and_collect();
+        assert_eq!(reports.len(), 2);
+        let total: u64 = reports.iter().map(|r| r.iterations).sum();
+        assert!(total > 0, "Producer/Consumer cohort must iterate: {reports:?}");
+    }
+
+    /// `WorkType::RtStarvation` smoke test. 1 RT + 1 CFS worker.
+    /// Requires CAP_SYS_NICE for `sched_setscheduler(SCHED_FIFO)`
+    /// (ktstr always runs as root per project memory).
+    #[test]
+    fn pathology_rt_starvation_iterates() {
+        let cfg = WorkloadConfig {
+            num_workers: 2,
+            work_type: WorkType::RtStarvation {
+                rt_workers: 1,
+                cfs_workers: 1,
+                rt_priority: 50,
+                burst_iters: 64,
+            },
+            ..Default::default()
+        };
+        let mut h = WorkloadHandle::spawn(&cfg).expect("RtStarvation must spawn");
+        h.start();
+        std::thread::sleep(Duration::from_millis(200));
+        let reports = h.stop_and_collect();
+        assert_eq!(reports.len(), 2);
+        // RT worker pegs the CPU; CFS may or may not iterate
+        // depending on starvation. At least one must have run.
+        let total: u64 = reports.iter().map(|r| r.iterations).sum();
+        assert!(total > 0, "RtStarvation cohort must iterate: {reports:?}");
+    }
+
+    /// `WorkType::AsymmetricWaker` smoke test. Default classes
+    /// (Cfs/Cfs) so no privilege required at the kernel layer.
+    #[test]
+    fn pathology_asymmetric_waker_iterates() {
+        let cfg = WorkloadConfig {
+            num_workers: 2,
+            work_type: WorkType::AsymmetricWaker {
+                waker_class: SchedClass::Cfs,
+                wakee_class: SchedClass::Cfs,
+                burst_iters: 128,
+            },
+            ..Default::default()
+        };
+        let mut h = WorkloadHandle::spawn(&cfg).expect("AsymmetricWaker must spawn");
+        h.start();
+        std::thread::sleep(Duration::from_millis(200));
+        let reports = h.stop_and_collect();
+        assert_eq!(reports.len(), 2);
+        let total: u64 = reports.iter().map(|r| r.iterations).sum();
+        assert!(total > 0, "AsymmetricWaker pair must iterate: {reports:?}");
+    }
+
+    /// `WorkType::WakeChain` smoke test. depth=2 → 2 workers per
+    /// chain × 1 chain = 2 workers total. Single linear chain.
+    #[test]
+    fn pathology_wake_chain_iterates() {
+        let cfg = WorkloadConfig {
+            num_workers: 2,
+            work_type: WorkType::WakeChain {
+                depth: 2,
+                fanout: 1,
+                sync: false,
+                work_per_hop: Duration::from_micros(50),
+            },
+            ..Default::default()
+        };
+        let mut h = WorkloadHandle::spawn(&cfg).expect("WakeChain must spawn");
+        h.start();
+        std::thread::sleep(Duration::from_millis(200));
+        let reports = h.stop_and_collect();
+        assert_eq!(reports.len(), 2);
+        let total: u64 = reports.iter().map(|r| r.iterations).sum();
+        assert!(total > 0, "WakeChain ring must iterate: {reports:?}");
+    }
+
+    /// `WorkType::NumaWorkingSetSweep` smoke test. Empty
+    /// `target_nodes` disables binding (per the variant's doc:
+    /// "Empty list disables binding ... no migration is
+    /// triggered"); the worker still touches the region every
+    /// iteration. Sufficient for the pathology smoke check —
+    /// real multi-node migration tests live under
+    /// `tests/numa_tests.rs` (see #143/#146).
+    #[test]
+    fn pathology_numa_working_set_sweep_iterates() {
+        let cfg = WorkloadConfig {
+            num_workers: 2,
+            work_type: WorkType::NumaWorkingSetSweep {
+                region_kb: 256,
+                sweep_period_ms: 100,
+                target_nodes: vec![],
+            },
+            ..Default::default()
+        };
+        let mut h = WorkloadHandle::spawn(&cfg).expect("NumaWorkingSetSweep must spawn");
+        h.start();
+        std::thread::sleep(Duration::from_millis(200));
+        let reports = h.stop_and_collect();
+        assert_eq!(reports.len(), 2);
+        for r in &reports {
+            assert!(
+                r.iterations > 0,
+                "NumaWorkingSetSweep worker must iterate: {r:?}"
+            );
+        }
+    }
+
+    // -- Thread-mode dispatch coverage expansion --
+    //
+    // These tests pin Thread-mode worker contracts the initial
+    // dispatch tests didn't cover: thread/tgid identity, bounded
+    // stop latency, multi-worker panic isolation, drop cleanup,
+    // affinity, and paired-WorkType compatibility.
+
+    /// All Thread-mode workers share the same tgid (kernel
+    /// "process") because they live inside the test harness's own
+    /// process. Distinct gettid()s but a single getpid() — pinning
+    /// this proves the Thread variant really creates std::thread
+    /// kernel tasks, not hidden subprocess-style isolation. The
+    /// tgid invariant is what makes the cgroup.procs hazard at
+    /// `worker_pids` real.
+    #[test]
+    fn thread_workers_share_tgid_with_harness() {
+        let config = WorkloadConfig {
+            num_workers: 3,
+            clone_mode: CloneMode::Thread,
+            work_type: WorkType::CpuSpin,
+            ..Default::default()
+        };
+        let mut h = WorkloadHandle::spawn(&config).expect("Thread spawn must succeed");
+        h.start();
+        std::thread::sleep(Duration::from_millis(100));
+        let pids = h.worker_pids();
+        assert_eq!(pids.len(), 3);
+        let harness_pid = unsafe { libc::getpid() };
+        for &tid in &pids {
+            let status = std::fs::read_to_string(format!("/proc/{tid}/status"))
+                .expect("must read /proc/<tid>/status for thread worker");
+            let tgid_line = status
+                .lines()
+                .find(|l| l.starts_with("Tgid:"))
+                .expect("status must include Tgid line");
+            let tgid: i32 = tgid_line
+                .trim_start_matches("Tgid:")
+                .trim()
+                .parse()
+                .expect("Tgid must be a parseable integer");
+            assert_eq!(
+                tgid, harness_pid,
+                "Thread worker tid={tid} must share tgid with test harness pid={harness_pid}; \
+                 found Tgid={tgid}. Thread workers run inside the harness process — a \
+                 distinct tgid would mean the dispatch silently forked instead."
+            );
+        }
+        let _ = h.stop_and_collect();
+    }
+
+    /// Thread-mode `stop_and_collect` must return inside a bounded
+    /// deadline once the per-worker stop flag is flipped. Pin a 5s
+    /// upper bound: workers that don't poll their stop flag would
+    /// hang the harness, and this test would fail at the deadline.
+    #[test]
+    fn thread_stop_and_collect_returns_within_bounded_deadline() {
+        fn spin_until_stop(stop: &AtomicBool) -> WorkerReport {
+            let tid: libc::pid_t =
+                unsafe { libc::syscall(libc::SYS_gettid) as libc::pid_t };
+            while !stop_requested(stop) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            WorkerReport {
+                tid,
+                completed: true,
+                ..WorkerReport::default()
+            }
+        }
+        let config = WorkloadConfig {
+            num_workers: 4,
+            clone_mode: CloneMode::Thread,
+            work_type: WorkType::custom("spin_until_stop", spin_until_stop),
+            ..Default::default()
+        };
+        let mut h = WorkloadHandle::spawn(&config).expect("Thread spawn must succeed");
+        h.start();
+        std::thread::sleep(Duration::from_millis(50));
+        let started = std::time::Instant::now();
+        let reports = h.stop_and_collect();
+        let elapsed = started.elapsed();
         assert!(
-            r.passed,
-            "union and BitOr must agree: union=0x{union_bits:x} bitor=0x{bitor_bits:x}",
+            elapsed < Duration::from_secs(5),
+            "stop_and_collect must return inside 5s for cooperating workers; took {elapsed:?}"
         );
+        assert_eq!(reports.len(), 4);
+        for r in &reports {
+            assert!(r.completed, "every worker must observe stop and return: {r:?}");
+        }
+    }
+
+    /// One panicking thread worker must NOT kill its siblings —
+    /// each worker is a separate `std::thread::JoinHandle`, so a
+    /// panic in one is captured by the join machinery and the
+    /// others continue to completion. Pin both halves: panicked
+    /// worker reports `completed=false`, surviving siblings report
+    /// `completed=true`.
+    #[test]
+    fn thread_panic_in_one_worker_does_not_kill_siblings() {
+        use std::sync::atomic::AtomicUsize;
+        static PANIC_PICKED: AtomicUsize = AtomicUsize::new(0);
+        fn pick_one_panic(stop: &AtomicBool) -> WorkerReport {
+            let n = PANIC_PICKED.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                panic!("test panic in worker 0");
+            }
+            let tid: libc::pid_t =
+                unsafe { libc::syscall(libc::SYS_gettid) as libc::pid_t };
+            while !stop_requested(stop) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            WorkerReport {
+                tid,
+                completed: true,
+                ..WorkerReport::default()
+            }
+        }
+        PANIC_PICKED.store(0, Ordering::SeqCst);
+
+        let config = WorkloadConfig {
+            num_workers: 3,
+            clone_mode: CloneMode::Thread,
+            work_type: WorkType::custom("pick_one_panic", pick_one_panic),
+            ..Default::default()
+        };
+        let mut h = WorkloadHandle::spawn(&config).expect("Thread spawn must succeed");
+        h.start();
+        std::thread::sleep(Duration::from_millis(100));
+        let reports = h.stop_and_collect();
+        assert_eq!(reports.len(), 3, "every worker must produce a report even after panic");
+        let panicked: Vec<&WorkerReport> = reports.iter().filter(|r| !r.completed).collect();
+        let surviving: Vec<&WorkerReport> = reports.iter().filter(|r| r.completed).collect();
+        assert_eq!(
+            panicked.len(),
+            1,
+            "exactly one worker must report completed=false: reports={reports:?}"
+        );
+        assert_eq!(
+            surviving.len(),
+            2,
+            "two workers must survive sibling's panic: reports={reports:?}"
+        );
+        match &panicked[0].exit_info {
+            Some(WorkerExitInfo::Panicked(msg)) => assert!(
+                msg.contains("test panic in worker 0"),
+                "exit_info must round-trip the panic message: {msg}"
+            ),
+            other => panic!("expected Panicked(_) on the failing worker, got {other:?}"),
+        }
+    }
+
+    /// `WorkloadHandle` dropped without `stop_and_collect` MUST
+    /// NOT leak threads — the Drop impl joins outstanding threads
+    /// (waits for them to observe the per-worker stop flag and
+    /// return). Pre-drop the worker is alive (poll /proc/<tid>);
+    /// post-drop the tid is gone. If Drop regressed to "abandon
+    /// threads", the worker would still be alive and the test
+    /// would observe the tid in /proc.
+    #[test]
+    fn thread_handle_drop_joins_threads_and_releases_resources() {
+        fn spin_until_stop(stop: &AtomicBool) -> WorkerReport {
+            let tid: libc::pid_t =
+                unsafe { libc::syscall(libc::SYS_gettid) as libc::pid_t };
+            while !stop_requested(stop) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            WorkerReport {
+                tid,
+                completed: true,
+                ..WorkerReport::default()
+            }
+        }
+        let config = WorkloadConfig {
+            num_workers: 1,
+            clone_mode: CloneMode::Thread,
+            work_type: WorkType::custom("spin_until_stop", spin_until_stop),
+            ..Default::default()
+        };
+        let h = WorkloadHandle::spawn(&config).expect("Thread spawn must succeed");
+        let pids_before = h.worker_pids();
+        assert_eq!(pids_before.len(), 1);
+        let worker_tid = pids_before[0];
+        drop(h);
+        let started = std::time::Instant::now();
+        let mut tid_dead = false;
+        while started.elapsed() < Duration::from_secs(5) {
+            if !std::path::Path::new(&format!("/proc/{worker_tid}/status")).exists() {
+                tid_dead = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            tid_dead,
+            "worker tid {worker_tid} must be reaped after WorkloadHandle::drop; \
+             /proc/{worker_tid}/status still exists 5s after drop. Drop must \
+             join outstanding threads, not abandon them."
+        );
+    }
+
+    /// FutexPingPong under Thread mode shares the harness's
+    /// address space. Pin that the paired WorkType runs to
+    /// completion under Thread without the shared-memory plumbing
+    /// breaking.
+    #[test]
+    fn thread_paired_futex_ping_pong_runs_to_completion() {
+        let config = WorkloadConfig {
+            num_workers: 2,
+            clone_mode: CloneMode::Thread,
+            work_type: WorkType::FutexPingPong { spin_iters: 1024 },
+            ..Default::default()
+        };
+        let mut h = WorkloadHandle::spawn(&config)
+            .expect("FutexPingPong Thread spawn must succeed");
+        h.start();
+        std::thread::sleep(Duration::from_millis(150));
+        let reports = h.stop_and_collect();
+        assert_eq!(reports.len(), 2, "FutexPingPong pairs into worker_group_size=2");
+        for r in &reports {
+            assert!(
+                r.iterations > 0 || r.work_units > 0,
+                "FutexPingPong worker must show progress under Thread: {r:?}"
+            );
+        }
+    }
+
+    /// FanOutCompute's worker-group dispatch logic assigns the
+    /// messenger role to `pos == 0` of each group. Pin that the
+    /// per-group worker count comes out correctly so the role
+    /// assignment lands on the expected worker indices.
+    #[test]
+    fn thread_fan_out_compute_messenger_classification() {
+        let work_type = WorkType::FanOutCompute {
+            fan_out: 3,
+            cache_footprint_kb: 16,
+            operations: 1,
+            sleep_usec: 0,
+        };
+        let group_size = work_type.worker_group_size().expect("FanOutCompute groups");
+        assert_eq!(group_size, 4, "1 messenger + 3 workers = group of 4");
+    }
+
+    /// Affinity sets must apply to Thread-mode worker tids
+    /// (kernel tasks with their own `cpus_allowed`). Pin that
+    /// `affinity` plus a single-CPU mask results in each worker
+    /// actually pinned to that CPU, observable via
+    /// /proc/<tid>/status::Cpus_allowed_list.
+    #[test]
+    fn thread_workers_honor_single_cpu_affinity() {
+        let config = WorkloadConfig {
+            num_workers: 2,
+            clone_mode: CloneMode::Thread,
+            work_type: WorkType::CpuSpin,
+            affinity: ResolvedAffinity::SingleCpu(0),
+            ..Default::default()
+        };
+        let mut h = WorkloadHandle::spawn(&config)
+            .expect("Thread + SingleCpu(0) spawn must succeed");
+        h.start();
+        std::thread::sleep(Duration::from_millis(100));
+        let pids = h.worker_pids();
+        assert_eq!(pids.len(), 2);
+        for &tid in &pids {
+            let status = std::fs::read_to_string(format!("/proc/{tid}/status"))
+                .expect("must read /proc/<tid>/status for thread worker");
+            let line = status
+                .lines()
+                .find(|l| l.starts_with("Cpus_allowed_list:"))
+                .expect("status must include Cpus_allowed_list");
+            let mask = line.trim_start_matches("Cpus_allowed_list:").trim();
+            assert_eq!(
+                mask, "0",
+                "Thread worker tid={tid} must be pinned to CPU 0; \
+                 Cpus_allowed_list reports {mask:?}"
+            );
+        }
+        let _ = h.stop_and_collect();
     }
 }

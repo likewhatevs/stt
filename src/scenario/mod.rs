@@ -824,7 +824,8 @@ where
             pids = h.worker_pids().len(),
             "spawned workers",
         );
-        ctx.cgroups.move_tasks(name.as_str(), &h.worker_pids())?;
+        ctx.cgroups
+            .move_tasks(name.as_str(), &h.worker_pids_for_cgroup_procs()?)?;
         handles.push(h);
     }
     for h in &mut handles {
@@ -1044,7 +1045,8 @@ pub fn spawn_diverse(ctx: &Ctx, cgroup_names: &[&str]) -> Result<Vec<WorkloadHan
             work_type: wt,
             ..Default::default()
         })?;
-        ctx.cgroups.move_tasks(name, &h.worker_pids())?;
+        ctx.cgroups
+            .move_tasks(name, &h.worker_pids_for_cgroup_procs()?)?;
         h.start();
         handles.push(h);
     }

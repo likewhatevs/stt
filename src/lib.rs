@@ -94,7 +94,7 @@
 //!         ..Default::default()
 //!     };
 //!     let mut handle = WorkloadHandle::spawn(&cfg)?;
-//!     ctx.cgroups.move_tasks("workers", &handle.worker_pids())?;
+//!     ctx.cgroups.move_tasks("workers", &handle.worker_pids_for_cgroup_procs()?)?;
 //!     handle.start();
 //!
 //!     std::thread::sleep(ctx.duration);
@@ -644,7 +644,7 @@ pub mod prelude {
     // `resolve_scheduler`, `resolve_test_kernel`.
     pub use crate::topology::{LlcInfo, NodeMemInfo, TestTopology};
     pub use crate::workload::{
-        AffinityIntent, ResolvedAffinity, CloneFlags, CloneMode, MemPolicy, Migration, MpolFlags, Phase,
+        AffinityIntent, ResolvedAffinity, CloneMode, MemPolicy, Migration, MpolFlags, Phase,
         SchedPolicy, WorkSpec, WorkType, WorkerReport, WorkloadConfig, WorkloadHandle, build_nodemask,
     };
 }
@@ -1832,5 +1832,306 @@ mod tests {
         let merged = merge_kconfig_fragments(EMBEDDED_KCONFIG, Some(""));
         let expected = format!("{EMBEDDED_KCONFIG}\n");
         assert_eq!(merged, expected);
+    }
+
+    /// Last-wins ordering invariant: when the user fragment overrides
+    /// a baked-in symbol, the user line MUST appear AFTER the baked-in
+    /// line in the merged content. kbuild's
+    /// `scripts/kconfig/confdata.c::conf_read_simple` keeps the
+    /// last-occurring assignment per symbol, so a regression that
+    /// flipped the order would silently make user values lose. Pinning
+    /// at the merge-helper level catches the byte sequence kbuild
+    /// operates on without spinning up a kernel build.
+    #[test]
+    fn merge_kconfig_fragments_user_line_appears_after_baked_for_overrides() {
+        let baked = "CONFIG_FOO=y\nCONFIG_BAR=m\n";
+        let user = "CONFIG_FOO=n\n";
+        let merged = merge_kconfig_fragments(baked, Some(user)).into_owned();
+        let baked_idx = merged
+            .find("CONFIG_FOO=y")
+            .expect("baked CONFIG_FOO=y must be present");
+        let user_idx = merged
+            .find("CONFIG_FOO=n")
+            .expect("user CONFIG_FOO=n override must be present");
+        assert!(
+            baked_idx < user_idx,
+            "baked-in CONFIG_FOO=y must precede user override CONFIG_FOO=n so \
+             kbuild's last-wins rule picks the user value: {merged}"
+        );
+    }
+
+    /// Disjoint fragments (user adds a symbol the baked-in fragment
+    /// doesn't mention) combine verbatim — both lines reach kbuild
+    /// untouched. Pins the non-conflict path so a refactor that
+    /// dedupes or reorders user lines doesn't drop additive
+    /// configuration.
+    #[test]
+    fn merge_kconfig_fragments_disjoint_symbols_both_present() {
+        let baked = "CONFIG_FOO=y\n";
+        let user = "CONFIG_DISJOINT_TEST_SYMBOL=m\n";
+        let merged = merge_kconfig_fragments(baked, Some(user)).into_owned();
+        assert!(
+            merged.contains("CONFIG_FOO=y"),
+            "baked symbol must survive merge: {merged}"
+        );
+        assert!(
+            merged.contains("CONFIG_DISJOINT_TEST_SYMBOL=m"),
+            "user-added disjoint symbol must survive merge: {merged}"
+        );
+    }
+
+    // -- --extra-kconfig cache roundtrip / discrimination --
+    //
+    // These integration tests pin the cache-key behavior the
+    // `--extra-kconfig` plumbing depends on. They use
+    // `CacheDir::with_root` to plant fixture entries against an
+    // isolated tempdir so the host's real cache (if any) does not
+    // interfere, and exercise the production `cache.lookup` (the
+    // same call site `cli::cache_lookup` consumes) directly. No
+    // network, no kernel build — the bug surface is the cache-key
+    // suffix machinery, and the tests target that surface
+    // directly.
+
+    /// Two consecutive lookups with the SAME `--extra-kconfig`
+    /// content must hit the same cache slot. Pins the cache-hit
+    /// branch of the roundtrip: identical extras content →
+    /// identical `cache_key_suffix_with_extra` → identical cache
+    /// key → planted entry retrieved.
+    #[test]
+    fn cache_lookup_same_extras_hits_planted_entry() {
+        use crate::cache::{CacheArtifacts, CacheDir, KernelMetadata, KernelSource};
+        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+
+        let _env_lock = lock_env();
+        let _kernel_guard = EnvVarGuard::remove("KTSTR_KERNEL");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache_root = tmp.path().join("cache");
+        let _cache_guard = EnvVarGuard::set("KTSTR_CACHE_DIR", &cache_root);
+
+        let extra = "CONFIG_KTSTR_CACHE_ROUNDTRIP_TEST_A=y\n";
+        let extra_hash = extra_kconfig_hash(extra);
+        let cache_key = format!("test-roundtrip-{}-xkc{}", kconfig_hash(), extra_hash);
+
+        // Plant a fixture entry whose key matches what a build
+        // with this extras content would produce.
+        let cache = CacheDir::with_root(cache_root.clone());
+        let src_dir = tempfile::TempDir::new().unwrap();
+        let image = src_dir.path().join("bzImage");
+        std::fs::write(&image, b"fake kernel image").unwrap();
+        let meta = KernelMetadata::new(
+            KernelSource::Tarball,
+            "x86_64".to_string(),
+            "bzImage".to_string(),
+            "2026-04-12T10:00:00Z".to_string(),
+        )
+        .with_extra_kconfig_hash(Some(extra_hash.clone()));
+        cache
+            .store(&cache_key, &CacheArtifacts::new(&image), &meta)
+            .unwrap();
+
+        // Look up the same key — must hit.
+        let hit = cache.lookup(&cache_key);
+        assert!(
+            hit.is_some(),
+            "cache lookup with same extras must return planted entry; \
+             cache_key={cache_key}"
+        );
+        assert_eq!(
+            hit.as_ref().unwrap().metadata.extra_kconfig_hash.as_deref(),
+            Some(extra_hash.as_str()),
+            "retrieved entry must carry the planted extra_kconfig_hash"
+        );
+    }
+
+    /// Different `--extra-kconfig` contents must land at distinct
+    /// cache slots — a build with extras=A must NOT serve a cached
+    /// entry produced with extras=B. Pins the cache-discrimination
+    /// branch: distinct extras → distinct hashes → distinct keys.
+    #[test]
+    fn cache_lookup_different_extras_misses_planted_entry() {
+        use crate::cache::{CacheArtifacts, CacheDir, KernelMetadata, KernelSource};
+        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+
+        let _env_lock = lock_env();
+        let _kernel_guard = EnvVarGuard::remove("KTSTR_KERNEL");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache_root = tmp.path().join("cache");
+        let _cache_guard = EnvVarGuard::set("KTSTR_CACHE_DIR", &cache_root);
+
+        let extra_a = "CONFIG_KTSTR_CACHE_DISCRIMINATE_A=y\n";
+        let extra_b = "CONFIG_KTSTR_CACHE_DISCRIMINATE_B=y\n";
+        let key_a = format!("test-disc-{}-xkc{}", kconfig_hash(), extra_kconfig_hash(extra_a));
+        let key_b = format!("test-disc-{}-xkc{}", kconfig_hash(), extra_kconfig_hash(extra_b));
+        assert_ne!(
+            key_a, key_b,
+            "extras A and B must produce distinct cache keys (precondition)"
+        );
+
+        // Plant entry under key_a only.
+        let cache = CacheDir::with_root(cache_root.clone());
+        let src_dir = tempfile::TempDir::new().unwrap();
+        let image = src_dir.path().join("bzImage");
+        std::fs::write(&image, b"fake kernel image A").unwrap();
+        let meta = KernelMetadata::new(
+            KernelSource::Tarball,
+            "x86_64".to_string(),
+            "bzImage".to_string(),
+            "2026-04-12T10:00:00Z".to_string(),
+        )
+        .with_extra_kconfig_hash(Some(extra_kconfig_hash(extra_a)));
+        cache
+            .store(&key_a, &CacheArtifacts::new(&image), &meta)
+            .unwrap();
+
+        // Lookup with key_b must MISS — extras=B's slot is
+        // different from extras=A's slot.
+        let hit_b = cache.lookup(&key_b);
+        assert!(
+            hit_b.is_none(),
+            "lookup with extras=B's key must miss when only extras=A is planted; \
+             key_a={key_a} key_b={key_b}"
+        );
+
+        // Sanity: the planted entry IS reachable via key_a.
+        assert!(
+            cache.lookup(&key_a).is_some(),
+            "planted entry must be reachable via its own key"
+        );
+    }
+
+    /// A bare-suffix entry (built without `--extra-kconfig`) must
+    /// NOT be served when an extras lookup runs — and conversely,
+    /// an extras-suffix entry must NOT be served to a bare lookup.
+    /// Both halves of the segregation are pinned because either
+    /// regression silently mis-serves a kernel built against a
+    /// different configuration to a build that asked for a
+    /// distinct one.
+    #[test]
+    fn cache_lookup_bare_and_extras_keys_segregated() {
+        use crate::cache::{CacheArtifacts, CacheDir, KernelMetadata, KernelSource};
+        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+
+        let _env_lock = lock_env();
+        let _kernel_guard = EnvVarGuard::remove("KTSTR_KERNEL");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache_root = tmp.path().join("cache");
+        let _cache_guard = EnvVarGuard::set("KTSTR_CACHE_DIR", &cache_root);
+
+        let baked = kconfig_hash();
+        let extra = "CONFIG_KTSTR_CACHE_SEGREGATE=y\n";
+        let bare_key = format!("test-seg-{baked}");
+        let extras_key = format!("test-seg-{baked}-xkc{}", extra_kconfig_hash(extra));
+        assert_ne!(
+            bare_key, extras_key,
+            "bare and extras-suffix keys must be distinct (precondition)"
+        );
+
+        // Plant only the bare entry.
+        let cache = CacheDir::with_root(cache_root.clone());
+        let src_dir = tempfile::TempDir::new().unwrap();
+        let image = src_dir.path().join("bzImage");
+        std::fs::write(&image, b"bare kernel").unwrap();
+        let bare_meta = KernelMetadata::new(
+            KernelSource::Tarball,
+            "x86_64".to_string(),
+            "bzImage".to_string(),
+            "2026-04-12T10:00:00Z".to_string(),
+        );
+        // bare_meta has extra_kconfig_hash=None by default.
+        assert!(
+            bare_meta.extra_kconfig_hash.is_none(),
+            "bare entry fixture must not carry extras hash"
+        );
+        cache
+            .store(&bare_key, &CacheArtifacts::new(&image), &bare_meta)
+            .unwrap();
+
+        // An extras lookup must not reach the bare entry.
+        assert!(
+            cache.lookup(&extras_key).is_none(),
+            "extras lookup must NOT serve the bare entry — operator built with \
+             --extra-kconfig and would silently get a kernel without their \
+             user symbols if this regressed"
+        );
+
+        // Now plant an extras entry.
+        let extras_image = src_dir.path().join("bzImage-extras");
+        std::fs::write(&extras_image, b"extras kernel").unwrap();
+        let extras_meta = KernelMetadata::new(
+            KernelSource::Tarball,
+            "x86_64".to_string(),
+            "bzImage".to_string(),
+            "2026-04-13T10:00:00Z".to_string(),
+        )
+        .with_extra_kconfig_hash(Some(extra_kconfig_hash(extra)));
+        cache
+            .store(&extras_key, &CacheArtifacts::new(&extras_image), &extras_meta)
+            .unwrap();
+
+        // Both keys must now hit their own slot independently.
+        let bare_hit = cache.lookup(&bare_key).expect("bare entry");
+        let extras_hit = cache.lookup(&extras_key).expect("extras entry");
+        assert!(
+            bare_hit.metadata.extra_kconfig_hash.is_none(),
+            "bare entry must report None extras hash"
+        );
+        assert!(
+            extras_hit.metadata.extra_kconfig_hash.is_some(),
+            "extras entry must report Some(hash)"
+        );
+    }
+
+    /// `CacheEntry::has_extra_kconfig()` must return true for an
+    /// entry built with `--extra-kconfig` and false for a bare
+    /// entry. Pins the metadata-readback contract that drives the
+    /// `(extra kconfig)` tag in `kernel list` output — operators
+    /// inspecting their cache need to distinguish at-a-glance
+    /// which entries carry user modifications.
+    #[test]
+    fn cache_entry_has_extra_kconfig_reflects_metadata() {
+        use crate::cache::{CacheArtifacts, CacheDir, KernelMetadata, KernelSource};
+        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+
+        let _env_lock = lock_env();
+        let _kernel_guard = EnvVarGuard::remove("KTSTR_KERNEL");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache_root = tmp.path().join("cache");
+        let _cache_guard = EnvVarGuard::set("KTSTR_CACHE_DIR", &cache_root);
+
+        let cache = CacheDir::with_root(cache_root.clone());
+        let src_dir = tempfile::TempDir::new().unwrap();
+        let image = src_dir.path().join("bzImage");
+        std::fs::write(&image, b"img").unwrap();
+
+        // Bare entry: extra_kconfig_hash = None.
+        let bare_meta = KernelMetadata::new(
+            KernelSource::Tarball,
+            "x86_64".to_string(),
+            "bzImage".to_string(),
+            "2026-04-12T10:00:00Z".to_string(),
+        );
+        let bare = cache
+            .store("test-has-bare", &CacheArtifacts::new(&image), &bare_meta)
+            .unwrap();
+        assert!(
+            !bare.has_extra_kconfig(),
+            "bare entry (extra_kconfig_hash = None) must report has_extra_kconfig() = false"
+        );
+
+        // Extras entry: extra_kconfig_hash = Some(hash).
+        let extras_meta = KernelMetadata::new(
+            KernelSource::Tarball,
+            "x86_64".to_string(),
+            "bzImage".to_string(),
+            "2026-04-13T10:00:00Z".to_string(),
+        )
+        .with_extra_kconfig_hash(Some("deadbeef".to_string()));
+        let extras = cache
+            .store("test-has-extras", &CacheArtifacts::new(&image), &extras_meta)
+            .unwrap();
+        assert!(
+            extras.has_extra_kconfig(),
+            "entry with extra_kconfig_hash = Some(...) must report has_extra_kconfig() = true"
+        );
     }
 }

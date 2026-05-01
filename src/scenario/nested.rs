@@ -121,7 +121,8 @@ pub fn custom_nested_cgroup_cpuset(ctx: &Ctx) -> Result<AssertResult> {
         ..Default::default()
     };
     let mut h = WorkloadHandle::spawn(&wl)?;
-    ctx.cgroups.move_tasks("cg_0/narrow", &h.worker_pids())?;
+    ctx.cgroups
+        .move_tasks("cg_0/narrow", &h.worker_pids_for_cgroup_procs()?)?;
     h.start();
 
     thread::sleep(ctx.duration);
