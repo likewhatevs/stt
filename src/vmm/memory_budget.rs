@@ -209,3 +209,170 @@ pub(crate) fn initramfs_min_memory_mb(budget: &MemoryBudget) -> u32 {
     // total = computed boot requirement + workload budget + SHM gap.
     (boot_mb + WORKLOAD_MB + shm_mb) as u32
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pin the workload-budget constant. Bumping the value
+    /// (`WORKLOAD_MB`) changes the floor for every deferred-memory
+    /// VM boot; this test fails any change so the bump goes through
+    /// review rather than slipping in unnoticed.
+    #[test]
+    fn workload_mb_is_256() {
+        assert_eq!(WORKLOAD_MB, 256);
+    }
+
+    /// All-zero inputs collapse to just the workload budget — no
+    /// kernel, no initramfs, no shm reservation. Pins the lower
+    /// bound the deferred-memory path always allocates.
+    #[test]
+    fn initramfs_min_memory_mb_zeros_returns_workload_budget() {
+        let budget = MemoryBudget {
+            uncompressed_initramfs_bytes: 0,
+            compressed_initrd_bytes: 0,
+            kernel_init_size: 0,
+            shm_bytes: 0,
+        };
+        assert_eq!(initramfs_min_memory_mb(&budget), WORKLOAD_MB as u32);
+    }
+
+    /// `shm_bytes` is added linearly to the total. Pin the contract
+    /// by varying only the SHM input — the delta in the result must
+    /// exactly equal the SHM contribution rounded up to MiB.
+    #[test]
+    fn initramfs_min_memory_mb_shm_contribution_linear() {
+        let zero = MemoryBudget {
+            uncompressed_initramfs_bytes: 0,
+            compressed_initrd_bytes: 0,
+            kernel_init_size: 0,
+            shm_bytes: 0,
+        };
+        let with_shm = MemoryBudget {
+            shm_bytes: 16 * (1 << 20), // 16 MiB exactly
+            ..zero_budget()
+        };
+        let base = initramfs_min_memory_mb(&zero);
+        let shifted = initramfs_min_memory_mb(&with_shm);
+        assert_eq!(shifted, base + 16);
+    }
+
+    /// `kernel_init_size` and `compressed_initrd_bytes` flow into
+    /// `content_mb` additively, then through the `*64/63` struct-page
+    /// circular-dependency factor. Verify the math against a
+    /// hand-computed reference. Inputs:
+    ///   uncompressed=10 MiB, init_size=5 MiB, compressed=2 MiB,
+    ///   shm=8 MiB.
+    /// Hand trace per `initramfs_min_memory_mb`:
+    ///   uncompressed_scaled = ceil(10*10/9) = ceil(11.111) = 12
+    ///   content_mb         = 12 + 5 + 2 = 19
+    ///   boot_mb            = ceil(19*64/63) = ceil(19.301) = 20
+    ///   total              = 20 + 256 (WORKLOAD_MB) + 8 = 284
+    #[test]
+    fn initramfs_min_memory_mb_known_input() {
+        let budget = MemoryBudget {
+            uncompressed_initramfs_bytes: 10 * (1 << 20),
+            compressed_initrd_bytes: 2 * (1 << 20),
+            kernel_init_size: 5 * (1 << 20),
+            shm_bytes: 8 * (1 << 20),
+        };
+        assert_eq!(initramfs_min_memory_mb(&budget), 284);
+    }
+
+    /// Sub-MiB inputs round up to 1 MiB before participating in the
+    /// math. A 1-byte initramfs (degenerate but reachable when test
+    /// fixtures construct empty payloads) must not silently round
+    /// down to zero and bypass the tmpfs-90% safety factor. With
+    /// uncompressed=1 byte, init=0, compressed=0, shm=0:
+    ///   uncompressed_scaled = ceil(1*10/9) = 2
+    ///   content_mb         = 2 + 0 + 0 = 2
+    ///   boot_mb            = ceil(2*64/63) = ceil(2.031) = 3
+    ///   total              = 3 + 256 + 0 = 259
+    #[test]
+    fn initramfs_min_memory_mb_subbyte_uncompressed_rounds_up() {
+        let budget = MemoryBudget {
+            uncompressed_initramfs_bytes: 1,
+            compressed_initrd_bytes: 0,
+            kernel_init_size: 0,
+            shm_bytes: 0,
+        };
+        assert_eq!(initramfs_min_memory_mb(&budget), 259);
+    }
+
+    /// Larger realistic-shape inputs: uncompressed=200 MiB,
+    /// compressed=50 MiB, init_size=30 MiB, shm=16 MiB.
+    /// Verifies the math holds at integration-realistic scales (the
+    /// production callers in vmm/mod.rs feed values of this order).
+    /// Trace:
+    ///   uncompressed_scaled = ceil(200*10/9) = ceil(222.222) = 223
+    ///   content_mb         = 223 + 30 + 50 = 303
+    ///   boot_mb            = ceil(303*64/63) = ceil(307.809) = 308
+    ///   total              = 308 + 256 + 16 = 580
+    #[test]
+    fn initramfs_min_memory_mb_larger_input() {
+        let budget = MemoryBudget {
+            uncompressed_initramfs_bytes: 200 * (1 << 20),
+            compressed_initrd_bytes: 50 * (1 << 20),
+            kernel_init_size: 30 * (1 << 20),
+            shm_bytes: 16 * (1 << 20),
+        };
+        assert_eq!(initramfs_min_memory_mb(&budget), 580);
+    }
+
+    /// `read_kernel_init_size` on x86_64 reads 4 little-endian bytes
+    /// at file offset 0x260. Construct a tempfile padded to that
+    /// offset with a known init_size value and assert the function
+    /// returns it as u64. Pins the exact byte-offset and width
+    /// against a future drift in the bzImage setup_header layout.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn read_kernel_init_size_x86_64_reads_offset_0x260() {
+        use std::io::Write;
+
+        let mut f = tempfile::NamedTempFile::new().expect("tempfile");
+        // Pad up to 0x260 with zeros, then write 4 bytes of init_size.
+        let pad = vec![0u8; 0x260];
+        f.write_all(&pad).expect("write pad");
+        // Distinct value, large enough that wrong-offset reads would
+        // yield zero (the surrounding pad).
+        let init_size: u32 = 0x1234_5678;
+        f.write_all(&init_size.to_le_bytes()).expect("write init_size");
+        f.flush().expect("flush");
+
+        let got = read_kernel_init_size(f.path()).expect("read init_size");
+        assert_eq!(got, init_size as u64);
+    }
+
+    /// Reading a file shorter than 0x264 bytes (the high end of the
+    /// init_size field on x86_64) must surface an error rather than
+    /// silently returning 0. Pin the failure shape so a future
+    /// "graceful-fallback" refactor that swallows truncated-bzImage
+    /// errors can't slip past review.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn read_kernel_init_size_x86_64_short_file_errors() {
+        use std::io::Write;
+
+        let mut f = tempfile::NamedTempFile::new().expect("tempfile");
+        // Only 0x100 bytes — well short of the 0x264 needed.
+        let truncated = vec![0u8; 0x100];
+        f.write_all(&truncated).expect("write truncated");
+        f.flush().expect("flush");
+
+        let result = read_kernel_init_size(f.path());
+        assert!(
+            result.is_err(),
+            "truncated file must fail; got: {result:?}",
+        );
+    }
+
+    /// Helper: an all-zero MemoryBudget for spread-syntax in tests.
+    fn zero_budget() -> MemoryBudget {
+        MemoryBudget {
+            uncompressed_initramfs_bytes: 0,
+            compressed_initrd_bytes: 0,
+            kernel_init_size: 0,
+            shm_bytes: 0,
+        }
+    }
+}

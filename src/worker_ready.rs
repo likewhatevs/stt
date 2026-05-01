@@ -213,3 +213,94 @@ pub const WORKER_STDERR_PREFIX: &str = "jemalloc-alloc-worker:";
 /// `pid=` / `bytes=` tail is NOT part of the constant, matching
 /// the [`WORKER_STDERR_PREFIX`] convention.
 pub const WORKER_STDOUT_READY_PREFIX: &str = "jemalloc-alloc-worker ready";
+
+#[cfg(test)]
+mod tests {
+    // `super::` only — this file is dual-compiled (lib + bin) per the
+    // module-doc dual-compilation constraint. `crate::` resolves to two
+    // different crates; `super::` reaches this file's own items
+    // identically under both compilation paths.
+    use super::*;
+
+    /// `worker_ready_marker_path` formats the pid as a decimal ASCII
+    /// suffix on the canonical prefix. Pins the wire-format contract
+    /// the worker (in `src/bin/jemalloc_alloc_worker.rs`) and the
+    /// poller ([`crate::worker_ready_wait::wait_for_worker_ready`])
+    /// agree on. A rename of the prefix or a switch to hex/zero-pad
+    /// pid formatting would surface here.
+    #[test]
+    fn worker_ready_marker_path_decimal_pid_suffix() {
+        assert_eq!(
+            worker_ready_marker_path(0),
+            "/tmp/ktstr-worker-ready-0",
+        );
+        assert_eq!(
+            worker_ready_marker_path(1),
+            "/tmp/ktstr-worker-ready-1",
+        );
+        assert_eq!(
+            worker_ready_marker_path(12345),
+            "/tmp/ktstr-worker-ready-12345",
+        );
+        assert_eq!(
+            worker_ready_marker_path(u32::MAX),
+            format!("/tmp/ktstr-worker-ready-{}", u32::MAX),
+        );
+    }
+
+    /// The path produced by `worker_ready_marker_path` always begins
+    /// with `WORKER_READY_MARKER_PREFIX`. Test-side assertions that
+    /// match against the prefix alone (rather than re-deriving the
+    /// full path) stay correct only as long as this invariant holds.
+    #[test]
+    fn worker_ready_marker_path_starts_with_prefix() {
+        for pid in [0, 1, 100, 65535, u32::MAX] {
+            let path = worker_ready_marker_path(pid);
+            assert!(
+                path.starts_with(WORKER_READY_MARKER_PREFIX),
+                "path {path:?} must start with prefix {:?}",
+                WORKER_READY_MARKER_PREFIX,
+            );
+        }
+    }
+
+    /// Pin the literal prefix value. The worker binary writes a file
+    /// at this path; integration tests grep for the prefix; a
+    /// rename-without-coordinated-update would silently desync the
+    /// two halves. Pin the literal so the rename surfaces as a test
+    /// failure, not as a poll timeout.
+    #[test]
+    fn worker_ready_marker_prefix_literal() {
+        assert_eq!(
+            WORKER_READY_MARKER_PREFIX,
+            "/tmp/ktstr-worker-ready-",
+        );
+    }
+
+    /// Pin the literal env-var name. The worker reads this env var
+    /// to optionally override the default pid-scoped path; tests in
+    /// `tests/jemalloc_alloc_worker_exit_codes.rs` and
+    /// `tests/ctprof_capture_jemalloc_wiring.rs` reference the same
+    /// const via the `pub` re-export. A typo on either side would
+    /// silently break the override path.
+    #[test]
+    fn worker_ready_marker_override_env_literal() {
+        assert_eq!(
+            WORKER_READY_MARKER_OVERRIDE_ENV,
+            "KTSTR_WORKER_READY_MARKER_OVERRIDE",
+        );
+    }
+
+    /// Pin the worker's stderr-line prefix and stdout-ready prefix
+    /// literals. Both are exposed for host-side test grepping; a
+    /// rename without updating callers would silently lose all
+    /// matches.
+    #[test]
+    fn worker_log_prefix_literals() {
+        assert_eq!(WORKER_STDERR_PREFIX, "jemalloc-alloc-worker:");
+        assert_eq!(
+            WORKER_STDOUT_READY_PREFIX,
+            "jemalloc-alloc-worker ready",
+        );
+    }
+}
