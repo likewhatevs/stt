@@ -590,3 +590,183 @@ static __KTSTR_ENTRY_DUMP_TRIGGER: ktstr::test_support::KtstrTestEntry =
         expect_err: true,
         ..ktstr::test_support::KtstrTestEntry::DEFAULT
     };
+
+// ----------------------------------------------------------------------------
+// `#[test] #[ignore]` shims — cargo nextest entry points
+// ----------------------------------------------------------------------------
+//
+// The five scenarios above are registered with the `KTSTR_TESTS`
+// distributed_slice and run via `cargo ktstr test --filter <name>`,
+// which is the canonical pattern for tests that need a real KVM VM
+// (see `failure_dump_e2e.rs`, `eevdf_tests.rs`, `scenario_coverage.rs`).
+//
+// The shims below let the same scenarios surface under
+// `cargo nextest run --run-ignored all` by shelling out to
+// `cargo ktstr test --filter <scenario_name>`. Each shim is gated
+// `#[ignore]` because:
+//   - VM boot requires a built kernel image cache (~10-100MB),
+//     a built scx-ktstr scheduler binary, /dev/kvm access,
+//     `kernel.perf_event_paranoid <= 2` for the perf-counter test,
+//     and CONFIG_SCHED_DEADLINE in the guest kernel for the Deadline test.
+//   - Each test takes ~10-30 seconds (boot + run + freeze + teardown).
+//   - Default `cargo nextest run` would hang or fail on hosts
+//     without these prerequisites.
+//
+// Run all five via:
+//
+// ```bash
+// cargo nextest run --test vm_integration --run-ignored all
+// # OR (canonical):
+// cargo ktstr test --kernel ../linux \
+//     --filter "vm_integration_dsq_and_rq_walker|\
+// vm_integration_perf_counters_capture|\
+// vm_integration_event_counter_timeline|\
+// vm_integration_sched_deadline|\
+// vm_integration_failure_dump_trigger"
+// ```
+
+/// Locate the `cargo-ktstr` binary built for this test pass.
+/// `CARGO_BIN_EXE_<name>` is set at compile time for every `[[bin]]`
+/// the workspace declares, so the shims resolve the absolute path
+/// without shelling out to `which cargo-ktstr`.
+const CARGO_KTSTR_BINARY: &str = env!("CARGO_BIN_EXE_cargo-ktstr");
+
+/// Resolve the linux source tree (`../linux` relative to this
+/// crate). VM boot requires a kernel cache populated from this
+/// source; if the directory is missing, the shim panics with an
+/// actionable message rather than a silent timeout.
+fn linux_source_dir() -> std::path::PathBuf {
+    let crate_root = env!("CARGO_MANIFEST_DIR");
+    std::path::PathBuf::from(crate_root).join("..").join("linux")
+}
+
+/// Drive one `vm_integration_*` scenario via `cargo ktstr test`,
+/// asserting the subprocess exits 0 (or, for `expect_err: true`
+/// tests, that the test framework reports it as expected-failure
+/// rather than wholesale subprocess error).
+///
+/// Stdout + stderr are captured and surfaced in the panic message
+/// on failure so the operator can pinpoint which assertion or boot
+/// stage failed without re-running the test under verbose logging.
+fn drive_ktstr_test(scenario_name: &str) {
+    let source = linux_source_dir();
+    assert!(
+        source.is_dir(),
+        "../linux source tree missing — VM tests need a kernel source \
+         tree. Expected: {}",
+        source.display(),
+    );
+
+    let output = std::process::Command::new(CARGO_KTSTR_BINARY)
+        .arg("ktstr")
+        .arg("test")
+        .arg("--kernel")
+        .arg(&source)
+        .arg("--")
+        .arg("--filter")
+        .arg(scenario_name)
+        .output()
+        .expect("spawn cargo-ktstr test");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "cargo ktstr test --filter {scenario_name} failed (exit={:?})\n\
+         STDOUT:\n{stdout}\n\nSTDERR:\n{stderr}",
+        output.status.code(),
+    );
+}
+
+/// G4 — DSQ + rq->scx walker.
+///
+/// Boots scx-ktstr `--stall-after=1`, asserts `dsq_states` and
+/// `rq_scx_states` in the failure-dump JSON are both non-empty.
+/// Pins the kernel-facing walker pipeline end-to-end on a frozen
+/// VM. See `scenario_dsq_and_rq_walker_populates_failure_dump`
+/// above for the full scenario body.
+///
+/// Prerequisites:
+/// - `../linux` kernel source tree
+/// - `scx-ktstr` scheduler binary on `$PATH`
+/// - `/dev/kvm` accessible
+/// - guest kernel with CONFIG_SCHED_CLASS_EXT + CONFIG_DEBUG_INFO_BTF
+#[test]
+#[ignore = "long-running VM integration test (~30s); requires KVM, \
+            ../linux, scx-ktstr binary, kernel BTF. Run via \
+            `cargo nextest run --run-ignored all` or \
+            `cargo ktstr test --kernel ../linux \
+            --filter vm_integration_dsq_and_rq_walker`."]
+fn vm_integration_dsq_and_rq_walker() {
+    drive_ktstr_test("vm_integration_dsq_and_rq_walker");
+}
+
+/// G5 — Per-vCPU perf counters via `perf_event_open(exclude_host=1)`.
+///
+/// Boots a CpuSpin workload, asserts `vcpu_perf_at_freeze` carries
+/// at least one non-null `VcpuPerfSample` after the stall freeze.
+///
+/// Prerequisites: same as DSQ test, plus
+/// - `kernel.perf_event_paranoid <= 2` on the host
+/// - `CAP_PERFMON` (or root) in the test runner
+#[test]
+#[ignore = "long-running VM integration test (~30s); requires KVM, \
+            ../linux, scx-ktstr binary, AND kernel.perf_event_paranoid \
+            <= 2 on the host (CAP_PERFMON or root). Run via \
+            `cargo nextest run --run-ignored all` or \
+            `cargo ktstr test --kernel ../linux \
+            --filter vm_integration_perf_counters_capture`."]
+fn vm_integration_perf_counters_capture() {
+    drive_ktstr_test("vm_integration_perf_counters_capture");
+}
+
+/// G6 — Event-counter timeline (per-tick sched-event capture).
+///
+/// Asserts `event_counter_timeline` non-empty after a 15s run
+/// window. Pins the per-monitor-tick capture loop + SCX_EV_*
+/// offset resolution + `EventCounterCapture` attach path.
+#[test]
+#[ignore = "long-running VM integration test (~45s, longer duration \
+            for timeline samples); requires KVM, ../linux, \
+            scx-ktstr. Run via `cargo nextest run --run-ignored all` \
+            or `cargo ktstr test --kernel ../linux \
+            --filter vm_integration_event_counter_timeline`."]
+fn vm_integration_event_counter_timeline() {
+    drive_ktstr_test("vm_integration_event_counter_timeline");
+}
+
+/// G9 — `SchedPolicy::Deadline` real `sched_setattr(2)` invocation.
+///
+/// Spawns a CpuSpin worker under SCHED_DEADLINE 5% bandwidth
+/// reservation; asserts the worker reports `completed=true` and
+/// `work_units > 0`. Pins the syscall ABI end-to-end on a real
+/// CONFIG_SCHED_DEADLINE kernel.
+///
+/// Distinct from the other tests: no stall, just exercises the
+/// `sched_setattr` path. `expect_err: false` because the success
+/// path is what's under test.
+#[test]
+#[ignore = "VM integration test (~10s); requires KVM, ../linux, \
+            scx-ktstr, AND guest kernel with CONFIG_SCHED_DEADLINE. \
+            Run via `cargo nextest run --run-ignored all` or \
+            `cargo ktstr test --kernel ../linux \
+            --filter vm_integration_sched_deadline`."]
+fn vm_integration_sched_deadline() {
+    drive_ktstr_test("vm_integration_sched_deadline");
+}
+
+/// G16 — Failure-dump trigger, full-stack invariants.
+///
+/// Asserts `schema == "single"`, `maps` non-empty,
+/// `vcpu_regs` non-empty after a stall freeze. Pins three
+/// cross-pipeline invariants independent of which BPF struct
+/// happens to be inspected.
+#[test]
+#[ignore = "long-running VM integration test (~30s); requires KVM, \
+            ../linux, scx-ktstr. Run via \
+            `cargo nextest run --run-ignored all` or \
+            `cargo ktstr test --kernel ../linux \
+            --filter vm_integration_failure_dump_trigger`."]
+fn vm_integration_failure_dump_trigger() {
+    drive_ktstr_test("vm_integration_failure_dump_trigger");
+}

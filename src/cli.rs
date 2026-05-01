@@ -2105,6 +2105,12 @@ const VALIDATE_CONFIG_CRITICAL: &[(&str, &str)] = &[
         "CONFIG_BPF_EVENTS",
         "required for BPF kprobe/tracepoint attachment (depends on KPROBE_EVENTS + PERF_EVENTS)",
     ),
+    (
+        "CONFIG_VIRTIO_BLK",
+        "required for ktstr DiskConfig — backs /dev/vd* in the guest. Depends on VIRTIO + BLOCK; \
+         a user --extra-kconfig that strips BLOCK would silently disable this and disk-IO WorkTypes \
+         would fail with a confusing 'no /dev/vda' inside the guest instead of a clear build error",
+    ),
 ];
 
 pub fn validate_kernel_config(kernel_dir: &std::path::Path) -> Result<()> {
@@ -9093,7 +9099,8 @@ mod tests {
              CONFIG_BPF_SYSCALL=y\n\
              CONFIG_FTRACE=y\n\
              CONFIG_KPROBE_EVENTS=y\n\
-             CONFIG_BPF_EVENTS=y\n",
+             CONFIG_BPF_EVENTS=y\n\
+             CONFIG_VIRTIO_BLK=y\n",
         )
         .unwrap();
         assert!(validate_kernel_config(dir.path()).is_ok());
@@ -9171,7 +9178,8 @@ mod tests {
              CONFIG_BPF_SYSCALL=y\r\n\
              CONFIG_FTRACE=y \n\
              CONFIG_KPROBE_EVENTS=y\r\n\
-             CONFIG_BPF_EVENTS=y \n",
+             CONFIG_BPF_EVENTS=y \n\
+             CONFIG_VIRTIO_BLK=y\r\n",
         )
         .unwrap();
         let result = validate_kernel_config(dir.path());

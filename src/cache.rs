@@ -541,6 +541,24 @@ impl CacheEntry {
         self.metadata.has_vmlinux.then(|| self.path.join("vmlinux"))
     }
 
+    /// Absolute path to the cached btrfs disk template
+    /// (`<entry>/disk-template.img`).
+    ///
+    /// The template is built once per cache entry alongside the
+    /// kernel image; per-test virtio-blk backings are reflink-copied
+    /// from this file at fan-out time. The template depends on the
+    /// kernel's btrfs kconfig (kernel + mkfs.btrfs version), so it
+    /// lives in the same cache entry — invalidating the kernel
+    /// cache entry invalidates the template.
+    ///
+    /// Filesystem existence is NOT checked: callers verify with
+    /// `Path::exists()` and fall back to building the template on
+    /// the first virtio-blk fan-out attempt. The build-pipeline
+    /// wiring is a deferred follow-up.
+    pub fn disk_template_path(&self) -> PathBuf {
+        self.path.join("disk-template.img")
+    }
+
     /// Compare this entry's kconfig hash against `current_hash`.
     pub fn kconfig_status(&self, current_hash: &str) -> KconfigStatus {
         match self.metadata.ktstr_kconfig_hash.as_deref() {

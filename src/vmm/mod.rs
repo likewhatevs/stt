@@ -27,6 +27,8 @@ pub mod shm_ring;
 mod terminal;
 pub mod topology;
 mod vcpu_panic;
+pub mod disk_config;
+pub(crate) mod virtio_blk;
 pub(crate) mod virtio_console;
 mod vmlinux;
 
@@ -1242,6 +1244,14 @@ pub struct KtstrVm {
     /// Files to include in the guest initramfs at their archive paths.
     /// Each entry is (archive_path, host_path).
     include_files: Vec<(String, PathBuf)>,
+    /// v0 holds at most one DiskConfig; rendered as `/dev/vda`.
+    /// Vec retained for future multi-disk expansion. The backing
+    /// file is produced by the template-VM lifecycle (one-time
+    /// guest-side `mkfs.<fstype>` against a sparse image, cached
+    /// alongside the kernel; per-test reflink-copy at fan-out).
+    /// Template lifecycle wiring is a deferred follow-up; today
+    /// `init_virtio_blk` opens a fresh sparse `tempfile` per test.
+    disks: Vec<disk_config::DiskConfig>,
     /// Embed busybox in the initramfs for shell mode.
     busybox: bool,
     /// Forward COM1 (kernel console) to stderr in real-time during
@@ -1435,6 +1445,10 @@ impl KtstrVm {
                 .context("register virtio-console irqfd")?;
         }
 
+        // Optional virtio-blk for shell mode. `None` when the builder
+        // has no disks attached.
+        let virtio_blk = self.init_virtio_blk(&vm)?;
+
         // Non-interactive exec mode (--exec) does not need a TTY.
         let exec_mode = self.exec_cmd.is_some();
 
@@ -1504,6 +1518,7 @@ impl KtstrVm {
             &com1,
             &com2,
             Some(&virtio_con),
+            virtio_blk.as_ref(),
             &kill,
             &freeze,
             &ap_pins,
@@ -1788,6 +1803,7 @@ impl KtstrVm {
             &com1,
             &com2,
             Some(&virtio_con),
+            virtio_blk.as_ref(),
             &kill,
             &freeze,
             &bsp_parked,
@@ -1855,6 +1871,80 @@ impl KtstrVm {
             eprintln!("Connection to VM closed.");
         }
         Ok(())
+    }
+
+    /// Construct the optional virtio-blk device for the configured
+    /// disk in `self.disks`. Returns `Ok(None)` when no disk is
+    /// attached.
+    ///
+    /// On `Ok(Some(_))`, the returned `Arc<PiMutex<VirtioBlk>>` has:
+    ///   - the backing file open (sparse temp file when
+    ///     `disk.backing_path` is `None`, otherwise the operator-supplied
+    ///     path),
+    ///   - the file extended to `disk.capacity_bytes()` (so unallocated
+    ///     reads return zeros via short-read padding in `handle_read`),
+    ///   - the throttle wired in,
+    ///   - the irqfd registered with the VM,
+    ///   - guest memory set so subsequent `process_requests` calls can
+    ///     read/write descriptor data.
+    ///
+    /// The framework reserves a single MMIO base + IRQ pair
+    /// (`VIRTIO_BLK_MMIO_BASE` / `VIRTIO_BLK_IRQ`); the builder's
+    /// `.disk()` enforces the single-disk constraint by overwriting
+    /// any previous disk on each call.
+    fn init_virtio_blk(
+        &self,
+        vm: &kvm::KtstrKvm,
+    ) -> Result<Option<Arc<PiMutex<virtio_blk::VirtioBlk>>>> {
+        if self.disks.is_empty() {
+            return Ok(None);
+        }
+        let disk = &self.disks[0];
+
+        // Allocate a sparse tempfile as the backing. The proper
+        // path is the template-VM lifecycle (one-time guest-side
+        // mkfs.btrfs against a sparse image, snapshot, cache
+        // alongside kernel; per-test reflink-copy at fan-out — see
+        // disk_config.rs module doc). That pipeline wires into
+        // cargo-ktstr's kernel build path and is a deferred
+        // follow-up. Until it lands, every test gets a fresh empty
+        // sparse file. `tempfile::tempfile()` returns a File whose
+        // underlying path is unlinked at creation — the kernel
+        // reclaims storage when the device drops the File.
+        let backing =
+            tempfile::tempfile().context("create virtio-blk sparse temp backing file")?;
+        // Make sure the file covers the advertised capacity. set_len
+        // creates a sparse file: holes don't consume disk space until
+        // written.
+        let capacity = disk.capacity_bytes();
+        backing
+            .set_len(capacity)
+            .context("set virtio-blk backing file length")?;
+
+        let mut blk =
+            virtio_blk::VirtioBlk::with_options(backing, capacity, disk.throttle, disk.read_only);
+        blk.set_mem((*vm.guest_mem).clone());
+        let blk_arc = Arc::new(PiMutex::new(blk));
+
+        // irqfd registration. On x86_64 with split irqchip, IOAPIC
+        // routing is unavailable; matches the virtio-console
+        // constraint and we simply skip the irqfd in that case (the
+        // guest still polls via the interrupt-status MMIO register;
+        // throughput is degraded but functional).
+        #[cfg(target_arch = "x86_64")]
+        if !vm.split_irqchip {
+            vm.vm_fd
+                .register_irqfd(blk_arc.lock().irq_evt(), kvm::VIRTIO_BLK_IRQ)
+                .context("register virtio-blk irqfd")?;
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            vm.vm_fd
+                .register_irqfd(blk_arc.lock().irq_evt(), kvm::VIRTIO_BLK_IRQ)
+                .context("register virtio-blk irqfd")?;
+        }
+
+        Ok(Some(blk_arc))
     }
 
     /// Create the KVM VM and optionally load the kernel.
@@ -2550,6 +2640,21 @@ impl KtstrVm {
             kvm::VIRTIO_CONSOLE_MMIO_BASE,
             kvm::VIRTIO_CONSOLE_IRQ,
         ));
+        // Virtio-block MMIO device — appended only when the builder
+        // attached at least one disk. The kernel's virtio_mmio_cmdline
+        // parser registers a MMIO transport per `virtio_mmio.device=`
+        // token; the order on the cmdline determines the device-probe
+        // order, which in turn determines the `/dev/vd{a,b,...}`
+        // assignment. Console-first then blk matches the expected
+        // `/dev/vda = first disk` mapping.
+        if !self.disks.is_empty() {
+            cmdline.push_str(&format!(
+                " virtio_mmio.device={:#x}@{:#x}:{}",
+                virtio_blk::VIRTIO_MMIO_SIZE,
+                kvm::VIRTIO_BLK_MMIO_BASE,
+                kvm::VIRTIO_BLK_IRQ,
+            ));
+        }
         if self.shm_size > 0 {
             let mem_size = (memory_mb as u64) << 20;
             let shm_base = mem_size - self.shm_size;
@@ -2679,6 +2784,12 @@ impl KtstrVm {
                 .context("register serial2 irqfd")?;
         }
 
+        // Optional virtio-blk: `None` when no disks are attached,
+        // `Some` when the builder has at least one `DiskConfig`.
+        // Constructed BEFORE we tear down vm.vcpus so the helper
+        // can still read `vm.guest_mem` and the irqchip state.
+        let virtio_blk = self.init_virtio_blk(&vm)?;
+
         let kill = Arc::new(AtomicBool::new(false));
         // Failure-dump freeze rendezvous: broadcast `freeze` flag plus a
         // per-vCPU `parked` ACK, parallel to the existing `kill` +
@@ -2740,6 +2851,7 @@ impl KtstrVm {
             &com1,
             &com2,
             None,
+            virtio_blk.as_ref(),
             &kill,
             &freeze,
             &ap_pins,
@@ -4115,6 +4227,7 @@ impl KtstrVm {
                     &com1,
                     &com2,
                     None,
+                    virtio_blk.as_ref(),
                     &kill,
                     &freeze,
                     &bsp_parked,
@@ -4189,6 +4302,7 @@ impl KtstrVm {
         com1: &Arc<PiMutex<console::Serial>>,
         com2: &Arc<PiMutex<console::Serial>>,
         virtio_con: Option<&Arc<PiMutex<virtio_console::VirtioConsole>>>,
+        virtio_blk: Option<&Arc<PiMutex<virtio_blk::VirtioBlk>>>,
         kill: &Arc<AtomicBool>,
         freeze: &Arc<AtomicBool>,
         pin_targets: &[Option<usize>],
@@ -4217,6 +4331,7 @@ impl KtstrVm {
             let com1_clone = com1.clone();
             let com2_clone = com2.clone();
             let vc_clone = virtio_con.cloned();
+            let vblk_clone = virtio_blk.cloned();
             let exited = Arc::new(AtomicBool::new(false));
             let exited_clone = exited.clone();
             let parked = Arc::new(AtomicBool::new(false));
@@ -4261,6 +4376,7 @@ impl KtstrVm {
                             &com1_clone,
                             &com2_clone,
                             vc_clone.as_ref(),
+                            vblk_clone.as_ref(),
                             &kill_clone,
                             &freeze_clone,
                             &parked_clone,
@@ -4719,6 +4835,7 @@ impl KtstrVm {
         com1: &Arc<PiMutex<console::Serial>>,
         com2: &Arc<PiMutex<console::Serial>>,
         virtio_con: Option<&Arc<PiMutex<virtio_console::VirtioConsole>>>,
+        virtio_blk: Option<&Arc<PiMutex<virtio_blk::VirtioBlk>>>,
         kill: &Arc<AtomicBool>,
         freeze: &Arc<AtomicBool>,
         bsp_parked: &Arc<AtomicBool>,
@@ -4764,7 +4881,13 @@ impl KtstrVm {
                         }
                         continue;
                     }
-                    match classify_exit(com1, com2, virtio_con.map(|a| a.as_ref()), &mut exit) {
+                    match classify_exit(
+                        com1,
+                        com2,
+                        virtio_con.map(|a| a.as_ref()),
+                        virtio_blk.map(|a| a.as_ref()),
+                        &mut exit,
+                    ) {
                         Some(ExitAction::Continue) | None => {}
                         Some(ExitAction::Shutdown) => {
                             exit_code = 0;
@@ -5193,6 +5316,7 @@ impl KtstrVm {
                  in this function and set numa_layout via \
                  allocate_and_register_memory in src/vmm/aarch64/kvm.rs",
             ),
+            !self.disks.is_empty(),
         )
         .context("create FDT")?;
         vm.guest_mem
@@ -5261,6 +5385,10 @@ pub struct KtstrVmBuilder {
     sched_enable_cmds: Vec<String>,
     sched_disable_cmds: Vec<String>,
     include_files: Vec<(String, PathBuf)>,
+    /// v0 holds at most one DiskConfig; rendered as `/dev/vda`.
+    /// Vec retained for future multi-disk expansion. See
+    /// [`KtstrVm::disks`].
+    disks: Vec<disk_config::DiskConfig>,
     busybox: bool,
     dmesg: bool,
     exec_cmd: Option<String>,
@@ -5316,6 +5444,7 @@ impl Default for KtstrVmBuilder {
             sched_enable_cmds: Vec::new(),
             sched_disable_cmds: Vec::new(),
             include_files: Vec::new(),
+            disks: Vec::new(),
             busybox: false,
             dmesg: false,
             exec_cmd: None,
@@ -5602,6 +5731,26 @@ impl KtstrVmBuilder {
         self
     }
 
+    /// Attach a disk to the VM. Each call replaces any previously
+    /// attached disk; the framework reserves a single MMIO + IRQ
+    /// pair, so today the VM exposes at most one virtio-blk device
+    /// at `/dev/vda`.
+    ///
+    /// The backing file is produced by a separate "template VM"
+    /// boot — a one-time guest-side `mkfs.<fstype>` formats the
+    /// cached image, then per-test boots reflink-copy that
+    /// template. The host never execs mkfs. Guest init auto-mounts
+    /// at `/mnt/disk0`. Test authors never run mkfs or mount —
+    /// they get a ready-to-use mounted filesystem.
+    ///
+    /// Template lifecycle wiring is a deferred follow-up (see
+    /// `disk_config.rs` module doc); today the device opens a
+    /// fresh sparse `tempfile` per test.
+    pub fn disk(mut self, disk: disk_config::DiskConfig) -> Self {
+        self.disks = vec![disk];
+        self
+    }
+
     /// Host path to `ktstr-jemalloc-probe`. When set, the probe is
     /// packed into the guest initramfs as an extra binary under
     /// `bin/` and resolves by bare name on the guest `PATH`. Tests
@@ -5826,6 +5975,7 @@ impl KtstrVmBuilder {
             sched_enable_cmds: self.sched_enable_cmds,
             sched_disable_cmds: self.sched_disable_cmds,
             include_files: self.include_files,
+            disks: self.disks,
             busybox: self.busybox,
             dmesg: self.dmesg,
             exec_cmd: self.exec_cmd,

@@ -5,10 +5,12 @@ use crate::vmm::aarch64::topology::mpidr_to_fdt_reg;
 use crate::vmm::kvm::{
     DRAM_START, FDT_MAX_SIZE, GIC_DIST_BASE, GIC_DIST_SIZE, GIC_REDIST_BASE,
     GIC_REDIST_SIZE_PER_CPU, SERIAL_IRQ, SERIAL_MMIO_BASE, SERIAL_MMIO_SIZE, SERIAL2_IRQ,
-    SERIAL2_MMIO_BASE, VIRTIO_CONSOLE_IRQ, VIRTIO_CONSOLE_MMIO_BASE,
+    SERIAL2_MMIO_BASE, VIRTIO_BLK_IRQ, VIRTIO_BLK_MMIO_BASE, VIRTIO_CONSOLE_IRQ,
+    VIRTIO_CONSOLE_MMIO_BASE,
 };
 use crate::vmm::numa_mem::NumaMemoryLayout;
 use crate::vmm::topology::Topology;
+use crate::vmm::virtio_blk;
 use crate::vmm::virtio_console;
 
 /// GIC phandle — unique identifier referenced by interrupt-parent properties.
@@ -59,6 +61,7 @@ pub fn create_fdt(
     hw_cache_level: u32,
     guest_l1_unified: bool,
     numa_layout: &NumaMemoryLayout,
+    has_virtio_blk: bool,
 ) -> Result<Vec<u8>> {
     // SHM base address (top of guest DRAM minus SHM size).
     let shm_base = if shm_size > 0 {
@@ -124,6 +127,18 @@ pub fn create_fdt(
         virtio_console::VIRTIO_MMIO_SIZE,
         VIRTIO_CONSOLE_IRQ,
     )?;
+
+    // /virtio_mmio — virtio-block (only when at least one disk
+    // is attached; absent FDT node leaves the slot dark so the
+    // guest does not probe a non-existent device).
+    if has_virtio_blk {
+        write_virtio_mmio(
+            &mut fdt,
+            VIRTIO_BLK_MMIO_BASE,
+            virtio_blk::VIRTIO_MMIO_SIZE,
+            VIRTIO_BLK_IRQ,
+        )?;
+    }
 
     // /timer — arm generic timer
     write_timer(&mut fdt)?;
@@ -570,6 +585,7 @@ mod tests {
             hw_cache_level,
             guest_l1_unified,
             &layout,
+            false,
         )
     }
 

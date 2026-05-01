@@ -643,6 +643,7 @@ pub mod prelude {
     // `ktstr_test_early_dispatch`, `run_ktstr_test`,
     // `resolve_scheduler`, `resolve_test_kernel`.
     pub use crate::topology::{LlcInfo, NodeMemInfo, TestTopology};
+    pub use crate::vmm::disk_config::{DiskConfig, Filesystem};
     pub use crate::workload::{
         AffinityIntent, ResolvedAffinity, CloneMode, MemPolicy, Migration, MpolFlags, Phase,
         SchedPolicy, WorkSpec, WorkType, WorkerReport, WorkloadConfig, WorkloadHandle, build_nodemask,

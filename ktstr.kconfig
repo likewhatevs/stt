@@ -67,11 +67,6 @@ CONFIG_SERIAL_8250_CONSOLE=y
 CONFIG_SERIAL_OF_PLATFORM=y
 CONFIG_SERIAL_AMBA_PL011=y
 CONFIG_SERIAL_AMBA_PL011_CONSOLE=y
-# Virtio-console: MMIO transport, creates /dev/hvc0 for shell mode.
-CONFIG_VIRTIO=y
-CONFIG_VIRTIO_MMIO=y
-CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
-CONFIG_VIRTIO_CONSOLE=y
 CONFIG_BLK_DEV_INITRD=y
 CONFIG_RD_LZ4=y
 CONFIG_TTY=y
@@ -86,6 +81,29 @@ CONFIG_SHMEM=y
 CONFIG_BINFMT_SCRIPT=y
 # x86 only — arm64 uses earlycon (auto-selected by PL011/8250 drivers).
 CONFIG_EARLY_PRINTK=y
+
+# -- Virtio device support --
+# VIRTIO + VIRTIO_MMIO are the transport layer the VMM exposes; both
+# are required for any virtio device (console, block, or net) to
+# probe. VIRTIO_MMIO_CMDLINE_DEVICES lets the kernel pick up the
+# `virtio_mmio.device=...` kernel cmdline entries the VMM appends so
+# devices land in deterministic probe order. The console device
+# powers /dev/hvc0 for shell mode; the block device is used by tests
+# that need a real disk (DiskConfig); the net device is used by
+# tests that need a NIC and is also a future-proofing knob (#20).
+CONFIG_VIRTIO=y
+CONFIG_VIRTIO_MMIO=y
+CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
+CONFIG_VIRTIO_CONSOLE=y
+CONFIG_VIRTIO_BLK=y
+CONFIG_VIRTIO_NET=y
+
+# -- Filesystems --
+# Btrfs: optional, for DiskConfig::Btrfs when the template-VM
+# lifecycle lands. Requires crypto deps (CRC32, BLAKE2B, SHA256,
+# ZLIB); if deps are not met, make olddefconfig silently drops it.
+# Not in VALIDATE_CONFIG_CRITICAL — v0 uses Filesystem::Raw.
+CONFIG_BTRFS_FS=y
 
 # -- Topology (required) --
 # Multi-socket/core/thread VMs with NUMA.

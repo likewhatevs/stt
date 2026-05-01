@@ -275,6 +275,13 @@ grok = { version = "2", default-features = false, features = ["fancy-regex"] }
 tracing-test = "0.2"
 trybuild = "1"
 mockito = "1"
+# `test-utils` feature on the existing virtio-queue dep — gates the
+# upstream `mock` module (`MockSplitQueue`, `desc_chain` builders)
+# used by virtio-blk descriptor-chain tests. Pinned as a separate
+# dev-dep entry rather than via `features = [...]` on the main
+# `[dependencies]` line so the mock infrastructure does NOT leak
+# into shipped binaries.
+virtio-queue = { version = "0.17", features = ["test-utils"] }
 
 [build-dependencies]
 cc = "1"
