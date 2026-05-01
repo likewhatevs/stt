@@ -2476,8 +2476,8 @@ pub(crate) fn reset() {
 /// JSON-parse failure of the model's response returns an empty
 /// metric set — matching the [`extract_metrics`] contract that
 /// extraction errors are non-fatal and the downstream
-/// [`Check`](crate::test_support::Check) evaluation reports each
-/// referenced metric as missing.
+/// [`MetricCheck`](crate::test_support::MetricCheck) evaluation reports
+/// each referenced metric as missing.
 ///
 /// No retry: under `LlamaSampler::greedy()` (deterministic ArgMax,
 /// no RNG state), a second inference call on the same prompt +
@@ -2496,7 +2496,7 @@ pub(crate) fn reset() {
 ///   inference hiccup") and the caller keeps going.
 /// - `Err(reason)` — the **model cache load** failed. This is a
 ///   setup-level problem (missing weights, bad SHA, corrupt GGUF).
-///   The `Check` evaluator translates the reason into a
+///   The `MetricCheck` evaluator translates the reason into a
 ///   `DetailKind::Other` entry on the `AssertResult` so the user
 ///   sees "LlmExtract model load failed: <reason>" instead of an
 ///   opaque "metric 'foo' not found" when the real failure was
@@ -5249,7 +5249,7 @@ mod tests {
         let _env_offline = EnvVarGuard::set(OFFLINE_ENV, "1");
         // A cache-load failure (the offline gate in this test) now
         // surfaces as `Err(reason)` rather than `Ok(Vec::new())` so
-        // the Check evaluator can thread the reason into the
+        // the MetricCheck evaluator can thread the reason into the
         // AssertResult. The "returns empty" test-name predates the
         // signature change — kept for git blame continuity.
         let err = extract_via_llm(

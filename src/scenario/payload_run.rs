@@ -35,7 +35,7 @@
 //! whose bytes span both streams.
 //!
 //! Stderr is still forwarded verbatim into the exit-code-mismatch
-//! detail produced by [`Check::ExitCodeEq`] (see the
+//! detail produced by [`MetricCheck::ExitCodeEq`] (see the
 //! `format_exit_mismatch` path) so failing binaries surface their
 //! error output directly.
 
@@ -50,7 +50,7 @@ use anyhow::{Context, Result, anyhow};
 use crate::assert::{AssertDetail, AssertResult, DetailKind};
 use crate::scenario::Ctx;
 use crate::test_support::{
-    Check, Metric, OutputFormat, Payload, PayloadKind, PayloadMetrics, extract_metrics,
+    MetricCheck, Metric, OutputFormat, Payload, PayloadKind, PayloadMetrics, extract_metrics,
 };
 
 /// Per-process monotonic counter for payload-invocation indexing.
@@ -88,7 +88,7 @@ fn next_payload_index() -> usize {
 /// (foreground, blocking) or `.spawn()` (background) to execute the
 /// payload's binary inside the guest VM and receive the extracted
 /// [`PayloadMetrics`] plus an [`AssertResult`] for any declared
-/// [`Check`]s.
+/// [`MetricCheck`]s.
 pub struct PayloadRun<'a> {
     ctx: &'a Ctx<'a>,
     payload: &'static Payload,
@@ -97,7 +97,7 @@ pub struct PayloadRun<'a> {
     args: Vec<String>,
     /// Effective check list. Initialized to `payload.default_checks`;
     /// `.check` appends, `.clear_checks` truncates.
-    checks: Vec<Check>,
+    checks: Vec<MetricCheck>,
     /// User-supplied relative cgroup name (from [`in_cgroup`]). The
     /// absolute path is resolved + validated at `.run()`/`.spawn()`.
     /// [`Cow`] keeps static-name callers zero-alloc while still
@@ -161,8 +161,8 @@ impl<'a> PayloadRun<'a> {
         self
     }
 
-    /// Append a [`Check`] to the effective check list.
-    pub fn check(mut self, c: Check) -> Self {
+    /// Append a [`MetricCheck`] to the effective check list.
+    pub fn check(mut self, c: MetricCheck) -> Self {
         self.checks.push(c);
         self
     }
@@ -211,7 +211,7 @@ impl<'a> PayloadRun<'a> {
     /// for it to exit, extracts metrics from its output per the
     /// payload's [`OutputFormat`] (stdout-primary with stderr
     /// fallback for `Json` / `LlmExtract`; no extraction for
-    /// `ExitCode`), and evaluates declared [`Check`]s into an
+    /// `ExitCode`), and evaluates declared [`MetricCheck`]s into an
     /// [`AssertResult`]. See the module-level
     /// `# Stdout-primary, stderr-fallback metric extraction`
     /// section for the full contract.
@@ -332,7 +332,7 @@ fn payload_binary(payload: &Payload) -> Result<&'static str> {
 /// 3. Emits a paired [`MSG_TYPE_PAYLOAD_METRICS`] SHM message with
 ///    `metrics: vec![]` so per-invocation ordering still aligns with
 ///    sidecar entries.
-/// 4. Evaluates `Check::ExitCodeEq` checks guest-side and returns
+/// 4. Evaluates `MetricCheck::ExitCodeEq` checks guest-side and returns
 ///    the resulting [`AssertResult`] (passing when no ExitCodeEq
 ///    check is declared or every declared one matches `exit_code`).
 ///    Metric-level checks (`Min`/`Max`/`Range`/`Exists`) cannot be
@@ -353,7 +353,7 @@ fn payload_binary(payload: &Payload) -> Result<&'static str> {
 /// them.
 fn evaluate(
     payload: &Payload,
-    checks: &[Check],
+    checks: &[MetricCheck],
     output: SpawnOutput,
 ) -> (AssertResult, PayloadMetrics) {
     if let OutputFormat::LlmExtract(hint) = payload.output {
@@ -492,7 +492,7 @@ fn emit_raw_payload_output_to_shm(raw: &crate::test_support::RawPayloadOutput) {
 /// scanning the SHM ring in order sees the pair adjacent; that
 /// adjacency is observability, not pairing semantics.
 ///
-/// Check handling: `Check::ExitCodeEq` is evaluated guest-side here
+/// MetricCheck handling: `MetricCheck::ExitCodeEq` is evaluated guest-side here
 /// via [`exit_code_mismatch_detail`] because the exit code is
 /// available in `output.exit_code`; the resulting detail (if any) is
 /// folded into the returned `AssertResult`. Metric-level checks
@@ -517,24 +517,24 @@ fn evaluate_llm_extract_deferred(
     hint: Option<&'static str>,
     metric_hints: &'static [crate::test_support::MetricHint],
     metric_bounds: Option<&'static crate::test_support::MetricBounds>,
-    checks: &[Check],
+    checks: &[MetricCheck],
 ) -> (AssertResult, PayloadMetrics) {
     let bad: Vec<String> = checks
         .iter()
-        .filter(|c| !matches!(c, Check::ExitCodeEq(_)))
+        .filter(|c| !matches!(c, MetricCheck::ExitCodeEq(_)))
         .map(|c| match c {
-            Check::Min { metric, value } => format!("Min {{ metric: {metric:?}, value: {value} }}"),
-            Check::Max { metric, value } => format!("Max {{ metric: {metric:?}, value: {value} }}"),
-            Check::Range { metric, lo, hi } => {
+            MetricCheck::Min { metric, value } => format!("Min {{ metric: {metric:?}, value: {value} }}"),
+            MetricCheck::Max { metric, value } => format!("Max {{ metric: {metric:?}, value: {value} }}"),
+            MetricCheck::Range { metric, lo, hi } => {
                 format!("Range {{ metric: {metric:?}, lo: {lo}, hi: {hi} }}")
             }
-            Check::Exists(metric) => format!("Exists({metric:?})"),
+            MetricCheck::Exists(metric) => format!("Exists({metric:?})"),
             // `ExitCodeEq` is filtered out above; keep an explicit
-            // unreachable arm so a future Check variant added on
+            // unreachable arm so a future MetricCheck variant added on
             // the LlmExtract-acceptable side surfaces here at
             // compile time rather than rendering as a fallback
             // Debug.
-            Check::ExitCodeEq(_) => unreachable!(
+            MetricCheck::ExitCodeEq(_) => unreachable!(
                 "ExitCodeEq is filtered out of the bad list above; \
                  this arm is exhaustive-match coverage for the variant"
             ),
@@ -615,7 +615,7 @@ pub struct PayloadHandle {
     /// reach into a `None`.
     child: Option<std::process::Child>,
     payload: &'static Payload,
-    checks: Vec<Check>,
+    checks: Vec<MetricCheck>,
     /// `SIGCHLD` guard installed at spawn time. Kept alive until
     /// the handle is consumed (via `wait`/`kill`/Drop) so the
     /// child's eventual `waitpid` sees `SIG_DFL` instead of the
@@ -1043,15 +1043,15 @@ pub(crate) fn resolve_polarities_owned(
     }
 }
 
-/// Evaluate [`Check`]s against a [`PayloadMetrics`] and fold the
+/// Evaluate [`MetricCheck`]s against a [`PayloadMetrics`] and fold the
 /// verdict into an [`AssertResult`].
 ///
 /// Evaluation order:
-/// 1. [`Check::ExitCodeEq`] pre-pass — evaluated FIRST so a
+/// 1. [`MetricCheck::ExitCodeEq`] pre-pass — evaluated FIRST so a
 ///    misconfigured binary fails with an actionable exit-code error
 ///    rather than "metric X not found".
-/// 2. Metric-path checks ([`Check::Min`], [`Check::Max`],
-///    [`Check::Range`], [`Check::Exists`]).
+/// 2. Metric-path checks ([`MetricCheck::Min`], [`MetricCheck::Max`],
+///    [`MetricCheck::Range`], [`MetricCheck::Exists`]).
 ///
 /// `stderr` is folded into the exit-code-mismatch detail when
 /// present — when a binary fails with "expected 0 got 1", the
@@ -1061,7 +1061,7 @@ pub(crate) fn resolve_polarities_owned(
 /// Missing metrics fail loudly — a `Min` / `Max` / `Range` / `Exists`
 /// check against an absent metric reports a "not found" detail
 /// instead of silently passing.
-fn evaluate_checks(checks: &[Check], pm: &PayloadMetrics, stderr: &str) -> AssertResult {
+fn evaluate_checks(checks: &[MetricCheck], pm: &PayloadMetrics, stderr: &str) -> AssertResult {
     let mut result = AssertResult::pass();
     // Pre-pass: exit-code checks first. Delegates to
     // `exit_code_mismatch_detail` so the detail's kind + message
@@ -1077,7 +1077,7 @@ fn evaluate_checks(checks: &[Check], pm: &PayloadMetrics, stderr: &str) -> Asser
     // Metric-path pass.
     for check in checks {
         let detail = match check {
-            Check::Min { metric, value } => pm.get(metric).map_or_else(
+            MetricCheck::Min { metric, value } => pm.get(metric).map_or_else(
                 || Some(missing_metric(metric)),
                 |actual| {
                     (actual < *value).then(|| AssertDetail {
@@ -1086,7 +1086,7 @@ fn evaluate_checks(checks: &[Check], pm: &PayloadMetrics, stderr: &str) -> Asser
                     })
                 },
             ),
-            Check::Max { metric, value } => pm.get(metric).map_or_else(
+            MetricCheck::Max { metric, value } => pm.get(metric).map_or_else(
                 || Some(missing_metric(metric)),
                 |actual| {
                     (actual > *value).then(|| AssertDetail {
@@ -1095,7 +1095,7 @@ fn evaluate_checks(checks: &[Check], pm: &PayloadMetrics, stderr: &str) -> Asser
                     })
                 },
             ),
-            Check::Range { metric, lo, hi } => pm.get(metric).map_or_else(
+            MetricCheck::Range { metric, lo, hi } => pm.get(metric).map_or_else(
                 || Some(missing_metric(metric)),
                 |actual| {
                     ((actual < *lo) || (actual > *hi)).then(|| AssertDetail {
@@ -1104,8 +1104,8 @@ fn evaluate_checks(checks: &[Check], pm: &PayloadMetrics, stderr: &str) -> Asser
                     })
                 },
             ),
-            Check::Exists(metric) => pm.get(metric).is_none().then(|| missing_metric(metric)),
-            Check::ExitCodeEq(_) => None, // already evaluated in pre-pass
+            MetricCheck::Exists(metric) => pm.get(metric).is_none().then(|| missing_metric(metric)),
+            MetricCheck::ExitCodeEq(_) => None, // already evaluated in pre-pass
         };
         if let Some(d) = detail {
             result.merge(AssertResult::fail(d));
@@ -1121,7 +1121,7 @@ fn missing_metric(metric: &str) -> AssertDetail {
     }
 }
 
-/// Scan `checks` for the first `Check::ExitCodeEq` whose expected
+/// Scan `checks` for the first `MetricCheck::ExitCodeEq` whose expected
 /// value differs from `actual_exit_code` and return a matching
 /// diagnostic [`AssertDetail`]. Returns `None` when no
 /// `ExitCodeEq` check is declared, or when every declared one
@@ -1131,14 +1131,14 @@ fn missing_metric(metric: &str) -> AssertDetail {
 /// LlmExtract evaluation in `crate::test_support::eval` so the two
 /// sites produce bit-identical details for the same inputs — without
 /// this helper they would drift on kind, message format, or the
-/// "which Check wins" order.
+/// "which MetricCheck wins" order.
 fn exit_code_mismatch_detail(
-    checks: &[Check],
+    checks: &[MetricCheck],
     actual_exit_code: i32,
     stderr: &str,
 ) -> Option<AssertDetail> {
     checks.iter().find_map(|c| match c {
-        Check::ExitCodeEq(expected) if actual_exit_code != *expected => Some(AssertDetail {
+        MetricCheck::ExitCodeEq(expected) if actual_exit_code != *expected => Some(AssertDetail {
             kind: DetailKind::Other,
             message: format_exit_mismatch(actual_exit_code, *expected, stderr),
         }),
@@ -1691,7 +1691,7 @@ fn spawn_with_cgroup_sync(handles: CgroupSyncHandles) -> Result<libc::pid_t> {
                 "cgroup-sync notify pipe: no pid written by child within 5s. \
                  The child's pre_exec likely failed before Step 1 (possibly \
                  EBADF on `notify_write_fd` because the fd number was \
-                 recycled by stdlib's internal pipe2). Check the spawn \
+                 recycled by stdlib's internal pipe2). MetricCheck the spawn \
                  thread's error for the underlying cause."
             );
         }
@@ -2383,12 +2383,12 @@ mod tests {
         let topo = TestTopology::synthetic(4, 1);
         let ctx = make_ctx(&cgroups, &topo);
         let run = PayloadRun::new(&ctx, &FIO_BINARY)
-            .check(Check::min("iops", 1000.0))
-            .check(Check::max("latency", 500.0));
+            .check(MetricCheck::min("iops", 1000.0))
+            .check(MetricCheck::max("latency", 500.0));
         assert_eq!(run.checks.len(), 2);
         let cleared = PayloadRun::new(&ctx, &FIO_BINARY)
             .clear_checks()
-            .check(Check::exit_code_eq(0));
+            .check(MetricCheck::exit_code_eq(0));
         assert_eq!(cleared.checks.len(), 1);
     }
 
@@ -2491,7 +2491,7 @@ mod tests {
             metrics: vec![],
             exit_code: 42,
         };
-        let checks = [Check::exit_code_eq(0), Check::min("iops", 100.0)];
+        let checks = [MetricCheck::exit_code_eq(0), MetricCheck::min("iops", 100.0)];
         let r = evaluate_checks(&checks, &pm, "");
         assert!(!r.passed);
         // exit-code failure short-circuits — only one detail, not
@@ -2511,7 +2511,7 @@ mod tests {
             metrics: vec![],
             exit_code: 1,
         };
-        let r = evaluate_checks(&[Check::exit_code_eq(0)], &pm, "fatal: config missing\n");
+        let r = evaluate_checks(&[MetricCheck::exit_code_eq(0)], &pm, "fatal: config missing\n");
         assert!(!r.passed);
         assert!(
             r.details[0].message.contains("fatal: config missing"),
@@ -2532,7 +2532,7 @@ mod tests {
             metrics: vec![],
             exit_code: 1,
         };
-        let r = evaluate_checks(&[Check::exit_code_eq(0)], &pm, "");
+        let r = evaluate_checks(&[MetricCheck::exit_code_eq(0)], &pm, "");
         assert!(!r.passed);
         // Empty stderr → no "stderr:" prefix in the detail.
         assert!(
@@ -2546,7 +2546,7 @@ mod tests {
     /// `std::process::ExitStatus::code()` returns `None` on
     /// signal death and the spawn layer maps that to `-1` (see
     /// `spawn_foreground`). A user who expects the signal-death
-    /// case can assert `Check::exit_code_eq(-1)`, and the pre-pass
+    /// case can assert `MetricCheck::exit_code_eq(-1)`, and the pre-pass
     /// comparison must pass under exact `i32` equality.
     #[test]
     fn evaluate_checks_exit_code_eq_negative_one_matches_signal_death() {
@@ -2555,7 +2555,7 @@ mod tests {
             metrics: vec![],
             exit_code: -1,
         };
-        let r = evaluate_checks(&[Check::exit_code_eq(-1)], &pm, "");
+        let r = evaluate_checks(&[MetricCheck::exit_code_eq(-1)], &pm, "");
         assert!(
             r.passed,
             "exit_code_eq(-1) must pass when exit_code == -1: {:?}",
@@ -2563,7 +2563,7 @@ mod tests {
         );
     }
 
-    /// Symmetric negative case: `Check::exit_code_eq(-1)` against a
+    /// Symmetric negative case: `MetricCheck::exit_code_eq(-1)` against a
     /// CLEAN exit (`exit_code == 0`) must fail and surface the
     /// mismatch with both integers printed so the user sees what
     /// they asked for vs what happened.
@@ -2574,7 +2574,7 @@ mod tests {
             metrics: vec![],
             exit_code: 0,
         };
-        let r = evaluate_checks(&[Check::exit_code_eq(-1)], &pm, "");
+        let r = evaluate_checks(&[MetricCheck::exit_code_eq(-1)], &pm, "");
         assert!(!r.passed);
         let msg = &r.details[0].message;
         assert!(
@@ -2587,7 +2587,7 @@ mod tests {
         );
     }
 
-    /// `Check::Range { lo: 100, hi: 50 }` — reversed bounds that make
+    /// `MetricCheck::Range { lo: 100, hi: 50 }` — reversed bounds that make
     /// `lo > hi` — currently fails EVERY finite metric value because
     /// the evaluator tests `(actual < lo) || (actual > hi)` and both
     /// halves are always true for an empty interval. No up-front
@@ -2599,7 +2599,7 @@ mod tests {
     #[test]
     fn evaluate_checks_range_reversed_bounds_fails_every_finite_value() {
         use crate::test_support::{Metric, MetricSource, MetricStream, Polarity};
-        let reversed = Check::range("iops", 100.0, 50.0);
+        let reversed = MetricCheck::range("iops", 100.0, 50.0);
         for actual in &[0.0, 50.0, 75.0, 100.0, 200.0, -1000.0, 1e9] {
             let pm = PayloadMetrics {
                 payload_index: 0,
@@ -2772,7 +2772,7 @@ mod tests {
             metrics: vec![],
             exit_code: 0,
         };
-        let checks = [Check::min("iops", 100.0)];
+        let checks = [MetricCheck::min("iops", 100.0)];
         let r = evaluate_checks(&checks, &pm, "");
         assert!(!r.passed);
         assert!(
@@ -2796,7 +2796,7 @@ mod tests {
             }],
             exit_code: 0,
         };
-        let r = evaluate_checks(&[Check::min("iops", 100.0)], &pm, "");
+        let r = evaluate_checks(&[MetricCheck::min("iops", 100.0)], &pm, "");
         assert!(!r.passed);
         assert!(r.details[0].message.contains("below minimum"));
     }
@@ -2815,7 +2815,7 @@ mod tests {
             }],
             exit_code: 0,
         };
-        let r = evaluate_checks(&[Check::max("lat", 500.0)], &pm, "");
+        let r = evaluate_checks(&[MetricCheck::max("lat", 500.0)], &pm, "");
         assert!(!r.passed);
         assert!(r.details[0].message.contains("exceeds maximum"));
     }
@@ -2834,7 +2834,7 @@ mod tests {
             }],
             exit_code: 0,
         };
-        let r = evaluate_checks(&[Check::range("cpu", 0.0, 100.0)], &pm, "");
+        let r = evaluate_checks(&[MetricCheck::range("cpu", 0.0, 100.0)], &pm, "");
         assert!(!r.passed);
         assert!(r.details[0].message.contains("outside"));
     }
@@ -2846,7 +2846,7 @@ mod tests {
             metrics: vec![],
             exit_code: 0,
         };
-        let r = evaluate_checks(&[Check::exists("thing")], &pm, "");
+        let r = evaluate_checks(&[MetricCheck::exists("thing")], &pm, "");
         assert!(!r.passed);
     }
 
@@ -2866,9 +2866,9 @@ mod tests {
         };
         let r = evaluate_checks(
             &[
-                Check::exit_code_eq(0),
-                Check::min("iops", 1000.0),
-                Check::exists("iops"),
+                MetricCheck::exit_code_eq(0),
+                MetricCheck::min("iops", 1000.0),
+                MetricCheck::exists("iops"),
             ],
             &pm,
             "",
@@ -2900,7 +2900,7 @@ mod tests {
             exit_code: 0,
         };
         let r = evaluate_checks(
-            &[Check::min("iops", 50.0), Check::min("iops", 200.0)],
+            &[MetricCheck::min("iops", 50.0), MetricCheck::min("iops", 200.0)],
             &pm,
             "",
         );
@@ -2936,8 +2936,8 @@ mod tests {
         };
         let r = evaluate_checks(
             &[
-                Check::min("iops", 100.0), // 75 < 100: fail
-                Check::max("iops", 50.0),  // 75 > 50: fail
+                MetricCheck::min("iops", 100.0), // 75 < 100: fail
+                MetricCheck::max("iops", 50.0),  // 75 > 50: fail
             ],
             &pm,
             "",
@@ -2951,7 +2951,7 @@ mod tests {
         );
     }
 
-    /// `Check::Exists` with a zero-value metric passes. The check is
+    /// `MetricCheck::Exists` with a zero-value metric passes. The check is
     /// presence-only — a metric of 0.0 is still present in the
     /// PayloadMetrics map and `pm.get(name).is_some()` returns true.
     /// A naive `pm.get(name).filter(|v| *v != 0.0)` would spuriously
@@ -2971,7 +2971,7 @@ mod tests {
             }],
             exit_code: 0,
         };
-        let r = evaluate_checks(&[Check::exists("errors")], &pm, "");
+        let r = evaluate_checks(&[MetricCheck::exists("errors")], &pm, "");
         assert!(
             r.passed,
             "exists('errors') must pass when metric is 0.0: {:?}",
@@ -2980,7 +2980,7 @@ mod tests {
     }
 
     /// Negative zero (`-0.0`) also counts as present for
-    /// `Check::Exists`. Paranoid pin because f64 `-0.0` surprises
+    /// `MetricCheck::Exists`. Paranoid pin because f64 `-0.0` surprises
     /// some pattern-matching code (`0.0 == -0.0` but they differ
     /// under `f64::to_bits`).
     #[test]
@@ -2997,7 +2997,7 @@ mod tests {
             }],
             exit_code: 0,
         };
-        let r = evaluate_checks(&[Check::exists("drift")], &pm, "");
+        let r = evaluate_checks(&[MetricCheck::exists("drift")], &pm, "");
         assert!(r.passed);
     }
 
@@ -3014,7 +3014,7 @@ mod tests {
         let run = PayloadRun::new(&ctx, &TRUE_BIN)
             .arg("--foo")
             .arg("--bar")
-            .check(Check::exit_code_eq(0))
+            .check(MetricCheck::exit_code_eq(0))
             .in_cgroup("workers");
         let s = format!("{run:?}");
         assert!(s.contains("PayloadRun"), "prefix: {s}");
@@ -3253,10 +3253,10 @@ mod tests {
             exit_code: 0,
         };
         let checks = [
-            Check::exit_code_eq(0),
-            Check::min("iops", 1000.0),
-            Check::max("lat", 100.0),
-            Check::range("cpu", 0.0, 100.0),
+            MetricCheck::exit_code_eq(0),
+            MetricCheck::min("iops", 1000.0),
+            MetricCheck::max("lat", 100.0),
+            MetricCheck::range("cpu", 0.0, 100.0),
         ];
         let r = evaluate_checks(&checks, &pm, "");
         assert!(!r.passed);
@@ -3300,7 +3300,7 @@ mod tests {
             kind: PayloadKind::Binary("checked"),
             output: OutputFormat::ExitCode,
             default_args: &[],
-            default_checks: &[Check::exit_code_eq(0), Check::min("iops", 500.0)],
+            default_checks: &[MetricCheck::exit_code_eq(0), MetricCheck::min("iops", 500.0)],
             metrics: &[],
             include_files: &[],
             uses_parent_pgrp: false,
@@ -3314,14 +3314,14 @@ mod tests {
         // Fresh builder inherits both default checks in order.
         let fresh = PayloadRun::new(&ctx, &CHECKED);
         assert_eq!(fresh.checks.len(), 2);
-        assert!(matches!(fresh.checks[0], Check::ExitCodeEq(0)));
+        assert!(matches!(fresh.checks[0], MetricCheck::ExitCodeEq(0)));
         assert!(matches!(
             fresh.checks[1],
-            Check::Min { value, .. } if value == 500.0,
+            MetricCheck::Min { value, .. } if value == 500.0,
         ));
 
         // Appending preserves defaults and adds on top.
-        let appended = PayloadRun::new(&ctx, &CHECKED).check(Check::exists("latency"));
+        let appended = PayloadRun::new(&ctx, &CHECKED).check(MetricCheck::exists("latency"));
         assert_eq!(appended.checks.len(), 3);
 
         // Clearing wipes defaults too.
@@ -5024,7 +5024,7 @@ mod tests {
     /// `evaluate` on an LlmExtract payload propagates exit_code and
     /// stamps it on the returned `PayloadMetrics`. Pins that the
     /// deferral arm doesn't accidentally zero or stub the exit_code
-    /// field — host-side `Check::ExitCodeEq` evaluation reads this
+    /// field — host-side `MetricCheck::ExitCodeEq` evaluation reads this
     /// field, so a regression that lost the exit_code on the
     /// LlmExtract path would silently turn every ExitCodeEq check
     /// into a "process exited 0" judgment.
@@ -5072,7 +5072,7 @@ mod tests {
         );
     }
 
-    /// The deferral arm honors `Check::ExitCodeEq` guest-side: a
+    /// The deferral arm honors `MetricCheck::ExitCodeEq` guest-side: a
     /// matching exit code passes; a mismatch produces a fail
     /// AssertResult with a detail describing the mismatch. Pins
     /// that the only check kind permitted on LlmExtract is still
@@ -5093,7 +5093,7 @@ mod tests {
             stderr: String::new(),
             exit_code: 0,
         };
-        let (assert_result, pm) = evaluate(&LLM_EXTRACT_PAYLOAD, &[Check::exit_code_eq(0)], output);
+        let (assert_result, pm) = evaluate(&LLM_EXTRACT_PAYLOAD, &[MetricCheck::exit_code_eq(0)], output);
         assert!(
             assert_result.passed,
             "matching ExitCodeEq must pass on LlmExtract deferral arm; got {assert_result:?}",
@@ -5106,7 +5106,7 @@ mod tests {
             stderr: "stderr lives in the failure detail".to_string(),
             exit_code: 1,
         };
-        let (assert_result, _) = evaluate(&LLM_EXTRACT_PAYLOAD, &[Check::exit_code_eq(0)], output);
+        let (assert_result, _) = evaluate(&LLM_EXTRACT_PAYLOAD, &[MetricCheck::exit_code_eq(0)], output);
         assert!(
             !assert_result.passed,
             "mismatching ExitCodeEq must produce a failing AssertResult on the deferral arm",
@@ -5118,7 +5118,7 @@ mod tests {
     }
 
     /// Hard-assert contract: a runtime metric-level
-    /// `.check(Check::Min)` on an LlmExtract payload triggers the
+    /// `.check(MetricCheck::Min)` on an LlmExtract payload triggers the
     /// `assert!(bad.is_empty(), ...)` panic in
     /// `evaluate_llm_extract_deferred`. Pins the developer-error
     /// boundary so a future regression that silently dropped the
@@ -5146,7 +5146,7 @@ mod tests {
         // Wrap the call in catch_unwind; the assertion fires inside
         // evaluate_llm_extract_deferred → evaluate.
         let result = std::panic::catch_unwind(|| {
-            evaluate(&LLM_EXTRACT_PAYLOAD, &[Check::min("iops", 1.0)], output)
+            evaluate(&LLM_EXTRACT_PAYLOAD, &[MetricCheck::min("iops", 1.0)], output)
         });
         let payload = result.expect_err("metric-level check on LlmExtract must panic");
         let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {

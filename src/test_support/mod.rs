@@ -26,7 +26,7 @@
 //! `entry` (scheduler + test-entry types), `eval` (host-side VM
 //! result evaluation), `metrics` (payload stdout → `Metric` list),
 //! `model` (LLM backend + model cache), `output` (guest-output and
-//! console parsing), `payload` (`Payload` / `Check` / `Metric` /
+//! console parsing), `payload` (`Payload` / `MetricCheck` / `Metric` /
 //! `Polarity`), `probe` (auto-repro and BPF probe pipeline),
 //! `probe_metrics` (host-side BPF map introspection),
 //! `profraw` (coverage flush), `runtime` (neutral home for
@@ -106,7 +106,7 @@ pub(crate) use output::{
     SENTINEL_PAYLOAD_STARTING, SENTINEL_SCHEDULER_DIED, SENTINEL_SCHEDULER_NOT_ATTACHED,
 };
 pub use payload::{
-    Check, Metric, MetricBounds, MetricHint, MetricSource, MetricStream, OutputFormat, Payload,
+    MetricCheck, Metric, MetricBounds, MetricHint, MetricSource, MetricStream, OutputFormat, Payload,
     PayloadKind, PayloadMetrics, Polarity,
 };
 pub(crate) use payload::{RawPayloadOutput, WireMetricHint};

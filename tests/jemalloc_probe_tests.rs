@@ -18,7 +18,7 @@ use ktstr::assert::{AssertDetail, AssertResult, DetailKind};
 use ktstr::ktstr_test;
 use ktstr::scenario::Ctx;
 use ktstr::scenario::payload_run::PayloadHandle;
-use ktstr::test_support::{Check, OutputFormat, Payload, PayloadKind, PayloadMetrics};
+use ktstr::test_support::{MetricCheck, OutputFormat, Payload, PayloadKind, PayloadMetrics};
 use ktstr::worker_ready_wait::wait_for_worker_ready;
 
 // ---------------------------------------------------------------------------
@@ -63,7 +63,7 @@ static JEMALLOC_PROBE: Payload = Payload::new(
     PayloadKind::Binary("ktstr-jemalloc-probe"),
     OutputFormat::Json,
     &[],
-    &[Check::ExitCodeEq(0)],
+    &[MetricCheck::ExitCodeEq(0)],
     &[],
     &[],
     false,
@@ -328,7 +328,7 @@ fn jemalloc_probe_external_target_observes_known_allocation(ctx: &Ctx) -> Result
 
 /// Error path — probe a pid that does not exist. The probe must
 /// exit non-zero; the test reads `exit_code` directly rather
-/// than gating via `Check::ExitCodeEq(0)` because the expected
+/// than gating via `MetricCheck::ExitCodeEq(0)` because the expected
 /// outcome is failure. Uses [`JEMALLOC_PROBE_NO_EXIT_CHECK`] so
 /// the framework does not mark the `AssertResult` as failed when
 /// the probe returns non-zero.

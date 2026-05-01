@@ -105,7 +105,7 @@ fn model_loaded_llm_extract_schbench(ctx: &Ctx) -> Result<AssertResult> {
     // `host_side_llm_extract` populate the metric set, apply the
     // universal invariants, and fold any failure details into the
     // final test verdict. A non-passing `assert_result` here means
-    // the guest's `Check::ExitCodeEq(0)` pre-pass on SCHBENCH already
+    // the guest's `MetricCheck::ExitCodeEq(0)` pre-pass on SCHBENCH already
     // detected a non-zero exit; that detail surfaces unchanged.
     Ok(assert_result)
 }

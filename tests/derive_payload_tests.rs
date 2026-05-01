@@ -7,7 +7,7 @@
 //! Isolating the struct-only tests here keeps them visible to the
 //! standard Rust test harness.
 
-use ktstr::test_support::{Check, OutputFormat, PayloadKind, Polarity};
+use ktstr::test_support::{MetricCheck, OutputFormat, PayloadKind, Polarity};
 
 /// Minimal derive: only `binary` is set, everything else defaults.
 /// Checks the const-name strip + uppercase conversion,
@@ -28,7 +28,7 @@ fn derive_payload_minimal_const_name_and_defaults() {
 }
 
 /// Full grammar: every optional attribute at once. Checks
-/// accumulation of `default_args` across multiple attrs, Check
+/// accumulation of `default_args` across multiple attrs, MetricCheck
 /// expressions, MetricHint with every polarity variant surface.
 #[derive(ktstr::Payload)]
 #[payload(
@@ -59,10 +59,10 @@ fn derive_payload_full_grammar() {
     );
 
     assert_eq!(FIO_FULL.default_checks.len(), 2);
-    assert!(matches!(FIO_FULL.default_checks[0], Check::ExitCodeEq(0)));
+    assert!(matches!(FIO_FULL.default_checks[0], MetricCheck::ExitCodeEq(0)));
     assert!(matches!(
         FIO_FULL.default_checks[1],
-        Check::Min { metric, value } if metric == "jobs.0.read.iops" && value == 1000.0,
+        MetricCheck::Min { metric, value } if metric == "jobs.0.read.iops" && value == 1000.0,
     ));
 
     assert_eq!(FIO_FULL.metrics.len(), 4);
@@ -183,7 +183,7 @@ fn derive_payload_metric_minimal_defaults_unknown_polarity() {
 }
 
 /// Default check uses `range(...)` — checks the macro's bare
-/// Check-constructor resolution against every const-fn constructor,
+/// MetricCheck-constructor resolution against every const-fn constructor,
 /// not just the ones used above.
 #[derive(ktstr::Payload)]
 #[payload(binary = "range_check_bin")]
@@ -198,28 +198,28 @@ fn derive_payload_default_checks_resolve_all_constructors() {
     assert_eq!(RANGE_CHECK.default_checks.len(), 3);
     assert!(matches!(
         RANGE_CHECK.default_checks[0],
-        Check::Range { metric, lo, hi } if metric == "cpu_pct" && lo == 10.0 && hi == 90.0,
+        MetricCheck::Range { metric, lo, hi } if metric == "cpu_pct" && lo == 10.0 && hi == 90.0,
     ));
     assert!(matches!(
         RANGE_CHECK.default_checks[1],
-        Check::Max { metric, value } if metric == "latency_us" && value == 500.0,
+        MetricCheck::Max { metric, value } if metric == "latency_us" && value == 500.0,
     ));
     assert!(matches!(
         RANGE_CHECK.default_checks[2],
-        Check::Exists("sampling_key"),
+        MetricCheck::Exists("sampling_key"),
     ));
 }
 
-/// Both bare (`min(...)`) and qualified (`Check::min(...)`)
-/// constructor forms must resolve to the same generated `Check::...`
-/// variant. The macro detects the explicit `Check` segment on the
-/// callee path and skips its implicit `::ktstr::test_support::Check::`
-/// prepend so a user who imports `Check` and writes the prefix
-/// themselves gets `Check::min(...)`, not `Check::Check::min(...)`.
+/// Both bare (`min(...)`) and qualified (`MetricCheck::min(...)`)
+/// constructor forms must resolve to the same generated `MetricCheck::...`
+/// variant. The macro detects the explicit `MetricCheck` segment on the
+/// callee path and skips its implicit `::ktstr::test_support::MetricCheck::`
+/// prepend so a user who imports `MetricCheck` and writes the prefix
+/// themselves gets `MetricCheck::min(...)`, not `MetricCheck::MetricCheck::min(...)`.
 #[derive(ktstr::Payload)]
 #[payload(binary = "qualified_check_bin")]
-#[default_check(Check::min("iops", 1000.0))]
-#[default_check(Check::max("latency_us", 500.0))]
+#[default_check(MetricCheck::min("iops", 1000.0))]
+#[default_check(MetricCheck::max("latency_us", 500.0))]
 #[default_check(exists("sampling_key"))]
 #[allow(dead_code)]
 struct QualifiedCheckPayload;
@@ -229,15 +229,15 @@ fn derive_payload_accepts_qualified_check_prefix() {
     assert_eq!(QUALIFIED_CHECK.default_checks.len(), 3);
     assert!(matches!(
         QUALIFIED_CHECK.default_checks[0],
-        Check::Min { metric, value } if metric == "iops" && value == 1000.0,
+        MetricCheck::Min { metric, value } if metric == "iops" && value == 1000.0,
     ));
     assert!(matches!(
         QUALIFIED_CHECK.default_checks[1],
-        Check::Max { metric, value } if metric == "latency_us" && value == 500.0,
+        MetricCheck::Max { metric, value } if metric == "latency_us" && value == 500.0,
     ));
     assert!(matches!(
         QUALIFIED_CHECK.default_checks[2],
-        Check::Exists("sampling_key"),
+        MetricCheck::Exists("sampling_key"),
     ));
 }
 
@@ -264,17 +264,17 @@ fn derive_payload_explicit_exit_code_output() {
 }
 
 /// The fully-qualified crate path
-/// `::ktstr::test_support::Check::min(...)` must also resolve
+/// `::ktstr::test_support::MetricCheck::min(...)` must also resolve
 /// through the same prefix-detection branch as the shorter
-/// `Check::min(...)` form. `expr_has_check_prefix` scans every
-/// segment for an ident named `Check`, so any absolute path that
+/// `MetricCheck::min(...)` form. `expr_has_check_prefix` scans every
+/// segment for an ident named `MetricCheck`, so any absolute path that
 /// carries the type still lands on the user-written callee
 /// without the macro double-prepending its implicit
-/// `::ktstr::test_support::Check::` segment.
+/// `::ktstr::test_support::MetricCheck::` segment.
 #[derive(ktstr::Payload)]
 #[payload(binary = "fully_qualified_check_bin")]
-#[default_check(::ktstr::test_support::Check::min("iops", 500.0))]
-#[default_check(::ktstr::test_support::Check::exit_code_eq(0))]
+#[default_check(::ktstr::test_support::MetricCheck::min("iops", 500.0))]
+#[default_check(::ktstr::test_support::MetricCheck::exit_code_eq(0))]
 #[allow(dead_code)]
 struct FullyQualifiedCheckPayload;
 
@@ -283,10 +283,10 @@ fn derive_payload_accepts_fully_qualified_check_path() {
     assert_eq!(FULLY_QUALIFIED_CHECK.default_checks.len(), 2);
     assert!(matches!(
         FULLY_QUALIFIED_CHECK.default_checks[0],
-        Check::Min { metric, value } if metric == "iops" && value == 500.0,
+        MetricCheck::Min { metric, value } if metric == "iops" && value == 500.0,
     ));
     assert!(matches!(
         FULLY_QUALIFIED_CHECK.default_checks[1],
-        Check::ExitCodeEq(0),
+        MetricCheck::ExitCodeEq(0),
     ));
 }

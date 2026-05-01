@@ -72,10 +72,10 @@ pub struct Payload {
     pub default_args: &'static [&'static str],
     /// Author-declared default checks evaluated against extracted
     /// [`PayloadMetrics`]. Payloads that need exit-code gating
-    /// should include [`Check::ExitCodeEq(0)`](Check::ExitCodeEq)
+    /// should include [`MetricCheck::ExitCodeEq(0)`](MetricCheck::ExitCodeEq)
     /// here; the runtime evaluates `ExitCodeEq` as a pre-pass
     /// before metric checks.
-    pub default_checks: &'static [Check],
+    pub default_checks: &'static [MetricCheck],
     /// Declared metric hints — polarity, unit. Unhinted metrics
     /// extracted from output land as [`Polarity::Unknown`].
     pub metrics: &'static [MetricHint],
@@ -413,7 +413,7 @@ impl Payload {
         kind: PayloadKind,
         output: OutputFormat,
         default_args: &'static [&'static str],
-        default_checks: &'static [Check],
+        default_checks: &'static [MetricCheck],
         metrics: &'static [MetricHint],
         include_files: &'static [&'static str],
         uses_parent_pgrp: bool,
@@ -750,7 +750,7 @@ pub enum OutputFormat {
     /// the captured text. Test bodies for LlmExtract payloads must
     /// return `Ok(assert_result)` without inspecting `metrics.metrics`
     /// directly. Runtime `.check()` on LlmExtract payloads accepts
-    /// only `Check::ExitCodeEq`; metric-level variants
+    /// only `MetricCheck::ExitCodeEq`; metric-level variants
     /// (`Min`/`Max`/`Range`/`Exists`) panic at runtime. Declare
     /// metric checks via `default_checks` on the `Payload` so the
     /// host can apply them.
@@ -768,7 +768,7 @@ pub enum OutputFormat {
 }
 
 // ---------------------------------------------------------------------------
-// Polarity, Check, Metric, MetricSource
+// Polarity, MetricCheck, Metric, MetricSource
 // ---------------------------------------------------------------------------
 
 /// Regression direction for a metric.
@@ -964,9 +964,9 @@ impl MetricBounds {
 
 /// Assertion check evaluated against an extracted
 /// [`PayloadMetrics`] (or the exit code for
-/// [`Check::ExitCodeEq`](Check::ExitCodeEq)).
+/// [`MetricCheck::ExitCodeEq`](MetricCheck::ExitCodeEq)).
 #[derive(Debug, Clone, Copy)]
-pub enum Check {
+pub enum MetricCheck {
     /// Fail when the named metric is below `value`.
     Min { metric: &'static str, value: f64 },
     /// Fail when the named metric exceeds `value`.
@@ -983,39 +983,39 @@ pub enum Check {
     ExitCodeEq(i32),
 }
 
-impl Check {
+impl MetricCheck {
     /// Fail when the named metric is below `value`. Missing metric
     /// fails loudly per the evaluation pipeline's missing-metric
     /// contract.
-    pub const fn min(metric: &'static str, value: f64) -> Check {
-        Check::Min { metric, value }
+    pub const fn min(metric: &'static str, value: f64) -> MetricCheck {
+        MetricCheck::Min { metric, value }
     }
 
     /// Fail when the named metric exceeds `value`. Missing metric
     /// fails loudly.
-    pub const fn max(metric: &'static str, value: f64) -> Check {
-        Check::Max { metric, value }
+    pub const fn max(metric: &'static str, value: f64) -> MetricCheck {
+        MetricCheck::Max { metric, value }
     }
 
     /// Fail when the named metric falls outside `[lo, hi]` (inclusive
     /// on both ends). Missing metric fails loudly.
-    pub const fn range(metric: &'static str, lo: f64, hi: f64) -> Check {
-        Check::Range { metric, lo, hi }
+    pub const fn range(metric: &'static str, lo: f64, hi: f64) -> MetricCheck {
+        MetricCheck::Range { metric, lo, hi }
     }
 
     /// Fail when the named metric is absent from the extracted set.
     /// Presence-only — the metric value can be any finite number,
     /// including zero or negative.
-    pub const fn exists(metric: &'static str) -> Check {
-        Check::Exists(metric)
+    pub const fn exists(metric: &'static str) -> MetricCheck {
+        MetricCheck::Exists(metric)
     }
 
     /// Fail when the payload's exit code differs from `expected`.
     /// Evaluated before metric-path checks so a mis-exited binary
     /// reports the exit-code mismatch rather than chained
     /// missing-metric failures.
-    pub const fn exit_code_eq(expected: i32) -> Check {
-        Check::ExitCodeEq(expected)
+    pub const fn exit_code_eq(expected: i32) -> MetricCheck {
+        MetricCheck::ExitCodeEq(expected)
     }
 }
 
@@ -1168,7 +1168,7 @@ pub struct PayloadMetrics {
     /// used or when JSON parsing found no numeric leaves.
     pub metrics: Vec<Metric>,
     /// Process exit code (0 = success). Used by
-    /// [`Check::ExitCodeEq`](Check::ExitCodeEq) in the check
+    /// [`MetricCheck::ExitCodeEq`](MetricCheck::ExitCodeEq) in the check
     /// evaluation pre-pass.
     pub exit_code: i32,
 }
@@ -1333,11 +1333,11 @@ mod tests {
 
     #[test]
     fn check_constructors() {
-        assert!(matches!(Check::min("x", 1.0), Check::Min { .. }));
-        assert!(matches!(Check::max("x", 1.0), Check::Max { .. }));
-        assert!(matches!(Check::range("x", 1.0, 2.0), Check::Range { .. }));
-        assert!(matches!(Check::exists("x"), Check::Exists("x")));
-        assert!(matches!(Check::exit_code_eq(0), Check::ExitCodeEq(0)));
+        assert!(matches!(MetricCheck::min("x", 1.0), MetricCheck::Min { .. }));
+        assert!(matches!(MetricCheck::max("x", 1.0), MetricCheck::Max { .. }));
+        assert!(matches!(MetricCheck::range("x", 1.0, 2.0), MetricCheck::Range { .. }));
+        assert!(matches!(MetricCheck::exists("x"), MetricCheck::Exists("x")));
+        assert!(matches!(MetricCheck::exit_code_eq(0), MetricCheck::ExitCodeEq(0)));
     }
 
     #[test]
@@ -1445,11 +1445,11 @@ mod tests {
     }
 
     // Const bindings verify const-fn actually works in const context.
-    const _MIN: Check = Check::min("x", 1.0);
-    const _MAX: Check = Check::max("x", 2.0);
-    const _RANGE: Check = Check::range("x", 1.0, 2.0);
-    const _EXISTS: Check = Check::exists("x");
-    const _EXIT: Check = Check::exit_code_eq(0);
+    const _MIN: MetricCheck = MetricCheck::min("x", 1.0);
+    const _MAX: MetricCheck = MetricCheck::max("x", 2.0);
+    const _RANGE: MetricCheck = MetricCheck::range("x", 1.0, 2.0);
+    const _EXISTS: MetricCheck = MetricCheck::exists("x");
+    const _EXIT: MetricCheck = MetricCheck::exit_code_eq(0);
     const _KERNEL_DEFAULT_REF: &Payload = &Payload::KERNEL_DEFAULT;
     const _KERNEL_DEFAULT_IS_SCHED: bool = Payload::KERNEL_DEFAULT.is_scheduler();
     const _KERNEL_DEFAULT_DISPLAY: &str = Payload::KERNEL_DEFAULT.display_name();
@@ -1462,7 +1462,7 @@ mod tests {
         kind: PayloadKind::Binary("fio"),
         output: OutputFormat::Json,
         default_args: &["--output-format=json"],
-        default_checks: &[Check::exit_code_eq(0)],
+        default_checks: &[MetricCheck::exit_code_eq(0)],
         metrics: &[MetricHint {
             name: "jobs.0.read.iops",
             polarity: Polarity::HigherBetter,
@@ -1476,11 +1476,11 @@ mod tests {
 
     #[test]
     fn const_bindings_are_usable() {
-        assert!(matches!(_MIN, Check::Min { .. }));
-        assert!(matches!(_MAX, Check::Max { .. }));
-        assert!(matches!(_RANGE, Check::Range { .. }));
-        assert!(matches!(_EXISTS, Check::Exists("x")));
-        assert!(matches!(_EXIT, Check::ExitCodeEq(0)));
+        assert!(matches!(_MIN, MetricCheck::Min { .. }));
+        assert!(matches!(_MAX, MetricCheck::Max { .. }));
+        assert!(matches!(_RANGE, MetricCheck::Range { .. }));
+        assert!(matches!(_EXISTS, MetricCheck::Exists("x")));
+        assert!(matches!(_EXIT, MetricCheck::ExitCodeEq(0)));
         assert_eq!(_KERNEL_DEFAULT_REF.name, "kernel_default");
         const { assert!(_KERNEL_DEFAULT_IS_SCHED) };
         assert_eq!(_KERNEL_DEFAULT_DISPLAY, "kernel_default");
@@ -1638,9 +1638,9 @@ mod tests {
         assert!(serde_json::from_str::<Polarity>("{\"TargetValue\":-Infinity}").is_err());
     }
 
-    /// `Check::Range { lo: hi, hi: lo }` — i.e. reversed bounds that
+    /// `MetricCheck::Range { lo: hi, hi: lo }` — i.e. reversed bounds that
     /// make `lo > hi` — produces an empty interval that every finite
-    /// metric fails against. The Check API has no runtime validation
+    /// metric fails against. The MetricCheck API has no runtime validation
     /// for `lo <= hi`, so the failure manifests as "metric outside
     /// [lo, hi]" for any probe value. Pin that current behavior so a
     /// future validation pass (which SHOULD exist, since a reversed
@@ -1648,9 +1648,9 @@ mod tests {
     /// here instead of quietly flipping semantics.
     #[test]
     fn check_range_reversed_bounds_fails_every_finite_value() {
-        let reversed = Check::range("iops", 100.0, 50.0); // lo=100, hi=50
+        let reversed = MetricCheck::range("iops", 100.0, 50.0); // lo=100, hi=50
         match reversed {
-            Check::Range { metric, lo, hi } => {
+            MetricCheck::Range { metric, lo, hi } => {
                 assert_eq!(metric, "iops");
                 assert!(
                     lo > hi,

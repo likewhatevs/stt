@@ -62,7 +62,7 @@
 //! [`Polarity::Unknown`](ktstr::test_support::Polarity::Unknown) and
 //! an empty unit. Unknown propagates as follows:
 //!
-//! - **`Check` assertion pass** — [`Check`](ktstr::test_support::Check)
+//! - **`MetricCheck` assertion pass** — [`MetricCheck`](ktstr::test_support::MetricCheck)
 //!   variants (`Min`, `Max`, `Range`, `Exists`, `ExitCodeEq`) compare
 //!   values to thresholds without consulting polarity. An Unknown
 //!   metric fails checks the same way a hinted metric does; polarity

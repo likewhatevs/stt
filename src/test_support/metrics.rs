@@ -12,7 +12,7 @@
 //! walks numeric leaves into [`Metric`]s keyed by dotted paths.
 //!
 //! [`OutputFormat::ExitCode`] returns an empty metric set; exit-code
-//! pass/fail is handled by the [`Check::ExitCodeEq`] pre-pass
+//! pass/fail is handled by the [`MetricCheck::ExitCodeEq`] pre-pass
 //! elsewhere.
 //!
 //! [`OutputFormat::LlmExtract`] is HOST-ONLY. The guest-side
@@ -41,7 +41,7 @@ use crate::test_support::{Metric, MetricSource, MetricStream, OutputFormat, Pola
 /// [`OutputFormat::Json`] when no JSON document is located or the
 /// document carries no numeric leaves. JSON-parse errors are
 /// non-fatal: the extraction returns `Vec::new()` so downstream
-/// [`Check`](crate::test_support::Check) evaluation reports each
+/// [`MetricCheck`](crate::test_support::MetricCheck) evaluation reports each
 /// referenced metric as missing rather than failing the whole run.
 ///
 /// [`OutputFormat::LlmExtract`] returns an empty `Vec` from this
@@ -376,7 +376,7 @@ fn walk(
                 });
             }
         }
-        // Strings/bools/null: skipped. Check::Exists can gate on
+        // Strings/bools/null: skipped. MetricCheck::Exists can gate on
         // presence via the PayloadMetrics lookup — a missing
         // string-valued key is treated the same as a missing numeric.
         _ => {}
@@ -1013,7 +1013,7 @@ mod tests {
     /// Zero is emitted as a real metric value, not filtered
     /// out. A payload that genuinely measured zero (idle CPU, no
     /// errors) must produce a zero metric — otherwise downstream
-    /// checks like `Check::exit_code_eq(0)` against an `exit_code`
+    /// checks like `MetricCheck::exit_code_eq(0)` against an `exit_code`
     /// metric of 0.0 would spuriously report "missing" instead of
     /// passing.
     #[test]

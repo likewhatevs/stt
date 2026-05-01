@@ -17,7 +17,7 @@ mod common;
 
 use common::fixtures::{FIO, FIO_JSON, SCHBENCH, SCHBENCH_HINTED, STRESS_NG};
 use ktstr::test_support::{
-    Check, MetricHint, MetricSource, MetricStream, OutputFormat, PayloadKind, Polarity,
+    MetricCheck, MetricHint, MetricSource, MetricStream, OutputFormat, PayloadKind, Polarity,
     extract_metrics,
 };
 
@@ -36,7 +36,7 @@ fn fio_identity_fields_are_stable() {
 #[test]
 fn fio_default_checks_include_exit_code_zero() {
     assert_eq!(FIO.default_checks.len(), 1);
-    assert!(matches!(FIO.default_checks[0], Check::ExitCodeEq(0)));
+    assert!(matches!(FIO.default_checks[0], MetricCheck::ExitCodeEq(0)));
 }
 
 /// FIO's metric hints cover iops (higher-better) and lat_ns
@@ -92,7 +92,7 @@ fn stress_ng_identity_fields_are_stable() {
     assert!(matches!(STRESS_NG.output, OutputFormat::ExitCode));
     assert!(STRESS_NG.metrics.is_empty());
     assert_eq!(STRESS_NG.default_checks.len(), 1);
-    assert!(matches!(STRESS_NG.default_checks[0], Check::ExitCodeEq(0),));
+    assert!(matches!(STRESS_NG.default_checks[0], MetricCheck::ExitCodeEq(0),));
 }
 
 /// Smoke test: FIO's extraction pipeline produces Json-sourced
@@ -151,7 +151,7 @@ fn schbench_identity_fields_are_stable() {
     );
     assert!(SCHBENCH.metrics.is_empty());
     assert_eq!(SCHBENCH.default_checks.len(), 1);
-    assert!(matches!(SCHBENCH.default_checks[0], Check::ExitCodeEq(0)));
+    assert!(matches!(SCHBENCH.default_checks[0], MetricCheck::ExitCodeEq(0)));
 }
 
 /// SCHBENCH_HINTED is the hint-carrying sibling of [`SCHBENCH`].
@@ -204,7 +204,7 @@ fn schbench_hinted_output_carries_hint_through_derive() {
     assert_eq!(SCHBENCH_HINTED.default_checks.len(), 1);
     assert!(matches!(
         SCHBENCH_HINTED.default_checks[0],
-        Check::ExitCodeEq(0),
+        MetricCheck::ExitCodeEq(0),
     ));
 }
 
@@ -268,13 +268,13 @@ fn extract_metrics_does_not_apply_polarity_hints() {
 #[test]
 fn fixtures_default_checks_pin_exit_code_gate() {
     const _: () = {
-        assert!(matches!(FIO.default_checks[0], Check::ExitCodeEq(0)));
-        assert!(matches!(FIO_JSON.default_checks[0], Check::ExitCodeEq(0)));
-        assert!(matches!(STRESS_NG.default_checks[0], Check::ExitCodeEq(0)));
-        assert!(matches!(SCHBENCH.default_checks[0], Check::ExitCodeEq(0)));
+        assert!(matches!(FIO.default_checks[0], MetricCheck::ExitCodeEq(0)));
+        assert!(matches!(FIO_JSON.default_checks[0], MetricCheck::ExitCodeEq(0)));
+        assert!(matches!(STRESS_NG.default_checks[0], MetricCheck::ExitCodeEq(0)));
+        assert!(matches!(SCHBENCH.default_checks[0], MetricCheck::ExitCodeEq(0)));
         assert!(matches!(
             SCHBENCH_HINTED.default_checks[0],
-            Check::ExitCodeEq(0),
+            MetricCheck::ExitCodeEq(0),
         ));
     };
     assert!(!FIO.default_checks.is_empty());

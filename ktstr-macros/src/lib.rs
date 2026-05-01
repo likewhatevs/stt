@@ -1762,15 +1762,15 @@ fn derive_scheduler_inner(input: DeriveInput) -> syn::Result<proc_macro2::TokenS
 ///   literals appended to the binary's argv when the payload runs.
 ///   May repeat across multiple `#[default_args(...)]` attrs; entries
 ///   accumulate in source order.
-/// - `#[default_check(...)]` — one [`Check`](ktstr::test_support::Check)
+/// - `#[default_check(...)]` — one [`MetricCheck`](ktstr::test_support::MetricCheck)
 ///   construction expression (e.g. `min("iops", 1000.0)`,
 ///   `exit_code_eq(0)`). May repeat; entries accumulate in source
-///   order. Both `min(...)` and `Check::min(...)` are accepted: the
-///   macro prepends `::ktstr::test_support::Check::` when the
-///   expression doesn't already spell `Check::` on its callee path,
+///   order. Both `min(...)` and `MetricCheck::min(...)` are accepted: the
+///   macro prepends `::ktstr::test_support::MetricCheck::` when the
+///   expression doesn't already spell `MetricCheck::` on its callee path,
 ///   so bare constructors work without an import and qualified
 ///   constructors read naturally in modules that already have
-///   `Check` in scope.
+///   `MetricCheck` in scope.
 /// - `#[metric(name = "...", polarity = ..., unit = "...")]` —
 ///   kwarg form. `polarity` is one of `HigherBetter`, `LowerBetter`,
 ///   `TargetValue(f64)`, `Unknown`. May repeat; entries accumulate.
@@ -1904,24 +1904,24 @@ fn derive_payload_inner(input: DeriveInput) -> syn::Result<proc_macro2::TokenStr
                 default_args.push(lit.value());
             }
         } else if attr.path().is_ident("default_check") {
-            // Single Check-constructing expression. Two forms accepted:
+            // Single MetricCheck-constructing expression. Two forms accepted:
             //   - bare: `min("iops", 1000.0)` — the macro prepends
-            //     `::ktstr::test_support::Check::` so users don't have
-            //     to import `Check` in every module that derives.
-            //   - qualified: `Check::min("iops", 1000.0)` — the user
-            //     wrote `Check::` themselves; emit the expression
+            //     `::ktstr::test_support::MetricCheck::` so users don't have
+            //     to import `MetricCheck` in every module that derives.
+            //   - qualified: `MetricCheck::min("iops", 1000.0)` — the user
+            //     wrote `MetricCheck::` themselves; emit the expression
             //     unchanged so the user's own path resolution wins
-            //     (and a double `Check::Check::` prefix can't happen).
+            //     (and a double `MetricCheck::MetricCheck::` prefix can't happen).
             let expr: syn::Expr = attr.parse_args().map_err(|e| {
                 syn::Error::new(
                     e.span(),
-                    "default_check must be a Check constructor expression (e.g. min(\"iops\", 1000.0))",
+                    "default_check must be a MetricCheck constructor expression (e.g. min(\"iops\", 1000.0))",
                 )
             })?;
             if expr_has_check_prefix(&expr) {
                 default_checks.push(quote! { #expr });
             } else {
-                default_checks.push(quote! { ::ktstr::test_support::Check::#expr });
+                default_checks.push(quote! { ::ktstr::test_support::MetricCheck::#expr });
             }
         } else if attr.path().is_ident("metric") {
             // Kwarg form: name = "...", polarity = ..., unit = "...".
@@ -2153,19 +2153,19 @@ fn parse_metric_attr(attr: &syn::Attribute) -> syn::Result<(String, proc_macro2:
 }
 
 /// Does this `#[default_check(...)]` expression already spell
-/// `Check::` somewhere in its function path? Returns true for
-/// `Check::min(...)` and `::ktstr::test_support::Check::min(...)`;
+/// `MetricCheck::` somewhere in its function path? Returns true for
+/// `MetricCheck::min(...)` and `::ktstr::test_support::MetricCheck::min(...)`;
 /// false for bare `min(...)`. Used to skip the macro's implicit
-/// `::ktstr::test_support::Check::` prepend when the user has
-/// already written the prefix, so `Check::Check::min(...)` can't
+/// `::ktstr::test_support::MetricCheck::` prepend when the user has
+/// already written the prefix, so `MetricCheck::MetricCheck::min(...)` can't
 /// happen.
 ///
 /// Only inspects the callee path of an `Expr::Call`; non-call
-/// expressions (rare but legal: a free function returning `Check`,
+/// expressions (rare but legal: a free function returning `MetricCheck`,
 /// or a `const` value) fall back to the prepend path, matching the
 /// pre-bugfix behavior for anything that isn't a plain constructor
 /// call. A future refactor could lift this to also handle
-/// `MethodCall` / `Path`, but the Check API today is constructor
+/// `MethodCall` / `Path`, but the MetricCheck API today is constructor
 /// calls only — adding more shapes is a no-op until a new constructor
 /// form lands.
 fn expr_has_check_prefix(expr: &syn::Expr) -> bool {
@@ -2179,7 +2179,7 @@ fn expr_has_check_prefix(expr: &syn::Expr) -> bool {
         .path
         .segments
         .iter()
-        .any(|seg| seg.ident == "Check")
+        .any(|seg| seg.ident == "MetricCheck")
 }
 
 /// Translate the user-facing `polarity = ...` expression to a

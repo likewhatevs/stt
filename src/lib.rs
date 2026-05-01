@@ -623,7 +623,7 @@ pub mod prelude {
     pub use crate::scenario::scenarios;
     pub use crate::scenario::{CgroupGroup, Ctx, collect_all, spawn_diverse};
     pub use crate::test_support::{
-        BpfMapWrite, CgroupPath, Check, MemSideCache, Metric, MetricBounds, MetricHint,
+        BpfMapWrite, CgroupPath, MetricCheck, MemSideCache, Metric, MetricBounds, MetricHint,
         MetricSource, NumaDistance, NumaNode, OutputFormat, Payload, PayloadKind, PayloadMetrics,
         Polarity, Scheduler, SchedulerSpec, SidecarResult, Sysctl, Topology, extract_metrics,
     };

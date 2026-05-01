@@ -384,7 +384,7 @@ fn host_side_llm_extract(
     // ring-full and overflow paths in `shm_write`). Without this
     // surfacing, an LlmExtract test whose raw-output bytes
     // arrived corrupted would silently produce empty metrics and
-    // fail downstream `Check::Min` / `Check::Exists` evaluations
+    // fail downstream `MetricCheck::Min` / `MetricCheck::Exists` evaluations
     // with a "metric not found" message that hides the real cause.
     //
     // Ambiguity disclosure: we cannot tell from PayloadMetrics
@@ -1205,7 +1205,7 @@ pub(crate) fn run_ktstr_test_inner(
             "auto-repro: no probe data — the scheduler may have \
              exited before probes could capture events, or the \
              crash did not reproduce in the repro VM. Re-run with \
-             RUST_LOG=debug for probe pipeline diagnostics. Check \
+             RUST_LOG=debug for probe pipeline diagnostics. MetricCheck \
              the sched_ext dump and scheduler log sections above \
              for crash details."
                 .to_string()
@@ -1730,7 +1730,7 @@ pub(crate) fn trim_settle_samples(
     }
 }
 
-/// Check that `/dev/kvm` is accessible for read+write.
+/// MetricCheck that `/dev/kvm` is accessible for read+write.
 ///
 /// Pre-flight check for VM-booting test runs: every ktstr test needs
 /// a KVM fd, and failing fast here yields an actionable error
@@ -1743,7 +1743,7 @@ fn ensure_kvm() -> Result<()> {
         .open("/dev/kvm")
         .context(
             "/dev/kvm not accessible — KVM is required for ktstr_test. \
-             Check that KVM is enabled and your user is in the kvm group.",
+             MetricCheck that KVM is enabled and your user is in the kvm group.",
         )?;
     Ok(())
 }
@@ -1925,7 +1925,7 @@ pub fn resolve_scheduler(spec: &SchedulerSpec) -> Result<(Option<PathBuf>, Resol
 /// then delegates to [`crate::find_kernel()`] for cache and
 /// filesystem discovery. Bails with actionable hints on failure.
 pub fn resolve_test_kernel() -> Result<PathBuf> {
-    // Check environment variable first.
+    // MetricCheck environment variable first.
     if let Ok(path) = std::env::var("KTSTR_TEST_KERNEL") {
         let p = PathBuf::from(&path);
         anyhow::ensure!(p.exists(), "KTSTR_TEST_KERNEL not found: {path}");
@@ -2573,7 +2573,7 @@ mod tests {
         let repro_fn = |_output: &str| -> Option<String> {
             Some(
                 "auto-repro: no probe data — scheduler may have exited before \
-                 probes could attach. Check the sched_ext dump and scheduler \
+                 probes could attach. MetricCheck the sched_ext dump and scheduler \
                  log sections above for crash details."
                     .to_string(),
             )
@@ -4365,7 +4365,7 @@ mod tests {
     /// CRC-bad RawPayloadOutput silently dropped during SHM
     /// drain. Without this surfacing, an LlmExtract test whose
     /// raw-output bytes arrived corrupted would fail downstream
-    /// `Check::Min` / `Check::Exists` evaluations with a
+    /// `MetricCheck::Min` / `MetricCheck::Exists` evaluations with a
     /// "metric not found" message that hides the real cause.
     ///
     /// Setup: an LlmExtract pair at index 7 (raw + matching PM)
