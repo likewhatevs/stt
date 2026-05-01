@@ -644,6 +644,7 @@ pub mod prelude {
     // `resolve_scheduler`, `resolve_test_kernel`.
     pub use crate::topology::{LlcInfo, NodeMemInfo, TestTopology};
     pub use crate::vmm::disk_config::{DiskConfig, DiskThrottle, Filesystem};
+    pub use crate::vmm::VirtioBlkCounters;
     pub use crate::workload::{
         AffinityIntent, ResolvedAffinity, CloneMode, MemPolicy, Migration, MpolFlags, Phase,
         SchedPolicy, WorkSpec, WorkType, WorkerReport, WorkloadConfig, WorkloadHandle, build_nodemask,
@@ -996,10 +997,7 @@ pub(crate) fn resolve_current_exe() -> anyhow::Result<std::path::PathBuf> {
 /// `disk`: optional virtio-blk device backing for `/dev/vda`. When
 ///   `Some`, the framework calls
 ///   [`vmm::KtstrVm::builder`]'s `.disk(..)` so the guest probes a
-///   raw block device sized per `disk.capacity_mb`. The guest cmdline
-///   gains `KTSTR_DISK=<MiB>` so a future auto-mount path in
-///   `vmm::rust_init` can detect the attached disk without re-reading
-///   the device tree.
+///   raw block device sized per `disk.capacity_mb`.
 #[allow(clippy::too_many_arguments)]
 pub fn run_shell(
     kernel: std::path::PathBuf,
@@ -1021,16 +1019,6 @@ pub fn run_shell(
         .collect();
 
     let mut cmdline = format!("KTSTR_MODE=shell KTSTR_TOPO={numa_nodes},{llcs},{cores},{threads}");
-    if let Some(ref d) = disk {
-        // Surface the attached disk's MiB count to the guest so a
-        // future auto-mount path in vmm::rust_init can locate the
-        // virtio-blk device without re-walking sysfs / device tree.
-        // The MiB count is a stable identifier today (single-disk
-        // limit per `init_virtio_blk`'s framework reservation of one
-        // MMIO + IRQ pair) and acts as a sentinel ("disk attached")
-        // for absent (== no-disk).
-        cmdline.push_str(&format!(" KTSTR_DISK={}", d.capacity_mb));
-    }
     if dmesg {
         cmdline.push_str(" loglevel=7");
     }

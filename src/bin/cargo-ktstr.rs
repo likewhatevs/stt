@@ -224,9 +224,11 @@ enum KtstrCommand {
     ///
     ///   {"comm": "scx_simple", "pid": 1234, "nr_running": 7}
     ///
-    /// Output (with `--seed demo`):
+    /// Output (with `--seed demo`, illustrative — exact funified
+    /// values depend on the seed):
     ///
-    ///   {"comm": "swift-otter", "pid": 8231..., "nr_running": 7}
+    ///   {"comm": "swift-otter", "pid": 8231554926718902741,
+    ///    "nr_running": 7}
     ///
     /// `nr_running` is on the metric allowlist so 7 passes
     /// through; `comm` and `pid` are not, so they get funified.
@@ -471,13 +473,7 @@ enum KtstrCommand {
         #[arg(long, requires = "no_perf_mode", help = ktstr::cli::CPU_CAP_HELP)]
         cpu_cap: Option<usize>,
 
-        /// Attach a raw virtio-blk disk to `/dev/vda`. Accepts a
-        /// human-readable size with a unit suffix (case-insensitive):
-        /// `b`, `kb`, `kib`, `mb`, `mib`, `gb`, `gib`. SI variants
-        /// (`kb`/`mb`/`gb`) use 10^N; IEC variants (`kib`/`mib`/`gib`)
-        /// use 2^N. The size must be a positive whole number of MiB
-        /// (e.g. `256mib`, `1gib`). Omit to boot without a disk.
-        #[arg(long)]
+        #[arg(long, help = ktstr::cli::DISK_HELP)]
         disk: Option<String>,
     },
 }
@@ -3133,19 +3129,10 @@ fn run_shell(
     }
     // Parse the human-readable disk size into a DiskConfig before the
     // KVM probe so a bad string surfaces at CLI-argument time, not
-    // mid-VM-setup. Default-everything except `capacity_mb` so the
-    // shell flow lines up with `DiskConfig::default()` for the
-    // remaining knobs (raw fs, no throttle, read-write).
-    let disk_cfg = match disk.as_deref() {
-        Some(s) => {
-            let mib = cli::parse_disk_size_mib(s).map_err(|e| format!("{e:#}"))?;
-            Some(ktstr::prelude::DiskConfig {
-                capacity_mb: mib,
-                ..ktstr::prelude::DiskConfig::default()
-            })
-        }
-        None => None,
-    };
+    // mid-VM-setup. `parse_disk_arg` returns `Ok(None)` when the
+    // attribute is absent and applies `DiskConfig::default()` for
+    // every knob except `capacity_mb` when present.
+    let disk_cfg = cli::parse_disk_arg(disk.as_deref()).map_err(|e| format!("{e:#}"))?;
     cli::check_kvm().map_err(|e| format!("{e:#}"))?;
     let kernel_path = resolve_kernel_image(kernel.as_deref())?;
 

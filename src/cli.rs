@@ -2055,17 +2055,19 @@ pub fn parse_topology_string(topology: &str) -> Result<(u32, u32, u32, u32)> {
     Ok((numa_nodes, llcs, cores, threads))
 }
 
-/// Parse a human-readable size string (e.g. `"256mb"`, `"10gib"`, `"1gib"`)
+/// Parse a human-readable size string (e.g. `"256mib"`, `"10gib"`, `"1gib"`)
 /// into a count of mebibytes (MiB), rounded down. Returns `Err` when the
 /// suffix is unrecognized, the numeric portion fails to parse, the value
 /// is not a positive integer multiple of one MiB, or the result exceeds
 /// `u32::MAX` MiB (the [`crate::vmm::disk_config::DiskConfig::capacity_mb`]
 /// capacity).
 ///
-/// Accepted suffixes (case-insensitive): `b`, `kb`, `kib`, `mb`, `mib`,
-/// `gb`, `gib`. SI variants (`kb`/`mb`/`gb`) use 10^N; IEC variants
-/// (`kib`/`mib`/`gib`) use 2^N. The bare suffix-less form is rejected so
-/// units are never ambiguous.
+/// Accepted suffixes (case-insensitive): `b`, `kib`, `mib`, `gib`. All
+/// IEC (powers of two): `kib`=2^10, `mib`=2^20, `gib`=2^30. SI variants
+/// (`kb`/`mb`/`gb`) are intentionally NOT accepted — they reject on the
+/// MiB-alignment check anyway, which is a footgun. IEC-only is
+/// unambiguous and consistent. The bare suffix-less form is rejected so
+/// units are never implicit.
 ///
 /// The output unit is MiB to match
 /// [`crate::vmm::disk_config::DiskConfig::capacity_mb`] (despite the
@@ -2085,18 +2087,12 @@ pub fn parse_disk_size_mib(s: &str) -> Result<u32> {
         (rest, "mib", 1u64 << 20)
     } else if let Some(rest) = lower.strip_suffix("kib") {
         (rest, "kib", 1u64 << 10)
-    } else if let Some(rest) = lower.strip_suffix("gb") {
-        (rest, "gb", 1_000_000_000u64)
-    } else if let Some(rest) = lower.strip_suffix("mb") {
-        (rest, "mb", 1_000_000u64)
-    } else if let Some(rest) = lower.strip_suffix("kb") {
-        (rest, "kb", 1_000u64)
     } else if let Some(rest) = lower.strip_suffix('b') {
         (rest, "b", 1u64)
     } else {
         bail!(
             "invalid disk size '{s}': missing unit suffix. Use one of \
-             b, kb, kib, mb, mib, gb, gib (case-insensitive)."
+             b, kib, mib, gib (case-insensitive)."
         );
     };
     let n = num_str.trim().parse::<u64>().map_err(|_| {
@@ -2127,6 +2123,38 @@ pub fn parse_disk_size_mib(s: &str) -> Result<u32> {
         );
     }
     Ok(mib_count as u32)
+}
+
+/// Help text for the `--disk <SIZE>` shell flag, shared between
+/// `cargo ktstr shell` (`src/bin/cargo-ktstr.rs`) and
+/// `ktstr shell` (`src/bin/ktstr.rs`) so a future tweak lands in
+/// one place. Mirrors the [`CPU_CAP_HELP`] pattern.
+pub const DISK_HELP: &str = "Attach a raw virtio-blk disk to /dev/vda. \
+     Accepts a human-readable size with a unit suffix (case-insensitive): \
+     b, kb, kib, mb, mib, gb, gib. SI variants (kb/mb/gb) use 10^N; IEC \
+     variants (kib/mib/gib) use 2^N. The size must be a positive whole \
+     number of MiB (e.g. 256mib, 1gib). Omit to boot without a disk.";
+
+/// Parse the `--disk <SIZE>` CLI argument into an
+/// [`Option<crate::vmm::disk_config::DiskConfig>`]. `None` input
+/// returns `Ok(None)` (no disk attached); a `Some(s)` input runs
+/// `s` through [`parse_disk_size_mib`] and wraps the result in a
+/// `DiskConfig` whose remaining fields fall through to
+/// [`crate::vmm::disk_config::DiskConfig::default`] (raw filesystem,
+/// no throttle, read-write). Shared between `cargo ktstr shell` and
+/// `ktstr shell` so both bins parse identically; a malformed size
+/// surfaces here at CLI-argument time, never mid-VM-setup.
+pub fn parse_disk_arg(s: Option<&str>) -> Result<Option<crate::vmm::disk_config::DiskConfig>> {
+    match s {
+        Some(raw) => {
+            let mib = parse_disk_size_mib(raw)?;
+            Ok(Some(crate::vmm::disk_config::DiskConfig {
+                capacity_mb: mib,
+                ..crate::vmm::disk_config::DiskConfig::default()
+            }))
+        }
+        None => Ok(None),
+    }
 }
 
 /// Check if a kernel .config contains CONFIG_SCHED_CLASS_EXT=y.
@@ -6256,22 +6284,20 @@ mod tests {
         assert_eq!(parse_disk_size_mib("1024kib").unwrap(), 1);
     }
 
-    /// SI `mb` parses 1 megabyte = 1_000_000 bytes; reject when not a
-    /// whole MiB, accept when it lines up. Pins the SI vs IEC split.
+    /// SI suffixes (`kb`, `mb`, `gb`) are rejected as unrecognized so
+    /// the user sees the unit-list diagnostic instead of a confusing
+    /// MiB-alignment failure. IEC-only is the unambiguous contract.
     #[test]
-    fn parse_disk_size_mib_si_suffixes_must_align_to_mib() {
-        // 1 MB = 1_000_000 bytes; 1 MiB = 1_048_576 bytes; not aligned.
-        let err = parse_disk_size_mib("1mb").expect_err("1MB is not a whole MiB");
-        assert!(format!("{err:#}").contains("not a whole number"));
-
-        // 1 GB = 1_000_000_000 bytes; 1 GB / 1 MiB = 953.6740... — also
-        // not aligned. Reject.
-        let err2 = parse_disk_size_mib("1gb").expect_err("1GB is not a whole MiB");
-        assert!(format!("{err2:#}").contains("not a whole number"));
-
-        // 1 KB * 1024 = 1_024_000 bytes — also not aligned to 1 MiB.
-        let err3 = parse_disk_size_mib("1024kb").expect_err("1024KB != 1 MiB");
-        assert!(format!("{err3:#}").contains("not a whole number"));
+    fn parse_disk_size_mib_rejects_si_suffixes() {
+        for input in ["1kb", "1mb", "1gb", "256MB", "10GB"] {
+            let err = parse_disk_size_mib(input)
+                .expect_err(&format!("SI suffix '{input}' must be rejected"));
+            let rendered = format!("{err:#}");
+            assert!(
+                rendered.contains("missing unit suffix"),
+                "expected unit-list diagnostic for {input:?}, got: {rendered}",
+            );
+        }
     }
 
     /// Bare `b` with a value that aligns to a MiB succeeds; a value
@@ -6298,8 +6324,9 @@ mod tests {
         let err = parse_disk_size_mib("256").expect_err("bare integer must fail");
         let rendered = format!("{err:#}");
         assert!(rendered.contains("missing unit suffix"));
-        assert!(rendered.contains("kb"));
+        assert!(rendered.contains("kib"));
         assert!(rendered.contains("mib"));
+        assert!(rendered.contains("gib"));
     }
 
     /// Empty / whitespace-only input is rejected up front.

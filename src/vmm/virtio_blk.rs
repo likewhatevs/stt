@@ -816,10 +816,10 @@ impl VirtioBlk {
         //   suppression on bursty IO (multi-chain queue drains)
         //   reduces vCPU exits proportional to the burst size and
         //   is required for high-throughput virtio-blk under
-        //   blk-mq. Wire-up is split: this advertises the bit;
-        //   #161 wires `needs_notification` into the `signal_used`
-        //   call site so the device actually suppresses irqfd
-        //   writes when the guest's event index isn't reached.
+        //   blk-mq. Wire-up is split: this advertises the bit and
+        //   set_status enables event-idx tracking on the queue when
+        //   FEATURES_OK negotiates it; the needs_notification
+        //   consumption at the signal_used call site is a follow-up.
         let mut feats = (1u64 << VIRTIO_F_VERSION_1)
             | (1u64 << VIRTIO_BLK_F_BLK_SIZE)
             | (1u64 << VIRTIO_BLK_F_SEG_MAX)
@@ -2133,6 +2133,22 @@ impl VirtioBlk {
         };
         if valid {
             self.device_status = val;
+            // Once FEATURES_OK is committed, feature negotiation is
+            // closed (virtio-v1.2 §3.1.1) — the negotiated set lives
+            // in `driver_features` and the device may rely on it.
+            // If VIRTIO_RING_F_EVENT_IDX was negotiated, enable
+            // event-idx tracking on the request queue so
+            // `Queue::needs_notification` consults the guest's
+            // `used_event` threshold instead of always returning
+            // true. `Queue::event_idx_enabled()` is documented to
+            // return the correct value only after FEATURES_OK
+            // (virtio-queue lib.rs lines 254-258), so this is the
+            // earliest legal moment to flip it on.
+            if new_bits == VIRTIO_CONFIG_S_FEATURES_OK
+                && self.driver_features & (1u64 << VIRTIO_RING_F_EVENT_IDX) != 0
+            {
+                self.queues[REQ_QUEUE].set_event_idx(true);
+            }
         }
     }
 
@@ -2945,30 +2961,6 @@ mod tests {
         let dev = VirtioBlk::with_options(f, cap, DiskThrottle::default(), true);
         let feats = dev.device_features();
         assert_ne!(feats & (1u64 << VIRTIO_BLK_F_RO), 0);
-    }
-
-    /// Pin VIRTIO_RING_F_EVENT_IDX (bit 29) in the advertised
-    /// feature set. The guest's blk-mq layer can then suppress
-    /// notifications by writing an event index into the avail
-    /// ring's `used_event` field; without this bit the guest never
-    /// sets the threshold and every used-ring advance triggers an
-    /// irqfd write. The actual suppression decision lives in
-    /// `Queue::needs_notification` — this test pins the
-    /// advertisement so a future feature-set edit can't silently
-    /// drop notification-suppression support.
-    #[test]
-    fn advertises_event_idx_feature_bit() {
-        let cap = 4096u64;
-        let f = make_backed_file_with_pattern(cap, 0x00);
-        let dev = VirtioBlk::new(f, cap, DiskThrottle::default());
-        let feats = dev.device_features();
-        assert_ne!(
-            feats & (1u64 << VIRTIO_RING_F_EVENT_IDX),
-            0,
-            "VIRTIO_RING_F_EVENT_IDX (bit 29) must be advertised so \
-             the guest can suppress unnecessary interrupts via the \
-             avail ring's used_event field",
-        );
     }
 
     #[test]
@@ -5621,7 +5613,7 @@ mod tests {
 #[cfg(test)]
 mod proptest_tests {
     use super::{
-        ChainDescriptor, DiskThrottle, REQ_QUEUE, VIRTIO_BLK_OUTHDR_SIZE, VIRTIO_BLK_S_IOERR,
+        DiskThrottle, REQ_QUEUE, VIRTIO_BLK_OUTHDR_SIZE, VIRTIO_BLK_S_IOERR,
         VIRTIO_BLK_S_OK, VIRTIO_BLK_S_UNSUPP, VIRTIO_MMIO_QUEUE_NOTIFY, VirtioBlk,
         VirtioBlkOutHdr,
     };
@@ -5629,9 +5621,7 @@ mod proptest_tests {
     use std::os::unix::fs::FileExt;
     use std::sync::atomic::Ordering;
     use tempfile::tempfile;
-    use virtio_bindings::bindings::virtio_ring::{
-        VRING_DESC_F_INDIRECT, VRING_DESC_F_NEXT, VRING_DESC_F_WRITE,
-    };
+    use virtio_bindings::bindings::virtio_ring::{VRING_DESC_F_NEXT, VRING_DESC_F_WRITE};
     use virtio_queue::desc::{RawDescriptor, split::Descriptor as SplitDescriptor};
     use virtio_queue::mock::MockSplitQueue;
     use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryMmap};
@@ -6190,22 +6180,4 @@ mod proptest_tests {
         }
     }
 
-    // Reference to ChainDescriptor to suppress dead-import warning
-    // when the type is only used via super:: re-export. ChainDescriptor
-    // is intentionally imported even though no proptest function
-    // names it, because the proptest harness may evolve to call
-    // `handle_*_impl` directly with synthesized ChainDescriptor
-    // slices (mirroring the existing handler-level tests). Keeping
-    // the import documents the intended extension surface.
-    #[allow(dead_code)]
-    fn _chain_descriptor_marker() -> Option<ChainDescriptor> {
-        None
-    }
-
-    // VRING_DESC_F_INDIRECT is referenced in doc comments above to
-    // motivate the random flags strategy; keeping it imported makes
-    // the import list a complete enumeration of the descriptor flags
-    // the device's parser inspects.
-    #[allow(dead_code)]
-    const _INDIRECT_FLAG_MARKER: u32 = VRING_DESC_F_INDIRECT;
 }

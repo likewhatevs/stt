@@ -85,12 +85,14 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut threads_set = false;
     let mut numa_nodes_set = false;
     let mut memory_mb = DEFAULT_MEMORY_MB;
+    let mut memory_mb_set = false;
     let mut scheduler: Option<syn::Path> = None;
     let mut payload: Option<syn::Path> = None;
     let mut payload_set = false;
     let mut workloads: Vec<syn::Path> = Vec::new();
     let mut workloads_set = false;
     let mut auto_repro = true;
+    let mut auto_repro_set = false;
     let mut not_starved: Option<bool> = None;
     let mut isolation: Option<bool> = None;
     let mut max_gap_ms: Option<u64> = None;
@@ -129,12 +131,18 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut max_cpus: Option<u32> = Some(192);
     let mut max_cpus_set = false;
     let mut watchdog_timeout_s: u64 = 4;
+    let mut watchdog_timeout_s_set = false;
     let mut performance_mode: bool = false;
+    let mut performance_mode_set = false;
     let mut duration_s: u64 = 2;
+    let mut duration_s_set = false;
     let mut workers_per_cgroup: u32 = 2;
+    let mut workers_per_cgroup_set = false;
     let mut bpf_map_write: Option<syn::Path> = None;
     let mut expect_err: bool = false;
+    let mut expect_err_set = false;
     let mut host_only: bool = false;
+    let mut host_only_set = false;
     let mut cleanup_budget_ms: Option<u64> = None;
 
     let attr_parser = syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated;
@@ -262,17 +270,29 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                             }
                         };
                         match ident.as_str() {
-                            "auto_repro" => auto_repro = lit_bool.value(),
+                            "auto_repro" => {
+                                auto_repro = lit_bool.value();
+                                auto_repro_set = true;
+                            }
                             "not_starved" => not_starved = Some(lit_bool.value()),
                             "isolation" => isolation = Some(lit_bool.value()),
-                            "performance_mode" => performance_mode = lit_bool.value(),
+                            "performance_mode" => {
+                                performance_mode = lit_bool.value();
+                                performance_mode_set = true;
+                            }
                             "requires_smt" => {
                                 requires_smt = lit_bool.value();
                                 requires_smt_set = true;
                             }
-                            "expect_err" => expect_err = lit_bool.value(),
+                            "expect_err" => {
+                                expect_err = lit_bool.value();
+                                expect_err_set = true;
+                            }
                             "fail_on_stall" => fail_on_stall = Some(lit_bool.value()),
-                            "host_only" => host_only = lit_bool.value(),
+                            "host_only" => {
+                                host_only = lit_bool.value();
+                                host_only_set = true;
+                            }
                             _ => unreachable!(),
                         }
                     }
@@ -334,7 +354,8 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                             "memory_mb" => {
                                 memory_mb = lit_int
                                     .base10_parse::<u32>()
-                                    .unwrap_or_else(|e| panic!("{e}"))
+                                    .unwrap_or_else(|e| panic!("{e}"));
+                                memory_mb_set = true;
                             }
                             "sustained_samples" => {
                                 sustained_samples = Some(
@@ -360,17 +381,20 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                             "watchdog_timeout_s" => {
                                 watchdog_timeout_s = lit_int
                                     .base10_parse::<u64>()
-                                    .unwrap_or_else(|e| panic!("{e}"))
+                                    .unwrap_or_else(|e| panic!("{e}"));
+                                watchdog_timeout_s_set = true;
                             }
                             "duration_s" => {
                                 duration_s = lit_int
                                     .base10_parse::<u64>()
-                                    .unwrap_or_else(|e| panic!("{e}"))
+                                    .unwrap_or_else(|e| panic!("{e}"));
+                                duration_s_set = true;
                             }
                             "workers_per_cgroup" => {
                                 workers_per_cgroup = lit_int
                                     .base10_parse::<u32>()
-                                    .unwrap_or_else(|e| panic!("{e}"))
+                                    .unwrap_or_else(|e| panic!("{e}"));
+                                workers_per_cgroup_set = true;
                             }
                             "max_local_dsq_depth" => {
                                 max_local_dsq_depth = Some(
@@ -929,6 +953,144 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         workloads.iter().map(|p| quote! { &#p }).collect();
     let workloads_tokens = quote! { &[#(#workload_refs),*] };
 
+    // Conditionally-emitted KtstrTestEntry fields. Each block is
+    // either an empty TokenStream (so the field is left to
+    // `..KtstrTestEntry::DEFAULT` in the spread) or a `field: VAL,`
+    // pair when the macro must override the default. This pattern
+    // means new struct fields with sane defaults need no macro
+    // change — adding to KtstrTestEntry::DEFAULT alone is enough.
+    let memory_mb_field = if memory_mb_set {
+        quote! { memory_mb: #memory_mb, }
+    } else {
+        quote! {}
+    };
+    let payload_field = if payload_set {
+        quote! { payload: #payload_tokens, }
+    } else {
+        quote! {}
+    };
+    let workloads_field = if workloads_set {
+        quote! { workloads: #workloads_tokens, }
+    } else {
+        quote! {}
+    };
+    let auto_repro_field = if auto_repro_set {
+        quote! { auto_repro: #auto_repro, }
+    } else {
+        quote! {}
+    };
+    // Any of the per-check assert fields supplied by the attribute
+    // forces emission of the full `assert: Assert { .. }` block. When
+    // none are set the spread inherits `Assert::NO_OVERRIDES` from
+    // `KtstrTestEntry::DEFAULT`, which is bit-for-bit identical to
+    // the all-`None` Assert the prior unconditional emission produced.
+    let any_assert_set = not_starved.is_some()
+        || isolation.is_some()
+        || max_gap_ms.is_some()
+        || max_spread_pct.is_some()
+        || max_throughput_cv.is_some()
+        || min_work_rate.is_some()
+        || max_p99_wake_latency_ns.is_some()
+        || max_wake_latency_cv.is_some()
+        || min_iteration_rate.is_some()
+        || max_migration_ratio.is_some()
+        || max_imbalance_ratio.is_some()
+        || max_local_dsq_depth.is_some()
+        || fail_on_stall.is_some()
+        || sustained_samples.is_some()
+        || max_fallback_rate.is_some()
+        || max_keep_last_rate.is_some()
+        || min_page_locality.is_some()
+        || max_cross_node_migration_ratio.is_some()
+        || max_slow_tier_ratio.is_some();
+    let assert_field = if any_assert_set {
+        quote! {
+            assert: ::ktstr::assert::Assert {
+                not_starved: #not_starved_tokens,
+                isolation: #isolation_tokens,
+                max_gap_ms: #gap_tokens,
+                max_spread_pct: #spread_tokens,
+                max_throughput_cv: #throughput_cv_tokens,
+                min_work_rate: #work_rate_tokens,
+                max_p99_wake_latency_ns: #p99_wake_tokens,
+                max_wake_latency_cv: #wake_cv_tokens,
+                min_iteration_rate: #iter_rate_tokens,
+                max_migration_ratio: #mig_ratio_tokens,
+                max_imbalance_ratio: #imbalance_tokens,
+                max_local_dsq_depth: #dsq_tokens,
+                fail_on_stall: #stall_tokens,
+                sustained_samples: #sustained_tokens,
+                max_fallback_rate: #fallback_rate_tokens,
+                max_keep_last_rate: #keep_last_rate_tokens,
+                min_page_locality: #page_locality_tokens,
+                max_cross_node_migration_ratio: #cross_node_mig_tokens,
+                max_slow_tier_ratio: #slow_tier_tokens,
+            },
+        }
+    } else {
+        quote! {}
+    };
+    let extra_sched_args_field = if extra_sched_args.is_empty() {
+        quote! {}
+    } else {
+        quote! { extra_sched_args: &[#(#extra_sched_args),*], }
+    };
+    let required_flags_field = if required_flags.is_empty() {
+        quote! {}
+    } else {
+        quote! { required_flags: &[#(#required_flags),*], }
+    };
+    let excluded_flags_field = if excluded_flags.is_empty() {
+        quote! {}
+    } else {
+        quote! { excluded_flags: &[#(#excluded_flags),*], }
+    };
+    let watchdog_timeout_field = if watchdog_timeout_s_set {
+        quote! { watchdog_timeout: ::std::time::Duration::from_secs(#watchdog_timeout_s), }
+    } else {
+        quote! {}
+    };
+    let bpf_map_write_field = if bpf_map_write.is_some() {
+        quote! { bpf_map_write: #bpf_map_write_tokens, }
+    } else {
+        quote! {}
+    };
+    let performance_mode_field = if performance_mode_set {
+        quote! { performance_mode: #performance_mode, }
+    } else {
+        quote! {}
+    };
+    let duration_field = if duration_s_set {
+        quote! { duration: ::std::time::Duration::from_secs(#duration_s), }
+    } else {
+        quote! {}
+    };
+    let workers_per_cgroup_field = if workers_per_cgroup_set {
+        quote! { workers_per_cgroup: #workers_per_cgroup, }
+    } else {
+        quote! {}
+    };
+    let expect_err_field = if expect_err_set {
+        quote! { expect_err: #expect_err, }
+    } else {
+        quote! {}
+    };
+    let host_only_field = if host_only_set {
+        quote! { host_only: #host_only, }
+    } else {
+        quote! {}
+    };
+    let extra_include_files_field = if extra_include_files.is_empty() {
+        quote! {}
+    } else {
+        quote! { extra_include_files: &[#(#extra_include_files),*], }
+    };
+    let cleanup_budget_field = if cleanup_budget_ms.is_some() {
+        quote! { cleanup_budget: #cleanup_budget_tokens, }
+    } else {
+        quote! {}
+    };
+
     let test_body = if expect_err {
         quote! {
             let result = ::ktstr::test_support::run_ktstr_test(&#entry_name);
@@ -1021,6 +1183,17 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         #[::ktstr::__private::linkme::distributed_slice(::ktstr::test_support::KTSTR_TESTS)]
         #[linkme(crate = ::ktstr::__private::linkme)]
         static #entry_name: ::ktstr::test_support::KtstrTestEntry = ::ktstr::test_support::KtstrTestEntry {
+            // Always-emit fields. `name`/`func` are macro-generated;
+            // `topology`/`constraints` inherit from the scheduler
+            // payload via const accessors that the spread cannot
+            // recover; `scheduler` substitutes
+            // `Payload::KERNEL_DEFAULT` when no `scheduler = ...`
+            // attribute was supplied. Every remaining field below
+            // (memory_mb, payload, workloads, auto_repro, assert,
+            // extra_sched_args, ..., disk, and any future addition)
+            // falls through to `..KtstrTestEntry::DEFAULT` when the
+            // attribute did not specify a value, so future fields
+            // with sane defaults need no macro change at all.
             name: #name_str,
             func: #inner_name,
             topology: #topology_tokens,
@@ -1033,45 +1206,25 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                 min_cpus: #min_cpus_tokens,
                 max_cpus: #max_cpus_tokens,
             },
-            memory_mb: #memory_mb,
             scheduler: #scheduler_tokens,
-            payload: #payload_tokens,
-            workloads: #workloads_tokens,
-            auto_repro: #auto_repro,
-            assert: ::ktstr::assert::Assert {
-                not_starved: #not_starved_tokens,
-                isolation: #isolation_tokens,
-                max_gap_ms: #gap_tokens,
-                max_spread_pct: #spread_tokens,
-                max_throughput_cv: #throughput_cv_tokens,
-                min_work_rate: #work_rate_tokens,
-                max_p99_wake_latency_ns: #p99_wake_tokens,
-                max_wake_latency_cv: #wake_cv_tokens,
-                min_iteration_rate: #iter_rate_tokens,
-                max_migration_ratio: #mig_ratio_tokens,
-                max_imbalance_ratio: #imbalance_tokens,
-                max_local_dsq_depth: #dsq_tokens,
-                fail_on_stall: #stall_tokens,
-                sustained_samples: #sustained_tokens,
-                max_fallback_rate: #fallback_rate_tokens,
-                max_keep_last_rate: #keep_last_rate_tokens,
-                min_page_locality: #page_locality_tokens,
-                max_cross_node_migration_ratio: #cross_node_mig_tokens,
-                max_slow_tier_ratio: #slow_tier_tokens,
-            },
-            extra_sched_args: &[#(#extra_sched_args),*],
-            required_flags: &[#(#required_flags),*],
-            excluded_flags: &[#(#excluded_flags),*],
-            watchdog_timeout: ::std::time::Duration::from_secs(#watchdog_timeout_s),
-            bpf_map_write: #bpf_map_write_tokens,
-            performance_mode: #performance_mode,
-            duration: ::std::time::Duration::from_secs(#duration_s),
-            workers_per_cgroup: #workers_per_cgroup,
-            expect_err: #expect_err,
-            host_only: #host_only,
-            extra_include_files: &[#(#extra_include_files),*],
-            cleanup_budget: #cleanup_budget_tokens,
-            disk: ::core::option::Option::None,
+            #memory_mb_field
+            #payload_field
+            #workloads_field
+            #auto_repro_field
+            #assert_field
+            #extra_sched_args_field
+            #required_flags_field
+            #excluded_flags_field
+            #watchdog_timeout_field
+            #bpf_map_write_field
+            #performance_mode_field
+            #duration_field
+            #workers_per_cgroup_field
+            #expect_err_field
+            #host_only_field
+            #extra_include_files_field
+            #cleanup_budget_field
+            ..::ktstr::test_support::KtstrTestEntry::DEFAULT
         };
 
         #[test]

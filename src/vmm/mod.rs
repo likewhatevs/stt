@@ -953,10 +953,38 @@ pub struct VmResult {
     /// per field on the consumer side observes the final cumulative
     /// totals.
     ///
-    /// Test code that wants to assert on disk activity reads the
-    /// fields through the public re-export at
-    /// [`crate::vmm::VirtioBlkCounters`]; see the type docs for the
-    /// counter semantics.
+    /// The counter struct exposes seven `AtomicU64` fields, each
+    /// bumped from `process_requests`:
+    ///
+    ///   - `reads_completed` — count of `VIRTIO_BLK_T_IN` requests
+    ///     that returned `S_OK` to the guest. Bumped together with
+    ///     `bytes_read` per [`VirtioBlkCounters::record_read`] in
+    ///     `src/vmm/virtio_blk.rs`.
+    ///   - `writes_completed` — count of `VIRTIO_BLK_T_OUT` requests
+    ///     that returned `S_OK`. Bumped together with `bytes_written`.
+    ///   - `flushes_completed` — count of `VIRTIO_BLK_T_FLUSH`
+    ///     requests that returned `S_OK` (real `fdatasync` for
+    ///     read-write disks, no-op for `read_only`).
+    ///   - `bytes_read` — total bytes returned to the guest for
+    ///     completed reads.
+    ///   - `bytes_written` — total bytes accepted from the guest for
+    ///     completed writes.
+    ///   - `throttled_count` — token-bucket rejections. The guest
+    ///     sees `S_IOERR`; this counter is separate from
+    ///     `io_errors` so operators can distinguish "throttle bucket
+    ///     drained" from "real IO problem".
+    ///   - `io_errors` — every path that reports `S_IOERR`:
+    ///     spec violations, backend `pread`/`pwrite` errors,
+    ///     malformed chains, `add_used` failures.
+    ///
+    /// Reading example:
+    ///
+    /// ```ignore
+    /// use std::sync::atomic::Ordering;
+    /// let r: VmResult = builder.run()?;
+    /// let c = r.virtio_blk_counters.expect("disk attached");
+    /// assert!(c.reads_completed.load(Ordering::Relaxed) > 0);
+    /// ```
     ///
     /// `#[allow(dead_code)]` mirrors `stimulus_events` above: the
     /// field is part of the public API surface and read by user
@@ -6459,10 +6487,14 @@ mod tests {
         assert_eq!(r2.duration, Duration::from_millis(500));
         assert!(r2.cleanup_duration.is_none());
         // Opposite polarity: counters present. Reads must observe
-        // the default-zero values; the Arc handle is the same one
-        // `init_virtio_blk` clones onto `VmRunState`, so test code
-        // that wants to assert on disk activity calls `.load()` on
-        // each counter through this field after the VM exits.
+        // the default-zero values for every field — a future field
+        // added to VirtioBlkCounters that doesn't initialise to 0
+        // would break the "fresh device reports zero activity"
+        // contract that VmResult readers rely on. The Arc handle is
+        // the same one `init_virtio_blk` clones onto `VmRunState`,
+        // so test code that wants to assert on disk activity calls
+        // `.load()` on each counter through this field after the VM
+        // exits.
         let counters = r2.virtio_blk_counters.as_ref().unwrap();
         assert_eq!(
             counters
@@ -6474,6 +6506,34 @@ mod tests {
             counters
                 .writes_completed
                 .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+        );
+        assert_eq!(
+            counters
+                .flushes_completed
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+        );
+        assert_eq!(
+            counters
+                .bytes_read
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+        );
+        assert_eq!(
+            counters
+                .bytes_written
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+        );
+        assert_eq!(
+            counters
+                .throttled_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+        );
+        assert_eq!(
+            counters.io_errors.load(std::sync::atomic::Ordering::Relaxed),
             0,
         );
     }
