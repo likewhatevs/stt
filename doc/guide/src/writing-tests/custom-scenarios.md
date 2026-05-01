@@ -2,8 +2,6 @@
 
 For dynamic scenarios (cgroup creation/removal, cpuset changes), prefer
 the [ops/steps system](../concepts/ops.md) over raw `Action::Custom`.
-See [Write a Dynamic Scenario](../recipes/dynamic-scenario.md) for
-ops-based examples.
 
 Use `Action::Custom` only when you need logic that the ops system
 cannot express.
@@ -93,7 +91,3 @@ Use `Assert` for both direct report checking and ops-based scenarios.
 Call `assert.assert_cgroup(reports, cpuset)` for manual report
 collection, or use `execute_steps_with()` for ops-based scenarios. See
 [Checking](../concepts/checking.md#worker-checks-via-assert).
-
-## Registering a custom scenario (ktstr contributors only)
-
-See [Write a Dynamic Scenario: Registering](../recipes/dynamic-scenario.md#registering-ktstr-contributors-only).

@@ -1374,22 +1374,6 @@ static SCHED_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::n
 /// In repro mode, don't kill the scheduler on stall — keep it alive for assertions.
 static REPRO_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Set the scheduler PID for the work-conservation watchdog.
-///
-/// Workers send SIGUSR2 to this PID when stuck > 2 seconds,
-/// unless repro mode is active (see [`set_repro_mode`]).
-#[doc(hidden)]
-pub(crate) fn set_sched_pid(pid: i32) {
-    SCHED_PID.store(pid, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Enable/disable repro mode. When true, the watchdog is suppressed
-/// so the scheduler stays alive for BPF kprobe assertions.
-#[doc(hidden)]
-pub(crate) fn set_repro_mode(v: bool) {
-    REPRO_MODE.store(v, std::sync::atomic::Ordering::Relaxed);
-}
-
 /// Handle to spawned worker processes (forked, not threads).
 /// Workers block until [`start()`](Self::start) is called.
 /// Each worker is a separate process so it can be in its own cgroup.
@@ -5263,23 +5247,6 @@ mod tests {
             !std::path::Path::new(&path).exists(),
             "temp file {path} should be cleaned up"
         );
-    }
-
-    #[test]
-    fn set_sched_pid_stores_value() {
-        set_sched_pid(12345);
-        let v = SCHED_PID.load(std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(v, 12345);
-        // Reset
-        set_sched_pid(0);
-    }
-
-    #[test]
-    fn set_repro_mode_stores_value() {
-        set_repro_mode(true);
-        assert!(REPRO_MODE.load(std::sync::atomic::Ordering::Relaxed));
-        set_repro_mode(false);
-        assert!(!REPRO_MODE.load(std::sync::atomic::Ordering::Relaxed));
     }
 
     #[test]

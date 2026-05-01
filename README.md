@@ -77,10 +77,12 @@ cargo install --locked ktstr --bin ktstr --bin cargo-ktstr
 
 This installs the two user-facing binaries:
 
-- `ktstr` -- host-side CLI for running scenarios outside VMs and
-  managing cached kernel images
+- `ktstr` -- standalone CLI for kernel cache management,
+  interactive VM shells, host-wide per-thread profiling, and
+  lock introspection
 - `cargo-ktstr` -- wraps `cargo nextest run` with kernel resolution,
-  coverage, verifier stats, and shell access
+  coverage, verifier stats, shell access, and `cargo ktstr export`
+  for reproducing test scenarios as self-contained shell scripts
 
 The workspace defines two additional `[[bin]]` targets —
 `ktstr-jemalloc-probe` and `ktstr-jemalloc-alloc-worker` — but
@@ -343,28 +345,23 @@ cargo ktstr stats                                          # aggregate gauntlet 
 cargo ktstr stats show-host --run <key>                    # print archived HostContext for a run
 cargo ktstr show-host                                      # print current host context
 cargo ktstr show-thresholds my_test                        # print resolved Assert thresholds for a test
-cargo ktstr cleanup                                        # remove leftover ktstr cgroups
+cargo ktstr export my_test                                 # write a self-contained .run for bare-metal repro
 cargo ktstr shell --kernel 6.14.2                          # interactive VM shell
 cargo ktstr shell --kernel 6.14.2 --no-perf-mode           # shell on shared runners (skip flock/pinning/RT)
 cargo ktstr completions bash                               # shell completions
 ```
 
-### Host-side CLI
+### Standalone CLI
 
-`ktstr` runs scenarios directly on the host under whatever scheduler
-is already active -- no VM, just the real
-hardware. This complements `#[ktstr_test]` library tests, which boot
-a KVM VM per test with a controlled virtual topology for reproducible
-results.
+`ktstr` is the debugging companion to the `#[ktstr_test]`
+test harness. It owns kernel cache management, interactive VM
+shells, host-wide per-thread profiling, and lock introspection.
 
 Every `ktstr kernel ...` subcommand is identical to the corresponding
 `cargo ktstr kernel ...`.
 
 ```sh
-ktstr list                                                 # list available scenarios
-ktstr run                                                  # run all scenarios on the host
 ktstr topo                                                 # show host CPU topology
-ktstr cleanup                                              # remove leftover cgroups
 ktstr shell --kernel 6.14.2                                # interactive VM shell (kernel optional)
 ktstr kernel list                                          # manage cached kernels
 ktstr kernel build 6.14.2
@@ -377,15 +374,12 @@ ktstr ctprof capture --output baseline.ctprof.zst         # snapshot every live 
 ktstr ctprof compare baseline.ctprof.zst candidate.ctprof.zst # diff two snapshots on the selected grouping axis
 ktstr ctprof show baseline.ctprof.zst                     # render one snapshot, no diff math
 ktstr ctprof metric-list                                  # discover the metric vocabulary (--sort-by / --metrics)
+ktstr locks                                               # enumerate held flocks (read-only)
 ktstr completions bash
 ```
 
-Or via `cargo run` from the workspace:
-
-```sh
-cargo run --bin ktstr -- list
-cargo run --bin ktstr -- run
-```
+To reproduce a test scenario as a bare-metal shell script
+without the test harness, use `cargo ktstr export`.
 
 ## Release profile — `panic = "abort"`
 

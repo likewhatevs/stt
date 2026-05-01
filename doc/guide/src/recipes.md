@@ -14,8 +14,6 @@ Standalone examples for common tasks. Each recipe is self-contained.
 - [Diagnose a slow scheduler with ctprof](recipes/diagnose-slow-scheduler.md) --
   per-thread profile diff via `ktstr ctprof capture` /
   `compare`, with the taskstats off-CPU lens
-- [Write a dynamic scenario](recipes/dynamic-scenario.md) -- ops/steps
-  with CgroupDef
 - [Customize checking](recipes/custom-checking.md) -- scheduler
   thresholds, per-test overrides
 - [Benchmarking and negative tests](recipes/benchmarking-tests.md) --

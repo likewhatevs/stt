@@ -329,7 +329,6 @@ regression measurement where host jitter must be controlled.
 
 Available via:
 
-- `ktstr run --no-perf-mode`
 - `ktstr shell --no-perf-mode`
 - `cargo ktstr test --no-perf-mode`
 - `cargo ktstr coverage --no-perf-mode`

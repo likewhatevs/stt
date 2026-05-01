@@ -108,21 +108,6 @@ pub const STRUCT_FIELDS: &[(&str, &[(&str, &str)])] = &[
     ("scx_cgroup_init_args", &[("->weight", "weight")]),
 ];
 
-/// Resolve the BTF source path for a given kernel source directory.
-/// If `{kernel_dir}/vmlinux` exists (uncompressed ELF with embedded BTF),
-/// return its path. Otherwise return None to fall back to sysfs.
-pub fn resolve_btf_path(kernel_dir: Option<&str>) -> Option<std::path::PathBuf> {
-    let dir = kernel_dir?;
-    let vmlinux = std::path::Path::new(dir).join("vmlinux");
-    if vmlinux.exists() {
-        tracing::debug!(path = %vmlinux.display(), "btf: using vmlinux from kernel_dir");
-        Some(vmlinux)
-    } else {
-        tracing::debug!(path = %vmlinux.display(), "btf: vmlinux not found, falling back to sysfs");
-        None
-    }
-}
-
 /// Runtime-resolved field dereference spec for the BPF skeleton.
 /// Maps 1:1 to the C `struct field_spec` in intf.h.
 #[derive(Debug, Clone)]
@@ -1765,24 +1750,6 @@ mod tests {
         let _ = discover_bpf_symbols(&[]);
     }
 
-    // -- resolve_btf_path --
-
-    #[test]
-    fn resolve_btf_path_none() {
-        assert!(resolve_btf_path(None).is_none());
-    }
-
-    #[test]
-    fn resolve_btf_path_nonexistent() {
-        assert!(resolve_btf_path(Some("/nonexistent/path")).is_none());
-    }
-
-    #[test]
-    fn resolve_btf_path_dir_without_vmlinux() {
-        let dir = std::env::temp_dir();
-        assert!(resolve_btf_path(Some(dir.to_str().unwrap())).is_none());
-    }
-
     // -- STRUCT_FIELDS invariants --
 
     #[test]
@@ -1909,15 +1876,6 @@ mod tests {
     fn parse_btf_multiple_unknown_funcs() {
         let funcs = parse_btf_functions(&["__fake_a__", "__fake_b__", "__fake_c__"], None);
         assert!(funcs.is_empty());
-    }
-
-    // -- resolve_btf_path with existing vmlinux --
-
-    #[test]
-    fn resolve_btf_path_real_kernel_dir() {
-        // If /usr/lib/debug/boot/vmlinux exists, this would return Some.
-        // On most systems it doesn't, so we just verify no panic.
-        let _ = resolve_btf_path(Some("/usr/lib/debug/boot"));
     }
 
     // -- STRUCT_FIELDS field access patterns --

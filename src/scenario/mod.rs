@@ -18,9 +18,6 @@
 //!
 //! The [`scenarios`] submodule provides curated canned scenarios.
 //!
-//! For data-driven test cases (used by the internal catalog), see
-//! [`Scenario`], [`CpusetPartition`], and [`Action`].
-//!
 //! See the [Scenarios](https://likewhatevs.github.io/ktstr/guide/concepts/scenarios.html)
 //! and [Writing Tests](https://likewhatevs.github.io/ktstr/guide/writing-tests.html)
 //! chapters of the guide.
@@ -28,7 +25,6 @@
 pub mod affinity;
 pub mod backdrop;
 pub mod basic;
-mod catalog;
 pub mod cpuset;
 pub mod dynamic;
 pub mod interaction;
@@ -40,7 +36,6 @@ pub mod scenarios;
 pub mod stress;
 
 pub use backdrop::Backdrop;
-pub use catalog::all_scenarios;
 
 use std::collections::BTreeSet;
 use std::thread;
@@ -97,8 +92,6 @@ fn process_alive(pid: libc::pid_t) -> bool {
     kill(Pid::from_raw(pid), None).is_ok()
 }
 
-pub(crate) use crate::read_kmsg;
-
 // ---------------------------------------------------------------------------
 // Flag system
 // ---------------------------------------------------------------------------
@@ -107,9 +100,9 @@ pub(crate) use crate::read_kmsg;
 ///
 /// The built-in `*_DECL` constants (`LLC_DECL`, `BORROW_DECL`, etc.)
 /// have empty `args` fields. They define flag names and dependencies
-/// for ktstr's internal scenario catalog. External consumers define
-/// their own `FlagDecl` statics with populated `args` fields
-/// containing their scheduler's actual CLI arguments.
+/// only. External consumers define their own `FlagDecl` statics with
+/// populated `args` fields containing their scheduler's actual CLI
+/// arguments.
 ///
 /// String name constants (`LLC`, `BORROW`, etc.) are used in
 /// [`FlagProfile::flags`] and [`generate_profiles()`](Scheduler::generate_profiles).
@@ -346,15 +339,8 @@ impl FlagProfile {
 }
 
 // Re-export AffinityKind from workload so existing `use super::*` in
-// submodules (catalog.rs, affinity.rs, etc.) can find it.
+// submodules (affinity.rs, etc.) can find it.
 pub use crate::workload::AffinityKind;
-
-/// Look up flag dependencies via FlagDecl.requires.
-fn flag_requires(flag: &str) -> Vec<&'static str> {
-    flags::decl_by_name(flag)
-        .map(|d| d.requires.iter().map(|r| r.name).collect())
-        .unwrap_or_default()
-}
 
 /// Enumerate flag profiles from a flag-name universe, a
 /// requires-edge resolver, and required/excluded constraints.
@@ -407,180 +393,6 @@ where
         }
     }
     out
-}
-
-fn generate_profiles(required: &[&'static str], excluded: &[&'static str]) -> Vec<FlagProfile> {
-    compute_flag_profiles(flags::ALL, |&f| flag_requires(f), required, excluded)
-        .into_iter()
-        .map(|flags| FlagProfile { flags })
-        .collect()
-}
-
-// ---------------------------------------------------------------------------
-// Scenario definition (data-driven)
-// ---------------------------------------------------------------------------
-
-/// Scenario-level CPU partitioning strategy.
-///
-/// Determines how CPUs are split across all cgroups in a data-driven
-/// [`Scenario`]. Each variant produces a different cpuset assignment
-/// based on the VM's [`TestTopology`] and the scenario's `num_cgroups`.
-///
-/// This is distinct from [`ops::CpusetSpec`], which computes a single
-/// cpuset for one cgroup in the ops/steps system. `CpusetPartition`
-/// partitions at the scenario level; `CpusetSpec` specifies per-cgroup.
-#[derive(Clone, Debug)]
-pub enum CpusetPartition {
-    /// Each cgroup sees the full usable CPU set; no partitioning.
-    None,
-    /// Each cgroup is pinned to the CPUs of one full LLC, assigned in
-    /// order. Requires at least as many LLCs as cgroups.
-    LlcAligned,
-    /// Partition `usable_cpus()` into contiguous even halves (or
-    /// as-even-as-possible groups) per cgroup.
-    SplitHalf,
-    /// Like `SplitHalf` but chooses boundaries that cross LLC lines
-    /// to stress cross-LLC placement.
-    SplitMisaligned,
-    /// Each cgroup gets the full set overlapped by the given fraction
-    /// with its neighbour; `0.0` behaves like `SplitHalf`, `1.0` like
-    /// `None`.
-    Overlap(f64),
-    /// Asymmetric split where cgroup 0 receives this fraction of the
-    /// usable CPUs and the remaining cgroups share the rest.
-    Uneven(f64),
-    /// Reserve this fraction of CPUs outside the scenario, then split
-    /// the rest evenly across cgroups.
-    Holdback(f64),
-}
-
-/// Callable body for [`Action::Custom`].
-///
-/// Wrapped in [`std::sync::Arc`] so [`Action`] (and the enclosing
-/// [`Scenario`]) stays cheaply [`Clone`] while allowing closures that
-/// capture state. Bare `fn` pointers forced callers to hoist state
-/// into static or thread-local slots; `Arc<dyn Fn>` keeps captures
-/// where the scenario is built. The `Send + Sync` bounds mirror
-/// [`Scenario`]'s — catalog entries are shared across the worker
-/// dispatch pool.
-pub type CustomFn = std::sync::Arc<dyn Fn(&Ctx) -> Result<AssertResult> + Send + Sync>;
-
-/// What happens during a scenario's workload phase.
-///
-/// `Steady` runs workers for the configured duration with no dynamic
-/// operations. `Custom` wraps a caller-supplied closure (see
-/// [`Action::custom`] for an example with captured state).
-#[derive(Clone)]
-pub enum Action {
-    /// Run workers for the configured duration with no dynamic operations.
-    Steady,
-    /// Execute custom scenario logic with access to the full test context.
-    Custom(CustomFn),
-}
-
-impl Action {
-    /// Build a [`Custom`](Self::Custom) from any closure. Wraps the
-    /// body in the shared [`CustomFn`] `Arc` so callers avoid spelling
-    /// out `Arc::new(...)` at every catalog entry.
-    ///
-    /// The closure may capture state. Captured values must be
-    /// `Send + Sync + 'static` so the closure can be shared across
-    /// threads. The resulting [`Action`] is cheaply [`Clone`] via
-    /// `Arc` reference counting.
-    ///
-    /// # Example
-    /// ```
-    /// use ktstr::scenario::Action;
-    /// use ktstr::assert::AssertResult;
-    /// use std::sync::atomic::{AtomicU32, Ordering};
-    /// use std::sync::Arc;
-    ///
-    /// // Capture a shared counter that the scenario increments per run.
-    /// let counter = Arc::new(AtomicU32::new(0));
-    /// let counter_ref = counter.clone();
-    /// let _action = Action::custom(move |_ctx| {
-    ///     counter_ref.fetch_add(1, Ordering::Relaxed);
-    ///     Ok(AssertResult::pass())
-    /// });
-    /// ```
-    pub fn custom<F>(f: F) -> Self
-    where
-        F: Fn(&Ctx) -> Result<AssertResult> + Send + Sync + 'static,
-    {
-        Action::Custom(std::sync::Arc::new(f))
-    }
-}
-
-impl std::fmt::Debug for Action {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Action::Steady => write!(f, "Steady"),
-            Action::Custom(_) => write!(f, "Custom(<closure>)"),
-        }
-    }
-}
-
-/// A data-driven test case.
-///
-/// Declares the cgroup topology, CPU partitioning, workloads, and
-/// execution mode for a single test scenario. All scenarios are
-/// registered in [`all_scenarios()`].
-///
-/// # Flag constraints
-///
-/// `required_flags` and `excluded_flags` use typed [`FlagDecl`](flags::FlagDecl)
-/// references. [`profiles()`](Scenario::profiles) generates all valid
-/// flag combinations that satisfy these constraints.
-///
-/// ```
-/// # use ktstr::scenario::all_scenarios;
-/// let scenarios = all_scenarios();
-/// assert!(!scenarios.is_empty());
-///
-/// let first = &scenarios[0];
-/// assert!(!first.name.is_empty());
-/// assert!(!first.category.is_empty());
-///
-/// let profiles = first.profiles();
-/// assert!(!profiles.is_empty());
-/// ```
-#[derive(Clone, Debug)]
-pub struct Scenario {
-    /// Unique identifier (e.g. `"cgroup_steady"`).
-    pub name: &'static str,
-    /// Category: basic, cpuset, affinity, sched_class, dynamic, stress,
-    /// stall, advanced, nested, interaction, or performance.
-    pub category: &'static str,
-    /// Human-readable description.
-    pub description: &'static str,
-    /// Flags that must be present in every run.
-    pub required_flags: &'static [&'static flags::FlagDecl],
-    /// Flags that must not be present in any run.
-    pub excluded_flags: &'static [&'static flags::FlagDecl],
-    /// Number of cgroups to create.
-    pub num_cgroups: usize,
-    /// How to partition CPUs across cgroups.
-    pub cpuset_partition: CpusetPartition,
-    /// Per-cgroup workload definitions.
-    pub cgroup_works: Vec<Work>,
-    /// Execution mode: steady-state or custom logic.
-    pub action: Action,
-}
-
-impl Scenario {
-    /// Generate all valid flag profiles for this scenario.
-    ///
-    /// Enumerates all flag combinations that satisfy `required_flags`,
-    /// `excluded_flags`, and per-flag `requires` dependencies.
-    pub fn profiles(&self) -> Vec<FlagProfile> {
-        let req: Vec<&'static str> = self.required_flags.iter().map(|d| d.name).collect();
-        let excl: Vec<&'static str> = self.excluded_flags.iter().map(|d| d.name).collect();
-        generate_profiles(&req, &excl)
-    }
-    /// Returns `"{name}/{profile_name}"` (e.g. `"cgroup_steady/llc+borrow"`).
-    pub fn qualified_name(&self, p: &FlagProfile) -> String {
-        format!("{}/{}", self.name, p.name())
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -735,14 +547,6 @@ pub struct Ctx<'a> {
     /// the "no scheduler" state is a distinct variant rather than a
     /// 0-sentinel — `run_scenario` and step-level liveness probes
     /// destructure via `if let Some(pid)` instead of `!= 0` guards.
-    ///
-    /// Note: the `workload` module keeps a module-private
-    /// `AtomicI32` scheduler-pid slot that uses a 0-sentinel form
-    /// (wrapping it in an `AtomicOption` would cost an allocation
-    /// on the polling hot path). That sentinel never leaks across
-    /// module boundaries — this `Option<pid_t>` is the only
-    /// crate-visible shape. The internal 0-sentinel convention is
-    /// documented at the workload-side `set_sched_pid` call site.
     pub sched_pid: Option<libc::pid_t>,
     /// Time to wait after cgroup creation for scheduler stabilization.
     pub settle: Duration,
@@ -1029,234 +833,6 @@ where
     Ok(handles)
 }
 
-/// Run a scenario and return its assertion result.
-///
-/// Skips early (returning `AssertResult::skip`) when the scenario's
-/// requested cpuset partitioning produces an empty cpuset for any
-/// cgroup under the current topology. Polls scheduler liveness at
-/// 500ms intervals. If the scheduler exits after cgroup creation but
-/// before the workload starts, returns an `Err` so callers can treat
-/// the run as a setup failure. A scheduler exit mid-workload is
-/// reported as a completed-but-failed `AssertResult` with
-/// "scheduler process died unexpectedly during workload" in
-/// `details`, not an error. On workload failure, captures the guest
-/// kernel console via `read_kmsg` so diagnostics include the stall
-/// or crash context.
-pub fn run_scenario(scenario: &Scenario, ctx: &Ctx) -> Result<AssertResult> {
-    tracing::info!(scenario = scenario.name, "running");
-    if let Action::Custom(f) = &scenario.action {
-        return f(ctx);
-    }
-
-    let cpusets = resolve_cpusets(&scenario.cpuset_partition, scenario.num_cgroups, ctx.topo);
-
-    // Skip if topology doesn't support the test
-    if let Some(ref cs) = cpusets
-        && cs.iter().any(|s| s.is_empty())
-    {
-        return Ok(AssertResult::skip("not enough CPUs/LLCs"));
-    }
-
-    let scenario_start = std::time::Instant::now();
-
-    let names: Vec<String> = (0..scenario.num_cgroups)
-        .map(|i| format!("cg_{i}"))
-        .collect();
-    let mut cgroup_guard = CgroupGroup::new(ctx.cgroups);
-    for (i, name) in names.iter().enumerate() {
-        cgroup_guard.add_cgroup_no_cpuset(name)?;
-        if let Some(ref cs) = cpusets {
-            ctx.cgroups.set_cpuset(name, &cs[i])?;
-        }
-    }
-    tracing::debug!(cgroups = scenario.num_cgroups, "cgroups created, settling");
-    thread::sleep(ctx.settle);
-
-    // Bail early if the scheduler process is no longer running after
-    // cgroup creation. `active_sched_pid` returns `None` when no
-    // scheduler was configured (kernel-default path) OR when the
-    // caller planted a `<= 0` sentinel by mistake — both cases skip
-    // the bail, because `process_alive(<= 0)` would otherwise
-    // produce a false-positive scheduler-died diagnostic.
-    if let Some(pid) = ctx.active_sched_pid()
-        && !process_alive(pid)
-    {
-        anyhow::bail!(
-            "{} after cgroup creation (pid={})",
-            crate::assert::SCHED_DIED_PREFIX,
-            pid,
-        );
-    }
-
-    let handles = spawn_and_move(ctx, &names, |i, name| {
-        let cw = scenario
-            .cgroup_works
-            .get(i)
-            .or(scenario.cgroup_works.first())
-            .cloned()
-            .unwrap_or_default();
-        if let Err(reason) = cw.mem_policy.validate() {
-            anyhow::bail!("cgroup '{}': {}", name, reason);
-        }
-        let n = resolve_num_workers(&cw, ctx.workers_per_cgroup, name)?;
-        let cpuset = cpusets.as_deref().and_then(|cs| cs.get(i));
-        if let Some(cs) = cpusets.as_deref()
-            && i >= cs.len()
-        {
-            // Panic in debug builds to surface caller bugs early;
-            // release builds fall through to the warn + fallback below.
-            debug_assert!(
-                i < cs.len(),
-                "cgroup_idx {i} out of range for cpusets of len {}",
-                cs.len(),
-            );
-            tracing::warn!(
-                cgroup_idx = i,
-                cpusets_len = cs.len(),
-                "cgroup index out of range for cpusets array; falling back to unrestricted pool"
-            );
-        }
-        let affinity = resolve_affinity_for_cgroup(&cw.affinity, cpuset, ctx.topo);
-        let effective_work_type = crate::workload::resolve_work_type(
-            &cw.work_type,
-            ctx.work_type_override.as_ref(),
-            matches!(cw.work_type, WorkType::CpuSpin),
-            n,
-        );
-        Ok(WorkloadConfig {
-            num_workers: n,
-            affinity,
-            work_type: effective_work_type,
-            sched_policy: cw.sched_policy,
-            mem_policy: cw.mem_policy.clone(),
-            mpol_flags: cw.mpol_flags,
-        })
-    })?;
-
-    tracing::debug!(duration_s = ctx.duration.as_secs(), "running workload");
-
-    // Poll scheduler liveness during the workload phase instead of a
-    // single sleep. Detects scheduler exit within 500ms rather than
-    // waiting the full duration and collecting misleading results.
-    // `active_sched_pid()` returns `None` when no scheduler was
-    // configured (kernel-default path) OR when a `<= 0` sentinel
-    // slipped through the builder; in either case skip liveness
-    // polling entirely and sleep the full duration. Passing a `0`
-    // into `process_alive` would otherwise mark `sched_dead = true`
-    // every iteration and fail the test with a spurious
-    // scheduler-died detail.
-    let deadline = std::time::Instant::now() + ctx.duration;
-    let mut sched_dead = false;
-    if let Some(pid) = ctx.active_sched_pid() {
-        while std::time::Instant::now() < deadline {
-            if !process_alive(pid) {
-                sched_dead = true;
-                tracing::warn!("scheduler process died during workload phase");
-                break;
-            }
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            thread::sleep(remaining.min(Duration::from_millis(500)));
-        }
-
-        if !sched_dead {
-            sched_dead = !process_alive(pid);
-        }
-    } else {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        thread::sleep(remaining);
-    }
-
-    let mut result = AssertResult::pass();
-    for (i, h) in handles.into_iter().enumerate() {
-        let reports = h.stop_and_collect();
-        let cs = cpusets.as_ref().map(|v| &v[i]);
-        let numa_nodes = cs.map(|c| ctx.topo.numa_nodes_for_cpuset(c));
-        result.merge(
-            ctx.assert
-                .assert_cgroup_with_numa(&reports, cs, numa_nodes.as_ref()),
-        );
-    }
-
-    // Capture kernel log on failure
-    if !result.passed {
-        for line in read_kmsg().lines() {
-            result.details.push(line.to_string().into());
-        }
-    }
-
-    if sched_dead {
-        result.passed = false;
-        result.details.push(crate::assert::AssertDetail::new(
-            crate::assert::DetailKind::SchedulerDied,
-            crate::assert::format_sched_died_during_workload(
-                scenario_start.elapsed().as_secs_f64(),
-            ),
-        ));
-    }
-
-    Ok(result)
-}
-
-fn resolve_cpusets(
-    mode: &CpusetPartition,
-    n: usize,
-    topo: &TestTopology,
-) -> Option<Vec<BTreeSet<usize>>> {
-    let all = topo.all_cpus();
-    let usable = topo.usable_cpus();
-    match mode {
-        CpusetPartition::None => None,
-        CpusetPartition::LlcAligned => {
-            let llcs = topo.split_by_llc();
-            if llcs.len() < 2 {
-                return Some(vec![BTreeSet::new()]);
-            }
-            // Remove last CPU from last LLC to reserve for cgroup 0
-            let mut sets: Vec<BTreeSet<usize>> = llcs[..n.min(llcs.len())].to_vec();
-            if let Some(last) = sets.last_mut()
-                && last.len() > 1
-            {
-                last.remove(&all[all.len() - 1]);
-            }
-            Some(sets)
-        }
-        CpusetPartition::SplitHalf => {
-            let mid = usable.len() / 2;
-            Some(vec![
-                usable[..mid].iter().copied().collect(),
-                usable[mid..].iter().copied().collect(),
-            ])
-        }
-        CpusetPartition::SplitMisaligned => {
-            let split = if topo.num_llcs() > 1 {
-                topo.cpus_in_llc(0).len() / 2
-            } else {
-                usable.len() / 2
-            };
-            Some(vec![
-                usable[..split].iter().copied().collect(),
-                usable[split..].iter().copied().collect(),
-            ])
-        }
-        CpusetPartition::Overlap(frac) => Some(topo.overlapping_cpusets(n, *frac)),
-        CpusetPartition::Uneven(frac) => {
-            let split = (usable.len() as f64 * frac) as usize;
-            Some(vec![
-                usable[..split.max(1)].iter().copied().collect(),
-                usable[split.max(1)..].iter().copied().collect(),
-            ])
-        }
-        CpusetPartition::Holdback(frac) => {
-            let keep = all.len() - (all.len() as f64 * frac) as usize;
-            let mid = keep / 2;
-            Some(vec![
-                all[..mid.max(1)].iter().copied().collect(),
-                all[mid.max(1)..keep].iter().copied().collect(),
-            ])
-        }
-    }
-}
-
 /// Resolve an [`AffinityKind`] to a concrete [`AffinityMode`] for workers
 /// in a cgroup with the given effective cpuset.
 ///
@@ -1511,117 +1087,6 @@ mod tests {
     }
 
     #[test]
-    fn generate_profiles_no_constraints() {
-        // 2^6=64 minus 16 invalid (steal without llc) = 48
-        assert_eq!(generate_profiles(&[], &[]).len(), 48);
-    }
-
-    #[test]
-    fn generate_profiles_work_stealing_requires_llc() {
-        let profiles = generate_profiles(&[flags::STEAL], &[]);
-        for p in &profiles {
-            assert!(
-                p.flags.contains(&flags::LLC),
-                "steal without llc: {:?}",
-                p.flags
-            );
-        }
-    }
-
-    #[test]
-    fn generate_profiles_excluded_never_present() {
-        let profiles = generate_profiles(&[], &[flags::NO_CTRL]);
-        for p in &profiles {
-            assert!(!p.flags.contains(&flags::NO_CTRL));
-        }
-    }
-
-    #[test]
-    fn generate_profiles_required_always_present() {
-        let profiles = generate_profiles(&[flags::BORROW], &[]);
-        for p in &profiles {
-            assert!(p.flags.contains(&flags::BORROW));
-        }
-    }
-
-    #[test]
-    fn generate_profiles_required_and_excluded() {
-        let profiles = generate_profiles(&[flags::BORROW], &[flags::REBAL]);
-        for p in &profiles {
-            assert!(p.flags.contains(&flags::BORROW));
-            assert!(!p.flags.contains(&flags::REBAL));
-        }
-    }
-
-    #[test]
-    fn all_scenarios_non_empty() {
-        assert!(!all_scenarios().is_empty());
-    }
-
-    #[test]
-    fn all_scenarios_unique_names() {
-        let scenarios = all_scenarios();
-        let names: Vec<&str> = scenarios.iter().map(|s| s.name).collect();
-        let unique: std::collections::HashSet<&&str> = names.iter().collect();
-        assert_eq!(names.len(), unique.len(), "duplicate scenario names");
-    }
-
-    #[test]
-    fn all_scenarios_have_profiles() {
-        for s in &all_scenarios() {
-            assert!(!s.profiles().is_empty(), "{} has no valid profiles", s.name);
-        }
-    }
-
-    #[test]
-    fn resolve_cpusets_none_returns_none() {
-        let t = crate::topology::TestTopology::synthetic(8, 2);
-        assert!(resolve_cpusets(&CpusetPartition::None, 2, &t).is_none());
-    }
-
-    #[test]
-    fn resolve_cpusets_split_half_covers_usable() {
-        let t = crate::topology::TestTopology::synthetic(8, 2);
-        let r = resolve_cpusets(&CpusetPartition::SplitHalf, 2, &t).unwrap();
-        assert_eq!(r.len(), 2);
-        // Last CPU reserved for cgroup 0 → 7 usable
-        let total: usize = r.iter().map(|s| s.len()).sum();
-        assert_eq!(total, 7);
-    }
-
-    #[test]
-    fn resolve_cpusets_llc_aligned() {
-        let t = crate::topology::TestTopology::synthetic(8, 2);
-        let r = resolve_cpusets(&CpusetPartition::LlcAligned, 2, &t).unwrap();
-        assert_eq!(r.len(), 2);
-        // Both sets non-empty
-        assert!(!r[0].is_empty());
-        assert!(!r[1].is_empty());
-    }
-
-    #[test]
-    fn resolve_cpusets_uneven() {
-        let t = crate::topology::TestTopology::synthetic(8, 2);
-        let r = resolve_cpusets(&CpusetPartition::Uneven(0.75), 2, &t).unwrap();
-        assert!(r[0].len() > r[1].len(), "75/25 split should be uneven");
-    }
-
-    #[test]
-    fn resolve_cpusets_holdback() {
-        let t = crate::topology::TestTopology::synthetic(8, 2);
-        let r = resolve_cpusets(&CpusetPartition::Holdback(0.5), 2, &t).unwrap();
-        let total: usize = r.iter().map(|s| s.len()).sum();
-        assert!(total < 8, "holdback should use fewer CPUs");
-    }
-
-    #[test]
-    fn resolve_cpusets_overlap() {
-        let t = crate::topology::TestTopology::synthetic(8, 2);
-        let r = resolve_cpusets(&CpusetPartition::Overlap(0.5), 3, &t).unwrap();
-        assert_eq!(r.len(), 3);
-    }
-
-    #[test]
     fn resolve_affinity_inherit() {
         let t = crate::topology::TestTopology::synthetic(8, 2);
         assert!(matches!(
@@ -1687,38 +1152,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_cpusets_split_misaligned() {
-        let t = crate::topology::TestTopology::synthetic(8, 2);
-        let r = resolve_cpusets(&CpusetPartition::SplitMisaligned, 2, &t).unwrap();
-        assert_eq!(r.len(), 2);
-        let total: usize = r.iter().map(|s| s.len()).sum();
-        assert!(total > 0);
-        // Misaligned means split within an LLC, not at LLC boundary
-        assert_ne!(r[0].len(), 4, "misaligned should NOT split at LLC boundary");
-    }
-
-    #[test]
-    fn resolve_cpusets_llc_aligned_single_llc() {
-        let t = crate::topology::TestTopology::synthetic(4, 1);
-        let r = resolve_cpusets(&CpusetPartition::LlcAligned, 2, &t).unwrap();
-        // With 1 LLC, can only make 1 set -> returns empty for missing
-        assert!(
-            r.iter().any(|s| s.is_empty()),
-            "should signal skip with empty set"
-        );
-    }
-
-    #[test]
-    fn resolve_cpusets_small_topology() {
-        let t = crate::topology::TestTopology::synthetic(2, 1);
-        let r = resolve_cpusets(&CpusetPartition::SplitHalf, 2, &t).unwrap();
-        assert_eq!(r.len(), 2);
-        // 2 CPUs, no reserve (too small), each gets 1
-        assert_eq!(r[0].len(), 1);
-        assert_eq!(r[1].len(), 1);
-    }
-
-    #[test]
     fn cgroup_work_default() {
         let cw = Work::default();
         assert_eq!(cw.num_workers, None);
@@ -1726,97 +1159,6 @@ mod tests {
         assert!(matches!(cw.sched_policy, SchedPolicy::Normal));
         assert!(matches!(cw.affinity, AffinityKind::Inherit));
         assert!(matches!(cw.mem_policy, MemPolicy::Default));
-    }
-
-    #[test]
-    fn scenario_qualified_name() {
-        let s = &all_scenarios()[0];
-        let p = FlagProfile { flags: vec![] };
-        assert_eq!(s.qualified_name(&p), format!("{}/default", s.name));
-    }
-
-    #[test]
-    fn scenario_qualified_name_with_flags() {
-        let s = &all_scenarios()[0];
-        let p = FlagProfile {
-            flags: vec![flags::LLC, flags::BORROW],
-        };
-        assert_eq!(s.qualified_name(&p), format!("{}/llc+borrow", s.name));
-    }
-
-    #[test]
-    fn all_scenarios_count() {
-        let scenarios = all_scenarios();
-        assert!(
-            scenarios.len() >= 30,
-            "expected >=30 scenarios, got {}",
-            scenarios.len()
-        );
-    }
-
-    #[test]
-    fn scenario_categories_valid() {
-        let valid = [
-            "basic",
-            "cpuset",
-            "affinity",
-            "sched_class",
-            "dynamic",
-            "stress",
-            "stall",
-            "advanced",
-            "nested",
-            "interaction",
-            "performance",
-        ];
-        for s in &all_scenarios() {
-            assert!(
-                valid.contains(&s.category),
-                "unknown category '{}' in {}",
-                s.category,
-                s.name
-            );
-        }
-    }
-
-    #[test]
-    fn generate_profiles_single_required_count() {
-        // Required=[borrow], 5 optional, steal needs llc
-        // 2^5=32 minus 8 invalid = 24
-        assert_eq!(generate_profiles(&[flags::BORROW], &[]).len(), 24);
-    }
-
-    #[test]
-    fn profiles_sorted_by_flag_order() {
-        for p in &generate_profiles(&[], &[]) {
-            for w in p.flags.windows(2) {
-                let pos0 = flags::ALL.iter().position(|a| a == &w[0]).unwrap();
-                let pos1 = flags::ALL.iter().position(|a| a == &w[1]).unwrap();
-                assert!(pos0 < pos1, "flags not sorted: {:?}", p.flags);
-            }
-        }
-    }
-
-    #[test]
-    fn resolve_cpusets_holdback_reserves_cpus() {
-        let t = crate::topology::TestTopology::synthetic(12, 3);
-        let r = resolve_cpusets(&CpusetPartition::Holdback(0.33), 2, &t).unwrap();
-        let total: usize = r.iter().map(|s| s.len()).sum();
-        // 12 CPUs, holdback 33%: keep = 12 - floor(12*0.33) = 12 - 3 = 9
-        assert_eq!(total, 9, "holdback 33% of 12 should keep 9");
-        assert!(total < 12, "holdback should use fewer CPUs than total");
-        assert_eq!(r.len(), 2);
-    }
-
-    #[test]
-    fn resolve_cpusets_overlap_sets_overlap() {
-        let t = crate::topology::TestTopology::synthetic(12, 1);
-        let r = resolve_cpusets(&CpusetPartition::Overlap(0.5), 2, &t).unwrap();
-        let overlap: BTreeSet<usize> = r[0].intersection(&r[1]).copied().collect();
-        assert!(
-            !overlap.is_empty(),
-            "50% overlap should have overlapping CPUs"
-        );
     }
 
     #[test]
@@ -2098,24 +1440,6 @@ mod tests {
         assert!(borrow.requires.is_empty());
     }
 
-    // -- flag_requires tests --
-
-    #[test]
-    fn flag_requires_steal_returns_llc() {
-        let req = flag_requires("steal");
-        assert_eq!(req, vec!["llc"]);
-    }
-
-    #[test]
-    fn flag_requires_borrow_returns_empty() {
-        assert!(flag_requires("borrow").is_empty());
-    }
-
-    #[test]
-    fn flag_requires_unknown_returns_empty() {
-        assert!(flag_requires("nonexistent").is_empty());
-    }
-
     // -- FlagProfile name tests --
 
     #[test]
@@ -2124,39 +1448,6 @@ mod tests {
             flags: vec![flags::LLC, flags::BORROW, flags::REBAL],
         };
         assert_eq!(p.name(), "llc+borrow+rebal");
-    }
-
-    // -- resolve_cpusets edge cases --
-
-    #[test]
-    fn resolve_cpusets_split_misaligned_single_llc() {
-        let t = crate::topology::TestTopology::synthetic(8, 1);
-        let r = resolve_cpusets(&CpusetPartition::SplitMisaligned, 2, &t).unwrap();
-        assert_eq!(r.len(), 2);
-        let total: usize = r.iter().map(|s| s.len()).sum();
-        assert!(total > 0);
-    }
-
-    #[test]
-    fn resolve_cpusets_uneven_small_frac() {
-        let t = crate::topology::TestTopology::synthetic(8, 2);
-        let r = resolve_cpusets(&CpusetPartition::Uneven(0.1), 2, &t).unwrap();
-        assert!(
-            r[0].len() < r[1].len(),
-            "0.1 fraction should give smaller first set"
-        );
-    }
-
-    // -- scenario profiles edge cases --
-
-    #[test]
-    fn scenario_profiles_count_bounded() {
-        for s in &all_scenarios() {
-            let n = s.profiles().len();
-            // Each scenario should have at least 1 profile and at most 48 (all flag combos)
-            assert!(n >= 1, "{} has {} profiles", s.name, n);
-            assert!(n <= 48, "{} has {} profiles (>48)", s.name, n);
-        }
     }
 
     // -- ALL_DECLS tests --
@@ -2196,121 +1487,6 @@ mod tests {
             }
             other => panic!("expected Fixed, got {:?}", other),
         }
-    }
-
-    // -- qualified_name computed values --
-
-    #[test]
-    fn qualified_name_all_scenarios_with_default() {
-        let p = FlagProfile { flags: vec![] };
-        for s in &all_scenarios() {
-            // Every scenario produces "{name}/default" with the default profile.
-            assert_eq!(
-                s.qualified_name(&p),
-                format!("{}/default", s.name),
-                "qualified_name mismatch for {}",
-                s.name
-            );
-        }
-    }
-
-    #[test]
-    fn qualified_name_single_flag() {
-        let s = &all_scenarios()[0];
-        let p = FlagProfile {
-            flags: vec![flags::REBAL],
-        };
-        assert_eq!(s.qualified_name(&p), format!("{}/rebal", s.name));
-    }
-
-    #[test]
-    fn qualified_name_three_flags_joined() {
-        let s = &all_scenarios()[0];
-        let p = FlagProfile {
-            flags: vec![flags::LLC, flags::STEAL, flags::BORROW],
-        };
-        // FlagProfile.name() joins with "+".
-        assert_eq!(s.qualified_name(&p), format!("{}/llc+steal+borrow", s.name));
-    }
-
-    // -- generate_profiles computed counts --
-
-    #[test]
-    fn generate_profiles_steal_only_forces_llc() {
-        // steal requires llc. Profiles with steal must also contain llc.
-        let profiles = generate_profiles(&[flags::STEAL], &[]);
-        assert!(!profiles.is_empty());
-        for p in &profiles {
-            assert!(
-                p.flags.contains(&flags::STEAL),
-                "steal missing: {:?}",
-                p.flags
-            );
-            assert!(
-                p.flags.contains(&flags::LLC),
-                "llc missing when steal present: {:?}",
-                p.flags
-            );
-        }
-    }
-
-    #[test]
-    fn generate_profiles_all_excluded_returns_single_empty() {
-        // Exclude everything -> only the empty profile (no flags) remains.
-        let profiles = generate_profiles(&[], flags::ALL);
-        assert_eq!(profiles.len(), 1);
-        assert!(profiles[0].flags.is_empty());
-    }
-
-    #[test]
-    fn generate_profiles_required_and_excluded_all_others() {
-        // Require borrow, exclude everything else -> exactly 1 profile: [borrow].
-        let excluded: Vec<&str> = flags::ALL
-            .iter()
-            .copied()
-            .filter(|f| *f != flags::BORROW)
-            .collect();
-        let profiles = generate_profiles(&[flags::BORROW], &excluded);
-        assert_eq!(profiles.len(), 1);
-        assert_eq!(profiles[0].flags, vec![flags::BORROW]);
-    }
-
-    // -- resolve_cpusets computed values --
-
-    #[test]
-    fn resolve_cpusets_split_half_exact_cpu_assignment() {
-        // synthetic(8, 2) -> all_cpus=[0..7], usable=[0..6] (7 reserved).
-        // SplitHalf: mid=3, first=[0,1,2], second=[3,4,5,6].
-        let t = crate::topology::TestTopology::synthetic(8, 2);
-        let r = resolve_cpusets(&CpusetPartition::SplitHalf, 2, &t).unwrap();
-        assert_eq!(r[0], [0, 1, 2].into_iter().collect());
-        assert_eq!(r[1], [3, 4, 5, 6].into_iter().collect());
-    }
-
-    #[test]
-    fn resolve_cpusets_uneven_75_exact_split() {
-        // synthetic(8, 2) -> usable=[0..6] (7 CPUs).
-        // Uneven(0.75): split = floor(7 * 0.75) = 5.
-        // first=[0,1,2,3,4], second=[5,6].
-        let t = crate::topology::TestTopology::synthetic(8, 2);
-        let r = resolve_cpusets(&CpusetPartition::Uneven(0.75), 2, &t).unwrap();
-        assert_eq!(r[0].len(), 5);
-        assert_eq!(r[1].len(), 2);
-        assert_eq!(r[0], [0, 1, 2, 3, 4].into_iter().collect());
-        assert_eq!(r[1], [5, 6].into_iter().collect());
-    }
-
-    #[test]
-    fn resolve_cpusets_holdback_50_exact() {
-        // synthetic(8, 2) -> all_cpus=[0..7] (8 CPUs).
-        // Holdback(0.5): keep = 8 - floor(8*0.5) = 4. mid=2.
-        // first=[0,1], second=[2,3].
-        let t = crate::topology::TestTopology::synthetic(8, 2);
-        let r = resolve_cpusets(&CpusetPartition::Holdback(0.5), 2, &t).unwrap();
-        let total: usize = r.iter().map(|s| s.len()).sum();
-        assert_eq!(total, 4, "holdback 50% of 8 should keep 4");
-        assert_eq!(r[0], [0, 1].into_iter().collect());
-        assert_eq!(r[1], [2, 3].into_iter().collect());
     }
 
     #[test]
@@ -2357,24 +1533,6 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(resolve_num_workers(&w, 3, "cg").unwrap(), 7);
-    }
-
-    /// Catalog sweep: every bundled [`Scenario`] must have
-    /// `num_workers != Some(0)` in each of its `cgroup_works` entries.
-    /// A zero-worker entry would vacuously pass every assertion at runtime.
-    #[test]
-    fn catalog_has_no_zero_worker_cgroup_works() {
-        for scenario in crate::scenario::all_scenarios() {
-            for (idx, cw) in scenario.cgroup_works.iter().enumerate() {
-                assert_ne!(
-                    cw.num_workers,
-                    Some(0),
-                    "scenario {:?} cgroup_works[{}] declares num_workers=Some(0)",
-                    scenario.name,
-                    idx,
-                );
-            }
-        }
     }
 
     /// Minimal `CgroupOps` double for `CgroupGroup::drop` error-path

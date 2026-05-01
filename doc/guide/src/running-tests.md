@@ -31,10 +31,7 @@ layout, last-writer-wins semantics, and the comparison workflow.
 
 Define flags via `#[derive(Scheduler)]` with `#[flag(...)]` attributes.
 Use `required_flags` and `excluded_flags` in `#[ktstr_test]` to constrain
-which flag profiles a test runs under.
-
-ktstr includes built-in flags (`llc`, `borrow`, `steal`, `rebal`,
-`reject-pin`, `no-ctrl`) for the internal catalog. See
+which flag profiles a test runs under. See
 [Flags](concepts/flags.md) for details.
 
 ## Budget-based test selection

@@ -1,14 +1,19 @@
 # ktstr
 
-`ktstr` runs ktstr scenarios directly on the host under whatever
-scheduler is already active. Unlike `#[ktstr_test]` (which boots
-KVM VMs), `ktstr` operates on the host's real topology and cgroups.
-It does not manage scheduler lifecycle -- start your scheduler
-externally before running.
+`ktstr` is the standalone debugging companion to the
+[`#[ktstr_test]`](../writing-tests/ktstr-test-macro.md) test harness.
+It owns kernel cache management, interactive VM shells, host-wide
+per-thread profiling, and lock introspection — the operations a
+scheduler author reaches for when investigating a test failure.
 
-See also [`cargo ktstr`](cargo-ktstr.md) for cargo-integrated
-workflows including test execution, coverage, BPF verifier stats,
-and gauntlet statistics.
+To reproduce a test scenario as a self-contained shell script
+without a VM, use [`cargo ktstr export`](cargo-ktstr.md#export).
+To run the test suite, use
+[`cargo ktstr test`](cargo-ktstr.md#test).
+
+See also [`cargo ktstr`](cargo-ktstr.md) for the cargo-integrated
+companion that also covers test execution, coverage, BPF verifier
+stats, and gauntlet statistics.
 
 Build from the workspace:
 
@@ -18,88 +23,12 @@ cargo build --bin ktstr
 
 ## Subcommands
 
-### run
-
-Run scenarios on the host:
-
-```sh
-ktstr run
-ktstr run --flags llc,borrow --duration 30
-ktstr run --filter cpuset --json
-ktstr run --work-type YieldHeavy
-ktstr run --repro --kernel-dir ../linux
-ktstr run --auto-repro --probe-stack crash_stack.txt
-```
-
-Scenarios run under whatever scheduler is currently active on the
-host. Start your scheduler before invoking `ktstr run`.
-
-Without `--flags`, all valid flag profiles are generated for each
-scenario. With `--flags`, only the specified profile is run. Flags
-select which test profiles to run -- they do not configure the
-scheduler. Start the scheduler with the desired features before
-running ktstr.
-
-`--filter` selects scenarios whose name contains the given substring.
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--duration SECS` | `20` | Scenario duration in seconds. |
-| `--workers N` | `4` | Workers per cgroup. |
-| `--flags LIST` | all profiles | Active flags (comma-separated). Omit for all valid profiles. Built-in catalog flags: `llc, borrow, steal, rebal, reject-pin, no-ctrl`. |
-| `--filter SUB` | -- | Run only scenarios whose name contains the substring. |
-| `--json` | off | Output results as JSON. |
-| `--repro` | off | Attach BPF probes for crash capture while running. |
-| `--probe-stack` | -- | Crash stack for auto-probe: a file path or comma-separated function names. |
-| `--auto-repro` | off | **No-op on `ktstr run`** — this command executes scenarios on the host without spawning a VM, so there is no second boot to perform. The flag applies only to VM-based runs through the `#[ktstr_test]` harness (invoked via `cargo nextest run` / `cargo ktstr test`), where a crashing scenario reruns with probes attached. |
-| `--kernel-dir PATH` | -- | Kernel build directory; used for DWARF source location lookup in probe output (requires `--repro` or `--auto-repro`). |
-| `--work-type NAME` | per-scenario | Override the work type for all cgroups. Case-sensitive; see list below. |
-| `--no-perf-mode` | off | Disable all performance mode features (flock, pinning, RT scheduling, hugepages, NUMA mbind, KVM exit suppression). Also settable via `KTSTR_NO_PERF_MODE` env var. |
-
-**Work types (for `--work-type`):** `CpuSpin`, `YieldHeavy`, `Mixed`,
-`IoSync`, `Bursty`, `PipeIo`, `FutexPingPong`, `CachePressure`,
-`CacheYield`, `CachePipe`, `FutexFanOut`, `ForkExit`, `NiceSweep`,
-`AffinityChurn`, `PolicyChurn`, `FanOutCompute`, `PageFaultChurn`,
-`MutexContention`. Names are matched case-sensitively. `Sequence` and
-`Custom` exist in the library but are not constructible from
-`--work-type` (`Sequence` requires explicit phases; `Custom` requires
-a function pointer).
-
-### list
-
-List available scenarios:
-
-```sh
-ktstr list
-ktstr list --filter dynamic
-ktstr list --json
-```
-
 ### topo
 
 Show the host CPU topology (CPUs, LLCs, NUMA nodes):
 
 ```sh
 ktstr topo
-```
-
-### cleanup
-
-Remove leftover cgroups from a previous run. With no arguments, cleans
-up `/sys/fs/cgroup/ktstr` (used by the test harness) and every
-`/sys/fs/cgroup/ktstr-<pid>` directory left behind by `ktstr run`
-instances (normal-exit runs remove their own via an RAII guard, so
-leftovers are from runs that crashed or were SIGKILLed), removing
-the directories themselves. Directories whose `<pid>` still owns a
-live `ktstr` or `cargo-ktstr` process are skipped so a concurrent
-cleanup never yanks an active run's cgroup; each skip emits a
-`ktstr: skipping <path> (live process)` line on stderr. Pass
-`--parent-cgroup PATH` to clean a single explicit path (no
-live-process check).
-
-```sh
-ktstr cleanup
-ktstr cleanup --parent-cgroup /sys/fs/cgroup/ktstr-12345
 ```
 
 ### kernel

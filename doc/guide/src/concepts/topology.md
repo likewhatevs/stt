@@ -132,7 +132,9 @@ nodes to populate `NodeMemInfo`. When `None`, memory info is omitted.
 
 **`overlapping_cpusets(n, overlap_frac) -> Vec<BTreeSet<usize>>`** --
 generates `n` cpusets with `overlap_frac` overlap between adjacent
-sets. Used by `CpusetPartition::Overlap`.
+sets. Available to scenarios that want to hand-build overlapping
+cpusets (e.g. via `CpusetSpec::Exact`); `CpusetSpec::Overlap`
+computes its slice inline rather than calling this helper.
 
 **`cpuset_string(cpus) -> String`** -- formats a CPU set as a compact
 range string (e.g. `"0-3,5,7-9"`). Used when writing `cpuset.cpus`.
@@ -160,26 +162,21 @@ topologies).
 ## How scenarios use topology
 
 `TestTopology` is available to scenarios via `Ctx.topo`. The
-`CpusetPartition` variants use topology methods to partition CPUs:
-
-| CpusetPartition | Topology method |
-|---|---|
-| `LlcAligned` | `split_by_llc()` |
-| `SplitHalf` | `usable_cpus()` split at midpoint |
-| `SplitMisaligned` | `cpus_in_llc(0)` split at midpoint |
-| `Overlap(frac)` | `overlapping_cpusets(n, frac)` |
-| `Uneven(frac)` | `usable_cpus()` with asymmetric split |
-| `Holdback(frac)` | `all_cpus()` with fraction held back |
-
-The ops system's `CpusetSpec` also resolves against topology:
+`CpusetSpec` variants use topology methods to resolve a cgroup's
+cpuset:
 
 | CpusetSpec | Topology method |
 |---|---|
 | `Llc(idx)` | `llc_aligned_cpuset(idx)` |
 | `Numa(node)` | `numa_aligned_cpuset(node)` |
+| `Range { start_frac, end_frac }` | `usable_cpus()` sliced by fraction |
+| `Disjoint { index, of }` | `usable_cpus()` partitioned into `of` equal sets |
+| `Overlap { index, of, frac }` | `usable_cpus()` partitioned with neighbor overlap |
+| `Exact(set)` | no topology resolution (caller-supplied set) |
 
 `Llc` confines a cgroup to a single LLC's CPUs; `Numa` spans all
-LLCs in a NUMA node.
+LLCs in a NUMA node. The fraction- and partition-style variants
+operate on the usable-CPUs pool the host reservation has granted.
 
 See [Ops and Steps](ops.md#cpusetspec) for the full `CpusetSpec` enum.
 
@@ -197,7 +194,7 @@ See also: [CgroupManager](../architecture/cgroup-manager.md) for
 `set_cpuset()` which consumes cpuset strings,
 [CgroupGroup](../architecture/cgroup-group.md) for RAII cgroup
 management, [WorkloadHandle](../architecture/workload-handle.md) for
-worker lifecycle, [Scenarios](scenarios.md) for how `CpusetPartition`
+worker lifecycle, [Scenarios](scenarios.md) for how `CpusetSpec`
 drives cpuset partitioning.
 
 ## Host-side reservation

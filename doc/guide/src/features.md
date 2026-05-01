@@ -63,11 +63,12 @@ dependencies — no manual `.so` lists or `LD_LIBRARY_PATH` hacks.
 <details>
 <summary><b>Bare-metal mode</b> — run the same scenarios on real hardware without VMs</summary>
 
-`ktstr run` executes scenarios directly on the host — no VM, real
-hardware, real scheduler. Reads the host's CPU topology from sysfs,
-creates cgroups under `/sys/fs/cgroup/ktstr-{pid}`, and runs under
-whatever scheduler is already active. Used for testing with
-production schedulers and real topology.
+`cargo ktstr export` packages a registered test as a self-extracting
+`.run` script that reproduces the scenario on bare metal without
+a VM. The runfile validates host topology and sched_ext support,
+then dispatches the test directly under whatever scheduler is
+already active. Used for testing under production schedulers and
+real topology.
 
 </details>
 

@@ -128,7 +128,6 @@
 //! - [`flock`] -- advisory file-locking primitives used by cache + LLC reservations
 //! - [`kernel_path`] -- kernel ID parsing and filesystem image discovery
 //! - [`remote_cache`] -- GitHub Actions cache integration
-//! - [`runner`] -- host-side scenario runner used by `ktstr run`
 //! - [`scenario`] -- declarative ops API (`CgroupDef`, `Step`, `Op`, `Backdrop`, `execute_defs`, `execute_steps`, `execute_scenario`)
 //! - [`scenario::scenarios`] -- curated canned scenarios for common patterns
 //! - [`mod@assert`] -- pass/fail assertions (starvation, isolation, fairness)
@@ -352,7 +351,6 @@ pub mod metric_types;
 pub(crate) mod monitor;
 pub(crate) mod probe;
 pub(crate) mod report;
-pub mod runner;
 pub mod scenario;
 pub(crate) mod stats;
 pub(crate) mod taskstats;

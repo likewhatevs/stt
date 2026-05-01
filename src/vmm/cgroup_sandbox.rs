@@ -55,8 +55,9 @@ const CGROUP2_SUPER_MAGIC: i64 = 0x6367_7270;
 /// gives kernel housekeeping 50ms to release references the
 /// build process may have left on the cgroup (e.g. a grandchild
 /// caught mid-fork). Past that, the directory is orphaned and
-/// logged; re-running `ktstr cleanup` (which recurses into
-/// `/sys/fs/cgroup/…/ktstr-build-*`) sweeps the orphan later.
+/// logged; the operator sweeps it with a manual
+/// `rmdir /sys/fs/cgroup/…/ktstr-build-{pid}` keyed off the
+/// `tag=resource_budget.cgroup_orphan_left` warning.
 const RMDIR_EBUSY_RETRIES: u32 = 5;
 /// Per-attempt backoff for `RMDIR_EBUSY_RETRIES`.
 const RMDIR_EBUSY_BACKOFF: Duration = Duration::from_millis(10);
@@ -537,8 +538,8 @@ impl Drop for BuildSandbox {
                         continue;
                     }
                     // Final failure — orphan left behind. Log
-                    // with the conventional tag so `ktstr cleanup`
-                    // operators can key on it.
+                    // with the conventional tag so an operator
+                    // sweeping orphans manually can key on it.
                     tracing::warn!(
                         cgroup = %inner.name,
                         parent = %inner.parent_cgroup.display(),

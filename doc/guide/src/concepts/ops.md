@@ -246,6 +246,3 @@ fn my_scenario(ctx: &Ctx) -> Result<AssertResult> {
 When `assertions` is `Some`, the provided `Assert` overrides `ctx.assert`
 for worker checks. When `None`, uses `ctx.assert` (the merged
 three-layer config: `default_checks` -> scheduler -> per-test).
-
-For a complete example using ops/steps, see
-[Write a Dynamic Scenario](../recipes/dynamic-scenario.md).

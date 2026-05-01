@@ -3,7 +3,7 @@
 `cargo ktstr` is a cargo plugin for kernel build, cache, and test
 workflow. Subcommands in `--help` order: `test` (alias: `nextest`),
 `coverage`, `llvm-cov`, `stats`, `kernel`, `model`, `verifier`,
-`completions`, `show-host`, `show-thresholds`, `cleanup`, `locks`,
+`completions`, `show-host`, `show-thresholds`, `export`, `locks`,
 `shell`.
 
 ## test
@@ -1139,27 +1139,6 @@ cargo ktstr show-thresholds preempt_regression_fault_under_load
 Fails with an actionable message when no registered test
 matches the given name; the diagnostic includes a `Did you
 mean ...?` Levenshtein suggestion when a near match exists.
-
-## cleanup
-
-Clean up leftover ktstr cgroups. With no flags, scans
-`/sys/fs/cgroup` for the default ktstr parents — `ktstr/`
-(used by the in-process test harness) and every
-`ktstr-<pid>/` left behind by `ktstr run` instances — and
-rmdirs each. `ktstr-<pid>` directories whose `<pid>` still
-owns a live `ktstr` or `cargo-ktstr` process are skipped, so
-a concurrent cleanup run does not yank an active run's
-cgroup; each skip emits a `ktstr: skipping <path> (live
-process)` line on stderr.
-
-```sh
-cargo ktstr cleanup                               # scan defaults
-cargo ktstr cleanup --parent-cgroup /sys/fs/cgroup/ktstr-12345  # explicit path
-```
-
-| Flag | Description |
-|------|-------------|
-| `--parent-cgroup PATH` | Clean only this explicit path and leave the parent directory in place. No live-process check is performed. When omitted, the default scan path runs. |
 
 ## locks
 

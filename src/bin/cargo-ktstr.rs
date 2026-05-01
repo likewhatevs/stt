@@ -289,22 +289,6 @@ enum KtstrCommand {
         #[arg(short = 'o', long = "output")]
         output: Option<PathBuf>,
     },
-    /// Clean up leftover ktstr cgroups.
-    ///
-    /// Without `--parent-cgroup`, scans `/sys/fs/cgroup` for the default
-    /// ktstr parents (`ktstr` and `ktstr-<pid>`, the paths that `ktstr
-    /// run` and the in-process test harness create) and rmdirs each.
-    /// `ktstr-<pid>` directories whose pid is still a running ktstr or
-    /// cargo-ktstr process are skipped, so a concurrent cleanup run
-    /// doesn't yank an active run's cgroup.
-    Cleanup {
-        /// Parent cgroup path. When set, cleans only this path and
-        /// leaves the parent directory in place; when omitted, scans
-        /// `/sys/fs/cgroup` for the default ktstr parents
-        /// (`ktstr/` and `ktstr-<pid>/`) and rmdirs each.
-        #[arg(long)]
-        parent_cgroup: Option<String>,
-    },
     /// Enumerate every ktstr flock held on this host.
     ///
     /// Troubleshooting companion for `--cpu-cap` contention. Scans
@@ -3382,9 +3366,6 @@ fn main() {
         },
         KtstrCommand::Export { test, output } => {
             ktstr::export::export_test(&test, output).map_err(|e| format!("{e:#}"))
-        }
-        KtstrCommand::Cleanup { parent_cgroup } => {
-            cli::cleanup(parent_cgroup).map_err(|e| format!("{e:#}"))
         }
         KtstrCommand::Locks { json, watch } => {
             cli::list_locks(json, watch).map_err(|e| format!("{e:#}"))

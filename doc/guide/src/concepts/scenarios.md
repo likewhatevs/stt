@@ -43,77 +43,14 @@ for the full list.
 
 Most tests use these canned functions or build custom scenarios with
 `CgroupDef` and `execute_defs` / `execute_steps` (see
-[Ops and Steps](ops.md)). The `Scenario` struct below is ktstr's
-internal catalog format used by the `ktstr run` CLI -- external test
-suites do not need it.
-
-## How scenarios run
-
-For `Steady` scenarios, `run_scenario()`:
-
-1. Resolves cpusets from `cpuset_partition` and the VM's topology.
-2. Creates cgroups via `CgroupManager`.
-3. Forks worker processes via `WorkloadHandle::spawn()`.
-4. Moves workers into their target cgroups.
-5. Signals workers to start (two-phase start protocol).
-6. Polls scheduler liveness during the workload phase.
-7. Stops workers, collects `WorkerReport` telemetry.
-8. Runs starvation, fairness, gap, and cpuset isolation checks (see
-   [Worker checks](checking.md#worker-checks)).
-
-`Custom` scenarios get a `Ctx` reference and implement their own logic
-using the same building blocks. See
-[Custom Scenarios](../writing-tests/custom-scenarios.md) for the `Ctx`
-struct and helper functions.
+[Ops and Steps](ops.md)). Custom scenarios receive a `Ctx` reference
+and use the same building blocks; see
+[Custom Scenarios](../writing-tests/custom-scenarios.md) for the
+`Ctx` struct and helper functions.
 
 ## Flag profiles
 
-Each scenario generates valid flag combinations from its
-`required_flags` and `excluded_flags`. See [Flags](flags.md) for
-details on how profiles are generated.
-
-## The Scenario struct (internal catalog)
-
-`Scenario` is ktstr's internal catalog format. All catalog entries are
-registered in `all_scenarios()` across 10 categories.
-
-```rust,ignore
-pub struct Scenario {
-    pub name: &'static str,
-    pub category: &'static str,
-    pub description: &'static str,
-    pub required_flags: &'static [&'static flags::FlagDecl],
-    pub excluded_flags: &'static [&'static flags::FlagDecl],
-    pub num_cgroups: usize,
-    pub cpuset_partition: CpusetPartition,
-    pub cgroup_works: Vec<Work>,
-    pub action: Action,
-}
-```
-
-**`cpuset_partition`** -- how to partition CPUs across cgroups. This is an
-internal type; external tests use
-[`CpusetSpec`](ops.md#cpusetspec) instead.
-
-| Variant | Behavior |
-|---|---|
-| `None` | No cpuset constraints |
-| `LlcAligned` | One cgroup per LLC |
-| `SplitHalf` | Split usable CPUs in half |
-| `SplitMisaligned` | Split at midpoint of LLC 0's CPUs (not at LLC boundary) |
-| `Overlap(f64)` | Overlapping cpusets with specified fraction |
-| `Uneven(f64)` | Asymmetric split (fraction for cgroup 0) |
-| `Holdback(f64)` | Reserve a fraction of CPUs, split the rest |
-
-**CPU pools**: `SplitHalf`, `Uneven`, and `SplitMisaligned` partition
-[`usable_cpus()`](topology.md#topology-queries).
-`Holdback` operates on `all_cpus()` (no reservation).
-
-**`cgroup_works`** -- per-cgroup workload definition using
-[`Work`](https://likewhatevs.github.io/ktstr/api/ktstr/workload/struct.Work.html)
-from the workload module (same type used by `CgroupDef` and
-`Op::Spawn`).
-
-**`action`** -- `Steady` (run workers for the duration) or
-`Custom(fn(&Ctx) -> Result<AssertResult>)` for scenarios with custom
-logic (dynamic cgroup operations, topology changes, etc.).
+`#[derive(Scheduler)]` declares the flag set for a scheduler. Each
+test then uses `required_flags` and `excluded_flags` on
+`#[ktstr_test]` to constrain which combinations the test runs under.
+See [Flags](flags.md) for profile generation.
