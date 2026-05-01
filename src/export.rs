@@ -317,13 +317,14 @@ fn append_file<W: Write>(
 ) -> Result<()> {
     let bytes = std::fs::read(host_path)
         .with_context(|| format!("read {} for archive", host_path.display()))?;
-    let mut header = tar::Header::new_gnu();
-    header.set_path(archive_name).context("tar set_path")?;
-    header.set_size(bytes.len() as u64);
-    header.set_mode(0o755);
-    header.set_cksum();
-    tar.append(&header, bytes.as_slice())
-        .with_context(|| format!("append {archive_name} to tar"))?;
+    crate::tar_util::pack_tar_entry(
+        tar,
+        archive_name,
+        0o755,
+        bytes.len() as u64,
+        bytes.as_slice(),
+    )
+    .with_context(|| format!("append {archive_name} to tar"))?;
     Ok(())
 }
 
@@ -1096,5 +1097,353 @@ mod tests {
             found.is_none(),
             "non-executable file must NOT match PATH lookup, got: {found:?}",
         );
+    }
+
+    /// Read every entry from a gzip-compressed tar blob. Used by the
+    /// archive-shape tests below — keeps the read path consolidated
+    /// so a future tar-or-gzip change forces only one update.
+    fn read_archive_entries(blob: &[u8]) -> Vec<(String, u32, Vec<u8>)> {
+        use flate2::read::GzDecoder;
+        use std::io::Read as _;
+        let gz = GzDecoder::new(blob);
+        let mut archive = tar::Archive::new(gz);
+        let mut out = Vec::new();
+        for entry in archive.entries().expect("read tar entries") {
+            let mut e = entry.expect("entry");
+            let name = e.path().expect("entry path").to_string_lossy().into_owned();
+            let mode = e.header().mode().expect("entry mode");
+            let mut data = Vec::new();
+            e.read_to_end(&mut data).expect("read entry body");
+            out.push((name, mode, data));
+        }
+        out
+    }
+
+    /// `build_archive` with no scheduler and no includes packs ONLY
+    /// the ktstr binary under the name `ktstr`. Pins the
+    /// scheduler-less code path: the EEVDF/binary-payload export
+    /// must NOT silently embed extra entries when the test has no
+    /// scheduler binary to ship.
+    #[test]
+    fn build_archive_no_scheduler_packs_only_ktstr() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let ktstr_path = tmp.path().join("fake-ktstr");
+        std::fs::write(&ktstr_path, b"#!/bin/sh\necho ktstr-stub\n").expect("write fake ktstr");
+
+        let blob = build_archive(&ktstr_path, None, &[]).expect("build_archive");
+        let entries = read_archive_entries(&blob);
+
+        assert_eq!(entries.len(), 1, "expected 1 entry, got: {entries:?}");
+        let (name, mode, data) = &entries[0];
+        assert_eq!(name, "ktstr", "entry must be named 'ktstr'");
+        assert_eq!(*mode, 0o755, "entry must be mode 0o755 (executable)");
+        assert_eq!(
+            data.as_slice(),
+            b"#!/bin/sh\necho ktstr-stub\n",
+            "entry payload must roundtrip the input file bytes",
+        );
+    }
+
+    /// `build_archive` with a scheduler and N include files emits
+    /// the canonical layout: `ktstr`, `scheduler`, then
+    /// `include/<basename>` per include. Mode 0o755 on every entry
+    /// so the .run extractor preserves executable bits. Pins the
+    /// archive-layout contract the preamble's
+    /// `sed | base64 -d | tar xz` extraction depends on.
+    #[test]
+    fn build_archive_packs_ktstr_scheduler_and_includes() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let ktstr_path = tmp.path().join("fake-ktstr");
+        let sched_path = tmp.path().join("fake-sched");
+        let inc_a = tmp.path().join("inc_a.txt");
+        let inc_b = tmp.path().join("inc_b.txt");
+        std::fs::write(&ktstr_path, b"K").expect("write ktstr");
+        std::fs::write(&sched_path, b"S").expect("write scheduler");
+        std::fs::write(&inc_a, b"A").expect("write inc_a");
+        std::fs::write(&inc_b, b"B").expect("write inc_b");
+
+        let includes = vec![inc_a.clone(), inc_b.clone()];
+        let blob = build_archive(&ktstr_path, Some(&sched_path), &includes).expect("build_archive");
+        let entries = read_archive_entries(&blob);
+
+        let names: Vec<&str> = entries.iter().map(|(n, _, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "ktstr",
+                "scheduler",
+                "include/inc_a.txt",
+                "include/inc_b.txt"
+            ],
+            "entry names and order must match the documented layout",
+        );
+        for (name, mode, _) in &entries {
+            assert_eq!(*mode, 0o755, "entry {name} must be mode 0o755");
+        }
+    }
+
+    /// `build_archive` rejects two include specs whose basenames
+    /// collide. The error message must name the colliding basename
+    /// so the operator can find and rename one. The flat
+    /// `include/<basename>` layout is documented as the contract;
+    /// silently dropping a collision would corrupt the archive.
+    #[test]
+    fn build_archive_rejects_basename_collision() {
+        let tmp_a = tempfile::TempDir::new().expect("temp dir a");
+        let tmp_b = tempfile::TempDir::new().expect("temp dir b");
+        let inc_1 = tmp_a.path().join("dup.txt");
+        let inc_2 = tmp_b.path().join("dup.txt");
+        std::fs::write(&inc_1, b"first").expect("write inc_1");
+        std::fs::write(&inc_2, b"second").expect("write inc_2");
+
+        let ktstr_path = tmp_a.path().join("fake-ktstr");
+        std::fs::write(&ktstr_path, b"K").expect("write ktstr");
+
+        let err = build_archive(&ktstr_path, None, &[inc_1.clone(), inc_2.clone()])
+            .expect_err("colliding basenames must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("dup.txt"),
+            "error must name the colliding basename: '{msg}'",
+        );
+        assert!(
+            msg.contains("collision") || msg.contains("collide"),
+            "error must describe the failure as a collision: '{msg}'",
+        );
+    }
+
+    /// `generate_preamble` emits a syntactically valid bash script
+    /// that `bash -n` parses without error. This is the load-bearing
+    /// invariant of the export pipeline — a malformed preamble means
+    /// every `.run` file the operator generates is a dud, regardless
+    /// of whether the embedded archive is correct.
+    ///
+    /// Skipped (not failed) when `bash` is unavailable on the host
+    /// running the unit tests; bash is universal on linux dev hosts
+    /// but a CI image without it shouldn't make the rest of the
+    /// suite red.
+    #[test]
+    fn generate_preamble_parses_under_bash_n() {
+        if which_bash().is_none() {
+            crate::report::test_skip("no bash on PATH");
+            return;
+        }
+
+        let entry = KtstrTestEntry {
+            name: "test_preamble_smoke",
+            extra_sched_args: &["--foo", "bar baz"],
+            ..KtstrTestEntry::DEFAULT
+        };
+
+        for has_scheduler in [true, false] {
+            let preamble = generate_preamble(&entry, has_scheduler);
+            assert_bash_n_accepts(&preamble, has_scheduler);
+        }
+    }
+
+    /// `generate_preamble` interpolates the test name, scheduler
+    /// name, topology, duration, and watchdog into the script in
+    /// shape that an operator can grep. Pins the variable names
+    /// (KTSTR_TEST_NAME, KTSTR_SCHED_NAME, NEED_LLCS,
+    /// TEST_DURATION_SECS, TEST_WATCHDOG_SECS) and their values
+    /// against the entry — a future format change must update this
+    /// test in lockstep with the preamble.
+    #[test]
+    fn generate_preamble_interpolates_entry_fields() {
+        let entry = KtstrTestEntry {
+            name: "interp_smoke",
+            duration: std::time::Duration::from_secs(7),
+            watchdog_timeout: std::time::Duration::from_secs(13),
+            topology: crate::vmm::topology::Topology {
+                llcs: 3,
+                cores_per_llc: 5,
+                threads_per_core: 2,
+                numa_nodes: 4,
+                nodes: None,
+                distances: None,
+            },
+            ..KtstrTestEntry::DEFAULT
+        };
+        let preamble = generate_preamble(&entry, true);
+
+        assert!(
+            preamble.contains("KTSTR_TEST_NAME=interp_smoke"),
+            "preamble must set KTSTR_TEST_NAME from entry.name",
+        );
+        assert!(
+            preamble.contains("NEED_LLCS=3"),
+            "preamble must set NEED_LLCS from entry.topology.llcs",
+        );
+        assert!(
+            preamble.contains("NEED_CORES_PER_LLC=5"),
+            "preamble must set NEED_CORES_PER_LLC",
+        );
+        assert!(
+            preamble.contains("NEED_THREADS_PER_CORE=2"),
+            "preamble must set NEED_THREADS_PER_CORE",
+        );
+        assert!(
+            preamble.contains("NEED_NUMA_NODES=4"),
+            "preamble must set NEED_NUMA_NODES",
+        );
+        assert!(
+            preamble.contains("TEST_DURATION_SECS=7"),
+            "preamble must set TEST_DURATION_SECS from entry.duration",
+        );
+        assert!(
+            preamble.contains("TEST_WATCHDOG_SECS=13"),
+            "preamble must set TEST_WATCHDOG_SECS from entry.watchdog_timeout",
+        );
+    }
+
+    /// `write_runfile` produces the exact on-disk shape the
+    /// preamble's extraction step depends on:
+    /// 1. The preamble bytes verbatim
+    /// 2. A literal `__ARCHIVE__\n` marker line
+    /// 3. Base64-encoded archive bytes split into lines of <= 76
+    ///    characters each
+    ///
+    /// The runfile must also be mode 0o755 so the operator can run
+    /// `./repro.run` directly. Decoding the base64 chunk back must
+    /// reproduce the original archive bytes exactly.
+    #[test]
+    fn runfile_layout_and_archive_roundtrip() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let out = tmp.path().join("smoke.run");
+        let preamble = "#!/bin/bash\necho hello\n";
+        // Use bytes that look nothing like ASCII so we know we're
+        // verifying the binary roundtrip and not picking up a
+        // text-mode coincidence.
+        let archive: Vec<u8> = (0u8..=255).chain(0u8..=128).collect();
+
+        write_runfile(&out, preamble, &archive).expect("write_runfile");
+
+        // Mode 0o755 on the file itself.
+        let mode = std::fs::metadata(&out).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "runfile mode must be 0o755");
+
+        let raw = std::fs::read_to_string(&out).expect("read runfile");
+        let marker = "\n__ARCHIVE__\n";
+        let split_at = raw
+            .find(marker)
+            .expect("runfile must contain a __ARCHIVE__ marker line");
+        // The preamble portion is everything up to and including the
+        // newline that immediately precedes __ARCHIVE__. The preamble
+        // string already terminates with `\n`, so the first split
+        // point includes that trailing newline.
+        assert_eq!(
+            &raw[..split_at + 1],
+            preamble,
+            "preamble must be written verbatim before the marker",
+        );
+
+        let after = &raw[split_at + marker.len()..];
+        for line in after.lines() {
+            assert!(
+                line.len() <= 76,
+                "base64 line must be <= 76 cols (POSIX MIME width), got {}: {line:?}",
+                line.len(),
+            );
+        }
+        let joined: String = after.lines().collect();
+        let decoded = BASE64
+            .decode(joined.as_bytes())
+            .expect("base64 decode of runfile tail must succeed");
+        assert_eq!(
+            decoded, archive,
+            "base64 roundtrip must reproduce the input archive bytes",
+        );
+    }
+
+    /// End-to-end smoke: build_archive + generate_preamble +
+    /// write_runfile compose into a runfile whose extracted archive
+    /// contains the expected entries AND whose preamble parses
+    /// under `bash -n`. Validates that the three pipeline stages
+    /// glue together without truncation, escaping bugs, or shape
+    /// drift between layers.
+    #[test]
+    fn export_pipeline_round_trip_for_eevdf_entry() {
+        if which_bash().is_none() {
+            crate::report::test_skip("no bash on PATH");
+            return;
+        }
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let ktstr_path = tmp.path().join("fake-ktstr");
+        std::fs::write(&ktstr_path, b"FAKE_KTSTR").expect("write ktstr stub");
+        let inc = tmp.path().join("topology.yaml");
+        std::fs::write(&inc, b"some: yaml").expect("write include");
+        let out = tmp.path().join("e2e.run");
+
+        let entry = KtstrTestEntry {
+            name: "export_smoke",
+            ..KtstrTestEntry::DEFAULT
+        };
+        let archive =
+            build_archive(&ktstr_path, None, std::slice::from_ref(&inc)).expect("build archive");
+        let preamble = generate_preamble(&entry, false);
+        write_runfile(&out, &preamble, &archive).expect("write runfile");
+
+        // Preamble half: split at marker, run bash -n on the
+        // preamble portion.
+        let raw = std::fs::read_to_string(&out).expect("read runfile");
+        let split_at = raw.find("\n__ARCHIVE__\n").expect("marker present");
+        assert_bash_n_accepts(&raw[..split_at + 1], false);
+
+        // Archive half: decode + verify both expected entries.
+        let entries = read_archive_entries(&archive);
+        let names: Vec<&str> = entries.iter().map(|(n, _, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["ktstr", "include/topology.yaml"],
+            "archive must contain ktstr and the single include entry",
+        );
+
+        // Preamble half (positive content checks): operator-visible
+        // identifiers must reflect the entry name and the test's
+        // duration default (DEFAULT.duration is 2s).
+        assert!(
+            raw[..split_at].contains("KTSTR_TEST_NAME=export_smoke"),
+            "preamble must name the entry",
+        );
+        assert!(
+            raw[..split_at].contains("TEST_DURATION_SECS=2"),
+            "preamble must reflect the entry's duration",
+        );
+    }
+
+    /// Pipe `script` through `bash -n` and assert exit status 0.
+    /// `has_scheduler` is included only to make failure messages
+    /// distinguish the two preamble shapes.
+    fn assert_bash_n_accepts(script: &str, has_scheduler: bool) {
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+        let bash = which_bash().expect("bash should have been checked by caller");
+        let mut child = Command::new(&bash)
+            .arg("-n")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn bash -n");
+        child
+            .stdin
+            .as_mut()
+            .expect("bash stdin")
+            .write_all(script.as_bytes())
+            .expect("pipe script to bash");
+        let output = child.wait_with_output().expect("bash -n wait");
+        assert!(
+            output.status.success(),
+            "bash -n rejected the preamble (has_scheduler={has_scheduler}); \
+             stderr:\n{}\nscript:\n{script}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    /// Locate `bash` on the host running the unit tests. Returns
+    /// `None` rather than panicking when bash is absent; callers
+    /// use the `None` path to skip the bash-dependent checks.
+    fn which_bash() -> Option<PathBuf> {
+        search_path_for("bash")
     }
 }

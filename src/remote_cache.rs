@@ -154,13 +154,14 @@ fn pack_entry(entry_dir: &Path, metadata: &KernelMetadata) -> Result<Vec<u8>, St
     let meta_json = serde_json::to_string_pretty(&meta_sanitized)
         .map_err(|e| format!("serialize metadata: {e}"))?;
     let meta_bytes = meta_json.as_bytes();
-    let mut header = tar::Header::new_gnu();
-    header.set_size(meta_bytes.len() as u64);
-    header.set_mode(0o644);
-    header.set_cksum();
-    archive
-        .append_data(&mut header, "metadata.json", meta_bytes)
-        .map_err(|e| format!("tar append metadata: {e}"))?;
+    crate::tar_util::pack_tar_entry(
+        &mut archive,
+        "metadata.json",
+        0o644,
+        meta_bytes.len() as u64,
+        meta_bytes,
+    )
+    .map_err(|e| format!("tar append metadata: {e}"))?;
 
     // Add kernel image.
     let image_path = entry_dir.join(&metadata.image_name);
@@ -170,13 +171,14 @@ fn pack_entry(entry_dir: &Path, metadata: &KernelMetadata) -> Result<Vec<u8>, St
         .metadata()
         .map_err(|e| format!("image metadata: {e}"))?
         .len();
-    let mut header = tar::Header::new_gnu();
-    header.set_size(image_size);
-    header.set_mode(0o644);
-    header.set_cksum();
-    archive
-        .append_data(&mut header, &metadata.image_name, &mut image_file)
-        .map_err(|e| format!("tar append image: {e}"))?;
+    crate::tar_util::pack_tar_entry(
+        &mut archive,
+        &metadata.image_name,
+        0o644,
+        image_size,
+        &mut image_file,
+    )
+    .map_err(|e| format!("tar append image: {e}"))?;
 
     // Add vmlinux if present (BTF source for build.rs).
     let vmlinux_path = entry_dir.join("vmlinux");
@@ -185,13 +187,14 @@ fn pack_entry(entry_dir: &Path, metadata: &KernelMetadata) -> Result<Vec<u8>, St
             .metadata()
             .map_err(|e| format!("vmlinux metadata: {e}"))?
             .len();
-        let mut header = tar::Header::new_gnu();
-        header.set_size(vmlinux_size);
-        header.set_mode(0o644);
-        header.set_cksum();
-        archive
-            .append_data(&mut header, "vmlinux", &mut vmlinux_file)
-            .map_err(|e| format!("tar append vmlinux: {e}"))?;
+        crate::tar_util::pack_tar_entry(
+            &mut archive,
+            "vmlinux",
+            0o644,
+            vmlinux_size,
+            &mut vmlinux_file,
+        )
+        .map_err(|e| format!("tar append vmlinux: {e}"))?;
     }
 
     let tar_bytes = archive
@@ -599,13 +602,14 @@ mod tests {
         let meta = test_metadata();
         let meta_json = serde_json::to_string_pretty(&meta).unwrap();
         let meta_bytes = meta_json.as_bytes();
-        let mut header = tar::Header::new_gnu();
-        header.set_size(meta_bytes.len() as u64);
-        header.set_mode(0o644);
-        header.set_cksum();
-        archive
-            .append_data(&mut header, "metadata.json", meta_bytes)
-            .unwrap();
+        crate::tar_util::pack_tar_entry(
+            &mut archive,
+            "metadata.json",
+            0o644,
+            meta_bytes.len() as u64,
+            meta_bytes,
+        )
+        .unwrap();
         let raw_tar = archive.into_inner().unwrap();
 
         // Raw tar should not start with zstd magic.
@@ -647,13 +651,14 @@ mod tests {
 
         let mut archive = tar::Builder::new(Vec::new());
         let data = b"kernel image";
-        let mut header = tar::Header::new_gnu();
-        header.set_size(data.len() as u64);
-        header.set_mode(0o644);
-        header.set_cksum();
-        archive
-            .append_data(&mut header, "bzImage", data.as_slice())
-            .unwrap();
+        crate::tar_util::pack_tar_entry(
+            &mut archive,
+            "bzImage",
+            0o644,
+            data.len() as u64,
+            data.as_slice(),
+        )
+        .unwrap();
         let raw_tar = archive.into_inner().unwrap();
         let packed = zstd::encode_all(raw_tar.as_slice(), 3).unwrap();
 
@@ -674,13 +679,14 @@ mod tests {
         let meta = test_metadata();
         let meta_json = serde_json::to_string_pretty(&meta).unwrap();
         let meta_bytes = meta_json.as_bytes();
-        let mut header = tar::Header::new_gnu();
-        header.set_size(meta_bytes.len() as u64);
-        header.set_mode(0o644);
-        header.set_cksum();
-        archive
-            .append_data(&mut header, "metadata.json", meta_bytes)
-            .unwrap();
+        crate::tar_util::pack_tar_entry(
+            &mut archive,
+            "metadata.json",
+            0o644,
+            meta_bytes.len() as u64,
+            meta_bytes,
+        )
+        .unwrap();
         let raw_tar = archive.into_inner().unwrap();
         let packed = zstd::encode_all(raw_tar.as_slice(), 3).unwrap();
 
