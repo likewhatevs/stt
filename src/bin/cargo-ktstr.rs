@@ -207,24 +207,27 @@ enum KtstrCommand {
         profiles: Vec<String>,
     },
     /// Throw a costume party for a JSON dump — replaces every
-    /// identifier (pid / tid / cpu / cgroup / comm / scheduler /
-    /// label) with a deterministic `adjective-animal` petname so a
-    /// downstream LLM can reason about the structural shape of
-    /// the dump without dragging real identifiers into its
-    /// context. The transformation is one-way: there is no
-    /// reverse-mapping file by design.
+    /// non-metric value with a deterministic `adjective-animal`
+    /// petname so a downstream LLM can reason about the
+    /// structural shape of the dump without dragging real
+    /// identifiers into its context. The transformation is
+    /// one-way: there is no reverse-mapping file by design.
     ///
     /// `swift-otter` is just `swift-otter` — fun, terse, and
-    /// recognizable as a placeholder. Two pids that share the
-    /// same numeric value (across the same dump) get the same fun
-    /// name so cross-references inside the dump survive.
+    /// recognizable as a placeholder. Two values that share the
+    /// same key AND the same payload (across the same dump) get
+    /// the same fun name so cross-references inside the dump
+    /// survive.
     ///
     /// Reads JSON from `input` (or stdin when no path is given)
-    /// and writes the funified JSON to stdout. Fields that
-    /// classify as identifiers per
-    /// [`Funifier::classify_key`](ktstr::fun::Funifier::classify_key)
-    /// are funified; everything else passes through. Non-JSON
-    /// input fails fast with the serde_json parse error.
+    /// and writes the funified JSON to stdout. The walker
+    /// funifies every value by default and passes through only
+    /// the values whose containing key is a recognised metric
+    /// per
+    /// [`Funifier::is_metric_passthrough`](ktstr::fun::Funifier::is_metric_passthrough)
+    /// — counts / rates / ratios / byte-and-duration units /
+    /// structural enums. Non-JSON input fails fast with the
+    /// serde_json parse error.
     ///
     /// Visible alias `costume` matches the costume-party theme.
     #[command(visible_alias = "costume")]
@@ -3458,9 +3461,9 @@ fn run_completions(shell: clap_complete::Shell, binary: &str) {
     clap_complete::generate(shell, &mut cmd, binary, &mut std::io::stdout());
 }
 
-/// `cargo ktstr funify <input>` — read a JSON dump, replace
-/// identifiers (per
-/// [`ktstr::fun::Funifier::classify_key`](ktstr::fun::Funifier::classify_key))
+/// `cargo ktstr funify <input>` — read a JSON dump, replace every
+/// non-metric value (per
+/// [`ktstr::fun::Funifier::is_metric_passthrough`](ktstr::fun::Funifier::is_metric_passthrough))
 /// with `adjective-animal` petnames, write the result to stdout.
 ///
 /// `seed.is_some()` makes the mapping deterministic across

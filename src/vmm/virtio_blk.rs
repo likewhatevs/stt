@@ -6,9 +6,10 @@
 //! `VIRTIO_BLK_F_SIZE_MAX`, `VIRTIO_BLK_F_FLUSH`, plus the optional
 //! `VIRTIO_BLK_F_RO` when the disk is configured read-only. MMIO
 //! register layout per virtio-v1.2 §4.2.2; block-specific config
-//! space at offsets `0x100..` is hand-built per the `virtio_blk_config` layout in
-//! virtio-v1.2 §5.2.4. Interrupt delivery via irqfd (eventfd → KVM
-//! GSI).
+//! space at offsets `0x100..` is served from a [`VirtioBlkConfig`]
+//! struct whose `repr(C, packed)` layout mirrors the kernel uapi
+//! `struct virtio_blk_config` byte-for-byte (virtio-v1.2 §5.2.4).
+//! Interrupt delivery via irqfd (eventfd → KVM GSI).
 //!
 //! Every request flows through chain-shape validation, per-descriptor
 //! `SIZE_MAX` enforcement, pre-throttle terminal classification (RO
@@ -42,8 +43,9 @@ use std::time::Instant;
 
 use virtio_bindings::virtio_blk::{
     VIRTIO_BLK_F_BLK_SIZE, VIRTIO_BLK_F_FLUSH, VIRTIO_BLK_F_RO, VIRTIO_BLK_F_SEG_MAX,
-    VIRTIO_BLK_F_SIZE_MAX, VIRTIO_BLK_S_IOERR, VIRTIO_BLK_S_OK, VIRTIO_BLK_S_UNSUPP,
-    VIRTIO_BLK_T_FLUSH, VIRTIO_BLK_T_IN, VIRTIO_BLK_T_OUT,
+    VIRTIO_BLK_F_SIZE_MAX, VIRTIO_BLK_ID_BYTES, VIRTIO_BLK_S_IOERR, VIRTIO_BLK_S_OK,
+    VIRTIO_BLK_S_UNSUPP, VIRTIO_BLK_T_FLUSH, VIRTIO_BLK_T_GET_ID, VIRTIO_BLK_T_IN,
+    VIRTIO_BLK_T_OUT,
 };
 use virtio_bindings::virtio_config::{
     VIRTIO_CONFIG_S_ACKNOWLEDGE, VIRTIO_CONFIG_S_DRIVER, VIRTIO_CONFIG_S_DRIVER_OK,
@@ -61,7 +63,7 @@ use virtio_bindings::virtio_mmio::{
     VIRTIO_MMIO_STATUS, VIRTIO_MMIO_VENDOR_ID, VIRTIO_MMIO_VERSION,
 };
 use virtio_queue::{Queue, QueueT};
-use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
+use vm_memory::{ByteValued, Bytes, GuestAddress, GuestMemoryMmap};
 use vmm_sys_util::eventfd::EventFd;
 
 use super::disk_config::DiskThrottle;
@@ -111,6 +113,18 @@ const VIRTIO_BLK_SEG_MAX: u32 = 128;
 /// length as unbounded — host OOM hazard on a hostile guest.
 const VIRTIO_BLK_SIZE_MAX: u32 = 1 << 20;
 
+/// Device serial number returned by `VIRTIO_BLK_T_GET_ID`. Per
+/// virtio-v1.2 §5.2.6.4 (and `virtio_blk.h` `VIRTIO_BLK_ID_BYTES`)
+/// the kernel driver passes a 20-byte buffer (`virtblk_get_id` →
+/// `blk_rq_map_kern(req, id_str, VIRTIO_BLK_ID_BYTES, GFP_KERNEL)`,
+/// drivers/block/virtio_blk.c). The string is exposed at
+/// `/sys/block/<dev>/serial` after `serial_show` reads it from the
+/// device. The 16-byte payload `ktstr-virtio-blk` is null-padded to
+/// 20 bytes; the trailing zeros let `serial_show`'s
+/// `strlen(buf)` (after the kernel's `buf[VIRTIO_BLK_ID_BYTES] =
+/// '\0'` sentinel) terminate at the first NUL.
+const VIRTIO_BLK_SERIAL: [u8; VIRTIO_BLK_ID_BYTES as usize] = *b"ktstr-virtio-blk\0\0\0\0";
+
 /// Request out-header. virtio-v1.2 §5.2.6: every request chain
 /// starts with a device-readable, 16-byte header carrying the
 /// request type, ioprio (ignored), and starting sector. The struct
@@ -140,6 +154,97 @@ unsafe impl vm_memory::ByteValued for VirtioBlkOutHdr {}
 /// Header size for `VirtioBlkOutHdr`. virtio-v1.2 §5.2.6:
 /// type:u32, ioprio:u32, sector:u64.
 const VIRTIO_BLK_OUTHDR_SIZE: usize = std::mem::size_of::<VirtioBlkOutHdr>();
+
+/// Legacy CHS geometry sub-struct of `VirtioBlkConfig`, gated on
+/// `VIRTIO_BLK_F_GEOMETRY`. Mirrors the kernel uapi
+/// `struct virtio_blk_geometry` (cylinders:u16, heads:u8, sectors:u8 —
+/// 4 bytes total) at config-space offset 0x10. We don't advertise
+/// `F_GEOMETRY` so the field is left zero; the guest driver reads it
+/// via `virtio_cread_feature`, which returns `-ENOENT` when the
+/// feature bit is not negotiated and the read is skipped.
+#[repr(C, packed)]
+#[derive(Copy, Clone, Default, Debug)]
+struct VirtioBlkGeometry {
+    cylinders: u16,
+    heads: u8,
+    sectors: u8,
+}
+
+/// Block-device config space (virtio-v1.2 §5.2.4). Mirrors the kernel
+/// uapi `struct virtio_blk_config` field-for-field up through
+/// `blk_size` (the last field whose feature bit this device
+/// advertises). Trailing fields (topology, MQ, discard, write-zeroes,
+/// secure-erase, zoned) are gated on feature bits we don't advertise,
+/// so the guest driver's `virtio_cread_feature` returns `-ENOENT` for
+/// those reads and never depends on the device-side bytes — we serve
+/// zeros for any read past `size_of::<VirtioBlkConfig>()`, matching
+/// virtio-v1.2 §4.2.2.2 ("reads past the populated config layout
+/// return zero").
+///
+/// The kernel struct is `__attribute__((packed))` (see
+/// `include/uapi/linux/virtio_blk.h`), so this redeclaration uses
+/// `repr(C, packed)` to match the wire layout byte-for-byte. Without
+/// the `packed` attribute the compiler would insert padding after
+/// `seg_max` to align `geometry` (which contains a `u16`) — that
+/// padding would shift `blk_size` from offset 0x14 to 0x18 and serve
+/// the guest a wrong block-size value silently.
+#[repr(C, packed)]
+#[derive(Copy, Clone, Default, Debug)]
+struct VirtioBlkConfig {
+    /// Capacity in 512-byte sectors. Always populated; the kernel
+    /// driver reads this unconditionally (no feature bit gates it).
+    capacity: u64,
+    /// Maximum per-descriptor data length, gated on
+    /// `VIRTIO_BLK_F_SIZE_MAX`.
+    size_max: u32,
+    /// Maximum scatter-gather segments per request, gated on
+    /// `VIRTIO_BLK_F_SEG_MAX`.
+    seg_max: u32,
+    /// Legacy CHS geometry, gated on `VIRTIO_BLK_F_GEOMETRY`. We
+    /// don't advertise that bit so this field is left zero.
+    geometry: VirtioBlkGeometry,
+    /// Logical block size, gated on `VIRTIO_BLK_F_BLK_SIZE`.
+    blk_size: u32,
+}
+
+// SAFETY: `VirtioBlkConfig` and `VirtioBlkGeometry` are
+// `repr(C, packed)`. With `packed` the alignment is 1 and there is no
+// inter-field padding by definition (every field is byte-aligned). All
+// fields are integer types (`u8`, `u16`, `u32`, `u64`) for which every
+// bit pattern is a valid value, so reading arbitrary bytes into the
+// struct yields a well-defined value. The struct is `Copy`, `Send`,
+// and `Sync` (all primitives), satisfying the `ByteValued` supertrait
+// bounds. Total size is verified against the kernel uapi layout by
+// the `VIRTIO_BLK_CONFIG_SIZE` const assertion below.
+unsafe impl vm_memory::ByteValued for VirtioBlkConfig {}
+// SAFETY: same justification as `VirtioBlkConfig`. `VirtioBlkGeometry`
+// is `repr(C, packed)` with three integer fields (`u16`, `u8`, `u8`),
+// no padding, all bit patterns valid, `Copy + Send + Sync`.
+unsafe impl vm_memory::ByteValued for VirtioBlkGeometry {}
+
+/// Size of the populated portion of block config space (24 bytes:
+/// capacity 8 + size_max 4 + seg_max 4 + geometry 4 + blk_size 4).
+/// Reads at config-space offsets `>= VIRTIO_BLK_CONFIG_SIZE` return
+/// zero per virtio-v1.2 §4.2.2.2.
+const VIRTIO_BLK_CONFIG_SIZE: usize = std::mem::size_of::<VirtioBlkConfig>();
+// Compile-time check that the struct layout matches the kernel uapi
+// byte budget (8+4+4+4+4 = 24). A mismatch here means either Rust's
+// `repr(C, packed)` introduced a divergence from the kernel's
+// `__attribute__((packed))` layout, or a field was added/removed —
+// in either case the guest would read garbage from a misaligned
+// field. Failing to compile is preferable to silently serving wrong
+// bytes.
+const _: () = assert!(VIRTIO_BLK_CONFIG_SIZE == 24);
+// Field-offset checks: the kernel driver reads each field at a
+// specific offset via `virtio_cread`. If `repr(C, packed)` ever
+// drifts from the kernel's `__attribute__((packed))` layout, these
+// asserts catch it at compile time before a wrong-offset bug ships
+// to the guest.
+const _: () = assert!(std::mem::offset_of!(VirtioBlkConfig, capacity) == 0x00);
+const _: () = assert!(std::mem::offset_of!(VirtioBlkConfig, size_max) == 0x08);
+const _: () = assert!(std::mem::offset_of!(VirtioBlkConfig, seg_max) == 0x0C);
+const _: () = assert!(std::mem::offset_of!(VirtioBlkConfig, geometry) == 0x10);
+const _: () = assert!(std::mem::offset_of!(VirtioBlkConfig, blk_size) == 0x14);
 
 /// One descriptor from a virtio request chain. Used uniformly for
 /// every chain role — header, data segments, and status — so the
@@ -695,8 +800,8 @@ impl VirtioBlk {
     /// when applicable. Returns `Some((status_byte, used_len))` for
     /// requests the device decides without ever touching the backing
     /// file or the throttle (RO-mode writes, RO-mode flushes, unknown
-    /// request types). Returns `None` for the normal IN/OUT/FLUSH
-    /// paths that need the backend handlers.
+    /// request types). Returns `None` for the normal
+    /// IN/OUT/FLUSH/GET_ID paths that need the backend handlers.
     ///
     /// Side effects per branch:
     ///
@@ -711,6 +816,11 @@ impl VirtioBlk {
     ///   a read-only disk). The counter records the delivery, not
     ///   the work — symmetric with how the writable-disk path
     ///   bumps `flushes_completed` after `fdatasync` returns Ok.
+    /// - **`T_GET_ID` → None (regardless of `read_only`)**: T_GET_ID
+    ///   is a metadata read that never touches the backing file, so
+    ///   the RO disk accepts it the same as a writable disk. Per
+    ///   virtio-v1.2 §5.2.6.4 GET_ID is not gated on any feature
+    ///   bit and is always accepted.
     /// - **Unknown type → `S_UNSUPP`**: NO counter bump. UNSUPP is
     ///   a graceful decline ("the device doesn't speak this
     ///   request"), not a service failure — the device never tried
@@ -744,7 +854,7 @@ impl VirtioBlk {
                 counters.record_flush();
                 Some((VIRTIO_BLK_S_OK as u8, 1))
             }
-            VIRTIO_BLK_T_IN | VIRTIO_BLK_T_OUT | VIRTIO_BLK_T_FLUSH => None,
+            VIRTIO_BLK_T_IN | VIRTIO_BLK_T_OUT | VIRTIO_BLK_T_FLUSH | VIRTIO_BLK_T_GET_ID => None,
             _ => Some((VIRTIO_BLK_S_UNSUPP as u8, 1)),
         }
     }
@@ -1044,18 +1154,28 @@ impl VirtioBlk {
             // accounting and the `add_used` length).
             let data_len: u64 = data_segments.iter().map(|d| d.len as u64).sum();
 
-            // Zero-data T_IN/T_OUT must IOERR. virtio-v1.2 §5.2.6
-            // defines IN/OUT as carrying a non-empty data payload;
-            // a chain that has only the header + status with no
-            // data segments is malformed for these request types.
-            // cloud-hypervisor explicitly rejects this; matching
-            // their behaviour. T_FLUSH is exempt — flush carries
-            // no data by design.
-            if matches!(req_type, VIRTIO_BLK_T_IN | VIRTIO_BLK_T_OUT) && data_segments.is_empty() {
+            // Zero-data T_IN/T_OUT/T_GET_ID must IOERR. virtio-v1.2
+            // §5.2.6 defines IN/OUT as carrying a non-empty data
+            // payload; §5.2.6.4 defines GET_ID as writing a 20-byte
+            // string into a device-writable data segment — a chain
+            // with only header + status has no destination buffer.
+            // cloud-hypervisor explicitly rejects this for
+            // IN/OUT; firecracker rejects sub-20-byte GET_ID via the
+            // handler's `data_len < VIRTIO_BLK_ID_BYTES` arm. We
+            // hoist the empty case here so the throttle bucket is
+            // never charged for a request the handler will reject
+            // anyway. T_FLUSH is exempt — flush carries no data by
+            // design (kernel `virtblk_setup_cmd` sets
+            // `vbr->in_hdr_len = sizeof(status)` for flushes).
+            if matches!(
+                req_type,
+                VIRTIO_BLK_T_IN | VIRTIO_BLK_T_OUT | VIRTIO_BLK_T_GET_ID
+            ) && data_segments.is_empty()
+            {
                 tracing::warn!(
                     head,
                     req_type,
-                    "virtio-blk T_IN/T_OUT with no data segments"
+                    "virtio-blk T_IN/T_OUT/T_GET_ID with no data segments"
                 );
                 self.counters.record_io_error();
                 if publish_completion(
@@ -1132,25 +1252,32 @@ impl VirtioBlk {
             let pre_throttle = Self::classify_pre_throttle(req_type, read_only, counters);
 
             // Direction validation, hoisted out of
-            // handle_read_impl/handle_write_impl so it runs BEFORE
-            // the throttle bucket is consumed. virtio-v1.2 §5.2.6:
-            // T_IN data segments must be device-writable
-            // (is_write_only); T_OUT data segments must be
-            // device-readable (!is_write_only). A request whose
-            // data SG direction violates the spec is rejected
-            // unconditionally — running it would either read
-            // host data into a guest-readable-only buffer (T_IN)
-            // or write guest-writable buffers to the backing file
-            // (T_OUT), neither of which the kernel driver expects.
-            // Pre-throttle classifications skip this — RO writes
-            // and unsupported requests are already terminal and
-            // never dispatch. The redundant per-segment check
-            // remains in handle_read_impl/handle_write_impl as
+            // handle_read_impl/handle_write_impl/handle_get_id_impl
+            // so it runs BEFORE the throttle bucket is consumed.
+            // virtio-v1.2 §5.2.6: T_IN data segments must be
+            // device-writable (is_write_only); T_OUT data segments
+            // must be device-readable (!is_write_only). T_GET_ID
+            // (§5.2.6.4) writes a 20-byte string into a
+            // device-writable data segment, matching T_IN's
+            // direction (cloud-hypervisor and firecracker both
+            // reject non-write-only data segments for GET_ID). A
+            // request whose data SG direction violates the spec is
+            // rejected unconditionally — running it would either
+            // read host data into a guest-readable-only buffer
+            // (T_IN/T_GET_ID) or write guest-writable buffers to
+            // the backing file (T_OUT), neither of which the
+            // kernel driver expects. Pre-throttle classifications
+            // skip this — RO writes and unsupported requests are
+            // already terminal and never dispatch. The redundant
+            // per-segment check remains in
+            // handle_read_impl/handle_write_impl as
             // defense-in-depth in case a future caller bypasses
             // this gate.
             let direction_violation = pre_throttle.is_none()
                 && match req_type {
-                    VIRTIO_BLK_T_IN => data_segments.iter().any(|d| !d.is_write_only),
+                    VIRTIO_BLK_T_IN | VIRTIO_BLK_T_GET_ID => {
+                        data_segments.iter().any(|d| !d.is_write_only)
+                    }
                     VIRTIO_BLK_T_OUT => data_segments.iter().any(|d| d.is_write_only),
                     _ => false,
                 };
@@ -1158,7 +1285,7 @@ impl VirtioBlk {
                 tracing::warn!(
                     head,
                     req_type,
-                    "virtio-blk T_IN/T_OUT data segment direction mismatch"
+                    "virtio-blk T_IN/T_OUT/T_GET_ID data segment direction mismatch"
                 );
                 self.counters.record_io_error();
                 if publish_completion(
@@ -1266,15 +1393,18 @@ impl VirtioBlk {
                         &mut self.io_buf_scratch,
                     ),
                     VIRTIO_BLK_T_FLUSH => Self::handle_flush_impl(backing, counters),
+                    VIRTIO_BLK_T_GET_ID => {
+                        Self::handle_get_id_impl(counters, mem, data_segments)
+                    }
                     // Defense-in-depth fall-through. classify_pre_throttle's
                     // catch-all `_ => Some((VIRTIO_BLK_S_UNSUPP, 1))` arm
                     // means this branch is unreachable today — but a future
                     // patch that adds a new variant to the
-                    // `T_IN | T_OUT | T_FLUSH => None` arm without updating
-                    // this match would otherwise panic the vCPU thread.
-                    // Return S_UNSUPP and bump io_errors so the regression
-                    // surfaces as a guest-visible error and a counter bump
-                    // rather than a panic that kills the VM.
+                    // `T_IN | T_OUT | T_FLUSH | T_GET_ID => None` arm
+                    // without updating this match would otherwise panic the
+                    // vCPU thread. Return S_UNSUPP and bump io_errors so the
+                    // regression surfaces as a guest-visible error and a
+                    // counter bump rather than a panic that kills the VM.
                     _ => {
                         counters.record_io_error();
                         (VIRTIO_BLK_S_UNSUPP as u8, 1)
@@ -1301,6 +1431,7 @@ impl VirtioBlk {
                 VIRTIO_BLK_T_IN => "in",
                 VIRTIO_BLK_T_OUT => "out",
                 VIRTIO_BLK_T_FLUSH => "flush",
+                VIRTIO_BLK_T_GET_ID => "get_id",
                 _ => "unsupp",
             };
             tracing::trace!(
@@ -1553,6 +1684,87 @@ impl VirtioBlk {
         (status, 1)
     }
 
+    /// Service `VIRTIO_BLK_T_GET_ID` (virtio-v1.2 §5.2.6.4). Writes
+    /// the device's 20-byte serial string into the FIRST data
+    /// descriptor and returns `(status_byte, used_len)` where
+    /// `used_len = VIRTIO_BLK_ID_BYTES + 1` on success (20 data
+    /// bytes + 1 status byte). Caller publishes the status byte and
+    /// gates `add_used` on a successful status write.
+    ///
+    /// The kernel driver `virtblk_get_id`
+    /// (drivers/block/virtio_blk.c) maps a single 20-byte buffer
+    /// via `blk_rq_map_kern(req, id_str, VIRTIO_BLK_ID_BYTES,
+    /// GFP_KERNEL)`, so a well-formed chain has exactly one data
+    /// descriptor of length >= 20. Multi-descriptor chains are
+    /// theoretically legal under the spec but never produced by
+    /// the kernel driver; we honor the kernel's contract by
+    /// writing into the first descriptor only — matching
+    /// firecracker's `process_get_device_id` and libkrun's
+    /// `worker.rs` arm. If the first data descriptor is shorter
+    /// than 20 bytes the request is rejected with `S_IOERR`
+    /// (firecracker, cloud-hypervisor, libkrun all reject;
+    /// QEMU truncates instead — we diverge intentionally because
+    /// a guest that hands us a too-small buffer is already buggy
+    /// and partial-data is a silent footgun).
+    ///
+    /// The data descriptor's direction has already been validated
+    /// by the outer `direction_violation` gate in
+    /// `process_requests` (T_GET_ID requires write-only); the
+    /// per-segment direction check below is defense-in-depth for
+    /// callers that bypass the gate.
+    ///
+    /// Free function (not `&self`-method) so the caller can pass
+    /// disjoint field borrows individually — matching
+    /// `handle_read_impl` / `handle_write_impl` for the same
+    /// borrow-checker reason (`process_requests` holds
+    /// `&mut self.queues[..]`).
+    fn handle_get_id_impl(
+        counters: &VirtioBlkCounters,
+        mem: &GuestMemoryMmap,
+        data_segments: &[ChainDescriptor],
+    ) -> (u8, u32) {
+        // First data descriptor receives the serial. The empty
+        // case is filtered upstream by the zero-data gate, so
+        // `first()` is always Some at production reach.
+        // Defense-in-depth: still handle the empty slice by
+        // returning S_IOERR rather than panicking on
+        // `data_segments[0]` indexing.
+        let Some(first) = data_segments.first() else {
+            counters.record_io_error();
+            return (VIRTIO_BLK_S_IOERR as u8, 1);
+        };
+        if !first.is_write_only {
+            // Spec violation — GET_ID's data SG must be
+            // device-writable. Defense-in-depth: the outer gate in
+            // process_requests already rejected this chain before
+            // throttle. Kept in case a future caller reaches
+            // handle_get_id_impl directly.
+            counters.record_io_error();
+            return (VIRTIO_BLK_S_IOERR as u8, 1);
+        }
+        if first.len < VIRTIO_BLK_ID_BYTES {
+            // Buffer too small — kernel driver always passes
+            // exactly VIRTIO_BLK_ID_BYTES (20). Reject rather than
+            // truncate: matches firecracker / cloud-hypervisor /
+            // libkrun. A truncated serial would surface as a
+            // garbled `/sys/block/<dev>/serial` value, which is
+            // worse than an explicit IOERR (the guest's
+            // `serial_show` maps -EIO to an empty string).
+            counters.record_io_error();
+            return (VIRTIO_BLK_S_IOERR as u8, 1);
+        }
+        if mem
+            .write_slice(&VIRTIO_BLK_SERIAL[..], first.addr)
+            .is_err()
+        {
+            counters.record_io_error();
+            return (VIRTIO_BLK_S_IOERR as u8, 1);
+        }
+        // used_len: 20 data bytes written + 1 status byte. Symmetric
+        // with handle_read_impl's `total_read + 1` accounting.
+        (VIRTIO_BLK_S_OK as u8, VIRTIO_BLK_ID_BYTES + 1)
+    }
+
     // ------------------------------------------------------------------
     // MMIO register dispatch
     // ------------------------------------------------------------------
@@ -1626,6 +1838,20 @@ impl VirtioBlk {
         (status, used_len)
     }
 
+    #[cfg(test)]
+    fn handle_get_id(
+        &self,
+        mem: &GuestMemoryMmap,
+        data_segments: &[ChainDescriptor],
+        status_addr: GuestAddress,
+    ) -> (u8, u32) {
+        let (status, used_len) =
+            Self::handle_get_id_impl(self.counters.as_ref(), mem, data_segments);
+        mem.write_slice(&[status], status_addr)
+            .expect("write status in test wrapper");
+        (status, used_len)
+    }
+
     /// Handle MMIO read at `offset` within the device's MMIO region.
     ///
     /// Two address ranges:
@@ -1683,34 +1909,44 @@ impl VirtioBlk {
         data.copy_from_slice(&val.to_le_bytes());
     }
 
-    /// Read from block config space. virtio-v1.2 §5.2.4 layout:
+    /// Read from block config space. virtio-v1.2 §5.2.4 layout, mirrored
+    /// in [`VirtioBlkConfig`]:
     ///   - 0x00..0x08: capacity (u64 LE, sectors) — always
     ///   - 0x08..0x0C: size_max (u32 LE) — VIRTIO_BLK_F_SIZE_MAX
     ///   - 0x0C..0x10: seg_max (u32 LE) — VIRTIO_BLK_F_SEG_MAX
+    ///   - 0x10..0x14: geometry (4 bytes) — VIRTIO_BLK_F_GEOMETRY (zero;
+    ///                  feature bit not advertised)
     ///   - 0x14..0x18: blk_size (u32 LE) — VIRTIO_BLK_F_BLK_SIZE
+    ///
+    /// Reads at offsets `>= VIRTIO_BLK_CONFIG_SIZE` return zero per
+    /// virtio-v1.2 §4.2.2.2 ("reads past the populated config layout
+    /// return zero") — guarded fields like topology / MQ / discard
+    /// have feature bits we don't advertise, so the kernel driver's
+    /// `virtio_cread_feature` skips them and never observes the
+    /// zero-bytes we serve.
     fn read_blk_config(&self, offset: u64, data: &mut [u8]) {
+        let cfg = VirtioBlkConfig {
+            capacity: self.capacity_sectors,
+            size_max: VIRTIO_BLK_SIZE_MAX,
+            seg_max: VIRTIO_BLK_SEG_MAX,
+            geometry: VirtioBlkGeometry::default(),
+            blk_size: VIRTIO_BLK_SECTOR_SIZE,
+        };
+        // `as_slice()` returns the struct's wire-format byte
+        // representation directly — `repr(C, packed)` guarantees no
+        // padding and host-LE u32/u64 stores match the virtio LE wire
+        // format on the supported (x86_64, aarch64) hosts. See
+        // ByteValued impl SAFETY note above.
+        let cfg_bytes = cfg.as_slice();
         let len = data.len();
-        let mut config = [0u8; 64];
-        // virtio-v1.2 §5.2.4 layout:
-        //   0x00..0x08  capacity (sectors, u64 LE) — always populated.
-        //   0x08..0x0C  size_max (u32 LE) — gated on F_SIZE_MAX.
-        //   0x0C..0x10  seg_max (u32 LE) — gated on F_SEG_MAX.
-        //   0x14..0x18  blk_size (u32 LE) — gated on F_BLK_SIZE.
-        // geometry (0x10) and topology (0x18+) are left zero —
-        // their respective feature bits are not advertised so the
-        // guest never reads them.
-        config[0..8].copy_from_slice(&self.capacity_sectors.to_le_bytes());
-        config[0x08..0x0C].copy_from_slice(&VIRTIO_BLK_SIZE_MAX.to_le_bytes());
-        config[0x0C..0x10].copy_from_slice(&VIRTIO_BLK_SEG_MAX.to_le_bytes());
-        config[0x14..0x18].copy_from_slice(&VIRTIO_BLK_SECTOR_SIZE.to_le_bytes());
         let start = offset as usize;
-        if start >= config.len() {
+        if start >= cfg_bytes.len() {
             data.fill(0);
             return;
         }
-        let end = (start + len).min(config.len());
+        let end = (start + len).min(cfg_bytes.len());
         let n = end - start;
-        data[..n].copy_from_slice(&config[start..end]);
+        data[..n].copy_from_slice(&cfg_bytes[start..end]);
         data[n..].fill(0);
     }
 
@@ -1977,6 +2213,106 @@ mod tests {
         let mut buf = [0u8; 4];
         dev.mmio_read(0x100 + 0x0C, &mut buf);
         assert_eq!(u32::from_le_bytes(buf), VIRTIO_BLK_SEG_MAX);
+    }
+
+    #[test]
+    fn config_space_struct_layout_byte_for_byte() {
+        // Read the entire 24-byte populated config-space layout via
+        // a single mmio read and verify that every field lands at
+        // the kernel-uapi-mandated offset:
+        //   capacity (u64 LE) @ 0x00 — VIRTIO_BLK_DEFAULT_CAPACITY_BYTES / 512
+        //   size_max (u32 LE) @ 0x08 — VIRTIO_BLK_SIZE_MAX
+        //   seg_max  (u32 LE) @ 0x0C — VIRTIO_BLK_SEG_MAX
+        //   geometry (4B zeroed) @ 0x10 — F_GEOMETRY not advertised
+        //   blk_size (u32 LE) @ 0x14 — VIRTIO_BLK_SECTOR_SIZE
+        // A regression in `repr(C, packed)` field ordering or padding
+        // would shift any field by a byte and break this assertion
+        // before the wrong bytes ever reach the guest.
+        let dev = make_device(VIRTIO_BLK_DEFAULT_CAPACITY_BYTES, DiskThrottle::default());
+        let mut bytes = [0u8; VIRTIO_BLK_CONFIG_SIZE];
+        dev.mmio_read(0x100, &mut bytes);
+
+        let capacity = u64::from_le_bytes(bytes[0x00..0x08].try_into().unwrap());
+        let size_max = u32::from_le_bytes(bytes[0x08..0x0C].try_into().unwrap());
+        let seg_max = u32::from_le_bytes(bytes[0x0C..0x10].try_into().unwrap());
+        let geometry = &bytes[0x10..0x14];
+        let blk_size = u32::from_le_bytes(bytes[0x14..0x18].try_into().unwrap());
+
+        assert_eq!(
+            capacity,
+            VIRTIO_BLK_DEFAULT_CAPACITY_BYTES / VIRTIO_BLK_SECTOR_SIZE as u64,
+            "capacity mismatch — repr(C, packed) layout drift?",
+        );
+        assert_eq!(size_max, VIRTIO_BLK_SIZE_MAX, "size_max layout drift");
+        assert_eq!(seg_max, VIRTIO_BLK_SEG_MAX, "seg_max layout drift");
+        assert_eq!(
+            geometry,
+            &[0u8; 4],
+            "F_GEOMETRY not advertised; geometry must be zero",
+        );
+        assert_eq!(blk_size, VIRTIO_BLK_SECTOR_SIZE, "blk_size layout drift");
+    }
+
+    #[test]
+    fn config_space_zero_past_struct_size() {
+        // virtio-v1.2 §4.2.2.2: reads past the populated config layout
+        // return zero. Our `repr(C, packed)` struct is 24 bytes; the
+        // device must zero-fill any read at offset >= 24 within
+        // config space. A buggy guest or future feature negotiation
+        // must see deterministic zero rather than uninitialized memory.
+        let dev = make_device(VIRTIO_BLK_DEFAULT_CAPACITY_BYTES, DiskThrottle::default());
+        let mut buf = [0xffu8; 16];
+        dev.mmio_read(0x100 + VIRTIO_BLK_CONFIG_SIZE as u64, &mut buf);
+        assert!(
+            buf.iter().all(|&b| b == 0),
+            "config-space read past struct size must be zero-filled, got {:02x?}",
+            buf,
+        );
+
+        // Read straddling the struct boundary: half within, half
+        // past. The within portion carries blk_size at offset 0x14;
+        // the past portion (offset 0x18..0x1C) must zero-fill.
+        let mut buf = [0xffu8; 8];
+        dev.mmio_read(0x100 + 0x14, &mut buf);
+        assert_eq!(
+            u32::from_le_bytes(buf[0..4].try_into().unwrap()),
+            VIRTIO_BLK_SECTOR_SIZE,
+            "first 4 bytes must be blk_size",
+        );
+        assert_eq!(
+            &buf[4..],
+            &[0u8; 4],
+            "trailing 4 bytes (offset 0x18..0x1C) must zero-fill past struct end",
+        );
+    }
+
+    #[test]
+    fn config_space_struct_size_matches_kernel_uapi() {
+        // Mirror the compile-time size assertion at runtime so a
+        // broken assertion surfaces under nextest output rather than
+        // hidden in a const-eval failure. Also pin the alignment to
+        // 1: ByteValued::as_slice() returns the struct's bytes
+        // directly, and `repr(C, packed)` collapses alignment to 1
+        // — which both matches the kernel's
+        // `__attribute__((packed))` layout and avoids any
+        // unaligned-access UB on architectures we don't currently
+        // target.
+        assert_eq!(
+            VIRTIO_BLK_CONFIG_SIZE, 24,
+            "VirtioBlkConfig must be 24 bytes (capacity 8 + size_max 4 + \
+             seg_max 4 + geometry 4 + blk_size 4) per the kernel uapi \
+             layout. Mismatch implies repr(C, packed) drift.",
+        );
+        assert_eq!(
+            std::mem::align_of::<VirtioBlkConfig>(),
+            1,
+            "repr(C, packed) must produce alignment 1",
+        );
+        assert_eq!(
+            std::mem::align_of::<VirtioBlkGeometry>(),
+            1,
+            "geometry sub-struct must also be packed to align 1",
+        );
     }
 
     #[test]
@@ -4701,6 +5037,463 @@ mod tests {
             u32::from_le_bytes(buf),
             VIRTIO_BLK_SIZE_MAX,
             "config-space size_max must equal VIRTIO_BLK_SIZE_MAX (1 MB)",
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // T_GET_ID (virtio-v1.2 §5.2.6.4) coverage. The kernel driver's
+    // `virtblk_get_id` (drivers/block/virtio_blk.c) issues a single
+    // 20-byte request to populate `/sys/block/<dev>/serial`. Tests
+    // span the direct handler, classify_pre_throttle dispatch, and
+    // the full chain pipeline.
+    // ----------------------------------------------------------------
+
+    /// `T_GET_ID` is NOT a pre-throttle terminal classification; it
+    /// dispatches to `handle_get_id_impl`. Pin that
+    /// `classify_pre_throttle` returns `None` for both writable and
+    /// read-only disks (the metadata read is RO-safe).
+    #[test]
+    fn classify_get_id_returns_none_for_both_modes() {
+        let counters = VirtioBlkCounters::default();
+        assert_eq!(
+            VirtioBlk::classify_pre_throttle(VIRTIO_BLK_T_GET_ID, false, &counters),
+            None,
+            "writable disk: T_GET_ID falls through to handler",
+        );
+        assert_eq!(
+            VirtioBlk::classify_pre_throttle(VIRTIO_BLK_T_GET_ID, true, &counters),
+            None,
+            "read-only disk: T_GET_ID is metadata-read-only and \
+             still falls through to handler",
+        );
+        assert_eq!(
+            counters.io_errors.load(Ordering::Relaxed),
+            0,
+            "T_GET_ID classification never bumps io_errors",
+        );
+    }
+
+    /// `handle_get_id_impl` writes the device serial into a
+    /// 20-byte device-writable data segment and returns
+    /// `(S_OK, VIRTIO_BLK_ID_BYTES + 1)`. The serial bytes must
+    /// equal `VIRTIO_BLK_SERIAL` exactly so the guest's
+    /// `/sys/block/<dev>/serial` reads back the same string.
+    #[test]
+    fn handle_get_id_writes_serial_and_returns_ok() {
+        let cap = 4096u64;
+        let f = make_backed_file_with_pattern(cap, 0x00);
+        let dev = VirtioBlk::new(f, cap, DiskThrottle::default());
+        let mem = make_guest_mem(8192);
+        let data_addr = GuestAddress(0x1000);
+        let status_addr = GuestAddress(0x2000);
+        // Pre-fill the data buffer with a sentinel so a regression
+        // that wrote zero bytes (or the wrong number of bytes)
+        // surfaces as residual sentinel rather than a silent
+        // pass.
+        mem.write_slice(
+            &[0xCDu8; VIRTIO_BLK_ID_BYTES as usize],
+            data_addr,
+        )
+        .unwrap();
+        let segs = vec![ChainDescriptor {
+            addr: data_addr,
+            len: VIRTIO_BLK_ID_BYTES,
+            is_write_only: true,
+        }];
+        let (status, used) = dev.handle_get_id(&mem, &segs, status_addr);
+        assert_eq!(status, VIRTIO_BLK_S_OK as u8);
+        assert_eq!(
+            used,
+            VIRTIO_BLK_ID_BYTES + 1,
+            "used_len = 20 data bytes + 1 status byte",
+        );
+        let mut buf = [0u8; VIRTIO_BLK_ID_BYTES as usize];
+        mem.read_slice(&mut buf, data_addr).unwrap();
+        assert_eq!(
+            buf, VIRTIO_BLK_SERIAL,
+            "data segment must hold the device serial verbatim",
+        );
+        // Status descriptor holds S_OK.
+        let mut s = [0u8; 1];
+        mem.read_slice(&mut s, status_addr).unwrap();
+        assert_eq!(s[0], VIRTIO_BLK_S_OK as u8);
+    }
+
+    /// A data buffer shorter than `VIRTIO_BLK_ID_BYTES` (20) is
+    /// rejected with `S_IOERR`. Matches firecracker /
+    /// cloud-hypervisor / libkrun. QEMU truncates here; we
+    /// deliberately diverge — a partial serial would silently
+    /// surface garbage in `/sys/block/<dev>/serial`. The kernel
+    /// driver always passes exactly 20 bytes
+    /// (`virtblk_get_id` → `blk_rq_map_kern(req, id_str,
+    /// VIRTIO_BLK_ID_BYTES, GFP_KERNEL)`), so the only producers
+    /// of sub-20 buffers are buggy or hostile.
+    #[test]
+    fn handle_get_id_rejects_short_buffer() {
+        let cap = 4096u64;
+        let f = make_backed_file_with_pattern(cap, 0x00);
+        let dev = VirtioBlk::new(f, cap, DiskThrottle::default());
+        let mem = make_guest_mem(8192);
+        let data_addr = GuestAddress(0x1000);
+        let status_addr = GuestAddress(0x2000);
+        // 19 bytes — one short of the 20-byte minimum.
+        let segs = vec![ChainDescriptor {
+            addr: data_addr,
+            len: VIRTIO_BLK_ID_BYTES - 1,
+            is_write_only: true,
+        }];
+        let (status, used) = dev.handle_get_id(&mem, &segs, status_addr);
+        assert_eq!(
+            status,
+            VIRTIO_BLK_S_IOERR as u8,
+            "sub-20-byte buffer must IOERR, not truncate",
+        );
+        assert_eq!(used, 1, "IOERR used_len is 1 (status byte only)");
+        assert_eq!(
+            dev.counters().io_errors.load(Ordering::Relaxed),
+            1,
+            "short buffer rejection bumps io_errors",
+        );
+    }
+
+    /// A device-readable data descriptor (direction violation) is
+    /// rejected. virtio-v1.2 §5.2.6.4 mandates the data SG be
+    /// device-writable for T_GET_ID. The outer
+    /// `direction_violation` gate in `process_requests` already
+    /// filters this; the handler-level check is defense-in-depth
+    /// for callers that bypass the gate.
+    #[test]
+    fn handle_get_id_rejects_readonly_data_segment() {
+        let cap = 4096u64;
+        let f = make_backed_file_with_pattern(cap, 0x00);
+        let dev = VirtioBlk::new(f, cap, DiskThrottle::default());
+        let mem = make_guest_mem(8192);
+        let data_addr = GuestAddress(0x1000);
+        let status_addr = GuestAddress(0x2000);
+        let segs = vec![ChainDescriptor {
+            addr: data_addr,
+            len: VIRTIO_BLK_ID_BYTES,
+            is_write_only: false, // wrong direction for GET_ID
+        }];
+        let (status, _) = dev.handle_get_id(&mem, &segs, status_addr);
+        assert_eq!(status, VIRTIO_BLK_S_IOERR as u8);
+        assert_eq!(dev.counters().io_errors.load(Ordering::Relaxed), 1);
+    }
+
+    /// Drive a full T_GET_ID chain through `process_requests` via
+    /// MockSplitQueue + QUEUE_NOTIFY. Verifies the request reaches
+    /// `handle_get_id_impl`, the 20-byte serial lands in the data
+    /// descriptor, the status byte is S_OK, and used.idx
+    /// advances. Mirrors the kernel's `virtblk_get_id` chain shape:
+    /// header (RO, 16B) + data (WO, 20B) + status (WO, 1B).
+    #[test]
+    fn process_requests_full_get_id_chain() {
+        let cap = 4096u64;
+        let f = make_backed_file_with_pattern(cap, 0x00);
+        let mut dev = VirtioBlk::new(f, cap, DiskThrottle::default());
+        let mem = make_chain_test_mem();
+        let mock = MockSplitQueue::create(&mem, GuestAddress(0), 16);
+        let header_addr = GuestAddress(0x4000);
+        let data_addr = GuestAddress(0x5000);
+        let status_addr = GuestAddress(0x6000);
+        // Pre-fill the data buffer so a regression that doesn't
+        // write the serial leaves a detectable sentinel. 0xCD
+        // is distinct from the serial bytes (ascii letters + NUL).
+        mem.write_slice(
+            &[0xCDu8; VIRTIO_BLK_ID_BYTES as usize],
+            data_addr,
+        )
+        .unwrap();
+        // Plant the GET_ID header. Kernel driver sets sector=0
+        // (`vbr->out_hdr.sector = 0;` in virtblk_get_id) — we
+        // mirror that for fidelity.
+        write_blk_header(&mem, header_addr, VIRTIO_BLK_T_GET_ID, 0);
+        let descs = [
+            RawDescriptor::from(SplitDescriptor::new(
+                header_addr.0,
+                VIRTIO_BLK_OUTHDR_SIZE as u32,
+                0,
+                0,
+            )),
+            RawDescriptor::from(SplitDescriptor::new(
+                data_addr.0,
+                VIRTIO_BLK_ID_BYTES,
+                VRING_DESC_F_WRITE as u16,
+                0,
+            )),
+            RawDescriptor::from(SplitDescriptor::new(
+                status_addr.0,
+                1,
+                VRING_DESC_F_WRITE as u16,
+                0,
+            )),
+        ];
+        mock.build_desc_chain(&descs).expect("build chain");
+        dev.set_mem(mem.clone());
+        wire_device_to_mock(&mut dev, &mock);
+        write_reg(&mut dev, VIRTIO_MMIO_QUEUE_NOTIFY, REQ_QUEUE as u32);
+
+        // Status byte landed S_OK.
+        let mut s = [0u8; 1];
+        mem.read_slice(&mut s, status_addr).unwrap();
+        assert_eq!(s[0], VIRTIO_BLK_S_OK as u8);
+
+        // Data descriptor holds the device serial verbatim.
+        let mut buf = [0u8; VIRTIO_BLK_ID_BYTES as usize];
+        mem.read_slice(&mut buf, data_addr).unwrap();
+        assert_eq!(
+            buf, VIRTIO_BLK_SERIAL,
+            "T_GET_ID chain must populate data segment with device serial",
+        );
+
+        // Used ring advanced by one.
+        let used_idx: u16 = mem
+            .read_obj(mock.used_addr().checked_add(2).unwrap())
+            .expect("read used.idx");
+        assert_eq!(used_idx, 1);
+
+        // io_errors stays 0 — the request completed cleanly.
+        let c = dev.counters();
+        assert_eq!(c.io_errors.load(Ordering::Relaxed), 0);
+        // reads/writes/flushes counters all stay at 0 — GET_ID
+        // is a metadata operation, not classified as any of those.
+        assert_eq!(c.reads_completed.load(Ordering::Relaxed), 0);
+        assert_eq!(c.writes_completed.load(Ordering::Relaxed), 0);
+        assert_eq!(c.flushes_completed.load(Ordering::Relaxed), 0);
+    }
+
+    /// `T_GET_ID` chain on a read-only disk must succeed. The
+    /// metadata read is RO-safe, and the kernel always issues
+    /// `virtblk_get_id` for `serial_show` regardless of the disk's
+    /// RO state — rejecting it would surface as an empty
+    /// `/sys/block/<dev>/serial` on every RO mount.
+    #[test]
+    fn process_requests_get_id_succeeds_on_ro_disk() {
+        let cap = 4096u64;
+        let f = make_backed_file_with_pattern(cap, 0x00);
+        let mut dev = VirtioBlk::with_options(f, cap, DiskThrottle::default(), true);
+        let mem = make_chain_test_mem();
+        let mock = MockSplitQueue::create(&mem, GuestAddress(0), 16);
+        let header_addr = GuestAddress(0x4000);
+        let data_addr = GuestAddress(0x5000);
+        let status_addr = GuestAddress(0x6000);
+        write_blk_header(&mem, header_addr, VIRTIO_BLK_T_GET_ID, 0);
+        let descs = [
+            RawDescriptor::from(SplitDescriptor::new(
+                header_addr.0,
+                VIRTIO_BLK_OUTHDR_SIZE as u32,
+                0,
+                0,
+            )),
+            RawDescriptor::from(SplitDescriptor::new(
+                data_addr.0,
+                VIRTIO_BLK_ID_BYTES,
+                VRING_DESC_F_WRITE as u16,
+                0,
+            )),
+            RawDescriptor::from(SplitDescriptor::new(
+                status_addr.0,
+                1,
+                VRING_DESC_F_WRITE as u16,
+                0,
+            )),
+        ];
+        mock.build_desc_chain(&descs).expect("build chain");
+        dev.set_mem(mem.clone());
+        wire_device_to_mock(&mut dev, &mock);
+        write_reg(&mut dev, VIRTIO_MMIO_QUEUE_NOTIFY, REQ_QUEUE as u32);
+
+        let mut s = [0u8; 1];
+        mem.read_slice(&mut s, status_addr).unwrap();
+        assert_eq!(
+            s[0], VIRTIO_BLK_S_OK as u8,
+            "RO disk must accept T_GET_ID — serial is RO-safe metadata",
+        );
+        let mut buf = [0u8; VIRTIO_BLK_ID_BYTES as usize];
+        mem.read_slice(&mut buf, data_addr).unwrap();
+        assert_eq!(buf, VIRTIO_BLK_SERIAL);
+
+        let c = dev.counters();
+        assert_eq!(c.io_errors.load(Ordering::Relaxed), 0);
+    }
+
+    /// Sub-20-byte data descriptor through the chain pipeline.
+    /// The handler rejects the chain with S_IOERR; used.idx still
+    /// advances (the chain completes normally with the error
+    /// status, blk-mq surfaces the error to userspace immediately).
+    #[test]
+    fn process_requests_get_id_short_buffer_returns_ioerr() {
+        let cap = 4096u64;
+        let f = make_backed_file_with_pattern(cap, 0x00);
+        let mut dev = VirtioBlk::new(f, cap, DiskThrottle::default());
+        let mem = make_chain_test_mem();
+        let mock = MockSplitQueue::create(&mem, GuestAddress(0), 16);
+        let header_addr = GuestAddress(0x4000);
+        let data_addr = GuestAddress(0x5000);
+        let status_addr = GuestAddress(0x6000);
+        write_blk_header(&mem, header_addr, VIRTIO_BLK_T_GET_ID, 0);
+        // 19-byte buffer — short.
+        let short_len: u32 = VIRTIO_BLK_ID_BYTES - 1;
+        let descs = [
+            RawDescriptor::from(SplitDescriptor::new(
+                header_addr.0,
+                VIRTIO_BLK_OUTHDR_SIZE as u32,
+                0,
+                0,
+            )),
+            RawDescriptor::from(SplitDescriptor::new(
+                data_addr.0,
+                short_len,
+                VRING_DESC_F_WRITE as u16,
+                0,
+            )),
+            RawDescriptor::from(SplitDescriptor::new(
+                status_addr.0,
+                1,
+                VRING_DESC_F_WRITE as u16,
+                0,
+            )),
+        ];
+        mock.build_desc_chain(&descs).expect("build chain");
+        dev.set_mem(mem.clone());
+        wire_device_to_mock(&mut dev, &mock);
+        write_reg(&mut dev, VIRTIO_MMIO_QUEUE_NOTIFY, REQ_QUEUE as u32);
+
+        let mut s = [0u8; 1];
+        mem.read_slice(&mut s, status_addr).unwrap();
+        assert_eq!(s[0], VIRTIO_BLK_S_IOERR as u8);
+
+        let used_idx: u16 = mem
+            .read_obj(mock.used_addr().checked_add(2).unwrap())
+            .expect("read used.idx");
+        assert_eq!(used_idx, 1);
+
+        let c = dev.counters();
+        assert_eq!(c.io_errors.load(Ordering::Relaxed), 1);
+    }
+
+    /// Zero-data T_GET_ID chain (header + status only, no data
+    /// descriptor) is rejected by the upstream zero-data gate
+    /// before the handler dispatches. Matches the IN/OUT zero-data
+    /// rejection.
+    #[test]
+    fn process_requests_get_id_zero_data_returns_ioerr() {
+        let cap = 4096u64;
+        let f = make_backed_file_with_pattern(cap, 0x00);
+        let mut dev = VirtioBlk::new(f, cap, DiskThrottle::default());
+        let mem = make_chain_test_mem();
+        let mock = MockSplitQueue::create(&mem, GuestAddress(0), 16);
+        let header_addr = GuestAddress(0x4000);
+        let status_addr = GuestAddress(0x5000);
+        write_blk_header(&mem, header_addr, VIRTIO_BLK_T_GET_ID, 0);
+        // No data descriptor — chain is just header + status.
+        let descs = [
+            RawDescriptor::from(SplitDescriptor::new(
+                header_addr.0,
+                VIRTIO_BLK_OUTHDR_SIZE as u32,
+                0,
+                0,
+            )),
+            RawDescriptor::from(SplitDescriptor::new(
+                status_addr.0,
+                1,
+                VRING_DESC_F_WRITE as u16,
+                0,
+            )),
+        ];
+        mock.build_desc_chain(&descs).expect("build chain");
+        dev.set_mem(mem.clone());
+        wire_device_to_mock(&mut dev, &mock);
+        write_reg(&mut dev, VIRTIO_MMIO_QUEUE_NOTIFY, REQ_QUEUE as u32);
+
+        let mut s = [0u8; 1];
+        mem.read_slice(&mut s, status_addr).unwrap();
+        assert_eq!(s[0], VIRTIO_BLK_S_IOERR as u8);
+
+        let c = dev.counters();
+        assert_eq!(c.io_errors.load(Ordering::Relaxed), 1);
+        // Throttle untouched — zero-data gate fires pre-throttle.
+        assert_eq!(c.throttled_count.load(Ordering::Relaxed), 0);
+    }
+
+    /// Direction violation through the chain pipeline: T_GET_ID
+    /// with a device-readable data segment. Outer
+    /// `direction_violation` gate writes S_IOERR; throttle
+    /// untouched.
+    #[test]
+    fn process_requests_get_id_readonly_data_returns_ioerr() {
+        let cap = 4096u64;
+        let f = make_backed_file_with_pattern(cap, 0x00);
+        let mut dev = VirtioBlk::new(f, cap, DiskThrottle::default());
+        let mem = make_chain_test_mem();
+        let mock = MockSplitQueue::create(&mem, GuestAddress(0), 16);
+        let header_addr = GuestAddress(0x4000);
+        let data_addr = GuestAddress(0x5000);
+        let status_addr = GuestAddress(0x6000);
+        write_blk_header(&mem, header_addr, VIRTIO_BLK_T_GET_ID, 0);
+        let descs = [
+            RawDescriptor::from(SplitDescriptor::new(
+                header_addr.0,
+                VIRTIO_BLK_OUTHDR_SIZE as u32,
+                0,
+                0,
+            )),
+            RawDescriptor::from(SplitDescriptor::new(
+                data_addr.0,
+                VIRTIO_BLK_ID_BYTES,
+                0, // device-readable — wrong direction for GET_ID
+                0,
+            )),
+            RawDescriptor::from(SplitDescriptor::new(
+                status_addr.0,
+                1,
+                VRING_DESC_F_WRITE as u16,
+                0,
+            )),
+        ];
+        mock.build_desc_chain(&descs).expect("build chain");
+        dev.set_mem(mem.clone());
+        wire_device_to_mock(&mut dev, &mock);
+        write_reg(&mut dev, VIRTIO_MMIO_QUEUE_NOTIFY, REQ_QUEUE as u32);
+
+        let mut s = [0u8; 1];
+        mem.read_slice(&mut s, status_addr).unwrap();
+        assert_eq!(s[0], VIRTIO_BLK_S_IOERR as u8);
+
+        let c = dev.counters();
+        assert_eq!(c.io_errors.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            c.throttled_count.load(Ordering::Relaxed),
+            0,
+            "direction violation must not consume throttle tokens",
+        );
+    }
+
+    /// `VIRTIO_BLK_SERIAL` is exactly 20 bytes (matches
+    /// `VIRTIO_BLK_ID_BYTES`). A regression that resized the
+    /// constant would silently truncate or pad the serial in
+    /// guest sysfs — this pin catches it at compile time of the
+    /// const init AND at the assertion below.
+    #[test]
+    fn serial_constant_is_id_bytes_long() {
+        assert_eq!(
+            VIRTIO_BLK_SERIAL.len(),
+            VIRTIO_BLK_ID_BYTES as usize,
+            "serial must be exactly VIRTIO_BLK_ID_BYTES (20) bytes",
+        );
+        // Last 4 bytes are NUL padding — the kernel's `serial_show`
+        // does `buf[VIRTIO_BLK_ID_BYTES] = '\0'` THEN `strlen(buf)`,
+        // so we want the embedded NUL inside the 20-byte payload to
+        // truncate the string at the meaningful length.
+        assert_eq!(
+            &VIRTIO_BLK_SERIAL[..16],
+            b"ktstr-virtio-blk",
+            "serial payload prefix",
+        );
+        assert_eq!(
+            &VIRTIO_BLK_SERIAL[16..],
+            &[0u8; 4],
+            "trailing 4 bytes are NUL padding",
         );
     }
 }

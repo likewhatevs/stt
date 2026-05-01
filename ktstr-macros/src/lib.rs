@@ -1071,6 +1071,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
             host_only: #host_only,
             extra_include_files: &[#(#extra_include_files),*],
             cleanup_budget: #cleanup_budget_tokens,
+            disk: ::core::option::Option::None,
         };
 
         #[test]

@@ -65,6 +65,12 @@ pub struct DiskConfig {
     /// VIRTIO_BLK_F_RO so the guest mounts read-only. Useful for
     /// tests that need protection against accidental writes.
     pub read_only: bool,
+    /// Optional human-readable label for this disk. `None` (the
+    /// default) is an anonymous disk addressable only by index. A
+    /// name lets WorkType variants reference the disk symbolically
+    /// (e.g. `"data"`, `"log"`) instead of by index, which keeps
+    /// tests stable across topology rearrangements.
+    pub name: Option<String>,
 }
 
 impl Default for DiskConfig {
@@ -86,6 +92,7 @@ impl Default for DiskConfig {
             filesystem: Filesystem::Raw,
             throttle: DiskThrottle::default(),
             read_only: false,
+            name: None,
         }
     }
 }
@@ -124,6 +131,16 @@ impl DiskConfig {
         self
     }
 
+    /// Attach a human-readable label to this disk. WorkType variants
+    /// that need to address a specific disk (e.g. one of several
+    /// attached) can resolve the name instead of relying on
+    /// attachment order. Default is anonymous (`None`); calling
+    /// `.name(...)` sets it.
+    pub fn name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+
     /// Capacity in bytes (`capacity_mb << 20`). Used by the device
     /// for the config-space `capacity` field.
     pub(crate) fn capacity_bytes(&self) -> u64 {
@@ -147,6 +164,7 @@ mod tests {
         assert_eq!(d.filesystem, Filesystem::Raw);
         assert_eq!(d.throttle, DiskThrottle::default());
         assert!(!d.read_only);
+        assert!(d.name.is_none());
     }
 
     #[test]
@@ -242,6 +260,7 @@ mod tests {
                 bytes_per_sec: NonZeroU64::new(50 * 1024 * 1024),
             },
             read_only: true,
+            name: Some("data-disk".to_string()),
         };
 
         let json = serde_json::to_string(&original).expect("serialize DiskConfig");
@@ -260,6 +279,8 @@ mod tests {
             original.throttle.bytes_per_sec
         );
         assert_eq!(parsed.read_only, original.read_only);
+        assert_eq!(parsed.name, original.name);
+        assert_eq!(parsed.name.as_deref(), Some("data-disk"));
     }
 
     /// Roundtrip the unthrottled default (both throttle fields
@@ -273,6 +294,7 @@ mod tests {
         let original = DiskConfig::default();
         assert!(original.throttle.iops.is_none());
         assert!(original.throttle.bytes_per_sec.is_none());
+        assert!(original.name.is_none());
 
         let json = serde_json::to_string(&original).expect("serialize default DiskConfig");
         let parsed: DiskConfig =
@@ -284,5 +306,22 @@ mod tests {
         assert!(parsed.throttle.iops.is_none());
         assert!(parsed.throttle.bytes_per_sec.is_none());
         assert_eq!(parsed.read_only, original.read_only);
+        assert!(parsed.name.is_none());
+    }
+
+    #[test]
+    fn name_builder_sets_label() {
+        let d = DiskConfig::default().name("data-disk");
+        assert_eq!(d.name.as_deref(), Some("data-disk"));
+
+        // Accepts both &str (Into<String>) and String — pin the
+        // generic-bound coverage so a future tightening to &str-only
+        // surfaces here.
+        let d = DiskConfig::default().name(String::from("log-disk"));
+        assert_eq!(d.name.as_deref(), Some("log-disk"));
+
+        // Last call wins — the builder overwrites.
+        let d = DiskConfig::default().name("first").name("second");
+        assert_eq!(d.name.as_deref(), Some("second"));
     }
 }

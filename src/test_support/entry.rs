@@ -700,6 +700,17 @@ pub struct KtstrTestEntry {
     /// `#[ktstr_test(cleanup_budget_ms = N)]` or by direct entry
     /// construction.
     pub cleanup_budget: Option<Duration>,
+    /// Optional virtio-blk disk attached to the VM at `/dev/vda`.
+    /// `None` (the default) boots without a disk; `Some(cfg)` calls
+    /// [`crate::vmm::KtstrVmBuilder::disk`] in
+    /// [`crate::test_support::runtime::build_vm_builder_base`] so the
+    /// guest sees a raw block device sized per `cfg.capacity_mb`.
+    /// The `#[ktstr_test]` macro does not currently surface this
+    /// slot — direct construction via `..KtstrTestEntry::DEFAULT`
+    /// is the only path. Mutually exclusive with `host_only`:
+    /// `validate` rejects the combination because `host_only`
+    /// skips the VM boot that owns the disk lifecycle.
+    pub disk: Option<crate::vmm::disk_config::DiskConfig>,
 }
 
 /// Placeholder function for [`KtstrTestEntry::DEFAULT`].
@@ -770,6 +781,7 @@ impl KtstrTestEntry {
         host_only: false,
         extra_include_files: &[],
         cleanup_budget: None,
+        disk: None,
     };
 
     /// Reject values that would boot a broken VM or leave assertions
@@ -839,6 +851,15 @@ impl KtstrTestEntry {
                  not Scheduler-kind (schedulers belong in the `scheduler` \
                  slot; the `payload` slot is for userspace binaries \
                  composed under the scheduler)",
+                self.name,
+            );
+        }
+        if self.host_only && self.disk.is_some() {
+            anyhow::bail!(
+                "KtstrTestEntry '{}'.host_only=true with disk=Some(..) — \
+                 host_only skips the VM boot that owns the virtio-blk \
+                 device lifecycle, so the disk would never be attached. \
+                 Drop one of host_only or disk.",
                 self.name,
             );
         }

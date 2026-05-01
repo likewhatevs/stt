@@ -296,11 +296,14 @@ fn live_host_pipeline_e2e_debug_capture_serde_roundtrip() {
 }
 
 /// Funify pass over the serialized DebugCapture replaces
-/// identifier fields (cgroup paths, scheduler names — anything
-/// `Funifier::classify_key` recognises) without breaking the JSON
-/// shape. Mirrors the LLM-safe consumption use case for the
-/// live-host pipeline: a captured DebugCapture goes through
-/// `funify` before it ever lands in an LLM context.
+/// every non-metric-keyed value (cgroup paths, scheduler names,
+/// any field whose key is not in the
+/// [`Funifier::is_metric_passthrough`] allowlist) without
+/// breaking the JSON shape. Metric-keyed values such as
+/// `thread_count` pass through unchanged. Mirrors the LLM-safe
+/// consumption use case for the live-host pipeline: a captured
+/// DebugCapture goes through `funify` before it ever lands in an
+/// LLM context.
 #[test]
 fn live_host_pipeline_e2e_funify_preserves_structure() {
     let mut capture = DebugCapture::default();
@@ -327,14 +330,14 @@ fn live_host_pipeline_e2e_funify_preserves_structure() {
     let funified_str = serde_json::to_string(&funified).expect("serialize funified");
     // Real cgroup path must NOT survive — the funifier replaces
     // any `path`/`cgroup_path`-keyed value with a fun name (since
-    // both classify as identifier fields per the v1 hardcoded
-    // table). The test only fails if the original string leaks.
+    // neither is in the metric allowlist, the default funify path
+    // fires). The test only fails if the original string leaks.
     assert!(
         !funified_str.contains("scx-test.service"),
         "real cgroup path must not survive funification: {funified_str}",
     );
-    // thread_count / cpu_time_fraction / wakeups_per_sec are NOT
-    // identifier fields — they pass through unchanged.
+    // thread_count / cpu_time_fraction / wakeups_per_sec hit the
+    // metric allowlist — they pass through unchanged.
     assert!(
         funified_str.contains("\"thread_count\":4")
             || funified_str.contains("\"thread_count\": 4"),

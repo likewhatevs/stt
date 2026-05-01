@@ -1,7 +1,11 @@
-//! Fun mode — replace identifiers in a ktstr dump with playful
-//! `adjective-animal` names so an LLM can reason about the structural
-//! and relational shape of a failure dump without dragging real
-//! internal identifiers into its context.
+//! Fun mode — funify everything in a ktstr dump except recognised
+//! metrics, so an LLM can reason about the structural and relational
+//! shape of a failure dump without dragging real internal identifiers
+//! into its context. Strings and integers under non-metric keys are
+//! replaced with deterministic `adjective-animal` names or hashed
+//! numeric IDs; values under metric-allowlisted keys (counts, rates,
+//! ratios, byte/duration units, structural enums) pass through
+//! unchanged.
 //!
 //! This is a CONTEXT-HYGIENE feature, not a security feature. Real
 //! pids, cpu ids, cgroup names, and process comms are not sensitive
@@ -11,7 +15,21 @@
 //! without learning anything internal about whatever pid that
 //! actually was.
 //!
-//! Two surfaces:
+//! # Polarity: metric allowlist
+//!
+//! The walker funifies **every** value by default and passes through
+//! only the values whose containing key is a recognised metric
+//! ([`Funifier::is_metric_passthrough`]). This is the inverse of v1's
+//! identifier deny-list. A novel identifier-shaped field added to a
+//! schema is hidden by default; only counts / rates / ratios /
+//! byte-and-duration units / structural enums survive funification.
+//! The suffix-based allowlist may over-match novel keys ending in
+//! structural-enum suffixes (`_type`, `_kind`, `_state`, `_len`,
+//! `_offset`) — schema-driven classification is a future direction
+//! that would remove the heuristic's false positives.
+//!
+//! # Surfaces
+//!
 //!   - [`Funifier::petname_for`] turns a string identifier (cgroup
 //!     name, process comm, scheduler name, ...) into a deterministic
 //!     `adjective-animal` pair like `"swift-otter"`.
@@ -22,9 +40,13 @@
 //!
 //! Categories namespace the mapping: `petname_for("pid", "42")` and
 //! `petname_for("cgroup", "42")` produce different fun names because
-//! the category byte string is mixed into the keyed hash. Two pids
-//! with the same numeric value across two different dumps map to the
-//! same fun name only when both dumps share a `--seed`.
+//! the category byte string is mixed into the keyed hash. The walker
+//! uses each non-metric key's literal name as the namespace, so two
+//! values under the same key collide deterministically (intentional —
+//! cross-reference preservation) and two values under different keys
+//! don't. Two pids with the same numeric value across two different
+//! dumps map to the same fun name only when both dumps share a
+//! `--seed`.
 //!
 //! Determinism contract: given a fixed seed, the same input always
 //! produces the same fun output. With the default
@@ -172,7 +194,7 @@ impl Funifier {
     /// Two distinct `(category, n)` inputs collide on the same
     /// output u64 with probability ~2^-64. Within a single
     /// category, n=0 always maps to 0 is NOT guaranteed; consumers
-    /// that need a sentinel zero should call [`Self::is_sentinel`]
+    /// that need a sentinel zero should call [`Self::is_sentinel_u64`]
     /// or carry the original value out-of-band.
     pub fn numeric_id(&self, category: &str, n: u64) -> u64 {
         let h = self.keyed_hash(category.as_bytes(), &n.to_le_bytes());
@@ -205,46 +227,160 @@ impl Funifier {
         n == 0 || n == u64::MAX
     }
 
-    /// Known identifier-key handler: classify a JSON-object key
-    /// name by category, returning `Some(category)` for known
-    /// identifier keys and `None` for keys that should pass
-    /// through unchanged. Hardcoded heuristic per the v1 ruling
-    /// (schema-driven mapping is a future task).
+    /// Allowlist gate for the funify walker: returns `true` when
+    /// the JSON-object key holds a value that is a METRIC (count,
+    /// rate, ratio, byte/duration unit, structural enum) and
+    /// should pass through funification unchanged. Returns `false`
+    /// for everything else — those values get funified.
     ///
-    /// Categories returned here align with the namespace argument
-    /// to [`Self::petname_for`] / [`Self::numeric_id`], so a
-    /// caller can call this to decide whether to funify a field
-    /// AND get the right namespace in one lookup.
-    pub fn classify_key(key: &str) -> Option<&'static str> {
-        // Match against the lowercased-final segment of the key.
-        // e.g. "running_pid" -> "pid", "next_pid" -> "pid",
-        // "scheduler_name" -> "name". Keeps the table small.
+    /// Inverted polarity vs. v1: previously a deny-list of known
+    /// identifier keys (pid/cpu/cgroup/...) selected the funify
+    /// path. The deny-list missed every novel identifier-shaped
+    /// field as the schema grew. The allowlist makes the safe
+    /// default "funify it" — any new or unrecognised field is
+    /// hidden by default, only metrics whose values are
+    /// numeric/categorical truth (and therefore safe to retain)
+    /// pass through.
+    ///
+    /// Match strategy:
+    ///   * lowercased-key whole-match against a fixed structural
+    ///     vocabulary (schema/version/type/kind/status/...);
+    ///   * suffix-match against unit/quantity vocabulary
+    ///     (_count/_total/_per_sec/_ns/_bytes/_ratio/_pct/...);
+    ///   * everything else returns false.
+    ///
+    /// Returns true when `key` names a metric value.
+    pub fn is_metric_passthrough(key: &str) -> bool {
         let lc = key.to_ascii_lowercase();
-        // Most-specific multi-word matches first.
-        let by_suffix: &[(&str, &str)] = &[
-            ("_pid", "pid"),
-            ("_tid", "pid"),
-            ("_tgid", "pid"),
-            ("_cpu", "cpu"),
-            ("_cgroup", "cgroup"),
-            ("_comm", "comm"),
-            ("_name", "name"),
-            ("_label", "name"),
+
+        // Whole-key allowlist. Structural enums, schema markers,
+        // top-level kernel/runqueue counters, and other named
+        // metrics whose value is numeric/categorical truth.
+        if matches!(
+            lc.as_str(),
+            "schema"
+                | "version"
+                | "type"
+                | "kind"
+                | "status"
+                | "state"
+                | "result"
+                | "verdict"
+                | "outcome"
+                | "phase"
+                | "policy"
+                | "priority"
+                | "nice"
+                | "weight"
+                | "capacity"
+                | "size"
+                | "len"
+                | "length"
+                | "depth"
+                | "index"
+                | "idx"
+                | "level"
+                | "tier"
+                | "rank"
+                | "slot"
+                | "epoch"
+                | "generation"
+                | "nr_running"
+                | "nr_queued"
+                | "nr_failed"
+                | "nr_switches"
+                | "runqueue_depth"
+                // NUMA event counters (vm_numa_event)
+                | "numa_hit" | "numa_miss" | "numa_foreign" | "numa_interleave_hit" | "numa_local" | "numa_other"
+                // SCX event counters (scx_exit_info)
+                | "select_cpu_fallback" | "dispatch_local_dsq_offline" | "dispatch_keep_last" | "enq_skip_exiting" | "enq_skip_migration_disabled" | "reenq_immed" | "reenq_local_repeat" | "refill_slice_dfl" | "bypass_duration" | "bypass_dispatch" | "bypass_activate" | "insert_not_owned" | "sub_bypass_dispatch"
+                // BPF prog runtime stats
+                | "cnt" | "nsecs" | "misses" | "verified_insns"
+                // Hardware perf counters
+                | "cycles" | "instructions" | "cache_misses" | "branch_misses"
+                // Per-rq SCX state
+                | "flags" | "ops_qseq" | "kick_sync" | "nr_immed" | "rq_clock"
+                // DSQ state
+                | "nr" | "seq"
+                // Task enrichment
+                | "nr_threads" | "prio" | "static_prio" | "normal_prio" | "nvcsw" | "nivcsw" | "signal_nvcsw" | "signal_nivcsw"
+                // VirtioBlkCounters disk metrics
+                | "bytes_read" | "bytes_written" | "io_errors"
+        ) {
+            return true;
+        }
+
+        // Suffix allowlist. Quantity / rate / ratio / unit
+        // vocabulary the failure-dump schemas use across
+        // VirtioBlkCounters, FailureDumpReport, ctprof samples,
+        // and the topology/cgroup-stats trees.
+        const METRIC_SUFFIXES: &[&str] = &[
+            "_count",
+            "_total",
+            "_completed",
+            "_dropped",
+            "_failed",
+            "_skipped",
+            "_throttled",
+            "_read",
+            "_written",
+            "_errors",
+            "_per_sec",
+            "_per_ms",
+            "_rate",
+            "_hz",
+            "_ratio",
+            "_fraction",
+            "_pct",
+            "_percent",
+            "_ns",
+            "_us",
+            "_ms",
+            "_sec",
+            "_seconds",
+            "_bytes",
+            "_kb",
+            "_mb",
+            "_gb",
+            "_pages",
+            "_min",
+            "_max",
+            "_mean",
+            "_avg",
+            "_stddev",
+            "_p50",
+            "_p90",
+            "_p95",
+            "_p99",
+            "_capacity",
+            "_size",
+            "_depth",
+            "_len",
+            "_length",
+            "_weight",
+            "_nice",
+            "_priority",
+            "_index",
+            "_idx",
+            "_offset",
+            "_generation",
+            "_epoch",
+            "_version",
+            "_status",
+            "_state",
+            "_kind",
+            "_type",
+            "_phase",
+            "_verdict",
+            "_outcome",
         ];
-        for (suffix, cat) in by_suffix {
+        for suffix in METRIC_SUFFIXES {
             if lc.ends_with(suffix) {
-                return Some(cat);
+                return true;
             }
         }
-        // Whole-key matches.
-        match lc.as_str() {
-            "pid" | "tid" | "tgid" | "ppid" | "next_pid" | "prev_pid" => Some("pid"),
-            "cpu" | "dest_cpu" | "orig_cpu" | "wake_cpu" => Some("cpu"),
-            "cgroup" => Some("cgroup"),
-            "comm" => Some("comm"),
-            "name" | "label" | "scheduler" => Some("name"),
-            _ => None,
-        }
+
+        false
     }
 }
 
@@ -252,67 +388,121 @@ impl Funifier {
 // JSON walker
 // ---------------------------------------------------------------------------
 
-/// Recursively walk a `serde_json::Value` and replace identifier
-/// fields per [`Funifier::classify_key`]. Returns the funified value
-/// — input is consumed (cheaper than cloning a deep tree).
+/// Recursively walk a `serde_json::Value` and funify every value
+/// whose containing key is NOT in [`Funifier::is_metric_passthrough`].
+/// Returns the funified value — input is consumed (cheaper than
+/// cloning a deep tree).
 ///
-/// String identifiers map via [`Funifier::petname_for`]. Numeric
-/// identifiers (u64 or i64 inside `serde_json::Number`) map via
-/// [`Funifier::numeric_id`] / [`numeric_id_i64`]. Floats and
-/// booleans at identifier keys are left unchanged — there is no
-/// sensible "fun" mapping for those types. Sentinel zero is
-/// preserved on numerics.
+/// Inverted polarity (metric allowlist): the default action is
+/// "funify it" — a value passes through unchanged ONLY when its
+/// containing key is a metric (count/rate/ratio/byte/duration/
+/// structural enum). Any other field — pid, comm, cgroup_path,
+/// scheduler name, version string, novel identifier-shaped key
+/// the schema didn't have last week — gets replaced.
 ///
-/// Arrays apply field classification to each element. Nested
-/// objects recurse. Top-level non-objects pass through unchanged.
+/// Funification rules at the leaves:
+/// * **String** under a non-metric key — replaced via
+///   [`Funifier::petname_for`] using the key name itself as the
+///   namespace. Two distinct keys with the same string value get
+///   different fun names; the same key + same value yields the
+///   same fun name everywhere in the dump (cross-reference
+///   preservation).
+/// * **Integer** (u64 or i64) under a non-metric key — replaced
+///   via [`Funifier::numeric_id`] / [`Funifier::numeric_id_i64`]
+///   with the key name as namespace. Sentinel zero and `u64::MAX`
+///   pass through unchanged ([`Funifier::is_sentinel_u64`]); the
+///   i64 path also preserves zero per [`Funifier::numeric_id_i64`].
+/// * **Float** — always passes through. Floats are quasi-
+///   exclusively rates/ratios/durations in the dump schemas
+///   (cpu_time_fraction, wakeups_per_sec, ...) and there is no
+///   sensible fun mapping for IEEE-754 values; making the rule
+///   uniform avoids hazarding the rate/ratio metrics that happen
+///   to live under non-metric-keyed parents (e.g. inside an
+///   anonymous-object array element).
+/// * **Bool / null** — always pass through.
+///
+/// Recursive rules:
+/// * **Object** — re-classify each key independently. Nested
+///   objects do NOT inherit metric state across the boundary.
+/// * **Array** — children inherit the parent key's
+///   metric/non-metric verdict and (when non-metric) the parent
+///   key's namespace. So `"pids": [1, 2, 3]` funifies each int
+///   under namespace "pids" and `"counters": [...]` passes every
+///   element through.
 pub fn funify_json(value: serde_json::Value, f: &Funifier) -> serde_json::Value {
     funify_json_with_context(value, f, None)
 }
 
+/// `category` semantics:
+/// * `Some(key)` — value sits under a NON-metric key whose name
+///   is `key`; leaves get funified using `key` as the namespace.
+/// * `None` — value sits at the root or under a metric key;
+///   leaves pass through unchanged.
 fn funify_json_with_context(
     value: serde_json::Value,
     f: &Funifier,
-    inherited_category: Option<&'static str>,
+    category: Option<&str>,
 ) -> serde_json::Value {
     use serde_json::Value;
     match value {
         Value::Object(map) => {
             let mut out = serde_json::Map::with_capacity(map.len());
             for (k, v) in map {
-                let cat = Funifier::classify_key(&k);
-                let funified = funify_json_with_context(v, f, cat);
+                // Re-classify each key independently. Metric ⇒
+                // descendants pass through (`None`); non-metric
+                // ⇒ descendants funify under `k`'s namespace.
+                let child_cat: Option<&str> = if Funifier::is_metric_passthrough(&k) {
+                    None
+                } else {
+                    Some(k.as_str())
+                };
+                let funified = funify_json_with_context(v, f, child_cat);
                 out.insert(k, funified);
             }
             Value::Object(out)
         }
         Value::Array(items) => {
-            // Array elements inherit the parent key's category, so
-            // a `"pids": [42, 99]` array funifies each element with
-            // the "pid" namespace.
+            // Inherit the parent key's category verbatim. An
+            // array under a metric key passes through; an array
+            // under a non-metric key funifies each element using
+            // the parent's name as namespace.
             let out: Vec<Value> = items
                 .into_iter()
-                .map(|v| funify_json_with_context(v, f, inherited_category))
+                .map(|v| funify_json_with_context(v, f, category))
                 .collect();
             Value::Array(out)
         }
         Value::String(s) => {
-            if let Some(cat) = inherited_category {
+            if let Some(cat) = category {
                 Value::String(f.petname_for(cat, &s))
             } else {
                 Value::String(s)
             }
         }
         Value::Number(num) => {
-            if let Some(cat) = inherited_category {
+            // Floats always pass through (see module doc) — check
+            // first so the u64/i64 cascade only runs for integer
+            // numbers.
+            if num.is_f64() {
+                return Value::Number(num);
+            }
+            // Sentinel preservation applies universally — even
+            // at a non-metric key, 0 and u64::MAX retain their
+            // sentinel meaning (kthread pid 0, "no value"
+            // u64::MAX) so failure-dump renderers downstream
+            // don't have to special-case the funified bytes.
+            if let Some(cat) = category {
                 if let Some(u) = num.as_u64() {
                     if Funifier::is_sentinel_u64(u) {
                         return Value::Number(num);
                     }
                     Value::Number(serde_json::Number::from(f.numeric_id(cat, u)))
                 } else if let Some(i) = num.as_i64() {
+                    // numeric_id_i64 itself preserves zero.
                     Value::Number(serde_json::Number::from(f.numeric_id_i64(cat, i)))
                 } else {
-                    // Float at an identifier key — leave alone.
+                    // Defensive: serde_json::Number variants are
+                    // u64/i64/f64; the float case is handled above.
                     Value::Number(num)
                 }
             } else {
@@ -408,7 +598,7 @@ const ANIMALS: &[&str] = &[
     "parakeet", "parrot", "partridge", "peacock", "pelican", "penguin", "perch", "petrel",
     "pheasant", "pig", "pigeon", "piglet", "pika", "pike", "pinscher", "piranha",
     "platypus", "polecat", "pony", "poodle", "porcupine", "porpoise", "possum", "prawn",
-    "puffin", "puma", "puppy", "pythons", "quagga", "quail", "quetzal", "quokka",
+    "puffin", "puma", "puppy", "python", "quagga", "quail", "quetzal", "quokka",
     "rabbit", "raccoon", "ram", "rat", "raven", "reindeer", "rhino", "robin",
 ];
 
@@ -488,58 +678,256 @@ mod tests {
         assert!(!Funifier::is_sentinel_u64(42));
     }
 
-    /// classify_key picks up canonical and suffix-based keys.
+    /// `is_metric_passthrough` allowlist hits — whole-key
+    /// structural vocabulary plus suffix-based unit/quantity
+    /// patterns. Pins the allowlist content so a future edit
+    /// that drops an entry (and silently un-allowlists a metric)
+    /// trips here.
     #[test]
-    fn classify_key_matches_known_keys() {
-        assert_eq!(Funifier::classify_key("pid"), Some("pid"));
-        assert_eq!(Funifier::classify_key("tid"), Some("pid"));
-        assert_eq!(Funifier::classify_key("running_pid"), Some("pid"));
-        assert_eq!(Funifier::classify_key("dest_cpu"), Some("cpu"));
-        assert_eq!(Funifier::classify_key("comm"), Some("comm"));
-        assert_eq!(Funifier::classify_key("scheduler"), Some("name"));
-        assert_eq!(Funifier::classify_key("xyz"), None);
-        assert_eq!(Funifier::classify_key("nr_running"), None);
+    fn is_metric_passthrough_allowlist_hits() {
+        // Whole-key structural vocabulary.
+        assert!(Funifier::is_metric_passthrough("schema"));
+        assert!(Funifier::is_metric_passthrough("version"));
+        assert!(Funifier::is_metric_passthrough("type"));
+        assert!(Funifier::is_metric_passthrough("kind"));
+        assert!(Funifier::is_metric_passthrough("status"));
+        assert!(Funifier::is_metric_passthrough("nr_running"));
+        assert!(Funifier::is_metric_passthrough("nr_queued"));
+        assert!(Funifier::is_metric_passthrough("runqueue_depth"));
+        assert!(Funifier::is_metric_passthrough("nice"));
+        assert!(Funifier::is_metric_passthrough("weight"));
+        assert!(Funifier::is_metric_passthrough("priority"));
+
+        // Suffix vocabulary — count / rate / unit / ratio.
+        assert!(Funifier::is_metric_passthrough("reads_completed"));
+        assert!(Funifier::is_metric_passthrough("io_errors_total"));
+        assert!(Funifier::is_metric_passthrough("wakeups_per_sec"));
+        assert!(Funifier::is_metric_passthrough("memory_max_bytes"));
+        assert!(Funifier::is_metric_passthrough("cpu_max_quota_us"));
+        assert!(Funifier::is_metric_passthrough("page_locality_ratio"));
+        assert!(Funifier::is_metric_passthrough("cpu_time_fraction"));
+        assert!(Funifier::is_metric_passthrough("idle_pct"));
+        assert!(Funifier::is_metric_passthrough("queue_depth"));
+        assert!(Funifier::is_metric_passthrough("buffer_size"));
+        assert!(Funifier::is_metric_passthrough("thread_count"));
     }
 
-    /// funify_json swaps known identifier values and leaves
-    /// non-identifier fields intact. Round-trip serializes
-    /// without errors.
+    /// `is_metric_passthrough` allowlist misses — identifier-
+    /// shaped keys that the inverted polarity now FUNIFIES (vs.
+    /// v1, which passed through everything not in the
+    /// identifier deny-list).
     #[test]
-    fn funify_json_replaces_identifiers_and_preserves_structure() {
+    fn is_metric_passthrough_allowlist_misses() {
+        // Keys the v1 deny-list classified as identifiers — now
+        // funified through the default-funify path.
+        assert!(!Funifier::is_metric_passthrough("pid"));
+        assert!(!Funifier::is_metric_passthrough("tid"));
+        assert!(!Funifier::is_metric_passthrough("tgid"));
+        assert!(!Funifier::is_metric_passthrough("ppid"));
+        assert!(!Funifier::is_metric_passthrough("comm"));
+        assert!(!Funifier::is_metric_passthrough("cpu"));
+        assert!(!Funifier::is_metric_passthrough("cgroup"));
+        assert!(!Funifier::is_metric_passthrough("dest_cpu"));
+        assert!(!Funifier::is_metric_passthrough("running_pid"));
+        assert!(!Funifier::is_metric_passthrough("scheduler"));
+
+        // Known suffix-aliasing gaps. The current allowlist treats
+        // `_type`, `_kind`, `_state`, `_len`, `_offset` (and other
+        // structural-enum / quantity suffixes) as metric markers,
+        // which is sound when the value is a structural enum or
+        // numeric quantity but over-matches on identifier-shaped
+        // keys whose tail happens to resemble one. The keys below
+        // SHOULD funify and DO NOT under the suffix gate. No
+        // assertions are added — they would fail today, and the
+        // resolution is schema-driven classification rather than
+        // encoding a known-bad expectation. Examples observed in
+        // the failure-dump and capture schemas:
+        //   - `task_type`, `node_type`   — cgroup / NUMA tags whose
+        //                                  values are identifier-
+        //                                  shaped enums
+        //   - `parent_kind`              — task-relationship tag
+        //   - `path_len`                 — ends in `_len`, but the
+        //                                  sibling `path` carries
+        //                                  the actual identifier
+        //                                  string
+        //   - `mount_offset`             — ends in `_offset`, but
+        //                                  co-locates with a
+        //                                  mount-point identifier
+        // All of the above pass through is_metric_passthrough
+        // today. Schema-driven classification (tagging each field's
+        // intent at the type level) is a future direction that
+        // would remove the suffix heuristic's false positives.
+
+        // Novel identifier-shaped keys the v1 deny-list missed
+        // entirely — now funified by default. The suffix heuristic
+        // can over-match keys ending in structural-enum suffixes
+        // (see the gap comment above); the cases below avoid those
+        // suffixes and are reliably hidden.
+        assert!(!Funifier::is_metric_passthrough("cgroup_path"));
+        assert!(!Funifier::is_metric_passthrough("path"));
+        assert!(!Funifier::is_metric_passthrough("hostname"));
+        assert!(!Funifier::is_metric_passthrough("xyz"));
+    }
+
+    /// Every VirtioBlkCounters field name passes the metric
+    /// allowlist. Pinning each name guards against fun mode
+    /// silently hiding disk counters in failure dumps when a
+    /// future allowlist edit drops a suffix or whole-key entry
+    /// these counters depend on.
+    #[test]
+    fn virtio_blk_counter_names_are_metric_passthrough() {
+        for name in [
+            "reads_completed",
+            "writes_completed",
+            "flushes_completed",
+            "bytes_read",
+            "bytes_written",
+            "throttled_count",
+            "io_errors",
+        ] {
+            assert!(
+                Funifier::is_metric_passthrough(name),
+                "{name} must be metric",
+            );
+        }
+    }
+
+    /// funify_json funifies non-metric-keyed values and
+    /// preserves metric-keyed values. The input mixes both
+    /// classes plus an array of objects to exercise every
+    /// walker path.
+    #[test]
+    fn funify_json_funifies_non_metric_keys_and_preserves_metrics() {
         let f = Funifier::with_seed("demo");
         let input = json!({
             "schema": "single",
+            "version": "1.2.3",
             "comm": "ktstr_test",
             "pid": 42,
             "nr_running": 7,
             "scheduler": "scx_simple",
+            "wakeups_per_sec": 500.0,
+            "thread_count": 4,
             "cpus": [
-                { "cpu": 0, "comm": "swapper" },
+                { "cpu": 1, "comm": "swapper" },
                 { "cpu": 3, "comm": "ktstr_worker" }
             ]
         });
         let out = funify_json(input.clone(), &f);
-        // Schema and nr_running pass through.
+
+        // Metric-keyed values pass through unchanged.
         assert_eq!(out["schema"], json!("single"));
+        assert_eq!(out["version"], json!("1.2.3"));
         assert_eq!(out["nr_running"], json!(7));
-        // Identifier fields differ from input.
+        assert_eq!(out["wakeups_per_sec"], json!(500.0));
+        assert_eq!(out["thread_count"], json!(4));
+
+        // Non-metric-keyed values get funified.
         assert_ne!(out["comm"], input["comm"]);
         assert_ne!(out["pid"], input["pid"]);
         assert_ne!(out["scheduler"], input["scheduler"]);
-        // Comm renders as "adjective-animal".
+
+        // String funification renders as "adjective-animal".
         let comm = out["comm"].as_str().unwrap();
-        assert!(comm.contains('-'));
-        // Array elements get funified individually with the
-        // parent key's category.
+        assert!(
+            comm.contains('-'),
+            "expected adjective-animal token, got {comm:?}",
+        );
+
+        // Array of objects: each object's keys are independently
+        // re-classified. cpu and comm are non-metric so they get
+        // funified per element.
         assert_ne!(out["cpus"][0]["comm"], input["cpus"][0]["comm"]);
+        assert_ne!(out["cpus"][1]["comm"], input["cpus"][1]["comm"]);
+        // cpu=1 is non-sentinel so funification swaps it.
         assert_ne!(out["cpus"][0]["cpu"], input["cpus"][0]["cpu"]);
-        // Sentinel zero on `cpu` preserved.
-        // (cpu=0 is a real value here; but zero is preserved per
-        // the sentinel rule, so cpus[0].cpu stays 0.)
-        assert_eq!(out["cpus"][0]["cpu"], json!(0));
+        assert_ne!(out["cpus"][1]["cpu"], input["cpus"][1]["cpu"]);
+
         // Round-trip through serde_json::to_string succeeds.
         let s = serde_json::to_string(&out).expect("serialize");
         assert!(!s.is_empty());
+    }
+
+    /// Sentinel preservation under non-metric keys: `cpu: 0`
+    /// stays 0, `pid: u64::MAX` stays u64::MAX. Sentinels carry
+    /// kthread / "no value" semantics that downstream renderers
+    /// must still see.
+    #[test]
+    fn funify_json_preserves_numeric_sentinels() {
+        let f = Funifier::with_seed("demo");
+        let input = json!({
+            "cpu": 0,
+            "pid": u64::MAX,
+            "tid": 1,
+        });
+        let out = funify_json(input.clone(), &f);
+        // Sentinel u64 zero preserved (cpu).
+        assert_eq!(out["cpu"], json!(0));
+        // Sentinel u64::MAX preserved (pid).
+        assert_eq!(out["pid"], json!(u64::MAX));
+        // Non-sentinel funified (tid=1).
+        assert_ne!(out["tid"], json!(1));
+    }
+
+    /// Floats always pass through, regardless of whether the
+    /// containing key is a metric. Non-metric float keys stay
+    /// stable because there is no sensible fun mapping for
+    /// IEEE-754 values and rates/ratios live everywhere in the
+    /// schemas.
+    #[test]
+    fn funify_json_floats_pass_through_unconditionally() {
+        let f = Funifier::with_seed("demo");
+        let input = json!({
+            "wakeups_per_sec": 500.5,
+            "fairness_score": 0.75,
+            "anonymous_float": 3.14,
+        });
+        let out = funify_json(input.clone(), &f);
+        assert_eq!(out["wakeups_per_sec"], json!(500.5));
+        assert_eq!(out["fairness_score"], json!(0.75));
+        assert_eq!(out["anonymous_float"], json!(3.14));
+    }
+
+    /// Cross-reference preservation: two values that share both
+    /// a key AND a payload yield the same funified output, so
+    /// downstream tooling can correlate "same pid mentioned in
+    /// two places" without leaking the real pid.
+    #[test]
+    fn funify_json_cross_reference_within_dump() {
+        let f = Funifier::with_seed("demo");
+        let input = json!({
+            "running": [
+                { "pid": 100 },
+                { "pid": 100 },
+                { "pid": 200 }
+            ]
+        });
+        let out = funify_json(input, &f);
+        let p0 = &out["running"][0]["pid"];
+        let p1 = &out["running"][1]["pid"];
+        let p2 = &out["running"][2]["pid"];
+        assert_eq!(p0, p1, "same key + same value must funify identically");
+        assert_ne!(p0, p2, "same key + different value must differ");
+    }
+
+    /// Array elements inherit the parent key's category. A
+    /// non-metric parent key (e.g. `pids`) makes every array
+    /// element funify under that key's namespace; a metric
+    /// parent key passes every element through.
+    #[test]
+    fn funify_json_array_inherits_parent_category() {
+        let f = Funifier::with_seed("demo");
+        let input = json!({
+            "pids": [1, 2, 3],
+            "completed_per_sec": [10.0, 20.0, 30.0],
+        });
+        let out = funify_json(input.clone(), &f);
+        // Non-metric parent → each element funified.
+        for i in 0..3 {
+            assert_ne!(out["pids"][i], input["pids"][i]);
+        }
+        // Metric parent → array passes through.
+        assert_eq!(out["completed_per_sec"], input["completed_per_sec"]);
     }
 
     /// Two seeds produce different mappings for the same input.

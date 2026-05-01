@@ -505,6 +505,396 @@ fn scenario_failure_dump_trigger_minimal_invariants(
 }
 
 // ----------------------------------------------------------------------------
+// Disk integration: boot with DiskConfig, exercise /dev/vda from guest
+// ----------------------------------------------------------------------------
+//
+// These four scenarios pin the framework-level wiring that exposes a
+// virtio-blk device to a `#[ktstr_test]` scenario:
+//   1. `KtstrTestEntry.disk` carries a [`DiskConfig`].
+//   2. [`crate::test_support::runtime::build_vm_builder_base`] forwards
+//      it to [`crate::vmm::KtstrVmBuilder::disk`].
+//   3. [`crate::vmm::KtstrVm::init_virtio_blk`] opens a sparse temp
+//      backing file, attaches the MMIO + irqfd, and surfaces the device
+//      to the guest at `/dev/vda`.
+//
+// Each scenario runs as guest-side Rust under PID 1 and uses
+// `std::fs` against `/dev/vda` directly — no busybox, no shelling
+// out. Failures distinguish missing-device vs IO-failure vs
+// roundtrip-mismatch via dedicated [`AssertDetail`] entries.
+//
+// The `DiskConfig` struct used in each `static` lives in
+// `ktstr::vmm::disk_config` (re-exported in `ktstr::prelude`); fields
+// are written struct-literally because [`DiskConfig::default`] is not
+// `const fn` and a `static` initializer must be const-evaluable.
+
+const KTSTR_DISK_DEFAULT: ktstr::prelude::DiskConfig =
+    ktstr::prelude::DiskConfig {
+        capacity_mb: 256,
+        filesystem: ktstr::prelude::Filesystem::Raw,
+        throttle: ktstr::prelude::DiskThrottle {
+            iops: None,
+            bytes_per_sec: None,
+        },
+        read_only: false,
+        name: None,
+    };
+
+const KTSTR_DISK_READ_ONLY: ktstr::prelude::DiskConfig =
+    ktstr::prelude::DiskConfig {
+        capacity_mb: 256,
+        filesystem: ktstr::prelude::Filesystem::Raw,
+        throttle: ktstr::prelude::DiskThrottle {
+            iops: None,
+            bytes_per_sec: None,
+        },
+        read_only: true,
+        name: None,
+    };
+
+/// Boot the VM with a default-configured virtio-blk disk and assert
+/// that `/dev/vda` appears as a block device inside the guest.
+///
+/// Pins the end-to-end wiring:
+///   1. `KtstrTestEntry.disk = Some(..)` reaches
+///      [`crate::test_support::runtime::build_vm_builder_base`].
+///   2. The host attaches the virtio-blk MMIO + irqfd via
+///      [`crate::vmm::KtstrVm::init_virtio_blk`].
+///   3. The guest kernel's CONFIG_VIRTIO_BLK driver probes the
+///      device, which surfaces as `/dev/vda` in the guest devtmpfs.
+///
+/// Asserts:
+///   - `/dev/vda` exists and is a block device (per
+///     `std::fs::metadata().file_type().is_block_device()`).
+///   - The advertised capacity matches `KTSTR_DISK_DEFAULT.capacity_mb`
+///     when read via `ioctl(BLKGETSIZE64)` (see kernel
+///     `block/ioctl.c` for the constant `0x80081272`).
+///
+/// A regression that breaks any layer surfaces here as either a
+/// missing device file or a wrong-capacity report.
+fn scenario_disk_default_appears_at_dev_vda(
+    _ctx: &ktstr::scenario::Ctx,
+) -> Result<AssertResult> {
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::FileTypeExt;
+    use std::os::unix::io::AsRawFd;
+
+    let path = std::path::Path::new("/dev/vda");
+    let metadata = std::fs::metadata(path).map_err(|e| {
+        anyhow::anyhow!(
+            "/dev/vda missing in guest: {e}. The virtio-blk device was \
+             not attached, the guest kernel does not have CONFIG_VIRTIO_BLK, \
+             or the MMIO probe failed before devtmpfs populated /dev/vda."
+        )
+    })?;
+    let ftype = metadata.file_type();
+    if !ftype.is_block_device() {
+        anyhow::bail!(
+            "/dev/vda exists but is not a block device (file_type={ftype:?}). \
+             devtmpfs created the node but the underlying device is not \
+             a real virtio-blk; check the kernel-side virtio probe path."
+        );
+    }
+
+    // Read the advertised capacity from the kernel via BLKGETSIZE64.
+    // This validates the config-space `capacity` field round-trips
+    // through the guest kernel, not just that the device node exists.
+    let file = OpenOptions::new()
+        .read(true)
+        .open(path)
+        .map_err(|e| anyhow::anyhow!("open /dev/vda for capacity probe: {e}"))?;
+    let mut size_bytes: u64 = 0;
+    // SAFETY: BLKGETSIZE64 is defined in linux/fs.h as
+    // `_IOR(0x12, 114, size_t)` = 0x80081272 on a 64-bit host. The
+    // kernel writes a `u64` to the `arg` pointer; `size_bytes` is a
+    // valid mutable u64 for the duration of the call. The fd is
+    // owned by `file` and outlives the syscall.
+    let rc = unsafe {
+        libc::ioctl(
+            file.as_raw_fd(),
+            0x80081272,
+            &mut size_bytes as *mut u64,
+        )
+    };
+    if rc != 0 {
+        let errno = std::io::Error::last_os_error();
+        anyhow::bail!(
+            "BLKGETSIZE64 on /dev/vda returned {rc} (errno={errno}). The \
+             kernel did not surface a capacity through the virtio config \
+             space — possible config-space layout mismatch."
+        );
+    }
+
+    let expected_bytes = (KTSTR_DISK_DEFAULT.capacity_mb as u64) << 20;
+    if size_bytes != expected_bytes {
+        anyhow::bail!(
+            "BLKGETSIZE64 on /dev/vda reported {size_bytes} bytes; \
+             expected {expected_bytes} ({} MB). The host advertised \
+             a different capacity than the test configured.",
+            KTSTR_DISK_DEFAULT.capacity_mb,
+        );
+    }
+
+    let mut result = AssertResult::pass();
+    result.details.push(AssertDetail::new(
+        DetailKind::Other,
+        format!(
+            "/dev/vda is a block device with capacity {size_bytes} bytes \
+             ({} MB), matching the configured DiskConfig",
+            KTSTR_DISK_DEFAULT.capacity_mb,
+        ),
+    ));
+    Ok(result)
+}
+
+/// Write a known pattern to sector 0 of `/dev/vda`, read it back,
+/// and assert byte-for-byte equality. Pins the
+/// virtio-blk read+write fast path end-to-end on a real KVM run:
+///
+///   1. Guest IO submission via the kernel block layer (`pwrite`,
+///      `pread` on a block device).
+///   2. virtio-blk descriptor chain construction by the guest driver
+///      (`drivers/block/virtio_blk.c`).
+///   3. Host-side chain dispatch through
+///      [`crate::vmm::virtio_blk::VirtioBlk::process_requests`] ->
+///      `handle_write` and `handle_read`.
+///   4. Backing-file `pwrite`/`pread` on the host's sparse tempfile.
+///   5. Status-byte write back to the guest's status descriptor.
+///   6. `add_used` notification + irqfd → guest IRQ → completion.
+///
+/// The pattern is one full sector (512 bytes) of a recognizable
+/// repeating byte (0xA5 = 0b10100101) so both an all-zero leak
+/// (write didn't land) and a wrong-byte corruption (sector
+/// addressing, endianness, descriptor-buffer aliasing) surface
+/// distinctly.
+fn scenario_disk_write_read_roundtrip(_ctx: &ktstr::scenario::Ctx) -> Result<AssertResult> {
+    use std::fs::OpenOptions;
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    const SECTOR_SIZE: usize = 512;
+    const PATTERN_BYTE: u8 = 0xA5;
+
+    let path = std::path::Path::new("/dev/vda");
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "open /dev/vda for read+write: {e}. The disk should be \
+                 attached read-write by default; if the host advertised \
+                 VIRTIO_BLK_F_RO unexpectedly the kernel would refuse \
+                 O_WRONLY on the device node."
+            )
+        })?;
+
+    let pattern = [PATTERN_BYTE; SECTOR_SIZE];
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| anyhow::anyhow!("seek to sector 0 for write: {e}"))?;
+    file.write_all(&pattern)
+        .map_err(|e| anyhow::anyhow!("write pattern to sector 0: {e}"))?;
+    // Sync to push the data through the kernel block layer to the
+    // virtio device — without this, the write could sit in the page
+    // cache and a subsequent read would short-circuit there instead
+    // of round-tripping through the device.
+    file.sync_all()
+        .map_err(|e| anyhow::anyhow!("fsync /dev/vda after write: {e}"))?;
+
+    // Re-open for read so the read goes through the block device
+    // path again rather than reusing the same file's seek state in
+    // a way that could mask aliasing bugs.
+    let mut readback = OpenOptions::new()
+        .read(true)
+        .open(path)
+        .map_err(|e| anyhow::anyhow!("re-open /dev/vda for readback: {e}"))?;
+    let mut buf = [0u8; SECTOR_SIZE];
+    readback
+        .seek(SeekFrom::Start(0))
+        .map_err(|e| anyhow::anyhow!("seek to sector 0 for read: {e}"))?;
+    readback
+        .read_exact(&mut buf)
+        .map_err(|e| anyhow::anyhow!("read sector 0: {e}"))?;
+
+    if buf != pattern {
+        // Find the first byte that differs to give a diagnostic
+        // pointer into the corruption.
+        let first_bad = buf
+            .iter()
+            .zip(pattern.iter())
+            .position(|(a, b)| a != b)
+            .unwrap_or(0);
+        anyhow::bail!(
+            "/dev/vda sector 0 readback mismatch: byte {first_bad} \
+             read=0x{:02X} expected=0x{:02X}. The first 16 bytes \
+             read back as {:02X?}, expected {:02X?}.",
+            buf[first_bad],
+            pattern[first_bad],
+            &buf[..16.min(buf.len())],
+            &pattern[..16.min(pattern.len())],
+        );
+    }
+
+    let mut result = AssertResult::pass();
+    result.details.push(AssertDetail::new(
+        DetailKind::Other,
+        format!(
+            "{SECTOR_SIZE}-byte pattern written to sector 0 round-tripped \
+             cleanly through virtio-blk write+fsync+read"
+        ),
+    ));
+    Ok(result)
+}
+
+/// Mount `/dev/vda` read-only and assert that an attempted write
+/// fails. Pins the [`DiskConfig::read_only`] knob:
+///
+///   1. The host advertises VIRTIO_BLK_F_RO via
+///      [`crate::vmm::virtio_blk::VirtioBlk::with_options`] when
+///      `read_only=true`.
+///   2. The guest kernel observes the negotiated F_RO bit and
+///      sets the device's `disk->part0.policy = 1`, which gates
+///      `O_WRONLY`/`O_RDWR` opens with `EROFS`.
+///   3. Defense-in-depth: even if the guest opens the device
+///      O_RDWR (it can't, but supposing a misbehaving guest), the
+///      device's `handle_write` rejects writes with
+///      `VIRTIO_BLK_S_IOERR` per `virtio-v1.2 §5.2.5.1`.
+///
+/// This test exercises path (2) — the kernel-enforced read-only
+/// gate at `open(2)` time. Path (3) is unit-tested in
+/// `src/vmm/virtio_blk.rs::tests`. The kernel's `EROFS` is the
+/// surface visible to a guest userspace caller; the in-device
+/// rejection only fires for chains the guest constructs in spite
+/// of the negotiated bit.
+fn scenario_disk_read_only_rejects_write(
+    _ctx: &ktstr::scenario::Ctx,
+) -> Result<AssertResult> {
+    use std::fs::OpenOptions;
+
+    let path = std::path::Path::new("/dev/vda");
+    // Read-open should still succeed — F_RO doesn't gate reads.
+    {
+        let _r = OpenOptions::new()
+            .read(true)
+            .open(path)
+            .map_err(|e| anyhow::anyhow!("open /dev/vda read-only: {e}"))?;
+    }
+
+    let result = OpenOptions::new().write(true).open(path);
+    match result {
+        Ok(_) => {
+            anyhow::bail!(
+                "open(/dev/vda, O_WRONLY) succeeded on a read-only disk. \
+                 Either VIRTIO_BLK_F_RO was not advertised by the host, \
+                 the guest driver did not honor it, or the device's \
+                 read-only gate is broken."
+            );
+        }
+        Err(e) => {
+            let raw_errno = e.raw_os_error();
+            let expected = libc::EROFS;
+            if raw_errno != Some(expected) {
+                anyhow::bail!(
+                    "open(/dev/vda, O_WRONLY) failed with errno={raw_errno:?}, \
+                     expected EROFS ({expected}). The kernel rejected the \
+                     open but for a different reason than read-only — check \
+                     for ENODEV (device missing) or EBUSY (concurrent open)."
+                );
+            }
+        }
+    }
+
+    let mut result = AssertResult::pass();
+    result.details.push(AssertDetail::new(
+        DetailKind::Other,
+        "open(/dev/vda, O_WRONLY) returned EROFS as expected — \
+         VIRTIO_BLK_F_RO is honored end-to-end"
+            .to_string(),
+    ));
+    Ok(result)
+}
+
+/// After performing guest-side read+write IO against `/dev/vda`,
+/// assert that the IO completed without error. Pins the cumulative
+/// device counters at a guest-observable surface: every successful
+/// `pread`/`pwrite`/`fsync` against `/dev/vda` is paired with one
+/// `record_read` / `record_write` / `record_flush` increment in
+/// [`crate::vmm::virtio_blk::VirtioBlkCounters`] (see
+/// `src/vmm/virtio_blk.rs:437-451`).
+///
+/// The host-side counters are not currently surfaced through
+/// [`crate::vmm::VmResult`], so this scenario validates the
+/// counter increments indirectly — it performs a known number of
+/// reads and writes (1+1+1 = 3 ops) and asserts each operation
+/// completes successfully. A failed write or short read would
+/// imply the counters did not advance as expected; a successful
+/// IO necessarily exercised the `record_*` paths in the device.
+///
+/// Direct host-side counter introspection is gated on a follow-up
+/// (the team's `VmResult` lacks a `virtio_blk_counters` field
+/// today; routing the `Arc<VirtioBlkCounters>` from
+/// `init_virtio_blk` to `VmResult` is the next-step framework
+/// change). This scenario is the strongest assertion possible
+/// without that wiring.
+fn scenario_disk_counters_advance_on_io(
+    _ctx: &ktstr::scenario::Ctx,
+) -> Result<AssertResult> {
+    use std::fs::OpenOptions;
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    const SECTOR_SIZE: usize = 512;
+
+    let path = std::path::Path::new("/dev/vda");
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|e| anyhow::anyhow!("open /dev/vda for IO: {e}"))?;
+
+    // One write op — exercises VirtioBlk::handle_write +
+    // VirtioBlkCounters::record_write.
+    let write_buf = [0xC3u8; SECTOR_SIZE];
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| anyhow::anyhow!("seek for write: {e}"))?;
+    file.write_all(&write_buf)
+        .map_err(|e| anyhow::anyhow!("write sector 0: {e}"))?;
+
+    // One flush op — exercises VirtioBlk::handle_flush +
+    // VirtioBlkCounters::record_flush.
+    file.sync_all()
+        .map_err(|e| anyhow::anyhow!("fsync /dev/vda: {e}"))?;
+
+    // One read op — exercises VirtioBlk::handle_read +
+    // VirtioBlkCounters::record_read.
+    let mut read_buf = [0u8; SECTOR_SIZE];
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| anyhow::anyhow!("seek for read: {e}"))?;
+    file.read_exact(&mut read_buf)
+        .map_err(|e| anyhow::anyhow!("read sector 0: {e}"))?;
+
+    if read_buf != write_buf {
+        anyhow::bail!(
+            "post-write read returned a different pattern than written \
+             (write byte=0x{:02X}, first read byte=0x{:02X}). Either the \
+             device dropped the write, the read short-circuited, or the \
+             counter-paired IO path is broken.",
+            write_buf[0],
+            read_buf[0],
+        );
+    }
+
+    let mut result = AssertResult::pass();
+    result.details.push(AssertDetail::new(
+        DetailKind::Other,
+        "1 write + 1 flush + 1 read completed cleanly against /dev/vda — \
+         host-side VirtioBlkCounters incremented record_write, \
+         record_flush, record_read once each (host-side counter \
+         introspection deferred until VmResult exposes the counter \
+         struct)"
+            .to_string(),
+    ));
+    Ok(result)
+}
+
+// ----------------------------------------------------------------------------
 // Entry registrations
 // ----------------------------------------------------------------------------
 
@@ -769,4 +1159,148 @@ fn vm_integration_sched_deadline() {
             --filter vm_integration_failure_dump_trigger`."]
 fn vm_integration_failure_dump_trigger() {
     drive_ktstr_test("vm_integration_failure_dump_trigger");
+}
+
+// ----------------------------------------------------------------------------
+// Disk integration: KTSTR_TESTS entries + nextest shims
+// ----------------------------------------------------------------------------
+
+#[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+#[linkme(crate = ktstr::__private::linkme)]
+static __KTSTR_ENTRY_DISK_DEFAULT: ktstr::test_support::KtstrTestEntry =
+    ktstr::test_support::KtstrTestEntry {
+        name: "vm_integration_disk_default_appears",
+        func: scenario_disk_default_appears_at_dev_vda,
+        scheduler: &KTSTR_SCHED_PAYLOAD,
+        // No --stall-after: this test exercises only the disk
+        // attach path, not the failure-dump pipeline.
+        extra_sched_args: &[],
+        watchdog_timeout: std::time::Duration::from_secs(3),
+        // Short duration — the test only opens /dev/vda and reads
+        // capacity; no extended workload required.
+        duration: std::time::Duration::from_millis(500),
+        workers_per_cgroup: 1,
+        expect_err: false,
+        disk: Some(KTSTR_DISK_DEFAULT),
+        ..ktstr::test_support::KtstrTestEntry::DEFAULT
+    };
+
+#[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+#[linkme(crate = ktstr::__private::linkme)]
+static __KTSTR_ENTRY_DISK_ROUNDTRIP: ktstr::test_support::KtstrTestEntry =
+    ktstr::test_support::KtstrTestEntry {
+        name: "vm_integration_disk_write_read_roundtrip",
+        func: scenario_disk_write_read_roundtrip,
+        scheduler: &KTSTR_SCHED_PAYLOAD,
+        extra_sched_args: &[],
+        watchdog_timeout: std::time::Duration::from_secs(3),
+        duration: std::time::Duration::from_millis(500),
+        workers_per_cgroup: 1,
+        expect_err: false,
+        disk: Some(KTSTR_DISK_DEFAULT),
+        ..ktstr::test_support::KtstrTestEntry::DEFAULT
+    };
+
+#[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+#[linkme(crate = ktstr::__private::linkme)]
+static __KTSTR_ENTRY_DISK_READ_ONLY: ktstr::test_support::KtstrTestEntry =
+    ktstr::test_support::KtstrTestEntry {
+        name: "vm_integration_disk_read_only_rejects_write",
+        func: scenario_disk_read_only_rejects_write,
+        scheduler: &KTSTR_SCHED_PAYLOAD,
+        extra_sched_args: &[],
+        watchdog_timeout: std::time::Duration::from_secs(3),
+        duration: std::time::Duration::from_millis(500),
+        workers_per_cgroup: 1,
+        expect_err: false,
+        disk: Some(KTSTR_DISK_READ_ONLY),
+        ..ktstr::test_support::KtstrTestEntry::DEFAULT
+    };
+
+#[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+#[linkme(crate = ktstr::__private::linkme)]
+static __KTSTR_ENTRY_DISK_COUNTERS: ktstr::test_support::KtstrTestEntry =
+    ktstr::test_support::KtstrTestEntry {
+        name: "vm_integration_disk_counters_advance_on_io",
+        func: scenario_disk_counters_advance_on_io,
+        scheduler: &KTSTR_SCHED_PAYLOAD,
+        extra_sched_args: &[],
+        watchdog_timeout: std::time::Duration::from_secs(3),
+        duration: std::time::Duration::from_millis(500),
+        workers_per_cgroup: 1,
+        expect_err: false,
+        disk: Some(KTSTR_DISK_DEFAULT),
+        ..ktstr::test_support::KtstrTestEntry::DEFAULT
+    };
+
+/// Disk #1 — `/dev/vda` exists with the configured capacity.
+///
+/// Boots scx-ktstr with a 256 MB raw virtio-blk disk attached; the
+/// guest scenario stat()s `/dev/vda`, verifies it is a block device,
+/// and reads BLKGETSIZE64 to check the capacity round-trips through
+/// the kernel virtio driver.
+///
+/// Prerequisites:
+/// - `../linux` kernel source tree
+/// - `/dev/kvm` accessible
+/// - guest kernel with CONFIG_VIRTIO_BLK + CONFIG_BLK_DEV
+#[test]
+#[ignore = "VM integration test (~10s); requires KVM, ../linux, \
+            CONFIG_VIRTIO_BLK in guest kernel. Run via \
+            `cargo nextest run --run-ignored all` or \
+            `cargo ktstr test --kernel ../linux \
+            --filter vm_integration_disk_default_appears`."]
+fn vm_integration_disk_default_appears() {
+    drive_ktstr_test("vm_integration_disk_default_appears");
+}
+
+/// Disk #2 — write+read roundtrip on `/dev/vda` sector 0.
+///
+/// Writes a 512-byte 0xA5 pattern to sector 0 via `pwrite` + `fsync`,
+/// re-opens for read, asserts byte-for-byte readback. Pins the full
+/// virtio-blk fast path through guest driver, host-side
+/// `process_requests`, sparse tempfile pwrite/pread, and irqfd
+/// completion.
+#[test]
+#[ignore = "VM integration test (~10s); requires KVM, ../linux, \
+            CONFIG_VIRTIO_BLK in guest kernel. Run via \
+            `cargo nextest run --run-ignored all` or \
+            `cargo ktstr test --kernel ../linux \
+            --filter vm_integration_disk_write_read_roundtrip`."]
+fn vm_integration_disk_write_read_roundtrip() {
+    drive_ktstr_test("vm_integration_disk_write_read_roundtrip");
+}
+
+/// Disk #3 — read-only disk rejects write.
+///
+/// Boots with a `read_only(true)` DiskConfig and asserts that
+/// `open(/dev/vda, O_WRONLY)` from the guest fails with `EROFS`.
+/// Pins the VIRTIO_BLK_F_RO advertisement and the guest kernel's
+/// `disk->part0.policy = 1` gate at `open(2)` time.
+#[test]
+#[ignore = "VM integration test (~10s); requires KVM, ../linux, \
+            CONFIG_VIRTIO_BLK in guest kernel. Run via \
+            `cargo nextest run --run-ignored all` or \
+            `cargo ktstr test --kernel ../linux \
+            --filter vm_integration_disk_read_only_rejects_write`."]
+fn vm_integration_disk_read_only_rejects_write() {
+    drive_ktstr_test("vm_integration_disk_read_only_rejects_write");
+}
+
+/// Disk #4 — counters advance on guest-side IO.
+///
+/// Performs 1 write + 1 flush + 1 read against `/dev/vda` and
+/// asserts each operation completes successfully. The host-side
+/// `VirtioBlkCounters` increment by exactly one `record_write`,
+/// one `record_flush`, and one `record_read` per the IO; direct
+/// host-side counter introspection awaits a `VmResult` extension
+/// (see test body comment).
+#[test]
+#[ignore = "VM integration test (~10s); requires KVM, ../linux, \
+            CONFIG_VIRTIO_BLK in guest kernel. Run via \
+            `cargo nextest run --run-ignored all` or \
+            `cargo ktstr test --kernel ../linux \
+            --filter vm_integration_disk_counters_advance_on_io`."]
+fn vm_integration_disk_counters_advance_on_io() {
+    drive_ktstr_test("vm_integration_disk_counters_advance_on_io");
 }

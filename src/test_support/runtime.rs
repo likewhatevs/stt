@@ -227,6 +227,10 @@ pub(crate) fn build_vm_builder_base(
             builder.bpf_map_write(bpf_write.map_name_suffix, bpf_write.offset, bpf_write.value);
     }
 
+    if let Some(disk_cfg) = entry.disk.clone() {
+        builder = builder.disk(disk_cfg);
+    }
+
     builder.watchdog_timeout(entry.watchdog_timeout)
 }
 
