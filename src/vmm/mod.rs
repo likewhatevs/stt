@@ -3161,35 +3161,126 @@ impl KtstrVm {
                     // sched_ext_entity, etc.) leave `scan_ctx` None
                     // and the early-trigger path stays dormant for
                     // the rest of the run — the late path still works.
-                    if freeze_coord_dual_snapshot
-                        && scan_ctx.is_none()
-                        && let Some(ref owned) = owned_accessor
-                        && let Some(ref vmlinux) = freeze_coord_vmlinux
-                        && let Some(ref btf) = dump_btf
-                        && let Ok(syms) =
-                            crate::monitor::symbols::KernelSymbols::from_vmlinux(vmlinux)
-                        && let Some(jiffies_64_kva) = syms.jiffies_64
-                        && let Ok(scan_offsets) =
-                            crate::monitor::btf_offsets::RunnableScanOffsets::from_btf(btf)
-                        && let Ok(rq_offsets) =
-                            crate::monitor::btf_offsets::KernelOffsets::from_vmlinux(vmlinux)
-                    {
-                        let kernel = owned.guest_kernel();
-                        let cr3_pa = kernel.cr3_pa();
-                        let page_offset = kernel.page_offset();
-                        let l5 = kernel.l5();
-                        // Translate jiffies_64's KVA to a PA. Lives
-                        // in the kernel text/data mapping
-                        // (text_kva_to_pa) — same as scx_root et al.
-                        let jiffies_64_pa =
-                            crate::monitor::symbols::text_kva_to_pa(jiffies_64_kva);
-                        // Per-CPU rq PAs come from the existing
-                        // `compute_rq_pas` helper. It needs the
-                        // per_cpu_offsets array, which we read from
-                        // guest memory via the symbol's KVA.
-                        let per_cpu_offset_pa =
-                            crate::monitor::symbols::text_kva_to_pa(syms.per_cpu_offset);
-                        if let Some(ref mem) = freeze_coord_mem {
+                    //
+                    // Each failed prerequisite emits a per-iteration
+                    // `tracing::debug!` line under the
+                    // `RUST_LOG=ktstr=debug` filter — the
+                    // DualFailureDumpReport's absent-early Display
+                    // message points operators here. Per-iteration
+                    // (not single-shot) is the right cadence for
+                    // debug output: an operator who asked for verbose
+                    // logging wants to see the full retry pattern,
+                    // not just one snapshot. The aggregate "something
+                    // is wrong" signal stays at the warn level (see
+                    // `scan_ctx_warned` below) so default-visible
+                    // output still surfaces a single line per run.
+                    if freeze_coord_dual_snapshot && scan_ctx.is_none() {
+                        let try_resolve = || -> Option<RunnableScanCtx> {
+                            let owned = match owned_accessor.as_ref() {
+                                Some(o) => o,
+                                None => {
+                                    tracing::debug!(
+                                        "freeze-coord: scan resolve: \
+                                         owned_accessor not ready (guest still booting)"
+                                    );
+                                    return None;
+                                }
+                            };
+                            let vmlinux = match freeze_coord_vmlinux.as_ref() {
+                                Some(v) => v,
+                                None => {
+                                    tracing::debug!(
+                                        "freeze-coord: scan resolve: \
+                                         vmlinux path absent (no kernel image to parse)"
+                                    );
+                                    return None;
+                                }
+                            };
+                            let btf = match dump_btf.as_ref() {
+                                Some(b) => b,
+                                None => {
+                                    tracing::debug!(
+                                        "freeze-coord: scan resolve: \
+                                         dump_btf not loaded (vmlinux BTF parse failed)"
+                                    );
+                                    return None;
+                                }
+                            };
+                            let syms = match crate::monitor::symbols::KernelSymbols::from_vmlinux(
+                                vmlinux,
+                            ) {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    tracing::debug!(
+                                        "freeze-coord: scan resolve: \
+                                         KernelSymbols::from_vmlinux failed: {e}"
+                                    );
+                                    return None;
+                                }
+                            };
+                            let jiffies_64_kva = match syms.jiffies_64 {
+                                Some(k) => k,
+                                None => {
+                                    tracing::debug!(
+                                        "freeze-coord: scan resolve: \
+                                         jiffies_64 symbol absent from vmlinux"
+                                    );
+                                    return None;
+                                }
+                            };
+                            let scan_offsets =
+                                match crate::monitor::btf_offsets::RunnableScanOffsets::from_btf(
+                                    btf,
+                                ) {
+                                    Ok(o) => o,
+                                    Err(e) => {
+                                        tracing::debug!(
+                                            "freeze-coord: scan resolve: \
+                                             RunnableScanOffsets::from_btf failed: {e} \
+                                             (BTF likely lacks sched_ext_entity)"
+                                        );
+                                        return None;
+                                    }
+                                };
+                            let rq_offsets =
+                                match crate::monitor::btf_offsets::KernelOffsets::from_vmlinux(
+                                    vmlinux,
+                                ) {
+                                    Ok(o) => o,
+                                    Err(e) => {
+                                        tracing::debug!(
+                                            "freeze-coord: scan resolve: \
+                                             KernelOffsets::from_vmlinux failed: {e}"
+                                        );
+                                        return None;
+                                    }
+                                };
+                            let mem = match freeze_coord_mem.as_ref() {
+                                Some(m) => m,
+                                None => {
+                                    tracing::debug!(
+                                        "freeze-coord: scan resolve: \
+                                         GuestMem not ready"
+                                    );
+                                    return None;
+                                }
+                            };
+                            let kernel = owned.guest_kernel();
+                            let cr3_pa = kernel.cr3_pa();
+                            let page_offset = kernel.page_offset();
+                            let l5 = kernel.l5();
+                            // Translate jiffies_64's KVA to a PA.
+                            // Lives in the kernel text/data mapping
+                            // (text_kva_to_pa) — same as scx_root
+                            // et al.
+                            let jiffies_64_pa =
+                                crate::monitor::symbols::text_kva_to_pa(jiffies_64_kva);
+                            // Per-CPU rq PAs come from the existing
+                            // `compute_rq_pas` helper. It needs the
+                            // per_cpu_offsets array, which we read
+                            // from guest memory via the symbol's KVA.
+                            let per_cpu_offset_pa =
+                                crate::monitor::symbols::text_kva_to_pa(syms.per_cpu_offset);
                             let per_cpu_offsets =
                                 crate::monitor::symbols::read_per_cpu_offsets(
                                     mem,
@@ -3214,7 +3305,7 @@ impl KtstrVm {
                                 .iter()
                                 .map(|&pa| pa.wrapping_add(page_offset))
                                 .collect();
-                            scan_ctx = Some(RunnableScanCtx {
+                            Some(RunnableScanCtx {
                                 rq_pas,
                                 rq_kvas,
                                 offsets: scan_offsets,
@@ -3223,7 +3314,10 @@ impl KtstrVm {
                                 cr3_pa,
                                 page_offset,
                                 l5,
-                            });
+                            })
+                        };
+                        if let Some(ctx) = try_resolve() {
+                            scan_ctx = Some(ctx);
                         }
                     }
                     // Single-shot warn when the resolve has been

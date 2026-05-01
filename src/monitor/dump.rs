@@ -262,7 +262,8 @@ impl std::fmt::Display for DualFailureDumpReport {
                 f.write_str(
                     "late snapshot (error-exit; early snapshot absent \
                      (stall fired before half-way threshold, or runnable_at \
-                     scan setup failed)):\n",
+                     scan setup failed) — re-run with RUST_LOG=ktstr=debug \
+                     for scan resolution diagnostics):\n",
                 )?;
                 std::fmt::Display::fmt(&self.late, f)
             }
@@ -1496,7 +1497,10 @@ mod tests {
     /// Display output for the early=absent branch carries the
     /// summary header AND the documented absence-reason text
     /// describing both possible causes (stall fired before the
-    /// half-way threshold; runnable_at scan setup failed).
+    /// half-way threshold; runnable_at scan setup failed) AND a
+    /// pointer to the RUST_LOG knob that surfaces scan-resolution
+    /// diagnostics — so an operator reading "early=absent" knows
+    /// the next debugging step rather than having to guess.
     #[test]
     fn dual_report_display_absent_names_both_causes() {
         let dual = DualFailureDumpReport {
@@ -1518,6 +1522,10 @@ mod tests {
         assert!(
             s.contains("runnable_at scan setup failed"),
             "Display must name the scan-setup-failure cause: {s}"
+        );
+        assert!(
+            s.contains("RUST_LOG=ktstr=debug"),
+            "Display must point at the RUST_LOG knob for diagnostics: {s}"
         );
     }
 }

@@ -96,6 +96,43 @@ fn format_tail(text: &str, n: usize, header: &str) -> Option<String> {
     Some(format!("--- {header} ---\n{}", lines[start..].join("\n")))
 }
 
+/// Read the repro VM's failure-dump JSON, sniff the schema, parse it
+/// as the matching report shape, and emit the Display rendering as a
+/// `--- repro VM failure dump ---` tail. Returns `None` when the
+/// file is missing (no freeze fired during repro), unreadable, or
+/// fails to parse — the JSON file itself stays on disk for any
+/// downstream consumer that needs the structured form. Both
+/// [`crate::monitor::dump::FailureDumpReport`] and
+/// [`crate::monitor::dump::DualFailureDumpReport`] carry a
+/// `schema: String` discriminant; sniff with a lightweight
+/// `serde_json::Value` parse rather than attempting deserialisation
+/// twice. Lives here next to `format_tail` because the auto-repro
+/// path is the sole consumer.
+fn render_failure_dump_file(path: &std::path::Path) -> Option<String> {
+    use crate::monitor::dump::{
+        DualFailureDumpReport, FailureDumpReport, SCHEMA_DUAL, SCHEMA_SINGLE,
+    };
+    let json = std::fs::read_to_string(path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&json).ok()?;
+    let schema = value.get("schema").and_then(|v| v.as_str()).unwrap_or("");
+    let body = match schema {
+        SCHEMA_DUAL => {
+            let parsed: DualFailureDumpReport = serde_json::from_str(&json).ok()?;
+            format!("{parsed}")
+        }
+        // Default to single-schema for back-compat: an older dump
+        // file written before the schema discriminant landed has
+        // an absent `schema` field, and `default_schema_single`
+        // makes that deserialise as a `FailureDumpReport`.
+        SCHEMA_SINGLE | "" => {
+            let parsed: FailureDumpReport = serde_json::from_str(&json).ok()?;
+            format!("{parsed}")
+        }
+        _ => return None,
+    };
+    Some(format!("--- repro VM failure dump ---\n{body}"))
+}
+
 /// Classify the repro VM outcome into a single human-readable status
 /// line, used when the probe pipeline produced no events and the
 /// caller needs to tell the user *why* the repro VM did not yield
@@ -300,9 +337,9 @@ pub(crate) fn attempt_auto_repro(
     // auto-repro path: `build_vm_builder_base` deliberately does
     // not attach a path, so the primary dump is never touched
     // during auto-repro.
-    builder = builder.failure_dump_path(
-        super::sidecar::sidecar_dir().join(format!("{}.repro.failure-dump.json", entry.name)),
-    );
+    let repro_dump_path =
+        super::sidecar::sidecar_dir().join(format!("{}.repro.failure-dump.json", entry.name));
+    builder = builder.failure_dump_path(&repro_dump_path);
 
     // Repro VM gets the dual-snapshot freeze coordinator. The
     // primary VM keeps the single-snapshot path (the primary's
@@ -400,7 +437,18 @@ pub(crate) fn attempt_auto_repro(
         .join("\n");
     let dmesg_tail = format_tail(&dmesg_filtered, REPRO_TAIL_LINES, "repro VM dmesg");
 
-    let tails: Vec<String> = [sched_log_tail, dump_tail, dmesg_tail]
+    // Inline-render the freeze coordinator's failure-dump JSON when
+    // present. The freeze-coord writes a `FailureDumpReport` /
+    // `DualFailureDumpReport` to `repro_dump_path` if any error-class
+    // SCX exit (or the dual-snapshot half-way trigger) fired during
+    // the repro VM run. Surfacing the Display rendering inline means a
+    // CLI user sees the BPF map state, vCPU regs, and (for dual)
+    // early/late jiffies metadata in the same tail block as the
+    // sched_ext_dump and dmesg — no need to chase the separate
+    // `.repro.failure-dump.json` sibling for the at-a-glance view.
+    let failure_dump_tail = render_failure_dump_file(&repro_dump_path);
+
+    let tails: Vec<String> = [sched_log_tail, dump_tail, failure_dump_tail, dmesg_tail]
         .into_iter()
         .flatten()
         .collect();
@@ -1856,5 +1904,121 @@ mod tests {
         let status =
             classify_repro_vm_status(false, false, "SCHEDULER_NOT_ATTACHED\nKTSTR_EXIT=1", 1);
         assert_eq!(status, "repro VM: exited abnormally (exit code 1)");
+    }
+
+    // -- render_failure_dump_file -----------------------------------
+    //
+    // The auto-repro path reads its `{name}.repro.failure-dump.json`
+    // sidecar back, sniffs the `schema` discriminant to choose
+    // between [`FailureDumpReport`] and [`DualFailureDumpReport`],
+    // and emits the Display rendering as a tail block. These tests
+    // pin every branch of that helper: missing file, both schemas,
+    // absent schema (back-compat), unknown schema, malformed JSON.
+    // tempfile gives us scratch paths without polluting the working
+    // directory or relying on sidecar_dir() machinery.
+
+    #[test]
+    fn render_failure_dump_file_missing_returns_none() {
+        // A path under temp_dir that we never create returns None
+        // without panicking. Mirrors the auto-repro path when the
+        // freeze coordinator never fired (no dump written).
+        let nonexistent = std::env::temp_dir().join("ktstr-render-failure-dump-missing");
+        // Best-effort: ensure the file does not exist if a prior
+        // test left one behind.
+        let _ = std::fs::remove_file(&nonexistent);
+        assert!(render_failure_dump_file(&nonexistent).is_none());
+    }
+
+    #[test]
+    fn render_failure_dump_file_single_schema() {
+        use crate::monitor::dump::{FailureDumpReport, SCHEMA_SINGLE};
+        let report = FailureDumpReport {
+            schema: SCHEMA_SINGLE.to_string(),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&report).expect("serialize single");
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        std::fs::write(tmp.path(), json).expect("write tempfile");
+
+        let rendered =
+            render_failure_dump_file(tmp.path()).expect("single-schema must render Some");
+        assert!(
+            rendered.starts_with("--- repro VM failure dump ---"),
+            "header missing: {rendered}"
+        );
+        // FailureDumpReport's empty Display body is "(empty failure dump)";
+        // pin the substring that the FailureDumpReport's own Display
+        // emits for an empty-but-valid report so we know the body
+        // came from FailureDumpReport::fmt and not a different path.
+        assert!(
+            rendered.contains("(empty failure dump)"),
+            "single-schema body must come from FailureDumpReport Display: {rendered}"
+        );
+    }
+
+    #[test]
+    fn render_failure_dump_file_dual_schema() {
+        use crate::monitor::dump::{DualFailureDumpReport, FailureDumpReport, SCHEMA_DUAL};
+        let dual = DualFailureDumpReport {
+            schema: SCHEMA_DUAL.to_string(),
+            early: None,
+            late: FailureDumpReport::default(),
+            early_max_age_jiffies: 0,
+            early_threshold_jiffies: 0,
+        };
+        let json = serde_json::to_string(&dual).expect("serialize dual");
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        std::fs::write(tmp.path(), json).expect("write tempfile");
+
+        let rendered = render_failure_dump_file(tmp.path()).expect("dual-schema must render Some");
+        assert!(
+            rendered.starts_with("--- repro VM failure dump ---"),
+            "header missing: {rendered}"
+        );
+        assert!(
+            rendered.contains("DualFailureDumpReport:"),
+            "dual-schema body must come from DualFailureDumpReport Display: {rendered}"
+        );
+    }
+
+    #[test]
+    fn render_failure_dump_file_absent_schema_defaults_to_single() {
+        // JSON without the `schema` field: matches what older dump
+        // files (pre-discriminant) wrote. The
+        // `default_schema_single` serde default in
+        // `FailureDumpReport` makes that deserialise as a single
+        // report, and the helper falls into the single branch.
+        let json = r#"{"maps":[],"vcpu_regs":[],"sdt_allocations":[]}"#;
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        std::fs::write(tmp.path(), json).expect("write tempfile");
+
+        let rendered =
+            render_failure_dump_file(tmp.path()).expect("absent-schema JSON must render as single");
+        assert!(
+            rendered.contains("(empty failure dump)"),
+            "absent schema must default to single: {rendered}"
+        );
+    }
+
+    #[test]
+    fn render_failure_dump_file_unknown_schema_returns_none() {
+        // A schema value the helper doesn't know about (e.g. a
+        // future "triple" wrapper) returns None — the helper does
+        // not silently fall back to single, since that could
+        // mis-render a richer wrapper as the lossy single shape.
+        let json = r#"{"schema":"triple","maps":[],"vcpu_regs":[],"sdt_allocations":[]}"#;
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        std::fs::write(tmp.path(), json).expect("write tempfile");
+        assert!(render_failure_dump_file(tmp.path()).is_none());
+    }
+
+    #[test]
+    fn render_failure_dump_file_invalid_json_returns_none() {
+        // Garbage bytes on disk: the initial
+        // `serde_json::from_str::<Value>` call returns Err, and the
+        // helper short-circuits to None without panicking.
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        std::fs::write(tmp.path(), "not json").expect("write tempfile");
+        assert!(render_failure_dump_file(tmp.path()).is_none());
     }
 }
