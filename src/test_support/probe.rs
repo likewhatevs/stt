@@ -96,41 +96,21 @@ fn format_tail(text: &str, n: usize, header: &str) -> Option<String> {
     Some(format!("--- {header} ---\n{}", lines[start..].join("\n")))
 }
 
-/// Read the repro VM's failure-dump JSON, sniff the schema, parse it
-/// as the matching report shape, and emit the Display rendering as a
-/// `--- repro VM failure dump ---` tail. Returns `None` when the
-/// file is missing (no freeze fired during repro), unreadable, or
-/// fails to parse — the JSON file itself stays on disk for any
-/// downstream consumer that needs the structured form. Both
-/// [`crate::monitor::dump::FailureDumpReport`] and
-/// [`crate::monitor::dump::DualFailureDumpReport`] carry a
-/// `schema: String` discriminant; sniff with a lightweight
-/// `serde_json::Value` parse rather than attempting deserialisation
-/// twice. Lives here next to `format_tail` because the auto-repro
-/// path is the sole consumer.
+/// Read the repro VM's failure-dump JSON, parse it via
+/// [`crate::monitor::dump::FailureDumpReportAny`], and emit the
+/// Display rendering as a `--- repro VM failure dump ---` tail.
+/// Returns `None` when the file is missing (no freeze fired during
+/// repro), unreadable, or fails to parse — the JSON file itself
+/// stays on disk for any downstream consumer that needs the
+/// structured form. Schema-dispatch logic (single vs dual, absent
+/// schema fallback, unknown schema rejection) lives in
+/// `FailureDumpReportAny::from_json`; this helper is just the
+/// file-IO + tail-header wrapper.
 fn render_failure_dump_file(path: &std::path::Path) -> Option<String> {
-    use crate::monitor::dump::{
-        DualFailureDumpReport, FailureDumpReport, SCHEMA_DUAL, SCHEMA_SINGLE,
-    };
+    use crate::monitor::dump::FailureDumpReportAny;
     let json = std::fs::read_to_string(path).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&json).ok()?;
-    let schema = value.get("schema").and_then(|v| v.as_str()).unwrap_or("");
-    let body = match schema {
-        SCHEMA_DUAL => {
-            let parsed: DualFailureDumpReport = serde_json::from_str(&json).ok()?;
-            format!("{parsed}")
-        }
-        // Default to single-schema for back-compat: an older dump
-        // file written before the schema discriminant landed has
-        // an absent `schema` field, and `default_schema_single`
-        // makes that deserialise as a `FailureDumpReport`.
-        SCHEMA_SINGLE | "" => {
-            let parsed: FailureDumpReport = serde_json::from_str(&json).ok()?;
-            format!("{parsed}")
-        }
-        _ => return None,
-    };
-    Some(format!("--- repro VM failure dump ---\n{body}"))
+    let any = FailureDumpReportAny::from_json(&json)?;
+    Some(format!("--- repro VM failure dump ---\n{any}"))
 }
 
 /// Classify the repro VM outcome into a single human-readable status

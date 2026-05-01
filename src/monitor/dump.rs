@@ -271,6 +271,71 @@ impl std::fmt::Display for DualFailureDumpReport {
     }
 }
 
+/// Either-or wrapper that owns a parsed [`FailureDumpReport`] or
+/// [`DualFailureDumpReport`]. Lets a consumer hold and render a
+/// failure-dump file without prematurely committing to one schema —
+/// the discriminant lives in the JSON's `schema` field, not in the
+/// type the consumer holds.
+///
+/// Centralises the schema-tag dispatch logic that previously lived
+/// inline at every read site (the auto-repro tail renderer, the
+/// failure-dump-e2e test, any future consumer that wants to inspect
+/// either shape). Use [`Self::from_json`] to parse an arbitrary
+/// failure-dump JSON blob; the Display impl forwards to the
+/// underlying report's existing Display so the rendered output is
+/// indistinguishable from holding the unwrapped report directly.
+///
+/// `non_exhaustive` so a future third schema (e.g. a `triple`
+/// wrapper that captures snapshots at three points instead of two)
+/// can be added without breaking external pattern matches.
+#[non_exhaustive]
+pub enum FailureDumpReportAny {
+    /// Single-snapshot report, schema=`"single"`. Emitted by the
+    /// primary VM's freeze coordinator when an error-class SCX exit
+    /// fires.
+    Single(FailureDumpReport),
+    /// Dual-snapshot wrapper, schema=`"dual"`. Emitted by the
+    /// auto-repro VM when the dual-snapshot path is enabled. Carries
+    /// optional `early` + required `late` snapshots plus jiffies
+    /// metadata for the early-trigger condition.
+    Dual(DualFailureDumpReport),
+}
+
+impl FailureDumpReportAny {
+    /// Parse a failure-dump JSON blob, choosing the variant by the
+    /// `schema` field. Returns `None` on any of:
+    ///
+    /// - the blob does not parse as JSON
+    /// - the `schema` field carries an unknown value (no silent
+    ///   fallback to single — that would mis-render a richer wrapper
+    ///   as a lossy single shape)
+    /// - the typed deserialisation under the chosen schema fails
+    ///
+    /// An absent `schema` field deserialises as
+    /// [`Self::Single`] via the
+    /// `default_schema_single` serde default — this preserves
+    /// backwards compatibility with dumps written before the
+    /// schema-tag landed.
+    pub fn from_json(json: &str) -> Option<Self> {
+        let value: serde_json::Value = serde_json::from_str(json).ok()?;
+        let schema = value.get("schema").and_then(|v| v.as_str()).unwrap_or("");
+        match schema {
+            SCHEMA_DUAL => serde_json::from_str(json).ok().map(Self::Dual),
+            SCHEMA_SINGLE | "" => serde_json::from_str(json).ok().map(Self::Single),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for FailureDumpReportAny {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Single(r) => std::fmt::Display::fmt(r, f),
+            Self::Dual(r) => std::fmt::Display::fmt(r, f),
+        }
+    }
+}
+
 /// Rendering of one BPF map's contents.
 ///
 /// Unifies the four map-type rendering paths under a single
@@ -1527,5 +1592,93 @@ mod tests {
             s.contains("RUST_LOG=ktstr=debug"),
             "Display must point at the RUST_LOG knob for diagnostics: {s}"
         );
+    }
+
+    // -- FailureDumpReportAny serde + Display tests --
+
+    /// `FailureDumpReportAny::from_json` picks the `Single` variant
+    /// for JSON whose `schema` field is `"single"`, the `Dual`
+    /// variant for `"dual"`, and the `Single` variant for an absent
+    /// `schema` field (back-compat with pre-discriminant dumps).
+    /// Unknown schemas return `None` rather than silently falling
+    /// back to single — mismatching a future richer wrapper as a
+    /// lossy single shape would be the wrong behaviour. Malformed
+    /// JSON also returns `None`.
+    #[test]
+    fn report_any_dispatch_branches() {
+        // Single branch: schema="single".
+        let single = FailureDumpReport::default();
+        let single_json = serde_json::to_string(&single).expect("serialize single");
+        match FailureDumpReportAny::from_json(&single_json) {
+            Some(FailureDumpReportAny::Single(_)) => {}
+            other => panic!(
+                "schema=single must map to Single, got {other:?}",
+                other = other.is_some()
+            ),
+        }
+
+        // Dual branch: schema="dual".
+        let dual = DualFailureDumpReport {
+            schema: SCHEMA_DUAL.to_string(),
+            early: None,
+            late: FailureDumpReport::default(),
+            early_max_age_jiffies: 0,
+            early_threshold_jiffies: 0,
+        };
+        let dual_json = serde_json::to_string(&dual).expect("serialize dual");
+        match FailureDumpReportAny::from_json(&dual_json) {
+            Some(FailureDumpReportAny::Dual(_)) => {}
+            other => panic!(
+                "schema=dual must map to Dual, got {other:?}",
+                other = other.is_some()
+            ),
+        }
+
+        // Absent-schema branch: pre-discriminant dump.
+        let absent = r#"{"maps":[],"vcpu_regs":[],"sdt_allocations":[]}"#;
+        match FailureDumpReportAny::from_json(absent) {
+            Some(FailureDumpReportAny::Single(_)) => {}
+            other => panic!(
+                "absent schema must default to Single, got {other:?}",
+                other = other.is_some()
+            ),
+        }
+
+        // Unknown schema → None, not a silent single fallback.
+        let unknown = r#"{"schema":"triple","maps":[],"vcpu_regs":[],"sdt_allocations":[]}"#;
+        assert!(
+            FailureDumpReportAny::from_json(unknown).is_none(),
+            "unknown schema must return None, not silent fallback"
+        );
+
+        // Malformed JSON → None.
+        assert!(
+            FailureDumpReportAny::from_json("not json").is_none(),
+            "garbage input must return None"
+        );
+    }
+
+    /// Display roundtrip: a Single-wrapped report renders the same
+    /// as the underlying `FailureDumpReport`'s own Display, and a
+    /// Dual-wrapped report renders the same as
+    /// `DualFailureDumpReport`'s Display. The wrapper's Display is
+    /// transparent.
+    #[test]
+    fn report_any_display_matches_underlying() {
+        let single = FailureDumpReport::default();
+        let single_direct = format!("{single}");
+        let single_via_any = format!("{}", FailureDumpReportAny::Single(single));
+        assert_eq!(single_direct, single_via_any);
+
+        let dual = DualFailureDumpReport {
+            schema: SCHEMA_DUAL.to_string(),
+            early: Some(FailureDumpReport::default()),
+            late: FailureDumpReport::default(),
+            early_max_age_jiffies: 42,
+            early_threshold_jiffies: 21,
+        };
+        let dual_direct = format!("{dual}");
+        let dual_via_any = format!("{}", FailureDumpReportAny::Dual(dual));
+        assert_eq!(dual_direct, dual_via_any);
     }
 }

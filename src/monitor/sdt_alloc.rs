@@ -956,4 +956,112 @@ mod tests {
             "missing reason: {out}"
         );
     }
+
+    // -- discover_payload_btf_id ------------------------------------
+    //
+    // Pure-function tests that don't need a `GuestKernel`. The
+    // `walk_sdt_allocator` walker is intentionally NOT covered by
+    // unit tests — it requires a live GuestKernel reading frozen
+    // VM memory, which is structural integration coverage owned by
+    // the existing failure_dump_e2e harness. These tests exercise
+    // the BTF heuristic and offset-resolver branches that don't
+    // need a kernel handle.
+
+    /// `payload_size == 0` short-circuits without probing any BTF
+    /// type ids — the heuristic correctly recognises that an
+    /// allocator with zero payload bytes has no struct to discover.
+    /// Pinning the early-return shape against a future regression
+    /// that might silently start probing on zero (which would
+    /// produce a spurious "no candidate of size 0" diagnostic).
+    #[test]
+    fn discover_payload_btf_id_zero_size_short_circuits() {
+        let path = match crate::monitor::find_test_vmlinux() {
+            Some(p) => p,
+            None => {
+                crate::report::test_skip("no vmlinux for BTF load");
+                return;
+            }
+        };
+        let btf = match crate::monitor::btf_offsets::load_btf_from_path(&path) {
+            Ok(b) => b,
+            Err(_) => {
+                crate::report::test_skip("BTF load failed");
+                return;
+            }
+        };
+        let choice = discover_payload_btf_id(&btf, 0);
+        assert_eq!(choice.btf_type_id, 0, "zero-size must yield btf_type_id=0");
+        assert_eq!(
+            choice.reason, "payload_size == 0",
+            "zero-size reason must be the early-return marker, got: {}",
+            choice.reason
+        );
+    }
+
+    /// A payload size that no real kernel struct can possibly hit —
+    /// `usize::MAX / 2` is far larger than any real struct
+    /// (kernel `struct task_struct` is on the order of 10 KiB, the
+    /// largest plausible kernel struct is well under a megabyte).
+    /// Searching for that size yields zero candidates; assert the
+    /// returned reason matches the documented "no candidate of size
+    /// {N}" wording so a consumer reading `payload_type_reason` can
+    /// rely on the exact format.
+    #[test]
+    fn discover_payload_btf_id_no_candidate_path() {
+        let path = match crate::monitor::find_test_vmlinux() {
+            Some(p) => p,
+            None => {
+                crate::report::test_skip("no vmlinux for BTF load");
+                return;
+            }
+        };
+        let btf = match crate::monitor::btf_offsets::load_btf_from_path(&path) {
+            Ok(b) => b,
+            Err(_) => {
+                crate::report::test_skip("BTF load failed");
+                return;
+            }
+        };
+        let impossible_size = usize::MAX / 2;
+        let choice = discover_payload_btf_id(&btf, impossible_size);
+        assert_eq!(choice.btf_type_id, 0);
+        let expected = format!("no candidate of size {impossible_size}");
+        assert_eq!(
+            choice.reason, expected,
+            "reason must exactly match documented format: got '{}'",
+            choice.reason
+        );
+    }
+
+    /// SdtAllocOffsets::from_btf returns Err when `struct
+    /// scx_allocator` is absent from the BTF — vmlinux BTF never
+    /// contains it (sdt_alloc lives in the scheduler's program BTF,
+    /// not the kernel's), so a from_btf call against vmlinux must
+    /// surface the expected error and not panic. The dump pipeline
+    /// reads this Err to decide "no sdt_alloc state to surface."
+    /// Pin the diagnostic-string contract since callers rely on it.
+    #[test]
+    fn sdt_alloc_offsets_from_vmlinux_btf_returns_err() {
+        let path = match crate::monitor::find_test_vmlinux() {
+            Some(p) => p,
+            None => {
+                crate::report::test_skip("no vmlinux for BTF load");
+                return;
+            }
+        };
+        let btf = match crate::monitor::btf_offsets::load_btf_from_path(&path) {
+            Ok(b) => b,
+            Err(_) => {
+                crate::report::test_skip("BTF load failed");
+                return;
+            }
+        };
+        let err = SdtAllocOffsets::from_btf(&btf)
+            .expect_err("vmlinux BTF must NOT contain scx_allocator — from_btf must Err");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("scx_allocator"),
+            "error must name the missing struct so the dump pipeline can log a useful diagnostic: '{msg}'"
+        );
+    }
 }
