@@ -1252,6 +1252,82 @@ impl BpfProgOffsets {
     }
 }
 
+/// Byte offsets needed by the dual-snapshot freeze coordinator's
+/// per-CPU `runnable_at` scanner.
+///
+/// Mirrors the kernel's `check_rq_for_timeouts`
+/// (`kernel/sched/ext.c`) walk:
+///
+/// ```ignore
+/// list_for_each_entry(p, &rq->scx.runnable_list, scx.runnable_node) {
+///     unsigned long last_runnable = p->scx.runnable_at;
+///     ...
+/// }
+/// ```
+///
+/// The host-side scanner walks the same list per CPU, follows each
+/// `runnable_node` link back to its containing `task_struct` via
+/// `container_of`, and reads `task_struct.scx.runnable_at` to
+/// compare against the current `jiffies_64`. All offsets resolve
+/// from a single `Btf` object loaded from vmlinux.
+///
+/// Path uses paired `member_byte_offset` calls: `rq.scx`
+/// (already resolved by [`KernelOffsets`]) plus the four offsets
+/// captured here. The two struct fields off `task_struct` are
+/// resolved using the BTF's anonymous-struct-walking
+/// `member_byte_offset`, so `task_struct.scx` works even if the
+/// kernel later wraps the field in an anonymous union.
+#[derive(Debug, Clone, Copy)]
+pub struct RunnableScanOffsets {
+    /// Offset of `runnable_list` (struct list_head) within
+    /// `struct scx_rq`. Combined with [`KernelOffsets::rq_scx`] to
+    /// reach the list head from a `struct rq` pointer:
+    /// `rq + rq_scx + scx_rq_runnable_list`.
+    pub scx_rq_runnable_list: usize,
+    /// Offset of `scx` (struct sched_ext_entity) within
+    /// `struct task_struct`. Used by the container_of step to
+    /// translate a `runnable_node` list_head pointer back to the
+    /// owning `task_struct`.
+    pub task_struct_scx: usize,
+    /// Offset of `runnable_node` (struct list_head) within
+    /// `struct sched_ext_entity`. The full offset of
+    /// `runnable_node` within `task_struct` is
+    /// `task_struct_scx + sched_ext_entity_runnable_node` —
+    /// subtract this from a `runnable_node` KVA to recover the
+    /// `task_struct` KVA via container_of.
+    pub sched_ext_entity_runnable_node: usize,
+    /// Offset of `runnable_at` (unsigned long, jiffies) within
+    /// `struct sched_ext_entity`. Combined with `task_struct_scx`
+    /// to read the field off a `task_struct *`:
+    /// `task + task_struct_scx + sched_ext_entity_runnable_at`.
+    pub sched_ext_entity_runnable_at: usize,
+}
+
+impl RunnableScanOffsets {
+    /// Resolve runnable_at scanner offsets from a pre-loaded BTF
+    /// object. Returns Err on a kernel without sched_ext (the
+    /// `sched_ext_entity` struct is missing) or one whose layout has
+    /// dropped any of the four fields.
+    pub fn from_btf(btf: &Btf) -> Result<Self> {
+        let (scx_rq, _) = find_struct(btf, "scx_rq")?;
+        let scx_rq_runnable_list = member_byte_offset(btf, &scx_rq, "runnable_list")?;
+
+        let (task_struct, _) = find_struct(btf, "task_struct")?;
+        let task_struct_scx = member_byte_offset(btf, &task_struct, "scx")?;
+
+        let (see, _) = find_struct(btf, "sched_ext_entity")?;
+        let sched_ext_entity_runnable_node = member_byte_offset(btf, &see, "runnable_node")?;
+        let sched_ext_entity_runnable_at = member_byte_offset(btf, &see, "runnable_at")?;
+
+        Ok(Self {
+            scx_rq_runnable_list,
+            task_struct_scx,
+            sched_ext_entity_runnable_node,
+            sched_ext_entity_runnable_at,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

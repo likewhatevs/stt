@@ -105,6 +105,14 @@ pub(crate) struct KernelSymbols {
     /// file-scope static rather than a field on `struct scx_sched`.
     /// None on 7.1+ or when the symbol is absent.
     pub scx_watchdog_timeout: Option<u64>,
+    /// Kernel virtual address of `jiffies_64` (`u64` global maintained
+    /// by the timer subsystem). Used by the dual-snapshot freeze
+    /// coordinator to compare each runnable task's `p->scx.runnable_at`
+    /// against the current jiffies value, mirroring the kernel's
+    /// `check_rq_for_timeouts` walk. None when the symbol is absent
+    /// (CONFIG_64BIT=n on a host that emits only the legacy `jiffies`
+    /// alias, or a stripped vmlinux that lost the symbol).
+    pub jiffies_64: Option<u64>,
 }
 
 impl KernelSymbols {
@@ -143,6 +151,8 @@ impl KernelSymbols {
 
         let scx_watchdog_timeout = sym_addr("scx_watchdog_timeout");
 
+        let jiffies_64 = sym_addr("jiffies_64");
+
         Ok(Self {
             runqueues,
             per_cpu_offset,
@@ -152,6 +162,7 @@ impl KernelSymbols {
             pgtable_l5_enabled,
             prog_idr,
             scx_watchdog_timeout,
+            jiffies_64,
         })
     }
 }
@@ -452,6 +463,7 @@ mod tests {
             pgtable_l5_enabled: None,
             prog_idr: None,
             scx_watchdog_timeout: None,
+            jiffies_64: None,
         };
 
         assert_eq!(resolve_page_offset(&mem, &symbols), expected_page_offset);
@@ -474,6 +486,7 @@ mod tests {
             pgtable_l5_enabled: None,
             prog_idr: None,
             scx_watchdog_timeout: None,
+            jiffies_64: None,
         };
 
         assert_eq!(resolve_page_offset(&mem, &symbols), DEFAULT_PAGE_OFFSET);
@@ -498,6 +511,7 @@ mod tests {
             pgtable_l5_enabled: None,
             prog_idr: None,
             scx_watchdog_timeout: None,
+            jiffies_64: None,
         };
 
         assert_eq!(resolve_page_offset(&mem, &symbols), DEFAULT_PAGE_OFFSET);
@@ -525,6 +539,7 @@ mod tests {
             pgtable_l5_enabled: None,
             prog_idr: None,
             scx_watchdog_timeout: None,
+            jiffies_64: None,
         };
 
         assert_eq!(resolve_page_offset(&mem, &symbols), DEFAULT_PAGE_OFFSET);
@@ -555,6 +570,7 @@ mod tests {
             pgtable_l5_enabled: None,
             prog_idr: None,
             scx_watchdog_timeout: None,
+            jiffies_64: None,
         };
 
         assert_eq!(resolve_page_offset(&mem, &symbols), randomized_page_offset);
@@ -581,6 +597,7 @@ mod tests {
             pgtable_l5_enabled: Some(l5_kva),
             prog_idr: None,
             scx_watchdog_timeout: None,
+            jiffies_64: None,
         };
 
         assert!(resolve_pgtable_l5(&mem, &symbols));
@@ -607,6 +624,7 @@ mod tests {
             pgtable_l5_enabled: Some(l5_kva),
             prog_idr: None,
             scx_watchdog_timeout: None,
+            jiffies_64: None,
         };
 
         assert!(!resolve_pgtable_l5(&mem, &symbols));
@@ -629,6 +647,7 @@ mod tests {
             pgtable_l5_enabled: None,
             prog_idr: None,
             scx_watchdog_timeout: None,
+            jiffies_64: None,
         };
 
         assert!(!resolve_pgtable_l5(&mem, &symbols));

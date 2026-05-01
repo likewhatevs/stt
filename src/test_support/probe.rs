@@ -304,6 +304,17 @@ pub(crate) fn attempt_auto_repro(
         super::sidecar::sidecar_dir().join(format!("{}.repro.failure-dump.json", entry.name)),
     );
 
+    // Repro VM gets the dual-snapshot freeze coordinator. The
+    // primary VM keeps the single-snapshot path (the primary's
+    // failure-dump.json schema is `FailureDumpReport`, not
+    // wrapped); flipping this on the repro builder is what tells
+    // the freeze coord to run the per-CPU `runnable_at` scanner
+    // and emit a `DualFailureDumpReport` at the repro path. The
+    // gate is a builder field rather than a path-string match so
+    // a future caller invoking the repro logic with a different
+    // `.failure_dump_path()` keeps working without surprise.
+    builder = builder.dual_snapshot(true);
+
     {
         let mut args: Vec<String> = Vec::new();
         if let Some((archive_path, host_path, guest_path)) = config_file_parts(entry) {

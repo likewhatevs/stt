@@ -1183,6 +1183,25 @@ pub struct KtstrVm {
     /// library callers that want the dump on disk set the path
     /// explicitly via [`KtstrVmBuilder::failure_dump_path`].
     failure_dump_path: Option<PathBuf>,
+    /// Capture two BPF-state snapshots per VM run: an early one when
+    /// the host-side `runnable_at` scanner observes any task with
+    /// `jiffies - p->scx.runnable_at > watchdog_timeout/2`
+    /// (mirrors the kernel's `check_rq_for_timeouts`), and a late
+    /// one at the same `ktstr_err_exit_detected` latch as the
+    /// single-snapshot path. Emits
+    /// [`monitor::dump::DualFailureDumpReport`] instead of the
+    /// single-snapshot `FailureDumpReport`. Only the late snapshot
+    /// is required — the early one is `None` when the stall fires
+    /// before the half-way threshold trips, and the file is not
+    /// written at all when only the early snapshot is captured (the
+    /// run completed without a stall, so the early snapshot is not
+    /// useful as a standalone artifact).
+    ///
+    /// Set by [`crate::test_support::probe::attempt_auto_repro`] for
+    /// the repro VM only. Primary VMs leave this `false`; their
+    /// freeze coordinator emits a [`monitor::dump::FailureDumpReport`]
+    /// directly, matching the existing single-snapshot behaviour.
+    dual_snapshot: bool,
 }
 
 /// Parameters for a host-side BPF map write during VM execution.
@@ -2742,6 +2761,31 @@ impl KtstrVm {
         // freeze coord can write the file without touching the env
         // or the parent `KtstrVm`.
         let freeze_coord_dump_path = self.failure_dump_path.clone();
+        // Dual-snapshot mode: when true, the freeze coordinator
+        // additionally polls per-CPU `rq->scx.runnable_list` for any
+        // task whose `jiffies - p->scx.runnable_at` crosses
+        // `watchdog_timeout/2`, takes a snapshot at that point, and
+        // wraps both early + late snapshots into a
+        // [`monitor::dump::DualFailureDumpReport`]. Set by
+        // `attempt_auto_repro` for the repro VM only.
+        let freeze_coord_dual_snapshot = self.dual_snapshot;
+        // Half of the configured watchdog timeout, in nanoseconds.
+        // Used by the dual-snapshot scanner to compare against each
+        // task's runnable-age in jiffies (converted via the guest's
+        // CONFIG_HZ at scan time). The fallback default
+        // (`Duration::from_secs(4)` per the builder default) means
+        // a coord that never received an explicit
+        // `watchdog_timeout()` call still has a coherent half-way
+        // mark — 2 s of stall before the early snapshot fires.
+        let freeze_coord_watchdog_half = self
+            .watchdog_timeout
+            .unwrap_or(Duration::from_secs(4))
+            .checked_div(2)
+            .unwrap_or(Duration::ZERO);
+        // Guest CONFIG_HZ resolved from the kernel image. Used to
+        // convert the watchdog_half Duration into a jiffies-domain
+        // threshold the runnable_at scan can compare against.
+        let freeze_coord_hz = monitor::guest_kernel_hz(Some(&self.kernel));
         // GuestMem for the coordinator's .bss-poll path. Built from
         // the same guest_mem the monitor uses; lifetime tied to the
         // VM run.
@@ -2811,6 +2855,24 @@ impl KtstrVm {
         let freeze_coord_handle = std::thread::Builder::new()
             .name("vmm-freeze-coord".into())
             .spawn(move || {
+                // Per-CPU runnable_at scanner context. Holds every
+                // input the scanner needs, all resolved once and
+                // cached for the rest of the run. Only built when
+                // dual_snapshot is enabled AND every prerequisite
+                // resolves (vmlinux ELF parses, BTF resolves the
+                // four runnable_scan offsets, jiffies_64 symbol is
+                // present, the GuestKernel handshake completes so
+                // we have a cr3_pa / page_offset / l5 view).
+                struct RunnableScanCtx {
+                    rq_pas: Vec<u64>,
+                    rq_kvas: Vec<u64>,
+                    offsets: crate::monitor::btf_offsets::RunnableScanOffsets,
+                    rq_scx_offset: usize,
+                    jiffies_64_pa: u64,
+                    cr3_pa: u64,
+                    page_offset: u64,
+                    l5: bool,
+                }
                 // Lazy-construct BpfMapAccessorOwned. The constructor
                 // parses vmlinux ELF (goblin) and BTF (~MB-scale
                 // work) and reads guest-memory bootstrap symbols
@@ -2866,7 +2928,65 @@ impl KtstrVm {
                 //     (warn_logged is the latch).
                 let mut cached_bss_offset: Option<u32> = None;
                 let mut bss_offset_warn_logged = false;
-                let mut latched = false;
+                // Dual-snapshot state machine. Only used when
+                // `freeze_coord_dual_snapshot` is true; the
+                // single-snapshot path drives the same transitions
+                // but skips the early branch entirely.
+                //
+                // - Idle      → no dump captured yet.
+                // - TookEarly → early snapshot captured (dual-snapshot
+                //               mode only); waiting for the err_exit
+                //               latch to fire.
+                // - Done      → late snapshot captured and emission
+                //               complete; coord just idles until
+                //               kill / bsp_done.
+                #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+                enum FreezeState {
+                    Idle,
+                    TookEarly,
+                    Done,
+                }
+                let mut freeze_state = FreezeState::Idle;
+                // Cached early snapshot from a midway-trigger freeze.
+                // Held until the late freeze fires; then both early
+                // and late are wrapped into a DualFailureDumpReport
+                // and emitted as one file. Discarded silently when
+                // the run ends without a late freeze (the run passed
+                // and the early sample is not useful as a standalone
+                // artifact).
+                let mut early_snapshot: Option<crate::monitor::dump::FailureDumpReport> = None;
+                // Per-snapshot scanner metadata, captured at the
+                // early-trigger site and threaded into the
+                // DualFailureDumpReport wrapper alongside the
+                // snapshots themselves. Both fields stay 0 when no
+                // early snapshot fires, mirroring the report's
+                // `skip_serializing_if = is_zero` behaviour.
+                let mut early_max_age_jiffies: u64 = 0;
+                let mut early_threshold_jiffies: u64 = 0;
+                // Lazy-resolved runnable_at scanner context. Built
+                // from the same vmlinux ELF the .bss-poll path uses.
+                // None disables the early-trigger path on this
+                // iteration but does not block the late path. Becomes
+                // Some once every prerequisite resolves; cached for
+                // the rest of the run.
+                let mut scan_ctx: Option<RunnableScanCtx> = None;
+                // Half of the configured watchdog timeout, expressed
+                // in guest jiffies. Computed once from
+                // freeze_coord_watchdog_half + freeze_coord_hz so each
+                // poll's comparison is a cheap u64 compare against
+                // the scan's max age.
+                //
+                // Use millisecond precision (`as_millis() * hz / 1000`)
+                // rather than `as_secs() * hz`. The seconds-based form
+                // truncated any sub-second watchdog timeout to 0,
+                // silently disabling the early-trigger path for any
+                // caller setting `watchdog_timeout(Duration::from_millis(N))`
+                // with `N < 1000`. The ms-based form preserves the
+                // exact half-watchdog jiffies count to the jiffies
+                // tick boundary (1000/HZ ms).
+                let half_threshold_jiffies = (freeze_coord_watchdog_half.as_millis() as u64)
+                    * freeze_coord_hz
+                    / 1000;
                 while !freeze_coord_kill.load(Ordering::Acquire) {
                     if freeze_coord_bsp_done.load(Ordering::Acquire) {
                         return;
@@ -2995,246 +3115,398 @@ impl KtstrVm {
                             }
                         }
                     }
-                    // Poll the cached PA for the latch flip.
-                    let triggered =
+                    // Lazy-resolve the per-CPU runnable_at scan
+                    // context once `owned_accessor` lands and the
+                    // bootstrap symbols are readable. Skipped entirely
+                    // when dual_snapshot is off; failed prerequisites
+                    // (missing jiffies_64 symbol, BTF without
+                    // sched_ext_entity, etc.) leave `scan_ctx` None
+                    // and the early-trigger path stays dormant for
+                    // the rest of the run — the late path still works.
+                    if freeze_coord_dual_snapshot
+                        && scan_ctx.is_none()
+                        && let Some(ref owned) = owned_accessor
+                        && let Some(ref vmlinux) = freeze_coord_vmlinux
+                        && let Some(ref btf) = dump_btf
+                        && let Ok(syms) =
+                            crate::monitor::symbols::KernelSymbols::from_vmlinux(vmlinux)
+                        && let Some(jiffies_64_kva) = syms.jiffies_64
+                        && let Ok(scan_offsets) =
+                            crate::monitor::btf_offsets::RunnableScanOffsets::from_btf(btf)
+                        && let Ok(rq_offsets) =
+                            crate::monitor::btf_offsets::KernelOffsets::from_vmlinux(vmlinux)
+                    {
+                        let kernel = owned.guest_kernel();
+                        let cr3_pa = kernel.cr3_pa();
+                        let page_offset = kernel.page_offset();
+                        let l5 = kernel.l5();
+                        // Translate jiffies_64's KVA to a PA. Lives
+                        // in the kernel text/data mapping
+                        // (text_kva_to_pa) — same as scx_root et al.
+                        let jiffies_64_pa =
+                            crate::monitor::symbols::text_kva_to_pa(jiffies_64_kva);
+                        // Per-CPU rq PAs come from the existing
+                        // `compute_rq_pas` helper. It needs the
+                        // per_cpu_offsets array, which we read from
+                        // guest memory via the symbol's KVA.
+                        let per_cpu_offset_pa =
+                            crate::monitor::symbols::text_kva_to_pa(syms.per_cpu_offset);
+                        if let Some(ref mem) = freeze_coord_mem {
+                            let per_cpu_offsets =
+                                crate::monitor::symbols::read_per_cpu_offsets(
+                                    mem,
+                                    per_cpu_offset_pa,
+                                    freeze_coord_num_cpus,
+                                );
+                            // runqueues is a percpu symbol — its
+                            // st_value is a section-relative offset,
+                            // not a KVA. compute_rq_pas adds
+                            // per_cpu_offset[cpu] before translating.
+                            let rq_pas = crate::monitor::symbols::compute_rq_pas(
+                                syms.runqueues,
+                                &per_cpu_offsets,
+                                page_offset,
+                            );
+                            // Recover each per-CPU rq KVA so the
+                            // runnable_list head's KVA can serve as
+                            // the loop terminator. Mirrors the kva
+                            // used to build the PA: pa = kva - po,
+                            // so kva = pa + po.
+                            let rq_kvas: Vec<u64> = rq_pas
+                                .iter()
+                                .map(|&pa| pa.wrapping_add(page_offset))
+                                .collect();
+                            scan_ctx = Some(RunnableScanCtx {
+                                rq_pas,
+                                rq_kvas,
+                                offsets: scan_offsets,
+                                rq_scx_offset: rq_offsets.rq_scx,
+                                jiffies_64_pa,
+                                cr3_pa,
+                                page_offset,
+                                l5,
+                            });
+                        }
+                    }
+                    // Poll the cached PA for the err_exit latch flip.
+                    let err_triggered =
                         if let (Some(pa), Some(mem)) = (cached_bss_pa, freeze_coord_mem.as_ref()) {
                             mem.read_u32(pa, 0) != 0
                         } else {
                             false
                         };
-                    if !triggered || latched {
+                    // Once the late snapshot has been emitted, the
+                    // coordinator's only remaining job is to keep
+                    // the freeze=false invariant clear and wait for
+                    // teardown. Idle in 100 ms steps (matching the
+                    // pre-trigger cadence) so kill / bsp_done is
+                    // observed promptly.
+                    if freeze_state == FreezeState::Done {
                         std::thread::sleep(Duration::from_millis(100));
                         continue;
                     }
-                    // Latch so subsequent iterations don't re-fire even
-                    // though the BPF flag stays sticky on. One freeze
-                    // per VM run.
-                    latched = true;
-                    tracing::info!("freeze-coord: ktstr_err_exit_detected latched, freezing vCPUs");
-                    freeze_coord_freeze.store(true, Ordering::Release);
-                    // Pass 1: set every immediate_exit=1. Each
-                    // ImmediateExitHandle::set is a single-byte
-                    // write_volatile into the corresponding kvm_run
-                    // mmap (MAP_SHARED, lifetime tied to the running
-                    // VcpuFd that owns it).
-                    for ie in freeze_coord_ap_ies.iter().flatten() {
-                        ie.set(1);
-                    }
-                    if let Some(ref ie) = freeze_coord_bsp_ie_handle {
-                        ie.set(1);
-                    }
-                    // Release fence between pass 1 and pass 2 so all
-                    // immediate_exit writes are observable before any
-                    // vCPU thread receives the kick signal — without
-                    // this, a thread could process its signal, enter
-                    // KVM_RUN, and miss the immediate_exit byte that
-                    // is supposed to short-circuit guest entry.
-                    std::sync::atomic::fence(Ordering::Release);
-                    // Pass 2: signal every vCPU.
-                    for &tid in &freeze_coord_ap_pthreads {
-                        unsafe {
-                            libc::pthread_kill(tid, vcpu_signal());
-                        }
-                    }
-                    unsafe {
-                        libc::pthread_kill(freeze_coord_bsp_tid, vcpu_signal());
-                    }
-                    // Wait for N-of-N parked acks. The Acquire load
-                    // synchronizes-with the vCPU's Release store after
-                    // the drain dance — this rendezvous IS the memory
-                    // barrier that makes the future host-side
-                    // guest-memory reads correct.
-                    let deadline = Instant::now() + FREEZE_RENDEZVOUS_TIMEOUT;
-                    let mut all_parked = false;
-                    loop {
-                        if freeze_coord_kill.load(Ordering::Acquire)
-                            || freeze_coord_bsp_done.load(Ordering::Acquire)
-                        {
-                            break;
-                        }
-                        let aps_parked = freeze_coord_ap_parked
-                            .iter()
-                            .all(|p| p.load(Ordering::Acquire));
-                        let bsp_p = freeze_coord_bsp_parked.load(Ordering::Acquire);
-                        if aps_parked && bsp_p {
-                            all_parked = true;
-                            break;
-                        }
-                        if Instant::now() > deadline {
-                            // Per-vCPU parked status so the operator
-                            // can see which threads stalled.
-                            let ap_states: Vec<bool> = freeze_coord_ap_parked
-                                .iter()
-                                .map(|p| p.load(Ordering::Acquire))
-                                .collect();
-                            tracing::error!(
-                                ?ap_states,
-                                bsp_parked = bsp_p,
-                                "freeze-coord: timed out waiting for vCPUs to park"
+                    // Closures capture by reference. Building the
+                    // full freeze-rendezvous-dump cycle once and
+                    // calling it for either the early or late
+                    // snapshot keeps the drain-dance contract
+                    // (immediate_exit pass 1 → release fence →
+                    // signal pass 2 → N-of-N rendezvous) defined in
+                    // exactly one place. Returns
+                    // `Some(FailureDumpReport)` when the rendezvous
+                    // succeeded; None on timeout (the surrounding
+                    // logic still thaws). The thaw is the caller's
+                    // responsibility so the same closure works for
+                    // a state-resetting late freeze (thaw to allow
+                    // teardown to run) and a transient early freeze
+                    // (thaw to let the test continue).
+                    let freeze_and_capture =
+                        || -> Option<crate::monitor::dump::FailureDumpReport> {
+                            tracing::info!(
+                                "freeze-coord: freezing vCPUs for snapshot"
                             );
-                            break;
-                        }
-                        std::thread::sleep(Duration::from_micros(100));
-                    }
-                    // Dump BPF map state while every vCPU is parked.
-                    // Only run when the rendezvous succeeded (no
-                    // timeout) AND every prerequisite is in place:
-                    //   - owned_accessor: BPF map walker (vmlinux ELF
-                    //     parse + BTF + map_idr symbol)
-                    //   - dump_btf: BTF for type-driven rendering
-                    //
-                    // A timeout reaching here without all_parked means
-                    // some vCPU is still inside KVM_RUN; reading guest
-                    // memory before that vCPU has Released its
-                    // `parked` flag would race writes. Skip the dump
-                    // in that case so the operator gets an empty
-                    // section with the timeout already logged above.
-                    //
-                    // Output goes through tracing::error (rather than
-                    // info) because reaching this branch means an
-                    // error-class scheduler exit fired in the guest;
-                    // the dump is post-mortem evidence, not routine
-                    // observation.
-                    // Helper: emit a fully-built FailureDumpReport via
-                    // tracing + an optional file sink at
-                    // `freeze_coord_dump_path` (set by the test
-                    // framework / library callers via
-                    // `KtstrVmBuilder::failure_dump_path`). Used by
-                    // both the full-dump branch and the partial
-                    // (vcpu_regs-only) branch below so the
-                    // formatting / file-write contract stays
-                    // identical across the two paths — operators
-                    // see the same JSON shape and log target
-                    // regardless of whether BTF/accessor were
-                    // available.
-                    let emit_report = |report: &crate::monitor::dump::FailureDumpReport| {
-                        match serde_json::to_string_pretty(report) {
-                            Ok(json) => {
-                                tracing::error!(
-                                    target: "ktstr::failure_dump",
-                                    map_count = report.maps.len(),
-                                    vcpu_regs_count = report.vcpu_regs.len(),
-                                    "freeze-coord: failure dump\n{json}"
+                            freeze_coord_freeze.store(true, Ordering::Release);
+                            // Pass 1: set every immediate_exit=1.
+                            // Each ImmediateExitHandle::set is a
+                            // single-byte write_volatile into the
+                            // corresponding kvm_run mmap (MAP_SHARED,
+                            // lifetime tied to the running VcpuFd
+                            // that owns it).
+                            for ie in freeze_coord_ap_ies.iter().flatten() {
+                                ie.set(1);
+                            }
+                            if let Some(ref ie) = freeze_coord_bsp_ie_handle {
+                                ie.set(1);
+                            }
+                            // Release fence between pass 1 and pass 2
+                            // so all immediate_exit writes are
+                            // observable before any vCPU thread
+                            // receives the kick signal — without
+                            // this, a thread could process its signal,
+                            // enter KVM_RUN, and miss the
+                            // immediate_exit byte that is supposed to
+                            // short-circuit guest entry.
+                            std::sync::atomic::fence(Ordering::Release);
+                            // Pass 2: signal every vCPU.
+                            for &tid in &freeze_coord_ap_pthreads {
+                                unsafe {
+                                    libc::pthread_kill(tid, vcpu_signal());
+                                }
+                            }
+                            unsafe {
+                                libc::pthread_kill(freeze_coord_bsp_tid, vcpu_signal());
+                            }
+                            // Wait for N-of-N parked acks. The
+                            // Acquire load synchronizes-with the
+                            // vCPU's Release store after the drain
+                            // dance — this rendezvous IS the memory
+                            // barrier that makes the future host-side
+                            // guest-memory reads correct.
+                            let deadline = Instant::now() + FREEZE_RENDEZVOUS_TIMEOUT;
+                            let mut all_parked = false;
+                            loop {
+                                if freeze_coord_kill.load(Ordering::Acquire)
+                                    || freeze_coord_bsp_done.load(Ordering::Acquire)
+                                {
+                                    break;
+                                }
+                                let aps_parked = freeze_coord_ap_parked
+                                    .iter()
+                                    .all(|p| p.load(Ordering::Acquire));
+                                let bsp_p = freeze_coord_bsp_parked.load(Ordering::Acquire);
+                                if aps_parked && bsp_p {
+                                    all_parked = true;
+                                    break;
+                                }
+                                if Instant::now() > deadline {
+                                    let ap_states: Vec<bool> = freeze_coord_ap_parked
+                                        .iter()
+                                        .map(|p| p.load(Ordering::Acquire))
+                                        .collect();
+                                    tracing::error!(
+                                        ?ap_states,
+                                        bsp_parked = bsp_p,
+                                        "freeze-coord: timed out waiting for vCPUs to park"
+                                    );
+                                    break;
+                                }
+                                std::thread::sleep(Duration::from_micros(100));
+                            }
+                            // Collect per-vCPU register snapshots.
+                            // Reads happens-after the rendezvous
+                            // Acquire on each vCPU's `parked` flag,
+                            // which synchronizes-with the vCPU
+                            // thread's Release store after its
+                            // capture_vcpu_regs / regs_slot write —
+                            // so these Mutex reads see the captured
+                            // values even on weakly-ordered
+                            // architectures. Index 0 = BSP, 1..N =
+                            // APs.
+                            let collect_vcpu_regs = ||
+                                -> Vec<Option<exit_dispatch::VcpuRegSnapshot>> {
+                                let mut regs:
+                                    Vec<Option<exit_dispatch::VcpuRegSnapshot>> =
+                                    Vec::with_capacity(1 + freeze_coord_ap_regs.len());
+                                regs.push(
+                                    *freeze_coord_bsp_regs
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner()),
                                 );
-                                // Best-effort file sink: a write
-                                // failure logs a warning and does
-                                // not affect the freeze/thaw path.
-                                // `freeze_coord_dump_path == None`
-                                // means the caller did not request
-                                // a file copy — the tracing emit
-                                // above is the sole record.
-                                if let Some(ref path) = freeze_coord_dump_path {
-                                    // The sidecar dir
-                                    // (`{runs_root}/{kernel}-{commit}`)
-                                    // may not exist on the first run
-                                    // of a fresh invocation; create
-                                    // it eagerly so the write below
-                                    // does not silently fail with
-                                    // ENOENT. Best-effort — the
-                                    // write's own error handling
-                                    // surfaces the failure if the
-                                    // mkdir fails too.
-                                    if let Some(parent) = path.parent() {
-                                        let _ = std::fs::create_dir_all(parent);
+                                for ap in &freeze_coord_ap_regs {
+                                    regs.push(
+                                        *ap.lock().unwrap_or_else(|e| e.into_inner()),
+                                    );
+                                }
+                                regs
+                            };
+                            if !all_parked {
+                                // Rendezvous timed out — at least
+                                // one vCPU never set its parked
+                                // flag, so we cannot safely read
+                                // guest memory.
+                                tracing::debug!(
+                                    "freeze-coord: dump skipped: rendezvous timed out"
+                                );
+                                return None;
+                            }
+                            if let Some(ref owned) = owned_accessor
+                                && let Some(ref btf) = dump_btf
+                            {
+                                let mut report = crate::monitor::dump::dump_state(
+                                    &owned.as_accessor(),
+                                    btf,
+                                    freeze_coord_num_cpus,
+                                    dump_arena_offsets.as_ref(),
+                                );
+                                report.vcpu_regs = collect_vcpu_regs();
+                                Some(report)
+                            } else {
+                                // Partial dump: vcpu_regs only.
+                                let report = crate::monitor::dump::FailureDumpReport {
+                                    schema: crate::monitor::dump::SCHEMA_SINGLE.to_string(),
+                                    maps: Vec::new(),
+                                    vcpu_regs: collect_vcpu_regs(),
+                                    sdt_allocations: Vec::new(),
+                                };
+                                tracing::warn!(
+                                    owned_accessor = owned_accessor.is_some(),
+                                    dump_btf = dump_btf.is_some(),
+                                    "freeze-coord: dump prerequisites unavailable; \
+                                     emitting partial report with vcpu_regs only"
+                                );
+                                Some(report)
+                            }
+                        };
+                    // Helper: emit the JSON of any Serialize value
+                    // (FailureDumpReport for the single-snapshot
+                    // path, DualFailureDumpReport for dual-snapshot)
+                    // via tracing::error and the optional file sink.
+                    // Wrapped in a closure so the file-sink contract
+                    // (mkdir parent, write, log warn on failure)
+                    // lives in one place across both report shapes.
+                    let emit_json =
+                        |json: &str, map_count: usize, vcpu_regs_count: usize| {
+                            tracing::error!(
+                                target: "ktstr::failure_dump",
+                                map_count,
+                                vcpu_regs_count,
+                                "freeze-coord: failure dump\n{json}"
+                            );
+                            if let Some(ref path) = freeze_coord_dump_path {
+                                if let Some(parent) = path.parent() {
+                                    let _ = std::fs::create_dir_all(parent);
+                                }
+                                if let Err(e) = std::fs::write(path, json) {
+                                    tracing::warn!(
+                                        path = %path.display(),
+                                        error = %e,
+                                        "freeze-coord: failure-dump file write failed"
+                                    );
+                                }
+                            }
+                        };
+                    // Early-snapshot trigger: dual_snapshot mode and
+                    // we have a working scan context. Mirror the
+                    // kernel's `check_rq_for_timeouts` logic — any
+                    // task whose `jiffies - p->scx.runnable_at`
+                    // exceeds the half-way mark trips the trigger.
+                    // Half-way comes from the configured
+                    // watchdog_timeout (already plumbed through
+                    // `KtstrTestEntry.watchdog_timeout`), so the
+                    // early snapshot lands well before the kernel
+                    // would emit SCX_EXIT_ERROR_STALL — gives the
+                    // operator pre-stall BPF state to diff against
+                    // the late snapshot.
+                    if freeze_state == FreezeState::Idle
+                        && freeze_coord_dual_snapshot
+                        && half_threshold_jiffies > 0
+                        && let Some(ref ctx) = scan_ctx
+                        && let Some(ref mem) = freeze_coord_mem
+                    {
+                        let jiffies = mem.read_u64(ctx.jiffies_64_pa, 0);
+                        let max_age = crate::monitor::runnable_scan::max_runnable_age(
+                            mem,
+                            &ctx.rq_pas,
+                            &ctx.rq_kvas,
+                            &ctx.offsets,
+                            ctx.rq_scx_offset,
+                            jiffies,
+                            ctx.cr3_pa,
+                            ctx.page_offset,
+                            ctx.l5,
+                        );
+                        if max_age >= half_threshold_jiffies {
+                            tracing::info!(
+                                max_age,
+                                half_threshold_jiffies,
+                                "freeze-coord: dual-snapshot early threshold tripped"
+                            );
+                            // Persist the trigger metric and the
+                            // half-way threshold ONLY when the freeze
+                            // capture succeeds. The
+                            // `DualFailureDumpReport` doc says "Zero
+                            // when `early` is `None`", which a
+                            // consumer relies on to detect the
+                            // capture-failed case from JSON alone:
+                            // a `late`-only wrapper with non-zero
+                            // metric values would be ambiguous (did
+                            // the early capture fail, or did the
+                            // trigger never fire?). Co-gating both
+                            // sides on `Some(report)` keeps the
+                            // invariant.
+                            if let Some(report) = freeze_and_capture() {
+                                early_max_age_jiffies = max_age;
+                                early_threshold_jiffies = half_threshold_jiffies;
+                                early_snapshot = Some(report);
+                            }
+                            // Thaw whether or not we got a report:
+                            // the freeze flag was set unconditionally,
+                            // and a stuck rendezvous already logged.
+                            freeze_coord_freeze.store(false, Ordering::Release);
+                            freeze_state = FreezeState::TookEarly;
+                        }
+                    }
+                    // Late-snapshot trigger: err_exit_detected has
+                    // flipped. The state-machine guard ensures we
+                    // only fire once per VM run — TookEarly → late
+                    // is allowed (capturing both halves of the
+                    // dual-snapshot wrapper); Done is terminal.
+                    if err_triggered
+                        && (freeze_state == FreezeState::Idle
+                            || freeze_state == FreezeState::TookEarly)
+                    {
+                        tracing::info!(
+                            "freeze-coord: ktstr_err_exit_detected latched, freezing vCPUs"
+                        );
+                        let late_report = freeze_and_capture();
+                        // Thaw before emission so a slow JSON
+                        // serialise doesn't keep vCPUs parked any
+                        // longer than the dump strictly needs.
+                        freeze_coord_freeze.store(false, Ordering::Release);
+                        if let Some(late) = late_report {
+                            if freeze_coord_dual_snapshot {
+                                let dual = crate::monitor::dump::DualFailureDumpReport {
+                                    schema: crate::monitor::dump::SCHEMA_DUAL.to_string(),
+                                    early: early_snapshot.take(),
+                                    late,
+                                    early_max_age_jiffies,
+                                    early_threshold_jiffies,
+                                };
+                                match serde_json::to_string_pretty(&dual) {
+                                    Ok(json) => {
+                                        let map_count = dual.late.maps.len();
+                                        let vcpu_regs_count = dual.late.vcpu_regs.len();
+                                        emit_json(&json, map_count, vcpu_regs_count);
                                     }
-                                    if let Err(e) = std::fs::write(path, &json) {
-                                        tracing::warn!(
-                                            path = %path.display(),
+                                    Err(e) => {
+                                        tracing::error!(
                                             error = %e,
-                                            "freeze-coord: failure-dump file write failed"
+                                            "freeze-coord: dual failure dump (JSON serialization failed)"
+                                        );
+                                    }
+                                }
+                            } else {
+                                match serde_json::to_string_pretty(&late) {
+                                    Ok(json) => {
+                                        let map_count = late.maps.len();
+                                        let vcpu_regs_count = late.vcpu_regs.len();
+                                        emit_json(&json, map_count, vcpu_regs_count);
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            error = %e,
+                                            map_count = late.maps.len(),
+                                            vcpu_regs_count = late.vcpu_regs.len(),
+                                            "freeze-coord: failure dump (JSON serialization failed)"
                                         );
                                     }
                                 }
                             }
-                            Err(e) => {
-                                tracing::error!(
-                                    error = %e,
-                                    map_count = report.maps.len(),
-                                    vcpu_regs_count = report.vcpu_regs.len(),
-                                    "freeze-coord: failure dump (JSON serialization failed)"
-                                );
-                            }
                         }
-                    };
-                    // Collect per-vCPU register snapshots once. Reads
-                    // are happens-after the rendezvous Acquire on
-                    // each vCPU's `parked` flag (loaded in the wait
-                    // loop above), which synchronizes-with the vCPU
-                    // thread's Release store after its
-                    // capture_vcpu_regs / regs_slot write — so these
-                    // Mutex reads see the captured values even on
-                    // weakly-ordered architectures. Index 0 = BSP,
-                    // 1..N = APs (mirroring the VcpuFd ordering
-                    // inside KtstrKvm.vcpus that run_vm splits into
-                    // bsp + ap_threads). Computed once because both
-                    // branches below (full dump, partial dump) need
-                    // the same Vec.
-                    let collect_vcpu_regs = || -> Vec<Option<exit_dispatch::VcpuRegSnapshot>> {
-                        let mut regs: Vec<Option<exit_dispatch::VcpuRegSnapshot>> =
-                            Vec::with_capacity(1 + freeze_coord_ap_regs.len());
-                        regs.push(
-                            *freeze_coord_bsp_regs
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner()),
-                        );
-                        for ap in &freeze_coord_ap_regs {
-                            regs.push(*ap.lock().unwrap_or_else(|e| e.into_inner()));
-                        }
-                        regs
-                    };
-                    if all_parked
-                        && let Some(ref owned) = owned_accessor
-                        && let Some(ref btf) = dump_btf
-                    {
-                        let mut report = crate::monitor::dump::dump_state(
-                            &owned.as_accessor(),
-                            btf,
-                            freeze_coord_num_cpus,
-                            dump_arena_offsets.as_ref(),
-                        );
-                        report.vcpu_regs = collect_vcpu_regs();
-                        emit_report(&report);
-                    } else if all_parked {
-                        // Rendezvous succeeded but BPF map
-                        // enumeration prerequisites are missing
-                        // (vmlinux unreadable, BTF parse failed,
-                        // BpfMapAccessor never reached the
-                        // guest-kernel handshake). The captured
-                        // vCPU registers are still valid because the
-                        // rendezvous Acquire fence saw them — emit a
-                        // partial report carrying only `vcpu_regs`
-                        // so the operator at least sees per-vCPU
-                        // RIP/RSP/CR3 (or PC/SP/TTBR1+TTBR0). The
-                        // empty `maps` Vec serialises to `"maps": []`
-                        // (no skip_serializing_if on the Vec),
-                        // signalling unambiguously "no map dump".
-                        let report = crate::monitor::dump::FailureDumpReport {
-                            maps: Vec::new(),
-                            vcpu_regs: collect_vcpu_regs(),
-                            sdt_allocations: Vec::new(),
-                        };
-                        tracing::warn!(
-                            owned_accessor = owned_accessor.is_some(),
-                            dump_btf = dump_btf.is_some(),
-                            "freeze-coord: dump prerequisites unavailable; \
-                             emitting partial report with vcpu_regs only"
-                        );
-                        emit_report(&report);
-                    } else {
-                        // Rendezvous timed out — at least one vCPU
-                        // never set its parked flag, so we cannot
-                        // safely read guest memory. Surface the
-                        // causal link so an operator reading the
-                        // log doesn't have to infer "no dump =
-                        // timeout" from the absence of a dump
-                        // record.
-                        tracing::debug!("freeze-coord: dump skipped: rendezvous timed out");
+                        freeze_state = FreezeState::Done;
+                        continue;
                     }
-                    // Thaw. Each parked vCPU is polling on
-                    // park_timeout(10ms), so the cleared freeze flag
-                    // is observed within at most 10 ms — no explicit
-                    // unpark needed for either APs or BSP.
-                    freeze_coord_freeze.store(false, Ordering::Release);
+                    // No trigger this iteration. Sleep and retry.
+                    std::thread::sleep(Duration::from_millis(100));
                 }
             })
             .context("spawn freeze coordinator thread")?;
@@ -3549,7 +3821,16 @@ impl KtstrVm {
                 });
 
         let hz = monitor::guest_kernel_hz(Some(&self.kernel));
-        let watchdog_jiffies = self.watchdog_timeout.map(|d| d.as_secs() * hz);
+        // Use millisecond precision (`as_millis() * hz / 1000`) rather
+        // than `as_secs() * hz`. The seconds-based form silently
+        // truncates any sub-second watchdog timeout to 0, disabling
+        // the freeze-coord watchdog jiffies value for any caller
+        // setting `watchdog_timeout(Duration::from_millis(N))` with
+        // `N < 1000`. Mirrors the same fix at the
+        // `freeze_coord_watchdog_half` derivation site upstream.
+        let watchdog_jiffies = self
+            .watchdog_timeout
+            .map(|d| (d.as_millis() as u64) * hz / 1000);
         let preemption_threshold_ns = monitor::vcpu_preemption_threshold_ns(Some(&self.kernel));
         let rt_monitor = self.performance_mode;
         let service_cpu = self.pinning_plan.as_ref().and_then(|p| p.service_cpu);
@@ -4467,6 +4748,11 @@ pub struct KtstrVmBuilder {
     /// sink — the dump still emits via `tracing::error`. See
     /// [`Self::failure_dump_path`].
     failure_dump_path: Option<PathBuf>,
+    /// Capture two BPF-state snapshots per VM run instead of one.
+    /// See the runtime field of the same name on [`KtstrVm`] for
+    /// the full contract; the builder field flows through `build`
+    /// unchanged.
+    dual_snapshot: bool,
 }
 
 impl Default for KtstrVmBuilder {
@@ -4504,6 +4790,7 @@ impl Default for KtstrVmBuilder {
             jemalloc_probe_binary: None,
             jemalloc_alloc_worker_binary: None,
             failure_dump_path: None,
+            dual_snapshot: false,
         }
     }
 }
@@ -4666,6 +4953,41 @@ impl KtstrVmBuilder {
     /// the repro path before falling into the repro VM build).
     pub fn failure_dump_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.failure_dump_path = Some(path.into());
+        self
+    }
+
+    /// Enable the dual-snapshot freeze-coordinator path. With
+    /// `enabled = true` the coordinator runs an additional per-CPU
+    /// `runnable_at` scanner alongside the existing
+    /// `ktstr_err_exit_detected` poll: when any task crosses the
+    /// `watchdog_timeout/2` half-way mark it triggers an extra
+    /// freeze + dump cycle. Both snapshots are emitted as a single
+    /// [`crate::monitor::dump::DualFailureDumpReport`] file at
+    /// [`Self::failure_dump_path`] (the late snapshot at the same
+    /// trigger as the single-snapshot path; the early snapshot is
+    /// optional). Used by the auto-repro path to capture BPF state
+    /// deltas across a stall window.
+    ///
+    /// Default off — two reasons:
+    /// 1. **Scanner cost.** The early-trigger path walks every
+    ///    per-CPU `rq->scx.runnable_list` once per 100 ms poll
+    ///    cycle, reading each task's
+    ///    `task_struct.scx.runnable_at` via direct-mapped guest
+    ///    memory. On a 64-vCPU host with hundreds of runnable
+    ///    tasks the steady-state cost is non-negligible — a primary
+    ///    VM doesn't pay it unless the run already failed and an
+    ///    auto-repro is being attempted.
+    /// 2. **Consumer compatibility.** The on-disk shape changes
+    ///    from [`crate::monitor::dump::FailureDumpReport`] to
+    ///    [`crate::monitor::dump::DualFailureDumpReport`], a
+    ///    different JSON schema. Any consumer reading the dump
+    ///    file must handle both schemas (gated on the `schema`
+    ///    field). Keeping the primary path on the single-snapshot
+    ///    shape means existing consumers (e.g.
+    ///    `tests/failure_dump_e2e.rs`) keep working without
+    ///    awareness of the dual-snapshot wrapper.
+    pub fn dual_snapshot(mut self, enabled: bool) -> Self {
+        self.dual_snapshot = enabled;
         self
     }
 
@@ -4978,6 +5300,7 @@ impl KtstrVmBuilder {
             jemalloc_probe_binary: self.jemalloc_probe_binary,
             jemalloc_alloc_worker_binary: self.jemalloc_alloc_worker_binary,
             failure_dump_path: self.failure_dump_path,
+            dual_snapshot: self.dual_snapshot,
         })
     }
 

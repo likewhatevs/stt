@@ -163,8 +163,8 @@ pub enum DetailKind {
     /// Use `DetailKind::SchedulerDied` for scheduler-liveness failures.
     Monitor,
     /// Scheduler process observed to have died (via `sched_pid`
-    /// probe returning ESRCH or wait on the leader). Covers both
-    /// in-workload watchdog detection and post-ops liveness probes;
+    /// probe returning ESRCH or wait on the leader). Covers
+    /// post-ops liveness probes and inter-step liveness checks;
     /// the vocabulary was unified from "exited" / "no longer
     /// running" onto "died" so every scheduler-liveness failure
     /// lands under a single structural tag. Consumers filter on
@@ -179,10 +179,9 @@ pub enum DetailKind {
 }
 
 /// Message prefix emitted by every scenario-runner site that
-/// detects the scheduler process has died — whether through
-/// in-workload watchdog (`sched_pid` probe returns ESRCH),
-/// post-ops liveness probe, or inter-step liveness probe. All
-/// three paths share this single prefix as the operator-visible
+/// detects the scheduler process has died — whether through a
+/// post-ops liveness probe or an inter-step liveness check. Both
+/// paths share this single prefix as the operator-visible
 /// message format so someone grepping stderr for the canonical
 /// "scheduler process died" string hits every emission site.
 /// Structural routing (the console-dump gate in
@@ -5514,7 +5513,7 @@ numa_miss 5";
 
     // -- sched-died format helpers --
     //
-    // The three `format_sched_died_*` helpers in this module are
+    // The two `format_sched_died_*` helpers in this module are
     // the single source of truth for emitter-side message formatting;
     // every production site goes through them. These tests pin the
     // exact message templates so operators grepping stderr can keep

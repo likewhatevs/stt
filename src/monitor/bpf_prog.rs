@@ -236,8 +236,22 @@ pub(crate) fn read_prog_runtime_stats(
                 if let Some(stats_pa) = translate_any_kva(mem, cr3_pa, page_offset, stats_kva, l5)
                     && stats_pa < mem.size()
                 {
-                    cnt += mem.read_u64(stats_pa, offsets.stats_cnt);
-                    nsecs += mem.read_u64(stats_pa, offsets.stats_nsecs);
+                    // saturating_add: per-CPU `bpf_prog_stats.cnt` /
+                    // `.nsecs` are kernel-side u64 counters that
+                    // monotonically increase on every program
+                    // execution. Summing N CPUs' values can in
+                    // principle overflow on a long-running guest with
+                    // a hot BPF program; observed in nextest runs
+                    // where uninitialized / scrambled per-CPU pages
+                    // yield near-u64::MAX values. Saturating to
+                    // u64::MAX is the right semantics — the consumer
+                    // (`ProgRuntimeStats` viewer) never produces
+                    // signed deltas off this so a saturated sum still
+                    // sorts correctly, and it prevents an `attempt to
+                    // add with overflow` panic in the monitor thread
+                    // that would tear the whole VM down.
+                    cnt = cnt.saturating_add(mem.read_u64(stats_pa, offsets.stats_cnt));
+                    nsecs = nsecs.saturating_add(mem.read_u64(stats_pa, offsets.stats_nsecs));
                 }
             }
             ProgRuntimeStats {

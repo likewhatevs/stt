@@ -836,6 +836,203 @@ mod tests {
         assert_eq!(shell_quote(""), "''");
     }
 
+    /// Tab (`\t`) is whitespace under bash IFS — unquoted, the
+    /// arg would split on the tab. Quoting preserves the literal
+    /// tab byte inside the single-quoted form (single quotes are
+    /// fully literal in POSIX shell, no escape interpretation).
+    #[test]
+    fn shell_quote_tab() {
+        assert_eq!(shell_quote("a\tb"), "'a\tb'");
+    }
+
+    /// Newline must be quoted: an unquoted newline ends the
+    /// command and starts a new one. Inside single quotes the
+    /// literal `\n` byte is preserved verbatim.
+    #[test]
+    fn shell_quote_newline() {
+        assert_eq!(shell_quote("a\nb"), "'a\nb'");
+    }
+
+    /// Backslash is a non-special byte INSIDE POSIX single quotes
+    /// (only `'` ends the quoted region). The shell_quote
+    /// implementation must preserve the backslash verbatim, NOT
+    /// double it (a common bug from "escape everything" thinking).
+    #[test]
+    fn shell_quote_backslash() {
+        assert_eq!(shell_quote(r"a\b"), r"'a\b'");
+        // Trailing backslash is also fine — the closing quote
+        // terminates the literal cleanly.
+        assert_eq!(shell_quote(r"trail\"), r"'trail\'");
+    }
+
+    /// Unicode is preserved byte-for-byte: emoji + CJK both
+    /// roundtrip through the single-quoted form. POSIX single
+    /// quotes are byte-literal so multi-byte UTF-8 sequences are
+    /// safe; we still wrap because the `is_ascii_alphanumeric`
+    /// gate rejects non-ASCII and falls into the quoted path.
+    #[test]
+    fn shell_quote_unicode_emoji_and_cjk() {
+        assert_eq!(shell_quote("test ✅"), "'test ✅'");
+        assert_eq!(shell_quote("日本語"), "'日本語'");
+        assert_eq!(shell_quote("héllo"), "'héllo'");
+    }
+
+    /// NUL byte: bash refuses NUL bytes in argv, but `shell_quote`
+    /// itself must not panic — emit a quoted form and let the
+    /// downstream shell reject it. `\0` inside single quotes is
+    /// byte-literal, same as any other non-quote byte.
+    #[test]
+    fn shell_quote_null_byte() {
+        let s = "a\0b";
+        let q = shell_quote(s);
+        assert_eq!(q, "'a\0b'");
+    }
+
+    /// Mixed quote types (`'` and `"`): single quotes are escaped
+    /// via the `'\''` close-escape-reopen pattern; double quotes
+    /// are byte-literal inside single quotes and pass through
+    /// untouched.
+    #[test]
+    fn shell_quote_mixed_quote_types() {
+        // Single inside, double outside: single becomes the
+        // escape sequence, double is literal.
+        assert_eq!(shell_quote(r#"he said "don't""#), r#"'he said "don'\''t"'"#);
+    }
+
+    /// String that already looks like a single-quoted literal
+    /// must be re-quoted: the existing surrounding `'` are bytes,
+    /// not metacharacters, so the wrapping pattern still applies
+    /// and the embedded `'` get the close-escape-reopen treatment.
+    #[test]
+    fn shell_quote_already_single_quoted() {
+        assert_eq!(shell_quote("'pre-quoted'"), r"''\''pre-quoted'\'''");
+    }
+
+    /// A bare single quote: edge of the escape pattern. The output
+    /// must still be a valid single-quoted shell word.
+    #[test]
+    fn shell_quote_only_single_quote() {
+        let q = shell_quote("'");
+        // Must be syntactically valid POSIX: `'\''` is the canonical
+        // pattern. Wrapped in outer quotes -> `''\'''`.
+        assert_eq!(q, r"''\'''");
+    }
+
+    /// Carriage return is non-printable and would terminate a
+    /// shell line on systems that treat `\r` as a newline (CRLF
+    /// terminals). Single-quoted form preserves the byte verbatim.
+    #[test]
+    fn shell_quote_carriage_return() {
+        assert_eq!(shell_quote("a\rb"), "'a\rb'");
+        assert_eq!(shell_quote("a\r\nb"), "'a\r\nb'");
+    }
+
+    /// Consecutive embedded single quotes: each one independently
+    /// triggers the close-escape-reopen pattern. Tests that the
+    /// per-char loop doesn't collapse runs of `'` into a single
+    /// escape.
+    #[test]
+    fn shell_quote_consecutive_single_quotes() {
+        assert_eq!(shell_quote("a''b"), r"'a'\'''\''b'");
+        assert_eq!(shell_quote("'''"), r"''\'''\'''\'''");
+    }
+
+    /// Combination: tab byte AND embedded single quote in the same
+    /// input. The tab passes through verbatim (single quotes are
+    /// byte-literal) and the apostrophe takes the escape path.
+    #[test]
+    fn shell_quote_tab_with_single_quote() {
+        assert_eq!(shell_quote("a\t'b"), "'a\t'\\''b'");
+    }
+
+    /// Other low-byte control characters (vertical tab, form feed,
+    /// bell, ESC). All non-printable, all byte-literal inside POSIX
+    /// single quotes.
+    #[test]
+    fn shell_quote_low_control_bytes() {
+        assert_eq!(shell_quote("\x07"), "'\x07'"); // bell
+        assert_eq!(shell_quote("\x08"), "'\x08'"); // backspace
+        assert_eq!(shell_quote("\x0b"), "'\x0b'"); // vertical tab
+        assert_eq!(shell_quote("\x0c"), "'\x0c'"); // form feed
+        assert_eq!(shell_quote("\x1b[31mred\x1b[0m"), "'\x1b[31mred\x1b[0m'");
+    }
+
+    /// Safe-set chars (`+`, `=`, `:`, `/`, `.`, `_`, `-`) at
+    /// boundaries: this pins which characters bypass the quote
+    /// wrap. The safe set is a positive list; any change to it
+    /// flips this test.
+    #[test]
+    fn shell_quote_safe_set_unquoted() {
+        // Each of these should pass through verbatim.
+        for raw in [
+            "+",
+            "=",
+            ":",
+            "/",
+            ".",
+            "_",
+            "-",
+            "abc+def",
+            "key=value",
+            "ns:resource",
+            "/usr/local/bin",
+            "v1.0.0",
+            "file_name-1.txt",
+        ] {
+            assert_eq!(
+                shell_quote(raw),
+                raw,
+                "safe-set input must remain unquoted: {raw:?}"
+            );
+        }
+    }
+
+    /// Long string with no special chars stays unquoted; long
+    /// string with a single special char anywhere triggers the
+    /// full-string wrap. Pins behavior for size-conscious callers.
+    #[test]
+    fn shell_quote_long_strings() {
+        let safe = "a".repeat(1024);
+        assert_eq!(
+            shell_quote(&safe),
+            safe,
+            "long safe-set string passes through"
+        );
+
+        let with_space = format!("{}{}", "a".repeat(512), " end");
+        let q = shell_quote(&with_space);
+        assert!(q.starts_with('\'') && q.ends_with('\''));
+        assert_eq!(&q[1..q.len() - 1], &with_space);
+    }
+
+    /// Shell metacharacters that would otherwise be interpreted
+    /// by the parser must all roundtrip through the quoted form
+    /// without forking a subshell, expanding a glob, or
+    /// dereferencing a variable.
+    #[test]
+    fn shell_quote_shell_metacharacters() {
+        // Each of these would, unquoted, do something dangerous.
+        for raw in [
+            "a&b", "a|b", "a`b`c", "a$b", "a*b", "a?b", "a[b]c", "a{b}c", "a(b)c", "a~b", "a#b",
+            "a!b",
+        ] {
+            let q = shell_quote(raw);
+            assert!(
+                q.starts_with('\'') && q.ends_with('\''),
+                "metachar input must be wrapped: input={raw:?} output={q:?}"
+            );
+            // The byte content (between the wrapping quotes) must
+            // equal the original — single quotes are byte-literal,
+            // no escape interpretation, no `'` to escape in these
+            // inputs.
+            let inner = &q[1..q.len() - 1];
+            assert_eq!(
+                inner, raw,
+                "metachar input must be byte-preserved inside the wrap"
+            );
+        }
+    }
+
     #[test]
     fn search_path_for_finds_existing_executable() {
         // /bin/sh is executable on every supported host; PATH lookup

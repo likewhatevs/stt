@@ -72,10 +72,40 @@ use super::sdt_alloc::{
 /// internals.
 pub use crate::vmm::exit_dispatch::VcpuRegSnapshot;
 
+/// Schema discriminant value emitted in `FailureDumpReport.schema`.
+///
+/// Consumers that read a `.failure-dump.json` file use the `schema`
+/// field's value to choose between [`FailureDumpReport`] and
+/// [`DualFailureDumpReport`] before attempting deserialization.
+/// Values are stable wire constants — extending the dump pipeline
+/// with a new shape adds a new constant rather than changing this
+/// one.
+pub const SCHEMA_SINGLE: &str = "single";
+
+/// Schema discriminant value emitted in `DualFailureDumpReport.schema`.
+/// See [`SCHEMA_SINGLE`] for the discriminant contract.
+pub const SCHEMA_DUAL: &str = "dual";
+
+fn default_schema_single() -> String {
+    SCHEMA_SINGLE.to_string()
+}
+
+fn default_schema_dual() -> String {
+    SCHEMA_DUAL.to_string()
+}
+
 /// Top-level failure-dump report. One per freeze trigger.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct FailureDumpReport {
+    /// Wire-format discriminant. Always `"single"` for this variant,
+    /// pinning [`SCHEMA_SINGLE`]. Consumers branch on this to
+    /// choose between [`FailureDumpReport`] and
+    /// [`DualFailureDumpReport`] before deserializing — the two
+    /// variants share top-level field names that would collide
+    /// without an explicit tag.
+    #[serde(default = "default_schema_single")]
+    pub schema: String,
     /// One entry per BPF map enumerated. Order matches the IDR walk
     /// (i.e. allocation order); the report is otherwise unsorted so
     /// callers that want a stable view should sort by name.
@@ -101,6 +131,143 @@ pub struct FailureDumpReport {
     /// on whether they want raw bytes or named-field allocations.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sdt_allocations: Vec<SdtAllocatorSnapshot>,
+}
+
+impl Default for FailureDumpReport {
+    /// Empty report with `schema = "single"`. Pinning the schema
+    /// here keeps `FailureDumpReport::default()` and a
+    /// freshly-constructed `FailureDumpReport { ..., schema:
+    /// SCHEMA_SINGLE.into(), ... }` indistinguishable to consumers,
+    /// so the schema discriminant is never quietly missing on a
+    /// default-built report.
+    fn default() -> Self {
+        Self {
+            schema: SCHEMA_SINGLE.to_string(),
+            maps: Vec::new(),
+            vcpu_regs: Vec::new(),
+            sdt_allocations: Vec::new(),
+        }
+    }
+}
+
+/// Pair of failure-dump snapshots captured at two points in a stall.
+///
+/// `early` is taken when the host-side runnable_at scanner observes
+/// any task with `jiffies - p->scx.runnable_at > watchdog_timeout/2`
+/// (mirrors the kernel's `check_rq_for_timeouts` walk over
+/// `rq->scx.runnable_list`). `late` is taken at the same trigger as
+/// the single-snapshot path: the BPF probe's
+/// `ktstr_err_exit_detected` latch flipping after a sched_ext
+/// error-class exit.
+///
+/// `early == None` when the watchdog half-way threshold never
+/// triggered before `late` fired (e.g. an immediate scheduler error
+/// in `init_task` before any task became runnable). Diffing
+/// `late` against `early` shows what BPF state changed during the
+/// stall window — the value-add over the single-snapshot dump.
+///
+/// **No user toggle — auto-repro engages this automatically.** Only
+/// the auto-repro VM emits this shape;
+/// [`crate::test_support::probe::attempt_auto_repro`] is the
+/// single call site flipping the builder's `dual_snapshot` flag,
+/// and there is no public ktstr surface for asking for it from a
+/// primary VM. Test authors don't need to know about it — when an
+/// auto-repro fires, the file at `<test>.repro.failure-dump.json`
+/// changes shape from [`FailureDumpReport`] to this wrapper.
+///
+/// Note: there is no `Default` impl. The `late` field is required
+/// by the doc invariant ("the freeze coordinator only writes a
+/// `DualFailureDumpReport` after the late snapshot has been
+/// captured"); a `Default::default()` would have produced a wrapper
+/// with an empty late report whose `maps`/`vcpu_regs` vectors
+/// silently lie about a successful capture. Construct via the
+/// struct literal with an explicit `late: FailureDumpReport`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct DualFailureDumpReport {
+    /// Wire-format discriminant. Always `"dual"` for this variant,
+    /// pinning [`SCHEMA_DUAL`]. Mirror of [`FailureDumpReport::schema`]
+    /// — consumers branch on it before deserializing.
+    #[serde(default = "default_schema_dual")]
+    pub schema: String,
+    /// Snapshot at the watchdog half-way point. `None` when the
+    /// stall fired before the half-way scanner crossed its threshold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub early: Option<FailureDumpReport>,
+    /// Snapshot at the error-exit latch trigger. Always present
+    /// (the freeze coordinator only writes a `DualFailureDumpReport`
+    /// after the late snapshot has been captured; if the run ends
+    /// with only an early snapshot the file is not written at all).
+    pub late: FailureDumpReport,
+    /// Maximum `jiffies - p->scx.runnable_at` observed by the
+    /// runnable_at scanner at the moment the early snapshot fired.
+    /// Zero when `early` is `None`.
+    ///
+    /// Diff against the kernel's `watchdog_timeout` (carried
+    /// alongside as [`Self::early_threshold_jiffies`] doubled — the
+    /// scanner trigger is half the watchdog) to see how close the
+    /// system was to the SCX_EXIT_ERROR_STALL emission line at the
+    /// early-trigger point.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub early_max_age_jiffies: u64,
+    /// The half-way trigger threshold the scanner compared against
+    /// when capturing the early snapshot, expressed in guest
+    /// jiffies. Equals `(watchdog_timeout_ms * CONFIG_HZ) / 1000 / 2`
+    /// at the moment the snapshot fired. Zero when `early` is
+    /// `None`.
+    ///
+    /// Surfaced alongside `early_max_age_jiffies` so a downstream
+    /// consumer reading the JSON does not have to recompute the
+    /// kernel-internal jiffies arithmetic to reproduce the
+    /// trigger condition.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub early_threshold_jiffies: u64,
+}
+
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
+}
+
+impl std::fmt::Display for DualFailureDumpReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Summary header: a one-line at-a-glance description so an
+        // operator scanning logs sees the shape (early present /
+        // absent, late map + vcpu_regs counts, plus the trigger
+        // metric and threshold when early fired) before paging
+        // through the full body.
+        let n_maps = self.late.maps.len();
+        let m_vcpu_regs = self.late.vcpu_regs.len();
+        if self.early.is_some() {
+            write!(
+                f,
+                "DualFailureDumpReport: early=present (max_age={}j, threshold={}j), \
+                 late=({n_maps} maps, {m_vcpu_regs} vcpu_regs)\n\n",
+                self.early_max_age_jiffies, self.early_threshold_jiffies,
+            )?;
+        } else {
+            write!(
+                f,
+                "DualFailureDumpReport: early=absent, late=({n_maps} maps, \
+                 {m_vcpu_regs} vcpu_regs)\n\n",
+            )?;
+        }
+        match &self.early {
+            Some(early) => {
+                f.write_str("early snapshot (sched_ext watchdog half-way):\n")?;
+                std::fmt::Display::fmt(early, f)?;
+                f.write_str("\n\nlate snapshot (error-exit):\n")?;
+                std::fmt::Display::fmt(&self.late, f)
+            }
+            None => {
+                f.write_str(
+                    "late snapshot (error-exit; early snapshot absent \
+                     (stall fired before half-way threshold, or runnable_at \
+                     scan setup failed)):\n",
+                )?;
+                std::fmt::Display::fmt(&self.late, f)
+            }
+        }
+    }
 }
 
 /// Rendering of one BPF map's contents.
@@ -351,6 +518,7 @@ pub fn dump_state(
 ) -> FailureDumpReport {
     let maps = accessor.maps();
     let mut report = FailureDumpReport {
+        schema: SCHEMA_SINGLE.to_string(),
         maps: Vec::with_capacity(maps.len()),
         vcpu_regs: Vec::new(),
         sdt_allocations: Vec::new(),
@@ -890,6 +1058,7 @@ mod tests {
     #[test]
     fn report_serde_roundtrip() {
         let report = FailureDumpReport {
+            schema: SCHEMA_SINGLE.to_string(),
             maps: vec![FailureDumpMap {
                 name: "scx_demo.bss".into(),
                 map_type: BPF_MAP_TYPE_ARRAY,
@@ -959,6 +1128,7 @@ mod tests {
     #[test]
     fn report_display_one_map_with_value() {
         let report = FailureDumpReport {
+            schema: SCHEMA_SINGLE.to_string(),
             maps: vec![make_simple_map()],
             vcpu_regs: Vec::new(),
             sdt_allocations: Vec::new(),
@@ -978,6 +1148,7 @@ mod tests {
     #[test]
     fn report_display_multiple_maps_separated() {
         let report = FailureDumpReport {
+            schema: SCHEMA_SINGLE.to_string(),
             maps: vec![make_simple_map(), make_simple_map()],
             vcpu_regs: Vec::new(),
             sdt_allocations: Vec::new(),
@@ -1055,6 +1226,7 @@ mod tests {
     #[test]
     fn report_display_includes_vcpu_regs_section() {
         let report = FailureDumpReport {
+            schema: SCHEMA_SINGLE.to_string(),
             maps: Vec::new(),
             vcpu_regs: vec![
                 Some(VcpuRegSnapshot {
@@ -1088,6 +1260,7 @@ mod tests {
     #[test]
     fn report_display_pairs_maps_and_vcpu_regs_with_blank_line() {
         let report = FailureDumpReport {
+            schema: SCHEMA_SINGLE.to_string(),
             maps: vec![make_simple_map()],
             vcpu_regs: vec![Some(VcpuRegSnapshot {
                 instruction_pointer: 0x1,
@@ -1107,6 +1280,7 @@ mod tests {
         // An all-empty maps Vec but populated vcpu_regs must still
         // render rather than fall through to "(empty failure dump)".
         let report = FailureDumpReport {
+            schema: SCHEMA_SINGLE.to_string(),
             maps: Vec::new(),
             vcpu_regs: vec![None],
             sdt_allocations: Vec::new(),
@@ -1130,6 +1304,7 @@ mod tests {
     #[test]
     fn report_display_partial_with_populated_regs_and_empty_maps() {
         let report = FailureDumpReport {
+            schema: SCHEMA_SINGLE.to_string(),
             maps: Vec::new(),
             vcpu_regs: vec![Some(VcpuRegSnapshot {
                 instruction_pointer: 0xdead,
@@ -1168,6 +1343,181 @@ mod tests {
         assert!(
             json.contains("\"vcpu_regs\""),
             "JSON must carry vcpu_regs key: {json}"
+        );
+    }
+
+    // -- DualFailureDumpReport serde + Display tests --
+
+    /// Roundtrip a `DualFailureDumpReport` with a populated early
+    /// snapshot and non-zero metric/threshold fields. Pins the wire
+    /// format on the dual-snapshot side: the wrapper deserialises
+    /// back with `early` present and the jiffies fields preserved.
+    #[test]
+    fn dual_report_serde_roundtrip_with_early() {
+        let early = FailureDumpReport {
+            schema: SCHEMA_SINGLE.to_string(),
+            maps: Vec::new(),
+            vcpu_regs: vec![None],
+            sdt_allocations: Vec::new(),
+        };
+        let late = FailureDumpReport {
+            schema: SCHEMA_SINGLE.to_string(),
+            maps: Vec::new(),
+            vcpu_regs: vec![None, None],
+            sdt_allocations: Vec::new(),
+        };
+        let dual = DualFailureDumpReport {
+            schema: SCHEMA_DUAL.to_string(),
+            early: Some(early),
+            late,
+            early_max_age_jiffies: 1234,
+            early_threshold_jiffies: 600,
+        };
+        let json = serde_json::to_string(&dual).unwrap();
+        let parsed: DualFailureDumpReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.schema, SCHEMA_DUAL);
+        assert!(parsed.early.is_some(), "early must roundtrip: {json}");
+        assert_eq!(parsed.early_max_age_jiffies, 1234);
+        assert_eq!(parsed.early_threshold_jiffies, 600);
+        assert_eq!(parsed.late.vcpu_regs.len(), 2);
+    }
+
+    /// Zero `early_max_age_jiffies` / `early_threshold_jiffies`
+    /// must be skipped on serialize (per the
+    /// `skip_serializing_if = is_zero_u64` attributes). Pinning
+    /// this keeps the JSON tight when the early snapshot did not
+    /// fire — a `late`-only run yields a wrapper without the
+    /// trigger-metric noise.
+    #[test]
+    fn dual_report_serde_skips_zero_jiffies_fields() {
+        let dual = DualFailureDumpReport {
+            schema: SCHEMA_DUAL.to_string(),
+            early: None,
+            late: FailureDumpReport::default(),
+            early_max_age_jiffies: 0,
+            early_threshold_jiffies: 0,
+        };
+        let json = serde_json::to_string(&dual).unwrap();
+        assert!(
+            !json.contains("early_max_age_jiffies"),
+            "zero early_max_age_jiffies must skip: {json}"
+        );
+        assert!(
+            !json.contains("early_threshold_jiffies"),
+            "zero early_threshold_jiffies must skip: {json}"
+        );
+    }
+
+    /// Non-zero jiffies fields must serialize so a downstream
+    /// consumer can recover the trigger condition without
+    /// recomputing kernel arithmetic. Mirror of the
+    /// `skips_zero_jiffies_fields` test.
+    #[test]
+    fn dual_report_serde_emits_nonzero_jiffies_fields() {
+        let dual = DualFailureDumpReport {
+            schema: SCHEMA_DUAL.to_string(),
+            early: Some(FailureDumpReport::default()),
+            late: FailureDumpReport::default(),
+            early_max_age_jiffies: 4096,
+            early_threshold_jiffies: 2048,
+        };
+        let json = serde_json::to_string(&dual).unwrap();
+        assert!(
+            json.contains("\"early_max_age_jiffies\":4096"),
+            "non-zero max_age must serialize: {json}"
+        );
+        assert!(
+            json.contains("\"early_threshold_jiffies\":2048"),
+            "non-zero threshold must serialize: {json}"
+        );
+    }
+
+    /// The `schema` field is the wire-format discriminant.
+    /// `FailureDumpReport` carries `"single"`,
+    /// `DualFailureDumpReport` carries `"dual"`, and the two
+    /// values are distinguishable so a consumer can inspect a
+    /// single field before deciding which type to deserialize
+    /// into.
+    #[test]
+    fn dual_report_schema_distinguishes_from_single() {
+        let single = FailureDumpReport::default();
+        let single_json = serde_json::to_string(&single).unwrap();
+        assert!(
+            single_json.contains(&format!("\"schema\":\"{SCHEMA_SINGLE}\"")),
+            "single carries schema='single': {single_json}"
+        );
+
+        let dual = DualFailureDumpReport {
+            schema: SCHEMA_DUAL.to_string(),
+            early: None,
+            late: FailureDumpReport::default(),
+            early_max_age_jiffies: 0,
+            early_threshold_jiffies: 0,
+        };
+        let dual_json = serde_json::to_string(&dual).unwrap();
+        assert!(
+            dual_json.contains(&format!("\"schema\":\"{SCHEMA_DUAL}\"")),
+            "dual carries schema='dual': {dual_json}"
+        );
+        // The two discriminants are distinct strings — a consumer
+        // checking the field can tell the variants apart without
+        // attempting deserialization first.
+        assert_ne!(SCHEMA_SINGLE, SCHEMA_DUAL);
+    }
+
+    /// Display output for the early=present branch carries the
+    /// summary header AND the jiffies metadata, so an operator
+    /// scanning a log can see at a glance whether the early
+    /// snapshot fired and what trigger condition produced it.
+    #[test]
+    fn dual_report_display_present_carries_jiffies() {
+        let dual = DualFailureDumpReport {
+            schema: SCHEMA_DUAL.to_string(),
+            early: Some(FailureDumpReport::default()),
+            late: FailureDumpReport::default(),
+            early_max_age_jiffies: 9001,
+            early_threshold_jiffies: 4500,
+        };
+        let s = format!("{dual}");
+        assert!(
+            s.contains("early=present"),
+            "Display must say early=present: {s}"
+        );
+        assert!(
+            s.contains("max_age=9001j"),
+            "Display must surface max_age: {s}"
+        );
+        assert!(
+            s.contains("threshold=4500j"),
+            "Display must surface threshold: {s}"
+        );
+    }
+
+    /// Display output for the early=absent branch carries the
+    /// summary header AND the documented absence-reason text
+    /// describing both possible causes (stall fired before the
+    /// half-way threshold; runnable_at scan setup failed).
+    #[test]
+    fn dual_report_display_absent_names_both_causes() {
+        let dual = DualFailureDumpReport {
+            schema: SCHEMA_DUAL.to_string(),
+            early: None,
+            late: FailureDumpReport::default(),
+            early_max_age_jiffies: 0,
+            early_threshold_jiffies: 0,
+        };
+        let s = format!("{dual}");
+        assert!(
+            s.contains("early=absent"),
+            "Display must say early=absent: {s}"
+        );
+        assert!(
+            s.contains("stall fired before half-way threshold"),
+            "Display must name the threshold-not-reached cause: {s}"
+        );
+        assert!(
+            s.contains("runnable_at scan setup failed"),
+            "Display must name the scan-setup-failure cause: {s}"
         );
     }
 }

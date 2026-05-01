@@ -1362,18 +1362,6 @@ fn classify_wait_outcome(
     }
 }
 
-/// PID of the scheduler process. Workers kill it on stall to trigger
-/// dump. `0` encodes "no scheduler configured"; the TLS keeps the
-/// sentinel (rather than `Option<i32>`) because `AtomicOption` is
-/// materially more expensive on the hot watchdog path. The
-/// scenario-side [`crate::scenario::Ctx::sched_pid`] uses
-/// `Option<pid_t>` with `None` as the unconfigured state — the two
-/// channels are deliberately split.
-static SCHED_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
-
-/// In repro mode, don't kill the scheduler on stall — keep it alive for assertions.
-static REPRO_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
 /// Handle to spawned worker processes (forked, not threads).
 /// Workers block until [`start()`](Self::start) is called.
 /// Each worker is a separate process so it can be in its own cgroup.
@@ -1954,12 +1942,11 @@ impl WorkloadHandle {
                     //
                     //    Global-state safety under unwind, scoped
                     //    to `worker_main`'s reachable code path —
-                    //    the `fork()` child's observable set. Four
-                    //    items: `STOP: AtomicBool`, `SCHED_PID:
-                    //    AtomicI32`, `REPRO_MODE: AtomicBool`, and
-                    //    `STATIC_HOST_INFO: OnceLock<_>`. None of
-                    //    them carry a Drop whose body touches the
-                    //    inherited MAP_SHARED regions or the
+                    //    the `fork()` child's observable set. Two
+                    //    items: `STOP: AtomicBool` and
+                    //    `STATIC_HOST_INFO: OnceLock<_>`. Neither
+                    //    of them carries a Drop whose body touches
+                    //    the inherited MAP_SHARED regions or the
                     //    parent-owned pipe fds. Under a
                     //    hypothetical unwind that escaped
                     //    `catch_unwind` (a double-panic that
@@ -3370,19 +3357,6 @@ fn worker_main(
                 max_gap_ns = gap;
                 max_gap_cpu = last_cpu;
                 max_gap_at_ns = now.duration_since(start).as_nanos() as u64;
-            }
-            // If stuck >2s and not in repro mode, send SIGUSR2 to the
-            // scheduler. Default POSIX disposition terminates it, which
-            // ktstr detects as a scheduler death. In repro mode, keep it
-            // alive for BPF probes.
-            if gap > 2_000_000_000 && !REPRO_MODE.load(std::sync::atomic::Ordering::Relaxed) {
-                let pid = SCHED_PID.load(std::sync::atomic::Ordering::Relaxed);
-                if pid > 0 {
-                    let _ = nix::sys::signal::kill(
-                        nix::unistd::Pid::from_raw(pid),
-                        nix::sys::signal::Signal::SIGUSR2,
-                    );
-                }
             }
             last_iter_time = now;
 

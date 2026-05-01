@@ -23,6 +23,7 @@ pub mod dump;
 pub mod guest;
 pub mod idr;
 pub mod reader;
+pub mod runnable_scan;
 pub mod sdt_alloc;
 pub mod symbols;
 
