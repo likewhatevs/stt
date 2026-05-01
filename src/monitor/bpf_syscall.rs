@@ -864,16 +864,34 @@ mod tests {
     /// `bpf_map_info` must be at least the historical minimum
     /// (the kernel rejects info_len smaller than its known floor).
     /// Modern kernels accept the full struct including map_extra.
+    ///
+    /// Verdict-routed so a multi-field uapi-shape regression
+    /// surfaces every drift in one run rather than failing on
+    /// the first mismatch.
     #[test]
     fn bpf_map_info_uapi_layout() {
-        // map_type at offset 0
-        assert_eq!(std::mem::offset_of!(BpfMapInfoUapi, map_type), 0);
-        // name at offset 24 per uapi
-        assert_eq!(std::mem::offset_of!(BpfMapInfoUapi, name), 24);
-        // map_extra is the trailing field
-        let sz = std::mem::size_of::<BpfMapInfoUapi>();
-        let map_extra_off = std::mem::offset_of!(BpfMapInfoUapi, map_extra);
-        assert_eq!(map_extra_off + 8, sz);
+        use crate::assert::Verdict;
+
+        let off_map_type = std::mem::offset_of!(BpfMapInfoUapi, map_type);
+        let off_name = std::mem::offset_of!(BpfMapInfoUapi, name);
+        let total_size = std::mem::size_of::<BpfMapInfoUapi>();
+        let off_map_extra = std::mem::offset_of!(BpfMapInfoUapi, map_extra);
+        let map_extra_tail = off_map_extra + 8;
+
+        let mut v = Verdict::new();
+        // map_type at offset 0 per uapi.
+        crate::claim!(v, off_map_type).eq(0usize);
+        // name at offset 24 per uapi.
+        crate::claim!(v, off_name).eq(24usize);
+        // map_extra is the trailing field — its offset + 8 should
+        // equal total struct size.
+        crate::claim!(v, map_extra_tail).eq(total_size);
+        let r = v.into_result();
+        assert!(
+            r.passed,
+            "bpf_map_info uapi layout drift: {:?}",
+            r.details,
+        );
     }
 
     /// Round-up arithmetic for percpu stride matches the kernel's

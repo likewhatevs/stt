@@ -840,6 +840,15 @@ impl WorkType {
     }
 
     /// Whether this work type needs a pre-fork shared memory region (MAP_SHARED mmap).
+    ///
+    /// `RtStarvation` opts in even though its body never reads or
+    /// writes the futex word: the spawn-side `(futex_ptr, pos)`
+    /// tuple is the only mechanism that hands the worker its
+    /// per-position index, which `RtStarvation` consumes to
+    /// classify itself as RT or CFS. Allocating a single 4-byte
+    /// MAP_SHARED region per group is the cheapest way to get
+    /// `pos` plumbed through worker_main without a wider dispatch
+    /// contract change.
     pub fn needs_shared_mem(&self) -> bool {
         matches!(
             self,
@@ -852,6 +861,7 @@ impl WorkType {
                 | WorkType::ProducerConsumerImbalance { .. }
                 | WorkType::AsymmetricWaker { .. }
                 | WorkType::WakeChain { .. }
+                | WorkType::RtStarvation { .. }
         )
     }
 
@@ -5129,9 +5139,114 @@ fn worker_main(
                 last_iter_time = Instant::now();
                 iterations += 1;
             }
-            WorkType::NumaWorkingSetSweep { .. } => {
-                // Stub — see batch 8.
-                spin_burst(&mut work_units, 1024);
+            WorkType::NumaWorkingSetSweep {
+                region_kb,
+                sweep_period_ms,
+                ref target_nodes,
+            } => {
+                // Per-worker anonymous region, rebound to a
+                // rotating NUMA node every `sweep_period_ms`. Each
+                // sweep:
+                //   1. mbind(MPOL_BIND, MPOL_MF_MOVE) the region to
+                //      `target_nodes[(iter + phase) % len]` so the
+                //      kernel migrates pages off the current node.
+                //   2. Touch every page (via volatile write) so
+                //      the migration triggers physical page motion
+                //      rather than lazy-reservation.
+                //   3. nanosleep(sweep_period_ms) before next bind.
+                //
+                // Empty target_nodes: no binding, just keep
+                // touching the region every iteration for the
+                // baseline. Single-node target_nodes: pin once
+                // (effectively MPOL_BIND with no rotation).
+                //
+                // Per-worker phase = tid % len so the cohort
+                // doesn't slam the same node simultaneously
+                // (matches the "phase offset" doc on the variant).
+                //
+                // Region allocated lazily on first iteration via
+                // `page_fault_region` to reuse the existing
+                // PageFaultChurn-style mmap+free idiom (the
+                // SpawnGuard does NOT clean per-worker mmaps on
+                // exit because they're post-fork; the worker
+                // lives until SIGUSR1 and then exits, releasing
+                // the mapping).
+                let region_size = match region_kb.checked_mul(1024) {
+                    Some(v) => v,
+                    None => {
+                        tracing::warn!(
+                            tid,
+                            region_kb,
+                            "NumaWorkingSetSweep region_kb * 1024 overflowed usize"
+                        );
+                        break;
+                    }
+                };
+                let (ptr, _) = match page_fault_region {
+                    Some(p) => p,
+                    None => {
+                        let ptr = unsafe {
+                            libc::mmap(
+                                std::ptr::null_mut(),
+                                region_size,
+                                libc::PROT_READ | libc::PROT_WRITE,
+                                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                                -1,
+                                0,
+                            )
+                        };
+                        if ptr == libc::MAP_FAILED {
+                            break;
+                        }
+                        page_fault_region = Some((ptr, region_size));
+                        (ptr, region_size)
+                    }
+                };
+                // Rotate target node based on iteration count.
+                if !target_nodes.is_empty() {
+                    let phase = (tid as usize) % target_nodes.len();
+                    let node_idx =
+                        ((iterations as usize).wrapping_add(phase)) % target_nodes.len();
+                    let node = target_nodes[node_idx];
+                    let (mask, maxnode) =
+                        build_nodemask(&[node].into_iter().collect::<BTreeSet<usize>>());
+                    // MPOL_MF_MOVE = 1 << 1 (include/uapi/linux/mempolicy.h).
+                    // MPOL_BIND from libc.
+                    const MPOL_MF_MOVE: libc::c_ulong = 1 << 1;
+                    let _ = unsafe {
+                        libc::syscall(
+                            libc::SYS_mbind,
+                            ptr,
+                            region_size as libc::c_ulong,
+                            libc::MPOL_BIND as libc::c_ulong,
+                            mask.as_ptr(),
+                            maxnode,
+                            MPOL_MF_MOVE,
+                        )
+                    };
+                }
+                // Touch every page so any migration kicked off
+                // by mbind actually moves a referenced page (the
+                // kernel only migrates pages the process has
+                // accessed). page_count clamped to 1 so a sub-page
+                // region is still touched.
+                let page_count = (region_size / 4096).max(1);
+                for page_idx in 0..page_count {
+                    let page_ptr = unsafe { (ptr as *mut u8).add(page_idx * 4096) };
+                    unsafe { std::ptr::write_volatile(page_ptr, 1u8) };
+                    work_units = std::hint::black_box(work_units.wrapping_add(1));
+                }
+                if sweep_period_ms > 0 && !STOP.load(Ordering::Relaxed) {
+                    let before_sleep = Instant::now();
+                    std::thread::sleep(Duration::from_millis(sweep_period_ms));
+                    reservoir_push(
+                        &mut resume_latencies_ns,
+                        &mut wake_sample_count,
+                        before_sleep.elapsed().as_nanos() as u64,
+                        MAX_WAKE_SAMPLES,
+                    );
+                }
+                last_iter_time = Instant::now();
                 iterations += 1;
             }
             WorkType::Custom { .. } => unreachable!("handled by early return"),

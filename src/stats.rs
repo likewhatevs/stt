@@ -65,11 +65,134 @@ pub struct MetricDef {
     /// this value mean worse?" while the enum answers "what
     /// direction do we want this to move?".
     pub polarity: crate::test_support::Polarity,
+    /// Temporal aggregation kind. Drives how
+    /// [`aggregate_samples`] collapses N readings of the same
+    /// metric across multiple capture samples (e.g. periodic
+    /// monitor ticks within one run, or two `cargo ktstr stats
+    /// compare` snapshot subdirectories) into one comparable
+    /// value. Distinct from [`Self::polarity`], which is the
+    /// "good direction" of the FINAL value: kind tells us HOW to
+    /// reduce a vec of samples; polarity tells us how to interpret
+    /// the reduced number.
+    ///
+    /// Default `Counter` matches the most common shape — every
+    /// kernel monotonic counter (SCX_EV_*, ttwu_count, run_delay,
+    /// cpustat[]) collapses by sum-of-deltas. Per
+    /// [`research_metric_semantics.md`](file://...) ~80% of ktstr
+    /// fields are counters; the field exists so the remaining
+    /// peaks and gauges can opt out of sum-aggregation explicitly.
+    pub kind: MetricKind,
     pub default_abs: f64,
     pub default_rel: f64,
     pub display_unit: &'static str,
     #[serde(skip)]
     pub accessor: fn(&GauntletRow) -> Option<f64>,
+}
+
+/// Temporal aggregation classification for a metric.
+///
+/// Kernel-source-grounded per the #117 metric-semantics taxonomy
+/// (see `~/.claude/projects/.../memory/research_metric_semantics.md`).
+/// Drives [`aggregate_samples`] — the function that collapses a
+/// slice of per-sample readings of the SAME metric into one
+/// representative value for downstream regression / display.
+///
+/// Reduction semantics by variant:
+///   - [`MetricKind::Counter`] — kernel monotonic counter; the
+///     temporal aggregate is the SUM of consecutive deltas across
+///     the sample window. For pre-deltaed inputs (each sample
+///     carries its own window's count) this is `samples.iter().sum()`.
+///   - [`MetricKind::Gauge`] — instantaneous value; the
+///     [`GaugeAgg`] subkind picks Avg / Last / Max.
+///   - [`MetricKind::Peak`] — kernel-side max-of-window (e.g.
+///     `max_run_delay`, `max_newidle_lb_cost`); temporal aggregate
+///     is max-of-max so a window-wise high-water never gets
+///     diluted.
+///   - [`MetricKind::Timestamp`] — wall/rq clock; the temporal
+///     aggregate is the LAST sample's value (a snapshot of "where
+///     the clock is now"). Diffing two captures gives elapsed
+///     time, but a single window's reduction picks the latest
+///     reading — averaging timestamps is meaningless.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
+pub enum MetricKind {
+    /// Monotonic counter (SCX_EV_* event counters,
+    /// `cpustat[CPUTIME_*]`, `bpf_prog_stats.cnt`, `ttwu_count`,
+    /// `nr_migrations`, …). Aggregate by sum.
+    Counter,
+    /// Instantaneous value (`nr_running`, `local_dsq.nr`, current
+    /// `policy`, current `comm`). The [`GaugeAgg`] tag picks the
+    /// reduction: Avg for typical-load, Last for "what's happening
+    /// now", Max for worst-instant.
+    Gauge(GaugeAgg),
+    /// Kernel max-of-window (`max_run_delay`,
+    /// `max_newidle_lb_cost`, the per-CPU preempt-off peak).
+    /// Aggregate by max — a peak that ever fired must survive the
+    /// reduction.
+    Peak,
+    /// Clock or wall-time reading (`rq.clock`,
+    /// CLOCK_REALTIME-stamped capture timestamps). Aggregate by
+    /// Last — averaging timestamps loses meaning.
+    Timestamp,
+}
+
+/// Sub-classification for [`MetricKind::Gauge`] picking the
+/// per-window reduction. Most ktstr gauges are Avg ("typical-load
+/// over the window"); Last fits "current state" snapshots like
+/// `comm` / `policy`; Max fits worst-instant queue-depth probes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
+pub enum GaugeAgg {
+    /// Reduce by arithmetic mean. Default for `nr_running`-style
+    /// gauges where the question is "what was the typical load".
+    Avg,
+    /// Take the latest sample. Default for `comm` / `policy` /
+    /// `cgroup_path`-style snapshots where the value is "what is
+    /// it RIGHT NOW".
+    Last,
+    /// Take the max sample. Useful when a gauge is being used to
+    /// detect a worst-case regression (e.g. queue-depth probe
+    /// where any spike is the signal of interest).
+    Max,
+}
+
+/// Reduce a slice of per-sample readings of the same metric into
+/// one representative value, dispatching on [`MetricKind`]. Used
+/// by sample-windowed comparison paths (e.g. multi-tick monitor
+/// captures, stats compare across multiple snapshot
+/// subdirectories) to collapse a sample vec into the value the
+/// existing scalar-comparison pipeline already understands.
+///
+/// Returns `None` when `samples` is empty — the caller decides
+/// whether absence is a missing-data condition or a benign
+/// "no samples in window" result. NaN samples are dropped from
+/// the reduction (same semantics as the existing percentile()
+/// helper); a final all-NaN input also returns `None`.
+///
+/// Semantics by kind:
+///   - `Counter` → sum of finite samples.
+///   - `Gauge(Avg)` → arithmetic mean of finite samples.
+///   - `Gauge(Last)` → last finite sample.
+///   - `Gauge(Max)` → max of finite samples.
+///   - `Peak` → max of finite samples.
+///   - `Timestamp` → last finite sample.
+pub fn aggregate_samples(samples: &[f64], kind: MetricKind) -> Option<f64> {
+    let finite: Vec<f64> = samples.iter().copied().filter(|x| x.is_finite()).collect();
+    if finite.is_empty() {
+        return None;
+    }
+    Some(match kind {
+        MetricKind::Counter => finite.iter().sum(),
+        MetricKind::Gauge(GaugeAgg::Avg) => {
+            finite.iter().sum::<f64>() / (finite.len() as f64)
+        }
+        MetricKind::Gauge(GaugeAgg::Last) | MetricKind::Timestamp => {
+            *finite.last().expect("non-empty by check above")
+        }
+        MetricKind::Gauge(GaugeAgg::Max) | MetricKind::Peak => {
+            finite.iter().copied().fold(f64::NEG_INFINITY, f64::max)
+        }
+    })
 }
 
 impl MetricDef {
@@ -172,6 +295,7 @@ pub static METRICS: &[MetricDef] = &[
         // match this string by value).
         name: "worst_spread",
         polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::Gauge(GaugeAgg::Last),
         default_abs: 5.0,
         default_rel: 0.25,
         display_unit: "%",
@@ -180,6 +304,7 @@ pub static METRICS: &[MetricDef] = &[
     MetricDef {
         name: "worst_gap_ms",
         polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::Peak,
         default_abs: 500.0,
         default_rel: 0.50,
         display_unit: "ms",
@@ -188,6 +313,7 @@ pub static METRICS: &[MetricDef] = &[
     MetricDef {
         name: "total_migrations",
         polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::Counter,
         default_abs: 10.0,
         default_rel: 0.30,
         display_unit: "",
@@ -196,6 +322,7 @@ pub static METRICS: &[MetricDef] = &[
     MetricDef {
         name: "worst_migration_ratio",
         polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::Gauge(GaugeAgg::Last),
         default_abs: 0.05,
         default_rel: 0.20,
         display_unit: "",
@@ -204,6 +331,7 @@ pub static METRICS: &[MetricDef] = &[
     MetricDef {
         name: "max_imbalance_ratio",
         polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::Peak,
         default_abs: 1.0,
         default_rel: 0.25,
         display_unit: "x",
@@ -212,6 +340,7 @@ pub static METRICS: &[MetricDef] = &[
     MetricDef {
         name: "max_dsq_depth",
         polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::Peak,
         default_abs: 10.0,
         default_rel: 0.50,
         display_unit: "",
@@ -220,6 +349,7 @@ pub static METRICS: &[MetricDef] = &[
     MetricDef {
         name: "stall_count",
         polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::Counter,
         default_abs: 1.0,
         default_rel: 0.50,
         display_unit: "",
@@ -228,6 +358,7 @@ pub static METRICS: &[MetricDef] = &[
     MetricDef {
         name: "total_fallback",
         polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::Counter,
         default_abs: 5.0,
         default_rel: 0.30,
         // Integer event count, not a rate — the source field on
@@ -241,6 +372,7 @@ pub static METRICS: &[MetricDef] = &[
     MetricDef {
         name: "total_keep_last",
         polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::Counter,
         default_abs: 5.0,
         default_rel: 0.30,
         // Integer event count, not a rate — see `total_fallback`
@@ -252,6 +384,7 @@ pub static METRICS: &[MetricDef] = &[
     MetricDef {
         name: "worst_p99_wake_latency_us",
         polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::Gauge(GaugeAgg::Last),
         default_abs: 50.0,
         default_rel: 0.25,
         display_unit: "\u{00b5}s",
@@ -260,6 +393,7 @@ pub static METRICS: &[MetricDef] = &[
     MetricDef {
         name: "worst_median_wake_latency_us",
         polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::Gauge(GaugeAgg::Last),
         default_abs: 20.0,
         default_rel: 0.25,
         display_unit: "\u{00b5}s",
@@ -268,6 +402,7 @@ pub static METRICS: &[MetricDef] = &[
     MetricDef {
         name: "worst_wake_latency_cv",
         polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::Gauge(GaugeAgg::Last),
         default_abs: 0.10,
         default_rel: 0.25,
         display_unit: "",
@@ -276,6 +411,7 @@ pub static METRICS: &[MetricDef] = &[
     MetricDef {
         name: "total_iterations",
         polarity: crate::test_support::Polarity::HigherBetter,
+        kind: MetricKind::Counter,
         default_abs: 100.0,
         default_rel: 0.10,
         display_unit: "",
@@ -284,6 +420,7 @@ pub static METRICS: &[MetricDef] = &[
     MetricDef {
         name: "worst_mean_run_delay_us",
         polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::Gauge(GaugeAgg::Last),
         default_abs: 50.0,
         default_rel: 0.25,
         display_unit: "\u{00b5}s",
@@ -292,6 +429,7 @@ pub static METRICS: &[MetricDef] = &[
     MetricDef {
         name: "worst_run_delay_us",
         polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::Peak,
         default_abs: 100.0,
         default_rel: 0.50,
         display_unit: "\u{00b5}s",
@@ -321,6 +459,7 @@ pub static METRICS: &[MetricDef] = &[
         // for the threshold-value rationale.
         name: "worst_wake_latency_tail_ratio",
         polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::Gauge(GaugeAgg::Last),
         default_abs: 0.5,
         default_rel: 0.25,
         display_unit: "x",
@@ -359,6 +498,7 @@ pub static METRICS: &[MetricDef] = &[
         // where rel-only would let single-digit losses slip through.
         name: "worst_iterations_per_worker",
         polarity: crate::test_support::Polarity::HigherBetter,
+        kind: MetricKind::Gauge(GaugeAgg::Last),
         default_abs: 10.0,
         default_rel: 0.10,
         display_unit: "",
@@ -367,6 +507,7 @@ pub static METRICS: &[MetricDef] = &[
     MetricDef {
         name: "worst_page_locality",
         polarity: crate::test_support::Polarity::HigherBetter,
+        kind: MetricKind::Gauge(GaugeAgg::Last),
         default_abs: 0.05,
         default_rel: 0.10,
         display_unit: "",
@@ -375,6 +516,7 @@ pub static METRICS: &[MetricDef] = &[
     MetricDef {
         name: "worst_cross_node_migration_ratio",
         polarity: crate::test_support::Polarity::LowerBetter,
+        kind: MetricKind::Gauge(GaugeAgg::Last),
         default_abs: 0.05,
         default_rel: 0.20,
         display_unit: "",
@@ -3778,6 +3920,100 @@ pub(crate) fn format_host_delta(
 mod tests {
     use super::*;
     use crate::assert::ScenarioStats;
+
+    // -- MetricKind temporal aggregation (#118) ---------------------
+
+    /// `Counter` reduces by sum-of-finite-samples. NaN drops, empty
+    /// returns None.
+    #[test]
+    fn aggregate_samples_counter_sums_finite_values() {
+        assert_eq!(
+            aggregate_samples(&[1.0, 2.0, 3.0], MetricKind::Counter),
+            Some(6.0),
+        );
+        assert_eq!(
+            aggregate_samples(&[1.0, f64::NAN, 3.0], MetricKind::Counter),
+            Some(4.0),
+            "NaN samples drop from the sum",
+        );
+        assert_eq!(
+            aggregate_samples(&[], MetricKind::Counter),
+            None,
+            "empty input → None",
+        );
+        assert_eq!(
+            aggregate_samples(&[f64::NAN, f64::INFINITY], MetricKind::Counter),
+            None,
+            "all-non-finite → None",
+        );
+    }
+
+    /// `Gauge(Avg)` reduces by arithmetic mean.
+    #[test]
+    fn aggregate_samples_gauge_avg_means_finite() {
+        let r = aggregate_samples(&[1.0, 2.0, 3.0], MetricKind::Gauge(GaugeAgg::Avg));
+        assert_eq!(r, Some(2.0));
+    }
+
+    /// `Gauge(Last)` returns the last finite sample.
+    #[test]
+    fn aggregate_samples_gauge_last_returns_last() {
+        let r = aggregate_samples(&[1.0, 2.0, 3.0], MetricKind::Gauge(GaugeAgg::Last));
+        assert_eq!(r, Some(3.0));
+        // NaN at the tail still drops; Last picks the last FINITE.
+        let r = aggregate_samples(&[1.0, 2.0, f64::NAN], MetricKind::Gauge(GaugeAgg::Last));
+        assert_eq!(r, Some(2.0));
+    }
+
+    /// `Gauge(Max)` and `Peak` both reduce by max.
+    #[test]
+    fn aggregate_samples_max_and_peak_pick_largest() {
+        let r = aggregate_samples(&[1.0, 5.0, 3.0], MetricKind::Gauge(GaugeAgg::Max));
+        assert_eq!(r, Some(5.0));
+        let r = aggregate_samples(&[1.0, 5.0, 3.0], MetricKind::Peak);
+        assert_eq!(r, Some(5.0));
+    }
+
+    /// `Timestamp` returns the last sample (latest snapshot).
+    #[test]
+    fn aggregate_samples_timestamp_returns_last() {
+        let r = aggregate_samples(&[100.0, 200.0, 300.0], MetricKind::Timestamp);
+        assert_eq!(r, Some(300.0));
+    }
+
+    /// Every entry in the `METRICS` registry must have a kind set.
+    /// Pinned via the registry walk so a future entry that forgot
+    /// to specify `kind` fails to compile (struct-literal
+    /// non_exhaustive forces it), and a registry entry whose kind
+    /// is `Counter` matches one of the well-known total/stall_count
+    /// names — drift either direction trips here.
+    #[test]
+    fn every_metric_has_kind_consistent_with_naming() {
+        for m in METRICS {
+            // Counter metrics must be named with `total_` / `_count` /
+            // `total_iterations` / `stall_count` per the established
+            // convention.
+            if matches!(m.kind, MetricKind::Counter) {
+                assert!(
+                    m.name.starts_with("total_") || m.name.ends_with("_count"),
+                    "Counter-kind metric must follow total_*/*_count naming, got {:?}",
+                    m.name,
+                );
+            }
+            // Peak metrics must be named with `max_` or be one of
+            // the documented worst-case high-water entries
+            // (`worst_gap_ms`, `worst_run_delay_us`).
+            if matches!(m.kind, MetricKind::Peak) {
+                assert!(
+                    m.name.starts_with("max_")
+                        || m.name == "worst_gap_ms"
+                        || m.name == "worst_run_delay_us",
+                    "Peak-kind metric must use max_* naming OR be a documented worst-* peak, got {:?}",
+                    m.name,
+                );
+            }
+        }
+    }
 
     #[test]
     fn col_mean_std_basic() {

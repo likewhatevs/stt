@@ -415,18 +415,40 @@ mod tests {
     /// `TimelineEventRaw` matches the BPF-side struct timeline_event
     /// in size and field offsets. Drift here is a wire-protocol
     /// break; the test catches it at compile + run time.
+    ///
+    /// Verdict-routed so a multi-field layout regression (e.g.
+    /// somebody re-orders the struct) surfaces every drift in one
+    /// run rather than failing on the first mismatch.
     #[test]
     fn timeline_event_layout_pinned() {
-        // Total size: 4 + 4 + 8 + 4 + 4 + 8 + 8 = 40 bytes.
-        assert_eq!(std::mem::size_of::<TimelineEventRaw>(), 40);
-        // Field offsets, matching src/bpf/intf.h::struct timeline_event.
-        assert_eq!(std::mem::offset_of!(TimelineEventRaw, type_), 0);
-        assert_eq!(std::mem::offset_of!(TimelineEventRaw, cpu), 4);
-        assert_eq!(std::mem::offset_of!(TimelineEventRaw, ts), 8);
-        assert_eq!(std::mem::offset_of!(TimelineEventRaw, prev_pid), 16);
-        assert_eq!(std::mem::offset_of!(TimelineEventRaw, next_pid), 20);
-        assert_eq!(std::mem::offset_of!(TimelineEventRaw, a), 24);
-        assert_eq!(std::mem::offset_of!(TimelineEventRaw, b), 32);
+        use crate::assert::Verdict;
+
+        let total_size = std::mem::size_of::<TimelineEventRaw>();
+        let off_type = std::mem::offset_of!(TimelineEventRaw, type_);
+        let off_cpu = std::mem::offset_of!(TimelineEventRaw, cpu);
+        let off_ts = std::mem::offset_of!(TimelineEventRaw, ts);
+        let off_prev_pid = std::mem::offset_of!(TimelineEventRaw, prev_pid);
+        let off_next_pid = std::mem::offset_of!(TimelineEventRaw, next_pid);
+        let off_a = std::mem::offset_of!(TimelineEventRaw, a);
+        let off_b = std::mem::offset_of!(TimelineEventRaw, b);
+
+        let mut v = Verdict::new();
+        // Total: 4 + 4 + 8 + 4 + 4 + 8 + 8 = 40 bytes.
+        crate::claim!(v, total_size).eq(40usize);
+        // Field offsets matching src/bpf/intf.h::struct timeline_event.
+        crate::claim!(v, off_type).eq(0usize);
+        crate::claim!(v, off_cpu).eq(4usize);
+        crate::claim!(v, off_ts).eq(8usize);
+        crate::claim!(v, off_prev_pid).eq(16usize);
+        crate::claim!(v, off_next_pid).eq(20usize);
+        crate::claim!(v, off_a).eq(24usize);
+        crate::claim!(v, off_b).eq(32usize);
+        let r = v.into_result();
+        assert!(
+            r.passed,
+            "timeline_event layout drift detected: {:?}",
+            r.details,
+        );
     }
 
     fn raw(type_: u32, cpu: u32, ts: u64, p: u32, n: u32, a: u64, b: u64) -> Vec<u8> {
@@ -450,9 +472,12 @@ mod tests {
     }
 
     /// Switch record decodes with prev/next pids + prev_state +
-    /// preempt bool.
+    /// preempt bool. Verdict-routed so every field surfaces its own
+    /// labeled detail on regression.
     #[test]
     fn parse_switch_record() {
+        use crate::assert::Verdict;
+
         let bytes = raw(tl_evt::SWITCH, 3, 1_000_000, 100, 200, 0x402, 1);
         let ev = parse_timeline_record(&bytes).unwrap();
         match ev {
@@ -464,12 +489,19 @@ mod tests {
                 prev_state,
                 preempt,
             } => {
-                assert_eq!(ts, 1_000_000);
-                assert_eq!(cpu, 3);
-                assert_eq!(prev_pid, 100);
-                assert_eq!(next_pid, 200);
-                assert_eq!(prev_state, 0x402);
-                assert!(preempt);
+                let mut v = Verdict::new();
+                crate::claim!(v, ts).eq(1_000_000u64);
+                crate::claim!(v, cpu).eq(3u32);
+                crate::claim!(v, prev_pid).eq(100u32);
+                crate::claim!(v, next_pid).eq(200u32);
+                crate::claim!(v, prev_state).eq(0x402u64);
+                crate::claim!(v, preempt).eq(true);
+                let r = v.into_result();
+                assert!(
+                    r.passed,
+                    "Switch record decode drift: {:?}",
+                    r.details,
+                );
             }
             other => panic!("expected Switch, got {other:?}"),
         }

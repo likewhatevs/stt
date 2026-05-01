@@ -441,8 +441,13 @@ mod tests {
 
     /// The canonical anchor line + a follow-on stack trace produces
     /// one event with the right scheduler name + extracted frames.
+    /// Verdict-routed so a multi-field parser regression (anchor
+    /// shape change, classifier rename, stack extractor regression)
+    /// surfaces every drift in one run.
     #[test]
     fn parse_kmsg_window_simple_error() {
+        use crate::assert::Verdict;
+
         let text = "\
 [12345.678] sched_ext: BPF scheduler \"scx_test\" disabled (BPF runtime error)
 [12345.679] scx_test: aborting due to BPF runtime error
@@ -452,13 +457,29 @@ mod tests {
 [12345.683]  ? scx_error+0x30/0x80
 ";
         let events = parse_kmsg_window(text);
-        assert_eq!(events.len(), 1);
+        let event_count = events.len();
+        assert_eq!(event_count, 1, "expected exactly one event");
         let ev = &events[0];
-        assert_eq!(ev.scheduler_name, "scx_test");
-        assert_eq!(ev.kind, ScxExitKind::Error);
-        assert!(ev.message.contains("BPF runtime error"));
-        assert_eq!(ev.stack.len(), 3);
-        assert_eq!(ev.stack[0].name, "scx_disable_workfn");
+        let scheduler_name = ev.scheduler_name.clone();
+        // ScxExitKind doesn't Display; match-against-shape and claim
+        // on the resulting bool so the verdict carries a labeled detail.
+        let kind_is_error = matches!(ev.kind, ScxExitKind::Error);
+        let message_has_runtime_error = ev.message.contains("BPF runtime error");
+        let stack_len = ev.stack.len();
+        let first_frame_name = ev.stack[0].name.clone();
+
+        let mut v = Verdict::new();
+        crate::claim!(v, scheduler_name).eq("scx_test".to_string());
+        crate::claim!(v, kind_is_error).eq(true);
+        crate::claim!(v, message_has_runtime_error).eq(true);
+        crate::claim!(v, stack_len).eq(3usize);
+        crate::claim!(v, first_frame_name).eq("scx_disable_workfn".to_string());
+        let r = v.into_result();
+        assert!(
+            r.passed,
+            "kmsg parse drift on canonical error event: {:?}",
+            r.details,
+        );
     }
 
     /// Watchdog / stall classification fires when the message

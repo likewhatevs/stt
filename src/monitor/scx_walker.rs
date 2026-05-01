@@ -872,8 +872,15 @@ mod tests {
         assert!(json.contains("\"nr_running\":4"));
     }
 
+    /// Roundtrip every populated field — Verdict-routed so a single
+    /// regression in any field surfaces with its own labeled detail
+    /// rather than a cliff-edge `assert_eq!` panic that hides the
+    /// other field outcomes. Better signal when multiple serde
+    /// renames land at once.
     #[test]
     fn rq_scx_state_serde_roundtrip_populated() {
+        use crate::assert::Verdict;
+
         let s = RqScxState {
             cpu: 1,
             nr_running: 2,
@@ -890,11 +897,44 @@ mod tests {
         };
         let json = serde_json::to_string(&s).unwrap();
         let parsed: RqScxState = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.cpu, 1);
-        assert_eq!(parsed.runnable_task_kvas.len(), 2);
-        assert_eq!(parsed.curr_pid, Some(1234));
-        assert!(parsed.runnable_truncated);
-        assert!(parsed.cpu_released);
+
+        let parsed_cpu = parsed.cpu;
+        let parsed_nr_running = parsed.nr_running;
+        let parsed_flags = parsed.flags;
+        let parsed_cpu_released = parsed.cpu_released;
+        let parsed_ops_qseq = parsed.ops_qseq;
+        let parsed_kick_sync = parsed.kick_sync;
+        let parsed_nr_immed = parsed.nr_immed;
+        let parsed_rq_clock = parsed.rq_clock;
+        let parsed_curr_pid = parsed.curr_pid;
+        let parsed_curr_comm = parsed.curr_comm.clone();
+        let parsed_runnable_kvas_len = parsed.runnable_task_kvas.len();
+        let parsed_runnable_truncated = parsed.runnable_truncated;
+
+        let mut v = Verdict::new();
+        crate::claim!(v, parsed_cpu).eq(1u32);
+        crate::claim!(v, parsed_nr_running).eq(2u32);
+        crate::claim!(v, parsed_flags).eq(0x1u32);
+        crate::claim!(v, parsed_cpu_released).eq(true);
+        crate::claim!(v, parsed_ops_qseq).eq(42u64);
+        crate::claim!(v, parsed_kick_sync).eq(17u64);
+        crate::claim!(v, parsed_nr_immed).eq(1u32);
+        crate::claim!(v, parsed_rq_clock).eq(999_999u64);
+        // Option<T> doesn't impl Display, so claim on the unwrapped
+        // values via match-against-known-shape: bake the expected
+        // outcome ("present + value matches") into a single bool.
+        let curr_pid_match = parsed_curr_pid == Some(1234);
+        let curr_comm_match = parsed_curr_comm.as_deref() == Some("ktstr");
+        crate::claim!(v, curr_pid_match).eq(true);
+        crate::claim!(v, curr_comm_match).eq(true);
+        crate::claim!(v, parsed_runnable_kvas_len).eq(2usize);
+        crate::claim!(v, parsed_runnable_truncated).eq(true);
+        let r = v.into_result();
+        assert!(
+            r.passed,
+            "rq_scx_state roundtrip claims must all pass: {:?}",
+            r.details,
+        );
     }
 
     #[test]
@@ -936,8 +976,12 @@ mod tests {
         assert_eq!(s.exit_kind, 0);
     }
 
+    /// Roundtrip every scalar field — Verdict-routed so a serde
+    /// rename on one field doesn't mask the other two.
     #[test]
     fn scx_sched_state_serde_roundtrip() {
+        use crate::assert::Verdict;
+
         let s = ScxSchedState {
             aborting: true,
             bypass_depth: 2,
@@ -946,9 +990,21 @@ mod tests {
         };
         let json = serde_json::to_string(&s).unwrap();
         let parsed: ScxSchedState = serde_json::from_str(&json).unwrap();
-        assert!(parsed.aborting);
-        assert_eq!(parsed.bypass_depth, 2);
-        assert_eq!(parsed.exit_kind, 1027);
+
+        let parsed_aborting = parsed.aborting;
+        let parsed_bypass_depth = parsed.bypass_depth;
+        let parsed_exit_kind = parsed.exit_kind;
+
+        let mut v = Verdict::new();
+        crate::claim!(v, parsed_aborting).eq(true);
+        crate::claim!(v, parsed_bypass_depth).eq(2i32);
+        crate::claim!(v, parsed_exit_kind).eq(1027u32);
+        let r = v.into_result();
+        assert!(
+            r.passed,
+            "scx_sched_state roundtrip claims must all pass: {:?}",
+            r.details,
+        );
     }
 
     /// Walk a hand-built list with two task entries — verifies
