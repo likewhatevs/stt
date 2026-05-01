@@ -523,10 +523,18 @@ fn publish_completion(
     if mem.write_slice(&[status_byte], status_addr).is_err() {
         // Status-byte write failed — the chain stays in the avail
         // ring and blk-mq's 30s timeout fires on the guest side.
-        // Callers ALWAYS bump io_errors at the request-level error
-        // site before calling here; bumping again would
-        // double-count. add_used failure (below) is a separate
-        // class — own that count locally.
+        // Bump io_errors so the host operator sees a counter for
+        // every silent-stall event. Error-site callers also bump
+        // io_errors before reaching here; the double-count is
+        // intentional under hostile-guest scenarios — a guest
+        // constructing chains with systematically unmapped
+        // status_addr will double-count every request, but the
+        // silent-stall it prevents on the success path is the
+        // worse failure mode. Silent-swallow on the success path
+        // (FLUSH or T_IN/T_OUT/T_GET_ID succeeded but the status
+        // descriptor itself is unmapped) would otherwise produce
+        // a 30s blk-mq timeout with no host-side counter.
+        counters.record_io_error();
         return false;
     }
     match q.add_used(mem, head, used_len) {
@@ -594,9 +602,13 @@ impl VirtioBlkCounters {
         self.flushes_completed.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Record one IO error. Used for spec violations, backend IO
-    /// errors, malformed chains, and add_used failures — every
-    /// path that reports `VIRTIO_BLK_S_IOERR` to the guest.
+    /// Bumped on every host-observed IO failure, whether the guest
+    /// saw S_IOERR or not (e.g. unmapped status-byte address that
+    /// prevented the status write). Covers spec violations, backend
+    /// IO errors, malformed chains, add_used failures, and
+    /// status-write failures where the chain stays in the avail
+    /// ring (no S_IOERR ever reaches the guest, but the host still
+    /// counts the silent-stall event).
     fn record_io_error(&self) {
         self.io_errors.fetch_add(1, Ordering::Relaxed);
     }
@@ -816,10 +828,14 @@ impl VirtioBlk {
         //   suppression on bursty IO (multi-chain queue drains)
         //   reduces vCPU exits proportional to the burst size and
         //   is required for high-throughput virtio-blk under
-        //   blk-mq. Wire-up is split: this advertises the bit and
-        //   set_status enables event-idx tracking on the queue when
-        //   FEATURES_OK negotiates it; the needs_notification
-        //   consumption at the signal_used call site is a follow-up.
+        //   blk-mq. Wire-up: this advertises the bit, set_status
+        //   enables event-idx tracking on the queue when FEATURES_OK
+        //   negotiates it, and process_requests consults
+        //   `Queue::needs_notification` after each drain to decide
+        //   whether to fire the irqfd. The V8 split: process_requests
+        //   sets VIRTIO_MMIO_INT_VRING unconditionally on any chain
+        //   publish, then consults needs_notification to decide
+        //   whether to also fire the irqfd.
         let mut feats = (1u64 << VIRTIO_F_VERSION_1)
             | (1u64 << VIRTIO_BLK_F_BLK_SIZE)
             | (1u64 << VIRTIO_BLK_F_SEG_MAX)
@@ -835,11 +851,6 @@ impl VirtioBlk {
     fn selected_queue(&self) -> Option<usize> {
         let idx = self.queue_select as usize;
         if idx < NUM_QUEUES { Some(idx) } else { None }
-    }
-
-    fn signal_used(&mut self) {
-        self.interrupt_status |= VIRTIO_MMIO_INT_VRING;
-        let _ = self.irq_evt.write(1);
     }
 
     fn queue_config_allowed(&self) -> bool {
@@ -951,10 +962,44 @@ impl VirtioBlk {
         // `&mut self.ops_bucket`/`&mut self.bytes_bucket`). To keep
         // the borrow checker happy we materialise the queue handle
         // separately and reach into `&mut self` only via the
-        // disjoint-fields it owns. The `signal_used()` write to
-        // `self.interrupt_status` is hoisted to the end so it does
-        // not aliase with the queue mutation in the loop.
+        // disjoint-fields it owns. The eventfd write that signals
+        // the guest is hoisted to the end so it does not alias with
+        // the queue mutation in the loop.
         let mut signal_needed = false;
+        // Outer bracket: disable_notification → drain → enable_notification.
+        // Canonical virtio-queue pattern — the doctest on the
+        // `Queue` struct in the virtio-queue crate spells out the
+        // disable/drain/enable shape this loop mirrors.
+        // `Queue::enable_notification` returns Ok(true) when new
+        // chain heads appeared during the disabled window — re-drain
+        // to avoid stranding chains the guest has enqueued without
+        // a fresh QUEUE_NOTIFY MMIO exit. Its trait-level contract
+        // on `QueueT::enable_notification` documents the
+        // re-iteration semantics. Without re-checking, a chain
+        // enqueued after our final `pop_descriptor_chain` returns
+        // None but before notifications come back on would sit
+        // unprocessed until the guest's blk-mq 30s timeout fired.
+        //
+        // `Queue::disable_notification` semantics depend on whether
+        // EVENT_IDX is negotiated (see `Queue::set_notification`,
+        // which `disable_notification` and `enable_notification`
+        // both delegate to):
+        //   * legacy path (event_idx_enabled=false): writes the
+        //     VRING_USED_F_NO_NOTIFY flag in used.flags, telling
+        //     the guest to skip QUEUE_NOTIFY MMIO writes during
+        //     the drain — removes redundant vCPU exits.
+        //   * EVENT_IDX path (event_idx_enabled=true): no-op (the
+        //     used_event-based one-shot suppression took effect
+        //     when the prior `needs_notification` returned true).
+        // Either way, the bracket pattern is correct; both paths
+        // route through the canonical disable/enable.
+        'outer: loop {
+            // Best-effort disable; failure is non-fatal — the worst
+            // case is the guest issues a redundant QUEUE_NOTIFY
+            // mid-drain that we'd absorb on the next call anyway.
+            if let Err(e) = self.queues[REQ_QUEUE].disable_notification(mem) {
+                tracing::warn!(%e, "virtio-blk disable_notification failed");
+            }
         loop {
             let q = &mut self.queues[REQ_QUEUE];
             let Some(chain) = q.pop_descriptor_chain(mem) else {
@@ -1524,8 +1569,64 @@ impl VirtioBlk {
                 signal_needed = true;
             }
         }
+            // Inner drain ran to None. Re-arm notifications and
+            // check whether new chains arrived during the disabled
+            // window. `enable_notification` returns Ok(true) when
+            // `avail_idx != next_avail` after re-enabling — those
+            // chains MUST be processed before exiting or they'll
+            // be stranded (V3: honour the return value).
+            match self.queues[REQ_QUEUE].enable_notification(mem) {
+                Ok(true) => continue 'outer,
+                Ok(false) => break 'outer,
+                Err(e) => {
+                    // A persistent enable failure (e.g. used-ring
+                    // GPA unmapped) would otherwise spin the outer
+                    // loop forever. Bail to avoid a livelock; on
+                    // the next QUEUE_NOTIFY the guest may have
+                    // recovered guest memory layout.
+                    tracing::warn!(%e, "virtio-blk enable_notification failed");
+                    break 'outer;
+                }
+            }
+        }
         if signal_needed {
-            self.signal_used();
+            // V8: always set the interrupt_status MMIO bit when
+            // anything was published. The bit is the guest-visible
+            // "there's pending work in the used ring" indicator,
+            // independent of the irqfd delivery decision. Holding
+            // the bit set across a suppressed eventfd is harmless:
+            // the next genuine IRQ delivers and the guest's ISR
+            // reads-then-clears via VIRTIO_MMIO_INTERRUPT_ACK.
+            self.interrupt_status |= VIRTIO_MMIO_INT_VRING;
+            // `Queue::needs_notification` consults the guest's
+            // `used_event` threshold (from the avail ring) when
+            // EVENT_IDX is negotiated — returns false if the guest
+            // hasn't asked to be woken yet, true otherwise. In the
+            // legacy path (event_idx_enabled=false) it always
+            // returns Ok(true) (the trailing `Ok(true)` arm of
+            // `Queue::needs_notification`), so the eventfd fires
+            // every time as before.
+            //
+            // V6: only call `needs_notification` on the
+            // signal_needed=true path. The method has side effects
+            // (resets `num_added`, remembers position — see the
+            // doc comment on `QueueT::needs_notification`) so
+            // calling it speculatively would corrupt the
+            // suppression state.
+            //
+            // unwrap_or(true): on guest-memory errors reading the
+            // `used_event` field, fail-safe to firing the IRQ. A
+            // missed IRQ stalls the guest until blk-mq's 30s
+            // timeout; a redundant IRQ wastes a vCPU exit.
+            let q = &mut self.queues[REQ_QUEUE];
+            if q.needs_notification(mem)
+                .inspect_err(|e| {
+                    tracing::warn!(%e, "needs_notification failed; firing IRQ as fail-safe")
+                })
+                .unwrap_or(true)
+            {
+                let _ = self.irq_evt.write(1);
+            }
         }
     }
 
@@ -2140,10 +2241,9 @@ impl VirtioBlk {
             // event-idx tracking on the request queue so
             // `Queue::needs_notification` consults the guest's
             // `used_event` threshold instead of always returning
-            // true. `Queue::event_idx_enabled()` is documented to
-            // return the correct value only after FEATURES_OK
-            // (virtio-queue lib.rs lines 254-258), so this is the
-            // earliest legal moment to flip it on.
+            // true. `QueueT::event_idx_enabled` is documented to
+            // return the correct value only after FEATURES_OK, so
+            // this is the earliest legal moment to flip it on.
             if new_bits == VIRTIO_CONFIG_S_FEATURES_OK
                 && self.driver_features & (1u64 << VIRTIO_RING_F_EVENT_IDX) != 0
             {
@@ -2757,22 +2857,6 @@ mod tests {
         assert_eq!(read_reg(&dev, VIRTIO_MMIO_QUEUE_READY), 0);
     }
 
-    /// `signal_used` sets the `VIRTIO_MMIO_INT_VRING` bit on
-    /// `interrupt_status` AND writes to the `irq_evt` eventfd so the
-    /// KVM irqfd path delivers the IRQ. Without both, the guest
-    /// either never sees the IRQ (eventfd not written) or sees an
-    /// IRQ without context (status bit not set). Mirrors
-    /// `virtio_console::signal_used_sets_interrupt_and_writes_eventfd`.
-    #[test]
-    fn signal_used_sets_interrupt_and_writes_eventfd() {
-        let mut dev = make_device(VIRTIO_BLK_DEFAULT_CAPACITY_BYTES, DiskThrottle::default());
-        assert_eq!(dev.interrupt_status, 0);
-        dev.signal_used();
-        assert_ne!(dev.interrupt_status & VIRTIO_MMIO_INT_VRING, 0);
-        let val = dev.irq_evt.read().unwrap();
-        assert!(val > 0);
-    }
-
     /// `DEVICE_FEATURES_SEL` page 2 returns 0. Only pages 0
     /// and 1 are defined (low / high 32 bits of the 64-bit feature
     /// set); higher pages must read 0 per virtio-v1.2's
@@ -2932,9 +3016,12 @@ mod tests {
         let cap = 4096u64;
         let f = make_backed_file_with_pattern(cap, 0x00);
         let dev = VirtioBlk::new(f, cap, DiskThrottle::default());
-        let mem = make_guest_mem(8192);
-        let data_addr = GuestAddress(0x2000);
-        let status_addr = GuestAddress(0x2FFF);
+        // 16 KiB guest mem to hold both data buffer (sized 512) and
+        // status byte addr without overlap. data at 0x1000, status
+        // at 0x2000, both well within [0, 0x4000).
+        let mem = make_guest_mem(16384);
+        let data_addr = GuestAddress(0x1000);
+        let status_addr = GuestAddress(0x2000);
         let segs = vec![ChainDescriptor { addr: data_addr, len: 512, is_write_only: false }];
         let (status, _) = dev.handle_write(&mem, 9, &segs, status_addr);
         assert_eq!(status, VIRTIO_BLK_S_IOERR as u8);
@@ -3327,6 +3414,105 @@ mod tests {
              (got {:#x}) — feature negotiation likely regressed",
             dev.device_status,
         );
+    }
+
+    /// Same as `wire_device_to_mock` but additionally negotiates
+    /// VIRTIO_RING_F_EVENT_IDX (bit 29 in the low feature half) and
+    /// places the used ring at a separate GPA (`used_override_addr`)
+    /// far from the avail ring's `used_event` field. After this
+    /// call, `process_requests` consults the avail ring's
+    /// `used_event` field via `Queue::needs_notification` and may
+    /// suppress the irqfd write — the rest of the suite uses
+    /// `wire_device_to_mock` (legacy path) where every drain
+    /// unconditionally fires.
+    ///
+    /// `queue_size` is load-bearing for EVENT_IDX correctness:
+    /// `Queue::used_event` (the private helper that the public
+    /// `Queue::needs_notification` delegates to) computes the
+    /// avail-ring field offset as `VIRTQ_AVAIL_RING_HEADER_SIZE
+    /// + size * VIRTQ_AVAIL_ELEMENT_SIZE = 4 + size * 2`. The
+    /// device's negotiated queue size must match the mock's queue
+    /// size or the device reads `used_event` from the wrong GPA.
+    /// Existing legacy-path tests don't care because
+    /// `needs_notification` returns Ok(true) without consulting
+    /// `used_event` when `event_idx_enabled=false`.
+    ///
+    /// `used_override_addr`: where the device should place the
+    /// used ring. The MockSplitQueue's default used ring address
+    /// overlaps the avail ring's `used_event` field (the mock
+    /// computes `used_addr = avail.end().align_up(4)` where
+    /// `avail.end()` does NOT include the trailing used_event
+    /// field — so add_used writes clobber the planted threshold).
+    /// Pass an address well above the avail ring's footprint
+    /// (`avail_addr + 4 + size*2 + 2 + slack`) to avoid the
+    /// collision.
+    fn wire_device_to_mock_with_event_idx(
+        dev: &mut VirtioBlk,
+        mock: &MockSplitQueue<GuestMemoryMmap>,
+        queue_size: u16,
+        used_override_addr: GuestAddress,
+    ) {
+        write_reg(dev, VIRTIO_MMIO_STATUS, S_ACK);
+        write_reg(dev, VIRTIO_MMIO_STATUS, S_DRV);
+        // Low half: VIRTIO_RING_F_EVENT_IDX is bit 29.
+        write_reg(dev, VIRTIO_MMIO_DRIVER_FEATURES_SEL, 0);
+        write_reg(
+            dev,
+            VIRTIO_MMIO_DRIVER_FEATURES,
+            1u32 << VIRTIO_RING_F_EVENT_IDX,
+        );
+        // High half: VIRTIO_F_VERSION_1 is bit 32, i.e. bit 0 of
+        // the high page.
+        write_reg(dev, VIRTIO_MMIO_DRIVER_FEATURES_SEL, 1);
+        write_reg(
+            dev,
+            VIRTIO_MMIO_DRIVER_FEATURES,
+            1 << (VIRTIO_F_VERSION_1 - 32),
+        );
+        write_reg(dev, VIRTIO_MMIO_STATUS, S_FEAT);
+
+        write_reg(dev, VIRTIO_MMIO_QUEUE_SEL, 0);
+        write_reg(dev, VIRTIO_MMIO_QUEUE_NUM, queue_size as u32);
+        let desc = mock.desc_table_addr().0;
+        let avail = mock.avail_addr().0;
+        let used = used_override_addr.0;
+        write_reg(dev, VIRTIO_MMIO_QUEUE_DESC_LOW, desc as u32);
+        write_reg(dev, VIRTIO_MMIO_QUEUE_DESC_HIGH, (desc >> 32) as u32);
+        write_reg(dev, VIRTIO_MMIO_QUEUE_AVAIL_LOW, avail as u32);
+        write_reg(dev, VIRTIO_MMIO_QUEUE_AVAIL_HIGH, (avail >> 32) as u32);
+        write_reg(dev, VIRTIO_MMIO_QUEUE_USED_LOW, used as u32);
+        write_reg(dev, VIRTIO_MMIO_QUEUE_USED_HIGH, (used >> 32) as u32);
+        write_reg(dev, VIRTIO_MMIO_QUEUE_READY, 1);
+        write_reg(dev, VIRTIO_MMIO_STATUS, S_OK);
+        assert_eq!(
+            dev.device_status, S_OK,
+            "wire_device_to_mock_with_event_idx: FSM did not reach \
+             DRIVER_OK (got {:#x})",
+            dev.device_status,
+        );
+        // Sanity: the device must have observed and stored the
+        // EVENT_IDX bit. Without this assertion, a regression in
+        // driver_features wiring would silently downgrade every
+        // EVENT_IDX test to the legacy path.
+        assert_ne!(
+            dev.driver_features & (1u64 << VIRTIO_RING_F_EVENT_IDX),
+            0,
+            "VIRTIO_RING_F_EVENT_IDX missing from driver_features after \
+             wire_device_to_mock_with_event_idx",
+        );
+    }
+
+    /// Compute the GPA of the avail ring's `used_event` field for a
+    /// given queue size. Layout per virtio-v1.2 §2.7.6: the avail
+    /// ring is `flags(2) + idx(2) + ring[size]*2 + used_event(2)`.
+    /// Mirrors the offset arithmetic in
+    /// `virtio-queue::queue::Queue::used_event` which uses
+    /// `VIRTQ_AVAIL_RING_HEADER_SIZE + size * VIRTQ_AVAIL_ELEMENT_SIZE`.
+    fn used_event_addr(avail_addr: GuestAddress, queue_size: u16) -> GuestAddress {
+        // Header (4 bytes: flags + idx) + ring entries (2 bytes each).
+        avail_addr
+            .checked_add(4 + queue_size as u64 * 2)
+            .expect("used_event_addr overflow")
     }
 
     /// Build a guest memory map sized to host both the queue
@@ -5003,12 +5189,17 @@ mod tests {
         }
     }
 
-    /// signal_used eventfd write through full chain. Before
+    /// Legacy-path irqfd delivery through a full chain. Before
     /// process_requests, irq_evt is unsignalled (read returns
-    /// EAGAIN). After, it MUST be readable (KVM irqfd path
-    /// delivery).
+    /// EAGAIN). After QUEUE_NOTIFY drains the chain, the post-drain
+    /// V8-split logic inlined in `process_requests`
+    /// (interrupt_status bit + needs_notification-gated eventfd
+    /// write) MUST leave irq_evt readable on the legacy path
+    /// because `Queue::needs_notification` returns Ok(true)
+    /// unconditionally when EVENT_IDX is not negotiated. This
+    /// pins the KVM irqfd delivery contract.
     #[test]
-    fn signal_used_writes_irq_eventfd_after_process_requests() {
+    fn process_requests_fires_irqfd_on_legacy_path() {
         let cap = 4096u64;
         let f = make_backed_file_with_pattern(cap, 0xAB);
         let mut dev = VirtioBlk::new(f, cap, DiskThrottle::default());
@@ -5054,6 +5245,567 @@ mod tests {
             .expect("irq_evt must be readable after notify");
         assert!(val > 0, "irq_evt counter must be > 0 after process_requests");
         assert_ne!(dev.interrupt_status & VIRTIO_MMIO_INT_VRING, 0);
+    }
+
+    /// EVENT_IDX path: when the guest's `used_event` threshold has
+    /// not been crossed by `next_used`, the device must NOT write
+    /// the irqfd, even though it advanced the used ring.
+    /// `Queue::needs_notification` returns false in that window —
+    /// its `event_idx_enabled` arm runs the
+    /// `used_idx - used_event - 1 < used_idx - old`
+    /// wrapping-arithmetic test, which is false when `used_event`
+    /// is well above `next_used`.
+    /// The `interrupt_status` bit must still be set so the guest's
+    /// MMIO read sees pending work — the V8 split between bit and
+    /// eventfd lets the guest poll without losing context if it
+    /// happens to read INTERRUPT_STATUS while suppressed.
+    #[test]
+    fn event_idx_suppresses_irqfd_when_threshold_unreached() {
+        let cap = 4096u64;
+        let f = make_backed_file_with_pattern(cap, 0xAB);
+        let mut dev = VirtioBlk::new(f, cap, DiskThrottle::default());
+        let mem = make_chain_test_mem();
+        let qsize = 16u16;
+        let mock = MockSplitQueue::create(&mem, GuestAddress(0), qsize);
+        // Plant `used_event = u16::MAX` BEFORE wiring the device:
+        // the guest writes this before the first QUEUE_NOTIFY in
+        // real life, and `Queue::needs_notification` reads it
+        // every time it's called.
+        let used_event = used_event_addr(mock.avail_addr(), qsize);
+        mem.write_obj::<u16>(u16::to_le(u16::MAX), used_event)
+            .expect("plant used_event");
+        let header_addr = GuestAddress(0x4000);
+        let data_addr = GuestAddress(0x5000);
+        let status_addr = GuestAddress(0x6000);
+        write_blk_header(&mem, header_addr, VIRTIO_BLK_T_IN, 0);
+        let descs = [
+            RawDescriptor::from(SplitDescriptor::new(
+                header_addr.0,
+                VIRTIO_BLK_OUTHDR_SIZE as u32,
+                0,
+                0,
+            )),
+            RawDescriptor::from(SplitDescriptor::new(
+                data_addr.0,
+                512,
+                VRING_DESC_F_WRITE as u16,
+                0,
+            )),
+            RawDescriptor::from(SplitDescriptor::new(
+                status_addr.0,
+                1,
+                VRING_DESC_F_WRITE as u16,
+                0,
+            )),
+        ];
+        mock.build_desc_chain(&descs).expect("build chain");
+        dev.set_mem(mem.clone());
+        // used_override: place the used ring at 0x10000, well above
+        // the avail ring's used_event field at avail_addr + 36. The
+        // mock's default used_addr collides with used_event; see
+        // `wire_device_to_mock_with_event_idx` doc comment.
+        wire_device_to_mock_with_event_idx(
+            &mut dev,
+            &mock,
+            qsize,
+            GuestAddress(0x10000),
+        );
+        write_reg(&mut dev, VIRTIO_MMIO_QUEUE_NOTIFY, REQ_QUEUE as u32);
+
+        // The chain landed: status byte and counter ticked.
+        let mut s = [0u8; 1];
+        mem.read_slice(&mut s, status_addr).unwrap();
+        assert_eq!(s[0], VIRTIO_BLK_S_OK as u8);
+        assert_eq!(
+            dev.counters().reads_completed.load(Ordering::Relaxed),
+            1,
+        );
+        // V8: interrupt_status bit IS set even when irqfd is
+        // suppressed. The guest reads INTERRUPT_STATUS during its
+        // ISR (or polling); seeing the bit lets it know there's
+        // work even if no IRQ delivered.
+        assert_ne!(
+            dev.interrupt_status & VIRTIO_MMIO_INT_VRING,
+            0,
+            "interrupt_status bit must be set when chain published",
+        );
+        // irqfd MUST be unsignalled — read returns EAGAIN
+        // (counter is 0, eventfd in counter mode blocks/EAGAINs
+        // on read of zero-value).
+        assert!(
+            dev.irq_evt.read().is_err(),
+            "irq_evt must be unsignalled when used_event threshold not crossed",
+        );
+    }
+
+    /// EVENT_IDX path: when the guest's `used_event` threshold IS
+    /// crossed (e.g. used_event = 0 and we publish a chain causing
+    /// next_used = 1), the device fires the irqfd. This is the
+    /// common case for the first request after the guest sets up
+    /// the queue.
+    #[test]
+    fn event_idx_fires_irqfd_when_threshold_reached() {
+        let cap = 4096u64;
+        let f = make_backed_file_with_pattern(cap, 0xAB);
+        let mut dev = VirtioBlk::new(f, cap, DiskThrottle::default());
+        let mem = make_chain_test_mem();
+        let qsize = 16u16;
+        let mock = MockSplitQueue::create(&mem, GuestAddress(0), qsize);
+        // used_event = 0: the guest is asking to be notified as
+        // soon as next_used reaches 1. After one chain
+        // completion, `needs_notification` returns true.
+        let used_event = used_event_addr(mock.avail_addr(), qsize);
+        mem.write_obj::<u16>(u16::to_le(0), used_event)
+            .expect("plant used_event");
+        let header_addr = GuestAddress(0x4000);
+        let data_addr = GuestAddress(0x5000);
+        let status_addr = GuestAddress(0x6000);
+        write_blk_header(&mem, header_addr, VIRTIO_BLK_T_IN, 0);
+        let descs = [
+            RawDescriptor::from(SplitDescriptor::new(
+                header_addr.0,
+                VIRTIO_BLK_OUTHDR_SIZE as u32,
+                0,
+                0,
+            )),
+            RawDescriptor::from(SplitDescriptor::new(
+                data_addr.0,
+                512,
+                VRING_DESC_F_WRITE as u16,
+                0,
+            )),
+            RawDescriptor::from(SplitDescriptor::new(
+                status_addr.0,
+                1,
+                VRING_DESC_F_WRITE as u16,
+                0,
+            )),
+        ];
+        mock.build_desc_chain(&descs).expect("build chain");
+        dev.set_mem(mem.clone());
+        // used_override: place the used ring at 0x10000, well above
+        // the avail ring's used_event field at avail_addr + 36. The
+        // mock's default used_addr collides with used_event; see
+        // `wire_device_to_mock_with_event_idx` doc comment.
+        wire_device_to_mock_with_event_idx(
+            &mut dev,
+            &mock,
+            qsize,
+            GuestAddress(0x10000),
+        );
+        write_reg(&mut dev, VIRTIO_MMIO_QUEUE_NOTIFY, REQ_QUEUE as u32);
+
+        // irqfd fired exactly once (counter mode: a single write(1)
+        // produces read returning 1).
+        let val = dev
+            .irq_evt
+            .read()
+            .expect("irq_evt must be readable when threshold reached");
+        assert_eq!(
+            val, 1,
+            "irq_evt counter must be exactly 1 after a single chain completion",
+        );
+        assert_ne!(dev.interrupt_status & VIRTIO_MMIO_INT_VRING, 0);
+    }
+
+    /// EVENT_IDX path: a multi-chain drain consults
+    /// `needs_notification` exactly once at the END of the drain
+    /// (V6: only call on the signal_needed=true path), so the
+    /// irqfd fires at most ONCE regardless of chain count. This
+    /// is the IRQ-coalescing benefit of EVENT_IDX — without it
+    /// the legacy path would fire once per drain anyway, but
+    /// with EVENT_IDX the fire decision is held until the drain
+    /// completes so `needs_notification` sees the final
+    /// `next_used` value (`num_added` reflects all 3 chains).
+    #[test]
+    fn event_idx_multi_chain_drain_fires_once() {
+        let cap = 4096u64;
+        let f = make_backed_file_with_pattern(cap, 0xAB);
+        let mut dev = VirtioBlk::new(f, cap, DiskThrottle::default());
+        let mem = make_chain_test_mem();
+        let qsize = 16u16;
+        let mock = MockSplitQueue::create(&mem, GuestAddress(0), qsize);
+        // used_event = 0: notify when next_used reaches 1.
+        let used_event = used_event_addr(mock.avail_addr(), qsize);
+        mem.write_obj::<u16>(u16::to_le(0), used_event)
+            .expect("plant used_event");
+        // Build 3 chains, each its own header/data/status triple.
+        for i in 0..3u64 {
+            let header_addr = GuestAddress(0x4000 + i * 0x1000);
+            let data_addr = GuestAddress(0x8000 + i * 0x1000);
+            let status_addr = GuestAddress(0xC000 + i * 0x100);
+            write_blk_header(&mem, header_addr, VIRTIO_BLK_T_IN, 0);
+            let descs = [
+                RawDescriptor::from(SplitDescriptor::new(
+                    header_addr.0,
+                    VIRTIO_BLK_OUTHDR_SIZE as u32,
+                    0,
+                    0,
+                )),
+                RawDescriptor::from(SplitDescriptor::new(
+                    data_addr.0,
+                    512,
+                    VRING_DESC_F_WRITE as u16,
+                    0,
+                )),
+                RawDescriptor::from(SplitDescriptor::new(
+                    status_addr.0,
+                    1,
+                    VRING_DESC_F_WRITE as u16,
+                    0,
+                )),
+            ];
+            mock.build_desc_chain(&descs).expect("build chain");
+        }
+        dev.set_mem(mem.clone());
+        // used_override: place the used ring at 0x10000, well above
+        // the avail ring's used_event field at avail_addr + 36. The
+        // mock's default used_addr collides with used_event; see
+        // `wire_device_to_mock_with_event_idx` doc comment.
+        wire_device_to_mock_with_event_idx(
+            &mut dev,
+            &mock,
+            qsize,
+            GuestAddress(0x10000),
+        );
+        write_reg(&mut dev, VIRTIO_MMIO_QUEUE_NOTIFY, REQ_QUEUE as u32);
+
+        // 3 chains completed.
+        assert_eq!(
+            dev.counters().reads_completed.load(Ordering::Relaxed),
+            3,
+        );
+        // irqfd fired exactly once. EventFd in counter mode: one
+        // write(1) → read returns 1; three writes → read returns
+        // 3. The post-drain gate produces a single write, so
+        // read must return 1.
+        let val = dev
+            .irq_evt
+            .read()
+            .expect("irq_evt must be readable after multi-chain drain");
+        assert_eq!(
+            val, 1,
+            "irq_evt must fire exactly once for a multi-chain drain \
+             (V6: needs_notification consulted once at end of drain)",
+        );
+    }
+
+    /// Legacy path (EVENT_IDX not negotiated):
+    /// `Queue::needs_notification` always returns Ok(true) (the
+    /// trailing `Ok(true)` after the `event_idx_enabled` branch),
+    /// so every drain that publishes any chain fires the irqfd.
+    /// This test pins the legacy contract — a regression that
+    /// gated the irqfd write on the wrong path would silently
+    /// break the legacy guest's IRQ delivery.
+    #[test]
+    fn legacy_path_fires_irqfd_every_drain() {
+        let cap = 4096u64;
+        let f = make_backed_file_with_pattern(cap, 0xAB);
+        let mut dev = VirtioBlk::new(f, cap, DiskThrottle::default());
+        let mem = make_chain_test_mem();
+        let qsize = 16u16;
+        let mock = MockSplitQueue::create(&mem, GuestAddress(0), qsize);
+        // Plant used_event = u16::MAX. In the EVENT_IDX path this
+        // would suppress; in the legacy path it's IGNORED — proves
+        // the test exercises the legacy path.
+        let used_event = used_event_addr(mock.avail_addr(), qsize);
+        mem.write_obj::<u16>(u16::to_le(u16::MAX), used_event)
+            .expect("plant used_event");
+        let header_addr = GuestAddress(0x4000);
+        let data_addr = GuestAddress(0x5000);
+        let status_addr = GuestAddress(0x6000);
+        write_blk_header(&mem, header_addr, VIRTIO_BLK_T_IN, 0);
+        let descs = [
+            RawDescriptor::from(SplitDescriptor::new(
+                header_addr.0,
+                VIRTIO_BLK_OUTHDR_SIZE as u32,
+                0,
+                0,
+            )),
+            RawDescriptor::from(SplitDescriptor::new(
+                data_addr.0,
+                512,
+                VRING_DESC_F_WRITE as u16,
+                0,
+            )),
+            RawDescriptor::from(SplitDescriptor::new(
+                status_addr.0,
+                1,
+                VRING_DESC_F_WRITE as u16,
+                0,
+            )),
+        ];
+        mock.build_desc_chain(&descs).expect("build chain");
+        dev.set_mem(mem.clone());
+        // Legacy path: VIRTIO_RING_F_EVENT_IDX NOT negotiated.
+        wire_device_to_mock(&mut dev, &mock);
+        write_reg(&mut dev, VIRTIO_MMIO_QUEUE_NOTIFY, REQ_QUEUE as u32);
+
+        // irqfd fired despite used_event=u16::MAX, because the
+        // legacy path ignores the threshold.
+        let val = dev
+            .irq_evt
+            .read()
+            .expect("irq_evt must be readable on legacy path");
+        assert_eq!(
+            val, 1,
+            "legacy path must fire irq_evt unconditionally — used_event \
+             is irrelevant when EVENT_IDX is not negotiated",
+        );
+    }
+
+    /// Outer-loop bracket: when 2 chains are queued before
+    /// QUEUE_NOTIFY, both complete in a single `process_requests`
+    /// call. This is a deterministic variant of the re-drain
+    /// coverage — see the doc note below for why the
+    /// `enable_notification → Ok(true) → continue 'outer` arm
+    /// itself can't be tested deterministically from a single
+    /// thread.
+    ///
+    /// Race-window note: the production re-drain arm fires when
+    /// `avail_idx != next_avail` AT the moment `enable_notification`
+    /// runs. In a real VMM, that gap exists between the inner-loop
+    /// break (next_avail caught up to the avail_idx the device saw)
+    /// and the `set_avail_event` call inside `enable_notification`
+    /// — a vCPU can write a fresh chain head and bump `avail_idx`
+    /// in that window. In a single-threaded test there is no such
+    /// vCPU; `MockSplitQueue` is the only writer and we control
+    /// when it writes. To trigger Ok(true) deterministically would
+    /// require interposing on `enable_notification` itself
+    /// (e.g. a test-only `Queue` implementation) — too invasive
+    /// for the value gained. The deterministic variant here pins
+    /// the WEAKER property: 2 chains queued before notify both
+    /// complete in one process_requests call. The actual re-drain
+    /// arm is exercised by the existing
+    /// `event_idx_multi_chain_drain_fires_once` test which queues
+    /// 3 chains; both tests share the same single-process-requests
+    /// shape.
+    ///
+    /// What this DOES guarantee: a 2-chain pre-notify queue drains
+    /// fully in one call. A regression that prematurely broke out
+    /// of the outer loop after the first chain (e.g. dropping
+    /// `continue 'outer` in favour of `break 'outer`) would leave
+    /// the second chain unprocessed — that regression IS caught
+    /// here even though the path through the Ok(true) arm itself
+    /// isn't directly observed.
+    #[test]
+    fn outer_loop_drains_two_pre_queued_chains_in_one_call() {
+        let cap = 4096u64;
+        let f = make_backed_file_with_pattern(cap, 0xAB);
+        let mut dev = VirtioBlk::new(f, cap, DiskThrottle::default());
+        let mem = make_chain_test_mem();
+        let qsize = 16u16;
+        let mock = MockSplitQueue::create(&mem, GuestAddress(0), qsize);
+        // used_event = 0: notify on first completion. After both
+        // chains are processed the post-drain `needs_notification`
+        // observes next_used=2, num_added=2, threshold-crossed →
+        // fires. Either Ok(true)→Ok(false) (re-drain path) OR
+        // Ok(false) directly leaves both chains processed and
+        // signal_needed=true.
+        let used_event = used_event_addr(mock.avail_addr(), qsize);
+        mem.write_obj::<u16>(u16::to_le(0), used_event)
+            .expect("plant used_event");
+        let header_addr = GuestAddress(0x4000);
+        let status_addr = GuestAddress(0x4100);
+        write_blk_header(&mem, header_addr, VIRTIO_BLK_T_FLUSH, 0);
+        // Two FLUSH chains pre-queued. FLUSH carries no data
+        // (header + status only — virtio-v1.2 §5.2.6.3). Both
+        // chains share the same desc_table slots because
+        // `MockSplitQueue::add_desc_chains` writes at offset 0
+        // each call; the second build_desc_chain overwrites
+        // descriptors 0..1 but the avail_ring grows by one each
+        // call — so 2 chain heads point at desc_table[0] and the
+        // device walks the same descriptors twice. fdatasync on a
+        // tempfile is idempotent.
+        let descs = [
+            RawDescriptor::from(SplitDescriptor::new(
+                header_addr.0,
+                VIRTIO_BLK_OUTHDR_SIZE as u32,
+                0,
+                0,
+            )),
+            RawDescriptor::from(SplitDescriptor::new(
+                status_addr.0,
+                1,
+                VRING_DESC_F_WRITE as u16,
+                0,
+            )),
+        ];
+        mock.build_desc_chain(&descs).expect("build chain 1");
+        mock.build_desc_chain(&descs).expect("build chain 2");
+        dev.set_mem(mem.clone());
+        wire_device_to_mock_with_event_idx(
+            &mut dev,
+            &mock,
+            qsize,
+            GuestAddress(0x10000),
+        );
+        write_reg(&mut dev, VIRTIO_MMIO_QUEUE_NOTIFY, REQ_QUEUE as u32);
+
+        // Both chains completed. The bracket pattern guarantees
+        // EITHER (a) inner loop drains both immediately and
+        // enable_notification returns Ok(false) → break, OR (b)
+        // inner drains chain 1, enable_notification returns Ok(true)
+        // because chain 2's avail-idx advance was visible after the
+        // bracket close → continue 'outer drains chain 2. Both end
+        // states are observable as flushes_completed == 2.
+        let c = dev.counters();
+        assert_eq!(
+            c.flushes_completed.load(Ordering::Relaxed),
+            2,
+            "both pre-queued FLUSH chains must complete in a single \
+             process_requests call",
+        );
+        // Used ring (placed at the override addr 0x10000) reflects
+        // exactly two completions. The mock's default used ring is
+        // unused; read used.idx from the override location.
+        let used_idx: u16 = mem
+            .read_obj(GuestAddress(0x10000).checked_add(2).unwrap())
+            .expect("read device used.idx at override addr");
+        assert_eq!(
+            used_idx, 2,
+            "exactly two used-ring entries expected after two-chain drain",
+        );
+        // Single irqfd fire: V6 has needs_notification consulted
+        // once at end of drain. Whether the path went through the
+        // re-drain arm or broke out directly, the tail signal is
+        // ONE eventfd write.
+        let val = dev
+            .irq_evt
+            .read()
+            .expect("irq_evt readable after two-chain drain");
+        assert_eq!(
+            val, 1,
+            "exactly one irq_evt write expected — needs_notification \
+             consulted once after the drain settles",
+        );
+    }
+
+    /// Bail-out branch: when `enable_notification` returns Err
+    /// (the `set_avail_event` write to the used ring's
+    /// `avail_event` field hits unmapped guest memory), the outer
+    /// loop must break cleanly without hanging, the chain that
+    /// was already published before the failure stays published
+    /// (`add_used` succeeded; the failure is in the post-drain
+    /// notification arming), and the irqfd fires fail-safe via
+    /// the `unwrap_or(true)` on the post-drain `needs_notification`
+    /// call.
+    ///
+    /// Test setup: a multi-region GuestMemoryMmap with a hole
+    /// straddling the device's `avail_event` GPA. The used ring is
+    /// placed via `used_override_addr` so its body
+    /// (header + ring elements at offsets 0..132) lives in the
+    /// first region and the trailing `avail_event` u16 at
+    /// `used_addr + 132` lands at the boundary, in the unmapped
+    /// gap. add_used (offsets 4..12 for index 0) succeeds;
+    /// `set_avail_event` writing 2 bytes at `used_addr + 132`
+    /// fails with InvalidGuestAddress.
+    ///
+    /// Layout: `Queue::set_avail_event` writes at
+    /// `used_ring + VIRTQ_USED_RING_HEADER_SIZE
+    /// + VIRTQ_USED_ELEMENT_SIZE * size = used_ring + 4 + 8 * 16 =
+    /// used_ring + 132`.
+    #[test]
+    fn enable_notification_err_breaks_outer_and_fires_irqfd_fail_safe() {
+        let cap = 4096u64;
+        let f = make_backed_file_with_pattern(cap, 0xAB);
+        let mut dev = VirtioBlk::new(f, cap, DiskThrottle::default());
+        // Multi-region mem: [0, 0x20000) and [0x30000, 0x40000).
+        // The hole is [0x20000, 0x30000). With used_addr=0x1FF7C
+        // and size=16: avail_event is at 0x20000 (start of the
+        // hole), inaccessible. add_used at next_used=0 writes 8
+        // bytes to 0x1FF80..0x1FF88 (in-range) plus the 2-byte
+        // next_used u16 to 0x1FF7E (in-range).
+        let mem = GuestMemoryMmap::from_ranges(&[
+            (GuestAddress(0), 0x20000),
+            (GuestAddress(0x30000), 0x10000),
+        ])
+        .expect("create multi-region guest mem");
+        let qsize = 16u16;
+        let mock = MockSplitQueue::create(&mem, GuestAddress(0), qsize);
+        let header_addr = GuestAddress(0x4000);
+        let status_addr = GuestAddress(0x5000);
+        write_blk_header(&mem, header_addr, VIRTIO_BLK_T_FLUSH, 0);
+        let descs = [
+            RawDescriptor::from(SplitDescriptor::new(
+                header_addr.0,
+                VIRTIO_BLK_OUTHDR_SIZE as u32,
+                0,
+                0,
+            )),
+            RawDescriptor::from(SplitDescriptor::new(
+                status_addr.0,
+                1,
+                VRING_DESC_F_WRITE as u16,
+                0,
+            )),
+        ];
+        mock.build_desc_chain(&descs).expect("build chain");
+        dev.set_mem(mem.clone());
+        // used_override = 0x1FF7C: with size=16 the used-ring body
+        // (header + 16 * 8-byte elements = 132 bytes) ends exactly
+        // at 0x20000 (the boundary), and the trailing avail_event
+        // u16 store at 0x20000..0x20002 lies in the unmapped hole.
+        wire_device_to_mock_with_event_idx(
+            &mut dev,
+            &mock,
+            qsize,
+            GuestAddress(0x1FF7C),
+        );
+
+        // Pre-notify: irqfd MUST be unsignalled.
+        assert!(
+            dev.irq_evt.read().is_err(),
+            "irq_evt must not be signalled before notify",
+        );
+
+        // Fire QUEUE_NOTIFY. Inner drain processes the chain
+        // (add_used succeeds at offsets in the mapped region),
+        // enable_notification returns Err on the unmapped
+        // avail_event store, the outer loop breaks cleanly. If
+        // the bail were missing (infinite outer loop on persistent
+        // err), this call would hang and the test would time out.
+        write_reg(&mut dev, VIRTIO_MMIO_QUEUE_NOTIFY, REQ_QUEUE as u32);
+
+        // Chain was published before the bail. flushes_completed
+        // ticked, used.idx advanced to 1.
+        let c = dev.counters();
+        assert_eq!(
+            c.flushes_completed.load(Ordering::Relaxed),
+            1,
+            "FLUSH must complete before the enable_notification bail",
+        );
+        let used_idx: u16 = mem
+            .read_obj(GuestAddress(0x1FF7C).checked_add(2).unwrap())
+            .expect("read device used.idx at override addr");
+        assert_eq!(
+            used_idx, 1,
+            "add_used must have run before the enable_notification bail",
+        );
+
+        // V8 + fail-safe: the irqfd MUST fire. The post-drain
+        // `needs_notification` reads `used_event` from the avail
+        // ring (in the mapped region — only the USED ring's
+        // `avail_event` is in the hole), so the call returns
+        // Ok(true|false) cleanly. With used_event=0 (default mock
+        // initialisation, mock.rs:151) and next_used=1, the
+        // formula returns true → fire. Even if it returned an
+        // Err, `unwrap_or(true)` would still fire fail-safe.
+        let val = dev
+            .irq_evt
+            .read()
+            .expect("irq_evt must fire fail-safe after enable_notification bail");
+        assert_eq!(
+            val, 1,
+            "irq_evt must fire exactly once after the bail (V8 \
+             interrupt_status bit + needs_notification gate)",
+        );
+        assert_ne!(
+            dev.interrupt_status & VIRTIO_MMIO_INT_VRING,
+            0,
+            "interrupt_status bit must be set when chain published, \
+             independent of the enable_notification bail",
+        );
     }
 
     /// Fragmented header. The first descriptor is shorter
@@ -5169,7 +5921,11 @@ mod tests {
         let cap = 4096u64;
         let f = make_backed_file_with_pattern(cap, 0x00);
         let dev = VirtioBlk::new(f, cap, DiskThrottle::default());
-        let mem = make_guest_mem(8192);
+        // 16 KiB mem so status_addr=0x2000 is in-range (the
+        // single-region GuestMemoryMmap exposes [0, len) — len=8192
+        // would put 0x2000 at the exclusive upper bound and reject
+        // write_slice).
+        let mem = make_guest_mem(16384);
         let data_addr = GuestAddress(0x1000);
         let status_addr = GuestAddress(0x2000);
         // Pre-fill the data buffer with a sentinel so a regression
@@ -5219,7 +5975,7 @@ mod tests {
         let cap = 4096u64;
         let f = make_backed_file_with_pattern(cap, 0x00);
         let dev = VirtioBlk::new(f, cap, DiskThrottle::default());
-        let mem = make_guest_mem(8192);
+        let mem = make_guest_mem(16384);
         let data_addr = GuestAddress(0x1000);
         let status_addr = GuestAddress(0x2000);
         // 19 bytes — one short of the 20-byte minimum.
@@ -5253,7 +6009,7 @@ mod tests {
         let cap = 4096u64;
         let f = make_backed_file_with_pattern(cap, 0x00);
         let dev = VirtioBlk::new(f, cap, DiskThrottle::default());
-        let mem = make_guest_mem(8192);
+        let mem = make_guest_mem(16384);
         let data_addr = GuestAddress(0x1000);
         let status_addr = GuestAddress(0x2000);
         let segs = vec![ChainDescriptor {

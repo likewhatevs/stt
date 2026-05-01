@@ -137,6 +137,9 @@ impl VirtioConsole {
         if idx < NUM_QUEUES { Some(idx) } else { None }
     }
 
+    // Console does not negotiate VIRTIO_RING_F_EVENT_IDX so the
+    // combined bit+eventfd pattern is correct here. virtio_blk
+    // splits the two because it negotiates EVENT_IDX.
     fn signal_used(&mut self) {
         self.interrupt_status |= VIRTIO_MMIO_INT_VRING;
         let _ = self.irq_evt.write(1);
