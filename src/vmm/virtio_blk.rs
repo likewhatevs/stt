@@ -5490,6 +5490,112 @@ mod tests {
         );
     }
 
+    /// EVENT_IDX path, multi-chain drain, threshold above the
+    /// post-drain `next_used` value: 3 chains complete but
+    /// `needs_notification` returns false because `used_event = 10`
+    /// (the guest is asking to be notified only once `next_used`
+    /// crosses 10). Pins suppression under multi-chain load — a
+    /// regression that fired the irqfd once per chain (or once per
+    /// drain regardless of threshold) would surface as a non-zero
+    /// `irq_evt.read()` here. Companion to
+    /// `event_idx_multi_chain_drain_fires_once` (used_event=0,
+    /// expected fire) — together the pair pin both halves of the
+    /// gate at multi-chain load.
+    #[test]
+    fn event_idx_multi_chain_drain_suppresses_below_threshold() {
+        let cap = 4096u64;
+        let f = make_backed_file_with_pattern(cap, 0xAB);
+        let mut dev = VirtioBlk::new(f, cap, DiskThrottle::default());
+        let mem = make_chain_test_mem();
+        let qsize = 16u16;
+        let mock = MockSplitQueue::create(&mem, GuestAddress(0), qsize);
+        // used_event = 10: the guest is asking for notification only
+        // once next_used crosses 10. We're going to drain 3 chains
+        // (next_used → 3) so the threshold is unreached and the
+        // post-drain `needs_notification` returns false. Plant
+        // BEFORE wiring the device per the existing EVENT_IDX
+        // pattern (Queue reads used_event lazily on each
+        // needs_notification call).
+        let used_event = used_event_addr(mock.avail_addr(), qsize);
+        mem.write_obj::<u16>(u16::to_le(10), used_event)
+            .expect("plant used_event");
+        // Build 3 read chains with disjoint addresses so the
+        // descriptor table doesn't alias across iterations.
+        for i in 0..3u64 {
+            let header_addr = GuestAddress(0x4000 + i * 0x1000);
+            let data_addr = GuestAddress(0x8000 + i * 0x1000);
+            let status_addr = GuestAddress(0xC000 + i * 0x100);
+            write_blk_header(&mem, header_addr, VIRTIO_BLK_T_IN, 0);
+            let descs = [
+                RawDescriptor::from(SplitDescriptor::new(
+                    header_addr.0,
+                    VIRTIO_BLK_OUTHDR_SIZE as u32,
+                    0,
+                    0,
+                )),
+                RawDescriptor::from(SplitDescriptor::new(
+                    data_addr.0,
+                    512,
+                    VRING_DESC_F_WRITE as u16,
+                    0,
+                )),
+                RawDescriptor::from(SplitDescriptor::new(
+                    status_addr.0,
+                    1,
+                    VRING_DESC_F_WRITE as u16,
+                    0,
+                )),
+            ];
+            mock.build_desc_chain(&descs).expect("build chain");
+        }
+        dev.set_mem(mem.clone());
+        // used_override: place the used ring at 0x10000, well above
+        // the avail ring's used_event field at avail_addr + 36. The
+        // mock's default used_addr collides with used_event; see
+        // `wire_device_to_mock_with_event_idx` doc comment.
+        wire_device_to_mock_with_event_idx(
+            &mut dev,
+            &mock,
+            qsize,
+            GuestAddress(0x10000),
+        );
+        write_reg(&mut dev, VIRTIO_MMIO_QUEUE_NOTIFY, REQ_QUEUE as u32);
+
+        // All 3 chains landed.
+        assert_eq!(
+            dev.counters().reads_completed.load(Ordering::Relaxed),
+            3,
+            "all 3 chains must complete in the single QUEUE_NOTIFY drain",
+        );
+        // Used ring (at the override addr 0x10000) reflects exactly
+        // 3 completions. Reads u16 used.idx at offset 2 of the
+        // override addr.
+        let used_idx: u16 = mem
+            .read_obj(GuestAddress(0x10000).checked_add(2).unwrap())
+            .expect("read device used.idx at override addr");
+        assert_eq!(
+            used_idx, 3,
+            "exactly three used-ring entries expected after 3-chain drain",
+        );
+        // V8: interrupt_status bit IS set even when irqfd is
+        // suppressed. The guest's ISR or polling path reads
+        // INTERRUPT_STATUS to find work; the bit must be visible
+        // independent of the irqfd gate.
+        assert_ne!(
+            dev.interrupt_status & VIRTIO_MMIO_INT_VRING,
+            0,
+            "interrupt_status bit must be set after 3 completions \
+             even when irqfd suppressed",
+        );
+        // irqfd MUST be unsignalled — `needs_notification` saw
+        // next_used=3 < used_event=10 so the gate held.
+        assert!(
+            dev.irq_evt.read().is_err(),
+            "irq_evt must be unsignalled when post-drain next_used \
+             stays below used_event threshold",
+        );
+    }
+
     /// Legacy path (EVENT_IDX not negotiated):
     /// `Queue::needs_notification` always returns Ok(true) (the
     /// trailing `Ok(true)` after the `event_idx_enabled` branch),
@@ -5859,6 +5965,130 @@ mod tests {
         let c = dev.counters();
         assert_eq!(c.io_errors.load(Ordering::Relaxed), 1);
         assert_eq!(c.reads_completed.load(Ordering::Relaxed), 0);
+    }
+
+    /// EVENT_IDX path with an error chain: the IOERR completion must
+    /// route through the SAME post-drain `needs_notification` gate
+    /// as success completions, so a guest that asks for suppression
+    /// (`used_event = u16::MAX`) does not get spuriously interrupted
+    /// by an error chain.
+    ///
+    /// Setup mirrors `fragmented_header_returns_ioerr` (chain has a
+    /// short first descriptor of 8 bytes — less than
+    /// `VIRTIO_BLK_OUTHDR_SIZE` = 16 — so the device cannot read a
+    /// full header from desc[0] and rejects via
+    /// `publish_completion(..., VIRTIO_BLK_S_IOERR, ...)` at
+    /// `process_requests`'s "header missing/short" branch). The
+    /// publish_completion call returns true (status-byte write
+    /// succeeded, add_used succeeded), so `signal_needed = true` —
+    /// the chain reaches the post-drain notification arm.
+    ///
+    /// With EVENT_IDX negotiated and `used_event = u16::MAX`, the
+    /// post-drain `needs_notification` returns false (next_used=1
+    /// nowhere near u16::MAX) so the irqfd MUST stay unsignalled.
+    /// `interrupt_status` is still set (the guest's ISR/polling
+    /// path needs to see there's work). Pins the contract that
+    /// error completions are NOT a special-case bypass of the
+    /// suppression gate.
+    #[test]
+    fn event_idx_error_chain_suppressed_when_threshold_unreached() {
+        let cap = 4096u64;
+        let f = make_backed_file_with_pattern(cap, 0x00);
+        let mut dev = VirtioBlk::new(f, cap, DiskThrottle::default());
+        let mem = make_chain_test_mem();
+        let qsize = 16u16;
+        let mock = MockSplitQueue::create(&mem, GuestAddress(0), qsize);
+        // Plant `used_event = u16::MAX` BEFORE wiring the device:
+        // the guest is asking to never be notified for any normal
+        // post-drain `next_used` value (it polls instead). The
+        // post-drain `needs_notification` reads `used_event`
+        // lazily, so plant before notify, not before wire.
+        let used_event = used_event_addr(mock.avail_addr(), qsize);
+        mem.write_obj::<u16>(u16::to_le(u16::MAX), used_event)
+            .expect("plant used_event");
+        // Fragmented-header layout: desc[0] = 8 bytes (< OUTHDR_SIZE
+        // = 16) → header rejected, IOERR published via
+        // publish_completion. desc[1] is also 8 bytes RO so the
+        // device cannot stitch a full header from desc[0]+desc[1]
+        // (per the "first_len < OUTHDR_SIZE" gate). desc[2] is the
+        // 1-byte writable status descriptor.
+        let header_part1_addr = GuestAddress(0x4000);
+        let header_part2_addr = GuestAddress(0x4008);
+        let status_addr = GuestAddress(0x5000);
+        let descs = [
+            RawDescriptor::from(SplitDescriptor::new(
+                header_part1_addr.0,
+                8, // SHORT — triggers IOERR via publish_completion
+                0,
+                0,
+            )),
+            RawDescriptor::from(SplitDescriptor::new(
+                header_part2_addr.0,
+                8,
+                0,
+                0,
+            )),
+            RawDescriptor::from(SplitDescriptor::new(
+                status_addr.0,
+                1,
+                VRING_DESC_F_WRITE as u16,
+                0,
+            )),
+        ];
+        mock.build_desc_chain(&descs).expect("build chain");
+        dev.set_mem(mem.clone());
+        wire_device_to_mock_with_event_idx(
+            &mut dev,
+            &mock,
+            qsize,
+            GuestAddress(0x10000),
+        );
+        write_reg(&mut dev, VIRTIO_MMIO_QUEUE_NOTIFY, REQ_QUEUE as u32);
+
+        // The error chain landed: status=IOERR, io_errors=1.
+        let mut s = [0u8; 1];
+        mem.read_slice(&mut s, status_addr).unwrap();
+        assert_eq!(
+            s[0], VIRTIO_BLK_S_IOERR as u8,
+            "fragmented header must produce IOERR even on EVENT_IDX path",
+        );
+        let c = dev.counters();
+        assert_eq!(
+            c.io_errors.load(Ordering::Relaxed),
+            1,
+            "fragmented-header reject must bump io_errors exactly once",
+        );
+        // The chain WAS add_used'd: error completions reach the
+        // post-drain gate via signal_needed=true. used.idx at the
+        // override addr advances to 1.
+        let used_idx: u16 = mem
+            .read_obj(GuestAddress(0x10000).checked_add(2).unwrap())
+            .expect("read device used.idx at override addr");
+        assert_eq!(
+            used_idx, 1,
+            "error chain must still be add_used'd so the guest sees \
+             the IOERR status — V8 + the publish_completion contract",
+        );
+        // V8: interrupt_status bit IS set on the error chain too —
+        // the guest's polling path reads INTERRUPT_STATUS to learn
+        // there's work, regardless of irqfd suppression.
+        assert_ne!(
+            dev.interrupt_status & VIRTIO_MMIO_INT_VRING,
+            0,
+            "interrupt_status bit must be set after error chain \
+             completes, independent of irqfd gate",
+        );
+        // The contract this test pins: irqfd suppressed for the
+        // error chain because `used_event=u16::MAX` was unreached.
+        // A regression that bypassed `needs_notification` for
+        // error completions (e.g. firing the irqfd unconditionally
+        // on signal_needed=true) would surface here.
+        assert!(
+            dev.irq_evt.read().is_err(),
+            "irq_evt must be unsignalled — error completions route \
+             through the same needs_notification gate as success \
+             completions, and used_event=u16::MAX was unreached",
+        );
     }
 
     /// SIZE_MAX advertised in config space. virtio-v1.2
