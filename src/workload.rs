@@ -1504,6 +1504,21 @@ impl WorkType {
         }
     }
 
+    /// Construct a [`WorkType::Sequence`] from a head phase and an
+    /// iterator of follow-on phases.
+    ///
+    /// The `Sequence` variant cannot use [`from_name`](Self::from_name)
+    /// because phases require explicit construction; this constructor
+    /// is the only typed entry point. Accepts any `IntoIterator<Item =
+    /// Phase>` for `rest` so callers can pass arrays, `Vec`, or
+    /// builder-style chains.
+    pub fn sequence(first: Phase, rest: impl IntoIterator<Item = Phase>) -> Self {
+        WorkType::Sequence {
+            first,
+            rest: rest.into_iter().collect(),
+        }
+    }
+
     /// Construct a [`WorkType::CgroupChurn`].
     pub fn cgroup_churn(groups: usize, cycle_ms: u64) -> Self {
         WorkType::CgroupChurn { groups, cycle_ms }
