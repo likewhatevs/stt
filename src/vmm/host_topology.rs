@@ -691,9 +691,12 @@ fn try_acquire_all(
 
 /// Acquire exclusive CPU locks for a non-perf VM (non-blocking).
 ///
-/// Tries to flock `count` consecutive CPU files starting from offset 0,
-/// stepping by 1 if any CPU in the window is busy. Returns the held
-/// fds on success, or `ResourceContention` when no window is available.
+/// Tries to flock `count` consecutive CPU files starting from a
+/// pid-derived offset, stepping by 1 if any CPU in the window is busy
+/// and wrapping around once the high end of the search range is
+/// exhausted so the lower windows (those below `start_offset`) are
+/// also probed before giving up. Returns the held fds on success, or
+/// `ResourceContention` when no window is available.
 ///
 /// When `host_topo` is provided, also acquires `LOCK_SH` on the LLC lock
 /// files containing the acquired CPUs. This prevents a perf VM from
@@ -710,8 +713,33 @@ pub fn acquire_cpu_locks(
         return Ok(Vec::new());
     }
 
-    let mut offset = 0;
-    while offset + count <= total_host_cpus {
+    // No window can fit if the request exceeds the host. Bail before
+    // entering the search loop so the modular arithmetic below has a
+    // non-zero domain.
+    if count > total_host_cpus {
+        return Err(anyhow::Error::new(ResourceContention {
+            reason: format!(
+                "no {count} consecutive CPUs available on a {total_host_cpus}-CPU host\n  \
+                 hint: pass --no-perf-mode or set KTSTR_NO_PERF_MODE=1 to run without CPU reservation"
+            ),
+        }));
+    }
+
+    // Spread peers across the lockfile pool: start at a pid-derived
+    // offset so two ktstr invocations launching simultaneously don't
+    // both probe CPU 0 first. `max_start` is the count of valid
+    // window-start positions in `[0, total_host_cpus - count]`
+    // (inclusive), giving `total_host_cpus - count + 1` candidates.
+    // The `count > total_host_cpus` early-bail above guarantees
+    // `max_start >= 1`, so the modulo never divides by zero.
+    let max_start = total_host_cpus - count + 1;
+    let start_offset = (std::process::id() as usize) % max_start;
+    // Walk every candidate window exactly once, wrapping around so a
+    // peer holding the high end never starves the low end. Visit
+    // order is `start_offset, start_offset+1, ..., max_start-1,
+    // 0, 1, ..., start_offset-1`.
+    for step in 0..max_start {
+        let offset = (start_offset + step) % max_start;
         match try_acquire_cpu_window(offset, count) {
             Ok(mut locks) => {
                 // Acquire shared LLC locks so perf VMs cannot take
@@ -723,16 +751,13 @@ pub fn acquire_cpu_locks(
                         Err(_) => {
                             // LLC lock busy — drop CPU locks and try next window.
                             drop(locks);
-                            offset += 1;
                             continue;
                         }
                     }
                 }
                 return Ok(locks);
             }
-            Err(_) => {
-                offset += 1;
-            }
+            Err(_) => continue,
         }
     }
 
@@ -766,12 +791,15 @@ pub fn acquire_cpu_locks(
 // [`acquire_resource_locks`] for its `LOCK_EX` reservation contract.
 //
 // The pipeline has three phases: discover (snapshot holders per
-// LLC), plan (NUMA-aware, consolidation-aware selection, filtered
-// to the process's allowed cpuset), acquire (non-blocking `LOCK_SH`
-// on each selected LLC). One TOCTOU retry absorbs the window between
-// the discover snapshot and the non-blocking acquire; the second
-// discover's /proc/locks read IS the backoff, so no sleep is needed
-// between attempts.
+// LLC, filtered to the process's allowed cpuset), plan (NUMA-aware,
+// consolidation-aware selection), acquire (non-blocking `LOCK_SH`
+// on each selected LLC). Up to ACQUIRE_MAX_TOCTOU_RETRIES retries
+// absorb the window between the discover snapshot and the
+// non-blocking acquire; between retries the loop sleeps for an
+// ascending micro-budget (TOCTOU_RETRY_DELAYS) so a peer that
+// raced us has time to drop its fds before the next snapshot.
+// If every retry fails, the contention is persistent and the
+// caller falls back to nextest-retry / operator-wait.
 
 /// Return the CPUs the calling process is allowed to run on, per
 /// `sched_getaffinity(2)` with a `/proc/self/status` Cpus_allowed_list
@@ -989,18 +1017,43 @@ pub struct LlcPlan {
     pub(crate) locks: Vec<std::os::fd::OwnedFd>,
 }
 
-/// Total wall-clock budget for PLAN + ACQUIRE under the consolidation
-/// path. Each DISCOVER + PLAN + ACQUIRE attempt is essentially
-/// non-blocking; the TOCTOU retry absorbs at most one racing peer.
-/// No sleep is needed between the first and second attempt — the
-/// second DISCOVER's `/proc/locks` read IS the backoff. If two attempts
-/// fail, the contention is persistent and the caller should
-/// nextest-retry / operator-wait.
-const ACQUIRE_MAX_TOCTOU_RETRIES: u32 = 1;
+/// Maximum TOCTOU retry budget for the DISCOVER → PLAN → ACQUIRE
+/// pipeline. Production sees up to `RETRIES + 1 = 4` attempts: one
+/// initial DISCOVER and three retries. Between retries the caller
+/// sleeps for an ascending micro-budget (10ms, 50ms, 200ms — see
+/// [`TOCTOU_RETRY_DELAYS`]) so two peers that initially raced on the
+/// same LLC have time to drop their fds before the next snapshot.
+/// Without the sleep the second DISCOVER often sees the same holder
+/// state and bails on a transient race; the in-process micro-sleep
+/// absorbs that without paying the nextest-retry cost.
+const ACQUIRE_MAX_TOCTOU_RETRIES: u32 = 3;
+
+/// Per-retry sleep durations between DISCOVER attempts. Indexed by
+/// the retry index: after attempt 0 fails the loop sleeps
+/// `TOCTOU_RETRY_DELAYS[0]`, after attempt 1 fails it sleeps
+/// `TOCTOU_RETRY_DELAYS[1]`, etc. Length must equal
+/// [`ACQUIRE_MAX_TOCTOU_RETRIES`] — there are exactly that many
+/// sleeps before the final attempt that can still bail.
+const TOCTOU_RETRY_DELAYS: [std::time::Duration; ACQUIRE_MAX_TOCTOU_RETRIES as usize] = [
+    std::time::Duration::from_millis(10),
+    std::time::Duration::from_millis(50),
+    std::time::Duration::from_millis(200),
+];
 
 /// DISCOVER phase — read-only LLC snapshot.
 ///
-/// For every LLC on the host: stat the canonical lockfile (materializing
+/// Walks ONLY the LLCs whose CPUs overlap `allowed` (the calling
+/// process's `sched_getaffinity` cpuset). LLCs entirely outside the
+/// cpuset are skipped — locking one would never contribute a
+/// schedulable CPU to `plan.cpus`, and on a heavily-pinned runner
+/// (CI cgroup with N out of M CPUs allowed) skipping them avoids
+/// O(host_llcs - allowed_llcs) lockfile materializations and
+/// /proc/locks lookups per attempt. The PLAN phase still receives a
+/// snapshot vector indexed by `LlcSnapshot.llc_idx`, not by
+/// position, so a sparse snapshot set works without any further
+/// adjustment downstream.
+///
+/// For every selected LLC: stat the canonical lockfile (materializing
 /// it with `O_CREAT | O_CLOEXEC | 0o666` if absent so subsequent
 /// ACQUIRE has a stable inode), then parse one `/proc/locks` read to
 /// populate every snapshot's holder list in a single pass. No flock
@@ -1016,9 +1069,27 @@ const ACQUIRE_MAX_TOCTOU_RETRIES: u32 = 1;
 /// Returns `Ok(snapshots)` on success. Propagates opening + stat
 /// errors so a missing `/tmp` or permission failure surfaces
 /// actionably.
-fn discover_llc_snapshots(topo: &HostTopology, mountinfo: &str) -> Result<Vec<LlcSnapshot>> {
+fn discover_llc_snapshots(
+    topo: &HostTopology,
+    allowed: &std::collections::BTreeSet<usize>,
+    mountinfo: &str,
+) -> Result<Vec<LlcSnapshot>> {
     let mut snapshots: Vec<LlcSnapshot> = Vec::with_capacity(topo.llc_groups.len());
     for llc_idx in 0..topo.llc_groups.len() {
+        // Skip LLCs whose CPUs are entirely outside the calling
+        // process's allowed cpuset — they cannot contribute a
+        // schedulable CPU to `plan.cpus`, and locking one would just
+        // pay for a lockfile + /proc/locks pass without coordination
+        // value. The sparse snapshot vector keeps llc_idx as the
+        // identity key, so PLAN's index-based iteration is
+        // unaffected.
+        if !topo.llc_groups[llc_idx]
+            .cpus
+            .iter()
+            .any(|c| allowed.contains(c))
+        {
+            continue;
+        }
         let path = std::path::PathBuf::from(llc_lock_path(llc_idx));
         // Ensure the lockfile inode exists so `read_holders_with_mountinfo`
         // can key /proc/locks lookups on it. Deliberately takes no
@@ -1210,7 +1281,9 @@ fn try_acquire_llc_plan_locks(
 
 /// Entry point for the `--cpu-cap` PLAN pipeline.
 ///
-/// Runs DISCOVER → PLAN → ACQUIRE with at most one TOCTOU retry. On
+/// Runs DISCOVER → PLAN → ACQUIRE with up to
+/// [`ACQUIRE_MAX_TOCTOU_RETRIES`] retries (each separated by a
+/// per-retry sleep from [`TOCTOU_RETRY_DELAYS`]). On
 /// success returns an [`LlcPlan`] holding the selected LLCs, their
 /// flattened CPUs (intersected with the calling process's allowed
 /// cpuset), the derived `mems` set, the diagnostic snapshot, and the
@@ -1313,7 +1386,7 @@ where
 
     let mut attempt: u32 = 0;
     loop {
-        let snapshots = discover_llc_snapshots(topo, &mountinfo)?;
+        let snapshots = discover_llc_snapshots(topo, &allowed, &mountinfo)?;
         let selected = plan_from_snapshots(&snapshots, target_cpus, topo, &allowed, |from, to| {
             test_topo.numa_distance(from, to)
         });
@@ -1378,7 +1451,7 @@ where
                 if attempt >= ACQUIRE_MAX_TOCTOU_RETRIES {
                     // Rebuild holder diagnostics from a FRESH read so
                     // the error points at the peer that actually won.
-                    let final_snapshots = discover_llc_snapshots(topo, &mountinfo)?;
+                    let final_snapshots = discover_llc_snapshots(topo, &allowed, &mountinfo)?;
                     let holders: Vec<String> = final_snapshots
                         .iter()
                         .filter(|s| !s.holders.is_empty())
@@ -1398,13 +1471,17 @@ where
                     return Err(anyhow::Error::new(ResourceContention {
                         reason: format!(
                             "acquire_llc_plan: could not reserve {target_cpus} \
-                             CPU(s) after {retries} TOCTOU retry; holders: \
+                             CPU(s) after {attempts} attempts; holders: \
                              {holder_text}. Run `ktstr locks --json` to see \
                              every ktstr lock on this host.",
-                            retries = ACQUIRE_MAX_TOCTOU_RETRIES + 1,
+                            attempts = ACQUIRE_MAX_TOCTOU_RETRIES + 1,
                         ),
                     }));
                 }
+                // Sleep between attempts so a racing peer has time
+                // to drop its fds before the next DISCOVER. Indexed
+                // by `attempt` (0..RETRIES) — see TOCTOU_RETRY_DELAYS.
+                std::thread::sleep(TOCTOU_RETRY_DELAYS[attempt as usize]);
                 attempt += 1;
             }
         }
@@ -4231,17 +4308,25 @@ mod tests {
         let _ = child.wait();
     }
 
-    /// `ACQUIRE_MAX_TOCTOU_RETRIES` pins the retry budget at 1 —
-    /// one DISCOVER + at most one retry DISCOVER (two total
-    /// attempts). The second DISCOVER's /proc/locks read IS the
-    /// backoff; more retries just amplify livelock risk without
-    /// adding coordination signal. Regression guard against a
-    /// future "just retry harder" tweak.
+    /// `ACQUIRE_MAX_TOCTOU_RETRIES` pins the retry budget at 3 —
+    /// one DISCOVER + up to three retry DISCOVERs (four total
+    /// attempts), each separated by an ascending micro-sleep
+    /// (10ms, 50ms, 200ms — see [`TOCTOU_RETRY_DELAYS`]) so a
+    /// racing peer has time to drop its fds before the next
+    /// snapshot. Regression guard against a future "just retry
+    /// harder" tweak that would amplify livelock cost without
+    /// adding coordination signal.
     #[test]
-    fn acquire_max_toctou_retries_pinned_at_one() {
+    fn acquire_max_toctou_retries_pinned() {
         assert_eq!(
-            ACQUIRE_MAX_TOCTOU_RETRIES, 1,
-            "retry budget must be 1 — higher values amplify livelock",
+            ACQUIRE_MAX_TOCTOU_RETRIES, 3,
+            "retry budget must be 3 — micro-sleeps absorb mid-sized races",
+        );
+        assert_eq!(
+            TOCTOU_RETRY_DELAYS.len(),
+            ACQUIRE_MAX_TOCTOU_RETRIES as usize,
+            "one sleep per retry — TOCTOU_RETRY_DELAYS length must \
+             match ACQUIRE_MAX_TOCTOU_RETRIES exactly",
         );
     }
 
@@ -4339,8 +4424,8 @@ mod tests {
         );
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("TOCTOU retry"),
-            "message must name the retry outcome: {msg}",
+            msg.contains("attempts"),
+            "message must name the attempt count: {msg}",
         );
 
         cleanup_lock("/tmp/ktstr-llc-0.lock");
