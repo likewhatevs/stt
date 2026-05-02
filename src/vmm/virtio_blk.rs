@@ -75,7 +75,7 @@
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;
 
 use virtio_bindings::virtio_blk::{
@@ -626,53 +626,26 @@ impl VirtioBlkCounters {
 // Device struct
 // ----------------------------------------------------------------------------
 
-/// Virtio-block MMIO device.
-pub struct VirtioBlk {
+/// Owns the request-processing state — descriptor queue, backing
+/// file, throttle buckets, scratch buffers, capacity, RO flag, and
+/// the shared counters Arc. Today the worker runs inline on the
+/// vCPU thread (`VirtioBlk::drain_bracket` → `BlkWorker::drain_bracket`);
+/// the struct boundary isolates request-processing state from MMIO
+/// state, enabling a future worker-thread move.
+///
+/// The MMIO-side state (interrupt_status, irq_evt, mem, FSM bits)
+/// stays on `VirtioBlk` so the MMIO read/write paths don't need to
+/// reach across the worker boundary.
+struct BlkWorker {
     queues: [Queue; NUM_QUEUES],
-    queue_select: u32,
-    device_features_sel: u32,
-    driver_features_sel: u32,
-    driver_features: u64,
-    device_status: u32,
-    interrupt_status: u32,
-    config_generation: u32,
-    /// Eventfd for KVM irqfd.
-    irq_evt: EventFd,
-    /// Guest memory reference. Set before starting vCPUs.
-    mem: Option<GuestMemoryMmap>,
-    /// Backing file. The device reads and writes sectors via
+    /// Backing file. The worker reads and writes sectors via
     /// `pread`/`pwrite` and never inspects the on-disk contents.
     backing: File,
-    /// Capacity in 512-byte sectors. Determines what the guest sees
-    /// in the config space's `capacity` field.
-    capacity_sectors: u64,
-    /// Capacity in bytes. Computed once at construction
-    /// (`capacity_sectors * VIRTIO_BLK_SECTOR_SIZE`) and threaded
-    /// into handlers so the multiply isn't repeated per request and
-    /// can never overflow on a malicious sector value (the multiply
-    /// happens once on host-trusted input).
-    capacity_bytes: u64,
     /// Token-bucket for ops/sec.
     ops_bucket: TokenBucket,
     /// Token-bucket for bytes/sec.
     bytes_bucket: TokenBucket,
-    /// Counters.
-    counters: Arc<VirtioBlkCounters>,
-    /// Read-only mode. When `true`, the device advertises
-    /// `VIRTIO_BLK_F_RO`. `VIRTIO_BLK_T_OUT` requests are rejected
-    /// with `VIRTIO_BLK_S_IOERR`; `VIRTIO_BLK_T_FLUSH` requests
-    /// return `VIRTIO_BLK_S_OK` (a no-op flush — there's no dirty
-    /// data to flush, and a guest issuing a precautionary flush
-    /// during mount-readonly should not see an error). Per
-    /// virtio-v1.2 §5.2.5.1, when `F_RO` is negotiated the device
-    /// is read-only and the guest driver SHOULD treat the device
-    /// as read-only; how the driver chooses to do that
-    /// (read-only mount, error on `open(O_WRONLY)`, etc.) is
-    /// driver business. The in-device rejection is defense
-    /// against a malicious or buggy guest that ignores the
-    /// negotiated feature bit.
-    read_only: bool,
-    /// Reusable scratch for the descriptor-walk in `process_requests`.
+    /// Reusable scratch for the descriptor-walk in `drain_bracket`.
     /// Allocated once at construction and `clear()`-ed each
     /// iteration so the underlying capacity (sized by the worst-case
     /// chain) is reused. Avoids one Vec allocation per request on
@@ -690,7 +663,68 @@ pub struct VirtioBlk {
     /// at which point all subsequent IO is amortized to zero
     /// allocation.
     io_buf_scratch: Vec<u8>,
-    /// One-shot guard so the "process_requests called before
+    /// Capacity in bytes. Computed once at construction
+    /// (`capacity_sectors * VIRTIO_BLK_SECTOR_SIZE`) and threaded
+    /// into handlers so the multiply isn't repeated per request and
+    /// can never overflow on a malicious sector value (the multiply
+    /// happens once on host-trusted input).
+    capacity_bytes: u64,
+    /// Read-only mode. When `true`, the device advertises
+    /// `VIRTIO_BLK_F_RO`. `VIRTIO_BLK_T_OUT` requests are rejected
+    /// with `VIRTIO_BLK_S_IOERR`; `VIRTIO_BLK_T_FLUSH` requests
+    /// return `VIRTIO_BLK_S_OK` (a no-op flush — there's no dirty
+    /// data to flush, and a guest issuing a precautionary flush
+    /// during mount-readonly should not see an error). Per
+    /// virtio-v1.2 §5.2.5.1, when `F_RO` is negotiated the device
+    /// is read-only and the guest driver SHOULD treat the device
+    /// as read-only; how the driver chooses to do that
+    /// (read-only mount, error on `open(O_WRONLY)`, etc.) is
+    /// driver business. The in-device rejection is defense
+    /// against a malicious or buggy guest that ignores the
+    /// negotiated feature bit.
+    read_only: bool,
+    /// Counters. `Arc` so external monitor observers can read them
+    /// without holding any device borrow; the worker mutates via
+    /// the same `Arc`.
+    counters: Arc<VirtioBlkCounters>,
+}
+
+/// Virtio-block MMIO device.
+pub struct VirtioBlk {
+    queue_select: u32,
+    device_features_sel: u32,
+    driver_features_sel: u32,
+    driver_features: u64,
+    device_status: u32,
+    /// Atomic so a future worker thread can set bits via `fetch_or`;
+    /// today `BlkWorker::drain_bracket` runs inline on the vCPU thread.
+    /// vCPU MMIO readers (`load(Acquire)` in `mmio_read
+    /// INTERRUPT_STATUS`) can race without a lock. INTERRUPT_ACK clears
+    /// bits via `fetch_and(!val, AcqRel)`. Worker writes are
+    /// Release-ordered so the bit set is visible alongside the chain's
+    /// `add_used` publish (Queue::add_used publishes used.idx with
+    /// Release; Queue::needs_notification issues a SeqCst fence before
+    /// reading used_event, ordering the fetch_or against the IRQ
+    /// decision).
+    interrupt_status: AtomicU32,
+    /// Atomic so a future resize path can bump generation from a
+    /// non-vCPU thread without locking, while the vCPU MMIO read
+    /// observes a fresh value via `load(Acquire)`. v0 still bumps
+    /// only on `reset()` (vCPU thread); the atomic shape is
+    /// defense-in-depth for future runtime config changes.
+    config_generation: AtomicU32,
+    /// Eventfd for KVM irqfd.
+    irq_evt: EventFd,
+    /// Guest memory reference. Set before starting vCPUs.
+    mem: Option<GuestMemoryMmap>,
+    /// Capacity in 512-byte sectors. Determines what the guest sees
+    /// in the config space's `capacity` field.
+    capacity_sectors: u64,
+    /// Request-processing state (queue, backing, throttle, scratch,
+    /// capacity_bytes, read_only, counters Arc). Inline today; a
+    /// follow-up moves this onto a dedicated worker thread.
+    worker: BlkWorker,
+    /// One-shot guard so the "drain_bracket called before
     /// set_mem" warning fires at most once per device instance.
     /// Without this, a buggy caller that issues N notifies before
     /// `set_mem` would flood the log with N copies of the same
@@ -742,26 +776,29 @@ impl VirtioBlk {
         let capacity_sectors = capacity_bytes / VIRTIO_BLK_SECTOR_SIZE as u64;
         let capacity_bytes = capacity_sectors * VIRTIO_BLK_SECTOR_SIZE as u64;
         let (ops_bucket, bytes_bucket) = buckets_from_throttle(throttle);
-        VirtioBlk {
+        let worker = BlkWorker {
             queues: [Queue::new(QUEUE_MAX_SIZE).expect("valid queue size")],
+            backing,
+            ops_bucket,
+            bytes_bucket,
+            all_descs_scratch: Vec::with_capacity(VIRTIO_BLK_SEG_MAX as usize + 2),
+            io_buf_scratch: Vec::new(),
+            capacity_bytes,
+            read_only,
+            counters: Arc::new(VirtioBlkCounters::default()),
+        };
+        VirtioBlk {
             queue_select: 0,
             device_features_sel: 0,
             driver_features_sel: 0,
             driver_features: 0,
             device_status: 0,
-            interrupt_status: 0,
-            config_generation: 0,
+            interrupt_status: AtomicU32::new(0),
+            config_generation: AtomicU32::new(0),
             irq_evt,
             mem: None,
-            backing,
             capacity_sectors,
-            capacity_bytes,
-            ops_bucket,
-            bytes_bucket,
-            counters: Arc::new(VirtioBlkCounters::default()),
-            read_only,
-            all_descs_scratch: Vec::with_capacity(VIRTIO_BLK_SEG_MAX as usize + 2),
-            io_buf_scratch: Vec::new(),
+            worker,
             mem_unset_warned: AtomicBool::new(false),
         }
     }
@@ -785,7 +822,7 @@ impl VirtioBlk {
     /// monitor thread holds an Arc to read counters without locking
     /// the device.
     pub fn counters(&self) -> Arc<VirtioBlkCounters> {
-        Arc::clone(&self.counters)
+        Arc::clone(&self.worker.counters)
     }
 
     fn device_features(&self) -> u64 {
@@ -842,7 +879,7 @@ impl VirtioBlk {
             | (1u64 << VIRTIO_BLK_F_SIZE_MAX)
             | (1u64 << VIRTIO_BLK_F_FLUSH)
             | (1u64 << VIRTIO_RING_F_EVENT_IDX);
-        if self.read_only {
+        if self.worker.read_only {
             feats |= 1u64 << VIRTIO_BLK_F_RO;
         }
         feats
@@ -928,6 +965,37 @@ impl VirtioBlk {
     // Request queue processing
     // ------------------------------------------------------------------
 
+    /// Synchronous wrapper; calls drain_bracket inline.
+    fn process_requests(&mut self) {
+        self.drain_bracket();
+    }
+
+    /// Forward the drain to the worker, supplying it with the
+    /// MMIO-side state it needs: guest memory, the irqfd, and the
+    /// interrupt-status atomic. When `mem` is unset the worker is
+    /// never engaged — the wiring bug is surfaced here once per
+    /// device via the `mem_unset_warned` latch.
+    fn drain_bracket(&mut self) {
+        let Some(mem) = self.mem.as_ref() else {
+            // Caller (kvm wiring in src/vmm/mod.rs) is supposed to
+            // call `set_mem` before any vCPU runs. A queue-notify
+            // before that is a wiring bug; surface it once per
+            // device so the log isn't flooded if the guest spams
+            // notifies on the broken setup.
+            if !self.mem_unset_warned.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    "virtio-blk drain_bracket called before set_mem; \
+                     dropping all requests until guest memory is wired"
+                );
+            }
+            return;
+        };
+        self.worker
+            .drain_bracket(mem, &self.irq_evt, &self.interrupt_status);
+    }
+}
+
+impl BlkWorker {
     /// Drain the request queue, processing reads/writes/flushes
     /// against the backing file and respecting the throttle.
     ///
@@ -938,26 +1006,23 @@ impl VirtioBlk {
     /// data-segment vector), so the borrow on the queue is released
     /// before `add_used` re-borrows it. This mirrors the
     /// virtio-console pattern (see `process_tx` in virtio_console.rs).
-    fn process_requests(&mut self) {
-        // Borrow guest memory rather than cloning. `Arc::clone` would
-        // bump the refcount on every notify; the guest memory map is
-        // alive for the full VM lifetime so the borrow is sufficient.
-        let Some(mem) = self.mem.as_ref() else {
-            // Caller (kvm wiring in src/vmm/mod.rs) is supposed to
-            // call `set_mem` before any vCPU runs. A queue-notify
-            // before that is a wiring bug; surface it once per
-            // device so the log isn't flooded if the guest spams
-            // notifies on the broken setup.
-            if !self.mem_unset_warned.swap(true, Ordering::Relaxed) {
-                tracing::warn!(
-                    "virtio-blk process_requests called before set_mem; \
-                     dropping all requests until guest memory is wired"
-                );
-            }
-            return;
-        };
-        // `mem` borrows `self.mem`, and the request loop also calls
-        // through `self.handle_*` (which take `&self`) plus
+    ///
+    /// Extracted onto `BlkWorker` so the body — outer/inner
+    /// bracket, validation, throttle, dispatch, publish_completion,
+    /// post-drain V8 split — owns one source of truth for the
+    /// drain logic. Invoked today from the vCPU MMIO arm via
+    /// `VirtioBlk::drain_bracket`.
+    ///
+    /// Borrows guest memory, the irqfd, and the interrupt-status
+    /// atomic from the device — those live on the MMIO side
+    /// (`VirtioBlk`) and are passed in.
+    fn drain_bracket(
+        &mut self,
+        mem: &GuestMemoryMmap,
+        irq_evt: &EventFd,
+        interrupt_status: &AtomicU32,
+    ) {
+        // The request loop calls handlers (which take `&self`) plus
         // `self.ops_bucket.consume` / counter mutation (which take
         // `&mut self.ops_bucket`/`&mut self.bytes_bucket`). To keep
         // the borrow checker happy we materialise the queue handle
@@ -1033,7 +1098,7 @@ impl VirtioBlk {
             // `clear()` keeps the underlying Vec capacity allocated
             // once at construction (sized by VIRTIO_BLK_SEG_MAX + 2),
             // so steady-state push/clear is amortized to zero
-            // allocation. Hot-path optimization — process_requests
+            // allocation. Hot-path optimization — drain_bracket
             // runs on the vCPU thread and is invoked once per
             // QUEUE_NOTIFY MMIO write.
             self.all_descs_scratch.clear();
@@ -1350,7 +1415,7 @@ impl VirtioBlk {
             let counters = self.counters.as_ref();
             let cap_bytes = self.capacity_bytes;
             let read_only = self.read_only;
-            let pre_throttle = Self::classify_pre_throttle(req_type, read_only, counters);
+            let pre_throttle = VirtioBlk::classify_pre_throttle(req_type, read_only, counters);
 
             // Direction validation, hoisted out of
             // handle_read_impl/handle_write_impl/handle_get_id_impl
@@ -1473,7 +1538,7 @@ impl VirtioBlk {
                 // VIRTIO_BLK_SIZE_MAX, then steady-state is zero
                 // allocation per segment.
                 match req_type {
-                    VIRTIO_BLK_T_IN => Self::handle_read_impl(
+                    VIRTIO_BLK_T_IN => VirtioBlk::handle_read_impl(
                         backing,
                         cap_bytes,
                         counters,
@@ -1483,7 +1548,7 @@ impl VirtioBlk {
                         data_len,
                         &mut self.io_buf_scratch,
                     ),
-                    VIRTIO_BLK_T_OUT => Self::handle_write_impl(
+                    VIRTIO_BLK_T_OUT => VirtioBlk::handle_write_impl(
                         backing,
                         cap_bytes,
                         counters,
@@ -1493,9 +1558,9 @@ impl VirtioBlk {
                         data_len,
                         &mut self.io_buf_scratch,
                     ),
-                    VIRTIO_BLK_T_FLUSH => Self::handle_flush_impl(backing, counters),
+                    VIRTIO_BLK_T_FLUSH => VirtioBlk::handle_flush_impl(backing, counters),
                     VIRTIO_BLK_T_GET_ID => {
-                        Self::handle_get_id_impl(counters, mem, data_segments)
+                        VirtioBlk::handle_get_id_impl(counters, mem, data_segments)
                     }
                     // Defense-in-depth fall-through. classify_pre_throttle's
                     // catch-all `_ => Some((VIRTIO_BLK_S_UNSUPP, 1))` arm
@@ -1545,10 +1610,10 @@ impl VirtioBlk {
                 "virtio-blk request done"
             );
             // Write status, then add_used ONLY if the status write
-            // succeeded. `Queue::add_used` performs a Release-store
-            // of the descriptor head/len then a SeqCst fence before
-            // publishing used.idx, so the prior status-byte
-            // write_slice is flushed before the guest sees the new
+            // succeeded. `Queue::add_used` writes the descriptor
+            // head/len via write_obj, then publishes used.idx with
+            // Ordering::Release, so the prior status-byte
+            // write_slice is ordered before the guest sees the new
             // index. The chain has already been dropped (the for
             // loop above consumed it), so this `q` re-borrow is
             // legal.
@@ -1599,7 +1664,15 @@ impl VirtioBlk {
             // the bit set across a suppressed eventfd is harmless:
             // the next genuine IRQ delivers and the guest's ISR
             // reads-then-clears via VIRTIO_MMIO_INTERRUPT_ACK.
-            self.interrupt_status |= VIRTIO_MMIO_INT_VRING;
+            // Release-ordered fetch_or so the bit set happens-after
+            // the chain's add_used publish (Queue::needs_notification
+            // issues a SeqCst fence after this, ordering the bit-set
+            // against the IRQ decision). Result: a vCPU
+            // reading INTERRUPT_STATUS via Acquire-load and finding
+            // INT_VRING set is guaranteed to also observe the
+            // freshly-published used.idx — no torn observation
+            // where the bit appears before the ring update.
+            interrupt_status.fetch_or(VIRTIO_MMIO_INT_VRING, Ordering::Release);
             // `Queue::needs_notification` consults the guest's
             // `used_event` threshold (from the avail ring) when
             // EVENT_IDX is negotiated — returns false if the guest
@@ -1627,11 +1700,13 @@ impl VirtioBlk {
                 })
                 .unwrap_or(true)
             {
-                let _ = self.irq_evt.write(1);
+                let _ = irq_evt.write(1);
             }
         }
     }
+}
 
+impl VirtioBlk {
     /// Service `VIRTIO_BLK_T_IN` (read). Reads bytes from the
     /// backing file at `sector * 512` into the device-writable
     /// guest segments (scatter). Returns `(status_byte, used_len)`;
@@ -1948,9 +2023,9 @@ impl VirtioBlk {
         let data_len: u64 = data_segments.iter().map(|d| d.len as u64).sum();
         let mut scratch = Vec::new();
         let (status, used_len) = Self::handle_read_impl(
-            &self.backing,
-            self.capacity_bytes,
-            self.counters.as_ref(),
+            &self.worker.backing,
+            self.worker.capacity_bytes,
+            self.worker.counters.as_ref(),
             mem,
             sector,
             data_segments,
@@ -1973,9 +2048,9 @@ impl VirtioBlk {
         let data_len: u64 = data_segments.iter().map(|d| d.len as u64).sum();
         let mut scratch = Vec::new();
         let (status, used_len) = Self::handle_write_impl(
-            &self.backing,
-            self.capacity_bytes,
-            self.counters.as_ref(),
+            &self.worker.backing,
+            self.worker.capacity_bytes,
+            self.worker.counters.as_ref(),
             mem,
             sector,
             data_segments,
@@ -1989,7 +2064,8 @@ impl VirtioBlk {
 
     #[cfg(test)]
     fn handle_flush(&self, mem: &GuestMemoryMmap, status_addr: GuestAddress) -> (u8, u32) {
-        let (status, used_len) = Self::handle_flush_impl(&self.backing, self.counters.as_ref());
+        let (status, used_len) =
+            Self::handle_flush_impl(&self.worker.backing, self.worker.counters.as_ref());
         mem.write_slice(&[status], status_addr)
             .expect("write status in test wrapper");
         (status, used_len)
@@ -2003,7 +2079,7 @@ impl VirtioBlk {
         status_addr: GuestAddress,
     ) -> (u8, u32) {
         let (status, used_len) =
-            Self::handle_get_id_impl(self.counters.as_ref(), mem, data_segments);
+            Self::handle_get_id_impl(self.worker.counters.as_ref(), mem, data_segments);
         mem.write_slice(&[status], status_addr)
             .expect("write status in test wrapper");
         (status, used_len)
@@ -2052,15 +2128,15 @@ impl VirtioBlk {
             }
             VIRTIO_MMIO_QUEUE_NUM_MAX => self
                 .selected_queue()
-                .map(|i| self.queues[i].max_size() as u32)
+                .map(|i| self.worker.queues[i].max_size() as u32)
                 .unwrap_or(0),
             VIRTIO_MMIO_QUEUE_READY => self
                 .selected_queue()
-                .map(|i| self.queues[i].ready() as u32)
+                .map(|i| self.worker.queues[i].ready() as u32)
                 .unwrap_or(0),
-            VIRTIO_MMIO_INTERRUPT_STATUS => self.interrupt_status,
+            VIRTIO_MMIO_INTERRUPT_STATUS => self.interrupt_status.load(Ordering::Acquire),
             VIRTIO_MMIO_STATUS => self.device_status,
-            VIRTIO_MMIO_CONFIG_GENERATION => self.config_generation,
+            VIRTIO_MMIO_CONFIG_GENERATION => self.config_generation.load(Ordering::Acquire),
             _ => 0,
         };
         data.copy_from_slice(&val.to_le_bytes());
@@ -2152,12 +2228,12 @@ impl VirtioBlk {
             VIRTIO_MMIO_QUEUE_SEL => self.queue_select = val,
             VIRTIO_MMIO_QUEUE_NUM if self.queue_config_allowed() => {
                 if let Some(i) = self.selected_queue() {
-                    self.queues[i].set_size(val as u16);
+                    self.worker.queues[i].set_size(val as u16);
                 }
             }
             VIRTIO_MMIO_QUEUE_READY if self.queue_config_allowed() => {
                 if let Some(i) = self.selected_queue() {
-                    self.queues[i].set_ready(val == 1);
+                    self.worker.queues[i].set_ready(val == 1);
                 }
             }
             VIRTIO_MMIO_QUEUE_NOTIFY => {
@@ -2167,7 +2243,11 @@ impl VirtioBlk {
                 }
             }
             VIRTIO_MMIO_INTERRUPT_ACK => {
-                self.interrupt_status &= !val;
+                // Clear bits the guest ACKed. AcqRel: the Acquire
+                // half pairs with the worker's Release fetch_or so
+                // we don't lose a bit racing with worker bit-set;
+                // the Release half publishes the cleared state.
+                self.interrupt_status.fetch_and(!val, Ordering::AcqRel);
             }
             VIRTIO_MMIO_STATUS => {
                 if val == 0 {
@@ -2189,32 +2269,32 @@ impl VirtioBlk {
             // then HIGH but the order is not load-bearing here.
             VIRTIO_MMIO_QUEUE_DESC_LOW if self.queue_config_allowed() => {
                 if let Some(i) = self.selected_queue() {
-                    self.queues[i].set_desc_table_address(Some(val), None);
+                    self.worker.queues[i].set_desc_table_address(Some(val), None);
                 }
             }
             VIRTIO_MMIO_QUEUE_DESC_HIGH if self.queue_config_allowed() => {
                 if let Some(i) = self.selected_queue() {
-                    self.queues[i].set_desc_table_address(None, Some(val));
+                    self.worker.queues[i].set_desc_table_address(None, Some(val));
                 }
             }
             VIRTIO_MMIO_QUEUE_AVAIL_LOW if self.queue_config_allowed() => {
                 if let Some(i) = self.selected_queue() {
-                    self.queues[i].set_avail_ring_address(Some(val), None);
+                    self.worker.queues[i].set_avail_ring_address(Some(val), None);
                 }
             }
             VIRTIO_MMIO_QUEUE_AVAIL_HIGH if self.queue_config_allowed() => {
                 if let Some(i) = self.selected_queue() {
-                    self.queues[i].set_avail_ring_address(None, Some(val));
+                    self.worker.queues[i].set_avail_ring_address(None, Some(val));
                 }
             }
             VIRTIO_MMIO_QUEUE_USED_LOW if self.queue_config_allowed() => {
                 if let Some(i) = self.selected_queue() {
-                    self.queues[i].set_used_ring_address(Some(val), None);
+                    self.worker.queues[i].set_used_ring_address(Some(val), None);
                 }
             }
             VIRTIO_MMIO_QUEUE_USED_HIGH if self.queue_config_allowed() => {
                 if let Some(i) = self.selected_queue() {
-                    self.queues[i].set_used_ring_address(None, Some(val));
+                    self.worker.queues[i].set_used_ring_address(None, Some(val));
                 }
             }
             _ => {}
@@ -2249,14 +2329,18 @@ impl VirtioBlk {
             if new_bits == VIRTIO_CONFIG_S_FEATURES_OK
                 && self.driver_features & (1u64 << VIRTIO_RING_F_EVENT_IDX) != 0
             {
-                self.queues[REQ_QUEUE].set_event_idx(true);
+                self.worker.queues[REQ_QUEUE].set_event_idx(true);
             }
         }
     }
 
     fn reset(&mut self) {
         self.device_status = 0;
-        self.interrupt_status = 0;
+        // Release-ordered store so any subsequent vCPU MMIO read of
+        // INTERRUPT_STATUS observes the cleared state alongside
+        // the post-reset queue/feature state. Pairs with the
+        // mmio_read Acquire load.
+        self.interrupt_status.store(0, Ordering::Release);
         self.queue_select = 0;
         self.device_features_sel = 0;
         self.driver_features_sel = 0;
@@ -2271,8 +2355,12 @@ impl VirtioBlk {
         // guards. The cost is a single u32 increment per reset,
         // worth paying to avoid a torn-read class of bug if/when
         // resize lands.
-        self.config_generation = self.config_generation.wrapping_add(1);
-        for q in &mut self.queues {
+        // fetch_add with Release so a re-binding driver's MMIO
+        // read of CONFIG_GENERATION sees the bumped value before
+        // it re-reads any config-space field. wrapping_add is
+        // implicit in fetch_add's modular arithmetic.
+        self.config_generation.fetch_add(1, Ordering::Release);
+        for q in &mut self.worker.queues {
             q.reset();
         }
     }
@@ -2686,7 +2774,8 @@ mod tests {
     fn interrupt_status_and_ack() {
         let mut dev = make_device(VIRTIO_BLK_DEFAULT_CAPACITY_BYTES, DiskThrottle::default());
         assert_eq!(read_reg(&dev, VIRTIO_MMIO_INTERRUPT_STATUS), 0);
-        dev.interrupt_status = VIRTIO_MMIO_INT_VRING;
+        dev.interrupt_status
+            .store(VIRTIO_MMIO_INT_VRING, Ordering::Release);
         assert_eq!(
             read_reg(&dev, VIRTIO_MMIO_INTERRUPT_STATUS),
             VIRTIO_MMIO_INT_VRING
@@ -2711,7 +2800,8 @@ mod tests {
     fn interrupt_ack_clears_bits() {
         use virtio_bindings::virtio_mmio::VIRTIO_MMIO_INT_CONFIG;
         let mut dev = make_device(VIRTIO_BLK_DEFAULT_CAPACITY_BYTES, DiskThrottle::default());
-        dev.interrupt_status = VIRTIO_MMIO_INT_VRING | VIRTIO_MMIO_INT_CONFIG;
+        dev.interrupt_status
+            .store(VIRTIO_MMIO_INT_VRING | VIRTIO_MMIO_INT_CONFIG, Ordering::Release);
         write_reg(&mut dev, VIRTIO_MMIO_INTERRUPT_ACK, VIRTIO_MMIO_INT_VRING);
         assert_eq!(
             read_reg(&dev, VIRTIO_MMIO_INTERRUPT_STATUS),
@@ -2805,7 +2895,7 @@ mod tests {
         write_reg(&mut dev, VIRTIO_MMIO_QUEUE_SEL, 0);
         write_reg(&mut dev, VIRTIO_MMIO_QUEUE_DESC_LOW, 0x1000);
         // Not accepted before FEATURES_OK.
-        assert_ne!(dev.queues[0].desc_table(), 0x1000);
+        assert_ne!(dev.worker.queues[0].desc_table(), 0x1000);
 
         write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_ACK);
         write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_DRV);
@@ -2820,7 +2910,7 @@ mod tests {
         write_reg(&mut dev, VIRTIO_MMIO_QUEUE_SEL, 0);
         write_reg(&mut dev, VIRTIO_MMIO_QUEUE_DESC_LOW, 0x1000);
         write_reg(&mut dev, VIRTIO_MMIO_QUEUE_DESC_HIGH, 0);
-        assert_eq!(dev.queues[0].desc_table(), 0x1000);
+        assert_eq!(dev.worker.queues[0].desc_table(), 0x1000);
     }
 
     /// Reads of unknown register offsets return 0 (the catchall
@@ -2908,7 +2998,7 @@ mod tests {
         write_reg(&mut dev, VIRTIO_MMIO_QUEUE_NUM, 64);
         // Queue size should still be the post-init default
         // (QUEUE_MAX_SIZE), not 64.
-        assert_eq!(dev.queues[0].size(), QUEUE_MAX_SIZE);
+        assert_eq!(dev.worker.queues[0].size(), QUEUE_MAX_SIZE);
     }
 
     // ----------------------------------------------------------------
@@ -3117,7 +3207,7 @@ mod tests {
         // read_only flush behaviour is checked through the
         // process_requests dispatch table; here we just pin the
         // device's `read_only` flag is captured.
-        assert!(dev.read_only);
+        assert!(dev.worker.read_only);
     }
 
     #[test]
@@ -3992,7 +4082,7 @@ mod tests {
         // process_requests). A regression that set the bit
         // unconditionally on every notify would leak phantom
         // interrupts to the guest's polling path.
-        assert_eq!(dev.interrupt_status & VIRTIO_MMIO_INT_VRING, 0);
+        assert_eq!(dev.interrupt_status.load(Ordering::Acquire) & VIRTIO_MMIO_INT_VRING, 0);
     }
 
     /// Multi-chain FIFO ordering through
@@ -4123,10 +4213,10 @@ mod tests {
 
         // Drain the bucket and pin its last_refill so refill on
         // the next consume yields 0 tokens.
-        dev.ops_bucket
+        dev.worker.ops_bucket
             .set_last_refill_for_test(std::time::Instant::now());
-        assert!(dev.ops_bucket.consume(1), "drain the 1-token bucket");
-        dev.ops_bucket
+        assert!(dev.worker.ops_bucket.consume(1), "drain the 1-token bucket");
+        dev.worker.ops_bucket
             .set_last_refill_for_test(std::time::Instant::now());
 
         let header_addr = GuestAddress(0x4000);
@@ -5102,10 +5192,10 @@ mod tests {
         let mut dev = VirtioBlk::new(f, cap, throttle);
         // Drain the bucket and pin its last_refill so refill on
         // the next consume yields 0 tokens.
-        dev.ops_bucket
+        dev.worker.ops_bucket
             .set_last_refill_for_test(std::time::Instant::now());
-        assert!(dev.ops_bucket.consume(1));
-        dev.ops_bucket
+        assert!(dev.worker.ops_bucket.consume(1));
+        dev.worker.ops_bucket
             .set_last_refill_for_test(std::time::Instant::now());
 
         let mem = make_chain_test_mem();
@@ -5286,7 +5376,7 @@ mod tests {
         // A loose `> 0` would let a regression that fired the
         // eventfd twice slip through; pin the exact count.
         assert_eq!(val, 1, "irq_evt counter must be exactly 1 after a single chain drain");
-        assert_ne!(dev.interrupt_status & VIRTIO_MMIO_INT_VRING, 0);
+        assert_ne!(dev.interrupt_status.load(Ordering::Acquire) & VIRTIO_MMIO_INT_VRING, 0);
     }
 
     /// EVENT_IDX path: when the guest's `used_event` threshold has
@@ -5367,7 +5457,7 @@ mod tests {
         // ISR (or polling); seeing the bit lets it know there's
         // work even if no IRQ delivered.
         assert_ne!(
-            dev.interrupt_status & VIRTIO_MMIO_INT_VRING,
+            dev.interrupt_status.load(Ordering::Acquire) & VIRTIO_MMIO_INT_VRING,
             0,
             "interrupt_status bit must be set when chain published",
         );
@@ -5455,7 +5545,7 @@ mod tests {
             val, 1,
             "irq_evt counter must be exactly 1 after a single chain completion",
         );
-        assert_ne!(dev.interrupt_status & VIRTIO_MMIO_INT_VRING, 0);
+        assert_ne!(dev.interrupt_status.load(Ordering::Acquire) & VIRTIO_MMIO_INT_VRING, 0);
     }
 
     /// EVENT_IDX path: a multi-chain drain consults
@@ -5632,7 +5722,7 @@ mod tests {
         // INTERRUPT_STATUS to find work; the bit must be visible
         // independent of the irqfd gate.
         assert_ne!(
-            dev.interrupt_status & VIRTIO_MMIO_INT_VRING,
+            dev.interrupt_status.load(Ordering::Acquire) & VIRTIO_MMIO_INT_VRING,
             0,
             "interrupt_status bit must be set after 3 completions \
              even when irqfd suppressed",
@@ -5967,7 +6057,7 @@ mod tests {
              interrupt_status bit + needs_notification gate)",
         );
         assert_ne!(
-            dev.interrupt_status & VIRTIO_MMIO_INT_VRING,
+            dev.interrupt_status.load(Ordering::Acquire) & VIRTIO_MMIO_INT_VRING,
             0,
             "interrupt_status bit must be set when chain published, \
              independent of the enable_notification bail",
@@ -6133,7 +6223,7 @@ mod tests {
         // the guest's polling path reads INTERRUPT_STATUS to learn
         // there's work, regardless of irqfd suppression.
         assert_ne!(
-            dev.interrupt_status & VIRTIO_MMIO_INT_VRING,
+            dev.interrupt_status.load(Ordering::Acquire) & VIRTIO_MMIO_INT_VRING,
             0,
             "interrupt_status bit must be set after error chain \
              completes, independent of irqfd gate",
@@ -6749,7 +6839,7 @@ mod tests {
             "drain 1 must publish exactly one chain",
         );
         assert_ne!(
-            dev.interrupt_status & VIRTIO_MMIO_INT_VRING,
+            dev.interrupt_status.load(Ordering::Acquire) & VIRTIO_MMIO_INT_VRING,
             0,
             "interrupt_status bit must be set after drain 1 \
              (V8 split: bit set independent of irqfd)",
@@ -6862,7 +6952,7 @@ mod tests {
     /// window. We let `wire_device_to_mock_with_event_idx`
     /// drive the FSM through DRIVER_OK with the mock's avail
     /// addr, then directly call
-    /// `dev.queues[REQ_QUEUE].set_avail_ring_address(...)` to
+    /// `dev.worker.queues[REQ_QUEUE].set_avail_ring_address(...)` to
     /// override post-FSM. The QueueT setter bypasses the FSM
     /// gate (the FSM gate is in `mmio_write`, not in `Queue`).
     #[test]
@@ -6959,12 +7049,12 @@ mod tests {
         // table at the mock's desc_table_addr remains in use
         // (the chain head index in custom avail.ring[0] points
         // there).
-        dev.queues[REQ_QUEUE].set_avail_ring_address(
+        dev.worker.queues[REQ_QUEUE].set_avail_ring_address(
             Some(custom_avail.0 as u32),
             Some((custom_avail.0 >> 32) as u32),
         );
         assert_eq!(
-            dev.queues[REQ_QUEUE].avail_ring(),
+            dev.worker.queues[REQ_QUEUE].avail_ring(),
             custom_avail.0,
             "avail ring override did not take effect",
         );
@@ -7008,7 +7098,7 @@ mod tests {
         );
         // V8: interrupt_status bit set independent of irqfd gate.
         assert_ne!(
-            dev.interrupt_status & VIRTIO_MMIO_INT_VRING,
+            dev.interrupt_status.load(Ordering::Acquire) & VIRTIO_MMIO_INT_VRING,
             0,
             "interrupt_status bit must be set after publish, even \
              when needs_notification fails",
@@ -7067,7 +7157,7 @@ mod tests {
         // branch and break this test's premise.
         use virtio_queue::QueueT;
         assert!(
-            !dev.queues[REQ_QUEUE].event_idx_enabled(),
+            !dev.worker.queues[REQ_QUEUE].event_idx_enabled(),
             "wire_device_to_mock must produce a legacy-path queue \
              (no EVENT_IDX); test premise depends on it",
         );
@@ -7084,7 +7174,7 @@ mod tests {
 
         // disable_notification → VRING_USED_F_NO_NOTIFY in
         // used.flags.
-        dev.queues[REQ_QUEUE]
+        dev.worker.queues[REQ_QUEUE]
             .disable_notification(&mem)
             .expect("disable_notification on legacy queue");
         let flags1: u16 = mem
@@ -7102,7 +7192,7 @@ mod tests {
         // The return Ok(_) value reflects whether avail_idx
         // changed during the disabled window; with no chains
         // queued by the test, it must be Ok(false).
-        let re_drain = dev.queues[REQ_QUEUE]
+        let re_drain = dev.worker.queues[REQ_QUEUE]
             .enable_notification(&mem)
             .expect("enable_notification on legacy queue");
         assert!(
@@ -7122,14 +7212,14 @@ mod tests {
         // produce the same observed state. Catches a regression
         // that accumulated a stale bit or that latched the flag
         // after the first toggle.
-        dev.queues[REQ_QUEUE]
+        dev.worker.queues[REQ_QUEUE]
             .disable_notification(&mem)
             .expect("second disable");
         let flags3: u16 = mem
             .read_obj(mock.used_addr())
             .expect("read used.flags after second disable");
         assert_eq!(flags3, VRING_USED_F_NO_NOTIFY as u16);
-        dev.queues[REQ_QUEUE]
+        dev.worker.queues[REQ_QUEUE]
             .enable_notification(&mem)
             .expect("second enable");
         let flags4: u16 = mem
@@ -7264,7 +7354,7 @@ mod tests {
              a chain the guest can't observe must NOT trigger an IRQ",
         );
         assert_eq!(
-            dev.interrupt_status & VIRTIO_MMIO_INT_VRING,
+            dev.interrupt_status.load(Ordering::Acquire) & VIRTIO_MMIO_INT_VRING,
             0,
             "interrupt_status bit must stay 0 when no chain is \
              published — signal_needed remained false throughout",
@@ -7511,7 +7601,7 @@ mod tests {
         // wrong reason. Pin the wiring premise.
         use virtio_queue::QueueT;
         assert!(
-            !dev.queues[REQ_QUEUE].event_idx_enabled(),
+            !dev.worker.queues[REQ_QUEUE].event_idx_enabled(),
             "legacy wiring must not negotiate EVENT_IDX",
         );
 
@@ -7596,10 +7686,10 @@ mod tests {
         // Drain the bucket and pin its last_refill so the next
         // consume yields 0 tokens (matches the existing throttle
         // tests' set_last_refill_for_test pattern).
-        dev.ops_bucket
+        dev.worker.ops_bucket
             .set_last_refill_for_test(std::time::Instant::now());
-        assert!(dev.ops_bucket.consume(1), "drain the 1-token bucket");
-        dev.ops_bucket
+        assert!(dev.worker.ops_bucket.consume(1), "drain the 1-token bucket");
+        dev.worker.ops_bucket
             .set_last_refill_for_test(std::time::Instant::now());
         // Plant `used_event = u16::MAX` BEFORE wiring the device
         // — `Queue::needs_notification` reads `used_event` lazily
@@ -7664,7 +7754,7 @@ mod tests {
         // V8: interrupt_status bit IS set independent of irqfd
         // gate. Same V8-split contract as the success path.
         assert_ne!(
-            dev.interrupt_status & VIRTIO_MMIO_INT_VRING,
+            dev.interrupt_status.load(Ordering::Acquire) & VIRTIO_MMIO_INT_VRING,
             0,
             "interrupt_status bit must be set after throttled \
              chain published, independent of irqfd suppression",

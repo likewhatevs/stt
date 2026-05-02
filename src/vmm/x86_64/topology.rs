@@ -165,12 +165,39 @@ pub fn generate_cpuid(
                 patch_cache_topology_eax(entry, smt, core, topo.cores_per_llc);
             }
 
-            // Leaf 0xA: PMU — zero all registers (disable PMU, vendor-independent)
+            // Leaf 0xA: Architectural Performance Monitoring (Intel SDM,
+            // Architectural Performance Monitoring). Synthesized to a
+            // conservative PMU v2 surface so guest
+            // sched_ext schedulers (scx_layered, scx_cosmos) get usable perf
+            // counters regardless of host hardware. KVM's intel_pmu_refresh
+            // (arch/x86/kvm/vmx/pmu_intel.c) further clamps these values
+            // against the host's actual PMU capabilities, so the guest sees
+            // min(synthesized, host). AMD CPUs ignore leaf 0xA and use
+            // MSR-based counters; populating it is a no-op on AMD.
+            //
+            // Gated on the ORIGINAL entry's version (EAX[7:0]) being non-zero.
+            // On a kvm.enable_pmu=0 host, KVM zeros leaf 0xA before exposing
+            // it via get_supported_cpuid; overwriting with v2 would tell the
+            // guest "PMU available" while intel_pmu_refresh clamps every
+            // counter count back to 0 — silent failures inside the guest.
+            // Leaving zeros lets the guest's intel_pmu_init see version=0 and
+            // graceful-fail the same way it does on a no-PMU bare-metal host.
+            //
+            // EAX[7:0]   version = 2  (Arch Perf Monitor v2)
+            // EAX[15:8]  number of GP counters per logical CPU = 4
+            // EAX[23:16] GP counter bit width = 48
+            // EAX[31:24] EBX bit-vector length = 7  (matches v2 unsupported-event mask)
+            // EBX        unsupported-event mask = 0  (all 7 architectural events available)
+            // ECX        reserved
+            // EDX[4:0]   number of fixed-function counters = 3
+            // EDX[12:5]  fixed-function counter bit width = 48
             0xa => {
-                entry.eax = 0;
-                entry.ebx = 0;
-                entry.ecx = 0;
-                entry.edx = 0;
+                if entry.eax & 0xff != 0 {
+                    entry.eax = 2 | (4 << 8) | (48 << 16) | (7 << 24);
+                    entry.ebx = 0;
+                    entry.ecx = 0;
+                    entry.edx = 3 | (48 << 5);
+                }
             }
 
             // Leaf 0x80000001: AMD extended feature identification (AMD only)
@@ -963,7 +990,7 @@ mod tests {
     }
 
     #[test]
-    fn leaf_0xa_pmu_zeroed() {
+    fn leaf_0xa_pmu_v2_synthesized() {
         let kvm = match kvm_ioctls::Kvm::new() {
             Ok(k) => k,
             Err(_) => return,
@@ -986,10 +1013,41 @@ mod tests {
         );
         let leaf_a = cpuid.iter().find(|e| e.function == 0xa);
         if let Some(entry) = leaf_a {
-            assert_eq!(entry.eax, 0, "PMU leaf should be zeroed");
-            assert_eq!(entry.ebx, 0);
-            assert_eq!(entry.ecx, 0);
-            assert_eq!(entry.edx, 0);
+            // Bit-field decode per arch/x86/include/asm/perf_event.h
+            // union cpuid10_eax: version_id, num_counters, bit_width, mask_length
+            // (each 8 bits, little end first).
+            let version = entry.eax & 0xff;
+            // Host has no PMU (kvm.enable_pmu=0 or PMU-less hardware): the
+            // gating in generate_cpuid leaves the entry zero on purpose so
+            // the guest's intel_pmu_init sees version=0 and graceful-fails.
+            // Skip the v2-shape assertions in that case — they apply only
+            // when the host advertises a PMU and we synthesized over it.
+            if version == 0 {
+                return;
+            }
+            let num_gp = (entry.eax >> 8) & 0xff;
+            let gp_width = (entry.eax >> 16) & 0xff;
+            let mask_len = (entry.eax >> 24) & 0xff;
+            assert_eq!(version, 2, "PMU v2 version must be 2");
+            assert_eq!(num_gp, 4, "PMU v2 GP counter count");
+            assert_eq!(gp_width, 48, "PMU v2 GP counter width");
+            // mask_length must be >= ARCH_PERFMON_EVENTS_COUNT (7) or
+            // intel_pmu_init in arch/x86/events/intel/core.c returns -ENODEV.
+            assert_eq!(
+                mask_len, 7,
+                "mask_length must be exactly 7 (ARCH_PERFMON_EVENTS_COUNT)"
+            );
+
+            // EBX = unsupported-event bitmap; 0 means all 7 arch events available.
+            assert_eq!(entry.ebx, 0, "no architectural events disabled");
+            assert_eq!(entry.ecx, 0, "ECX reserved for PMU v2");
+
+            // EDX: union cpuid10_edx — num_counters_fixed[4:0], bit_width_fixed[12:5].
+            let num_fixed = entry.edx & 0x1f;
+            let fixed_width = (entry.edx >> 5) & 0xff;
+            assert_eq!(num_fixed, 3, "PMU v2 fixed counter count");
+            assert_eq!(fixed_width, 48, "PMU v2 fixed counter width");
+            assert_eq!(entry.edx & !0x1fff, 0, "EDX bits[31:13] must be zero for PMU v2");
         }
     }
 

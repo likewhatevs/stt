@@ -32,6 +32,14 @@ CONFIG_FTRACE=y
 CONFIG_KPROBES=y
 CONFIG_KPROBE_EVENTS=y
 CONFIG_PERF_EVENTS=y
+# HW_PERF_EVENTS: hardware PMU sampling. On arm64 this is def_bool y
+# guarded on ARM_PMU (drivers/perf/Kconfig); declaring it explicitly
+# makes the dependency visible. Required for sched_ext schedulers
+# (scx_layered, scx_cosmos) that read perf counters via BPF kfuncs.
+# x86 builds ignore this symbol (x86 PMU support is unconditional via
+# CONFIG_PERF_EVENTS above); the symbol is defined only in
+# arch/arm64/Kconfig.
+CONFIG_HW_PERF_EVENTS=y
 # BPF_EVENTS: default y when deps met (KPROBE_EVENTS + PERF_EVENTS).
 # Explicit for clarity.
 CONFIG_BPF_EVENTS=y

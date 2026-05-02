@@ -4,7 +4,7 @@ use vm_fdt::{FdtReserveEntry, FdtWriter};
 use crate::vmm::aarch64::topology::mpidr_to_fdt_reg;
 use crate::vmm::kvm::{
     DRAM_START, FDT_MAX_SIZE, GIC_DIST_BASE, GIC_DIST_SIZE, GIC_REDIST_BASE,
-    GIC_REDIST_SIZE_PER_CPU, SERIAL_IRQ, SERIAL_MMIO_BASE, SERIAL_MMIO_SIZE, SERIAL2_IRQ,
+    GIC_REDIST_SIZE_PER_CPU, PMU_PPI, SERIAL_IRQ, SERIAL_MMIO_BASE, SERIAL_MMIO_SIZE, SERIAL2_IRQ,
     SERIAL2_MMIO_BASE, VIRTIO_BLK_IRQ, VIRTIO_BLK_MMIO_BASE, VIRTIO_CONSOLE_IRQ,
     VIRTIO_CONSOLE_MMIO_BASE,
 };
@@ -29,6 +29,11 @@ const IRQ_TYPE_EDGE_RISING: u32 = 1;
 
 /// IRQ_TYPE_LEVEL_LOW for timer PPIs (active-low per arm spec).
 const IRQ_TYPE_LEVEL_LOW: u32 = 8;
+
+/// IRQ_TYPE_LEVEL_HIGH for the PMU PPI. Matches qemu virt
+/// (hw/arm/virt.c GIC_FDT_IRQ_FLAGS_LEVEL_HI) and cloud-hypervisor
+/// (arch/src/aarch64/fdt.rs IRQ_TYPE_LEVEL_HI).
+const IRQ_TYPE_LEVEL_HIGH: u32 = 4;
 
 /// Generate a Flattened Device Tree blob for the guest.
 ///
@@ -62,6 +67,7 @@ pub fn create_fdt(
     guest_l1_unified: bool,
     numa_layout: &NumaMemoryLayout,
     has_virtio_blk: bool,
+    has_pmu: bool,
 ) -> Result<Vec<u8>> {
     // SHM base address (top of guest DRAM minus SHM size).
     let shm_base = if shm_size > 0 {
@@ -142,6 +148,24 @@ pub fn create_fdt(
 
     // /timer — arm generic timer
     write_timer(&mut fdt)?;
+
+    // /pmu — arm,armv8-pmuv3 binding so the guest pmuv3 driver
+    // attaches and perf_event_open can return a hardware backend.
+    // Required by sched_ext schedulers (scx_layered, scx_cosmos)
+    // that read perf counters via BPF kfuncs. KVM emulates the PMU
+    // via KVM_ARM_VCPU_PMU_V3; the FDT binding gates driver probe
+    // on this node's compatible string.
+    //
+    // Only emitted when the host KVM advertises Cap::ArmPmuV3
+    // (threaded as `has_pmu` from KtstrKvm). On no-PMU hosts the
+    // KVM_ARM_VCPU_PMU_V3 feature bit is masked out of vcpu_init,
+    // so the in-kernel PMU emulation never runs; advertising the
+    // FDT node anyway would have the guest pmuv3 driver attach to
+    // PPI 23, fail to receive any events, and log a noisy attach
+    // failure. Omitting the node lets the driver silently skip.
+    if has_pmu {
+        write_pmu(&mut fdt)?;
+    }
 
     // /psci — power state coordination interface
     write_psci(&mut fdt)?;
@@ -499,6 +523,30 @@ fn write_timer(fdt: &mut FdtWriter) -> Result<()> {
     Ok(())
 }
 
+/// Emit the arm,armv8-pmuv3 PMU node.
+///
+/// The compatible "arm,armv8-pmuv3" is the s/w-model binding listed in
+/// Documentation/devicetree/bindings/arm/pmu.yaml — the only one valid for
+/// KVM-emulated PMUs. The interrupt cell is `<GIC_PPI ppi flags>`; PMU_PPI
+/// (=7) is in the GIC PPI namespace (FDT cell, not the global intid that
+/// KVM_ARM_VCPU_PMU_V3_IRQ takes). Level-high matches qemu virt
+/// (GIC_FDT_IRQ_FLAGS_LEVEL_HI) and cloud-hypervisor
+/// (create_pmu_node IRQ_TYPE_LEVEL_HI).
+///
+/// interrupt-affinity is omitted: the PPI itself is per-CPU, so the
+/// driver attaches to all CPUs without an explicit phandle list — matches
+/// the binding doc note "unless this is already specified by the PPI
+/// interrupt specifier itself".
+fn write_pmu(fdt: &mut FdtWriter) -> Result<()> {
+    let pmu = fdt.begin_node("pmu").context("begin pmu")?;
+    fdt.property_string("compatible", "arm,armv8-pmuv3")
+        .context("pmu compatible")?;
+    fdt.property_array_u32("interrupts", &[GIC_PPI, PMU_PPI, IRQ_TYPE_LEVEL_HIGH])
+        .context("pmu interrupts")?;
+    fdt.end_node(pmu).context("end pmu")?;
+    Ok(())
+}
+
 fn write_psci(fdt: &mut FdtWriter) -> Result<()> {
     let psci = fdt.begin_node("psci").context("begin psci")?;
     fdt.property_string("compatible", "arm,psci-0.2")
@@ -586,6 +634,7 @@ mod tests {
             guest_l1_unified,
             &layout,
             false,
+            true,
         )
     }
 
@@ -1301,5 +1350,47 @@ mod tests {
             .iter()
             .any(|(n, _, _)| n.contains("cache") && n.starts_with("cpus/l"));
         assert!(!has_cache, "single-LLC: no cache nodes expected");
+    }
+
+    #[test]
+    fn fdt_pmu_node_present() {
+        // Verify the FDT emits an arm,armv8-pmuv3 pmu node referencing
+        // PPI 7 with level-high triggering — the binding the guest
+        // pmuv3 driver attaches to so BPF perf-event syscalls succeed.
+        let topo = default_topo();
+        let mpidrs = fake_mpidrs(topo.total_cpus());
+        let dtb = test_fdt(
+            &topo,
+            &mpidrs,
+            256,
+            "console=ttyS0",
+            None,
+            None,
+            0,
+            0,
+            false,
+        )
+        .unwrap();
+        let props = parse_dtb_props(&dtb);
+
+        let compat = props
+            .iter()
+            .find(|(n, p, _)| n == "pmu" && p == "compatible")
+            .expect("pmu node must exist with compatible property");
+        assert_eq!(
+            std::str::from_utf8(&compat.2).unwrap().trim_end_matches('\0'),
+            "arm,armv8-pmuv3",
+            "pmu compatible must match the kernel s/w-model binding",
+        );
+
+        let irq = prop_u32_array(&props, "pmu", "interrupts")
+            .expect("pmu interrupts must exist");
+        assert_eq!(irq.len(), 3, "pmu interrupt cell count");
+        assert_eq!(irq[0], GIC_PPI, "pmu interrupt type must be PPI");
+        assert_eq!(irq[1], 7, "pmu interrupt PPI must be 7");
+        assert_eq!(
+            irq[2], IRQ_TYPE_LEVEL_HIGH,
+            "pmu interrupt flags must be level-high"
+        );
     }
 }

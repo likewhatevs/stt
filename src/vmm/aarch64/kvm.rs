@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use kvm_bindings::{
+    KVM_ARM_VCPU_PMU_V3_CTRL, KVM_ARM_VCPU_PMU_V3_INIT, KVM_ARM_VCPU_PMU_V3_IRQ,
     KVM_DEV_ARM_VGIC_CTRL_INIT, KVM_DEV_ARM_VGIC_GRP_ADDR, KVM_DEV_ARM_VGIC_GRP_CTRL,
     KVM_DEV_ARM_VGIC_GRP_NR_IRQS, KVM_IRQ_ROUTING_IRQCHIP, KVM_VGIC_V3_ADDR_TYPE_DIST,
     KVM_VGIC_V3_ADDR_TYPE_REDIST, KvmIrqRouting, kvm_create_device, kvm_device_attr,
@@ -73,6 +74,16 @@ pub(crate) const CMDLINE_MAX: usize = 4096;
 pub(crate) const SERIAL_IRQ: u32 = 33;
 pub(crate) const SERIAL2_IRQ: u32 = 34;
 
+/// PMU overflow interrupt — PPI number in the GIC PPI namespace (0..15).
+/// PPI 7 is the standard arm,armv8-pmuv3 binding (matches qemu virt
+/// hw/arm/virt.c VIRTUAL_PMU_IRQ and cloud-hypervisor AARCH64_PMU_IRQ).
+/// The FDT pmu node references PMU_PPI directly. KVM_ARM_VCPU_PMU_V3_IRQ
+/// expects the global intid namespace (PPI + VGIC_NR_SGIS = 7 + 16 = 23),
+/// exposed as PMU_INTID for the irq_is_ppi check in
+/// arch/arm64/kvm/pmu-emul.c pmu_irq_is_valid.
+pub(crate) const PMU_PPI: u32 = 7;
+pub(crate) const PMU_INTID: u32 = PMU_PPI + 16;
+
 /// Number of IRQs for the GIC. Must be a multiple of 32 and >= 64.
 /// 128 covers SPIs 0-95, sufficient for serial + headroom.
 const GIC_NR_IRQS: u32 = 128;
@@ -89,6 +100,11 @@ pub struct KtstrKvm {
     /// `None` in deferred mode before `allocate_and_register_memory()`.
     pub(crate) numa_layout: Option<NumaMemoryLayout>,
     pub has_immediate_exit: bool,
+    /// True when the host KVM advertises Cap::ArmPmuV3. Threaded into
+    /// FDT generation so the arm,armv8-pmuv3 node is only emitted when
+    /// the kernel will actually deliver PMU events; on no-PMU hosts the
+    /// guest pmuv3 driver would otherwise attach and fail noisily.
+    pub has_pmu: bool,
     /// GICv3 device fd — held to keep the device alive.
     gic_fd: ManuallyDrop<DeviceFd>,
     /// Whether hugepages were requested at construction time.
@@ -143,9 +159,9 @@ impl KtstrKvm {
 
     /// Create a KVM VM without allocating guest memory.
     ///
-    /// Sets up /dev/kvm, VM fd, vCPUs, and GICv3 — none of which depend
-    /// on guest memory size. Memory is allocated later via
-    /// [`Self::allocate_and_register_memory`].
+    /// Sets up /dev/kvm, VM fd, vCPUs, GICv3, and PMUv3 (when host
+    /// supports) — none of which depend on guest memory size. Memory is
+    /// allocated later via [`Self::allocate_and_register_memory`].
     pub fn new_deferred(
         topo: Topology,
         use_hugepages: bool,
@@ -224,6 +240,19 @@ impl KtstrKvm {
         if vm_fd.check_extension(kvm_ioctls::Cap::ArmPtrAuthGeneric) {
             kvi.features[0] |= 1 << kvm_bindings::KVM_ARM_VCPU_PTRAUTH_GENERIC;
         }
+        // Enable PMUv3 emulation when the host supports it. Without this
+        // bit set in vcpu_init, ID_AA64DFR0_EL1.PMUVer is forced to 0 and
+        // sched_ext schedulers (scx_layered, scx_cosmos) that read
+        // perf counters via BPF kfuncs see no available PMU.
+        // Per arch/arm64/kvm/arm.c system_supported_vcpu_features, the
+        // KVM_ARM_VCPU_PMU_V3 bit is silently masked out of
+        // system_supported_vcpu_features() when !kvm_supports_guest_pmuv3,
+        // so setting it on a no-PMU host returns -EINVAL. Gate via
+        // KVM_CAP_ARM_PMU_V3.
+        let pmu_supported = vm_fd.check_extension(Cap::ArmPmuV3);
+        if pmu_supported {
+            kvi.features[0] |= 1 << kvm_bindings::KVM_ARM_VCPU_PMU_V3;
+        }
 
         for cpu_id in 0..total {
             let vcpu = vm_fd
@@ -253,6 +282,15 @@ impl KtstrKvm {
         // Map GSI N -> irqchip 0, pin N for the serial SPI IRQs.
         Self::setup_gsi_routing(&vm_fd)?;
 
+        // Initialise PMUv3 per vcpu after GIC init. kvm_arm_pmu_v3_init
+        // (arch/arm64/kvm/pmu-emul.c) requires vgic_initialized AND
+        // kvm_arm_pmu_irq_initialized — i.e. KVM_ARM_VCPU_PMU_V3_IRQ
+        // must be set before KVM_ARM_VCPU_PMU_V3_INIT. The IRQ value is
+        // a PPI (16..32), shared across vcpus per pmu_irq_is_valid.
+        if pmu_supported {
+            Self::init_pmuv3(&vcpus)?;
+        }
+
         Ok(KtstrKvm {
             kvm: ManuallyDrop::new(kvm),
             vm_fd: ManuallyDrop::new(vm_fd),
@@ -261,6 +299,7 @@ impl KtstrKvm {
             topology: topo,
             numa_layout,
             has_immediate_exit,
+            has_pmu: pmu_supported,
             gic_fd: ManuallyDrop::new(gic_fd),
             use_hugepages,
             performance_mode,
@@ -362,6 +401,40 @@ impl KtstrKvm {
         vm_fd
             .set_gsi_routing(&routing)
             .context("set GSI routing for serial IRQs")?;
+        Ok(())
+    }
+
+    /// Initialise PMUv3 emulation on each vcpu.
+    ///
+    /// kvm_arm_pmu_v3_set_attr (arch/arm64/kvm/pmu-emul.c) requires the
+    /// IRQ to be configured before INIT when the irqchip is in-kernel.
+    /// Calling order:
+    ///   1. KVM_ARM_VCPU_PMU_V3_IRQ — programs vcpu->arch.pmu.irq_num
+    ///   2. KVM_ARM_VCPU_PMU_V3_INIT — checks irq is initialised, marks
+    ///      pmu.created = true (further attr writes return -EBUSY).
+    /// PMU_INTID is a PPI in the global intid namespace (16..32), so
+    /// the same value is used for every vcpu per pmu_irq_is_valid.
+    fn init_pmuv3(vcpus: &[VcpuFd]) -> Result<()> {
+        for (cpu_id, vcpu) in vcpus.iter().enumerate() {
+            let irq: u32 = PMU_INTID;
+            let irq_attr = kvm_device_attr {
+                group: KVM_ARM_VCPU_PMU_V3_CTRL,
+                attr: KVM_ARM_VCPU_PMU_V3_IRQ as u64,
+                addr: &irq as *const u32 as u64,
+                flags: 0,
+            };
+            vcpu.set_device_attr(&irq_attr)
+                .with_context(|| format!("set PMU IRQ on vcpu {cpu_id}"))?;
+
+            let init_attr = kvm_device_attr {
+                group: KVM_ARM_VCPU_PMU_V3_CTRL,
+                attr: KVM_ARM_VCPU_PMU_V3_INIT as u64,
+                addr: 0,
+                flags: 0,
+            };
+            vcpu.set_device_attr(&init_attr)
+                .with_context(|| format!("init PMU on vcpu {cpu_id}"))?;
+        }
         Ok(())
     }
 }

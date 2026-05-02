@@ -5398,6 +5398,7 @@ impl KtstrVm {
                  allocate_and_register_memory in src/vmm/aarch64/kvm.rs",
             ),
             !self.disks.is_empty(),
+            vm.has_pmu,
         )
         .context("create FDT")?;
         vm.guest_mem
