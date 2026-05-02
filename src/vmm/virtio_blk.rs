@@ -2336,12 +2336,17 @@ fn clamp_retry_nanos(wait_nanos: u64) -> u64 {
 /// at which point the loop exits and the thread terminates.
 ///
 /// Per-iteration:
-///   1. Block in `epoll_wait` until kick_fd or stop_fd readable.
+///   1. Block in `epoll_wait` until kick_fd, stop_fd, or the
+///      throttle retry timerfd is readable.
 ///   2. If stop_fd readable → return (drop everything cleanly).
-///   3. If kick_fd readable → drain the eventfd counter (one read
-///      consumes any number of coalesced kicks per the eventfd
-///      counter-mode semantics — see eventfd(2)) and run one
-///      drain iteration via `drain_bracket_impl`.
+///   3. If timer_fd readable (THROTTLE_TOKEN) → consume the expiry
+///      count (counter-mode timerfd) and fall through to drain so
+///      the rolled-back chain can re-pop now that the bucket has
+///      refilled.
+///   4. If kick_fd readable (KICK_TOKEN) → drain the eventfd
+///      counter (one read consumes any number of coalesced kicks
+///      per the eventfd counter-mode semantics — see eventfd(2))
+///      and run one drain iteration via `drain_bracket_impl`.
 ///
 /// Reading mem from the shared `Arc<Mutex<…>>` gives the worker the
 /// up-to-date `GuestMemoryMmap` set by the device's `set_mem` call.
