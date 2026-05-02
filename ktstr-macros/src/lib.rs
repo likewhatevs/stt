@@ -1093,18 +1093,35 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let test_body = if expect_err {
         quote! {
-            let result = ::ktstr::test_support::run_ktstr_test(&#entry_name);
-            assert!(
-                result.is_err(),
-                "expected test to fail but it passed",
-            );
+            match ::ktstr::test_support::run_ktstr_test(&#entry_name) {
+                Ok(_) => panic!("expected test to fail but it passed"),
+                Err(e) if ::ktstr::test_support::is_resource_contention(&e) => {
+                    // Resource contention is host-infra, not a test
+                    // outcome: emit the canonical SKIP banner and
+                    // early-return so libtest sees pass. Otherwise an
+                    // expect_err test would mask host contention as a
+                    // satisfied "expected failure", hiding the
+                    // contention from stats tooling and producing a
+                    // false-positive pass for the wrong reason.
+                    eprintln!("ktstr: SKIP: resource contention: {e:#}");
+                    return;
+                }
+                Err(_) => {}
+            }
         }
     } else {
         quote! {
             match ::ktstr::test_support::run_ktstr_test(&#entry_name) {
                 Ok(_) => {}
                 Err(e) if ::ktstr::test_support::is_resource_contention(&e) => {
-                    panic!("{e}");
+                    // Resource contention is host-infra, not a test
+                    // failure: emit the canonical SKIP banner and
+                    // early-return so libtest sees pass. The skip
+                    // sidecar is recorded inside `run_ktstr_test_inner`
+                    // at every contention site, so stats tooling still
+                    // sees the skip without a panic-driven retry.
+                    eprintln!("ktstr: SKIP: resource contention: {e:#}");
+                    return;
                 }
                 Err(e) => panic!("{e:#}"),
             }

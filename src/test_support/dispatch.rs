@@ -82,13 +82,26 @@ use super::{
     run_ktstr_test_inner, sidecar_dir, try_flush_profraw, validate_entry_flags,
 };
 
-/// Check if an `anyhow::Error` is a `ResourceContention`.
-/// Used by the `#[ktstr_test]` macro expansion to panic with a
-/// clean message on CPU lock exhaustion — nextest retries the
-/// test on the next attempt. `pub` because the
-/// macro-generated `#[test]` body in `ktstr-macros` references it
-/// by absolute path; `#[doc(hidden)]` keeps it out of rustdoc's
-/// public surface — it is plumbing, not user API.
+/// Check if an `anyhow::Error` carries a [`ResourceContention`].
+///
+/// Walks the FULL error chain via `e.chain().any(...)` so a
+/// `ResourceContention` wrapped in `.context(...)` (e.g. the
+/// `eval.rs` `"build ktstr_test VM"` and `"run ktstr_test VM"`
+/// wrappers) is still recognised — the macro's match arm depends on
+/// this.
+///
+/// Used by the `#[ktstr_test]` macro expansion to short-circuit on
+/// host-resource contention (LLC slots / CPUs unavailable, KVM fd
+/// budget exhausted, ENOMEM): the macro emits the canonical
+/// `ktstr: SKIP: resource contention: ...` banner and early-returns
+/// so libtest sees pass. The skip sidecar is recorded at every
+/// contention site inside `run_ktstr_test_inner`, so stats tooling
+/// still sees the skip without a panic-driven nextest retry. `pub`
+/// because the macro-generated `#[test]` body in `ktstr-macros`
+/// references it by absolute path; `#[doc(hidden)]` keeps it out
+/// of rustdoc's public surface — it is plumbing, not user API.
+///
+/// [`ResourceContention`]: crate::vmm::host_topology::ResourceContention
 #[doc(hidden)]
 pub fn is_resource_contention(e: &anyhow::Error) -> bool {
     e.chain().any(|cause| {

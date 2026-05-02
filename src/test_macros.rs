@@ -214,4 +214,80 @@ mod tests {
         let text = std::str::from_utf8(&bytes).unwrap();
         assert_eq!(text, "ktstr: SKIP: \n");
     }
+
+    /// Pin the contract that the `#[ktstr_test]` macro's generated
+    /// body relies on: when `run_ktstr_test` returns
+    /// `Err(ResourceContention)` (possibly wrapped in
+    /// `.context(...)`), the macro must NOT panic — it must emit
+    /// the canonical `ktstr: SKIP: resource contention: ...`
+    /// banner and return. The macro lives in `ktstr-macros` and
+    /// expands to a literal `match` block that depends on
+    /// [`crate::test_support::is_resource_contention`] walking the
+    /// full error chain plus an `eprintln! + return` arm. We can't
+    /// invoke the proc-macro from a unit test, but we CAN simulate
+    /// its expansion shape and assert the same observable
+    /// behaviour: the banner is emitted, the post-arm sentinel
+    /// never executes, and the generated function never panics.
+    ///
+    /// `#[cfg(panic = "unwind")]`: same rationale as the sibling
+    /// `skip_on_contention_walks_context_chain` test —
+    /// `catch_unwind` is unusable under `panic = "abort"`.
+    #[test]
+    #[cfg(panic = "unwind")]
+    fn ktstr_test_macro_body_skips_on_resource_contention() {
+        use crate::test_support::test_helpers::capture_stderr;
+        use crate::vmm::host_topology::ResourceContention;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let reached_tail = AtomicBool::new(false);
+        let result = std::panic::catch_unwind(|| {
+            let (_, bytes) = capture_stderr(|| {
+                // Simulates the body that
+                // `ktstr-macros::ktstr_test` expands into for a
+                // non-`expect_err` test. The contention arm must
+                // emit the SKIP banner and return; the trailing
+                // store must not execute.
+                #[allow(unused_variables, unreachable_code)]
+                fn helper(reached: &AtomicBool) {
+                    let result: Result<(), anyhow::Error> = Err(anyhow::Error::new(
+                        ResourceContention {
+                            reason: "all 3 LLC slots busy".into(),
+                        },
+                    )
+                    .context("build ktstr_test VM"));
+                    match result {
+                        Ok(_) => {}
+                        Err(e) if crate::test_support::is_resource_contention(&e) => {
+                            eprintln!("ktstr: SKIP: resource contention: {e:#}");
+                            return;
+                        }
+                        Err(e) => panic!("{e:#}"),
+                    }
+                    reached.store(true, Ordering::SeqCst);
+                }
+                helper(&reached_tail);
+            });
+            let text = std::str::from_utf8(&bytes).expect("stderr is UTF-8");
+            assert!(
+                text.starts_with("ktstr: SKIP: resource contention: "),
+                "expected SKIP banner, got: {text:?}"
+            );
+            assert!(
+                text.contains("build ktstr_test VM"),
+                "banner must include the wrapping context layer; got: {text:?}"
+            );
+            assert!(
+                text.contains("all 3 LLC slots busy"),
+                "banner must include the inner ResourceContention reason; got: {text:?}"
+            );
+        });
+        assert!(
+            result.is_ok(),
+            "macro body must NOT panic on ResourceContention",
+        );
+        assert!(
+            !reached_tail.load(Ordering::SeqCst),
+            "macro body must early-return after emitting the SKIP banner",
+        );
+    }
 }
