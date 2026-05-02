@@ -50,6 +50,20 @@
 //! | SchedPolicyHint::Idle         | SchedPolicy::Idle                       |
 //! | SchedPolicyHint::Ext          | (no explicit policy — scx default)      |
 //!
+//! `WorkType::IoRandRead` and `WorkType::IoMixed` are absent from
+//! the table by design: the capture pipeline today exposes only a
+//! single coarse `WorkTypeHint::IoSyncWrite` for synchronous-write
+//! workloads, and there is no fingerprint signal that distinguishes
+//! random-read or mixed-IO patterns from sync-write at projection
+//! time. Capturing such a workload thus projects to
+//! `WorkType::IoSyncWrite`, and a human / LLM consuming
+//! `ktstr show / compare` is expected to refine the variant by
+//! editing the generated reproducer if the workload is actually
+//! random-read or mixed. A future hint that distinguishes IO modes
+//! would close this gap; until then, the projection deliberately
+//! collapses all three IO variants onto the single observable
+//! signal.
+//!
 //! Hints that don't fire produce framework defaults. Hints that
 //! fire ambiguously (multiple variants in one fingerprint) pick
 //! the first observed-frequency-ranked entry; the rest are emitted

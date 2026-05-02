@@ -1214,6 +1214,85 @@ mod tests {
         entry.validate().expect("binary-only workloads must pass");
     }
 
+    /// `validate()` rejects `host_only=true` paired with a
+    /// `Some(DiskConfig)`. The combination is unsatisfiable today:
+    /// `host_only` skips the VM boot that owns the virtio-blk device
+    /// lifecycle, so the disk never attaches. Catching it at validate
+    /// time surfaces the misconfiguration during nextest discovery
+    /// instead of after a confusing host-only run that silently
+    /// ignored the disk request.
+    #[test]
+    fn validate_rejects_host_only_with_disk() {
+        fn good_test_func(_: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
+        }
+        let entry = KtstrTestEntry {
+            name: "host_only_with_disk",
+            func: good_test_func,
+            host_only: true,
+            disk: Some(crate::vmm::disk_config::DiskConfig::default()),
+            ..KtstrTestEntry::DEFAULT
+        };
+        let err = entry
+            .validate()
+            .expect_err("host_only=true + disk=Some must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("host_only=true") && msg.contains("disk"),
+            "expected host_only+disk diagnostic, got: {msg}",
+        );
+        assert!(
+            msg.contains("host_only_with_disk"),
+            "error must name the offending entry, got: {msg}",
+        );
+    }
+
+    /// `host_only=true` with `disk=None` is the legitimate host-side
+    /// shape: a host-only test running without any VM device. Pins
+    /// the happy path against the rejection path so future edits
+    /// to the host_only/disk gate don't flip polarity (rejecting a
+    /// legitimate combination would silently break every host-only
+    /// test author).
+    #[test]
+    fn validate_accepts_host_only_without_disk() {
+        fn good_test_func(_: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
+        }
+        let entry = KtstrTestEntry {
+            name: "host_only_no_disk",
+            func: good_test_func,
+            host_only: true,
+            disk: None,
+            ..KtstrTestEntry::DEFAULT
+        };
+        entry
+            .validate()
+            .expect("host_only=true + disk=None must validate");
+    }
+
+    /// `host_only=false` (the default) with `disk=Some(..)` is the
+    /// canonical disk-attached VM test. Pins that the gate fires
+    /// only on the actual conflict (host_only=true) and not on any
+    /// `disk=Some(..)` entry — a future tightening that rejected
+    /// every Some(DiskConfig) would break the entire #18/#165 disk
+    /// integration test surface.
+    #[test]
+    fn validate_accepts_vm_with_disk() {
+        fn good_test_func(_: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
+        }
+        let entry = KtstrTestEntry {
+            name: "vm_with_disk",
+            func: good_test_func,
+            host_only: false,
+            disk: Some(crate::vmm::disk_config::DiskConfig::default()),
+            ..KtstrTestEntry::DEFAULT
+        };
+        entry
+            .validate()
+            .expect("host_only=false + disk=Some must validate");
+    }
+
     #[test]
     fn ktstr_test_entry_default_rejected_by_empty_name() {
         // DEFAULT has name = "" which validate() rejects — so the

@@ -235,6 +235,22 @@ pub enum Phase {
 /// the module-level "Churn vs Sweep" section for the convention's
 /// rationale and the runtime contract for each suffix.
 ///
+/// # Migration: `IoSync` was replaced
+///
+/// `IoSync` was replaced by [`IoSyncWrite`](Self::IoSyncWrite),
+/// [`IoRandRead`](Self::IoRandRead), and [`IoMixed`](Self::IoMixed).
+/// The old `IoSync` simulated IO via tmpfs+sleep — write 64 KB to
+/// a temp file (page-cache memcpy on tmpfs) then sleep 100 µs to
+/// imitate disk-fsync latency. The new variants do real
+/// block-device IO on `/dev/vda` with `O_SYNC`/`O_DIRECT`
+/// (sector-aligned 4 KiB pread/pwrite, optional `fdatasync`),
+/// so the kernel paths under stress are the actual virtio-blk
+/// submit/complete + BIO routing paths rather than a synthetic
+/// page-cache + nanosleep loop. Tests that depended on the old
+/// page-cache + sleep behavior should use a [`Sequence`](Self::Sequence)
+/// with [`Phase::Sleep`] (and an arbitrary CPU phase) to model
+/// the simulated-IO-completion pause without doing real disk IO.
+///
 /// ```
 /// # use ktstr::workload::WorkType;
 /// let wt = WorkType::from_name("CpuSpin").unwrap();
@@ -4288,10 +4304,12 @@ unsafe fn futex_wait(futex_ptr: *mut u32, expected: u32, ts: &libc::timespec) {
 // Real-disk IO helpers for IoSyncWrite / IoRandRead / IoMixed
 // ----------------------------------------------------------------------------
 
-/// Block size for the IO workloads. Matches the page size on x86_64
-/// and aarch64 (the only ktstr targets) so `O_DIRECT` reads /
-/// writes have the alignment the block layer requires (the BIO
-/// path rejects non-page-aligned `O_DIRECT` IO with -EINVAL).
+/// Block size for the IO workloads. The block layer requires
+/// `O_DIRECT` IO to be logical-block-aligned (512 bytes for
+/// virtio-blk); page-sized blocks (4 KiB on x86_64 / aarch64)
+/// are a convenience, not a kernel requirement, but matching
+/// the page size keeps the BIO submission fast-path simple. The
+/// BIO path rejects misaligned `O_DIRECT` IO with -EINVAL.
 const IO_BLOCK_SIZE: usize = 4096;
 
 /// Sector size enforced by the virtio-blk device. Every offset the
@@ -4305,11 +4323,11 @@ const IO_SECTOR_SIZE: u64 = 512;
 const IO_NUM_STRIPES: u64 = 64;
 
 /// Linux ioctl number for BLKGETSIZE64 (returns device size in
-/// bytes via `*u64`). Magic encoding: `_IOR(0x12, 114,
-/// sizeof(u64))` per `<linux/fs.h>` — direction=READ (2),
-/// type=0x12, nr=114, size=8. The libc crate does not export this
-/// constant; it's the same value GLIBC's `<sys/mount.h>` exposes
-/// when included.
+/// bytes via `*u64`). Magic encoding: `_IOR(0x12, 114, size_t)`
+/// per `<linux/fs.h>` — direction=READ (2), type=0x12, nr=114,
+/// size=8 (size_t is 8 bytes on x86_64 / aarch64, the only ktstr
+/// targets). The libc crate does not export this constant; it's
+/// the same value GLIBC's `<sys/mount.h>` exposes when included.
 const BLKGETSIZE64: libc::c_ulong = 0x80081272;
 
 /// Tempfile capacity for the host-side fallback when /dev/vda is
@@ -4363,6 +4381,22 @@ fn open_io_backing(extra_flags: libc::c_int, tid: libc::pid_t) -> Option<(std::f
         .join(format!("ktstr_iodev_{tid}"))
         .to_string_lossy()
         .to_string();
+    // One-shot per-worker warn that the fallback path is in use.
+    // The `tracing` crate has no `warn_once!` macro, so the
+    // codebase's idiom (also used in `VirtioBlk::process_requests`
+    // for `mem_unset_warned`) is an `AtomicBool::swap(true)` guard
+    // around `tracing::warn!`. Each forked worker process gets its
+    // own copy of this static at fork time, so the warn fires
+    // exactly once per worker even though the function is called
+    // on every workload that uses real disk IO.
+    static FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
+    if !FALLBACK_WARNED.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            path = %path,
+            "virtio-blk /dev/vda absent; using tempfile fallback at {path}. \
+             IO workload pathology may not reproduce."
+        );
+    }
     use std::os::unix::fs::OpenOptionsExt;
     let f = std::fs::OpenOptions::new()
         .read(true)
@@ -4376,8 +4410,7 @@ fn open_io_backing(extra_flags: libc::c_int, tid: libc::pid_t) -> Option<(std::f
     Some((f, IO_TEMPFILE_CAPACITY, Some(path)))
 }
 
-/// xorshift64* PRNG step. Returns the new state and the output
-/// sample (high-quality scrambling of the state). One self-citing
+/// xorshift64 PRNG step. Returns the next state. One self-citing
 /// invariant: the input `state` must be non-zero (xorshift's
 /// fixed-point); callers seed with a tid-derived non-zero value
 /// in `worker_main`.
@@ -4491,9 +4524,9 @@ fn worker_main(
     // and advances by 4 KiB per pwrite, wrapping at the stripe end.
     let mut io_seq_cursor: u64 = 0;
     let mut io_iter: u64 = 0;
-    // Phase::Io still uses the legacy tempfile-on-tmpfs implementation
-    // (separate from IoSync*). Keep its own slot so worker cleanup is
-    // independent.
+    // Phase::Io still uses the legacy tempfile-on-tmpfs
+    // implementation (separate from IoSyncWrite / IoRandRead /
+    // IoMixed). Keep its own slot so worker cleanup is independent.
     let mut io_seq_file: Option<(std::fs::File, String)> = None;
     // PageFaultChurn: persistent anonymous mmap region and PRNG
     // state, allocated on first outer iteration and reused across
@@ -4631,8 +4664,17 @@ fn worker_main(
                     if let Some(d) = open_io_backing(libc::O_SYNC, tid) {
                         io_disk = Some(d);
                     } else {
-                        // Open failed: skip this iteration and yield
-                        // so the worker doesn't spin-hot.
+                        // Open failed (both /dev/vda open and the
+                        // tempfile fallback returned None). Surface
+                        // it once per worker, then yield so the
+                        // worker doesn't spin-hot.
+                        static OPEN_FAILED_WARNED: AtomicBool =
+                            AtomicBool::new(false);
+                        if !OPEN_FAILED_WARNED.swap(true, Ordering::Relaxed) {
+                            tracing::error!(
+                                "IO backing open failed; worker yielding without IO."
+                            );
+                        }
                         std::thread::yield_now();
                         iterations += 1;
                         continue;
@@ -4687,22 +4729,42 @@ fn worker_main(
                     if let Some(d) = open_io_backing(libc::O_DIRECT, tid) {
                         io_disk = Some(d);
                     } else {
+                        static OPEN_FAILED_WARNED: AtomicBool =
+                            AtomicBool::new(false);
+                        if !OPEN_FAILED_WARNED.swap(true, Ordering::Relaxed) {
+                            tracing::error!(
+                                "IO backing open failed; worker yielding without IO."
+                            );
+                        }
                         std::thread::yield_now();
                         iterations += 1;
                         continue;
                     }
                 }
                 if io_buf.is_none() {
-                    // SAFETY: layout has size 4096, alignment 4096.
-                    // alloc returns a non-null pointer on success
-                    // (we check with NonNull::new). Buffer is freed
-                    // in the cleanup block at end of worker_main.
+                    // Logical-block-aligned (512 for virtio-blk);
+                    // page-sized blocks (4 KiB) are a convenience,
+                    // not a kernel requirement. The block layer
+                    // accepts any alignment that's a multiple of
+                    // the queue's logical block size, but using
+                    // 4 KiB matches the BLOCK_SIZE constant the
+                    // workloads pass to pread/pwrite.
+                    //
+                    // SAFETY: layout has size 4096, alignment 4096
+                    // (≥ 512). `alloc_zeroed` returns a non-null
+                    // pointer on success (we check with NonNull::new).
+                    // Buffer is freed in the cleanup block at end
+                    // of worker_main. Zero-init avoids UB from a
+                    // future code path that reads the buffer
+                    // before pread fills it (today only pread runs
+                    // first, but IoMixed's pwrite-before-fill
+                    // opens that window).
                     let layout = std::alloc::Layout::from_size_align(
                         IO_BLOCK_SIZE,
                         IO_BLOCK_SIZE,
                     )
-                    .expect("page-aligned 4 KiB layout is valid");
-                    let ptr = unsafe { std::alloc::alloc(layout) };
+                    .expect("logical-block-aligned 4 KiB layout is valid");
+                    let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
                     io_buf = std::ptr::NonNull::new(ptr);
                     if io_buf.is_none() {
                         // OOM at allocator. Skip the IO this iteration.
@@ -4715,10 +4777,12 @@ fn worker_main(
                 let off = rand_io_offset(&mut io_rng, *capacity);
                 let fd = f.as_raw_fd();
                 let before_pread = Instant::now();
-                // SAFETY: `io_buf` is page-aligned (4 KiB allocation
-                // from the system allocator with a 4 KiB align
-                // request) and large enough for IO_BLOCK_SIZE. `fd`
-                // is owned and valid.
+                // SAFETY: `io_buf` is logical-block-aligned (4 KiB
+                // allocation from the system allocator with a
+                // 4 KiB align request, ≥ the 512-byte
+                // virtio-blk logical block size required by
+                // O_DIRECT) and large enough for IO_BLOCK_SIZE.
+                // `fd` is owned and valid.
                 let _ = unsafe {
                     libc::pread(
                         fd,
@@ -4746,18 +4810,29 @@ fn worker_main(
                         io_disk = Some(d);
                         io_seq_cursor = stripe_base(tid, cap);
                     } else {
+                        static OPEN_FAILED_WARNED: AtomicBool =
+                            AtomicBool::new(false);
+                        if !OPEN_FAILED_WARNED.swap(true, Ordering::Relaxed) {
+                            tracing::error!(
+                                "IO backing open failed; worker yielding without IO."
+                            );
+                        }
                         std::thread::yield_now();
                         iterations += 1;
                         continue;
                     }
                 }
                 if io_buf.is_none() {
+                    // See IoRandRead arm: same logical-block
+                    // alignment requirement; alloc_zeroed defends
+                    // against UB from the IoMixed pwrite issued
+                    // before the first pread fills the buffer.
                     let layout = std::alloc::Layout::from_size_align(
                         IO_BLOCK_SIZE,
                         IO_BLOCK_SIZE,
                     )
-                    .expect("page-aligned 4 KiB layout is valid");
-                    let ptr = unsafe { std::alloc::alloc(layout) };
+                    .expect("logical-block-aligned 4 KiB layout is valid");
+                    let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
                     io_buf = std::ptr::NonNull::new(ptr);
                     if io_buf.is_none() {
                         std::thread::yield_now();
@@ -4779,9 +4854,11 @@ fn worker_main(
                     io_seq_cursor = base;
                 }
                 let before_io = Instant::now();
-                // SAFETY: io_buf is the page-aligned 4 KiB
-                // allocation; treating it as a const slice of
-                // IO_BLOCK_SIZE bytes is in-bounds.
+                // SAFETY: io_buf is the logical-block-aligned
+                // 4 KiB allocation (≥ the 512-byte virtio-blk
+                // logical block size required by O_DIRECT);
+                // treating it as a const slice of IO_BLOCK_SIZE
+                // bytes is in-bounds.
                 let _ = unsafe {
                     libc::pwrite(
                         fd,
@@ -6327,13 +6404,14 @@ fn worker_main(
             let _ = std::fs::remove_file(&p);
         }
     }
-    // Free the page-aligned scratch buffer used by IoRandRead /
-    // IoMixed. SAFETY: the layout matches what was passed to alloc
-    // (4 KiB / 4 KiB align); the pointer is non-null per
-    // `NonNull::new` at allocation time.
+    // Free the logical-block-aligned scratch buffer used by
+    // IoRandRead / IoMixed. SAFETY: the layout matches what was
+    // passed to alloc_zeroed (4 KiB / 4 KiB align, ≥ the 512-byte
+    // virtio-blk logical block size required by O_DIRECT); the
+    // pointer is non-null per `NonNull::new` at allocation time.
     if let Some(ptr) = io_buf.take() {
         let layout = std::alloc::Layout::from_size_align(IO_BLOCK_SIZE, IO_BLOCK_SIZE)
-            .expect("page-aligned 4 KiB layout is valid");
+            .expect("logical-block-aligned 4 KiB layout is valid");
         unsafe { std::alloc::dealloc(ptr.as_ptr(), layout) };
     }
     // Clean up persistent PageFaultChurn mmap region.

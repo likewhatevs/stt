@@ -6382,6 +6382,61 @@ mod tests {
         assert!(format!("{err:#}").contains("overflows u64"));
     }
 
+    // -- parse_disk_arg --
+
+    /// Absent `--disk` flag → `Ok(None)`. Pins the
+    /// no-disk-attached default so a future refactor that flips the
+    /// arm to a `Some(default())` placeholder fails the test
+    /// instead of silently changing the boot shape (a disk where
+    /// the user asked for none).
+    #[test]
+    fn parse_disk_arg_none_yields_no_disk() {
+        let got = parse_disk_arg(None).expect("None input must not error");
+        assert!(
+            got.is_none(),
+            "absent --disk must produce Ok(None), got: {got:?}",
+        );
+    }
+
+    /// `--disk 256mib` → `Some(DiskConfig)` with `capacity_mb=256`
+    /// and the remaining fields equal to `DiskConfig::default()`.
+    /// Pins the size-only fast path (the only shape `parse_disk_arg`
+    /// accepts today) and guards against drift in the spread of
+    /// non-size fields — if a future change flips a default
+    /// (read_only=true, throttle non-default), this test surfaces it
+    /// at the CLI parse boundary rather than mid-VM-setup.
+    #[test]
+    fn parse_disk_arg_some_size_uses_default_other_fields() {
+        let got = parse_disk_arg(Some("256mib"))
+            .expect("256mib must parse")
+            .expect("Some(...) input must yield Some(DiskConfig)");
+        let mut expected = crate::vmm::disk_config::DiskConfig::default();
+        expected.capacity_mb = 256;
+        assert_eq!(
+            got, expected,
+            "parse_disk_arg(\"256mib\") must equal DiskConfig::default() \
+             with capacity_mb=256: got {got:?}, expected {expected:?}",
+        );
+    }
+
+    /// Malformed size → `Err`. Pins that a CLI typo surfaces at
+    /// argument time with a parse-error message, not mid-VM-setup
+    /// or as a confusing zero-size disk.
+    #[test]
+    fn parse_disk_arg_garbage_propagates_size_error() {
+        let err = parse_disk_arg(Some("garbage"))
+            .expect_err("malformed size must propagate parse error");
+        let rendered = format!("{err:#}");
+        // The error from `parse_disk_size_mib` mentions the offending
+        // input via `invalid disk size '...'`; assert on that substring
+        // so a future message-format change is caught instead of being
+        // silently absorbed.
+        assert!(
+            rendered.contains("invalid disk size") || rendered.contains("missing unit suffix"),
+            "expected size-parse diagnostic in disk-arg error, got: {rendered}",
+        );
+    }
+
     // -- show_host smoke --
 
     /// `show_host` must return a non-empty, newline-terminated
