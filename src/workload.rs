@@ -674,15 +674,18 @@ pub enum WorkType {
         /// CPU-spin iterations the waker burns before each wake.
         burst_iters: u64,
     },
-    /// Pipeline of waker-wakee hops `A → B → C → ...` of `depth`
-    /// Workers form a ring chain of `depth` stages, optionally
-    /// with `fanout` parallel chains. Each chain owns one shared
-    /// 4-byte futex word; the active stage rotates through
-    /// `0..depth`. The active stage burns `work_per_hop` of CPU
-    /// work, advances the word to `(pos + 1) % depth`, and
-    /// `FUTEX_WAKE`s the chain — only the next stage's worker
-    /// satisfies its wait predicate and proceeds. Tests
-    /// `SCX_WAKE_SYNC` path under producer-consumer NUMA pinning.
+    /// Pipeline of waker-wakee hops forming a ring of `depth` stages,
+    /// optionally with `fanout` parallel chains. Two wake mechanisms
+    /// gated by the `sync` field — see its doc for kernel citations:
+    ///
+    /// - `sync: true` — anon-pipe ring (`depth` pipes per chain).
+    ///   Wakes carry `WF_SYNC` via `wake_up_interruptible_sync_poll`,
+    ///   biasing scheduler placement against migration. Tests the
+    ///   `SCX_WAKE_SYNC` path that scx variants must respect.
+    ///
+    /// - `sync: false` — single shared futex word per chain. The
+    ///   active stage advances the word and `FUTEX_WAKE`s; the stage
+    ///   whose `pos` matches runs, others re-park. No `WF_SYNC`.
     ///
     /// Worker indices are partitioned into `fanout` chains of
     /// `depth` workers each. `worker_group_size = depth` so the
@@ -690,6 +693,11 @@ pub enum WorkType {
     /// (one per chain). At the end of the chain the last worker
     /// loops back to the first, forming a ring so the work
     /// pattern can run for a long test window.
+    ///
+    /// When `sync: true`, the spawn-side additionally allocates
+    /// `depth` pipes per chain — see
+    /// [`chain_pipe_depth`](Self::chain_pipe_depth) and the
+    /// `SpawnGuard::chain_pipes` field.
     WakeChain {
         /// Number of workers per chain. Each worker waits for its
         /// predecessor's signal, does `work_per_hop` of CPU work,
@@ -699,14 +707,35 @@ pub enum WorkType {
         /// linear chain; `fanout > 1` runs multiple chains in
         /// parallel, all sharing one configuration.
         fanout: usize,
-        /// Reserved for future per-stage pipe wiring. `true` is
-        /// intended to add a 1-byte pipe write per stage so the
-        /// kernel raises `WF_SYNC` on the wakeup
-        /// (`kernel/sched/core.c::ttwu_queue` / `try_to_wake_up`);
-        /// `false` keeps the futex-only path (no `WF_SYNC`). The
-        /// current implementation uses the futex path for both
-        /// values — pipe wiring requires per-stage pipe pairs in
-        /// `SpawnGuard` that don't yet exist.
+        /// Selects the wake mechanism between stages.
+        ///
+        /// `true` allocates one anonymous pipe per stage (a chain
+        /// ring of `depth` pipes) and uses `write(1 byte)` /
+        /// blocking `read(1 byte)` for stage handoffs. The kernel
+        /// raises `WF_SYNC` on the wake because
+        /// `anon_pipe_write` (`fs/pipe.c`) calls
+        /// `wake_up_interruptible_sync_poll` (`include/linux/wait.h`)
+        /// which expands to `__wake_up_sync_key` (`kernel/sched/wait.c`)
+        /// and that passes `WF_SYNC` through `__wake_up_common_lock`
+        /// to `try_to_wake_up`. `WF_SYNC` biases scheduler placement
+        /// away from migrating the woken stage off the waker's CPU
+        /// — testing the wake-affine cohabitation that scx variants
+        /// must respect.
+        ///
+        /// `false` uses the existing futex-word ring: `FUTEX_WAKE`
+        /// fans out to every parked worker on the same word, the
+        /// active stage proceeds, the rest re-park. No `WF_SYNC`;
+        /// the scheduler is free to migrate the woken stage.
+        ///
+        /// The `true` path needs `depth` pipes per chain — see
+        /// [`chain_pipe_depth`](Self::chain_pipe_depth) — and
+        /// closes the inverse ends of every other stage's pipe in
+        /// the worker post-fork. The kernel-side `WF_SYNC` raise
+        /// is verified by reading the call chain:
+        /// `anon_pipe_write` at `fs/pipe.c:431-601`,
+        /// `wake_up_interruptible_sync_poll` at
+        /// `include/linux/wait.h:246-247`, and
+        /// `__wake_up_sync_key` at `kernel/sched/wait.c:186-193`.
         sync: bool,
         /// Wall-clock CPU work each worker performs per stage
         /// before signalling the next. Use [`Duration`] to keep
@@ -1288,6 +1317,27 @@ impl WorkType {
                 | WorkType::PreemptStorm { .. }
                 | WorkType::EpollStorm { .. }
         )
+    }
+
+    /// Number of pipes per chain that the spawn-side must allocate
+    /// for this work type, or `None` when no per-stage pipe ring is
+    /// needed. The returned `depth` matches the variant's `depth`
+    /// field for `WakeChain { sync: true }`; every other variant
+    /// returns `None`.
+    ///
+    /// When this returns `Some(depth)`, the spawn-side allocates
+    /// `depth` pipes per chain so stage `i` holds
+    /// `pipe[i].write_end` (to wake stage `i + 1`) and
+    /// `pipe[(i + depth - 1) % depth].read_end` (predecessor's
+    /// wake). `sync: false` keeps the existing futex-word ring and
+    /// returns `None`.
+    pub fn chain_pipe_depth(&self) -> Option<usize> {
+        match self {
+            WorkType::WakeChain {
+                sync: true, depth, ..
+            } => Some(*depth),
+            _ => None,
+        }
     }
 
     /// Whether this work type allocates a per-worker cache buffer post-fork.
@@ -2941,6 +2991,13 @@ struct SpawnGuard {
     /// Closed by the guard on every exit (success or failure) —
     /// children inherit copies via fork and close their own ends.
     pipe_pairs: Vec<([i32; 2], [i32; 2])>,
+    /// Per-chain pipe rings for `WakeChain { sync: true }`. Outer
+    /// Vec is one entry per chain (= `num_workers / depth`); inner
+    /// Vec is `depth` pipes per chain. Pipe `i` connects stage `i`
+    /// (writer) to stage `(i + 1) % depth` (reader). Closed by the
+    /// guard on every exit; children inherit copies via fork and
+    /// close the inverse ends post-fork.
+    chain_pipes: Vec<Vec<[i32; 2]>>,
     /// Shared-memory futex regions (transferred to handle on success).
     futex_ptrs: Vec<*mut u32>,
     futex_region_size: usize,
@@ -2962,6 +3019,7 @@ impl SpawnGuard {
     fn new(futex_region_size: usize) -> Self {
         Self {
             pipe_pairs: Vec::new(),
+            chain_pipes: Vec::new(),
             futex_ptrs: Vec::new(),
             futex_region_size,
             iter_counters: std::ptr::null_mut(),
@@ -3053,6 +3111,16 @@ impl Drop for SpawnGuard {
         for (ab, ba) in &self.pipe_pairs {
             for fd in [ab[0], ab[1], ba[0], ba[1]] {
                 let _ = nix::unistd::close(fd);
+            }
+        }
+        // Close every per-stage chain pipe (WakeChain sync=true).
+        // Same parent-side cleanup contract as `pipe_pairs`: each
+        // child inherited a copy and closed its inverse end on
+        // fork; the parent's references close here.
+        for chain in &self.chain_pipes {
+            for pipe in chain {
+                let _ = nix::unistd::close(pipe[0]);
+                let _ = nix::unistd::close(pipe[1]);
             }
         }
         // Munmap shared regions.
@@ -3332,6 +3400,7 @@ impl WorkloadHandle {
             config.work_type,
             WorkType::PipeIo { .. } | WorkType::CachePipe { .. }
         );
+        let chain_depth = config.work_type.chain_pipe_depth();
         let needs_futex = config.work_type.needs_shared_mem();
         if let Some(group_size) = config.work_type.worker_group_size()
             && (config.num_workers == 0 || !config.num_workers.is_multiple_of(group_size))
@@ -3341,6 +3410,48 @@ impl WorkloadHandle {
                 config.work_type.name(),
                 group_size,
                 config.num_workers
+            );
+        }
+        // WakeChain `sync: true` is incompatible with
+        // `CloneMode::Thread`: `SpawnGuard::into_handle` does not
+        // transfer `chain_pipes` (only children/threads/futex
+        // ptrs/iter counters), so the guard's `Drop` runs after a
+        // successful spawn and closes every chain pipe fd. Under
+        // Fork mode each child holds its own fd-table copy of
+        // those pipes (inherited via `fork()`), so the parent's
+        // close is a no-op for the children. Under Thread mode
+        // every thread shares the parent's fd table — the close
+        // makes every worker's pipe fd `EBADF`, and (worse) if
+        // the kernel reuses the freed fd numbers for a subsequent
+        // `open()`, threads then write 1-byte garbage to whatever
+        // unrelated file inherited the fd. Reject at spawn time
+        // with an actionable diagnostic; CloneMode::Fork is the
+        // correct choice for WakeChain sync=true.
+        if chain_depth.is_some() && matches!(dispatch, Dispatch::Thread) {
+            anyhow::bail!(
+                "WakeChain sync=true is not supported under CloneMode::Thread \
+                 (the spawn-side closes chain pipe fds via SpawnGuard::Drop \
+                 after spawn returns; threads share the parent fd table and \
+                 would observe EBADF or, post-fd-reuse, write to the wrong \
+                 file). Use CloneMode::Fork."
+            );
+        }
+        // WakeChain `sync: true` with depth=1 deadlocks at fork:
+        // prev_stage and stage collapse to 0, so the post-fork
+        // close-other-fds block closes BOTH ends of the worker's
+        // own pipe (the `s == prev_stage` arm runs first and
+        // closes `pipe[1]`, leaving the worker without a write
+        // end). A 1-stage "ring chain" also has no meaningful
+        // wake-chain semantics — there is no successor to wake.
+        // Reject at spawn time with an actionable diagnostic.
+        if let Some(depth) = chain_depth
+            && depth < 2
+        {
+            anyhow::bail!(
+                "WakeChain depth must be >= 2 (got {}); a 1-stage chain has no \
+                 successor to wake and the post-fork fd close logic would close \
+                 the worker's own write end",
+                depth
             );
         }
 
@@ -3399,6 +3510,45 @@ impl WorkloadHandle {
                     anyhow::bail!("pipe failed: {}", std::io::Error::last_os_error());
                 }
                 guard.pipe_pairs.push((ab, ba));
+            }
+        }
+
+        // For WakeChain { sync: true }, allocate `depth` pipes per
+        // chain (one pipe per stage). Pipe `i` connects stage `i`
+        // (writer) to stage `(i + 1) % depth` (reader). On any
+        // `pipe()` failure mid-allocation, close the half-built
+        // chain's pipes before bailing — the chain is not yet
+        // pushed onto `guard.chain_pipes`, so its Drop won't
+        // otherwise reach those fds.
+        if let Some(depth) = chain_depth
+            && depth > 0
+            && config.num_workers >= depth
+        {
+            let chains = config.num_workers / depth;
+            for _ in 0..chains {
+                let mut chain: Vec<[i32; 2]> = Vec::with_capacity(depth);
+                let mut alloc_ok = true;
+                for _ in 0..depth {
+                    let mut p = [0i32; 2];
+                    if unsafe { libc::pipe(p.as_mut_ptr()) } != 0 {
+                        alloc_ok = false;
+                        break;
+                    }
+                    chain.push(p);
+                }
+                if !alloc_ok {
+                    for p in &chain {
+                        unsafe {
+                            libc::close(p[0]);
+                            libc::close(p[1]);
+                        }
+                    }
+                    anyhow::bail!(
+                        "WakeChain pipe allocation failed: {}",
+                        std::io::Error::last_os_error()
+                    );
+                }
+                guard.chain_pipes.push(chain);
             }
         }
 
@@ -3488,7 +3638,19 @@ impl WorkloadHandle {
         for i in 0..config.num_workers {
             let affinity = resolve_affinity(&config.affinity)?;
 
-            // Determine pipe fds for this worker (PipeIo/CachePipe).
+            // Determine pipe fds for this worker.
+            //
+            // Three shapes use the same `Option<(read_fd, write_fd)>`
+            // parameter:
+            // - PipeIo / CachePipe (paired): worker A reads `ba[0]`,
+            //   writes `ab[1]`; worker B reads `ab[0]`, writes
+            //   `ba[1]`.
+            // - WakeChain { sync: true } (chain ring): stage `s`
+            //   reads from pipe `(s + depth - 1) % depth` (its
+            //   predecessor's write end's matching read end) and
+            //   writes to pipe `s` (its own pipe's write end, which
+            //   stage `s + 1` reads from).
+            // - Everything else: `None`.
             let worker_pipe_fds: Option<(i32, i32)> = if needs_pipes {
                 let pair_idx = i / 2;
                 let (ref ab, ref ba) = guard.pipe_pairs[pair_idx];
@@ -3499,6 +3661,17 @@ impl WorkloadHandle {
                     // Worker B: writes to ba[1], reads from ab[0]
                     Some((ab[0], ba[1]))
                 }
+            } else if let Some(depth) = chain_depth
+                && depth > 0
+            {
+                let chain_idx = i / depth;
+                let stage = i % depth;
+                let prev_stage = (stage + depth - 1) % depth;
+                let chain = &guard.chain_pipes[chain_idx];
+                // Read end of predecessor's pipe; write end of own
+                // pipe. The kernel pipe pair is `[read_end,
+                // write_end]` per `libc::pipe`'s manpage.
+                Some((chain[prev_stage][0], chain[stage][1]))
             } else {
                 None
             };
@@ -3728,6 +3901,58 @@ impl WorkloadHandle {
                                     libc::close(ab2[1]);
                                     libc::close(ba2[0]);
                                     libc::close(ba2[1]);
+                                }
+                            }
+                        }
+                    }
+                    if let Some(depth) = chain_depth
+                        && depth > 0
+                    {
+                        let chain_idx = i / depth;
+                        let stage = i % depth;
+                        let prev_stage = (stage + depth - 1) % depth;
+                        // Close every fd in the chain that this
+                        // stage does not own. Owned fds (kept open):
+                        //   - chain[prev_stage][0]: read end of the
+                        //     pipe predecessor writes to.
+                        //   - chain[stage][1]: write end of the
+                        //     pipe successor reads from.
+                        // Everything else is the inverse end of an
+                        // owned pipe or fully unrelated.
+                        for (s, pipe) in guard.chain_pipes[chain_idx]
+                            .iter()
+                            .enumerate()
+                        {
+                            // Always close the write end of the
+                            // predecessor's pipe (we only need its
+                            // read end).
+                            if s == prev_stage {
+                                unsafe {
+                                    libc::close(pipe[1]);
+                                }
+                            // Always close the read end of our own
+                            // pipe (we only need its write end).
+                            } else if s == stage {
+                                unsafe {
+                                    libc::close(pipe[0]);
+                                }
+                            // Pipes belonging to neither this stage
+                            // nor its predecessor: close both ends.
+                            } else {
+                                unsafe {
+                                    libc::close(pipe[0]);
+                                    libc::close(pipe[1]);
+                                }
+                            }
+                        }
+                        // Close every fd from other chains.
+                        for (cj, chain) in guard.chain_pipes.iter().enumerate() {
+                            if cj != chain_idx {
+                                for pipe in chain {
+                                    unsafe {
+                                        libc::close(pipe[0]);
+                                        libc::close(pipe[1]);
+                                    }
                                 }
                             }
                         }
@@ -6069,104 +6294,230 @@ fn worker_main(
                 sync,
                 work_per_hop,
             } => {
-                // Linear ring chain inside one chain group. Each
-                // chain owns one shared 4-byte futex word
-                // (`worker_group_size = depth`); workers within the
-                // chain are positioned by `pos` (0..depth). Stage
-                // boundary = the futex word's value advances to
-                // `next_stage`; the worker holding `pos == word_val`
-                // is the active stage. After `work_per_hop` of CPU
-                // work, the active stage advances the word to
-                // `(pos + 1) % depth` and wakes everyone parked on
-                // it; only the next stage's worker satisfies its
-                // wait predicate and proceeds.
+                // Two implementations selected by `sync`:
                 //
-                // `sync = true` adds a 1-byte pipe round-trip on
-                // the existing report-pipe-style infra... but we
-                // don't have per-stage pipe pairs allocated for
-                // this variant (`needs_pipes = false` for
-                // WakeChain). To keep batch 3 scope confined to
-                // worker_main, both `sync = true` and
-                // `sync = false` use the futex-word advance; the
-                // wake call uses `clamp_futex_wake_n(usize::MAX)`
-                // which lowers to FUTEX_WAKE(i32::MAX) — the kernel
-                // walks the bucket's plist and wakes every parked
-                // waiter (kernel/futex/waitwake.c::futex_wake_op),
-                // so all non-active stages observe the advance and
-                // re-park on the new value. This preserves the
-                // wake-chain shape (sequenced stages, per-stage CPU
-                // burst, scheduler observes a chain of WAKE→work→
-                // WAKE→work transitions). The `sync` flag is read
-                // and recorded so future work that wires per-stage
-                // pipes can branch on it; for now it's ignored at
-                // the syscall layer.
-                let (futex_ptr, pos) = match futex {
-                    Some(f) => f,
-                    None => break,
-                };
-                let _ = sync;
-                if depth == 0 || pos >= depth {
-                    // Defense in depth: surface uses
-                    // `worker_group_size = depth`, so the spawn-side
-                    // divisibility check guarantees pos < depth
-                    // before we get here. This branch handles only
-                    // a programmer bug that bypasses spawn.
+                // - `sync == true` (anon-pipe ring): each stage
+                //   blocks on `read(read_fd, &mut [0u8; 1], 1)`,
+                //   does its CPU burst, then `write(write_fd,
+                //   &[0u8; 1], 1)` to wake the next stage. The
+                //   kernel routes the write through
+                //   `anon_pipe_write` (fs/pipe.c:431-601) →
+                //   `wake_up_interruptible_sync_poll`
+                //   (include/linux/wait.h:246) →
+                //   `__wake_up_sync_key`
+                //   (kernel/sched/wait.c:186-193) → `WF_SYNC` is
+                //   set in the wake call. Stage 0 bootstraps the
+                //   ring on its first iteration with a single
+                //   write so stage 1 unblocks.
+                //
+                // - `sync == false` (futex-word ring): all `depth`
+                //   stages share one futex word; the stage whose
+                //   `pos` matches the word value is active, does
+                //   its CPU burst, advances the word, and
+                //   `FUTEX_WAKE(INT_MAX)` broadcasts so every
+                //   other stage observes the new value and
+                //   either runs or re-parks. No `WF_SYNC`.
+                //
+                // `worker_group_size = depth` for both paths.
+                if depth == 0 {
                     break;
                 }
-                let atom = unsafe { &*(futex_ptr as *const std::sync::atomic::AtomicU32) };
-                let my_stage = pos as u32;
-                let next_stage = ((pos + 1) % depth) as u32;
-                let before_block = Instant::now();
-                loop {
+                if sync {
+                    let (read_fd, write_fd) = match pipe_fds {
+                        Some(p) => p,
+                        None => break,
+                    };
+                    if read_fd < 0 || write_fd < 0 {
+                        break;
+                    }
+                    // Stage 0 is the bootstrap producer on the
+                    // first iteration only — it writes one byte
+                    // into its own pipe so stage 1 can unblock.
+                    // After that, every stage waits for its
+                    // predecessor's wake before proceeding.
+                    //
+                    // pos is the worker's position within its
+                    // chain, supplied by the spawn-side futex
+                    // tuple. When `chain_pipe_depth` is Some, the
+                    // spawn-side always allocates the per-group
+                    // futex too, so `futex == None` here means
+                    // the spawn-side broke its own invariant —
+                    // bail rather than silently treating every
+                    // worker as stage 0 (which would have every
+                    // worker fire the bootstrap write and stall
+                    // the chain).
+                    let pos = match futex {
+                        Some((_, p)) => p,
+                        None => break,
+                    };
+                    if iterations == 0 && pos == 0 {
+                        // Gate the bootstrap write behind a stop
+                        // check. If SIGUSR1 fires during spawn,
+                        // skipping this write keeps the chain
+                        // dormant — every other stage is already
+                        // poll-blocking with the same stop check
+                        // so the chain unwinds promptly. Without
+                        // the gate, a deep chain (depth=64,
+                        // work_per_hop=100ms) would burn through a
+                        // full ring round-trip (~6.4s) before
+                        // observing the stop on its second
+                        // iteration.
+                        if stop_requested(stop) {
+                            iterations += 1;
+                            continue;
+                        }
+                        let one = [0u8; 1];
+                        let _ = unsafe {
+                            libc::write(
+                                write_fd,
+                                one.as_ptr() as *const libc::c_void,
+                                1,
+                            )
+                        };
+                    }
+                    // Stop-pollable read: 100ms poll cadence so
+                    // the worker re-checks `stop_requested` even
+                    // when the predecessor never wakes us. Mirrors
+                    // `pipe_exchange` (the PipeIo/CachePipe wake
+                    // helper) verbatim. POLLIN→read 1 byte and
+                    // record the wake-latency reservoir;
+                    // POLLHUP/POLLERR→break (predecessor's pipe
+                    // end is closed, no more wakes will arrive).
+                    let before_block = Instant::now();
+                    let mut pfd = libc::pollfd {
+                        fd: read_fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    let mut got_byte = false;
+                    loop {
+                        if stop_requested(stop) {
+                            break;
+                        }
+                        let ret = unsafe { libc::poll(&mut pfd, 1, 100) };
+                        if ret > 0 {
+                            let mut buf = [0u8; 1];
+                            let n = unsafe {
+                                libc::read(
+                                    read_fd,
+                                    buf.as_mut_ptr() as *mut libc::c_void,
+                                    1,
+                                )
+                            };
+                            reservoir_push(
+                                &mut resume_latencies_ns,
+                                &mut wake_sample_count,
+                                before_block.elapsed().as_nanos() as u64,
+                                MAX_WAKE_SAMPLES,
+                            );
+                            if n == 1 {
+                                got_byte = true;
+                            }
+                            break;
+                        }
+                        if ret < 0 {
+                            break;
+                        }
+                    }
+                    if !got_byte {
+                        // Either stop fired during the poll loop
+                        // or POLLHUP / poll error broke us out
+                        // without delivering a byte. Both paths
+                        // skip the CPU burst and successor wake;
+                        // the next outer loop iteration handles
+                        // teardown.
+                        if stop_requested(stop) {
+                            iterations += 1;
+                            continue;
+                        }
+                        break;
+                    }
                     if stop_requested(stop) {
+                        iterations += 1;
+                        continue;
+                    }
+                    let work_end = Instant::now() + work_per_hop;
+                    while Instant::now() < work_end && !stop_requested(stop) {
+                        spin_burst(&mut work_units, 256);
+                    }
+                    if stop_requested(stop) {
+                        iterations += 1;
+                        continue;
+                    }
+                    let one = [0u8; 1];
+                    let _ = unsafe {
+                        libc::write(
+                            write_fd,
+                            one.as_ptr() as *const libc::c_void,
+                            1,
+                        )
+                    };
+                    last_iter_time = Instant::now();
+                    iterations += 1;
+                } else {
+                    let (futex_ptr, pos) = match futex {
+                        Some(f) => f,
+                        None => break,
+                    };
+                    if pos >= depth {
+                        // Defense in depth: surface uses
+                        // `worker_group_size = depth`, so the
+                        // spawn-side divisibility check
+                        // guarantees pos < depth before we get
+                        // here. This branch handles only a
+                        // programmer bug that bypasses spawn.
                         break;
                     }
-                    let cur = atom.load(Ordering::Relaxed);
-                    if cur == my_stage {
-                        // Our turn. Record blocked-time as a wake
-                        // sample. pos == 0 on the very first
-                        // iteration sees `cur == 0` immediately
-                        // (never blocked) — `before_block` is
-                        // post-spawn, the elapsed time still
-                        // captures the spawn-to-first-stage gap,
-                        // matching how FutexFanOut handles its
-                        // first iteration.
-                        reservoir_push(
-                            &mut resume_latencies_ns,
-                            &mut wake_sample_count,
-                            before_block.elapsed().as_nanos() as u64,
-                            MAX_WAKE_SAMPLES,
-                        );
-                        break;
+                    let atom = unsafe { &*(futex_ptr as *const std::sync::atomic::AtomicU32) };
+                    let my_stage = pos as u32;
+                    let next_stage = ((pos + 1) % depth) as u32;
+                    let before_block = Instant::now();
+                    loop {
+                        if stop_requested(stop) {
+                            break;
+                        }
+                        let cur = atom.load(Ordering::Relaxed);
+                        if cur == my_stage {
+                            // Our turn. Record blocked-time as
+                            // a wake sample. pos == 0 on the
+                            // very first iteration sees
+                            // `cur == 0` immediately (never
+                            // blocked) — `before_block` is
+                            // post-spawn, the elapsed time still
+                            // captures the spawn-to-first-stage
+                            // gap, matching how FutexFanOut
+                            // handles its first iteration.
+                            reservoir_push(
+                                &mut resume_latencies_ns,
+                                &mut wake_sample_count,
+                                before_block.elapsed().as_nanos() as u64,
+                                MAX_WAKE_SAMPLES,
+                            );
+                            break;
+                        }
+                        unsafe { futex_wait(futex_ptr, cur, &FUTEX_WAIT_TIMEOUT) };
                     }
-                    unsafe { futex_wait(futex_ptr, cur, &FUTEX_WAIT_TIMEOUT) };
-                }
-                if stop_requested(stop) {
+                    if stop_requested(stop) {
+                        iterations += 1;
+                        continue;
+                    }
+                    let work_end = Instant::now() + work_per_hop;
+                    while Instant::now() < work_end && !stop_requested(stop) {
+                        spin_burst(&mut work_units, 256);
+                    }
+                    if stop_requested(stop) {
+                        iterations += 1;
+                        continue;
+                    }
+                    // Advance to the next stage and wake everyone
+                    // parked. Relaxed store: futex syscall provides
+                    // the kernel-side cross-thread ordering for the
+                    // wake event (matches FutexFanOut's idiom).
+                    atom.store(next_stage, Ordering::Relaxed);
+                    unsafe { futex_wake(futex_ptr, clamp_futex_wake_n(usize::MAX)) };
+                    last_iter_time = Instant::now();
                     iterations += 1;
-                    continue;
                 }
-                // Stage work: spin for the configured duration. Use
-                // `Instant`-based gating so `work_per_hop`'s unit
-                // (Duration) is honored regardless of host CPU
-                // speed — same idiom as `Bursty`'s `burst_ms`
-                // (Duration::from_millis on a per-iteration
-                // deadline).
-                let work_end = Instant::now() + work_per_hop;
-                while Instant::now() < work_end && !stop_requested(stop) {
-                    spin_burst(&mut work_units, 256);
-                }
-                if stop_requested(stop) {
-                    iterations += 1;
-                    continue;
-                }
-                // Advance to the next stage and wake everyone
-                // parked. Relaxed store: futex syscall provides the
-                // kernel-side cross-thread ordering for the wake
-                // event (matches FutexFanOut's idiom).
-                atom.store(next_stage, Ordering::Relaxed);
-                unsafe { futex_wake(futex_ptr, clamp_futex_wake_n(usize::MAX)) };
-                last_iter_time = Instant::now();
-                iterations += 1;
             }
             WorkType::AsymmetricWaker {
                 waker_class,
@@ -13604,6 +13955,131 @@ mod tests {
         assert_eq!(reports.len(), 2);
         let total: u64 = reports.iter().map(|r| r.iterations).sum();
         assert!(total > 0, "WakeChain ring must iterate: {reports:?}");
+    }
+
+    /// `WorkType::WakeChain { sync: true }` smoke test. Drives the
+    /// anon-pipe ring path so the kernel `wake_up_interruptible_sync_poll`
+    /// → `__wake_up_sync_key` → `WF_SYNC` chain runs end-to-end.
+    /// Asserts every worker iterates at least once; the rigorous
+    /// WF_SYNC-fired assertion lives in #294.
+    #[test]
+    fn pathology_wake_chain_sync_iterates() {
+        let cfg = WorkloadConfig {
+            num_workers: 2,
+            work_type: WorkType::WakeChain {
+                depth: 2,
+                fanout: 1,
+                sync: true,
+                work_per_hop: Duration::from_micros(50),
+            },
+            ..Default::default()
+        };
+        let mut h = WorkloadHandle::spawn(&cfg).expect("WakeChain sync=true must spawn");
+        h.start();
+        std::thread::sleep(Duration::from_millis(200));
+        let reports = h.stop_and_collect();
+        assert_eq!(reports.len(), 2);
+        for r in &reports {
+            assert!(
+                r.iterations > 0,
+                "WakeChain sync=true worker must iterate: {r:?}"
+            );
+        }
+    }
+
+    /// `WakeChain { sync: true }` deeper chain. depth=4 → 4 workers
+    /// per chain × 1 chain = 4 workers. Verifies the ring closes
+    /// (stage 3 wakes stage 0) by requiring every stage iterates.
+    #[test]
+    fn pathology_wake_chain_sync_deeper_chain() {
+        let cfg = WorkloadConfig {
+            num_workers: 4,
+            work_type: WorkType::WakeChain {
+                depth: 4,
+                fanout: 1,
+                sync: true,
+                work_per_hop: Duration::from_micros(20),
+            },
+            ..Default::default()
+        };
+        let mut h = WorkloadHandle::spawn(&cfg).expect("WakeChain sync=true depth=4 must spawn");
+        h.start();
+        std::thread::sleep(Duration::from_millis(300));
+        let reports = h.stop_and_collect();
+        assert_eq!(reports.len(), 4);
+        for r in &reports {
+            assert!(
+                r.iterations > 0,
+                "WakeChain sync=true depth=4 worker must iterate: {r:?}"
+            );
+        }
+    }
+
+    /// `WakeChain { sync: true }` multi-chain. depth=2, fanout=2 →
+    /// 2 stages × 2 parallel chains = 4 workers. Each chain owns
+    /// its own pipe ring; pipes are not shared across chains. All
+    /// workers must iterate independently.
+    #[test]
+    fn pathology_wake_chain_sync_multi_chain() {
+        let cfg = WorkloadConfig {
+            num_workers: 4,
+            work_type: WorkType::WakeChain {
+                depth: 2,
+                fanout: 2,
+                sync: true,
+                work_per_hop: Duration::from_micros(50),
+            },
+            ..Default::default()
+        };
+        let mut h =
+            WorkloadHandle::spawn(&cfg).expect("WakeChain sync=true fanout=2 must spawn");
+        h.start();
+        std::thread::sleep(Duration::from_millis(200));
+        let reports = h.stop_and_collect();
+        assert_eq!(reports.len(), 4);
+        for r in &reports {
+            assert!(
+                r.iterations > 0,
+                "WakeChain sync=true fanout=2 worker must iterate: {r:?}"
+            );
+        }
+    }
+
+    /// `WakeChain { sync: true }` stop responsiveness. Pins the
+    /// FIX 1 contract: workers blocked in the pipe `read` must
+    /// re-check `stop_requested` via the `poll(POLLIN, 100ms)`
+    /// loop and exit cleanly. `stop_and_collect` must complete
+    /// within 500 ms (well under the SIGUSR1 escalation deadline)
+    /// and every worker must report `completed == true`.
+    #[test]
+    fn pathology_wake_chain_sync_stop_responsive() {
+        let cfg = WorkloadConfig {
+            num_workers: 2,
+            work_type: WorkType::WakeChain {
+                depth: 2,
+                fanout: 1,
+                sync: true,
+                work_per_hop: Duration::from_micros(50),
+            },
+            ..Default::default()
+        };
+        let mut h = WorkloadHandle::spawn(&cfg).expect("WakeChain sync=true must spawn");
+        h.start();
+        std::thread::sleep(Duration::from_millis(200));
+        let stop_start = Instant::now();
+        let reports = h.stop_and_collect();
+        let stop_elapsed = stop_start.elapsed();
+        assert!(
+            stop_elapsed < Duration::from_millis(500),
+            "stop_and_collect took {stop_elapsed:?}, expected < 500ms"
+        );
+        assert_eq!(reports.len(), 2);
+        for r in &reports {
+            assert!(
+                r.completed,
+                "WakeChain sync=true worker must complete on stop: {r:?}"
+            );
+        }
     }
 
     /// `WorkType::NumaWorkingSetSweep` smoke test. Empty
