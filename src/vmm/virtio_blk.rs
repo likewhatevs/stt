@@ -114,9 +114,9 @@ use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-#[cfg(not(test))]
+use std::sync::mpsc;
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use virtio_bindings::virtio_blk::{
     VIRTIO_BLK_F_BLK_SIZE, VIRTIO_BLK_F_FLUSH, VIRTIO_BLK_F_RO, VIRTIO_BLK_F_SEG_MAX,
@@ -3607,6 +3607,150 @@ impl VirtioBlk {
     }
 }
 
+/// Upper bound on how long [`VirtioBlk::drop`] will block while
+/// joining the worker thread.
+///
+/// 1 s is a deliberate trade between two failure modes. Below 1 s,
+/// the timeout would fire on healthy shutdowns under load — the
+/// worker may be mid-`pread`/`pwrite` when `stop_fd` is signalled,
+/// and a fast-but-not-instant drain (cold page cache, contended
+/// disk) can take tens to hundreds of milliseconds before the
+/// worker reaches the next `epoll_wait` and observes the stop. A
+/// budget shorter than typical drain latency would log false
+/// "wedged worker" warnings and detach threads that were about to
+/// exit. Above 1 s, the budget would risk vCPU thread starvation
+/// during freeze rendezvous: the freeze coordinator's SIGRTMIN
+/// rendezvous timeout is 30 s and the vCPU thread can be mid-`drop`
+/// at that moment, so any `Drop` blocking budget compounds with
+/// other pre-rendezvous overhead.
+///
+/// The 1 s value is large enough to absorb realistic drain
+/// latency on warm caches and small enough to keep the `Drop`
+/// completion well below the rendezvous threshold.
+const DROP_JOIN_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Outcome of a bounded join attempt by [`join_worker_with_timeout`].
+///
+/// The variants distinguish observable shutdown states so callers
+/// can log appropriately and unit tests can assert which path the
+/// worker took. `Joined` carries the recovered `BlkWorkerState`;
+/// the other variants are valueless because the state is either
+/// lost (panic) or still owned by a detached helper / worker
+/// thread (timeout, helper failure).
+enum JoinWithTimeoutOutcome {
+    /// Worker exited normally and yielded its `BlkWorkerState`.
+    Joined(BlkWorkerState),
+    /// Worker panicked. The variant carries the panic payload
+    /// returned by `JoinHandle::join` so the caller can render it
+    /// (commonly a `&'static str` or `String` from `panic!(…)`)
+    /// into a log message via `Debug` or by downcasting.
+    Panicked(Box<dyn std::any::Any + Send>),
+    /// Worker did not exit within `timeout`. The original
+    /// `JoinHandle` is held by the helper thread, which continues
+    /// running until the worker finally exits.
+    TimedOut,
+    /// `thread::Builder::spawn` for the helper thread failed
+    /// (typically `EAGAIN` from `RLIMIT_NPROC` or thread-count
+    /// exhaustion). The original handle was dropped — the worker
+    /// is detached.
+    HelperSpawnFailed,
+    /// Helper thread itself panicked before forwarding the join
+    /// result. Worker's outcome is unknown.
+    HelperDisconnected,
+}
+
+/// Best-effort conversion of a `JoinHandle::join` panic payload to
+/// a borrowed `&str`. Matches the two variants `panic!(…)` emits
+/// in safe code: `&'static str` for `panic!("literal")` and
+/// `String` for `panic!("{}", x)` / `panic!(format!(…))`. Other
+/// payload types fall through to the placeholder `<non-string panic>`.
+fn panic_payload_str(payload: &(dyn std::any::Any + Send)) -> &str {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        s
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.as_str()
+    } else {
+        "<non-string panic>"
+    }
+}
+
+/// Join `handle` with an upper bound on the calling thread's wait
+/// time.
+///
+/// Spawns a short-lived `ktstr-vblk-drop` helper thread that
+/// performs the blocking `JoinHandle::join` and forwards the
+/// result on an `mpsc::channel`. The calling thread waits via
+/// `recv_timeout`; on timeout the helper is left running with the
+/// handle and the calling thread returns. This bounds the
+/// worst-case duration even when the worker is wedged in a
+/// blocking syscall that does not check `stop_fd`
+/// (`pread`/`pwrite` on slow backing, hung NFS, etc.). The vCPU
+/// thread — which calls `VirtioBlk::drop` post-reset — therefore
+/// cannot miss a SIGRTMIN delivery during freeze rendezvous
+/// because the worker is hung.
+///
+/// # Outcomes
+///
+/// - [`JoinWithTimeoutOutcome::Joined`] — worker exited within
+///   `timeout`; state recovered.
+/// - [`JoinWithTimeoutOutcome::Panicked`] — worker exited within
+///   `timeout`, but with a panic; state lost. The `Box<dyn Any +
+///   Send>` payload returned by `JoinHandle::join` is propagated
+///   so the caller can render it via [`panic_payload_str`] or by
+///   downcasting to a concrete type.
+/// - [`JoinWithTimeoutOutcome::TimedOut`] — worker did not exit
+///   within `timeout`. Helper retains the `JoinHandle` and (through
+///   it) the worker's `BlkWorkerState` until the worker finally
+///   exits; if the worker never exits (perpetually-stuck IO), the
+///   state outlives the device.
+/// - [`JoinWithTimeoutOutcome::HelperSpawnFailed`] — the helper
+///   thread itself could not be created (`RLIMIT_NPROC`,
+///   thread-count exhaustion). Falling back to a direct
+///   `handle.join()` would re-introduce the unbounded block this
+///   function exists to prevent, so the handle is dropped and the
+///   worker is detached.
+/// - [`JoinWithTimeoutOutcome::HelperDisconnected`] — the helper
+///   thread panicked before forwarding the join result. Worker's
+///   outcome is unknown; the helper's `JoinHandle<()>` is dropped
+///   when this function returns, detaching it.
+///
+/// # Resource retention on timeout
+///
+/// `BlkWorkerState` owns a `File`, an `Arc<VirtioBlkCounters>`,
+/// two scratch `Vec`s, and two `TokenBucket`s. On timeout these
+/// are reclaimed only when the worker thread finally exits; if it
+/// does not, they outlive the device. This is the explicit trade
+/// chosen over blocking a vCPU thread indefinitely. (The worker
+/// also retains an `Arc<GuestMemoryMmap>` and the queue Arc clones
+/// it was spawned with; those are part of the worker thread's
+/// stack frame, not `BlkWorkerState`, but the same retention
+/// applies — they live until the worker exits.)
+fn join_worker_with_timeout(
+    handle: thread::JoinHandle<BlkWorkerState>,
+    timeout: Duration,
+) -> JoinWithTimeoutOutcome {
+    let (tx, rx) = mpsc::channel();
+    let spawn_result = thread::Builder::new()
+        .name("ktstr-vblk-drop".to_string())
+        .spawn(move || {
+            // Forward the join result. `send` failure means the
+            // calling thread already gave up on `recv_timeout`
+            // and dropped `rx`; the helper still owns the joined
+            // state until this closure returns.
+            let _ = tx.send(handle.join());
+        });
+    let _helper = match spawn_result {
+        Ok(h) => h,
+        Err(_) => return JoinWithTimeoutOutcome::HelperSpawnFailed,
+    };
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(state)) => JoinWithTimeoutOutcome::Joined(state),
+        Ok(Err(payload)) => JoinWithTimeoutOutcome::Panicked(payload),
+        Err(mpsc::RecvTimeoutError::Timeout) => JoinWithTimeoutOutcome::TimedOut,
+        Err(mpsc::RecvTimeoutError::Disconnected) => JoinWithTimeoutOutcome::HelperDisconnected,
+    }
+}
+
 /// `Drop` matches on `WorkerEngine` rather than gating the entire
 /// impl on `cfg(not(test))`: the Inline branch is a no-op (the
 /// default Drop drops `BlkWorkerState` cleanly when the engine
@@ -3625,6 +3769,15 @@ impl VirtioBlk {
 /// thread holding the queue Arcs and the backing file open after
 /// the device is dropped — visible as "test process leaks fds and
 /// threads under stress."
+///
+/// # Bounded join
+///
+/// The Spawned arm delegates to [`join_worker_with_timeout`] with
+/// a [`DROP_JOIN_TIMEOUT`] budget. On timeout the helper thread
+/// retains the `JoinHandle` and the calling thread returns without
+/// blocking further. See that function's docs for full outcome
+/// semantics and resource-retention notes, and `DROP_JOIN_TIMEOUT`
+/// for why the budget is set where it is.
 impl Drop for VirtioBlk {
     fn drop(&mut self) {
         match &mut self.worker.engine {
@@ -3640,14 +3793,40 @@ impl Drop for VirtioBlk {
                 // being woken so a missed write is benign.
                 let _ = eng.stop_fd.write(1);
                 if let Some(handle) = eng.handle.take() {
-                    // The join handle yields the `BlkWorkerState`
-                    // the worker held; on Drop we discard it (the
-                    // backing File closes, the scratch Vecs free,
-                    // the counters Arc decrements). `reset()`
-                    // takes a different path that captures and
-                    // re-uses the state.
-                    if let Err(e) = handle.join() {
-                        tracing::error!(?e, "virtio-blk worker thread panicked");
+                    match join_worker_with_timeout(handle, DROP_JOIN_TIMEOUT) {
+                        JoinWithTimeoutOutcome::Joined(_state) => {
+                            // Clean shutdown: state drops at scope end.
+                        }
+                        JoinWithTimeoutOutcome::Panicked(payload) => {
+                            tracing::error!(
+                                panic = panic_payload_str(&*payload),
+                                "virtio-blk worker thread panicked"
+                            );
+                        }
+                        JoinWithTimeoutOutcome::TimedOut => {
+                            tracing::warn!(
+                                timeout_s = DROP_JOIN_TIMEOUT.as_secs_f32(),
+                                "virtio-blk worker did not exit within \
+                                 DROP_JOIN_TIMEOUT of stop_fd; leaking \
+                                 the worker thread to avoid blocking the \
+                                 calling thread (likely a vCPU). Worker \
+                                 is wedged in a blocking syscall that \
+                                 does not check stop_fd."
+                            );
+                        }
+                        JoinWithTimeoutOutcome::HelperSpawnFailed => {
+                            tracing::error!(
+                                "virtio-blk drop helper thread spawn \
+                                 failed; detaching worker without join"
+                            );
+                        }
+                        JoinWithTimeoutOutcome::HelperDisconnected => {
+                            tracing::error!(
+                                "virtio-blk drop helper thread \
+                                 terminated without forwarding the \
+                                 worker join result"
+                            );
+                        }
                     }
                 }
             }
@@ -11466,6 +11645,137 @@ mod tests {
             "INTERRUPT_ACK with VIRTIO_MMIO_INT_VRING must clear the bit",
         );
     }
+
+    // ------------------------------------------------------------------
+    // join_worker_with_timeout unit tests
+    // ------------------------------------------------------------------
+
+    /// Build a minimal `BlkWorkerState` for tests that exercise the
+    /// timeout helper. The state's contents are irrelevant — these
+    /// tests only assert on the `JoinWithTimeoutOutcome` variant —
+    /// so the buckets are unlimited, the scratch buffers empty, and
+    /// the backing file an unsized tempfile.
+    fn dummy_worker_state() -> BlkWorkerState {
+        BlkWorkerState {
+            backing: tempfile().expect("create tempfile for dummy_worker_state"),
+            ops_bucket: TokenBucket::unlimited(),
+            bytes_bucket: TokenBucket::unlimited(),
+            all_descs_scratch: Vec::new(),
+            io_buf_scratch: Vec::new(),
+            capacity_bytes: 0,
+            read_only: false,
+            counters: Arc::new(VirtioBlkCounters::default()),
+        }
+    }
+
+    #[test]
+    fn join_worker_with_timeout_happy_path_returns_joined() {
+        // The worker thread returns immediately; the helper joins
+        // it well before the budget. Using DROP_JOIN_TIMEOUT here
+        // mirrors the production `Drop` site so this test is also
+        // a smoke test for that arrangement.
+        let handle = std::thread::Builder::new()
+            .name("ktstr-vblk-test-happy".to_string())
+            .spawn(dummy_worker_state)
+            .expect("spawn happy-path worker");
+        let start = Instant::now();
+        let outcome = join_worker_with_timeout(handle, DROP_JOIN_TIMEOUT);
+        let elapsed = start.elapsed();
+        assert!(
+            matches!(outcome, JoinWithTimeoutOutcome::Joined(_)),
+            "expected Joined, got {:?}",
+            outcome_label(&outcome)
+        );
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "happy-path join took {elapsed:?}, expected < 100ms"
+        );
+    }
+
+    #[test]
+    fn join_worker_with_timeout_returns_timed_out_when_worker_blocks() {
+        // The worker sleeps 60 s — much longer than the 50 ms
+        // budget — so `recv_timeout` must return `Timeout` and the
+        // function reports `TimedOut`. After the assertion the
+        // helper holds the worker `JoinHandle` and remains blocked
+        // in `handle.join()`; the worker is still in its sleep.
+        // Both are leaked. They are killed when the test binary
+        // process exits; nothing in this test waits on them.
+        let handle = std::thread::Builder::new()
+            .name("ktstr-vblk-test-timeout".to_string())
+            .spawn(|| {
+                std::thread::sleep(Duration::from_secs(60));
+                dummy_worker_state()
+            })
+            .expect("spawn timeout-path worker");
+        let start = Instant::now();
+        let outcome = join_worker_with_timeout(handle, Duration::from_millis(50));
+        let elapsed = start.elapsed();
+        assert!(
+            matches!(outcome, JoinWithTimeoutOutcome::TimedOut),
+            "expected TimedOut, got {:?}",
+            outcome_label(&outcome)
+        );
+        assert!(
+            elapsed >= Duration::from_millis(50),
+            "timeout fired too early at {elapsed:?}; expected >= 50ms"
+        );
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "timeout fired too late at {elapsed:?}; expected < 200ms \
+             (recv_timeout overhead budget)"
+        );
+    }
+
+    #[test]
+    fn join_worker_with_timeout_returns_panicked_on_worker_panic() {
+        // The worker thread panics. `JoinHandle::join` returns
+        // `Err(payload)`, which the helper forwards verbatim; the
+        // function maps it to `Panicked(payload)`. The payload
+        // round-trips: a `panic!("literal")` deposits a
+        // `&'static str` recoverable via `downcast_ref`.
+        let handle = std::thread::Builder::new()
+            .name("ktstr-vblk-test-panic".to_string())
+            .spawn(|| -> BlkWorkerState {
+                panic!("intentional panic from join_worker_with_timeout test");
+            })
+            .expect("spawn panic-path worker");
+        let start = Instant::now();
+        let outcome = join_worker_with_timeout(handle, DROP_JOIN_TIMEOUT);
+        let elapsed = start.elapsed();
+        assert!(
+            matches!(outcome, JoinWithTimeoutOutcome::Panicked(_)),
+            "expected Panicked, got {:?}",
+            outcome_label(&outcome)
+        );
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "panic-path join took {elapsed:?}, expected < 100ms \
+             (parity with happy path)"
+        );
+        // Confirm the payload round-trips through the channel.
+        if let JoinWithTimeoutOutcome::Panicked(payload) = outcome {
+            assert_eq!(
+                panic_payload_str(&*payload),
+                "intentional panic from join_worker_with_timeout test",
+                "panic payload round-trip should preserve the &'static str"
+            );
+        }
+    }
+
+    /// Stable label for `JoinWithTimeoutOutcome` for use in test
+    /// failure messages — the enum itself does not derive `Debug`
+    /// (the `Joined` variant carries `BlkWorkerState`, which has no
+    /// `Debug` impl and shouldn't gain one just for tests).
+    fn outcome_label(o: &JoinWithTimeoutOutcome) -> &'static str {
+        match o {
+            JoinWithTimeoutOutcome::Joined(_) => "Joined",
+            JoinWithTimeoutOutcome::Panicked(_) => "Panicked",
+            JoinWithTimeoutOutcome::TimedOut => "TimedOut",
+            JoinWithTimeoutOutcome::HelperSpawnFailed => "HelperSpawnFailed",
+            JoinWithTimeoutOutcome::HelperDisconnected => "HelperDisconnected",
+        }
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -12064,5 +12374,4 @@ mod proptest_tests {
             );
         }
     }
-
 }
