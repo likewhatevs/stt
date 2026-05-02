@@ -117,6 +117,16 @@ u32 degrade_cnt;
 u32 slow_cnt;
 
 
+s32 BPF_STRUCT_OPS(ktstr_select_cpu, struct task_struct *p,
+		   s32 prev_cpu, u64 wake_flags)
+{
+	bool is_idle = false;
+	s32 cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
+	if (is_idle)
+		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
+	return cpu;
+}
+
 void BPF_STRUCT_OPS(ktstr_enqueue, struct task_struct *p, u64 enq_flags)
 {
 	if (scattershot || degrade || degrade_rt) {
@@ -318,6 +328,7 @@ void BPF_STRUCT_OPS(ktstr_dump_task, struct scx_dump_ctx *dctx,
 }
 
 SCX_OPS_DEFINE(ktstr_ops,
+	       .select_cpu	= (void *)ktstr_select_cpu,
 	       .enqueue		= (void *)ktstr_enqueue,
 	       .dispatch	= (void *)ktstr_dispatch,
 	       .init_task	= (void *)ktstr_init_task,
