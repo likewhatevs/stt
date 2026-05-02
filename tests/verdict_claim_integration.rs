@@ -36,7 +36,7 @@ use ktstr::workload::{
     WorkloadConfig, WorkloadHandle,
 };
 
-/// Spawn 2 Thread-mode CpuSpin workers, let them run for 200ms, then
+/// Spawn 2 Thread-mode SpinWait workers, let them run for 200ms, then
 /// collect their `WorkerReport`s. Thread mode runs in-process via
 /// `std::thread::spawn`, so this is a pure host-side test — no VM,
 /// no `/dev/kvm`, no kernel build. Returns at least one report
@@ -46,14 +46,14 @@ fn collect_real_reports() -> Vec<WorkerReport> {
     let config = WorkloadConfig {
         num_workers: 2,
         clone_mode: CloneMode::Thread,
-        work_type: WorkType::CpuSpin,
+        work_type: WorkType::SpinWait,
         affinity: ResolvedAffinity::None,
         sched_policy: SchedPolicy::Normal,
         ..Default::default()
     };
-    let mut handle = WorkloadHandle::spawn(&config).expect("Thread-mode CpuSpin must spawn");
+    let mut handle = WorkloadHandle::spawn(&config).expect("Thread-mode SpinWait must spawn");
     handle.start();
-    // 200ms is well above the wake-cadence floor for a CpuSpin worker
+    // 200ms is well above the wake-cadence floor for a SpinWait worker
     // (1024-iter checkpoints clear in microseconds), so every report
     // records non-zero wall_time_ns and a non-zero work_units count
     // — the at_least(1) bounds below depend on real progress.
@@ -61,7 +61,7 @@ fn collect_real_reports() -> Vec<WorkerReport> {
     let reports = handle.stop_and_collect();
     assert!(
         !reports.is_empty(),
-        "Thread-mode CpuSpin must produce at least one WorkerReport",
+        "Thread-mode SpinWait must produce at least one WorkerReport",
     );
     reports
 }

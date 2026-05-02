@@ -483,7 +483,7 @@ fn cover_op_spawn_host(ctx: &Ctx) -> Result<AssertResult> {
             HoldSpec::Fixed(ctx.settle + ctx.duration),
         )
         .set_ops(vec![Op::spawn_host(
-            WorkSpec::default().workers(2).work_type(WorkType::CpuSpin),
+            WorkSpec::default().workers(2).work_type(WorkType::SpinWait),
         )]),
     ];
     execute_steps(ctx, steps)
@@ -519,10 +519,10 @@ fn cover_execute_defs_two_cgroups(ctx: &Ctx) -> Result<AssertResult> {
         vec![
             CgroupDef::named("cg_0")
                 .workers(2)
-                .work_type(WorkType::CpuSpin),
+                .work_type(WorkType::SpinWait),
             CgroupDef::named("cg_1")
                 .workers(2)
-                .work_type(WorkType::CpuSpin),
+                .work_type(WorkType::SpinWait),
         ],
     )
 }

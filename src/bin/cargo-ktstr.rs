@@ -894,7 +894,7 @@ enum StatsCommand {
         #[arg(long, action = ArgAction::Append)]
         topology: Vec<String>,
         /// Repeatable OR-combined filter on the sidecar's
-        /// `work_type` field (e.g. `--work-type CpuSpin`). Valid
+        /// `work_type` field (e.g. `--work-type SpinWait`). Valid
         /// names are the PascalCase variants of `WorkType`. See
         /// `WorkType::ALL_NAMES` for the canonical variant list, or
         /// `doc/guide/src/concepts/work-types.md`. `--work-type A
@@ -5041,7 +5041,7 @@ mod tests {
             "stats",
             "compare",
             "--work-type",
-            "CpuSpin",
+            "SpinWait",
             "--work-type",
             "PageFaultChurn",
             "--a-kernel",
@@ -5055,7 +5055,7 @@ mod tests {
                 command: Some(StatsCommand::Compare { work_type, .. }),
                 ..
             } => {
-                assert_eq!(work_type, vec!["CpuSpin", "PageFaultChurn"]);
+                assert_eq!(work_type, vec!["SpinWait", "PageFaultChurn"]);
             }
             _ => panic!("expected Stats Compare"),
         }

@@ -37,7 +37,7 @@
 //!   netlink path but their accumulation depends on the
 //!   workload still being LIVE at capture time; the test
 //!   reaches them as a diagnostic surface but does NOT pin
-//!   `> 0` because the CpuSpin workers exit before
+//!   `> 0` because the SpinWait workers exit before
 //!   `capture()` runs and the surviving tids weren't
 //!   oversubscribed. The unit-test fixture
 //!   `parse_taskstats_payload_handles_truncation` already
@@ -179,7 +179,7 @@ fn ctprof_capture_records_wchar_under_iosync(ctx: &Ctx) -> Result<AssertResult> 
 // ---------------------------------------------------------------------------
 
 /// Drive CPU oversubscription inside the guest — more workers
-/// than cores, all running [`WorkType::CpuSpin`] — and call
+/// than cores, all running [`WorkType::SpinWait`] — and call
 /// `capture()`. Assert PSI reachability: the snapshot has
 /// threads (proves capture ran end-to-end) and the
 /// `snap.psi.cpu` struct is populated (proves
@@ -201,7 +201,7 @@ fn ctprof_capture_records_wchar_under_iosync(ctx: &Ctx) -> Result<AssertResult> 
 /// zero.
 ///
 /// Topology: 1 LLC / 2 cores / 1 thread, with
-/// `workers_per_cgroup` workers running CpuSpin — the
+/// `workers_per_cgroup` workers running SpinWait — the
 /// load shape is right for `cpu.some` accumulation when the
 /// kernel observes it, and the snapshot's PSI struct is
 /// populated either way.
@@ -211,7 +211,7 @@ fn ctprof_capture_reaches_host_psi_cpu_under_oversubscription(ctx: &Ctx) -> Resu
         setup: vec![
             CgroupDef::named("cg_0")
                 .workers(ctx.workers_per_cgroup)
-                .work_type(WorkType::CpuSpin),
+                .work_type(WorkType::SpinWait),
         ]
         .into(),
         ops: vec![],
@@ -265,7 +265,7 @@ fn ctprof_capture_reaches_host_psi_cpu_under_oversubscription(ctx: &Ctx) -> Resu
 // ---------------------------------------------------------------------------
 
 /// Drive CPU oversubscription inside the guest — more workers
-/// than cores running [`WorkType::CpuSpin`] — and call
+/// than cores running [`WorkType::SpinWait`] — and call
 /// `capture()`. Two assertions, asymmetric in strength:
 ///
 /// 1. **hiwater_rss > 0 (HARD)**: at least one thread must
@@ -280,7 +280,7 @@ fn ctprof_capture_reaches_host_psi_cpu_under_oversubscription(ctx: &Ctx) -> Resu
 ///    process has an mm. Crucially, this is a LIFETIME watermark
 ///    that survives the workload exiting: the test process itself
 ///    is a user-space process with an mm, so even though the
-///    CpuSpin workers have exited by the time `capture()` runs
+///    SpinWait workers have exited by the time `capture()` runs
 ///    (see assertion 2's caveat), the test process and any other
 ///    surviving user-space tgid still report non-zero
 ///    hiwater_rss. Kernel threads (`PF_KTHREAD`, `mm == NULL`)
@@ -295,7 +295,7 @@ fn ctprof_capture_reaches_host_psi_cpu_under_oversubscription(ctx: &Ctx) -> Resu
 ///    `tsk->sched_info.run_delay` fields and only reaches
 ///    userspace through `delayacct_add_tsk` while the task is
 ///    still alive. By the time `capture()` runs (AFTER
-///    `execute_steps()` returns), the CpuSpin workers that
+///    `execute_steps()` returns), the SpinWait workers that
 ///    accumulated cpu_delay under oversubscription have exited —
 ///    /proc only enumerates LIVE threads, and the netlink
 ///    `query_tid` for an exited tid returns ESRCH. The remaining
@@ -327,7 +327,7 @@ fn ctprof_capture_reaches_host_psi_cpu_under_oversubscription(ctx: &Ctx) -> Resu
 ///   ktstr binary runs as root inside the VM, so this is
 ///   satisfied unconditionally.
 ///
-/// Topology: 1 LLC / 2 cores / 1 thread + 4 CpuSpin workers
+/// Topology: 1 LLC / 2 cores / 1 thread + 4 SpinWait workers
 /// (`workers_per_cgroup = 4` overrides the default of 2) for
 /// 2× oversubscription. Even though cpu_delay is now
 /// reachability-only, the oversubscription topology is kept so
@@ -359,7 +359,7 @@ fn ctprof_capture_records_taskstats_cpu_delay_and_hiwater_under_oversubscription
         setup: vec![
             CgroupDef::named("cg_0")
                 .workers(ctx.workers_per_cgroup)
-                .work_type(WorkType::CpuSpin),
+                .work_type(WorkType::SpinWait),
         ]
         .into(),
         ops: vec![],
@@ -380,7 +380,7 @@ fn ctprof_capture_records_taskstats_cpu_delay_and_hiwater_under_oversubscription
 
     // cpu_delay (reachability-only): collect the maxes for the
     // diagnostic detail print but do NOT fail on zero. The
-    // CpuSpin workers exited before capture() ran; any
+    // SpinWait workers exited before capture() ran; any
     // surviving tids accumulated their cpu_delay only in
     // proportion to the (light) post-workload runqueue
     // pressure they experienced. See doc above for why
@@ -404,7 +404,7 @@ fn ctprof_capture_records_taskstats_cpu_delay_and_hiwater_under_oversubscription
     // pipeline end-to-end. Kernel threads (mm == NULL) read
     // zero by design (guarded at xacct_add_tsk:100); the test
     // process itself is a user-space process with an mm, so
-    // its watermark survives the CpuSpin workers exiting.
+    // its watermark survives the SpinWait workers exiting.
     let max_hiwater_rss_bytes = snap
         .threads
         .iter()

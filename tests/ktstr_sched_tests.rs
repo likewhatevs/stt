@@ -476,7 +476,7 @@ static __KTSTR_ENTRY_SCX: ktstr::test_support::KtstrTestEntry =
 ///
 /// `watchdog_timeout_s = 15` overrides the 4 s
 /// `KtstrTestEntry::DEFAULT.watchdog_timeout`. The minimal scx-ktstr
-/// pull-from-shared-DSQ scheduler under 2-vCPU CpuSpin contention can
+/// pull-from-shared-DSQ scheduler under 2-vCPU SpinWait contention can
 /// leave background tasks (init, RCU kthreads) sitting on
 /// `rq->scx.runnable_list` longer than 4 s as the per-CPU dispatch
 /// loop cycles workers in/out of SHARED_DSQ; the kernel watchdog's

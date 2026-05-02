@@ -253,8 +253,8 @@ pub enum Phase {
 ///
 /// ```
 /// # use ktstr::workload::WorkType;
-/// let wt = WorkType::from_name("CpuSpin").unwrap();
-/// assert!(matches!(wt, WorkType::CpuSpin));
+/// let wt = WorkType::from_name("SpinWait").unwrap();
+/// assert!(matches!(wt, WorkType::SpinWait));
 ///
 /// let bursty = WorkType::bursty(10, 5);
 /// assert!(matches!(bursty, WorkType::Bursty { .. }));
@@ -301,7 +301,7 @@ pub enum Phase {
 #[serde(bound(deserialize = ""))]
 pub enum WorkType {
     /// Tight CPU spin loop (1024 iterations per cycle).
-    CpuSpin,
+    SpinWait,
     /// Repeated sched_yield with minimal CPU work.
     YieldHeavy,
     /// CPU spin burst followed by sched_yield.
@@ -842,7 +842,7 @@ impl WorkType {
     /// field instead.
     pub fn name(&self) -> &str {
         match self {
-            WorkType::CpuSpin => "CpuSpin",
+            WorkType::SpinWait => "SpinWait",
             WorkType::YieldHeavy => "YieldHeavy",
             WorkType::Mixed => "Mixed",
             WorkType::IoSyncWrite => "IoSyncWrite",
@@ -880,7 +880,7 @@ impl WorkType {
     /// pointer).
     pub fn from_name(s: &str) -> Option<WorkType> {
         match s {
-            "CpuSpin" => Some(WorkType::CpuSpin),
+            "SpinWait" => Some(WorkType::SpinWait),
             "YieldHeavy" => Some(WorkType::YieldHeavy),
             "Mixed" => Some(WorkType::Mixed),
             "IoSyncWrite" => Some(WorkType::IoSyncWrite),
@@ -993,8 +993,8 @@ impl WorkType {
     ///
     /// Distinct from [`from_name`](Self::from_name) in two ways:
     ///
-    /// 1. It matches case-insensitively, so `"cpuspin"` / `"CPUSPIN"`
-    ///    / `"CpuSpin"` all map to the same canonical `"CpuSpin"`.
+    /// 1. It matches case-insensitively, so `"spinwait"` / `"SPINWAIT"`
+    ///    / `"SpinWait"` all map to the same canonical `"SpinWait"`.
     /// 2. It returns the name string rather than a default-parameter
     ///    [`WorkType`] value, so callers can quote the canonical
     ///    spelling in error messages without also instantiating the
@@ -1003,14 +1003,14 @@ impl WorkType {
     /// Intended as a CLI / config-parser helper: when `from_name`
     /// returns `None` for the user's input, pass the same string
     /// here to recover the canonical spelling (if any) for a
-    /// friendlier "did you mean `CpuSpin`?" diagnostic. Includes
+    /// friendlier "did you mean `SpinWait`?" diagnostic. Includes
     /// `"Sequence"` and `"Custom"` in the match space even though
     /// `from_name` refuses to construct them — the point of
     /// [`suggest`](Self::suggest) is naming, not construction.
     ///
     /// Whitespace handling: the match uses `eq_ignore_ascii_case`
     /// without trimming, so surrounding whitespace in `s`
-    /// (`" CpuSpin"`, `"CpuSpin\n"`) suppresses a match. Callers
+    /// (`" SpinWait"`, `"SpinWait\n"`) suppresses a match. Callers
     /// that accept user input with possible surrounding whitespace
     /// must `s.trim()` before calling — the same convention
     /// [`from_name`] follows. Keeping the predicate strict here
@@ -2042,7 +2042,7 @@ impl Default for WorkloadConfig {
         Self {
             num_workers: 1,
             affinity: ResolvedAffinity::None,
-            work_type: WorkType::CpuSpin,
+            work_type: WorkType::SpinWait,
             sched_policy: SchedPolicy::Normal,
             mem_policy: MemPolicy::Default,
             mpol_flags: MpolFlags::NONE,
@@ -2157,7 +2157,7 @@ pub struct WorkSpec {
 impl Default for WorkSpec {
     fn default() -> Self {
         Self {
-            work_type: WorkType::CpuSpin,
+            work_type: WorkType::SpinWait,
             sched_policy: SchedPolicy::Normal,
             num_workers: None,
             affinity: AffinityIntent::Inherit,
@@ -4837,7 +4837,7 @@ fn worker_main(
 
     while !stop_requested(stop) {
         match work_type {
-            WorkType::CpuSpin => {
+            WorkType::SpinWait => {
                 spin_burst(&mut work_units, 1024);
                 iterations += 1;
             }
@@ -7690,8 +7690,8 @@ mod tests {
 
     /// [`WorkType::suggest`] matches case-insensitively and
     /// returns the canonical PascalCase entry. A user who types
-    /// `"cpuspin"`, `"CPUSPIN"`, or the already-canonical `"CpuSpin"`
-    /// all land on the same `"CpuSpin"` suggestion; truly unknown
+    /// `"spinwait"`, `"SPINWAIT"`, or the already-canonical `"SpinWait"`
+    /// all land on the same `"SpinWait"` suggestion; truly unknown
     /// inputs return `None` so the caller can distinguish "typo of a
     /// known variant" from "wholly unknown name".
     /// Composition pin: the intended CLI recovery flow is
@@ -7711,12 +7711,12 @@ mod tests {
     fn suggest_then_from_name_roundtrips_for_buildable_variants() {
         // Lowercase user input: from_name misses, suggest hits,
         // from_name on the canonical spelling succeeds.
-        assert!(WorkType::from_name("cpuspin").is_none());
-        let canonical = WorkType::suggest("cpuspin").expect("suggest must find CpuSpin");
-        assert_eq!(canonical, "CpuSpin");
+        assert!(WorkType::from_name("spinwait").is_none());
+        let canonical = WorkType::suggest("spinwait").expect("suggest must find SpinWait");
+        assert_eq!(canonical, "SpinWait");
         let wt =
             WorkType::from_name(canonical).expect("from_name must build from canonical spelling");
-        assert!(matches!(wt, WorkType::CpuSpin));
+        assert!(matches!(wt, WorkType::SpinWait));
 
         // Uppercase user input roundtrips too.
         assert!(WorkType::from_name("YIELDHEAVY").is_none());
@@ -7737,9 +7737,9 @@ mod tests {
 
     #[test]
     fn suggest_is_case_insensitive_and_canonical() {
-        assert_eq!(WorkType::suggest("cpuspin"), Some("CpuSpin"));
-        assert_eq!(WorkType::suggest("CPUSPIN"), Some("CpuSpin"));
-        assert_eq!(WorkType::suggest("CpuSpin"), Some("CpuSpin"));
+        assert_eq!(WorkType::suggest("spinwait"), Some("SpinWait"));
+        assert_eq!(WorkType::suggest("SPINWAIT"), Some("SpinWait"));
+        assert_eq!(WorkType::suggest("SpinWait"), Some("SpinWait"));
         assert_eq!(WorkType::suggest("YIELDHEAVY"), Some("YieldHeavy"));
         // Sequence and Custom are in the match space even though
         // `from_name` refuses to construct them — point of the
@@ -7751,7 +7751,7 @@ mod tests {
         assert!(WorkType::suggest("nonexistent").is_none());
         assert!(WorkType::suggest("").is_none());
         // A partial match is NOT fuzzy-accepted — "cpu" does not
-        // shorten to "CpuSpin". The helper pins exact case-insensitive
+        // shorten to "SpinWait". The helper pins exact case-insensitive
         // equality, not prefix or substring semantics.
         assert!(WorkType::suggest("cpu").is_none());
     }
@@ -7759,7 +7759,7 @@ mod tests {
     /// Surrounding / embedded whitespace must NOT silently resolve
     /// to a canonical name. The helper's doc commits to strict
     /// (non-trimming) matching so a caller that passes unsanitized
-    /// user input like `" CpuSpin"` or `"CpuSpin\n"` sees `None` —
+    /// user input like `" SpinWait"` or `"SpinWait\n"` sees `None` —
     /// callers are expected to `s.trim()` first (same convention
     /// [`WorkType::from_name`] follows). If this test ever starts
     /// failing because [`suggest`] returns `Some(_)` for a whitespace-
@@ -7768,15 +7768,15 @@ mod tests {
     #[test]
     fn suggest_rejects_whitespace_padded_inputs() {
         // Leading / trailing ASCII space.
-        assert!(WorkType::suggest(" CpuSpin").is_none());
-        assert!(WorkType::suggest("CpuSpin ").is_none());
-        assert!(WorkType::suggest(" CpuSpin ").is_none());
+        assert!(WorkType::suggest(" SpinWait").is_none());
+        assert!(WorkType::suggest("SpinWait ").is_none());
+        assert!(WorkType::suggest(" SpinWait ").is_none());
         // Trailing newline (typical for unsanitized fgets / read_line
         // output).
-        assert!(WorkType::suggest("CpuSpin\n").is_none());
+        assert!(WorkType::suggest("SpinWait\n").is_none());
         // Tab separators on either side.
-        assert!(WorkType::suggest("\tCpuSpin").is_none());
-        assert!(WorkType::suggest("CpuSpin\t").is_none());
+        assert!(WorkType::suggest("\tSpinWait").is_none());
+        assert!(WorkType::suggest("SpinWait\t").is_none());
         // Embedded whitespace inside an otherwise-known name also
         // fails — the helper is NOT doing fuzzy tokenization.
         assert!(WorkType::suggest("Cpu Spin").is_none());
@@ -7787,12 +7787,12 @@ mod tests {
         // Sanity check: the same input without whitespace does
         // resolve, confirming the rejection is specifically about
         // the whitespace and not an unrelated regression.
-        assert_eq!(WorkType::suggest("CpuSpin"), Some("CpuSpin"));
+        assert_eq!(WorkType::suggest("SpinWait"), Some("SpinWait"));
     }
 
     #[test]
     fn work_type_all_names_count() {
-        // 20 historical variants (CpuSpin, YieldHeavy, Mixed,
+        // 20 historical variants (SpinWait, YieldHeavy, Mixed,
         // IoSyncWrite, IoRandRead, IoConvoy, Bursty, PipeIo,
         // FutexPingPong, CachePressure, CacheYield, CachePipe,
         // FutexFanOut, Sequence, ForkExit, NiceSweep,
@@ -7938,7 +7938,7 @@ mod tests {
     fn workload_config_default() {
         let c = WorkloadConfig::default();
         assert_eq!(c.num_workers, 1);
-        assert!(matches!(c.work_type, WorkType::CpuSpin));
+        assert!(matches!(c.work_type, WorkType::SpinWait));
         assert!(matches!(c.sched_policy, SchedPolicy::Normal));
         assert!(matches!(c.affinity, ResolvedAffinity::None));
         // Default nice is 0 — `apply_nice(0)` short-circuits before
@@ -7950,11 +7950,11 @@ mod tests {
     fn workload_config_builder_setters_chain() {
         let cfg = WorkloadConfig::default()
             .workers(7)
-            .work_type(WorkType::CpuSpin)
+            .work_type(WorkType::SpinWait)
             .sched_policy(SchedPolicy::Batch)
             .nice(5);
         assert_eq!(cfg.num_workers, 7);
-        assert!(matches!(cfg.work_type, WorkType::CpuSpin));
+        assert!(matches!(cfg.work_type, WorkType::SpinWait));
         assert!(matches!(cfg.sched_policy, SchedPolicy::Batch));
         assert_eq!(cfg.nice, 5);
     }
@@ -8042,7 +8042,7 @@ mod tests {
         let config = WorkloadConfig {
             num_workers: 1,
             affinity: ResolvedAffinity::None,
-            work_type: WorkType::CpuSpin,
+            work_type: WorkType::SpinWait,
             sched_policy: SchedPolicy::Normal,
             nice: 10,
             ..Default::default()
@@ -8145,7 +8145,7 @@ mod tests {
         let config = WorkloadConfig {
             num_workers: 2,
             affinity: ResolvedAffinity::None,
-            work_type: WorkType::CpuSpin,
+            work_type: WorkType::SpinWait,
             sched_policy: SchedPolicy::Normal,
             ..Default::default()
         };
@@ -8167,7 +8167,7 @@ mod tests {
         let config = WorkloadConfig {
             num_workers: 1,
             affinity: ResolvedAffinity::None,
-            work_type: WorkType::CpuSpin,
+            work_type: WorkType::SpinWait,
             sched_policy: SchedPolicy::Normal,
             ..Default::default()
         };
@@ -8204,7 +8204,7 @@ mod tests {
         let config = WorkloadConfig {
             num_workers: 4,
             affinity: ResolvedAffinity::None,
-            work_type: WorkType::CpuSpin,
+            work_type: WorkType::SpinWait,
             sched_policy: SchedPolicy::Normal,
             ..Default::default()
         };
@@ -8274,7 +8274,7 @@ mod tests {
         let config = WorkloadConfig {
             num_workers: 4,
             affinity: ResolvedAffinity::None,
-            work_type: WorkType::CpuSpin,
+            work_type: WorkType::SpinWait,
             sched_policy: SchedPolicy::Normal,
             ..Default::default()
         };
@@ -8294,7 +8294,7 @@ mod tests {
         let config = WorkloadConfig {
             num_workers: 1,
             affinity: ResolvedAffinity::Fixed([0].into_iter().collect()),
-            work_type: WorkType::CpuSpin,
+            work_type: WorkType::SpinWait,
             sched_policy: SchedPolicy::Normal,
             ..Default::default()
         };
@@ -8541,7 +8541,7 @@ mod tests {
         );
     }
 
-    /// EAGAIN on `fork`: with num_workers=1 and CpuSpin (no pipe
+    /// EAGAIN on `fork`: with num_workers=1 and SpinWait (no pipe
     /// pairs, no futex), cap RLIMIT_NPROC to 0 so the very first
     /// `libc::fork` inside the per-worker loop returns -1. At bail
     /// time the local cleanup (in the per-worker fork dispatch in
@@ -8560,7 +8560,7 @@ mod tests {
             let config = WorkloadConfig {
                 num_workers: 1,
                 affinity: ResolvedAffinity::None,
-                work_type: WorkType::CpuSpin,
+                work_type: WorkType::SpinWait,
                 sched_policy: SchedPolicy::Normal,
                 ..Default::default()
             };
@@ -8940,7 +8940,7 @@ mod tests {
         let config = WorkloadConfig {
             num_workers: 2,
             affinity: ResolvedAffinity::None,
-            work_type: WorkType::CpuSpin,
+            work_type: WorkType::SpinWait,
             sched_policy: SchedPolicy::Normal,
             ..Default::default()
         };
@@ -9095,7 +9095,7 @@ mod tests {
         let config = WorkloadConfig {
             num_workers: 1,
             affinity: ResolvedAffinity::None,
-            work_type: WorkType::CpuSpin,
+            work_type: WorkType::SpinWait,
             sched_policy: SchedPolicy::Normal,
             ..Default::default()
         };
@@ -9135,7 +9135,7 @@ mod tests {
         let config = WorkloadConfig {
             num_workers: 1,
             affinity: ResolvedAffinity::None,
-            work_type: WorkType::CpuSpin,
+            work_type: WorkType::SpinWait,
             sched_policy: SchedPolicy::Normal,
             ..Default::default()
         };
@@ -10064,7 +10064,7 @@ mod tests {
         let config = WorkloadConfig {
             num_workers: 2,
             affinity: ResolvedAffinity::None,
-            work_type: WorkType::CpuSpin,
+            work_type: WorkType::SpinWait,
             sched_policy: SchedPolicy::Normal,
             ..Default::default()
         };
@@ -10073,7 +10073,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(200));
         let iters = h.snapshot_iterations();
         assert_eq!(iters.len(), 2);
-        // After 200ms of CpuSpin, workers should have done iterations.
+        // After 200ms of SpinWait, workers should have done iterations.
         for (i, &v) in iters.iter().enumerate() {
             assert!(v > 0, "worker {i} should have iterations > 0, got {v}");
         }
@@ -10116,7 +10116,7 @@ mod tests {
 
     #[test]
     fn worker_group_size_ungrouped() {
-        assert_eq!(WorkType::CpuSpin.worker_group_size(), None);
+        assert_eq!(WorkType::SpinWait.worker_group_size(), None);
         assert_eq!(WorkType::YieldHeavy.worker_group_size(), None);
         assert_eq!(WorkType::Mixed.worker_group_size(), None);
         assert_eq!(WorkType::IoSyncWrite.worker_group_size(), None);
@@ -10137,7 +10137,7 @@ mod tests {
 
     #[test]
     fn needs_shared_mem_non_futex() {
-        assert!(!WorkType::CpuSpin.needs_shared_mem());
+        assert!(!WorkType::SpinWait.needs_shared_mem());
         assert!(!WorkType::pipe_io(100).needs_shared_mem());
         assert!(!WorkType::cache_pipe(32, 100).needs_shared_mem());
         assert!(!WorkType::cache_pressure(32, 64).needs_shared_mem());
@@ -10154,7 +10154,7 @@ mod tests {
 
     #[test]
     fn needs_cache_buf_non_cache() {
-        assert!(!WorkType::CpuSpin.needs_cache_buf());
+        assert!(!WorkType::SpinWait.needs_cache_buf());
         assert!(!WorkType::pipe_io(100).needs_cache_buf());
         assert!(!WorkType::futex_ping_pong(100).needs_cache_buf());
         assert!(!WorkType::futex_fan_out(4, 100).needs_cache_buf());
@@ -10164,15 +10164,15 @@ mod tests {
 
     #[test]
     fn resolve_work_type_not_swappable() {
-        let base = WorkType::CpuSpin;
+        let base = WorkType::SpinWait;
         let over = WorkType::YieldHeavy;
         let result = resolve_work_type(&base, Some(&over), false, 4);
-        assert!(matches!(result, WorkType::CpuSpin));
+        assert!(matches!(result, WorkType::SpinWait));
     }
 
     #[test]
     fn resolve_work_type_swappable_applies_override() {
-        let base = WorkType::CpuSpin;
+        let base = WorkType::SpinWait;
         let over = WorkType::YieldHeavy;
         let result = resolve_work_type(&base, Some(&over), true, 4);
         assert!(matches!(result, WorkType::YieldHeavy));
@@ -10180,22 +10180,22 @@ mod tests {
 
     #[test]
     fn resolve_work_type_swappable_no_override() {
-        let base = WorkType::CpuSpin;
+        let base = WorkType::SpinWait;
         let result = resolve_work_type(&base, None, true, 4);
-        assert!(matches!(result, WorkType::CpuSpin));
+        assert!(matches!(result, WorkType::SpinWait));
     }
 
     #[test]
     fn resolve_work_type_group_size_mismatch() {
-        let base = WorkType::CpuSpin;
+        let base = WorkType::SpinWait;
         let over = WorkType::pipe_io(100); // group_size = 2
         let result = resolve_work_type(&base, Some(&over), true, 3); // 3 not divisible by 2
-        assert!(matches!(result, WorkType::CpuSpin));
+        assert!(matches!(result, WorkType::SpinWait));
     }
 
     #[test]
     fn resolve_work_type_group_size_match() {
-        let base = WorkType::CpuSpin;
+        let base = WorkType::SpinWait;
         let over = WorkType::pipe_io(100); // group_size = 2
         let result = resolve_work_type(&base, Some(&over), true, 4); // 4 divisible by 2
         assert!(matches!(result, WorkType::PipeIo { .. }));
@@ -10203,12 +10203,12 @@ mod tests {
 
     #[test]
     fn resolve_work_type_fan_out_group_size() {
-        let base = WorkType::CpuSpin;
+        let base = WorkType::SpinWait;
         let over = WorkType::futex_fan_out(3, 100); // group_size = 4
         let result = resolve_work_type(&base, Some(&over), true, 8); // 8 divisible by 4
         assert!(matches!(result, WorkType::FutexFanOut { .. }));
         let fail = resolve_work_type(&base, Some(&over), true, 6); // 6 not divisible by 4
-        assert!(matches!(fail, WorkType::CpuSpin));
+        assert!(matches!(fail, WorkType::SpinWait));
     }
 
     // -- WorkSpec builder --
@@ -10238,7 +10238,7 @@ mod tests {
     fn work_default_values() {
         let w = WorkSpec::default();
         assert_eq!(w.num_workers, None);
-        assert!(matches!(w.work_type, WorkType::CpuSpin));
+        assert!(matches!(w.work_type, WorkType::SpinWait));
         assert!(matches!(w.sched_policy, SchedPolicy::Normal));
         assert!(matches!(w.affinity, AffinityIntent::Inherit));
         // Default nice is 0 — same skip semantics as
@@ -11859,7 +11859,7 @@ mod tests {
         let config = WorkloadConfig {
             num_workers: 2,
             clone_mode: CloneMode::Thread,
-            work_type: WorkType::CpuSpin,
+            work_type: WorkType::SpinWait,
             ..Default::default()
         };
         let mut h = WorkloadHandle::spawn(&config).expect("Thread mode must spawn");
@@ -12304,7 +12304,7 @@ mod tests {
         let config = WorkloadConfig {
             num_workers: 1,
             clone_mode: CloneMode::Thread,
-            work_type: WorkType::CpuSpin,
+            work_type: WorkType::SpinWait,
             ..Default::default()
         };
         let mut h = WorkloadHandle::spawn(&config).expect("Thread spawn must succeed");
@@ -12765,8 +12765,8 @@ mod tests {
         assert_eq!(json, r#""none""#);
 
         // WorkType variants
-        let json = serde_json::to_string(&WorkType::CpuSpin).unwrap();
-        assert_eq!(json, r#""cpu_spin""#);
+        let json = serde_json::to_string(&WorkType::SpinWait).unwrap();
+        assert_eq!(json, r#""spin_wait""#);
         let json = serde_json::to_string(&WorkType::ForkExit).unwrap();
         assert_eq!(json, r#""fork_exit""#);
         // IO variants — pin the snake_case wire form for each.
@@ -13085,7 +13085,7 @@ mod tests {
         let config = WorkloadConfig {
             num_workers: 3,
             clone_mode: CloneMode::Thread,
-            work_type: WorkType::CpuSpin,
+            work_type: WorkType::SpinWait,
             ..Default::default()
         };
         let mut h = WorkloadHandle::spawn(&config).expect("Thread spawn must succeed");

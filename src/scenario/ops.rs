@@ -411,14 +411,14 @@ pub struct IoLimits {
 /// let def = CgroupDef::named("workers")
 ///     .with_cpuset(CpusetSpec::disjoint(0, 2))
 ///     .workers(4)
-///     .work_type(WorkType::CpuSpin);
+///     .work_type(WorkType::SpinWait);
 ///
 /// assert_eq!(def.name, "workers");
 /// assert_eq!(def.works[0].num_workers, Some(4));
 ///
 /// // Multiple concurrent work groups via .work().
 /// let def = CgroupDef::named("mixed")
-///     .work(WorkSpec::default().workers(4).work_type(WorkType::CpuSpin))
+///     .work(WorkSpec::default().workers(4).work_type(WorkType::SpinWait))
 ///     .work(WorkSpec::default().workers(2).work_type(WorkType::YieldHeavy));
 ///
 /// assert_eq!(def.works.len(), 2);
@@ -442,7 +442,7 @@ pub struct IoLimits {
 /// let def = CgroupDef::named("io_and_spin")
 ///     .with_cpuset(CpusetSpec::disjoint(0, 2))
 ///     .workers(2)
-///     .work_type(WorkType::CpuSpin)
+///     .work_type(WorkType::SpinWait)
 ///     .workload(&BENCH);
 ///
 /// assert!(def.payload.is_some());
@@ -457,7 +457,7 @@ pub struct CgroupDef {
     /// cpuset (typically the scenario's usable CPU set).
     pub cpuset: Option<CpusetSpec>,
     /// WorkSpec groups to spawn. Empty means use a single default WorkSpec
-    /// (CpuSpin, Normal, ctx.workers_per_cgroup workers).
+    /// (SpinWait, Normal, ctx.workers_per_cgroup workers).
     pub works: Vec<WorkSpec>,
     /// When true, the gauntlet work_type override replaces each WorkSpec's
     /// work_type (applied per-WorkSpec via resolve_work_type).
@@ -507,7 +507,7 @@ impl CgroupDef {
     ///
     /// **Worker-spawning default:** `CgroupDef::named("cg_0")` alone
     /// still spawns workers at execution time — `apply_setup` fills
-    /// an empty `works` slice with one default [`WorkSpec`] (CpuSpin,
+    /// an empty `works` slice with one default [`WorkSpec`] (SpinWait,
     /// SCHED_NORMAL, `ctx.workers_per_cgroup` workers). To express
     /// an empty move-target cgroup with NO workers, declare it via
     /// [`Op::AddCgroup`] at step or Backdrop level instead of using
@@ -2649,7 +2649,7 @@ fn validate_mempolicy_cpuset(
 /// handle entries with the same name key; Ops that filter by cgroup name
 /// (StopCgroup, SetAffinity, etc.) naturally apply to all of them.
 ///
-/// When `works` is empty, a single default WorkSpec is used (CpuSpin, Normal,
+/// When `works` is empty, a single default WorkSpec is used (SpinWait, Normal,
 /// ctx.workers_per_cgroup workers).
 ///
 /// Cgroups created here route into step-local or backdrop state per
@@ -4541,7 +4541,7 @@ mod tests {
     #[test]
     fn cgroup_def_multi_work() {
         let d = CgroupDef::named("multi")
-            .work(WorkSpec::default().workers(4).work_type(WorkType::CpuSpin))
+            .work(WorkSpec::default().workers(4).work_type(WorkType::SpinWait))
             .work(WorkSpec::default().workers(2).work_type(WorkType::YieldHeavy));
         assert_eq!(d.works.len(), 2);
         assert_eq!(d.works[0].num_workers, Some(4));
@@ -7097,7 +7097,7 @@ mod tests {
             let wl = WorkloadConfig {
                 num_workers: 1,
                 affinity: ResolvedAffinity::None,
-                work_type: WorkType::CpuSpin,
+                work_type: WorkType::SpinWait,
                 ..Default::default()
             };
             let h = WorkloadHandle::spawn(&wl).expect("spawn worker");

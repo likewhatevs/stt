@@ -333,7 +333,7 @@ fn scenario_event_counter_timeline_populates_dump(
 /// `sched_setattr(2)` syscall path needs a real kernel with
 /// CONFIG_SCHED_DEADLINE — host-side unit tests cannot exercise it.
 ///
-/// The scenario uses `WorkType::CpuSpin` under SCHED_DEADLINE
+/// The scenario uses `WorkType::SpinWait` under SCHED_DEADLINE
 /// `(runtime=500us, deadline=1ms, period=10ms)` — a 5% bandwidth
 /// reservation that easily fits on any single CPU, so the
 /// admission-control path (`__checkparam_dl`,
@@ -360,7 +360,7 @@ fn scenario_sched_deadline_real_setattr(ctx: &ktstr::scenario::Ctx) -> Result<As
 
     let config = WorkloadConfig {
         num_workers: 1,
-        work_type: WorkType::CpuSpin,
+        work_type: WorkType::SpinWait,
         affinity: ResolvedAffinity::None,
         sched_policy: SchedPolicy::Deadline {
             runtime: Duration::from_micros(500),
@@ -1016,7 +1016,7 @@ fn vm_integration_dsq_and_rq_walker() {
 
 /// G5 — Per-vCPU perf counters via `perf_event_open(exclude_host=1)`.
 ///
-/// Boots a CpuSpin workload, asserts `vcpu_perf_at_freeze` carries
+/// Boots a SpinWait workload, asserts `vcpu_perf_at_freeze` carries
 /// at least one non-null `VcpuPerfSample` after the stall freeze.
 ///
 /// Prerequisites: same as DSQ test, plus
@@ -1050,7 +1050,7 @@ fn vm_integration_event_counter_timeline() {
 
 /// G9 — `SchedPolicy::Deadline` real `sched_setattr(2)` invocation.
 ///
-/// Spawns a CpuSpin worker under SCHED_DEADLINE 5% bandwidth
+/// Spawns a SpinWait worker under SCHED_DEADLINE 5% bandwidth
 /// reservation; asserts the worker reports `completed=true` and
 /// `work_units > 0`. Pins the syscall ABI end-to-end on a real
 /// CONFIG_SCHED_DEADLINE kernel.

@@ -45,7 +45,7 @@ and iteration throughput. Three thresholds:
   (receivers), `Sequence` (Sleep / Yield / Io phases),
   `ForkExit`, `NiceSweep`, `AffinityChurn`, `PolicyChurn`,
   `FanOutCompute`, `MutexContention`. Pure-CPU work types
-  (`CpuSpin`, `Mixed`, `CachePressure`, `PageFaultChurn`) do not
+  (`SpinWait`, `Mixed`, `CachePressure`, `PageFaultChurn`) do not
   record samples.
 - `max_wake_latency_cv`: coefficient of variation of wake latency
   samples. High CV means inconsistent scheduling latency.

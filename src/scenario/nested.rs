@@ -133,7 +133,7 @@ pub fn custom_nested_cgroup_cpuset(ctx: &Ctx) -> Result<AssertResult> {
     Ok(r)
 }
 
-/// Nested sub-cgroups with heavy CpuSpin vs light Bursty load imbalance.
+/// Nested sub-cgroups with heavy SpinWait vs light Bursty load imbalance.
 pub fn custom_nested_cgroup_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![
         Step::with_defs(

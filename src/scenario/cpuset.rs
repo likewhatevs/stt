@@ -121,7 +121,7 @@ pub fn custom_cgroup_cpuset_swap_disjoint(ctx: &Ctx) -> Result<AssertResult> {
     execute_scenario(ctx, backdrop, steps)
 }
 
-/// Disjoint cpusets with oversubscribed CpuSpin vs bursty workers.
+/// Disjoint cpusets with oversubscribed SpinWait vs bursty workers.
 pub fn custom_cgroup_cpuset_workload_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     let mid = ctx.topo.usable_cpus().len() / 2;
 

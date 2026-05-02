@@ -550,7 +550,7 @@ pub struct Ctx<'a> {
     pub sched_pid: Option<libc::pid_t>,
     /// Time to wait after cgroup creation for scheduler stabilization.
     pub settle: Duration,
-    /// Override work type for scenarios that use `CpuSpin` by default.
+    /// Override work type for scenarios that use `SpinWait` by default.
     pub work_type_override: Option<WorkType>,
     /// Merged assertion config (default_checks + scheduler + per-test).
     /// Used by `run_scenario` for data-driven scenarios and by
@@ -713,7 +713,7 @@ impl<'a> CtxBuilder<'a> {
     }
 
     /// Override the default work type for scenarios that would
-    /// otherwise use `CpuSpin`.
+    /// otherwise use `SpinWait`.
     pub fn work_type_override(mut self, wt: Option<WorkType>) -> Self {
         self.work_type_override = wt;
         self
@@ -800,7 +800,7 @@ impl<'a> Ctx<'a> {
 /// every worker pid moved, so workers see a stable cgroup
 /// membership at first run. [`spawn_diverse`] does NOT use this
 /// helper because it starts each handle inline (eager-start
-/// semantics required for its IoSyncWrite/CpuSpin mix — workload
+/// semantics required for its IoSyncWrite/SpinWait mix — workload
 /// ordering matters when the mix includes I/O-bound and CPU-bound
 /// cgroups).
 ///
@@ -1020,14 +1020,14 @@ pub fn split_half(ctx: &Ctx) -> (BTreeSet<usize>, BTreeSet<usize>) {
     )
 }
 
-/// Spawn diverse workloads across N cgroups: CpuSpin, Bursty,
+/// Spawn diverse workloads across N cgroups: SpinWait, Bursty,
 /// IoSyncWrite, Mixed, YieldHeavy. Each cgroup uses
 /// `ctx.workers_per_cgroup` workers except IoSyncWrite cgroups,
 /// which always use 2 workers to avoid drowning the scenario in
 /// blocking IO.
 pub fn spawn_diverse(ctx: &Ctx, cgroup_names: &[&str]) -> Result<Vec<WorkloadHandle>> {
     let types = [
-        WorkType::CpuSpin,
+        WorkType::SpinWait,
         WorkType::bursty(50, 100),
         WorkType::IoSyncWrite,
         WorkType::Mixed,
@@ -1158,7 +1158,7 @@ mod tests {
     fn cgroup_work_default() {
         let cw = WorkSpec::default();
         assert_eq!(cw.num_workers, None);
-        assert!(matches!(cw.work_type, WorkType::CpuSpin));
+        assert!(matches!(cw.work_type, WorkType::SpinWait));
         assert!(matches!(cw.sched_policy, SchedPolicy::Normal));
         assert!(matches!(cw.affinity, AffinityIntent::Inherit));
         assert!(matches!(cw.mem_policy, MemPolicy::Default));
@@ -1270,7 +1270,7 @@ mod tests {
         };
         let wl = dfl_wl(&ctx);
         assert_eq!(wl.num_workers, 7);
-        assert!(matches!(wl.work_type, WorkType::CpuSpin));
+        assert!(matches!(wl.work_type, WorkType::SpinWait));
     }
 
     #[test]

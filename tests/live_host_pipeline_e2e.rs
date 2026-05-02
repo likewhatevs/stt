@@ -119,7 +119,7 @@ fn live_host_pipeline_e2e_kmsg_to_reproducer_spec_to_source() {
     capture.fingerprint.affinity_hints = vec![AffinityHint::Exact { cpus: vec![0, 1, 2, 3] }];
     capture.fingerprint.work_type_hints = vec![
         WorkTypeHint::Bursty { burst_ms: 10, sleep_ms: 90 },
-        WorkTypeHint::CpuSpin, // secondary hint should land in notes
+        WorkTypeHint::SpinWait, // secondary hint should land in notes
     ];
     let mut cg = CgroupHint::default();
     cg.path = "/test/scx_simple".into();
@@ -219,7 +219,7 @@ fn live_host_pipeline_e2e_empty_capture_falls_back_to_defaults() {
     let capture = DebugCapture::default();
     let spec = generate_spec(&capture);
 
-    // Defaults: 1 worker, no affinity, CpuSpin work type.
+    // Defaults: 1 worker, no affinity, SpinWait work type.
     assert_eq!(spec.config.num_workers, 1);
     // The fall-back reasons land in notes so a user sees WHY the
     // generated test is parameterless.

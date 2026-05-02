@@ -51,7 +51,7 @@ use ktstr::scenario::ops::{CgroupDef, HoldSpec, Step, execute_steps};
 /// faulted their stacks yet on slow CI runners.
 #[ktstr_test(llcs = 1, cores = 2, threads = 1, duration_s = 3)]
 fn ctprof_capture_returns_threads_with_nonzero_counters(ctx: &Ctx) -> Result<AssertResult> {
-    // Simple CpuSpin workload — workers hit the dispatcher,
+    // Simple SpinWait workload — workers hit the dispatcher,
     // accrue run_time_ns / voluntary_csw / minflt. One cgroup,
     // default workers_per_cgroup so the test doesn't need to
     // pick a specific count.

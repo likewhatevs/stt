@@ -34,7 +34,7 @@
 //! | AffinityHint::Exact{cpus}     | ResolvedAffinity::Fixed(set)                |
 //! | AffinityHint::Inherit         | ResolvedAffinity::None                      |
 //! | AffinityHint::RandomSubset    | ResolvedAffinity::Random { from, count }    |
-//! | WorkTypeHint::CpuSpin         | WorkType::CpuSpin                       |
+//! | WorkTypeHint::SpinWait         | WorkType::SpinWait                       |
 //! | WorkTypeHint::YieldHeavy      | WorkType::YieldHeavy                    |
 //! | WorkTypeHint::Mixed           | WorkType::Mixed                         |
 //! | WorkTypeHint::Bursty{b,s}     | WorkType::Bursty { burst_ms, sleep_ms } |
@@ -272,13 +272,13 @@ fn map_work_type(fp: &WorkloadFingerprint, spec: &mut ReproducerSpec) {
     let Some(primary) = fp.work_type_hints.first() else {
         spec.notes.push(
             "no work-type hint in fingerprint — defaulting to \
-             WorkType::CpuSpin"
+             WorkType::SpinWait"
                 .into(),
         );
         return;
     };
     spec.config.work_type = match primary {
-        WorkTypeHint::CpuSpin => WorkType::CpuSpin,
+        WorkTypeHint::SpinWait => WorkType::SpinWait,
         WorkTypeHint::YieldHeavy => WorkType::YieldHeavy,
         WorkTypeHint::Mixed => WorkType::Mixed,
         WorkTypeHint::Bursty { burst_ms, sleep_ms } => WorkType::Bursty {
@@ -482,7 +482,7 @@ fn render_affinity(a: &ResolvedAffinity) -> String {
 
 fn render_work_type(w: &WorkType) -> String {
     match w {
-        WorkType::CpuSpin => "WorkType::CpuSpin".into(),
+        WorkType::SpinWait => "WorkType::SpinWait".into(),
         WorkType::YieldHeavy => "WorkType::YieldHeavy".into(),
         WorkType::Mixed => "WorkType::Mixed".into(),
         WorkType::IoSyncWrite => "WorkType::IoSyncWrite".into(),
@@ -503,7 +503,7 @@ fn render_work_type(w: &WorkType) -> String {
         // Other variants we don't currently project from fingerprint
         // hints — emit a placeholder that compiles with a TODO so
         // hand-editing is obvious.
-        _ => "WorkType::CpuSpin /* TODO: refine from capture */".into(),
+        _ => "WorkType::SpinWait /* TODO: refine from capture */".into(),
     }
 }
 
@@ -541,7 +541,7 @@ mod tests {
         let spec = generate_spec(&cap);
         assert_eq!(spec.config.num_workers, 1);
         assert!(matches!(spec.config.affinity, ResolvedAffinity::None));
-        assert!(matches!(spec.config.work_type, WorkType::CpuSpin));
+        assert!(matches!(spec.config.work_type, WorkType::SpinWait));
         assert!(spec.notes.iter().any(|n| n.contains("no workload groups")));
         assert!(spec.notes.iter().any(|n| n.contains("no work-type hint")));
     }
@@ -624,9 +624,9 @@ mod tests {
     fn generate_spec_multiple_hints_first_wins() {
         let mut cap = DebugCapture::default();
         cap.fingerprint.work_type_hints =
-            vec![WorkTypeHint::CpuSpin, WorkTypeHint::IoSyncWrite];
+            vec![WorkTypeHint::SpinWait, WorkTypeHint::IoSyncWrite];
         let spec = generate_spec(&cap);
-        assert!(matches!(spec.config.work_type, WorkType::CpuSpin));
+        assert!(matches!(spec.config.work_type, WorkType::SpinWait));
         assert!(
             spec.notes
                 .iter()
@@ -716,7 +716,7 @@ mod tests {
             cpu_time_fraction: 0.0,
             wakeups_per_sec: 0.0,
         }];
-        cap.fingerprint.work_type_hints = vec![WorkTypeHint::CpuSpin];
+        cap.fingerprint.work_type_hints = vec![WorkTypeHint::SpinWait];
         let spec = generate_spec(&cap);
         // Sanity-pin the no-notes precondition so a future change
         // that starts emitting notes for this shape lands here
@@ -732,7 +732,7 @@ mod tests {
         assert!(src.contains("use ktstr::workload::*;"));
         assert!(src.contains("pub fn regression_repro"));
         assert!(src.contains(".workers(4)"));
-        assert!(src.contains(".work_type(WorkType::CpuSpin)"));
+        assert!(src.contains(".work_type(WorkType::SpinWait)"));
         // Notes are conditionally rendered — no notes here means
         // no "Generator notes:" comment block (verified by the
         // dedicated test).

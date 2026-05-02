@@ -741,7 +741,7 @@ pub(crate) fn maybe_dispatch_vm_test_with_args(args: &[String]) -> Option<i32> {
     let work_type_override = extract_work_type_arg(args).and_then(|s| {
         crate::workload::WorkType::from_name(&s).or_else(|| {
             // `from_name` is exact-match on the PascalCase canonical
-            // form. A user typo (`cpuspin`, `CPUSPIN`) lands here;
+            // form. A user typo (`spinwait`, `SPINWAIT`) lands here;
             // call `WorkType::suggest` for the canonical spelling
             // and surface it in the diagnostic so the user doesn't
             // have to guess the correct casing.
@@ -1153,7 +1153,7 @@ pub(crate) fn maybe_dispatch_vm_test_with_phase_a(
     let work_type_override = extract_work_type_arg(args).and_then(|s| {
         crate::workload::WorkType::from_name(&s).or_else(|| {
             // `from_name` is exact-match on the PascalCase canonical
-            // form. A user typo (`cpuspin`, `CPUSPIN`) lands here;
+            // form. A user typo (`spinwait`, `SPINWAIT`) lands here;
             // call `WorkType::suggest` for the canonical spelling
             // and surface it in the diagnostic so the user doesn't
             // have to guess the correct casing.

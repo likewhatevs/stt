@@ -95,14 +95,14 @@ ops-based scenarios.
 let def = CgroupDef::named("cg_0")
     .with_cpuset(CpusetSpec::disjoint(0, 2))
     .workers(4)
-    .work_type(WorkType::CpuSpin);
+    .work_type(WorkType::SpinWait);
 ```
 
 ### Builder methods
 
 - `.with_cpuset(CpusetSpec)` -- set the cpuset.
 - `.workers(n)` -- set worker count.
-- `.work_type(WorkType)` -- set work type (default: `CpuSpin`).
+- `.work_type(WorkType)` -- set work type (default: `SpinWait`).
 - `.sched_policy(SchedPolicy)` -- set Linux scheduling policy
   (default: `Normal`). See [WorkSpec Types](work-types.md#scheduling-policies).
 - `.work(WorkSpec)` -- add a work group (multiple calls for concurrent groups).
@@ -128,10 +128,10 @@ and a work type override is active (`Ctx.work_type_override`), the
 override replaces this def's work type.
 
 In contrast, the `Scenario`-level override (in `run_scenario()`) only
-replaces `CpuSpin` work types. The two mechanisms serve different
+replaces `SpinWait` work types. The two mechanisms serve different
 scopes:
 
-- **Scenario-level**: replaces `CpuSpin` in `WorkSpec.work_type`
+- **Scenario-level**: replaces `SpinWait` in `WorkSpec.work_type`
 - **CgroupDef-level**: replaces the work type when `swappable = true`
 
 Both skip overrides to grouped work types when `num_workers` is not

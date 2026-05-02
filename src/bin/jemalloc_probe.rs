@@ -2207,7 +2207,7 @@ mod tests {
             stats: ktstr::assert::ScenarioStats::default(),
             monitor: None,
             stimulus_events: Vec::new(),
-            work_type: "CpuSpin".to_string(),
+            work_type: "SpinWait".to_string(),
             active_flags: Vec::new(),
             verifier_stats: Vec::new(),
             kvm_stats: None,

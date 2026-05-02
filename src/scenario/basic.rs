@@ -27,9 +27,9 @@ pub fn custom_host_cgroup_contention(ctx: &Ctx) -> Result<AssertResult> {
 
 fn sched_mixed_steps(ctx: &Ctx) -> Vec<Step> {
     let configs = [
-        (SchedPolicy::Normal, WorkType::CpuSpin),
-        (SchedPolicy::Batch, WorkType::CpuSpin),
-        (SchedPolicy::Idle, WorkType::CpuSpin),
+        (SchedPolicy::Normal, WorkType::SpinWait),
+        (SchedPolicy::Batch, WorkType::SpinWait),
+        (SchedPolicy::Idle, WorkType::SpinWait),
         (SchedPolicy::Fifo(1), WorkType::bursty(500, 250)),
     ];
 
@@ -74,7 +74,7 @@ fn cgroup_pipe_io_steps(ctx: &Ctx) -> Vec<Step> {
     vec![Step::new(ops, HoldSpec::Fixed(ctx.settle + ctx.duration))]
 }
 
-/// Two cgroups each with paired PipeIo workers and CpuSpin workers.
+/// Two cgroups each with paired PipeIo workers and SpinWait workers.
 /// Exercises cross-CPU wake placement from pipe I/O under CPU load.
 pub fn custom_cgroup_pipe_io(ctx: &Ctx) -> Result<AssertResult> {
     execute_steps(ctx, cgroup_pipe_io_steps(ctx))
@@ -166,12 +166,12 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(spawns.len(), 4, "pipe_io spawn + cpuspin spawn per cgroup");
-        let cpuspin_workers: Vec<_> = spawns
+        assert_eq!(spawns.len(), 4, "pipe_io spawn + spinwait spawn per cgroup");
+        let spinwait_workers: Vec<_> = spawns
             .iter()
             .filter(|(_, n)| *n == Some(ctx.workers_per_cgroup))
             .collect();
-        assert_eq!(cpuspin_workers.len(), 2);
+        assert_eq!(spinwait_workers.len(), 2);
         let pipe_workers: Vec<_> = spawns.iter().filter(|(_, n)| *n == Some(2)).collect();
         assert_eq!(pipe_workers.len(), 2);
     }

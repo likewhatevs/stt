@@ -335,7 +335,7 @@ group size. `WorkType::worker_group_size()` returns the divisor.
 - Set `CgroupDef::workers(n)` to a value divisible by the work
   type's group size (2 for pipe/futex pairs, `fan_out + 1` for
   FutexFanOut and FanOutCompute).
-- Use an ungrouped work type (`CpuSpin`, `Mixed`, `Bursty`,
+- Use an ungrouped work type (`SpinWait`, `Mixed`, `Bursty`,
   `IoSync`, `YieldHeavy`) if worker count flexibility is needed.
 
 ## Cache corruption

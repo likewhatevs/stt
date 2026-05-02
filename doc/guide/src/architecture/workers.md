@@ -109,7 +109,7 @@ Three fields worth calling out explicitly:
   in outer iterations is
   `1024 / gcd(units_per_iter, 1024)`. Default parameters assumed
   unless noted:
-  - **Every outer iteration (period = 1 iter)**: CpuSpin (1024),
+  - **Every outer iteration (period = 1 iter)**: SpinWait (1024),
     Mixed (1024), Bursty (each outer iter runs `spin_burst(1024)`
     some number of times inside the `burst_ms` loop — always a
     multiple of 1024), PipeIo (`burst_iters`=1024), FutexPingPong
@@ -144,7 +144,7 @@ Three fields worth calling out explicitly:
     tick per multiply → `gcd(5, 1024) = 1`).
   - **Phase-inherited**: Sequence inherits whichever phase is
     currently active — Spin / Yield / Io use the same per-unit
-    accounting as the CpuSpin / YieldHeavy / IoSync groups above;
+    accounting as the SpinWait / YieldHeavy / IoSync groups above;
     Sleep contributes no `work_units` and so pauses migration
     checks while it runs.
   - **Not tracked by the framework**: Custom workers do not

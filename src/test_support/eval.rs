@@ -1378,7 +1378,7 @@ fn evaluate_vm_result(
         // loses visibility.
         let args: Vec<String> = std::env::args().collect();
         let work_type =
-            super::args::extract_work_type_arg(&args).unwrap_or_else(|| "CpuSpin".to_string());
+            super::args::extract_work_type_arg(&args).unwrap_or_else(|| "SpinWait".to_string());
         if let Err(e) = write_sidecar(
             entry,
             result,

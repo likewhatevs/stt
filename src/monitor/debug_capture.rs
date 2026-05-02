@@ -165,7 +165,7 @@ pub struct CtprofSampleRef {
 /// a corresponding type in `crate::workload`. Multiple hints fire on
 /// rich captures (e.g. a task that pinned itself to one CPU AND ran
 /// CPU-bound work AND lived in a cgroup with `cpu.weight=200` —
-/// projects to `AffinityHint::SingleCpu` + `WorkTypeHint::CpuSpin` +
+/// projects to `AffinityHint::SingleCpu` + `WorkTypeHint::SpinWait` +
 /// `CgroupHint::WeightOverride { weight: 200 }`).
 ///
 /// All hint vectors may be empty (insufficient data to project).
@@ -221,7 +221,7 @@ pub struct WorkloadGroupHint {
     pub thread_count: u32,
     /// Mean CPU-time fraction across the capture window (0.0 to
     /// 1.0). The reproducer generator uses this to pick a
-    /// `WorkType` intensity (e.g. `CpuSpin` for >0.8, `Mixed` for
+    /// `WorkType` intensity (e.g. `SpinWait` for >0.8, `Mixed` for
     /// 0.3-0.8, `Bursty` for <0.3).
     pub cpu_time_fraction: f64,
     /// Mean wakeup rate (Hz) across the capture window. High wakeup
@@ -267,8 +267,8 @@ pub enum AffinityHint {
 #[serde(tag = "kind")]
 pub enum WorkTypeHint {
     /// CPU-bound, no observed IO or wake-driven blocking. Maps to
-    /// `WorkType::CpuSpin`.
-    CpuSpin,
+    /// `WorkType::SpinWait`.
+    SpinWait,
     /// Heavy `sched_yield` rate observed (yields/sec >>
     /// involuntary-context-switch rate). Maps to
     /// `WorkType::YieldHeavy`.
@@ -425,7 +425,7 @@ pub fn project_fingerprint(
 
     // WorkSpec-type hints come from CPU-time / wakeup-rate shape across
     // the sampling window. Bursty / IoSyncWrite are detected by sleep
-    // ratio; CpuSpin / Mixed by yield rate vs CPU time.
+    // ratio; SpinWait / Mixed by yield rate vs CPU time.
     fp.work_type_hints = project_work_type_hints(samples);
 
     fp.cgroup_hints = project_cgroup_hints(samples);
@@ -660,7 +660,7 @@ mod tests {
                 AffinityHint::Exact { cpus: vec![0, 1, 2, 3] },
             ],
             work_type_hints: vec![
-                WorkTypeHint::CpuSpin,
+                WorkTypeHint::SpinWait,
                 WorkTypeHint::Bursty { burst_ms: 10, sleep_ms: 90 },
             ],
             cgroup_hints: vec![CgroupHint {

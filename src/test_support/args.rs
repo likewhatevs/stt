@@ -255,8 +255,8 @@ mod tests {
 
     #[test]
     fn extract_work_type_arg_equals() {
-        let args = vec!["ktstr".into(), "--ktstr-work-type=CpuSpin".into()];
-        assert_eq!(extract_work_type_arg(&args), Some("CpuSpin".to_string()));
+        let args = vec!["ktstr".into(), "--ktstr-work-type=SpinWait".into()];
+        assert_eq!(extract_work_type_arg(&args), Some("SpinWait".to_string()));
     }
 
     #[test]

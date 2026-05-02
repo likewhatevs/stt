@@ -90,7 +90,7 @@
 //!
 //!     let cfg = WorkloadConfig {
 //!         num_workers: 2,
-//!         work_type: WorkType::CpuSpin,
+//!         work_type: WorkType::SpinWait,
 //!         ..Default::default()
 //!     };
 //!     let mut handle = WorkloadHandle::spawn(&cfg)?;

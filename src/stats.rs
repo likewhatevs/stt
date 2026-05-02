@@ -4040,7 +4040,7 @@ mod tests {
         GauntletRow {
             scenario: scenario.into(),
             topology: topo.into(),
-            work_type: "CpuSpin".into(),
+            work_type: "SpinWait".into(),
             scheduler: String::new(),
             kernel_version: None,
             commit: None,
@@ -4129,14 +4129,14 @@ mod tests {
             make_row("a", "t1", true, 5.0),
             make_row("a", "t1", true, 6.0),
         ];
-        rows[0].work_type = "CpuSpin".into();
+        rows[0].work_type = "SpinWait".into();
         rows[1].work_type = "Bursty".into();
         let report = analyze_rows(&rows);
         assert!(
             report.contains("By work_type"),
             "should show work_type section when diverse"
         );
-        assert!(report.contains("CpuSpin"), "should list CpuSpin");
+        assert!(report.contains("SpinWait"), "should list SpinWait");
         assert!(report.contains("Bursty"), "should list Bursty");
     }
 
@@ -5040,7 +5040,7 @@ mod tests {
                 test_name: "t_a".to_string(),
                 topology: "1n2l4c1t".to_string(),
                 scheduler: "scx_rusty".to_string(),
-                work_type: "CpuSpin".to_string(),
+                work_type: "SpinWait".to_string(),
                 active_flags: vec!["llc".to_string(), "rusty_balance".to_string()],
                 kernel_version: Some("6.14.2".to_string()),
                 project_commit: Some("abcdef1".to_string()),
@@ -5063,7 +5063,7 @@ mod tests {
                 test_name: "t_c".to_string(),
                 topology: "1n2l4c1t".to_string(),
                 scheduler: "scx_rusty".to_string(),
-                work_type: "CpuSpin".to_string(),
+                work_type: "SpinWait".to_string(),
                 active_flags: vec!["rusty_balance".to_string()],
                 kernel_version: Some("6.14.2".to_string()),
                 project_commit: Some("abcdef1".to_string()),
@@ -5076,7 +5076,7 @@ mod tests {
 
         // Dedupe: each distinct VALUE appears EXACTLY once per
         // dim (set semantics) even though "scx_rusty" / "1n2l4c1t"
-        // / "CpuSpin" / "abcdef1" / "6.14.2" come from two of the
+        // / "SpinWait" / "abcdef1" / "6.14.2" come from two of the
         // three fixtures. Each value below is unique to its dim
         // so it should appear once across the rendered text. The
         // `unknown` sentinel is checked separately because both
@@ -5089,7 +5089,7 @@ mod tests {
             "eevdf",
             "1n2l4c1t",
             "1n4l2c1t",
-            "CpuSpin",
+            "SpinWait",
             "PageFaultChurn",
             "llc",
             "rusty_balance",
@@ -5306,7 +5306,7 @@ mod tests {
     // -- compare_rows tests --
 
     /// Build a row matching the sidecar-derived schema:
-    /// `work_type = "CpuSpin"`, all metrics zeroed except `spread`
+    /// `work_type = "SpinWait"`, all metrics zeroed except `spread`
     /// and `total_iterations`.
     fn cmp_row(scenario: &str, topo: &str, passed: bool, spread: f64, iters: u64) -> GauntletRow {
         let mut r = make_row(scenario, topo, passed, spread);
@@ -5573,7 +5573,7 @@ mod tests {
         // Finding carries work_type so two findings sharing
         // scenario+topology under different workloads stay
         // distinguishable.
-        assert_eq!(res.findings[0].work_type, "CpuSpin");
+        assert_eq!(res.findings[0].work_type, "SpinWait");
 
         // Filter on topology substring is also honored. Both rows
         // share the "tiny-1llc" topology and only worst_spread crosses
@@ -6945,7 +6945,7 @@ mod tests {
     /// nothing" semantic lands here.
     #[test]
     fn row_filter_default_matches_every_row() {
-        let row = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", Some("6.14.2"), &[]);
+        let row = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", Some("6.14.2"), &[]);
         let filter = RowFilter::default();
         assert!(filter.matches(&row), "empty filter must match every row");
     }
@@ -6956,7 +6956,7 @@ mod tests {
     /// substring knob; typed flags exact-match.
     #[test]
     fn row_filter_scheduler_strict_equality_rejects_prefix() {
-        let row = make_filter_row("t", "scx_rusty", "1n2l4c1t", "CpuSpin", None, &[]);
+        let row = make_filter_row("t", "scx_rusty", "1n2l4c1t", "SpinWait", None, &[]);
         let filter = RowFilter {
             schedulers: vec!["scx".to_string()],
             ..RowFilter::default()
@@ -6972,7 +6972,7 @@ mod tests {
     /// happy path.
     #[test]
     fn row_filter_scheduler_strict_equality_matches_exact() {
-        let row = make_filter_row("t", "scx_rusty", "1n2l4c1t", "CpuSpin", None, &[]);
+        let row = make_filter_row("t", "scx_rusty", "1n2l4c1t", "SpinWait", None, &[]);
         let filter = RowFilter {
             schedulers: vec!["scx_rusty".to_string()],
             ..RowFilter::default()
@@ -6985,7 +6985,7 @@ mod tests {
     /// kernel and a None-row would silently dilute the filtered set.
     #[test]
     fn row_filter_kernel_none_row_never_matches_populated_filter() {
-        let row = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", None, &[]);
+        let row = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None, &[]);
         let filter = RowFilter {
             kernels: vec!["6.14.2".to_string()],
             ..RowFilter::default()
@@ -7000,7 +7000,7 @@ mod tests {
     /// `Some("6.14.2")` matches.
     #[test]
     fn row_filter_kernel_exact_match() {
-        let row = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", Some("6.14.2"), &[]);
+        let row = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", Some("6.14.2"), &[]);
         let filter = RowFilter {
             kernels: vec!["6.14.2".to_string()],
             ..RowFilter::default()
@@ -7012,7 +7012,7 @@ mod tests {
     /// `Some("6.14.3")` rejects.
     #[test]
     fn row_filter_kernel_mismatch_rejects() {
-        let row = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", Some("6.14.3"), &[]);
+        let row = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", Some("6.14.3"), &[]);
         let filter = RowFilter {
             kernels: vec!["6.14.2".to_string()],
             ..RowFilter::default()
@@ -7025,9 +7025,9 @@ mod tests {
     /// Pins the multi-value semantic.
     #[test]
     fn row_filter_kernels_or_combined_matches_any_listed() {
-        let row_a = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", Some("6.14.2"), &[]);
-        let row_b = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", Some("6.15.0"), &[]);
-        let row_c = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", Some("6.16.0"), &[]);
+        let row_a = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", Some("6.14.2"), &[]);
+        let row_b = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", Some("6.15.0"), &[]);
+        let row_c = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", Some("6.16.0"), &[]);
         let filter = RowFilter {
             kernels: vec!["6.14.2".to_string(), "6.15.0".to_string()],
             ..RowFilter::default()
@@ -7048,9 +7048,9 @@ mod tests {
     /// OR semantic did not exist.
     #[test]
     fn row_filter_schedulers_or_combined_matches_any_listed() {
-        let row_a = make_filter_row("t", "scx_alpha", "1n2l4c1t", "CpuSpin", None, &[]);
-        let row_b = make_filter_row("t", "scx_beta", "1n2l4c1t", "CpuSpin", None, &[]);
-        let row_c = make_filter_row("t", "scx_gamma", "1n2l4c1t", "CpuSpin", None, &[]);
+        let row_a = make_filter_row("t", "scx_alpha", "1n2l4c1t", "SpinWait", None, &[]);
+        let row_b = make_filter_row("t", "scx_beta", "1n2l4c1t", "SpinWait", None, &[]);
+        let row_c = make_filter_row("t", "scx_gamma", "1n2l4c1t", "SpinWait", None, &[]);
         let filter = RowFilter {
             schedulers: vec!["scx_alpha".to_string(), "scx_beta".to_string()],
             ..RowFilter::default()
@@ -7070,9 +7070,9 @@ mod tests {
     /// for the topologies field.
     #[test]
     fn row_filter_topologies_or_combined_matches_any_listed() {
-        let row_a = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", None, &[]);
-        let row_b = make_filter_row("t", "scx_a", "1n2l4c2t", "CpuSpin", None, &[]);
-        let row_c = make_filter_row("t", "scx_a", "1n4l8c1t", "CpuSpin", None, &[]);
+        let row_a = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None, &[]);
+        let row_b = make_filter_row("t", "scx_a", "1n2l4c2t", "SpinWait", None, &[]);
+        let row_c = make_filter_row("t", "scx_a", "1n4l8c1t", "SpinWait", None, &[]);
         let filter = RowFilter {
             topologies: vec!["1n2l4c1t".to_string(), "1n2l4c2t".to_string()],
             ..RowFilter::default()
@@ -7092,11 +7092,11 @@ mod tests {
     /// for the work_types field.
     #[test]
     fn row_filter_work_types_or_combined_matches_any_listed() {
-        let row_a = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", None, &[]);
+        let row_a = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None, &[]);
         let row_b = make_filter_row("t", "scx_a", "1n2l4c1t", "PageFaultChurn", None, &[]);
         let row_c = make_filter_row("t", "scx_a", "1n2l4c1t", "MutexContention", None, &[]);
         let filter = RowFilter {
-            work_types: vec!["CpuSpin".to_string(), "PageFaultChurn".to_string()],
+            work_types: vec!["SpinWait".to_string(), "PageFaultChurn".to_string()],
             ..RowFilter::default()
         };
         assert!(filter.matches(&row_a), "first listed work_type must match",);
@@ -7113,7 +7113,7 @@ mod tests {
     /// for the project-commit field.
     #[test]
     fn row_filter_commit_none_row_never_matches_populated_filter() {
-        let row = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", None, &[]);
+        let row = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None, &[]);
         let filter = RowFilter {
             project_commits: vec!["abcdef1".to_string()],
             ..RowFilter::default()
@@ -7133,11 +7133,11 @@ mod tests {
     /// of the same HEAD bucket separately).
     #[test]
     fn row_filter_commit_exact_match_and_or_combined() {
-        let mut row_clean = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", None, &[]);
+        let mut row_clean = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None, &[]);
         row_clean.commit = Some("abcdef1".to_string());
-        let mut row_dirty = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", None, &[]);
+        let mut row_dirty = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None, &[]);
         row_dirty.commit = Some("abcdef1-dirty".to_string());
-        let mut row_other = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", None, &[]);
+        let mut row_other = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None, &[]);
         row_other.commit = Some("fedcba2".to_string());
 
         let filter_single = RowFilter {
@@ -7185,7 +7185,7 @@ mod tests {
     /// for the kernel-commit field.
     #[test]
     fn row_filter_kernel_commit_none_row_never_matches_populated_filter() {
-        let row = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", None, &[]);
+        let row = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None, &[]);
         let filter = RowFilter {
             kernel_commits: vec!["kabcde7".to_string()],
             ..RowFilter::default()
@@ -7206,11 +7206,11 @@ mod tests {
     /// same kernel HEAD bucket separately).
     #[test]
     fn row_filter_kernel_commit_exact_match_and_or_combined() {
-        let mut row_clean = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", None, &[]);
+        let mut row_clean = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None, &[]);
         row_clean.kernel_commit = Some("kabcde7".to_string());
-        let mut row_dirty = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", None, &[]);
+        let mut row_dirty = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None, &[]);
         row_dirty.kernel_commit = Some("kabcde7-dirty".to_string());
-        let mut row_other = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", None, &[]);
+        let mut row_other = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None, &[]);
         row_other.kernel_commit = Some("fedcba2".to_string());
 
         let filter_single = RowFilter {
@@ -7260,7 +7260,7 @@ mod tests {
     /// sets.
     #[test]
     fn row_filter_kernel_commit_and_commit_filter_distinct_fields() {
-        let mut row = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", None, &[]);
+        let mut row = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None, &[]);
         row.commit = Some("project1".to_string());
         row.kernel_commit = Some("kernel1".to_string());
 
@@ -7305,7 +7305,7 @@ mod tests {
     /// for the `run_source` field.
     #[test]
     fn row_filter_run_source_none_row_never_matches_populated_filter() {
-        let row = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", None, &[]);
+        let row = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None, &[]);
         let filter = RowFilter {
             run_sources: vec!["local".to_string()],
             ..RowFilter::default()
@@ -7323,11 +7323,11 @@ mod tests {
     /// for the `run_source` dimension.
     #[test]
     fn row_filter_run_sources_or_combined_matches_any_listed() {
-        let mut row_local = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", None, &[]);
+        let mut row_local = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None, &[]);
         row_local.run_source = Some("local".to_string());
-        let mut row_ci = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", None, &[]);
+        let mut row_ci = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None, &[]);
         row_ci.run_source = Some("ci".to_string());
-        let mut row_archive = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", None, &[]);
+        let mut row_archive = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None, &[]);
         row_archive.run_source = Some("archive".to_string());
         let filter = RowFilter {
             run_sources: vec!["local".to_string(), "ci".to_string()],
@@ -7358,7 +7358,7 @@ mod tests {
     /// for the `run_source` × `kernel_commit` cross-wire surface.
     #[test]
     fn row_filter_run_sources_and_kernel_commits_are_distinct_fields() {
-        let mut row = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", None, &[]);
+        let mut row = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None, &[]);
         row.run_source = Some("local".to_string());
         row.kernel_commit = None;
         let filter = RowFilter {
@@ -7376,7 +7376,7 @@ mod tests {
 
         // Symmetric arm: run_source mismatches but kernel_commit
         // matches. Whole filter must still reject.
-        let mut row2 = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", None, &[]);
+        let mut row2 = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None, &[]);
         row2.run_source = Some("ci".to_string());
         row2.kernel_commit = Some("abc1234".to_string());
         let filter2 = RowFilter {
@@ -7400,7 +7400,7 @@ mod tests {
     /// existing multi-field test for scheduler+topology+kernel.
     #[test]
     fn row_filter_commit_and_kernel_compose_and() {
-        let mut row = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", Some("6.14.2"), &[]);
+        let mut row = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", Some("6.14.2"), &[]);
         row.commit = Some("abcdef1".to_string());
         let filter_both_match = RowFilter {
             kernels: vec!["6.14.2".to_string()],
@@ -7430,7 +7430,7 @@ mod tests {
     /// is the operator's expected workflow.
     #[test]
     fn row_filter_topology_strict_equality() {
-        let row = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", None, &[]);
+        let row = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None, &[]);
         let filter_match = RowFilter {
             topologies: vec!["1n2l4c1t".to_string()],
             ..RowFilter::default()
@@ -7454,7 +7454,7 @@ mod tests {
             "t",
             "scx_a",
             "1n2l4c1t",
-            "CpuSpin",
+            "SpinWait",
             None,
             &["llc", "rusty_balance", "extra"],
         );
@@ -7473,7 +7473,7 @@ mod tests {
     /// whole match, even when other required flags are present.
     #[test]
     fn row_filter_flags_missing_required_rejects() {
-        let row = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", None, &["llc"]);
+        let row = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None, &["llc"]);
         let filter = RowFilter {
             flags: vec!["llc".to_string(), "rusty_balance".to_string()],
             ..RowFilter::default()
@@ -7494,7 +7494,7 @@ mod tests {
             "t",
             "scx_a",
             "1n2l4c1t",
-            "CpuSpin",
+            "SpinWait",
             Some("6.14.2"),
             &["llc"],
         );
@@ -7521,9 +7521,9 @@ mod tests {
     #[test]
     fn apply_row_filters_preserves_order_drops_mismatch() {
         let rows = vec![
-            make_filter_row("t1", "scx_a", "1n2l4c1t", "CpuSpin", None, &[]),
-            make_filter_row("t2", "scx_b", "1n2l4c1t", "CpuSpin", None, &[]),
-            make_filter_row("t3", "scx_a", "1n2l4c1t", "CpuSpin", None, &[]),
+            make_filter_row("t1", "scx_a", "1n2l4c1t", "SpinWait", None, &[]),
+            make_filter_row("t2", "scx_b", "1n2l4c1t", "SpinWait", None, &[]),
+            make_filter_row("t3", "scx_a", "1n2l4c1t", "SpinWait", None, &[]),
         ];
         let filter = RowFilter {
             schedulers: vec!["scx_b".to_string()],
@@ -7539,7 +7539,7 @@ mod tests {
     #[test]
     fn apply_row_filters_default_is_identity() {
         let rows = vec![
-            make_filter_row("t1", "scx_a", "1n2l4c1t", "CpuSpin", None, &[]),
+            make_filter_row("t1", "scx_a", "1n2l4c1t", "SpinWait", None, &[]),
             make_filter_row(
                 "t2",
                 "scx_b",
@@ -8143,7 +8143,7 @@ mod tests {
                     test_name: "avg_test".to_string(),
                     topology: "1n2l4c1t".to_string(),
                     scheduler: sched.to_string(),
-                    work_type: "CpuSpin".to_string(),
+                    work_type: "SpinWait".to_string(),
                     ..SidecarResult::test_fixture()
                 };
                 sidecar.stats.worst_spread = *spread;
@@ -8262,12 +8262,12 @@ mod tests {
     #[test]
     fn format_per_group_pass_counts_renders_every_group_with_n_over_m() {
         let avg_a = vec![
-            group("alpha", "tiny-1llc", "CpuSpin", &[], 5, 5),
-            group("beta", "tiny-1llc", "CpuSpin", &[], 3, 5),
+            group("alpha", "tiny-1llc", "SpinWait", &[], 5, 5),
+            group("beta", "tiny-1llc", "SpinWait", &[], 3, 5),
         ];
         let avg_b = vec![
-            group("alpha", "tiny-1llc", "CpuSpin", &[], 4, 5),
-            group("beta", "tiny-1llc", "CpuSpin", &[], 5, 5),
+            group("alpha", "tiny-1llc", "SpinWait", &[], 4, 5),
+            group("beta", "tiny-1llc", "SpinWait", &[], 5, 5),
         ];
         let out = format_per_group_pass_counts(&avg_a, &avg_b, "a", "b");
         // Header line present.
@@ -8277,11 +8277,11 @@ mod tests {
         );
         // Both groups render with their per-side N/M counters.
         assert!(
-            out.contains("alpha/tiny-1llc/CpuSpin: a=5/5 b=4/5"),
+            out.contains("alpha/tiny-1llc/SpinWait: a=5/5 b=4/5"),
             "alpha group line missing; got: {out:?}",
         );
         assert!(
-            out.contains("beta/tiny-1llc/CpuSpin: a=3/5 b=5/5"),
+            out.contains("beta/tiny-1llc/SpinWait: a=3/5 b=5/5"),
             "beta group line missing; got: {out:?}",
         );
         // Trailing newline so the next section reads cleanly.
@@ -8300,15 +8300,15 @@ mod tests {
     /// missing.
     #[test]
     fn format_per_group_pass_counts_one_side_missing_renders_dash() {
-        let avg_a = vec![group("only_a", "tiny-1llc", "CpuSpin", &[], 5, 5)];
-        let avg_b = vec![group("only_b", "tiny-1llc", "CpuSpin", &[], 3, 5)];
+        let avg_a = vec![group("only_a", "tiny-1llc", "SpinWait", &[], 5, 5)];
+        let avg_b = vec![group("only_b", "tiny-1llc", "SpinWait", &[], 3, 5)];
         let out = format_per_group_pass_counts(&avg_a, &avg_b, "a", "b");
         assert!(
-            out.contains("only_a/tiny-1llc/CpuSpin: a=5/5 b=-"),
+            out.contains("only_a/tiny-1llc/SpinWait: a=5/5 b=-"),
             "A-only group must render b=-; got: {out:?}",
         );
         assert!(
-            out.contains("only_b/tiny-1llc/CpuSpin: a=- b=3/5"),
+            out.contains("only_b/tiny-1llc/SpinWait: a=- b=3/5"),
             "B-only group must render a=-; got: {out:?}",
         );
     }
@@ -8321,18 +8321,18 @@ mod tests {
     #[test]
     fn format_per_group_pass_counts_distinct_flags_render_separately() {
         let avg_a = vec![
-            group("t", "tiny-1llc", "CpuSpin", &["llc"], 5, 5),
-            group("t", "tiny-1llc", "CpuSpin", &["borrow"], 4, 5),
+            group("t", "tiny-1llc", "SpinWait", &["llc"], 5, 5),
+            group("t", "tiny-1llc", "SpinWait", &["borrow"], 4, 5),
         ];
         let avg_b = vec![
-            group("t", "tiny-1llc", "CpuSpin", &["llc"], 3, 5),
-            group("t", "tiny-1llc", "CpuSpin", &["borrow"], 5, 5),
+            group("t", "tiny-1llc", "SpinWait", &["llc"], 3, 5),
+            group("t", "tiny-1llc", "SpinWait", &["borrow"], 5, 5),
         ];
         let out = format_per_group_pass_counts(&avg_a, &avg_b, "a", "b");
         // Both lines must appear separately — not collapsed.
-        // Count occurrences of "t/tiny-1llc/CpuSpin" — there
+        // Count occurrences of "t/tiny-1llc/SpinWait" — there
         // should be exactly 2 (one per flag profile).
-        let occurrences = out.matches("t/tiny-1llc/CpuSpin").count();
+        let occurrences = out.matches("t/tiny-1llc/SpinWait").count();
         assert_eq!(
             occurrences, 2,
             "two flag profiles must render as two separate lines; got: {out:?}",
@@ -8556,7 +8556,7 @@ mod tests {
     #[test]
     fn derive_slicing_dims_work_type_only_diff() {
         let f_a = RowFilter {
-            work_types: vec!["CpuSpin".to_string()],
+            work_types: vec!["SpinWait".to_string()],
             ..RowFilter::default()
         };
         let f_b = RowFilter {
@@ -8572,14 +8572,14 @@ mod tests {
         // Sorted-deduped Vec semantics: same set in different
         // order/multiplicity must NOT slice.
         let f_c = RowFilter {
-            work_types: vec!["CpuSpin".to_string(), "PageFaultChurn".to_string()],
+            work_types: vec!["SpinWait".to_string(), "PageFaultChurn".to_string()],
             ..RowFilter::default()
         };
         let f_d = RowFilter {
             work_types: vec![
                 "PageFaultChurn".to_string(),
-                "CpuSpin".to_string(),
-                "CpuSpin".to_string(),
+                "SpinWait".to_string(),
+                "SpinWait".to_string(),
             ],
             ..RowFilter::default()
         };
@@ -8626,7 +8626,7 @@ mod tests {
     /// series.
     #[test]
     fn row_filter_kernel_major_minor_prefix_admits_patch_version() {
-        let row = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", Some("6.12.5"), &[]);
+        let row = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", Some("6.12.5"), &[]);
         let filter = RowFilter {
             kernels: vec!["6.12".to_string()],
             ..RowFilter::default()
@@ -8645,9 +8645,9 @@ mod tests {
     /// (when topology IS a pairing dim) does not.
     #[test]
     fn pairing_key_from_row_basic() {
-        let row_a = make_filter_row("scenA", "scx_a", "1n1l", "CpuSpin", Some("6.14"), &[]);
-        let row_b = make_filter_row("scenA", "scx_a", "1n1l", "CpuSpin", Some("6.14"), &[]);
-        let row_c = make_filter_row("scenA", "scx_a", "2n2l", "CpuSpin", Some("6.14"), &[]);
+        let row_a = make_filter_row("scenA", "scx_a", "1n1l", "SpinWait", Some("6.14"), &[]);
+        let row_b = make_filter_row("scenA", "scx_a", "1n1l", "SpinWait", Some("6.14"), &[]);
+        let row_c = make_filter_row("scenA", "scx_a", "2n2l", "SpinWait", Some("6.14"), &[]);
         let dims = &[Dimension::Topology, Dimension::WorkType];
         assert_eq!(
             PairingKey::from_row(&row_a, dims),
@@ -8666,8 +8666,8 @@ mod tests {
     /// them across A/B sides.
     #[test]
     fn pairing_key_excludes_slicing_dim() {
-        let row_a = make_filter_row("scenA", "scx_a", "1n1l", "CpuSpin", Some("6.14"), &[]);
-        let row_b = make_filter_row("scenA", "scx_a", "2n2l", "CpuSpin", Some("6.14"), &[]);
+        let row_a = make_filter_row("scenA", "scx_a", "1n1l", "SpinWait", Some("6.14"), &[]);
+        let row_b = make_filter_row("scenA", "scx_a", "2n2l", "SpinWait", Some("6.14"), &[]);
         // Pairing dims = ALL minus Topology. So these two rows
         // pair iff they agree on everything BUT topology.
         let pair_dims = Dimension::pairing_dims(&[Dimension::Topology]);
@@ -8684,12 +8684,12 @@ mod tests {
     /// are pairing dims.
     #[test]
     fn pairing_key_join_renders_legacy_shape() {
-        let mut row = make_filter_row("test_a", "scx_a", "1n2l", "CpuSpin", Some("6.14"), &[]);
+        let mut row = make_filter_row("test_a", "scx_a", "1n2l", "SpinWait", Some("6.14"), &[]);
         row.flags = vec!["llc".to_string(), "steal".to_string()];
         let key = PairingKey::from_row(&row, LEGACY_PAIRING_DIMS);
         assert_eq!(
             key.0.join("/"),
-            "test_a/1n2l/CpuSpin/llc|steal",
+            "test_a/1n2l/SpinWait/llc|steal",
             "legacy-shape join must render the four-segment label \
              with flags sorted+deduped via `|`",
         );
@@ -8708,9 +8708,9 @@ mod tests {
     /// shape is shared across every Option-typed dim arm.
     #[test]
     fn pairing_key_from_row_includes_kernel_commit_when_pairing() {
-        let mut row_some = make_filter_row("scn", "scx_a", "1n1l", "CpuSpin", Some("6.14"), &[]);
+        let mut row_some = make_filter_row("scn", "scx_a", "1n1l", "SpinWait", Some("6.14"), &[]);
         row_some.kernel_commit = Some("kabcde7".to_string());
-        let mut row_none = make_filter_row("scn", "scx_a", "1n1l", "CpuSpin", Some("6.14"), &[]);
+        let mut row_none = make_filter_row("scn", "scx_a", "1n1l", "SpinWait", Some("6.14"), &[]);
         row_none.kernel_commit = None;
 
         // KernelCommit in pairing dims → key carries the commit
@@ -8760,11 +8760,11 @@ mod tests {
     /// `row.run_source` would surface here.
     #[test]
     fn pairing_key_from_row_includes_run_source_when_pairing() {
-        let mut row_local = make_filter_row("scn", "scx_a", "1n1l", "CpuSpin", Some("6.14"), &[]);
+        let mut row_local = make_filter_row("scn", "scx_a", "1n1l", "SpinWait", Some("6.14"), &[]);
         row_local.run_source = Some("local".to_string());
-        let mut row_ci = make_filter_row("scn", "scx_a", "1n1l", "CpuSpin", Some("6.14"), &[]);
+        let mut row_ci = make_filter_row("scn", "scx_a", "1n1l", "SpinWait", Some("6.14"), &[]);
         row_ci.run_source = Some("ci".to_string());
-        let mut row_none = make_filter_row("scn", "scx_a", "1n1l", "CpuSpin", Some("6.14"), &[]);
+        let mut row_none = make_filter_row("scn", "scx_a", "1n1l", "SpinWait", Some("6.14"), &[]);
         row_none.run_source = None;
 
         let pair_dims = &[Dimension::RunSource];
@@ -8809,9 +8809,9 @@ mod tests {
     /// land in ONE group).
     #[test]
     fn pairing_key_from_row_strips_dirty_suffix_on_commit() {
-        let mut row_clean = make_filter_row("scn", "scx_a", "1n1l", "CpuSpin", Some("6.14"), &[]);
+        let mut row_clean = make_filter_row("scn", "scx_a", "1n1l", "SpinWait", Some("6.14"), &[]);
         row_clean.commit = Some("abc1234".to_string());
-        let mut row_dirty = make_filter_row("scn", "scx_a", "1n1l", "CpuSpin", Some("6.14"), &[]);
+        let mut row_dirty = make_filter_row("scn", "scx_a", "1n1l", "SpinWait", Some("6.14"), &[]);
         row_dirty.commit = Some("abc1234-dirty".to_string());
 
         let pair_dims = &[Dimension::ProjectCommit];
@@ -8837,9 +8837,9 @@ mod tests {
     /// strip one but not the other.
     #[test]
     fn pairing_key_from_row_strips_dirty_suffix_on_kernel_commit() {
-        let mut row_clean = make_filter_row("scn", "scx_a", "1n1l", "CpuSpin", Some("6.14"), &[]);
+        let mut row_clean = make_filter_row("scn", "scx_a", "1n1l", "SpinWait", Some("6.14"), &[]);
         row_clean.kernel_commit = Some("def5678".to_string());
-        let mut row_dirty = make_filter_row("scn", "scx_a", "1n1l", "CpuSpin", Some("6.14"), &[]);
+        let mut row_dirty = make_filter_row("scn", "scx_a", "1n1l", "SpinWait", Some("6.14"), &[]);
         row_dirty.kernel_commit = Some("def5678-dirty".to_string());
 
         let pair_dims = &[Dimension::KernelCommit];
@@ -8860,9 +8860,9 @@ mod tests {
     /// `bbb2222` remain distinct.
     #[test]
     fn pairing_key_from_row_distinct_hexes_remain_distinct_under_strip() {
-        let mut row_a = make_filter_row("scn", "scx_a", "1n1l", "CpuSpin", Some("6.14"), &[]);
+        let mut row_a = make_filter_row("scn", "scx_a", "1n1l", "SpinWait", Some("6.14"), &[]);
         row_a.commit = Some("aaa1111-dirty".to_string());
-        let mut row_b = make_filter_row("scn", "scx_a", "1n1l", "CpuSpin", Some("6.14"), &[]);
+        let mut row_b = make_filter_row("scn", "scx_a", "1n1l", "SpinWait", Some("6.14"), &[]);
         row_b.commit = Some("bbb2222".to_string());
 
         let pair_dims = &[Dimension::ProjectCommit];
@@ -8884,7 +8884,7 @@ mod tests {
     /// inadvertently changed the unwrap_or_default behavior.
     #[test]
     fn pairing_key_from_row_none_commit_unchanged_under_strip() {
-        let mut row = make_filter_row("scn", "scx_a", "1n1l", "CpuSpin", Some("6.14"), &[]);
+        let mut row = make_filter_row("scn", "scx_a", "1n1l", "SpinWait", Some("6.14"), &[]);
         row.commit = None;
         row.kernel_commit = None;
         let pair_dims = &[Dimension::ProjectCommit, Dimension::KernelCommit];

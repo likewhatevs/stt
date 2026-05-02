@@ -412,7 +412,7 @@ impl SidecarResult {
     ///
     /// Defaults model a passing EEVDF run on a minimal `1n1l1c1t`
     /// topology with no payload and no VM telemetry: `test_name="t"`,
-    /// `topology="1n1l1c1t"`, `scheduler="eevdf"`, `work_type="CpuSpin"`,
+    /// `topology="1n1l1c1t"`, `scheduler="eevdf"`, `work_type="SpinWait"`,
     /// `passed=true`, `skipped=false`, every [`Option`] `None`, every
     /// [`Vec`] empty, `stats` is `ScenarioStats::default()`, and both
     /// `timestamp`/`run_id` are empty strings.
@@ -443,7 +443,7 @@ impl SidecarResult {
             stats: crate::assert::ScenarioStats::default(),
             monitor: None,
             stimulus_events: Vec::new(),
-            work_type: "CpuSpin".to_string(),
+            work_type: "SpinWait".to_string(),
             active_flags: Vec::new(),
             verifier_stats: Vec::new(),
             kvm_stats: None,
@@ -2906,7 +2906,7 @@ mod tests {
                 detail: Some("4 cpus".to_string()),
                 total_iterations: None,
             }],
-            work_type: "CpuSpin".to_string(),
+            work_type: "SpinWait".to_string(),
             active_flags: Vec::new(),
             verifier_stats: vec![],
             kvm_stats: None,
@@ -2962,7 +2962,7 @@ mod tests {
         assert_eq!(test_name, "my_test");
         assert_eq!(topology, "1n2l4c2t");
         assert_eq!(scheduler, "scx_mitosis");
-        assert_eq!(work_type, "CpuSpin");
+        assert_eq!(work_type, "SpinWait");
         // Nullable string metadata fields.
         assert_eq!(scheduler_commit.as_deref(), Some("abc123"));
         assert_eq!(project_commit.as_deref(), Some("def4567"));
@@ -3062,7 +3062,7 @@ mod tests {
     /// - `test_name="audit"` (vs fixture `"t"`).
     /// - `topology="8n8l16c2t"` (vs fixture `"1n1l1c1t"`).
     /// - `scheduler="scx_audit"` (vs fixture `"eevdf"`).
-    /// - `work_type="AuditWork"` (vs fixture `"CpuSpin"`).
+    /// - `work_type="AuditWork"` (vs fixture `"SpinWait"`).
     /// - `passed=false, skipped=true` (vs fixture `true`, `false`).
     /// - Non-empty collections for every `Vec<_>` field.
     /// - `Some(…)` for every `Option<_>` field.
@@ -3596,7 +3596,7 @@ mod tests {
         };
         let vm_result = crate::vmm::VmResult::test_fixture();
         let check_result = AssertResult::pass();
-        write_sidecar(&entry, &vm_result, &[], &check_result, "CpuSpin", &[], &[]).unwrap();
+        write_sidecar(&entry, &vm_result, &[], &check_result, "SpinWait", &[], &[]).unwrap();
 
         // The actual on-disk filename embeds a variant-hash suffix
         // (see `serialize_and_write_sidecar`), so a fixed
@@ -4347,7 +4347,7 @@ mod tests {
         };
         let vm_result = crate::vmm::VmResult::test_fixture();
         let ok = AssertResult::pass();
-        write_sidecar(&entry_a, &vm_result, &[], &ok, "CpuSpin", &[], &[]).unwrap();
+        write_sidecar(&entry_a, &vm_result, &[], &ok, "SpinWait", &[], &[]).unwrap();
         // Confirm the first invocation's sidecar is on disk.
         assert_eq!(
             find_sidecars_by_prefix(tmp, "__reuse_first_run__-").len(),
@@ -4377,7 +4377,7 @@ mod tests {
             auto_repro: false,
             ..KtstrTestEntry::DEFAULT
         };
-        write_sidecar(&entry_b, &vm_result, &[], &ok, "CpuSpin", &[], &[]).unwrap();
+        write_sidecar(&entry_b, &vm_result, &[], &ok, "SpinWait", &[], &[]).unwrap();
 
         // Final state: only the second invocation's sidecar is
         // present. The first invocation is gone, the second is
@@ -4431,7 +4431,7 @@ mod tests {
         };
         let vm_result = crate::vmm::VmResult::test_fixture();
         let ok = AssertResult::pass();
-        write_sidecar(&entry, &vm_result, &[], &ok, "CpuSpin", &[], &[]).unwrap();
+        write_sidecar(&entry, &vm_result, &[], &ok, "SpinWait", &[], &[]).unwrap();
 
         // The pre-existing sidecar must still be there. A regression
         // that fired pre_clear on the override path would have
@@ -4533,7 +4533,7 @@ mod tests {
         // canonicalize-fails (dir missing) → cache key under raw
         // path → wipe was a no-op (dir didn't exist) → created
         // dir → wrote sidecar 1.
-        write_sidecar(&entry_first, &vm_result, &[], &ok, "CpuSpin", &[], &[]).unwrap();
+        write_sidecar(&entry_first, &vm_result, &[], &ok, "SpinWait", &[], &[]).unwrap();
         // Confirm sidecar 1 lands.
         assert_eq!(
             find_sidecars_by_prefix(&dir, "__b3_first__-").len(),
@@ -4549,7 +4549,7 @@ mod tests {
         // both calls, both canonicalize against an existing dir,
         // both produce the same canonicalized key, and the second
         // call hits the cache → no wipe → both survive.
-        write_sidecar(&entry_second, &vm_result, &[], &ok, "CpuSpin", &[], &[]).unwrap();
+        write_sidecar(&entry_second, &vm_result, &[], &ok, "SpinWait", &[], &[]).unwrap();
 
         // Both sidecars must be present. A regression to the buggy
         // ordering would surface here as `__b3_first__-` count = 0.
@@ -4588,7 +4588,7 @@ mod tests {
         };
         let vm_result = crate::vmm::VmResult::test_fixture();
         let check_result = AssertResult::pass();
-        write_sidecar(&entry, &vm_result, &[], &check_result, "CpuSpin", &[], &[]).unwrap();
+        write_sidecar(&entry, &vm_result, &[], &check_result, "SpinWait", &[], &[]).unwrap();
 
         // Sidecar filename now includes a variant hash suffix so
         // gauntlet variants don't clobber each other. Use the
@@ -4668,8 +4668,8 @@ mod tests {
         let ok = AssertResult::pass();
         let flags_a = vec!["llc".to_string()];
         let flags_b = vec!["llc".to_string(), "steal".to_string()];
-        write_sidecar(&entry, &vm_result, &[], &ok, "CpuSpin", &flags_a, &[]).unwrap();
-        write_sidecar(&entry, &vm_result, &[], &ok, "CpuSpin", &flags_b, &[]).unwrap();
+        write_sidecar(&entry, &vm_result, &[], &ok, "SpinWait", &flags_a, &[]).unwrap();
+        write_sidecar(&entry, &vm_result, &[], &ok, "SpinWait", &flags_b, &[]).unwrap();
 
         let paths = find_sidecars_by_prefix(tmp, "__flagvariant_test__-");
         assert_eq!(
@@ -4726,8 +4726,8 @@ mod tests {
         // which order the caller supplied them.
         let forward = vec!["llc".to_string(), "steal".to_string()];
         let reversed = vec!["steal".to_string(), "llc".to_string()];
-        write_sidecar(&entry, &vm_result, &[], &ok, "CpuSpin", &forward, &[]).unwrap();
-        write_sidecar(&entry, &vm_result, &[], &ok, "CpuSpin", &reversed, &[]).unwrap();
+        write_sidecar(&entry, &vm_result, &[], &ok, "SpinWait", &forward, &[]).unwrap();
+        write_sidecar(&entry, &vm_result, &[], &ok, "SpinWait", &reversed, &[]).unwrap();
 
         let paths = find_sidecars_by_prefix(tmp, "__flagorder_test__-");
         assert_eq!(
@@ -4990,7 +4990,7 @@ mod tests {
         };
         let vm_result = crate::vmm::VmResult::test_fixture();
         let ok = AssertResult::pass();
-        write_sidecar(&entry, &vm_result, &[], &ok, "CpuSpin", &[], &[]).unwrap();
+        write_sidecar(&entry, &vm_result, &[], &ok, "SpinWait", &[], &[]).unwrap();
         write_sidecar(&entry, &vm_result, &[], &ok, "YieldHeavy", &[], &[]).unwrap();
 
         let paths = find_sidecars_by_prefix(tmp, "__variant_test__-");
@@ -5030,7 +5030,7 @@ mod tests {
             topology: "1n2l4c1t".to_string(),
             scheduler: "scx-ktstr".to_string(),
             payload: None,
-            work_type: "CpuSpin".to_string(),
+            work_type: "SpinWait".to_string(),
             active_flags: vec!["llc".to_string(), "steal".to_string()],
             sysctls: vec!["sysctl.kernel.sched_cfs_bandwidth_slice_us=1000".to_string()],
             kargs: vec!["nosmt".to_string()],
@@ -5677,7 +5677,7 @@ mod tests {
         };
         let vm_result = crate::vmm::VmResult::test_fixture();
         let ok = AssertResult::pass();
-        write_sidecar(&entry, &vm_result, &[], &ok, "CpuSpin", &[], &[]).unwrap();
+        write_sidecar(&entry, &vm_result, &[], &ok, "SpinWait", &[], &[]).unwrap();
 
         let path = find_single_sidecar_by_prefix(&tmp, "__payload_name_test__-");
         let data = std::fs::read_to_string(&path).unwrap();
@@ -5734,7 +5734,7 @@ mod tests {
                 exit_code: 2,
             },
         ];
-        write_sidecar(&entry, &vm_result, &[], &ok, "CpuSpin", &[], &metrics).unwrap();
+        write_sidecar(&entry, &vm_result, &[], &ok, "SpinWait", &[], &metrics).unwrap();
 
         let path = find_single_sidecar_by_prefix(&tmp, "__metrics_slice_test__-");
         let data = std::fs::read_to_string(&path).unwrap();

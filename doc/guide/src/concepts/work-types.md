@@ -4,7 +4,7 @@
 
 ```rust,ignore
 pub enum WorkType {
-    CpuSpin,
+    SpinWait,
     YieldHeavy,
     Mixed,
     IoSync,
@@ -42,7 +42,7 @@ Parameterized variants have convenience constructors:
 
 | Scheduler behavior to test | Recommended work type |
 |---|---|
-| Basic load balancing / fairness | `CpuSpin` (default) |
+| Basic load balancing / fairness | `SpinWait` (default) |
 | Wake placement / sleep-wake cycles | `YieldHeavy`, `FutexPingPong` |
 | CPU borrowing / idle balance | `Bursty` |
 | Cross-CPU wake latency | `PipeIo`, `CachePipe` |
@@ -60,7 +60,7 @@ Parameterized variants have convenience constructors:
 
 ## Variants
 
-**`CpuSpin`** -- tight spin loop with `spin_loop()` hints. 1024
+**`SpinWait`** -- tight spin loop with `spin_loop()` hints. 1024
 iterations per check. Pure CPU-bound workload.
 
 **`YieldHeavy`** -- `thread::yield_now()` on every iteration. Exercises
@@ -272,7 +272,7 @@ and `MutexContention` use shared mmap pages with futex wait/wake.
 ## String lookup
 
 `WorkType::from_name()` accepts PascalCase names matching the enum
-variants (e.g. `"CpuSpin"`, `"FutexPingPong"`). `Sequence` and `Custom`
+variants (e.g. `"SpinWait"`, `"FutexPingPong"`). `Sequence` and `Custom`
 return `None` because they require explicit construction parameters.
 `WorkType::ALL_NAMES` lists every variant name. `WorkType::name()`
 returns the PascalCase name for a given value; for `Custom`, it returns
@@ -296,7 +296,7 @@ pub struct WorkloadConfig {
 }
 ```
 
-`Default`: 1 worker, no affinity, CpuSpin, Normal policy, Default
+`Default`: 1 worker, no affinity, SpinWait, Normal policy, Default
 mem_policy, no mpol_flags.
 
 See [MemPolicy](mem-policy.md) for the NUMA memory placement API.
@@ -320,8 +320,8 @@ pub enum SchedPolicy {
 ## Overriding work types
 
 The work type override (configured via gauntlet or
-`Ctx.work_type_override`) replaces the default `CpuSpin` work type
-for all scenarios that use it. Scenarios with non-`CpuSpin` work types
+`Ctx.work_type_override`) replaces the default `SpinWait` work type
+for all scenarios that use it. Scenarios with non-`SpinWait` work types
 are not overridden.
 
 Overrides to grouped work types (`PipeIo`, `FutexPingPong`,

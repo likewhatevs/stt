@@ -6,10 +6,10 @@ use crate::assert::{Assert, AssertResult};
 use crate::workload::*;
 use anyhow::Result;
 
-/// CachePressure vs CpuSpin cgroups under work conservation.
+/// CachePressure vs SpinWait cgroups under work conservation.
 ///
 /// One cgroup runs CachePressure workers (L1-strided RMW, cache-hot) and
-/// the other runs CpuSpin workers (cache-cold). Checks throughput
+/// the other runs SpinWait workers (cache-cold). Checks throughput
 /// fairness across workers (CV < 1.0) to catch gross placement imbalance.
 pub fn custom_cache_pressure_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     let checks = Assert::default_checks().max_throughput_cv(1.0);
@@ -59,11 +59,11 @@ pub fn custom_cache_yield_wake_affine(ctx: &Ctx) -> Result<AssertResult> {
     execute_steps_with(ctx, steps, Some(&checks))
 }
 
-/// CachePipe vs CpuSpin cgroups under work conservation.
+/// CachePipe vs SpinWait cgroups under work conservation.
 ///
 /// One cgroup runs CachePipe workers (cache-hot burst then pipe exchange,
 /// combining cache pressure with cross-CPU wake placement). The other runs
-/// CpuSpin at full CPU count. Checks wake latency CV to catch erratic
+/// SpinWait at full CPU count. Checks wake latency CV to catch erratic
 /// pipe wake placement.
 pub fn custom_cache_pipe_io_compute_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     let n_pipe = ctx.workers_per_cgroup;
@@ -93,7 +93,7 @@ pub fn custom_cache_pipe_io_compute_imbalance(ctx: &Ctx) -> Result<AssertResult>
 ///
 /// One cgroup runs FutexFanOut workers: each group has 1 messenger that
 /// does CPU work then wakes 4 receivers via FUTEX_WAKE. Receivers measure
-/// wake-to-run latency. A second cgroup runs CpuSpin workers to create
+/// wake-to-run latency. A second cgroup runs SpinWait workers to create
 /// CPU contention. Checks wake latency CV to catch inconsistent
 /// receiver placement.
 pub fn custom_fan_out_wake(ctx: &Ctx) -> Result<AssertResult> {
@@ -124,7 +124,7 @@ pub fn custom_fan_out_wake(ctx: &Ctx) -> Result<AssertResult> {
 /// One cgroup runs FanOutCompute workers: each group has 1 messenger that
 /// stamps a wake timestamp then wakes 4 receivers via FUTEX_WAKE.
 /// Receivers measure wake-to-run latency, sleep, and do matrix multiply
-/// work. A second cgroup runs CpuSpin workers to create CPU contention.
+/// work. A second cgroup runs SpinWait workers to create CPU contention.
 /// Checks wake latency CV to catch inconsistent receiver placement.
 pub fn custom_fan_out_compute(ctx: &Ctx) -> Result<AssertResult> {
     let fan_out = 4usize;

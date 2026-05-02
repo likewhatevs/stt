@@ -176,7 +176,7 @@ readiness gates between host and guest.
 
 Workers are `fork()`ed processes placed in cgroups:
 
-- `CpuSpin` — tight CPU spin loop
+- `SpinWait` — tight CPU spin loop
 - `YieldHeavy` — repeated sched_yield with minimal CPU work
 - `Mixed` — CPU spin burst followed by sched_yield
 - `IoSync` — 64 KB write + 100 us sleep (simulated blocking I/O)

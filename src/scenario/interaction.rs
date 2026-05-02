@@ -39,7 +39,7 @@ pub fn custom_cgroup_add_load_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     execute_scenario(ctx, backdrop, steps)
 }
 
-/// Three cgroups with CpuSpin, Bursty, and IoSyncWrite workloads.
+/// Three cgroups with SpinWait, Bursty, and IoSyncWrite workloads.
 pub fn custom_cgroup_imbalance_mixed_workload(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![Step::with_defs(
         vec![
@@ -113,7 +113,7 @@ pub fn custom_cgroup_4way_load_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     execute_steps(ctx, steps)
 }
 
-/// Disjoint cpusets with oversubscribed CpuSpin vs light Bursty workers.
+/// Disjoint cpusets with oversubscribed SpinWait vs light Bursty workers.
 pub fn custom_cgroup_cpuset_imbalance_combined(ctx: &Ctx) -> Result<AssertResult> {
     let mid = ctx.topo.usable_cpus().len() / 2;
 
@@ -274,7 +274,7 @@ pub fn custom_cgroup_no_ctrl_cpuset_change(ctx: &Ctx) -> Result<AssertResult> {
     execute_scenario(ctx, backdrop, steps)
 }
 
-/// Heavy CpuSpin vs light YieldHeavy cgroups with cpu-controller disabled.
+/// Heavy SpinWait vs light YieldHeavy cgroups with cpu-controller disabled.
 pub fn custom_cgroup_no_ctrl_load_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![Step::with_defs(
         vec![
@@ -289,7 +289,7 @@ pub fn custom_cgroup_no_ctrl_load_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     execute_steps(ctx, steps)
 }
 
-/// IoSyncWrite cgroup vs fully-subscribed CpuSpin cgroup.
+/// IoSyncWrite cgroup vs fully-subscribed SpinWait cgroup.
 pub fn custom_cgroup_io_compute_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![Step::with_defs(
         vec![
