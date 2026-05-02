@@ -84,20 +84,197 @@ use vm_memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
 
 use crate::monitor;
 
-/// Create a KVM VM with EINTR retry (up to 5 attempts, exponential backoff).
+/// EINTR retry schedule for `KVM_CREATE_VM` — eight attempts with
+/// millisecond-scale backoff that totals roughly one second. The
+/// previous schedule (`1 << attempts` microseconds, five attempts,
+/// 62 µs total) could be starved by any sustained signal source
+/// firing across a few tens of microseconds (e.g. a runtime that
+/// uses async-cancellation signals on the parent thread). KVM_CREATE_VM
+/// runs before any vCPU thread has been created, so the freeze
+/// coordinator's `SIGRTMIN` broadcast cannot itself trigger this path —
+/// the retry budget defends against any signal source that could
+/// preempt the parent thread, not a specific known one. The new
+/// schedule matches Firecracker's spirit (exponential backoff with a
+/// cap) at a budget realistic for sustained signal activity.
+const KVM_CREATE_VM_EINTR_DELAYS: [Duration; 8] = [
+    Duration::from_micros(100),
+    Duration::from_micros(500),
+    Duration::from_millis(2),
+    Duration::from_millis(10),
+    Duration::from_millis(50),
+    Duration::from_millis(100),
+    Duration::from_millis(200),
+    Duration::from_millis(500),
+];
+
+/// Errno values that callers should treat as transient host-resource
+/// pressure rather than a hard fault. Used by
+/// [`map_transient_to_contention`] to convert KVM ioctl failures
+/// into [`host_topology::ResourceContention`] so the
+/// `#[ktstr_test]` macro can route them through the canonical
+/// SKIP-on-contention path instead of panicking the test.
 ///
-/// KVM_CREATE_VM can return EINTR when a signal arrives mid-ioctl.
-/// Retrying with backoff matches the Firecracker pattern.
+/// - `ENOMEM` — kernel memory allocator could not satisfy a
+///   GuestMemoryMmap region or KVM internal table allocation.
+/// - `EMFILE` — process fd table full (per-process `RLIMIT_NOFILE`).
+/// - `ENFILE` — system-wide fd table full (`/proc/sys/fs/file-max`).
+/// - `EBUSY` — KVM vm/vcpu fd hit a transient busy state.
+/// - `EAGAIN` — kernel subsystem signalled "try again". Defensive
+///   inclusion: KVM init ioctls rarely return EAGAIN, but a future
+///   kernel that adds a non-blocking allocation path could surface it
+///   transiently — better to classify it as contention than fault.
+const TRANSIENT_HOST_ERRNOS: &[i32] = &[
+    libc::ENOMEM,
+    libc::EMFILE,
+    libc::ENFILE,
+    libc::EBUSY,
+    libc::EAGAIN,
+];
+
+/// Capture a one-shot snapshot of process-level resource state for
+/// inclusion in a contention diagnostic. Reads:
+///
+/// - `/proc/self/status` for `VmRSS` and `Threads`.
+/// - `/proc/self/limits` for `Max open files` and `Max processes`.
+/// - count of entries in `/proc/self/fd` (cheap fd-usage estimate;
+///   produced from readdir, NOT from the `FDSize` field of
+///   `/proc/self/status` — `FDSize` reports the kernel's fd-table
+///   capacity, not the count of open fds).
+///
+/// All reads are best-effort: a missing field or unreadable file
+/// folds into `<unknown>` rather than failing the snapshot. The
+/// snapshot exists to give an operator hitting a SKIP banner one
+/// place to start triaging — `fds=1023/1024` is actionable, an
+/// opaque `ENOMEM` is not. Cheap enough (three small file reads,
+/// one readdir) that callers can take it on every transient
+/// classification without measurable cost.
+pub(crate) fn host_resource_snapshot() -> String {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let limits = std::fs::read_to_string("/proc/self/limits").unwrap_or_default();
+    let fd_count: usize = std::fs::read_dir("/proc/self/fd")
+        .map(|d| d.filter_map(|e| e.ok()).count())
+        .unwrap_or(0);
+
+    let pick = |s: &str, prefix: &str| -> String {
+        for line in s.lines() {
+            if let Some(rest) = line.strip_prefix(prefix) {
+                return rest.trim().to_string();
+            }
+        }
+        "<unknown>".into()
+    };
+    let pick_limit = |key: &str| -> String {
+        for line in limits.lines() {
+            if let Some(rest) = line.strip_prefix(key) {
+                return rest.split_whitespace().next().unwrap_or("<unknown>").into();
+            }
+        }
+        "<unknown>".into()
+    };
+
+    let vm_rss = pick(&status, "VmRSS:");
+    let threads = pick(&status, "Threads:");
+    let max_files = pick_limit("Max open files");
+    let max_procs = pick_limit("Max processes");
+    format!(
+        "fds={fd_count}/{max_files}, vmrss={vm_rss}, threads={threads}, max_procs={max_procs}"
+    )
+}
+
+/// Map a kvm_ioctls / vmm_sys_util `errno::Error` to a
+/// [`host_topology::ResourceContention`] when its errno appears in
+/// [`TRANSIENT_HOST_ERRNOS`]; otherwise return the error wrapped in
+/// the supplied context unchanged.
+///
+/// The contention reason embeds the original errno name and the
+/// caller-supplied context (e.g. `"create VM"` or
+/// `"set TSS address"`) so the `ktstr: SKIP: resource contention:
+/// ...` banner names the exact ioctl that failed and the
+/// host-resource snapshot points the operator at the actionable
+/// limit. Non-transient errors (EINVAL, ENOSYS, EPERM, etc.) flow
+/// through unchanged so a real bug never gets misclassified as
+/// contention.
+///
+/// `context` is `impl Into<String>` so callers can pass either a
+/// static `&str` (the common case — `"create VM"`) or a freshly
+/// formatted `String` (vCPU loops naming the offending CPU).
+pub(crate) fn map_transient_to_contention(
+    e: kvm_ioctls::Error,
+    context: impl Into<String>,
+) -> anyhow::Error {
+    let context = context.into();
+    let errno = e.errno();
+    if TRANSIENT_HOST_ERRNOS.contains(&errno) {
+        let snapshot = host_resource_snapshot();
+        anyhow::Error::new(host_topology::ResourceContention {
+            reason: format!(
+                "{context}: transient KVM errno {errno} ({}): host resources: {snapshot}\n  \
+                 hint: KVM ioctl failed with a host-resource errno; another peer may be \
+                 holding the budget. nextest will not retry; the SKIP banner records this \
+                 attempt for stats tooling.",
+                errno_name(errno)
+            ),
+        })
+    } else {
+        anyhow::Error::new(e).context(context)
+    }
+}
+
+/// Render a numeric errno to its libc name for diagnostic text.
+/// Limited to the values in [`TRANSIENT_HOST_ERRNOS`] plus a few
+/// neighbours an operator commonly sees in KVM ioctl failures —
+/// the goal is "name what the operator should grep for", not a
+/// complete errno table.
+fn errno_name(errno: i32) -> &'static str {
+    match errno {
+        libc::ENOMEM => "ENOMEM",
+        libc::EMFILE => "EMFILE",
+        libc::ENFILE => "ENFILE",
+        libc::EBUSY => "EBUSY",
+        libc::EAGAIN => "EAGAIN",
+        libc::EINTR => "EINTR",
+        libc::EINVAL => "EINVAL",
+        libc::ENOSYS => "ENOSYS",
+        libc::EPERM => "EPERM",
+        libc::EACCES => "EACCES",
+        _ => "<other>",
+    }
+}
+
+/// Create a KVM VM with EINTR retry plus transient-errno
+/// classification.
+///
+/// `KVM_CREATE_VM` can fail under two qualitatively different
+/// conditions: (a) signal interruption (`EINTR`), where the right
+/// answer is to retry the ioctl with a small backoff, and (b)
+/// host-resource pressure (`ENOMEM`, `EMFILE`, `ENFILE`, `EBUSY`,
+/// `EAGAIN`), where the right answer is to surface a
+/// [`host_topology::ResourceContention`] so the `#[ktstr_test]`
+/// macro can SKIP-skip cleanly. Anything else (`EINVAL`, `ENOSYS`,
+/// `EPERM`, …) is a real fault; surface it as a regular error so
+/// nextest fails the test loudly.
+///
+/// EINTR retry uses [`KVM_CREATE_VM_EINTR_DELAYS`] — eight
+/// millisecond-scale steps totalling ≈862 ms. The previous schedule
+/// (5 µs-scale steps, 62 µs total) was tuned for the bare-ioctl
+/// case and starved against any signal source that fires
+/// continuously across a few tens of microseconds.
 pub(crate) fn create_vm_with_retry(kvm: &kvm_ioctls::Kvm) -> Result<kvm_ioctls::VmFd> {
-    let mut attempts = 0;
+    let mut attempts = 0usize;
     loop {
         match kvm.create_vm() {
             Ok(fd) => break Ok(fd),
-            Err(e) if e.errno() == libc::EINTR && attempts < 5 => {
+            Err(e) if e.errno() == libc::EINTR && attempts < KVM_CREATE_VM_EINTR_DELAYS.len() => {
+                let delay = KVM_CREATE_VM_EINTR_DELAYS[attempts];
+                tracing::warn!(
+                    attempt = attempts,
+                    delay_us = delay.as_micros() as u64,
+                    "KVM_CREATE_VM EINTR; retrying"
+                );
+                std::thread::sleep(delay);
                 attempts += 1;
-                std::thread::sleep(std::time::Duration::from_micros(1 << attempts));
             }
-            Err(e) => break Err(e).context("create VM"),
+            Err(e) => break Err(map_transient_to_contention(e, "create VM")),
         }
     }
 }
@@ -969,13 +1146,24 @@ pub struct VmResult {
     ///     completed reads.
     ///   - `bytes_written` — total bytes accepted from the guest for
     ///     completed writes.
-    ///   - `throttled_count` — token-bucket rejections. The guest
-    ///     sees `S_IOERR`; this counter is separate from
-    ///     `io_errors` so operators can distinguish "throttle bucket
-    ///     drained" from "real IO problem".
+    ///   - `throttled_count` — token-bucket stalls. The chain is
+    ///     rolled back and the worker arms a retry timerfd; the
+    ///     guest does not see `S_IOERR` for a stall (the request
+    ///     is deferred until the bucket refills). This counter is
+    ///     separate from `io_errors` so operators can distinguish
+    ///     "throttle bucket drained, request deferred" from "real
+    ///     IO problem".
     ///   - `io_errors` — every path that reports `S_IOERR`:
     ///     spec violations, backend `pread`/`pwrite` errors,
     ///     malformed chains, `add_used` failures.
+    ///     Stalls do not report `S_IOERR`; see `throttled_count`.
+    ///
+    /// Counters are cumulative for the device's lifetime. A guest
+    /// driver re-bind (writing `STATUS=0` to `VIRTIO_MMIO_STATUS`
+    /// triggers `VirtioBlk::reset`) does NOT zero them — the
+    /// counters Arc is shared across reset cycles and an operator
+    /// observes a monotonically non-decreasing series spanning the
+    /// entire device lifetime, not just a post-reset fragment.
     ///
     /// Reading example:
     ///
@@ -3022,11 +3210,16 @@ impl KtstrVm {
                     // host_base addresses that single mapping; using the
                     // sum of all region lengths would extend past the
                     // mapping into host heap when multiple regions exist.
+                    // `guest_mem` is constructed with at least one region
+                    // by every `KtstrKvm` constructor; surfacing this as
+                    // an error rather than `expect()` keeps the
+                    // VM-builder path panic-free even if a future refactor
+                    // introduces a degenerate zero-region path.
                     let mem_size = vm
                         .guest_mem
                         .iter()
                         .next()
-                        .expect("guest_mem has at least one region")
+                        .context("guest_mem must have at least one region (watchdog)")?
                         .len();
                     // SAFETY: host_base came from GuestMemoryMmap's
                     // get_host_address, mapping is owned by vm.guest_mem
@@ -4521,7 +4714,7 @@ impl KtstrVm {
                     .guest_mem
                     .iter()
                     .next()
-                    .expect("guest_mem has at least one region")
+                    .context("guest_mem must have at least one region (monitor)")?
                     .len();
                 // SAFETY: host_base is from GuestMemoryMmap's mapping,
                 // which outlives this GuestMem (owned by `vm` until
@@ -4744,7 +4937,7 @@ impl KtstrVm {
                     .guest_mem
                     .iter()
                     .next()
-                    .expect("guest_mem has at least one region")
+                    .context("guest_mem must have at least one region (bpf-map-write)")?
                     .len();
                 // SAFETY: host_base is from GuestMemoryMmap's mapping,
                 // which outlives this GuestMem (owned by `vm` until
@@ -5291,7 +5484,16 @@ impl KtstrVm {
         // Non-deferred path: memory already allocated, kernel already loaded.
         let (initrd_addr, initrd_size) = match initramfs_handle {
             Some(handle) => {
-                let memory_mb = self.memory_mb.unwrap();
+                // `self.memory_mb` is required on the non-deferred
+                // path: deferred boots take the early-return branches
+                // above, so we only reach this site after the builder
+                // accepted a concrete `memory_mb`. Surface it as an
+                // error rather than `unwrap()` so a future refactor
+                // that drops the deferred guard fails loudly with an
+                // actionable diagnostic instead of an opaque panic.
+                let memory_mb = self.memory_mb.context(
+                    "internal: non-deferred aarch64 path requires memory_mb to be set",
+                )?;
                 let (base, _key) = handle
                     .join()
                     .map_err(|_| anyhow::anyhow!("initramfs-resolve thread panicked"))??;
@@ -7896,6 +8098,125 @@ mod tests {
         assert_eq!(
             b.kernel.as_deref(),
             Some(std::path::Path::new("/some/linux/arch/arm64/boot/Image"))
+        );
+    }
+
+    /// `host_resource_snapshot` must produce a single-line string
+    /// naming the four key fields the operator needs when triaging a
+    /// `ktstr: SKIP: resource contention: ...` banner: open-fd
+    /// count + soft cap, RSS, thread count, and process cap. The
+    /// values themselves are runtime-dependent (every CI runner has
+    /// a different RLIMIT shape) so the test pins only the SHAPE,
+    /// not the numbers — a regression that swallows a field would
+    /// fail here.
+    #[test]
+    fn host_resource_snapshot_emits_all_keys() {
+        let s = host_resource_snapshot();
+        assert!(s.contains("fds="), "snapshot missing fds=: {s}");
+        assert!(s.contains("vmrss="), "snapshot missing vmrss=: {s}");
+        assert!(s.contains("threads="), "snapshot missing threads=: {s}");
+        assert!(s.contains("max_procs="), "snapshot missing max_procs=: {s}");
+        assert!(
+            !s.contains('\n'),
+            "snapshot must be single-line for banner formatting: {s:?}"
+        );
+    }
+
+    /// `map_transient_to_contention` must classify the documented
+    /// transient errnos (ENOMEM, EMFILE, ENFILE, EBUSY, EAGAIN) as
+    /// `ResourceContention` so the macro's contention arm fires
+    /// and the test SKIPs cleanly. Asserts the result downcasts
+    /// AND that the rendered banner includes the caller-supplied
+    /// context plus the errno name and the host-resource snapshot.
+    #[test]
+    fn map_transient_to_contention_classifies_enomem() {
+        for &errno in TRANSIENT_HOST_ERRNOS {
+            let kvm_err = kvm_ioctls::Error::new(errno);
+            let mapped = map_transient_to_contention(kvm_err, "create VM");
+            assert!(
+                mapped
+                    .downcast_ref::<host_topology::ResourceContention>()
+                    .is_some(),
+                "errno {errno} ({}): expected ResourceContention, got {mapped:#}",
+                errno_name(errno),
+            );
+            let rendered = format!("{mapped:#}");
+            assert!(
+                rendered.contains("create VM"),
+                "errno {errno} banner missing context: {rendered}"
+            );
+            assert!(
+                rendered.contains(errno_name(errno)),
+                "errno {errno} banner missing errno name: {rendered}"
+            );
+            assert!(
+                rendered.contains("host resources:"),
+                "errno {errno} banner missing host-resource snapshot: {rendered}"
+            );
+        }
+    }
+
+    /// Non-transient errnos (EINVAL, ENOSYS, EPERM, EACCES) MUST
+    /// flow through unchanged so a real KVM bug never gets
+    /// misclassified as a recoverable SKIP. Pins the negative
+    /// case: the result must NOT downcast to
+    /// `ResourceContention`. The kernel returning EINVAL from
+    /// `KVM_CREATE_VM` would mean a programming fault (wrong
+    /// kvm_xen_hvm_config layout, etc.); SKIP-skipping it would
+    /// hide the bug from the test report.
+    #[test]
+    fn map_transient_to_contention_passes_through_hard_errors() {
+        for &errno in &[libc::EINVAL, libc::ENOSYS, libc::EPERM, libc::EACCES] {
+            let kvm_err = kvm_ioctls::Error::new(errno);
+            let mapped = map_transient_to_contention(kvm_err, "set TSS");
+            assert!(
+                mapped
+                    .downcast_ref::<host_topology::ResourceContention>()
+                    .is_none(),
+                "errno {errno} ({}): hard fault must NOT be classified as \
+                 ResourceContention; got {mapped:#}",
+                errno_name(errno),
+            );
+            let rendered = format!("{mapped:#}");
+            assert!(
+                rendered.contains("set TSS"),
+                "errno {errno} banner missing context: {rendered}"
+            );
+        }
+    }
+
+    /// `KVM_CREATE_VM_EINTR_DELAYS` must be monotonically
+    /// non-decreasing — exponential backoff is the contract — and
+    /// must total at least 800 ms so a sustained signal storm gets
+    /// a real chance to drain instead of starving the ioctl in <1 ms.
+    /// Pins the schedule against a regression that re-tunes it
+    /// downwards (the previous schedule was 62 µs total, which
+    /// adv-vm flagged as too short).
+    #[test]
+    fn kvm_create_vm_eintr_delays_total_budget() {
+        let mut prev = Duration::ZERO;
+        let mut total = Duration::ZERO;
+        for &d in &KVM_CREATE_VM_EINTR_DELAYS {
+            assert!(
+                d >= prev,
+                "EINTR delays must be monotonic: {prev:?} → {d:?}"
+            );
+            prev = d;
+            total += d;
+        }
+        assert!(
+            total >= Duration::from_millis(800),
+            "total EINTR budget must be ≥ 800 ms to absorb signal storms; got {total:?}"
+        );
+        // Upper bound — guard against a future tweak that pushes the
+        // budget past the freeze coordinator's rendezvous window.
+        // 2 s gives ~2.3x headroom over the current 862 ms schedule
+        // while still staying well below the typical 30 s freeze
+        // timeout.
+        assert!(
+            total <= Duration::from_secs(2),
+            "total EINTR budget must be ≤ 2 s to stay within the \
+             freeze rendezvous window; got {total:?}"
         );
     }
 }

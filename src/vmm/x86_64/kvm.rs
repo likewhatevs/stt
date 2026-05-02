@@ -233,16 +233,19 @@ impl KtstrKvm {
 
         let vm_fd = crate::vmm::create_vm_with_retry(&kvm)?;
 
-        // TSS (required on x86_64 before creating vCPUs)
+        // TSS (required on x86_64 before creating vCPUs). Maps
+        // transient host errnos (ENOMEM, EBUSY) into
+        // ResourceContention so the macro SKIPs cleanly instead of
+        // panicking under host-resource pressure.
         vm_fd
             .set_tss_address(KVM_TSS_ADDRESS as usize)
-            .context("set TSS")?;
+            .map_err(|e| crate::vmm::map_transient_to_contention(e, "set TSS"))?;
 
         // Identity map — one page after the 3-page TSS region.
         // Must be set before creating vCPUs.
         vm_fd
             .set_identity_map_address(KVM_IDENTITY_MAP_ADDRESS)
-            .context("set identity map address")?;
+            .map_err(|e| crate::vmm::map_transient_to_contention(e, "set identity map address"))?;
 
         // Determine whether any APIC ID exceeds the 8-bit xAPIC limit.
         // If so, use split IRQ chip (LAPIC-only in kernel) + x2APIC API.
@@ -257,7 +260,13 @@ impl KtstrKvm {
                 ..Default::default()
             };
             cap.args[0] = NUM_IOAPIC_PINS;
-            vm_fd.enable_cap(&cap).context("enable split IRQ chip")?;
+            // KVM_CAP_SPLIT_IRQCHIP allocates the in-kernel LAPIC
+            // tables and sets up the userspace IRQ routing slots.
+            // ENOMEM under host pressure is transient — route through
+            // the contention classifier so the macro SKIPs cleanly.
+            vm_fd.enable_cap(&cap).map_err(|e| {
+                crate::vmm::map_transient_to_contention(e, "enable split IRQ chip")
+            })?;
 
             // Enable x2APIC API for 32-bit destination IDs and correct
             // broadcast behavior with APIC IDs > 254.
@@ -270,7 +279,9 @@ impl KtstrKvm {
             vm_fd.enable_cap(&cap).context("enable x2APIC API")?;
         } else {
             // Full IRQ chip (PIC + IOAPIC + LAPIC) — must exist before KVM_CREATE_VCPU
-            vm_fd.create_irq_chip().context("create IRQ chip")?;
+            vm_fd
+                .create_irq_chip()
+                .map_err(|e| crate::vmm::map_transient_to_contention(e, "create IRQ chip"))?;
 
             // PIT (timer) with dummy speaker port.
             // Only created with full IRQ chip — PIT routes through the in-kernel
@@ -280,7 +291,9 @@ impl KtstrKvm {
                 flags: KVM_PIT_SPEAKER_DUMMY,
                 ..Default::default()
             };
-            vm_fd.create_pit2(pit_config).context("create PIT")?;
+            vm_fd
+                .create_pit2(pit_config)
+                .map_err(|e| crate::vmm::map_transient_to_contention(e, "create PIT"))?;
         }
 
         // Disable PAUSE and HLT VM exits in performance mode.
@@ -366,13 +379,17 @@ impl KtstrKvm {
             .get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
             .context("get_supported_cpuid")?;
 
-        // Create vCPUs with topology-specific CPUID
+        // Create vCPUs with topology-specific CPUID. KVM_CREATE_VCPU
+        // allocates per-vCPU kernel memory (struct kvm_vcpu, kvm_run
+        // page, posted-interrupt descriptor); EMFILE / ENOMEM here is
+        // host-resource pressure, not a test fault — route through
+        // the contention classifier so the macro SKIPs cleanly.
         let total = topo.total_cpus();
         let mut vcpus = Vec::with_capacity(total as usize);
         for cpu_id in 0..total {
-            let vcpu = vm_fd
-                .create_vcpu(cpu_id as u64)
-                .with_context(|| format!("create vCPU {cpu_id}"))?;
+            let vcpu = vm_fd.create_vcpu(cpu_id as u64).map_err(|e| {
+                crate::vmm::map_transient_to_contention(e, format!("create vCPU {cpu_id}"))
+            })?;
 
             let cpuid_entries =
                 generate_cpuid(base_cpuid.as_slice(), &topo, cpu_id, performance_mode);

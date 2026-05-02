@@ -255,16 +255,23 @@ impl KtstrKvm {
         }
 
         for cpu_id in 0..total {
-            let vcpu = vm_fd
-                .create_vcpu(cpu_id as u64)
-                .with_context(|| format!("create vCPU {cpu_id}"))?;
+            // KVM_CREATE_VCPU allocates per-vCPU kernel state; map
+            // EMFILE/ENOMEM to ResourceContention so the macro SKIPs
+            // cleanly on host-resource pressure.
+            let vcpu = vm_fd.create_vcpu(cpu_id as u64).map_err(|e| {
+                crate::vmm::map_transient_to_contention(e, format!("create vCPU {cpu_id}"))
+            })?;
 
             let mut vcpu_kvi = kvi;
             if cpu_id != 0 {
                 vcpu_kvi.features[0] |= 1 << kvm_bindings::KVM_ARM_VCPU_POWER_OFF;
             }
-            vcpu.vcpu_init(&vcpu_kvi)
-                .with_context(|| format!("init vCPU {cpu_id}"))?;
+            // KVM_ARM_VCPU_INIT allocates the per-vCPU register
+            // file and finalises feature bits; ENOMEM under host
+            // pressure is transient.
+            vcpu.vcpu_init(&vcpu_kvi).map_err(|e| {
+                crate::vmm::map_transient_to_contention(e, format!("init vCPU {cpu_id}"))
+            })?;
 
             vcpus.push(vcpu);
         }
@@ -314,9 +321,12 @@ impl KtstrKvm {
             fd: 0,
             flags: 0,
         };
+        // KVM_CREATE_DEVICE allocates the GICv3 distributor +
+        // redistributor tables. ENOMEM under host pressure is
+        // transient — route through map_transient_to_contention.
         let gic_fd = vm_fd
             .create_device(&mut gic_device)
-            .context("create GICv3 device")?;
+            .map_err(|e| crate::vmm::map_transient_to_contention(e, "create GICv3 device"))?;
 
         // Set number of IRQs.
         let nr_irqs: u32 = GIC_NR_IRQS;
@@ -362,7 +372,9 @@ impl KtstrKvm {
             .set_device_attr(&redist_attr)
             .context("set GIC redistributor address")?;
 
-        // Initialize the GIC.
+        // Initialize the GIC. KVM_DEV_ARM_VGIC_CTRL_INIT allocates
+        // the per-vcpu redistributor tables and finalises the
+        // distributor; ENOMEM under host pressure is transient.
         let init_attr = kvm_device_attr {
             group: KVM_DEV_ARM_VGIC_GRP_CTRL,
             attr: KVM_DEV_ARM_VGIC_CTRL_INIT as u64,
@@ -371,7 +383,7 @@ impl KtstrKvm {
         };
         gic_fd
             .set_device_attr(&init_attr)
-            .context("init GIC device")?;
+            .map_err(|e| crate::vmm::map_transient_to_contention(e, "init GIC device"))?;
 
         Ok(gic_fd)
     }
@@ -398,9 +410,12 @@ impl KtstrKvm {
                 },
             };
         }
-        vm_fd
-            .set_gsi_routing(&routing)
-            .context("set GSI routing for serial IRQs")?;
+        // KVM_SET_GSI_ROUTING allocates a kernel-side routing table
+        // (kfree_rcu replaces the old one); ENOMEM under host
+        // pressure is transient.
+        vm_fd.set_gsi_routing(&routing).map_err(|e| {
+            crate::vmm::map_transient_to_contention(e, "set GSI routing for serial IRQs")
+        })?;
         Ok(())
     }
 
