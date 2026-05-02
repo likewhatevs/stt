@@ -120,6 +120,24 @@ fn live_host_pipeline_inside_guest_produces_expected_shape(
     let accessor = match BpfSyscallAccessor::from_running_kernel() {
         Ok(a) => a,
         Err(e) => {
+            // Diagnostic: dump /proc/self/status to understand
+            // why BPF_MAP_GET_NEXT_ID returned EPERM despite running
+            // as PID 1.
+            let status = std::fs::read_to_string("/proc/self/status")
+                .unwrap_or_else(|e| format!("(read /proc/self/status: {e})"));
+            let pid = unsafe { libc::getpid() };
+            let euid = unsafe { libc::geteuid() };
+            let mut diagnostic = format!(
+                "pid={pid} euid={euid}\n--- /proc/self/status ---\n{status}\n",
+            );
+            // Also try to read /proc/sys/kernel/unprivileged_bpf_disabled
+            if let Ok(v) = std::fs::read_to_string("/proc/sys/kernel/unprivileged_bpf_disabled") {
+                diagnostic.push_str(&format!("--- unprivileged_bpf_disabled ---\n{v}"));
+            }
+            // Check if /sys/kernel/security/lockdown reports lockdown state
+            if let Ok(v) = std::fs::read_to_string("/sys/kernel/security/lockdown") {
+                diagnostic.push_str(&format!("--- /sys/kernel/security/lockdown ---\n{v}"));
+            }
             return Ok(AssertResult::fail(AssertDetail::new(
                 DetailKind::Other,
                 format!(
@@ -129,7 +147,7 @@ fn live_host_pipeline_inside_guest_produces_expected_shape(
                      here means BPF_MAP_GET_NEXT_ID returned a kernel \
                      error other than ENOENT (the end-of-iteration \
                      sentinel), which would indicate a deeper BPF \
-                     subsystem problem"
+                     subsystem problem.\n\nDIAGNOSTIC:\n{diagnostic}"
                 ),
             )));
         }

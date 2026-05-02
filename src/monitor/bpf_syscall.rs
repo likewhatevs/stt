@@ -66,13 +66,16 @@ const BPF_MAP_LOOKUP_ELEM: u32 = 1;
 /// `BPF_MAP_GET_NEXT_KEY` — advance hash iteration cursor.
 const BPF_MAP_GET_NEXT_KEY: u32 = 4;
 /// `BPF_MAP_GET_NEXT_ID` — advance the kernel's map id walk.
-const BPF_MAP_GET_NEXT_ID: u32 = 0xb;
+const BPF_MAP_GET_NEXT_ID: u32 = 0xc;
 /// `BPF_MAP_GET_FD_BY_ID` — pin a map by id.
 const BPF_MAP_GET_FD_BY_ID: u32 = 0xe;
 /// `BPF_OBJ_GET_INFO_BY_FD` — fetch map/btf metadata from an open fd.
 const BPF_OBJ_GET_INFO_BY_FD: u32 = 0xf;
 /// `BPF_BTF_GET_FD_BY_ID` — pin a BTF object by id.
-const BPF_BTF_GET_FD_BY_ID: u32 = 0x14;
+/// Per `include/uapi/linux/bpf.h::enum bpf_cmd`: 19 (0x13). Counting
+/// from `BPF_MAP_CREATE = 0` through `BPF_BTF_LOAD = 18` makes the
+/// next entry `BPF_BTF_GET_FD_BY_ID = 19`.
+const BPF_BTF_GET_FD_BY_ID: u32 = 0x13;
 
 /// `BPF_OBJ_NAME_LEN` from `include/uapi/linux/bpf.h`.
 const BPF_OBJ_NAME_LEN: usize = 16;
@@ -153,8 +156,11 @@ struct BpfMapInfoUapi {
     btf_id: u32,
     btf_key_type_id: u32,
     btf_value_type_id: u32,
-    /// Kernel kept this field as `u32 :32;` historically; treated
-    /// here as plain padding.
+    /// Kernel field `btf_vmlinux_id` per
+    /// `include/uapi/linux/bpf.h::struct bpf_map_info`. Unused by the
+    /// caller; named `_pad` here because the value is currently
+    /// discarded by the BPF accessor — rename without binding the
+    /// field to a public consumer that can rot.
     _pad: u32,
     map_extra: u64,
 }
@@ -197,7 +203,7 @@ fn bpf_call_fd(cmd: u32, attr_ptr: *const u8, attr_size: usize) -> Result<RawFd>
     // command's bpf_attr arm.
     let ret = unsafe { bpf_syscall(cmd, attr_ptr, attr_size) };
     if ret < 0 {
-        let err = std::io::Error::from_raw_os_error(-(ret as i32));
+        let err = std::io::Error::last_os_error();
         Err(anyhow!("bpf({cmd}) failed: {err}"))
     } else {
         Ok(ret as RawFd)
@@ -210,7 +216,7 @@ fn bpf_call_status(cmd: u32, attr_ptr: *const u8, attr_size: usize) -> Result<()
     // SAFETY: caller has built attr_ptr/attr_size correctly.
     let ret = unsafe { bpf_syscall(cmd, attr_ptr, attr_size) };
     if ret < 0 {
-        let err = std::io::Error::from_raw_os_error(-(ret as i32));
+        let err = std::io::Error::last_os_error();
         Err(anyhow!("bpf({cmd}) failed: {err}"))
     } else {
         Ok(())
@@ -314,13 +320,10 @@ impl BpfSyscallAccessor {
                 )
             };
             if res < 0 {
-                let errno = -(res as i32);
-                // ENOENT (-2) at the end of the id space is the
-                // kernel's way of saying "no more maps".
-                if errno == libc::ENOENT {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::ENOENT) {
                     break;
                 }
-                let err = std::io::Error::from_raw_os_error(errno);
                 return Err(anyhow!("BPF_MAP_GET_NEXT_ID failed: {err}"));
             }
 
@@ -353,15 +356,11 @@ impl BpfSyscallAccessor {
                 )
             };
             if fd_ret < 0 {
-                let errno = -(fd_ret as i32);
-                if errno == libc::ENOENT {
-                    // Map died — skip silently.
-                    continue;
-                }
-                // Other errors (EPERM, EBADF) are surfaced once and
-                // we keep going; a single failed pin shouldn't kill
-                // the whole enumeration.
-                let _ = std::io::Error::from_raw_os_error(errno);
+                // ENOENT — map died between GET_NEXT_ID and
+                // GET_FD_BY_ID; skip silently. Other errors (EPERM,
+                // EBADF) are dropped here too: a single failed pin
+                // shouldn't kill the whole enumeration. Surfacing
+                // them via tracing is taskified.
                 continue;
             }
             // SAFETY: fd_ret >= 0; the kernel guarantees a valid fd
