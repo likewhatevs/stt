@@ -2836,7 +2836,7 @@ mod tests {
         let b = sidecar_variant_hash(&SidecarResult::test_fixture());
         assert_eq!(a, b, "two fresh fixtures must hash identically");
         assert_eq!(
-            a, 0x55f6b9881e152f8c,
+            a, 0x95f45cfb2df24fa1,
             "fixture hash drifted — update only if the fixture default \
              change is intentional; verify every call site that passes \
              the fixture straight into sidecar_variant_hash still expresses \

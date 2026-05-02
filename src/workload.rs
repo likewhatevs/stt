@@ -747,6 +747,133 @@ pub enum WorkType {
         /// rotating sweep.
         target_nodes: Vec<usize>,
     },
+    /// Workers cycle their cgroup membership between sibling cgroups
+    /// every `cycle_ms`, rewriting `cgroup.procs` to drive
+    /// `sched_move_task` (`kernel/sched/core.c`) and the registered
+    /// `scx_cgroup_move_task` ops callback. Distinct from
+    /// [`AffinityChurn`](Self::AffinityChurn): that variant rotates
+    /// `task_struct->cpus_ptr` (cpuset membership) and never moves
+    /// the task between cgroup containers; `CgroupChurn` rotates
+    /// the cgroup itself, which takes the cgroup_threadgroup_rwsem
+    /// write lock and exercises the per-class `sched_move_task` /
+    /// `task_change_group` callbacks. Zero coverage today.
+    ///
+    /// Sibling cgroups must already exist under the worker's parent
+    /// cgroup with names `wt-cgroup-churn-<i>` for `i in
+    /// 0..groups`; the test harness or scenario setup creates them.
+    /// Each iteration the worker writes its tid to the next sibling
+    /// in rotation. `worker_group_size = None` (any worker count
+    /// valid; each worker rotates independently). Per-iteration
+    /// budget is one `write` syscall to `cgroup.procs`.
+    CgroupChurn {
+        /// Number of sibling cgroups to rotate through. The harness
+        /// creates `wt-cgroup-churn-0` … `wt-cgroup-churn-(groups-1)`
+        /// before spawn.
+        groups: usize,
+        /// Wall-clock interval between cgroup rewrites (ms). Lower
+        /// values increase contention on `cgroup_threadgroup_rwsem`
+        /// and the per-class `task_change_group` paths.
+        cycle_ms: u64,
+    },
+    /// Paired workers signal each other with `kill(partner,
+    /// SIGUSR1)`. Each worker installs a SIGUSR1 handler via
+    /// `sigaction`, then alternates: do `work_iters` of CPU work,
+    /// fire `signals_per_iter` signals at the partner, repeat.
+    /// Exercises `signal_wake_up_state` (`kernel/signal.c`) and the
+    /// per-task `sighand->siglock`, which is distinct from the
+    /// futex `pi_lock` path. The wake itself goes through
+    /// `kick_process` / `smp_send_reschedule`, not
+    /// `ttwu_queue_wakelist`.
+    ///
+    /// Workers are paired (0,1), (2,3), … so `worker_group_size = 2`
+    /// and `num_workers` must be even. Partner tids are exchanged
+    /// via the existing pair shared-memory region. The signal
+    /// handler is a no-op SA_RESTART handler; its only purpose is
+    /// to trip `TIF_SIGPENDING` on the partner and force the
+    /// scheduler through the signal-delivery wake path.
+    SignalStorm {
+        /// Number of `kill(partner, SIGUSR1)` calls per iteration.
+        signals_per_iter: u64,
+        /// CPU-spin iterations between bursts of signals.
+        work_iters: u64,
+    },
+    /// Mixed RT + CFS preemption pressure. One worker per group runs
+    /// as `SCHED_FIFO` doing `rt_burst_iters` of CPU work followed
+    /// by `clock_nanosleep(rt_sleep_us)`; the remaining
+    /// `cfs_workers` workers run as `SCHED_NORMAL` and spin
+    /// continuously. Each RT wake (post-`nanosleep`) hits
+    /// `wakeup_preempt` (`kernel/sched/core.c`) → `resched_curr`,
+    /// preempting the CFS worker on the same CPU. Drives sustained
+    /// `nonvoluntary_ctxt_switches` on the CFS workers.
+    ///
+    /// Distinct from [`RtStarvation`](Self::RtStarvation) which
+    /// monopolises the CPU at 100% RT (and relies on
+    /// `sysctl_sched_rt_runtime_us=-1`) and from
+    /// [`PriorityInversion`](Self::PriorityInversion) which uses a
+    /// PI-aware lock chain. `PreemptStorm` is the
+    /// "RT-flickers-and-preempts" pathology: short bursts at high
+    /// frequency, no monopolisation.
+    ///
+    /// `worker_group_size = cfs_workers + 1`. Worker index 0 in
+    /// each group is the RT worker; indices 1..=cfs_workers are
+    /// CFS spinners. RT priority defaults to 1 (lowest above
+    /// `SCHED_NORMAL`); raise the priority via the host
+    /// `RLIMIT_RTPRIO` and `CAP_SYS_NICE` are present.
+    PreemptStorm {
+        /// Number of CFS spinners per group. Set to the host CPU
+        /// count for full preemption coverage.
+        cfs_workers: usize,
+        /// CPU-spin iterations the RT worker burns between
+        /// nanosleep gaps.
+        rt_burst_iters: u64,
+        /// `clock_nanosleep` interval between RT bursts (us). 1000
+        /// gives ~1 kHz RT preemption rate.
+        rt_sleep_us: u64,
+    },
+    /// Producers / consumers connected by a single eventfd +
+    /// epoll_wait pair. Producers `write(eventfd, &1u64)` in a
+    /// burst loop; consumers wait in `epoll_wait(maxevents=1)`,
+    /// `read` the counter, and burn one CPU-burst before re-arming
+    /// the wait. Exercises `__wake_up_common` (`kernel/sched/wait.c`)
+    /// with exclusive autoremove — ONE wake per event, distinct
+    /// from [`ThunderingHerd`](Self::ThunderingHerd)'s broadcast
+    /// futex wake. Hits `scx_select_cpu_dfl` WITHOUT the
+    /// `SCX_WAKE_SYNC` fast-path because `epoll_wait` is not a
+    /// sync wakeup primitive.
+    ///
+    /// `worker_group_size = producers + consumers`; needs shared
+    /// memory for the eventfd / epoll fd handoff between sibling
+    /// workers. Producers' `events_per_burst` controls how many
+    /// `write`s they issue back-to-back before one `nanosleep` gap
+    /// (paces production rate without per-event sleep overhead).
+    EpollStorm {
+        /// Number of producer workers per group. Each writes
+        /// `events_per_burst` events per cycle.
+        producers: usize,
+        /// Number of consumer workers per group. Each does one
+        /// `epoll_wait` + `read` + spin-burst per event.
+        consumers: usize,
+        /// Producer burst size (events per write loop).
+        events_per_burst: u64,
+    },
+    /// Workers rotate `sched_setaffinity` across NUMA nodes every
+    /// `period_ms`. Reads online NUMA nodes from
+    /// `/sys/devices/system/node/online` at startup, then cycles
+    /// the worker through one node's CPUs per period. Exercises
+    /// task migration via `select_task_rq` (`kernel/sched/core.c`)
+    /// with the `WF_MIGRATED` flag and, on sched_ext, the
+    /// `SCX_OPS_BUILTIN_IDLE_PER_NODE` branch of `scx_select_cpu_dfl`.
+    ///
+    /// Distinct from [`NumaWorkingSetSweep`](Self::NumaWorkingSetSweep)
+    /// which moves the working-set MEMORY across nodes via `mbind`;
+    /// `NumaMigrationChurn` moves the TASK across nodes via
+    /// `sched_setaffinity`. `worker_group_size = None`. On hosts
+    /// with one NUMA node, the variant degenerates to a no-op
+    /// (every iteration re-pins to the same node).
+    NumaMigrationChurn {
+        /// Wall-clock interval between affinity rotations (ms).
+        period_ms: u64,
+    },
 }
 
 /// Named defaults for the parametric [`WorkType`] variants, used by
@@ -825,6 +952,22 @@ pub mod defaults {
     // NumaWorkingSetSweep
     pub const NUMA_WORKING_SET_SWEEP_REGION_KB: usize = 4_096;
     pub const NUMA_WORKING_SET_SWEEP_SWEEP_PERIOD_MS: u64 = 100;
+    // CgroupChurn
+    pub const CGROUP_CHURN_GROUPS: usize = 2;
+    pub const CGROUP_CHURN_CYCLE_MS: u64 = 100;
+    // SignalStorm
+    pub const SIGNAL_STORM_SIGNALS_PER_ITER: u64 = 16;
+    pub const SIGNAL_STORM_WORK_ITERS: u64 = 1024;
+    // PreemptStorm
+    pub const PREEMPT_STORM_CFS_WORKERS: usize = 2;
+    pub const PREEMPT_STORM_RT_BURST_ITERS: u64 = 1024;
+    pub const PREEMPT_STORM_RT_SLEEP_US: u64 = 1_000;
+    // EpollStorm
+    pub const EPOLL_STORM_PRODUCERS: usize = 1;
+    pub const EPOLL_STORM_CONSUMERS: usize = 2;
+    pub const EPOLL_STORM_EVENTS_PER_BURST: u64 = 32;
+    // NumaMigrationChurn
+    pub const NUMA_MIGRATION_CHURN_PERIOD_MS: u64 = 100;
 }
 
 impl WorkType {
@@ -871,6 +1014,11 @@ impl WorkType {
             WorkType::AsymmetricWaker { .. } => "AsymmetricWaker",
             WorkType::WakeChain { .. } => "WakeChain",
             WorkType::NumaWorkingSetSweep { .. } => "NumaWorkingSetSweep",
+            WorkType::CgroupChurn { .. } => "CgroupChurn",
+            WorkType::SignalStorm { .. } => "SignalStorm",
+            WorkType::PreemptStorm { .. } => "PreemptStorm",
+            WorkType::EpollStorm { .. } => "EpollStorm",
+            WorkType::NumaMigrationChurn { .. } => "NumaMigrationChurn",
         }
     }
 
@@ -982,6 +1130,27 @@ impl WorkType {
                 // list via the constructor.
                 target_nodes: Vec::new(),
             }),
+            "CgroupChurn" => Some(WorkType::CgroupChurn {
+                groups: defaults::CGROUP_CHURN_GROUPS,
+                cycle_ms: defaults::CGROUP_CHURN_CYCLE_MS,
+            }),
+            "SignalStorm" => Some(WorkType::SignalStorm {
+                signals_per_iter: defaults::SIGNAL_STORM_SIGNALS_PER_ITER,
+                work_iters: defaults::SIGNAL_STORM_WORK_ITERS,
+            }),
+            "PreemptStorm" => Some(WorkType::PreemptStorm {
+                cfs_workers: defaults::PREEMPT_STORM_CFS_WORKERS,
+                rt_burst_iters: defaults::PREEMPT_STORM_RT_BURST_ITERS,
+                rt_sleep_us: defaults::PREEMPT_STORM_RT_SLEEP_US,
+            }),
+            "EpollStorm" => Some(WorkType::EpollStorm {
+                producers: defaults::EPOLL_STORM_PRODUCERS,
+                consumers: defaults::EPOLL_STORM_CONSUMERS,
+                events_per_burst: defaults::EPOLL_STORM_EVENTS_PER_BURST,
+            }),
+            "NumaMigrationChurn" => Some(WorkType::NumaMigrationChurn {
+                period_ms: defaults::NUMA_MIGRATION_CHURN_PERIOD_MS,
+            }),
             // Sequence requires explicit phases; no default from_name.
             _ => None,
         }
@@ -1072,6 +1241,22 @@ impl WorkType {
             // the per-chain size; num_workers must equal
             // depth * fanout.
             WorkType::WakeChain { depth, .. } => Some(*depth),
+            // SignalStorm: paired (waker / wakee), num_workers
+            // must be even. Each pair shares the partner-tid
+            // exchange region.
+            WorkType::SignalStorm { .. } => Some(2),
+            // PreemptStorm: 1 RT worker + cfs_workers CFS spinners
+            // share the same affinity-constrained scheduling
+            // domain so the RT preempts on the same CPU.
+            WorkType::PreemptStorm { cfs_workers, .. } => Some(cfs_workers + 1),
+            // EpollStorm: producers + consumers share the eventfd
+            // / epoll fd handoff. One group per (producers,
+            // consumers) tuple.
+            WorkType::EpollStorm {
+                producers,
+                consumers,
+                ..
+            } => Some(producers + consumers),
             _ => None,
         }
     }
@@ -1099,6 +1284,9 @@ impl WorkType {
                 | WorkType::AsymmetricWaker { .. }
                 | WorkType::WakeChain { .. }
                 | WorkType::RtStarvation { .. }
+                | WorkType::SignalStorm { .. }
+                | WorkType::PreemptStorm { .. }
+                | WorkType::EpollStorm { .. }
         )
     }
 
@@ -1314,6 +1502,42 @@ impl WorkType {
             sweep_period_ms,
             target_nodes: target_nodes.into_iter().collect(),
         }
+    }
+
+    /// Construct a [`WorkType::CgroupChurn`].
+    pub fn cgroup_churn(groups: usize, cycle_ms: u64) -> Self {
+        WorkType::CgroupChurn { groups, cycle_ms }
+    }
+
+    /// Construct a [`WorkType::SignalStorm`].
+    pub fn signal_storm(signals_per_iter: u64, work_iters: u64) -> Self {
+        WorkType::SignalStorm {
+            signals_per_iter,
+            work_iters,
+        }
+    }
+
+    /// Construct a [`WorkType::PreemptStorm`].
+    pub fn preempt_storm(cfs_workers: usize, rt_burst_iters: u64, rt_sleep_us: u64) -> Self {
+        WorkType::PreemptStorm {
+            cfs_workers,
+            rt_burst_iters,
+            rt_sleep_us,
+        }
+    }
+
+    /// Construct a [`WorkType::EpollStorm`].
+    pub fn epoll_storm(producers: usize, consumers: usize, events_per_burst: u64) -> Self {
+        WorkType::EpollStorm {
+            producers,
+            consumers,
+            events_per_burst,
+        }
+    }
+
+    /// Construct a [`WorkType::NumaMigrationChurn`].
+    pub fn numa_migration_churn(period_ms: u64) -> Self {
+        WorkType::NumaMigrationChurn { period_ms }
     }
 
     /// User-supplied work function with a display name.
@@ -6490,6 +6714,335 @@ fn worker_main(
                 last_iter_time = Instant::now();
                 iterations += 1;
             }
+            WorkType::CgroupChurn { groups, cycle_ms } => {
+                // Rotate the worker's cgroup membership by writing
+                // tid to `wt-cgroup-churn-<i>/cgroup.procs` under
+                // the worker's parent cgroup. Drives
+                // `sched_move_task` and the `scx_cgroup_move_task`
+                // ops callback. The host-side scenario harness is
+                // responsible for creating the sibling cgroups; if
+                // they are absent the open() fails and the worker
+                // logs once and continues spinning so the variant
+                // is observable but does not panic on a
+                // misconfigured topology.
+                let target_idx = (iterations as usize) % groups.max(1);
+                let path = format!(
+                    "/sys/fs/cgroup/wt-cgroup-churn-{}/cgroup.procs",
+                    target_idx
+                );
+                let tid_str = format!("{}\n", tid);
+                match std::fs::OpenOptions::new().write(true).open(&path) {
+                    Ok(mut f) => {
+                        use std::io::Write;
+                        if let Err(e) = f.write_all(tid_str.as_bytes()) {
+                            tracing::warn!(?e, %path, "CgroupChurn write failed");
+                        }
+                    }
+                    Err(e) => {
+                        // Missing-cgroup is the typical
+                        // misconfiguration. Log once per worker per
+                        // iteration via tracing's rate-limited path
+                        // (best-effort; worker keeps spinning).
+                        tracing::warn!(?e, %path, "CgroupChurn open failed");
+                    }
+                }
+                if cycle_ms > 0 && !stop_requested(stop) {
+                    std::thread::sleep(Duration::from_millis(cycle_ms));
+                }
+                spin_burst(&mut work_units, 256);
+                last_iter_time = Instant::now();
+                iterations += 1;
+            }
+            WorkType::SignalStorm {
+                signals_per_iter,
+                work_iters,
+            } => {
+                // Paired SIGUSR1 storm. Each worker installs a
+                // no-op SIGUSR1 handler once and exchanges its tid
+                // with the partner via the per-pair futex shared
+                // region (slot 0 = worker 0's tid, slot 1 = worker
+                // 1's tid). Once both slots are populated, each
+                // worker fires `signals_per_iter` `kill` syscalls
+                // at the partner per iteration, with a
+                // `work_iters` CPU spin between bursts. Exercises
+                // `signal_wake_up_state` + `sighand->siglock`.
+                use std::sync::Once;
+                use std::sync::atomic::AtomicU32;
+                static SIG_HANDLER_INSTALLED: Once = Once::new();
+                SIG_HANDLER_INSTALLED.call_once(|| {
+                    extern "C" fn handler(_: libc::c_int) {}
+                    let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
+                    sa.sa_sigaction = handler as usize;
+                    sa.sa_flags = libc::SA_RESTART;
+                    unsafe {
+                        libc::sigemptyset(&mut sa.sa_mask);
+                        libc::sigaction(libc::SIGUSR1, &sa, std::ptr::null_mut());
+                    }
+                });
+                let (futex_ptr, pos) = match futex {
+                    Some(f) => f,
+                    None => break,
+                };
+                // SAFETY: `futex_ptr` is a stable mmap region the
+                // spawn-side allocated for this group; the first 8
+                // bytes hold two u32 tid slots (one per pair
+                // member). The cast from `*mut u32` to `*mut
+                // AtomicU32` is sound because `AtomicU32` and
+                // `u32` have the same in-memory layout (atomics
+                // doc).
+                let slots = futex_ptr as *mut AtomicU32;
+                let self_slot_idx = pos & 1;
+                let partner_slot_idx = self_slot_idx ^ 1;
+                unsafe {
+                    (*slots.add(self_slot_idx)).store(tid as u32, Ordering::Release);
+                }
+                let partner_tid =
+                    unsafe { (*slots.add(partner_slot_idx)).load(Ordering::Acquire) as i32 };
+                if partner_tid != 0 {
+                    for _ in 0..signals_per_iter {
+                        unsafe {
+                            libc::kill(partner_tid, libc::SIGUSR1);
+                        }
+                        work_units = std::hint::black_box(work_units.wrapping_add(1));
+                    }
+                }
+                spin_burst(&mut work_units, work_iters);
+                last_iter_time = Instant::now();
+                iterations += 1;
+            }
+            WorkType::PreemptStorm {
+                cfs_workers: _,
+                rt_burst_iters,
+                rt_sleep_us,
+            } => {
+                // Worker 0 in the group runs as SCHED_FIFO at
+                // priority 1 with a burst+nanosleep loop; workers
+                // 1..=cfs_workers stay on SCHED_NORMAL and spin.
+                // Each RT wake (post-nanosleep) hits
+                // `wakeup_preempt` → `resched_curr` against the
+                // CFS sibling on the same CPU. The PER_POS_RT_APPLIED
+                // latch is per-process so the FIFO promotion runs
+                // exactly once per worker.
+                let pos = match futex {
+                    Some((_, p)) => p,
+                    // Without the per-pos shared region we cannot
+                    // distinguish RT from CFS — fall back to all
+                    // CFS spinning so the variant is observable
+                    // even if spawn-side wiring drops the futex.
+                    None => 1,
+                };
+                static PER_POS_RT_APPLIED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                let is_rt = pos == 0;
+                if is_rt && !PER_POS_RT_APPLIED.swap(true, Ordering::Relaxed) {
+                    let param = libc::sched_param { sched_priority: 1 };
+                    let rc =
+                        unsafe { libc::sched_setscheduler(0, libc::SCHED_FIFO, &param) };
+                    if rc != 0 {
+                        tracing::warn!(
+                            errno = std::io::Error::last_os_error().raw_os_error(),
+                            "PreemptStorm sched_setscheduler(FIFO) failed \
+                             (need CAP_SYS_NICE / RLIMIT_RTPRIO)"
+                        );
+                    }
+                }
+                spin_burst(&mut work_units, rt_burst_iters);
+                if is_rt && rt_sleep_us > 0 && !stop_requested(stop) {
+                    let req = libc::timespec {
+                        tv_sec: (rt_sleep_us / 1_000_000) as libc::time_t,
+                        tv_nsec: ((rt_sleep_us % 1_000_000) * 1_000) as libc::c_long,
+                    };
+                    unsafe {
+                        libc::clock_nanosleep(
+                            libc::CLOCK_MONOTONIC,
+                            0,
+                            &req,
+                            std::ptr::null_mut(),
+                        );
+                    }
+                }
+                last_iter_time = Instant::now();
+                iterations += 1;
+            }
+            WorkType::EpollStorm {
+                producers,
+                consumers: _,
+                events_per_burst,
+            } => {
+                // Producers `eventfd_write` in bursts; consumers
+                // `epoll_wait(maxevents=1)` + read counter + spin.
+                // Per-pos role: indices [0, producers) are
+                // producers; the rest are consumers. The eventfd
+                // and epoll fd are stored in the per-group
+                // shared-memory region: u64 slot 0 = eventfd + 1,
+                // u64 slot 1 = epoll fd + 1 (the +1 distinguishes
+                // "not yet initialised" — value 0 — from a real
+                // fd of 0). Worker pos 0 (the first producer)
+                // creates them on its first iteration; siblings
+                // busy-spin on the slots until they appear.
+                use std::sync::atomic::AtomicU64;
+                let (futex_ptr, pos) = match futex {
+                    Some(f) => f,
+                    None => break,
+                };
+                // SAFETY: spawn-side allocates a shared region
+                // sized for at least 16 bytes; reinterpreting the
+                // first two u64s as `AtomicU64` is sound (same
+                // layout as `u64`).
+                let slots = futex_ptr as *mut AtomicU64;
+                let efd_slot = unsafe { &*slots };
+                let epfd_slot = unsafe { &*slots.add(1) };
+                let is_producer = pos < producers;
+                if pos == 0 && efd_slot.load(Ordering::Acquire) == 0 {
+                    let efd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
+                    let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+                    if efd >= 0 && epfd >= 0 {
+                        let mut ev = libc::epoll_event {
+                            events: libc::EPOLLIN as u32,
+                            u64: 0,
+                        };
+                        unsafe {
+                            libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, efd, &mut ev);
+                        }
+                        efd_slot.store(efd as u64 + 1, Ordering::Release);
+                        epfd_slot.store(epfd as u64 + 1, Ordering::Release);
+                    }
+                }
+                let efd_raw = efd_slot.load(Ordering::Acquire);
+                let epfd_raw = epfd_slot.load(Ordering::Acquire);
+                if efd_raw == 0 || epfd_raw == 0 {
+                    spin_burst(&mut work_units, 256);
+                } else {
+                    let efd = (efd_raw - 1) as libc::c_int;
+                    let epfd = (epfd_raw - 1) as libc::c_int;
+                    if is_producer {
+                        for _ in 0..events_per_burst {
+                            let one: u64 = 1;
+                            unsafe {
+                                libc::write(
+                                    efd,
+                                    &one as *const u64 as *const libc::c_void,
+                                    8,
+                                );
+                            }
+                            work_units =
+                                std::hint::black_box(work_units.wrapping_add(1));
+                        }
+                    } else {
+                        let mut ev: libc::epoll_event = unsafe { std::mem::zeroed() };
+                        let before_wait = Instant::now();
+                        let n = unsafe { libc::epoll_wait(epfd, &mut ev, 1, 100) };
+                        if n > 0 {
+                            let mut buf = [0u8; 8];
+                            unsafe {
+                                libc::read(
+                                    efd,
+                                    buf.as_mut_ptr() as *mut libc::c_void,
+                                    8,
+                                );
+                            }
+                            reservoir_push(
+                                &mut resume_latencies_ns,
+                                &mut wake_sample_count,
+                                before_wait.elapsed().as_nanos() as u64,
+                                MAX_WAKE_SAMPLES,
+                            );
+                        }
+                        spin_burst(&mut work_units, 256);
+                    }
+                }
+                last_iter_time = Instant::now();
+                iterations += 1;
+            }
+            WorkType::NumaMigrationChurn { period_ms } => {
+                // Read online NUMA nodes once at startup, then
+                // rotate sched_setaffinity through one node's CPUs
+                // per period. On hosts with one NUMA node this
+                // degenerates to re-pinning to the same node.
+                //
+                // sysfs cpulist format is comma-separated ranges or
+                // singletons (`"0-7,16-23"`); the inline parser
+                // expands every range into individual CPU ids.
+                fn parse_cpulist_inline(s: &str) -> Vec<usize> {
+                    let mut out = Vec::new();
+                    for part in s.split(',') {
+                        let part = part.trim();
+                        if part.is_empty() {
+                            continue;
+                        }
+                        if let Some((lo, hi)) = part.split_once('-') {
+                            if let (Ok(lo), Ok(hi)) =
+                                (lo.parse::<usize>(), hi.parse::<usize>())
+                            {
+                                for c in lo..=hi {
+                                    out.push(c);
+                                }
+                            }
+                        } else if let Ok(c) = part.parse::<usize>() {
+                            out.push(c);
+                        }
+                    }
+                    out
+                }
+                static NUMA_NODES: std::sync::OnceLock<Vec<Vec<usize>>> =
+                    std::sync::OnceLock::new();
+                let nodes = NUMA_NODES.get_or_init(|| {
+                    let online = std::fs::read_to_string(
+                        "/sys/devices/system/node/online",
+                    )
+                    .unwrap_or_default();
+                    let mut node_cpus: Vec<Vec<usize>> = Vec::new();
+                    for part in online.trim().split(',') {
+                        if let Some((lo, hi)) = part.split_once('-') {
+                            let lo: usize = lo.parse().unwrap_or(0);
+                            let hi: usize = hi.parse().unwrap_or(0);
+                            for n in lo..=hi {
+                                if let Ok(s) = std::fs::read_to_string(format!(
+                                    "/sys/devices/system/node/node{}/cpulist",
+                                    n
+                                )) {
+                                    node_cpus.push(parse_cpulist_inline(s.trim()));
+                                }
+                            }
+                        } else if let Ok(n) = part.parse::<usize>() {
+                            if let Ok(s) = std::fs::read_to_string(format!(
+                                "/sys/devices/system/node/node{}/cpulist",
+                                n
+                            )) {
+                                node_cpus.push(parse_cpulist_inline(s.trim()));
+                            }
+                        }
+                    }
+                    if node_cpus.is_empty() {
+                        node_cpus.push(vec![0]);
+                    }
+                    node_cpus
+                });
+                let target_node = (iterations as usize) % nodes.len();
+                let cpus = &nodes[target_node];
+                if !cpus.is_empty() {
+                    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+                    unsafe { libc::CPU_ZERO(&mut set) };
+                    for &cpu in cpus {
+                        if cpu < libc::CPU_SETSIZE as usize {
+                            unsafe { libc::CPU_SET(cpu, &mut set) };
+                        }
+                    }
+                    unsafe {
+                        libc::sched_setaffinity(
+                            0,
+                            std::mem::size_of::<libc::cpu_set_t>(),
+                            &set,
+                        );
+                    }
+                }
+                if period_ms > 0 && !stop_requested(stop) {
+                    std::thread::sleep(Duration::from_millis(period_ms));
+                }
+                spin_burst(&mut work_units, 256);
+                last_iter_time = Instant::now();
+                iterations += 1;
+            }
             WorkType::Custom { .. } => unreachable!("handled by early return"),
         }
 
@@ -7803,11 +8356,14 @@ mod tests {
         // PriorityInversion, ProducerConsumerImbalance,
         // RtStarvation, AsymmetricWaker, WakeChain,
         // NumaWorkingSetSweep)
-        // = 29. `strum::VariantNames` enumerates every variant
+        // + 5 scheduler-coverage-gap variants (CgroupChurn,
+        // SignalStorm, PreemptStorm, EpollStorm,
+        // NumaMigrationChurn)
+        // = 34. `strum::VariantNames` enumerates every variant
         // including `Custom` (the derive does not honor
         // `#[serde(skip)]` — that attribute only affects serde
         // (de)serialization, not strum reflection).
-        assert_eq!(WorkType::ALL_NAMES.len(), 29);
+        assert_eq!(WorkType::ALL_NAMES.len(), 34);
     }
 
     // -- matrix_multiply --
