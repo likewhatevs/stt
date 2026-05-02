@@ -7792,11 +7792,22 @@ mod tests {
 
     #[test]
     fn work_type_all_names_count() {
-        // 20 historical variants + 7 pathology-taxonomy variants
-        // (ThunderingHerd, PriorityInversion,
-        // ProducerConsumerImbalance, RtStarvation, AsymmetricWaker,
-        // WakeChain, NumaWorkingSetSweep) = 27.
-        assert_eq!(WorkType::ALL_NAMES.len(), 27);
+        // 20 historical variants (CpuSpin, YieldHeavy, Mixed,
+        // IoSyncWrite, IoRandRead, IoConvoy, Bursty, PipeIo,
+        // FutexPingPong, CachePressure, CacheYield, CachePipe,
+        // FutexFanOut, Sequence, ForkExit, NiceSweep,
+        // AffinityChurn, PolicyChurn, FanOutCompute, Custom)
+        // + 2 fundamental work-primitive variants (PageFaultChurn,
+        // MutexContention)
+        // + 7 pathology-taxonomy variants (ThunderingHerd,
+        // PriorityInversion, ProducerConsumerImbalance,
+        // RtStarvation, AsymmetricWaker, WakeChain,
+        // NumaWorkingSetSweep)
+        // = 29. `strum::VariantNames` enumerates every variant
+        // including `Custom` (the derive does not honor
+        // `#[serde(skip)]` — that attribute only affects serde
+        // (de)serialization, not strum reflection).
+        assert_eq!(WorkType::ALL_NAMES.len(), 29);
     }
 
     // -- matrix_multiply --
@@ -7975,20 +7986,22 @@ mod tests {
             );
             return;
         }
-        // getpriority returns 20 - nice (per glibc convention),
-        // so a nice of 5 reads back as 15. errno-clear before
-        // call because getpriority can legitimately return -1
-        // for nice=20.
+        // The Rust `libc` crate's `getpriority` is a direct binding
+        // to glibc's POSIX `getpriority(3)` wrapper, which returns
+        // the actual nice value (range -20..=19) rather than the
+        // raw syscall encoding (`20 - nice`). errno-clear before
+        // call because getpriority can legitimately return -1 for
+        // nice=-1 — only errno disambiguates -1-as-error from
+        // -1-as-nice.
         unsafe {
             *libc::__errno_location() = 0;
         }
-        let read_back = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
+        let nice_before = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
         let errno_before = unsafe { *libc::__errno_location() };
         assert_eq!(
             errno_before, 0,
-            "getpriority must succeed before apply_nice; rc={read_back}"
+            "getpriority must succeed before apply_nice; rc={nice_before}"
         );
-        let nice_before = 20 - read_back;
         assert_eq!(
             nice_before, 5,
             "setpriority must have stuck before apply_nice runs"
@@ -8000,10 +8013,9 @@ mod tests {
         unsafe {
             *libc::__errno_location() = 0;
         }
-        let read_back2 = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
+        let nice_after = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
         let errno_after = unsafe { *libc::__errno_location() };
         assert_eq!(errno_after, 0, "getpriority must succeed after apply_nice");
-        let nice_after = 20 - read_back2;
         assert_eq!(
             nice_after, 5,
             "apply_nice(0) must not touch nice — observed change \

@@ -514,11 +514,17 @@ fn render_sched_policy(p: &SchedPolicy) -> String {
         SchedPolicy::Idle => "SchedPolicy::Idle".into(),
         SchedPolicy::Fifo(prio) => format!("SchedPolicy::Fifo({prio})"),
         SchedPolicy::RoundRobin(prio) => format!("SchedPolicy::RoundRobin({prio})"),
-        // Deadline serializes as the builder constructor since the
-        // SchedPolicy::Deadline tuple variant carries 3 Duration
-        // fields and a literal struct expr would need feature
-        // gates.
-        _ => "SchedPolicy::Normal /* TODO: refine deadline params */".into(),
+        SchedPolicy::Deadline {
+            runtime,
+            deadline,
+            period,
+        } => format!(
+            "SchedPolicy::Deadline {{ runtime: Duration::from_nanos({}), \
+             deadline: Duration::from_nanos({}), period: Duration::from_nanos({}) }}",
+            runtime.as_nanos(),
+            deadline.as_nanos(),
+            period.as_nanos(),
+        ),
     }
 }
 
@@ -695,7 +701,12 @@ mod tests {
     }
 
     /// `render_run_file_source` produces compilable-shape output
-    /// containing the expected builder calls + import lines.
+    /// containing the expected builder calls + import lines. Sets up
+    /// a fingerprint that produces zero generator notes (single
+    /// workload group + single work-type hint, no gaps or other
+    /// hint vectors) so the test pins the unconditional skeleton —
+    /// note rendering is conditional on `!spec.notes.is_empty()`
+    /// and is covered by [`render_run_file_source_renders_notes`].
     #[test]
     fn render_run_file_source_basic_shape() {
         let mut cap = DebugCapture::default();
@@ -707,6 +718,14 @@ mod tests {
         }];
         cap.fingerprint.work_type_hints = vec![WorkTypeHint::CpuSpin];
         let spec = generate_spec(&cap);
+        // Sanity-pin the no-notes precondition so a future change
+        // that starts emitting notes for this shape lands here
+        // first rather than in a flake.
+        assert!(
+            spec.notes.is_empty(),
+            "basic-shape fingerprint must produce no notes; got {:?}",
+            spec.notes,
+        );
 
         let src = render_run_file_source(&spec, "regression_repro");
 
@@ -714,8 +733,30 @@ mod tests {
         assert!(src.contains("pub fn regression_repro"));
         assert!(src.contains(".workers(4)"));
         assert!(src.contains(".work_type(WorkType::CpuSpin)"));
-        // Notes are surfaced as comments.
+        // Notes are conditionally rendered — no notes here means
+        // no "Generator notes:" comment block (verified by the
+        // dedicated test).
+        assert!(!src.contains("Generator notes:"));
+    }
+
+    /// When the generator emits any notes (e.g. from fingerprint
+    /// gaps), `render_run_file_source` surfaces them under a
+    /// `// Generator notes:` comment block prefixed by `// - `.
+    /// Pins the conditional-rendering branch at L395-401 so a
+    /// regression that drops the comment block surfaces here.
+    #[test]
+    fn render_run_file_source_renders_notes() {
+        let mut cap = DebugCapture::default();
+        cap.fingerprint.gaps = vec!["test gap from fingerprint".into()];
+        let spec = generate_spec(&cap);
+        assert!(
+            !spec.notes.is_empty(),
+            "fingerprint gap must propagate to spec.notes",
+        );
+
+        let src = render_run_file_source(&spec, "with_notes");
         assert!(src.contains("Generator notes:"));
+        assert!(src.contains("// - fingerprint gap: test gap from fingerprint"));
     }
 
     /// `render_ktstr_test_source` decorates the generated function

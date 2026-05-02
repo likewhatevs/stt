@@ -307,6 +307,16 @@ impl Funifier {
                 | "nr_threads" | "prio" | "static_prio" | "normal_prio" | "nvcsw" | "nivcsw" | "signal_nvcsw" | "signal_nivcsw"
                 // VirtioBlkCounters disk metrics
                 | "bytes_read" | "bytes_written" | "io_errors"
+                // Topology metrics — CPU IDs in cpusets and affinity
+                // masks are placement information about the workload,
+                // not personally-identifying data. Funifying these to
+                // a u64 keyed-hash also breaks round-trip into the
+                // schema's `Vec<usize>` typing: the CPU IDs sit at
+                // 0..N for an N-CPU host (small values), but
+                // `numeric_id` returns a full 64-bit hash that scales
+                // CPU IDs into the u64 range and changes their
+                // semantic identity.
+                | "cpus" | "cpuset_cpus"
         ) {
             return true;
         }
@@ -519,7 +529,7 @@ fn funify_json_with_context(
 // Petname dictionary
 // ---------------------------------------------------------------------------
 //
-// 256 adjectives + 256 animals = 65 536 distinct (adjective, animal)
+// 272 adjectives x 264 animals = 71 808 distinct (adjective, animal)
 // pairs. Words are common-language, public-domain, single-word
 // (no spaces or hyphens) so the rendered name is always a clean
 // `adjective-animal` token suitable for downstream tooling.
@@ -974,9 +984,9 @@ mod tests {
     /// trims either array trips here before downstream callers
     /// see fewer fun names than expected.
     #[test]
-    fn dictionary_sizes_pinned_at_256() {
-        assert_eq!(ADJECTIVES.len(), 256, "adjective list must be 256 entries");
-        assert_eq!(ANIMALS.len(), 256, "animal list must be 256 entries");
+    fn dictionary_sizes_pinned() {
+        assert_eq!(ADJECTIVES.len(), 272, "adjective list must be 272 entries");
+        assert_eq!(ANIMALS.len(), 264, "animal list must be 264 entries");
     }
 
     /// Every dictionary entry is non-empty lowercase ASCII (no

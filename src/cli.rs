@@ -2079,6 +2079,20 @@ pub fn parse_disk_size_mib(s: &str) -> Result<u32> {
     if lower.is_empty() {
         bail!("invalid disk size '{s}': empty");
     }
+    // Reject SI-suffix forms (kb/mb/gb) up front. The IEC-only
+    // policy keeps the contract unambiguous: 1mib means exactly
+    // 2^20 bytes, never 10^6. Without this short-circuit the
+    // generic `b` (byte) suffix below would chew off the trailing
+    // 'b' and then fail to parse e.g. "1k" as a u64, producing a
+    // misleading "numeric portion not an unsigned integer" error
+    // instead of the unit-list diagnostic the user needs.
+    if lower.ends_with("kb") || lower.ends_with("mb") || lower.ends_with("gb") {
+        bail!(
+            "invalid disk size '{s}': SI suffixes (kb/mb/gb) are \
+             not supported. Use one of b, kib, mib, gib \
+             (case-insensitive)."
+        );
+    }
     let (num_str, suffix, unit_bytes): (&str, &str, u64) = if let Some(rest) =
         lower.strip_suffix("gib")
     {
@@ -2131,8 +2145,8 @@ pub fn parse_disk_size_mib(s: &str) -> Result<u32> {
 /// one place. Mirrors the [`CPU_CAP_HELP`] pattern.
 pub const DISK_HELP: &str = "Attach a raw virtio-blk disk to /dev/vda. \
      Accepts a human-readable size with a unit suffix (case-insensitive): \
-     b, kb, kib, mb, mib, gb, gib. SI variants (kb/mb/gb) use 10^N; IEC \
-     variants (kib/mib/gib) use 2^N. The size must be a positive whole \
+     b, kib, mib, gib. IEC-only — SI variants (kb/mb/gb) are rejected to \
+     keep the contract unambiguous. The size must be a positive whole \
      number of MiB (e.g. 256mib, 1gib). Omit to boot without a disk.";
 
 /// Parse the `--disk <SIZE>` CLI argument into an
@@ -6294,8 +6308,8 @@ mod tests {
                 .expect_err(&format!("SI suffix '{input}' must be rejected"));
             let rendered = format!("{err:#}");
             assert!(
-                rendered.contains("missing unit suffix"),
-                "expected unit-list diagnostic for {input:?}, got: {rendered}",
+                rendered.contains("SI suffixes"),
+                "expected SI-rejection diagnostic for {input:?}, got: {rendered}",
             );
         }
     }
