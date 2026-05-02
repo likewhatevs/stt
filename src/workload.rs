@@ -676,16 +676,19 @@ pub enum WorkType {
     },
     /// Pipeline of waker-wakee hops forming a ring of `depth` stages,
     /// optionally with `fanout` parallel chains. Two wake mechanisms
-    /// gated by the `sync` field — see its doc for kernel citations:
+    /// gated by the `wake` field — see [`WakeMechanism`] for kernel
+    /// citations:
     ///
-    /// - `sync: true` — anon-pipe ring (`depth` pipes per chain).
-    ///   Wakes carry `WF_SYNC` via `wake_up_interruptible_sync_poll`,
-    ///   biasing scheduler placement against migration. Tests the
-    ///   `SCX_WAKE_SYNC` path that scx variants must respect.
+    /// - [`WakeMechanism::Pipe`] — anon-pipe ring (`depth` pipes
+    ///   per chain). Wakes carry `WF_SYNC` via
+    ///   `wake_up_interruptible_sync_poll`, biasing scheduler
+    ///   placement against migration. Tests the `SCX_WAKE_SYNC`
+    ///   path that scx variants must respect.
     ///
-    /// - `sync: false` — single shared futex word per chain. The
-    ///   active stage advances the word and `FUTEX_WAKE`s; the stage
-    ///   whose `pos` matches runs, others re-park. No `WF_SYNC`.
+    /// - [`WakeMechanism::Futex`] — single shared futex word per
+    ///   chain. The active stage advances the word and
+    ///   `FUTEX_WAKE`s; the stage whose `pos` matches runs, others
+    ///   re-park. No `WF_SYNC`.
     ///
     /// Worker indices are partitioned into `fanout` chains of
     /// `depth` workers each. `worker_group_size = depth` so the
@@ -694,8 +697,8 @@ pub enum WorkType {
     /// loops back to the first, forming a ring so the work
     /// pattern can run for a long test window.
     ///
-    /// When `sync: true`, the spawn-side additionally allocates
-    /// `depth` pipes per chain — see
+    /// When `wake == WakeMechanism::Pipe`, the spawn-side
+    /// additionally allocates `depth` pipes per chain — see
     /// [`chain_pipe_depth`](Self::chain_pipe_depth) and the
     /// `SpawnGuard::chain_pipes` field.
     WakeChain {
@@ -707,13 +710,14 @@ pub enum WorkType {
         /// linear chain; `fanout > 1` runs multiple chains in
         /// parallel, all sharing one configuration.
         fanout: usize,
-        /// Selects the wake mechanism between stages.
+        /// Selects the wake mechanism between stages — see
+        /// [`WakeMechanism`].
         ///
-        /// `true` allocates one anonymous pipe per stage (a chain
-        /// ring of `depth` pipes) and uses `write(1 byte)` /
-        /// blocking `read(1 byte)` for stage handoffs. The kernel
-        /// raises `WF_SYNC` on the wake because
-        /// `anon_pipe_write` (`fs/pipe.c`) calls
+        /// [`WakeMechanism::Pipe`] allocates one anonymous pipe
+        /// per stage (a chain ring of `depth` pipes) and uses
+        /// `write(1 byte)` / `read(1 byte)` (poll-stop-pollable)
+        /// for stage handoffs. The kernel raises `WF_SYNC` on the
+        /// wake because `anon_pipe_write` (`fs/pipe.c`) calls
         /// `wake_up_interruptible_sync_poll` (`include/linux/wait.h`)
         /// which expands to `__wake_up_sync_key` (`kernel/sched/wait.c`)
         /// and that passes `WF_SYNC` through `__wake_up_common_lock`
@@ -722,12 +726,13 @@ pub enum WorkType {
         /// — testing the wake-affine cohabitation that scx variants
         /// must respect.
         ///
-        /// `false` uses the existing futex-word ring: `FUTEX_WAKE`
-        /// fans out to every parked worker on the same word, the
-        /// active stage proceeds, the rest re-park. No `WF_SYNC`;
-        /// the scheduler is free to migrate the woken stage.
+        /// [`WakeMechanism::Futex`] uses the existing futex-word
+        /// ring: `FUTEX_WAKE` fans out to every parked worker on
+        /// the same word, the active stage proceeds, the rest
+        /// re-park. No `WF_SYNC`; the scheduler is free to
+        /// migrate the woken stage.
         ///
-        /// The `true` path needs `depth` pipes per chain — see
+        /// The `Pipe` path needs `depth` pipes per chain — see
         /// [`chain_pipe_depth`](Self::chain_pipe_depth) — and
         /// closes the inverse ends of every other stage's pipe in
         /// the worker post-fork. The kernel-side `WF_SYNC` raise
@@ -736,7 +741,7 @@ pub enum WorkType {
         /// `wake_up_interruptible_sync_poll` at
         /// `include/linux/wait.h:246-247`, and
         /// `__wake_up_sync_key` at `kernel/sched/wait.c:186-193`.
-        sync: bool,
+        wake: WakeMechanism,
         /// Wall-clock CPU work each worker performs per stage
         /// before signalling the next. Use [`Duration`] to keep
         /// the unit visible at the call site (consistent with
@@ -903,6 +908,74 @@ pub enum WorkType {
         /// Wall-clock interval between affinity rotations (ms).
         period_ms: u64,
     },
+    /// CPU burst for `burst_duration` followed by `nanosleep` for
+    /// `sleep_duration`, repeated. Exercises task off-CPU/on-CPU
+    /// transitions: `nanosleep` dequeues the worker into
+    /// TASK_INTERRUPTIBLE; on the pinned CPU, when no other tasks
+    /// are runnable, `__pick_next_task` selects the idle class
+    /// (`pick_task_idle` at `kernel/sched/idle.c:480`); on
+    /// `nanosleep` expiry the hrtimer callback `hrtimer_wakeup`
+    /// calls `wake_up_process` → `try_to_wake_up`.
+    ///
+    /// Distinct from [`Bursty`](Self::Bursty) (millisecond
+    /// `thread::sleep` regime) and from variants that block on
+    /// futex/pipe — IdleChurn's blocking primitive is `nanosleep`
+    /// directly, the same hrtimer path the idle thread itself
+    /// observes.
+    ///
+    /// **CPU enters idle only under exclusive pinning.** The
+    /// variant exercises the nanosleep → schedule path on every
+    /// iteration regardless of placement, but the CPU only
+    /// transitions to the idle class when no other tasks are
+    /// runnable on the pinned CPU. Run with
+    /// [`AffinityIntent::SingleCpu`] or a one-CPU `Exact` mask
+    /// for true idle-path testing; without exclusive pinning the
+    /// wake races against other runnable tasks and IdleChurn
+    /// degenerates to a yield-heavy variant.
+    ///
+    /// **Timer slack.** The kernel adds
+    /// `current->timer_slack_ns` (~50µs default) to the
+    /// requested `sleep_duration` per `kernel/time/hrtimer.c::
+    /// schedule_hrtimeout_range`, so `sleep_duration` is a
+    /// **lower bound** on the observed idle interval. Sub-50µs
+    /// values do not produce sub-50µs idle periods.
+    ///
+    /// **Tick-stop boundary.** Sleeps > 1ms exercise the full
+    /// idle path including tick stop and (on configured
+    /// platforms) C-state entry. Sub-millisecond sleeps still
+    /// produce `sched_switch` transitions but skip the tick-stop
+    /// branch.
+    ///
+    /// **Caveats**: no `PR_SET_TIMERSLACK` adjustment yet — the
+    /// kernel's default timer slack still applies; exclusive
+    /// pinning is currently a doc requirement, not an enforced
+    /// precondition; under `NO_HZ_FULL` tickless idle alters
+    /// wake-latency observation; inside a KVM guest the host
+    /// scheduler can amplify wake latency.
+    ///
+    /// `worker_group_size = None`. Spawn-side validation rejects
+    /// `Duration::ZERO` for either field (a zero burst makes the
+    /// loop pure sleep; a zero sleep collapses to
+    /// [`SpinWait`](Self::SpinWait)).
+    IdleChurn {
+        /// Wall-clock duration of CPU work between idle
+        /// periods. Use [`Duration`] to keep the unit visible at
+        /// the call site, matching
+        /// [`WakeChain`](Self::WakeChain)'s `work_per_hop`.
+        /// Default 1ms (see
+        /// [`defaults::IDLE_CHURN_BURST_DURATION`]). Short
+        /// bursts (< 1ms) maximise idle-cycle frequency.
+        #[serde(with = "humantime_serde_helper")]
+        burst_duration: Duration,
+        /// Wall-clock duration of each idle period. Lower bound
+        /// — the kernel adds `timer_slack_ns` (~50µs) to the
+        /// requested duration. Default 5ms (see
+        /// [`defaults::IDLE_CHURN_SLEEP_DURATION`]). Sub-1ms
+        /// values produce `sched_switch` transitions but skip
+        /// tick-stop / C-state entry.
+        #[serde(with = "humantime_serde_helper")]
+        sleep_duration: Duration,
+    },
 }
 
 /// Named defaults for the parametric [`WorkType`] variants, used by
@@ -976,7 +1049,7 @@ pub mod defaults {
     // WakeChain
     pub const WAKE_CHAIN_DEPTH: usize = 4;
     pub const WAKE_CHAIN_FANOUT: usize = 1;
-    pub const WAKE_CHAIN_SYNC: bool = true;
+    pub const WAKE_CHAIN_WAKE: super::WakeMechanism = super::WakeMechanism::Pipe;
     pub const WAKE_CHAIN_WORK_PER_HOP: std::time::Duration = std::time::Duration::from_micros(100);
     // NumaWorkingSetSweep
     pub const NUMA_WORKING_SET_SWEEP_REGION_KB: usize = 4_096;
@@ -997,6 +1070,11 @@ pub mod defaults {
     pub const EPOLL_STORM_EVENTS_PER_BURST: u64 = 32;
     // NumaMigrationChurn
     pub const NUMA_MIGRATION_CHURN_PERIOD_MS: u64 = 100;
+    // IdleChurn
+    pub const IDLE_CHURN_BURST_DURATION: std::time::Duration =
+        std::time::Duration::from_millis(1);
+    pub const IDLE_CHURN_SLEEP_DURATION: std::time::Duration =
+        std::time::Duration::from_millis(5);
 }
 
 impl WorkType {
@@ -1048,6 +1126,7 @@ impl WorkType {
             WorkType::PreemptStorm { .. } => "PreemptStorm",
             WorkType::EpollStorm { .. } => "EpollStorm",
             WorkType::NumaMigrationChurn { .. } => "NumaMigrationChurn",
+            WorkType::IdleChurn { .. } => "IdleChurn",
         }
     }
 
@@ -1147,7 +1226,7 @@ impl WorkType {
             "WakeChain" => Some(WorkType::WakeChain {
                 depth: defaults::WAKE_CHAIN_DEPTH,
                 fanout: defaults::WAKE_CHAIN_FANOUT,
-                sync: defaults::WAKE_CHAIN_SYNC,
+                wake: defaults::WAKE_CHAIN_WAKE,
                 work_per_hop: defaults::WAKE_CHAIN_WORK_PER_HOP,
             }),
             "NumaWorkingSetSweep" => Some(WorkType::NumaWorkingSetSweep {
@@ -1179,6 +1258,10 @@ impl WorkType {
             }),
             "NumaMigrationChurn" => Some(WorkType::NumaMigrationChurn {
                 period_ms: defaults::NUMA_MIGRATION_CHURN_PERIOD_MS,
+            }),
+            "IdleChurn" => Some(WorkType::IdleChurn {
+                burst_duration: defaults::IDLE_CHURN_BURST_DURATION,
+                sleep_duration: defaults::IDLE_CHURN_SLEEP_DURATION,
             }),
             // Sequence requires explicit phases; no default from_name.
             _ => None,
@@ -1322,19 +1405,22 @@ impl WorkType {
     /// Number of pipes per chain that the spawn-side must allocate
     /// for this work type, or `None` when no per-stage pipe ring is
     /// needed. The returned `depth` matches the variant's `depth`
-    /// field for `WakeChain { sync: true }`; every other variant
-    /// returns `None`.
+    /// field for `WakeChain { wake: WakeMechanism::Pipe, .. }`;
+    /// every other variant (and `WakeChain` with
+    /// `wake: WakeMechanism::Futex`) returns `None`.
     ///
     /// When this returns `Some(depth)`, the spawn-side allocates
     /// `depth` pipes per chain so stage `i` holds
     /// `pipe[i].write_end` (to wake stage `i + 1`) and
     /// `pipe[(i + depth - 1) % depth].read_end` (predecessor's
-    /// wake). `sync: false` keeps the existing futex-word ring and
-    /// returns `None`.
+    /// wake). `WakeMechanism::Futex` keeps the existing futex-word
+    /// ring and returns `None`.
     pub fn chain_pipe_depth(&self) -> Option<usize> {
         match self {
             WorkType::WakeChain {
-                sync: true, depth, ..
+                wake: WakeMechanism::Pipe,
+                depth,
+                ..
             } => Some(*depth),
             _ => None,
         }
@@ -1529,11 +1615,16 @@ impl WorkType {
 
     /// Pipeline of waker-wakee hops with optional `WF_SYNC`. See
     /// [`WorkType::WakeChain`].
-    pub fn wake_chain(depth: usize, fanout: usize, sync: bool, work_per_hop: Duration) -> Self {
+    pub fn wake_chain(
+        depth: usize,
+        fanout: usize,
+        wake: WakeMechanism,
+        work_per_hop: Duration,
+    ) -> Self {
         WorkType::WakeChain {
             depth,
             fanout,
-            sync,
+            wake,
             work_per_hop,
         }
     }
@@ -1603,6 +1694,14 @@ impl WorkType {
     /// Construct a [`WorkType::NumaMigrationChurn`].
     pub fn numa_migration_churn(period_ms: u64) -> Self {
         WorkType::NumaMigrationChurn { period_ms }
+    }
+
+    /// Construct a [`WorkType::IdleChurn`].
+    pub fn idle_churn(burst_duration: Duration, sleep_duration: Duration) -> Self {
+        WorkType::IdleChurn {
+            burst_duration,
+            sleep_duration,
+        }
     }
 
     /// User-supplied work function with a display name.
@@ -1812,6 +1911,29 @@ pub enum FutexLockMode {
     /// uncorrected inversion the workload exists to surface.
     #[default]
     Plain,
+}
+
+/// Wake mechanism between stages of a [`WorkType::WakeChain`].
+///
+/// Carried as a typed enum rather than a `bool` so call sites
+/// name the choice explicitly (`Pipe` / `Futex`) instead of a
+/// bare `sync: true` / `sync: false`. The serde wire format is
+/// `"pipe"` / `"futex"` (snake_case).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WakeMechanism {
+    /// Anon-pipe ring (`depth` pipes per chain). Wakes carry
+    /// `WF_SYNC` via `wake_up_interruptible_sync_poll`, biasing
+    /// scheduler placement against migration. Tests the
+    /// `SCX_WAKE_SYNC` path that scx variants must respect. The
+    /// default — see [`WakeChain`](WorkType::WakeChain) for the
+    /// kernel call-chain citations.
+    #[default]
+    Pipe,
+    /// Single shared futex word per chain. The active stage
+    /// advances the word and `FUTEX_WAKE`s; the stage whose
+    /// `pos` matches runs, others re-park. No `WF_SYNC`.
+    Futex,
 }
 
 /// Coarse Linux scheduling class identifier.
@@ -2991,7 +3113,7 @@ struct SpawnGuard {
     /// Closed by the guard on every exit (success or failure) —
     /// children inherit copies via fork and close their own ends.
     pipe_pairs: Vec<([i32; 2], [i32; 2])>,
-    /// Per-chain pipe rings for `WakeChain { sync: true }`. Outer
+    /// Per-chain pipe rings for `WakeChain { wake: WakeMechanism::Pipe }`. Outer
     /// Vec is one entry per chain (= `num_workers / depth`); inner
     /// Vec is `depth` pipes per chain. Pipe `i` connects stage `i`
     /// (writer) to stage `(i + 1) % depth` (reader). Closed by the
@@ -3113,7 +3235,7 @@ impl Drop for SpawnGuard {
                 let _ = nix::unistd::close(fd);
             }
         }
-        // Close every per-stage chain pipe (WakeChain sync=true).
+        // Close every per-stage chain pipe (WakeChain wake=Pipe).
         // Same parent-side cleanup contract as `pipe_pairs`: each
         // child inherited a copy and closed its inverse end on
         // fork; the parent's references close here.
@@ -3412,7 +3534,7 @@ impl WorkloadHandle {
                 config.num_workers
             );
         }
-        // WakeChain `sync: true` is incompatible with
+        // WakeChain `wake: WakeMechanism::Pipe` is incompatible with
         // `CloneMode::Thread`: `SpawnGuard::into_handle` does not
         // transfer `chain_pipes` (only children/threads/futex
         // ptrs/iter counters), so the guard's `Drop` runs after a
@@ -3426,17 +3548,17 @@ impl WorkloadHandle {
         // `open()`, threads then write 1-byte garbage to whatever
         // unrelated file inherited the fd. Reject at spawn time
         // with an actionable diagnostic; CloneMode::Fork is the
-        // correct choice for WakeChain sync=true.
+        // correct choice for WakeChain wake=Pipe.
         if chain_depth.is_some() && matches!(dispatch, Dispatch::Thread) {
             anyhow::bail!(
-                "WakeChain sync=true is not supported under CloneMode::Thread \
+                "WakeChain wake=Pipe is not supported under CloneMode::Thread \
                  (the spawn-side closes chain pipe fds via SpawnGuard::Drop \
                  after spawn returns; threads share the parent fd table and \
                  would observe EBADF or, post-fd-reuse, write to the wrong \
                  file). Use CloneMode::Fork."
             );
         }
-        // WakeChain `sync: true` with depth=1 deadlocks at fork:
+        // WakeChain `wake: WakeMechanism::Pipe` with depth=1 deadlocks at fork:
         // prev_stage and stage collapse to 0, so the post-fork
         // close-other-fds block closes BOTH ends of the worker's
         // own pipe (the `s == prev_stage` arm runs first and
@@ -3453,6 +3575,32 @@ impl WorkloadHandle {
                  the worker's own write end",
                 depth
             );
+        }
+        // IdleChurn rejects Duration::ZERO for either field:
+        //   - burst_duration = 0 collapses the loop to pure
+        //     nanosleep — the worker accrues no runtime; the
+        //     idle-transition observability is unchanged but the
+        //     workload becomes useless as a scheduler test.
+        //   - sleep_duration = 0 produces no idle period; the
+        //     workload degenerates to SpinWait. Use SpinWait
+        //     directly.
+        if let WorkType::IdleChurn {
+            burst_duration,
+            sleep_duration,
+        } = config.work_type
+        {
+            if burst_duration.is_zero() {
+                anyhow::bail!(
+                    "IdleChurn burst_duration must be > 0; a zero burst makes the \
+                     loop pure sleep and the worker accrues no runtime"
+                );
+            }
+            if sleep_duration.is_zero() {
+                anyhow::bail!(
+                    "IdleChurn sleep_duration must be > 0; a zero sleep collapses \
+                     the variant to SpinWait. Use WorkType::SpinWait directly."
+                );
+            }
         }
 
         // All failable acquisitions in this function route through
@@ -3513,7 +3661,7 @@ impl WorkloadHandle {
             }
         }
 
-        // For WakeChain { sync: true }, allocate `depth` pipes per
+        // For WakeChain { wake: WakeMechanism::Pipe }, allocate `depth` pipes per
         // chain (one pipe per stage). Pipe `i` connects stage `i`
         // (writer) to stage `(i + 1) % depth` (reader). On any
         // `pipe()` failure mid-allocation, close the half-built
@@ -3645,7 +3793,7 @@ impl WorkloadHandle {
             // - PipeIo / CachePipe (paired): worker A reads `ba[0]`,
             //   writes `ab[1]`; worker B reads `ab[0]`, writes
             //   `ba[1]`.
-            // - WakeChain { sync: true } (chain ring): stage `s`
+            // - WakeChain { wake: WakeMechanism::Pipe } (chain ring): stage `s`
             //   reads from pipe `(s + depth - 1) % depth` (its
             //   predecessor's write end's matching read end) and
             //   writes to pipe `s` (its own pipe's write end, which
@@ -6291,13 +6439,13 @@ fn worker_main(
             WorkType::WakeChain {
                 depth,
                 fanout: _,
-                sync,
+                wake,
                 work_per_hop,
             } => {
-                // Two implementations selected by `sync`:
+                // Two implementations selected by `wake`:
                 //
-                // - `sync == true` (anon-pipe ring): each stage
-                //   blocks on `read(read_fd, &mut [0u8; 1], 1)`,
+                // - [`WakeMechanism::Pipe`] (anon-pipe ring): each
+                //   stage blocks on `read(read_fd, &mut [0u8; 1], 1)`,
                 //   does its CPU burst, then `write(write_fd,
                 //   &[0u8; 1], 1)` to wake the next stage. The
                 //   kernel routes the write through
@@ -6310,19 +6458,19 @@ fn worker_main(
                 //   ring on its first iteration with a single
                 //   write so stage 1 unblocks.
                 //
-                // - `sync == false` (futex-word ring): all `depth`
-                //   stages share one futex word; the stage whose
-                //   `pos` matches the word value is active, does
-                //   its CPU burst, advances the word, and
-                //   `FUTEX_WAKE(INT_MAX)` broadcasts so every
-                //   other stage observes the new value and
+                // - [`WakeMechanism::Futex`] (futex-word ring):
+                //   all `depth` stages share one futex word; the
+                //   stage whose `pos` matches the word value is
+                //   active, does its CPU burst, advances the
+                //   word, and `FUTEX_WAKE(INT_MAX)` broadcasts so
+                //   every other stage observes the new value and
                 //   either runs or re-parks. No `WF_SYNC`.
                 //
                 // `worker_group_size = depth` for both paths.
                 if depth == 0 {
                     break;
                 }
-                if sync {
+                if matches!(wake, WakeMechanism::Pipe) {
                     let (read_fd, write_fd) = match pipe_fds {
                         Some(p) => p,
                         None => break,
@@ -7406,6 +7554,88 @@ fn worker_main(
                     std::thread::sleep(Duration::from_millis(period_ms));
                 }
                 spin_burst(&mut work_units, 256);
+                last_iter_time = Instant::now();
+                iterations += 1;
+            }
+            WorkType::IdleChurn {
+                burst_duration,
+                sleep_duration,
+            } => {
+                // Per-iteration: spin for `burst_duration`, then
+                // `nanosleep` for `sleep_duration`. Both fields
+                // are pre-validated non-zero at spawn time, so
+                // the loop always exercises both phases.
+                //
+                // The nanosleep dequeues the task into
+                // TASK_INTERRUPTIBLE; on a CPU with no other
+                // runnable tasks the scheduler picks the idle
+                // class via `__pick_next_task` →
+                // `pick_task_idle` (kernel/sched/idle.c:480).
+                // The hrtimer expiry callback `hrtimer_wakeup`
+                // fires `wake_up_process` → `try_to_wake_up`
+                // and the worker re-runs.
+                //
+                // Stop discipline: check `stop_requested` at three
+                // points — at the start of the iteration, between
+                // the burst and the sleep, and after the wake.
+                // The middle check ensures a stop signal observed
+                // mid-iteration aborts the sleep without
+                // initiating it.
+                //
+                // Burst gating: `Instant`-based deadline matches
+                // Bursty / WakeChain. CPU-spin granularity is
+                // `spin_burst(256)` so the worker checks
+                // `stop_requested` and the deadline at most every
+                // 256 iterations of the inner loop.
+                let burst_end = Instant::now() + burst_duration;
+                while Instant::now() < burst_end && !stop_requested(stop) {
+                    spin_burst(&mut work_units, 256);
+                }
+                if stop_requested(stop) {
+                    iterations += 1;
+                    continue;
+                }
+                let req = libc::timespec {
+                    tv_sec: sleep_duration.as_secs() as libc::time_t,
+                    tv_nsec: sleep_duration.subsec_nanos() as libc::c_long,
+                };
+                let before_sleep = Instant::now();
+                // SAFETY: `req` is a valid `timespec` populated
+                // with non-negative `tv_sec` (from
+                // `Duration::as_secs`, u64 → time_t cast safe on
+                // all supported targets) and `tv_nsec` in
+                // [0, 1_000_000_000) (from `subsec_nanos()`).
+                // `rem` parameter is null because we don't
+                // resume on EINTR — the SIGUSR1 handler sets STOP
+                // and the post-sleep `stop_requested` check
+                // exits the outer loop.
+                let nanosleep_rc =
+                    unsafe { libc::nanosleep(&req, std::ptr::null_mut()) };
+                // Bail on EINVAL: the timespec is malformed
+                // (negative `tv_sec`, or `tv_nsec` outside
+                // [0, 1e9)). Spawn-side validation guarantees
+                // non-zero Durations and `subsec_nanos` is
+                // always in range, so this branch is only
+                // reachable if a future refactor breaks the
+                // invariants. EINTR is handled by the post-sleep
+                // `stop_requested` check on the next outer-loop
+                // iteration; no special EINTR handling here.
+                if nanosleep_rc < 0 {
+                    let errno = std::io::Error::last_os_error().raw_os_error();
+                    if errno == Some(libc::EINVAL) {
+                        tracing::error!(
+                            errno = errno,
+                            "IdleChurn nanosleep returned EINVAL; bailing"
+                        );
+                        break;
+                    }
+                }
+                reservoir_push(
+                    &mut resume_latencies_ns,
+                    &mut wake_sample_count,
+                    before_sleep.elapsed().as_nanos() as u64,
+                    MAX_WAKE_SAMPLES,
+                );
                 last_iter_time = Instant::now();
                 iterations += 1;
             }
@@ -8725,11 +8955,12 @@ mod tests {
         // + 5 scheduler-coverage-gap variants (CgroupChurn,
         // SignalStorm, PreemptStorm, EpollStorm,
         // NumaMigrationChurn)
-        // = 34. `strum::VariantNames` enumerates every variant
+        // + 1 idle-transition variant (IdleChurn)
+        // = 35. `strum::VariantNames` enumerates every variant
         // including `Custom` (the derive does not honor
         // `#[serde(skip)]` — that attribute only affects serde
         // (de)serialization, not strum reflection).
-        assert_eq!(WorkType::ALL_NAMES.len(), 34);
+        assert_eq!(WorkType::ALL_NAMES.len(), 35);
     }
 
     // -- matrix_multiply --
@@ -11022,9 +11253,9 @@ mod tests {
         // WakeChain group_size == depth (per-chain), independent
         // of fanout. Spawn-side allocates `num_workers / depth =
         // fanout` futex regions.
-        let wc = WorkType::wake_chain(8, 4, false, Duration::from_micros(100));
+        let wc = WorkType::wake_chain(8, 4, WakeMechanism::Futex, Duration::from_micros(100));
         assert_eq!(wc.worker_group_size(), Some(8));
-        let wc1 = WorkType::wake_chain(3, 1, true, Duration::from_micros(50));
+        let wc1 = WorkType::wake_chain(3, 1, WakeMechanism::Pipe, Duration::from_micros(50));
         assert_eq!(wc1.worker_group_size(), Some(3));
     }
 
@@ -13943,7 +14174,7 @@ mod tests {
             work_type: WorkType::WakeChain {
                 depth: 2,
                 fanout: 1,
-                sync: false,
+                wake: WakeMechanism::Futex,
                 work_per_hop: Duration::from_micros(50),
             },
             ..Default::default()
@@ -13957,7 +14188,7 @@ mod tests {
         assert!(total > 0, "WakeChain ring must iterate: {reports:?}");
     }
 
-    /// `WorkType::WakeChain { sync: true }` smoke test. Drives the
+    /// `WorkType::WakeChain { wake: WakeMechanism::Pipe }` smoke test. Drives the
     /// anon-pipe ring path so the kernel `wake_up_interruptible_sync_poll`
     /// → `__wake_up_sync_key` → `WF_SYNC` chain runs end-to-end.
     /// Asserts every worker iterates at least once; the rigorous
@@ -13969,12 +14200,12 @@ mod tests {
             work_type: WorkType::WakeChain {
                 depth: 2,
                 fanout: 1,
-                sync: true,
+                wake: WakeMechanism::Pipe,
                 work_per_hop: Duration::from_micros(50),
             },
             ..Default::default()
         };
-        let mut h = WorkloadHandle::spawn(&cfg).expect("WakeChain sync=true must spawn");
+        let mut h = WorkloadHandle::spawn(&cfg).expect("WakeChain wake=Pipe must spawn");
         h.start();
         std::thread::sleep(Duration::from_millis(200));
         let reports = h.stop_and_collect();
@@ -13982,12 +14213,12 @@ mod tests {
         for r in &reports {
             assert!(
                 r.iterations > 0,
-                "WakeChain sync=true worker must iterate: {r:?}"
+                "WakeChain wake=Pipe worker must iterate: {r:?}"
             );
         }
     }
 
-    /// `WakeChain { sync: true }` deeper chain. depth=4 → 4 workers
+    /// `WakeChain { wake: WakeMechanism::Pipe }` deeper chain. depth=4 → 4 workers
     /// per chain × 1 chain = 4 workers. Verifies the ring closes
     /// (stage 3 wakes stage 0) by requiring every stage iterates.
     #[test]
@@ -13997,12 +14228,12 @@ mod tests {
             work_type: WorkType::WakeChain {
                 depth: 4,
                 fanout: 1,
-                sync: true,
+                wake: WakeMechanism::Pipe,
                 work_per_hop: Duration::from_micros(20),
             },
             ..Default::default()
         };
-        let mut h = WorkloadHandle::spawn(&cfg).expect("WakeChain sync=true depth=4 must spawn");
+        let mut h = WorkloadHandle::spawn(&cfg).expect("WakeChain wake=Pipe depth=4 must spawn");
         h.start();
         std::thread::sleep(Duration::from_millis(300));
         let reports = h.stop_and_collect();
@@ -14010,12 +14241,12 @@ mod tests {
         for r in &reports {
             assert!(
                 r.iterations > 0,
-                "WakeChain sync=true depth=4 worker must iterate: {r:?}"
+                "WakeChain wake=Pipe depth=4 worker must iterate: {r:?}"
             );
         }
     }
 
-    /// `WakeChain { sync: true }` multi-chain. depth=2, fanout=2 →
+    /// `WakeChain { wake: WakeMechanism::Pipe }` multi-chain. depth=2, fanout=2 →
     /// 2 stages × 2 parallel chains = 4 workers. Each chain owns
     /// its own pipe ring; pipes are not shared across chains. All
     /// workers must iterate independently.
@@ -14026,13 +14257,13 @@ mod tests {
             work_type: WorkType::WakeChain {
                 depth: 2,
                 fanout: 2,
-                sync: true,
+                wake: WakeMechanism::Pipe,
                 work_per_hop: Duration::from_micros(50),
             },
             ..Default::default()
         };
         let mut h =
-            WorkloadHandle::spawn(&cfg).expect("WakeChain sync=true fanout=2 must spawn");
+            WorkloadHandle::spawn(&cfg).expect("WakeChain wake=Pipe fanout=2 must spawn");
         h.start();
         std::thread::sleep(Duration::from_millis(200));
         let reports = h.stop_and_collect();
@@ -14040,12 +14271,12 @@ mod tests {
         for r in &reports {
             assert!(
                 r.iterations > 0,
-                "WakeChain sync=true fanout=2 worker must iterate: {r:?}"
+                "WakeChain wake=Pipe fanout=2 worker must iterate: {r:?}"
             );
         }
     }
 
-    /// `WakeChain { sync: true }` stop responsiveness. Pins the
+    /// `WakeChain { wake: WakeMechanism::Pipe }` stop responsiveness. Pins the
     /// FIX 1 contract: workers blocked in the pipe `read` must
     /// re-check `stop_requested` via the `poll(POLLIN, 100ms)`
     /// loop and exit cleanly. `stop_and_collect` must complete
@@ -14058,12 +14289,12 @@ mod tests {
             work_type: WorkType::WakeChain {
                 depth: 2,
                 fanout: 1,
-                sync: true,
+                wake: WakeMechanism::Pipe,
                 work_per_hop: Duration::from_micros(50),
             },
             ..Default::default()
         };
-        let mut h = WorkloadHandle::spawn(&cfg).expect("WakeChain sync=true must spawn");
+        let mut h = WorkloadHandle::spawn(&cfg).expect("WakeChain wake=Pipe must spawn");
         h.start();
         std::thread::sleep(Duration::from_millis(200));
         let stop_start = Instant::now();
@@ -14077,7 +14308,7 @@ mod tests {
         for r in &reports {
             assert!(
                 r.completed,
-                "WakeChain sync=true worker must complete on stop: {r:?}"
+                "WakeChain wake=Pipe worker must complete on stop: {r:?}"
             );
         }
     }
@@ -14110,6 +14341,33 @@ mod tests {
                 r.iterations > 0,
                 "NumaWorkingSetSweep worker must iterate: {r:?}"
             );
+        }
+    }
+
+    /// `WorkType::IdleChurn` smoke test. burst=1ms + sleep=5ms
+    /// matches the variant's defaults; a 200ms run gives ~30
+    /// iterations per worker (timer_slack adds ~50µs to each
+    /// 5ms sleep). Asserts every worker iterates — the variant
+    /// is dead if `nanosleep` returns immediately, the timespec
+    /// is malformed, or the spawn-side validation rejects the
+    /// non-zero defaults.
+    #[test]
+    fn pathology_idle_churn_iterates() {
+        let cfg = WorkloadConfig {
+            num_workers: 2,
+            work_type: WorkType::IdleChurn {
+                burst_duration: Duration::from_millis(1),
+                sleep_duration: Duration::from_millis(5),
+            },
+            ..Default::default()
+        };
+        let mut h = WorkloadHandle::spawn(&cfg).expect("IdleChurn must spawn");
+        h.start();
+        std::thread::sleep(Duration::from_millis(200));
+        let reports = h.stop_and_collect();
+        assert_eq!(reports.len(), 2);
+        for r in &reports {
+            assert!(r.iterations > 0, "IdleChurn worker must iterate: {r:?}");
         }
     }
 
