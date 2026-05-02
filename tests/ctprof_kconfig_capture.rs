@@ -69,7 +69,7 @@ use ktstr::workload::WorkType;
 // CONFIG_TASK_IO_ACCOUNTING — assert rchar/wchar > 0 after file I/O
 // ---------------------------------------------------------------------------
 
-/// Run the [`WorkType::IoSync`] workload inside the guest —
+/// Run the [`WorkType::IoSyncWrite`] workload inside the guest —
 /// each iteration writes 64 KB to a temp file and sleeps to
 /// simulate I/O completion latency. The vfs write path goes
 /// through `task_io_account_write` /
@@ -87,7 +87,7 @@ use ktstr::workload::WorkType;
 /// `ctprof::ThreadState::wchar` cited in the registry).
 /// Reading-side `rchar` is more permissive (mere `read(2)`
 /// from /proc / /sys / vdso increments it), but the write
-/// path is what `IoSync` actively drives so pin on `wchar`
+/// path is what `IoSyncWrite` actively drives so pin on `wchar`
 /// — a regression that drops `CONFIG_TASK_IO_ACCOUNTING`
 /// from the kconfig fragment, or one that breaks the
 /// `/proc/<tid>/io` parser, lands as `wchar == 0` on every
@@ -98,23 +98,23 @@ use ktstr::workload::WorkType;
 /// a larger topology would just lengthen the run for no
 /// added signal.
 ///
-/// Duration: 3 s — enough wall-clock for `IoSync` to land
-/// many 64 KB writes (one per iteration with a 100 µs sleep
-/// between iterations) before the capture fires. Shorter
-/// windows (< 1 s) risk the workers not having issued any
-/// writes yet on slow CI runners.
+/// Duration: 3 s — enough wall-clock for `IoSyncWrite` to land
+/// many 64 KB writes (one per iteration; each iteration issues
+/// 16 × 4 KB pwrites + an fdatasync) before the capture fires.
+/// Shorter windows (< 1 s) risk the workers not having issued
+/// any writes yet on slow CI runners.
 #[ktstr_test(llcs = 1, cores = 2, threads = 1, duration_s = 3)]
 fn ctprof_capture_records_wchar_under_iosync(ctx: &Ctx) -> Result<AssertResult> {
-    // IoSync workers write 64 KB to a temp file then sleep
-    // 100 µs to simulate I/O completion latency. On the
-    // guest's tmpfs the write is a page-cache memcpy, but
-    // the vfs path still runs `task_io_account_write`
-    // unconditionally — `wchar` accumulates.
+    // IoSyncWrite workers issue 16 × 4 KB pwrites totalling 64 KB
+    // per iteration directly to /dev/vda (or a host-side tempfile
+    // fallback) and then fdatasync. The vfs/block path runs
+    // `task_io_account_write` unconditionally — `wchar`
+    // accumulates.
     let steps = vec![Step {
         setup: vec![
             CgroupDef::named("cg_0")
                 .workers(ctx.workers_per_cgroup)
-                .work_type(WorkType::IoSync),
+                .work_type(WorkType::IoSyncWrite),
         ]
         .into(),
         ops: vec![],
@@ -133,7 +133,7 @@ fn ctprof_capture_records_wchar_under_iosync(ctx: &Ctx) -> Result<AssertResult> 
         )));
     }
 
-    // Look for any thread with non-zero wchar. The IoSync
+    // Look for any thread with non-zero wchar. The IoSyncWrite
     // workers are the dominant write-source in the guest, but
     // any thread issuing write(2) syscalls (init, the test
     // runtime itself) also accumulates — pinning ANY thread
@@ -146,7 +146,7 @@ fn ctprof_capture_records_wchar_under_iosync(ctx: &Ctx) -> Result<AssertResult> 
             DetailKind::Other,
             format!(
                 "ctprof::capture() returned {total} threads but NONE \
-                 had wchar > 0 after an IoSync workload; threads with \
+                 had wchar > 0 after an IoSyncWrite workload; threads with \
                  rchar > 0 = {nonzero_rchar}. Suggests either \
                  CONFIG_TASK_IO_ACCOUNTING is missing from the kconfig \
                  fragment, /proc/<tid>/io is unreadable, or the \

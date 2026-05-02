@@ -41,7 +41,7 @@
 //! | WorkTypeHint::PipeIo          | WorkType::PipeIo { burst_iters: 1024 }  |
 //! | WorkTypeHint::FutexPingPong   | WorkType::FutexPingPong { spin_iters: 1024 } |
 //! | WorkTypeHint::CachePressure   | WorkType::CachePressure { size_kb, stride } |
-//! | WorkTypeHint::IoSync          | WorkType::IoSync                        |
+//! | WorkTypeHint::IoSyncWrite     | WorkType::IoSyncWrite                   |
 //! | SchedPolicyHint::Other{nice}  | SchedPolicy::Normal + nice              |
 //! | SchedPolicyHint::Fifo{prio}   | SchedPolicy::Fifo(prio)                 |
 //! | SchedPolicyHint::RoundRobin   | SchedPolicy::RoundRobin(prio)           |
@@ -282,7 +282,7 @@ fn map_work_type(fp: &WorkloadFingerprint, spec: &mut ReproducerSpec) {
             size_kb: *size_kb as usize,
             stride: *stride as usize,
         },
-        WorkTypeHint::IoSync => WorkType::IoSync,
+        WorkTypeHint::IoSyncWrite => WorkType::IoSyncWrite,
     };
 
     if fp.work_type_hints.len() > 1 {
@@ -474,7 +474,9 @@ fn render_work_type(w: &WorkType) -> String {
         WorkType::CpuSpin => "WorkType::CpuSpin".into(),
         WorkType::YieldHeavy => "WorkType::YieldHeavy".into(),
         WorkType::Mixed => "WorkType::Mixed".into(),
-        WorkType::IoSync => "WorkType::IoSync".into(),
+        WorkType::IoSyncWrite => "WorkType::IoSyncWrite".into(),
+        WorkType::IoRandRead => "WorkType::IoRandRead".into(),
+        WorkType::IoMixed => "WorkType::IoMixed".into(),
         WorkType::Bursty { burst_ms, sleep_ms } => format!(
             "WorkType::Bursty {{ burst_ms: {burst_ms}, sleep_ms: {sleep_ms} }}"
         ),
@@ -605,7 +607,7 @@ mod tests {
     fn generate_spec_multiple_hints_first_wins() {
         let mut cap = DebugCapture::default();
         cap.fingerprint.work_type_hints =
-            vec![WorkTypeHint::CpuSpin, WorkTypeHint::IoSync];
+            vec![WorkTypeHint::CpuSpin, WorkTypeHint::IoSyncWrite];
         let spec = generate_spec(&cap);
         assert!(matches!(spec.config.work_type, WorkType::CpuSpin));
         assert!(

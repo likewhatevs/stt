@@ -800,7 +800,7 @@ impl<'a> Ctx<'a> {
 /// every worker pid moved, so workers see a stable cgroup
 /// membership at first run. [`spawn_diverse`] does NOT use this
 /// helper because it starts each handle inline (eager-start
-/// semantics required for its IoSync/CpuSpin mix — workload
+/// semantics required for its IoSyncWrite/CpuSpin mix — workload
 /// ordering matters when the mix includes I/O-bound and CPU-bound
 /// cgroups).
 ///
@@ -1020,22 +1020,23 @@ pub fn split_half(ctx: &Ctx) -> (BTreeSet<usize>, BTreeSet<usize>) {
     )
 }
 
-/// Spawn diverse workloads across N cgroups: CpuSpin, Bursty, IoSync,
-/// Mixed, YieldHeavy. Each cgroup uses `ctx.workers_per_cgroup`
-/// workers except IoSync cgroups, which always use 2 workers to
-/// avoid drowning the scenario in blocking IO.
+/// Spawn diverse workloads across N cgroups: CpuSpin, Bursty,
+/// IoSyncWrite, Mixed, YieldHeavy. Each cgroup uses
+/// `ctx.workers_per_cgroup` workers except IoSyncWrite cgroups,
+/// which always use 2 workers to avoid drowning the scenario in
+/// blocking IO.
 pub fn spawn_diverse(ctx: &Ctx, cgroup_names: &[&str]) -> Result<Vec<WorkloadHandle>> {
     let types = [
         WorkType::CpuSpin,
         WorkType::bursty(50, 100),
-        WorkType::IoSync,
+        WorkType::IoSyncWrite,
         WorkType::Mixed,
         WorkType::YieldHeavy,
     ];
     let mut handles = Vec::new();
     for (i, name) in cgroup_names.iter().enumerate() {
         let wt = types[i % types.len()].clone();
-        let n = if matches!(wt, WorkType::IoSync) {
+        let n = if matches!(wt, WorkType::IoSyncWrite) {
             2
         } else {
             ctx.workers_per_cgroup

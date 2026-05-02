@@ -288,9 +288,9 @@ pub enum WorkTypeHint {
     /// Strided memory access pattern dominating CPU time. Maps to
     /// `WorkType::CachePressure` with measured `size_kb` / `stride`.
     CachePressure { size_kb: u32, stride: u32 },
-    /// IO-sync-style workload — short bursts of write + small sleep
-    /// loops. Maps to `WorkType::IoSync`.
-    IoSync,
+    /// IO-sync-style workload — short bursts of write + fdatasync
+    /// loops. Maps to `WorkType::IoSyncWrite`.
+    IoSyncWrite,
 }
 
 /// Cgroup definition hint. Maps to `crate::workload::CgroupDef`.
@@ -410,7 +410,7 @@ pub fn project_fingerprint(
     }
 
     // WorkSpec-type hints come from CPU-time / wakeup-rate shape across
-    // the sampling window. Bursty / IoSync are detected by sleep
+    // the sampling window. Bursty / IoSyncWrite are detected by sleep
     // ratio; CpuSpin / Mixed by yield rate vs CPU time.
     fp.work_type_hints = project_work_type_hints(samples);
 

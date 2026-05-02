@@ -214,8 +214,13 @@ pub enum Phase {
     Sleep(#[serde(with = "humantime_serde_helper")] Duration),
     /// Yield (sched_yield) repeatedly for the given duration.
     Yield(#[serde(with = "humantime_serde_helper")] Duration),
-    /// Simulated I/O (write 64 KB to tmpfs + 100 us sleep) for the given
-    /// duration. See [`WorkType::IoSync`] for details on tmpfs behavior.
+    /// Simulated I/O (write 64 KB to a tempfile + 100 us sleep) for
+    /// the given duration. The tempfile lives on whatever filesystem
+    /// `std::env::temp_dir()` returns; on the ktstr guest's tmpfs the
+    /// write is a page-cache memcpy and the sleep provides the
+    /// blocking behavior that real disk fsync would cause.
+    /// `WorkType::IoSyncWrite` (the standalone variant) is the disk-IO
+    /// counterpart that opens `/dev/vda` directly.
     Io(#[serde(with = "humantime_serde_helper")] Duration),
 }
 
@@ -265,12 +270,32 @@ pub enum WorkType {
     YieldHeavy,
     /// CPU spin burst followed by sched_yield.
     Mixed,
-    /// Simulated I/O-bound workload: writes 64 KB to a temp file then
-    /// sleeps 100 us to simulate I/O completion latency. On tmpfs (which
-    /// ktstr VMs use), the write is a page-cache memcpy and fsync is a
-    /// no-op (`noop_fsync`), so the sleep provides the blocking behavior
-    /// that real disk fsync would cause.
-    IoSync,
+    /// Synchronous write workload against a real block device. Each
+    /// iteration issues 16 × 4 KB pwrites totaling 64 KB at the
+    /// worker's stripe offset (per-worker striping prevents fdatasync
+    /// from coalescing across writers), then `fdatasync()`s. Drives
+    /// fsync-heavy D-state cycles. Opens `/dev/vda` with `O_SYNC` once
+    /// per worker; if `/dev/vda` is absent (host-side unit tests), a
+    /// per-worker tempfile is opened with the same flags and used as
+    /// the backing.
+    IoSyncWrite,
+    /// Random-read workload against a real block device. Each
+    /// iteration issues a single 4 KB pread at a sector-aligned random
+    /// offset within the device capacity. Opens `/dev/vda` with
+    /// `O_DIRECT` once per worker; if `/dev/vda` is absent, a
+    /// per-worker tempfile is opened with the same flags and used as
+    /// the backing. Drives high-IOPS short-D-state cycles. Offsets
+    /// come from a per-worker xorshift PRNG seeded from `tid`; no
+    /// crate dependency on `rand`.
+    IoRandRead,
+    /// Mixed sequential-write + random-read workload. Each iteration
+    /// alternates between a 4 KB pwrite at the worker's monotonic
+    /// sequential cursor and a 4 KB pread at a random offset.
+    /// `fdatasync()` runs every 16 iterations, exercising the
+    /// convoy/coalescing-failure pathology where writes batch up to a
+    /// large flush. Opens `/dev/vda` (or tempfile fallback) with
+    /// `O_DIRECT` once per worker.
+    IoMixed,
     /// Work hard for burst_ms, sleep for sleep_ms, repeat. Frees CPUs during sleep for borrowing.
     Bursty { burst_ms: u64, sleep_ms: u64 },
     /// CPU burst then 1-byte pipe exchange with a partner worker. Sleep
@@ -779,7 +804,9 @@ impl WorkType {
             WorkType::CpuSpin => "CpuSpin",
             WorkType::YieldHeavy => "YieldHeavy",
             WorkType::Mixed => "Mixed",
-            WorkType::IoSync => "IoSync",
+            WorkType::IoSyncWrite => "IoSyncWrite",
+            WorkType::IoRandRead => "IoRandRead",
+            WorkType::IoMixed => "IoMixed",
             WorkType::Bursty { .. } => "Bursty",
             WorkType::PipeIo { .. } => "PipeIo",
             WorkType::FutexPingPong { .. } => "FutexPingPong",
@@ -815,7 +842,9 @@ impl WorkType {
             "CpuSpin" => Some(WorkType::CpuSpin),
             "YieldHeavy" => Some(WorkType::YieldHeavy),
             "Mixed" => Some(WorkType::Mixed),
-            "IoSync" => Some(WorkType::IoSync),
+            "IoSyncWrite" => Some(WorkType::IoSyncWrite),
+            "IoRandRead" => Some(WorkType::IoRandRead),
+            "IoMixed" => Some(WorkType::IoMixed),
             "Bursty" => Some(WorkType::Bursty {
                 burst_ms: defaults::BURSTY_BURST_MS,
                 sleep_ms: defaults::BURSTY_SLEEP_MS,
@@ -2247,7 +2276,8 @@ pub struct WorkerReport {
     /// futex wait, `poll`, `sched_yield`, `nanosleep`, etc.) and the
     /// wakeup that resumes execution; not a yield-specific measure.
     /// Populated for blocking work types: Bursty, PipeIo, FutexPingPong,
-    /// FutexFanOut, FanOutCompute, CacheYield, CachePipe, IoSync, NiceSweep,
+    /// FutexFanOut, FanOutCompute, CacheYield, CachePipe, IoSyncWrite,
+    /// IoRandRead, IoMixed, NiceSweep,
     /// AffinityChurn, PolicyChurn, MutexContention, ForkExit (parent's
     /// waitpid wait), Sequence with Sleep/Yield/Io phases.
     pub resume_latencies_ns: Vec<u64>,
@@ -4254,6 +4284,136 @@ unsafe fn futex_wait(futex_ptr: *mut u32, expected: u32, ts: &libc::timespec) {
     }
 }
 
+// ----------------------------------------------------------------------------
+// Real-disk IO helpers for IoSyncWrite / IoRandRead / IoMixed
+// ----------------------------------------------------------------------------
+
+/// Block size for the IO workloads. Matches the page size on x86_64
+/// and aarch64 (the only ktstr targets) so `O_DIRECT` reads /
+/// writes have the alignment the block layer requires (the BIO
+/// path rejects non-page-aligned `O_DIRECT` IO with -EINVAL).
+const IO_BLOCK_SIZE: usize = 4096;
+
+/// Sector size enforced by the virtio-blk device. Every offset the
+/// workloads pass to pread/pwrite must be a multiple of this.
+const IO_SECTOR_SIZE: u64 = 512;
+
+/// Number of stripes the per-worker striping divides the device
+/// into. Matches the upper bound on plausible worker counts for
+/// the smoke-test fan-out so each worker gets its own
+/// non-overlapping write region.
+const IO_NUM_STRIPES: u64 = 64;
+
+/// Linux ioctl number for BLKGETSIZE64 (returns device size in
+/// bytes via `*u64`). Magic encoding: `_IOR(0x12, 114,
+/// sizeof(u64))` per `<linux/fs.h>` — direction=READ (2),
+/// type=0x12, nr=114, size=8. The libc crate does not export this
+/// constant; it's the same value GLIBC's `<sys/mount.h>` exposes
+/// when included.
+const BLKGETSIZE64: libc::c_ulong = 0x80081272;
+
+/// Tempfile capacity for the host-side fallback when /dev/vda is
+/// absent. 16 MiB is enough room for `IO_NUM_STRIPES` stripes of
+/// `256 KiB` each, large enough that the random-offset PRNG hits
+/// many sectors per second without wrapping immediately.
+const IO_TEMPFILE_CAPACITY: u64 = 16 * 1024 * 1024;
+
+/// Open `/dev/vda` (or a host-side tempfile fallback) with the
+/// requested flags, query its capacity in bytes, and return
+/// `(File, capacity_bytes, optional_tempfile_path)`. The path is
+/// `Some` only when the fallback was used so the caller can unlink
+/// on exit; for `/dev/vda` it's `None` because block devices are
+/// never deleted.
+fn open_io_backing(extra_flags: libc::c_int, tid: libc::pid_t) -> Option<(std::fs::File, u64, Option<String>)> {
+    use std::os::unix::io::FromRawFd;
+
+    let dev_vda = std::path::Path::new("/dev/vda");
+    if dev_vda.exists() {
+        // SAFETY: nul-terminated string literal, valid for the
+        // duration of the open call.
+        let cstr = c"/dev/vda";
+        let fd = unsafe { libc::open(cstr.as_ptr(), libc::O_RDWR | extra_flags) };
+        if fd < 0 {
+            return None;
+        }
+        let mut size_bytes: u64 = 0;
+        // SAFETY: BLKGETSIZE64 writes a u64 through the pointer; we
+        // own the storage and pass a valid mutable pointer. The
+        // ioctl is documented for any block-device fd in
+        // `<linux/fs.h>`.
+        let rc = unsafe {
+            libc::ioctl(fd, BLKGETSIZE64, &mut size_bytes as *mut u64)
+        };
+        if rc != 0 {
+            unsafe { libc::close(fd) };
+            return None;
+        }
+        // SAFETY: `fd` is owned and valid; from_raw_fd takes
+        // ownership and the resulting File closes the fd on drop.
+        let f = unsafe { std::fs::File::from_raw_fd(fd) };
+        return Some((f, size_bytes, None));
+    }
+
+    // Host-side fallback: per-worker tempfile sized to
+    // `IO_TEMPFILE_CAPACITY`. Opened via OpenOptions so the file is
+    // created+truncated in one call; flags are then applied via
+    // fcntl since OpenOptions doesn't expose O_SYNC / O_DIRECT
+    // directly.
+    let path = std::env::temp_dir()
+        .join(format!("ktstr_iodev_{tid}"))
+        .to_string_lossy()
+        .to_string();
+    use std::os::unix::fs::OpenOptionsExt;
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .custom_flags(extra_flags)
+        .open(&path)
+        .ok()?;
+    f.set_len(IO_TEMPFILE_CAPACITY).ok()?;
+    Some((f, IO_TEMPFILE_CAPACITY, Some(path)))
+}
+
+/// xorshift64* PRNG step. Returns the new state and the output
+/// sample (high-quality scrambling of the state). One self-citing
+/// invariant: the input `state` must be non-zero (xorshift's
+/// fixed-point); callers seed with a tid-derived non-zero value
+/// in `worker_main`.
+#[inline]
+fn xorshift64(state: u64) -> u64 {
+    let mut x = state;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    x
+}
+
+/// Pick a sector-aligned random offset in `[0, capacity - block_size)`.
+fn rand_io_offset(rng_state: &mut u64, capacity_bytes: u64) -> u64 {
+    *rng_state = xorshift64(*rng_state);
+    let max_offset = capacity_bytes.saturating_sub(IO_BLOCK_SIZE as u64);
+    if max_offset == 0 {
+        return 0;
+    }
+    // Round down to sector boundary. `IO_SECTOR_SIZE` is a power of
+    // 2 so the mask is a single `&` (no division).
+    let raw = *rng_state % max_offset;
+    raw & !(IO_SECTOR_SIZE - 1)
+}
+
+/// Compute the per-worker stripe base offset for sequential writes.
+/// `tid % IO_NUM_STRIPES` selects the stripe index; `stripe_size`
+/// is `capacity / IO_NUM_STRIPES`. Result is sector-aligned because
+/// `capacity` is a sector-aligned device size and the divisor is a
+/// power of 2.
+fn stripe_base(tid: libc::pid_t, capacity_bytes: u64) -> u64 {
+    let stripe_size = (capacity_bytes / IO_NUM_STRIPES) & !(IO_SECTOR_SIZE - 1);
+    let stripe_idx = (tid as u64) % IO_NUM_STRIPES;
+    stripe_idx * stripe_size
+}
+
 #[allow(clippy::too_many_arguments)]
 fn worker_main(
     affinity: Option<BTreeSet<usize>>,
@@ -4305,8 +4465,35 @@ fn worker_main(
     // contents. Vec<u64> gives natural 8-byte alignment from the
     // allocator.
     let mut matrix_buf: Option<Vec<u64>> = None;
-    // Persistent temp file for IoSync / Phase::Io (opened on first use, removed on exit).
-    let mut io_sync_file: Option<(std::fs::File, String)> = None;
+    // Persistent /dev/vda fd (or tempfile fallback) for IoSyncWrite /
+    // IoRandRead / IoMixed. Opened on first iteration, closed when
+    // worker_main returns. The Option holds (File, capacity_bytes,
+    // optional_tempfile_path). When `path` is Some, the file is a
+    // per-worker tempfile that must be unlinked on exit; when None,
+    // the file is /dev/vda which is a block device we never delete.
+    let mut io_disk: Option<(std::fs::File, u64, Option<String>)> = None;
+    // Page-aligned 4 KiB scratch buffer for O_DIRECT pread/pwrite.
+    // Allocated lazily on first IO iteration via std::alloc; freed
+    // before worker_main returns. Reused across iterations so the
+    // hot-path issues no per-iteration allocator calls.
+    let mut io_buf: Option<std::ptr::NonNull<u8>> = None;
+    // Per-worker xorshift PRNG state for IoRandRead / IoMixed.
+    // Seeded from `tid ^ 0x9E37_79B9_7F4A_7C15` (the same Weyl
+    // increment golden-ratio constant glibc's `nrand48` family
+    // uses) so a tid of 0 still produces a non-zero seed. Kept on
+    // the stack (not heap) — pure scalar state.
+    let mut io_rng: u64 = (tid as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    if io_rng == 0 {
+        io_rng = 0x9E37_79B9_7F4A_7C15;
+    }
+    // Sequential write cursor for IoMixed. Starts at the worker's
+    // stripe base (computed lazily once /dev/vda capacity is known)
+    // and advances by 4 KiB per pwrite, wrapping at the stripe end.
+    let mut io_seq_cursor: u64 = 0;
+    let mut io_iter: u64 = 0;
+    // Phase::Io still uses the legacy tempfile-on-tmpfs implementation
+    // (separate from IoSync*). Keep its own slot so worker cleanup is
+    // independent.
     let mut io_seq_file: Option<(std::fs::File, String)> = None;
     // PageFaultChurn: persistent anonymous mmap region and PRNG
     // state, allocated on first outer iteration and reused across
@@ -4438,38 +4625,198 @@ fn worker_main(
                 std::thread::yield_now();
                 iterations += 1;
             }
-            WorkType::IoSync => {
-                let (f, _) = io_sync_file.get_or_insert_with(|| {
-                    let path = std::env::temp_dir()
-                        .join(format!("ktstr_io_{tid}"))
-                        .to_string_lossy()
-                        .to_string();
-                    let f = std::fs::OpenOptions::new()
-                        .write(true)
-                        .create(true)
-                        .truncate(true)
-                        .open(&path)
-                        .expect("failed to create IoSync temp file");
-                    (f, path)
-                });
-                let _ = f.set_len(0);
-                let _ = f.seek(std::io::SeekFrom::Start(0));
-                let buf = [0u8; 4096];
-                for _ in 0..16 {
-                    let _ = f.write_all(&buf);
+            WorkType::IoSyncWrite => {
+                use std::os::unix::io::AsRawFd;
+                if io_disk.is_none() {
+                    if let Some(d) = open_io_backing(libc::O_SYNC, tid) {
+                        io_disk = Some(d);
+                    } else {
+                        // Open failed: skip this iteration and yield
+                        // so the worker doesn't spin-hot.
+                        std::thread::yield_now();
+                        iterations += 1;
+                        continue;
+                    }
+                }
+                let (f, capacity, _) = io_disk.as_ref().unwrap();
+                let buf = [0u8; IO_BLOCK_SIZE];
+                let base = stripe_base(tid, *capacity);
+                let stripe_size =
+                    (*capacity / IO_NUM_STRIPES) & !(IO_SECTOR_SIZE - 1);
+                // 16 × 4 KiB = 64 KiB per iteration. Walk
+                // sequentially within the stripe; wrap at stripe end
+                // so a long-running worker re-writes the same
+                // 64 KiB → 256 KiB region (depending on stripe size)
+                // forever rather than running off the end.
+                let stripe_extent = stripe_size.max(IO_BLOCK_SIZE as u64 * 16);
+                let iter_off = (io_iter * IO_BLOCK_SIZE as u64 * 16) % stripe_extent;
+                let fd = f.as_raw_fd();
+                for i in 0..16u64 {
+                    let off = base + iter_off + i * IO_BLOCK_SIZE as u64;
+                    // SAFETY: `buf` is a valid &[u8] of length
+                    // IO_BLOCK_SIZE; `fd` is owned by `f` which lives
+                    // for the duration of this match arm.
+                    let _ = unsafe {
+                        libc::pwrite(
+                            fd,
+                            buf.as_ptr() as *const libc::c_void,
+                            IO_BLOCK_SIZE,
+                            off as libc::off_t,
+                        )
+                    };
                     work_units = std::hint::black_box(work_units.wrapping_add(1));
                 }
-                // Sleep 100us to simulate I/O completion latency.
-                // On tmpfs, fsync is noop_fsync (returns 0), so without
-                // this sleep IoSync would be a pure CPU workload.
-                let before_sleep = Instant::now();
-                std::thread::sleep(Duration::from_micros(100));
+                let before_fsync = Instant::now();
+                // SAFETY: `fd` is a valid file descriptor owned by
+                // `f`. fdatasync blocks until kernel-level
+                // dirty-data flush completes.
+                let _ = unsafe { libc::fdatasync(fd) };
                 reservoir_push(
                     &mut resume_latencies_ns,
                     &mut wake_sample_count,
-                    before_sleep.elapsed().as_nanos() as u64,
+                    before_fsync.elapsed().as_nanos() as u64,
                     MAX_WAKE_SAMPLES,
                 );
+                io_iter = io_iter.wrapping_add(1);
+                last_iter_time = Instant::now();
+                iterations += 1;
+            }
+            WorkType::IoRandRead => {
+                use std::os::unix::io::AsRawFd;
+                if io_disk.is_none() {
+                    if let Some(d) = open_io_backing(libc::O_DIRECT, tid) {
+                        io_disk = Some(d);
+                    } else {
+                        std::thread::yield_now();
+                        iterations += 1;
+                        continue;
+                    }
+                }
+                if io_buf.is_none() {
+                    // SAFETY: layout has size 4096, alignment 4096.
+                    // alloc returns a non-null pointer on success
+                    // (we check with NonNull::new). Buffer is freed
+                    // in the cleanup block at end of worker_main.
+                    let layout = std::alloc::Layout::from_size_align(
+                        IO_BLOCK_SIZE,
+                        IO_BLOCK_SIZE,
+                    )
+                    .expect("page-aligned 4 KiB layout is valid");
+                    let ptr = unsafe { std::alloc::alloc(layout) };
+                    io_buf = std::ptr::NonNull::new(ptr);
+                    if io_buf.is_none() {
+                        // OOM at allocator. Skip the IO this iteration.
+                        std::thread::yield_now();
+                        iterations += 1;
+                        continue;
+                    }
+                }
+                let (f, capacity, _) = io_disk.as_ref().unwrap();
+                let off = rand_io_offset(&mut io_rng, *capacity);
+                let fd = f.as_raw_fd();
+                let before_pread = Instant::now();
+                // SAFETY: `io_buf` is page-aligned (4 KiB allocation
+                // from the system allocator with a 4 KiB align
+                // request) and large enough for IO_BLOCK_SIZE. `fd`
+                // is owned and valid.
+                let _ = unsafe {
+                    libc::pread(
+                        fd,
+                        io_buf.unwrap().as_ptr() as *mut libc::c_void,
+                        IO_BLOCK_SIZE,
+                        off as libc::off_t,
+                    )
+                };
+                reservoir_push(
+                    &mut resume_latencies_ns,
+                    &mut wake_sample_count,
+                    before_pread.elapsed().as_nanos() as u64,
+                    MAX_WAKE_SAMPLES,
+                );
+                work_units = std::hint::black_box(work_units.wrapping_add(1));
+                io_iter = io_iter.wrapping_add(1);
+                last_iter_time = Instant::now();
+                iterations += 1;
+            }
+            WorkType::IoMixed => {
+                use std::os::unix::io::AsRawFd;
+                if io_disk.is_none() {
+                    if let Some(d) = open_io_backing(libc::O_DIRECT, tid) {
+                        let cap = d.1;
+                        io_disk = Some(d);
+                        io_seq_cursor = stripe_base(tid, cap);
+                    } else {
+                        std::thread::yield_now();
+                        iterations += 1;
+                        continue;
+                    }
+                }
+                if io_buf.is_none() {
+                    let layout = std::alloc::Layout::from_size_align(
+                        IO_BLOCK_SIZE,
+                        IO_BLOCK_SIZE,
+                    )
+                    .expect("page-aligned 4 KiB layout is valid");
+                    let ptr = unsafe { std::alloc::alloc(layout) };
+                    io_buf = std::ptr::NonNull::new(ptr);
+                    if io_buf.is_none() {
+                        std::thread::yield_now();
+                        iterations += 1;
+                        continue;
+                    }
+                }
+                let (f, capacity, _) = io_disk.as_ref().unwrap();
+                let fd = f.as_raw_fd();
+                let stripe_size =
+                    (*capacity / IO_NUM_STRIPES) & !(IO_SECTOR_SIZE - 1);
+                let stripe_extent = stripe_size.max(IO_BLOCK_SIZE as u64 * 16);
+                let base = stripe_base(tid, *capacity);
+                // Sequential pwrite at the per-worker cursor. Wrap
+                // back to the stripe base when the cursor walks
+                // past the stripe end so a long worker re-writes
+                // its stripe forever.
+                if io_seq_cursor >= base + stripe_extent {
+                    io_seq_cursor = base;
+                }
+                let before_io = Instant::now();
+                // SAFETY: io_buf is the page-aligned 4 KiB
+                // allocation; treating it as a const slice of
+                // IO_BLOCK_SIZE bytes is in-bounds.
+                let _ = unsafe {
+                    libc::pwrite(
+                        fd,
+                        io_buf.unwrap().as_ptr() as *const libc::c_void,
+                        IO_BLOCK_SIZE,
+                        io_seq_cursor as libc::off_t,
+                    )
+                };
+                io_seq_cursor = io_seq_cursor.wrapping_add(IO_BLOCK_SIZE as u64);
+                // Random pread.
+                let r_off = rand_io_offset(&mut io_rng, *capacity);
+                // SAFETY: same buffer, same fd; mutating the
+                // 4 KiB region in-place.
+                let _ = unsafe {
+                    libc::pread(
+                        fd,
+                        io_buf.unwrap().as_ptr() as *mut libc::c_void,
+                        IO_BLOCK_SIZE,
+                        r_off as libc::off_t,
+                    )
+                };
+                // fdatasync every 16 iterations — the
+                // convoy/coalescing-failure pathology cadence.
+                if io_iter.is_multiple_of(16) {
+                    // SAFETY: `fd` is owned and valid.
+                    let _ = unsafe { libc::fdatasync(fd) };
+                }
+                reservoir_push(
+                    &mut resume_latencies_ns,
+                    &mut wake_sample_count,
+                    before_io.elapsed().as_nanos() as u64,
+                    MAX_WAKE_SAMPLES,
+                );
+                work_units = std::hint::black_box(work_units.wrapping_add(2));
+                io_iter = io_iter.wrapping_add(1);
                 last_iter_time = Instant::now();
                 iterations += 1;
             }
@@ -5966,12 +6313,28 @@ fn worker_main(
         unsafe { libc::sched_setscheduler(0, libc::SCHED_OTHER, &param) };
     }
 
-    // Clean up persistent temp files.
-    if let Some((_, path)) = io_sync_file {
-        let _ = std::fs::remove_file(&path);
-    }
+    // Clean up Phase::Io tempfile.
     if let Some((_, path)) = io_seq_file {
         let _ = std::fs::remove_file(&path);
+    }
+    // Clean up IoSyncWrite/IoRandRead/IoMixed: drop the File (which
+    // closes the fd), and unlink the host-side fallback tempfile if
+    // any. /dev/vda has `path=None` so the unlink is skipped — block
+    // devices are never deleted.
+    if let Some((file, _capacity, path)) = io_disk.take() {
+        drop(file);
+        if let Some(p) = path {
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+    // Free the page-aligned scratch buffer used by IoRandRead /
+    // IoMixed. SAFETY: the layout matches what was passed to alloc
+    // (4 KiB / 4 KiB align); the pointer is non-null per
+    // `NonNull::new` at allocation time.
+    if let Some(ptr) = io_buf.take() {
+        let layout = std::alloc::Layout::from_size_align(IO_BLOCK_SIZE, IO_BLOCK_SIZE)
+            .expect("page-aligned 4 KiB layout is valid");
+        unsafe { std::alloc::dealloc(ptr.as_ptr(), layout) };
     }
     // Clean up persistent PageFaultChurn mmap region.
     if let Some((ptr, size)) = page_fault_region {
@@ -6099,7 +6462,8 @@ fn worker_main(
 //    construction. The optimizer cannot reason across the
 //    user-kernel boundary, so syscall sites act as natural barriers
 //    that force surrounding values to materialize. WorkTypes that
-//    need scheduler events (`FutexFanOut`, `IoSync`, `Phase::Yield`)
+//    need scheduler events (`FutexFanOut`, `IoSyncWrite`,
+//    `Phase::Yield`)
 //    rely on this implicit barrier in addition to the explicit
 //    `black_box` / volatile pairs above.
 //
@@ -8005,10 +8369,55 @@ mod tests {
     }
 
     #[test]
-    fn spawn_io_sync_produces_work() {
-        let reports = spawn_and_collect_after(WorkType::IoSync, 1, 200);
+    fn spawn_io_sync_write_produces_work() {
+        let reports = spawn_and_collect_after(WorkType::IoSyncWrite, 1, 200);
         assert_eq!(reports.len(), 1);
-        assert!(reports[0].work_units > 0);
+        assert!(
+            reports[0].work_units > 0,
+            "IoSyncWrite worker {} did no work",
+            reports[0].tid
+        );
+    }
+
+    #[test]
+    fn spawn_io_rand_read_produces_work() {
+        let reports = spawn_and_collect_after(WorkType::IoRandRead, 1, 200);
+        assert_eq!(reports.len(), 1);
+        assert!(
+            reports[0].work_units > 0,
+            "IoRandRead worker {} did no work",
+            reports[0].tid
+        );
+    }
+
+    #[test]
+    fn spawn_io_mixed_produces_work() {
+        let reports = spawn_and_collect_after(WorkType::IoMixed, 1, 200);
+        assert_eq!(reports.len(), 1);
+        assert!(
+            reports[0].work_units > 0,
+            "IoMixed worker {} did no work",
+            reports[0].tid
+        );
+    }
+
+    /// Each new IO variant's PascalCase name round-trips through
+    /// `from_name` back to the same variant. Pins the bidirectional
+    /// API contract — a regression that drops one of the 3 names
+    /// from `from_name`'s match would surface here rather than at
+    /// CLI parse time.
+    #[test]
+    fn io_variant_names_round_trip() {
+        for name in ["IoSyncWrite", "IoRandRead", "IoMixed"] {
+            let wt = WorkType::from_name(name)
+                .unwrap_or_else(|| panic!("from_name({name:?}) returned None"));
+            assert_eq!(
+                wt.name(),
+                name,
+                "round-trip mismatch: from_name({name:?}).name() == {:?}",
+                wt.name()
+            );
+        }
     }
 
     #[test]
@@ -8219,12 +8628,25 @@ mod tests {
         assert_eq!(r2.tid, i32::MAX);
     }
 
+    /// IoSyncWrite uses /dev/vda when available (block device, no
+    /// path to clean up) and falls back to a per-worker tempfile
+    /// `ktstr_iodev_{tid}` on host machines where /dev/vda is
+    /// absent. The cleanup contract: when the fallback was used,
+    /// the tempfile must be unlinked when the worker exits.
+    /// Skipped when running inside a VM where /dev/vda exists —
+    /// no fallback path to assert on.
     #[test]
-    fn io_sync_cleans_up_temp_file() {
+    fn io_sync_write_cleans_up_tempfile_fallback() {
+        if std::path::Path::new("/dev/vda").exists() {
+            // Running inside a VM with a real virtio-blk: the
+            // workload uses /dev/vda directly, no host-side
+            // tempfile to clean up.
+            return;
+        }
         let config = WorkloadConfig {
             num_workers: 1,
             affinity: ResolvedAffinity::None,
-            work_type: WorkType::IoSync,
+            work_type: WorkType::IoSyncWrite,
             sched_policy: SchedPolicy::Normal,
             ..Default::default()
         };
@@ -8235,12 +8657,12 @@ mod tests {
         assert_eq!(reports.len(), 1);
         let tid = reports[0].tid;
         let path = std::env::temp_dir()
-            .join(format!("ktstr_io_{tid}"))
+            .join(format!("ktstr_iodev_{tid}"))
             .to_string_lossy()
             .to_string();
         assert!(
             !std::path::Path::new(&path).exists(),
-            "temp file {path} should be cleaned up"
+            "tempfile fallback {path} should be cleaned up"
         );
     }
 
@@ -9280,7 +9702,9 @@ mod tests {
         assert_eq!(WorkType::CpuSpin.worker_group_size(), None);
         assert_eq!(WorkType::YieldHeavy.worker_group_size(), None);
         assert_eq!(WorkType::Mixed.worker_group_size(), None);
-        assert_eq!(WorkType::IoSync.worker_group_size(), None);
+        assert_eq!(WorkType::IoSyncWrite.worker_group_size(), None);
+        assert_eq!(WorkType::IoRandRead.worker_group_size(), None);
+        assert_eq!(WorkType::IoMixed.worker_group_size(), None);
         assert_eq!(WorkType::bursty(50, 100).worker_group_size(), None);
         assert_eq!(WorkType::cache_pressure(32, 64).worker_group_size(), None);
         assert_eq!(WorkType::cache_yield(32, 64).worker_group_size(), None);

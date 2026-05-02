@@ -39,7 +39,7 @@ pub fn custom_cgroup_add_load_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     execute_scenario(ctx, backdrop, steps)
 }
 
-/// Three cgroups with CpuSpin, Bursty, and IoSync workloads.
+/// Three cgroups with CpuSpin, Bursty, and IoSyncWrite workloads.
 pub fn custom_cgroup_imbalance_mixed_workload(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![Step::with_defs(
         vec![
@@ -49,7 +49,7 @@ pub fn custom_cgroup_imbalance_mixed_workload(ctx: &Ctx) -> Result<AssertResult>
                 .work_type(WorkType::bursty(100, 50)),
             CgroupDef::named("cg_2")
                 .workers(ctx.workers_per_cgroup)
-                .work_type(WorkType::IoSync),
+                .work_type(WorkType::IoSyncWrite),
         ],
         HoldSpec::Fixed(ctx.settle + ctx.duration),
     )];
@@ -289,13 +289,13 @@ pub fn custom_cgroup_no_ctrl_load_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     execute_steps(ctx, steps)
 }
 
-/// IoSync cgroup vs fully-subscribed CpuSpin cgroup.
+/// IoSyncWrite cgroup vs fully-subscribed CpuSpin cgroup.
 pub fn custom_cgroup_io_compute_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![Step::with_defs(
         vec![
             CgroupDef::named("cg_0")
                 .workers(ctx.workers_per_cgroup)
-                .work_type(WorkType::IoSync),
+                .work_type(WorkType::IoSyncWrite),
             CgroupDef::named("cg_1").workers(ctx.topo.total_cpus()),
         ],
         HoldSpec::Fixed(ctx.settle + ctx.duration),
