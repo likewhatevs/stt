@@ -177,7 +177,7 @@ fn live_host_pipeline_e2e_kmsg_to_reproducer_spec_to_source() {
     );
     // num_workers from the workload group hint should be visible.
     assert!(
-        run_src.contains("num_workers: 4") || run_src.contains("num_workers : 4"),
+        run_src.contains(".workers(4)") || run_src.contains("num_workers: 4"),
         "thread_count=4 must materialize in source: {run_src}",
     );
 }
@@ -232,9 +232,12 @@ fn live_host_pipeline_e2e_empty_capture_falls_back_to_defaults() {
     let src = render_run_file_source(&spec, "default_template");
     assert!(src.contains("pub fn default_template"));
     assert!(src.contains("WorkloadConfig"));
-    // num_workers default is 1 — pin it explicitly.
+    // num_workers default is 1 — pin it explicitly. The generator
+    // emits the public builder API (`.workers(N)`); accept either
+    // form so an out-of-band switch to struct-literal syntax doesn't
+    // silently break the assertion.
     assert!(
-        src.contains("num_workers: 1") || src.contains("num_workers : 1"),
+        src.contains(".workers(1)") || src.contains("num_workers: 1"),
         "default num_workers=1 must render: {src}",
     );
 }

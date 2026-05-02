@@ -189,6 +189,22 @@ pub fn parse_kmsg_window(text: &str) -> Vec<ScxExitEvent> {
                 if !new_frames.is_empty() {
                     frames.append(&mut new_frames);
                 } else if !next.trim().is_empty() {
+                    // Skip standard kernel stack-trace formatting lines
+                    // (`Call Trace:`, `<TASK>`, `</TASK>`) that appear
+                    // between the message body and the actual %pS frames.
+                    // These carry no symbol tokens but mark the start of
+                    // a stack section that follows — breaking here would
+                    // miss the frames the kernel emits next.
+                    let trimmed = next.trim();
+                    if trimmed.ends_with("Call Trace:")
+                        || trimmed == "<TASK>"
+                        || trimmed == "</TASK>"
+                        || trimmed.ends_with("<TASK>")
+                        || trimmed.ends_with("</TASK>")
+                    {
+                        j += 1;
+                        continue;
+                    }
                     // Stop accumulating message text once we leave
                     // the printk continuation block — heuristic:
                     // lines that don't carry a kmsg priority/timestamp
@@ -342,24 +358,47 @@ fn classify_exit_kind(message: &str, stack: &[StackSymbol]) -> ScxExitKind {
 ///
 /// Scans for the patterns ktstr-aware schedulers (and the
 /// upstream watchdog) tend to emit:
-/// - `task <COMM>` (mainline watchdog: "...stalled task <COMM>:<pid>")
+/// - `task <COMM>:<pid>` (mainline watchdog: "...stalled task <COMM>:<pid>")
 /// - `comm=<COMM>` (some custom schedulers)
+///
+/// The `task <COMM>` pattern requires the COMM to be followed by
+/// `:<digits>` (the watchdog always prints the pid). This avoids
+/// matching prose like "runnable task stall" in the anchor's
+/// parenthesized body, where "stall" is a classification keyword
+/// rather than a process name.
 ///
 /// Returns the first matching COMM truncated to TASK_COMM_LEN bytes,
 /// or `None` when no pattern matches.
 fn extract_stuck_task_comm(message: &str) -> Option<String> {
     const TASK_COMM_LEN: usize = 16;
-    // task <COMM>[:<pid>]
-    if let Some(idx) = message.find("task ") {
+    // Kernel watchdog format: `task <COMM>:<pid>`. The bare `find("task ")`
+    // matches phrases like "task stall" before "task hot_path:1234", so we
+    // walk every "task " occurrence and accept the first whose next
+    // whitespace-delimited token has the `<COMM>:<digits>` shape.
+    let mut search_from = 0;
+    while let Some(rel) = message[search_from..].find("task ") {
+        let idx = search_from + rel;
         let after = &message[idx + 5..];
         let token = after
-            .split(|c: char| c.is_whitespace() || c == ':')
-            .next()?
-            .trim_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != '-');
-        if !token.is_empty() {
-            let bounded: String = token.chars().take(TASK_COMM_LEN).collect();
-            return Some(bounded);
+            .split_whitespace()
+            .next()
+            .unwrap_or("");
+        if let Some((comm, pid_part)) = token.split_once(':') {
+            let pid_digits: String = pid_part
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            if !pid_digits.is_empty() {
+                let comm = comm.trim_matches(
+                    |c: char| !c.is_alphanumeric() && c != '_' && c != '-',
+                );
+                if !comm.is_empty() {
+                    let bounded: String = comm.chars().take(TASK_COMM_LEN).collect();
+                    return Some(bounded);
+                }
+            }
         }
+        search_from = idx + 5;
     }
     if let Some(idx) = message.find("comm=") {
         let after = &message[idx + 5..];
@@ -485,13 +524,22 @@ mod tests {
     /// Watchdog / stall classification fires when the message
     /// mentions stall keywords OR the stack carries
     /// check_rq_for_timeouts.
+    ///
+    /// Fixture mirrors production `dump_stack` output: a `Call Trace:`
+    /// header followed by `<TASK>` / `</TASK>` brackets around the
+    /// actual `%pS` frames. The parser must skip those formatting
+    /// lines (they carry no symbol tokens) instead of treating them
+    /// as end-of-stack.
     #[test]
     fn parse_kmsg_window_stall_classification() {
         let text = "\
 [1.0] sched_ext: BPF scheduler \"scx_test\" disabled (runnable task stall)
 [1.1] scx_test: stalled task hot_path:1234 not dispatched
-[1.2]  ? check_rq_for_timeouts+0x50/0x100
-[1.3]  ? scx_watchdog_workfn+0x10/0x80
+[1.2] Call Trace:
+[1.3]  <TASK>
+[1.4]  ? check_rq_for_timeouts+0x50/0x100
+[1.5]  ? scx_watchdog_workfn+0x10/0x80
+[1.6]  </TASK>
 ";
         let events = parse_kmsg_window(text);
         assert_eq!(events.len(), 1);

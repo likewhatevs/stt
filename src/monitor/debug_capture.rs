@@ -288,9 +288,23 @@ pub enum WorkTypeHint {
     /// Strided memory access pattern dominating CPU time. Maps to
     /// `WorkType::CachePressure` with measured `size_kb` / `stride`.
     CachePressure { size_kb: u32, stride: u32 },
-    /// IO-sync-style workload — short bursts of write + fdatasync
-    /// loops. Maps to `WorkType::IoSyncWrite`.
+    /// Synchronous-write workload — short bursts of `pwrite` followed
+    /// by `fdatasync`, opened with `O_SYNC`. Detection signal (when
+    /// capture pipeline wired): `O_SYNC` open flag plus a sequential
+    /// pwrite pattern. Maps to `WorkType::IoSyncWrite`.
     IoSyncWrite,
+    /// Random-read direct-IO workload — single-block `pread` at
+    /// random offsets, opened with `O_DIRECT`. Detection signal
+    /// (when capture pipeline wired): `O_DIRECT` open flag plus a
+    /// single-block read-only pattern at scattered offsets. Maps
+    /// to `WorkType::IoRandRead`.
+    IoRandRead,
+    /// Interleaved sequential `pwrite` and random `pread` with
+    /// periodic `fdatasync` via `O_DIRECT`. Detection signal (when
+    /// capture pipeline wired): `O_DIRECT` open flag plus mixed
+    /// read/write traffic at the same fd. Maps to
+    /// `WorkType::IoConvoy`.
+    IoConvoy,
 }
 
 /// Cgroup definition hint. Maps to `crate::workload::CgroupDef`.
@@ -503,12 +517,8 @@ fn project_sched_policy_hints(dump: &FailureDumpReport) -> Vec<SchedPolicyHint> 
 }
 
 fn project_work_type_hints(_samples: &[crate::ctprof::CtprofSnapshot]) -> Vec<WorkTypeHint> {
-    // The classifier (per classifier_design.md) is "human or LLM
-    // reading ktstr show/compare" — this projection's job is to
-    // expose the SHAPE of the work-type distribution as a hint
-    // list, not to render a definitive label. Producer wiring
-    // computes utilization / yield rate / sleep ratio from the
-    // sampling window and feeds the cases below.
+    // Returns empty; classification is human/LLM reading
+    // `ktstr show`/`compare` output.
     Vec::new()
 }
 
@@ -674,5 +684,35 @@ mod tests {
         assert_eq!(parsed.cgroup_hints.len(), 1);
         assert_eq!(parsed.sched_policy_hints.len(), 2);
         assert_eq!(parsed.gaps.len(), 1);
+    }
+
+    /// `WorkTypeHint::IoRandRead` and `WorkTypeHint::IoConvoy`
+    /// round-trip through the `#[serde(tag = "kind")]` wire format
+    /// without losing the variant. Pins both new IO-mode hints
+    /// alongside the existing `IoSyncWrite` so a regression that
+    /// drops one of them silently from the fingerprint serializer
+    /// surfaces here rather than at reproducer-generation time.
+    #[test]
+    fn work_type_hint_io_variants_roundtrip() {
+        for hint in [
+            WorkTypeHint::IoSyncWrite,
+            WorkTypeHint::IoRandRead,
+            WorkTypeHint::IoConvoy,
+        ] {
+            let json = serde_json::to_string(&hint)
+                .expect("WorkTypeHint must serialize");
+            let back: WorkTypeHint = serde_json::from_str(&json)
+                .expect("WorkTypeHint must deserialize");
+            // Match-arm equality so the test fails on a wrong
+            // variant rather than a generic mismatch.
+            match (&hint, &back) {
+                (WorkTypeHint::IoSyncWrite, WorkTypeHint::IoSyncWrite) => {}
+                (WorkTypeHint::IoRandRead, WorkTypeHint::IoRandRead) => {}
+                (WorkTypeHint::IoConvoy, WorkTypeHint::IoConvoy) => {}
+                _ => panic!(
+                    "IO hint roundtrip mismatch: sent {hint:?}, got {back:?}",
+                ),
+            }
+        }
     }
 }

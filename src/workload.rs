@@ -238,7 +238,7 @@ pub enum Phase {
 /// # Migration: `IoSync` was replaced
 ///
 /// `IoSync` was replaced by [`IoSyncWrite`](Self::IoSyncWrite),
-/// [`IoRandRead`](Self::IoRandRead), and [`IoMixed`](Self::IoMixed).
+/// [`IoRandRead`](Self::IoRandRead), and [`IoConvoy`](Self::IoConvoy).
 /// The old `IoSync` simulated IO via tmpfs+sleep — write 64 KB to
 /// a temp file (page-cache memcpy on tmpfs) then sleep 100 µs to
 /// imitate disk-fsync latency. The new variants do real
@@ -260,6 +260,26 @@ pub enum Phase {
 /// assert!(matches!(bursty, WorkType::Bursty { .. }));
 ///
 /// assert!(WorkType::from_name("nonexistent").is_none());
+/// ```
+///
+/// IO variants share the [`IoBacking`] open path but differ in the
+/// open flag + IO shape used to detect them:
+///
+/// - [`IoSyncWrite`](Self::IoSyncWrite): `O_SYNC` + sequential
+///   `pwrite` bursts followed by `fdatasync`.
+/// - [`IoRandRead`](Self::IoRandRead): `O_DIRECT` + random `pread`
+///   to a logical-block-aligned scratch buffer.
+/// - [`IoConvoy`](Self::IoConvoy): `O_DIRECT` + interleaved
+///   sequential `pwrite` and random `pread`, with an `fdatasync`
+///   every 16 iterations (the pathology cadence).
+///
+/// ```
+/// # use ktstr::workload::{WorkType, WorkloadConfig};
+/// let cfg = WorkloadConfig {
+///     work_type: WorkType::IoConvoy,
+///     ..Default::default()
+/// };
+/// assert!(matches!(cfg.work_type, WorkType::IoConvoy));
 /// ```
 ///
 /// The `VariantNames` derive generates `WorkType::VARIANTS: &[&str]`
@@ -304,14 +324,19 @@ pub enum WorkType {
     /// come from a per-worker xorshift PRNG seeded from `tid`; no
     /// crate dependency on `rand`.
     IoRandRead,
-    /// Mixed sequential-write + random-read workload. Each iteration
-    /// alternates between a 4 KB pwrite at the worker's monotonic
-    /// sequential cursor and a 4 KB pread at a random offset.
-    /// `fdatasync()` runs every 16 iterations, exercising the
-    /// convoy/coalescing-failure pathology where writes batch up to a
-    /// large flush. Opens `/dev/vda` (or tempfile fallback) with
-    /// `O_DIRECT` once per worker.
-    IoMixed,
+    /// Interleaved sequential `pwrite` and random `pread` with
+    /// periodic `fdatasync` via `O_DIRECT`. Each iteration alternates
+    /// between a 4 KB pwrite at the worker's monotonic sequential
+    /// cursor and a 4 KB pread at a random offset; `fdatasync()`
+    /// runs every 16 iterations. Opens `/dev/vda` (or tempfile
+    /// fallback) with `O_DIRECT` once per worker.
+    ///
+    /// The convoy pathology (writes batching behind a flush
+    /// barrier) requires buffered writes; v0 uses direct IO and so
+    /// does not yet exhibit the full pathology — see the
+    /// follow-up tracked in the project queue for the buffered-IO
+    /// variant.
+    IoConvoy,
     /// Work hard for burst_ms, sleep for sleep_ms, repeat. Frees CPUs during sleep for borrowing.
     Bursty { burst_ms: u64, sleep_ms: u64 },
     /// CPU burst then 1-byte pipe exchange with a partner worker. Sleep
@@ -822,7 +847,7 @@ impl WorkType {
             WorkType::Mixed => "Mixed",
             WorkType::IoSyncWrite => "IoSyncWrite",
             WorkType::IoRandRead => "IoRandRead",
-            WorkType::IoMixed => "IoMixed",
+            WorkType::IoConvoy => "IoConvoy",
             WorkType::Bursty { .. } => "Bursty",
             WorkType::PipeIo { .. } => "PipeIo",
             WorkType::FutexPingPong { .. } => "FutexPingPong",
@@ -860,7 +885,7 @@ impl WorkType {
             "Mixed" => Some(WorkType::Mixed),
             "IoSyncWrite" => Some(WorkType::IoSyncWrite),
             "IoRandRead" => Some(WorkType::IoRandRead),
-            "IoMixed" => Some(WorkType::IoMixed),
+            "IoConvoy" => Some(WorkType::IoConvoy),
             "Bursty" => Some(WorkType::Bursty {
                 burst_ms: defaults::BURSTY_BURST_MS,
                 sleep_ms: defaults::BURSTY_SLEEP_MS,
@@ -2293,7 +2318,7 @@ pub struct WorkerReport {
     /// wakeup that resumes execution; not a yield-specific measure.
     /// Populated for blocking work types: Bursty, PipeIo, FutexPingPong,
     /// FutexFanOut, FanOutCompute, CacheYield, CachePipe, IoSyncWrite,
-    /// IoRandRead, IoMixed, NiceSweep,
+    /// IoRandRead, IoConvoy, NiceSweep,
     /// AffinityChurn, PolicyChurn, MutexContention, ForkExit (parent's
     /// waitpid wait), Sequence with Sleep/Yield/Io phases.
     pub resume_latencies_ns: Vec<u64>,
@@ -4301,7 +4326,7 @@ unsafe fn futex_wait(futex_ptr: *mut u32, expected: u32, ts: &libc::timespec) {
 }
 
 // ----------------------------------------------------------------------------
-// Real-disk IO helpers for IoSyncWrite / IoRandRead / IoMixed
+// Real-disk IO helpers for IoSyncWrite / IoRandRead / IoConvoy
 // ----------------------------------------------------------------------------
 
 /// Block size for the IO workloads. The block layer requires
@@ -4336,13 +4361,120 @@ const BLKGETSIZE64: libc::c_ulong = 0x80081272;
 /// many sectors per second without wrapping immediately.
 const IO_TEMPFILE_CAPACITY: u64 = 16 * 1024 * 1024;
 
+/// RAII handle to the IO backing for a worker — either `/dev/vda`
+/// (block-device path; `tempfile_path: None`) or a per-worker
+/// host-side tempfile (`tempfile_path: Some(path)`). Drop closes
+/// the file (via `File`'s own Drop) and unlinks `tempfile_path` if
+/// set; block-device paths are never deleted.
+///
+/// Pulling the unlink into Drop closes the panic-leak window the
+/// previous tuple shape left open: a panic between
+/// `open_io_backing` returning the tempfile path and the manual
+/// `remove_file` in the worker_main cleanup tail leaked the file.
+/// File close is already RAII via `std::fs::File`; the value
+/// added here is the unlink.
+pub(crate) struct IoBacking {
+    pub(crate) file: std::fs::File,
+    pub(crate) capacity_bytes: u64,
+    pub(crate) tempfile_path: Option<String>,
+}
+
+impl Drop for IoBacking {
+    fn drop(&mut self) {
+        // Drop has nothing to assert against — swallow remove_file
+        // errors. The file's own Drop closes the fd; the unlink is
+        // the only host-visible cleanup we can still miss.
+        if let Some(path) = self.tempfile_path.take() {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+/// RAII handle to the simulated-IO tempfile [`Phase::Io`] uses.
+/// Always tempfile-backed (no `/dev/vda` path), so the design is
+/// simpler than [`IoBacking`]: file + path, both unconditional. The
+/// path is unlinked on Drop alongside the file's own Drop closing
+/// the fd. Same panic-safety rationale as [`IoBacking`] — pulling
+/// the unlink into Drop closes the leak window the previous tuple
+/// shape left open between iteration and the manual cleanup tail.
+pub(crate) struct PhaseIoTempfile {
+    pub(crate) file: std::fs::File,
+    pub(crate) path: String,
+}
+
+impl Drop for PhaseIoTempfile {
+    fn drop(&mut self) {
+        // Drop has nothing to assert against — swallow remove_file
+        // errors. File close is RAII via `std::fs::File::drop`.
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// RAII handle to a logical-block-aligned scratch buffer used by
+/// the `O_DIRECT` IO workloads (IoRandRead, IoConvoy). Owns a
+/// non-null pointer + the layout it was allocated with, and frees
+/// the allocation on Drop. Zero-initialised at construction
+/// (one-shot); subsequent iterations see stale data from prior
+/// `pread`/`pwrite`. The zero-init defends only against a
+/// read-before-fill on the very first iteration — it is not a
+/// per-iteration scrub.
+///
+/// Stack buffers cannot satisfy `O_DIRECT`'s 512-byte alignment
+/// requirement (the BIO path rejects misaligned `O_DIRECT` IO with
+/// EINVAL) on every Rust-stack target, so the heap allocation is
+/// load-bearing for the workload's pathology shape.
+pub(crate) struct DirectIoBuf {
+    ptr: std::ptr::NonNull<u8>,
+    layout: std::alloc::Layout,
+}
+
+impl DirectIoBuf {
+    /// Allocate a logical-block-aligned 4 KiB buffer (`IO_BLOCK_SIZE`
+    /// bytes, `IO_BLOCK_SIZE`-byte alignment). Returns `None` on
+    /// allocator failure so the caller can yield-and-continue
+    /// rather than abort.
+    fn alloc() -> Option<Self> {
+        // 4 KiB / 4 KiB align is well-defined (size is a multiple
+        // of align, both powers of two). `from_size_align` returns
+        // Err only if align is not a power of two or the rounded
+        // size overflows isize::MAX — neither holds here.
+        let layout = std::alloc::Layout::from_size_align(IO_BLOCK_SIZE, IO_BLOCK_SIZE)
+            .expect("logical-block-aligned 4 KiB layout is valid");
+        // SAFETY: layout has non-zero size (4 KiB > 0). alloc_zeroed
+        // returns null on failure (returned to caller as None) or a
+        // valid pointer to `layout.size()` bytes initialized to
+        // zero. Zero-init defends against a future code path that
+        // reads the buffer before it has been filled.
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        let ptr = std::ptr::NonNull::new(ptr)?;
+        Some(Self { ptr, layout })
+    }
+
+    /// Raw pointer to the buffer head. Used as the `pread`/`pwrite`
+    /// `buf` argument. Returns `*mut u8` because the `pwrite` call
+    /// site needs `*mut c_void` cast and `pread` needs the same
+    /// — matches `NonNull::as_ptr` convention.
+    fn as_ptr(&self) -> *mut u8 {
+        self.ptr.as_ptr()
+    }
+}
+
+impl Drop for DirectIoBuf {
+    fn drop(&mut self) {
+        // SAFETY: the pointer was obtained from `alloc_zeroed` with
+        // `self.layout`; same layout passes to `dealloc`. Drop runs
+        // exactly once per allocation (NonNull is not Copy and the
+        // field is private, so no aliasing).
+        unsafe { std::alloc::dealloc(self.ptr.as_ptr(), self.layout) };
+    }
+}
+
 /// Open `/dev/vda` (or a host-side tempfile fallback) with the
-/// requested flags, query its capacity in bytes, and return
-/// `(File, capacity_bytes, optional_tempfile_path)`. The path is
-/// `Some` only when the fallback was used so the caller can unlink
-/// on exit; for `/dev/vda` it's `None` because block devices are
-/// never deleted.
-fn open_io_backing(extra_flags: libc::c_int, tid: libc::pid_t) -> Option<(std::fs::File, u64, Option<String>)> {
+/// requested flags, query its capacity in bytes, and return an
+/// [`IoBacking`] that owns the file + (when the fallback fired)
+/// the tempfile path. The tempfile is unlinked when the returned
+/// value is dropped; block-device paths are never deleted.
+fn open_io_backing(extra_flags: libc::c_int, tid: libc::pid_t) -> Option<IoBacking> {
     use std::os::unix::io::FromRawFd;
 
     let dev_vda = std::path::Path::new("/dev/vda");
@@ -4368,8 +4500,12 @@ fn open_io_backing(extra_flags: libc::c_int, tid: libc::pid_t) -> Option<(std::f
         }
         // SAFETY: `fd` is owned and valid; from_raw_fd takes
         // ownership and the resulting File closes the fd on drop.
-        let f = unsafe { std::fs::File::from_raw_fd(fd) };
-        return Some((f, size_bytes, None));
+        let file = unsafe { std::fs::File::from_raw_fd(fd) };
+        return Some(IoBacking {
+            file,
+            capacity_bytes: size_bytes,
+            tempfile_path: None,
+        });
     }
 
     // Host-side fallback: per-worker tempfile sized to
@@ -4398,7 +4534,7 @@ fn open_io_backing(extra_flags: libc::c_int, tid: libc::pid_t) -> Option<(std::f
         );
     }
     use std::os::unix::fs::OpenOptionsExt;
-    let f = std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
@@ -4406,8 +4542,62 @@ fn open_io_backing(extra_flags: libc::c_int, tid: libc::pid_t) -> Option<(std::f
         .custom_flags(extra_flags)
         .open(&path)
         .ok()?;
-    f.set_len(IO_TEMPFILE_CAPACITY).ok()?;
-    Some((f, IO_TEMPFILE_CAPACITY, Some(path)))
+    file.set_len(IO_TEMPFILE_CAPACITY).ok()?;
+    Some(IoBacking {
+        file,
+        capacity_bytes: IO_TEMPFILE_CAPACITY,
+        tempfile_path: Some(path),
+    })
+}
+
+/// Lazy-init `io_disk` if it is not yet open. Returns `true` on
+/// success (caller proceeds with IO); `false` when the open failed
+/// and the caller should yield + continue this iteration. Collapses
+/// the previously per-arm open-or-yield-and-warn block (3×
+/// duplicated across IoSyncWrite, IoRandRead, IoConvoy) into a
+/// single helper. The one-shot warn fires across all callers.
+fn ensure_io_disk(
+    io_disk: &mut Option<IoBacking>,
+    extra_flags: libc::c_int,
+    tid: libc::pid_t,
+) -> bool {
+    if io_disk.is_some() {
+        return true;
+    }
+    if let Some(d) = open_io_backing(extra_flags, tid) {
+        *io_disk = Some(d);
+        true
+    } else {
+        // One-shot per-worker error log shared across all IO
+        // variants — a fallback failure in one variant is the same
+        // root cause as a failure in another (both routes through
+        // `open_io_backing`), and the previous per-arm static
+        // multiplied the log lines without adding signal.
+        static OPEN_FAILED_WARNED: AtomicBool = AtomicBool::new(false);
+        if !OPEN_FAILED_WARNED.swap(true, Ordering::Relaxed) {
+            tracing::error!("IO backing open failed; worker yielding without IO.");
+        }
+        false
+    }
+}
+
+/// Lazy-init `io_buf` if it is not yet allocated. Returns `true`
+/// on success; `false` on allocator failure so the caller can
+/// yield + continue this iteration. Used only by IoRandRead and
+/// IoConvoy — IoSyncWrite uses a stack buffer because it does not
+/// open with `O_DIRECT` and so does not need the heap-aligned
+/// scratch.
+fn ensure_io_buf(io_buf: &mut Option<DirectIoBuf>) -> bool {
+    if io_buf.is_some() {
+        return true;
+    }
+    match DirectIoBuf::alloc() {
+        Some(b) => {
+            *io_buf = Some(b);
+            true
+        }
+        None => false,
+    }
 }
 
 /// xorshift64 PRNG step. Returns the next state. One self-citing
@@ -4499,18 +4689,18 @@ fn worker_main(
     // allocator.
     let mut matrix_buf: Option<Vec<u64>> = None;
     // Persistent /dev/vda fd (or tempfile fallback) for IoSyncWrite /
-    // IoRandRead / IoMixed. Opened on first iteration, closed when
-    // worker_main returns. The Option holds (File, capacity_bytes,
-    // optional_tempfile_path). When `path` is Some, the file is a
-    // per-worker tempfile that must be unlinked on exit; when None,
-    // the file is /dev/vda which is a block device we never delete.
-    let mut io_disk: Option<(std::fs::File, u64, Option<String>)> = None;
-    // Page-aligned 4 KiB scratch buffer for O_DIRECT pread/pwrite.
-    // Allocated lazily on first IO iteration via std::alloc; freed
-    // before worker_main returns. Reused across iterations so the
-    // hot-path issues no per-iteration allocator calls.
-    let mut io_buf: Option<std::ptr::NonNull<u8>> = None;
-    // Per-worker xorshift PRNG state for IoRandRead / IoMixed.
+    // IoRandRead / IoConvoy. Opened on first iteration via
+    // [`ensure_io_disk`]; the [`IoBacking`] Drop closes the file
+    // and unlinks the host-side tempfile when the worker returns
+    // (whether by clean exit, panic, or any other unwinding path).
+    let mut io_disk: Option<IoBacking> = None;
+    // Logical-block-aligned 4 KiB scratch buffer for O_DIRECT
+    // pread/pwrite (IoRandRead, IoConvoy). Allocated lazily on
+    // first IO iteration via [`DirectIoBuf::alloc`]; freed by
+    // Drop when the worker returns. Reused across iterations so
+    // the hot-path issues no per-iteration allocator calls.
+    let mut io_buf: Option<DirectIoBuf> = None;
+    // Per-worker xorshift PRNG state for IoRandRead / IoConvoy.
     // Seeded from `tid ^ 0x9E37_79B9_7F4A_7C15` (the same Weyl
     // increment golden-ratio constant glibc's `nrand48` family
     // uses) so a tid of 0 still produces a non-zero seed. Kept on
@@ -4519,15 +4709,18 @@ fn worker_main(
     if io_rng == 0 {
         io_rng = 0x9E37_79B9_7F4A_7C15;
     }
-    // Sequential write cursor for IoMixed. Starts at the worker's
+    // Sequential write cursor for IoConvoy. Starts at the worker's
     // stripe base (computed lazily once /dev/vda capacity is known)
     // and advances by 4 KiB per pwrite, wrapping at the stripe end.
     let mut io_seq_cursor: u64 = 0;
     let mut io_iter: u64 = 0;
     // Phase::Io still uses the legacy tempfile-on-tmpfs
     // implementation (separate from IoSyncWrite / IoRandRead /
-    // IoMixed). Keep its own slot so worker cleanup is independent.
-    let mut io_seq_file: Option<(std::fs::File, String)> = None;
+    // IoConvoy). Keep its own slot so worker cleanup is independent.
+    // The [`PhaseIoTempfile`] RAII Drop unlinks the tempfile when
+    // the worker returns, including on panic / unwind paths the
+    // earlier manual `remove_file` could miss.
+    let mut io_seq_file: Option<PhaseIoTempfile> = None;
     // PageFaultChurn: persistent anonymous mmap region and PRNG
     // state, allocated on first outer iteration and reused across
     // every subsequent iteration (`madvise(MADV_DONTNEED)` re-faults
@@ -4660,31 +4853,16 @@ fn worker_main(
             }
             WorkType::IoSyncWrite => {
                 use std::os::unix::io::AsRawFd;
-                if io_disk.is_none() {
-                    if let Some(d) = open_io_backing(libc::O_SYNC, tid) {
-                        io_disk = Some(d);
-                    } else {
-                        // Open failed (both /dev/vda open and the
-                        // tempfile fallback returned None). Surface
-                        // it once per worker, then yield so the
-                        // worker doesn't spin-hot.
-                        static OPEN_FAILED_WARNED: AtomicBool =
-                            AtomicBool::new(false);
-                        if !OPEN_FAILED_WARNED.swap(true, Ordering::Relaxed) {
-                            tracing::error!(
-                                "IO backing open failed; worker yielding without IO."
-                            );
-                        }
-                        std::thread::yield_now();
-                        iterations += 1;
-                        continue;
-                    }
+                if !ensure_io_disk(&mut io_disk, libc::O_SYNC, tid) {
+                    std::thread::yield_now();
+                    iterations += 1;
+                    continue;
                 }
-                let (f, capacity, _) = io_disk.as_ref().unwrap();
+                let backing = io_disk.as_ref().unwrap();
                 let buf = [0u8; IO_BLOCK_SIZE];
-                let base = stripe_base(tid, *capacity);
+                let base = stripe_base(tid, backing.capacity_bytes);
                 let stripe_size =
-                    (*capacity / IO_NUM_STRIPES) & !(IO_SECTOR_SIZE - 1);
+                    (backing.capacity_bytes / IO_NUM_STRIPES) & !(IO_SECTOR_SIZE - 1);
                 // 16 × 4 KiB = 64 KiB per iteration. Walk
                 // sequentially within the stripe; wrap at stripe end
                 // so a long-running worker re-writes the same
@@ -4692,12 +4870,12 @@ fn worker_main(
                 // forever rather than running off the end.
                 let stripe_extent = stripe_size.max(IO_BLOCK_SIZE as u64 * 16);
                 let iter_off = (io_iter * IO_BLOCK_SIZE as u64 * 16) % stripe_extent;
-                let fd = f.as_raw_fd();
+                let fd = backing.file.as_raw_fd();
                 for i in 0..16u64 {
                     let off = base + iter_off + i * IO_BLOCK_SIZE as u64;
                     // SAFETY: `buf` is a valid &[u8] of length
-                    // IO_BLOCK_SIZE; `fd` is owned by `f` which lives
-                    // for the duration of this match arm.
+                    // IO_BLOCK_SIZE; `fd` is owned by `backing.file`
+                    // which lives for the duration of this match arm.
                     let n = unsafe {
                         libc::pwrite(
                             fd,
@@ -4722,8 +4900,8 @@ fn worker_main(
                 }
                 let before_fsync = Instant::now();
                 // SAFETY: `fd` is a valid file descriptor owned by
-                // `f`. fdatasync blocks until kernel-level
-                // dirty-data flush completes.
+                // `backing.file`. fdatasync blocks until kernel-
+                // level dirty-data flush completes.
                 let _ = unsafe { libc::fdatasync(fd) };
                 reservoir_push(
                     &mut resume_latencies_ns,
@@ -4737,68 +4915,33 @@ fn worker_main(
             }
             WorkType::IoRandRead => {
                 use std::os::unix::io::AsRawFd;
-                if io_disk.is_none() {
-                    if let Some(d) = open_io_backing(libc::O_DIRECT, tid) {
-                        io_disk = Some(d);
-                    } else {
-                        static OPEN_FAILED_WARNED: AtomicBool =
-                            AtomicBool::new(false);
-                        if !OPEN_FAILED_WARNED.swap(true, Ordering::Relaxed) {
-                            tracing::error!(
-                                "IO backing open failed; worker yielding without IO."
-                            );
-                        }
-                        std::thread::yield_now();
-                        iterations += 1;
-                        continue;
-                    }
+                if !ensure_io_disk(&mut io_disk, libc::O_DIRECT, tid) {
+                    std::thread::yield_now();
+                    iterations += 1;
+                    continue;
                 }
-                if io_buf.is_none() {
-                    // Logical-block-aligned (512 for virtio-blk);
-                    // page-sized blocks (4 KiB) are a convenience,
-                    // not a kernel requirement. The block layer
-                    // accepts any alignment that's a multiple of
-                    // the queue's logical block size, but using
-                    // 4 KiB matches the BLOCK_SIZE constant the
-                    // workloads pass to pread/pwrite.
-                    //
-                    // SAFETY: layout has size 4096, alignment 4096
-                    // (≥ 512). `alloc_zeroed` returns a non-null
-                    // pointer on success (we check with NonNull::new).
-                    // Buffer is freed in the cleanup block at end
-                    // of worker_main. Zero-init avoids UB from a
-                    // future code path that reads the buffer
-                    // before pread fills it (today only pread runs
-                    // first, but IoMixed's pwrite-before-fill
-                    // opens that window).
-                    let layout = std::alloc::Layout::from_size_align(
-                        IO_BLOCK_SIZE,
-                        IO_BLOCK_SIZE,
-                    )
-                    .expect("logical-block-aligned 4 KiB layout is valid");
-                    let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
-                    io_buf = std::ptr::NonNull::new(ptr);
-                    if io_buf.is_none() {
-                        // OOM at allocator. Skip the IO this iteration.
-                        std::thread::yield_now();
-                        iterations += 1;
-                        continue;
-                    }
+                if !ensure_io_buf(&mut io_buf) {
+                    // OOM at allocator. Skip the IO this iteration.
+                    std::thread::yield_now();
+                    iterations += 1;
+                    continue;
                 }
-                let (f, capacity, _) = io_disk.as_ref().unwrap();
-                let off = rand_io_offset(&mut io_rng, *capacity);
-                let fd = f.as_raw_fd();
+                let backing = io_disk.as_ref().unwrap();
+                let buf = io_buf.as_ref().unwrap();
+                let off = rand_io_offset(&mut io_rng, backing.capacity_bytes);
+                let fd = backing.file.as_raw_fd();
                 let before_pread = Instant::now();
-                // SAFETY: `io_buf` is logical-block-aligned (4 KiB
-                // allocation from the system allocator with a
-                // 4 KiB align request, ≥ the 512-byte
-                // virtio-blk logical block size required by
-                // O_DIRECT) and large enough for IO_BLOCK_SIZE.
-                // `fd` is owned and valid.
+                // SAFETY: `buf.as_ptr()` is logical-block-
+                // aligned (4 KiB allocation from the system
+                // allocator with a 4 KiB align request, ≥ the
+                // 512-byte virtio-blk logical block size required
+                // by O_DIRECT) and large enough for IO_BLOCK_SIZE.
+                // `fd` is owned and valid for the life of
+                // `backing`.
                 let _ = unsafe {
                     libc::pread(
                         fd,
-                        io_buf.unwrap().as_ptr() as *mut libc::c_void,
+                        buf.as_ptr() as *mut libc::c_void,
                         IO_BLOCK_SIZE,
                         off as libc::off_t,
                     )
@@ -4814,50 +4957,36 @@ fn worker_main(
                 last_iter_time = Instant::now();
                 iterations += 1;
             }
-            WorkType::IoMixed => {
+            WorkType::IoConvoy => {
                 use std::os::unix::io::AsRawFd;
-                if io_disk.is_none() {
-                    if let Some(d) = open_io_backing(libc::O_DIRECT, tid) {
-                        let cap = d.1;
-                        io_disk = Some(d);
-                        io_seq_cursor = stripe_base(tid, cap);
-                    } else {
-                        static OPEN_FAILED_WARNED: AtomicBool =
-                            AtomicBool::new(false);
-                        if !OPEN_FAILED_WARNED.swap(true, Ordering::Relaxed) {
-                            tracing::error!(
-                                "IO backing open failed; worker yielding without IO."
-                            );
-                        }
-                        std::thread::yield_now();
-                        iterations += 1;
-                        continue;
-                    }
+                let was_open = io_disk.is_some();
+                if !ensure_io_disk(&mut io_disk, libc::O_DIRECT, tid) {
+                    std::thread::yield_now();
+                    iterations += 1;
+                    continue;
                 }
-                if io_buf.is_none() {
-                    // See IoRandRead arm: same logical-block
-                    // alignment requirement; alloc_zeroed defends
-                    // against UB from the IoMixed pwrite issued
-                    // before the first pread fills the buffer.
-                    let layout = std::alloc::Layout::from_size_align(
-                        IO_BLOCK_SIZE,
-                        IO_BLOCK_SIZE,
-                    )
-                    .expect("logical-block-aligned 4 KiB layout is valid");
-                    let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
-                    io_buf = std::ptr::NonNull::new(ptr);
-                    if io_buf.is_none() {
-                        std::thread::yield_now();
-                        iterations += 1;
-                        continue;
-                    }
+                if !was_open {
+                    // First-open hook: initialise the per-worker
+                    // sequential write cursor at the stripe base.
+                    // `ensure_io_disk` doesn't surface this because
+                    // only IoConvoy needs the cursor; treating it
+                    // as a per-arm post-open step keeps the helper
+                    // single-purpose.
+                    let cap = io_disk.as_ref().unwrap().capacity_bytes;
+                    io_seq_cursor = stripe_base(tid, cap);
                 }
-                let (f, capacity, _) = io_disk.as_ref().unwrap();
-                let fd = f.as_raw_fd();
+                if !ensure_io_buf(&mut io_buf) {
+                    std::thread::yield_now();
+                    iterations += 1;
+                    continue;
+                }
+                let backing = io_disk.as_ref().unwrap();
+                let buf = io_buf.as_ref().unwrap();
+                let fd = backing.file.as_raw_fd();
                 let stripe_size =
-                    (*capacity / IO_NUM_STRIPES) & !(IO_SECTOR_SIZE - 1);
+                    (backing.capacity_bytes / IO_NUM_STRIPES) & !(IO_SECTOR_SIZE - 1);
                 let stripe_extent = stripe_size.max(IO_BLOCK_SIZE as u64 * 16);
-                let base = stripe_base(tid, *capacity);
+                let base = stripe_base(tid, backing.capacity_bytes);
                 // Sequential pwrite at the per-worker cursor. Wrap
                 // back to the stripe base when the cursor walks
                 // past the stripe end so a long worker re-writes
@@ -4866,37 +4995,37 @@ fn worker_main(
                     io_seq_cursor = base;
                 }
                 let before_io = Instant::now();
-                // SAFETY: io_buf is the logical-block-aligned
-                // 4 KiB allocation (≥ the 512-byte virtio-blk
-                // logical block size required by O_DIRECT);
+                // SAFETY: `buf.as_ptr()` is the logical-block-
+                // aligned 4 KiB allocation (≥ the 512-byte virtio-
+                // blk logical block size required by O_DIRECT);
                 // treating it as a const slice of IO_BLOCK_SIZE
                 // bytes is in-bounds.
                 let n = unsafe {
                     libc::pwrite(
                         fd,
-                        io_buf.unwrap().as_ptr() as *const libc::c_void,
+                        buf.as_ptr() as *const libc::c_void,
                         IO_BLOCK_SIZE,
                         io_seq_cursor as libc::off_t,
                     )
                 };
                 // Surface short writes / errors. See the IoSyncWrite
                 // arm for the rationale — same observability defense
-                // applies to IoMixed's pwrite half. The pread half
+                // applies to IoConvoy's pwrite half. The pread half
                 // (below) does NOT get this check because short reads
                 // are a normal sparse-file outcome (a hole reads zero
                 // bytes EOF-style), not a defect.
                 if n < IO_BLOCK_SIZE as isize {
-                    tracing::warn!(n, off = io_seq_cursor, "IoMixed short pwrite");
+                    tracing::warn!(n, off = io_seq_cursor, "IoConvoy short pwrite");
                 }
                 io_seq_cursor = io_seq_cursor.wrapping_add(IO_BLOCK_SIZE as u64);
                 // Random pread.
-                let r_off = rand_io_offset(&mut io_rng, *capacity);
+                let r_off = rand_io_offset(&mut io_rng, backing.capacity_bytes);
                 // SAFETY: same buffer, same fd; mutating the
                 // 4 KiB region in-place.
                 let _ = unsafe {
                     libc::pread(
                         fd,
-                        io_buf.unwrap().as_ptr() as *mut libc::c_void,
+                        buf.as_ptr() as *mut libc::c_void,
                         IO_BLOCK_SIZE,
                         r_off as libc::off_t,
                     )
@@ -5137,19 +5266,20 @@ fn worker_main(
                         }
                         Phase::Io(dur) => {
                             let end = Instant::now() + *dur;
-                            let (f, _) = io_seq_file.get_or_insert_with(|| {
+                            let tf = io_seq_file.get_or_insert_with(|| {
                                 let path = std::env::temp_dir()
                                     .join(format!("ktstr_seq_{tid}"))
                                     .to_string_lossy()
                                     .to_string();
-                                let f = std::fs::OpenOptions::new()
+                                let file = std::fs::OpenOptions::new()
                                     .write(true)
                                     .create(true)
                                     .truncate(true)
                                     .open(&path)
                                     .expect("failed to create Phase::Io temp file");
-                                (f, path)
+                                PhaseIoTempfile { file, path }
                             });
+                            let f = &mut tf.file;
                             while Instant::now() < end && !stop_requested(stop) {
                                 let _ = f.set_len(0);
                                 let _ = f.seek(std::io::SeekFrom::Start(0));
@@ -6411,30 +6541,12 @@ fn worker_main(
         unsafe { libc::sched_setscheduler(0, libc::SCHED_OTHER, &param) };
     }
 
-    // Clean up Phase::Io tempfile.
-    if let Some((_, path)) = io_seq_file {
-        let _ = std::fs::remove_file(&path);
-    }
-    // Clean up IoSyncWrite/IoRandRead/IoMixed: drop the File (which
-    // closes the fd), and unlink the host-side fallback tempfile if
-    // any. /dev/vda has `path=None` so the unlink is skipped — block
-    // devices are never deleted.
-    if let Some((file, _capacity, path)) = io_disk.take() {
-        drop(file);
-        if let Some(p) = path {
-            let _ = std::fs::remove_file(&p);
-        }
-    }
-    // Free the logical-block-aligned scratch buffer used by
-    // IoRandRead / IoMixed. SAFETY: the layout matches what was
-    // passed to alloc_zeroed (4 KiB / 4 KiB align, ≥ the 512-byte
-    // virtio-blk logical block size required by O_DIRECT); the
-    // pointer is non-null per `NonNull::new` at allocation time.
-    if let Some(ptr) = io_buf.take() {
-        let layout = std::alloc::Layout::from_size_align(IO_BLOCK_SIZE, IO_BLOCK_SIZE)
-            .expect("logical-block-aligned 4 KiB layout is valid");
-        unsafe { std::alloc::dealloc(ptr.as_ptr(), layout) };
-    }
+    // io_seq_file (Phase::Io tempfile), io_disk, and io_buf clean
+    // themselves up via Drop on [`PhaseIoTempfile`] / [`IoBacking`] /
+    // [`DirectIoBuf`] when this function returns: file fd closed,
+    // host-side tempfile unlinked, heap buffer freed. Intentionally
+    // NOT explicitly `take()`-d here so a panic between this point
+    // and the function return still runs Drop.
     // Clean up persistent PageFaultChurn mmap region.
     if let Some((ptr, size)) = page_fault_region {
         unsafe { libc::munmap(ptr, size) };
@@ -8490,12 +8602,12 @@ mod tests {
     }
 
     #[test]
-    fn spawn_io_mixed_produces_work() {
-        let reports = spawn_and_collect_after(WorkType::IoMixed, 1, 200);
+    fn spawn_io_convoy_produces_work() {
+        let reports = spawn_and_collect_after(WorkType::IoConvoy, 1, 200);
         assert_eq!(reports.len(), 1);
         assert!(
             reports[0].work_units > 0,
-            "IoMixed worker {} did no work",
+            "IoConvoy worker {} did no work",
             reports[0].tid
         );
     }
@@ -8507,7 +8619,7 @@ mod tests {
     /// CLI parse time.
     #[test]
     fn io_variant_names_round_trip() {
-        for name in ["IoSyncWrite", "IoRandRead", "IoMixed"] {
+        for name in ["IoSyncWrite", "IoRandRead", "IoConvoy"] {
             let wt = WorkType::from_name(name)
                 .unwrap_or_else(|| panic!("from_name({name:?}) returned None"));
             assert_eq!(
@@ -8517,6 +8629,200 @@ mod tests {
                 wt.name()
             );
         }
+    }
+
+    // -- RAII unit tests for the IO scratch / backing wrappers --
+    //
+    // Pin the contracts each Drop documents: DirectIoBuf returns a
+    // logical-block-aligned heap buffer, IoBacking unlinks its
+    // tempfile path on Drop (only when one was set), and
+    // PhaseIoTempfile unlinks unconditionally. The `ensure_*`
+    // helpers must be lazy-init — second call returns the same fd /
+    // pointer rather than re-opening / re-allocating.
+
+    /// `DirectIoBuf::alloc` returns a 4 KiB buffer aligned to the
+    /// logical-block boundary `O_DIRECT` requires. Writing the full
+    /// region and reading it back proves the allocation is mapped
+    /// for both reads and writes; the 0xAA pattern is arbitrary,
+    /// any non-zero bit pattern that survives the round trip is
+    /// sufficient.
+    #[test]
+    fn direct_io_buf_alloc_aligned() {
+        let buf = DirectIoBuf::alloc()
+            .expect("DirectIoBuf::alloc must succeed under normal allocator pressure");
+        let addr = buf.as_ptr() as usize;
+        assert_eq!(
+            addr % IO_BLOCK_SIZE,
+            0,
+            "DirectIoBuf must be IO_BLOCK_SIZE-aligned (got addr={addr:#x})"
+        );
+        // SAFETY: alloc returned a non-null pointer to IO_BLOCK_SIZE
+        // bytes of writable heap; the slice is fully covered by the
+        // allocation, no aliasing live, and the pointer is unique
+        // to this test scope.
+        let slice = unsafe { std::slice::from_raw_parts_mut(buf.as_ptr(), IO_BLOCK_SIZE) };
+        slice.fill(0xAA);
+        assert!(
+            slice.iter().all(|&b| b == 0xAA),
+            "round-trip pattern must persist across the buffer",
+        );
+        // Drop runs at end of scope and dealloc's the layout. The
+        // test itself can't observe dealloc; it only proves no
+        // panic / no UB on the freed pointer.
+    }
+
+    /// `IoBacking` with `tempfile_path: Some(_)` unlinks the path on
+    /// Drop. Constructs a real on-disk file with a unique name,
+    /// drops the wrapper inside a scope, then asserts the path no
+    /// longer exists.
+    #[test]
+    fn io_backing_tempfile_unlinked_on_drop() {
+        let path = std::env::temp_dir()
+            .join(format!(
+                "ktstr_iobacking_unlink_{}_{}",
+                std::process::id(),
+                unsafe { libc::syscall(libc::SYS_gettid) },
+            ))
+            .to_string_lossy()
+            .to_string();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .expect("create real tempfile for IoBacking test");
+        assert!(std::path::Path::new(&path).exists(), "precondition: file exists");
+        {
+            let _backing = IoBacking {
+                file,
+                capacity_bytes: 0,
+                tempfile_path: Some(path.clone()),
+            };
+            // Path still exists inside scope.
+            assert!(std::path::Path::new(&path).exists());
+        }
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "IoBacking::Drop must unlink {path}",
+        );
+    }
+
+    /// `IoBacking` with `tempfile_path: None` (the `/dev/vda` case)
+    /// must NOT call `remove_file` — block devices are never
+    /// deleted. Drop in this shape only closes the file fd. Use a
+    /// host tempfile as the backing fd so the test is self-contained
+    /// (running outside a VM where /dev/vda exists), but pass
+    /// `tempfile_path: None` to exercise the "block device" arm.
+    #[test]
+    fn io_backing_none_path_no_unlink() {
+        let path = std::env::temp_dir()
+            .join(format!(
+                "ktstr_iobacking_nounlink_{}_{}",
+                std::process::id(),
+                unsafe { libc::syscall(libc::SYS_gettid) },
+            ))
+            .to_string_lossy()
+            .to_string();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .expect("create stand-in for /dev/vda");
+        {
+            let _backing = IoBacking {
+                file,
+                capacity_bytes: 0,
+                tempfile_path: None,
+            };
+            // Drop fires here.
+        }
+        // File still exists because tempfile_path was None.
+        assert!(
+            std::path::Path::new(&path).exists(),
+            "IoBacking::Drop must NOT unlink when tempfile_path is None",
+        );
+        // Cleanup the stand-in we created for the test.
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `PhaseIoTempfile::Drop` unconditionally unlinks `path`. Same
+    /// shape as the IoBacking test, simpler invariants (no
+    /// optional path).
+    #[test]
+    fn phase_io_tempfile_unlinked_on_drop() {
+        let path = std::env::temp_dir()
+            .join(format!(
+                "ktstr_phaseio_unlink_{}_{}",
+                std::process::id(),
+                unsafe { libc::syscall(libc::SYS_gettid) },
+            ))
+            .to_string_lossy()
+            .to_string();
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .expect("create real tempfile for PhaseIoTempfile test");
+        assert!(std::path::Path::new(&path).exists(), "precondition");
+        {
+            let _tf = PhaseIoTempfile { file, path: path.clone() };
+        }
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "PhaseIoTempfile::Drop must unlink {path}",
+        );
+    }
+
+    /// `ensure_io_disk` is lazy-init — calling it twice on the same
+    /// `Option<IoBacking>` slot opens the backing once and returns
+    /// the same fd on the second call. Compares `as_raw_fd()` across
+    /// both calls.
+    #[test]
+    fn ensure_io_disk_lazy_init() {
+        use std::os::unix::io::AsRawFd;
+        let tid: libc::pid_t = unsafe { libc::syscall(libc::SYS_gettid) as libc::pid_t };
+        let mut io_disk: Option<IoBacking> = None;
+        // First call: opens the backing.
+        assert!(
+            ensure_io_disk(&mut io_disk, 0, tid),
+            "first ensure_io_disk must succeed (host can open tempfile fallback)",
+        );
+        let fd1 = io_disk
+            .as_ref()
+            .expect("io_disk Some after first call")
+            .file
+            .as_raw_fd();
+        // Second call: must be a no-op, return the same fd.
+        assert!(ensure_io_disk(&mut io_disk, 0, tid));
+        let fd2 = io_disk.as_ref().unwrap().file.as_raw_fd();
+        assert_eq!(
+            fd1, fd2,
+            "ensure_io_disk must be lazy-init — second call must not re-open",
+        );
+        // Drop unlinks the tempfile (if fallback path was used).
+    }
+
+    /// `ensure_io_buf` is lazy-init — calling it twice on the same
+    /// `Option<DirectIoBuf>` allocates once and returns the same
+    /// pointer on the second call.
+    #[test]
+    fn ensure_io_buf_lazy_init() {
+        let mut io_buf: Option<DirectIoBuf> = None;
+        assert!(
+            ensure_io_buf(&mut io_buf),
+            "first ensure_io_buf must succeed under normal allocator pressure",
+        );
+        let ptr1 = io_buf.as_ref().expect("io_buf Some after first call").as_ptr();
+        assert!(ensure_io_buf(&mut io_buf));
+        let ptr2 = io_buf.as_ref().unwrap().as_ptr();
+        assert_eq!(
+            ptr1, ptr2,
+            "ensure_io_buf must be lazy-init — second call must not re-allocate",
+        );
     }
 
     #[test]
@@ -9803,7 +10109,7 @@ mod tests {
         assert_eq!(WorkType::Mixed.worker_group_size(), None);
         assert_eq!(WorkType::IoSyncWrite.worker_group_size(), None);
         assert_eq!(WorkType::IoRandRead.worker_group_size(), None);
-        assert_eq!(WorkType::IoMixed.worker_group_size(), None);
+        assert_eq!(WorkType::IoConvoy.worker_group_size(), None);
         assert_eq!(WorkType::bursty(50, 100).worker_group_size(), None);
         assert_eq!(WorkType::cache_pressure(32, 64).worker_group_size(), None);
         assert_eq!(WorkType::cache_yield(32, 64).worker_group_size(), None);
@@ -12451,6 +12757,22 @@ mod tests {
         assert_eq!(json, r#""cpu_spin""#);
         let json = serde_json::to_string(&WorkType::ForkExit).unwrap();
         assert_eq!(json, r#""fork_exit""#);
+        // IO variants — pin the snake_case wire form for each.
+        // `IoConvoy` was renamed from `IoMixed` so the wire form
+        // moved from `io_mixed` → `io_convoy`; pinning all three
+        // keeps the JSON contract auditable. Old `io_mixed` sidecar
+        // files will not deserialize; re-run tests to regenerate.
+        let json = serde_json::to_string(&WorkType::IoSyncWrite).unwrap();
+        assert_eq!(json, r#""io_sync_write""#);
+        let json = serde_json::to_string(&WorkType::IoRandRead).unwrap();
+        assert_eq!(json, r#""io_rand_read""#);
+        let json = serde_json::to_string(&WorkType::IoConvoy).unwrap();
+        assert_eq!(json, r#""io_convoy""#);
+        // Roundtrip the IoConvoy variant so its name() / from-JSON
+        // path is exercised end-to-end (matches the IoSyncWrite +
+        // IoRandRead coverage in `io_variant_names_round_trip`).
+        let back: WorkType = serde_json::from_str(r#""io_convoy""#).unwrap();
+        assert!(matches!(back, WorkType::IoConvoy));
     }
 
     /// `Phase` Duration fields serialize as humantime strings, not

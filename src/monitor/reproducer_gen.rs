@@ -42,6 +42,8 @@
 //! | WorkTypeHint::FutexPingPong   | WorkType::FutexPingPong { spin_iters: 1024 } |
 //! | WorkTypeHint::CachePressure   | WorkType::CachePressure { size_kb, stride } |
 //! | WorkTypeHint::IoSyncWrite     | WorkType::IoSyncWrite                   |
+//! | WorkTypeHint::IoRandRead      | WorkType::IoRandRead                    |
+//! | WorkTypeHint::IoConvoy        | WorkType::IoConvoy                      |
 //! | SchedPolicyHint::Other{nice}  | SchedPolicy::Normal + nice              |
 //! | SchedPolicyHint::Fifo{prio}   | SchedPolicy::Fifo(prio)                 |
 //! | SchedPolicyHint::RoundRobin   | SchedPolicy::RoundRobin(prio)           |
@@ -50,19 +52,12 @@
 //! | SchedPolicyHint::Idle         | SchedPolicy::Idle                       |
 //! | SchedPolicyHint::Ext          | (no explicit policy — scx default)      |
 //!
-//! `WorkType::IoRandRead` and `WorkType::IoMixed` are absent from
-//! the table by design: the capture pipeline today exposes only a
-//! single coarse `WorkTypeHint::IoSyncWrite` for synchronous-write
-//! workloads, and there is no fingerprint signal that distinguishes
-//! random-read or mixed-IO patterns from sync-write at projection
-//! time. Capturing such a workload thus projects to
-//! `WorkType::IoSyncWrite`, and a human / LLM consuming
-//! `ktstr show / compare` is expected to refine the variant by
-//! editing the generated reproducer if the workload is actually
-//! random-read or mixed. A future hint that distinguishes IO modes
-//! would close this gap; until then, the projection deliberately
-//! collapses all three IO variants onto the single observable
-//! signal.
+//! `IoRandRead` and `IoConvoy` hints are accepted by the projection
+//! layer but not yet emitted by the capture pipeline; all real-disk-
+//! IO captures currently project to `IoSyncWrite`. The mapping is
+//! ready for the day the pipeline learns to discriminate IO modes
+//! from the captured open-flag + IO-shape signals documented on
+//! [`super::debug_capture::WorkTypeHint`].
 //!
 //! Hints that don't fire produce framework defaults. Hints that
 //! fire ambiguously (multiple variants in one fingerprint) pick
@@ -297,6 +292,8 @@ fn map_work_type(fp: &WorkloadFingerprint, spec: &mut ReproducerSpec) {
             stride: *stride as usize,
         },
         WorkTypeHint::IoSyncWrite => WorkType::IoSyncWrite,
+        WorkTypeHint::IoRandRead => WorkType::IoRandRead,
+        WorkTypeHint::IoConvoy => WorkType::IoConvoy,
     };
 
     if fp.work_type_hints.len() > 1 {
@@ -490,7 +487,7 @@ fn render_work_type(w: &WorkType) -> String {
         WorkType::Mixed => "WorkType::Mixed".into(),
         WorkType::IoSyncWrite => "WorkType::IoSyncWrite".into(),
         WorkType::IoRandRead => "WorkType::IoRandRead".into(),
-        WorkType::IoMixed => "WorkType::IoMixed".into(),
+        WorkType::IoConvoy => "WorkType::IoConvoy".into(),
         WorkType::Bursty { burst_ms, sleep_ms } => format!(
             "WorkType::Bursty {{ burst_ms: {burst_ms}, sleep_ms: {sleep_ms} }}"
         ),
@@ -628,6 +625,43 @@ mod tests {
             spec.notes
                 .iter()
                 .any(|n| n.contains("additional work-type hints"))
+        );
+    }
+
+    /// `WorkTypeHint::IoRandRead` and `WorkTypeHint::IoConvoy`
+    /// each project to the matching `WorkType::IoRandRead` /
+    /// `WorkType::IoConvoy`. Pins the dedicated mapping the
+    /// generator gained when the capture pipeline learned to
+    /// distinguish IO modes — a regression that silently
+    /// collapses either hint back to `IoSyncWrite` (the previous
+    /// "absent by design" fallback) would surface here.
+    #[test]
+    fn generate_spec_maps_each_io_hint_directly() {
+        let mut cap = DebugCapture::default();
+        cap.fingerprint.work_type_hints = vec![WorkTypeHint::IoRandRead];
+        let spec = generate_spec(&cap);
+        assert!(
+            matches!(spec.config.work_type, WorkType::IoRandRead),
+            "IoRandRead hint must map to WorkType::IoRandRead, got {:?}",
+            spec.config.work_type,
+        );
+
+        let mut cap = DebugCapture::default();
+        cap.fingerprint.work_type_hints = vec![WorkTypeHint::IoConvoy];
+        let spec = generate_spec(&cap);
+        assert!(
+            matches!(spec.config.work_type, WorkType::IoConvoy),
+            "IoConvoy hint must map to WorkType::IoConvoy, got {:?}",
+            spec.config.work_type,
+        );
+
+        let mut cap = DebugCapture::default();
+        cap.fingerprint.work_type_hints = vec![WorkTypeHint::IoSyncWrite];
+        let spec = generate_spec(&cap);
+        assert!(
+            matches!(spec.config.work_type, WorkType::IoSyncWrite),
+            "IoSyncWrite hint must map to WorkType::IoSyncWrite, got {:?}",
+            spec.config.work_type,
         );
     }
 
