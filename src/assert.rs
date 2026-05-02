@@ -3369,6 +3369,7 @@ mod tests {
             vmstat_numa_pages_migrated: 0,
             exit_info: None,
             is_messenger: false,
+            group_idx: 0,
         }
     }
 
@@ -5761,6 +5762,7 @@ mod tests {
             vmstat_numa_pages_migrated: 0,
             exit_info: None,
             is_messenger: false,
+            group_idx: 0,
         }
     }
 
@@ -7306,6 +7308,7 @@ numa_miss 5";
             vmstat_numa_pages_migrated: 0,
             exit_info: None,
             is_messenger: false,
+            group_idx: 0,
         };
 
         let mut v = Verdict::new();

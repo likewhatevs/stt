@@ -177,6 +177,7 @@ fn fault_under_lock(stop: &AtomicBool) -> WorkerReport {
         vmstat_numa_pages_migrated: 0,
         exit_info: None,
         is_messenger: false,
+        group_idx: 0,
     }
 }
 
@@ -204,6 +205,7 @@ fn zeroed_report(tid: libc::pid_t, start: Instant) -> WorkerReport {
         vmstat_numa_pages_migrated: 0,
         exit_info: None,
         is_messenger: false,
+        group_idx: 0,
     }
 }
 

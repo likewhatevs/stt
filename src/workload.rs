@@ -2174,7 +2174,7 @@ impl std::ops::BitOr for MpolFlags {
 /// - [`WorkType::AsymmetricWaker`] with an RT class: legal but
 ///   the harness still runs as its original (likely SCHED_NORMAL)
 ///   policy; only the worker thread is RT.
-#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CloneMode {
     /// Plain `fork(2)`: separate address space, separate thread
@@ -2446,6 +2446,47 @@ pub struct WorkloadConfig {
     pub nice: i32,
     /// How to create each worker. Defaults to [`CloneMode::Fork`].
     pub clone_mode: CloneMode,
+    /// Secondary worker groups spawned alongside the primary group
+    /// described by the top-level fields. Each entry is a
+    /// [`WorkSpec`] with its own `work_type`, `num_workers`,
+    /// `sched_policy`, `affinity`, etc. Composed groups are spawned
+    /// in declaration order after the primary group; their workers
+    /// run concurrently with the primary's for the lifetime of the
+    /// [`WorkloadHandle`]. The default (an empty vec) skips the
+    /// composed pass and behaves exactly as the pre-composition
+    /// spawn.
+    ///
+    /// All groups share the same stop signal —
+    /// [`WorkloadHandle::stop_and_collect`] terminates primary plus
+    /// every composed group atomically. Per-group stop is not
+    /// supported.
+    ///
+    /// Reports carry [`WorkerReport::group_idx`] = 0 for the primary
+    /// group and 1..=N for composed entries in declaration order.
+    ///
+    /// # Resolution rules at spawn time
+    ///
+    /// Composed [`WorkSpec`] entries must specify
+    /// [`WorkSpec::num_workers`] (`Some(n)`); the `None` default
+    /// resolved by the scenario engine via
+    /// `Ctx::workers_per_cgroup` is unreachable from
+    /// [`WorkloadHandle::spawn`] and is rejected with an actionable
+    /// diagnostic.
+    ///
+    /// Composed [`WorkSpec::affinity`] accepts only the no-context
+    /// variants [`AffinityIntent::Inherit`] (resolved to
+    /// [`ResolvedAffinity::None`]) and [`AffinityIntent::Exact`]
+    /// (resolved to [`ResolvedAffinity::Fixed`]). The
+    /// topology-aware variants (`SingleCpu`, `LlcAligned`,
+    /// `RandomSubset`, `CrossCgroup`) are rejected because spawn()
+    /// has no access to the
+    /// [`crate::topology::TestTopology`] / cpuset state that the
+    /// scenario engine threads in.
+    ///
+    /// Composition is single-level — a [`WorkSpec`] inside
+    /// `composed` has no `composed` field of its own.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub composed: Vec<WorkSpec>,
 }
 
 impl Default for WorkloadConfig {
@@ -2459,6 +2500,7 @@ impl Default for WorkloadConfig {
             mpol_flags: MpolFlags::NONE,
             nice: 0,
             clone_mode: CloneMode::Fork,
+            composed: Vec::new(),
         }
     }
 }
@@ -2516,6 +2558,28 @@ impl WorkloadConfig {
     /// status.
     pub fn clone_mode(mut self, m: CloneMode) -> Self {
         self.clone_mode = m;
+        self
+    }
+
+    /// Replace the composed worker groups.
+    ///
+    /// Pass an iterator of [`WorkSpec`] entries; each will be
+    /// spawned as an independent group alongside the primary
+    /// described by the top-level fields. Pass an empty iterator
+    /// to clear any previously-set composed groups.
+    ///
+    /// See [`Self::composed`] for the resolution rules applied to
+    /// each entry's `num_workers` / `affinity` fields at spawn time.
+    pub fn composed(mut self, specs: impl IntoIterator<Item = WorkSpec>) -> Self {
+        self.composed = specs.into_iter().collect();
+        self
+    }
+
+    /// Append a single composed worker group to the existing list.
+    ///
+    /// Convenience for chained construction: `cfg.with_composed(a).with_composed(b)`.
+    pub fn with_composed(mut self, spec: WorkSpec) -> Self {
+        self.composed.push(spec);
         self
     }
 }
@@ -2829,6 +2893,30 @@ pub struct WorkerReport {
     /// exits before producing a report.
     #[serde(default)]
     pub is_messenger: bool,
+    /// Index of the worker group this report belongs to.
+    ///
+    /// `0` denotes the primary group described by
+    /// [`WorkloadConfig`]'s top-level `work_type` / `num_workers` /
+    /// `affinity` / `sched_policy` fields. `1..=N` denotes
+    /// composed groups in the order they appear in
+    /// [`WorkloadConfig::composed`]. Reports collected by
+    /// [`WorkloadHandle::stop_and_collect`] are tagged with the
+    /// `group_idx` of the spawning [`WorkSpec`] (or `0` for the
+    /// primary), so per-group filtering in test assertions can
+    /// cleanly partition the vector.
+    ///
+    /// Sentinel reports (synthesized on missing JSON / panic /
+    /// timeout) carry the `group_idx` of the worker whose pid the
+    /// sentinel replaces, so a "this composed group failed"
+    /// assertion still works on an outright crash.
+    ///
+    /// `#[serde(default)]` so reports persisted before `group_idx`
+    /// existed (or written by a worker on a non-composed config)
+    /// deserialize cleanly with `group_idx == 0` — the primary
+    /// group, which is also the only group such reports could
+    /// possibly belong to.
+    #[serde(default)]
+    pub group_idx: usize,
 }
 
 /// Reason a sentinel [`WorkerReport`] was synthesized — attached to
@@ -3350,6 +3438,113 @@ impl SendIterSlotPtr {
     }
 }
 
+/// Per-group view of [`WorkloadConfig`] used by the spawn pipeline.
+///
+/// [`WorkloadHandle::spawn`] iterates one `GroupParams` per group it
+/// spawns: the primary group (`group_idx == 0`) carries the
+/// top-level [`WorkloadConfig`] fields, and each composed
+/// [`WorkSpec`] entry is resolved into its own `GroupParams` with
+/// `group_idx == 1..=N`.
+///
+/// `clone_mode` is shared across every group — the top-level
+/// [`WorkloadConfig::clone_mode`] selects fork vs thread dispatch
+/// for the entire workload; composed entries' [`WorkSpec::clone_mode`]
+/// is inspected during resolution and a mismatch is rejected at
+/// spawn time (the [`SpawnGuard`]'s lifecycle assumes a single
+/// dispatch path).
+#[derive(Clone)]
+struct GroupParams {
+    work_type: WorkType,
+    sched_policy: SchedPolicy,
+    mem_policy: MemPolicy,
+    mpol_flags: MpolFlags,
+    nice: i32,
+    affinity: ResolvedAffinity,
+    num_workers: usize,
+    group_idx: usize,
+}
+
+impl GroupParams {
+    /// Build the primary group's parameters from the top-level
+    /// [`WorkloadConfig`] fields. `group_idx` is fixed to `0`.
+    fn primary(config: &WorkloadConfig) -> Self {
+        Self {
+            work_type: config.work_type.clone(),
+            sched_policy: config.sched_policy,
+            mem_policy: config.mem_policy.clone(),
+            mpol_flags: config.mpol_flags,
+            nice: config.nice,
+            affinity: config.affinity.clone(),
+            num_workers: config.num_workers,
+            group_idx: 0,
+        }
+    }
+
+    /// Resolve a composed [`WorkSpec`] into per-group parameters,
+    /// applying the spawn-time rules documented on
+    /// [`WorkloadConfig::composed`]:
+    ///
+    /// - `num_workers` must be `Some(n)`; the `None` default
+    ///   resolved by the scenario engine via
+    ///   `Ctx::workers_per_cgroup` is unreachable here. A `None`
+    ///   value is rejected with an actionable diagnostic.
+    /// - `affinity` must be either [`AffinityIntent::Inherit`]
+    ///   (mapped to [`ResolvedAffinity::None`]) or
+    ///   [`AffinityIntent::Exact`] (mapped to
+    ///   [`ResolvedAffinity::Fixed`]). Topology-aware variants
+    ///   (`SingleCpu`, `LlcAligned`, `RandomSubset`,
+    ///   `CrossCgroup`) are rejected because spawn() lacks the
+    ///   [`crate::topology::TestTopology`] / cpuset state that the
+    ///   scenario engine threads in.
+    ///
+    /// `clone_mode` is verified against the parent
+    /// [`WorkloadConfig::clone_mode`] by the caller; this constructor
+    /// captures only the per-group fields that flow into the worker
+    /// loop.
+    fn from_composed(
+        spec: &WorkSpec,
+        group_idx: usize,
+    ) -> Result<Self> {
+        let num_workers = spec.num_workers.ok_or_else(|| {
+            anyhow::anyhow!(
+                "composed[{}].num_workers must be set explicitly at spawn time \
+                 (the Some/None resolution via Ctx::workers_per_cgroup is only \
+                 available through the scenario engine; \
+                 WorkloadHandle::spawn requires a concrete count)",
+                group_idx - 1,
+            )
+        })?;
+        let affinity = match &spec.affinity {
+            AffinityIntent::Inherit => ResolvedAffinity::None,
+            AffinityIntent::Exact(cpus) => ResolvedAffinity::Fixed(cpus.clone()),
+            AffinityIntent::SingleCpu
+            | AffinityIntent::LlcAligned
+            | AffinityIntent::RandomSubset
+            | AffinityIntent::CrossCgroup => {
+                anyhow::bail!(
+                    "composed[{}].affinity = {:?} requires scenario topology \
+                     context (TestTopology / cpuset); use \
+                     AffinityIntent::Exact(set) or AffinityIntent::Inherit \
+                     for composed entries spawned directly via \
+                     WorkloadHandle::spawn",
+                    group_idx - 1,
+                    spec.affinity,
+                );
+            }
+        };
+        Ok(Self {
+            work_type: spec.work_type.clone(),
+            sched_policy: spec.sched_policy,
+            mem_policy: spec.mem_policy.clone(),
+            mpol_flags: spec.mpol_flags,
+            nice: spec.nice,
+            affinity,
+            num_workers,
+            group_idx,
+        })
+    }
+}
+
 /// Spawn a single thread-mode worker via [`std::thread::Builder`].
 ///
 /// The thread closure runs `worker_main` directly with the same
@@ -3371,7 +3566,7 @@ impl SendIterSlotPtr {
 #[allow(clippy::too_many_arguments)]
 fn spawn_thread_worker(
     guard: &mut SpawnGuard,
-    config: &WorkloadConfig,
+    group: &GroupParams,
     affinity: Option<BTreeSet<usize>>,
     worker_pipe_fds: Option<(i32, i32)>,
     worker_futex: Option<(*mut u32, usize)>,
@@ -3394,11 +3589,13 @@ fn spawn_thread_worker(
     // ThreadWorker for stop signaling and tid reading.
     let stop_thread = Arc::clone(&stop);
     let tid_thread = Arc::clone(&tid);
-    let work_type = config.work_type.clone();
-    let sched_policy = config.sched_policy;
-    let mem_policy = config.mem_policy.clone();
-    let mpol_flags = config.mpol_flags;
-    let nice = config.nice;
+    let work_type = group.work_type.clone();
+    let sched_policy = group.sched_policy;
+    let mem_policy = group.mem_policy.clone();
+    let mpol_flags = group.mpol_flags;
+    let nice = group.nice;
+    let group_idx = group.group_idx;
+    let num_workers = group.num_workers;
 
     // The closure must be `Send` to cross the thread boundary.
     // `worker_pipe_fds` is `Option<(i32, i32)>` (Copy + Send), but
@@ -3411,7 +3608,10 @@ fn spawn_thread_worker(
     let iter_slot_send = SendIterSlotPtr::new(iter_slot);
 
     let join = std::thread::Builder::new()
-        .name(format!("ktstr-worker-{}", guard.threads.len()))
+        .name(format!(
+            "ktstr-worker-g{group_idx}-{}",
+            guard.threads.len()
+        ))
         .spawn(move || {
             // Publish gettid() so the parent can address this task
             // for sched_setaffinity and report it from worker_pids.
@@ -3433,6 +3633,7 @@ fn spawn_thread_worker(
                 return WorkerReport {
                     tid: my_tid,
                     completed: false,
+                    group_idx,
                     ..WorkerReport::default()
                 };
             }
@@ -3456,13 +3657,15 @@ fn spawn_thread_worker(
                 futex,
                 slot,
                 &stop_thread,
+                group_idx,
             )
         })
         .with_context(|| {
             format!(
-                "thread::spawn for worker {}/{} failed",
+                "thread::spawn for worker {}/{} (group {}) failed",
                 guard.threads.len() + 1,
-                config.num_workers,
+                num_workers,
+                group_idx,
             )
         })?;
 
@@ -3494,120 +3697,186 @@ impl WorkloadHandle {
             CloneMode::Thread => Dispatch::Thread,
         };
 
-        // Thread mode + ForkExit is incompatible. ForkExit's worker
-        // body calls `libc::fork()` from inside `worker_main` to
-        // exercise wake_up_new_task / do_exit / wait_task_zombie;
-        // under [`CloneMode::Thread`] the worker is a thread inside
-        // the parent's tgid, so its `fork()` produces a child that
-        // shares tgid with the parent and every sibling thread. The
-        // child then calls `libc::_exit(0)` which the kernel routes
-        // through `do_exit` — and `do_exit` for a thread-group leader
-        // tears down the whole tgid (every worker thread dies). This
-        // converts the workload into a fratricidal sibling kill on
-        // the very first ForkExit iteration. Reject at spawn time
-        // with an actionable diagnostic; CloneMode::Fork is the
-        // correct choice for ForkExit and will continue to work.
-        if matches!(dispatch, Dispatch::Thread)
-            && matches!(config.work_type, WorkType::ForkExit)
-        {
-            anyhow::bail!(
-                "CloneMode::Thread is incompatible with WorkType::ForkExit — \
-                 ForkExit forks inside the worker, which under a thread-group \
-                 worker tears down every sibling thread on the child's _exit. \
-                 Use CloneMode::Fork for ForkExit workloads."
-            );
-        }
-
-        let needs_pipes = matches!(
-            config.work_type,
-            WorkType::PipeIo { .. } | WorkType::CachePipe { .. }
-        );
-        let chain_depth = config.work_type.chain_pipe_depth();
-        let needs_futex = config.work_type.needs_shared_mem();
-        if let Some(group_size) = config.work_type.worker_group_size()
-            && (config.num_workers == 0 || !config.num_workers.is_multiple_of(group_size))
-        {
-            anyhow::bail!(
-                "{} requires num_workers divisible by {}, got {}",
-                config.work_type.name(),
-                group_size,
-                config.num_workers
-            );
-        }
-        // WakeChain `wake: WakeMechanism::Pipe` is incompatible with
-        // `CloneMode::Thread`: `SpawnGuard::into_handle` does not
-        // transfer `chain_pipes` (only children/threads/futex
-        // ptrs/iter counters), so the guard's `Drop` runs after a
-        // successful spawn and closes every chain pipe fd. Under
-        // Fork mode each child holds its own fd-table copy of
-        // those pipes (inherited via `fork()`), so the parent's
-        // close is a no-op for the children. Under Thread mode
-        // every thread shares the parent's fd table — the close
-        // makes every worker's pipe fd `EBADF`, and (worse) if
-        // the kernel reuses the freed fd numbers for a subsequent
-        // `open()`, threads then write 1-byte garbage to whatever
-        // unrelated file inherited the fd. Reject at spawn time
-        // with an actionable diagnostic; CloneMode::Fork is the
-        // correct choice for WakeChain wake=Pipe.
-        if chain_depth.is_some() && matches!(dispatch, Dispatch::Thread) {
-            anyhow::bail!(
-                "WakeChain wake=Pipe is not supported under CloneMode::Thread \
-                 (the spawn-side closes chain pipe fds via SpawnGuard::Drop \
-                 after spawn returns; threads share the parent fd table and \
-                 would observe EBADF or, post-fd-reuse, write to the wrong \
-                 file). Use CloneMode::Fork."
-            );
-        }
-        // WakeChain `wake: WakeMechanism::Pipe` with depth=1 deadlocks at fork:
-        // prev_stage and stage collapse to 0, so the post-fork
-        // close-other-fds block closes BOTH ends of the worker's
-        // own pipe (the `s == prev_stage` arm runs first and
-        // closes `pipe[1]`, leaving the worker without a write
-        // end). A 1-stage "ring chain" also has no meaningful
-        // wake-chain semantics — there is no successor to wake.
-        // Reject at spawn time with an actionable diagnostic.
-        if let Some(depth) = chain_depth
-            && depth < 2
-        {
-            anyhow::bail!(
-                "WakeChain depth must be >= 2 (got {}); a 1-stage chain has no \
-                 successor to wake and the post-fork fd close logic would close \
-                 the worker's own write end",
-                depth
-            );
-        }
-        // IdleChurn rejects Duration::ZERO for either field:
-        //   - burst_duration = 0 collapses the loop to pure
-        //     nanosleep — the worker accrues no runtime; the
-        //     idle-transition observability is unchanged but the
-        //     workload becomes useless as a scheduler test.
-        //   - sleep_duration = 0 produces no idle period; the
-        //     workload degenerates to SpinWait. Use SpinWait
-        //     directly.
-        if let WorkType::IdleChurn {
-            burst_duration,
-            sleep_duration,
-        } = config.work_type
-        {
-            if burst_duration.is_zero() {
+        // Build the per-group params list: primary first
+        // (group_idx == 0), then composed[k] resolved into
+        // group_idx == k+1. The resolver enforces the "spawn-time
+        // resolution rules" documented on
+        // [`WorkloadConfig::composed`] (Q1: num_workers must be
+        // explicit; Q2: only Inherit/Exact affinity reachable from
+        // spawn() — topology-aware variants need the scenario
+        // engine).
+        //
+        // composed[k].clone_mode must match the parent's
+        // [`WorkloadConfig::clone_mode`]: SpawnGuard's lifecycle
+        // assumes a single dispatch path (every guard.children
+        // entry is a fork-mode child reaped via waitpid; every
+        // guard.threads entry is a thread-mode worker joined via
+        // JoinHandle). Mixing modes inside one guard would route
+        // teardown through the wrong code path. Reject at the
+        // resolver entry; CloneMode is a workload-wide property.
+        let mut groups: Vec<GroupParams> = Vec::with_capacity(1 + config.composed.len());
+        groups.push(GroupParams::primary(config));
+        for (i, spec) in config.composed.iter().enumerate() {
+            if spec.clone_mode != config.clone_mode {
                 anyhow::bail!(
-                    "IdleChurn burst_duration must be > 0; a zero burst makes the \
-                     loop pure sleep and the worker accrues no runtime"
+                    "composed[{}].clone_mode = {:?} disagrees with the \
+                     parent WorkloadConfig.clone_mode = {:?}; clone_mode \
+                     is a workload-wide property — every group within one \
+                     WorkloadHandle must use the same dispatch path \
+                     (fork or thread)",
+                    i,
+                    spec.clone_mode,
+                    config.clone_mode,
                 );
             }
-            if sleep_duration.is_zero() {
+            groups.push(GroupParams::from_composed(spec, i + 1)?);
+        }
+
+        // Per-group admission. Each group's work_type is checked
+        // independently — a malformed composed entry bails the
+        // whole workload before any resources are acquired.
+        for group in &groups {
+            // Thread mode + ForkExit is incompatible. ForkExit's worker
+            // body calls `libc::fork()` from inside `worker_main` to
+            // exercise wake_up_new_task / do_exit / wait_task_zombie;
+            // under [`CloneMode::Thread`] the worker is a thread inside
+            // the parent's tgid, so its `fork()` produces a child that
+            // shares tgid with the parent and every sibling thread. The
+            // child then calls `libc::_exit(0)` which the kernel routes
+            // through `do_exit` — and `do_exit` for a thread-group leader
+            // tears down the whole tgid (every worker thread dies). This
+            // converts the workload into a fratricidal sibling kill on
+            // the very first ForkExit iteration. Reject at spawn time
+            // with an actionable diagnostic; CloneMode::Fork is the
+            // correct choice for ForkExit and will continue to work.
+            if matches!(dispatch, Dispatch::Thread)
+                && matches!(group.work_type, WorkType::ForkExit)
+            {
                 anyhow::bail!(
-                    "IdleChurn sleep_duration must be > 0; a zero sleep collapses \
-                     the variant to SpinWait. Use WorkType::SpinWait directly."
+                    "CloneMode::Thread is incompatible with WorkType::ForkExit \
+                     (group {}) — ForkExit forks inside the worker, which under \
+                     a thread-group worker tears down every sibling thread on \
+                     the child's _exit. Use CloneMode::Fork for ForkExit workloads.",
+                    group.group_idx,
                 );
+            }
+            if let Some(group_size) = group.work_type.worker_group_size()
+                && (group.num_workers == 0 || !group.num_workers.is_multiple_of(group_size))
+            {
+                anyhow::bail!(
+                    "{} (group {}) requires num_workers divisible by {}, got {}",
+                    group.work_type.name(),
+                    group.group_idx,
+                    group_size,
+                    group.num_workers
+                );
+            }
+            let group_chain_depth = group.work_type.chain_pipe_depth();
+            // WakeChain `wake: WakeMechanism::Pipe` is incompatible with
+            // `CloneMode::Thread`: `SpawnGuard::into_handle` does not
+            // transfer `chain_pipes` (only children/threads/futex
+            // ptrs/iter counters), so the guard's `Drop` runs after a
+            // successful spawn and closes every chain pipe fd. Under
+            // Fork mode each child holds its own fd-table copy of
+            // those pipes (inherited via `fork()`), so the parent's
+            // close is a no-op for the children. Under Thread mode
+            // every thread shares the parent's fd table — the close
+            // makes every worker's pipe fd `EBADF`, and (worse) if
+            // the kernel reuses the freed fd numbers for a subsequent
+            // `open()`, threads then write 1-byte garbage to whatever
+            // unrelated file inherited the fd. Reject at spawn time
+            // with an actionable diagnostic; CloneMode::Fork is the
+            // correct choice for WakeChain wake=Pipe.
+            if group_chain_depth.is_some() && matches!(dispatch, Dispatch::Thread) {
+                anyhow::bail!(
+                    "WakeChain wake=Pipe is not supported under CloneMode::Thread \
+                     (group {}) — the spawn-side closes chain pipe fds via \
+                     SpawnGuard::Drop after spawn returns; threads share the \
+                     parent fd table and would observe EBADF or, post-fd-reuse, \
+                     write to the wrong file. Use CloneMode::Fork.",
+                    group.group_idx,
+                );
+            }
+            // WakeChain `wake: WakeMechanism::Pipe` with depth=1 deadlocks at fork:
+            // prev_stage and stage collapse to 0, so the post-fork
+            // close-other-fds block closes BOTH ends of the worker's
+            // own pipe (the `s == prev_stage` arm runs first and
+            // closes `pipe[1]`, leaving the worker without a write
+            // end). A 1-stage "ring chain" also has no meaningful
+            // wake-chain semantics — there is no successor to wake.
+            // Reject at spawn time with an actionable diagnostic.
+            if let Some(depth) = group_chain_depth
+                && depth < 2
+            {
+                anyhow::bail!(
+                    "WakeChain depth must be >= 2 (got {}, group {}); a 1-stage \
+                     chain has no successor to wake and the post-fork fd close \
+                     logic would close the worker's own write end",
+                    depth,
+                    group.group_idx,
+                );
+            }
+            // IdleChurn rejects Duration::ZERO for either field:
+            //   - burst_duration = 0 collapses the loop to pure
+            //     nanosleep — the worker accrues no runtime; the
+            //     idle-transition observability is unchanged but the
+            //     workload becomes useless as a scheduler test.
+            //   - sleep_duration = 0 produces no idle period; the
+            //     workload degenerates to SpinWait. Use SpinWait
+            //     directly.
+            if let WorkType::IdleChurn {
+                burst_duration,
+                sleep_duration,
+            } = group.work_type
+            {
+                if burst_duration.is_zero() {
+                    anyhow::bail!(
+                        "IdleChurn burst_duration must be > 0 (group {}); a zero \
+                         burst makes the loop pure sleep and the worker accrues \
+                         no runtime",
+                        group.group_idx,
+                    );
+                }
+                if sleep_duration.is_zero() {
+                    anyhow::bail!(
+                        "IdleChurn sleep_duration must be > 0 (group {}); a zero \
+                         sleep collapses the variant to SpinWait. Use \
+                         WorkType::SpinWait directly.",
+                        group.group_idx,
+                    );
+                }
             }
         }
 
-        // All failable acquisitions in this function route through
-        // `guard`. If any `?`/`bail!` returns early, the guard's Drop
-        // SIGKILLs+reaps forked children, closes open pipe fds, and
-        // munmaps the shared regions — so no leak on a mid-spawn
-        // error path.
+        // futex_region_size: a single per-guard scalar drives the
+        // SpawnGuard's munmap-on-drop. With multiple groups, each
+        // group's futex region MAY have a different natural size
+        // (FanOutCompute=16, ProducerConsumerImbalance=24+Q*8,
+        // everything else=4). Pick the MAX across all groups so
+        // every futex page in `guard.futex_ptrs` munmaps cleanly
+        // with the same length (the kernel rounds munmap length up
+        // to PAGE_SIZE anyway, so over-allocating to the next
+        // page boundary is free). Each group still mmaps the
+        // same futex_region_size and writes only what its variant
+        // expects — the trailing bytes are unused but kernel-zero-
+        // initialised by MAP_ANONYMOUS, which is the documented
+        // pre-condition for every variant's read sites.
+        //
+        // Worst-case waste: when groups have heterogeneous
+        // natural sizes — e.g. a single ProducerConsumerImbalance
+        // group with large `queue_depth_target` (size 24 + Q*8,
+        // many KiB) composed alongside one or more 4-byte futex
+        // groups (FutexPingPong/FutexFanOut/MutexContention) —
+        // every small-variant region is inflated to the
+        // ProducerConsumer size. Each over-allocated region
+        // crosses the page boundary that would otherwise have
+        // bounded the small-variant mapping at 4 KiB, so the
+        // waste per small group can exceed one page. Per-group
+        // sizing would eliminate this waste but adds a parallel
+        // `Vec<usize>` to SpawnGuard tracking each region's
+        // length so munmap on Drop receives the right length;
+        // deferred to a follow-up.
+        //
         // Sizing the per-group MAP_SHARED region:
         //   - FanOutCompute needs 16 bytes (futex u32 @ 0, wake_ns
         //     u64 @ 8).
@@ -3624,24 +3893,151 @@ impl WorkloadHandle {
         //     degenerate input that itself fails admission control
         //     elsewhere (the queue is far larger than RAM).
         //   - Everything else: u32 (4 bytes).
-        let futex_region_size = match config.work_type {
-            WorkType::FanOutCompute { .. } => 16,
-            WorkType::ProducerConsumerImbalance {
-                queue_depth_target,
-                ..
-            } => {
-                let q = std::cmp::min(queue_depth_target as usize, usize::MAX / 8 - 3);
-                24 + q * 8
-            }
-            _ => std::mem::size_of::<u32>(),
-        };
+        let futex_region_size = groups
+            .iter()
+            .map(|g| match g.work_type {
+                WorkType::FanOutCompute { .. } => 16,
+                WorkType::ProducerConsumerImbalance {
+                    queue_depth_target,
+                    ..
+                } => {
+                    let q =
+                        std::cmp::min(queue_depth_target as usize, usize::MAX / 8 - 3);
+                    24 + q * 8
+                }
+                _ => std::mem::size_of::<u32>(),
+            })
+            .max()
+            .unwrap_or_else(|| std::mem::size_of::<u32>());
+
+        // All failable acquisitions in this function route through
+        // `guard`. If any `?`/`bail!` returns early, the guard's Drop
+        // SIGKILLs+reaps forked children, closes open pipe fds, and
+        // munmaps the shared regions — so no leak on a mid-spawn
+        // error path.
         let mut guard = SpawnGuard::new(futex_region_size);
+
+        // Per-worker iteration counter region (MAP_SHARED). Sized
+        // for ALL groups' workers laid out contiguously: primary
+        // group occupies slots `[0, primary.num_workers)`, composed
+        // group `k` occupies slots starting at the running offset
+        // tracked by `iter_offset` in the per-group spawn loop
+        // below. Each worker atomically stores its iteration count
+        // to its assigned slot; the parent reads all slots via
+        // `snapshot_iterations()`. The mmap base is page-aligned
+        // (kernel guarantee), so casting to `*mut AtomicU64` is
+        // sound: page alignment (≥ 4096) ≥ AtomicU64 alignment (8),
+        // and the region size is an exact multiple of
+        // `size_of::<AtomicU64>()` (== 8). Each `.add(i)` moves by
+        // `i * 8` bytes, preserving the 8-byte alignment invariant.
+        // No non-atomic access to the region exists anywhere in the
+        // crate, so the atomic-only aliasing rule (workers + parent
+        // share `&AtomicU64` references derived from the raw
+        // pointer) holds.
+        let total_workers: usize = groups.iter().map(|g| g.num_workers).sum();
+        if total_workers > 0 {
+            let size = total_workers * std::mem::size_of::<AtomicU64>();
+            let ptr = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    size,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            if ptr == libc::MAP_FAILED {
+                let errno = std::io::Error::last_os_error();
+                let hint = mmap_shared_anon_errno_hint(errno.raw_os_error());
+                anyhow::bail!(
+                    "mmap(MAP_SHARED|MAP_ANONYMOUS, {size} bytes) for the \
+                     per-worker iter_counters region failed: {errno}{hint}; \
+                     this region holds one AtomicU64 per worker \
+                     ({total_workers} slots across {} group(s)) so the parent \
+                     can snapshot iteration counts via \
+                     `snapshot_iterations()`. Remediation: reduce num_workers \
+                     (each worker consumes 8 bytes of this region, rounded up \
+                     to a page) or raise `vm.max_map_count` / the memory \
+                     cgroup limit.",
+                    groups.len(),
+                );
+            }
+            guard.iter_counters = ptr as *mut AtomicU64;
+            guard.iter_counter_bytes = size;
+        }
+
+        // Spawn each group in declaration order. `iter_offset`
+        // tracks the running offset into the iter_counters mmap
+        // (slot allocation per the layout commented above). Each
+        // group's pipes / chain_pipes / futex_ptrs are appended to
+        // the guard's flat vectors; we record per-group base
+        // offsets so the per-worker fork loop can compute
+        // global-vector indices from per-group worker indices and
+        // the close-other-fds child path can iterate the full
+        // guard while still identifying its own group's resources.
+        let mut iter_offset: usize = 0;
+        for group in &groups {
+            Self::spawn_group(&mut guard, group, &dispatch, iter_offset)?;
+            iter_offset += group.num_workers;
+        }
+
+        // Success: transfer live resources (children, futex_ptrs,
+        // iter_counters) to the handle. The guard's subsequent Drop
+        // closes the inter-worker `pipe_pairs` — the parent never
+        // uses them post-fork, and they were never owned by the
+        // handle.
+        Ok(guard.into_handle())
+    }
+
+    /// Spawn a single worker group's resources and per-worker
+    /// tasks, appending each into the shared [`SpawnGuard`].
+    ///
+    /// Each group records its own base offsets into the guard's
+    /// flat vectors at entry time, then uses those offsets when
+    /// computing per-worker `pair_idx` / `chain_idx` /
+    /// `futex_group_idx`. The fork-child close-other-fds block
+    /// iterates the FULL guard so it sweeps fds belonging to
+    /// other groups too — without that sweep, a composed-group
+    /// worker would inherit (and never close) every primary-group
+    /// pipe fd.
+    ///
+    /// Resource ownership is uniform across groups: every
+    /// allocated pipe / mmap region lives in the guard's flat
+    /// vectors and is freed by `SpawnGuard::Drop` on early-bail or
+    /// transferred to [`WorkloadHandle`] on success via
+    /// [`SpawnGuard::into_handle`].
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_group(
+        guard: &mut SpawnGuard,
+        group: &GroupParams,
+        dispatch: &Dispatch,
+        iter_offset: usize,
+    ) -> Result<()> {
+        let needs_pipes = matches!(
+            group.work_type,
+            WorkType::PipeIo { .. } | WorkType::CachePipe { .. }
+        );
+        let chain_depth = group.work_type.chain_pipe_depth();
+        let needs_futex = group.work_type.needs_shared_mem();
+
+        // Record the bases into the guard's flat vectors BEFORE
+        // appending this group's allocations. The base values
+        // identify "where this group's resources start" — the
+        // per-worker fork loop combines `pipe_pair_base + i / 2`
+        // (and analogous for chain_idx / futex_group_idx) to
+        // address its own resources without colliding with another
+        // group's range.
+        let pipe_pair_base = guard.pipe_pairs.len();
+        let chain_pipes_base = guard.chain_pipes.len();
+        let futex_ptrs_base = guard.futex_ptrs.len();
+        let futex_region_size = guard.futex_region_size;
 
         // For paired work types, create one pipe per worker pair before forking.
         // pipe_pairs[pair_idx] = (read_fd, write_fd) for the A->B direction,
         // and a second pipe for B->A.
         if needs_pipes {
-            for _ in 0..config.num_workers / 2 {
+            for _ in 0..group.num_workers / 2 {
                 let mut ab = [0i32; 2]; // A writes, B reads
                 if unsafe { libc::pipe(ab.as_mut_ptr()) } != 0 {
                     anyhow::bail!("pipe failed: {}", std::io::Error::last_os_error());
@@ -3670,9 +4066,9 @@ impl WorkloadHandle {
         // otherwise reach those fds.
         if let Some(depth) = chain_depth
             && depth > 0
-            && config.num_workers >= depth
+            && group.num_workers >= depth
         {
-            let chains = config.num_workers / depth;
+            let chains = group.num_workers / depth;
             for _ in 0..chains {
                 let mut chain: Vec<[i32; 2]> = Vec::with_capacity(depth);
                 let mut alloc_ok = true;
@@ -3704,10 +4100,14 @@ impl WorkloadHandle {
         // one shared region per worker group via MAP_SHARED|MAP_ANONYMOUS
         // so all members of the fork see the same physical page. FanOutCompute
         // needs 16 bytes (futex u32 at offset 0, wake timestamp u64 at
-        // offset 8); others need 4 bytes.
-        let futex_group_size = config.work_type.worker_group_size().unwrap_or(2);
+        // offset 8); others need 4 bytes. The guard's
+        // `futex_region_size` is the MAX across all groups (see
+        // sizing comment in `spawn`), so the trailing bytes for
+        // smaller-variant groups are unused but kernel-zero-
+        // initialised by MAP_ANONYMOUS.
+        let futex_group_size = group.work_type.worker_group_size().unwrap_or(2);
         if needs_futex {
-            for _ in 0..config.num_workers / futex_group_size {
+            for _ in 0..group.num_workers / futex_group_size {
                 let ptr = unsafe {
                     libc::mmap(
                         std::ptr::null_mut(),
@@ -3724,13 +4124,14 @@ impl WorkloadHandle {
                     anyhow::bail!(
                         "mmap(MAP_SHARED|MAP_ANONYMOUS, {futex_region_size} bytes) \
                          for a futex shared-memory region failed: {errno}{hint}; \
-                         this region backs the {:?} worker-group's \
+                         this region backs the {:?} worker-group's (group {}) \
                          inter-process futex word and is allocated \
                          before fork so every child inherits the same \
                          mapping. Remediation: reduce num_workers (each \
                          futex group consumes one shared page) or raise \
                          `vm.max_map_count` / the memory cgroup limit.",
-                        config.work_type.name(),
+                        group.work_type.name(),
+                        group.group_idx,
                     );
                 }
                 unsafe { std::ptr::write_bytes(ptr as *mut u8, 0, futex_region_size) };
@@ -3738,53 +4139,8 @@ impl WorkloadHandle {
             }
         }
 
-        // Per-worker iteration counter region (MAP_SHARED). Each
-        // worker atomically stores its iteration count to slot [i];
-        // the parent reads all slots via `snapshot_iterations()`.
-        // The mmap base is page-aligned (kernel guarantee), so
-        // casting to `*mut AtomicU64` is sound: page alignment (≥
-        // 4096) ≥ AtomicU64 alignment (8), and the region size is
-        // an exact multiple of `size_of::<AtomicU64>()` (== 8).
-        // Each `.add(i)` moves by `i * 8` bytes, preserving the
-        // 8-byte alignment invariant. No non-atomic access to the
-        // region exists anywhere in the crate, so the atomic-only
-        // aliasing rule (workers + parent share `&AtomicU64`
-        // references derived from the raw pointer) holds.
-        let iter_counter_len = config.num_workers;
-        if iter_counter_len > 0 {
-            let size = iter_counter_len * std::mem::size_of::<AtomicU64>();
-            let ptr = unsafe {
-                libc::mmap(
-                    std::ptr::null_mut(),
-                    size,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_SHARED | libc::MAP_ANONYMOUS,
-                    -1,
-                    0,
-                )
-            };
-            if ptr == libc::MAP_FAILED {
-                let errno = std::io::Error::last_os_error();
-                let hint = mmap_shared_anon_errno_hint(errno.raw_os_error());
-                anyhow::bail!(
-                    "mmap(MAP_SHARED|MAP_ANONYMOUS, {size} bytes) for the \
-                     {work_type:?} worker-group's per-worker iter_counters \
-                     region failed: {errno}{hint}; this region holds one \
-                     AtomicU64 per worker ({iter_counter_len} slots) so \
-                     the parent can snapshot iteration counts via \
-                     `snapshot_iterations()`. Remediation: reduce \
-                     num_workers (each worker consumes 8 bytes of this \
-                     region, rounded up to a page) or raise \
-                     `vm.max_map_count` / the memory cgroup limit.",
-                    work_type = config.work_type.name(),
-                );
-            }
-            guard.iter_counters = ptr as *mut AtomicU64;
-            guard.iter_counter_bytes = size;
-        }
-
-        for i in 0..config.num_workers {
-            let affinity = resolve_affinity(&config.affinity)?;
+        for i in 0..group.num_workers {
+            let affinity = resolve_affinity(&group.affinity)?;
 
             // Determine pipe fds for this worker.
             //
@@ -3799,8 +4155,16 @@ impl WorkloadHandle {
             //   writes to pipe `s` (its own pipe's write end, which
             //   stage `s + 1` reads from).
             // - Everything else: `None`.
+            //
+            // Indices are computed in the GLOBAL `guard.pipe_pairs`
+            // / `guard.chain_pipes` space by adding the per-group
+            // base recorded at the top of `spawn_group`. A composed
+            // group's pipe-pair-base, for example, equals the sum
+            // of every prior group's pipe-pair count, so its first
+            // worker pair is allocated immediately after the
+            // primary's last entry — no collision, no aliasing.
             let worker_pipe_fds: Option<(i32, i32)> = if needs_pipes {
-                let pair_idx = i / 2;
+                let pair_idx = pipe_pair_base + i / 2;
                 let (ref ab, ref ba) = guard.pipe_pairs[pair_idx];
                 if i % 2 == 0 {
                     // Worker A: writes to ab[1], reads from ba[0]
@@ -3812,7 +4176,7 @@ impl WorkloadHandle {
             } else if let Some(depth) = chain_depth
                 && depth > 0
             {
-                let chain_idx = i / depth;
+                let chain_idx = chain_pipes_base + i / depth;
                 let stage = i % depth;
                 let prev_stage = (stage + depth - 1) % depth;
                 let chain = &guard.chain_pipes[chain_idx];
@@ -3835,16 +4199,19 @@ impl WorkloadHandle {
             // producer/consumer split, RtStarvation's RT/CFS split,
             // WakeChain's stage index) consume `pos` directly.
             let worker_futex: Option<(*mut u32, usize)> = if needs_futex {
-                let group_idx = i / futex_group_size;
+                let futex_group_idx = futex_ptrs_base + i / futex_group_size;
                 let pos = i % futex_group_size;
-                Some((guard.futex_ptrs[group_idx], pos))
+                Some((guard.futex_ptrs[futex_group_idx], pos))
             } else {
                 None
             };
 
-            // Shared iteration counter slot for this worker.
+            // Shared iteration counter slot for this worker. The
+            // group-local index `i` is added to the spawn-time
+            // `iter_offset` so each group's slot range is disjoint
+            // from every other group's.
             let iter_slot: *mut AtomicU64 = if !guard.iter_counters.is_null() {
-                unsafe { guard.iter_counters.add(i) }
+                unsafe { guard.iter_counters.add(iter_offset + i) }
             } else {
                 std::ptr::null_mut()
             };
@@ -3857,8 +4224,8 @@ impl WorkloadHandle {
             match dispatch {
                 Dispatch::Thread => {
                     spawn_thread_worker(
-                        &mut guard,
-                        config,
+                        guard,
+                        group,
                         affinity,
                         worker_pipe_fds,
                         worker_futex,
@@ -3878,9 +4245,10 @@ impl WorkloadHandle {
             let mut report_fds = [0i32; 2];
             if unsafe { libc::pipe(report_fds.as_mut_ptr()) } != 0 {
                 anyhow::bail!(
-                    "worker {}/{}: report pipe failed: {}",
+                    "worker {}/{} (group {}): report pipe failed: {}",
                     i + 1,
-                    config.num_workers,
+                    group.num_workers,
+                    group.group_idx,
                     std::io::Error::last_os_error(),
                 );
             }
@@ -3891,9 +4259,10 @@ impl WorkloadHandle {
                     libc::close(report_fds[1]);
                 }
                 anyhow::bail!(
-                    "worker {}/{}: start pipe failed: {}",
+                    "worker {}/{} (group {}): start pipe failed: {}",
                     i + 1,
-                    config.num_workers,
+                    group.num_workers,
+                    group.group_idx,
                     std::io::Error::last_os_error(),
                 );
             }
@@ -3911,9 +4280,10 @@ impl WorkloadHandle {
                         libc::close(start_fds[1]);
                     }
                     anyhow::bail!(
-                        "worker {}/{}: fork failed: {}",
+                        "worker {}/{} (group {}): fork failed: {}",
                         i + 1,
-                        config.num_workers,
+                        group.num_workers,
+                        group.group_idx,
                         std::io::Error::last_os_error(),
                     );
                 }
@@ -4022,9 +4392,21 @@ impl WorkloadHandle {
                         libc::close(report_fds[0]);
                         libc::close(start_fds[1]);
                     }
-                    // Close pipe ends belonging to other workers in this pair.
+                    // Close pipe ends belonging to other workers
+                    // in this pair, AND every pipe fd that belongs
+                    // to any other pair anywhere in the workload —
+                    // including pairs owned by other groups, since
+                    // every pre-fork allocation lives in
+                    // `guard.pipe_pairs` regardless of which group
+                    // declared it. The fork inherits the parent's
+                    // entire fd table; without this sweep, a
+                    // composed-group worker would hold open every
+                    // primary-group pipe fd for its lifetime,
+                    // producing fd leaks and (for chain-shaped
+                    // workloads) keeping reader-side blocks live
+                    // when the writer-side closes.
                     if needs_pipes {
-                        let pair_idx = i / 2;
+                        let pair_idx = pipe_pair_base + i / 2;
                         let (ref ab, ref ba) = guard.pipe_pairs[pair_idx];
                         if i % 2 == 0 {
                             // Worker A keeps ba[0] (read) and ab[1] (write).
@@ -4041,7 +4423,7 @@ impl WorkloadHandle {
                                 libc::close(ba[0]);
                             }
                         }
-                        // Close all pipe fds from other pairs.
+                        // Close all pipe fds from other pairs (any group).
                         for (j, (ab2, ba2)) in guard.pipe_pairs.iter().enumerate() {
                             if j != pair_idx {
                                 unsafe {
@@ -4052,11 +4434,23 @@ impl WorkloadHandle {
                                 }
                             }
                         }
+                    } else {
+                        // Worker doesn't own any pipe pair, but
+                        // other groups' pipe pairs are still in the
+                        // child's fd table — close them all.
+                        for (ab2, ba2) in guard.pipe_pairs.iter() {
+                            unsafe {
+                                libc::close(ab2[0]);
+                                libc::close(ab2[1]);
+                                libc::close(ba2[0]);
+                                libc::close(ba2[1]);
+                            }
+                        }
                     }
                     if let Some(depth) = chain_depth
                         && depth > 0
                     {
-                        let chain_idx = i / depth;
+                        let chain_idx = chain_pipes_base + i / depth;
                         let stage = i % depth;
                         let prev_stage = (stage + depth - 1) % depth;
                         // Close every fd in the chain that this
@@ -4093,7 +4487,7 @@ impl WorkloadHandle {
                                 }
                             }
                         }
-                        // Close every fd from other chains.
+                        // Close every fd from other chains (any group).
                         for (cj, chain) in guard.chain_pipes.iter().enumerate() {
                             if cj != chain_idx {
                                 for pipe in chain {
@@ -4101,6 +4495,21 @@ impl WorkloadHandle {
                                         libc::close(pipe[0]);
                                         libc::close(pipe[1]);
                                     }
+                                }
+                            }
+                        }
+                    } else {
+                        // This group has no chain pipes, but other
+                        // groups may. Close every chain-pipe fd
+                        // inherited via fork — leaving a primary
+                        // group's chain pipe open in a composed
+                        // worker would prevent the chain from ever
+                        // observing EOF on its read ends.
+                        for chain in guard.chain_pipes.iter() {
+                            for pipe in chain {
+                                unsafe {
+                                    libc::close(pipe[0]);
+                                    libc::close(pipe[1]);
                                 }
                             }
                         }
@@ -4225,15 +4634,16 @@ impl WorkloadHandle {
                             // `stop.load(Relaxed)` checks.
                             let report = worker_main(
                                 affinity,
-                                config.work_type.clone(),
-                                config.sched_policy,
-                                config.mem_policy.clone(),
-                                config.mpol_flags,
-                                config.nice,
+                                group.work_type.clone(),
+                                group.sched_policy,
+                                group.mem_policy.clone(),
+                                group.mpol_flags,
+                                group.nice,
                                 worker_pipe_fds,
                                 worker_futex,
                                 iter_slot,
                                 &STOP,
+                                group.group_idx,
                             );
                             let json = serde_json::to_vec(&report).unwrap_or_default();
                             let mut f = unsafe { std::fs::File::from_raw_fd(report_fds[1]) };
@@ -4262,12 +4672,7 @@ impl WorkloadHandle {
             }
         }
 
-        // Success: transfer live resources (children, futex_ptrs,
-        // iter_counters) to the handle. The guard's subsequent Drop
-        // closes the inter-worker `pipe_pairs` — the parent never
-        // uses them post-fork, and they were never owned by the
-        // handle.
-        Ok(guard.into_handle())
+        Ok(())
     }
 
     /// Kernel TIDs of all worker tasks, in spawn order.
@@ -5261,6 +5666,7 @@ fn worker_main(
     futex: Option<(*mut u32, usize)>,
     iter_slot: *mut AtomicU64,
     stop: &AtomicBool,
+    group_idx: usize,
 ) -> WorkerReport {
     // The kernel's per-task identifier is gettid(), not getpid():
     // - For fork-based workers, getpid() == gettid() because the
@@ -7783,6 +8189,7 @@ fn worker_main(
             work_type,
             WorkType::FutexFanOut { .. } | WorkType::FanOutCompute { .. }
         ) && futex.map(|(_, p)| p == 0).unwrap_or(false),
+        group_idx,
     }
 }
 
@@ -9266,6 +9673,11 @@ mod tests {
             // survives, not just that Default's value matches on
             // both sides.
             is_messenger: true,
+            // Non-zero so the serde roundtrip proves group_idx
+            // serializes/deserializes correctly. The composed
+            // dispatch path tags reports with their group_idx; a
+            // silent default-zero on serde would lose that tag.
+            group_idx: 7,
         };
         let json = serde_json::to_string(&r).unwrap();
         let r2: WorkerReport = serde_json::from_str(&json).unwrap();
@@ -9277,6 +9689,7 @@ mod tests {
         assert_eq!(r.wake_sample_total, r2.wake_sample_total);
         assert_eq!(r.completed, r2.completed);
         assert_eq!(r.is_messenger, r2.is_messenger);
+        assert_eq!(r.group_idx, r2.group_idx);
     }
 
     #[test]
@@ -9312,6 +9725,251 @@ mod tests {
             assert!(r.work_units > 0, "worker {} did no work", r.tid);
             assert!(r.wall_time_ns > 0);
             assert!(!r.cpus_used.is_empty());
+        }
+    }
+
+    /// Composed groups spawn alongside the primary group and tag
+    /// every produced [`WorkerReport`] with the spawning group's
+    /// `group_idx`. The brief specifies SpinWait(2) primary +
+    /// composed=[PipeIo(2)] → 4 reports total with group_idxs
+    /// `[0, 0, 1, 1]` in spawn order.
+    #[test]
+    fn spawn_with_composed_tags_group_idx() {
+        let config = WorkloadConfig::default()
+            .work_type(WorkType::SpinWait)
+            .workers(2)
+            .with_composed(
+                WorkSpec::default()
+                    .work_type(WorkType::pipe_io(64))
+                    .workers(2),
+            );
+        let mut h = WorkloadHandle::spawn(&config).unwrap();
+        assert_eq!(
+            h.worker_pids().len(),
+            4,
+            "primary(2) + composed[0](2) = 4 worker pids",
+        );
+        h.start();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let reports = h.stop_and_collect();
+        assert_eq!(reports.len(), 4, "every spawned worker emits a report");
+
+        // Per-group counts: 2 reports from group 0, 2 from group 1.
+        let group_idxs: Vec<usize> = reports.iter().map(|r| r.group_idx).collect();
+        let n_primary = group_idxs.iter().filter(|&&g| g == 0).count();
+        let n_composed_0 = group_idxs.iter().filter(|&&g| g == 1).count();
+        assert_eq!(
+            n_primary, 2,
+            "group_idx==0 (primary) must produce exactly num_workers reports; got {group_idxs:?}",
+        );
+        assert_eq!(
+            n_composed_0, 2,
+            "group_idx==1 (composed[0]) must produce exactly num_workers reports; got {group_idxs:?}",
+        );
+
+        // Every report must come from one of the declared groups —
+        // a group_idx outside `0..=1` would mean a sentinel/leak
+        // path is forging a tag.
+        for r in &reports {
+            assert!(
+                r.group_idx <= 1,
+                "report carries group_idx={}, exceeds composed-list \
+                 cardinality (1 primary + 1 composed = max group_idx 1)",
+                r.group_idx,
+            );
+        }
+    }
+
+    /// Composed [`WorkSpec::num_workers`] = `None` is rejected at
+    /// spawn time. The scenario engine resolves `None` against
+    /// `Ctx::workers_per_cgroup` before reaching
+    /// [`WorkloadHandle::spawn`]; bare callers of `spawn()` must
+    /// supply a concrete count.
+    #[test]
+    fn spawn_with_composed_rejects_none_num_workers() {
+        let config = WorkloadConfig::default()
+            .work_type(WorkType::SpinWait)
+            .workers(1)
+            .with_composed(WorkSpec::default().work_type(WorkType::SpinWait));
+        let result = WorkloadHandle::spawn(&config);
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!(
+                "composed entry with num_workers=None must be rejected at spawn"
+            ),
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("num_workers must be set"),
+            "diagnostic must name the failure cause; got: {msg}",
+        );
+    }
+
+    /// Composed [`WorkSpec::affinity`] resolution: only `Inherit`
+    /// and `Exact` are reachable from spawn() — topology-aware
+    /// variants need scenario-level state (TestTopology, cpuset)
+    /// that bare `spawn()` does not have.
+    #[test]
+    fn spawn_with_composed_rejects_topology_affinity() {
+        let config = WorkloadConfig::default()
+            .work_type(WorkType::SpinWait)
+            .workers(1)
+            .with_composed(
+                WorkSpec::default()
+                    .work_type(WorkType::SpinWait)
+                    .workers(1)
+                    .affinity(AffinityIntent::LlcAligned),
+            );
+        let result = WorkloadHandle::spawn(&config);
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!(
+                "composed entry with topology-aware affinity must be rejected"
+            ),
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("scenario topology context"),
+            "diagnostic must point at the missing scenario context; got: {msg}",
+        );
+    }
+
+    /// Composed [`WorkSpec::affinity`] = `Exact(set)` is accepted
+    /// — it carries its own resolved CPU set and needs no
+    /// scenario context. Confirms the no-context path remains
+    /// reachable from bare `spawn()`.
+    #[test]
+    fn spawn_with_composed_accepts_exact_affinity() {
+        let config = WorkloadConfig::default()
+            .work_type(WorkType::SpinWait)
+            .workers(1)
+            .with_composed(
+                WorkSpec::default()
+                    .work_type(WorkType::SpinWait)
+                    .workers(1)
+                    .affinity(AffinityIntent::exact([0])),
+            );
+        let mut h = WorkloadHandle::spawn(&config).expect("Exact affinity must accept");
+        h.start();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let reports = h.stop_and_collect();
+        assert_eq!(reports.len(), 2, "1 primary + 1 composed = 2 reports");
+    }
+
+    /// Composed [`WorkSpec::clone_mode`] mismatched with the
+    /// parent is rejected: SpawnGuard's lifecycle assumes a
+    /// single dispatch path (children OR threads, never mixed).
+    #[test]
+    fn spawn_with_composed_rejects_clone_mode_mismatch() {
+        let config = WorkloadConfig::default()
+            .work_type(WorkType::SpinWait)
+            .workers(1)
+            .clone_mode(CloneMode::Fork)
+            .with_composed(
+                WorkSpec::default()
+                    .work_type(WorkType::SpinWait)
+                    .workers(1)
+                    .clone_mode(CloneMode::Thread),
+            );
+        let result = WorkloadHandle::spawn(&config);
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!(
+                "composed entry with mismatched clone_mode must be rejected"
+            ),
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("clone_mode"),
+            "diagnostic must name clone_mode; got: {msg}",
+        );
+    }
+
+    /// Three composed entries plus the primary = 4 groups total.
+    /// Catches off-by-one in the group_idx assignment loop: if the
+    /// primary mistakenly used group_idx=1 (or composed[k] used
+    /// k instead of k+1), the count-by-group_idx asserts surface
+    /// the drift immediately.
+    #[test]
+    fn spawn_with_three_composed_tags_each_group_idx() {
+        let config = WorkloadConfig::default()
+            .work_type(WorkType::SpinWait)
+            .workers(1)
+            .with_composed(
+                WorkSpec::default()
+                    .work_type(WorkType::SpinWait)
+                    .workers(2),
+            )
+            .with_composed(
+                WorkSpec::default()
+                    .work_type(WorkType::SpinWait)
+                    .workers(3),
+            )
+            .with_composed(
+                WorkSpec::default()
+                    .work_type(WorkType::SpinWait)
+                    .workers(4),
+            );
+        let mut h = WorkloadHandle::spawn(&config).unwrap();
+        assert_eq!(
+            h.worker_pids().len(),
+            1 + 2 + 3 + 4,
+            "primary(1) + composed[0](2) + composed[1](3) + composed[2](4) = 10 pids",
+        );
+        h.start();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let reports = h.stop_and_collect();
+        assert_eq!(reports.len(), 10);
+        let group_idxs: Vec<usize> = reports.iter().map(|r| r.group_idx).collect();
+        // Per-group counts: 1 primary, 2 in composed[0], 3 in
+        // composed[1], 4 in composed[2].
+        let count_for = |g: usize| group_idxs.iter().filter(|&&x| x == g).count();
+        assert_eq!(
+            count_for(0),
+            1,
+            "primary (group_idx=0) must produce 1 report; got {group_idxs:?}",
+        );
+        assert_eq!(
+            count_for(1),
+            2,
+            "composed[0] (group_idx=1) must produce 2 reports; got {group_idxs:?}",
+        );
+        assert_eq!(
+            count_for(2),
+            3,
+            "composed[1] (group_idx=2) must produce 3 reports; got {group_idxs:?}",
+        );
+        assert_eq!(
+            count_for(3),
+            4,
+            "composed[2] (group_idx=3) must produce 4 reports; got {group_idxs:?}",
+        );
+        // group_idx must never exceed declared cardinality (4 groups → max 3).
+        for r in &reports {
+            assert!(
+                r.group_idx <= 3,
+                "report carries group_idx={}, exceeds composed list cardinality",
+                r.group_idx,
+            );
+        }
+    }
+
+    /// Composed = empty Vec spawns the primary group only — the
+    /// composed iteration is a no-op when the vec is empty.
+    #[test]
+    fn spawn_with_empty_composed_runs_primary_only() {
+        let config = WorkloadConfig::default()
+            .work_type(WorkType::SpinWait)
+            .workers(2)
+            .composed(std::iter::empty());
+        let mut h = WorkloadHandle::spawn(&config).unwrap();
+        assert_eq!(h.worker_pids().len(), 2);
+        h.start();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let reports = h.stop_and_collect();
+        assert_eq!(reports.len(), 2);
+        for r in &reports {
+            assert_eq!(r.group_idx, 0, "empty composed: every report is primary");
         }
     }
 
@@ -10160,6 +10818,7 @@ mod tests {
             vmstat_numa_pages_migrated: 0,
             exit_info: None,
             is_messenger: false,
+            group_idx: 0,
         };
         let json = serde_json::to_string(&r).unwrap();
         let r2: WorkerReport = serde_json::from_str(&json).unwrap();
@@ -10191,6 +10850,7 @@ mod tests {
             vmstat_numa_pages_migrated: 0,
             exit_info: None,
             is_messenger: false,
+            group_idx: usize::MAX,
         };
         let json = serde_json::to_string(&r).unwrap();
         let r2: WorkerReport = serde_json::from_str(&json).unwrap();
@@ -10770,6 +11430,7 @@ mod tests {
             vmstat_numa_pages_migrated: 0,
             exit_info: None,
             is_messenger: false,
+            group_idx: 0,
         };
         let s = format!("{:?}", r);
         assert!(s.contains("42"), "must show tid value");
@@ -10826,6 +11487,7 @@ mod tests {
             vmstat_numa_pages_migrated: 0,
             exit_info: None,
             is_messenger: false,
+            group_idx: 0,
         };
         assert_eq!(r.off_cpu_ns, r.wall_time_ns - r.cpu_time_ns);
     }
@@ -11514,6 +12176,7 @@ mod tests {
             vmstat_numa_pages_migrated: 0,
             exit_info: None,
             is_messenger: false,
+            group_idx: 0,
         }
     }
 
@@ -11561,6 +12224,7 @@ mod tests {
             vmstat_numa_pages_migrated: 0,
             exit_info: None,
             is_messenger: false,
+            group_idx: 0,
         }
     }
 

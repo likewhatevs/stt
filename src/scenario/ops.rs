@@ -2795,6 +2795,7 @@ fn apply_setup(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, defs: &[CgroupDef])
                 mpol_flags: work.mpol_flags,
                 nice: 0,
                 clone_mode: Default::default(),
+                composed: Vec::new(),
             };
             let mut h = WorkloadHandle::spawn(&wl)?;
             ctx.cgroups.move_tasks(&def.name, &h.worker_pids())?;
@@ -2991,6 +2992,7 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                     mpol_flags: work.mpol_flags,
                     nice: 0,
                     clone_mode: Default::default(),
+                    composed: Vec::new(),
                 };
                 let mut h = WorkloadHandle::spawn(&wl)?;
                 ctx.cgroups.move_tasks(cgroup, &h.worker_pids())?;
@@ -3080,6 +3082,7 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                     mpol_flags: work.mpol_flags,
                     nice: 0,
                     clone_mode: Default::default(),
+                    composed: Vec::new(),
                 };
                 let mut h = WorkloadHandle::spawn(&wl)?;
                 h.start();
@@ -6453,6 +6456,7 @@ mod tests {
             mpol_flags: w.mpol_flags,
             nice: 0,
             clone_mode: Default::default(),
+            composed: Vec::new(),
         };
         let h = WorkloadHandle::spawn(&wl).expect("spawn worker");
         step_state.handles.push(("step_cg".to_string(), h));
@@ -6513,6 +6517,7 @@ mod tests {
             mpol_flags: w.mpol_flags,
             nice: 0,
             clone_mode: Default::default(),
+            composed: Vec::new(),
         };
         let h = WorkloadHandle::spawn(&wl).expect("spawn");
         step_state.handles.push(("src".to_string(), h));
