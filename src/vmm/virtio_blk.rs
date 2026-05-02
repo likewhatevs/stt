@@ -17,65 +17,89 @@
 //! write → `S_IOERR`, RO flush → `S_OK`, unsupported request type →
 //! `S_UNSUPP`), then throttle bucket consumption. Validation
 //! precedes consumption — a malformed or type-rejected request never
-//! drains the bucket or hits `pread`/`pwrite`. See `process_requests`.
+//! drains the bucket or hits `pread`/`pwrite`. See
+//! `drain_bracket_impl`.
+//!
+//! # Execution model: split between vCPU and worker thread
+//!
+//! The cfg split decides which thread runs `drain_bracket_impl`:
+//!
+//! - **Production (`cfg(not(test))`):** A dedicated worker thread
+//!   (`ktstr-vblk`, spawned in `with_options`) owns the
+//!   `BlkWorkerState` for the device's lifetime. The vCPU's
+//!   `mmio_write(QUEUE_NOTIFY)` performs a non-blocking
+//!   `kick_fd.write(1)` and returns immediately; the worker's
+//!   `epoll_wait` resumes and runs one drain iteration per kick.
+//!   The vCPU thread never blocks on backing IO — `pread` /
+//!   `pwrite` / `fdatasync` all happen on the worker thread, off
+//!   the SIGRTMIN-delivery path. The freeze coordinator's
+//!   rendezvous timeout therefore is no longer at risk from slow
+//!   backing IO. `Drop` writes `stop_fd` and joins the worker.
+//!
+//! - **Tests (`cfg(test)`):** `process_requests` calls
+//!   `drain_inline` on the caller thread synchronously. This
+//!   preserves the existing test surface that calls
+//!   `process_requests` and immediately reads back queue +
+//!   counter state without crossing a thread boundary, and keeps
+//!   `dev.worker.queues[REQ_QUEUE].…` direct access valid (the
+//!   `BlkQueue` alias resolves to bare `Queue` in test builds).
+//!
+//! Both paths share the same `drain_bracket_impl` body — the only
+//! difference is which thread owns the `BlkWorkerState` it
+//! mutates.
 //!
 //! # Why
 //!
-//! - **Inline request processing on the vCPU thread.** `mmio_write` of
-//!   `QUEUE_NOTIFY` drives `process_requests` synchronously. The
-//!   throttle therefore must NOT block: the vCPU thread is the
-//!   target of SIGRTMIN from the failure-dump freeze coordinator,
-//!   and a blocked syscall delays SIGRTMIN delivery — a stalled
-//!   vCPU produces an empty dump. Throttle exhaustion returns
-//!   `S_IOERR` immediately rather than parking the request.
-//!
-//! - **Status-write-success gates `add_used`.** A used-ring
+//! - **`add_used` gated on status-write success.** A used-ring
 //!   advancement without a successfully-written status byte lets
 //!   the guest's `virtblk_done` observe its `vbr->in_hdr.status`
 //!   byte that's stale from prior blk-mq tag use as `BLK_STS_OK`
 //!   — silent data corruption for reads, silent dropped writes
 //!   for writes. See `publish_completion`.
 //!
-//! # Blocking-IO assumption
+//! - **Throttle returns `S_IOERR` rather than parking.** The
+//!   bucket never sleeps. In production this is liveness for the
+//!   worker thread — a sleeping worker thread cannot drain the
+//!   queue, so the guest's blk-mq retry/timeout logic owns the
+//!   delay budget rather than us pinning the worker on a futex.
+//!   In `cfg(test)` the bucket runs on the test thread; same
+//!   non-blocking contract applies for the same reason
+//!   (synchronous tests must not deadlock on a clock).
 //!
-//! Backend IO is synchronous on the vCPU thread:
+//! # Backing-speed caveat
+//!
+//! Backend IO is synchronous within `drain_bracket_impl`:
 //! `handle_read_impl` / `handle_write_impl` call
 //! `FileExt::read_at` / `write_at` (`pread64` / `pwrite64`) and
-//! `handle_flush_impl` calls `File::sync_data` (`fdatasync`)
-//! inline from `process_requests`. The vCPU thread blocks until
-//! the syscall returns. There is no host worker thread, no
-//! io_uring, no async queue.
+//! `handle_flush_impl` calls `File::sync_data` (`fdatasync`).
+//! There is no `io_uring` and no second-tier async queue — the
+//! worker serializes requests through the backing fd one at a
+//! time.
 //!
-//! This is acceptable when the backing is **fast** — tmpfs
-//! (the `tempfile()` default) or warm page cache — where pread /
-//! pwrite return in sub-microsecond time and fdatasync is a
-//! no-op (`noop_fsync`). The vCPU continues running guest code
-//! between requests with negligible interruption.
+//! This is fine when the backing is **fast** — tmpfs (the
+//! `tempfile()` default) or warm page cache — where pread / pwrite
+//! return in sub-microsecond time and fdatasync is a no-op
+//! (`noop_fsync`). With slow backing (cold page cache on spinning
+//! media, network-mounted file, fdatasync forcing real journal
+//! writes), the worker serializes through it; the guest observes
+//! high IO latency, but the vCPU thread is no longer at risk of
+//! missing SIGRTMIN. The trade-off shifts: slow backing now means
+//! "high guest-observed latency" rather than "stalled vCPU empties
+//! the failure dump."
 //!
-//! It is **not** acceptable when the backing could block for
-//! milliseconds — cold page cache on a real spinning disk,
-//! contended file locks, fdatasync forcing real journal writes,
-//! a network-mounted backing file, etc. A blocked syscall on
-//! the vCPU thread delays SIGRTMIN delivery from the
-//! failure-dump freeze coordinator (the same constraint
-//! `TokenBucket` documents for the throttle path); the freeze
-//! rendezvous times out at 30 s and the failure dump arrives
-//! empty for any vCPU still stuck in IO.
-//!
-//! v0 commits to this tradeoff because the test fixture targets
-//! small backing files on tmpfs — every request returns in
-//! microseconds and SIGRTMIN delivery is never delayed in
-//! practice. Operators who point a virtio-blk disk at a slow
-//! backing accept the failure-dump-empties risk; the rule is
-//! "the backing must be fast." Moving IO to a worker thread
-//! would lift this constraint but is not implemented in v0;
-//! see also the per-request request-cap commentary in the
-//! validation pipeline.
+//! v0 still targets small backing files on tmpfs; operators who
+//! point a virtio-blk disk at a slow backing simply accept the
+//! latency penalty.
 
 use std::fs::File;
 use std::os::unix::fs::FileExt;
+#[cfg(not(test))]
+use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+#[cfg(not(test))]
+use std::thread;
 use std::time::Instant;
 
 use virtio_bindings::virtio_blk::{
@@ -100,8 +124,14 @@ use virtio_bindings::virtio_mmio::{
     VIRTIO_MMIO_QUEUE_SEL, VIRTIO_MMIO_QUEUE_USED_HIGH, VIRTIO_MMIO_QUEUE_USED_LOW,
     VIRTIO_MMIO_STATUS, VIRTIO_MMIO_VENDOR_ID, VIRTIO_MMIO_VERSION,
 };
-use virtio_queue::{Queue, QueueT};
+#[cfg(test)]
+use virtio_queue::Queue;
+#[cfg(not(test))]
+use virtio_queue::QueueSync;
+use virtio_queue::QueueT;
 use vm_memory::{ByteValued, Bytes, GuestAddress, GuestMemoryMmap};
+#[cfg(not(test))]
+use vmm_sys_util::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use vmm_sys_util::eventfd::EventFd;
 
 use super::disk_config::DiskThrottle;
@@ -118,6 +148,27 @@ pub const VIRTIO_MMIO_SIZE: u64 = 0x1000;
 const NUM_QUEUES: usize = 1;
 const QUEUE_MAX_SIZE: u16 = 256;
 const REQ_QUEUE: usize = 0;
+
+/// Queue type used for the request virtqueue. Production uses
+/// `QueueSync` (`Arc<Mutex<Queue>>` internally) so the vCPU thread
+/// (MMIO config writes — set_size/ready/desc/avail/used addresses)
+/// and the dedicated worker thread (drain_bracket_impl — pop, add_used,
+/// needs_notification) can share the same queue state safely. Tests
+/// run drain_bracket_impl inline on the caller thread so the bare `Queue`
+/// (single-threaded, no internal lock) is sufficient and avoids
+/// changing the test surface that drives `Queue` methods directly
+/// (`disable_notification`, `set_avail_ring_address`, etc.).
+///
+/// The `QueueT` trait is the single API both implementations honour;
+/// every drain-side method this file calls (pop_descriptor_chain,
+/// add_used, disable/enable_notification, needs_notification,
+/// avail_ring, event_idx_enabled) is part of `QueueT`. Generic
+/// helpers like `publish_completion` are bound by `QueueT` so they
+/// compile against either alias without further indirection.
+#[cfg(not(test))]
+type BlkQueue = QueueSync;
+#[cfg(test)]
+type BlkQueue = Queue;
 
 /// Logical block size advertised to the guest. 512 bytes matches
 /// the virtio spec default.
@@ -322,34 +373,38 @@ const S_OK: u32 = S_FEAT | VIRTIO_CONFIG_S_DRIVER_OK;
 /// on elapsed wall time since the last refill, capped at `capacity`.
 /// No periodic timer needed — the refill is on-demand per request.
 ///
-/// # vCPU thread blocking budget
+/// # Non-blocking invariant
 ///
-/// `process_requests` is invoked from `mmio_write` on a `QUEUE_NOTIFY`,
-/// which runs on the vCPU thread (KVM exit → exit_dispatch →
-/// virtio_blk MMIO handler → here). The vCPU thread is also the
-/// signal target for the failure-dump freeze coordinator, which
-/// kicks every vCPU with `SIGRTMIN` to force a `KVM_RUN` return
-/// and rendezvous on the freeze barrier. Per the CLAUDE.md
-/// "vCPU thread blocking budget" rule: any code on this path
-/// must NOT block, because a blocked syscall delays SIGRTMIN
-/// delivery and the freeze rendezvous times out at 30 s — the
-/// failure dump arrives empty.
+/// `consume` runs inside `drain_bracket_impl`, which executes on the
+/// thread that owns the `BlkWorkerState` — the worker thread in
+/// production (`cfg(not(test))`), the vCPU/test thread inline
+/// (`cfg(test)`). Both modes require the bucket to be non-blocking:
+///
+/// - **Production worker thread:** A sleeping worker cannot drain
+///   the queue, so the guest stalls until the sleep elapses
+///   regardless of how much queue work has accumulated. Liveness
+///   for the worker means each `consume` must return immediately
+///   whether the bucket is satisfied or empty; the caller fails the
+///   request with `S_IOERR` and lets the guest's blk-mq layer
+///   retry/timeout policy own the delay budget.
+///
+/// - **`cfg(test)` inline path:** Tests call `process_requests`
+///   synchronously and assert on the post-call queue + counter
+///   state; a sleeping bucket would deadlock the test thread on
+///   the throttle clock. The synchronous test surface depends on
+///   `consume` always returning promptly.
 ///
 /// **Critical invariant: this bucket NEVER calls `thread::sleep` or
-/// any blocking syscall.** `consume` returns immediately whether the
-/// bucket is satisfied or empty. Caller (`process_requests`) is
-/// responsible for failing the request with `S_IOERR` when
-/// `consume` returns false. This is non-negotiable: the device's
-/// throttle reject path is "S_IOERR + bump throttled_count + let
-/// the guest's blk-mq retry"; sleeping or blocking is forbidden.
-/// `std::thread::sleep` in particular retries on EINTR per the
-/// Rust std source, so even a SIGRTMIN-targeted thread would not
-/// wake until the sleep duration elapsed.
+/// any blocking syscall.** `std::thread::sleep` in particular
+/// retries on EINTR per the Rust std source, so even a
+/// signal-targeted thread would not wake until the sleep duration
+/// elapsed.
 ///
 /// The "low-IOPS guest sees transient IO errors" trade-off is
 /// acceptable — btrfs and the blk-mq layer retry. Realism of disk
-/// latency is NOT a goal of the test fixture; preserving the
-/// failure-dump signal chain is.
+/// latency is NOT a goal of the test fixture; worker-thread
+/// liveness (production) and synchronous test progress (`cfg(test)`)
+/// are.
 ///
 /// `unlimited` (capacity == 0) is a fast path that always returns
 /// true. `DiskConfig` materialises this when neither IOPS nor bytes
@@ -510,9 +565,9 @@ fn buckets_from_throttle(throttle: DiskThrottle) -> (TokenBucket, TokenBucket) {
 ///
 /// `label` is included in any tracing::warn from this function so
 /// operators can identify which gate triggered the publish.
-fn publish_completion(
+fn publish_completion<Q: QueueT>(
     mem: &GuestMemoryMmap,
-    q: &mut Queue,
+    q: &mut Q,
     counters: &VirtioBlkCounters,
     head: u16,
     status_addr: GuestAddress,
@@ -626,18 +681,16 @@ impl VirtioBlkCounters {
 // Device struct
 // ----------------------------------------------------------------------------
 
-/// Owns the request-processing state — descriptor queue, backing
-/// file, throttle buckets, scratch buffers, capacity, RO flag, and
-/// the shared counters Arc. Today the worker runs inline on the
-/// vCPU thread (`VirtioBlk::drain_bracket` → `BlkWorker::drain_bracket`);
-/// the struct boundary isolates request-processing state from MMIO
-/// state, enabling a future worker-thread move.
+/// Worker-thread-owned mutable state. In production this lives on
+/// the dedicated worker thread for the device's lifetime; in test
+/// builds it lives directly inside `BlkWorker` (Inline mode) so the
+/// existing test surface — which calls `process_requests`
+/// synchronously and immediately reads back state via
+/// `dev.worker.state_mut().ops_bucket` etc. — keeps working.
 ///
 /// The MMIO-side state (interrupt_status, irq_evt, mem, FSM bits)
-/// stays on `VirtioBlk` so the MMIO read/write paths don't need to
-/// reach across the worker boundary.
-struct BlkWorker {
-    queues: [Queue; NUM_QUEUES],
+/// stays on `VirtioBlk` and is shared with the worker via Arc.
+struct BlkWorkerState {
     /// Backing file. The worker reads and writes sectors via
     /// `pread`/`pwrite` and never inspects the on-disk contents.
     backing: File,
@@ -645,14 +698,14 @@ struct BlkWorker {
     ops_bucket: TokenBucket,
     /// Token-bucket for bytes/sec.
     bytes_bucket: TokenBucket,
-    /// Reusable scratch for the descriptor-walk in `drain_bracket`.
+    /// Reusable scratch for the descriptor-walk in `drain_bracket_impl`.
     /// Allocated once at construction and `clear()`-ed each
     /// iteration so the underlying capacity (sized by the worst-case
     /// chain) is reused. Avoids one Vec allocation per request on
     /// the hot path. Capacity grows monotonically up to
     /// `VIRTIO_BLK_SEG_MAX + 2`. The data-segment slice given to
     /// the handlers is borrowed directly from
-    /// `&self.all_descs_scratch[1..chain_len - 1]` once `status_addr`
+    /// `&state.all_descs_scratch[1..chain_len - 1]` once `status_addr`
     /// has been validated — no second Vec, no copy.
     all_descs_scratch: Vec<ChainDescriptor>,
     /// Reusable per-segment IO buffer. Sized by `resize(len, 0)`
@@ -689,6 +742,101 @@ struct BlkWorker {
     counters: Arc<VirtioBlkCounters>,
 }
 
+/// Wraps the request-processing engine. In Inline mode (cfg(test))
+/// the state lives in-line and `process_requests` runs the drain
+/// synchronously on the caller thread — preserving the existing
+/// 113-test surface that calls `process_requests` then immediately
+/// reads back queue + counter state without crossing a thread
+/// boundary. In Spawned mode (production) a dedicated worker thread
+/// owns the state and is woken by `kick_fd`; the MMIO QUEUE_NOTIFY
+/// handler writes 1 to `kick_fd` and returns immediately so the
+/// vCPU thread is never blocked by the IO syscall.
+///
+/// `read_only` and `counters` are duplicated outside the engine so
+/// MMIO accessors (`device_features` reads `read_only`, `counters()`
+/// returns the Arc) can reach them without coordinating with the
+/// worker. They are immutable after construction in Spawned mode and
+/// kept in sync with the Inline branch's `BlkWorkerState`.
+///
+/// The shared resources the worker needs to drive the drain
+/// (`Arc<BlkQueue>` queue, `Arc<EventFd>` irq_evt,
+/// `Arc<AtomicU32>` interrupt_status, `Arc<Mutex<Option<…>>>` mem)
+/// are stored on `VirtioBlk` and cloned into the worker thread at
+/// spawn time; the worker holds independent Arc handles for the
+/// duration of its run.
+struct BlkWorker {
+    queues: [BlkQueue; NUM_QUEUES],
+    /// `read_only` flag, mirrored on the device side for
+    /// `device_features` and direct test inspection
+    /// (`dev.worker.read_only`). Set once at construction and never
+    /// mutated.
+    read_only: bool,
+    /// Counters Arc shared with the worker thread; mirrored on the
+    /// device side for `counters()` and direct test inspection.
+    counters: Arc<VirtioBlkCounters>,
+    /// Engine-mode-specific state.
+    engine: WorkerEngine,
+}
+
+/// Implementation strategy for the request-processing engine.
+enum WorkerEngine {
+    /// Synchronous in-thread mode (cfg(test)). The drain runs on the
+    /// caller thread when `process_requests` is called.
+    #[cfg(test)]
+    Inline(InlineEngine),
+    /// Production mode: a dedicated worker thread owns the state
+    /// and drives the drain on receipt of a kick eventfd write.
+    #[cfg(not(test))]
+    Spawned(SpawnedEngine),
+}
+
+/// Inline-mode engine state (cfg(test) only). Holds `BlkWorkerState`
+/// directly so the existing test surface that reaches into
+/// `dev.worker.<state field>` keeps compiling without renames.
+#[cfg(test)]
+struct InlineEngine {
+    state: BlkWorkerState,
+}
+
+/// Test-only accessors: in `cfg(test)` the `BlkWorkerState` lives in
+/// the Inline engine; tests reach in via `dev.worker.state_mut()` /
+/// `dev.worker.state()` rather than walking the engine enum on every
+/// access. The `match` is exhaustive against the single-variant cfg
+/// — there is no Spawned variant to handle in test builds.
+#[cfg(test)]
+impl BlkWorker {
+    fn state(&self) -> &BlkWorkerState {
+        let WorkerEngine::Inline(engine) = &self.engine;
+        &engine.state
+    }
+    fn state_mut(&mut self) -> &mut BlkWorkerState {
+        let WorkerEngine::Inline(engine) = &mut self.engine;
+        &mut engine.state
+    }
+}
+
+/// Spawned-mode engine state (production only). The mutable
+/// `BlkWorkerState` lives entirely on the worker thread; the device
+/// retains only a kick eventfd, a stop eventfd, and the join handle.
+#[cfg(not(test))]
+struct SpawnedEngine {
+    /// Eventfd written by `mmio_write(QUEUE_NOTIFY, …)`; the worker
+    /// epoll-waits on it and runs one drain iteration per signal.
+    /// Counter-mode (no `EFD_SEMAPHORE` flag) so coalesced kicks
+    /// produce one wakeup. Configured `EFD_NONBLOCK` so neither the
+    /// vCPU `write(1)` nor the worker `read()` ever blocks.
+    kick_fd: EventFd,
+    /// Eventfd written by `Drop::drop`; worker reads it and exits.
+    /// Counter-mode + `EFD_NONBLOCK`. The worker checks both fds in
+    /// the same `epoll_wait` call so a stop signal supersedes any
+    /// pending kick.
+    stop_fd: EventFd,
+    /// Worker thread join handle. Wrapped in `Option` so `Drop` can
+    /// `take()` and `join()` it. None after the thread has been
+    /// joined.
+    handle: Option<thread::JoinHandle<()>>,
+}
+
 /// Virtio-block MMIO device.
 pub struct VirtioBlk {
     queue_select: u32,
@@ -696,42 +844,57 @@ pub struct VirtioBlk {
     driver_features_sel: u32,
     driver_features: u64,
     device_status: u32,
-    /// Atomic so a future worker thread can set bits via `fetch_or`;
-    /// today `BlkWorker::drain_bracket` runs inline on the vCPU thread.
-    /// vCPU MMIO readers (`load(Acquire)` in `mmio_read
-    /// INTERRUPT_STATUS`) can race without a lock. INTERRUPT_ACK clears
-    /// bits via `fetch_and(!val, AcqRel)`. Worker writes are
-    /// Release-ordered so the bit set is visible alongside the chain's
-    /// `add_used` publish (Queue::add_used publishes used.idx with
-    /// Release; Queue::needs_notification issues a SeqCst fence before
-    /// reading used_event, ordering the fetch_or against the IRQ
-    /// decision).
-    interrupt_status: AtomicU32,
-    /// Atomic so a future resize path can bump generation from a
-    /// non-vCPU thread without locking, while the vCPU MMIO read
-    /// observes a fresh value via `load(Acquire)`. v0 still bumps
-    /// only on `reset()` (vCPU thread); the atomic shape is
-    /// defense-in-depth for future runtime config changes.
+    /// Worker may be on a separate thread (production cfg) and the
+    /// vCPU MMIO reader may race the worker's bit-set, so the value
+    /// is wrapped in an `Arc` and updated with atomic ops. Worker
+    /// writes the bit via `fetch_or(VIRTIO_MMIO_INT_VRING, Release)`
+    /// alongside its `add_used` publish; vCPU `mmio_read` of
+    /// `INTERRUPT_STATUS` does `load(Acquire)`; `INTERRUPT_ACK`
+    /// clears bits via `fetch_and(!val, AcqRel)`. The Release/Acquire
+    /// pair orders the bit set vs. the used-ring `add_used` (which
+    /// itself publishes `used.idx` with Release internally), so a
+    /// vCPU reading the bit set is guaranteed to also observe the
+    /// freshly-published used.idx — no torn observation where the
+    /// bit appears before the ring update.
+    interrupt_status: Arc<AtomicU32>,
+    /// `AtomicU32` for consistency with `interrupt_status`; v0 bumps
+    /// only from `reset()` on the vCPU thread, not from any other
+    /// thread (the worker thread does not touch config space). The
+    /// atomic shape is defense-in-depth for future runtime config
+    /// changes that might add a non-vCPU writer.
     config_generation: AtomicU32,
-    /// Eventfd for KVM irqfd.
-    irq_evt: EventFd,
-    /// Guest memory reference. Set before starting vCPUs.
-    mem: Option<GuestMemoryMmap>,
+    /// Eventfd for KVM irqfd. Shared `Arc` so the worker thread
+    /// (production cfg) can call `write(1)` to fire the IRQ without
+    /// taking ownership away from the device. Tests run inline so
+    /// the same Arc is read directly via `dev.irq_evt.read()`.
+    irq_evt: Arc<EventFd>,
+    /// Guest memory reference. Set before starting vCPUs via
+    /// `set_mem`. Wrapped in `Arc<Mutex<Option<…>>>` so the worker
+    /// thread (production) can pick up `mem` post-construction; the
+    /// Mutex is uncontended in steady state because writers
+    /// (`set_mem`) run once at boot and readers
+    /// (`drain_bracket_impl` / `drain_inline`) lock briefly to clone
+    /// the inner `GuestMemoryMmap` (which is itself `Arc`-internal
+    /// per `vm_memory`'s impl, so the clone is cheap).
+    mem: Arc<Mutex<Option<GuestMemoryMmap>>>,
     /// Capacity in 512-byte sectors. Determines what the guest sees
     /// in the config space's `capacity` field.
     capacity_sectors: u64,
-    /// Request-processing state (queue, backing, throttle, scratch,
-    /// capacity_bytes, read_only, counters Arc). Inline today; a
-    /// follow-up moves this onto a dedicated worker thread.
+    /// Request-processing state. In production a worker thread owns
+    /// the underlying `BlkWorkerState`; in `cfg(test)` the state is
+    /// inline so existing tests can read it back synchronously.
     worker: BlkWorker,
-    /// One-shot guard so the "drain_bracket called before
-    /// set_mem" warning fires at most once per device instance.
+    /// One-shot guard so the "queue notify before set_mem"
+    /// warning fires at most once per device instance.
     /// Without this, a buggy caller that issues N notifies before
     /// `set_mem` would flood the log with N copies of the same
     /// message. Latched with Relaxed because the order of the
     /// log message vs. other operations doesn't affect
-    /// correctness.
-    mem_unset_warned: AtomicBool,
+    /// correctness. `Arc` so the worker thread can also
+    /// access-and-latch the same flag (production: the warn fires
+    /// the first time the worker observes the unset mem during a
+    /// drain).
+    mem_unset_warned: Arc<AtomicBool>,
 }
 
 impl VirtioBlk {
@@ -763,8 +926,9 @@ impl VirtioBlk {
         throttle: DiskThrottle,
         read_only: bool,
     ) -> Self {
-        let irq_evt =
-            EventFd::new(libc::EFD_NONBLOCK).expect("failed to create virtio-blk irq eventfd");
+        let irq_evt = Arc::new(
+            EventFd::new(libc::EFD_NONBLOCK).expect("failed to create virtio-blk irq eventfd"),
+        );
         if capacity_bytes < VIRTIO_BLK_SECTOR_SIZE as u64 && capacity_bytes != 0 {
             tracing::warn!(
                 capacity_bytes,
@@ -776,8 +940,9 @@ impl VirtioBlk {
         let capacity_sectors = capacity_bytes / VIRTIO_BLK_SECTOR_SIZE as u64;
         let capacity_bytes = capacity_sectors * VIRTIO_BLK_SECTOR_SIZE as u64;
         let (ops_bucket, bytes_bucket) = buckets_from_throttle(throttle);
-        let worker = BlkWorker {
-            queues: [Queue::new(QUEUE_MAX_SIZE).expect("valid queue size")],
+        let counters = Arc::new(VirtioBlkCounters::default());
+
+        let state = BlkWorkerState {
             backing,
             ops_bucket,
             bytes_bucket,
@@ -785,21 +950,103 @@ impl VirtioBlk {
             io_buf_scratch: Vec::new(),
             capacity_bytes,
             read_only,
-            counters: Arc::new(VirtioBlkCounters::default()),
+            counters: Arc::clone(&counters),
         };
+
+        let interrupt_status = Arc::new(AtomicU32::new(0));
+        let mem = Arc::new(Mutex::new(None));
+        let mem_unset_warned = Arc::new(AtomicBool::new(false));
+
+        // Build the queue. Production uses `QueueSync` (Arc<Mutex<Queue>>
+        // internally) so the vCPU MMIO config writes and the worker
+        // thread's drain can share the same queue state. Tests use the
+        // bare `Queue` so the existing test surface that drives queue
+        // methods directly via `dev.worker.queues[REQ_QUEUE].…` keeps
+        // working without a runtime lock.
+        let queues = [BlkQueue::new(QUEUE_MAX_SIZE).expect("valid queue size")];
+
+        // Build the engine. cfg(test) keeps the state inline so the
+        // existing test surface drives drain_bracket_impl synchronously;
+        // cfg(not(test)) spawns a dedicated worker thread that owns
+        // the state and waits for kick eventfd writes from
+        // `process_requests`.
+        #[cfg(test)]
+        let engine = WorkerEngine::Inline(InlineEngine { state });
+
+        #[cfg(not(test))]
+        let engine = {
+            // Counter-mode eventfds (no EFD_SEMAPHORE). EFD_NONBLOCK so
+            // the vCPU `write(1)` to kick_fd never blocks even under
+            // pathological backpressure (the worker has fallen behind
+            // by more than u64::MAX-1 kicks — implausible under any
+            // realistic workload, but the non-blocking flag keeps the
+            // failure mode "EAGAIN, drop the spurious kick" instead of
+            // "vCPU thread blocks on eventfd write").
+            let kick_fd = EventFd::new(libc::EFD_NONBLOCK)
+                .expect("failed to create virtio-blk kick eventfd");
+            let stop_fd = EventFd::new(libc::EFD_NONBLOCK)
+                .expect("failed to create virtio-blk stop eventfd");
+            // The worker thread needs read-side fds for kick/stop and
+            // write-side fds for irq_evt; clone all eventfd handles so
+            // the device-side and worker-side own distinct File objects
+            // pointing at the same underlying eventfd.
+            let worker_kick = kick_fd
+                .try_clone()
+                .expect("clone virtio-blk kick eventfd for worker");
+            let worker_stop = stop_fd
+                .try_clone()
+                .expect("clone virtio-blk stop eventfd for worker");
+            // The worker thread receives a clone of the QueueSync
+            // (cheap — Arc<Mutex<Queue>> internally), an Arc'd irq
+            // eventfd it writes to fire the IRQ, and Arcs for the
+            // shared atomic and mem slot.
+            let worker_queues = [queues[REQ_QUEUE].clone()];
+            let worker_mem = Arc::clone(&mem);
+            let worker_irq = Arc::clone(&irq_evt);
+            let worker_status = Arc::clone(&interrupt_status);
+            let worker_warned = Arc::clone(&mem_unset_warned);
+            let handle = thread::Builder::new()
+                .name("ktstr-vblk".to_string())
+                .spawn(move || {
+                    worker_thread_main(
+                        state,
+                        worker_queues,
+                        worker_mem,
+                        worker_irq,
+                        worker_status,
+                        worker_warned,
+                        worker_kick,
+                        worker_stop,
+                    );
+                })
+                .expect("spawn virtio-blk worker thread");
+            WorkerEngine::Spawned(SpawnedEngine {
+                kick_fd,
+                stop_fd,
+                handle: Some(handle),
+            })
+        };
+
+        let worker = BlkWorker {
+            queues,
+            read_only,
+            counters,
+            engine,
+        };
+
         VirtioBlk {
             queue_select: 0,
             device_features_sel: 0,
             driver_features_sel: 0,
             driver_features: 0,
             device_status: 0,
-            interrupt_status: AtomicU32::new(0),
+            interrupt_status,
             config_generation: AtomicU32::new(0),
             irq_evt,
-            mem: None,
+            mem,
             capacity_sectors,
             worker,
-            mem_unset_warned: AtomicBool::new(false),
+            mem_unset_warned,
         }
     }
 
@@ -809,8 +1056,33 @@ impl VirtioBlk {
     }
 
     /// Set guest memory reference. Must be called before starting vCPUs.
+    ///
+    /// Stores the memory inside the device's shared `Arc<Mutex<…>>`
+    /// so the worker thread (production cfg) can observe the new
+    /// reference on its next drain. Returning before the worker
+    /// observes the value is safe because the worker only consults
+    /// `mem` in response to a kick (driven by `mmio_write` of
+    /// QUEUE_NOTIFY), and KVM wiring guarantees `set_mem` runs
+    /// before any vCPU runs (i.e. before any QUEUE_NOTIFY can fire).
+    ///
+    /// On a poisoned mutex (a previous holder panicked), log and
+    /// return rather than re-panic — `set_mem` may itself be invoked
+    /// from a panicking context (Drop ordering during VM teardown,
+    /// or a parent panic that's still unwinding the KVM wiring), and
+    /// a re-panic here would abort instead of unwinding cleanly. The
+    /// worker's own poison check mirrors this pattern.
     pub fn set_mem(&mut self, mem: GuestMemoryMmap) {
-        self.mem = Some(mem);
+        let mut slot = match self.mem.lock() {
+            Ok(g) => g,
+            Err(_) => {
+                tracing::error!(
+                    "virtio-blk: mem mutex poisoned in set_mem; \
+                     guest memory will not be wired"
+                );
+                return;
+            }
+        };
+        *slot = Some(mem);
     }
 
     /// Advertised capacity in 512-byte sectors.
@@ -965,18 +1237,52 @@ impl VirtioBlk {
     // Request queue processing
     // ------------------------------------------------------------------
 
-    /// Synchronous wrapper; calls drain_bracket inline.
+    /// Drive the request queue. In `cfg(test)` the drain runs
+    /// inline on the caller thread (preserving the synchronous
+    /// test surface). In production this is a non-blocking
+    /// kick of the worker thread's eventfd — `mmio_write` of
+    /// `QUEUE_NOTIFY` returns immediately so the vCPU thread
+    /// doesn't block on backing-file IO.
     fn process_requests(&mut self) {
-        self.drain_bracket();
+        #[cfg(test)]
+        {
+            self.drain_inline();
+        }
+        #[cfg(not(test))]
+        {
+            // Non-blocking kick. The worker thread's epoll_wait
+            // resumes and runs one drain iteration per kick. EAGAIN
+            // (counter saturated at u64::MAX-1) is implausible under
+            // any realistic workload — the worker would have to be
+            // ~2^64 kicks behind — and on encountering it we drop
+            // the spurious kick because counter-mode coalesces all
+            // pending kicks into a single read by the worker on the
+            // next wakeup, so no QUEUE_NOTIFY is permanently lost.
+            let WorkerEngine::Spawned(eng) = &self.worker.engine;
+            let _ = eng.kick_fd.write(1);
+        }
     }
 
-    /// Forward the drain to the worker, supplying it with the
-    /// MMIO-side state it needs: guest memory, the irqfd, and the
-    /// interrupt-status atomic. When `mem` is unset the worker is
-    /// never engaged — the wiring bug is surfaced here once per
-    /// device via the `mem_unset_warned` latch.
-    fn drain_bracket(&mut self) {
-        let Some(mem) = self.mem.as_ref() else {
+    /// Inline drain (test-mode only). Resolves the Inline engine,
+    /// fetches a `mem` clone from the shared `Arc<Mutex<…>>`, and
+    /// calls `drain_bracket_impl` directly with the worker state +
+    /// queue + irq + interrupt_status borrows. The mem clone is
+    /// cheap because `GuestMemoryMmap` is internally `Arc`-based
+    /// (per `vm_memory`'s impl) so the clone bumps a refcount
+    /// rather than copying mapped pages.
+    #[cfg(test)]
+    fn drain_inline(&mut self) {
+        let mem_opt: Option<GuestMemoryMmap> = match self.mem.lock() {
+            Ok(g) => g.clone(),
+            Err(_) => {
+                tracing::error!(
+                    "virtio-blk: mem mutex poisoned in drain_inline; \
+                     dropping kick"
+                );
+                return;
+            }
+        };
+        let Some(mem) = mem_opt else {
             // Caller (kvm wiring in src/vmm/mod.rs) is supposed to
             // call `set_mem` before any vCPU runs. A queue-notify
             // before that is a wiring bug; surface it once per
@@ -984,52 +1290,62 @@ impl VirtioBlk {
             // notifies on the broken setup.
             if !self.mem_unset_warned.swap(true, Ordering::Relaxed) {
                 tracing::warn!(
-                    "virtio-blk drain_bracket called before set_mem; \
-                     dropping all requests until guest memory is wired"
+                    "virtio-blk: queue notify before set_mem; \
+                     dropping requests until guest memory is wired"
                 );
             }
             return;
         };
-        self.worker
-            .drain_bracket(mem, &self.irq_evt, &self.interrupt_status);
+        let WorkerEngine::Inline(engine) = &mut self.worker.engine;
+        drain_bracket_impl(
+            &mut engine.state,
+            &mut self.worker.queues,
+            &mem,
+            &self.irq_evt,
+            &self.interrupt_status,
+        );
     }
 }
 
-impl BlkWorker {
-    /// Drain the request queue, processing reads/writes/flushes
-    /// against the backing file and respecting the throttle.
-    ///
-    /// The chain is walked in one pass and `add_used` is called
-    /// in the same loop iteration that completes the request.
-    /// `pop_descriptor_chain` returns a chain whose lifetime ends
-    /// at the bottom of the iteration (after we've collected the
-    /// data-segment vector), so the borrow on the queue is released
-    /// before `add_used` re-borrows it. This mirrors the
-    /// virtio-console pattern (see `process_tx` in virtio_console.rs).
-    ///
-    /// Extracted onto `BlkWorker` so the body — outer/inner
-    /// bracket, validation, throttle, dispatch, publish_completion,
-    /// post-drain V8 split — owns one source of truth for the
-    /// drain logic. Invoked today from the vCPU MMIO arm via
-    /// `VirtioBlk::drain_bracket`.
-    ///
-    /// Borrows guest memory, the irqfd, and the interrupt-status
-    /// atomic from the device — those live on the MMIO side
-    /// (`VirtioBlk`) and are passed in.
-    fn drain_bracket(
-        &mut self,
-        mem: &GuestMemoryMmap,
-        irq_evt: &EventFd,
-        interrupt_status: &AtomicU32,
-    ) {
-        // The request loop calls handlers (which take `&self`) plus
-        // `self.ops_bucket.consume` / counter mutation (which take
-        // `&mut self.ops_bucket`/`&mut self.bytes_bucket`). To keep
-        // the borrow checker happy we materialise the queue handle
-        // separately and reach into `&mut self` only via the
-        // disjoint-fields it owns. The eventfd write that signals
-        // the guest is hoisted to the end so it does not alias with
-        // the queue mutation in the loop.
+/// Drain the request queue, processing reads/writes/flushes
+/// against the backing file and respecting the throttle.
+///
+/// The chain is walked in one pass and `add_used` is called
+/// in the same loop iteration that completes the request.
+/// `pop_descriptor_chain` returns a chain whose lifetime ends
+/// at the bottom of the iteration (after we've collected the
+/// data-segment vector), so the borrow on the queue is released
+/// before `add_used` re-borrows it. This mirrors the
+/// virtio-console pattern (see `process_tx` in virtio_console.rs).
+///
+/// Free function (not a method) so the worker thread (production)
+/// and the inline test harness (cfg(test)) can both invoke it
+/// against a `BlkWorkerState` they own without taking a method
+/// receiver — production owns `state` on the worker thread and the
+/// inline path borrows it via `self.worker.engine`.
+///
+/// Borrows guest memory, the irqfd, and the interrupt-status atomic
+/// from the device — those live on the MMIO side (`VirtioBlk`) and
+/// are passed in. `queues` is borrowed mutably so the drain can
+/// pop / add_used / disable+enable_notification / needs_notification
+/// in lock-pop-unlock-walk-lock-add_used order without holding any
+/// queue lock during IO.
+fn drain_bracket_impl(
+    state: &mut BlkWorkerState,
+    queues: &mut [BlkQueue; NUM_QUEUES],
+    mem: &GuestMemoryMmap,
+    irq_evt: &EventFd,
+    interrupt_status: &AtomicU32,
+) {
+        // The request loop calls handlers (which take `&` borrows
+        // of state.backing/state.counters) plus throttle bucket
+        // mutation (`&mut state.ops_bucket` / `&mut state.bytes_bucket`).
+        // To keep the borrow checker happy we materialise the queue
+        // handle separately (`&mut queues[REQ_QUEUE]`) and reach
+        // into `&mut state` only via the disjoint fields it owns.
+        // The eventfd write that signals the guest is hoisted to
+        // the end so it does not alias with the queue mutation in
+        // the loop.
         let mut signal_needed = false;
         // Outer bracket: disable_notification → drain → enable_notification.
         // Canonical virtio-queue pattern — the doctest on the
@@ -1064,11 +1380,11 @@ impl BlkWorker {
             // Best-effort disable; failure is non-fatal — the worst
             // case is the guest issues a redundant QUEUE_NOTIFY
             // mid-drain that we'd absorb on the next call anyway.
-            if let Err(e) = self.queues[REQ_QUEUE].disable_notification(mem) {
+            if let Err(e) = queues[REQ_QUEUE].disable_notification(mem) {
                 tracing::warn!(%e, "virtio-blk disable_notification failed");
             }
         loop {
-            let q = &mut self.queues[REQ_QUEUE];
+            let q = &mut queues[REQ_QUEUE];
             let Some(chain) = q.pop_descriptor_chain(mem) else {
                 break;
             };
@@ -1098,23 +1414,24 @@ impl BlkWorker {
             // `clear()` keeps the underlying Vec capacity allocated
             // once at construction (sized by VIRTIO_BLK_SEG_MAX + 2),
             // so steady-state push/clear is amortized to zero
-            // allocation. Hot-path optimization — drain_bracket
-            // runs on the vCPU thread and is invoked once per
-            // QUEUE_NOTIFY MMIO write.
-            self.all_descs_scratch.clear();
+            // allocation. Hot-path optimization — drain_bracket_impl
+            // runs on the worker thread in production (cfg(test): on
+            // the test thread) and is invoked once per kick (one
+            // per QUEUE_NOTIFY MMIO write in production).
+            state.all_descs_scratch.clear();
             for desc in chain {
-                self.all_descs_scratch.push(ChainDescriptor {
+                state.all_descs_scratch.push(ChainDescriptor {
                     addr: desc.addr(),
                     len: desc.len(),
                     is_write_only: desc.is_write_only(),
                 });
             }
 
-            let chain_len = self.all_descs_scratch.len();
+            let chain_len = state.all_descs_scratch.len();
 
             let mut header_addr: Option<GuestAddress> = None;
             let mut status_addr: Option<GuestAddress> = None;
-            if let Some((first, rest)) = self.all_descs_scratch.split_first() {
+            if let Some((first, rest)) = state.all_descs_scratch.split_first() {
                 if !first.is_write_only && (first.len as usize) >= VIRTIO_BLK_OUTHDR_SIZE {
                     header_addr = Some(first.addr);
                 }
@@ -1182,7 +1499,7 @@ impl BlkWorker {
             // request.
             let Some(status_addr) = status_addr else {
                 tracing::warn!(head, "virtio-blk request without status descriptor");
-                self.counters.record_io_error();
+                state.counters.record_io_error();
                 continue;
             };
 
@@ -1208,11 +1525,11 @@ impl BlkWorker {
                     desc_count = chain_len,
                     "virtio-blk chain exceeds seg_max + 2"
                 );
-                self.counters.record_io_error();
+                state.counters.record_io_error();
                 if publish_completion(
                     mem,
                     q,
-                    &self.counters,
+                    &state.counters,
                     head,
                     status_addr,
                     VIRTIO_BLK_S_IOERR as u8,
@@ -1237,11 +1554,11 @@ impl BlkWorker {
             // malformed request.
             let Some(header_addr) = header_addr else {
                 tracing::warn!(head, "virtio-blk request without valid header descriptor");
-                self.counters.record_io_error();
+                state.counters.record_io_error();
                 if publish_completion(
                     mem,
                     q,
-                    &self.counters,
+                    &state.counters,
                     head,
                     status_addr,
                     VIRTIO_BLK_S_IOERR as u8,
@@ -1256,11 +1573,11 @@ impl BlkWorker {
                 Ok(h) => h,
                 Err(_) => {
                     tracing::warn!(head, "virtio-blk header read failed");
-                    self.counters.record_io_error();
+                    state.counters.record_io_error();
                     if publish_completion(
                         mem,
                         q,
-                        &self.counters,
+                        &state.counters,
                         head,
                         status_addr,
                         VIRTIO_BLK_S_IOERR as u8,
@@ -1286,11 +1603,11 @@ impl BlkWorker {
             // `rest.len() >= 1`, which means `chain_len >= 2`).
             // The slice is therefore always in-bounds.
             //
-            // The borrow is immutable; `&self.all_descs_scratch[..]`
-            // is disjoint from `&mut self.queues[..]` (the `q`
-            // borrow) and `&mut self.ops_bucket` / `&mut
-            // self.bytes_bucket`, so split-borrow lets all coexist.
-            let data_segments: &[ChainDescriptor] = &self.all_descs_scratch[1..chain_len - 1];
+            // The borrow is immutable; `&state.all_descs_scratch[..]`
+            // is disjoint from `&mut queues[..]` (the `q` borrow)
+            // and `&mut state.ops_bucket` / `&mut state.bytes_bucket`,
+            // so split-borrow lets all coexist.
+            let data_segments: &[ChainDescriptor] = &state.all_descs_scratch[1..chain_len - 1];
 
             // SIZE_MAX enforcement: reject any chain that violates
             // the per-descriptor cap we advertised. A guest that
@@ -1300,11 +1617,11 @@ impl BlkWorker {
             // multi-gigabyte buffers under host control.
             if data_segments.iter().any(|d| d.len > VIRTIO_BLK_SIZE_MAX) {
                 tracing::warn!(head, "virtio-blk descriptor exceeds size_max");
-                self.counters.record_io_error();
+                state.counters.record_io_error();
                 if publish_completion(
                     mem,
                     q,
-                    &self.counters,
+                    &state.counters,
                     head,
                     status_addr,
                     VIRTIO_BLK_S_IOERR as u8,
@@ -1343,11 +1660,11 @@ impl BlkWorker {
                     req_type,
                     "virtio-blk T_IN/T_OUT/T_GET_ID with no data segments"
                 );
-                self.counters.record_io_error();
+                state.counters.record_io_error();
                 if publish_completion(
                     mem,
                     q,
-                    &self.counters,
+                    &state.counters,
                     head,
                     status_addr,
                     VIRTIO_BLK_S_IOERR as u8,
@@ -1381,11 +1698,11 @@ impl BlkWorker {
                     data_len,
                     "virtio-blk T_IN/T_OUT data_len not a multiple of 512"
                 );
-                self.counters.record_io_error();
+                state.counters.record_io_error();
                 if publish_completion(
                     mem,
                     q,
-                    &self.counters,
+                    &state.counters,
                     head,
                     status_addr,
                     VIRTIO_BLK_S_IOERR as u8,
@@ -1411,10 +1728,10 @@ impl BlkWorker {
             // `self.read_only` field, NOT against re-read guest
             // memory. The header was read once into `hdr` above and
             // not consulted again — no TOCTOU.
-            let backing = &self.backing;
-            let counters = self.counters.as_ref();
-            let cap_bytes = self.capacity_bytes;
-            let read_only = self.read_only;
+            let backing = &state.backing;
+            let counters = state.counters.as_ref();
+            let cap_bytes = state.capacity_bytes;
+            let read_only = state.read_only;
             let pre_throttle = VirtioBlk::classify_pre_throttle(req_type, read_only, counters);
 
             // Direction validation, hoisted out of
@@ -1453,11 +1770,11 @@ impl BlkWorker {
                     req_type,
                     "virtio-blk T_IN/T_OUT/T_GET_ID data segment direction mismatch"
                 );
-                self.counters.record_io_error();
+                state.counters.record_io_error();
                 if publish_completion(
                     mem,
                     q,
-                    &self.counters,
+                    &state.counters,
                     head,
                     status_addr,
                     VIRTIO_BLK_S_IOERR as u8,
@@ -1476,8 +1793,9 @@ impl BlkWorker {
             // a throttled request becomes a transient IO error
             // from the guest's perspective. The device returns
             // synchronously rather than delaying inline; sleeping
-            // here would block SIGRTMIN delivery to the vCPU
-            // thread (see `TokenBucket` doc).
+            // here would block the thread running drain_bracket_impl
+            // (worker in production, test thread in cfg(test); see
+            // `TokenBucket` doc).
             //
             // Both buckets are checked first via `can_consume` and
             // only consumed once both pass. Short-circuiting on
@@ -1491,14 +1809,14 @@ impl BlkWorker {
             // are pre-classified above and never reach here, so
             // they don't touch the bucket.
             if pre_throttle.is_none() {
-                let ops_ok = self.ops_bucket.can_consume(1);
-                let bytes_ok = self.bytes_bucket.can_consume(data_len);
+                let ops_ok = state.ops_bucket.can_consume(1);
+                let bytes_ok = state.bytes_bucket.can_consume(data_len);
                 if !ops_ok || !bytes_ok {
-                    self.counters.record_throttled();
+                    state.counters.record_throttled();
                     if publish_completion(
                         mem,
                         q,
-                        &self.counters,
+                        &state.counters,
                         head,
                         status_addr,
                         VIRTIO_BLK_S_IOERR as u8,
@@ -1513,8 +1831,8 @@ impl BlkWorker {
                 // `consume` does its own refill+capacity check, so
                 // the post-can_consume window can't see a smaller
                 // bucket here (refills are monotone-non-negative).
-                let ops_consumed = self.ops_bucket.consume(1);
-                let bytes_consumed = self.bytes_bucket.consume(data_len);
+                let ops_consumed = state.ops_bucket.consume(1);
+                let bytes_consumed = state.bytes_bucket.consume(data_len);
                 debug_assert!(
                     ops_consumed && bytes_consumed,
                     "throttle invariant: can_consume must imply consume",
@@ -1531,7 +1849,7 @@ impl BlkWorker {
             } else {
                 // Pass `data_len` already computed above so handlers
                 // don't re-derive it (was a third sum() pass each).
-                // Pass `&mut self.io_buf_scratch` as a reusable
+                // Pass `&mut state.io_buf_scratch` as a reusable
                 // per-segment buffer; handlers `resize(len, 0)` it
                 // per descriptor and the underlying `Vec<u8>`
                 // capacity grows monotonically up to
@@ -1546,7 +1864,7 @@ impl BlkWorker {
                         sector,
                         data_segments,
                         data_len,
-                        &mut self.io_buf_scratch,
+                        &mut state.io_buf_scratch,
                     ),
                     VIRTIO_BLK_T_OUT => VirtioBlk::handle_write_impl(
                         backing,
@@ -1556,7 +1874,7 @@ impl BlkWorker {
                         sector,
                         data_segments,
                         data_len,
-                        &mut self.io_buf_scratch,
+                        &mut state.io_buf_scratch,
                     ),
                     VIRTIO_BLK_T_FLUSH => VirtioBlk::handle_flush_impl(backing, counters),
                     VIRTIO_BLK_T_GET_ID => {
@@ -1568,7 +1886,8 @@ impl BlkWorker {
                     // patch that adds a new variant to the
                     // `T_IN | T_OUT | T_FLUSH | T_GET_ID => None` arm
                     // without updating this match would otherwise panic the
-                    // vCPU thread. Return S_UNSUPP and bump io_errors so the
+                    // thread running drain_bracket_impl. Return S_UNSUPP and
+                    // bump io_errors so the
                     // regression surfaces as a guest-visible error and a
                     // counter bump rather than a panic that kills the VM.
                     _ => {
@@ -1626,7 +1945,7 @@ impl BlkWorker {
             if publish_completion(
                 mem,
                 q,
-                &self.counters,
+                &state.counters,
                 head,
                 status_addr,
                 status_byte,
@@ -1642,7 +1961,7 @@ impl BlkWorker {
             // `avail_idx != next_avail` after re-enabling — those
             // chains MUST be processed before exiting or they'll
             // be stranded (V3: honour the return value).
-            match self.queues[REQ_QUEUE].enable_notification(mem) {
+            match queues[REQ_QUEUE].enable_notification(mem) {
                 Ok(true) => continue 'outer,
                 Ok(false) => break 'outer,
                 Err(e) => {
@@ -1693,7 +2012,7 @@ impl BlkWorker {
             // `used_event` field, fail-safe to firing the IRQ. A
             // missed IRQ stalls the guest until blk-mq's 30s
             // timeout; a redundant IRQ wastes a vCPU exit.
-            let q = &mut self.queues[REQ_QUEUE];
+            let q = &mut queues[REQ_QUEUE];
             if q.needs_notification(mem)
                 .inspect_err(|e| {
                     tracing::warn!(%e, "needs_notification failed; firing IRQ as fail-safe")
@@ -1703,6 +2022,158 @@ impl BlkWorker {
                 let _ = irq_evt.write(1);
             }
         }
+}
+
+/// Worker thread main loop (production cfg only). Owns
+/// `BlkWorkerState`, the `[QueueSync; NUM_QUEUES]` clones, and Arcs
+/// for the shared atomics + mem slot for the device's lifetime. Loops
+/// in epoll_wait until the device's `Drop::drop` writes to `stop_fd`,
+/// at which point the loop exits and the thread terminates.
+///
+/// Per-iteration:
+///   1. Block in `epoll_wait` until kick_fd or stop_fd readable.
+///   2. If stop_fd readable → return (drop everything cleanly).
+///   3. If kick_fd readable → drain the eventfd counter (one read
+///      consumes any number of coalesced kicks per the eventfd
+///      counter-mode semantics — see eventfd(2)) and run one
+///      drain iteration via `drain_bracket_impl`.
+///
+/// Reading mem from the shared `Arc<Mutex<…>>` gives the worker the
+/// up-to-date `GuestMemoryMmap` set by the device's `set_mem` call.
+/// When `mem` is None (kick fired before set_mem — a wiring bug),
+/// the `mem_unset_warned` latch fires once and the kick is silently
+/// dropped.
+#[cfg(not(test))]
+fn worker_thread_main(
+    mut state: BlkWorkerState,
+    mut queues: [BlkQueue; NUM_QUEUES],
+    mem: Arc<Mutex<Option<GuestMemoryMmap>>>,
+    irq_evt: Arc<EventFd>,
+    interrupt_status: Arc<AtomicU32>,
+    mem_unset_warned: Arc<AtomicBool>,
+    kick_fd: EventFd,
+    stop_fd: EventFd,
+) {
+    // epoll setup. KICK_TOKEN and STOP_TOKEN are the
+    // `EpollEvent::data` discriminators we'll match on after
+    // `epoll_wait` returns. Using opaque 64-bit tokens (rather than
+    // the raw fd numbers, which would also work) makes the dispatch
+    // intent explicit at the read site.
+    const KICK_TOKEN: u64 = 1;
+    const STOP_TOKEN: u64 = 2;
+    let epoll = match Epoll::new() {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::error!(%e, "virtio-blk worker: failed to create epoll instance; \
+                exiting (device IO will not be serviced)");
+            return;
+        }
+    };
+    if let Err(e) = epoll.ctl(
+        ControlOperation::Add,
+        kick_fd.as_raw_fd(),
+        EpollEvent::new(EventSet::IN, KICK_TOKEN),
+    ) {
+        tracing::error!(%e, "virtio-blk worker: failed to add kick_fd to epoll; exiting");
+        return;
+    }
+    if let Err(e) = epoll.ctl(
+        ControlOperation::Add,
+        stop_fd.as_raw_fd(),
+        EpollEvent::new(EventSet::IN, STOP_TOKEN),
+    ) {
+        tracing::error!(%e, "virtio-blk worker: failed to add stop_fd to epoll; exiting");
+        return;
+    }
+
+    // Two-element scratch — only kick_fd and stop_fd are registered,
+    // so `epoll_wait` can return at most 2 events per call.
+    let mut events = [EpollEvent::default(); 2];
+    loop {
+        let n = match epoll.wait(-1, &mut events) {
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                tracing::error!(%e, "virtio-blk worker: epoll_wait failed; exiting");
+                return;
+            }
+        };
+        let mut kicked = false;
+        for ev in &events[..n] {
+            match ev.data() {
+                STOP_TOKEN => {
+                    // Drop signal — exit immediately. The device's
+                    // Drop is waiting on join(); the worker's
+                    // resources (state, queues, Arcs, eventfd
+                    // clones) are reclaimed when this function
+                    // returns and the thread frame unwinds.
+                    return;
+                }
+                KICK_TOKEN => {
+                    kicked = true;
+                }
+                _ => {
+                    // Unknown token — defensive: log and continue.
+                    // The kick/stop registration above guarantees we
+                    // only receive these two tokens; an unknown one
+                    // would indicate corruption of the EpollEvent
+                    // data field, which the kernel does not do.
+                    tracing::warn!(
+                        token = ev.data(),
+                        "virtio-blk worker: unknown epoll token"
+                    );
+                }
+            }
+        }
+        if !kicked {
+            continue;
+        }
+        // Drain the kick eventfd counter. Counter-mode semantics
+        // (eventfd(2)): a single `read` returns the accumulated
+        // counter value and resets it to 0. So multiple coalesced
+        // kicks (vCPU wrote 1 several times before we woke) all
+        // collapse to a single drain — the desired property.
+        // EAGAIN is impossible because epoll told us the fd was
+        // readable; if we still see it, log and continue (the next
+        // iteration's epoll_wait will block until the next kick).
+        match kick_fd.read() {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // Spurious epoll wakeup — extremely rare but
+                // harmless. Fall through to drain anyway: a kick
+                // that arrived between epoll_wait and read() is
+                // already incorporated into the queue's avail ring.
+            }
+            Err(e) => {
+                tracing::warn!(%e, "virtio-blk worker: kick_fd read failed");
+            }
+        }
+
+        // Resolve the current guest memory. If `set_mem` hasn't run
+        // yet, latch the warn once and skip the drain.
+        let mem_opt: Option<GuestMemoryMmap> = match mem.lock() {
+            Ok(g) => g.clone(),
+            Err(_) => {
+                tracing::error!("virtio-blk worker: mem mutex poisoned; exiting");
+                return;
+            }
+        };
+        let Some(mem_clone) = mem_opt else {
+            if !mem_unset_warned.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    "virtio-blk: queue notify before set_mem; \
+                     dropping requests until guest memory is wired"
+                );
+            }
+            continue;
+        };
+        drain_bracket_impl(
+            &mut state,
+            &mut queues,
+            &mem_clone,
+            &irq_evt,
+            &interrupt_status,
+        );
     }
 }
 
@@ -2022,10 +2493,11 @@ impl VirtioBlk {
     ) -> (u8, u32) {
         let data_len: u64 = data_segments.iter().map(|d| d.len as u64).sum();
         let mut scratch = Vec::new();
+        let s = self.worker.state();
         let (status, used_len) = Self::handle_read_impl(
-            &self.worker.backing,
-            self.worker.capacity_bytes,
-            self.worker.counters.as_ref(),
+            &s.backing,
+            s.capacity_bytes,
+            s.counters.as_ref(),
             mem,
             sector,
             data_segments,
@@ -2047,10 +2519,11 @@ impl VirtioBlk {
     ) -> (u8, u32) {
         let data_len: u64 = data_segments.iter().map(|d| d.len as u64).sum();
         let mut scratch = Vec::new();
+        let s = self.worker.state();
         let (status, used_len) = Self::handle_write_impl(
-            &self.worker.backing,
-            self.worker.capacity_bytes,
-            self.worker.counters.as_ref(),
+            &s.backing,
+            s.capacity_bytes,
+            s.counters.as_ref(),
             mem,
             sector,
             data_segments,
@@ -2064,8 +2537,8 @@ impl VirtioBlk {
 
     #[cfg(test)]
     fn handle_flush(&self, mem: &GuestMemoryMmap, status_addr: GuestAddress) -> (u8, u32) {
-        let (status, used_len) =
-            Self::handle_flush_impl(&self.worker.backing, self.worker.counters.as_ref());
+        let s = self.worker.state();
+        let (status, used_len) = Self::handle_flush_impl(&s.backing, s.counters.as_ref());
         mem.write_slice(&[status], status_addr)
             .expect("write status in test wrapper");
         (status, used_len)
@@ -2078,8 +2551,8 @@ impl VirtioBlk {
         data_segments: &[ChainDescriptor],
         status_addr: GuestAddress,
     ) -> (u8, u32) {
-        let (status, used_len) =
-            Self::handle_get_id_impl(self.worker.counters.as_ref(), mem, data_segments);
+        let s = self.worker.state();
+        let (status, used_len) = Self::handle_get_id_impl(s.counters.as_ref(), mem, data_segments);
         mem.write_slice(&[status], status_addr)
             .expect("write status in test wrapper");
         (status, used_len)
@@ -2362,6 +2835,48 @@ impl VirtioBlk {
         self.config_generation.fetch_add(1, Ordering::Release);
         for q in &mut self.worker.queues {
             q.reset();
+        }
+    }
+}
+
+/// `Drop` matches on `WorkerEngine` rather than gating the entire
+/// impl on `cfg(not(test))`: the Inline branch is a no-op (the
+/// default Drop drops `BlkWorkerState` cleanly when the engine
+/// goes out of scope), the Spawned branch signals via `stop_fd`
+/// and joins the worker thread so its resources (state, queues,
+/// Arcs, eventfd clones) are reclaimed before `VirtioBlk` is
+/// fully torn down.
+///
+/// The unconditional impl removes a fragility: a cfg-gated Drop
+/// silently disappears in `cfg(test)`, so any pre-Drop side effect
+/// added later (e.g. `tracing::debug!` on shutdown) would be
+/// missing in tests. Pattern-matching the engine variant inside a
+/// single impl keeps the dispatch obvious and makes adding such
+/// side effects symmetric across cfgs. A regression that detached
+/// the worker thread without stopping it would leave a daemon
+/// thread holding the queue Arcs and the backing file open after
+/// the device is dropped — visible as "test process leaks fds and
+/// threads under stress."
+impl Drop for VirtioBlk {
+    fn drop(&mut self) {
+        match &mut self.worker.engine {
+            #[cfg(test)]
+            WorkerEngine::Inline(_) => {
+                // Default-drop the inline state when this fn returns.
+            }
+            #[cfg(not(test))]
+            WorkerEngine::Spawned(eng) => {
+                // Signal the worker to exit. The eventfd write is
+                // non-blocking; if it fails (EAGAIN — counter
+                // saturated) the worker is already in the act of
+                // being woken so a missed write is benign.
+                let _ = eng.stop_fd.write(1);
+                if let Some(handle) = eng.handle.take() {
+                    if let Err(e) = handle.join() {
+                        tracing::error!(?e, "virtio-blk worker thread panicked");
+                    }
+                }
+            }
         }
     }
 }
@@ -4079,7 +4594,7 @@ mod tests {
         // No-status chain → publish_completion never runs →
         // signal_needed stays false → interrupt_status bit MUST
         // remain 0 (the bit is set inside `if signal_needed`,
-        // process_requests). A regression that set the bit
+        // drain_bracket_impl). A regression that set the bit
         // unconditionally on every notify would leak phantom
         // interrupts to the guest's polling path.
         assert_eq!(dev.interrupt_status.load(Ordering::Acquire) & VIRTIO_MMIO_INT_VRING, 0);
@@ -4213,10 +4728,10 @@ mod tests {
 
         // Drain the bucket and pin its last_refill so refill on
         // the next consume yields 0 tokens.
-        dev.worker.ops_bucket
+        dev.worker.state_mut().ops_bucket
             .set_last_refill_for_test(std::time::Instant::now());
-        assert!(dev.worker.ops_bucket.consume(1), "drain the 1-token bucket");
-        dev.worker.ops_bucket
+        assert!(dev.worker.state_mut().ops_bucket.consume(1), "drain the 1-token bucket");
+        dev.worker.state_mut().ops_bucket
             .set_last_refill_for_test(std::time::Instant::now());
 
         let header_addr = GuestAddress(0x4000);
@@ -4924,8 +5439,9 @@ mod tests {
     /// Multi-byte status descriptor. Status byte goes at
     /// the LAST byte of the descriptor (`addr + len - 1`) so the
     /// kernel driver's `virtio_blk_outhdr` lookup lines up
-    /// regardless of leading padding. virtio_blk.rs:657-659
-    /// implements this; pin the offset.
+    /// regardless of leading padding. The status_addr arithmetic
+    /// in drain_bracket_impl's chain-shape walk implements this;
+    /// pin the offset.
     #[test]
     fn multi_byte_status_writes_to_last_byte() {
         let cap = 4096u64;
@@ -5192,10 +5708,10 @@ mod tests {
         let mut dev = VirtioBlk::new(f, cap, throttle);
         // Drain the bucket and pin its last_refill so refill on
         // the next consume yields 0 tokens.
-        dev.worker.ops_bucket
+        dev.worker.state_mut().ops_bucket
             .set_last_refill_for_test(std::time::Instant::now());
-        assert!(dev.worker.ops_bucket.consume(1));
-        dev.worker.ops_bucket
+        assert!(dev.worker.state_mut().ops_bucket.consume(1));
+        dev.worker.state_mut().ops_bucket
             .set_last_refill_for_test(std::time::Instant::now());
 
         let mem = make_chain_test_mem();
@@ -7686,10 +8202,10 @@ mod tests {
         // Drain the bucket and pin its last_refill so the next
         // consume yields 0 tokens (matches the existing throttle
         // tests' set_last_refill_for_test pattern).
-        dev.worker.ops_bucket
+        dev.worker.state_mut().ops_bucket
             .set_last_refill_for_test(std::time::Instant::now());
-        assert!(dev.worker.ops_bucket.consume(1), "drain the 1-token bucket");
-        dev.worker.ops_bucket
+        assert!(dev.worker.state_mut().ops_bucket.consume(1), "drain the 1-token bucket");
+        dev.worker.state_mut().ops_bucket
             .set_last_refill_for_test(std::time::Instant::now());
         // Plant `used_event = u16::MAX` BEFORE wiring the device
         // — `Queue::needs_notification` reads `used_event` lazily
@@ -7774,9 +8290,10 @@ mod tests {
     }
 
     /// G4: `mem_unset_warned` latch fires once across multiple
-    /// pre-`set_mem` notifies. `process_requests` drops requests
-    /// when `self.mem` is None and emits one warn the first time
-    /// (line 951 `if !self.mem_unset_warned.swap(true, Relaxed)`).
+    /// pre-`set_mem` notifies. The drain path drops requests when
+    /// the shared `mem` slot is None and emits one warn the first
+    /// time (in `drain_inline` and `worker_thread_main` via
+    /// `if !mem_unset_warned.swap(true, Relaxed)`).
     /// Without the latch, a buggy caller that issues N notifies
     /// before set_mem would flood the log with N copies.
     ///
@@ -7802,7 +8319,7 @@ mod tests {
         // First QUEUE_NOTIFY without set_mem: process_requests's
         // early-return arm flips the latch from false to true.
         // mmio_write(QUEUE_NOTIFY, REQ_QUEUE) goes through unconditionally
-        // — the FSM does not gate QUEUE_NOTIFY (mmio_write line 2161).
+        // — the FSM does not gate QUEUE_NOTIFY (the QUEUE_NOTIFY arm of mmio_write).
         write_reg(&mut dev, VIRTIO_MMIO_QUEUE_NOTIFY, REQ_QUEUE as u32);
         assert!(
             dev.mem_unset_warned.load(Ordering::Relaxed),
@@ -7831,7 +8348,7 @@ mod tests {
     /// the public MMIO surface, confirm INTERRUPT_STATUS reflects
     /// the bit, write INTERRUPT_ACK to clear, confirm
     /// INTERRUPT_STATUS reads zero. Distinct from
-    /// `interrupt_ack_clears_bits` (line 2710) which manipulates
+    /// `interrupt_ack_clears_bits` which manipulates
     /// `dev.interrupt_status` directly — this test pins ACK
     /// semantics on a real-world bit-set source.
     ///
@@ -7900,7 +8417,7 @@ mod tests {
 //
 // The harness asserts the device's hostile-input contract:
 //   1. No panic, OOB index, or unwrap-on-None — process_requests must
-//      handle every input without crashing the vCPU thread.
+//      handle every input without crashing the thread running drain_bracket_impl.
 //   2. Forward progress: for every chain that reaches `process_requests`,
 //      the device either advances `used.idx` (status published) OR
 //      bumps `io_errors` (chain dropped because no observable status
