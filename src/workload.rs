@@ -4698,7 +4698,7 @@ fn worker_main(
                     // SAFETY: `buf` is a valid &[u8] of length
                     // IO_BLOCK_SIZE; `fd` is owned by `f` which lives
                     // for the duration of this match arm.
-                    let _ = unsafe {
+                    let n = unsafe {
                         libc::pwrite(
                             fd,
                             buf.as_ptr() as *const libc::c_void,
@@ -4706,6 +4706,18 @@ fn worker_main(
                             off as libc::off_t,
                         )
                     };
+                    // Surface short writes / errors. A short pwrite
+                    // means the device returned fewer bytes than
+                    // requested (sparse-file extent boundary, throttle
+                    // saturation, S_IOERR after a malformed request);
+                    // a -1 return is a kernel-reported failure (EIO,
+                    // ENOSPC, ...). Either condition silently drops
+                    // observability about disk-IO health if not
+                    // logged — the workload keeps "succeeding" while
+                    // the backing path is broken.
+                    if n < IO_BLOCK_SIZE as isize {
+                        tracing::warn!(n, off, "IoSyncWrite short pwrite");
+                    }
                     work_units = std::hint::black_box(work_units.wrapping_add(1));
                 }
                 let before_fsync = Instant::now();
@@ -4859,7 +4871,7 @@ fn worker_main(
                 // logical block size required by O_DIRECT);
                 // treating it as a const slice of IO_BLOCK_SIZE
                 // bytes is in-bounds.
-                let _ = unsafe {
+                let n = unsafe {
                     libc::pwrite(
                         fd,
                         io_buf.unwrap().as_ptr() as *const libc::c_void,
@@ -4867,6 +4879,15 @@ fn worker_main(
                         io_seq_cursor as libc::off_t,
                     )
                 };
+                // Surface short writes / errors. See the IoSyncWrite
+                // arm for the rationale — same observability defense
+                // applies to IoMixed's pwrite half. The pread half
+                // (below) does NOT get this check because short reads
+                // are a normal sparse-file outcome (a hole reads zero
+                // bytes EOF-style), not a defect.
+                if n < IO_BLOCK_SIZE as isize {
+                    tracing::warn!(n, off = io_seq_cursor, "IoMixed short pwrite");
+                }
                 io_seq_cursor = io_seq_cursor.wrapping_add(IO_BLOCK_SIZE as u64);
                 // Random pread.
                 let r_off = rand_io_offset(&mut io_rng, *capacity);
