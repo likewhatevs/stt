@@ -12,12 +12,13 @@
 //!
 //! # Why parse dmesg
 //!
-//! The kernel ALWAYS emits stack traces for error-class scx exits
-//! via `pr_err` (kernel/sched/ext.c around the `dump_stack` call in
-//! the disable path). The `%pS` format renders kernel addresses as
-//! `funcname+0xoff/0xsz` — readable AND symbolic, so the live-host
-//! pipeline can extract function names without doing its own
-//! kallsyms walk against raw addresses (the alternative path).
+//! The kernel emits stack traces for error-class scx exits via
+//! `pr_err` (kernel/sched/ext.c:5834 `stack_trace_print` call in the
+//! disable path), gated by `CONFIG_STACKTRACE`. The `%pS` format
+//! renders kernel addresses as `funcname+0xoff/0xsz` — readable AND
+//! symbolic, so the live-host pipeline can extract function names
+//! without doing its own kallsyms walk against raw addresses (the
+//! alternative path).
 //!
 //! For STALL-class exits the stack is the WATCHDOG KTHREAD's stack
 //! (`check_rq_for_timeouts` → `scx_watchdog_workfn`), NOT the BPF

@@ -525,11 +525,13 @@ pub enum WorkType {
     /// woken cohort across CPUs without convoying.
     ///
     /// The first worker (index 0) is the waker; the remaining
-    /// `num_workers - 1` are waiters. Structural minimum is
-    /// `waiters >= 5` to surface convoy effects on a multi-CPU
-    /// host. `worker_group_size = num_workers` so every worker
-    /// shares the same shared-memory region; reuses the existing
-    /// futex MAP_SHARED allocator.
+    /// `num_workers - 1` are waiters. Pick `waiters >= 5` so the
+    /// herd (5) + waker (1) = 6 tasks saturates a 4-core host,
+    /// making convoy effects observable; scale up further on
+    /// larger hosts so the runnable cohort exceeds the cgroup's
+    /// CPU budget. `worker_group_size = num_workers` so every
+    /// worker shares the same shared-memory region; reuses the
+    /// existing futex MAP_SHARED allocator.
     ThunderingHerd {
         /// Number of waiter workers (the herd). Must satisfy
         /// `num_workers == waiters + 1` (1 waker + waiters).
@@ -990,15 +992,20 @@ pub enum WorkType {
     ///   `Duration::ZERO` for either field with an actionable
     ///   bail message. `burst_duration=0` collapses the loop to
     ///   pure nanosleep (worker accrues no runtime);
-    ///   `sleep_duration=0` collapses to
-    ///   [`SpinWait`](Self::SpinWait) (no idle path exercised).
+    ///   `sleep_duration=0` overlaps with two existing variants
+    ///   — [`SpinWait`](Self::SpinWait) is the bail message's
+    ///   forwarding target (no idle path exercised, pure spin
+    ///   loop), but the kernel-level semantic is closer to
+    ///   [`YieldHeavy`](Self::YieldHeavy) since `nanosleep(0)`
+    ///   still calls `set_current_state(TASK_INTERRUPTIBLE)` +
+    ///   `schedule()` (sched_yield-equivalent).
     /// - **NO_HZ_FULL** — workers pinned to a CPU in the
-    ///   `nohz_full=` mask see a different wake-latency
-    ///   profile: lower median `resume_latencies_ns` from
-    ///   skipped tick re-arm, heavier high-percentile tail
-    ///   from deferred jiffy-driven work catchup. Mixing
-    ///   pinned-vs-unpinned workers across the mask boundary
-    ///   produces a bimodal distribution.
+    ///   `nohz_full=` mask see LOWER median
+    ///   `resume_latencies_ns` (tick re-arm is skipped) but
+    ///   heavier high-percentile tail (deferred jiffy-driven
+    ///   work catchup). Mixing pinned-vs-unpinned workers
+    ///   across the mask boundary produces a bimodal
+    ///   distribution.
     /// - **vCPU-in-KVM** — wake latency aggregates guest +
     ///   host scheduler costs. `performance_mode=true` disables
     ///   HLT vmexits so the test measures guest scheduling in
@@ -1036,11 +1043,15 @@ pub enum WorkType {
     ///    rather than "CPU idle/exit transitions".
     /// 2. **Co-scheduled kernel threads** — kworker, ksoftirqd,
     ///    rcu_* kthreads (kthread_run on the same CPU) and
-    ///    deferred-work softirqs run on every CPU periodically.
-    ///    For `sleep_duration` ~ ksoftirqd's wakeup interval
-    ///    (typically 1ms), the CPU may briefly run ksoftirqd
-    ///    between nanosleep and the next IdleChurn iteration —
-    ///    diluting the idle-transition signal.
+    ///    deferred-work softirqs run on every CPU. ksoftirqd is
+    ///    woken from `wakeup_softirqd` (kernel/softirq.c) when
+    ///    `irq_exit` observes pending softirqs after inline
+    ///    processing — its wake frequency tracks irq load, not a
+    ///    fixed cadence. Sleep durations short enough to overlap
+    ///    with steady-state softirq backlog (e.g. NIC interrupt
+    ///    pressure) may observe ksoftirqd preempting the
+    ///    IdleChurn worker between iterations — diluting the
+    ///    idle-transition signal.
     /// 3. **Sibling test workloads in the same LLC** — a peer
     ///    test pinned to a different CPU within the same LLC can
     ///    spawn kernel threads that get migrated onto IdleChurn's
@@ -1162,10 +1173,15 @@ pub enum WorkType {
     /// - tolerate both populations with looser thresholds.
     ///
     /// The active mask is readable at runtime via
-    /// `/sys/devices/system/cpu/nohz_full`; IdleChurn does not
-    /// adjust the mask itself, and mixing pinned-vs-unpinned
-    /// workers in the same scenario produces a bimodal latency
-    /// distribution if the host is configured for nohz_full.
+    /// `/sys/devices/system/cpu/nohz_full`. The file only
+    /// exists when the kernel was built with
+    /// `CONFIG_NO_HZ_FULL=y`; on a `CONFIG_NO_HZ_IDLE`-only
+    /// kernel (the typical distro default) the file is absent
+    /// and the test author can assume no nohz_full effects.
+    /// IdleChurn does not adjust the mask itself, and mixing
+    /// pinned-vs-unpinned workers in the same scenario produces
+    /// a bimodal latency distribution if the host is configured
+    /// for nohz_full.
     ///
     /// # vCPU-in-KVM amplifies wake latency
     ///
@@ -1208,11 +1224,17 @@ pub enum WorkType {
     /// scheduler under test cannot be observed through
     /// IdleChurn while the host has preempted its vCPU.
     ///
-    /// **Performance-mode interaction.** ktstr's x86_64 VMM
-    /// disables HLT vmexits when `performance_mode=true` (see
+    /// **Performance-mode interaction.** This subsection
+    /// describes x86_64 only. ktstr's x86_64 VMM disables HLT
+    /// vmexits when `performance_mode=true` (see
     /// `src/vmm/x86_64/kvm.rs::Vm::new` around the
-    /// `KVM_X86_DISABLE_EXITS_HLT` enable_cap call). With HLT
-    /// exits disabled:
+    /// `KVM_X86_DISABLE_EXITS_HLT` enable_cap call). The
+    /// aarch64 VMM accepts the `performance_mode` flag but does
+    /// NOT configure WFI trap behavior (no HCR_EL2.TWI tweak in
+    /// `src/vmm/aarch64/kvm.rs::Vm::new`), so on aarch64 every
+    /// guest WFI exits to host regardless of `performance_mode`
+    /// — IdleChurn always exercises the cross-VM idle path
+    /// there. With HLT exits disabled (x86_64 only):
     ///
     /// - Step 4 stays in-guest: the vCPU spins on HLT without
     ///   vmexit, consuming its assigned host CPU slot. The
@@ -1277,9 +1299,15 @@ pub enum WorkType {
     /// returns or sub-tick measurement windows; saturating to 0
     /// matches the "no observable resume overhead" interpretation.
     ///
-    /// Samples ARE directly comparable to `resume_latencies_ns`
-    /// from FutexPingPong, FutexFanOut, and other wake-pair
-    /// variants — they all measure the post-block wake portion.
+    /// Samples are comparable in DIRECTION to
+    /// `resume_latencies_ns` from FutexPingPong, FutexFanOut,
+    /// and other wake-pair variants (lower = better scheduler
+    /// resume), but the IdleChurn distribution carries a
+    /// ~50µs floor from `current->timer_slack_ns` that
+    /// event-driven futex variants don't. Cross-variant
+    /// absolute comparisons must subtract the slack floor or
+    /// limit the comparison to the > P50 percentile where the
+    /// slack contribution is dwarfed by tail latency.
     ///
     /// # Spawn-time validation
     ///
@@ -1303,7 +1331,10 @@ pub enum WorkType {
     /// the degenerate semantics — see the spawn-side check in
     /// `WorkloadHandle::spawn`.
     ///
-    /// `worker_group_size = None`.
+    /// `worker_group_size = None` — every worker operates
+    /// independently with no shared-memory group; see
+    /// [`Self::worker_group_size`] for the framework-wide
+    /// semantics.
     IdleChurn {
         /// Wall-clock duration of CPU work between idle
         /// periods. Use [`Duration`] to keep the unit visible at
@@ -4220,9 +4251,11 @@ impl WorkloadHandle {
                 if sleep_duration.is_zero() {
                     anyhow::bail!(
                         "IdleChurn sleep_duration must be > 0 (group {}); a zero \
-                         sleep collapses the variant to SpinWait. Use \
-                         WorkType::SpinWait directly \
-                         (see [`WorkType::IdleChurn`] variant doc).",
+                         sleep collapses the loop to a CPU-bound burst. \
+                         Use WorkType::SpinWait for pure CPU spin, or \
+                         WorkType::YieldHeavy for the closer overlap \
+                         (nanosleep(0) is yield-like — see the variant \
+                         doc rationale in [`WorkType::IdleChurn`]).",
                         group.group_idx,
                     );
                 }
@@ -8480,16 +8513,25 @@ fn worker_main(
                 // signal a scheduler-A/B test cares about.
                 //
                 // saturating_sub guards against the rare case
-                // where `elapsed < sleep_duration`. That can
-                // happen if the kernel returns from nanosleep
-                // early (EINTR with rem=null still yields control
-                // immediately under some signal-delivery races,
-                // and Instant::now's monotonic clock has finite
-                // resolution — a sub-tick measurement window can
-                // round to a value below the request). The
-                // saturation produces 0 instead of underflowing
-                // u64, matching the "no observable resume
-                // overhead" interpretation.
+                // where `elapsed < sleep_duration`. With rem=null,
+                // do_nanosleep (kernel/time/hrtimer.c:2115-2148)
+                // returns 0 when the hrtimer fires before any
+                // signal lands (full sleep elapsed), otherwise
+                // returns -ERESTART_RESTARTBLOCK. The syscall
+                // layer then either restarts via
+                // hrtimer_nanosleep_restart (absolute expiry, no
+                // time loss) when the signal handler has
+                // SA_RESTART set, or returns -EINTR to userspace
+                // immediately at signal-delivery time when it
+                // does not — the latter case can leave elapsed <
+                // sleep_duration. Other triggers include
+                // virtualization-layer clock skew (KVM TSC reads
+                // under host frequency scaling) and
+                // sub-microsecond measurement-window boundaries
+                // where Instant::now's monotonic resolution
+                // rounds elapsed down. Saturation produces 0
+                // instead of underflowing u64, matching the
+                // "no observable resume overhead" interpretation.
                 let elapsed = before_sleep.elapsed();
                 let resume_overhead = elapsed.saturating_sub(sleep_duration);
                 reservoir_push(
@@ -14688,11 +14730,18 @@ mod tests {
     /// [`spawn_thread_with_wake_chain_pipe`] and similar.
     #[test]
     fn wake_chain_pipe_bootstrap_once_invariant() {
+        // DEPTH=4 is load-bearing: with depth=2 the buggy total
+        // (40) equals the threshold, eliminating discrimination
+        // margin. depth=4 gives correct=20, buggy=80,
+        // threshold=40 with 2x margin on each side.
         const DEPTH: usize = 4;
         const WORK_PER_HOP_MS: u64 = 50;
         const TEST_WINDOW_MS: u64 = 1000;
-        // 2× margin over the 20-iter correct upper bound, well
-        // below the 80-iter buggy expectation.
+        // Threshold 40 is the geometric midpoint of [20, 80]
+        // (sqrt(20*80)=40), placing the boundary equidistant in
+        // log-space from the correct upper bound (20) and the
+        // buggy expectation (80). The arithmetic midpoint would
+        // be 50.
         const TOTAL_ITER_THRESHOLD: u64 = 40;
 
         let config = WorkloadConfig {
@@ -14730,16 +14779,21 @@ mod tests {
             (TEST_WINDOW_MS / WORK_PER_HOP_MS) * (DEPTH as u64),
             reports,
         );
-        // Lower bound: the correct chain MUST make at least some
-        // forward progress over a 1s window with 50ms hops. A
-        // total of zero indicates the chain deadlocked at the
+        // Lower bound: the correct chain MUST make at least one
+        // full ring round-trip over a 1s window with 50ms hops.
+        // One round-trip = DEPTH stages = 4 iters (the byte
+        // visits each stage exactly once). A total below that
+        // indicates the chain deadlocked or stalled at the
         // bootstrap site (a different bug than the one this test
         // primarily guards, but worth surfacing here too).
+        // `>= 4` is tighter than `> 0` without producing false
+        // positives — the correct expectation is ~20 iters.
         assert!(
-            total_iters > 0,
-            "WakeChain wake=Pipe made zero forward progress over \
-             {TEST_WINDOW_MS}ms — the bootstrap byte never propagated. \
-             Per-worker reports: {:?}",
+            total_iters >= 4,
+            "WakeChain wake=Pipe made fewer than one ring round-trip \
+             over {TEST_WINDOW_MS}ms (got {total_iters}, expected ≥ 4) — \
+             the bootstrap byte never completed a full lap. Per-worker \
+             reports: {:?}",
             reports,
         );
     }

@@ -280,10 +280,18 @@ impl NumaMemoryLayout {
             // ENOMEM when a peer is holding the host's GuestMemoryMmap
             // budget at the time we register this slot. Routing through
             // the classifier turns those into a SKIP banner instead of a
-            // hard test failure; non-transient errnos (EINVAL on bad
-            // gpa_start / overlapping slot, EFAULT on invalid
-            // userspace_addr — programming faults) flow through unchanged
-            // so a real bug never gets misclassified as contention.
+            // hard test failure; non-transient errnos flow through
+            // unchanged so a real bug never gets misclassified as
+            // contention. The non-transient set per kernel source:
+            //   - EINVAL: bad alignment, untagged-addr mismatch, or
+            //     access_ok failure on userspace_addr; bad slot ID;
+            //     bad gpa_start (virt/kvm/kvm_main.c:2025-2038).
+            //   - EEXIST: requested slot overlaps an existing one
+            //     (virt/kvm/kvm_main.c:2101).
+            //   - EIO: kernel WARN-on-impossible-state path
+            //     (virt/kvm/kvm_main.c:2065, arch/x86 mmu.c).
+            //   - EFAULT: arm64/riscv guest-phys-bounds violation
+            //     (arch/arm64/kvm/mmu.c, arch/riscv/kvm/mmu.c).
             let mem_region = kvm_bindings::kvm_userspace_memory_region {
                 slot: region.slot,
                 guest_phys_addr: region.gpa_start,

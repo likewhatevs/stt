@@ -285,8 +285,11 @@ pub(crate) fn host_resource_snapshot() -> String {
 /// `near_limit=false` AND the errno is in the soft-contention set
 /// (EAGAIN, ENOMEM), return the underlying error unchanged instead
 /// of wrapping in `ResourceContention`. EBUSY stays unconditionally
-/// classified because kvm-ioctls returns it strictly under
-/// host-resource pressure (per the kvm-ioctls source). The remaining
+/// classified because every KVM ioctl path that surfaces EBUSY does
+/// so under host-resource pressure (kvm-ioctls is a thin wrapper —
+/// see the per-callsite reachability note below — and propagates
+/// whatever errno the kernel returned via `errno::Error::last`).
+/// The remaining
 /// `TRANSIENT_HOST_ERRNOS` entries (EMFILE, ENFILE, ENOSPC) are
 /// always host-resource-driven by definition, so gating them on
 /// `near_limit` would only mask the trigger.
@@ -307,6 +310,19 @@ pub(crate) fn host_resource_snapshot() -> String {
 ///   currently-SKIPped tests would FAIL), so it is a behavior
 ///   change that warrants its own commit + soak window rather than
 ///   piggy-backing on the classifier's introduction.
+///
+/// # Per-callsite reachability
+///
+/// kvm-ioctls is a thin ioctl wrapper with no per-crate errno
+/// injection — every errno surfaced here comes directly from the
+/// kernel ioctl path. The classifier therefore handles the union of
+/// errnos that any KVM ioctl can return, but the practically-reachable
+/// subset varies by callsite. For `set_user_memory_region`
+/// specifically, only ENOMEM is practically reachable from the kernel
+/// memslot path; EBUSY / EMFILE / ENFILE / EAGAIN remain in
+/// [`TRANSIENT_HOST_ERRNOS`] as inherited generality from the
+/// KVM_CREATE_VM context (where they are the dominant signal), not
+/// because the memslot ioctl is observed to return them.
 pub(crate) fn map_transient_to_contention(
     e: kvm_ioctls::Error,
     context: impl Into<String>,
