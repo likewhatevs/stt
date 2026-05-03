@@ -1,22 +1,21 @@
 //! Disk-template cache and per-test fan-out.
 //!
-//! v0 status: this module ships the cache and clone primitives — the
+//! This module ships the cache and clone primitives — the
 //! `(Filesystem, capacity)` keyed lookup, atomic-rename publish,
 //! per-key flock coordination, statfs-based btrfs/xfs gate at the
-//! cache root, FICLONE per-test fan-out, and host `mkfs.btrfs`
-//! locator. [`ensure_template`] returns an actionable error on cache
-//! miss until the host-side template-VM driver lands (see the
-//! follow-up task referenced from [`build_template_via_vm`]). The
-//! guest-side `mkfs.btrfs /dev/vda` runner already exists in
-//! [`crate::vmm::rust_init`] and is gated on
-//! `KTSTR_MODE=disk_template`.
+//! cache root, FICLONE per-test fan-out, host `mkfs.btrfs` locator,
+//! AND the host-side template-VM driver in
+//! [`build_template_via_vm`] that boots a one-shot guest to run
+//! `mkfs.btrfs /dev/vda` against a sparse staging image. The
+//! guest-side dispatch lives in [`crate::vmm::rust_init`] and is
+//! gated on `KTSTR_MODE=disk_template`.
 //!
-//! Once the driver lands, the design is: the framework caches a
-//! guest-formatted backing image on the host and per-test
-//! reflink-clones it via the `FICLONE` ioctl. The host never execs
-//! `mkfs.btrfs` against a real backing file — the kernel inside a
-//! one-off template VM is the on-disk-format authority (see the
-//! project CLAUDE.md "disk template lifecycle" section).
+//! Design: the framework caches a guest-formatted backing image on
+//! the host and per-test reflink-clones it via the `FICLONE` ioctl.
+//! The host never execs `mkfs.btrfs` against a real backing file —
+//! the kernel inside a one-off template VM is the on-disk-format
+//! authority (see the project CLAUDE.md "disk template lifecycle"
+//! section).
 //!
 //! # Lifecycle
 //!
@@ -30,15 +29,23 @@
 //!    already populating the cache, this blocks until they finish (or
 //!    the timeout fires). After acquire, re-check the cache for
 //!    publish-while-waiting.
-//! 3. **Template VM boot.** v0: [`build_template_via_vm`] is a stub
-//!    that bails with an actionable error after probing
-//!    [`locate_host_mkfs_btrfs`]. Once landed, the driver will build
-//!    a sparse image of the requested capacity under a tempdir on
-//!    the cache filesystem, boot a one-shot guest that runs the
-//!    host-supplied `mkfs.btrfs` against `/dev/vda`, wait for clean
-//!    shutdown, and discard the guest. The guest dispatch is gated
-//!    on `KTSTR_MODE=disk_template` (see
-//!    [`crate::vmm::rust_init`]).
+//! 3. **Template VM boot.** [`build_template_via_vm`] materialises
+//!    a sparse `template.img.in-flight.<pid>` of the requested
+//!    capacity under the cache root (so `rename(2)` into place is
+//!    same-filesystem), packs the host's `mkfs.btrfs` into the
+//!    template-VM initramfs at `bin/mkfs.btrfs`, and boots a
+//!    one-shot guest with `KTSTR_MODE=disk_template` on the kernel
+//!    cmdline. The disk attaches via
+//!    [`crate::vmm::KtstrVmBuilder::template_staging_image`], which
+//!    bypasses both the per-test `Raw` tempfile branch AND the
+//!    `Btrfs` ensure_template branch in
+//!    [`crate::vmm::KtstrVm::init_virtio_blk`] — the template-build
+//!    VM cannot recursively re-enter the cache it is itself
+//!    populating. Guest dispatch
+//!    ([`crate::vmm::rust_init::run_disk_template_mode`]) execs
+//!    `/bin/mkfs.btrfs /dev/vda` and reboots cleanly; on non-zero
+//!    exit / timeout the staging image is unlinked and the build
+//!    bails with the trailing guest stderr.
 //! 4. **Atomic install.** The formatted image is moved into
 //!    `<cache>/disk_templates/<key>/template.img` via tempdir +
 //!    `rename(2)` ([`store_atomic`]). Partial failures leave no
@@ -52,7 +59,7 @@
 //! # Filesystem requirements
 //!
 //! `FICLONE` is implemented only on btrfs and xfs (kernel
-//! `fs/remap_range.c:do_clone_file_range`; the VFS gates on the
+//! `fs/remap_range.c:vfs_clone_file_range`; the VFS gates on the
 //! `remap_file_range` superblock op which neither tmpfs nor ext4
 //! provide). [`verify_cache_dir_supports_reflink`] checks the cache
 //! filesystem's `statfs.f_type` and bails fast on non-supporting
@@ -174,6 +181,25 @@ pub(crate) fn cache_root() -> Result<PathBuf> {
 /// only show up at mount points and the cache root inherits its
 /// parent's filesystem unless an operator mounted something custom
 /// on top.
+///
+/// When the walk-up lands on an ancestor that is not `dir` itself —
+/// because no leaf component of `dir` exists yet — the bail
+/// diagnostic names both `dir` and the probed ancestor so the
+/// operator can tell the f_type they see came from an ancestor, not
+/// from `dir`. This matters when `dir` would, once created, mount on
+/// a different filesystem than the ancestor (e.g. `KTSTR_CACHE_DIR`
+/// points at a not-yet-mounted btrfs subvolume): the diagnostic does
+/// not silently mislead about which filesystem was probed.
+///
+/// Symlink behaviour: `Path::exists` follows symlinks, so a
+/// dangling symlink probes as missing and the walk-up moves to the
+/// symlink's parent (the directory containing the symlink), not the
+/// symlink target's parent. Operators who set `KTSTR_CACHE_DIR` to a
+/// dangling symlink see the diagnostic name the symlink container's
+/// filesystem rather than the (nonexistent) target's. Resolving the
+/// symlink target before probing is intentionally NOT done — the
+/// missing target is a configuration error, not a filesystem-type
+/// question.
 pub(crate) fn verify_cache_dir_supports_reflink(dir: &Path) -> Result<()> {
     let mut probe: PathBuf = dir.to_path_buf();
     loop {
@@ -198,12 +224,28 @@ pub(crate) fn verify_cache_dir_supports_reflink(dir: &Path) -> Result<()> {
     if fs_type == BTRFS_SUPER_MAGIC || fs_type == XFS_SUPER_MAGIC {
         return Ok(());
     }
+    // Surface the probed ancestor in the diagnostic when it differs
+    // from `dir`: the f_type we read came from `probe`, not from
+    // `dir`, and an operator who reads only "dir lives on f_type X"
+    // can be misled when X is the root filesystem's magic and the
+    // intended cache mount simply does not exist yet.
+    let probe_note = if probe == dir {
+        String::new()
+    } else {
+        format!(
+            " (no part of {dir:?} exists yet; the f_type was read from \
+             ancestor {probe:?} — once {dir:?} is created on that same \
+             filesystem the cache will inherit f_type=0x{fs_type:x}, \
+             so create the intermediate mount first if you intended a \
+             different filesystem)"
+        )
+    };
     bail!(
         "ktstr disk-template cache requires a btrfs or xfs filesystem \
          for FICLONE-based per-test fan-out; cache directory {dir:?} \
          lives on a filesystem whose statfs.f_type=0x{fs_type:x} (not \
-         btrfs=0x{btrfs:x}, not xfs=0x{xfs:x}). Set KTSTR_CACHE_DIR \
-         to a directory on a btrfs/xfs mount, or use \
+         btrfs=0x{btrfs:x}, not xfs=0x{xfs:x}).{probe_note} Set \
+         KTSTR_CACHE_DIR to a directory on a btrfs/xfs mount, or use \
          Filesystem::Raw which does not need a reflink-capable cache.",
         btrfs = BTRFS_SUPER_MAGIC,
         xfs = XFS_SUPER_MAGIC,
@@ -533,40 +575,182 @@ pub(crate) fn ensure_template(fs: Filesystem, capacity_bytes: u64) -> Result<Pat
 
 /// Build a fresh template image by booting a one-shot template VM.
 ///
-/// Stub today — the host-side template-VM driver lives in a future
-/// patch that wires this function up to [`crate::vmm::KtstrVmBuilder`]
-/// with `template_mode=true`. Callers see an actionable error
-/// instead of a silent failure.
+/// Steps:
+/// 1. Materialise a sparse `template.img.in-flight.<pid>` of
+///    `capacity_bytes` under `cache_root` so the file shares the
+///    cache filesystem ([`store_atomic`]'s rename requires
+///    same-fs source/dest).
+/// 2. Locate `mkfs.<fstype>` on the host PATH and pack it into the
+///    template-VM initramfs at `bin/mkfs.<fstype>`. The kernel
+///    inside the VM is the on-disk-format authority — the host's
+///    `mkfs` binary just provides the userspace driver that runs
+///    against `/dev/vda` inside the guest.
+/// 3. Boot a [`crate::vmm::KtstrVm`] with the sparse image attached
+///    via [`crate::vmm::KtstrVmBuilder::template_staging_image`],
+///    which short-circuits the per-test backing-file branches in
+///    [`crate::vmm::KtstrVm::init_virtio_blk`] so the template-build
+///    VM cannot recursively re-enter [`ensure_template`] for its
+///    own `(fs, capacity_bytes)` key. Cmdline carries
+///    `KTSTR_MODE=disk_template`; the guest dispatch at
+///    [`crate::vmm::rust_init::run_disk_template_mode`] execs the
+///    embedded `mkfs.btrfs` against `/dev/vda` and reboots.
+/// 4. After clean exit (`VmResult::success` and `exit_code == 0`),
+///    return the staging path for [`store_atomic`] to rename into
+///    the cache. Non-zero exit, timeout, or run failure unlinks
+///    the staging file and bails.
 ///
-/// The driver, once landed, will:
-/// 1. Materialize a sparse `template.img.in-flight` of size
-///    `capacity_bytes` under `cache_root` (so it shares the cache's
-///    btrfs/xfs filesystem and survives the rename(2) into place).
-/// 2. Locate `mkfs.btrfs` via [`locate_host_mkfs_btrfs`].
-/// 3. Construct a `KtstrVmBuilder` with `KTSTR_MODE=disk_template`,
-///    the sparse image as the disk backing, and `mkfs.btrfs` packed
-///    as an extra binary at `bin/mkfs.btrfs`.
-/// 4. Run the VM until it reboots; the guest dispatch in
-///    [`crate::vmm::rust_init`] runs `mkfs.btrfs /dev/vda` and
-///    reboots cleanly.
-/// 5. Return the populated `template.img.in-flight` path for
-///    [`store_atomic`] to publish.
+/// `Filesystem::Raw` is unreachable on this path: [`ensure_template`]
+/// only invokes this driver from the gated `Btrfs` arm in
+/// [`crate::vmm::KtstrVm::init_virtio_blk`]. A `Raw` argument means
+/// a caller bypassed that gate; bail with an actionable error
+/// rather than build a Raw template (which would be a no-op).
 fn build_template_via_vm(
     fs: Filesystem,
     capacity_bytes: u64,
-    _cache_root: &Path,
+    cache_root: &Path,
 ) -> Result<PathBuf> {
-    // Probe that the host has the mkfs binary BEFORE bailing on the
-    // VM driver — operators get the more actionable error first.
-    let _mkfs = locate_host_mkfs_btrfs()?;
-    bail!(
-        "disk-template VM builder is not yet wired to KtstrVmBuilder \
-         (fs={fs:?}, capacity_bytes={capacity_bytes}). The host-side \
-         driver is staged for a follow-up patch in this task series. \
-         Until it lands, ktstr supports Filesystem::Raw on this code \
-         path; pre-populate the disk-template cache by hand if you \
-         need Filesystem::Btrfs.",
-    )
+    let mkfs = match fs {
+        Filesystem::Btrfs => locate_host_mkfs_btrfs()?,
+        Filesystem::Raw => bail!(
+            "build_template_via_vm called with Filesystem::Raw — \
+             Raw disks have no template image to build. \
+             ensure_template should only invoke this path for \
+             filesystem variants that require pre-formatting; \
+             this call indicates a bypass of the gate in \
+             init_virtio_blk."
+        ),
+    };
+
+    // Resolve a kernel image so the template-build VM can boot.
+    // Reuses the same KTSTR_KERNEL / cache / sysroot cascade the
+    // test framework uses, so an operator who set KTSTR_KERNEL for
+    // tests gets the same kernel for the template build.
+    let kernel = crate::find_kernel()
+        .context("locate kernel image for template-build VM")?
+        .ok_or_else(|| {
+            anyhow!(
+                "no kernel image found for template-build VM. {}",
+                crate::KTSTR_KERNEL_HINT,
+            )
+        })?;
+
+    // Stage the sparse image under the cache root so the eventual
+    // rename(2) into place is on the same filesystem (statfs
+    // f_type / f_fsid match — see store_atomic). The pid suffix
+    // disambiguates concurrent template builds for distinct
+    // `(fs, capacity)` pairs (the per-key flock serialises within
+    // a key; cross-key concurrency is permitted).
+    std::fs::create_dir_all(cache_root)
+        .with_context(|| format!("create cache root {cache_root:?} for staging image"))?;
+    let staging_path = cache_root.join(format!(
+        "template.img.in-flight.{}",
+        std::process::id(),
+    ));
+    // Remove any leftover from a prior crashed run with the same
+    // pid before opening. The per-key flock serialises peers; a
+    // surviving file at this path is debris from a same-pid retry
+    // and is safe to truncate.
+    if staging_path.exists() {
+        std::fs::remove_file(&staging_path).with_context(|| {
+            format!("remove leftover staging image {staging_path:?} before rebuild")
+        })?;
+    }
+    let staging_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&staging_path)
+        .with_context(|| format!("create staging image {staging_path:?}"))?;
+    staging_file
+        .set_len(capacity_bytes)
+        .with_context(|| {
+            format!(
+                "set staging image length to {capacity_bytes} bytes \
+                 ({staging_path:?})"
+            )
+        })?;
+    // Drop the host-side fd before booting; the VM opens its own
+    // RW fd via `template_staging_image`, and host writes through
+    // a stale fd would race the guest's mkfs.
+    drop(staging_file);
+
+    // Build the template VM. The `template_staging_image` setter
+    // makes init_virtio_blk open `staging_path` directly, bypassing
+    // BOTH the Raw tempfile and the Btrfs ensure_template branches —
+    // this is what breaks the recursion that would otherwise occur
+    // (a Btrfs disk inside a build-time VM would re-call
+    // ensure_template on the same key while we already hold the
+    // per-key flock above).
+    //
+    // The mkfs binary rides through `include_files` packed at
+    // `bin/<name>` so the guest's KTSTR_MODE=disk_template
+    // dispatch can spawn `/bin/<name>` against `/dev/vda`. The
+    // disk attached here uses Filesystem::Raw — the guest sees an
+    // unformatted device exactly as expected for the staging
+    // image (the whole point of this VM is to format it).
+    let mkfs_archive_path = match fs {
+        Filesystem::Btrfs => "bin/mkfs.btrfs".to_string(),
+        Filesystem::Raw => unreachable!("Raw rejected at function entry"),
+    };
+    let disk = crate::vmm::disk_config::DiskConfig::default()
+        .capacity_mb((capacity_bytes / (1024 * 1024)) as u32)
+        .filesystem(Filesystem::Raw);
+    let vm = crate::vmm::KtstrVm::builder()
+        .kernel(kernel)
+        .topology(1, 1, 1, 1)
+        .memory_mb(256)
+        .timeout(std::time::Duration::from_secs(120))
+        .cmdline("KTSTR_MODE=disk_template")
+        .disk(disk)
+        .template_staging_image(staging_path.clone())
+        .include_files(vec![(mkfs_archive_path, mkfs)])
+        .busybox(true)
+        .build()
+        .with_context(|| {
+            format!(
+                "build template-VM for {fs:?} capacity_bytes={capacity_bytes}"
+            )
+        })?;
+    let result = vm.run().with_context(|| {
+        format!(
+            "run template-build VM for {fs:?} capacity_bytes={capacity_bytes}"
+        )
+    });
+    let result = match result {
+        Ok(r) => r,
+        Err(e) => {
+            // Best-effort cleanup of the staging image. The
+            // template-build error itself is the dominant signal
+            // and any remove_file error here is a tertiary
+            // problem the caller cannot meaningfully act on.
+            let _ = std::fs::remove_file(&staging_path);
+            return Err(e);
+        }
+    };
+    if result.timed_out || result.exit_code != 0 || !result.success {
+        let _ = std::fs::remove_file(&staging_path);
+        bail!(
+            "template-build VM did not complete cleanly \
+             (timed_out={}, exit_code={}, success={}). \
+             Tail of guest stderr: {}",
+            result.timed_out,
+            result.exit_code,
+            result.success,
+            tail_lines(&result.stderr, 20),
+        );
+    }
+    Ok(staging_path)
+}
+
+/// Extract the last `n` lines of `text` for an error context.
+/// Used by [`build_template_via_vm`] to surface the trailing guest
+/// stderr — typically the `mkfs` failure message — without
+/// dumping the whole transcript into the bail message.
+fn tail_lines(text: &str, n: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(n);
+    lines[start..].join("\n")
 }
 
 #[cfg(test)]
@@ -595,6 +779,13 @@ mod tests {
 
     #[test]
     fn template_path_includes_filename_constant() {
+        // Isolate from operator state: KTSTR_CACHE_DIR / XDG_CACHE_HOME
+        // / $HOME bleed into template_path_for_key via cache_root().
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let _guard = crate::test_support::test_helpers::EnvVarGuard::set(
+            "KTSTR_CACHE_DIR",
+            tmp.path(),
+        );
         let path = template_path_for_key("btrfs-256m").expect("resolve template path");
         assert!(path.ends_with(format!("btrfs-256m/{TEMPLATE_FILENAME}")));
     }
@@ -690,47 +881,181 @@ mod tests {
     }
 
     #[test]
-    fn build_template_via_vm_bails_with_actionable_message() {
-        // Until the VM driver is wired up, the stub bails with a
-        // message that names the deferred work and the workaround.
-        // Pin the diagnostic wording so a future driver landing
-        // updates this test in lock-step (and a regression to
-        // silent-failure surfaces here).
+    fn build_template_via_vm_rejects_raw_filesystem() {
+        // [`build_template_via_vm`] is only supposed to be invoked
+        // from filesystem variants that require pre-formatting. A
+        // `Filesystem::Raw` argument means a caller bypassed the
+        // gate in [`crate::vmm::KtstrVm::init_virtio_blk`] and would
+        // produce a no-op template (Raw disks have no on-disk
+        // format). Pin the rejection so that bypass surfaces as a
+        // bail with a hint at the offending caller rather than as a
+        // silent empty template.
         let tmp = tempfile::tempdir().expect("create tempdir");
         let _guard = crate::test_support::test_helpers::EnvVarGuard::set(
             "KTSTR_CACHE_DIR",
             tmp.path(),
         );
-        // The mkfs probe runs first; on hosts without btrfs-progs
-        // the error talks about that. Skip the assertion on those
-        // hosts to avoid CI-environment skew.
-        if locate_host_mkfs_btrfs().is_err() {
-            return;
-        }
-        let err = build_template_via_vm(Filesystem::Btrfs, 256 * 1024 * 1024, tmp.path())
-            .expect_err("driver is not wired yet");
+        let err = build_template_via_vm(Filesystem::Raw, 256 * 1024 * 1024, tmp.path())
+            .expect_err("Raw must be rejected");
         let msg = err.to_string();
-        assert!(msg.contains("KtstrVmBuilder") || msg.contains("Filesystem::Raw"));
+        assert!(
+            msg.contains("Filesystem::Raw"),
+            "error must name the rejected variant: {msg}",
+        );
+        assert!(
+            msg.contains("init_virtio_blk"),
+            "error must name the gate location for the operator: {msg}",
+        );
     }
 
     #[test]
     fn verify_cache_dir_walks_up_to_existing_ancestor() {
         // A non-existent cache root must still produce a usable
-        // statfs result by walking up. Use a path under /tmp (which
-        // exists) and confirm the helper does not bail on ENOENT.
-        let nonexistent =
-            std::path::PathBuf::from("/tmp/ktstr-disk-template-test-does-not-exist-9242/sub/dir");
-        // The result depends on the host's /tmp filesystem; this
-        // test only pins that the helper does not panic and either
-        // returns Ok (btrfs/xfs /tmp) or a fs-magic-named error
+        // statfs result by walking up. Anchor the missing path under
+        // a per-test tempdir so parallel runs do not collide on a
+        // shared system path; the tempdir itself exists and walking
+        // up from `<tempdir>/nonexistent/sub/dir` reaches it on the
+        // first ancestor probe.
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let nonexistent = tmp.path().join("nonexistent/sub/dir");
+        // The result depends on the tempdir's filesystem; this test
+        // only pins that the helper does not panic and either
+        // returns Ok (btrfs/xfs tempdir) or a fs-magic-named error
         // (anything else).
         match verify_cache_dir_supports_reflink(&nonexistent) {
-            Ok(()) => { /* host /tmp is btrfs/xfs */ }
+            Ok(()) => { /* tempdir lives on btrfs/xfs */ }
             Err(e) => {
                 let msg = e.to_string();
                 assert!(
                     msg.contains("statfs.f_type") || msg.contains("FICLONE"),
                     "unexpected error wording: {msg}",
+                );
+            }
+        }
+    }
+
+    /// When the walk-up lands on an ancestor (`probe != dir`), the
+    /// bail diagnostic appends a `probe_note` that names the probed
+    /// ancestor explicitly so the operator can tell the f_type came
+    /// from an ancestor rather than `dir` itself. Pins the
+    /// conditional interpolation: a regression that drops
+    /// `{probe_note}` from the bail string would silently strip the
+    /// "(no part of {dir:?} exists yet; ... ancestor {probe:?} ...)"
+    /// guidance, leaving operators with the misleading
+    /// "cache directory X lives on f_type Y" wording even when Y
+    /// came from a probed ancestor.
+    ///
+    /// Skipped when the tempdir lives on btrfs/xfs — the helper
+    /// returns Ok and there is no diagnostic to inspect. Most
+    /// CI runners use tmpfs or ext4 for `TMPDIR`, so the
+    /// assertion fires there.
+    #[test]
+    fn verify_cache_dir_probe_note_fires_when_probe_differs_from_dir() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let nonexistent = tmp.path().join("nonexistent/sub/dir");
+        match verify_cache_dir_supports_reflink(&nonexistent) {
+            Ok(()) => {
+                // tempdir lives on btrfs/xfs — no diagnostic emitted,
+                // skip the probe_note assertion.
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("ancestor") && msg.contains("no part of"),
+                    "walk-up diagnostic must surface the probed \
+                     ancestor when probe != dir; got: {msg}",
+                );
+            }
+        }
+    }
+
+    /// When `dir` itself exists (`probe == dir`), the bail diagnostic
+    /// MUST NOT include the probe_note text — that text is
+    /// conditional on the walk-up landing on an ancestor. Pins the
+    /// `probe == dir` branch of the conditional interpolation: a
+    /// regression that always emits the probe_note (e.g. drops the
+    /// `if probe == dir` guard) would leak the misleading "no part
+    /// of dir exists yet" wording on every non-btrfs/xfs probe.
+    ///
+    /// Skipped when the tempdir lives on btrfs/xfs — the helper
+    /// returns Ok and there is no diagnostic to inspect.
+    #[test]
+    fn verify_cache_dir_probe_note_absent_when_probe_equals_dir() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        match verify_cache_dir_supports_reflink(tmp.path()) {
+            Ok(()) => {
+                // tempdir lives on btrfs/xfs — no diagnostic emitted.
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    !msg.contains("ancestor") && !msg.contains("no part of"),
+                    "probe == dir branch must NOT emit the probe_note \
+                     text; got: {msg}",
+                );
+                // Sanity: the rest of the diagnostic still names the
+                // f_type so the operator gets actionable guidance.
+                assert!(
+                    msg.contains("statfs.f_type") || msg.contains("FICLONE"),
+                    "diagnostic must still name the f_type; got: {msg}",
+                );
+            }
+        }
+    }
+
+    /// `Path::exists` follows symlinks, so a dangling symlink
+    /// probes as missing and the walk-up moves to the symlink
+    /// container's parent rather than the (nonexistent) target's
+    /// parent. Pin the documented behaviour at
+    /// `verify_cache_dir_supports_reflink`'s "Symlink behaviour"
+    /// paragraph: the diagnostic must reference the tempdir's
+    /// f_type (the container, which exists) rather than failing on
+    /// the broken symlink.
+    ///
+    /// A regression that switches `Path::exists` to
+    /// `Path::try_exists` would surface here: try_exists returns
+    /// `Err` on a broken symlink, breaking the walk-up loop
+    /// invariant.
+    ///
+    /// Linux-only: requires `std::os::unix::fs::symlink`. Skipped
+    /// when the tempdir lives on btrfs/xfs (helper returns Ok by
+    /// walking up to a reflink-capable filesystem, which is the
+    /// correct outcome).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verify_cache_dir_walks_through_dangling_symlink() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let symlink_path = tmp.path().join("dangling");
+        // Target does not exist; dangling symlink lands in the
+        // tempdir.
+        std::os::unix::fs::symlink(
+            "/nonexistent-symlink-target-9242",
+            &symlink_path,
+        )
+        .expect("create dangling symlink");
+        // Probing a path under the dangling symlink: walk-up
+        // ascends to symlink_path → tmp.path() (the symlink's
+        // container). The symlink target's parent is never
+        // consulted.
+        let probe_path = symlink_path.join("sub");
+        match verify_cache_dir_supports_reflink(&probe_path) {
+            Ok(()) => {
+                // tempdir lives on btrfs/xfs — helper returned Ok
+                // by walking up to a reflink-capable filesystem,
+                // which is the correct outcome.
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                // The diagnostic must reference the f_type of the
+                // walked-up ancestor (tempdir's filesystem) rather
+                // than failing on the dangling symlink. The error
+                // wording always names the f_type magic, regardless
+                // of whether the probed ancestor is the original
+                // dir or an ancestor.
+                assert!(
+                    msg.contains("statfs.f_type") || msg.contains("FICLONE"),
+                    "symlink walk-up must produce an f_type-named \
+                     diagnostic, not a symlink-resolution error; got: {msg}",
                 );
             }
         }

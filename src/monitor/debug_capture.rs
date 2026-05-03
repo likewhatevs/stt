@@ -234,8 +234,9 @@ pub struct WorkloadGroupHint {
 /// Affinity placement hint. Maps directly to `crate::workload::AffinityIntent`.
 ///
 /// Each topology-aware variant (`SingleCpu`, `LlcAligned`,
-/// `CrossCgroup`, `RandomSubset`) carries an optional `cpus` payload
-/// recording the actual CPUs the producer observed at capture time.
+/// `CrossCgroup`, `SmtSiblingPair`, `RandomSubset`) carries an
+/// optional `cpus` payload recording the actual CPUs the producer
+/// observed at capture time.
 /// Empty `cpus` means the producer classified the pattern but did not
 /// record concrete CPUs (legacy producers, or projection from a
 /// failure dump that lacked per-task `cpus_allowed_mask` data); the
@@ -285,6 +286,20 @@ pub enum AffinityHint {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         cpus: Vec<u32>,
     },
+    /// Threads observed pinned to the two SMT siblings of one
+    /// physical core (mask popcount == 2 across the capture window
+    /// for the majority of threads in the group, and the two CPUs
+    /// share a thread_siblings list per
+    /// `/sys/devices/system/cpu/cpu*/topology/thread_siblings_list`).
+    /// → `AffinityIntent::SmtSiblingPair`.
+    ///
+    /// `cpus` records the observed sibling-pair CPU IDs when the
+    /// producer resolved them. Empty when the producer classified
+    /// the pattern without recording the concrete sibling pair.
+    SmtSiblingPair {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        cpus: Vec<u32>,
+    },
     /// Threads observed pinned to an explicit CPU set. The capture
     /// records the exact CPUs so the reproducer can reproduce the
     /// specific placement. → `AffinityIntent::Exact`.
@@ -293,18 +308,115 @@ pub enum AffinityHint {
     /// cpuset, but the subset varies across threads — typical of
     /// a placement randomizer. → `AffinityIntent::RandomSubset`.
     ///
-    /// `pool` records the observed source pool (the union of CPUs
+    /// `from` records the observed source pool (the union of CPUs
     /// any thread was pinned to across the capture window) when the
     /// producer resolved it. `count` records the typical mask
-    /// popcount per thread. Empty `pool` or zero `count` means the
+    /// popcount per thread. Empty `from` or zero `count` means the
     /// producer classified the pattern without recording the
-    /// resolved pool / sample size.
+    /// resolved pool / sample size. Field name matches
+    /// [`crate::workload::AffinityIntent::RandomSubset::from`] so the
+    /// hint and the resolved intent share the same vocabulary.
     RandomSubset {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        pool: Vec<u32>,
+        from: Vec<u32>,
         #[serde(default, skip_serializing_if = "is_zero_u32")]
         count: u32,
     },
+}
+
+impl AffinityHint {
+    /// Construct a `SingleCpu` hint with the producer-observed CPU
+    /// set. Mirrors [`crate::workload::AffinityIntent::exact`]'s
+    /// iterator flexibility — accepts arrays, ranges, `Vec`, or any
+    /// `IntoIterator<Item = u32>`.
+    pub fn single_cpu(cpus: impl IntoIterator<Item = u32>) -> Self {
+        Self::SingleCpu {
+            cpus: cpus.into_iter().collect(),
+        }
+    }
+
+    /// Construct an unresolved `SingleCpu` hint — the producer
+    /// classified the pattern but did not record concrete CPUs. The
+    /// reproducer generator falls back to
+    /// [`crate::workload::AffinityIntent::SingleCpu`] plus a
+    /// hand-edit note.
+    pub fn single_cpu_unresolved() -> Self {
+        Self::SingleCpu { cpus: Vec::new() }
+    }
+
+    /// Construct an `LlcAligned` hint with the producer-observed LLC
+    /// CPU set.
+    pub fn llc_aligned(cpus: impl IntoIterator<Item = u32>) -> Self {
+        Self::LlcAligned {
+            cpus: cpus.into_iter().collect(),
+        }
+    }
+
+    /// Construct an unresolved `LlcAligned` hint — see
+    /// [`Self::single_cpu_unresolved`] for the
+    /// unresolved-classification semantics.
+    pub fn llc_aligned_unresolved() -> Self {
+        Self::LlcAligned { cpus: Vec::new() }
+    }
+
+    /// Construct a `CrossCgroup` hint with the producer-observed
+    /// cross-cgroup CPU span.
+    pub fn cross_cgroup(cpus: impl IntoIterator<Item = u32>) -> Self {
+        Self::CrossCgroup {
+            cpus: cpus.into_iter().collect(),
+        }
+    }
+
+    /// Construct an unresolved `CrossCgroup` hint.
+    pub fn cross_cgroup_unresolved() -> Self {
+        Self::CrossCgroup { cpus: Vec::new() }
+    }
+
+    /// Construct an `SmtSiblingPair` hint with the producer-observed
+    /// sibling-pair CPU IDs.
+    pub fn smt_sibling_pair(cpus: impl IntoIterator<Item = u32>) -> Self {
+        Self::SmtSiblingPair {
+            cpus: cpus.into_iter().collect(),
+        }
+    }
+
+    /// Construct an unresolved `SmtSiblingPair` hint.
+    pub fn smt_sibling_pair_unresolved() -> Self {
+        Self::SmtSiblingPair { cpus: Vec::new() }
+    }
+
+    /// Construct an `Exact` hint with the producer-observed CPU set.
+    /// Maps to [`crate::workload::AffinityIntent::Exact`] in the
+    /// reproducer generator.
+    pub fn exact(cpus: impl IntoIterator<Item = u32>) -> Self {
+        Self::Exact {
+            cpus: cpus.into_iter().collect(),
+        }
+    }
+
+    /// Construct a `RandomSubset` hint with the producer-observed
+    /// pool and per-thread popcount. Mirrors
+    /// [`crate::workload::AffinityIntent::random_subset`]. The
+    /// reproducer generator emits an empty placeholder when `from`
+    /// is empty or `count == 0`.
+    pub fn random_subset(from: impl IntoIterator<Item = u32>, count: u32) -> Self {
+        Self::RandomSubset {
+            from: from.into_iter().collect(),
+            count,
+        }
+    }
+
+    /// Construct an unresolved `RandomSubset` hint — the producer
+    /// classified the pattern but did not record the resolved pool /
+    /// sample size. The reproducer generator emits an empty
+    /// placeholder that the spawn-time gate rejects, prompting
+    /// hand-edit before the spec runs.
+    pub fn random_subset_unresolved() -> Self {
+        Self::RandomSubset {
+            from: Vec::new(),
+            count: 0,
+        }
+    }
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
@@ -755,7 +867,7 @@ mod tests {
     /// shapes — empty `cpus` (unresolved, the producer classified
     /// the pattern without recording concrete CPUs) and non-empty
     /// `cpus` (resolved, the producer recorded the observed CPU
-    /// set). `RandomSubset` adds the `pool`/`count` pair. Pins the
+    /// set). `RandomSubset` adds the `from`/`count` pair. Pins the
     /// `#[serde(default, skip_serializing_if = "Vec::is_empty")]`
     /// wire shape so a regression that drops the resolved-payload
     /// fields silently surfaces here rather than at
@@ -769,12 +881,14 @@ mod tests {
             AffinityHint::LlcAligned { cpus: vec![0, 1, 2, 3] },
             AffinityHint::CrossCgroup { cpus: Vec::new() },
             AffinityHint::CrossCgroup { cpus: vec![4, 5, 6, 7] },
+            AffinityHint::SmtSiblingPair { cpus: Vec::new() },
+            AffinityHint::SmtSiblingPair { cpus: vec![2, 3] },
             AffinityHint::RandomSubset {
-                pool: Vec::new(),
+                from: Vec::new(),
                 count: 0,
             },
             AffinityHint::RandomSubset {
-                pool: vec![0, 1, 2, 3, 4, 5],
+                from: vec![0, 1, 2, 3, 4, 5],
                 count: 3,
             },
         ];
@@ -796,16 +910,20 @@ mod tests {
                     AffinityHint::CrossCgroup { cpus: b },
                 ) => assert_eq!(a, b, "CrossCgroup cpus must round-trip"),
                 (
+                    AffinityHint::SmtSiblingPair { cpus: a },
+                    AffinityHint::SmtSiblingPair { cpus: b },
+                ) => assert_eq!(a, b, "SmtSiblingPair cpus must round-trip"),
+                (
                     AffinityHint::RandomSubset {
-                        pool: pa,
+                        from: pa,
                         count: ca,
                     },
                     AffinityHint::RandomSubset {
-                        pool: pb,
+                        from: pb,
                         count: cb,
                     },
                 ) => {
-                    assert_eq!(pa, pb, "RandomSubset pool must round-trip");
+                    assert_eq!(pa, pb, "RandomSubset from must round-trip");
                     assert_eq!(ca, cb, "RandomSubset count must round-trip");
                 }
                 _ => panic!(
@@ -843,5 +961,70 @@ mod tests {
                 ),
             }
         }
+    }
+
+    /// Constructors produce the same enum variants as struct-literal
+    /// construction. Pins the convention that
+    /// `AffinityHint::single_cpu(cpus)` and
+    /// `AffinityHint::SingleCpu { cpus }` are interchangeable, and
+    /// covers the resolved/unresolved pair for every topology-aware
+    /// variant plus `Exact` and `RandomSubset`.
+    #[test]
+    fn affinity_hint_constructors_match_struct_literal() {
+        assert!(matches!(
+            AffinityHint::single_cpu([3u32]),
+            AffinityHint::SingleCpu { cpus } if cpus == vec![3]
+        ));
+        assert!(matches!(
+            AffinityHint::single_cpu_unresolved(),
+            AffinityHint::SingleCpu { cpus } if cpus.is_empty()
+        ));
+        assert!(matches!(
+            AffinityHint::llc_aligned(0u32..4),
+            AffinityHint::LlcAligned { cpus } if cpus == vec![0, 1, 2, 3]
+        ));
+        assert!(matches!(
+            AffinityHint::llc_aligned_unresolved(),
+            AffinityHint::LlcAligned { cpus } if cpus.is_empty()
+        ));
+        assert!(matches!(
+            AffinityHint::cross_cgroup(vec![4u32, 5, 6, 7]),
+            AffinityHint::CrossCgroup { cpus } if cpus == vec![4, 5, 6, 7]
+        ));
+        assert!(matches!(
+            AffinityHint::cross_cgroup_unresolved(),
+            AffinityHint::CrossCgroup { cpus } if cpus.is_empty()
+        ));
+        assert!(matches!(
+            AffinityHint::smt_sibling_pair([2u32, 3]),
+            AffinityHint::SmtSiblingPair { cpus } if cpus == vec![2, 3]
+        ));
+        assert!(matches!(
+            AffinityHint::smt_sibling_pair_unresolved(),
+            AffinityHint::SmtSiblingPair { cpus } if cpus.is_empty()
+        ));
+        assert!(matches!(
+            AffinityHint::exact([0u32, 1, 2]),
+            AffinityHint::Exact { cpus } if cpus == vec![0, 1, 2]
+        ));
+        assert!(matches!(
+            AffinityHint::random_subset([0u32, 1, 2, 3, 4, 5], 3),
+            AffinityHint::RandomSubset { from, count }
+                if from == vec![0, 1, 2, 3, 4, 5] && count == 3
+        ));
+        assert!(matches!(
+            AffinityHint::random_subset_unresolved(),
+            AffinityHint::RandomSubset { from, count }
+                if from.is_empty() && count == 0
+        ));
+
+        // Empty-iterator synonym: `single_cpu([])` produces the same
+        // variant shape as `single_cpu_unresolved()`. Pin the synonym
+        // so a future change that rejects empty iterators (or maps
+        // them to a different variant) surfaces here.
+        assert!(matches!(
+            AffinityHint::single_cpu([] as [u32; 0]),
+            AffinityHint::SingleCpu { cpus } if cpus.is_empty()
+        ));
     }
 }

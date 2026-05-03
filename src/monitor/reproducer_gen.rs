@@ -34,7 +34,8 @@
 //! | AffinityHint::Inherit         | AffinityIntent::Inherit                  |
 //! | AffinityHint::LlcAligned{cpus}| AffinityIntent::Exact(set) when cpus non-empty; AffinityIntent::LlcAligned when empty |
 //! | AffinityHint::CrossCgroup{cpus}| AffinityIntent::Exact(set) when cpus non-empty; AffinityIntent::CrossCgroup when empty |
-//! | AffinityHint::RandomSubset{pool,count (popcount-per-thread)} | AffinityIntent::RandomSubset { from: pool, count } when both non-empty; placeholder otherwise [†] |
+//! | AffinityHint::SmtSiblingPair{cpus}| AffinityIntent::Exact(set) when cpus non-empty; AffinityIntent::SmtSiblingPair when empty |
+//! | AffinityHint::RandomSubset { from, count: popcount-per-thread } | AffinityIntent::RandomSubset { from, count } when both non-empty; placeholder otherwise [†] |
 //! | WorkTypeHint::SpinWait         | WorkType::SpinWait                       |
 //! | WorkTypeHint::YieldHeavy      | WorkType::YieldHeavy                    |
 //! | WorkTypeHint::Mixed           | WorkType::Mixed                         |
@@ -214,12 +215,12 @@ fn map_workload_groups(fp: &WorkloadFingerprint, spec: &mut ReproducerSpec) {
 }
 
 /// Build the user-facing note attached when a topology-aware
-/// [`AffinityHint`] is projected without a resolved CPU set. The 3
-/// topology-aware variants (`SingleCpu`, `LlcAligned`, `CrossCgroup`)
-/// share the same structure: name the variant, describe what the
-/// scenario engine resolves at apply time, then point the user at the
-/// concrete `AffinityIntent::Exact(...)` they should hand-edit to if
-/// they want to spawn directly via
+/// [`AffinityHint`] is projected without a resolved CPU set. The 4
+/// topology-aware variants (`SingleCpu`, `LlcAligned`, `CrossCgroup`,
+/// `SmtSiblingPair`) share the same structure: name the variant,
+/// describe what the scenario engine resolves at apply time, then
+/// point the user at the concrete `AffinityIntent::Exact(...)` they
+/// should hand-edit to if they want to spawn directly via
 /// [`crate::workload::WorkloadHandle::spawn`] (which rejects the
 /// topology-aware variants — they require scenario context the
 /// spawn-time gate doesn't have).
@@ -241,9 +242,10 @@ fn topology_aware_note(
 /// Build the note attached when a topology-aware [`AffinityHint`]
 /// carried resolved CPUs and the generator collapsed it to
 /// [`AffinityIntent::Exact`]. The note preserves the original
-/// pattern classification (SingleCpu / LlcAligned / CrossCgroup) so
-/// the consumer can see what the producer observed before
-/// resolution, even though the emitted spec is a flat `Exact`.
+/// pattern classification (SingleCpu / LlcAligned / CrossCgroup /
+/// SmtSiblingPair) so the consumer can see what the producer
+/// observed before resolution, even though the emitted spec is a
+/// flat `Exact`.
 fn topology_resolved_note(variant: &str, cpus: &[u32]) -> String {
     format!(
         "AffinityHint::{variant} observed with resolved CPUs {cpus:?}; \
@@ -252,60 +254,92 @@ fn topology_resolved_note(variant: &str, cpus: &[u32]) -> String {
     )
 }
 
+/// Build a `BTreeSet<usize>` from a slice of `u32` CPU IDs. Centralises
+/// the `u32 → usize` widening the `AffinityHint` payload requires
+/// before it can populate an [`AffinityIntent::Exact`] / `RandomSubset`
+/// pool.
+fn cpus_to_set(cpus: &[u32]) -> BTreeSet<usize> {
+    cpus.iter().map(|&c| c as usize).collect()
+}
+
+/// Resolve a topology-aware [`AffinityHint`] payload to an
+/// [`AffinityIntent`] and append the matching note to `spec.notes`.
+///
+/// The 4 topology-aware variants (`SingleCpu`, `LlcAligned`,
+/// `CrossCgroup`, `SmtSiblingPair`) share the same shape: an empty
+/// `cpus` payload falls back to the matching topology-aware
+/// `AffinityIntent` variant (resolved by the scenario engine at apply
+/// time) plus a hand-edit note, while a non-empty payload collapses
+/// to [`AffinityIntent::Exact`] containing the observed CPUs.
+///
+/// `variant` names the [`AffinityHint`] variant for the note text,
+/// `topology_intent` is the matching topology-aware intent emitted on
+/// the empty path, `engine_action` and `hand_edit_target` describe
+/// the scenario engine's resolution and the user's hand-edit target
+/// respectively (the strings appear in [`topology_aware_note`]).
+fn map_topology_aware_affinity(
+    cpus: &[u32],
+    variant: &str,
+    topology_intent: AffinityIntent,
+    engine_action: &str,
+    hand_edit_target: &str,
+    spec: &mut ReproducerSpec,
+) -> AffinityIntent {
+    if cpus.is_empty() {
+        spec.notes.push(topology_aware_note(
+            variant,
+            engine_action,
+            hand_edit_target,
+        ));
+        topology_intent
+    } else {
+        spec.notes.push(topology_resolved_note(variant, cpus));
+        AffinityIntent::Exact(cpus_to_set(cpus))
+    }
+}
+
 fn map_affinity(fp: &WorkloadFingerprint, spec: &mut ReproducerSpec) {
     let Some(primary) = fp.affinity_hints.first() else {
         return;
     };
     spec.config.affinity = match primary {
         AffinityHint::Inherit => AffinityIntent::Inherit,
-        AffinityHint::SingleCpu { cpus } => {
-            if cpus.is_empty() {
-                spec.notes.push(topology_aware_note(
-                    "SingleCpu",
-                    "picks the concrete CPU from the cgroup's cpuset",
-                    "[cpu]",
-                ));
-                AffinityIntent::SingleCpu
-            } else {
-                spec.notes.push(topology_resolved_note("SingleCpu", cpus));
-                let set: BTreeSet<usize> = cpus.iter().map(|&c| c as usize).collect();
-                AffinityIntent::Exact(set)
-            }
-        }
-        AffinityHint::LlcAligned { cpus } => {
-            if cpus.is_empty() {
-                spec.notes.push(topology_aware_note(
-                    "LlcAligned",
-                    "resolves the LLC mask from the cgroup's cpuset",
-                    "<llc cpus>",
-                ));
-                AffinityIntent::LlcAligned
-            } else {
-                spec.notes.push(topology_resolved_note("LlcAligned", cpus));
-                let set: BTreeSet<usize> = cpus.iter().map(|&c| c as usize).collect();
-                AffinityIntent::Exact(set)
-            }
-        }
-        AffinityHint::CrossCgroup { cpus } => {
-            if cpus.is_empty() {
-                spec.notes.push(topology_aware_note(
-                    "CrossCgroup",
-                    "expands to the full topology",
-                    "<all cpus>",
-                ));
-                AffinityIntent::CrossCgroup
-            } else {
-                spec.notes.push(topology_resolved_note("CrossCgroup", cpus));
-                let set: BTreeSet<usize> = cpus.iter().map(|&c| c as usize).collect();
-                AffinityIntent::Exact(set)
-            }
-        }
-        AffinityHint::Exact { cpus } => {
-            let set: BTreeSet<usize> = cpus.iter().map(|&c| c as usize).collect();
-            AffinityIntent::Exact(set)
-        }
-        AffinityHint::RandomSubset { pool, count } => {
-            if pool.is_empty() || *count == 0 {
+        AffinityHint::SingleCpu { cpus } => map_topology_aware_affinity(
+            cpus,
+            "SingleCpu",
+            AffinityIntent::SingleCpu,
+            "picks the concrete CPU from the cgroup's cpuset",
+            "[cpu]",
+            spec,
+        ),
+        AffinityHint::LlcAligned { cpus } => map_topology_aware_affinity(
+            cpus,
+            "LlcAligned",
+            AffinityIntent::LlcAligned,
+            "resolves the LLC mask from the cgroup's cpuset",
+            "<llc cpus>",
+            spec,
+        ),
+        AffinityHint::CrossCgroup { cpus } => map_topology_aware_affinity(
+            cpus,
+            "CrossCgroup",
+            AffinityIntent::CrossCgroup,
+            "expands to the full topology",
+            "<all cpus>",
+            spec,
+        ),
+        AffinityHint::SmtSiblingPair { cpus } => map_topology_aware_affinity(
+            cpus,
+            "SmtSiblingPair",
+            AffinityIntent::SmtSiblingPair,
+            "picks an SMT-sibling pair from the cgroup's effective cpuset, \
+             or the full topology when no cpuset is active",
+            "[sibling_a, sibling_b]",
+            spec,
+        ),
+        AffinityHint::Exact { cpus } => AffinityIntent::Exact(cpus_to_set(cpus)),
+        AffinityHint::RandomSubset { from, count } => {
+            if from.is_empty() || *count == 0 {
                 spec.notes.push(
                     "AffinityHint::RandomSubset observed without a \
                      resolved pool / count; emitting \
@@ -325,14 +359,13 @@ fn map_affinity(fp: &WorkloadFingerprint, spec: &mut ReproducerSpec) {
             } else {
                 spec.notes.push(format!(
                     "AffinityHint::RandomSubset observed with resolved \
-                     pool {pool:?} count={count}; emitting \
+                     pool {from:?} count={count}; emitting \
                      AffinityIntent::RandomSubset directly so the \
                      spawn-time affinity gate accepts it without \
                      hand-editing",
                 ));
-                let from: BTreeSet<usize> = pool.iter().map(|&c| c as usize).collect();
                 AffinityIntent::RandomSubset {
-                    from,
+                    from: cpus_to_set(from),
                     count: *count as usize,
                 }
             }
@@ -940,7 +973,7 @@ mod tests {
         );
     }
 
-    /// Resolved `RandomSubset` hint (non-empty `pool`, non-zero
+    /// Resolved `RandomSubset` hint (non-empty `from`, non-zero
     /// `count`) emits [`AffinityIntent::RandomSubset`] with the
     /// resolved pool and count. The spawn-time gate accepts this
     /// shape directly — no hand-editing required.
@@ -948,7 +981,7 @@ mod tests {
     fn generate_spec_random_subset_resolved_emits_populated() {
         let mut cap = DebugCapture::default();
         cap.fingerprint.affinity_hints = vec![AffinityHint::RandomSubset {
-            pool: vec![0, 1, 2, 3, 4, 5],
+            from: vec![0, 1, 2, 3, 4, 5],
             count: 3,
         }];
         let spec = generate_spec(&cap);
@@ -968,7 +1001,7 @@ mod tests {
         );
     }
 
-    /// Unresolved `RandomSubset` hint (empty `pool` or zero `count`)
+    /// Unresolved `RandomSubset` hint (empty `from` or zero `count`)
     /// emits the empty placeholder and surfaces the hand-edit note.
     /// Pins the legacy fallback for producers that classify the
     /// pattern without recording the pool.
@@ -976,7 +1009,7 @@ mod tests {
     fn generate_spec_random_subset_unresolved_emits_placeholder() {
         let mut cap = DebugCapture::default();
         cap.fingerprint.affinity_hints = vec![AffinityHint::RandomSubset {
-            pool: Vec::new(),
+            from: Vec::new(),
             count: 0,
         }];
         let spec = generate_spec(&cap);
@@ -992,6 +1025,59 @@ mod tests {
                 .iter()
                 .any(|n| n.contains("AffinityHint::RandomSubset")
                     && n.contains("without a resolved pool")),
+        );
+    }
+
+    /// Resolved `SmtSiblingPair` hint (non-empty `cpus`) collapses to
+    /// [`AffinityIntent::Exact`]. The producer recorded the observed
+    /// SMT sibling pair and the generator emits a runnable spec.
+    #[test]
+    fn generate_spec_smt_sibling_pair_resolved_emits_exact() {
+        let mut cap = DebugCapture::default();
+        cap.fingerprint.affinity_hints =
+            vec![AffinityHint::SmtSiblingPair { cpus: vec![2, 3] }];
+        let spec = generate_spec(&cap);
+        match &spec.config.affinity {
+            AffinityIntent::Exact(set) => {
+                let v: Vec<usize> = set.iter().copied().collect();
+                assert_eq!(v, vec![2, 3]);
+            }
+            other => panic!("expected Exact, got {other:?}"),
+        }
+        assert!(
+            spec.notes
+                .iter()
+                .any(|n| n.contains("AffinityHint::SmtSiblingPair")
+                    && n.contains("with resolved CPUs")),
+            "resolved SmtSiblingPair must surface a resolved-collapse note: {:?}",
+            spec.notes,
+        );
+    }
+
+    /// Unresolved `SmtSiblingPair` hint (empty `cpus`) emits
+    /// [`AffinityIntent::SmtSiblingPair`] and surfaces a note
+    /// reminding the consumer that direct
+    /// [`crate::workload::WorkloadHandle::spawn`] rejects this
+    /// variant (the scenario engine resolves it from the cgroup's
+    /// cpuset). Pins the unresolved-fallback path of the
+    /// SmtSiblingPair topology-aware projection.
+    #[test]
+    fn generate_spec_smt_sibling_pair_unresolved_emits_topology_aware() {
+        let mut cap = DebugCapture::default();
+        cap.fingerprint.affinity_hints =
+            vec![AffinityHint::SmtSiblingPair { cpus: Vec::new() }];
+        let spec = generate_spec(&cap);
+        assert!(matches!(
+            spec.config.affinity,
+            AffinityIntent::SmtSiblingPair
+        ));
+        assert!(
+            spec.notes
+                .iter()
+                .any(|n| n.contains("AffinityHint::SmtSiblingPair")
+                    && n.contains("without resolved CPUs")),
+            "unresolved SmtSiblingPair must surface a topology-aware-fallback note: {:?}",
+            spec.notes,
         );
     }
 
@@ -1103,6 +1189,10 @@ mod tests {
         assert_eq!(
             render_affinity(&AffinityIntent::CrossCgroup),
             "AffinityIntent::CrossCgroup"
+        );
+        assert_eq!(
+            render_affinity(&AffinityIntent::SmtSiblingPair),
+            "AffinityIntent::SmtSiblingPair"
         );
         let random = AffinityIntent::RandomSubset {
             from: BTreeSet::from([0usize, 1, 2, 3]),
