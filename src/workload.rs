@@ -3990,11 +3990,14 @@ pub struct WorkerReport {
     ///
     /// Distinct from [`iteration_costs_ns`](Self::iteration_costs_ns):
     /// this field measures the OFF-CPU gap between blocks (scheduler
-    /// resume latency); `iteration_costs_ns` measures the ON-CPU
-    /// burst duration of a single compute iteration. A pure
-    /// compute work type that never blocks reports
-    /// `resume_latencies_ns: vec![]` and populates
-    /// `iteration_costs_ns` instead.
+    /// resume latency); `iteration_costs_ns` measures the wall-clock
+    /// duration of a single compute iteration. The three pure-compute
+    /// variants that populate `iteration_costs_ns` —
+    /// [`WorkType::AluHot`], [`WorkType::SmtSiblingSpin`], and
+    /// [`WorkType::IpcVariance`] — never block and report
+    /// `resume_latencies_ns: vec![]`. Other compute variants
+    /// (e.g. SpinWait, YieldHeavy, Mixed) populate neither
+    /// reservoir.
     pub resume_latencies_ns: Vec<u64>,
     /// Total number of wake-latency observations the worker
     /// recorded, INCLUDING any that were dropped by the reservoir
@@ -4006,7 +4009,14 @@ pub struct WorkerReport {
     /// observed" (vs. "entries in the sample") read this field;
     /// percentile / CV computations read `resume_latencies_ns`.
     pub wake_sample_total: u64,
-    /// Per-iteration on-CPU compute-burst duration samples (ns).
+    /// Per-iteration wall-clock duration of one compute iteration (ns),
+    /// including any scheduler preemption. Measured via
+    /// `Instant::now()` (CLOCK_MONOTONIC), so a sample includes any
+    /// off-CPU time the kernel inserted mid-iteration. The variance
+    /// across iterations is the load-bearing scheduler signal —
+    /// preemption inflates samples and that inflation is the
+    /// observable.
+    ///
     /// Reservoir-sampled at the same cap (`MAX_WAKE_SAMPLES` =
     /// 100_000) as [`resume_latencies_ns`](Self::resume_latencies_ns),
     /// using the same Algorithm-R sampler.
@@ -4015,16 +4025,17 @@ pub struct WorkerReport {
     /// never blocks: [`WorkType::AluHot`], [`WorkType::SmtSiblingSpin`],
     /// and [`WorkType::IpcVariance`]. Each sample is the elapsed
     /// time from the start to the end of one outer-loop iteration's
-    /// compute burst — the duration the worker spent ON-CPU
-    /// retiring instructions, not the off-CPU gap between iterations.
+    /// compute burst.
     ///
     /// Distinct from [`resume_latencies_ns`](Self::resume_latencies_ns):
     /// the wake-latency reservoir captures off-CPU time (futex /
-    /// pipe / nanosleep wakeups); this reservoir captures on-CPU
-    /// burst duration. The two are NOT comparable across variants —
-    /// a scheduler-A/B test that wants iteration cost for a compute
-    /// variant reads this field; a test that wants wake latency for
-    /// a blocking variant reads `resume_latencies_ns`.
+    /// pipe / nanosleep wakeups); this reservoir captures the
+    /// wall-clock duration of one compute iteration (which
+    /// includes any scheduler preemption inside the iteration).
+    /// The two are NOT comparable across variants — a
+    /// scheduler-A/B test that wants iteration cost for a compute
+    /// variant reads this field; a test that wants wake latency
+    /// for a blocking variant reads `resume_latencies_ns`.
     pub iteration_costs_ns: Vec<u64>,
     /// Total number of iteration-cost observations the worker
     /// recorded, INCLUDING any that were dropped by the reservoir
@@ -7244,11 +7255,10 @@ fn worker_main(
     const MAX_WAKE_SAMPLES: usize = 100_000;
     let mut resume_latencies_ns: Vec<u64> = Vec::with_capacity(MAX_WAKE_SAMPLES);
     let mut wake_sample_count: u64 = 0;
-    // Per-iteration on-CPU compute-burst duration samples
+    // Per-iteration wall-clock compute duration samples
     // (reservoir-sampled at the same cap as resume_latencies_ns).
-    // Populated by pure compute variants (AluHot, SmtSiblingSpin,
-    // IpcVariance); blocking variants leave it empty since their
-    // ON-CPU burst between blocks is not the load-bearing signal.
+    // Populated by AluHot, SmtSiblingSpin, IpcVariance; all other
+    // variants leave it empty.
     let mut iteration_costs_ns: Vec<u64> = Vec::with_capacity(MAX_WAKE_SAMPLES);
     let mut iteration_cost_sample_count: u64 = 0;
     let mut iterations: u64 = 0;
@@ -9643,10 +9653,12 @@ fn worker_main(
                 // iteration — the outer loop checks `stop` between
                 // iterations so shutdown latency stays bounded.
                 //
-                // Sample iteration cost (ON-CPU burst duration) into
-                // iteration_costs_ns: AluHot never blocks, so the
-                // resume_latencies_ns reservoir would conflate
-                // off-CPU and on-CPU signal if it captured this.
+                // Sample iteration cost (wall-clock duration of one
+                // compute iteration, including any scheduler
+                // preemption) into iteration_costs_ns: AluHot never
+                // blocks, so the resume_latencies_ns reservoir would
+                // not capture preemption inflation here. Variance
+                // across samples encodes the scheduler signal.
                 let iter_start = Instant::now();
                 alu_hot_chain(resolved, ALU_HOT_CHAIN_STEPS, &mut work_units);
                 reservoir_push(
@@ -9670,11 +9682,12 @@ fn worker_main(
                 // SpinWait — the SMT semantics come from the
                 // affinity layer, not the work loop.
                 //
-                // Sample iteration cost (ON-CPU burst duration)
-                // into iteration_costs_ns: SmtSiblingSpin never
-                // blocks. Variance across iterations encodes the
-                // SMT-contention signal — sibling activity slows
-                // each spin burst measurably.
+                // Sample iteration cost (wall-clock duration of one
+                // compute iteration, including any scheduler
+                // preemption) into iteration_costs_ns:
+                // SmtSiblingSpin never blocks. Variance across
+                // iterations encodes the SMT-contention signal —
+                // sibling activity slows each spin burst measurably.
                 let iter_start = Instant::now();
                 spin_burst(&mut work_units, 1024);
                 reservoir_push(
@@ -9708,15 +9721,24 @@ fn worker_main(
                     *state = x;
                     x
                 };
-                // Sample iteration cost (ON-CPU burst duration)
-                // covering the full hot+cold loop into
-                // iteration_costs_ns. IpcVariance never blocks;
-                // the cost variance across iterations is the
+                // Sample iteration cost (wall-clock duration of one
+                // compute iteration, including any scheduler
+                // preemption) covering the full hot+cold loop into
+                // iteration_costs_ns. IpcVariance never blocks; the
+                // cost variance across iterations is the
                 // load-bearing signal that distinguishes hot- vs
                 // cold-phase IPC under different schedulers.
+                //
+                // The `completed` flag gates reservoir_push: a
+                // truncated iteration (loop broke early via
+                // stop_requested) is not a full hot+cold cycle
+                // and would contaminate the reservoir with a
+                // shorter-than-real sample.
                 let iter_start = Instant::now();
+                let mut completed = true;
                 for _ in 0..period_iters {
                     if stop_requested(stop) {
+                        completed = false;
                         break;
                     }
                     // Hot phase: `hot_iters` of independent
@@ -9725,6 +9747,7 @@ fn worker_main(
                     // ALU phases are direct.
                     alu_hot_chain(AluWidth::Scalar, hot_iters, &mut work_units);
                     if stop_requested(stop) {
+                        completed = false;
                         break;
                     }
                     // Cold phase: `cold_iters` random cache-line
@@ -9748,12 +9771,14 @@ fn worker_main(
                         }
                     }
                 }
-                reservoir_push(
-                    &mut iteration_costs_ns,
-                    &mut iteration_cost_sample_count,
-                    iter_start.elapsed().as_nanos() as u64,
-                    MAX_WAKE_SAMPLES,
-                );
+                if completed {
+                    reservoir_push(
+                        &mut iteration_costs_ns,
+                        &mut iteration_cost_sample_count,
+                        iter_start.elapsed().as_nanos() as u64,
+                        MAX_WAKE_SAMPLES,
+                    );
+                }
                 iterations += 1;
             }
             WorkType::Custom { .. } => unreachable!("handled by early return"),
@@ -11708,8 +11733,12 @@ mod tests {
         };
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("scenario topology context"),
+            msg.contains("requires scenario context"),
             "diagnostic must point at the missing scenario context; got: {msg}",
+        );
+        assert!(
+            msg.contains("composed[0].affinity"),
+            "diagnostic must name the composed-entry site; got: {msg}",
         );
     }
 
@@ -18434,6 +18463,41 @@ mod tests {
         let reports = h.stop_and_collect();
         assert_eq!(reports.len(), 1);
         assert!(reports[0].iterations > 0, "AluHot Scalar worker must iterate: {:?}", reports[0]);
+    }
+
+    /// AluHot must populate `iteration_costs_ns` and bump
+    /// `iteration_cost_sample_total`. Pins the per-iteration
+    /// reservoir-sampling path so a regression that drops the
+    /// `reservoir_push` call (or wires the wrong counter) is
+    /// caught at the WorkerReport boundary, not just at the
+    /// downstream consumer. AluHot is the simplest of the three
+    /// pure-compute variants that populate the reservoir; if it
+    /// stops sampling, SmtSiblingSpin and IpcVariance almost
+    /// certainly stop too.
+    #[test]
+    fn pathology_alu_hot_populates_iteration_costs() {
+        let cfg = WorkloadConfig {
+            num_workers: 1,
+            work_type: WorkType::AluHot {
+                width: AluWidth::Scalar,
+            },
+            ..Default::default()
+        };
+        let mut h = WorkloadHandle::spawn(&cfg)
+            .expect("AluHot must spawn");
+        h.start();
+        std::thread::sleep(Duration::from_millis(200));
+        let reports = h.stop_and_collect();
+        assert_eq!(reports.len(), 1);
+        let r = &reports[0];
+        assert!(
+            !r.iteration_costs_ns.is_empty(),
+            "AluHot must populate iteration_costs_ns: {r:?}",
+        );
+        assert!(
+            r.iteration_cost_sample_total >= 1,
+            "AluHot must record at least one iteration-cost sample: {r:?}",
+        );
     }
 
     /// `WorkType::SmtSiblingSpin` smoke test. Pairs require
