@@ -3778,12 +3778,80 @@ fn join_worker_with_timeout(
 /// blocking further. See that function's docs for full outcome
 /// semantics and resource-retention notes, and `DROP_JOIN_TIMEOUT`
 /// for why the budget is set where it is.
+/// `Drop` quiesces the worker thread (production
+/// `WorkerEngine::Spawned` path) by writing the `stop_fd` and
+/// joining the thread with [`DROP_JOIN_TIMEOUT`] via
+/// [`join_worker_with_timeout`]. The match arms log
+/// per-outcome diagnostics — every error arm emits a structured
+/// `tracing` event so the operator can correlate a missing-VM
+/// teardown against the originating device.
+/// `JoinWithTimeoutOutcome::Joined` is silent (clean shutdown
+/// is not logged).
+///
+/// # Resource retention on `TimedOut`
+///
+/// When the worker join exceeds [`DROP_JOIN_TIMEOUT`] (the
+/// `JoinWithTimeoutOutcome::TimedOut` arm), the [`Drop`] returns
+/// without calling [`std::thread::JoinHandle::join`] — the
+/// helper thread is detached and the worker keeps running. Every
+/// `Arc` the worker holds remains live until the worker thread
+/// exits naturally (typically when its blocking syscall
+/// returns) and its captured state finally drops.
+///
+/// The retained Arcs are:
+/// - `Arc<Mutex<Option<GuestMemoryMmap>>>` (the `mem` field;
+///   cloned into `BlkWorkerState`). The guest memory mapping
+///   stays mapped on the host until the worker exits — the
+///   parent VM's teardown does NOT free guest memory at the
+///   `VirtioBlk::drop` site.
+/// - `Arc<EventFd>` (the IRQ eventfd, `irq_evt`). The eventfd's
+///   kernel object stays alive; the kvmfd irqfd binding the
+///   parent VM held does not unwind synchronously.
+/// - `Arc<AtomicU32>` (the `interrupt_status` register, used
+///   for the worker's release-store of `VIRTIO_MMIO_INT_VRING`).
+/// - `Arc<AtomicBool>` (the `mem_unset_warned` one-shot latch).
+/// - `Arc<VirtioBlkCounters>` (the per-device counter Arc the
+///   worker increments on each request).
+///
+/// Operationally: a wedged worker means the VM teardown returns
+/// to the caller (the calling thread is freed promptly, which is
+/// the [`DROP_JOIN_TIMEOUT`] mechanism's whole point — usually a
+/// vCPU thread that the freeze coordinator must not pin) but
+/// the per-device shared state stays mapped until the kernel
+/// eventually unblocks the worker. For long-lived host
+/// processes that build many VMs, this can accumulate retained
+/// memory; restart the host process to flush all leaked
+/// per-device state. Bug reports mentioning "host RSS keeps
+/// climbing across many ktstr test runs even though no VM is
+/// active" should investigate `tracing::warn!` lines from this
+/// arm to identify the wedged device(s).
 impl Drop for VirtioBlk {
     fn drop(&mut self) {
+        // Snapshot the device-identifier fields BEFORE the
+        // match so the per-arm logs can correlate the device
+        // across multiple concurrent VirtioBlk drops without
+        // borrowing `self` after the `&mut self.worker.engine`
+        // mutable borrow lands. None of the three are stable
+        // across host restarts (`stop_fd` recycles,
+        // `device_ptr` is the live address) but together they
+        // uniquely identify the device within this process
+        // run.
+        //
+        // The cfg(test) Inline arm doesn't consume these
+        // snapshots; the `let _ = (capacity_sectors, device_ptr);`
+        // reference inside that arm is what keeps cfg(test)
+        // builds free of `unused_variables` lints. (`stop_fd` is
+        // read inside the cfg(not(test)) Spawned arm directly,
+        // so it doesn't need the same dead-code dance.)
+        let capacity_sectors = self.capacity_sectors;
+        let device_ptr = self as *const _ as usize;
         match &mut self.worker.engine {
             #[cfg(test)]
             WorkerEngine::Inline(_) => {
                 // Default-drop the inline state when this fn returns.
+                // Reference the snapshot vars to avoid `unused`
+                // lints in cfg(test).
+                let _ = (capacity_sectors, device_ptr);
             }
             #[cfg(not(test))]
             WorkerEngine::Spawned(eng) => {
@@ -3792,6 +3860,10 @@ impl Drop for VirtioBlk {
                 // saturated) the worker is already in the act of
                 // being woken so a missed write is benign.
                 let _ = eng.stop_fd.write(1);
+                // The third device-identifier field (`stop_fd`
+                // raw fd) is only meaningful in the Spawned
+                // arm — Inline mode has no eventfd to name.
+                let stop_fd = eng.stop_fd.as_raw_fd();
                 if let Some(handle) = eng.handle.take() {
                     match join_worker_with_timeout(handle, DROP_JOIN_TIMEOUT) {
                         JoinWithTimeoutOutcome::Joined(_state) => {
@@ -3800,28 +3872,49 @@ impl Drop for VirtioBlk {
                         JoinWithTimeoutOutcome::Panicked(payload) => {
                             tracing::error!(
                                 panic = panic_payload_str(&*payload),
+                                stop_fd,
+                                capacity_sectors,
+                                device_ptr,
                                 "virtio-blk worker thread panicked"
                             );
                         }
                         JoinWithTimeoutOutcome::TimedOut => {
                             tracing::warn!(
                                 timeout_s = DROP_JOIN_TIMEOUT.as_secs_f32(),
+                                stop_fd,
+                                capacity_sectors,
+                                device_ptr,
                                 "virtio-blk worker did not exit within \
                                  DROP_JOIN_TIMEOUT of stop_fd; leaking \
                                  the worker thread to avoid blocking the \
                                  calling thread (likely a vCPU). Worker \
                                  is wedged in a blocking syscall that \
-                                 does not check stop_fd."
+                                 does not check stop_fd. \
+                                 hint: identify the wedged device by \
+                                 stop_fd / device_ptr / capacity_sectors \
+                                 above; per-device GuestMemoryMmap and \
+                                 EventFd Arcs stay live until the worker \
+                                 unblocks (see Drop's resource-retention \
+                                 doc). hint: kill -USR1 the host process \
+                                 to dump worker thread backtraces, OR \
+                                 check `dmesg` for the backing fd's \
+                                 storage path stalling on I/O."
                             );
                         }
                         JoinWithTimeoutOutcome::HelperSpawnFailed => {
                             tracing::error!(
+                                stop_fd,
+                                capacity_sectors,
+                                device_ptr,
                                 "virtio-blk drop helper thread spawn \
                                  failed; detaching worker without join"
                             );
                         }
                         JoinWithTimeoutOutcome::HelperDisconnected => {
                             tracing::error!(
+                                stop_fd,
+                                capacity_sectors,
+                                device_ptr,
                                 "virtio-blk drop helper thread \
                                  terminated without forwarding the \
                                  worker join result"
