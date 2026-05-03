@@ -1,10 +1,24 @@
 //! Disk configuration for virtio-blk devices.
 //!
-//! v0 creates a raw sparse backing file per test via `tempfile()` —
-//! the guest sees an unformatted block device at `/dev/vda`, and no
-//! mount happens. Filesystem formatting via a template VM and guest
-//! auto-mount at `/mnt/disk{N}` are deferred follow-ups; the
-//! [`Filesystem`] enum reserves API headroom for that work.
+//! [`Filesystem::Raw`] gives the guest an unformatted block device at
+//! `/dev/vda` (a fresh sparse `tempfile()` backing per test). No mount
+//! happens.
+//!
+//! [`Filesystem::Btrfs`] is the entry point for the disk-template
+//! lifecycle. v0: selecting it returns an actionable error from
+//! `init_virtio_blk` because the host-side template-VM driver is
+//! still stubbed (see the follow-up task referenced in
+//! [`crate::vmm::disk_template::build_template_via_vm`]). Once that
+//! driver lands, a one-time template VM will boot a sparse image of
+//! the requested capacity, the guest will run `mkfs.btrfs` against
+//! `/dev/vda`, the formatted image will be cached under the ktstr
+//! cache root, and per-test boots will reflink-copy that template
+//! via `FICLONE` so each per-test filesystem starts pre-formatted
+//! with zero host-side mkfs cost. The host never execs mkfs against
+//! a real backing file — the kernel's own mkfs (run inside the
+//! template VM) is the on-disk-format authority. See
+//! [`crate::vmm::disk_template`] for the cache primitives that
+//! ship today.
 //!
 //! `DiskConfig` is the descriptor — passed by value, copious
 //! defaults, no path field (the framework owns the per-test backing
@@ -14,15 +28,48 @@ use std::num::NonZeroU64;
 
 /// Filesystem to format the backing file with.
 ///
-/// Reserved for future variants; v0 is always Raw. `Raw` matches the
-/// actual on-disk state: no formatting happens, the guest sees
-/// `/dev/vda` as a raw unformatted block device.
+/// `Raw` matches the actual on-disk state: no formatting happens, the
+/// guest sees `/dev/vda` as a raw unformatted block device.
+///
+/// `Btrfs` activates the template-cache lifecycle (see module docs).
+/// Selecting it requires the ktstr cache directory to live on a
+/// reflink-capable filesystem (btrfs or xfs) — the per-test fan-out
+/// uses `FICLONE` to clone the cached template image and would fail
+/// on tmpfs/ext4. The host must also have `mkfs.btrfs` on `PATH` at
+/// template-build time so the template-VM initramfs can pack it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Filesystem {
-    /// No filesystem; raw block device. v0 always behaves this way.
+    /// No filesystem; raw block device. The guest sees `/dev/vda` as
+    /// an unformatted volume of the configured capacity. Default.
     #[default]
     Raw,
+    /// btrfs filesystem. Once the template-VM driver lands, per-test
+    /// backing will be a reflink clone of a host-cached,
+    /// guest-formatted btrfs image at the configured capacity; the
+    /// cache lives under the ktstr cache root and requires a
+    /// btrfs/xfs mount, and `mkfs.btrfs` must be on the host `PATH`
+    /// at template-build time. v0: selecting `Btrfs` returns an
+    /// actionable error from `init_virtio_blk` until the driver
+    /// referenced by
+    /// [`crate::vmm::disk_template::build_template_via_vm`] lands.
+    /// See [`crate::vmm::disk_template`].
+    Btrfs,
+}
+
+impl Filesystem {
+    /// Short identifier used in cache keys and diagnostics. The
+    /// values are intentionally short (≤8 chars), kebab-free, and
+    /// stable across rebuilds — they participate in on-disk cache
+    /// path names, so renaming a variant invalidates already-cached
+    /// templates. New variants must add a new tag rather than
+    /// reusing one.
+    pub(crate) fn cache_tag(self) -> &'static str {
+        match self {
+            Filesystem::Raw => "raw",
+            Filesystem::Btrfs => "btrfs",
+        }
+    }
 }
 
 /// IO throttle for one disk. Each field caps a separate dimension;
@@ -104,6 +151,24 @@ impl DiskConfig {
         self
     }
 
+    /// Select the on-disk filesystem.
+    ///
+    /// `Filesystem::Raw` (the default) leaves the device unformatted.
+    /// v0: selecting `Filesystem::Btrfs` returns an actionable error
+    /// at VM build time because the host-side template-VM driver is
+    /// stubbed (see [`crate::vmm::disk_template::build_template_via_vm`]).
+    /// Once that driver lands, the framework will boot a one-shot
+    /// template VM, run `mkfs.btrfs` inside the guest, cache the
+    /// formatted image, and per-test reflink-clone it; the
+    /// lifecycle will require a reflink-capable cache directory
+    /// (btrfs or xfs) and a host `mkfs.btrfs` binary on `PATH` at
+    /// template-build time. See the module-level docs and
+    /// [`crate::vmm::disk_template`].
+    pub fn filesystem(mut self, fs: Filesystem) -> Self {
+        self.filesystem = fs;
+        self
+    }
+
     /// Set IOPS throttle. Passing 0 disables IOPS throttling
     /// (equivalent to `None`). To throttle near-zero, use `iops(1)`.
     /// There is no "block all IO" mode — the minimum throttled rate
@@ -179,6 +244,15 @@ mod tests {
     }
 
     #[test]
+    fn filesystem_builder_sets_variant() {
+        let d = DiskConfig::default().filesystem(Filesystem::Btrfs);
+        assert_eq!(d.filesystem, Filesystem::Btrfs);
+        // Builder is overwriting (not OR-ing) — last call wins.
+        let d = d.filesystem(Filesystem::Raw);
+        assert_eq!(d.filesystem, Filesystem::Raw);
+    }
+
+    #[test]
     fn builder_chain() {
         let d = DiskConfig::default()
             .capacity_mb(128)
@@ -217,6 +291,25 @@ mod tests {
     #[test]
     fn filesystem_serde_snake_case() {
         assert_eq!(serde_json::to_string(&Filesystem::Raw).unwrap(), r#""raw""#);
+        assert_eq!(serde_json::to_string(&Filesystem::Btrfs).unwrap(), r#""btrfs""#);
+        let parsed: Filesystem = serde_json::from_str(r#""raw""#).unwrap();
+        assert_eq!(parsed, Filesystem::Raw);
+        let parsed: Filesystem = serde_json::from_str(r#""btrfs""#).unwrap();
+        assert_eq!(parsed, Filesystem::Btrfs);
+    }
+
+    #[test]
+    fn filesystem_cache_tag_round_trips_serde_name() {
+        // The cache_tag is the on-disk identifier used in the
+        // template-cache key. Pinning that it matches the serde
+        // serialization keeps the two name spaces aligned — a future
+        // `#[serde(rename = "...")]` change must update cache_tag in
+        // lock-step or the cache stops finding old entries.
+        for fs in [Filesystem::Raw, Filesystem::Btrfs] {
+            let json = serde_json::to_string(&fs).unwrap();
+            let stripped = json.trim_matches('"');
+            assert_eq!(fs.cache_tag(), stripped, "cache_tag drift for {fs:?}");
+        }
     }
 
     #[test]

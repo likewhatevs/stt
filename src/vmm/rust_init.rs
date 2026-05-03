@@ -188,6 +188,37 @@ pub(crate) fn ktstr_guest_init() -> ! {
         std::env::set_var("KTSTR_GUEST_INIT", "1");
     }
 
+    // Disk-template build mode: format /dev/vda with the embedded
+    // mkfs binary, then reboot. No scheduler load, no test dispatch,
+    // no shell. Must run before shell_mode_requested() so a future
+    // operator-facing shell command cannot accidentally trip the
+    // template path. See [`crate::vmm::disk_template`] for the host
+    // side that drives this mode.
+    if disk_template_mode_requested() {
+        let _span = tracing::debug_span!("disk_template_mode").entered();
+        let code = run_disk_template_mode();
+        // Match the post-test exit semantics: drain stdout/stderr,
+        // emit the exit sentinel on COM2 so the host knows we're
+        // done, reboot.
+        let _ = std::io::stdout().flush();
+        let _ = std::io::stderr().flush();
+        unsafe {
+            libc::tcdrain(1);
+            libc::tcdrain(2);
+        }
+        write_com2(&format!(
+            "{prefix}{code}",
+            prefix = crate::test_support::SENTINEL_EXIT_PREFIX,
+        ));
+        if let Ok(com2) = fs::OpenOptions::new().write(true).open(COM2) {
+            unsafe {
+                libc::tcdrain(com2.as_raw_fd());
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        force_reboot();
+    }
+
     // Shell mode: interactive busybox shell instead of test dispatch.
     if shell_mode_requested() {
         let _shell_span = tracing::debug_span!("shell_mode").entered();
@@ -486,8 +517,71 @@ fn redirect_stdio_to_com2() {
 /// Check kernel cmdline for KTSTR_MODE=shell.
 fn shell_mode_requested() -> bool {
     fs::read_to_string("/proc/cmdline")
-        .map(|c| c.split_whitespace().any(|s| s == "KTSTR_MODE=shell"))
+        .map(|c| cmdline_contains_token(&c, "KTSTR_MODE=shell"))
         .unwrap_or(false)
+}
+
+/// Check kernel cmdline for `KTSTR_MODE=disk_template`. The host
+/// asserts this when booting a one-shot template-build VM (see
+/// [`crate::vmm::disk_template`]).
+fn disk_template_mode_requested() -> bool {
+    fs::read_to_string("/proc/cmdline")
+        .map(|c| cmdline_contains_token(&c, "KTSTR_MODE=disk_template"))
+        .unwrap_or(false)
+}
+
+/// Pure-function cmdline-token check, factored out of
+/// [`shell_mode_requested`] / [`disk_template_mode_requested`] so
+/// the precedence-and-multiplicity behavior can be tested without
+/// mocking `/proc/cmdline`. Whitespace-separated, exact match (the
+/// kernel passes cmdline tokens verbatim — no quoting, no escapes).
+fn cmdline_contains_token(cmdline: &str, token: &str) -> bool {
+    cmdline.split_whitespace().any(|s| s == token)
+}
+
+/// Disk-template build dispatch: exec `/bin/mkfs.btrfs /dev/vda`
+/// (the host packed `mkfs.btrfs` into the initramfs at this path),
+/// wait for it, return its exit code so the caller emits the exit
+/// sentinel on COM2 before rebooting. Returns `0` on success and
+/// the binary's exit code (or `1` on spawn failure) otherwise.
+///
+/// The disk image at `/dev/vda` is the host-side staging file
+/// (sparse, sized to the requested capacity); after this function
+/// returns and the VM reboots, the host's [`crate::vmm::disk_template::store_atomic`]
+/// publishes the now-formatted image into the cache.
+///
+/// This dispatch matches the constraint stated in the project
+/// CLAUDE.md "disk template lifecycle" section: the kernel's own
+/// mkfs (driven by the userspace `mkfs.btrfs` binary running
+/// inside the guest) is the on-disk-format authority. The host
+/// never execs mkfs against a real backing file.
+fn run_disk_template_mode() -> i32 {
+    redirect_stdio_to_com2();
+    // The mkfs.btrfs binary is packed at `bin/mkfs.btrfs` by
+    // [`crate::vmm::disk_template::ensure_template`] when it
+    // assembles the template-VM initramfs.
+    const MKFS: &str = "/bin/mkfs.btrfs";
+    // `-f` forces overwrite of any existing signature so a leftover
+    // ext4 magic from a host that recycled the staging file does
+    // not block formatting. `--quiet` keeps the COM2 transcript
+    // small. `/dev/vda` is the singleton virtio-blk device the
+    // host attached.
+    //
+    // No `--metadata DUP` override: btrfs picks DUP metadata by
+    // default on a single-device fs, which is the desired
+    // production format. The 256 MB minimum capacity (see
+    // VIRTIO_BLK_DEFAULT_CAPACITY_BYTES doc) accommodates DUP.
+    tracing::info!(mkfs = MKFS, target = "/dev/vda", "running mkfs.btrfs");
+    let status = Command::new(MKFS)
+        .args(["-f", "--quiet", "/dev/vda"])
+        .status();
+    match status {
+        Ok(s) => s.code().unwrap_or(1),
+        Err(e) => {
+            eprintln!("ktstr-init: failed to spawn {MKFS}: {e}");
+            1
+        }
+    }
 }
 
 /// Read /exec_cmd from the initramfs if present.
@@ -1618,6 +1712,64 @@ mod tests {
     fn shell_mode_not_requested_in_test() {
         // /proc/cmdline exists on the host but won't contain KTSTR_MODE=shell.
         assert!(!shell_mode_requested());
+    }
+
+    #[test]
+    fn disk_template_mode_not_requested_in_test() {
+        // /proc/cmdline on the host won't contain KTSTR_MODE=disk_template.
+        assert!(!disk_template_mode_requested());
+    }
+
+    #[test]
+    fn disk_template_dispatch_precedes_shell_when_both_present() {
+        // The dispatch order in `ktstr_guest_init` is:
+        //   1. disk_template_mode_requested → run mkfs + reboot, never returns
+        //   2. shell_mode_requested → drop into busybox shell
+        //   3. test dispatch
+        //
+        // If both KTSTR_MODE entries appear in /proc/cmdline (e.g.
+        // operator typo, host-side cmdline-construction bug), the
+        // disk_template path MUST win — running shell mode against
+        // a disk that the operator intended to format would skip
+        // the formatting step silently. Pin the token-parser
+        // semantics so a future refactor that changes the matching
+        // logic (regex, prefix-only, or per-token last-wins) does
+        // not silently invert the precedence.
+        let cmdline = "ro KTSTR_MODE=disk_template KTSTR_MODE=shell console=ttyS0";
+        // Both checks see their token in the cmdline.
+        assert!(cmdline_contains_token(cmdline, "KTSTR_MODE=disk_template"));
+        assert!(cmdline_contains_token(cmdline, "KTSTR_MODE=shell"));
+        // The dispatch order in ktstr_guest_init runs the
+        // disk_template check FIRST, so the disk_template path is
+        // taken and the shell branch is never reached. This test
+        // pins the token-parser invariant; the dispatch-order
+        // invariant lives in the code at ktstr_guest_init's
+        // disk-template-mode block.
+        //
+        // Reverse-token order produces the same result — the
+        // checks are commutative and dispatch-order is the only
+        // disambiguator.
+        let cmdline_reversed =
+            "ro KTSTR_MODE=shell KTSTR_MODE=disk_template console=ttyS0";
+        assert!(cmdline_contains_token(cmdline_reversed, "KTSTR_MODE=disk_template"));
+        assert!(cmdline_contains_token(cmdline_reversed, "KTSTR_MODE=shell"));
+    }
+
+    #[test]
+    fn cmdline_contains_token_exact_match_not_prefix() {
+        // Matching is whole-token, not prefix. A future kernel
+        // cmdline that introduces e.g. `KTSTR_MODE=shell_extended`
+        // must not accidentally trip the shell-mode dispatch.
+        assert!(cmdline_contains_token("KTSTR_MODE=shell", "KTSTR_MODE=shell"));
+        assert!(!cmdline_contains_token(
+            "KTSTR_MODE=shell_extended",
+            "KTSTR_MODE=shell"
+        ));
+        assert!(!cmdline_contains_token(
+            "prefix_KTSTR_MODE=shell",
+            "KTSTR_MODE=shell"
+        ));
+        assert!(!cmdline_contains_token("", "KTSTR_MODE=shell"));
     }
 
     #[test]

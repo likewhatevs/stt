@@ -28,6 +28,7 @@ mod terminal;
 pub mod topology;
 mod vcpu_panic;
 pub mod disk_config;
+pub(crate) mod disk_template;
 pub(crate) mod virtio_blk;
 pub(crate) mod virtio_console;
 mod vmlinux;
@@ -2490,26 +2491,96 @@ impl KtstrVm {
             return Ok(None);
         }
         let disk = &self.disks[0];
-
-        // Allocate a sparse tempfile as the backing. The proper
-        // path is the template-VM lifecycle (one-time guest-side
-        // mkfs.btrfs against a sparse image, snapshot, cache
-        // alongside kernel; per-test reflink-copy at fan-out — see
-        // disk_config.rs module doc). That pipeline wires into
-        // cargo-ktstr's kernel build path and is a deferred
-        // follow-up. Until it lands, every test gets a fresh empty
-        // sparse file. `tempfile::tempfile()` returns a File whose
-        // underlying path is unlinked at creation — the kernel
-        // reclaims storage when the device drops the File.
-        let backing =
-            tempfile::tempfile().context("create virtio-blk sparse temp backing file")?;
-        // Make sure the file covers the advertised capacity. set_len
-        // creates a sparse file: holes don't consume disk space until
-        // written.
         let capacity = disk.capacity_bytes();
-        backing
-            .set_len(capacity)
-            .context("set virtio-blk backing file length")?;
+
+        // Per-test backing-file allocation forks on the configured
+        // [`disk_config::Filesystem`]:
+        //
+        //  - `Raw`: anonymous sparse `tempfile()`. The kernel
+        //    reclaims storage when the device drops the File. No
+        //    cache, no FICLONE.
+        //
+        //  - `Btrfs`: builder wired, VM driver stubbed —
+        //    [`disk_template::ensure_template`] returns an actionable
+        //    error today and Btrfs disks fail at this point with the
+        //    diagnostic from
+        //    [`disk_template::build_template_via_vm`] until the
+        //    follow-up driver wiring lands. Once that driver lands,
+        //    this branch will FICLONE-clone the host-cached,
+        //    guest-formatted template into a per-test tempfile under
+        //    the cache root (so FICLONE source and dest share a
+        //    filesystem), unlink the dest immediately after open so
+        //    the device sees the same anonymous-file semantics as
+        //    the `Raw` path, and hand the open `File` to the
+        //    `VirtioBlk` device. See [`crate::vmm::disk_template`]
+        //    module docs.
+        let backing = match disk.filesystem {
+            disk_config::Filesystem::Raw => {
+                let f =
+                    tempfile::tempfile().context("create virtio-blk sparse temp backing file")?;
+                // Make sure the file covers the advertised capacity.
+                // set_len creates a sparse file: holes don't consume
+                // disk space until written.
+                f.set_len(capacity)
+                    .context("set virtio-blk backing file length")?;
+                f
+            }
+            disk_config::Filesystem::Btrfs => {
+                let template = disk_template::ensure_template(
+                    disk_config::Filesystem::Btrfs,
+                    capacity,
+                )
+                .context("ensure btrfs disk template")?;
+                let cache_root = disk_template::cache_root()
+                    .context("resolve disk-template cache root for per-test clone")?;
+                std::fs::create_dir_all(&cache_root)
+                    .with_context(|| format!("create cache root {cache_root:?}"))?;
+                // Generate a unique per-test path under the cache
+                // root. Use pid + timestamp_ns + random_u64 so
+                // concurrent tests in the same process and across
+                // processes never collide.
+                let dest = cache_root.join(format!(
+                    ".per-test-{pid}-{ns:x}-{rnd:x}.img",
+                    pid = std::process::id(),
+                    ns = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos())
+                        .unwrap_or(0),
+                    rnd = rand::random::<u64>(),
+                ));
+                let f = disk_template::clone_to_per_test(&template, &dest)
+                    .context("FICLONE template into per-test backing")?;
+                // Unlink the dest path immediately. The open File
+                // keeps the inode alive for the device's lifetime;
+                // the kernel reclaims storage on drop, matching the
+                // `tempfile()` semantics of the Raw branch.
+                //
+                // If the unlink fails (very rare — ENOENT means a
+                // peer beat us to it, EACCES means the operator's
+                // cache permissions are broken, EBUSY can come from
+                // some FUSE backings), we keep the open File and
+                // warn — the device still works on the open fd, the
+                // only consequence is a stale path on disk that the
+                // next cache GC sweeps. Do NOT propagate the error,
+                // because the device's per-test backing is already
+                // valid and aborting VM init would be a regression
+                // versus the Raw branch where `tempfile::tempfile()`
+                // returns an already-unlinked file with no failure
+                // mode.
+                if let Err(e) = std::fs::remove_file(&dest) {
+                    tracing::warn!(
+                        path = %dest.display(),
+                        error = %e,
+                        "failed to unlink per-test btrfs backing after \
+                         FICLONE; the open File still backs the device, \
+                         but the leftover path will accumulate in the \
+                         cache directory until manual cleanup or the \
+                         next disk-template cache GC pass."
+                    );
+                }
+                f
+            }
+        };
 
         let mut blk =
             virtio_blk::VirtioBlk::with_options(backing, capacity, disk.throttle, disk.read_only);
