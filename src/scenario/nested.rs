@@ -141,7 +141,10 @@ pub fn custom_nested_cgroup_imbalance(ctx: &Ctx) -> Result<AssertResult> {
                 CgroupDef::named("cg_0/sub_a").workers(8),
                 CgroupDef::named("cg_1/sub_b")
                     .workers(2)
-                    .work_type(WorkType::bursty(50, 100)),
+                    .work_type(WorkType::bursty(
+                        Duration::from_millis(50),
+                        Duration::from_millis(100),
+                    )),
             ],
             HoldSpec::Fixed(ctx.settle + ctx.duration),
         )

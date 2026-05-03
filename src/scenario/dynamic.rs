@@ -132,7 +132,10 @@ pub fn custom_cgroup_add_during_imbalance(ctx: &Ctx) -> Result<AssertResult> {
         CgroupDef::named("cg_0").workers(8),
         CgroupDef::named("cg_1")
             .workers(2)
-            .work_type(WorkType::bursty(50, 100)),
+            .work_type(WorkType::bursty(
+                Duration::from_millis(50),
+                Duration::from_millis(100),
+            )),
     ]);
     let steps = vec![
         // Phase 1: settle with cg_0 and cg_1 alone.

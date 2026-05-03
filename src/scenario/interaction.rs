@@ -46,7 +46,10 @@ pub fn custom_cgroup_imbalance_mixed_workload(ctx: &Ctx) -> Result<AssertResult>
             CgroupDef::named("cg_0").workers(8),
             CgroupDef::named("cg_1")
                 .workers(ctx.workers_per_cgroup)
-                .work_type(WorkType::bursty(100, 50)),
+                .work_type(WorkType::bursty(
+                    Duration::from_millis(100),
+                    Duration::from_millis(50),
+                )),
             CgroupDef::named("cg_2")
                 .workers(ctx.workers_per_cgroup)
                 .work_type(WorkType::IoSyncWrite),
@@ -125,7 +128,10 @@ pub fn custom_cgroup_cpuset_imbalance_combined(ctx: &Ctx) -> Result<AssertResult
             CgroupDef::named("cg_1")
                 .with_cpuset(CpusetSpec::disjoint(1, 2))
                 .workers(2)
-                .work_type(WorkType::bursty(50, 150)),
+                .work_type(WorkType::bursty(
+                    Duration::from_millis(50),
+                    Duration::from_millis(150),
+                )),
         ],
         HoldSpec::Fixed(ctx.settle + ctx.duration),
     )];
@@ -148,7 +154,10 @@ pub fn custom_cgroup_cpuset_overlap_imbalance_combined(ctx: &Ctx) -> Result<Asse
             CgroupDef::named("cg_1")
                 .with_cpuset(CpusetSpec::Exact(sets[1].clone()))
                 .workers(2)
-                .work_type(WorkType::bursty(50, 100)),
+                .work_type(WorkType::bursty(
+                    Duration::from_millis(50),
+                    Duration::from_millis(100),
+                )),
             CgroupDef::named("cg_2")
                 .with_cpuset(CpusetSpec::Exact(sets[2].clone()))
                 .workers(1)
@@ -224,7 +233,10 @@ pub fn custom_cgroup_no_ctrl_imbalance(ctx: &Ctx) -> Result<AssertResult> {
         .with_cgroup(
             CgroupDef::named("cg_light")
                 .workers(2)
-                .work_type(WorkType::bursty(50, 100)),
+                .work_type(WorkType::bursty(
+                    Duration::from_millis(50),
+                    Duration::from_millis(100),
+                )),
         )
         .with_op(Op::add_cgroup("cg_overflow"));
 

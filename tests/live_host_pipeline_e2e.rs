@@ -25,6 +25,8 @@
 //!
 //! No VM boot, no kernel, no scx attach — pure library-level.
 
+use std::time::Duration;
+
 use ktstr::fun::{Funifier, funify_json};
 use ktstr::live_host::{
     AffinityHint, CgroupHint, DebugCapture, ScxExitKind, SchedPolicyHint, WorkTypeHint,
@@ -118,7 +120,10 @@ fn live_host_pipeline_e2e_kmsg_to_reproducer_spec_to_source() {
     capture.fingerprint.workload_groups = vec![wg];
     capture.fingerprint.affinity_hints = vec![AffinityHint::Exact { cpus: vec![0, 1, 2, 3] }];
     capture.fingerprint.work_type_hints = vec![
-        WorkTypeHint::Bursty { burst_ms: 10, sleep_ms: 90 },
+        WorkTypeHint::Bursty {
+            burst_duration: Duration::from_millis(10),
+            sleep_duration: Duration::from_millis(90),
+        },
         WorkTypeHint::SpinWait, // secondary hint should land in notes
     ];
     let mut cg = CgroupHint::default();

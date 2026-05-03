@@ -68,9 +68,12 @@
 //! granularity for any of those filters to compose without forcing
 //! a pre-baked aggregate menu.
 
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 
 use super::dump::FailureDumpReport;
+use crate::workload::humantime_serde_helper;
 
 /// One end-to-end debug capture record.
 ///
@@ -260,7 +263,8 @@ pub enum AffinityHint {
 /// The hint records the primary signal (CPU-bound vs IO-bound vs
 /// futex / pipe wake patterns) and lets the reproducer generator
 /// choose a parameterized variant (e.g. `WorkType::Bursty` with
-/// burst_ms/sleep_ms picked from the hint's window measurement).
+/// `burst_duration` / `sleep_duration` picked from the hint's window
+/// measurement).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 #[serde(tag = "kind")]
@@ -275,8 +279,14 @@ pub enum WorkTypeHint {
     /// Mixed CPU + yield pattern. `WorkType::Mixed`.
     Mixed,
     /// CPU bursts followed by long sleeps. Maps to
-    /// `WorkType::Bursty` with measured `burst_ms` / `sleep_ms`.
-    Bursty { burst_ms: u64, sleep_ms: u64 },
+    /// `WorkType::Bursty` with measured `burst_duration` /
+    /// `sleep_duration`.
+    Bursty {
+        #[serde(with = "humantime_serde_helper")]
+        burst_duration: Duration,
+        #[serde(with = "humantime_serde_helper")]
+        sleep_duration: Duration,
+    },
     /// Pipe-mediated wake exchanges. Maps to `WorkType::PipeIo`.
     /// Detected by `read`/`write` syscall pattern + paired tids.
     PipeIo,
@@ -660,7 +670,10 @@ mod tests {
             ],
             work_type_hints: vec![
                 WorkTypeHint::SpinWait,
-                WorkTypeHint::Bursty { burst_ms: 10, sleep_ms: 90 },
+                WorkTypeHint::Bursty {
+                    burst_duration: Duration::from_millis(10),
+                    sleep_duration: Duration::from_millis(90),
+                },
             ],
             cgroup_hints: vec![CgroupHint {
                 path: "/system.slice/foo.service".into(),

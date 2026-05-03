@@ -4522,7 +4522,10 @@ mod tests {
         let d = CgroupDef::named("test")
             .with_cpuset(CpusetSpec::llc(0))
             .workers(8)
-            .work_type(WorkType::bursty(50, 100))
+            .work_type(WorkType::bursty(
+                Duration::from_millis(50),
+                Duration::from_millis(100),
+            ))
             .sched_policy(crate::workload::SchedPolicy::Batch)
             .swappable(true);
         assert_eq!(d.name, "test");

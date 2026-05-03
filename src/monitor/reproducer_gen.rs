@@ -36,7 +36,7 @@
 //! | WorkTypeHint::SpinWait         | WorkType::SpinWait                       |
 //! | WorkTypeHint::YieldHeavy      | WorkType::YieldHeavy                    |
 //! | WorkTypeHint::Mixed           | WorkType::Mixed                         |
-//! | WorkTypeHint::Bursty{b,s}     | WorkType::Bursty { burst_ms, sleep_ms } |
+//! | WorkTypeHint::Bursty{b,s}     | WorkType::Bursty { burst_duration: b, sleep_duration: s } |
 //! | WorkTypeHint::PipeIo          | WorkType::PipeIo { burst_iters: 1024 }  |
 //! | WorkTypeHint::FutexPingPong   | WorkType::FutexPingPong { spin_iters: 1024 } |
 //! | WorkTypeHint::CachePressure   | WorkType::CachePressure { size_kb, stride } |
@@ -280,9 +280,12 @@ fn map_work_type(fp: &WorkloadFingerprint, spec: &mut ReproducerSpec) {
         WorkTypeHint::SpinWait => WorkType::SpinWait,
         WorkTypeHint::YieldHeavy => WorkType::YieldHeavy,
         WorkTypeHint::Mixed => WorkType::Mixed,
-        WorkTypeHint::Bursty { burst_ms, sleep_ms } => WorkType::Bursty {
-            burst_ms: *burst_ms,
-            sleep_ms: *sleep_ms,
+        WorkTypeHint::Bursty {
+            burst_duration,
+            sleep_duration,
+        } => WorkType::Bursty {
+            burst_duration: *burst_duration,
+            sleep_duration: *sleep_duration,
         },
         WorkTypeHint::PipeIo => WorkType::PipeIo { burst_iters: 1024 },
         WorkTypeHint::FutexPingPong => WorkType::FutexPingPong { spin_iters: 1024 },
@@ -487,8 +490,16 @@ fn render_work_type(w: &WorkType) -> String {
         WorkType::IoSyncWrite => "WorkType::IoSyncWrite".into(),
         WorkType::IoRandRead => "WorkType::IoRandRead".into(),
         WorkType::IoConvoy => "WorkType::IoConvoy".into(),
-        WorkType::Bursty { burst_ms, sleep_ms } => format!(
-            "WorkType::Bursty {{ burst_ms: {burst_ms}, sleep_ms: {sleep_ms} }}"
+        WorkType::Bursty {
+            burst_duration,
+            sleep_duration,
+        } => format!(
+            "WorkType::Bursty {{ \
+             burst_duration: Duration::from_millis({}), \
+             sleep_duration: Duration::from_millis({}) \
+             }}",
+            burst_duration.as_millis(),
+            sleep_duration.as_millis(),
         ),
         WorkType::PipeIo { burst_iters } => {
             format!("WorkType::PipeIo {{ burst_iters: {burst_iters} }}")
@@ -576,19 +587,24 @@ mod tests {
         }
     }
 
-    /// WorkTypeHint::Bursty{b,s} → WorkType::Bursty{b,s} pass-through.
+    /// `WorkTypeHint::Bursty {burst_duration, sleep_duration}`
+    /// passes its `Duration` fields straight through to
+    /// `WorkType::Bursty` in the hint→work-type mapping.
     #[test]
     fn generate_spec_bursty_passthrough() {
         let mut cap = DebugCapture::default();
         cap.fingerprint.work_type_hints = vec![WorkTypeHint::Bursty {
-            burst_ms: 5,
-            sleep_ms: 95,
+            burst_duration: Duration::from_millis(5),
+            sleep_duration: Duration::from_millis(95),
         }];
         let spec = generate_spec(&cap);
         match spec.config.work_type {
-            WorkType::Bursty { burst_ms, sleep_ms } => {
-                assert_eq!(burst_ms, 5);
-                assert_eq!(sleep_ms, 95);
+            WorkType::Bursty {
+                burst_duration,
+                sleep_duration,
+            } => {
+                assert_eq!(burst_duration, Duration::from_millis(5));
+                assert_eq!(sleep_duration, Duration::from_millis(95));
             }
             other => panic!("expected Bursty, got {other:?}"),
         }

@@ -103,7 +103,7 @@ compile_error!(
 /// Reuses the [`humantime`] crate already pulled in for CLI flag
 /// parsing — no new dependency. Use via `#[serde(with =
 /// "humantime_serde_helper")]` on `Duration` fields.
-mod humantime_serde_helper {
+pub(crate) mod humantime_serde_helper {
     use std::time::Duration;
 
     pub fn serialize<S: serde::Serializer>(d: &Duration, s: S) -> Result<S::Ok, S::Error> {
@@ -256,7 +256,10 @@ pub enum Phase {
 /// let wt = WorkType::from_name("SpinWait").unwrap();
 /// assert!(matches!(wt, WorkType::SpinWait));
 ///
-/// let bursty = WorkType::bursty(10, 5);
+/// let bursty = WorkType::bursty(
+///     std::time::Duration::from_millis(10),
+///     std::time::Duration::from_millis(5),
+/// );
 /// assert!(matches!(bursty, WorkType::Bursty { .. }));
 ///
 /// assert!(WorkType::from_name("nonexistent").is_none());
@@ -337,8 +340,23 @@ pub enum WorkType {
     /// follow-up tracked in the project queue for the buffered-IO
     /// variant.
     IoConvoy,
-    /// Work hard for burst_ms, sleep for sleep_ms, repeat. Frees CPUs during sleep for borrowing.
-    Bursty { burst_ms: u64, sleep_ms: u64 },
+    /// Work hard for `burst_duration`, sleep for `sleep_duration`,
+    /// repeat. Frees CPUs during sleep for borrowing. Both fields
+    /// use [`Duration`] (humantime-serialised) so call sites and
+    /// captured configs carry units explicitly, matching
+    /// [`WakeChain`](Self::WakeChain) and
+    /// [`IdleChurn`](Self::IdleChurn).
+    Bursty {
+        /// Wall-clock duration of CPU work between sleeps.
+        /// Default 50ms (see [`defaults::BURSTY_BURST_DURATION`]).
+        #[serde(with = "humantime_serde_helper")]
+        burst_duration: Duration,
+        /// Wall-clock duration of each sleep period; the worker
+        /// off-CPUs via `thread::sleep`. Default 100ms (see
+        /// [`defaults::BURSTY_SLEEP_DURATION`]).
+        #[serde(with = "humantime_serde_helper")]
+        sleep_duration: Duration,
+    },
     /// CPU burst then 1-byte pipe exchange with a partner worker. Sleep
     /// duration depends on partner scheduling, exercising cross-CPU wake
     /// placement. Requires even num_workers; workers are paired (0,1), (2,3), etc.
@@ -1107,12 +1125,18 @@ pub enum WorkType {
     ///   (`kernel/sched/syscalls.c:258`), so RT IdleChurn workers
     ///   get exact wake timing. CFS / SCHED_NORMAL workers
     ///   inherit the 50µs default.
-    /// - IdleChurn does NOT call `PR_SET_TIMERSLACK` — the
-    ///   inherited 50µs default applies. Tests that need tighter
-    ///   wake timing on a CFS worker must set `PR_SET_TIMERSLACK`
-    ///   post-fork in a [`Custom`](Self::Custom) closure (or wait
-    ///   for a future IdleChurn extension), or run the worker
-    ///   under an RT policy.
+    /// - IdleChurn calls `prctl(PR_SET_TIMERSLACK, 1)` ONLY when
+    ///   the variant's
+    ///   [`precise_timing`](Self::IdleChurn::precise_timing)
+    ///   field is `true`. The default is `false`, preserving the
+    ///   inherited 50µs slack for CFS workers. Set
+    ///   `precise_timing: true` (or use the struct-literal form
+    ///   directly — the [`idle_churn`](Self::idle_churn)
+    ///   constructor leaves the field at its default) to shrink
+    ///   slack to 1ns for sub-50µs `sleep_duration` measurements.
+    ///   See the field's doc for the kernel-source citation that
+    ///   explains why `1` (not `0`) is the value that narrows
+    ///   slack.
     ///
     /// # Tick-stop boundary
     ///
@@ -1353,6 +1377,49 @@ pub enum WorkType {
         /// tick-stop / C-state entry.
         #[serde(with = "humantime_serde_helper")]
         sleep_duration: Duration,
+        /// Opt-in: shrink `current->timer_slack_ns` from the
+        /// inherited 50µs default to 1ns at worker entry via
+        /// `prctl(PR_SET_TIMERSLACK, 1)`. Default `false` so
+        /// existing callers see the inherited slack the variant
+        /// doc describes.
+        ///
+        /// When `true`, the IdleChurn dispatch arm calls
+        /// `prctl(PR_SET_TIMERSLACK, 1)` once before the work
+        /// loop. The kernel's PR_SET_TIMERSLACK arm at
+        /// `kernel/sys.c:2645` sets `current->timer_slack_ns =
+        /// arg2` when `arg2 > 0`; passing `0` is a RESET to
+        /// `default_timer_slack_ns` (the inherited 50µs), so
+        /// `1` is the smallest value that actually shrinks the
+        /// slack. After the call, `hrtimer_nanosleep`
+        /// (`kernel/time/hrtimer.c:2162-2188`) coalesces
+        /// expiries within a 1ns window instead of the default
+        /// 50µs, exposing the scheduler's true wake-resume
+        /// latency for sub-100µs `sleep_duration` values.
+        ///
+        /// This setting is most useful when the test measures
+        /// wake-latency distributions for sub-50µs sleeps,
+        /// where the inherited slack would otherwise dominate
+        /// the observed sleep time. For `sleep_duration` ≥ 1ms
+        /// the slack contribution is < 5% noise and
+        /// `precise_timing=true` makes no observable
+        /// difference.
+        ///
+        /// **RT/DL workers ignore this setting.** The kernel
+        /// guard at `kernel/sys.c:2646`
+        /// (`if (rt_or_dl_task_policy(current)) break;`)
+        /// makes `prctl(PR_SET_TIMERSLACK, ...)` a no-op for
+        /// RT/DL tasks; their slack is independently forced to
+        /// 0 at sched-class entry by
+        /// `kernel/sched/syscalls.c:258`. Setting
+        /// `precise_timing=true` for an RT IdleChurn worker is
+        /// harmless but redundant.
+        ///
+        /// Field defaults to `false` so existing
+        /// [`from_name("IdleChurn")`](Self::from_name) callers
+        /// see the historical (inherited-slack) behaviour. Opt
+        /// in via the struct-literal form
+        /// `WorkType::IdleChurn { ..., precise_timing: true }`.
+        precise_timing: bool,
     },
 }
 
@@ -1367,8 +1434,10 @@ pub enum WorkType {
 /// compile errors in both sites.
 pub mod defaults {
     // Bursty
-    pub const BURSTY_BURST_MS: u64 = 50;
-    pub const BURSTY_SLEEP_MS: u64 = 100;
+    pub const BURSTY_BURST_DURATION: std::time::Duration =
+        std::time::Duration::from_millis(50);
+    pub const BURSTY_SLEEP_DURATION: std::time::Duration =
+        std::time::Duration::from_millis(100);
     // PipeIo
     pub const PIPE_IO_BURST_ITERS: u64 = 1024;
     // FutexPingPong
@@ -1452,6 +1521,11 @@ pub mod defaults {
         std::time::Duration::from_millis(1);
     pub const IDLE_CHURN_SLEEP_DURATION: std::time::Duration =
         std::time::Duration::from_millis(5);
+    /// Default for [`WorkType::IdleChurn`]'s `precise_timing` field.
+    /// `false` keeps the inherited 50µs `current->timer_slack_ns`
+    /// the variant doc describes; opt-in callers set the field to
+    /// `true` directly to call `prctl(PR_SET_TIMERSLACK, 1)`.
+    pub const IDLE_CHURN_PRECISE_TIMING: bool = false;
 }
 
 impl WorkType {
@@ -1520,8 +1594,8 @@ impl WorkType {
             "IoRandRead" => Some(WorkType::IoRandRead),
             "IoConvoy" => Some(WorkType::IoConvoy),
             "Bursty" => Some(WorkType::Bursty {
-                burst_ms: defaults::BURSTY_BURST_MS,
-                sleep_ms: defaults::BURSTY_SLEEP_MS,
+                burst_duration: defaults::BURSTY_BURST_DURATION,
+                sleep_duration: defaults::BURSTY_SLEEP_DURATION,
             }),
             "PipeIo" => Some(WorkType::PipeIo {
                 burst_iters: defaults::PIPE_IO_BURST_ITERS,
@@ -1638,6 +1712,7 @@ impl WorkType {
             "IdleChurn" => Some(WorkType::IdleChurn {
                 burst_duration: defaults::IDLE_CHURN_BURST_DURATION,
                 sleep_duration: defaults::IDLE_CHURN_SLEEP_DURATION,
+                precise_timing: defaults::IDLE_CHURN_PRECISE_TIMING,
             }),
             // Sequence requires explicit phases; no default from_name.
             _ => None,
@@ -1814,32 +1889,54 @@ impl WorkType {
         )
     }
 
-    /// Bursty work: CPU burst for `burst_ms`, sleep for `sleep_ms`, repeat.
-    pub fn bursty(burst_ms: u64, sleep_ms: u64) -> Self {
-        WorkType::Bursty { burst_ms, sleep_ms }
+    /// Bursty work: CPU burst for `burst_duration`, sleep for
+    /// `sleep_duration`, repeat.
+    ///
+    /// Validation fires at spawn time, not construction time; see
+    /// [`WorkType::Bursty`] variant doc for preconditions.
+    pub fn bursty(burst_duration: Duration, sleep_duration: Duration) -> Self {
+        WorkType::Bursty {
+            burst_duration,
+            sleep_duration,
+        }
     }
 
     /// Paired pipe I/O with CPU burst between exchanges.
+    ///
+    /// Validation fires at spawn time, not construction time; see
+    /// [`WorkType::PipeIo`] variant doc for preconditions.
     pub fn pipe_io(burst_iters: u64) -> Self {
         WorkType::PipeIo { burst_iters }
     }
 
     /// Paired futex ping-pong with CPU spin between wakes.
+    ///
+    /// Validation fires at spawn time, not construction time; see
+    /// [`WorkType::FutexPingPong`] variant doc for preconditions.
     pub fn futex_ping_pong(spin_iters: u64) -> Self {
         WorkType::FutexPingPong { spin_iters }
     }
 
     /// Strided read-modify-write over a `size_kb` KB buffer.
+    ///
+    /// Validation fires at spawn time, not construction time; see
+    /// [`WorkType::CachePressure`] variant doc for preconditions.
     pub fn cache_pressure(size_kb: usize, stride: usize) -> Self {
         WorkType::CachePressure { size_kb, stride }
     }
 
     /// Cache pressure burst followed by sched_yield().
+    ///
+    /// Validation fires at spawn time, not construction time; see
+    /// [`WorkType::CacheYield`] variant doc for preconditions.
     pub fn cache_yield(size_kb: usize, stride: usize) -> Self {
         WorkType::CacheYield { size_kb, stride }
     }
 
     /// Cache pressure burst then pipe exchange with a partner worker.
+    ///
+    /// Validation fires at spawn time, not construction time; see
+    /// [`WorkType::CachePipe`] variant doc for preconditions.
     pub fn cache_pipe(size_kb: usize, burst_iters: u64) -> Self {
         WorkType::CachePipe {
             size_kb,
@@ -1848,6 +1945,9 @@ impl WorkType {
     }
 
     /// 1:N fan-out wake pattern with CPU spin between wakes.
+    ///
+    /// Validation fires at spawn time, not construction time; see
+    /// [`WorkType::FutexFanOut`] variant doc for preconditions.
     pub fn futex_fan_out(fan_out: usize, spin_iters: u64) -> Self {
         WorkType::FutexFanOut {
             fan_out,
@@ -1856,11 +1956,17 @@ impl WorkType {
     }
 
     /// Rapid self-directed affinity changes with `spin_iters` CPU work between.
+    ///
+    /// Validation fires at spawn time, not construction time; see
+    /// [`WorkType::AffinityChurn`] variant doc for preconditions.
     pub fn affinity_churn(spin_iters: u64) -> Self {
         WorkType::AffinityChurn { spin_iters }
     }
 
     /// Cycle scheduling policies with `spin_iters` CPU work between switches.
+    ///
+    /// Validation fires at spawn time, not construction time; see
+    /// [`WorkType::PolicyChurn`] variant doc for preconditions.
     pub fn policy_churn(spin_iters: u64) -> Self {
         WorkType::PolicyChurn { spin_iters }
     }
@@ -1876,6 +1982,9 @@ impl WorkType {
     /// wrapping to a negative (FUTEX_WAKE broadcasts when passed a
     /// negative N on some kernels, which would wake every waiter on
     /// the futex rather than just this messenger's receivers).
+    ///
+    /// Validation fires at spawn time, not construction time; see
+    /// [`WorkType::FanOutCompute`] variant doc for preconditions.
     pub fn fan_out_compute(
         fan_out: usize,
         cache_footprint_kb: usize,
@@ -1891,6 +2000,9 @@ impl WorkType {
     }
 
     /// Rapid page fault cycling with `spin_iters` CPU work between cycles.
+    ///
+    /// Validation fires at spawn time, not construction time; see
+    /// [`WorkType::PageFaultChurn`] variant doc for preconditions.
     pub fn page_fault_churn(region_kb: usize, touches_per_cycle: usize, spin_iters: u64) -> Self {
         WorkType::PageFaultChurn {
             region_kb,
@@ -1900,6 +2012,9 @@ impl WorkType {
     }
 
     /// N-way futex mutex contention with `contenders` workers per group.
+    ///
+    /// Validation fires at spawn time, not construction time; see
+    /// [`WorkType::MutexContention`] variant doc for preconditions.
     pub fn mutex_contention(contenders: usize, hold_iters: u64, work_iters: u64) -> Self {
         WorkType::MutexContention {
             contenders,
@@ -1911,6 +2026,9 @@ impl WorkType {
     /// One waker, N waiters on a single global futex; broadcasts via
     /// `FUTEX_WAKE` per batch. Pairs with
     /// [`WorkType::ThunderingHerd`].
+    ///
+    /// Validation fires at spawn time, not construction time; see
+    /// [`WorkType::ThunderingHerd`] variant doc for preconditions.
     pub fn thundering_herd(waiters: usize, batches: u64, inter_batch_ms: u64) -> Self {
         WorkType::ThunderingHerd {
             waiters,
@@ -1923,6 +2041,9 @@ impl WorkType {
     /// [`WorkType::PriorityInversion`] for behavior; pass
     /// [`FutexLockMode::Pi`] to invoke `FUTEX_LOCK_PI` or
     /// [`FutexLockMode::Plain`] for a non-PI futex.
+    ///
+    /// Validation fires at spawn time, not construction time; see
+    /// [`WorkType::PriorityInversion`] variant doc for preconditions.
     pub fn priority_inversion(
         high_count: usize,
         medium_count: usize,
@@ -1943,6 +2064,9 @@ impl WorkType {
 
     /// Producer/consumer pipeline with deliberately unbalanced
     /// rates. See [`WorkType::ProducerConsumerImbalance`].
+    ///
+    /// Validation fires at spawn time, not construction time; see
+    /// [`WorkType::ProducerConsumerImbalance`] variant doc for preconditions.
     pub fn producer_consumer_imbalance(
         producers: usize,
         consumers: usize,
@@ -1962,6 +2086,9 @@ impl WorkType {
     /// `rt_workers` SCHED_FIFO workers vs. `cfs_workers` SCHED_NORMAL
     /// workers competing on the same CPU set. See
     /// [`WorkType::RtStarvation`].
+    ///
+    /// Validation fires at spawn time, not construction time; see
+    /// [`WorkType::RtStarvation`] variant doc for preconditions.
     pub fn rt_starvation(
         rt_workers: usize,
         cfs_workers: usize,
@@ -1978,6 +2105,9 @@ impl WorkType {
 
     /// Paired workers in mismatched scheduling classes. See
     /// [`WorkType::AsymmetricWaker`].
+    ///
+    /// Validation fires at spawn time, not construction time; see
+    /// [`WorkType::AsymmetricWaker`] variant doc for preconditions.
     pub fn asymmetric_waker(
         waker_class: SchedClass,
         wakee_class: SchedClass,
@@ -1992,6 +2122,10 @@ impl WorkType {
 
     /// Pipeline of waker-wakee hops with optional `WF_SYNC`. See
     /// [`WorkType::WakeChain`].
+    ///
+    /// Validation fires at spawn time, not construction time; see
+    /// [`WorkType::WakeChain`] variant doc for preconditions
+    /// (`depth >= 2`, `num_workers` divisible by `depth`, etc.).
     pub fn wake_chain(
         depth: usize,
         wake: WakeMechanism,
@@ -2008,6 +2142,9 @@ impl WorkType {
     /// [`WorkType::NumaWorkingSetSweep`]. `target_nodes` accepts
     /// any `IntoIterator<Item = usize>` for ergonomic call sites
     /// (`[0, 1, 2]`, `0..node_count`, `BTreeSet`, etc.).
+    ///
+    /// Validation fires at spawn time, not construction time; see
+    /// [`WorkType::NumaWorkingSetSweep`] variant doc for preconditions.
     pub fn numa_working_set_sweep(
         region_kb: usize,
         sweep_period_ms: u64,
@@ -2028,6 +2165,9 @@ impl WorkType {
     /// is the only typed entry point. Accepts any `IntoIterator<Item =
     /// Phase>` for `rest` so callers can pass arrays, `Vec`, or
     /// builder-style chains.
+    ///
+    /// Validation fires at spawn time, not construction time; see
+    /// [`WorkType::Sequence`] variant doc for preconditions.
     pub fn sequence(first: Phase, rest: impl IntoIterator<Item = Phase>) -> Self {
         WorkType::Sequence {
             first,
@@ -2036,11 +2176,17 @@ impl WorkType {
     }
 
     /// Construct a [`WorkType::CgroupChurn`].
+    ///
+    /// Validation fires at spawn time, not construction time; see
+    /// [`WorkType::CgroupChurn`] variant doc for preconditions.
     pub fn cgroup_churn(groups: usize, cycle_ms: u64) -> Self {
         WorkType::CgroupChurn { groups, cycle_ms }
     }
 
     /// Construct a [`WorkType::SignalStorm`].
+    ///
+    /// Validation fires at spawn time, not construction time; see
+    /// [`WorkType::SignalStorm`] variant doc for preconditions.
     pub fn signal_storm(signals_per_iter: u64, work_iters: u64) -> Self {
         WorkType::SignalStorm {
             signals_per_iter,
@@ -2049,6 +2195,9 @@ impl WorkType {
     }
 
     /// Construct a [`WorkType::PreemptStorm`].
+    ///
+    /// Validation fires at spawn time, not construction time; see
+    /// [`WorkType::PreemptStorm`] variant doc for preconditions.
     pub fn preempt_storm(cfs_workers: usize, rt_burst_iters: u64, rt_sleep_us: u64) -> Self {
         WorkType::PreemptStorm {
             cfs_workers,
@@ -2058,6 +2207,9 @@ impl WorkType {
     }
 
     /// Construct a [`WorkType::EpollStorm`].
+    ///
+    /// Validation fires at spawn time, not construction time; see
+    /// [`WorkType::EpollStorm`] variant doc for preconditions.
     pub fn epoll_storm(producers: usize, consumers: usize, events_per_burst: u64) -> Self {
         WorkType::EpollStorm {
             producers,
@@ -2067,11 +2219,15 @@ impl WorkType {
     }
 
     /// Construct a [`WorkType::NumaMigrationChurn`].
+    ///
+    /// Validation fires at spawn time, not construction time; see
+    /// [`WorkType::NumaMigrationChurn`] variant doc for preconditions.
     pub fn numa_migration_churn(period_ms: u64) -> Self {
         WorkType::NumaMigrationChurn { period_ms }
     }
 
-    /// Construct a [`WorkType::IdleChurn`].
+    /// Construct a [`WorkType::IdleChurn`] with the default
+    /// `precise_timing = false`.
     ///
     /// # Spawn-time precondition
     ///
@@ -2082,10 +2238,23 @@ impl WorkType {
     /// actionable bail message naming the offending field. See
     /// [`WorkType::IdleChurn`] variant doc for the rationale and
     /// the kernel-source citation.
+    ///
+    /// # `precise_timing`
+    ///
+    /// This constructor sets `precise_timing` to
+    /// [`defaults::IDLE_CHURN_PRECISE_TIMING`] (`false`),
+    /// preserving the inherited `current->timer_slack_ns`
+    /// (~50µs default). To opt into 1ns timer slack, build the
+    /// variant directly via the struct-literal form:
+    /// `WorkType::IdleChurn { burst_duration, sleep_duration,
+    /// precise_timing: true }`. See the variant's
+    /// `precise_timing` field doc for the kernel-side
+    /// mechanism.
     pub fn idle_churn(burst_duration: Duration, sleep_duration: Duration) -> Self {
         WorkType::IdleChurn {
             burst_duration,
             sleep_duration,
+            precise_timing: defaults::IDLE_CHURN_PRECISE_TIMING,
         }
     }
 
@@ -2110,6 +2279,96 @@ impl WorkType {
             run,
         }
     }
+}
+
+/// Spawn-time validation failures for [`WorkType`] preconditions.
+///
+/// Returned (boxed inside [`anyhow::Error`]) by
+/// [`WorkloadHandle::spawn`] when a per-group [`WorkSpec`] violates a
+/// runtime invariant the variant doc declares as a precondition.
+/// Tests that need to assert on a specific variant downcast via
+/// `err.downcast_ref::<WorkTypeValidationError>()`; the
+/// `Display` impl carries the same human-readable text the previous
+/// `anyhow::bail!` strings did so call sites that match on the
+/// rendered message keep working.
+///
+/// Each variant carries `group_idx` (the position of the offending
+/// [`WorkSpec`] inside [`WorkloadConfig::composed`]; the primary
+/// group is index 0) so multi-group scenarios can locate the
+/// offending entry without re-parsing the message string. Variants
+/// with multiple constraint inputs (depth, divisor, observed count)
+/// expose those values as named fields to the same end.
+#[derive(Debug, thiserror::Error)]
+pub enum WorkTypeValidationError {
+    /// [`WorkType::IdleChurn`] with `burst_duration == Duration::ZERO`.
+    /// Collapses the per-iteration loop to pure nanosleep so the
+    /// worker accrues no runtime — useless as a scheduler test. See
+    /// the variant doc's "Spawn-time validation" section for the
+    /// full rationale.
+    #[error(
+        "IdleChurn burst_duration must be > 0 (group {group_idx}); a zero \
+         burst makes the loop pure sleep and the worker accrues \
+         no runtime (see [`WorkType::IdleChurn`] variant doc)"
+    )]
+    ZeroBurstDuration {
+        /// Index of the offending group in
+        /// [`WorkloadConfig::composed`] (primary group = 0).
+        group_idx: usize,
+    },
+    /// [`WorkType::IdleChurn`] with `sleep_duration == Duration::ZERO`.
+    /// Collapses the per-iteration loop to a CPU-bound burst with
+    /// no idle path; the kernel's `nanosleep(0)` is yield-like
+    /// rather than idle-like. The diagnostic steers the caller to
+    /// [`WorkType::SpinWait`] (pure CPU spin) or
+    /// [`WorkType::YieldHeavy`] (the closer overlap).
+    #[error(
+        "IdleChurn sleep_duration must be > 0 (group {group_idx}); a zero \
+         sleep collapses the loop to a CPU-bound burst. \
+         Use WorkType::SpinWait for pure CPU spin, or \
+         WorkType::YieldHeavy for the closer overlap \
+         (nanosleep(0) is yield-like — see the variant \
+         doc rationale in [`WorkType::IdleChurn`])."
+    )]
+    ZeroSleepDuration {
+        /// Index of the offending group in
+        /// [`WorkloadConfig::composed`] (primary group = 0).
+        group_idx: usize,
+    },
+    /// [`WorkType::WakeChain`] with `depth < 2`. A 1-stage chain has
+    /// no successor to wake, and the post-fork close-other-fds
+    /// block would close the worker's own write end (deadlock).
+    #[error(
+        "WakeChain depth must be >= 2 (got {depth}, group {group_idx}); a 1-stage \
+         chain has no successor to wake and the post-fork fd close \
+         logic would close the worker's own write end \
+         (see [`WorkType::WakeChain`] variant doc)"
+    )]
+    InsufficientWakeChainDepth {
+        /// The offending `depth` value the caller supplied.
+        depth: usize,
+        /// Index of the offending group in
+        /// [`WorkloadConfig::composed`] (primary group = 0).
+        group_idx: usize,
+    },
+    /// `num_workers` is not a positive multiple of the variant's
+    /// [`worker_group_size`](WorkType::worker_group_size). Affects
+    /// every grouped variant (paired, fan-out, herd, contention,
+    /// chain). The diagnostic names the variant via [`WorkType::name`].
+    #[error(
+        "{name} (group {group_idx}) requires num_workers divisible by {group_size}, got {num_workers}"
+    )]
+    NonDivisibleWorkerCount {
+        /// PascalCase variant name from [`WorkType::name`].
+        name: String,
+        /// Index of the offending group in
+        /// [`WorkloadConfig::composed`] (primary group = 0).
+        group_idx: usize,
+        /// Required group size (the variant's
+        /// [`worker_group_size`](WorkType::worker_group_size)).
+        group_size: usize,
+        /// The `num_workers` count the caller supplied.
+        num_workers: usize,
+    },
 }
 
 /// Resolve a work type with an optional override.
@@ -3034,9 +3293,13 @@ impl WorkloadConfig {
 ///
 /// ```
 /// # use ktstr::workload::{WorkSpec, WorkType, SchedPolicy, MemPolicy};
+/// # use std::time::Duration;
 /// let w = WorkSpec::default()
 ///     .workers(4)
-///     .work_type(WorkType::bursty(50, 100))
+///     .work_type(WorkType::bursty(
+///         Duration::from_millis(50),
+///         Duration::from_millis(100),
+///     ))
 ///     .sched_policy(SchedPolicy::Batch)
 ///     .mem_policy(MemPolicy::bind([0, 1]));
 /// assert_eq!(w.num_workers, Some(4));
@@ -4321,13 +4584,13 @@ impl WorkloadHandle {
             if let Some(group_size) = group.work_type.worker_group_size()
                 && (group.num_workers == 0 || !group.num_workers.is_multiple_of(group_size))
             {
-                anyhow::bail!(
-                    "{} (group {}) requires num_workers divisible by {}, got {}",
-                    group.work_type.name(),
-                    group.group_idx,
+                return Err(WorkTypeValidationError::NonDivisibleWorkerCount {
+                    name: group.work_type.name().to_string(),
+                    group_idx: group.group_idx,
                     group_size,
-                    group.num_workers
-                );
+                    num_workers: group.num_workers,
+                }
+                .into());
             }
             let group_chain_depth = group.work_type.chain_pipe_depth();
             // WakeChain `wake: WakeMechanism::Pipe` runs under both
@@ -4352,14 +4615,11 @@ impl WorkloadHandle {
             if let Some(depth) = group_chain_depth
                 && depth < 2
             {
-                anyhow::bail!(
-                    "WakeChain depth must be >= 2 (got {}, group {}); a 1-stage \
-                     chain has no successor to wake and the post-fork fd close \
-                     logic would close the worker's own write end \
-                     (see [`WorkType::WakeChain`] variant doc)",
+                return Err(WorkTypeValidationError::InsufficientWakeChainDepth {
                     depth,
-                    group.group_idx,
-                );
+                    group_idx: group.group_idx,
+                }
+                .into());
             }
             // IdleChurn rejects Duration::ZERO for either field:
             //   - burst_duration = 0 collapses the loop to pure
@@ -4372,26 +4632,20 @@ impl WorkloadHandle {
             if let WorkType::IdleChurn {
                 burst_duration,
                 sleep_duration,
+                ..
             } = group.work_type
             {
                 if burst_duration.is_zero() {
-                    anyhow::bail!(
-                        "IdleChurn burst_duration must be > 0 (group {}); a zero \
-                         burst makes the loop pure sleep and the worker accrues \
-                         no runtime (see [`WorkType::IdleChurn`] variant doc)",
-                        group.group_idx,
-                    );
+                    return Err(WorkTypeValidationError::ZeroBurstDuration {
+                        group_idx: group.group_idx,
+                    }
+                    .into());
                 }
                 if sleep_duration.is_zero() {
-                    anyhow::bail!(
-                        "IdleChurn sleep_duration must be > 0 (group {}); a zero \
-                         sleep collapses the loop to a CPU-bound burst. \
-                         Use WorkType::SpinWait for pure CPU spin, or \
-                         WorkType::YieldHeavy for the closer overlap \
-                         (nanosleep(0) is yield-like — see the variant \
-                         doc rationale in [`WorkType::IdleChurn`]).",
-                        group.group_idx,
-                    );
+                    return Err(WorkTypeValidationError::ZeroSleepDuration {
+                        group_idx: group.group_idx,
+                    }
+                    .into());
                 }
             }
         }
@@ -6320,6 +6574,13 @@ fn worker_main(
     // it's the last word on the worker's class, and ONCE so we don't
     // hammer sched_setattr/sched_setscheduler every outer iteration.
     let mut per_pos_policy_applied = false;
+    // One-shot guard for IdleChurn's `precise_timing` opt-in.
+    // When set, the IdleChurn dispatch arm calls
+    // `prctl(PR_SET_TIMERSLACK, 1)` once per worker — see the
+    // dispatch arm's inline comment for the kernel-source
+    // citation explaining why `1` (not `0`) is the value that
+    // shrinks slack.
+    let mut idle_churn_slack_applied = false;
     // Benchmarking: per-wakeup latency samples (reservoir-sampled) and iteration counter.
     const MAX_WAKE_SAMPLES: usize = 100_000;
     let mut resume_latencies_ns: Vec<u64> = Vec::with_capacity(MAX_WAKE_SAMPLES);
@@ -6620,14 +6881,17 @@ fn worker_main(
                 last_iter_time = Instant::now();
                 iterations += 1;
             }
-            WorkType::Bursty { burst_ms, sleep_ms } => {
-                let burst_end = Instant::now() + Duration::from_millis(burst_ms);
+            WorkType::Bursty {
+                burst_duration,
+                sleep_duration,
+            } => {
+                let burst_end = Instant::now() + burst_duration;
                 while Instant::now() < burst_end && !stop_requested(stop) {
                     spin_burst(&mut work_units, 1024);
                 }
                 if !stop_requested(stop) {
                     let before_sleep = Instant::now();
-                    std::thread::sleep(Duration::from_millis(sleep_ms));
+                    std::thread::sleep(sleep_duration);
                     reservoir_push(
                         &mut resume_latencies_ns,
                         &mut wake_sample_count,
@@ -8520,6 +8784,7 @@ fn worker_main(
             WorkType::IdleChurn {
                 burst_duration,
                 sleep_duration,
+                precise_timing,
             } => {
                 // Per-iteration: spin for `burst_duration`, then
                 // `nanosleep` for `sleep_duration`. Both fields
@@ -8554,6 +8819,56 @@ fn worker_main(
                 // `spin_burst(256)` so the worker checks
                 // `stop_requested` and the deadline at most every
                 // 256 iterations of the inner loop.
+                //
+                // `precise_timing`: opt-in
+                // `prctl(PR_SET_TIMERSLACK, 1)` shrinks
+                // `current->timer_slack_ns` from the inherited
+                // 50µs default to 1ns. The kernel arm at
+                // `kernel/sys.c:2645-2653` sets
+                // `current->timer_slack_ns = arg2` when `arg2 >
+                // 0`; passing `0` is a RESET to
+                // `default_timer_slack_ns` (the inherited
+                // default), so `1` is the smallest value that
+                // actually narrows the slack. RT/DL tasks bypass
+                // PR_SET_TIMERSLACK entirely (`if
+                // (rt_or_dl_task_policy(current)) break;` at
+                // `kernel/sys.c:2646`); the syscall returns 0
+                // but the slack stays at 0 (forced by the
+                // sched-class entry path at
+                // `kernel/sched/syscalls.c:258`), so the call
+                // is a harmless no-op for RT IdleChurn workers.
+                //
+                // The one-shot guard
+                // `idle_churn_slack_applied` ensures the prctl
+                // fires once per worker, not on every loop
+                // iteration. Pre-loop application is impossible
+                // here because `worker_main`'s outer loop
+                // re-matches `work_type` every iteration; the
+                // guard is the cheapest way to keep the
+                // single-call discipline without restructuring
+                // the dispatch.
+                if precise_timing && !idle_churn_slack_applied {
+                    // SAFETY: `prctl` is async-signal-unsafe
+                    // per signal-safety(7) but this site runs
+                    // outside any signal handler context — the
+                    // worker's only async signal is SIGUSR1
+                    // (stop), and the SIGUSR1 handler does not
+                    // call into worker_main. PR_SET_TIMERSLACK
+                    // is documented for arg2 = unsigned long;
+                    // we pass 1 (smallest value that narrows
+                    // slack — see kernel cite above).
+                    // Return code is intentionally unused: a
+                    // failure leaves the worker on the
+                    // inherited slack (50µs default) which
+                    // matches the `precise_timing == false`
+                    // semantics, so the test still runs and
+                    // produces wake-latency samples; only the
+                    // slack-floor distribution differs.
+                    let _ = unsafe {
+                        libc::prctl(libc::PR_SET_TIMERSLACK, 1u64)
+                    };
+                    idle_churn_slack_applied = true;
+                }
                 let burst_end = Instant::now() + burst_duration;
                 while Instant::now() < burst_end && !stop_requested(stop) {
                     spin_burst(&mut work_units, 256);
@@ -11335,8 +11650,8 @@ mod tests {
     fn spawn_bursty_produces_work() {
         let reports = spawn_and_collect_after(
             WorkType::Bursty {
-                burst_ms: 50,
-                sleep_ms: 50,
+                burst_duration: Duration::from_millis(50),
+                sleep_duration: Duration::from_millis(50),
             },
             1,
             300,
@@ -11608,9 +11923,13 @@ mod tests {
     #[test]
     fn work_type_bursty_defaults() {
         let wt = WorkType::from_name("Bursty").unwrap();
-        if let WorkType::Bursty { burst_ms, sleep_ms } = wt {
-            assert_eq!(burst_ms, 50);
-            assert_eq!(sleep_ms, 100);
+        if let WorkType::Bursty {
+            burst_duration,
+            sleep_duration,
+        } = wt
+        {
+            assert_eq!(burst_duration, Duration::from_millis(50));
+            assert_eq!(sleep_duration, Duration::from_millis(100));
         } else {
             panic!("expected Bursty variant");
         }
@@ -11992,22 +12311,22 @@ mod tests {
         let s = format!(
             "{:?}",
             WorkType::Bursty {
-                burst_ms: 10,
-                sleep_ms: 20
+                burst_duration: Duration::from_millis(10),
+                sleep_duration: Duration::from_millis(20),
             }
         );
-        assert!(s.contains("10"), "must show burst_ms value");
-        assert!(s.contains("20"), "must show sleep_ms value");
+        assert!(s.contains("10"), "must show burst_duration value");
+        assert!(s.contains("20"), "must show sleep_duration value");
         // Different field values must produce different output.
         let s2 = format!(
             "{:?}",
             WorkType::Bursty {
-                burst_ms: 99,
-                sleep_ms: 1
+                burst_duration: Duration::from_millis(99),
+                sleep_duration: Duration::from_millis(1),
             }
         );
-        assert!(s2.contains("99"), "must show changed burst_ms");
-        assert!(s2.contains("1"), "must show changed sleep_ms");
+        assert!(s2.contains("99"), "must show changed burst_duration");
+        assert!(s2.contains("1"), "must show changed sleep_duration");
         assert_ne!(
             s, s2,
             "different field values must produce different debug output"
@@ -12621,7 +12940,11 @@ mod tests {
         assert_eq!(WorkType::IoSyncWrite.worker_group_size(), None);
         assert_eq!(WorkType::IoRandRead.worker_group_size(), None);
         assert_eq!(WorkType::IoConvoy.worker_group_size(), None);
-        assert_eq!(WorkType::bursty(50, 100).worker_group_size(), None);
+        assert_eq!(
+            WorkType::bursty(Duration::from_millis(50), Duration::from_millis(100))
+                .worker_group_size(),
+            None
+        );
         assert_eq!(WorkType::cache_pressure(32, 64).worker_group_size(), None);
         assert_eq!(WorkType::cache_yield(32, 64).worker_group_size(), None);
     }
@@ -12716,18 +13039,24 @@ mod tests {
     fn work_builder_chain() {
         let w = WorkSpec::default()
             .workers(8)
-            .work_type(WorkType::bursty(10, 20))
+            .work_type(WorkType::bursty(
+                Duration::from_millis(10),
+                Duration::from_millis(20),
+            ))
             .sched_policy(SchedPolicy::Batch)
             .affinity(AffinityIntent::SingleCpu)
             .nice(7);
         assert_eq!(w.num_workers, Some(8));
-        assert!(matches!(
-            w.work_type,
-            WorkType::Bursty {
-                burst_ms: 10,
-                sleep_ms: 20
-            }
-        ));
+        if let WorkType::Bursty {
+            burst_duration,
+            sleep_duration,
+        } = w.work_type
+        {
+            assert_eq!(burst_duration, Duration::from_millis(10));
+            assert_eq!(sleep_duration, Duration::from_millis(20));
+        } else {
+            panic!("expected Bursty variant; got {:?}", w.work_type);
+        }
         assert!(matches!(w.sched_policy, SchedPolicy::Batch));
         assert!(matches!(w.affinity, AffinityIntent::SingleCpu));
         assert_eq!(w.nice, 7);
@@ -16337,7 +16666,89 @@ mod tests {
                 "WakeChain rejection diagnostic must name the offending depth \
                  ({depth}); num_workers={num_workers}, got: {rendered}",
             );
+            let typed = err
+                .downcast_ref::<WorkTypeValidationError>()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "error must downcast to WorkTypeValidationError; \
+                         num_workers={num_workers}, depth={depth}, err: {rendered}"
+                    )
+                });
+            match typed {
+                WorkTypeValidationError::NonDivisibleWorkerCount {
+                    name,
+                    group_idx,
+                    group_size,
+                    num_workers: nw,
+                } => {
+                    assert_eq!(
+                        name, "WakeChain",
+                        "name field must be WakeChain; got: {name}",
+                    );
+                    assert_eq!(
+                        *group_idx, 0,
+                        "primary group has group_idx == 0; got: {group_idx}",
+                    );
+                    assert_eq!(
+                        *group_size, depth,
+                        "group_size must equal depth; got: {group_size}",
+                    );
+                    assert_eq!(
+                        *nw, num_workers,
+                        "num_workers field must echo input; got: {nw}",
+                    );
+                }
+                other => panic!(
+                    "expected NonDivisibleWorkerCount; got: {other:?}; \
+                     num_workers={num_workers}, depth={depth}"
+                ),
+            }
         }
+    }
+
+    /// `WakeChain` with `depth == 1` and
+    /// `wake: WakeMechanism::Pipe` is rejected at spawn — a
+    /// 1-stage chain has no successor to wake AND the post-fork
+    /// fd-close logic would close the worker's own write end
+    /// (deadlock). The typed-error variant must be
+    /// [`WorkTypeValidationError::InsufficientWakeChainDepth`]
+    /// so callers can program against the depth precondition
+    /// without parsing the diagnostic. The depth-rejection check
+    /// only fires for `wake: Pipe` because
+    /// [`chain_pipe_depth`](WorkType::chain_pipe_depth) returns
+    /// `None` for `wake: Futex`.
+    #[test]
+    fn wake_chain_spawn_rejects_depth_one_pipe() {
+        let cfg = WorkloadConfig {
+            num_workers: 1,
+            work_type: WorkType::WakeChain {
+                depth: 1,
+                wake: WakeMechanism::Pipe,
+                work_per_hop: Duration::from_micros(50),
+            },
+            ..Default::default()
+        };
+        let err = WorkloadHandle::spawn(&cfg)
+            .err()
+            .expect("WakeChain wake=Pipe with depth=1 must be rejected at spawn");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("depth must be >= 2"),
+            "diagnostic must mention `depth must be >= 2`; got: {rendered}",
+        );
+        let typed = err
+            .downcast_ref::<WorkTypeValidationError>()
+            .expect("error must downcast to WorkTypeValidationError");
+        assert!(
+            matches!(
+                typed,
+                WorkTypeValidationError::InsufficientWakeChainDepth {
+                    depth: 1,
+                    group_idx: 0,
+                }
+            ),
+            "expected InsufficientWakeChainDepth {{ depth: 1, group_idx: 0 }}, got: {typed:?}",
+        );
     }
 
     /// `WakeChain` accepts every positive multiple of depth at
@@ -16455,6 +16866,7 @@ mod tests {
             work_type: WorkType::IdleChurn {
                 burst_duration: Duration::from_millis(1),
                 sleep_duration: Duration::from_millis(5),
+                precise_timing: false,
             },
             ..Default::default()
         };
@@ -16481,7 +16893,9 @@ mod tests {
 
     /// Zero `sleep_duration` collapses IdleChurn to SpinWait — the
     /// bail must name `sleep_duration` and steer the caller to
-    /// SpinWait directly.
+    /// SpinWait directly. Also pins the typed-error downcast to
+    /// [`WorkTypeValidationError::ZeroSleepDuration`] so callers
+    /// can program against the variant rather than the message text.
     #[test]
     fn idle_churn_zero_sleep_rejects() {
         let cfg = WorkloadConfig {
@@ -16489,6 +16903,7 @@ mod tests {
             work_type: WorkType::IdleChurn {
                 burst_duration: Duration::from_millis(1),
                 sleep_duration: Duration::ZERO,
+                precise_timing: false,
             },
             ..Default::default()
         };
@@ -16504,10 +16919,22 @@ mod tests {
             msg.contains("SpinWait"),
             "diagnostic must steer the caller to SpinWait; got: {msg}",
         );
+        let typed = err
+            .downcast_ref::<WorkTypeValidationError>()
+            .expect("error must downcast to WorkTypeValidationError");
+        assert!(
+            matches!(
+                typed,
+                WorkTypeValidationError::ZeroSleepDuration { group_idx: 0 }
+            ),
+            "expected ZeroSleepDuration {{ group_idx: 0 }}, got: {typed:?}",
+        );
     }
 
     /// Zero `burst_duration` makes the loop pure sleep — the bail
-    /// must name `burst_duration` and explain "pure sleep".
+    /// must name `burst_duration` and explain "pure sleep". Also
+    /// pins the typed-error downcast to
+    /// [`WorkTypeValidationError::ZeroBurstDuration`].
     #[test]
     fn idle_churn_zero_burst_rejects() {
         let cfg = WorkloadConfig {
@@ -16515,6 +16942,7 @@ mod tests {
             work_type: WorkType::IdleChurn {
                 burst_duration: Duration::ZERO,
                 sleep_duration: Duration::from_millis(5),
+                precise_timing: false,
             },
             ..Default::default()
         };
@@ -16530,13 +16958,25 @@ mod tests {
             msg.contains("pure sleep"),
             "diagnostic must explain the pure-sleep degeneracy; got: {msg}",
         );
+        let typed = err
+            .downcast_ref::<WorkTypeValidationError>()
+            .expect("error must downcast to WorkTypeValidationError");
+        assert!(
+            matches!(
+                typed,
+                WorkTypeValidationError::ZeroBurstDuration { group_idx: 0 }
+            ),
+            "expected ZeroBurstDuration {{ group_idx: 0 }}, got: {typed:?}",
+        );
     }
 
     /// When both fields are zero, the burst check must fire first
     /// (validation order). The diagnostic must name
     /// `burst_duration` and must NOT name `sleep_duration` —
     /// proving the spawn returns on the first failed check rather
-    /// than concatenating both messages.
+    /// than concatenating both messages. The typed-error variant
+    /// must be [`WorkTypeValidationError::ZeroBurstDuration`] for
+    /// the same reason.
     #[test]
     fn idle_churn_both_zero_rejects_burst_first() {
         let cfg = WorkloadConfig {
@@ -16544,6 +16984,7 @@ mod tests {
             work_type: WorkType::IdleChurn {
                 burst_duration: Duration::ZERO,
                 sleep_duration: Duration::ZERO,
+                precise_timing: false,
             },
             ..Default::default()
         };
@@ -16558,6 +16999,16 @@ mod tests {
         assert!(
             !msg.contains("sleep_duration must be > 0"),
             "sleep check must NOT fire when burst already failed; got: {msg}",
+        );
+        let typed = err
+            .downcast_ref::<WorkTypeValidationError>()
+            .expect("error must downcast to WorkTypeValidationError");
+        assert!(
+            matches!(
+                typed,
+                WorkTypeValidationError::ZeroBurstDuration { group_idx: 0 }
+            ),
+            "expected ZeroBurstDuration {{ group_idx: 0 }} (burst fires first), got: {typed:?}",
         );
     }
 
@@ -16574,6 +17025,7 @@ mod tests {
             work_type: WorkType::IdleChurn {
                 burst_duration: Duration::from_nanos(1),
                 sleep_duration: Duration::from_nanos(1),
+                precise_timing: false,
             },
             ..Default::default()
         };
@@ -16588,13 +17040,16 @@ mod tests {
     /// offending entry. Primary IdleChurn is valid; the composed
     /// group at index 1 has zero burst_duration. The error must
     /// mention "group 1" so the caller knows WHICH composed entry
-    /// is malformed.
+    /// is malformed. The typed-error variant carries the same
+    /// `group_idx` field so callers can program against it without
+    /// parsing the message.
     #[test]
     fn idle_churn_zero_in_composed_group_rejects_with_group_idx() {
         let cfg = WorkloadConfig::default()
             .work_type(WorkType::IdleChurn {
                 burst_duration: Duration::from_millis(1),
                 sleep_duration: Duration::from_millis(5),
+                precise_timing: false,
             })
             .workers(1)
             .with_composed(
@@ -16602,6 +17057,7 @@ mod tests {
                     .work_type(WorkType::IdleChurn {
                         burst_duration: Duration::ZERO,
                         sleep_duration: Duration::from_millis(5),
+                        precise_timing: false,
                     })
                     .workers(1),
             );
@@ -16616,6 +17072,56 @@ mod tests {
         assert!(
             msg.contains("group 1"),
             "diagnostic must tag the composed group_idx (1); got: {msg}",
+        );
+        let typed = err
+            .downcast_ref::<WorkTypeValidationError>()
+            .expect("error must downcast to WorkTypeValidationError");
+        assert!(
+            matches!(
+                typed,
+                WorkTypeValidationError::ZeroBurstDuration { group_idx: 1 }
+            ),
+            "expected ZeroBurstDuration {{ group_idx: 1 }} (composed group), got: {typed:?}",
+        );
+    }
+
+    /// `precise_timing: true` is the IdleChurn opt-in for shrinking
+    /// `current->timer_slack_ns` from the inherited 50µs default to
+    /// 1ns. This smoke test exercises spawn + run with the flag on
+    /// to prove the dispatch arm's `prctl(PR_SET_TIMERSLACK, 1)`
+    /// branch survives end-to-end (worker doesn't crash, iterations
+    /// still accrue). It does NOT measure the slack itself —
+    /// `prctl(PR_GET_TIMERSLACK)` would be required for an
+    /// observable assertion, and slack effects only become visible
+    /// in wake-latency distributions for sub-50µs sleeps which
+    /// require longer runs than this smoke test allocates.
+    /// `default_timer_slack_ns` per
+    /// `init/init_task.c:172` is 50_000ns, so a 5ms sleep already
+    /// drowns the slack signal in the dispatch arm's
+    /// `resume_overhead = elapsed.saturating_sub(sleep_duration)`
+    /// computation; this test only proves the prctl call doesn't
+    /// fail-stop the worker.
+    #[test]
+    fn idle_churn_precise_timing_iterates() {
+        let cfg = WorkloadConfig {
+            num_workers: 1,
+            work_type: WorkType::IdleChurn {
+                burst_duration: Duration::from_millis(1),
+                sleep_duration: Duration::from_millis(5),
+                precise_timing: true,
+            },
+            ..Default::default()
+        };
+        let mut h = WorkloadHandle::spawn(&cfg)
+            .expect("IdleChurn precise_timing=true must spawn");
+        h.start();
+        std::thread::sleep(Duration::from_millis(100));
+        let reports = h.stop_and_collect();
+        assert_eq!(reports.len(), 1);
+        assert!(
+            reports[0].iterations > 0,
+            "IdleChurn precise_timing=true worker must iterate: {:?}",
+            reports[0],
         );
     }
 

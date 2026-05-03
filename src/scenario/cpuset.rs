@@ -6,6 +6,7 @@ use super::ops::{CgroupDef, CpusetSpec, HoldSpec, Op, Step, execute_scenario, ex
 use crate::assert::AssertResult;
 use crate::workload::*;
 use anyhow::Result;
+use std::time::Duration;
 
 fn cgroup_cpuset_apply_midrun_backdrop() -> Backdrop {
     Backdrop::new()
@@ -132,7 +133,10 @@ pub fn custom_cgroup_cpuset_workload_imbalance(ctx: &Ctx) -> Result<AssertResult
                 .workers(mid * 2),
             CgroupDef::named("cg_1")
                 .with_cpuset(CpusetSpec::disjoint(1, 2))
-                .work_type(WorkType::bursty(50, 100)),
+                .work_type(WorkType::bursty(
+                    Duration::from_millis(50),
+                    Duration::from_millis(100),
+                )),
         ],
         HoldSpec::Fixed(ctx.settle + ctx.duration),
     )];
@@ -162,7 +166,10 @@ pub fn custom_cgroup_cpuset_change_imbalance(ctx: &Ctx) -> Result<AssertResult> 
             CgroupDef::named("cg_1")
                 .with_cpuset(CpusetSpec::range(0.5, 1.0))
                 .workers(2)
-                .work_type(WorkType::bursty(30, 100)),
+                .work_type(WorkType::bursty(
+                    Duration::from_millis(30),
+                    Duration::from_millis(100),
+                )),
         );
 
     let steps = vec![

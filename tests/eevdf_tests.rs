@@ -3,6 +3,7 @@ use ktstr::assert::AssertResult;
 use ktstr::ktstr_test;
 use ktstr::scenario::Ctx;
 use ktstr::workload::{ResolvedAffinity, SchedPolicy, WorkType, WorkloadConfig, WorkloadHandle};
+use std::time::Duration;
 
 /// Boots a VM under EEVDF (no `sched_ext` scheduler attached) and
 /// exits without running any workload. Guards against the
@@ -97,8 +98,8 @@ fn eevdf_burst_oversubscription(ctx: &Ctx) -> Result<AssertResult> {
         num_workers,
         affinity: ResolvedAffinity::None,
         work_type: WorkType::Bursty {
-            burst_ms: 1,
-            sleep_ms: 0,
+            burst_duration: Duration::from_millis(1),
+            sleep_duration: Duration::ZERO,
         },
         sched_policy: SchedPolicy::Normal,
         ..Default::default()

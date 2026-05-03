@@ -5,6 +5,7 @@ use super::ops::{CgroupDef, HoldSpec, Op, Step, execute_steps};
 use crate::assert::AssertResult;
 use crate::workload::*;
 use anyhow::Result;
+use std::time::Duration;
 
 fn host_cgroup_contention_steps(ctx: &Ctx) -> Vec<Step> {
     vec![
@@ -30,7 +31,10 @@ fn sched_mixed_steps(ctx: &Ctx) -> Vec<Step> {
         (SchedPolicy::Normal, WorkType::SpinWait),
         (SchedPolicy::Batch, WorkType::SpinWait),
         (SchedPolicy::Idle, WorkType::SpinWait),
-        (SchedPolicy::Fifo(1), WorkType::bursty(500, 250)),
+        (
+            SchedPolicy::Fifo(1),
+            WorkType::bursty(Duration::from_millis(500), Duration::from_millis(250)),
+        ),
     ];
 
     let mut ops = vec![Op::add_cgroup("cg_0"), Op::add_cgroup("cg_1")];
