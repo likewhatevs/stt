@@ -601,6 +601,7 @@ impl TokenBucket {
             return true;
         }
         if n == 0 {
+            // Skips refill — a stream of zero-cost requests does not advance last_refill.
             return true;
         }
         self.refill();
@@ -7256,8 +7257,8 @@ mod tests {
     /// immediately. Drive `available` deeply negative via an
     /// oversized consume, pin `last_refill` so refill yields zero,
     /// then ask for the wait — the deficit is effectively u64-scale
-    /// and the post-multiply numerator (~u64::MAX * 1e9) overflows
-    /// u64 in the final cast, hitting the `unwrap_or(u64::MAX)` arm.
+    /// and the post-multiply numerator (~u64::MAX * 1e9) exceeds
+    /// u64::MAX in the final try_from cast, hitting the saturate arm.
     #[test]
     fn nanos_until_n_tokens_saturates_at_u64_max() {
         // Capacity = 1, refill_rate = 1/sec. Overconsume(i64::MAX)
@@ -9363,13 +9364,25 @@ mod tests {
     /// Throttle stall on the bytes bucket alone (iops bucket
     /// unlimited). DiskThrottle with `bytes_per_sec=Some(512)` and
     /// `iops=None` accepts 1 request per second worth of bytes; a
-    /// 1024-byte T_IN request needs 1024 bytes-tokens but the
-    /// initial capacity is 512 → can_consume(1024) fails on bytes
-    /// while the unlimited ops bucket passes. Pin the asymmetric
-    /// stall: status sentinel survives, used.idx=0,
-    /// throttled_count=1, io_errors=0. Companion to the iops-only
-    /// stall tests; together they cover both single-bucket
-    /// exhaustion shapes.
+    /// Post-#32 overconsumption policy: when `n > capacity` the
+    /// throttle gate is `available >= 0` (not `available >= n`),
+    /// so an oversized request whose chain is the FIRST one this
+    /// drain sees against a freshly-seeded bucket succeeds and
+    /// drives `available` deeply negative. To exercise the STALL
+    /// path for an oversized request, the bucket must already be
+    /// in debt (`available < 0`) before the drain: at that point
+    /// the `n > capacity` gate fails on the negative balance.
+    ///
+    /// This test pre-drains the bytes bucket into debt via a
+    /// direct `bytes_bucket.consume(4096)` (allowed by the
+    /// overconsumption policy from a fresh `available = 512`
+    /// — the consume drives `available` to -3584), then issues a
+    /// 1024-byte T_IN request. With `available < 0` the
+    /// oversize gate fails and the chain stalls: status sentinel
+    /// survives, used.idx=0, throttled_count=1, io_errors=0.
+    /// Companion to the iops-only stall tests; together they
+    /// cover both single-bucket-exhaustion shapes under the
+    /// post-#32 policy.
     #[test]
     fn throttle_bytes_request_exceeds_capacity_stalls() {
         let cap = 4096u64;
@@ -9383,14 +9396,47 @@ mod tests {
         let mut dev = VirtioBlk::new(f, cap, throttle);
         let mem = make_chain_test_mem();
         let mock = MockSplitQueue::create(&mem, GuestAddress(0), 16);
+
+        // Pin last_refill BEFORE the priming consume so the refill
+        // pass inside `consume` and inside the drain's
+        // `can_consume` sees zero elapsed time and adds nothing.
+        // Without this pin the initial `available = capacity = 512`
+        // refill would have already happened (constructors seed
+        // last_refill at `Instant::now()`), but a small wall-clock
+        // tick between construction and the priming consume could
+        // otherwise nudge available upward.
+        dev.worker
+            .state_mut()
+            .bytes_bucket
+            .set_last_refill_for_test(std::time::Instant::now());
+        // Drive the bytes bucket into debt via overconsumption.
+        // n=4096 > capacity=512, gate is `available >= 0`; from
+        // a fresh seeding `available = 512 >= 0` so the consume
+        // is granted and `available = 512 - 4096 = -3584`. After
+        // this the next oversize request will FAIL the gate
+        // because `available < 0`.
+        assert!(
+            dev.worker.state_mut().bytes_bucket.consume(4096),
+            "priming overconsume must succeed against fresh \
+             available=512 — the gate is `available >= 0` for \
+             n > capacity",
+        );
+        // Re-pin so the post-priming drain's refill sees zero
+        // elapsed time and `available` stays at -3584.
+        dev.worker
+            .state_mut()
+            .bytes_bucket
+            .set_last_refill_for_test(std::time::Instant::now());
+
         let header_addr = GuestAddress(0x4000);
         let data_addr = GuestAddress(0x5000);
         let status_addr = GuestAddress(0x6000);
         // Sentinel at status so a write would be detectable.
         mem.write_slice(&[0xEEu8], status_addr).unwrap();
         write_blk_header(&mem, header_addr, VIRTIO_BLK_T_IN, 0);
-        // 1024-byte data segment — consumes 1024 bytes-tokens, but
-        // capacity is 512. can_consume(1024) → false on bytes.
+        // 1024-byte data segment — n=1024 > capacity=512, gate
+        // is `available >= 0`. With `available = -3584` from the
+        // priming consume above, the gate FAILS → stall.
         let descs = [
             RawDescriptor::from(SplitDescriptor::new(
                 header_addr.0,

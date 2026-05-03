@@ -693,9 +693,9 @@ fn build_template_via_vm(
     // on disk. The
     // VM-boot error path below unlinks on failure; replicate that
     // here so the empty / truncated file does not accumulate in the
-    // cache root across retries. Drop the fd first so the unlink
-    // observes a closed inode (matters on filesystems that delay
-    // truncate visibility until close).
+    // cache root across retries. Drop fd first as defense-in-depth
+    // — local filesystems (btrfs/ext4/xfs) propagate truncate
+    // synchronously, but FUSE/NFS backings can delay until close.
     if let Err(e) = staging_file.set_len(capacity_bytes) {
         drop(staging_file);
         let _ = std::fs::remove_file(&staging_path);

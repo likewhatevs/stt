@@ -426,6 +426,9 @@ impl CgroupManager {
     ///
     /// Requires `+memory` in the parent's `cgroup.subtree_control`;
     /// [`Self::setup`] enables it unconditionally.
+    ///
+    /// Requires CONFIG_SWAP=y in the test kernel. The file does not
+    /// exist on swapless builds; the write returns ENOENT.
     pub fn set_memory_swap_max(&self, name: &str, bytes: Option<u64>) -> Result<()> {
         let p = self.parent.join(name).join("memory.swap.max");
         let line = match bytes {
