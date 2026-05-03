@@ -8,7 +8,7 @@
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
-use super::WorkerReport;
+use super::WorkerReport; // re-exported from super::spawn
 use super::{AluWidth, FutexLockMode, SchedClass, WakeMechanism};
 use super::{defaults, humantime_serde_helper};
 
@@ -34,7 +34,6 @@ pub enum Phase {
     /// counterpart that opens `/dev/vda` directly.
     Io(#[serde(with = "humantime_serde_helper")] Duration),
 }
-
 
 /// What each worker process does during a scenario.
 ///
@@ -147,10 +146,10 @@ pub enum WorkType {
     /// fallback) with `O_DIRECT` once per worker.
     ///
     /// The convoy pathology (writes batching behind a flush
-    /// barrier) requires buffered writes; v0 uses direct IO and so
-    /// does not yet exhibit the full pathology — see the
-    /// follow-up tracked in the project queue for the buffered-IO
-    /// variant.
+    /// barrier) requires buffered writes; this variant currently
+    /// uses direct IO so the pathology surface is the synchronous
+    /// flush + the IO-mix latency distribution rather than the
+    /// page-cache convoy build-up itself.
     IoConvoy,
     /// Work hard for `burst_duration`, sleep for `sleep_duration`,
     /// repeat. Frees CPUs during sleep for borrowing. Both fields
@@ -1255,10 +1254,11 @@ pub enum WorkType {
     /// package-wide frequency throttle on x86_64 is a kernel-
     /// observable effect of running AVX-512 / AMX instructions.
     ///
-    /// **v0:** runs scalar four-stream multiplies for ALL
-    /// widths; the width selector shapes the dispatch for future
-    /// SIMD intrinsics (follow-up #309-#314). No observable
-    /// behavioral difference between widths today.
+    /// All widths currently run a scalar four-stream multiply
+    /// chain; the width selector is preserved on `WorkerReport`
+    /// so a downstream classifier can distinguish runs that
+    /// requested SIMD from runs that requested scalar, even
+    /// though the dispatch is uniform in this revision.
     ///
     /// `worker_group_size = None` (any worker count is valid;
     /// each worker runs an independent multiply chain). No
@@ -2003,11 +2003,7 @@ impl WorkType {
     /// Validation fires at spawn time, not construction time; see
     /// [`WorkType::WakeChain`] variant doc for preconditions
     /// (`depth >= 2`, `num_workers` divisible by `depth`, etc.).
-    pub fn wake_chain(
-        depth: usize,
-        wake: WakeMechanism,
-        work_per_hop: Duration,
-    ) -> Self {
+    pub fn wake_chain(depth: usize, wake: WakeMechanism, work_per_hop: Duration) -> Self {
         WorkType::WakeChain {
             depth,
             wake,
@@ -2322,3 +2318,6 @@ pub enum WorkTypeValidationError {
         group_idx: usize,
     },
 }
+
+#[cfg(test)]
+mod tests;

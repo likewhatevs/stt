@@ -1,8 +1,42 @@
 //! [`CacheDir`] handle, lock guards, and cache-lock timeout policy.
 //!
+//! Public surface: [`CacheDir`] (the operator-facing handle exposed
+//! via `crate::cache::CacheDir`), [`SharedLockGuard`] /
+//! [`ExclusiveLockGuard`] (RAII wrappers around per-key flock
+//! acquisitions), and the [`CacheDir::store`] /
+//! [`CacheDir::lookup`] / [`CacheDir::list`] /
+//! [`CacheDir::clean`] lifecycle methods. The internal
+//! `warn_if_unstripped_vmlinux` and `should_warn_unstripped`
+//! helpers gate a per-lookup warning on entries whose vmlinux
+//! sidecar took the strip-failure fallback in
+//! [`super::vmlinux_strip::strip_vmlinux_debug`].
+//!
+//! Sibling modules:
+//! - [`super::metadata`] — pure types ([`KernelSource`],
+//!   [`KernelMetadata`], [`CacheArtifacts`], [`KconfigStatus`],
+//!   [`CacheEntry`], [`ListedEntry`]) plus the
+//!   [`super::metadata::classify_corrupt_reason`] dispatcher and
+//!   [`super::metadata::format_image_missing_reason`] helper that
+//!   `list` uses to emit corrupt-entry reason strings.
+//! - [`super::housekeeping`] — atomic-rename install primitives
+//!   ([`super::housekeeping::atomic_swap_dirs`],
+//!   [`super::housekeeping::TmpDirGuard`]), cache-key /
+//!   filename validators, the JSON metadata reader
+//!   ([`super::housekeeping::read_metadata`]), and the cross-PID
+//!   orphan-tempdir sweep
+//!   ([`super::housekeeping::clean_orphaned_tmp_dirs`]).
+//! - [`super::vmlinux_strip`] — the ELF strip pipeline
+//!   ([`super::vmlinux_strip::strip_vmlinux_debug`]) `store()`
+//!   invokes when an artifact carries a vmlinux sidecar.
+//! - [`super::resolve`] — env-cascade root resolution that
+//!   `CacheDir::new` and `CacheDir::default_root` flow through.
+//!
 //! Reader/writer asymmetry: shared (reader) lock blocks 10 s,
 //! exclusive (writer) lock blocks 60 s. Writer must outlast every
 //! concurrent test reader; reader bails fast on a stuck writer.
+//! See [`SHARED_LOCK_DEFAULT_TIMEOUT`] and
+//! [`STORE_EXCLUSIVE_LOCK_TIMEOUT`] for the literal durations and
+//! their rationale.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -13,7 +47,10 @@ use super::housekeeping::{
     TmpDirGuard, atomic_swap_dirs, clean_orphaned_tmp_dirs, read_metadata, validate_cache_key,
     validate_filename,
 };
-use super::metadata::{CacheArtifacts, CacheEntry, KernelMetadata, ListedEntry};
+use super::metadata::{
+    CacheArtifacts, CacheEntry, KconfigStatus, KernelMetadata, ListedEntry,
+    format_image_missing_reason,
+};
 use super::resolve::resolve_cache_root;
 use super::vmlinux_strip::strip_vmlinux_debug;
 use super::{LOCK_DIR_NAME, TMP_DIR_PREFIX};
@@ -34,12 +71,20 @@ pub struct CacheDir {
 
 /// Emit a per-lookup warning when a cache entry was created with an
 /// unstripped vmlinux.
+///
+/// Uses [`tracing::warn!`] so the message routes through the same
+/// observability pipeline as every other cache-layer diagnostic
+/// (the cargo-ktstr binary's `tracing_subscriber::fmt` writes warns
+/// to stderr; library consumers can subscribe a different layer).
+/// `eprintln!` would bypass that pipeline and force every consumer
+/// to live with raw-stderr output regardless of their tracing
+/// configuration.
 fn warn_if_unstripped_vmlinux(entry: &CacheEntry) {
     if should_warn_unstripped(entry) {
-        eprintln!(
-            "cache: using unstripped vmlinux for {} (strip failed on a prior build; \
+        tracing::warn!(
+            cache_key = %entry.key,
+            "cache: using unstripped vmlinux (strip failed on a prior build; \
              re-run with a clean cache to retry)",
-            entry.key,
         );
     }
 }
@@ -136,10 +181,7 @@ impl CacheDir {
                         entries.push(ListedEntry::Corrupt {
                             key: name,
                             path,
-                            reason: format!(
-                                "image file {} missing from entry directory",
-                                metadata.image_name
-                            ),
+                            reason: format_image_missing_reason(&metadata.image_name),
                         });
                     }
                 }
@@ -166,8 +208,60 @@ impl CacheDir {
         Ok(entries)
     }
 
-    /// Store a kernel image in the cache. Atomic install via temp
-    /// directory + `renameat2(RENAME_EXCHANGE)`.
+    /// Store a kernel image (and optional vmlinux sidecar) in the
+    /// cache under `cache_key`. Atomic install via temp directory +
+    /// `renameat2(RENAME_EXCHANGE)`, so a concurrent reader never
+    /// observes a partially-written entry.
+    ///
+    /// # Steps (in order)
+    ///
+    /// 1. **Validate inputs.** [`validate_cache_key`] rejects
+    ///    `..`, slashes, NUL, and the `TMP_DIR_PREFIX` reservation;
+    ///    [`validate_filename`] rejects path-separator characters in
+    ///    the image basename. Invalid input fails before any I/O.
+    /// 2. **Acquire the per-key store lock.** `LOCK_EX` on
+    ///    `<root>/.locks/<cache_key>.lock` with a
+    ///    [`STORE_EXCLUSIVE_LOCK_TIMEOUT`]-second budget (currently
+    ///    60s). The lock excludes other writers for the same key
+    ///    while letting readers and writers for unrelated keys
+    ///    proceed. Timeout produces an error rather than blocking
+    ///    forever — a hung writer cannot indefinitely block a fresh
+    ///    rebuild attempt.
+    /// 3. **Stage into a temp directory.** `<root>/.tmp-<key>-<pid>`
+    ///    is created (or pruned and recreated if a previous attempt
+    ///    by the same PID exists), with [`TmpDirGuard`] enrolling the
+    ///    path for cleanup on any subsequent error. A best-effort
+    ///    [`clean_orphaned_tmp_dirs`] pass also runs here so dead
+    ///    sibling temp directories from crashed PIDs are GC'd before
+    ///    we add another one.
+    /// 4. **Copy the boot image.** `metadata.image_name` lands at
+    ///    `tmp/<image_name>` via `fs::copy`.
+    /// 5. **Strip and copy vmlinux (if supplied).** When
+    ///    `artifacts.vmlinux` is `Some`, [`strip_vmlinux_debug`]
+    ///    runs the 3-stage strip pipeline and the result is written
+    ///    to `tmp/vmlinux`. **Strip-fallback rationale:** if the
+    ///    strip pipeline returns an error (e.g. an unrecognised ELF
+    ///    layout from a future toolchain or an exotic config), the
+    ///    write does NOT abort — it falls back to copying the raw
+    ///    unstripped vmlinux and records `vmlinux_stripped: false`
+    ///    in metadata. The cache trades a much larger on-disk
+    ///    payload for "still usable for monitoring/probes," and
+    ///    `cargo ktstr kernel list --json` exposes the
+    ///    `vmlinux_stripped` field so operators can spot entries
+    ///    that need rebuilding once the strip-failure root cause is
+    ///    fixed. A hard failure here would be worse: it would
+    ///    effectively brick the cache for that build.
+    /// 6. **Write `metadata.json`.** A pretty-printed serde dump of
+    ///    `KernelMetadata` (with `has_vmlinux` and `vmlinux_stripped`
+    ///    set from step 5) at `tmp/metadata.json`. Pretty-print is
+    ///    intentional — operators inspect this file directly when
+    ///    debugging cache state.
+    /// 7. **Atomic publish.** `fs::rename(tmp → final)` if `final`
+    ///    does not exist; otherwise [`atomic_swap_dirs`] uses
+    ///    `renameat2(RENAME_EXCHANGE)` to swap the two directories
+    ///    in a single atomic syscall. Either way, no reader observes
+    ///    a partial entry; the swap path also cleans up the
+    ///    now-stale prior version under the temp name.
     pub fn store(
         &self,
         cache_key: &str,
@@ -366,4 +460,1357 @@ pub struct SharedLockGuard {
 pub struct ExclusiveLockGuard {
     #[allow(dead_code)]
     fd: std::os::fd::OwnedFd,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::shared_test_helpers::{create_fake_image, test_metadata};
+    use super::*;
+    use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+    use std::fs;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    // -- CacheDir --
+
+    #[test]
+    fn cache_dir_with_root_does_not_create_dir() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("kernels");
+        assert!(!root.exists());
+        let cache = CacheDir::with_root(root.clone());
+        assert!(!root.exists());
+        assert_eq!(cache.root(), root);
+    }
+
+    #[test]
+    fn cache_dir_list_returns_empty_for_nonexistent_root() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("never-created");
+        assert!(!root.exists());
+        let cache = CacheDir::with_root(root);
+        let entries = cache.list().unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn cache_dir_store_creates_root_lazily() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("lazy-root");
+        assert!(!root.exists());
+        let cache = CacheDir::with_root(root.clone());
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+        let meta = test_metadata("6.14.2");
+        cache
+            .store("key", &CacheArtifacts::new(&image), &meta)
+            .unwrap();
+        assert!(root.exists(), "store() must create the cache root");
+    }
+
+    #[test]
+    fn cache_dir_default_root_returns_path() {
+        let _lock = lock_env();
+        let tmp = TempDir::new().unwrap();
+        let _guard = EnvVarGuard::set("KTSTR_CACHE_DIR", tmp.path());
+        let resolved = CacheDir::default_root().unwrap();
+        assert_eq!(resolved, tmp.path());
+    }
+
+    #[test]
+    fn cache_dir_list_empty() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().to_path_buf());
+        let entries = cache.list().unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn cache_dir_store_and_lookup() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
+
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+        let meta = test_metadata("6.14.2");
+
+        let entry = cache
+            .store("6.14.2-tarball-x86_64", &CacheArtifacts::new(&image), &meta)
+            .unwrap();
+        assert_eq!(entry.key, "6.14.2-tarball-x86_64");
+        assert!(entry.path.join("bzImage").exists());
+        assert!(entry.path.join("metadata.json").exists());
+
+        let found = cache.lookup("6.14.2-tarball-x86_64");
+        assert!(found.is_some());
+        let found = found.unwrap();
+        assert_eq!(found.key, "6.14.2-tarball-x86_64");
+        assert_eq!(found.metadata.version.as_deref(), Some("6.14.2"));
+    }
+
+    #[test]
+    fn cache_dir_lookup_missing() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().to_path_buf());
+        assert!(cache.lookup("nonexistent").is_none());
+    }
+
+    #[test]
+    fn cache_dir_lookup_corrupt_metadata() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().to_path_buf());
+        let entry_dir = tmp.path().join("bad-entry");
+        fs::create_dir_all(&entry_dir).unwrap();
+        fs::write(entry_dir.join("bzImage"), b"fake").unwrap();
+        fs::write(entry_dir.join("metadata.json"), b"not json").unwrap();
+        let found = cache.lookup("bad-entry");
+        assert!(found.is_none());
+    }
+
+    #[test]
+    fn cache_dir_lookup_missing_image() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().to_path_buf());
+
+        let entry_dir = tmp.path().join("no-image");
+        fs::create_dir_all(&entry_dir).unwrap();
+        let meta = test_metadata("6.14.2");
+        let json = serde_json::to_string(&meta).unwrap();
+        fs::write(entry_dir.join("metadata.json"), json).unwrap();
+
+        let found = cache.lookup("no-image");
+        assert!(found.is_none());
+    }
+
+    #[test]
+    fn cache_dir_store_overwrites_existing() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+
+        let meta1 = KernelMetadata {
+            built_at: "2026-04-12T10:00:00Z".to_string(),
+            ..test_metadata("6.14.2")
+        };
+        cache
+            .store(
+                "6.14.2-tarball-x86_64",
+                &CacheArtifacts::new(&image),
+                &meta1,
+            )
+            .unwrap();
+
+        let meta2 = KernelMetadata {
+            built_at: "2026-04-12T11:00:00Z".to_string(),
+            ..test_metadata("6.14.2")
+        };
+        cache
+            .store(
+                "6.14.2-tarball-x86_64",
+                &CacheArtifacts::new(&image),
+                &meta2,
+            )
+            .unwrap();
+
+        let found = cache.lookup("6.14.2-tarball-x86_64").unwrap();
+        assert_eq!(found.metadata.built_at, "2026-04-12T11:00:00Z");
+    }
+
+    #[test]
+    fn cache_dir_list_sorted_newest_first() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+
+        let meta_old = KernelMetadata {
+            built_at: "2026-04-10T10:00:00Z".to_string(),
+            ..test_metadata("6.13.0")
+        };
+        let meta_new = KernelMetadata {
+            built_at: "2026-04-12T10:00:00Z".to_string(),
+            ..test_metadata("6.14.2")
+        };
+        let meta_mid = KernelMetadata {
+            built_at: "2026-04-11T10:00:00Z".to_string(),
+            ..test_metadata("6.14.0")
+        };
+
+        cache
+            .store("old", &CacheArtifacts::new(&image), &meta_old)
+            .unwrap();
+        cache
+            .store("new", &CacheArtifacts::new(&image), &meta_new)
+            .unwrap();
+        cache
+            .store("mid", &CacheArtifacts::new(&image), &meta_mid)
+            .unwrap();
+
+        let entries = cache.list().unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].key(), "new");
+        assert_eq!(entries[1].key(), "mid");
+        assert_eq!(entries[2].key(), "old");
+    }
+
+    #[test]
+    fn cache_dir_list_includes_corrupt_entries() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().to_path_buf());
+
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+        let meta = test_metadata("6.14.2");
+        cache
+            .store("valid", &CacheArtifacts::new(&image), &meta)
+            .unwrap();
+
+        let bad_dir = tmp.path().join("corrupt");
+        fs::create_dir_all(&bad_dir).unwrap();
+
+        let entries = cache.list().unwrap();
+        assert_eq!(entries.len(), 2);
+        let valid = entries.iter().find(|e| e.key() == "valid").unwrap();
+        assert!(valid.as_valid().is_some());
+        let corrupt = entries.iter().find(|e| e.key() == "corrupt").unwrap();
+        assert!(corrupt.as_valid().is_none());
+        let ListedEntry::Corrupt { reason, .. } = corrupt else {
+            panic!("expected Corrupt variant");
+        };
+        assert_eq!(
+            reason, "metadata.json missing",
+            "missing-metadata reason should be the exact missing-file label, got: {reason}",
+        );
+    }
+
+    #[test]
+    fn cache_dir_list_classifies_missing_image_as_corrupt() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().to_path_buf());
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+        let meta = test_metadata("6.14.2");
+        let entry = cache
+            .store("missing-image", &CacheArtifacts::new(&image), &meta)
+            .unwrap();
+
+        fs::remove_file(entry.image_path()).unwrap();
+
+        let entries = cache.list().unwrap();
+        assert_eq!(entries.len(), 1);
+        let listed = &entries[0];
+        assert_eq!(listed.key(), "missing-image");
+        assert!(
+            listed.as_valid().is_none(),
+            "entry with missing image must not surface as Valid",
+        );
+        let ListedEntry::Corrupt { reason, .. } = listed else {
+            panic!("expected Corrupt variant for missing-image entry");
+        };
+        assert!(
+            reason.contains("image file") && reason.contains("missing"),
+            "reason should cite missing image file, got: {reason}",
+        );
+        assert!(
+            reason.contains(&meta.image_name),
+            "reason should name the specific image file, got: {reason}",
+        );
+    }
+
+    #[test]
+    fn cache_dir_list_classifies_unreadable_metadata_as_corrupt() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().to_path_buf());
+        let entry_dir = tmp.path().join("unreadable-metadata");
+        fs::create_dir_all(entry_dir.join("metadata.json")).unwrap();
+
+        let entries = cache.list().unwrap();
+        assert_eq!(entries.len(), 1);
+        let listed = &entries[0];
+        assert_eq!(listed.key(), "unreadable-metadata");
+        assert!(listed.as_valid().is_none());
+        let ListedEntry::Corrupt { reason, .. } = listed else {
+            panic!("expected Corrupt variant for entry with unreadable metadata");
+        };
+        assert!(
+            reason.starts_with("metadata.json unreadable: "),
+            "unreadable-metadata reason should carry the unreadable prefix distinct from the \
+             missing / schema-drift / malformed / truncated prefixes, got: {reason}",
+        );
+    }
+
+    #[test]
+    fn cache_dir_list_classifies_malformed_json_as_corrupt() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().to_path_buf());
+        let entry_dir = tmp.path().join("malformed-json");
+        fs::create_dir_all(&entry_dir).unwrap();
+        fs::write(entry_dir.join("metadata.json"), b"not valid json {[").unwrap();
+
+        let entries = cache.list().unwrap();
+        assert_eq!(entries.len(), 1);
+        let listed = &entries[0];
+        assert_eq!(listed.key(), "malformed-json");
+        assert!(listed.as_valid().is_none());
+        let ListedEntry::Corrupt { reason, .. } = listed else {
+            panic!("expected Corrupt variant for malformed-json entry");
+        };
+        assert!(
+            reason.starts_with("metadata.json malformed: "),
+            "malformed-JSON reason should carry the malformed prefix \
+             (Category::Syntax route), got: {reason}",
+        );
+    }
+
+    #[test]
+    fn cache_dir_list_classifies_incomplete_metadata_as_corrupt() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().to_path_buf());
+        let entry_dir = tmp.path().join("incomplete-metadata");
+        fs::create_dir_all(&entry_dir).unwrap();
+        fs::write(entry_dir.join("metadata.json"), br#"{"version": "6.14"}"#).unwrap();
+
+        let entries = cache.list().unwrap();
+        assert_eq!(entries.len(), 1);
+        let listed = &entries[0];
+        assert_eq!(listed.key(), "incomplete-metadata");
+        assert!(
+            listed.as_valid().is_none(),
+            "incomplete-metadata missing required fields must not deserialize as Valid",
+        );
+        let ListedEntry::Corrupt { reason, .. } = listed else {
+            panic!("expected Corrupt variant for entry with incomplete metadata");
+        };
+        assert!(
+            reason.starts_with("metadata.json schema drift: "),
+            "incomplete-metadata reason should carry the schema-drift \
+             prefix (Category::Data route), got: {reason}",
+        );
+        assert!(
+            reason.contains("missing field `source`"),
+            "incomplete-metadata reason should name the first missing required field, got: {reason}",
+        );
+    }
+
+    #[test]
+    fn cache_dir_list_classifies_truncated_json_as_corrupt() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().to_path_buf());
+        let entry_dir = tmp.path().join("truncated-json");
+        fs::create_dir_all(&entry_dir).unwrap();
+        fs::write(entry_dir.join("metadata.json"), br#"{"source":"#).unwrap();
+
+        let entries = cache.list().unwrap();
+        assert_eq!(entries.len(), 1);
+        let listed = &entries[0];
+        assert_eq!(listed.key(), "truncated-json");
+        assert!(listed.as_valid().is_none());
+        let ListedEntry::Corrupt { reason, .. } = listed else {
+            panic!("expected Corrupt variant for truncated-json entry");
+        };
+        assert!(
+            reason.starts_with("metadata.json truncated: "),
+            "truncated-JSON reason should carry the truncated prefix \
+             (Category::Eof route), got: {reason}",
+        );
+    }
+
+    #[test]
+    fn cache_dir_list_skips_tmp_dirs() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().to_path_buf());
+
+        let tmp_dir = tmp.path().join(".tmp-in-progress-12345");
+        fs::create_dir_all(&tmp_dir).unwrap();
+
+        let entries = cache.list().unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn cache_dir_list_skips_regular_files() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().to_path_buf());
+
+        fs::write(tmp.path().join("stray-file.txt"), b"stray").unwrap();
+
+        let entries = cache.list().unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn cache_dir_clean_all() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+
+        cache
+            .store("a", &CacheArtifacts::new(&image), &test_metadata("6.14.0"))
+            .unwrap();
+        cache
+            .store("b", &CacheArtifacts::new(&image), &test_metadata("6.14.1"))
+            .unwrap();
+        cache
+            .store("c", &CacheArtifacts::new(&image), &test_metadata("6.14.2"))
+            .unwrap();
+
+        let removed = cache.clean_all().unwrap();
+        assert_eq!(removed, 3);
+        assert!(cache.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cache_dir_clean_keep_n() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+
+        let meta_old = KernelMetadata {
+            built_at: "2026-04-10T10:00:00Z".to_string(),
+            ..test_metadata("6.13.0")
+        };
+        let meta_new = KernelMetadata {
+            built_at: "2026-04-12T10:00:00Z".to_string(),
+            ..test_metadata("6.14.2")
+        };
+        let meta_mid = KernelMetadata {
+            built_at: "2026-04-11T10:00:00Z".to_string(),
+            ..test_metadata("6.14.0")
+        };
+
+        cache
+            .store("old", &CacheArtifacts::new(&image), &meta_old)
+            .unwrap();
+        cache
+            .store("new", &CacheArtifacts::new(&image), &meta_new)
+            .unwrap();
+        cache
+            .store("mid", &CacheArtifacts::new(&image), &meta_mid)
+            .unwrap();
+
+        let removed = cache.clean_keep(1).unwrap();
+        assert_eq!(removed, 2);
+
+        let remaining = cache.list().unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].key(), "new");
+    }
+
+    #[test]
+    fn cache_dir_clean_keep_more_than_exist() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+
+        cache
+            .store(
+                "only",
+                &CacheArtifacts::new(&image),
+                &test_metadata("6.14.2"),
+            )
+            .unwrap();
+
+        let removed = cache.clean_keep(5).unwrap();
+        assert_eq!(removed, 0);
+        assert_eq!(cache.list().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn cache_dir_clean_empty_cache() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().to_path_buf());
+        let removed = cache.clean_all().unwrap();
+        assert_eq!(removed, 0);
+    }
+
+    // -- image_name traversal via store --
+
+    #[test]
+    fn cache_dir_store_rejects_image_name_traversal() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+        let mut meta = test_metadata("6.14.2");
+        meta.image_name = "../escape".to_string();
+
+        let err = cache
+            .store("valid-key", &CacheArtifacts::new(&image), &meta)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("image name"),
+            "expected image_name rejection, got: {err}"
+        );
+    }
+
+    // -- .tmp- prefix via store/lookup --
+
+    #[test]
+    fn cache_dir_store_tmp_prefix_key_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+        let meta = test_metadata("6.14.2");
+
+        let err = cache
+            .store(".tmp-sneaky", &CacheArtifacts::new(&image), &meta)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains(".tmp-"),
+            "expected .tmp- rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn cache_dir_lookup_tmp_prefix_returns_none() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().to_path_buf());
+        assert!(cache.lookup(".tmp-sneaky").is_none());
+    }
+
+    // -- cache key validation via store/lookup --
+
+    #[test]
+    fn cache_dir_store_empty_key_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+        let meta = test_metadata("6.14.2");
+
+        let err = cache
+            .store("", &CacheArtifacts::new(&image), &meta)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("empty"),
+            "expected empty-key error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn cache_dir_lookup_empty_key_returns_none() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().to_path_buf());
+        assert!(cache.lookup("").is_none());
+    }
+
+    #[test]
+    fn cache_dir_store_path_traversal_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+        let meta = test_metadata("6.14.2");
+
+        let err = cache
+            .store("../escape", &CacheArtifacts::new(&image), &meta)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("path"),
+            "expected path-traversal error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn cache_dir_lookup_path_traversal_returns_none() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().to_path_buf());
+        assert!(cache.lookup("../escape").is_none());
+        assert!(cache.lookup("foo/../bar").is_none());
+    }
+
+    #[test]
+    fn cache_dir_store_slash_in_key_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+        let meta = test_metadata("6.14.2");
+
+        let err = cache
+            .store("a/b", &CacheArtifacts::new(&image), &meta)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("path separator"),
+            "expected path-separator error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn cache_dir_store_whitespace_only_key_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+        let meta = test_metadata("6.14.2");
+
+        let err = cache
+            .store("   ", &CacheArtifacts::new(&image), &meta)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("empty"),
+            "expected empty/whitespace error, got: {err}"
+        );
+    }
+
+    // -- clean with mixed valid + corrupt entries --
+
+    #[test]
+    fn cache_dir_clean_keep_n_with_mixed_entries() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+
+        let meta_new = KernelMetadata {
+            built_at: "2026-04-12T10:00:00Z".to_string(),
+            ..test_metadata("6.14.2")
+        };
+        let meta_old = KernelMetadata {
+            built_at: "2026-04-10T10:00:00Z".to_string(),
+            ..test_metadata("6.13.0")
+        };
+        cache
+            .store("new", &CacheArtifacts::new(&image), &meta_new)
+            .unwrap();
+        cache
+            .store("old", &CacheArtifacts::new(&image), &meta_old)
+            .unwrap();
+
+        let corrupt_dir = tmp.path().join("cache").join("corrupt");
+        fs::create_dir_all(&corrupt_dir).unwrap();
+
+        let removed = cache.clean_keep(1).unwrap();
+        assert_eq!(removed, 2);
+
+        let remaining = cache.list().unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].key(), "new");
+    }
+
+    // -- atomic write safety --
+
+    #[test]
+    fn cache_dir_store_overwrites_existing_key_atomically() {
+        let tmp = TempDir::new().unwrap();
+        let cache_root = tmp.path().join("cache");
+        let cache = CacheDir::with_root(cache_root.clone());
+
+        let src_a = TempDir::new().unwrap();
+        let image_a = create_fake_image(src_a.path());
+        fs::write(&image_a, b"version-a").unwrap();
+        let mut meta_a = test_metadata("6.14.2");
+        meta_a.built_at = "2026-04-10T00:00:00Z".to_string();
+        let entry_a = cache
+            .store("collide", &CacheArtifacts::new(&image_a), &meta_a)
+            .unwrap();
+        assert_eq!(
+            fs::read(entry_a.path.join("bzImage")).unwrap(),
+            b"version-a"
+        );
+
+        let src_b = TempDir::new().unwrap();
+        let image_b = create_fake_image(src_b.path());
+        fs::write(&image_b, b"version-b").unwrap();
+        let mut meta_b = test_metadata("6.14.2");
+        meta_b.built_at = "2026-04-18T00:00:00Z".to_string();
+        let entry_b = cache
+            .store("collide", &CacheArtifacts::new(&image_b), &meta_b)
+            .unwrap();
+
+        assert_eq!(
+            fs::read(entry_b.path.join("bzImage")).unwrap(),
+            b"version-b",
+            "new content must replace old content atomically"
+        );
+        let installed_meta = read_metadata(&entry_b.path).expect("metadata.json");
+        assert_eq!(installed_meta.built_at, "2026-04-18T00:00:00Z");
+
+        for dirent in fs::read_dir(&cache_root).unwrap() {
+            let name = dirent.unwrap().file_name().to_string_lossy().into_owned();
+            assert!(
+                !name.starts_with(".evict-") && !name.starts_with(".tmp-"),
+                "unexpected leftover directory under cache_root: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn cache_dir_store_cleans_stale_tmp() {
+        let tmp = TempDir::new().unwrap();
+        let cache_root = tmp.path().join("cache");
+        let cache = CacheDir::with_root(cache_root.clone());
+
+        let stale_tmp = cache_root.join(format!(".tmp-mykey-{}", std::process::id()));
+        fs::create_dir_all(&stale_tmp).unwrap();
+        fs::write(stale_tmp.join("junk"), b"leftover").unwrap();
+
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+        let meta = test_metadata("6.14.2");
+
+        let entry = cache
+            .store("mykey", &CacheArtifacts::new(&image), &meta)
+            .unwrap();
+        assert!(entry.path.join("bzImage").exists());
+        assert!(!stale_tmp.exists());
+    }
+
+    #[test]
+    fn cache_dir_store_atomic_under_concurrent_readers() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::thread;
+
+        let tmp = TempDir::new().unwrap();
+        let cache_root = tmp.path().join("cache");
+        let cache = Arc::new(CacheDir::with_root(cache_root.clone()));
+
+        let src_a = TempDir::new().unwrap();
+        let image_a = src_a.path().join("bzImage");
+        let content_a = b"AAAAAAAA-image-version-a-AAAAAAAA".repeat(64);
+        fs::write(&image_a, &content_a).unwrap();
+
+        let src_b = TempDir::new().unwrap();
+        let image_b = src_b.path().join("bzImage");
+        let content_b = b"BBBBBBBB-image-version-b-BBBBBBBB".repeat(64);
+        fs::write(&image_b, &content_b).unwrap();
+
+        let meta_prime = test_metadata("6.14.2");
+        cache
+            .store("atomic-key", &CacheArtifacts::new(&image_a), &meta_prime)
+            .unwrap();
+
+        const WRITE_ITERATIONS: usize = 40;
+        let stop = Arc::new(AtomicBool::new(false));
+        let lookups_observed = Arc::new(AtomicUsize::new(0));
+        let atomicity_violations = Arc::new(AtomicUsize::new(0));
+
+        let reader_count = 4;
+        let mut readers = Vec::with_capacity(reader_count);
+        for _ in 0..reader_count {
+            let cache = Arc::clone(&cache);
+            let stop = Arc::clone(&stop);
+            let lookups_observed = Arc::clone(&lookups_observed);
+            let violations = Arc::clone(&atomicity_violations);
+            let expected_a = content_a.clone();
+            let expected_b = content_b.clone();
+            readers.push(thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let Some(entry) = cache.lookup("atomic-key") else {
+                        violations.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    };
+                    let image_path = entry.image_path();
+                    let Ok(bytes) = fs::read(&image_path) else {
+                        violations.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    };
+                    if bytes != expected_a && bytes != expected_b {
+                        violations.fetch_add(1, Ordering::Relaxed);
+                    }
+                    lookups_observed.fetch_add(1, Ordering::Relaxed);
+                }
+            }));
+        }
+
+        for i in 0..WRITE_ITERATIONS {
+            let (image, label) = if i % 2 == 0 {
+                (&image_a, "a")
+            } else {
+                (&image_b, "b")
+            };
+            let mut meta = test_metadata("6.14.2");
+            meta.built_at = format!("2026-04-18T00:00:{:02}Z", i % 60);
+            meta.config_hash = Some(format!("iter-{i}-{label}"));
+            cache
+                .store("atomic-key", &CacheArtifacts::new(image), &meta)
+                .expect("store under concurrent readers must not fail");
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        for r in readers {
+            r.join().expect("reader thread panicked");
+        }
+
+        assert_eq!(
+            atomicity_violations.load(Ordering::Relaxed),
+            0,
+            "lookup observed a missing or torn cache entry during concurrent store; \
+             rename-to-staging swap is not atomic",
+        );
+        assert!(
+            lookups_observed.load(Ordering::Relaxed) > 0,
+            "readers never observed a successful lookup — test did not \
+             actually exercise the concurrency window",
+        );
+
+        let final_entry = cache.lookup("atomic-key").expect("entry must exist");
+        let final_bytes = fs::read(final_entry.image_path()).unwrap();
+        assert!(
+            final_bytes == content_a || final_bytes == content_b,
+            "final image must match one of the writer's versions",
+        );
+        for dirent in fs::read_dir(&cache_root).unwrap() {
+            let name = dirent.unwrap().file_name().to_string_lossy().into_owned();
+            assert!(
+                !name.starts_with(".evict-") && !name.starts_with(".tmp-"),
+                "unexpected leftover directory under cache_root: {name}",
+            );
+        }
+    }
+
+    #[test]
+    fn cache_dir_store_with_vmlinux() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+        let vmlinux = src_dir.path().join("vmlinux");
+        fs::write(&vmlinux, b"fake vmlinux ELF").unwrap();
+        let meta = test_metadata("6.14.2");
+
+        let entry = cache
+            .store(
+                "with-vmlinux",
+                &CacheArtifacts::new(&image).with_vmlinux(&vmlinux),
+                &meta,
+            )
+            .unwrap();
+        assert!(entry.path.join("bzImage").exists());
+        assert!(entry.path.join("vmlinux").exists());
+        assert!(entry.path.join("metadata.json").exists());
+        assert!(entry.metadata.has_vmlinux);
+        assert!(image.exists());
+        assert!(vmlinux.exists());
+    }
+
+    #[test]
+    fn cache_dir_store_without_vmlinux() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+        let meta = test_metadata("6.14.2");
+
+        let entry = cache
+            .store("no-vmlinux", &CacheArtifacts::new(&image), &meta)
+            .unwrap();
+        assert!(entry.path.join("bzImage").exists());
+        assert!(!entry.path.join("vmlinux").exists());
+        assert!(entry.path.join("metadata.json").exists());
+        assert!(!entry.metadata.has_vmlinux);
+        assert!(!entry.metadata.vmlinux_stripped);
+    }
+
+    #[test]
+    fn cache_dir_store_falls_back_when_strip_fails() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+        let vmlinux = src_dir.path().join("vmlinux");
+        let raw = b"not an ELF file";
+        fs::write(&vmlinux, raw).unwrap();
+        let meta = test_metadata("6.14.2");
+
+        let entry = cache
+            .store(
+                "strip-fallback",
+                &CacheArtifacts::new(&image).with_vmlinux(&vmlinux),
+                &meta,
+            )
+            .unwrap();
+        let cached = fs::read(entry.path.join("vmlinux")).unwrap();
+        assert_eq!(cached, raw, "fallback must copy raw bytes verbatim");
+        assert!(entry.metadata.has_vmlinux);
+        assert!(
+            !entry.metadata.vmlinux_stripped,
+            "raw-fallback path must set vmlinux_stripped = false"
+        );
+    }
+
+    // -- should_warn_unstripped --
+
+    fn make_warn_test_entry(has_vmlinux: bool, vmlinux_stripped: bool) -> CacheEntry {
+        let mut meta = KernelMetadata::new(
+            super::super::metadata::KernelSource::Tarball,
+            "x86_64".to_string(),
+            "bzImage".to_string(),
+            "2026-04-24T12:00:00Z".to_string(),
+        );
+        meta.set_has_vmlinux(has_vmlinux);
+        meta.set_vmlinux_stripped(vmlinux_stripped);
+        CacheEntry {
+            key: "test-key".to_string(),
+            path: PathBuf::from("/nonexistent/entry"),
+            metadata: meta,
+        }
+    }
+
+    #[test]
+    fn should_warn_unstripped_fires_when_vmlinux_present_and_unstripped() {
+        let entry = make_warn_test_entry(true, false);
+        assert!(
+            should_warn_unstripped(&entry),
+            "has_vmlinux=true + vmlinux_stripped=false must warn"
+        );
+    }
+
+    #[test]
+    fn should_warn_unstripped_silent_when_vmlinux_stripped() {
+        let entry = make_warn_test_entry(true, true);
+        assert!(
+            !should_warn_unstripped(&entry),
+            "has_vmlinux=true + vmlinux_stripped=true must not warn"
+        );
+    }
+
+    #[test]
+    fn should_warn_unstripped_silent_when_no_vmlinux() {
+        let entry = make_warn_test_entry(false, false);
+        assert!(
+            !should_warn_unstripped(&entry),
+            "has_vmlinux=false must not warn (no vmlinux to worry about)"
+        );
+    }
+
+    #[test]
+    fn cache_dir_store_preserves_original_image() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+        let meta = test_metadata("6.14.2");
+
+        cache
+            .store("key", &CacheArtifacts::new(&image), &meta)
+            .unwrap();
+
+        assert!(image.exists());
+    }
+
+    // -- CacheEntry accessors --
+
+    #[test]
+    fn cache_entry_image_path_joins_key_with_image_name() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+        let entry = cache
+            .store(
+                "key",
+                &CacheArtifacts::new(&image),
+                &test_metadata("6.14.2"),
+            )
+            .unwrap();
+        assert_eq!(entry.image_path(), entry.path.join("bzImage"));
+        assert!(entry.image_path().exists());
+    }
+
+    #[test]
+    fn cache_entry_vmlinux_path_none_when_not_stored() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+        let entry = cache
+            .store(
+                "no-vml",
+                &CacheArtifacts::new(&image),
+                &test_metadata("6.14.2"),
+            )
+            .unwrap();
+        assert!(entry.vmlinux_path().is_none());
+    }
+
+    // -- KconfigStatus variants --
+
+    #[test]
+    fn kconfig_status_matches_when_hash_equal() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+        let meta = test_metadata("6.14.2").with_ktstr_kconfig_hash(Some("deadbeef".to_string()));
+        let entry = cache
+            .store("kc-match", &CacheArtifacts::new(&image), &meta)
+            .unwrap();
+        assert_eq!(entry.kconfig_status("deadbeef"), KconfigStatus::Matches);
+    }
+
+    #[test]
+    fn kconfig_status_untracked_when_no_hash_in_entry() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+        let meta = KernelMetadata {
+            ktstr_kconfig_hash: None,
+            ..test_metadata("6.14.2")
+        };
+        let entry = cache
+            .store("kc-untracked", &CacheArtifacts::new(&image), &meta)
+            .unwrap();
+        assert_eq!(entry.kconfig_status("anything"), KconfigStatus::Untracked);
+    }
+
+    #[test]
+    fn kconfig_status_stale_pins_cached_and_current_field_order() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+        let meta = test_metadata("6.14.2").with_ktstr_kconfig_hash(Some("old_cached".to_string()));
+        let entry = cache
+            .store("kc-stale", &CacheArtifacts::new(&image), &meta)
+            .unwrap();
+        match entry.kconfig_status("new_current") {
+            KconfigStatus::Stale { cached, current } => {
+                assert_eq!(
+                    cached, "old_cached",
+                    "`cached` must hold the hash recorded in the entry"
+                );
+                assert_eq!(
+                    current, "new_current",
+                    "`current` must hold the hash the caller passed in"
+                );
+            }
+            other => panic!("expected KconfigStatus::Stale, got {other:?}"),
+        }
+    }
+
+    // -- Cache-entry coordination locks --
+
+    #[test]
+    fn acquire_shared_lock_creates_lockfile_at_expected_path() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().to_path_buf());
+        let _guard = cache.acquire_shared_lock("some-key-123").unwrap();
+        assert!(
+            tmp.path().join(".locks").is_dir(),
+            "parent .locks/ subdirectory must materialize on first acquire",
+        );
+        assert!(
+            tmp.path().join(".locks").join("some-key-123.lock").exists(),
+            "lockfile must materialize at {{cache_root}}/.locks/{{key}}.lock on first acquire",
+        );
+    }
+
+    #[test]
+    fn acquire_shared_lock_permits_concurrent_readers() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let tmp = TempDir::new().unwrap();
+        let cache = Arc::new(CacheDir::with_root(tmp.path().to_path_buf()));
+        let key = "concurrent-sh";
+        let success = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let cache = Arc::clone(&cache);
+            let success = Arc::clone(&success);
+            handles.push(std::thread::spawn(move || {
+                let _g = cache
+                    .acquire_shared_lock(key)
+                    .expect("LOCK_SH must succeed");
+                success.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }));
+        }
+        for h in handles {
+            h.join().expect("reader thread panicked");
+        }
+        assert_eq!(
+            success.load(Ordering::SeqCst),
+            4,
+            "all 4 concurrent LOCK_SH acquires must succeed",
+        );
+    }
+
+    #[test]
+    fn try_acquire_exclusive_lock_fails_with_active_reader() {
+        use std::sync::Arc;
+        use std::sync::mpsc;
+        let tmp = TempDir::new().unwrap();
+        let cache = Arc::new(CacheDir::with_root(tmp.path().to_path_buf()));
+        let key = "force-contended";
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let cache_reader = Arc::clone(&cache);
+        let reader = std::thread::spawn(move || {
+            let _g = cache_reader
+                .acquire_shared_lock(key)
+                .expect("reader LOCK_SH must succeed");
+            ready_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("reader thread did not signal ready in time");
+        let err = cache.try_acquire_exclusive_lock(key).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("is locked by active test runs") || msg.contains("holders:"),
+            "error must surface the contention diagnostic; got: {msg}",
+        );
+        assert!(
+            msg.contains("lockfile"),
+            "error must name the lockfile path: {msg}",
+        );
+        release_tx.send(()).unwrap();
+        reader.join().expect("reader thread panicked");
+    }
+
+    #[test]
+    fn acquire_exclusive_lock_blocking_times_out_on_contention() {
+        use std::sync::Arc;
+        use std::sync::mpsc;
+        let tmp = TempDir::new().unwrap();
+        let cache = Arc::new(CacheDir::with_root(tmp.path().to_path_buf()));
+        let key = "blocking-timeout";
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let cache_reader = Arc::clone(&cache);
+        let reader = std::thread::spawn(move || {
+            let _g = cache_reader
+                .acquire_shared_lock(key)
+                .expect("reader LOCK_SH must succeed");
+            ready_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("reader did not signal ready in time");
+        let start = std::time::Instant::now();
+        let err = cache
+            .acquire_exclusive_lock_blocking(key, std::time::Duration::from_millis(200))
+            .unwrap_err();
+        let elapsed = start.elapsed();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("timed out"),
+            "error must mention the timeout: {msg}",
+        );
+        assert!(
+            elapsed >= std::time::Duration::from_millis(150),
+            "acquire should have waited ~timeout (150ms lower bound); \
+             got {elapsed:?}",
+        );
+        release_tx.send(()).unwrap();
+        reader.join().expect("reader thread panicked");
+    }
+
+    #[test]
+    fn store_succeeds_under_internal_exclusive_lock() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+        let meta = test_metadata("6.14.2");
+        let entry = cache
+            .store("internal-lock", &CacheArtifacts::new(&image), &meta)
+            .expect("store must succeed when no readers contend");
+        assert!(entry.path.join("bzImage").exists());
+        assert!(
+            tmp.path()
+                .join("cache")
+                .join(".locks")
+                .join("internal-lock.lock")
+                .exists(),
+            "lockfile materialized during store must persist after store returns",
+        );
+    }
+
+    #[test]
+    fn store_blocks_while_reader_holds_shared_lock() {
+        use std::sync::Arc;
+        use std::sync::mpsc;
+        let tmp = TempDir::new().unwrap();
+        let cache = Arc::new(CacheDir::with_root(tmp.path().join("cache-block")));
+        let key = "blocked-store";
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let cache_reader = Arc::clone(&cache);
+        let reader = std::thread::spawn(move || {
+            let _g = cache_reader
+                .acquire_shared_lock(key)
+                .expect("reader LOCK_SH must succeed");
+            ready_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("reader did not signal ready in time");
+
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+        let meta = test_metadata("6.14.2");
+        let (store_done_tx, store_done_rx) = mpsc::channel();
+        let cache_store = Arc::clone(&cache);
+        let image_clone = image.clone();
+        let store_thread = std::thread::spawn(move || {
+            let _ = cache_store.store(key, &CacheArtifacts::new(&image_clone), &meta);
+            store_done_tx.send(()).unwrap();
+        });
+        let early = store_done_rx.recv_timeout(std::time::Duration::from_millis(200));
+        assert!(
+            early.is_err(),
+            "store() must block while reader holds LOCK_SH; got completion signal early",
+        );
+        release_tx.send(()).unwrap();
+        let finish = store_done_rx.recv_timeout(std::time::Duration::from_secs(10));
+        assert!(
+            finish.is_ok(),
+            "store() must complete after reader releases; got timeout",
+        );
+        reader.join().expect("reader thread panicked");
+        store_thread.join().expect("store thread panicked");
+    }
+
+    #[test]
+    fn lock_path_returns_expected_shape() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().to_path_buf());
+        let path = cache.lock_path("my-key-42");
+        assert_eq!(path, tmp.path().join(".locks").join("my-key-42.lock"));
+    }
+
+    #[test]
+    fn locks_subdir_persists_after_guard_drop() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().to_path_buf());
+        let locks_dir = tmp.path().join(".locks");
+        {
+            let _guard = cache
+                .acquire_shared_lock("persist-test")
+                .expect("acquire must succeed");
+            assert!(locks_dir.is_dir(), "must exist during guard lifetime");
+        }
+        assert!(
+            locks_dir.is_dir(),
+            ".locks/ must persist after guard drop — next acquire \
+             keys /proc/locks on the existing inode",
+        );
+    }
+
+    #[test]
+    fn list_skips_locks_dotfile_subdirectory() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().to_path_buf());
+        let _guard = cache.acquire_shared_lock("dummy").expect("acquire");
+        drop(_guard);
+        assert!(
+            tmp.path().join(".locks").is_dir(),
+            ".locks/ must exist after acquire drop",
+        );
+        let entries = cache.list().expect("list must succeed");
+        let keys: Vec<&str> = entries
+            .iter()
+            .map(|e| match e {
+                ListedEntry::Valid(entry) => entry.key.as_str(),
+                ListedEntry::Corrupt { key, .. } => key.as_str(),
+            })
+            .collect();
+        assert!(
+            !keys.iter().any(|k| k.starts_with('.')),
+            "list() must not return dotfile children: {keys:?}",
+        );
+    }
+
+    #[test]
+    fn acquire_on_empty_root_creates_locks_dir_lazily() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("pristine");
+        std::fs::create_dir(&root).unwrap();
+        let cache = CacheDir::with_root(root.clone());
+        assert!(!root.join(".locks").exists());
+        let _guard = cache
+            .acquire_shared_lock("lazy-test")
+            .expect("first acquire on empty root must succeed");
+        assert!(
+            root.join(".locks").is_dir(),
+            "first acquire must materialize .locks/ lazily",
+        );
+    }
+
+    #[test]
+    fn cache_dir_clean_all_preserves_locks_subdir() {
+        let tmp = TempDir::new().unwrap();
+        let cache_root = tmp.path().join("cache");
+        let cache = CacheDir::with_root(cache_root.clone());
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+
+        cache
+            .store(
+                "entry-a",
+                &CacheArtifacts::new(&image),
+                &test_metadata("6.14.0"),
+            )
+            .expect("store must succeed");
+        let _guard = cache
+            .acquire_shared_lock("entry-a")
+            .expect("SH acquire must succeed");
+
+        let locks_dir = cache_root.join(".locks");
+        let lockfile = locks_dir.join("entry-a.lock");
+        assert!(locks_dir.is_dir(), "precondition: .locks/ must exist");
+        assert!(lockfile.exists(), "precondition: lockfile must exist");
+
+        let removed = cache.clean_all().expect("clean_all must succeed");
+        assert_eq!(removed, 1, "clean_all must remove exactly 1 entry");
+
+        assert!(
+            locks_dir.is_dir(),
+            ".locks/ subdirectory must survive clean_all",
+        );
+        assert!(
+            lockfile.exists(),
+            "lockfile must still exist under .locks/ after clean_all",
+        );
+
+        assert!(
+            !cache_root.join("entry-a").exists(),
+            "cache entry must be removed by clean_all",
+        );
+    }
+
+    #[test]
+    fn cache_dir_acquire_rejects_path_traversal_key() {
+        let tmp = TempDir::new().unwrap();
+        let cache_root = tmp.path().join("cache");
+        let cache = CacheDir::with_root(cache_root.clone());
+
+        let err = cache
+            .acquire_shared_lock("../../etc/passwd")
+            .expect_err("path-traversal key must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("path"),
+            "error must mention path rejection: {msg}",
+        );
+
+        let etc_passwd_lock = tmp.path().join("etc").join("passwd.lock");
+        assert!(
+            !etc_passwd_lock.exists(),
+            "path traversal must NOT create a lockfile outside .locks/",
+        );
+        assert!(
+            !cache_root.join(".locks").exists()
+                || cache_root
+                    .join(".locks")
+                    .read_dir()
+                    .unwrap()
+                    .next()
+                    .is_none(),
+            ".locks/ must be empty if it exists at all — validator \
+             rejects before lockfile creation",
+        );
+    }
 }

@@ -430,7 +430,10 @@ impl<'a> GuestMemProgAccessorOwned<'a> {
     /// Errors when the vmlinux ELF / BTF parse fails, when the
     /// `GuestKernel` handshake fails (still-booting guest), or
     /// when `prog_idr` is missing from the symbol table.
-    pub fn new(mem: &'a super::reader::GuestMem, vmlinux: &std::path::Path) -> anyhow::Result<Self> {
+    pub fn new(
+        mem: &'a super::reader::GuestMem,
+        vmlinux: &std::path::Path,
+    ) -> anyhow::Result<Self> {
         let kernel = super::guest::GuestKernel::new(mem, vmlinux)?;
         let offsets = BpfProgOffsets::from_vmlinux(vmlinux)?;
         let prog_idr_kva = kernel
@@ -616,7 +619,10 @@ mod tests {
         let s = format!("{info}");
         assert_eq!(s, "never_ran: cnt=0 nsecs=0 misses=0");
         assert!(!s.contains("ns/call"), "ns/call must elide when cnt=0: {s}");
-        assert!(!s.contains("miss_rate"), "miss_rate must elide when total=0: {s}");
+        assert!(
+            !s.contains("miss_rate"),
+            "miss_rate must elide when total=0: {s}"
+        );
     }
 
     /// Healthy program with no recursion misses — `ns/call`

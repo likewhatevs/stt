@@ -632,7 +632,9 @@ pub trait BpfMapAccessor {
     /// targeted lookups can override (e.g. a libbpf-handle-backed
     /// accessor that already holds a name index).
     fn find_map(&self, name_suffix: &str) -> Option<BpfMapInfo> {
-        self.maps().into_iter().find(|m| m.name.ends_with(name_suffix))
+        self.maps()
+            .into_iter()
+            .find(|m| m.name.ends_with(name_suffix))
     }
 
     /// Read a contiguous byte range from a map's value region.
@@ -669,12 +671,7 @@ pub trait BpfMapAccessor {
     /// guest-memory path; the planned bpf-syscall backend surfaces
     /// out-of-range CPU on `bpf_map_lookup_elem` failure). Returns an
     /// empty vec for non-PERCPU_ARRAY maps or `key >= max_entries`.
-    fn read_percpu_array(
-        &self,
-        map: &BpfMapInfo,
-        key: u32,
-        num_cpus: u32,
-    ) -> Vec<Option<Vec<u8>>>;
+    fn read_percpu_array(&self, map: &BpfMapInfo, key: u32, num_cpus: u32) -> Vec<Option<Vec<u8>>>;
 
     /// Snapshot every mapped page of a `BPF_MAP_TYPE_ARENA` map.
     ///
@@ -835,12 +832,7 @@ impl BpfMapAccessor for GuestMemMapAccessor<'_> {
     /// past the end of guest memory and BSS-zero slots beyond
     /// `nr_cpu_ids`) return `None` rather than aliasing CPU 0's bytes;
     /// see the cpu_off==0 guard in [`read_percpu_array_value`].
-    fn read_percpu_array(
-        &self,
-        map: &BpfMapInfo,
-        key: u32,
-        num_cpus: u32,
-    ) -> Vec<Option<Vec<u8>>> {
+    fn read_percpu_array(&self, map: &BpfMapInfo, key: u32, num_cpus: u32) -> Vec<Option<Vec<u8>>> {
         let Some(pco_kva) = self.kernel.symbol_kva("__per_cpu_offset") else {
             return Vec::new();
         };
@@ -858,11 +850,7 @@ impl BpfMapAccessor for GuestMemMapAccessor<'_> {
         super::arena::snapshot_arena(self.kernel, map, arena_offsets)
     }
 
-    fn load_program_btf(
-        &self,
-        map: &BpfMapInfo,
-        base_btf: &btf_rs::Btf,
-    ) -> Option<btf_rs::Btf> {
+    fn load_program_btf(&self, map: &BpfMapInfo, base_btf: &btf_rs::Btf) -> Option<btf_rs::Btf> {
         if map.btf_kva == 0 {
             return None;
         }
@@ -4605,8 +4593,7 @@ mod tests {
             .copy_from_slice(&0xDEAD_BEEFu64.to_ne_bytes());
         // Write distinct values at the real CPUs' regions.
         let cpu1_pa = percpu_base_pa + stride;
-        buf[cpu1_pa as usize..cpu1_pa as usize + 8]
-            .copy_from_slice(&0x1111u64.to_ne_bytes());
+        buf[cpu1_pa as usize..cpu1_pa as usize + 8].copy_from_slice(&0x1111u64.to_ne_bytes());
 
         // Per-CPU offset layout used for this test:
         // - CPU 0 (cpu_index==0): offset 0 — legitimate per the
@@ -4634,10 +4621,7 @@ mod tests {
         // CPU 0 (cpu_index==0): zero offset is legitimate; reads
         // the marker bytes at percpu_base+0.
         let v0 = result[0].as_ref().expect("CPU 0 should be Some");
-        assert_eq!(
-            u64::from_ne_bytes(v0[..8].try_into().unwrap()),
-            0xDEAD_BEEF,
-        );
+        assert_eq!(u64::from_ne_bytes(v0[..8].try_into().unwrap()), 0xDEAD_BEEF,);
         // CPU 1 (cpu_index>0, non-zero offset): real CPU.
         let v1 = result[1].as_ref().expect("CPU 1 should be Some");
         assert_eq!(u64::from_ne_bytes(v1[..8].try_into().unwrap()), 0x1111);

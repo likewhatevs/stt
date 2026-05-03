@@ -71,14 +71,8 @@ mod tests {
         let mut buf: Vec<u8> = Vec::new();
         {
             let mut builder = tar::Builder::new(&mut buf);
-            pack_tar_entry(
-                &mut builder,
-                NAME,
-                MODE,
-                payload.len() as u64,
-                payload,
-            )
-            .expect("pack_tar_entry must succeed for valid inputs");
+            pack_tar_entry(&mut builder, NAME, MODE, payload.len() as u64, payload)
+                .expect("pack_tar_entry must succeed for valid inputs");
             builder.finish().expect("tar finish");
         }
 

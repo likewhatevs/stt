@@ -1180,15 +1180,16 @@ impl std::fmt::Display for FailureDumpReport {
             // every sample to keep the rendering compact (a
             // counter at zero everywhere has no signal worth
             // surfacing in the human-readable view).
-            let extract: [(
-                &str,
-                fn(&EventCounterSample) -> i64,
-            ); 13] = [
+            let extract: [(&str, fn(&EventCounterSample) -> i64); 13] = [
                 ("select_cpu_fallback", |s| s.select_cpu_fallback),
-                ("dispatch_local_dsq_offline", |s| s.dispatch_local_dsq_offline),
+                ("dispatch_local_dsq_offline", |s| {
+                    s.dispatch_local_dsq_offline
+                }),
                 ("dispatch_keep_last", |s| s.dispatch_keep_last),
                 ("enq_skip_exiting", |s| s.enq_skip_exiting),
-                ("enq_skip_migration_disabled", |s| s.enq_skip_migration_disabled),
+                ("enq_skip_migration_disabled", |s| {
+                    s.enq_skip_migration_disabled
+                }),
                 ("reenq_immed", |s| s.reenq_immed),
                 ("reenq_local_repeat", |s| s.reenq_local_repeat),
                 ("refill_slice_dfl", |s| s.refill_slice_dfl),
@@ -1199,8 +1200,7 @@ impl std::fmt::Display for FailureDumpReport {
                 ("sub_bypass_dispatch", |s| s.sub_bypass_dispatch),
             ];
             for (name, ext) in extract {
-                let series: Vec<i64> =
-                    self.event_counter_timeline.iter().map(ext).collect();
+                let series: Vec<i64> = self.event_counter_timeline.iter().map(ext).collect();
                 if series.iter().all(|&v| v == 0) {
                     continue;
                 }
@@ -1502,10 +1502,7 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
             };
             (enrichments, reason)
         }
-        None => (
-            Vec::new(),
-            Some(REASON_NO_TASK_WALKER.to_string()),
-        ),
+        None => (Vec::new(), Some(REASON_NO_TASK_WALKER.to_string())),
     };
     let event_counter_timeline = match event_counter_capture {
         Some(cap) => cap
@@ -1537,8 +1534,7 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
                         let cr3_pa = cap.kernel.cr3_pa();
                         let po = cap.kernel.page_offset();
                         let l5 = cap.kernel.l5();
-                        let pa =
-                            super::idr::translate_any_kva(mem, cr3_pa, po, sched_kva, l5);
+                        let pa = super::idr::translate_any_kva(mem, cr3_pa, po, sched_kva, l5);
                         (pa, Some(state))
                     }
                     None => (None, None),
@@ -1595,10 +1591,7 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
                         "scx walker partial: missing offset groups [{}]",
                         missing.join(", ")
                     ))
-                } else if rq_states.is_empty()
-                    && dsqs.is_empty()
-                    && sched_state.is_none()
-                {
+                } else if rq_states.is_empty() && dsqs.is_empty() && sched_state.is_none() {
                     Some(REASON_SCX_WALKER_NO_STATE.to_string())
                 } else {
                     None
@@ -1620,15 +1613,11 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
     // `None` for that entry; a failure on one vCPU does not blank the
     // others. When `perf_capture` is None the vec stays empty (the
     // host lacked perf, or `perf_event_open` failed at run start).
-    let vcpu_perf_at_freeze: Vec<Option<super::perf_counters::VcpuPerfSample>> =
-        match perf_capture {
-            Some(cap) => cap
-                .per_vcpu
-                .iter()
-                .map(|p| p.read().ok())
-                .collect(),
-            None => Vec::new(),
-        };
+    let vcpu_perf_at_freeze: Vec<Option<super::perf_counters::VcpuPerfSample>> = match perf_capture
+    {
+        Some(cap) => cap.per_vcpu.iter().map(|p| p.read().ok()).collect(),
+        None => Vec::new(),
+    };
 
     let mut report = FailureDumpReport {
         schema: SCHEMA_SINGLE.to_string(),
@@ -1872,8 +1861,7 @@ fn collect_per_cpu_time(cap: &CpuTimeCapture<'_>) -> Vec<PerCpuTimeStats> {
         let cpustat_base = cap.offsets.kernel_cpustat_cpustat;
         let read_cpustat = |idx: usize| -> u64 {
             // sizeof(u64) == 8.
-            cap.mem
-                .read_u64(cpustat_pa, cpustat_base + idx * 8)
+            cap.mem.read_u64(cpustat_pa, cpustat_base + idx * 8)
         };
         let cpustat_user_ns = read_cpustat(CPUTIME_USER);
         let cpustat_nice_ns = read_cpustat(CPUTIME_NICE);
@@ -1891,8 +1879,9 @@ fn collect_per_cpu_time(cap: &CpuTimeCapture<'_>) -> Vec<PerCpuTimeStats> {
         let mut softirqs = [0u64; NR_SOFTIRQS];
         for (i, slot) in softirqs.iter_mut().enumerate() {
             // sizeof(unsigned int) == 4.
-            *slot = cap.mem.read_u32(kstat_pa, cap.offsets.kstat_softirqs + i * 4)
-                as u64;
+            *slot = cap
+                .mem
+                .read_u32(kstat_pa, cap.offsets.kstat_softirqs + i * 4) as u64;
         }
 
         // kernel_stat::irqs_sum: unsigned long. 64-bit only
@@ -1903,13 +1892,14 @@ fn collect_per_cpu_time(cap: &CpuTimeCapture<'_>) -> Vec<PerCpuTimeStats> {
         // accumulated only under NO_HZ when the CPU enters idle
         // with nr_iowait > 0. Skip when the symbol or BTF offset
         // is absent.
-        let iowait_sleeptime_ns = cap.tick_cpu_sched_kva.zip(cap.offsets.tick_sched_iowait_sleeptime).map(
-            |(tick_sym_kva, off)| {
+        let iowait_sleeptime_ns = cap
+            .tick_cpu_sched_kva
+            .zip(cap.offsets.tick_sched_iowait_sleeptime)
+            .map(|(tick_sym_kva, off)| {
                 let kva = tick_sym_kva.wrapping_add(per_cpu_off);
                 let pa = super::symbols::kva_to_pa(kva, cap.page_offset);
                 cap.mem.read_u64(pa, off)
-            },
-        );
+            });
 
         out.push(PerCpuTimeStats {
             cpu,
@@ -2392,10 +2382,10 @@ mod tests {
             elapsed_ms: 123_456,
             select_cpu_fallback: i64::MAX,
             insert_not_owned: -1, // kernel never produces this
-                                  // but the wire format must
-                                  // preserve whatever the read
-                                  // captured rather than silently
-                                  // clamp.
+            // but the wire format must
+            // preserve whatever the read
+            // captured rather than silently
+            // clamp.
             ..Default::default()
         };
         let json = serde_json::to_string(&s).unwrap();
@@ -3319,12 +3309,18 @@ mod tests {
 
     #[test]
     fn reason_prog_accessor_unavailable_string_pinned() {
-        assert_eq!(REASON_PROG_ACCESSOR_UNAVAILABLE, "prog accessor unavailable");
+        assert_eq!(
+            REASON_PROG_ACCESSOR_UNAVAILABLE,
+            "prog accessor unavailable"
+        );
     }
 
     #[test]
     fn reason_task_walker_zero_tasks_string_pinned() {
-        assert_eq!(REASON_TASK_WALKER_ZERO_TASKS, "task walker yielded zero tasks");
+        assert_eq!(
+            REASON_TASK_WALKER_ZERO_TASKS,
+            "task walker yielded zero tasks"
+        );
     }
 
     #[test]
@@ -3521,8 +3517,7 @@ mod tests {
         let rendered: String =
             "arena BTF offsets unavailable (kernel lacks struct bpf_arena?)".into();
         assert_eq!(
-            rendered,
-            "arena BTF offsets unavailable (kernel lacks struct bpf_arena?)",
+            rendered, "arena BTF offsets unavailable (kernel lacks struct bpf_arena?)",
             "arena-unavailable error string drifted from pin",
         );
     }
@@ -3561,8 +3556,7 @@ mod tests {
             "PERCPU_ARRAY truncated at {MAX_PERCPU_KEYS} keys (max_entries={max_entries})",
         );
         assert_eq!(
-            rendered,
-            "PERCPU_ARRAY truncated at 256 keys (max_entries=999)",
+            rendered, "PERCPU_ARRAY truncated at 256 keys (max_entries=999)",
             "PERCPU_ARRAY truncation string OR MAX_PERCPU_KEYS drifted from pin",
         );
     }
@@ -3649,6 +3643,9 @@ mod tests {
         // failure-dump consumers. Drift would silently break that
         // tooling. The constant is the single source of truth; this
         // test pins it byte-for-byte.
-        assert_eq!(REASON_NO_NUMA_WALKER, "no NUMA walker (host-side walker pending)");
+        assert_eq!(
+            REASON_NO_NUMA_WALKER,
+            "no NUMA walker (host-side walker pending)"
+        );
     }
 }

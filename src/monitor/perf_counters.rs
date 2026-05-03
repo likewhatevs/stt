@@ -167,8 +167,7 @@ fn open_one(tid: libc::pid_t, config: u64) -> io::Result<OwnedFd> {
     attr.size = std::mem::size_of::<perf_event_attr>() as u32;
     attr.type_ = PERF_TYPE_HARDWARE;
     attr.config = config;
-    attr.read_format =
-        (PERF_FORMAT_TOTAL_TIME_ENABLED | PERF_FORMAT_TOTAL_TIME_RUNNING) as u64;
+    attr.read_format = (PERF_FORMAT_TOTAL_TIME_ENABLED | PERF_FORMAT_TOTAL_TIME_RUNNING) as u64;
     // disabled=0 — start counting immediately on open. We don't gate
     // with PERF_EVENT_IOC_ENABLE because the monitor opens these on
     // a steady-state vCPU that is already running.

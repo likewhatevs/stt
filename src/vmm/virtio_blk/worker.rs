@@ -59,9 +59,9 @@ use vmm_sys_util::epoll::{ControlOperation, Epoll, EpollEvent};
 #[cfg(not(test))]
 use vmm_sys_util::eventfd::EventFd;
 
+use super::DrainOutcome;
 #[cfg(not(test))]
 use super::{BlkQueue, BlkWorkerState, NUM_QUEUES, drain_bracket_impl};
-use super::DrainOutcome;
 
 /// Cap the throttle retry timer so a pathological refill rate (e.g.
 /// tens of millions of bytes per second backing a single very large
@@ -89,7 +89,7 @@ use super::DrainOutcome;
 /// callback (drivers/block/virtio_blk.c `virtio_mq_ops` has no
 /// `.timeout` field) and an unpublished request never surfaces an
 /// error to the guest's block layer on its own.
-pub(super) const RETRY_TIMER_MAX_NANOS: u64 = 1_000_000_000;
+pub(crate) const RETRY_TIMER_MAX_NANOS: u64 = 1_000_000_000;
 
 /// Clamp a `wait_nanos` value (from `DrainOutcome::ThrottleStalled`)
 /// into the legal `timerfd_settime` range used by the worker.
@@ -107,7 +107,7 @@ pub(super) const RETRY_TIMER_MAX_NANOS: u64 = 1_000_000_000;
 /// its own; matches the rationale on `RETRY_TIMER_MAX_NANOS` above).
 /// Free function (not method) so tests can pin both boundaries
 /// without constructing a worker.
-pub(super) fn clamp_retry_nanos(wait_nanos: u64) -> u64 {
+pub(crate) fn clamp_retry_nanos(wait_nanos: u64) -> u64 {
     wait_nanos.clamp(1, RETRY_TIMER_MAX_NANOS)
 }
 
@@ -144,7 +144,7 @@ pub(super) fn clamp_retry_nanos(wait_nanos: u64) -> u64 {
 /// `last_known_blocked` so subsequent KICK_TOKENs are suppressed
 /// until THROTTLE_TOKEN clears the flag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum StallAction {
+pub(crate) enum StallAction {
     Continue,
     ReDrain,
     Sleep { nanos: u64 },
@@ -163,7 +163,7 @@ pub(super) enum StallAction {
 ///   a synchronous re-drain is cheaper than a timerfd round-trip).
 /// - `ThrottleStalled { wait_nanos: n > 0 }` →
 ///   `Sleep { nanos: clamp_retry_nanos(n) }` (arm the retry timerfd).
-pub(super) fn decide_stall_action(outcome: DrainOutcome) -> StallAction {
+pub(crate) fn decide_stall_action(outcome: DrainOutcome) -> StallAction {
     match outcome {
         DrainOutcome::Done => StallAction::Continue,
         DrainOutcome::ThrottleStalled { wait_nanos: 0 } => StallAction::ReDrain,
@@ -177,15 +177,15 @@ pub(super) fn decide_stall_action(outcome: DrainOutcome) -> StallAction {
 /// so the testable `worker_dispatch_event` helper (and its unit
 /// tests under `cfg(test)`) can name them without duplicating
 /// the values inside `worker_thread_main`'s frame.
-pub(super) const KICK_TOKEN: u64 = 1;
-pub(super) const STOP_TOKEN: u64 = 2;
-pub(super) const THROTTLE_TOKEN: u64 = 3;
+pub(crate) const KICK_TOKEN: u64 = 1;
+pub(crate) const STOP_TOKEN: u64 = 2;
+pub(crate) const THROTTLE_TOKEN: u64 = 3;
 
 /// Outcome of one epoll-event dispatch decision. Lifted to a
 /// dedicated enum so `worker_thread_main` and its unit tests
 /// share the same vocabulary for "what should the loop do next?"
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub(super) enum WorkerDispatchAction {
+pub(crate) enum WorkerDispatchAction {
     /// STOP_TOKEN observed — return state and exit the worker loop.
     Stop,
     /// Run one drain iteration. `throttle_token_fired` is true when
@@ -234,7 +234,7 @@ pub(super) enum WorkerDispatchAction {
 /// counter and clears EPOLLERR). The free fn makes the dispatch
 /// decision; the worker loop performs the side effects (read,
 /// drain, mutate state).
-pub(super) fn worker_dispatch_event(event_set: EventSet, token: u64) -> WorkerDispatchAction {
+pub(crate) fn worker_dispatch_event(event_set: EventSet, token: u64) -> WorkerDispatchAction {
     if event_set.contains(EventSet::ERROR) {
         tracing::warn!(
             ?event_set,
@@ -266,11 +266,7 @@ pub(super) fn worker_dispatch_event(event_set: EventSet, token: u64) -> WorkerDi
             throttle_token_fired: true,
         },
         _ => {
-            tracing::warn!(
-                ?event_set,
-                token,
-                "virtio-blk worker: unknown epoll token"
-            );
+            tracing::warn!(?event_set, token, "virtio-blk worker: unknown epoll token");
             WorkerDispatchAction::Skip
         }
     }
@@ -301,7 +297,7 @@ pub(super) fn worker_dispatch_event(event_set: EventSet, token: u64) -> WorkerDi
 /// set_mem — a wiring bug), the `mem_unset_warned` latch fires once
 /// and the kick is silently dropped.
 #[cfg(not(test))]
-pub(super) fn worker_thread_main(
+pub(crate) fn worker_thread_main(
     mut state: BlkWorkerState,
     mut queues: [BlkQueue; NUM_QUEUES],
     mem: Arc<OnceLock<GuestMemoryMmap>>,
@@ -377,7 +373,8 @@ pub(super) fn worker_thread_main(
     // SAFETY: `timer_fd_raw` is the just-created timerfd, owned by
     // this thread; wrapping in `File` transfers the close
     // responsibility on Drop.
-    let timer_fd: std::fs::File = unsafe { std::os::unix::io::FromRawFd::from_raw_fd(timer_fd_raw) };
+    let timer_fd: std::fs::File =
+        unsafe { std::os::unix::io::FromRawFd::from_raw_fd(timer_fd_raw) };
     if let Err(e) = epoll.ctl(
         ControlOperation::Add,
         timer_fd_raw,
@@ -488,12 +485,8 @@ pub(super) fn worker_thread_main(
                         use std::io::Read;
                         match (&timer_fd).read(&mut buf) {
                             Ok(_) => {}
-                            Err(e)
-                                if e.kind()
-                                    == std::io::ErrorKind::WouldBlock => {}
-                            Err(e)
-                                if e.kind()
-                                    == std::io::ErrorKind::Interrupted => {}
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                             Err(e) => {
                                 tracing::warn!(
                                     %e,
@@ -608,9 +601,7 @@ pub(super) fn worker_thread_main(
         // preserves the original `it_value`.
         let action = match decide_stall_action(outcome) {
             StallAction::ReDrain => {
-                tracing::trace!(
-                    "virtio-blk worker: wait_nanos==0 inline re-drain"
-                );
+                tracing::trace!("virtio-blk worker: wait_nanos==0 inline re-drain");
                 let outcome2 = drain_bracket_impl(
                     &mut state,
                     &mut queues,
@@ -689,5 +680,404 @@ pub(super) fn worker_thread_main(
                 last_known_blocked = true;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Tier 3 of the test co-location split: pure worker-policy tests
+    //! (clamp_retry_nanos boundary, decide_stall_action mapping,
+    //! worker_dispatch_event dispatch, epoll-event-set roundtrip).
+    //! Each is a pure-function test of the always-compiled helpers
+    //! defined in this file — no `VirtioBlk` construction, no chain
+    //! plant, so they live closest to their targets and don't need
+    //! anything from `super::testing`.
+    use super::*;
+    use vmm_sys_util::epoll::{EpollEvent, EventSet};
+
+    /// `clamp_retry_nanos(0)` floors at 1 ns rather than 0.
+    /// `timerfd_settime(2)` with `it_value = 0` disarms the
+    /// timer, so a `wait_nanos == 0` outcome (the bucket already
+    /// refilled between can_consume and the deficit
+    /// computation) must be mapped to the smallest non-zero
+    /// value to fire the retry immediately.
+    #[test]
+    fn clamp_retry_nanos_zero_floors_at_one() {
+        assert_eq!(
+            clamp_retry_nanos(0),
+            1,
+            "wait_nanos==0 must be floored to 1ns to avoid \
+             timerfd_settime(it_value=0) disarming the timer",
+        );
+    }
+
+    /// `clamp_retry_nanos(u64::MAX)` caps at
+    /// `RETRY_TIMER_MAX_NANOS` so a pathological refill rate
+    /// can't push the retry past the guest's hung-task watchdog
+    /// (`kernel.hung_task_timeout_secs`, default 120 s — virtio_blk
+    /// has no `mq_ops->timeout`).
+    #[test]
+    fn clamp_retry_nanos_saturates_at_cap() {
+        assert_eq!(
+            clamp_retry_nanos(u64::MAX),
+            RETRY_TIMER_MAX_NANOS,
+            "wait_nanos==u64::MAX must saturate at RETRY_TIMER_MAX_NANOS \
+             (1s) — well below the guest's hung-task watchdog (120s)",
+        );
+        // Boundary just over the cap also clamps.
+        assert_eq!(
+            clamp_retry_nanos(RETRY_TIMER_MAX_NANOS + 1),
+            RETRY_TIMER_MAX_NANOS,
+        );
+        // Boundary at the cap is unchanged.
+        assert_eq!(
+            clamp_retry_nanos(RETRY_TIMER_MAX_NANOS),
+            RETRY_TIMER_MAX_NANOS,
+        );
+        // Boundary just below the cap is unchanged. Catches an
+        // off-by-one regression that used `< RETRY_TIMER_MAX_NANOS`
+        // instead of `<=` in the upper-bound clamp.
+        assert_eq!(
+            clamp_retry_nanos(RETRY_TIMER_MAX_NANOS - 1),
+            RETRY_TIMER_MAX_NANOS - 1,
+        );
+        // Boundary at the lower floor is unchanged. Catches an
+        // off-by-one regression that mapped `wait_nanos == 1` to
+        // 0 (disarming the timer) or to 2 (over-correcting the
+        // floor).
+        assert_eq!(clamp_retry_nanos(1), 1);
+        // Mid-range values pass through.
+        assert_eq!(clamp_retry_nanos(500_000_000), 500_000_000);
+    }
+
+    /// Pin `RETRY_TIMER_MAX_NANOS` at 1 s. Doc comments throughout
+    /// the file (module doc, `clamp_retry_nanos`, throttled_count
+    /// counter doc) cite "1 s" as the cap; a regression that
+    /// changed the const without updating the docs would surface as
+    /// a doc-drift class-of-bug, but the const itself is the
+    /// authoritative source. The docs cite this constant by name,
+    /// so this assertion is the single load-bearing pin.
+    #[test]
+    fn retry_timer_max_nanos_constant_pin() {
+        assert_eq!(RETRY_TIMER_MAX_NANOS, 1_000_000_000);
+    }
+
+    /// `decide_stall_action(Done)` produces `Continue`. The worker
+    /// treats `Continue` as the cue to clear `last_known_blocked`
+    /// and resume `epoll_wait` without arming the retry timerfd.
+    /// Pins the happy-path mapping that the production loop depends
+    /// on after every successful drain.
+    #[test]
+    fn decide_stall_action_done_is_continue() {
+        assert_eq!(
+            decide_stall_action(DrainOutcome::Done),
+            StallAction::Continue,
+        );
+    }
+
+    /// `decide_stall_action(ThrottleStalled { wait_nanos: 0 })`
+    /// produces `ReDrain`. The wait_nanos==0 outcome is the only
+    /// state that re-runs `drain_bracket_impl` synchronously —
+    /// arming the timerfd would round-trip through epoll for no
+    /// reason because the bucket has already refilled between
+    /// `can_consume` failure and the deficit computation.
+    #[test]
+    fn decide_stall_action_zero_wait_is_redrain() {
+        assert_eq!(
+            decide_stall_action(DrainOutcome::ThrottleStalled { wait_nanos: 0 }),
+            StallAction::ReDrain,
+        );
+    }
+
+    /// `decide_stall_action(ThrottleStalled { wait_nanos: n > 0 })`
+    /// produces `Sleep { nanos: clamp_retry_nanos(n) }`. The
+    /// clamp is composed in-line so the worker can feed `nanos`
+    /// directly to `timerfd_settime` without re-clamping. Pins the
+    /// boundary cases:
+    ///
+    /// - `wait_nanos == 1` → `Sleep { nanos: 1 }` (already at floor;
+    ///   the floor at 1 ns prevents timerfd disarm).
+    /// - mid-range pass-through.
+    /// - `wait_nanos == RETRY_TIMER_MAX_NANOS` → unchanged (cap
+    ///   inclusive).
+    /// - `wait_nanos == RETRY_TIMER_MAX_NANOS + 1` → capped (cap
+    ///   exclusive on the over side).
+    /// - `wait_nanos == u64::MAX` → capped at the same maximum, so
+    ///   a pathological refill rate can't push the retry past
+    ///   `kernel.hung_task_timeout_secs`.
+    #[test]
+    fn decide_stall_action_nonzero_wait_is_sleep_with_clamped_nanos() {
+        assert_eq!(
+            decide_stall_action(DrainOutcome::ThrottleStalled { wait_nanos: 1 }),
+            StallAction::Sleep { nanos: 1 },
+        );
+        assert_eq!(
+            decide_stall_action(DrainOutcome::ThrottleStalled {
+                wait_nanos: 500_000_000,
+            }),
+            StallAction::Sleep { nanos: 500_000_000 },
+        );
+        assert_eq!(
+            decide_stall_action(DrainOutcome::ThrottleStalled {
+                wait_nanos: RETRY_TIMER_MAX_NANOS,
+            }),
+            StallAction::Sleep {
+                nanos: RETRY_TIMER_MAX_NANOS,
+            },
+        );
+        assert_eq!(
+            decide_stall_action(DrainOutcome::ThrottleStalled {
+                wait_nanos: RETRY_TIMER_MAX_NANOS + 1,
+            }),
+            StallAction::Sleep {
+                nanos: RETRY_TIMER_MAX_NANOS,
+            },
+        );
+        assert_eq!(
+            decide_stall_action(DrainOutcome::ThrottleStalled {
+                wait_nanos: u64::MAX,
+            }),
+            StallAction::Sleep {
+                nanos: RETRY_TIMER_MAX_NANOS,
+            },
+        );
+    }
+
+    /// `decide_stall_action` is a pure function — calling it twice
+    /// with the same input must produce the same output. Pins the
+    /// "pure" property the worker loop depends on when it
+    /// double-calls the decision (once on the initial drain, once
+    /// on the second drain after `ReDrain`). A regression that
+    /// added internal state (e.g. a bucket-refill side effect)
+    /// would surface here.
+    #[test]
+    fn decide_stall_action_is_pure() {
+        let inputs = [
+            DrainOutcome::Done,
+            DrainOutcome::ThrottleStalled { wait_nanos: 0 },
+            DrainOutcome::ThrottleStalled { wait_nanos: 1 },
+            DrainOutcome::ThrottleStalled { wait_nanos: 12345 },
+            DrainOutcome::ThrottleStalled {
+                wait_nanos: u64::MAX,
+            },
+        ];
+        for input in inputs {
+            assert_eq!(
+                decide_stall_action(input),
+                decide_stall_action(input),
+                "decide_stall_action must be deterministic for {input:?}",
+            );
+        }
+    }
+
+    /// Pins the worker-loop's bounded-recursion contract: a second
+    /// `ReDrain` produced from the inline retry must be downgraded
+    /// to `Sleep { nanos: 1 }` so the loop never spins. The worker
+    /// expresses this with an inline `match` against
+    /// `decide_stall_action(outcome2)`; this test mirrors that
+    /// match shape so a regression in the worker that drops the
+    /// downgrade would break a unit test in addition to the
+    /// integration paths.
+    #[test]
+    fn decide_stall_action_redrain_downgrades_to_sleep_one_ns() {
+        // First drain returns wait_nanos==0 → ReDrain.
+        let outcome1 = DrainOutcome::ThrottleStalled { wait_nanos: 0 };
+        assert_eq!(decide_stall_action(outcome1), StallAction::ReDrain);
+        // Second drain ALSO returns wait_nanos==0 → ReDrain. The
+        // worker downgrades it to `Sleep { nanos: 1 }` to bound
+        // the recursion. `clamp_retry_nanos(0) == 1`, so this is
+        // exactly equivalent to `decide_stall_action` if the input
+        // had been wait_nanos==1.
+        let outcome2 = DrainOutcome::ThrottleStalled { wait_nanos: 0 };
+        let downgraded = match decide_stall_action(outcome2) {
+            StallAction::ReDrain => StallAction::Sleep { nanos: 1 },
+            other => other,
+        };
+        assert_eq!(downgraded, StallAction::Sleep { nanos: 1 });
+        // Sanity: the downgrade matches the floor that
+        // clamp_retry_nanos imposes on a fresh wait_nanos==0
+        // outcome — so the bounded-recursion arm produces the
+        // same it_value as the legacy code (which always passed
+        // through clamp_retry_nanos before arming the timerfd).
+        assert_eq!(clamp_retry_nanos(0), 1);
+    }
+
+    /// `worker_dispatch_event` routes STOP_TOKEN with EventSet::IN
+    /// to `Stop`. The worker treats this as a clean exit signal —
+    /// any other action would mean the device's `Drop::drop`
+    /// stop-fd write either gets lost (no exit) or is misclassified
+    /// as a drain-and-then-exit (extra drain iteration on a queue
+    /// that's about to be dismantled).
+    #[test]
+    fn worker_dispatch_stop_token_clean() {
+        assert_eq!(
+            worker_dispatch_event(EventSet::IN, STOP_TOKEN),
+            WorkerDispatchAction::Stop,
+        );
+    }
+
+    /// `worker_dispatch_event` routes KICK_TOKEN with EventSet::IN
+    /// to `Drain { throttle_token_fired: false }`. The drain is
+    /// guarded by the `last_known_blocked` skip in the worker
+    /// loop, so a kick that arrives while the throttle is stalled
+    /// must NOT force the drain — only THROTTLE_TOKEN does.
+    #[test]
+    fn worker_dispatch_kick_token_clean() {
+        assert_eq!(
+            worker_dispatch_event(EventSet::IN, KICK_TOKEN),
+            WorkerDispatchAction::Drain {
+                throttle_token_fired: false,
+            },
+        );
+    }
+
+    /// `worker_dispatch_event` routes THROTTLE_TOKEN with
+    /// EventSet::IN to `Drain { throttle_token_fired: true }`.
+    /// Setting the flag is load-bearing for liveness: it forces
+    /// the drain past `last_known_blocked` so the rolled-back
+    /// chain is retried after the bucket refill timer expires.
+    #[test]
+    fn worker_dispatch_throttle_token_sets_flag() {
+        assert_eq!(
+            worker_dispatch_event(EventSet::IN, THROTTLE_TOKEN),
+            WorkerDispatchAction::Drain {
+                throttle_token_fired: true,
+            },
+        );
+    }
+
+    /// Unknown token dispatches to `Skip` and the worker loop
+    /// continues without draining. Defends against a future
+    /// regression that registers an additional fd on the same
+    /// epoll without extending the dispatch match.
+    #[test]
+    fn worker_dispatch_unknown_token_skips() {
+        for token in [0u64, 4, 99, u64::MAX] {
+            assert_eq!(
+                worker_dispatch_event(EventSet::IN, token),
+                WorkerDispatchAction::Skip,
+                "token {token} must dispatch to Skip",
+            );
+        }
+    }
+
+    /// EPOLLERR | IN on KICK_TOKEN still drains. Eventfd
+    /// `eventfd_poll` co-sets EPOLLIN whenever count > 0, and
+    /// EPOLLERR when count == ULLONG_MAX. The recovery is for the
+    /// per-token handler's `kick_fd.read()` to drain the saturated
+    /// counter — so the dispatch must still produce
+    /// `Drain { throttle_token_fired: false }`.
+    #[test]
+    fn worker_dispatch_kick_token_with_epollerr_still_drains() {
+        let event_set = EventSet::IN | EventSet::ERROR;
+        assert_eq!(
+            worker_dispatch_event(event_set, KICK_TOKEN),
+            WorkerDispatchAction::Drain {
+                throttle_token_fired: false,
+            },
+            "EPOLLERR on eventfd indicates counter saturation; \
+             fall through to per-token drain so the read clears it",
+        );
+    }
+
+    /// EPOLLERR | IN on THROTTLE_TOKEN still drains. Timerfd
+    /// never sets EPOLLERR (timerfd_poll only checks ticks), so
+    /// observing it means the kernel contract changed — but the
+    /// dispatch still falls through and the timerfd read in the
+    /// worker arm yields EAGAIN if no expiry is queued. Net
+    /// effect: defensive log + no-op.
+    #[test]
+    fn worker_dispatch_throttle_token_with_epollerr_still_drains() {
+        let event_set = EventSet::IN | EventSet::ERROR;
+        assert_eq!(
+            worker_dispatch_event(event_set, THROTTLE_TOKEN),
+            WorkerDispatchAction::Drain {
+                throttle_token_fired: true,
+            },
+        );
+    }
+
+    /// EPOLLERR | IN on STOP_TOKEN still stops. Stop-fd is an
+    /// eventfd (same EFD_NONBLOCK flags as kick_fd); saturation
+    /// is implausible because Drop writes 1 once. But if it ever
+    /// happens (e.g. a regression hands the worker a long-lived
+    /// stop_fd whose counter accumulated), Stop semantics
+    /// dominate ERR — there's no useful recovery once we've
+    /// decided to exit.
+    #[test]
+    fn worker_dispatch_stop_token_with_epollerr_still_stops() {
+        let event_set = EventSet::IN | EventSet::ERROR;
+        assert_eq!(
+            worker_dispatch_event(event_set, STOP_TOKEN),
+            WorkerDispatchAction::Stop,
+        );
+    }
+
+    /// EPOLLHUP | IN on KICK_TOKEN still drains. eventfd_poll
+    /// never sets POLLHUP, so observing it is structurally
+    /// impossible for our owned eventfd — but we log defensively
+    /// and the dispatch still falls through. The per-token
+    /// handler's `kick_fd.read()` is harmless in any case.
+    #[test]
+    fn worker_dispatch_kick_token_with_epollhup_still_drains() {
+        let event_set = EventSet::IN | EventSet::HANG_UP;
+        assert_eq!(
+            worker_dispatch_event(event_set, KICK_TOKEN),
+            WorkerDispatchAction::Drain {
+                throttle_token_fired: false,
+            },
+        );
+    }
+
+    /// EPOLLERR ALONE (no EPOLLIN) on KICK_TOKEN still drains.
+    /// Reaching this state in production for eventfd is
+    /// structurally impossible (count==ULLONG_MAX implies
+    /// count>0 implies EPOLLIN is also set per eventfd_poll), but
+    /// the dispatch must remain robust if a future kernel patch
+    /// changes the contract or a different fd type is registered.
+    /// Falling through to the per-token handler's read is the
+    /// canonical recovery; the read returns EAGAIN harmlessly if
+    /// no data is queued.
+    #[test]
+    fn worker_dispatch_kick_token_epollerr_alone_still_drains() {
+        let event_set = EventSet::ERROR;
+        assert_eq!(
+            worker_dispatch_event(event_set, KICK_TOKEN),
+            WorkerDispatchAction::Drain {
+                throttle_token_fired: false,
+            },
+        );
+    }
+
+    /// EPOLLERR | EPOLLHUP | IN on THROTTLE_TOKEN: every defensive
+    /// flag is set at once. The dispatch still drains and sets
+    /// the throttle-fired marker. Catches a regression that
+    /// short-circuits on EPOLLHUP before reaching the token
+    /// match.
+    #[test]
+    fn worker_dispatch_all_flags_throttle_still_drains() {
+        let event_set = EventSet::IN | EventSet::ERROR | EventSet::HANG_UP;
+        assert_eq!(
+            worker_dispatch_event(event_set, THROTTLE_TOKEN),
+            WorkerDispatchAction::Drain {
+                throttle_token_fired: true,
+            },
+        );
+    }
+
+    /// EpollEvent::new + event_set roundtrip pin. Defends against
+    /// a vmm-sys-util regression that lost the EventSet::ERROR or
+    /// EventSet::HANG_UP bit-mapping — without it, the dispatch
+    /// helper's `event_set.contains(EventSet::ERROR)` checks would
+    /// silently fail and the warn log would never fire on
+    /// saturation.
+    #[test]
+    fn epoll_event_set_roundtrip_pin() {
+        let combo = EventSet::IN | EventSet::ERROR | EventSet::HANG_UP;
+        let ev = EpollEvent::new(combo, KICK_TOKEN);
+        assert_eq!(ev.data(), KICK_TOKEN);
+        assert!(ev.event_set().contains(EventSet::IN));
+        assert!(ev.event_set().contains(EventSet::ERROR));
+        assert!(ev.event_set().contains(EventSet::HANG_UP));
     }
 }

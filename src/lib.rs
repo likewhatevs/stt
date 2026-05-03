@@ -413,21 +413,18 @@ pub mod topology;
 /// consume the live-host capture pipeline.
 pub mod live_host {
     pub use crate::monitor::bpf_map::{
-        BpfMapAccessor, BpfMapInfo, BPF_MAP_TYPE_ARENA, BPF_MAP_TYPE_ARRAY, BPF_MAP_TYPE_HASH,
-        BPF_MAP_TYPE_PERCPU_ARRAY,
+        BPF_MAP_TYPE_ARENA, BPF_MAP_TYPE_ARRAY, BPF_MAP_TYPE_HASH, BPF_MAP_TYPE_PERCPU_ARRAY,
+        BpfMapAccessor, BpfMapInfo,
     };
     pub use crate::monitor::bpf_syscall::BpfSyscallAccessor;
     pub use crate::monitor::debug_capture::{
-        AffinityHint, CgroupHint, CtprofSampleRef, DebugCapture, SchedPolicyHint,
-        WorkTypeHint, WorkloadFingerprint, WorkloadGroupHint, project_fingerprint,
-        DEBUG_CAPTURE_SCHEMA,
+        AffinityHint, CgroupHint, CtprofSampleRef, DEBUG_CAPTURE_SCHEMA, DebugCapture,
+        SchedPolicyHint, WorkTypeHint, WorkloadFingerprint, WorkloadGroupHint, project_fingerprint,
     };
     pub use crate::monitor::dmesg_scx::{
         ScxExitEvent, ScxExitKind, StackSymbol, extract_stack_symbols, parse_kmsg_window,
     };
-    pub use crate::monitor::live_host_kernel::{
-        KallsymsTable, LiveHostKernelEnv, uname_release,
-    };
+    pub use crate::monitor::live_host_kernel::{KallsymsTable, LiveHostKernelEnv, uname_release};
     pub use crate::monitor::reproducer_gen::{
         ReproducerSpec, generate_spec, render_ktstr_test_source, render_run_file_source,
     };
@@ -608,8 +605,8 @@ pub mod prelude {
         Assert, AssertDetail, AssertResult, ClaimBuilder, DetailKind, NoteValue, SchedulerBaseline,
         SeqClaim, SetClaim, Verdict, assert_baseline, assert_scx_events_clean,
     };
-    pub use crate::claim;
     pub use crate::cgroup::CgroupManager;
+    pub use crate::claim;
     pub use crate::host_context::HostContext;
     pub use crate::host_heap::HostHeapState;
     pub use crate::ktstr_test;
@@ -623,7 +620,7 @@ pub mod prelude {
     pub use crate::scenario::scenarios;
     pub use crate::scenario::{CgroupGroup, Ctx, collect_all, spawn_diverse};
     pub use crate::test_support::{
-        BpfMapWrite, CgroupPath, MetricCheck, MemSideCache, Metric, MetricBounds, MetricHint,
+        BpfMapWrite, CgroupPath, MemSideCache, Metric, MetricBounds, MetricCheck, MetricHint,
         MetricSource, NumaDistance, NumaNode, OutputFormat, Payload, PayloadKind, PayloadMetrics,
         Polarity, Scheduler, SchedulerSpec, SidecarResult, Sysctl, Topology, extract_metrics,
     };
@@ -643,10 +640,10 @@ pub mod prelude {
     // `ktstr_test_early_dispatch`, `run_ktstr_test`,
     // `resolve_scheduler`, `resolve_test_kernel`.
     pub use crate::topology::{LlcInfo, NodeMemInfo, TestTopology};
+    pub use crate::vmm::VirtioBlkCounters;
     pub use crate::vmm::disk_config::{
         DiskConfig, DiskThrottle, DiskThrottleValidationError, Filesystem, ThrottleDimension,
     };
-    pub use crate::vmm::VirtioBlkCounters;
     pub use crate::workload::{
         AffinityIntent, AluWidth, CloneMode, MemPolicy, Migration, MpolFlags, Phase,
         ResolvedAffinity, SchedPolicy, WorkSpec, WorkType, WorkTypeValidationError, WorkerReport,
@@ -1974,8 +1971,16 @@ mod tests {
 
         let extra_a = "CONFIG_KTSTR_CACHE_DISCRIMINATE_A=y\n";
         let extra_b = "CONFIG_KTSTR_CACHE_DISCRIMINATE_B=y\n";
-        let key_a = format!("test-disc-{}-xkc{}", kconfig_hash(), extra_kconfig_hash(extra_a));
-        let key_b = format!("test-disc-{}-xkc{}", kconfig_hash(), extra_kconfig_hash(extra_b));
+        let key_a = format!(
+            "test-disc-{}-xkc{}",
+            kconfig_hash(),
+            extra_kconfig_hash(extra_a)
+        );
+        let key_b = format!(
+            "test-disc-{}-xkc{}",
+            kconfig_hash(),
+            extra_kconfig_hash(extra_b)
+        );
         assert_ne!(
             key_a, key_b,
             "extras A and B must produce distinct cache keys (precondition)"
@@ -2079,7 +2084,11 @@ mod tests {
         )
         .with_extra_kconfig_hash(Some(extra_kconfig_hash(extra)));
         cache
-            .store(&extras_key, &CacheArtifacts::new(&extras_image), &extras_meta)
+            .store(
+                &extras_key,
+                &CacheArtifacts::new(&extras_image),
+                &extras_meta,
+            )
             .unwrap();
 
         // Both keys must now hit their own slot independently.
@@ -2141,7 +2150,11 @@ mod tests {
         )
         .with_extra_kconfig_hash(Some("deadbeef".to_string()));
         let extras = cache
-            .store("test-has-extras", &CacheArtifacts::new(&image), &extras_meta)
+            .store(
+                "test-has-extras",
+                &CacheArtifacts::new(&image),
+                &extras_meta,
+            )
             .unwrap();
         assert!(
             extras.has_extra_kconfig(),

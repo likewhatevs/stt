@@ -404,9 +404,7 @@ pub(crate) fn store_atomic(key: &str, src_path: &Path) -> Result<PathBuf> {
         .with_context(|| format!("statfs source {src_path:?} for cross-fs check"))?;
     let dest_buf = statfs_path(&root)
         .with_context(|| format!("statfs cache root {root:?} for cross-fs check"))?;
-    if src_buf.f_type != dest_buf.f_type
-        || fsid_bytes(&src_buf) != fsid_bytes(&dest_buf)
-    {
+    if src_buf.f_type != dest_buf.f_type || fsid_bytes(&src_buf) != fsid_bytes(&dest_buf) {
         bail!(
             "disk-template store_atomic: source {src_path:?} \
              (f_type=0x{src_type:x}) and cache root {root:?} \
@@ -433,9 +431,7 @@ pub(crate) fn store_atomic(key: &str, src_path: &Path) -> Result<PathBuf> {
     // empty `.tmp.<pid>` directories across retries.
     if let Err(e) = std::fs::rename(src_path, &staging_image) {
         let _ = std::fs::remove_dir_all(&staging);
-        return Err(e).with_context(|| {
-            format!("rename {src_path:?} -> {staging_image:?}")
-        });
+        return Err(e).with_context(|| format!("rename {src_path:?} -> {staging_image:?}"));
     }
     // Final atomic publish. On failure the staging directory now
     // contains `staging_image` (the first rename moved src_path into
@@ -447,9 +443,7 @@ pub(crate) fn store_atomic(key: &str, src_path: &Path) -> Result<PathBuf> {
     if let Err(e) = std::fs::rename(&staging, &final_dir) {
         let _ = std::fs::remove_dir_all(&staging);
         return Err(e).with_context(|| {
-            format!(
-                "publish staging {staging:?} -> {final_dir:?} (cache key {key})",
-            )
+            format!("publish staging {staging:?} -> {final_dir:?} (cache key {key})",)
         });
     }
     Ok(final_dir.join(TEMPLATE_FILENAME))
@@ -782,10 +776,7 @@ fn staging_image_path(cache_root: &Path, cache_key: &str, pid: u32) -> PathBuf {
 /// that does not require booting a VM. Production callsites in
 /// [`build_template_via_vm`] reach this helper via the standard
 /// resource-bootstrap path.
-fn create_and_size_staging_image(
-    staging_path: &Path,
-    capacity_bytes: u64,
-) -> Result<()> {
+fn create_and_size_staging_image(staging_path: &Path, capacity_bytes: u64) -> Result<()> {
     if staging_path.exists() {
         std::fs::remove_file(staging_path).with_context(|| {
             format!("remove leftover staging image {staging_path:?} before rebuild")
@@ -980,16 +971,12 @@ fn build_template_via_vm(
         Err(e) => {
             let _ = std::fs::remove_file(&staging_path);
             return Err(e).with_context(|| {
-                format!(
-                    "build template-VM for {fs:?} capacity_bytes={capacity_bytes}"
-                )
+                format!("build template-VM for {fs:?} capacity_bytes={capacity_bytes}")
             });
         }
     };
     let result = vm.run().with_context(|| {
-        format!(
-            "run template-build VM for {fs:?} capacity_bytes={capacity_bytes}"
-        )
+        format!("run template-build VM for {fs:?} capacity_bytes={capacity_bytes}")
     });
     let result = match result {
         Ok(r) => r,
@@ -1445,10 +1432,8 @@ mod tests {
         // Isolate from operator state: KTSTR_CACHE_DIR / XDG_CACHE_HOME
         // / $HOME bleed into template_path_for_key via cache_root().
         let tmp = tempfile::tempdir().expect("create tempdir");
-        let _guard = crate::test_support::test_helpers::EnvVarGuard::set(
-            "KTSTR_CACHE_DIR",
-            tmp.path(),
-        );
+        let _guard =
+            crate::test_support::test_helpers::EnvVarGuard::set("KTSTR_CACHE_DIR", tmp.path());
         let path = template_path_for_key("btrfs-256m").expect("resolve template path");
         assert!(path.ends_with(format!("btrfs-256m/{TEMPLATE_FILENAME}")));
     }
@@ -1460,10 +1445,8 @@ mod tests {
         // KTSTR_CACHE_DIR; setting it for the lifetime of the test
         // via EnvVarGuard isolates per-test state.
         let tmp = tempfile::tempdir().expect("create tempdir");
-        let _guard = crate::test_support::test_helpers::EnvVarGuard::set(
-            "KTSTR_CACHE_DIR",
-            tmp.path(),
-        );
+        let _guard =
+            crate::test_support::test_helpers::EnvVarGuard::set("KTSTR_CACHE_DIR", tmp.path());
         let result = lookup("missing-key").expect("lookup must not error on miss");
         assert!(result.is_none());
     }
@@ -1471,10 +1454,8 @@ mod tests {
     #[test]
     fn store_atomic_publishes_then_lookup_finds() {
         let tmp = tempfile::tempdir().expect("create tempdir");
-        let _guard = crate::test_support::test_helpers::EnvVarGuard::set(
-            "KTSTR_CACHE_DIR",
-            tmp.path(),
-        );
+        let _guard =
+            crate::test_support::test_helpers::EnvVarGuard::set("KTSTR_CACHE_DIR", tmp.path());
         // Stage a fake template under the cache root so the rename
         // is on the same filesystem.
         let cache_root_path = cache_root().unwrap();
@@ -1499,10 +1480,8 @@ mod tests {
         // than raising — by design (both writes produce
         // byte-identical templates for the same key).
         let tmp = tempfile::tempdir().expect("create tempdir");
-        let _guard = crate::test_support::test_helpers::EnvVarGuard::set(
-            "KTSTR_CACHE_DIR",
-            tmp.path(),
-        );
+        let _guard =
+            crate::test_support::test_helpers::EnvVarGuard::set("KTSTR_CACHE_DIR", tmp.path());
         let cache_root_path = cache_root().unwrap();
         std::fs::create_dir_all(&cache_root_path).unwrap();
         let staged1 = cache_root_path.join("staged1.img");
@@ -1526,10 +1505,7 @@ mod tests {
         // Override PATH to a single empty dir so the host binary is
         // guaranteed to be missing.
         let tmp = tempfile::tempdir().expect("create tempdir");
-        let _guard = crate::test_support::test_helpers::EnvVarGuard::set(
-            "PATH",
-            tmp.path(),
-        );
+        let _guard = crate::test_support::test_helpers::EnvVarGuard::set("PATH", tmp.path());
         let err = locate_host_binary("nonexistent-binary-9242", "imagined-package")
             .expect_err("must error when binary absent");
         let msg = err.to_string();
@@ -1554,17 +1530,10 @@ mod tests {
         // bail with a hint at the offending caller rather than as a
         // silent empty template.
         let tmp = tempfile::tempdir().expect("create tempdir");
-        let _guard = crate::test_support::test_helpers::EnvVarGuard::set(
-            "KTSTR_CACHE_DIR",
-            tmp.path(),
-        );
-        let err = build_template_via_vm(
-            Filesystem::Raw,
-            256 * 1024 * 1024,
-            tmp.path(),
-            "raw-256m",
-        )
-        .expect_err("Raw must be rejected");
+        let _guard =
+            crate::test_support::test_helpers::EnvVarGuard::set("KTSTR_CACHE_DIR", tmp.path());
+        let err = build_template_via_vm(Filesystem::Raw, 256 * 1024 * 1024, tmp.path(), "raw-256m")
+            .expect_err("Raw must be rejected");
         let msg = err.to_string();
         assert!(
             msg.contains("Filesystem::Raw"),
@@ -1696,11 +1665,8 @@ mod tests {
         let symlink_path = tmp.path().join("dangling");
         // Target does not exist; dangling symlink lands in the
         // tempdir.
-        std::os::unix::fs::symlink(
-            "/nonexistent-symlink-target-9242",
-            &symlink_path,
-        )
-        .expect("create dangling symlink");
+        std::os::unix::fs::symlink("/nonexistent-symlink-target-9242", &symlink_path)
+            .expect("create dangling symlink");
         // Probing a path under the dangling symlink: walk-up
         // ascends to symlink_path → tmp.path() (the symlink's
         // container). The symlink target's parent is never
@@ -1937,8 +1903,7 @@ mod tests {
     fn clean_orphaned_tmp_dirs_handles_missing_root() {
         let tmp = tempfile::tempdir().expect("create tempdir");
         let nonexistent = tmp.path().join("never-created");
-        let count = clean_orphaned_tmp_dirs(&nonexistent)
-            .expect("missing root must not error");
+        let count = clean_orphaned_tmp_dirs(&nonexistent).expect("missing root must not error");
         assert_eq!(count, 0, "missing root sweeps zero entries");
     }
 
@@ -1956,17 +1921,11 @@ mod tests {
         let cache_root = tmp.path();
         // i32::MAX > PID_MAX_LIMIT (2^22); guaranteed-dead.
         let dead_pid = i32::MAX;
-        let leaked = cache_root.join(format!(
-            "template.img.in-flight.btrfs-256m.{dead_pid}",
-        ));
+        let leaked = cache_root.join(format!("template.img.in-flight.btrfs-256m.{dead_pid}",));
         std::fs::write(&leaked, b"FAKE_STAGING_IMG").unwrap();
-        let count = clean_orphaned_tmp_dirs(cache_root)
-            .expect("sweep must succeed");
+        let count = clean_orphaned_tmp_dirs(cache_root).expect("sweep must succeed");
         assert_eq!(count, 1, "exactly one debris entry removed");
-        assert!(
-            !leaked.exists(),
-            "dead-pid staging image must be unlinked",
-        );
+        assert!(!leaked.exists(), "dead-pid staging image must be unlinked",);
     }
 
     /// `clean_orphaned_tmp_dirs` removes a stale staging directory
@@ -1980,8 +1939,7 @@ mod tests {
         let leaked = cache_root.join(format!("btrfs-256m.tmp.{dead_pid}"));
         std::fs::create_dir_all(&leaked).unwrap();
         std::fs::write(leaked.join("template.img"), b"PARTIAL").unwrap();
-        let count = clean_orphaned_tmp_dirs(cache_root)
-            .expect("sweep must succeed");
+        let count = clean_orphaned_tmp_dirs(cache_root).expect("sweep must succeed");
         assert_eq!(count, 1, "exactly one debris entry removed");
         assert!(
             !leaked.exists(),
@@ -2001,12 +1959,9 @@ mod tests {
         let tmp = tempfile::tempdir().expect("create tempdir");
         let cache_root = tmp.path();
         let live_pid = std::process::id();
-        let live_image = cache_root.join(format!(
-            "template.img.in-flight.btrfs-256m.{live_pid}",
-        ));
+        let live_image = cache_root.join(format!("template.img.in-flight.btrfs-256m.{live_pid}",));
         std::fs::write(&live_image, b"LIVE_PEER_DEBRIS").unwrap();
-        let count = clean_orphaned_tmp_dirs(cache_root)
-            .expect("sweep must succeed");
+        let count = clean_orphaned_tmp_dirs(cache_root).expect("sweep must succeed");
         assert_eq!(
             count, 0,
             "no entries removed when only live-pid debris exists",
@@ -2033,8 +1988,7 @@ mod tests {
         let published = cache_root.join("btrfs-256m");
         std::fs::create_dir_all(&published).unwrap();
         std::fs::write(published.join(TEMPLATE_FILENAME), b"GOOD").unwrap();
-        let count = clean_orphaned_tmp_dirs(cache_root)
-            .expect("sweep must succeed");
+        let count = clean_orphaned_tmp_dirs(cache_root).expect("sweep must succeed");
         assert_eq!(
             count, 0,
             "published cache entries must not be swept by debris GC",
@@ -2059,12 +2013,8 @@ mod tests {
         let locks = cache_root.join(LOCK_DIR_NAME);
         std::fs::create_dir_all(&locks).unwrap();
         std::fs::write(locks.join("btrfs-256m.lock"), b"").unwrap();
-        let count = clean_orphaned_tmp_dirs(cache_root)
-            .expect("sweep must succeed");
-        assert_eq!(
-            count, 0,
-            ".locks/ must be invisible to the debris sweep",
-        );
+        let count = clean_orphaned_tmp_dirs(cache_root).expect("sweep must succeed");
+        assert_eq!(count, 0, ".locks/ must be invisible to the debris sweep",);
         assert!(locks.is_dir(), ".locks/ subdirectory must survive");
         assert!(
             locks.join("btrfs-256m.lock").is_file(),
@@ -2079,16 +2029,13 @@ mod tests {
     #[test]
     fn clean_all_removes_published_entry() {
         let tmp = tempfile::tempdir().expect("create tempdir");
-        let _guard = crate::test_support::test_helpers::EnvVarGuard::set(
-            "KTSTR_CACHE_DIR",
-            tmp.path(),
-        );
+        let _guard =
+            crate::test_support::test_helpers::EnvVarGuard::set("KTSTR_CACHE_DIR", tmp.path());
         let cache_root_path = cache_root().unwrap();
         std::fs::create_dir_all(&cache_root_path).unwrap();
         let staged = cache_root_path.join("staged.img");
         std::fs::write(&staged, b"FAKE_TEMPLATE").unwrap();
-        let installed = store_atomic("btrfs-256m", &staged)
-            .expect("store_atomic publishes");
+        let installed = store_atomic("btrfs-256m", &staged).expect("store_atomic publishes");
         assert!(installed.is_file());
         let count = clean_all().expect("clean_all must succeed");
         assert_eq!(count, 1, "exactly one published entry removed");
@@ -2104,10 +2051,7 @@ mod tests {
             // whether store_atomic touched it (this code path
             // doesn't); but if it does exist, it must NOT have
             // been removed by clean_all.
-            assert!(
-                lock_path.is_file(),
-                "lockfile inode must survive clean_all",
-            );
+            assert!(lock_path.is_file(), "lockfile inode must survive clean_all",);
         }
     }
 
@@ -2117,10 +2061,8 @@ mod tests {
     #[test]
     fn clean_all_reports_zero_on_empty_cache() {
         let tmp = tempfile::tempdir().expect("create tempdir");
-        let _guard = crate::test_support::test_helpers::EnvVarGuard::set(
-            "KTSTR_CACHE_DIR",
-            tmp.path(),
-        );
+        let _guard =
+            crate::test_support::test_helpers::EnvVarGuard::set("KTSTR_CACHE_DIR", tmp.path());
         let count = clean_all().expect("clean_all must succeed on empty");
         assert_eq!(count, 0);
     }
@@ -2136,10 +2078,8 @@ mod tests {
         // (no create_dir_all, no store_atomic call). cache_root()
         // resolves the path string but the directory is absent.
         let nonexistent = tmp.path().join("never-created");
-        let _guard = crate::test_support::test_helpers::EnvVarGuard::set(
-            "KTSTR_CACHE_DIR",
-            &nonexistent,
-        );
+        let _guard =
+            crate::test_support::test_helpers::EnvVarGuard::set("KTSTR_CACHE_DIR", &nonexistent);
         let count = clean_all().expect("missing cache root must not error");
         assert_eq!(count, 0);
     }
@@ -2161,30 +2101,23 @@ mod tests {
     #[test]
     fn clean_all_skips_entry_locked_by_live_peer() {
         let tmp = tempfile::tempdir().expect("create tempdir");
-        let _guard = crate::test_support::test_helpers::EnvVarGuard::set(
-            "KTSTR_CACHE_DIR",
-            tmp.path(),
-        );
+        let _guard =
+            crate::test_support::test_helpers::EnvVarGuard::set("KTSTR_CACHE_DIR", tmp.path());
         // Stage a published entry so there's something to skip.
         let cache_root_path = cache_root().unwrap();
         std::fs::create_dir_all(&cache_root_path).unwrap();
         let staged = cache_root_path.join("staged.img");
         std::fs::write(&staged, b"FAKE_TEMPLATE").unwrap();
-        let installed = store_atomic("btrfs-256m", &staged)
-            .expect("store_atomic publishes");
+        let installed = store_atomic("btrfs-256m", &staged).expect("store_atomic publishes");
         assert!(installed.is_file());
         // Hold the per-key flock from this process. `clean_all`'s
         // `try_flock(LOCK_EX|LOCK_NB)` against the same file
         // returns `Ok(None)` because EX is exclusive — even our
         // own process's prior fd blocks the second acquire (flock
         // semantics: fd-scoped, not process-scoped).
-        let _hold = acquire_template_lock("btrfs-256m")
-            .expect("acquire template lock");
+        let _hold = acquire_template_lock("btrfs-256m").expect("acquire template lock");
         let count = clean_all().expect("clean_all must succeed");
-        assert_eq!(
-            count, 0,
-            "locked entry must not be removed by clean_all",
-        );
+        assert_eq!(count, 0, "locked entry must not be removed by clean_all",);
         // And the entry directory must still be on disk.
         assert!(
             lookup("btrfs-256m").expect("lookup ok").is_some(),
@@ -2201,10 +2134,8 @@ mod tests {
     #[test]
     fn clean_all_sweeps_debris_alongside_published_entries() {
         let tmp = tempfile::tempdir().expect("create tempdir");
-        let _guard = crate::test_support::test_helpers::EnvVarGuard::set(
-            "KTSTR_CACHE_DIR",
-            tmp.path(),
-        );
+        let _guard =
+            crate::test_support::test_helpers::EnvVarGuard::set("KTSTR_CACHE_DIR", tmp.path());
         let cache_root_path = cache_root().unwrap();
         std::fs::create_dir_all(&cache_root_path).unwrap();
         // Published entry.
@@ -2213,9 +2144,8 @@ mod tests {
         store_atomic("btrfs-256m", &staged).unwrap();
         // Dead-pid staging image debris.
         let dead_pid = i32::MAX;
-        let debris = cache_root_path.join(format!(
-            "template.img.in-flight.btrfs-1024m.{dead_pid}",
-        ));
+        let debris =
+            cache_root_path.join(format!("template.img.in-flight.btrfs-1024m.{dead_pid}",));
         std::fs::write(&debris, b"DEBRIS").unwrap();
         // Sanity: both exist before clean_all.
         assert!(debris.is_file());

@@ -474,9 +474,9 @@ fn kernel_build(
     // empty-file warning so a 0-byte fragment doesn't silently
     // produce an "extras present but nothing merged" build.
     let extra_content: Option<String> = match extra_kconfig.as_ref() {
-        Some(p) => Some(
-            ktstr::cli::read_extra_kconfig(p, "ktstr").map_err(|e| anyhow::anyhow!("{e}"))?,
-        ),
+        Some(p) => {
+            Some(ktstr::cli::read_extra_kconfig(p, "ktstr").map_err(|e| anyhow::anyhow!("{e}"))?)
+        }
         None => None,
     };
 

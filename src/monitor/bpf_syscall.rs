@@ -190,9 +190,7 @@ struct BpfBtfInfoUapi {
 unsafe fn bpf_syscall(cmd: u32, attr_ptr: *const u8, attr_size: usize) -> i64 {
     // SAFETY: caller must ensure attr_ptr/attr_size validity. The
     // syscall itself is signal-safe and reentrant.
-    unsafe {
-        libc::syscall(libc::SYS_bpf, cmd as i64, attr_ptr, attr_size) as i64
-    }
+    unsafe { libc::syscall(libc::SYS_bpf, cmd as i64, attr_ptr, attr_size) as i64 }
 }
 
 /// Wrap a `bpf()` syscall result in a `Result<RawFd>` for commands
@@ -467,7 +465,11 @@ fn obj_get_info_map(fd: RawFd) -> Result<(BpfMapInfo, u64)> {
     )
     .context("BPF_OBJ_GET_INFO_BY_FD on map fd")?;
 
-    let nul = info.name.iter().position(|&b| b == 0).unwrap_or(BPF_OBJ_NAME_LEN);
+    let nul = info
+        .name
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(BPF_OBJ_NAME_LEN);
     let name = String::from_utf8_lossy(&info.name[..nul]).to_string();
 
     Ok((
@@ -621,12 +623,7 @@ impl BpfMapAccessor for BpfSyscallAccessor {
         out
     }
 
-    fn read_percpu_array(
-        &self,
-        map: &BpfMapInfo,
-        key: u32,
-        num_cpus: u32,
-    ) -> Vec<Option<Vec<u8>>> {
+    fn read_percpu_array(&self, map: &BpfMapInfo, key: u32, num_cpus: u32) -> Vec<Option<Vec<u8>>> {
         let Some(pinned) = self.pinned_for(map) else {
             return Vec::new();
         };
@@ -767,9 +764,7 @@ impl BpfMapAccessor for BpfSyscallAccessor {
         // read only the present ones. mincore returns 0 for
         // resident pages, < 0 on error.
         let mut residency = vec![0u8; walk_pages as usize];
-        let mincore_ret = unsafe {
-            libc::mincore(addr, walk_bytes, residency.as_mut_ptr())
-        };
+        let mincore_ret = unsafe { libc::mincore(addr, walk_bytes, residency.as_mut_ptr()) };
         if mincore_ret == 0 {
             for (idx, &resident) in residency.iter().enumerate() {
                 if resident & 1 == 0 {
@@ -789,7 +784,10 @@ impl BpfMapAccessor for BpfSyscallAccessor {
                     );
                 }
                 let user_addr = user_vm_start + (idx as u64) * ARENA_PAGE_SIZE as u64;
-                pages.push(ArenaPage { user_addr, bytes: buf });
+                pages.push(ArenaPage {
+                    user_addr,
+                    bytes: buf,
+                });
             }
         }
 
@@ -926,18 +924,22 @@ mod tests {
         // equal total struct size.
         crate::claim!(v, map_extra_tail).eq(total_size);
         let r = v.into_result();
-        assert!(
-            r.passed,
-            "bpf_map_info uapi layout drift: {:?}",
-            r.details,
-        );
+        assert!(r.passed, "bpf_map_info uapi layout drift: {:?}", r.details,);
     }
 
     /// Round-up arithmetic for percpu stride matches the kernel's
     /// `round_up(value_size, 8)`.
     #[test]
     fn percpu_stride_round_up() {
-        let cases = [(0usize, 0), (1, 8), (7, 8), (8, 8), (9, 16), (15, 16), (16, 16)];
+        let cases = [
+            (0usize, 0),
+            (1, 8),
+            (7, 8),
+            (8, 8),
+            (9, 16),
+            (15, 16),
+            (16, 16),
+        ];
         for (val_sz, expected) in cases {
             let stride = (val_sz + 7) & !7;
             assert_eq!(stride, expected, "value_size {val_sz} → stride {stride}");
@@ -956,10 +958,10 @@ mod tests {
         // type annotation matches the trait shape callers will
         // use.
         fn _check_predicate_shape() {
-            let _ = BpfSyscallAccessor::from_running_kernel_filtered(
-                |_info: &BpfMapInfo| -> bool { false },
-            );
+            let _ =
+                BpfSyscallAccessor::from_running_kernel_filtered(|_info: &BpfMapInfo| -> bool {
+                    false
+                });
         }
     }
 }
-

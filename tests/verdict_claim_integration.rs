@@ -257,7 +257,9 @@ fn verdict_merges_external_assert_result_into_pointwise_claims() {
     );
     let messages: Vec<&str> = r.details.iter().map(|d| d.message.as_str()).collect();
     assert!(
-        messages.iter().any(|m| m.contains("synthetic upstream failure")),
+        messages
+            .iter()
+            .any(|m| m.contains("synthetic upstream failure")),
         "merged upstream details must survive into the final result: {:?}",
         messages,
     );

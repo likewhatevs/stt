@@ -685,6 +685,10 @@ mod tests {
         v.merge(parsed);
 
         let r = v.into_result();
-        assert!(r.passed, "passing merge must keep verdict passing: {:?}", r.details);
+        assert!(
+            r.passed,
+            "passing merge must keep verdict passing: {:?}",
+            r.details
+        );
     }
 }

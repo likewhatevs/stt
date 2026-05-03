@@ -8,9 +8,10 @@
 //! the [`defaults`] constants `WorkType::from_name` consults, the
 //! [`humantime_serde_helper`] module the duration fields cite, and the
 //! [`resolve_work_type`] selector. The corresponding kernel-call
-//! helpers (`apply_mempolicy_with_flags`, `apply_nice`,
-//! `build_nodemask`, `set_sched_policy`) live in the parent module
-//! alongside `worker_main`.
+//! helpers live in the [`spawn`](super::spawn) submodule
+//! (`apply_mempolicy_with_flags`, `apply_nice`, `build_nodemask`)
+//! and the [`worker`](super::worker) submodule
+//! (`set_sched_policy` in `worker/sched.rs`).
 //!
 //! Types are re-exported from the parent module via `pub use config::*`,
 //! so existing `crate::workload::WorkloadConfig` paths continue to
@@ -57,10 +58,8 @@ pub(crate) mod humantime_serde_helper {
 /// compile errors in both sites.
 pub mod defaults {
     // Bursty
-    pub const BURSTY_BURST_DURATION: std::time::Duration =
-        std::time::Duration::from_millis(50);
-    pub const BURSTY_SLEEP_DURATION: std::time::Duration =
-        std::time::Duration::from_millis(100);
+    pub const BURSTY_BURST_DURATION: std::time::Duration = std::time::Duration::from_millis(50);
+    pub const BURSTY_SLEEP_DURATION: std::time::Duration = std::time::Duration::from_millis(100);
     // PipeIo
     pub const PIPE_IO_BURST_ITERS: u64 = 1024;
     // FutexPingPong
@@ -140,10 +139,8 @@ pub mod defaults {
     // NumaMigrationChurn
     pub const NUMA_MIGRATION_CHURN_PERIOD_MS: u64 = 100;
     // IdleChurn
-    pub const IDLE_CHURN_BURST_DURATION: std::time::Duration =
-        std::time::Duration::from_millis(1);
-    pub const IDLE_CHURN_SLEEP_DURATION: std::time::Duration =
-        std::time::Duration::from_millis(5);
+    pub const IDLE_CHURN_BURST_DURATION: std::time::Duration = std::time::Duration::from_millis(1);
+    pub const IDLE_CHURN_SLEEP_DURATION: std::time::Duration = std::time::Duration::from_millis(5);
     /// Default for [`WorkType::IdleChurn`]'s `precise_timing` field.
     /// `false` keeps the inherited 50µs `current->timer_slack_ns`
     /// the variant doc describes; opt-in callers set the field to
@@ -385,23 +382,25 @@ pub enum WakeMechanism {
 /// ALU/SIMD execution width for [`WorkType::AluHot`].
 ///
 /// Selects the widest data-path the worker exercises per
-/// multiply chain. Wider variants WILL drive more
-/// functional-unit pressure and (for AVX-512 / AMX) draw the
-/// package into a frequency-throttled mode the kernel scheduler
-/// must observe when SIMD intrinsics land per-arm; v0 is
-/// scalar-only, so all widths execute the same scalar
-/// four-stream multiply chain today. The serde wire form is
-/// snake_case (`"scalar"`, `"vec128"`, `"vec256"`,
-/// `"vec512"`, `"amx"`, `"widest"`).
+/// multiply chain. Today every variant executes the same scalar
+/// four-stream multiply chain — the width selector is preserved
+/// on the wire so a downstream classifier can distinguish runs
+/// that requested SIMD from runs that requested scalar even
+/// though the dispatch is uniform. Wider variants WILL drive
+/// more functional-unit pressure and (for AVX-512 / AMX) draw
+/// the package into a frequency-throttled mode the kernel
+/// scheduler must observe once SIMD intrinsics land per-arm.
+/// The serde wire form is snake_case (`"scalar"`, `"vec128"`,
+/// `"vec256"`, `"vec512"`, `"amx"`, `"widest"`).
 ///
-/// # v0 behaviour
+/// # Current behaviour
 ///
-/// All widths run the SAME four-stream scalar multiply path in
-/// v0; the width selector shapes the dispatch for future SIMD
-/// intrinsics (follow-up #309-#314). No observable behavioral
-/// difference between widths today — the variant is
-/// preserved so existing serialized configs keep round-tripping
-/// when the SIMD bodies land.
+/// All widths run the same four-stream scalar multiply path;
+/// the width selector is preserved on the wire and on
+/// [`WorkerReport`](crate::workload::WorkerReport) so a
+/// downstream classifier can distinguish runs that requested
+/// SIMD from runs that requested scalar even though the
+/// dispatch is uniform.
 ///
 /// # Default semantics
 ///
@@ -442,7 +441,9 @@ pub enum WakeMechanism {
 /// comparison because the throttle is package-wide, not
 /// per-task. Tests that A/B-compare schedulers under
 /// [`Vec512`](Self::Vec512) or [`Amx`](Self::Amx) need the
-/// runs serialized on the same package — see follow-up #310.
+/// runs serialized on the same package — the framework does
+/// not currently coordinate this serialization across worker
+/// groups.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AluWidth {
@@ -481,8 +482,8 @@ pub enum AluWidth {
     /// process before the first AMX instruction; the framework
     /// does NOT issue this prctl, so AMX is not yet runnable.
     /// `resolve_alu_width` therefore downgrades `AluWidth::Amx`
-    /// to the host's widest stable-detectable variant. See
-    /// follow-up #309 for the AMX detection + prctl path.
+    /// to the host's widest stable-detectable variant; AMX is
+    /// not currently runnable end-to-end on this framework.
     ///
     /// Not available on aarch64 — falls back to `Vec128`.
     Amx,
@@ -1196,5 +1197,299 @@ impl WorkSpec {
     pub fn nice(mut self, n: i32) -> Self {
         self.nice = n;
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::types::WorkType;
+    use super::*;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn sched_policy_debug_shows_variant_and_priority() {
+        let s = format!("{:?}", SchedPolicy::Fifo(50));
+        assert!(s.contains("Fifo"), "must show variant name");
+        assert!(s.contains("50"), "must show priority value");
+        let s = format!("{:?}", SchedPolicy::RoundRobin(99));
+        assert!(s.contains("RoundRobin"), "must show variant name");
+        assert!(s.contains("99"), "must show priority value");
+        // Ensure different priorities produce different output.
+        let s1 = format!("{:?}", SchedPolicy::Fifo(1));
+        let s10 = format!("{:?}", SchedPolicy::Fifo(10));
+        assert_ne!(
+            s1, s10,
+            "different priorities must produce different debug output"
+        );
+    }
+    #[test]
+    fn sched_policy_copy_preserves_priority() {
+        let a = SchedPolicy::Fifo(42);
+        let b = a; // Copy
+        match b {
+            SchedPolicy::Fifo(p) => assert_eq!(p, 42),
+            _ => panic!("copy must preserve variant and priority"),
+        }
+    }
+    // -- SchedPolicy constructors --
+
+    #[test]
+    fn sched_policy_fifo_constructor() {
+        match SchedPolicy::fifo(50) {
+            SchedPolicy::Fifo(p) => assert_eq!(p, 50),
+            _ => panic!("expected Fifo"),
+        }
+    }
+    #[test]
+    fn sched_policy_rr_constructor() {
+        match SchedPolicy::round_robin(25) {
+            SchedPolicy::RoundRobin(p) => assert_eq!(p, 25),
+            _ => panic!("expected RoundRobin"),
+        }
+    }
+    // -- MemPolicy tests --
+
+    #[test]
+    fn mempolicy_default_node_set_empty() {
+        assert!(MemPolicy::Default.node_set().is_empty());
+    }
+    #[test]
+    fn mempolicy_local_node_set_empty() {
+        assert!(MemPolicy::Local.node_set().is_empty());
+    }
+    #[test]
+    fn mempolicy_bind_node_set() {
+        let p = MemPolicy::Bind([0, 2].into_iter().collect());
+        assert_eq!(p.node_set(), [0, 2].into_iter().collect());
+    }
+    #[test]
+    fn mempolicy_preferred_node_set() {
+        let p = MemPolicy::Preferred(1);
+        assert_eq!(p.node_set(), [1].into_iter().collect());
+    }
+    #[test]
+    fn mempolicy_interleave_node_set() {
+        let p = MemPolicy::Interleave([0, 1, 3].into_iter().collect());
+        assert_eq!(p.node_set(), [0, 1, 3].into_iter().collect());
+    }
+    #[test]
+    fn mempolicy_preferred_many_node_set() {
+        let p = MemPolicy::preferred_many([0, 2]);
+        assert_eq!(p.node_set(), [0, 2].into_iter().collect());
+    }
+    #[test]
+    fn mempolicy_weighted_interleave_node_set() {
+        let p = MemPolicy::weighted_interleave([1, 3]);
+        assert_eq!(p.node_set(), [1, 3].into_iter().collect());
+    }
+    #[test]
+    fn mempolicy_validate_preferred_many_empty() {
+        assert!(
+            MemPolicy::PreferredMany(BTreeSet::new())
+                .validate()
+                .is_err()
+        );
+    }
+    #[test]
+    fn mempolicy_validate_weighted_interleave_empty() {
+        assert!(
+            MemPolicy::WeightedInterleave(BTreeSet::new())
+                .validate()
+                .is_err()
+        );
+    }
+    #[test]
+    fn mempolicy_validate_preferred_many_ok() {
+        assert!(MemPolicy::preferred_many([0]).validate().is_ok());
+    }
+    #[test]
+    fn mempolicy_validate_weighted_interleave_ok() {
+        assert!(MemPolicy::weighted_interleave([0, 1]).validate().is_ok());
+    }
+    #[test]
+    fn mpol_flags_union() {
+        let f = MpolFlags::STATIC_NODES | MpolFlags::NUMA_BALANCING;
+        assert_eq!(f.bits(), (1 << 15) | (1 << 13));
+    }
+    #[test]
+    fn mpol_flags_none_is_zero() {
+        assert_eq!(MpolFlags::NONE.bits(), 0);
+    }
+    #[test]
+    fn work_mpol_flags_builder() {
+        let w = WorkSpec::default().mpol_flags(MpolFlags::STATIC_NODES);
+        assert_eq!(w.mpol_flags, MpolFlags::STATIC_NODES);
+    }
+    #[test]
+    fn mpol_flags_contains_identity() {
+        assert!(MpolFlags::NONE.contains(MpolFlags::NONE));
+        assert!(MpolFlags::STATIC_NODES.contains(MpolFlags::STATIC_NODES));
+        let composite = MpolFlags::STATIC_NODES | MpolFlags::NUMA_BALANCING;
+        assert!(composite.contains(composite));
+    }
+    #[test]
+    fn mpol_flags_contains_superset_is_true_for_subset() {
+        let composite = MpolFlags::STATIC_NODES | MpolFlags::NUMA_BALANCING;
+        assert!(composite.contains(MpolFlags::STATIC_NODES));
+        assert!(composite.contains(MpolFlags::NUMA_BALANCING));
+    }
+    #[test]
+    fn mpol_flags_contains_subset_is_false_for_superset() {
+        let composite = MpolFlags::STATIC_NODES | MpolFlags::NUMA_BALANCING;
+        assert!(!MpolFlags::STATIC_NODES.contains(composite));
+        assert!(!MpolFlags::NUMA_BALANCING.contains(composite));
+    }
+    #[test]
+    fn mpol_flags_contains_empty_is_always_true() {
+        // `(x & 0) == 0` holds for every x, so every MpolFlags
+        // value — including NONE itself — is a superset of NONE.
+        assert!(MpolFlags::NONE.contains(MpolFlags::NONE));
+        assert!(MpolFlags::STATIC_NODES.contains(MpolFlags::NONE));
+        let composite = MpolFlags::STATIC_NODES | MpolFlags::NUMA_BALANCING;
+        assert!(composite.contains(MpolFlags::NONE));
+    }
+    #[test]
+    fn mpol_flags_none_does_not_contain_any_set_flag() {
+        assert!(!MpolFlags::NONE.contains(MpolFlags::STATIC_NODES));
+        assert!(!MpolFlags::NONE.contains(MpolFlags::RELATIVE_NODES));
+        assert!(!MpolFlags::NONE.contains(MpolFlags::NUMA_BALANCING));
+    }
+    #[test]
+    fn mpol_flags_contains_rejects_disjoint_flag() {
+        // Single-flag values that share no bits must not satisfy
+        // `contains` in either direction.
+        assert!(!MpolFlags::STATIC_NODES.contains(MpolFlags::NUMA_BALANCING));
+        assert!(!MpolFlags::NUMA_BALANCING.contains(MpolFlags::STATIC_NODES));
+    }
+    #[test]
+    fn mpol_flags_contains_rejects_partial_overlap() {
+        // Partial bit overlap must not satisfy `contains` — every
+        // bit of `other` must be set in `self`, not merely some.
+        let a = MpolFlags::STATIC_NODES | MpolFlags::NUMA_BALANCING;
+        let b = MpolFlags::RELATIVE_NODES | MpolFlags::NUMA_BALANCING;
+        assert!(!a.contains(b));
+        assert!(!b.contains(a));
+    }
+    // -- CloneMode tests --
+
+    #[test]
+    fn clone_mode_default_is_fork() {
+        // Preserves historical fork-based behavior — anything else
+        // would silently change every existing caller's spawn path.
+        assert!(matches!(CloneMode::default(), CloneMode::Fork));
+    }
+    #[test]
+    fn workload_config_default_clone_mode_is_fork() {
+        let c = WorkloadConfig::default();
+        assert!(matches!(c.clone_mode, CloneMode::Fork));
+    }
+    #[test]
+    fn workload_config_clone_mode_builder() {
+        let cfg = WorkloadConfig::default().clone_mode(CloneMode::Thread);
+        assert!(matches!(cfg.clone_mode, CloneMode::Thread));
+    }
+    #[test]
+    fn work_mem_policy_builder() {
+        let w = WorkSpec::default().mem_policy(MemPolicy::Bind([0].into_iter().collect()));
+        assert!(matches!(w.mem_policy, MemPolicy::Bind(_)));
+    }
+    #[test]
+    fn work_default_mempolicy_is_default() {
+        let w = WorkSpec::default();
+        assert!(matches!(w.mem_policy, MemPolicy::Default));
+    }
+    #[test]
+    fn workload_config_default_mempolicy() {
+        let wl = WorkloadConfig::default();
+        assert!(matches!(wl.mem_policy, MemPolicy::Default));
+    }
+    /// Full `WorkloadConfig` round-trip with `Default` ensures every
+    /// field handles serde correctly together — no field is silently
+    /// missing a derive.
+    #[test]
+    fn workload_config_default_roundtrips() {
+        let cfg = WorkloadConfig::default();
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: WorkloadConfig = serde_json::from_str(&json).unwrap();
+        // Compare via re-serialization since WorkloadConfig has no PartialEq.
+        let json2 = serde_json::to_string(&back).unwrap();
+        assert_eq!(json, json2);
+    }
+
+    // -- resolve_work_type --
+
+    #[test]
+    fn resolve_work_type_not_swappable() {
+        let base = WorkType::SpinWait;
+        let over = WorkType::YieldHeavy;
+        let result = resolve_work_type(&base, Some(&over), false, 4);
+        assert!(matches!(result, WorkType::SpinWait));
+    }
+    #[test]
+    fn resolve_work_type_swappable_applies_override() {
+        let base = WorkType::SpinWait;
+        let over = WorkType::YieldHeavy;
+        let result = resolve_work_type(&base, Some(&over), true, 4);
+        assert!(matches!(result, WorkType::YieldHeavy));
+    }
+    #[test]
+    fn resolve_work_type_swappable_no_override() {
+        let base = WorkType::SpinWait;
+        let result = resolve_work_type(&base, None, true, 4);
+        assert!(matches!(result, WorkType::SpinWait));
+    }
+    #[test]
+    fn resolve_work_type_group_size_mismatch() {
+        let base = WorkType::SpinWait;
+        let over = WorkType::pipe_io(100); // group_size = 2
+        let result = resolve_work_type(&base, Some(&over), true, 3); // 3 not divisible by 2
+        assert!(matches!(result, WorkType::SpinWait));
+    }
+    #[test]
+    fn resolve_work_type_group_size_match() {
+        let base = WorkType::SpinWait;
+        let over = WorkType::pipe_io(100); // group_size = 2
+        let result = resolve_work_type(&base, Some(&over), true, 4); // 4 divisible by 2
+        assert!(matches!(result, WorkType::PipeIo { .. }));
+    }
+
+    // -- WorkSpec builder --
+
+    #[test]
+    fn work_builder_chain() {
+        let w = WorkSpec::default()
+            .workers(8)
+            .work_type(WorkType::bursty(
+                Duration::from_millis(10),
+                Duration::from_millis(20),
+            ))
+            .sched_policy(SchedPolicy::Batch)
+            .affinity(AffinityIntent::SingleCpu)
+            .nice(7);
+        assert_eq!(w.num_workers, Some(8));
+        if let WorkType::Bursty {
+            burst_duration,
+            sleep_duration,
+        } = w.work_type
+        {
+            assert_eq!(burst_duration, Duration::from_millis(10));
+            assert_eq!(sleep_duration, Duration::from_millis(20));
+        } else {
+            panic!("expected Bursty variant; got {:?}", w.work_type);
+        }
+        assert!(matches!(w.sched_policy, SchedPolicy::Batch));
+        assert!(matches!(w.affinity, AffinityIntent::SingleCpu));
+        assert_eq!(w.nice, 7);
+    }
+    #[test]
+    fn work_default_values() {
+        let w = WorkSpec::default();
+        assert_eq!(w.num_workers, None);
+        assert!(matches!(w.work_type, WorkType::SpinWait));
+        assert!(matches!(w.sched_policy, SchedPolicy::Normal));
+        assert!(matches!(w.affinity, AffinityIntent::Inherit));
+        // Default nice is 0 — same skip semantics as
+        // [`WorkloadConfig::nice`].
+        assert_eq!(w.nice, 0);
     }
 }

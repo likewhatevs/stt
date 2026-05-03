@@ -1068,21 +1068,27 @@ fn cleanup_recursive(path: &std::path::Path) {
     // (b) avoids a brief frozen-counter churn while migration
     // batches advance, and (c) makes the teardown path symmetric
     // with `remove_cgroup` so operators reading either function
-    // see the same auto-unfreeze step. Tolerates ENOENT (no
-    // `cgroup.freeze` file — `CONFIG_CGROUP_FREEZE` absent on
-    // legacy kernels, or this is a non-cgroup directory entry) by
-    // ignoring the error: the file is simply absent and the drain
-    // can proceed without it.
+    // see the same auto-unfreeze step.
+    //
+    // Gate on existence: `fs::write` on a regular filesystem
+    // CREATES the file when it doesn't exist (open(O_WRONLY |
+    // O_CREAT | O_TRUNC)), so unconditionally writing
+    // `cgroup.freeze` would plant a stray 1-byte file under any
+    // non-cgroupfs directory and cause the subsequent
+    // `fs::remove_dir(path)` to fail with ENOTEMPTY. On a real
+    // cgroup v2 tree the file is always present (cgroup-core,
+    // ungated by controllers); on a legacy kernel without
+    // `CONFIG_CGROUP_FREEZE` or on a non-cgroup directory entry
+    // the file is absent and the unfreeze step is a no-op.
     let freeze_path = path.join("cgroup.freeze");
-    if let Err(err) = write_with_timeout(&freeze_path, "0", CGROUP_WRITE_TIMEOUT) {
-        let errno = anyhow_first_io_errno(&err);
-        if errno != Some(libc::ENOENT) {
-            tracing::warn!(
-                path = %path.display(),
-                err = %format!("{err:#}"),
-                "cleanup_recursive: pre-drain unfreeze failed; source-cgroup state-hygiene step skipped",
-            );
-        }
+    if freeze_path.exists()
+        && let Err(err) = write_with_timeout(&freeze_path, "0", CGROUP_WRITE_TIMEOUT)
+    {
+        tracing::warn!(
+            path = %path.display(),
+            err = %format!("{err:#}"),
+            "cleanup_recursive: pre-drain unfreeze failed; source-cgroup state-hygiene step skipped",
+        );
     }
     drain_pids_to_root(&path.join("cgroup.procs"), &path.display().to_string());
     std::thread::sleep(std::time::Duration::from_millis(10));
@@ -1244,7 +1250,8 @@ mod tests {
     /// file back and asserts every controller token is present.
     #[test]
     fn setup_writes_all_controllers() {
-        let root = std::env::temp_dir().join(format!("ktstr-setup-controllers-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("ktstr-setup-controllers-{}", std::process::id()));
         let parent = root.join("ktstr");
         fs::create_dir_all(&parent).unwrap();
         // Pre-create the subtree_control file so the strip-prefix
@@ -1257,13 +1264,7 @@ mod tests {
         cg.setup_under_root(true, &root).unwrap();
 
         let written = fs::read_to_string(parent.join("cgroup.subtree_control")).unwrap();
-        for token in [
-            "+cpuset",
-            "+cpu",
-            "+memory",
-            "+pids",
-            "+io",
-        ] {
+        for token in ["+cpuset", "+cpu", "+memory", "+pids", "+io"] {
             assert!(
                 written.contains(token),
                 "subtree_control must contain {token}; got: {written:?}",
@@ -1598,7 +1599,8 @@ mod tests {
         let (dir, cg) = make_test_cgroup("mem-swap-max");
         let target = dir.join("cg_x").join("memory.swap.max");
         fs::write(&target, "").unwrap();
-        cg.set_memory_swap_max("cg_x", Some(2 * 1024 * 1024)).unwrap();
+        cg.set_memory_swap_max("cg_x", Some(2 * 1024 * 1024))
+            .unwrap();
         assert_eq!(fs::read_to_string(&target).unwrap(), "2097152");
         cg.set_memory_swap_max("cg_x", None).unwrap();
         assert_eq!(fs::read_to_string(&target).unwrap(), "max");
@@ -1674,13 +1676,9 @@ mod tests {
         assert!(err.to_string().contains("'..' component"));
         let err = cg.set_pids_max(bad, Some(10)).unwrap_err();
         assert!(err.to_string().contains("'..' component"));
-        let err = cg
-            .set_memory_swap_max(bad, Some(1024))
-            .unwrap_err();
+        let err = cg.set_memory_swap_max(bad, Some(1024)).unwrap_err();
         assert!(err.to_string().contains("'..' component"));
-        let err = cg
-            .set_cpuset_mems(bad, &BTreeSet::new())
-            .unwrap_err();
+        let err = cg.set_cpuset_mems(bad, &BTreeSet::new()).unwrap_err();
         assert!(err.to_string().contains("'..' component"));
         let err = cg.move_task(bad, 1).unwrap_err();
         assert!(err.to_string().contains("'..' component"));
@@ -1710,7 +1708,8 @@ mod tests {
     #[test]
     fn setup_under_root_outside_root_creates_dir_and_skips_walk() {
         let outside = std::env::temp_dir().join(format!("ktstr-out-{}", std::process::id()));
-        let unrelated_root = std::env::temp_dir().join(format!("ktstr-other-{}", std::process::id()));
+        let unrelated_root =
+            std::env::temp_dir().join(format!("ktstr-other-{}", std::process::id()));
         // Pre-create both so neither needs `mkdir`. The point is that
         // `outside.strip_prefix(unrelated_root)` returns Err.
         fs::create_dir_all(&unrelated_root).unwrap();

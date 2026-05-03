@@ -249,12 +249,11 @@ mod tests {
                 // store must not execute.
                 #[allow(unused_variables, unreachable_code)]
                 fn helper(reached: &AtomicBool) {
-                    let result: Result<(), anyhow::Error> = Err(anyhow::Error::new(
-                        ResourceContention {
+                    let result: Result<(), anyhow::Error> =
+                        Err(anyhow::Error::new(ResourceContention {
                             reason: "all 3 LLC slots busy".into(),
-                        },
-                    )
-                    .context("build ktstr_test VM"));
+                        })
+                        .context("build ktstr_test VM"));
                     match result {
                         Ok(_) => {}
                         Err(e) if crate::test_support::is_resource_contention(&e) => {

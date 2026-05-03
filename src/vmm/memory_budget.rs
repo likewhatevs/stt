@@ -336,7 +336,8 @@ mod tests {
         // Distinct value, large enough that wrong-offset reads would
         // yield zero (the surrounding pad).
         let init_size: u32 = 0x1234_5678;
-        f.write_all(&init_size.to_le_bytes()).expect("write init_size");
+        f.write_all(&init_size.to_le_bytes())
+            .expect("write init_size");
         f.flush().expect("flush");
 
         let got = read_kernel_init_size(f.path()).expect("read init_size");
@@ -360,10 +361,7 @@ mod tests {
         f.flush().expect("flush");
 
         let result = read_kernel_init_size(f.path());
-        assert!(
-            result.is_err(),
-            "truncated file must fail; got: {result:?}",
-        );
+        assert!(result.is_err(), "truncated file must fail; got: {result:?}",);
     }
 
     /// Helper: an all-zero MemoryBudget for spread-syntax in tests.

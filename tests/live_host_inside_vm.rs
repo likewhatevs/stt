@@ -39,15 +39,12 @@
 use anyhow::Result;
 use ktstr::assert::{AssertDetail, AssertResult, DetailKind};
 use ktstr::ktstr_test;
-use ktstr::live_host::{
-    BpfMapAccessor, BpfSyscallAccessor, KallsymsTable, LiveHostKernelEnv,
-};
+use ktstr::live_host::{BpfMapAccessor, BpfSyscallAccessor, KallsymsTable, LiveHostKernelEnv};
 use ktstr::scenario::Ctx;
 use ktstr::scenario::ops::{CgroupDef, HoldSpec, Step, execute_steps};
 
-const KTSTR_SCHED: ktstr::prelude::Scheduler =
-    ktstr::prelude::Scheduler::new("ktstr_sched")
-        .binary(ktstr::prelude::SchedulerSpec::Discover("scx-ktstr"));
+const KTSTR_SCHED: ktstr::prelude::Scheduler = ktstr::prelude::Scheduler::new("ktstr_sched")
+    .binary(ktstr::prelude::SchedulerSpec::Discover("scx-ktstr"));
 const KTSTR_SCHED_PAYLOAD: ktstr::prelude::Payload =
     ktstr::prelude::Payload::from_scheduler(&KTSTR_SCHED);
 
@@ -67,9 +64,7 @@ const KTSTR_SCHED_PAYLOAD: ktstr::prelude::Payload =
 /// captured pipeline state, not on scheduler-level behavior over
 /// time.
 #[ktstr_test(llcs = 1, cores = 2, threads = 1, duration_s = 1, scheduler = KTSTR_SCHED_PAYLOAD)]
-fn live_host_pipeline_inside_guest_produces_expected_shape(
-    ctx: &Ctx,
-) -> Result<AssertResult> {
+fn live_host_pipeline_inside_guest_produces_expected_shape(ctx: &Ctx) -> Result<AssertResult> {
     // Run a brief workload so the scheduler is exercised and any
     // lazily-populated BPF maps (event counters, struct_ops state)
     // have entries before we enumerate.
@@ -133,9 +128,8 @@ fn live_host_pipeline_inside_guest_produces_expected_shape(
                 .unwrap_or_else(|e| format!("(read /proc/self/status: {e})"));
             let pid = unsafe { libc::getpid() };
             let euid = unsafe { libc::geteuid() };
-            let mut diagnostic = format!(
-                "pid={pid} euid={euid}\n--- /proc/self/status ---\n{status}\n",
-            );
+            let mut diagnostic =
+                format!("pid={pid} euid={euid}\n--- /proc/self/status ---\n{status}\n",);
             // Also try to read /proc/sys/kernel/unprivileged_bpf_disabled
             if let Ok(v) = std::fs::read_to_string("/proc/sys/kernel/unprivileged_bpf_disabled") {
                 diagnostic.push_str(&format!("--- unprivileged_bpf_disabled ---\n{v}"));

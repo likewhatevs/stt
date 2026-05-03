@@ -35,7 +35,9 @@ use std::num::NonZeroU64;
 /// image and would fail on tmpfs/ext4. The host must also have the
 /// formatter named by [`Self::mkfs_binary_name`] on `PATH` at
 /// template-build time so the template-VM initramfs can pack it.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Filesystem {
     /// No filesystem; raw block device. The guest sees `/dev/vda` as
@@ -180,7 +182,9 @@ impl Filesystem {
 /// Clearing a refill rate via the builder (`iops(0)` /
 /// `bytes_per_sec(0)`) auto-clears its matching `*_burst_capacity`
 /// so the second rule never trips on a cleared-rate chain.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct DiskThrottle {
     /// Maximum operations per second (1 read = 1 op, 1 write = 1
     /// op, 1 flush = 1 op). Refill rate of the IOPS token bucket.
@@ -738,7 +742,10 @@ mod tests {
     #[test]
     fn filesystem_serde_snake_case() {
         assert_eq!(serde_json::to_string(&Filesystem::Raw).unwrap(), r#""raw""#);
-        assert_eq!(serde_json::to_string(&Filesystem::Btrfs).unwrap(), r#""btrfs""#);
+        assert_eq!(
+            serde_json::to_string(&Filesystem::Btrfs).unwrap(),
+            r#""btrfs""#
+        );
         let parsed: Filesystem = serde_json::from_str(r#""raw""#).unwrap();
         assert_eq!(parsed, Filesystem::Raw);
         let parsed: Filesystem = serde_json::from_str(r#""btrfs""#).unwrap();
@@ -809,8 +816,7 @@ mod tests {
         };
 
         let json = serde_json::to_string(&original).expect("serialize DiskConfig");
-        let parsed: DiskConfig =
-            serde_json::from_str(&json).expect("deserialize DiskConfig");
+        let parsed: DiskConfig = serde_json::from_str(&json).expect("deserialize DiskConfig");
 
         // Whole-struct equality first — catches any field drift.
         assert_eq!(parsed, original);
@@ -1373,8 +1379,7 @@ mod tests {
             .bytes_burst_capacity(200 * 1024 * 1024);
 
         let json = serde_json::to_string(&original).expect("serialize burst DiskConfig");
-        let parsed: DiskConfig =
-            serde_json::from_str(&json).expect("deserialize burst DiskConfig");
+        let parsed: DiskConfig = serde_json::from_str(&json).expect("deserialize burst DiskConfig");
 
         assert_eq!(parsed, original);
         assert_eq!(parsed.throttle.iops, NonZeroU64::new(2_500));

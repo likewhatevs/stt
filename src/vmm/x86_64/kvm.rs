@@ -264,9 +264,9 @@ impl KtstrKvm {
             // tables and sets up the userspace IRQ routing slots.
             // ENOMEM under host pressure is transient — route through
             // the contention classifier so the macro SKIPs cleanly.
-            vm_fd.enable_cap(&cap).map_err(|e| {
-                crate::vmm::map_transient_to_contention(e, "enable split IRQ chip")
-            })?;
+            vm_fd
+                .enable_cap(&cap)
+                .map_err(|e| crate::vmm::map_transient_to_contention(e, "enable split IRQ chip"))?;
 
             // Enable x2APIC API for 32-bit destination IDs and correct
             // broadcast behavior with APIC IDs > 254.

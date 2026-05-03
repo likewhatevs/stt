@@ -1074,12 +1074,19 @@ mod tests {
             // EDX: union cpuid10_edx — num_counters_fixed[4:0], bit_width_fixed[12:5].
             let num_fixed = entry.edx & 0x1f;
             let fixed_width = (entry.edx >> 5) & 0xff;
-            assert_eq!(num_fixed, PMU_NUM_FIXED_COUNTERS, "PMU v2 fixed counter count");
+            assert_eq!(
+                num_fixed, PMU_NUM_FIXED_COUNTERS,
+                "PMU v2 fixed counter count"
+            );
             assert_eq!(
                 fixed_width, PMU_FIXED_COUNTER_WIDTH,
                 "PMU v2 fixed counter width"
             );
-            assert_eq!(entry.edx & !0x1fff, 0, "EDX bits[31:13] must be zero for PMU v2");
+            assert_eq!(
+                entry.edx & !0x1fff,
+                0,
+                "EDX bits[31:13] must be zero for PMU v2"
+            );
         }
     }
 
@@ -1267,10 +1274,16 @@ mod tests {
             | (PMU_GP_COUNTER_WIDTH << 16)
             | (PMU_EVENT_MASK_LENGTH << 24);
         let expected_edx = PMU_NUM_FIXED_COUNTERS | (PMU_FIXED_COUNTER_WIDTH << 5);
-        assert_eq!(leaf_a.eax, expected_eax, "AMD synthesized identically to Intel");
+        assert_eq!(
+            leaf_a.eax, expected_eax,
+            "AMD synthesized identically to Intel"
+        );
         assert_eq!(leaf_a.ebx, 0, "EBX cleared on AMD");
         assert_eq!(leaf_a.ecx, 0, "ECX cleared on AMD");
-        assert_eq!(leaf_a.edx, expected_edx, "AMD synthesized identically to Intel");
+        assert_eq!(
+            leaf_a.edx, expected_edx,
+            "AMD synthesized identically to Intel"
+        );
     }
 
     /// Synthetic-base test: when the base hypervisor max-leaf

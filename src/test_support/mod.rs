@@ -106,8 +106,8 @@ pub(crate) use output::{
     SENTINEL_PAYLOAD_STARTING, SENTINEL_SCHEDULER_DIED, SENTINEL_SCHEDULER_NOT_ATTACHED,
 };
 pub use payload::{
-    MetricCheck, Metric, MetricBounds, MetricHint, MetricSource, MetricStream, OutputFormat, Payload,
-    PayloadKind, PayloadMetrics, Polarity,
+    Metric, MetricBounds, MetricCheck, MetricHint, MetricSource, MetricStream, OutputFormat,
+    Payload, PayloadKind, PayloadMetrics, Polarity,
 };
 pub(crate) use payload::{RawPayloadOutput, WireMetricHint};
 pub(crate) use probe::maybe_dispatch_vm_test;

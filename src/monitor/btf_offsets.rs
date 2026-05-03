@@ -1287,7 +1287,7 @@ impl BpfProgOffsets {
 /// `curr` (the currently-running `struct task_struct *`).
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)] // wired via ScxWalkerOffsets; stays alive once the
-                    // freeze coordinator populates ScxWalkerCapture.
+// freeze coordinator populates ScxWalkerCapture.
 pub struct RqStructOffsets {
     /// Offset of `scx` (struct scx_rq) within `struct rq`.
     /// Same value as [`KernelOffsets::rq_scx`]; resolved here so the
@@ -2202,9 +2202,9 @@ pub struct TaskEnrichmentOffsets {
 }
 
 #[allow(dead_code)] // wired into DumpContext + walk_task_enrichment;
-                    // freeze coordinator passes None until the
-                    // rq->scx walker lands a producer that builds
-                    // TaskEnrichmentCapture.
+// freeze coordinator passes None until the
+// rq->scx walker lands a producer that builds
+// TaskEnrichmentCapture.
 impl TaskEnrichmentOffsets {
     /// Resolve all per-task / signal_struct / pid / upid offsets
     /// from a pre-loaded BTF object. Returns Err on a stripped
@@ -2304,8 +2304,8 @@ pub mod pid_type {
 /// - `struct rhashtable` / `struct bucket_table`: include/linux/rhashtable.h
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // wired into ScxWalkerCapture; freeze coordinator
-                    // populates the capture once the producer-side
-                    // wiring lands.
+// populates the capture once the producer-side
+// wiring lands.
 pub struct ScxWalkerOffsets {
     /// `struct rq` field offsets (`scx`, `curr`). Required for every
     /// per-CPU read; `None` blinds the walker entirely.
@@ -2348,9 +2348,9 @@ pub struct ScxWalkerOffsets {
 }
 
 #[allow(dead_code)] // wired into DumpContext::ScxWalkerCapture; the
-                    // freeze coordinator passes None until the
-                    // producer-side wiring (resolve offsets +
-                    // build rq arrays) lands.
+// freeze coordinator passes None until the
+// producer-side wiring (resolve offsets +
+// build rq arrays) lands.
 impl ScxWalkerOffsets {
     /// Resolve every scx walker sub-group from a pre-loaded BTF
     /// object. Each sub-group resolves independently — a missing
@@ -3820,25 +3820,19 @@ mod tests {
         // matches the canonical name. The pairs below enumerate the
         // 10 sub-groups; a regression adding/removing/renaming a
         // push arm trips here.
-        let cases: &[(
-            fn(&mut ScxWalkerOffsets),
-            &'static str,
-        )] = &[
-            ((|o: &mut ScxWalkerOffsets| o.rq = None) as fn(&mut ScxWalkerOffsets), "rq"),
+        let cases: &[(fn(&mut ScxWalkerOffsets), &'static str)] = &[
+            (
+                (|o: &mut ScxWalkerOffsets| o.rq = None) as fn(&mut ScxWalkerOffsets),
+                "rq",
+            ),
             (|o: &mut ScxWalkerOffsets| o.scx_rq = None, "scx_rq"),
             (|o: &mut ScxWalkerOffsets| o.task = None, "task_struct"),
-            (
-                |o: &mut ScxWalkerOffsets| o.see = None,
-                "sched_ext_entity",
-            ),
+            (|o: &mut ScxWalkerOffsets| o.see = None, "sched_ext_entity"),
             (
                 |o: &mut ScxWalkerOffsets| o.dsq_lnode = None,
                 "scx_dsq_list_node",
             ),
-            (
-                |o: &mut ScxWalkerOffsets| o.dsq = None,
-                "scx_dispatch_q",
-            ),
+            (|o: &mut ScxWalkerOffsets| o.dsq = None, "scx_dispatch_q"),
             (|o: &mut ScxWalkerOffsets| o.sched = None, "scx_sched"),
             (
                 |o: &mut ScxWalkerOffsets| o.sched_pnode = None,

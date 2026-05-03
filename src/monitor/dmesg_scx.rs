@@ -51,7 +51,7 @@ use serde::{Deserialize, Serialize};
 #[non_exhaustive]
 #[serde(tag = "kind")]
 #[allow(dead_code)] // wired by the live-host capture-mode binary;
-                    // library lands the data shape.
+// library lands the data shape.
 pub enum ScxExitKind {
     /// Default — used by `ScxExitEvent::default()` in test fixtures
     /// and as the post-anchor placeholder before classification
@@ -333,17 +333,17 @@ fn classify_exit_kind(message: &str, stack: &[StackSymbol]) -> ScxExitKind {
     if lower.contains("watchdog")
         || lower.contains("stall")
         || lower.contains("stuck")
-        || stack.iter().any(|f| {
-            f.name == "check_rq_for_timeouts" || f.name == "scx_watchdog_workfn"
-        })
+        || stack
+            .iter()
+            .any(|f| f.name == "check_rq_for_timeouts" || f.name == "scx_watchdog_workfn")
     {
         return ScxExitKind::Stall;
     }
     if lower.contains("aborting")
         || lower.contains("error")
         || lower.contains("ebpf")
-        || lower.contains("enabled")
-            && lower.contains("disabled") // weak — see Other below
+        || lower.contains("enabled") && lower.contains("disabled")
+    // weak — see Other below
     {
         return ScxExitKind::Error;
     }
@@ -385,19 +385,15 @@ fn extract_stuck_task_comm(message: &str) -> Option<String> {
     while let Some(rel) = message[search_from..].find("task ") {
         let idx = search_from + rel;
         let after = &message[idx + 5..];
-        let token = after
-            .split_whitespace()
-            .next()
-            .unwrap_or("");
+        let token = after.split_whitespace().next().unwrap_or("");
         if let Some((comm, pid_part)) = token.split_once(':') {
             let pid_digits: String = pid_part
                 .chars()
                 .take_while(|c| c.is_ascii_digit())
                 .collect();
             if !pid_digits.is_empty() {
-                let comm = comm.trim_matches(
-                    |c: char| !c.is_alphanumeric() && c != '_' && c != '-',
-                );
+                let comm =
+                    comm.trim_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != '-');
                 if !comm.is_empty() {
                     let bounded: String = comm.chars().take(TASK_COMM_LEN).collect();
                     return Some(bounded);
@@ -456,9 +452,7 @@ mod tests {
     /// Multiple frames on one line all extract.
     #[test]
     fn extract_multiple_frames_one_line() {
-        let frames = extract_stack_symbols(
-            "? func_a+0x10/0x20 func_b+0x30/0x40 func_c+0x50",
-        );
+        let frames = extract_stack_symbols("? func_a+0x10/0x20 func_b+0x30/0x40 func_c+0x50");
         assert_eq!(frames.len(), 3);
         assert_eq!(frames[0].name, "func_a");
         assert_eq!(frames[1].name, "func_b");

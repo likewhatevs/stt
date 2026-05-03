@@ -50,7 +50,7 @@ use anyhow::{Context, Result, anyhow};
 use crate::assert::{AssertDetail, AssertResult, DetailKind};
 use crate::scenario::Ctx;
 use crate::test_support::{
-    MetricCheck, Metric, OutputFormat, Payload, PayloadKind, PayloadMetrics, extract_metrics,
+    Metric, MetricCheck, OutputFormat, Payload, PayloadKind, PayloadMetrics, extract_metrics,
 };
 
 /// Per-process monotonic counter for payload-invocation indexing.
@@ -530,8 +530,12 @@ fn evaluate_llm_extract_deferred(
         .iter()
         .filter(|c| !matches!(c, MetricCheck::ExitCodeEq(_)))
         .map(|c| match c {
-            MetricCheck::Min { metric, value } => format!("Min {{ metric: {metric:?}, value: {value} }}"),
-            MetricCheck::Max { metric, value } => format!("Max {{ metric: {metric:?}, value: {value} }}"),
+            MetricCheck::Min { metric, value } => {
+                format!("Min {{ metric: {metric:?}, value: {value} }}")
+            }
+            MetricCheck::Max { metric, value } => {
+                format!("Max {{ metric: {metric:?}, value: {value} }}")
+            }
             MetricCheck::Range { metric, lo, hi } => {
                 format!("Range {{ metric: {metric:?}, lo: {lo}, hi: {hi} }}")
             }
@@ -2498,7 +2502,10 @@ mod tests {
             metrics: vec![],
             exit_code: 42,
         };
-        let checks = [MetricCheck::exit_code_eq(0), MetricCheck::min("iops", 100.0)];
+        let checks = [
+            MetricCheck::exit_code_eq(0),
+            MetricCheck::min("iops", 100.0),
+        ];
         let r = evaluate_checks(&checks, &pm, "");
         assert!(!r.passed);
         // exit-code failure short-circuits — only one detail, not
@@ -2518,7 +2525,11 @@ mod tests {
             metrics: vec![],
             exit_code: 1,
         };
-        let r = evaluate_checks(&[MetricCheck::exit_code_eq(0)], &pm, "fatal: config missing\n");
+        let r = evaluate_checks(
+            &[MetricCheck::exit_code_eq(0)],
+            &pm,
+            "fatal: config missing\n",
+        );
         assert!(!r.passed);
         assert!(
             r.details[0].message.contains("fatal: config missing"),
@@ -2907,7 +2918,10 @@ mod tests {
             exit_code: 0,
         };
         let r = evaluate_checks(
-            &[MetricCheck::min("iops", 50.0), MetricCheck::min("iops", 200.0)],
+            &[
+                MetricCheck::min("iops", 50.0),
+                MetricCheck::min("iops", 200.0),
+            ],
             &pm,
             "",
         );
@@ -3307,7 +3321,10 @@ mod tests {
             kind: PayloadKind::Binary("checked"),
             output: OutputFormat::ExitCode,
             default_args: &[],
-            default_checks: &[MetricCheck::exit_code_eq(0), MetricCheck::min("iops", 500.0)],
+            default_checks: &[
+                MetricCheck::exit_code_eq(0),
+                MetricCheck::min("iops", 500.0),
+            ],
             metrics: &[],
             include_files: &[],
             uses_parent_pgrp: false,
@@ -5100,7 +5117,11 @@ mod tests {
             stderr: String::new(),
             exit_code: 0,
         };
-        let (assert_result, pm) = evaluate(&LLM_EXTRACT_PAYLOAD, &[MetricCheck::exit_code_eq(0)], output);
+        let (assert_result, pm) = evaluate(
+            &LLM_EXTRACT_PAYLOAD,
+            &[MetricCheck::exit_code_eq(0)],
+            output,
+        );
         assert!(
             assert_result.passed,
             "matching ExitCodeEq must pass on LlmExtract deferral arm; got {assert_result:?}",
@@ -5113,7 +5134,11 @@ mod tests {
             stderr: "stderr lives in the failure detail".to_string(),
             exit_code: 1,
         };
-        let (assert_result, _) = evaluate(&LLM_EXTRACT_PAYLOAD, &[MetricCheck::exit_code_eq(0)], output);
+        let (assert_result, _) = evaluate(
+            &LLM_EXTRACT_PAYLOAD,
+            &[MetricCheck::exit_code_eq(0)],
+            output,
+        );
         assert!(
             !assert_result.passed,
             "mismatching ExitCodeEq must produce a failing AssertResult on the deferral arm",
@@ -5153,7 +5178,11 @@ mod tests {
         // Wrap the call in catch_unwind; the assertion fires inside
         // evaluate_llm_extract_deferred → evaluate.
         let result = std::panic::catch_unwind(|| {
-            evaluate(&LLM_EXTRACT_PAYLOAD, &[MetricCheck::min("iops", 1.0)], output)
+            evaluate(
+                &LLM_EXTRACT_PAYLOAD,
+                &[MetricCheck::min("iops", 1.0)],
+                output,
+            )
         });
         let payload = result.expect_err("metric-level check on LlmExtract must panic");
         let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {

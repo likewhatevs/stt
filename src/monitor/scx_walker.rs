@@ -42,9 +42,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::btf_offsets::{
-    RHT_PTR_LOCK_BIT, SCX_DSQ_LNODE_ITER_CURSOR, ScxWalkerOffsets,
-};
+use super::btf_offsets::{RHT_PTR_LOCK_BIT, SCX_DSQ_LNODE_ITER_CURSOR, ScxWalkerOffsets};
 use super::dump::TaskWalkerEntry;
 use super::guest::GuestKernel;
 use super::idr::translate_any_kva;
@@ -227,9 +225,7 @@ pub fn walk_rq_scx(
     // Walk runnable_list when sched_ext_entity offsets are available.
     // Without `see` we can still report scalar state but cannot
     // container_of a runnable_node back to its task_struct.
-    let (runnable_task_kvas, runnable_truncated) = if let Some(see_offs) =
-        offsets.see.as_ref()
-    {
+    let (runnable_task_kvas, runnable_truncated) = if let Some(see_offs) = offsets.see.as_ref() {
         let list_head_off = scx_off + scx_rq_offs.runnable_list;
         let head_kva = rq_kva.wrapping_add(list_head_off as u64);
         let head_pa = rq_pa.wrapping_add(list_head_off as u64);
@@ -380,14 +376,10 @@ pub fn walk_dsqs(
 
     // Pass 1: per-CPU local DSQs. Needs rq + scx_rq sub-groups for
     // the local_dsq embedded in each rq.
-    if let (Some(rq_offs), Some(scx_rq_offs)) =
-        (offsets.rq.as_ref(), offsets.scx_rq.as_ref())
-    {
+    if let (Some(rq_offs), Some(scx_rq_offs)) = (offsets.rq.as_ref(), offsets.scx_rq.as_ref()) {
         for (cpu, (&rq_kva, &rq_pa)) in rq_kvas.iter().zip(rq_pas.iter()).enumerate() {
-            let dsq_kva = rq_kva
-                .wrapping_add((rq_offs.scx + scx_rq_offs.local_dsq) as u64);
-            let dsq_pa = rq_pa
-                .wrapping_add((rq_offs.scx + scx_rq_offs.local_dsq) as u64);
+            let dsq_kva = rq_kva.wrapping_add((rq_offs.scx + scx_rq_offs.local_dsq) as u64);
+            let dsq_pa = rq_pa.wrapping_add((rq_offs.scx + scx_rq_offs.local_dsq) as u64);
             if let Some((state, entries)) = walk_one_dsq(
                 mem,
                 cr3_pa,
@@ -426,8 +418,7 @@ pub fn walk_dsqs(
                 let dsq_kva = pcpu_kva
                     .wrapping_add(cpu_off)
                     .wrapping_add(pcpu_offs.bypass_dsq as u64);
-                if let Some(dsq_pa) =
-                    translate_any_kva(mem, cr3_pa, page_offset, dsq_kva, l5)
+                if let Some(dsq_pa) = translate_any_kva(mem, cr3_pa, page_offset, dsq_kva, l5)
                     && let Some((state, entries)) = walk_one_dsq(
                         mem,
                         cr3_pa,
@@ -456,16 +447,14 @@ pub fn walk_dsqs(
     {
         let pnode_kva = mem.read_u64(sched_pa, sched_offs.pnode);
         if pnode_kva != 0
-            && let Some(pnode_arr_pa) =
-                translate_any_kva(mem, cr3_pa, page_offset, pnode_kva, l5)
+            && let Some(pnode_arr_pa) = translate_any_kva(mem, cr3_pa, page_offset, pnode_kva, l5)
         {
             for node in 0..nr_nodes as u64 {
                 let pnode_ptr_kva = mem.read_u64(pnode_arr_pa, (node * 8) as usize);
                 if pnode_ptr_kva == 0 {
                     continue;
                 }
-                let Some(pnode_pa) =
-                    translate_any_kva(mem, cr3_pa, page_offset, pnode_ptr_kva, l5)
+                let Some(pnode_pa) = translate_any_kva(mem, cr3_pa, page_offset, pnode_ptr_kva, l5)
                 else {
                     continue;
                 };
@@ -494,25 +483,15 @@ pub fn walk_dsqs(
     // Pass 4: user-allocated DSQs via the scx_sched.dsq_hash
     // rhashtable. Walks at most MAX_RHT_NODES nodes total across
     // all buckets.
-    if let (Some(sched_offs), Some(rht_offs)) =
-        (offsets.sched.as_ref(), offsets.rht.as_ref())
-    {
+    if let (Some(sched_offs), Some(rht_offs)) = (offsets.sched.as_ref(), offsets.rht.as_ref()) {
         let rht_kva = sched_pa.wrapping_add(sched_offs.dsq_hash as u64);
         // dsq_hash is embedded in scx_sched (not a pointer); rht_kva
         // here is a KVA we can translate directly. The walker reads
         // it via the rht sub-group offsets.
-        let user_dsqs = walk_user_dsq_hash(
-            mem,
-            cr3_pa,
-            page_offset,
-            l5,
-            rht_kva,
-            rht_offs,
-            dsq_offs,
-        );
+        let user_dsqs =
+            walk_user_dsq_hash(mem, cr3_pa, page_offset, l5, rht_kva, rht_offs, dsq_offs);
         for dsq_kva in user_dsqs {
-            let Some(dsq_pa) = translate_any_kva(mem, cr3_pa, page_offset, dsq_kva, l5)
-            else {
+            let Some(dsq_pa) = translate_any_kva(mem, cr3_pa, page_offset, dsq_kva, l5) else {
                 continue;
             };
             if let Some((state, entries)) = walk_one_dsq(
@@ -568,8 +547,7 @@ fn walk_one_dsq(
     //            - task.scx
     //            - see.dsq_list
     //            - dsq_lnode.node
-    let dsq_node_off_in_task =
-        task_offs.scx + see_offs.dsq_list + dsq_lnode_offs.node;
+    let dsq_node_off_in_task = task_offs.scx + see_offs.dsq_list + dsq_lnode_offs.node;
 
     let (task_kvas, truncated) = walk_list_head_for_dsq_task_kvas(
         mem,
@@ -646,8 +624,7 @@ fn walk_list_head_for_task_kvas(
         task_kvas.push(task_kva);
 
         // Step to next node — translate node_kva, read .next at offset 0.
-        let Some(node_pa) = translate_any_kva(mem, cr3_pa, page_offset, node_kva, l5)
-        else {
+        let Some(node_pa) = translate_any_kva(mem, cr3_pa, page_offset, node_kva, l5) else {
             return (task_kvas, false);
         };
         let next_kva = mem.read_u64(node_pa, 0);
@@ -693,14 +670,11 @@ fn walk_list_head_for_dsq_task_kvas(
         let lnode_kva = node_kva.wrapping_sub(dsq_lnode_offs.node as u64);
 
         // Read the lnode's flags to skip iterator-cursor entries.
-        if let Some(lnode_pa) =
-            translate_any_kva(mem, cr3_pa, page_offset, lnode_kva, l5)
-        {
+        if let Some(lnode_pa) = translate_any_kva(mem, cr3_pa, page_offset, lnode_kva, l5) {
             let lnode_flags = mem.read_u32(lnode_pa, dsq_lnode_offs.flags);
             if lnode_flags & SCX_DSQ_LNODE_ITER_CURSOR != 0 {
                 // Cursor entry — advance without recording.
-                let Some(node_pa) =
-                    translate_any_kva(mem, cr3_pa, page_offset, node_kva, l5)
+                let Some(node_pa) = translate_any_kva(mem, cr3_pa, page_offset, node_kva, l5)
                 else {
                     return (task_kvas, false);
                 };
@@ -719,8 +693,7 @@ fn walk_list_head_for_dsq_task_kvas(
         let task_kva = node_kva.wrapping_sub(dsq_node_off_in_task as u64);
         task_kvas.push(task_kva);
 
-        let Some(node_pa) = translate_any_kva(mem, cr3_pa, page_offset, node_kva, l5)
-        else {
+        let Some(node_pa) = translate_any_kva(mem, cr3_pa, page_offset, node_kva, l5) else {
             return (task_kvas, false);
         };
         let next_kva = mem.read_u64(node_pa, 0);
@@ -755,8 +728,7 @@ fn walk_user_dsq_hash(
 ) -> Vec<u64> {
     let mut dsq_kvas = Vec::new();
 
-    let Some(rht_pa) = translate_any_kva(mem, cr3_pa, page_offset, rht_kva, l5)
-    else {
+    let Some(rht_pa) = translate_any_kva(mem, cr3_pa, page_offset, rht_kva, l5) else {
         return dsq_kvas;
     };
 
@@ -764,8 +736,7 @@ fn walk_user_dsq_hash(
     if tbl_kva == 0 {
         return dsq_kvas;
     }
-    let Some(tbl_pa) = translate_any_kva(mem, cr3_pa, page_offset, tbl_kva, l5)
-    else {
+    let Some(tbl_pa) = translate_any_kva(mem, cr3_pa, page_offset, tbl_kva, l5) else {
         return dsq_kvas;
     };
 
@@ -796,9 +767,7 @@ fn walk_user_dsq_hash(
             total_nodes += 1;
             let dsq_kva = node_kva.wrapping_sub(dsq_offs.hash_node as u64);
             dsq_kvas.push(dsq_kva);
-            let Some(node_pa) =
-                translate_any_kva(mem, cr3_pa, page_offset, node_kva, l5)
-            else {
+            let Some(node_pa) = translate_any_kva(mem, cr3_pa, page_offset, node_kva, l5) else {
                 break;
             };
             let next_raw = mem.read_u64(node_pa, rht_offs.rhash_head_next);
@@ -829,8 +798,7 @@ fn read_task_pid_comm(
     if task_kva == 0 {
         return (None, None);
     }
-    let Some(task_pa) = translate_any_kva(mem, cr3_pa, page_offset, task_kva, l5)
-    else {
+    let Some(task_pa) = translate_any_kva(mem, cr3_pa, page_offset, task_kva, l5) else {
         return (None, None);
     };
     let pid = mem.read_u32(task_pa, pid_off) as i32;
@@ -1036,7 +1004,13 @@ mod tests {
         // page_offset = 0 so kva_to_pa is identity.
         let runnable_node_off = 0x10usize;
         let (kvas, truncated) = walk_list_head_for_task_kvas(
-            &mem, 0, 0, false, head as u64, head as u64, runnable_node_off,
+            &mem,
+            0,
+            0,
+            false,
+            head as u64,
+            head as u64,
+            runnable_node_off,
         );
         assert!(!truncated);
         assert_eq!(kvas.len(), 2);
@@ -1219,8 +1193,10 @@ mod tests {
         crate::claim!(v, s.nr_running).at_most(64);
         crate::claim!(v, s.runnable_truncated).eq(false);
         // Sequence claim via claim_seq.
-        v.claim_seq("runnable_task_kvas", &s.runnable_task_kvas).nonempty();
-        v.claim_seq("runnable_task_kvas", &s.runnable_task_kvas).len_at_most(64);
+        v.claim_seq("runnable_task_kvas", &s.runnable_task_kvas)
+            .nonempty();
+        v.claim_seq("runnable_task_kvas", &s.runnable_task_kvas)
+            .len_at_most(64);
 
         let r = v.into_result();
         assert!(

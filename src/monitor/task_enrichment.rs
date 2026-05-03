@@ -69,8 +69,8 @@ pub struct SchedClassRegistry {
 }
 
 #[allow(dead_code)] // wired through DumpContext::TaskEnrichmentCapture;
-                    // freeze coordinator passes None until the rq->scx
-                    // walker lands a walker producer.
+// freeze coordinator passes None until the rq->scx
+// walker lands a walker producer.
 impl SchedClassRegistry {
     /// Resolve all six class symbols via the GuestKernel's vmlinux
     /// symbol table. Each lookup is independent — a missing symbol
@@ -329,9 +329,8 @@ pub fn walk_task_enrichment(
     // not ext_sched_class. This catches the case where rt_mutex_setprio
     // moved the task to a higher-prio class while it remained on the
     // SCX runnable list.
-    let pi_boosted_out_of_scx = is_runnable_in_scx
-        && classes.ext.is_some()
-        && Some(sched_class_kva) != classes.ext;
+    let pi_boosted_out_of_scx =
+        is_runnable_in_scx && classes.ext.is_some() && Some(sched_class_kva) != classes.ext;
 
     // Per-task context-switch counters.
     let nvcsw = mem.read_u64(task_pa, offsets.task_struct_nvcsw);

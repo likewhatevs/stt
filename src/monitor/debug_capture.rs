@@ -89,8 +89,8 @@ use crate::workload::humantime_serde_helper;
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[non_exhaustive]
 #[allow(dead_code)] // the library ships the data shape; producers
-                    // populate it externally and the reproducer
-                    // generator consumes it.
+// populate it externally and the reproducer
+// generator consumes it.
 pub struct DebugCapture {
     /// Capture format schema identifier — pinned at construction
     /// to the current [`DEBUG_CAPTURE_SCHEMA`] string. Consumers
@@ -566,7 +566,7 @@ pub enum SchedPolicyHint {
 /// stamped [`DebugCapture::schema`] against this constant and reject
 /// mismatches before deserialising; no automatic migration runs.
 #[allow(dead_code)] // the library ships the pinned constant;
-                    // producers stamp it at capture time.
+// producers stamp it at capture time.
 pub const DEBUG_CAPTURE_SCHEMA: &str = "ktstr.debug_capture/v1";
 
 /// Compute a [`WorkloadFingerprint`] from raw capture inputs.
@@ -619,9 +619,8 @@ pub fn project_fingerprint(
         fp.affinity_hints = project_affinity_hints(d);
         fp.sched_policy_hints = project_sched_policy_hints(d);
     } else {
-        fp.gaps.push(
-            "affinity + sched_policy hints unavailable (no failure dump)".to_string(),
-        );
+        fp.gaps
+            .push("affinity + sched_policy hints unavailable (no failure dump)".to_string());
     }
 
     // WorkSpec-type hints come from CPU-time / wakeup-rate shape across
@@ -886,7 +885,9 @@ mod tests {
             }],
             affinity_hints: vec![
                 AffinityHint::SingleCpu { cpus: Vec::new() },
-                AffinityHint::Exact { cpus: vec![0, 1, 2, 3] },
+                AffinityHint::Exact {
+                    cpus: vec![0, 1, 2, 3],
+                },
             ],
             work_type_hints: vec![
                 WorkTypeHint::SpinWait,
@@ -934,12 +935,18 @@ mod tests {
             AffinityHint::SingleCpu { cpus: Vec::new() },
             AffinityHint::SingleCpu { cpus: vec![3] },
             AffinityHint::LlcAligned { cpus: Vec::new() },
-            AffinityHint::LlcAligned { cpus: vec![0, 1, 2, 3] },
+            AffinityHint::LlcAligned {
+                cpus: vec![0, 1, 2, 3],
+            },
             AffinityHint::CrossCgroup { cpus: Vec::new() },
-            AffinityHint::CrossCgroup { cpus: vec![4, 5, 6, 7] },
+            AffinityHint::CrossCgroup {
+                cpus: vec![4, 5, 6, 7],
+            },
             AffinityHint::SmtSiblingPair { cpus: Vec::new() },
             AffinityHint::SmtSiblingPair { cpus: vec![2, 3] },
-            AffinityHint::Exact { cpus: vec![0, 1, 2, 3] },
+            AffinityHint::Exact {
+                cpus: vec![0, 1, 2, 3],
+            },
             AffinityHint::RandomSubset {
                 from: Vec::new(),
                 count: 0,
@@ -955,26 +962,22 @@ mod tests {
                 serde_json::from_str(&json).expect("AffinityHint must deserialize");
             match (hint, &back) {
                 (AffinityHint::Inherit, AffinityHint::Inherit) => {}
-                (
-                    AffinityHint::SingleCpu { cpus: a },
-                    AffinityHint::SingleCpu { cpus: b },
-                ) => assert_eq!(a, b, "SingleCpu cpus must round-trip"),
-                (
-                    AffinityHint::LlcAligned { cpus: a },
-                    AffinityHint::LlcAligned { cpus: b },
-                ) => assert_eq!(a, b, "LlcAligned cpus must round-trip"),
-                (
-                    AffinityHint::CrossCgroup { cpus: a },
-                    AffinityHint::CrossCgroup { cpus: b },
-                ) => assert_eq!(a, b, "CrossCgroup cpus must round-trip"),
+                (AffinityHint::SingleCpu { cpus: a }, AffinityHint::SingleCpu { cpus: b }) => {
+                    assert_eq!(a, b, "SingleCpu cpus must round-trip")
+                }
+                (AffinityHint::LlcAligned { cpus: a }, AffinityHint::LlcAligned { cpus: b }) => {
+                    assert_eq!(a, b, "LlcAligned cpus must round-trip")
+                }
+                (AffinityHint::CrossCgroup { cpus: a }, AffinityHint::CrossCgroup { cpus: b }) => {
+                    assert_eq!(a, b, "CrossCgroup cpus must round-trip")
+                }
                 (
                     AffinityHint::SmtSiblingPair { cpus: a },
                     AffinityHint::SmtSiblingPair { cpus: b },
                 ) => assert_eq!(a, b, "SmtSiblingPair cpus must round-trip"),
-                (
-                    AffinityHint::Exact { cpus: a },
-                    AffinityHint::Exact { cpus: b },
-                ) => assert_eq!(a, b, "Exact cpus must round-trip"),
+                (AffinityHint::Exact { cpus: a }, AffinityHint::Exact { cpus: b }) => {
+                    assert_eq!(a, b, "Exact cpus must round-trip")
+                }
                 (
                     AffinityHint::RandomSubset {
                         from: pa,
@@ -988,9 +991,7 @@ mod tests {
                     assert_eq!(pa, pb, "RandomSubset from must round-trip");
                     assert_eq!(ca, cb, "RandomSubset count must round-trip");
                 }
-                _ => panic!(
-                    "AffinityHint round-trip mismatch: sent {hint:?}, got {back:?}",
-                ),
+                _ => panic!("AffinityHint round-trip mismatch: sent {hint:?}, got {back:?}",),
             }
         }
     }
@@ -1008,19 +1009,16 @@ mod tests {
             WorkTypeHint::IoRandRead,
             WorkTypeHint::IoConvoy,
         ] {
-            let json = serde_json::to_string(&hint)
-                .expect("WorkTypeHint must serialize");
-            let back: WorkTypeHint = serde_json::from_str(&json)
-                .expect("WorkTypeHint must deserialize");
+            let json = serde_json::to_string(&hint).expect("WorkTypeHint must serialize");
+            let back: WorkTypeHint =
+                serde_json::from_str(&json).expect("WorkTypeHint must deserialize");
             // Match-arm equality so the test fails on a wrong
             // variant rather than a generic mismatch.
             match (&hint, &back) {
                 (WorkTypeHint::IoSyncWrite, WorkTypeHint::IoSyncWrite) => {}
                 (WorkTypeHint::IoRandRead, WorkTypeHint::IoRandRead) => {}
                 (WorkTypeHint::IoConvoy, WorkTypeHint::IoConvoy) => {}
-                _ => panic!(
-                    "IO hint roundtrip mismatch: sent {hint:?}, got {back:?}",
-                ),
+                _ => panic!("IO hint roundtrip mismatch: sent {hint:?}, got {back:?}",),
             }
         }
     }

@@ -391,7 +391,47 @@ impl ListedEntry {
     }
 }
 
+/// Format the canonical "image_missing" reason string emitted by
+/// [`crate::cache::CacheDir::list`] when an entry's
+/// `metadata.json` is parseable but the boot image it names is
+/// absent from the entry directory.
+///
+/// Centralised here so the producer site (`cache_dir.rs`'s
+/// `list` corrupt-entry arm) and the classifier
+/// [`classify_corrupt_reason`] cannot drift out of lockstep — both
+/// the literal `"image file "` prefix and the substring `"missing"`
+/// appear in the result, so the `starts_with(…) && contains(…)`
+/// classification predicate continues to match by construction.
+pub(crate) fn format_image_missing_reason(image_name: &str) -> String {
+    format!("image file {image_name} missing from entry directory")
+}
+
 /// Shared prefix → `error_kind` classifier.
+///
+/// Each `ListedEntry::Corrupt` carries a free-form `reason` string
+/// produced by [`super::housekeeping::read_metadata`]. This helper
+/// flattens those strings into a small, stable enum-of-strings the
+/// CLI surfaces in `cargo ktstr kernel list --json` as the
+/// `error_kind` field.
+///
+/// Reason-prefix → kind mapping (matched in this order):
+///
+/// | Reason (prefix or exact)               | `error_kind`     |
+/// |----------------------------------------|------------------|
+/// | `"metadata.json missing"` (exact)      | `"missing"`      |
+/// | `"metadata.json unreadable: …"`        | `"unreadable"`   |
+/// | `"metadata.json schema drift: …"`      | `"schema_drift"` |
+/// | `"metadata.json malformed: …"`         | `"malformed"`    |
+/// | `"metadata.json truncated: …"`         | `"truncated"`    |
+/// | `"metadata.json parse error: …"`       | `"parse_error"`  |
+/// | `"image file …"` containing `"missing"`| `"image_missing"`|
+/// | (anything else)                        | `"unknown"`      |
+///
+/// The producer in [`super::housekeeping::read_metadata`] is the
+/// authoritative source of these prefixes. If a new failure mode is
+/// added there, both this dispatcher and the
+/// `classify_corrupt_reason_covers_every_documented_prefix` test
+/// must be updated in lockstep so the JSON contract stays stable.
 pub(crate) fn classify_corrupt_reason(reason: &str) -> &'static str {
     if reason == "metadata.json missing" {
         "missing"
@@ -409,5 +449,352 @@ pub(crate) fn classify_corrupt_reason(reason: &str) -> &'static str {
         "image_missing"
     } else {
         "unknown"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cache::shared_test_helpers::{create_fake_image, test_metadata};
+    use crate::cache::{CacheArtifacts, CacheDir};
+    use std::fs;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    // -- KernelMetadata serde --
+
+    #[test]
+    fn cache_metadata_serde_roundtrip() {
+        let meta = test_metadata("6.14.2");
+        let json = serde_json::to_string_pretty(&meta).unwrap();
+        let parsed: KernelMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.version.as_deref(), Some("6.14.2"));
+        assert_eq!(parsed.source, KernelSource::Tarball);
+        assert_eq!(parsed.arch, "x86_64");
+        assert_eq!(parsed.image_name, "bzImage");
+        assert_eq!(parsed.config_hash.as_deref(), Some("abc123"));
+        assert_eq!(parsed.built_at, "2026-04-12T10:00:00Z");
+        assert_eq!(parsed.ktstr_kconfig_hash.as_deref(), Some("def456"));
+        assert!(!parsed.has_vmlinux);
+        assert!(!parsed.vmlinux_stripped);
+    }
+
+    #[test]
+    fn cache_metadata_serde_git_with_payload() {
+        let meta = KernelMetadata {
+            version: Some("6.15-rc3".to_string()),
+            source: KernelSource::Git {
+                git_hash: Some("a1b2c3d".to_string()),
+                git_ref: Some("v6.15-rc3".to_string()),
+            },
+            arch: "aarch64".to_string(),
+            image_name: "Image".to_string(),
+            config_hash: None,
+            built_at: "2026-04-12T12:00:00Z".to_string(),
+            ktstr_kconfig_hash: None,
+            extra_kconfig_hash: None,
+            has_vmlinux: false,
+            vmlinux_stripped: false,
+            source_vmlinux_size: None,
+            source_vmlinux_mtime_secs: None,
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        let parsed: KernelMetadata = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed.source,
+            KernelSource::Git {
+                git_hash: Some(ref h),
+                git_ref: Some(ref r),
+            }
+            if h == "a1b2c3d" && r == "v6.15-rc3"
+        ));
+    }
+
+    #[test]
+    fn cache_metadata_serde_local_with_source_tree() {
+        let meta = KernelMetadata {
+            version: Some("6.14.0".to_string()),
+            source: KernelSource::Local {
+                source_tree_path: Some(PathBuf::from("/tmp/linux")),
+                git_hash: Some("deadbee".to_string()),
+            },
+            arch: "x86_64".to_string(),
+            image_name: "bzImage".to_string(),
+            config_hash: Some("fff000".to_string()),
+            built_at: "2026-04-12T14:00:00Z".to_string(),
+            ktstr_kconfig_hash: Some("aaa111".to_string()),
+            extra_kconfig_hash: None,
+            has_vmlinux: true,
+            vmlinux_stripped: true,
+            source_vmlinux_size: None,
+            source_vmlinux_mtime_secs: None,
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        let parsed: KernelMetadata = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed.source,
+            KernelSource::Local {
+                source_tree_path: Some(ref p),
+                git_hash: Some(ref h),
+            }
+            if p == &PathBuf::from("/tmp/linux") && h == "deadbee"
+        ));
+        assert!(parsed.has_vmlinux);
+        assert!(parsed.vmlinux_stripped);
+    }
+
+    /// git_hash on KernelSource::Local is a plain Option<String> with
+    /// no serde attributes — the compat shims (serde(default) +
+    /// skip_serializing_if) were removed for pre-1.0, so `None`
+    /// serializes as an explicit `null` key and deserialization
+    /// accepts `null` back as `None`. This test pins only the
+    /// None → null → None round trip; the absent-key branch is
+    /// exercised separately by
+    /// [`kernel_source_absent_option_keys_deserialize_as_none`].
+    #[test]
+    fn kernel_source_local_git_hash_serde_round_trip_none() {
+        let src = KernelSource::Local {
+            source_tree_path: Some(PathBuf::from("/tmp/linux")),
+            git_hash: None,
+        };
+        let json = serde_json::to_string(&src).unwrap();
+        assert!(
+            json.contains(r#""git_hash":null"#),
+            "git_hash=None must round-trip as explicit null, got {json}"
+        );
+        let parsed: KernelSource = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, KernelSource::Local { git_hash: None, .. }));
+    }
+
+    /// Pins the post-shim wire format: `Option` payload fields inside
+    /// every [`KernelSource`] variant serialize as explicit `null`
+    /// rather than being omitted.
+    #[test]
+    fn kernel_source_option_fields_serialize_as_explicit_null() {
+        let local = KernelSource::Local {
+            source_tree_path: None,
+            git_hash: None,
+        };
+        let local_json = serde_json::to_string(&local).unwrap();
+        assert!(
+            local_json.contains(r#""source_tree_path":null"#),
+            "Local.source_tree_path=None must serialize as explicit null, got {local_json}"
+        );
+        assert!(
+            local_json.contains(r#""git_hash":null"#),
+            "Local.git_hash=None must serialize as explicit null, got {local_json}"
+        );
+
+        let git = KernelSource::Git {
+            git_hash: None,
+            git_ref: None,
+        };
+        let git_json = serde_json::to_string(&git).unwrap();
+        assert!(
+            git_json.contains(r#""git_hash":null"#),
+            "Git.git_hash=None must serialize as explicit null, got {git_json}"
+        );
+        assert!(
+            git_json.contains(r#""ref":null"#),
+            "Git.git_ref=None must serialize as explicit null under the `ref` key, got {git_json}"
+        );
+    }
+
+    /// Older `metadata.json` files written before `Option` fields
+    /// were emitted as explicit `null` simply omit the keys.
+    #[test]
+    fn kernel_source_absent_option_keys_deserialize_as_none() {
+        let git_bare: KernelSource = serde_json::from_str(r#"{"type":"git"}"#)
+            .expect("Git with absent Option keys must deserialize");
+        assert!(matches!(
+            git_bare,
+            KernelSource::Git {
+                git_hash: None,
+                git_ref: None,
+            }
+        ));
+
+        let git_hash_only: KernelSource =
+            serde_json::from_str(r#"{"type":"git","git_hash":"abc"}"#)
+                .expect("Git with only git_hash must deserialize");
+        assert!(matches!(
+            git_hash_only,
+            KernelSource::Git {
+                git_hash: Some(ref h),
+                git_ref: None,
+            } if h == "abc"
+        ));
+
+        let git_ref_only: KernelSource = serde_json::from_str(r#"{"type":"git","ref":"main"}"#)
+            .expect("Git with only ref must deserialize");
+        assert!(matches!(
+            git_ref_only,
+            KernelSource::Git {
+                git_hash: None,
+                git_ref: Some(ref r),
+            } if r == "main"
+        ));
+
+        let local_bare: KernelSource = serde_json::from_str(r#"{"type":"local"}"#)
+            .expect("Local with absent Option keys must deserialize");
+        assert!(matches!(
+            local_bare,
+            KernelSource::Local {
+                source_tree_path: None,
+                git_hash: None,
+            }
+        ));
+
+        let local_path_only: KernelSource =
+            serde_json::from_str(r#"{"type":"local","source_tree_path":"/tmp/linux"}"#)
+                .expect("Local with only source_tree_path must deserialize");
+        assert!(matches!(
+            local_path_only,
+            KernelSource::Local {
+                source_tree_path: Some(ref p),
+                git_hash: None,
+            } if p.to_str() == Some("/tmp/linux")
+        ));
+
+        let local_hash_only: KernelSource =
+            serde_json::from_str(r#"{"type":"local","git_hash":"deadbeef"}"#)
+                .expect("Local with only git_hash must deserialize");
+        assert!(matches!(
+            local_hash_only,
+            KernelSource::Local {
+                source_tree_path: None,
+                git_hash: Some(ref h),
+            } if h == "deadbeef"
+        ));
+    }
+
+    #[test]
+    fn kernel_source_serde_tagged_representation() {
+        let t = serde_json::to_string(&KernelSource::Tarball).unwrap();
+        assert_eq!(t, r#"{"type":"tarball"}"#);
+        let g = serde_json::to_string(&KernelSource::Git {
+            git_hash: Some("abc".to_string()),
+            git_ref: Some("main".to_string()),
+        })
+        .unwrap();
+        assert!(g.contains(r#""type":"git""#));
+        assert!(g.contains(r#""git_hash":"abc""#));
+        assert!(g.contains(r#""ref":"main""#));
+        let l = serde_json::to_string(&KernelSource::Local {
+            source_tree_path: Some(PathBuf::from("/tmp/linux")),
+            git_hash: Some("a1b2c3d".to_string()),
+        })
+        .unwrap();
+        assert!(l.contains(r#""type":"local""#));
+        assert!(l.contains(r#""source_tree_path":"/tmp/linux""#));
+        assert!(l.contains(r#""git_hash":"a1b2c3d""#));
+    }
+
+    /// Table-drive every prefix → `error_kind` classifier mapping.
+    #[test]
+    fn classify_corrupt_reason_covers_every_documented_prefix() {
+        let cases: &[(&str, &str)] = &[
+            ("metadata.json missing", "missing"),
+            (
+                "metadata.json unreadable: Is a directory (os error 21)",
+                "unreadable",
+            ),
+            (
+                "metadata.json schema drift: missing field `source` at line 1 column 21",
+                "schema_drift",
+            ),
+            (
+                "metadata.json malformed: expected value at line 1 column 1",
+                "malformed",
+            ),
+            (
+                "metadata.json truncated: EOF while parsing a value at line 1 column 10",
+                "truncated",
+            ),
+            (
+                "metadata.json parse error: something unexpected",
+                "parse_error",
+            ),
+            (
+                "image file bzImage missing from entry directory",
+                "image_missing",
+            ),
+            ("some future prefix nobody wrote yet", "unknown"),
+        ];
+        for (reason, expected) in cases {
+            assert_eq!(
+                classify_corrupt_reason(reason),
+                *expected,
+                "reason `{reason}` should classify as `{expected}`",
+            );
+        }
+    }
+
+    /// `ListedEntry::error_kind()` returns `None` on a Valid entry
+    /// and the classifier result on a Corrupt entry.
+    #[test]
+    fn listed_entry_error_kind_dispatches_on_variant() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+        let meta = test_metadata("6.14.2");
+        cache
+            .store("valid-ek", &CacheArtifacts::new(&image), &meta)
+            .unwrap();
+
+        let bad_dir = tmp.path().join("cache").join("corrupt-ek");
+        fs::create_dir_all(&bad_dir).unwrap();
+
+        let entries = cache.list().unwrap();
+        assert_eq!(entries.len(), 2);
+        let valid = entries
+            .iter()
+            .find(|e| e.key() == "valid-ek")
+            .expect("valid entry must be listed");
+        let corrupt = entries
+            .iter()
+            .find(|e| e.key() == "corrupt-ek")
+            .expect("corrupt entry must be listed");
+        assert_eq!(
+            valid.error_kind(),
+            None,
+            "Valid entries must report no error_kind",
+        );
+        assert_eq!(
+            corrupt.error_kind(),
+            Some("missing"),
+            "missing-metadata Corrupt entry must classify as `missing`",
+        );
+    }
+
+    // -- KconfigStatus Display impl --
+    //
+    // Pins the three Display strings that flow through `kernel list
+    // --json` as the `kconfig_status` field. CI scripts consume these
+    // exact strings, so any rewording is a downstream-visible
+    // contract change.
+
+    #[test]
+    fn kconfig_status_display_matches_renders_lowercase_word() {
+        assert_eq!(KconfigStatus::Matches.to_string(), "matches");
+    }
+
+    #[test]
+    fn kconfig_status_display_stale_renders_lowercase_word_without_hashes() {
+        let s = KconfigStatus::Stale {
+            cached: "deadbeef".to_string(),
+            current: "cafebabe".to_string(),
+        }
+        .to_string();
+        assert_eq!(
+            s, "stale",
+            "Display elides the cached/current hashes; callers that need them must match on the variant directly"
+        );
+    }
+
+    #[test]
+    fn kconfig_status_display_untracked_renders_lowercase_word() {
+        assert_eq!(KconfigStatus::Untracked.to_string(), "untracked");
     }
 }

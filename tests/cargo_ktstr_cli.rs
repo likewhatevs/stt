@@ -688,8 +688,7 @@ fn extra_kconfig_cache_roundtrip() {
             .unwrap()
             .iter()
             .find(|e| e["key"].as_str() == Some("test-extras-roundtrip-bbbb1111"))
-            .expect("planted extras entry must appear in both runs")
-            ["extra_kconfig_hash"]
+            .expect("planted extras entry must appear in both runs")["extra_kconfig_hash"]
             .as_str()
             .expect("extra_kconfig_hash must be present")
             .to_string()

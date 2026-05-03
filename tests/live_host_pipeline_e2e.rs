@@ -29,7 +29,7 @@ use std::time::Duration;
 
 use ktstr::fun::{Funifier, funify_json};
 use ktstr::live_host::{
-    AffinityHint, CgroupHint, DebugCapture, ScxExitKind, SchedPolicyHint, WorkTypeHint,
+    AffinityHint, CgroupHint, DebugCapture, SchedPolicyHint, ScxExitKind, WorkTypeHint,
     WorkloadGroupHint, generate_spec, parse_kmsg_window, render_ktstr_test_source,
     render_run_file_source,
 };
@@ -105,7 +105,11 @@ fn live_host_pipeline_e2e_kmsg_to_reproducer_spec_to_source() {
             | ScxExitKind::Normal
             | ScxExitKind::Other,
     );
-    assert!(kind_is_known, "kind must be a well-known variant: {:?}", event.kind);
+    assert!(
+        kind_is_known,
+        "kind must be a well-known variant: {:?}",
+        event.kind
+    );
 
     // -- Phase 2: synthesize a DebugCapture from the parsed event +
     // realistic fingerprint data. Mirrors what the live-host
@@ -118,7 +122,9 @@ fn live_host_pipeline_e2e_kmsg_to_reproducer_spec_to_source() {
     wg.cpu_time_fraction = 0.85;
     wg.wakeups_per_sec = 1200.0;
     capture.fingerprint.workload_groups = vec![wg];
-    capture.fingerprint.affinity_hints = vec![AffinityHint::Exact { cpus: vec![0, 1, 2, 3] }];
+    capture.fingerprint.affinity_hints = vec![AffinityHint::Exact {
+        cpus: vec![0, 1, 2, 3],
+    }];
     capture.fingerprint.work_type_hints = vec![
         WorkTypeHint::Bursty {
             burst_duration: Duration::from_millis(10),
@@ -194,7 +200,11 @@ fn live_host_pipeline_e2e_kmsg_to_reproducer_spec_to_source() {
 #[test]
 fn live_host_pipeline_e2e_normal_exit_does_not_signal_error() {
     let events = parse_kmsg_window(KMSG_NORMAL_FIXTURE);
-    assert_eq!(events.len(), 2, "fixture has two anchors (normal + duplicate)");
+    assert_eq!(
+        events.len(),
+        2,
+        "fixture has two anchors (normal + duplicate)"
+    );
     for event in events {
         assert_eq!(event.scheduler_name, "scx_qmap");
         // Normal exits carry no stack — distinguishes from
@@ -266,8 +276,11 @@ fn live_host_pipeline_e2e_debug_capture_serde_roundtrip() {
         AffinityHint::CrossCgroup { cpus: Vec::new() },
     ];
     original.fingerprint.work_type_hints = vec![WorkTypeHint::FutexPingPong];
-    original.fingerprint.sched_policy_hints =
-        vec![SchedPolicyHint::Deadline { runtime_ns: 1_000_000, deadline_ns: 5_000_000, period_ns: 10_000_000 }];
+    original.fingerprint.sched_policy_hints = vec![SchedPolicyHint::Deadline {
+        runtime_ns: 1_000_000,
+        deadline_ns: 5_000_000,
+        period_ns: 10_000_000,
+    }];
 
     let json = serde_json::to_string(&original).expect("serialize DebugCapture");
     let restored: DebugCapture = serde_json::from_str(&json).expect("deserialize DebugCapture");
@@ -281,10 +294,7 @@ fn live_host_pipeline_e2e_debug_capture_serde_roundtrip() {
         "workload_groups must round-trip: got {:?}",
         restored.fingerprint.workload_groups,
     );
-    assert_eq!(
-        restored.fingerprint.workload_groups[0].thread_count,
-        8,
-    );
+    assert_eq!(restored.fingerprint.workload_groups[0].thread_count, 8,);
     assert_eq!(
         restored.fingerprint.affinity_hints.len(),
         2,
@@ -300,7 +310,10 @@ fn live_host_pipeline_e2e_debug_capture_serde_roundtrip() {
     assert!(
         matches!(
             &restored.fingerprint.sched_policy_hints[0],
-            SchedPolicyHint::Deadline { runtime_ns: 1_000_000, .. },
+            SchedPolicyHint::Deadline {
+                runtime_ns: 1_000_000,
+                ..
+            },
         ),
         "SchedPolicyHint::Deadline must round-trip with runtime preserved",
     );
@@ -350,8 +363,7 @@ fn live_host_pipeline_e2e_funify_preserves_structure() {
     // thread_count / cpu_time_fraction / wakeups_per_sec hit the
     // metric allowlist — they pass through unchanged.
     assert!(
-        funified_str.contains("\"thread_count\":4")
-            || funified_str.contains("\"thread_count\": 4"),
+        funified_str.contains("\"thread_count\":4") || funified_str.contains("\"thread_count\": 4"),
         "thread_count=4 must pass through funification: {funified_str}",
     );
     // Round-trip structurally: serde_json::from_value on the

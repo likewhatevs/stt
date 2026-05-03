@@ -205,7 +205,7 @@ pub(super) fn split_into_segments(s: &str) -> Vec<Segment<'_>> {
 /// - `session-a1234` → `session-{H}` (hex-like).
 /// - `BPF_CUBIC` → `BPF_CUBIC` (pure alpha, no digits).
 /// - `bloop-tangler` → `bloop-tangler` (pure alpha).
-pub(super) fn pattern_key(name: &str) -> String {
+pub fn pattern_key(name: &str) -> String {
     let segments = split_into_segments(name);
     let mut out = String::new();
     for seg in segments {

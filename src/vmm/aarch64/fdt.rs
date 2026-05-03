@@ -1378,13 +1378,14 @@ mod tests {
             .find(|(n, p, _)| n == "pmu" && p == "compatible")
             .expect("pmu node must exist with compatible property");
         assert_eq!(
-            std::str::from_utf8(&compat.2).unwrap().trim_end_matches('\0'),
+            std::str::from_utf8(&compat.2)
+                .unwrap()
+                .trim_end_matches('\0'),
             "arm,armv8-pmuv3",
             "pmu compatible must match the kernel s/w-model binding",
         );
 
-        let irq = prop_u32_array(&props, "pmu", "interrupts")
-            .expect("pmu interrupts must exist");
+        let irq = prop_u32_array(&props, "pmu", "interrupts").expect("pmu interrupts must exist");
         assert_eq!(irq.len(), 3, "pmu interrupt cell count");
         assert_eq!(irq[0], GIC_PPI, "pmu interrupt type must be PPI");
         assert_eq!(irq[1], 7, "pmu interrupt PPI must be 7");

@@ -181,9 +181,7 @@ pub fn aggregate_samples(samples: &[f64], kind: MetricKind) -> Option<f64> {
     }
     Some(match kind {
         MetricKind::Counter => finite.iter().sum(),
-        MetricKind::Gauge(GaugeAgg::Avg) => {
-            finite.iter().sum::<f64>() / (finite.len() as f64)
-        }
+        MetricKind::Gauge(GaugeAgg::Avg) => finite.iter().sum::<f64>() / (finite.len() as f64),
         MetricKind::Gauge(GaugeAgg::Last) | MetricKind::Timestamp => {
             *finite.last().expect("non-empty by check above")
         }

@@ -299,10 +299,7 @@ fn scenario_event_counter_timeline_populates_dump(
     // counter map. Pin the most basic shape invariant — entries are
     // objects, not scalars — without fixing field names that may
     // change as the schema evolves.
-    let non_object: Vec<&serde_json::Value> = timeline
-        .iter()
-        .filter(|s| !s.is_object())
-        .collect();
+    let non_object: Vec<&serde_json::Value> = timeline.iter().filter(|s| !s.is_object()).collect();
     if !non_object.is_empty() {
         anyhow::bail!(
             "event_counter_timeline has {} non-object entries; \
@@ -353,9 +350,7 @@ fn scenario_event_counter_timeline_populates_dump(
 /// assertion-string-drift unit tests elsewhere catch the error path
 /// shapes.
 fn scenario_sched_deadline_real_setattr(ctx: &ktstr::scenario::Ctx) -> Result<AssertResult> {
-    use ktstr::workload::{
-        AffinityIntent, SchedPolicy, WorkType, WorkloadConfig, WorkloadHandle,
-    };
+    use ktstr::workload::{AffinityIntent, SchedPolicy, WorkType, WorkloadConfig, WorkloadHandle};
     use std::time::Duration;
 
     let config = WorkloadConfig {
@@ -527,35 +522,33 @@ fn scenario_failure_dump_trigger_minimal_invariants(
 // are written struct-literally because [`DiskConfig::default`] is not
 // `const fn` and a `static` initializer must be const-evaluable.
 
-const KTSTR_DISK_DEFAULT: ktstr::prelude::DiskConfig =
-    ktstr::prelude::DiskConfig {
-        capacity_mb: 256,
-        filesystem: ktstr::prelude::Filesystem::Raw,
-        throttle: ktstr::prelude::DiskThrottle {
-            iops: None,
-            bytes_per_sec: None,
-            iops_burst_capacity: None,
-            bytes_burst_capacity: None,
-        },
-        read_only: false,
-        name: None,
-        no_auto_mount: false,
-    };
+const KTSTR_DISK_DEFAULT: ktstr::prelude::DiskConfig = ktstr::prelude::DiskConfig {
+    capacity_mb: 256,
+    filesystem: ktstr::prelude::Filesystem::Raw,
+    throttle: ktstr::prelude::DiskThrottle {
+        iops: None,
+        bytes_per_sec: None,
+        iops_burst_capacity: None,
+        bytes_burst_capacity: None,
+    },
+    read_only: false,
+    name: None,
+    no_auto_mount: false,
+};
 
-const KTSTR_DISK_READ_ONLY: ktstr::prelude::DiskConfig =
-    ktstr::prelude::DiskConfig {
-        capacity_mb: 256,
-        filesystem: ktstr::prelude::Filesystem::Raw,
-        throttle: ktstr::prelude::DiskThrottle {
-            iops: None,
-            bytes_per_sec: None,
-            iops_burst_capacity: None,
-            bytes_burst_capacity: None,
-        },
-        read_only: true,
-        name: None,
-        no_auto_mount: false,
-    };
+const KTSTR_DISK_READ_ONLY: ktstr::prelude::DiskConfig = ktstr::prelude::DiskConfig {
+    capacity_mb: 256,
+    filesystem: ktstr::prelude::Filesystem::Raw,
+    throttle: ktstr::prelude::DiskThrottle {
+        iops: None,
+        bytes_per_sec: None,
+        iops_burst_capacity: None,
+        bytes_burst_capacity: None,
+    },
+    read_only: true,
+    name: None,
+    no_auto_mount: false,
+};
 
 /// Boot the VM with a default-configured virtio-blk disk and assert
 /// that `/dev/vda` appears as a block device inside the guest.
@@ -577,9 +570,7 @@ const KTSTR_DISK_READ_ONLY: ktstr::prelude::DiskConfig =
 ///
 /// A regression that breaks any layer surfaces here as either a
 /// missing device file or a wrong-capacity report.
-fn scenario_disk_default_appears_at_dev_vda(
-    _ctx: &ktstr::scenario::Ctx,
-) -> Result<AssertResult> {
+fn scenario_disk_default_appears_at_dev_vda(_ctx: &ktstr::scenario::Ctx) -> Result<AssertResult> {
     use std::fs::OpenOptions;
     use std::os::unix::fs::FileTypeExt;
     use std::os::unix::io::AsRawFd;
@@ -614,13 +605,7 @@ fn scenario_disk_default_appears_at_dev_vda(
     // kernel writes a `u64` to the `arg` pointer; `size_bytes` is a
     // valid mutable u64 for the duration of the call. The fd is
     // owned by `file` and outlives the syscall.
-    let rc = unsafe {
-        libc::ioctl(
-            file.as_raw_fd(),
-            0x80081272,
-            &mut size_bytes as *mut u64,
-        )
-    };
+    let rc = unsafe { libc::ioctl(file.as_raw_fd(), 0x80081272, &mut size_bytes as *mut u64) };
     if rc != 0 {
         let errno = std::io::Error::last_os_error();
         anyhow::bail!(
@@ -770,9 +755,7 @@ fn scenario_disk_write_read_roundtrip(_ctx: &ktstr::scenario::Ctx) -> Result<Ass
 /// surface visible to a guest userspace caller; the in-device
 /// rejection only fires for chains the guest constructs in spite
 /// of the negotiated bit.
-fn scenario_disk_read_only_rejects_write(
-    _ctx: &ktstr::scenario::Ctx,
-) -> Result<AssertResult> {
+fn scenario_disk_read_only_rejects_write(_ctx: &ktstr::scenario::Ctx) -> Result<AssertResult> {
     use std::fs::OpenOptions;
 
     let path = std::path::Path::new("/dev/vda");
@@ -956,7 +939,9 @@ const CARGO_KTSTR_BINARY: &str = env!("CARGO_BIN_EXE_cargo-ktstr");
 /// actionable message rather than a silent timeout.
 fn linux_source_dir() -> std::path::PathBuf {
     let crate_root = env!("CARGO_MANIFEST_DIR");
-    std::path::PathBuf::from(crate_root).join("..").join("linux")
+    std::path::PathBuf::from(crate_root)
+        .join("..")
+        .join("linux")
 }
 
 /// Drive one `vm_integration_*` scenario via `cargo ktstr test`,
@@ -1199,4 +1184,3 @@ fn vm_integration_disk_write_read_roundtrip() {
 fn vm_integration_disk_read_only_rejects_write() {
     drive_ktstr_test("vm_integration_disk_read_only_rejects_write");
 }
-

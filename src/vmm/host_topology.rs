@@ -720,7 +720,7 @@ fn pid_window_offset(pid: u32, max_start: usize) -> usize {
     use siphasher::sip::SipHasher13;
     use std::hash::Hasher;
     let mut hasher = SipHasher13::new();
-    hasher.write_u32(pid);
+    hasher.write(&pid.to_le_bytes());
     (hasher.finish() as usize) % max_start
 }
 

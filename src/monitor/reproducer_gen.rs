@@ -116,7 +116,7 @@ use crate::workload::{AffinityIntent, SchedPolicy, WorkType, WorkloadConfig};
 /// caller (or generated source) can flag them for the user.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(dead_code)] // wired by the (separate) cargo ktstr capture-
-                    // reproduce subcommand; library lands the type.
+// reproduce subcommand; library lands the type.
 pub struct ReproducerSpec {
     /// The mappable WorkloadConfig — what the framework executes.
     /// Skipped from serde because WorkloadConfig isn't (and doesn't
@@ -282,18 +282,18 @@ fn failure_scheduler_name(capture: &DebugCapture) -> String {
 
 fn map_workload_groups(fp: &WorkloadFingerprint, spec: &mut ReproducerSpec) {
     let Some(primary) = fp.workload_groups.first() else {
-        spec.notes.push(
-            "no workload groups in fingerprint — defaulting num_workers=1".into(),
-        );
+        spec.notes
+            .push("no workload groups in fingerprint — defaulting num_workers=1".into());
         return;
     };
     spec.config.num_workers = primary.thread_count.max(1) as usize;
     push_extras_note(
         &mut spec.notes,
         "additional workload groups not modeled in primary spec",
-        fp.workload_groups.iter().skip(1).map(|g: &WorkloadGroupHint| {
-            format!("{} ({} threads)", g.cgroup_path, g.thread_count)
-        }),
+        fp.workload_groups
+            .iter()
+            .skip(1)
+            .map(|g: &WorkloadGroupHint| format!("{} ({} threads)", g.cgroup_path, g.thread_count)),
     );
 }
 
@@ -330,11 +330,7 @@ fn push_extras_note(notes: &mut Vec<String>, header: &str, entries: impl Iterato
 /// `AffinityIntent::exact(...)` call with angle-bracket placeholders)
 /// so the generated note can be copied into a test file with minimal
 /// editing.
-fn topology_aware_note(
-    variant: &str,
-    engine_action: &str,
-    hand_edit_target: &str,
-) -> String {
+fn topology_aware_note(variant: &str, engine_action: &str, hand_edit_target: &str) -> String {
     // Every unresolved-fallback note embeds the
     // [`UNRESOLVED_NOTE_MARKER`] substring (currently
     // `"spawn-time affinity gate rejects"`) so
@@ -676,7 +672,10 @@ fn map_sched_policy(fp: &WorkloadFingerprint, spec: &mut ReproducerSpec) {
     push_extras_note(
         &mut spec.notes,
         "additional sched-policy hints observed",
-        fp.sched_policy_hints.iter().skip(1).map(|s| format!("{s:?}")),
+        fp.sched_policy_hints
+            .iter()
+            .skip(1)
+            .map(|s| format!("{s:?}")),
     );
 }
 
@@ -724,10 +723,7 @@ pub fn render_run_file_source(spec: &ReproducerSpec, template_name: &str) -> Str
     // reproducer is independent of the host's `WorkloadConfig`
     // defaults at render time.
     s.push_str("    WorkloadConfig::default()\n");
-    s.push_str(&format!(
-        "        .workers({})\n",
-        spec.config.num_workers
-    ));
+    s.push_str(&format!("        .workers({})\n", spec.config.num_workers));
     s.push_str(&format!(
         "        .affinity({})\n",
         render_affinity(&spec.config.affinity)
@@ -837,9 +833,9 @@ fn render_work_type(w: &WorkType) -> String {
         WorkType::FutexPingPong { spin_iters } => {
             format!("WorkType::FutexPingPong {{ spin_iters: {spin_iters} }}")
         }
-        WorkType::CachePressure { size_kb, stride } => format!(
-            "WorkType::CachePressure {{ size_kb: {size_kb}, stride: {stride} }}"
-        ),
+        WorkType::CachePressure { size_kb, stride } => {
+            format!("WorkType::CachePressure {{ size_kb: {size_kb}, stride: {stride} }}")
+        }
         // Variants that no fingerprint hint currently projects to.
         // Each produces an explicit TODO placeholder so the rendered
         // source compiles, surfaces the hand-edit requirement, and
@@ -967,8 +963,9 @@ mod tests {
             other => panic!("expected Exact, got {other:?}"),
         }
         assert!(
-            spec.notes.iter().any(|n| n.contains("AffinityHint::Exact")
-                && n.contains("with resolved CPUs")),
+            spec.notes
+                .iter()
+                .any(|n| n.contains("AffinityHint::Exact") && n.contains("with resolved CPUs")),
             "populated Exact must emit a resolved-collapse note for surface consistency: {:?}",
             spec.notes,
         );
@@ -990,20 +987,24 @@ mod tests {
         let spec = generate_spec(&cap);
         match &spec.config.affinity {
             AffinityIntent::Exact(set) => {
-                assert!(set.is_empty(), "empty Exact must propagate through to AffinityIntent: {set:?}");
+                assert!(
+                    set.is_empty(),
+                    "empty Exact must propagate through to AffinityIntent: {set:?}"
+                );
             }
             other => panic!("expected empty Exact, got {other:?}"),
         }
         assert!(
-            spec.notes.iter().any(|n| n.contains("AffinityHint::Exact")
-                && n.contains("no CPUs")),
+            spec.notes
+                .iter()
+                .any(|n| n.contains("AffinityHint::Exact") && n.contains("no CPUs")),
             "empty Exact must surface a hand-edit-required note: {:?}",
             spec.notes,
         );
         assert!(
-            spec.notes.iter().any(|n| n.contains(
-                "AffinityIntent::exact([<cpu_0>, <cpu_1>, ...])"
-            )),
+            spec.notes
+                .iter()
+                .any(|n| n.contains("AffinityIntent::exact([<cpu_0>, <cpu_1>, ...])")),
             "empty Exact note must include paste-ready Rust hand-edit target: {:?}",
             spec.notes,
         );
@@ -1036,8 +1037,7 @@ mod tests {
     #[test]
     fn generate_spec_fifo_priority() {
         let mut cap = DebugCapture::default();
-        cap.fingerprint.sched_policy_hints =
-            vec![SchedPolicyHint::Fifo { priority: 50 }];
+        cap.fingerprint.sched_policy_hints = vec![SchedPolicyHint::Fifo { priority: 50 }];
         let spec = generate_spec(&cap);
         match spec.config.sched_policy {
             SchedPolicy::Fifo(prio) => assert_eq!(prio, 50),
@@ -1049,8 +1049,7 @@ mod tests {
     #[test]
     fn generate_spec_nice_applied() {
         let mut cap = DebugCapture::default();
-        cap.fingerprint.sched_policy_hints =
-            vec![SchedPolicyHint::Other { nice: 5 }];
+        cap.fingerprint.sched_policy_hints = vec![SchedPolicyHint::Other { nice: 5 }];
         let spec = generate_spec(&cap);
         assert!(matches!(spec.config.sched_policy, SchedPolicy::Normal));
         assert_eq!(spec.config.nice, 5);
@@ -1060,8 +1059,7 @@ mod tests {
     #[test]
     fn generate_spec_multiple_hints_first_wins() {
         let mut cap = DebugCapture::default();
-        cap.fingerprint.work_type_hints =
-            vec![WorkTypeHint::SpinWait, WorkTypeHint::IoSyncWrite];
+        cap.fingerprint.work_type_hints = vec![WorkTypeHint::SpinWait, WorkTypeHint::IoSyncWrite];
         let spec = generate_spec(&cap);
         assert!(matches!(spec.config.work_type, WorkType::SpinWait));
         assert!(
@@ -1145,9 +1143,9 @@ mod tests {
             spec.notes,
         );
         assert!(
-            spec.notes.iter().any(|n| n.contains(
-                "AffinityIntent::exact([<llc_cpu_0>, <llc_cpu_1>, ...])"
-            )),
+            spec.notes
+                .iter()
+                .any(|n| n.contains("AffinityIntent::exact([<llc_cpu_0>, <llc_cpu_1>, ...])")),
             "unresolved LlcAligned note must include paste-ready Rust hand-edit target: {:?}",
             spec.notes,
         );
@@ -1207,8 +1205,7 @@ mod tests {
         assert!(
             spec.notes
                 .iter()
-                .any(|n| n.contains("AffinityHint::SingleCpu")
-                    && n.contains("with resolved CPUs")),
+                .any(|n| n.contains("AffinityHint::SingleCpu") && n.contains("with resolved CPUs")),
             "resolved SingleCpu must surface a resolved-collapse note: {:?}",
             spec.notes,
         );
@@ -1232,9 +1229,9 @@ mod tests {
                     && n.contains("without resolved CPUs")),
         );
         assert!(
-            spec.notes.iter().any(|n| n.contains(
-                "AffinityIntent::exact([<cpu>])"
-            )),
+            spec.notes
+                .iter()
+                .any(|n| n.contains("AffinityIntent::exact([<cpu>])")),
             "unresolved SingleCpu note must include paste-ready Rust hand-edit target: {:?}",
             spec.notes,
         );
@@ -1259,10 +1256,9 @@ mod tests {
             other => panic!("expected Exact, got {other:?}"),
         }
         assert!(
-            spec.notes
-                .iter()
-                .any(|n| n.contains("AffinityHint::CrossCgroup")
-                    && n.contains("with resolved CPUs")),
+            spec.notes.iter().any(
+                |n| n.contains("AffinityHint::CrossCgroup") && n.contains("with resolved CPUs")
+            ),
         );
     }
 
@@ -1276,8 +1272,7 @@ mod tests {
     #[test]
     fn generate_spec_cross_cgroup_unresolved_emits_topology_aware() {
         let mut cap = DebugCapture::default();
-        cap.fingerprint.affinity_hints =
-            vec![AffinityHint::CrossCgroup { cpus: Vec::new() }];
+        cap.fingerprint.affinity_hints = vec![AffinityHint::CrossCgroup { cpus: Vec::new() }];
         let spec = generate_spec(&cap);
         assert!(matches!(spec.config.affinity, AffinityIntent::CrossCgroup));
         assert!(
@@ -1289,9 +1284,9 @@ mod tests {
             spec.notes,
         );
         assert!(
-            spec.notes.iter().any(|n| n.contains(
-                "AffinityIntent::exact([<cpu_0>, <cpu_1>, ...])"
-            )),
+            spec.notes
+                .iter()
+                .any(|n| n.contains("AffinityIntent::exact([<cpu_0>, <cpu_1>, ...])")),
             "unresolved CrossCgroup note must include paste-ready Rust hand-edit target: {:?}",
             spec.notes,
         );
@@ -1339,7 +1334,10 @@ mod tests {
         let spec = generate_spec(&cap);
         match &spec.config.affinity {
             AffinityIntent::RandomSubset { from, count } => {
-                assert!(from.is_empty(), "unresolved RandomSubset must emit empty pool");
+                assert!(
+                    from.is_empty(),
+                    "unresolved RandomSubset must emit empty pool"
+                );
                 assert_eq!(*count, 0);
             }
             other => panic!("expected placeholder RandomSubset, got {other:?}"),
@@ -1461,8 +1459,7 @@ mod tests {
     #[test]
     fn generate_spec_smt_sibling_pair_resolved_emits_exact() {
         let mut cap = DebugCapture::default();
-        cap.fingerprint.affinity_hints =
-            vec![AffinityHint::SmtSiblingPair { cpus: vec![2, 3] }];
+        cap.fingerprint.affinity_hints = vec![AffinityHint::SmtSiblingPair { cpus: vec![2, 3] }];
         let spec = generate_spec(&cap);
         match &spec.config.affinity {
             AffinityIntent::Exact(set) => {
@@ -1494,8 +1491,7 @@ mod tests {
     #[test]
     fn generate_spec_smt_sibling_pair_unresolved_emits_topology_aware() {
         let mut cap = DebugCapture::default();
-        cap.fingerprint.affinity_hints =
-            vec![AffinityHint::SmtSiblingPair { cpus: Vec::new() }];
+        cap.fingerprint.affinity_hints = vec![AffinityHint::SmtSiblingPair { cpus: Vec::new() }];
         let spec = generate_spec(&cap);
         assert!(matches!(
             spec.config.affinity,
@@ -1510,9 +1506,9 @@ mod tests {
             spec.notes,
         );
         assert!(
-            spec.notes.iter().any(|n| n.contains(
-                "AffinityIntent::exact([<sibling_a>, <sibling_b>])"
-            )),
+            spec.notes
+                .iter()
+                .any(|n| n.contains("AffinityIntent::exact([<sibling_a>, <sibling_b>])")),
             "unresolved SmtSiblingPair note must include paste-ready Rust hand-edit target: {:?}",
             spec.notes,
         );
@@ -1801,7 +1797,9 @@ mod tests {
         // formatter.
         cap.fingerprint.affinity_hints = vec![
             AffinityHint::SmtSiblingPair { cpus: vec![4, 5] },
-            AffinityHint::Exact { cpus: vec![0, 1, 2, 3] },
+            AffinityHint::Exact {
+                cpus: vec![0, 1, 2, 3],
+            },
         ];
         cap.fingerprint.work_type_hints = vec![WorkTypeHint::Bursty {
             burst_duration: Duration::from_millis(7),
@@ -1814,8 +1812,7 @@ mod tests {
             cpuset_cpus: vec![4, 5],
             cpu_max_quota_us: Some(50_000),
         }];
-        cap.fingerprint.sched_policy_hints =
-            vec![SchedPolicyHint::Fifo { priority: 60 }];
+        cap.fingerprint.sched_policy_hints = vec![SchedPolicyHint::Fifo { priority: 60 }];
         cap.fingerprint.gaps = vec!["sample window had 2 dropouts".into()];
 
         let spec1 = generate_spec(&cap);
@@ -2084,7 +2081,9 @@ mod tests {
             ));
         }
         assert!(
-            spec.notes.iter().any(|n| n.contains(WORK_TYPE_TODO_NOTE_MARKER)),
+            spec.notes
+                .iter()
+                .any(|n| n.contains(WORK_TYPE_TODO_NOTE_MARKER)),
             "marker substring must appear in the pushed note: {:?}",
             spec.notes,
         );

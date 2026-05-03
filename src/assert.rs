@@ -2249,11 +2249,7 @@ impl Verdict {
     /// 12345i64)`) alongside pass/fail claims, so sidecar parsers
     /// and `stats compare` dashboards can read the typed value
     /// without re-grepping `details`.
-    pub fn note_value(
-        &mut self,
-        key: impl Into<String>,
-        value: impl Into<NoteValue>,
-    ) -> &mut Self {
+    pub fn note_value(&mut self, key: impl Into<String>, value: impl Into<NoteValue>) -> &mut Self {
         self.result.note_value(key, value);
         self
     }
@@ -2264,7 +2260,9 @@ impl Verdict {
     /// when a precondition is missing and the scenario cannot run.
     pub fn skip(&mut self, reason: &'static str) -> &mut Self {
         self.result.skipped = true;
-        self.result.details.push(AssertDetail::new(DetailKind::Skip, reason));
+        self.result
+            .details
+            .push(AssertDetail::new(DetailKind::Skip, reason));
         self
     }
 
@@ -2319,9 +2317,7 @@ impl Verdict {
     fn record(&mut self, outcome: ClaimOutcome) {
         if let ClaimOutcome::Fail { kind, message } = outcome {
             self.result.passed = false;
-            self.result
-                .details
-                .push(AssertDetail::new(kind, message));
+            self.result.details.push(AssertDetail::new(kind, message));
         }
     }
 }
@@ -2388,14 +2384,17 @@ where
     /// `NaN == NaN` is `false`. Use `is_finite` or
     /// [`claim!`](crate::claim) on `value.is_nan()` instead.
     pub fn eq(self, expected: T) -> &'a mut Verdict {
-        let ClaimBuilder { verdict, name, value, kind, reason } = self;
+        let ClaimBuilder {
+            verdict,
+            name,
+            value,
+            kind,
+            reason,
+        } = self;
         let outcome = if value == expected {
             ClaimOutcome::Pass
         } else {
-            let msg = append_reason(
-                format!("{name}: expected {expected}, was {value}"),
-                reason,
-            );
+            let msg = append_reason(format!("{name}: expected {expected}, was {value}"), reason);
             ClaimOutcome::Fail { kind, message: msg }
         };
         verdict.record(outcome);
@@ -2405,7 +2404,13 @@ where
     /// Pass when `value != forbidden`; fail with
     /// `<name>: expected != <forbidden>, was <value>` otherwise.
     pub fn ne(self, forbidden: T) -> &'a mut Verdict {
-        let ClaimBuilder { verdict, name, value, kind, reason } = self;
+        let ClaimBuilder {
+            verdict,
+            name,
+            value,
+            kind,
+            reason,
+        } = self;
         let outcome = if value != forbidden {
             ClaimOutcome::Pass
         } else {
@@ -2427,7 +2432,13 @@ where
     /// Pass when `value >= floor`; fail with `<name>: expected at
     /// least <floor>, was <value>` otherwise.
     pub fn at_least(self, floor: T) -> &'a mut Verdict {
-        let ClaimBuilder { verdict, name, value, kind, reason } = self;
+        let ClaimBuilder {
+            verdict,
+            name,
+            value,
+            kind,
+            reason,
+        } = self;
         let outcome = if value >= floor {
             ClaimOutcome::Pass
         } else {
@@ -2444,7 +2455,13 @@ where
     /// Pass when `value <= ceiling`; fail with `<name>: expected at
     /// most <ceiling>, was <value>` otherwise.
     pub fn at_most(self, ceiling: T) -> &'a mut Verdict {
-        let ClaimBuilder { verdict, name, value, kind, reason } = self;
+        let ClaimBuilder {
+            verdict,
+            name,
+            value,
+            kind,
+            reason,
+        } = self;
         let outcome = if value <= ceiling {
             ClaimOutcome::Pass
         } else {
@@ -2460,7 +2477,13 @@ where
 
     /// Pass when `value < ceiling`; fail otherwise.
     pub fn lt(self, ceiling: T) -> &'a mut Verdict {
-        let ClaimBuilder { verdict, name, value, kind, reason } = self;
+        let ClaimBuilder {
+            verdict,
+            name,
+            value,
+            kind,
+            reason,
+        } = self;
         let outcome = if value < ceiling {
             ClaimOutcome::Pass
         } else {
@@ -2476,7 +2499,13 @@ where
 
     /// Pass when `value > floor`; fail otherwise.
     pub fn gt(self, floor: T) -> &'a mut Verdict {
-        let ClaimBuilder { verdict, name, value, kind, reason } = self;
+        let ClaimBuilder {
+            verdict,
+            name,
+            value,
+            kind,
+            reason,
+        } = self;
         let outcome = if value > floor {
             ClaimOutcome::Pass
         } else {
@@ -2493,7 +2522,13 @@ where
     /// Pass when `lo <= value <= hi` (inclusive on both ends). Fails
     /// with caller-error message when `lo > hi`.
     pub fn between(self, lo: T, hi: T) -> &'a mut Verdict {
-        let ClaimBuilder { verdict, name, value, kind, reason } = self;
+        let ClaimBuilder {
+            verdict,
+            name,
+            value,
+            kind,
+            reason,
+        } = self;
         let outcome = if lo > hi {
             let msg = append_reason(
                 format!("{name}: caller error: interval inverted (lo={lo} > hi={hi})"),
@@ -2517,14 +2552,17 @@ where
 impl<'a> ClaimBuilder<'a, f64> {
     /// Pass when the value is finite (neither NaN nor ±Infinity).
     pub fn is_finite(self) -> &'a mut Verdict {
-        let ClaimBuilder { verdict, name, value, kind, reason } = self;
+        let ClaimBuilder {
+            verdict,
+            name,
+            value,
+            kind,
+            reason,
+        } = self;
         let outcome = if value.is_finite() {
             ClaimOutcome::Pass
         } else {
-            let msg = append_reason(
-                format!("{name}: expected finite, was {value}"),
-                reason,
-            );
+            let msg = append_reason(format!("{name}: expected finite, was {value}"), reason);
             ClaimOutcome::Fail { kind, message: msg }
         };
         verdict.record(outcome);
@@ -2536,7 +2574,13 @@ impl<'a> ClaimBuilder<'a, f64> {
     /// `±inf == ±inf` reads as a match. Negative `tolerance` is a
     /// caller bug — the failure message names it.
     pub fn near(self, target: f64, tolerance: f64) -> &'a mut Verdict {
-        let ClaimBuilder { verdict, name, value, kind, reason } = self;
+        let ClaimBuilder {
+            verdict,
+            name,
+            value,
+            kind,
+            reason,
+        } = self;
         let outcome = if tolerance < 0.0 {
             let msg = append_reason(
                 format!("{name}: caller error: tolerance negative (={tolerance})"),
@@ -2580,7 +2624,13 @@ impl<'a, T: Ord + std::fmt::Debug> SetClaim<'a, T> {
 
     /// Pass iff the set is empty.
     pub fn empty(self) -> &'a mut Verdict {
-        let SetClaim { verdict, name, value, kind, reason } = self;
+        let SetClaim {
+            verdict,
+            name,
+            value,
+            kind,
+            reason,
+        } = self;
         let outcome = if value.is_empty() {
             ClaimOutcome::Pass
         } else {
@@ -2593,7 +2643,13 @@ impl<'a, T: Ord + std::fmt::Debug> SetClaim<'a, T> {
 
     /// Pass iff the set is non-empty.
     pub fn nonempty(self) -> &'a mut Verdict {
-        let SetClaim { verdict, name, value, kind, reason } = self;
+        let SetClaim {
+            verdict,
+            name,
+            value,
+            kind,
+            reason,
+        } = self;
         let outcome = if !value.is_empty() {
             ClaimOutcome::Pass
         } else {
@@ -2606,7 +2662,13 @@ impl<'a, T: Ord + std::fmt::Debug> SetClaim<'a, T> {
 
     /// Pass iff the set contains `needle`.
     pub fn contains(self, needle: &T) -> &'a mut Verdict {
-        let SetClaim { verdict, name, value, kind, reason } = self;
+        let SetClaim {
+            verdict,
+            name,
+            value,
+            kind,
+            reason,
+        } = self;
         let outcome = if value.contains(needle) {
             ClaimOutcome::Pass
         } else {
@@ -2622,15 +2684,18 @@ impl<'a, T: Ord + std::fmt::Debug> SetClaim<'a, T> {
 
     /// Pass iff `set.len() == n`.
     pub fn len_eq(self, n: usize) -> &'a mut Verdict {
-        let SetClaim { verdict, name, value, kind, reason } = self;
+        let SetClaim {
+            verdict,
+            name,
+            value,
+            kind,
+            reason,
+        } = self;
         let actual = value.len();
         let outcome = if actual == n {
             ClaimOutcome::Pass
         } else {
-            let msg = append_reason(
-                format!("{name}: expected len == {n}, was {actual}"),
-                reason,
-            );
+            let msg = append_reason(format!("{name}: expected len == {n}, was {actual}"), reason);
             ClaimOutcome::Fail { kind, message: msg }
         };
         verdict.record(outcome);
@@ -2639,15 +2704,18 @@ impl<'a, T: Ord + std::fmt::Debug> SetClaim<'a, T> {
 
     /// Pass iff `set.len() <= n`.
     pub fn len_at_most(self, n: usize) -> &'a mut Verdict {
-        let SetClaim { verdict, name, value, kind, reason } = self;
+        let SetClaim {
+            verdict,
+            name,
+            value,
+            kind,
+            reason,
+        } = self;
         let actual = value.len();
         let outcome = if actual <= n {
             ClaimOutcome::Pass
         } else {
-            let msg = append_reason(
-                format!("{name}: expected len <= {n}, was {actual}"),
-                reason,
-            );
+            let msg = append_reason(format!("{name}: expected len <= {n}, was {actual}"), reason);
             ClaimOutcome::Fail { kind, message: msg }
         };
         verdict.record(outcome);
@@ -2656,15 +2724,18 @@ impl<'a, T: Ord + std::fmt::Debug> SetClaim<'a, T> {
 
     /// Pass iff `set.len() >= n`.
     pub fn len_at_least(self, n: usize) -> &'a mut Verdict {
-        let SetClaim { verdict, name, value, kind, reason } = self;
+        let SetClaim {
+            verdict,
+            name,
+            value,
+            kind,
+            reason,
+        } = self;
         let actual = value.len();
         let outcome = if actual >= n {
             ClaimOutcome::Pass
         } else {
-            let msg = append_reason(
-                format!("{name}: expected len >= {n}, was {actual}"),
-                reason,
-            );
+            let msg = append_reason(format!("{name}: expected len >= {n}, was {actual}"), reason);
             ClaimOutcome::Fail { kind, message: msg }
         };
         verdict.record(outcome);
@@ -2674,15 +2745,19 @@ impl<'a, T: Ord + std::fmt::Debug> SetClaim<'a, T> {
     /// Pass iff every element of `value` is in `whitelist`. Fails with
     /// the offending elements listed.
     pub fn subset_of(self, whitelist: &BTreeSet<T>) -> &'a mut Verdict {
-        let SetClaim { verdict, name, value, kind, reason } = self;
+        let SetClaim {
+            verdict,
+            name,
+            value,
+            kind,
+            reason,
+        } = self;
         let bad: Vec<&T> = value.iter().filter(|x| !whitelist.contains(x)).collect();
         let outcome = if bad.is_empty() {
             ClaimOutcome::Pass
         } else {
             let msg = append_reason(
-                format!(
-                    "{name}: expected subset of {whitelist:?}, but {bad:?} are not in the set"
-                ),
+                format!("{name}: expected subset of {whitelist:?}, but {bad:?} are not in the set"),
                 reason,
             );
             ClaimOutcome::Fail { kind, message: msg }
@@ -2694,7 +2769,13 @@ impl<'a, T: Ord + std::fmt::Debug> SetClaim<'a, T> {
     /// Pass iff `value` shares no element with `forbidden`. Fails with
     /// the offending elements listed.
     pub fn disjoint_from(self, forbidden: &BTreeSet<T>) -> &'a mut Verdict {
-        let SetClaim { verdict, name, value, kind, reason } = self;
+        let SetClaim {
+            verdict,
+            name,
+            value,
+            kind,
+            reason,
+        } = self;
         let bad: Vec<&T> = value.iter().filter(|x| forbidden.contains(x)).collect();
         let outcome = if bad.is_empty() {
             ClaimOutcome::Pass
@@ -2735,7 +2816,13 @@ impl<'a, T: std::fmt::Debug> SeqClaim<'a, T> {
 
     /// Pass iff the sequence is empty.
     pub fn empty(self) -> &'a mut Verdict {
-        let SeqClaim { verdict, name, value, kind, reason } = self;
+        let SeqClaim {
+            verdict,
+            name,
+            value,
+            kind,
+            reason,
+        } = self;
         let outcome = if value.is_empty() {
             ClaimOutcome::Pass
         } else {
@@ -2748,7 +2835,13 @@ impl<'a, T: std::fmt::Debug> SeqClaim<'a, T> {
 
     /// Pass iff the sequence is non-empty.
     pub fn nonempty(self) -> &'a mut Verdict {
-        let SeqClaim { verdict, name, value, kind, reason } = self;
+        let SeqClaim {
+            verdict,
+            name,
+            value,
+            kind,
+            reason,
+        } = self;
         let outcome = if !value.is_empty() {
             ClaimOutcome::Pass
         } else {
@@ -2764,7 +2857,13 @@ impl<'a, T: std::fmt::Debug> SeqClaim<'a, T> {
     where
         T: PartialEq,
     {
-        let SeqClaim { verdict, name, value, kind, reason } = self;
+        let SeqClaim {
+            verdict,
+            name,
+            value,
+            kind,
+            reason,
+        } = self;
         let outcome = if value.iter().any(|x| x == needle) {
             ClaimOutcome::Pass
         } else {
@@ -2780,15 +2879,18 @@ impl<'a, T: std::fmt::Debug> SeqClaim<'a, T> {
 
     /// Pass iff `seq.len() == n`.
     pub fn len_eq(self, n: usize) -> &'a mut Verdict {
-        let SeqClaim { verdict, name, value, kind, reason } = self;
+        let SeqClaim {
+            verdict,
+            name,
+            value,
+            kind,
+            reason,
+        } = self;
         let actual = value.len();
         let outcome = if actual == n {
             ClaimOutcome::Pass
         } else {
-            let msg = append_reason(
-                format!("{name}: expected len == {n}, was {actual}"),
-                reason,
-            );
+            let msg = append_reason(format!("{name}: expected len == {n}, was {actual}"), reason);
             ClaimOutcome::Fail { kind, message: msg }
         };
         verdict.record(outcome);
@@ -2797,15 +2899,18 @@ impl<'a, T: std::fmt::Debug> SeqClaim<'a, T> {
 
     /// Pass iff `seq.len() <= n`.
     pub fn len_at_most(self, n: usize) -> &'a mut Verdict {
-        let SeqClaim { verdict, name, value, kind, reason } = self;
+        let SeqClaim {
+            verdict,
+            name,
+            value,
+            kind,
+            reason,
+        } = self;
         let actual = value.len();
         let outcome = if actual <= n {
             ClaimOutcome::Pass
         } else {
-            let msg = append_reason(
-                format!("{name}: expected len <= {n}, was {actual}"),
-                reason,
-            );
+            let msg = append_reason(format!("{name}: expected len <= {n}, was {actual}"), reason);
             ClaimOutcome::Fail { kind, message: msg }
         };
         verdict.record(outcome);
@@ -2814,15 +2919,18 @@ impl<'a, T: std::fmt::Debug> SeqClaim<'a, T> {
 
     /// Pass iff `seq.len() >= n`.
     pub fn len_at_least(self, n: usize) -> &'a mut Verdict {
-        let SeqClaim { verdict, name, value, kind, reason } = self;
+        let SeqClaim {
+            verdict,
+            name,
+            value,
+            kind,
+            reason,
+        } = self;
         let actual = value.len();
         let outcome = if actual >= n {
             ClaimOutcome::Pass
         } else {
-            let msg = append_reason(
-                format!("{name}: expected len >= {n}, was {actual}"),
-                reason,
-            );
+            let msg = append_reason(format!("{name}: expected len >= {n}, was {actual}"), reason);
             ClaimOutcome::Fail { kind, message: msg }
         };
         verdict.record(outcome);
@@ -3405,9 +3513,7 @@ pub fn assert_scx_events_clean(events: &[(&str, i64)], max_count: Option<i64>) -
             };
             r.details.push(AssertDetail::new(
                 DetailKind::SchedulerEvent,
-                format!(
-                    "scx event `{name}` count {count} exceeds bound {bound_desc}",
-                ),
+                format!("scx event `{name}` count {count} exceeds bound {bound_desc}",),
             ));
         }
     }
@@ -3571,10 +3677,7 @@ impl SchedulerBaseline {
 /// let r = assert_baseline(&[report], &SchedulerBaseline::strict());
 /// assert!(r.passed);
 /// ```
-pub fn assert_baseline(
-    reports: &[WorkerReport],
-    baseline: &SchedulerBaseline,
-) -> AssertResult {
+pub fn assert_baseline(reports: &[WorkerReport], baseline: &SchedulerBaseline) -> AssertResult {
     // Empty `reports` means nothing was measured. Returning a fresh
     // `pass()` here would silently green-light a broken run that
     // produced no signal; delegating to `assert_benchmarks` and
@@ -4482,11 +4585,7 @@ mod tests {
             median_wake_latency_us: -10.0,
             ..CgroupStats::default()
         };
-        assert_finite_eq(
-            cg.wake_latency_tail_ratio(),
-            0.0,
-            "negative-median",
-        );
+        assert_finite_eq(cg.wake_latency_tail_ratio(), 0.0, "negative-median");
 
         // --- iterations_per_worker with max u64 iterations and
         // positive workers: the cast `as f64` loses precision but
@@ -6788,7 +6887,10 @@ not_hex default N0=10
             .unwrap();
         // Percentage form must accompany the fraction so an operator
         // reading the diagnostic doesn't mentally translate 0.5000 → 50%.
-        assert!(detail.contains("50.00%"), "must include observed %: {detail}");
+        assert!(
+            detail.contains("50.00%"),
+            "must include observed %: {detail}"
+        );
         assert!(
             detail.contains("80.00%"),
             "must include threshold %: {detail}"
@@ -6827,14 +6929,13 @@ not_hex default N0=10
         let nodes: BTreeSet<usize> = [0].into_iter().collect();
         let r = assert_slow_tier_ratio(&pages, 0.5, 100, Some(&nodes));
         assert!(!r.passed);
-        let detail = r
-            .details
-            .iter()
-            .find(|d| d.contains("slow-tier"))
-            .unwrap();
+        let detail = r.details.iter().find(|d| d.contains("slow-tier")).unwrap();
         // 60% slow-tier (node 2 has 60 pages) vs 50% threshold; both
         // surfaces appear so the operator sees raw ratio AND human %.
-        assert!(detail.contains("60.00%"), "must include observed %: {detail}");
+        assert!(
+            detail.contains("60.00%"),
+            "must include observed %: {detail}"
+        );
         assert!(
             detail.contains("50.00%"),
             "must include threshold %: {detail}"
@@ -7006,7 +7107,10 @@ numa_miss 5";
             .unwrap();
         // 20% migrated vs 10% threshold; pin both percentage tokens so
         // dropping either form regresses here.
-        assert!(detail.contains("20.00%"), "must include observed %: {detail}");
+        assert!(
+            detail.contains("20.00%"),
+            "must include observed %: {detail}"
+        );
         assert!(
             detail.contains("10.00%"),
             "must include threshold %: {detail}"
@@ -7537,7 +7641,9 @@ numa_miss 5";
         let p99 = 5000u64;
         let locality = 0.5_f64;
         claim!(v, p99).kind(DetailKind::Benchmark).at_most(1000);
-        claim!(v, locality).kind(DetailKind::PageLocality).at_least(0.9);
+        claim!(v, locality)
+            .kind(DetailKind::PageLocality)
+            .at_least(0.9);
         let r = v.into_result();
         assert!(!r.passed);
         let bench = r
@@ -7714,9 +7820,11 @@ numa_miss 5";
         let r = v.into_result();
         assert!(r.passed);
         assert!(r.skipped);
-        assert!(r.details.iter().any(|d| {
-            d.kind == DetailKind::Skip && d.message.contains("topology missing")
-        }));
+        assert!(
+            r.details
+                .iter()
+                .any(|d| { d.kind == DetailKind::Skip && d.message.contains("topology missing") })
+        );
     }
 
     #[test]
@@ -7820,7 +7928,9 @@ numa_miss 5";
         let r = v.into_result();
         assert!(r.passed);
         assert!(
-            r.details.iter().any(|d| d.message.contains("optional probe")),
+            r.details
+                .iter()
+                .any(|d| d.message.contains("optional probe")),
             "skip rationale must reach merged details: {:?}",
             r.details
         );

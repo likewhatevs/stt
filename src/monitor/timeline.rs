@@ -75,7 +75,7 @@ pub struct TimelineEventRaw {
 #[non_exhaustive]
 #[serde(tag = "kind")]
 #[allow(dead_code)] // wired into FailureDumpReport.timeline_events;
-                    // freeze coordinator populates via TimelineCapture.
+// freeze coordinator populates via TimelineCapture.
 pub enum TimelineEvent {
     /// `tp_btf/sched_switch`. The kernel switched from `prev_pid`
     /// to `next_pid` on `cpu` at `ts` (boot-time ns).
@@ -496,11 +496,7 @@ mod tests {
                 crate::claim!(v, prev_state).eq(0x402u64);
                 crate::claim!(v, preempt).eq(true);
                 let r = v.into_result();
-                assert!(
-                    r.passed,
-                    "Switch record decode drift: {:?}",
-                    r.details,
-                );
+                assert!(r.passed, "Switch record decode drift: {:?}", r.details,);
             }
             other => panic!("expected Switch, got {other:?}"),
         }

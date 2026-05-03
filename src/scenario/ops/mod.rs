@@ -75,7 +75,6 @@ use crate::scenario::{CgroupGroup, Ctx, process_alive};
 use crate::vmm::shm_ring::{self, StimulusPayload};
 use crate::workload::{MemPolicy, WorkSpec, WorkloadConfig, WorkloadHandle};
 
-
 // ---------------------------------------------------------------------------
 // SHM writer for stimulus events
 // ---------------------------------------------------------------------------
@@ -1405,10 +1404,7 @@ fn apply_setup(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, defs: &[CgroupDef])
             // schedule slice in the kernel; reject here with a
             // clearer message.
             if cpu.max_period_us == 0 {
-                anyhow::bail!(
-                    "cgroup '{}': cpu.max period must be > 0 (got 0)",
-                    def.name,
-                );
+                anyhow::bail!("cgroup '{}': cpu.max period must be > 0 (got 0)", def.name,);
             }
             if let Some(q) = cpu.max_quota_us {
                 if q == 0 {
@@ -1447,8 +1443,7 @@ fn apply_setup(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, defs: &[CgroupDef])
             // the write keeps swap-disabled kernels viable for
             // tests that just set memory_max.
             if mem.swap_max.is_some() {
-                ctx.cgroups
-                    .set_memory_swap_max(&def.name, mem.swap_max)?;
+                ctx.cgroups.set_memory_swap_max(&def.name, mem.swap_max)?;
             }
         }
         if let Some(ref io) = def.io {
@@ -1751,8 +1746,11 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
             }
             Op::SetAffinity { cgroup, affinity } => {
                 let cgroup_cpuset: Option<BTreeSet<usize>> = state.lookup_cpuset(cgroup).cloned();
-                let resolved =
-                    crate::scenario::resolve_affinity_for_cgroup(affinity, cgroup_cpuset.as_ref(), ctx.topo)?;
+                let resolved = crate::scenario::resolve_affinity_for_cgroup(
+                    affinity,
+                    cgroup_cpuset.as_ref(),
+                    ctx.topo,
+                )?;
                 for (name, handle) in state.all_handles() {
                     if name.as_str() == *cgroup {
                         match &resolved {
@@ -1800,7 +1798,8 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                 if let Err(reason) = work.mem_policy.validate() {
                     anyhow::bail!("SpawnHost: {}", reason);
                 }
-                let n = crate::scenario::resolve_num_workers(work, ctx.workers_per_cgroup, "<host>")?;
+                let n =
+                    crate::scenario::resolve_num_workers(work, ctx.workers_per_cgroup, "<host>")?;
                 let affinity = crate::scenario::intent_for_spawn(&work.affinity, None, ctx.topo)?;
                 let wl = WorkloadConfig {
                     num_workers: n,
@@ -2603,14 +2602,8 @@ mod tests {
             .discriminant(),
             12,
         );
-        assert_eq!(
-            Op::FreezeCgroup { cgroup: "a".into() }.discriminant(),
-            13,
-        );
-        assert_eq!(
-            Op::UnfreezeCgroup { cgroup: "a".into() }.discriminant(),
-            14,
-        );
+        assert_eq!(Op::FreezeCgroup { cgroup: "a".into() }.discriminant(), 13,);
+        assert_eq!(Op::UnfreezeCgroup { cgroup: "a".into() }.discriminant(), 14,);
     }
 
     // -- seeded_rng tests --
@@ -3299,7 +3292,11 @@ mod tests {
     fn cgroup_def_multi_work() {
         let d = CgroupDef::named("multi")
             .work(WorkSpec::default().workers(4).work_type(WorkType::SpinWait))
-            .work(WorkSpec::default().workers(2).work_type(WorkType::YieldHeavy));
+            .work(
+                WorkSpec::default()
+                    .workers(2)
+                    .work_type(WorkType::YieldHeavy),
+            );
         assert_eq!(d.works.len(), 2);
         assert_eq!(d.works[0].num_workers, Some(4));
         assert_eq!(d.works[1].num_workers, Some(2));
@@ -6231,8 +6228,8 @@ mod tests {
     /// converts to microseconds.
     #[test]
     fn cgroup_def_cpu_quota_accepts_explicit_durations() {
-        let def =
-            CgroupDef::named("cg_a").cpu_quota(Duration::from_micros(7_500), Duration::from_millis(10));
+        let def = CgroupDef::named("cg_a")
+            .cpu_quota(Duration::from_micros(7_500), Duration::from_millis(10));
         let cpu = def.cpu.unwrap();
         assert_eq!(cpu.max_quota_us, Some(7_500));
         assert_eq!(cpu.max_period_us, 10_000);
@@ -6363,9 +6360,10 @@ mod tests {
         // Specific values: max=Some, high=None (writes "max"),
         // low=None (writes "0") — pin both the SET and the
         // implicit-clear.
-        assert!(
-            calls.contains(&CgroupCall::SetMemoryMax("cg_mem".to_string(), Some(1_000_000))),
-        );
+        assert!(calls.contains(&CgroupCall::SetMemoryMax(
+            "cg_mem".to_string(),
+            Some(1_000_000)
+        )),);
         assert!(calls.contains(&CgroupCall::SetMemoryHigh("cg_mem".to_string(), None)));
         assert!(calls.contains(&CgroupCall::SetMemoryLow("cg_mem".to_string(), None)));
         cleanup_state(&mut state);
@@ -6459,10 +6457,8 @@ mod tests {
         let topo = mock_topo();
         let ctx = mock_ctx(&mock, &topo);
         let mut state = StepState::empty(&ctx);
-        let defs = vec![
-            CgroupDef::named("cg_bad")
-                .cpu_quota(Duration::from_millis(50), Duration::ZERO),
-        ];
+        let defs =
+            vec![CgroupDef::named("cg_bad").cpu_quota(Duration::from_millis(50), Duration::ZERO)];
         let err = apply_setup_test(&ctx, &mut state, &defs)
             .err()
             .expect("apply_setup must reject period=0");
@@ -6579,8 +6575,7 @@ mod tests {
         let topo = mock_topo();
         let ctx = mock_ctx(&mock, &topo);
         let mut state = StepState::empty(&ctx);
-        let defs =
-            vec![CgroupDef::named("cg_swap").memory_swap_max(4 * 1024 * 1024)];
+        let defs = vec![CgroupDef::named("cg_swap").memory_swap_max(4 * 1024 * 1024)];
         apply_setup_test(&ctx, &mut state, &defs).expect("apply_setup must succeed");
         let calls = mock.calls();
         assert!(
@@ -6711,7 +6706,9 @@ mod tests {
         apply_setup_test(&ctx, &mut state, &defs).expect("apply_setup must succeed");
         let calls = mock.calls();
         assert!(
-            !calls.iter().any(|c| matches!(c, CgroupCall::SetPidsMax(_, _))),
+            !calls
+                .iter()
+                .any(|c| matches!(c, CgroupCall::SetPidsMax(_, _))),
             "no SetPidsMax expected when pids field is None, got: {calls:?}",
         );
         cleanup_state(&mut state);
@@ -6776,12 +6773,8 @@ mod tests {
         // the framework does not gate FreezeCgroup on prior
         // creation; the kernel is the final authority on whether
         // the cgroup directory exists.
-        apply_ops_test(
-            &ctx,
-            &mut state,
-            &[Op::freeze_cgroup("ghost_cg")],
-        )
-        .expect("apply_ops must dispatch FreezeCgroup even for an undeclared name");
+        apply_ops_test(&ctx, &mut state, &[Op::freeze_cgroup("ghost_cg")])
+            .expect("apply_ops must dispatch FreezeCgroup even for an undeclared name");
         let calls = mock.calls();
         assert!(
             calls.contains(&CgroupCall::SetFreeze("ghost_cg".to_string(), true)),
@@ -6801,12 +6794,8 @@ mod tests {
         let topo = mock_topo();
         let ctx = mock_ctx(&mock, &topo);
         let mut state = StepState::empty(&ctx);
-        let err = apply_ops_test(
-            &ctx,
-            &mut state,
-            &[Op::freeze_cgroup("ghost_cg")],
-        )
-        .expect_err("set_freeze failure must surface as Err");
+        let err = apply_ops_test(&ctx, &mut state, &[Op::freeze_cgroup("ghost_cg")])
+            .expect_err("set_freeze failure must surface as Err");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("Op::FreezeCgroup") && msg.contains("ghost_cg"),
@@ -6831,10 +6820,7 @@ mod tests {
         apply_ops_test(
             &ctx,
             &mut state,
-            &[
-                Op::freeze_cgroup("cg_x"),
-                Op::unfreeze_cgroup("cg_x"),
-            ],
+            &[Op::freeze_cgroup("cg_x"), Op::unfreeze_cgroup("cg_x")],
         )
         .expect("freeze/unfreeze ops must succeed");
         let calls = mock.calls();

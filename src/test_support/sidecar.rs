@@ -1793,54 +1793,22 @@ fn resolve_kernel_source_dir_with_cache(
 pub(crate) fn sidecar_variant_hash(sidecar: &SidecarResult) -> u64 {
     use siphasher::sip::SipHasher13;
     use std::hash::Hasher;
+    let mut sorted_sysctls = sidecar.sysctls.clone();
+    sorted_sysctls.sort();
+    let mut sorted_kargs = sidecar.kargs.clone();
+    sorted_kargs.sort();
+    let canonical = serde_json::json!({
+        "topology": sidecar.topology,
+        "scheduler": sidecar.scheduler,
+        "payload": sidecar.payload,
+        "work_type": sidecar.work_type,
+        "active_flags": sidecar.active_flags,
+        "sysctls": sorted_sysctls,
+        "kargs": sorted_kargs,
+    });
+    let bytes = serde_json::to_vec(&canonical).expect("json serialization cannot fail for strings");
     let mut h = SipHasher13::new_with_keys(0, 0);
-    h.write(sidecar.topology.as_bytes());
-    h.write(&[0]);
-    h.write(sidecar.scheduler.as_bytes());
-    h.write(&[0]);
-    // Binary payload name — two tests that differ only in the
-    // primary payload (e.g. scheduler=EEVDF + payload=FIO vs
-    // scheduler=EEVDF + payload=STRESS_NG) must produce distinct
-    // sidecar filenames. `None` emits a single separator byte so the
-    // absent-payload variant doesn't collide with a payload name that
-    // happens to hash-chain into the next field.
-    h.write(&[0xfc]);
-    if let Some(name) = &sidecar.payload {
-        h.write(name.as_bytes());
-    }
-    h.write(&[0]);
-    h.write(sidecar.work_type.as_bytes());
-    h.write(&[0]);
-    h.write(&[0xfe]);
-    for f in &sidecar.active_flags {
-        h.write(f.as_bytes());
-        h.write(&[0]);
-    }
-    // Sysctls and kargs are canonicalized at hash time — NOT at
-    // write time like `active_flags` — so the on-disk sidecar
-    // preserves the scheduler-declared order (useful for humans
-    // reading the JSON) while the filename suffix stays a pure
-    // function of the SET, not the sequence. Sorting lexically
-    // here means two schedulers that declare the same sysctls in
-    // different source-code orders fold to the same filename,
-    // matching the order-insensitivity contract documented on
-    // `canonicalize_active_flags`. Two small `Vec<&str>` per
-    // call — acceptable because `sidecar_variant_hash` runs
-    // once per `write_sidecar`, not on a hot path.
-    h.write(&[0xfd]);
-    let mut sorted_sysctls: Vec<&str> = sidecar.sysctls.iter().map(String::as_str).collect();
-    sorted_sysctls.sort_unstable();
-    for s in &sorted_sysctls {
-        h.write(s.as_bytes());
-        h.write(&[0]);
-    }
-    h.write(&[0xff]);
-    let mut sorted_kargs: Vec<&str> = sidecar.kargs.iter().map(String::as_str).collect();
-    sorted_kargs.sort_unstable();
-    for k in &sorted_kargs {
-        h.write(k.as_bytes());
-        h.write(&[0]);
-    }
+    h.write(&bytes);
     h.finish()
 }
 
@@ -2836,7 +2804,7 @@ mod tests {
         let b = sidecar_variant_hash(&SidecarResult::test_fixture());
         assert_eq!(a, b, "two fresh fixtures must hash identically");
         assert_eq!(
-            a, 0x95f45cfb2df24fa1,
+            a, 0x4ea01e28f65add5e,
             "fixture hash drifted — update only if the fixture default \
              change is intentional; verify every call site that passes \
              the fixture straight into sidecar_variant_hash still expresses \
@@ -5042,7 +5010,7 @@ mod tests {
         // `sidecar_variant_hash`.
         assert_eq!(
             sidecar_variant_hash(&sc),
-            0xf5818a33e58e8c93,
+            0x33d8d0cf741e3a06,
             "sidecar_variant_hash output drifted — regenerate expected only if \
              the wire format change is intentional and old sidecars are \
              disposable (which they are per ktstr's pre-1.0 stance)",
@@ -5073,7 +5041,7 @@ mod tests {
             kargs: Vec::new(),
             ..SidecarResult::test_fixture()
         };
-        assert_eq!(sidecar_variant_hash(&sc), 0x1b61394511b42e01);
+        assert_eq!(sidecar_variant_hash(&sc), 0x5aa363a3d9aacd98);
     }
 
     /// Two sidecars that differ only in `payload` must produce

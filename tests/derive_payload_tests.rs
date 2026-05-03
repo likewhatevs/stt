@@ -59,7 +59,10 @@ fn derive_payload_full_grammar() {
     );
 
     assert_eq!(FIO_FULL.default_checks.len(), 2);
-    assert!(matches!(FIO_FULL.default_checks[0], MetricCheck::ExitCodeEq(0)));
+    assert!(matches!(
+        FIO_FULL.default_checks[0],
+        MetricCheck::ExitCodeEq(0)
+    ));
     assert!(matches!(
         FIO_FULL.default_checks[1],
         MetricCheck::Min { metric, value } if metric == "jobs.0.read.iops" && value == 1000.0,

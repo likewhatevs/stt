@@ -1080,11 +1080,15 @@ fn auto_mount_data_disks() {
     // is absent so a future host that emits FS but not MOUNT
     // (e.g. an older binary against a newer kernel) still mounts
     // somewhere sane rather than failing.
-    let mount_point_owned = cmdline_val("KTSTR_DISK0_MOUNT")
-        .unwrap_or_else(|| "/mnt/disk0".to_string());
+    let mount_point_owned =
+        cmdline_val("KTSTR_DISK0_MOUNT").unwrap_or_else(|| "/mnt/disk0".to_string());
     let mount_point = mount_point_owned.as_str();
     mkdir_p(mount_point);
-    let flags = if ro { MsFlags::MS_RDONLY } else { MsFlags::empty() };
+    let flags = if ro {
+        MsFlags::MS_RDONLY
+    } else {
+        MsFlags::empty()
+    };
     let result = mount(
         Some("/dev/vda"),
         mount_point,
@@ -1843,9 +1847,11 @@ mod tests {
         // Reverse-token order produces the same result — the
         // checks are commutative and dispatch-order is the only
         // disambiguator.
-        let cmdline_reversed =
-            "ro KTSTR_MODE=shell KTSTR_MODE=disk_template console=ttyS0";
-        assert!(cmdline_contains_token(cmdline_reversed, "KTSTR_MODE=disk_template"));
+        let cmdline_reversed = "ro KTSTR_MODE=shell KTSTR_MODE=disk_template console=ttyS0";
+        assert!(cmdline_contains_token(
+            cmdline_reversed,
+            "KTSTR_MODE=disk_template"
+        ));
         assert!(cmdline_contains_token(cmdline_reversed, "KTSTR_MODE=shell"));
     }
 
@@ -1854,7 +1860,10 @@ mod tests {
         // Matching is whole-token, not prefix. A future kernel
         // cmdline that introduces e.g. `KTSTR_MODE=shell_extended`
         // must not accidentally trip the shell-mode dispatch.
-        assert!(cmdline_contains_token("KTSTR_MODE=shell", "KTSTR_MODE=shell"));
+        assert!(cmdline_contains_token(
+            "KTSTR_MODE=shell",
+            "KTSTR_MODE=shell"
+        ));
         assert!(!cmdline_contains_token(
             "KTSTR_MODE=shell_extended",
             "KTSTR_MODE=shell"

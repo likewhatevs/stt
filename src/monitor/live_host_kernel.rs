@@ -64,7 +64,7 @@ use anyhow::{Context, Result, anyhow};
 /// the dump.
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // wired from the debug capture binary; the
-                    // freeze-VM pipeline doesn't use this struct.
+// freeze-VM pipeline doesn't use this struct.
 pub struct LiveHostKernelEnv {
     /// Output of `uname -r` — the running kernel's release string
     /// (e.g. "6.16.0-1234-generic"). Used to interpolate paths
@@ -98,8 +98,9 @@ impl LiveHostKernelEnv {
     #[allow(dead_code)]
     pub fn discover() -> Result<Self> {
         let release = uname_release().context("uname(2) failed")?;
-        let btf_path = locate_btf(&release)
-            .ok_or_else(|| anyhow!("no BTF found (looked in /sys/kernel/btf/vmlinux and ELF paths)"))?;
+        let btf_path = locate_btf(&release).ok_or_else(|| {
+            anyhow!("no BTF found (looked in /sys/kernel/btf/vmlinux and ELF paths)")
+        })?;
         let vmlinux_elf_path = locate_vmlinux_elf(&release);
         Ok(Self {
             release,
@@ -221,8 +222,8 @@ impl KallsymsTable {
     /// `/proc/kallsyms`.
     #[allow(dead_code)]
     pub fn load_from_path(path: &Path) -> Result<Self> {
-        let raw = std::fs::read_to_string(path)
-            .with_context(|| format!("read {}", path.display()))?;
+        let raw =
+            std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
         Ok(Self::parse(&raw))
     }
 
@@ -319,7 +320,10 @@ ffffffff8000abcd D ext_sched_class
 ";
         let table = KallsymsTable::parse(raw);
         assert_eq!(table.resolve("_stext"), Some(0xffffffff80100000));
-        assert_eq!(table.resolve("scx_disable_workfn"), Some(0xffffffff80101234));
+        assert_eq!(
+            table.resolve("scx_disable_workfn"),
+            Some(0xffffffff80101234)
+        );
         assert_eq!(
             table.resolve("local_static_function"),
             Some(0xffffffff80105678)

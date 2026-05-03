@@ -1333,11 +1333,23 @@ mod tests {
 
     #[test]
     fn check_constructors() {
-        assert!(matches!(MetricCheck::min("x", 1.0), MetricCheck::Min { .. }));
-        assert!(matches!(MetricCheck::max("x", 1.0), MetricCheck::Max { .. }));
-        assert!(matches!(MetricCheck::range("x", 1.0, 2.0), MetricCheck::Range { .. }));
+        assert!(matches!(
+            MetricCheck::min("x", 1.0),
+            MetricCheck::Min { .. }
+        ));
+        assert!(matches!(
+            MetricCheck::max("x", 1.0),
+            MetricCheck::Max { .. }
+        ));
+        assert!(matches!(
+            MetricCheck::range("x", 1.0, 2.0),
+            MetricCheck::Range { .. }
+        ));
         assert!(matches!(MetricCheck::exists("x"), MetricCheck::Exists("x")));
-        assert!(matches!(MetricCheck::exit_code_eq(0), MetricCheck::ExitCodeEq(0)));
+        assert!(matches!(
+            MetricCheck::exit_code_eq(0),
+            MetricCheck::ExitCodeEq(0)
+        ));
     }
 
     #[test]

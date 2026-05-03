@@ -1080,9 +1080,7 @@ fn flatten_for_spawn(resolved: ResolvedAffinity) -> AffinityIntent {
                 AffinityIntent::Exact(set)
             }
         }
-        ResolvedAffinity::SingleCpu(cpu) => {
-            AffinityIntent::Exact([cpu].into_iter().collect())
-        }
+        ResolvedAffinity::SingleCpu(cpu) => AffinityIntent::Exact([cpu].into_iter().collect()),
         ResolvedAffinity::Random { from, count } => {
             // Round-trip the resolved pool through
             // [`AffinityIntent::RandomSubset`] so per-worker

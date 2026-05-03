@@ -30,10 +30,7 @@ pub fn custom_cgroup_affinity_change(ctx: &Ctx) -> Result<AssertResult> {
     // Sample size is half the topology (clamped to at least 1).
     let pool = ctx.topo.all_cpuset();
     let count = (pool.len() / 2).max(1);
-    let intent = AffinityIntent::RandomSubset {
-        from: pool,
-        count,
-    };
+    let intent = AffinityIntent::RandomSubset { from: pool, count };
 
     for _ in 0..4 {
         steps.push(Step::new(

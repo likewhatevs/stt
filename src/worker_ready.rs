@@ -230,14 +230,8 @@ mod tests {
     /// pid formatting would surface here.
     #[test]
     fn worker_ready_marker_path_decimal_pid_suffix() {
-        assert_eq!(
-            worker_ready_marker_path(0),
-            "/tmp/ktstr-worker-ready-0",
-        );
-        assert_eq!(
-            worker_ready_marker_path(1),
-            "/tmp/ktstr-worker-ready-1",
-        );
+        assert_eq!(worker_ready_marker_path(0), "/tmp/ktstr-worker-ready-0",);
+        assert_eq!(worker_ready_marker_path(1), "/tmp/ktstr-worker-ready-1",);
         assert_eq!(
             worker_ready_marker_path(12345),
             "/tmp/ktstr-worker-ready-12345",
@@ -271,10 +265,7 @@ mod tests {
     /// failure, not as a poll timeout.
     #[test]
     fn worker_ready_marker_prefix_literal() {
-        assert_eq!(
-            WORKER_READY_MARKER_PREFIX,
-            "/tmp/ktstr-worker-ready-",
-        );
+        assert_eq!(WORKER_READY_MARKER_PREFIX, "/tmp/ktstr-worker-ready-",);
     }
 
     /// Pin the literal env-var name. The worker reads this env var
@@ -298,9 +289,6 @@ mod tests {
     #[test]
     fn worker_log_prefix_literals() {
         assert_eq!(WORKER_STDERR_PREFIX, "jemalloc-alloc-worker:");
-        assert_eq!(
-            WORKER_STDOUT_READY_PREFIX,
-            "jemalloc-alloc-worker ready",
-        );
+        assert_eq!(WORKER_STDOUT_READY_PREFIX, "jemalloc-alloc-worker ready",);
     }
 }

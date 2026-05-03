@@ -580,10 +580,6 @@ mod tests {
             )
         };
         const { assert!(VIRTIO_BLK_MMIO_BASE < DRAM_START) };
-        const {
-            assert!(
-                VIRTIO_BLK_MMIO_BASE + crate::vmm::virtio_blk::VIRTIO_MMIO_SIZE <= DRAM_START
-            )
-        };
+        const { assert!(VIRTIO_BLK_MMIO_BASE + crate::vmm::virtio_blk::VIRTIO_MMIO_SIZE <= DRAM_START) };
     }
 }
