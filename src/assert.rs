@@ -175,6 +175,20 @@ pub enum DetailKind {
     /// gate matches on `kind == SchedulerDied` rather than
     /// scanning message text.
     SchedulerDied,
+    /// SCX event-counter threshold failure. An error-class
+    /// `SCX_EV_*` counter (e.g. `enq_skip_exiting`,
+    /// `enq_skip_migration_disabled`, `dispatch_offline`) crossed
+    /// the configured bound. Distinct from
+    /// [`DetailKind::SchedulerDied`] (process-liveness) and
+    /// [`DetailKind::Monitor`] (imbalance / DSQ-depth /
+    /// rq_clock-stall): this kind flags individual event-counter
+    /// regressions surfaced by [`assert_scx_events_clean`]. The
+    /// counters themselves originate in the kernel's per-task
+    /// `scx_event_stats` (see `kernel/sched/ext.c` —
+    /// `SCX_EV_*` macros); ktstr reads aggregated deltas via
+    /// `monitor::ScxEventDeltas` and presents them to the
+    /// assertion as `(name, count)` pairs.
+    SchedulerEvent,
     /// Skip notification (scenario could not run under this topology/flags).
     Skip,
     /// Informational annotation that does NOT contribute to the
@@ -3321,6 +3335,292 @@ pub fn assert_benchmarks(
                     format!(
                         "worker {} iteration rate {rate:.1}/s below floor {rate_floor:.1}/s",
                         w.tid
+                    ),
+                ));
+            }
+        }
+    }
+
+    r
+}
+
+/// Assert that every SCX event counter in `events` is at or below
+/// `max_count`. `events` is a slice of `(name, count)` pairs sourced
+/// from the kernel's per-task `scx_event_stats` (see `kernel/sched/ext.c`,
+/// `SCX_EV_*` macros) — typically aggregated and surfaced via
+/// `monitor::ScxEventDeltas` or sidecar `GauntletRow.fallback_count` /
+/// `keep_last_count` fields. Pass `None` for `max_count` to require zero
+/// (the strict default — error-class events should not fire under a
+/// healthy scheduler).
+///
+/// The assertion is decoupled from the `monitor` module on purpose:
+/// callers harvest the counters they care about (via the live monitor
+/// path or by reading sidecar JSON post-hoc) and feed name/count
+/// pairs in. This keeps the assert API surface decoupled from the
+/// kernel-side counter inventory, which evolves across kernel
+/// versions — adding a new `SCX_EV_*` does not force an API change
+/// here.
+///
+/// Returns a passing result if every counter is within bound; failures
+/// concatenate one [`AssertDetail`] per offending counter under
+/// [`DetailKind::SchedulerEvent`] so an operator can identify which
+/// events fired without scanning the full counter set.
+///
+/// ```
+/// # use ktstr::assert::assert_scx_events_clean;
+/// // Strict default — every counter must be zero.
+/// let r = assert_scx_events_clean(&[("enq_skip_exiting", 0), ("dispatch_offline", 0)], None);
+/// assert!(r.passed);
+///
+/// // A non-zero error-class counter fails.
+/// let r = assert_scx_events_clean(&[("enq_skip_exiting", 7)], None);
+/// assert!(!r.passed);
+///
+/// // Caller-supplied bound tolerates small counts.
+/// let r = assert_scx_events_clean(&[("dispatch_keep_last", 3)], Some(10));
+/// assert!(r.passed);
+/// ```
+pub fn assert_scx_events_clean(events: &[(&str, i64)], max_count: Option<i64>) -> AssertResult {
+    let mut r = AssertResult::pass();
+    let bound = max_count.unwrap_or(0);
+    for (name, count) in events {
+        if *count > bound {
+            r.passed = false;
+            r.details.push(AssertDetail::new(
+                DetailKind::SchedulerEvent,
+                format!(
+                    "scx event `{name}` count {count} exceeds bound {bound}",
+                ),
+            ));
+        }
+    }
+    r
+}
+
+/// Threshold-preset bundle for [`assert_baseline`]. Captures the
+/// guarantees a scheduler-under-test should meet on a healthy run:
+/// wake latency stays within bound, per-iteration compute cost stays
+/// within bound, CPU migrations stay within bound, and every worker
+/// makes some forward progress.
+///
+/// Each `Option` field is independent — `None` skips that check. A
+/// `SchedulerBaseline` with every field `None` is a no-op (the
+/// returned [`AssertResult`] always passes), useful as a starting
+/// point for builder-style composition. Use [`Self::strict`] for the
+/// "every check enabled with sane defaults" preset.
+///
+/// Distinct from [`Assert`]: `Assert` is the merge-tree threshold
+/// config consumed by the worker-side `AssertPlan`; `SchedulerBaseline`
+/// is a flat preset designed for direct invocation in test bodies
+/// where the test author wants a one-call multi-field check without
+/// engaging the merge chain. The two surfaces compose — a test can
+/// run `assert_baseline` against a worker-report slice AND merge the
+/// `Assert`-derived result into the same accumulator via
+/// [`AssertResult::merge`].
+#[must_use = "SchedulerBaseline only takes effect when passed to assert_baseline"]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SchedulerBaseline {
+    /// Maximum acceptable p99 wake latency (nanoseconds). Compared
+    /// against the pooled p99 across every worker's
+    /// [`WorkerReport::resume_latencies_ns`]. `None` skips the check.
+    /// Same units / semantics as [`Assert::max_p99_wake_latency_ns`].
+    pub max_p99_wake_latency_ns: Option<u64>,
+    /// Maximum acceptable p99 per-iteration compute cost (nanoseconds).
+    /// Compared against the pooled p99 across every worker's
+    /// [`WorkerReport::iteration_costs_ns`]. `None` skips the check.
+    /// Only meaningful for compute work types that populate the
+    /// reservoir (`AluHot`, `SmtSiblingSpin`, `IpcVariance`); blocking
+    /// variants report empty `iteration_costs_ns` and the check is a
+    /// no-op for those.
+    pub max_iteration_cost_p99_ns: Option<u64>,
+    /// Maximum acceptable total CPU migrations across every worker.
+    /// Compared against the sum of [`WorkerReport::migration_count`].
+    /// `None` skips the check. Distinct from
+    /// [`Assert::max_migration_ratio`] (migrations per iteration) —
+    /// this is an absolute count, useful when the test pins a known
+    /// workload size and migrations should stay below a fixed ceiling
+    /// regardless of how many iterations completed.
+    pub max_migrations: Option<u64>,
+    /// Minimum acceptable per-worker work_units. Every worker must
+    /// have completed at least this many work units; one starved
+    /// worker fails the check. `None` skips. Distinct from
+    /// [`assert_not_starved`]'s zero-work-units check, which gates
+    /// only against literal zero — this gate accepts a non-zero
+    /// floor so a test can reject "barely made progress" runs that
+    /// pass the strict starvation gate.
+    pub min_work_units: Option<u64>,
+}
+
+impl SchedulerBaseline {
+    /// Identity baseline — every field `None`, so [`assert_baseline`]
+    /// returns a passing result with no checks performed. Useful as a
+    /// starting point for builder-style composition.
+    pub const EMPTY: SchedulerBaseline = SchedulerBaseline {
+        max_p99_wake_latency_ns: None,
+        max_iteration_cost_p99_ns: None,
+        max_migrations: None,
+        min_work_units: None,
+    };
+
+    /// Sane-default preset: p99 wake latency under 10ms, p99
+    /// iteration cost under 1ms, total migrations under 1000, every
+    /// worker completes ≥1 work unit. The defaults are deliberately
+    /// loose — a baseline tight enough to catch egregious regressions
+    /// without flagging every routine scheduler perturbation. Tests
+    /// that need tighter bounds should set the fields explicitly via
+    /// the `with_*` builder methods rather than tuning these constants.
+    pub const fn strict() -> Self {
+        Self {
+            max_p99_wake_latency_ns: Some(10_000_000),
+            max_iteration_cost_p99_ns: Some(1_000_000),
+            max_migrations: Some(1000),
+            min_work_units: Some(1),
+        }
+    }
+
+    /// Builder setter for [`Self::max_p99_wake_latency_ns`].
+    pub const fn with_max_p99_wake_latency_ns(mut self, v: u64) -> Self {
+        self.max_p99_wake_latency_ns = Some(v);
+        self
+    }
+
+    /// Builder setter for [`Self::max_iteration_cost_p99_ns`].
+    pub const fn with_max_iteration_cost_p99_ns(mut self, v: u64) -> Self {
+        self.max_iteration_cost_p99_ns = Some(v);
+        self
+    }
+
+    /// Builder setter for [`Self::max_migrations`].
+    pub const fn with_max_migrations(mut self, v: u64) -> Self {
+        self.max_migrations = Some(v);
+        self
+    }
+
+    /// Builder setter for [`Self::min_work_units`].
+    pub const fn with_min_work_units(mut self, v: u64) -> Self {
+        self.min_work_units = Some(v);
+        self
+    }
+}
+
+/// Run every check in `baseline` against `reports`, merging results
+/// into a single [`AssertResult`]. A `None` field on the baseline
+/// skips that check; an empty baseline returns a passing result
+/// without inspecting `reports`.
+///
+/// Field-to-check mapping:
+/// - `max_p99_wake_latency_ns` -> pooled p99 across every worker's
+///   `resume_latencies_ns`; tagged [`DetailKind::Benchmark`].
+/// - `max_iteration_cost_p99_ns` -> pooled p99 across every worker's
+///   `iteration_costs_ns`; tagged [`DetailKind::Benchmark`].
+/// - `max_migrations` -> sum of `migration_count` across workers;
+///   tagged [`DetailKind::Migration`].
+/// - `min_work_units` -> per-worker `work_units >= floor`; tagged
+///   [`DetailKind::Starved`] when a worker is below the floor.
+///
+/// The wake-latency check delegates to [`assert_benchmarks`] for the
+/// percentile path so the same nearest-rank algorithm applies; the
+/// iteration-cost check uses an inline percentile call against the
+/// pooled `iteration_costs_ns` reservoir.
+///
+/// ```
+/// # use ktstr::assert::{SchedulerBaseline, assert_baseline};
+/// # use ktstr::workload::WorkerReport;
+/// # let report = WorkerReport {
+/// #     tid: 1, cpus_used: [0].into_iter().collect(),
+/// #     work_units: 1000, cpu_time_ns: 2_500_000_000,
+/// #     wall_time_ns: 5_000_000_000, off_cpu_ns: 2_500_000_000,
+/// #     migration_count: 5, migrations: vec![],
+/// #     max_gap_ms: 50, max_gap_cpu: 0, max_gap_at_ms: 1000,
+/// #     resume_latencies_ns: vec![100, 200, 300, 400, 500],
+/// #     wake_sample_total: 5,
+/// #     iteration_costs_ns: vec![1000, 2000, 3000, 4000, 5000],
+/// #     iteration_cost_sample_total: 5,
+/// #     iterations: 1000,
+/// #     schedstat_run_delay_ns: 0, schedstat_run_count: 0,
+/// #     schedstat_cpu_time_ns: 0,
+/// #     completed: true,
+/// #     numa_pages: std::collections::BTreeMap::new(),
+/// #     vmstat_numa_pages_migrated: 0,
+/// #     exit_info: None,
+/// #     is_messenger: false,
+/// #     group_idx: 0,
+/// # };
+/// // Strict preset on a healthy run — passes.
+/// let r = assert_baseline(&[report], &SchedulerBaseline::strict());
+/// assert!(r.passed);
+/// ```
+pub fn assert_baseline(
+    reports: &[WorkerReport],
+    baseline: &SchedulerBaseline,
+) -> AssertResult {
+    let mut r = AssertResult::pass();
+
+    // Wake-latency p99: reuse the existing `assert_benchmarks` path
+    // so the percentile algorithm and skip-on-empty semantics stay
+    // unified.
+    if baseline.max_p99_wake_latency_ns.is_some() {
+        r.merge(assert_benchmarks(
+            reports,
+            baseline.max_p99_wake_latency_ns,
+            None,
+            None,
+        ));
+    }
+
+    // Iteration-cost p99: pooled across every worker's reservoir.
+    // Skipped when no samples are present — compute work types that
+    // populate `iteration_costs_ns` are sparse, so an empty pooled
+    // set is the common case for blocking variants and not a failure.
+    if let Some(cost_limit) = baseline.max_iteration_cost_p99_ns {
+        let all_costs: Vec<u64> = reports
+            .iter()
+            .flat_map(|w| w.iteration_costs_ns.iter().copied())
+            .collect();
+        if !all_costs.is_empty() {
+            let mut sorted = all_costs.clone();
+            sorted.sort_unstable();
+            let p99 = percentile(&sorted, 0.99);
+            if p99 > cost_limit {
+                r.passed = false;
+                r.details.push(AssertDetail::new(
+                    DetailKind::Benchmark,
+                    format!(
+                        "p99 iteration cost {p99}ns exceeds limit {cost_limit}ns ({} samples)",
+                        sorted.len(),
+                    ),
+                ));
+            }
+        }
+    }
+
+    // Total migrations across all workers: absolute-count gate
+    // (distinct from migration_ratio which is a per-iteration rate).
+    if let Some(max_mig) = baseline.max_migrations {
+        let total_mig: u64 = reports.iter().map(|w| w.migration_count).sum();
+        if total_mig > max_mig {
+            r.passed = false;
+            r.details.push(AssertDetail::new(
+                DetailKind::Migration,
+                format!(
+                    "total migrations {total_mig} exceeds limit {max_mig} ({} workers)",
+                    reports.len(),
+                ),
+            ));
+        }
+    }
+
+    // Per-worker work_units floor: every worker must have completed
+    // at least `min` work units. One starved worker fails the check.
+    if let Some(min_units) = baseline.min_work_units {
+        for w in reports {
+            if w.work_units < min_units {
+                r.passed = false;
+                r.details.push(AssertDetail::new(
+                    DetailKind::Starved,
+                    format!(
+                        "tid {} work_units {} below floor {min_units}",
+                        w.tid, w.work_units,
                     ),
                 ));
             }
