@@ -1057,14 +1057,14 @@ mod tests {
             let num_gp = (entry.eax >> 8) & 0xff;
             let gp_width = (entry.eax >> 16) & 0xff;
             let mask_len = (entry.eax >> 24) & 0xff;
-            assert_eq!(version, 2, "PMU v2 version must be 2");
-            assert_eq!(num_gp, 4, "PMU v2 GP counter count");
-            assert_eq!(gp_width, 48, "PMU v2 GP counter width");
+            assert_eq!(version, PMU_ARCH_PERFMON_VERSION, "PMU v2 version");
+            assert_eq!(num_gp, PMU_NUM_GP_COUNTERS, "PMU v2 GP counter count");
+            assert_eq!(gp_width, PMU_GP_COUNTER_WIDTH, "PMU v2 GP counter width");
             // mask_length must be >= ARCH_PERFMON_EVENTS_COUNT (7) or
             // intel_pmu_init in arch/x86/events/intel/core.c returns -ENODEV.
             assert_eq!(
-                mask_len, 7,
-                "mask_length must be exactly 7 (ARCH_PERFMON_EVENTS_COUNT)"
+                mask_len, PMU_EVENT_MASK_LENGTH,
+                "mask_length must equal ARCH_PERFMON_EVENTS_COUNT"
             );
 
             // EBX = unsupported-event bitmap; 0 means all 7 arch events available.
@@ -1074,10 +1074,261 @@ mod tests {
             // EDX: union cpuid10_edx — num_counters_fixed[4:0], bit_width_fixed[12:5].
             let num_fixed = entry.edx & 0x1f;
             let fixed_width = (entry.edx >> 5) & 0xff;
-            assert_eq!(num_fixed, 3, "PMU v2 fixed counter count");
-            assert_eq!(fixed_width, 48, "PMU v2 fixed counter width");
+            assert_eq!(num_fixed, PMU_NUM_FIXED_COUNTERS, "PMU v2 fixed counter count");
+            assert_eq!(
+                fixed_width, PMU_FIXED_COUNTER_WIDTH,
+                "PMU v2 fixed counter width"
+            );
             assert_eq!(entry.edx & !0x1fff, 0, "EDX bits[31:13] must be zero for PMU v2");
         }
+    }
+
+    /// Synthetic-base test: build a base CPUID with leaf 0xA absent and
+    /// verify generate_cpuid leaves the result without leaf 0xA. This is
+    /// the host-absent-leaf scenario — KVM may omit leaf 0xA entirely
+    /// (rather than zeroing it) on hosts where intel_pmu_refresh decides
+    /// no PMU is available. The handler in generate_cpuid only fires
+    /// when the leaf is present in entries; if it isn't, the result
+    /// must also lack the leaf (no fabrication).
+    #[test]
+    fn leaf_0xa_absent_from_base_stays_absent() {
+        let base = vec![kvm_cpuid_entry2 {
+            function: 0,
+            index: 0,
+            flags: 0,
+            eax: 0,
+            ebx: 0x756e_6547,
+            edx: 0x4965_6e69,
+            ecx: 0x6c65_746e,
+            ..Default::default()
+        }];
+        let topo = Topology {
+            llcs: 1,
+            cores_per_llc: 1,
+            threads_per_core: 1,
+            numa_nodes: 1,
+            nodes: None,
+            distances: None,
+        };
+        let cpuid = generate_cpuid(&base, &topo, 0, false);
+        assert!(
+            cpuid.iter().all(|e| e.function != 0xa),
+            "leaf 0xA must not be fabricated when absent from base"
+        );
+    }
+
+    /// Synthetic-base test: a base entry with version=0 (the kvm.enable_pmu=0
+    /// signal) must remain zero. Overwriting it would lie to the guest
+    /// about PMU availability while intel_pmu_refresh clamps every counter
+    /// back to 0.
+    #[test]
+    fn leaf_0xa_zero_version_preserved() {
+        let base = vec![
+            kvm_cpuid_entry2 {
+                function: 0,
+                index: 0,
+                flags: 0,
+                eax: 0,
+                ebx: 0x756e_6547,
+                edx: 0x4965_6e69,
+                ecx: 0x6c65_746e,
+                ..Default::default()
+            },
+            // Leaf 0xA with EAX[7:0]=0 — host PMU is disabled.
+            kvm_cpuid_entry2 {
+                function: 0xa,
+                index: 0,
+                flags: 0,
+                eax: 0,
+                ebx: 0,
+                ecx: 0,
+                edx: 0,
+                ..Default::default()
+            },
+        ];
+        let topo = Topology {
+            llcs: 1,
+            cores_per_llc: 1,
+            threads_per_core: 1,
+            numa_nodes: 1,
+            nodes: None,
+            distances: None,
+        };
+        let cpuid = generate_cpuid(&base, &topo, 0, false);
+        let leaf_a = cpuid
+            .iter()
+            .find(|e| e.function == 0xa)
+            .expect("leaf 0xA preserved from base");
+        assert_eq!(leaf_a.eax, 0, "EAX must stay zero (host PMU disabled)");
+        assert_eq!(leaf_a.ebx, 0, "EBX must stay zero");
+        assert_eq!(leaf_a.ecx, 0, "ECX must stay zero");
+        assert_eq!(leaf_a.edx, 0, "EDX must stay zero");
+    }
+
+    /// Synthetic-base test: a base entry with non-zero version is
+    /// overwritten with the synthesized PMU v2 surface using the
+    /// named consts at the top of the file. This covers vendor-agnostic
+    /// behavior — the leaf-0xA handler is unconditional on vendor.
+    #[test]
+    fn leaf_0xa_nonzero_version_synthesized_to_v2() {
+        let base = vec![
+            kvm_cpuid_entry2 {
+                function: 0,
+                index: 0,
+                flags: 0,
+                eax: 0,
+                ebx: 0x756e_6547,
+                edx: 0x4965_6e69,
+                ecx: 0x6c65_746e,
+                ..Default::default()
+            },
+            // Synthetic host PMU: version=5, 8 GP counters, 56-bit width,
+            // mask_length=10. Our synthesizer must overwrite all four
+            // registers to the conservative v2 surface.
+            kvm_cpuid_entry2 {
+                function: 0xa,
+                index: 0,
+                flags: 0,
+                eax: 5 | (8 << 8) | (56 << 16) | (10 << 24),
+                ebx: 0xdead_beef,
+                ecx: 0xcafe_f00d,
+                edx: 0xface_d00d,
+                ..Default::default()
+            },
+        ];
+        let topo = Topology {
+            llcs: 1,
+            cores_per_llc: 1,
+            threads_per_core: 1,
+            numa_nodes: 1,
+            nodes: None,
+            distances: None,
+        };
+        let cpuid = generate_cpuid(&base, &topo, 0, false);
+        let leaf_a = cpuid
+            .iter()
+            .find(|e| e.function == 0xa)
+            .expect("leaf 0xA present from base");
+        let expected_eax = PMU_ARCH_PERFMON_VERSION
+            | (PMU_NUM_GP_COUNTERS << 8)
+            | (PMU_GP_COUNTER_WIDTH << 16)
+            | (PMU_EVENT_MASK_LENGTH << 24);
+        let expected_edx = PMU_NUM_FIXED_COUNTERS | (PMU_FIXED_COUNTER_WIDTH << 5);
+        assert_eq!(leaf_a.eax, expected_eax, "EAX synthesized to PMU v2");
+        assert_eq!(leaf_a.ebx, 0, "EBX cleared (no events disabled)");
+        assert_eq!(leaf_a.ecx, 0, "ECX cleared (reserved)");
+        assert_eq!(leaf_a.edx, expected_edx, "EDX synthesized to PMU v2");
+    }
+
+    /// Synthetic-base test: AMD vendor + non-zero leaf 0xA must follow
+    /// the same synthesis path as Intel. AMD CPUs ignore leaf 0xA at
+    /// runtime (they use MSR-based counters) but the leaf is still
+    /// present in CPUID enumeration and KVM may populate it. Our
+    /// vendor-agnostic handler must not introduce vendor divergence.
+    #[test]
+    fn leaf_0xa_amd_vendor_same_synthesis() {
+        let base = vec![
+            kvm_cpuid_entry2 {
+                function: 0,
+                index: 0,
+                flags: 0,
+                eax: 0,
+                ebx: 0x6874_7541, // "Auth"
+                edx: 0x6974_6e65, // "enti"
+                ecx: 0x444d_4163, // "cAMD"
+                ..Default::default()
+            },
+            kvm_cpuid_entry2 {
+                function: 0xa,
+                index: 0,
+                flags: 0,
+                eax: 1 | (2 << 8) | (32 << 16) | (4 << 24),
+                ebx: 0x1111_1111,
+                ecx: 0x2222_2222,
+                edx: 0x3333_3333,
+                ..Default::default()
+            },
+        ];
+        let topo = Topology {
+            llcs: 1,
+            cores_per_llc: 1,
+            threads_per_core: 1,
+            numa_nodes: 1,
+            nodes: None,
+            distances: None,
+        };
+        let cpuid = generate_cpuid(&base, &topo, 0, false);
+        let leaf_a = cpuid
+            .iter()
+            .find(|e| e.function == 0xa)
+            .expect("leaf 0xA present from base");
+        let expected_eax = PMU_ARCH_PERFMON_VERSION
+            | (PMU_NUM_GP_COUNTERS << 8)
+            | (PMU_GP_COUNTER_WIDTH << 16)
+            | (PMU_EVENT_MASK_LENGTH << 24);
+        let expected_edx = PMU_NUM_FIXED_COUNTERS | (PMU_FIXED_COUNTER_WIDTH << 5);
+        assert_eq!(leaf_a.eax, expected_eax, "AMD synthesized identically to Intel");
+        assert_eq!(leaf_a.ebx, 0, "EBX cleared on AMD");
+        assert_eq!(leaf_a.ecx, 0, "ECX cleared on AMD");
+        assert_eq!(leaf_a.edx, expected_edx, "AMD synthesized identically to Intel");
+    }
+
+    /// Synthetic-base test: when the base hypervisor max-leaf
+    /// (0x40000000.EAX) is already higher than 0x40000001 (e.g.
+    /// 0x40000010 from a host that exposes more KVM hypervisor leaves),
+    /// performance_mode must NOT lower it — we use .max() to bump but
+    /// preserve a higher existing value.
+    #[test]
+    fn max_hypervisor_leaf_not_lowered_in_performance_mode() {
+        let base = vec![
+            kvm_cpuid_entry2 {
+                function: 0,
+                index: 0,
+                flags: 0,
+                eax: 0,
+                ebx: 0x756e_6547,
+                edx: 0x4965_6e69,
+                ecx: 0x6c65_746e,
+                ..Default::default()
+            },
+            kvm_cpuid_entry2 {
+                function: 0x4000_0000,
+                index: 0,
+                flags: 0,
+                eax: 0x4000_0010, // already higher than 0x40000001
+                ebx: 0,
+                ecx: 0,
+                edx: 0,
+                ..Default::default()
+            },
+            kvm_cpuid_entry2 {
+                function: 0x4000_0001,
+                index: 0,
+                flags: 0,
+                eax: 0,
+                ebx: 0,
+                ecx: 0,
+                edx: 0,
+                ..Default::default()
+            },
+        ];
+        let topo = Topology {
+            llcs: 1,
+            cores_per_llc: 1,
+            threads_per_core: 1,
+            numa_nodes: 1,
+            nodes: None,
+            distances: None,
+        };
+        let cpuid = generate_cpuid(&base, &topo, 0, true);
+        let leaf40 = cpuid
+            .iter()
+            .find(|e| e.function == 0x4000_0000)
+            .expect("leaf 0x40000000 present");
+        assert_eq!(
+            leaf40.eax, 0x4000_0010,
+            "max hypervisor leaf must not regress when already > 0x40000001"
+        );
     }
 
     #[test]
