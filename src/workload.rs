@@ -2849,6 +2849,44 @@ pub struct WorkloadConfig {
     /// Reports carry [`WorkerReport::group_idx`] = 0 for the primary
     /// group and 1..=N for composed entries in declaration order.
     ///
+    /// # Worked example
+    ///
+    /// Build a multi-group workload — primary `SpinWait(2)` plus
+    /// one `PipeIo(2)` composed group plus one `YieldHeavy(1)`
+    /// composed group — using either the replacing
+    /// [`composed`](Self::composed) setter or the appending
+    /// [`with_composed`](Self::with_composed) chain:
+    ///
+    /// ```
+    /// use ktstr::workload::{WorkSpec, WorkType, WorkloadConfig};
+    ///
+    /// // Append style: each call adds one group to the existing list.
+    /// let cfg = WorkloadConfig::default()
+    ///     .work_type(WorkType::SpinWait)
+    ///     .workers(2)
+    ///     .with_composed(
+    ///         WorkSpec::default()
+    ///             .work_type(WorkType::pipe_io(64))
+    ///             .workers(2),
+    ///     )
+    ///     .with_composed(
+    ///         WorkSpec::default()
+    ///             .work_type(WorkType::YieldHeavy)
+    ///             .workers(1),
+    ///     );
+    /// assert_eq!(cfg.composed.len(), 2);
+    ///
+    /// // Replace style: one call passes every composed group at once.
+    /// let cfg2 = WorkloadConfig::default()
+    ///     .work_type(WorkType::SpinWait)
+    ///     .workers(2)
+    ///     .composed([
+    ///         WorkSpec::default().work_type(WorkType::pipe_io(64)).workers(2),
+    ///         WorkSpec::default().work_type(WorkType::YieldHeavy).workers(1),
+    ///     ]);
+    /// assert_eq!(cfg2.composed.len(), 2);
+    /// ```
+    ///
     /// # Resolution rules at spawn time
     ///
     /// Composed [`WorkSpec`] entries must specify
@@ -2867,6 +2905,11 @@ pub struct WorkloadConfig {
     /// has no access to the
     /// [`crate::topology::TestTopology`] / cpuset state that the
     /// scenario engine threads in.
+    ///
+    /// Composed entries inherit the parent
+    /// [`WorkloadConfig::clone_mode`] — the dispatch path
+    /// (fork vs thread) is a workload-wide property, so
+    /// [`WorkSpec`] carries no `clone_mode` field of its own.
     ///
     /// Composition is single-level — a [`WorkSpec`] inside
     /// `composed` has no `composed` field of its own.
@@ -2946,12 +2989,17 @@ impl WorkloadConfig {
         self
     }
 
-    /// Replace the composed worker groups.
+    /// Replace the composed worker groups (replacing setter).
     ///
-    /// Pass an iterator of [`WorkSpec`] entries; each will be
-    /// spawned as an independent group alongside the primary
-    /// described by the top-level fields. Pass an empty iterator
-    /// to clear any previously-set composed groups.
+    /// Pass an iterator of [`WorkSpec`] entries; the existing
+    /// `composed` vec is REPLACED with the supplied entries. Each
+    /// will be spawned as an independent group alongside the
+    /// primary described by the top-level fields. Pass an empty
+    /// iterator to clear any previously-set composed groups.
+    ///
+    /// Use this when you have all groups in hand at once. To add
+    /// one group at a time to an existing list, use the appending
+    /// [`with_composed`](Self::with_composed) instead.
     ///
     /// See [`Self::composed`] for the resolution rules applied to
     /// each entry's `num_workers` / `affinity` fields at spawn time.
@@ -2960,9 +3008,18 @@ impl WorkloadConfig {
         self
     }
 
-    /// Append a single composed worker group to the existing list.
+    /// Append a single composed worker group to the existing list
+    /// (appending setter).
     ///
-    /// Convenience for chained construction: `cfg.with_composed(a).with_composed(b)`.
+    /// The supplied [`WorkSpec`] is PUSHED onto the existing
+    /// `composed` vec; previously-set groups are preserved.
+    /// Convenience for chained construction:
+    /// `cfg.with_composed(a).with_composed(b)` produces
+    /// `composed: [a, b]`.
+    ///
+    /// Use this when building the group list incrementally. To
+    /// replace the entire list in one call, use the replacing
+    /// [`composed`](Self::composed) instead.
     pub fn with_composed(mut self, spec: WorkSpec) -> Self {
         self.composed.push(spec);
         self
@@ -3009,9 +3066,6 @@ pub struct WorkSpec {
     /// for range, default-zero skip semantics, and `CAP_SYS_NICE`
     /// rules.
     pub nice: i32,
-    /// Clone mode for spawning each worker. See [`CloneMode`] for
-    /// the variant menu and dispatch status.
-    pub clone_mode: CloneMode,
 }
 
 impl Default for WorkSpec {
@@ -3024,7 +3078,6 @@ impl Default for WorkSpec {
             mem_policy: MemPolicy::Default,
             mpol_flags: MpolFlags::NONE,
             nice: 0,
-            clone_mode: CloneMode::Fork,
         }
     }
 }
@@ -3072,12 +3125,6 @@ impl WorkSpec {
     /// parent's nice. Negative values require `CAP_SYS_NICE`.
     pub fn nice(mut self, n: i32) -> Self {
         self.nice = n;
-        self
-    }
-
-    /// Set the clone mode used when spawning each worker.
-    pub fn clone_mode(mut self, m: CloneMode) -> Self {
-        self.clone_mode = m;
         self
     }
 }
@@ -3550,8 +3597,15 @@ pub struct WorkloadHandle {
     started: bool,
     /// Shared mmap regions for futex-based work types (one per worker group). Unmapped on drop.
     futex_ptrs: Vec<*mut u32>,
-    /// Size of each futex mmap region (4 for FutexPingPong/FutexFanOut/MutexContention, 16 for FanOutCompute: u64 generation @ 0 + u64 wake_ns @ 8).
-    futex_region_size: usize,
+    /// Per-region byte length, parallel to `futex_ptrs`. Each
+    /// region was sized at spawn time to its source group's
+    /// natural width (4 for FutexPingPong / FutexFanOut /
+    /// MutexContention / etc., 16 for FanOutCompute, 24 + Q*8 for
+    /// ProducerConsumerImbalance — see [`futex_region_size_for`]).
+    /// `futex_ptrs[i]` and `futex_region_sizes[i]` describe the
+    /// same region; both are consumed pairwise on `Drop` so each
+    /// `munmap` call receives the matching length.
+    futex_region_sizes: Vec<usize>,
     /// MAP_SHARED region of per-worker iteration counters. Workers
     /// atomically store their iteration count; parent reads via
     /// `snapshot_iterations()`. Pointer to the first element; length
@@ -3584,6 +3638,46 @@ pub struct WorkloadHandle {
     /// Thread-mode chain workers don't observe `EBADF` mid-run.
     /// Empty when `work_type` is not `WakeChain { wake: Pipe }`.
     chain_pipes: Vec<Vec<[i32; 2]>>,
+}
+
+/// Per-variant byte length for the MAP_SHARED futex region.
+///
+/// Each WorkType that needs a shared region has a fixed natural
+/// size:
+///
+/// - [`WorkType::FanOutCompute`] needs 16 bytes — futex `u32` at
+///   offset 0, wake-timestamp `u64` at offset 8.
+/// - [`WorkType::ProducerConsumerImbalance`] needs a ring buffer:
+///   head `u64` @ 0, tail `u64` @ 8, producer-wake `u32` @ 16,
+///   consumer-wake `u32` @ 20, then `Q` × `u64` ring slots
+///   starting at offset 24. Total bytes = `24 + Q*8`.
+///   `queue_depth_target` is `u64` to match the variant; an `as
+///   usize` truncation on a 32-bit host could silently produce a
+///   sub-page region with a malformed queue, so the conversion is
+///   clamped at `usize::MAX/8 - 3` to keep the layout
+///   well-defined. Realistic configs use Q in the
+///   hundreds-to-thousands; the clamp only triggers on a
+///   degenerate input that itself fails admission control
+///   elsewhere (the queue is far larger than RAM).
+/// - Everything else: `u32` (4 bytes).
+///
+/// Returning the same byte count for every WorkType variant lets
+/// the caller mmap exactly what's needed for THIS group rather
+/// than the MAX across all groups, so a small-variant group
+/// composed alongside a large `ProducerConsumerImbalance` no
+/// longer pays the large group's per-region overhead.
+fn futex_region_size_for(work_type: &WorkType) -> usize {
+    match work_type {
+        WorkType::FanOutCompute { .. } => 16,
+        WorkType::ProducerConsumerImbalance {
+            queue_depth_target,
+            ..
+        } => {
+            let q = std::cmp::min(*queue_depth_target as usize, usize::MAX / 8 - 3);
+            24 + q * 8
+        }
+        _ => std::mem::size_of::<u32>(),
+    }
 }
 
 /// Scope guard that owns every resource acquired during
@@ -3622,7 +3716,15 @@ struct SpawnGuard {
     chain_pipes: Vec<Vec<[i32; 2]>>,
     /// Shared-memory futex regions (transferred to handle on success).
     futex_ptrs: Vec<*mut u32>,
-    futex_region_size: usize,
+    /// Per-region byte length, parallel to `futex_ptrs`. Each
+    /// region is sized to its source group's natural width
+    /// (4 / 16 / 24+Q*8 — see [`futex_region_size_for`]) and
+    /// recorded here at `spawn_group` time so munmap on Drop
+    /// can call `libc::munmap(ptr, len)` with the matching length
+    /// even when groups with different natural sizes co-exist.
+    /// `futex_ptrs[i]` and `futex_region_sizes[i]` describe the
+    /// same region.
+    futex_region_sizes: Vec<usize>,
     /// Per-worker iteration counter region (transferred on success).
     /// Typed matches the handle field; see `WorkloadHandle::iter_counters`.
     iter_counters: *mut AtomicU64,
@@ -3638,12 +3740,12 @@ struct SpawnGuard {
 }
 
 impl SpawnGuard {
-    fn new(futex_region_size: usize) -> Self {
+    fn new() -> Self {
         Self {
             pipe_pairs: Vec::new(),
             chain_pipes: Vec::new(),
             futex_ptrs: Vec::new(),
-            futex_region_size,
+            futex_region_sizes: Vec::new(),
             iter_counters: std::ptr::null_mut(),
             iter_counter_bytes: 0,
             children: Vec::new(),
@@ -3652,21 +3754,22 @@ impl SpawnGuard {
     }
 
     /// Transfer live resources into a [`WorkloadHandle`]. Leaves the
-    /// guard's `children`, `threads`, `futex_ptrs`, `iter_counters`,
-    /// `pipe_pairs`, and `chain_pipes` empty, so the guard's
-    /// subsequent `Drop` is a no-op on the success path. The handle
-    /// is now the sole owner of every resource — its own `Drop`
-    /// closes the pipe fds AFTER worker shutdown completes, which
-    /// is the ordering Thread mode requires (workers share the
-    /// parent's fd table; closing pre-shutdown would surface as
-    /// `EBADF` on every worker's pipe op). Fork mode is unaffected
-    /// either way: each child holds its own fd-table copy via
-    /// `fork()`, so the parent's close timing is invisible to the
-    /// child.
+    /// guard's `children`, `threads`, `futex_ptrs`,
+    /// `futex_region_sizes`, `iter_counters`, `pipe_pairs`, and
+    /// `chain_pipes` empty, so the guard's subsequent `Drop` is a
+    /// no-op on the success path. The handle is now the sole owner
+    /// of every resource — its own `Drop` closes the pipe fds
+    /// AFTER worker shutdown completes, which is the ordering
+    /// Thread mode requires (workers share the parent's fd table;
+    /// closing pre-shutdown would surface as `EBADF` on every
+    /// worker's pipe op). Fork mode is unaffected either way: each
+    /// child holds its own fd-table copy via `fork()`, so the
+    /// parent's close timing is invisible to the child.
     fn into_handle(mut self) -> WorkloadHandle {
         let children = std::mem::take(&mut self.children);
         let threads = std::mem::take(&mut self.threads);
         let futex_ptrs = std::mem::take(&mut self.futex_ptrs);
+        let futex_region_sizes = std::mem::take(&mut self.futex_region_sizes);
         let iter_counters = std::mem::replace(&mut self.iter_counters, std::ptr::null_mut());
         let iter_counter_bytes = std::mem::replace(&mut self.iter_counter_bytes, 0);
         let iter_counter_len = iter_counter_bytes / std::mem::size_of::<AtomicU64>();
@@ -3677,7 +3780,7 @@ impl SpawnGuard {
             threads,
             started: false,
             futex_ptrs,
-            futex_region_size: self.futex_region_size,
+            futex_region_sizes,
             iter_counters,
             iter_counter_len,
             pipe_pairs,
@@ -3757,10 +3860,15 @@ impl Drop for SpawnGuard {
                 let _ = nix::unistd::close(pipe[1]);
             }
         }
-        // Munmap shared regions.
-        for &ptr in &self.futex_ptrs {
+        // Munmap shared regions. `futex_ptrs[i]` and
+        // `futex_region_sizes[i]` describe the same region, so each
+        // munmap receives the exact length used for the matching
+        // mmap. The two vectors are appended in lockstep inside
+        // `spawn_group`, so they have identical lengths in every
+        // observable state.
+        for (&ptr, &size) in self.futex_ptrs.iter().zip(self.futex_region_sizes.iter()) {
             unsafe {
-                libc::munmap(ptr as *mut libc::c_void, self.futex_region_size);
+                libc::munmap(ptr as *mut libc::c_void, size);
             }
         }
         if !self.iter_counters.is_null() && self.iter_counter_bytes > 0 {
@@ -3862,19 +3970,29 @@ impl SendIterSlotPtr {
     }
 }
 
-/// Per-group view of [`WorkloadConfig`] used by the spawn pipeline.
+/// Per-group resolved view of [`WorkloadConfig`] used by the
+/// spawn pipeline.
 ///
-/// [`WorkloadHandle::spawn`] iterates one `GroupParams` per group it
-/// spawns: the primary group (`group_idx == 0`) carries the
-/// top-level [`WorkloadConfig`] fields, and each composed
-/// [`WorkSpec`] entry is resolved into its own `GroupParams` with
-/// `group_idx == 1..=N`.
+/// [`WorkloadHandle::spawn`] iterates one `GroupParams` per group
+/// it spawns: the primary group (`group_idx == 0`) is built from
+/// the top-level [`WorkloadConfig`] fields via
+/// [`Self::primary`], and each composed [`WorkSpec`] entry is
+/// resolved into its own `GroupParams` (with `group_idx ==
+/// 1..=N`) via [`Self::from_work_spec`].
+///
+/// `GroupParams` is the post-resolution shape — `num_workers` is a
+/// concrete `usize` (not the `Option<usize>` that [`WorkSpec`]
+/// carries), `affinity` is a concrete [`ResolvedAffinity`] (not
+/// the [`AffinityIntent`] that [`WorkSpec`] carries). The spawn
+/// pipeline operates on `GroupParams` exclusively so it never has
+/// to deal with the unresolved intent/optional shapes that the
+/// user-facing types expose.
 ///
 /// `clone_mode` is shared across every group — the top-level
 /// [`WorkloadConfig::clone_mode`] selects fork vs thread dispatch
-/// for the entire workload; composed entries' [`WorkSpec::clone_mode`]
-/// is inspected during resolution and a mismatch is rejected at
-/// spawn time (the [`SpawnGuard`]'s lifecycle assumes a single
+/// for the entire workload, and [`WorkSpec`] carries no
+/// `clone_mode` field of its own (composed entries inherit the
+/// parent's mode; the [`SpawnGuard`]'s lifecycle assumes a single
 /// dispatch path).
 #[derive(Clone)]
 struct GroupParams {
@@ -3889,19 +4007,58 @@ struct GroupParams {
 }
 
 impl GroupParams {
+    /// Extract a [`GroupParams`] from a [`WorkSpec`] given the
+    /// resolved sibling values. This is the single field-extraction
+    /// site — both [`Self::primary`] and [`Self::from_composed`]
+    /// funnel through here, so the field-by-field copy lives in one
+    /// place.
+    ///
+    /// The caller is responsible for resolving the
+    /// [`WorkSpec::num_workers`] `Option<usize>` to a concrete
+    /// `usize` and the [`WorkSpec::affinity`] [`AffinityIntent`] to
+    /// a concrete [`ResolvedAffinity`]. The remaining fields
+    /// (`work_type`, `sched_policy`, `mem_policy`, `mpol_flags`,
+    /// `nice`) are copied verbatim — they need no resolution
+    /// because both [`WorkSpec`] and [`GroupParams`] carry them in
+    /// their final runtime form.
+    fn from_work_spec(
+        spec: &WorkSpec,
+        group_idx: usize,
+        resolved_affinity: ResolvedAffinity,
+        resolved_num_workers: usize,
+    ) -> Self {
+        Self {
+            work_type: spec.work_type.clone(),
+            sched_policy: spec.sched_policy,
+            mem_policy: spec.mem_policy.clone(),
+            mpol_flags: spec.mpol_flags,
+            nice: spec.nice,
+            affinity: resolved_affinity,
+            num_workers: resolved_num_workers,
+            group_idx,
+        }
+    }
+
     /// Build the primary group's parameters from the top-level
     /// [`WorkloadConfig`] fields. `group_idx` is fixed to `0`.
+    ///
+    /// Synthesises a [`WorkSpec`] view of the top-level config
+    /// fields and funnels through [`Self::from_work_spec`] so the
+    /// field-by-field copy lives in exactly one place. The
+    /// synthesised spec mirrors the resolved sibling values
+    /// (`num_workers: Some(n)`, `affinity: Inherit | Exact(...)`)
+    /// — the spawn pipeline never reads it.
     fn primary(config: &WorkloadConfig) -> Self {
-        Self {
+        let spec = WorkSpec {
             work_type: config.work_type.clone(),
             sched_policy: config.sched_policy,
+            num_workers: Some(config.num_workers),
+            affinity: AffinityIntent::Inherit,
             mem_policy: config.mem_policy.clone(),
             mpol_flags: config.mpol_flags,
             nice: config.nice,
-            affinity: config.affinity.clone(),
-            num_workers: config.num_workers,
-            group_idx: 0,
-        }
+        };
+        Self::from_work_spec(&spec, 0, config.affinity.clone(), config.num_workers)
     }
 
     /// Resolve a composed [`WorkSpec`] into per-group parameters,
@@ -3921,14 +4078,11 @@ impl GroupParams {
     ///   [`crate::topology::TestTopology`] / cpuset state that the
     ///   scenario engine threads in.
     ///
-    /// `clone_mode` is verified against the parent
-    /// [`WorkloadConfig::clone_mode`] by the caller; this constructor
-    /// captures only the per-group fields that flow into the worker
-    /// loop.
-    fn from_composed(
-        spec: &WorkSpec,
-        group_idx: usize,
-    ) -> Result<Self> {
+    /// Resolves the optional/intent fields, then funnels through
+    /// [`Self::from_work_spec`] for the actual extraction. Composed
+    /// entries inherit the parent [`WorkloadConfig::clone_mode`];
+    /// [`WorkSpec`] has no `clone_mode` field of its own.
+    fn from_composed(spec: &WorkSpec, group_idx: usize) -> Result<Self> {
         let num_workers = spec.num_workers.ok_or_else(|| {
             anyhow::anyhow!(
                 "composed[{}].num_workers must be set explicitly at spawn time \
@@ -3956,16 +4110,7 @@ impl GroupParams {
                 );
             }
         };
-        Ok(Self {
-            work_type: spec.work_type.clone(),
-            sched_policy: spec.sched_policy,
-            mem_policy: spec.mem_policy.clone(),
-            mpol_flags: spec.mpol_flags,
-            nice: spec.nice,
-            affinity,
-            num_workers,
-            group_idx,
-        })
+        Ok(Self::from_work_spec(spec, group_idx, affinity, num_workers))
     }
 }
 
@@ -4130,29 +4275,18 @@ impl WorkloadHandle {
         // spawn() — topology-aware variants need the scenario
         // engine).
         //
-        // composed[k].clone_mode must match the parent's
+        // Every group inherits the parent
         // [`WorkloadConfig::clone_mode`]: SpawnGuard's lifecycle
         // assumes a single dispatch path (every guard.children
         // entry is a fork-mode child reaped via waitpid; every
         // guard.threads entry is a thread-mode worker joined via
         // JoinHandle). Mixing modes inside one guard would route
-        // teardown through the wrong code path. Reject at the
-        // resolver entry; CloneMode is a workload-wide property.
+        // teardown through the wrong code path, so [`WorkSpec`]
+        // carries no `clone_mode` field — it is a workload-wide
+        // property fixed by [`WorkloadConfig::clone_mode`].
         let mut groups: Vec<GroupParams> = Vec::with_capacity(1 + config.composed.len());
         groups.push(GroupParams::primary(config));
         for (i, spec) in config.composed.iter().enumerate() {
-            if spec.clone_mode != config.clone_mode {
-                anyhow::bail!(
-                    "composed[{}].clone_mode = {:?} disagrees with the \
-                     parent WorkloadConfig.clone_mode = {:?}; clone_mode \
-                     is a workload-wide property — every group within one \
-                     WorkloadHandle must use the same dispatch path \
-                     (fork or thread)",
-                    i,
-                    spec.clone_mode,
-                    config.clone_mode,
-                );
-            }
             groups.push(GroupParams::from_composed(spec, i + 1)?);
         }
 
@@ -4262,74 +4396,28 @@ impl WorkloadHandle {
             }
         }
 
-        // futex_region_size: a single per-guard scalar drives the
-        // SpawnGuard's munmap-on-drop. With multiple groups, each
-        // group's futex region MAY have a different natural size
-        // (FanOutCompute=16, ProducerConsumerImbalance=24+Q*8,
-        // everything else=4). Pick the MAX across all groups so
-        // every futex page in `guard.futex_ptrs` munmaps cleanly
-        // with the same length (the kernel rounds munmap length up
-        // to PAGE_SIZE anyway, so over-allocating to the next
-        // page boundary is free). Each group still mmaps the
-        // same futex_region_size and writes only what its variant
-        // expects — the trailing bytes are unused but kernel-zero-
-        // initialised by MAP_ANONYMOUS, which is the documented
-        // pre-condition for every variant's read sites.
+        // futex region sizing is per-group, not MAX'd across all
+        // groups. Each group's futex region has its own natural
+        // size determined by [`futex_region_size_for`] (FanOutCompute
+        // = 16, ProducerConsumerImbalance = 24 + Q*8, everything
+        // else = 4). Storing the size alongside each pointer in
+        // `SpawnGuard::futex_region_sizes` lets Drop munmap each
+        // region with its own length, so a small-variant group
+        // composed alongside a large ProducerConsumerImbalance group
+        // is no longer inflated to the large size.
         //
-        // Worst-case waste: when groups have heterogeneous
-        // natural sizes — e.g. a single ProducerConsumerImbalance
-        // group with large `queue_depth_target` (size 24 + Q*8,
-        // many KiB) composed alongside one or more 4-byte futex
-        // groups (FutexPingPong/FutexFanOut/MutexContention) —
-        // every small-variant region is inflated to the
-        // ProducerConsumer size. Each over-allocated region
-        // crosses the page boundary that would otherwise have
-        // bounded the small-variant mapping at 4 KiB, so the
-        // waste per small group can exceed one page. Per-group
-        // sizing would eliminate this waste but adds a parallel
-        // `Vec<usize>` to SpawnGuard tracking each region's
-        // length so munmap on Drop receives the right length;
-        // deferred to a follow-up.
-        //
-        // Sizing the per-group MAP_SHARED region:
-        //   - FanOutCompute needs 16 bytes (futex u32 @ 0, wake_ns
-        //     u64 @ 8).
-        //   - ProducerConsumerImbalance needs a ring buffer:
-        //     head u64 @ 0, tail u64 @ 8, producer-wake u32 @ 16,
-        //     consumer-wake u32 @ 20, then Q × u64 ring slots
-        //     starting at offset 24. Total bytes = 24 + Q*8.
-        //     queue_depth_target is u64 to match the variant, but
-        //     `as usize` truncation to a sub-page region would
-        //     silently produce a malformed queue — clamp the
-        //     conversion at usize::MAX/8 - 3 to keep the layout
-        //     well-defined. Realistic configs use Q in the
-        //     hundreds-to-thousands; the clamp only triggers on a
-        //     degenerate input that itself fails admission control
-        //     elsewhere (the queue is far larger than RAM).
-        //   - Everything else: u32 (4 bytes).
-        let futex_region_size = groups
-            .iter()
-            .map(|g| match g.work_type {
-                WorkType::FanOutCompute { .. } => 16,
-                WorkType::ProducerConsumerImbalance {
-                    queue_depth_target,
-                    ..
-                } => {
-                    let q =
-                        std::cmp::min(queue_depth_target as usize, usize::MAX / 8 - 3);
-                    24 + q * 8
-                }
-                _ => std::mem::size_of::<u32>(),
-            })
-            .max()
-            .unwrap_or_else(|| std::mem::size_of::<u32>());
+        // The kernel rounds munmap length up to PAGE_SIZE, so the
+        // per-region waste for sub-page allocations is bounded at
+        // one page; the previous MAX-across-groups approach could
+        // waste many pages per small-variant group when paired with
+        // a large queue_depth_target.
 
         // All failable acquisitions in this function route through
         // `guard`. If any `?`/`bail!` returns early, the guard's Drop
         // SIGKILLs+reaps forked children, closes open pipe fds, and
         // munmaps the shared regions — so no leak on a mid-spawn
         // error path.
-        let mut guard = SpawnGuard::new(futex_region_size);
+        let mut guard = SpawnGuard::new();
 
         // Per-worker iteration counter region (MAP_SHARED). Sized
         // for ALL groups' workers laid out contiguously: primary
@@ -4447,7 +4535,12 @@ impl WorkloadHandle {
         let pipe_pair_base = guard.pipe_pairs.len();
         let chain_pipes_base = guard.chain_pipes.len();
         let futex_ptrs_base = guard.futex_ptrs.len();
-        let futex_region_size = guard.futex_region_size;
+        // Per-group natural size for the futex MAP_SHARED region —
+        // each region in this group's range gets exactly this many
+        // bytes (rather than the previous global MAX across every
+        // group). See `futex_region_size_for` for the per-variant
+        // sizing rules.
+        let futex_region_size = futex_region_size_for(&group.work_type);
 
         // For paired work types, create one pipe per worker pair before forking.
         // pipe_pairs[pair_idx] = (read_fd, write_fd) for the A->B direction,
@@ -4519,13 +4612,13 @@ impl WorkloadHandle {
 
         // For FutexPingPong/FutexFanOut/FanOutCompute/MutexContention, allocate
         // one shared region per worker group via MAP_SHARED|MAP_ANONYMOUS
-        // so all members of the fork see the same physical page. FanOutCompute
-        // needs 16 bytes (futex u32 at offset 0, wake timestamp u64 at
-        // offset 8); others need 4 bytes. The guard's
-        // `futex_region_size` is the MAX across all groups (see
-        // sizing comment in `spawn`), so the trailing bytes for
-        // smaller-variant groups are unused but kernel-zero-
-        // initialised by MAP_ANONYMOUS.
+        // so all members of the fork see the same physical page.
+        // Each region is sized exactly to the variant's natural
+        // need (see [`futex_region_size_for`]) — the per-region
+        // size is recorded in `guard.futex_region_sizes` parallel
+        // to `guard.futex_ptrs`, so munmap on Drop receives the
+        // correct length even when groups with different natural
+        // sizes co-exist in the same workload.
         let futex_group_size = group.work_type.worker_group_size().unwrap_or(2);
         if needs_futex {
             for _ in 0..group.num_workers / futex_group_size {
@@ -4557,6 +4650,7 @@ impl WorkloadHandle {
                 }
                 unsafe { std::ptr::write_bytes(ptr as *mut u8, 0, futex_region_size) };
                 guard.futex_ptrs.push(ptr as *mut u32);
+                guard.futex_region_sizes.push(futex_region_size);
             }
         }
 
@@ -5685,9 +5779,9 @@ impl Drop for WorkloadHandle {
                 }
             }
         }
-        for &ptr in &self.futex_ptrs {
+        for (&ptr, &size) in self.futex_ptrs.iter().zip(self.futex_region_sizes.iter()) {
             unsafe {
-                libc::munmap(ptr as *mut libc::c_void, self.futex_region_size);
+                libc::munmap(ptr as *mut libc::c_void, size);
             }
         }
         if !self.iter_counters.is_null() && self.iter_counter_len > 0 {
@@ -10354,33 +10448,31 @@ mod tests {
         assert_eq!(reports.len(), 2, "1 primary + 1 composed = 2 reports");
     }
 
-    /// Composed [`WorkSpec::clone_mode`] mismatched with the
-    /// parent is rejected: SpawnGuard's lifecycle assumes a
-    /// single dispatch path (children OR threads, never mixed).
+    /// Composed entries inherit the parent
+    /// [`WorkloadConfig::clone_mode`] — [`WorkSpec`] carries no
+    /// `clone_mode` field of its own, so there's nothing to
+    /// disagree with the parent. The dispatch path is a
+    /// workload-wide property; mixing `fork` and `thread` workers
+    /// inside one [`SpawnGuard`] would route teardown through the
+    /// wrong code path. Composed Thread-mode workloads still spawn
+    /// correctly because every group inherits the same mode.
     #[test]
-    fn spawn_with_composed_rejects_clone_mode_mismatch() {
+    fn spawn_with_composed_inherits_parent_clone_mode() {
         let config = WorkloadConfig::default()
             .work_type(WorkType::SpinWait)
             .workers(1)
-            .clone_mode(CloneMode::Fork)
+            .clone_mode(CloneMode::Thread)
             .with_composed(
                 WorkSpec::default()
                     .work_type(WorkType::SpinWait)
-                    .workers(1)
-                    .clone_mode(CloneMode::Thread),
+                    .workers(1),
             );
-        let result = WorkloadHandle::spawn(&config);
-        let err = match result {
-            Err(e) => e,
-            Ok(_) => panic!(
-                "composed entry with mismatched clone_mode must be rejected"
-            ),
-        };
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("clone_mode"),
-            "diagnostic must name clone_mode; got: {msg}",
-        );
+        let mut h = WorkloadHandle::spawn(&config)
+            .expect("composed entry must inherit Thread mode without diagnostic");
+        h.start();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let reports = h.stop_and_collect();
+        assert_eq!(reports.len(), 2, "1 primary + 1 composed = 2 reports");
     }
 
     /// Three composed entries plus the primary = 4 groups total.
@@ -14240,21 +14332,9 @@ mod tests {
     }
 
     #[test]
-    fn work_default_clone_mode_is_fork() {
-        let w = WorkSpec::default();
-        assert!(matches!(w.clone_mode, CloneMode::Fork));
-    }
-
-    #[test]
     fn workload_config_clone_mode_builder() {
         let cfg = WorkloadConfig::default().clone_mode(CloneMode::Thread);
         assert!(matches!(cfg.clone_mode, CloneMode::Thread));
-    }
-
-    #[test]
-    fn work_clone_mode_builder() {
-        let w = WorkSpec::default().clone_mode(CloneMode::Thread);
-        assert!(matches!(w.clone_mode, CloneMode::Thread));
     }
 
 
