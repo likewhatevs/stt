@@ -29,12 +29,12 @@
 //! | fingerprint hint              | ktstr type                              |
 //! |-------------------------------|-----------------------------------------|
 //! | WorkloadGroupHint.thread_count| WorkloadConfig::num_workers             |
-//! | AffinityHint::SingleCpu       | AffinityIntent::SingleCpu                |
+//! | AffinityHint::SingleCpu{cpus} | AffinityIntent::Exact(set) when cpus non-empty; AffinityIntent::SingleCpu when empty |
 //! | AffinityHint::Exact{cpus}     | AffinityIntent::Exact(set)               |
 //! | AffinityHint::Inherit         | AffinityIntent::Inherit                  |
-//! | AffinityHint::LlcAligned      | AffinityIntent::LlcAligned               |
-//! | AffinityHint::CrossCgroup     | AffinityIntent::CrossCgroup              |
-//! | AffinityHint::RandomSubset    | AffinityIntent::RandomSubset { from: empty, count: 0 } [†] |
+//! | AffinityHint::LlcAligned{cpus}| AffinityIntent::Exact(set) when cpus non-empty; AffinityIntent::LlcAligned when empty |
+//! | AffinityHint::CrossCgroup{cpus}| AffinityIntent::Exact(set) when cpus non-empty; AffinityIntent::CrossCgroup when empty |
+//! | AffinityHint::RandomSubset{pool,count} | AffinityIntent::RandomSubset { from: pool, count } when both non-empty; placeholder otherwise [†] |
 //! | WorkTypeHint::SpinWait         | WorkType::SpinWait                       |
 //! | WorkTypeHint::YieldHeavy      | WorkType::YieldHeavy                    |
 //! | WorkTypeHint::Mixed           | WorkType::Mixed                         |
@@ -54,10 +54,13 @@
 //! | SchedPolicyHint::Ext          | (no explicit policy — scx default)      |
 //!
 //! [†] The `RandomSubset` row emits an empty-pool / zero-count
-//! placeholder that the spawn-time affinity gate REJECTS. The
-//! resulting spec is not runnable as-is — hand-edit `from` to the
-//! actual CPU pool and `count` to the desired sample size before
-//! running, or change to `AffinityIntent::Inherit`.
+//! placeholder that the spawn-time affinity gate REJECTS when the
+//! producer did not record a resolved pool. The resulting spec is
+//! not runnable as-is — hand-edit `from` to the actual CPU pool and
+//! `count` to the desired sample size before running, or change to
+//! `AffinityIntent::Inherit`. When the producer DID record a pool,
+//! the generator emits a fully-populated `AffinityIntent::RandomSubset`
+//! that the spawn-time gate accepts directly.
 //!
 //! `IoRandRead` and `IoConvoy` hints are accepted by the projection
 //! layer but not yet emitted by the capture pipeline; all real-disk-
@@ -211,26 +214,41 @@ fn map_workload_groups(fp: &WorkloadFingerprint, spec: &mut ReproducerSpec) {
 }
 
 /// Build the user-facing note attached when a topology-aware
-/// [`AffinityHint`] is projected. The 3 topology-aware variants
-/// (`SingleCpu`, `LlcAligned`, `CrossCgroup`) share the same
-/// structure: name the variant, describe what the scenario engine
-/// resolves at apply time, then point the user at the concrete
-/// `AffinityIntent::Exact(...)` they should hand-edit to if they
-/// want to spawn directly via [`crate::workload::WorkloadHandle::spawn`]
-/// (which rejects the topology-aware variants — they require
-/// scenario context the spawn-time gate doesn't have).
+/// [`AffinityHint`] is projected without a resolved CPU set. The 3
+/// topology-aware variants (`SingleCpu`, `LlcAligned`, `CrossCgroup`)
+/// share the same structure: name the variant, describe what the
+/// scenario engine resolves at apply time, then point the user at the
+/// concrete `AffinityIntent::Exact(...)` they should hand-edit to if
+/// they want to spawn directly via
+/// [`crate::workload::WorkloadHandle::spawn`] (which rejects the
+/// topology-aware variants — they require scenario context the
+/// spawn-time gate doesn't have).
 fn topology_aware_note(
     variant: &str,
     engine_action: &str,
     hand_edit_target: &str,
 ) -> String {
     format!(
-        "AffinityHint::{variant} observed; emitting \
-         AffinityIntent::{variant} — the scenario engine \
+        "AffinityHint::{variant} observed without resolved CPUs; \
+         emitting AffinityIntent::{variant} — the scenario engine \
          {engine_action} at apply time. Direct \
          WorkloadHandle::spawn rejects this variant (no topology \
          context); use the scenario engine or hand-edit to \
          AffinityIntent::Exact({hand_edit_target})"
+    )
+}
+
+/// Build the note attached when a topology-aware [`AffinityHint`]
+/// carried resolved CPUs and the generator collapsed it to
+/// [`AffinityIntent::Exact`]. The note preserves the original
+/// pattern classification (SingleCpu / LlcAligned / CrossCgroup) so
+/// the consumer can see what the producer observed before
+/// resolution, even though the emitted spec is a flat `Exact`.
+fn topology_resolved_note(variant: &str, cpus: &[u32]) -> String {
+    format!(
+        "AffinityHint::{variant} observed with resolved CPUs {cpus:?}; \
+         emitting AffinityIntent::Exact directly so the spec runs \
+         without scenario-engine resolution",
     )
 }
 
@@ -240,49 +258,83 @@ fn map_affinity(fp: &WorkloadFingerprint, spec: &mut ReproducerSpec) {
     };
     spec.config.affinity = match primary {
         AffinityHint::Inherit => AffinityIntent::Inherit,
-        AffinityHint::SingleCpu => {
-            spec.notes.push(topology_aware_note(
-                "SingleCpu",
-                "picks the concrete CPU from the cgroup's cpuset",
-                "[cpu]",
-            ));
-            AffinityIntent::SingleCpu
+        AffinityHint::SingleCpu { cpus } => {
+            if cpus.is_empty() {
+                spec.notes.push(topology_aware_note(
+                    "SingleCpu",
+                    "picks the concrete CPU from the cgroup's cpuset",
+                    "[cpu]",
+                ));
+                AffinityIntent::SingleCpu
+            } else {
+                spec.notes.push(topology_resolved_note("SingleCpu", cpus));
+                let set: BTreeSet<usize> = cpus.iter().map(|&c| c as usize).collect();
+                AffinityIntent::Exact(set)
+            }
         }
-        AffinityHint::LlcAligned => {
-            spec.notes.push(topology_aware_note(
-                "LlcAligned",
-                "resolves the LLC mask from the cgroup's cpuset",
-                "<llc cpus>",
-            ));
-            AffinityIntent::LlcAligned
+        AffinityHint::LlcAligned { cpus } => {
+            if cpus.is_empty() {
+                spec.notes.push(topology_aware_note(
+                    "LlcAligned",
+                    "resolves the LLC mask from the cgroup's cpuset",
+                    "<llc cpus>",
+                ));
+                AffinityIntent::LlcAligned
+            } else {
+                spec.notes.push(topology_resolved_note("LlcAligned", cpus));
+                let set: BTreeSet<usize> = cpus.iter().map(|&c| c as usize).collect();
+                AffinityIntent::Exact(set)
+            }
         }
-        AffinityHint::CrossCgroup => {
-            spec.notes.push(topology_aware_note(
-                "CrossCgroup",
-                "expands to the full topology",
-                "<all cpus>",
-            ));
-            AffinityIntent::CrossCgroup
+        AffinityHint::CrossCgroup { cpus } => {
+            if cpus.is_empty() {
+                spec.notes.push(topology_aware_note(
+                    "CrossCgroup",
+                    "expands to the full topology",
+                    "<all cpus>",
+                ));
+                AffinityIntent::CrossCgroup
+            } else {
+                spec.notes.push(topology_resolved_note("CrossCgroup", cpus));
+                let set: BTreeSet<usize> = cpus.iter().map(|&c| c as usize).collect();
+                AffinityIntent::Exact(set)
+            }
         }
         AffinityHint::Exact { cpus } => {
             let set: BTreeSet<usize> = cpus.iter().map(|&c| c as usize).collect();
             AffinityIntent::Exact(set)
         }
-        AffinityHint::RandomSubset => {
-            spec.notes.push(
-                "AffinityHint::RandomSubset observed; no source pool \
-                 inferred from the capture. Emitting \
-                 AffinityIntent::RandomSubset { from: empty, count: 0 } \
-                 as a placeholder — the spawn-time affinity gate \
-                 rejects empty-pool / zero-count RandomSubset, so this \
-                 spec is NOT runnable as-is. Hand-edit `from` to the \
-                 actual CPU pool and `count` to the desired sample \
-                 size before running, or change to AffinityIntent::Inherit."
-                    .into(),
-            );
-            AffinityIntent::RandomSubset {
-                from: BTreeSet::new(),
-                count: 0,
+        AffinityHint::RandomSubset { pool, count } => {
+            if pool.is_empty() || *count == 0 {
+                spec.notes.push(
+                    "AffinityHint::RandomSubset observed without a \
+                     resolved pool / count; emitting \
+                     AffinityIntent::RandomSubset { from: empty, count: 0 } \
+                     as a placeholder — the spawn-time affinity gate \
+                     rejects empty-pool / zero-count RandomSubset, so \
+                     this spec is NOT runnable as-is. Hand-edit `from` \
+                     to the actual CPU pool and `count` to the desired \
+                     sample size before running, or change to \
+                     AffinityIntent::Inherit."
+                        .into(),
+                );
+                AffinityIntent::RandomSubset {
+                    from: BTreeSet::new(),
+                    count: 0,
+                }
+            } else {
+                spec.notes.push(format!(
+                    "AffinityHint::RandomSubset observed with resolved \
+                     pool {pool:?} count={count}; emitting \
+                     AffinityIntent::RandomSubset directly so the \
+                     spawn-time affinity gate accepts it without \
+                     hand-editing",
+                ));
+                let from: BTreeSet<usize> = pool.iter().map(|&c| c as usize).collect();
+                AffinityIntent::RandomSubset {
+                    from,
+                    count: *count as usize,
+                }
             }
         }
     };
@@ -738,19 +790,185 @@ mod tests {
         );
     }
 
-    /// LlcAligned hint emits AffinityIntent::LlcAligned and surfaces a note
-    /// reminding the consumer that direct WorkloadHandle::spawn rejects this
-    /// variant (the scenario engine resolves it from cgroup cpuset context).
+    /// Unresolved `LlcAligned` hint (empty `cpus`) emits
+    /// [`AffinityIntent::LlcAligned`] and surfaces a note reminding
+    /// the consumer that direct [`crate::workload::WorkloadHandle::spawn`]
+    /// rejects this variant (the scenario engine resolves it from
+    /// cgroup cpuset context). Pins the unresolved-fallback path of
+    /// the topology-aware projection.
     #[test]
-    fn generate_spec_llc_aligned_note() {
+    fn generate_spec_llc_aligned_unresolved_emits_topology_aware() {
         let mut cap = DebugCapture::default();
-        cap.fingerprint.affinity_hints = vec![AffinityHint::LlcAligned];
+        cap.fingerprint.affinity_hints = vec![AffinityHint::LlcAligned { cpus: Vec::new() }];
         let spec = generate_spec(&cap);
         assert!(matches!(spec.config.affinity, AffinityIntent::LlcAligned));
         assert!(
             spec.notes
                 .iter()
-                .any(|n| n.contains("AffinityHint::LlcAligned"))
+                .any(|n| n.contains("AffinityHint::LlcAligned")
+                    && n.contains("without resolved CPUs")),
+            "unresolved LlcAligned must surface a topology-aware-fallback note: {:?}",
+            spec.notes,
+        );
+    }
+
+    /// Resolved `LlcAligned` hint (non-empty `cpus`) collapses to
+    /// [`AffinityIntent::Exact`] containing those CPUs and surfaces
+    /// a note that preserves the original pattern classification.
+    /// The emitted spec is runnable directly via
+    /// [`crate::workload::WorkloadHandle::spawn`] — no scenario-engine
+    /// resolution required. Pins the resolved-data path that #401
+    /// added.
+    #[test]
+    fn generate_spec_llc_aligned_resolved_emits_exact() {
+        let mut cap = DebugCapture::default();
+        cap.fingerprint.affinity_hints = vec![AffinityHint::LlcAligned {
+            cpus: vec![0, 1, 2, 3],
+        }];
+        let spec = generate_spec(&cap);
+        match &spec.config.affinity {
+            AffinityIntent::Exact(set) => {
+                let v: Vec<usize> = set.iter().copied().collect();
+                assert_eq!(
+                    v,
+                    vec![0, 1, 2, 3],
+                    "resolved LlcAligned must collapse to Exact with the observed CPUs: got {v:?}",
+                );
+            }
+            other => panic!("expected Exact, got {other:?}"),
+        }
+        assert!(
+            spec.notes
+                .iter()
+                .any(|n| n.contains("AffinityHint::LlcAligned")
+                    && n.contains("with resolved CPUs")),
+            "resolved LlcAligned must surface a resolved-collapse note: {:?}",
+            spec.notes,
+        );
+    }
+
+    /// Resolved `SingleCpu` hint (non-empty `cpus`) collapses to
+    /// [`AffinityIntent::Exact`]. Mirrors the LlcAligned resolved
+    /// case for the SingleCpu pattern — the producer recorded the
+    /// concrete CPU(s) and the generator emits a runnable spec.
+    #[test]
+    fn generate_spec_single_cpu_resolved_emits_exact() {
+        let mut cap = DebugCapture::default();
+        cap.fingerprint.affinity_hints = vec![AffinityHint::SingleCpu { cpus: vec![7] }];
+        let spec = generate_spec(&cap);
+        match &spec.config.affinity {
+            AffinityIntent::Exact(set) => {
+                let v: Vec<usize> = set.iter().copied().collect();
+                assert_eq!(v, vec![7]);
+            }
+            other => panic!("expected Exact, got {other:?}"),
+        }
+        assert!(
+            spec.notes
+                .iter()
+                .any(|n| n.contains("AffinityHint::SingleCpu")
+                    && n.contains("with resolved CPUs")),
+            "resolved SingleCpu must surface a resolved-collapse note: {:?}",
+            spec.notes,
+        );
+    }
+
+    /// Unresolved `SingleCpu` hint falls back to
+    /// [`AffinityIntent::SingleCpu`] with a hand-edit note. Pins the
+    /// fallback path so a regression that drops the unresolved
+    /// branch surfaces here.
+    #[test]
+    fn generate_spec_single_cpu_unresolved_emits_topology_aware() {
+        let mut cap = DebugCapture::default();
+        cap.fingerprint.affinity_hints = vec![AffinityHint::SingleCpu { cpus: Vec::new() }];
+        let spec = generate_spec(&cap);
+        assert!(matches!(spec.config.affinity, AffinityIntent::SingleCpu));
+        assert!(
+            spec.notes
+                .iter()
+                .any(|n| n.contains("AffinityHint::SingleCpu")
+                    && n.contains("without resolved CPUs")),
+        );
+    }
+
+    /// Resolved `CrossCgroup` hint collapses to
+    /// [`AffinityIntent::Exact`]. The producer recorded the
+    /// observed cross-cgroup span and the generator emits it
+    /// directly.
+    #[test]
+    fn generate_spec_cross_cgroup_resolved_emits_exact() {
+        let mut cap = DebugCapture::default();
+        cap.fingerprint.affinity_hints = vec![AffinityHint::CrossCgroup {
+            cpus: vec![2, 4, 6, 8],
+        }];
+        let spec = generate_spec(&cap);
+        match &spec.config.affinity {
+            AffinityIntent::Exact(set) => {
+                let v: Vec<usize> = set.iter().copied().collect();
+                assert_eq!(v, vec![2, 4, 6, 8]);
+            }
+            other => panic!("expected Exact, got {other:?}"),
+        }
+        assert!(
+            spec.notes
+                .iter()
+                .any(|n| n.contains("AffinityHint::CrossCgroup")
+                    && n.contains("with resolved CPUs")),
+        );
+    }
+
+    /// Resolved `RandomSubset` hint (non-empty `pool`, non-zero
+    /// `count`) emits [`AffinityIntent::RandomSubset`] with the
+    /// resolved pool and count. The spawn-time gate accepts this
+    /// shape directly — no hand-editing required.
+    #[test]
+    fn generate_spec_random_subset_resolved_emits_populated() {
+        let mut cap = DebugCapture::default();
+        cap.fingerprint.affinity_hints = vec![AffinityHint::RandomSubset {
+            pool: vec![0, 1, 2, 3, 4, 5],
+            count: 3,
+        }];
+        let spec = generate_spec(&cap);
+        match &spec.config.affinity {
+            AffinityIntent::RandomSubset { from, count } => {
+                let v: Vec<usize> = from.iter().copied().collect();
+                assert_eq!(v, vec![0, 1, 2, 3, 4, 5]);
+                assert_eq!(*count, 3);
+            }
+            other => panic!("expected populated RandomSubset, got {other:?}"),
+        }
+        assert!(
+            spec.notes
+                .iter()
+                .any(|n| n.contains("AffinityHint::RandomSubset")
+                    && n.contains("with resolved pool")),
+        );
+    }
+
+    /// Unresolved `RandomSubset` hint (empty `pool` or zero `count`)
+    /// emits the empty placeholder and surfaces the hand-edit note.
+    /// Pins the legacy fallback for producers that classify the
+    /// pattern without recording the pool.
+    #[test]
+    fn generate_spec_random_subset_unresolved_emits_placeholder() {
+        let mut cap = DebugCapture::default();
+        cap.fingerprint.affinity_hints = vec![AffinityHint::RandomSubset {
+            pool: Vec::new(),
+            count: 0,
+        }];
+        let spec = generate_spec(&cap);
+        match &spec.config.affinity {
+            AffinityIntent::RandomSubset { from, count } => {
+                assert!(from.is_empty(), "unresolved RandomSubset must emit empty pool");
+                assert_eq!(*count, 0);
+            }
+            other => panic!("expected placeholder RandomSubset, got {other:?}"),
+        }
+        assert!(
+            spec.notes
+                .iter()
+                .any(|n| n.contains("AffinityHint::RandomSubset")
+                    && n.contains("without a resolved pool")),
         );
     }
 

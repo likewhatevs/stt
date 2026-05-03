@@ -232,6 +232,19 @@ pub struct WorkloadGroupHint {
 }
 
 /// Affinity placement hint. Maps directly to `crate::workload::AffinityIntent`.
+///
+/// Each topology-aware variant (`SingleCpu`, `LlcAligned`,
+/// `CrossCgroup`, `RandomSubset`) carries an optional `cpus` payload
+/// recording the actual CPUs the producer observed at capture time.
+/// Empty `cpus` means the producer classified the pattern but did not
+/// record concrete CPUs (legacy producers, or projection from a
+/// failure dump that lacked per-task `cpus_allowed_mask` data); the
+/// reproducer generator falls back to emitting the matching
+/// topology-aware [`crate::workload::AffinityIntent`] variant plus a
+/// hand-edit note in that case. Non-empty `cpus` lets the reproducer
+/// generator emit a concrete [`crate::workload::AffinityIntent::Exact`]
+/// (or `RandomSubset` with a populated pool) directly, producing a
+/// runnable spec without scenario-engine resolution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 #[serde(tag = "kind")]
@@ -242,13 +255,36 @@ pub enum AffinityHint {
     /// Threads observed pinned to a single CPU each (mask popcount
     /// == 1 across the capture window for the majority of threads
     /// in the group). → `AffinityIntent::SingleCpu`.
-    SingleCpu,
+    ///
+    /// `cpus` records the specific CPU(s) observed across the
+    /// thread group. Typically a single element when every thread
+    /// pinned to the same CPU; multiple elements when different
+    /// threads in the group each pinned to a distinct CPU. Empty
+    /// when the producer did not record concrete CPUs.
+    SingleCpu {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        cpus: Vec<u32>,
+    },
     /// Threads observed pinned to LLC-aligned subsets of the
     /// cgroup's cpuset. → `AffinityIntent::LlcAligned`.
-    LlcAligned,
+    ///
+    /// `cpus` records the observed LLC's CPU set when the producer
+    /// resolved it. Empty when the producer classified the pattern
+    /// without recording the resolved LLC mask.
+    LlcAligned {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        cpus: Vec<u32>,
+    },
     /// Threads observed pinned to cgroup-spanning CPU sets. →
     /// `AffinityIntent::CrossCgroup`.
-    CrossCgroup,
+    ///
+    /// `cpus` records the observed cross-cgroup CPU span when the
+    /// producer resolved it. Empty when the producer classified the
+    /// pattern without recording the resolved span.
+    CrossCgroup {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        cpus: Vec<u32>,
+    },
     /// Threads observed pinned to an explicit CPU set. The capture
     /// records the exact CPUs so the reproducer can reproduce the
     /// specific placement. → `AffinityIntent::Exact`.
@@ -256,7 +292,24 @@ pub enum AffinityHint {
     /// Threads observed pinned to a strict subset of the cgroup's
     /// cpuset, but the subset varies across threads — typical of
     /// a placement randomizer. → `AffinityIntent::RandomSubset`.
-    RandomSubset,
+    ///
+    /// `pool` records the observed source pool (the union of CPUs
+    /// any thread was pinned to across the capture window) when the
+    /// producer resolved it. `count` records the typical mask
+    /// popcount per thread. Empty `pool` or zero `count` means the
+    /// producer classified the pattern without recording the
+    /// resolved pool / sample size.
+    RandomSubset {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pool: Vec<u32>,
+        #[serde(default, skip_serializing_if = "is_zero_u32")]
+        count: u32,
+    },
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
 }
 
 /// Workload type hint. Maps to `crate::workload::WorkType` variants.
@@ -665,7 +718,7 @@ mod tests {
                 wakeups_per_sec: 1200.0,
             }],
             affinity_hints: vec![
-                AffinityHint::SingleCpu,
+                AffinityHint::SingleCpu { cpus: Vec::new() },
                 AffinityHint::Exact { cpus: vec![0, 1, 2, 3] },
             ],
             work_type_hints: vec![
@@ -696,6 +749,70 @@ mod tests {
         assert_eq!(parsed.cgroup_hints.len(), 1);
         assert_eq!(parsed.sched_policy_hints.len(), 2);
         assert_eq!(parsed.gaps.len(), 1);
+    }
+
+    /// Topology-aware [`AffinityHint`] variants round-trip both
+    /// shapes — empty `cpus` (unresolved, the producer classified
+    /// the pattern without recording concrete CPUs) and non-empty
+    /// `cpus` (resolved, the producer recorded the observed CPU
+    /// set). `RandomSubset` adds the `pool`/`count` pair. Pins the
+    /// `#[serde(default, skip_serializing_if = "Vec::is_empty")]`
+    /// wire shape so a regression that drops the resolved-payload
+    /// fields silently surfaces here rather than at
+    /// reproducer-generation time.
+    #[test]
+    fn affinity_hint_resolved_payload_roundtrips() {
+        let hints = [
+            AffinityHint::SingleCpu { cpus: Vec::new() },
+            AffinityHint::SingleCpu { cpus: vec![3] },
+            AffinityHint::LlcAligned { cpus: Vec::new() },
+            AffinityHint::LlcAligned { cpus: vec![0, 1, 2, 3] },
+            AffinityHint::CrossCgroup { cpus: Vec::new() },
+            AffinityHint::CrossCgroup { cpus: vec![4, 5, 6, 7] },
+            AffinityHint::RandomSubset {
+                pool: Vec::new(),
+                count: 0,
+            },
+            AffinityHint::RandomSubset {
+                pool: vec![0, 1, 2, 3, 4, 5],
+                count: 3,
+            },
+        ];
+        for hint in &hints {
+            let json = serde_json::to_string(hint).expect("AffinityHint must serialize");
+            let back: AffinityHint =
+                serde_json::from_str(&json).expect("AffinityHint must deserialize");
+            match (hint, &back) {
+                (
+                    AffinityHint::SingleCpu { cpus: a },
+                    AffinityHint::SingleCpu { cpus: b },
+                ) => assert_eq!(a, b, "SingleCpu cpus must round-trip"),
+                (
+                    AffinityHint::LlcAligned { cpus: a },
+                    AffinityHint::LlcAligned { cpus: b },
+                ) => assert_eq!(a, b, "LlcAligned cpus must round-trip"),
+                (
+                    AffinityHint::CrossCgroup { cpus: a },
+                    AffinityHint::CrossCgroup { cpus: b },
+                ) => assert_eq!(a, b, "CrossCgroup cpus must round-trip"),
+                (
+                    AffinityHint::RandomSubset {
+                        pool: pa,
+                        count: ca,
+                    },
+                    AffinityHint::RandomSubset {
+                        pool: pb,
+                        count: cb,
+                    },
+                ) => {
+                    assert_eq!(pa, pb, "RandomSubset pool must round-trip");
+                    assert_eq!(ca, cb, "RandomSubset count must round-trip");
+                }
+                _ => panic!(
+                    "AffinityHint round-trip mismatch: sent {hint:?}, got {back:?}",
+                ),
+            }
+        }
     }
 
     /// `WorkTypeHint::IoRandRead` and `WorkTypeHint::IoConvoy`

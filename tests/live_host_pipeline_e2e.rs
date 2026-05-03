@@ -261,7 +261,10 @@ fn live_host_pipeline_e2e_debug_capture_serde_roundtrip() {
     wg.cpu_time_fraction = 0.5;
     wg.wakeups_per_sec = 100.0;
     original.fingerprint.workload_groups = vec![wg];
-    original.fingerprint.affinity_hints = vec![AffinityHint::SingleCpu, AffinityHint::CrossCgroup];
+    original.fingerprint.affinity_hints = vec![
+        AffinityHint::SingleCpu { cpus: Vec::new() },
+        AffinityHint::CrossCgroup { cpus: Vec::new() },
+    ];
     original.fingerprint.work_type_hints = vec![WorkTypeHint::FutexPingPong];
     original.fingerprint.sched_policy_hints =
         vec![SchedPolicyHint::Deadline { runtime_ns: 1_000_000, deadline_ns: 5_000_000, period_ns: 10_000_000 }];
