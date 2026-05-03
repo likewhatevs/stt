@@ -674,10 +674,9 @@ pub enum WorkType {
         /// CPU-spin iterations the waker burns before each wake.
         burst_iters: u64,
     },
-    /// Pipeline of waker-wakee hops forming a ring of `depth` stages,
-    /// optionally with `fanout` parallel chains. Two wake mechanisms
-    /// gated by the `wake` field — see [`WakeMechanism`] for kernel
-    /// citations:
+    /// Pipeline of waker-wakee hops forming a ring of `depth` stages.
+    /// Two wake mechanisms gated by the `wake` field — see
+    /// [`WakeMechanism`] for kernel citations:
     ///
     /// - [`WakeMechanism::Pipe`] — anon-pipe ring (`depth` pipes
     ///   per chain). Wakes carry `WF_SYNC` via
@@ -690,12 +689,16 @@ pub enum WorkType {
     ///   `FUTEX_WAKE`s; the stage whose `pos` matches runs, others
     ///   re-park. No `WF_SYNC`.
     ///
-    /// Worker indices are partitioned into `fanout` chains of
-    /// `depth` workers each. `worker_group_size = depth` so the
-    /// spawn-side allocates `fanout` independent futex regions
-    /// (one per chain). At the end of the chain the last worker
-    /// loops back to the first, forming a ring so the work
-    /// pattern can run for a long test window.
+    /// Worker indices are partitioned into `num_workers / depth`
+    /// chains of `depth` workers each. `worker_group_size = depth`
+    /// so the spawn-side allocates one independent futex region
+    /// per chain. At the end of the chain the last worker loops
+    /// back to the first, forming a ring so the work pattern can
+    /// run for a long test window.
+    ///
+    /// To run multiple parallel chains, set `num_workers` to a
+    /// multiple of `depth` greater than `depth` itself — the
+    /// spawn-side derives the chain count from the ratio.
     ///
     /// When `wake == WakeMechanism::Pipe`, the spawn-side
     /// additionally allocates `depth` pipes per chain — see
@@ -706,10 +709,6 @@ pub enum WorkType {
         /// predecessor's signal, does `work_per_hop` of CPU work,
         /// signals the next worker, and repeats.
         depth: usize,
-        /// Number of parallel chains. `fanout = 1` is a single
-        /// linear chain; `fanout > 1` runs multiple chains in
-        /// parallel, all sharing one configuration.
-        fanout: usize,
         /// Selects the wake mechanism between stages — see
         /// [`WakeMechanism`].
         ///
@@ -1048,7 +1047,6 @@ pub mod defaults {
     pub const ASYMMETRIC_WAKER_BURST_ITERS: u64 = 1024;
     // WakeChain
     pub const WAKE_CHAIN_DEPTH: usize = 4;
-    pub const WAKE_CHAIN_FANOUT: usize = 1;
     pub const WAKE_CHAIN_WAKE: super::WakeMechanism = super::WakeMechanism::Pipe;
     pub const WAKE_CHAIN_WORK_PER_HOP: std::time::Duration = std::time::Duration::from_micros(100);
     // NumaWorkingSetSweep
@@ -1225,7 +1223,6 @@ impl WorkType {
             }),
             "WakeChain" => Some(WorkType::WakeChain {
                 depth: defaults::WAKE_CHAIN_DEPTH,
-                fanout: defaults::WAKE_CHAIN_FANOUT,
                 wake: defaults::WAKE_CHAIN_WAKE,
                 work_per_hop: defaults::WAKE_CHAIN_WORK_PER_HOP,
             }),
@@ -1348,10 +1345,11 @@ impl WorkType {
             // AsymmetricWaker: paired waker + wakee (group of 2),
             // matching FutexPingPong's shape.
             WorkType::AsymmetricWaker { .. } => Some(2),
-            // WakeChain: each chain has `depth` workers; multiple
-            // chains run in parallel via `fanout`. Group size is
-            // the per-chain size; num_workers must equal
-            // depth * fanout.
+            // WakeChain: each chain has `depth` workers. Group
+            // size is the per-chain size; num_workers must be a
+            // positive multiple of depth, and the spawn-side
+            // derives the parallel-chain count from
+            // `num_workers / depth`.
             WorkType::WakeChain { depth, .. } => Some(*depth),
             // SignalStorm: paired (waker / wakee), num_workers
             // must be even. Each pair shares the partner-tid
@@ -1617,13 +1615,11 @@ impl WorkType {
     /// [`WorkType::WakeChain`].
     pub fn wake_chain(
         depth: usize,
-        fanout: usize,
         wake: WakeMechanism,
         work_per_hop: Duration,
     ) -> Self {
         WorkType::WakeChain {
             depth,
-            fanout,
             wake,
             work_per_hop,
         }
@@ -4035,15 +4031,20 @@ impl WorkloadHandle {
 
         // For paired work types, create one pipe per worker pair before forking.
         // pipe_pairs[pair_idx] = (read_fd, write_fd) for the A->B direction,
-        // and a second pipe for B->A.
+        // and a second pipe for B->A. Use `pipe2(O_CLOEXEC)` rather
+        // than bare `pipe(2)` for defense-in-depth: workers don't
+        // exec today, but a future code path that adds an exec
+        // (e.g. a Custom worker shelling out a helper binary)
+        // would inherit these fds without O_CLOEXEC and leak the
+        // pipe ends into the helper's fd table.
         if needs_pipes {
             for _ in 0..group.num_workers / 2 {
                 let mut ab = [0i32; 2]; // A writes, B reads
-                if unsafe { libc::pipe(ab.as_mut_ptr()) } != 0 {
-                    anyhow::bail!("pipe failed: {}", std::io::Error::last_os_error());
+                if unsafe { libc::pipe2(ab.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+                    anyhow::bail!("pipe2 failed: {}", std::io::Error::last_os_error());
                 }
                 let mut ba = [0i32; 2]; // B writes, A reads
-                if unsafe { libc::pipe(ba.as_mut_ptr()) } != 0 {
+                if unsafe { libc::pipe2(ba.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
                     // Close the ab half we just created: it is not
                     // yet owned by the guard, so its Drop won't
                     // otherwise reach it.
@@ -4051,7 +4052,7 @@ impl WorkloadHandle {
                         libc::close(ab[0]);
                         libc::close(ab[1]);
                     }
-                    anyhow::bail!("pipe failed: {}", std::io::Error::last_os_error());
+                    anyhow::bail!("pipe2 failed: {}", std::io::Error::last_os_error());
                 }
                 guard.pipe_pairs.push((ab, ba));
             }
@@ -4060,10 +4061,12 @@ impl WorkloadHandle {
         // For WakeChain { wake: WakeMechanism::Pipe }, allocate `depth` pipes per
         // chain (one pipe per stage). Pipe `i` connects stage `i`
         // (writer) to stage `(i + 1) % depth` (reader). On any
-        // `pipe()` failure mid-allocation, close the half-built
+        // `pipe2()` failure mid-allocation, close the half-built
         // chain's pipes before bailing — the chain is not yet
         // pushed onto `guard.chain_pipes`, so its Drop won't
-        // otherwise reach those fds.
+        // otherwise reach those fds. `O_CLOEXEC` matches the
+        // defense-in-depth posture documented above on the
+        // pipe-pair allocation.
         if let Some(depth) = chain_depth
             && depth > 0
             && group.num_workers >= depth
@@ -4074,7 +4077,7 @@ impl WorkloadHandle {
                 let mut alloc_ok = true;
                 for _ in 0..depth {
                     let mut p = [0i32; 2];
-                    if unsafe { libc::pipe(p.as_mut_ptr()) } != 0 {
+                    if unsafe { libc::pipe2(p.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
                         alloc_ok = false;
                         break;
                     }
@@ -4088,7 +4091,7 @@ impl WorkloadHandle {
                         }
                     }
                     anyhow::bail!(
-                        "WakeChain pipe allocation failed: {}",
+                        "WakeChain pipe2 allocation failed: {}",
                         std::io::Error::last_os_error()
                     );
                 }
@@ -4241,11 +4244,13 @@ impl WorkloadHandle {
             // Create pipe for report and a second pipe for "start" signal.
             // Local cleanup on second-pipe failure: the guard has no
             // per-worker tracking of half-allocated pipes, so the first
-            // half closes here before the bail.
+            // half closes here before the bail. `O_CLOEXEC` matches
+            // the defense-in-depth posture above on the inter-worker
+            // pipe pairs and chain pipes.
             let mut report_fds = [0i32; 2];
-            if unsafe { libc::pipe(report_fds.as_mut_ptr()) } != 0 {
+            if unsafe { libc::pipe2(report_fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
                 anyhow::bail!(
-                    "worker {}/{} (group {}): report pipe failed: {}",
+                    "worker {}/{} (group {}): report pipe2 failed: {}",
                     i + 1,
                     group.num_workers,
                     group.group_idx,
@@ -4253,13 +4258,13 @@ impl WorkloadHandle {
                 );
             }
             let mut start_fds = [0i32; 2];
-            if unsafe { libc::pipe(start_fds.as_mut_ptr()) } != 0 {
+            if unsafe { libc::pipe2(start_fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
                 unsafe {
                     libc::close(report_fds[0]);
                     libc::close(report_fds[1]);
                 }
                 anyhow::bail!(
-                    "worker {}/{} (group {}): start pipe failed: {}",
+                    "worker {}/{} (group {}): start pipe2 failed: {}",
                     i + 1,
                     group.num_workers,
                     group.group_idx,
@@ -6844,7 +6849,6 @@ fn worker_main(
             }
             WorkType::WakeChain {
                 depth,
-                fanout: _,
                 wake,
                 work_per_hop,
             } => {
@@ -11912,12 +11916,13 @@ mod tests {
 
     #[test]
     fn worker_group_size_wake_chain() {
-        // WakeChain group_size == depth (per-chain), independent
-        // of fanout. Spawn-side allocates `num_workers / depth =
-        // fanout` futex regions.
-        let wc = WorkType::wake_chain(8, 4, WakeMechanism::Futex, Duration::from_micros(100));
+        // WakeChain group_size == depth (per-chain). Spawn-side
+        // allocates one futex region per chain; the chain count
+        // derives from `num_workers / depth` so multi-chain
+        // configurations need num_workers ≥ depth + 1 multiple.
+        let wc = WorkType::wake_chain(8, WakeMechanism::Futex, Duration::from_micros(100));
         assert_eq!(wc.worker_group_size(), Some(8));
-        let wc1 = WorkType::wake_chain(3, 1, WakeMechanism::Pipe, Duration::from_micros(50));
+        let wc1 = WorkType::wake_chain(3, WakeMechanism::Pipe, Duration::from_micros(50));
         assert_eq!(wc1.worker_group_size(), Some(3));
     }
 
@@ -14036,11 +14041,12 @@ mod tests {
     }
 
     /// `CloneMode::Thread + WorkType::PipeIo` MUST run to
-    /// completion. PipeIo allocates a per-pair `pipe2(O_DIRECT)`
-    /// in shared memory (host-resident under Thread because every
-    /// worker shares the harness's mm) and exchanges 1-byte
-    /// messages — pinning that the existing pair-pipe plumbing
-    /// works under Thread mode without the per-worker
+    /// completion. PipeIo allocates a per-pair `pipe2(O_CLOEXEC)`
+    /// (a kernel-side anon-pipe shared between fork siblings; under
+    /// Thread mode every worker shares the harness's mm so the same
+    /// fds are visible without any extra mapping) and exchanges
+    /// 1-byte messages — pinning that the existing pair-pipe
+    /// plumbing works under Thread mode without the per-worker
     /// `MAP_SHARED` allocation that Fork mode relies on. Both
     /// workers in the (0,1) pair must produce work_units > 0;
     /// either reporting zero would mean the pipe pair-up didn't
@@ -14829,15 +14835,14 @@ mod tests {
         assert!(total > 0, "AsymmetricWaker pair must iterate: {reports:?}");
     }
 
-    /// `WorkType::WakeChain` smoke test. depth=2 → 2 workers per
-    /// chain × 1 chain = 2 workers total. Single linear chain.
+    /// `WorkType::WakeChain` smoke test. depth=2, num_workers=2 →
+    /// 1 chain of 2 workers. Single linear chain.
     #[test]
     fn pathology_wake_chain_iterates() {
         let cfg = WorkloadConfig {
             num_workers: 2,
             work_type: WorkType::WakeChain {
                 depth: 2,
-                fanout: 1,
                 wake: WakeMechanism::Futex,
                 work_per_hop: Duration::from_micros(50),
             },
@@ -14863,7 +14868,6 @@ mod tests {
             num_workers: 2,
             work_type: WorkType::WakeChain {
                 depth: 2,
-                fanout: 1,
                 wake: WakeMechanism::Pipe,
                 work_per_hop: Duration::from_micros(50),
             },
@@ -14882,16 +14886,16 @@ mod tests {
         }
     }
 
-    /// `WakeChain { wake: WakeMechanism::Pipe }` deeper chain. depth=4 → 4 workers
-    /// per chain × 1 chain = 4 workers. Verifies the ring closes
-    /// (stage 3 wakes stage 0) by requiring every stage iterates.
+    /// `WakeChain { wake: WakeMechanism::Pipe }` deeper chain.
+    /// depth=4, num_workers=4 → 1 chain of 4 workers. Verifies the
+    /// ring closes (stage 3 wakes stage 0) by requiring every
+    /// stage iterates.
     #[test]
     fn pathology_wake_chain_sync_deeper_chain() {
         let cfg = WorkloadConfig {
             num_workers: 4,
             work_type: WorkType::WakeChain {
                 depth: 4,
-                fanout: 1,
                 wake: WakeMechanism::Pipe,
                 work_per_hop: Duration::from_micros(20),
             },
@@ -14910,24 +14914,24 @@ mod tests {
         }
     }
 
-    /// `WakeChain { wake: WakeMechanism::Pipe }` multi-chain. depth=2, fanout=2 →
-    /// 2 stages × 2 parallel chains = 4 workers. Each chain owns
-    /// its own pipe ring; pipes are not shared across chains. All
-    /// workers must iterate independently.
+    /// `WakeChain { wake: WakeMechanism::Pipe }` multi-chain.
+    /// depth=2, num_workers=4 → 2 stages × 2 parallel chains
+    /// (chains derived from `num_workers / depth`). Each chain
+    /// owns its own pipe ring; pipes are not shared across
+    /// chains. All workers must iterate independently.
     #[test]
     fn pathology_wake_chain_sync_multi_chain() {
         let cfg = WorkloadConfig {
             num_workers: 4,
             work_type: WorkType::WakeChain {
                 depth: 2,
-                fanout: 2,
                 wake: WakeMechanism::Pipe,
                 work_per_hop: Duration::from_micros(50),
             },
             ..Default::default()
         };
         let mut h =
-            WorkloadHandle::spawn(&cfg).expect("WakeChain wake=Pipe fanout=2 must spawn");
+            WorkloadHandle::spawn(&cfg).expect("WakeChain wake=Pipe multi-chain must spawn");
         h.start();
         std::thread::sleep(Duration::from_millis(200));
         let reports = h.stop_and_collect();
@@ -14935,7 +14939,7 @@ mod tests {
         for r in &reports {
             assert!(
                 r.iterations > 0,
-                "WakeChain wake=Pipe fanout=2 worker must iterate: {r:?}"
+                "WakeChain wake=Pipe multi-chain worker must iterate: {r:?}"
             );
         }
     }
@@ -14952,7 +14956,6 @@ mod tests {
             num_workers: 2,
             work_type: WorkType::WakeChain {
                 depth: 2,
-                fanout: 1,
                 wake: WakeMechanism::Pipe,
                 work_per_hop: Duration::from_micros(50),
             },
