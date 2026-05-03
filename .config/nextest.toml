@@ -143,7 +143,7 @@ threads-required = 1
 
 # ── alu-vec512 ───────────────────────────────────────────────────────
 # AVX-512 / AMX execution triggers package-wide frequency throttle on
-# Intel: vector-heavy code drops the package's all-core frequency
+# x86: vector-heavy code drops the package's all-core frequency
 # (license-2/license-3 transitions in skylake-X-and-later) and AMX
 # tile loads add tens-of-microseconds on TILELOAD/TILEZERO. A
 # concurrent test running on the same socket sees iteration latency

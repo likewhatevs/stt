@@ -34,7 +34,7 @@
 //! | AffinityHint::Inherit         | AffinityIntent::Inherit                  |
 //! | AffinityHint::LlcAligned{cpus}| AffinityIntent::Exact(set) when cpus non-empty; AffinityIntent::LlcAligned when empty |
 //! | AffinityHint::CrossCgroup{cpus}| AffinityIntent::Exact(set) when cpus non-empty; AffinityIntent::CrossCgroup when empty |
-//! | AffinityHint::RandomSubset{pool,count} | AffinityIntent::RandomSubset { from: pool, count } when both non-empty; placeholder otherwise [†] |
+//! | AffinityHint::RandomSubset{pool,count (popcount-per-thread)} | AffinityIntent::RandomSubset { from: pool, count } when both non-empty; placeholder otherwise [†] |
 //! | WorkTypeHint::SpinWait         | WorkType::SpinWait                       |
 //! | WorkTypeHint::YieldHeavy      | WorkType::YieldHeavy                    |
 //! | WorkTypeHint::Mixed           | WorkType::Mixed                         |
@@ -914,6 +914,29 @@ mod tests {
                 .iter()
                 .any(|n| n.contains("AffinityHint::CrossCgroup")
                     && n.contains("with resolved CPUs")),
+        );
+    }
+
+    /// Unresolved `CrossCgroup` hint (empty `cpus`) emits
+    /// [`AffinityIntent::CrossCgroup`] and surfaces a note reminding
+    /// the consumer that direct [`crate::workload::WorkloadHandle::spawn`]
+    /// rejects this variant (the scenario engine expands it to the
+    /// full topology). Pins the unresolved-fallback path of the
+    /// CrossCgroup topology-aware projection.
+    #[test]
+    fn generate_spec_cross_cgroup_unresolved_emits_topology_aware() {
+        let mut cap = DebugCapture::default();
+        cap.fingerprint.affinity_hints =
+            vec![AffinityHint::CrossCgroup { cpus: Vec::new() }];
+        let spec = generate_spec(&cap);
+        assert!(matches!(spec.config.affinity, AffinityIntent::CrossCgroup));
+        assert!(
+            spec.notes
+                .iter()
+                .any(|n| n.contains("AffinityHint::CrossCgroup")
+                    && n.contains("without resolved CPUs")),
+            "unresolved CrossCgroup must surface a topology-aware-fallback note: {:?}",
+            spec.notes,
         );
     }
 
