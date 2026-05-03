@@ -2,6 +2,42 @@ use kvm_bindings::kvm_cpuid_entry2;
 
 use crate::vmm::topology::Topology;
 
+// ---- Leaf 0xA: Architectural Performance Monitoring (Intel) ----
+//
+// Field layout per arch/x86/include/asm/perf_event.h:
+//   union cpuid10_eax { version_id:8, num_counters:8, bit_width:8, mask_length:8 }
+//   union cpuid10_edx { num_counters_fixed:5, bit_width_fixed:8, reserved:19 }
+//
+// We synthesize a conservative PMU v2 surface so guest sched_ext
+// schedulers (scx_layered, scx_cosmos) get usable perf counters
+// regardless of host hardware. KVM's intel_pmu_refresh
+// (arch/x86/kvm/vmx/pmu_intel.c) clamps these against the host's
+// actual PMU capabilities, so the guest sees min(synthesized, host).
+
+/// PMU architectural version reported in EAX[7:0]. Version 2
+/// matches Intel SDM "Architectural Performance Monitoring v2".
+const PMU_ARCH_PERFMON_VERSION: u32 = 2;
+
+/// Number of general-purpose counters per logical CPU, EAX[15:8].
+/// Conservative — Intel hardware ranges from 4 to 8.
+const PMU_NUM_GP_COUNTERS: u32 = 4;
+
+/// General-purpose counter bit width, EAX[23:16]. PMU v2 spec value.
+const PMU_GP_COUNTER_WIDTH: u32 = 48;
+
+/// Bit-vector length for the unsupported-event mask, EAX[31:24].
+/// Must equal ARCH_PERFMON_EVENTS_COUNT (7) from
+/// arch/x86/include/asm/perf_event.h or intel_pmu_init in
+/// arch/x86/events/intel/core.c returns -ENODEV.
+const PMU_EVENT_MASK_LENGTH: u32 = 7;
+
+/// Number of fixed-function counters, EDX[4:0]. PMU v2 surface = 3
+/// (instructions, cycles, ref-cycles).
+const PMU_NUM_FIXED_COUNTERS: u32 = 3;
+
+/// Fixed-function counter bit width, EDX[12:5]. PMU v2 spec value.
+const PMU_FIXED_COUNTER_WIDTH: u32 = 48;
+
 /// CPU vendor, detected from CPUID leaf 0x0 EBX:EDX:ECX.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CpuVendor {
@@ -167,13 +203,12 @@ pub fn generate_cpuid(
 
             // Leaf 0xA: Architectural Performance Monitoring (Intel SDM,
             // Architectural Performance Monitoring). Synthesized to a
-            // conservative PMU v2 surface so guest
-            // sched_ext schedulers (scx_layered, scx_cosmos) get usable perf
-            // counters regardless of host hardware. KVM's intel_pmu_refresh
-            // (arch/x86/kvm/vmx/pmu_intel.c) further clamps these values
-            // against the host's actual PMU capabilities, so the guest sees
-            // min(synthesized, host). AMD CPUs ignore leaf 0xA and use
-            // MSR-based counters; populating it is a no-op on AMD.
+            // conservative PMU v2 surface so guest sched_ext schedulers
+            // (scx_layered, scx_cosmos) get usable perf counters
+            // regardless of host hardware. AMD CPUs ignore leaf 0xA and
+            // use MSR-based counters; populating it is a no-op on AMD.
+            // See PMU_* consts at the top of this file for field
+            // semantics.
             //
             // Gated on the ORIGINAL entry's version (EAX[7:0]) being non-zero.
             // On a kvm.enable_pmu=0 host, KVM zeros leaf 0xA before exposing
@@ -182,21 +217,15 @@ pub fn generate_cpuid(
             // counter count back to 0 — silent failures inside the guest.
             // Leaving zeros lets the guest's intel_pmu_init see version=0 and
             // graceful-fail the same way it does on a no-PMU bare-metal host.
-            //
-            // EAX[7:0]   version = 2  (Arch Perf Monitor v2)
-            // EAX[15:8]  number of GP counters per logical CPU = 4
-            // EAX[23:16] GP counter bit width = 48
-            // EAX[31:24] EBX bit-vector length = 7  (matches v2 unsupported-event mask)
-            // EBX        unsupported-event mask = 0  (all 7 architectural events available)
-            // ECX        reserved
-            // EDX[4:0]   number of fixed-function counters = 3
-            // EDX[12:5]  fixed-function counter bit width = 48
             0xa => {
                 if entry.eax & 0xff != 0 {
-                    entry.eax = 2 | (4 << 8) | (48 << 16) | (7 << 24);
+                    entry.eax = PMU_ARCH_PERFMON_VERSION
+                        | (PMU_NUM_GP_COUNTERS << 8)
+                        | (PMU_GP_COUNTER_WIDTH << 16)
+                        | (PMU_EVENT_MASK_LENGTH << 24);
                     entry.ebx = 0;
                     entry.ecx = 0;
-                    entry.edx = 3 | (48 << 5);
+                    entry.edx = PMU_NUM_FIXED_COUNTERS | (PMU_FIXED_COUNTER_WIDTH << 5);
                 }
             }
 
