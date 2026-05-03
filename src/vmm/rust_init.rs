@@ -121,6 +121,15 @@ pub(crate) fn ktstr_guest_init() -> ! {
         force_reboot();
     }
 
+    // Phase 1.5: Auto-mount the user data disk at /mnt/disk0 if the
+    // host pre-formatted it (KTSTR_DISK0_FS=<tag> on the cmdline).
+    // Runs BEFORE `disk_template_mode_requested()` is checked below
+    // — but the template-build cmdline never carries
+    // `KTSTR_DISK0_FS` (the host emits it only for non-Raw disks
+    // and the template-build VM attaches a Raw disk because the
+    // whole point is to format it), so this call is a no-op
+    // during template-build and the build path is unaffected.
+    auto_mount_data_disks();
     // Enable per-program BPF runtime stats (cnt, nsecs). The kernel
     // only populates bpf_prog_stats when bpf_stats_enabled_key is set.
     let _ = fs::write("/proc/sys/kernel/bpf_stats_enabled", "1");
@@ -1006,6 +1015,83 @@ fn mount_filesystems() {
     let _ = std::os::unix::fs::symlink("/proc/self/fd/0", "/dev/stdin");
     let _ = std::os::unix::fs::symlink("/proc/self/fd/1", "/dev/stdout");
     let _ = std::os::unix::fs::symlink("/proc/self/fd/2", "/dev/stderr");
+}
+
+/// Auto-mount the user-configured data disk at `/mnt/disk0` if the
+/// host pre-formatted it. Driven by two kernel cmdline tokens
+/// emitted by the host's
+/// [`crate::vmm::KtstrVmBuilder::build`] cmdline assembly:
+///
+/// * `KTSTR_DISK0_FS=<tag>` — selects the on-disk filesystem to
+///   pass to `mount(2)` (`btrfs` for the only non-Raw variant
+///   today). Absence short-circuits this whole function: a `Raw`
+///   disk has nothing to mount, and a config with no disk attached
+///   never sees a `KTSTR_DISK0_FS` token at all.
+/// * `KTSTR_DISK0_RO=1` — set when the host configured the disk
+///   `read_only`. The virtio_blk device advertises
+///   `VIRTIO_BLK_F_RO` for that case so the guest's gendisk is
+///   read-only at the block layer; mounting RW would fail with
+///   `-EROFS` (kernel `do_mount` sets the superblock RO from the
+///   bdev). Setting `MS_RDONLY` proactively avoids that error path
+///   entirely.
+///
+/// Failure modes are non-fatal: if the mount syscall returns an
+/// error (unrecognized fstype tag, kernel `CONFIG_BTRFS_FS=n`,
+/// device probe race, ENOMEM), the function logs to COM2 and
+/// returns. The test still gets a usable VM; a subsequent test
+/// step that depends on `/mnt/disk0` surfaces as a clean
+/// userspace filesystem error rather than a confusing init abort.
+///
+/// Skips entirely when `KTSTR_DISK0_FS` is absent. The cmdline
+/// emission on the host side is gated on
+/// `disks[0].filesystem != Filesystem::Raw`, so this branch
+/// matches the host-side opt-in: every config that requests an
+/// on-disk filesystem gets the auto-mount, and every config that
+/// doesn't is unaffected.
+fn auto_mount_data_disks() {
+    let Some(fstype) = cmdline_val("KTSTR_DISK0_FS") else {
+        return;
+    };
+    // Validate the fstype against the known set. Today only
+    // `btrfs` is wired (mirroring `Filesystem::Btrfs::cache_tag`);
+    // unknown values warn-and-skip rather than handing arbitrary
+    // strings to `mount(2)`. A future `Filesystem` variant must
+    // add its tag here AND in the disk_config.rs `cache_tag`
+    // match — keeping both lists in lockstep is the on-disk-format
+    // / cmdline contract.
+    let recognized = matches!(fstype.as_str(), "btrfs");
+    if !recognized {
+        let msg = format!(
+            "ktstr-init: KTSTR_DISK0_FS={fstype} not recognized; \
+             skipping auto-mount of /dev/vda"
+        );
+        let _ = fs::write(COM2, &msg);
+        eprintln!("{msg}");
+        return;
+    }
+    // RO bit. Absent or any value other than "1" means RW.
+    // Strict-`==` rather than truthy-string parsing keeps the
+    // contract simple and aligned with the host-side emission
+    // (`KTSTR_DISK0_RO=1`).
+    let ro = cmdline_val("KTSTR_DISK0_RO").as_deref() == Some("1");
+    let mount_point = "/mnt/disk0";
+    mkdir_p(mount_point);
+    let flags = if ro { MsFlags::MS_RDONLY } else { MsFlags::empty() };
+    let result = mount(
+        Some("/dev/vda"),
+        mount_point,
+        Some(fstype.as_str()),
+        flags,
+        None::<&str>,
+    );
+    if let Err(e) = result {
+        let msg = format!(
+            "ktstr-init: mount {fstype} on {mount_point} \
+             (ro={ro}): {e}"
+        );
+        let _ = fs::write(COM2, &msg);
+        eprintln!("{msg}");
+    }
 }
 
 /// Recursive mkdir -p equivalent. `DirBuilder::recursive(true)` is

@@ -227,6 +227,7 @@ impl Default for DiskConfig {
 
 impl DiskConfig {
     /// Set capacity in megabytes.
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn capacity_mb(mut self, mb: u32) -> Self {
         self.capacity_mb = mb;
         self
@@ -243,6 +244,7 @@ impl DiskConfig {
     /// a reflink-capable cache directory (btrfs or xfs) and a host
     /// `mkfs.btrfs` binary on `PATH` at template-build time. See
     /// the module-level docs and [`crate::vmm::disk_template`].
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn filesystem(mut self, fs: Filesystem) -> Self {
         self.filesystem = fs;
         self
@@ -260,6 +262,7 @@ impl DiskConfig {
     /// disabled the rate is a footgun: the next `validate()` call
     /// would fail with a less-helpful "burst without rate" error
     /// rather than the user's intent (a fully-unthrottled bucket).
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn iops(mut self, iops: u64) -> Self {
         self.throttle.iops = NonZeroU64::new(iops);
         if self.throttle.iops.is_none() {
@@ -277,6 +280,7 @@ impl DiskConfig {
     /// `iops` — a burst without a rate is invalid and stale-burst
     /// retention turns a deliberate "drop the throttle" into a
     /// validate-time failure.
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn bytes_per_sec(mut self, bytes_per_sec: u64) -> Self {
         self.throttle.bytes_per_sec = NonZeroU64::new(bytes_per_sec);
         if self.throttle.bytes_per_sec.is_none() {
@@ -297,6 +301,7 @@ impl DiskConfig {
     /// burst before rate). Tests should call `validate()` after
     /// chaining, or construct an invalid config and observe the
     /// error from VM build.
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn iops_burst_capacity(mut self, capacity: u64) -> Self {
         self.throttle.iops_burst_capacity = NonZeroU64::new(capacity);
         self
@@ -311,6 +316,7 @@ impl DiskConfig {
     /// and must not be set without `bytes_per_sec`. Both rules are
     /// enforced by [`DiskThrottle::validate`] at VM build time, not
     /// by the builder.
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn bytes_burst_capacity(mut self, capacity: u64) -> Self {
         self.throttle.bytes_burst_capacity = NonZeroU64::new(capacity);
         self
@@ -321,6 +327,7 @@ impl DiskConfig {
     /// boolean footgun) and only flips the flag on. To return to
     /// read-write, drop the call or reconstruct from
     /// `DiskConfig::default()`.
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn read_only(mut self) -> Self {
         self.read_only = true;
         self
@@ -331,6 +338,7 @@ impl DiskConfig {
     /// attached) can resolve the name instead of relying on
     /// attachment order. Default is anonymous (`None`); calling
     /// `.name(...)` sets it.
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn name(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
         self

@@ -3361,6 +3361,45 @@ impl KtstrVm {
                 kvm::VIRTIO_BLK_MMIO_BASE,
                 kvm::VIRTIO_BLK_IRQ,
             ));
+            // Auto-mount handshake (#437). Emit a `KTSTR_DISK0_FS=<tag>`
+            // token whenever the first disk has been pre-formatted so
+            // the guest init at
+            // [`crate::vmm::rust_init::auto_mount_data_disks`]
+            // can mount `/dev/vda` at `/mnt/disk0` before the test
+            // dispatch runs. `Filesystem::Raw` skips the emission
+            // because there is no on-disk fs to mount; the guest
+            // sees only the absent token and short-circuits the
+            // mount path.
+            //
+            // `KTSTR_DISK0_RO=1` is emitted when the disk is
+            // configured `read_only`. The virtio_blk device
+            // advertises `VIRTIO_BLK_F_RO` for that case so the
+            // guest's gendisk is RO; mounting RW would fail with
+            // `-EROFS` (kernel `do_mount` path: `__btrfs_open_devices`
+            // probes the bdev's `bdev_read_only` and returns EROFS
+            // when the RW mount tries to write). The token lets the
+            // guest set `MS_RDONLY` proactively, surfacing the
+            // intent in the cmdline and avoiding the kernel-side
+            // EROFS path.
+            //
+            // The cache_tag() value is reused as the fstype string
+            // because it is already kebab-free, ≤8 chars, and
+            // matches the on-disk-format identifier the host
+            // selected — using the same value for both keeps the
+            // guest mount and host cache key in lockstep, so a
+            // future `Filesystem` variant rename only has to update
+            // one place (the `cache_tag` match in disk_config.rs)
+            // and the cmdline / mount automatically follow.
+            let disk = &self.disks[0];
+            if disk.filesystem != disk_config::Filesystem::Raw {
+                cmdline.push_str(&format!(
+                    " KTSTR_DISK0_FS={}",
+                    disk.filesystem.cache_tag(),
+                ));
+                if disk.read_only {
+                    cmdline.push_str(" KTSTR_DISK0_RO=1");
+                }
+            }
         }
         if self.shm_size > 0 {
             let mem_size = (memory_mb as u64) << 20;
