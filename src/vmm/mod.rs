@@ -1840,9 +1840,23 @@ pub struct KtstrVm {
     /// file is produced by the template-VM lifecycle (one-time
     /// guest-side `mkfs.<fstype>` against a sparse image, cached
     /// alongside the kernel; per-test reflink-copy at fan-out).
-    /// Template lifecycle wiring is a deferred follow-up; today
-    /// `init_virtio_blk` opens a fresh sparse `tempfile` per test.
+    /// Per-test boots populate the backing via the `Raw` tempfile
+    /// or `Btrfs` cache-clone branches in
+    /// [`KtstrVm::init_virtio_blk`]; the disk-template-build VM
+    /// driver overrides both branches via
+    /// [`Self::template_staging_image`] so it can format a
+    /// host-staged image without re-entering its own cache.
     disks: Vec<disk_config::DiskConfig>,
+    /// Internal-only override for `init_virtio_blk`'s per-test
+    /// backing-file allocation. `Some(path)` makes the device open
+    /// `path` directly instead of allocating a fresh `tempfile()`
+    /// or invoking [`disk_template::ensure_template`]. Set
+    /// exclusively by [`KtstrVmBuilder::template_staging_image`] for
+    /// the disk-template-build VM driver in
+    /// [`disk_template::build_template_via_vm`]; `None` for every
+    /// other code path. See the builder field's doc for the full
+    /// recursion-break rationale.
+    template_staging_image: Option<PathBuf>,
     /// Embed busybox in the initramfs for shell mode.
     busybox: bool,
     /// Forward COM1 (kernel console) to stderr in real-time during
@@ -2494,28 +2508,47 @@ impl KtstrVm {
         let capacity = disk.capacity_bytes();
 
         // Per-test backing-file allocation forks on the configured
-        // [`disk_config::Filesystem`]:
+        // [`disk_config::Filesystem`], with one override for the
+        // template-build VM driver:
+        //
+        //  - **`template_staging_image` set** (internal-only — see
+        //    [`KtstrVmBuilder::template_staging_image`]): open the
+        //    caller-supplied path RW and hand it to the device. This
+        //    branch exists exclusively for
+        //    [`disk_template::build_template_via_vm`]: the driver
+        //    materialises a sparse staging image, points the
+        //    template-build guest at it via this field, and recovers
+        //    the now-formatted file after VM exit for
+        //    [`disk_template::store_atomic`]. Bypasses both the
+        //    `Raw` tempfile and `Btrfs` ensure_template branches so
+        //    the template-build VM cannot recursively re-enter the
+        //    cache it is itself populating.
         //
         //  - `Raw`: anonymous sparse `tempfile()`. The kernel
         //    reclaims storage when the device drops the File. No
         //    cache, no FICLONE.
         //
-        //  - `Btrfs`: builder wired, VM driver stubbed —
-        //    [`disk_template::ensure_template`] returns an actionable
-        //    error today and Btrfs disks fail at this point with the
-        //    diagnostic from
-        //    [`disk_template::build_template_via_vm`] until the
-        //    follow-up driver wiring lands. Once that driver lands,
-        //    this branch will FICLONE-clone the host-cached,
-        //    guest-formatted template into a per-test tempfile under
-        //    the cache root (so FICLONE source and dest share a
-        //    filesystem), unlink the dest immediately after open so
-        //    the device sees the same anonymous-file semantics as
-        //    the `Raw` path, and hand the open `File` to the
-        //    `VirtioBlk` device. See [`crate::vmm::disk_template`]
-        //    module docs.
-        let backing = match disk.filesystem {
-            disk_config::Filesystem::Raw => {
+        //  - `Btrfs`: FICLONE-clones the host-cached, guest-formatted
+        //    template into a per-test tempfile under the cache root
+        //    (so FICLONE source and dest share a filesystem), unlinks
+        //    the dest immediately after open so the device sees the
+        //    same anonymous-file semantics as the `Raw` path, and
+        //    hands the open `File` to the `VirtioBlk` device. See
+        //    [`crate::vmm::disk_template`] module docs.
+        let backing = if let Some(staging) = self.template_staging_image.as_ref() {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(staging)
+                .with_context(|| {
+                    format!(
+                        "open template staging image {} for virtio-blk",
+                        staging.display(),
+                    )
+                })?
+        } else {
+            match disk.filesystem {
+                disk_config::Filesystem::Raw => {
                 let f =
                     tempfile::tempfile().context("create virtio-blk sparse temp backing file")?;
                 // Make sure the file covers the advertised capacity.
@@ -2580,7 +2613,19 @@ impl KtstrVm {
                 }
                 f
             }
+            }
         };
+
+        // Validate throttle/burst consistency before constructing the
+        // device. `DiskThrottle::validate` rejects misconfigurations
+        // (burst < rate, burst without rate) that would otherwise
+        // silently reduce the effective throttle rate or carry
+        // orphaned state. Runs after backing allocation today; a
+        // future refactor may hoist this earlier to bail before
+        // expensive backing setup.
+        disk.throttle
+            .validate()
+            .map_err(|e| anyhow::anyhow!("invalid disk throttle: {e}"))?;
 
         let mut blk =
             virtio_blk::VirtioBlk::with_options(backing, capacity, disk.throttle, disk.read_only);
@@ -6100,6 +6145,22 @@ pub struct KtstrVmBuilder {
     /// the full contract; the builder field flows through `build`
     /// unchanged.
     dual_snapshot: bool,
+    /// When set, [`KtstrVm::init_virtio_blk`] opens this path
+    /// directly as the virtio-blk backing file instead of allocating
+    /// a fresh `tempfile()` (Raw branch) or invoking
+    /// [`disk_template::ensure_template`] (Btrfs branch). The
+    /// path-supplied backing exists exclusively for the
+    /// disk-template-build VM driver in
+    /// [`disk_template::build_template_via_vm`]: that driver
+    /// materialises a sparse staging image, points the template VM
+    /// at it via this field, and recovers the now-formatted file
+    /// after VM exit for [`disk_template::store_atomic`] to
+    /// publish. Setting this from any other code path bypasses the
+    /// template cache and is ALMOST CERTAINLY a mistake —
+    /// per-test runs want the `Raw` tempfile or `Btrfs` cache
+    /// branches in `init_virtio_blk`. `None` is the production
+    /// default.
+    template_staging_image: Option<PathBuf>,
 }
 
 impl Default for KtstrVmBuilder {
@@ -6139,6 +6200,7 @@ impl Default for KtstrVmBuilder {
             jemalloc_alloc_worker_binary: None,
             failure_dump_path: None,
             dual_snapshot: false,
+            template_staging_image: None,
         }
     }
 }
@@ -6423,18 +6485,48 @@ impl KtstrVmBuilder {
     /// pair, so today the VM exposes at most one virtio-blk device
     /// at `/dev/vda`.
     ///
-    /// The backing file is produced by a separate "template VM"
-    /// boot — a one-time guest-side `mkfs.<fstype>` formats the
-    /// cached image, then per-test boots reflink-copy that
-    /// template. The host never execs mkfs. Guest init auto-mounts
-    /// at `/mnt/disk0`. Test authors never run mkfs or mount —
-    /// they get a ready-to-use mounted filesystem.
-    ///
-    /// Template lifecycle wiring is a deferred follow-up (see
-    /// `disk_config.rs` module doc); today the device opens a
-    /// fresh sparse `tempfile` per test.
+    /// Per-test backing is allocated by
+    /// [`KtstrVm::init_virtio_blk`]:
+    /// - `Filesystem::Raw` (the default): a fresh sparse
+    ///   `tempfile()` per test, the kernel reclaims storage on
+    ///   device drop.
+    /// - `Filesystem::Btrfs`: a host-cached, guest-formatted
+    ///   template image produced by a one-shot template VM
+    ///   ([`disk_template::build_template_via_vm`]) is
+    ///   reflink-cloned via `FICLONE` for the per-test backing.
+    ///   The host never execs mkfs against a real backing file;
+    ///   the kernel inside the template VM is the on-disk-format
+    ///   authority.
     pub fn disk(mut self, disk: disk_config::DiskConfig) -> Self {
         self.disks = vec![disk];
+        self
+    }
+
+    /// Override [`KtstrVm::init_virtio_blk`]'s per-test backing-file
+    /// allocation with `path`. Internal-only: this is the seam the
+    /// disk-template-build VM driver
+    /// ([`disk_template::build_template_via_vm`]) uses to point a
+    /// template-build guest at a host-staged sparse image, run
+    /// `mkfs.<fstype>` against it inside the guest, and recover the
+    /// now-formatted bytes after VM exit.
+    ///
+    /// When set, `init_virtio_blk` opens `path` for read+write and
+    /// hands the resulting [`std::fs::File`] to the device — neither
+    /// the `Raw` tempfile branch nor the `Btrfs` ensure_template
+    /// branch executes, so a template-build VM cannot recursively
+    /// re-enter the disk-template cache it is itself populating.
+    /// The first attached disk's
+    /// [`disk_config::DiskConfig::capacity_bytes`] still drives the
+    /// device's advertised capacity; the staging image must already
+    /// be sized to match.
+    ///
+    /// Production test paths leave this `None`. Setting it from a
+    /// per-test build silently disables the template cache and would
+    /// surface as a wrong-content backing file — the `Raw`/`Btrfs`
+    /// branches in `init_virtio_blk` exist exactly to satisfy
+    /// per-test isolation.
+    pub(crate) fn template_staging_image(mut self, path: PathBuf) -> Self {
+        self.template_staging_image = Some(path);
         self
     }
 
@@ -6670,6 +6762,7 @@ impl KtstrVmBuilder {
             jemalloc_alloc_worker_binary: self.jemalloc_alloc_worker_binary,
             failure_dump_path: self.failure_dump_path,
             dual_snapshot: self.dual_snapshot,
+            template_staging_image: self.template_staging_image,
         })
     }
 

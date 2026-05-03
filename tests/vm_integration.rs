@@ -534,6 +534,8 @@ const KTSTR_DISK_DEFAULT: ktstr::prelude::DiskConfig =
         throttle: ktstr::prelude::DiskThrottle {
             iops: None,
             bytes_per_sec: None,
+            iops_burst_capacity: None,
+            bytes_burst_capacity: None,
         },
         read_only: false,
         name: None,
@@ -546,6 +548,8 @@ const KTSTR_DISK_READ_ONLY: ktstr::prelude::DiskConfig =
         throttle: ktstr::prelude::DiskThrottle {
             iops: None,
             bytes_per_sec: None,
+            iops_burst_capacity: None,
+            bytes_burst_capacity: None,
         },
         read_only: true,
         name: None,

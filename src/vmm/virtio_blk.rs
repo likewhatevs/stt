@@ -108,6 +108,7 @@
 //! latency penalty.
 
 use std::fs::File;
+use std::num::NonZeroU64;
 use std::os::unix::fs::FileExt;
 #[cfg(not(test))]
 use std::os::unix::io::AsRawFd;
@@ -377,7 +378,7 @@ const S_FEAT: u32 = S_DRV | VIRTIO_CONFIG_S_FEATURES_OK;
 const S_OK: u32 = S_FEAT | VIRTIO_CONFIG_S_DRIVER_OK;
 
 // ----------------------------------------------------------------------------
-// Token bucket throttle (firecracker pattern)
+// Token bucket throttle
 // ----------------------------------------------------------------------------
 
 /// Single token-bucket. `capacity` tokens accumulate at `refill_rate`
@@ -388,6 +389,42 @@ const S_OK: u32 = S_FEAT | VIRTIO_CONFIG_S_DRIVER_OK;
 /// "Leak rate" is implicit: every `consume` call first refills based
 /// on elapsed wall time since the last refill, capped at `capacity`.
 /// No periodic timer needed — the refill is on-demand per request.
+///
+/// # Overconsumption (request size > capacity)
+///
+/// `available` is `i64` (not `u64`) so a single oversized request —
+/// `n > capacity` — can be granted by driving `available` negative
+/// instead of stalling forever. Without this allowance, a guest that
+/// submits a chain whose `data_len` exceeds the bytes-bucket
+/// capacity would never make progress: `refill()` caps `available`
+/// at `capacity`, so the `available >= n` gate is permanently
+/// unsatisfiable, the worker arms its retry timerfd at every
+/// `RETRY_TIMER_MAX_NANOS` boundary, and the chain re-stalls
+/// indefinitely (livelock — the guest's hung-task watchdog is the
+/// only escape, default 120 s).
+///
+/// `consume(n)` policy:
+///
+/// - `n <= capacity` (normal path): grant when `available >= n`,
+///   `available -= n`. Otherwise return false; caller stalls.
+/// - `n > capacity` (overconsume): grant when `available >= 0`,
+///   `available -= n` (drives negative). Otherwise return false;
+///   caller stalls.
+///
+/// Followers (any subsequent request, regardless of size) wait
+/// proportional to the accumulated debt: while `available < 0`,
+/// every `consume(m)` for `m > 0` returns false, and
+/// `nanos_until_n_tokens` reports the time required for `refill()`
+/// to bring `available` back to either `m` (normal-sized followers)
+/// or `0` (oversized followers). The negative-balance design
+/// converts a stall-forever livelock into a finite-but-proportional
+/// wait: the oversized request runs immediately at the cost of
+/// debt that subsequent requests amortise over.
+///
+/// `consume(0)` and `can_consume(0)` always succeed — even when the
+/// bucket is in debt — because a zero-cost request has no token
+/// charge. T_FLUSH chains issue `bytes_bucket.consume(0)` and must
+/// not stall on a sibling oversized-T_OUT debt.
 ///
 /// # Non-blocking invariant
 ///
@@ -442,7 +479,17 @@ const S_OK: u32 = S_FEAT | VIRTIO_CONFIG_S_DRIVER_OK;
 struct TokenBucket {
     capacity: u64,
     refill_rate: u64, // tokens per second
-    available: u64,
+    /// Current token balance. `i64` (not `u64`) so an oversized
+    /// `consume(n > capacity)` can drive the balance negative
+    /// rather than re-stall forever. Range invariant:
+    /// `i64::MIN <= available <= i64::try_from(capacity).unwrap_or(i64::MAX)`.
+    /// The lower bound is `i64::MIN` because `consume`'s
+    /// `saturating_sub` floors at the type minimum on a
+    /// pathological-`n` subtraction. Negative values represent
+    /// debt accumulated by a prior overconsume; `refill()`
+    /// monotonically pays it down at `refill_rate`. See the
+    /// type-level "Overconsumption" doc for the full policy.
+    available: i64,
     last_refill: Instant,
     unlimited: bool,
 }
@@ -461,6 +508,14 @@ impl TokenBucket {
     /// Build a bucket with the given capacity that refills at the
     /// rate per second. `capacity == 0` becomes `unlimited()` (no
     /// throttle).
+    ///
+    /// `capacity > i64::MAX` is clamped at `i64::MAX` for the
+    /// initial `available` value. The bucket's `> capacity`
+    /// overconsume gate still uses the original `u64` capacity, so
+    /// the only observable effect is that the seed balance can
+    /// hold at most `i64::MAX` tokens — an immaterial bound for
+    /// realistic ktstr throttle settings (IOPS in the millions,
+    /// bytes/sec in the GB/s, both << 2^63).
     fn new(capacity: u64, refill_rate_per_sec: u64) -> Self {
         if capacity == 0 || refill_rate_per_sec == 0 {
             return Self::unlimited();
@@ -468,7 +523,7 @@ impl TokenBucket {
         Self {
             capacity,
             refill_rate: refill_rate_per_sec,
-            available: capacity,
+            available: i64::try_from(capacity).unwrap_or(i64::MAX),
             last_refill: Instant::now(),
             unlimited: false,
         }
@@ -501,21 +556,63 @@ impl TokenBucket {
         if new_tokens_u64 == 0 {
             return;
         }
-        self.available = self.available.saturating_add(new_tokens_u64).min(self.capacity);
+        // Pay down accumulated debt (negative `available`) and cap
+        // the positive side at `capacity`. `saturating_add` with an
+        // i64 addend pinned to `i64::MAX` keeps the addition safe
+        // for pathological elapsed-time values; `min(cap_i64)` then
+        // enforces the upper bound. `i64::try_from(self.capacity)`
+        // matches the seed clamp in `new()`.
+        let add = i64::try_from(new_tokens_u64).unwrap_or(i64::MAX);
+        let cap_i64 = i64::try_from(self.capacity).unwrap_or(i64::MAX);
+        self.available = self.available.saturating_add(add).min(cap_i64);
         self.last_refill = now;
     }
 
+    /// Drain `n` tokens. Returns `true` on success, `false` when the
+    /// bucket cannot satisfy the request (caller stalls).
+    ///
+    /// Three branches:
+    /// - `n == 0`: always succeeds with no mutation. Zero-cost
+    ///   requests (T_FLUSH on the bytes bucket) must not stall on a
+    ///   sibling oversized-T_OUT debt.
+    /// - `n > capacity` (overconsume): grant when `available >= 0`,
+    ///   set `available -= n` (drives negative). The negative
+    ///   balance is paid down by subsequent `refill()` calls;
+    ///   followers stall via the normal-path branch until the debt
+    ///   clears.
+    /// - `n <= capacity` (normal): grant when `available >= n`, set
+    ///   `available -= n`. Followers with `available < n` stall.
+    ///
+    /// `n > i64::MAX` is rejected (`false`). The drain caller caps
+    /// `data_len` at `SEG_MAX × SIZE_MAX = 128 MiB << 2^63` so the
+    /// rejection branch is unreachable from production callers,
+    /// but the guard prevents silent wraparound in `n as i64`
+    /// against a future caller bypassing the caps.
     fn consume(&mut self, n: u64) -> bool {
         if self.unlimited {
             return true;
         }
-        self.refill();
-        if self.available >= n {
-            self.available -= n;
-            true
-        } else {
-            false
+        if n == 0 {
+            return true;
         }
+        self.refill();
+        let Ok(n_signed) = i64::try_from(n) else {
+            return false;
+        };
+        let granted = if n > self.capacity {
+            self.available >= 0
+        } else {
+            self.available >= n_signed
+        };
+        if !granted {
+            return false;
+        }
+        // saturating_sub keeps `available >= i64::MIN` in the
+        // pathological-`n` case (n_signed near i64::MAX, available
+        // small-positive). The realistic range stays well above
+        // i64::MIN; the saturate is defense-in-depth.
+        self.available = self.available.saturating_sub(n_signed);
+        true
     }
 
     /// Check whether `n` tokens are currently available without
@@ -523,46 +620,101 @@ impl TokenBucket {
     /// pass" gate so a request that fails the bytes check doesn't
     /// silently drain the ops bucket (or vice versa). Refills
     /// on-demand so the answer reflects up-to-the-instant state.
+    ///
+    /// Returns the same predicate `consume(n)` would: zero-cost
+    /// requests always pass, oversized requests pass when
+    /// `available >= 0`, normal requests pass when
+    /// `available >= n`. `n > i64::MAX` returns false.
     fn can_consume(&mut self, n: u64) -> bool {
         if self.unlimited {
             return true;
         }
+        if n == 0 {
+            return true;
+        }
         self.refill();
-        self.available >= n
+        let Ok(n_signed) = i64::try_from(n) else {
+            return false;
+        };
+        if n > self.capacity {
+            self.available >= 0
+        } else {
+            self.available >= n_signed
+        }
     }
 
     /// Refill-deficit estimate: nanoseconds required for the bucket
-    /// to accumulate `need` tokens (post-refill). Returns `0` for the
-    /// unlimited fast path and when `need <= available` after the
-    /// in-place refill. Used to size the worker thread's retry-timer
-    /// when a request stalls on throttle exhaustion.
+    /// to permit `consume(need)` (post-refill). Returns `0` for the
+    /// unlimited fast path, the zero-cost case, and when the
+    /// post-refill state already satisfies `can_consume(need)`. Used
+    /// to size the worker thread's retry-timer when a request
+    /// stalls on throttle exhaustion.
     ///
-    /// Caller has already failed `can_consume(need)`; the answer is
-    /// the time until enough tokens accumulate at `refill_rate`. The
-    /// duration is the worst-case wait — the bucket may refill
-    /// faster if the kernel's monotonic clock advances faster than
-    /// expected (it doesn't), but never slower. Capping at `u64::MAX`
-    /// nanoseconds saturates if `need` is pathologically large
-    /// relative to `refill_rate`; the caller (worker_thread_main)
-    /// further caps the timer arm to a sane upper bound (worst case
-    /// well below the guest's hung-task watchdog at
-    /// `kernel.hung_task_timeout_secs`, default 120 s — virtio_blk
-    /// has no `mq_ops->timeout`, so an unpublished request hangs
-    /// until the watchdog fires or a higher layer retries).
+    /// The deficit calculation matches `consume`'s grant predicate:
+    ///
+    /// - `need > capacity` (overconsume retry): the gate is
+    ///   `available >= 0`. With `available < 0`, the caller waits
+    ///   `-available` tokens worth of refill time.
+    /// - `need <= capacity` (normal retry): the gate is
+    ///   `available >= need`. With `available < need` (possibly
+    ///   negative from a prior overconsume), the caller waits
+    ///   `need - available` tokens — `available`'s sign is
+    ///   handled directly (subtracting a negative `available`
+    ///   from `need` widens the deficit, which is exactly the
+    ///   "wait proportional to accumulated debt" property the
+    ///   overconsume policy promises).
+    ///
+    /// All math in `i128`/`u128` to keep deficits accurate even
+    /// when `available` approaches `i64::MIN` (the most-negative
+    /// post-overconsume balance, pinned by `consume`'s
+    /// `saturating_sub`) and `need` approaches `u64::MAX`.
+    /// Capping at `u64::MAX` nanoseconds saturates if `need` is
+    /// pathologically large relative to `refill_rate`; the caller
+    /// (worker_thread_main) further clamps the timer arm to
+    /// `RETRY_TIMER_MAX_NANOS` (1 s) so a pathological refill
+    /// rate can't push the retry past the guest's hung-task
+    /// watchdog (`kernel.hung_task_timeout_secs`, default 120 s —
+    /// virtio_blk has no `mq_ops->timeout`, so an unpublished
+    /// request hangs until the watchdog fires or a higher layer
+    /// retries).
+    ///
+    /// Caller has already failed `can_consume(need)` so the
+    /// non-zero return is the dominant path; the post-refill
+    /// `0` shortcut covers the race where the bucket refilled
+    /// between the upstream `can_consume` and this call.
     fn nanos_until_n_tokens(&mut self, need: u64) -> u64 {
-        if self.unlimited {
+        if self.unlimited || need == 0 {
             return 0;
         }
         self.refill();
-        if self.available >= need {
-            return 0;
-        }
-        let deficit = need - self.available;
+        // Deficit in i128 to avoid overflow: `available` ranges
+        // down to `i64::MIN` post-overconsume (pinned by
+        // `consume`'s `saturating_sub`); subtracting from a u64
+        // `need` near `u64::MAX` would otherwise overflow i64.
+        let deficit_i128: i128 = if need > self.capacity {
+            if self.available >= 0 {
+                return 0;
+            }
+            -(self.available as i128)
+        } else {
+            let avail_i128 = self.available as i128;
+            let need_i128 = need as i128;
+            if avail_i128 >= need_i128 {
+                return 0;
+            }
+            need_i128 - avail_i128
+        };
+        debug_assert!(
+            deficit_i128 > 0,
+            "deficit must be positive after the early-return \
+             arms above (need={need}, available={})",
+            self.available,
+        );
         // tokens / (tokens/sec) = sec. Want nanos: deficit * 1e9 /
-        // refill_rate, rounded up. ceil-div via (numerator +
-        // denom - 1) / denom; in u128 to avoid overflow on large
-        // deficits.
-        let numerator = (deficit as u128) * 1_000_000_000;
+        // refill_rate, rounded up. ceil-div via div_ceil; in u128
+        // to fit the post-multiply numerator for large deficits.
+        let deficit_u128 = deficit_i128 as u128;
+        let numerator = deficit_u128 * 1_000_000_000;
         let denom = self.refill_rate as u128;
         let nanos_u128 = numerator.div_ceil(denom);
         u64::try_from(nanos_u128).unwrap_or(u64::MAX)
@@ -581,26 +733,39 @@ impl TokenBucket {
     }
 }
 
-/// Materialise a [`DiskThrottle`] into a pair of token buckets with
-/// initial capacity == refill_rate (1-second burst). `None` on
-/// either field becomes the unlimited fast path. `Option<NonZeroU64>`
-/// is unwrapped via `NonZeroU64::get` so the bucket sees a plain
-/// `u64`; the type-level invariant (the value can't be 0) means the
-/// `if rate == 0` branch in `TokenBucket::new` is unreachable from
-/// this caller — kept there for defense-in-depth against direct
-/// construction.
+/// Materialise a [`DiskThrottle`] into a pair of token buckets.
+/// `None` on the rate field becomes the unlimited fast path.
+/// `Option<NonZeroU64>` is unwrapped via `NonZeroU64::get` so the
+/// bucket sees a plain `u64`; the type-level invariant (the value
+/// can't be 0) means the `if rate == 0` branch in
+/// `TokenBucket::new` is unreachable from this caller — kept there
+/// for defense-in-depth against direct construction.
+///
+/// # Bucket capacity
+///
+/// When `*_burst_capacity` is set, the bucket capacity equals the
+/// burst value (peak instantaneous burst the device absorbs).
+/// When `*_burst_capacity` is `None`, the capacity falls back to
+/// the refill rate — the historical 1-second-burst default.
+/// [`DiskThrottle::validate`] enforces `burst >= rate` and rejects
+/// burst-without-rate at VM build time, so this materialisation
+/// step trusts the input and never down-clamps the burst below the
+/// rate (such a bucket would discard refilled tokens immediately
+/// and silently reduce the steady-state rate).
 fn buckets_from_throttle(throttle: DiskThrottle) -> (TokenBucket, TokenBucket) {
     let ops_bucket = throttle
         .iops
         .map_or_else(TokenBucket::unlimited, |nz| {
             let r = nz.get();
-            TokenBucket::new(r, r)
+            let cap = throttle.iops_burst_capacity.map_or(r, NonZeroU64::get);
+            TokenBucket::new(cap, r)
         });
     let bytes_bucket = throttle
         .bytes_per_sec
         .map_or_else(TokenBucket::unlimited, |nz| {
             let r = nz.get();
-            TokenBucket::new(r, r)
+            let cap = throttle.bytes_burst_capacity.map_or(r, NonZeroU64::get);
+            TokenBucket::new(cap, r)
         });
     (ops_bucket, bytes_bucket)
 }
@@ -2588,9 +2753,16 @@ fn drain_bracket_impl(
 /// enough tokens. The cap is per-stall, not per-request — total
 /// per-request latency is `n * 1 s` worst case, where `n` is the
 /// number of re-stall cycles before the bucket holds enough tokens.
-/// This bound assumes request size ≤ bucket capacity. Requests
-/// larger than bucket capacity re-stall indefinitely under the
-/// current implementation.
+///
+/// Requests larger than bucket capacity are handled via the
+/// `TokenBucket` overconsume policy (see the type-level
+/// "Overconsumption" doc): the first oversized request grants
+/// immediately by driving `available` negative, and followers wait
+/// proportional to the accumulated debt. The retry-timer cap still
+/// applies — followers stalled behind the debt re-arm at every 1 s
+/// boundary until the debt clears, with finite (not unbounded)
+/// total wait.
+///
 /// A too-long cap is the dangerous direction: it risks tripping the
 /// guest's hung-task watchdog (`kernel.hung_task_timeout_secs`,
 /// default 120 s), since virtio_blk has no `mq_ops->timeout`
@@ -4492,6 +4664,8 @@ mod tests {
         let throttle = DiskThrottle {
             iops: std::num::NonZeroU64::new(4),
             bytes_per_sec: std::num::NonZeroU64::new(8192),
+            iops_burst_capacity: None,
+            bytes_burst_capacity: None,
         };
         let mut dev = make_device(VIRTIO_BLK_DEFAULT_CAPACITY_BYTES, throttle);
         // Pin last_refill so consume() doesn't passively refill in
@@ -4855,6 +5029,8 @@ mod tests {
         let throttle = DiskThrottle {
             iops: std::num::NonZeroU64::new(1),
             bytes_per_sec: None,
+            iops_burst_capacity: None,
+            bytes_burst_capacity: None,
         };
         let f = make_backed_file_with_pattern(cap, 0xAB);
         let mut dev = VirtioBlk::new(f, cap, throttle);
@@ -6032,7 +6208,7 @@ mod tests {
     fn token_bucket_consume_zero_is_free() {
         // A zero-byte data transfer (e.g. T_FLUSH) should not consume
         // any bytes-bucket tokens. Pin that consume(0) is a no-op
-        // success, which is the established firecracker semantic.
+        // success.
         let mut tb = TokenBucket::new(10, 10);
         for _ in 0..1_000 {
             assert!(tb.consume(0));
@@ -6115,22 +6291,44 @@ mod tests {
     /// deficit is pathologically large relative to refill_rate.
     /// Path: `numerator = deficit * 1e9` in u128 → divide by
     /// `refill_rate` (also in u128) → `try_from` to u64 returns
-    /// `u64::MAX` on overflow via `unwrap_or(u64::MAX)`. With
-    /// `refill_rate=1` and `need=u64::MAX`, the deficit is
-    /// effectively `u64::MAX` and the post-multiply numerator is
-    /// `u64::MAX * 1e9` (well within u128 capacity but well past
-    /// u64), so the saturation arm fires.
+    /// `u64::MAX` on overflow via `unwrap_or(u64::MAX)`.
+    ///
+    /// To reach the saturation path under the overconsume policy,
+    /// the bucket must be in debt before the call: with `available`
+    /// non-negative the `need > capacity` branch returns 0
+    /// immediately. Drive `available` deeply negative via an
+    /// oversized consume, pin `last_refill` so refill yields zero,
+    /// then ask for the wait — the deficit is effectively u64-scale
+    /// and the post-multiply numerator (~u64::MAX * 1e9) overflows
+    /// u64 in the final cast, hitting the `unwrap_or(u64::MAX)` arm.
     #[test]
     fn nanos_until_n_tokens_saturates_at_u64_max() {
+        // Capacity = 1, refill_rate = 1/sec. Overconsume(i64::MAX)
+        // pushes available from 1 to 1 - i64::MAX = -(i64::MAX - 1)
+        // = i64::MIN + 2 (well below zero, near i64::MIN).
         let mut tb = TokenBucket::new(1, 1);
-        // Drain the single token so available=0.
-        assert!(tb.consume(1));
-        // Pin last_refill so the in-place refill yields 0 tokens.
+        // Pin last_refill at construction so the consume() call
+        // below cannot pick up stray wall-clock refill between
+        // `new()`'s `Instant::now()` and our subsequent calls.
+        // Without this pin a slow test runner could trickle a
+        // refill-rate=1 token in, perturb `available`, and shift
+        // the post-overconsume balance off `i64::MIN + 2`.
         tb.set_last_refill_for_test(std::time::Instant::now());
+        let huge = i64::MAX as u64;
+        assert!(tb.consume(huge), "overconsume succeeds when available >= 0");
+        assert!(tb.available < 0, "post-overconsume balance is negative");
+        // Re-pin last_refill so the in-place refill in
+        // nanos_until_n_tokens yields 0 tokens and the deficit
+        // math is deterministic.
+        tb.set_last_refill_for_test(std::time::Instant::now());
+        // need (u64::MAX) > capacity (1); blocker is available < 0.
+        // deficit_i128 = -(available as i128); with available near
+        // i64::MIN, deficit is ~i64::MAX. nanos = deficit * 1e9 / 1
+        // overflows u64 → saturates.
         assert_eq!(
             tb.nanos_until_n_tokens(u64::MAX),
             u64::MAX,
-            "deficit=u64::MAX with rate=1 must saturate at u64::MAX",
+            "u64-scale deficit at rate=1 must saturate at u64::MAX",
         );
     }
 
@@ -6195,6 +6393,309 @@ mod tests {
             0,
             "post-refill `available >= need` must return 0",
         );
+    }
+
+    /// A single oversized request (`n > capacity`) is granted
+    /// immediately when the bucket is non-negative, driving
+    /// `available` negative. Without this allowance the chain
+    /// would stall forever — `refill()` caps `available` at
+    /// `capacity`, so `available >= n` is permanently
+    /// unsatisfiable for `n > capacity`. Pins the negative-balance
+    /// overconsume semantic (see `TokenBucket` type-level
+    /// "Overconsumption" doc).
+    #[test]
+    fn token_bucket_oversized_grants_and_drives_negative() {
+        let mut tb = TokenBucket::new(100, 100);
+        // 150 > capacity (100) and available (100) >= 0 → grant.
+        assert!(
+            tb.consume(150),
+            "oversized consume must grant when available >= 0",
+        );
+        assert_eq!(
+            tb.available, -50,
+            "post-overconsume balance must equal capacity - n",
+        );
+        // can_consume mirrors consume; a follower observation also
+        // sees the post-debt state.
+        assert!(
+            !tb.can_consume(1),
+            "follower (any size) stalls while bucket is in debt",
+        );
+    }
+
+    /// Two oversized requests back-to-back: the first grants
+    /// (driving available negative), the second stalls because
+    /// `available < 0` fails the overconsume gate. The follower
+    /// must wait for `refill()` to climb back to >= 0 — that's
+    /// the "wait proportional to accumulated debt" property of
+    /// the overconsume policy.
+    #[test]
+    fn token_bucket_oversized_back_to_back_second_stalls() {
+        let mut tb = TokenBucket::new(100, 100);
+        // First oversized grants.
+        assert!(tb.consume(150));
+        assert_eq!(tb.available, -50);
+        // Pin last_refill so the second consume's refill grants no
+        // tokens; otherwise the test would race wall-clock refills.
+        tb.set_last_refill_for_test(std::time::Instant::now());
+        // Second oversized must stall: available (-50) < 0 fails
+        // the overconsume gate.
+        assert!(
+            !tb.consume(150),
+            "second oversized must stall while bucket is in debt",
+        );
+        // Balance unchanged (consume returned false → no decrement).
+        assert_eq!(tb.available, -50);
+        // can_consume mirrors consume.
+        assert!(!tb.can_consume(150));
+    }
+
+    /// `nanos_until_n_tokens` reports the time-to-zero for an
+    /// oversized follower (need > capacity, available < 0): wait
+    /// = -available / refill_rate. With available=-50 and
+    /// rate=100/sec, the wait is 50/100 = 0.5 s = 500 ms ns.
+    #[test]
+    fn nanos_until_n_tokens_oversized_follower_waits_for_zero() {
+        let mut tb = TokenBucket::new(100, 100);
+        assert!(tb.consume(150));
+        assert_eq!(tb.available, -50);
+        // Pin last_refill so the in-place refill yields 0 tokens
+        // and the deficit math is deterministic.
+        tb.set_last_refill_for_test(std::time::Instant::now());
+        // need (200) > capacity (100); blocker is available < 0.
+        // deficit = -(-50) = 50; nanos = 50 * 1e9 / 100 = 500_000_000.
+        assert_eq!(
+            tb.nanos_until_n_tokens(200),
+            500_000_000,
+            "oversized follower waits for available to climb to 0",
+        );
+    }
+
+    /// `nanos_until_n_tokens` reports the wider deficit for a
+    /// normal-sized follower behind an overconsume debt: wait
+    /// = (need + |available|) / refill_rate. With need=10,
+    /// available=-50, rate=100/sec, wait = 60 / 100 = 0.6 s.
+    /// Verifies the negative-available case in the i128 deficit
+    /// math.
+    #[test]
+    fn nanos_until_n_tokens_normal_follower_after_debt() {
+        let mut tb = TokenBucket::new(100, 100);
+        assert!(tb.consume(150));
+        assert_eq!(tb.available, -50);
+        tb.set_last_refill_for_test(std::time::Instant::now());
+        assert_eq!(
+            tb.nanos_until_n_tokens(10),
+            600_000_000,
+            "normal-sized follower waits for available to climb \
+             from -50 to need=10",
+        );
+    }
+
+    /// `consume(n)` rejects `n > i64::MAX` to prevent silent
+    /// wraparound when casting `n as i64`. The drain caller caps
+    /// `data_len` well below i64::MAX (SEG_MAX × SIZE_MAX =
+    /// 128 MiB), so this branch is unreachable from production
+    /// callers — defense-in-depth against a future caller that
+    /// bypasses the gate. `can_consume(n)` mirrors the rejection.
+    #[test]
+    fn token_bucket_consume_rejects_n_above_i64_max() {
+        let mut tb = TokenBucket::new(100, 100);
+        let pathological = (i64::MAX as u64) + 1;
+        assert!(
+            !tb.can_consume(pathological),
+            "n > i64::MAX must fail can_consume — i64 cast guard",
+        );
+        assert!(
+            !tb.consume(pathological),
+            "n > i64::MAX must fail consume — i64 cast guard",
+        );
+        // Balance unchanged after rejection.
+        assert_eq!(tb.available, 100);
+        // u64::MAX also rejected.
+        assert!(!tb.consume(u64::MAX));
+        assert!(!tb.can_consume(u64::MAX));
+        assert_eq!(tb.available, 100);
+    }
+
+    /// `consume(0)` and `can_consume(0)` always succeed — even
+    /// when the bucket is in debt. T_FLUSH chains issue
+    /// `bytes_bucket.consume(0)` (data_len == 0 for flushes) and
+    /// must not stall on a sibling oversized-T_OUT debt.
+    /// Distinct from the existing `token_bucket_consume_zero_is_free`
+    /// test which checks the happy-path (full bucket); this test
+    /// pins the in-debt case.
+    #[test]
+    fn token_bucket_zero_consume_succeeds_in_debt() {
+        let mut tb = TokenBucket::new(100, 100);
+        assert!(tb.consume(150));
+        assert!(tb.available < 0, "bucket must be in debt");
+        // Zero-cost requests pass regardless of debt.
+        assert!(tb.consume(0));
+        assert!(tb.can_consume(0));
+        // Balance unchanged.
+        assert_eq!(tb.available, -50);
+    }
+
+    /// After enough refill, an in-debt bucket recovers and admits
+    /// followers normally. Pin the recovery semantic: with
+    /// available=-50 at rate=100/sec, ≥0.5 s of wall-clock refill
+    /// brings available back to >= 0; subsequent `consume(50)`
+    /// succeeds.
+    #[test]
+    fn token_bucket_debt_clears_with_refill() {
+        let mut tb = TokenBucket::new(100, 100);
+        assert!(tb.consume(150));
+        assert_eq!(tb.available, -50);
+        // Step last_refill back 1 s — refill grants 100 tokens,
+        // pays the -50 debt, brings available to +50, capped at
+        // capacity=100. Then consume(50) succeeds.
+        tb.set_last_refill_for_test(
+            std::time::Instant::now() - std::time::Duration::from_secs(1),
+        );
+        assert!(
+            tb.consume(50),
+            "consume must succeed after refill clears the debt",
+        );
+        assert_eq!(tb.available, 0);
+    }
+
+    /// An unlimited bucket grants every consume regardless of `n`,
+    /// including `n > i64::MAX`. The `unlimited` short-circuit
+    /// runs before the `i64::try_from` guard so a hostile guest
+    /// against an unconfigured-throttle disk still gets serviced.
+    #[test]
+    fn token_bucket_unlimited_grants_oversized() {
+        let mut tb = TokenBucket::unlimited();
+        assert!(tb.consume(u64::MAX));
+        assert!(tb.can_consume(u64::MAX));
+        assert_eq!(
+            tb.nanos_until_n_tokens(u64::MAX),
+            0,
+            "unlimited bucket reports zero wait for any need",
+        );
+    }
+
+    /// `consume(n)` with `n == capacity` takes the normal-path
+    /// branch (`available >= n_signed`), NOT the overconsume
+    /// branch (`available >= 0` for `n > capacity`). Pins the
+    /// strict-greater boundary in `consume`'s grant predicate:
+    /// changing `n > self.capacity` to `n >= self.capacity` would
+    /// re-route exact-capacity drains through the overconsume gate
+    /// and let a follower drain to debt without first earning
+    /// the full balance back.
+    ///
+    /// Construction: `new(100, 100)`, `consume(100)` succeeds
+    /// (available 100 >= 100), available drops to 0. Pin
+    /// `last_refill` so the second call's refill yields no
+    /// tokens. Second `consume(100)` must FAIL (normal path:
+    /// available 0 < 100; overconsume path also rejects because
+    /// 100 is NOT > capacity 100). Available remains 0 — proving
+    /// the overconsume branch was not entered (which would have
+    /// driven it to -100).
+    #[test]
+    fn token_bucket_consume_at_capacity_takes_normal_branch() {
+        let mut tb = TokenBucket::new(100, 100);
+        assert!(
+            tb.consume(100),
+            "n == capacity must succeed via normal-path \
+             available >= n_signed gate",
+        );
+        assert_eq!(tb.available, 0, "post-drain balance is zero, not negative");
+        // Pin last_refill so the next consume's refill grants no
+        // tokens; otherwise wall-clock drift could top up the
+        // bucket and mask the failure mode the test pins.
+        tb.set_last_refill_for_test(std::time::Instant::now());
+        assert!(
+            !tb.consume(100),
+            "n == capacity (not > capacity) must fail when \
+             available < n_signed; overconsume branch is \
+             strictly `n > capacity`, not `n >= capacity`",
+        );
+        assert_eq!(
+            tb.available, 0,
+            "available unchanged at 0 — overconsume branch did \
+             NOT drive it negative, proving the boundary check \
+             is `>` not `>=`",
+        );
+    }
+
+    /// `buckets_from_throttle` falls back to capacity = refill_rate
+    /// (1-second burst) when `*_burst_capacity` is `None`. Mirrors
+    /// the historical default before burst-capacity was a
+    /// configurable knob — every existing test that constructs a
+    /// throttle without burst fields must continue to observe the
+    /// old behaviour.
+    #[test]
+    fn buckets_from_throttle_default_burst_equals_rate() {
+        let throttle = DiskThrottle {
+            iops: NonZeroU64::new(1_000),
+            bytes_per_sec: NonZeroU64::new(50_000),
+            iops_burst_capacity: None,
+            bytes_burst_capacity: None,
+        };
+        let (ops, bytes) = buckets_from_throttle(throttle);
+        assert_eq!(ops.capacity, 1_000);
+        assert_eq!(ops.refill_rate, 1_000);
+        assert_eq!(ops.available, 1_000, "1-second-burst seed equals rate");
+        assert_eq!(bytes.capacity, 50_000);
+        assert_eq!(bytes.refill_rate, 50_000);
+        assert_eq!(bytes.available, 50_000);
+    }
+
+    /// `buckets_from_throttle` honours `*_burst_capacity` when
+    /// set: bucket capacity equals the burst value, refill rate
+    /// stays at the configured rate. A 5-second burst (capacity
+    /// = 5×rate) lets the bucket absorb a 5-second-equivalent
+    /// transient before throttling kicks in.
+    #[test]
+    fn buckets_from_throttle_burst_capacity_overrides_rate() {
+        let throttle = DiskThrottle {
+            iops: NonZeroU64::new(1_000),
+            bytes_per_sec: NonZeroU64::new(50_000),
+            iops_burst_capacity: NonZeroU64::new(5_000),
+            bytes_burst_capacity: NonZeroU64::new(250_000),
+        };
+        let (ops, bytes) = buckets_from_throttle(throttle);
+        assert_eq!(ops.capacity, 5_000);
+        assert_eq!(ops.refill_rate, 1_000);
+        assert_eq!(ops.available, 5_000, "seed equals burst capacity");
+        assert_eq!(bytes.capacity, 250_000);
+        assert_eq!(bytes.refill_rate, 50_000);
+        assert_eq!(bytes.available, 250_000);
+    }
+
+    /// `buckets_from_throttle` ignores `*_burst_capacity` when
+    /// the matching rate is `None`. The validate() step at the
+    /// API boundary rejects this combination, but materialisation
+    /// must be safe for any input: a `None`-rate field produces an
+    /// unlimited bucket regardless of any orphaned burst value.
+    #[test]
+    fn buckets_from_throttle_burst_without_rate_is_unlimited() {
+        let throttle = DiskThrottle {
+            iops: None,
+            bytes_per_sec: None,
+            iops_burst_capacity: NonZeroU64::new(5_000),
+            bytes_burst_capacity: NonZeroU64::new(250_000),
+        };
+        let (ops, bytes) = buckets_from_throttle(throttle);
+        assert!(ops.unlimited);
+        assert!(bytes.unlimited);
+    }
+
+    /// Mixed configuration: IOPS rate-only, bandwidth rate+burst.
+    /// Pins per-dimension independence — setting bandwidth burst
+    /// does not affect the IOPS bucket, and vice versa.
+    #[test]
+    fn buckets_from_throttle_per_dimension_independence() {
+        let throttle = DiskThrottle {
+            iops: NonZeroU64::new(1_000),
+            bytes_per_sec: NonZeroU64::new(50_000),
+            iops_burst_capacity: None,
+            bytes_burst_capacity: NonZeroU64::new(200_000),
+        };
+        let (ops, bytes) = buckets_from_throttle(throttle);
+        assert_eq!(ops.capacity, 1_000, "iops bucket falls back to rate");
+        assert_eq!(bytes.capacity, 200_000, "bytes bucket honours burst");
     }
 
     /// A read-only device must reject `VIRTIO_BLK_T_OUT` with
@@ -7169,6 +7670,8 @@ mod tests {
         let throttle = DiskThrottle {
             iops: std::num::NonZeroU64::new(1),
             bytes_per_sec: None,
+            iops_burst_capacity: None,
+            bytes_burst_capacity: None,
         };
         let mut dev = VirtioBlk::new(f, cap, throttle);
         let mem = make_chain_test_mem();
@@ -7327,6 +7830,8 @@ mod tests {
         let throttle = DiskThrottle {
             iops: std::num::NonZeroU64::new(1),
             bytes_per_sec: None,
+            iops_burst_capacity: None,
+            bytes_burst_capacity: None,
         };
         let mut dev = VirtioBlk::new(f, cap, throttle);
         let mem = make_chain_test_mem();
@@ -7508,6 +8013,8 @@ mod tests {
         let throttle = DiskThrottle {
             iops: std::num::NonZeroU64::new(1),
             bytes_per_sec: None,
+            iops_burst_capacity: None,
+            bytes_burst_capacity: None,
         };
         let mut dev = VirtioBlk::new(f, cap, throttle);
         let mem = make_chain_test_mem();
@@ -7668,6 +8175,8 @@ mod tests {
         let throttle = DiskThrottle {
             iops: std::num::NonZeroU64::new(1),
             bytes_per_sec: None,
+            iops_burst_capacity: None,
+            bytes_burst_capacity: None,
         };
         let mut dev = VirtioBlk::new(f, cap, throttle);
         // Drain the bucket so any throttle-path probe would stall.
@@ -7769,6 +8278,8 @@ mod tests {
         let throttle = DiskThrottle {
             iops: std::num::NonZeroU64::new(1),
             bytes_per_sec: None,
+            iops_burst_capacity: None,
+            bytes_burst_capacity: None,
         };
         let mut dev = VirtioBlk::new(f, cap, throttle);
         let mem = make_chain_test_mem();
@@ -7909,6 +8420,8 @@ mod tests {
         let throttle = DiskThrottle {
             iops: None,
             bytes_per_sec: std::num::NonZeroU64::new(512),
+            iops_burst_capacity: None,
+            bytes_burst_capacity: None,
         };
         let mut dev = VirtioBlk::new(f, cap, throttle);
         let mem = make_chain_test_mem();
@@ -7989,6 +8502,8 @@ mod tests {
         let throttle = DiskThrottle {
             iops: std::num::NonZeroU64::new(10),
             bytes_per_sec: std::num::NonZeroU64::new(1024),
+            iops_burst_capacity: None,
+            bytes_burst_capacity: None,
         };
         let mut dev = VirtioBlk::new(f, cap, throttle);
         let mem = make_chain_test_mem();
@@ -8074,6 +8589,8 @@ mod tests {
         let throttle = DiskThrottle {
             iops: None,
             bytes_per_sec: std::num::NonZeroU64::new(1024),
+            iops_burst_capacity: None,
+            bytes_burst_capacity: None,
         };
         let mut dev = VirtioBlk::new(f, cap, throttle);
         let mem = make_chain_test_mem();
@@ -8233,6 +8750,8 @@ mod tests {
         let throttle = DiskThrottle {
             iops: std::num::NonZeroU64::new(1),
             bytes_per_sec: None,
+            iops_burst_capacity: None,
+            bytes_burst_capacity: None,
         };
         let mut dev = VirtioBlk::new(f, cap, throttle);
         let mem = make_chain_test_mem();
@@ -8343,6 +8862,8 @@ mod tests {
         let throttle = DiskThrottle {
             iops: std::num::NonZeroU64::new(2),
             bytes_per_sec: None,
+            iops_burst_capacity: None,
+            bytes_burst_capacity: None,
         };
         let mut dev = VirtioBlk::new(f, cap, throttle);
         let mem = make_chain_test_mem();
@@ -8469,6 +8990,8 @@ mod tests {
         let throttle = DiskThrottle {
             iops: None,
             bytes_per_sec: std::num::NonZeroU64::new(1),
+            iops_burst_capacity: None,
+            bytes_burst_capacity: None,
         };
         let mut dev = VirtioBlk::new(f, cap, throttle);
         let mem = make_chain_test_mem();
@@ -9500,6 +10023,8 @@ mod tests {
         let throttle = DiskThrottle {
             iops: std::num::NonZeroU64::new(1),
             bytes_per_sec: None,
+            iops_burst_capacity: None,
+            bytes_burst_capacity: None,
         };
         let mut dev = VirtioBlk::new(f, cap, throttle);
         // Drain the bucket and pin its last_refill so refill on
@@ -11988,6 +12513,8 @@ mod tests {
         let throttle = DiskThrottle {
             iops: std::num::NonZeroU64::new(1),
             bytes_per_sec: None,
+            iops_burst_capacity: None,
+            bytes_burst_capacity: None,
         };
         let mem = make_chain_test_mem();
         let qsize = 16u16;
@@ -12724,6 +13251,8 @@ mod tests {
         let throttle = DiskThrottle {
             iops: std::num::NonZeroU64::new(1),
             bytes_per_sec: None,
+            iops_burst_capacity: None,
+            bytes_burst_capacity: None,
         };
         let mut dev = VirtioBlk::new(f, cap, throttle);
         let mem = make_chain_test_mem();
@@ -12804,6 +13333,8 @@ mod tests {
         let throttle = DiskThrottle {
             iops: std::num::NonZeroU64::new(1),
             bytes_per_sec: None,
+            iops_burst_capacity: None,
+            bytes_burst_capacity: None,
         };
         let mut dev = VirtioBlk::new(f, cap, throttle);
         let mem = make_chain_test_mem();
@@ -12893,6 +13424,8 @@ mod tests {
         let throttle = DiskThrottle {
             iops: std::num::NonZeroU64::new(1),
             bytes_per_sec: None,
+            iops_burst_capacity: None,
+            bytes_burst_capacity: None,
         };
         let mut dev = VirtioBlk::new(f, cap, throttle);
         let mem = make_chain_test_mem();
@@ -12972,6 +13505,8 @@ mod tests {
         let throttle = DiskThrottle {
             iops: std::num::NonZeroU64::new(1),
             bytes_per_sec: None,
+            iops_burst_capacity: None,
+            bytes_burst_capacity: None,
         };
         let mut dev = VirtioBlk::new(f, cap, throttle);
         let mem = make_chain_test_mem();
