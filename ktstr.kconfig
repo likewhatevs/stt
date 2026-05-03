@@ -40,6 +40,14 @@ CONFIG_PERF_EVENTS=y
 # CONFIG_PERF_EVENTS above); the symbol is defined only in
 # arch/arm64/Kconfig.
 CONFIG_HW_PERF_EVENTS=y
+# ARM_PMUV3: arm64 PMUv3 driver (drivers/perf/arm_pmuv3.c). bool with
+# `default ARM64` and `depends on HW_PERF_EVENTS && ((ARM && CPU_V7) ||
+# ARM64)` (drivers/perf/Kconfig). On arm64 it would be picked up by
+# defconfig anyway; declaring it explicitly pins the PMU driver in the
+# kconfig fragment so future merge_config runs cannot silently drop it
+# if the dependency chain changes. x86 builds ignore this symbol — it
+# is gated on ARM/ARM64 in drivers/perf/Kconfig.
+CONFIG_ARM_PMUV3=y
 # BPF_EVENTS: default y when deps met (KPROBE_EVENTS + PERF_EVENTS).
 # Explicit for clarity.
 CONFIG_BPF_EVENTS=y
