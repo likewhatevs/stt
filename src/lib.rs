@@ -468,8 +468,8 @@ pub fn kconfig_hash() -> String {
 /// CRC32 hash (8 hex chars) of a user-supplied `--extra-kconfig`
 /// fragment, hashed verbatim.
 ///
-/// Coordinator ruling D1/D2: hash raw bytes, no comment stripping or
-/// CRLF canonicalization. Two semantically-equivalent inputs with
+/// Hashes raw bytes — no comment stripping, no CRLF
+/// canonicalization. Two semantically-equivalent inputs with
 /// different comments or line endings produce different hashes and
 /// therefore land at distinct cache entries — accept the disk waste
 /// in exchange for byte-deterministic cache discrimination.

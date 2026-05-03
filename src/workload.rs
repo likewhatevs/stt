@@ -926,46 +926,384 @@ pub enum WorkType {
     /// `nanosleep` expiry the hrtimer callback `hrtimer_wakeup`
     /// calls `wake_up_process` → `try_to_wake_up`.
     ///
-    /// Distinct from [`Bursty`](Self::Bursty) (millisecond
-    /// `thread::sleep` regime) and from variants that block on
-    /// futex/pipe — IdleChurn's blocking primitive is `nanosleep`
-    /// directly, the same hrtimer path the idle thread itself
-    /// observes.
+    /// # When to use IdleChurn
     ///
-    /// **CPU enters idle only under exclusive pinning.** The
-    /// variant exercises the nanosleep → schedule path on every
-    /// iteration regardless of placement, but the CPU only
-    /// transitions to the idle class when no other tasks are
-    /// runnable on the pinned CPU. Run with
-    /// [`AffinityIntent::SingleCpu`] or a one-CPU `Exact` mask
-    /// for true idle-path testing; without exclusive pinning the
-    /// wake races against other runnable tasks and IdleChurn
-    /// degenerates to a yield-heavy variant.
+    /// Reach for IdleChurn when the test needs the kernel's
+    /// hrtimer + idle-class scheduling path — exercising the
+    /// nanosleep → schedule → idle → hrtimer-wakeup loop that
+    /// the idle thread itself observes. Concrete pickers:
     ///
-    /// **Timer slack.** The kernel adds
-    /// `current->timer_slack_ns` (~50µs default) to the
-    /// requested `sleep_duration` per `kernel/time/hrtimer.c::
-    /// schedule_hrtimeout_range`, so `sleep_duration` is a
-    /// **lower bound** on the observed idle interval. Sub-50µs
-    /// values do not produce sub-50µs idle periods.
+    /// - You need to measure scheduler wake placement after a
+    ///   `TASK_INTERRUPTIBLE` dequeue — IdleChurn blocks via
+    ///   `nanosleep` directly, the same hrtimer path the idle
+    ///   thread enters when no work is runnable.
+    /// - You need to drive the tick-stop / C-state boundary on
+    ///   the pinned CPU — sleeps > 1ms exercise the full idle
+    ///   path including the tickless branch (`tick_nohz_idle_enter`).
+    /// - You're A/B-testing scheduler behavior on the idle-class
+    ///   transition specifically (e.g. scx_lavd's idle-CPU
+    ///   selection vs scx_simple's), and need a reproducible
+    ///   workload that passes through the kernel idle path.
     ///
-    /// **Tick-stop boundary.** Sleeps > 1ms exercise the full
-    /// idle path including tick stop and (on configured
-    /// platforms) C-state entry. Sub-millisecond sleeps still
-    /// produce `sched_switch` transitions but skip the tick-stop
-    /// branch.
+    /// Choose [`Bursty`](Self::Bursty) instead when:
     ///
-    /// **Caveats**: no `PR_SET_TIMERSLACK` adjustment yet — the
-    /// kernel's default timer slack still applies; exclusive
-    /// pinning is currently a doc requirement, not an enforced
-    /// precondition; under `NO_HZ_FULL` tickless idle alters
-    /// wake-latency observation; inside a KVM guest the host
-    /// scheduler can amplify wake latency.
+    /// - The test measures THROUGHPUT under burst-then-sleep
+    ///   patterns at the millisecond regime — Bursty uses
+    ///   `thread::sleep` (which is itself nanosleep-backed but
+    ///   coarser-grained in libc) and matches the existing
+    ///   pthread/std-lib timing model most application
+    ///   benchmarks assume.
+    /// - The test needs >1 ms sleeps without caring about the
+    ///   idle-class transition specifically — Bursty is the
+    ///   simpler variant and has fewer caveats below.
     ///
-    /// `worker_group_size = None`. Spawn-side validation rejects
-    /// `Duration::ZERO` for either field (a zero burst makes the
-    /// loop pure sleep; a zero sleep collapses to
-    /// [`SpinWait`](Self::SpinWait)).
+    /// IdleChurn is distinct from variants that block on
+    /// futex/pipe (FutexPingPong, PipeIo, WakeChain) — those
+    /// route the wake through `futex_wake` /
+    /// `wake_up_interruptible_sync_poll`, exercising
+    /// inter-task-coordination paths. IdleChurn's blocking
+    /// primitive is the hrtimer expiry, not a peer's wake call.
+    ///
+    /// # Caveat impacts at a glance
+    ///
+    /// NB: the five bullets below mirror the detailed
+    /// sections that follow — keep both in sync when
+    /// editing.
+    ///
+    /// The five sections below detail the kernel-side mechanisms.
+    /// For test authors picking thresholds, the practical
+    /// per-iteration impact is:
+    ///
+    /// - **Timer slack** — observed sleep is
+    ///   `sleep_duration + current->timer_slack_ns`. Default
+    ///   slack is 50µs, so a `sleep_duration` of 80µs produces
+    ///   ~130µs actual sleep. For `sleep_duration` ≥ 1ms the
+    ///   slack is < 5% noise; for sub-100µs sleeps the slack
+    ///   floor dominates.
+    /// - **Task off-CPU vs CPU idle** — the worker off-CPUs
+    ///   every iteration regardless of placement, but the CPU
+    ///   only enters the idle class under exclusive pinning.
+    ///   Without `AffinityIntent::SingleCpu` the CPU runs
+    ///   another runnable task during the sleep window — the
+    ///   variant tests TASK transitions, not CPU-idle.
+    /// - **Degenerate-input rejection** — spawn-side rejects
+    ///   `Duration::ZERO` for either field with an actionable
+    ///   bail message. `burst_duration=0` collapses the loop to
+    ///   pure nanosleep (worker accrues no runtime);
+    ///   `sleep_duration=0` collapses to
+    ///   [`SpinWait`](Self::SpinWait) (no idle path exercised).
+    /// - **NO_HZ_FULL** — workers pinned to a CPU in the
+    ///   `nohz_full=` mask see a different wake-latency
+    ///   profile: lower median `resume_latencies_ns` from
+    ///   skipped tick re-arm, heavier high-percentile tail
+    ///   from deferred jiffy-driven work catchup. Mixing
+    ///   pinned-vs-unpinned workers across the mask boundary
+    ///   produces a bimodal distribution.
+    /// - **vCPU-in-KVM** — wake latency aggregates guest +
+    ///   host scheduler costs. `performance_mode=true` disables
+    ///   HLT vmexits so the test measures guest scheduling in
+    ///   isolation; `performance_mode=false` exercises the
+    ///   cross-VM idle path but adds host-scheduler jitter
+    ///   bounded by one host scheduler tick.
+    ///
+    /// # Task off-CPU is guaranteed; CPU idle is conditional
+    ///
+    /// IdleChurn exercises the **TASK off-CPU/back-on-CPU
+    /// transition** on every iteration — NOT necessarily the CPU
+    /// idle/exit transition. The two are distinct paths in the
+    /// scheduler and a test must pick the one the design
+    /// requires:
+    ///
+    /// - `do_nanosleep` at `kernel/time/hrtimer.c:2115-2148` calls
+    ///   `set_current_state(TASK_INTERRUPTIBLE | TASK_FREEZABLE)`
+    ///   then `schedule()`. The current task IS dequeued and goes
+    ///   off-CPU on every iteration regardless of what else is
+    ///   runnable. `nr_voluntary_ctxt_switches` ticks per
+    ///   iteration unconditionally.
+    /// - Whether the CPU enters the **idle class**
+    ///   (`__pick_next_task` selecting `pick_task_idle`) depends
+    ///   on what else is on the runqueue. If any other task is
+    ///   runnable on the pinned CPU, `schedule()` picks it and
+    ///   the CPU never idles for that iteration.
+    ///
+    /// Three concrete adversary scenarios where the CPU does NOT
+    /// enter the idle class even though IdleChurn fired:
+    ///
+    /// 1. **Multi-worker on a single CPU** — IdleChurn with
+    ///    `num_workers=2` and overlapping affinity runs A and B on
+    ///    the same CPU. When A nanosleeps, B is runnable; CPU
+    ///    runs B, never idles. The variant tests "worker churn"
+    ///    rather than "CPU idle/exit transitions".
+    /// 2. **Co-scheduled kernel threads** — kworker, ksoftirqd,
+    ///    rcu_* kthreads (kthread_run on the same CPU) and
+    ///    deferred-work softirqs run on every CPU periodically.
+    ///    For `sleep_duration` ~ ksoftirqd's wakeup interval
+    ///    (typically 1ms), the CPU may briefly run ksoftirqd
+    ///    between nanosleep and the next IdleChurn iteration —
+    ///    diluting the idle-transition signal.
+    /// 3. **Sibling test workloads in the same LLC** — a peer
+    ///    test pinned to a different CPU within the same LLC can
+    ///    spawn kernel threads that get migrated onto IdleChurn's
+    ///    CPU by the kernel's load balancer. The migration is
+    ///    invisible to the IdleChurn worker but breaks the
+    ///    "CPU is exclusive" assumption.
+    ///
+    /// **For TASK-off-CPU testing** (the default and the variant's
+    /// guaranteed semantic): no special pinning required — every
+    /// iteration off-CPUs the worker.
+    ///
+    /// **For CPU-idle-class testing**: ensure the worker has
+    /// exclusive CPU affinity AND no co-scheduled kernel threads.
+    /// Concrete recipe:
+    ///
+    /// - Use [`AffinityIntent::SingleCpu`] or a one-CPU `Exact`
+    ///   mask so only this worker is pinned to the CPU.
+    /// - Run under `performance_mode=true` so the CPU lock budget
+    ///   reserves the CPU for this test.
+    /// - Set `num_workers=1` (multiple IdleChurn workers on the
+    ///   same CPU break the assumption — see scenario 1 above).
+    /// - Be aware that kernel-side periodic work (RCU callbacks,
+    ///   vmstat updates, watchdog ticks) still runs on every CPU
+    ///   regardless of affinity — sub-millisecond sleeps will
+    ///   sometimes observe a non-idle iteration even with
+    ///   exclusive pinning.
+    ///
+    /// This is a runtime contract, not a static one. The
+    /// spawn-side does not check the affinity policy because
+    /// "exclusive" depends on the rest of the host's load,
+    /// which the framework cannot observe at spawn time.
+    ///
+    /// # Timer slack expands the requested sleep
+    ///
+    /// The kernel adds `current->timer_slack_ns` to the requested
+    /// `sleep_duration` inside `hrtimer_nanosleep` at
+    /// `kernel/time/hrtimer.c:2162-2188`, specifically the
+    /// `hrtimer_set_expires_range_ns(&t.timer, rqtp,
+    /// current->timer_slack_ns)` call at L2170.
+    /// `timer_slack_ns` is inherited from the parent at fork; the
+    /// kernel default propagated from `init_task` is 50000ns
+    /// (50µs, set at `init/init_task.c:172`). So:
+    ///
+    /// - `sleep_duration` is a **lower bound** on the observed
+    ///   idle interval — actual sleep extends by up to
+    ///   `current->timer_slack_ns` to let the kernel coalesce
+    ///   timer wakeups.
+    /// - Sub-50µs `sleep_duration` values do not produce sub-50µs
+    ///   idle periods — the slack floor dominates.
+    /// - **RT workers bypass slack.** Under
+    ///   [`SchedPolicy::Fifo`] or [`SchedPolicy::RoundRobin`] the
+    ///   kernel forces `timer_slack_ns` to 0
+    ///   (`kernel/sched/syscalls.c:258`), so RT IdleChurn workers
+    ///   get exact wake timing. CFS / SCHED_NORMAL workers
+    ///   inherit the 50µs default.
+    /// - IdleChurn does NOT call `PR_SET_TIMERSLACK` — the
+    ///   inherited 50µs default applies. Tests that need tighter
+    ///   wake timing on a CFS worker must set `PR_SET_TIMERSLACK`
+    ///   post-fork in a [`Custom`](Self::Custom) closure (or wait
+    ///   for a future IdleChurn extension), or run the worker
+    ///   under an RT policy.
+    ///
+    /// # Tick-stop boundary
+    ///
+    /// Sleeps > 1ms exercise the full idle path including tick
+    /// stop and (on configured platforms) C-state entry —
+    /// `tick_nohz_idle_enter`, `cpuidle_idle_call`, governor
+    /// selection. Sub-millisecond sleeps still produce
+    /// `sched_switch` transitions but skip the tick-stop branch
+    /// because the tick is reprogrammed for the imminent
+    /// expiry rather than stopped entirely.
+    ///
+    /// # NO_HZ_FULL alters wake observation
+    ///
+    /// Three NO_HZ kernel configurations affect wake latency
+    /// differently:
+    ///
+    /// - `CONFIG_HZ_PERIODIC` — the periodic timer tick fires
+    ///   every `1/CONFIG_HZ` seconds regardless of CPU state.
+    ///   Wake-from-idle latency is bounded above by the tick
+    ///   period; the kernel may choose to delay wakes to the
+    ///   next tick. Most predictable wake population, useful for
+    ///   strict-bound assertions.
+    /// - `CONFIG_NO_HZ_IDLE` — tick stops when a CPU goes idle
+    ///   but resumes immediately on any wake event. Wake latency
+    ///   reflects the `TASK_INTERRUPTIBLE → TASK_RUNNING`
+    ///   transition cost plus tick re-arming. This is the
+    ///   default on modern x86_64 / arm64 distro kernels and the
+    ///   posture ktstr's bundled `ktstr.kconfig` inherits (the
+    ///   fragment does not override NO_HZ_*).
+    /// - `CONFIG_NO_HZ_FULL` — for CPUs in the `nohz_full=` boot
+    ///   parameter mask, the tick stays stopped even when one
+    ///   task is runnable. Wake delivery routes through hrtimer
+    ///   expiry alone; the kernel skips tick re-arm on wake when
+    ///   no tick-dependent subsystem demands it
+    ///   (`tick_nohz_idle_enter` at `kernel/time/tick-sched.c`),
+    ///   so steady-state `resume_latencies_ns` reads LOWER on
+    ///   nohz_full CPUs than on `NO_HZ_IDLE` CPUs.
+    ///   The catch: deferred jiffy-driven work (RCU callbacks,
+    ///   vmstat updates, watchdog ticks) accumulates while the
+    ///   tick is stopped and produces visible long-tail jitter
+    ///   when it eventually runs — manifesting as occasional
+    ///   high-percentile spikes in the wake-latency distribution
+    ///   even though the median drops.
+    ///
+    /// IdleChurn behavior is consistent under
+    /// `CONFIG_NO_HZ_IDLE` (the default). On hosts with
+    /// `CONFIG_NO_HZ_FULL`, samples from workers whose CPU is in
+    /// the nohz_full mask are NOT directly comparable to samples
+    /// from CPUs outside that mask — the populations differ in
+    /// both the median (lower on nohz_full) and the tail (heavier
+    /// on nohz_full from deferred-work catchup). Tests asserting
+    /// precise idle-duration scheduler decisions (e.g. "tasks
+    /// idle <1ms get latency-sensitive treatment") must either:
+    ///
+    /// - require NO_HZ_FULL on (and pin the worker into the mask),
+    /// - require NO_HZ_FULL off (CONFIG_HZ_PERIODIC or
+    ///   CONFIG_NO_HZ_IDLE), or
+    /// - tolerate both populations with looser thresholds.
+    ///
+    /// The active mask is readable at runtime via
+    /// `/sys/devices/system/cpu/nohz_full`; IdleChurn does not
+    /// adjust the mask itself, and mixing pinned-vs-unpinned
+    /// workers in the same scenario produces a bimodal latency
+    /// distribution if the host is configured for nohz_full.
+    ///
+    /// # vCPU-in-KVM amplifies wake latency
+    ///
+    /// ktstr tests run inside KVM guests. IdleChurn's
+    /// `nanosleep` inside a guest vCPU has a layered cost:
+    ///
+    /// 1. Guest task calls `nanosleep` → guest kernel arms a
+    ///    guest-side hrtimer.
+    /// 2. Guest task off-CPUs (`TASK_INTERRUPTIBLE` →
+    ///    `schedule()`).
+    /// 3. Guest CPU idles → guest kernel issues `HLT` (or
+    ///    `MWAIT` on x86, `WFI` on arm64).
+    /// 4. The HLT either vmexits to host KVM or spins in-guest
+    ///    (see perf-mode interaction below).
+    /// 5. On vmexit: host KVM blocks the vCPU thread on a wait
+    ///    queue.
+    /// 6. Guest-side timer expires (in guest time) → host KVM
+    ///    injects a timer interrupt → vCPU thread wakes →
+    ///    vmenter back to guest.
+    /// 7. Guest kernel's hrtimer ISR fires →
+    ///    `wake_up_process` → guest scheduler reruns the
+    ///    IdleChurn task.
+    ///
+    /// `resume_latencies_ns` (the dispatch arm subtracts
+    /// `sleep_duration` to isolate scheduler-resume overhead)
+    /// captures the SUM of guest scheduling cost +
+    /// vmexit-vmenter round-trip + host scheduling cost. The
+    /// SCHEDULER-UNDER-TEST is the GUEST scheduler, but the
+    /// host's contribution can dominate under load.
+    ///
+    /// **Strict bound on host preemption.** The guest's hrtimer
+    /// expiry routes through the emulated LAPIC (x86) or arch
+    /// timer (arm64), both backed by host timers. If the host
+    /// has descheduled the vCPU thread (PLE-induced eviction
+    /// from a busy guest spinlock, host-side preemption by
+    /// higher-priority work, or simple oversubscription), the
+    /// guest's hrtimer CANNOT fire until the host re-runs the
+    /// vCPU thread. This is a hard additional latency bound
+    /// added on top of guest-side scheduling cost — the guest
+    /// scheduler under test cannot be observed through
+    /// IdleChurn while the host has preempted its vCPU.
+    ///
+    /// **Performance-mode interaction.** ktstr's x86_64 VMM
+    /// disables HLT vmexits when `performance_mode=true` (see
+    /// `src/vmm/x86_64/kvm.rs::Vm::new` around the
+    /// `KVM_X86_DISABLE_EXITS_HLT` enable_cap call). With HLT
+    /// exits disabled:
+    ///
+    /// - Step 4 stays in-guest: the vCPU spins on HLT without
+    ///   vmexit, consuming its assigned host CPU slot. The
+    ///   guest kernel still sees the CPU as idle, but the host
+    ///   never blocks the vCPU thread.
+    /// - Steps 5-6 collapse: no host wait queue, no
+    ///   guest-time-aware injection. The host runs the vCPU
+    ///   thread continuously, and the guest hrtimer expiry is
+    ///   handled inside the running vCPU.
+    /// - IdleChurn under `performance_mode=true` therefore
+    ///   tests ONLY the guest's idle path. It does NOT
+    ///   exercise the cross-VM idle / host-scheduler
+    ///   interaction. This is the right config for measuring
+    ///   guest scheduler decisions in isolation.
+    ///
+    /// With `performance_mode=false`, HLT vmexits fire and
+    /// IdleChurn DOES test the cross-VM idle path — but the
+    /// host scheduler's contribution to wake latency
+    /// interferes with timing-sensitive guest measurements.
+    ///
+    /// **Test-author guidance:**
+    ///
+    /// - For tests measuring GUEST scheduler decisions in
+    ///   isolation (e.g. `scx_lavd` idle-CPU selection): set
+    ///   `performance_mode=true` so the host doesn't perturb
+    ///   the measurement.
+    /// - For tests measuring CROSS-VM idle (e.g. how the host
+    ///   schedules a vCPU thread after a guest HLT): set
+    ///   `performance_mode=false`, run on a dedicated host (no
+    ///   noisy neighbors), and budget for host-scheduler-
+    ///   contributed jitter.
+    /// - On a heavily-loaded host (concurrent ktstr tests, or
+    ///   noisy neighbors), `resume_latencies_ns` reflects host
+    ///   contention even under `performance_mode=true` because
+    ///   the vCPU thread itself can be preempted on the host
+    ///   (the guest sees this as "the worker just took longer
+    ///   than it should").
+    ///
+    /// Distinguishing host vs guest contribution requires
+    /// host-side observation — e.g. `perf sched` on the vCPU
+    /// thread, or comparing
+    /// `/proc/<vcpu_tid>/status::voluntary_ctxt_switches`
+    /// before vs after the test window.
+    ///
+    /// # Wake-latency interpretation
+    ///
+    /// `resume_latencies_ns` samples for IdleChurn capture the
+    /// **scheduler-resume overhead** — the time the kernel spent
+    /// scheduling the worker back on-CPU after the requested
+    /// `sleep_duration` elapsed. The dispatch arm subtracts
+    /// `sleep_duration` from the measured nanosleep elapsed time,
+    /// leaving timer slack (default 50µs) plus
+    /// `try_to_wake_up` → on-CPU latency. This isolates the
+    /// signal a scheduler A/B test cares about: comparing
+    /// `resume_latencies_ns` distributions across schedulers
+    /// directly measures their idle-class → run-class transition
+    /// behavior without the requested-sleep duration dominating
+    /// the measurement.
+    ///
+    /// `saturating_sub` guards against the rare case where
+    /// `elapsed < sleep_duration`. That can happen on early-EINTR
+    /// returns or sub-tick measurement windows; saturating to 0
+    /// matches the "no observable resume overhead" interpretation.
+    ///
+    /// Samples ARE directly comparable to `resume_latencies_ns`
+    /// from FutexPingPong, FutexFanOut, and other wake-pair
+    /// variants — they all measure the post-block wake portion.
+    ///
+    /// # Spawn-time validation
+    ///
+    /// The spawn path rejects `burst_duration == Duration::ZERO`
+    /// (loop collapses to pure nanosleep, no runtime accrued)
+    /// and `sleep_duration == Duration::ZERO` (loop degenerates
+    /// to [`SpinWait`](Self::SpinWait), making the variant
+    /// useless as an idle-path test).
+    ///
+    /// The `sleep_duration == 0` rejection deserves an
+    /// implementation-rationale note: `nanosleep(0)` is NOT a
+    /// no-op — the kernel still calls
+    /// `set_current_state(TASK_INTERRUPTIBLE)` followed by
+    /// `schedule()`, which produces sched_yield-equivalent
+    /// semantics (yield to the next runnable task on the
+    /// runqueue, return immediately). That overlaps with
+    /// [`YieldHeavy`](Self::YieldHeavy) and provides no idle-path
+    /// signal, so the rejection sends the caller to the variant
+    /// that already covers the yield case. Both rejections
+    /// produce actionable bail messages naming the field and
+    /// the degenerate semantics — see the spawn-side check in
+    /// `WorkloadHandle::spawn`.
+    ///
+    /// `worker_group_size = None`.
     IdleChurn {
         /// Wall-clock duration of CPU work between idle
         /// periods. Use [`Duration`] to keep the unit visible at
@@ -1703,6 +2041,16 @@ impl WorkType {
     }
 
     /// Construct a [`WorkType::IdleChurn`].
+    ///
+    /// # Spawn-time precondition
+    ///
+    /// `burst_duration` and `sleep_duration` must both be
+    /// strictly greater than `Duration::ZERO`. The constructor
+    /// itself accepts any value (no early validation); the
+    /// rejection fires at [`WorkloadHandle::spawn`] time with an
+    /// actionable bail message naming the offending field. See
+    /// [`WorkType::IdleChurn`] variant doc for the rationale and
+    /// the kernel-source citation.
     pub fn idle_churn(burst_duration: Duration, sleep_duration: Duration) -> Self {
         WorkType::IdleChurn {
             burst_duration,
@@ -3842,7 +4190,8 @@ impl WorkloadHandle {
                 anyhow::bail!(
                     "WakeChain depth must be >= 2 (got {}, group {}); a 1-stage \
                      chain has no successor to wake and the post-fork fd close \
-                     logic would close the worker's own write end",
+                     logic would close the worker's own write end \
+                     (see [`WorkType::WakeChain`] variant doc)",
                     depth,
                     group.group_idx,
                 );
@@ -3864,7 +4213,7 @@ impl WorkloadHandle {
                     anyhow::bail!(
                         "IdleChurn burst_duration must be > 0 (group {}); a zero \
                          burst makes the loop pure sleep and the worker accrues \
-                         no runtime",
+                         no runtime (see [`WorkType::IdleChurn`] variant doc)",
                         group.group_idx,
                     );
                 }
@@ -3872,7 +4221,8 @@ impl WorkloadHandle {
                     anyhow::bail!(
                         "IdleChurn sleep_duration must be > 0 (group {}); a zero \
                          sleep collapses the variant to SpinWait. Use \
-                         WorkType::SpinWait directly.",
+                         WorkType::SpinWait directly \
+                         (see [`WorkType::IdleChurn`] variant doc).",
                         group.group_idx,
                     );
                 }
@@ -4068,12 +4418,10 @@ impl WorkloadHandle {
 
         // For paired work types, create one pipe per worker pair before forking.
         // pipe_pairs[pair_idx] = (read_fd, write_fd) for the A->B direction,
-        // and a second pipe for B->A. Use `pipe2(O_CLOEXEC)` rather
-        // than bare `pipe(2)` for defense-in-depth: workers don't
-        // exec today, but a future code path that adds an exec
-        // (e.g. a Custom worker shelling out a helper binary)
-        // would inherit these fds without O_CLOEXEC and leak the
-        // pipe ends into the helper's fd table.
+        // and a second pipe for B->A. Use `pipe2(O_CLOEXEC)` instead
+        // of bare `pipe(2)`: O_CLOEXEC is the correct default for
+        // any kernel fd in long-running processes — fds without
+        // O_CLOEXEC silently leak into any exec path.
         if needs_pipes {
             for _ in 0..group.num_workers / 2 {
                 let mut ab = [0i32; 2]; // A writes, B reads
@@ -8048,8 +8396,15 @@ fn worker_main(
             } => {
                 // Per-iteration: spin for `burst_duration`, then
                 // `nanosleep` for `sleep_duration`. Both fields
-                // are pre-validated non-zero at spawn time, so
-                // the loop always exercises both phases.
+                // are pre-validated non-zero at spawn time — the
+                // `if let WorkType::IdleChurn { ... }` block
+                // inside `WorkloadHandle::spawn`'s per-group
+                // setup loop bails on `Duration::ZERO` for either
+                // field with an actionable diagnostic before this
+                // dispatch arm runs (grep
+                // `IdleChurn burst_duration must be > 0`). The
+                // loop body therefore always exercises both
+                // phases.
                 //
                 // The nanosleep dequeues the task into
                 // TASK_INTERRUPTIBLE; on a CPU with no other
@@ -8115,10 +8470,32 @@ fn worker_main(
                         break;
                     }
                 }
+                // Isolate the scheduler-resume overhead from the
+                // sleep request. `before_sleep.elapsed()` measures
+                // the FULL nanosleep interval — `sleep_duration` +
+                // `current->timer_slack_ns` (default 50µs) +
+                // wake-path delay. Subtracting the requested
+                // `sleep_duration` leaves the slack + actual
+                // try_to_wake_up → on-CPU latency, which is the
+                // signal a scheduler-A/B test cares about.
+                //
+                // saturating_sub guards against the rare case
+                // where `elapsed < sleep_duration`. That can
+                // happen if the kernel returns from nanosleep
+                // early (EINTR with rem=null still yields control
+                // immediately under some signal-delivery races,
+                // and Instant::now's monotonic clock has finite
+                // resolution — a sub-tick measurement window can
+                // round to a value below the request). The
+                // saturation produces 0 instead of underflowing
+                // u64, matching the "no observable resume
+                // overhead" interpretation.
+                let elapsed = before_sleep.elapsed();
+                let resume_overhead = elapsed.saturating_sub(sleep_duration);
                 reservoir_push(
                     &mut resume_latencies_ns,
                     &mut wake_sample_count,
-                    before_sleep.elapsed().as_nanos() as u64,
+                    resume_overhead.as_nanos() as u64,
                     MAX_WAKE_SAMPLES,
                 );
                 last_iter_time = Instant::now();
@@ -14304,10 +14681,10 @@ mod tests {
     /// shared fd table makes the bug behavior identical, and
     /// Fork covers the production path.
     ///
-    /// Adversarial-test charter: this test is destructive — its
-    /// job is to prove the bootstrap-once invariant by failing
-    /// catastrophically when the guard is dropped. It does NOT
-    /// validate normal operation in detail; that lives in
+    /// This test is intentionally narrow — it asserts the
+    /// bootstrap-once invariant by failing catastrophically when
+    /// the guard is dropped, and does not exercise normal
+    /// operation. Normal-operation coverage lives in
     /// [`spawn_thread_with_wake_chain_pipe`] and similar.
     #[test]
     fn wake_chain_pipe_bootstrap_once_invariant() {
@@ -15518,6 +15895,157 @@ mod tests {
         for r in &reports {
             assert!(r.iterations > 0, "IdleChurn worker must iterate: {r:?}");
         }
+    }
+
+    // -- IdleChurn spawn-side validation coverage --
+    //
+    // Pin the bail messages emitted by the IdleChurn arm of
+    // `WorkloadHandle::spawn`'s per-group validation: zero
+    // sleep_duration collapses to SpinWait, zero burst_duration
+    // produces pure-sleep no-runtime workers, both-zero must fire
+    // the burst check first (validation order), and minimal
+    // non-zero values must pass through. Composed groups must
+    // tag their group_idx in the diagnostic so multi-group test
+    // scenarios can locate the offending entry.
+
+    /// Zero `sleep_duration` collapses IdleChurn to SpinWait — the
+    /// bail must name `sleep_duration` and steer the caller to
+    /// SpinWait directly.
+    #[test]
+    fn idle_churn_zero_sleep_rejects() {
+        let cfg = WorkloadConfig {
+            num_workers: 1,
+            work_type: WorkType::IdleChurn {
+                burst_duration: Duration::from_millis(1),
+                sleep_duration: Duration::ZERO,
+            },
+            ..Default::default()
+        };
+        let err = WorkloadHandle::spawn(&cfg)
+            .err()
+            .expect("IdleChurn with sleep_duration=ZERO must be rejected at spawn");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("sleep_duration must be > 0"),
+            "diagnostic must name the rejected field; got: {msg}",
+        );
+        assert!(
+            msg.contains("SpinWait"),
+            "diagnostic must steer the caller to SpinWait; got: {msg}",
+        );
+    }
+
+    /// Zero `burst_duration` makes the loop pure sleep — the bail
+    /// must name `burst_duration` and explain "pure sleep".
+    #[test]
+    fn idle_churn_zero_burst_rejects() {
+        let cfg = WorkloadConfig {
+            num_workers: 1,
+            work_type: WorkType::IdleChurn {
+                burst_duration: Duration::ZERO,
+                sleep_duration: Duration::from_millis(5),
+            },
+            ..Default::default()
+        };
+        let err = WorkloadHandle::spawn(&cfg)
+            .err()
+            .expect("IdleChurn with burst_duration=ZERO must be rejected at spawn");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("burst_duration must be > 0"),
+            "diagnostic must name the rejected field; got: {msg}",
+        );
+        assert!(
+            msg.contains("pure sleep"),
+            "diagnostic must explain the pure-sleep degeneracy; got: {msg}",
+        );
+    }
+
+    /// When both fields are zero, the burst check must fire first
+    /// (validation order). The diagnostic must name
+    /// `burst_duration` and must NOT name `sleep_duration` —
+    /// proving the spawn returns on the first failed check rather
+    /// than concatenating both messages.
+    #[test]
+    fn idle_churn_both_zero_rejects_burst_first() {
+        let cfg = WorkloadConfig {
+            num_workers: 1,
+            work_type: WorkType::IdleChurn {
+                burst_duration: Duration::ZERO,
+                sleep_duration: Duration::ZERO,
+            },
+            ..Default::default()
+        };
+        let err = WorkloadHandle::spawn(&cfg)
+            .err()
+            .expect("IdleChurn with both fields ZERO must be rejected at spawn");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("burst_duration must be > 0"),
+            "burst check fires first; diagnostic must name burst_duration: {msg}",
+        );
+        assert!(
+            !msg.contains("sleep_duration must be > 0"),
+            "sleep check must NOT fire when burst already failed; got: {msg}",
+        );
+    }
+
+    /// Minimum-valid Durations (1ns each) must pass spawn-time
+    /// validation. The runtime semantics of 1ns burst+sleep are
+    /// degenerate (timer slack dominates the sleep, the burst
+    /// completes in a single iter check), but spawn must accept
+    /// any non-zero Duration — only `Duration::ZERO` is rejected.
+    /// Start+stop immediately to bound test runtime.
+    #[test]
+    fn idle_churn_min_valid_durations_pass_validation() {
+        let cfg = WorkloadConfig {
+            num_workers: 1,
+            work_type: WorkType::IdleChurn {
+                burst_duration: Duration::from_nanos(1),
+                sleep_duration: Duration::from_nanos(1),
+            },
+            ..Default::default()
+        };
+        let mut h = WorkloadHandle::spawn(&cfg)
+            .expect("IdleChurn with 1ns durations must pass spawn-side validation");
+        h.start();
+        let _reports = h.stop_and_collect();
+    }
+
+    /// Composed groups must tag their `group_idx` in the bail
+    /// diagnostic so multi-group scenarios can locate the
+    /// offending entry. Primary IdleChurn is valid; the composed
+    /// group at index 1 has zero burst_duration. The error must
+    /// mention "group 1" so the caller knows WHICH composed entry
+    /// is malformed.
+    #[test]
+    fn idle_churn_zero_in_composed_group_rejects_with_group_idx() {
+        let cfg = WorkloadConfig::default()
+            .work_type(WorkType::IdleChurn {
+                burst_duration: Duration::from_millis(1),
+                sleep_duration: Duration::from_millis(5),
+            })
+            .workers(1)
+            .with_composed(
+                WorkSpec::default()
+                    .work_type(WorkType::IdleChurn {
+                        burst_duration: Duration::ZERO,
+                        sleep_duration: Duration::from_millis(5),
+                    })
+                    .workers(1),
+            );
+        let err = WorkloadHandle::spawn(&cfg)
+            .err()
+            .expect("composed IdleChurn with burst_duration=ZERO must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("burst_duration must be > 0"),
+            "diagnostic must name the rejected field; got: {msg}",
+        );
+        assert!(
+            msg.contains("group 1"),
+            "diagnostic must tag the composed group_idx (1); got: {msg}",
+        );
     }
 
     // -- Thread-mode dispatch coverage expansion --

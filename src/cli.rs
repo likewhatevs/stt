@@ -6705,19 +6705,18 @@ mod tests {
         }
     }
 
-    /// Per the design ruling: the most-common-case `fix:`
-    /// assignments are Some for project_commit (run from a
+    /// `fix:` assignment policy: Some for fields with a single
+    /// concrete recovery action — project_commit (run from a
     /// git-tracked source tree), kernel_commit (set
-    /// KTSTR_KERNEL), host (re-run), and run_source (re-run or
-    /// rename). Other Actionable fields (monitor / kvm_stats /
-    /// kernel_version / cleanup_duration_ms) span causes that
-    /// don't converge on a single operator action and
-    /// intentionally carry None. Encoding the assignment matrix
-    /// in a test makes a future reviewer's "why doesn't monitor
-    /// have a fix?" question answerable from the test name
-    /// alone.
+    /// KTSTR_KERNEL), host (re-run), run_source (re-run or
+    /// rename). None for Actionable fields whose cause set spans
+    /// multiple unrelated remedies (monitor / kvm_stats /
+    /// kernel_version / cleanup_duration_ms) — no single
+    /// operator action covers them. Encoding the matrix in a
+    /// test makes "why doesn't monitor have a fix?" answerable
+    /// from the test name alone.
     #[test]
-    fn none_catalog_fix_assignments_match_design_ruling() {
+    fn none_catalog_fix_assignments_match_policy() {
         let by_field: std::collections::HashMap<&'static str, Option<&'static str>> =
             super::SIDECAR_NONE_CATALOG
                 .iter()
@@ -6755,7 +6754,7 @@ mod tests {
             let fix = by_field.get(field).copied().flatten();
             assert!(
                 fix.is_some(),
-                "field {field} must carry a `fix:` per the design ruling",
+                "field {field} has a single concrete recovery action and must carry a `fix:`",
             );
         }
         for field in &must_not_fix {
@@ -6910,7 +6909,7 @@ mod tests {
             .iter()
             .find(|e| e.field == "project_commit")
             .and_then(|e| e.fix)
-            .expect("project_commit must carry a fix per the design ruling");
+            .expect("project_commit has a single concrete recovery action and must carry a fix");
         assert!(
             out.contains(&format!("fix: {project_commit_fix}")),
             "project_commit's fix: line must render its catalog \
@@ -7951,8 +7950,8 @@ mod tests {
     /// Catalog classification per field is operator-visible as a
     /// stable tag (`expected` vs `actionable`). A typo regression
     /// flipping any field's classification would silently mislead
-    /// dashboards and triage. Pin the exact mapping per the
-    /// catalog's documented design ruling.
+    /// dashboards and triage. Pin the exact mapping documented on
+    /// each catalog entry.
     ///
     /// HashMap dedup guard: collecting catalog entries into a
     /// `HashMap` keyed by field name silently overwrites
@@ -7984,11 +7983,11 @@ mod tests {
             by_field.len(),
             super::SIDECAR_NONE_CATALOG.len(),
         );
-        // Per-field expected classification — pinned from the
-        // catalog's documented design ruling. Two Expected
-        // (steady-state None with no operator action), eight
-        // Actionable (operator can recover or environment is
-        // wrong).
+        // Per-field expected classification — pinned from each
+        // catalog entry's documented classification: two
+        // Expected (steady-state None with no operator action)
+        // and eight Actionable (operator can recover or
+        // environment is wrong).
         let expected_pairs: &[(&str, super::NoneClassification)] = &[
             ("scheduler_commit", super::NoneClassification::Expected),
             ("payload", super::NoneClassification::Expected),
@@ -10089,8 +10088,8 @@ CONFIG_BAR=m\n";
     /// Pin the literal env-var name. A future rename must update
     /// every reader in lockstep (the constant is the single
     /// source of truth, but if this test fails alongside an
-    /// unrelated change, it surfaces the rename to the team
-    /// reviewer).
+    /// unrelated change, the failure surfaces the rename in code
+    /// review).
     #[test]
     fn ktstr_kernel_parallelism_env_const_matches_literal() {
         assert_eq!(

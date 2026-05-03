@@ -13,10 +13,10 @@
 //!
 //! 2. **Incremental snapshot ring** ([`SnapshotRing`],
 //!    [`IncrementalCapture`]) — periodic VM-freeze capture of raw
-//!    BPF state bytes for deferred render at trigger time. Steady
-//!    cadence is 1 Hz with 10 Hz escalation under stall-proximate
-//!    conditions and a 60-entry ring; rendering only on trigger
-//!    keeps observer effect to ~0.2-1% wall-time at the 5s interval.
+//!    BPF state bytes for deferred render at trigger time. Cadence,
+//!    ring depth, and rendering policy are tuned per consumer; the
+//!    [`DEFAULT_SNAPSHOT_RING_DEPTH`] constant pins the storage
+//!    budget at 60 entries.
 //!
 //! Both surfaces compose into [`super::dump::DumpContext`] as
 //! optional captures so frozen-VM and live-host pipelines can

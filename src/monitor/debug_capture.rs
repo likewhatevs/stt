@@ -35,17 +35,17 @@
 //! generator is the downstream consumer. Splitting at this module
 //! boundary keeps each side free to evolve independently.
 //!
-//! The fingerprint projection lives here (rather than in the reproducer
-//! generator module) because
-//! it's a pure function of capture data — the reproducer generator
-//! consumes the projected hints rather than re-deriving them, and
-//! that boundary is testable without a working producer or generator.
+//! The fingerprint projection lives here rather than in the
+//! reproducer generator module because it's a pure function of
+//! capture data — the reproducer generator consumes the projected
+//! hints rather than re-deriving them, and that boundary is testable
+//! without a working producer or generator.
 //!
 //! # Vocabulary alignment with ktstr test primitives
 //!
-//! The capture format must speak
-//! the same vocabulary as the test library. Projected hints map
-//! one-to-one with primitive types in `crate::workload`:
+//! The capture format must speak the same vocabulary as the test
+//! library. Projected hints map one-to-one with primitive types in
+//! `crate::workload`:
 //!
 //! | observation                      | hint type                          |
 //! |----------------------------------|------------------------------------|

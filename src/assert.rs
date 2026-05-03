@@ -2166,10 +2166,11 @@ impl Verdict {
     ///
     /// Public so the `#[derive(Claim)]` generator and the `claim!`
     /// macro can dispatch through it; not the recommended user-facing
-    /// entry point. Hand-typing `verdict.claim("subject", value)` is a
-    /// design violation — the team rejected manual labels because they
-    /// drift independent of the value they label. Use the derive or
-    /// the macro instead.
+    /// entry point. Hand-typing `verdict.claim("subject", value)` is
+    /// disallowed: a manual string can drift from the value it
+    /// labels (rename a field, leave the literal stale), so labels
+    /// must originate from `stringify!(field)` or `stringify!(expr)`
+    /// via the derive or the macro.
     #[doc(hidden)]
     pub fn claim<T>(&mut self, name: &'static str, value: T) -> ClaimBuilder<'_, T> {
         ClaimBuilder {

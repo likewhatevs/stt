@@ -17,13 +17,12 @@
 //! # The translation contract
 //!
 //! The generator's job is to take fingerprint HINTS (best-effort
-//! projections from
-//! capture data) and emit a test spec the framework will execute.
-//! The generator is NOT a classifier — it does not decide "this
-//! workload is locking-bound" or "this is a cache pressure
-//! pathology"; it just maps observed shapes to primitive types.
-//! Pathology classification is a separate, downstream concern (the
-//! reader / LLM consuming `ktstr show / compare`).
+//! projections from capture data) and emit a test spec the framework
+//! will execute. The generator is NOT a classifier — it does not
+//! decide "this workload is locking-bound" or "this is a cache
+//! pressure pathology"; it just maps observed shapes to primitive
+//! types. Pathology classification is a separate, downstream
+//! concern (the reader / LLM consuming `ktstr show / compare`).
 //!
 //! # Mapping table
 //!

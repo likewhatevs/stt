@@ -280,12 +280,33 @@ pub(crate) fn host_resource_snapshot() -> String {
 /// The false-positive cost is bounded by [`host_resource_snapshot`]'s
 /// `near_limit` flag — operators can grep for `near_limit=false` +
 /// sustained SKIPs to catch a kernel-side regression that the
-/// classifier silently masks. Adding a host-pressure heuristic to
-/// the classification path itself (reading `near_limit` here and
-/// returning the underlying error unchanged when the host is NOT
-/// under pressure) would need design-team review — which errnos
-/// trigger it, what threshold counts as "real pressure", how to
-/// avoid race conditions with concurrent peers' allocations.
+/// classifier silently masks. The proposed refinement is a
+/// `near_limit`-gated bypass: when the snapshot reports
+/// `near_limit=false` AND the errno is in the soft-contention set
+/// (EAGAIN, ENOMEM), return the underlying error unchanged instead
+/// of wrapping in `ResourceContention`. EBUSY stays unconditionally
+/// classified because kvm-ioctls returns it strictly under
+/// host-resource pressure (per the kvm-ioctls source). The remaining
+/// `TRANSIENT_HOST_ERRNOS` entries (EMFILE, ENFILE, ENOSPC) are
+/// always host-resource-driven by definition, so gating them on
+/// `near_limit` would only mask the trigger.
+///
+/// The bypass is not implemented today because:
+/// - The TRANSIENT_HOST_ERRNOS set is small and conservative; the
+///   bias-toward-SKIP behavior is the correct default until the
+///   `near_limit=false + sustained SKIPs` triage workflow surfaces
+///   a real masking case the bypass would have caught.
+/// - The `near_limit` snapshot is read AFTER the failure, so a peer
+///   allocation between the ioctl and the snapshot would mark the
+///   host pressured retroactively. Steady-state analysis shows the
+///   per-thread atomic `/proc/self/status` reads bound the
+///   inconsistency to a single iteration, well within the
+///   macro-layer retry budget — but the bypass design must verify
+///   that empirically before flipping the default.
+/// - The bypass changes observable test outcomes (some
+///   currently-SKIPped tests would FAIL), so it is a behavior
+///   change that warrants its own commit + soak window rather than
+///   piggy-backing on the classifier's introduction.
 pub(crate) fn map_transient_to_contention(
     e: kvm_ioctls::Error,
     context: impl Into<String>,

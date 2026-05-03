@@ -692,31 +692,41 @@ fn dedupe_include_files(
 // non-x86_64 definition saves only sigmask + SIGRTMIN.
 
 /// Public-crate entry point. Thin wrapper around
-/// [`run_ktstr_test_inner_impl`] that records a skip sidecar
-/// whenever the inner pipeline bails with a
-/// [`crate::vmm::host_topology::ResourceContention`] from any
-/// `?`-propagated site — `ensure_kvm`, `resolve_test_kernel`,
-/// `acquire_test_kernel_lock_if_cached`, `resolve_scheduler`, the
-/// declarative-include-files resolver, or any other early bail
-/// before VM build. Without this catch-all, contention before
-/// `builder.build()` skipped silently from stats tooling's
-/// perspective: the macro-layer SKIP banner fired (so libtest
-/// saw a pass), but the sidecar — the artifact stats tooling
-/// reads to count skips per test — never landed.
+/// [`run_ktstr_test_inner_impl`] that records a skip sidecar as a
+/// **defensive late catch-all** whenever the inner pipeline bails
+/// with a [`crate::vmm::host_topology::ResourceContention`].
 ///
-/// The two existing `match builder.build() { ... }` and
-/// `match vm.run() { ... }` arms downstream still record the
-/// sidecar at their own sites; this wrapper backs them up by
-/// catching anything they missed. Double-recording is acceptable
-/// but NOT idempotent in the strict sense: the wrapper's write
-/// overwrites the per-site write's `run_id` and timestamp with
-/// fresh values produced at wrapper-return time. Both recordings
-/// carry the same skip classification (the same
-/// `ResourceContention` reason flowing through the same
-/// `write_skip_sidecar`), so the final sidecar is correct for
-/// stats tooling — only the run_id / timestamp shift between the
-/// two writes, and downstream tooling keys on (test name, skip
-/// classification), not on those volatile fields.
+/// No pre-build path constructs `ResourceContention` today. Every
+/// `ResourceContention` construction site in the crate
+/// (`vmm::host_topology` and `vmm::mod`) fires from inside
+/// `builder.build()` or `vm.run()` — both already record their
+/// own sidecar at the bail point via the per-site
+/// `record_skip_sidecar` calls in the match arms below. The
+/// pre-build helpers (`ensure_kvm`, `resolve_test_kernel`,
+/// `acquire_test_kernel_lock_if_cached`, `resolve_scheduler`)
+/// produce plain `anyhow` contexts, `KernelUnavailable`, or
+/// `anyhow::bail!` string errors — none of those route through
+/// this wrapper's downcast.
+///
+/// This wrapper exists to guard against future migrations that
+/// move a contention-producing site into the pre-build chain
+/// (e.g. a flock timeout that today returns plain `anyhow` but
+/// later starts surfacing as `ResourceContention`). Catching it
+/// here means stats coverage stays correct without requiring a
+/// per-site retro-fit at every new producer. Today the wrapper
+/// is purely defensive — drop it and stats tooling sees no
+/// difference until such a migration lands.
+///
+/// Double-recording is acceptable but NOT idempotent in the
+/// strict sense: the wrapper's write overwrites the per-site
+/// write's `run_id` and timestamp with fresh values produced at
+/// wrapper-return time. Both recordings carry the same skip
+/// classification (the same `ResourceContention` reason flowing
+/// through the same `write_skip_sidecar`), so the final sidecar
+/// is correct for stats tooling — only the run_id / timestamp
+/// shift between the two writes, and downstream tooling keys on
+/// (test name, skip classification), not on those volatile
+/// fields.
 pub(crate) fn run_ktstr_test_inner(
     entry: &KtstrTestEntry,
     topo: Option<&TopoOverride>,
