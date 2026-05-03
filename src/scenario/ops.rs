@@ -2781,7 +2781,7 @@ fn apply_setup(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, defs: &[CgroupDef])
                 def.swappable,
                 n,
             );
-            let affinity = super::resolve_affinity_for_cgroup(
+            let affinity = super::intent_for_spawn(
                 &work.affinity,
                 cgroup_cpuset.as_ref(),
                 ctx.topo,
@@ -2978,7 +2978,7 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                         cgroup,
                     )?;
                 }
-                let affinity = super::resolve_affinity_for_cgroup(
+                let affinity = super::intent_for_spawn(
                     &work.affinity,
                     cgroup_cpuset.as_ref(),
                     ctx.topo,
@@ -3072,7 +3072,7 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                     anyhow::bail!("SpawnHost: {}", reason);
                 }
                 let n = super::resolve_num_workers(work, ctx.workers_per_cgroup, "<host>")?;
-                let affinity = super::resolve_affinity_for_cgroup(&work.affinity, None, ctx.topo);
+                let affinity = super::intent_for_spawn(&work.affinity, None, ctx.topo);
                 let wl = WorkloadConfig {
                     num_workers: n,
                     affinity,
@@ -6452,7 +6452,7 @@ mod tests {
         let w = WorkSpec::default();
         let wl = WorkloadConfig {
             num_workers: 1,
-            affinity: crate::workload::ResolvedAffinity::None,
+            affinity: crate::workload::AffinityIntent::Inherit,
             work_type: w.work_type,
             sched_policy: w.sched_policy,
             mem_policy: w.mem_policy,
@@ -6513,7 +6513,7 @@ mod tests {
         let w = WorkSpec::default();
         let wl = WorkloadConfig {
             num_workers: 1,
-            affinity: crate::workload::ResolvedAffinity::None,
+            affinity: crate::workload::AffinityIntent::Inherit,
             work_type: w.work_type,
             sched_policy: w.sched_policy,
             mem_policy: w.mem_policy,
@@ -7089,7 +7089,7 @@ mod tests {
     /// `Op::Spawn` ops on the same cgroup name.
     #[test]
     fn move_all_tasks_renames_every_handle_keyed_under_from() {
-        use crate::workload::{ResolvedAffinity, WorkType, WorkloadConfig, WorkloadHandle};
+        use crate::workload::{AffinityIntent, WorkType, WorkloadConfig, WorkloadHandle};
 
         let mock = MockCgroupOps::new();
         let topo = mock_topo();
@@ -7104,7 +7104,7 @@ mod tests {
         for _ in 0..3 {
             let wl = WorkloadConfig {
                 num_workers: 1,
-                affinity: ResolvedAffinity::None,
+                affinity: AffinityIntent::Inherit,
                 work_type: WorkType::SpinWait,
                 ..Default::default()
             };

@@ -131,13 +131,18 @@ pub(crate) mod humantime_serde_helper {
 /// sides; payload differences encode the intent → concrete-CPU-set
 /// distinction:
 ///
-/// | [`AffinityIntent`]               | [`ResolvedAffinity`]              |
-/// |----------------------------------|-----------------------------------|
-/// | `Inherit` (no payload)           | `None`                            |
-/// | `Exact(BTreeSet<usize>)`         | `Fixed(BTreeSet<usize>)`          |
-/// | `RandomSubset` (no payload)      | `Random { from, count }`          |
-/// | `SingleCpu` (no payload)         | `SingleCpu(usize)`                |
-/// | `LlcAligned` / `CrossCgroup`     | `Fixed(...)` (resolver expands)   |
+/// | [`AffinityIntent`]                       | [`ResolvedAffinity`]              |
+/// |------------------------------------------|-----------------------------------|
+/// | `Inherit` (no payload)                   | `None`                            |
+/// | `Exact(BTreeSet<usize>)`                 | `Fixed(BTreeSet<usize>)`          |
+/// | `RandomSubset { from, count }`           | `Random { from, count }`          |
+/// | `SingleCpu` (no payload)                 | `SingleCpu(usize)`                |
+/// | `LlcAligned` / `CrossCgroup`             | `Fixed(...)` (resolver expands)   |
+///
+/// Constructor helpers: [`AffinityIntent::exact`] takes any
+/// `IntoIterator<Item = usize>` for the `Exact` set;
+/// [`AffinityIntent::random_subset`] takes the same iterator shape
+/// for the `RandomSubset` pool plus a sample-count argument.
 ///
 /// The `SingleCpu` pair specifically: [`AffinityIntent::SingleCpu`]
 /// expresses "pin to one CPU; resolver picks which based on cgroup
@@ -145,15 +150,31 @@ pub(crate) mod humantime_serde_helper {
 /// records the concrete CPU id chosen. Reusing the variant name keeps
 /// the pre/post mapping lexically obvious — payload presence
 /// distinguishes intent from resolution without renaming the variant.
+///
+/// [`AffinityIntent::RandomSubset`] carries the resolved pool
+/// (`from`) and sample size (`count`) — sampling itself is deferred
+/// to spawn time so each worker gets an independent draw. The
+/// scenario engine's `resolve_affinity_for_cgroup` materialises the
+/// pool from cgroup cpuset / topology before constructing this
+/// variant; spawn-time `resolve_affinity` samples per-worker.
+/// Construct directly via [`AffinityIntent::random_subset`].
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AffinityIntent {
     /// No affinity constraint -- inherit from parent cgroup.
     #[default]
     Inherit,
-    /// Pin to a random subset of the cgroup's cpuset, or all CPUs if no
-    /// cpuset is configured.
-    RandomSubset,
+    /// Pin each worker to a random subset of `from`, sampling `count`
+    /// CPUs per worker. Sampling is deferred to spawn time so each
+    /// worker gets an independent draw — mirrors
+    /// [`ResolvedAffinity::Random`] semantics. Construct with the
+    /// resolved pool already materialised; the scenario engine pre-
+    /// resolves topology-aware "pick from cgroup state" intent
+    /// before building this variant.
+    RandomSubset {
+        from: BTreeSet<usize>,
+        count: usize,
+    },
     /// Pin to the CPUs in the worker's LLC.
     LlcAligned,
     /// Pin to all CPUs (crosses cgroup boundaries).
@@ -170,6 +191,24 @@ impl AffinityIntent {
     /// Accepts arrays, ranges, `Vec`, `BTreeSet`, or any `IntoIterator<Item = usize>`.
     pub fn exact(cpus: impl IntoIterator<Item = usize>) -> Self {
         AffinityIntent::Exact(cpus.into_iter().collect())
+    }
+
+    /// Construct a `RandomSubset` from a pool iterator and a sample
+    /// size. Mirrors the [`Self::exact`] constructor's iterator
+    /// flexibility — accepts arrays, `Vec`, `BTreeSet`, ranges, or
+    /// any `IntoIterator<Item = usize>` for the pool.
+    ///
+    /// Sampling is deferred to spawn time; each worker gets an
+    /// independent `count`-sized draw from `from`. `count > from.len()`
+    /// is clamped to `from.len()` at sample time (topology fact, not
+    /// caller error). `count == 0` and empty `from` are rejected at
+    /// the spawn-time affinity gate with an actionable diagnostic —
+    /// use [`AffinityIntent::Inherit`] for no affinity constraint.
+    pub fn random_subset(from: impl IntoIterator<Item = usize>, count: usize) -> Self {
+        AffinityIntent::RandomSubset {
+            from: from.into_iter().collect(),
+            count,
+        }
     }
 }
 
@@ -3065,8 +3104,22 @@ fn warn_setpriority_failed_once() {
 pub struct WorkloadConfig {
     /// Number of worker processes to fork.
     pub num_workers: usize,
-    /// CPU affinity mode for workers.
-    pub affinity: ResolvedAffinity,
+    /// Per-worker affinity intent. Resolved at spawn time via the
+    /// same gate as composed entries (see [`Self::composed`]):
+    /// [`AffinityIntent::Inherit`] (resolved to
+    /// [`ResolvedAffinity::None`]),
+    /// [`AffinityIntent::Exact`] (resolved to
+    /// [`ResolvedAffinity::Fixed`]), and
+    /// [`AffinityIntent::RandomSubset`] (resolved to
+    /// [`ResolvedAffinity::Random`] — sampling deferred per-worker
+    /// at spawn time) are accepted at [`WorkloadHandle::spawn`].
+    /// Topology-aware variants (`SingleCpu`, `LlcAligned`,
+    /// `CrossCgroup`) require scenario context and are rejected
+    /// with an actionable diagnostic. Type-unified with
+    /// [`WorkSpec::affinity`] so a test author writes the same
+    /// affinity expression at the top level and inside `composed`
+    /// entries.
+    pub affinity: AffinityIntent,
     /// What each worker does.
     pub work_type: WorkType,
     /// Linux scheduling policy.
@@ -3155,12 +3208,14 @@ pub struct WorkloadConfig {
     /// [`WorkloadHandle::spawn`] and is rejected with an actionable
     /// diagnostic.
     ///
-    /// Composed [`WorkSpec::affinity`] accepts only the no-context
+    /// Composed [`WorkSpec::affinity`] accepts the no-context
     /// variants [`AffinityIntent::Inherit`] (resolved to
-    /// [`ResolvedAffinity::None`]) and [`AffinityIntent::Exact`]
-    /// (resolved to [`ResolvedAffinity::Fixed`]). The
-    /// topology-aware variants (`SingleCpu`, `LlcAligned`,
-    /// `RandomSubset`, `CrossCgroup`) are rejected because spawn()
+    /// [`ResolvedAffinity::None`]), [`AffinityIntent::Exact`]
+    /// (resolved to [`ResolvedAffinity::Fixed`]), and
+    /// [`AffinityIntent::RandomSubset`] (resolved to
+    /// [`ResolvedAffinity::Random`] — sampling deferred per-worker
+    /// at spawn time). The topology-aware variants (`SingleCpu`,
+    /// `LlcAligned`, `CrossCgroup`) are rejected because spawn()
     /// has no access to the
     /// [`crate::topology::TestTopology`] / cpuset state that the
     /// scenario engine threads in.
@@ -3180,7 +3235,7 @@ impl Default for WorkloadConfig {
     fn default() -> Self {
         Self {
             num_workers: 1,
-            affinity: ResolvedAffinity::None,
+            affinity: AffinityIntent::Inherit,
             work_type: WorkType::SpinWait,
             sched_policy: SchedPolicy::Normal,
             mem_policy: MemPolicy::Default,
@@ -3199,8 +3254,17 @@ impl WorkloadConfig {
         self
     }
 
-    /// Set the resolved CPU affinity.
-    pub fn affinity(mut self, a: ResolvedAffinity) -> Self {
+    /// Set the per-worker affinity intent.
+    ///
+    /// At [`WorkloadHandle::spawn`], [`AffinityIntent::Inherit`],
+    /// [`AffinityIntent::Exact`], and [`AffinityIntent::RandomSubset`]
+    /// are accepted; topology-aware variants (`SingleCpu`,
+    /// `LlcAligned`, `CrossCgroup`) require scenario context and are
+    /// rejected.
+    ///
+    /// Idiomatic short form for an exact CPU set:
+    /// `cfg.affinity(AffinityIntent::exact([0, 1]))`.
+    pub fn affinity(mut self, a: AffinityIntent) -> Self {
         self.affinity = a;
         self
     }
@@ -4241,7 +4305,8 @@ impl SendIterSlotPtr {
 /// the top-level [`WorkloadConfig`] fields via
 /// [`Self::primary`], and each composed [`WorkSpec`] entry is
 /// resolved into its own `GroupParams` (with `group_idx ==
-/// 1..=N`) via [`Self::from_work_spec`].
+/// 1..=N`) via [`Self::from_composed`]. Both paths funnel through
+/// [`Self::from_work_spec`] for the actual field copy.
 ///
 /// `GroupParams` is the post-resolution shape — `num_workers` is a
 /// concrete `usize` (not the `Option<usize>` that [`WorkSpec`]
@@ -4302,6 +4367,72 @@ impl GroupParams {
         }
     }
 
+    /// Resolve an [`AffinityIntent`] to a [`ResolvedAffinity`] under
+    /// the spawn-time gate: only `Inherit`, `Exact`, and
+    /// `RandomSubset` carry enough information to resolve without
+    /// scenario context (the caller supplies the `from` pool for
+    /// `RandomSubset`, so per-worker sampling stays self-contained).
+    /// Topology-aware variants (`SingleCpu`, `LlcAligned`,
+    /// `CrossCgroup`) require a [`crate::topology::TestTopology`] /
+    /// cpuset state that [`WorkloadHandle::spawn`] does not have, so
+    /// they bail with an actionable diagnostic.
+    ///
+    /// `site` names the location of the affinity field for the bail
+    /// message — `"WorkloadConfig::affinity"` for the primary group,
+    /// `"composed[N].affinity"` for entries inside `composed`. Pinned
+    /// across both call sites so the gate matches exactly and a
+    /// future variant addition is rejected uniformly.
+    fn resolve_spawn_affinity(intent: &AffinityIntent, site: &str) -> Result<ResolvedAffinity> {
+        match intent {
+            AffinityIntent::Inherit => Ok(ResolvedAffinity::None),
+            AffinityIntent::Exact(cpus) => {
+                if cpus.is_empty() {
+                    anyhow::bail!(
+                        "{site} = AffinityIntent::Exact with empty CPU set \
+                         would produce EINVAL from sched_setaffinity; \
+                         use AffinityIntent::Inherit for no affinity \
+                         constraint",
+                    );
+                }
+                Ok(ResolvedAffinity::Fixed(cpus.clone()))
+            }
+            AffinityIntent::RandomSubset { from, count } => {
+                if from.is_empty() {
+                    anyhow::bail!(
+                        "{site} = AffinityIntent::RandomSubset with empty \
+                         pool; use AffinityIntent::Inherit for no affinity \
+                         constraint",
+                    );
+                }
+                if *count == 0 {
+                    anyhow::bail!(
+                        "{site} = AffinityIntent::RandomSubset with \
+                         count=0; use AffinityIntent::Inherit for no \
+                         affinity constraint",
+                    );
+                }
+                Ok(ResolvedAffinity::Random {
+                    from: from.clone(),
+                    count: *count,
+                })
+            }
+            AffinityIntent::SingleCpu
+            | AffinityIntent::LlcAligned
+            | AffinityIntent::CrossCgroup => {
+                anyhow::bail!(
+                    "{site} = {:?} requires scenario context; use \
+                     AffinityIntent::Exact(set), \
+                     AffinityIntent::RandomSubset {{ from, count }}, \
+                     or AffinityIntent::Inherit when spawning directly \
+                     via WorkloadHandle::spawn. Topology-aware variants \
+                     resolve automatically inside #[ktstr_test] \
+                     scenarios.",
+                    intent,
+                );
+            }
+        }
+    }
+
     /// Build the primary group's parameters from the top-level
     /// [`WorkloadConfig`] fields. `group_idx` is fixed to `0`.
     ///
@@ -4309,9 +4440,26 @@ impl GroupParams {
     /// fields and funnels through [`Self::from_work_spec`] so the
     /// field-by-field copy lives in exactly one place. The
     /// synthesised spec mirrors the resolved sibling values
-    /// (`num_workers: Some(n)`, `affinity: Inherit | Exact(...)`)
-    /// — the spawn pipeline never reads it.
-    fn primary(config: &WorkloadConfig) -> Self {
+    /// (`num_workers: Some(n)`, `affinity: Inherit`) — the spawn
+    /// pipeline never reads it.
+    ///
+    /// `WorkloadConfig::affinity` is an [`AffinityIntent`]
+    /// (type-unified with [`WorkSpec::affinity`]); resolution to
+    /// [`ResolvedAffinity`] runs through
+    /// [`Self::resolve_spawn_affinity`] under the same gate as
+    /// [`Self::from_composed`]. Topology-aware variants
+    /// (`SingleCpu`, `LlcAligned`, `CrossCgroup`) require scenario
+    /// context; the scenario engine pre-resolves them via
+    /// `crate::scenario::intent_for_spawn` (which round-trips
+    /// `RandomSubset` verbatim and flattens topology-aware variants
+    /// to `Exact`) before building [`WorkloadConfig`], so the gate
+    /// only ever sees `Inherit`, `Exact`, or `RandomSubset` from
+    /// this path.
+    fn primary(config: &WorkloadConfig) -> Result<Self> {
+        let resolved_affinity = Self::resolve_spawn_affinity(
+            &config.affinity,
+            "WorkloadConfig::affinity",
+        )?;
         let spec = WorkSpec {
             work_type: config.work_type.clone(),
             sched_policy: config.sched_policy,
@@ -4321,7 +4469,12 @@ impl GroupParams {
             mpol_flags: config.mpol_flags,
             nice: config.nice,
         };
-        Self::from_work_spec(&spec, 0, config.affinity.clone(), config.num_workers)
+        Ok(Self::from_work_spec(
+            &spec,
+            0,
+            resolved_affinity,
+            config.num_workers,
+        ))
     }
 
     /// Resolve a composed [`WorkSpec`] into per-group parameters,
@@ -4332,19 +4485,19 @@ impl GroupParams {
     ///   resolved by the scenario engine via
     ///   `Ctx::workers_per_cgroup` is unreachable here. A `None`
     ///   value is rejected with an actionable diagnostic.
-    /// - `affinity` must be either [`AffinityIntent::Inherit`]
-    ///   (mapped to [`ResolvedAffinity::None`]) or
+    /// - `affinity` resolution runs through
+    ///   [`Self::resolve_spawn_affinity`] —
+    ///   [`AffinityIntent::Inherit`] (mapped to
+    ///   [`ResolvedAffinity::None`]),
     ///   [`AffinityIntent::Exact`] (mapped to
-    ///   [`ResolvedAffinity::Fixed`]). Topology-aware variants
-    ///   (`SingleCpu`, `LlcAligned`, `RandomSubset`,
-    ///   `CrossCgroup`) are rejected because spawn() lacks the
-    ///   [`crate::topology::TestTopology`] / cpuset state that the
-    ///   scenario engine threads in.
+    ///   [`ResolvedAffinity::Fixed`]), and
+    ///   [`AffinityIntent::RandomSubset`] (mapped to
+    ///   [`ResolvedAffinity::Random`]) are accepted; topology-aware
+    ///   variants are rejected.
     ///
-    /// Resolves the optional/intent fields, then funnels through
-    /// [`Self::from_work_spec`] for the actual extraction. Composed
-    /// entries inherit the parent [`WorkloadConfig::clone_mode`];
-    /// [`WorkSpec`] has no `clone_mode` field of its own.
+    /// Composed entries inherit the parent
+    /// [`WorkloadConfig::clone_mode`]; [`WorkSpec`] has no
+    /// `clone_mode` field of its own.
     fn from_composed(spec: &WorkSpec, group_idx: usize) -> Result<Self> {
         let num_workers = spec.num_workers.ok_or_else(|| {
             anyhow::anyhow!(
@@ -4355,24 +4508,8 @@ impl GroupParams {
                 group_idx - 1,
             )
         })?;
-        let affinity = match &spec.affinity {
-            AffinityIntent::Inherit => ResolvedAffinity::None,
-            AffinityIntent::Exact(cpus) => ResolvedAffinity::Fixed(cpus.clone()),
-            AffinityIntent::SingleCpu
-            | AffinityIntent::LlcAligned
-            | AffinityIntent::RandomSubset
-            | AffinityIntent::CrossCgroup => {
-                anyhow::bail!(
-                    "composed[{}].affinity = {:?} requires scenario topology \
-                     context (TestTopology / cpuset); use \
-                     AffinityIntent::Exact(set) or AffinityIntent::Inherit \
-                     for composed entries spawned directly via \
-                     WorkloadHandle::spawn",
-                    group_idx - 1,
-                    spec.affinity,
-                );
-            }
-        };
+        let site = format!("composed[{}].affinity", group_idx - 1);
+        let affinity = Self::resolve_spawn_affinity(&spec.affinity, &site)?;
         Ok(Self::from_work_spec(spec, group_idx, affinity, num_workers))
     }
 }
@@ -4548,7 +4685,7 @@ impl WorkloadHandle {
         // carries no `clone_mode` field — it is a workload-wide
         // property fixed by [`WorkloadConfig::clone_mode`].
         let mut groups: Vec<GroupParams> = Vec::with_capacity(1 + config.composed.len());
-        groups.push(GroupParams::primary(config));
+        groups.push(GroupParams::primary(config)?);
         for (i, spec) in config.composed.iter().enumerate() {
             groups.push(GroupParams::from_composed(spec, i + 1)?);
         }
@@ -9807,7 +9944,7 @@ mod tests {
     ) -> Vec<WorkerReport> {
         let config = WorkloadConfig {
             num_workers,
-            affinity: ResolvedAffinity::None,
+            affinity: AffinityIntent::Inherit,
             work_type,
             sched_policy: SchedPolicy::Normal,
             ..Default::default()
@@ -10407,7 +10544,7 @@ mod tests {
         assert_eq!(c.num_workers, 1);
         assert!(matches!(c.work_type, WorkType::SpinWait));
         assert!(matches!(c.sched_policy, SchedPolicy::Normal));
-        assert!(matches!(c.affinity, ResolvedAffinity::None));
+        assert!(matches!(c.affinity, AffinityIntent::Inherit));
         // Default nice is 0 — `apply_nice(0)` short-circuits before
         // the syscall, preserving inherit-from-parent semantics.
         assert_eq!(c.nice, 0);
@@ -10508,7 +10645,7 @@ mod tests {
     fn worker_nice_applied_via_setpriority() {
         let config = WorkloadConfig {
             num_workers: 1,
-            affinity: ResolvedAffinity::None,
+            affinity: AffinityIntent::Inherit,
             work_type: WorkType::SpinWait,
             sched_policy: SchedPolicy::Normal,
             nice: 10,
@@ -10617,7 +10754,7 @@ mod tests {
     fn spawn_start_collect_integration() {
         let config = WorkloadConfig {
             num_workers: 2,
-            affinity: ResolvedAffinity::None,
+            affinity: AffinityIntent::Inherit,
             work_type: WorkType::SpinWait,
             sched_policy: SchedPolicy::Normal,
             ..Default::default()
@@ -10882,7 +11019,7 @@ mod tests {
     fn spawn_auto_start_on_collect() {
         let config = WorkloadConfig {
             num_workers: 1,
-            affinity: ResolvedAffinity::None,
+            affinity: AffinityIntent::Inherit,
             work_type: WorkType::SpinWait,
             sched_policy: SchedPolicy::Normal,
             ..Default::default()
@@ -10919,7 +11056,7 @@ mod tests {
     fn spawn_pids_fit_in_pid_t() {
         let config = WorkloadConfig {
             num_workers: 4,
-            affinity: ResolvedAffinity::None,
+            affinity: AffinityIntent::Inherit,
             work_type: WorkType::SpinWait,
             sched_policy: SchedPolicy::Normal,
             ..Default::default()
@@ -10954,7 +11091,7 @@ mod tests {
     fn handle_drop_reaps_children_and_closes_pipes() {
         let config = WorkloadConfig {
             num_workers: 2,
-            affinity: ResolvedAffinity::None,
+            affinity: AffinityIntent::Inherit,
             work_type: WorkType::PipeIo { burst_iters: 4 },
             sched_policy: SchedPolicy::Normal,
             ..Default::default()
@@ -10989,7 +11126,7 @@ mod tests {
     fn spawn_multiple_workers_distinct_pids() {
         let config = WorkloadConfig {
             num_workers: 4,
-            affinity: ResolvedAffinity::None,
+            affinity: AffinityIntent::Inherit,
             work_type: WorkType::SpinWait,
             sched_policy: SchedPolicy::Normal,
             ..Default::default()
@@ -11009,7 +11146,7 @@ mod tests {
     fn spawn_with_fixed_affinity() {
         let config = WorkloadConfig {
             num_workers: 1,
-            affinity: ResolvedAffinity::Fixed([0].into_iter().collect()),
+            affinity: AffinityIntent::Exact([0].into_iter().collect()),
             work_type: WorkType::SpinWait,
             sched_policy: SchedPolicy::Normal,
             ..Default::default()
@@ -11021,6 +11158,282 @@ mod tests {
         assert_eq!(reports.len(), 1);
         assert!(reports[0].cpus_used.contains(&0));
         assert_eq!(reports[0].cpus_used.len(), 1, "should only use pinned CPU");
+    }
+
+    /// Spawn-time affinity gate: every accepted variant resolves to
+    /// the matching [`ResolvedAffinity`] shape, every rejected variant
+    /// bails with an actionable diagnostic. Pins the gate's accept /
+    /// reject contract so adding a new [`AffinityIntent`] variant
+    /// forces a deliberate decision here.
+    #[test]
+    fn resolve_spawn_affinity_accepts_no_context_variants() {
+        // Inherit -> ResolvedAffinity::None
+        let r = GroupParams::resolve_spawn_affinity(
+            &AffinityIntent::Inherit,
+            "WorkloadConfig::affinity",
+        )
+        .expect("Inherit must resolve");
+        assert!(matches!(r, ResolvedAffinity::None));
+
+        // Exact -> ResolvedAffinity::Fixed (set preserved)
+        let r = GroupParams::resolve_spawn_affinity(
+            &AffinityIntent::exact([0, 2, 4]),
+            "WorkloadConfig::affinity",
+        )
+        .expect("Exact must resolve");
+        match r {
+            ResolvedAffinity::Fixed(set) => {
+                assert_eq!(set.len(), 3);
+                assert!(set.contains(&0) && set.contains(&2) && set.contains(&4));
+            }
+            other => panic!("expected Fixed, got {:?}", other),
+        }
+
+        // RandomSubset -> ResolvedAffinity::Random (pool + count preserved)
+        let r = GroupParams::resolve_spawn_affinity(
+            &AffinityIntent::random_subset([0usize, 1, 2, 3], 2),
+            "WorkloadConfig::affinity",
+        )
+        .expect("RandomSubset must resolve");
+        match r {
+            ResolvedAffinity::Random { from, count } => {
+                assert_eq!(from.len(), 4);
+                assert_eq!(count, 2);
+            }
+            other => panic!("expected Random, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn resolve_spawn_affinity_rejects_topology_variants() {
+        for variant in [
+            AffinityIntent::SingleCpu,
+            AffinityIntent::LlcAligned,
+            AffinityIntent::CrossCgroup,
+        ] {
+            let err = GroupParams::resolve_spawn_affinity(
+                &variant,
+                "WorkloadConfig::affinity",
+            )
+            .expect_err("topology-aware variant must bail at gate");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("requires scenario"),
+                "diagnostic must mention scenario context, got: {msg}"
+            );
+            assert!(
+                msg.contains("WorkloadConfig::affinity"),
+                "diagnostic must include site, got: {msg}"
+            );
+        }
+    }
+
+    /// Empty `Exact` would yield a zero-mask `sched_setaffinity` call
+    /// that the kernel rejects with EINVAL. The gate bails with an
+    /// actionable diagnostic pointing the caller at `Inherit`.
+    #[test]
+    fn resolve_spawn_affinity_rejects_empty_exact() {
+        let err = GroupParams::resolve_spawn_affinity(
+            &AffinityIntent::Exact(BTreeSet::new()),
+            "WorkloadConfig::affinity",
+        )
+        .expect_err("empty Exact must bail at gate");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("empty CPU set"),
+            "diagnostic must name the empty-set condition, got: {msg}"
+        );
+        assert!(
+            msg.contains("Inherit"),
+            "diagnostic must point caller at Inherit, got: {msg}"
+        );
+        assert!(
+            msg.contains("WorkloadConfig::affinity"),
+            "diagnostic must include site, got: {msg}"
+        );
+    }
+
+    /// `RandomSubset` with an empty pool leaves the spawn-time gate
+    /// nothing to sample from. The gate bails rather than silently
+    /// resolving to no affinity.
+    #[test]
+    fn resolve_spawn_affinity_rejects_empty_random_pool() {
+        let err = GroupParams::resolve_spawn_affinity(
+            &AffinityIntent::RandomSubset {
+                from: BTreeSet::new(),
+                count: 2,
+            },
+            "WorkloadConfig::affinity",
+        )
+        .expect_err("empty RandomSubset pool must bail at gate");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("empty pool"),
+            "diagnostic must name the empty-pool condition, got: {msg}"
+        );
+        assert!(
+            msg.contains("Inherit"),
+            "diagnostic must point caller at Inherit, got: {msg}"
+        );
+        assert!(
+            msg.contains("WorkloadConfig::affinity"),
+            "diagnostic must include site, got: {msg}"
+        );
+    }
+
+    /// `RandomSubset { count: 0 }` would draw zero CPUs per worker —
+    /// equivalent to no constraint. The gate bails rather than
+    /// silently resolving to no affinity.
+    #[test]
+    fn resolve_spawn_affinity_rejects_zero_count_random() {
+        let err = GroupParams::resolve_spawn_affinity(
+            &AffinityIntent::RandomSubset {
+                from: BTreeSet::from([0usize, 1, 2]),
+                count: 0,
+            },
+            "WorkloadConfig::affinity",
+        )
+        .expect_err("RandomSubset count=0 must bail at gate");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("count=0"),
+            "diagnostic must name the zero-count condition, got: {msg}"
+        );
+        assert!(
+            msg.contains("Inherit"),
+            "diagnostic must point caller at Inherit, got: {msg}"
+        );
+        assert!(
+            msg.contains("WorkloadConfig::affinity"),
+            "diagnostic must include site, got: {msg}"
+        );
+    }
+
+    /// JSON roundtrip for `AffinityIntent::RandomSubset` — the `from`
+    /// pool and `count` survive serialize → deserialize unchanged.
+    /// Pins the serde shape so a future variant rename or field
+    /// reorder surfaces here rather than in user-visible config files.
+    #[test]
+    fn affinity_intent_random_subset_serde_roundtrip() {
+        let original = WorkloadConfig::default()
+            .work_type(WorkType::SpinWait)
+            .affinity(AffinityIntent::RandomSubset {
+                from: BTreeSet::from([0usize, 1, 2, 3]),
+                count: 2,
+            });
+        let json = serde_json::to_string(&original)
+            .expect("WorkloadConfig with RandomSubset must serialize");
+        let deserialized: WorkloadConfig = serde_json::from_str(&json)
+            .expect("WorkloadConfig RandomSubset JSON must deserialize");
+        match deserialized.affinity {
+            AffinityIntent::RandomSubset { from, count } => {
+                assert_eq!(
+                    from,
+                    BTreeSet::from([0usize, 1, 2, 3]),
+                    "from set must roundtrip unchanged"
+                );
+                assert_eq!(count, 2, "count must roundtrip unchanged");
+            }
+            other => panic!(
+                "expected RandomSubset after roundtrip, got {:?}",
+                other
+            ),
+        }
+    }
+
+    /// Direct `WorkloadHandle::spawn` rejects each topology-aware
+    /// variant the gate guards. Verifies the bail propagates through
+    /// the spawn pipeline and the error message identifies the
+    /// offending field.
+    #[test]
+    fn spawn_rejects_topology_aware_variants_at_primary() {
+        for variant in [
+            AffinityIntent::SingleCpu,
+            AffinityIntent::LlcAligned,
+            AffinityIntent::CrossCgroup,
+        ] {
+            let label = format!("{variant:?}");
+            let config = WorkloadConfig::default()
+                .work_type(WorkType::SpinWait)
+                .affinity(variant);
+            // WorkloadHandle does not impl Debug, so expect_err is
+            // unavailable — match on the Result directly.
+            let err = match WorkloadHandle::spawn(&config) {
+                Ok(_) => panic!(
+                    "topology-aware variant {label} must reject at \
+                     WorkloadHandle::spawn"
+                ),
+                Err(e) => e,
+            };
+            let msg = err.to_string();
+            assert!(
+                msg.contains("WorkloadConfig::affinity"),
+                "diagnostic must name the field for {label}, got: {msg}"
+            );
+            assert!(
+                msg.contains("requires scenario"),
+                "diagnostic must mention scenario context for {label}, got: {msg}"
+            );
+        }
+    }
+
+    /// Direct `WorkloadHandle::spawn` accepts `RandomSubset` because
+    /// the caller supplies the `from` pool, so the gate has every
+    /// resolved field it needs without scenario context. Each worker
+    /// gets an independent draw at spawn time; this test verifies the
+    /// resolved affinity falls inside the pool.
+    #[test]
+    fn spawn_accepts_random_subset_directly() {
+        let pool: Vec<usize> = (0..2).collect();
+        let config = WorkloadConfig::default()
+            .work_type(WorkType::SpinWait)
+            .workers(2)
+            .affinity(AffinityIntent::random_subset(pool.iter().copied(), 1));
+        let mut h = WorkloadHandle::spawn(&config)
+            .expect("RandomSubset with explicit pool must spawn");
+        h.start();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let reports = h.stop_and_collect();
+        assert_eq!(reports.len(), 2);
+        for r in &reports {
+            assert!(
+                !r.cpus_used.is_empty(),
+                "RandomSubset worker must run somewhere"
+            );
+            for cpu in &r.cpus_used {
+                assert!(
+                    pool.contains(cpu),
+                    "worker used CPU {cpu} outside pool {pool:?}"
+                );
+            }
+        }
+    }
+
+    /// Serde JSON roundtrip for `AffinityIntent::RandomSubset`
+    /// embedded in `WorkloadConfig`. Mirrors the table-driven serde
+    /// pattern used for `WorkType` (#307): asserts the pool's CPU set
+    /// and `count` field survive serialize → JSON → deserialize.
+    /// Empty-pool / zero-count cases are excluded — those are
+    /// rejected at the spawn-time gate (see
+    /// `resolve_spawn_affinity_rejects_empty_random_pool` and
+    /// `resolve_spawn_affinity_rejects_zero_count_random`).
+    #[test]
+    fn workload_config_random_subset_serde_roundtrip() {
+        let original = WorkloadConfig::default()
+            .work_type(WorkType::SpinWait)
+            .workers(4)
+            .affinity(AffinityIntent::random_subset([0usize, 2, 4, 6], 2));
+        let json = serde_json::to_string(&original).expect("serialize");
+        let restored: WorkloadConfig =
+            serde_json::from_str(&json).expect("deserialize");
+        match restored.affinity {
+            AffinityIntent::RandomSubset { from, count } => {
+                assert_eq!(count, 2, "count must roundtrip");
+                let cpus: Vec<usize> = from.into_iter().collect();
+                assert_eq!(cpus, vec![0, 2, 4, 6], "pool must roundtrip");
+            }
+            other => panic!("expected RandomSubset, got {other:?}"),
+        }
     }
 
     #[test]
@@ -11215,7 +11628,7 @@ mod tests {
             }
             let config = WorkloadConfig {
                 num_workers: 4,
-                affinity: ResolvedAffinity::None,
+                affinity: AffinityIntent::Inherit,
                 work_type: WorkType::PipeIo { burst_iters: 1 },
                 sched_policy: SchedPolicy::Normal,
                 ..Default::default()
@@ -11310,7 +11723,7 @@ mod tests {
             }
             let config = WorkloadConfig {
                 num_workers: 4,
-                affinity: ResolvedAffinity::None,
+                affinity: AffinityIntent::Inherit,
                 work_type: WorkType::WakeChain {
                     depth: 4,
                     wake: WakeMechanism::Pipe,
@@ -11368,7 +11781,7 @@ mod tests {
             }
             let config = WorkloadConfig {
                 num_workers: 1,
-                affinity: ResolvedAffinity::None,
+                affinity: AffinityIntent::Inherit,
                 work_type: WorkType::SpinWait,
                 sched_policy: SchedPolicy::Normal,
                 ..Default::default()
@@ -11673,7 +12086,7 @@ mod tests {
     fn spawn_pipeio_odd_workers_fails() {
         let config = WorkloadConfig {
             num_workers: 3,
-            affinity: ResolvedAffinity::None,
+            affinity: AffinityIntent::Inherit,
             work_type: WorkType::PipeIo { burst_iters: 1024 },
             sched_policy: SchedPolicy::Normal,
             ..Default::default()
@@ -11748,7 +12161,7 @@ mod tests {
     fn workload_handle_drop_tolerates_externally_killed_child() {
         let config = WorkloadConfig {
             num_workers: 2,
-            affinity: ResolvedAffinity::None,
+            affinity: AffinityIntent::Inherit,
             work_type: WorkType::SpinWait,
             sched_policy: SchedPolicy::Normal,
             ..Default::default()
@@ -11873,7 +12286,7 @@ mod tests {
         }
         let config = WorkloadConfig {
             num_workers: 1,
-            affinity: ResolvedAffinity::None,
+            affinity: AffinityIntent::Inherit,
             work_type: WorkType::IoSyncWrite,
             sched_policy: SchedPolicy::Normal,
             ..Default::default()
@@ -11905,7 +12318,7 @@ mod tests {
     fn set_affinity_via_handle() {
         let config = WorkloadConfig {
             num_workers: 1,
-            affinity: ResolvedAffinity::None,
+            affinity: AffinityIntent::Inherit,
             work_type: WorkType::SpinWait,
             sched_policy: SchedPolicy::Normal,
             ..Default::default()
@@ -11949,7 +12362,7 @@ mod tests {
     fn start_idempotent() {
         let config = WorkloadConfig {
             num_workers: 1,
-            affinity: ResolvedAffinity::None,
+            affinity: AffinityIntent::Inherit,
             work_type: WorkType::SpinWait,
             sched_policy: SchedPolicy::Normal,
             ..Default::default()
@@ -11967,7 +12380,7 @@ mod tests {
     fn spawn_pipeio_four_workers() {
         let config = WorkloadConfig {
             num_workers: 4,
-            affinity: ResolvedAffinity::None,
+            affinity: AffinityIntent::Inherit,
             work_type: WorkType::PipeIo { burst_iters: 512 },
             sched_policy: SchedPolicy::Normal,
             ..Default::default()
@@ -12371,15 +12784,15 @@ mod tests {
     fn workload_config_debug_shows_field_values() {
         let c = WorkloadConfig {
             num_workers: 7,
-            affinity: ResolvedAffinity::SingleCpu(3),
+            affinity: AffinityIntent::Exact([3].into_iter().collect()),
             work_type: WorkType::YieldHeavy,
             sched_policy: SchedPolicy::Batch,
             ..Default::default()
         };
         let s = format!("{:?}", c);
         assert!(s.contains("7"), "must show num_workers value");
-        assert!(s.contains("SingleCpu"), "must show affinity variant");
-        assert!(s.contains("3"), "must show affinity CPU");
+        assert!(s.contains("Exact"), "must show affinity variant");
+        assert!(s.contains("3"), "must show affinity CPU set");
         assert!(s.contains("YieldHeavy"), "must show work_type variant");
         assert!(s.contains("Batch"), "must show sched_policy variant");
     }
@@ -12746,7 +13159,7 @@ mod tests {
     fn spawn_futex_fan_out_receivers_record_wake_latency() {
         let config = WorkloadConfig {
             num_workers: 5,
-            affinity: ResolvedAffinity::None,
+            affinity: AffinityIntent::Inherit,
             work_type: WorkType::FutexFanOut {
                 fan_out: 4,
                 spin_iters: 512,
@@ -12767,7 +13180,7 @@ mod tests {
     fn spawn_futex_fan_out_bad_worker_count_fails() {
         let config = WorkloadConfig {
             num_workers: 3, // not divisible by 5
-            affinity: ResolvedAffinity::None,
+            affinity: AffinityIntent::Inherit,
             work_type: WorkType::FutexFanOut {
                 fan_out: 4,
                 spin_iters: 1024,
@@ -12788,7 +13201,7 @@ mod tests {
     fn spawn_futex_fan_out_two_groups() {
         let config = WorkloadConfig {
             num_workers: 10, // 2 groups of (1+4)
-            affinity: ResolvedAffinity::None,
+            affinity: AffinityIntent::Inherit,
             work_type: WorkType::FutexFanOut {
                 fan_out: 4,
                 spin_iters: 512,
@@ -12812,7 +13225,7 @@ mod tests {
         // Minimal fan-out: 1 messenger + 1 receiver per group (like ping-pong).
         let config = WorkloadConfig {
             num_workers: 2,
-            affinity: ResolvedAffinity::None,
+            affinity: AffinityIntent::Inherit,
             work_type: WorkType::FutexFanOut {
                 fan_out: 1,
                 spin_iters: 1024,
@@ -12880,7 +13293,7 @@ mod tests {
     fn snapshot_iterations_running_workers() {
         let config = WorkloadConfig {
             num_workers: 2,
-            affinity: ResolvedAffinity::None,
+            affinity: AffinityIntent::Inherit,
             work_type: WorkType::SpinWait,
             sched_policy: SchedPolicy::Normal,
             ..Default::default()
@@ -13245,7 +13658,7 @@ mod tests {
     fn spawn_custom_produces_work() {
         let config = WorkloadConfig {
             num_workers: 1,
-            affinity: ResolvedAffinity::None,
+            affinity: AffinityIntent::Inherit,
             work_type: WorkType::custom("test_spin", custom_spin_fn),
             sched_policy: SchedPolicy::Normal,
             ..Default::default()
@@ -13403,7 +13816,7 @@ mod tests {
     fn stop_and_collect_sentinel_exits_for_sigusr1_ignoring_worker() {
         let config = WorkloadConfig {
             num_workers: 1,
-            affinity: ResolvedAffinity::None,
+            affinity: AffinityIntent::Inherit,
             work_type: WorkType::custom("sigusr1_ignore", ignores_sigusr1_fn),
             sched_policy: SchedPolicy::Normal,
             ..Default::default()
@@ -13812,7 +14225,7 @@ mod tests {
         require_grandchild_sleep_binary();
         let config = WorkloadConfig {
             num_workers: 1,
-            affinity: ResolvedAffinity::None,
+            affinity: AffinityIntent::Inherit,
             work_type: WorkType::custom("grandchild_sleep", forks_grandchild_sleep_fn),
             sched_policy: SchedPolicy::Normal,
             ..Default::default()
@@ -13850,7 +14263,7 @@ mod tests {
         const N: usize = 3;
         let config = WorkloadConfig {
             num_workers: N,
-            affinity: ResolvedAffinity::None,
+            affinity: AffinityIntent::Inherit,
             work_type: WorkType::custom("grandchild_sleep", forks_grandchild_sleep_fn),
             sched_policy: SchedPolicy::Normal,
             ..Default::default()
@@ -13943,7 +14356,7 @@ mod tests {
         require_grandchild_sleep_binary();
         let config = WorkloadConfig {
             num_workers: 1,
-            affinity: ResolvedAffinity::None,
+            affinity: AffinityIntent::Inherit,
             work_type: WorkType::custom("grandchild_panic", forks_grandchild_and_panics_fn),
             sched_policy: SchedPolicy::Normal,
             ..Default::default()
@@ -14024,7 +14437,7 @@ mod tests {
         require_grandchild_sleep_binary();
         let config = WorkloadConfig {
             num_workers: 1,
-            affinity: ResolvedAffinity::None,
+            affinity: AffinityIntent::Inherit,
             work_type: WorkType::custom("grandchild_sleep", forks_grandchild_sleep_fn),
             sched_policy: SchedPolicy::Normal,
             ..Default::default()
@@ -14066,7 +14479,7 @@ mod tests {
         require_grandchild_sleep_binary();
         let config = WorkloadConfig {
             num_workers: 1,
-            affinity: ResolvedAffinity::None,
+            affinity: AffinityIntent::Inherit,
             work_type: WorkType::custom(
                 "grandchild_graceful",
                 forks_grandchild_and_exits_cleanly_fn,
@@ -14322,7 +14735,7 @@ mod tests {
     fn spawn_fan_out_compute_produces_work() {
         let config = WorkloadConfig {
             num_workers: 5, // 1 messenger + 4 workers
-            affinity: ResolvedAffinity::None,
+            affinity: AffinityIntent::Inherit,
             work_type: WorkType::FanOutCompute {
                 fan_out: 4,
                 cache_footprint_kb: 256,
@@ -14402,7 +14815,7 @@ mod tests {
     fn spawn_fan_out_compute_bad_worker_count_fails() {
         let config = WorkloadConfig {
             num_workers: 3,
-            affinity: ResolvedAffinity::None,
+            affinity: AffinityIntent::Inherit,
             work_type: WorkType::FanOutCompute {
                 fan_out: 4,
                 cache_footprint_kb: 256,
@@ -14429,7 +14842,7 @@ mod tests {
     fn spawn_fan_out_compute_two_groups() {
         let config = WorkloadConfig {
             num_workers: 10, // 2 groups of (1 messenger + 4 workers)
-            affinity: ResolvedAffinity::None,
+            affinity: AffinityIntent::Inherit,
             work_type: WorkType::FanOutCompute {
                 fan_out: 4,
                 cache_footprint_kb: 256,
@@ -15806,7 +16219,7 @@ mod tests {
     fn page_fault_churn_region_kb_overflow_worker_exits_cleanly() {
         let config = WorkloadConfig {
             num_workers: 1,
-            affinity: ResolvedAffinity::None,
+            affinity: AffinityIntent::Inherit,
             // `region_kb = usize::MAX` — `usize::MAX * 1024`
             // overflows on both 32-bit and 64-bit usize, so
             // `checked_mul` returns None and the outer loop
@@ -15895,7 +16308,7 @@ mod tests {
         let num_workers = num_cpus + 1;
         let config = WorkloadConfig {
             num_workers,
-            affinity: ResolvedAffinity::None,
+            affinity: AffinityIntent::Inherit,
             work_type: WorkType::PageFaultChurn {
                 region_kb: 64,
                 touches_per_cycle: 16,
@@ -16031,7 +16444,7 @@ mod tests {
     fn spawn_mutex_contention_bad_worker_count_fails() {
         let config = WorkloadConfig {
             num_workers: 3,
-            affinity: ResolvedAffinity::None,
+            affinity: AffinityIntent::Inherit,
             work_type: WorkType::MutexContention {
                 contenders: 4,
                 hold_iters: 256,
@@ -16053,7 +16466,7 @@ mod tests {
     fn mutex_contention_records_wake_latency() {
         let config = WorkloadConfig {
             num_workers: 4,
-            affinity: ResolvedAffinity::None,
+            affinity: AffinityIntent::Inherit,
             work_type: WorkType::MutexContention {
                 contenders: 4,
                 hold_iters: 64,

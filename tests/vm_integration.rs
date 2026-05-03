@@ -354,14 +354,14 @@ fn scenario_event_counter_timeline_populates_dump(
 /// shapes.
 fn scenario_sched_deadline_real_setattr(ctx: &ktstr::scenario::Ctx) -> Result<AssertResult> {
     use ktstr::workload::{
-        ResolvedAffinity, SchedPolicy, WorkType, WorkloadConfig, WorkloadHandle,
+        AffinityIntent, SchedPolicy, WorkType, WorkloadConfig, WorkloadHandle,
     };
     use std::time::Duration;
 
     let config = WorkloadConfig {
         num_workers: 1,
         work_type: WorkType::SpinWait,
-        affinity: ResolvedAffinity::None,
+        affinity: AffinityIntent::Inherit,
         sched_policy: SchedPolicy::Deadline {
             runtime: Duration::from_micros(500),
             deadline: Duration::from_millis(1),

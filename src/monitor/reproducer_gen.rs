@@ -29,10 +29,12 @@
 //! | fingerprint hint              | ktstr type                              |
 //! |-------------------------------|-----------------------------------------|
 //! | WorkloadGroupHint.thread_count| WorkloadConfig::num_workers             |
-//! | AffinityHint::SingleCpu       | ResolvedAffinity::SingleCpu(0)              |
-//! | AffinityHint::Exact{cpus}     | ResolvedAffinity::Fixed(set)                |
-//! | AffinityHint::Inherit         | ResolvedAffinity::None                      |
-//! | AffinityHint::RandomSubset    | ResolvedAffinity::Random { from, count }    |
+//! | AffinityHint::SingleCpu       | AffinityIntent::SingleCpu                |
+//! | AffinityHint::Exact{cpus}     | AffinityIntent::Exact(set)               |
+//! | AffinityHint::Inherit         | AffinityIntent::Inherit                  |
+//! | AffinityHint::LlcAligned      | AffinityIntent::LlcAligned               |
+//! | AffinityHint::CrossCgroup     | AffinityIntent::CrossCgroup              |
+//! | AffinityHint::RandomSubset    | AffinityIntent::RandomSubset { from: empty, count: 0 } [†] |
 //! | WorkTypeHint::SpinWait         | WorkType::SpinWait                       |
 //! | WorkTypeHint::YieldHeavy      | WorkType::YieldHeavy                    |
 //! | WorkTypeHint::Mixed           | WorkType::Mixed                         |
@@ -50,6 +52,12 @@
 //! | SchedPolicyHint::Batch        | SchedPolicy::Batch                      |
 //! | SchedPolicyHint::Idle         | SchedPolicy::Idle                       |
 //! | SchedPolicyHint::Ext          | (no explicit policy — scx default)      |
+//!
+//! [†] The `RandomSubset` row emits an empty-pool / zero-count
+//! placeholder that the spawn-time affinity gate REJECTS. The
+//! resulting spec is not runnable as-is — hand-edit `from` to the
+//! actual CPU pool and `count` to the desired sample size before
+//! running, or change to `AffinityIntent::Inherit`.
 //!
 //! `IoRandRead` and `IoConvoy` hints are accepted by the projection
 //! layer but not yet emitted by the capture pipeline; all real-disk-
@@ -86,7 +94,7 @@ use super::debug_capture::{
     AffinityHint, CgroupHint, DebugCapture, SchedPolicyHint, WorkTypeHint, WorkloadFingerprint,
     WorkloadGroupHint,
 };
-use crate::workload::{ResolvedAffinity, MemPolicy, MpolFlags, SchedPolicy, WorkType, WorkloadConfig, CloneMode};
+use crate::workload::{AffinityIntent, MemPolicy, MpolFlags, SchedPolicy, WorkType, WorkloadConfig, CloneMode};
 
 /// One reproducer spec — a `WorkloadConfig` value plus diagnostic
 /// notes about confidence / ambiguity.
@@ -207,49 +215,65 @@ fn map_affinity(fp: &WorkloadFingerprint, spec: &mut ReproducerSpec) {
         return;
     };
     spec.config.affinity = match primary {
-        AffinityHint::Inherit => ResolvedAffinity::None,
-        AffinityHint::SingleCpu => ResolvedAffinity::SingleCpu(0),
-        AffinityHint::LlcAligned => {
-            // ResolvedAffinity doesn't carry an LlcAligned variant —
-            // the topology resolver handles that at framework
-            // level (`AffinityIntent::LlcAligned`). Fall back to
-            // `None` and surface the hint as a note.
+        AffinityHint::Inherit => AffinityIntent::Inherit,
+        AffinityHint::SingleCpu => {
             spec.notes.push(
-                "AffinityHint::LlcAligned observed; \
-                 ResolvedAffinity lacks an LlcAligned variant — \
-                 framework runs with ResolvedAffinity::None and the \
-                 test harness should use AffinityIntent::LlcAligned \
-                 from the higher-level workload builder"
+                "AffinityHint::SingleCpu observed; emitting \
+                 AffinityIntent::SingleCpu — the scenario engine \
+                 picks the concrete CPU from the cgroup's cpuset \
+                 at apply time. Direct WorkloadHandle::spawn \
+                 rejects this variant (no topology context); use \
+                 the scenario engine or hand-edit to \
+                 AffinityIntent::Exact([cpu])"
                     .into(),
             );
-            ResolvedAffinity::None
+            AffinityIntent::SingleCpu
+        }
+        AffinityHint::LlcAligned => {
+            spec.notes.push(
+                "AffinityHint::LlcAligned observed; emitting \
+                 AffinityIntent::LlcAligned — the scenario engine \
+                 resolves the LLC mask from the cgroup's cpuset at \
+                 apply time. Direct WorkloadHandle::spawn rejects \
+                 this variant (no topology context); use the \
+                 scenario engine or hand-edit to \
+                 AffinityIntent::Exact(<llc cpus>)"
+                    .into(),
+            );
+            AffinityIntent::LlcAligned
         }
         AffinityHint::CrossCgroup => {
             spec.notes.push(
-                "AffinityHint::CrossCgroup observed; framework runs \
-                 with ResolvedAffinity::None — the cgroup-spanning placement \
-                 is the harness's responsibility to set up via \
-                 AffinityIntent::CrossCgroup at the test-builder level"
+                "AffinityHint::CrossCgroup observed; emitting \
+                 AffinityIntent::CrossCgroup — the scenario engine \
+                 expands to the full topology at apply time. \
+                 Direct WorkloadHandle::spawn rejects this variant \
+                 (no topology context); use the scenario engine or \
+                 hand-edit to AffinityIntent::Exact(<all cpus>)"
                     .into(),
             );
-            ResolvedAffinity::None
+            AffinityIntent::CrossCgroup
         }
         AffinityHint::Exact { cpus } => {
             let set: BTreeSet<usize> = cpus.iter().map(|&c| c as usize).collect();
-            ResolvedAffinity::Fixed(set)
+            AffinityIntent::Exact(set)
         }
         AffinityHint::RandomSubset => {
-            // Without the source pool, default to single-CPU
-            // sampling. The note tells the user to refine the
-            // pool when they hand-edit.
             spec.notes.push(
-                "AffinityHint::RandomSubset observed — no source \
-                 pool inferred; emitting ResolvedAffinity::SingleCpu(0). \
-                 Hand-edit to ResolvedAffinity::Random { from, count } \
-                 with the actual cpuset."
+                "AffinityHint::RandomSubset observed; no source pool \
+                 inferred from the capture. Emitting \
+                 AffinityIntent::RandomSubset { from: empty, count: 0 } \
+                 as a placeholder — the spawn-time affinity gate \
+                 rejects empty-pool / zero-count RandomSubset, so this \
+                 spec is NOT runnable as-is. Hand-edit `from` to the \
+                 actual CPU pool and `count` to the desired sample \
+                 size before running, or change to AffinityIntent::Inherit."
                     .into(),
             );
-            ResolvedAffinity::SingleCpu(0)
+            AffinityIntent::RandomSubset {
+                from: BTreeSet::new(),
+                count: 0,
+            }
         }
     };
 
@@ -460,23 +484,25 @@ pub fn render_ktstr_test_source(spec: &ReproducerSpec, template_name: &str) -> S
     )
 }
 
-fn render_affinity(a: &ResolvedAffinity) -> String {
+fn render_affinity(a: &AffinityIntent) -> String {
     match a {
-        ResolvedAffinity::None => "ResolvedAffinity::None".into(),
-        ResolvedAffinity::SingleCpu(c) => format!("ResolvedAffinity::SingleCpu({c})"),
-        ResolvedAffinity::Fixed(set) => {
-            let cpus: Vec<String> = set.iter().map(|c| c.to_string()).collect();
-            format!(
-                "ResolvedAffinity::Fixed(BTreeSet::from([{}]))",
-                cpus.join(", ")
-            )
-        }
-        ResolvedAffinity::Random { from, count } => {
+        AffinityIntent::Inherit => "AffinityIntent::Inherit".into(),
+        AffinityIntent::SingleCpu => "AffinityIntent::SingleCpu".into(),
+        AffinityIntent::LlcAligned => "AffinityIntent::LlcAligned".into(),
+        AffinityIntent::CrossCgroup => "AffinityIntent::CrossCgroup".into(),
+        AffinityIntent::RandomSubset { from, count } => {
             let cpus: Vec<String> = from.iter().map(|c| c.to_string()).collect();
             format!(
-                "ResolvedAffinity::Random {{ from: BTreeSet::from([{}]), count: {} }}",
+                "AffinityIntent::RandomSubset {{ from: BTreeSet::from([{}]), count: {} }}",
                 cpus.join(", "),
                 count
+            )
+        }
+        AffinityIntent::Exact(set) => {
+            let cpus: Vec<String> = set.iter().map(|c| c.to_string()).collect();
+            format!(
+                "AffinityIntent::Exact(BTreeSet::from([{}]))",
+                cpus.join(", ")
             )
         }
     }
@@ -550,7 +576,7 @@ mod tests {
         let cap = DebugCapture::default();
         let spec = generate_spec(&cap);
         assert_eq!(spec.config.num_workers, 1);
-        assert!(matches!(spec.config.affinity, ResolvedAffinity::None));
+        assert!(matches!(spec.config.affinity, AffinityIntent::Inherit));
         assert!(matches!(spec.config.work_type, WorkType::SpinWait));
         assert!(spec.notes.iter().any(|n| n.contains("no workload groups")));
         assert!(spec.notes.iter().any(|n| n.contains("no work-type hint")));
@@ -570,7 +596,7 @@ mod tests {
         assert_eq!(spec.config.num_workers, 8);
     }
 
-    /// AffinityHint::Exact{cpus} → ResolvedAffinity::Fixed(set).
+    /// AffinityHint::Exact{cpus} → AffinityIntent::Exact(set).
     #[test]
     fn generate_spec_exact_affinity() {
         let mut cap = DebugCapture::default();
@@ -579,11 +605,11 @@ mod tests {
         }];
         let spec = generate_spec(&cap);
         match spec.config.affinity {
-            ResolvedAffinity::Fixed(set) => {
+            AffinityIntent::Exact(set) => {
                 let v: Vec<usize> = set.into_iter().collect();
                 assert_eq!(v, vec![0, 1, 4, 5]);
             }
-            other => panic!("expected Fixed, got {other:?}"),
+            other => panic!("expected Exact, got {other:?}"),
         }
     }
 
@@ -701,13 +727,15 @@ mod tests {
         );
     }
 
-    /// LlcAligned hint surfaces a note (no ResolvedAffinity mapping).
+    /// LlcAligned hint emits AffinityIntent::LlcAligned and surfaces a note
+    /// reminding the consumer that direct WorkloadHandle::spawn rejects this
+    /// variant (the scenario engine resolves it from cgroup cpuset context).
     #[test]
     fn generate_spec_llc_aligned_note() {
         let mut cap = DebugCapture::default();
         cap.fingerprint.affinity_hints = vec![AffinityHint::LlcAligned];
         let spec = generate_spec(&cap);
-        assert!(matches!(spec.config.affinity, ResolvedAffinity::None));
+        assert!(matches!(spec.config.affinity, AffinityIntent::LlcAligned));
         assert!(
             spec.notes
                 .iter()
@@ -805,26 +833,37 @@ mod tests {
         assert!(src.contains("weight=Some(200)"));
     }
 
-    /// Affinity render handles every ResolvedAffinity variant.
+    /// Affinity render handles every AffinityIntent variant.
     #[test]
     fn render_affinity_all_variants() {
-        assert_eq!(render_affinity(&ResolvedAffinity::None), "ResolvedAffinity::None");
         assert_eq!(
-            render_affinity(&ResolvedAffinity::SingleCpu(3)),
-            "ResolvedAffinity::SingleCpu(3)"
+            render_affinity(&AffinityIntent::Inherit),
+            "AffinityIntent::Inherit"
         );
-        let fixed = ResolvedAffinity::Fixed(BTreeSet::from([0usize, 1, 2]));
         assert_eq!(
-            render_affinity(&fixed),
-            "ResolvedAffinity::Fixed(BTreeSet::from([0, 1, 2]))"
+            render_affinity(&AffinityIntent::SingleCpu),
+            "AffinityIntent::SingleCpu"
         );
-        let random = ResolvedAffinity::Random {
-            from: BTreeSet::from([0usize, 1]),
-            count: 1,
+        assert_eq!(
+            render_affinity(&AffinityIntent::LlcAligned),
+            "AffinityIntent::LlcAligned"
+        );
+        assert_eq!(
+            render_affinity(&AffinityIntent::CrossCgroup),
+            "AffinityIntent::CrossCgroup"
+        );
+        let random = AffinityIntent::RandomSubset {
+            from: BTreeSet::from([0usize, 1, 2, 3]),
+            count: 2,
         };
         assert_eq!(
             render_affinity(&random),
-            "ResolvedAffinity::Random { from: BTreeSet::from([0, 1]), count: 1 }"
+            "AffinityIntent::RandomSubset { from: BTreeSet::from([0, 1, 2, 3]), count: 2 }"
+        );
+        let exact = AffinityIntent::Exact(BTreeSet::from([0usize, 1, 2]));
+        assert_eq!(
+            render_affinity(&exact),
+            "AffinityIntent::Exact(BTreeSet::from([0, 1, 2]))"
         );
     }
 }

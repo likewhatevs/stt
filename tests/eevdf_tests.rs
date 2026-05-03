@@ -2,7 +2,7 @@ use anyhow::Result;
 use ktstr::assert::AssertResult;
 use ktstr::ktstr_test;
 use ktstr::scenario::Ctx;
-use ktstr::workload::{ResolvedAffinity, SchedPolicy, WorkType, WorkloadConfig, WorkloadHandle};
+use ktstr::workload::{AffinityIntent, SchedPolicy, WorkType, WorkloadConfig, WorkloadHandle};
 use std::time::Duration;
 
 /// Boots a VM under EEVDF (no `sched_ext` scheduler attached) and
@@ -96,7 +96,7 @@ fn eevdf_burst_oversubscription(ctx: &Ctx) -> Result<AssertResult> {
 
     let config = WorkloadConfig {
         num_workers,
-        affinity: ResolvedAffinity::None,
+        affinity: AffinityIntent::Inherit,
         work_type: WorkType::Bursty {
             burst_duration: Duration::from_millis(1),
             sleep_duration: Duration::ZERO,

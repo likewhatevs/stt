@@ -32,7 +32,7 @@
 use ktstr::assert::{Assert, AssertResult, DetailKind, Verdict};
 use ktstr::claim;
 use ktstr::workload::{
-    CloneMode, ResolvedAffinity, SchedPolicy, WorkType, WorkerReport, WorkerReportClaim,
+    AffinityIntent, CloneMode, SchedPolicy, WorkType, WorkerReport, WorkerReportClaim,
     WorkloadConfig, WorkloadHandle,
 };
 
@@ -47,7 +47,7 @@ fn collect_real_reports() -> Vec<WorkerReport> {
         num_workers: 2,
         clone_mode: CloneMode::Thread,
         work_type: WorkType::SpinWait,
-        affinity: ResolvedAffinity::None,
+        affinity: AffinityIntent::Inherit,
         sched_policy: SchedPolicy::Normal,
         ..Default::default()
     };

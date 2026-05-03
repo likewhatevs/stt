@@ -867,17 +867,31 @@ pub fn resolve_affinity_for_cgroup(
 ) -> ResolvedAffinity {
     match kind {
         AffinityIntent::Inherit => ResolvedAffinity::None,
-        AffinityIntent::RandomSubset => {
-            let pool = cpuset.cloned().unwrap_or_else(|| topo.all_cpuset());
-            if pool.is_empty() {
+        AffinityIntent::RandomSubset { from, count } => {
+            // The pool is already resolved by the caller (typed
+            // `from`). Intersect with the cgroup's cpuset if one is
+            // active so the resolved pool stays within the
+            // scenario's CPU budget — same intersection semantic
+            // applied to `Exact` below.
+            let pool = if let Some(cs) = cpuset {
+                from.intersection(cs).copied().collect::<BTreeSet<usize>>()
+            } else {
+                from.clone()
+            };
+            if pool.is_empty() || *count == 0 {
                 tracing::debug!(
-                    "RandomSubset: empty cpuset and empty topology pool, \
-                     falling back to ResolvedAffinity::None"
+                    pool_len = pool.len(),
+                    count = *count,
+                    "RandomSubset: empty pool or zero count after \
+                     cpuset intersection, falling back to \
+                     ResolvedAffinity::None"
                 );
                 ResolvedAffinity::None
             } else {
-                let count = (pool.len() / 2).max(1);
-                ResolvedAffinity::Random { from: pool, count }
+                ResolvedAffinity::Random {
+                    from: pool,
+                    count: *count,
+                }
             }
         }
         AffinityIntent::LlcAligned => {
@@ -926,6 +940,73 @@ pub fn resolve_affinity_for_cgroup(
                 }
             } else {
                 ResolvedAffinity::Fixed(cpus.clone())
+            }
+        }
+    }
+}
+
+/// Resolve an [`AffinityIntent`] for direct storage in
+/// [`crate::workload::WorkloadConfig::affinity`].
+///
+/// [`crate::workload::WorkloadConfig::affinity`] is an
+/// [`AffinityIntent`] (type-unified with [`crate::workload::WorkSpec::affinity`])
+/// and its spawn-time gate (see
+/// [`crate::workload::WorkloadHandle::spawn`]) accepts
+/// [`AffinityIntent::Inherit`], [`AffinityIntent::Exact`], and
+/// [`AffinityIntent::RandomSubset`]. The scenario engine holds the
+/// topology and cpuset that the spawn-time gate lacks, so it
+/// pre-resolves topology-aware variants here:
+///
+/// - [`ResolvedAffinity::None`] → [`AffinityIntent::Inherit`]
+/// - [`ResolvedAffinity::Fixed(set)`](ResolvedAffinity::Fixed) →
+///   [`AffinityIntent::Exact(set)`](AffinityIntent::Exact)
+/// - [`ResolvedAffinity::SingleCpu(cpu)`](ResolvedAffinity::SingleCpu) →
+///   [`AffinityIntent::Exact`] containing `cpu`
+/// - [`ResolvedAffinity::Random { from, count }`](ResolvedAffinity::Random) →
+///   [`AffinityIntent::RandomSubset { from, count }`](AffinityIntent::RandomSubset)
+///   — the resolved pool is forwarded verbatim and per-worker
+///   sampling stays deferred to spawn time (each worker gets an
+///   independent draw from `from`).
+///
+/// Empty pools (`Random` with `count == 0` or empty `from`, or `Fixed`
+/// emptied by cpuset intersection) degrade to
+/// [`AffinityIntent::Inherit`] so the spawn-time gate does not see a
+/// pre-resolved empty mask. This matches the spawn-side
+/// `resolve_affinity` policy that emits no affinity for an empty pool.
+pub(crate) fn intent_for_spawn(
+    kind: &AffinityIntent,
+    cpuset: Option<&BTreeSet<usize>>,
+    topo: &TestTopology,
+) -> AffinityIntent {
+    flatten_for_spawn(resolve_affinity_for_cgroup(kind, cpuset, topo))
+}
+
+fn flatten_for_spawn(resolved: ResolvedAffinity) -> AffinityIntent {
+    match resolved {
+        ResolvedAffinity::None => AffinityIntent::Inherit,
+        ResolvedAffinity::Fixed(set) => {
+            if set.is_empty() {
+                AffinityIntent::Inherit
+            } else {
+                AffinityIntent::Exact(set)
+            }
+        }
+        ResolvedAffinity::SingleCpu(cpu) => {
+            AffinityIntent::Exact([cpu].into_iter().collect())
+        }
+        ResolvedAffinity::Random { from, count } => {
+            // Round-trip the resolved pool through
+            // [`AffinityIntent::RandomSubset`] so per-worker
+            // sampling stays deferred to spawn time
+            // (`workload::resolve_affinity` samples each worker
+            // independently). Empty pool / zero count degrade to
+            // [`AffinityIntent::Inherit`] — same policy as
+            // `resolve_affinity_for_cgroup` for the same
+            // degenerate cases.
+            if count == 0 || from.is_empty() {
+                AffinityIntent::Inherit
+            } else {
+                AffinityIntent::RandomSubset { from, count }
             }
         }
     }
@@ -1145,7 +1226,12 @@ mod tests {
     fn resolve_affinity_random_subset() {
         let t = crate::topology::TestTopology::synthetic(8, 2);
         let cpusets: Vec<BTreeSet<usize>> = vec![[0, 1, 2, 3].into_iter().collect()];
-        match resolve_affinity_for_cgroup(&AffinityIntent::RandomSubset, cpusets.first(), &t) {
+        // Caller pre-builds the pool from topology; the resolver
+        // intersects with the cgroup's cpuset so the effective sample
+        // pool stays within the cgroup's CPU budget. Sample size
+        // is half the cpuset (`(pool.len() / 2).max(1)`).
+        let intent = AffinityIntent::random_subset(t.all_cpus().iter().copied(),2);
+        match resolve_affinity_for_cgroup(&intent, cpusets.first(), &t) {
             ResolvedAffinity::Random { from, count } => {
                 assert_eq!(from, cpusets[0]);
                 assert_eq!(count, 2); // half of 4
@@ -1167,7 +1253,9 @@ mod tests {
     #[test]
     fn resolve_affinity_random_no_cpusets() {
         let t = crate::topology::TestTopology::synthetic(8, 2);
-        match resolve_affinity_for_cgroup(&AffinityIntent::RandomSubset, None, &t) {
+        // No cgroup cpuset → pool is the caller-supplied set verbatim.
+        let intent = AffinityIntent::random_subset(t.all_cpus().iter().copied(),4);
+        match resolve_affinity_for_cgroup(&intent, None, &t) {
             ResolvedAffinity::Random { from, count } => {
                 assert_eq!(from.len(), 8); // all CPUs
                 assert_eq!(count, 4); // half
@@ -1181,10 +1269,13 @@ mod tests {
         // Regression: empty cpuset produced ResolvedAffinity::Random { from: empty,
         // count: 1 }, which previously produced an empty affinity mask
         // rejected by sched_setaffinity with EINVAL. Must short-circuit
-        // to ResolvedAffinity::None here.
+        // to ResolvedAffinity::None here. The caller-supplied pool is
+        // intersected with the cgroup cpuset; an empty cpuset empties
+        // the intersection and the resolver short-circuits.
         let t = crate::topology::TestTopology::synthetic(4, 1);
         let empty: BTreeSet<usize> = BTreeSet::new();
-        match resolve_affinity_for_cgroup(&AffinityIntent::RandomSubset, Some(&empty), &t) {
+        let intent = AffinityIntent::random_subset(t.all_cpus().iter().copied(),1);
+        match resolve_affinity_for_cgroup(&intent, Some(&empty), &t) {
             ResolvedAffinity::None => {}
             other => panic!("expected None for empty cpuset, got {:?}", other),
         }
@@ -1204,7 +1295,8 @@ mod tests {
         // Mirror the inlined expression in run_scenario:
         let cpuset = cpusets.get(oob_idx);
         assert!(cpuset.is_none(), "OOB index must yield None cpuset");
-        match resolve_affinity_for_cgroup(&AffinityIntent::RandomSubset, cpuset, &t) {
+        let intent = AffinityIntent::random_subset(t.all_cpus().iter().copied(),2);
+        match resolve_affinity_for_cgroup(&intent, cpuset, &t) {
             ResolvedAffinity::Random { from, count } => {
                 assert_eq!(from.len(), 4, "OOB idx falls back to full topology");
                 assert_eq!(count, 2);
@@ -1727,6 +1819,163 @@ mod tests {
             remove_cgroup_errno_hint(&non_io),
             None,
             "non-io root causes must yield no hint",
+        );
+    }
+
+    // -- flatten_for_spawn / intent_for_spawn coverage --
+    //
+    // Every arm of `flatten_for_spawn` must round-trip a known
+    // [`ResolvedAffinity`] into the matching [`AffinityIntent`]
+    // shape. The flatten step gates the scenario engine's output
+    // against the spawn-time gate in `workload::resolve_spawn_affinity`
+    // — empty pools (`Random` with `from.is_empty()` or `count == 0`,
+    // and `Fixed` with an empty set) MUST degrade to
+    // [`AffinityIntent::Inherit`] so the gate never sees a
+    // pre-resolved empty mask. These tests pin every arm.
+
+    #[test]
+    fn flatten_for_spawn_none_to_inherit() {
+        let out = flatten_for_spawn(ResolvedAffinity::None);
+        assert!(
+            matches!(out, AffinityIntent::Inherit),
+            "ResolvedAffinity::None must flatten to Inherit, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn flatten_for_spawn_fixed_to_exact() {
+        let set: BTreeSet<usize> = [1usize, 3, 5].into_iter().collect();
+        let out = flatten_for_spawn(ResolvedAffinity::Fixed(set.clone()));
+        match out {
+            AffinityIntent::Exact(got) => {
+                assert_eq!(got, set, "Fixed payload must round-trip into Exact");
+            }
+            other => panic!("expected Exact, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn flatten_for_spawn_fixed_empty_to_inherit() {
+        let out = flatten_for_spawn(ResolvedAffinity::Fixed(BTreeSet::new()));
+        assert!(
+            matches!(out, AffinityIntent::Inherit),
+            "Fixed(empty) must degrade to Inherit (an empty mask would \
+             EINVAL at sched_setaffinity), got {out:?}"
+        );
+    }
+
+    #[test]
+    fn flatten_for_spawn_single_cpu_to_exact_singleton() {
+        let out = flatten_for_spawn(ResolvedAffinity::SingleCpu(7));
+        match out {
+            AffinityIntent::Exact(got) => {
+                let expected: BTreeSet<usize> = [7usize].into_iter().collect();
+                assert_eq!(got, expected, "SingleCpu must flatten to a 1-CPU Exact set");
+            }
+            other => panic!("expected Exact({{7}}), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn flatten_for_spawn_random_to_random_subset() {
+        let from: BTreeSet<usize> = [0usize, 1, 2, 3].into_iter().collect();
+        let out = flatten_for_spawn(ResolvedAffinity::Random {
+            from: from.clone(),
+            count: 2,
+        });
+        match out {
+            AffinityIntent::RandomSubset {
+                from: got_from,
+                count: got_count,
+            } => {
+                assert_eq!(got_from, from, "Random.from must round-trip verbatim");
+                assert_eq!(got_count, 2, "Random.count must round-trip verbatim");
+            }
+            other => panic!("expected RandomSubset, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn flatten_for_spawn_random_empty_pool_to_inherit() {
+        let out = flatten_for_spawn(ResolvedAffinity::Random {
+            from: BTreeSet::new(),
+            count: 4,
+        });
+        assert!(
+            matches!(out, AffinityIntent::Inherit),
+            "Random with empty pool must degrade to Inherit (the \
+             spawn-time gate rejects empty-pool RandomSubset), got {out:?}"
+        );
+    }
+
+    #[test]
+    fn flatten_for_spawn_random_zero_count_to_inherit() {
+        let from: BTreeSet<usize> = [0usize, 1, 2, 3].into_iter().collect();
+        let out = flatten_for_spawn(ResolvedAffinity::Random { from, count: 0 });
+        assert!(
+            matches!(out, AffinityIntent::Inherit),
+            "Random with count=0 must degrade to Inherit (the \
+             spawn-time gate rejects count=0 RandomSubset), got {out:?}"
+        );
+    }
+
+    /// End-to-end: `intent_for_spawn` chains
+    /// `resolve_affinity_for_cgroup` into `flatten_for_spawn`. Verify
+    /// the full pipeline produces a spawn-gate-acceptable intent for
+    /// each top-level [`AffinityIntent`] variant. Topology-aware
+    /// variants flatten to `Exact`; `Inherit` round-trips; empty-pool
+    /// `RandomSubset` degrades to `Inherit`.
+    #[test]
+    fn intent_for_spawn_full_pipeline() {
+        let t = crate::topology::TestTopology::synthetic(8, 2);
+
+        // Inherit → Inherit
+        let out = intent_for_spawn(&AffinityIntent::Inherit, None, &t);
+        assert!(
+            matches!(out, AffinityIntent::Inherit),
+            "Inherit must round-trip, got {out:?}"
+        );
+
+        // SingleCpu → Exact({some_cpu})
+        let out = intent_for_spawn(&AffinityIntent::SingleCpu, None, &t);
+        match out {
+            AffinityIntent::Exact(set) => {
+                assert_eq!(set.len(), 1, "SingleCpu flattens to a 1-CPU Exact set");
+            }
+            other => panic!("expected Exact, got {other:?}"),
+        }
+
+        // CrossCgroup → Exact(<all CPUs>)
+        let out = intent_for_spawn(&AffinityIntent::CrossCgroup, None, &t);
+        match out {
+            AffinityIntent::Exact(set) => {
+                assert_eq!(set.len(), 8, "CrossCgroup flattens to all-CPU Exact set");
+            }
+            other => panic!("expected Exact, got {other:?}"),
+        }
+
+        // RandomSubset with valid pool → RandomSubset round-trip
+        let pool: BTreeSet<usize> = [0usize, 1, 2, 3].into_iter().collect();
+        let intent = AffinityIntent::random_subset(pool.iter().copied(), 2);
+        let out = intent_for_spawn(&intent, None, &t);
+        match out {
+            AffinityIntent::RandomSubset { from, count } => {
+                assert_eq!(from, pool, "RandomSubset.from must round-trip");
+                assert_eq!(count, 2, "RandomSubset.count must round-trip");
+            }
+            other => panic!("expected RandomSubset, got {other:?}"),
+        }
+
+        // RandomSubset with empty cpuset → Inherit (pool intersects to
+        // empty, resolver short-circuits to None, flatten degrades to
+        // Inherit).
+        let empty_cpuset: BTreeSet<usize> = BTreeSet::new();
+        let intent = AffinityIntent::random_subset(t.all_cpus().iter().copied(), 1);
+        let out = intent_for_spawn(&intent, Some(&empty_cpuset), &t);
+        assert!(
+            matches!(out, AffinityIntent::Inherit),
+            "RandomSubset with empty cpuset intersection must flatten \
+             to Inherit, got {out:?}"
         );
     }
 }

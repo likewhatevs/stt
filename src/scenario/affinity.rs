@@ -24,11 +24,22 @@ pub fn custom_cgroup_affinity_change(ctx: &Ctx) -> Result<AssertResult> {
         HoldSpec::Fixed(ctx.settle + ctx.duration / 5),
     )];
 
+    // Pool the random sample across every CPU in the topology;
+    // `Op::SetAffinity` intersects with the cgroup's cpuset at apply
+    // time so each cgroup ends up sampling from its actual budget.
+    // Sample size is half the topology (clamped to at least 1).
+    let pool = ctx.topo.all_cpuset();
+    let count = (pool.len() / 2).max(1);
+    let intent = AffinityIntent::RandomSubset {
+        from: pool,
+        count,
+    };
+
     for _ in 0..4 {
         steps.push(Step::new(
             vec![
-                Op::set_affinity("cg_0", AffinityIntent::RandomSubset),
-                Op::set_affinity("cg_1", AffinityIntent::RandomSubset),
+                Op::set_affinity("cg_0", intent.clone()),
+                Op::set_affinity("cg_1", intent.clone()),
             ],
             HoldSpec::Frac(0.2),
         ));
