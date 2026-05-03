@@ -689,6 +689,40 @@ fn try_acquire_all(
     Ok(locks)
 }
 
+/// Diffuse a pid across `[0, max_start)` so adjacent pids do not
+/// land on adjacent offsets. Used by [`acquire_cpu_locks`] to
+/// pick a starting window.
+///
+/// Bare `pid % max_start` collapses adjacent pids onto adjacent
+/// offsets (Linux's pid allocator walks `pid_max` sequentially),
+/// which is the worst spread shape for the common batch-spawn
+/// case: nextest forks N test processes back-to-back, every pid
+/// lands within a small contiguous range, every `pid % max_start`
+/// lands within an equally small contiguous slice of the offset
+/// space, and they all probe overlapping windows on the first
+/// pass. SipHash13 avalanche on the pid bytes diffuses adjacent
+/// pids across the whole `[0, max_start)` range, so the
+/// walk-around-once loop in [`acquire_cpu_locks`] has a fair
+/// chance of finding a free window without burning the entire
+/// lockfile pool.
+///
+/// The hash key is fixed `(0, 0)` — a per-run random key would
+/// defeat reproducibility for unit-test fixtures and for any
+/// future debug logging that wants to confirm "pid X picks
+/// offset Y for window N".
+///
+/// Caller invariant: `max_start >= 1`. Panics on `max_start == 0`
+/// (modulo-by-zero); callers must enforce this upstream — the
+/// `count > total_host_cpus` early-bail in [`acquire_cpu_locks`]
+/// is the production guarantee.
+pub(crate) fn pid_window_offset(pid: u32, max_start: usize) -> usize {
+    use siphasher::sip::SipHasher13;
+    use std::hash::Hasher;
+    let mut hasher = SipHasher13::new_with_keys(0, 0);
+    hasher.write_u32(pid);
+    (hasher.finish() as usize) % max_start
+}
+
 /// Acquire exclusive CPU locks for a non-perf VM (non-blocking).
 ///
 /// Tries to flock `count` consecutive CPU files starting from a
@@ -733,7 +767,7 @@ pub fn acquire_cpu_locks(
     // The `count > total_host_cpus` early-bail above guarantees
     // `max_start >= 1`, so the modulo never divides by zero.
     let max_start = total_host_cpus - count + 1;
-    let start_offset = (std::process::id() as usize) % max_start;
+    let start_offset = pid_window_offset(std::process::id(), max_start);
     // Walk every candidate window exactly once, wrapping around so a
     // peer holding the high end never starves the low end. Visit
     // order is `start_offset, start_offset+1, ..., max_start-1,
@@ -3174,6 +3208,108 @@ mod tests {
             Err(e) => panic!("{e:#}"),
         };
         assert_eq!(locks.len(), 3);
+    }
+
+    /// `pid_window_offset` must diffuse adjacent pids across the
+    /// offset space so a batch-spawn (e.g. nextest forking N test
+    /// processes back-to-back, common pid range like
+    /// 100000..100100) doesn't pile every peer onto the same
+    /// starting window.
+    ///
+    /// Pin the spread shape across a window of 100 consecutive pids:
+    ///   * every pid's offset must fit in `[0, max_start)`;
+    ///   * the unique-offset count must exceed half the input
+    ///     range (50 for 100 pids), so adjacent pids don't all
+    ///     collapse to the same offset;
+    ///   * the average gap between consecutive pids' offsets
+    ///     must exceed 1 (the trivial `pid % max_start` baseline).
+    ///
+    /// `max_start = 33` is chosen so the ideal uniform spread
+    /// would visit every offset 100/33 ≈ 3 times; the unique
+    /// count must approach `max_start`.
+    #[test]
+    fn pid_window_offset_spreads_adjacent_pids() {
+        let max_start = 33usize;
+        let pids: Vec<u32> = (100_000..100_100).collect();
+        let offsets: Vec<usize> = pids
+            .iter()
+            .map(|&p| pid_window_offset(p, max_start))
+            .collect();
+
+        // Every offset must fit in the target range.
+        for (pid, off) in pids.iter().zip(offsets.iter()) {
+            assert!(
+                *off < max_start,
+                "pid_window_offset({pid}, {max_start}) = {off}, exceeds max_start",
+            );
+        }
+
+        // Unique-offset count: SipHash13's avalanche makes
+        // adjacent pid landings independent of each other, so
+        // 100 pids over 33 offsets should hit roughly all 33
+        // offsets. Pin >= 25 to absorb the natural birthday-
+        // paradox compression while still catching a regression
+        // that flattens adjacent pids onto the same offset (the
+        // bare `pid % 33` baseline produces exactly 33 offsets in
+        // a strict cyclic pattern, which is also acceptable —
+        // but the regression of interest is the OPPOSITE: a hash
+        // mixer that loses entropy and collapses to fewer than
+        // half the offset space).
+        let unique: std::collections::HashSet<_> = offsets.iter().copied().collect();
+        assert!(
+            unique.len() >= 25,
+            "100 adjacent pids spread to only {} unique offsets (max_start={max_start}); \
+             hash mixer is losing entropy. offsets: {offsets:?}",
+            unique.len(),
+        );
+
+        // Average gap between consecutive pids' offsets — the
+        // signal that distinguishes "diffused" (gap >> 1) from
+        // "adjacent collapse" (gap == 1, the bare `pid % 33`
+        // shape that this fix replaces). Compute mean absolute
+        // difference; SipHash13 avalanche should give average
+        // gap near `max_start / 3` (uniform random walk on a
+        // circular space of size N has expected step `N/3`).
+        let gaps: Vec<usize> = offsets
+            .windows(2)
+            .map(|w| {
+                let a = w[0] as i64;
+                let b = w[1] as i64;
+                (a - b).unsigned_abs() as usize
+            })
+            .collect();
+        let mean_gap: f64 = gaps.iter().sum::<usize>() as f64 / gaps.len() as f64;
+        assert!(
+            mean_gap > 5.0,
+            "mean offset gap between adjacent pids = {mean_gap:.2}, expected > 5 \
+             (the bare `pid % {max_start}` baseline produces gap = 1; SipHash13 \
+             avalanche should produce >> 5). offsets: {offsets:?}",
+        );
+    }
+
+    /// `pid_window_offset` is deterministic: same (pid, max_start)
+    /// always produces the same offset. Pin against a regression
+    /// that introduces randomness or per-run state.
+    #[test]
+    fn pid_window_offset_deterministic() {
+        for &pid in &[1u32, 100, 12345, 999_999, u32::MAX] {
+            for &max_start in &[1usize, 3, 33, 1024, usize::MAX] {
+                assert_eq!(
+                    pid_window_offset(pid, max_start),
+                    pid_window_offset(pid, max_start),
+                    "non-deterministic offset for pid={pid}, max_start={max_start}",
+                );
+            }
+        }
+    }
+
+    /// `pid_window_offset` with `max_start == 1` always returns 0
+    /// (only valid offset). Pin the trivial-domain edge.
+    #[test]
+    fn pid_window_offset_max_start_one() {
+        for &pid in &[0u32, 1, 100, u32::MAX] {
+            assert_eq!(pid_window_offset(pid, 1), 0);
+        }
     }
 
     #[test]

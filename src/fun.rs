@@ -420,6 +420,34 @@ impl Funifier {
                 // `numeric_id` returns a full 64-bit hash that scales
                 // CPU IDs into the u64 range and changes their
                 // semantic identity.
+                //
+                // # Collision risk
+                //
+                // `cpus` is a short, common key name. A future
+                // schema that adds a different field also called
+                // `cpus` — for example a list of pid-shaped task
+                // identifiers, a sequence of byte-counts named
+                // after a CPU-related metric, or any other
+                // payload that SHOULD funify — would silently
+                // pass through the allowlist instead of being
+                // funified, leaking the identifiers into
+                // user-visible output. Schema authors adding a
+                // new `cpus`-keyed field whose value is NOT a
+                // topology cpuset must either:
+                //   1. rename their field (preferred — `cpus` as
+                //      a bare key is reserved for topology
+                //      placement),
+                //   2. namespace this match by walker context
+                //      (would require threading parent-key
+                //      provenance through the walker), or
+                //   3. demonstrate that the value is also placement
+                //      information that's safe to pass through.
+                //
+                // The bare key is retained because every existing
+                // ktstr schema's `cpus` field IS a topology
+                // cpuset (`Vec<usize>` of CPU IDs); a rename here
+                // would break round-trip parsing of every
+                // failure-dump emitted to date.
                 | "cpus" | "cpuset_cpus"
         ) {
             return true;
