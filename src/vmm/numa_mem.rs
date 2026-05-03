@@ -273,7 +273,17 @@ impl NumaMemoryLayout {
                 })?;
             guest_regions.push(guest_region);
 
-            // Step 7: Register KVM memory slot.
+            // Step 7: Register KVM memory slot. KVM_SET_USER_MEMORY_REGION
+            // can fail with the host-resource errnos that
+            // [`super::map_transient_to_contention`] classifies as
+            // [`super::host_topology::ResourceContention`] — most commonly
+            // ENOMEM when a peer is holding the host's GuestMemoryMmap
+            // budget at the time we register this slot. Routing through
+            // the classifier turns those into a SKIP banner instead of a
+            // hard test failure; non-transient errnos (EINVAL on bad
+            // gpa_start / overlapping slot, EFAULT on invalid
+            // userspace_addr — programming faults) flow through unchanged
+            // so a real bug never gets misclassified as contention.
             let mem_region = kvm_bindings::kvm_userspace_memory_region {
                 slot: region.slot,
                 guest_phys_addr: region.gpa_start,
@@ -282,10 +292,13 @@ impl NumaMemoryLayout {
                 flags: 0,
             };
             unsafe {
-                vm_fd.set_user_memory_region(mem_region).with_context(|| {
-                    format!(
-                        "set KVM memory slot {} for node {}",
-                        region.slot, region.node_id
+                vm_fd.set_user_memory_region(mem_region).map_err(|e| {
+                    super::map_transient_to_contention(
+                        e,
+                        format!(
+                            "set KVM memory slot {} for node {}",
+                            region.slot, region.node_id
+                        ),
                     )
                 })?;
             }

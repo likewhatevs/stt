@@ -243,6 +243,49 @@ pub(crate) fn host_resource_snapshot() -> String {
 /// `context` is `impl Into<String>` so callers can pass either a
 /// static `&str` (the common case — `"create VM"`) or a freshly
 /// formatted `String` (vCPU loops naming the offending CPU).
+///
+/// # False-positive risk
+///
+/// The errnos in [`TRANSIENT_HOST_ERRNOS`] are PRESUMED transient,
+/// but the kernel can return any of them for genuinely-broken
+/// reasons that should NOT classify as contention:
+///
+/// - `ENOMEM` — typically host memory pressure (a peer holding
+///   guest mappings), but the kernel can also return ENOMEM from
+///   a page allocator leak, a stuck slab cache, or a permanently-
+///   exhausted memory cgroup. SKIP-classifying those silently
+///   masks the regression instead of surfacing it.
+/// - `EBUSY` — typically a device-fd or memslot held by a peer,
+///   but a stuck virtqueue, an unbalanced refcount on a kernel
+///   object, or a kernel-side state-machine lockup also returns
+///   EBUSY and is permanent until the kernel restarts.
+/// - `EMFILE` / `ENFILE` — typically fd-table pressure, but a leak
+///   in the calling process surfaces as the same errno even when
+///   the host is otherwise idle.
+/// - `EAGAIN` — defensively included but rarely returned by KVM
+///   init ioctls; a genuine `EAGAIN` from a kernel subsystem that
+///   never recovers (e.g. a deadlocked workqueue) would also SKIP
+///   on every retry.
+///
+/// The classifier accepts these false positives because the
+/// alternative — letting transient host pressure surface as a
+/// hard failure on every CI run — is much worse: every parallel
+/// test slot would fail at once, the SKIP banner would never
+/// fire, and stats tooling would record runner-incompatibility as
+/// product regressions. The cost is that a real kernel bug
+/// matching one of these errnos gets quietly skipped on the
+/// affected test slot until the operator notices the SKIP rate
+/// rising.
+///
+/// The false-positive cost is bounded by [`host_resource_snapshot`]'s
+/// `near_limit` flag — operators can grep for `near_limit=false` +
+/// sustained SKIPs to catch a kernel-side regression that the
+/// classifier silently masks. Adding a host-pressure heuristic to
+/// the classification path itself (reading `near_limit` here and
+/// returning the underlying error unchanged when the host is NOT
+/// under pressure) would need design-team review — which errnos
+/// trigger it, what threshold counts as "real pressure", how to
+/// avoid race conditions with concurrent peers' allocations.
 pub(crate) fn map_transient_to_contention(
     e: kvm_ioctls::Error,
     context: impl Into<String>,
@@ -256,7 +299,11 @@ pub(crate) fn map_transient_to_contention(
                 "{context}: transient KVM errno {errno} ({}): host resources: {snapshot}\n  \
                  hint: KVM ioctl failed with a host-resource errno; another peer may be \
                  holding the budget. nextest will not retry; the SKIP banner records this \
-                 attempt for stats tooling.",
+                 attempt for stats tooling.\n  \
+                 hint: if `near_limit=false` in the snapshot above and SKIPs persist \
+                 across runs, the errno is likely a kernel-side regression (leak / stuck \
+                 device / cgroup-exhausted state) — check `dmesg` for the affected \
+                 subsystem rather than retrying the test.",
                 errno_name(errno)
             ),
         })
