@@ -566,20 +566,35 @@ pub(crate) fn ensure_template(fs: Filesystem, capacity_bytes: u64) -> Result<Pat
     if let Some(hit) = lookup(&key)? {
         return Ok(hit);
     }
-    let staged = build_template_via_vm(fs, capacity_bytes, &root)
+    let staged = build_template_via_vm(fs, capacity_bytes, &root, &key)
         .with_context(|| format!("build disk template for {key}"))?;
-    let final_path = store_atomic(&key, &staged)
-        .with_context(|| format!("install disk template {key}"))?;
+    // store_atomic moves `staged` into the cache via rename. On
+    // failure (cross-fs detection, staging-dir creation, the rename
+    // itself) `staged` is stranded: the per-key flock prevents a
+    // peer from observing a partial cache entry, but the in-flight
+    // file persists in the cache root until the next build. Unlink
+    // before propagating so retries find a clean root. Best-effort
+    // because the store_atomic error is the dominant signal — a
+    // remove_file failure here adds no actionable diagnostic.
+    let final_path = match store_atomic(&key, &staged) {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = std::fs::remove_file(&staged);
+            return Err(e).with_context(|| format!("install disk template {key}"));
+        }
+    };
     Ok(final_path)
 }
 
 /// Build a fresh template image by booting a one-shot template VM.
 ///
 /// Steps:
-/// 1. Materialise a sparse `template.img.in-flight.<pid>` of
-///    `capacity_bytes` under `cache_root` so the file shares the
-///    cache filesystem ([`store_atomic`]'s rename requires
-///    same-fs source/dest).
+/// 1. Materialise a sparse `template.img.in-flight.<key>.<pid>`
+///    of `capacity_bytes` under `cache_root` so the file shares
+///    the cache filesystem ([`store_atomic`]'s rename requires
+///    same-fs source/dest). The `<key>` qualifier disambiguates
+///    cross-key concurrent builds in the same process; the per-key
+///    flock already serialises within a single key.
 /// 2. Locate `mkfs.<fstype>` on the host PATH and pack it into the
 ///    template-VM initramfs at `bin/mkfs.<fstype>`. The kernel
 ///    inside the VM is the on-disk-format authority — the host's
@@ -608,6 +623,7 @@ fn build_template_via_vm(
     fs: Filesystem,
     capacity_bytes: u64,
     cache_root: &Path,
+    cache_key: &str,
 ) -> Result<PathBuf> {
     let mkfs = match fs {
         Filesystem::Btrfs => locate_host_mkfs_btrfs()?,
@@ -636,15 +652,24 @@ fn build_template_via_vm(
 
     // Stage the sparse image under the cache root so the eventual
     // rename(2) into place is on the same filesystem (statfs
-    // f_type / f_fsid match — see store_atomic). The pid suffix
-    // disambiguates concurrent template builds for distinct
-    // `(fs, capacity)` pairs (the per-key flock serialises within
-    // a key; cross-key concurrency is permitted).
+    // f_type / f_fsid match — see store_atomic). The filename
+    // includes BOTH the cache key and the pid: the per-key flock
+    // already serialises peers within a single key, but the same
+    // process holds different per-key flocks concurrently across
+    // distinct `(fs, capacity)` pairs (cross-key concurrency is
+    // permitted). Without the key in the filename, two
+    // simultaneous in-flight builds for `btrfs-256m` and
+    // `btrfs-1024m` from the same pid would collide on
+    // `template.img.in-flight.<pid>` — the second open would
+    // truncate the first's image while it boots, corrupting the
+    // template the first build is formatting. Including the key
+    // makes the filename unique per (key, pid).
     std::fs::create_dir_all(cache_root)
         .with_context(|| format!("create cache root {cache_root:?} for staging image"))?;
     let staging_path = cache_root.join(format!(
-        "template.img.in-flight.{}",
-        std::process::id(),
+        "template.img.in-flight.{key}.{pid}",
+        key = cache_key,
+        pid = std::process::id(),
     ));
     // Remove any leftover from a prior crashed run with the same
     // pid before opening. The per-key flock serialises peers; a
@@ -662,14 +687,25 @@ fn build_template_via_vm(
         .truncate(true)
         .open(&staging_path)
         .with_context(|| format!("create staging image {staging_path:?}"))?;
-    staging_file
-        .set_len(capacity_bytes)
-        .with_context(|| {
+    // Pre-VM-boot path: a `set_len` failure (typically ENOSPC for a
+    // sparse-file extent allocation, ENOMEM for the kernel's
+    // metadata commit, EFBIG when the kernel rejects an oversized
+    // request) leaves the just-created `staging_path` on disk. The
+    // VM-boot error path below unlinks on failure; replicate that
+    // here so the empty / truncated file does not accumulate in the
+    // cache root across retries. Drop the fd first so the unlink
+    // observes a closed inode (matters on filesystems that delay
+    // truncate visibility until close).
+    if let Err(e) = staging_file.set_len(capacity_bytes) {
+        drop(staging_file);
+        let _ = std::fs::remove_file(&staging_path);
+        return Err(e).with_context(|| {
             format!(
                 "set staging image length to {capacity_bytes} bytes \
                  ({staging_path:?})"
             )
-        })?;
+        });
+    }
     // Drop the host-side fd before booting; the VM opens its own
     // RW fd via `template_staging_image`, and host writes through
     // a stale fd would race the guest's mkfs.
@@ -696,7 +732,7 @@ fn build_template_via_vm(
     let disk = crate::vmm::disk_config::DiskConfig::default()
         .capacity_mb((capacity_bytes / (1024 * 1024)) as u32)
         .filesystem(Filesystem::Raw);
-    let vm = crate::vmm::KtstrVm::builder()
+    let build_result = crate::vmm::KtstrVm::builder()
         .kernel(kernel)
         .topology(1, 1, 1, 1)
         .memory_mb(256)
@@ -706,12 +742,24 @@ fn build_template_via_vm(
         .template_staging_image(staging_path.clone())
         .include_files(vec![(mkfs_archive_path, mkfs)])
         .busybox(true)
-        .build()
-        .with_context(|| {
-            format!(
-                "build template-VM for {fs:?} capacity_bytes={capacity_bytes}"
-            )
-        })?;
+        .build();
+    // .build() can fail for host-resource reasons (KVM ioctl
+    // ENOMEM, sysfs unreadable, hugepage planning) AFTER the
+    // staging image is already on disk. Without the cleanup arm
+    // below, those failures leak the staging file across retries
+    // — same pattern as the .run() error handler farther down,
+    // but earlier in the lifecycle.
+    let vm = match build_result {
+        Ok(vm) => vm,
+        Err(e) => {
+            let _ = std::fs::remove_file(&staging_path);
+            return Err(e).with_context(|| {
+                format!(
+                    "build template-VM for {fs:?} capacity_bytes={capacity_bytes}"
+                )
+            });
+        }
+    };
     let result = vm.run().with_context(|| {
         format!(
             "run template-build VM for {fs:?} capacity_bytes={capacity_bytes}"
@@ -895,8 +943,13 @@ mod tests {
             "KTSTR_CACHE_DIR",
             tmp.path(),
         );
-        let err = build_template_via_vm(Filesystem::Raw, 256 * 1024 * 1024, tmp.path())
-            .expect_err("Raw must be rejected");
+        let err = build_template_via_vm(
+            Filesystem::Raw,
+            256 * 1024 * 1024,
+            tmp.path(),
+            "raw-256m",
+        )
+        .expect_err("Raw must be rejected");
         let msg = err.to_string();
         assert!(
             msg.contains("Filesystem::Raw"),

@@ -1902,6 +1902,15 @@ mod tests {
         fn set_io_weight(&self, _: &str, _: u16) -> Result<()> {
             Ok(())
         }
+        fn set_freeze(&self, _: &str, _: bool) -> Result<()> {
+            Ok(())
+        }
+        fn set_pids_max(&self, _: &str, _: Option<u64>) -> Result<()> {
+            Ok(())
+        }
+        fn set_memory_swap_max(&self, _: &str, _: Option<u64>) -> Result<()> {
+            Ok(())
+        }
         fn move_task(&self, _: &str, _: libc::pid_t) -> Result<()> {
             Ok(())
         }

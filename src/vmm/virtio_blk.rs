@@ -5689,6 +5689,140 @@ mod tests {
         assert_eq!(c2.reads_completed.load(Ordering::Relaxed), 42);
     }
 
+    /// Each `VirtioBlkCounters` accessor returns the value stored in
+    /// the matching atomic field — no swapped-accessor wiring. Pin
+    /// distinct sentinel values per field (1..=8) so a regression
+    /// that, for example, has `reads_completed()` return
+    /// `writes_completed`'s atomic surfaces here as a wrong-value
+    /// assertion failure that names the field.
+    ///
+    /// Counters are crate-internal; the test reaches into the public
+    /// `pub(crate)` atomic fields to seed sentinels, then exercises
+    /// each `pub fn` accessor. Without this test the eight accessors
+    /// have zero call sites in the test suite and a swap regression
+    /// would only surface at runtime via wrong failure-dump numbers.
+    #[test]
+    fn counters_accessors_match_atomic_state() {
+        let counters = VirtioBlkCounters::default();
+        // Distinct sentinels so any swapped-accessor returns a value
+        // that mismatches the field name in the assertion message.
+        counters.reads_completed.store(1, Ordering::Relaxed);
+        counters.writes_completed.store(2, Ordering::Relaxed);
+        counters.flushes_completed.store(3, Ordering::Relaxed);
+        counters.bytes_read.store(4, Ordering::Relaxed);
+        counters.bytes_written.store(5, Ordering::Relaxed);
+        counters.throttled_count.store(6, Ordering::Relaxed);
+        counters.io_errors.store(7, Ordering::Relaxed);
+        counters.currently_throttled_gauge.store(8, Ordering::Relaxed);
+        assert_eq!(counters.reads_completed(), 1, "reads_completed accessor");
+        assert_eq!(counters.writes_completed(), 2, "writes_completed accessor");
+        assert_eq!(counters.flushes_completed(), 3, "flushes_completed accessor");
+        assert_eq!(counters.bytes_read(), 4, "bytes_read accessor");
+        assert_eq!(counters.bytes_written(), 5, "bytes_written accessor");
+        assert_eq!(counters.throttled_count(), 6, "throttled_count accessor");
+        assert_eq!(counters.io_errors(), 7, "io_errors accessor");
+        assert_eq!(
+            counters.currently_throttled_gauge(),
+            8,
+            "currently_throttled_gauge accessor",
+        );
+    }
+
+    /// FEATURES_OK without VIRTIO_F_VERSION_1 must be observable as a
+    /// rejection via the MMIO read-back path, not just via the
+    /// internal `device_status` field. The kernel's
+    /// `virtio_features_ok` writes FEATURES_OK and re-reads STATUS;
+    /// the production rejection signal is "the bit didn't stick" as
+    /// observed through MMIO reads. A regression that updated
+    /// `device_status` but broke the STATUS read register would pass
+    /// `features_ok_rejected_without_version_1` (which checks the
+    /// field directly) while presenting as accept-then-reject to a
+    /// real driver.
+    ///
+    /// Construction parallels `features_ok_rejected_without_version_1`:
+    /// walk to S_DRV, ack a non-VERSION_1 feature, attempt FEATURES_OK,
+    /// then read STATUS via `read_reg` and assert the response equals
+    /// S_DRV (S_FEAT bit absent).
+    #[test]
+    fn features_ok_rejection_visible_via_mmio_read() {
+        let mut dev = make_device(VIRTIO_BLK_DEFAULT_CAPACITY_BYTES, DiskThrottle::default());
+        write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_ACK);
+        write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_DRV);
+        // Ack BLK_SIZE in the low half but skip VIRTIO_F_VERSION_1
+        // (bit 32 in the high half). A legitimate non-VERSION_1
+        // feature ack — the rejection is specifically about the
+        // missing transport bit, not the device's feature set.
+        write_reg(&mut dev, VIRTIO_MMIO_DRIVER_FEATURES_SEL, 0);
+        write_reg(&mut dev, VIRTIO_MMIO_DRIVER_FEATURES, 1 << VIRTIO_BLK_F_BLK_SIZE);
+        // Attempt FEATURES_OK without VIRTIO_F_VERSION_1.
+        write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_FEAT);
+        // MMIO read-back: STATUS must report S_DRV (not S_FEAT) so
+        // the kernel's read-after-write check surfaces the
+        // rejection.
+        let status = read_reg(&dev, VIRTIO_MMIO_STATUS);
+        assert_eq!(
+            status, S_DRV,
+            "MMIO STATUS read-back must show FEATURES_OK is unset \
+             when VIRTIO_F_VERSION_1 was not negotiated",
+        );
+        assert_ne!(
+            status & VIRTIO_CONFIG_S_FEATURES_OK,
+            VIRTIO_CONFIG_S_FEATURES_OK,
+            "FEATURES_OK bit must NOT be set in MMIO read-back",
+        );
+
+        // Sanity check: same MMIO walk after acking VIRTIO_F_VERSION_1
+        // succeeds — proves the rejection was version-1-specific,
+        // not a blanket MMIO-read-broken regression.
+        write_reg(&mut dev, VIRTIO_MMIO_DRIVER_FEATURES_SEL, 1);
+        write_reg(
+            &mut dev,
+            VIRTIO_MMIO_DRIVER_FEATURES,
+            1 << (VIRTIO_F_VERSION_1 - 32),
+        );
+        write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_FEAT);
+        let status = read_reg(&dev, VIRTIO_MMIO_STATUS);
+        assert_eq!(
+            status, S_FEAT,
+            "MMIO STATUS read-back must show FEATURES_OK is set \
+             once VIRTIO_F_VERSION_1 was negotiated",
+        );
+    }
+
+    /// `set_mem` is one-shot: the second call must NOT replace the
+    /// stored guest memory. The field is `Arc<OnceLock<GuestMemoryMmap>>`,
+    /// and `OnceLock::set` returns Err on already-initialised; the
+    /// device's `set_mem` logs a warn and returns without overwriting.
+    /// Pin the warn+ignore behaviour: after two `set_mem` calls with
+    /// distinct memory maps, the stored map must point at the FIRST
+    /// instance.
+    ///
+    /// Pointer equality via `OnceLock::get() as *const GuestMemoryMmap`
+    /// is the load-bearing assertion — `GuestMemoryMmap` has no
+    /// `PartialEq` and copying via `clone()` would defeat the point
+    /// (clones would be address-distinct even if content-equal).
+    #[test]
+    fn set_mem_twice_keeps_first_instance() {
+        let mut dev = make_device(VIRTIO_BLK_DEFAULT_CAPACITY_BYTES, DiskThrottle::default());
+        let mem_a = make_guest_mem(4096);
+        let mem_b = make_guest_mem(8192);
+        dev.set_mem(mem_a);
+        // Snapshot the address `OnceLock::get()` returns AFTER the
+        // first set. The second set call must not alter what
+        // `get()` returns.
+        let first_ptr = dev.mem.get().expect("set_mem populated OnceLock") as *const GuestMemoryMmap;
+        // Second set with a distinct map. set_mem swallows the
+        // already-initialised Err with a warn (per its doc); the
+        // function returns Ok regardless.
+        dev.set_mem(mem_b);
+        let after_ptr = dev.mem.get().expect("OnceLock still populated") as *const GuestMemoryMmap;
+        assert_eq!(
+            first_ptr, after_ptr,
+            "OnceLock must retain the first GuestMemoryMmap; set_mem \
+             must not overwrite on the second call",
+        );
+    }
+
     #[test]
     fn handle_flush_no_mem_no_panic() {
         // Flush calls fdatasync on the backing file. Ensure it
@@ -13602,6 +13736,332 @@ mod tests {
             c.currently_throttled_gauge.load(Ordering::Relaxed),
             0,
             "currently_throttled_gauge must initialize to 0",
+        );
+    }
+
+    /// Two BACK-TO-BACK calls to `drain_bracket_impl` against the same
+    /// `BlkWorkerState` — the cfg(test) analogue of the production
+    /// worker's wait_nanos==0 inline re-drain (see worker_thread_main).
+    ///
+    /// First call: bucket drained → stall, gauge 0→1, currently_stalled
+    /// transitions false→true. Second call (after stepping the bucket
+    /// forward to grant a token): chain runs to completion, gauge 1→0,
+    /// currently_stalled clears, reads_completed=1, throttled_count
+    /// stays at 1 (no second stall event).
+    ///
+    /// Pins the gauge invariant under inline re-drain: the
+    /// stall→success sequence must dec the gauge EXACTLY ONCE, not
+    /// zero (missing dec) and not twice (double-dec). Distinct from
+    /// `currently_throttled_gauge_decrements_on_retry_success` which
+    /// uses two separate `process_requests` calls (two worker
+    /// iterations); this test pins the single-iteration inline
+    /// re-drain semantics.
+    #[test]
+    fn currently_throttled_gauge_inline_redrain_succeeds_decrements_once() {
+        let cap = 4096u64;
+        let f = make_backed_file_with_pattern(cap, 0xAB);
+        let throttle = DiskThrottle {
+            iops: std::num::NonZeroU64::new(1),
+            bytes_per_sec: None,
+            iops_burst_capacity: None,
+            bytes_burst_capacity: None,
+        };
+        let mut dev = VirtioBlk::new(f, cap, throttle);
+        let mem = make_chain_test_mem();
+        let mock = MockSplitQueue::create(&mem, GuestAddress(0), 16);
+
+        // Drain the bucket so the first drain stalls.
+        dev.worker
+            .state_mut()
+            .ops_bucket
+            .set_last_refill_for_test(std::time::Instant::now());
+        assert!(dev.worker.state_mut().ops_bucket.consume(1));
+        dev.worker
+            .state_mut()
+            .ops_bucket
+            .set_last_refill_for_test(std::time::Instant::now());
+
+        let header_addr = GuestAddress(0x4000);
+        let data_addr = GuestAddress(0x5000);
+        let status_addr = GuestAddress(0x6000);
+        write_blk_header(&mem, header_addr, VIRTIO_BLK_T_IN, 0);
+        let descs = [
+            RawDescriptor::from(SplitDescriptor::new(
+                header_addr.0,
+                VIRTIO_BLK_OUTHDR_SIZE as u32,
+                0,
+                0,
+            )),
+            RawDescriptor::from(SplitDescriptor::new(
+                data_addr.0,
+                512,
+                VRING_DESC_F_WRITE as u16,
+                0,
+            )),
+            RawDescriptor::from(SplitDescriptor::new(
+                status_addr.0,
+                1,
+                VRING_DESC_F_WRITE as u16,
+                0,
+            )),
+        ];
+        mock.build_desc_chain(&descs).expect("build chain");
+        dev.set_mem(mem.clone());
+        wire_device_to_mock(&mut dev, &mock);
+
+        // Pin the bucket again — wire_device_to_mock walked the FSM
+        // and microseconds elapsed; even at iops=1 (1 token/sec)
+        // the elapsed wallclock is negligible but we pin for
+        // determinism.
+        dev.worker
+            .state_mut()
+            .ops_bucket
+            .set_last_refill_for_test(std::time::Instant::now());
+
+        // First call — direct drain_bracket_impl, NOT process_requests.
+        // Disjoint-field borrow split mirrors `drain_inline`.
+        let mem_ref = dev.mem.get().expect("mem set above");
+        let outcome1 = {
+            let WorkerEngine::Inline(engine) = &mut dev.worker.engine;
+            drain_bracket_impl(
+                &mut engine.state,
+                &mut dev.worker.queues,
+                mem_ref,
+                &dev.irq_evt,
+                &dev.interrupt_status,
+            )
+        };
+        // Pin the exact wait_nanos value the bucket math produces:
+        // capacity=1, refill_rate=1, available=0, deficit=1 →
+        // (1 token * 1e9 ns/sec) / 1 token-per-sec = 1_000_000_000
+        // ns. Wildcarding `wait_nanos: ..` would let a regression in
+        // `nanos_until_n_tokens`'s deficit calculation slip through.
+        //
+        // Note: production's wait_nanos==0 inline re-drain trigger
+        // (worker_thread_main) is unreachable from cfg(test) without
+        // a TokenBucket seam — see follow-up #454. These tests pin
+        // the gauge invariants under back-to-back drain_bracket_impl,
+        // not the production trigger condition itself.
+        assert!(
+            matches!(
+                outcome1,
+                DrainOutcome::ThrottleStalled { wait_nanos: 1_000_000_000 }
+            ),
+            "first call must stall with wait_nanos=1_000_000_000 \
+             (capacity=1, rate=1, deficit=1 → 1s); got {:?}",
+            outcome1,
+        );
+        let c = dev.counters();
+        assert_eq!(
+            c.currently_throttled_gauge.load(Ordering::Relaxed),
+            1,
+            "first stall must increment gauge to 1",
+        );
+        assert!(
+            dev.worker.state().currently_stalled,
+            "currently_stalled must be true after first stall",
+        );
+        assert_eq!(
+            c.throttled_count.load(Ordering::Relaxed),
+            1,
+            "first stall bumps throttled_count to 1",
+        );
+
+        // Step the bucket forward so the second drain succeeds.
+        dev.worker
+            .state_mut()
+            .ops_bucket
+            .set_last_refill_for_test(
+                std::time::Instant::now() - std::time::Duration::from_secs(2),
+            );
+
+        // Second back-to-back call — this IS the inline re-drain.
+        let outcome2 = {
+            let WorkerEngine::Inline(engine) = &mut dev.worker.engine;
+            drain_bracket_impl(
+                &mut engine.state,
+                &mut dev.worker.queues,
+                mem_ref,
+                &dev.irq_evt,
+                &dev.interrupt_status,
+            )
+        };
+        assert_eq!(
+            outcome2,
+            DrainOutcome::Done,
+            "second drain (post-refill) must complete; got {:?}",
+            outcome2,
+        );
+        assert_eq!(
+            c.currently_throttled_gauge.load(Ordering::Relaxed),
+            0,
+            "inline re-drain success must dec gauge exactly once: \
+             1 → 0, not staying at 1, not going negative",
+        );
+        assert!(
+            !dev.worker.state().currently_stalled,
+            "currently_stalled must clear on retry success",
+        );
+        assert_eq!(
+            c.reads_completed.load(Ordering::Relaxed),
+            1,
+            "chain must complete on second drain",
+        );
+        assert_eq!(
+            c.throttled_count.load(Ordering::Relaxed),
+            1,
+            "second drain succeeded; throttled_count must NOT bump again",
+        );
+    }
+
+    /// Two BACK-TO-BACK calls to `drain_bracket_impl` where the second
+    /// call ALSO stalls (bucket not refilled). Mimics the production
+    /// worker's wait_nanos==0 inline re-drain that re-stalls and falls
+    /// through to the timerfd arm.
+    ///
+    /// First call: stall, gauge 0→1, currently_stalled false→true,
+    /// throttled_count 0→1.
+    /// Second call (no refill): re-stall on same head, gauge stays at
+    /// 1 (idempotent re-stall — no double-inc), currently_stalled
+    /// stays true, throttled_count 1→2 (events ARE per-call, not
+    /// per-request).
+    ///
+    /// Pins the gauge invariant under inline re-drain that fails: the
+    /// second stall must NOT double-increment the gauge. A regression
+    /// that re-checked the false→true transition without the
+    /// per-worker `currently_stalled` gate would surface as gauge=2.
+    #[test]
+    fn currently_throttled_gauge_inline_redrain_restalls_no_double_count() {
+        let cap = 4096u64;
+        let f = make_backed_file_with_pattern(cap, 0xAB);
+        let throttle = DiskThrottle {
+            iops: std::num::NonZeroU64::new(1),
+            bytes_per_sec: None,
+            iops_burst_capacity: None,
+            bytes_burst_capacity: None,
+        };
+        let mut dev = VirtioBlk::new(f, cap, throttle);
+        let mem = make_chain_test_mem();
+        let mock = MockSplitQueue::create(&mem, GuestAddress(0), 16);
+
+        dev.worker
+            .state_mut()
+            .ops_bucket
+            .set_last_refill_for_test(std::time::Instant::now());
+        assert!(dev.worker.state_mut().ops_bucket.consume(1));
+        dev.worker
+            .state_mut()
+            .ops_bucket
+            .set_last_refill_for_test(std::time::Instant::now());
+
+        let header_addr = GuestAddress(0x4000);
+        let data_addr = GuestAddress(0x5000);
+        let status_addr = GuestAddress(0x6000);
+        write_blk_header(&mem, header_addr, VIRTIO_BLK_T_IN, 0);
+        let descs = [
+            RawDescriptor::from(SplitDescriptor::new(
+                header_addr.0,
+                VIRTIO_BLK_OUTHDR_SIZE as u32,
+                0,
+                0,
+            )),
+            RawDescriptor::from(SplitDescriptor::new(
+                data_addr.0,
+                512,
+                VRING_DESC_F_WRITE as u16,
+                0,
+            )),
+            RawDescriptor::from(SplitDescriptor::new(
+                status_addr.0,
+                1,
+                VRING_DESC_F_WRITE as u16,
+                0,
+            )),
+        ];
+        mock.build_desc_chain(&descs).expect("build chain");
+        dev.set_mem(mem.clone());
+        wire_device_to_mock(&mut dev, &mock);
+
+        dev.worker
+            .state_mut()
+            .ops_bucket
+            .set_last_refill_for_test(std::time::Instant::now());
+
+        let mem_ref = dev.mem.get().expect("mem set above");
+
+        // First call — stall, gauge 0→1. Pin the exact wait_nanos
+        // value the bucket math produces (1_000_000_000 ns from
+        // capacity=1, rate=1, deficit=1). Production's wait_nanos==0
+        // inline re-drain trigger is unreachable from cfg(test) —
+        // see follow-up #454.
+        let outcome1 = {
+            let WorkerEngine::Inline(engine) = &mut dev.worker.engine;
+            drain_bracket_impl(
+                &mut engine.state,
+                &mut dev.worker.queues,
+                mem_ref,
+                &dev.irq_evt,
+                &dev.interrupt_status,
+            )
+        };
+        assert!(matches!(
+            outcome1,
+            DrainOutcome::ThrottleStalled { wait_nanos: 1_000_000_000 }
+        ));
+        let c = dev.counters();
+        assert_eq!(c.currently_throttled_gauge.load(Ordering::Relaxed), 1);
+        assert!(dev.worker.state().currently_stalled);
+        assert_eq!(c.throttled_count.load(Ordering::Relaxed), 1);
+
+        // Re-pin so the second drain ALSO sees an empty bucket.
+        dev.worker
+            .state_mut()
+            .ops_bucket
+            .set_last_refill_for_test(std::time::Instant::now());
+
+        // Second back-to-back call — re-stall (no refill).
+        let outcome2 = {
+            let WorkerEngine::Inline(engine) = &mut dev.worker.engine;
+            drain_bracket_impl(
+                &mut engine.state,
+                &mut dev.worker.queues,
+                mem_ref,
+                &dev.irq_evt,
+                &dev.interrupt_status,
+            )
+        };
+        // Same pinned wait_nanos as outcome1 — re-stall on an
+        // unchanged bucket repeats the same deficit math.
+        assert!(
+            matches!(
+                outcome2,
+                DrainOutcome::ThrottleStalled { wait_nanos: 1_000_000_000 }
+            ),
+            "second drain (no refill) must also stall with \
+             wait_nanos=1_000_000_000; got {:?}",
+            outcome2,
+        );
+        assert_eq!(
+            c.currently_throttled_gauge.load(Ordering::Relaxed),
+            1,
+            "re-stall on same head must NOT double-increment gauge \
+             (idempotent — gauge is per-request live state, not \
+             per-event)",
+        );
+        assert!(
+            dev.worker.state().currently_stalled,
+            "currently_stalled stays true across re-stall",
+        );
+        assert_eq!(
+            c.throttled_count.load(Ordering::Relaxed),
+            2,
+            "throttled_count IS per-event; two stall events must \
+             produce two bumps",
+        );
+        assert_eq!(
+            c.reads_completed.load(Ordering::Relaxed),
+            0,
+            "no chain completed; reads_completed must stay 0",
         );
     }
 }

@@ -2507,6 +2507,18 @@ impl KtstrVm {
         let disk = &self.disks[0];
         let capacity = disk.capacity_bytes();
 
+        // Throttle sanity gate. `DiskThrottle::validate` rejects
+        // burst capacities below their refill rate (which would
+        // silently cap the steady-state at the lower capacity
+        // instead of the configured rate) and burst capacities set
+        // without a refill rate (a one-shot bucket that never
+        // refills). Run BEFORE allocating any backing-file resources
+        // so a misconfigured throttle bails before host disk / VM
+        // memory commitments.
+        disk.throttle
+            .validate()
+            .map_err(|e| anyhow::anyhow!("invalid disk throttle: {e}"))?;
+
         // Per-test backing-file allocation forks on the configured
         // [`disk_config::Filesystem`], with one override for the
         // template-build VM driver:
@@ -2615,17 +2627,6 @@ impl KtstrVm {
             }
             }
         };
-
-        // Validate throttle/burst consistency before constructing the
-        // device. `DiskThrottle::validate` rejects misconfigurations
-        // (burst < rate, burst without rate) that would otherwise
-        // silently reduce the effective throttle rate or carry
-        // orphaned state. Runs after backing allocation today; a
-        // future refactor may hoist this earlier to bail before
-        // expensive backing setup.
-        disk.throttle
-            .validate()
-            .map_err(|e| anyhow::anyhow!("invalid disk throttle: {e}"))?;
 
         let mut blk =
             virtio_blk::VirtioBlk::with_options(backing, capacity, disk.throttle, disk.read_only);

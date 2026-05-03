@@ -92,20 +92,43 @@ impl CgroupManager {
         &self.parent
     }
 
-    /// Create the parent directory and enable cgroup controllers (cpuset, optionally cpu).
+    /// Create the parent directory and enable cgroup controllers
+    /// (cpuset, optionally cpu, plus memory + pids + io unconditionally).
+    ///
+    /// `enable_cpu_controller` gates `+cpu` only — the memory, pids, and
+    /// io controllers are always enabled because the test framework's
+    /// CgroupDef builders (`memory_max`, `pids_max`, `io_weight`,
+    /// `memory_swap_max`) can land on any cgroup the test author defines,
+    /// and per-write lazy enablement would race against concurrent
+    /// sibling cgroups reading their controller files. Per the cgroup v2
+    /// docs ("Documentation/admin-guide/cgroup-v2.rst"), `+memory`
+    /// enables memory controller files including `memory.max`,
+    /// `memory.high`, `memory.swap.max`; `+pids` enables `pids.max`;
+    /// `+io` enables `io.weight`. `cgroup.freeze` is a cgroup-core file
+    /// not gated by any controller.
     pub fn setup(&self, enable_cpu_controller: bool) -> Result<()> {
+        self.setup_under_root(enable_cpu_controller, &PathBuf::from("/sys/fs/cgroup"))
+    }
+
+    /// Inner setup that takes the cgroup-fs root as an explicit
+    /// argument so tests can drive the controller-enable path against
+    /// a tmpdir without touching `/sys/fs/cgroup`. Production
+    /// [`Self::setup`] hardcodes `/sys/fs/cgroup`. The strip-prefix
+    /// gate stays — if the parent is outside the supplied root,
+    /// directory creation still happens but no subtree_control walk
+    /// fires (matches the existing "non-cgroup-mount" early-bail).
+    fn setup_under_root(&self, enable_cpu_controller: bool, root: &Path) -> Result<()> {
         if !self.parent.exists() {
             fs::create_dir_all(&self.parent)
                 .with_context(|| format!("mkdir {}", self.parent.display()))?;
         }
         let controllers = if enable_cpu_controller {
-            "+cpuset +cpu"
+            "+cpuset +cpu +memory +pids +io"
         } else {
-            "+cpuset"
+            "+cpuset +memory +pids +io"
         };
-        let root = PathBuf::from("/sys/fs/cgroup");
-        if let Ok(rel) = self.parent.strip_prefix(&root) {
-            let mut cur = root.clone();
+        if let Ok(rel) = self.parent.strip_prefix(root) {
+            let mut cur = root.to_path_buf();
             for c in rel.components() {
                 let sc = cur.join("cgroup.subtree_control");
                 if sc.exists()
@@ -347,6 +370,70 @@ impl CgroupManager {
         write_with_timeout(&p, &weight.to_string(), CGROUP_WRITE_TIMEOUT)
     }
 
+    /// Write `cgroup.freeze` for a child cgroup. `frozen = true` writes
+    /// `"1"`, `frozen = false` writes `"0"`.
+    ///
+    /// `cgroup.freeze` is a cgroup-core file exposed on every non-root
+    /// cgroup automatically — it is NOT gated by `cgroup.subtree_control`.
+    /// The kernel's `cgroup_freeze_write`
+    /// (kernel/cgroup/cgroup.c:4099-4122) parses the value via
+    /// `kstrtoint`, rejects anything outside `{0, 1}` with `-ERANGE`,
+    /// and dispatches `cgroup_freeze(cgrp, freeze)`. Writing `1` to a
+    /// cgroup containing tasks transitions every task in the subtree to
+    /// the frozen state; writing `0` releases. The transition is
+    /// asynchronous — `cgroup.events`'s `frozen` field reaches `1` once
+    /// every task has parked.
+    pub fn set_freeze(&self, name: &str, frozen: bool) -> Result<()> {
+        let p = self.parent.join(name).join("cgroup.freeze");
+        let line = if frozen { "1" } else { "0" };
+        write_with_timeout(&p, line, CGROUP_WRITE_TIMEOUT)
+    }
+
+    /// Write `pids.max` for a child cgroup. `max = None` writes `"max"`
+    /// (the kernel's `PIDS_MAX_STR` sentinel for unlimited);
+    /// `Some(n)` writes the decimal `n`.
+    ///
+    /// Per the kernel's `pids_max_write`
+    /// (kernel/cgroup/pids.c:301-329): the parser short-circuits to the
+    /// unlimited limit when `buf == PIDS_MAX_STR`; otherwise
+    /// `kstrtoll(buf, 0, &limit)` parses a signed integer and rejects
+    /// `< 0` or `>= PIDS_MAX` with `-EINVAL`. The update is atomic
+    /// (`atomic64_set(&pids->limit, limit)`); existing tasks are NOT
+    /// killed when the limit lands below the current task count — only
+    /// future `fork()` / `clone()` calls are blocked.
+    ///
+    /// Requires `+pids` in the parent's `cgroup.subtree_control`;
+    /// [`Self::setup`] enables it unconditionally so this write
+    /// succeeds on every ktstr-managed cgroup tree.
+    pub fn set_pids_max(&self, name: &str, max: Option<u64>) -> Result<()> {
+        let p = self.parent.join(name).join("pids.max");
+        let line = match max {
+            Some(n) => n.to_string(),
+            None => "max".to_string(),
+        };
+        write_with_timeout(&p, &line, CGROUP_WRITE_TIMEOUT)
+    }
+
+    /// Write `memory.swap.max` for a child cgroup. `bytes = None` writes
+    /// `"max"` (no swap cap); `Some(b)` writes the decimal byte count.
+    ///
+    /// Per the kernel's `swap_max_write` (mm/memcontrol.c:5379-5394):
+    /// the value is parsed via `page_counter_memparse(buf, "max", &max)`,
+    /// which accepts the literal `"max"` token for unlimited or a
+    /// numeric byte count. The store is `xchg(&memcg->swap.max, max)` —
+    /// atomic, with no failure path beyond the parse.
+    ///
+    /// Requires `+memory` in the parent's `cgroup.subtree_control`;
+    /// [`Self::setup`] enables it unconditionally.
+    pub fn set_memory_swap_max(&self, name: &str, bytes: Option<u64>) -> Result<()> {
+        let p = self.parent.join(name).join("memory.swap.max");
+        let line = match bytes {
+            Some(b) => b.to_string(),
+            None => "max".to_string(),
+        };
+        write_with_timeout(&p, &line, CGROUP_WRITE_TIMEOUT)
+    }
+
     /// Move a single task into a child cgroup via `cgroup.procs`.
     pub fn move_task(&self, name: &str, pid: libc::pid_t) -> Result<()> {
         let p = self.parent.join(name).join("cgroup.procs");
@@ -514,6 +601,13 @@ pub trait CgroupOps {
     fn set_memory_low(&self, name: &str, bytes: Option<u64>) -> Result<()>;
     /// Write `io.weight`. See [`CgroupManager::set_io_weight`].
     fn set_io_weight(&self, name: &str, weight: u16) -> Result<()>;
+    /// Write `cgroup.freeze`. See [`CgroupManager::set_freeze`].
+    fn set_freeze(&self, name: &str, frozen: bool) -> Result<()>;
+    /// Write `pids.max`. See [`CgroupManager::set_pids_max`].
+    fn set_pids_max(&self, name: &str, max: Option<u64>) -> Result<()>;
+    /// Write `memory.swap.max`. See
+    /// [`CgroupManager::set_memory_swap_max`].
+    fn set_memory_swap_max(&self, name: &str, bytes: Option<u64>) -> Result<()>;
     /// Move a single task via `cgroup.procs`. See
     /// [`CgroupManager::move_task`].
     fn move_task(&self, name: &str, pid: libc::pid_t) -> Result<()>;
@@ -578,6 +672,15 @@ impl CgroupOps for CgroupManager {
     }
     fn set_io_weight(&self, name: &str, weight: u16) -> Result<()> {
         CgroupManager::set_io_weight(self, name, weight)
+    }
+    fn set_freeze(&self, name: &str, frozen: bool) -> Result<()> {
+        CgroupManager::set_freeze(self, name, frozen)
+    }
+    fn set_pids_max(&self, name: &str, max: Option<u64>) -> Result<()> {
+        CgroupManager::set_pids_max(self, name, max)
+    }
+    fn set_memory_swap_max(&self, name: &str, bytes: Option<u64>) -> Result<()> {
+        CgroupManager::set_memory_swap_max(self, name, bytes)
     }
     fn move_task(&self, name: &str, pid: libc::pid_t) -> Result<()> {
         CgroupManager::move_task(self, name, pid)
@@ -844,6 +947,77 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// `setup` writes every expected controller (`+cpuset +cpu
+    /// +memory +pids +io`) to the parent cgroup's
+    /// `cgroup.subtree_control`. Without this assertion, a future
+    /// edit that drops `+pids` (or any other controller) from the
+    /// expansion would silently land — apply_setup's pids/swap_max
+    /// writes would then fail with ENOENT at scenario-execution
+    /// time, NOT at framework-setup time.
+    ///
+    /// Path: drives [`setup_under_root`] against a tmpdir-rooted
+    /// "cgroup tree" (parent dir + pre-created
+    /// `cgroup.subtree_control` file at the leaf), then reads the
+    /// file back and asserts every controller token is present.
+    #[test]
+    fn setup_writes_all_controllers() {
+        let root = std::env::temp_dir().join(format!("ktstr-setup-controllers-{}", std::process::id()));
+        let parent = root.join("ktstr");
+        fs::create_dir_all(&parent).unwrap();
+        // Pre-create the subtree_control file so the strip-prefix
+        // walk in setup_under_root's leaf-write branch sees it
+        // exist (the production setup() also depends on the file
+        // existing — cgroup v2 creates it at mount time).
+        fs::write(parent.join("cgroup.subtree_control"), "").unwrap();
+
+        let cg = CgroupManager::new(parent.to_str().unwrap());
+        cg.setup_under_root(true, &root).unwrap();
+
+        let written = fs::read_to_string(parent.join("cgroup.subtree_control")).unwrap();
+        for token in [
+            "+cpuset",
+            "+cpu",
+            "+memory",
+            "+pids",
+            "+io",
+        ] {
+            assert!(
+                written.contains(token),
+                "subtree_control must contain {token}; got: {written:?}",
+            );
+        }
+
+        // enable_cpu_controller=false drops only +cpu; the other
+        // four must still appear.
+        fs::write(parent.join("cgroup.subtree_control"), "").unwrap();
+        cg.setup_under_root(false, &root).unwrap();
+        let written = fs::read_to_string(parent.join("cgroup.subtree_control")).unwrap();
+        assert!(written.contains("+cpuset"));
+        assert!(written.contains("+memory"));
+        assert!(written.contains("+pids"));
+        assert!(written.contains("+io"));
+        assert!(
+            !written.contains("+cpu "),
+            "+cpu must be absent when enable_cpu_controller=false; got: {written:?}",
+        );
+        // Distinguish "+cpu " (token bound) from "+cpuset" / "+cpu"
+        // tail-without-space: the only +cpu* tokens we expect when
+        // enable_cpu_controller=false are +cpuset. Verify the raw
+        // string ends without a bare +cpu by asserting the position
+        // of "+cpu" only matches the +cpuset prefix.
+        let cpu_positions: Vec<usize> = written.match_indices("+cpu").map(|(i, _)| i).collect();
+        for pos in cpu_positions {
+            let suffix = &written[pos..];
+            assert!(
+                suffix.starts_with("+cpuset"),
+                "every +cpu* token must be +cpuset when enable_cpu_controller=false; \
+                 got '{suffix}' at pos {pos} in {written:?}",
+            );
+        }
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn write_with_timeout_success() {
         let dir = std::env::temp_dir().join(format!("ktstr-wt-{}", std::process::id()));
@@ -1098,6 +1272,53 @@ mod tests {
         fs::write(&target, "").unwrap();
         cg.set_io_weight("cg_x", 500).unwrap();
         assert_eq!(fs::read_to_string(&target).unwrap(), "500");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `set_freeze(true)` writes the literal `"1"`; `false` writes
+    /// `"0"`. Pinned because the kernel's `cgroup_freeze_write` rejects
+    /// any other value with `-ERANGE` — a regression that emits "true"
+    /// or "frozen" would surface as a syscall failure on real cgroupfs.
+    #[test]
+    fn set_freeze_writes_zero_or_one() {
+        let (dir, cg) = make_test_cgroup("freeze");
+        let target = dir.join("cg_x").join("cgroup.freeze");
+        fs::write(&target, "").unwrap();
+        cg.set_freeze("cg_x", true).unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "1");
+        cg.set_freeze("cg_x", false).unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "0");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `set_pids_max(Some(n))` writes the decimal `n`;
+    /// `set_pids_max(None)` writes `"max"` — the kernel's
+    /// `PIDS_MAX_STR` sentinel that selects the unlimited path in
+    /// `pids_max_write`.
+    #[test]
+    fn set_pids_max_writes_decimal_or_max_keyword() {
+        let (dir, cg) = make_test_cgroup("pids-max");
+        let target = dir.join("cg_x").join("pids.max");
+        fs::write(&target, "").unwrap();
+        cg.set_pids_max("cg_x", Some(1024)).unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "1024");
+        cg.set_pids_max("cg_x", None).unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "max");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `set_memory_swap_max(Some(b))` writes the decimal byte count;
+    /// `None` writes `"max"` — the unlimited sentinel
+    /// `page_counter_memparse` recognises in `swap_max_write`.
+    #[test]
+    fn set_memory_swap_max_writes_bytes_or_max_keyword() {
+        let (dir, cg) = make_test_cgroup("mem-swap-max");
+        let target = dir.join("cg_x").join("memory.swap.max");
+        fs::write(&target, "").unwrap();
+        cg.set_memory_swap_max("cg_x", Some(2 * 1024 * 1024)).unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "2097152");
+        cg.set_memory_swap_max("cg_x", None).unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "max");
         let _ = fs::remove_dir_all(&dir);
     }
 }

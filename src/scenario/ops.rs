@@ -205,6 +205,25 @@ pub enum Op {
         name: Cow<'static, str>,
         cgroup: Option<Cow<'static, str>>,
     },
+    /// Freeze every task in the named cgroup via `cgroup.freeze`.
+    ///
+    /// Writes `"1"` to the cgroup's `cgroup.freeze` file. The kernel's
+    /// `cgroup_freeze_write` (kernel/cgroup/cgroup.c:4099-4122)
+    /// dispatches the asynchronous freeze path; tasks transition to
+    /// the frozen state without external SIGSTOP, and `cgroup.events`
+    /// reaches `frozen 1` once every task has parked. Idempotent —
+    /// freezing an already-frozen cgroup is a no-op.
+    ///
+    /// Pair with [`Op::UnfreezeCgroup`] to release. Useful for
+    /// scheduler suspend/resume tests where the test body wants to
+    /// observe how the scheduler handles a suddenly-frozen workload
+    /// and the resumption sequence afterwards.
+    FreezeCgroup { cgroup: Cow<'static, str> },
+    /// Unfreeze every task in the named cgroup via `cgroup.freeze`.
+    ///
+    /// Writes `"0"` to the cgroup's `cgroup.freeze` file. Inverse of
+    /// [`Op::FreezeCgroup`]. Idempotent.
+    UnfreezeCgroup { cgroup: Cow<'static, str> },
 }
 
 /// How to compute a cpuset from topology.
@@ -346,8 +365,8 @@ pub struct CpuLimits {
 }
 
 /// Memory controller limits (`memory.max` / `memory.high` /
-/// `memory.low`). Each field is `None` by default (inherit from
-/// parent / no limit).
+/// `memory.low` / `memory.swap.max`). Each field is `None` by
+/// default (inherit from parent / no limit).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct MemoryLimits {
@@ -365,6 +384,34 @@ pub struct MemoryLimits {
     /// this cgroup's memory below `low`. `None` writes `"0"` (no
     /// protection).
     pub low: Option<u64>,
+    /// `memory.swap.max` ceiling on the cgroup's swap usage in bytes.
+    /// `None` writes `"max"` (no swap cap, the kernel default). The
+    /// kernel parses the wire value via `page_counter_memparse` —
+    /// either the literal `"max"` or a decimal byte count
+    /// (mm/memcontrol.c:5379-5394 `swap_max_write`).
+    pub swap_max: Option<u64>,
+}
+
+/// Pids controller limits (`pids.max`). `None` is the default
+/// (inherit from parent — typically `"max"`, no ceiling).
+///
+/// Per the kernel's `pids_max_write` (kernel/cgroup/pids.c:301-329),
+/// existing tasks are NOT killed when the limit lands below the
+/// current task count; only future `fork()` / `clone()` calls are
+/// blocked once the cgroup's task count meets the limit. Useful for
+/// fork-bomb / task-count-ceiling tests.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PidsLimits {
+    /// `pids.max` task-count ceiling. `None` writes the literal
+    /// string `"max"` (the kernel's `PIDS_MAX_STR` sentinel for
+    /// unlimited). `Some(n)` writes the decimal `n`. The kernel
+    /// rejects negative or `>= PIDS_MAX (1 << 22)` values with
+    /// EINVAL; the framework's `apply_setup` rejects `Some(0)`
+    /// before the syscall (a 0 limit silently halts every fork
+    /// inside the cgroup, including the spawned worker's own
+    /// futex-helper threads).
+    pub max: Option<u64>,
 }
 
 /// IO controller limits (`io.weight`). Per-device throughput caps
@@ -493,13 +540,18 @@ pub struct CgroupDef {
     /// [`Self::cpu_weight`].
     pub cpu: Option<CpuLimits>,
     /// Optional memory controller limits (`memory.max`,
-    /// `memory.high`, `memory.low`). `None` leaves all three at
-    /// the kernel defaults. Set via [`Self::memory_max`] /
-    /// [`Self::memory_high`] / [`Self::memory_low`].
+    /// `memory.high`, `memory.low`, `memory.swap.max`). `None`
+    /// leaves all four at the kernel defaults. Set via
+    /// [`Self::memory_max`] / [`Self::memory_high`] /
+    /// [`Self::memory_low`] / [`Self::memory_swap_max`].
     pub memory: Option<MemoryLimits>,
     /// Optional io controller limits (`io.weight`). `None` leaves
     /// the kernel default in place. Set via [`Self::io_weight`].
     pub io: Option<IoLimits>,
+    /// Optional pids controller limits (`pids.max`). `None` leaves
+    /// the kernel default in place (no ceiling). Set via
+    /// [`Self::pids_max`].
+    pub pids: Option<PidsLimits>,
 }
 
 impl CgroupDef {
@@ -760,6 +812,61 @@ impl CgroupDef {
         io.weight = Some(weight);
         self
     }
+
+    /// Set `memory.swap.max` ceiling in bytes. The kernel parses the
+    /// wire value via `page_counter_memparse` and accepts a decimal
+    /// byte count (mm/memcontrol.c:5379-5394 `swap_max_write`).
+    /// Distinct from `memory.max`: this caps how much of the
+    /// cgroup's memory can spill to swap, separate from total
+    /// memory consumption.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn memory_swap_max(mut self, bytes: u64) -> Self {
+        let m = self.memory.get_or_insert_with(MemoryLimits::default);
+        m.swap_max = Some(bytes);
+        self
+    }
+
+    /// Clear any previously-set `memory.swap.max` (writes `"max"`).
+    /// Mirrors [`Self::cpu_unlimited`] / [`Self::memory_unlimited`]
+    /// for a single memory-knob unset; useful when a base
+    /// `CgroupDef` builder applied a swap cap and the test wants to
+    /// remove only that knob while preserving `memory.max`/`high`/
+    /// `low`.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn memory_swap_unlimited(mut self) -> Self {
+        let m = self.memory.get_or_insert_with(MemoryLimits::default);
+        m.swap_max = None;
+        self
+    }
+
+    /// Set `pids.max` task-count ceiling. `n` is the maximum number
+    /// of processes the cgroup may host before subsequent
+    /// `fork()` / `clone()` calls return EAGAIN. Existing tasks are
+    /// NOT killed when the limit lands below the current count
+    /// (kernel/cgroup/pids.c:301-329 — the kernel comment says
+    /// "Limit updates don't need to be mutex'd, since it isn't
+    /// critical that any racing fork()s follow the new limit").
+    ///
+    /// `n = 0` is rejected at `apply_setup` time: a 0-limit cgroup
+    /// silently halts every fork from inside, including the
+    /// futex-helper threads spawned by some `WorkType` variants.
+    /// To express "no fork ever" intent, taskify and discuss with
+    /// the team — there's no kernel sentinel for it.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn pids_max(mut self, n: u64) -> Self {
+        let pids = self.pids.get_or_insert_with(PidsLimits::default);
+        pids.max = Some(n);
+        self
+    }
+
+    /// Clear any previously-set `pids.max` (writes `"max"`).
+    /// Mirrors [`Self::cpu_unlimited`] / [`Self::memory_unlimited`].
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn pids_unlimited(mut self) -> Self {
+        let pids = self.pids.get_or_insert_with(PidsLimits::default);
+        pids.max = None;
+        self
+    }
 }
 
 /// Constructor for the default [`CpuLimits`] used by the cgroup
@@ -788,6 +895,7 @@ impl Default for CgroupDef {
             cpu: None,
             memory: None,
             io: None,
+            pids: None,
         }
     }
 }
@@ -1020,6 +1128,8 @@ impl OpKind {
             OpKind::RunPayload => 10,
             OpKind::WaitPayload => 11,
             OpKind::KillPayload => 12,
+            OpKind::FreezeCgroup => 13,
+            OpKind::UnfreezeCgroup => 14,
         }
     }
 }
@@ -1183,6 +1293,20 @@ impl Op {
         Op::KillPayload {
             name: name.into(),
             cgroup: Some(cgroup.into()),
+        }
+    }
+
+    /// Freeze every task in a cgroup via `cgroup.freeze`.
+    pub fn freeze_cgroup(cgroup: impl Into<Cow<'static, str>>) -> Self {
+        Op::FreezeCgroup {
+            cgroup: cgroup.into(),
+        }
+    }
+
+    /// Unfreeze every task in a cgroup via `cgroup.freeze`.
+    pub fn unfreeze_cgroup(cgroup: impl Into<Cow<'static, str>>) -> Self {
+        Op::UnfreezeCgroup {
+            cgroup: cgroup.into(),
         }
     }
 }
@@ -2759,9 +2883,26 @@ fn apply_setup(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, defs: &[CgroupDef])
             // operator-meaningful constraint per cgroup-v2 docs;
             // kernel allows any ordering but writing max first
             // means a high write fails clearly when high>max).
+            // swap_max is independent of the max/high/low triple
+            // and lands last in the memory block.
             ctx.cgroups.set_memory_max(&def.name, mem.max)?;
             ctx.cgroups.set_memory_high(&def.name, mem.high)?;
             ctx.cgroups.set_memory_low(&def.name, mem.low)?;
+            // memory.swap.max only exists when the kernel was built
+            // with CONFIG_SWAP. On a swap-disabled kernel the file is
+            // absent and write returns ENOENT. Match the per-knob
+            // explicit-set semantics of the pids block: emit the
+            // write only when the user opted in via memory_swap_max
+            // / memory_swap_unlimited. swap_max=None means "the
+            // user never asked for a swap cap" — in that case the
+            // kernel default (unlimited on swap-enabled, no file on
+            // swap-disabled) is exactly what we want, and skipping
+            // the write keeps swap-disabled kernels viable for
+            // tests that just set memory_max.
+            if mem.swap_max.is_some() {
+                ctx.cgroups
+                    .set_memory_swap_max(&def.name, mem.swap_max)?;
+            }
         }
         if let Some(ref io) = def.io {
             if let Some(w) = io.weight {
@@ -2773,6 +2914,22 @@ fn apply_setup(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, defs: &[CgroupDef])
                 }
                 ctx.cgroups.set_io_weight(&def.name, w)?;
             }
+        }
+        if let Some(ref pids) = def.pids {
+            // pids.max: zero is a foot-cannon (no fork ever), so
+            // reject before the syscall — the kernel would accept
+            // 0 but the workload would silently halt every fork
+            // including the futex-helper threads spawned by some
+            // WorkType variants. There's no kernel sentinel for
+            // "no fork ever"; the explicit None path writes "max".
+            if let Some(0) = pids.max {
+                anyhow::bail!(
+                    "cgroup '{}': pids.max must be > 0; use \
+                     pids_unlimited() to remove the cap",
+                    def.name,
+                );
+            }
+            ctx.cgroups.set_pids_max(&def.name, pids.max)?;
         }
         let effective_works: &[WorkSpec] = if def.works.is_empty() {
             &default_work
@@ -3258,6 +3415,16 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                     .handle
                     .kill()
                     .with_context(|| format!("Op::KillPayload: kill payload '{name}'"))?;
+            }
+            Op::FreezeCgroup { cgroup } => {
+                ctx.cgroups
+                    .set_freeze(cgroup, true)
+                    .with_context(|| format!("Op::FreezeCgroup: cgroup '{cgroup}'"))?;
+            }
+            Op::UnfreezeCgroup { cgroup } => {
+                ctx.cgroups
+                    .set_freeze(cgroup, false)
+                    .with_context(|| format!("Op::UnfreezeCgroup: cgroup '{cgroup}'"))?;
             }
         }
     }
@@ -3821,6 +3988,8 @@ mod tests {
                 name: "p".into(),
                 cgroup: None,
             },
+            Op::FreezeCgroup { cgroup: "a".into() },
+            Op::UnfreezeCgroup { cgroup: "a".into() },
         ];
         let mut seen = std::collections::BTreeSet::new();
         for op in &ops {
@@ -3884,6 +4053,14 @@ mod tests {
             }
             .discriminant(),
             12,
+        );
+        assert_eq!(
+            Op::FreezeCgroup { cgroup: "a".into() }.discriminant(),
+            13,
+        );
+        assert_eq!(
+            Op::UnfreezeCgroup { cgroup: "a".into() }.discriminant(),
+            14,
         );
     }
 
@@ -5383,7 +5560,10 @@ mod tests {
         SetMemoryMax(String, Option<u64>),
         SetMemoryHigh(String, Option<u64>),
         SetMemoryLow(String, Option<u64>),
+        SetMemorySwapMax(String, Option<u64>),
         SetIoWeight(String, u16),
+        SetFreeze(String, bool),
+        SetPidsMax(String, Option<u64>),
         MoveTask(String, libc::pid_t),
         MoveTasks(String, usize), // (cgroup name, number of pids)
         ClearSubtreeControl(String),
@@ -5481,6 +5661,15 @@ mod tests {
         }
         fn set_io_weight(&self, name: &str, weight: u16) -> Result<()> {
             self.record(CgroupCall::SetIoWeight(name.to_string(), weight))
+        }
+        fn set_freeze(&self, name: &str, frozen: bool) -> Result<()> {
+            self.record(CgroupCall::SetFreeze(name.to_string(), frozen))
+        }
+        fn set_pids_max(&self, name: &str, max: Option<u64>) -> Result<()> {
+            self.record(CgroupCall::SetPidsMax(name.to_string(), max))
+        }
+        fn set_memory_swap_max(&self, name: &str, bytes: Option<u64>) -> Result<()> {
+            self.record(CgroupCall::SetMemorySwapMax(name.to_string(), bytes))
         }
         fn move_task(&self, name: &str, pid: libc::pid_t) -> Result<()> {
             self.record(CgroupCall::MoveTask(name.to_string(), pid))
@@ -7402,13 +7591,15 @@ mod tests {
             Op::wait_payload_in_cgroup("constructor-test", "a"),
             Op::kill_payload("constructor-test"),
             Op::kill_payload_in_cgroup("constructor-test", "a"),
+            Op::freeze_cgroup("a"),
+            Op::unfreeze_cgroup("a"),
         ];
 
         // Track which variants we observed. Adding a variant to `Op`
         // without a constructor call above leaves one slot `false`,
         // and adding a variant without a match arm below fails to
         // compile (no `_ =>` on purpose).
-        let mut seen = [false; 13];
+        let mut seen = [false; 15];
         for op in &constructed {
             let idx = match op {
                 Op::AddCgroup { .. } => 0,
@@ -7424,6 +7615,8 @@ mod tests {
                 Op::RunPayload { .. } => 10,
                 Op::WaitPayload { .. } => 11,
                 Op::KillPayload { .. } => 12,
+                Op::FreezeCgroup { .. } => 13,
+                Op::UnfreezeCgroup { .. } => 14,
             };
             seen[idx] = true;
         }
@@ -7728,6 +7921,262 @@ mod tests {
         assert!(
             msg.contains("cg_bad") && msg.contains("period"),
             "error must name cgroup and period; got: {msg}",
+        );
+        cleanup_state(&mut state);
+    }
+
+    // -- pids.max + memory.swap.max + cgroup.freeze ------------------
+
+    /// `.memory_swap_max(bytes)` populates the swap_max field on the
+    /// MemoryLimits inner; `.memory_swap_unlimited()` clears it back
+    /// to None. Mirrors the cpu_quota_pct / cpu_unlimited convention.
+    #[test]
+    fn cgroup_def_memory_swap_max_builder_round_trip() {
+        let d = CgroupDef::named("cg_a").memory_swap_max(2 * 1024 * 1024);
+        assert_eq!(d.memory.as_ref().unwrap().swap_max, Some(2 * 1024 * 1024));
+
+        let d = d.memory_swap_unlimited();
+        assert_eq!(d.memory.as_ref().unwrap().swap_max, None);
+    }
+
+    /// `.pids_max(n)` populates the pids field; `.pids_unlimited()`
+    /// clears it. The pids field is independent of memory/cpu/io.
+    #[test]
+    fn cgroup_def_pids_max_builder_round_trip() {
+        let d = CgroupDef::named("cg_a").pids_max(1024);
+        assert_eq!(d.pids.as_ref().unwrap().max, Some(1024));
+
+        let d = d.pids_unlimited();
+        assert_eq!(d.pids.as_ref().unwrap().max, None);
+    }
+
+    /// apply_setup with `.memory_swap_max(N)` records exactly one
+    /// SetMemorySwapMax call. swap_max defaults to None on a
+    /// MemoryLimits constructed by `memory_max` alone — pin both
+    /// shapes so a regression that always emits swap_max writes
+    /// (or never emits them) surfaces here.
+    #[test]
+    fn apply_setup_records_set_memory_swap_max() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        let defs =
+            vec![CgroupDef::named("cg_swap").memory_swap_max(4 * 1024 * 1024)];
+        apply_setup_test(&ctx, &mut state, &defs).expect("apply_setup must succeed");
+        let calls = mock.calls();
+        assert!(
+            calls.contains(&CgroupCall::SetMemorySwapMax(
+                "cg_swap".to_string(),
+                Some(4 * 1024 * 1024),
+            )),
+            "swap_max with bytes must record SetMemorySwapMax(Some(N)), got: {calls:?}",
+        );
+        cleanup_state(&mut state);
+
+        // memory_max alone: swap_max stays None — apply_setup must
+        // SKIP the SetMemorySwapMax write entirely. memory.swap.max
+        // only exists on CONFIG_SWAP kernels; the per-knob
+        // explicit-set semantics (write only when the user opted in)
+        // keeps swap-disabled kernels viable for tests that just set
+        // memory_max. This mirrors the pids block's "only write when
+        // pids.max.is_some()" gate.
+        let mock = MockCgroupOps::new();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        let defs = vec![CgroupDef::named("cg_nosw").memory_max(1_000_000)];
+        apply_setup_test(&ctx, &mut state, &defs).expect("apply_setup must succeed");
+        let calls = mock.calls();
+        assert!(
+            !calls.iter().any(|c| matches!(
+                c,
+                CgroupCall::SetMemorySwapMax(n, _) if n == "cg_nosw",
+            )),
+            "memory_max-only must NOT record SetMemorySwapMax (would \
+             ENOENT on CONFIG_SWAP=n kernels); got: {calls:?}",
+        );
+        // Memory-write order pin: max → high → low. The ordering
+        // matters because max must precede high so a high-above-max
+        // user error surfaces with a clearer kernel error. swap_max
+        // is excluded from the order check here because it only
+        // emits when explicitly opted in (see test
+        // `apply_setup_orders_memory_swap_max_after_low` for the
+        // 4-write order pin).
+        let max_idx = calls
+            .iter()
+            .position(|c| matches!(c, CgroupCall::SetMemoryMax(n, _) if n == "cg_nosw"))
+            .expect("SetMemoryMax must fire");
+        let high_idx = calls
+            .iter()
+            .position(|c| matches!(c, CgroupCall::SetMemoryHigh(n, _) if n == "cg_nosw"))
+            .expect("SetMemoryHigh must fire");
+        let low_idx = calls
+            .iter()
+            .position(|c| matches!(c, CgroupCall::SetMemoryLow(n, _) if n == "cg_nosw"))
+            .expect("SetMemoryLow must fire");
+        assert!(
+            max_idx < high_idx && high_idx < low_idx,
+            "memory writes must land in (max, high, low) order; \
+             got max={max_idx} high={high_idx} low={low_idx}",
+        );
+        cleanup_state(&mut state);
+    }
+
+    /// When the user opts in via `.memory_swap_max(N)`, apply_setup
+    /// emits SetMemorySwapMax AFTER the max/high/low triple. Pins the
+    /// 4-write order across the full memory block so a regression
+    /// that re-orders swap_max relative to the other knobs surfaces
+    /// here. Distinct from `apply_setup_records_set_memory_swap_max`
+    /// which pins presence/absence under the swap-disabled-kernel
+    /// gate; this test pins ordering under the swap-enabled path.
+    #[test]
+    fn apply_setup_orders_memory_swap_max_after_low() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        let defs = vec![
+            CgroupDef::named("cg_full_mem")
+                .memory_max(2_000_000)
+                .memory_high(1_500_000)
+                .memory_low(500_000)
+                .memory_swap_max(8 * 1024 * 1024),
+        ];
+        apply_setup_test(&ctx, &mut state, &defs).expect("apply_setup must succeed");
+        let calls = mock.calls();
+        let max_idx = calls
+            .iter()
+            .position(|c| matches!(c, CgroupCall::SetMemoryMax(n, _) if n == "cg_full_mem"))
+            .expect("SetMemoryMax must fire");
+        let high_idx = calls
+            .iter()
+            .position(|c| matches!(c, CgroupCall::SetMemoryHigh(n, _) if n == "cg_full_mem"))
+            .expect("SetMemoryHigh must fire");
+        let low_idx = calls
+            .iter()
+            .position(|c| matches!(c, CgroupCall::SetMemoryLow(n, _) if n == "cg_full_mem"))
+            .expect("SetMemoryLow must fire");
+        let swap_idx = calls
+            .iter()
+            .position(|c| matches!(c, CgroupCall::SetMemorySwapMax(n, _) if n == "cg_full_mem"))
+            .expect("SetMemorySwapMax must fire when swap_max is opted in");
+        assert!(
+            max_idx < high_idx && high_idx < low_idx && low_idx < swap_idx,
+            "memory writes must land in (max, high, low, swap_max) order; \
+             got max={max_idx} high={high_idx} low={low_idx} swap={swap_idx}",
+        );
+        cleanup_state(&mut state);
+    }
+
+    /// apply_setup with `.pids_max(N)` records SetPidsMax(Some(N)).
+    /// Without `pids` set, no SetPidsMax call is emitted.
+    #[test]
+    fn apply_setup_records_set_pids_max_only_when_set() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        let defs = vec![CgroupDef::named("cg_pids").pids_max(512)];
+        apply_setup_test(&ctx, &mut state, &defs).expect("apply_setup must succeed");
+        let calls = mock.calls();
+        assert!(
+            calls.contains(&CgroupCall::SetPidsMax("cg_pids".to_string(), Some(512))),
+            "pids_max(N) must record SetPidsMax(Some(N)), got: {calls:?}",
+        );
+        cleanup_state(&mut state);
+
+        // No pids — no SetPidsMax call.
+        let mock = MockCgroupOps::new();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        let defs = vec![CgroupDef::named("cg_nopids").memory_max(1_000_000)];
+        apply_setup_test(&ctx, &mut state, &defs).expect("apply_setup must succeed");
+        let calls = mock.calls();
+        assert!(
+            !calls.iter().any(|c| matches!(c, CgroupCall::SetPidsMax(_, _))),
+            "no SetPidsMax expected when pids field is None, got: {calls:?}",
+        );
+        cleanup_state(&mut state);
+    }
+
+    /// `pids_max(0)` must be rejected at apply_setup with a clear
+    /// error naming the cgroup and the offending value. A 0-limit
+    /// cgroup silently halts every fork inside, including the
+    /// futex-helper threads spawned by some WorkType variants —
+    /// kernel accepts it but the workload would silently halt.
+    #[test]
+    fn apply_setup_rejects_pids_max_zero() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        let defs = vec![CgroupDef::named("cg_zero").pids_max(0)];
+        let err = apply_setup_test(&ctx, &mut state, &defs)
+            .err()
+            .expect("apply_setup must reject pids_max(0)");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("cg_zero") && msg.contains("pids.max"),
+            "error must name cgroup and pids.max; got: {msg}",
+        );
+        // Pin the full diagnostic wording: the actionable hint
+        // ("must be > 0" + "pids_unlimited") is what tells a user
+        // to switch builders rather than rewrite their config.
+        // Drift in either substring makes the diagnostic less
+        // actionable; surface it here at test time, not at
+        // user-debugging time.
+        assert!(
+            msg.contains("must be > 0"),
+            "error must spell out the constraint; got: {msg}",
+        );
+        assert!(
+            msg.contains("pids_unlimited"),
+            "error must name the escape hatch (pids_unlimited()); got: {msg}",
+        );
+        cleanup_state(&mut state);
+    }
+
+    /// `Op::FreezeCgroup` dispatches to set_freeze(true);
+    /// `Op::UnfreezeCgroup` to set_freeze(false). The mock records
+    /// both shapes verbatim so a regression that swaps the bool
+    /// surfaces here. Direct apply_ops dispatch — no workers needed.
+    #[test]
+    fn apply_ops_freeze_and_unfreeze_record_set_freeze() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        apply_ops_test(
+            &ctx,
+            &mut state,
+            &[
+                Op::freeze_cgroup("cg_x"),
+                Op::unfreeze_cgroup("cg_x"),
+            ],
+        )
+        .expect("freeze/unfreeze ops must succeed");
+        let calls = mock.calls();
+        assert!(
+            calls.contains(&CgroupCall::SetFreeze("cg_x".to_string(), true)),
+            "FreezeCgroup must dispatch SetFreeze(true), got: {calls:?}",
+        );
+        assert!(
+            calls.contains(&CgroupCall::SetFreeze("cg_x".to_string(), false)),
+            "UnfreezeCgroup must dispatch SetFreeze(false), got: {calls:?}",
+        );
+        // Sanity: the order must be (true, false) — the ops were
+        // applied in that order.
+        let true_idx = calls
+            .iter()
+            .position(|c| matches!(c, CgroupCall::SetFreeze(_, true)))
+            .expect("found freeze");
+        let false_idx = calls
+            .iter()
+            .position(|c| matches!(c, CgroupCall::SetFreeze(_, false)))
+            .expect("found unfreeze");
+        assert!(
+            true_idx < false_idx,
+            "freeze (true) must come before unfreeze (false): {calls:?}",
         );
         cleanup_state(&mut state);
     }

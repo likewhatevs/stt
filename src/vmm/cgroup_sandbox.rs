@@ -1310,6 +1310,18 @@ mod tests {
             self.record(&format!("set_io_weight({name})"));
             Ok(())
         }
+        fn set_freeze(&self, name: &str, frozen: bool) -> Result<()> {
+            self.record(&format!("set_freeze({name},{frozen})"));
+            Ok(())
+        }
+        fn set_pids_max(&self, name: &str, _: Option<u64>) -> Result<()> {
+            self.record(&format!("set_pids_max({name})"));
+            Ok(())
+        }
+        fn set_memory_swap_max(&self, name: &str, _: Option<u64>) -> Result<()> {
+            self.record(&format!("set_memory_swap_max({name})"));
+            Ok(())
+        }
         fn move_task(&self, name: &str, pid: libc::pid_t) -> Result<()> {
             self.record(&format!("move_task({name},{pid})"));
             if let Some(msg) = *self.move_task_err.lock().unwrap() {
