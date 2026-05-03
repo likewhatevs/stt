@@ -688,12 +688,14 @@ pub struct CtxBuilder<'a> {
 
 impl<'a> CtxBuilder<'a> {
     /// Wall-clock budget for the workload phase of the scenario.
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn duration(mut self, d: Duration) -> Self {
         self.duration = d;
         self
     }
 
     /// Number of worker threads started per cgroup by the default workload.
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn workers_per_cgroup(mut self, n: usize) -> Self {
         self.workers_per_cgroup = n;
         self
@@ -701,12 +703,14 @@ impl<'a> CtxBuilder<'a> {
 
     /// PID of the scheduler process; `None` disables the liveness
     /// checks in [`run_scenario`].
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn sched_pid(mut self, pid: Option<libc::pid_t>) -> Self {
         self.sched_pid = pid;
         self
     }
 
     /// Time to wait after cgroup creation for scheduler stabilisation.
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn settle(mut self, s: Duration) -> Self {
         self.settle = s;
         self
@@ -714,6 +718,7 @@ impl<'a> CtxBuilder<'a> {
 
     /// Override the default work type for scenarios that would
     /// otherwise use `SpinWait`.
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn work_type_override(mut self, wt: Option<WorkType>) -> Self {
         self.work_type_override = wt;
         self
@@ -723,6 +728,7 @@ impl<'a> CtxBuilder<'a> {
     /// layering should pass `Assert::default_checks().merge(&...)`;
     /// tests that pin a specific policy can pass
     /// [`crate::assert::Assert::NO_OVERRIDES`] directly.
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn assert(mut self, a: crate::assert::Assert) -> Self {
         self.assert = a;
         self
@@ -731,6 +737,7 @@ impl<'a> CtxBuilder<'a> {
     /// When true, `execute_steps` polls the SHM signal slot after
     /// writing the scenario start marker. See the field doc on
     /// [`Ctx::wait_for_map_write`].
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn wait_for_map_write(mut self, v: bool) -> Self {
         self.wait_for_map_write = v;
         self
