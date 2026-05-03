@@ -210,6 +210,30 @@ fn map_workload_groups(fp: &WorkloadFingerprint, spec: &mut ReproducerSpec) {
     }
 }
 
+/// Build the user-facing note attached when a topology-aware
+/// [`AffinityHint`] is projected. The 3 topology-aware variants
+/// (`SingleCpu`, `LlcAligned`, `CrossCgroup`) share the same
+/// structure: name the variant, describe what the scenario engine
+/// resolves at apply time, then point the user at the concrete
+/// `AffinityIntent::Exact(...)` they should hand-edit to if they
+/// want to spawn directly via [`crate::workload::WorkloadHandle::spawn`]
+/// (which rejects the topology-aware variants — they require
+/// scenario context the spawn-time gate doesn't have).
+fn topology_aware_note(
+    variant: &str,
+    engine_action: &str,
+    hand_edit_target: &str,
+) -> String {
+    format!(
+        "AffinityHint::{variant} observed; emitting \
+         AffinityIntent::{variant} — the scenario engine \
+         {engine_action} at apply time. Direct \
+         WorkloadHandle::spawn rejects this variant (no topology \
+         context); use the scenario engine or hand-edit to \
+         AffinityIntent::Exact({hand_edit_target})"
+    )
+}
+
 fn map_affinity(fp: &WorkloadFingerprint, spec: &mut ReproducerSpec) {
     let Some(primary) = fp.affinity_hints.first() else {
         return;
@@ -217,41 +241,27 @@ fn map_affinity(fp: &WorkloadFingerprint, spec: &mut ReproducerSpec) {
     spec.config.affinity = match primary {
         AffinityHint::Inherit => AffinityIntent::Inherit,
         AffinityHint::SingleCpu => {
-            spec.notes.push(
-                "AffinityHint::SingleCpu observed; emitting \
-                 AffinityIntent::SingleCpu — the scenario engine \
-                 picks the concrete CPU from the cgroup's cpuset \
-                 at apply time. Direct WorkloadHandle::spawn \
-                 rejects this variant (no topology context); use \
-                 the scenario engine or hand-edit to \
-                 AffinityIntent::Exact([cpu])"
-                    .into(),
-            );
+            spec.notes.push(topology_aware_note(
+                "SingleCpu",
+                "picks the concrete CPU from the cgroup's cpuset",
+                "[cpu]",
+            ));
             AffinityIntent::SingleCpu
         }
         AffinityHint::LlcAligned => {
-            spec.notes.push(
-                "AffinityHint::LlcAligned observed; emitting \
-                 AffinityIntent::LlcAligned — the scenario engine \
-                 resolves the LLC mask from the cgroup's cpuset at \
-                 apply time. Direct WorkloadHandle::spawn rejects \
-                 this variant (no topology context); use the \
-                 scenario engine or hand-edit to \
-                 AffinityIntent::Exact(<llc cpus>)"
-                    .into(),
-            );
+            spec.notes.push(topology_aware_note(
+                "LlcAligned",
+                "resolves the LLC mask from the cgroup's cpuset",
+                "<llc cpus>",
+            ));
             AffinityIntent::LlcAligned
         }
         AffinityHint::CrossCgroup => {
-            spec.notes.push(
-                "AffinityHint::CrossCgroup observed; emitting \
-                 AffinityIntent::CrossCgroup — the scenario engine \
-                 expands to the full topology at apply time. \
-                 Direct WorkloadHandle::spawn rejects this variant \
-                 (no topology context); use the scenario engine or \
-                 hand-edit to AffinityIntent::Exact(<all cpus>)"
-                    .into(),
-            );
+            spec.notes.push(topology_aware_note(
+                "CrossCgroup",
+                "expands to the full topology",
+                "<all cpus>",
+            ));
             AffinityIntent::CrossCgroup
         }
         AffinityHint::Exact { cpus } => {

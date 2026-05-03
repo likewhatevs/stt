@@ -3249,6 +3249,7 @@ impl Default for WorkloadConfig {
 
 impl WorkloadConfig {
     /// Set the number of worker processes.
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn workers(mut self, n: usize) -> Self {
         self.num_workers = n;
         self
@@ -3264,30 +3265,35 @@ impl WorkloadConfig {
     ///
     /// Idiomatic short form for an exact CPU set:
     /// `cfg.affinity(AffinityIntent::exact([0, 1]))`.
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn affinity(mut self, a: AffinityIntent) -> Self {
         self.affinity = a;
         self
     }
 
     /// Set the work type.
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn work_type(mut self, wt: WorkType) -> Self {
         self.work_type = wt;
         self
     }
 
     /// Set the Linux scheduling policy.
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn sched_policy(mut self, p: SchedPolicy) -> Self {
         self.sched_policy = p;
         self
     }
 
     /// Set the NUMA memory placement policy.
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn mem_policy(mut self, p: MemPolicy) -> Self {
         self.mem_policy = p;
         self
     }
 
     /// Set the NUMA memory policy mode flags.
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn mpol_flags(mut self, f: MpolFlags) -> Self {
         self.mpol_flags = f;
         self
@@ -3297,6 +3303,7 @@ impl WorkloadConfig {
     ///
     /// `0` (the default) skips the syscall and inherits the
     /// parent's nice. Negative values require `CAP_SYS_NICE`.
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn nice(mut self, n: i32) -> Self {
         self.nice = n;
         self
@@ -3307,6 +3314,7 @@ impl WorkloadConfig {
     /// [`CloneMode::Fork`] (the default) preserves historical
     /// behavior. See [`CloneMode`] for the full menu and dispatch
     /// status.
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn clone_mode(mut self, m: CloneMode) -> Self {
         self.clone_mode = m;
         self
@@ -3326,6 +3334,7 @@ impl WorkloadConfig {
     ///
     /// See [`Self::composed`] for the resolution rules applied to
     /// each entry's `num_workers` / `affinity` fields at spawn time.
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn composed(mut self, specs: impl IntoIterator<Item = WorkSpec>) -> Self {
         self.composed = specs.into_iter().collect();
         self
@@ -3343,6 +3352,7 @@ impl WorkloadConfig {
     /// Use this when building the group list incrementally. To
     /// replace the entire list in one call, use the replacing
     /// [`composed`](Self::composed) instead.
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn with_composed(mut self, spec: WorkSpec) -> Self {
         self.composed.push(spec);
         self
@@ -3411,36 +3421,42 @@ impl Default for WorkSpec {
 
 impl WorkSpec {
     /// Set the number of workers.
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn workers(mut self, n: usize) -> Self {
         self.num_workers = Some(n);
         self
     }
 
     /// Set the work type.
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn work_type(mut self, wt: WorkType) -> Self {
         self.work_type = wt;
         self
     }
 
     /// Set the Linux scheduling policy.
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn sched_policy(mut self, p: SchedPolicy) -> Self {
         self.sched_policy = p;
         self
     }
 
     /// Set the per-worker affinity intent.
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn affinity(mut self, a: AffinityIntent) -> Self {
         self.affinity = a;
         self
     }
 
     /// Set the NUMA memory placement policy.
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn mem_policy(mut self, p: MemPolicy) -> Self {
         self.mem_policy = p;
         self
     }
 
     /// Set the NUMA memory policy mode flags.
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn mpol_flags(mut self, f: MpolFlags) -> Self {
         self.mpol_flags = f;
         self
@@ -3450,6 +3466,7 @@ impl WorkSpec {
     ///
     /// `0` (the default) skips the syscall and inherits the
     /// parent's nice. Negative values require `CAP_SYS_NICE`.
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn nice(mut self, n: i32) -> Self {
         self.nice = n;
         self
@@ -10520,6 +10537,23 @@ mod tests {
     fn resolve_affinity_single_cpu() {
         let r = resolve_affinity(&ResolvedAffinity::SingleCpu(5)).unwrap();
         assert_eq!(r, Some([5].into_iter().collect()));
+    }
+
+    /// `ResolvedAffinity` derives `Debug`; the `SingleCpu` variant
+    /// must render its variant name and the embedded CPU id so
+    /// failure-dump and tracing output are diagnosable. Pins the
+    /// derive against accidental removal.
+    #[test]
+    fn resolved_affinity_single_cpu_debug_format() {
+        let dbg = format!("{:?}", ResolvedAffinity::SingleCpu(7));
+        assert!(
+            dbg.contains("SingleCpu"),
+            "Debug output must name the variant, got: {dbg}"
+        );
+        assert!(
+            dbg.contains('7'),
+            "Debug output must include the CPU id payload, got: {dbg}"
+        );
     }
 
     #[test]
