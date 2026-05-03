@@ -159,10 +159,27 @@ const TEMPLATE_LOCK_TIMEOUT: Duration = Duration::from_secs(600);
 /// btrfs `statfs.f_type` magic per `linux/magic.h`. `libc::BTRFS_SUPER_MAGIC`
 /// covers GNU but is gated on Linux; pinning the constant defends
 /// against a future libc minor release that drops/renames it.
-const BTRFS_SUPER_MAGIC: i64 = 0x9123_683e;
+///
+/// Stored as `u64` so the comparison expression has matching unsigned
+/// types. `statfs.f_type` is `__fsword_t` — `i64` on 64-bit Linux
+/// (LP64), and ktstr only targets 64-bit Linux (`x86_64-unknown-linux-*`
+/// and `aarch64-unknown-linux-*`). The call-site `as u64` cast
+/// preserves the bit pattern of an `i64` source, so the comparison
+/// against `0x9123_683e` matches the on-disk magic correctly on every
+/// supported target. Bit 31 of `BTRFS_SUPER_MAGIC` IS set
+/// (`0x9123_683e` = `1001 0001 ...`); on a hypothetical 32-bit Linux
+/// port where `__fsword_t` is `i32`, the `as u64` cast would
+/// sign-extend the negative value into the high 32 bits and break
+/// the comparison. ktstr does not support 32-bit targets, so the
+/// sign-extension trap is unreachable in practice. `XFS_SUPER_MAGIC`
+/// (`0x5846_5342`) has bit 31 clear and would survive that
+/// hypothetical 32-bit port; the asymmetry is documented here so a
+/// future 32-bit attempt fails loudly on btrfs rather than silently
+/// rejecting valid btrfs cache directories.
+const BTRFS_SUPER_MAGIC: u64 = 0x9123_683e;
 /// xfs `statfs.f_type` magic per `linux/magic.h`. Same reasoning as
 /// `BTRFS_SUPER_MAGIC`.
-const XFS_SUPER_MAGIC: i64 = 0x5846_5342;
+const XFS_SUPER_MAGIC: u64 = 0x5846_5342;
 
 /// Run `statfs(2)` against an existing path and return the populated
 /// `libc::statfs` buffer. Used by [`verify_cache_dir_supports_reflink`]
@@ -250,7 +267,7 @@ pub(crate) fn verify_cache_dir_supports_reflink(dir: &Path) -> Result<()> {
              (probed ancestor {probe:?})"
         )
     })?;
-    let fs_type = buf.f_type as i64;
+    let fs_type = buf.f_type as u64;
     if fs_type == BTRFS_SUPER_MAGIC || fs_type == XFS_SUPER_MAGIC {
         return Ok(());
     }
@@ -396,8 +413,8 @@ pub(crate) fn store_atomic(key: &str, src_path: &Path) -> Result<PathBuf> {
              (f_type=0x{dest_type:x}) live on different filesystems. \
              rename(2) would return EXDEV. Stage the template image \
              on the cache filesystem before calling store_atomic.",
-            src_type = src_buf.f_type as i64,
-            dest_type = dest_buf.f_type as i64,
+            src_type = src_buf.f_type as u64,
+            dest_type = dest_buf.f_type as u64,
         );
     }
     let staging = root.join(format!("{key}.tmp.{pid}", pid = std::process::id()));
