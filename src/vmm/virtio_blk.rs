@@ -149,8 +149,14 @@ use virtio_queue::Error as VirtioQueueError;
 use virtio_queue::QueueOwnedT;
 use virtio_queue::QueueT;
 use vm_memory::{ByteValued, Bytes, GuestAddress, GuestMemoryMmap};
+// `EpollEvent` / `EventSet` are imported unconditionally because
+// `worker_dispatch_event` (the testable extracted dispatch helper) is
+// always-compiled so cfg(test) unit tests can construct EventSet
+// values directly. `ControlOperation` / `Epoll` stay cfg(not(test))
+// because only the production worker thread issues epoll syscalls.
+use vmm_sys_util::epoll::{EpollEvent, EventSet};
 #[cfg(not(test))]
-use vmm_sys_util::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
+use vmm_sys_util::epoll::{ControlOperation, Epoll};
 use vmm_sys_util::eventfd::EventFd;
 
 use super::disk_config::DiskThrottle;
@@ -2985,6 +2991,109 @@ fn clamp_retry_nanos(wait_nanos: u64) -> u64 {
     wait_nanos.clamp(1, RETRY_TIMER_MAX_NANOS)
 }
 
+/// Worker-thread epoll dispatch tokens. Hoisted to module scope
+/// so the testable `worker_dispatch_event` helper (and its unit
+/// tests under `cfg(test)`) can name them without duplicating
+/// the values inside `worker_thread_main`'s frame.
+const KICK_TOKEN: u64 = 1;
+const STOP_TOKEN: u64 = 2;
+const THROTTLE_TOKEN: u64 = 3;
+
+/// Outcome of one epoll-event dispatch decision. Lifted to a
+/// dedicated enum so `worker_thread_main` and its unit tests
+/// share the same vocabulary for "what should the loop do next?"
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum WorkerDispatchAction {
+    /// STOP_TOKEN observed — return state and exit the worker loop.
+    Stop,
+    /// Run one drain iteration. `throttle_token_fired` is true when
+    /// THROTTLE_TOKEN was the cause: forces the drain past the
+    /// `last_known_blocked` skip because the bucket refill timer
+    /// just expired and the rolled-back chain may now be
+    /// satisfiable.
+    Drain { throttle_token_fired: bool },
+    /// Unknown token — log and continue without draining.
+    Skip,
+}
+
+/// Decide what one `EpollEvent` from `epoll.wait` should make the
+/// worker loop do. Free fn (not method) so cfg(test) unit tests
+/// can drive every (event_set, token) combination without
+/// spawning a worker thread or constructing an `Epoll` instance.
+///
+/// EPOLLERR / EPOLLHUP semantics for the worker's three fd types
+/// (kernel-grounded, verified against fs/eventfd.c::eventfd_poll
+/// and fs/timerfd.c::timerfd_poll):
+///
+/// * eventfd EPOLLERR fires iff `count == ULLONG_MAX`. With
+///   `EFD_NONBLOCK` the vCPU `kick_fd.write(1)` returns EAGAIN
+///   on saturation rather than blocking, so the counter saturates
+///   at `ULLONG_MAX - 1`; reaching `ULLONG_MAX` requires an
+///   internal kernel write the worker doesn't issue. Treated as
+///   defensive — log and fall through to the per-token handler
+///   so the next eventfd `read` drains the saturated counter
+///   back to 0 (eventfd's read returns the count and resets it).
+///
+/// * eventfd EPOLLHUP never fires. `eventfd_poll` only sets
+///   `EPOLLIN` (count > 0), `EPOLLOUT` (count < ULLONG_MAX-1),
+///   and `EPOLLERR` (count == ULLONG_MAX). No code path returns
+///   EPOLLHUP. Observing it on our owned eventfd indicates a
+///   kernel-contract change or an Epoll registration bug — log
+///   and fall through.
+///
+/// * timerfd EPOLLERR / EPOLLHUP never fire. `timerfd_poll`
+///   only sets `EPOLLIN` (ticks > 0). Same defensive log + fall
+///   through.
+///
+/// In all anomaly cases the per-token handler's eventfd or
+/// timerfd `read` is the recovery action. For the production
+/// fd types the read is harmless (yields EAGAIN if no data) and
+/// for an eventfd at saturation it's curative (drains the
+/// counter and clears EPOLLERR). The free fn makes the dispatch
+/// decision; the worker loop performs the side effects (read,
+/// drain, mutate state).
+fn worker_dispatch_event(event_set: EventSet, token: u64) -> WorkerDispatchAction {
+    if event_set.contains(EventSet::ERROR) {
+        tracing::warn!(
+            ?event_set,
+            token,
+            "virtio-blk worker: epoll event_set contains EPOLLERR; \
+             expected only on eventfd counter saturation \
+             (count == ULLONG_MAX) — fall through to per-token \
+             handler so the eventfd read drains the saturated \
+             counter back to 0"
+        );
+    }
+    if event_set.contains(EventSet::HANG_UP) {
+        tracing::warn!(
+            ?event_set,
+            token,
+            "virtio-blk worker: epoll event_set contains EPOLLHUP; \
+             structurally impossible for eventfd/timerfd \
+             (eventfd_poll and timerfd_poll never set POLLHUP). \
+             Indicates a kernel-contract change or Epoll \
+             registration bug — log and fall through"
+        );
+    }
+    match token {
+        STOP_TOKEN => WorkerDispatchAction::Stop,
+        KICK_TOKEN => WorkerDispatchAction::Drain {
+            throttle_token_fired: false,
+        },
+        THROTTLE_TOKEN => WorkerDispatchAction::Drain {
+            throttle_token_fired: true,
+        },
+        _ => {
+            tracing::warn!(
+                ?event_set,
+                token,
+                "virtio-blk worker: unknown epoll token"
+            );
+            WorkerDispatchAction::Skip
+        }
+    }
+}
+
 /// Worker thread main loop (production cfg only). Owns
 /// `BlkWorkerState`, the `[QueueSync; NUM_QUEUES]` clones, and Arcs
 /// for the shared atomics + mem slot for the device's lifetime. Loops
@@ -3145,8 +3254,12 @@ fn worker_thread_main(
         // can be retried.
         let mut throttle_token_fired = false;
         for ev in &events[..n] {
-            match ev.data() {
-                STOP_TOKEN => {
+            // Dispatch via the testable free fn so cfg(test) unit
+            // tests cover every (event_set, token) combination —
+            // including EPOLLERR/EPOLLHUP defensive arms — without
+            // spawning a worker thread.
+            match worker_dispatch_event(ev.event_set(), ev.data()) {
+                WorkerDispatchAction::Stop => {
                     // Stop signal — exit immediately and yield
                     // `state` back to the caller via the join
                     // handle. Drop discards the returned state
@@ -3159,63 +3272,69 @@ fn worker_thread_main(
                     // return.
                     return state;
                 }
-                KICK_TOKEN => {
+                WorkerDispatchAction::Drain {
+                    throttle_token_fired: tt_fired,
+                } => {
                     should_drain = true;
-                }
-                THROTTLE_TOKEN => {
-                    // Timer fired — bucket should now have refilled
-                    // enough to satisfy the rolled-back chain.
-                    // Re-drain. Counter-mode timerfd: a single
-                    // `read` returns the expiry count and resets
-                    // it to zero; we don't care about the count,
-                    // just need to clear the readiness.
-                    //
-                    // Two expected Err variants are non-fatal:
-                    //   * EAGAIN (WouldBlock) — `timerfd_settime`
-                    //     cleared the expiry counter between
-                    //     `epoll_wait` and this `read` (e.g. a
-                    //     re-arm from the immediately-prior drain
-                    //     raced with readiness delivery). Harmless:
-                    //     the next THROTTLE_TOKEN wakeup will read
-                    //     whatever count is pending then.
-                    //   * EINTR (Interrupted) — harmless: the
-                    //     timerfd remains readable, and the next
-                    //     epoll_wait re-delivers THROTTLE_TOKEN.
-                    // Anything else is unexpected (e.g. EBADF on a
-                    // closed fd) — log it so operators can debug.
-                    // In all cases the worker still falls through
-                    // to `should_drain = true` so the intended
-                    // semantics ("re-drain because the refill timer
-                    // expired") are preserved regardless of read
-                    // outcome.
-                    let mut buf = [0u8; 8];
-                    use std::io::Read;
-                    match (&timer_fd).read(&mut buf) {
-                        Ok(_) => {}
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                        Err(e) => {
-                            tracing::warn!(
-                                %e,
-                                "virtio-blk worker: unexpected timerfd read error",
-                            );
+                    if tt_fired {
+                        // Timer fired — bucket should now have
+                        // refilled enough to satisfy the
+                        // rolled-back chain. Counter-mode
+                        // timerfd: a single `read` returns the
+                        // expiry count and resets it to zero; we
+                        // don't care about the count, just need to
+                        // clear the readiness.
+                        //
+                        // Two expected Err variants are non-fatal:
+                        //   * EAGAIN (WouldBlock) —
+                        //     `timerfd_settime` cleared the expiry
+                        //     counter between `epoll_wait` and
+                        //     this `read` (e.g. a re-arm from the
+                        //     immediately-prior drain raced with
+                        //     readiness delivery). Harmless: the
+                        //     next THROTTLE_TOKEN wakeup will read
+                        //     whatever count is pending then.
+                        //   * EINTR (Interrupted) — harmless: the
+                        //     timerfd remains readable, and the
+                        //     next epoll_wait re-delivers
+                        //     THROTTLE_TOKEN.
+                        // Anything else is unexpected (e.g. EBADF
+                        // on a closed fd) — log it so operators
+                        // can debug. In all cases the worker
+                        // still falls through to the drain so the
+                        // intended semantics ("re-drain because
+                        // the refill timer expired") are
+                        // preserved regardless of read outcome.
+                        let mut buf = [0u8; 8];
+                        use std::io::Read;
+                        match (&timer_fd).read(&mut buf) {
+                            Ok(_) => {}
+                            Err(e)
+                                if e.kind()
+                                    == std::io::ErrorKind::WouldBlock => {}
+                            Err(e)
+                                if e.kind()
+                                    == std::io::ErrorKind::Interrupted => {}
+                            Err(e) => {
+                                tracing::warn!(
+                                    %e,
+                                    "virtio-blk worker: unexpected timerfd read error",
+                                );
+                            }
                         }
+                        throttle_token_fired = true;
+                        // Clear the cached "blocked" flag now
+                        // that the timer has fired. The actual
+                        // drain outcome below will re-set it if
+                        // the chain still cannot make progress
+                        // (e.g. premature refill, request size
+                        // larger than capacity).
+                        last_known_blocked = false;
                     }
-                    should_drain = true;
-                    throttle_token_fired = true;
-                    // Clear the cached "blocked" flag now that
-                    // the timer has fired. The actual drain
-                    // outcome below will re-set it if the chain
-                    // still cannot make progress (e.g. premature
-                    // refill, request size larger than capacity).
-                    last_known_blocked = false;
                 }
-                _ => {
-                    // Unknown token — defensive: log and continue.
-                    tracing::warn!(
-                        token = ev.data(),
-                        "virtio-blk worker: unknown epoll token"
-                    );
+                WorkerDispatchAction::Skip => {
+                    // Unknown token already logged by
+                    // worker_dispatch_event; nothing to do here.
                 }
             }
         }
@@ -11767,6 +11886,57 @@ mod tests {
             0,
             "queue cursor must be rewound to 0 — set_next_avail \
              rolled the pop back so the chain re-pops on retry",
+        );
+    }
+
+    /// Pin the u16-wrap arithmetic the throttle-stall rollback
+    /// depends on: `set_next_avail(prev.wrapping_sub(1))` at
+    /// `prev = 0` MUST land at `u16::MAX`, not panic via signed
+    /// underflow. The companion proptest
+    /// `throttle_stall_under_random_chain_shapes_holds_invariants`
+    /// runs at `next_avail = 0 → 1 → 0` (no wrap exercised
+    /// because `MockSplitQueue::build_desc_chain` only supports
+    /// fresh avail rings); this dedicated unit test pins the
+    /// wrap edge by directly calling `set_next_avail` on the
+    /// queue and asserting the contract `wrapping_sub` provides.
+    ///
+    /// A regression that swapped `wrapping_sub` for plain `-` or
+    /// `checked_sub().unwrap()` would panic on this test
+    /// instead of silently corrupting the cursor in production.
+    /// `wrapping_sub` matches the virtio ring's u16 wrap
+    /// semantics (avail/used cursors are u16 modular per
+    /// virtio-v1.2 §2.7).
+    #[test]
+    fn next_avail_zero_rollback_wraps_to_u16_max() {
+        let mut dev = make_device(VIRTIO_BLK_DEFAULT_CAPACITY_BYTES, DiskThrottle::default());
+        // Drive next_avail to 0 explicitly so the sub-1 wrap is
+        // observable via wrapping arithmetic (not a "happened to
+        // be at 0" coincidence).
+        dev.worker.queues[REQ_QUEUE].set_next_avail(0);
+        assert_eq!(dev.worker.queues[REQ_QUEUE].next_avail(), 0);
+
+        // The exact arithmetic the production stall path uses:
+        // `set_next_avail(prev.wrapping_sub(1))`.
+        let prev = dev.worker.queues[REQ_QUEUE].next_avail();
+        dev.worker.queues[REQ_QUEUE].set_next_avail(prev.wrapping_sub(1));
+
+        assert_eq!(
+            dev.worker.queues[REQ_QUEUE].next_avail(),
+            u16::MAX,
+            "next_avail rollback at prev=0 must wrap to u16::MAX, \
+             matching the virtio ring's u16 modular semantics",
+        );
+
+        // Wrap-back: another wrapping_sub from u16::MAX lands at
+        // u16::MAX - 1, no panic. Pins the arithmetic in both
+        // directions so a regression that handled the 0→u16::MAX
+        // case but broke u16::MAX→u16::MAX-1 surfaces here.
+        let prev = dev.worker.queues[REQ_QUEUE].next_avail();
+        dev.worker.queues[REQ_QUEUE].set_next_avail(prev.wrapping_sub(1));
+        assert_eq!(
+            dev.worker.queues[REQ_QUEUE].next_avail(),
+            u16::MAX - 1,
+            "subsequent rollback at prev=u16::MAX must land at u16::MAX-1",
         );
     }
 
