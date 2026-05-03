@@ -112,7 +112,7 @@ use std::os::unix::fs::FileExt;
 #[cfg(not(test))]
 use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread;
@@ -695,9 +695,9 @@ fn publish_completion<Q: QueueT>(
 /// device fast paths.
 ///
 /// Fields are `pub(crate)` so the helper-mutation rule is enforced
-/// across the crate by visibility. External consumers must reach
-/// in via dedicated accessors (none exist today; add them as the
-/// public API needs them).
+/// across the crate by visibility. External consumers reach in via
+/// the per-field `pub fn` accessors below — each performs a
+/// `Relaxed` load and returns the current value as `u64`.
 ///
 /// # Counter taxonomy: events vs requests vs gauges
 ///
@@ -935,6 +935,74 @@ impl VirtioBlkCounters {
     fn record_throttle_pending_dec(&self) {
         self.currently_throttled_gauge.fetch_sub(1, Ordering::Relaxed);
     }
+
+    /// Read the cumulative count of successfully completed read
+    /// requests for this device's lifetime. Per-request counter:
+    /// bumped exactly once per successful read via
+    /// [`Self::record_read`] (paired with a `bytes_read` add).
+    /// `Relaxed` ordering matches the writer side — counters are
+    /// publish-only observability and do not establish
+    /// happens-before with other operations.
+    pub fn reads_completed(&self) -> u64 {
+        self.reads_completed.load(Ordering::Relaxed)
+    }
+
+    /// Read the cumulative count of successfully completed write
+    /// requests for this device's lifetime. Per-request counter:
+    /// bumped exactly once per successful write via
+    /// [`Self::record_write`] (paired with a `bytes_written` add).
+    pub fn writes_completed(&self) -> u64 {
+        self.writes_completed.load(Ordering::Relaxed)
+    }
+
+    /// Read the cumulative count of successfully completed flush
+    /// requests for this device's lifetime. Per-request counter:
+    /// bumped once per successful flush via
+    /// [`Self::record_flush`].
+    pub fn flushes_completed(&self) -> u64 {
+        self.flushes_completed.load(Ordering::Relaxed)
+    }
+
+    /// Read the cumulative number of bytes successfully read from
+    /// the backing file and delivered to the guest. Per-request
+    /// counter: incremented in lockstep with `reads_completed`.
+    pub fn bytes_read(&self) -> u64 {
+        self.bytes_read.load(Ordering::Relaxed)
+    }
+
+    /// Read the cumulative number of bytes successfully written
+    /// from guest memory to the backing file. Per-request counter:
+    /// incremented in lockstep with `writes_completed`.
+    pub fn bytes_written(&self) -> u64 {
+        self.bytes_written.load(Ordering::Relaxed)
+    }
+
+    /// Read the cumulative count of throttle-stall **events** for
+    /// this device's lifetime. Per-event counter (NOT per-request):
+    /// a single chain that stalls multiple times produces multiple
+    /// bumps. To answer "how many requests are stuck right now,"
+    /// read [`Self::currently_throttled_gauge`] instead.
+    pub fn throttled_count(&self) -> u64 {
+        self.throttled_count.load(Ordering::Relaxed)
+    }
+
+    /// Read the cumulative count of host-observed IO failure
+    /// **events**. Per-event counter (NOT per-request): a single
+    /// hostile chain can produce multiple bumps if it trips
+    /// several gates in sequence. See [`Self::record_io_error`]
+    /// for the double-bump scenarios.
+    pub fn io_errors(&self) -> u64 {
+        self.io_errors.load(Ordering::Relaxed)
+    }
+
+    /// Read the live "how many requests are currently waiting for
+    /// throttle tokens" gauge. NOT cumulative — increments when a
+    /// chain enters the stalled state, decrements when it exits.
+    /// On a single-queue device the value is bounded at 0 or 1 in
+    /// practice.
+    pub fn currently_throttled_gauge(&self) -> u64 {
+        self.currently_throttled_gauge.load(Ordering::Relaxed)
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -1043,7 +1111,7 @@ struct BlkWorkerState {
 ///
 /// The shared resources the worker needs to drive the drain
 /// (`Arc<BlkQueue>` queue, `Arc<EventFd>` irq_evt,
-/// `Arc<AtomicU32>` interrupt_status, `Arc<Mutex<Option<…>>>` mem)
+/// `Arc<AtomicU32>` interrupt_status, `Arc<OnceLock<GuestMemoryMmap>>` mem)
 /// are stored on `VirtioBlk` and cloned into the worker thread at
 /// spawn time; the worker holds independent Arc handles for the
 /// duration of its run.
@@ -1169,14 +1237,18 @@ pub struct VirtioBlk {
     /// the same Arc is read directly via `dev.irq_evt.read()`.
     irq_evt: Arc<EventFd>,
     /// Guest memory reference. Set before starting vCPUs via
-    /// `set_mem`. Wrapped in `Arc<Mutex<Option<…>>>` so the worker
-    /// thread (production) can pick up `mem` post-construction; the
-    /// Mutex is uncontended in steady state because writers
-    /// (`set_mem`) run once at boot and readers
-    /// (`drain_bracket_impl` / `drain_inline`) lock briefly to clone
-    /// the inner `GuestMemoryMmap` (which is itself `Arc`-internal
-    /// per `vm_memory`'s impl, so the clone is cheap).
-    mem: Arc<Mutex<Option<GuestMemoryMmap>>>,
+    /// `set_mem`. Wrapped in `Arc<OnceLock<…>>` so the worker
+    /// thread (production) can pick up `mem` post-construction
+    /// without locking on every drain. `set_mem` is the only
+    /// writer and KVM wiring guarantees it runs before any vCPU
+    /// runs (i.e. before any QUEUE_NOTIFY can fire), so the
+    /// reader-side `OnceLock::get` is lock-free in steady state
+    /// and returns `&GuestMemoryMmap` directly — no clone needed.
+    /// `reset()` does NOT clear `mem`: the same guest memory map
+    /// is re-used across re-binds (matching the behaviour of the
+    /// original `Mutex<Option<…>>` field, which `set_mem` only
+    /// overwrote at boot).
+    mem: Arc<OnceLock<GuestMemoryMmap>>,
     /// Capacity in 512-byte sectors. Determines what the guest sees
     /// in the config space's `capacity` field.
     capacity_sectors: u64,
@@ -1270,7 +1342,7 @@ impl VirtioBlk {
         };
 
         let interrupt_status = Arc::new(AtomicU32::new(0));
-        let mem = Arc::new(Mutex::new(None));
+        let mem = Arc::new(OnceLock::new());
         let mem_unset_warned = Arc::new(AtomicBool::new(false));
 
         // Build the queue. Production uses `QueueSync` (Arc<Mutex<Queue>>
@@ -1375,32 +1447,32 @@ impl VirtioBlk {
 
     /// Set guest memory reference. Must be called before starting vCPUs.
     ///
-    /// Stores the memory inside the device's shared `Arc<Mutex<…>>`
-    /// so the worker thread (production cfg) can observe the new
-    /// reference on its next drain. Returning before the worker
-    /// observes the value is safe because the worker only consults
-    /// `mem` in response to a kick (driven by `mmio_write` of
-    /// QUEUE_NOTIFY), and KVM wiring guarantees `set_mem` runs
-    /// before any vCPU runs (i.e. before any QUEUE_NOTIFY can fire).
+    /// Stores the memory inside the device's shared `Arc<OnceLock<…>>`
+    /// so the worker thread (production cfg) can observe the
+    /// reference on its next drain via a lock-free
+    /// `OnceLock::get`. Returning before the worker observes the
+    /// value is safe because the worker only consults `mem` in
+    /// response to a kick (driven by `mmio_write` of QUEUE_NOTIFY),
+    /// and KVM wiring guarantees `set_mem` runs before any vCPU
+    /// runs (i.e. before any QUEUE_NOTIFY can fire).
     ///
-    /// On a poisoned mutex (a previous holder panicked), log and
-    /// return rather than re-panic — `set_mem` may itself be invoked
-    /// from a panicking context (Drop ordering during VM teardown,
-    /// or a parent panic that's still unwinding the KVM wiring), and
-    /// a re-panic here would abort instead of unwinding cleanly. The
-    /// worker's own poison check mirrors this pattern.
+    /// `OnceLock::set` returns `Err` if the slot is already
+    /// populated. The current production wiring (mod.rs `init_virtio_blk`)
+    /// calls `set_mem` exactly once per device, so the `Err` branch
+    /// is unreachable in normal operation; `reset()` does NOT clear
+    /// `mem`, matching the prior `Mutex<Option<…>>` semantics where
+    /// the slot was only written at boot. Log on `Err` rather than
+    /// panic so a future re-wire bug surfaces as a warning instead
+    /// of aborting (a panic here could land mid-teardown when the
+    /// caller is already unwinding).
     pub fn set_mem(&mut self, mem: GuestMemoryMmap) {
-        let mut slot = match self.mem.lock() {
-            Ok(g) => g,
-            Err(_) => {
-                tracing::error!(
-                    "virtio-blk: mem mutex poisoned in set_mem; \
-                     guest memory will not be wired"
-                );
-                return;
-            }
-        };
-        *slot = Some(mem);
+        if self.mem.set(mem).is_err() {
+            tracing::warn!(
+                "virtio-blk: set_mem called on already-initialised \
+                 device; guest memory binding unchanged (mem is set \
+                 once at boot and preserved across reset())"
+            );
+        }
     }
 
     /// Advertised capacity in 512-byte sectors.
@@ -1582,25 +1654,14 @@ impl VirtioBlk {
     }
 
     /// Inline drain (test-mode only). Resolves the Inline engine,
-    /// fetches a `mem` clone from the shared `Arc<Mutex<…>>`, and
-    /// calls `drain_bracket_impl` directly with the worker state +
-    /// queue + irq + interrupt_status borrows. The mem clone is
-    /// cheap because `GuestMemoryMmap` is internally `Arc`-based
-    /// (per `vm_memory`'s impl) so the clone bumps a refcount
-    /// rather than copying mapped pages.
+    /// fetches a `&mem` reference from the shared `Arc<OnceLock<…>>`
+    /// via a lock-free `OnceLock::get`, and calls `drain_bracket_impl`
+    /// directly with the worker state + queue + irq + interrupt_status
+    /// borrows. No clone is needed — `drain_bracket_impl` accepts
+    /// `&GuestMemoryMmap` and the lifetime ends inside this fn.
     #[cfg(test)]
     fn drain_inline(&mut self) {
-        let mem_opt: Option<GuestMemoryMmap> = match self.mem.lock() {
-            Ok(g) => g.clone(),
-            Err(_) => {
-                tracing::error!(
-                    "virtio-blk: mem mutex poisoned in drain_inline; \
-                     dropping kick"
-                );
-                return;
-            }
-        };
-        let Some(mem) = mem_opt else {
+        let Some(mem) = self.mem.get() else {
             // Caller (kvm wiring in src/vmm/mod.rs) is supposed to
             // call `set_mem` before any vCPU runs. A queue-notify
             // before that is a wiring bug; surface it once per
@@ -1623,7 +1684,7 @@ impl VirtioBlk {
         let _ = drain_bracket_impl(
             &mut engine.state,
             &mut self.worker.queues,
-            &mem,
+            mem,
             &self.irq_evt,
             &self.interrupt_status,
         );
@@ -2577,16 +2638,16 @@ fn clamp_retry_nanos(wait_nanos: u64) -> u64 {
 ///      per the eventfd counter-mode semantics — see eventfd(2))
 ///      and run one drain iteration via `drain_bracket_impl`.
 ///
-/// Reading mem from the shared `Arc<Mutex<…>>` gives the worker the
-/// up-to-date `GuestMemoryMmap` set by the device's `set_mem` call.
-/// When `mem` is None (kick fired before set_mem — a wiring bug),
-/// the `mem_unset_warned` latch fires once and the kick is silently
-/// dropped.
+/// Reading mem from the shared `Arc<OnceLock<…>>` gives the worker
+/// the `GuestMemoryMmap` set by the device's `set_mem` call via a
+/// lock-free `OnceLock::get`. When `mem` is unset (kick fired before
+/// set_mem — a wiring bug), the `mem_unset_warned` latch fires once
+/// and the kick is silently dropped.
 #[cfg(not(test))]
 fn worker_thread_main(
     mut state: BlkWorkerState,
     mut queues: [BlkQueue; NUM_QUEUES],
-    mem: Arc<Mutex<Option<GuestMemoryMmap>>>,
+    mem: Arc<OnceLock<GuestMemoryMmap>>,
     irq_evt: Arc<EventFd>,
     interrupt_status: Arc<AtomicU32>,
     mem_unset_warned: Arc<AtomicBool>,
@@ -2836,15 +2897,14 @@ fn worker_thread_main(
         }
 
         // Resolve the current guest memory. If `set_mem` hasn't run
-        // yet, latch the warn once and skip the drain.
-        let mem_opt: Option<GuestMemoryMmap> = match mem.lock() {
-            Ok(g) => g.clone(),
-            Err(_) => {
-                tracing::error!("virtio-blk worker: mem mutex poisoned; exiting");
-                return state;
-            }
-        };
-        let Some(mem_clone) = mem_opt else {
+        // yet, latch the warn once and skip the drain. Lock-free
+        // `OnceLock::get` returns `Option<&GuestMemoryMmap>`; the
+        // borrow lives for the duration of this loop iteration so
+        // we can pass it straight to `drain_bracket_impl` without
+        // a clone (matching the prior path's intent — the previous
+        // `Mutex<Option<…>>` field also yielded a single-iteration
+        // borrow, just via a clone).
+        let Some(mem_ref) = mem.get() else {
             if !mem_unset_warned.swap(true, Ordering::Relaxed) {
                 tracing::warn!(
                     "virtio-blk: queue notify before set_mem; \
@@ -2856,7 +2916,7 @@ fn worker_thread_main(
         let mut outcome = drain_bracket_impl(
             &mut state,
             &mut queues,
-            &mem_clone,
+            mem_ref,
             &irq_evt,
             &interrupt_status,
         );
@@ -2886,7 +2946,7 @@ fn worker_thread_main(
             outcome = drain_bracket_impl(
                 &mut state,
                 &mut queues,
-                &mem_clone,
+                mem_ref,
                 &irq_evt,
                 &interrupt_status,
             );
@@ -3547,6 +3607,17 @@ impl VirtioBlk {
     }
 
     /// Validate and apply a status transition per virtio-v1.2 §3.1.1.
+    ///
+    /// FEATURES_OK additionally enforces VIRTIO_F_VERSION_1 negotiation
+    /// (virtio-v1.2 §6.1: "A driver MUST accept VIRTIO_F_VERSION_1").
+    /// Modern devices require this bit; a driver that fails to ack
+    /// it (legacy/transitional driver against this modern-only
+    /// device) cannot operate. The kernel's
+    /// `virtio_features_ok` (drivers/virtio/virtio.c) writes
+    /// FEATURES_OK then re-reads STATUS to confirm the bit stuck —
+    /// rejecting here clears the path: the FSM leaves FEATURES_OK
+    /// unset, the kernel's read-back fails, and the driver bind
+    /// surfaces -ENODEV without descending into queue config.
     fn set_status(&mut self, val: u32) {
         if val & self.device_status != self.device_status {
             return;
@@ -3555,7 +3626,10 @@ impl VirtioBlk {
         let valid = match new_bits {
             VIRTIO_CONFIG_S_ACKNOWLEDGE => self.device_status == 0,
             VIRTIO_CONFIG_S_DRIVER => self.device_status == S_ACK,
-            VIRTIO_CONFIG_S_FEATURES_OK => self.device_status == S_DRV,
+            VIRTIO_CONFIG_S_FEATURES_OK => {
+                self.device_status == S_DRV
+                    && self.driver_features & (1u64 << VIRTIO_F_VERSION_1) != 0
+            }
             VIRTIO_CONFIG_S_DRIVER_OK => self.device_status == S_FEAT,
             _ => false,
         };
@@ -3576,6 +3650,14 @@ impl VirtioBlk {
             {
                 self.worker.queues[REQ_QUEUE].set_event_idx(true);
             }
+        } else if new_bits == VIRTIO_CONFIG_S_FEATURES_OK
+            && self.driver_features & (1u64 << VIRTIO_F_VERSION_1) == 0
+        {
+            tracing::warn!(
+                driver_features = ?self.driver_features,
+                "FEATURES_OK rejected — VIRTIO_F_VERSION_1 not negotiated; \
+                 legacy/transitional driver against modern-only device",
+            );
         }
     }
 
@@ -4154,10 +4236,10 @@ fn join_worker_with_timeout(
 /// returns) and its captured state finally drops.
 ///
 /// The retained Arcs are:
-/// - `Arc<Mutex<Option<GuestMemoryMmap>>>` (the `mem` field;
-///   cloned into `BlkWorkerState`). The guest memory mapping
-///   stays mapped on the host until the worker exits — the
-///   parent VM's teardown does NOT free guest memory at the
+/// - `Arc<OnceLock<GuestMemoryMmap>>` (the `mem` field;
+///   cloned into the worker thread frame). The guest memory
+///   mapping stays mapped on the host until the worker exits —
+///   the parent VM's teardown does NOT free guest memory at the
 ///   `VirtioBlk::drop` site.
 /// - `Arc<EventFd>` (the IRQ eventfd, `irq_evt`). The eventfd's
 ///   kernel object stays alive; the kvmfd irqfd binding the
@@ -5284,6 +5366,55 @@ mod tests {
         // Skipping FEATURES_OK is rejected.
         write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_OK);
         assert_eq!(dev.device_status, S_DRV);
+    }
+
+    /// FEATURES_OK transition rejected when VIRTIO_F_VERSION_1 is
+    /// not in the driver-acknowledged set (virtio-v1.2 §6.1: "A
+    /// driver MUST accept VIRTIO_F_VERSION_1"). Modern devices
+    /// require this bit; the kernel's `virtio_features_ok`
+    /// (drivers/virtio/virtio.c) writes FEATURES_OK then re-reads
+    /// STATUS to confirm the device accepted, surfacing -ENODEV
+    /// otherwise. The device's role is to leave FEATURES_OK clear
+    /// when the bit is missing so the kernel's read-back fails.
+    ///
+    /// The legacy path here exercises a guest that walks the FSM
+    /// to the FEATURES_OK write WITHOUT having acknowledged
+    /// VIRTIO_F_VERSION_1. The device must not commit the
+    /// transition; `device_status` stays at S_DRV and a subsequent
+    /// driver re-read of STATUS sees FEATURES_OK is unset.
+    #[test]
+    fn features_ok_rejected_without_version_1() {
+        let mut dev = make_device(VIRTIO_BLK_DEFAULT_CAPACITY_BYTES, DiskThrottle::default());
+        write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_ACK);
+        write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_DRV);
+        // Driver acks an unrelated feature (BLK_SIZE in the low
+        // half) but skips VIRTIO_F_VERSION_1 (bit 32, page 1).
+        // device_features() advertises BLK_SIZE so this is a
+        // legitimate ack from the device's perspective — only
+        // VIRTIO_F_VERSION_1 is missing.
+        write_reg(&mut dev, VIRTIO_MMIO_DRIVER_FEATURES_SEL, 0);
+        write_reg(&mut dev, VIRTIO_MMIO_DRIVER_FEATURES, 1 << VIRTIO_BLK_F_BLK_SIZE);
+        // Attempt FEATURES_OK without VIRTIO_F_VERSION_1: rejected.
+        write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_FEAT);
+        assert_eq!(
+            dev.device_status, S_DRV,
+            "FEATURES_OK must be rejected when VIRTIO_F_VERSION_1 is not negotiated",
+        );
+
+        // After the driver acks VIRTIO_F_VERSION_1, the same
+        // FEATURES_OK write succeeds — confirms the gate is
+        // version-1-specific, not blanket-rejecting.
+        write_reg(&mut dev, VIRTIO_MMIO_DRIVER_FEATURES_SEL, 1);
+        write_reg(
+            &mut dev,
+            VIRTIO_MMIO_DRIVER_FEATURES,
+            1 << (VIRTIO_F_VERSION_1 - 32),
+        );
+        write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_FEAT);
+        assert_eq!(
+            dev.device_status, S_FEAT,
+            "FEATURES_OK must be accepted once VIRTIO_F_VERSION_1 is in driver_features",
+        );
     }
 
     #[test]
