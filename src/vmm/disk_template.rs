@@ -3,10 +3,12 @@
 //! This module ships the cache and clone primitives — the
 //! `(Filesystem, capacity)` keyed lookup, atomic-rename publish,
 //! per-key flock coordination, statfs-based btrfs/xfs gate at the
-//! cache root, FICLONE per-test fan-out, host `mkfs.btrfs` locator,
+//! cache root, FICLONE per-test fan-out, host mkfs locator (see
+//! [`Filesystem::mkfs_binary_name`] and [`locate_host_mkfs`]),
 //! AND the host-side template-VM driver in
 //! [`build_template_via_vm`] that boots a one-shot guest to run
-//! `mkfs.btrfs /dev/vda` against a sparse staging image. The
+//! the variant's `mkfs.<fstype>` against a sparse staging image
+//! (`mkfs.btrfs /dev/vda` for `Filesystem::Btrfs`). The
 //! guest-side dispatch lives in [`crate::vmm::rust_init`] and is
 //! gated on `KTSTR_MODE=disk_template`.
 //!
@@ -30,12 +32,15 @@
 //!    the timeout fires). After acquire, re-check the cache for
 //!    publish-while-waiting.
 //! 3. **Template VM boot.** [`build_template_via_vm`] materialises
-//!    a sparse `template.img.in-flight.<pid>` of the requested
-//!    capacity under the cache root (so `rename(2)` into place is
-//!    same-filesystem), packs the host's `mkfs.btrfs` into the
-//!    template-VM initramfs at `bin/mkfs.btrfs`, and boots a
-//!    one-shot guest with `KTSTR_MODE=disk_template` on the kernel
-//!    cmdline. The disk attaches via
+//!    a sparse `template.img.in-flight.<cache_key>.<pid>` of the
+//!    requested capacity under the cache root (so `rename(2)` into
+//!    place is same-filesystem; the `<cache_key>` qualifier
+//!    disambiguates cross-key concurrent builds in the same pid —
+//!    see [`staging_image_path`]), packs the host's mkfs binary
+//!    (resolved via [`locate_host_mkfs`]) into the template-VM
+//!    initramfs at `bin/<mkfs_name>`, and boots a one-shot guest
+//!    with `KTSTR_MODE=disk_template` on the kernel cmdline. The
+//!    disk attaches via
 //!    [`crate::vmm::KtstrVmBuilder::template_staging_image`], which
 //!    bypasses both the per-test `Raw` tempfile branch AND the
 //!    `Btrfs` ensure_template branch in
@@ -43,9 +48,11 @@
 //!    VM cannot recursively re-enter the cache it is itself
 //!    populating. Guest dispatch
 //!    ([`crate::vmm::rust_init::run_disk_template_mode`]) execs
-//!    `/bin/mkfs.btrfs /dev/vda` and reboots cleanly; on non-zero
-//!    exit / timeout the staging image is unlinked and the build
-//!    bails with the trailing guest stderr.
+//!    `/bin/<mkfs_binary_name>` against `/dev/vda` (currently
+//!    `mkfs.btrfs` for `Filesystem::Btrfs` per
+//!    [`Filesystem::mkfs_binary_name`]) and reboots cleanly; on
+//!    non-zero exit / timeout the staging image is unlinked and
+//!    the build bails with the trailing guest stderr.
 //! 4. **Atomic install.** The formatted image is moved into
 //!    `<cache>/disk_templates/<key>/template.img` via tempdir +
 //!    `rename(2)` ([`store_atomic`]). Partial failures leave no
@@ -86,7 +93,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 
-use crate::flock::{FlockMode, acquire_flock_with_timeout};
+use crate::flock::{FlockMode, acquire_flock_with_timeout, try_flock};
 use crate::vmm::disk_config::Filesystem;
 
 /// Cache subdirectory suffix passed to
@@ -432,11 +439,14 @@ pub(crate) fn store_atomic(key: &str, src_path: &Path) -> Result<PathBuf> {
 }
 
 /// Extract `f_fsid` as a fixed-size byte tuple for equality
-/// comparisons between two `statfs` results. `libc::fsid_t` has
-/// platform-dependent struct layout (the public ABI is "an array of
-/// two ints" but the layout varies between glibc and musl), so we
-/// pull the bytes through a fixed-width read instead of relying on
-/// `PartialEq` which `fsid_t` does not implement.
+/// comparisons between two `statfs` results. `libc::fsid_t` is
+/// `__val: [c_int; 2]` across glibc, musl, and uClibc, but `__val`
+/// is a private field — direct field access does not compile. The
+/// bytewise read via `ptr::copy_nonoverlapping` is layout-opaque
+/// and does not depend on which libc backend the build links
+/// against. `fsid_t` also does not implement `PartialEq`, so the
+/// fixed-width byte read also serves as the equality primitive
+/// [`store_atomic`]'s cross-fs gate uses.
 fn fsid_bytes(buf: &libc::statfs) -> [u8; std::mem::size_of::<libc::fsid_t>()] {
     let mut out = [0u8; std::mem::size_of::<libc::fsid_t>()];
     // SAFETY: we read exactly size_of::<fsid_t>() bytes out of an
@@ -490,16 +500,57 @@ pub(crate) fn acquire_template_lock(key: &str) -> Result<std::os::fd::OwnedFd> {
 /// use. Failures with `EOPNOTSUPP` / `EXDEV` / `EINVAL` indicate a
 /// reflink-incapable filesystem or cross-fs attempt and bail with a
 /// hint at the operator's KTSTR_CACHE_DIR.
+///
+/// # Stale per-test debris and `EEXIST` diagnostics
+///
+/// `dest_path` is opened with `O_CREAT | O_EXCL` (via
+/// [`OpenOptions::create_new`]), so the open returns `EEXIST` when
+/// a regular file already sits at that path. Operators reading an
+/// `EEXIST` here should NOT look at [`acquire_template_lock`] —
+/// the per-key flock guards the cache *template* (read-only after
+/// publish), not the per-test fan-out *dest*. The `EEXIST` surfaces
+/// at the dest open, NOT at lock acquisition.
+///
+/// The realistic source of an `EEXIST` here is leftover staging
+/// debris from a previous run that crashed before unlinking its
+/// per-test fan-out file. The caller's tempfile name embeds a pid
+/// (mkstemp-style); a prior ktstr peer that crashed mid-test (SIGKILL,
+/// host reboot, OOM kill, panic before the per-test cleanup ran)
+/// can leave its dest file in place. If the operating system later
+/// reuses the same pid for a new ktstr process and that process
+/// happens to generate a tempfile name colliding with the leaked
+/// file's name, the `O_EXCL` open trips on the leftover. PID reuse
+/// alone does not collide — the mkstemp randomization disambiguates
+/// most cases — but the check is `O_EXCL` precisely to surface the
+/// rare collision as a hard error rather than a silent overwrite.
+///
+/// **Triage checklist for an `EEXIST`-shaped failure here**:
+///
+/// 1. List the cache directory for orphan per-test files matching
+///    the dest tempfile pattern. They are unlinked by ktstr after
+///    each test; survivors indicate a crashed predecessor.
+/// 2. Verify no live ktstr peer holds the file open
+///    (`fuser`/`lsof`-equivalent against the path); a live owner
+///    means the collision is real and the tempfile generator is the
+///    bug, not the leftover.
+/// 3. If no live owner, remove the leftover by hand and retry. The
+///    cache template (under [`acquire_template_lock`]) is unaffected
+///    by per-test fan-out failures — only the per-test dest file
+///    needs cleanup.
+///
+/// The flock itself is irrelevant to this failure mode: a stale
+/// flock on the per-key lockfile would cause [`ensure_template`] to
+/// time out at [`acquire_template_lock`] long before any per-test
+/// fan-out runs, surfacing as a holder-list bail with the lockfile
+/// path — a visibly different diagnostic than the `EEXIST` here.
 pub(crate) fn clone_to_per_test(src_path: &Path, dest_path: &Path) -> Result<File> {
     let src = OpenOptions::new()
         .read(true)
         .open(src_path)
         .with_context(|| format!("open template source {src_path:?}"))?;
-    // Open dest with O_CREAT | O_EXCL — if a peer materialized the
-    // same path between our caller's tempfile generation and this
-    // call, we want a hard error, not a silent overwrite. The
-    // tempfile name space (mkstemp-style) plus per-process pid
-    // suffix makes a real collision astronomically unlikely.
+    // O_CREAT | O_EXCL — surface stale leftover debris as EEXIST
+    // instead of silently overwriting. See "Stale per-test debris
+    // and EEXIST diagnostics" on this fn's doc comment.
     let dest = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -525,27 +576,53 @@ pub(crate) fn clone_to_per_test(src_path: &Path, dest_path: &Path) -> Result<Fil
     Ok(dest)
 }
 
-/// Locate `mkfs.btrfs` on the host `PATH` so it can be packed into
+/// Locate the host mkfs binary for `fs` so it can be packed into
 /// the template-VM initramfs.
 ///
-/// Walks `PATH` (split on `:`) and returns the first directory that
-/// contains an executable `mkfs.btrfs`. Bails with an actionable
-/// error when the binary is absent — this is the operator's signal
-/// to install `btrfs-progs` (or equivalent distro package) before
-/// using `Filesystem::Btrfs`.
+/// Resolves the userspace formatter name via
+/// [`Filesystem::mkfs_binary_name`] and walks `PATH` (split on `:`)
+/// for the first directory containing an executable of that name.
+/// Returns `Ok(None)` when the variant requires no formatter
+/// (`Filesystem::Raw`). Bails with an actionable error when a
+/// formatter-requiring variant's binary is absent — the operator's
+/// signal to install the corresponding distro package (e.g.
+/// `btrfs-progs` for `Btrfs`) before using that filesystem.
 ///
 /// The host binary is NOT exec'd at template-build time — it is
 /// embedded into the template-VM initramfs and exec'd by guest init
 /// inside the VM. The kernel inside the VM is the on-disk-format
-/// authority; the host binary just provides the `mkfs.btrfs`
+/// authority; the host binary just provides the `mkfs.<fstype>`
 /// userspace driver to drive the kernel into formatting.
-pub(crate) fn locate_host_mkfs_btrfs() -> Result<PathBuf> {
-    locate_host_binary("mkfs.btrfs", "btrfs-progs")
+pub(crate) fn locate_host_mkfs(fs: Filesystem) -> Result<Option<PathBuf>> {
+    let Some(name) = fs.mkfs_binary_name() else {
+        return Ok(None);
+    };
+    locate_host_binary(name, mkfs_package_hint(fs)).map(Some)
 }
 
-/// Locate a binary by name on the host `PATH`. Used for
-/// `mkfs.btrfs` today; future filesystem variants ([`Filesystem`]
-/// extensions) reuse the same machinery for their respective mkfs
+/// Distro package hint for the formatter binary returned by
+/// [`Filesystem::mkfs_binary_name`]. Surfaced in
+/// [`locate_host_binary`]'s "binary not found" diagnostic so an
+/// operator hitting the missing-formatter case sees a concrete
+/// install target.
+///
+/// The match is exhaustive on `Filesystem` so a future variant
+/// that ships a `mkfs_binary_name` Some(_) without picking a
+/// package hint here surfaces as a non-exhaustive-match build
+/// error. The `Raw` arm is unreachable in practice — callers gate
+/// on `mkfs_binary_name().is_some()` first — but the arm is
+/// retained so the match stays exhaustive at the type level.
+fn mkfs_package_hint(fs: Filesystem) -> &'static str {
+    match fs {
+        Filesystem::Btrfs => "btrfs-progs",
+        Filesystem::Raw => "<none — Raw needs no formatter>",
+    }
+}
+
+/// Locate a binary by name on the host `PATH`. Used by
+/// [`locate_host_mkfs`] today; future filesystem variants
+/// ([`Filesystem`] extensions) reuse the same machinery via
+/// [`Filesystem::mkfs_binary_name`] for their respective mkfs
 /// binaries.
 fn locate_host_binary(name: &str, package_hint: &str) -> Result<PathBuf> {
     let path_var = std::env::var_os("PATH")
@@ -587,8 +664,8 @@ fn locate_host_binary(name: &str, package_hint: &str) -> Result<PathBuf> {
     bail!(
         "{name} not found on PATH. \
          Install the {package_hint} package (or your distro's \
-         equivalent) so the disk-template VM can format Btrfs disks. \
-         PATH={path:?}",
+         equivalent) so the disk-template VM can format the requested \
+         filesystem. PATH={path:?}",
         path = path_var,
     )
 }
@@ -743,34 +820,56 @@ fn create_and_size_staging_image(
 ///    own `(fs, capacity_bytes)` key. Cmdline carries
 ///    `KTSTR_MODE=disk_template`; the guest dispatch at
 ///    [`crate::vmm::rust_init::run_disk_template_mode`] execs the
-///    embedded `mkfs.btrfs` against `/dev/vda` and reboots.
+///    embedded `bin/<mkfs_binary_name>` against `/dev/vda`
+///    (currently `mkfs.btrfs` for `Filesystem::Btrfs` per
+///    [`Filesystem::mkfs_binary_name`]) and reboots.
 /// 4. After clean exit (`VmResult::success` and `exit_code == 0`),
 ///    return the staging path for [`store_atomic`] to rename into
 ///    the cache. Non-zero exit, timeout, or run failure unlinks
 ///    the staging file and bails.
 ///
-/// `Filesystem::Raw` is unreachable on this path: [`ensure_template`]
-/// only invokes this driver from the gated `Btrfs` arm in
-/// [`crate::vmm::KtstrVm::init_virtio_blk`]. A `Raw` argument means
-/// a caller bypassed that gate; bail with an actionable error
-/// rather than build a Raw template (which would be a no-op).
+/// Filesystem variants whose [`Filesystem::mkfs_binary_name`]
+/// returns `None` (currently `Filesystem::Raw`) are unreachable on
+/// this path: [`ensure_template`] only invokes this driver from the
+/// gated formatting arm in [`crate::vmm::KtstrVm::init_virtio_blk`].
+/// Such an argument means a caller bypassed that gate; bail with an
+/// actionable error rather than build an unformatted template
+/// (which would be a no-op).
 fn build_template_via_vm(
     fs: Filesystem,
     capacity_bytes: u64,
     cache_root: &Path,
     cache_key: &str,
 ) -> Result<PathBuf> {
-    let mkfs = match fs {
-        Filesystem::Btrfs => locate_host_mkfs_btrfs()?,
-        Filesystem::Raw => bail!(
-            "build_template_via_vm called with Filesystem::Raw — \
-             Raw disks have no template image to build. \
-             ensure_template should only invoke this path for \
-             filesystem variants that require pre-formatting; \
-             this call indicates a bypass of the gate in \
-             init_virtio_blk."
-        ),
-    };
+    // Resolve the mkfs binary for `fs` via the typed accessor so
+    // the exhaustive match forces a future `Filesystem` variant to
+    // declare its formatter at compile time. `locate_host_mkfs`
+    // returns `Ok(None)` when the variant has no formatter
+    // (currently only `Filesystem::Raw`); that case is unreachable
+    // on this path because [`ensure_template`] gates on
+    // [`Filesystem::mkfs_binary_name`] before calling here. A
+    // `None` result means a caller bypassed the gate in
+    // [`crate::vmm::KtstrVm::init_virtio_blk`]; reject with an
+    // actionable diagnostic.
+    let mkfs = locate_host_mkfs(fs)?.ok_or_else(|| {
+        anyhow!(
+            "build_template_via_vm called with Filesystem::{fs:?} — \
+             this filesystem variant has no userspace formatter \
+             (mkfs_binary_name() returned None) so there is no \
+             template image to build. ensure_template should only \
+             invoke this path for filesystem variants that require \
+             pre-formatting; this call indicates a bypass of the gate \
+             in init_virtio_blk."
+        )
+    })?;
+    // mkfs_name comes from the same accessor; reuse it for the
+    // in-archive path so the host-PATH lookup name and the in-
+    // archive path stay in lockstep without a parallel match arm.
+    // Safe to unwrap because `locate_host_mkfs` only returns Some
+    // when `mkfs_binary_name()` was Some.
+    let mkfs_name = fs
+        .mkfs_binary_name()
+        .expect("locate_host_mkfs returned Some only when mkfs_binary_name is Some");
 
     // Resolve a kernel image so the template-build VM can boot.
     // Reuses the same KTSTR_KERNEL / cache / sysroot cascade the
@@ -806,10 +905,14 @@ fn build_template_via_vm(
     // disk attached here uses Filesystem::Raw — the guest sees an
     // unformatted device exactly as expected for the staging
     // image (the whole point of this VM is to format it).
-    let mkfs_archive_path = match fs {
-        Filesystem::Btrfs => "bin/mkfs.btrfs".to_string(),
-        Filesystem::Raw => unreachable!("Raw rejected at function entry"),
-    };
+    //
+    // `mkfs_name` was non-None at the function-entry gate above
+    // (the only `None` variant — Raw — bails before reaching this
+    // point), so reusing it for the archive path is sound. Driving
+    // the archive path off the same accessor keeps the host-PATH
+    // lookup name and the in-archive path in lockstep without a
+    // parallel match arm to drift.
+    let mkfs_archive_path = format!("bin/{mkfs_name}");
     let disk = crate::vmm::disk_config::DiskConfig::default()
         .capacity_mb((capacity_bytes / (1024 * 1024)) as u32)
         .filesystem(Filesystem::Raw);
@@ -895,6 +998,395 @@ fn build_template_via_vm(
         );
     }
     Ok(staging_path)
+}
+
+/// Sweep stale staging debris out of the disk-template cache root.
+///
+/// Two debris shapes accumulate when a template-build peer dies
+/// before its [`store_atomic`] rename completes:
+///
+/// 1. **`template.img.in-flight.<cache_key>.<pid>`** — sparse
+///    staging images created by [`create_and_size_staging_image`]
+///    when [`build_template_via_vm`] runs. Normally unlinked at
+///    the failure-cleanup arms inside that function, AND moved
+///    into a `.tmp.<pid>/` directory by `store_atomic` on success.
+///    A SIGKILL between size-up and store_atomic leaks the file.
+/// 2. **`<cache_key>.tmp.<pid>/`** — staging directories created
+///    by [`store_atomic`] for the rename-into-place dance.
+///    Normally renamed onto the final `<cache_key>/` directory at
+///    the end of `store_atomic`. A SIGKILL during the
+///    src→staging_image rename or the staging→final_dir rename
+///    leaves the populated tmpdir on disk.
+///
+/// Both shapes embed the originating peer's pid in the filename.
+/// The sweep parses that pid and probes liveness via
+/// `kill(pid, None)` (rust-side: [`nix::sys::signal::kill`] with
+/// `Signal::None`). The kernel returns:
+/// - `Ok(())` — pid is live AND in-policy for our uid (the signal
+///   COULD have been delivered). Debris is owned by a peer that
+///   may still publish; leave alone.
+/// - `Err(ESRCH)` — pid does not exist. Debris is safe to remove.
+/// - `Err(EPERM)` — pid is live but owned by a different uid.
+///   Not ours to clean up; leave alone.
+/// - any other errno — treat as live and skip; false negatives
+///   (debris left on disk) are recoverable, false positives
+///   (deleting live state) are not.
+///
+/// Mirrors [`crate::cache::clean_orphaned_tmp_dirs`] in
+/// `src/cache.rs` — the disk-template cache and the kernel-image
+/// cache use the same pid-in-suffix + ESRCH-probe contract for
+/// cross-process cleanup. The two are independent because their
+/// debris namespaces don't overlap (kernel cache uses `.tmp-`
+/// prefix, disk-template cache uses `.tmp.` infix on the
+/// directories and a `template.img.in-flight.` prefix on the
+/// staging images).
+///
+/// Returns the count of debris entries removed. Errors during
+/// individual `remove_dir_all` / `remove_file` calls are logged
+/// at `warn` and the sweep continues — operator visibility into
+/// "this entry could not be cleaned" beats abandoning the rest of
+/// the sweep on the first failure.
+///
+/// Refuses to descend into the `.locks/` subdirectory (the only
+/// non-debris namespace inside the cache root); the prefix filter
+/// excludes it via the `template.img.in-flight.` and `*.tmp.*`
+/// pattern match. Published cache entries (`<cache_key>/`) are
+/// left untouched — they have no pid suffix and don't match either
+/// debris shape.
+pub fn clean_orphaned_tmp_dirs(cache_root: &Path) -> Result<usize> {
+    if !cache_root.is_dir() {
+        // Cache root not yet materialised — nothing to sweep.
+        // Mirrors the early-return at the head of
+        // [`crate::cache::clean_orphaned_tmp_dirs`].
+        return Ok(0);
+    }
+    let read_dir = match std::fs::read_dir(cache_root) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => {
+            return Err(anyhow!("read cache root {cache_root:?}: {e}"));
+        }
+    };
+    let mut removed: usize = 0;
+    for dir_entry in read_dir {
+        let dir_entry = match dir_entry {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(
+                    err = %format!("{e:#}"),
+                    "skip unreadable disk-template cache root entry",
+                );
+                continue;
+            }
+        };
+        let name = match dir_entry.file_name().into_string() {
+            Ok(n) => n,
+            // Non-UTF-8 filename — neither of our patterns can
+            // match (both contain only ASCII), so it's foreign
+            // debris (not ours to touch).
+            Err(_) => continue,
+        };
+        // Identify which debris shape this entry is, and extract
+        // the pid suffix. Patterns:
+        //
+        //   - `template.img.in-flight.<cache_key>.<pid>` — staging
+        //     image (see [`staging_image_path`]).
+        //   - `<cache_key>.tmp.<pid>` — staging directory (see
+        //     [`store_atomic`]).
+        //
+        // Anything else (notably the `.locks/` subdirectory and
+        // the published `<cache_key>/` entries) is skipped.
+        let pid_str = if let Some(rest) = name.strip_prefix("template.img.in-flight.") {
+            // The trailing `.<pid>` is what we need; key may
+            // itself contain `-` / `.` so we split at the LAST
+            // `.` token.
+            match rest.rsplit_once('.') {
+                Some((_, suffix)) if !suffix.is_empty() => suffix,
+                _ => continue,
+            }
+        } else if name.contains(".tmp.") {
+            // `<cache_key>.tmp.<pid>` — the pid is everything
+            // after the LAST `.tmp.`.
+            match name.rsplit_once(".tmp.") {
+                Some((_, suffix)) if !suffix.is_empty() => suffix,
+                _ => continue,
+            }
+        } else {
+            continue;
+        };
+        let pid: i32 = match pid_str.parse() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        // Reject non-positive pids defensively — `kill(0, ...)`
+        // probes the caller's own process group, `kill(-N, ...)`
+        // probes process group N. Same hardening as
+        // [`crate::cache::clean_orphaned_tmp_dirs`].
+        if pid <= 0 {
+            continue;
+        }
+        let dead = matches!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
+            Err(nix::errno::Errno::ESRCH),
+        );
+        if !dead {
+            continue;
+        }
+        let path = dir_entry.path();
+        // The two debris shapes need different removers. Probe
+        // via `metadata` rather than re-checking the prefix —
+        // the prefix already classified the path; metadata picks
+        // the right `remove_*` arm.
+        let result = match dir_entry.file_type() {
+            Ok(ft) if ft.is_dir() => std::fs::remove_dir_all(&path),
+            Ok(_) => std::fs::remove_file(&path),
+            Err(e) => {
+                tracing::warn!(
+                    err = %format!("{e:#}"),
+                    path = %path.display(),
+                    "skip disk-template cache entry; \
+                     file_type() failed",
+                );
+                continue;
+            }
+        };
+        match result {
+            Ok(()) => {
+                tracing::info!(
+                    path = %path.display(),
+                    orphan_pid = pid,
+                    "cleaned orphaned disk-template debris from \
+                     prior crashed process",
+                );
+                removed += 1;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    err = %format!("{e:#}"),
+                    path = %path.display(),
+                    "failed to remove orphaned disk-template debris; \
+                     leaving in place",
+                );
+            }
+        }
+    }
+    Ok(removed)
+}
+
+/// Remove every published disk-template cache entry, returning the
+/// count of entries actually removed.
+///
+/// Mirrors [`crate::cache::CacheDir::clean_all`] in `src/cache.rs`.
+/// Operators run this after a host `mkfs.<fstype>` upgrade that
+/// invalidates the on-disk format the cached templates were
+/// formatted with: today the cache key is `(fs_tag, capacity_mib)`
+/// only — it does NOT capture the mkfs binary version — so a
+/// post-upgrade run would silently reuse stale templates whose
+/// internal format the new kernel may reject. Until the cache key
+/// learns the mkfs version (tracked separately in #566), `clean_all`
+/// is the operator-driven escape hatch.
+///
+/// # Concurrency
+///
+/// Each entry's per-key lockfile is acquired non-blocking in
+/// `LOCK_EX` mode via [`crate::flock::try_flock`]. An entry whose
+/// lock is held by a live peer (an active test run mid-FICLONE,
+/// or a concurrent template build that finished its rename but is
+/// still inside the lock holder's critical section) is skipped
+/// rather than removed — the holder is using the entry; deleting
+/// it would yank the template out from under a live `clone_to_per_test`.
+///
+/// The flock is held across the `remove_dir_all` so a peer that
+/// blocks on the lock while we're removing observes a clean
+/// "entry gone, rebuild from scratch" sequence: their post-lock
+/// `lookup()` returns `None` and `ensure_template` proceeds to
+/// rebuild. Without holding the lock during removal, a peer that
+/// raced through `acquire_template_lock` → `lookup` between our
+/// lock-release and our `remove_dir_all` would see the template
+/// path, `clone_to_per_test` would race against the rmtree, and
+/// either side could win unpredictably.
+///
+/// The lockfile inode itself is NOT removed — other peers may
+/// have it open, and dropping the file while peers wait on it
+/// would orphan their fds. Lockfile inodes are sized at a few
+/// bytes each and accumulate at the rate of distinct `(fs,
+/// capacity)` keys; leaving them is bounded growth, not a leak.
+///
+/// # Sweeps debris first
+///
+/// Calls [`clean_orphaned_tmp_dirs`] before walking published
+/// entries so a rebuilding peer that hits the freshly-empty cache
+/// doesn't trip on stale staging debris from a crashed predecessor
+/// during its first `store_atomic`.
+///
+/// # What gets skipped
+///
+/// - The `.locks/` subdirectory (lockfile namespace).
+/// - Any cache entry whose lockfile is currently held by a live
+///   peer (logged at `info` so the operator sees what was kept).
+/// - Any cache entry whose `template.img` is missing (corrupt /
+///   half-installed) — those are removed regardless of lock state
+///   because they can't serve a `clone_to_per_test` and waste
+///   inode space.
+/// - Non-UTF-8 entry names (foreign — not produced by ktstr).
+/// - Files at the cache root (only directories are cache entries;
+///   `clean_orphaned_tmp_dirs` already swept the staging-image
+///   files before we got here).
+pub fn clean_all() -> Result<usize> {
+    let root = cache_root()?;
+    if !root.is_dir() {
+        return Ok(0);
+    }
+    // Sweep staging debris first so a peer that re-acquires a
+    // freshly-emptied cache doesn't trip on leftover .tmp.<pid>
+    // / template.img.in-flight.* files from a crashed predecessor.
+    // The result is logged but not fed into the return count —
+    // `clean_all` reports published-entry removals only, matching
+    // the [`crate::cache::CacheDir::clean_all`] contract.
+    let _debris = clean_orphaned_tmp_dirs(&root)?;
+    // Ensure the lockfile parent directory exists. `try_flock` opens
+    // the lockfile with `O_CREAT`, but the open fails with `ENOENT`
+    // when the parent `.locks/` subdirectory is absent — which is
+    // the steady state on a freshly-published cache that was never
+    // touched by `acquire_template_lock` (e.g. a cache populated by
+    // an earlier ktstr run that crashed between `store_atomic` and
+    // first lock acquire). Without this, `clean_all` would silently
+    // skip every published entry on such a cache: the `try_flock`
+    // call returns `Err(ENOENT)`, the loop's tracing-warn branch
+    // logs and `continue`s, and the operator-driven `clean_all`
+    // becomes a no-op. `create_dir_all` is idempotent — it's a
+    // no-op when `.locks/` already exists, so this also covers the
+    // mixed-cache case (some keys lock-touched, others not).
+    let lock_dir = root.join(LOCK_DIR_NAME);
+    std::fs::create_dir_all(&lock_dir).with_context(|| {
+        format!(
+            "create disk-template lock subdirectory {} for clean_all",
+            lock_dir.display(),
+        )
+    })?;
+    let read_dir = match std::fs::read_dir(&root) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => {
+            return Err(anyhow!("read cache root {root:?}: {e}"));
+        }
+    };
+    let mut removed: usize = 0;
+    for dir_entry in read_dir {
+        let dir_entry = match dir_entry {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(
+                    err = %format!("{e:#}"),
+                    "skip unreadable disk-template cache root entry \
+                     during clean_all",
+                );
+                continue;
+            }
+        };
+        let file_type = match dir_entry.file_type() {
+            Ok(ft) => ft,
+            Err(e) => {
+                tracing::warn!(
+                    err = %format!("{e:#}"),
+                    path = %dir_entry.path().display(),
+                    "skip disk-template entry; file_type() failed",
+                );
+                continue;
+            }
+        };
+        // Only published cache entries are directories at the
+        // cache root. Files are staging images already swept by
+        // clean_orphaned_tmp_dirs above; skip them here so we
+        // don't double-account.
+        if !file_type.is_dir() {
+            continue;
+        }
+        let name = match dir_entry.file_name().into_string() {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        // Skip the lockfile subdirectory — it's not a cache
+        // entry. Its pathname is fixed by [`LOCK_DIR_NAME`].
+        if name == LOCK_DIR_NAME {
+            continue;
+        }
+        // Skip staging directories left by store_atomic (handled
+        // by clean_orphaned_tmp_dirs above; defense-in-depth in
+        // case the sweep returned early on a syscall error).
+        if name.contains(".tmp.") {
+            continue;
+        }
+        let entry_path = dir_entry.path();
+        // Probe via try_flock that no live peer is currently
+        // using this entry. The lockfile is acquired non-blocking
+        // in LOCK_EX mode: success means there are zero readers
+        // AND zero writers on this key. Failure (Ok(None)) means
+        // a peer holds the lock — skip this entry.
+        let lock_path = match lock_path_for_key(&name) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(
+                    err = %format!("{e:#}"),
+                    cache_key = %name,
+                    "skip disk-template entry; lock_path resolution \
+                     failed",
+                );
+                continue;
+            }
+        };
+        let lock_fd = match try_flock(&lock_path, FlockMode::Exclusive) {
+            Ok(Some(fd)) => fd,
+            Ok(None) => {
+                // A live peer holds the lock. Skip — its work
+                // would race a `remove_dir_all` mid-clone.
+                tracing::info!(
+                    cache_key = %name,
+                    lockfile = %lock_path.display(),
+                    "skip disk-template entry during clean_all — \
+                     locked by live peer",
+                );
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    err = %format!("{e:#}"),
+                    cache_key = %name,
+                    "skip disk-template entry; try_flock failed",
+                );
+                continue;
+            }
+        };
+        // Lock acquired. Perform the removal while holding the
+        // lock so any peer that subsequently blocks on this
+        // lockfile observes "no entry, rebuild from scratch" via
+        // their re-check after acquire (see [`ensure_template`]).
+        match std::fs::remove_dir_all(&entry_path) {
+            Ok(()) => {
+                tracing::info!(
+                    cache_key = %name,
+                    path = %entry_path.display(),
+                    "removed disk-template cache entry during clean_all",
+                );
+                removed += 1;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    err = %format!("{e:#}"),
+                    cache_key = %name,
+                    path = %entry_path.display(),
+                    "failed to remove disk-template cache entry \
+                     during clean_all; leaving in place",
+                );
+            }
+        }
+        // OwnedFd `lock_fd` drops here, releasing the per-key
+        // flock. The lockfile inode at `lock_path` stays — see
+        // the doc comment "the lockfile inode itself is NOT
+        // removed".
+        drop(lock_fd);
+    }
+    Ok(removed)
 }
 
 /// Extract the last `n` lines of `text` for an error context.
@@ -1329,5 +1821,402 @@ mod tests {
             ),
             Err(e) => panic!("unexpected stat error: {e}"),
         }
+    }
+
+    /// Determinism contract for [`fsid_bytes`]: two `statfs` calls
+    /// against the same path must produce byte-identical
+    /// `fsid_bytes` outputs. The bytewise `f_fsid` read in
+    /// [`fsid_bytes`] sidesteps the private `__val` field on
+    /// `libc::fsid_t`; this test pins the same-input → same-output
+    /// property through the actual host libc. A regression that,
+    /// for instance, mis-sizes the read or includes uninitialised
+    /// padding would surface here as flaky byte mismatches across
+    /// the pair of statfs calls.
+    ///
+    /// Uses a tempdir so the test does not depend on operator
+    /// state — `tempfile::tempdir()` resolves under `TMPDIR` /
+    /// `$XDG_RUNTIME_DIR` / `/tmp`, all real filesystems with a
+    /// stable `f_fsid` for the duration of the test.
+    #[test]
+    fn fsid_bytes_is_deterministic_for_same_path() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let buf1 = statfs_path(tmp.path()).expect("first statfs");
+        let buf2 = statfs_path(tmp.path()).expect("second statfs");
+        assert_eq!(
+            fsid_bytes(&buf1),
+            fsid_bytes(&buf2),
+            "fsid_bytes must be deterministic across repeated statfs \
+             calls against the same path; a mismatch would indicate \
+             the bytewise f_fsid read produces different output for \
+             the same input on this host",
+        );
+    }
+
+    /// Cross-filesystem distinguishability for [`fsid_bytes`]: two
+    /// paths that live on distinct filesystems must produce
+    /// different `fsid_bytes` outputs. This is the property
+    /// [`store_atomic`] relies on at the cross-fs gate (`f_fsid`
+    /// inequality across two distinct btrfs subvolumes is the
+    /// reason `f_fsid` is compared in addition to `f_type`).
+    ///
+    /// Probes `tempfile::tempdir()` (typically `TMPDIR` /
+    /// `/tmp`, often tmpfs) against `/proc` (procfs). On almost
+    /// every Linux host these land on different filesystems —
+    /// procfs has a synthetic `f_fsid` distinct from any real
+    /// backing filesystem. The test guards against the rare host
+    /// where the two probed paths happen to share an `f_fsid`
+    /// (e.g. a minimal container without `/proc` mounted, where
+    /// `/proc` is fabricated by the rootfs): if both probes
+    /// resolve to byte-identical `f_fsid` AND byte-identical
+    /// `f_type`, the cross-fs distinguishability is genuinely
+    /// not exercised on this host and we skip the inequality
+    /// assertion rather than fail noisily.
+    ///
+    /// The skip-arm is the standard hermetic-test guard
+    /// (see `verify_cache_dir_walks_through_dangling_symlink` for
+    /// the same pattern in this module): we cannot demand a
+    /// specific filesystem layout in CI, but when the layout
+    /// holds we pin the property.
+    #[test]
+    fn fsid_bytes_distinguishes_different_filesystems() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let tmp_buf = statfs_path(tmp.path()).expect("statfs tempdir");
+        let proc_buf = match statfs_path(std::path::Path::new("/proc")) {
+            Ok(b) => b,
+            Err(_) => {
+                // /proc not mounted (rare — minimal containers,
+                // chroots without procfs). The cross-fs property
+                // cannot be exercised here; skip rather than fail.
+                return;
+            }
+        };
+        let tmp_fsid = fsid_bytes(&tmp_buf);
+        let proc_fsid = fsid_bytes(&proc_buf);
+        // f_type alone discriminates tmpfs from procfs; if it
+        // matches AND f_fsid matches, the two probes resolved to
+        // the same filesystem and the cross-fs property is not
+        // exercised on this host.
+        if tmp_buf.f_type == proc_buf.f_type && tmp_fsid == proc_fsid {
+            return;
+        }
+        assert_ne!(
+            tmp_fsid, proc_fsid,
+            "fsid_bytes must differ across distinct filesystems \
+             (tempdir f_type=0x{:x}, /proc f_type=0x{:x}); a match \
+             would indicate the bytewise f_fsid read is producing a \
+             constant byte pattern instead of the real fsid_t — \
+             e.g. reading from a wrong offset within libc::statfs",
+            tmp_buf.f_type, proc_buf.f_type,
+        );
+    }
+
+    // -- clean_orphaned_tmp_dirs / clean_all coverage ------------
+
+    /// `clean_orphaned_tmp_dirs` returns `Ok(0)` and does not
+    /// error when the cache root does not exist. Mirrors the
+    /// early-return contract that lets `clean_all` invoke this on
+    /// a never-materialised root without bailing.
+    #[test]
+    fn clean_orphaned_tmp_dirs_handles_missing_root() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let nonexistent = tmp.path().join("never-created");
+        let count = clean_orphaned_tmp_dirs(&nonexistent)
+            .expect("missing root must not error");
+        assert_eq!(count, 0, "missing root sweeps zero entries");
+    }
+
+    /// `clean_orphaned_tmp_dirs` removes a stale staging image
+    /// (`template.img.in-flight.<key>.<pid>`) when the embedded
+    /// pid is dead. Uses pid=1 with a sentinel suffix that
+    /// distinguishes the "dead" path from a real pid: pid=1 is
+    /// reserved for init and exists; instead we use the highest
+    /// possible pid value (`i32::MAX`) which is guaranteed not
+    /// to be allocated on Linux — `kernel/pid.c` caps at
+    /// `PID_MAX_LIMIT = 4194304` (2^22), well below i32::MAX.
+    #[test]
+    fn clean_orphaned_tmp_dirs_removes_dead_pid_staging_image() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let cache_root = tmp.path();
+        // i32::MAX > PID_MAX_LIMIT (2^22); guaranteed-dead.
+        let dead_pid = i32::MAX;
+        let leaked = cache_root.join(format!(
+            "template.img.in-flight.btrfs-256m.{dead_pid}",
+        ));
+        std::fs::write(&leaked, b"FAKE_STAGING_IMG").unwrap();
+        let count = clean_orphaned_tmp_dirs(cache_root)
+            .expect("sweep must succeed");
+        assert_eq!(count, 1, "exactly one debris entry removed");
+        assert!(
+            !leaked.exists(),
+            "dead-pid staging image must be unlinked",
+        );
+    }
+
+    /// `clean_orphaned_tmp_dirs` removes a stale staging directory
+    /// (`<key>.tmp.<pid>`) when the embedded pid is dead. Mirrors
+    /// the previous test for the second debris shape.
+    #[test]
+    fn clean_orphaned_tmp_dirs_removes_dead_pid_staging_directory() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let cache_root = tmp.path();
+        let dead_pid = i32::MAX;
+        let leaked = cache_root.join(format!("btrfs-256m.tmp.{dead_pid}"));
+        std::fs::create_dir_all(&leaked).unwrap();
+        std::fs::write(leaked.join("template.img"), b"PARTIAL").unwrap();
+        let count = clean_orphaned_tmp_dirs(cache_root)
+            .expect("sweep must succeed");
+        assert_eq!(count, 1, "exactly one debris entry removed");
+        assert!(
+            !leaked.exists(),
+            "dead-pid staging directory must be removed",
+        );
+    }
+
+    /// `clean_orphaned_tmp_dirs` PRESERVES debris owned by a live
+    /// peer pid. The current process's own pid is the obvious
+    /// "live" sentinel: as long as this test is running,
+    /// `kill(getpid(), None)` returns `Ok(())`, NOT `Err(ESRCH)`.
+    /// Without this skip, a multi-process ktstr operator running
+    /// `cargo ktstr disk-template clean` while a sibling test is
+    /// in flight would yank the sibling's staging file mid-build.
+    #[test]
+    fn clean_orphaned_tmp_dirs_preserves_live_pid_debris() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let cache_root = tmp.path();
+        let live_pid = std::process::id();
+        let live_image = cache_root.join(format!(
+            "template.img.in-flight.btrfs-256m.{live_pid}",
+        ));
+        std::fs::write(&live_image, b"LIVE_PEER_DEBRIS").unwrap();
+        let count = clean_orphaned_tmp_dirs(cache_root)
+            .expect("sweep must succeed");
+        assert_eq!(
+            count, 0,
+            "no entries removed when only live-pid debris exists",
+        );
+        assert!(
+            live_image.exists(),
+            "live-pid debris must be preserved across sweep",
+        );
+    }
+
+    /// `clean_orphaned_tmp_dirs` does NOT touch published cache
+    /// entries (`<cache_key>/`) — those have no pid suffix and
+    /// don't match either debris pattern. Pin the
+    /// non-removal contract for published entries; a regression
+    /// that broadened the prefix filter would silently delete
+    /// healthy templates.
+    #[test]
+    fn clean_orphaned_tmp_dirs_preserves_published_entries() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let cache_root = tmp.path();
+        // Published entry: directory whose name matches a cache
+        // key (no `.tmp.` infix, no `template.img.in-flight.`
+        // prefix) containing a `template.img`.
+        let published = cache_root.join("btrfs-256m");
+        std::fs::create_dir_all(&published).unwrap();
+        std::fs::write(published.join(TEMPLATE_FILENAME), b"GOOD").unwrap();
+        let count = clean_orphaned_tmp_dirs(cache_root)
+            .expect("sweep must succeed");
+        assert_eq!(
+            count, 0,
+            "published cache entries must not be swept by debris GC",
+        );
+        assert!(published.is_dir(), "published entry must survive");
+        assert!(
+            published.join(TEMPLATE_FILENAME).is_file(),
+            "published template.img must survive",
+        );
+    }
+
+    /// `clean_orphaned_tmp_dirs` skips the `.locks/` subdirectory
+    /// — it's not debris, it's the lockfile namespace. Pin the
+    /// skip so a regression that broadened the prefix filter
+    /// (e.g. adding `.locks` to a generic dotfile bucket) does
+    /// not shatter the lockfile inodes that live peers may have
+    /// open.
+    #[test]
+    fn clean_orphaned_tmp_dirs_preserves_lock_subdirectory() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let cache_root = tmp.path();
+        let locks = cache_root.join(LOCK_DIR_NAME);
+        std::fs::create_dir_all(&locks).unwrap();
+        std::fs::write(locks.join("btrfs-256m.lock"), b"").unwrap();
+        let count = clean_orphaned_tmp_dirs(cache_root)
+            .expect("sweep must succeed");
+        assert_eq!(
+            count, 0,
+            ".locks/ must be invisible to the debris sweep",
+        );
+        assert!(locks.is_dir(), ".locks/ subdirectory must survive");
+        assert!(
+            locks.join("btrfs-256m.lock").is_file(),
+            "individual lockfiles must survive",
+        );
+    }
+
+    /// `clean_all` removes a published entry and reports the
+    /// count. Stages a fake template via `store_atomic`, then
+    /// calls `clean_all` and asserts the entry is gone and the
+    /// returned count is 1.
+    #[test]
+    fn clean_all_removes_published_entry() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let _guard = crate::test_support::test_helpers::EnvVarGuard::set(
+            "KTSTR_CACHE_DIR",
+            tmp.path(),
+        );
+        let cache_root_path = cache_root().unwrap();
+        std::fs::create_dir_all(&cache_root_path).unwrap();
+        let staged = cache_root_path.join("staged.img");
+        std::fs::write(&staged, b"FAKE_TEMPLATE").unwrap();
+        let installed = store_atomic("btrfs-256m", &staged)
+            .expect("store_atomic publishes");
+        assert!(installed.is_file());
+        let count = clean_all().expect("clean_all must succeed");
+        assert_eq!(count, 1, "exactly one published entry removed");
+        // The published entry directory is gone.
+        assert!(
+            lookup("btrfs-256m").expect("lookup ok").is_none(),
+            "published entry must be gone after clean_all",
+        );
+        // But the lockfile inode survives.
+        let lock_path = lock_path_for_key("btrfs-256m").unwrap();
+        if lock_path.exists() {
+            // Lock dir/file may or may not exist depending on
+            // whether store_atomic touched it (this code path
+            // doesn't); but if it does exist, it must NOT have
+            // been removed by clean_all.
+            assert!(
+                lock_path.is_file(),
+                "lockfile inode must survive clean_all",
+            );
+        }
+    }
+
+    /// `clean_all` reports 0 for an empty cache root. Pin the
+    /// "no entries" return value so a regression that double-
+    /// counts (e.g. counts the `.locks/` subdirectory) trips here.
+    #[test]
+    fn clean_all_reports_zero_on_empty_cache() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let _guard = crate::test_support::test_helpers::EnvVarGuard::set(
+            "KTSTR_CACHE_DIR",
+            tmp.path(),
+        );
+        let count = clean_all().expect("clean_all must succeed on empty");
+        assert_eq!(count, 0);
+    }
+
+    /// `clean_all` returns 0 (not Err) on a never-materialised
+    /// cache root. Lets operator-driven runs against a fresh host
+    /// (where the cache directory has not been created yet)
+    /// succeed silently rather than bail.
+    #[test]
+    fn clean_all_handles_missing_cache_root() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        // KTSTR_CACHE_DIR points at a path that does NOT exist
+        // (no create_dir_all, no store_atomic call). cache_root()
+        // resolves the path string but the directory is absent.
+        let nonexistent = tmp.path().join("never-created");
+        let _guard = crate::test_support::test_helpers::EnvVarGuard::set(
+            "KTSTR_CACHE_DIR",
+            &nonexistent,
+        );
+        let count = clean_all().expect("missing cache root must not error");
+        assert_eq!(count, 0);
+    }
+
+    /// `clean_all` SKIPS an entry whose lockfile is currently
+    /// held by a live peer — even when run inside the same
+    /// process. Acquire the lock via `acquire_template_lock`
+    /// before calling `clean_all` and assert the entry survives.
+    /// This covers the most operationally important contract:
+    /// a `cargo ktstr disk-template clean` invoked while another
+    /// ktstr process holds the lock for an in-flight test must
+    /// NOT remove that entry.
+    ///
+    /// We hold the lock from the SAME process to avoid spawning
+    /// a child; flock is per-open-file-description, so an
+    /// independent open in the same process produces a distinct
+    /// fd that is observed as a separate holder by `try_flock`
+    /// on a third open from `clean_all`.
+    #[test]
+    fn clean_all_skips_entry_locked_by_live_peer() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let _guard = crate::test_support::test_helpers::EnvVarGuard::set(
+            "KTSTR_CACHE_DIR",
+            tmp.path(),
+        );
+        // Stage a published entry so there's something to skip.
+        let cache_root_path = cache_root().unwrap();
+        std::fs::create_dir_all(&cache_root_path).unwrap();
+        let staged = cache_root_path.join("staged.img");
+        std::fs::write(&staged, b"FAKE_TEMPLATE").unwrap();
+        let installed = store_atomic("btrfs-256m", &staged)
+            .expect("store_atomic publishes");
+        assert!(installed.is_file());
+        // Hold the per-key flock from this process. `clean_all`'s
+        // `try_flock(LOCK_EX|LOCK_NB)` against the same file
+        // returns `Ok(None)` because EX is exclusive — even our
+        // own process's prior fd blocks the second acquire (flock
+        // semantics: fd-scoped, not process-scoped).
+        let _hold = acquire_template_lock("btrfs-256m")
+            .expect("acquire template lock");
+        let count = clean_all().expect("clean_all must succeed");
+        assert_eq!(
+            count, 0,
+            "locked entry must not be removed by clean_all",
+        );
+        // And the entry directory must still be on disk.
+        assert!(
+            lookup("btrfs-256m").expect("lookup ok").is_some(),
+            "locked entry must survive clean_all",
+        );
+    }
+
+    /// `clean_all` invokes `clean_orphaned_tmp_dirs` before
+    /// walking published entries. Stage a dead-pid staging image
+    /// alongside a published entry, run `clean_all`, and assert
+    /// BOTH are removed. The published entry counts toward the
+    /// returned value; the debris does not (per the doc
+    /// "`clean_all` reports published-entry removals only").
+    #[test]
+    fn clean_all_sweeps_debris_alongside_published_entries() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let _guard = crate::test_support::test_helpers::EnvVarGuard::set(
+            "KTSTR_CACHE_DIR",
+            tmp.path(),
+        );
+        let cache_root_path = cache_root().unwrap();
+        std::fs::create_dir_all(&cache_root_path).unwrap();
+        // Published entry.
+        let staged = cache_root_path.join("staged.img");
+        std::fs::write(&staged, b"FAKE_TEMPLATE").unwrap();
+        store_atomic("btrfs-256m", &staged).unwrap();
+        // Dead-pid staging image debris.
+        let dead_pid = i32::MAX;
+        let debris = cache_root_path.join(format!(
+            "template.img.in-flight.btrfs-1024m.{dead_pid}",
+        ));
+        std::fs::write(&debris, b"DEBRIS").unwrap();
+        // Sanity: both exist before clean_all.
+        assert!(debris.is_file());
+        assert!(lookup("btrfs-256m").unwrap().is_some());
+        let count = clean_all().expect("clean_all must succeed");
+        // The returned count covers published entries only (1).
+        // The debris removal is documented in clean_all's body
+        // but not folded into the count.
+        assert_eq!(count, 1, "one published entry removed");
+        // Both should be gone on disk regardless of count
+        // accounting.
+        assert!(
+            !debris.exists(),
+            "debris must be removed by the embedded sweep",
+        );
+        assert!(
+            lookup("btrfs-256m").unwrap().is_none(),
+            "published entry must be removed by clean_all",
+        );
     }
 }

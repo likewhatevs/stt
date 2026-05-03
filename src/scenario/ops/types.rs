@@ -520,41 +520,87 @@ pub struct MemoryLimits {
 /// # Per-WorkType thread-budget guidance
 ///
 /// `pids.max` counts every task (process AND thread) inside the
-/// cgroup. Sizing the limit below the workload's natural thread
+/// cgroup. Sizing the limit below the workload's natural task
 /// budget produces silent fork failures that surface as
-/// `WorkloadConfig`-level workers refusing to start. Conservative
-/// budgets per [`WorkType`](crate::workload::WorkType) variant:
+/// `WorkloadConfig`-level workers refusing to start.
 ///
-/// | Variant family | Per-worker thread cost | Notes |
-/// |----------------|------------------------|-------|
-/// | `SpinWait` / `YieldHeavy` / `PauseSpin` | 1 | Pure compute; one task per worker. |
-/// | `Bursty` / `IdleChurn` | 1 | Wake-from-sleep workers; no helper threads. |
-/// | `FutexPingPong` / `WakeChain` (`Fork`) | 1 | Each worker is a separate fork; no extra threads. |
-/// | `WakeChain` (`Thread`) | num_workers | All workers share one process under `CloneMode::Thread`. |
-/// | `MutexContention` / `ProducerConsumerImbalance` | 2 | Plus a futex-helper thread per worker for backoff signaling. |
-/// | `PageFaultChurn` | 1 | Single mmap-reset thread; no helpers. |
-/// | `IpcVariance` / `AluHot` / `SmtSiblingSpin` | 1 | Compute-only; helper-free. |
+/// **The framework spawns exactly one task per worker** — no
+/// per-worker helper threads in any variant's
+/// [`worker_main`](crate::workload) dispatch arm. Per-worker
+/// budget therefore depends only on
+/// [`CloneMode`](crate::workload::CloneMode) (whether each worker
+/// is a process or a thread sharing the parent's tgid) and
+/// whether the variant transiently forks short-lived children
+/// inside its own loop. The two columns below capture both:
 ///
-/// **Sizing rule**: `pids.max ≥ Σ(per-worker thread cost) + 16`
-/// for the cgroup's total worker pool, with the +16 absorbing
-/// `cgroup.procs` migration scratch threads, the `BlkWorker`
-/// teardown thread, and any payload-binary helper processes
-/// (e.g. `stress-ng` spawns one task per `--cpu N`). Tests with
-/// composed [`WorkSpec`](crate::workload::WorkSpec) groups must sum
-/// the worst-case across every group — the framework does NOT
-/// auto-derive a budget from the work spec.
+/// | Variant | Steady-state tasks | Transient peak |
+/// |---------|--------------------|----------------|
+/// | `SpinWait`, `YieldHeavy`, `Mixed` | 1/worker | — |
+/// | `Bursty`, `IdleChurn` | 1/worker | — |
+/// | `IoSyncWrite`, `IoRandRead`, `IoConvoy` | 1/worker | — |
+/// | `CachePressure`, `CacheYield`, `CachePipe` | 1/worker | — |
+/// | `PageFaultChurn` | 1/worker | — |
+/// | `AffinityChurn`, `PolicyChurn`, `NiceSweep` | 1/worker | — |
+/// | `NumaWorkingSetSweep`, `NumaMigrationChurn`, `CgroupChurn` | 1/worker | — |
+/// | `Sequence` | 1/worker | — |
+/// | `AluHot`, `SmtSiblingSpin`, `IpcVariance` | 1/worker | — |
+/// | `PipeIo`, `FutexPingPong`, `AsymmetricWaker`, `SignalStorm` | 1/worker | — |
+/// | `FutexFanOut`, `FanOutCompute` | 1/worker | — |
+/// | `ThunderingHerd`, `MutexContention`, `WakeChain` | 1/worker | — |
+/// | `PriorityInversion`, `ProducerConsumerImbalance` | 1/worker | — |
+/// | `RtStarvation`, `PreemptStorm`, `EpollStorm` | 1/worker | — |
+/// | `ForkExit` | 1/worker | +1/worker (waitpid'd before next iter) |
+/// | `Custom` | 1/worker | depends on user closure (see below) |
+///
+/// **`CloneMode::Fork`** (the default): each worker is a separate
+/// process placed in the cgroup. The cgroup's task count for one
+/// `WorkSpec` is exactly `num_workers`; for `ForkExit` the
+/// instantaneous peak is `2 × num_workers` (each parent forks one
+/// child, waitpid's, repeats).
+///
+/// **`CloneMode::Thread`**: every worker is a thread sharing the
+/// test runner's tgid. The pids controller counts each thread as
+/// a task, so the cgroup's task count for one `WorkSpec` is
+/// `num_workers + 1` (workers + the parent task). `ForkExit` is
+/// rejected at spawn time under Thread mode (see
+/// [`WorkType::ForkExit`](crate::workload::WorkType::ForkExit)).
+///
+/// **`Custom`**: the framework runs the user closure in a single
+/// task per worker (1/worker, identical to every other variant).
+/// Any fork/clone the closure issues inside its loop adds to the
+/// cgroup's task count for as long as the resulting child lives;
+/// `pids.max` must reserve headroom equal to the closure's peak
+/// child count per worker. Under `CloneMode::Fork` the framework
+/// reaps closure-spawned descendants at teardown via
+/// `killpg(worker_pid, SIGKILL)` against the worker's per-process
+/// group, so transient children are bounded by the closure
+/// itself. Under `CloneMode::Thread` the worker shares the test
+/// runner's pgid and `killpg`-based cleanup is unavailable, so
+/// the closure owns whatever helpers it spawns and must reap
+/// them explicitly before returning the
+/// [`WorkerReport`](crate::workload::WorkerReport).
+///
+/// **Sizing rule**: `pids.max ≥ Σ(steady-state + transient)` for
+/// every [`WorkSpec`](crate::workload::WorkSpec) in the cgroup,
+/// plus headroom for `cgroup.procs` migration scratch tasks and
+/// any payload-binary helper processes the test attaches via
+/// [`CgroupDef::workload`] (e.g. `stress-ng` spawns one task per
+/// `--cpu N`). Tests with composed `WorkSpec` groups must sum
+/// across every group — the framework does NOT auto-derive a
+/// budget from the work spec.
 ///
 /// # `pids.max(0)` is rejected at apply_setup, not type-level
 ///
-/// `Some(0)` would silently halt every fork inside the cgroup,
-/// including the spawned worker's own futex-helper threads. The
-/// kernel accepts the value (it's a legitimate `pids_max_write`
-/// input), so `apply_setup` adds the bail at scenario-setup time;
-/// promoting it to a type-level invariant (e.g. `NonZeroU64`)
-/// would force every numeric literal through a non-`const`
-/// constructor and ripple into every test fixture. The runtime
-/// bail keeps the surface ergonomic while still surfacing the
-/// foot-cannon at construction time (before any worker spawns).
+/// `Some(0)` would silently halt every fork/clone inside the
+/// cgroup, including the worker spawn itself for `CloneMode::Fork`
+/// and the `ForkExit` per-iteration child fork. The kernel accepts
+/// the value (it's a legitimate `pids_max_write` input), so
+/// `apply_setup` adds the bail at scenario-setup time; promoting
+/// it to a type-level invariant (e.g. `NonZeroU64`) would force
+/// every numeric literal through a non-`const` constructor and
+/// ripple into every test fixture. The runtime bail keeps the
+/// surface ergonomic while still surfacing the foot-cannon at
+/// construction time (before any worker spawns).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct PidsLimits {
@@ -564,8 +610,9 @@ pub struct PidsLimits {
     /// rejects negative or `>= PIDS_MAX (PID_MAX_LIMIT + 1, typically ~4M on 64-bit)` values with
     /// EINVAL; the framework's `apply_setup` rejects `Some(0)`
     /// before the syscall (a 0 limit silently halts every fork
-    /// inside the cgroup, including the spawned worker's own
-    /// futex-helper threads).
+    /// or clone inside the cgroup, blocking both worker spawn
+    /// under `CloneMode::Fork` and `ForkExit`'s per-iteration
+    /// child fork).
     pub max: Option<u64>,
 }
 
@@ -1083,11 +1130,11 @@ impl CgroupDef {
     /// racing fork()s follow the new limit").
     ///
     /// `n = 0` is rejected at `apply_setup` time: a 0-limit cgroup
-    /// silently halts every fork from inside, including the
-    /// futex-helper threads spawned by some `WorkType` variants.
-    /// There is no kernel sentinel for "no fork ever"; `pids_max=0`
-    /// silently fails every `fork()` inside with `EAGAIN`, which is
-    /// almost certainly a configuration bug.
+    /// halts every fork/clone inside, including the worker spawn
+    /// under `CloneMode::Fork` and the `ForkExit` per-iteration
+    /// child fork. There is no kernel sentinel for "no fork ever";
+    /// `pids_max=0` silently fails every `fork()` inside with
+    /// `EAGAIN`, which is almost certainly a configuration bug.
     #[must_use = "builder methods consume self; bind the result"]
     pub fn pids_max(mut self, n: u64) -> Self {
         let pids = self.pids.get_or_insert_with(PidsLimits::default);

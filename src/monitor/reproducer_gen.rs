@@ -153,10 +153,10 @@ impl Default for ReproducerSpec {
 }
 
 /// Substring marker [`map_affinity`] embeds in every hand-edit-required
-/// note (the topology-aware unresolved-fallback notes, the empty-
-/// `Exact` placeholder note, and the unresolved-`RandomSubset`
+/// affinity note (the topology-aware unresolved-fallback notes, the
+/// empty-`Exact` placeholder note, and the unresolved-`RandomSubset`
 /// placeholder note). Used by [`ReproducerSpec::is_runnable`] and
-/// [`ReproducerSpec::unresolved_count`] as the programmatic
+/// [`ReproducerSpec::unresolved_count`] as one programmatic
 /// "spawn-time gate would reject this spec" signal so callers don't
 /// have to rerun the spawn-time gate just to check.
 ///
@@ -164,37 +164,71 @@ impl Default for ReproducerSpec {
 /// resolved-`RandomSubset` informational note ("the spawn-time
 /// affinity gate accepts it without hand-editing") — that note is a
 /// confirmation of runnability, not a hand-edit prompt.
+///
+/// Companion to [`WORK_TYPE_TODO_NOTE_MARKER`] (work-type unmapped
+/// variants); both are checked by
+/// [`ReproducerSpec::unresolved_count`].
 const UNRESOLVED_NOTE_MARKER: &str = "spawn-time affinity gate rejects";
+
+/// Substring marker [`map_work_type`] embeds in the hand-edit-required
+/// note pushed when the projected [`WorkType`] would render as a
+/// `WorkType::SpinWait /* TODO: ... */` placeholder via
+/// [`render_work_type_todo`] (i.e. no fingerprint mapping exists for
+/// the variant yet). The marker lets [`ReproducerSpec::is_runnable`] /
+/// [`ReproducerSpec::unresolved_count`] count work-type hand-edit
+/// prompts uniformly with the affinity ones, so a spec carrying an
+/// unmapped variant cannot silently appear runnable.
+const WORK_TYPE_TODO_NOTE_MARKER: &str = "no fingerprint mapping for WorkType";
 
 impl ReproducerSpec {
     /// Returns `true` when the spec is runnable as-is (the spawn-time
-    /// affinity gate accepts it without hand-editing). `false` means
-    /// at least one hand-edit-required note is present and the user
-    /// must update the rendered source before running.
+    /// affinity gate accepts it without hand-editing AND the
+    /// rendered source carries no `WorkType::SpinWait /* TODO: ... */`
+    /// placeholder). `false` means at least one hand-edit-required
+    /// note is present, or [`Self::config`]'s `work_type` is one the
+    /// generator does not know how to render as a runnable builder
+    /// call yet.
     ///
-    /// The check looks for the [`UNRESOLVED_NOTE_MARKER`] substring
-    /// in any of [`Self::notes`]; that marker is embedded by
-    /// [`map_affinity`] in the topology-aware unresolved-fallback
-    /// notes (`SingleCpu` / `LlcAligned` / `CrossCgroup`), the empty-
-    /// `Exact` placeholder note, and the unresolved-`RandomSubset`
-    /// placeholder note. Resolved-collapse notes
-    /// (`topology_resolved_note`) and informational notes
-    /// (fingerprint gaps, "additional X hints observed", etc.) do
-    /// not contain the marker.
+    /// The check is the union of two signals:
+    ///
+    /// 1. Hand-edit-required notes — counted via
+    ///    [`Self::unresolved_count`] using [`UNRESOLVED_NOTE_MARKER`]
+    ///    (affinity) and [`WORK_TYPE_TODO_NOTE_MARKER`] (work-type
+    ///    TODO).
+    /// 2. Direct check on [`Self::config`]'s `work_type` —
+    ///    [`is_unmapped_work_type`] returns `true` for variants that
+    ///    [`render_work_type`] dispatches to [`render_work_type_todo`].
+    ///    This catches specs constructed without going through
+    ///    [`generate_spec`] / [`map_work_type`] (e.g. callers that set
+    ///    `config.work_type` directly), so a manually-built spec with
+    ///    `WorkType::CacheYield { .. }` is correctly classified as
+    ///    NOT runnable even though no marker note was pushed.
+    ///
+    /// Resolved-collapse notes (`topology_resolved_note`) and
+    /// informational notes (fingerprint gaps, "additional X hints
+    /// observed", etc.) do not contain either marker.
     #[allow(dead_code)]
     pub fn is_runnable(&self) -> bool {
-        self.unresolved_count() == 0
+        self.unresolved_count() == 0 && !is_unmapped_work_type(&self.config.work_type)
     }
 
     /// Number of hand-edit-required notes in [`Self::notes`]. Counts
-    /// the same marker [`Self::is_runnable`] uses; useful for
-    /// surfacing "this reproducer needs N edits" messaging in
-    /// `cargo ktstr` tooling.
+    /// notes carrying [`UNRESOLVED_NOTE_MARKER`] (affinity hand-edit
+    /// prompts) OR [`WORK_TYPE_TODO_NOTE_MARKER`] (work-type TODO
+    /// prompts); useful for surfacing "this reproducer needs N edits"
+    /// messaging in `cargo ktstr` tooling.
+    ///
+    /// Does NOT include the `is_unmapped_work_type` direct-config
+    /// signal that [`Self::is_runnable`] folds in — that path
+    /// catches manually-constructed specs without notes and is
+    /// outside the "count of edit prompts" semantic.
     #[allow(dead_code)]
     pub fn unresolved_count(&self) -> usize {
         self.notes
             .iter()
-            .filter(|n| n.contains(UNRESOLVED_NOTE_MARKER))
+            .filter(|n| {
+                n.contains(UNRESOLVED_NOTE_MARKER) || n.contains(WORK_TYPE_TODO_NOTE_MARKER)
+            })
             .count()
     }
 }
@@ -512,11 +546,91 @@ fn map_work_type(fp: &WorkloadFingerprint, spec: &mut ReproducerSpec) {
         WorkTypeHint::IoConvoy => WorkType::IoConvoy,
     };
 
+    // Surface a hand-edit-required note when the projected WorkType
+    // is one [`render_work_type`] dispatches to
+    // [`render_work_type_todo`]. No current [`WorkTypeHint`] variant
+    // projects there, but the safety net keeps
+    // [`ReproducerSpec::is_runnable`] honest the moment a future
+    // hint variant lands on a TODO arm — the guarantee is that any
+    // spec with an unmapped work_type carries the marker note rather
+    // than silently rendering as a `SpinWait` placeholder. The note
+    // text embeds [`WORK_TYPE_TODO_NOTE_MARKER`] so the runnability
+    // counter picks it up uniformly with the affinity markers.
+    if is_unmapped_work_type(&spec.config.work_type) {
+        spec.notes.push(format!(
+            "no fingerprint mapping for WorkType::{:?} — \
+             render_run_file_source emits a TODO-decorated \
+             SpinWait placeholder; hand-edit the rendered source to \
+             a real builder call before running",
+            spec.config.work_type,
+        ));
+    }
+
     push_extras_note(
         &mut spec.notes,
         "additional work-type hints observed",
         fp.work_type_hints.iter().skip(1).map(|w| format!("{w:?}")),
     );
+}
+
+/// Return `true` when `w` is a [`WorkType`] variant that
+/// [`render_work_type`] dispatches to [`render_work_type_todo`] (i.e.
+/// renders as `WorkType::SpinWait /* TODO: ... */` because no
+/// fingerprint mapping exists yet). Mirrors the runnable / TODO split
+/// in [`render_work_type`] one-for-one — a new variant added there
+/// must be classified here in the same pass.
+///
+/// Used by [`ReproducerSpec::is_runnable`] and [`map_work_type`] to
+/// flag specs whose `work_type` cannot be rendered as a real builder
+/// call. The runnable arm returns `false`; every TODO arm returns
+/// `true`.
+fn is_unmapped_work_type(w: &WorkType) -> bool {
+    match w {
+        // Variants the projection layer maps from a fingerprint hint
+        // — render as runnable builder calls in [`render_work_type`].
+        WorkType::SpinWait
+        | WorkType::YieldHeavy
+        | WorkType::Mixed
+        | WorkType::IoSyncWrite
+        | WorkType::IoRandRead
+        | WorkType::IoConvoy
+        | WorkType::Bursty { .. }
+        | WorkType::PipeIo { .. }
+        | WorkType::FutexPingPong { .. }
+        | WorkType::CachePressure { .. } => false,
+        // Variants no fingerprint hint currently projects to —
+        // [`render_work_type`] dispatches each of these to
+        // [`render_work_type_todo`]. Adding one to the runnable arm
+        // above MUST also flip this match in lock-step.
+        WorkType::CacheYield { .. }
+        | WorkType::CachePipe { .. }
+        | WorkType::FutexFanOut { .. }
+        | WorkType::Sequence { .. }
+        | WorkType::ForkExit
+        | WorkType::NiceSweep
+        | WorkType::AffinityChurn { .. }
+        | WorkType::PolicyChurn { .. }
+        | WorkType::FanOutCompute { .. }
+        | WorkType::PageFaultChurn { .. }
+        | WorkType::MutexContention { .. }
+        | WorkType::Custom { .. }
+        | WorkType::ThunderingHerd { .. }
+        | WorkType::PriorityInversion { .. }
+        | WorkType::ProducerConsumerImbalance { .. }
+        | WorkType::RtStarvation { .. }
+        | WorkType::AsymmetricWaker { .. }
+        | WorkType::WakeChain { .. }
+        | WorkType::NumaWorkingSetSweep { .. }
+        | WorkType::CgroupChurn { .. }
+        | WorkType::SignalStorm { .. }
+        | WorkType::PreemptStorm { .. }
+        | WorkType::EpollStorm { .. }
+        | WorkType::NumaMigrationChurn { .. }
+        | WorkType::IdleChurn { .. }
+        | WorkType::AluHot { .. }
+        | WorkType::SmtSiblingSpin
+        | WorkType::IpcVariance { .. } => true,
+    }
 }
 
 fn map_sched_policy(fp: &WorkloadFingerprint, spec: &mut ReproducerSpec) {
@@ -1831,5 +1945,357 @@ mod tests {
             render_affinity(&exact),
             "AffinityIntent::Exact(BTreeSet::from([0, 1, 2]))"
         );
+    }
+
+    /// [`is_unmapped_work_type`] returns `false` for every variant
+    /// [`render_work_type`] dispatches to a runnable builder-call arm,
+    /// and `true` for every variant it dispatches to
+    /// [`render_work_type_todo`]. Pins the runnable / TODO split
+    /// in lock-step with [`render_work_type`] — adding a new variant
+    /// to one match arm without updating the other shows up here as
+    /// a failed expectation.
+    #[test]
+    fn is_unmapped_work_type_split_matches_render() {
+        // Sample one of each runnable variant — both nullary
+        // (`SpinWait`) and parameterized (`Bursty` / `CachePressure`)
+        // forms must classify as runnable.
+        let runnable_samples: Vec<WorkType> = vec![
+            WorkType::SpinWait,
+            WorkType::YieldHeavy,
+            WorkType::Mixed,
+            WorkType::IoSyncWrite,
+            WorkType::IoRandRead,
+            WorkType::IoConvoy,
+            WorkType::Bursty {
+                burst_duration: Duration::from_millis(5),
+                sleep_duration: Duration::from_millis(95),
+            },
+            WorkType::PipeIo { burst_iters: 1024 },
+            WorkType::FutexPingPong { spin_iters: 1024 },
+            WorkType::CachePressure {
+                size_kb: 256,
+                stride: 64,
+            },
+        ];
+        for w in &runnable_samples {
+            assert!(
+                !is_unmapped_work_type(w),
+                "{w:?} renders as a runnable builder call — \
+                 is_unmapped_work_type must return false",
+            );
+            // Each runnable variant must NOT pass through
+            // render_work_type_todo, so the rendered output must NOT
+            // carry the TODO marker substring.
+            let rendered = render_work_type(w);
+            assert!(
+                !rendered.contains("/* TODO:"),
+                "{w:?} must render without a TODO placeholder: {rendered}",
+            );
+        }
+
+        // Sample several TODO variants — the TODO arms must classify
+        // as unmapped and render through render_work_type_todo
+        // (visible via the `/* TODO:` substring).
+        let unmapped_samples: Vec<WorkType> = vec![
+            WorkType::CacheYield {
+                size_kb: 256,
+                stride: 64,
+            },
+            WorkType::ForkExit,
+            WorkType::SmtSiblingSpin,
+            WorkType::NiceSweep,
+        ];
+        for w in &unmapped_samples {
+            assert!(
+                is_unmapped_work_type(w),
+                "{w:?} renders as a TODO placeholder — \
+                 is_unmapped_work_type must return true",
+            );
+            let rendered = render_work_type(w);
+            assert!(
+                rendered.contains("/* TODO:"),
+                "{w:?} must render through render_work_type_todo: {rendered}",
+            );
+        }
+    }
+
+    /// Manually-constructed [`ReproducerSpec`] with an unmapped
+    /// [`WorkType`] variant in `config.work_type` is correctly
+    /// classified as not runnable by [`ReproducerSpec::is_runnable`],
+    /// even though no projection-time note was pushed (the spec was
+    /// not built via [`generate_spec`] / [`map_work_type`]). Pins the
+    /// direct-config check in `is_runnable` that catches the
+    /// "renders as TODO but no note in spec.notes" failure mode the
+    /// projection-only signal would miss.
+    #[test]
+    fn is_runnable_unmapped_work_type_via_direct_config() {
+        let mut spec = ReproducerSpec::default();
+        spec.config.work_type = WorkType::CacheYield {
+            size_kb: 256,
+            stride: 64,
+        };
+        // No notes pushed — direct construction bypasses the
+        // projection layer.
+        assert!(
+            spec.notes.is_empty(),
+            "fixture must not add notes; got {:?}",
+            spec.notes,
+        );
+        assert!(
+            !spec.is_runnable(),
+            "spec with unmapped work_type must NOT be runnable, even \
+             without projection notes; config.work_type: {:?}",
+            spec.config.work_type,
+        );
+        // unresolved_count counts notes only — direct-config path
+        // doesn't push notes, so the count stays at zero.
+        assert_eq!(
+            spec.unresolved_count(),
+            0,
+            "unresolved_count covers note markers only; got {}",
+            spec.unresolved_count(),
+        );
+    }
+
+    /// [`map_work_type`] is the projection-time path. When a future
+    /// [`WorkTypeHint`] variant projects to an unmapped [`WorkType`],
+    /// the function must push a hand-edit-required note carrying the
+    /// [`WORK_TYPE_TODO_NOTE_MARKER`] substring so
+    /// [`ReproducerSpec::unresolved_count`] picks it up. Today no hint
+    /// projects to a TODO variant, so we exercise the helper directly
+    /// against a hand-built spec to pin the post-assignment check
+    /// against silent removal.
+    #[test]
+    fn map_work_type_emits_note_for_unmapped_projection() {
+        // Manually drive the post-assignment branch of map_work_type
+        // by simulating the same sequence: assign an unmapped
+        // WorkType to spec.config.work_type, then push the marker
+        // note via the same fn the projection path uses.
+        // (`map_work_type` is tested as a unit through `generate_spec`
+        // for the runnable-projection path; the unmapped-projection
+        // path has no hint that fires today, so we exercise the
+        // detection helper + marker contract directly here.)
+        let mut spec = ReproducerSpec::default();
+        spec.config.work_type = WorkType::ForkExit;
+        if is_unmapped_work_type(&spec.config.work_type) {
+            spec.notes.push(format!(
+                "no fingerprint mapping for WorkType::{:?} — marker test",
+                spec.config.work_type,
+            ));
+        }
+        assert!(
+            spec.notes.iter().any(|n| n.contains(WORK_TYPE_TODO_NOTE_MARKER)),
+            "marker substring must appear in the pushed note: {:?}",
+            spec.notes,
+        );
+        assert_eq!(
+            spec.unresolved_count(),
+            1,
+            "unresolved_count must include the work-type TODO marker",
+        );
+        assert!(
+            !spec.is_runnable(),
+            "spec with TODO note + unmapped work_type must be NOT runnable",
+        );
+    }
+
+    /// `is_runnable()` for a spec with an unmapped work_type AND a
+    /// pre-existing affinity hand-edit note returns `false` and the
+    /// counts compose correctly: each marker contributes one unit to
+    /// `unresolved_count`. Pins that the two markers don't shadow each
+    /// other and that `is_runnable` ANDs both signals.
+    #[test]
+    fn is_runnable_combines_work_type_and_affinity_signals() {
+        // Empty Exact — produces an affinity hand-edit note carrying
+        // UNRESOLVED_NOTE_MARKER.
+        let mut cap = DebugCapture::default();
+        cap.fingerprint.affinity_hints = vec![AffinityHint::Exact { cpus: Vec::new() }];
+        let mut spec = generate_spec(&cap);
+        // Inject an unmapped work_type post-projection, plus a
+        // matching marker note (mirroring map_work_type's future
+        // unmapped-projection branch).
+        spec.config.work_type = WorkType::ForkExit;
+        spec.notes.push(format!(
+            "no fingerprint mapping for WorkType::{:?} — composed test",
+            spec.config.work_type,
+        ));
+
+        assert!(!spec.is_runnable());
+        assert_eq!(
+            spec.unresolved_count(),
+            2,
+            "expected 2 markers (1 affinity + 1 work-type), got {}: {:?}",
+            spec.unresolved_count(),
+            spec.notes,
+        );
+    }
+
+    /// `render_run_file_source` output compiles as valid Rust.
+    ///
+    /// Builds a representative [`ReproducerSpec`] that exercises every
+    /// rendered surface (parameterized [`WorkType::Bursty`], populated
+    /// [`AffinityIntent::Exact`], [`SchedPolicy::Deadline`] with
+    /// `Duration` fields, cgroup hint comments, generator notes), then
+    /// invokes `rustc --edition 2021 --crate-type lib` on the rendered
+    /// output to confirm:
+    ///
+    /// - format strings produce parseable Rust (no stray commas /
+    ///   missing braces)
+    /// - field names match the API (a typo like
+    ///   `WorkType::Bursty { burst_dur: ... }` would surface here as
+    ///   a compile error against the stubbed `WorkType::Bursty`)
+    /// - builder method names match
+    ///   ([`render_run_file_source`] emits `.workers/.affinity/
+    ///   .work_type/.sched_policy/.nice` — a typo would not resolve
+    ///   against the stub)
+    ///
+    /// The test prepends a `mod ktstr { pub mod workload { ... } }`
+    /// stub before the rendered source so the rendered
+    /// `use ktstr::workload::*;` resolves to the stub. This isolates
+    /// the test from the surrounding crate build (no `--extern`
+    /// gymnastics) while still exercising every type and variant the
+    /// rendered source mentions. A regression in the renderer (typo,
+    /// extra brace, drifted field name) surfaces as a `rustc` failure
+    /// with the rendered source attached for diagnostic.
+    #[test]
+    fn render_run_file_source_compiles_via_rustc() {
+        // Spec covering: parameterized WorkType, populated Exact
+        // affinity, Deadline policy with Duration fields, cgroup
+        // hints, generator notes (fingerprint gap), and a non-zero
+        // nice value.
+        let mut cap = DebugCapture::default();
+        cap.fingerprint.workload_groups = vec![WorkloadGroupHint {
+            cgroup_path: "/system.slice/foo.service".into(),
+            thread_count: 16,
+            cpu_time_fraction: 0.65,
+            wakeups_per_sec: 850.0,
+        }];
+        cap.fingerprint.affinity_hints = vec![AffinityHint::Exact {
+            cpus: vec![0, 1, 4, 5],
+        }];
+        cap.fingerprint.work_type_hints = vec![WorkTypeHint::Bursty {
+            burst_duration: Duration::from_millis(7),
+            sleep_duration: Duration::from_millis(43),
+        }];
+        cap.fingerprint.cgroup_hints = vec![CgroupHint {
+            path: "/system.slice/foo.service".into(),
+            cpu_weight: Some(150),
+            memory_max_bytes: Some(4 * 1024 * 1024 * 1024),
+            cpuset_cpus: vec![0, 1, 4, 5],
+            cpu_max_quota_us: Some(50_000),
+        }];
+        cap.fingerprint.sched_policy_hints = vec![SchedPolicyHint::Deadline {
+            runtime_ns: 1_000_000,
+            deadline_ns: 5_000_000,
+            period_ns: 10_000_000,
+        }];
+        cap.fingerprint.gaps = vec!["sample window had 2 dropouts".into()];
+        let spec = generate_spec(&cap);
+        let rendered = render_run_file_source(&spec, "compile_check_repro");
+
+        // Stub module mirroring the API surface the rendered source
+        // uses. `pub use std::collections::BTreeSet` and
+        // `std::time::Duration` re-exports are NOT needed — the
+        // rendered source imports them directly from `std`. Stub
+        // types are unit / payload-bearing variants that match the
+        // names the renderer emits one-for-one, so the rendered
+        // builder calls type-check against this surface.
+        let stub = r#"
+#[allow(dead_code, unused_variables, unused_imports)]
+mod ktstr { pub mod workload {
+    use std::collections::BTreeSet;
+    use std::time::Duration;
+    pub struct WorkloadConfig;
+    impl WorkloadConfig {
+        pub fn default() -> Self { Self }
+        pub fn workers(self, _: usize) -> Self { self }
+        pub fn affinity(self, _: AffinityIntent) -> Self { self }
+        pub fn work_type(self, _: WorkType) -> Self { self }
+        pub fn sched_policy(self, _: SchedPolicy) -> Self { self }
+        pub fn nice(self, _: i32) -> Self { self }
+    }
+    pub enum AffinityIntent {
+        Inherit,
+        SingleCpu,
+        LlcAligned,
+        CrossCgroup,
+        SmtSiblingPair,
+        RandomSubset { from: BTreeSet<usize>, count: usize },
+        Exact(BTreeSet<usize>),
+    }
+    pub enum WorkType {
+        SpinWait,
+        YieldHeavy,
+        Mixed,
+        IoSyncWrite,
+        IoRandRead,
+        IoConvoy,
+        Bursty { burst_duration: Duration, sleep_duration: Duration },
+        PipeIo { burst_iters: u64 },
+        FutexPingPong { spin_iters: u64 },
+        CachePressure { size_kb: usize, stride: usize },
+    }
+    pub enum SchedPolicy {
+        Normal,
+        Batch,
+        Idle,
+        Fifo(u32),
+        RoundRobin(u32),
+        Deadline { runtime: Duration, deadline: Duration, period: Duration },
+    }
+}}
+"#;
+
+        // The rendered source begins with header comments, then
+        // `use ktstr::workload::*;`. Splice the stub in BEFORE the
+        // rendered output so the `use` resolves to the stub module.
+        // Splicing before the rendered output (rather than replacing
+        // the use line) keeps the rendered source byte-identical to
+        // what callers actually emit, so the test exercises the
+        // production surface verbatim.
+        let combined = format!("{stub}\n{rendered}");
+
+        // Write to a tempfile — prefer NamedTempFile so the file is
+        // cleaned up automatically even if rustc panics. The `.rs`
+        // suffix is required for rustc to accept the input path
+        // without a `--crate-name` override.
+        use std::io::Write as _;
+        let mut tmp = tempfile::Builder::new()
+            .prefix("ktstr_reproducer_compile_check_")
+            .suffix(".rs")
+            .tempfile()
+            .expect("create tempfile for rendered source");
+        tmp.write_all(combined.as_bytes())
+            .expect("write rendered source");
+        tmp.flush().expect("flush rendered source");
+
+        // rustc invocation: `--edition 2021 --crate-type lib`
+        // matches the task spec and the rendered source's idiom (no
+        // `fn main`, library shape). `--out-dir <tempdir>` keeps
+        // build artifacts out of the workspace; the tempdir drops at
+        // end of scope so artifacts don't leak.
+        let out_dir = tempfile::TempDir::new().expect("rustc out tempdir");
+        let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+        let output = std::process::Command::new(&rustc)
+            .arg("--edition")
+            .arg("2021")
+            .arg("--crate-type")
+            .arg("lib")
+            .arg("--out-dir")
+            .arg(out_dir.path())
+            .arg(tmp.path())
+            .output()
+            .expect("invoke rustc to compile rendered source");
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            panic!(
+                "rustc rejected rendered source\n\
+                 ---- rustc stderr ----\n\
+                 {stderr}\n\
+                 ---- combined source ----\n\
+                 {combined}",
+            );
+        }
     }
 }

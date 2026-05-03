@@ -28,11 +28,12 @@ use std::num::NonZeroU64;
 /// `Raw` matches the actual on-disk state: no formatting happens, the
 /// guest sees `/dev/vda` as a raw unformatted block device.
 ///
-/// `Btrfs` activates the template-cache lifecycle (see module docs).
-/// Selecting it requires the ktstr cache directory to live on a
-/// reflink-capable filesystem (btrfs or xfs) — the per-test fan-out
-/// uses `FICLONE` to clone the cached template image and would fail
-/// on tmpfs/ext4. The host must also have `mkfs.btrfs` on `PATH` at
+/// Non-`Raw` variants activate the template-cache lifecycle (see
+/// module docs). Selecting one requires the ktstr cache directory
+/// to live on a reflink-capable filesystem (btrfs or xfs) — the
+/// per-test fan-out uses `FICLONE` to clone the cached template
+/// image and would fail on tmpfs/ext4. The host must also have the
+/// formatter named by [`Self::mkfs_binary_name`] on `PATH` at
 /// template-build time so the template-VM initramfs can pack it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -41,16 +42,18 @@ pub enum Filesystem {
     /// an unformatted volume of the configured capacity. Default.
     #[default]
     Raw,
-    /// btrfs filesystem. Once the template-VM driver lands, per-test
-    /// backing will be a reflink clone of a host-cached,
-    /// guest-formatted btrfs image at the configured capacity; the
-    /// cache lives under the ktstr cache root and requires a
-    /// btrfs/xfs mount, and `mkfs.btrfs` must be on the host `PATH`
-    /// at template-build time. v0: selecting `Btrfs` returns an
-    /// actionable error from `init_virtio_blk` until the driver
-    /// referenced by
-    /// [`crate::vmm::disk_template::build_template_via_vm`] lands.
-    /// See [`crate::vmm::disk_template`].
+    /// btrfs filesystem. Per-test backing is a reflink clone of a
+    /// host-cached, guest-formatted btrfs image at the configured
+    /// capacity. On cache miss
+    /// [`crate::vmm::disk_template::ensure_template`] boots a one-shot
+    /// template VM that runs `mkfs.btrfs /dev/vda` inside the guest,
+    /// caches the formatted image under the ktstr cache root, and
+    /// returns the cached path. On cache hit
+    /// [`crate::vmm::disk_template::clone_to_per_test`] FICLONE-clones
+    /// the cached template into a per-test tempfile under the same
+    /// cache filesystem. The cache directory must live on a btrfs/xfs
+    /// mount, and `mkfs.btrfs` must be on the host `PATH` at
+    /// template-build time. See [`crate::vmm::disk_template`].
     Btrfs,
 }
 
@@ -65,6 +68,26 @@ impl Filesystem {
         match self {
             Filesystem::Raw => "raw",
             Filesystem::Btrfs => "btrfs",
+        }
+    }
+
+    /// Userspace mkfs binary name to pack into the template-VM
+    /// initramfs for variants that require pre-formatting.
+    ///
+    /// Returns `Some(name)` for variants whose template-build VM
+    /// execs an `mkfs.<fstype>` against `/dev/vda` inside the guest;
+    /// `None` for variants that need no formatter (`Raw`). The
+    /// exhaustive match here forces every future `Filesystem`
+    /// variant to wire its mkfs lookup at compile time —
+    /// [`crate::vmm::disk_template::locate_host_mkfs`] takes the
+    /// returned name verbatim and PATH-resolves it, so a new
+    /// variant that forgets to declare a binary surfaces as a
+    /// non-exhaustive-match build error rather than as a runtime
+    /// "binary not found" diagnostic at template-build time.
+    pub(crate) fn mkfs_binary_name(self) -> Option<&'static str> {
+        match self {
+            Filesystem::Raw => None,
+            Filesystem::Btrfs => Some("mkfs.btrfs"),
         }
     }
 }
