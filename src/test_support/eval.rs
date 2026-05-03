@@ -73,15 +73,16 @@ pub(crate) const ERR_NO_TEST_FUNCTION_OUTPUT: &str =
 pub(crate) const ERR_GUEST_CRASHED_PREFIX: &str = "guest crashed:";
 
 /// Write a skip sidecar for `entry` + `active_flags`, logging to
-/// stderr on failure without propagating the error. Used at five
-/// sites — the three in [`run_ktstr_test_inner`] (performance_mode
-/// gate plus the two `ResourceContention` arms at VM build + VM
-/// run) and the two in `super::dispatch` (performance_mode gates
-/// at the plain-run and flag-profile entry points) — all of which
-/// must record the skip for stats tooling but cannot meaningfully
-/// handle a sidecar-write failure beyond logging it. The skip
-/// itself is still valid; only post-run stats tooling loses
-/// visibility.
+/// stderr on failure without propagating the error. Used at six
+/// sites — the four in [`run_ktstr_test_inner`] (the wrapper's
+/// catch-all that fires for any pre-VM-build ResourceContention,
+/// the performance_mode gate, and the two `ResourceContention`
+/// arms at VM build + VM run) and the two in `super::dispatch`
+/// (performance_mode gates at the plain-run and flag-profile
+/// entry points) — all of which must record the skip for stats
+/// tooling but cannot meaningfully handle a sidecar-write failure
+/// beyond logging it. The skip itself is still valid; only
+/// post-run stats tooling loses visibility.
 pub(crate) fn record_skip_sidecar(entry: &KtstrTestEntry, active_flags: &[String]) {
     if let Err(e) = write_skip_sidecar(entry, active_flags) {
         // Dual-emit at warn level: an unwritten skip sidecar costs
@@ -690,7 +691,54 @@ fn dedupe_include_files(
 // (each CPUID-gated) plus sigmask + SIGRTMIN sigaction. The
 // non-x86_64 definition saves only sigmask + SIGRTMIN.
 
+/// Public-crate entry point. Thin wrapper around
+/// [`run_ktstr_test_inner_impl`] that records a skip sidecar
+/// whenever the inner pipeline bails with a
+/// [`crate::vmm::host_topology::ResourceContention`] from any
+/// `?`-propagated site — `ensure_kvm`, `resolve_test_kernel`,
+/// `acquire_test_kernel_lock_if_cached`, `resolve_scheduler`, the
+/// declarative-include-files resolver, or any other early bail
+/// before VM build. Without this catch-all, contention before
+/// `builder.build()` skipped silently from stats tooling's
+/// perspective: the macro-layer SKIP banner fired (so libtest
+/// saw a pass), but the sidecar — the artifact stats tooling
+/// reads to count skips per test — never landed.
+///
+/// The two existing `match builder.build() { ... }` and
+/// `match vm.run() { ... }` arms downstream still record the
+/// sidecar at their own sites; this wrapper backs them up by
+/// catching anything they missed. Double-recording is acceptable
+/// but NOT idempotent in the strict sense: the wrapper's write
+/// overwrites the per-site write's `run_id` and timestamp with
+/// fresh values produced at wrapper-return time. Both recordings
+/// carry the same skip classification (the same
+/// `ResourceContention` reason flowing through the same
+/// `write_skip_sidecar`), so the final sidecar is correct for
+/// stats tooling — only the run_id / timestamp shift between the
+/// two writes, and downstream tooling keys on (test name, skip
+/// classification), not on those volatile fields.
 pub(crate) fn run_ktstr_test_inner(
+    entry: &KtstrTestEntry,
+    topo: Option<&TopoOverride>,
+    active_flags: &[String],
+) -> Result<AssertResult> {
+    let result = run_ktstr_test_inner_impl(entry, topo, active_flags);
+    if let Err(ref e) = result
+        && e.downcast_ref::<crate::vmm::host_topology::ResourceContention>()
+            .is_some()
+    {
+        // Late catch-all for ResourceContention from any early-
+        // bail path before the existing per-site `record_skip_sidecar`
+        // calls in builder.build()/vm.run() arms below. Not strictly
+        // idempotent — a second write refreshes run_id and timestamp
+        // — but the skip classification round-trips identically, so
+        // stats tooling sees the same outcome.
+        record_skip_sidecar(entry, active_flags);
+    }
+    result
+}
+
+fn run_ktstr_test_inner_impl(
     entry: &KtstrTestEntry,
     topo: Option<&TopoOverride>,
     active_flags: &[String],

@@ -306,6 +306,31 @@ fn errno_name(errno: i32) -> std::borrow::Cow<'static, str> {
     }
 }
 
+/// Build the [`host_topology::ResourceContention`] error returned
+/// from [`create_vm_with_retry`] when the EINTR retry budget is
+/// exhausted. Factored out so the format (which appears in the
+/// SKIP banner and is parsed by stats tooling for skip
+/// classification) can be pinned by a unit test without the test
+/// having to actually drive the ioctl through a sustained signal
+/// storm.
+fn eintr_exhausted_contention() -> anyhow::Error {
+    let snapshot = host_resource_snapshot();
+    let total_delay: std::time::Duration = KVM_CREATE_VM_EINTR_DELAYS.iter().copied().sum();
+    anyhow::Error::new(host_topology::ResourceContention {
+        reason: format!(
+            "create VM: KVM_CREATE_VM kept returning EINTR after \
+             {n} retries totalling {total_ms} ms — sustained \
+             signal pressure on the host. host resources: {snapshot}\n  \
+             hint: a peer process is firing realtime / SIGRTMIN \
+             signals at a rate that out-paces the EINTR backoff \
+             schedule. nextest will not retry; the SKIP banner \
+             records this attempt for stats tooling.",
+            n = KVM_CREATE_VM_EINTR_DELAYS.len(),
+            total_ms = total_delay.as_millis(),
+        ),
+    })
+}
+
 /// Create a KVM VM with EINTR retry plus transient-errno
 /// classification.
 ///
@@ -324,6 +349,22 @@ fn errno_name(errno: i32) -> std::borrow::Cow<'static, str> {
 /// (5 µs-scale steps, 62 µs total) was tuned for the bare-ioctl
 /// case and starved against any signal source that fires
 /// continuously across a few tens of microseconds.
+///
+/// # EINTR exhaustion → contention
+///
+/// When the EINTR retry budget is exhausted (every step in
+/// [`KVM_CREATE_VM_EINTR_DELAYS`] tried) and the ioctl is STILL
+/// returning EINTR, the host is under sustained signal pressure:
+/// some peer is firing realtime / SIGRTMIN / SIGUSR signals at a
+/// rate that walks faster than the backoff schedule can absorb.
+/// That is a transient host condition, not a kernel fault, so it
+/// classifies as [`host_topology::ResourceContention`] — the
+/// `#[ktstr_test]` macro then SKIPs cleanly and stats tooling
+/// records the skip via the sidecar. Without this branch, the
+/// terminal EINTR fell through `map_transient_to_contention`
+/// (which doesn't recognize EINTR as transient) and surfaced as a
+/// hard error — every co-located test failed loudly during a CI
+/// signal storm.
 pub(crate) fn create_vm_with_retry(kvm: &kvm_ioctls::Kvm) -> Result<kvm_ioctls::VmFd> {
     let mut attempts = 0usize;
     loop {
@@ -338,6 +379,17 @@ pub(crate) fn create_vm_with_retry(kvm: &kvm_ioctls::Kvm) -> Result<kvm_ioctls::
                 );
                 std::thread::sleep(delay);
                 attempts += 1;
+            }
+            Err(e) if e.errno() == libc::EINTR => {
+                // Exhausted the EINTR retry budget; sustained
+                // signal pressure is a transient host condition,
+                // not a kernel fault. Surface as
+                // ResourceContention so the macro layer SKIPs
+                // cleanly instead of letting EINTR fall through
+                // `map_transient_to_contention` (which doesn't
+                // include EINTR in `TRANSIENT_HOST_ERRNOS` because
+                // the routine retry path covers the common case).
+                break Err(eintr_exhausted_contention());
             }
             Err(e) => break Err(map_transient_to_contention(e, "create VM")),
         }
@@ -8297,6 +8349,65 @@ mod tests {
                 "errno {errno} banner missing context: {rendered}"
             );
         }
+    }
+
+    /// EINTR is NOT in `TRANSIENT_HOST_ERRNOS` because the routine
+    /// retry loop in `create_vm_with_retry` covers the common
+    /// case. Pins that contract: passing EINTR through
+    /// `map_transient_to_contention` directly would silently
+    /// SKIP every test on a single signal interruption — the
+    /// retry loop's whole reason to exist. The EINTR-exhausted
+    /// path uses the dedicated `eintr_exhausted_contention`
+    /// helper instead, asserted in the test below.
+    #[test]
+    fn map_transient_to_contention_does_not_classify_eintr() {
+        let kvm_err = kvm_ioctls::Error::new(libc::EINTR);
+        let mapped = map_transient_to_contention(kvm_err, "create VM");
+        assert!(
+            mapped
+                .downcast_ref::<host_topology::ResourceContention>()
+                .is_none(),
+            "EINTR must NOT classify as ResourceContention via \
+             map_transient_to_contention — the retry loop handles \
+             single EINTR; only EXHAUSTED EINTR is contention. \
+             got: {mapped:#}",
+        );
+    }
+
+    /// `eintr_exhausted_contention` produces a
+    /// [`host_topology::ResourceContention`] with the canonical
+    /// banner shape stats tooling parses for skip classification.
+    /// Pins (a) the type so the macro layer's downcast fires,
+    /// (b) the `create VM` context tag for grep-based test-summary
+    /// tools, (c) the host-resource snapshot for triage, and (d)
+    /// the EINTR-specific hint so an operator hitting this skip
+    /// knows to look for a signal-storm peer rather than a
+    /// memory-pressure peer.
+    #[test]
+    fn eintr_exhausted_contention_format() {
+        let err = eintr_exhausted_contention();
+        assert!(
+            err.downcast_ref::<host_topology::ResourceContention>()
+                .is_some(),
+            "EINTR-exhausted error must downcast to ResourceContention; got: {err:#}",
+        );
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("create VM"),
+            "banner missing context tag: {rendered}",
+        );
+        assert!(
+            rendered.contains("EINTR"),
+            "banner missing EINTR-specific classification: {rendered}",
+        );
+        assert!(
+            rendered.contains("host resources:"),
+            "banner missing host-resource snapshot: {rendered}",
+        );
+        assert!(
+            rendered.contains("signal"),
+            "banner missing signal-storm hint: {rendered}",
+        );
     }
 
     /// `errno_name` falls through to a `errno=<raw>` rendering for
