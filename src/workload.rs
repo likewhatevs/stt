@@ -138,6 +138,7 @@ pub(crate) mod humantime_serde_helper {
 /// | `RandomSubset { from, count }`           | `Random { from, count }`          |
 /// | `SingleCpu` (no payload)                 | `SingleCpu(usize)`                |
 /// | `LlcAligned` / `CrossCgroup`             | `Fixed(...)` (resolver expands)   |
+/// | `SmtSiblingPair` (no payload)            | `Fixed({sibling_a, sibling_b})`   |
 ///
 /// Constructor helpers: [`AffinityIntent::exact`] takes any
 /// `IntoIterator<Item = usize>` for the `Exact` set;
@@ -183,6 +184,40 @@ pub enum AffinityIntent {
     SingleCpu,
     /// Pin to an exact set of CPUs.
     Exact(BTreeSet<usize>),
+    /// Pin all workers in the group to the two SMT siblings of one
+    /// physical core. Tests how the scheduler handles two
+    /// compute-bound tasks placed on SMT siblings — both threads
+    /// contend for the core's shared front-end / execution
+    /// resources, exposing scheduler decisions about co-running
+    /// vs. spreading compute load across cores.
+    ///
+    /// Designed for [`WorkType::SmtSiblingSpin`] and other
+    /// `worker_group_size = 2` variants
+    /// ([`WorkType::FutexPingPong`], [`WorkType::AsymmetricWaker`],
+    /// [`WorkType::SignalStorm`], etc.) where both workers in a
+    /// group are intended to run on a sibling pair. The variant
+    /// has no payload — the resolver picks an SMT-sibling pair
+    /// from the cgroup's effective cpuset (or the full topology
+    /// when no cpuset is active).
+    ///
+    /// Resolution is performed by the scenario engine's
+    /// `resolve_affinity_for_cgroup` (topology-aware, not
+    /// available at the bare [`WorkloadHandle::spawn`] gate). The
+    /// resolver searches the cpuset for a physical core with at
+    /// least two thread siblings present and resolves to
+    /// [`ResolvedAffinity::Fixed`] containing those two CPU IDs.
+    /// All workers in the group get pinned to that 2-CPU set;
+    /// when `num_workers == 2` the kernel runs one worker on each
+    /// sibling, which is the contention pattern this intent
+    /// targets.
+    ///
+    /// Returns an error from the resolver — NOT a silent
+    /// fallback — when no SMT-sibling pair is available
+    /// (`threads_per_core == 1`, or the cpuset isolates each
+    /// sibling onto a different CPU set). Callers must handle
+    /// the error; running [`WorkType::SmtSiblingSpin`] without
+    /// SMT siblings would produce a misleading result.
+    SmtSiblingPair,
 }
 
 impl AffinityIntent {
@@ -1503,20 +1538,25 @@ pub enum WorkType {
     /// from [`SpinWait`](Self::SpinWait) which is a single-
     /// position spin: `SmtSiblingSpin` requires
     /// [`worker_group_size`](Self::worker_group_size) `== 2` and
-    /// is intended to be paired with [`AffinityIntent::Exact`]
-    /// pinning both workers to the SMT siblings of one core
-    /// (e.g. `cpu_a` and `cpu_b` where
-    /// `/sys/devices/system/cpu/cpu_a/topology/thread_siblings_list`
-    /// contains `cpu_b`).
+    /// is paired with an SMT-aware affinity that pins both
+    /// workers to the two siblings of one physical core.
     ///
-    /// Without that pinning the variant degenerates to two
-    /// independent SpinWait workers and exercises no SMT
-    /// contention. The framework does NOT auto-pin to SMT
-    /// siblings — the caller owns the affinity decision because
-    /// SMT-pair availability is host-dependent and the test
-    /// author may want to compare same-core vs cross-core
-    /// behaviour. See follow-up #311 for the framework-level
-    /// affinity helper.
+    /// The framework provides
+    /// [`AffinityIntent::SmtSiblingPair`] for this purpose: the
+    /// scenario engine resolves it against the host topology
+    /// (using sysfs's
+    /// `/sys/devices/system/cpu/cpu_a/topology/thread_siblings_list`
+    /// when the topology was built from sysfs) and produces a
+    /// 2-CPU [`AffinityIntent::Exact`] for the spawn pipeline.
+    /// Resolving on a non-SMT host (`threads_per_core == 1`)
+    /// returns an explicit error rather than silently degrading.
+    /// Test authors who want exact CPU IDs (e.g. comparing
+    /// same-core vs. cross-core behaviour on a known topology)
+    /// can still hand-pick via [`AffinityIntent::Exact`].
+    ///
+    /// Without one of those affinity intents the variant
+    /// degenerates to two independent [`SpinWait`](Self::SpinWait)
+    /// workers and exercises no SMT contention.
     ///
     /// `worker_group_size = Some(2)` so paired workers share
     /// the position metadata the dispatch arm uses to assert
@@ -2042,10 +2082,10 @@ impl WorkType {
             // pinned to the two SMT siblings of one physical
             // core. The variant doesn't allocate shared memory;
             // the group of 2 is what binds the AffinityIntent
-            // resolution to a sibling pair (the test author
-            // supplies the per-pair pinning via
-            // [`AffinityIntent::Exact`] — see follow-up #311
-            // for a framework-level helper).
+            // resolution to a sibling pair. Pair via
+            // [`AffinityIntent::SmtSiblingPair`] (auto-resolved
+            // from host topology) or [`AffinityIntent::Exact`]
+            // (caller-supplied CPU IDs).
             WorkType::SmtSiblingSpin => Some(2),
             _ => None,
         }
@@ -3488,11 +3528,11 @@ pub struct WorkloadConfig {
     /// [`ResolvedAffinity::Random`] — sampling deferred per-worker
     /// at spawn time) are accepted at [`WorkloadHandle::spawn`].
     /// Topology-aware variants (`SingleCpu`, `LlcAligned`,
-    /// `CrossCgroup`) require scenario context and are rejected
-    /// with an actionable diagnostic. Type-unified with
-    /// [`WorkSpec::affinity`] so a test author writes the same
-    /// affinity expression at the top level and inside `composed`
-    /// entries.
+    /// `CrossCgroup`, `SmtSiblingPair`) require scenario context
+    /// and are rejected with an actionable diagnostic.
+    /// Type-unified with [`WorkSpec::affinity`] so a test author
+    /// writes the same affinity expression at the top level and
+    /// inside `composed` entries.
     pub affinity: AffinityIntent,
     /// What each worker does.
     pub work_type: WorkType,
@@ -3589,8 +3629,8 @@ pub struct WorkloadConfig {
     /// [`AffinityIntent::RandomSubset`] (resolved to
     /// [`ResolvedAffinity::Random`] — sampling deferred per-worker
     /// at spawn time). The topology-aware variants (`SingleCpu`,
-    /// `LlcAligned`, `CrossCgroup`) are rejected because spawn()
-    /// has no access to the
+    /// `LlcAligned`, `CrossCgroup`, `SmtSiblingPair`) are rejected
+    /// because spawn() has no access to the
     /// [`crate::topology::TestTopology`] / cpuset state that the
     /// scenario engine threads in.
     ///
@@ -3634,8 +3674,8 @@ impl WorkloadConfig {
     /// At [`WorkloadHandle::spawn`], [`AffinityIntent::Inherit`],
     /// [`AffinityIntent::Exact`], and [`AffinityIntent::RandomSubset`]
     /// are accepted; topology-aware variants (`SingleCpu`,
-    /// `LlcAligned`, `CrossCgroup`) require scenario context and are
-    /// rejected.
+    /// `LlcAligned`, `CrossCgroup`, `SmtSiblingPair`) require
+    /// scenario context and are rejected.
     ///
     /// Idiomatic short form for an exact CPU set:
     /// `cfg.affinity(AffinityIntent::exact([0, 1]))`.
@@ -4846,7 +4886,8 @@ impl GroupParams {
             }
             AffinityIntent::SingleCpu
             | AffinityIntent::LlcAligned
-            | AffinityIntent::CrossCgroup => {
+            | AffinityIntent::CrossCgroup
+            | AffinityIntent::SmtSiblingPair => {
                 anyhow::bail!(
                     "{site} = {:?} requires scenario context; use \
                      AffinityIntent::Exact(set), \
@@ -12004,6 +12045,7 @@ mod tests {
             AffinityIntent::SingleCpu,
             AffinityIntent::LlcAligned,
             AffinityIntent::CrossCgroup,
+            AffinityIntent::SmtSiblingPair,
         ] {
             let err = GroupParams::resolve_spawn_affinity(
                 &variant,
@@ -12145,6 +12187,7 @@ mod tests {
             AffinityIntent::SingleCpu,
             AffinityIntent::LlcAligned,
             AffinityIntent::CrossCgroup,
+            AffinityIntent::SmtSiblingPair,
         ] {
             let label = format!("{variant:?}");
             let config = WorkloadConfig::default()

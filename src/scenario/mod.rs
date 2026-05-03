@@ -870,13 +870,22 @@ pub(crate) fn resolve_num_workers(work: &WorkSpec, default_n: usize, label: &str
     Ok(n)
 }
 
+/// Resolve an [`AffinityIntent`] to a concrete [`ResolvedAffinity`]
+/// for workers in a cgroup with the given effective cpuset.
+///
+/// Returns `Err` for [`AffinityIntent::SmtSiblingPair`] when the
+/// topology exposes no SMT-sibling pair within the effective cpuset
+/// — there is no silent fallback because running an SMT-pair
+/// workload on a non-SMT host would produce a misleading result.
+/// Every other variant succeeds (degrading to
+/// [`ResolvedAffinity::None`] when the resolved pool is empty).
 pub fn resolve_affinity_for_cgroup(
     kind: &AffinityIntent,
     cpuset: Option<&BTreeSet<usize>>,
     topo: &TestTopology,
-) -> ResolvedAffinity {
+) -> Result<ResolvedAffinity> {
     match kind {
-        AffinityIntent::Inherit => ResolvedAffinity::None,
+        AffinityIntent::Inherit => Ok(ResolvedAffinity::None),
         AffinityIntent::RandomSubset { from, count } => {
             // The pool is already resolved by the caller (typed
             // `from`). Intersect with the cgroup's cpuset if one is
@@ -896,12 +905,12 @@ pub fn resolve_affinity_for_cgroup(
                      cpuset intersection, falling back to \
                      ResolvedAffinity::None"
                 );
-                ResolvedAffinity::None
+                Ok(ResolvedAffinity::None)
             } else {
-                ResolvedAffinity::Random {
+                Ok(ResolvedAffinity::Random {
                     from: pool,
                     count: *count,
-                }
+                })
             }
         }
         AffinityIntent::LlcAligned => {
@@ -921,38 +930,102 @@ pub fn resolve_affinity_for_cgroup(
             let effective: BTreeSet<usize> = best_llc.intersection(&pool).copied().collect();
             if effective.is_empty() {
                 // All LLC CPUs outside cpuset -- fall back to inheriting cpuset.
-                ResolvedAffinity::None
+                Ok(ResolvedAffinity::None)
             } else {
-                ResolvedAffinity::Fixed(effective)
+                Ok(ResolvedAffinity::Fixed(effective))
             }
         }
         AffinityIntent::CrossCgroup => {
             // When a cpuset is active, crossing cgroup boundaries is the intent,
             // but the kernel will intersect. Use all CPUs -- the kernel enforces
             // the cpuset constraint.
-            ResolvedAffinity::Fixed(topo.all_cpuset())
+            Ok(ResolvedAffinity::Fixed(topo.all_cpuset()))
         }
         AffinityIntent::SingleCpu => {
             let pool = cpuset.cloned().unwrap_or_else(|| topo.all_cpuset());
             if let Some(&cpu) = pool.iter().next() {
-                ResolvedAffinity::SingleCpu(cpu)
+                Ok(ResolvedAffinity::SingleCpu(cpu))
             } else {
-                ResolvedAffinity::None
+                Ok(ResolvedAffinity::None)
             }
         }
         AffinityIntent::Exact(cpus) => {
             if let Some(cs) = cpuset {
                 let effective: BTreeSet<usize> = cpus.intersection(cs).copied().collect();
                 if effective.is_empty() {
-                    ResolvedAffinity::None
+                    Ok(ResolvedAffinity::None)
                 } else {
-                    ResolvedAffinity::Fixed(effective)
+                    Ok(ResolvedAffinity::Fixed(effective))
                 }
             } else {
-                ResolvedAffinity::Fixed(cpus.clone())
+                Ok(ResolvedAffinity::Fixed(cpus.clone()))
+            }
+        }
+        AffinityIntent::SmtSiblingPair => resolve_smt_sibling_pair(cpuset, topo),
+    }
+}
+
+/// Resolve [`AffinityIntent::SmtSiblingPair`] against the cgroup's
+/// effective cpuset.
+///
+/// Walks every LLC's per-core sibling map looking for a physical
+/// core whose SMT siblings are all present in the pool (cgroup's
+/// cpuset, or the full topology when no cpuset is active). Returns
+/// the first matching pair as [`ResolvedAffinity::Fixed`] containing
+/// the two sibling CPU IDs.
+///
+/// Returns `Err` when no core has 2+ siblings in the pool —
+/// `threads_per_core == 1` (SMT disabled or non-SMT host), the
+/// cpuset isolates each sibling onto a different cgroup, or the
+/// topology was constructed without per-core sibling data
+/// (`LlcInfo::cores` empty — see [`TestTopology::synthetic`]). The
+/// error path is explicit, not a silent fallback, because
+/// [`WorkType::SmtSiblingSpin`] and other paired-on-siblings
+/// workloads produce meaningless results without true SMT
+/// contention.
+///
+/// All workers in the group resolve to the same 2-CPU set; for
+/// `num_workers == 2` the kernel runs one worker on each sibling,
+/// which is the contention pattern this intent targets. For
+/// `num_workers > 2` (multiple pairs in one group) every worker
+/// shares the same pair — the kernel time-slices them, which
+/// approximates pair contention but does not place each pair on
+/// distinct cores. Strict per-pair distribution across cores
+/// requires per-worker affinity that the current
+/// [`ResolvedAffinity`] model does not express; track via a
+/// follow-up if a test author needs it.
+///
+/// [`WorkType::SmtSiblingSpin`]: crate::workload::WorkType::SmtSiblingSpin
+/// [`AffinityIntent::SmtSiblingPair`]: crate::workload::AffinityIntent::SmtSiblingPair
+fn resolve_smt_sibling_pair(
+    cpuset: Option<&BTreeSet<usize>>,
+    topo: &TestTopology,
+) -> Result<ResolvedAffinity> {
+    let pool = cpuset.cloned().unwrap_or_else(|| topo.all_cpuset());
+    for llc in topo.llcs() {
+        for siblings in llc.cores().values() {
+            // Take the first two sibling CPUs that are both in the
+            // pool. `cores()` is sorted; pairing the lowest two
+            // present siblings gives a deterministic choice for a
+            // given (topology, cpuset) input.
+            let mut iter = siblings.iter().copied().filter(|cpu| pool.contains(cpu));
+            if let (Some(a), Some(b)) = (iter.next(), iter.next()) {
+                let pair: BTreeSet<usize> = [a, b].into_iter().collect();
+                return Ok(ResolvedAffinity::Fixed(pair));
             }
         }
     }
+    anyhow::bail!(
+        "AffinityIntent::SmtSiblingPair requires a physical core with at \
+         least two SMT siblings present in the effective cpuset. The \
+         current topology and cpuset expose no such pair — \
+         threads_per_core may be 1 (SMT disabled or non-SMT host), the \
+         cpuset may have isolated each sibling onto a different cgroup, \
+         or the topology was built without per-core sibling data. \
+         Switch to a different AffinityIntent for non-SMT scheduling \
+         tests, or run on a host whose VM topology has \
+         threads_per_core >= 2.",
+    );
 }
 
 /// Resolve an [`AffinityIntent`] for direct storage in
@@ -983,12 +1056,18 @@ pub fn resolve_affinity_for_cgroup(
 /// [`AffinityIntent::Inherit`] so the spawn-time gate does not see a
 /// pre-resolved empty mask. This matches the spawn-side
 /// `resolve_affinity` policy that emits no affinity for an empty pool.
+///
+/// Returns `Err` when the inner [`resolve_affinity_for_cgroup`] does —
+/// today only [`AffinityIntent::SmtSiblingPair`] errors, when the
+/// effective cpuset exposes no SMT-sibling pair.
 pub(crate) fn intent_for_spawn(
     kind: &AffinityIntent,
     cpuset: Option<&BTreeSet<usize>>,
     topo: &TestTopology,
-) -> AffinityIntent {
-    flatten_for_spawn(resolve_affinity_for_cgroup(kind, cpuset, topo))
+) -> Result<AffinityIntent> {
+    Ok(flatten_for_spawn(resolve_affinity_for_cgroup(
+        kind, cpuset, topo,
+    )?))
 }
 
 fn flatten_for_spawn(resolved: ResolvedAffinity) -> AffinityIntent {
@@ -1184,7 +1263,7 @@ mod tests {
     fn resolve_affinity_inherit() {
         let t = crate::topology::TestTopology::synthetic(8, 2);
         assert!(matches!(
-            resolve_affinity_for_cgroup(&AffinityIntent::Inherit, None, &t),
+            resolve_affinity_for_cgroup(&AffinityIntent::Inherit, None, &t).unwrap(),
             ResolvedAffinity::None
         ));
     }
@@ -1192,7 +1271,7 @@ mod tests {
     #[test]
     fn resolve_affinity_single_cpu() {
         let t = crate::topology::TestTopology::synthetic(8, 2);
-        match resolve_affinity_for_cgroup(&AffinityIntent::SingleCpu, None, &t) {
+        match resolve_affinity_for_cgroup(&AffinityIntent::SingleCpu, None, &t).unwrap() {
             ResolvedAffinity::SingleCpu(c) => assert_eq!(c, 0),
             other => panic!("expected SingleCpu, got {:?}", other),
         }
@@ -1201,7 +1280,7 @@ mod tests {
     #[test]
     fn resolve_affinity_cross_cgroup() {
         let t = crate::topology::TestTopology::synthetic(8, 2);
-        match resolve_affinity_for_cgroup(&AffinityIntent::CrossCgroup, None, &t) {
+        match resolve_affinity_for_cgroup(&AffinityIntent::CrossCgroup, None, &t).unwrap() {
             ResolvedAffinity::Fixed(cpus) => assert_eq!(cpus.len(), 8),
             other => panic!("expected Fixed, got {:?}", other),
         }
@@ -1212,7 +1291,7 @@ mod tests {
         let t = crate::topology::TestTopology::synthetic(8, 2);
         // No cpuset: both LLCs cover the full pool equally. LLC 0
         // is found first with max overlap, so result is LLC 0 CPUs.
-        match resolve_affinity_for_cgroup(&AffinityIntent::LlcAligned, None, &t) {
+        match resolve_affinity_for_cgroup(&AffinityIntent::LlcAligned, None, &t).unwrap() {
             ResolvedAffinity::Fixed(cpus) => assert_eq!(cpus, [0, 1, 2, 3].into_iter().collect()),
             other => panic!("expected Fixed, got {:?}", other),
         }
@@ -1226,7 +1305,8 @@ mod tests {
             [0, 1, 2, 3].into_iter().collect(),
             [4, 5, 6, 7].into_iter().collect(),
         ];
-        match resolve_affinity_for_cgroup(&AffinityIntent::LlcAligned, cpusets.get(1), &t) {
+        match resolve_affinity_for_cgroup(&AffinityIntent::LlcAligned, cpusets.get(1), &t).unwrap()
+        {
             ResolvedAffinity::Fixed(cpus) => assert_eq!(cpus, [4, 5, 6, 7].into_iter().collect()),
             other => panic!("expected Fixed, got {:?}", other),
         }
@@ -1240,8 +1320,8 @@ mod tests {
         // intersects with the cgroup's cpuset so the effective sample
         // pool stays within the cgroup's CPU budget. Sample size
         // is half the cpuset (`(pool.len() / 2).max(1)`).
-        let intent = AffinityIntent::random_subset(t.all_cpus().iter().copied(),2);
-        match resolve_affinity_for_cgroup(&intent, cpusets.first(), &t) {
+        let intent = AffinityIntent::random_subset(t.all_cpus().iter().copied(), 2);
+        match resolve_affinity_for_cgroup(&intent, cpusets.first(), &t).unwrap() {
             ResolvedAffinity::Random { from, count } => {
                 assert_eq!(from, cpusets[0]);
                 assert_eq!(count, 2); // half of 4
@@ -1264,8 +1344,8 @@ mod tests {
     fn resolve_affinity_random_no_cpusets() {
         let t = crate::topology::TestTopology::synthetic(8, 2);
         // No cgroup cpuset → pool is the caller-supplied set verbatim.
-        let intent = AffinityIntent::random_subset(t.all_cpus().iter().copied(),4);
-        match resolve_affinity_for_cgroup(&intent, None, &t) {
+        let intent = AffinityIntent::random_subset(t.all_cpus().iter().copied(), 4);
+        match resolve_affinity_for_cgroup(&intent, None, &t).unwrap() {
             ResolvedAffinity::Random { from, count } => {
                 assert_eq!(from.len(), 8); // all CPUs
                 assert_eq!(count, 4); // half
@@ -1284,8 +1364,8 @@ mod tests {
         // the intersection and the resolver short-circuits.
         let t = crate::topology::TestTopology::synthetic(4, 1);
         let empty: BTreeSet<usize> = BTreeSet::new();
-        let intent = AffinityIntent::random_subset(t.all_cpus().iter().copied(),1);
-        match resolve_affinity_for_cgroup(&intent, Some(&empty), &t) {
+        let intent = AffinityIntent::random_subset(t.all_cpus().iter().copied(), 1);
+        match resolve_affinity_for_cgroup(&intent, Some(&empty), &t).unwrap() {
             ResolvedAffinity::None => {}
             other => panic!("expected None for empty cpuset, got {:?}", other),
         }
@@ -1305,14 +1385,116 @@ mod tests {
         // Mirror the inlined expression in run_scenario:
         let cpuset = cpusets.get(oob_idx);
         assert!(cpuset.is_none(), "OOB index must yield None cpuset");
-        let intent = AffinityIntent::random_subset(t.all_cpus().iter().copied(),2);
-        match resolve_affinity_for_cgroup(&intent, cpuset, &t) {
+        let intent = AffinityIntent::random_subset(t.all_cpus().iter().copied(), 2);
+        match resolve_affinity_for_cgroup(&intent, cpuset, &t).unwrap() {
             ResolvedAffinity::Random { from, count } => {
                 assert_eq!(from.len(), 4, "OOB idx falls back to full topology");
                 assert_eq!(count, 2);
             }
             other => panic!("expected Random with full pool, got {:?}", other),
         }
+    }
+
+    /// `SmtSiblingPair` resolves to a 2-CPU `Fixed` set drawn from
+    /// the first physical core whose siblings live inside the
+    /// effective cpuset. The sequential VM topology constructor
+    /// numbers core `c` of LLC `l` with siblings at
+    /// `(l*cores_per_llc + c) * threads_per_core ..`, so a
+    /// `(1 numa, 1 llc, 2 cores, 2 threads)` topology produces
+    /// core 0's pair `{0, 1}` first.
+    #[test]
+    fn resolve_affinity_smt_sibling_pair_uses_first_core() {
+        let vmt = crate::vmm::topology::Topology::new(1, 1, 2, 2);
+        let t = crate::topology::TestTopology::from_vm_topology(&vmt);
+        match resolve_affinity_for_cgroup(&AffinityIntent::SmtSiblingPair, None, &t).unwrap() {
+            ResolvedAffinity::Fixed(cpus) => {
+                assert_eq!(
+                    cpus,
+                    [0usize, 1].into_iter().collect(),
+                    "SmtSiblingPair must pick the first core's siblings"
+                );
+            }
+            other => panic!("expected Fixed({{0, 1}}), got {:?}", other),
+        }
+    }
+
+    /// When the cpuset excludes one of core 0's siblings, the
+    /// resolver must skip that core and look for another core whose
+    /// siblings are both present. With 2 cores per LLC and a cpuset
+    /// of `{2, 3}`, core 1's pair `{2, 3}` is selected.
+    #[test]
+    fn resolve_affinity_smt_sibling_pair_skips_partial_cores() {
+        let vmt = crate::vmm::topology::Topology::new(1, 1, 2, 2);
+        let t = crate::topology::TestTopology::from_vm_topology(&vmt);
+        let cpuset: BTreeSet<usize> = [2usize, 3].into_iter().collect();
+        match resolve_affinity_for_cgroup(&AffinityIntent::SmtSiblingPair, Some(&cpuset), &t)
+            .unwrap()
+        {
+            ResolvedAffinity::Fixed(cpus) => {
+                assert_eq!(
+                    cpus,
+                    [2usize, 3].into_iter().collect(),
+                    "SmtSiblingPair must skip core 0 when cpuset excludes one of its \
+                     siblings and pick the next eligible pair"
+                );
+            }
+            other => panic!("expected Fixed({{2, 3}}), got {:?}", other),
+        }
+    }
+
+    /// `threads_per_core == 1` means no SMT. The resolver must
+    /// return an explicit error rather than silently degrading to
+    /// `None` — running an SMT-pair workload without true SMT
+    /// produces a misleading test result.
+    #[test]
+    fn resolve_affinity_smt_sibling_pair_errors_without_smt() {
+        let vmt = crate::vmm::topology::Topology::new(1, 1, 4, 1);
+        let t = crate::topology::TestTopology::from_vm_topology(&vmt);
+        let err = resolve_affinity_for_cgroup(&AffinityIntent::SmtSiblingPair, None, &t)
+            .expect_err("threads_per_core=1 must produce an error, not silent fallback");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("SmtSiblingPair"),
+            "diagnostic must name the variant, got: {msg}"
+        );
+        assert!(
+            msg.contains("two SMT siblings"),
+            "diagnostic must explain the missing precondition, got: {msg}"
+        );
+    }
+
+    /// When the cpuset isolates each sibling onto a different
+    /// cgroup (e.g. `{0, 2}` keeps one sibling from each core but
+    /// no full pair), the resolver must error rather than silently
+    /// producing a 1-CPU set.
+    #[test]
+    fn resolve_affinity_smt_sibling_pair_errors_when_cpuset_breaks_pairs() {
+        let vmt = crate::vmm::topology::Topology::new(1, 1, 2, 2);
+        let t = crate::topology::TestTopology::from_vm_topology(&vmt);
+        let cpuset: BTreeSet<usize> = [0usize, 2].into_iter().collect();
+        let err = resolve_affinity_for_cgroup(&AffinityIntent::SmtSiblingPair, Some(&cpuset), &t)
+            .expect_err("cpuset that breaks every sibling pair must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("SmtSiblingPair"),
+            "diagnostic must name the variant, got: {msg}"
+        );
+    }
+
+    /// `TestTopology::synthetic` builds an empty per-core sibling
+    /// map (no SMT info), so `SmtSiblingPair` must error there as
+    /// well — the resolver depends on `LlcInfo::cores`, not on the
+    /// raw CPU list.
+    #[test]
+    fn resolve_affinity_smt_sibling_pair_errors_on_synthetic_topology() {
+        let t = crate::topology::TestTopology::synthetic(8, 2);
+        let err = resolve_affinity_for_cgroup(&AffinityIntent::SmtSiblingPair, None, &t)
+            .expect_err("synthetic topology has no per-core sibling data — must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("SmtSiblingPair"),
+            "diagnostic must name the variant, got: {msg}"
+        );
     }
 
     #[test]
@@ -1572,7 +1754,8 @@ mod tests {
         let t = crate::topology::TestTopology::synthetic(4, 1);
         // Cpuset restricts to CPUs {2,3}: SingleCpu picks first in cpuset.
         let cpusets: Vec<BTreeSet<usize>> = vec![[2, 3].into_iter().collect()];
-        match resolve_affinity_for_cgroup(&AffinityIntent::SingleCpu, cpusets.first(), &t) {
+        match resolve_affinity_for_cgroup(&AffinityIntent::SingleCpu, cpusets.first(), &t).unwrap()
+        {
             ResolvedAffinity::SingleCpu(c) => assert_eq!(c, 2),
             other => panic!("expected SingleCpu, got {:?}", other),
         }
@@ -1585,7 +1768,8 @@ mod tests {
         // LLC 0 = {0,1,2,3}, LLC 1 = {4,5,6,7}.
         // Cpuset = {3, 4, 5, 6, 7}: LLC 1 has 4 CPUs in cpuset, LLC 0 has 1.
         let cpusets: Vec<BTreeSet<usize>> = vec![[3, 4, 5, 6, 7].into_iter().collect()];
-        match resolve_affinity_for_cgroup(&AffinityIntent::LlcAligned, cpusets.first(), &t) {
+        match resolve_affinity_for_cgroup(&AffinityIntent::LlcAligned, cpusets.first(), &t).unwrap()
+        {
             ResolvedAffinity::Fixed(cpus) => {
                 // LLC 1 has best overlap; result is intersection {4,5,6,7}.
                 assert_eq!(cpus, [4, 5, 6, 7].into_iter().collect());
@@ -1937,17 +2121,23 @@ mod tests {
     /// `RandomSubset` degrades to `Inherit`.
     #[test]
     fn intent_for_spawn_full_pipeline() {
-        let t = crate::topology::TestTopology::synthetic(8, 2);
+        // Use a real VM topology so the per-LLC sibling map is
+        // populated — `synthetic` leaves `LlcInfo::cores` empty,
+        // which forces the SmtSiblingPair arm into its no-SMT
+        // error branch. `Topology::new(numa, llcs, cores, threads)`
+        // with threads=2 produces 2 SMT siblings per core.
+        let vmt = crate::vmm::topology::Topology::new(1, 2, 2, 2);
+        let t = crate::topology::TestTopology::from_vm_topology(&vmt);
 
         // Inherit → Inherit
-        let out = intent_for_spawn(&AffinityIntent::Inherit, None, &t);
+        let out = intent_for_spawn(&AffinityIntent::Inherit, None, &t).unwrap();
         assert!(
             matches!(out, AffinityIntent::Inherit),
             "Inherit must round-trip, got {out:?}"
         );
 
         // SingleCpu → Exact({some_cpu})
-        let out = intent_for_spawn(&AffinityIntent::SingleCpu, None, &t);
+        let out = intent_for_spawn(&AffinityIntent::SingleCpu, None, &t).unwrap();
         match out {
             AffinityIntent::Exact(set) => {
                 assert_eq!(set.len(), 1, "SingleCpu flattens to a 1-CPU Exact set");
@@ -1956,7 +2146,7 @@ mod tests {
         }
 
         // CrossCgroup → Exact(<all CPUs>)
-        let out = intent_for_spawn(&AffinityIntent::CrossCgroup, None, &t);
+        let out = intent_for_spawn(&AffinityIntent::CrossCgroup, None, &t).unwrap();
         match out {
             AffinityIntent::Exact(set) => {
                 assert_eq!(set.len(), 8, "CrossCgroup flattens to all-CPU Exact set");
@@ -1964,10 +2154,27 @@ mod tests {
             other => panic!("expected Exact, got {other:?}"),
         }
 
+        // SmtSiblingPair → Exact({sibling_a, sibling_b})
+        let out = intent_for_spawn(&AffinityIntent::SmtSiblingPair, None, &t).unwrap();
+        match out {
+            AffinityIntent::Exact(set) => {
+                assert_eq!(set.len(), 2, "SmtSiblingPair flattens to a 2-CPU Exact set");
+                // First core's siblings are CPUs 0 and 1 in the
+                // sequential VM topology (cores 0..2 within LLC 0:
+                // core 0 = {0, 1}, core 1 = {2, 3}).
+                assert_eq!(
+                    set,
+                    [0usize, 1].into_iter().collect(),
+                    "SmtSiblingPair must pick the first core's siblings"
+                );
+            }
+            other => panic!("expected Exact, got {other:?}"),
+        }
+
         // RandomSubset with valid pool → RandomSubset round-trip
         let pool: BTreeSet<usize> = [0usize, 1, 2, 3].into_iter().collect();
         let intent = AffinityIntent::random_subset(pool.iter().copied(), 2);
-        let out = intent_for_spawn(&intent, None, &t);
+        let out = intent_for_spawn(&intent, None, &t).unwrap();
         match out {
             AffinityIntent::RandomSubset { from, count } => {
                 assert_eq!(from, pool, "RandomSubset.from must round-trip");
@@ -1981,7 +2188,7 @@ mod tests {
         // Inherit).
         let empty_cpuset: BTreeSet<usize> = BTreeSet::new();
         let intent = AffinityIntent::random_subset(t.all_cpus().iter().copied(), 1);
-        let out = intent_for_spawn(&intent, Some(&empty_cpuset), &t);
+        let out = intent_for_spawn(&intent, Some(&empty_cpuset), &t).unwrap();
         assert!(
             matches!(out, AffinityIntent::Inherit),
             "RandomSubset with empty cpuset intersection must flatten \

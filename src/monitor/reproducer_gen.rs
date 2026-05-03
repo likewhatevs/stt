@@ -500,6 +500,7 @@ fn render_affinity(a: &AffinityIntent) -> String {
         AffinityIntent::SingleCpu => "AffinityIntent::SingleCpu".into(),
         AffinityIntent::LlcAligned => "AffinityIntent::LlcAligned".into(),
         AffinityIntent::CrossCgroup => "AffinityIntent::CrossCgroup".into(),
+        AffinityIntent::SmtSiblingPair => "AffinityIntent::SmtSiblingPair".into(),
         AffinityIntent::RandomSubset { from, count } => {
             let cpus: Vec<String> = from.iter().map(|c| c.to_string()).collect();
             format!(

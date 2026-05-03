@@ -2810,7 +2810,7 @@ fn apply_setup(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, defs: &[CgroupDef])
                 &work.affinity,
                 cgroup_cpuset.as_ref(),
                 ctx.topo,
-            );
+            )?;
             let wl = WorkloadConfig {
                 num_workers: n,
                 affinity,
@@ -3007,7 +3007,7 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                     &work.affinity,
                     cgroup_cpuset.as_ref(),
                     ctx.topo,
-                );
+                )?;
                 let wl = WorkloadConfig {
                     num_workers: n,
                     affinity,
@@ -3048,7 +3048,7 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
             Op::SetAffinity { cgroup, affinity } => {
                 let cgroup_cpuset: Option<BTreeSet<usize>> = state.lookup_cpuset(cgroup).cloned();
                 let resolved =
-                    super::resolve_affinity_for_cgroup(affinity, cgroup_cpuset.as_ref(), ctx.topo);
+                    super::resolve_affinity_for_cgroup(affinity, cgroup_cpuset.as_ref(), ctx.topo)?;
                 for (name, handle) in state.all_handles() {
                     if name.as_str() == *cgroup {
                         match &resolved {
@@ -3097,7 +3097,7 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                     anyhow::bail!("SpawnHost: {}", reason);
                 }
                 let n = super::resolve_num_workers(work, ctx.workers_per_cgroup, "<host>")?;
-                let affinity = super::intent_for_spawn(&work.affinity, None, ctx.topo);
+                let affinity = super::intent_for_spawn(&work.affinity, None, ctx.topo)?;
                 let wl = WorkloadConfig {
                     num_workers: n,
                     affinity,
