@@ -539,6 +539,7 @@ const KTSTR_DISK_DEFAULT: ktstr::prelude::DiskConfig =
         },
         read_only: false,
         name: None,
+        no_auto_mount: false,
     };
 
 const KTSTR_DISK_READ_ONLY: ktstr::prelude::DiskConfig =
@@ -553,6 +554,7 @@ const KTSTR_DISK_READ_ONLY: ktstr::prelude::DiskConfig =
         },
         read_only: true,
         name: None,
+        no_auto_mount: false,
     };
 
 /// Boot the VM with a default-configured virtio-blk disk and assert

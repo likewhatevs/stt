@@ -196,6 +196,17 @@ pub struct DiskConfig {
     /// (e.g. `"data"`, `"log"`) instead of by index, which keeps
     /// tests stable across topology rearrangements.
     pub name: Option<String>,
+    /// Opt out of guest-side auto-mount. Default `false` means a
+    /// non-`Raw` disk is auto-mounted at `/mnt/disk0` by the guest
+    /// init (see
+    /// [`crate::vmm::rust_init::auto_mount_data_disks`]); setting
+    /// `true` suppresses the auto-mount cmdline tokens and leaves
+    /// `/dev/vda` raw to the test author. Has no effect for
+    /// `Filesystem::Raw` disks (there is nothing to mount). The
+    /// only honest reason to flip this is a test that wants to
+    /// drive the mount path itself (e.g. exercise mount-option
+    /// fuzzing or fail-injection on the kernel mount syscall).
+    pub no_auto_mount: bool,
 }
 
 impl Default for DiskConfig {
@@ -221,6 +232,7 @@ impl Default for DiskConfig {
             throttle: DiskThrottle::default(),
             read_only: false,
             name: None,
+            no_auto_mount: false,
         }
     }
 }
@@ -338,10 +350,48 @@ impl DiskConfig {
     /// attached) can resolve the name instead of relying on
     /// attachment order. Default is anonymous (`None`); calling
     /// `.name(...)` sets it.
+    ///
+    /// The name also drives the guest auto-mount path: a disk
+    /// named `"data"` auto-mounts at `/mnt/data` instead of the
+    /// default `/mnt/disk0`. See [`Self::no_auto_mount`] to opt
+    /// out of auto-mount entirely.
     #[must_use = "builder methods consume self; bind the result"]
     pub fn name(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
         self
+    }
+
+    /// Suppress the guest-side auto-mount of this disk. Default
+    /// behavior auto-mounts a non-`Raw` disk at the path returned
+    /// by [`Self::auto_mount_path`]; calling this method flips
+    /// the flag on. Useful for tests that want raw access to
+    /// `/dev/vda` after a host-driven mkfs (e.g. mount-option
+    /// fuzzing, deliberate mount-failure injection, manual
+    /// subvolume traversal).
+    ///
+    /// No-op for `Filesystem::Raw` disks (there is nothing to
+    /// mount). The flag is honored at cmdline-emission time in
+    /// [`crate::vmm::KtstrVmBuilder::build`]: when set, the
+    /// `KTSTR_DISK0_FS` / `KTSTR_DISK0_MOUNT` / `KTSTR_DISK0_RO`
+    /// tokens are not emitted, and the guest's
+    /// [`crate::vmm::rust_init::auto_mount_data_disks`] short-
+    /// circuits at the missing-token check.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn no_auto_mount(mut self) -> Self {
+        self.no_auto_mount = true;
+        self
+    }
+
+    /// Resolve the guest-side mount path for this disk. Returns
+    /// `/mnt/<name>` when [`Self::name`] is set, `/mnt/disk0`
+    /// otherwise. Used by the cmdline emission to populate the
+    /// `KTSTR_DISK0_MOUNT` token consumed by the guest's
+    /// [`crate::vmm::rust_init::auto_mount_data_disks`].
+    pub(crate) fn auto_mount_path(&self) -> String {
+        match self.name.as_deref() {
+            Some(n) => format!("/mnt/{n}"),
+            None => "/mnt/disk0".to_string(),
+        }
     }
 
     /// Capacity in bytes (`capacity_mb << 20`). Used by the device
@@ -496,6 +546,7 @@ mod tests {
             },
             read_only: true,
             name: Some("data-disk".to_string()),
+            no_auto_mount: false,
         };
 
         let json = serde_json::to_string(&original).expect("serialize DiskConfig");
@@ -746,6 +797,55 @@ mod tests {
             err.contains("bytes_burst_capacity") && err.contains("must be >="),
             "unexpected error message: {err}"
         );
+    }
+
+    /// Off-by-one boundary: `burst == rate - 1` must be rejected. Pins
+    /// the strict `<` vs `<=` direction of the validate predicate
+    /// against a future flip that would silently accept a steady-state
+    /// rate one below the configured value.
+    #[test]
+    fn validate_rejects_burst_one_below_rate() {
+        let err = DiskConfig::default()
+            .iops(1_000)
+            .iops_burst_capacity(999)
+            .throttle
+            .validate()
+            .expect_err("iops burst one below rate must be rejected");
+        assert!(
+            err.contains("iops_burst_capacity") && err.contains("must be >="),
+            "unexpected error message: {err}"
+        );
+
+        let err = DiskConfig::default()
+            .bytes_per_sec(1_000)
+            .bytes_burst_capacity(999)
+            .throttle
+            .validate()
+            .expect_err("bytes burst one below rate must be rejected");
+        assert!(
+            err.contains("bytes_burst_capacity") && err.contains("must be >="),
+            "unexpected error message: {err}"
+        );
+    }
+
+    /// Builder chain that sets a rate and burst then clears the rate
+    /// via `iops(0)` must validate clean — clearing the rate also
+    /// clears the matching burst (per the [`DiskConfig::iops`]
+    /// auto-clear contract), so the resulting throttle is fully
+    /// unthrottled and validate rejects nothing. Distinct from
+    /// `clearing_rate_leaves_throttle_validate_clean` (which clears
+    /// both rates simultaneously); this one isolates the iops-only
+    /// clear path so a regression in just one auto-clear branch
+    /// surfaces here.
+    #[test]
+    fn iops_clear_after_burst_set_validates_clean() {
+        DiskConfig::default()
+            .iops(1_000)
+            .iops_burst_capacity(5_000)
+            .iops(0)
+            .throttle
+            .validate()
+            .expect("iops-cleared throttle must validate clean");
     }
 
     #[test]

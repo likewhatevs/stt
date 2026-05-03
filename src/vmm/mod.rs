@@ -1112,6 +1112,44 @@ impl ImmediateExitHandle {
 /// (1000/HZ ms), which is the kernel's own arithmetic precision.
 ///
 /// Two call sites today: the freeze coordinator's
+/// Build the auto-mount cmdline tokens for one disk. Returns an
+/// empty string when no auto-mount is requested (Raw filesystem,
+/// or `no_auto_mount` opt-out); otherwise returns the
+/// space-prefixed `KTSTR_DISK0_FS=... KTSTR_DISK0_MOUNT=...`
+/// pair, with `KTSTR_DISK0_RO=1` appended when `read_only` is
+/// set.
+///
+/// Free fn so cfg(test) unit tests cover all branches without
+/// driving a full `KtstrVmBuilder::build` call.
+///
+/// Token contract (consumed by
+/// [`crate::vmm::rust_init::auto_mount_data_disks`]):
+/// * `KTSTR_DISK0_FS=<cache_tag>` — fstype string for the
+///   `mount(2)` syscall. Reuses `Filesystem::cache_tag()` so the
+///   on-disk-format identifier and the cmdline value stay in
+///   lockstep.
+/// * `KTSTR_DISK0_MOUNT=<path>` — guest-side mount point. Driven
+///   by `DiskConfig::auto_mount_path` (`/mnt/<name>` when
+///   `name` is set, `/mnt/disk0` otherwise).
+/// * `KTSTR_DISK0_RO=1` — emitted only when `read_only` is set
+///   (matches the host-side virtio-blk F_RO advertisement). The
+///   guest sets `MS_RDONLY` proactively rather than letting the
+///   kernel fail with -EROFS when bdev RO meets RW mount.
+fn disk_auto_mount_cmdline_tokens(disk: &disk_config::DiskConfig) -> String {
+    if disk.filesystem == disk_config::Filesystem::Raw || disk.no_auto_mount {
+        return String::new();
+    }
+    let mut s = format!(
+        " KTSTR_DISK0_FS={} KTSTR_DISK0_MOUNT={}",
+        disk.filesystem.cache_tag(),
+        disk.auto_mount_path(),
+    );
+    if disk.read_only {
+        s.push_str(" KTSTR_DISK0_RO=1");
+    }
+    s
+}
+
 /// `half_threshold_jiffies` (compares against scanned per-task
 /// runnable-age in jiffies) and the `watchdog_override` setup
 /// (writes a jiffies count into `scx_sched.watchdog_timeout` in
@@ -3391,15 +3429,7 @@ impl KtstrVm {
             // one place (the `cache_tag` match in disk_config.rs)
             // and the cmdline / mount automatically follow.
             let disk = &self.disks[0];
-            if disk.filesystem != disk_config::Filesystem::Raw {
-                cmdline.push_str(&format!(
-                    " KTSTR_DISK0_FS={}",
-                    disk.filesystem.cache_tag(),
-                ));
-                if disk.read_only {
-                    cmdline.push_str(" KTSTR_DISK0_RO=1");
-                }
-            }
+            cmdline.push_str(&disk_auto_mount_cmdline_tokens(disk));
         }
         if self.shm_size > 0 {
             let mem_size = (memory_mb as u64) << 20;

@@ -1074,7 +1074,15 @@ fn auto_mount_data_disks() {
     // contract simple and aligned with the host-side emission
     // (`KTSTR_DISK0_RO=1`).
     let ro = cmdline_val("KTSTR_DISK0_RO").as_deref() == Some("1");
-    let mount_point = "/mnt/disk0";
+    // Mount path. The host emits `KTSTR_DISK0_MOUNT=<path>` based
+    // on `DiskConfig.name` — `/mnt/<name>` when set, `/mnt/disk0`
+    // otherwise. Fall back to the default if the host-side value
+    // is absent so a future host that emits FS but not MOUNT
+    // (e.g. an older binary against a newer kernel) still mounts
+    // somewhere sane rather than failing.
+    let mount_point_owned = cmdline_val("KTSTR_DISK0_MOUNT")
+        .unwrap_or_else(|| "/mnt/disk0".to_string());
+    let mount_point = mount_point_owned.as_str();
     mkdir_p(mount_point);
     let flags = if ro { MsFlags::MS_RDONLY } else { MsFlags::empty() };
     let result = mount(

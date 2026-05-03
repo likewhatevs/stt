@@ -875,6 +875,7 @@ mod tests {
     #[test]
     fn affinity_hint_resolved_payload_roundtrips() {
         let hints = [
+            AffinityHint::Inherit,
             AffinityHint::SingleCpu { cpus: Vec::new() },
             AffinityHint::SingleCpu { cpus: vec![3] },
             AffinityHint::LlcAligned { cpus: Vec::new() },
@@ -883,6 +884,7 @@ mod tests {
             AffinityHint::CrossCgroup { cpus: vec![4, 5, 6, 7] },
             AffinityHint::SmtSiblingPair { cpus: Vec::new() },
             AffinityHint::SmtSiblingPair { cpus: vec![2, 3] },
+            AffinityHint::Exact { cpus: vec![0, 1, 2, 3] },
             AffinityHint::RandomSubset {
                 from: Vec::new(),
                 count: 0,
@@ -897,6 +899,7 @@ mod tests {
             let back: AffinityHint =
                 serde_json::from_str(&json).expect("AffinityHint must deserialize");
             match (hint, &back) {
+                (AffinityHint::Inherit, AffinityHint::Inherit) => {}
                 (
                     AffinityHint::SingleCpu { cpus: a },
                     AffinityHint::SingleCpu { cpus: b },
@@ -913,6 +916,10 @@ mod tests {
                     AffinityHint::SmtSiblingPair { cpus: a },
                     AffinityHint::SmtSiblingPair { cpus: b },
                 ) => assert_eq!(a, b, "SmtSiblingPair cpus must round-trip"),
+                (
+                    AffinityHint::Exact { cpus: a },
+                    AffinityHint::Exact { cpus: b },
+                ) => assert_eq!(a, b, "Exact cpus must round-trip"),
                 (
                     AffinityHint::RandomSubset {
                         from: pa,
