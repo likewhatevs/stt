@@ -14641,6 +14641,133 @@ mod tests {
         );
     }
 
+    /// Table-driven JSON roundtrip for every entry in
+    /// [`WorkType::ALL_NAMES`] that [`WorkType::from_name`] can
+    /// construct with default parameters. The single iteration form
+    /// catches three regression classes a per-variant test would
+    /// miss:
+    ///
+    /// - A new variant added without a `from_name` default arm: the
+    ///   `name` lands in [`WorkType::ALL_NAMES`] (driven by the
+    ///   `strum::VariantNames` derive on the enum) but `from_name`
+    ///   returns `None`. The walk asserts that every name except
+    ///   the two documented exceptions (`Sequence`, `Custom`) is
+    ///   constructible.
+    /// - A variant whose serialized JSON does not deserialize back
+    ///   to the same shape — e.g. a missing `#[serde(rename)]`,
+    ///   a Duration field that lost its `humantime_serde_helper`
+    ///   wrapper, or a default that drifted between `from_name` and
+    ///   the enum's struct-literal form. Each name is serialized,
+    ///   deserialized, and re-serialized; the second JSON string
+    ///   must equal the first.
+    /// - A renaming of the enum's wire form (snake_case key) that
+    ///   silently drops `from_name`'s lookup. Re-serializing the
+    ///   `from_name` output and comparing the two strings catches
+    ///   this without a hard-coded JSON literal per variant — those
+    ///   live in [`workload_enums_use_snake_case_wire_format`] for
+    ///   the unit-form variants.
+    ///
+    /// `Sequence` is excluded from the `from_name` walk because
+    /// `from_name` deliberately refuses to construct it (it has no
+    /// natural default — phases are mandatory). The `Sequence` arm
+    /// is exercised by an explicit struct-literal at the end of the
+    /// test so the test still covers every WorkType variant by
+    /// kind, not just by `from_name`-reachability. `Custom` is
+    /// `#[serde(skip)]` and covered by
+    /// [`worktype_custom_serialize_errors_skipped_variant`].
+    ///
+    /// Comparison uses re-serialized JSON strings rather than
+    /// `PartialEq` because `WorkType` does not derive `PartialEq`
+    /// (its `Custom` variant carries a non-comparable `fn`
+    /// pointer). The same pattern is used in
+    /// [`workload_config_default_roundtrips`] below.
+    #[test]
+    fn worktype_serde_roundtrip_table_driven() {
+        // `Sequence` and `Custom` are exempt from the from_name
+        // walk: see the doc comment for the rationale.
+        const FROM_NAME_EXCLUSIONS: &[&str] = &["Sequence", "Custom"];
+
+        let mut covered = 0;
+        let mut excluded = 0;
+        for name in WorkType::ALL_NAMES {
+            if FROM_NAME_EXCLUSIONS.contains(name) {
+                excluded += 1;
+                continue;
+            }
+            let wt = WorkType::from_name(name).unwrap_or_else(|| {
+                panic!(
+                    "WorkType::from_name({name:?}) returned None — every \
+                     name in ALL_NAMES outside the documented exclusions \
+                     must have a from_name arm"
+                )
+            });
+            let json = serde_json::to_string(&wt).unwrap_or_else(|e| {
+                panic!("serialize {name:?} failed: {e}")
+            });
+            let back: WorkType = serde_json::from_str(&json).unwrap_or_else(|e| {
+                panic!("deserialize {name:?} failed: {e}; json was {json}")
+            });
+            let json2 = serde_json::to_string(&back).unwrap_or_else(|e| {
+                panic!("re-serialize {name:?} failed after roundtrip: {e}")
+            });
+            assert_eq!(
+                json, json2,
+                "WorkType::{name} JSON roundtrip drift: \
+                 original={json}, after-roundtrip={json2}"
+            );
+            covered += 1;
+        }
+
+        // Every name in ALL_NAMES is accounted for: covered +
+        // excluded must equal the full list. Catches a future
+        // exclusion that was added to FROM_NAME_EXCLUSIONS but
+        // never landed in ALL_NAMES (e.g. a typo) — the loop
+        // would silently skip nothing and `excluded` would
+        // mismatch the constant length.
+        assert_eq!(
+            covered + excluded,
+            WorkType::ALL_NAMES.len(),
+            "table walk dropped variants: covered={covered}, \
+             excluded={excluded}, ALL_NAMES.len()={}",
+            WorkType::ALL_NAMES.len()
+        );
+        assert_eq!(
+            excluded,
+            FROM_NAME_EXCLUSIONS.len(),
+            "FROM_NAME_EXCLUSIONS contains {excluded} entries that \
+             were not seen in ALL_NAMES; one was likely typo'd or \
+             renamed"
+        );
+
+        // Sequence is excluded from the from_name walk; cover it
+        // here with an explicit construction so the roundtrip is
+        // still proven for every kind of variant.
+        let seq = WorkType::Sequence {
+            first: Phase::Spin(Duration::from_millis(10)),
+            rest: vec![
+                Phase::Sleep(Duration::from_millis(5)),
+                Phase::Yield(Duration::from_millis(2)),
+                Phase::Io(Duration::from_millis(1)),
+            ],
+        };
+        let json = serde_json::to_string(&seq).unwrap();
+        let back: WorkType = serde_json::from_str(&json).unwrap();
+        let json2 = serde_json::to_string(&back).unwrap();
+        assert_eq!(
+            json, json2,
+            "WorkType::Sequence roundtrip drift: original={json}, \
+             after-roundtrip={json2}"
+        );
+        // Pin one humantime field's wire form so a regression that
+        // drops `humantime_serde_helper` from `Phase` surfaces
+        // here even if the other Phase tests are skipped.
+        assert!(
+            json.contains(r#""spin":"10ms""#),
+            "Sequence first-phase Phase::Spin must serialize \
+             through humantime_serde_helper as \"10ms\"; got {json}"
+        );
+    }
+
     /// Full `WorkloadConfig` round-trip with `Default` ensures every
     /// field handles serde correctly together — no field is silently
     /// missing a derive.
