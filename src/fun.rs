@@ -220,6 +220,42 @@ impl Funifier {
         if n < 0 { -funified } else { funified }
     }
 
+    /// Replace an i32 identifier (e.g. a kernel pid_t / signed
+    /// uid_t / any 32-bit-wide signed field) with another i32.
+    /// Same contract as [`Self::numeric_id_i64`] but the output
+    /// is masked so it fits in 31 bits of magnitude (so a
+    /// downstream `as i32` cast of the funified value can never
+    /// wrap a high-bit hash output back into the legal i32
+    /// range). Sentinels (`0`, `i32::MIN`, `i32::MAX`) round-
+    /// trip unchanged so failure-dump renderers see the same
+    /// "kthread / no value" markers in the funified output.
+    pub fn numeric_id_i32(&self, category: &str, n: i32) -> i32 {
+        if Self::is_sentinel_i32(n) {
+            return n;
+        }
+        // i32::MIN is a sentinel per the schema convention;
+        // filtering it preserves round-trip semantics
+        // (i32::MIN funifies to i32::MIN). The 31-bit mask
+        // makes the cast safe regardless, but the sentinel
+        // guard also avoids routing i32::MIN through the hash
+        // which would lose the "no value" marker meaning.
+        let abs = n.unsigned_abs() as u64;
+        // Reuse numeric_id then mask to 31 bits so the result
+        // always fits in i32 with sign preserved.
+        let funified = (self.numeric_id(category, abs) & ((1u32 << 31) - 1) as u64) as i32;
+        if n < 0 { -funified } else { funified }
+    }
+
+    /// 32-bit-wide analog of [`Self::is_sentinel_u64`] for signed
+    /// 32-bit identifiers. Schemas commonly use `0` for
+    /// "kernel/unset", `i32::MIN` for "no value" / error sentinels,
+    /// and `i32::MAX` for "max" markers. Kept distinct from
+    /// [`Self::is_sentinel_u32`] because the negative sentinel
+    /// (`i32::MIN`) has no u32 analog.
+    pub fn is_sentinel_i32(n: i32) -> bool {
+        n == 0 || n == i32::MIN || n == i32::MAX
+    }
+
     /// Replace a u32 identifier (e.g. a host CPU number, uid, gid,
     /// nlink, or any other 32-bit-wide field) with another u32.
     /// Same contract as [`Self::numeric_id`] but the output is
@@ -670,7 +706,30 @@ fn funify_json_with_context(
                     }
                 } else if let Some(i) = num.as_i64() {
                     // numeric_id_i64 itself preserves zero.
-                    Value::Number(serde_json::Number::from(f.numeric_id_i64(cat, i)))
+                    // For u32-category keys with negative
+                    // values, narrow to i32 so a downstream
+                    // `as i32`/`as u32` cast cannot wrap a high-
+                    // bit hash output back into the legal i32/u32
+                    // range. Same rationale as the unsigned u32
+                    // branch above; the negative-value case is
+                    // reachable when serde lowers a kernel
+                    // pid_t/uid_t value (signed) through
+                    // `as_i64` because the field declared i32 in
+                    // Rust serializes as i64 in `serde_json::Value`
+                    // when the value is negative.
+                    if Funifier::is_u32_category(cat) {
+                        let narrow = if i < i32::MIN as i64 {
+                            i32::MIN
+                        } else if i > i32::MAX as i64 {
+                            i32::MAX
+                        } else {
+                            i as i32
+                        };
+                        let funified = f.numeric_id_i32(cat, narrow);
+                        Value::Number(serde_json::Number::from(funified))
+                    } else {
+                        Value::Number(serde_json::Number::from(f.numeric_id_i64(cat, i)))
+                    }
                 } else {
                     // Defensive: serde_json::Number variants are
                     // u64/i64/f64; the float case is handled above.
@@ -964,6 +1023,86 @@ mod tests {
         assert_eq!(out["cpu_id_max"]["cpu_id"], json!(u32::MAX));
         assert_eq!(out["uid_zero"]["uid"], json!(0));
         assert_eq!(out["uid_max"]["uid"], json!(u32::MAX));
+    }
+
+    /// `numeric_id_i32` produces in-range output deterministically.
+    /// Pins (a) sentinels round-trip (0, i32::MIN, i32::MAX),
+    /// (b) sign survives funification, (c) abs values match
+    /// across signs, (d) determinism per (seed, category, n),
+    /// and (e) the i32::MIN sentinel guard prevents the
+    /// `unsigned_abs` overflow that would otherwise wrap to 0.
+    #[test]
+    fn numeric_id_i32_masks_to_i32_range_and_preserves_sentinels() {
+        let f = Funifier::with_seed("demo");
+        // Sentinels.
+        assert_eq!(f.numeric_id_i32("kuid", 0), 0);
+        assert_eq!(f.numeric_id_i32("kuid", i32::MIN), i32::MIN);
+        assert_eq!(f.numeric_id_i32("kuid", i32::MAX), i32::MAX);
+        // Sign + abs symmetry mirrors numeric_id_i64.
+        let pos = f.numeric_id_i32("kuid", 42);
+        let neg = f.numeric_id_i32("kuid", -42);
+        assert!(pos > 0, "positive input must funify to positive output");
+        assert!(neg < 0, "negative input must funify to negative output");
+        assert_eq!(pos, -neg, "abs value must match across signs");
+        // Determinism.
+        assert_eq!(f.numeric_id_i32("kuid", 42), pos);
+        // Different category → different funified output.
+        assert_ne!(
+            f.numeric_id_i32("kuid", 42),
+            f.numeric_id_i32("cpu_id", 42),
+            "category must namespace the funified output",
+        );
+    }
+
+    /// `is_sentinel_i32` recognises the documented signed-32
+    /// sentinels.
+    #[test]
+    fn is_sentinel_i32_table() {
+        assert!(Funifier::is_sentinel_i32(0));
+        assert!(Funifier::is_sentinel_i32(i32::MIN));
+        assert!(Funifier::is_sentinel_i32(i32::MAX));
+        assert!(!Funifier::is_sentinel_i32(1));
+        assert!(!Funifier::is_sentinel_i32(-1));
+        assert!(!Funifier::is_sentinel_i32(42));
+    }
+
+    /// JSON walker: u32-categorised NEGATIVE values (lowered
+    /// through serde's i64 path) funify through the i32-narrow
+    /// dispatch and stay in i32 range. Without the dispatch a
+    /// negative kuid/kgid would funify to a full-range i64 that
+    /// overflows a downstream `as i32` cast — this is the
+    /// regression the new branch closes.
+    #[test]
+    fn funify_json_u32_category_negative_stays_in_i32_range() {
+        let f = Funifier::with_seed("demo");
+        for n in [
+            -1i64,
+            -7,
+            -42,
+            -100,
+            -1024,
+            -65535,
+            -1_000_000,
+            i32::MIN as i64,
+            // Below i32::MIN — exercises the lower clamp arm
+            // (`i < i32::MIN as i64` → `i32::MIN`).
+            i32::MIN as i64 - 1,
+            // i64::MIN — extreme of the clamp domain; pins the
+            // arm against an i64-wide negative.
+            i64::MIN,
+        ] {
+            let input = json!({ "kuid": n });
+            let out = funify_json(input, &f);
+            let funified = out["kuid"]
+                .as_i64()
+                .expect("u32 category negative must remain a signed Number");
+            assert!(
+                (i32::MIN as i64..=i32::MAX as i64).contains(&funified),
+                "funified `kuid`={n} produced {funified}, exceeds i32 range. \
+                 The i32-narrow dispatch in the i64 branch is broken or the \
+                 category fell through to numeric_id_i64 (full i64).",
+            );
+        }
     }
 
     /// `is_metric_passthrough` allowlist hits — whole-key

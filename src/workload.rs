@@ -15501,6 +15501,27 @@ mod tests {
                 "WorkType::{name} JSON roundtrip drift: \
                  original={json}, after-roundtrip={json2}"
             );
+            // #[serde(skip)] fields don't appear in `json` so the
+            // roundtrip can't preserve their values from the wire.
+            // Debug renders every field — including skipped ones.
+            // If a future variant gains a #[serde(skip)] field that
+            // doesn't have Default::default()-equivalent
+            // initialization in its from_name arm, the roundtripped
+            // variant will reconstruct that field as the type's
+            // default while the from_name-constructed one carries
+            // the documented default — and the Debug strings will
+            // diverge here. Catches the drift BEFORE a downstream
+            // consumer tries to roundtrip a config and silently
+            // loses the skipped state.
+            let from_name_dbg = format!("{wt:?}");
+            let after_roundtrip_dbg = format!("{back:?}");
+            assert_eq!(
+                from_name_dbg, after_roundtrip_dbg,
+                "WorkType::{name} Debug drift across serde roundtrip: \
+                 a #[serde(skip)] field is reconstructing differently \
+                 than from_name produces. from_name={from_name_dbg}, \
+                 after-roundtrip={after_roundtrip_dbg}"
+            );
             covered += 1;
         }
 
@@ -15854,6 +15875,94 @@ mod tests {
                 r.iterations > 0,
                 "WakeChain wake=Pipe multi-chain worker must iterate: {r:?}"
             );
+        }
+    }
+
+    /// `WakeChain` rejects `num_workers % depth != 0` at spawn so
+    /// the chain-pipe allocator never produces a partial chain.
+    /// The framework derives `chains = num_workers / depth`, which
+    /// silently truncates if the ratio is not exact — leaving
+    /// workers unaccounted for. Pins the spawn-side check that
+    /// catches the bug at construction with an actionable
+    /// diagnostic naming the divisor (worker_group_size = depth).
+    /// Covered cases: depth=2 with num_workers in {1, 3, 5, 7},
+    /// depth=4 with num_workers in {1, 2, 3, 5, 6, 7}. Each
+    /// `spawn` must return `Err`; the diagnostic must mention
+    /// `divisible by` and the offending depth.
+    #[test]
+    fn wake_chain_spawn_rejects_non_multiple_num_workers() {
+        for &(num_workers, depth) in &[
+            (1usize, 2usize),
+            (3, 2),
+            (5, 2),
+            (7, 2),
+            (1, 4),
+            (2, 4),
+            (3, 4),
+            (5, 4),
+            (6, 4),
+            (7, 4),
+        ] {
+            let cfg = WorkloadConfig {
+                num_workers,
+                work_type: WorkType::WakeChain {
+                    depth,
+                    wake: WakeMechanism::Pipe,
+                    work_per_hop: Duration::from_micros(50),
+                },
+                ..Default::default()
+            };
+            let err = WorkloadHandle::spawn(&cfg).err().unwrap_or_else(|| {
+                panic!(
+                    "WakeChain spawn must reject num_workers={num_workers} \
+                     with depth={depth} (not a positive multiple)",
+                )
+            });
+            let rendered = format!("{err:#}");
+            assert!(
+                rendered.contains("divisible by"),
+                "WakeChain rejection diagnostic must mention `divisible by`; \
+                 num_workers={num_workers}, depth={depth}, got: {rendered}",
+            );
+            assert!(
+                rendered.contains(&depth.to_string()),
+                "WakeChain rejection diagnostic must name the offending depth \
+                 ({depth}); num_workers={num_workers}, got: {rendered}",
+            );
+        }
+    }
+
+    /// `WakeChain` accepts every positive multiple of depth at
+    /// spawn — pinned alongside the negative test above so a
+    /// regression that broadened the rejection (e.g. requiring
+    /// num_workers == depth) trips here. Spawned configurations
+    /// are immediately stopped to avoid running real work.
+    #[test]
+    fn wake_chain_spawn_accepts_positive_multiples_of_depth() {
+        for &(num_workers, depth) in
+            &[(2usize, 2usize), (4, 2), (6, 2), (4, 4), (8, 4), (12, 4)]
+        {
+            let cfg = WorkloadConfig {
+                num_workers,
+                work_type: WorkType::WakeChain {
+                    depth,
+                    wake: WakeMechanism::Pipe,
+                    work_per_hop: Duration::from_micros(20),
+                },
+                ..Default::default()
+            };
+            let mut h = WorkloadHandle::spawn(&cfg).unwrap_or_else(|e| {
+                panic!(
+                    "WakeChain spawn must accept num_workers={num_workers} \
+                     with depth={depth} (positive multiple); err: {e:#}"
+                )
+            });
+            // Run briefly and stop — this verifies spawn accepted
+            // the configuration without actually exercising the
+            // long-running chain.
+            h.start();
+            std::thread::sleep(Duration::from_millis(20));
+            let _ = h.stop_and_collect();
         }
     }
 

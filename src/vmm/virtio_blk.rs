@@ -941,6 +941,16 @@ struct SpawnedEngine {
     handle: Option<thread::JoinHandle<BlkWorkerState>>,
 }
 
+/// Process-wide monotonic counter for VirtioBlk instance IDs. Used
+/// to derive `instance_id` at construction so tracing logs name the
+/// device with a stable small integer instead of a raw heap pointer.
+/// Heap pointers expose ASLR offsets and process-layout details
+/// (the `host_resource_snapshot` doc treats this kind of detail as
+/// environment leakage); a per-process counter preserves the
+/// "uniquely identify the device within this process run" property
+/// that the diagnostics depend on without leaking the address.
+static VIRTIO_BLK_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 /// Virtio-block MMIO device.
 pub struct VirtioBlk {
     queue_select: u32,
@@ -1008,6 +1018,12 @@ pub struct VirtioBlk {
     /// is `Copy` (a pair of `Option<NonZeroU64>`) so this is cheap
     /// to keep around.
     throttle: DiskThrottle,
+    /// Stable per-device monotonic identifier from
+    /// [`VIRTIO_BLK_INSTANCE_COUNTER`]. Replaces the previous
+    /// `self as *const _ as usize` heap-pointer field for tracing
+    /// log correlation: pointers fingerprint the host's ASLR
+    /// layout, an integer counter does not.
+    instance_id: u64,
 }
 
 impl VirtioBlk {
@@ -1161,6 +1177,7 @@ impl VirtioBlk {
             worker,
             mem_unset_warned,
             throttle,
+            instance_id: VIRTIO_BLK_INSTANCE_COUNTER.fetch_add(1, Ordering::Relaxed),
         }
     }
 
@@ -3832,26 +3849,30 @@ impl Drop for VirtioBlk {
         // across multiple concurrent VirtioBlk drops without
         // borrowing `self` after the `&mut self.worker.engine`
         // mutable borrow lands. None of the three are stable
-        // across host restarts (`stop_fd` recycles,
-        // `device_ptr` is the live address) but together they
-        // uniquely identify the device within this process
-        // run.
+        // across host restarts (`stop_fd` recycles, `instance_id`
+        // resets at process start) but together they uniquely
+        // identify the device within this process run.
+        // `instance_id` replaces an earlier `self as *const _`
+        // pointer field — the pointer leaked the host's ASLR
+        // layout into log output (environment leakage); the
+        // process-local counter has the same uniqueness shape
+        // without the leak.
         //
         // The cfg(test) Inline arm doesn't consume these
-        // snapshots; the `let _ = (capacity_sectors, device_ptr);`
+        // snapshots; the `let _ = (capacity_sectors, instance_id);`
         // reference inside that arm is what keeps cfg(test)
         // builds free of `unused_variables` lints. (`stop_fd` is
         // read inside the cfg(not(test)) Spawned arm directly,
         // so it doesn't need the same dead-code dance.)
         let capacity_sectors = self.capacity_sectors;
-        let device_ptr = self as *const _ as usize;
+        let instance_id = self.instance_id;
         match &mut self.worker.engine {
             #[cfg(test)]
             WorkerEngine::Inline(_) => {
                 // Default-drop the inline state when this fn returns.
                 // Reference the snapshot vars to avoid `unused`
                 // lints in cfg(test).
-                let _ = (capacity_sectors, device_ptr);
+                let _ = (capacity_sectors, instance_id);
             }
             #[cfg(not(test))]
             WorkerEngine::Spawned(eng) => {
@@ -3874,7 +3895,7 @@ impl Drop for VirtioBlk {
                                 panic = panic_payload_str(&*payload),
                                 stop_fd,
                                 capacity_sectors,
-                                device_ptr,
+                                instance_id,
                                 "virtio-blk worker thread panicked"
                             );
                         }
@@ -3883,7 +3904,7 @@ impl Drop for VirtioBlk {
                                 timeout_s = DROP_JOIN_TIMEOUT.as_secs_f32(),
                                 stop_fd,
                                 capacity_sectors,
-                                device_ptr,
+                                instance_id,
                                 "virtio-blk worker did not exit within \
                                  DROP_JOIN_TIMEOUT of stop_fd; leaking \
                                  the worker thread to avoid blocking the \
@@ -3891,7 +3912,7 @@ impl Drop for VirtioBlk {
                                  is wedged in a blocking syscall that \
                                  does not check stop_fd. \
                                  hint: identify the wedged device by \
-                                 stop_fd / device_ptr / capacity_sectors \
+                                 stop_fd / instance_id / capacity_sectors \
                                  above; per-device GuestMemoryMmap and \
                                  EventFd Arcs stay live until the worker \
                                  unblocks (see Drop's resource-retention \
@@ -3905,7 +3926,7 @@ impl Drop for VirtioBlk {
                             tracing::error!(
                                 stop_fd,
                                 capacity_sectors,
-                                device_ptr,
+                                instance_id,
                                 "virtio-blk drop helper thread spawn \
                                  failed; detaching worker without join"
                             );
@@ -3914,7 +3935,7 @@ impl Drop for VirtioBlk {
                             tracing::error!(
                                 stop_fd,
                                 capacity_sectors,
-                                device_ptr,
+                                instance_id,
                                 "virtio-blk drop helper thread \
                                  terminated without forwarding the \
                                  worker join result"

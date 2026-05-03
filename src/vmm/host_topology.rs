@@ -706,19 +706,20 @@ fn try_acquire_all(
 /// chance of finding a free window without burning the entire
 /// lockfile pool.
 ///
-/// The hash key is fixed `(0, 0)` — a per-run random key would
-/// defeat reproducibility for unit-test fixtures and for any
-/// future debug logging that wants to confirm "pid X picks
+/// The hash key is the SipHash13 default (`SipHasher13::new()`,
+/// equivalent to `new_with_keys(0, 0)`) — a per-run random key
+/// would defeat reproducibility for unit-test fixtures and for
+/// any future debug logging that wants to confirm "pid X picks
 /// offset Y for window N".
 ///
 /// Caller invariant: `max_start >= 1`. Panics on `max_start == 0`
 /// (modulo-by-zero); callers must enforce this upstream — the
 /// `count > total_host_cpus` early-bail in [`acquire_cpu_locks`]
 /// is the production guarantee.
-pub(crate) fn pid_window_offset(pid: u32, max_start: usize) -> usize {
+fn pid_window_offset(pid: u32, max_start: usize) -> usize {
     use siphasher::sip::SipHasher13;
     use std::hash::Hasher;
-    let mut hasher = SipHasher13::new_with_keys(0, 0);
+    let mut hasher = SipHasher13::new();
     hasher.write_u32(pid);
     (hasher.finish() as usize) % max_start
 }
@@ -3249,18 +3250,50 @@ mod tests {
         // 100 pids over 33 offsets should hit roughly all 33
         // offsets. Pin >= 25 to absorb the natural birthday-
         // paradox compression while still catching a regression
-        // that flattens adjacent pids onto the same offset (the
-        // bare `pid % 33` baseline produces exactly 33 offsets in
-        // a strict cyclic pattern, which is also acceptable —
-        // but the regression of interest is the OPPOSITE: a hash
-        // mixer that loses entropy and collapses to fewer than
-        // half the offset space).
+        // that flattens adjacent pids onto the same offset.
+        //
+        // The bare `pid % 33` baseline ALSO produces 33 unique
+        // offsets, so the unique-count assertion alone does not
+        // distinguish the avalanching hash from the trivial
+        // modulo. The "adjacent-pid landings differ by 1"
+        // assertion below catches that case: bare modulo gives
+        // |offset[i+1] - offset[i]| == 1 always (the cyclic
+        // step), whereas SipHash13 produces a fully randomized
+        // step distribution.
         let unique: std::collections::HashSet<_> = offsets.iter().copied().collect();
         assert!(
             unique.len() >= 25,
             "100 adjacent pids spread to only {} unique offsets (max_start={max_start}); \
              hash mixer is losing entropy. offsets: {offsets:?}",
             unique.len(),
+        );
+
+        // Distinguish from the bare `pid % max_start` baseline:
+        // bare modulo on consecutive pids gives consecutive
+        // offsets (gap of exactly 1 modulo max_start). Count how
+        // many adjacent pid pairs land at exactly +/-1 offset
+        // (handling the wrap at the boundary). For SipHash13,
+        // each adjacent pair has a 2/max_start ≈ 6% probability
+        // of landing at +/-1 by chance, so over 99 pairs the
+        // expected count is ~6 with stddev ~2.4. The bare
+        // modulo baseline produces 99/99. Pin <= 30 (well above
+        // the random-noise expected value, well below the bare-
+        // modulo signature) so a regression that drops the
+        // SipHash mixer trips this without flaking on the
+        // hashed distribution.
+        let adjacent_step_count = offsets
+            .windows(2)
+            .filter(|w| {
+                let d = (w[0] as i64 - w[1] as i64).unsigned_abs() as usize;
+                d == 1 || d == max_start - 1
+            })
+            .count();
+        assert!(
+            adjacent_step_count <= 30,
+            "{adjacent_step_count} of {} adjacent pid pairs landed at +/-1 offset \
+             (max_start={max_start}); the bare `pid % {max_start}` baseline produces \
+             99/99 such pairs. SipHash13 avalanche should give ~6. offsets: {offsets:?}",
+            offsets.len() - 1,
         );
 
         // Average gap between consecutive pids' offsets — the

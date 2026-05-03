@@ -212,6 +212,19 @@ pub(crate) fn host_resource_snapshot() -> String {
         })
         .unwrap_or(false);
     let thread_count = threads.parse::<u64>().unwrap_or(0);
+    // RLIMIT_NPROC is per-UID (the per-UID enforcement lives in
+    // `kernel/ucount.c::is_rlimit_overlimit`, walking the user_ns
+    // ucounts chain and returning true once any tier exceeds
+    // its cap), counting the total number of processes/threads
+    // owned by the real user ID across the whole host — not just
+    // this process. We compare that per-UID cap against this
+    // process's own thread count from /proc/self/status::Threads
+    // as a proxy: if the local thread count is approaching the
+    // per-UID cap, the host is almost certainly near saturation.
+    // The proxy can underreport when peers under the same UID
+    // hold most of the budget (multi-UID hosts dilute the signal
+    // further), but the snapshot is a contention triage hint,
+    // not an authoritative gauge.
     let near_limit_procs = pick_limit_value("Max processes")
         .map(|cap| {
             let scaled_count = thread_count.saturating_mul(10);
@@ -8492,6 +8505,73 @@ mod tests {
             rendered.contains("signal"),
             "banner missing signal-storm hint: {rendered}",
         );
+    }
+
+    /// `create_vm_with_retry` happy path: a real KVM handle with no
+    /// signal pressure must succeed on the first attempt and return
+    /// an `Ok(VmFd)`. Pins the loop-exit ordering: the `Ok` arm is
+    /// matched first inside the loop, so a healthy syscall short-
+    /// circuits without entering any of the EINTR / transient /
+    /// hard-fault branches. The three failure arms are pinned by
+    /// the helper-level tests directly above
+    /// (`map_transient_to_contention_classifies_enomem`,
+    /// `map_transient_to_contention_passes_through_hard_errors`,
+    /// `map_transient_to_contention_does_not_classify_eintr`,
+    /// `eintr_exhausted_contention_format`); together they cover
+    /// every branch of the match, and this test pins the
+    /// composition.
+    ///
+    /// Kvm::new() failure panics — the test requires a KVM-capable
+    /// host. The ResourceContention skip only applies to
+    /// create_vm_with_retry's own return value: if the kernel
+    /// genuinely cannot grant a fresh VM after the EINTR retry
+    /// schedule resolves (host memory pressure, peer holding the
+    /// VM budget), the function surfaces ResourceContention and
+    /// the test treats that the same way the macro layer does
+    /// in production. A missing /dev/kvm at the OPENING step is
+    /// infrastructure misconfiguration, not host saturation, and
+    /// the test fails loudly rather than silently no-op'ing.
+    #[test]
+    fn create_vm_with_retry_succeeds_under_no_signal_pressure() {
+        let kvm = match kvm_ioctls::Kvm::new() {
+            Ok(k) => k,
+            Err(e) => {
+                // No /dev/kvm at all is infrastructure
+                // misconfiguration on this host (kernel built
+                // without KVM, /dev/kvm permission denied, etc.) —
+                // not the kind of transient host pressure that the
+                // ResourceContention skip path is designed for.
+                // Fail loudly so the misconfig is visible instead
+                // of being silently swallowed by a no-op test.
+                panic!(
+                    "Kvm::new() failed: {e}; cannot exercise \
+                     create_vm_with_retry on this host"
+                );
+            }
+        };
+        let vm = create_vm_with_retry(&kvm);
+        match vm {
+            Ok(_) => {
+                // Success path: the function returned a real VmFd
+                // without retrying. Drop releases the kernel
+                // resource immediately.
+            }
+            Err(e) if e
+                .downcast_ref::<host_topology::ResourceContention>()
+                .is_some() =>
+            {
+                // The host genuinely could not grant a VM — this
+                // is the same skip the macro layer surfaces in
+                // production. Treat as a pass since we already
+                // pinned the failure-arm classifiers above.
+            }
+            Err(e) => {
+                panic!(
+                    "create_vm_with_retry returned an unexpected \
+                     non-contention error on a no-signal-pressure host: {e:#}"
+                );
+            }
+        }
     }
 
     /// `errno_name` falls through to a `errno=<raw>` rendering for
