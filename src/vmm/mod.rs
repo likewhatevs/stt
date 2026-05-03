@@ -221,23 +221,43 @@ pub(crate) fn map_transient_to_contention(
 }
 
 /// Render a numeric errno to its libc name for diagnostic text.
-/// Limited to the values in [`TRANSIENT_HOST_ERRNOS`] plus a few
-/// neighbours an operator commonly sees in KVM ioctl failures —
-/// the goal is "name what the operator should grep for", not a
-/// complete errno table.
-fn errno_name(errno: i32) -> &'static str {
+///
+/// Covers the values in [`TRANSIENT_HOST_ERRNOS`] plus a handful
+/// of neighbours an operator commonly sees in KVM ioctl failures
+/// (`EINVAL` / `ENOSYS` / `EPERM` / `EACCES` mark hard fault
+/// boundaries the contention classifier is designed NOT to map).
+/// Falls through to `errno=<raw>` for unmapped values so the
+/// operator can grep for the integer in `man errno` / kernel
+/// sources rather than seeing a useless `<other>`. Returns
+/// [`Cow`] so the common (mapped) case stays zero-allocation while
+/// the fallthrough case can format the integer.
+fn errno_name(errno: i32) -> std::borrow::Cow<'static, str> {
+    use std::borrow::Cow;
     match errno {
-        libc::ENOMEM => "ENOMEM",
-        libc::EMFILE => "EMFILE",
-        libc::ENFILE => "ENFILE",
-        libc::EBUSY => "EBUSY",
-        libc::EAGAIN => "EAGAIN",
-        libc::EINTR => "EINTR",
-        libc::EINVAL => "EINVAL",
-        libc::ENOSYS => "ENOSYS",
-        libc::EPERM => "EPERM",
-        libc::EACCES => "EACCES",
-        _ => "<other>",
+        libc::ENOMEM => Cow::Borrowed("ENOMEM"),
+        libc::EMFILE => Cow::Borrowed("EMFILE"),
+        libc::ENFILE => Cow::Borrowed("ENFILE"),
+        libc::EBUSY => Cow::Borrowed("EBUSY"),
+        libc::EAGAIN => Cow::Borrowed("EAGAIN"),
+        libc::EINTR => Cow::Borrowed("EINTR"),
+        libc::EINVAL => Cow::Borrowed("EINVAL"),
+        libc::ENOSYS => Cow::Borrowed("ENOSYS"),
+        libc::EPERM => Cow::Borrowed("EPERM"),
+        libc::EACCES => Cow::Borrowed("EACCES"),
+        libc::ENOSPC => Cow::Borrowed("ENOSPC"),
+        libc::ENODEV => Cow::Borrowed("ENODEV"),
+        libc::ENOTSUP => Cow::Borrowed("ENOTSUP"),
+        libc::EFAULT => Cow::Borrowed("EFAULT"),
+        libc::EIO => Cow::Borrowed("EIO"),
+        libc::EBADF => Cow::Borrowed("EBADF"),
+        libc::ESRCH => Cow::Borrowed("ESRCH"),
+        libc::ENOENT => Cow::Borrowed("ENOENT"),
+        libc::ECHILD => Cow::Borrowed("ECHILD"),
+        libc::EEXIST => Cow::Borrowed("EEXIST"),
+        libc::EOVERFLOW => Cow::Borrowed("EOVERFLOW"),
+        libc::ETIMEDOUT => Cow::Borrowed("ETIMEDOUT"),
+        libc::ENOTTY => Cow::Borrowed("ENOTTY"),
+        other => Cow::Owned(format!("errno={other}")),
     }
 }
 
@@ -8146,7 +8166,7 @@ mod tests {
                 "errno {errno} banner missing context: {rendered}"
             );
             assert!(
-                rendered.contains(errno_name(errno)),
+                rendered.contains(&*errno_name(errno)),
                 "errno {errno} banner missing errno name: {rendered}"
             );
             assert!(
@@ -8181,6 +8201,51 @@ mod tests {
             assert!(
                 rendered.contains("set TSS"),
                 "errno {errno} banner missing context: {rendered}"
+            );
+        }
+    }
+
+    /// `errno_name` falls through to a `errno=<raw>` rendering for
+    /// values not in its mapped table — so an operator looking at
+    /// the SKIP banner can grep for the exact integer instead of
+    /// seeing a useless `<other>`. Pins the fallthrough format
+    /// against a regression that goes back to the static `<other>`.
+    #[test]
+    fn errno_name_fallthrough_renders_raw_value() {
+        // Pick an errno guaranteed not to be in the mapped table:
+        // 9999 is well above the kernel's defined range and reserved
+        // for tests. Any value the table starts mapping in the
+        // future would still leave 9999 as a fallthrough sample.
+        let rendered = errno_name(9999);
+        assert!(
+            rendered.contains("errno=9999"),
+            "fallthrough must include the exact `errno=N` format string \
+             so callers grepping for it find the integer reliably; got: {rendered}",
+        );
+        assert!(
+            !rendered.contains("<other>"),
+            "fallthrough must not collapse to the placeholder <other>; got: {rendered}",
+        );
+    }
+
+    /// Mapped errnos retain their canonical name (no regression
+    /// from the new `Cow` return type swallowing the static
+    /// `&'static str` branches).
+    #[test]
+    fn errno_name_maps_canonical_names() {
+        for (errno, expected) in [
+            (libc::ENOMEM, "ENOMEM"),
+            (libc::EBUSY, "EBUSY"),
+            (libc::EAGAIN, "EAGAIN"),
+            (libc::EINVAL, "EINVAL"),
+            (libc::ENOSYS, "ENOSYS"),
+            (libc::EPERM, "EPERM"),
+            (libc::EACCES, "EACCES"),
+        ] {
+            let rendered = errno_name(errno);
+            assert_eq!(
+                &*rendered, expected,
+                "errno {errno} must render as {expected}; got {rendered}",
             );
         }
     }

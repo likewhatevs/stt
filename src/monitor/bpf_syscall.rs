@@ -356,11 +356,39 @@ impl BpfSyscallAccessor {
                 )
             };
             if fd_ret < 0 {
-                // ENOENT — map died between GET_NEXT_ID and
-                // GET_FD_BY_ID; skip silently. Other errors (EPERM,
-                // EBADF) are dropped here too: a single failed pin
-                // shouldn't kill the whole enumeration. Surfacing
-                // them via tracing is taskified.
+                // A failed `BPF_MAP_GET_FD_BY_ID` skips this map and
+                // keeps walking — a single bad map must not abort
+                // enumeration. The error categories matter for
+                // diagnostics, so surface non-ENOENT cases via
+                // tracing rather than silently dropping them:
+                //
+                // - `ENOENT`: the map was freed between
+                //   `GET_NEXT_ID` and `GET_FD_BY_ID`. Routine
+                //   under churn; suppressed at `debug` level so the
+                //   normal log stays quiet.
+                // - `EPERM`: missing CAP_SYS_ADMIN / CAP_BPF for
+                //   this map (e.g. a kernel-internal map a less-
+                //   privileged caller can't pin). Logged at `warn`
+                //   so an operator who expects to see the map knows
+                //   why it's missing.
+                // - `EBADF` / others: a kernel-side state error.
+                //   Logged at `warn` with the errno so the operator
+                //   can correlate against `dmesg`.
+                let err = std::io::Error::last_os_error();
+                let raw = err.raw_os_error().unwrap_or(0);
+                if raw == libc::ENOENT {
+                    tracing::debug!(
+                        map_id = next_id,
+                        "BPF_MAP_GET_FD_BY_ID: map vanished mid-walk (ENOENT); skipping"
+                    );
+                } else {
+                    tracing::warn!(
+                        map_id = next_id,
+                        errno = raw,
+                        error = %err,
+                        "BPF_MAP_GET_FD_BY_ID failed; skipping this map but continuing the walk"
+                    );
+                }
                 continue;
             }
             // SAFETY: fd_ret >= 0; the kernel guarantees a valid fd
@@ -368,9 +396,21 @@ impl BpfSyscallAccessor {
             let fd = unsafe { OwnedFd::from_raw_fd(fd_ret as RawFd) };
 
             // Fetch info to populate BpfMapInfo + decide whether to
-            // keep the fd.
-            let Ok((info, map_extra)) = obj_get_info_map(fd.as_raw_fd()) else {
-                continue;
+            // keep the fd. A failure here means the map's metadata
+            // can't be read (kernel-side state error or fd was
+            // closed mid-walk); surface it via tracing so the
+            // operator sees the correlation rather than a silently
+            // dropped map.
+            let (info, map_extra) = match obj_get_info_map(fd.as_raw_fd()) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    tracing::warn!(
+                        map_id = next_id,
+                        error = %e,
+                        "BPF_OBJ_GET_INFO_BY_FD failed for pinned map; skipping"
+                    );
+                    continue;
+                }
             };
 
             // Hand the predicate a BpfMapInfo for the keep/discard
