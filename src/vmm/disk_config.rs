@@ -87,6 +87,63 @@ impl Filesystem {
 ///
 /// Throttle exhaustion stalls the request internally and retries via
 /// a timer — it is not surfaced to the guest as `VIRTIO_BLK_S_IOERR`.
+///
+/// # Worked example: cloud-style 1000 IOPS / 10 MiB·s with 5× burst
+///
+/// Model a "1000 IOPS sustained, tolerate a 5-second spike from a
+/// quiescent device" disk:
+///
+/// ```
+/// use ktstr::prelude::*;
+///
+/// let disk = DiskConfig::default()
+///     // Steady-state allowance — bucket refill rate.
+///     .iops(1_000)
+///     // Peak burst — bucket capacity. 5× the refill rate yields
+///     // ~5 seconds' worth of operations before throttling kicks in.
+///     .iops_burst_capacity(5_000)
+///     // Steady-state bandwidth: 10 MiB/s = 10 * 1024 * 1024 bytes/s.
+///     .bytes_per_sec(10 * 1024 * 1024)
+///     // Bandwidth burst — 5× the rate, mirroring the iops ratio.
+///     .bytes_burst_capacity(50 * 1024 * 1024);
+/// disk.throttle.validate().expect("burst >= rate, rate set");
+/// ```
+///
+/// At VM build time the buckets are seeded full (start of the test =
+/// "quiescent device"); a burst-friendly workload draws the bucket
+/// down at peak rate until empty, then is rate-limited to the refill
+/// rate from then on.
+///
+/// # Picking values
+///
+/// - **`iops`** — peak operations the device must sustain. Includes
+///   reads, writes, and flushes (each = 1 op).
+/// - **`bytes_per_sec`** — peak bandwidth the device must sustain
+///   for read+write data combined. Flushes do not count toward
+///   bandwidth.
+/// - **`*_burst_capacity`** — how long a burst from a full bucket
+///   should run before throttling kicks in. `burst = N * rate` gives
+///   ~N seconds of unrestricted IO from a quiescent device. Leave
+///   `None` to default to `burst = rate` (1-second burst, the
+///   pre-burst-feature behaviour).
+///
+/// # Constraint summary
+///
+/// Both rules are enforced by [`DiskThrottle::validate`] (run by
+/// [`crate::vmm::KtstrVmBuilder::build`] before the backing file is
+/// allocated):
+///
+/// - `*_burst_capacity` must be `>= *_refill_rate` when both are
+///   set; a capacity below the refill rate would silently cap the
+///   steady-state at the lower capacity instead of the configured
+///   rate.
+/// - `*_burst_capacity` must not be set without its matching refill
+///   rate; a one-shot bucket that never refills doesn't model any
+///   useful throttle.
+///
+/// Clearing a refill rate via the builder (`iops(0)` /
+/// `bytes_per_sec(0)`) auto-clears its matching `*_burst_capacity`
+/// so the second rule never trips on a cleared-rate chain.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct DiskThrottle {
     /// Maximum operations per second (1 read = 1 op, 1 write = 1
@@ -119,7 +176,118 @@ pub struct DiskThrottle {
     /// (1-second burst). When `Some`, the value must be
     /// `>= bytes_per_sec`. Has no effect when `bytes_per_sec` is
     /// `None`.
+    ///
+    /// Values above `i64::MAX` are accepted but the `TokenBucket`
+    /// seed is clamped to `i64::MAX` at construction — the effective
+    /// initial burst is ~9.2 exabytes, immaterial for realistic
+    /// settings.
     pub bytes_burst_capacity: Option<NonZeroU64>,
+}
+
+/// Throttle dimension a [`DiskThrottleValidationError`] applies to.
+///
+/// `Iops` covers `iops` / `iops_burst_capacity`; `Bytes` covers
+/// `bytes_per_sec` / `bytes_burst_capacity`. The discriminant lets
+/// callers route a programmatic recovery (e.g. clearing the offending
+/// burst) without parsing the rendered error message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ThrottleDimension {
+    /// IOPS dimension — `iops` refill rate, `iops_burst_capacity`
+    /// bucket capacity.
+    Iops,
+    /// Bandwidth dimension — `bytes_per_sec` refill rate,
+    /// `bytes_burst_capacity` bucket capacity.
+    Bytes,
+}
+
+impl ThrottleDimension {
+    /// Field name of the offending burst capacity. Stable wire
+    /// identifier — matches the [`DiskThrottle`] field name and the
+    /// builder method name on [`DiskConfig`] so error consumers can
+    /// echo it back to the user as the field they need to change.
+    pub fn burst_field(self) -> &'static str {
+        match self {
+            ThrottleDimension::Iops => "iops_burst_capacity",
+            ThrottleDimension::Bytes => "bytes_burst_capacity",
+        }
+    }
+
+    /// Field name of the matching refill rate. Symmetric with
+    /// [`Self::burst_field`].
+    pub fn rate_field(self) -> &'static str {
+        match self {
+            ThrottleDimension::Iops => "iops",
+            ThrottleDimension::Bytes => "bytes_per_sec",
+        }
+    }
+}
+
+/// Validation failure for [`DiskThrottle::validate`].
+///
+/// Returned by [`DiskThrottle::validate`] when a throttle/burst
+/// chain violates the constraints documented on [`DiskThrottle`].
+/// The `Display` impl carries the same actionable text the previous
+/// `String`-returning shape did (with the ", or pass 0 to clear …"
+/// remediation hint preserved) so callers that bubble the error
+/// through `anyhow::Error` and match on the rendered message keep
+/// working.
+///
+/// Tests that need to assert on a specific failure variant downcast
+/// via `err.downcast_ref::<DiskThrottleValidationError>()` (when the
+/// error is wrapped in `anyhow`) or pattern-match the enum directly.
+/// The [`dimension()`](Self::dimension) accessor exposes which
+/// dimension (iops/bytes) tripped the rule for callers that route
+/// programmatic recovery (e.g. clear the offending
+/// `*_burst_capacity` and retry).
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum DiskThrottleValidationError {
+    /// `*_burst_capacity` is set to a value strictly below the
+    /// corresponding `*` refill rate. A bucket with capacity below
+    /// its refill rate cannot hold a full second of refilled
+    /// tokens, so the effective steady-state rate would silently be
+    /// the capacity, not the configured rate.
+    #[error(
+        "{burst_field} ({burst}) must be >= {rate_field} ({rate}), \
+         or pass 0 to clear the burst override",
+        burst_field = dimension.burst_field(),
+        rate_field = dimension.rate_field(),
+    )]
+    BurstBelowRate {
+        /// Throttle dimension this failure applies to.
+        dimension: ThrottleDimension,
+        /// The offending burst-capacity value.
+        burst: u64,
+        /// The refill rate the burst was compared against.
+        rate: u64,
+    },
+    /// `*_burst_capacity` is set with no matching `*` refill rate.
+    /// A bucket with no refill rate is a functionally unbounded
+    /// one-shot capacity, which does not match any useful
+    /// throttling model.
+    #[error(
+        "{burst_field} set without {rate_field} refill rate, \
+         or pass 0 to clear the burst override",
+        burst_field = dimension.burst_field(),
+        rate_field = dimension.rate_field(),
+    )]
+    BurstWithoutRate {
+        /// Throttle dimension this failure applies to.
+        dimension: ThrottleDimension,
+    },
+}
+
+impl DiskThrottleValidationError {
+    /// Throttle dimension (iops/bytes) the failure applies to. Lets
+    /// callers route a programmatic recovery without parsing the
+    /// rendered message — e.g. "clear the offending burst override
+    /// and re-validate" can dispatch on this without string-matching
+    /// `iops_burst_capacity` vs `bytes_burst_capacity`.
+    pub fn dimension(&self) -> ThrottleDimension {
+        match self {
+            DiskThrottleValidationError::BurstBelowRate { dimension, .. } => *dimension,
+            DiskThrottleValidationError::BurstWithoutRate { dimension } => *dimension,
+        }
+    }
 }
 
 impl DiskThrottle {
@@ -136,21 +304,30 @@ impl DiskThrottle {
     /// rejected: a bucket with no refill rate is functionally
     /// unbounded one-shot capacity, which does not match any
     /// useful throttling model.
-    pub fn validate(&self) -> Result<(), String> {
+    ///
+    /// Returns [`DiskThrottleValidationError`] on failure — a typed
+    /// enum so callers can pattern-match the failure mode (e.g.
+    /// route a programmatic recovery via the
+    /// [`dimension()`](DiskThrottleValidationError::dimension)
+    /// accessor) rather than string-matching the rendered message.
+    /// The `Display` impl preserves the wording of the prior
+    /// `String`-returning shape, including the ", or pass 0 to
+    /// clear the burst override" remediation hint, so anyhow-bubbled
+    /// callers that match on the rendered text still work.
+    pub fn validate(&self) -> Result<(), DiskThrottleValidationError> {
         if let Some(burst) = self.iops_burst_capacity {
             match self.iops {
                 Some(rate) if burst < rate => {
-                    return Err(format!(
-                        "iops_burst_capacity ({burst}) must be >= iops \
-                         ({rate}), or pass 0 to clear the burst override",
-                    ));
+                    return Err(DiskThrottleValidationError::BurstBelowRate {
+                        dimension: ThrottleDimension::Iops,
+                        burst: burst.get(),
+                        rate: rate.get(),
+                    });
                 }
                 None => {
-                    return Err(
-                        "iops_burst_capacity set without iops refill rate, \
-                         or pass 0 to clear the burst override"
-                            .into(),
-                    );
+                    return Err(DiskThrottleValidationError::BurstWithoutRate {
+                        dimension: ThrottleDimension::Iops,
+                    });
                 }
                 _ => {}
             }
@@ -158,18 +335,16 @@ impl DiskThrottle {
         if let Some(burst) = self.bytes_burst_capacity {
             match self.bytes_per_sec {
                 Some(rate) if burst < rate => {
-                    return Err(format!(
-                        "bytes_burst_capacity ({burst}) must be >= \
-                         bytes_per_sec ({rate}), or pass 0 to clear the \
-                         burst override",
-                    ));
+                    return Err(DiskThrottleValidationError::BurstBelowRate {
+                        dimension: ThrottleDimension::Bytes,
+                        burst: burst.get(),
+                        rate: rate.get(),
+                    });
                 }
                 None => {
-                    return Err(
-                        "bytes_burst_capacity set without bytes_per_sec \
-                         refill rate, or pass 0 to clear the burst override"
-                            .into(),
-                    );
+                    return Err(DiskThrottleValidationError::BurstWithoutRate {
+                        dimension: ThrottleDimension::Bytes,
+                    });
                 }
                 _ => {}
             }
@@ -269,6 +444,41 @@ impl DiskConfig {
     /// a reflink-capable cache directory (btrfs or xfs) and a host
     /// `mkfs.btrfs` binary on `PATH` at template-build time. See
     /// the module-level docs and [`crate::vmm::disk_template`].
+    ///
+    /// # Disk-template lifecycle
+    ///
+    /// For `Filesystem::Btrfs`, the per-test backing file is produced
+    /// in three stages — none of which the test author needs to drive
+    /// explicitly:
+    ///
+    /// 1. **Cache lookup** —
+    ///    [`disk_template::ensure_template`](crate::vmm::disk_template::ensure_template)
+    ///    keys off `(filesystem, capacity)` and returns the cached
+    ///    image path on hit. See the module docs at
+    ///    [`crate::vmm::disk_template`] for the cache-key encoding
+    ///    and on-disk layout.
+    /// 2. **Template build (cache miss)** —
+    ///    [`disk_template::build_template_via_vm`](crate::vmm::disk_template::build_template_via_vm)
+    ///    boots a one-shot guest with the host's `mkfs.btrfs` packed
+    ///    into the initramfs; the guest formats `/dev/vda` against
+    ///    a sparse staging image, and the framework atomically moves
+    ///    the formatted image into the cache via
+    ///    [`disk_template::store_atomic`](crate::vmm::disk_template::store_atomic).
+    ///    The host never execs `mkfs.btrfs` against a real backing
+    ///    file — the guest kernel is the on-disk-format authority.
+    /// 3. **Per-test fan-out** —
+    ///    [`disk_template::clone_to_per_test`](crate::vmm::disk_template::clone_to_per_test)
+    ///    `FICLONE`-clones the cached image into a tempfile under
+    ///    the cache root. The clone is O(metadata) and copy-on-write
+    ///    at the extent level, so per-test writes never touch the
+    ///    cached template.
+    ///
+    /// Stage 3 requires the cache directory to live on a reflink-
+    /// capable filesystem (btrfs or xfs); see
+    /// [`disk_template::verify_cache_dir_supports_reflink`](crate::vmm::disk_template::verify_cache_dir_supports_reflink)
+    /// for the gate and
+    /// [`crate::vmm::KtstrVmBuilder::disk`] for the full
+    /// builder-side wiring.
     #[must_use = "builder methods consume self; bind the result"]
     pub fn filesystem(mut self, fs: Filesystem) -> Self {
         self.filesystem = fs;
@@ -795,9 +1005,23 @@ mod tests {
             .throttle
             .validate()
             .expect_err("burst < iops rejected");
+        assert_eq!(
+            err,
+            DiskThrottleValidationError::BurstBelowRate {
+                dimension: ThrottleDimension::Iops,
+                burst: 500,
+                rate: 1_000,
+            },
+            "unexpected error variant",
+        );
+        let msg = err.to_string();
         assert!(
-            err.contains("iops_burst_capacity") && err.contains("must be >="),
-            "unexpected error message: {err}"
+            msg.contains("iops_burst_capacity") && msg.contains("must be >="),
+            "unexpected error message: {msg}",
+        );
+        assert!(
+            msg.contains("pass 0 to clear"),
+            "remediation hint missing: {msg}",
         );
 
         let err = DiskConfig::default()
@@ -806,9 +1030,23 @@ mod tests {
             .throttle
             .validate()
             .expect_err("burst < bytes_per_sec rejected");
+        assert_eq!(
+            err,
+            DiskThrottleValidationError::BurstBelowRate {
+                dimension: ThrottleDimension::Bytes,
+                burst: 5_000,
+                rate: 10_000,
+            },
+            "unexpected error variant",
+        );
+        let msg = err.to_string();
         assert!(
-            err.contains("bytes_burst_capacity") && err.contains("must be >="),
-            "unexpected error message: {err}"
+            msg.contains("bytes_burst_capacity") && msg.contains("must be >="),
+            "unexpected error message: {msg}",
+        );
+        assert!(
+            msg.contains("pass 0 to clear"),
+            "remediation hint missing: {msg}",
         );
     }
 
@@ -824,9 +1062,18 @@ mod tests {
             .throttle
             .validate()
             .expect_err("iops burst one below rate must be rejected");
+        assert_eq!(
+            err,
+            DiskThrottleValidationError::BurstBelowRate {
+                dimension: ThrottleDimension::Iops,
+                burst: 999,
+                rate: 1_000,
+            },
+        );
+        let msg = err.to_string();
         assert!(
-            err.contains("iops_burst_capacity") && err.contains("must be >="),
-            "unexpected error message: {err}"
+            msg.contains("iops_burst_capacity") && msg.contains("must be >="),
+            "unexpected error message: {msg}",
         );
 
         let err = DiskConfig::default()
@@ -835,9 +1082,18 @@ mod tests {
             .throttle
             .validate()
             .expect_err("bytes burst one below rate must be rejected");
+        assert_eq!(
+            err,
+            DiskThrottleValidationError::BurstBelowRate {
+                dimension: ThrottleDimension::Bytes,
+                burst: 999,
+                rate: 1_000,
+            },
+        );
+        let msg = err.to_string();
         assert!(
-            err.contains("bytes_burst_capacity") && err.contains("must be >="),
-            "unexpected error message: {err}"
+            msg.contains("bytes_burst_capacity") && msg.contains("must be >="),
+            "unexpected error message: {msg}",
         );
     }
 
@@ -868,9 +1124,20 @@ mod tests {
             .throttle
             .validate()
             .expect_err("burst without iops rejected");
+        assert_eq!(
+            err,
+            DiskThrottleValidationError::BurstWithoutRate {
+                dimension: ThrottleDimension::Iops,
+            },
+        );
+        let msg = err.to_string();
         assert!(
-            err.contains("iops_burst_capacity") && err.contains("without iops"),
-            "unexpected error message: {err}"
+            msg.contains("iops_burst_capacity") && msg.contains("without iops"),
+            "unexpected error message: {msg}",
+        );
+        assert!(
+            msg.contains("pass 0 to clear"),
+            "remediation hint missing: {msg}",
         );
 
         let err = DiskConfig::default()
@@ -878,10 +1145,72 @@ mod tests {
             .throttle
             .validate()
             .expect_err("burst without bytes_per_sec rejected");
-        assert!(
-            err.contains("bytes_burst_capacity") && err.contains("without bytes_per_sec"),
-            "unexpected error message: {err}"
+        assert_eq!(
+            err,
+            DiskThrottleValidationError::BurstWithoutRate {
+                dimension: ThrottleDimension::Bytes,
+            },
         );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("bytes_burst_capacity") && msg.contains("without bytes_per_sec"),
+            "unexpected error message: {msg}",
+        );
+        assert!(
+            msg.contains("pass 0 to clear"),
+            "remediation hint missing: {msg}",
+        );
+    }
+
+    /// `DiskThrottleValidationError::dimension()` exposes the
+    /// throttle dimension (iops/bytes) the failure applies to so
+    /// callers can route a programmatic recovery without parsing
+    /// the rendered message. Pin the accessor's mapping over both
+    /// variants × both dimensions so a future variant addition
+    /// that forgets to populate the dimension surfaces here.
+    #[test]
+    fn validation_error_dimension_accessor() {
+        let err = DiskThrottleValidationError::BurstBelowRate {
+            dimension: ThrottleDimension::Iops,
+            burst: 500,
+            rate: 1_000,
+        };
+        assert_eq!(err.dimension(), ThrottleDimension::Iops);
+
+        let err = DiskThrottleValidationError::BurstBelowRate {
+            dimension: ThrottleDimension::Bytes,
+            burst: 500,
+            rate: 1_000,
+        };
+        assert_eq!(err.dimension(), ThrottleDimension::Bytes);
+
+        let err = DiskThrottleValidationError::BurstWithoutRate {
+            dimension: ThrottleDimension::Iops,
+        };
+        assert_eq!(err.dimension(), ThrottleDimension::Iops);
+
+        let err = DiskThrottleValidationError::BurstWithoutRate {
+            dimension: ThrottleDimension::Bytes,
+        };
+        assert_eq!(err.dimension(), ThrottleDimension::Bytes);
+    }
+
+    /// `ThrottleDimension::burst_field()` and `rate_field()` return
+    /// the wire field names matching [`DiskThrottle`] / [`DiskConfig`]
+    /// builder method names so error consumers can echo the offending
+    /// field back to the user. Pin both directions so a rename of
+    /// either field on `DiskThrottle` without a matching update here
+    /// surfaces as a test failure rather than silently desync'd
+    /// error messages.
+    #[test]
+    fn throttle_dimension_field_names() {
+        assert_eq!(ThrottleDimension::Iops.burst_field(), "iops_burst_capacity");
+        assert_eq!(ThrottleDimension::Iops.rate_field(), "iops");
+        assert_eq!(
+            ThrottleDimension::Bytes.burst_field(),
+            "bytes_burst_capacity",
+        );
+        assert_eq!(ThrottleDimension::Bytes.rate_field(), "bytes_per_sec");
     }
 
     /// Dedicated serde roundtrip for the burst fields. Distinct from

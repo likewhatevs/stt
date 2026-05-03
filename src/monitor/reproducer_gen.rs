@@ -30,7 +30,7 @@
 //! |-------------------------------|-----------------------------------------|
 //! | WorkloadGroupHint.thread_count| WorkloadConfig::num_workers             |
 //! | AffinityHint::SingleCpu{cpus} | AffinityIntent::Exact(set) when cpus non-empty; AffinityIntent::SingleCpu when empty |
-//! | AffinityHint::Exact{cpus}     | AffinityIntent::Exact(set)               |
+//! | AffinityHint::Exact{cpus}     | AffinityIntent::Exact(set) [‡]           |
 //! | AffinityHint::Inherit         | AffinityIntent::Inherit                  |
 //! | AffinityHint::LlcAligned{cpus}| AffinityIntent::Exact(set) when cpus non-empty; AffinityIntent::LlcAligned when empty |
 //! | AffinityHint::CrossCgroup{cpus}| AffinityIntent::Exact(set) when cpus non-empty; AffinityIntent::CrossCgroup when empty |
@@ -62,6 +62,14 @@
 //! `AffinityIntent::Inherit`. When the producer DID record a pool,
 //! the generator emits a fully-populated `AffinityIntent::RandomSubset`
 //! that the spawn-time gate accepts directly.
+//!
+//! [‡] Empty `cpus` emits a hand-edit-required note alongside the
+//! placeholder `AffinityIntent::Exact(empty)` — the spawn-time
+//! affinity gate rejects an empty Exact set, so the rendered spec
+//! is NOT runnable as-is until the user pastes in the observed CPUs
+//! (or switches to `AffinityIntent::Inherit`). Non-empty `cpus`
+//! emits a resolved-collapse note and the runnable
+//! `AffinityIntent::Exact` directly.
 //!
 //! `IoRandRead` and `IoConvoy` hints are accepted by the projection
 //! layer but not yet emitted by the capture pipeline; all real-disk-
@@ -98,7 +106,7 @@ use super::debug_capture::{
     AffinityHint, CgroupHint, DebugCapture, SchedPolicyHint, WorkTypeHint, WorkloadFingerprint,
     WorkloadGroupHint,
 };
-use crate::workload::{AffinityIntent, MemPolicy, MpolFlags, SchedPolicy, WorkType, WorkloadConfig, CloneMode};
+use crate::workload::{AffinityIntent, SchedPolicy, WorkType, WorkloadConfig};
 
 /// One reproducer spec — a `WorkloadConfig` value plus diagnostic
 /// notes about confidence / ambiguity.
@@ -224,6 +232,11 @@ fn map_workload_groups(fp: &WorkloadFingerprint, spec: &mut ReproducerSpec) {
 /// [`crate::workload::WorkloadHandle::spawn`] (which rejects the
 /// topology-aware variants — they require scenario context the
 /// spawn-time gate doesn't have).
+///
+/// `hand_edit_target` carries paste-ready Rust (an
+/// `AffinityIntent::exact(...)` call with angle-bracket placeholders)
+/// so the generated note can be copied into a test file with minimal
+/// editing.
 fn topology_aware_note(
     variant: &str,
     engine_action: &str,
@@ -235,7 +248,7 @@ fn topology_aware_note(
          {engine_action} at apply time. Direct \
          WorkloadHandle::spawn rejects this variant (no topology \
          context); use the scenario engine or hand-edit to \
-         AffinityIntent::Exact({hand_edit_target})"
+         {hand_edit_target}"
     )
 }
 
@@ -309,7 +322,7 @@ fn map_affinity(fp: &WorkloadFingerprint, spec: &mut ReproducerSpec) {
             "SingleCpu",
             AffinityIntent::SingleCpu,
             "picks the concrete CPU from the cgroup's cpuset",
-            "[cpu]",
+            "AffinityIntent::exact([<cpu>])",
             spec,
         ),
         AffinityHint::LlcAligned { cpus } => map_topology_aware_affinity(
@@ -317,7 +330,7 @@ fn map_affinity(fp: &WorkloadFingerprint, spec: &mut ReproducerSpec) {
             "LlcAligned",
             AffinityIntent::LlcAligned,
             "resolves the LLC mask from the cgroup's cpuset",
-            "<llc cpus>",
+            "AffinityIntent::exact([<llc_cpu_0>, <llc_cpu_1>, ...])",
             spec,
         ),
         AffinityHint::CrossCgroup { cpus } => map_topology_aware_affinity(
@@ -325,7 +338,7 @@ fn map_affinity(fp: &WorkloadFingerprint, spec: &mut ReproducerSpec) {
             "CrossCgroup",
             AffinityIntent::CrossCgroup,
             "expands to the full topology",
-            "<all cpus>",
+            "AffinityIntent::exact([<cpu_0>, <cpu_1>, ...])",
             spec,
         ),
         AffinityHint::SmtSiblingPair { cpus } => map_topology_aware_affinity(
@@ -334,10 +347,33 @@ fn map_affinity(fp: &WorkloadFingerprint, spec: &mut ReproducerSpec) {
             AffinityIntent::SmtSiblingPair,
             "picks an SMT-sibling pair from the cgroup's effective cpuset, \
              or the full topology when no cpuset is active",
-            "[sibling_a, sibling_b]",
+            "AffinityIntent::exact([<sibling_a>, <sibling_b>])",
             spec,
         ),
-        AffinityHint::Exact { cpus } => AffinityIntent::Exact(cpus_to_set(cpus)),
+        AffinityHint::Exact { cpus } => {
+            // Empty `cpus` produces an empty Exact set that the
+            // spawn-time affinity gate rejects. Emit a note so the
+            // reproducer surface is consistent — every other arm
+            // pushes a note when it lands a placeholder, and the
+            // resolved arms push a `topology_resolved_note`. An
+            // empty Exact is the malformed shape; a populated Exact
+            // is the runnable shape.
+            if cpus.is_empty() {
+                spec.notes.push(
+                    "AffinityHint::Exact observed with no CPUs; emitting \
+                     AffinityIntent::Exact(empty) — the spawn-time \
+                     affinity gate rejects an empty Exact set, so this \
+                     spec is NOT runnable as-is. Hand-edit to \
+                     AffinityIntent::exact([<cpu_0>, <cpu_1>, ...]) \
+                     with the observed CPUs, or change to \
+                     AffinityIntent::Inherit."
+                        .into(),
+                );
+            } else {
+                spec.notes.push(topology_resolved_note("Exact", cpus));
+            }
+            AffinityIntent::Exact(cpus_to_set(cpus))
+        }
         AffinityHint::RandomSubset { from, count } => {
             if from.is_empty() || *count == 0 {
                 spec.notes.push(
@@ -470,10 +506,6 @@ fn map_sched_policy(fp: &WorkloadFingerprint, spec: &mut ReproducerSpec) {
             );
         }
     }
-    // Ensure framework defaults for unset MemPolicy/MpolFlags/CloneMode.
-    spec.config.mem_policy = MemPolicy::Default;
-    spec.config.mpol_flags = MpolFlags::NONE;
-    spec.config.clone_mode = CloneMode::Fork;
 
     if fp.sched_policy_hints.len() > 1 {
         let alts: Vec<String> = fp
@@ -692,7 +724,11 @@ mod tests {
         assert_eq!(spec.config.num_workers, 8);
     }
 
-    /// AffinityHint::Exact{cpus} → AffinityIntent::Exact(set).
+    /// AffinityHint::Exact{cpus} → AffinityIntent::Exact(set), and
+    /// the populated path now emits a resolved-collapse note (the
+    /// Exact branch is the only one that previously left
+    /// `spec.notes` empty — fixed alongside #465 to match every
+    /// other arm's note-emission behavior).
     #[test]
     fn generate_spec_exact_affinity() {
         let mut cap = DebugCapture::default();
@@ -707,6 +743,47 @@ mod tests {
             }
             other => panic!("expected Exact, got {other:?}"),
         }
+        assert!(
+            spec.notes.iter().any(|n| n.contains("AffinityHint::Exact")
+                && n.contains("with resolved CPUs")),
+            "populated Exact must emit a resolved-collapse note for surface consistency: {:?}",
+            spec.notes,
+        );
+    }
+
+    /// Empty `AffinityHint::Exact { cpus: vec![] }` produces an
+    /// empty `AffinityIntent::Exact` set that the spawn-time
+    /// affinity gate rejects. The mapper must surface a
+    /// hand-edit-required note pointing at paste-ready Rust
+    /// (`AffinityIntent::exact([<cpu_0>, <cpu_1>, ...])`) so the
+    /// reproducer surface mirrors the topology-aware variants'
+    /// unresolved branch instead of silently producing a malformed
+    /// spec. Pins the asymmetry doc on
+    /// [`crate::monitor::debug_capture::AffinityHint::exact`].
+    #[test]
+    fn generate_spec_exact_empty_emits_unresolved_note() {
+        let mut cap = DebugCapture::default();
+        cap.fingerprint.affinity_hints = vec![AffinityHint::Exact { cpus: Vec::new() }];
+        let spec = generate_spec(&cap);
+        match &spec.config.affinity {
+            AffinityIntent::Exact(set) => {
+                assert!(set.is_empty(), "empty Exact must propagate through to AffinityIntent: {set:?}");
+            }
+            other => panic!("expected empty Exact, got {other:?}"),
+        }
+        assert!(
+            spec.notes.iter().any(|n| n.contains("AffinityHint::Exact")
+                && n.contains("no CPUs")),
+            "empty Exact must surface a hand-edit-required note: {:?}",
+            spec.notes,
+        );
+        assert!(
+            spec.notes.iter().any(|n| n.contains(
+                "AffinityIntent::exact([<cpu_0>, <cpu_1>, ...])"
+            )),
+            "empty Exact note must include paste-ready Rust hand-edit target: {:?}",
+            spec.notes,
+        );
     }
 
     /// `WorkTypeHint::Bursty {burst_duration, sleep_duration}`
@@ -828,7 +905,8 @@ mod tests {
     /// the consumer that direct [`crate::workload::WorkloadHandle::spawn`]
     /// rejects this variant (the scenario engine resolves it from
     /// cgroup cpuset context). Pins the unresolved-fallback path of
-    /// the topology-aware projection.
+    /// the topology-aware projection. The hand-edit target must be
+    /// paste-ready Rust (`AffinityIntent::exact(...)`).
     #[test]
     fn generate_spec_llc_aligned_unresolved_emits_topology_aware() {
         let mut cap = DebugCapture::default();
@@ -841,6 +919,13 @@ mod tests {
                 .any(|n| n.contains("AffinityHint::LlcAligned")
                     && n.contains("without resolved CPUs")),
             "unresolved LlcAligned must surface a topology-aware-fallback note: {:?}",
+            spec.notes,
+        );
+        assert!(
+            spec.notes.iter().any(|n| n.contains(
+                "AffinityIntent::exact([<llc_cpu_0>, <llc_cpu_1>, ...])"
+            )),
+            "unresolved LlcAligned note must include paste-ready Rust hand-edit target: {:?}",
             spec.notes,
         );
     }
@@ -909,7 +994,8 @@ mod tests {
     /// Unresolved `SingleCpu` hint falls back to
     /// [`AffinityIntent::SingleCpu`] with a hand-edit note. Pins the
     /// fallback path so a regression that drops the unresolved
-    /// branch surfaces here.
+    /// branch surfaces here. The hand-edit target must be paste-ready
+    /// Rust (`AffinityIntent::exact(...)`).
     #[test]
     fn generate_spec_single_cpu_unresolved_emits_topology_aware() {
         let mut cap = DebugCapture::default();
@@ -921,6 +1007,13 @@ mod tests {
                 .iter()
                 .any(|n| n.contains("AffinityHint::SingleCpu")
                     && n.contains("without resolved CPUs")),
+        );
+        assert!(
+            spec.notes.iter().any(|n| n.contains(
+                "AffinityIntent::exact([<cpu>])"
+            )),
+            "unresolved SingleCpu note must include paste-ready Rust hand-edit target: {:?}",
+            spec.notes,
         );
     }
 
@@ -955,7 +1048,8 @@ mod tests {
     /// the consumer that direct [`crate::workload::WorkloadHandle::spawn`]
     /// rejects this variant (the scenario engine expands it to the
     /// full topology). Pins the unresolved-fallback path of the
-    /// CrossCgroup topology-aware projection.
+    /// CrossCgroup topology-aware projection. The hand-edit target
+    /// must be paste-ready Rust (`AffinityIntent::exact(...)`).
     #[test]
     fn generate_spec_cross_cgroup_unresolved_emits_topology_aware() {
         let mut cap = DebugCapture::default();
@@ -969,6 +1063,13 @@ mod tests {
                 .any(|n| n.contains("AffinityHint::CrossCgroup")
                     && n.contains("without resolved CPUs")),
             "unresolved CrossCgroup must surface a topology-aware-fallback note: {:?}",
+            spec.notes,
+        );
+        assert!(
+            spec.notes.iter().any(|n| n.contains(
+                "AffinityIntent::exact([<cpu_0>, <cpu_1>, ...])"
+            )),
+            "unresolved CrossCgroup note must include paste-ready Rust hand-edit target: {:?}",
             spec.notes,
         );
     }
@@ -1028,6 +1129,109 @@ mod tests {
         );
     }
 
+    /// Mixed-input `RandomSubset`: non-empty `from` with `count == 0`
+    /// projects to the unresolved placeholder. The mapper rejects on
+    /// EITHER `from.is_empty()` OR `*count == 0`, so a producer that
+    /// records the pool but loses the popcount value (or vice versa)
+    /// must surface as the hand-edit-required placeholder rather
+    /// than a half-populated `AffinityIntent::RandomSubset` that the
+    /// spawn-time gate rejects with a less actionable error.
+    #[test]
+    fn generate_spec_random_subset_pool_without_count_is_placeholder() {
+        let mut cap = DebugCapture::default();
+        cap.fingerprint.affinity_hints = vec![AffinityHint::RandomSubset {
+            from: vec![0, 1, 2],
+            count: 0,
+        }];
+        let spec = generate_spec(&cap);
+        match &spec.config.affinity {
+            AffinityIntent::RandomSubset { from, count } => {
+                assert!(
+                    from.is_empty(),
+                    "(non_empty, 0) must drop pool to placeholder: got {from:?}",
+                );
+                assert_eq!(*count, 0);
+            }
+            other => panic!("expected placeholder RandomSubset, got {other:?}"),
+        }
+        assert!(
+            spec.notes
+                .iter()
+                .any(|n| n.contains("AffinityHint::RandomSubset")
+                    && n.contains("without a resolved pool")),
+            "(non_empty, 0) must surface unresolved-pool note: {:?}",
+            spec.notes,
+        );
+    }
+
+    /// Mixed-input `RandomSubset`: empty `from` with non-zero `count`
+    /// projects to the unresolved placeholder for the same reason
+    /// (either side missing → placeholder). The popcount alone is
+    /// insufficient to spawn — the spawn-time gate needs a real CPU
+    /// pool, so we surface the hand-edit prompt up-front.
+    #[test]
+    fn generate_spec_random_subset_count_without_pool_is_placeholder() {
+        let mut cap = DebugCapture::default();
+        cap.fingerprint.affinity_hints = vec![AffinityHint::RandomSubset {
+            from: Vec::new(),
+            count: 3,
+        }];
+        let spec = generate_spec(&cap);
+        match &spec.config.affinity {
+            AffinityIntent::RandomSubset { from, count } => {
+                assert!(from.is_empty());
+                assert_eq!(
+                    *count, 0,
+                    "([], non_zero) must drop count to placeholder: got {count}",
+                );
+            }
+            other => panic!("expected placeholder RandomSubset, got {other:?}"),
+        }
+        assert!(
+            spec.notes
+                .iter()
+                .any(|n| n.contains("AffinityHint::RandomSubset")
+                    && n.contains("without a resolved pool")),
+            "([], non_zero) must surface unresolved-pool note: {:?}",
+            spec.notes,
+        );
+    }
+
+    /// `count` > `from.len()` is accepted as resolved — the mapper
+    /// gates only on emptiness, not on whether `count` exceeds the
+    /// pool size. The spawn-time affinity resolver enforces the
+    /// `count <= from.len()` invariant; the projection layer trusts
+    /// the producer-observed values verbatim and lets the downstream
+    /// gate surface the constraint violation.
+    #[test]
+    fn generate_spec_random_subset_count_exceeds_pool_is_populated() {
+        let mut cap = DebugCapture::default();
+        cap.fingerprint.affinity_hints = vec![AffinityHint::RandomSubset {
+            from: vec![0, 1],
+            count: 10,
+        }];
+        let spec = generate_spec(&cap);
+        match &spec.config.affinity {
+            AffinityIntent::RandomSubset { from, count } => {
+                let v: Vec<usize> = from.iter().copied().collect();
+                assert_eq!(v, vec![0, 1]);
+                assert_eq!(
+                    *count, 10,
+                    "count > pool.len() must passthrough verbatim: got {count}",
+                );
+            }
+            other => panic!("expected populated RandomSubset, got {other:?}"),
+        }
+        assert!(
+            spec.notes
+                .iter()
+                .any(|n| n.contains("AffinityHint::RandomSubset")
+                    && n.contains("with resolved pool")),
+            "count > pool.len() must take the resolved path: {:?}",
+            spec.notes,
+        );
+    }
+
     /// Resolved `SmtSiblingPair` hint (non-empty `cpus`) collapses to
     /// [`AffinityIntent::Exact`]. The producer recorded the observed
     /// SMT sibling pair and the generator emits a runnable spec.
@@ -1060,7 +1264,10 @@ mod tests {
     /// [`crate::workload::WorkloadHandle::spawn`] rejects this
     /// variant (the scenario engine resolves it from the cgroup's
     /// cpuset). Pins the unresolved-fallback path of the
-    /// SmtSiblingPair topology-aware projection.
+    /// SmtSiblingPair topology-aware projection. The hand-edit
+    /// target string is paste-ready Rust
+    /// (`AffinityIntent::exact([<sibling_a>, <sibling_b>])`), so the
+    /// note must contain that exact substring.
     #[test]
     fn generate_spec_smt_sibling_pair_unresolved_emits_topology_aware() {
         let mut cap = DebugCapture::default();
@@ -1077,6 +1284,13 @@ mod tests {
                 .any(|n| n.contains("AffinityHint::SmtSiblingPair")
                     && n.contains("without resolved CPUs")),
             "unresolved SmtSiblingPair must surface a topology-aware-fallback note: {:?}",
+            spec.notes,
+        );
+        assert!(
+            spec.notes.iter().any(|n| n.contains(
+                "AffinityIntent::exact([<sibling_a>, <sibling_b>])"
+            )),
+            "unresolved SmtSiblingPair note must include paste-ready Rust hand-edit target: {:?}",
             spec.notes,
         );
     }
@@ -1123,8 +1337,9 @@ mod tests {
     /// When the generator emits any notes (e.g. from fingerprint
     /// gaps), `render_run_file_source` surfaces them under a
     /// `// Generator notes:` comment block prefixed by `// - `.
-    /// Pins the conditional-rendering branch at L395-401 so a
-    /// regression that drops the comment block surfaces here.
+    /// Pins the conditional-rendering branch in
+    /// [`render_run_file_source`] so a regression that drops the
+    /// comment block surfaces here.
     #[test]
     fn render_run_file_source_renders_notes() {
         let mut cap = DebugCapture::default();
@@ -1169,6 +1384,141 @@ mod tests {
         assert!(src.contains("Cgroup hints"));
         assert!(src.contains("/system.slice/foo.service"));
         assert!(src.contains("weight=Some(200)"));
+    }
+
+    /// End-to-end smoke test: build a fingerprint with one hint of
+    /// every kind (workload group, a resolved topology-aware affinity
+    /// variant, a parameterized work-type, a cgroup hint, a
+    /// sched-policy hint, and a fingerprint gap), run
+    /// [`generate_spec`] → [`render_run_file_source`], and assert the
+    /// output is deterministic (same input → byte-identical output)
+    /// and carries every expected fragment. The test pins the full
+    /// pipeline so a regression in any single stage (projection,
+    /// mapping, render) surfaces here even when the per-variant unit
+    /// tests pass.
+    ///
+    /// Picks `SmtSiblingPair { cpus: vec![4, 5] }` as the primary
+    /// affinity hint to exercise the resolved-collapse path; a
+    /// secondary `Exact` hint demonstrates the
+    /// "additional affinity hints not modeled" fallback.
+    /// Unresolved-payload branches for the topology-aware variants
+    /// have dedicated tests above.
+    #[test]
+    fn render_run_file_source_e2e_smoke() {
+        let mut cap = DebugCapture::default();
+        cap.fingerprint.workload_groups = vec![WorkloadGroupHint {
+            cgroup_path: "/system.slice/foo.service".into(),
+            thread_count: 16,
+            cpu_time_fraction: 0.65,
+            wakeups_per_sec: 850.0,
+        }];
+        // Pick one resolved affinity hint — the first wins; rest fold
+        // into notes via the existing "additional affinity hints"
+        // formatter.
+        cap.fingerprint.affinity_hints = vec![
+            AffinityHint::SmtSiblingPair { cpus: vec![4, 5] },
+            AffinityHint::Exact { cpus: vec![0, 1, 2, 3] },
+        ];
+        cap.fingerprint.work_type_hints = vec![WorkTypeHint::Bursty {
+            burst_duration: Duration::from_millis(7),
+            sleep_duration: Duration::from_millis(43),
+        }];
+        cap.fingerprint.cgroup_hints = vec![CgroupHint {
+            path: "/system.slice/foo.service".into(),
+            cpu_weight: Some(150),
+            memory_max_bytes: Some(4 * 1024 * 1024 * 1024),
+            cpuset_cpus: vec![4, 5],
+            cpu_max_quota_us: Some(50_000),
+        }];
+        cap.fingerprint.sched_policy_hints =
+            vec![SchedPolicyHint::Fifo { priority: 60 }];
+        cap.fingerprint.gaps = vec!["sample window had 2 dropouts".into()];
+
+        let spec1 = generate_spec(&cap);
+        let src1 = render_run_file_source(&spec1, "e2e_repro");
+
+        // Determinism: same capture → byte-identical render.
+        let spec2 = generate_spec(&cap);
+        let src2 = render_run_file_source(&spec2, "e2e_repro");
+        assert_eq!(
+            src1, src2,
+            "render_run_file_source must be deterministic for the same capture",
+        );
+
+        // Skeleton + import lines always present.
+        assert!(src1.contains("use ktstr::workload::*;"));
+        assert!(src1.contains("use std::collections::BTreeSet;"));
+        assert!(src1.contains("use std::time::Duration;"));
+        assert!(src1.contains("pub fn e2e_repro"));
+
+        // Workload-group projection wired into builder.
+        assert!(
+            src1.contains(".workers(16)"),
+            "thread_count=16 must surface as .workers(16): {src1}",
+        );
+
+        // The resolved SmtSiblingPair hint collapses to Exact —
+        // the captured siblings land in the rendered builder call.
+        assert!(
+            src1.contains(".affinity(AffinityIntent::Exact"),
+            "first affinity hint (SmtSiblingPair) must collapse to Exact: {src1}",
+        );
+        assert!(
+            src1.contains("BTreeSet::from([4, 5])"),
+            "Exact pool must contain the SmtSiblingPair CPUs: {src1}",
+        );
+
+        // Bursty parameters come through.
+        assert!(
+            src1.contains(".work_type(WorkType::Bursty"),
+            "Bursty work-type hint must reach the builder: {src1}",
+        );
+        assert!(
+            src1.contains("Duration::from_millis(7)") && src1.contains("Duration::from_millis(43)"),
+            "Bursty durations must surface in the rendered call: {src1}",
+        );
+
+        // Sched-policy + cgroup hints in the rendered surface.
+        assert!(
+            src1.contains(".sched_policy(SchedPolicy::Fifo(60))"),
+            "Fifo priority must surface: {src1}",
+        );
+        assert!(
+            src1.contains("Cgroup hints"),
+            "cgroup hints must render as comments: {src1}",
+        );
+        assert!(
+            src1.contains("/system.slice/foo.service"),
+            "cgroup path must appear in the rendered comments: {src1}",
+        );
+
+        // Notes block contains the propagated fingerprint gap +
+        // resolved-collapse note for SmtSiblingPair + the
+        // additional-hints fallback for the second affinity entry.
+        assert!(
+            src1.contains("Generator notes:"),
+            "non-empty notes must trigger the comment block: {src1}",
+        );
+        assert!(
+            src1.contains("fingerprint gap: sample window had 2 dropouts"),
+            "fingerprint gap must propagate verbatim: {src1}",
+        );
+        assert!(
+            src1.contains("AffinityHint::SmtSiblingPair"),
+            "resolved-collapse note must cite the original variant: {src1}",
+        );
+        assert!(
+            src1.contains("additional affinity hints not modeled"),
+            "second affinity hint must surface as an additional-hints note: {src1}",
+        );
+
+        // No "TODO: refine from capture" placeholder for any
+        // implemented work-type — Bursty is fully mapped, so the
+        // render_work_type wildcard arm must not fire.
+        assert!(
+            !src1.contains("TODO: refine from capture"),
+            "implemented work-type variants must not render a TODO placeholder: {src1}",
+        );
     }
 
     /// Affinity render handles every AffinityIntent variant.

@@ -643,7 +643,9 @@ pub mod prelude {
     // `ktstr_test_early_dispatch`, `run_ktstr_test`,
     // `resolve_scheduler`, `resolve_test_kernel`.
     pub use crate::topology::{LlcInfo, NodeMemInfo, TestTopology};
-    pub use crate::vmm::disk_config::{DiskConfig, DiskThrottle, Filesystem};
+    pub use crate::vmm::disk_config::{
+        DiskConfig, DiskThrottle, DiskThrottleValidationError, Filesystem, ThrottleDimension,
+    };
     pub use crate::vmm::VirtioBlkCounters;
     pub use crate::workload::{
         AffinityIntent, AluWidth, CloneMode, MemPolicy, Migration, MpolFlags, Phase,

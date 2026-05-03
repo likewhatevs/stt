@@ -306,9 +306,31 @@ pub(crate) fn lookup(key: &str) -> Result<Option<PathBuf>> {
 /// function trusts the caller already holds the lock.
 ///
 /// The atomic-rename pattern matches [`crate::cache::CacheDir::store`]:
-/// on partial failure the staging directory is removed by the OS on
-/// next boot if not by the caller, but the live cache always sees
-/// either no entry or a complete entry — never a half-written one.
+/// on partial failure the staging directory is removed by the
+/// caller (best-effort), and the live cache always sees either no
+/// entry or a complete entry — never a half-written one.
+///
+/// # Failure cleanup
+///
+/// Two failure points after the staging directory is created can
+/// strand intermediate state:
+///
+/// - The first `fs::rename(src_path, &staging_image)` failure
+///   leaves an empty staging directory (`src_path` is untouched —
+///   `rename(2)` does not modify the source on failure). The
+///   staging dir is removed best-effort before propagating.
+/// - The second `fs::rename(&staging, &final_dir)` failure leaves
+///   the populated staging dir on disk (the first rename moved
+///   `src_path` into `staging_image` and is irreversible). The
+///   staging dir AND its contained image are removed best-effort
+///   before propagating; without this cleanup the staging tree
+///   would accumulate across retries inside the cache root, where
+///   neither the per-key flock nor a future `ensure_template` peer
+///   would garbage-collect it.
+///
+/// Cleanup errors are best-effort because the original error is the
+/// dominant signal; a `remove_dir_all` failure on top of an already-
+/// failing publish adds no actionable diagnostic for the caller.
 pub(crate) fn store_atomic(key: &str, src_path: &Path) -> Result<PathBuf> {
     let root = cache_root()?;
     std::fs::create_dir_all(&root)
@@ -358,14 +380,31 @@ pub(crate) fn store_atomic(key: &str, src_path: &Path) -> Result<PathBuf> {
     let staging_image = staging.join(TEMPLATE_FILENAME);
     // Move src_path into the staging dir. `fs::rename` is atomic on
     // the same filesystem; the cross-fs gate above guarantees that.
-    std::fs::rename(src_path, &staging_image)
-        .with_context(|| format!("rename {src_path:?} -> {staging_image:?}"))?;
-    // Final atomic publish.
-    std::fs::rename(&staging, &final_dir).with_context(|| {
-        format!(
-            "publish staging {staging:?} -> {final_dir:?} (cache key {key})",
-        )
-    })?;
+    // On failure src_path is unchanged (rename(2) is atomic), but
+    // the empty staging directory is left behind — clean it up
+    // before propagating so the cache root does not accumulate
+    // empty `.tmp.<pid>` directories across retries.
+    if let Err(e) = std::fs::rename(src_path, &staging_image) {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(e).with_context(|| {
+            format!("rename {src_path:?} -> {staging_image:?}")
+        });
+    }
+    // Final atomic publish. On failure the staging directory now
+    // contains `staging_image` (the first rename moved src_path into
+    // it and is not reversible). Without the cleanup arm below the
+    // populated staging dir would persist across retries — the
+    // per-key flock prevents a peer from racing on the same key,
+    // but the in-flight staging tree is not garbage-collected by
+    // any other code path.
+    if let Err(e) = std::fs::rename(&staging, &final_dir) {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(e).with_context(|| {
+            format!(
+                "publish staging {staging:?} -> {final_dir:?} (cache key {key})",
+            )
+        });
+    }
     Ok(final_dir.join(TEMPLATE_FILENAME))
 }
 
@@ -586,6 +625,79 @@ pub(crate) fn ensure_template(fs: Filesystem, capacity_bytes: u64) -> Result<Pat
     Ok(final_path)
 }
 
+/// Compose the staging-image path for a `(cache_key, pid)` pair.
+///
+/// The filename includes BOTH the cache key and the pid because the
+/// per-key flock only serialises peers within a single key — the
+/// same process holds different per-key flocks concurrently across
+/// distinct `(fs, capacity)` pairs (cross-key concurrency is
+/// permitted). Without the key in the filename, two simultaneous
+/// in-flight builds for `btrfs-256m` and `btrfs-1024m` from the
+/// same pid would collide on `template.img.in-flight.<pid>` — the
+/// second open would truncate the first's image while it boots,
+/// corrupting the template the first build is formatting. Including
+/// the key makes the filename unique per `(key, pid)`.
+///
+/// Pulled out as a free fn so the uniqueness invariant has a
+/// dedicated test (`staging_image_path_is_unique_per_key_and_pid`).
+fn staging_image_path(cache_root: &Path, cache_key: &str, pid: u32) -> PathBuf {
+    cache_root.join(format!("template.img.in-flight.{cache_key}.{pid}"))
+}
+
+/// Materialise an empty sparse image at `staging_path` of exactly
+/// `capacity_bytes`.
+///
+/// Removes any same-path leftover from a prior crashed run (the
+/// per-key flock guarantees no live peer holds it; same-pid debris
+/// is the only realistic source). On `set_len` failure (the
+/// specific errno depends on the cache filesystem — common
+/// examples include ENOSPC and EFBIG) the empty file is
+/// unlinked best-effort before propagating; without that cleanup
+/// a 0-byte staging image would accumulate in the cache root
+/// across retries, mirroring the leak-cleanup behaviour at the
+/// VM-boot/run failure sites farther down. The file descriptor is
+/// dropped before the unlink as defense-in-depth: local
+/// filesystems (btrfs/ext4/xfs) propagate truncate synchronously
+/// but FUSE/NFS backings can delay until close.
+///
+/// Pulled out as a free fn so the cleanup arm has a dedicated
+/// test (`create_and_size_staging_image_cleans_up_on_set_len_failure`)
+/// that does not require booting a VM. Production callsites in
+/// [`build_template_via_vm`] reach this helper via the standard
+/// resource-bootstrap path.
+fn create_and_size_staging_image(
+    staging_path: &Path,
+    capacity_bytes: u64,
+) -> Result<()> {
+    if staging_path.exists() {
+        std::fs::remove_file(staging_path).with_context(|| {
+            format!("remove leftover staging image {staging_path:?} before rebuild")
+        })?;
+    }
+    let staging_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(staging_path)
+        .with_context(|| format!("create staging image {staging_path:?}"))?;
+    if let Err(e) = staging_file.set_len(capacity_bytes) {
+        drop(staging_file);
+        let _ = std::fs::remove_file(staging_path);
+        return Err(e).with_context(|| {
+            format!(
+                "set staging image length to {capacity_bytes} bytes \
+                 ({staging_path:?})"
+            )
+        });
+    }
+    // Drop the host-side fd before returning; the VM opens its own
+    // RW fd via `template_staging_image`, and host writes through a
+    // stale fd would race the guest's mkfs.
+    drop(staging_file);
+    Ok(())
+}
+
 /// Build a fresh template image by booting a one-shot template VM.
 ///
 /// Steps:
@@ -651,65 +763,11 @@ fn build_template_via_vm(
         })?;
 
     // Stage the sparse image under the cache root so the eventual
-    // rename(2) into place is on the same filesystem (statfs
-    // f_type / f_fsid match — see store_atomic). The filename
-    // includes BOTH the cache key and the pid: the per-key flock
-    // already serialises peers within a single key, but the same
-    // process holds different per-key flocks concurrently across
-    // distinct `(fs, capacity)` pairs (cross-key concurrency is
-    // permitted). Without the key in the filename, two
-    // simultaneous in-flight builds for `btrfs-256m` and
-    // `btrfs-1024m` from the same pid would collide on
-    // `template.img.in-flight.<pid>` — the second open would
-    // truncate the first's image while it boots, corrupting the
-    // template the first build is formatting. Including the key
-    // makes the filename unique per (key, pid).
+    // rename(2) into place is on the same filesystem.
     std::fs::create_dir_all(cache_root)
         .with_context(|| format!("create cache root {cache_root:?} for staging image"))?;
-    let staging_path = cache_root.join(format!(
-        "template.img.in-flight.{key}.{pid}",
-        key = cache_key,
-        pid = std::process::id(),
-    ));
-    // Remove any leftover from a prior crashed run with the same
-    // pid before opening. The per-key flock serialises peers; a
-    // surviving file at this path is debris from a same-pid retry
-    // and is safe to truncate.
-    if staging_path.exists() {
-        std::fs::remove_file(&staging_path).with_context(|| {
-            format!("remove leftover staging image {staging_path:?} before rebuild")
-        })?;
-    }
-    let staging_file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&staging_path)
-        .with_context(|| format!("create staging image {staging_path:?}"))?;
-    // Pre-VM-boot path: a `set_len` failure (the specific errno
-    // depends on the cache filesystem — common examples include
-    // ENOSPC, ENOMEM, EFBIG) leaves the just-created `staging_path`
-    // on disk. The
-    // VM-boot error path below unlinks on failure; replicate that
-    // here so the empty / truncated file does not accumulate in the
-    // cache root across retries. Drop fd first as defense-in-depth
-    // — local filesystems (btrfs/ext4/xfs) propagate truncate
-    // synchronously, but FUSE/NFS backings can delay until close.
-    if let Err(e) = staging_file.set_len(capacity_bytes) {
-        drop(staging_file);
-        let _ = std::fs::remove_file(&staging_path);
-        return Err(e).with_context(|| {
-            format!(
-                "set staging image length to {capacity_bytes} bytes \
-                 ({staging_path:?})"
-            )
-        });
-    }
-    // Drop the host-side fd before booting; the VM opens its own
-    // RW fd via `template_staging_image`, and host writes through
-    // a stale fd would race the guest's mkfs.
-    drop(staging_file);
+    let staging_path = staging_image_path(cache_root, cache_key, std::process::id());
+    create_and_size_staging_image(&staging_path, capacity_bytes)?;
 
     // Build the template VM. The `template_staging_image` setter
     // makes init_virtio_blk open `staging_path` directly, bypassing
@@ -1111,6 +1169,117 @@ mod tests {
                      diagnostic, not a symlink-resolution error; got: {msg}",
                 );
             }
+        }
+    }
+
+    /// Cross-key concurrency invariant: two distinct cache keys held
+    /// by the same pid produce distinct staging-image paths. Without
+    /// the cache_key qualifier in the filename, the same process
+    /// concurrently building `btrfs-256m` and `btrfs-1024m` would
+    /// collide on `template.img.in-flight.<pid>` — the second open
+    /// would truncate the first's image while it boots, corrupting
+    /// the template the first build is formatting. Pin the
+    /// uniqueness contract here so a regression that drops the
+    /// cache_key from [`staging_image_path`] surfaces immediately
+    /// rather than as a flaky cross-key test.
+    #[test]
+    fn staging_image_path_is_unique_per_key_and_pid() {
+        let cache_root = std::path::Path::new("/tmp/ktstr-fake-cache-root");
+        let pid = 12_345u32;
+        let p_256 = staging_image_path(cache_root, "btrfs-256m", pid);
+        let p_1024 = staging_image_path(cache_root, "btrfs-1024m", pid);
+        // Same pid, different keys → different paths.
+        assert_ne!(
+            p_256, p_1024,
+            "cache_key qualifier missing from staging-image path: \
+             distinct keys collided",
+        );
+        // Both paths embed the cache_key and the pid verbatim.
+        assert!(
+            p_256
+                .to_string_lossy()
+                .contains("template.img.in-flight.btrfs-256m.12345"),
+            "256m staging path missing key/pid token: {p_256:?}",
+        );
+        assert!(
+            p_1024
+                .to_string_lossy()
+                .contains("template.img.in-flight.btrfs-1024m.12345"),
+            "1024m staging path missing key/pid token: {p_1024:?}",
+        );
+        // Same key, different pids → different paths (per-pid debris
+        // never collides with a live peer's staging file).
+        let p_256_other_pid = staging_image_path(cache_root, "btrfs-256m", 67_890);
+        assert_ne!(p_256, p_256_other_pid);
+
+        // Idempotence: same input → same output. Defends against a
+        // future regression that introduces nondeterminism (e.g.
+        // reads `process::id()` internally instead of taking pid as
+        // an argument, or appends a randomised suffix). The function
+        // must be a pure mapping from `(cache_root, key, pid)` to
+        // `PathBuf` so the per-key flock and the staging-image path
+        // can coordinate without surprise.
+        assert_eq!(
+            p_256,
+            staging_image_path(cache_root, "btrfs-256m", pid),
+            "staging_image_path must be a pure function of its inputs",
+        );
+    }
+
+    /// Cleanup contract for the [`create_and_size_staging_image`]
+    /// helper: when `set_len` fails (ENOSPC, EFBIG, EINVAL, etc.)
+    /// the just-created empty file must be unlinked before
+    /// propagating the error, so the cache root does not accumulate
+    /// 0-byte staging images across retries.
+    ///
+    /// Drives the failure via `set_len(u64::MAX)`:
+    /// [`std::fs::File::set_len`] internally `try_into::<i64>()`-s
+    /// its `u64` argument and returns an `io::Error` of kind
+    /// `InvalidInput` ("out of range integral type conversion
+    /// attempted") for any value above `i64::MAX`, BEFORE issuing
+    /// the `ftruncate(2)` syscall. That gives a deterministic,
+    /// process-local, signal-free failure path — no `RLIMIT_FSIZE`
+    /// manipulation, no SIGXFSZ disposition juggling, no parallel-
+    /// test cross-talk. The cleanup arm semantics are identical
+    /// regardless of whether the failure originates in the std
+    /// pre-syscall guard or in the kernel itself, so this exercises
+    /// the same drop-fd-then-unlink path that ENOSPC / EFBIG / EINVAL
+    /// in production hit.
+    ///
+    /// Without the cleanup, the just-created 0-byte file would
+    /// persist (the open succeeded; only the size enlargement
+    /// failed). The post-condition asserts ENOENT at the staging
+    /// path after the helper returns Err.
+    #[test]
+    fn create_and_size_staging_image_cleans_up_on_set_len_failure() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let staging_path = tmp.path().join("template.img.in-flight.btrfs-256m.0");
+
+        // u64::MAX > i64::MAX → File::set_len returns InvalidInput
+        // before any ftruncate syscall is issued. Sentinel choice
+        // pins to this Rust-side guard rather than to a kernel
+        // errno that varies across filesystems.
+        let err = create_and_size_staging_image(&staging_path, u64::MAX)
+            .expect_err("set_len(u64::MAX) must fail at the i64 cast");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("set staging image length"),
+            "error must surface the set_len-failed context: {msg}",
+        );
+
+        // The cleanup arm must have unlinked the 0-byte file.
+        // Verify by stat'ing the path: ENOENT is the success
+        // criterion. Distinguishes the cleanup-fired success case
+        // from the cleanup-skipped regression where the empty file
+        // still sits on disk waiting to leak across retries.
+        match std::fs::metadata(&staging_path) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => { /* ok */ }
+            Ok(m) => panic!(
+                "staging image not cleaned up after set_len failure: \
+                 still exists at {staging_path:?} ({} bytes)",
+                m.len(),
+            ),
+            Err(e) => panic!("unexpected stat error: {e}"),
         }
     }
 }

@@ -286,16 +286,33 @@ pub enum AffinityHint {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         cpus: Vec<u32>,
     },
-    /// Threads observed pinned to the two SMT siblings of one
-    /// physical core (mask popcount == 2 across the capture window
-    /// for the majority of threads in the group, and the two CPUs
-    /// share a thread_siblings list per
+    /// Threads observed pinned to the SMT siblings of one physical
+    /// core (mask popcount equal to `threads_per_core` (2 on x86_64;
+    /// potentially higher on SMT-N architectures such as POWER9
+    /// SMT-4, POWER10 SMT-4/SMT-8, ThunderX2, or Xeon Phi) across
+    /// the capture window for the majority of threads in the group,
+    /// and all siblings share a `thread_siblings_list` entry per
     /// `/sys/devices/system/cpu/cpu*/topology/thread_siblings_list`).
     /// → `AffinityIntent::SmtSiblingPair`.
     ///
-    /// `cpus` records the observed sibling-pair CPU IDs when the
-    /// producer resolved them. Empty when the producer classified
-    /// the pattern without recording the concrete sibling pair.
+    /// `cpus` records the observed full sibling set when the
+    /// producer resolved it — preserved as captured so SMT-N hosts
+    /// retain every observed sibling. The resolver picks the lowest
+    /// 2 siblings from the N-way sibling set (the scenario engine
+    /// always resolves [`crate::workload::AffinityIntent::SmtSiblingPair`]
+    /// to a 2-CPU pair regardless of `threads_per_core`). The
+    /// variant name "Pair" reflects the resolved downstream
+    /// contract, not a capture-time constraint. Empty `cpus` when
+    /// the producer classified the pattern without recording the
+    /// concrete siblings.
+    ///
+    /// Detection: appears when capture observes popcount equal to
+    /// `threads_per_core` AND the CPUs share a
+    /// `thread_siblings_list` entry. Popcount == 1 →
+    /// [`Self::SingleCpu`]. Popcount == 2 but the CPUs are NOT
+    /// siblings → [`Self::Exact`]. Partial sibling sets (popcount
+    /// > 1 but < `threads_per_core` on SMT-N>2 hosts) project to
+    /// [`Self::Exact`], not `SmtSiblingPair`.
     SmtSiblingPair {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         cpus: Vec<u32>,
@@ -373,7 +390,11 @@ impl AffinityHint {
     }
 
     /// Construct an `SmtSiblingPair` hint with the producer-observed
-    /// sibling-pair CPU IDs.
+    /// sibling-set CPU IDs. The `IntoIterator` parameter accepts the
+    /// full sibling set so SMT-N>2 hosts (POWER9 SMT-4, POWER10
+    /// SMT-4/SMT-8, ThunderX2, Xeon Phi) preserve every observed
+    /// sibling — see the variant doc for the resolver-side narrowing
+    /// to 2 CPUs.
     pub fn smt_sibling_pair(cpus: impl IntoIterator<Item = u32>) -> Self {
         Self::SmtSiblingPair {
             cpus: cpus.into_iter().collect(),
@@ -388,6 +409,17 @@ impl AffinityHint {
     /// Construct an `Exact` hint with the producer-observed CPU set.
     /// Maps to [`crate::workload::AffinityIntent::Exact`] in the
     /// reproducer generator.
+    ///
+    /// No `exact_unresolved()` companion exists. `Exact` is the
+    /// terminal resolved state — the variant carries concrete CPUs
+    /// and has no semantic interpretation without them. The 4
+    /// topology-aware variants ([`Self::SingleCpu`],
+    /// [`Self::LlcAligned`], [`Self::CrossCgroup`],
+    /// [`Self::SmtSiblingPair`]) retain their meaning when the
+    /// payload is empty (the resolver determines the CPUs from
+    /// topology); `Exact` does not, so `Self::exact([])` is
+    /// permitted for type symmetry but produces a placeholder that
+    /// the spawn-time affinity gate rejects as malformed.
     pub fn exact(cpus: impl IntoIterator<Item = u32>) -> Self {
         Self::Exact {
             cpus: cpus.into_iter().collect(),

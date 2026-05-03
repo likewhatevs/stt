@@ -2553,9 +2553,15 @@ impl KtstrVm {
         // refills). Run BEFORE allocating any backing-file resources
         // so a misconfigured throttle bails before disk-side host
         // commitments.
+        //
+        // The typed `DiskThrottleValidationError` carries the
+        // failing dimension (iops/bytes) so callers downcasting via
+        // `err.downcast_ref::<DiskThrottleValidationError>()` can
+        // route a programmatic recovery without parsing the
+        // rendered message.
         disk.throttle
             .validate()
-            .map_err(|e| anyhow::anyhow!("invalid disk throttle: {e}"))?;
+            .map_err(|e| anyhow::anyhow!(e).context("invalid disk throttle"))?;
 
         // Per-test backing-file allocation forks on the configured
         // [`disk_config::Filesystem`], with one override for the
@@ -6567,6 +6573,32 @@ impl KtstrVmBuilder {
     ///   The host never execs mkfs against a real backing file;
     ///   the kernel inside the template VM is the on-disk-format
     ///   authority.
+    ///
+    /// # Visible cache + per-test fan-out
+    ///
+    /// For `Filesystem::Btrfs`, the cache is a real on-disk
+    /// directory under the ktstr cache root (resolved via
+    /// `KTSTR_CACHE_DIR` / `XDG_CACHE_HOME` / `$HOME/.cache`; see
+    /// [`disk_template::cache_root`]) so operators can inspect
+    /// what's been built, GC stale entries by hand, and warm the
+    /// cache out-of-band by running a Btrfs test once. The cache
+    /// is keyed by `(filesystem_tag, capacity_mib)` and the
+    /// directory layout is `<cache>/disk_templates/<key>/template.img`
+    /// — see [`disk_template`] module docs for the full encoding.
+    ///
+    /// Per-test fan-out goes through
+    /// [`disk_template::clone_to_per_test`], which uses the
+    /// `FICLONE` ioctl to reflink-copy the cached template image
+    /// into a tempfile for the test VM. `FICLONE` is `O(metadata)`
+    /// and copy-on-write at the extent level: per-test fan-out is
+    /// independent of disk capacity and per-test writes never
+    /// modify the cached template. The cache directory MUST live
+    /// on a btrfs or xfs filesystem;
+    /// [`disk_template::verify_cache_dir_supports_reflink`] checks
+    /// `statfs.f_type` up front and bails with an actionable
+    /// diagnostic when the cache filesystem cannot reflink, so
+    /// operators see the constraint at first use rather than
+    /// debugging a cryptic ioctl errno.
     pub fn disk(mut self, disk: disk_config::DiskConfig) -> Self {
         self.disks = vec![disk];
         self
