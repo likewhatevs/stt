@@ -111,6 +111,32 @@ pub fn is_resource_contention(e: &anyhow::Error) -> bool {
     })
 }
 
+/// Predicate: walks the [`anyhow::Error`] chain looking for a
+/// [`KernelUnavailable`] cause. Used by the `#[ktstr_test]`
+/// macro's wrapper to distinguish "harness not configured" (skip)
+/// from "test failed" (panic).
+///
+/// The harness signals "I have no kernel to boot, the binary was
+/// likely invoked outside `cargo ktstr test`" by surfacing
+/// [`KernelUnavailable`] rather than a generic
+/// `anyhow::bail!`. The macro wrapper emits the canonical
+/// `ktstr: SKIP: harness not configured: ...` banner and
+/// early-returns so libtest sees pass — same shape as the
+/// resource-contention SKIP arm. `pub` because the macro-generated
+/// `#[test]` body in `ktstr-macros` references it by absolute
+/// path; `#[doc(hidden)]` keeps it out of rustdoc — plumbing, not
+/// user API.
+///
+/// [`KernelUnavailable`]: crate::test_support::eval::KernelUnavailable
+#[doc(hidden)]
+pub fn is_kernel_unavailable(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        cause
+            .downcast_ref::<crate::test_support::eval::KernelUnavailable>()
+            .is_some()
+    })
+}
+
 /// Overwrite the argv string at index `arg_idx` with `replacement`.
 ///
 /// Uses `RAW_ARGV` captured by the `.init_array.00001` constructor

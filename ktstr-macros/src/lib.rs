@@ -1095,6 +1095,17 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {
             match ::ktstr::test_support::run_ktstr_test(&#entry_name) {
                 Ok(_) => panic!("expected test to fail but it passed"),
+                Err(e) if ::ktstr::test_support::is_kernel_unavailable(&e) => {
+                    // Harness not configured (no kernel resolved):
+                    // running outside `cargo ktstr test` produces no
+                    // expected failure either, because the test
+                    // never ran. Skip cleanly so a developer running
+                    // `cargo nextest run` directly sees a SKIP
+                    // banner rather than a confusing "no kernel
+                    // found" panic.
+                    eprintln!("ktstr: SKIP: harness not configured: {e:#}");
+                    return;
+                }
                 Err(e) if ::ktstr::test_support::is_resource_contention(&e) => {
                     // Resource contention is host-infra, not a test
                     // outcome: emit the canonical SKIP banner and
@@ -1113,6 +1124,17 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {
             match ::ktstr::test_support::run_ktstr_test(&#entry_name) {
                 Ok(_) => {}
+                Err(e) if ::ktstr::test_support::is_kernel_unavailable(&e) => {
+                    // Harness not configured (no kernel resolved):
+                    // the binary was likely invoked outside
+                    // `cargo ktstr test`, which builds and injects a
+                    // kernel automatically. Skip cleanly so a
+                    // developer running `cargo nextest run` directly
+                    // sees a SKIP banner rather than a confusing
+                    // "no kernel found" panic.
+                    eprintln!("ktstr: SKIP: harness not configured: {e:#}");
+                    return;
+                }
                 Err(e) if ::ktstr::test_support::is_resource_contention(&e) => {
                     // Resource contention is host-infra, not a test
                     // failure: emit the canonical SKIP banner and

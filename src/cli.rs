@@ -2064,10 +2064,14 @@ pub fn parse_topology_string(topology: &str) -> Result<(u32, u32, u32, u32)> {
 ///
 /// Accepted suffixes (case-insensitive): `b`, `kib`, `mib`, `gib`. All
 /// IEC (powers of two): `kib`=2^10, `mib`=2^20, `gib`=2^30. SI variants
-/// (`kb`/`mb`/`gb`) are intentionally NOT accepted — they reject on the
-/// MiB-alignment check anyway, which is a footgun. IEC-only is
-/// unambiguous and consistent. The bare suffix-less form is rejected so
-/// units are never implicit.
+/// (`kb`/`mb`/`gb`) are intentionally NOT accepted; they're rejected by
+/// a dedicated SI-suffix check at the top of the function — before any
+/// number-parsing or MiB-alignment runs — so the diagnostic names the
+/// IEC-only policy directly instead of leaking through as a misleading
+/// "numeric portion not an unsigned integer" message after the suffix
+/// strip eats the trailing `b`. IEC-only is unambiguous and consistent.
+/// The bare suffix-less form is also rejected so units are never
+/// implicit.
 ///
 /// The output unit is MiB to match
 /// [`crate::vmm::disk_config::DiskConfig::capacity_mb`] (despite the
@@ -6441,12 +6445,13 @@ mod tests {
         let err = parse_disk_arg(Some("garbage"))
             .expect_err("malformed size must propagate parse error");
         let rendered = format!("{err:#}");
-        // The error from `parse_disk_size_mib` mentions the offending
-        // input via `invalid disk size '...'`; assert on that substring
-        // so a future message-format change is caught instead of being
-        // silently absorbed.
+        // Every `parse_disk_size_mib` bail prefixes its message with
+        // `invalid disk size '...'` (the input echoed back), so a
+        // single-substring check is sufficient — every error path
+        // satisfies it. A future message-format change that drops the
+        // prefix would surface here instead of being silently absorbed.
         assert!(
-            rendered.contains("invalid disk size") || rendered.contains("missing unit suffix"),
+            rendered.contains("invalid disk size"),
             "expected size-parse diagnostic in disk-arg error, got: {rendered}",
         );
     }

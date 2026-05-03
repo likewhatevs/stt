@@ -1919,13 +1919,48 @@ pub fn resolve_scheduler(spec: &SchedulerSpec) -> Result<(Option<PathBuf>, Resol
 // Kernel resolution
 // ---------------------------------------------------------------------------
 
+/// Marker error for "the test harness can't find a kernel image to
+/// boot the VM against". Wraps the actionable diagnostic that
+/// [`resolve_test_kernel`] emits when neither
+/// `KTSTR_TEST_KERNEL` nor any standard cache / sysroot location
+/// produced a bootable image.
+///
+/// Distinct from a generic `anyhow::bail!` so the
+/// `#[ktstr_test]` macro's wrapper can downcast and emit a SKIP
+/// banner instead of panicking — the canonical "running under
+/// `cargo nextest run` instead of `cargo ktstr test`" symptom.
+/// Routes through [`crate::test_support::is_kernel_unavailable`]
+/// for the macro's predicate; downcast directly when adding new
+/// SKIP arms.
+#[derive(Debug)]
+pub struct KernelUnavailable {
+    pub diagnostic: String,
+}
+
+impl std::fmt::Display for KernelUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.diagnostic)
+    }
+}
+
+impl std::error::Error for KernelUnavailable {}
+
 /// Find a kernel image for running tests.
 ///
 /// Checks `KTSTR_TEST_KERNEL` env var first (direct image path),
 /// then delegates to [`crate::find_kernel()`] for cache and
-/// filesystem discovery. Bails with actionable hints on failure.
+/// filesystem discovery. Returns a typed [`KernelUnavailable`] on
+/// failure so the `#[ktstr_test]` macro wrapper can map it onto a
+/// clean SKIP banner — generic `anyhow` errors propagate to the
+/// panic arm and surface as confusing test failures when the
+/// binary runs outside `cargo ktstr test`.
 pub fn resolve_test_kernel() -> Result<PathBuf> {
-    // Check environment variable first.
+    // Check environment variable first. A set-but-missing
+    // `KTSTR_TEST_KERNEL` is an OPERATOR mistake (they pointed at
+    // a path that doesn't exist), not a "harness not configured"
+    // situation — surface it as a regular anyhow error so the
+    // panic arm catches it. Skipping on a typo would silently mask
+    // the bad path.
     if let Ok(path) = std::env::var("KTSTR_TEST_KERNEL") {
         let p = PathBuf::from(&path);
         anyhow::ensure!(p.exists(), "KTSTR_TEST_KERNEL not found: {path}");
@@ -1937,18 +1972,23 @@ pub fn resolve_test_kernel() -> Result<PathBuf> {
         return Ok(p);
     }
 
-    anyhow::bail!(
-        "no kernel found\n  \
-         hint: {kernel_hint}\n  \
-         hint: or set KTSTR_TEST_KERNEL=/path/to/{image_name} to point at a \
-         pre-built bootable image directly (bypasses KTSTR_KERNEL resolution)",
-        kernel_hint = crate::KTSTR_KERNEL_HINT,
-        image_name = if cfg!(target_arch = "aarch64") {
-            "Image"
-        } else {
-            "bzImage"
-        }
-    )
+    let image_name = if cfg!(target_arch = "aarch64") {
+        "Image"
+    } else {
+        "bzImage"
+    };
+    Err(anyhow::Error::new(KernelUnavailable {
+        diagnostic: format!(
+            "no kernel found — the test harness was likely invoked \
+             outside `cargo ktstr test` (which builds and injects a \
+             kernel automatically).\n  \
+             hint: run `cargo ktstr test --kernel <path-or-version>` \
+             to drive this test, or set KTSTR_TEST_KERNEL=/path/to/{image_name} \
+             to point at a pre-built bootable image directly.\n  \
+             hint: {kernel_hint}",
+            kernel_hint = crate::KTSTR_KERNEL_HINT,
+        ),
+    }))
 }
 
 /// If `kernel_path` resolves to an image inside a cache entry, hold a
@@ -2164,7 +2204,71 @@ mod tests {
         let _lock = lock_env();
         let _env = EnvVarGuard::set("KTSTR_TEST_KERNEL", "/nonexistent/kernel/path");
         let result = resolve_test_kernel();
-        assert!(result.is_err());
+        let err = match result {
+            Err(e) => e,
+            Ok(p) => panic!("expected nonexistent env path to fail, got {p:?}"),
+        };
+        // A pointed-at path that doesn't exist is an OPERATOR
+        // mistake, not a "harness not configured" condition. The
+        // macro must NOT swallow this as a SKIP — surface it as
+        // a regular anyhow error so the panic arm catches the typo.
+        assert!(
+            !crate::test_support::is_kernel_unavailable(&err),
+            "KTSTR_TEST_KERNEL pointing at a missing path must NOT downcast \
+             to KernelUnavailable (operator typo, not harness-misconfigured); \
+             got: {err:#}",
+        );
+    }
+
+    /// `resolve_test_kernel` must surface `KernelUnavailable` (the
+    /// typed marker the macro skips on) when neither
+    /// `KTSTR_TEST_KERNEL` nor any standard cache / sysroot location
+    /// produced a kernel. Pins the contract that a bare
+    /// `cargo nextest run` invocation skips cleanly instead of
+    /// panicking with "no kernel found".
+    #[test]
+    fn resolve_test_kernel_no_sources_returns_kernel_unavailable() {
+        let _lock = lock_env();
+        // Clear every candidate env var the discovery cascade reads
+        // so the standard-locations branch can't see anything.
+        let _e1 = EnvVarGuard::remove("KTSTR_TEST_KERNEL");
+        let _e2 = EnvVarGuard::remove("KTSTR_KERNEL");
+        let _e3 = EnvVarGuard::remove("KTSTR_KERNEL_LIST");
+        // `find_kernel()` may still resolve from /lib/modules or a
+        // local cache on the host. The test environment isn't
+        // guaranteed to be empty, so we accept either outcome:
+        // an Ok (host has a kernel cached / installed) or an Err
+        // that downcasts to `KernelUnavailable`. The negative
+        // assertion (Err but not KernelUnavailable) is the
+        // contract violation we're guarding against.
+        match resolve_test_kernel() {
+            Ok(_) => {
+                // Host environment provides a kernel — the negative
+                // branch we care about can't be exercised here.
+                // Skipping the assertion is correct; the unit test
+                // for `KernelUnavailable`'s Display below covers
+                // the type contract regardless of host state.
+            }
+            Err(e) => {
+                assert!(
+                    crate::test_support::is_kernel_unavailable(&e),
+                    "every Err from resolve_test_kernel after env-clearing must \
+                     downcast to KernelUnavailable; got: {e:#}",
+                );
+            }
+        }
+    }
+
+    /// `KernelUnavailable::Display` must surface the wrapped
+    /// diagnostic verbatim — the macro's SKIP banner relays it via
+    /// `{e:#}`, and a missing or mangled rendering would make the
+    /// "harness not configured" message unparseable.
+    #[test]
+    fn kernel_unavailable_display_renders_diagnostic() {
+        let err = KernelUnavailable {
+            diagnostic: "test fixture diagnostic".to_string(),
+        };
+        assert_eq!(format!("{err}"), "test fixture diagnostic");
     }
 
     // -- KVM check --

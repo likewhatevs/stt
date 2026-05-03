@@ -83,15 +83,15 @@ pub use sidecar::{
 };
 
 pub use dispatch::{
-    analyze_sidecars, is_resource_contention, ktstr_main, ktstr_test_early_dispatch,
-    run_ktstr_test, sanitize_kernel_label,
+    analyze_sidecars, is_kernel_unavailable, is_resource_contention, ktstr_main,
+    ktstr_test_early_dispatch, run_ktstr_test, sanitize_kernel_label,
 };
 pub(crate) use entry::validate_entry_flags;
 pub use entry::{
     BpfMapWrite, CgroupPath, KTSTR_TESTS, KtstrTestEntry, MemSideCache, NumaDistance, NumaNode,
     Scheduler, SchedulerSpec, Sysctl, Topology, TopologyConstraints, find_test,
 };
-pub use eval::{ResolveSource, resolve_scheduler, resolve_test_kernel};
+pub use eval::{KernelUnavailable, ResolveSource, resolve_scheduler, resolve_test_kernel};
 pub(crate) use eval::{record_skip_sidecar, run_ktstr_test_inner};
 pub use metrics::{
     MAX_WALK_DEPTH, WALK_TRUNCATION_SENTINEL_NAME, extract_metrics, is_truncation_sentinel_name,
