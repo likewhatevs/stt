@@ -131,6 +131,71 @@ const TRANSIENT_HOST_ERRNOS: &[i32] = &[
     libc::EAGAIN,
 ];
 
+/// Typed snapshot of process-level resource state. Captured by
+/// [`host_resource_snapshot`]; embedded into a `ResourceContention`
+/// diagnostic via its [`std::fmt::Display`] impl, and read directly
+/// by [`map_transient_to_contention`]'s
+/// `KTSTR_CONTENTION_BYPASS`-gated arm via the typed
+/// [`Self::near_limit`] field.
+///
+/// The struct centralises the two consumer needs that previously
+/// fanned out to separate string-format and substring-parse paths:
+///
+/// 1. **Diagnostic banner**: callers embed `{snapshot}` into a
+///    `ResourceContention.reason` so the operator's SKIP banner names
+///    `fds=...`, `vmrss=...`, `threads=...`, `near_limit=...`. The
+///    [`Display`] impl produces the same single-line format the
+///    SKIP banner has always carried, so banner readers and stats
+///    tooling that grep for these tokens stay backward-compatible.
+/// 2. **Bypass gate**: [`map_transient_to_contention`] reads
+///    `snapshot.near_limit` directly — a real `bool` field — instead
+///    of round-tripping through a parsed substring. A field rename
+///    that breaks the diagnostic shape can no longer silently
+///    desync the bypass; the gate lives on the type, the format
+///    is just for humans.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HostResourceSnapshot {
+    /// Open-fd count from a `readdir(/proc/self/fd)` (NOT
+    /// `/proc/self/status::FDSize`, which is fd-table capacity).
+    pub fd_count: usize,
+    /// `VmRSS:` from `/proc/self/status`, e.g. `"24 kB"`. Folds to
+    /// `"<unknown>"` when the field is missing.
+    pub vm_rss: String,
+    /// `Threads:` from `/proc/self/status` as a string for verbatim
+    /// banner rendering. Folds to `"<unknown>"` when missing.
+    pub threads: String,
+    /// `true` iff the snapshot detected ≥90% utilisation against
+    /// either the per-process `RLIMIT_NOFILE` soft cap or the
+    /// per-UID `RLIMIT_NPROC` soft cap. The bypass gate keys
+    /// directly on this field — no string parse, no substring
+    /// matching, no risk of a future field name embedding
+    /// `"near_limit=false"` as a substring fooling a `contains`
+    /// check. Reading either limit failing folds to `false`
+    /// (conservative — a missing limit is not a near-limit signal).
+    pub near_limit: bool,
+}
+
+impl std::fmt::Display for HostResourceSnapshot {
+    /// Single-line diagnostic format embedded in
+    /// `ResourceContention.reason` strings. The shape
+    /// (`fds=N, vmrss=X, threads=Y, near_limit=B`) is parsed by
+    /// stats tooling reading SKIP banners — pinned by
+    /// `host_resource_snapshot_emits_all_keys` and
+    /// `host_resource_snapshot_near_limit_is_boolean`. The bypass
+    /// gate does NOT consume this string — it reads
+    /// [`Self::near_limit`] directly.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "fds={fds}, vmrss={vmrss}, threads={threads}, near_limit={near_limit}",
+            fds = self.fd_count,
+            vmrss = self.vm_rss,
+            threads = self.threads,
+            near_limit = self.near_limit,
+        )
+    }
+}
+
 /// Capture a one-shot snapshot of process-level resource state for
 /// inclusion in a contention diagnostic. Reads:
 ///
@@ -151,6 +216,15 @@ const TRANSIENT_HOST_ERRNOS: &[i32] = &[
 /// callers can take it on every transient classification without
 /// measurable cost.
 ///
+/// Returns a [`HostResourceSnapshot`] struct: callers that need the
+/// diagnostic string format embed `{snapshot}` (using the
+/// [`std::fmt::Display`] impl — same format the SKIP banner has
+/// always carried). [`map_transient_to_contention`]'s
+/// `KTSTR_CONTENTION_BYPASS` gate reads
+/// [`HostResourceSnapshot::near_limit`] directly — no substring
+/// match against the diagnostic format, so a banner-format change
+/// cannot silently desync the bypass from the snapshot.
+///
 /// # Why no raw rlimits
 ///
 /// Earlier revisions echoed the `RLIMIT_NOFILE` soft cap and
@@ -162,7 +236,7 @@ const TRANSIENT_HOST_ERRNOS: &[i32] = &[
 /// snapshot time and left as a one-bit `yes/no`) preserves the
 /// actionable "are we close to a cap?" triage signal without
 /// leaking the cap itself.
-pub(crate) fn host_resource_snapshot() -> String {
+pub(crate) fn host_resource_snapshot() -> HostResourceSnapshot {
     let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
     let limits = std::fs::read_to_string("/proc/self/limits").unwrap_or_default();
     let fd_count: usize = std::fs::read_dir("/proc/self/fd")
@@ -234,64 +308,12 @@ pub(crate) fn host_resource_snapshot() -> String {
         .unwrap_or(false);
     let near_limit = near_limit_fds || near_limit_procs;
 
-    format!(
-        "fds={fd_count}, vmrss={vm_rss}, threads={threads}, near_limit={near_limit}"
-    )
-}
-
-/// Extract the boolean value of the `near_limit=` field from a
-/// [`host_resource_snapshot`] string and return `true` iff that field
-/// is exactly `false`.
-///
-/// Consumed by [`map_transient_to_contention`] to gate the
-/// `KTSTR_CONTENTION_BYPASS=1` opt-in: the bypass triggers only when
-/// the snapshot positively confirms the host has headroom
-/// (`near_limit=false`), so any failure to parse the value
-/// conservatively keeps the classifier in its default
-/// `ResourceContention` SKIP path. Equivalent in observable behaviour
-/// to the prior `snapshot.contains("near_limit=false")` test for
-/// well-formed snapshots; the helper differs only in that it parses
-/// the `near_limit=...` value instead of pattern-matching the literal
-/// substring `"near_limit=false"` anywhere in the string. That
-/// matters if a future field appended to the snapshot (e.g.
-/// `vmpeak=10000`) ever embeds the substring `near_limit=false` as
-/// part of an unrelated value (`prev_near_limit=false-positive`,
-/// say). The parser-based form pins the field rather than the
-/// substring.
-///
-/// Returns `true` only on a parsed `near_limit=false`; every other
-/// outcome (missing field, malformed value, `near_limit=true`,
-/// snapshot is empty) returns `false`. This is the conservative
-/// default — bypass stays OFF unless the snapshot positively
-/// asserts the host has headroom.
-///
-/// The parser is forgiving on whitespace and tolerates trailing
-/// commas/spaces — the snapshot format puts each `key=value` pair
-/// on a comma-separated single line, but tests construct snapshots
-/// without that exact shape and the helper accepts both.
-pub(crate) fn snapshot_near_limit_is_false(snapshot: &str) -> bool {
-    // Walk every `key=value` token. The snapshot format is
-    // `fds=N, vmrss=X, threads=Y, near_limit=Z` so splitting on
-    // commas yields one token per field; trimming whitespace handles
-    // both the format's `, ` separator and any test-supplied
-    // variation. The first whitespace-delimited subtoken of `value`
-    // is the actual boolean — discard any trailing punctuation a
-    // future format extension might add.
-    for token in snapshot.split(',') {
-        let token = token.trim();
-        let Some(value) = token.strip_prefix("near_limit=") else {
-            continue;
-        };
-        // Strip any trailing whitespace/punctuation a caller might
-        // append. `value.split_whitespace().next()` returns `None`
-        // only when the value is empty after trimming — fold to a
-        // sentinel that does not match `"false"` so empty values
-        // return false from the helper.
-        let value = value.split_whitespace().next().unwrap_or("");
-        return value == "false";
+    HostResourceSnapshot {
+        fd_count,
+        vm_rss,
+        threads,
+        near_limit,
     }
-    // No `near_limit=` field present — conservative default.
-    false
 }
 
 /// Map a kvm_ioctls / vmm_sys_util `errno::Error` to a
@@ -425,8 +447,11 @@ pub(crate) fn map_transient_to_contention(
             .ok()
             .as_deref()
             == Some("1");
-        let near_limit_false = snapshot_near_limit_is_false(&snapshot);
-        if bypass_requested && near_limit_false {
+        // Typed gate — reads the bool field directly from the
+        // snapshot struct. No substring parse against the diagnostic
+        // format, so a banner-format change cannot silently desync
+        // the bypass from the snapshot.
+        if bypass_requested && !snapshot.near_limit {
             return anyhow::Error::new(e).context(format!(
                 "{context}: KVM errno {errno} ({errno_name}) — errno looks transient \
                  but host is NOT near limits ({snapshot}). KTSTR_CONTENTION_BYPASS=1 \
@@ -8408,20 +8433,20 @@ mod tests {
         );
     }
 
-    /// `host_resource_snapshot` must produce a single-line string
-    /// naming the four key fields the operator needs when triaging a
-    /// `ktstr: SKIP: resource contention: ...` banner: open-fd
-    /// count, RSS, thread count, and a `near_limit` indicator that
-    /// summarises "are we close to RLIMIT_NOFILE / RLIMIT_NPROC?"
-    /// without echoing the cap value (host fingerprint). The
-    /// values themselves are runtime-dependent so the test pins
-    /// only the SHAPE, not the numbers — a regression that
-    /// swallows a field would fail here, AND any regression that
-    /// leaks a raw rlimit (max_files= / max_procs=) trips the
-    /// negative checks below.
+    /// `host_resource_snapshot`'s [`Display`] impl must produce a
+    /// single-line string naming the four key fields the operator
+    /// needs when triaging a `ktstr: SKIP: resource contention:
+    /// ...` banner: open-fd count, RSS, thread count, and a
+    /// `near_limit` indicator that summarises "are we close to
+    /// RLIMIT_NOFILE / RLIMIT_NPROC?" without echoing the cap value
+    /// (host fingerprint). The values themselves are
+    /// runtime-dependent so the test pins only the SHAPE, not the
+    /// numbers — a regression that swallows a field would fail
+    /// here, AND any regression that leaks a raw rlimit
+    /// (max_files= / max_procs=) trips the negative checks below.
     #[test]
     fn host_resource_snapshot_emits_all_keys() {
-        let s = host_resource_snapshot();
+        let s = format!("{}", host_resource_snapshot());
         assert!(s.contains("fds="), "snapshot missing fds=: {s}");
         assert!(s.contains("vmrss="), "snapshot missing vmrss=: {s}");
         assert!(s.contains("threads="), "snapshot missing threads=: {s}");
@@ -8432,17 +8457,17 @@ mod tests {
         );
     }
 
-    /// `host_resource_snapshot` must NOT echo raw RLIMIT_NOFILE /
-    /// RLIMIT_NPROC values. Those are host-specific fingerprints
-    /// that the SKIP banner surfaces into every CI artifact and
-    /// user-visible test log — leaking them lets a third party
-    /// reading a public failure dump infer host config. The
-    /// `near_limit` derived flag preserves the actionable triage
-    /// signal without the leak. Pins the deletion against a
+    /// `host_resource_snapshot`'s rendered string must NOT echo raw
+    /// RLIMIT_NOFILE / RLIMIT_NPROC values. Those are host-specific
+    /// fingerprints that the SKIP banner surfaces into every CI
+    /// artifact and user-visible test log — leaking them lets a
+    /// third party reading a public failure dump infer host config.
+    /// The `near_limit` derived flag preserves the actionable
+    /// triage signal without the leak. Pins the deletion against a
     /// regression that adds them back.
     #[test]
     fn host_resource_snapshot_does_not_leak_raw_rlimits() {
-        let s = host_resource_snapshot();
+        let s = format!("{}", host_resource_snapshot());
         assert!(
             !s.contains("max_files="),
             "host_resource_snapshot must not leak the RLIMIT_NOFILE soft cap; got: {s}",
@@ -8466,97 +8491,69 @@ mod tests {
         }
     }
 
-    /// `near_limit` must surface as a boolean literal (`true` or
-    /// `false`). Pins the parser-friendly format against a
-    /// regression that swaps the boolean for an opaque token.
+    /// `near_limit` must surface in the rendered banner as a
+    /// boolean literal (`true` or `false`). Pins the
+    /// parser-friendly format against a regression that swaps the
+    /// boolean for an opaque token.
     #[test]
     fn host_resource_snapshot_near_limit_is_boolean() {
-        let s = host_resource_snapshot();
+        let s = format!("{}", host_resource_snapshot());
         assert!(
             s.contains("near_limit=true") || s.contains("near_limit=false"),
             "near_limit must be boolean; got: {s}",
         );
     }
 
-    /// `snapshot_near_limit_is_false` returns `true` only when the
-    /// snapshot positively asserts `near_limit=false`. Every other
-    /// outcome (missing field, malformed value, `near_limit=true`,
-    /// empty input) returns `false` — the conservative default that
-    /// keeps `KTSTR_CONTENTION_BYPASS` OFF unless we can prove the
-    /// host has headroom.
-    ///
-    /// Pins the parser against four regressions:
-    /// 1. A field rename in [`host_resource_snapshot`] (e.g.
-    ///    `near_limit` → `at_capacity`) silently flips every
-    ///    snapshot to "no headroom" and disables the bypass.
-    /// 2. A future field whose name embeds `near_limit=false` as a
-    ///    substring (e.g. `prev_near_limit=false_positive`) tricks
-    ///    the substring-match form but not the parser-based form.
-    /// 3. A malformed value (`near_limit=maybe`) is treated as
-    ///    "headroom unconfirmed" rather than parsed-as-false.
-    /// 4. A trailing word in the value (`near_limit=false ;`) is
-    ///    handled by the whitespace-token extractor.
+    /// The typed [`HostResourceSnapshot::near_limit`] field that
+    /// [`map_transient_to_contention`]'s
+    /// `KTSTR_CONTENTION_BYPASS` arm gates on must agree with the
+    /// `near_limit=` token in the rendered banner. Pins the
+    /// invariant that a banner-format change cannot silently
+    /// desync the gate from the snapshot — both reads come from
+    /// the same struct field.
     #[test]
-    fn snapshot_near_limit_is_false_parses_field_value() {
-        // Realistic snapshot shape: the field is at the end after a
-        // `, ` separator. Must parse to true.
-        let realistic =
-            "fds=64, vmrss=24 kB, threads=8, near_limit=false";
+    fn host_resource_snapshot_typed_field_agrees_with_rendered_banner() {
+        let snapshot = host_resource_snapshot();
+        let rendered = format!("{snapshot}");
+        let expected_token = if snapshot.near_limit {
+            "near_limit=true"
+        } else {
+            "near_limit=false"
+        };
         assert!(
-            super::snapshot_near_limit_is_false(realistic),
-            "realistic near_limit=false must parse: {realistic}",
+            rendered.contains(expected_token),
+            "rendered banner must agree with typed field; \
+             snapshot.near_limit={field_val}, rendered={rendered}",
+            field_val = snapshot.near_limit,
         );
+    }
 
-        // Same shape with `near_limit=true`. Must parse to false.
-        let near_limit_true =
-            "fds=64, vmrss=24 kB, threads=8, near_limit=true";
-        assert!(
-            !super::snapshot_near_limit_is_false(near_limit_true),
-            "near_limit=true must NOT classify as headroom: {near_limit_true}",
+    /// Display formatting on a constructed snapshot pins the exact
+    /// `fds=N, vmrss=X, threads=Y, near_limit=B` shape that stats
+    /// tooling parses out of SKIP banners. A struct constructor
+    /// gives the test deterministic values; the runtime
+    /// `host_resource_snapshot()` reads vary by host.
+    #[test]
+    fn host_resource_snapshot_display_format_is_pinned() {
+        let snapshot = HostResourceSnapshot {
+            fd_count: 64,
+            vm_rss: "24 kB".into(),
+            threads: "8".into(),
+            near_limit: false,
+        };
+        assert_eq!(
+            format!("{snapshot}"),
+            "fds=64, vmrss=24 kB, threads=8, near_limit=false",
         );
-
-        // Field absent entirely (early-bail snapshot, future
-        // shortened format). Must parse to false (conservative).
-        let no_field = "fds=64, vmrss=24 kB, threads=8";
-        assert!(
-            !super::snapshot_near_limit_is_false(no_field),
-            "missing near_limit field must NOT classify as headroom: {no_field}",
-        );
-
-        // Empty snapshot. Conservative default.
-        assert!(
-            !super::snapshot_near_limit_is_false(""),
-            "empty snapshot must NOT classify as headroom",
-        );
-
-        // Malformed value. Conservative default — only the literal
-        // `false` token unlocks the bypass.
-        let malformed = "fds=64, near_limit=maybe";
-        assert!(
-            !super::snapshot_near_limit_is_false(malformed),
-            "malformed near_limit value must NOT classify as headroom: {malformed}",
-        );
-
-        // Substring-collision negative control: a future field whose
-        // name happens to contain `near_limit=false` as a substring
-        // would fool a `snapshot.contains("near_limit=false")` test.
-        // The parser-based helper rejects it because the field name
-        // `prev_near_limit` does not have the prefix `near_limit=`
-        // after token splitting.
-        let substring_collision =
-            "fds=64, prev_near_limit=false_positive, near_limit=true";
-        assert!(
-            !super::snapshot_near_limit_is_false(substring_collision),
-            "substring collision must NOT classify as headroom: {substring_collision}",
-        );
-
-        // Trailing whitespace + punctuation tolerance — the
-        // whitespace-token extractor strips anything past the first
-        // whitespace block in the value.
-        let trailing = "fds=64, near_limit=false  ";
-        assert!(
-            super::snapshot_near_limit_is_false(trailing),
-            "trailing whitespace must not block parsing: {trailing}",
+        let snapshot_at_limit = HostResourceSnapshot {
+            fd_count: 1023,
+            vm_rss: "999 mB".into(),
+            threads: "256".into(),
+            near_limit: true,
+        };
+        assert_eq!(
+            format!("{snapshot_at_limit}"),
+            "fds=1023, vmrss=999 mB, threads=256, near_limit=true",
         );
     }
 
@@ -8758,7 +8755,7 @@ mod tests {
         // and we cannot make the assertion below; bail without
         // failing.
         let snapshot = host_resource_snapshot();
-        if !snapshot.contains("near_limit=false") {
+        if snapshot.near_limit {
             return;
         }
         let _bypass_on =
