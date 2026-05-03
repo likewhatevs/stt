@@ -1,0 +1,6980 @@
+//! Composable ops/steps system for dynamic cgroup topology changes.
+//!
+//! [`Op`] is an atomic cgroup operation. [`Step`] sequences ops with a
+//! hold period. [`CgroupDef`] bundles create + cpuset + spawn into a
+//! single declaration. [`execute_steps()`] runs a step sequence with
+//! scheduler liveness checks and stimulus event recording.
+//!
+//! See the [Ops and Steps](https://likewhatevs.github.io/ktstr/guide/concepts/ops.html)
+//! chapter for a guide.
+//!
+//! # Cgroup tooling at a glance
+//!
+//! ktstr exposes the cgroup v2 surface across two layers — declarative
+//! steady-state via [`CgroupDef`] (set at scenario-setup time, holds
+//! for the cgroup's lifetime) and imperative state-transitions via
+//! [`Op`] (applied mid-step, describe transitions over time):
+//!
+//! | Knob | Layer | API entry | Underlying file | When to use |
+//! |------|-------|-----------|-----------------|-------------|
+//! | CPU affinity | setup | [`CgroupDef::with_cpuset`] | `cpuset.cpus` | Bind workers to a CPU subset for the whole run. |
+//! | NUMA-mem affinity | setup | [`CgroupDef::with_cpuset_mems`] | `cpuset.mems` | Constrain allocations to specific NUMA nodes. |
+//! | CPU bandwidth | setup | [`CgroupDef::cpu_quota_pct`] / [`CgroupDef::cpu_quota`] / [`CgroupDef::cpu_unlimited`] | `cpu.max` | Cap CPU time per period (1 CPU at 50% / 2 CPU at 100% / etc). |
+//! | CPU share weight | setup | [`CgroupDef::cpu_weight`] | `cpu.weight` | Bias relative CPU share when siblings contend. |
+//! | Memory ceiling | setup | [`CgroupDef::memory_max`] / [`CgroupDef::memory_unlimited`] | `memory.max` | Hard ceiling — exceeding triggers cgroup OOM. |
+//! | Memory throttle | setup | [`CgroupDef::memory_high`] | `memory.high` | Soft throttle: triggers reclaim, not OOM. |
+//! | Memory protection | setup | [`CgroupDef::memory_low`] | `memory.low` | Soft protection: kernel reclaims from siblings first. |
+//! | Swap cap | setup | [`CgroupDef::memory_swap_max`] / [`CgroupDef::memory_swap_unlimited`] | `memory.swap.max` | Cap how much memory can spill to swap (CONFIG_SWAP=y). |
+//! | IO share | setup | [`CgroupDef::io_weight`] | `io.weight` | Bias relative IO share when siblings contend. |
+//! | Task ceiling | setup | [`CgroupDef::pids_max`] / [`CgroupDef::pids_unlimited`] | `pids.max` | Cap process+thread count — fork/clone returns EAGAIN at limit. |
+//! | Mid-run cpuset rebind | mid-step | [`Op::set_cpuset`] / [`Op::clear_cpuset`] / [`Op::swap_cpusets`] | `cpuset.cpus` | Move cpuset on a live cgroup mid-scenario. |
+//! | Mid-run task migration | mid-step | [`Op::move_all_tasks`] | `cgroup.procs` | Move workers from one cgroup to another. |
+//! | Pause/resume | mid-step | [`Op::freeze_cgroup`] / [`Op::unfreeze_cgroup`] | `cgroup.freeze` | Suspend every task in the cgroup; resume later. |
+//! | Add/remove cgroup | mid-step | [`Op::add_cgroup`] / [`Op::remove_cgroup`] / [`Op::stop_cgroup`] | (cgroupfs mkdir/rmdir) | Spawn / tear down a cgroup mid-scenario. |
+//!
+//! # Worked examples
+//!
+//! * **Static topology** (one cgroup, fixed cpuset, weight-biased
+//!   compute): [`CgroupDef`] type-level docs.
+//! * **Suspend/resume** (3-Step idiom — run, freeze, run again):
+//!   [`Op::FreezeCgroup`] doc.
+//! * **Memory-cap teardown** (rewind a base CgroupDef's swap cap):
+//!   [`CgroupDef::memory_swap_unlimited`] doc.
+//!
+//! # Implementation entry points
+//!
+//! Every knob ends in [`crate::cgroup::CgroupOps`] (production:
+//! [`crate::cgroup::CgroupManager`]; tests: a recording `MockCgroupOps`
+//! double). [`apply_setup`] runs the [`CgroupDef`] passes; [`apply_ops`]
+//! dispatches the [`Op`] variants. Both share `ctx.cgroups` so a test
+//! that uses both layers writes through the same RAII teardown
+//! ([`crate::scenario::CgroupGroup::Drop`]).
+//!
+//! # File layout
+//!
+//! [`types`] holds the data model: [`Op`], [`CgroupDef`], [`Step`],
+//! [`HoldSpec`], [`Setup`], [`CpusetSpec`], the per-controller limits
+//! structs, and every builder constructor. Re-exported from this module
+//! so external paths remain `crate::scenario::ops::Op` etc. The executor
+//! in this file drives that model against [`crate::cgroup::CgroupOps`]
+//! via [`apply_setup`] / [`apply_ops`] and exposes the [`execute_steps`] /
+//! [`execute_scenario`] family of public entry points.
+
+mod types;
+pub use types::*;
+
+use std::collections::BTreeSet;
+use std::thread;
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+
+use crate::assert::AssertResult;
+use crate::scenario::backdrop;
+use crate::scenario::{CgroupGroup, Ctx, process_alive};
+use crate::vmm::shm_ring::{self, StimulusPayload};
+use crate::workload::{MemPolicy, WorkSpec, WorkloadConfig, WorkloadHandle};
+
+
+// ---------------------------------------------------------------------------
+// SHM writer for stimulus events
+// ---------------------------------------------------------------------------
+
+/// SHM ring writer for guest-to-host data transfer.
+///
+/// Prefers mmap of /dev/mem for zero-copy access. Falls back to
+/// pread/pwrite when mmap of the E820 gap fails (common on kernels
+/// that restrict mmap of non-RAM physical ranges).
+enum ShmWriter {
+    /// mmap succeeded — direct pointer access.
+    Mapped {
+        ptr: *mut u8,
+        map_base: *mut libc::c_void,
+        map_size: usize,
+        shm_size: usize,
+    },
+    /// mmap failed — use pread/pwrite on the /dev/mem fd.
+    Fd {
+        fd: std::fs::File,
+        shm_base: u64,
+        shm_size: usize,
+    },
+}
+
+impl ShmWriter {
+    /// Try to open the SHM region. Returns None if SHM params are absent
+    /// from /proc/cmdline or /dev/mem cannot be opened.
+    fn try_open() -> Option<Self> {
+        let cmdline = std::fs::read_to_string("/proc/cmdline").ok()?;
+        let (shm_base, shm_size) = shm_ring::parse_shm_params_from_str(&cmdline)?;
+
+        use std::fs::OpenOptions;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let fd = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_SYNC)
+            .open("/dev/mem")
+            .ok()?;
+
+        match shm_ring::mmap_devmem(
+            std::os::unix::io::AsRawFd::as_raw_fd(&fd),
+            shm_base,
+            shm_size,
+        ) {
+            Some(m) => Some(ShmWriter::Mapped {
+                ptr: m.ptr,
+                map_base: m.map_base,
+                map_size: m.map_size,
+                shm_size: shm_size as usize,
+            }),
+            None => {
+                eprintln!(
+                    "ktstr: SHM mmap failed ({}), using pread/pwrite fallback",
+                    std::io::Error::last_os_error(),
+                );
+                Some(ShmWriter::Fd {
+                    fd,
+                    shm_base,
+                    shm_size: shm_size as usize,
+                })
+            }
+        }
+    }
+
+    /// Write a TLV message to the SHM ring.
+    ///
+    /// Acquires `SHM_WRITE_LOCK` to serialize against concurrent writers
+    /// (sched-exit-mon thread via `write_msg`).
+    fn write(&self, msg_type: u32, payload: &[u8]) {
+        // Recover from poisoning: the ring is fully overwritten on
+        // each write, so a panicking writer does not leave shared
+        // invariants in a bad state.
+        let _guard = shm_ring::SHM_WRITE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match self {
+            ShmWriter::Mapped { ptr, shm_size, .. } => {
+                let buf = unsafe { std::slice::from_raw_parts_mut(*ptr, *shm_size) };
+                shm_ring::shm_write(buf, 0, msg_type, payload);
+            }
+            ShmWriter::Fd {
+                fd,
+                shm_base,
+                shm_size,
+            } => {
+                use std::os::unix::io::AsRawFd;
+
+                // Read current SHM state, apply the ring write, write back.
+                let mut buf = vec![0u8; *shm_size];
+                let n = unsafe {
+                    libc::pread(
+                        fd.as_raw_fd(),
+                        buf.as_mut_ptr() as *mut libc::c_void,
+                        buf.len(),
+                        *shm_base as libc::off_t,
+                    )
+                };
+                if n < 0 {
+                    return;
+                }
+
+                shm_ring::shm_write(&mut buf, 0, msg_type, payload);
+
+                unsafe {
+                    libc::pwrite(
+                        fd.as_raw_fd(),
+                        buf.as_ptr() as *const libc::c_void,
+                        buf.len(),
+                        *shm_base as libc::off_t,
+                    );
+                }
+            }
+        }
+    }
+}
+
+impl Drop for ShmWriter {
+    fn drop(&mut self) {
+        if let ShmWriter::Mapped {
+            map_base, map_size, ..
+        } = self
+        {
+            unsafe {
+                libc::munmap(*map_base, *map_size);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Step executor
+// ---------------------------------------------------------------------------
+
+/// Persistent scenario-wide state owned by
+/// [`execute_scenario_with`]. Lives for the entire step sequence;
+/// cgroups, workload handles, and payload handles declared by the
+/// [`Backdrop`](backdrop::Backdrop) go here and only tear
+/// down at scenario end (success or Err). See [`StepState`] for
+/// the step-local counterpart.
+struct BackdropState<'a> {
+    /// RAII cgroup guard for persistent cgroups — removes them on drop.
+    cgroups: CgroupGroup<'a>,
+    /// Active workload handles in persistent cgroups, keyed by cgroup name.
+    handles: Vec<(String, WorkloadHandle)>,
+    /// Resolved cpusets per persistent cgroup name.
+    cpusets: std::collections::HashMap<String, BTreeSet<usize>>,
+    /// Active payload-binary handles owned by the backdrop. Drained
+    /// via `.kill()` at scenario teardown so the metric-emission
+    /// pipeline still fires.
+    payload_handles: Vec<PayloadEntry>,
+}
+
+impl<'a> BackdropState<'a> {
+    /// Empty backdrop state (no persistent entities), scoped to `ctx.cgroups`.
+    fn empty(ctx: &'a Ctx) -> Self {
+        Self {
+            cgroups: CgroupGroup::new(ctx.cgroups),
+            handles: Vec::new(),
+            cpusets: std::collections::HashMap::new(),
+            payload_handles: Vec::new(),
+        }
+    }
+}
+
+/// Step-local execution state. Fresh per step, torn down at step
+/// boundary: cgroups removed (via RAII drop), workload handles
+/// collected, payload handles killed with metric emission. Any ops
+/// in the step that reference a cgroup name look here first before
+/// falling through to [`BackdropState`].
+struct StepState<'a> {
+    /// RAII cgroup guard — removes step-local cgroups on drop.
+    cgroups: CgroupGroup<'a>,
+    /// Active workload handles keyed by step-local cgroup name.
+    handles: Vec<(String, WorkloadHandle)>,
+    /// Resolved cpusets per step-local cgroup name, for isolation checks.
+    cpusets: std::collections::HashMap<String, BTreeSet<usize>>,
+    /// Active payload-binary handles keyed by cgroup name. Each entry
+    /// came from either a [`CgroupDef::workload`] spawn in
+    /// `apply_setup` or an explicit [`Op::RunPayload`] invocation;
+    /// `source` tags which path spawned it so the duplicate-name
+    /// dedup in `Op::RunPayload` can point at the original site. All
+    /// are killed during step-teardown / cgroup removal so cgroupfs
+    /// cleanup never trips EBUSY on a live process.
+    payload_handles: Vec<PayloadEntry>,
+}
+
+impl<'a> StepState<'a> {
+    /// Empty step state scoped to `ctx.cgroups`.
+    fn empty(ctx: &'a Ctx) -> Self {
+        Self {
+            cgroups: CgroupGroup::new(ctx.cgroups),
+            handles: Vec::new(),
+            cpusets: std::collections::HashMap::new(),
+            payload_handles: Vec::new(),
+        }
+    }
+}
+
+/// Combined mutable view over step-local and backdrop state.
+///
+/// Every function that touches execution state (apply_setup,
+/// apply_ops, the drain helpers) receives a
+/// `ScenarioState`; lookups prefer step-local, falling through to
+/// backdrop. New state created via ops/setup inside a step writes
+/// to step-local by default — that is the primary mechanism
+/// enforcing per-step bounded lifetime. Setup for the Backdrop
+/// itself (run once before the step loop) writes straight to the
+/// backdrop side via [`ScenarioState::with_target_backdrop`].
+struct ScenarioState<'a, 'b> {
+    step: &'b mut StepState<'a>,
+    backdrop: &'b mut BackdropState<'a>,
+    /// When true, all mutations route to [`Self::backdrop`] instead
+    /// of [`Self::step`]. Set by [`Self::with_target_backdrop`] when
+    /// running the Backdrop's initial `apply_setup` / `apply_ops`
+    /// before the first step.
+    target_backdrop: bool,
+}
+
+impl<'a, 'b> ScenarioState<'a, 'b> {
+    /// Build a combined scenario view. Starts with the step-local
+    /// slot as the mutation target — call [`Self::with_target_backdrop`]
+    /// to flip into backdrop-setup mode for Backdrop's own
+    /// apply_setup / apply_ops pass.
+    fn new(step: &'b mut StepState<'a>, backdrop: &'b mut BackdropState<'a>) -> Self {
+        Self {
+            step,
+            backdrop,
+            target_backdrop: false,
+        }
+    }
+
+    /// Run `f` with writes routed to the backdrop side.
+    fn with_target_backdrop<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let prev = self.target_backdrop;
+        self.target_backdrop = true;
+        let r = f(self);
+        self.target_backdrop = prev;
+        r
+    }
+
+    /// `cgroups` group that receives newly-created cgroups. Step-local
+    /// by default; backdrop when [`Self::with_target_backdrop`] is active.
+    fn target_cgroups(&mut self) -> &mut CgroupGroup<'a> {
+        if self.target_backdrop {
+            &mut self.backdrop.cgroups
+        } else {
+            &mut self.step.cgroups
+        }
+    }
+
+    /// `handles` vec that receives newly-spawned workload handles.
+    fn target_handles(&mut self) -> &mut Vec<(String, WorkloadHandle)> {
+        if self.target_backdrop {
+            &mut self.backdrop.handles
+        } else {
+            &mut self.step.handles
+        }
+    }
+
+    /// `cpusets` map that receives resolved cpusets for new cgroups.
+    fn target_cpusets(&mut self) -> &mut std::collections::HashMap<String, BTreeSet<usize>> {
+        if self.target_backdrop {
+            &mut self.backdrop.cpusets
+        } else {
+            &mut self.step.cpusets
+        }
+    }
+
+    /// `payload_handles` vec that receives newly-spawned payload handles.
+    fn target_payload_handles(&mut self) -> &mut Vec<PayloadEntry> {
+        if self.target_backdrop {
+            &mut self.backdrop.payload_handles
+        } else {
+            &mut self.step.payload_handles
+        }
+    }
+
+    /// Resolved cpuset for a cgroup name, looked up step-first then backdrop.
+    fn lookup_cpuset(&self, name: &str) -> Option<&BTreeSet<usize>> {
+        self.step
+            .cpusets
+            .get(name)
+            .or_else(|| self.backdrop.cpusets.get(name))
+    }
+
+    /// Returns the live payload handle matching the composite key
+    /// (`payload_name`, `cgroup_key`) from either step-local or
+    /// backdrop state, or `None` when no entry matches. Used for
+    /// the `Op::RunPayload` duplicate guard, which now treats
+    /// "same payload in a different cgroup" as legitimate rather
+    /// than a name collision.
+    fn find_live_payload_with_cgroup(
+        &self,
+        payload_name: &str,
+        cgroup_key: &str,
+    ) -> Option<&PayloadEntry> {
+        let matches =
+            |e: &&PayloadEntry| e.handle.payload_name() == payload_name && e.cgroup == cgroup_key;
+        self.step
+            .payload_handles
+            .iter()
+            .find(matches)
+            .or_else(|| self.backdrop.payload_handles.iter().find(matches))
+    }
+
+    /// Drop a payload handle by composite key (`name`, optional
+    /// `cgroup`). Checks step-local first, then backdrop.
+    ///
+    /// - `cgroup = Some(c)`: exact match on both name and cgroup.
+    /// - `cgroup = None`: if exactly one entry matches `name` across
+    ///   both slots, consume it (backward-compat for
+    ///   `Op::wait_payload(name)` / `Op::kill_payload(name)` when
+    ///   only one copy is live). If two or more match, returns
+    ///   `Err(ambiguous_cgroups)` where `ambiguous_cgroups` is the
+    ///   list of cgroup keys for the candidates so the caller can
+    ///   produce an actionable error.
+    ///
+    /// Returns `Ok(None)` when no entry matches.
+    fn take_payload_by_name(
+        &mut self,
+        name: &str,
+        cgroup: Option<&str>,
+    ) -> std::result::Result<Option<PayloadEntry>, Vec<String>> {
+        if let Some(c) = cgroup {
+            // Composite-key path: exact match on both.
+            if let Some(idx) = self
+                .step
+                .payload_handles
+                .iter()
+                .position(|e| e.handle.payload_name() == name && e.cgroup == c)
+            {
+                return Ok(Some(self.step.payload_handles.swap_remove(idx)));
+            }
+            if let Some(idx) = self
+                .backdrop
+                .payload_handles
+                .iter()
+                .position(|e| e.handle.payload_name() == name && e.cgroup == c)
+            {
+                return Ok(Some(self.backdrop.payload_handles.swap_remove(idx)));
+            }
+            return Ok(None);
+        }
+        // Name-only path: disambiguate across both slots before
+        // consuming, so a mid-test wait on an ambiguous name
+        // surfaces the caller's bug rather than silently waiting
+        // on the first match.
+        let mut step_idx: Option<usize> = None;
+        let mut backdrop_idx: Option<usize> = None;
+        let mut cgroups: Vec<String> = Vec::new();
+        for (i, e) in self.step.payload_handles.iter().enumerate() {
+            if e.handle.payload_name() == name {
+                if step_idx.is_none() {
+                    step_idx = Some(i);
+                }
+                cgroups.push(e.cgroup.clone());
+            }
+        }
+        for (i, e) in self.backdrop.payload_handles.iter().enumerate() {
+            if e.handle.payload_name() == name {
+                if backdrop_idx.is_none() && step_idx.is_none() {
+                    backdrop_idx = Some(i);
+                }
+                cgroups.push(e.cgroup.clone());
+            }
+        }
+        if cgroups.len() > 1 {
+            return Err(cgroups);
+        }
+        if let Some(i) = step_idx {
+            return Ok(Some(self.step.payload_handles.swap_remove(i)));
+        }
+        if let Some(i) = backdrop_idx {
+            return Ok(Some(self.backdrop.payload_handles.swap_remove(i)));
+        }
+        Ok(None)
+    }
+
+    /// Drain every live payload handle in step + backdrop state by
+    /// calling `.kill()` so the metric-emission pipeline fires. Used
+    /// on error paths in the step loop so mid-scenario failure still
+    /// leaves a usable sidecar.
+    fn drain_all_payloads(&mut self) {
+        drain_all_payload_handles(&mut self.step.payload_handles);
+        drain_all_payload_handles(&mut self.backdrop.payload_handles);
+    }
+
+    /// Kill every payload handle (step-first, then backdrop) whose
+    /// cgroup matches `cgroup`. Called before a cgroup removal so
+    /// cgroupfs cleanup does not trip EBUSY on a live process.
+    fn drain_payloads_for_cgroup(&mut self, cgroup: &str) {
+        drain_payload_handles_for_cgroup(&mut self.step.payload_handles, cgroup);
+        drain_payload_handles_for_cgroup(&mut self.backdrop.payload_handles, cgroup);
+    }
+
+    /// Remove every workload handle whose key matches `cgroup`. The
+    /// handles themselves drop (which SIGKILLs the workers) — this is
+    /// appropriate for `Op::StopCgroup` and `Op::RemoveCgroup`.
+    fn drop_handles_for_cgroup(&mut self, cgroup: &str) {
+        self.step.handles.retain(|(n, _)| n.as_str() != cgroup);
+        self.backdrop.handles.retain(|(n, _)| n.as_str() != cgroup);
+    }
+
+    /// Forget a tracked cpuset (step-first, then backdrop) for a cgroup.
+    fn forget_cpuset(&mut self, cgroup: &str) {
+        self.step.cpusets.remove(cgroup);
+        self.backdrop.cpusets.remove(cgroup);
+    }
+
+    /// Record / overwrite the resolved cpuset for a cgroup. If the
+    /// cgroup is known to step-local state, the step-local entry
+    /// updates; if it's known to backdrop, the backdrop entry
+    /// updates; otherwise the entry goes into the currently-active
+    /// target (step-local, or backdrop inside `with_target_backdrop`).
+    fn record_cpuset(&mut self, cgroup: &str, cpuset: BTreeSet<usize>) {
+        if self.step.cpusets.contains_key(cgroup) {
+            self.step.cpusets.insert(cgroup.to_string(), cpuset);
+        } else if self.backdrop.cpusets.contains_key(cgroup) {
+            self.backdrop.cpusets.insert(cgroup.to_string(), cpuset);
+        } else {
+            self.target_cpusets().insert(cgroup.to_string(), cpuset);
+        }
+    }
+
+    /// Re-key every workload handle from `from` to `to`. When `to`
+    /// names a Backdrop-owned cgroup, step-local handles are also
+    /// transferred into [`Self::backdrop`] so their lifetime extends
+    /// to scenario end instead of dying at step teardown. Backdrop
+    /// handles stay in the backdrop slot regardless of `to`.
+    ///
+    /// Called by `Op::MoveAllTasks` after the kernel-side
+    /// `cgroup.procs` writes succeed so subsequent ops that address
+    /// the moved workers by cgroup name find them under the new key
+    /// and in the correct state slot.
+    fn rename_handles(&mut self, from: &str, to: &str) {
+        let to_is_backdrop = self.cgroup_name_is_backdrop(to);
+        if to_is_backdrop {
+            // Move step-local handles keyed under `from` into the
+            // backdrop slot, re-keyed to `to`. Iterate in reverse so
+            // swap_remove indices stay stable.
+            let mut i = self.step.handles.len();
+            while i > 0 {
+                i -= 1;
+                if self.step.handles[i].0.as_str() == from {
+                    let (_, handle) = self.step.handles.swap_remove(i);
+                    self.backdrop.handles.push((to.to_string(), handle));
+                }
+            }
+        } else {
+            // Step-local destination: keep ownership, just rename.
+            for (name, _) in &mut self.step.handles {
+                if name.as_str() == from {
+                    *name = to.to_string();
+                }
+            }
+        }
+        // Backdrop handles are never demoted to step-local ownership
+        // regardless of destination — a backdrop worker is declared
+        // persistent and stays persistent for the scenario. Rename
+        // in place so subsequent ops still find it under the new key.
+        for (name, _) in &mut self.backdrop.handles {
+            if name.as_str() == from {
+                *name = to.to_string();
+            }
+        }
+    }
+
+    /// Iterate every live workload handle across step + backdrop.
+    /// Used by `Op::MoveAllTasks` / `Op::SetAffinity` which act on
+    /// whichever cgroup owns the handle without caring about which
+    /// state slot it's in.
+    fn all_handles(&self) -> impl Iterator<Item = &(String, WorkloadHandle)> {
+        self.step.handles.iter().chain(self.backdrop.handles.iter())
+    }
+
+    /// True iff a cgroup with the given name is already tracked by
+    /// either step-local or backdrop state. Used to reject duplicate
+    /// names at `apply_setup` time so a user can't accidentally
+    /// shadow a Backdrop cgroup with a step-local `CgroupDef`.
+    fn cgroup_name_is_tracked(&self, name: &str) -> bool {
+        self.step.cgroups.names().iter().any(|n| n == name)
+            || self.backdrop.cgroups.names().iter().any(|n| n == name)
+    }
+
+    /// True iff a cgroup with the given name is tracked by backdrop
+    /// (persistent) state. Used by `Op::RemoveCgroup` to reject a
+    /// step-local op that would remove a Backdrop-owned cgroup out
+    /// from under later Steps.
+    fn cgroup_name_is_backdrop(&self, name: &str) -> bool {
+        self.backdrop.cgroups.names().iter().any(|n| n == name)
+    }
+}
+
+/// Whether a live payload handle was spawned by an explicit
+/// [`Op::RunPayload`] inside the step or by a
+/// [`CgroupDef::workload`] attachment at `apply_setup`. Held by
+/// every [`PayloadEntry`] so the dedup path in `Op::RunPayload`
+/// can name the original source when rejecting a second spawn of
+/// the same name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PayloadSource {
+    /// Spawned by `CgroupDef::workload(&payload)` during `apply_setup`.
+    CgroupDefWorkload,
+    /// Spawned by `Op::RunPayload { payload, .. }` inside the step's ops.
+    OpRunPayload,
+}
+
+impl PayloadSource {
+    /// Human-readable tag for error output. Describes the API surface
+    /// that originated the spawn, not the internal dispatch site.
+    fn describe(self) -> &'static str {
+        match self {
+            PayloadSource::CgroupDefWorkload => "CgroupDef::workload",
+            PayloadSource::OpRunPayload => "Op::RunPayload",
+        }
+    }
+}
+
+/// One live payload handle plus the cgroup it runs inside and the
+/// API surface that spawned it. `cgroup` is empty iff
+/// `source == PayloadSource::OpRunPayload` was invoked without a
+/// `cgroup = Some(...)` argument — in which case the payload runs
+/// in whatever cgroup its parent process inherited (no explicit
+/// placement).
+struct PayloadEntry {
+    cgroup: String,
+    source: PayloadSource,
+    handle: crate::scenario::payload_run::PayloadHandle,
+}
+
+/// Execute a single step with CgroupDefs that hold for the full duration.
+///
+/// Convenience wrapper around [`execute_steps`] for the common pattern
+/// of creating cgroups and running them for [`HoldSpec::FULL`].
+pub fn execute_defs(ctx: &Ctx, defs: Vec<CgroupDef>) -> Result<AssertResult> {
+    execute_steps(ctx, vec![Step::with_defs(defs, HoldSpec::FULL)])
+}
+
+/// Execute a sequence of steps against the given context.
+///
+/// Convenience wrapper around [`execute_steps_with`] that passes
+/// `None` for checks, falling back to `ctx.assert`. Use
+/// [`execute_steps_with`] when you need to override `ctx.assert`.
+pub fn execute_steps(ctx: &Ctx, steps: Vec<Step>) -> Result<AssertResult> {
+    execute_steps_with(ctx, steps, None)
+}
+
+/// Execute a [`Backdrop`](backdrop::Backdrop) + Steps sequence
+/// against the given context.
+///
+/// The Backdrop declares persistent scenario-wide state
+/// (long-running payloads, cgroups referenced by many Steps) while
+/// Steps express bounded per-phase behavior. The runtime sets up
+/// the Backdrop before the first Step, runs the Step sequence
+/// with per-Step teardown (cgroups removed, workload handles
+/// collected, payload handles killed at step boundary), and tears
+/// the Backdrop down at the end.
+pub fn execute_scenario(
+    ctx: &Ctx,
+    backdrop: backdrop::Backdrop,
+    steps: Vec<Step>,
+) -> Result<AssertResult> {
+    execute_scenario_with(ctx, backdrop, steps, None)
+}
+
+/// [`execute_scenario`] with an explicit
+/// [`Assert`](crate::assert::Assert) override — the Backdrop
+/// equivalent of [`execute_steps_with`].
+pub fn execute_scenario_with(
+    ctx: &Ctx,
+    backdrop: backdrop::Backdrop,
+    steps: Vec<Step>,
+    checks: Option<&crate::assert::Assert>,
+) -> Result<AssertResult> {
+    run_scenario(ctx, backdrop, steps, checks)
+}
+
+/// Execute steps with an explicit [`Assert`](crate::assert::Assert) for
+/// worker checks. When `checks` is `Some`, it overrides `ctx.assert`.
+/// When `None`, uses `ctx.assert` (the merged three-layer config).
+///
+/// Thin wrapper around [`execute_scenario_with`] with an empty
+/// [`Backdrop`](backdrop::Backdrop) — every Step's effects
+/// (cgroups, workloads, payloads) tear down at the step boundary.
+pub fn execute_steps_with(
+    ctx: &Ctx,
+    steps: Vec<Step>,
+    checks: Option<&crate::assert::Assert>,
+) -> Result<AssertResult> {
+    execute_scenario_with(ctx, backdrop::Backdrop::EMPTY, steps, checks)
+}
+
+/// Internal driver: runs Backdrop setup, the Step loop with
+/// per-Step teardown, and final Backdrop teardown.
+fn run_scenario(
+    ctx: &Ctx,
+    backdrop: backdrop::Backdrop,
+    steps: Vec<Step>,
+    checks: Option<&crate::assert::Assert>,
+) -> Result<AssertResult> {
+    // Validate every step's hold spec up front so a typo doesn't
+    // reach `Duration::from_secs_f64(NaN)` / `thread::sleep(ZERO)` /
+    // a no-yield Loop busy-wait after ops have already been applied.
+    for (i, step) in steps.iter().enumerate() {
+        if let Err(reason) = step.hold.validate() {
+            anyhow::bail!("step {i} hold validation: {reason}");
+        }
+    }
+    // Validate Backdrop payloads before creating any runtime state.
+    // Only binary payloads can be spawned by Op::RunPayload, which
+    // is what the Backdrop setup uses under the hood. Reject
+    // scheduler-kind payloads here so the failure surface is the
+    // Backdrop declaration, not a mid-scenario spawn error after
+    // cgroups have already been created.
+    for p in &backdrop.payloads {
+        if p.is_scheduler() {
+            anyhow::bail!(
+                "Backdrop::with_payload received scheduler-kind Payload '{}' — \
+                 only PayloadKind::Binary payloads run in the Backdrop; \
+                 place scheduler-kind payloads on the #[ktstr_test(scheduler = ...)] \
+                 attribute instead",
+                p.name,
+            );
+        }
+    }
+    // Scheduler-kind payloads smuggled via Backdrop::with_op(Op::RunPayload { ... })
+    // would otherwise bypass the check above and only bail deep inside
+    // apply_ops. Reject them here with a Backdrop-specific error so
+    // the failure surface matches the declaration surface.
+    for op in &backdrop.ops {
+        if let Op::RunPayload { payload, .. } = op
+            && payload.is_scheduler()
+        {
+            anyhow::bail!(
+                "Backdrop::with_op(Op::RunPayload) received scheduler-kind Payload '{}' — \
+                 only PayloadKind::Binary payloads run in the Backdrop; \
+                 place scheduler-kind payloads on the #[ktstr_test(scheduler = ...)] \
+                 attribute instead",
+                payload.name,
+            );
+        }
+    }
+    let effective_checks = checks.unwrap_or(&ctx.assert);
+
+    let mut backdrop_state = BackdropState::empty(ctx);
+    let mut result = AssertResult::pass();
+
+    // Open SHM once for the entire step sequence. No-op outside a VM.
+    let shm = ShmWriter::try_open();
+
+    let scenario_start = std::time::Instant::now();
+
+    // ScenarioStart marker.
+    if let Some(ref w) = shm {
+        w.write(shm_ring::MSG_TYPE_SCENARIO_START, &[]);
+    }
+
+    // When a host-side BPF map write is configured, signal the host that
+    // probes are attached and the scenario is starting, then wait for the
+    // host to complete the write before starting the workload.
+    if ctx.wait_for_map_write {
+        shm_ring::signal_value(1, shm_ring::SIGNAL_PROBES_READY);
+        match shm_ring::wait_for(0, std::time::Duration::from_secs(10)) {
+            Ok(()) => {
+                // Brief delay for the crash trigger to propagate.
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            Err(e) => {
+                eprintln!("ktstr: signal slot 0 wait failed: {e} — proceeding without sync");
+            }
+        }
+    }
+
+    // --- Backdrop setup (persistent) ---
+    // Run before the first Step. Cgroups + payloads declared on
+    // `backdrop` land in `backdrop_state` so they survive every
+    // Step's teardown. On error, drain Backdrop payload handles
+    // (metric emission) and propagate.
+    if !backdrop.is_empty() {
+        let mut step_staging = StepState::empty(ctx);
+        let mut scratch = ScenarioState::new(&mut step_staging, &mut backdrop_state);
+        let setup_res = scratch.with_target_backdrop(|s| {
+            // Order: cgroups → ops → payloads. CgroupDefs go first so
+            // a later `Op::add_cgroup` / `Op::run_payload_in_cgroup`
+            // can target cgroups that `apply_setup` just created.
+            // Payloads spawn last so `run_payload` resolving a cgroup
+            // placement lands inside a cgroup that either apply pass
+            // already built.
+            if !backdrop.cgroups.is_empty() {
+                apply_setup(ctx, s, &backdrop.cgroups)?;
+            }
+            // Raw ops: typically `Op::AddCgroup` for empty move-target
+            // cgroups (can't be expressed via CgroupDef because
+            // apply_setup forces a worker spawn), or placement-aware
+            // `Op::RunPayload` targeting a just-created backdrop
+            // cgroup.
+            if !backdrop.ops.is_empty() {
+                apply_ops(ctx, s, &backdrop.ops)?;
+            }
+            // Shorthand payloads: one Op::RunPayload per entry,
+            // inherited cgroup placement.
+            if !backdrop.payloads.is_empty() {
+                let ops: Vec<Op> = backdrop
+                    .payloads
+                    .iter()
+                    .map(|p| Op::run_payload(p, Vec::<String>::new()))
+                    .collect();
+                apply_ops(ctx, s, &ops)?;
+            }
+            Ok::<(), anyhow::Error>(())
+        });
+        if let Err(err) = setup_res {
+            // Collect any workers that DID spawn before the failure
+            // so their stats reach the final result instead of being
+            // discarded by `WorkloadHandle::drop` (which SIGKILLs
+            // without gathering scheduler-side data). `collect_*`
+            // drain `payload_handles` internally, so the backdrop-
+            // and step-side payloads still get `.kill()` (SHM metric
+            // emission) on the error path.
+            //
+            // `with_target_backdrop` routes every target writer to
+            // the backdrop slot, so `step_staging` normally holds
+            // nothing — but collect defensively so a partial-failure
+            // path that leaks a non-backdrop write surfaces here
+            // rather than disappearing into `StepState::drop`.
+            let mut r = collect_backdrop(&mut backdrop_state, effective_checks, ctx.topo);
+            let staging_result = collect_step(&mut step_staging, effective_checks, ctx.topo);
+            r.merge(staging_result);
+            r.merge(result);
+            // step_staging's CgroupGroup RAII still drops here,
+            // removing any cgroups the failed Backdrop setup routed
+            // into step-local state.
+            r.passed = false;
+            r.details.push(crate::assert::AssertDetail::new(
+                crate::assert::DetailKind::Other,
+                format!("Backdrop setup failed: {err:#}"),
+            ));
+            return Ok(r);
+        }
+        // `step_staging` should not have accumulated anything
+        // because `with_target_backdrop` routed every target writer
+        // to the backdrop side. Collect any stray handles defensively
+        // before dropping so a future refactor that leaks a non-
+        // backdrop write here surfaces as a missed teardown rather
+        // than silently discarded state.
+        drain_all_payload_handles(&mut step_staging.payload_handles);
+    }
+
+    // --- Step loop with per-Step teardown ---
+    for (step_idx, step) in steps.iter().enumerate() {
+        // Check scheduler liveness between steps (skip before first).
+        // sched_pid == None means no scheduler was configured
+        // (kernel-default path); the liveness probe cannot
+        // meaningfully report on a pid that was never set.
+        if step_idx > 0
+            && let Some(pid) = ctx.sched_pid
+            && !process_alive(pid)
+        {
+            // Collect backdrop-owned workload handles into the
+            // result before reporting the crash so whatever the
+            // persistent workers produced is still assertable.
+            let mut r = collect_backdrop(&mut backdrop_state, effective_checks, ctx.topo);
+            r.merge(result);
+            r.passed = false;
+            r.details.push(crate::assert::AssertDetail::new(
+                crate::assert::DetailKind::SchedulerDied,
+                crate::assert::format_sched_died_after_step(
+                    step_idx,
+                    steps.len(),
+                    scenario_start.elapsed().as_secs_f64(),
+                ),
+            ));
+            return Ok(r);
+        }
+
+        let mut step_state = StepState::empty(ctx);
+        let step_res = run_step(
+            ctx,
+            step,
+            step_idx,
+            &mut step_state,
+            &mut backdrop_state,
+            shm.as_ref(),
+            scenario_start,
+            effective_checks,
+        );
+
+        // Per-Step teardown ALWAYS runs — on success and on error.
+        // This is the core of the "Step is fully bounded" invariant:
+        // cgroups created this step go away, workload handles are
+        // collected into the result, payload handles are killed
+        // with metric emission. Backdrop state is untouched.
+        let step_result = collect_step(&mut step_state, effective_checks, ctx.topo);
+        result.merge(step_result);
+
+        // A step-level error is converted into a failure on the
+        // accumulated result after teardown has run so every step
+        // boundary leaves clean state behind even on failure. The
+        // caller keeps the prior-steps' merged AssertResult plus
+        // the error context as a detail, instead of an opaque Err
+        // that discards everything.
+        if let Err(err) = step_res {
+            // Collect Backdrop-owned workload handles into a fresh
+            // result first, then merge the accumulated step result
+            // on top. `collect_backdrop` drains
+            // `backdrop_state.payload_handles` internally, so the
+            // backdrop-side payloads still get `.kill()` (metric
+            // emission) on the error path. Ordering mirrors the
+            // scheduler-crash path above so detail order is
+            // consistent across both Ok(failed) returns.
+            let mut r = collect_backdrop(&mut backdrop_state, effective_checks, ctx.topo);
+            r.merge(result);
+            r.passed = false;
+            r.details.push(crate::assert::AssertDetail::new(
+                crate::assert::DetailKind::Other,
+                format!("step {step_idx} failed: {err:#}"),
+            ));
+            return Ok(r);
+        }
+    }
+
+    // ScenarioEnd marker.
+    if let Some(ref w) = shm {
+        let elapsed = scenario_start.elapsed().as_millis() as u32;
+        w.write(shm_ring::MSG_TYPE_SCENARIO_END, &elapsed.to_ne_bytes());
+    }
+
+    // Final liveness check. sched_pid == None ⇒ no scheduler
+    // configured (kernel-default path); no liveness to report on.
+    let sched_dead = ctx.sched_pid.is_some_and(|pid| !process_alive(pid));
+
+    // --- Backdrop teardown ---
+    let backdrop_result = collect_backdrop(&mut backdrop_state, effective_checks, ctx.topo);
+    result.merge(backdrop_result);
+
+    if sched_dead {
+        result.passed = false;
+        result.details.push(crate::assert::AssertDetail::new(
+            crate::assert::DetailKind::SchedulerDied,
+            crate::assert::format_sched_died_after_all_steps(
+                steps.len(),
+                scenario_start.elapsed().as_secs_f64(),
+            ),
+        ));
+    }
+
+    Ok(result)
+}
+
+/// Run a single step's setup + ops + hold against step-local state.
+///
+/// On error, the caller is expected to invoke `collect_step` for
+/// per-step teardown (which runs regardless) and then propagate.
+#[allow(clippy::too_many_arguments)]
+fn run_step<'a>(
+    ctx: &Ctx,
+    step: &Step,
+    step_idx: usize,
+    step_state: &mut StepState<'a>,
+    backdrop_state: &mut BackdropState<'a>,
+    shm: Option<&ShmWriter>,
+    scenario_start: std::time::Instant,
+    _effective_checks: &crate::assert::Assert,
+) -> Result<()> {
+    let mut scenario = ScenarioState::new(step_state, backdrop_state);
+
+    // Any `?` out of apply_ops / apply_setup would bypass the
+    // per-step teardown ordering; `drain_on_err!` kills payload
+    // handles across step + backdrop (metric-emitting) before
+    // propagating so a mid-scenario spawn failure still leaves a
+    // usable sidecar.
+    macro_rules! drain_on_err {
+        ($scenario:expr, $e:expr) => {
+            match $e {
+                Ok(v) => v,
+                Err(err) => {
+                    $scenario.drain_all_payloads();
+                    return Err(err);
+                }
+            }
+        };
+    }
+
+    match &step.hold {
+        HoldSpec::Loop { interval } => {
+            // Setup runs once before the loop.
+            if !step.setup.is_empty() {
+                let defs = step.setup.resolve(ctx);
+                drain_on_err!(scenario, apply_setup(ctx, &mut scenario, &defs));
+            }
+            // Loop mode: apply ops repeatedly at interval until
+            // the remaining scenario time is exhausted.
+            let deadline = scenario_start + ctx.duration;
+            while std::time::Instant::now() < deadline {
+                drain_on_err!(scenario, apply_ops(ctx, &mut scenario, &step.ops));
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                thread::sleep(remaining.min(*interval));
+            }
+        }
+        _ => {
+            // Ops first (e.g. parent cgroup creation), then
+            // CgroupDef setup (children with workers).
+            drain_on_err!(scenario, apply_ops(ctx, &mut scenario, &step.ops));
+            if !step.setup.is_empty() {
+                let defs = step.setup.resolve(ctx);
+                drain_on_err!(scenario, apply_setup(ctx, &mut scenario, &defs));
+            }
+
+            // Write stimulus event after applying ops.
+            if let Some(w) = shm {
+                let payload = build_stimulus(&scenario_start, step_idx, &step.ops, &scenario);
+                w.write(
+                    shm_ring::MSG_TYPE_STIMULUS,
+                    zerocopy::IntoBytes::as_bytes(&payload),
+                );
+            }
+
+            let hold_dur = match &step.hold {
+                HoldSpec::Frac(f) => Duration::from_secs_f64(ctx.duration.as_secs_f64() * f),
+                HoldSpec::Fixed(d) => *d,
+                HoldSpec::Loop { .. } => unreachable!(),
+            };
+            thread::sleep(hold_dur);
+        }
+    }
+
+    Ok(())
+}
+
+/// Build a StimulusPayload from the current scenario state (step + backdrop).
+///
+/// # step_idx u16 saturation
+///
+/// `step_idx` is a `usize` on the caller side but the wire
+/// `StimulusPayload.step_index` is a `u16` — the slot is sized for
+/// realistic scenarios (≤ 65 536 distinct indices, `0..=u16::MAX`).
+/// Any `step_idx` > `u16::MAX as usize` is clamped to `u16::MAX` by
+/// `to_u16` below, with a `tracing::warn!` that names the overflow.
+/// Downstream consumers of the StepStart wire frame therefore see
+/// every step past index `u16::MAX` collapsed onto the same
+/// `step_index` value (`u16::MAX`) — the ordering is preserved for
+/// the first 65 536 steps (indices `0..=u16::MAX`), but labels
+/// saturate and become ambiguous once the scenario crosses the
+/// boundary. Scenarios that need to distinguish individual steps
+/// past `u16::MAX` must widen the wire schema field; the
+/// saturating-clip preserves visible wake ordering at the cost of
+/// individuality in the deep tail.
+fn build_stimulus(
+    scenario_start: &std::time::Instant,
+    step_idx: usize,
+    ops: &[Op],
+    state: &ScenarioState<'_, '_>,
+) -> StimulusPayload {
+    let mut op_kinds: u32 = 0;
+    for op in ops {
+        op_kinds |= 1 << op.discriminant();
+    }
+
+    let total_iterations: u64 = state
+        .all_handles()
+        .flat_map(|(_, h)| h.snapshot_iterations())
+        .sum();
+
+    let cgroup_count = state.step.cgroups.names().len() + state.backdrop.cgroups.names().len();
+    let worker_count = state.step.handles.len() + state.backdrop.handles.len();
+
+    // Saturate narrowing conversions for the wire schema: the
+    // StimulusPayload fields are sized for realistic scenarios
+    // (u32 ms, u16 counts) but `as u32` / `as u16` silently
+    // wrap on overflow, poisoning downstream consumers. Log the
+    // overflow so the operator sees which field exceeded its
+    // bound and substitute MAX — clipped-high is a safer wire
+    // value than silently wrapping to a small number.
+    let to_u32 = |field: &str, v: u128| -> u32 {
+        u32::try_from(v).unwrap_or_else(|_| {
+            tracing::warn!(
+                field,
+                value = %v,
+                "StimulusPayload field overflowed u32; saturating to u32::MAX",
+            );
+            u32::MAX
+        })
+    };
+    let to_u16 = |field: &str, v: usize| -> u16 {
+        u16::try_from(v).unwrap_or_else(|_| {
+            tracing::warn!(
+                field,
+                value = v,
+                "StimulusPayload field overflowed u16; saturating to u16::MAX",
+            );
+            u16::MAX
+        })
+    };
+
+    StimulusPayload {
+        elapsed_ms: to_u32("elapsed_ms", scenario_start.elapsed().as_millis()),
+        step_index: to_u16("step_index", step_idx),
+        op_count: to_u16("op_count", ops.len()),
+        op_kinds,
+        cgroup_count: to_u16("cgroup_count", cgroup_count),
+        worker_count: to_u16("worker_count", worker_count),
+        total_iterations,
+    }
+}
+
+/// Validate that a MemPolicy's node set is consistent with the
+/// cgroup's scenario intent — the cpuset the cgroup runs in and
+/// the host topology.
+///
+/// # Empty-nodemask early return
+///
+/// Policies with no nodemask — [`MemPolicy::Default`] and
+/// [`MemPolicy::Local`] — carry no node IDs to validate against,
+/// so this function returns `Ok(())` unconditionally for them
+/// (after the unknown-bit and mutual-exclusion flag guards run).
+/// Every other variant — any variant carrying a nodemask,
+/// currently [`MemPolicy::Bind`], [`MemPolicy::Preferred`],
+/// [`MemPolicy::PreferredMany`], [`MemPolicy::Interleave`], and
+/// [`MemPolicy::WeightedInterleave`] — reaches the cpuset /
+/// host-topology coverage logic below.
+///
+/// # Why this is a scenario-intent check, not a kernel guard
+///
+/// ktstr writes `cpuset.cpus` on each cgroup but never writes
+/// `cpuset.mems`, so `cpuset.mems` keeps its inherited default —
+/// the permissive "all nodes" set in every ktstr deployment
+/// shape (PID 1 inside the guest VM, cgroup root on the host).
+/// The kernel's `set_mempolicy(2)` path always runs the policy's
+/// nodemask through `mpol_set_nodemask` in `mm/mempolicy.c`, which
+/// intersects it with the caller's `mems_allowed` before it is
+/// stored on the task; because ktstr never narrows `mems_allowed`,
+/// that intersection is an identity operation under ktstr's
+/// deployment — the stored nodemask equals the one the caller
+/// supplied, and the kernel never rejects or silently trims the
+/// policy the way it would if `mems_allowed` were disjoint from
+/// the requested set. Rejection of a mismatched policy is
+/// therefore validator-only: if this function does not bail, the
+/// policy lands on the syscall unchanged and `run_steps` commits
+/// to running the worker with a misconfigured allocation target.
+///
+/// What the validator catches is a **scenario-design mismatch**:
+/// you pinned CPUs on NUMA node X (via `CpusetSpec::Numa(X)`) but
+/// asked the mempolicy to bind/prefer/interleave a disjoint node Y,
+/// meaning the worker's compute is local to node X while its
+/// allocations live on node Y — producing cross-socket traffic
+/// that the test author almost certainly did not intend. Surface
+/// the mismatch here before `run_steps` commits to the policy.
+///
+/// `MpolFlags::STATIC_NODES` is the rebind-behavior flag. Two
+/// kernel sites encode the semantics: `mpol_set_nodemask` in
+/// `mm/mempolicy.c` consumes the flag during policy creation (it
+/// determines whether the supplied nodemask is stored absolute or
+/// remapped against the caller's cpuset at install time), and
+/// `mpol_rebind_policy` (same file) branches on the flag when the
+/// cpuset's `mems_allowed` changes after the policy was installed
+/// — with `STATIC_NODES` set, the stored nodemask is unchanged;
+/// without it, the kernel remaps the nodemask against the new
+/// `mems_allowed`. Since ktstr never rebinds `cpuset.mems` mid-run,
+/// only the install-time semantics applies, and the flag is
+/// effectively a cross-node-intent declaration for the validator's
+/// purposes — a sign the author knows the intent is "allocations on
+/// a node outside the CPU-affinity cpuset" and has opted in to
+/// that shape.
+///
+/// # Flag-specific handling (in order of evaluation)
+///
+/// - `STATIC_NODES | RELATIVE_NODES` both set → bail: the kernel
+///   rejects this combination with `EINVAL`; surfacing it here
+///   names the offender before the syscall.
+/// - `STATIC_NODES` only → the caller has declared intentional
+///   cross-node placement. Skip the cpuset-intent check, but each
+///   referenced node must exist on the host topology or the
+///   kernel will reject the policy. Verify existence; bail with
+///   the missing nodes if any.
+/// - `RELATIVE_NODES` only → the nodemask is an ordinal into the
+///   cpuset's allowed-nodes set. Cpuset coverage does not apply in
+///   absolute-id terms, so bypass.
+/// - No relevant flag set → enforce cpuset-intent coverage:
+///   every policy node must appear in the cpuset's covered NUMA
+///   nodes. Bail naming the uncovered nodes AND both escape
+///   hatches (STATIC_NODES opt-in; widening the cpuset).
+///
+/// Reject `--flag` args whose bare name is not in the payload's
+/// `known_flags` allowlist. Returns `Ok(())` when the payload
+/// declared no allowlist (`known_flags: None`) — the opt-in
+/// contract defaults to "permissive" so payloads wrapping
+/// open-ended binaries (stress-ng, fio, schbench) aren't forced
+/// to enumerate every flag their upstream tool accepts.
+///
+/// Recognises two flag shapes: `--foo` (flag-only) and
+/// `--foo=value` (flag-with-attached-value). Non-flag args
+/// (positional, `-short`, everything else) are passed through
+/// without inspection — the allowlist scopes to long flags only.
+///
+/// Extracted out of `apply_ops`'s `Op::RunPayload` arm so the
+/// validation is unit-testable without standing up a full Ctx
+/// / scenario state. See the caller for how the allowlist is
+/// threaded through Op::RunPayload execution.
+fn validate_known_flags(payload: &crate::test_support::Payload, args: &[String]) -> Result<()> {
+    let Some(allowlist) = payload.known_flags else {
+        return Ok(());
+    };
+    for arg in args {
+        let Some(flag_body) = arg.strip_prefix("--") else {
+            continue;
+        };
+        // `split('=').next()` is infallible: `str::split` always
+        // yields at least one element (the full string when no
+        // separator is present). The prior `unwrap_or("")` fallback
+        // was dead code — the empty-name branch below never fired
+        // via this path since `flag_body` had already passed the
+        // `strip_prefix("--")` filter above (leaving at least one
+        // character). Kept the `name.is_empty()` guard in place
+        // only to handle the degenerate `"--"` bare-dashes case,
+        // which produces `flag_body = ""` → `name = ""`.
+        let name = flag_body
+            .split('=')
+            .next()
+            .expect("str::split always yields at least one element");
+        if name.is_empty() {
+            continue;
+        }
+        if !allowlist.contains(&name) {
+            anyhow::bail!(
+                "Op::RunPayload: payload '{}' received unknown flag \
+                 '--{name}' — not in its known_flags allowlist \
+                 {allowlist:?}. Check the spelling against the \
+                 payload's declared flags; if '--{name}' is a new \
+                 legitimate flag, add it to `Payload::known_flags`.",
+                payload.name,
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_mempolicy_cpuset(
+    policy: &MemPolicy,
+    flags: crate::workload::MpolFlags,
+    cpuset: &BTreeSet<usize>,
+    ctx: &Ctx,
+    cgroup_name: &str,
+) -> Result<()> {
+    use crate::workload::MpolFlags;
+
+    // Reject unknown bits before any other check. The `MpolFlags`
+    // type is a `u32` bitfield covering three documented bits
+    // (STATIC_NODES, RELATIVE_NODES, NUMA_BALANCING); any other bit
+    // set in `flags` is either a user typo (raw-constructing the
+    // struct with an arbitrary integer) or forward-compat from a
+    // future kernel flag that this validator hasn't learned yet.
+    // Either way, surfacing unknown bits here prevents a silent
+    // semantic mismatch — the kernel would either reject with
+    // EINVAL or (worse) treat the bit as a flag we don't model.
+    let known_bits = MpolFlags::STATIC_NODES.bits()
+        | MpolFlags::RELATIVE_NODES.bits()
+        | MpolFlags::NUMA_BALANCING.bits();
+    let unknown_bits = flags.bits() & !known_bits;
+    if unknown_bits != 0 {
+        anyhow::bail!(
+            "cgroup '{}': MpolFlags contains unknown bit(s) {:#x} (known bits: \
+             STATIC_NODES={:#x}, RELATIVE_NODES={:#x}, NUMA_BALANCING={:#x}); \
+             refusing to forward to the kernel — update MpolFlags to model the \
+             new bit before using it, or clear the bit at the call site",
+            cgroup_name,
+            unknown_bits,
+            MpolFlags::STATIC_NODES.bits(),
+            MpolFlags::RELATIVE_NODES.bits(),
+            MpolFlags::NUMA_BALANCING.bits(),
+        );
+    }
+
+    // `STATIC_NODES | RELATIVE_NODES` is a kernel-rejected combination —
+    // `MPOL_F_STATIC_NODES` and `MPOL_F_RELATIVE_NODES` are mutually
+    // exclusive (see `include/uapi/linux/mempolicy.h` + the
+    // `sanitize_mpol_flags` helper in `mm/mempolicy.c`, which bails
+    // with `EINVAL` if both are set). Fail early here instead of
+    // letting the syscall return a generic error — the scenario
+    // caller almost certainly meant one or the other, not both.
+    if flags.contains(MpolFlags::STATIC_NODES) && flags.contains(MpolFlags::RELATIVE_NODES) {
+        anyhow::bail!(
+            "cgroup '{}': MpolFlags::STATIC_NODES and MpolFlags::RELATIVE_NODES are \
+             mutually exclusive (the kernel will reject the set_mempolicy syscall with \
+             EINVAL); pick whichever matches the intended semantics — STATIC_NODES \
+             for absolute node ids that survive cpuset changes, RELATIVE_NODES for \
+             cpuset-relative indices",
+            cgroup_name,
+        );
+    }
+
+    let policy_nodes = policy.node_set();
+    if policy_nodes.is_empty() {
+        return Ok(());
+    }
+
+    // `STATIC_NODES`: nodemask is treated as absolute node ids and NOT
+    // intersected with the cpuset. The cpuset-coverage check below
+    // does not apply, but we DO need to verify the referenced nodes
+    // actually exist on the host — a policy pinning node 7 on a
+    // 2-node host would fail at syscall time; surfacing it here
+    // names the offender.
+    if flags.contains(MpolFlags::STATIC_NODES) {
+        let host_nodes = ctx.topo.numa_node_ids();
+        let missing: Vec<usize> = policy_nodes
+            .iter()
+            .copied()
+            .filter(|n| !host_nodes.contains(n))
+            .collect();
+        if !missing.is_empty() {
+            anyhow::bail!(
+                "cgroup '{}': MemPolicy with MpolFlags::STATIC_NODES references \
+                 NUMA node(s) {:?} that do not exist on this host (host nodes: {:?}); \
+                 the kernel will reject or silently drop the policy (Preferred can \
+                 silently fall back to local allocation; Bind/Interleave reject with \
+                 EINVAL) — fix the MemPolicy or pick a host with the required nodes",
+                cgroup_name,
+                missing,
+                host_nodes,
+            );
+        }
+        return Ok(());
+    }
+
+    // `RELATIVE_NODES`: nodemask is an ordinal into the cpuset's
+    // allowed nodes, not an absolute node id set. The cpuset-coverage
+    // check compares absolute ids, so it does not apply here — the
+    // kernel does the relative-to-absolute remap internally. Trust
+    // the caller and bypass the coverage bail, same shape as the
+    // STATIC_NODES early return.
+    if flags.contains(MpolFlags::RELATIVE_NODES) {
+        return Ok(());
+    }
+
+    let cpuset_numa = ctx.topo.numa_nodes_for_cpuset(cpuset);
+    let uncovered: Vec<usize> = policy_nodes
+        .iter()
+        .copied()
+        .filter(|n| !cpuset_numa.contains(n))
+        .collect();
+    if !uncovered.is_empty() {
+        anyhow::bail!(
+            "cgroup '{}': MemPolicy references NUMA node(s) {:?} \
+             outside the cpuset's coverage (cpuset covers node(s) \
+             {:?}) — some or all of the worker's allocations would \
+             live on NUMA nodes its CPUs cannot reach locally, \
+             producing cross-socket allocation traffic that is \
+             almost certainly unintended. Two fixes: \
+             (a) add .mpol_flags(MpolFlags::STATIC_NODES) to \
+             declare the cross-node placement intentional (the \
+             flag survives cpuset rebinds; see MpolFlags doc), or \
+             (b) widen the cpuset to cover the policy's nodes \
+             (e.g. CpusetSpec::Numa(N) for each referenced N, or \
+             a CpusetSpec::Exact set that spans both).",
+            cgroup_name,
+            uncovered,
+            cpuset_numa,
+        );
+    }
+    Ok(())
+}
+
+/// Each CgroupDef's `works` vec is iterated, spawning one WorkloadHandle
+/// per WorkSpec entry. Multiple Works for the same cgroup produce multiple
+/// handle entries with the same name key; Ops that filter by cgroup name
+/// (StopCgroup, SetAffinity, etc.) naturally apply to all of them.
+///
+/// When `works` is empty, a single default WorkSpec is used (SpinWait, Normal,
+/// ctx.workers_per_cgroup workers).
+///
+/// Cgroups created here route into step-local or backdrop state per
+/// `state.target_backdrop`. A duplicate name (already tracked by
+/// either state) bails — a `CgroupDef` must not silently shadow a
+/// cgroup that another state slot has already created.
+fn apply_setup(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, defs: &[CgroupDef]) -> Result<()> {
+    let default_work = [WorkSpec::default()];
+    for def in defs {
+        if state.cgroup_name_is_tracked(&def.name) {
+            anyhow::bail!(
+                "CgroupDef '{}' collides with a cgroup already tracked \
+                 (by a prior Backdrop or step-local CgroupDef) — declare it \
+                 in exactly one place; use a fresh name for the step-local cgroup",
+                def.name,
+            );
+        }
+        state.target_cgroups().add_cgroup_no_cpuset(&def.name)?;
+        if let Some(ref cpuset_spec) = def.cpuset {
+            if let Err(reason) = cpuset_spec.validate(ctx) {
+                anyhow::bail!(
+                    "cgroup '{}': CpusetSpec validation failed: {}",
+                    def.name,
+                    reason
+                );
+            }
+            let resolved = cpuset_spec.resolve(ctx);
+            ctx.cgroups.set_cpuset(&def.name, &resolved)?;
+            state.record_cpuset(&def.name, resolved);
+        }
+        if let Some(ref nodes) = def.cpuset_mems {
+            // The cpuset.mems write must succeed before any task
+            // moves into the cgroup; cpuset_update_task_spread will
+            // SIGKILL or fail allocations otherwise. Surfacing the
+            // error here (instead of at move_tasks time) lets the
+            // operator see the bad NUMA spec at setup, before the
+            // worker spawn pays its cost.
+            ctx.cgroups.set_cpuset_mems(&def.name, nodes)?;
+        }
+        if let Some(ref cpu) = def.cpu {
+            // cpu.weight: kernel range is 1..=10000 per
+            // Documentation/admin-guide/cgroup-v2.rst. Reject at
+            // setup so a 0 / 12000 from a typo fails fast instead
+            // of returning EINVAL from the kernel write.
+            if let Some(w) = cpu.weight {
+                if !(1..=10_000).contains(&w) {
+                    anyhow::bail!(
+                        "cgroup '{}': cpu.weight {w} out of range 1..=10000",
+                        def.name,
+                    );
+                }
+                ctx.cgroups.set_cpu_weight(&def.name, w)?;
+            }
+            // cpu.max: writing requires `+cpu` in subtree_control;
+            // CgroupManager::setup with enable_cpu_controller=true
+            // turns it on. quota=0 with period>0 would reject every
+            // schedule slice in the kernel; reject here with a
+            // clearer message.
+            if cpu.max_period_us == 0 {
+                anyhow::bail!(
+                    "cgroup '{}': cpu.max period must be > 0 (got 0)",
+                    def.name,
+                );
+            }
+            if let Some(q) = cpu.max_quota_us {
+                if q == 0 {
+                    anyhow::bail!(
+                        "cgroup '{}': cpu.max quota must be > 0 when set; \
+                         use cpu_unlimited() to remove the cap",
+                        def.name,
+                    );
+                }
+            }
+            // Always emit the cpu.max write so the period field is
+            // recorded even when quota is None. Aligns with the
+            // kernel's `"max <period>"` write format.
+            ctx.cgroups
+                .set_cpu_max(&def.name, cpu.max_quota_us, cpu.max_period_us)?;
+        }
+        if let Some(ref mem) = def.memory {
+            // Order: max first, then high (high <= max is the
+            // operator-meaningful constraint per cgroup-v2 docs;
+            // kernel allows any ordering but writing max first
+            // means a high write fails clearly when high>max).
+            // swap_max is independent of the max/high/low triple
+            // and lands last in the memory block.
+            ctx.cgroups.set_memory_max(&def.name, mem.max)?;
+            ctx.cgroups.set_memory_high(&def.name, mem.high)?;
+            ctx.cgroups.set_memory_low(&def.name, mem.low)?;
+            // memory.swap.max only exists when the kernel was built
+            // with CONFIG_SWAP. On a swap-disabled kernel the file is
+            // absent and write returns ENOENT. Match the per-knob
+            // explicit-set semantics of the pids block: emit the
+            // write only when the user opted in via memory_swap_max
+            // / memory_swap_unlimited. swap_max=None means "the
+            // user never asked for a swap cap" — in that case the
+            // kernel default (unlimited on swap-enabled, no file on
+            // swap-disabled) is exactly what we want, and skipping
+            // the write keeps swap-disabled kernels viable for
+            // tests that just set memory_max.
+            if mem.swap_max.is_some() {
+                ctx.cgroups
+                    .set_memory_swap_max(&def.name, mem.swap_max)?;
+            }
+        }
+        if let Some(ref io) = def.io {
+            if let Some(w) = io.weight {
+                if !(1..=10_000).contains(&w) {
+                    anyhow::bail!(
+                        "cgroup '{}': io.weight {w} out of range 1..=10000",
+                        def.name,
+                    );
+                }
+                ctx.cgroups.set_io_weight(&def.name, w)?;
+            }
+        }
+        if let Some(ref pids) = def.pids {
+            // pids.max: zero is a foot-cannon (no fork ever), so
+            // reject before the syscall — the kernel would accept
+            // 0 but the workload would silently halt every fork
+            // including the futex-helper threads spawned by some
+            // WorkType variants. There's no kernel sentinel for
+            // "no fork ever"; the explicit None path writes "max".
+            if let Some(0) = pids.max {
+                anyhow::bail!(
+                    "cgroup '{}': pids.max must be > 0; use \
+                     pids_unlimited() to remove the cap",
+                    def.name,
+                );
+            }
+            ctx.cgroups.set_pids_max(&def.name, pids.max)?;
+        }
+        let effective_works: &[WorkSpec] = if def.works.is_empty() {
+            &default_work
+        } else {
+            &def.works
+        };
+        for work in effective_works {
+            if let Err(reason) = work.mem_policy.validate() {
+                anyhow::bail!("cgroup '{}': {}", def.name, reason);
+            }
+        }
+        // Clone the cpuset out so we don't keep a borrow into
+        // `state` across the mutable spawn calls below.
+        let cgroup_cpuset: Option<BTreeSet<usize>> = state.lookup_cpuset(&def.name).cloned();
+        if let Some(ref resolved) = cgroup_cpuset {
+            for work in effective_works {
+                validate_mempolicy_cpuset(
+                    &work.mem_policy,
+                    work.mpol_flags,
+                    resolved,
+                    ctx,
+                    &def.name,
+                )?;
+            }
+        }
+        for work in effective_works {
+            let n = crate::scenario::resolve_num_workers(work, ctx.workers_per_cgroup, &def.name)?;
+            let effective_work_type = crate::workload::resolve_work_type(
+                &work.work_type,
+                ctx.work_type_override.as_ref(),
+                def.swappable,
+                n,
+            );
+            let affinity = crate::scenario::intent_for_spawn(
+                &work.affinity,
+                cgroup_cpuset.as_ref(),
+                ctx.topo,
+            )?;
+            let wl = WorkloadConfig {
+                num_workers: n,
+                affinity,
+                work_type: effective_work_type,
+                sched_policy: work.sched_policy,
+                mem_policy: work.mem_policy.clone(),
+                mpol_flags: work.mpol_flags,
+                nice: 0,
+                clone_mode: Default::default(),
+                composed: Vec::new(),
+            };
+            let mut h = WorkloadHandle::spawn(&wl)?;
+            ctx.cgroups.move_tasks(&def.name, &h.worker_pids())?;
+            h.start();
+            state.target_handles().push((def.name.to_string(), h));
+        }
+        // After synthetic workers are in place, spawn the optional
+        // userspace payload inside the same cgroup. The payload runs
+        // concurrently with the WorkSpec groups; its metrics are recorded
+        // to the sidecar via the guest-to-host SHM ring when the
+        // handle is killed at step-teardown. Spawning after the WorkSpec
+        // handles lets the cgroup cpuset + mempolicy settle first so
+        // the binary inherits a stable placement.
+        if let Some(payload) = def.payload {
+            // Composite-key dedup: the same payload CAN live in a
+            // different cgroup, but two copies in THIS cgroup would
+            // collide on teardown (one handle masks the other in
+            // the sidecar). Reject upfront with the same error
+            // shape as the Op::RunPayload path.
+            if let Some(existing) =
+                state.find_live_payload_with_cgroup(payload.name, def.name.as_ref())
+            {
+                anyhow::bail!(
+                    "CgroupDef::workload: payload '{}' already running in cgroup '{}' (spawned by {}) — \
+                     declare it in exactly one place per cgroup",
+                    payload.name,
+                    def.name,
+                    existing.source.describe(),
+                );
+            }
+            let handle = crate::scenario::payload_run::PayloadRun::new(ctx, payload)
+                .in_cgroup(def.name.clone())
+                .spawn()
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "cgroup '{}': spawn payload '{}': {:#}",
+                        def.name,
+                        payload.name,
+                        e,
+                    )
+                })?;
+            state.target_payload_handles().push(PayloadEntry {
+                cgroup: def.name.to_string(),
+                source: PayloadSource::CgroupDefWorkload,
+                handle,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Apply a slice of Ops to the running state.
+///
+/// Ops that create new entities (`AddCgroup`, `Spawn`, `SpawnHost`,
+/// `RunPayload`) route into step-local state by default, or into
+/// backdrop when the Backdrop's initial setup phase is active.
+/// Ops that read or mutate existing entities (`SetCpuset`,
+/// `ClearCpuset`, `SwapCpusets`, `SetAffinity`, `MoveAllTasks`,
+/// `RemoveCgroup`, `StopCgroup`, `WaitPayload`, `KillPayload`)
+/// resolve the target name against step-local first, then backdrop
+/// — so a Step's ops can reach into Backdrop-declared cgroups by
+/// name without the Backdrop leaking implementation details.
+fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result<()> {
+    for op in ops {
+        match op {
+            Op::AddCgroup { name } => {
+                // Mirror the collision check in `apply_setup`
+                // (`CgroupDef`) so the same name declared via `Op`
+                // is rejected the same way. Without this, an
+                // `Op::AddCgroup` could silently shadow a
+                // Backdrop-owned or step-local `CgroupDef`-created
+                // cgroup and the two writers could clobber each
+                // other's cpuset / subtree_control state.
+                if state.cgroup_name_is_tracked(name) {
+                    anyhow::bail!(
+                        "Op::AddCgroup '{}' collides with a cgroup already \
+                         tracked (by a prior Backdrop or step-local CgroupDef) — \
+                         declare it in exactly one place; use a fresh name for \
+                         the step-local cgroup",
+                        name,
+                    );
+                }
+                state.target_cgroups().add_cgroup_no_cpuset(name)?;
+            }
+            Op::RemoveCgroup { cgroup } => {
+                // A Step's ops must not remove a Backdrop-owned
+                // cgroup — later Steps expect the Backdrop's cgroups
+                // to survive every per-step teardown. Reject
+                // explicitly so a typo in the cgroup name does not
+                // silently dismantle a persistent cgroup and let
+                // subsequent Steps fail with confusing
+                // "cgroup missing" errors. Ops running during the
+                // Backdrop's own setup pass (`target_backdrop`)
+                // are exempt: the Backdrop is allowed to structure
+                // its own state however it needs before the Step
+                // loop starts.
+                if !state.target_backdrop && state.cgroup_name_is_backdrop(cgroup) {
+                    anyhow::bail!(
+                        "Op::RemoveCgroup targets Backdrop-owned cgroup '{}' — \
+                         Backdrop cgroups live for the full scenario and must \
+                         not be removed from a Step; drop the op or move the \
+                         cgroup declaration out of the Backdrop",
+                        cgroup,
+                    );
+                }
+                // Stop workers + payload binaries in this cgroup
+                // before the cgroupfs removal. A live process in the
+                // cgroup makes `rmdir` fail with EBUSY; kill the
+                // payload handles first so the cgroup frees up.
+                state.drain_payloads_for_cgroup(cgroup);
+                state.drop_handles_for_cgroup(cgroup);
+                state.forget_cpuset(cgroup);
+                // ENOENT is expected here only as a TOCTOU outcome:
+                // `CgroupManager::remove_cgroup` first checks
+                // `p.exists()` and returns `Ok(())` when the dir is
+                // already gone, so a clean "already removed by a
+                // prior op" case never reaches this error arm. The
+                // remaining ENOENT path is the narrow race where the
+                // dir is unlinked by another process between
+                // `exists()` and `fs::remove_dir(&p)`, which is
+                // benign — the post-condition we want (no dir) still
+                // holds. Every other error — EBUSY from a surviving
+                // task, EACCES from a permissions regression, I/O
+                // errors from a broken cgroupfs mount — gets logged
+                // so the failure surfaces in test output instead of
+                // being swallowed by `let _ = `.
+                if let Err(err) = ctx.cgroups.remove_cgroup(cgroup)
+                    && !crate::scenario::is_io_not_found(&err)
+                {
+                    let hint = crate::scenario::remove_cgroup_errno_hint(&err).unwrap_or("");
+                    tracing::warn!(
+                        cgroup = %cgroup,
+                        err = %format!("{err:#}"),
+                        hint,
+                        "Op::RemoveCgroup: remove_cgroup returned non-ENOENT error",
+                    );
+                }
+            }
+            Op::SetCpuset { cgroup, cpus } => {
+                if let Err(reason) = cpus.validate(ctx) {
+                    anyhow::bail!(
+                        "cgroup '{}': CpusetSpec validation failed: {}",
+                        cgroup,
+                        reason
+                    );
+                }
+                let resolved = cpus.resolve(ctx);
+                ctx.cgroups.set_cpuset(cgroup, &resolved)?;
+                state.record_cpuset(cgroup, resolved);
+            }
+            Op::ClearCpuset { cgroup } => {
+                ctx.cgroups.clear_cpuset(cgroup)?;
+                state.forget_cpuset(cgroup);
+            }
+            Op::SwapCpusets { a, b } => {
+                // Read current cpusets from the cgroup filesystem, swap them.
+                let cpus_a = read_cpuset(ctx, a);
+                let cpus_b = read_cpuset(ctx, b);
+                if let Some(ca) = cpus_a {
+                    ctx.cgroups.set_cpuset(b, &ca)?;
+                    state.record_cpuset(b, ca);
+                }
+                if let Some(cb) = cpus_b {
+                    ctx.cgroups.set_cpuset(a, &cb)?;
+                    state.record_cpuset(a, cb);
+                }
+            }
+            Op::Spawn { cgroup, work } => {
+                if let Err(reason) = work.mem_policy.validate() {
+                    anyhow::bail!("cgroup '{}': {}", cgroup, reason);
+                }
+                let n = crate::scenario::resolve_num_workers(work, ctx.workers_per_cgroup, cgroup)?;
+                let cgroup_cpuset: Option<BTreeSet<usize>> = state.lookup_cpuset(cgroup).cloned();
+                if let Some(ref resolved) = cgroup_cpuset {
+                    validate_mempolicy_cpuset(
+                        &work.mem_policy,
+                        work.mpol_flags,
+                        resolved,
+                        ctx,
+                        cgroup,
+                    )?;
+                }
+                let affinity = crate::scenario::intent_for_spawn(
+                    &work.affinity,
+                    cgroup_cpuset.as_ref(),
+                    ctx.topo,
+                )?;
+                let wl = WorkloadConfig {
+                    num_workers: n,
+                    affinity,
+                    work_type: work.work_type.clone(),
+                    sched_policy: work.sched_policy,
+                    mem_policy: work.mem_policy.clone(),
+                    mpol_flags: work.mpol_flags,
+                    nice: 0,
+                    clone_mode: Default::default(),
+                    composed: Vec::new(),
+                };
+                let mut h = WorkloadHandle::spawn(&wl)?;
+                ctx.cgroups.move_tasks(cgroup, &h.worker_pids())?;
+                h.start();
+                state.target_handles().push((cgroup.to_string(), h));
+            }
+            Op::StopCgroup { cgroup } => {
+                // Same invariant as Op::RemoveCgroup: a Step's ops
+                // must not stop a Backdrop-owned cgroup's workers.
+                // `drain_payloads_for_cgroup` and
+                // `drop_handles_for_cgroup` both touch step + backdrop
+                // state by name, so a silent step-local stop would
+                // kill persistent workers. Ops running inside the
+                // Backdrop's own setup pass (`target_backdrop`)
+                // stay exempt.
+                if !state.target_backdrop && state.cgroup_name_is_backdrop(cgroup) {
+                    anyhow::bail!(
+                        "Op::StopCgroup targets Backdrop-owned cgroup '{}' — \
+                         Backdrop workers live for the full scenario and must \
+                         not be stopped from a Step; drop the op or move the \
+                         cgroup declaration out of the Backdrop",
+                        cgroup,
+                    );
+                }
+                state.drain_payloads_for_cgroup(cgroup);
+                state.drop_handles_for_cgroup(cgroup);
+            }
+            Op::SetAffinity { cgroup, affinity } => {
+                let cgroup_cpuset: Option<BTreeSet<usize>> = state.lookup_cpuset(cgroup).cloned();
+                let resolved =
+                    crate::scenario::resolve_affinity_for_cgroup(affinity, cgroup_cpuset.as_ref(), ctx.topo)?;
+                for (name, handle) in state.all_handles() {
+                    if name.as_str() == *cgroup {
+                        match &resolved {
+                            crate::workload::ResolvedAffinity::None => {}
+                            crate::workload::ResolvedAffinity::Fixed(cpus) => {
+                                for idx in 0..handle.worker_pids().len() {
+                                    let _ = handle.set_affinity(idx, cpus);
+                                }
+                            }
+                            crate::workload::ResolvedAffinity::Random { from, count }
+                                if !from.is_empty() && *count > 0 =>
+                            {
+                                use rand::seq::IndexedRandom;
+                                let v: Vec<usize> = from.iter().copied().collect();
+                                for idx in 0..handle.worker_pids().len() {
+                                    let chosen: BTreeSet<usize> =
+                                        v.sample(&mut rand::rng(), *count).copied().collect();
+                                    let _ = handle.set_affinity(idx, &chosen);
+                                }
+                            }
+                            // Empty pool OR count == 0: divergence from
+                            // `workload::resolve_affinity`, which BAILS
+                            // on count == 0 because it runs during
+                            // workload setup where a zero-sample is a
+                            // caller-config bug. Here at the
+                            // step-execution layer the affinity was
+                            // already applied at spawn and this op is
+                            // re-applying; a zero-sample is a harmless
+                            // skip, not a caller error. No-op rather
+                            // than bail so a mid-run SetAffinity with
+                            // a degenerate Random spec doesn't abort
+                            // the whole scenario.
+                            crate::workload::ResolvedAffinity::Random { .. } => {}
+                            crate::workload::ResolvedAffinity::SingleCpu(cpu) => {
+                                let cpus: BTreeSet<usize> = [*cpu].into_iter().collect();
+                                for idx in 0..handle.worker_pids().len() {
+                                    let _ = handle.set_affinity(idx, &cpus);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Op::SpawnHost { work } => {
+                if let Err(reason) = work.mem_policy.validate() {
+                    anyhow::bail!("SpawnHost: {}", reason);
+                }
+                let n = crate::scenario::resolve_num_workers(work, ctx.workers_per_cgroup, "<host>")?;
+                let affinity = crate::scenario::intent_for_spawn(&work.affinity, None, ctx.topo)?;
+                let wl = WorkloadConfig {
+                    num_workers: n,
+                    affinity,
+                    work_type: work.work_type.clone(),
+                    sched_policy: work.sched_policy,
+                    mem_policy: work.mem_policy.clone(),
+                    mpol_flags: work.mpol_flags,
+                    nice: 0,
+                    clone_mode: Default::default(),
+                    composed: Vec::new(),
+                };
+                let mut h = WorkloadHandle::spawn(&wl)?;
+                h.start();
+                // Empty string key: workers in parent cgroup, not a managed cgroup.
+                state.target_handles().push((String::new(), h));
+            }
+            Op::MoveAllTasks { from, to } => {
+                // A step-local MoveAllTasks that pulls from a
+                // Backdrop-owned cgroup into a step-local cgroup
+                // would strand persistent workers inside a cgroup
+                // that gets rmdir'd at step boundary. Reject
+                // explicitly. Ops running inside the Backdrop's
+                // own setup pass (`target_backdrop`) stay exempt.
+                if !state.target_backdrop
+                    && state.cgroup_name_is_backdrop(from)
+                    && !state.cgroup_name_is_backdrop(to)
+                {
+                    anyhow::bail!(
+                        "Op::MoveAllTasks from Backdrop-owned '{}' to step-local '{}' \
+                         would leave persistent workers in a cgroup that disappears \
+                         at step boundary; declare `{}` in the Backdrop too, or \
+                         move the workers back into a Backdrop-owned cgroup",
+                        from,
+                        to,
+                        to,
+                    );
+                }
+                // Clear subtree_control on the destination before moving
+                // tasks. The kernel's no-internal-process constraint
+                // (cgroup_migrate_vet_dst) returns EBUSY when writing to
+                // cgroup.procs of a cgroup with subtree_control set.
+                if let Err(e) = ctx.cgroups.clear_subtree_control(to) {
+                    tracing::warn!(
+                        cgroup = to.as_ref(),
+                        err = %e,
+                        "failed to clear subtree_control before task move"
+                    );
+                }
+                // Perform the cgroup.procs writes for every handle
+                // currently keyed under `from` (step-local and backdrop).
+                for (name, handle) in state.all_handles() {
+                    if name.as_str() == *from {
+                        ctx.cgroups.move_tasks(to, &handle.worker_pids())?;
+                    }
+                }
+                // Re-key handles under `to` and transfer ownership
+                // when required. A step-local handle whose `to`
+                // names a Backdrop cgroup moves into the backdrop
+                // slot so its lifetime extends with the destination
+                // cgroup — without the transfer, the step's
+                // teardown would SIGKILL the worker even though the
+                // user moved it into a persistent cgroup. Backdrop
+                // handles always stay in the backdrop slot
+                // regardless of `to`; "Backdrop is persistent" does
+                // not degrade to step-local ownership because a
+                // later MoveAllTasks targets a step-local cgroup.
+                state.rename_handles(from, to);
+            }
+            Op::RunPayload {
+                payload,
+                args,
+                cgroup,
+            } => {
+                if payload.is_scheduler() {
+                    anyhow::bail!(
+                        "Op::RunPayload called with scheduler-kind Payload ('{}'); \
+                         only PayloadKind::Binary payloads can be spawned by step ops",
+                        payload.name,
+                    );
+                }
+                // Known-flags allowlist: if the Payload declared
+                // one, surface typos as scenario-execution-time
+                // errors instead of silent no-ops at payload
+                // runtime.
+                validate_known_flags(payload, args)?;
+                // Compute the cgroup key now so the composite-key
+                // dedup sees the same `(name, cgroup)` pair the
+                // spawn is about to record.
+                let cgroup_key = cgroup.as_ref().map(|c| c.to_string()).unwrap_or_default();
+                if let Some(existing) =
+                    state.find_live_payload_with_cgroup(payload.name, &cgroup_key)
+                {
+                    // Same payload in the same cgroup is still a
+                    // collision: two concurrent runs would write
+                    // overlapping metrics to the sidecar and there's
+                    // no way for a subsequent WaitPayload / KillPayload
+                    // to tell them apart. Same payload in a DIFFERENT
+                    // cgroup is now legitimate (placement-disambiguated).
+                    // Name the surface that spawned the live handle
+                    // so the user can find the original site without
+                    // guessing.
+                    anyhow::bail!(
+                        "Op::RunPayload: payload '{}' already running in cgroup {} (spawned by {}) — \
+                         WaitPayload/KillPayload it before spawning another with the same name in the same cgroup",
+                        payload.name,
+                        render_cgroup_key(&existing.cgroup),
+                        existing.source.describe(),
+                    );
+                }
+                let mut run = crate::scenario::payload_run::PayloadRun::new(ctx, payload);
+                if !args.is_empty() {
+                    run = run.args(args.iter().cloned());
+                }
+                if let Some(c) = cgroup {
+                    run = run.in_cgroup(c.clone());
+                }
+                let handle = run.spawn().with_context(|| {
+                    format!(
+                        "Op::RunPayload: spawn payload '{}' in cgroup {}",
+                        payload.name,
+                        render_cgroup_key(&cgroup_key),
+                    )
+                })?;
+                state.target_payload_handles().push(PayloadEntry {
+                    cgroup: cgroup_key,
+                    source: PayloadSource::OpRunPayload,
+                    handle,
+                });
+            }
+            Op::WaitPayload { name, cgroup } => {
+                let entry = take_payload_for_op(
+                    state,
+                    "Op::WaitPayload",
+                    "waiting",
+                    "Op::wait_payload_in_cgroup",
+                    name,
+                    cgroup.as_deref(),
+                )?;
+                // Check verdicts + metrics are recorded to the sidecar
+                // via the SHM ring inside `handle.wait()`; the returned
+                // tuple is discarded here because step-ops surface per-
+                // payload results through the sidecar, not the ops API.
+                let _result = entry
+                    .handle
+                    .wait()
+                    .with_context(|| format!("Op::WaitPayload: wait payload '{name}'"))?;
+            }
+            Op::KillPayload { name, cgroup } => {
+                let entry = take_payload_for_op(
+                    state,
+                    "Op::KillPayload",
+                    "killing",
+                    "Op::kill_payload_in_cgroup",
+                    name,
+                    cgroup.as_deref(),
+                )?;
+                let _result = entry
+                    .handle
+                    .kill()
+                    .with_context(|| format!("Op::KillPayload: kill payload '{name}'"))?;
+            }
+            Op::FreezeCgroup { cgroup } => {
+                ctx.cgroups
+                    .set_freeze(cgroup, true)
+                    .with_context(|| format!("Op::FreezeCgroup: cgroup '{cgroup}'"))?;
+            }
+            Op::UnfreezeCgroup { cgroup } => {
+                ctx.cgroups
+                    .set_freeze(cgroup, false)
+                    .with_context(|| format!("Op::UnfreezeCgroup: cgroup '{cgroup}'"))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Shared lookup for `Op::WaitPayload` / `Op::KillPayload`.
+///
+/// Consumes the payload handle matching the composite key
+/// (`name`, `cgroup`). Produces the op-specific not-found /
+/// ambiguous errors so the match arms stay short.
+///
+/// Callers pass the static trio that shapes the error text:
+///
+/// - `op_tag` — the user-facing op name (e.g. `"Op::WaitPayload"`).
+/// - `verb_ing` — the `-ing` form of the action for "before
+///   waiting" / "before killing" prose (no trailing
+///   `to_lowercase` munging so two-word op names don't collide
+///   into one word).
+/// - `ctor_path` — the fully-qualified constructor the user
+///   should switch to on ambiguity, e.g.
+///   `"Op::wait_payload_in_cgroup"`. Copying this hint into
+///   source must produce a callable path.
+fn take_payload_for_op(
+    state: &mut ScenarioState<'_, '_>,
+    op_tag: &str,
+    verb_ing: &str,
+    ctor_path: &str,
+    name: &str,
+    cgroup: Option<&str>,
+) -> Result<PayloadEntry> {
+    match state.take_payload_by_name(name, cgroup) {
+        Ok(Some(entry)) => Ok(entry),
+        Ok(None) => match cgroup {
+            Some(c) => anyhow::bail!(
+                "{op_tag}: no running payload named '{name}' in cgroup {} \
+                 (spawn it via Op::RunPayload or CgroupDef::workload before {verb_ing})",
+                render_cgroup_key(c),
+            ),
+            None => anyhow::bail!(
+                "{op_tag}: no running payload named '{name}' \
+                 (spawn it via Op::RunPayload or CgroupDef::workload before {verb_ing})",
+            ),
+        },
+        Err(cgroups) => {
+            // Name-only lookup matched >1 live payload. Enumerate
+            // the candidate cgroups so the caller knows which
+            // qualified form they need.
+            let rendered: Vec<String> = cgroups.iter().map(|c| render_cgroup_key(c)).collect();
+            anyhow::bail!(
+                "{op_tag}: payload '{name}' is ambiguous — {} live copies in cgroups {} — \
+                 use {ctor_path}(name, cgroup) to disambiguate",
+                rendered.len(),
+                rendered.join(", "),
+            )
+        }
+    }
+}
+
+/// Read the effective cpuset for a cgroup by reading cpuset.cpus.
+fn read_cpuset(ctx: &Ctx, name: &str) -> Option<BTreeSet<usize>> {
+    let path = ctx.cgroups.parent_path().join(name).join("cpuset.cpus");
+    let content = std::fs::read_to_string(&path).ok()?;
+    let content = content.trim();
+    if content.is_empty() {
+        return None;
+    }
+    let cpus: BTreeSet<usize> = crate::topology::parse_cpu_list_lenient(content)
+        .into_iter()
+        .collect();
+    Some(cpus)
+}
+
+/// Collect step-local worker results and produce an AssertResult.
+///
+/// Drains step-local handles + payload handles; backdrop state is
+/// untouched. Called at every step boundary (success AND error
+/// paths) as the "Step is fully bounded" teardown. The
+/// `step_state` goes out of scope at the end of this step's
+/// iteration, so its `CgroupGroup` drop removes every step-local
+/// cgroup immediately after `run_scenario` propagates the result
+/// of this call.
+fn collect_step(
+    step_state: &mut StepState<'_>,
+    checks: &crate::assert::Assert,
+    topo: &crate::topology::TestTopology,
+) -> AssertResult {
+    // Kill any CgroupDef::workload / Op::RunPayload payload binaries
+    // still live at step teardown so cgroupfs cleanup does not trip
+    // EBUSY. Metrics are emitted to the SHM ring by PayloadHandle::kill
+    // via the `evaluate()` pipeline.
+    drain_all_payload_handles(&mut step_state.payload_handles);
+    let handles = std::mem::take(&mut step_state.handles);
+    crate::scenario::collect_handles(
+        handles
+            .into_iter()
+            .map(|(name, h)| (h, step_state.cpusets.get(&name))),
+        checks,
+        Some(topo),
+    )
+}
+
+/// Collect backdrop (persistent) worker results. Called once at
+/// scenario end after every Step has torn down. The
+/// `backdrop_state.cgroups` RAII guard drops persistent cgroups
+/// when `backdrop_state` itself drops.
+fn collect_backdrop(
+    backdrop_state: &mut BackdropState<'_>,
+    checks: &crate::assert::Assert,
+    topo: &crate::topology::TestTopology,
+) -> AssertResult {
+    drain_all_payload_handles(&mut backdrop_state.payload_handles);
+    let handles = std::mem::take(&mut backdrop_state.handles);
+    crate::scenario::collect_handles(
+        handles
+            .into_iter()
+            .map(|(name, h)| (h, backdrop_state.cpusets.get(&name))),
+        checks,
+        Some(topo),
+    )
+}
+
+/// Kill every payload handle whose cgroup matches `cgroup` and drop
+/// the matched entries from `handles`. Runs before the cgroup is
+/// removed or stopped; failures are logged to stderr but do not
+/// propagate — the cgroup removal is best-effort already, and the
+/// payload-kill failure is never the primary error.
+///
+/// **Metric emission depends on the explicit `.kill()` call** —
+/// if a future refactor replaces the `.kill()` below with plain
+/// `drop(handle)`, the `PayloadHandle::drop` SIGKILLs the child
+/// but skips the evaluate-and-emit pipeline that records metrics
+/// to the SHM ring. Test helpers that drain payload handles
+/// likewise route through `drain_all_payload_handles` for the
+/// same reason. Preserve `.kill()` on every path that claims to
+/// drain handles for metric capture.
+fn drain_payload_handles_for_cgroup(handles: &mut Vec<PayloadEntry>, cgroup: &str) {
+    let mut i = 0;
+    while i < handles.len() {
+        if handles[i].cgroup.as_str() == cgroup {
+            let entry = handles.swap_remove(i);
+            if let Err(e) = entry.handle.kill() {
+                eprintln!("ktstr: kill payload in cgroup '{cgroup}': {e:#}");
+            }
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// Kill every payload handle regardless of cgroup and clear the
+/// vector. Called at step-sequence teardown so every handle gets a
+/// terminal `.kill()` (and therefore a sidecar metric emission) even
+/// when no explicit `RemoveCgroup`/`StopCgroup` op targeted it.
+fn drain_all_payload_handles(handles: &mut Vec<PayloadEntry>) {
+    for entry in handles.drain(..) {
+        if let Err(e) = entry.handle.kill() {
+            eprintln!(
+                "ktstr: teardown kill payload in cgroup {}: {e:#}",
+                render_cgroup_key(&entry.cgroup),
+            );
+        }
+    }
+}
+
+/// Render a cgroup key for inclusion in user-facing error text.
+/// An empty string is replaced with `(no cgroup)` so
+/// `Op::RunPayload { cgroup: None }` failures don't produce messages
+/// like `cgroup ''` that look like a corrupt log line. Non-empty
+/// keys are quoted so they read clearly next to surrounding prose.
+fn render_cgroup_key(cgroup: &str) -> String {
+    if cgroup.is_empty() {
+        "(no cgroup)".to_string()
+    } else {
+        format!("'{cgroup}'")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::borrow::Cow;
+    use std::ops::RangeInclusive;
+
+    use super::*;
+    use crate::vmm::shm_ring::parse_shm_params_from_str;
+    use crate::workload::{AffinityIntent, WorkType};
+    use strum::IntoEnumIterator;
+
+    /// Exhaustiveness guard for [`OpKind::bit_index`]. A new [`Op`]
+    /// variant auto-generates a matching [`OpKind`] variant (via
+    /// `#[derive(strum::EnumDiscriminants)]`), which the match arms
+    /// in `bit_index` must cover — adding an `Op` variant without
+    /// extending `bit_index` fails compilation. But the arms could
+    /// still drift in a way the compiler cannot see: two variants
+    /// accidentally mapped to the same index, or the contiguous-
+    /// from-zero invariant broken by a typo.
+    ///
+    /// This test iterates every `OpKind` via `EnumIter` and pins
+    /// both invariants:
+    /// - Every variant produces a distinct bit index.
+    /// - Indices are contiguous `0..N` where N = variant count.
+    ///
+    /// A regression — duplicate index, gap, or an off-by-one —
+    /// surfaces here before it silently corrupts the `op_kinds`
+    /// bitmask semantics elsewhere in the crate.
+    #[test]
+    fn op_kind_bit_indices_are_unique_and_contiguous() {
+        let kinds: Vec<OpKind> = OpKind::iter().collect();
+        let indices: Vec<u32> = kinds.iter().copied().map(OpKind::bit_index).collect();
+
+        // Unique: every kind has a distinct index.
+        let unique: std::collections::BTreeSet<u32> = indices.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            indices.len(),
+            "OpKind::bit_index produced duplicates. \
+             Pairs (OpKind, bit_index): {:?}. Fix the match in \
+             OpKind::bit_index so every variant maps to a distinct \
+             bit.",
+            kinds.iter().zip(&indices).collect::<Vec<_>>(),
+        );
+
+        // Contiguous: indices form `0..N`.
+        let expected: Vec<u32> = (0..kinds.len() as u32).collect();
+        let mut sorted = indices.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            sorted,
+            expected,
+            "OpKind::bit_index indices must be contiguous from 0 \
+             (no gaps, no duplicates). Got sorted indices {sorted:?} \
+             for {} OpKind variants; expected {expected:?}.",
+            kinds.len(),
+        );
+    }
+
+    // -- Traverse combinator (test-only) --
+
+    /// Layout strategy for Traverse phases.
+    #[derive(Debug)]
+    enum Layout {
+        Disjoint,
+        /// Overlapping cpusets. (min_frac, max_frac) — PRNG picks a value in range.
+        Overlap(f64, f64),
+    }
+
+    /// Generates a random walk of cgroup topology changes across phases.
+    ///
+    /// Each phase picks a random (cgroup_count, layout) pair, generates SetCpuset
+    /// ops, spawns workers in new cgroups, and holds for phase_duration.
+    ///
+    /// `persistent_cgroups` cgroups are created in phase 0 and never removed.
+    /// Only cgroups at index >= `persistent_cgroups` are added/removed by the
+    /// random walk. The `cgroup_count` range applies to the total cgroup count
+    /// (persistent + ephemeral).
+    ///
+    /// `cgroup_workloads` controls the workload for each cgroup index. If the
+    /// vec has fewer entries than the cgroup index, the last entry repeats.
+    #[derive(Debug)]
+    struct Traverse {
+        seed: Option<u64>,
+        cgroup_count: RangeInclusive<usize>,
+        layouts: Vec<Layout>,
+        phases: usize,
+        phase_duration: Duration,
+        settle: Duration,
+        /// Cgroups [0..persistent_cgroups) are created once and never removed.
+        persistent_cgroups: usize,
+        /// WorkSpec definition per cgroup index. Last entry repeats for higher indices.
+        cgroup_workloads: Vec<WorkSpec>,
+    }
+
+    impl Traverse {
+        /// Generate a `Vec<Step>` from the Traverse configuration.
+        fn generate(&self, ctx: &Ctx) -> Vec<Step> {
+            use rand::RngExt;
+
+            let seed = self.seed.unwrap_or_else(|| std::process::id() as u64);
+            let mut rng = seeded_rng(seed);
+
+            let usable_len = ctx.topo.usable_cpus().len();
+            let max_cgroups = (*self.cgroup_count.end()).min(usable_len / 2).max(1);
+            let min_cgroups = (*self.cgroup_count.start()).max(1).min(max_cgroups);
+
+            let mut steps = Vec::with_capacity(self.phases + 1);
+            let mut live_cgroups: Vec<Cow<'static, str>> = Vec::new();
+
+            let names: Vec<Cow<'static, str>> = (0..max_cgroups)
+                .map(|i| Cow::Owned(format!("cg_{i}")))
+                .collect();
+
+            for phase in 0..self.phases {
+                let range = max_cgroups - min_cgroups + 1;
+                let target_count = min_cgroups + rng.random_range(0..range);
+                let layout_idx = rng.random_range(0..self.layouts.len());
+                let layout = &self.layouts[layout_idx];
+
+                let mut ops = Vec::new();
+
+                // Add cgroups if needed.
+                while live_cgroups.len() < target_count {
+                    let idx = live_cgroups.len();
+                    let name = names[idx].clone();
+                    let w = self
+                        .cgroup_workloads
+                        .get(idx)
+                        .or(self.cgroup_workloads.last())
+                        .cloned()
+                        .unwrap_or_default();
+                    ops.push(Op::AddCgroup { name: name.clone() });
+                    ops.push(Op::Spawn {
+                        cgroup: name.clone(),
+                        work: w,
+                    });
+                    live_cgroups.push(name);
+                }
+
+                // Remove cgroups if needed (never remove persistent cgroups).
+                while live_cgroups.len() > target_count
+                    && live_cgroups.len() > self.persistent_cgroups
+                {
+                    if let Some(name) = live_cgroups.pop() {
+                        ops.push(Op::StopCgroup {
+                            cgroup: name.clone(),
+                        });
+                        ops.push(Op::RemoveCgroup { cgroup: name });
+                    }
+                }
+
+                // Apply cpuset layout.
+                for (i, name) in live_cgroups.iter().enumerate() {
+                    let spec = match layout {
+                        Layout::Disjoint => CpusetSpec::Disjoint {
+                            index: i,
+                            of: live_cgroups.len(),
+                        },
+                        Layout::Overlap(min_frac, max_frac) => {
+                            let frac = min_frac
+                                + rng.random_range(0..100) as f64 / 100.0 * (max_frac - min_frac);
+                            CpusetSpec::Overlap {
+                                index: i,
+                                of: live_cgroups.len(),
+                                frac,
+                            }
+                        }
+                    };
+                    ops.push(Op::SetCpuset {
+                        cgroup: name.clone(),
+                        cpus: spec,
+                    });
+                }
+
+                let hold = if phase == 0 {
+                    // First phase includes settle time.
+                    HoldSpec::Fixed(self.settle + self.phase_duration)
+                } else {
+                    HoldSpec::Fixed(self.phase_duration)
+                };
+
+                steps.push(Step {
+                    setup: vec![].into(),
+                    ops,
+                    hold,
+                });
+            }
+
+            steps
+        }
+    }
+
+    /// Seeded PRNG for deterministic topology generation.
+    fn seeded_rng(seed: u64) -> rand::rngs::StdRng {
+        use rand::SeedableRng;
+        rand::rngs::StdRng::seed_from_u64(seed)
+    }
+
+    // -- validate_known_flags tests --
+
+    /// Declared allowlist, every `--flag` in args is on the
+    /// allowlist → `Ok(())`. Covers both `--foo` and
+    /// `--foo=value` shapes to pin the flag-body split.
+    #[test]
+    fn validate_known_flags_accepts_listed_long_flags() {
+        use crate::test_support::{OutputFormat, Payload, PayloadKind};
+        static WITH_ALLOWLIST: Payload = Payload {
+            name: "with_allowlist",
+            kind: PayloadKind::Binary("/bin/true"),
+            output: OutputFormat::ExitCode,
+            default_args: &[],
+            default_checks: &[],
+            metrics: &[],
+            include_files: &[],
+            uses_parent_pgrp: false,
+            known_flags: Some(&["runtime", "threads", "verbose"]),
+            metric_bounds: None,
+        };
+        let args: Vec<String> = vec![
+            "--runtime=30".into(),
+            "--threads".into(),
+            "4".into(),
+            "--verbose".into(),
+            "positional_arg".into(),
+            "-s".into(), // short flags aren't inspected
+            // Degenerate forms: the bare `--` (end-of-flags
+            // marker used by many CLIs) and `--=value` (empty
+            // name before `=`) both skip the allowlist check
+            // because the extracted flag name is empty. Pin the
+            // empty-name skip path so a future refactor can't
+            // accidentally treat them as unknown long flags.
+            "--".into(),
+            "--=value".into(),
+        ];
+        validate_known_flags(&WITH_ALLOWLIST, &args)
+            .expect("all long flags in allowlist must pass");
+    }
+
+    /// Fail-fast ordering: when args contain a known flag, a
+    /// typo, then another known flag, the error must name ONLY
+    /// the typo — the validator bails on the first unknown flag
+    /// without continuing to inspect later args.
+    #[test]
+    fn validate_known_flags_fails_fast_on_first_unknown() {
+        use crate::test_support::{OutputFormat, Payload, PayloadKind};
+        static WITH_ALLOWLIST: Payload = Payload {
+            name: "with_allowlist",
+            kind: PayloadKind::Binary("/bin/true"),
+            output: OutputFormat::ExitCode,
+            default_args: &[],
+            default_checks: &[],
+            metrics: &[],
+            include_files: &[],
+            uses_parent_pgrp: false,
+            known_flags: Some(&["runtime", "threads", "verbose"]),
+            metric_bounds: None,
+        };
+        let args = vec!["--runtime=30".into(), "--threds".into(), "--verbose".into()];
+        let err = validate_known_flags(&WITH_ALLOWLIST, &args)
+            .expect_err("typo between two known flags must be rejected");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("--threds"), "error must name the typo: {msg}");
+        assert!(
+            !msg.contains("--verbose"),
+            "error must not mention the later known flag '--verbose' \
+             — fail-fast broke: {msg}",
+        );
+    }
+
+    /// A `--flag` whose bare name is not on the allowlist bails
+    /// with a message naming both the offending flag and the
+    /// allowlist — the loud-typo-detection contract.
+    #[test]
+    fn validate_known_flags_rejects_unknown_long_flag() {
+        use crate::test_support::{OutputFormat, Payload, PayloadKind};
+        static WITH_ALLOWLIST: Payload = Payload {
+            name: "with_allowlist",
+            kind: PayloadKind::Binary("/bin/true"),
+            output: OutputFormat::ExitCode,
+            default_args: &[],
+            default_checks: &[],
+            metrics: &[],
+            include_files: &[],
+            uses_parent_pgrp: false,
+            known_flags: Some(&["runtime", "threads"]),
+            metric_bounds: None,
+        };
+        // "threds" is a typo for "threads" — the exact failure
+        // the allowlist exists to catch.
+        let args = vec!["--threds".to_string(), "4".to_string()];
+        let err = validate_known_flags(&WITH_ALLOWLIST, &args).expect_err("typo must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("--threds"),
+            "error must name the offending flag: {msg}",
+        );
+        assert!(
+            msg.contains("known_flags allowlist"),
+            "error must mention the allowlist surface: {msg}",
+        );
+    }
+
+    /// `known_flags: None` (the default on every Payload that
+    /// doesn't opt in) lets every `--flag` through without
+    /// inspection. Required for payloads that wrap binaries with
+    /// open-ended flag surfaces (stress-ng, fio, schbench).
+    #[test]
+    fn validate_known_flags_none_is_permissive() {
+        use crate::test_support::{OutputFormat, Payload, PayloadKind};
+        static NO_ALLOWLIST: Payload = Payload {
+            name: "no_allowlist",
+            kind: PayloadKind::Binary("/bin/true"),
+            output: OutputFormat::ExitCode,
+            default_args: &[],
+            default_checks: &[],
+            metrics: &[],
+            include_files: &[],
+            uses_parent_pgrp: false,
+            known_flags: None,
+            metric_bounds: None,
+        };
+        let args: Vec<String> = vec![
+            "--anything".into(),
+            "--whatever=x".into(),
+            "--threds".into(),
+        ];
+        validate_known_flags(&NO_ALLOWLIST, &args).expect("None allowlist must pass any flag");
+    }
+
+    // -- Op discriminant tests --
+
+    #[test]
+    fn op_discriminant_unique() {
+        use crate::test_support::{OutputFormat, Payload, PayloadKind};
+        static TRUE_BIN: Payload = Payload {
+            name: "true_bin",
+            kind: PayloadKind::Binary("/bin/true"),
+            output: OutputFormat::ExitCode,
+            default_args: &[],
+            default_checks: &[],
+            metrics: &[],
+            include_files: &[],
+            uses_parent_pgrp: false,
+            known_flags: None,
+            metric_bounds: None,
+        };
+        let ops: Vec<Op> = vec![
+            Op::AddCgroup { name: "a".into() },
+            Op::RemoveCgroup { cgroup: "a".into() },
+            Op::SetCpuset {
+                cgroup: "a".into(),
+                cpus: CpusetSpec::exact([]),
+            },
+            Op::ClearCpuset { cgroup: "a".into() },
+            Op::SwapCpusets {
+                a: "a".into(),
+                b: "b".into(),
+            },
+            Op::Spawn {
+                cgroup: "a".into(),
+                work: Default::default(),
+            },
+            Op::StopCgroup { cgroup: "a".into() },
+            Op::SetAffinity {
+                cgroup: "a".into(),
+                affinity: Default::default(),
+            },
+            Op::SpawnHost {
+                work: Default::default(),
+            },
+            Op::MoveAllTasks {
+                from: "a".into(),
+                to: "b".into(),
+            },
+            Op::RunPayload {
+                payload: &TRUE_BIN,
+                args: vec![],
+                cgroup: None,
+            },
+            Op::WaitPayload {
+                name: "p".into(),
+                cgroup: None,
+            },
+            Op::KillPayload {
+                name: "p".into(),
+                cgroup: None,
+            },
+            Op::FreezeCgroup { cgroup: "a".into() },
+            Op::UnfreezeCgroup { cgroup: "a".into() },
+        ];
+        let mut seen = std::collections::BTreeSet::new();
+        for op in &ops {
+            assert!(seen.insert(op.discriminant()), "duplicate discriminant");
+        }
+    }
+
+    #[test]
+    fn op_discriminant_values() {
+        use crate::test_support::{OutputFormat, Payload, PayloadKind};
+        static TRUE_BIN: Payload = Payload {
+            name: "true_bin",
+            kind: PayloadKind::Binary("/bin/true"),
+            output: OutputFormat::ExitCode,
+            default_args: &[],
+            default_checks: &[],
+            metrics: &[],
+            include_files: &[],
+            uses_parent_pgrp: false,
+            known_flags: None,
+            metric_bounds: None,
+        };
+        assert_eq!(Op::AddCgroup { name: "a".into() }.discriminant(), 0);
+        assert_eq!(Op::RemoveCgroup { cgroup: "a".into() }.discriminant(), 1);
+        assert_eq!(
+            Op::SpawnHost {
+                work: Default::default()
+            }
+            .discriminant(),
+            8
+        );
+        assert_eq!(
+            Op::MoveAllTasks {
+                from: "a".into(),
+                to: "b".into()
+            }
+            .discriminant(),
+            9
+        );
+        assert_eq!(
+            Op::RunPayload {
+                payload: &TRUE_BIN,
+                args: vec![],
+                cgroup: None,
+            }
+            .discriminant(),
+            10,
+        );
+        assert_eq!(
+            Op::WaitPayload {
+                name: "p".into(),
+                cgroup: None,
+            }
+            .discriminant(),
+            11,
+        );
+        assert_eq!(
+            Op::KillPayload {
+                name: "p".into(),
+                cgroup: None,
+            }
+            .discriminant(),
+            12,
+        );
+        assert_eq!(
+            Op::FreezeCgroup { cgroup: "a".into() }.discriminant(),
+            13,
+        );
+        assert_eq!(
+            Op::UnfreezeCgroup { cgroup: "a".into() }.discriminant(),
+            14,
+        );
+    }
+
+    // -- seeded_rng tests --
+
+    #[test]
+    fn seeded_rng_deterministic() {
+        use rand::RngExt;
+        let mut rng1 = seeded_rng(42);
+        let mut rng2 = seeded_rng(42);
+        for _ in 0..100 {
+            assert_eq!(rng1.random::<u64>(), rng2.random::<u64>());
+        }
+    }
+
+    #[test]
+    fn seeded_rng_different_seeds_differ() {
+        use rand::RngExt;
+        let mut rng1 = seeded_rng(1);
+        let mut rng2 = seeded_rng(2);
+        let same = (0..10).all(|_| rng1.random::<u64>() == rng2.random::<u64>());
+        assert!(!same);
+    }
+
+    // -- HoldSpec validate --
+
+    #[test]
+    fn holdspec_validate_accepts_valid() {
+        HoldSpec::Frac(0.5).validate().unwrap();
+        HoldSpec::Frac(1.0).validate().unwrap();
+        HoldSpec::Fixed(Duration::from_millis(1))
+            .validate()
+            .unwrap();
+        HoldSpec::Loop {
+            interval: Duration::from_millis(100),
+        }
+        .validate()
+        .unwrap();
+    }
+
+    #[test]
+    fn holdspec_validate_rejects_fixed_zero() {
+        let err = HoldSpec::Fixed(Duration::ZERO).validate().unwrap_err();
+        assert!(
+            err.contains("Fixed") && err.contains("vacuous"),
+            "error must name the variant and reason: {err}"
+        );
+    }
+
+    #[test]
+    fn holdspec_validate_rejects_frac_zero() {
+        let err = HoldSpec::Frac(0.0).validate().unwrap_err();
+        assert!(err.contains("Frac") && err.contains("> 0"), "got: {err}");
+    }
+
+    #[test]
+    fn holdspec_validate_rejects_frac_negative() {
+        let err = HoldSpec::Frac(-0.5).validate().unwrap_err();
+        assert!(err.contains("Frac") && err.contains("> 0"), "got: {err}");
+    }
+
+    #[test]
+    fn holdspec_validate_rejects_frac_nan() {
+        let err = HoldSpec::Frac(f64::NAN).validate().unwrap_err();
+        assert!(
+            err.contains("not finite") || err.contains("NaN"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn holdspec_validate_rejects_frac_inf() {
+        let err = HoldSpec::Frac(f64::INFINITY).validate().unwrap_err();
+        assert!(
+            err.contains("not finite") || err.contains("Inf"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn holdspec_validate_rejects_loop_zero_interval() {
+        let err = HoldSpec::Loop {
+            interval: Duration::ZERO,
+        }
+        .validate()
+        .unwrap_err();
+        assert!(err.contains("Loop") && err.contains("busy"), "got: {err}");
+    }
+
+    // -- HoldSpec variants --
+
+    #[test]
+    fn holdspec_frac() {
+        let step = Step::new(vec![], HoldSpec::Frac(0.5));
+        match step.hold {
+            HoldSpec::Frac(f) => assert!((f - 0.5).abs() < f64::EPSILON),
+            _ => panic!("expected Frac"),
+        }
+    }
+
+    #[test]
+    fn holdspec_fixed() {
+        let step = Step::new(vec![], HoldSpec::Fixed(Duration::from_secs(3)));
+        match step.hold {
+            HoldSpec::Fixed(d) => assert_eq!(d, Duration::from_secs(3)),
+            _ => panic!("expected Fixed"),
+        }
+    }
+
+    #[test]
+    fn holdspec_loop() {
+        let step = Step::new(
+            vec![],
+            HoldSpec::Loop {
+                interval: Duration::from_millis(100),
+            },
+        );
+        match step.hold {
+            HoldSpec::Loop { interval } => assert_eq!(interval, Duration::from_millis(100)),
+            _ => panic!("expected Loop"),
+        }
+    }
+
+    // -- CpusetSpec::Exact --
+
+    #[test]
+    fn cpusetspec_exact_is_passthrough() {
+        let cpus: BTreeSet<usize> = [0, 2, 4].iter().copied().collect();
+        let spec = CpusetSpec::Exact(cpus.clone());
+        let topo = crate::topology::TestTopology::from_vm_topology(
+            &crate::vmm::topology::Topology::new(1, 1, 4, 1),
+        );
+        let cgroups = crate::cgroup::CgroupManager::new("/nonexistent");
+        let ctx = Ctx {
+            cgroups: &cgroups,
+            topo: &topo,
+            duration: Duration::from_secs(10),
+            workers_per_cgroup: 4,
+            sched_pid: None,
+            settle: Duration::from_millis(1000),
+            work_type_override: None,
+            assert: crate::assert::Assert::default_checks(),
+            wait_for_map_write: false,
+        };
+        let resolved = spec.resolve(&ctx);
+        assert_eq!(resolved, cpus);
+    }
+
+    // -- Defense-in-depth: resolve must not panic on spec shapes that
+    // -- validate rejects. Each test exercises a concrete panic the
+    // -- resolver's hardening guards against.
+
+    #[test]
+    fn resolve_disjoint_of_zero_returns_empty_instead_of_panicking() {
+        // `usable.len() / of` with of=0 would panic without hardening.
+        // Current behavior: returns an empty BTreeSet with a
+        // tracing::warn.
+        let (cg, topo) = make_ctx(1, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let spec = CpusetSpec::Disjoint { index: 0, of: 0 };
+        assert!(spec.resolve(&ctx).is_empty());
+    }
+
+    #[test]
+    fn resolve_overlap_of_zero_returns_empty_instead_of_panicking() {
+        let (cg, topo) = make_ctx(1, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let spec = CpusetSpec::Overlap {
+            index: 0,
+            of: 0,
+            frac: 0.5,
+        };
+        assert!(spec.resolve(&ctx).is_empty());
+    }
+
+    #[test]
+    fn resolve_range_inverted_fracs_returns_empty_instead_of_panicking() {
+        // Without hardening, `usable[start.min(len)..end.min(len)]`
+        // with start_frac > end_frac produced start > end after
+        // clamping and panicked the slice operation. Current
+        // behavior: the slice is clamped to length-zero instead.
+        let (cg, topo) = make_ctx(1, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let spec = CpusetSpec::Range {
+            start_frac: 0.8,
+            end_frac: 0.2,
+        };
+        assert!(spec.resolve(&ctx).is_empty());
+    }
+
+    #[test]
+    fn resolve_range_nan_fracs_clamps_to_zero_instead_of_panicking() {
+        // NaN as usize saturates to 0 on stable Rust, but inverted
+        // start/end after both saturate is still fine post-fix.
+        let (cg, topo) = make_ctx(1, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let spec = CpusetSpec::Range {
+            start_frac: f64::NAN,
+            end_frac: f64::NAN,
+        };
+        assert!(spec.resolve(&ctx).is_empty());
+    }
+
+    #[test]
+    fn resolve_overlap_nonfinite_frac_clamps_to_zero() {
+        // NaN frac pre-fix flowed through `(chunk as f64 * frac) as
+        // usize` and could produce an out-of-range overlap. Post-fix
+        // clamps NaN to 0, yielding the same partition boundaries as
+        // Disjoint.
+        let (cg, topo) = make_ctx(1, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let spec = CpusetSpec::Overlap {
+            index: 0,
+            of: 2,
+            frac: f64::NAN,
+        };
+        // No panic; result must be non-empty because index/of are valid.
+        let result = spec.resolve(&ctx);
+        assert!(!result.is_empty());
+    }
+
+    // -- parse_shm_params_from_str (from shm_ring) --
+
+    #[test]
+    fn ops_parse_shm_params_valid() {
+        let cmdline = "console=ttyS0 KTSTR_SHM_BASE=0xfc000000 KTSTR_SHM_SIZE=0x10000 quiet";
+        let (base, size) = parse_shm_params_from_str(cmdline).unwrap();
+        assert_eq!(base, 0xfc000000);
+        assert_eq!(size, 0x10000);
+    }
+
+    #[test]
+    fn ops_parse_shm_params_missing() {
+        assert!(parse_shm_params_from_str("console=ttyS0 quiet").is_none());
+    }
+
+    // -- CpusetSpec resolution helpers --
+
+    fn make_ctx(
+        llcs: u32,
+        cores: u32,
+        threads: u32,
+    ) -> (crate::cgroup::CgroupManager, crate::topology::TestTopology) {
+        let cgroups = crate::cgroup::CgroupManager::new("/nonexistent");
+        let topo = crate::topology::TestTopology::from_vm_topology(
+            &crate::vmm::topology::Topology::new(1, llcs, cores, threads),
+        );
+        (cgroups, topo)
+    }
+
+    fn ctx_from<'a>(
+        cgroups: &'a crate::cgroup::CgroupManager,
+        topo: &'a crate::topology::TestTopology,
+    ) -> Ctx<'a> {
+        Ctx {
+            cgroups,
+            topo,
+            duration: Duration::from_secs(10),
+            workers_per_cgroup: 4,
+            sched_pid: None,
+            settle: Duration::ZERO,
+            work_type_override: None,
+            assert: crate::assert::Assert::default_checks(),
+            wait_for_map_write: false,
+        }
+    }
+
+    // -- CpusetSpec::Disjoint --
+
+    #[test]
+    fn cpusetspec_disjoint_two_partitions() {
+        let (cg, topo) = make_ctx(1, 8, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let a = CpusetSpec::Disjoint { index: 0, of: 2 }.resolve(&ctx);
+        let b = CpusetSpec::Disjoint { index: 1, of: 2 }.resolve(&ctx);
+        // Partitions must be disjoint.
+        assert!(a.is_disjoint(&b), "partitions overlap: {:?} vs {:?}", a, b);
+        // Together they cover all usable CPUs.
+        let usable = ctx.topo.usable_cpuset();
+        let union: BTreeSet<usize> = a.union(&b).copied().collect();
+        assert_eq!(union, usable);
+    }
+
+    #[test]
+    fn cpusetspec_disjoint_remainder_to_last() {
+        // 7 usable CPUs / 3 partitions = chunk=2, so partition 0=[0,1], 1=[2,3], 2=[4,5,6].
+        // Last partition gets the remainder.
+        let (cg, topo) = make_ctx(1, 8, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let usable_len = ctx.topo.usable_cpus().len();
+        let c = CpusetSpec::Disjoint { index: 2, of: 3 }.resolve(&ctx);
+        let chunk = usable_len / 3;
+        // Last partition should be >= chunk size (gets remainder).
+        assert!(
+            c.len() >= chunk,
+            "last partition {}: expected >= {}",
+            c.len(),
+            chunk
+        );
+    }
+
+    #[test]
+    fn cpusetspec_disjoint_single_partition() {
+        let (cg, topo) = make_ctx(1, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let all = CpusetSpec::Disjoint { index: 0, of: 1 }.resolve(&ctx);
+        let usable = ctx.topo.usable_cpuset();
+        assert_eq!(all, usable);
+    }
+
+    #[test]
+    fn cpusetspec_disjoint_index_beyond_of_returns_empty() {
+        // Defense-in-depth: `validate` rejects index >= of with a clear
+        // error, but callers that skip validation (e.g. programmatic
+        // spec construction) must not hit the div-by-zero or panic in
+        // `resolve`. With index = 5 and of = 3 on 3 usable CPUs
+        // (4 total, 1 reserved by `usable_cpus`), chunk = 1 and
+        // start = 5 clamps past `usable.len()` to yield an empty set
+        // — a safe fallback, not a panic.
+        let (cg, topo) = make_ctx(1, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let cpus = CpusetSpec::Disjoint { index: 5, of: 3 }.resolve(&ctx);
+        assert!(
+            cpus.is_empty(),
+            "Disjoint with index beyond `of` must return an empty \
+             cpuset rather than panicking, got: {cpus:?}",
+        );
+    }
+
+    // -- CpusetSpec::Range --
+
+    #[test]
+    fn cpusetspec_range_first_half() {
+        let (cg, topo) = make_ctx(1, 8, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let cpus = CpusetSpec::Range {
+            start_frac: 0.0,
+            end_frac: 0.5,
+        }
+        .resolve(&ctx);
+        let usable = ctx.topo.usable_cpus();
+        let expected_len = usable.len() / 2;
+        assert_eq!(cpus.len(), expected_len);
+        // Should contain the first usable CPUs.
+        for &cpu in &cpus {
+            assert!(usable.contains(&cpu));
+        }
+    }
+
+    #[test]
+    fn cpusetspec_range_second_half() {
+        let (cg, topo) = make_ctx(1, 8, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let a = CpusetSpec::Range {
+            start_frac: 0.0,
+            end_frac: 0.5,
+        }
+        .resolve(&ctx);
+        let b = CpusetSpec::Range {
+            start_frac: 0.5,
+            end_frac: 1.0,
+        }
+        .resolve(&ctx);
+        assert!(a.is_disjoint(&b));
+    }
+
+    #[test]
+    fn cpusetspec_range_full() {
+        let (cg, topo) = make_ctx(1, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let cpus = CpusetSpec::Range {
+            start_frac: 0.0,
+            end_frac: 1.0,
+        }
+        .resolve(&ctx);
+        let usable = ctx.topo.usable_cpuset();
+        assert_eq!(cpus, usable);
+    }
+
+    #[test]
+    fn cpusetspec_range_empty() {
+        let (cg, topo) = make_ctx(1, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let cpus = CpusetSpec::Range {
+            start_frac: 0.5,
+            end_frac: 0.5,
+        }
+        .resolve(&ctx);
+        assert!(cpus.is_empty());
+    }
+
+    #[test]
+    fn cpusetspec_range_clamps_to_bounds() {
+        let (cg, topo) = make_ctx(1, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        // end_frac > 1.0 should be clamped to usable.len().
+        let cpus = CpusetSpec::Range {
+            start_frac: 0.0,
+            end_frac: 2.0,
+        }
+        .resolve(&ctx);
+        let usable = ctx.topo.usable_cpuset();
+        assert_eq!(cpus, usable);
+    }
+
+    // -- CpusetSpec::Overlap --
+
+    #[test]
+    fn cpusetspec_overlap_neighbors_share_cpus() {
+        let (cg, topo) = make_ctx(1, 8, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let a = CpusetSpec::Overlap {
+            index: 0,
+            of: 2,
+            frac: 0.5,
+        }
+        .resolve(&ctx);
+        let b = CpusetSpec::Overlap {
+            index: 1,
+            of: 2,
+            frac: 0.5,
+        }
+        .resolve(&ctx);
+        let shared: BTreeSet<usize> = a.intersection(&b).copied().collect();
+        assert!(!shared.is_empty(), "overlap=0.5 should produce shared CPUs");
+    }
+
+    #[test]
+    fn cpusetspec_overlap_zero_frac_is_disjoint() {
+        let (cg, topo) = make_ctx(1, 8, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let a = CpusetSpec::Overlap {
+            index: 0,
+            of: 2,
+            frac: 0.0,
+        }
+        .resolve(&ctx);
+        let b = CpusetSpec::Overlap {
+            index: 1,
+            of: 2,
+            frac: 0.0,
+        }
+        .resolve(&ctx);
+        assert!(a.is_disjoint(&b), "frac=0 should be disjoint");
+    }
+
+    #[test]
+    fn cpusetspec_overlap_last_partition_covers_tail() {
+        let (cg, topo) = make_ctx(1, 8, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let last = CpusetSpec::Overlap {
+            index: 2,
+            of: 3,
+            frac: 0.5,
+        }
+        .resolve(&ctx);
+        let usable = ctx.topo.usable_cpus();
+        // Last partition should include the last usable CPU.
+        assert!(last.contains(usable.last().unwrap()));
+    }
+
+    #[test]
+    fn cpusetspec_overlap_first_partition_starts_at_zero() {
+        let (cg, topo) = make_ctx(1, 8, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let first = CpusetSpec::Overlap {
+            index: 0,
+            of: 3,
+            frac: 0.5,
+        }
+        .resolve(&ctx);
+        let usable = ctx.topo.usable_cpus();
+        assert!(first.contains(&usable[0]));
+    }
+
+    // -- CpusetSpec::Llc --
+
+    #[test]
+    fn cpusetspec_llc_index_zero() {
+        let (cg, topo) = make_ctx(2, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let cpus = CpusetSpec::Llc(0).resolve(&ctx);
+        assert!(!cpus.is_empty());
+        // All CPUs in the set should belong to LLC 0.
+        let llc0 = ctx.topo.llc_aligned_cpuset(0);
+        assert_eq!(cpus, llc0);
+    }
+
+    #[test]
+    fn cpusetspec_llc_two_llcs_disjoint() {
+        let (cg, topo) = make_ctx(2, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let llc0 = CpusetSpec::Llc(0).resolve(&ctx);
+        let llc1 = CpusetSpec::Llc(1).resolve(&ctx);
+        assert!(llc0.is_disjoint(&llc1), "LLCs should be disjoint");
+    }
+
+    // -- CpusetSpec::Numa --
+
+    fn make_numa_ctx(
+        numa_nodes: u32,
+        llcs: u32,
+        cores: u32,
+        threads: u32,
+    ) -> (crate::cgroup::CgroupManager, crate::topology::TestTopology) {
+        let cgroups = crate::cgroup::CgroupManager::new("/nonexistent");
+        let topo = crate::topology::TestTopology::from_vm_topology(
+            &crate::vmm::topology::Topology::new(numa_nodes, llcs, cores, threads),
+        );
+        (cgroups, topo)
+    }
+
+    #[test]
+    fn cpusetspec_numa_node_zero() {
+        // 2 NUMA nodes, 4 LLCs (2 per NUMA), 4 cores, 1 thread
+        // LLCs 0,1 -> NUMA 0 (CPUs 0-7), LLCs 2,3 -> NUMA 1 (CPUs 8-15)
+        let (cg, topo) = make_numa_ctx(2, 4, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let cpus = CpusetSpec::Numa(0).resolve(&ctx);
+        let expected: BTreeSet<usize> = (0..8).collect();
+        assert_eq!(cpus, expected);
+    }
+
+    #[test]
+    fn cpusetspec_numa_node_one() {
+        let (cg, topo) = make_numa_ctx(2, 4, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let cpus = CpusetSpec::Numa(1).resolve(&ctx);
+        let expected: BTreeSet<usize> = (8..16).collect();
+        assert_eq!(cpus, expected);
+    }
+
+    #[test]
+    fn cpusetspec_numa_disjoint() {
+        let (cg, topo) = make_numa_ctx(2, 4, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let node0 = CpusetSpec::Numa(0).resolve(&ctx);
+        let node1 = CpusetSpec::Numa(1).resolve(&ctx);
+        assert!(
+            node0.is_disjoint(&node1),
+            "NUMA nodes should be disjoint: {:?} vs {:?}",
+            node0,
+            node1
+        );
+        let union: BTreeSet<usize> = node0.union(&node1).copied().collect();
+        assert_eq!(union, ctx.topo.all_cpuset());
+    }
+
+    #[test]
+    fn cpusetspec_numa_single_node_returns_all() {
+        let (cg, topo) = make_numa_ctx(1, 2, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let cpus = CpusetSpec::Numa(0).resolve(&ctx);
+        assert_eq!(cpus, ctx.topo.all_cpuset());
+    }
+
+    #[test]
+    fn cpusetspec_numa_validate_out_of_range() {
+        let (cg, topo) = make_numa_ctx(2, 4, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let spec = CpusetSpec::Numa(5);
+        let err = spec.validate(&ctx).unwrap_err();
+        assert!(err.contains("out of range"), "got: {err}");
+    }
+
+    #[test]
+    fn cpusetspec_numa_validate_valid() {
+        let (cg, topo) = make_numa_ctx(2, 4, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        assert!(CpusetSpec::Numa(0).validate(&ctx).is_ok());
+        assert!(CpusetSpec::Numa(1).validate(&ctx).is_ok());
+    }
+
+    #[test]
+    fn cpusetspec_numa_convenience_constructor() {
+        let spec = CpusetSpec::numa(0);
+        assert!(matches!(spec, CpusetSpec::Numa(0)));
+    }
+
+    // -- Traverse::generate --
+
+    #[test]
+    fn traverse_generate_produces_steps() {
+        let (cg, topo) = make_ctx(1, 8, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let t = Traverse {
+            seed: Some(42),
+            cgroup_count: 2..=4,
+            layouts: vec![Layout::Disjoint],
+            phases: 3,
+            phase_duration: Duration::from_millis(100),
+            settle: Duration::from_millis(50),
+            persistent_cgroups: 0,
+            cgroup_workloads: vec![WorkSpec::default()],
+        };
+        let steps = t.generate(&ctx);
+        assert_eq!(steps.len(), 3);
+        for step in &steps {
+            assert!(!step.ops.is_empty(), "each phase should have ops");
+        }
+    }
+
+    #[test]
+    fn traverse_generate_deterministic() {
+        let (cg, topo) = make_ctx(1, 8, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let t = Traverse {
+            seed: Some(99),
+            cgroup_count: 2..=4,
+            layouts: vec![Layout::Disjoint, Layout::Overlap(0.2, 0.5)],
+            phases: 5,
+            phase_duration: Duration::from_millis(100),
+            settle: Duration::from_millis(50),
+            persistent_cgroups: 1,
+            cgroup_workloads: vec![WorkSpec::default()],
+        };
+        let steps1 = t.generate(&ctx);
+        let steps2 = t.generate(&ctx);
+        assert_eq!(steps1.len(), steps2.len());
+        for (s1, s2) in steps1.iter().zip(steps2.iter()) {
+            assert_eq!(
+                s1.ops.len(),
+                s2.ops.len(),
+                "deterministic seed should produce same ops"
+            );
+        }
+    }
+
+    #[test]
+    fn traverse_generate_persistent_cgroups_preserved() {
+        let (cg, topo) = make_ctx(1, 8, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let t = Traverse {
+            seed: Some(42),
+            cgroup_count: 1..=4,
+            layouts: vec![Layout::Disjoint],
+            phases: 5,
+            phase_duration: Duration::from_millis(100),
+            settle: Duration::from_millis(50),
+            persistent_cgroups: 2,
+            cgroup_workloads: vec![WorkSpec::default()],
+        };
+        let steps = t.generate(&ctx);
+        // Every phase should have at least persistent_cgroups worth of SetCpuset ops
+        // (cg_0, cg_1 are never removed).
+        for step in &steps {
+            let remove_ops: Vec<&Op> = step.ops.iter()
+                .filter(|op| matches!(op, Op::RemoveCgroup { cgroup } if cgroup == "cg_0" || cgroup == "cg_1"))
+                .collect();
+            assert!(
+                remove_ops.is_empty(),
+                "persistent cgroups should never be removed"
+            );
+        }
+    }
+
+    // -- CgroupDef builder --
+
+    #[test]
+    fn cgroup_def_builder_chain() {
+        let d = CgroupDef::named("test")
+            .with_cpuset(CpusetSpec::llc(0))
+            .workers(8)
+            .work_type(WorkType::bursty(
+                Duration::from_millis(50),
+                Duration::from_millis(100),
+            ))
+            .sched_policy(crate::workload::SchedPolicy::Batch)
+            .swappable(true);
+        assert_eq!(d.name, "test");
+        assert!(d.cpuset.is_some());
+        assert_eq!(d.works.len(), 1);
+        assert_eq!(d.works[0].num_workers, Some(8));
+        assert!(d.swappable);
+    }
+
+    #[test]
+    fn cgroup_def_default() {
+        let d = CgroupDef::default();
+        assert_eq!(d.name, "cg_0");
+        assert!(d.cpuset.is_none());
+        assert!(d.works.is_empty());
+        assert!(!d.swappable);
+    }
+
+    #[test]
+    fn cgroup_def_multi_work() {
+        let d = CgroupDef::named("multi")
+            .work(WorkSpec::default().workers(4).work_type(WorkType::SpinWait))
+            .work(WorkSpec::default().workers(2).work_type(WorkType::YieldHeavy));
+        assert_eq!(d.works.len(), 2);
+        assert_eq!(d.works[0].num_workers, Some(4));
+        assert_eq!(d.works[1].num_workers, Some(2));
+    }
+
+    #[test]
+    fn cgroup_def_old_api_then_work() {
+        let d = CgroupDef::named("mixed")
+            .workers(4)
+            .work(WorkSpec::default().workers(2));
+        assert_eq!(d.works.len(), 2);
+        assert_eq!(d.works[0].num_workers, Some(4));
+        assert_eq!(d.works[1].num_workers, Some(2));
+    }
+
+    #[test]
+    fn cgroup_def_work_only_no_phantom() {
+        let d = CgroupDef::named("explicit").work(WorkSpec::default().workers(3));
+        assert_eq!(d.works.len(), 1);
+        assert_eq!(d.works[0].num_workers, Some(3));
+    }
+
+    // -- Setup --
+
+    #[test]
+    fn setup_defs_resolves() {
+        let defs = vec![CgroupDef::named("a"), CgroupDef::named("b")];
+        let setup = Setup::Defs(defs);
+        let (cg, topo) = make_ctx(1, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let resolved = setup.resolve(&ctx);
+        assert_eq!(resolved.len(), 2);
+        assert!(!setup.is_empty());
+    }
+
+    #[test]
+    fn setup_defs_empty() {
+        let setup = Setup::Defs(vec![]);
+        assert!(setup.is_empty());
+    }
+
+    #[test]
+    fn setup_factory_not_empty() {
+        let setup = Setup::Factory(|_| vec![CgroupDef::named("generated")]);
+        assert!(!setup.is_empty());
+    }
+
+    // -- Step::with_defs / with_ops --
+
+    #[test]
+    fn step_with_defs_empty() {
+        let step = Step::with_defs(vec![], HoldSpec::Frac(0.5));
+        assert!(step.setup.is_empty());
+        assert!(step.ops.is_empty());
+    }
+
+    #[test]
+    fn step_with_defs_populated() {
+        let step = Step::with_defs(
+            vec![CgroupDef::named("cg_0"), CgroupDef::named("cg_1")],
+            HoldSpec::Fixed(Duration::from_secs(5)),
+        );
+        assert!(!step.setup.is_empty());
+        assert!(step.ops.is_empty());
+    }
+
+    #[test]
+    fn step_with_defs_then_ops() {
+        let step = Step::with_defs(vec![CgroupDef::named("cg_0")], HoldSpec::FULL).set_ops(vec![
+            Op::AddCgroup {
+                name: "cg_1".into(),
+            },
+        ]);
+        assert!(!step.setup.is_empty());
+        assert_eq!(step.ops.len(), 1);
+    }
+
+    #[test]
+    fn step_set_ops_replaces() {
+        let step = Step::new(
+            vec![Op::AddCgroup { name: "a".into() }],
+            HoldSpec::Frac(0.5),
+        )
+        .set_ops(vec![
+            Op::AddCgroup { name: "b".into() },
+            Op::RemoveCgroup { cgroup: "c".into() },
+        ]);
+        assert_eq!(step.ops.len(), 2);
+    }
+
+    // -- CpusetSpec::validate --
+
+    #[test]
+    fn cpusetspec_validate_disjoint_of_zero() {
+        let (cg, topo) = make_ctx(1, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let spec = CpusetSpec::Disjoint { index: 0, of: 0 };
+        let err = spec.validate(&ctx).unwrap_err();
+        assert!(err.contains("must be > 0"), "got: {err}");
+    }
+
+    #[test]
+    fn cpusetspec_validate_disjoint_index_ge_of() {
+        let (cg, topo) = make_ctx(1, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let spec = CpusetSpec::Disjoint { index: 3, of: 3 };
+        let err = spec.validate(&ctx).unwrap_err();
+        assert!(err.contains("index 3 >= partition count 3"), "got: {err}");
+    }
+
+    #[test]
+    fn cpusetspec_validate_overlap_of_zero() {
+        let (cg, topo) = make_ctx(1, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let spec = CpusetSpec::Overlap {
+            index: 0,
+            of: 0,
+            frac: 0.5,
+        };
+        let err = spec.validate(&ctx).unwrap_err();
+        assert!(err.contains("must be > 0"), "got: {err}");
+    }
+
+    #[test]
+    fn cpusetspec_validate_overlap_index_ge_of() {
+        let (cg, topo) = make_ctx(1, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let spec = CpusetSpec::Overlap {
+            index: 2,
+            of: 2,
+            frac: 0.5,
+        };
+        let err = spec.validate(&ctx).unwrap_err();
+        assert!(err.contains("index 2 >= partition count 2"), "got: {err}");
+    }
+
+    #[test]
+    fn cpusetspec_validate_range_start_ge_end() {
+        let (cg, topo) = make_ctx(1, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let spec = CpusetSpec::Range {
+            start_frac: 0.8,
+            end_frac: 0.2,
+        };
+        let err = spec.validate(&ctx).unwrap_err();
+        assert!(err.contains("start_frac"), "got: {err}");
+    }
+
+    #[test]
+    fn cpusetspec_validate_range_rejects_nan() {
+        // Regression: IEEE 754 comparisons with NaN always return false, so
+        // `start_frac >= end_frac` failed to reject it. validate() now
+        // rejects non-finite fracs explicitly.
+        let (cg, topo) = make_ctx(1, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let spec = CpusetSpec::Range {
+            start_frac: 0.8,
+            end_frac: f64::NAN,
+        };
+        let err = spec.validate(&ctx).unwrap_err();
+        assert!(err.contains("not finite"), "got: {err}");
+    }
+
+    #[test]
+    fn cpusetspec_validate_range_rejects_infinity() {
+        let (cg, topo) = make_ctx(1, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let spec = CpusetSpec::Range {
+            start_frac: 0.0,
+            end_frac: f64::INFINITY,
+        };
+        let err = spec.validate(&ctx).unwrap_err();
+        assert!(err.contains("not finite"), "got: {err}");
+    }
+
+    #[test]
+    fn cpusetspec_validate_range_rejects_negative() {
+        let (cg, topo) = make_ctx(1, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let spec = CpusetSpec::Range {
+            start_frac: -0.5,
+            end_frac: 0.5,
+        };
+        let err = spec.validate(&ctx).unwrap_err();
+        assert!(err.contains("[0.0, 1.0]"), "got: {err}");
+    }
+
+    #[test]
+    fn cpusetspec_validate_range_rejects_above_one() {
+        let (cg, topo) = make_ctx(1, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let spec = CpusetSpec::Range {
+            start_frac: 0.5,
+            end_frac: 1.5,
+        };
+        let err = spec.validate(&ctx).unwrap_err();
+        assert!(err.contains("[0.0, 1.0]"), "got: {err}");
+    }
+
+    #[test]
+    fn cpusetspec_validate_overlap_rejects_nan_frac() {
+        let (cg, topo) = make_ctx(1, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let spec = CpusetSpec::Overlap {
+            index: 0,
+            of: 2,
+            frac: f64::NAN,
+        };
+        let err = spec.validate(&ctx).unwrap_err();
+        assert!(err.contains("not finite"), "got: {err}");
+    }
+
+    #[test]
+    fn cpusetspec_validate_overlap_rejects_infinity_frac() {
+        let (cg, topo) = make_ctx(1, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let spec = CpusetSpec::Overlap {
+            index: 0,
+            of: 2,
+            frac: f64::INFINITY,
+        };
+        let err = spec.validate(&ctx).unwrap_err();
+        assert!(err.contains("not finite"), "got: {err}");
+    }
+
+    #[test]
+    fn cpusetspec_validate_overlap_rejects_out_of_range_frac() {
+        let (cg, topo) = make_ctx(1, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let spec = CpusetSpec::Overlap {
+            index: 0,
+            of: 2,
+            frac: 1.5,
+        };
+        let err = spec.validate(&ctx).unwrap_err();
+        assert!(err.contains("[0.0, 1.0]"), "got: {err}");
+    }
+
+    #[test]
+    fn cpusetspec_validate_too_few_cpus_for_partitions() {
+        // 1 LLC, 2 cores, 1 thread => 2 total cpus, 2 usable
+        let (cg, topo) = make_ctx(1, 2, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let spec = CpusetSpec::Disjoint { index: 0, of: 5 };
+        let err = spec.validate(&ctx).unwrap_err();
+        assert!(err.contains("not enough usable CPUs"), "got: {err}");
+    }
+
+    #[test]
+    fn cpusetspec_validate_exact_in_range_ok() {
+        // 1 LLC * 4 cores * 1 thread = CPUs 0..=3 physically present.
+        let (cg, topo) = make_ctx(1, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let spec = CpusetSpec::exact([0, 2]);
+        assert!(spec.validate(&ctx).is_ok());
+    }
+
+    #[test]
+    fn cpusetspec_validate_exact_empty_rejected() {
+        let (cg, topo) = make_ctx(1, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let spec = CpusetSpec::Exact(BTreeSet::new());
+        let err = spec.validate(&ctx).unwrap_err();
+        assert!(err.contains("Exact") && err.contains("empty"), "got: {err}");
+    }
+
+    #[test]
+    fn cpusetspec_validate_exact_out_of_range_rejected() {
+        // Topology has CPUs 0..=3; 99 is not physically present.
+        let (cg, topo) = make_ctx(1, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let spec = CpusetSpec::exact([99]);
+        let err = spec.validate(&ctx).unwrap_err();
+        assert!(
+            err.contains("99") && err.contains("physical CPU set"),
+            "error must name the offending CPU and call it physical: {err}"
+        );
+    }
+
+    /// Regression: the reserved last CPU (when `total_cpus > 2`,
+    /// `usable_cpus` drops the last one to leave the root cgroup a
+    /// home) is still PHYSICALLY present. A scheduler author pinning
+    /// a cgroup to that CPU for testing is legitimate — validate
+    /// must NOT reject on `usable_cpuset` membership. Accepting it
+    /// here is the contract that lets isolated-CPU tests compile.
+    #[test]
+    fn cpusetspec_validate_exact_accepts_reserved_last_cpu() {
+        let (cg, topo) = make_ctx(1, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let total = ctx.topo.all_cpus().len();
+        assert!(total > 2, "test requires a topology that reserves a CPU");
+        let reserved_cpu = total - 1;
+        assert!(
+            !ctx.topo.usable_cpuset().contains(&reserved_cpu),
+            "precondition: reserved CPU {reserved_cpu} must sit outside usable_cpuset",
+        );
+        assert!(
+            ctx.topo.all_cpuset().contains(&reserved_cpu),
+            "precondition: reserved CPU {reserved_cpu} must be physically present",
+        );
+        let spec = CpusetSpec::exact([reserved_cpu]);
+        assert!(
+            spec.validate(&ctx).is_ok(),
+            "validate must accept the reserved CPU — physical presence, not \
+             usable-set membership, is the bar",
+        );
+    }
+
+    /// Regression guard for the HoldSpec pre-loop validation:
+    /// execute_steps_with must bail on a vacuous hold BEFORE running
+    /// any op. Failure mode without the pre-loop check: ops mutate
+    /// cgroup state, then `Duration::from_secs_f64` / `thread::sleep`
+    /// hit the downstream panic, leaving orphan cgroups on disk.
+    #[test]
+    fn execute_steps_with_bails_on_invalid_hold_before_ops() {
+        let parent =
+            std::env::temp_dir().join(format!("ktstr-hold-validate-{}", std::process::id()));
+        // Pre-clean in case a prior failing test left a directory.
+        let _ = std::fs::remove_dir_all(&parent);
+        std::fs::create_dir_all(&parent).unwrap();
+        let cgroups = crate::cgroup::CgroupManager::new(parent.to_str().unwrap());
+        let topo = crate::topology::TestTopology::from_vm_topology(
+            &crate::vmm::topology::Topology::new(1, 1, 4, 1),
+        );
+        let ctx = ctx_from(&cgroups, &topo);
+        let cg_name = "should_never_exist";
+        let step = Step::new(
+            vec![Op::add_cgroup(cg_name)],
+            HoldSpec::Fixed(Duration::ZERO),
+        );
+        let err = execute_steps_with(&ctx, vec![step], None).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("hold validation") && msg.contains("Fixed"),
+            "error must cite hold validation + variant: {msg}"
+        );
+        assert!(
+            !parent.join(cg_name).exists(),
+            "AddCgroup op ran before hold validation — cgroup dir '{}' exists",
+            parent.join(cg_name).display()
+        );
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    /// The SetAffinity dispatcher's `ResolvedAffinity::Random` arm is
+    /// guarded by `!from.is_empty() && *count > 0` (see the
+    /// `ResolvedAffinity::Random` arm with that same guard in
+    /// `apply_ops`). This test mirrors that classification to lock
+    /// the contract in place: future refactors that drop either
+    /// side of the AND must update this test alongside the dispatch.
+    /// The live dispatcher path is partially covered by the
+    /// `apply_setup_*` tests via `MockCgroupOps`, but the SetAffinity
+    /// arm specifically still requires a running workload handle to
+    /// exercise end-to-end and is therefore only covered by its
+    /// classification guard here.
+    #[test]
+    fn set_affinity_random_no_op_conditions() {
+        fn should_apply(from: &BTreeSet<usize>, count: usize) -> bool {
+            !from.is_empty() && count > 0
+        }
+        let pool: BTreeSet<usize> = [0, 1, 2].into_iter().collect();
+        let empty: BTreeSet<usize> = BTreeSet::new();
+        assert!(should_apply(&pool, 2));
+        assert!(!should_apply(&pool, 0), "count=0 → no-op");
+        assert!(!should_apply(&empty, 1), "empty pool → no-op");
+        assert!(!should_apply(&empty, 0), "both zero → no-op");
+    }
+
+    #[test]
+    fn cpusetspec_validate_llc_out_of_range() {
+        let (cg, topo) = make_ctx(1, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let spec = CpusetSpec::Llc(5);
+        let err = spec.validate(&ctx).unwrap_err();
+        assert!(err.contains("out of range"), "got: {err}");
+    }
+
+    #[test]
+    fn cpusetspec_validate_valid_disjoint_ok() {
+        let (cg, topo) = make_ctx(1, 8, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let spec = CpusetSpec::Disjoint { index: 1, of: 2 };
+        assert!(spec.validate(&ctx).is_ok());
+    }
+
+    // -- MemPolicy + cpuset validation tests --
+
+    #[test]
+    fn validate_mempolicy_default_always_ok() {
+        // 2 NUMA nodes, 2 LLCs (1 per node), 4 cores, 1 thread = 8 CPUs
+        let (cg, topo) = make_numa_ctx(2, 2, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let cpuset: BTreeSet<usize> = (0..4).collect();
+        assert!(
+            validate_mempolicy_cpuset(
+                &MemPolicy::Default,
+                crate::workload::MpolFlags::NONE,
+                &cpuset,
+                &ctx,
+                "cg_0",
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_mempolicy_local_always_ok() {
+        let (cg, topo) = make_numa_ctx(2, 2, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let cpuset: BTreeSet<usize> = (0..4).collect();
+        assert!(
+            validate_mempolicy_cpuset(
+                &MemPolicy::Local,
+                crate::workload::MpolFlags::NONE,
+                &cpuset,
+                &ctx,
+                "cg_0",
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_mempolicy_bind_covered() {
+        // 2 NUMA nodes, 2 LLCs, 4 cores each = 8 CPUs total
+        // LLC 0 (CPUs 0-3) = NUMA 0, LLC 1 (CPUs 4-7) = NUMA 1
+        let (cg, topo) = make_numa_ctx(2, 2, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let cpuset: BTreeSet<usize> = (0..8).collect(); // covers both nodes
+        let policy = MemPolicy::Bind([0, 1].into_iter().collect());
+        assert!(
+            validate_mempolicy_cpuset(
+                &policy,
+                crate::workload::MpolFlags::NONE,
+                &cpuset,
+                &ctx,
+                "cg_0",
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_mempolicy_bind_uncovered() {
+        let (cg, topo) = make_numa_ctx(2, 2, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let cpuset: BTreeSet<usize> = (0..4).collect(); // NUMA node 0 only
+        let policy = MemPolicy::Bind([1].into_iter().collect()); // node 1 not in cpuset
+        let err = validate_mempolicy_cpuset(
+            &policy,
+            crate::workload::MpolFlags::NONE,
+            &cpuset,
+            &ctx,
+            "cg_bind_test",
+        )
+        .unwrap_err()
+        .to_string();
+        // Cgroup name must appear so multi-cgroup scenarios can
+        // triage which entry triggered the bail.
+        assert!(err.contains("cg_bind_test"), "bail must name cgroup: {err}");
+        // Uncovered node (1) and the covering cpuset node (0) must
+        // both appear so the reader sees the exact disjoint pair.
+        assert!(
+            err.contains("[1]"),
+            "bail must name uncovered node 1: {err}"
+        );
+        assert!(err.contains("{0}"), "bail must name cpuset node 0: {err}");
+        // Both escape hatches must surface — pin the enumerated
+        // `(a)` / `(b)` markers so a regression that collapses them
+        // into one option trips this test before a user sees a
+        // vague diagnostic.
+        assert!(
+            err.contains("(a) add .mpol_flags(MpolFlags::STATIC_NODES)"),
+            "bail must call out hatch (a) STATIC_NODES opt-in by name: {err}",
+        );
+        assert!(
+            err.contains("(b) widen the cpuset"),
+            "bail must call out hatch (b) cpuset widening: {err}",
+        );
+        assert!(
+            err.contains("CpusetSpec::Numa(N)"),
+            "bail must name CpusetSpec::Numa(N) as a widening example: {err}",
+        );
+        assert!(
+            err.contains("CpusetSpec::Exact"),
+            "bail must name the CpusetSpec::Exact cpuset-widening escape hatch: {err}",
+        );
+        // The mismatch framing ("cross-socket allocation traffic
+        // that is almost certainly unintended") must survive doc
+        // edits — it's what makes the bail actionable for an
+        // author who wrote the policy assuming the kernel would
+        // silently intersect.
+        assert!(
+            err.contains("cross-socket allocation traffic"),
+            "bail must name the cross-socket framing: {err}",
+        );
+        assert!(
+            err.contains("almost certainly unintended"),
+            "bail must frame the mismatch as unintended: {err}",
+        );
+    }
+
+    #[test]
+    fn validate_mempolicy_preferred_covered() {
+        let (cg, topo) = make_numa_ctx(2, 2, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let cpuset: BTreeSet<usize> = (4..8).collect(); // NUMA node 1
+        let policy = MemPolicy::Preferred(1);
+        assert!(
+            validate_mempolicy_cpuset(
+                &policy,
+                crate::workload::MpolFlags::NONE,
+                &cpuset,
+                &ctx,
+                "cg_0",
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_mempolicy_preferred_uncovered() {
+        let (cg, topo) = make_numa_ctx(2, 2, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let cpuset: BTreeSet<usize> = (0..4).collect(); // NUMA node 0 only
+        let policy = MemPolicy::Preferred(1);
+        let err = validate_mempolicy_cpuset(
+            &policy,
+            crate::workload::MpolFlags::NONE,
+            &cpuset,
+            &ctx,
+            "cg_preferred_test",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("cg_preferred_test"),
+            "bail must name cgroup: {err}"
+        );
+        assert!(
+            err.contains("[1]"),
+            "bail must name uncovered node 1: {err}"
+        );
+        assert!(err.contains("{0}"), "bail must name cpuset node 0: {err}");
+        assert!(
+            err.contains("(a) add .mpol_flags(MpolFlags::STATIC_NODES)"),
+            "bail must enumerate hatch (a): {err}",
+        );
+        assert!(
+            err.contains("(b) widen the cpuset"),
+            "bail must enumerate hatch (b): {err}",
+        );
+        assert!(
+            err.contains("CpusetSpec::Numa(N)"),
+            "bail must cite CpusetSpec::Numa(N) example: {err}",
+        );
+        assert!(
+            err.contains("CpusetSpec::Exact"),
+            "bail must name CpusetSpec::Exact widening: {err}",
+        );
+        assert!(
+            err.contains("almost certainly unintended"),
+            "bail must frame mismatch as unintended: {err}",
+        );
+    }
+
+    #[test]
+    fn validate_mempolicy_interleave_partial_uncovered() {
+        let (cg, topo) = make_numa_ctx(2, 2, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let cpuset: BTreeSet<usize> = (0..4).collect(); // NUMA node 0 only
+        let policy = MemPolicy::Interleave([0, 1].into_iter().collect());
+        let err = validate_mempolicy_cpuset(
+            &policy,
+            crate::workload::MpolFlags::NONE,
+            &cpuset,
+            &ctx,
+            "cg_interleave_test",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("cg_interleave_test"),
+            "bail must name cgroup: {err}"
+        );
+        // Only node 1 is uncovered (node 0 is covered by cpuset); the
+        // bail should not list node 0 in the uncovered set.
+        assert!(
+            err.contains("[1]"),
+            "bail must name uncovered node 1: {err}"
+        );
+        assert!(err.contains("{0}"), "bail must name cpuset node 0: {err}");
+        assert!(
+            err.contains("(a) add .mpol_flags(MpolFlags::STATIC_NODES)"),
+            "bail must enumerate hatch (a): {err}",
+        );
+        assert!(
+            err.contains("(b) widen the cpuset"),
+            "bail must enumerate hatch (b): {err}",
+        );
+        assert!(
+            err.contains("CpusetSpec::Numa(N)"),
+            "bail must cite CpusetSpec::Numa(N) example: {err}",
+        );
+        assert!(
+            err.contains("CpusetSpec::Exact"),
+            "bail must name CpusetSpec::Exact widening: {err}",
+        );
+    }
+
+    /// `MPOL_F_STATIC_NODES` is the kernel's explicit opt-in for
+    /// keeping a mempolicy nodemask absolute across cpuset changes,
+    /// so the validator must NOT reject a policy referencing nodes
+    /// outside the cpuset when that flag is set — the caller has
+    /// signaled intentional cross-node placement.
+    #[test]
+    fn validate_mempolicy_static_nodes_bypasses_cpuset_check() {
+        let (cg, topo) = make_numa_ctx(2, 2, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let cpuset: BTreeSet<usize> = (0..4).collect(); // NUMA node 0 only
+        let policy = MemPolicy::Interleave([0, 1].into_iter().collect());
+        assert!(
+            validate_mempolicy_cpuset(
+                &policy,
+                crate::workload::MpolFlags::STATIC_NODES,
+                &cpuset,
+                &ctx,
+                "cg_0",
+            )
+            .is_ok()
+        );
+    }
+
+    /// `STATIC_NODES | RELATIVE_NODES` is a kernel-rejected
+    /// combination — `sanitize_mpol_flags` in `mm/mempolicy.c`
+    /// returns `EINVAL` if both bits are set. The validator must
+    /// surface this with a named diagnostic before the syscall,
+    /// not let it collapse into a generic EINVAL at runtime.
+    #[test]
+    fn validate_mempolicy_rejects_static_and_relative_conflict() {
+        let (cg, topo) = make_numa_ctx(2, 2, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let cpuset: BTreeSet<usize> = (0..4).collect();
+        let policy = MemPolicy::Bind([0].into_iter().collect());
+        let flags =
+            crate::workload::MpolFlags::STATIC_NODES | crate::workload::MpolFlags::RELATIVE_NODES;
+        let err = validate_mempolicy_cpuset(&policy, flags, &cpuset, &ctx, "cg_0")
+            .expect_err("STATIC_NODES | RELATIVE_NODES must be rejected");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("mutually exclusive"),
+            "error must name the mutual-exclusion contract; got: {rendered}"
+        );
+    }
+
+    /// The unknown-bit guard must reject any `MpolFlags` bit that
+    /// isn't one of the three documented constants. Without this
+    /// test, a regression that accidentally widened `known_bits` or
+    /// skipped the guard would land silently — the kernel would
+    /// either EINVAL or (worse) interpret the bit as a flag the
+    /// validator doesn't model. Uses the `#[cfg(test)]`
+    /// `from_bits_for_test` constructor to synthesize a bit pattern
+    /// (1 << 10) that no production `MpolFlags` call path can
+    /// produce via the named constants.
+    #[test]
+    fn validate_mempolicy_rejects_unknown_bits() {
+        let (cg, topo) = make_numa_ctx(2, 2, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let cpuset: BTreeSet<usize> = (0..8).collect();
+        let unknown = crate::workload::MpolFlags::from_bits_for_test(1 << 10);
+        let err = validate_mempolicy_cpuset(
+            &MemPolicy::Default,
+            unknown,
+            &cpuset,
+            &ctx,
+            "cg_unknown_bit",
+        )
+        .expect_err("unknown bit must bail");
+        let s = err.to_string();
+        assert!(s.contains("cg_unknown_bit"), "bail must name cgroup: {s}");
+        assert!(
+            s.contains("unknown bit"),
+            "bail must name the unknown-bit contract: {s}"
+        );
+        assert!(
+            s.contains("STATIC_NODES"),
+            "bail must enumerate the known bits so the user sees what IS supported: {s}",
+        );
+    }
+
+    /// `RELATIVE_NODES` treats the policy nodemask as an ordinal
+    /// into the cpuset's allowed-nodes set — the kernel performs
+    /// the relative→absolute remap internally, so cpuset coverage
+    /// in absolute-id terms does not apply. The validator must
+    /// bypass the uncovered-node bail path that the default
+    /// (no-flag) case enforces; otherwise every RELATIVE_NODES
+    /// policy referencing an ordinal beyond the cpuset's first
+    /// node would false-positive.
+    #[test]
+    fn validate_mempolicy_relative_nodes_bypasses_cpuset_check() {
+        let (cg, topo) = make_numa_ctx(2, 2, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        // cpuset covers NUMA node 0 only; policy references
+        // "node 1" which would fail the absolute-id coverage
+        // check in the default path. RELATIVE_NODES must bypass.
+        let cpuset: BTreeSet<usize> = (0..4).collect();
+        let policy = MemPolicy::Bind([1].into_iter().collect());
+        assert!(
+            validate_mempolicy_cpuset(
+                &policy,
+                crate::workload::MpolFlags::RELATIVE_NODES,
+                &cpuset,
+                &ctx,
+                "cg_0",
+            )
+            .is_ok(),
+            "RELATIVE_NODES must bypass the absolute-id cpuset coverage check"
+        );
+    }
+
+    /// Under `STATIC_NODES` the nodemask is absolute, so the
+    /// validator must verify every referenced node actually exists
+    /// on the host topology. A policy pinning node 7 on a 2-node
+    /// host would fail at syscall time; surfacing it here names
+    /// the offender before the failure.
+    #[test]
+    fn validate_mempolicy_static_nodes_rejects_missing_host_node() {
+        let (cg, topo) = make_numa_ctx(2, 2, 4, 1); // host has nodes {0, 1}
+        let ctx = ctx_from(&cg, &topo);
+        let cpuset: BTreeSet<usize> = (0..8).collect();
+        // Reference a node that does not exist on this synthetic host.
+        let policy = MemPolicy::Bind([7].into_iter().collect());
+        let err = validate_mempolicy_cpuset(
+            &policy,
+            crate::workload::MpolFlags::STATIC_NODES,
+            &cpuset,
+            &ctx,
+            "cg_0",
+        )
+        .expect_err("STATIC_NODES policy referencing missing host node must be rejected");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("do not exist on this host"),
+            "error must name the missing-host-node condition; got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn cgroupdef_mem_policy_builder() {
+        let def = CgroupDef::named("test").mem_policy(MemPolicy::Bind([0].into_iter().collect()));
+        assert!(matches!(def.works[0].mem_policy, MemPolicy::Bind(_)));
+    }
+
+    // ---------------------------------------------------------------
+    // apply_setup tests via MockCgroupOps
+    // ---------------------------------------------------------------
+    //
+    // MockCgroupOps is a recording implementor of crate::cgroup::CgroupOps
+    // that stores every call it receives in an internal Vec and can be
+    // primed to return an error from the next call. This lets
+    // apply_setup tests assert on the sequence of cgroup operations
+    // without touching /sys/fs/cgroup, so they run as regular userspace
+    // unit tests.
+    //
+    // apply_setup still calls WorkloadHandle::spawn, which forks real
+    // worker processes. That's intentional: fork does not require root,
+    // and the cgroup.procs write (which would require root in the real
+    // kernel) is abstracted behind the mock. The test subject is the
+    // orchestration logic — "for each def, call create_cgroup, then
+    // set_cpuset if spec.is_some(), then move_tasks after spawn".
+    //
+    // Parallel-nextest behavior: verified non-flaky over repeated
+    // `cargo nextest run --lib -E 'test(apply_setup)' --test-threads 8`
+    // invocations and back-to-back full-suite runs. Each `MockCgroupOps`
+    // owns its own `Mutex<Vec<CgroupCall>>`, so cross-test recording
+    // cannot contend. `apply_setup` does call `WorkloadHandle::start`
+    // (see top of this file) — workers wake, run briefly, and are then
+    // SIGKILL'd when the owning `WorkloadHandle` drops via
+    // `cleanup_state(&mut state)` / `state.handles.clear()` at the tail
+    // of each test. No test assertion depends on worker output, only
+    // on mock-recorded cgroup calls, so worker timing is not
+    // observable. Fd footprint is 4 pipes × `workers()` per test — 8
+    // fds for the 2-worker tests, well inside any RLIMIT_NOFILE the
+    // harness sets.
+
+    use crate::cgroup::CgroupOps;
+    use std::path::Path;
+    use std::sync::Mutex;
+
+    /// A call captured by MockCgroupOps during apply_setup execution.
+    /// Equality-comparable so tests can assert on the exact sequence.
+    /// `MoveTasks` stores the pid count rather than the full `pids` Vec
+    /// because PIDs are unpredictable between runs.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum CgroupCall {
+        Setup(bool),
+        CreateCgroup(String),
+        RemoveCgroup(String),
+        SetCpuset(String, BTreeSet<usize>),
+        ClearCpuset(String),
+        SetCpusetMems(String, BTreeSet<usize>),
+        #[allow(dead_code)] // Emitted by CgroupOps::clear_cpuset_mems; no test asserts on it yet.
+        ClearCpusetMems(String),
+        // (name, quota_us, period_us); quota=None means "max".
+        SetCpuMax(String, Option<u64>, u64),
+        SetCpuWeight(String, u32),
+        SetMemoryMax(String, Option<u64>),
+        SetMemoryHigh(String, Option<u64>),
+        SetMemoryLow(String, Option<u64>),
+        SetMemorySwapMax(String, Option<u64>),
+        SetIoWeight(String, u16),
+        SetFreeze(String, bool),
+        SetPidsMax(String, Option<u64>),
+        MoveTask(String, libc::pid_t),
+        MoveTasks(String, usize), // (cgroup name, number of pids)
+        ClearSubtreeControl(String),
+        DrainTasks(String),
+        CleanupAll,
+    }
+
+    struct MockCgroupOps {
+        parent: std::path::PathBuf,
+        calls: Mutex<Vec<CgroupCall>>,
+        // When Some, the Nth call (indexed from 0 at insertion time)
+        // returns an error and decrements; otherwise all calls return Ok.
+        fail_at: Mutex<Option<(usize, String)>>,
+    }
+
+    impl MockCgroupOps {
+        fn new() -> Self {
+            Self {
+                parent: std::path::PathBuf::from("/mock/cgroup"),
+                calls: Mutex::new(Vec::new()),
+                fail_at: Mutex::new(None),
+            }
+        }
+
+        /// Return an error from the Nth call (0-indexed from now) with
+        /// the given message. Used by tests that check error
+        /// propagation through apply_setup.
+        fn fail_call_at(&self, index: usize, message: &str) {
+            *self.fail_at.lock().unwrap() = Some((index, message.to_string()));
+        }
+
+        fn calls(&self) -> Vec<CgroupCall> {
+            self.calls.lock().unwrap().clone()
+        }
+
+        /// Record a call and decide whether to return Ok or inject an
+        /// error. Centralizes the fail_at logic so every trait method
+        /// gets it for free.
+        fn record(&self, call: CgroupCall) -> Result<()> {
+            let mut calls = self.calls.lock().unwrap();
+            let current_index = calls.len();
+            calls.push(call);
+            drop(calls);
+            let mut fail = self.fail_at.lock().unwrap();
+            if let Some((index, ref message)) = *fail
+                && current_index == index
+            {
+                let err_msg = message.clone();
+                *fail = None;
+                return Err(anyhow::anyhow!(err_msg));
+            }
+            Ok(())
+        }
+    }
+
+    impl CgroupOps for MockCgroupOps {
+        fn parent_path(&self) -> &Path {
+            &self.parent
+        }
+        fn setup(&self, enable_cpu_controller: bool) -> Result<()> {
+            self.record(CgroupCall::Setup(enable_cpu_controller))
+        }
+        fn create_cgroup(&self, name: &str) -> Result<()> {
+            self.record(CgroupCall::CreateCgroup(name.to_string()))
+        }
+        fn remove_cgroup(&self, name: &str) -> Result<()> {
+            self.record(CgroupCall::RemoveCgroup(name.to_string()))
+        }
+        fn set_cpuset(&self, name: &str, cpus: &BTreeSet<usize>) -> Result<()> {
+            self.record(CgroupCall::SetCpuset(name.to_string(), cpus.clone()))
+        }
+        fn clear_cpuset(&self, name: &str) -> Result<()> {
+            self.record(CgroupCall::ClearCpuset(name.to_string()))
+        }
+        fn set_cpuset_mems(&self, name: &str, nodes: &BTreeSet<usize>) -> Result<()> {
+            self.record(CgroupCall::SetCpusetMems(name.to_string(), nodes.clone()))
+        }
+        fn clear_cpuset_mems(&self, name: &str) -> Result<()> {
+            self.record(CgroupCall::ClearCpusetMems(name.to_string()))
+        }
+        fn set_cpu_max(&self, name: &str, quota_us: Option<u64>, period_us: u64) -> Result<()> {
+            self.record(CgroupCall::SetCpuMax(name.to_string(), quota_us, period_us))
+        }
+        fn set_cpu_weight(&self, name: &str, weight: u32) -> Result<()> {
+            self.record(CgroupCall::SetCpuWeight(name.to_string(), weight))
+        }
+        fn set_memory_max(&self, name: &str, bytes: Option<u64>) -> Result<()> {
+            self.record(CgroupCall::SetMemoryMax(name.to_string(), bytes))
+        }
+        fn set_memory_high(&self, name: &str, bytes: Option<u64>) -> Result<()> {
+            self.record(CgroupCall::SetMemoryHigh(name.to_string(), bytes))
+        }
+        fn set_memory_low(&self, name: &str, bytes: Option<u64>) -> Result<()> {
+            self.record(CgroupCall::SetMemoryLow(name.to_string(), bytes))
+        }
+        fn set_io_weight(&self, name: &str, weight: u16) -> Result<()> {
+            self.record(CgroupCall::SetIoWeight(name.to_string(), weight))
+        }
+        fn set_freeze(&self, name: &str, frozen: bool) -> Result<()> {
+            self.record(CgroupCall::SetFreeze(name.to_string(), frozen))
+        }
+        fn set_pids_max(&self, name: &str, max: Option<u64>) -> Result<()> {
+            self.record(CgroupCall::SetPidsMax(name.to_string(), max))
+        }
+        fn set_memory_swap_max(&self, name: &str, bytes: Option<u64>) -> Result<()> {
+            self.record(CgroupCall::SetMemorySwapMax(name.to_string(), bytes))
+        }
+        fn move_task(&self, name: &str, pid: libc::pid_t) -> Result<()> {
+            self.record(CgroupCall::MoveTask(name.to_string(), pid))
+        }
+        fn move_tasks(&self, name: &str, pids: &[libc::pid_t]) -> Result<()> {
+            self.record(CgroupCall::MoveTasks(name.to_string(), pids.len()))
+        }
+        fn clear_subtree_control(&self, name: &str) -> Result<()> {
+            self.record(CgroupCall::ClearSubtreeControl(name.to_string()))
+        }
+        fn drain_tasks(&self, name: &str) -> Result<()> {
+            self.record(CgroupCall::DrainTasks(name.to_string()))
+        }
+        fn cleanup_all(&self) -> Result<()> {
+            self.record(CgroupCall::CleanupAll)
+        }
+    }
+
+    /// Build a Ctx backed by MockCgroupOps so apply_setup can be driven
+    /// without cgroup filesystem access. Topology fixed at 1 NUMA /
+    /// 1 LLC / 4 cores / 1 thread = 4 CPUs — enough range to cover
+    /// per-cpu cpuset assertions without making the mock brittle.
+    fn mock_ctx<'a>(mock: &'a MockCgroupOps, topo: &'a crate::topology::TestTopology) -> Ctx<'a> {
+        Ctx {
+            cgroups: mock,
+            topo,
+            duration: Duration::from_secs(1),
+            workers_per_cgroup: 1,
+            sched_pid: None,
+            settle: Duration::ZERO,
+            work_type_override: None,
+            assert: crate::assert::Assert::default_checks(),
+            wait_for_map_write: false,
+        }
+    }
+
+    fn mock_topo() -> crate::topology::TestTopology {
+        crate::topology::TestTopology::from_vm_topology(&crate::vmm::topology::Topology::new(
+            1, 1, 4, 1,
+        ))
+    }
+
+    /// Drop workload + payload handles inside state so apply_setup
+    /// tests don't leak worker or payload processes. Synthetic
+    /// `WorkloadHandle`s SIGKILL their workers on Drop, so a
+    /// `handles.clear()` is enough; `PayloadHandle` likewise
+    /// SIGKILLs its child on Drop (with an eprintln warning about
+    /// metrics not being recorded — acceptable in the test path
+    /// where metrics aren't what's under test). Calling
+    /// `drain_all_payload_handles` routes through `.kill()` so the
+    /// metric-emission branch runs and the test doesn't trigger
+    /// the Drop-warning banner on stderr.
+    fn cleanup_state(state: &mut StepState<'_>) {
+        state.handles.clear();
+        drain_all_payload_handles(&mut state.payload_handles);
+    }
+
+    /// Test helper: call `apply_setup` against a step-local-only
+    /// [`ScenarioState`]. Constructs a throwaway backdrop state
+    /// pointing at the same mock-cgroups handle `state` uses so
+    /// tests that only exercise step-local semantics stay terse.
+    fn apply_setup_test<'a>(
+        ctx: &'a Ctx<'a>,
+        state: &mut StepState<'a>,
+        defs: &[CgroupDef],
+    ) -> Result<()> {
+        let mut backdrop = BackdropState::empty(ctx);
+        let mut scenario = ScenarioState::new(state, &mut backdrop);
+        apply_setup(ctx, &mut scenario, defs)
+    }
+
+    /// Test helper: call `apply_ops` against a step-local-only
+    /// [`ScenarioState`]. Mirrors [`apply_setup_test`] for ops.
+    fn apply_ops_test<'a>(ctx: &'a Ctx<'a>, state: &mut StepState<'a>, ops: &[Op]) -> Result<()> {
+        let mut backdrop = BackdropState::empty(ctx);
+        let mut scenario = ScenarioState::new(state, &mut backdrop);
+        apply_ops(ctx, &mut scenario, ops)
+    }
+
+    #[test]
+    fn apply_setup_empty_defs_is_noop() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        apply_setup_test(&ctx, &mut state, &[]).unwrap();
+        assert!(
+            mock.calls().is_empty(),
+            "apply_setup on zero defs must not call any cgroup op, got: {:?}",
+            mock.calls()
+        );
+        cleanup_state(&mut state);
+    }
+
+    #[test]
+    fn apply_setup_creates_cgroup_per_def() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        let defs = vec![
+            CgroupDef::named("cg_a").workers(1),
+            CgroupDef::named("cg_b").workers(1),
+        ];
+        apply_setup_test(&ctx, &mut state, &defs).unwrap();
+        let calls = mock.calls();
+        let creates: Vec<&CgroupCall> = calls
+            .iter()
+            .filter(|c| matches!(c, CgroupCall::CreateCgroup(_)))
+            .collect();
+        assert_eq!(
+            creates,
+            vec![
+                &CgroupCall::CreateCgroup("cg_a".to_string()),
+                &CgroupCall::CreateCgroup("cg_b".to_string()),
+            ],
+            "one create_cgroup call per def, in order"
+        );
+        cleanup_state(&mut state);
+    }
+
+    #[test]
+    fn apply_setup_sets_cpuset_when_spec_present() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        let cpus: BTreeSet<usize> = [0, 1].into_iter().collect();
+        let defs = vec![
+            CgroupDef::named("cg_0")
+                .with_cpuset(CpusetSpec::Exact(cpus.clone()))
+                .workers(1),
+        ];
+        apply_setup_test(&ctx, &mut state, &defs).unwrap();
+        let calls = mock.calls();
+        assert!(
+            calls.contains(&CgroupCall::SetCpuset("cg_0".to_string(), cpus.clone())),
+            "set_cpuset must be called with exactly the resolved cpu set, got: {calls:?}"
+        );
+        // state.cpusets should mirror the set so later SetAffinity /
+        // MemPolicy checks see the resolved cpuset.
+        assert_eq!(
+            state.cpusets.get("cg_0"),
+            Some(&cpus),
+            "state.cpusets must record the resolved set"
+        );
+        cleanup_state(&mut state);
+    }
+
+    #[test]
+    fn apply_setup_skips_cpuset_when_none() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        // cpuset: None → inherit parent's set, apply_setup must not
+        // emit a set_cpuset call.
+        let defs = vec![CgroupDef::named("cg_inherit").workers(1)];
+        apply_setup_test(&ctx, &mut state, &defs).unwrap();
+        let calls = mock.calls();
+        let has_set_cpuset = calls
+            .iter()
+            .any(|c| matches!(c, CgroupCall::SetCpuset(_, _)));
+        assert!(
+            !has_set_cpuset,
+            "no set_cpuset should be emitted when CgroupDef.cpuset is None, got: {calls:?}"
+        );
+        assert!(
+            state.cpusets.is_empty(),
+            "state.cpusets should stay empty when no CpusetSpec was resolved"
+        );
+        cleanup_state(&mut state);
+    }
+
+    #[test]
+    fn apply_setup_moves_spawned_tasks_into_cgroup() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        // workers(2): after spawn, apply_setup must call move_tasks
+        // with 2 pids.
+        let defs = vec![CgroupDef::named("cg_move").workers(2)];
+        apply_setup_test(&ctx, &mut state, &defs).unwrap();
+        let calls = mock.calls();
+        assert!(
+            calls.contains(&CgroupCall::MoveTasks("cg_move".to_string(), 2)),
+            "move_tasks must be called with the 2 spawned worker pids, got: {calls:?}"
+        );
+        // Ordering invariant: move_tasks follows create_cgroup, and
+        // set_cpuset (when present) follows create_cgroup but precedes
+        // move_tasks. Here with no cpuset, just assert create precedes
+        // move.
+        let create_idx = calls
+            .iter()
+            .position(|c| matches!(c, CgroupCall::CreateCgroup(n) if n == "cg_move"))
+            .expect("create_cgroup for cg_move");
+        let move_idx = calls
+            .iter()
+            .position(|c| matches!(c, CgroupCall::MoveTasks(n, _) if n == "cg_move"))
+            .expect("move_tasks for cg_move");
+        assert!(
+            create_idx < move_idx,
+            "create_cgroup must precede move_tasks for the same cgroup: {calls:?}"
+        );
+        cleanup_state(&mut state);
+    }
+
+    #[test]
+    fn apply_setup_sets_cpuset_before_move_tasks() {
+        // Ordering invariant: for a cgroup with both a cpuset spec and
+        // workers, `set_cpuset` MUST precede `move_tasks` so the
+        // kernel enforces the cpu mask on the first scheduling
+        // decision after the task enters the cgroup. Moving first
+        // would let tasks briefly run on cpus outside the intended
+        // set.
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        let cpus: BTreeSet<usize> = [0, 1].into_iter().collect();
+        let defs = vec![
+            CgroupDef::named("cg_ordered")
+                .with_cpuset(CpusetSpec::Exact(cpus.clone()))
+                .workers(2),
+        ];
+        apply_setup_test(&ctx, &mut state, &defs).unwrap();
+        let calls = mock.calls();
+        let set_idx = calls
+            .iter()
+            .position(|c| matches!(c, CgroupCall::SetCpuset(n, _) if n == "cg_ordered"))
+            .expect("set_cpuset for cg_ordered");
+        let move_idx = calls
+            .iter()
+            .position(|c| matches!(c, CgroupCall::MoveTasks(n, _) if n == "cg_ordered"))
+            .expect("move_tasks for cg_ordered");
+        assert!(
+            set_idx < move_idx,
+            "set_cpuset must precede move_tasks for the same cgroup: {calls:?}"
+        );
+        cleanup_state(&mut state);
+    }
+
+    #[test]
+    fn apply_setup_bails_on_invalid_cpuset_spec() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        // Llc(99) on a 1-LLC topology is out of range; CpusetSpec::validate
+        // bails after create_cgroup runs but before set_cpuset / move_tasks
+        // fire.
+        let defs = vec![CgroupDef::named("cg_bad").with_cpuset(CpusetSpec::Llc(99))];
+        let err = apply_setup_test(&ctx, &mut state, &defs).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("CpusetSpec validation failed"),
+            "expected validation error, got: {msg}"
+        );
+        // create_cgroup runs before cpuset validation — record that
+        // here so future refactors notice if the order flips.
+        let calls = mock.calls();
+        assert_eq!(
+            calls,
+            vec![CgroupCall::CreateCgroup("cg_bad".to_string())],
+            "current ordering: create_cgroup first, then cpuset validation"
+        );
+        cleanup_state(&mut state);
+    }
+
+    #[test]
+    fn apply_setup_propagates_set_cpuset_error() {
+        let mock = MockCgroupOps::new();
+        // Inject failure at call index 1. Index 0 is the create_cgroup
+        // emitted before the cpuset write; index 1 is the set_cpuset
+        // itself.
+        mock.fail_call_at(1, "set_cpuset kernel EBUSY");
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        let cpus: BTreeSet<usize> = [0, 1].into_iter().collect();
+        let defs = vec![
+            CgroupDef::named("cg_setfail")
+                .with_cpuset(CpusetSpec::Exact(cpus))
+                .workers(1),
+        ];
+        let err = apply_setup_test(&ctx, &mut state, &defs).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("set_cpuset kernel EBUSY"),
+            "set_cpuset error must propagate, got: {msg}"
+        );
+        // Check the failure halted apply_setup before reaching spawn:
+        // no MoveTasks call should have been recorded.
+        let calls = mock.calls();
+        let has_move = calls
+            .iter()
+            .any(|c| matches!(c, CgroupCall::MoveTasks(_, _)));
+        assert!(
+            !has_move,
+            "no move_tasks call should follow a failed set_cpuset, got: {calls:?}"
+        );
+        cleanup_state(&mut state);
+    }
+
+    #[test]
+    fn apply_setup_validates_mempolicy_against_cpuset() {
+        let mock = MockCgroupOps::new();
+        // 2 NUMA / 2 LLCs (1 per node) / 4 cores / 1 thread = 8 CPUs
+        let topo = crate::topology::TestTopology::from_vm_topology(
+            &crate::vmm::topology::Topology::new(2, 2, 4, 1),
+        );
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        // cpuset = NUMA node 0 only (CPUs 0-3); mem_policy binds to
+        // node 1 — must bail, no downstream spawn.
+        let cpus: BTreeSet<usize> = (0..4).collect();
+        let bind: BTreeSet<usize> = [1].into_iter().collect();
+        let defs = vec![
+            CgroupDef::named("cg_memfail")
+                .with_cpuset(CpusetSpec::Exact(cpus))
+                .mem_policy(MemPolicy::Bind(bind))
+                .workers(1),
+        ];
+        let err = apply_setup_test(&ctx, &mut state, &defs).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("cg_memfail"),
+            "error must name the bad cgroup, got: {msg}"
+        );
+        // set_cpuset was called before the mempolicy check (order
+        // documented by apply_setup). Assert move_tasks did not run —
+        // that would mean the pre-validation guard failed.
+        let calls = mock.calls();
+        let has_move = calls
+            .iter()
+            .any(|c| matches!(c, CgroupCall::MoveTasks(_, _)));
+        assert!(
+            !has_move,
+            "mempolicy validation must bail before spawn, got: {calls:?}"
+        );
+        cleanup_state(&mut state);
+    }
+
+    // -- CgroupDef::workload --
+
+    /// Default CgroupDef has no payload attached — every test that
+    /// doesn't opt in stays Payload-free so the synthetic-workload
+    /// path is unaffected.
+    #[test]
+    fn cgroup_def_default_payload_is_none() {
+        let def = CgroupDef::named("cg_0");
+        assert!(def.payload.is_none());
+    }
+
+    /// The `.workload(&FIO)` builder stores the reference on the
+    /// CgroupDef so apply_setup can spawn it. Because `Payload` is
+    /// `Copy`, the builder preserves identity through pointer
+    /// equality after conversion to `&'static` refs.
+    #[test]
+    fn cgroup_def_workload_stores_payload() {
+        use crate::test_support::{OutputFormat, Payload, PayloadKind};
+        static FIO: Payload = Payload {
+            name: "fio",
+            kind: PayloadKind::Binary("fio"),
+            output: OutputFormat::Json,
+            default_args: &[],
+            default_checks: &[],
+            metrics: &[],
+            include_files: &[],
+            uses_parent_pgrp: false,
+            known_flags: None,
+            metric_bounds: None,
+        };
+        let def = CgroupDef::named("cg_0").workload(&FIO);
+        let p = def.payload.expect("workload was attached");
+        assert_eq!(p.name, "fio");
+        assert!(!p.is_scheduler());
+    }
+
+    /// Scheduler-kind payloads are rejected at builder time — the
+    /// `workload` slot is exclusively for userspace binaries that
+    /// run *under* a scheduler, not for scheduler placement itself.
+    #[test]
+    #[should_panic(expected = "CgroupDef::workload called with a scheduler-kind Payload")]
+    fn cgroup_def_workload_rejects_scheduler_kind_payload() {
+        use crate::test_support::Payload;
+        let _ = CgroupDef::named("cg_0").workload(&Payload::KERNEL_DEFAULT);
+    }
+
+    /// The drain helper kills + removes entries whose cgroup name
+    /// matches the target. Non-matching entries stay in the vector
+    /// so subsequent step teardown (via `collect_step`) or scenario
+    /// end (via `collect_backdrop`) kills them in turn.
+    #[test]
+    fn drain_payload_handles_for_cgroup_removes_matching_only() {
+        use crate::cgroup::CgroupManager;
+        use crate::scenario::payload_run::PayloadRun;
+        use crate::test_support::{OutputFormat, Payload, PayloadKind};
+        use crate::topology::TestTopology;
+
+        static TRUE_BIN: Payload = Payload {
+            name: "true_bin",
+            kind: PayloadKind::Binary("/bin/true"),
+            output: OutputFormat::ExitCode,
+            default_args: &[],
+            default_checks: &[],
+            metrics: &[],
+            include_files: &[],
+            uses_parent_pgrp: false,
+            known_flags: None,
+            metric_bounds: None,
+        };
+
+        let cgroups = CgroupManager::new("/nonexistent");
+        let topo = TestTopology::synthetic(4, 1);
+        let ctx = crate::scenario::Ctx::builder(&cgroups, &topo).build();
+
+        let h_a = PayloadRun::new(&ctx, &TRUE_BIN)
+            .spawn()
+            .expect("spawn /bin/true for cg_a");
+        let h_b = PayloadRun::new(&ctx, &TRUE_BIN)
+            .spawn()
+            .expect("spawn /bin/true for cg_b");
+
+        let mut handles = vec![
+            PayloadEntry {
+                cgroup: "cg_a".to_string(),
+                source: PayloadSource::CgroupDefWorkload,
+                handle: h_a,
+            },
+            PayloadEntry {
+                cgroup: "cg_b".to_string(),
+                source: PayloadSource::CgroupDefWorkload,
+                handle: h_b,
+            },
+        ];
+        drain_payload_handles_for_cgroup(&mut handles, "cg_a");
+
+        assert_eq!(handles.len(), 1);
+        assert_eq!(handles[0].cgroup, "cg_b");
+
+        drain_all_payload_handles(&mut handles);
+        assert!(handles.is_empty());
+    }
+
+    // -- Step::with_payload + Op::RunPayload/WaitPayload/KillPayload --
+
+    /// Step::with_payload emits a step whose ops consist of a single
+    /// Op::RunPayload carrying the supplied payload. Hold passes
+    /// through unchanged.
+    #[test]
+    fn step_with_payload_emits_runpayload_op() {
+        use crate::test_support::{OutputFormat, Payload, PayloadKind};
+        static FIO: Payload = Payload {
+            name: "fio",
+            kind: PayloadKind::Binary("fio"),
+            output: OutputFormat::Json,
+            default_args: &[],
+            default_checks: &[],
+            metrics: &[],
+            include_files: &[],
+            uses_parent_pgrp: false,
+            known_flags: None,
+            metric_bounds: None,
+        };
+        let step = Step::with_payload(&FIO, HoldSpec::Fixed(Duration::from_millis(50)));
+        assert_eq!(step.ops.len(), 1);
+        match &step.ops[0] {
+            Op::RunPayload {
+                payload,
+                args,
+                cgroup,
+            } => {
+                assert_eq!(payload.name, "fio");
+                assert!(args.is_empty());
+                assert!(cgroup.is_none());
+            }
+            other => panic!("expected RunPayload, got {other:?}"),
+        }
+        assert!(matches!(step.hold, HoldSpec::Fixed(d) if d == Duration::from_millis(50)));
+        assert!(matches!(&step.setup, Setup::Defs(d) if d.is_empty()));
+    }
+
+    /// Op convenience constructors — `run_payload`, `wait_payload`,
+    /// `kill_payload`, `run_payload_in_cgroup` — build the expected
+    /// enum shapes with the right field contents.
+    #[test]
+    fn op_payload_constructors_produce_expected_variants() {
+        use crate::test_support::{OutputFormat, Payload, PayloadKind};
+        static FIO: Payload = Payload {
+            name: "fio",
+            kind: PayloadKind::Binary("fio"),
+            output: OutputFormat::Json,
+            default_args: &[],
+            default_checks: &[],
+            metrics: &[],
+            include_files: &[],
+            uses_parent_pgrp: false,
+            known_flags: None,
+            metric_bounds: None,
+        };
+
+        let op = Op::run_payload(&FIO, vec!["--warmup".into()]);
+        match op {
+            Op::RunPayload {
+                payload,
+                args,
+                cgroup,
+            } => {
+                assert_eq!(payload.name, "fio");
+                assert_eq!(args, vec!["--warmup".to_string()]);
+                assert!(cgroup.is_none());
+            }
+            other => panic!("expected RunPayload, got {other:?}"),
+        }
+
+        let op = Op::run_payload_in_cgroup(&FIO, vec![], "cg_0");
+        match op {
+            Op::RunPayload {
+                payload,
+                args,
+                cgroup,
+            } => {
+                assert_eq!(payload.name, "fio");
+                assert!(args.is_empty());
+                assert_eq!(cgroup.as_deref(), Some("cg_0"));
+            }
+            other => panic!("expected RunPayload, got {other:?}"),
+        }
+
+        let op = Op::wait_payload("fio");
+        assert!(matches!(
+            op,
+            Op::WaitPayload { ref name, ref cgroup } if name.as_ref() == "fio" && cgroup.is_none(),
+        ));
+
+        let op = Op::kill_payload("fio");
+        assert!(matches!(
+            op,
+            Op::KillPayload { ref name, ref cgroup } if name.as_ref() == "fio" && cgroup.is_none(),
+        ));
+
+        let op = Op::wait_payload_in_cgroup("fio", "cg_0");
+        assert!(matches!(
+            op,
+            Op::WaitPayload { ref name, cgroup: Some(ref c) } if name.as_ref() == "fio" && c.as_ref() == "cg_0",
+        ));
+
+        let op = Op::kill_payload_in_cgroup("fio", "cg_0");
+        assert!(matches!(
+            op,
+            Op::KillPayload { ref name, cgroup: Some(ref c) } if name.as_ref() == "fio" && c.as_ref() == "cg_0",
+        ));
+    }
+
+    /// Op::RunPayload rejects scheduler-kind payloads at apply time
+    /// with an actionable error message. The existing CgroupDef
+    /// path panics at builder time; the Op path runs at scenario
+    /// time and must bail instead of panicking so one bad step in
+    /// a sequence doesn't crash the harness.
+    #[test]
+    fn apply_ops_runpayload_rejects_scheduler_kind() {
+        use crate::test_support::Payload;
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        let ops = vec![Op::RunPayload {
+            payload: &Payload::KERNEL_DEFAULT,
+            args: vec![],
+            cgroup: None,
+        }];
+        let err = apply_ops_test(&ctx, &mut state, &ops).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("scheduler-kind Payload") && msg.contains("kernel_default"),
+            "error must name the scheduler-kind reason AND the payload name, got: {msg}"
+        );
+        assert!(
+            state.payload_handles.is_empty(),
+            "no handle should be stored when RunPayload rejects the kind"
+        );
+    }
+
+    /// Op::WaitPayload with no matching handle surfaces a descriptive
+    /// error rather than silently no-op'ing. Ditto KillPayload. A
+    /// silent no-op would let test authors wait for ghosts and pass
+    /// scenarios that never ran what they claim.
+    #[test]
+    fn apply_ops_wait_unknown_payload_bails() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        let err = apply_ops_test(
+            &ctx,
+            &mut state,
+            &[Op::WaitPayload {
+                name: "ghost".into(),
+                cgroup: None,
+            }],
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("no running payload named 'ghost'"),
+            "error must name the missing payload, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn apply_ops_kill_unknown_payload_bails() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        let err = apply_ops_test(
+            &ctx,
+            &mut state,
+            &[Op::KillPayload {
+                name: "ghost".into(),
+                cgroup: None,
+            }],
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("no running payload named 'ghost'"),
+            "error must name the missing payload, got: {msg}"
+        );
+    }
+
+    /// End-to-end on a real payload binary: Op::RunPayload spawns
+    /// a long-running `/bin/sleep`, Op::KillPayload matches by
+    /// payload.name and consumes the handle. The handle should
+    /// disappear from state.payload_handles so later teardown
+    /// drains don't double-consume.
+    #[test]
+    fn apply_ops_run_then_kill_consumes_handle() {
+        use crate::test_support::{OutputFormat, Payload, PayloadKind};
+        static SLEEP: Payload = Payload {
+            // Name distinct from binary so the payload_name lookup
+            // path is exercised against a non-basename key.
+            name: "sleeper",
+            kind: PayloadKind::Binary("/bin/sleep"),
+            output: OutputFormat::ExitCode,
+            default_args: &[],
+            default_checks: &[],
+            metrics: &[],
+            include_files: &[],
+            uses_parent_pgrp: false,
+            known_flags: None,
+            metric_bounds: None,
+        };
+
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        apply_ops_test(
+            &ctx,
+            &mut state,
+            &[Op::run_payload(&SLEEP, vec!["3600".into()])],
+        )
+        .expect("spawn /bin/sleep");
+        assert_eq!(state.payload_handles.len(), 1, "one payload is live");
+        assert_eq!(state.payload_handles[0].handle.payload_name(), "sleeper");
+
+        apply_ops_test(&ctx, &mut state, &[Op::kill_payload("sleeper")])
+            .expect("kill the live payload");
+        assert!(
+            state.payload_handles.is_empty(),
+            "handle must be consumed by KillPayload"
+        );
+    }
+
+    /// Spawning a second payload with the same name while the first
+    /// is still live is a caller bug — the `WaitPayload`/
+    /// `KillPayload` lookup would hit the first match and leave the
+    /// second leaked. Reject at RunPayload time.
+    #[test]
+    fn apply_ops_run_duplicate_payload_name_bails() {
+        use crate::test_support::{OutputFormat, Payload, PayloadKind};
+        static SLEEP: Payload = Payload {
+            name: "sleeper",
+            kind: PayloadKind::Binary("/bin/sleep"),
+            output: OutputFormat::ExitCode,
+            default_args: &[],
+            default_checks: &[],
+            metrics: &[],
+            include_files: &[],
+            uses_parent_pgrp: false,
+            known_flags: None,
+            metric_bounds: None,
+        };
+
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        apply_ops_test(
+            &ctx,
+            &mut state,
+            &[Op::run_payload(&SLEEP, vec!["3600".into()])],
+        )
+        .expect("first spawn");
+
+        let err = apply_ops_test(
+            &ctx,
+            &mut state,
+            &[Op::run_payload(&SLEEP, vec!["3600".into()])],
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("payload 'sleeper' already running"),
+            "error must flag the duplicate, got: {msg}"
+        );
+        // The dup error must identify the surface that spawned the
+        // live handle so the user knows where to go to fix it. The
+        // first spawn was via Op::RunPayload, not CgroupDef::workload.
+        assert!(
+            msg.contains("Op::RunPayload"),
+            "dup error must name the originating surface, got: {msg}"
+        );
+        // The Op::RunPayload in this test ran without a
+        // `cgroup = Some(..)`, so the rendered cgroup key must be
+        // `(no cgroup)`, not an empty-quoted `''`.
+        assert!(
+            msg.contains("(no cgroup)"),
+            "empty-cgroup key must render as '(no cgroup)', got: {msg}"
+        );
+        assert!(
+            !msg.contains("cgroup ''"),
+            "empty-cgroup key must not render as quoted empty, got: {msg}"
+        );
+        assert_eq!(
+            state.payload_handles.len(),
+            1,
+            "second spawn must not add a handle on failure"
+        );
+
+        // Clean up the live handle so the test process doesn't leak
+        // a /bin/sleep.
+        apply_ops_test(&ctx, &mut state, &[Op::kill_payload("sleeper")]).expect("teardown kill");
+    }
+
+    /// When the first spawn came from `CgroupDef::workload` in
+    /// `cg_def` and a subsequent `Op::run_payload_in_cgroup` targets
+    /// the same `cg_def` with the same payload name, the composite-
+    /// key dup check fires and names `CgroupDef::workload` as the
+    /// originating surface. A cross-cgroup duplicate (same name,
+    /// different cgroup) is legitimate and tested separately.
+    #[test]
+    fn apply_ops_run_rejects_payload_already_owned_by_cgroup_def() {
+        use crate::test_support::{OutputFormat, Payload, PayloadKind};
+        static SLEEP: Payload = Payload {
+            name: "sleeper",
+            kind: PayloadKind::Binary("/bin/sleep"),
+            output: OutputFormat::ExitCode,
+            default_args: &[],
+            default_checks: &[],
+            metrics: &[],
+            include_files: &[],
+            uses_parent_pgrp: false,
+            known_flags: None,
+            metric_bounds: None,
+        };
+
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        // Simulate the def-owned handle directly — apply_setup pushes
+        // entries with PayloadSource::CgroupDefWorkload, so construct
+        // the equivalent here without invoking the real spawn path
+        // (apply_setup needs workers(N) and cgroupfs ops which MockCgroupOps
+        // does not implement for this test shape).
+        let h = crate::scenario::payload_run::PayloadRun::new(&ctx, &SLEEP)
+            .args(["3600".to_string()])
+            .spawn()
+            .expect("manual def-source spawn");
+        state.payload_handles.push(PayloadEntry {
+            cgroup: "def_cg".to_string(),
+            source: PayloadSource::CgroupDefWorkload,
+            handle: h,
+        });
+
+        // Targeting the SAME cgroup as the pre-existing entry: dup.
+        let err = apply_ops_test(
+            &ctx,
+            &mut state,
+            &[Op::run_payload_in_cgroup(
+                &SLEEP,
+                vec!["1".into()],
+                "def_cg",
+            )],
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("CgroupDef::workload"),
+            "dup error must name the def-source surface, got: {msg}"
+        );
+        assert!(
+            msg.contains("'def_cg'"),
+            "dup error must name the cgroup the live handle is in, got: {msg}"
+        );
+        // Only the original handle remains — op branch bailed pre-spawn.
+        assert_eq!(state.payload_handles.len(), 1);
+
+        apply_ops_test(
+            &ctx,
+            &mut state,
+            &[Op::kill_payload_in_cgroup("sleeper", "def_cg")],
+        )
+        .expect("teardown kill");
+    }
+
+    /// [`render_cgroup_key`] renders an empty string as
+    /// `(no cgroup)` and a populated name as single-quoted prose.
+    /// Pins the formatting so every error path that echoes the
+    /// cgroup key through this helper stays consistent.
+    #[test]
+    fn render_cgroup_key_handles_empty_and_populated() {
+        assert_eq!(render_cgroup_key(""), "(no cgroup)");
+        assert_eq!(render_cgroup_key("cg_a"), "'cg_a'");
+    }
+
+    // -- payload_handles drain on error paths in execute_steps_with --
+
+    /// An Err return from `execute_steps_with` (here: a vacuous
+    /// `HoldSpec::Fixed(ZERO)` caught by up-front validation)
+    /// leaves no live payload_handles because no setup/ops ran.
+    /// Pins the invariant that the pre-ops validation path does
+    /// not spawn anything that could then leak.
+    #[test]
+    fn execute_steps_with_early_validation_err_has_nothing_to_drain() {
+        use crate::cgroup::CgroupManager;
+        let cgroups = CgroupManager::new("/nonexistent");
+        let topo = mock_topo();
+        let ctx = crate::scenario::Ctx::builder(&cgroups, &topo).build();
+        let step = Step::new(vec![], HoldSpec::Fixed(Duration::ZERO));
+        let err = execute_steps_with(&ctx, vec![step], None).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("hold validation") && msg.contains("vacuous"),
+            "expected pre-ops validation err, got: {msg}"
+        );
+    }
+
+    /// When a live payload has been spawned and a later op returns
+    /// Err, the drain-on-err path consumes the payload handles via
+    /// `.kill()` (which emits metrics) rather than leaking them to
+    /// `PayloadHandle::drop` (which SIGKILLs without recording).
+    ///
+    /// This test exercises the drain path directly by spawning a
+    /// /bin/sleep, then calling `apply_ops` with an op that forces
+    /// an error (unknown-name `WaitPayload`). After the Err, the
+    /// state's payload_handles must still be consulted by the
+    /// drain — verified by checking the live count before +
+    /// explicit teardown after.
+    #[test]
+    fn apply_ops_error_does_not_lose_live_payload_handles() {
+        use crate::test_support::{OutputFormat, Payload, PayloadKind};
+        static SLEEP: Payload = Payload {
+            name: "sleeper_drain",
+            kind: PayloadKind::Binary("/bin/sleep"),
+            output: OutputFormat::ExitCode,
+            default_args: &[],
+            default_checks: &[],
+            metrics: &[],
+            include_files: &[],
+            uses_parent_pgrp: false,
+            known_flags: None,
+            metric_bounds: None,
+        };
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        apply_ops_test(
+            &ctx,
+            &mut state,
+            &[Op::run_payload(&SLEEP, vec!["3600".into()])],
+        )
+        .expect("spawn");
+        assert_eq!(state.payload_handles.len(), 1);
+        // Trigger an Err via WaitPayload on an unknown name. Before
+        // the fix, execute_steps_with would propagate the Err via
+        // `?` and leave the SLEEP handle to be SIGKILLed by Drop
+        // (losing the metric emission).
+        let err =
+            apply_ops_test(&ctx, &mut state, &[Op::wait_payload("never_spawned")]).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("no running payload named 'never_spawned'"),
+            "expected wait-unknown-name err",
+        );
+        // The live handle is still in state — apply_ops itself does
+        // not drain on Err (that's execute_steps_with's
+        // responsibility). Manually drain via the helper to
+        // terminate the child cleanly.
+        drain_all_payload_handles(&mut state.payload_handles);
+        assert!(state.payload_handles.is_empty());
+    }
+
+    // ---------------------------------------------------------------
+    // Step/Backdrop ruling invariants
+    // ---------------------------------------------------------------
+
+    /// A step-local `Op::RemoveCgroup` that targets a Backdrop-owned
+    /// cgroup must bail before any cgroupfs write. Ops running inside
+    /// the Backdrop's own setup pass (i.e. `target_backdrop == true`)
+    /// stay exempt.
+    #[test]
+    fn remove_cgroup_rejects_backdrop_target() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+
+        // Populate a backdrop cgroup and leave the step state empty.
+        let mut step_state = StepState::empty(&ctx);
+        let mut backdrop_state = BackdropState::empty(&ctx);
+        backdrop_state
+            .cgroups
+            .add_cgroup_no_cpuset("bd_cg")
+            .expect("add backdrop cgroup");
+
+        // Step-local RemoveCgroup must reject.
+        {
+            let mut scenario = ScenarioState::new(&mut step_state, &mut backdrop_state);
+            let err = apply_ops(&ctx, &mut scenario, &[Op::remove_cgroup("bd_cg")]).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("Backdrop-owned") && msg.contains("bd_cg"),
+                "error must name the backdrop cgroup and explain why, got: {msg}"
+            );
+        }
+        // The backdrop cgroup is still tracked.
+        assert_eq!(backdrop_state.cgroups.names(), &["bd_cg".to_string()]);
+        // No remove_cgroup call was issued to the mock — the bail
+        // happened before any cgroupfs write.
+        let calls = mock.calls();
+        assert!(
+            !calls
+                .iter()
+                .any(|c| matches!(c, CgroupCall::RemoveCgroup(_))),
+            "pre-bail path must not invoke remove_cgroup, got: {calls:?}"
+        );
+
+        // Backdrop-pass RemoveCgroup (target_backdrop = true) is
+        // allowed and routes through to the mock.
+        {
+            let mut scenario = ScenarioState::new(&mut step_state, &mut backdrop_state);
+            scenario
+                .with_target_backdrop(|s| apply_ops(&ctx, s, &[Op::remove_cgroup("bd_cg")]))
+                .expect("backdrop-pass remove is permitted");
+        }
+        let calls = mock.calls();
+        assert!(
+            calls
+                .iter()
+                .any(|c| matches!(c, CgroupCall::RemoveCgroup(n) if n == "bd_cg")),
+            "backdrop-pass remove must reach the cgroup ops, got: {calls:?}"
+        );
+
+        cleanup_state(&mut step_state);
+    }
+
+    /// `Op::MoveAllTasks` from a step-local cgroup to a Backdrop
+    /// cgroup must transfer the handle from step-local slot to
+    /// backdrop slot so the worker survives the step boundary. A
+    /// step-to-step move keeps ownership step-local. A backdrop-to-
+    /// step move keeps the handle in the backdrop slot (persistent
+    /// does not degrade).
+    #[test]
+    fn move_all_tasks_transfers_handle_ownership_step_to_backdrop() {
+        use crate::workload::{WorkSpec, WorkloadConfig, WorkloadHandle};
+
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+
+        let mut step_state = StepState::empty(&ctx);
+        let mut backdrop_state = BackdropState::empty(&ctx);
+        // Backdrop owns "bd_cg"; the step owns "step_cg" and a
+        // handle keyed under it.
+        backdrop_state
+            .cgroups
+            .add_cgroup_no_cpuset("bd_cg")
+            .unwrap();
+        step_state.cgroups.add_cgroup_no_cpuset("step_cg").unwrap();
+        let w = WorkSpec::default();
+        let wl = WorkloadConfig {
+            num_workers: 1,
+            affinity: crate::workload::AffinityIntent::Inherit,
+            work_type: w.work_type,
+            sched_policy: w.sched_policy,
+            mem_policy: w.mem_policy,
+            mpol_flags: w.mpol_flags,
+            nice: 0,
+            clone_mode: Default::default(),
+            composed: Vec::new(),
+        };
+        let h = WorkloadHandle::spawn(&wl).expect("spawn worker");
+        step_state.handles.push(("step_cg".to_string(), h));
+        assert_eq!(step_state.handles.len(), 1);
+        assert_eq!(backdrop_state.handles.len(), 0);
+
+        // Move tasks from step_cg to bd_cg: ownership transfers.
+        {
+            let mut scenario = ScenarioState::new(&mut step_state, &mut backdrop_state);
+            apply_ops(
+                &ctx,
+                &mut scenario,
+                &[Op::move_all_tasks("step_cg", "bd_cg")],
+            )
+            .expect("move into backdrop");
+        }
+        assert_eq!(
+            step_state.handles.len(),
+            0,
+            "step-local handle must leave the step slot after transfer",
+        );
+        assert_eq!(
+            backdrop_state.handles.len(),
+            1,
+            "backdrop slot must receive the transferred handle",
+        );
+        assert_eq!(
+            backdrop_state.handles[0].0, "bd_cg",
+            "transferred handle must be re-keyed to `to`",
+        );
+
+        // Clear the handles before the test drops (handles SIGKILL on
+        // drop — avoid leaking the worker process).
+        backdrop_state.handles.clear();
+        step_state.handles.clear();
+    }
+
+    /// Step→step move does NOT cross state slots (companion to the
+    /// step→backdrop transfer test above).
+    #[test]
+    fn move_all_tasks_step_to_step_keeps_step_ownership() {
+        use crate::workload::{WorkSpec, WorkloadConfig, WorkloadHandle};
+
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut step_state = StepState::empty(&ctx);
+        let mut backdrop_state = BackdropState::empty(&ctx);
+        step_state.cgroups.add_cgroup_no_cpuset("src").unwrap();
+        step_state.cgroups.add_cgroup_no_cpuset("dst").unwrap();
+        let w = WorkSpec::default();
+        let wl = WorkloadConfig {
+            num_workers: 1,
+            affinity: crate::workload::AffinityIntent::Inherit,
+            work_type: w.work_type,
+            sched_policy: w.sched_policy,
+            mem_policy: w.mem_policy,
+            mpol_flags: w.mpol_flags,
+            nice: 0,
+            clone_mode: Default::default(),
+            composed: Vec::new(),
+        };
+        let h = WorkloadHandle::spawn(&wl).expect("spawn");
+        step_state.handles.push(("src".to_string(), h));
+        {
+            let mut scenario = ScenarioState::new(&mut step_state, &mut backdrop_state);
+            apply_ops(&ctx, &mut scenario, &[Op::move_all_tasks("src", "dst")])
+                .expect("step-to-step move");
+        }
+        assert_eq!(step_state.handles.len(), 1);
+        assert_eq!(step_state.handles[0].0, "dst");
+        assert_eq!(backdrop_state.handles.len(), 0);
+        step_state.handles.clear();
+    }
+
+    /// A step-local `Op::MoveAllTasks` that
+    /// pulls from a Backdrop-owned cgroup into a step-local cgroup
+    /// must bail before touching cgroupfs. The persistent worker
+    /// would otherwise be stranded in a cgroup that gets rmdir'd at
+    /// the step boundary. Backdrop-setup ops (`target_backdrop`)
+    /// stay exempt.
+    #[test]
+    fn move_all_tasks_backdrop_to_step_rejected() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut step_state = StepState::empty(&ctx);
+        let mut backdrop_state = BackdropState::empty(&ctx);
+        backdrop_state.cgroups.add_cgroup_no_cpuset("bd").unwrap();
+        step_state.cgroups.add_cgroup_no_cpuset("step").unwrap();
+
+        let mut scenario = ScenarioState::new(&mut step_state, &mut backdrop_state);
+        let err = apply_ops(&ctx, &mut scenario, &[Op::move_all_tasks("bd", "step")]).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Backdrop-owned 'bd'") && msg.contains("step-local 'step'"),
+            "error must name both cgroups and the direction, got: {msg}"
+        );
+        // The mock must not have seen a cgroup.procs write — the
+        // guard bails before any kernel-side work.
+        let calls = mock.calls();
+        assert!(
+            !calls
+                .iter()
+                .any(|c| matches!(c, CgroupCall::MoveTasks(_, _))),
+            "pre-bail path must not invoke move_tasks, got: {calls:?}"
+        );
+    }
+
+    /// `run_scenario` rejects a scheduler-kind payload in
+    /// `Backdrop::payloads` before running any setup.
+    #[test]
+    fn run_scenario_rejects_scheduler_kind_backdrop_payload() {
+        use crate::cgroup::CgroupManager;
+        use crate::test_support::Payload;
+        let cgroups = CgroupManager::new("/nonexistent");
+        let topo = mock_topo();
+        let ctx = crate::scenario::Ctx::builder(&cgroups, &topo).build();
+        let backdrop =
+            crate::scenario::backdrop::Backdrop::new().with_payload(&Payload::KERNEL_DEFAULT);
+        let err = execute_scenario_with(
+            &ctx,
+            backdrop,
+            vec![Step::new(vec![], HoldSpec::Fixed(Duration::from_millis(1)))],
+            None,
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("scheduler-kind") && msg.contains("Backdrop"),
+            "error must name the kind mismatch and the Backdrop surface, got: {msg}"
+        );
+    }
+
+    /// `apply_setup` rejects a step-local CgroupDef whose name
+    /// collides with a Backdrop-tracked cgroup.
+    #[test]
+    fn apply_setup_rejects_name_collision_with_backdrop() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut step_state = StepState::empty(&ctx);
+        let mut backdrop_state = BackdropState::empty(&ctx);
+        backdrop_state
+            .cgroups
+            .add_cgroup_no_cpuset("shared")
+            .unwrap();
+        let defs = vec![CgroupDef::named("shared").workers(1)];
+        let mut scenario = ScenarioState::new(&mut step_state, &mut backdrop_state);
+        let err = apply_setup(&ctx, &mut scenario, &defs).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("already tracked") && msg.contains("shared"),
+            "error must cite the collision and the offending name, got: {msg}"
+        );
+        cleanup_state(&mut step_state);
+    }
+
+    // ---------------------------------------------------------------
+    // composite-key (name, cgroup) dedup for Op::RunPayload
+    // ---------------------------------------------------------------
+
+    /// Push a synthetic live PayloadEntry into `state`'s step slot
+    /// so tests can exercise dedup / lookup paths without paying
+    /// the cost of a real cgroupfs-backed spawn (which fails inside
+    /// the MockCgroupOps test harness because `/mock/cgroup/...`
+    /// doesn't exist on disk).
+    fn push_fake_payload_entry<'a>(
+        ctx: &'a Ctx<'a>,
+        state: &mut StepState<'a>,
+        payload: &'static crate::test_support::Payload,
+        cgroup: &str,
+        source: PayloadSource,
+    ) {
+        let h = crate::scenario::payload_run::PayloadRun::new(ctx, payload)
+            .args(["3600".to_string()])
+            .spawn()
+            .expect("manual spawn (no cgroup placement)");
+        state.payload_handles.push(PayloadEntry {
+            cgroup: cgroup.to_string(),
+            source,
+            handle: h,
+        });
+    }
+
+    /// Same payload live in `cg_a` AND `cg_b`; a third
+    /// `Op::RunPayload` targeting a brand-new `cg_c` must NOT trip
+    /// the composite-key dedup because the (name, cgroup) pair is
+    /// fresh. Simulated via direct state injection so the test
+    /// doesn't depend on cgroupfs.
+    #[test]
+    fn apply_ops_run_duplicate_name_different_cgroups_allowed() {
+        use crate::test_support::{OutputFormat, Payload, PayloadKind};
+        static SLEEP: Payload = Payload {
+            name: "sleeper",
+            kind: PayloadKind::Binary("/bin/sleep"),
+            output: OutputFormat::ExitCode,
+            default_args: &[],
+            default_checks: &[],
+            metrics: &[],
+            include_files: &[],
+            uses_parent_pgrp: false,
+            known_flags: None,
+            metric_bounds: None,
+        };
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        push_fake_payload_entry(
+            &ctx,
+            &mut state,
+            &SLEEP,
+            "cg_a",
+            PayloadSource::OpRunPayload,
+        );
+        push_fake_payload_entry(
+            &ctx,
+            &mut state,
+            &SLEEP,
+            "cg_b",
+            PayloadSource::OpRunPayload,
+        );
+
+        let mut backdrop = BackdropState::empty(&ctx);
+        let scenario = ScenarioState::new(&mut state, &mut backdrop);
+        // The `find_live_payload_with_cgroup` lookup for ("sleeper", "cg_c")
+        // returns None because no live entry matches that pair — so
+        // the dup check passes and run_scenario would let the spawn
+        // proceed. We check the lookup directly (spawning against
+        // MockCgroupOps would fail on the pre_exec cgroup write).
+        assert!(
+            scenario
+                .find_live_payload_with_cgroup("sleeper", "cg_c")
+                .is_none(),
+            "fresh (name, cgroup) pair must not collide with live entries in other cgroups",
+        );
+        // And the existing same-cgroup entry still collides.
+        assert!(
+            scenario
+                .find_live_payload_with_cgroup("sleeper", "cg_a")
+                .is_some(),
+            "same (name, cgroup) still matches — only the pair matters",
+        );
+
+        cleanup_state(&mut state);
+    }
+
+    /// `take_payload_by_name` in composite mode matches only the
+    /// exact `(name, cgroup)` pair and leaves sibling copies alone.
+    #[test]
+    fn take_payload_by_composite_key_matches_exact_cgroup() {
+        use crate::test_support::{OutputFormat, Payload, PayloadKind};
+        static SLEEP: Payload = Payload {
+            name: "sleeper",
+            kind: PayloadKind::Binary("/bin/sleep"),
+            output: OutputFormat::ExitCode,
+            default_args: &[],
+            default_checks: &[],
+            metrics: &[],
+            include_files: &[],
+            uses_parent_pgrp: false,
+            known_flags: None,
+            metric_bounds: None,
+        };
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        push_fake_payload_entry(
+            &ctx,
+            &mut state,
+            &SLEEP,
+            "cg_a",
+            PayloadSource::OpRunPayload,
+        );
+        push_fake_payload_entry(
+            &ctx,
+            &mut state,
+            &SLEEP,
+            "cg_b",
+            PayloadSource::OpRunPayload,
+        );
+
+        let mut backdrop = BackdropState::empty(&ctx);
+        let mut scenario = ScenarioState::new(&mut state, &mut backdrop);
+        let taken = scenario
+            .take_payload_by_name("sleeper", Some("cg_a"))
+            .expect("composite lookup does not bail on ambiguity")
+            .expect("one entry matches");
+        assert_eq!(taken.cgroup, "cg_a");
+        // The cg_b entry survives.
+        assert_eq!(state.payload_handles.len(), 1);
+        assert_eq!(state.payload_handles[0].cgroup, "cg_b");
+        // Drain to avoid leaking the live child.
+        drain_all_payload_handles(&mut state.payload_handles);
+        let _ = taken.handle.kill();
+    }
+
+    /// Bare `take_payload_by_name(name, None)` returns
+    /// `Err(ambiguous_cgroups)` when two or more copies are live,
+    /// surfacing both cgroup keys so the caller can disambiguate.
+    #[test]
+    fn take_payload_by_bare_name_reports_ambiguous_cgroups() {
+        use crate::test_support::{OutputFormat, Payload, PayloadKind};
+        static SLEEP: Payload = Payload {
+            name: "sleeper",
+            kind: PayloadKind::Binary("/bin/sleep"),
+            output: OutputFormat::ExitCode,
+            default_args: &[],
+            default_checks: &[],
+            metrics: &[],
+            include_files: &[],
+            uses_parent_pgrp: false,
+            known_flags: None,
+            metric_bounds: None,
+        };
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        push_fake_payload_entry(
+            &ctx,
+            &mut state,
+            &SLEEP,
+            "cg_a",
+            PayloadSource::OpRunPayload,
+        );
+        push_fake_payload_entry(
+            &ctx,
+            &mut state,
+            &SLEEP,
+            "cg_b",
+            PayloadSource::OpRunPayload,
+        );
+
+        let mut backdrop = BackdropState::empty(&ctx);
+        let mut scenario = ScenarioState::new(&mut state, &mut backdrop);
+        let err = match scenario.take_payload_by_name("sleeper", None) {
+            Err(cgroups) => cgroups,
+            Ok(_) => panic!("bare lookup over multi-copy must surface ambiguity"),
+        };
+        assert_eq!(err.len(), 2);
+        assert!(err.contains(&"cg_a".to_string()) && err.contains(&"cg_b".to_string()));
+        // No handle consumed — both still live.
+        assert_eq!(state.payload_handles.len(), 2);
+        drain_all_payload_handles(&mut state.payload_handles);
+    }
+
+    /// Bare `take_payload_by_name(name, None)` succeeds when
+    /// exactly one copy is live, so `Op::wait_payload(name)` and
+    /// `Op::kill_payload(name)` don't need to carry a cgroup
+    /// argument in the single-copy case.
+    #[test]
+    fn take_payload_by_bare_name_succeeds_on_single_copy() {
+        use crate::test_support::{OutputFormat, Payload, PayloadKind};
+        static SLEEP: Payload = Payload {
+            name: "sleeper",
+            kind: PayloadKind::Binary("/bin/sleep"),
+            output: OutputFormat::ExitCode,
+            default_args: &[],
+            default_checks: &[],
+            metrics: &[],
+            include_files: &[],
+            uses_parent_pgrp: false,
+            known_flags: None,
+            metric_bounds: None,
+        };
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        push_fake_payload_entry(
+            &ctx,
+            &mut state,
+            &SLEEP,
+            "cg_a",
+            PayloadSource::OpRunPayload,
+        );
+
+        let mut backdrop = BackdropState::empty(&ctx);
+        let mut scenario = ScenarioState::new(&mut state, &mut backdrop);
+        let taken = scenario
+            .take_payload_by_name("sleeper", None)
+            .expect("single-copy bare lookup returns Ok")
+            .expect("one entry matches");
+        assert_eq!(taken.cgroup, "cg_a");
+        assert!(state.payload_handles.is_empty());
+        let _ = taken.handle.kill();
+    }
+
+    /// The apply_ops ambiguity hint must spell the full snake_case
+    /// constructor path so a user copying the hint into source
+    /// writes something that actually compiles. Covers both
+    /// `Op::wait_payload` and `Op::kill_payload` entry points
+    /// because they route through the same helper.
+    #[test]
+    fn apply_ops_bare_wait_and_kill_ambiguity_hint_names_full_constructor() {
+        use crate::test_support::{OutputFormat, Payload, PayloadKind};
+        static SLEEP: Payload = Payload {
+            name: "sleeper",
+            kind: PayloadKind::Binary("/bin/sleep"),
+            output: OutputFormat::ExitCode,
+            default_args: &[],
+            default_checks: &[],
+            metrics: &[],
+            include_files: &[],
+            uses_parent_pgrp: false,
+            known_flags: None,
+            metric_bounds: None,
+        };
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+
+        // WaitPayload path.
+        let mut state = StepState::empty(&ctx);
+        push_fake_payload_entry(
+            &ctx,
+            &mut state,
+            &SLEEP,
+            "cg_a",
+            PayloadSource::OpRunPayload,
+        );
+        push_fake_payload_entry(
+            &ctx,
+            &mut state,
+            &SLEEP,
+            "cg_b",
+            PayloadSource::OpRunPayload,
+        );
+        let err = apply_ops_test(&ctx, &mut state, &[Op::wait_payload("sleeper")]).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("ambiguous"),
+            "wait ambiguity message must flag ambiguity, got: {msg}"
+        );
+        assert!(
+            msg.contains("Op::wait_payload_in_cgroup(name, cgroup)"),
+            "wait ambiguity hint must name the full snake_case constructor \
+             so a copy-paste into source compiles, got: {msg}"
+        );
+        drain_all_payload_handles(&mut state.payload_handles);
+
+        // KillPayload path.
+        let mut state = StepState::empty(&ctx);
+        push_fake_payload_entry(
+            &ctx,
+            &mut state,
+            &SLEEP,
+            "cg_a",
+            PayloadSource::OpRunPayload,
+        );
+        push_fake_payload_entry(
+            &ctx,
+            &mut state,
+            &SLEEP,
+            "cg_b",
+            PayloadSource::OpRunPayload,
+        );
+        let err = apply_ops_test(&ctx, &mut state, &[Op::kill_payload("sleeper")]).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Op::kill_payload_in_cgroup(name, cgroup)"),
+            "kill ambiguity hint must name the full snake_case constructor, got: {msg}"
+        );
+        drain_all_payload_handles(&mut state.payload_handles);
+    }
+
+    /// The not-found arm uses `-ing` verb form ("before waiting" /
+    /// "before killing"), not the collapsed single-word lowercase
+    /// a previous implementation emitted.
+    #[test]
+    fn apply_ops_not_found_message_uses_gerund_verb() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        let err = apply_ops_test(&ctx, &mut state, &[Op::wait_payload("ghost")]).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("before waiting"),
+            "wait not-found message must say 'before waiting', got: {msg}"
+        );
+        assert!(
+            !msg.contains("before waitpayload"),
+            "must not collapse 'wait payload' into 'waitpayload', got: {msg}"
+        );
+
+        let err = apply_ops_test(&ctx, &mut state, &[Op::kill_payload("ghost")]).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("before killing"),
+            "kill not-found message must say 'before killing', got: {msg}"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Step-local vs Backdrop state invariants
+    // ---------------------------------------------------------------
+
+    /// Op::RemoveCgroup dispatches `ctx.cgroups.remove_cgroup`
+    /// directly but does NOT forget the name from CgroupGroup's
+    /// tracked `names` vec. Later, CgroupGroup's Drop iterates every
+    /// tracked name and calls remove_cgroup again. The second call
+    /// is swallowed by `let _ = ` in Drop, so the desync is
+    /// observable (two remove_cgroup calls for the same name) but
+    /// harmless. Pin the behavior so a future refactor that prunes
+    /// names out from under a live Drop (or that stops swallowing
+    /// the second error) surfaces here.
+    #[test]
+    fn remove_cgroup_does_not_forget_name_in_cgroupgroup_but_drop_is_safe() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        apply_ops_test(
+            &ctx,
+            &mut state,
+            &[Op::add_cgroup("cg_keep"), Op::add_cgroup("cg_drop")],
+        )
+        .unwrap();
+        // Op::RemoveCgroup records on the mock but does NOT prune
+        // `cg_drop` from the tracked names — both names stay.
+        apply_ops_test(&ctx, &mut state, &[Op::remove_cgroup("cg_drop")]).unwrap();
+        assert_eq!(
+            state.cgroups.names(),
+            &["cg_keep".to_string(), "cg_drop".to_string()],
+            "Op::RemoveCgroup must not mutate CgroupGroup::names (current \
+             invariant); Drop is the single rmdir dispatcher",
+        );
+        // The Drop call is safe because CgroupManager::remove_cgroup
+        // is idempotent and CgroupGroup::drop swallows the second
+        // error. Proved by dropping the state and asserting the mock
+        // observed two RemoveCgroup calls for cg_drop (one from the
+        // op, one from Drop), in that order, and did not panic.
+        drop(state);
+        let calls = mock.calls();
+        let drops: Vec<&CgroupCall> = calls
+            .iter()
+            .filter(|c| matches!(c, CgroupCall::RemoveCgroup(n) if n == "cg_drop"))
+            .collect();
+        assert_eq!(
+            drops.len(),
+            2,
+            "expected Op::RemoveCgroup + Drop to both hit the mock for cg_drop: {calls:?}",
+        );
+    }
+
+    /// Step-local `Op::AddCgroup` with a name that already lives
+    /// in the Backdrop must route through the same
+    /// `cgroup_name_is_tracked` collision guard as `apply_setup`
+    /// — otherwise the CgroupGroup would push a shadow step-local
+    /// entry that later steps could address, silently racing the
+    /// Backdrop's own writes to cpuset / subtree_control on the
+    /// same cgroupfs path.
+    #[test]
+    fn op_add_cgroup_step_local_rejects_collision_with_backdrop() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut step_state = StepState::empty(&ctx);
+        let mut backdrop_state = BackdropState::empty(&ctx);
+        backdrop_state
+            .cgroups
+            .add_cgroup_no_cpuset("shared")
+            .expect("add backdrop cgroup");
+        let mut scenario = ScenarioState::new(&mut step_state, &mut backdrop_state);
+        let err = apply_ops(&ctx, &mut scenario, &[Op::add_cgroup("shared")]).expect_err(
+            "apply_ops must reject a step-local AddCgroup whose \
+                         name already lives in the Backdrop",
+        );
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("'shared'") && msg.contains("collides"),
+            "error must name the colliding cgroup and explain the collision; got: {msg}",
+        );
+        // Step-local names must NOT gain a shadow entry after the
+        // guard fires.
+        assert!(
+            step_state.cgroups.names().iter().all(|n| n != "shared"),
+            "step-local names must not contain the rejected name; got: {:?}",
+            step_state.cgroups.names(),
+        );
+        // Backdrop copy is untouched.
+        assert!(
+            backdrop_state.cgroups.names().iter().any(|n| n == "shared"),
+            "backdrop copy must survive the rejected op",
+        );
+    }
+
+    /// `Op::AddCgroup` applied twice in one step with the same name
+    /// is rejected by the `cgroup_name_is_tracked` collision guard.
+    /// The first op adds the name to step-local tracking; the second
+    /// sees it already tracked and bails, so the CgroupGroup's name
+    /// vec gains exactly one entry and Drop's remove_cgroup runs
+    /// once per unique name.
+    #[test]
+    fn op_add_cgroup_duplicate_in_same_step_is_rejected() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        let err = apply_ops_test(
+            &ctx,
+            &mut state,
+            &[Op::add_cgroup("cg_dup"), Op::add_cgroup("cg_dup")],
+        )
+        .expect_err("second AddCgroup must fail against the same step-local name");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("'cg_dup'") && msg.contains("collides"),
+            "error must name the colliding cgroup and explain the collision; got: {msg}",
+        );
+        let names = state.cgroups.names();
+        assert_eq!(
+            names.iter().filter(|n| n.as_str() == "cg_dup").count(),
+            1,
+            "the first op must register the name exactly once; the second op \
+             must not push a shadow entry; got: {names:?}",
+        );
+    }
+
+    /// `MoveAllTasks` must re-key EVERY workload handle whose
+    /// current name matches `from`, not just the first. Multiple
+    /// handles on the same cgroup arise when a scenario issues two
+    /// `Op::Spawn` ops on the same cgroup name.
+    #[test]
+    fn move_all_tasks_renames_every_handle_keyed_under_from() {
+        use crate::workload::{AffinityIntent, WorkType, WorkloadConfig, WorkloadHandle};
+
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut step_state = StepState::empty(&ctx);
+        let mut backdrop_state = BackdropState::empty(&ctx);
+        step_state.cgroups.add_cgroup_no_cpuset("src").unwrap();
+        step_state.cgroups.add_cgroup_no_cpuset("dst").unwrap();
+
+        // Push THREE handles all keyed under "src" — simulates two
+        // Op::Spawn ops in the same cgroup + one from CgroupDef.
+        for _ in 0..3 {
+            let wl = WorkloadConfig {
+                num_workers: 1,
+                affinity: AffinityIntent::Inherit,
+                work_type: WorkType::SpinWait,
+                ..Default::default()
+            };
+            let h = WorkloadHandle::spawn(&wl).expect("spawn worker");
+            step_state.handles.push(("src".to_string(), h));
+        }
+        assert_eq!(step_state.handles.len(), 3);
+
+        {
+            let mut scenario = ScenarioState::new(&mut step_state, &mut backdrop_state);
+            apply_ops(&ctx, &mut scenario, &[Op::move_all_tasks("src", "dst")]).expect("move");
+        }
+
+        assert_eq!(step_state.handles.len(), 3, "no handles lost");
+        assert!(
+            step_state.handles.iter().all(|(name, _)| name == "dst"),
+            "every handle must be re-keyed to 'dst': {:?}",
+            step_state
+                .handles
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect::<Vec<_>>(),
+        );
+        // SIGKILL before drop so the synthetic workers don't leak.
+        step_state.handles.clear();
+    }
+
+    /// Per-step teardown is observable via the mock's call log.
+    /// `execute_scenario` runs Step::cgroups Drop at step boundary;
+    /// with MockCgroupOps we can pin that the rmdir calls happen
+    /// (a) only on step-local cgroups, (b) in REVERSE order of
+    /// addition — nested-cgroup-safe teardown.
+    #[test]
+    fn per_step_teardown_removes_step_local_cgroups_in_reverse_order() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        apply_ops_test(
+            &ctx,
+            &mut state,
+            &[
+                Op::add_cgroup("cg_a"),
+                Op::add_cgroup("cg_a/sub"),
+                Op::add_cgroup("cg_b"),
+            ],
+        )
+        .unwrap();
+        // Simulate step boundary: drop the state to run CgroupGroup::Drop.
+        drop(state);
+        let calls = mock.calls();
+        let removes: Vec<&str> = calls
+            .iter()
+            .filter_map(|c| match c {
+                CgroupCall::RemoveCgroup(n) => Some(n.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            removes,
+            vec!["cg_b", "cg_a/sub", "cg_a"],
+            "per-step teardown must rmdir in reverse addition order so a \
+             child cgroup's directory is gone before its parent's rmdir \
+             runs",
+        );
+    }
+
+    /// `build_stimulus` passes `step_idx` through the `to_u16` helper
+    /// which saturates to `u16::MAX` with a `tracing::warn!` on
+    /// overflow. The saturation arm is unreachable under realistic
+    /// gauntlet runs — scenarios do not hold 65k+ steps — but the
+    /// guard exists so a pathological scenario cannot silently wrap
+    /// the wire field. Exercise the three interesting values:
+    ///
+    /// - `step_idx == 0`: lower boundary, no saturation.
+    /// - `step_idx == u16::MAX as usize`: highest value that fits,
+    ///   still no saturation.
+    /// - `step_idx == u16::MAX as usize + 1`: first overflow, must
+    ///   saturate to `u16::MAX`.
+    #[test]
+    fn build_stimulus_saturates_step_idx_at_u16_max() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut step_state = StepState::empty(&ctx);
+        let mut backdrop_state = BackdropState::empty(&ctx);
+        let scenario = ScenarioState::new(&mut step_state, &mut backdrop_state);
+        let start = std::time::Instant::now();
+
+        let zero = build_stimulus(&start, 0, &[], &scenario);
+        assert_eq!(zero.step_index, 0, "step_idx=0 passes through");
+
+        let max = build_stimulus(&start, u16::MAX as usize, &[], &scenario);
+        assert_eq!(
+            max.step_index,
+            u16::MAX,
+            "step_idx=u16::MAX passes through unchanged (no saturation)",
+        );
+
+        let overflow = build_stimulus(&start, u16::MAX as usize + 1, &[], &scenario);
+        assert_eq!(
+            overflow.step_index,
+            u16::MAX,
+            "step_idx beyond u16::MAX must saturate to u16::MAX, not wrap",
+        );
+
+        // Far-overflow smoke check: u32::MAX as usize is well past
+        // the saturation boundary. The helper must still return
+        // u16::MAX. Note the coincidence that `u32::MAX as u16` also
+        // equals `u16::MAX` (the low 16 bits of `0xFFFF_FFFF_u32`
+        // are `0xFFFF`), so this specific input cannot distinguish
+        // saturation from a straight `as u16` truncation — the
+        // `u16::MAX as usize + 1` assertion above is what pins
+        // saturation (that input truncates to 0, so only saturation
+        // returns u16::MAX). This check therefore guards only the
+        // far-overflow call path (helper handles values past
+        // u16::MAX by orders of magnitude without panicking or
+        // returning nonsense), not the saturation semantics.
+        let far = build_stimulus(&start, u32::MAX as usize, &[], &scenario);
+        assert_eq!(
+            far.step_index,
+            u16::MAX,
+            "far-overflow step_idx must saturate to u16::MAX",
+        );
+    }
+
+    /// Saturation without a warn would silently clip the wire field;
+    /// the `tracing::warn!` inside `to_u16` is the only observable
+    /// signal an operator gets when a scenario blew past `u16::MAX`.
+    /// Install a minimal capturing subscriber, run a saturation-
+    /// triggering call, and assert the warn event fired.
+    #[test]
+    fn build_stimulus_warns_on_step_idx_saturation() {
+        use std::sync::{Arc, Mutex};
+        use tracing::field::{Field, Visit};
+        use tracing::span::{Attributes, Id, Record};
+        use tracing::{Event, Subscriber};
+        use tracing::{Level, Metadata};
+
+        // Capturing subscriber that records `(level, message)` pairs
+        // for every event. Span-related methods are implemented as
+        // no-ops; the test only cares about event emission.
+        #[derive(Default)]
+        struct CaptureSubscriber {
+            events: Arc<Mutex<Vec<(Level, String)>>>,
+        }
+        struct MessageVisitor<'a>(&'a mut String);
+        impl<'a> Visit for MessageVisitor<'a> {
+            fn record_debug(&mut self, _field: &Field, value: &dyn std::fmt::Debug) {
+                use std::fmt::Write;
+                let _ = write!(self.0, "{value:?} ");
+            }
+            fn record_str(&mut self, _field: &Field, value: &str) {
+                use std::fmt::Write;
+                let _ = write!(self.0, "{value} ");
+            }
+        }
+        impl Subscriber for CaptureSubscriber {
+            fn enabled(&self, _: &Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &Attributes<'_>) -> Id {
+                Id::from_u64(1)
+            }
+            fn record(&self, _: &Id, _: &Record<'_>) {}
+            fn record_follows_from(&self, _: &Id, _: &Id) {}
+            fn event(&self, event: &Event<'_>) {
+                let mut msg = String::new();
+                event.record(&mut MessageVisitor(&mut msg));
+                self.events
+                    .lock()
+                    .unwrap()
+                    .push((*event.metadata().level(), msg));
+            }
+            fn enter(&self, _: &Id) {}
+            fn exit(&self, _: &Id) {}
+        }
+
+        let events: Arc<Mutex<Vec<(Level, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let sub = CaptureSubscriber {
+            events: events.clone(),
+        };
+
+        tracing::subscriber::with_default(sub, || {
+            let mock = MockCgroupOps::new();
+            let topo = mock_topo();
+            let ctx = mock_ctx(&mock, &topo);
+            let mut step_state = StepState::empty(&ctx);
+            let mut backdrop_state = BackdropState::empty(&ctx);
+            let scenario = ScenarioState::new(&mut step_state, &mut backdrop_state);
+            let start = std::time::Instant::now();
+
+            // In-range call: no saturation, no warn expected.
+            let _ = build_stimulus(&start, 0, &[], &scenario);
+            // Saturating call: must emit a warn naming the
+            // overflowing field and the offending value.
+            let _ = build_stimulus(&start, u16::MAX as usize + 1, &[], &scenario);
+        });
+
+        let captured = events.lock().unwrap();
+        let warn_hits: Vec<&String> = captured
+            .iter()
+            .filter(|(lvl, _)| *lvl == Level::WARN)
+            .map(|(_, msg)| msg)
+            .collect();
+        assert!(
+            warn_hits
+                .iter()
+                .any(|m| m.contains("step_index")
+                    && m.contains("StimulusPayload field overflowed u16")),
+            "saturation must emit a tracing::warn naming step_index; got warns: {warn_hits:?}",
+        );
+        // Sanity: no warn should fire for the in-range 0 call.
+        // Since we can't easily partition the two calls, we assert
+        // the total count is exactly one: saturating call fires
+        // once, in-range call fires zero.
+        assert_eq!(
+            warn_hits.len(),
+            1,
+            "exactly one saturation warn expected; got: {warn_hits:?}",
+        );
+    }
+
+    // -- Op variant constructor coverage --
+    //
+    // `Op` is `#[non_exhaustive]` — its doc directs downstream
+    // authors to use the per-op constructors (`Op::add_cgroup`,
+    // `Op::run_payload`, …) rather than naming variants directly so
+    // new variants can land without breaking matchers. This test is
+    // the enforcement seam: it exercises every documented constructor
+    // once AND pattern-matches the produced value against every Op
+    // variant without a wildcard arm. Either half failing catches a
+    // different regression:
+    //
+    // - A new variant added without a constructor fails the match
+    //   compilation (non-exhaustive pattern).
+    // - A new variant with a constructor but no test coverage
+    //   survives compilation but the constructor block below won't
+    //   cover it — a reviewer adding a variant + constructor must
+    //   also add a call here.
+    //
+    // The guard is build-time rather than runtime: removing the
+    // wildcard `_ =>` arm makes the rustc exhaustiveness checker
+    // own the constructor-per-variant contract.
+
+    /// Static binary-kind Payload used only to address the
+    /// `RunPayload` / `WaitPayload` / `KillPayload` constructors.
+    /// The test never spawns or runs this payload — only the
+    /// `&'static Payload` reference is consumed.
+    static CONSTRUCTOR_TEST_PAYLOAD: crate::test_support::Payload =
+        crate::test_support::Payload::binary("constructor-test", "/bin/true");
+
+    #[test]
+    fn op_constructor_coverage_is_exhaustive() {
+        let w = WorkSpec::default();
+        let constructed: Vec<Op> = vec![
+            Op::add_cgroup("a"),
+            Op::remove_cgroup("a"),
+            Op::set_cpuset("a", CpusetSpec::Llc(0)),
+            Op::clear_cpuset("a"),
+            Op::swap_cpusets("a", "b"),
+            Op::spawn("a", w.clone()),
+            Op::stop_cgroup("a"),
+            Op::set_affinity("a", AffinityIntent::Inherit),
+            Op::spawn_host(w.clone()),
+            Op::move_all_tasks("a", "b"),
+            Op::run_payload(&CONSTRUCTOR_TEST_PAYLOAD, Vec::new()),
+            Op::run_payload_in_cgroup(&CONSTRUCTOR_TEST_PAYLOAD, Vec::new(), "a"),
+            Op::wait_payload("constructor-test"),
+            Op::wait_payload_in_cgroup("constructor-test", "a"),
+            Op::kill_payload("constructor-test"),
+            Op::kill_payload_in_cgroup("constructor-test", "a"),
+            Op::freeze_cgroup("a"),
+            Op::unfreeze_cgroup("a"),
+        ];
+
+        // Track which variants we observed. Adding a variant to `Op`
+        // without a constructor call above leaves one slot `false`,
+        // and adding a variant without a match arm below fails to
+        // compile (no `_ =>` on purpose).
+        let mut seen = [false; 15];
+        for op in &constructed {
+            let idx = match op {
+                Op::AddCgroup { .. } => 0,
+                Op::RemoveCgroup { .. } => 1,
+                Op::SetCpuset { .. } => 2,
+                Op::ClearCpuset { .. } => 3,
+                Op::SwapCpusets { .. } => 4,
+                Op::Spawn { .. } => 5,
+                Op::StopCgroup { .. } => 6,
+                Op::SetAffinity { .. } => 7,
+                Op::SpawnHost { .. } => 8,
+                Op::MoveAllTasks { .. } => 9,
+                Op::RunPayload { .. } => 10,
+                Op::WaitPayload { .. } => 11,
+                Op::KillPayload { .. } => 12,
+                Op::FreezeCgroup { .. } => 13,
+                Op::UnfreezeCgroup { .. } => 14,
+            };
+            seen[idx] = true;
+        }
+
+        let missing: Vec<usize> = seen
+            .iter()
+            .enumerate()
+            .filter(|(_, hit)| !**hit)
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "Op variant discriminants with no constructor coverage: {missing:?}. \
+             Every Op variant must have a public constructor under impl Op per the \
+             non_exhaustive convention documented on the enum.",
+        );
+    }
+
+    #[test]
+    fn cpuset_spec_constructor_coverage_is_exhaustive() {
+        let constructed = [
+            CpusetSpec::llc(0),
+            CpusetSpec::numa(0),
+            CpusetSpec::range(0.0, 1.0),
+            CpusetSpec::disjoint(0, 2),
+            CpusetSpec::overlap(0, 2, 0.25),
+            CpusetSpec::exact([0usize]),
+        ];
+        let mut seen = [false; 6];
+        for spec in &constructed {
+            let idx = match spec {
+                CpusetSpec::Llc(_) => 0,
+                CpusetSpec::Numa(_) => 1,
+                CpusetSpec::Range { .. } => 2,
+                CpusetSpec::Disjoint { .. } => 3,
+                CpusetSpec::Overlap { .. } => 4,
+                CpusetSpec::Exact(_) => 5,
+            };
+            seen[idx] = true;
+        }
+        assert!(
+            seen.iter().all(|s| *s),
+            "every CpusetSpec variant must have a matching constructor, seen={seen:?}",
+        );
+    }
+
+    // -- CgroupDef cgroup-v2 resource builders -----------------------
+
+    /// `.cpu_quota_pct(50)` populates `cpu.max_quota_us = 50_000`
+    /// with the default 100 ms period. Pins the percentage-to-µs
+    /// conversion factor so a future refactor that shifts to
+    /// nanoseconds trips this test.
+    #[test]
+    fn cgroup_def_cpu_quota_pct_uses_100ms_period_and_correct_quota() {
+        let def = CgroupDef::named("cg_a").cpu_quota_pct(50);
+        let cpu = def.cpu.expect("cpu_quota_pct must populate `cpu`");
+        assert_eq!(cpu.max_quota_us, Some(50_000));
+        assert_eq!(cpu.max_period_us, 100_000);
+        assert!(cpu.weight.is_none(), "weight must remain unset");
+    }
+
+    /// `.cpu_quota(quota, period)` accepts arbitrary Durations and
+    /// converts to microseconds.
+    #[test]
+    fn cgroup_def_cpu_quota_accepts_explicit_durations() {
+        let def =
+            CgroupDef::named("cg_a").cpu_quota(Duration::from_micros(7_500), Duration::from_millis(10));
+        let cpu = def.cpu.unwrap();
+        assert_eq!(cpu.max_quota_us, Some(7_500));
+        assert_eq!(cpu.max_period_us, 10_000);
+    }
+
+    /// `.cpu_unlimited()` clears the quota but preserves `weight`.
+    /// Pins the "weight survives clear" guarantee documented on
+    /// the builder.
+    #[test]
+    fn cgroup_def_cpu_unlimited_clears_quota_keeps_weight() {
+        let def = CgroupDef::named("cg_a")
+            .cpu_quota_pct(80)
+            .cpu_weight(200)
+            .cpu_unlimited();
+        let cpu = def.cpu.unwrap();
+        assert!(cpu.max_quota_us.is_none());
+        assert_eq!(cpu.max_period_us, 100_000);
+        assert_eq!(cpu.weight, Some(200));
+    }
+
+    /// All three memory builders compose into a single MemoryLimits.
+    #[test]
+    fn cgroup_def_memory_builders_compose() {
+        let def = CgroupDef::named("cg_a")
+            .memory_max(1_000_000)
+            .memory_high(800_000)
+            .memory_low(400_000);
+        let m = def.memory.unwrap();
+        assert_eq!(m.max, Some(1_000_000));
+        assert_eq!(m.high, Some(800_000));
+        assert_eq!(m.low, Some(400_000));
+    }
+
+    /// `.memory_unlimited()` resets every memory knob to None,
+    /// undoing prior `.memory_max/high/low` calls.
+    #[test]
+    fn cgroup_def_memory_unlimited_clears_all_three() {
+        let def = CgroupDef::named("cg_a")
+            .memory_max(1_000_000)
+            .memory_high(800_000)
+            .memory_low(400_000)
+            .memory_unlimited();
+        let m = def.memory.unwrap();
+        assert!(m.max.is_none());
+        assert!(m.high.is_none());
+        assert!(m.low.is_none());
+    }
+
+    /// `.io_weight(N)` populates the IoLimits.
+    #[test]
+    fn cgroup_def_io_weight_populates() {
+        let def = CgroupDef::named("cg_a").io_weight(750);
+        assert_eq!(def.io.unwrap().weight, Some(750));
+    }
+
+    /// `.with_cpuset_mems(nodes)` populates the new field without
+    /// disturbing the cpuset.cpus side.
+    #[test]
+    fn cgroup_def_with_cpuset_mems_populates_independent_field() {
+        let nodes: BTreeSet<usize> = [0usize, 1].into_iter().collect();
+        let def = CgroupDef::named("cg_a").with_cpuset_mems(nodes.clone());
+        assert_eq!(def.cpuset_mems, Some(nodes));
+        assert!(def.cpuset.is_none());
+    }
+
+    // -- apply_setup wires builder values to CgroupOps calls ----------
+    //
+    // These tests drive `apply_setup` against a `MockCgroupOps` that
+    // records every call into the existing `CgroupCall` enum, then
+    // assert on the recorded sequence. The apply_setup site emits
+    // the new resource-control writes between cpuset assignment and
+    // worker spawn, so the tests pin both presence (the calls fire)
+    // and ordering (cpu/memory/io land BEFORE move_tasks so the
+    // limits are in effect when workers join).
+
+    /// A bare CgroupDef with `.cpu_quota_pct(50)` records exactly
+    /// one SetCpuMax call with the converted u64 quota and the
+    /// default 100 ms period.
+    #[test]
+    fn apply_setup_records_set_cpu_max_for_cpu_quota_pct_builder() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        let defs = vec![CgroupDef::named("cg_cap").cpu_quota_pct(75)];
+        apply_setup_test(&ctx, &mut state, &defs).expect("apply_setup must succeed");
+        let calls = mock.calls();
+        assert!(
+            calls.contains(&CgroupCall::SetCpuMax(
+                "cg_cap".to_string(),
+                Some(75_000),
+                100_000,
+            )),
+            "expected SetCpuMax(cg_cap, Some(75000), 100000); got {calls:?}",
+        );
+        cleanup_state(&mut state);
+    }
+
+    /// `.memory_max(N)` records SetMemoryMax(Some(N)) AND clears
+    /// the unset high/low to None — the apply_setup loop emits all
+    /// three writes whenever the `memory` field is `Some` so a
+    /// prior cgroup's residue can't bleed through.
+    #[test]
+    fn apply_setup_records_three_memory_writes_when_memory_field_set() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        let defs = vec![CgroupDef::named("cg_mem").memory_max(1_000_000)];
+        apply_setup_test(&ctx, &mut state, &defs).expect("apply_setup must succeed");
+        let calls = mock.calls();
+        let max_idx = calls
+            .iter()
+            .position(|c| matches!(c, CgroupCall::SetMemoryMax(n, _) if n == "cg_mem"))
+            .expect("SetMemoryMax must fire");
+        let high_idx = calls
+            .iter()
+            .position(|c| matches!(c, CgroupCall::SetMemoryHigh(n, _) if n == "cg_mem"))
+            .expect("SetMemoryHigh must fire");
+        let low_idx = calls
+            .iter()
+            .position(|c| matches!(c, CgroupCall::SetMemoryLow(n, _) if n == "cg_mem"))
+            .expect("SetMemoryLow must fire");
+        assert!(
+            max_idx < high_idx && high_idx < low_idx,
+            "memory writes must land in (max, high, low) order; got max={max_idx} high={high_idx} low={low_idx}",
+        );
+        // Specific values: max=Some, high=None (writes "max"),
+        // low=None (writes "0") — pin both the SET and the
+        // implicit-clear.
+        assert!(
+            calls.contains(&CgroupCall::SetMemoryMax("cg_mem".to_string(), Some(1_000_000))),
+        );
+        assert!(calls.contains(&CgroupCall::SetMemoryHigh("cg_mem".to_string(), None)));
+        assert!(calls.contains(&CgroupCall::SetMemoryLow("cg_mem".to_string(), None)));
+        cleanup_state(&mut state);
+    }
+
+    /// Ordering pin: every resource-control write MUST land before
+    /// the first MoveTasks for the same cgroup so workers join an
+    /// already-configured environment. Reverse ordering is a kernel
+    /// race per Documentation/admin-guide/cgroup-v2.rst — tasks
+    /// admitted before cpuset.mems is set may fail allocation per
+    /// `cpuset_update_task_spread`.
+    #[test]
+    fn apply_setup_resource_writes_land_before_move_tasks() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        let mems: BTreeSet<usize> = [0usize].into_iter().collect();
+        let defs = vec![
+            CgroupDef::named("cg_full")
+                .with_cpuset_mems(mems)
+                .cpu_quota_pct(40)
+                .cpu_weight(200)
+                .memory_max(2_000_000)
+                .io_weight(150),
+        ];
+        apply_setup_test(&ctx, &mut state, &defs).expect("apply_setup must succeed");
+        let calls = mock.calls();
+        let move_idx = calls
+            .iter()
+            .position(|c| matches!(c, CgroupCall::MoveTasks(n, _) if n == "cg_full"));
+        // No workers here means no MoveTasks — but every resource
+        // write must still appear, in the documented order. Pin
+        // each kind's presence and then assert the inter-kind
+        // ordering relative to the (possibly absent) MoveTasks.
+        let kinds: Vec<usize> = calls
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| match c {
+                CgroupCall::SetCpusetMems(n, _) if n == "cg_full" => Some(i),
+                CgroupCall::SetCpuMax(n, _, _) if n == "cg_full" => Some(i),
+                CgroupCall::SetCpuWeight(n, _) if n == "cg_full" => Some(i),
+                CgroupCall::SetMemoryMax(n, _) if n == "cg_full" => Some(i),
+                CgroupCall::SetMemoryHigh(n, _) if n == "cg_full" => Some(i),
+                CgroupCall::SetMemoryLow(n, _) if n == "cg_full" => Some(i),
+                CgroupCall::SetIoWeight(n, _) if n == "cg_full" => Some(i),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            kinds.len() >= 7,
+            "expected at least 7 resource writes (mems + cpu.max + cpu.weight + 3 memory + io.weight); got {} ({calls:?})",
+            kinds.len(),
+        );
+        if let Some(mi) = move_idx {
+            assert!(
+                kinds.iter().all(|k| *k < mi),
+                "every resource write must precede MoveTasks; kinds={kinds:?} move_idx={mi}",
+            );
+        }
+        cleanup_state(&mut state);
+    }
+
+    /// `cpu.weight = 0` (out of kernel range 1..=10000) MUST be
+    /// rejected at apply_setup with a clear error message naming
+    /// the cgroup and the offending value.
+    #[test]
+    fn apply_setup_rejects_cpu_weight_out_of_range() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        let defs = vec![CgroupDef::named("cg_bad").cpu_weight(0)];
+        let err = apply_setup_test(&ctx, &mut state, &defs)
+            .err()
+            .expect("apply_setup must reject weight=0");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("cg_bad") && msg.contains("cpu.weight"),
+            "error must name cgroup and field; got: {msg}",
+        );
+        cleanup_state(&mut state);
+    }
+
+    /// `cpu.max` with `period_us = 0` MUST be rejected — the
+    /// kernel writes `quota period` and divide-by-zero in the CFS
+    /// scheduler is a guaranteed bug.
+    #[test]
+    fn apply_setup_rejects_cpu_max_period_zero() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        let defs = vec![
+            CgroupDef::named("cg_bad")
+                .cpu_quota(Duration::from_millis(50), Duration::ZERO),
+        ];
+        let err = apply_setup_test(&ctx, &mut state, &defs)
+            .err()
+            .expect("apply_setup must reject period=0");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("cg_bad") && msg.contains("period"),
+            "error must name cgroup and period; got: {msg}",
+        );
+        cleanup_state(&mut state);
+    }
+
+    // -- pids.max + memory.swap.max + cgroup.freeze ------------------
+
+    /// `.memory_swap_max(bytes)` populates the swap_max field on the
+    /// MemoryLimits inner; `.memory_swap_unlimited()` clears it back
+    /// to None. Mirrors the cpu_quota_pct / cpu_unlimited convention.
+    #[test]
+    fn cgroup_def_memory_swap_max_builder_round_trip() {
+        let d = CgroupDef::named("cg_a").memory_swap_max(2 * 1024 * 1024);
+        assert_eq!(d.memory.as_ref().unwrap().swap_max, Some(2 * 1024 * 1024));
+
+        let d = d.memory_swap_unlimited();
+        assert_eq!(d.memory.as_ref().unwrap().swap_max, None);
+    }
+
+    /// `memory_swap_unlimited()` on a fresh CgroupDef (no prior
+    /// `memory_*` calls) MUST NOT inflate `self.memory` from `None`
+    /// to `Some(MemoryLimits::default())` — that would trigger 3
+    /// unwanted apply_setup writes (`memory.max`, `memory.high`,
+    /// `memory.low`) for a user who only asked to clear the swap
+    /// cap. Pin the no-op short-circuit so a regression that drops
+    /// the `if let Some` guard surfaces here.
+    #[test]
+    fn cgroup_def_memory_swap_unlimited_on_fresh_def_is_noop() {
+        let d = CgroupDef::named("cg_a").memory_swap_unlimited();
+        assert!(
+            d.memory.is_none(),
+            "memory_swap_unlimited() on a fresh CgroupDef must leave \
+             self.memory == None; got: {:?}",
+            d.memory,
+        );
+    }
+
+    /// `memory_unlimited()` then `memory_swap_unlimited()` — the
+    /// chain cln-preread flagged. memory_unlimited sets
+    /// `self.memory = Some(MemoryLimits::default())` (already has
+    /// `swap_max = None`); the subsequent memory_swap_unlimited
+    /// must not redundantly recreate the MemoryLimits. After both
+    /// calls, the inner is `Some(default)` with all four knobs
+    /// `None`, mirroring memory_unlimited's intent. Pin both ends
+    /// of the chain.
+    #[test]
+    fn cgroup_def_memory_unlimited_then_swap_unlimited_is_idempotent() {
+        let d = CgroupDef::named("cg_a")
+            .memory_unlimited()
+            .memory_swap_unlimited();
+        let m = d.memory.expect("memory_unlimited installs Some(default)");
+        assert!(m.max.is_none());
+        assert!(m.high.is_none());
+        assert!(m.low.is_none());
+        assert!(m.swap_max.is_none());
+    }
+
+    /// `apply_setup` against a CgroupDef with `memory_swap_unlimited()`
+    /// alone (no other memory builders) must NOT emit any memory
+    /// writes — the no-op short-circuit keeps `self.memory == None`,
+    /// so the apply_setup `if let Some(ref mem)` block is skipped.
+    /// Without the fix, a fresh `MemoryLimits::default()` would land
+    /// in `self.memory` and fire `set_memory_max(None)` +
+    /// `set_memory_high(None)` + `set_memory_low(None)` — a silent
+    /// regression for tests that just want to clear a swap cap
+    /// inherited from a base CgroupDef factory.
+    #[test]
+    fn apply_setup_memory_swap_unlimited_on_fresh_def_emits_no_memory_writes() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        let defs = vec![CgroupDef::named("cg_swap_clear").memory_swap_unlimited()];
+        apply_setup_test(&ctx, &mut state, &defs).expect("apply_setup must succeed");
+        let calls = mock.calls();
+        assert!(
+            !calls.iter().any(|c| matches!(
+                c,
+                CgroupCall::SetMemoryMax(_, _)
+                    | CgroupCall::SetMemoryHigh(_, _)
+                    | CgroupCall::SetMemoryLow(_, _)
+                    | CgroupCall::SetMemorySwapMax(_, _)
+            )),
+            "memory_swap_unlimited() on a fresh CgroupDef must emit zero memory writes; got: {calls:?}"
+        );
+        cleanup_state(&mut state);
+    }
+
+    /// `.pids_max(n)` populates the pids field; `.pids_unlimited()`
+    /// clears it. The pids field is independent of memory/cpu/io.
+    #[test]
+    fn cgroup_def_pids_max_builder_round_trip() {
+        let d = CgroupDef::named("cg_a").pids_max(1024);
+        assert_eq!(d.pids.as_ref().unwrap().max, Some(1024));
+
+        let d = d.pids_unlimited();
+        assert_eq!(d.pids.as_ref().unwrap().max, None);
+    }
+
+    /// apply_setup with `.memory_swap_max(N)` records exactly one
+    /// SetMemorySwapMax call. swap_max defaults to None on a
+    /// MemoryLimits constructed by `memory_max` alone — pin both
+    /// shapes so a regression that always emits swap_max writes
+    /// (or never emits them) surfaces here.
+    #[test]
+    fn apply_setup_records_set_memory_swap_max() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        let defs =
+            vec![CgroupDef::named("cg_swap").memory_swap_max(4 * 1024 * 1024)];
+        apply_setup_test(&ctx, &mut state, &defs).expect("apply_setup must succeed");
+        let calls = mock.calls();
+        assert!(
+            calls.contains(&CgroupCall::SetMemorySwapMax(
+                "cg_swap".to_string(),
+                Some(4 * 1024 * 1024),
+            )),
+            "swap_max with bytes must record SetMemorySwapMax(Some(N)), got: {calls:?}",
+        );
+        cleanup_state(&mut state);
+
+        // memory_max alone: swap_max stays None — apply_setup must
+        // SKIP the SetMemorySwapMax write entirely. memory.swap.max
+        // only exists on CONFIG_SWAP kernels; the per-knob
+        // explicit-set semantics (write only when the user opted in)
+        // keeps swap-disabled kernels viable for tests that just set
+        // memory_max. This mirrors the pids block's "only write when
+        // pids.max.is_some()" gate.
+        let mock = MockCgroupOps::new();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        let defs = vec![CgroupDef::named("cg_nosw").memory_max(1_000_000)];
+        apply_setup_test(&ctx, &mut state, &defs).expect("apply_setup must succeed");
+        let calls = mock.calls();
+        assert!(
+            !calls.iter().any(|c| matches!(
+                c,
+                CgroupCall::SetMemorySwapMax(n, _) if n == "cg_nosw",
+            )),
+            "memory_max-only must NOT record SetMemorySwapMax (would \
+             ENOENT on CONFIG_SWAP=n kernels); got: {calls:?}",
+        );
+        // Memory-write order pin: max → high → low. The ordering
+        // matters because max must precede high so a high-above-max
+        // user error surfaces with a clearer kernel error. swap_max
+        // is excluded from the order check here because it only
+        // emits when explicitly opted in (see test
+        // `apply_setup_orders_memory_swap_max_after_low` for the
+        // 4-write order pin).
+        let max_idx = calls
+            .iter()
+            .position(|c| matches!(c, CgroupCall::SetMemoryMax(n, _) if n == "cg_nosw"))
+            .expect("SetMemoryMax must fire");
+        let high_idx = calls
+            .iter()
+            .position(|c| matches!(c, CgroupCall::SetMemoryHigh(n, _) if n == "cg_nosw"))
+            .expect("SetMemoryHigh must fire");
+        let low_idx = calls
+            .iter()
+            .position(|c| matches!(c, CgroupCall::SetMemoryLow(n, _) if n == "cg_nosw"))
+            .expect("SetMemoryLow must fire");
+        assert!(
+            max_idx < high_idx && high_idx < low_idx,
+            "memory writes must land in (max, high, low) order; \
+             got max={max_idx} high={high_idx} low={low_idx}",
+        );
+        cleanup_state(&mut state);
+    }
+
+    /// When the user opts in via `.memory_swap_max(N)`, apply_setup
+    /// emits SetMemorySwapMax AFTER the max/high/low triple. Pins the
+    /// 4-write order across the full memory block so a regression
+    /// that re-orders swap_max relative to the other knobs surfaces
+    /// here. Distinct from `apply_setup_records_set_memory_swap_max`
+    /// which pins presence/absence under the swap-disabled-kernel
+    /// gate; this test pins ordering under the swap-enabled path.
+    #[test]
+    fn apply_setup_orders_memory_swap_max_after_low() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        let defs = vec![
+            CgroupDef::named("cg_full_mem")
+                .memory_max(2_000_000)
+                .memory_high(1_500_000)
+                .memory_low(500_000)
+                .memory_swap_max(8 * 1024 * 1024),
+        ];
+        apply_setup_test(&ctx, &mut state, &defs).expect("apply_setup must succeed");
+        let calls = mock.calls();
+        let max_idx = calls
+            .iter()
+            .position(|c| matches!(c, CgroupCall::SetMemoryMax(n, _) if n == "cg_full_mem"))
+            .expect("SetMemoryMax must fire");
+        let high_idx = calls
+            .iter()
+            .position(|c| matches!(c, CgroupCall::SetMemoryHigh(n, _) if n == "cg_full_mem"))
+            .expect("SetMemoryHigh must fire");
+        let low_idx = calls
+            .iter()
+            .position(|c| matches!(c, CgroupCall::SetMemoryLow(n, _) if n == "cg_full_mem"))
+            .expect("SetMemoryLow must fire");
+        let swap_idx = calls
+            .iter()
+            .position(|c| matches!(c, CgroupCall::SetMemorySwapMax(n, _) if n == "cg_full_mem"))
+            .expect("SetMemorySwapMax must fire when swap_max is opted in");
+        assert!(
+            max_idx < high_idx && high_idx < low_idx && low_idx < swap_idx,
+            "memory writes must land in (max, high, low, swap_max) order; \
+             got max={max_idx} high={high_idx} low={low_idx} swap={swap_idx}",
+        );
+        cleanup_state(&mut state);
+    }
+
+    /// apply_setup with `.pids_max(N)` records SetPidsMax(Some(N)).
+    /// Without `pids` set, no SetPidsMax call is emitted.
+    #[test]
+    fn apply_setup_records_set_pids_max_only_when_set() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        let defs = vec![CgroupDef::named("cg_pids").pids_max(512)];
+        apply_setup_test(&ctx, &mut state, &defs).expect("apply_setup must succeed");
+        let calls = mock.calls();
+        assert!(
+            calls.contains(&CgroupCall::SetPidsMax("cg_pids".to_string(), Some(512))),
+            "pids_max(N) must record SetPidsMax(Some(N)), got: {calls:?}",
+        );
+        cleanup_state(&mut state);
+
+        // No pids — no SetPidsMax call.
+        let mock = MockCgroupOps::new();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        let defs = vec![CgroupDef::named("cg_nopids").memory_max(1_000_000)];
+        apply_setup_test(&ctx, &mut state, &defs).expect("apply_setup must succeed");
+        let calls = mock.calls();
+        assert!(
+            !calls.iter().any(|c| matches!(c, CgroupCall::SetPidsMax(_, _))),
+            "no SetPidsMax expected when pids field is None, got: {calls:?}",
+        );
+        cleanup_state(&mut state);
+    }
+
+    /// `pids_max(0)` must be rejected at apply_setup with a clear
+    /// error naming the cgroup and the offending value. A 0-limit
+    /// cgroup silently halts every fork inside, including the
+    /// futex-helper threads spawned by some WorkType variants —
+    /// kernel accepts it but the workload would silently halt.
+    #[test]
+    fn apply_setup_rejects_pids_max_zero() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        let defs = vec![CgroupDef::named("cg_zero").pids_max(0)];
+        let err = apply_setup_test(&ctx, &mut state, &defs)
+            .err()
+            .expect("apply_setup must reject pids_max(0)");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("cg_zero") && msg.contains("pids.max"),
+            "error must name cgroup and pids.max; got: {msg}",
+        );
+        // Pin the full diagnostic wording: the actionable hint
+        // ("must be > 0" + "pids_unlimited") is what tells a user
+        // to switch builders rather than rewrite their config.
+        // Drift in either substring makes the diagnostic less
+        // actionable; surface it here at test time, not at
+        // user-debugging time.
+        assert!(
+            msg.contains("must be > 0"),
+            "error must spell out the constraint; got: {msg}",
+        );
+        assert!(
+            msg.contains("pids_unlimited"),
+            "error must name the escape hatch (pids_unlimited()); got: {msg}",
+        );
+        cleanup_state(&mut state);
+    }
+
+    /// `Op::FreezeCgroup` against a cgroup the framework has never
+    /// created routes through `ctx.cgroups.set_freeze` and
+    /// surfaces the underlying kernel error as a step-level
+    /// failure. The MockCgroupOps double records the call but
+    /// returns Ok by default; pin the call sequence so a future
+    /// regression that swallows the FreezeCgroup op (or routes it
+    /// through a different code path that masks the error from a
+    /// real cgroupfs ENOENT) trips here. The "real" fail-on-ENOENT
+    /// path is exercised at the [`crate::cgroup`] layer's
+    /// `set_freeze_returns_err_with_enoent_when_freeze_file_missing`
+    /// test; this test pins the apply_ops dispatch shape.
+    #[test]
+    fn apply_ops_freeze_undefined_cgroup_dispatches_set_freeze() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        // The cgroup name "ghost_cg" is never declared via
+        // CgroupDef or Op::AddCgroup. apply_ops still dispatches —
+        // the framework does not gate FreezeCgroup on prior
+        // creation; the kernel is the final authority on whether
+        // the cgroup directory exists.
+        apply_ops_test(
+            &ctx,
+            &mut state,
+            &[Op::freeze_cgroup("ghost_cg")],
+        )
+        .expect("apply_ops must dispatch FreezeCgroup even for an undeclared name");
+        let calls = mock.calls();
+        assert!(
+            calls.contains(&CgroupCall::SetFreeze("ghost_cg".to_string(), true)),
+            "FreezeCgroup must reach set_freeze regardless of declaration state, got: {calls:?}"
+        );
+    }
+
+    /// `Op::FreezeCgroup` propagates the underlying ops error with
+    /// an `Op::FreezeCgroup: cgroup '<name>'` context prefix so a
+    /// failure dump names both the op and the offender. Inject an
+    /// error from the mock and verify the context chain.
+    #[test]
+    fn apply_ops_freeze_propagates_set_freeze_error_with_context() {
+        let mock = MockCgroupOps::new();
+        // Index 0 is the SetFreeze call from the FreezeCgroup op.
+        mock.fail_call_at(0, "kernel ENOENT — cgroup directory does not exist");
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        let err = apply_ops_test(
+            &ctx,
+            &mut state,
+            &[Op::freeze_cgroup("ghost_cg")],
+        )
+        .expect_err("set_freeze failure must surface as Err");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Op::FreezeCgroup") && msg.contains("ghost_cg"),
+            "error must name the op and the cgroup, got: {msg}"
+        );
+        assert!(
+            msg.contains("ENOENT"),
+            "error must propagate the underlying cause, got: {msg}"
+        );
+    }
+
+    /// `Op::FreezeCgroup` dispatches to set_freeze(true);
+    /// `Op::UnfreezeCgroup` to set_freeze(false). The mock records
+    /// both shapes verbatim so a regression that swaps the bool
+    /// surfaces here. Direct apply_ops dispatch — no workers needed.
+    #[test]
+    fn apply_ops_freeze_and_unfreeze_record_set_freeze() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        apply_ops_test(
+            &ctx,
+            &mut state,
+            &[
+                Op::freeze_cgroup("cg_x"),
+                Op::unfreeze_cgroup("cg_x"),
+            ],
+        )
+        .expect("freeze/unfreeze ops must succeed");
+        let calls = mock.calls();
+        assert!(
+            calls.contains(&CgroupCall::SetFreeze("cg_x".to_string(), true)),
+            "FreezeCgroup must dispatch SetFreeze(true), got: {calls:?}",
+        );
+        assert!(
+            calls.contains(&CgroupCall::SetFreeze("cg_x".to_string(), false)),
+            "UnfreezeCgroup must dispatch SetFreeze(false), got: {calls:?}",
+        );
+        // Sanity: the order must be (true, false) — the ops were
+        // applied in that order.
+        let true_idx = calls
+            .iter()
+            .position(|c| matches!(c, CgroupCall::SetFreeze(_, true)))
+            .expect("found freeze");
+        let false_idx = calls
+            .iter()
+            .position(|c| matches!(c, CgroupCall::SetFreeze(_, false)))
+            .expect("found unfreeze");
+        assert!(
+            true_idx < false_idx,
+            "freeze (true) must come before unfreeze (false): {calls:?}",
+        );
+        cleanup_state(&mut state);
+    }
+
+    /// `apply_setup` rejects `io.weight` outside the kernel's
+    /// `1..=10000` range BEFORE issuing the syscall. The kernel's
+    /// `cgrp_dfl_io_weight_write` parses via `kstrtouint` and
+    /// returns -ERANGE for values outside the documented bound; the
+    /// framework intercepts at apply-setup time so the operator
+    /// gets a structured error naming the offending cgroup and
+    /// value, rather than a raw ERANGE on cgroupfs.
+    ///
+    /// Pin both ends (0 and 10001) so a refactor that loosens the
+    /// check in either direction surfaces here.
+    #[test]
+    fn apply_setup_rejects_io_weight_out_of_range() {
+        for (weight, label) in [(0u16, "zero"), (10_001u16, "above-max")] {
+            let mock = MockCgroupOps::new();
+            let topo = mock_topo();
+            let ctx = mock_ctx(&mock, &topo);
+            let mut state = StepState::empty(&ctx);
+            let defs = vec![CgroupDef::named("cg_io").io_weight(weight)];
+            let err = apply_setup_test(&ctx, &mut state, &defs)
+                .expect_err(&format!("io.weight={weight} ({label}) must reject"));
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("io.weight") && msg.contains("out of range"),
+                "error must name the offending knob and constraint; got: {msg}",
+            );
+            assert!(
+                msg.contains("cg_io"),
+                "error must name the offending cgroup; got: {msg}",
+            );
+            // The reject must fire BEFORE the kernel write — no
+            // SetIoWeight call should have been recorded.
+            let calls = mock.calls();
+            assert!(
+                !calls
+                    .iter()
+                    .any(|c| matches!(c, CgroupCall::SetIoWeight(n, _) if n == "cg_io")),
+                "rejected weight must not reach the cgroupfs write: {calls:?}",
+            );
+            cleanup_state(&mut state);
+        }
+    }
+
+    /// Range boundary acceptance: `io.weight=1` and `io.weight=10000`
+    /// (the kernel's documented endpoints) MUST be accepted by the
+    /// framework's range gate. Pinned alongside the rejection test so
+    /// a future refactor that flips a `<` to `<=` (or vice versa)
+    /// breaks one of the two tests instead of silently widening or
+    /// narrowing the accepted set.
+    #[test]
+    fn apply_setup_accepts_io_weight_range_endpoints() {
+        for weight in [1u16, 10_000u16] {
+            let mock = MockCgroupOps::new();
+            let topo = mock_topo();
+            let ctx = mock_ctx(&mock, &topo);
+            let mut state = StepState::empty(&ctx);
+            let defs = vec![CgroupDef::named("cg_io").io_weight(weight)];
+            apply_setup_test(&ctx, &mut state, &defs).unwrap_or_else(|e| {
+                panic!("io.weight={weight} (boundary) must be accepted: {e:#}")
+            });
+            let calls = mock.calls();
+            assert!(
+                calls.contains(&CgroupCall::SetIoWeight("cg_io".to_string(), weight)),
+                "boundary weight must reach the cgroupfs write; got: {calls:?}",
+            );
+            cleanup_state(&mut state);
+        }
+    }
+
+    /// Empty `works` substitution: a `CgroupDef` declared without a
+    /// `.work(...)` or `.workload(...)` call falls back to a single
+    /// default `WorkSpec` (SpinWait, Normal, ctx.workers_per_cgroup
+    /// workers) at apply-setup time. Pin the substitution by
+    /// asserting that workers were spawned and migrated into the
+    /// cgroup — without the fallback, no MoveTasks call would fire
+    /// and the cgroup would sit empty.
+    ///
+    /// The tests above (e.g. `apply_setup_creates_cgroup_per_def`)
+    /// drive `CgroupDef::named` directly without a workload; this
+    /// test pins the fallback explicitly with a comment naming the
+    /// invariant so a future refactor that drops the default-work
+    /// substitution surfaces here with a clear failure message
+    /// rather than a generic "no MoveTasks" symptom.
+    #[test]
+    fn apply_setup_substitutes_default_workspec_when_works_empty() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        // No .work(...) and no .workload(...) — empty `works` vec.
+        let def = CgroupDef::named("cg_default_work");
+        assert!(
+            def.works.is_empty(),
+            "test premise: CgroupDef without .work() must start with empty works",
+        );
+        apply_setup_test(&ctx, &mut state, &[def])
+            .expect("apply_setup with default-work substitution must succeed");
+        let calls = mock.calls();
+        // The substitution surfaces as a real worker spawn → at
+        // least one MoveTasks call into the cgroup with a non-zero
+        // pid count. MoveTasks records the count (usize) rather
+        // than the Vec; matching `count > 0` pins both the call
+        // presence and the fact that the spawned workload had
+        // workers to migrate.
+        assert!(
+            calls.iter().any(|c| matches!(
+                c,
+                CgroupCall::MoveTasks(name, count) if name == "cg_default_work" && *count > 0
+            )),
+            "default-WorkSpec substitution must spawn workers and migrate them into the \
+             cgroup; without it the empty `works` would leave the cgroup taskless. \
+             Got: {calls:?}",
+        );
+        cleanup_state(&mut state);
+    }
+}
