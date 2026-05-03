@@ -6,7 +6,7 @@ use crate::vmm::topology::Topology;
 //
 // Field layout per arch/x86/include/asm/perf_event.h:
 //   union cpuid10_eax { version_id:8, num_counters:8, bit_width:8, mask_length:8 }
-//   union cpuid10_edx { num_counters_fixed:5, bit_width_fixed:8, reserved:19 }
+//   union cpuid10_edx { num_counters_fixed:5, bit_width_fixed:8, reserved1:2, anythread_deprecated:1, reserved2:16 }
 //
 // We synthesize a conservative PMU v2 surface so guest sched_ext
 // schedulers (scx_layered, scx_cosmos) get usable perf counters
