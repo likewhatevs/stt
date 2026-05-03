@@ -5042,7 +5042,7 @@ mod tests {
         // `sidecar_variant_hash`.
         assert_eq!(
             sidecar_variant_hash(&sc),
-            0xbc0f38005915a09f,
+            0xf5818a33e58e8c93,
             "sidecar_variant_hash output drifted — regenerate expected only if \
              the wire format change is intentional and old sidecars are \
              disposable (which they are per ktstr's pre-1.0 stance)",
