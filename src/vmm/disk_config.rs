@@ -84,6 +84,9 @@ impl Filesystem {
 /// 5-second-equivalent burst from a full bucket). A burst capacity
 /// without a corresponding rate is meaningless (a bucket that never
 /// refills); [`DiskThrottle::validate`] rejects it.
+///
+/// Throttle exhaustion stalls the request internally and retries via
+/// a timer — it is not surfaced to the guest as `VIRTIO_BLK_S_IOERR`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct DiskThrottle {
     /// Maximum operations per second (1 read = 1 op, 1 write = 1
@@ -105,6 +108,11 @@ pub struct DiskThrottle {
     /// would discard refilled tokens immediately and effectively
     /// reduce the steady-state rate); [`DiskThrottle::validate`]
     /// enforces this. Has no effect when `iops` is `None`.
+    ///
+    /// Values above `i64::MAX` are accepted but the `TokenBucket`
+    /// seed is clamped to `i64::MAX` at construction — the effective
+    /// initial burst is ~9.2 quintillion, immaterial for realistic
+    /// settings.
     pub iops_burst_capacity: Option<NonZeroU64>,
     /// Bandwidth bucket capacity (peak burst, in bytes). When
     /// `None`, capacity equals the `bytes_per_sec` refill rate

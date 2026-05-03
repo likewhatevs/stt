@@ -6985,6 +6985,119 @@ mod tests {
         assert_eq!(b.topology.total_cpus(), 1);
     }
 
+    /// `Filesystem::Raw` disks emit no auto-mount cmdline tokens.
+    /// The host has nothing to advertise: no on-disk fs to mount,
+    /// the guest sees an unformatted `/dev/vda` and the
+    /// `auto_mount_data_disks` short-circuits at the absent
+    /// `KTSTR_DISK0_FS` check. Pin the empty-string contract so a
+    /// future regression that emits Raw-disk tokens (e.g. for a
+    /// "mount as raw block device" feature) surfaces here loudly.
+    #[test]
+    fn disk_auto_mount_cmdline_tokens_raw_emits_nothing() {
+        let disk = disk_config::DiskConfig::default();
+        assert_eq!(disk.filesystem, disk_config::Filesystem::Raw);
+        assert_eq!(disk_auto_mount_cmdline_tokens(&disk), "");
+    }
+
+    /// `Filesystem::Btrfs` with no name and no read_only emits the
+    /// FS + MOUNT pair only — no RO token. Default mount path is
+    /// `/mnt/disk0` (driven by `auto_mount_path()` returning the
+    /// disk0 fallback when `name` is `None`). The leading space
+    /// is the cmdline-concatenation contract: callers paste the
+    /// returned string directly.
+    #[test]
+    fn disk_auto_mount_cmdline_tokens_btrfs_default() {
+        let disk = disk_config::DiskConfig::default()
+            .filesystem(disk_config::Filesystem::Btrfs);
+        assert_eq!(
+            disk_auto_mount_cmdline_tokens(&disk),
+            " KTSTR_DISK0_FS=btrfs KTSTR_DISK0_MOUNT=/mnt/disk0",
+        );
+    }
+
+    /// Named `Filesystem::Btrfs` disk emits the name-driven mount
+    /// path `/mnt/<name>` instead of `/mnt/disk0`. Pin the name
+    /// → mount-path translation so a future `auto_mount_path`
+    /// regression (e.g. dropping the name and reverting to fixed
+    /// /mnt/disk0) surfaces here.
+    #[test]
+    fn disk_auto_mount_cmdline_tokens_btrfs_named() {
+        let disk = disk_config::DiskConfig::default()
+            .filesystem(disk_config::Filesystem::Btrfs)
+            .name("data");
+        assert_eq!(
+            disk_auto_mount_cmdline_tokens(&disk),
+            " KTSTR_DISK0_FS=btrfs KTSTR_DISK0_MOUNT=/mnt/data",
+        );
+    }
+
+    /// Read-only Btrfs disk emits the RO token in addition to FS
+    /// + MOUNT. The guest's `auto_mount_data_disks` checks
+    /// `KTSTR_DISK0_RO == "1"` and sets `MS_RDONLY` to avoid the
+    /// kernel-side -EROFS path on RW mount of a F_RO bdev.
+    #[test]
+    fn disk_auto_mount_cmdline_tokens_btrfs_read_only() {
+        let disk = disk_config::DiskConfig::default()
+            .filesystem(disk_config::Filesystem::Btrfs)
+            .read_only();
+        assert_eq!(
+            disk_auto_mount_cmdline_tokens(&disk),
+            " KTSTR_DISK0_FS=btrfs KTSTR_DISK0_MOUNT=/mnt/disk0 KTSTR_DISK0_RO=1",
+        );
+    }
+
+    /// `no_auto_mount` opt-out suppresses every auto-mount token,
+    /// even for a Btrfs disk that would otherwise emit them. The
+    /// host-side mkfs still happens (Filesystem::Btrfs drives the
+    /// template-cache lifecycle); only the guest auto-mount is
+    /// skipped, leaving raw `/dev/vda` access to the test author.
+    #[test]
+    fn disk_auto_mount_cmdline_tokens_no_auto_mount_suppresses() {
+        let disk = disk_config::DiskConfig::default()
+            .filesystem(disk_config::Filesystem::Btrfs)
+            .no_auto_mount();
+        assert_eq!(disk_auto_mount_cmdline_tokens(&disk), "");
+
+        // RO + named + no_auto_mount: still empty. The opt-out
+        // dominates every other config dimension.
+        let disk = disk_config::DiskConfig::default()
+            .filesystem(disk_config::Filesystem::Btrfs)
+            .name("data")
+            .read_only()
+            .no_auto_mount();
+        assert_eq!(disk_auto_mount_cmdline_tokens(&disk), "");
+    }
+
+    /// Raw disk + no_auto_mount: still empty. The Raw branch is
+    /// the gate; no_auto_mount is only meaningful for non-Raw
+    /// filesystems but the function tolerates the redundant
+    /// combination.
+    #[test]
+    fn disk_auto_mount_cmdline_tokens_raw_with_no_auto_mount() {
+        let disk = disk_config::DiskConfig::default().no_auto_mount();
+        assert_eq!(disk.filesystem, disk_config::Filesystem::Raw);
+        assert_eq!(disk_auto_mount_cmdline_tokens(&disk), "");
+    }
+
+    /// Pin the leading-space cmdline-concatenation contract. The
+    /// returned tokens MUST start with a space when non-empty so
+    /// they can be appended directly to the cmdline buffer in
+    /// `KtstrVmBuilder::build`. A regression that drops the
+    /// leading space would create a glued-together token like
+    /// `virtio_mmio.device=...KTSTR_DISK0_FS=btrfs` which the
+    /// kernel cmdline parser would mis-classify as a single token.
+    #[test]
+    fn disk_auto_mount_cmdline_tokens_starts_with_space() {
+        let disk = disk_config::DiskConfig::default()
+            .filesystem(disk_config::Filesystem::Btrfs);
+        let s = disk_auto_mount_cmdline_tokens(&disk);
+        assert!(
+            s.starts_with(' '),
+            "non-empty tokens must start with a space for safe \
+             cmdline concatenation; got {s:?}",
+        );
+    }
+
     /// Pin the millisecond-precision Duration→jiffies conversion.
     /// Sub-second inputs must NOT truncate to 0 (the bug that masked
     /// the freeze-coord early trigger before this helper existed),

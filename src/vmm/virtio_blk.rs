@@ -490,13 +490,16 @@ struct TokenBucket {
     /// Current token balance. `i64` (not `u64`) so an oversized
     /// `consume(n > capacity)` can drive the balance negative
     /// rather than re-stall forever. Range invariant:
-    /// `i64::MIN <= available <= i64::try_from(capacity).unwrap_or(i64::MAX)`.
-    /// The lower bound is `i64::MIN` because `consume`'s
-    /// `saturating_sub` floors at the type minimum on a
-    /// pathological-`n` subtraction. Negative values represent
-    /// debt accumulated by a prior overconsume; `refill()`
-    /// monotonically pays it down at `refill_rate`. See the
-    /// type-level "Overconsumption" doc for the full policy.
+    /// `i64::MIN + 1 <= available <= i64::try_from(capacity).unwrap_or(i64::MAX)`.
+    /// The reachable lower bound is `i64::MIN + 1` (driven by
+    /// `0.saturating_sub(i64::MAX)` when an `available == 0`
+    /// overconsume hits the largest `n_signed` that the consume
+    /// gate accepts). `i64::MIN` itself is unreachable from the
+    /// consume gate but is handled defensively by `saturating_sub`.
+    /// Negative values represent debt accumulated by a prior
+    /// overconsume; `refill()` monotonically pays it down at
+    /// `refill_rate`. See the type-level "Overconsumption" doc for
+    /// the full policy.
     available: i64,
     last_refill: Instant,
     unlimited: bool,
