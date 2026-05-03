@@ -764,6 +764,7 @@ impl<'a> Ctx<'a> {
     /// Start a new [`CtxBuilder`] with required `cgroups` and `topo`
     /// borrows and sane defaults for every other field. See
     /// [`CtxBuilder`] for the full default set.
+    #[must_use = "discarding a CtxBuilder drops the scenario context defaults; chain setters and call .build()"]
     pub fn builder(
         cgroups: &'a dyn crate::cgroup::CgroupOps,
         topo: &'a TestTopology,
@@ -792,6 +793,7 @@ impl<'a> Ctx<'a> {
     ///
     /// Only `PayloadKind::Binary` payloads are runnable here;
     /// `.run()` on a `PayloadKind::Scheduler` payload returns `Err`.
+    #[must_use = "dropping a PayloadRun discards the payload configuration; chain setters and call .run()"]
     pub fn payload(
         &'a self,
         p: &'static crate::test_support::Payload,

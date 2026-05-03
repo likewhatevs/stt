@@ -118,6 +118,7 @@ impl Backdrop {
 
     /// Fresh Backdrop builder. Reads naturally in chain position:
     /// `Backdrop::new().with_cgroup(...).with_payload(...)`.
+    #[must_use = "dropping a Backdrop discards the scenario layout"]
     pub fn new() -> Self {
         Backdrop::EMPTY
     }
@@ -126,12 +127,14 @@ impl Backdrop {
     /// created before the first Step runs and removed after the
     /// last Step tears down. Steps reference it by name via
     /// `Op::MoveAllTasks` / `Op::SetCpuset` / etc.
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn with_cgroup(mut self, def: CgroupDef) -> Self {
         self.cgroups.push(def);
         self
     }
 
     /// Add several persistent cgroups at once.
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn with_cgroups<I: IntoIterator<Item = CgroupDef>>(mut self, defs: I) -> Self {
         self.cgroups.extend(defs);
         self
@@ -149,6 +152,7 @@ impl Backdrop {
     /// or `Op::run_payload_in_cgroup(...)` — both spawn through the
     /// same pipeline as this shorthand but expose the full argument
     /// and placement surface that [`Op::RunPayload`] carries.
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn with_payload(mut self, payload: &'static Payload) -> Self {
         self.payloads.push(payload);
         self
@@ -159,6 +163,7 @@ impl Backdrop {
     /// contract — every element follows the same no-custom-args
     /// rule, so pass `with_op(Op::run_payload(..))` entries via
     /// [`Self::with_ops`] when per-payload args are required.
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn with_payloads<I: IntoIterator<Item = &'static Payload>>(mut self, payloads: I) -> Self {
         self.payloads.extend(payloads);
         self
@@ -175,6 +180,7 @@ impl Backdrop {
     /// target slot active so any cgroup / handle / payload they
     /// create is tracked by the Backdrop and survives every Step's
     /// teardown.
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn with_op(mut self, op: Op) -> Self {
         self.ops.push(op);
         self
@@ -182,6 +188,7 @@ impl Backdrop {
 
     /// Append several raw [`Op`]s at once. See [`Self::with_op`]
     /// for the ordering and routing contract.
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn with_ops<I: IntoIterator<Item = Op>>(mut self, ops: I) -> Self {
         self.ops.extend(ops);
         self

@@ -139,12 +139,14 @@ impl<'a> PayloadRun<'a> {
     }
 
     /// Append one CLI argument to the effective argv.
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn arg(mut self, arg: impl Into<String>) -> Self {
         self.args.push(arg.into());
         self
     }
 
     /// Append multiple CLI arguments to the effective argv.
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn args<I, S>(mut self, args: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -156,12 +158,14 @@ impl<'a> PayloadRun<'a> {
 
     /// Wipe ALL args (both `payload.default_args` and any prior
     /// `.arg()` calls). Subsequent `.arg()` calls start from empty.
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn clear_args(mut self) -> Self {
         self.args.clear();
         self
     }
 
     /// Append a [`MetricCheck`] to the effective check list.
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn check(mut self, c: MetricCheck) -> Self {
         self.checks.push(c);
         self
@@ -169,6 +173,7 @@ impl<'a> PayloadRun<'a> {
 
     /// Wipe ALL checks (both `payload.default_checks` and any prior
     /// `.check()` calls).
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn clear_checks(mut self) -> Self {
         self.checks.clear();
         self
@@ -184,6 +189,7 @@ impl<'a> PayloadRun<'a> {
     ///
     /// The name is validated at `.run()`/`.spawn()` — leading `/`
     /// is stripped, `..` and NUL bytes are rejected.
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn in_cgroup(mut self, name: impl Into<Cow<'static, str>>) -> Self {
         self.cgroup = Some(name.into());
         self
@@ -202,6 +208,7 @@ impl<'a> PayloadRun<'a> {
     /// call sites read naturally, and leaves room for future
     /// knobs (per-test environment, stdin, …) without another
     /// signature break.
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn timeout(mut self, duration: Duration) -> Self {
         self.timeout = Some(duration);
         self

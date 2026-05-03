@@ -512,6 +512,7 @@ impl CgroupDef {
     /// an empty move-target cgroup with NO workers, declare it via
     /// [`Op::AddCgroup`] at step or Backdrop level instead of using
     /// a `CgroupDef`.
+    #[must_use = "dropping a CgroupDef discards the cgroup specification"]
     pub fn named(name: impl Into<Cow<'static, str>>) -> Self {
         Self {
             name: name.into(),
@@ -521,6 +522,7 @@ impl CgroupDef {
 
     /// Set the cpuset for this cgroup. Use when defining cgroups in step
     /// setup (initial topology). For mid-run cpuset changes, use [`Op::SetCpuset`].
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn with_cpuset(mut self, cpus: CpusetSpec) -> Self {
         self.cpuset = Some(cpus);
         self
@@ -528,6 +530,7 @@ impl CgroupDef {
 
     /// Add a work group. Can be called multiple times for concurrent
     /// work groups within this cgroup.
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn work(mut self, w: WorkSpec) -> Self {
         self.works.push(w);
         self
@@ -541,6 +544,7 @@ impl CgroupDef {
     }
 
     /// Set the number of workers (convenience for single WorkSpec).
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn workers(mut self, n: usize) -> Self {
         self.ensure_default_work();
         self.works[0].num_workers = Some(n);
@@ -548,6 +552,7 @@ impl CgroupDef {
     }
 
     /// Set the work type (convenience for single WorkSpec).
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn work_type(mut self, wt: WorkType) -> Self {
         self.ensure_default_work();
         self.works[0].work_type = wt;
@@ -555,6 +560,7 @@ impl CgroupDef {
     }
 
     /// Set the scheduling policy (convenience for single WorkSpec).
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn sched_policy(mut self, p: crate::workload::SchedPolicy) -> Self {
         self.ensure_default_work();
         self.works[0].sched_policy = p;
@@ -562,6 +568,7 @@ impl CgroupDef {
     }
 
     /// Set the per-worker affinity (convenience for single WorkSpec).
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn affinity(mut self, a: crate::workload::AffinityIntent) -> Self {
         self.ensure_default_work();
         self.works[0].affinity = a;
@@ -569,6 +576,7 @@ impl CgroupDef {
     }
 
     /// Set the NUMA memory placement policy (convenience for single WorkSpec).
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn mem_policy(mut self, p: crate::workload::MemPolicy) -> Self {
         self.ensure_default_work();
         self.works[0].mem_policy = p;
@@ -576,6 +584,7 @@ impl CgroupDef {
     }
 
     /// Set the NUMA memory policy mode flags (convenience for single WorkSpec).
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn mpol_flags(mut self, f: crate::workload::MpolFlags) -> Self {
         self.ensure_default_work();
         self.works[0].mpol_flags = f;
@@ -583,6 +592,7 @@ impl CgroupDef {
     }
 
     /// When true, the gauntlet work_type override replaces each WorkSpec's work type.
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn swappable(mut self, swappable: bool) -> Self {
         self.swappable = swappable;
         self
@@ -626,6 +636,7 @@ impl CgroupDef {
     /// path bail with an `anyhow::Error` instead of panicking —
     /// that path runs during scenario execution where one bad op
     /// should not crash a whole test run.
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn workload(mut self, p: &'static crate::test_support::Payload) -> Self {
         assert!(
             !p.is_scheduler(),
@@ -650,6 +661,7 @@ impl CgroupDef {
     /// The framework writes `cpuset.mems` immediately after
     /// `cpuset.cpus` so the binding is in effect before any worker
     /// is moved into the cgroup.
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn with_cpuset_mems(mut self, nodes: BTreeSet<usize>) -> Self {
         self.cpuset_mems = Some(nodes);
         self
@@ -659,6 +671,7 @@ impl CgroupDef {
     /// throughput, with a default 100 ms `period`. `100` means
     /// "one full CPU" (quota=100_000, period=100_000); `200` means
     /// "two CPUs". Use [`Self::cpu_quota`] for non-default periods.
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn cpu_quota_pct(mut self, pct: u32) -> Self {
         let cpu = self.cpu.get_or_insert_with(default_cpu_limits);
         cpu.max_period_us = 100_000;
@@ -670,6 +683,7 @@ impl CgroupDef {
     /// `period` (multi-CPU concurrency, see [`CpuLimits::max_quota_us`]).
     /// Both arguments are converted to microseconds; sub-microsecond
     /// fractions in the supplied [`Duration`]s are truncated.
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn cpu_quota(mut self, quota: Duration, period: Duration) -> Self {
         let cpu = self.cpu.get_or_insert_with(default_cpu_limits);
         cpu.max_quota_us = Some(quota.as_micros() as u64);
@@ -681,6 +695,7 @@ impl CgroupDef {
     /// leaving `cpu.weight` (if set) intact. Useful when a base
     /// CgroupDef builder applied a default cap and the test wants
     /// only weight-based bias.
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn cpu_unlimited(mut self) -> Self {
         let cpu = self.cpu.get_or_insert_with(default_cpu_limits);
         cpu.max_quota_us = None;
@@ -690,6 +705,7 @@ impl CgroupDef {
     /// Set `cpu.weight` (range 1..=10000, default 100 in the
     /// kernel). Larger values get a larger CPU share when the
     /// parent cgroup is contended. Independent of `cpu.max`.
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn cpu_weight(mut self, weight: u32) -> Self {
         let cpu = self.cpu.get_or_insert_with(default_cpu_limits);
         cpu.weight = Some(weight);
@@ -698,6 +714,7 @@ impl CgroupDef {
 
     /// Set `memory.max` hard ceiling in bytes. Crossing this
     /// triggers the cgroup OOM killer.
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn memory_max(mut self, bytes: u64) -> Self {
         let m = self.memory.get_or_insert_with(MemoryLimits::default);
         m.max = Some(bytes);
@@ -706,6 +723,7 @@ impl CgroupDef {
 
     /// Set `memory.high` soft throttle threshold in bytes.
     /// Crossing this triggers reclaim throttling but NOT OOM-kill.
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn memory_high(mut self, bytes: u64) -> Self {
         let m = self.memory.get_or_insert_with(MemoryLimits::default);
         m.high = Some(bytes);
@@ -715,6 +733,7 @@ impl CgroupDef {
     /// Set `memory.low` soft protection threshold in bytes.
     /// Reclaim prefers other cgroups before this one's memory
     /// drops below `low`.
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn memory_low(mut self, bytes: u64) -> Self {
         let m = self.memory.get_or_insert_with(MemoryLimits::default);
         m.low = Some(bytes);
@@ -725,6 +744,7 @@ impl CgroupDef {
     /// and `"0"` for low). Equivalent to leaving `memory` unset
     /// at construction; provided for symmetry with
     /// [`Self::cpu_unlimited`].
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn memory_unlimited(mut self) -> Self {
         self.memory = Some(MemoryLimits::default());
         self
@@ -734,6 +754,7 @@ impl CgroupDef {
     /// kernel). Biases relative IO share across sibling cgroups
     /// when the io controller is enabled. `io.max` per-device caps
     /// are not surfaced here — see [`IoLimits`] for the rationale.
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn io_weight(mut self, weight: u16) -> Self {
         let io = self.io.get_or_insert_with(IoLimits::default);
         io.weight = Some(weight);
@@ -846,6 +867,7 @@ pub struct Step {
 
 impl Step {
     /// Create a step with ops only (no CgroupDef setup).
+    #[must_use = "dropping a Step discards its ops and hold for that scenario phase"]
     pub fn new(ops: Vec<Op>, hold: HoldSpec) -> Self {
         Self {
             setup: Setup::Defs(vec![]),
@@ -858,6 +880,7 @@ impl Step {
     ///
     /// Most steps only need cgroup definitions and a hold duration.
     /// Use [`set_ops`](Step::set_ops) to chain ops onto the step.
+    #[must_use = "dropping a Step discards its CgroupDef setup and hold for that scenario phase"]
     pub fn with_defs(defs: Vec<CgroupDef>, hold: HoldSpec) -> Self {
         Self {
             setup: Setup::Defs(defs),
@@ -873,6 +896,7 @@ impl Step {
     /// [`Backdrop::with_ops`](crate::scenario::backdrop::Backdrop::with_ops),
     /// which appends. A chained `Step::new(ops).set_ops(more)`
     /// drops `ops` and keeps only `more`.
+    #[must_use = "builder methods consume self; bind the result"]
     pub fn set_ops(mut self, ops: Vec<Op>) -> Self {
         self.ops = ops;
         self
@@ -893,6 +917,7 @@ impl Step {
     /// should use `Op::run_payload_in_cgroup` directly; this
     /// convenience targets the common "one payload, whole step"
     /// shape.
+    #[must_use = "dropping a Step discards its payload and hold for that scenario phase"]
     pub fn with_payload(payload: &'static crate::test_support::Payload, hold: HoldSpec) -> Self {
         Self {
             setup: Setup::Defs(vec![]),
