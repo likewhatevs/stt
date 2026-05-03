@@ -744,6 +744,7 @@ impl<'a> CtxBuilder<'a> {
     }
 
     /// Materialise the configured [`Ctx`].
+    #[must_use = "dropping a Ctx without running the scenario discards the test setup"]
     pub fn build(self) -> Ctx<'a> {
         Ctx {
             cgroups: self.cgroups,
