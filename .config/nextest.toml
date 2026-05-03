@@ -141,6 +141,32 @@ filter = "test(sched_perf_)"
 test-group = "vm-perf"
 threads-required = 1
 
+# ── alu-vec512 ───────────────────────────────────────────────────────
+# AVX-512 / AMX execution triggers package-wide frequency throttle on
+# Intel: vector-heavy code drops the package's all-core frequency
+# (license-2/license-3 transitions in skylake-X-and-later) and AMX
+# tile loads add tens-of-microseconds on TILELOAD/TILEZERO. A
+# concurrent test running on the same socket sees iteration latency
+# from the throttled clock, not from the scheduler — and any
+# scheduler-latency assertion in the neighbouring test becomes
+# noisy. Serialize tests whose AluHot path may resolve to
+# `AluWidth::Vec512` or `AluWidth::Amx` so the throttle envelope is
+# deterministic.
+[test-groups.alu-vec512]
+max-threads = 1
+
+# `pathology_alu_hot_iterates` runs `AluWidth::Widest`, which
+# `resolve_alu_width` (src/workload.rs) downgrades to Vec512 on
+# avx512f hosts (Vec256/Vec128/Scalar otherwise). AMX is not
+# probed on stable Rust — `AluWidth::Amx` always downgrades to
+# the widest stable-detectable variant. The `alu_hot_vec512`
+# arm gives future Vec512 SIMD-intrinsic tests a stable naming
+# hook so they auto-serialize without a config change.
+[[profile.default.overrides]]
+filter = "test(pathology_alu_hot_iterates) | test(alu_hot_vec512)"
+test-group = "alu-vec512"
+threads-required = 1
+
 # ── llc-lock ─────────────────────────────────────────────────────────
 # Serialize tests that touch `/tmp/ktstr-llc-*.lock` or
 # `/tmp/ktstr-cpu-*.lock` at shared indices. Parallel runs race on
