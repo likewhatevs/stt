@@ -14688,6 +14688,41 @@ mod tests {
         }
     }
 
+    /// Skip a multi-stage WakeChain test when the host advertises
+    /// fewer than `min_cpus` parallel execution units. Bootstrap
+    /// throughput tests below pin per-stage rates against
+    /// `work_per_hop`-bounded ceilings; if the host serialises
+    /// stages onto a single CPU, scheduler jitter dominates and
+    /// the per-stage throughput collapses below the lower bound,
+    /// flaking the test on contended runners. `available_parallelism`
+    /// reads `sched_getaffinity` (per `std::thread` docs), so a
+    /// nextest invocation with `--test-threads` or a cpuset-pinned
+    /// runner reports its constrained budget — exactly the signal
+    /// these tests need.
+    ///
+    /// Returns `true` to indicate the caller should `return`
+    /// immediately without running the test body. Uses `eprintln!`
+    /// to surface the skip in nextest output (matches the
+    /// `set_mempolicy: ... skipping` precedent at sites like
+    /// `apply_mempolicy_with_flags`); `panic!` would fail the
+    /// test rather than skip it, contradicting the "skip on
+    /// insufficient CPUs" contract.
+    fn require_isolated_cpus(min_cpus: usize, test_name: &str) -> bool {
+        let available = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        if available < min_cpus {
+            eprintln!(
+                "ktstr: {test_name}: skipping — host reports \
+                 available_parallelism={available}, test requires \
+                 ≥ {min_cpus} CPUs to keep stages on independent \
+                 execution units"
+            );
+            return true;
+        }
+        false
+    }
+
     /// `WakeChain { wake: WakeMechanism::Pipe }` must dispatch
     /// the bootstrap byte ONLY at stage 0. The dispatch site
     /// (`workload.rs::worker_main` pipe-mode arm) gates the
@@ -14744,6 +14779,10 @@ mod tests {
         // be 50.
         const TOTAL_ITER_THRESHOLD: u64 = 40;
 
+        if require_isolated_cpus(DEPTH, "wake_chain_pipe_bootstrap_once_invariant") {
+            return;
+        }
+
         let config = WorkloadConfig {
             num_workers: DEPTH,
             work_type: WorkType::WakeChain {
@@ -14794,6 +14833,295 @@ mod tests {
              over {TEST_WINDOW_MS}ms (got {total_iters}, expected ≥ 4) — \
              the bootstrap byte never completed a full lap. Per-worker \
              reports: {:?}",
+            reports,
+        );
+    }
+
+    /// `WakeChain { wake: WakeMechanism::Pipe }` must dispatch
+    /// the bootstrap byte at iteration 0 ONLY. The dispatch site
+    /// gates the bootstrap `libc::write` behind both
+    /// `iterations == 0` AND `pos == 0`. A regression that drops
+    /// `iterations == 0` (keeping only `pos == 0`) has stage 0
+    /// fire its bootstrap byte every iteration into pipe[0],
+    /// queueing extra bytes that stage 1 reads without blocking.
+    /// Stage 0's poll on pipe[depth-1] then resolves immediately
+    /// against stage 1's prior-iteration write, so stage 0's
+    /// throughput rises beyond the `work_per_hop`-bounded
+    /// per-stage ceiling — the symptom is "stage 0 running ahead
+    /// of peers", distinct from the `pos == 0` regression covered
+    /// by `wake_chain_pipe_bootstrap_once_invariant` (which has
+    /// every stage running ahead at iteration 0 simultaneously).
+    ///
+    /// Parameters: depth=2, num_workers=2, work_per_hop=50ms,
+    /// 1000ms window. Correct steady-state: ~10 iters per stage,
+    /// ~20 total. The `[4, 25]` window catches both shoulders
+    /// without flaking on jitter — 4 ensures progress (matches the
+    /// `>= 4` lower bound from the bootstrap-once test); 25 is the
+    /// geometric upper bound that excludes the regression's
+    /// stage-0-runs-ahead pattern (with the bug, even a 50% boost
+    /// to stage 0 pushes total above 25). Per-stage iteration
+    /// count comparison adds a sharper signal: with the bug,
+    /// stage 0's iters grow disproportionately while stage 1
+    /// stays bounded by its CPU burst; the cross-stage ratio
+    /// constraint flags the asymmetry directly.
+    #[test]
+    fn wake_chain_pipe_no_repeat_bootstrap_invariant() {
+        const DEPTH: usize = 2;
+        const NUM_WORKERS: usize = 2;
+        const WORK_PER_HOP_MS: u64 = 50;
+        const TEST_WINDOW_MS: u64 = 1000;
+        const TOTAL_ITER_LOWER: u64 = 4;
+        const TOTAL_ITER_UPPER: u64 = 25;
+
+        if require_isolated_cpus(DEPTH, "wake_chain_pipe_no_repeat_bootstrap_invariant") {
+            return;
+        }
+
+        let config = WorkloadConfig {
+            num_workers: NUM_WORKERS,
+            work_type: WorkType::WakeChain {
+                depth: DEPTH,
+                wake: WakeMechanism::Pipe,
+                work_per_hop: Duration::from_millis(WORK_PER_HOP_MS),
+            },
+            ..Default::default()
+        };
+        let mut h = WorkloadHandle::spawn(&config)
+            .expect("WakeChain wake=Pipe depth=2 spawn must succeed");
+        h.start();
+        std::thread::sleep(Duration::from_millis(TEST_WINDOW_MS));
+        let reports = h.stop_and_collect();
+        assert_eq!(
+            reports.len(),
+            NUM_WORKERS,
+            "WakeChain wake=Pipe depth=2 collects one report per worker"
+        );
+        let total_iters: u64 = reports.iter().map(|r| r.iterations).sum();
+        assert!(
+            total_iters >= TOTAL_ITER_LOWER && total_iters <= TOTAL_ITER_UPPER,
+            "WakeChain wake=Pipe depth=2 total iterations over \
+             {TEST_WINDOW_MS}ms with work_per_hop={WORK_PER_HOP_MS}ms must \
+             land in [{TOTAL_ITER_LOWER}, {TOTAL_ITER_UPPER}] (got \
+             {total_iters}). Correct steady-state is ~20 (one wake per \
+             work_per_hop, summed across stages); a regression that drops \
+             the iterations==0 guard has stage 0 fire its bootstrap byte \
+             every iteration, queueing extra bytes in pipe[0] and \
+             unblocking stage 1's poll instantly — stage 0's poll on \
+             pipe[1] then resolves on stage 1's prior-iteration write, \
+             pushing stage 0 above the work_per_hop-bounded ceiling. \
+             Per-worker reports: {:?}",
+            reports,
+        );
+        // Per-stage comparison: with the regression, stage 0 runs
+        // ahead of its peer because its repeat-bootstrap writes
+        // collapse the wait on pipe[depth-1]. Bound the cross-stage
+        // ratio at 2× — a generous threshold that absorbs scheduler
+        // jitter while still flagging the systematic skew the
+        // regression produces. Stage 0 = reports[0], stage 1 =
+        // reports[1] (worker-index ordering preserved by
+        // `stop_and_collect`'s children iteration). Use saturating
+        // arithmetic so a degenerate `iterations == 0` peer doesn't
+        // panic the comparison before the lower-bound assertion
+        // surfaces it.
+        let stage0_iters = reports[0].iterations;
+        let stage1_iters = reports[1].iterations;
+        let max_iters = stage0_iters.max(stage1_iters);
+        let min_iters = stage0_iters.min(stage1_iters);
+        assert!(
+            min_iters > 0 && max_iters <= min_iters.saturating_mul(2),
+            "WakeChain wake=Pipe depth=2 per-stage iteration counts must \
+             stay within 2× of each other (stage0={stage0_iters}, \
+             stage1={stage1_iters}). A regression that drops the \
+             iterations==0 guard has stage 0 fire its bootstrap byte every \
+             iteration, queueing bytes that bypass stage 1's wait and \
+             letting stage 0's poll resolve instantly on stage 1's prior \
+             write — symptom: stage 0 runs ahead of stage 1. Per-worker \
+             reports: {:?}",
+            reports,
+        );
+    }
+
+    /// `WakeChain { wake: WakeMechanism::Pipe }` multi-chain
+    /// bootstrap independence. Each chain owns its own pipe ring
+    /// and its own bootstrap stage; chains do not share fds and
+    /// must run independently — a regression that crosses chain
+    /// indices (e.g. uses a global "stage 0" rather than the
+    /// per-chain `pos == 0`) would have one chain's bootstrap
+    /// activate the other's pipes, or have only one chain make
+    /// progress while the other stalls.
+    ///
+    /// Parameters: depth=4, num_workers=8 (2 chains of 4),
+    /// work_per_hop=50ms, 1000ms window. Workers `[0..4)` are
+    /// chain 0, workers `[4..8)` are chain 1 — `chain_idx = i /
+    /// depth` matches the spawn-side derivation at
+    /// `workload.rs:4600` (`chain_pipes_base + i / depth`).
+    /// Each chain's correct steady-state is ~20 iters total
+    /// (one wake per work_per_hop, depth stages share that rate);
+    /// the `[4, 30]` per-chain window catches stalls (lower
+    /// bound: < 4 means the chain didn't complete a ring
+    /// round-trip) and per-chain runaway throughput from a
+    /// chain-mixing bug (upper bound: > 30 means chain rate
+    /// exceeds work_per_hop ceiling). Cross-chain ratio ≤ 2×
+    /// flags asymmetric progress — both chains receive the same
+    /// scheduler attention modulo jitter, so a 2× ratio is well
+    /// outside expected variance and well within the symptom
+    /// envelope of a chain-mixing or chain-starvation regression.
+    /// Per-chain assertions (not aggregate) avoid the case where
+    /// one chain at 40 iters and the other at 0 totals 40 (just
+    /// above the aggregate threshold's ceiling) but represents a
+    /// catastrophic isolation failure.
+    #[test]
+    fn wake_chain_pipe_multi_chain_bootstrap_independence() {
+        const DEPTH: usize = 4;
+        const NUM_WORKERS: usize = 8;
+        const NUM_CHAINS: usize = NUM_WORKERS / DEPTH;
+        const WORK_PER_HOP_MS: u64 = 50;
+        const TEST_WINDOW_MS: u64 = 1000;
+        const PER_CHAIN_LOWER: u64 = 4;
+        const PER_CHAIN_UPPER: u64 = 30;
+
+        if require_isolated_cpus(NUM_WORKERS, "wake_chain_pipe_multi_chain_bootstrap_independence")
+        {
+            return;
+        }
+
+        let config = WorkloadConfig {
+            num_workers: NUM_WORKERS,
+            work_type: WorkType::WakeChain {
+                depth: DEPTH,
+                wake: WakeMechanism::Pipe,
+                work_per_hop: Duration::from_millis(WORK_PER_HOP_MS),
+            },
+            ..Default::default()
+        };
+        let mut h = WorkloadHandle::spawn(&config)
+            .expect("WakeChain wake=Pipe multi-chain spawn must succeed");
+        h.start();
+        std::thread::sleep(Duration::from_millis(TEST_WINDOW_MS));
+        let reports = h.stop_and_collect();
+        assert_eq!(
+            reports.len(),
+            NUM_WORKERS,
+            "WakeChain wake=Pipe multi-chain collects one report per worker"
+        );
+
+        // Per-chain totals: chain_idx = i / depth matches the
+        // spawn-side allocator's `chain_pipes_base + i / depth`.
+        let mut per_chain_totals: [u64; NUM_CHAINS] = [0; NUM_CHAINS];
+        for (i, r) in reports.iter().enumerate() {
+            let chain_idx = i / DEPTH;
+            per_chain_totals[chain_idx] += r.iterations;
+        }
+
+        for (chain_idx, &chain_total) in per_chain_totals.iter().enumerate() {
+            assert!(
+                chain_total >= PER_CHAIN_LOWER && chain_total <= PER_CHAIN_UPPER,
+                "WakeChain wake=Pipe multi-chain: chain {chain_idx} total \
+                 iterations over {TEST_WINDOW_MS}ms with \
+                 work_per_hop={WORK_PER_HOP_MS}ms must land in \
+                 [{PER_CHAIN_LOWER}, {PER_CHAIN_UPPER}] (got \
+                 {chain_total}). Correct steady-state is ~20 per chain \
+                 (one wake per work_per_hop across {DEPTH} stages); a \
+                 chain-mixing regression has one chain stall while the \
+                 other absorbs both bootstraps, or has the wrong stage \
+                 fire its bootstrap. Per-chain totals: {:?}. Per-worker \
+                 reports: {:?}",
+                per_chain_totals,
+                reports,
+            );
+        }
+
+        let max_chain = *per_chain_totals.iter().max().unwrap();
+        let min_chain = *per_chain_totals.iter().min().unwrap();
+        assert!(
+            min_chain > 0 && max_chain <= min_chain.saturating_mul(2),
+            "WakeChain wake=Pipe multi-chain: cross-chain iteration \
+             ratio must stay within 2× (max={max_chain}, min={min_chain}). \
+             Both chains receive the same scheduler attention modulo \
+             jitter; a > 2× spread indicates one chain is starving the \
+             other, which under independent fd ownership cannot happen \
+             unless a regression crosses chain indices. Per-chain totals: \
+             {:?}. Per-worker reports: {:?}",
+            per_chain_totals,
+            reports,
+        );
+    }
+
+    /// `WakeChain { wake: WakeMechanism::Pipe }` bootstrap-once
+    /// invariant under [`CloneMode::Thread`]. The shared fd table
+    /// makes the bug behavior identical to Fork mode (the same
+    /// repeat-bootstrap regression queues bytes on the same
+    /// pipe), but the spawn path differs: thread workers route
+    /// through `spawn_thread_worker` rather than `fork`, and the
+    /// pipe-fd ownership transfer goes through
+    /// `WorkloadHandle::chain_pipes` rather than the post-fork
+    /// close. This test pins the throughput contract under the
+    /// Thread spawn path so a regression that breaks Thread-mode
+    /// pipe-fd lifetime (e.g. closes fds before workers reach
+    /// the chain handoff) trips the bootstrap-once invariant
+    /// here too.
+    ///
+    /// Identical thresholds to the Fork-mode test
+    /// (`wake_chain_pipe_bootstrap_once_invariant`): depth=4,
+    /// work_per_hop=50ms, 1s window, total ≤ 40. Throughput is
+    /// wall-clock-bounded by `work_per_hop`, not clone-mode-
+    /// bounded — both Fork and Thread workers spend ~50ms in
+    /// the CPU burst per stage handoff, so the per-stage rate
+    /// ceiling and the buggy 4× upper expectation match
+    /// exactly.
+    #[test]
+    fn wake_chain_pipe_thread_mode_bootstrap_throughput() {
+        const DEPTH: usize = 4;
+        const WORK_PER_HOP_MS: u64 = 50;
+        const TEST_WINDOW_MS: u64 = 1000;
+        const TOTAL_ITER_THRESHOLD: u64 = 40;
+
+        if require_isolated_cpus(DEPTH, "wake_chain_pipe_thread_mode_bootstrap_throughput") {
+            return;
+        }
+
+        let config = WorkloadConfig {
+            num_workers: DEPTH,
+            clone_mode: CloneMode::Thread,
+            work_type: WorkType::WakeChain {
+                depth: DEPTH,
+                wake: WakeMechanism::Pipe,
+                work_per_hop: Duration::from_millis(WORK_PER_HOP_MS),
+            },
+            ..Default::default()
+        };
+        let mut h = WorkloadHandle::spawn(&config)
+            .expect("Thread + WakeChain wake=Pipe spawn must succeed");
+        h.start();
+        std::thread::sleep(Duration::from_millis(TEST_WINDOW_MS));
+        let reports = h.stop_and_collect();
+        assert_eq!(
+            reports.len(),
+            DEPTH,
+            "Thread + WakeChain wake=Pipe collects one report per worker"
+        );
+        let total_iters: u64 = reports.iter().map(|r| r.iterations).sum();
+        assert!(
+            total_iters <= TOTAL_ITER_THRESHOLD,
+            "Thread + WakeChain wake=Pipe total iterations across {DEPTH} \
+             stages exceeded {TOTAL_ITER_THRESHOLD} over {TEST_WINDOW_MS}ms \
+             with work_per_hop={WORK_PER_HOP_MS}ms (got {total_iters}). \
+             Throughput is wall-clock-bounded; the bootstrap-once invariant \
+             holds identically under Thread mode. Expected correct total \
+             ~{}; expected buggy total ~{}. Per-worker reports: {:?}",
+            TEST_WINDOW_MS / WORK_PER_HOP_MS,
+            (TEST_WINDOW_MS / WORK_PER_HOP_MS) * (DEPTH as u64),
+            reports,
+        );
+        assert!(
+            total_iters >= 4,
+            "Thread + WakeChain wake=Pipe made fewer than one ring \
+             round-trip over {TEST_WINDOW_MS}ms (got {total_iters}, \
+             expected ≥ 4) — the bootstrap byte never completed a full \
+             lap. Under Thread mode this typically means the pipe fds \
+             were closed before the workers reached the chain handoff \
+             site (a regression in `WorkloadHandle::chain_pipes` \
+             ownership transfer). Per-worker reports: {:?}",
             reports,
         );
     }

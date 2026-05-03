@@ -1794,16 +1794,56 @@ pub(crate) fn trim_settle_samples(
 /// a KVM fd, and failing fast here yields an actionable error
 /// ("add your user to the kvm group") before the VM builder starts
 /// allocating memory / fetching kernels.
+///
+/// Errno classification on open failure:
+/// - `ENOMEM` / `EBUSY` — transient host pressure (kernel memory
+///   allocator under load, or the kvm misc-device's per-CPU init
+///   contended). Routed through
+///   [`crate::vmm::host_topology::ResourceContention`] so the
+///   `#[ktstr_test]` macro SKIPs the run instead of failing it.
+/// - `EACCES` / `ENOENT` — infrastructure misconfiguration: the
+///   device is missing entirely, or the user lacks permission. The
+///   operator must fix their host setup; SKIP-classifying it would
+///   silently mask a misconfigured runner. Surfaced as a hard error
+///   with the actionable hint above.
+/// - Any other errno — surfaced as a hard error with the same hint;
+///   the rendered `io::Error` carries the raw errno for triage.
 fn ensure_kvm() -> Result<()> {
-    std::fs::OpenOptions::new()
+    match std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open("/dev/kvm")
-        .context(
-            "/dev/kvm not accessible — KVM is required for ktstr_test. \
-             Check that KVM is enabled and your user is in the kvm group.",
-        )?;
-    Ok(())
+    {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            let errno = e.raw_os_error();
+            if matches!(errno, Some(libc::ENOMEM) | Some(libc::EBUSY)) {
+                let snapshot = vmm::host_resource_snapshot();
+                let errno_label = match errno {
+                    Some(libc::ENOMEM) => "ENOMEM",
+                    Some(libc::EBUSY) => "EBUSY",
+                    _ => unreachable!(),
+                };
+                Err(anyhow::Error::new(
+                    crate::vmm::host_topology::ResourceContention {
+                        reason: format!(
+                            "/dev/kvm open: transient host errno {errno_label}: \
+                             host resources: {snapshot}\n  \
+                             hint: KVM device open failed with a host-resource \
+                             errno; another peer may be holding the budget. \
+                             nextest will not retry; the SKIP banner records \
+                             this attempt for stats tooling.",
+                        ),
+                    },
+                ))
+            } else {
+                Err(anyhow::Error::new(e).context(
+                    "/dev/kvm not accessible — KVM is required for ktstr_test. \
+                     Check that KVM is enabled and your user is in the kvm group.",
+                ))
+            }
+        }
+    }
 }
 
 /// Format a label for the scheduler spec, for use in test output.
@@ -2117,12 +2157,54 @@ pub(crate) fn acquire_test_kernel_lock_if_cached(
     }
 
     // The path is shaped as a cache entry under the resolved root.
-    // Acquire the reader lock. Propagate errors (fs corruption,
-    // timeout): a real cache-entry path that cannot be locked is an
-    // infrastructure failure, not a silent skip.
+    // Acquire the reader lock. The flock helper polls on
+    // `EAGAIN`/`EWOULDBLOCK` until either the lock is granted or its
+    // wall-clock timeout elapses. A timeout means a peer (concurrent
+    // `cargo ktstr kernel build` or another reader-blocking writer)
+    // is holding the lock — that is host-resource contention, not a
+    // kernel fault, so route it through
+    // [`crate::vmm::host_topology::ResourceContention`] so the
+    // `#[ktstr_test]` macro SKIPs cleanly and stats tooling records
+    // the attempt via the per-site sidecar. Non-timeout failures
+    // (parent-directory creation failure, an unexpected `try_flock`
+    // errno other than `EAGAIN`/`EWOULDBLOCK`) propagate as hard
+    // errors — they indicate filesystem corruption or a programming
+    // fault that SKIP-skipping would silently mask.
+    //
+    // Detection seam: the flock helper's bail format starts with
+    // `flock LOCK_SH on` (or `LOCK_EX`) and contains `timed out
+    // after`. Both substrings are pinned by the helper's internal
+    // contract and embedded in the rendered message together; the
+    // message also contains the lockfile path and the holder PID
+    // list parsed from `/proc/locks`, which we forward verbatim into
+    // the `ResourceContention` reason so the operator sees the
+    // identical triage information either way.
     let cache = crate::cache::CacheDir::with_root(resolved_root_canon);
-    let guard = cache.acquire_shared_lock(cache_key)?;
-    Ok(Some(guard))
+    match cache.acquire_shared_lock(cache_key) {
+        Ok(guard) => Ok(Some(guard)),
+        Err(e) => {
+            let rendered = format!("{e:#}");
+            if rendered.contains("timed out after") && rendered.contains("flock LOCK_") {
+                let snapshot = crate::vmm::host_resource_snapshot();
+                Err(anyhow::Error::new(
+                    crate::vmm::host_topology::ResourceContention {
+                        reason: format!(
+                            "test kernel cache lock: {rendered}. host resources: \
+                             {snapshot}\n  \
+                             hint: a concurrent `cargo ktstr kernel build` or \
+                             another lockholder is preventing the test VM from \
+                             reading the cached kernel image. nextest will not \
+                             retry; the SKIP banner records this attempt for \
+                             stats tooling. Wait for the holder PIDs above to \
+                             finish, or kill them, then retry.",
+                        ),
+                    },
+                ))
+            } else {
+                Err(e)
+            }
+        }
+    }
 }
 
 #[cfg(test)]

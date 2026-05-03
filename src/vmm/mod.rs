@@ -293,36 +293,40 @@ pub(crate) fn host_resource_snapshot() -> String {
 /// The false-positive cost is bounded by [`host_resource_snapshot`]'s
 /// `near_limit` flag — operators can grep for `near_limit=false` +
 /// sustained SKIPs to catch a kernel-side regression that the
-/// classifier silently masks. The proposed refinement is a
-/// `near_limit`-gated bypass: when the snapshot reports
-/// `near_limit=false` AND the errno is in the soft-contention set
-/// (EAGAIN, ENOMEM), return the underlying error unchanged instead
-/// of wrapping in `ResourceContention`. EBUSY stays unconditionally
-/// classified because every KVM ioctl path that surfaces EBUSY does
-/// so under host-resource pressure (kvm-ioctls is a thin wrapper —
-/// see the per-callsite reachability note below — and propagates
-/// whatever errno the kernel returned via `errno::Error::last`).
-/// The remaining
-/// `TRANSIENT_HOST_ERRNOS` entries (EMFILE, ENFILE, ENOSPC) are
-/// always host-resource-driven by definition, so gating them on
-/// `near_limit` would only mask the trigger.
+/// classifier silently masks. The classifier exposes an opt-in
+/// `near_limit`-gated bypass: when `KTSTR_CONTENTION_BYPASS=1` is
+/// set in the environment AND the snapshot reports
+/// `near_limit=false`, the underlying error is surfaced as a hard
+/// fault instead of being wrapped in `ResourceContention`. The
+/// applied diagnostic notes "errno looks transient but host is NOT
+/// near limits — likely a kernel-side bug" so the operator's
+/// triage points at `dmesg` rather than at peer contention.
 ///
-/// The bypass is not implemented today because:
-/// - The TRANSIENT_HOST_ERRNOS set is small and conservative; the
-///   bias-toward-SKIP behavior is the correct default until the
-///   `near_limit=false + sustained SKIPs` triage workflow surfaces
-///   a real masking case the bypass would have caught.
+/// Default-off behaviour: with the env var unset, every transient
+/// errno classifies as `ResourceContention` exactly as before. The
+/// bypass changes observable test outcomes (currently-SKIPped tests
+/// would FAIL), so it must remain opt-in until the operator has run
+/// a soak window confirming their `near_limit` snapshot is reliable
+/// on the host.
+///
+/// Caveats the operator should weigh before enabling:
 /// - The `near_limit` snapshot is read AFTER the failure, so a peer
-///   allocation between the ioctl and the snapshot would mark the
-///   host pressured retroactively. Steady-state analysis shows the
-///   per-thread atomic `/proc/self/status` reads bound the
-///   inconsistency to a single iteration, well within the
-///   macro-layer retry budget — but the bypass design must verify
-///   that empirically before flipping the default.
-/// - The bypass changes observable test outcomes (some
-///   currently-SKIPped tests would FAIL), so it is a behavior
-///   change that warrants its own commit + soak window rather than
-///   piggy-backing on the classifier's introduction.
+///   allocation between the ioctl and the snapshot can mark the
+///   host pressured retroactively. The per-thread atomic
+///   `/proc/self/status` reads bound the inconsistency to a single
+///   iteration, well within the macro-layer retry budget — but the
+///   risk is that a genuine peer-contention SKIP arrives as a hard
+///   failure on a freshly-drained host. Bypass-on is the
+///   "investigate kernel-side regressions aggressively" mode; leave
+///   it off in steady-state CI.
+/// - The bypass treats every transient errno uniformly. EMFILE /
+///   ENFILE / ENOSPC are always host-resource-driven by definition,
+///   so a `near_limit=false` snapshot that reports them means the
+///   snapshot itself is racy — surfacing them as hard errors lets
+///   the operator catch an inconsistent snapshot rather than
+///   silently SKIP-skipping. EAGAIN / ENOMEM / EBUSY can each be
+///   either contention or kernel bugs, and the bypass routes them
+///   the same way.
 ///
 /// # Per-callsite reachability
 ///
@@ -344,6 +348,39 @@ pub(crate) fn map_transient_to_contention(
     let errno = e.errno();
     if TRANSIENT_HOST_ERRNOS.contains(&errno) {
         let snapshot = host_resource_snapshot();
+        // Opt-in `near_limit`-gated bypass: when
+        // `KTSTR_CONTENTION_BYPASS=1` is set AND the snapshot reports
+        // `near_limit=false`, surface the underlying error as a hard
+        // fault instead of classifying as `ResourceContention`. The
+        // intent is to catch kernel-side regressions that share a
+        // transient errno with genuine host pressure (leaked
+        // page-allocator state surfacing as ENOMEM, a stuck virtqueue
+        // surfacing as EBUSY). With `near_limit=false`, the host's
+        // /proc/self/limits do not corroborate the errno's
+        // "transient" framing, so the failure is more likely a
+        // kernel bug than a peer holding resources.
+        //
+        // Default-off: the existing classifier behaviour is preserved
+        // unless the operator opts in. The bypass changes observable
+        // test outcomes (currently-SKIPped tests would FAIL) so it
+        // must remain opt-in until the operator has run a soak window
+        // confirming their `near_limit` snapshot is reliable on the
+        // host.
+        let bypass_requested = std::env::var("KTSTR_CONTENTION_BYPASS")
+            .ok()
+            .as_deref()
+            == Some("1");
+        let near_limit_false = snapshot.contains("near_limit=false");
+        if bypass_requested && near_limit_false {
+            return anyhow::Error::new(e).context(format!(
+                "{context}: KVM errno {errno} ({errno_name}) — errno looks transient \
+                 but host is NOT near limits ({snapshot}). KTSTR_CONTENTION_BYPASS=1 \
+                 routed this through as a hard error: likely a kernel-side bug \
+                 (leak / stuck device / cgroup-exhausted state) rather than peer \
+                 contention. Check `dmesg` for the affected subsystem.",
+                errno_name = errno_name(errno),
+            ));
+        }
         anyhow::Error::new(host_topology::ResourceContention {
             reason: format!(
                 "{context}: transient KVM errno {errno} ({}): host resources: {snapshot}\n  \
@@ -353,7 +390,8 @@ pub(crate) fn map_transient_to_contention(
                  hint: if `near_limit=false` in the snapshot above and SKIPs persist \
                  across runs, the errno is likely a kernel-side regression (leak / stuck \
                  device / cgroup-exhausted state) — check `dmesg` for the affected \
-                 subsystem rather than retrying the test.",
+                 subsystem rather than retrying the test, or set \
+                 `KTSTR_CONTENTION_BYPASS=1` to surface such failures as hard errors.",
                 errno_name(errno)
             ),
         })
@@ -8393,6 +8431,16 @@ mod tests {
     /// context plus the errno name and the host-resource snapshot.
     #[test]
     fn map_transient_to_contention_classifies_enomem() {
+        // Holds the env lock and ensures `KTSTR_CONTENTION_BYPASS`
+        // is unset for the test duration: the bypass is opt-in and
+        // its default-off behaviour is what this test pins. Without
+        // the guard, a developer with the var set in their shell
+        // would observe a spurious failure — the bypass would route
+        // the assertions through a hard-error branch instead of the
+        // `ResourceContention` branch this test pins.
+        let _lock = crate::test_support::test_helpers::lock_env();
+        let _bypass_off =
+            crate::test_support::test_helpers::EnvVarGuard::remove("KTSTR_CONTENTION_BYPASS");
         for &errno in TRANSIENT_HOST_ERRNOS {
             let kvm_err = kvm_ioctls::Error::new(errno);
             let mapped = map_transient_to_contention(kvm_err, "create VM");
@@ -8468,6 +8516,137 @@ mod tests {
              map_transient_to_contention — the retry loop handles \
              single EINTR; only EXHAUSTED EINTR is contention. \
              got: {mapped:#}",
+        );
+    }
+
+    /// `map_transient_to_contention` is the routing layer that
+    /// `set_user_memory_region` (in [`super::numa_mem`]) wraps
+    /// every memslot install through; the wrap was added so kernel-
+    /// side ENOMEM during region setup classifies as a clean SKIP
+    /// instead of a hard test failure. Pins the routing contract:
+    /// every errno in `TRANSIENT_HOST_ERRNOS` produces a
+    /// `ResourceContention`, and a non-transient errno (`EINVAL`,
+    /// the canonical "you handed me a bad memslot layout" return)
+    /// must NOT downcast — so a real layout regression surfaces
+    /// loudly instead of being skipped.
+    ///
+    /// Synthesizes `kvm_ioctls::Error::new(...)` for each errno
+    /// rather than driving the actual `set_user_memory_region`
+    /// ioctl: the routing layer is a pure function over
+    /// `kvm_ioctls::Error` and the routing contract holds for
+    /// every callsite that wraps it (vCPU init, GIC setup, memslot
+    /// install). Driving the real ioctl would also exercise the
+    /// kernel's memslot validation, which is out of scope for this
+    /// test.
+    ///
+    /// Holds [`crate::test_support::test_helpers::lock_env`] and
+    /// removes `KTSTR_CONTENTION_BYPASS` for the test duration so
+    /// a developer with the bypass set in their shell does not
+    /// observe spurious failures, and so a concurrent
+    /// bypass-exercising test cannot race the unset.
+    #[test]
+    fn set_user_memory_region_routing_via_map_transient() {
+        let _lock = crate::test_support::test_helpers::lock_env();
+        let _bypass_off =
+            crate::test_support::test_helpers::EnvVarGuard::remove("KTSTR_CONTENTION_BYPASS");
+        // Every transient errno must classify as ResourceContention
+        // when wrapped through map_transient_to_contention with the
+        // memslot-install context tag.
+        for &errno in TRANSIENT_HOST_ERRNOS {
+            let kvm_err = kvm_ioctls::Error::new(errno);
+            let mapped = map_transient_to_contention(kvm_err, "set_user_memory_region");
+            assert!(
+                mapped
+                    .downcast_ref::<host_topology::ResourceContention>()
+                    .is_some(),
+                "errno {errno} ({}): set_user_memory_region routing must \
+                 classify as ResourceContention; got {mapped:#}",
+                errno_name(errno),
+            );
+            let rendered = format!("{mapped:#}");
+            assert!(
+                rendered.contains("set_user_memory_region"),
+                "errno {errno} banner missing memslot-install context tag: {rendered}"
+            );
+            assert!(
+                rendered.contains(&*errno_name(errno)),
+                "errno {errno} banner missing errno name: {rendered}"
+            );
+        }
+        // EINVAL is the canonical "bad memslot layout" return — a
+        // real layout bug must surface as a hard error so the
+        // operator sees the regression rather than a silent SKIP.
+        let kvm_err = kvm_ioctls::Error::new(libc::EINVAL);
+        let mapped = map_transient_to_contention(kvm_err, "set_user_memory_region");
+        assert!(
+            mapped
+                .downcast_ref::<host_topology::ResourceContention>()
+                .is_none(),
+            "EINVAL from set_user_memory_region must NOT classify as \
+             ResourceContention — bad memslot layout is a programming \
+             fault that SKIP-skipping would hide; got: {mapped:#}",
+        );
+    }
+
+    /// `KTSTR_CONTENTION_BYPASS=1` opt-in: when the env var is set
+    /// AND the host-resource snapshot reports `near_limit=false`,
+    /// every transient errno surfaces as a hard error rather than a
+    /// `ResourceContention`. The opt-in exists so an operator
+    /// hunting kernel-side regressions (a leak / stuck device that
+    /// shares a transient errno with peer contention) can see the
+    /// failure instead of having it SKIP-skipped.
+    ///
+    /// Default-off behaviour is pinned by the
+    /// `map_transient_to_contention_classifies_enomem` test above
+    /// (which runs without setting the var).
+    ///
+    /// The test relies on `host_resource_snapshot()` reporting
+    /// `near_limit=false` on the test runner. That holds in
+    /// practice on a CI runner: it would take an exhaustion event
+    /// across `RLIMIT_NOFILE` or per-UID `RLIMIT_NPROC` (>= 90% of
+    /// the soft cap) to flip it true, and the test runner does not
+    /// approach those caps. If a future runner does saturate the
+    /// snapshot, the assertion below would mark the test as
+    /// `near_limit=true` (i.e. bypass not active), and the test
+    /// SKIPs the bypass assertion rather than failing it — the
+    /// snapshot precondition is documented, and a bypass test with
+    /// no near_limit=false snapshot to gate on cannot exercise the
+    /// path. Holds [`lock_env`] so the env-var mutation does not
+    /// race other env-touching tests.
+    #[test]
+    fn map_transient_to_contention_bypass_when_near_limit_false() {
+        let _lock = crate::test_support::test_helpers::lock_env();
+        // Sanity: confirm the runner's snapshot reports
+        // near_limit=false. If not, the bypass cannot be exercised
+        // and we cannot make the assertion below; bail without
+        // failing.
+        let snapshot = host_resource_snapshot();
+        if !snapshot.contains("near_limit=false") {
+            return;
+        }
+        let _bypass_on =
+            crate::test_support::test_helpers::EnvVarGuard::set("KTSTR_CONTENTION_BYPASS", "1");
+        // ENOMEM is in TRANSIENT_HOST_ERRNOS but with bypass-on +
+        // near_limit=false, must NOT classify as ResourceContention.
+        let kvm_err = kvm_ioctls::Error::new(libc::ENOMEM);
+        let mapped = map_transient_to_contention(kvm_err, "set_user_memory_region");
+        assert!(
+            mapped
+                .downcast_ref::<host_topology::ResourceContention>()
+                .is_none(),
+            "with KTSTR_CONTENTION_BYPASS=1 and near_limit=false, ENOMEM must \
+             surface as a hard error rather than ResourceContention; got: {mapped:#}",
+        );
+        let rendered = format!("{mapped:#}");
+        assert!(
+            rendered.contains("KTSTR_CONTENTION_BYPASS=1"),
+            "bypass diagnostic must mention the env var so the operator can \
+             see why this surfaced as a hard error; got: {rendered}",
+        );
+        assert!(
+            rendered.contains("NOT near limits"),
+            "bypass diagnostic must explain the `near_limit=false` rationale; \
+             got: {rendered}",
         );
     }
 
