@@ -3382,14 +3382,31 @@ pub fn assert_benchmarks(
 /// ```
 pub fn assert_scx_events_clean(events: &[(&str, i64)], max_count: Option<i64>) -> AssertResult {
     let mut r = AssertResult::pass();
-    let bound = max_count.unwrap_or(0);
     for (name, count) in events {
-        if *count > bound {
+        // Kernel `scx_event_stats` counters are monotonic u64 — a
+        // negative i64 here means the source data is corrupted
+        // (counter reset, wraparound on a signed conversion, or
+        // sidecar JSON bit-loss). Treat negatives as failures rather
+        // than letting them silently pass `*count > bound` for any
+        // non-negative bound.
+        let failed = match max_count {
+            // Strict default: every counter must be exactly zero.
+            // `*count > 0` would let -5 slip through.
+            None => *count != 0,
+            // Bounded: reject negatives explicitly, then enforce
+            // the upper bound.
+            Some(bound) => *count < 0 || *count > bound,
+        };
+        if failed {
             r.passed = false;
+            let bound_desc = match max_count {
+                None => "0".to_string(),
+                Some(b) => b.to_string(),
+            };
             r.details.push(AssertDetail::new(
                 DetailKind::SchedulerEvent,
                 format!(
-                    "scx event `{name}` count {count} exceeds bound {bound}",
+                    "scx event `{name}` count {count} exceeds bound {bound_desc}",
                 ),
             ));
         }
@@ -3505,8 +3522,12 @@ impl SchedulerBaseline {
 
 /// Run every check in `baseline` against `reports`, merging results
 /// into a single [`AssertResult`]. A `None` field on the baseline
-/// skips that check; an empty baseline returns a passing result
-/// without inspecting `reports`.
+/// skips that check.
+///
+/// An empty `reports` slice short-circuits to a skip (`"no worker
+/// reports to evaluate"`) regardless of baseline content — silently
+/// passing a baseline against zero samples would let thresholds look
+/// "green" on a run that produced no measurement.
 ///
 /// Field-to-check mapping:
 /// - `max_p99_wake_latency_ns` -> pooled p99 across every worker's
@@ -3554,11 +3575,23 @@ pub fn assert_baseline(
     reports: &[WorkerReport],
     baseline: &SchedulerBaseline,
 ) -> AssertResult {
+    // Empty `reports` means nothing was measured. Returning a fresh
+    // `pass()` here would silently green-light a broken run that
+    // produced no signal; delegating to `assert_benchmarks` and
+    // merging its skip would lose the skip flag (`AssertResult::merge`
+    // ANDs `skipped`, so `pass.merge(skip) == passed-not-skipped`).
+    // Surface the skip directly so the operator sees the baseline
+    // wasn't actually exercised.
+    if reports.is_empty() {
+        return AssertResult::skip("no worker reports to evaluate");
+    }
+
     let mut r = AssertResult::pass();
 
     // Wake-latency p99: reuse the existing `assert_benchmarks` path
-    // so the percentile algorithm and skip-on-empty semantics stay
-    // unified.
+    // so the percentile algorithm stays unified. With `reports`
+    // non-empty here, `assert_benchmarks` cannot return a skip —
+    // the merge sees only pass/fail, preserving baseline semantics.
     if baseline.max_p99_wake_latency_ns.is_some() {
         r.merge(assert_benchmarks(
             reports,
