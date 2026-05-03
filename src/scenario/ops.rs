@@ -7,6 +7,48 @@
 //!
 //! See the [Ops and Steps](https://likewhatevs.github.io/ktstr/guide/concepts/ops.html)
 //! chapter for a guide.
+//!
+//! # Cgroup tooling at a glance
+//!
+//! ktstr exposes the cgroup v2 surface across two layers — declarative
+//! steady-state via [`CgroupDef`] (set at scenario-setup time, holds
+//! for the cgroup's lifetime) and imperative state-transitions via
+//! [`Op`] (applied mid-step, describe transitions over time):
+//!
+//! | Knob | Layer | API entry | Underlying file | When to use |
+//! |------|-------|-----------|-----------------|-------------|
+//! | CPU affinity | setup | [`CgroupDef::with_cpuset`] | `cpuset.cpus` | Bind workers to a CPU subset for the whole run. |
+//! | NUMA-mem affinity | setup | [`CgroupDef::with_cpuset_mems`] | `cpuset.mems` | Constrain allocations to specific NUMA nodes. |
+//! | CPU bandwidth | setup | [`CgroupDef::cpu_quota_pct`] / [`CgroupDef::cpu_quota`] / [`CgroupDef::cpu_unlimited`] | `cpu.max` | Cap CPU time per period (1 CPU at 50% / 2 CPU at 100% / etc). |
+//! | CPU share weight | setup | [`CgroupDef::cpu_weight`] | `cpu.weight` | Bias relative CPU share when siblings contend. |
+//! | Memory ceiling | setup | [`CgroupDef::memory_max`] / [`CgroupDef::memory_unlimited`] | `memory.max` | Hard ceiling — exceeding triggers cgroup OOM. |
+//! | Memory throttle | setup | [`CgroupDef::memory_high`] | `memory.high` | Soft throttle: triggers reclaim, not OOM. |
+//! | Memory protection | setup | [`CgroupDef::memory_low`] | `memory.low` | Soft protection: kernel reclaims from siblings first. |
+//! | Swap cap | setup | [`CgroupDef::memory_swap_max`] / [`CgroupDef::memory_swap_unlimited`] | `memory.swap.max` | Cap how much memory can spill to swap (CONFIG_SWAP=y). |
+//! | IO share | setup | [`CgroupDef::io_weight`] | `io.weight` | Bias relative IO share when siblings contend. |
+//! | Task ceiling | setup | [`CgroupDef::pids_max`] / [`CgroupDef::pids_unlimited`] | `pids.max` | Cap process+thread count — fork/clone returns EAGAIN at limit. |
+//! | Mid-run cpuset rebind | mid-step | [`Op::set_cpuset`] / [`Op::clear_cpuset`] / [`Op::swap_cpusets`] | `cpuset.cpus` | Move cpuset on a live cgroup mid-scenario. |
+//! | Mid-run task migration | mid-step | [`Op::move_all_tasks`] | `cgroup.procs` | Move workers from one cgroup to another. |
+//! | Pause/resume | mid-step | [`Op::freeze_cgroup`] / [`Op::unfreeze_cgroup`] | `cgroup.freeze` | Suspend every task in the cgroup; resume later. |
+//! | Add/remove cgroup | mid-step | [`Op::add_cgroup`] / [`Op::remove_cgroup`] / [`Op::stop_cgroup`] | (cgroupfs mkdir/rmdir) | Spawn / tear down a cgroup mid-scenario. |
+//!
+//! # Worked examples
+//!
+//! * **Static topology** (one cgroup, fixed cpuset, weight-biased
+//!   compute): [`CgroupDef`] type-level docs.
+//! * **Suspend/resume** (3-Step idiom — run, freeze, run again):
+//!   [`Op::FreezeCgroup`] doc.
+//! * **Memory-cap teardown** (rewind a base CgroupDef's swap cap):
+//!   [`CgroupDef::memory_swap_unlimited`] doc.
+//!
+//! # Implementation entry points
+//!
+//! Every knob ends in [`crate::cgroup::CgroupOps`] (production:
+//! [`crate::cgroup::CgroupManager`]; tests: a recording `MockCgroupOps`
+//! double). [`apply_setup`] runs the [`CgroupDef`] passes; [`apply_ops`]
+//! dispatches the [`Op`] variants. Both share `ctx.cgroups` so a test
+//! that uses both layers writes through the same RAII teardown
+//! ([`crate::scenario::CgroupGroup::Drop`]).
 
 use std::borrow::Cow;
 use std::collections::BTreeSet;
@@ -208,11 +250,63 @@ pub enum Op {
     /// Freeze every task in the named cgroup via `cgroup.freeze`.
     ///
     /// Writes `"1"` to the cgroup's `cgroup.freeze` file. The kernel's
-    /// `cgroup_freeze_write` (kernel/cgroup/cgroup.c:4099-4122)
-    /// dispatches the asynchronous freeze path; tasks transition to
-    /// the frozen state without external SIGSTOP, and `cgroup.events`
-    /// reaches `frozen 1` once every task has parked. Idempotent —
-    /// freezing an already-frozen cgroup is a no-op.
+    /// `cgroup_freeze_write` dispatches the asynchronous freeze path;
+    /// tasks transition to the frozen state without external SIGSTOP,
+    /// and `cgroup.events` reaches `frozen 1` once every task has
+    /// parked. Idempotent — freezing an already-frozen cgroup is a
+    /// no-op.
+    ///
+    /// # Auto-unfreeze at teardown
+    ///
+    /// `Op::FreezeCgroup` is paired with [`Op::UnfreezeCgroup`] to
+    /// release. A test that omits the unfreeze still tears down
+    /// cleanly: [`crate::cgroup::CgroupManager::remove_cgroup`]
+    /// auto-unfreezes the cgroup before draining tasks (see the
+    /// kernel's `cgroup_freezer_migrate_task`, which clears the
+    /// task's freeze state when it migrates to an unfrozen
+    /// destination), so step teardown is robust to a stuck-frozen
+    /// cgroup. Pair the ops explicitly when the scenario needs
+    /// observable unfreeze timing inside the step body.
+    ///
+    /// # Worked example
+    ///
+    /// Three-Step suspend/resume sequence: a `Backdrop`-resident
+    /// long-running workload is paused mid-scenario and resumed
+    /// later, exercising how the scheduler responds to a sudden
+    /// idle window.
+    ///
+    /// ```text
+    /// Step 1 (run): apply cgroup; workload spins for 2s.
+    /// Step 2 (suspend): Op::freeze_cgroup("workers"); hold 1s.
+    ///                   The cgroup's tasks park via cgroup.freeze,
+    ///                   schedstat gauges drop to zero, and the
+    ///                   scheduler observes a sudden idle subtree.
+    /// Step 3 (resume): Op::unfreeze_cgroup("workers"); hold 2s.
+    ///                  Tasks return to runnable state, the
+    ///                  scheduler must re-pick them onto the
+    ///                  cgroup's CPUs without spuriously preempting
+    ///                  unrelated workloads.
+    /// ```
+    ///
+    /// # Observer-cgroup deadlock warning
+    ///
+    /// Do NOT freeze a cgroup that hosts the test's own observation
+    /// machinery. The freeze path stops every task in the cgroup —
+    /// including any thread that:
+    /// - opens `/proc/<pid>/sched` or other procfs entries owned by
+    ///   tasks inside the frozen cgroup, then waits on the read,
+    /// - holds a futex shared with frozen tasks (the unfreeze must
+    ///   land before the wait can complete),
+    /// - synchronously waits on a stalled-task pipe whose
+    ///   producer is in the frozen cgroup.
+    ///
+    /// The framework's stimulus-event SHM ring and the `BlkWorker`
+    /// epoll loop both run outside the test cgroup tree, so they
+    /// are unaffected — but a test author who explicitly places an
+    /// observer thread inside the same cgroup as its observation
+    /// targets will deadlock the scenario when the freeze fires.
+    /// Place observers in a sibling cgroup (or in the parent) so
+    /// `cgroup.freeze` is scoped to the workload subtree alone.
     ///
     /// Pair with [`Op::UnfreezeCgroup`] to release. Useful for
     /// scheduler suspend/resume tests where the test body wants to
@@ -221,7 +315,7 @@ pub enum Op {
     ///
     /// Treats a missing cgroup as a step failure: the
     /// `cgroup.freeze` write fails with `ENOENT` and the error
-    /// propagates via the `apply_setup` `with_context` chain.
+    /// propagates via the `apply_ops` `with_context` chain.
     /// Freezing a non-existent cgroup is NOT a no-op; only
     /// freezing an already-frozen cgroup is.
     FreezeCgroup { cgroup: Cow<'static, str> },
@@ -394,18 +488,92 @@ pub struct MemoryLimits {
     /// `None` writes `"max"` (no swap cap, the kernel default). The
     /// kernel parses the wire value via `page_counter_memparse` —
     /// either the literal `"max"` or a decimal byte count
-    /// (mm/memcontrol.c:5379-5394 `swap_max_write`).
+    /// (`swap_max_write` in `mm/memcontrol.c`).
+    ///
+    /// # `CONFIG_SWAP=n` kernel detection
+    ///
+    /// `memory.swap.max` only exists when the kernel was built with
+    /// `CONFIG_SWAP=y`; on swap-disabled builds the file is absent
+    /// and the wire-time write returns ENOENT. The framework only
+    /// emits the write when `swap_max.is_some()` — the explicit
+    /// opt-in matches the per-knob semantics of the pids block, so
+    /// tests that never call [`CgroupDef::memory_swap_max`] /
+    /// [`CgroupDef::memory_swap_unlimited`] succeed verbatim on a
+    /// swap-disabled kernel.
+    ///
+    /// **`swap_max = Some(N)` on a `CONFIG_SWAP=n` kernel surfaces
+    /// as a hard scenario failure**: `apply_setup` propagates the
+    /// ENOENT from `set_memory_swap_max`'s `write_with_timeout` up
+    /// the error chain with the `memory.swap.max` filename in the
+    /// context. Test authors who target the swap controller must
+    /// either (a) gate the swap_max call on a host probe, or (b)
+    /// require the test kernel be built with `CONFIG_SWAP=y` and
+    /// document the requirement on the test.
+    ///
+    /// # ktstr's kernel config and swap
+    ///
+    /// `ktstr.kconfig` (the project-level kernel-config fragment that
+    /// `cargo ktstr` merges into the test kernel's defconfig) does
+    /// NOT pin `CONFIG_SWAP=y` — swap is not a test-framework
+    /// requirement, and many test scenarios run faster without it.
+    /// Tests that call `memory_swap_max` therefore must either
+    /// extend the per-test kconfig fragment (passed alongside
+    /// `ktstr.kconfig` at kernel-build time) or detect at
+    /// scenario-setup time by reading `/proc/swaps` (a missing
+    /// file or empty body indicates no swap subsystem) or
+    /// `/proc/config.gz` (search for `CONFIG_SWAP=y`). The framework
+    /// does NOT auto-detect because host probing is policy that
+    /// belongs to the test author, not the workload runner.
     pub swap_max: Option<u64>,
 }
 
 /// Pids controller limits (`pids.max`). `None` is the default
 /// (inherit from parent — typically `"max"`, no ceiling).
 ///
-/// Per the kernel's `pids_max_write` (kernel/cgroup/pids.c:301-329),
-/// existing tasks are NOT killed when the limit lands below the
-/// current task count; only future `fork()` / `clone()` calls are
-/// blocked once the cgroup's task count meets the limit. Useful for
-/// fork-bomb / task-count-ceiling tests.
+/// Per the kernel's `pids_max_write`, existing tasks are NOT killed
+/// when the limit lands below the current task count; only future
+/// `fork()` / `clone()` calls are blocked once the cgroup's task
+/// count meets the limit. Useful for fork-bomb / task-count-ceiling
+/// tests.
+///
+/// # Per-WorkType thread-budget guidance
+///
+/// `pids.max` counts every task (process AND thread) inside the
+/// cgroup. Sizing the limit below the workload's natural thread
+/// budget produces silent fork failures that surface as
+/// `WorkloadConfig`-level workers refusing to start. Conservative
+/// budgets per [`WorkType`](crate::workload::WorkType) variant:
+///
+/// | Variant family | Per-worker thread cost | Notes |
+/// |----------------|------------------------|-------|
+/// | `SpinWait` / `YieldHeavy` / `PauseSpin` | 1 | Pure compute; one task per worker. |
+/// | `Bursty` / `IdleChurn` | 1 | Wake-from-sleep workers; no helper threads. |
+/// | `FutexPingPong` / `WakeChain` (`Fork`) | 1 | Each worker is a separate fork; no extra threads. |
+/// | `WakeChain` (`Thread`) | num_workers | All workers share one process under `CloneMode::Thread`. |
+/// | `MutexContention` / `ProducerConsumerImbalance` | 2 | Plus a futex-helper thread per worker for backoff signaling. |
+/// | `PageFaultChurn` | 1 | Single mmap-reset thread; no helpers. |
+/// | `IpcVariance` / `AluHot` / `SmtSiblingSpin` | 1 | Compute-only; helper-free. |
+///
+/// **Sizing rule**: `pids.max ≥ Σ(per-worker thread cost) + 16`
+/// for the cgroup's total worker pool, with the +16 absorbing
+/// `cgroup.procs` migration scratch threads, the `BlkWorker`
+/// teardown thread, and any payload-binary helper processes
+/// (e.g. `stress-ng` spawns one task per `--cpu N`). Tests with
+/// composed [`WorkSpec`](crate::workload::WorkSpec) groups must sum
+/// the worst-case across every group — the framework does NOT
+/// auto-derive a budget from the work spec.
+///
+/// # `pids.max(0)` is rejected at apply_setup, not type-level
+///
+/// `Some(0)` would silently halt every fork inside the cgroup,
+/// including the spawned worker's own futex-helper threads. The
+/// kernel accepts the value (it's a legitimate `pids_max_write`
+/// input), so `apply_setup` adds the bail at scenario-setup time;
+/// promoting it to a type-level invariant (e.g. `NonZeroU64`)
+/// would force every numeric literal through a non-`const`
+/// constructor and ripple into every test fixture. The runtime
+/// bail keeps the surface ergonomic while still surfacing the
+/// foot-cannon at construction time (before any worker spawns).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct PidsLimits {
@@ -457,6 +625,48 @@ pub struct IoLimits {
 /// `Op::Spawn` directly when you need mid-step cgroup creation, removal,
 /// or other dynamic operations between spawn and collect.
 ///
+/// # Resource controllers overview
+///
+/// `CgroupDef` exposes one builder method per cgroup v2 controller
+/// knob, each writing the corresponding `cgroup.*` / `*.max` /
+/// `*.weight` file at `apply_setup` time. The full surface:
+///
+/// | Controller | One-line description | Builder methods | Underlying file(s) |
+/// |------------|----------------------|-----------------|--------------------|
+/// | cpuset | Bind to a CPU subset and NUMA-node memory affinity. | [`Self::with_cpuset`], [`Self::with_cpuset_mems`] | `cpuset.cpus`, `cpuset.mems` |
+/// | cpu    | Bandwidth ceiling (`cpu.max` quota/period) plus relative-share weight. | [`Self::cpu_quota_pct`], [`Self::cpu_quota`], [`Self::cpu_unlimited`], [`Self::cpu_weight`] | `cpu.max`, `cpu.weight` |
+/// | memory | Hard ceiling, soft throttle threshold, soft protection floor, swap cap. | [`Self::memory_max`], [`Self::memory_high`], [`Self::memory_low`], [`Self::memory_swap_max`], [`Self::memory_swap_unlimited`], [`Self::memory_unlimited`] | `memory.max`, `memory.high`, `memory.low`, `memory.swap.max` |
+/// | io     | Relative IO share (BFQ / io.cost) when the io controller is enabled. | [`Self::io_weight`] | `io.weight` |
+/// | pids   | Task-count ceiling — fork(2)/clone(2) returns EAGAIN once the cap is hit. | [`Self::pids_max`], [`Self::pids_unlimited`] | `pids.max` |
+/// | freeze | Pause/resume every task in the cgroup mid-run via the JOBCTL freeze path. | (Op-level) [`Op::freeze_cgroup`], [`Op::unfreeze_cgroup`] | `cgroup.freeze` |
+///
+/// `CgroupDef` covers steady-state resource limits — knobs that
+/// hold for the cgroup's whole lifetime. The freeze knob is
+/// intentionally exposed at the [`Op`] layer instead, because
+/// freeze/unfreeze describe transitions over time (suspend
+/// mid-step, resume later) rather than the cgroup's identity; see
+/// the "See also" section below for the full Op-variants list.
+///
+/// All builders are additive — a `CgroupDef` accumulates an
+/// optional [`CpuLimits`] / [`MemoryLimits`] / [`IoLimits`] /
+/// [`PidsLimits`] block. When a block is set (e.g. `def.memory`
+/// is `Some`), **all** knobs in that block are written —
+/// `None`-valued fields emit their kernel-default sentinel
+/// (`"max"` for `memory.max`/`memory.high`, `"0"` for
+/// `memory.low`). Only `memory.swap.max` is gated: `None` means
+/// no write (for `CONFIG_SWAP=n` compatibility). The "*_unlimited"
+/// builders explicitly rewind a knob to its sentinel value
+/// (`"max"` / `"0"`) so a base `CgroupDef` factory can cap a
+/// resource and a per-test extension can clear that cap without
+/// rewriting the whole `CgroupDef`.
+///
+/// Validation runs at `apply_setup` time (before any worker
+/// spawn): out-of-range weights, `cpu.max period == 0`, and
+/// `pids.max == Some(0)` all produce actionable bails before the
+/// syscall fires. The kernel is the final authority on
+/// per-controller numeric ranges; framework-level checks catch
+/// only the foot-cannons documented per-builder.
+///
 /// # See also
 ///
 /// `CgroupDef` only expresses the steady-state shape of a cgroup
@@ -469,7 +679,9 @@ pub struct IoLimits {
 ///   kernel-side asynchronous freeze path; not a SIGSTOP).
 ///   Useful for scheduler suspend/resume tests that observe
 ///   how the scheduler handles a workload that goes idle
-///   mid-step.
+///   mid-step. **Do not freeze a cgroup hosting the test's own
+///   observers** — see the deadlock warning on
+///   [`Op::FreezeCgroup`].
 /// * [`Op::SetCpuset`] — re-pin an existing cgroup's cpuset to
 ///   exercise the scheduler's response to a moving CPU mask
 ///   without disrupting the worker tasks themselves.
@@ -848,10 +1060,9 @@ impl CgroupDef {
 
     /// Set `memory.swap.max` ceiling in bytes. The kernel parses the
     /// wire value via `page_counter_memparse` and accepts a decimal
-    /// byte count (mm/memcontrol.c:5379-5394 `swap_max_write`).
-    /// Distinct from `memory.max`: this caps how much of the
-    /// cgroup's memory can spill to swap, separate from total
-    /// memory consumption.
+    /// byte count (`swap_max_write` in `mm/memcontrol.c`). Distinct
+    /// from `memory.max`: this caps how much of the cgroup's memory
+    /// can spill to swap, separate from total memory consumption.
     #[must_use = "builder methods consume self; bind the result"]
     pub fn memory_swap_max(mut self, bytes: u64) -> Self {
         let m = self.memory.get_or_insert_with(MemoryLimits::default);
@@ -865,10 +1076,20 @@ impl CgroupDef {
     /// `CgroupDef` builder applied a swap cap and the test wants to
     /// remove only that knob while preserving `memory.max`/`high`/
     /// `low`.
+    ///
+    /// No-ops when `self.memory == None` — the default state already
+    /// means "no swap cap" (apply_setup emits no memory writes for an
+    /// unset `memory` field), so creating a fresh `MemoryLimits` just
+    /// to set `swap_max = None` would (a) be redundant and (b)
+    /// trigger 3 unwanted writes for `memory.max` / `memory.high` /
+    /// `memory.low` at apply_setup time. The no-op short-circuit
+    /// keeps "fresh CgroupDef + memory_swap_unlimited()" semantically
+    /// identical to "fresh CgroupDef".
     #[must_use = "builder methods consume self; bind the result"]
     pub fn memory_swap_unlimited(mut self) -> Self {
-        let m = self.memory.get_or_insert_with(MemoryLimits::default);
-        m.swap_max = None;
+        if let Some(m) = self.memory.as_mut() {
+            m.swap_max = None;
+        }
         self
     }
 
@@ -876,15 +1097,16 @@ impl CgroupDef {
     /// of processes the cgroup may host before subsequent
     /// `fork()` / `clone()` calls return EAGAIN. Existing tasks are
     /// NOT killed when the limit lands below the current count
-    /// (kernel/cgroup/pids.c:301-329 — the kernel comment says
-    /// "Limit updates don't need to be mutex'd, since it isn't
-    /// critical that any racing fork()s follow the new limit").
+    /// (per the `pids_max_write` kernel comment: "Limit updates
+    /// don't need to be mutex'd, since it isn't critical that any
+    /// racing fork()s follow the new limit").
     ///
     /// `n = 0` is rejected at `apply_setup` time: a 0-limit cgroup
     /// silently halts every fork from inside, including the
     /// futex-helper threads spawned by some `WorkType` variants.
-    /// To express "no fork ever" intent, taskify and discuss with
-    /// the team — there's no kernel sentinel for it.
+    /// There is no kernel sentinel for "no fork ever"; `pids_max=0`
+    /// silently fails every `fork()` inside with `EAGAIN`, which is
+    /// almost certainly a configuration bug.
     #[must_use = "builder methods consume self; bind the result"]
     pub fn pids_max(mut self, n: u64) -> Self {
         let pids = self.pids.get_or_insert_with(PidsLimits::default);
@@ -7972,6 +8194,75 @@ mod tests {
         assert_eq!(d.memory.as_ref().unwrap().swap_max, None);
     }
 
+    /// `memory_swap_unlimited()` on a fresh CgroupDef (no prior
+    /// `memory_*` calls) MUST NOT inflate `self.memory` from `None`
+    /// to `Some(MemoryLimits::default())` — that would trigger 3
+    /// unwanted apply_setup writes (`memory.max`, `memory.high`,
+    /// `memory.low`) for a user who only asked to clear the swap
+    /// cap. Pin the no-op short-circuit so a regression that drops
+    /// the `if let Some` guard surfaces here.
+    #[test]
+    fn cgroup_def_memory_swap_unlimited_on_fresh_def_is_noop() {
+        let d = CgroupDef::named("cg_a").memory_swap_unlimited();
+        assert!(
+            d.memory.is_none(),
+            "memory_swap_unlimited() on a fresh CgroupDef must leave \
+             self.memory == None; got: {:?}",
+            d.memory,
+        );
+    }
+
+    /// `memory_unlimited()` then `memory_swap_unlimited()` — the
+    /// chain cln-preread flagged. memory_unlimited sets
+    /// `self.memory = Some(MemoryLimits::default())` (already has
+    /// `swap_max = None`); the subsequent memory_swap_unlimited
+    /// must not redundantly recreate the MemoryLimits. After both
+    /// calls, the inner is `Some(default)` with all four knobs
+    /// `None`, mirroring memory_unlimited's intent. Pin both ends
+    /// of the chain.
+    #[test]
+    fn cgroup_def_memory_unlimited_then_swap_unlimited_is_idempotent() {
+        let d = CgroupDef::named("cg_a")
+            .memory_unlimited()
+            .memory_swap_unlimited();
+        let m = d.memory.expect("memory_unlimited installs Some(default)");
+        assert!(m.max.is_none());
+        assert!(m.high.is_none());
+        assert!(m.low.is_none());
+        assert!(m.swap_max.is_none());
+    }
+
+    /// `apply_setup` against a CgroupDef with `memory_swap_unlimited()`
+    /// alone (no other memory builders) must NOT emit any memory
+    /// writes — the no-op short-circuit keeps `self.memory == None`,
+    /// so the apply_setup `if let Some(ref mem)` block is skipped.
+    /// Without the fix, a fresh `MemoryLimits::default()` would land
+    /// in `self.memory` and fire `set_memory_max(None)` +
+    /// `set_memory_high(None)` + `set_memory_low(None)` — a silent
+    /// regression for tests that just want to clear a swap cap
+    /// inherited from a base CgroupDef factory.
+    #[test]
+    fn apply_setup_memory_swap_unlimited_on_fresh_def_emits_no_memory_writes() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        let defs = vec![CgroupDef::named("cg_swap_clear").memory_swap_unlimited()];
+        apply_setup_test(&ctx, &mut state, &defs).expect("apply_setup must succeed");
+        let calls = mock.calls();
+        assert!(
+            !calls.iter().any(|c| matches!(
+                c,
+                CgroupCall::SetMemoryMax(_, _)
+                    | CgroupCall::SetMemoryHigh(_, _)
+                    | CgroupCall::SetMemoryLow(_, _)
+                    | CgroupCall::SetMemorySwapMax(_, _)
+            )),
+            "memory_swap_unlimited() on a fresh CgroupDef must emit zero memory writes; got: {calls:?}"
+        );
+        cleanup_state(&mut state);
+    }
+
     /// `.pids_max(n)` populates the pids field; `.pids_unlimited()`
     /// clears it. The pids field is independent of memory/cpu/io.
     #[test]
@@ -8167,6 +8458,70 @@ mod tests {
             "error must name the escape hatch (pids_unlimited()); got: {msg}",
         );
         cleanup_state(&mut state);
+    }
+
+    /// `Op::FreezeCgroup` against a cgroup the framework has never
+    /// created routes through `ctx.cgroups.set_freeze` and
+    /// surfaces the underlying kernel error as a step-level
+    /// failure. The MockCgroupOps double records the call but
+    /// returns Ok by default; pin the call sequence so a future
+    /// regression that swallows the FreezeCgroup op (or routes it
+    /// through a different code path that masks the error from a
+    /// real cgroupfs ENOENT) trips here. The "real" fail-on-ENOENT
+    /// path is exercised at the [`crate::cgroup`] layer's
+    /// `set_freeze_returns_err_with_enoent_when_freeze_file_missing`
+    /// test; this test pins the apply_ops dispatch shape.
+    #[test]
+    fn apply_ops_freeze_undefined_cgroup_dispatches_set_freeze() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        // The cgroup name "ghost_cg" is never declared via
+        // CgroupDef or Op::AddCgroup. apply_ops still dispatches —
+        // the framework does not gate FreezeCgroup on prior
+        // creation; the kernel is the final authority on whether
+        // the cgroup directory exists.
+        apply_ops_test(
+            &ctx,
+            &mut state,
+            &[Op::freeze_cgroup("ghost_cg")],
+        )
+        .expect("apply_ops must dispatch FreezeCgroup even for an undeclared name");
+        let calls = mock.calls();
+        assert!(
+            calls.contains(&CgroupCall::SetFreeze("ghost_cg".to_string(), true)),
+            "FreezeCgroup must reach set_freeze regardless of declaration state, got: {calls:?}"
+        );
+    }
+
+    /// `Op::FreezeCgroup` propagates the underlying ops error with
+    /// an `Op::FreezeCgroup: cgroup '<name>'` context prefix so a
+    /// failure dump names both the op and the offender. Inject an
+    /// error from the mock and verify the context chain.
+    #[test]
+    fn apply_ops_freeze_propagates_set_freeze_error_with_context() {
+        let mock = MockCgroupOps::new();
+        // Index 0 is the SetFreeze call from the FreezeCgroup op.
+        mock.fail_call_at(0, "kernel ENOENT — cgroup directory does not exist");
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        let err = apply_ops_test(
+            &ctx,
+            &mut state,
+            &[Op::freeze_cgroup("ghost_cg")],
+        )
+        .expect_err("set_freeze failure must surface as Err");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Op::FreezeCgroup") && msg.contains("ghost_cg"),
+            "error must name the op and the cgroup, got: {msg}"
+        );
+        assert!(
+            msg.contains("ENOENT"),
+            "error must propagate the underlying cause, got: {msg}"
+        );
     }
 
     /// `Op::FreezeCgroup` dispatches to set_freeze(true);

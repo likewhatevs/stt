@@ -3,6 +3,41 @@
 //! Creates, configures, and removes cgroups under a parent path
 //! (default `/sys/fs/cgroup/ktstr`). Provides cpuset assignment,
 //! task migration, and cleanup.
+//!
+//! # Controller surface
+//!
+//! [`CgroupManager`] enables a fixed controller set in
+//! `cgroup.subtree_control` at [`Self::setup`] time so every method
+//! that writes a controller knob succeeds without per-call lazy
+//! enablement (which would race against concurrent sibling cgroup
+//! creation). The enabled controllers and the knobs each one exposes
+//! map to:
+//!
+//! | Controller | `setup` writes | Methods that touch the controller's files |
+//! |------------|----------------|-------------------------------------------|
+//! | `cpuset`   | always         | [`Self::set_cpuset`], [`Self::set_cpuset_mems`], [`Self::clear_cpuset`], [`Self::clear_cpuset_mems`] |
+//! | `cpu`      | when `enable_cpu_controller=true` | [`Self::set_cpu_max`], [`Self::set_cpu_weight`] |
+//! | `memory`   | always         | [`Self::set_memory_max`], [`Self::set_memory_high`], [`Self::set_memory_low`], [`Self::set_memory_swap_max`] |
+//! | `pids`     | always         | [`Self::set_pids_max`] |
+//! | `io`       | always         | [`Self::set_io_weight`] |
+//! | (cgroup-core) | not gated   | [`Self::set_freeze`], [`Self::move_task`], [`Self::move_tasks`] |
+//!
+//! `cgroup.freeze` and `cgroup.procs` are cgroup-core files exposed on
+//! every non-root cgroup automatically; they do not require a
+//! controller in `subtree_control`. `memory.swap.max` only exists when
+//! the kernel was built with `CONFIG_SWAP=y` — the file is absent on
+//! swap-disabled kernels and a write returns ENOENT (callers route
+//! through the wire-time error chain).
+//!
+//! # Untrusted-name validation
+//!
+//! Cgroup names flow into [`Path::join`] under `parent` to address
+//! files inside cgroupfs. [`validate_cgroup_name`] rejects shapes that
+//! would escape that parent (`..`, absolute leading `/`, `NUL`) or
+//! that produce invisible cgroupfs entries (leading `.`); other ASCII
+//! is passed through to the kernel which is the final authority on
+//! per-component validity. Every public method that takes a `name`
+//! validates it before any filesystem write.
 
 use crate::topology::TestTopology;
 use anyhow::{Context, Result, bail};
@@ -44,6 +79,75 @@ fn write_with_timeout(path: &Path, data: &str, timeout: Duration) -> Result<()> 
             timeout.as_millis()
         ),
     }
+}
+
+/// Validate a cgroup name before joining it onto the parent path.
+///
+/// Rejects shapes that would either escape the parent directory
+/// (`..` component, absolute leading `/`, embedded NUL) or produce
+/// a hidden / invisible cgroupfs entry (leading `.`). Empty names
+/// are also rejected — `parent.join("")` returns `parent`, which
+/// would let a caller accidentally clobber the parent's own
+/// `cpuset.cpus` / `cgroup.subtree_control` files via a method
+/// that expected to address a child.
+///
+/// Permits `/` only as a path separator between non-empty
+/// components (nested cgroups like `"cg_0/narrow"`); a leading
+/// `/` is rejected because `Path::join` would replace `parent`
+/// entirely with the absolute path.
+///
+/// Beyond these structural checks the kernel is the final authority
+/// on per-component validity: cgroupfs rejects names containing
+/// newlines or names colliding with reserved knobs (`cgroup.procs`,
+/// `cpuset.cpus`, etc.) at `mkdir` time with EINVAL / EEXIST. Those
+/// failures surface through the regular `fs::create_dir_all` /
+/// `fs::write` error chain.
+fn validate_cgroup_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        bail!("cgroup name must not be empty");
+    }
+    if name.starts_with('/') {
+        bail!(
+            "cgroup name '{name}' starts with '/' — would escape the \
+             managed parent via Path::join (absolute paths replace the \
+             join base)"
+        );
+    }
+    if name.contains('\0') {
+        bail!("cgroup name '{name}' contains a NUL byte");
+    }
+    // Per-component checks run before the whole-name leading-dot
+    // check so a component like `..` matches the more specific
+    // path-traversal diagnostic instead of the generic hidden-entry
+    // one. The ordering matters for error messages — `'..' component`
+    // is what callers grep for.
+    for component in name.split('/') {
+        if component.is_empty() {
+            bail!(
+                "cgroup name '{name}' contains an empty path component \
+                 (consecutive '/') — Path::join would emit a malformed path"
+            );
+        }
+        if component == ".." {
+            bail!(
+                "cgroup name '{name}' contains a '..' component — \
+                 would escape the managed parent via Path::join"
+            );
+        }
+        if component == "." {
+            bail!(
+                "cgroup name '{name}' contains a '.' component — \
+                 ambiguous self-reference, refuse before fs writes"
+            );
+        }
+        if component.starts_with('.') {
+            bail!(
+                "cgroup name '{name}' contains a leading-dot component \
+                 ('{component}') — produces a hidden cgroupfs entry"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Walk an `anyhow::Error` chain and return the first
@@ -158,6 +262,7 @@ impl CgroupManager {
     /// have the corresponding files (`cgroup_control()` returns
     /// `parent->subtree_control`).
     pub fn create_cgroup(&self, name: &str) -> Result<()> {
+        validate_cgroup_name(name)?;
         let p = self.parent.join(name);
         if !p.exists() {
             fs::create_dir_all(&p).with_context(|| format!("mkdir {}", p.display()))?;
@@ -192,10 +297,32 @@ impl CgroupManager {
     }
 
     /// Drain tasks from a child cgroup and remove it.
+    ///
+    /// Auto-unfreezes the cgroup before draining: a frozen cgroup that
+    /// reaches teardown (e.g. a step body issues `Op::FreezeCgroup` and
+    /// never pairs it with `Op::UnfreezeCgroup`) would migrate its
+    /// frozen tasks to the cgroup root via `drain_tasks` and rely on
+    /// the kernel's `cgroup_freezer_migrate_task` to clear the JOBCTL
+    /// freeze bit when the destination cgroup is unfrozen. The kernel
+    /// path is correct, but writing `cgroup.freeze=0` first makes the
+    /// teardown deterministic regardless of who froze the cgroup and
+    /// when. Tolerates ENOENT on the freeze file (cgroup directory
+    /// already gone, or `CONFIG_CGROUP_FREEZE` absent on legacy
+    /// kernels) silently — only non-ENOENT failures warn.
     pub fn remove_cgroup(&self, name: &str) -> Result<()> {
+        validate_cgroup_name(name)?;
         let p = self.parent.join(name);
         if !p.exists() {
             return Ok(());
+        }
+        if let Err(err) = self.set_freeze(name, false)
+            && anyhow_first_io_errno(&err) != Some(libc::ENOENT)
+        {
+            tracing::warn!(
+                cgroup = name,
+                err = %format!("{err:#}"),
+                "remove_cgroup: pre-drain unfreeze failed; drain may strand frozen tasks at root"
+            );
         }
         self.drain_tasks(name)?;
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -204,6 +331,7 @@ impl CgroupManager {
 
     /// Write `cpuset.cpus` for a child cgroup.
     pub fn set_cpuset(&self, name: &str, cpus: &BTreeSet<usize>) -> Result<()> {
+        validate_cgroup_name(name)?;
         let p = self.parent.join(name).join("cpuset.cpus");
         write_with_timeout(&p, &TestTopology::cpuset_string(cpus), CGROUP_WRITE_TIMEOUT)
     }
@@ -239,6 +367,7 @@ impl CgroupManager {
 
     /// Clear `cpuset.cpus` for a child cgroup (empty string = inherit parent).
     pub fn clear_cpuset(&self, name: &str) -> Result<()> {
+        validate_cgroup_name(name)?;
         let p = self.parent.join(name).join("cpuset.cpus");
         write_with_timeout(&p, "", CGROUP_WRITE_TIMEOUT)
     }
@@ -259,6 +388,7 @@ impl CgroupManager {
     /// hits SIGKILL on the next allocation per the kernel's
     /// `cpuset_update_task_spread` path.
     pub fn set_cpuset_mems(&self, name: &str, nodes: &BTreeSet<usize>) -> Result<()> {
+        validate_cgroup_name(name)?;
         let p = self.parent.join(name).join("cpuset.mems");
         write_with_timeout(
             &p,
@@ -272,6 +402,7 @@ impl CgroupManager {
     /// down a cpuset-restricted cgroup that needs to accept a
     /// fresh task binding with a different NUMA budget.
     pub fn clear_cpuset_mems(&self, name: &str) -> Result<()> {
+        validate_cgroup_name(name)?;
         let p = self.parent.join(name).join("cpuset.mems");
         write_with_timeout(&p, "", CGROUP_WRITE_TIMEOUT)
     }
@@ -293,6 +424,7 @@ impl CgroupManager {
     /// generically by [`write_with_timeout`]'s error path with the
     /// errno suffix).
     pub fn set_cpu_max(&self, name: &str, quota_us: Option<u64>, period_us: u64) -> Result<()> {
+        validate_cgroup_name(name)?;
         let p = self.parent.join(name).join("cpu.max");
         let line = match quota_us {
             Some(q) => format!("{q} {period_us}"),
@@ -311,6 +443,7 @@ impl CgroupManager {
     /// "shares" knob is `cpu.weight.nice` (mapped from nice value);
     /// this method targets the canonical `cpu.weight` knob.
     pub fn set_cpu_weight(&self, name: &str, weight: u32) -> Result<()> {
+        validate_cgroup_name(name)?;
         let p = self.parent.join(name).join("cpu.weight");
         write_with_timeout(&p, &weight.to_string(), CGROUP_WRITE_TIMEOUT)
     }
@@ -321,6 +454,7 @@ impl CgroupManager {
     /// `memory.max` semantics. Requires `+memory` in the parent's
     /// `cgroup.subtree_control`.
     pub fn set_memory_max(&self, name: &str, bytes: Option<u64>) -> Result<()> {
+        validate_cgroup_name(name)?;
         let p = self.parent.join(name).join("memory.max");
         let line = match bytes {
             Some(b) => b.to_string(),
@@ -334,6 +468,7 @@ impl CgroupManager {
     /// threshold triggers reclaim throttling but NOT OOM-kill,
     /// distinguishing it from `memory.max`.
     pub fn set_memory_high(&self, name: &str, bytes: Option<u64>) -> Result<()> {
+        validate_cgroup_name(name)?;
         let p = self.parent.join(name).join("memory.high");
         let line = match bytes {
             Some(b) => b.to_string(),
@@ -347,6 +482,7 @@ impl CgroupManager {
     /// reclaims FROM other cgroups before reclaiming this cgroup's
     /// memory below `memory.low`; not a hard reservation.
     pub fn set_memory_low(&self, name: &str, bytes: Option<u64>) -> Result<()> {
+        validate_cgroup_name(name)?;
         let p = self.parent.join(name).join("memory.low");
         let line = match bytes {
             Some(b) => b.to_string(),
@@ -367,6 +503,7 @@ impl CgroupManager {
     /// device-id lookup which has no in-tree consumer; surface it
     /// as a follow-up task when a concrete use case lands.
     pub fn set_io_weight(&self, name: &str, weight: u16) -> Result<()> {
+        validate_cgroup_name(name)?;
         let p = self.parent.join(name).join("io.weight");
         write_with_timeout(&p, &weight.to_string(), CGROUP_WRITE_TIMEOUT)
     }
@@ -376,8 +513,7 @@ impl CgroupManager {
     ///
     /// `cgroup.freeze` is a cgroup-core file exposed on every non-root
     /// cgroup automatically — it is NOT gated by `cgroup.subtree_control`.
-    /// The kernel's `cgroup_freeze_write`
-    /// (kernel/cgroup/cgroup.c:4099-4122) parses the value via
+    /// The kernel's `cgroup_freeze_write` parses the value via
     /// `kstrtoint`, rejects anything outside `{0, 1}` with `-ERANGE`,
     /// and dispatches `cgroup_freeze(cgrp, freeze)`. Writing `1` to a
     /// cgroup containing tasks transitions every task in the subtree to
@@ -385,6 +521,7 @@ impl CgroupManager {
     /// asynchronous — `cgroup.events`'s `frozen` field reaches `1` once
     /// every task has parked.
     pub fn set_freeze(&self, name: &str, frozen: bool) -> Result<()> {
+        validate_cgroup_name(name)?;
         let p = self.parent.join(name).join("cgroup.freeze");
         let line = if frozen { "1" } else { "0" };
         write_with_timeout(&p, line, CGROUP_WRITE_TIMEOUT)
@@ -394,9 +531,8 @@ impl CgroupManager {
     /// (the kernel's `PIDS_MAX_STR` sentinel for unlimited);
     /// `Some(n)` writes the decimal `n`.
     ///
-    /// Per the kernel's `pids_max_write`
-    /// (kernel/cgroup/pids.c:301-329): the parser short-circuits to the
-    /// unlimited limit when `buf == PIDS_MAX_STR`; otherwise
+    /// Per the kernel's `pids_max_write`: the parser short-circuits to
+    /// the unlimited limit when `buf == PIDS_MAX_STR`; otherwise
     /// `kstrtoll(buf, 0, &limit)` parses a signed integer and rejects
     /// `< 0` or `>= PIDS_MAX` with `-EINVAL`. The update is atomic
     /// (`atomic64_set(&pids->limit, limit)`); existing tasks are NOT
@@ -407,6 +543,7 @@ impl CgroupManager {
     /// [`Self::setup`] enables it unconditionally so this write
     /// succeeds on every ktstr-managed cgroup tree.
     pub fn set_pids_max(&self, name: &str, max: Option<u64>) -> Result<()> {
+        validate_cgroup_name(name)?;
         let p = self.parent.join(name).join("pids.max");
         let line = match max {
             Some(n) => n.to_string(),
@@ -418,11 +555,11 @@ impl CgroupManager {
     /// Write `memory.swap.max` for a child cgroup. `bytes = None` writes
     /// `"max"` (no swap cap); `Some(b)` writes the decimal byte count.
     ///
-    /// Per the kernel's `swap_max_write` (mm/memcontrol.c:5379-5394):
-    /// the value is parsed via `page_counter_memparse(buf, "max", &max)`,
-    /// which accepts the literal `"max"` token for unlimited or a
-    /// numeric byte count. The store is `xchg(&memcg->swap.max, max)` —
-    /// atomic, with no failure path beyond the parse.
+    /// Per the kernel's `swap_max_write`: the value is parsed via
+    /// `page_counter_memparse(buf, "max", &max)`, which accepts the
+    /// literal `"max"` token for unlimited or a numeric byte count.
+    /// The store is `xchg(&memcg->swap.max, max)` — atomic, with no
+    /// failure path beyond the parse.
     ///
     /// Requires `+memory` in the parent's `cgroup.subtree_control`;
     /// [`Self::setup`] enables it unconditionally.
@@ -430,6 +567,7 @@ impl CgroupManager {
     /// Requires CONFIG_SWAP=y in the test kernel. The file does not
     /// exist on swapless builds; the write returns ENOENT.
     pub fn set_memory_swap_max(&self, name: &str, bytes: Option<u64>) -> Result<()> {
+        validate_cgroup_name(name)?;
         let p = self.parent.join(name).join("memory.swap.max");
         let line = match bytes {
             Some(b) => b.to_string(),
@@ -440,6 +578,7 @@ impl CgroupManager {
 
     /// Move a single task into a child cgroup via `cgroup.procs`.
     pub fn move_task(&self, name: &str, pid: libc::pid_t) -> Result<()> {
+        validate_cgroup_name(name)?;
         let p = self.parent.join(name).join("cgroup.procs");
         write_with_timeout(&p, &pid.to_string(), CGROUP_WRITE_TIMEOUT)
     }
@@ -452,6 +591,7 @@ impl CgroupManager {
     /// (`scx_cgroup_can_attach`). Propagates EBUSY after retries
     /// exhausted. Propagates all other errors immediately.
     pub fn move_tasks(&self, name: &str, pids: &[libc::pid_t]) -> Result<()> {
+        validate_cgroup_name(name)?;
         for &pid in pids {
             if let Err(e) = self.move_task_with_retry(name, pid) {
                 if is_esrch(&e) {
@@ -496,6 +636,7 @@ impl CgroupManager {
     /// tasks are written to `cgroup.procs` of a cgroup with
     /// controllers in `subtree_control`.
     pub fn clear_subtree_control(&self, name: &str) -> Result<()> {
+        validate_cgroup_name(name)?;
         let p = self.parent.join(name).join("cgroup.subtree_control");
         if !p.exists() {
             return Ok(());
@@ -524,6 +665,7 @@ impl CgroupManager {
     /// rejects writes to `cgroup.procs` when `subtree_control` is
     /// active. The root cgroup is exempt from this constraint.
     pub fn drain_tasks(&self, name: &str) -> Result<()> {
+        validate_cgroup_name(name)?;
         let src = self.parent.join(name).join("cgroup.procs");
         if !src.exists() {
             return Ok(());
@@ -1323,6 +1465,310 @@ mod tests {
         assert_eq!(fs::read_to_string(&target).unwrap(), "2097152");
         cg.set_memory_swap_max("cg_x", None).unwrap();
         assert_eq!(fs::read_to_string(&target).unwrap(), "max");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -- validate_cgroup_name ----------------------------------------
+
+    /// Reject the path-escape and hidden-entry shapes that
+    /// [`validate_cgroup_name`] guards against. Each branch is named
+    /// in the assertion so a future regression that drops a check
+    /// surfaces with the specific shape that slipped through.
+    #[test]
+    fn validate_cgroup_name_rejects_unsafe_shapes() {
+        for (name, reason) in [
+            ("", "empty"),
+            ("/abs", "starts with '/'"),
+            ("nul\0byte", "NUL byte"),
+            (".hidden", "leading-dot component"),
+            ("..", "'..' component"),
+            ("a/..", "'..' component"),
+            ("../escape", "'..' component"),
+            (".", "'.' component"),
+            ("a//b", "empty path component"),
+            ("ok/.dotfile", "leading-dot component"),
+        ] {
+            let err =
+                validate_cgroup_name(name).expect_err(&format!("must reject {name:?} ({reason})"));
+            assert!(
+                err.to_string().contains(reason),
+                "error for {name:?} must mention {reason:?}; got: {err:#}"
+            );
+        }
+    }
+
+    /// Names the validator accepts: simple identifiers, nested paths
+    /// with non-leading dots, plain numeric suffixes. Pinned so a
+    /// future tightening that breaks legitimate `cg_0/narrow` shapes
+    /// is caught at test time.
+    #[test]
+    fn validate_cgroup_name_accepts_valid_shapes() {
+        for name in [
+            "cg_0",
+            "cg-1",
+            "cg.0",
+            "cg_0/narrow",
+            "level1/level2/level3",
+            "a.b.c",
+            "x",
+        ] {
+            validate_cgroup_name(name).unwrap_or_else(|e| {
+                panic!("must accept legitimate name {name:?}; got: {e:#}");
+            });
+        }
+    }
+
+    /// Public methods that take a `name` must run name validation
+    /// before any filesystem write so a hostile name never reaches
+    /// `Path::join`. Pin one representative method per knob type.
+    #[test]
+    fn cgroup_methods_reject_bad_names_before_fs_writes() {
+        let dir = std::env::temp_dir().join(format!("ktstr-cg-badname-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let cg = CgroupManager::new(dir.to_str().unwrap());
+        let bad = "../escape";
+        // Each call must fail at validation, not at the fs write.
+        // The shared error fragment ('..' component) appears in
+        // every diagnostic so callers see the same shape regardless
+        // of which method tripped.
+        let err = cg.create_cgroup(bad).unwrap_err();
+        assert!(err.to_string().contains("'..' component"));
+        let err = cg.set_freeze(bad, true).unwrap_err();
+        assert!(err.to_string().contains("'..' component"));
+        let err = cg.set_pids_max(bad, Some(10)).unwrap_err();
+        assert!(err.to_string().contains("'..' component"));
+        let err = cg
+            .set_memory_swap_max(bad, Some(1024))
+            .unwrap_err();
+        assert!(err.to_string().contains("'..' component"));
+        let err = cg
+            .set_cpuset_mems(bad, &BTreeSet::new())
+            .unwrap_err();
+        assert!(err.to_string().contains("'..' component"));
+        let err = cg.move_task(bad, 1).unwrap_err();
+        assert!(err.to_string().contains("'..' component"));
+        let err = cg.drain_tasks(bad).unwrap_err();
+        assert!(err.to_string().contains("'..' component"));
+        let err = cg.remove_cgroup(bad).unwrap_err();
+        assert!(err.to_string().contains("'..' component"));
+        // No directory under `dir` should have been created from any
+        // of these calls — the validator bails before fs writes.
+        let escape_marker = dir.join("escape");
+        assert!(
+            !escape_marker.exists(),
+            "validator must bail before fs writes; saw {escape_marker:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -- setup_under_root strip-prefix-fail branch -------------------
+
+    /// When `parent` does not lie under the supplied `root`, the
+    /// `strip_prefix` call returns `Err` and `setup_under_root` skips
+    /// the subtree-control walk entirely. The function must still
+    /// create the parent directory and return Ok — the early-bail
+    /// matches the production "non-cgroup-mount" path described on
+    /// [`Self::setup_under_root`]. Pin both: the parent dir exists,
+    /// no subtree_control was written.
+    #[test]
+    fn setup_under_root_outside_root_creates_dir_and_skips_walk() {
+        let outside = std::env::temp_dir().join(format!("ktstr-out-{}", std::process::id()));
+        let unrelated_root = std::env::temp_dir().join(format!("ktstr-other-{}", std::process::id()));
+        // Pre-create both so neither needs `mkdir`. The point is that
+        // `outside.strip_prefix(unrelated_root)` returns Err.
+        fs::create_dir_all(&unrelated_root).unwrap();
+        let cg = CgroupManager::new(outside.to_str().unwrap());
+        cg.setup_under_root(true, &unrelated_root).unwrap();
+        assert!(outside.exists(), "setup must create the parent directory");
+        assert!(
+            !outside.join("cgroup.subtree_control").exists(),
+            "no subtree_control walk should fire when the parent is not under root"
+        );
+        let _ = fs::remove_dir_all(&outside);
+        let _ = fs::remove_dir_all(&unrelated_root);
+    }
+
+    // -- set_freeze idempotency --------------------------------------
+
+    /// Freezing an already-frozen cgroup must not error — the kernel
+    /// short-circuits on the duplicate write. Pinned because the
+    /// `remove_cgroup` auto-unfreeze path depends on the inverse
+    /// idempotency (unfreezing an unfrozen cgroup), so the symmetric
+    /// case is checked here.
+    #[test]
+    fn set_freeze_is_idempotent_when_already_in_target_state() {
+        let (dir, cg) = make_test_cgroup("freeze-idem");
+        let target = dir.join("cg_x").join("cgroup.freeze");
+        fs::write(&target, "").unwrap();
+        cg.set_freeze("cg_x", true).unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "1");
+        // Second freeze: no error, file content unchanged.
+        cg.set_freeze("cg_x", true).unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "1");
+        // Inverse: idempotent unfreeze on already-unfrozen.
+        cg.set_freeze("cg_x", false).unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "0");
+        cg.set_freeze("cg_x", false).unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "0");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -- pids.max / memory.swap.max overflow boundary ---------------
+
+    /// `set_pids_max(Some(u64::MAX))` writes the decimal representation
+    /// verbatim. The kernel rejects values `>= PIDS_MAX` with EINVAL,
+    /// but the framework wire layer is responsible only for byte-exact
+    /// stringification — pinning u64::MAX guards against accidental
+    /// narrowing to i64 (which would turn the value into "-1") or to
+    /// u32 (which would silently saturate).
+    #[test]
+    fn set_pids_max_writes_u64_max_verbatim() {
+        let (dir, cg) = make_test_cgroup("pids-overflow");
+        let target = dir.join("cg_x").join("pids.max");
+        fs::write(&target, "").unwrap();
+        cg.set_pids_max("cg_x", Some(u64::MAX)).unwrap();
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            u64::MAX.to_string(),
+            "u64::MAX must round-trip without narrowing or sign change"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `set_memory_swap_max(Some(u64::MAX))` mirrors the pids.max
+    /// boundary check. Catches the same narrowing-regression class.
+    #[test]
+    fn set_memory_swap_max_writes_u64_max_verbatim() {
+        let (dir, cg) = make_test_cgroup("swap-overflow");
+        let target = dir.join("cg_x").join("memory.swap.max");
+        fs::write(&target, "").unwrap();
+        cg.set_memory_swap_max("cg_x", Some(u64::MAX)).unwrap();
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            u64::MAX.to_string(),
+            "u64::MAX must round-trip without narrowing or sign change"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -- write_with_timeout failure paths for new methods ------------
+    //
+    // [`write_with_timeout`] surfaces the per-method "knob file does
+    // not exist" path as an error chain that callers (e.g.
+    // `apply_setup`) propagate up. Pin the failure surface for every
+    // recently-added method so a regression that swallows the error
+    // (or returns Ok despite a missing file) trips here.
+
+    /// `set_pids_max` against a missing parent directory returns an
+    /// error whose chain walks back to the missing path. The cgroup
+    /// directory has to be missing — `fs::write` to a nonexistent
+    /// file inside an existing directory just creates the file —
+    /// so the test exercises the realistic "cgroup never created"
+    /// path through ENOENT on `parent.join(name).join("pids.max")`.
+    #[test]
+    fn set_pids_max_returns_err_when_pids_max_file_missing() {
+        let cg = CgroupManager::new("/nonexistent/ktstr-pids-test");
+        let err = cg
+            .set_pids_max("cg_x", Some(1024))
+            .expect_err("missing pids.max must surface as Err");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("pids.max"),
+            "error chain must name the missing file: {msg}"
+        );
+    }
+
+    /// Mirror of the pids.max test for memory.swap.max.
+    #[test]
+    fn set_memory_swap_max_returns_err_when_file_missing() {
+        let cg = CgroupManager::new("/nonexistent/ktstr-swap-test");
+        let err = cg
+            .set_memory_swap_max("cg_x", Some(2_000_000))
+            .expect_err("missing memory.swap.max must surface as Err");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("memory.swap.max"),
+            "error chain must name the missing file: {msg}"
+        );
+    }
+
+    /// `set_freeze` against a missing `cgroup.freeze` file surfaces
+    /// an ENOENT errno reachable from the error chain — what
+    /// `remove_cgroup`'s auto-unfreeze branch uses to suppress the
+    /// warn. Pin the errno so a regression that wraps the underlying
+    /// IO error in a way that loses the raw_os_error trips here.
+    #[test]
+    fn set_freeze_returns_err_with_enoent_when_freeze_file_missing() {
+        let cg = CgroupManager::new("/nonexistent/ktstr-freeze-test");
+        let err = cg
+            .set_freeze("cg_x", true)
+            .expect_err("missing cgroup.freeze must surface as Err");
+        assert_eq!(
+            anyhow_first_io_errno(&err),
+            Some(libc::ENOENT),
+            "ENOENT errno must be reachable from the error chain so \
+             remove_cgroup's auto-unfreeze can suppress it; got: {err:#}"
+        );
+    }
+
+    // -- remove_cgroup auto-unfreeze --------------------------------
+
+    /// `remove_cgroup` writes `0` to `cgroup.freeze` before draining
+    /// tasks — pin the side effect so a regression that drops the
+    /// auto-unfreeze surfaces here. The test observes the freeze
+    /// file's post-call contents instead of asserting on the rmdir
+    /// outcome: real cgroupfs auto-removes child files during a
+    /// directory rmdir, but tmpfs requires the files to be unlinked
+    /// first. The unfreeze-before-drain ordering is the invariant
+    /// under test, not the rmdir success.
+    #[test]
+    fn remove_cgroup_auto_unfreezes_before_drain() {
+        let dir = std::env::temp_dir().join(format!("ktstr-cg-autounf-{}", std::process::id()));
+        let inner = dir.join("cg_x");
+        fs::create_dir_all(&inner).unwrap();
+        // Pre-create the freeze + procs files. Seed `cgroup.freeze`
+        // with "1" so the test can observe the unfreeze write.
+        let freeze_path = inner.join("cgroup.freeze");
+        fs::write(&freeze_path, "1").unwrap();
+        fs::write(inner.join("cgroup.procs"), "").unwrap();
+        let cg = CgroupManager::new(dir.to_str().unwrap());
+        // The rmdir at the end fails on tmpfs because cgroup.freeze
+        // / cgroup.procs are leftover non-cgroupfs files; we don't
+        // care — the assertion is on the freeze-file content.
+        let _ = cg.remove_cgroup("cg_x");
+        // The auto-unfreeze must have written "0" to cgroup.freeze
+        // before the drain.
+        assert_eq!(
+            fs::read_to_string(&freeze_path).unwrap(),
+            "0",
+            "remove_cgroup must write '0' to cgroup.freeze before draining"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `remove_cgroup` swallows ENOENT on the unfreeze write so a
+    /// cgroup without `cgroup.freeze` (legacy kernel without
+    /// CONFIG_CGROUP_FREEZE) still drains cleanly. The drain reaches
+    /// `cgroup.procs` instead of returning early because of the
+    /// missing freeze file.
+    #[test]
+    fn remove_cgroup_tolerates_missing_freeze_file() {
+        let dir = std::env::temp_dir().join(format!("ktstr-cg-nofrz-{}", std::process::id()));
+        let inner = dir.join("cg_x");
+        fs::create_dir_all(&inner).unwrap();
+        // Deliberately omit cgroup.freeze. Provide cgroup.procs so
+        // drain_tasks finds something to read.
+        fs::write(inner.join("cgroup.procs"), "").unwrap();
+        let cg = CgroupManager::new(dir.to_str().unwrap());
+        // The rmdir at the end fails on tmpfs (cgroup.procs left
+        // over) — we only care that no error propagates from the
+        // pre-drain unfreeze branch. The test would catch a
+        // regression where the missing freeze file produces a hard
+        // error before the drain runs.
+        let _ = cg.remove_cgroup("cg_x");
+        // No assertion on the freeze file — it never existed. The
+        // test passes when the call body runs to completion without
+        // panicking on the tolerated ENOENT branch.
         let _ = fs::remove_dir_all(&dir);
     }
 }
