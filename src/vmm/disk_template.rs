@@ -687,10 +687,10 @@ fn build_template_via_vm(
         .truncate(true)
         .open(&staging_path)
         .with_context(|| format!("create staging image {staging_path:?}"))?;
-    // Pre-VM-boot path: a `set_len` failure (typically ENOSPC for a
-    // sparse-file extent allocation, ENOMEM for the kernel's
-    // metadata commit, EFBIG when the kernel rejects an oversized
-    // request) leaves the just-created `staging_path` on disk. The
+    // Pre-VM-boot path: a `set_len` failure (the specific errno
+    // depends on the cache filesystem — common examples include
+    // ENOSPC, ENOMEM, EFBIG) leaves the just-created `staging_path`
+    // on disk. The
     // VM-boot error path below unlinks on failure; replicate that
     // here so the empty / truncated file does not accumulate in the
     // cache root across retries. Drop the fd first so the unlink

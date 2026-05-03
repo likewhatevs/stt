@@ -2513,8 +2513,8 @@ impl KtstrVm {
         // instead of the configured rate) and burst capacities set
         // without a refill rate (a one-shot bucket that never
         // refills). Run BEFORE allocating any backing-file resources
-        // so a misconfigured throttle bails before host disk / VM
-        // memory commitments.
+        // so a misconfigured throttle bails before disk-side host
+        // commitments.
         disk.throttle
             .validate()
             .map_err(|e| anyhow::anyhow!("invalid disk throttle: {e}"))?;

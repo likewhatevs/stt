@@ -7065,6 +7065,185 @@ mod tests {
         assert_eq!(RETRY_TIMER_MAX_NANOS, 1_000_000_000);
     }
 
+    /// `worker_dispatch_event` routes STOP_TOKEN with EventSet::IN
+    /// to `Stop`. The worker treats this as a clean exit signal —
+    /// any other action would mean the device's `Drop::drop`
+    /// stop-fd write either gets lost (no exit) or is misclassified
+    /// as a drain-and-then-exit (extra drain iteration on a queue
+    /// that's about to be dismantled).
+    #[test]
+    fn worker_dispatch_stop_token_clean() {
+        assert_eq!(
+            worker_dispatch_event(EventSet::IN, STOP_TOKEN),
+            WorkerDispatchAction::Stop,
+        );
+    }
+
+    /// `worker_dispatch_event` routes KICK_TOKEN with EventSet::IN
+    /// to `Drain { throttle_token_fired: false }`. The drain is
+    /// guarded by the `last_known_blocked` skip in the worker
+    /// loop, so a kick that arrives while the throttle is stalled
+    /// must NOT force the drain — only THROTTLE_TOKEN does.
+    #[test]
+    fn worker_dispatch_kick_token_clean() {
+        assert_eq!(
+            worker_dispatch_event(EventSet::IN, KICK_TOKEN),
+            WorkerDispatchAction::Drain {
+                throttle_token_fired: false,
+            },
+        );
+    }
+
+    /// `worker_dispatch_event` routes THROTTLE_TOKEN with
+    /// EventSet::IN to `Drain { throttle_token_fired: true }`.
+    /// Setting the flag is load-bearing for liveness: it forces
+    /// the drain past `last_known_blocked` so the rolled-back
+    /// chain is retried after the bucket refill timer expires.
+    #[test]
+    fn worker_dispatch_throttle_token_sets_flag() {
+        assert_eq!(
+            worker_dispatch_event(EventSet::IN, THROTTLE_TOKEN),
+            WorkerDispatchAction::Drain {
+                throttle_token_fired: true,
+            },
+        );
+    }
+
+    /// Unknown token dispatches to `Skip` and the worker loop
+    /// continues without draining. Defends against a future
+    /// regression that registers an additional fd on the same
+    /// epoll without extending the dispatch match.
+    #[test]
+    fn worker_dispatch_unknown_token_skips() {
+        for token in [0u64, 4, 99, u64::MAX] {
+            assert_eq!(
+                worker_dispatch_event(EventSet::IN, token),
+                WorkerDispatchAction::Skip,
+                "token {token} must dispatch to Skip",
+            );
+        }
+    }
+
+    /// EPOLLERR | IN on KICK_TOKEN still drains. Eventfd
+    /// `eventfd_poll` co-sets EPOLLIN whenever count > 0, and
+    /// EPOLLERR when count == ULLONG_MAX. The recovery is for the
+    /// per-token handler's `kick_fd.read()` to drain the saturated
+    /// counter — so the dispatch must still produce
+    /// `Drain { throttle_token_fired: false }`.
+    #[test]
+    fn worker_dispatch_kick_token_with_epollerr_still_drains() {
+        let event_set = EventSet::IN | EventSet::ERROR;
+        assert_eq!(
+            worker_dispatch_event(event_set, KICK_TOKEN),
+            WorkerDispatchAction::Drain {
+                throttle_token_fired: false,
+            },
+            "EPOLLERR on eventfd indicates counter saturation; \
+             fall through to per-token drain so the read clears it",
+        );
+    }
+
+    /// EPOLLERR | IN on THROTTLE_TOKEN still drains. Timerfd
+    /// never sets EPOLLERR (timerfd_poll only checks ticks), so
+    /// observing it means the kernel contract changed — but the
+    /// dispatch still falls through and the timerfd read in the
+    /// worker arm yields EAGAIN if no expiry is queued. Net
+    /// effect: defensive log + no-op.
+    #[test]
+    fn worker_dispatch_throttle_token_with_epollerr_still_drains() {
+        let event_set = EventSet::IN | EventSet::ERROR;
+        assert_eq!(
+            worker_dispatch_event(event_set, THROTTLE_TOKEN),
+            WorkerDispatchAction::Drain {
+                throttle_token_fired: true,
+            },
+        );
+    }
+
+    /// EPOLLERR | IN on STOP_TOKEN still stops. Stop-fd is an
+    /// eventfd (same EFD_NONBLOCK flags as kick_fd); saturation
+    /// is implausible because Drop writes 1 once. But if it ever
+    /// happens (e.g. a regression hands the worker a long-lived
+    /// stop_fd whose counter accumulated), Stop semantics
+    /// dominate ERR — there's no useful recovery once we've
+    /// decided to exit.
+    #[test]
+    fn worker_dispatch_stop_token_with_epollerr_still_stops() {
+        let event_set = EventSet::IN | EventSet::ERROR;
+        assert_eq!(
+            worker_dispatch_event(event_set, STOP_TOKEN),
+            WorkerDispatchAction::Stop,
+        );
+    }
+
+    /// EPOLLHUP | IN on KICK_TOKEN still drains. eventfd_poll
+    /// never sets POLLHUP, so observing it is structurally
+    /// impossible for our owned eventfd — but we log defensively
+    /// and the dispatch still falls through. The per-token
+    /// handler's `kick_fd.read()` is harmless in any case.
+    #[test]
+    fn worker_dispatch_kick_token_with_epollhup_still_drains() {
+        let event_set = EventSet::IN | EventSet::HANG_UP;
+        assert_eq!(
+            worker_dispatch_event(event_set, KICK_TOKEN),
+            WorkerDispatchAction::Drain {
+                throttle_token_fired: false,
+            },
+        );
+    }
+
+    /// EPOLLERR ALONE (no EPOLLIN) on KICK_TOKEN still drains.
+    /// Reaching this state in production for eventfd is
+    /// structurally impossible (count==ULLONG_MAX implies
+    /// count>0 implies EPOLLIN is also set per eventfd_poll), but
+    /// the dispatch must remain robust if a future kernel patch
+    /// changes the contract or a different fd type is registered.
+    /// Falling through to the per-token handler's read is the
+    /// canonical recovery; the read returns EAGAIN harmlessly if
+    /// no data is queued.
+    #[test]
+    fn worker_dispatch_kick_token_epollerr_alone_still_drains() {
+        let event_set = EventSet::ERROR;
+        assert_eq!(
+            worker_dispatch_event(event_set, KICK_TOKEN),
+            WorkerDispatchAction::Drain {
+                throttle_token_fired: false,
+            },
+        );
+    }
+
+    /// EPOLLERR | EPOLLHUP | IN on THROTTLE_TOKEN: every defensive
+    /// flag is set at once. The dispatch still drains and sets
+    /// the throttle-fired marker. Catches a regression that
+    /// short-circuits on EPOLLHUP before reaching the token
+    /// match.
+    #[test]
+    fn worker_dispatch_all_flags_throttle_still_drains() {
+        let event_set = EventSet::IN | EventSet::ERROR | EventSet::HANG_UP;
+        assert_eq!(
+            worker_dispatch_event(event_set, THROTTLE_TOKEN),
+            WorkerDispatchAction::Drain {
+                throttle_token_fired: true,
+            },
+        );
+    }
+
+    /// EpollEvent::new + event_set roundtrip pin. Defends against
+    /// a vmm-sys-util regression that lost the EventSet::ERROR or
+    /// EventSet::HANG_UP bit-mapping — without it, the dispatch
+    /// helper's `event_set.contains(EventSet::ERROR)` checks would
+    /// silently fail and the warn log would never fire on
+    /// saturation.
+    #[test]
+    fn epoll_event_set_roundtrip_pin() {
+        let combo = EventSet::IN | EventSet::ERROR | EventSet::HANG_UP;
+        let ev = EpollEvent::new(combo, KICK_TOKEN);
+        assert_eq!(ev.data(), KICK_TOKEN);
+        assert!(ev.event_set().contains(EventSet::IN));
+        assert!(ev.event_set().contains(EventSet::ERROR));
+        assert!(ev.event_set().contains(EventSet::HANG_UP));
+    }
+
     /// `nanos_until_n_tokens` saturates at `u64::MAX` when the
     /// deficit is pathologically large relative to refill_rate.
     /// Path: `numerator = deficit * 1e9` in u128 → divide by

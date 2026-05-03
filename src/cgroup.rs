@@ -97,10 +97,11 @@ impl CgroupManager {
     ///
     /// `enable_cpu_controller` gates `+cpu` only — the memory, pids, and
     /// io controllers are always enabled because the test framework's
-    /// CgroupDef builders (`memory_max`, `pids_max`, `io_weight`,
-    /// `memory_swap_max`) can land on any cgroup the test author defines,
-    /// and per-write lazy enablement would race against concurrent
-    /// sibling cgroups reading their controller files. Per the cgroup v2
+    /// CgroupDef builders (examples include memory_max, pids_max, io_weight,
+    /// memory_swap_max) can land on any cgroup the test author defines,
+    /// and per-write lazy enablement would race against concurrent new
+    /// sibling cgroup creation where controller files would not yet exist.
+    /// Per the cgroup v2
     /// docs ("Documentation/admin-guide/cgroup-v2.rst"), `+memory`
     /// enables memory controller files including `memory.max`,
     /// `memory.high`, `memory.swap.max`; `+pids` enables `pids.max`;

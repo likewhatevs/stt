@@ -406,7 +406,7 @@ pub struct PidsLimits {
     /// `pids.max` task-count ceiling. `None` writes the literal
     /// string `"max"` (the kernel's `PIDS_MAX_STR` sentinel for
     /// unlimited). `Some(n)` writes the decimal `n`. The kernel
-    /// rejects negative or `>= PIDS_MAX (1 << 22)` values with
+    /// rejects negative or `>= PIDS_MAX (PID_MAX_LIMIT + 1, typically ~4M on 64-bit)` values with
     /// EINVAL; the framework's `apply_setup` rejects `Some(0)`
     /// before the syscall (a 0 limit silently halts every fork
     /// inside the cgroup, including the spawned worker's own
