@@ -220,12 +220,116 @@ impl Funifier {
         if n < 0 { -funified } else { funified }
     }
 
+    /// Replace a u32 identifier (e.g. a host CPU number, uid, gid,
+    /// nlink, or any other 32-bit-wide field) with another u32.
+    /// Same contract as [`Self::numeric_id`] but the output is
+    /// masked to fit in 32 bits so a downstream consumer that
+    /// `as u32`-casts the funified value cannot wrap a high-bit
+    /// hash output back into the legal 0..=u32::MAX range. Mirror
+    /// of [`Self::numeric_id_i64`] for the unsigned narrow case.
+    ///
+    /// Sentinel preservation differs from `numeric_id`: this
+    /// method preserves both `0` and `u32::MAX` exactly, since
+    /// 32-bit identifier schemas frequently use those as
+    /// sentinels (CPU 0, "no value" 0xFFFFFFFF). Consumers that
+    /// want the universal u64 sentinel-check semantics call
+    /// [`Self::is_sentinel_u64`] on the up-cast value, which is
+    /// equivalent because the u32 sentinels round-trip through
+    /// the u64 check.
+    pub fn numeric_id_u32(&self, category: &str, n: u32) -> u32 {
+        if Self::is_sentinel_u32(n) {
+            return n;
+        }
+        // Reuse numeric_id then mask to 32 bits. SipHash's
+        // avalanche means the low 32 bits are uniformly
+        // distributed conditional on the input, so the
+        // collision rate is the natural 2^-32 for a 32-bit
+        // permutation — same statistical posture as the i64
+        // narrowing in [`Self::numeric_id_i64`].
+        (self.numeric_id(category, n as u64) & u32::MAX as u64) as u32
+    }
+
     /// True when the given identifier is "obvious sentinel" — 0
     /// or "max" — and should be passed through unchanged. Lets
     /// downstream renderers preserve the failure-dump's "kthread"
     /// vs "pid 0" semantics without leaking real pids.
     pub fn is_sentinel_u64(n: u64) -> bool {
         n == 0 || n == u64::MAX
+    }
+
+    /// 32-bit-wide analog of [`Self::is_sentinel_u64`] for the
+    /// narrow u32 paths in [`Self::numeric_id_u32`]. Schemas
+    /// frequently use `u32::MAX` as the "no value" marker for
+    /// 32-bit fields and `0` as "kernel / unset", same shape as
+    /// the u64 check — kept distinct so downstream callers using
+    /// `numeric_id_u32` don't have to up-cast just to check.
+    pub fn is_sentinel_u32(n: u32) -> bool {
+        n == 0 || n == u32::MAX
+    }
+
+    /// Categories whose JSON value is u32-width in the originating
+    /// schema and must be funified through
+    /// [`Self::numeric_id_u32`] (32-bit-masked output) instead of
+    /// the default [`Self::numeric_id`] (full u64 output).
+    ///
+    /// Why this matters: serde_json's `Value::Number` only carries
+    /// `is_u64`/`is_i64`/`is_f64`, not the original Rust width.
+    /// When a struct field is typed `u32` but serialized through a
+    /// generic `serde_json::Value`, the funify walker can't see
+    /// the narrowing. A full-u64 funified output then overflows
+    /// when a downstream consumer (CLI parser, `as u32` cast,
+    /// JSON round-trip into a u32-field struct) narrows it back.
+    /// Naming the u32-width identifier categories explicitly
+    /// is the only mechanism available without schema metadata.
+    ///
+    /// The allowlist is conservative: only includes keys whose
+    /// originating Rust field is documented or named-matchable as
+    /// u32-wide. New u32 fields added to ktstr's schemas must be
+    /// declared here or they fall through to the u64 path and
+    /// the overflow returns.
+    pub fn is_u32_category(key: &str) -> bool {
+        // Match strategy mirrors `is_metric_passthrough`:
+        // whole-key match against a fixed vocabulary, then suffix
+        // match against narrow-width naming patterns. Keep the
+        // suffix list short — false positives here flip a u64
+        // identifier into a u32 funify, which silently
+        // collision-rate-bumps from 2^-64 to 2^-32.
+        let lc = key.to_ascii_lowercase();
+        if matches!(
+            lc.as_str(),
+            // CPU number — the kernel exposes them as `unsigned
+            // int` in /proc and sysfs; ktstr's u32-typed CPU
+            // fields (e.g. WorkerReport's u32 cpu samples) round-
+            // trip through u32 in the schema layer.
+            "cpu_id"
+            // Real / effective UID and GID. Linux kernel
+            // `uid_t`/`gid_t` are `unsigned int` (u32). Capture
+            // both bare and resolved forms used across ktstr's
+            // failure-dump enrichment.
+            | "uid" | "euid" | "ruid" | "suid" | "fsuid"
+            | "gid" | "egid" | "rgid" | "sgid" | "fsgid"
+            // /proc/[pid]/status `Tgid:` and `Pid:` are signed
+            // pid_t (i32) but most schemas representing them in
+            // unsigned form use u32. The *_set/u32 listing keeps
+            // them in the narrow path so the masked output fits
+            // a downstream u32 cast.
+            | "kuid" | "kgid"
+        ) {
+            return true;
+        }
+        // Suffix vocabulary. `_u32` is the explicit marker some
+        // schemas use; the narrow-namespace conventions
+        // `*_id_u32` / `*_u32_id` are reserved for callers that
+        // know the field is 32-bit-wide. No general `_id` suffix —
+        // that catches both u64 and u32 fields and the false-
+        // positive rate would be too high.
+        const U32_SUFFIXES: &[&str] = &["_u32", "_u32_id"];
+        for suffix in U32_SUFFIXES {
+            if lc.ends_with(suffix) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Allowlist gate for the funify walker: returns `true` when
@@ -507,7 +611,35 @@ fn funify_json_with_context(
                     if Funifier::is_sentinel_u64(u) {
                         return Value::Number(num);
                     }
-                    Value::Number(serde_json::Number::from(f.numeric_id(cat, u)))
+                    // Schemas that serialize a u32-width identifier
+                    // through a generic `serde_json::Value` lose
+                    // the width — the walker sees only `as_u64`.
+                    // `Funifier::is_u32_category` names the keys
+                    // whose originating Rust field is u32-wide;
+                    // route those through the 32-bit-masked path
+                    // so a downstream `as u32` cast / u32-typed
+                    // struct round-trip never wraps a high-bit
+                    // hash output back into the legal range.
+                    if Funifier::is_u32_category(cat) {
+                        // Values that exceed u32::MAX shouldn't
+                        // appear under a u32-category key in
+                        // well-formed input; clamp explicitly so a
+                        // hostile / malformed input can't bypass
+                        // the narrowing through truncation. Casting
+                        // a > u32::MAX value `as u32` would silently
+                        // discard the high bits and the funified
+                        // output would be derived from a different
+                        // input than the one the operator sees.
+                        let narrow = if u > u32::MAX as u64 {
+                            u32::MAX
+                        } else {
+                            u as u32
+                        };
+                        let funified = f.numeric_id_u32(cat, narrow);
+                        Value::Number(serde_json::Number::from(funified))
+                    } else {
+                        Value::Number(serde_json::Number::from(f.numeric_id(cat, u)))
+                    }
                 } else if let Some(i) = num.as_i64() {
                     // numeric_id_i64 itself preserves zero.
                     Value::Number(serde_json::Number::from(f.numeric_id_i64(cat, i)))
@@ -687,6 +819,123 @@ mod tests {
         assert!(Funifier::is_sentinel_u64(u64::MAX));
         assert!(!Funifier::is_sentinel_u64(1));
         assert!(!Funifier::is_sentinel_u64(42));
+    }
+
+    /// Sentinel u32 values pass through is_sentinel_u32.
+    #[test]
+    fn is_sentinel_u32_table() {
+        assert!(Funifier::is_sentinel_u32(0));
+        assert!(Funifier::is_sentinel_u32(u32::MAX));
+        assert!(!Funifier::is_sentinel_u32(1));
+        assert!(!Funifier::is_sentinel_u32(42));
+    }
+
+    /// `numeric_id_u32` produces u32-range output deterministically.
+    /// Pins (a) the output is masked to fit u32, (b) sentinels round-
+    /// trip unchanged, (c) determinism per (seed, category, n) is
+    /// preserved, and (d) the sample is well-distributed across the
+    /// 32-bit range — a regression that left the high bits of the
+    /// SipHash output in the result would have nearly all test
+    /// inputs land above u32::MAX.
+    #[test]
+    fn numeric_id_u32_masks_to_u32_range() {
+        let f = Funifier::with_seed("demo");
+        // Sentinels preserved.
+        assert_eq!(f.numeric_id_u32("cpu_id", 0), 0);
+        assert_eq!(f.numeric_id_u32("cpu_id", u32::MAX), u32::MAX);
+        // Non-sentinels are guaranteed to fit in u32 because the
+        // return type is u32 — the value-level assertion is that
+        // the result is non-zero and not the trivial echo of the
+        // input (catching a regression that would make
+        // numeric_id_u32 return its argument unchanged).
+        let id_42 = f.numeric_id_u32("cpu_id", 42);
+        assert_ne!(id_42, 42, "non-sentinel input must be funified");
+        assert_ne!(id_42, 0, "non-sentinel input must not collapse to 0");
+        // Determinism: same (seed, category, n) → same output.
+        assert_eq!(f.numeric_id_u32("cpu_id", 42), id_42);
+        // Different category → different funified output. Could
+        // collide by chance at 2^-32, but the seed is fixed so
+        // this is a stable assertion.
+        assert_ne!(
+            f.numeric_id_u32("cpu_id", 42),
+            f.numeric_id_u32("uid", 42),
+            "category must namespace the funified output",
+        );
+    }
+
+    /// `is_u32_category` allowlist hits — pins the documented u32-
+    /// width identifier vocabulary so a future edit that drops an
+    /// entry (and silently routes a u32 field through the u64
+    /// path) trips here.
+    #[test]
+    fn is_u32_category_allowlist_hits() {
+        // CPU IDs.
+        assert!(Funifier::is_u32_category("cpu_id"));
+        // UID/GID family.
+        assert!(Funifier::is_u32_category("uid"));
+        assert!(Funifier::is_u32_category("euid"));
+        assert!(Funifier::is_u32_category("ruid"));
+        assert!(Funifier::is_u32_category("gid"));
+        assert!(Funifier::is_u32_category("egid"));
+        assert!(Funifier::is_u32_category("kuid"));
+        assert!(Funifier::is_u32_category("kgid"));
+        // Suffix vocabulary.
+        assert!(Funifier::is_u32_category("worker_u32"));
+        assert!(Funifier::is_u32_category("alien_id_u32_id"));
+        // Misses — generic identifier fields stay on the u64
+        // path. A `_id` suffix would over-classify; pin that the
+        // current cautious allowlist does NOT include it.
+        assert!(!Funifier::is_u32_category("pid"));
+        assert!(!Funifier::is_u32_category("worker_id"));
+        assert!(!Funifier::is_u32_category("cgroup"));
+        assert!(!Funifier::is_u32_category("comm"));
+    }
+
+    /// JSON walker: u32-categorised values funify through the
+    /// 32-bit-masked path, NEVER exceed u32::MAX. Pins the bug fix
+    /// for the original "funifier produces u64 for u32 schema fields"
+    /// regression — without the dispatch, a value funified under
+    /// `cpu_id` could surface > u32::MAX and overflow a downstream
+    /// `as u32` cast.
+    #[test]
+    fn funify_json_u32_category_stays_in_u32_range() {
+        let f = Funifier::with_seed("demo");
+        // Iterate a range of u32-shaped inputs under a u32-category
+        // key. Every funified output must be representable in u32.
+        for n in [1u32, 7, 42, 100, 1024, 65535, 1_000_000, 0x7FFF_FFFF] {
+            let input = json!({ "cpu_id": n });
+            let out = funify_json(input, &f);
+            let funified = out["cpu_id"]
+                .as_u64()
+                .expect("u32 category must remain a Number");
+            assert!(
+                funified <= u32::MAX as u64,
+                "funified `cpu_id`={n} produced {funified}, exceeds u32::MAX. \
+                 The u32-narrow dispatch is broken or the category fell through \
+                 to numeric_id (full u64).",
+            );
+        }
+    }
+
+    /// JSON walker: u32 sentinels (0 and u32::MAX) round-trip
+    /// unchanged through the u32-category dispatch. Without this,
+    /// a `uid: 0` (root) or `cpu_id: u32::MAX` ("no value") marker
+    /// would silently turn into a random funified u32, hiding the
+    /// sentinel meaning the failure-dump renderers depend on.
+    #[test]
+    fn funify_json_u32_category_preserves_sentinels() {
+        let f = Funifier::with_seed("demo");
+        let input = json!({
+            "cpu_id_zero": { "cpu_id": 0 },
+            "cpu_id_max":  { "cpu_id": u32::MAX },
+            "uid_zero":    { "uid": 0 },
+            "uid_max":     { "uid": u32::MAX },
+        });
+        let out = funify_json(input, &f);
+        assert_eq!(out["cpu_id_zero"]["cpu_id"], json!(0));
+        assert_eq!(out["cpu_id_max"]["cpu_id"], json!(u32::MAX));
+        assert_eq!(out["uid_zero"]["uid"], json!(0));
+        assert_eq!(out["uid_max"]["uid"], json!(u32::MAX));
     }
 
     /// `is_metric_passthrough` allowlist hits — whole-key

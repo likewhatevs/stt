@@ -144,10 +144,24 @@ const TRANSIENT_HOST_ERRNOS: &[i32] = &[
 /// All reads are best-effort: a missing field or unreadable file
 /// folds into `<unknown>` rather than failing the snapshot. The
 /// snapshot exists to give an operator hitting a SKIP banner one
-/// place to start triaging — `fds=1023/1024` is actionable, an
-/// opaque `ENOMEM` is not. Cheap enough (three small file reads,
-/// one readdir) that callers can take it on every transient
-/// classification without measurable cost.
+/// place to start triaging — current resource USAGE (`fds=1023`,
+/// `threads=42`) plus a binary `near_limit` indicator is enough
+/// to distinguish "test hit a host cap" from "kernel had a real
+/// fault". Cheap enough (two small file reads, one readdir) that
+/// callers can take it on every transient classification without
+/// measurable cost.
+///
+/// # Why no raw rlimits
+///
+/// Earlier revisions echoed the `RLIMIT_NOFILE` soft cap and
+/// `RLIMIT_NPROC` soft cap directly. Those values are
+/// host-specific fingerprints that the SKIP banner surfaces into
+/// every CI artifact, sidecar, and user-visible test log. The
+/// operator already knows their host config; the banner does not
+/// need to echo it back. The `near_limit` indicator (computed at
+/// snapshot time and left as a one-bit `yes/no`) preserves the
+/// actionable "are we close to a cap?" triage signal without
+/// leaking the cap itself.
 pub(crate) fn host_resource_snapshot() -> String {
     let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
     let limits = std::fs::read_to_string("/proc/self/limits").unwrap_or_default();
@@ -163,21 +177,52 @@ pub(crate) fn host_resource_snapshot() -> String {
         }
         "<unknown>".into()
     };
-    let pick_limit = |key: &str| -> String {
+    let pick_limit_value = |key: &str| -> Option<u64> {
         for line in limits.lines() {
             if let Some(rest) = line.strip_prefix(key) {
-                return rest.split_whitespace().next().unwrap_or("<unknown>").into();
+                let token = rest.split_whitespace().next()?;
+                return token.parse::<u64>().ok();
             }
         }
-        "<unknown>".into()
+        None
     };
 
     let vm_rss = pick(&status, "VmRSS:");
     let threads = pick(&status, "Threads:");
-    let max_files = pick_limit("Max open files");
-    let max_procs = pick_limit("Max processes");
+
+    // `near_limit` thresholds at 90% utilization — a soft tripwire
+    // that surfaces "we're exhausted" without revealing the cap.
+    // Both rlimits read here are SOFT caps (the first
+    // whitespace-separated value on the line); the kernel raises
+    // the hard cap on EMFILE before EAGAIN. The 90% threshold is
+    // chosen so a routine test that fans out a few hundred fds
+    // doesn't trip it, but a stuck-fd-leak hitting RLIMIT_NOFILE
+    // does. Failure to read either limit (operator cgroup hiding
+    // /proc/self/limits, sandbox stripping it) folds into "no" —
+    // a missing limit is not a near-limit signal.
+    let near_limit_fds = pick_limit_value("Max open files")
+        .map(|cap| {
+            // Saturating math because `fd_count * 10` could
+            // theoretically overflow u64 on a 64-bit host with
+            // billions of fds open — practically unreachable, but
+            // saturating is free and removes the if-large branch.
+            let scaled_count = (fd_count as u64).saturating_mul(10);
+            let scaled_cap = cap.saturating_mul(9);
+            scaled_count >= scaled_cap
+        })
+        .unwrap_or(false);
+    let thread_count = threads.parse::<u64>().unwrap_or(0);
+    let near_limit_procs = pick_limit_value("Max processes")
+        .map(|cap| {
+            let scaled_count = thread_count.saturating_mul(10);
+            let scaled_cap = cap.saturating_mul(9);
+            scaled_count >= scaled_cap
+        })
+        .unwrap_or(false);
+    let near_limit = near_limit_fds || near_limit_procs;
+
     format!(
-        "fds={fd_count}/{max_files}, vmrss={vm_rss}, threads={threads}, max_procs={max_procs}"
+        "fds={fd_count}, vmrss={vm_rss}, threads={threads}, near_limit={near_limit}"
     )
 }
 
@@ -8124,21 +8169,70 @@ mod tests {
     /// `host_resource_snapshot` must produce a single-line string
     /// naming the four key fields the operator needs when triaging a
     /// `ktstr: SKIP: resource contention: ...` banner: open-fd
-    /// count + soft cap, RSS, thread count, and process cap. The
-    /// values themselves are runtime-dependent (every CI runner has
-    /// a different RLIMIT shape) so the test pins only the SHAPE,
-    /// not the numbers — a regression that swallows a field would
-    /// fail here.
+    /// count, RSS, thread count, and a `near_limit` indicator that
+    /// summarises "are we close to RLIMIT_NOFILE / RLIMIT_NPROC?"
+    /// without echoing the cap value (host fingerprint). The
+    /// values themselves are runtime-dependent so the test pins
+    /// only the SHAPE, not the numbers — a regression that
+    /// swallows a field would fail here, AND any regression that
+    /// leaks a raw rlimit (max_files= / max_procs=) trips the
+    /// negative checks below.
     #[test]
     fn host_resource_snapshot_emits_all_keys() {
         let s = host_resource_snapshot();
         assert!(s.contains("fds="), "snapshot missing fds=: {s}");
         assert!(s.contains("vmrss="), "snapshot missing vmrss=: {s}");
         assert!(s.contains("threads="), "snapshot missing threads=: {s}");
-        assert!(s.contains("max_procs="), "snapshot missing max_procs=: {s}");
+        assert!(s.contains("near_limit="), "snapshot missing near_limit=: {s}");
         assert!(
             !s.contains('\n'),
             "snapshot must be single-line for banner formatting: {s:?}"
+        );
+    }
+
+    /// `host_resource_snapshot` must NOT echo raw RLIMIT_NOFILE /
+    /// RLIMIT_NPROC values. Those are host-specific fingerprints
+    /// that the SKIP banner surfaces into every CI artifact and
+    /// user-visible test log — leaking them lets a third party
+    /// reading a public failure dump infer host config. The
+    /// `near_limit` derived flag preserves the actionable triage
+    /// signal without the leak. Pins the deletion against a
+    /// regression that adds them back.
+    #[test]
+    fn host_resource_snapshot_does_not_leak_raw_rlimits() {
+        let s = host_resource_snapshot();
+        assert!(
+            !s.contains("max_files="),
+            "host_resource_snapshot must not leak the RLIMIT_NOFILE soft cap; got: {s}",
+        );
+        assert!(
+            !s.contains("max_procs="),
+            "host_resource_snapshot must not leak the RLIMIT_NPROC soft cap; got: {s}",
+        );
+        // `fds=N/M` was the old leakage shape — the snapshot now
+        // emits `fds=N` (count alone) so the fds= field must not
+        // contain a slash. Slice from `fds=` to the next comma or
+        // end of string and assert the slice has no `/`.
+        if let Some(rest) = s.strip_prefix("fds=").or_else(|| {
+            s.split_once("fds=").map(|(_, r)| r)
+        }) {
+            let fds_field = rest.split(',').next().unwrap_or(rest);
+            assert!(
+                !fds_field.contains('/'),
+                "snapshot's fds= field must not include the cap (slash form); got: {s}",
+            );
+        }
+    }
+
+    /// `near_limit` must surface as a boolean literal (`true` or
+    /// `false`). Pins the parser-friendly format against a
+    /// regression that swaps the boolean for an opaque token.
+    #[test]
+    fn host_resource_snapshot_near_limit_is_boolean() {
+        let s = host_resource_snapshot();
+        assert!(
+            s.contains("near_limit=true") || s.contains("near_limit=false"),
+            "near_limit must be boolean; got: {s}",
         );
     }
 
