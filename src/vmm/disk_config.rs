@@ -141,13 +141,15 @@ impl DiskThrottle {
             match self.iops {
                 Some(rate) if burst < rate => {
                     return Err(format!(
-                        "iops_burst_capacity ({}) must be >= iops ({})",
-                        burst, rate
+                        "iops_burst_capacity ({burst}) must be >= iops \
+                         ({rate}), or pass 0 to clear the burst override",
                     ));
                 }
                 None => {
                     return Err(
-                        "iops_burst_capacity set without iops refill rate".into(),
+                        "iops_burst_capacity set without iops refill rate, \
+                         or pass 0 to clear the burst override"
+                            .into(),
                     );
                 }
                 _ => {}
@@ -157,13 +159,16 @@ impl DiskThrottle {
             match self.bytes_per_sec {
                 Some(rate) if burst < rate => {
                     return Err(format!(
-                        "bytes_burst_capacity ({}) must be >= bytes_per_sec ({})",
-                        burst, rate
+                        "bytes_burst_capacity ({burst}) must be >= \
+                         bytes_per_sec ({rate}), or pass 0 to clear the \
+                         burst override",
                     ));
                 }
                 None => {
                     return Err(
-                        "bytes_burst_capacity set without bytes_per_sec refill rate".into(),
+                        "bytes_burst_capacity set without bytes_per_sec \
+                         refill rate, or pass 0 to clear the burst override"
+                            .into(),
                     );
                 }
                 _ => {}

@@ -218,6 +218,12 @@ pub enum Op {
     /// scheduler suspend/resume tests where the test body wants to
     /// observe how the scheduler handles a suddenly-frozen workload
     /// and the resumption sequence afterwards.
+    ///
+    /// Treats a missing cgroup as a step failure: the
+    /// `cgroup.freeze` write fails with `ENOENT` and the error
+    /// propagates via the `apply_setup` `with_context` chain.
+    /// Freezing a non-existent cgroup is NOT a no-op; only
+    /// freezing an already-frozen cgroup is.
     FreezeCgroup { cgroup: Cow<'static, str> },
     /// Unfreeze every task in the named cgroup via `cgroup.freeze`.
     ///
@@ -450,6 +456,33 @@ pub struct IoLimits {
 /// created once and run for the step duration. Use `Op::AddCgroup` +
 /// `Op::Spawn` directly when you need mid-step cgroup creation, removal,
 /// or other dynamic operations between spawn and collect.
+///
+/// # See also
+///
+/// `CgroupDef` only expresses the steady-state shape of a cgroup
+/// (name, cpuset, work groups, payload). State changes that need
+/// to happen DURING a step — without tearing the cgroup down and
+/// recreating it — go through dedicated [`Op`] variants instead:
+///
+/// * [`Op::FreezeCgroup`] / [`Op::UnfreezeCgroup`] — pause and
+///   resume every task in the cgroup via `cgroup.freeze` (the
+///   kernel-side asynchronous freeze path; not a SIGSTOP).
+///   Useful for scheduler suspend/resume tests that observe
+///   how the scheduler handles a workload that goes idle
+///   mid-step.
+/// * [`Op::SetCpuset`] — re-pin an existing cgroup's cpuset to
+///   exercise the scheduler's response to a moving CPU mask
+///   without disrupting the worker tasks themselves.
+/// * [`Op::AddCgroup`] / [`Op::RemoveCgroup`] — add or destroy
+///   cgroups mid-step when a `CgroupDef`'s lifecycle is
+///   tied to step duration but the test wants a different
+///   (e.g. nested) cgroup to appear or disappear partway
+///   through.
+///
+/// These describe transitions over time rather than the cgroup's
+/// identity, which is why they live as `Op` variants alongside
+/// the rest of the operation vocabulary rather than as
+/// `CgroupDef` builders.
 ///
 /// ```
 /// # use ktstr::scenario::ops::{CgroupDef, CpusetSpec};
