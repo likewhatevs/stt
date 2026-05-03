@@ -152,6 +152,53 @@ impl Default for ReproducerSpec {
     }
 }
 
+/// Substring marker [`map_affinity`] embeds in every hand-edit-required
+/// note (the topology-aware unresolved-fallback notes, the empty-
+/// `Exact` placeholder note, and the unresolved-`RandomSubset`
+/// placeholder note). Used by [`ReproducerSpec::is_runnable`] and
+/// [`ReproducerSpec::unresolved_count`] as the programmatic
+/// "spawn-time gate would reject this spec" signal so callers don't
+/// have to rerun the spawn-time gate just to check.
+///
+/// The marker INCLUDES the `rejects` verb so it does NOT match the
+/// resolved-`RandomSubset` informational note ("the spawn-time
+/// affinity gate accepts it without hand-editing") — that note is a
+/// confirmation of runnability, not a hand-edit prompt.
+const UNRESOLVED_NOTE_MARKER: &str = "spawn-time affinity gate rejects";
+
+impl ReproducerSpec {
+    /// Returns `true` when the spec is runnable as-is (the spawn-time
+    /// affinity gate accepts it without hand-editing). `false` means
+    /// at least one hand-edit-required note is present and the user
+    /// must update the rendered source before running.
+    ///
+    /// The check looks for the [`UNRESOLVED_NOTE_MARKER`] substring
+    /// in any of [`Self::notes`]; that marker is embedded by
+    /// [`map_affinity`] in the topology-aware unresolved-fallback
+    /// notes (`SingleCpu` / `LlcAligned` / `CrossCgroup`), the empty-
+    /// `Exact` placeholder note, and the unresolved-`RandomSubset`
+    /// placeholder note. Resolved-collapse notes
+    /// (`topology_resolved_note`) and informational notes
+    /// (fingerprint gaps, "additional X hints observed", etc.) do
+    /// not contain the marker.
+    #[allow(dead_code)]
+    pub fn is_runnable(&self) -> bool {
+        self.unresolved_count() == 0
+    }
+
+    /// Number of hand-edit-required notes in [`Self::notes`]. Counts
+    /// the same marker [`Self::is_runnable`] uses; useful for
+    /// surfacing "this reproducer needs N edits" messaging in
+    /// `cargo ktstr` tooling.
+    #[allow(dead_code)]
+    pub fn unresolved_count(&self) -> usize {
+        self.notes
+            .iter()
+            .filter(|n| n.contains(UNRESOLVED_NOTE_MARKER))
+            .count()
+    }
+}
+
 /// Produce a [`ReproducerSpec`] from a [`DebugCapture`].
 ///
 /// Pure function: same capture always produces the same spec. The
@@ -188,12 +235,13 @@ pub fn generate_spec(capture: &DebugCapture) -> ReproducerSpec {
 }
 
 fn failure_scheduler_name(capture: &DebugCapture) -> String {
-    // Prefer the failure-dump's render of the scheduler if present;
-    // FailureDumpReport doesn't carry the scheduler name field
-    // today (a likely follow-up enrichment), so derive from the
-    // capture's metadata where possible. For now, leave empty —
-    // generated source will note the scheduler-name omission and
-    // expect the user to fill it in.
+    // Always returns the empty string. The current
+    // [`FailureDumpReport`] shape does not carry a scheduler-name
+    // field, and [`DebugCapture`] itself does not duplicate it. The
+    // returned empty string signals to [`render_run_file_source`]
+    // that the rendered source should not emit a `// Scheduler:`
+    // comment line — the consumer fills in the scheduler name when
+    // pasting the generated reproducer into a test file.
     let _ = capture;
     String::new()
 }
@@ -206,19 +254,30 @@ fn map_workload_groups(fp: &WorkloadFingerprint, spec: &mut ReproducerSpec) {
         return;
     };
     spec.config.num_workers = primary.thread_count.max(1) as usize;
-    if fp.workload_groups.len() > 1 {
-        let alts: Vec<String> = fp
-            .workload_groups
-            .iter()
-            .skip(1)
-            .map(|g: &WorkloadGroupHint| {
-                format!("{} ({} threads)", g.cgroup_path, g.thread_count)
-            })
-            .collect();
-        spec.notes.push(format!(
-            "additional workload groups not modeled in primary spec: {}",
-            alts.join(", ")
-        ));
+    push_extras_note(
+        &mut spec.notes,
+        "additional workload groups not modeled in primary spec",
+        fp.workload_groups.iter().skip(1).map(|g: &WorkloadGroupHint| {
+            format!("{} ({} threads)", g.cgroup_path, g.thread_count)
+        }),
+    );
+}
+
+/// Emit an "additional X observed: ..." note when the fingerprint
+/// carries more than one hint of a kind. Centralises the pattern
+/// shared by [`map_workload_groups`], [`map_affinity`],
+/// [`map_work_type`], and [`map_sched_policy`]: skip-first-then-render
+/// the secondary entries, comma-join them, and only push when the
+/// iterator yields anything.
+///
+/// `header` is the lead phrase before the colon (e.g.
+/// `"additional affinity hints not modeled"`). `entries` is an
+/// iterator of pre-rendered `String` descriptions for each
+/// secondary entry.
+fn push_extras_note(notes: &mut Vec<String>, header: &str, entries: impl Iterator<Item = String>) {
+    let alts: Vec<String> = entries.collect();
+    if !alts.is_empty() {
+        notes.push(format!("{header}: {}", alts.join(", ")));
     }
 }
 
@@ -242,13 +301,20 @@ fn topology_aware_note(
     engine_action: &str,
     hand_edit_target: &str,
 ) -> String {
+    // Every unresolved-fallback note embeds the
+    // [`UNRESOLVED_NOTE_MARKER`] substring (currently
+    // `"spawn-time affinity gate rejects"`) so
+    // [`ReproducerSpec::is_runnable`] /
+    // [`ReproducerSpec::unresolved_count`] can count
+    // hand-edit-required notes uniformly across the topology-aware,
+    // empty-`Exact`, and unresolved-`RandomSubset` paths. The marker
+    // string here must stay in sync with the const definition.
     format!(
         "AffinityHint::{variant} observed without resolved CPUs; \
          emitting AffinityIntent::{variant} — the scenario engine \
-         {engine_action} at apply time. Direct \
-         WorkloadHandle::spawn rejects this variant (no topology \
-         context); use the scenario engine or hand-edit to \
-         {hand_edit_target}"
+         {engine_action} at apply time. The spawn-time affinity gate \
+         rejects this variant (no topology context); use the \
+         scenario engine or hand-edit to {hand_edit_target}"
     )
 }
 
@@ -408,18 +474,11 @@ fn map_affinity(fp: &WorkloadFingerprint, spec: &mut ReproducerSpec) {
         }
     };
 
-    if fp.affinity_hints.len() > 1 {
-        let alts: Vec<String> = fp
-            .affinity_hints
-            .iter()
-            .skip(1)
-            .map(|a| format!("{a:?}"))
-            .collect();
-        spec.notes.push(format!(
-            "additional affinity hints not modeled: {}",
-            alts.join(", ")
-        ));
-    }
+    push_extras_note(
+        &mut spec.notes,
+        "additional affinity hints not modeled",
+        fp.affinity_hints.iter().skip(1).map(|a| format!("{a:?}")),
+    );
 }
 
 fn map_work_type(fp: &WorkloadFingerprint, spec: &mut ReproducerSpec) {
@@ -453,18 +512,11 @@ fn map_work_type(fp: &WorkloadFingerprint, spec: &mut ReproducerSpec) {
         WorkTypeHint::IoConvoy => WorkType::IoConvoy,
     };
 
-    if fp.work_type_hints.len() > 1 {
-        let alts: Vec<String> = fp
-            .work_type_hints
-            .iter()
-            .skip(1)
-            .map(|w| format!("{w:?}"))
-            .collect();
-        spec.notes.push(format!(
-            "additional work-type hints observed: {}",
-            alts.join(", ")
-        ));
-    }
+    push_extras_note(
+        &mut spec.notes,
+        "additional work-type hints observed",
+        fp.work_type_hints.iter().skip(1).map(|w| format!("{w:?}")),
+    );
 }
 
 fn map_sched_policy(fp: &WorkloadFingerprint, spec: &mut ReproducerSpec) {
@@ -507,18 +559,11 @@ fn map_sched_policy(fp: &WorkloadFingerprint, spec: &mut ReproducerSpec) {
         }
     }
 
-    if fp.sched_policy_hints.len() > 1 {
-        let alts: Vec<String> = fp
-            .sched_policy_hints
-            .iter()
-            .skip(1)
-            .map(|s| format!("{s:?}"))
-            .collect();
-        spec.notes.push(format!(
-            "additional sched-policy hints observed: {}",
-            alts.join(", ")
-        ));
-    }
+    push_extras_note(
+        &mut spec.notes,
+        "additional sched-policy hints observed",
+        fp.sched_policy_hints.iter().skip(1).map(|s| format!("{s:?}")),
+    );
 }
 
 /// Render a `.run` shar-style entry-point source string from a
@@ -558,6 +603,12 @@ pub fn render_run_file_source(spec: &ReproducerSpec, template_name: &str) -> Str
     s.push_str("use std::time::Duration;\n\n");
 
     s.push_str(&format!("pub fn {template_name}() -> WorkloadConfig {{\n"));
+    // Build from `WorkloadConfig::default()` and overlay every
+    // captured value explicitly. Each `.workers/.affinity/...` call
+    // pins the captured value directly, so the rendered spec runs
+    // identically even if the upstream default changes — the
+    // reproducer is independent of the host's `WorkloadConfig`
+    // defaults at render time.
     s.push_str("    WorkloadConfig::default()\n");
     s.push_str(&format!(
         "        .workers({})\n",
@@ -575,9 +626,10 @@ pub fn render_run_file_source(spec: &ReproducerSpec, template_name: &str) -> Str
         "        .sched_policy({})\n",
         render_sched_policy(&spec.config.sched_policy)
     ));
-    if spec.config.nice != 0 {
-        s.push_str(&format!("        .nice({})\n", spec.config.nice));
-    }
+    // Always emit `.nice(...)` so the rendered config does not
+    // silently inherit a future-changed `WorkloadConfig::nice`
+    // default.
+    s.push_str(&format!("        .nice({})\n", spec.config.nice));
     s.push_str("}\n");
 
     if !spec.cgroup_hints.is_empty() {
@@ -636,8 +688,18 @@ fn render_affinity(a: &AffinityIntent) -> String {
     }
 }
 
+/// Render a [`WorkType`] back to Rust source. Exhaustive match: a
+/// new variant added to [`WorkType`] in `crate::workload` is a
+/// compile error here, forcing the reproducer generator to make a
+/// deliberate decision about how to render it (either a real
+/// builder call or a `TODO` placeholder via
+/// [`render_work_type_todo`]). The exhaustive form prevents the
+/// "silent collapse to SpinWait" failure mode of the previous
+/// wildcard arm.
 fn render_work_type(w: &WorkType) -> String {
     match w {
+        // Variants the projection layer maps from a fingerprint hint
+        // — render them as runnable builder calls.
         WorkType::SpinWait => "WorkType::SpinWait".into(),
         WorkType::YieldHeavy => "WorkType::YieldHeavy".into(),
         WorkType::Mixed => "WorkType::Mixed".into(),
@@ -664,11 +726,58 @@ fn render_work_type(w: &WorkType) -> String {
         WorkType::CachePressure { size_kb, stride } => format!(
             "WorkType::CachePressure {{ size_kb: {size_kb}, stride: {stride} }}"
         ),
-        // Other variants we don't currently project from fingerprint
-        // hints — emit a placeholder that compiles with a TODO so
-        // hand-editing is obvious.
-        _ => "WorkType::SpinWait /* TODO: refine from capture */".into(),
+        // Variants that no fingerprint hint currently projects to.
+        // Each produces an explicit TODO placeholder so the rendered
+        // source compiles, surfaces the hand-edit requirement, and
+        // names the unmapped variant. When a future
+        // `WorkTypeHint::*` variant projects to one of these, move
+        // the corresponding arm above this comment with a real
+        // builder call.
+        WorkType::CacheYield { .. } => render_work_type_todo("CacheYield"),
+        WorkType::CachePipe { .. } => render_work_type_todo("CachePipe"),
+        WorkType::FutexFanOut { .. } => render_work_type_todo("FutexFanOut"),
+        WorkType::Sequence { .. } => render_work_type_todo("Sequence"),
+        WorkType::ForkExit => render_work_type_todo("ForkExit"),
+        WorkType::NiceSweep => render_work_type_todo("NiceSweep"),
+        WorkType::AffinityChurn { .. } => render_work_type_todo("AffinityChurn"),
+        WorkType::PolicyChurn { .. } => render_work_type_todo("PolicyChurn"),
+        WorkType::FanOutCompute { .. } => render_work_type_todo("FanOutCompute"),
+        WorkType::PageFaultChurn { .. } => render_work_type_todo("PageFaultChurn"),
+        WorkType::MutexContention { .. } => render_work_type_todo("MutexContention"),
+        WorkType::Custom { .. } => render_work_type_todo("Custom"),
+        WorkType::ThunderingHerd { .. } => render_work_type_todo("ThunderingHerd"),
+        WorkType::PriorityInversion { .. } => render_work_type_todo("PriorityInversion"),
+        WorkType::ProducerConsumerImbalance { .. } => {
+            render_work_type_todo("ProducerConsumerImbalance")
+        }
+        WorkType::RtStarvation { .. } => render_work_type_todo("RtStarvation"),
+        WorkType::AsymmetricWaker { .. } => render_work_type_todo("AsymmetricWaker"),
+        WorkType::WakeChain { .. } => render_work_type_todo("WakeChain"),
+        WorkType::NumaWorkingSetSweep { .. } => render_work_type_todo("NumaWorkingSetSweep"),
+        WorkType::CgroupChurn { .. } => render_work_type_todo("CgroupChurn"),
+        WorkType::SignalStorm { .. } => render_work_type_todo("SignalStorm"),
+        WorkType::PreemptStorm { .. } => render_work_type_todo("PreemptStorm"),
+        WorkType::EpollStorm { .. } => render_work_type_todo("EpollStorm"),
+        WorkType::NumaMigrationChurn { .. } => render_work_type_todo("NumaMigrationChurn"),
+        WorkType::IdleChurn { .. } => render_work_type_todo("IdleChurn"),
+        WorkType::AluHot { .. } => render_work_type_todo("AluHot"),
+        WorkType::SmtSiblingSpin => render_work_type_todo("SmtSiblingSpin"),
+        WorkType::IpcVariance { .. } => render_work_type_todo("IpcVariance"),
     }
+}
+
+/// Render a placeholder `WorkType` builder call for a variant the
+/// projection layer doesn't yet know how to translate from a
+/// fingerprint hint. Output names the variant explicitly so the
+/// hand-edit prompt is unambiguous, avoiding the silent
+/// collapse-to-SpinWait failure mode the previous-generation
+/// wildcard arm produced — every unmapped variant now resolves
+/// through this fn with its own variant-named TODO placeholder.
+fn render_work_type_todo(variant: &str) -> String {
+    format!(
+        "WorkType::SpinWait /* TODO: no fingerprint mapping for \
+         WorkType::{variant} — refine from capture */"
+    )
 }
 
 fn render_sched_policy(p: &SchedPolicy) -> String {
@@ -1366,6 +1475,167 @@ mod tests {
         assert!(src.contains("pub fn auto_repro"));
     }
 
+    /// `render_run_file_source` always emits `.nice(N)` even when
+    /// `N == 0`. Pins the explicit-render guarantee from #521: the
+    /// rendered spec must NOT silently inherit a future-changed
+    /// upstream `WorkloadConfig::nice` default. A regression that
+    /// suppresses the call when nice is 0 surfaces here.
+    #[test]
+    fn render_run_file_source_emits_nice_zero_explicitly() {
+        let cap = DebugCapture::default();
+        let spec = generate_spec(&cap);
+        // Default fingerprint → no sched-policy hints → nice stays 0.
+        assert_eq!(spec.config.nice, 0);
+
+        let src = render_run_file_source(&spec, "explicit_nice");
+        assert!(
+            src.contains(".nice(0)"),
+            "rendered source must always emit `.nice(0)` (no silent \
+             inheritance of upstream defaults): {src}",
+        );
+    }
+
+    /// `render_ktstr_test_source` rewrites the `pub fn` line by
+    /// substring-replacing `format!("pub fn {template_name}")`. If a
+    /// caller passes a template_name that also appears as a substring
+    /// elsewhere in the rendered body (e.g. as part of a comment
+    /// path or an `AffinityIntent::Exact` field name), the
+    /// `String::replace` could in theory rewrite an unintended
+    /// occurrence. Verify the actual behaviour: only the `pub fn ...`
+    /// site is rewritten because the search pattern includes the
+    /// `pub fn ` prefix, so unrelated substrings are not matched.
+    #[test]
+    fn render_ktstr_test_source_template_name_substring_in_body() {
+        // Choose a template_name that also appears in the body — the
+        // path "auto" appears nowhere else, but "default" does (in
+        // `WorkloadConfig::default()`). Pick "default" as the test
+        // name to verify that only the `pub fn default(` line gets
+        // the attribute prefix.
+        let cap = DebugCapture::default();
+        let spec = generate_spec(&cap);
+        let src = render_ktstr_test_source(&spec, "default");
+
+        // The attribute must appear exactly once, attached to the
+        // `pub fn default(` declaration.
+        let attribute = "#[ktstr::ktstr_test]";
+        let attribute_count = src.matches(attribute).count();
+        assert_eq!(
+            attribute_count, 1,
+            "attribute must be inserted exactly once, got {attribute_count} \
+             occurrences in: {src}",
+        );
+
+        // The `WorkloadConfig::default()` call in the body must NOT
+        // have been mangled into `WorkloadConfig::#[...] default()`.
+        assert!(
+            src.contains("WorkloadConfig::default()"),
+            "WorkloadConfig::default() must remain intact (substring \
+             replace must not match the `default()` body call): {src}",
+        );
+
+        // The rewritten function declaration must be present.
+        assert!(
+            src.contains("#[ktstr::ktstr_test]\npub fn default"),
+            "rewritten `pub fn default` must carry the attribute: {src}",
+        );
+    }
+
+    /// [`ReproducerSpec::is_runnable`] returns `true` for a
+    /// fully-resolved `RandomSubset` (non-empty `from`, non-zero
+    /// `count`). The spawn-time affinity gate accepts that shape, so
+    /// the resolved note ("...accepts it without hand-editing")
+    /// must NOT match the [`UNRESOLVED_NOTE_MARKER`] substring even
+    /// though both notes share the "spawn-time affinity gate" prefix.
+    /// This test pins the narrow-marker contract: a regression that
+    /// reverts the marker to the prefix-only form (matching the
+    /// "...accepts" note) would surface here as `is_runnable() == false`.
+    #[test]
+    fn is_runnable_resolved_random_subset() {
+        let mut cap = DebugCapture::default();
+        cap.fingerprint.affinity_hints = vec![AffinityHint::RandomSubset {
+            from: vec![0, 1, 2],
+            count: 2,
+        }];
+        let spec = generate_spec(&cap);
+        assert!(
+            spec.is_runnable(),
+            "resolved RandomSubset must be runnable; notes: {:?}",
+            spec.notes,
+        );
+        assert_eq!(spec.unresolved_count(), 0);
+    }
+
+    /// [`ReproducerSpec::is_runnable`] returns `false` for an
+    /// unresolved `SingleCpu` (empty `cpus`). Pins that the
+    /// topology-aware unresolved-fallback note carries the
+    /// hand-edit-required marker so callers can detect the
+    /// runnability gap without re-parsing the rendered source.
+    #[test]
+    fn is_runnable_unresolved_single_cpu() {
+        let mut cap = DebugCapture::default();
+        cap.fingerprint.affinity_hints = vec![AffinityHint::SingleCpu { cpus: Vec::new() }];
+        let spec = generate_spec(&cap);
+        assert!(
+            !spec.is_runnable(),
+            "unresolved SingleCpu must NOT be runnable; notes: {:?}",
+            spec.notes,
+        );
+        assert_eq!(spec.unresolved_count(), 1);
+    }
+
+    /// [`ReproducerSpec::is_runnable`] returns `false` for an
+    /// empty-`Exact` projection. Pins that the empty-`Exact` note
+    /// carries the hand-edit-required marker.
+    #[test]
+    fn is_runnable_empty_exact() {
+        let mut cap = DebugCapture::default();
+        cap.fingerprint.affinity_hints = vec![AffinityHint::Exact { cpus: Vec::new() }];
+        let spec = generate_spec(&cap);
+        assert!(
+            !spec.is_runnable(),
+            "empty Exact must NOT be runnable; notes: {:?}",
+            spec.notes,
+        );
+        assert_eq!(spec.unresolved_count(), 1);
+    }
+
+    /// [`ReproducerSpec::is_runnable`] returns `false` for an
+    /// unresolved `RandomSubset` (empty pool, zero count). Pins that
+    /// the placeholder note carries the hand-edit-required marker.
+    #[test]
+    fn is_runnable_unresolved_random_subset() {
+        let mut cap = DebugCapture::default();
+        cap.fingerprint.affinity_hints = vec![AffinityHint::RandomSubset {
+            from: Vec::new(),
+            count: 0,
+        }];
+        let spec = generate_spec(&cap);
+        assert!(
+            !spec.is_runnable(),
+            "unresolved RandomSubset must NOT be runnable; notes: {:?}",
+            spec.notes,
+        );
+        assert_eq!(spec.unresolved_count(), 1);
+    }
+
+    /// [`ReproducerSpec::is_runnable`] returns `true` for a default
+    /// (empty-fingerprint) capture. Default `WorkloadConfig` has
+    /// `AffinityIntent::Inherit` which the spawn-time gate accepts;
+    /// no hand-edit-required notes are generated, so `is_runnable`
+    /// must return true even though the spec carries informational
+    /// notes (e.g. "no workload groups in fingerprint").
+    #[test]
+    fn is_runnable_empty_fingerprint() {
+        let cap = DebugCapture::default();
+        let spec = generate_spec(&cap);
+        assert!(
+            spec.is_runnable(),
+            "empty fingerprint must be runnable (default Inherit); notes: {:?}",
+            spec.notes,
+        );
+        assert_eq!(spec.unresolved_count(), 0);
+    }
+
     /// Cgroup hints render as comments at the bottom of generated
     /// source (the harness applies them at setup time, not via
     /// WorkloadConfig builder).
@@ -1512,12 +1782,16 @@ mod tests {
             "second affinity hint must surface as an additional-hints note: {src1}",
         );
 
-        // No "TODO: refine from capture" placeholder for any
-        // implemented work-type — Bursty is fully mapped, so the
-        // render_work_type wildcard arm must not fire.
+        // No `/* TODO:` placeholder for any implemented work-type
+        // — Bursty is fully mapped, so `render_work_type_todo` must
+        // not fire for it. The `/* TODO:` substring is the lead-in
+        // every `render_work_type_todo` output emits regardless of
+        // the variant name; matching it catches any TODO placeholder
+        // even after the variant-specific wording in the body
+        // changes.
         assert!(
-            !src1.contains("TODO: refine from capture"),
-            "implemented work-type variants must not render a TODO placeholder: {src1}",
+            !src1.contains("/* TODO:"),
+            "implemented work-type variants must not render any TODO placeholder: {src1}",
         );
     }
 

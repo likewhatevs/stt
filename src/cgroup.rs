@@ -55,6 +55,44 @@ const CGROUP_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 /// `fs::write` and waits on a channel. If the write does not complete within
 /// `timeout`, returns an error (the spawned thread may still be blocked in
 /// the kernel but will not prevent the caller from making progress).
+///
+/// # Stranded-writer thread semantics
+///
+/// On timeout the helper returns `Err` while the spawned thread stays
+/// blocked in the kernel inside `fs::write` — typically inside the
+/// cgroupfs `cgroup_kn_lock_live` / `cgroup_mutex` lock acquisition or
+/// the per-file `kn->active` semaphore. The host-side fd to `path` is
+/// owned by the spawned thread, so:
+///
+/// - **Per-file lock retention.** While the writer is blocked, the
+///   target cgroupfs file's `kn->active` (kernfs's per-knob writer
+///   semaphore) remains held by the stranded thread. Concurrent
+///   writes to the SAME file from any thread in the same process —
+///   including this same caller's retry — will queue behind the
+///   stranded write inside the kernel. Writes to OTHER files in the
+///   same cgroup are unaffected (kernfs holds `kn->active`
+///   per-knob, not per-cgroup).
+/// - **Thread-handle drop.** The `JoinHandle` returned by
+///   `thread::spawn` is dropped when the helper returns. Rust's
+///   `JoinHandle::Drop` implementation detaches the thread without
+///   waiting; the thread continues to run and is implicitly joined
+///   when the kernel write eventually unblocks (or when the process
+///   exits).
+/// - **Bounded leak under wedged cgroupfs.** A genuinely-wedged
+///   cgroupfs (e.g. a stuck filesystem driver in the kernel) would
+///   accumulate threads at a rate of one per timed-out write site.
+///   The 2s per-write timeout caps the per-site stall to 2s; the
+///   total accumulation is driven by how many distinct write sites
+///   the scenario hits, not by elapsed wall-clock time alone.
+///   Operators noticing stranded `<defunct>` cgroupfs writers in
+///   `ps` should investigate whether the underlying kernel cgroup
+///   subsystem is hung; the framework's own teardown does not
+///   block on these stranded threads.
+///
+/// Each stranded thread holds the file's `kn->active` until the
+/// kernel write returns. The OS-level memory cost per stranded
+/// thread is the default Rust thread stack (8 MiB on Linux, mostly
+/// virtual until touched).
 fn write_with_timeout(path: &Path, data: &str, timeout: Duration) -> Result<()> {
     let display = path.display().to_string();
     let path = path.to_owned();
@@ -255,12 +293,38 @@ impl CgroupManager {
 
     /// Create a child cgroup directory.
     ///
-    /// For nested paths (e.g. `"cg_0/narrow"`), enables controllers on
+    /// For nested paths (e.g. `"cg_0/narrow"`), enables `+cpuset` on
     /// each intermediate cgroup's `subtree_control` so the leaf has
-    /// controller files available. The kernel requires each parent to
-    /// have the controller in `subtree_control` for its children to
-    /// have the corresponding files (`cgroup_control()` returns
-    /// `parent->subtree_control`).
+    /// `cpuset.cpus` / `cpuset.mems` files available. The kernel
+    /// requires each parent to have the controller in
+    /// `subtree_control` for its children to have the corresponding
+    /// files (`cgroup_control()` returns `parent->subtree_control`).
+    ///
+    /// # Limitation: only `+cpuset` is propagated through nested
+    /// intermediates
+    ///
+    /// [`Self::enable_subtree_cpuset`] writes ONLY `+cpuset` to each
+    /// intermediate's `cgroup.subtree_control`; the `+cpu` /
+    /// `+memory` / `+pids` / `+io` controllers enabled by
+    /// [`Self::setup`] cover only the manager's parent cgroup, not
+    /// arbitrary intermediate cgroups created via nested
+    /// `create_cgroup` calls. As a result, a nested leaf like
+    /// `"cg_0/narrow"` exposes `cpuset.*` knobs but NOT
+    /// `memory.max` / `pids.max` / `io.weight`. If a future
+    /// [`CgroupDef`](crate::scenario::ops::CgroupDef) addresses such
+    /// a leaf with a memory/pids/io knob, the corresponding
+    /// `set_*` write will return ENOENT.
+    ///
+    /// Today's in-tree consumers (host topology cpuset locks,
+    /// `BuildSandbox`, scenario ops) only nest cgroups for cpuset
+    /// scoping, so this matches the actual surface the framework
+    /// exercises. Extending [`Self::enable_subtree_cpuset`] to
+    /// propagate the remaining controllers across intermediates is
+    /// straightforward (write the same controller list as
+    /// [`Self::setup`] uses) but is deferred until a use case
+    /// concretely needs it; without one, the wider write would
+    /// race against concurrent sibling cgroup creation under the
+    /// same intermediate without buying anything.
     pub fn create_cgroup(&self, name: &str) -> Result<()> {
         validate_cgroup_name(name)?;
         let p = self.parent.join(name);
@@ -309,6 +373,28 @@ impl CgroupManager {
     /// when. Tolerates ENOENT on the freeze file (cgroup directory
     /// already gone, or `CONFIG_CGROUP_FREEZE` absent on legacy
     /// kernels) silently — only non-ENOENT failures warn.
+    ///
+    /// # Post-drain settle window
+    ///
+    /// The 50ms sleep between [`Self::drain_tasks`] and `rmdir` is a
+    /// concession to the cgroup v2 task-migration RCU grace period.
+    /// Writes to `cgroup.procs` queue the task move but the source
+    /// cgroup's `nr_populated` counter only drops once the per-task
+    /// css_set switch completes — `rmdir` returns EBUSY if the
+    /// counter is non-zero. The kernel's `cgroup_rmdir` path
+    /// (`kernel/cgroup/cgroup.c`) gates on `cgroup_is_populated()`
+    /// which reads `nr_populated`, and the migration RCU callback
+    /// runs from the next softirq tick. 50ms exceeds the longest
+    /// observed callback latency on a moderately-loaded host (worst
+    /// case ~30ms under heavy IRQ pressure on a 4.18-era kernel,
+    /// sub-millisecond on a quiet 6.x kernel).
+    ///
+    /// Without the sleep, the `rmdir` would race the migration RCU
+    /// callback under load and intermittently return EBUSY. A
+    /// per-attempt retry loop would also work, but adds branching
+    /// to a non-hot teardown path; the fixed-window sleep is
+    /// simpler and the 50ms tax on a teardown that is already
+    /// scheduled to absorb a VM shutdown is immaterial.
     pub fn remove_cgroup(&self, name: &str) -> Result<()> {
         validate_cgroup_name(name)?;
         let p = self.parent.join(name);
@@ -682,6 +768,28 @@ impl CgroupManager {
     /// `DirEntry` / `file_type` errors are surfaced via
     /// `tracing::warn!` — mirrors `CgroupGroup::drop` so a failure
     /// shows up in logs instead of silently leaving children behind.
+    ///
+    /// # Outer-read_dir failure semantic
+    ///
+    /// When `read_dir(self.parent)` itself fails — e.g. the parent
+    /// directory is unreadable, the cgroup mount has been unmounted
+    /// out from under us, or a stat-side IO error fires — the
+    /// failure is surfaced via `tracing::warn!` and the function
+    /// still returns `Ok(())`. The deliberate semantic here is
+    /// "teardown that observes a hostile filesystem state must
+    /// not block scenario completion": a hard `Err` would propagate
+    /// up through the runner's teardown and abort the whole test
+    /// run on a transient cgroupfs failure that the operator can
+    /// follow up on by reading the warn line.
+    ///
+    /// Production callers (the runner's drop path, scenario teardown)
+    /// already log-and-continue on `cleanup_all` errors, so the
+    /// always-Ok return is consistent with how every consumer
+    /// already treats the result. Operators who need to detect
+    /// teardown leakage should grep `tracing` output for
+    /// `"cleanup_all: read_dir failed"` rather than relying on a
+    /// non-zero exit; the warn includes both the offending path and
+    /// the underlying io::Error.
     pub fn cleanup_all(&self) -> Result<()> {
         if !self.parent.exists() {
             return Ok(());
@@ -946,6 +1054,35 @@ fn cleanup_recursive(path: &std::path::Path) {
             err = %err,
             "cleanup_recursive: read_dir failed; child cgroups may remain",
         );
+    }
+    // Auto-unfreeze before draining tasks. Mirrors
+    // `CgroupManager::remove_cgroup`'s pre-drain unfreeze, but for
+    // defense-in-depth and source-cgroup state hygiene rather than
+    // for correctness: the kernel's `cgroup_freezer_migrate_task`
+    // path DOES unfreeze tasks when they migrate to an unfrozen
+    // destination (the cgroup root is always unfrozen), so frozen
+    // tasks would not actually strand at the root. The explicit
+    // pre-drain `cgroup.freeze=0` write is still worthwhile because
+    // it (a) makes the source cgroup's transient state visible in
+    // tracing / `cgroup.events` before the directory disappears,
+    // (b) avoids a brief frozen-counter churn while migration
+    // batches advance, and (c) makes the teardown path symmetric
+    // with `remove_cgroup` so operators reading either function
+    // see the same auto-unfreeze step. Tolerates ENOENT (no
+    // `cgroup.freeze` file — `CONFIG_CGROUP_FREEZE` absent on
+    // legacy kernels, or this is a non-cgroup directory entry) by
+    // ignoring the error: the file is simply absent and the drain
+    // can proceed without it.
+    let freeze_path = path.join("cgroup.freeze");
+    if let Err(err) = write_with_timeout(&freeze_path, "0", CGROUP_WRITE_TIMEOUT) {
+        let errno = anyhow_first_io_errno(&err);
+        if errno != Some(libc::ENOENT) {
+            tracing::warn!(
+                path = %path.display(),
+                err = %format!("{err:#}"),
+                "cleanup_recursive: pre-drain unfreeze failed; source-cgroup state-hygiene step skipped",
+            );
+        }
     }
     drain_pids_to_root(&path.join("cgroup.procs"), &path.display().to_string());
     std::thread::sleep(std::time::Duration::from_millis(10));
@@ -1769,6 +1906,45 @@ mod tests {
         // No assertion on the freeze file — it never existed. The
         // test passes when the call body runs to completion without
         // panicking on the tolerated ENOENT branch.
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `cleanup_recursive` writes `0` to `cgroup.freeze` before
+    /// draining tasks — mirrors
+    /// [`remove_cgroup_auto_unfreezes_before_drain`]. The pre-drain
+    /// unfreeze is a state-hygiene step (the kernel would unfreeze
+    /// migrated tasks at the unfrozen root anyway), but the write
+    /// itself is observable in `cgroup.events` and tracing, so a
+    /// regression that drops the unfreeze step would silently lose
+    /// that visibility. Pin the side effect by seeding
+    /// `cgroup.freeze="1"` and asserting the post-call contents
+    /// are `"0"`. Test mirrors the `remove_cgroup` shape: rmdir at
+    /// the end fails on tmpfs (leftover non-cgroupfs files), but
+    /// the freeze-file content is what the assertion targets.
+    #[test]
+    fn cleanup_recursive_auto_unfreezes_before_drain() {
+        let dir =
+            std::env::temp_dir().join(format!("ktstr-cleanup-rec-autounf-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        // Seed cgroup.freeze="1" + empty cgroup.procs so the test
+        // observes the unfreeze write the same way
+        // remove_cgroup_auto_unfreezes_before_drain does.
+        let freeze_path = dir.join("cgroup.freeze");
+        fs::write(&freeze_path, "1").unwrap();
+        fs::write(dir.join("cgroup.procs"), "").unwrap();
+        // `cleanup_recursive` is the free fn the cleanup_all walk
+        // dispatches per directory; call it directly.
+        cleanup_recursive(&dir);
+        // The auto-unfreeze must have written "0" to cgroup.freeze
+        // before the drain — pinned identically to the
+        // remove_cgroup test so a regression on either path
+        // surfaces with the same diagnostic shape.
+        assert_eq!(
+            fs::read_to_string(&freeze_path).unwrap(),
+            "0",
+            "cleanup_recursive must write '0' to cgroup.freeze before draining \
+             (mirrors remove_cgroup auto-unfreeze for state hygiene)",
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

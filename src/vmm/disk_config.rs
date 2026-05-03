@@ -90,8 +90,8 @@ impl Filesystem {
 ///
 /// # Worked example: cloud-style 1000 IOPS / 10 MiB·s with 5× burst
 ///
-/// Model a "1000 IOPS sustained, tolerate a 5-second spike from a
-/// quiescent device" disk:
+/// Model a "1000 IOPS sustained, tolerate a brief unrestricted
+/// spike from a quiescent device" disk:
 ///
 /// ```
 /// use ktstr::prelude::*;
@@ -99,8 +99,9 @@ impl Filesystem {
 /// let disk = DiskConfig::default()
 ///     // Steady-state allowance — bucket refill rate.
 ///     .iops(1_000)
-///     // Peak burst — bucket capacity. 5× the refill rate yields
-///     // ~5 seconds' worth of operations before throttling kicks in.
+///     // Peak burst — bucket capacity. 5× the refill rate (5_000 ops)
+///     // is the maximum number of unrestricted ops the device will
+///     // absorb from a full bucket before throttling kicks in.
 ///     .iops_burst_capacity(5_000)
 ///     // Steady-state bandwidth: 10 MiB/s = 10 * 1024 * 1024 bytes/s.
 ///     .bytes_per_sec(10 * 1024 * 1024)
@@ -113,6 +114,18 @@ impl Filesystem {
 /// "quiescent device"); a burst-friendly workload draws the bucket
 /// down at peak rate until empty, then is rate-limited to the refill
 /// rate from then on.
+///
+/// The `5_000`-op burst capacity is NOT "5 seconds at 1000 IOPS"
+/// in any real-time sense — the bucket drains at whatever rate the
+/// guest workload submits ops, which is usually much faster than
+/// the refill rate. A workload submitting 10_000 IOPS empties the
+/// 5_000-op bucket in ~0.5s, after which the device steady-states
+/// at the 1000-IOPS refill rate. The "5 seconds" framing only
+/// applies as a hypothetical lower bound: a workload submitting
+/// exactly the refill rate (1000 IOPS) would never drain the
+/// bucket, and a workload submitting 2× the refill rate would
+/// drain a 5×-rate bucket over ~5 seconds. Most real workloads
+/// drain bursts much faster than that.
 ///
 /// # Picking values
 ///
@@ -1211,6 +1224,115 @@ mod tests {
             "bytes_burst_capacity",
         );
         assert_eq!(ThrottleDimension::Bytes.rate_field(), "bytes_per_sec");
+    }
+
+    /// Pin downcast through anyhow: `DiskThrottle::validate` returns
+    /// `Result<(), DiskThrottleValidationError>`, but production
+    /// callers (e.g. [`crate::vmm::KtstrVmBuilder::build`]) wrap the
+    /// failure in `anyhow::Error`. Library consumers that need to
+    /// pattern-match on the failure variant must therefore
+    /// `downcast_ref::<DiskThrottleValidationError>()` through the
+    /// anyhow chain. Without this test, a future change to the
+    /// callsite that loses the typed error (e.g. converting the
+    /// inner error to `String` before bubbling, or replacing
+    /// `anyhow::Error::new(e)` with `anyhow!("...{e}...")`) would
+    /// silently break the typed-error contract for downstream
+    /// callers — only surfacing as a regression at the consumer
+    /// site, which doesn't exist in-tree yet.
+    ///
+    /// The chain wraps with `.context(...)` to mirror the production
+    /// shape at `mod.rs:2557-2570` so the downcast walks through the
+    /// same context layer real callers see.
+    #[test]
+    fn disk_throttle_validation_error_downcasts_through_anyhow() {
+        let typed = DiskConfig::default()
+            .iops(1_000)
+            .iops_burst_capacity(500)
+            .throttle
+            .validate()
+            .expect_err("burst < iops rejected");
+        // Wrap in anyhow exactly like the production callsite does
+        // (mod.rs:2557-2570 — anyhow!(e).context("...")).
+        let wrapped = anyhow::anyhow!(typed).context("invalid disk throttle");
+        // The typed variant must be reachable through the anyhow
+        // chain via downcast_ref. Walk every cause.
+        let recovered = wrapped
+            .chain()
+            .find_map(|c| c.downcast_ref::<DiskThrottleValidationError>())
+            .expect(
+                "DiskThrottleValidationError must remain downcastable through \
+                 the production anyhow wrap; lost typing means library \
+                 consumers cannot route programmatic recovery",
+            );
+        assert_eq!(
+            *recovered,
+            DiskThrottleValidationError::BurstBelowRate {
+                dimension: ThrottleDimension::Iops,
+                burst: 500,
+                rate: 1_000,
+            },
+        );
+        // Sanity: the rendered chain still contains the operator-
+        // facing context so logs show "invalid disk throttle: ...".
+        let rendered = format!("{wrapped:#}");
+        assert!(
+            rendered.contains("invalid disk throttle"),
+            "anyhow context must survive the wrap: {rendered}",
+        );
+    }
+
+    /// `DiskThrottle::validate` checks the iops dimension first and
+    /// short-circuits on the first failure. When BOTH dimensions
+    /// hold violations, the iops failure is returned; the bytes
+    /// failure surfaces only on a subsequent re-validate after the
+    /// caller fixes the iops side. Pin this ordering so a refactor
+    /// that aggregates errors (e.g. returns the first non-violating
+    /// dimension's failure) or reverses the check order surfaces
+    /// here. The test sets both dimensions intentionally violating
+    /// and asserts the variant carries `ThrottleDimension::Iops` —
+    /// any other variant is wrong.
+    #[test]
+    fn validate_first_failure_wins_iops_before_bytes() {
+        let throttle = DiskConfig::default()
+            .iops(1_000)
+            .iops_burst_capacity(500) // iops violation: burst < rate
+            .bytes_per_sec(10_000)
+            .bytes_burst_capacity(5_000) // bytes violation: burst < rate
+            .throttle;
+        let err = throttle
+            .validate()
+            .expect_err("both-dimensions-bad must reject");
+        assert_eq!(
+            err,
+            DiskThrottleValidationError::BurstBelowRate {
+                dimension: ThrottleDimension::Iops,
+                burst: 500,
+                rate: 1_000,
+            },
+            "iops violation must surface first; refactor that aggregates \
+             or reverses the check order would change this",
+        );
+        assert_eq!(err.dimension(), ThrottleDimension::Iops);
+
+        // Same shape with the BurstWithoutRate variant: setting
+        // burst capacities on both dimensions with neither rate set
+        // exercises the "missing rate" branch with both dimensions
+        // violating.
+        let throttle = DiskConfig::default()
+            .iops_burst_capacity(5_000)
+            .bytes_burst_capacity(8_000)
+            .throttle;
+        let err = throttle
+            .validate()
+            .expect_err("both-without-rate must reject");
+        assert_eq!(
+            err,
+            DiskThrottleValidationError::BurstWithoutRate {
+                dimension: ThrottleDimension::Iops,
+            },
+            "iops violation must surface first across both \
+             BurstBelowRate and BurstWithoutRate variants",
+        );
     }
 
     /// Dedicated serde roundtrip for the burst fields. Distinct from

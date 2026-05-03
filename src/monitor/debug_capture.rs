@@ -22,24 +22,25 @@
 //!
 //! 3. **Workload fingerprint** ([`WorkloadFingerprint`]) — projected
 //!    HINTS in ktstr's test-primitive vocabulary that the reproducer
-//!    generator translates into a `WorkProgram` spec. NOT a
-//!    canonical reproducer; the projection is best-effort and the
-//!    reproducer generator (or human) decides which hints to honor.
+//!    generator translates into a [`crate::workload::WorkloadConfig`]
+//!    spec. NOT a canonical reproducer; the projection is
+//!    best-effort and the reproducer generator (or human) decides
+//!    which hints to honor.
 //!
 //! # Capture vs reproducer-generator boundary
 //!
-//! This module is the DATA-SHAPE deliverable for the capture path.
-//! The actual periodic-loop binary that drives [`ctprof::capture`]
-//! and the failure trigger pipeline (tp_btf/sched_ext_exit fentry)
-//! are upstream producers that emit [`DebugCapture`]; the reproducer
-//! generator is the downstream consumer. Splitting at this module
-//! boundary keeps each side free to evolve independently.
+//! This module is the DATA-SHAPE deliverable for the capture path:
+//! it defines [`DebugCapture`] and [`WorkloadFingerprint`] but does
+//! not produce records itself. Records are populated by external
+//! producers (any caller that fills [`DebugCapture`] fields and
+//! emits the value); the reproducer generator
+//! ([`super::reproducer_gen`]) is the downstream consumer.
 //!
 //! The fingerprint projection lives here rather than in the
 //! reproducer generator module because it's a pure function of
 //! capture data — the reproducer generator consumes the projected
 //! hints rather than re-deriving them, and that boundary is testable
-//! without a working producer or generator.
+//! without a producer or a generator.
 //!
 //! # Vocabulary alignment with ktstr test primitives
 //!
@@ -49,7 +50,7 @@
 //!
 //! | observation                      | hint type                          |
 //! |----------------------------------|------------------------------------|
-//! | per-cgroup thread count          | `WorkProgramHint::thread_count`    |
+//! | per-cgroup thread count          | `WorkloadGroupHint::thread_count`  |
 //! | sched_setaffinity mask patterns  | `AffinityHint::*`                  |
 //! | CPU-time vs IO-wait ratio        | `WorkTypeHint::*`                  |
 //! | cgroup cpu.weight + memory.max   | `CgroupHint::*`                    |
@@ -79,23 +80,24 @@ use crate::workload::humantime_serde_helper;
 ///
 /// Bundles every observation the reproducer generator needs to
 /// translate a real-world failure into a ktstr test. Serializable so
-/// the periodic-loop binary can persist captures to disk and the
-/// reproducer generator can consume them offline.
+/// producers can persist captures to disk and the reproducer
+/// generator can consume them offline.
 ///
 /// `non_exhaustive` so future fields (kernel command-line snapshot,
 /// scheduler config-file capture, host hardware fingerprint) can
 /// land without breaking on-disk records.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[non_exhaustive]
-#[allow(dead_code)] // wired from the (separate) capture-mode binary;
-                    // the library ships the data shape so the
-                    // reproducer generator can build against a stable
-                    // surface.
+#[allow(dead_code)] // the library ships the data shape; producers
+                    // populate it externally and the reproducer
+                    // generator consumes it.
 pub struct DebugCapture {
-    /// Capture format schema identifier — pinned at construction so
-    /// off-disk records older than the current shape parse via the
-    /// `FailureDumpReportAny`-style migration shim instead of
-    /// silently misinterpreting fields.
+    /// Capture format schema identifier — pinned at construction
+    /// to the current [`DEBUG_CAPTURE_SCHEMA`] string. Consumers
+    /// inspect the field to detect off-disk records emitted by an
+    /// incompatible build before deserialising the rest of the
+    /// record. No automatic migration runs today: a mismatched
+    /// schema is a hard error at the consumer.
     pub schema: String,
     /// Capture wall-clock start. Ns since epoch (CLOCK_REALTIME).
     /// `0` when the producer didn't stamp it (e.g. captures replayed
@@ -177,9 +179,10 @@ pub struct CtprofSampleRef {
 #[non_exhaustive]
 pub struct WorkloadFingerprint {
     /// Per-cgroup thread-count distribution. Maps to
-    /// `WorkProgram::thread_count` in the generated test. The
-    /// reproducer generator picks a representative group and emits
-    /// one `WorkProgram` per cgroup.
+    /// [`crate::workload::WorkloadConfig::num_workers`] in the
+    /// generated test. The reproducer generator picks a
+    /// representative group and emits one
+    /// [`crate::workload::WorkloadConfig`] per cgroup.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workload_groups: Vec<WorkloadGroupHint>,
     /// Aggregate CPU placement pattern observed across the capture.
@@ -219,7 +222,7 @@ pub struct WorkloadGroupHint {
     /// `CgroupDef::path(...)` in the generated test.
     pub cgroup_path: String,
     /// Number of live threads observed in the cgroup. Maps to
-    /// `WorkProgram::thread_count`.
+    /// [`crate::workload::WorkloadConfig::num_workers`].
     pub thread_count: u32,
     /// Mean CPU-time fraction across the capture window (0.0 to
     /// 1.0). The reproducer generator uses this to pick a
@@ -246,12 +249,16 @@ pub struct WorkloadGroupHint {
 /// generator emit a concrete [`crate::workload::AffinityIntent::Exact`]
 /// (or `RandomSubset` with a populated pool) directly, producing a
 /// runnable spec without scenario-engine resolution.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[non_exhaustive]
 #[serde(tag = "kind")]
 pub enum AffinityHint {
     /// Default placement — no affinity mask narrower than the
     /// containing cgroup's cpuset. → `AffinityIntent::Inherit`.
+    /// Also the [`Default`] for this enum, mirroring
+    /// [`crate::workload::AffinityIntent::Inherit`] which is the
+    /// default `AffinityIntent`.
+    #[default]
     Inherit,
     /// Threads observed pinned to a single CPU each (mask popcount
     /// == 1 across the capture window for the majority of threads
@@ -346,47 +353,39 @@ impl AffinityHint {
     /// set. Mirrors [`crate::workload::AffinityIntent::exact`]'s
     /// iterator flexibility — accepts arrays, ranges, `Vec`, or any
     /// `IntoIterator<Item = u32>`.
+    ///
+    /// Pass an empty iterator (e.g. `[] as [u32; 0]`,
+    /// `Vec::<u32>::new()`) to construct the unresolved form: the
+    /// producer classified the pattern as single-CPU pinning but did
+    /// not record the concrete CPU. Downstream the reproducer
+    /// generator falls back to
+    /// [`crate::workload::AffinityIntent::SingleCpu`] plus a
+    /// hand-edit note. Same convention applies to
+    /// [`Self::llc_aligned`], [`Self::cross_cgroup`],
+    /// [`Self::smt_sibling_pair`].
     pub fn single_cpu(cpus: impl IntoIterator<Item = u32>) -> Self {
         Self::SingleCpu {
             cpus: cpus.into_iter().collect(),
         }
     }
 
-    /// Construct an unresolved `SingleCpu` hint — the producer
-    /// classified the pattern but did not record concrete CPUs. The
-    /// reproducer generator falls back to
-    /// [`crate::workload::AffinityIntent::SingleCpu`] plus a
-    /// hand-edit note.
-    pub fn single_cpu_unresolved() -> Self {
-        Self::SingleCpu { cpus: Vec::new() }
-    }
-
     /// Construct an `LlcAligned` hint with the producer-observed LLC
-    /// CPU set.
+    /// CPU set. Empty iterator → unresolved form (see
+    /// [`Self::single_cpu`] for the unresolved-classification
+    /// semantics).
     pub fn llc_aligned(cpus: impl IntoIterator<Item = u32>) -> Self {
         Self::LlcAligned {
             cpus: cpus.into_iter().collect(),
         }
     }
 
-    /// Construct an unresolved `LlcAligned` hint — see
-    /// [`Self::single_cpu_unresolved`] for the
-    /// unresolved-classification semantics.
-    pub fn llc_aligned_unresolved() -> Self {
-        Self::LlcAligned { cpus: Vec::new() }
-    }
-
     /// Construct a `CrossCgroup` hint with the producer-observed
-    /// cross-cgroup CPU span.
+    /// cross-cgroup CPU span. Empty iterator → unresolved form (see
+    /// [`Self::single_cpu`]).
     pub fn cross_cgroup(cpus: impl IntoIterator<Item = u32>) -> Self {
         Self::CrossCgroup {
             cpus: cpus.into_iter().collect(),
         }
-    }
-
-    /// Construct an unresolved `CrossCgroup` hint.
-    pub fn cross_cgroup_unresolved() -> Self {
-        Self::CrossCgroup { cpus: Vec::new() }
     }
 
     /// Construct an `SmtSiblingPair` hint with the producer-observed
@@ -394,16 +393,12 @@ impl AffinityHint {
     /// full sibling set so SMT-N>2 hosts (POWER9 SMT-4, POWER10
     /// SMT-4/SMT-8, ThunderX2, Xeon Phi) preserve every observed
     /// sibling — see the variant doc for the resolver-side narrowing
-    /// to 2 CPUs.
+    /// to 2 CPUs. Empty iterator → unresolved form (see
+    /// [`Self::single_cpu`]).
     pub fn smt_sibling_pair(cpus: impl IntoIterator<Item = u32>) -> Self {
         Self::SmtSiblingPair {
             cpus: cpus.into_iter().collect(),
         }
-    }
-
-    /// Construct an unresolved `SmtSiblingPair` hint.
-    pub fn smt_sibling_pair_unresolved() -> Self {
-        Self::SmtSiblingPair { cpus: Vec::new() }
     }
 
     /// Construct an `Exact` hint with the producer-observed CPU set.
@@ -567,11 +562,11 @@ pub enum SchedPolicyHint {
 }
 
 /// Pinned schema identifier for [`DebugCapture`]. Bumped when
-/// on-disk shape changes incompatibly. Live-host pipeline
-/// consumers parse via a serde shim that accepts older schemas
-/// when the field set is a strict subset.
-#[allow(dead_code)] // wired from the (separate) capture-mode binary;
-                    // the library ships the pinned constant.
+/// on-disk shape changes incompatibly. Consumers compare the
+/// stamped [`DebugCapture::schema`] against this constant and reject
+/// mismatches before deserialising; no automatic migration runs.
+#[allow(dead_code)] // the library ships the pinned constant;
+                    // producers stamp it at capture time.
 pub const DEBUG_CAPTURE_SCHEMA: &str = "ktstr.debug_capture/v1";
 
 /// Compute a [`WorkloadFingerprint`] from raw capture inputs.
@@ -706,14 +701,23 @@ fn project_sched_policy_hints(dump: &FailureDumpReport) -> Vec<SchedPolicyHint> 
             "idle_sched_class" => SchedPolicyHint::Idle,
             _ => {
                 // Kernel default static_prio for nice 0 is 120
-                // (NICE_TO_PRIO(0) = MAX_RT_PRIO + 20 = 120). The
-                // observed nice value is `static_prio - 120`,
-                // bounded to a signed delta so a missing
-                // static_prio (which would read as 0 from a
-                // failure dump that didn't capture it) projects
-                // to nice -120 rather than triggering a panic on
-                // the cast.
-                let nice = (task.static_prio as i32) - 120;
+                // (NICE_TO_PRIO(0) = MAX_RT_PRIO + 20 = 120), so the
+                // raw observed nice value is `static_prio - 120`.
+                // The cast to i32 keeps the subtraction in signed
+                // arithmetic so a zero-initialised static_prio (from
+                // a failure dump that didn't capture the field, or a
+                // synthetic test fixture) doesn't panic.
+                //
+                // Linux exposes nice in `[-20, 19]`
+                // (`include/linux/sched/prio.h`'s `MIN_NICE = -20`,
+                // `MAX_NICE = 19`). The `raw` value can fall outside
+                // that range when the dump's static_prio is
+                // missing/zero-init. Clamp to the legal range so the
+                // projected `SchedPolicyHint::Other { nice }` is
+                // spawnable by the reproducer generator without
+                // further sanitisation.
+                let raw = (task.static_prio as i32) - 120;
+                let nice = raw.clamp(-20, 19);
                 SchedPolicyHint::Other { nice }
             }
         };
@@ -801,10 +805,19 @@ mod tests {
             make_task(100, "rt_sched_class", 50, 0),
             make_task(101, "ext_sched_class", 0, 0),
             make_task(102, "fair_sched_class", 0, 120),
+            // Zero-init static_prio + fair-class entry: a failure
+            // dump captured before the kernel populated the field.
+            // Pre-clamp this would project to nice=-120
+            // (`(0 as i32) - 120`) and produce an unspawnable
+            // SchedPolicyHint::Other. The clamp(-20, 19) bound (per
+            // `MIN_NICE`/`MAX_NICE` in
+            // `include/linux/sched/prio.h`) keeps the projected
+            // nice value in the kernel's legal range.
+            make_task(103, "fair_sched_class", 0, 0),
         ];
 
         let fp = project_fingerprint(&[], Some(&dump));
-        assert_eq!(fp.sched_policy_hints.len(), 3);
+        assert_eq!(fp.sched_policy_hints.len(), 4);
         match &fp.sched_policy_hints[0] {
             SchedPolicyHint::Fifo { priority } => assert_eq!(*priority, 50),
             other => panic!("expected Fifo, got {other:?}"),
@@ -817,11 +830,21 @@ mod tests {
             SchedPolicyHint::Other { nice } => assert_eq!(*nice, 0),
             other => panic!("expected Other, got {other:?}"),
         }
+        // Zero-init static_prio with a fair-class entry must clamp
+        // to MIN_NICE = -20 instead of producing nice=-120.
+        match &fp.sched_policy_hints[3] {
+            SchedPolicyHint::Other { nice } => assert_eq!(
+                *nice, -20,
+                "static_prio=0 (zero-init) must clamp to MIN_NICE=-20, got nice={nice}",
+            ),
+            other => panic!("expected Other, got {other:?}"),
+        }
     }
 
-    /// Schema constant matches the documented v1 identifier so
-    /// off-disk records produced by future builds are detectable
-    /// as schema-bumped.
+    /// Schema constant matches the documented `v1` identifier.
+    /// Consumers compare the stamped [`DebugCapture::schema`] against
+    /// this exact string; a future bump that flips the constant
+    /// without coordinating consumers must surface here first.
     #[test]
     fn schema_constant_pinned() {
         assert_eq!(DEBUG_CAPTURE_SCHEMA, "ktstr.debug_capture/v1");
@@ -1005,43 +1028,51 @@ mod tests {
     /// Constructors produce the same enum variants as struct-literal
     /// construction. Pins the convention that
     /// `AffinityHint::single_cpu(cpus)` and
-    /// `AffinityHint::SingleCpu { cpus }` are interchangeable, and
-    /// covers the resolved/unresolved pair for every topology-aware
-    /// variant plus `Exact` and `RandomSubset`.
+    /// `AffinityHint::SingleCpu { cpus }` are interchangeable for
+    /// both resolved (non-empty `cpus`) and unresolved (empty `cpus`)
+    /// shapes. Each topology-aware ctor drives both paths via an
+    /// empty / non-empty iterator. `Exact` and `RandomSubset` are
+    /// also covered.
     #[test]
     fn affinity_hint_constructors_match_struct_literal() {
+        // Resolved + unresolved single_cpu via the same ctor.
         assert!(matches!(
             AffinityHint::single_cpu([3u32]),
             AffinityHint::SingleCpu { cpus } if cpus == vec![3]
         ));
         assert!(matches!(
-            AffinityHint::single_cpu_unresolved(),
+            AffinityHint::single_cpu([] as [u32; 0]),
             AffinityHint::SingleCpu { cpus } if cpus.is_empty()
         ));
+        // Resolved + unresolved llc_aligned.
         assert!(matches!(
             AffinityHint::llc_aligned(0u32..4),
             AffinityHint::LlcAligned { cpus } if cpus == vec![0, 1, 2, 3]
         ));
         assert!(matches!(
-            AffinityHint::llc_aligned_unresolved(),
+            AffinityHint::llc_aligned(Vec::<u32>::new()),
             AffinityHint::LlcAligned { cpus } if cpus.is_empty()
         ));
+        // Resolved + unresolved cross_cgroup.
         assert!(matches!(
             AffinityHint::cross_cgroup(vec![4u32, 5, 6, 7]),
             AffinityHint::CrossCgroup { cpus } if cpus == vec![4, 5, 6, 7]
         ));
         assert!(matches!(
-            AffinityHint::cross_cgroup_unresolved(),
+            AffinityHint::cross_cgroup(Vec::<u32>::new()),
             AffinityHint::CrossCgroup { cpus } if cpus.is_empty()
         ));
+        // Resolved + unresolved smt_sibling_pair.
         assert!(matches!(
             AffinityHint::smt_sibling_pair([2u32, 3]),
             AffinityHint::SmtSiblingPair { cpus } if cpus == vec![2, 3]
         ));
         assert!(matches!(
-            AffinityHint::smt_sibling_pair_unresolved(),
+            AffinityHint::smt_sibling_pair(Vec::<u32>::new()),
             AffinityHint::SmtSiblingPair { cpus } if cpus.is_empty()
         ));
+        // Exact (no semantic unresolved form — see `Self::exact`
+        // doc); RandomSubset has its own resolved/unresolved pair.
         assert!(matches!(
             AffinityHint::exact([0u32, 1, 2]),
             AffinityHint::Exact { cpus } if cpus == vec![0, 1, 2]
@@ -1055,15 +1086,6 @@ mod tests {
             AffinityHint::random_subset_unresolved(),
             AffinityHint::RandomSubset { from, count }
                 if from.is_empty() && count == 0
-        ));
-
-        // Empty-iterator synonym: `single_cpu([])` produces the same
-        // variant shape as `single_cpu_unresolved()`. Pin the synonym
-        // so a future change that rejects empty iterators (or maps
-        // them to a different variant) surfaces here.
-        assert!(matches!(
-            AffinityHint::single_cpu([] as [u32; 0]),
-            AffinityHint::SingleCpu { cpus } if cpus.is_empty()
         ));
     }
 }

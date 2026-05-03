@@ -119,11 +119,34 @@ const FICLONE_IOCTL: libc::c_ulong = 0x4004_9409;
 /// Maximum wall-clock duration to wait for a peer process holding
 /// the cache lockfile while it builds the template.
 ///
-/// 10 minutes accommodates the worst-case template build (cold
-/// kernel cache + first-run `mkfs.btrfs` on slow storage) without
-/// hanging interactive runs forever. Operators who hit the timeout
-/// see a holder list parsed from `/proc/locks` so they can kill a
-/// stuck peer or wait by hand.
+/// # Budget breakdown
+///
+/// 600s = 10 minutes. The template build inside the lock holder
+/// covers, in order:
+///
+/// - **Kernel boot** (~2-30s on a cold page cache, sub-second when
+///   the kernel image is already mapped from a prior test).
+///   First-run on a host without the kernel image cached can stall
+///   on disk reads of the kernel + initramfs.
+/// - **`mkfs.<fstype>` execution against `/dev/vda`** (~1-30s for a
+///   256 MiB-1 GiB device on tmpfs/btrfs/xfs; 1-3 minutes on slow
+///   spinning storage when the cache directory points at HDD-backed
+///   storage). `mkfs.btrfs` does extent-tree initialisation plus
+///   metadata block allocation — bound by storage IOPS, not CPU.
+/// - **VM teardown** (sub-second).
+///
+/// The 10-minute ceiling absorbs the worst plausible host: a cold
+/// HDD-backed `KTSTR_CACHE_DIR` running its first ever `mkfs.btrfs`
+/// against a multi-GiB capacity. Below 10 minutes, a CI runner with
+/// a cold cache and contentious IO would surface flaky-template
+/// timeouts. Above 10 minutes, an interactive run against a
+/// genuinely-stuck peer would hang the developer's terminal beyond
+/// their patience threshold.
+///
+/// Operators who hit the timeout see a holder list parsed from
+/// `/proc/locks` so they can kill a stuck peer (`kill <pid>`) or
+/// wait by hand. The lockfile path is also surfaced so manual
+/// cleanup is always available.
 const TEMPLATE_LOCK_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// btrfs `statfs.f_type` magic per `linux/magic.h`. `libc::BTRFS_SUPER_MAGIC`
@@ -790,6 +813,31 @@ fn build_template_via_vm(
     let disk = crate::vmm::disk_config::DiskConfig::default()
         .capacity_mb((capacity_bytes / (1024 * 1024)) as u32)
         .filesystem(Filesystem::Raw);
+    // VM-level timeout for the template build. 120s = 2 minutes,
+    // chosen as the inner bound that lets the outer
+    // [`TEMPLATE_LOCK_TIMEOUT`] (10 minutes) catch stuck peers
+    // without firing on the legitimate worst-case build:
+    //
+    // - Kernel boot inside the VM: ~1-15s once the kernel image is
+    //   already cached on the host (first-run cold-page-cache boot
+    //   can stretch toward 30s on slow storage but is dominated by
+    //   host-side disk reads, NOT this in-VM timeout).
+    // - `mkfs.<fstype>` against `/dev/vda` inside the guest:
+    //   ~1-60s for 256 MiB-2 GiB capacities on a backing image that
+    //   itself lives on tmpfs/btrfs/xfs. The host backing-file IO
+    //   cost (sparse-file zero-fill on first write) is included in
+    //   this budget.
+    // - VM shutdown: sub-second.
+    //
+    // 120s sits above the expected worst-case build cost
+    // (kernel boot + mkfs + shutdown summed at the upper end of
+    // the per-stage ranges above), which lets `mkfs` finish even
+    // when KVM contention or a briefly-loaded host slows the
+    // guest. If a build genuinely hangs (e.g. mkfs deadlocked,
+    // kernel oops), the 120s VM timeout fires inside `vm.run()`,
+    // the caller unlinks the staging image, and `ensure_template`
+    // propagates the failure up — no peer holds the per-key flock
+    // past this point.
     let build_result = crate::vmm::KtstrVm::builder()
         .kernel(kernel)
         .topology(1, 1, 1, 1)

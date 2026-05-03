@@ -130,6 +130,38 @@ pub enum Op {
     /// error propagates and handle name keys are left unchanged (workers
     /// remain addressed under `from`). On success, handle name keys are
     /// updated to `to` so subsequent ops address the moved workers.
+    ///
+    /// # Lifetime / ownership-direction asymmetry
+    ///
+    /// `MoveAllTasks` is asymmetric with respect to cgroup ownership:
+    /// the legality of a move depends on the relative lifetimes of
+    /// the `from` and `to` cgroups, not just on which one is the
+    /// source.
+    ///
+    /// | `from` ownership      | `to` ownership        | Outcome |
+    /// |-----------------------|-----------------------|---------|
+    /// | step-local            | step-local            | Allowed; both die at step teardown together. |
+    /// | step-local            | Backdrop (persistent) | Allowed; handle ownership transfers from step-local set to Backdrop set so the worker survives step teardown. |
+    /// | Backdrop              | Backdrop              | Allowed; both persist for the scenario. |
+    /// | Backdrop              | step-local            | **Rejected at apply time.** A persistent worker would be stranded inside a cgroup that gets `rmdir`'d at step boundary; the kernel migrates the orphaned task to the cgroup root with a frozen-task warning in dmesg. The `bail!` diagnostic names the offending pair and tells the operator to either declare the destination in the Backdrop too, or move the worker back into a Backdrop-owned cgroup. |
+    ///
+    /// The Backdrop→Backdrop and step→step cases are unconditionally
+    /// allowed because both endpoints share a lifetime; the
+    /// step→Backdrop case is allowed because the kernel moves
+    /// reference-count once and the framework's
+    /// [`ScenarioState::rename_handles`](super::ScenarioState::rename_handles)
+    /// transfers the handle into the persistent slot in the same
+    /// step. The Backdrop→step case is the only one that produces
+    /// a guaranteed orphan, hence the asymmetric reject.
+    ///
+    /// # Backdrop-setup exemption
+    ///
+    /// `MoveAllTasks` ops running INSIDE a Backdrop's `setup_ops`
+    /// pass (`state.target_backdrop=true`) are exempt from the
+    /// Backdrop→step-local check: at that point, "step-local"
+    /// cgroups don't exist yet (the Backdrop is the only cgroup
+    /// scope), and the rule reduces to a pure source-ownership
+    /// check that the apply path handles already.
     MoveAllTasks {
         from: Cow<'static, str>,
         to: Cow<'static, str>,
@@ -8565,6 +8597,121 @@ mod tests {
         assert!(
             true_idx < false_idx,
             "freeze (true) must come before unfreeze (false): {calls:?}",
+        );
+        cleanup_state(&mut state);
+    }
+
+    /// `apply_setup` rejects `io.weight` outside the kernel's
+    /// `1..=10000` range BEFORE issuing the syscall. The kernel's
+    /// `cgrp_dfl_io_weight_write` parses via `kstrtouint` and
+    /// returns -ERANGE for values outside the documented bound; the
+    /// framework intercepts at apply-setup time so the operator
+    /// gets a structured error naming the offending cgroup and
+    /// value, rather than a raw ERANGE on cgroupfs.
+    ///
+    /// Pin both ends (0 and 10001) so a refactor that loosens the
+    /// check in either direction surfaces here.
+    #[test]
+    fn apply_setup_rejects_io_weight_out_of_range() {
+        for (weight, label) in [(0u16, "zero"), (10_001u16, "above-max")] {
+            let mock = MockCgroupOps::new();
+            let topo = mock_topo();
+            let ctx = mock_ctx(&mock, &topo);
+            let mut state = StepState::empty(&ctx);
+            let defs = vec![CgroupDef::named("cg_io").io_weight(weight)];
+            let err = apply_setup_test(&ctx, &mut state, &defs)
+                .expect_err(&format!("io.weight={weight} ({label}) must reject"));
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("io.weight") && msg.contains("out of range"),
+                "error must name the offending knob and constraint; got: {msg}",
+            );
+            assert!(
+                msg.contains("cg_io"),
+                "error must name the offending cgroup; got: {msg}",
+            );
+            // The reject must fire BEFORE the kernel write — no
+            // SetIoWeight call should have been recorded.
+            let calls = mock.calls();
+            assert!(
+                !calls
+                    .iter()
+                    .any(|c| matches!(c, CgroupCall::SetIoWeight(n, _) if n == "cg_io")),
+                "rejected weight must not reach the cgroupfs write: {calls:?}",
+            );
+            cleanup_state(&mut state);
+        }
+    }
+
+    /// Range boundary acceptance: `io.weight=1` and `io.weight=10000`
+    /// (the kernel's documented endpoints) MUST be accepted by the
+    /// framework's range gate. Pinned alongside the rejection test so
+    /// a future refactor that flips a `<` to `<=` (or vice versa)
+    /// breaks one of the two tests instead of silently widening or
+    /// narrowing the accepted set.
+    #[test]
+    fn apply_setup_accepts_io_weight_range_endpoints() {
+        for weight in [1u16, 10_000u16] {
+            let mock = MockCgroupOps::new();
+            let topo = mock_topo();
+            let ctx = mock_ctx(&mock, &topo);
+            let mut state = StepState::empty(&ctx);
+            let defs = vec![CgroupDef::named("cg_io").io_weight(weight)];
+            apply_setup_test(&ctx, &mut state, &defs).unwrap_or_else(|e| {
+                panic!("io.weight={weight} (boundary) must be accepted: {e:#}")
+            });
+            let calls = mock.calls();
+            assert!(
+                calls.contains(&CgroupCall::SetIoWeight("cg_io".to_string(), weight)),
+                "boundary weight must reach the cgroupfs write; got: {calls:?}",
+            );
+            cleanup_state(&mut state);
+        }
+    }
+
+    /// Empty `works` substitution: a `CgroupDef` declared without a
+    /// `.work(...)` or `.workload(...)` call falls back to a single
+    /// default `WorkSpec` (SpinWait, Normal, ctx.workers_per_cgroup
+    /// workers) at apply-setup time. Pin the substitution by
+    /// asserting that workers were spawned and migrated into the
+    /// cgroup — without the fallback, no MoveTasks call would fire
+    /// and the cgroup would sit empty.
+    ///
+    /// The tests above (e.g. `apply_setup_creates_cgroup_per_def`)
+    /// drive `CgroupDef::named` directly without a workload; this
+    /// test pins the fallback explicitly with a comment naming the
+    /// invariant so a future refactor that drops the default-work
+    /// substitution surfaces here with a clear failure message
+    /// rather than a generic "no MoveTasks" symptom.
+    #[test]
+    fn apply_setup_substitutes_default_workspec_when_works_empty() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        // No .work(...) and no .workload(...) — empty `works` vec.
+        let def = CgroupDef::named("cg_default_work");
+        assert!(
+            def.works.is_empty(),
+            "test premise: CgroupDef without .work() must start with empty works",
+        );
+        apply_setup_test(&ctx, &mut state, &[def])
+            .expect("apply_setup with default-work substitution must succeed");
+        let calls = mock.calls();
+        // The substitution surfaces as a real worker spawn → at
+        // least one MoveTasks call into the cgroup with a non-zero
+        // pid count. MoveTasks records the count (usize) rather
+        // than the Vec; matching `count > 0` pins both the call
+        // presence and the fact that the spawned workload had
+        // workers to migrate.
+        assert!(
+            calls.iter().any(|c| matches!(
+                c,
+                CgroupCall::MoveTasks(name, count) if name == "cg_default_work" && *count > 0
+            )),
+            "default-WorkSpec substitution must spawn workers and migrate them into the \
+             cgroup; without it the empty `works` would leave the cgroup taskless. \
+             Got: {calls:?}",
         );
         cleanup_state(&mut state);
     }
