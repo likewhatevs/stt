@@ -703,7 +703,18 @@ pub enum WorkType {
     /// When `wake == WakeMechanism::Pipe`, the spawn-side
     /// additionally allocates `depth` pipes per chain — see
     /// [`chain_pipe_depth`](Self::chain_pipe_depth) and the
-    /// `SpawnGuard::chain_pipes` field.
+    /// `chain_pipes` field on `SpawnGuard` (early-bail path) and
+    /// [`WorkloadHandle`] (success path).
+    ///
+    /// Both [`CloneMode::Fork`] and [`CloneMode::Thread`] are
+    /// supported for `WakeMechanism::Pipe`. On a successful spawn
+    /// the chain-pipe fds transfer from the guard into
+    /// [`WorkloadHandle`], and `WorkloadHandle::drop` closes them
+    /// only after every worker is reaped (Fork) or joined (Thread).
+    /// Under Thread mode each worker thread shares the parent's fd
+    /// table, so the post-shutdown close is what guarantees workers
+    /// finish their `read` / `write` ops before the fds become
+    /// invalid.
     WakeChain {
         /// Number of workers per chain. Each worker waits for its
         /// predecessor's signal, does `work_per_hop` of CPU work,
@@ -3178,6 +3189,23 @@ pub struct WorkloadHandle {
     iter_counters: *mut AtomicU64,
     /// Number of AtomicU64 slots in iter_counters (== num_workers at spawn time).
     iter_counter_len: usize,
+    /// Inter-worker paired pipes `(ab, ba)` for PipeIo / CachePipe.
+    /// Transferred from [`SpawnGuard`] on success; closed by
+    /// [`WorkloadHandle::drop`] AFTER worker shutdown so Thread-mode
+    /// workers (which share the parent's fd table) can finish their
+    /// pipe ops before the close. Under Fork mode each child holds
+    /// its own fd-table copy via `fork()`, so the parent's late
+    /// close is a no-op for the children. Empty when `work_type`
+    /// is neither PipeIo nor CachePipe.
+    pipe_pairs: Vec<([i32; 2], [i32; 2])>,
+    /// Per-chain pipe rings for `WakeChain { wake: WakeMechanism::Pipe }`.
+    /// Outer Vec is one entry per chain (= `num_workers / depth`);
+    /// inner Vec is `depth` pipes per chain. Same ownership rule as
+    /// `pipe_pairs`: transferred from [`SpawnGuard`] on success,
+    /// closed by [`WorkloadHandle::drop`] AFTER worker shutdown so
+    /// Thread-mode chain workers don't observe `EBADF` mid-run.
+    /// Empty when `work_type` is not `WakeChain { wake: Pipe }`.
+    chain_pipes: Vec<Vec<[i32; 2]>>,
 }
 
 /// Scope guard that owns every resource acquired during
@@ -3187,22 +3215,32 @@ pub struct WorkloadHandle {
 /// every shared region — so a mid-setup failure never leaks fds,
 /// zombie processes, or anonymous-shared pages.
 ///
-/// On success, [`SpawnGuard::into_handle`] moves the live resources
-/// into the returned [`WorkloadHandle`] and leaves the guard empty;
-/// its `Drop` then closes only the inter-worker `pipe_pairs`
-/// (intentionally owned by the guard, not the handle, because the
-/// parent never uses them after fork).
+/// On success, [`SpawnGuard::into_handle`] moves every live
+/// resource — children/threads, futex regions, iter-counter
+/// region, AND `pipe_pairs` / `chain_pipes` — into the returned
+/// [`WorkloadHandle`]. The guard's subsequent `Drop` runs against
+/// empty Vecs/null pointers and is a no-op on the success path.
+/// On the early-bail path (an `?` inside `WorkloadHandle::spawn`)
+/// the guard still owns whatever it allocated and `Drop` cleans
+/// it all up — fds, processes, threads, mmaps. Pipe fds are
+/// closed by the handle (not the guard) because Thread-mode
+/// workers share the parent's fd table; closing the fds before
+/// worker shutdown would surface as `EBADF` on every pipe op a
+/// thread runs after spawn returns.
 struct SpawnGuard {
     /// Inter-worker paired pipes `(ab, ba)` for PipeIo/CachePipe.
-    /// Closed by the guard on every exit (success or failure) —
-    /// children inherit copies via fork and close their own ends.
+    /// Transferred to [`WorkloadHandle`] on success; closed by the
+    /// guard only on the early-bail path. Under Fork mode each
+    /// child holds its own fd-table copy via `fork()`; under
+    /// Thread mode every worker thread shares these fds with the
+    /// parent.
     pipe_pairs: Vec<([i32; 2], [i32; 2])>,
     /// Per-chain pipe rings for `WakeChain { wake: WakeMechanism::Pipe }`. Outer
     /// Vec is one entry per chain (= `num_workers / depth`); inner
     /// Vec is `depth` pipes per chain. Pipe `i` connects stage `i`
-    /// (writer) to stage `(i + 1) % depth` (reader). Closed by the
-    /// guard on every exit; children inherit copies via fork and
-    /// close the inverse ends post-fork.
+    /// (writer) to stage `(i + 1) % depth` (reader). Same ownership
+    /// shape as `pipe_pairs`: transferred to the handle on success,
+    /// closed by the guard only on the early-bail path.
     chain_pipes: Vec<Vec<[i32; 2]>>,
     /// Shared-memory futex regions (transferred to handle on success).
     futex_ptrs: Vec<*mut u32>,
@@ -3236,10 +3274,17 @@ impl SpawnGuard {
     }
 
     /// Transfer live resources into a [`WorkloadHandle`]. Leaves the
-    /// guard's `children`, `threads`, `futex_ptrs`, and
-    /// `iter_counters` empty so the guard's subsequent `Drop` only
-    /// closes the inter-worker `pipe_pairs` (which the parent never
-    /// uses post-fork).
+    /// guard's `children`, `threads`, `futex_ptrs`, `iter_counters`,
+    /// `pipe_pairs`, and `chain_pipes` empty, so the guard's
+    /// subsequent `Drop` is a no-op on the success path. The handle
+    /// is now the sole owner of every resource — its own `Drop`
+    /// closes the pipe fds AFTER worker shutdown completes, which
+    /// is the ordering Thread mode requires (workers share the
+    /// parent's fd table; closing pre-shutdown would surface as
+    /// `EBADF` on every worker's pipe op). Fork mode is unaffected
+    /// either way: each child holds its own fd-table copy via
+    /// `fork()`, so the parent's close timing is invisible to the
+    /// child.
     fn into_handle(mut self) -> WorkloadHandle {
         let children = std::mem::take(&mut self.children);
         let threads = std::mem::take(&mut self.threads);
@@ -3247,6 +3292,8 @@ impl SpawnGuard {
         let iter_counters = std::mem::replace(&mut self.iter_counters, std::ptr::null_mut());
         let iter_counter_bytes = std::mem::replace(&mut self.iter_counter_bytes, 0);
         let iter_counter_len = iter_counter_bytes / std::mem::size_of::<AtomicU64>();
+        let pipe_pairs = std::mem::take(&mut self.pipe_pairs);
+        let chain_pipes = std::mem::take(&mut self.chain_pipes);
         WorkloadHandle {
             children,
             threads,
@@ -3255,6 +3302,8 @@ impl SpawnGuard {
             futex_region_size: self.futex_region_size,
             iter_counters,
             iter_counter_len,
+            pipe_pairs,
+            chain_pipes,
         }
     }
 }
@@ -3311,18 +3360,19 @@ impl Drop for SpawnGuard {
                 let _ = join_thread_with_timeout(j, THREAD_JOIN_TIMEOUT);
             }
         }
-        // Close every inter-worker pipe pair. Children closed their
-        // own inherited copies in the fork arm, so these are the
-        // only remaining references.
+        // Early-bail pipe close. On the success path, into_handle
+        // moved both `pipe_pairs` and `chain_pipes` into the handle,
+        // so these Vecs are empty here and these loops iterate
+        // nothing. On the early-bail path the guard still owns the
+        // partially-allocated pipes and must close them now — the
+        // child arm of each fork already closed any inherited
+        // copies it held, and Thread-mode early-bail joined any
+        // partially-spawned threads above before this loop runs.
         for (ab, ba) in &self.pipe_pairs {
             for fd in [ab[0], ab[1], ba[0], ba[1]] {
                 let _ = nix::unistd::close(fd);
             }
         }
-        // Close every per-stage chain pipe (WakeChain wake=Pipe).
-        // Same parent-side cleanup contract as `pipe_pairs`: each
-        // child inherited a copy and closed its inverse end on
-        // fork; the parent's references close here.
         for chain in &self.chain_pipes {
             for pipe in chain {
                 let _ = nix::unistd::close(pipe[0]);
@@ -3768,31 +3818,17 @@ impl WorkloadHandle {
                 );
             }
             let group_chain_depth = group.work_type.chain_pipe_depth();
-            // WakeChain `wake: WakeMechanism::Pipe` is incompatible with
-            // `CloneMode::Thread`: `SpawnGuard::into_handle` does not
-            // transfer `chain_pipes` (only children/threads/futex
-            // ptrs/iter counters), so the guard's `Drop` runs after a
-            // successful spawn and closes every chain pipe fd. Under
-            // Fork mode each child holds its own fd-table copy of
-            // those pipes (inherited via `fork()`), so the parent's
-            // close is a no-op for the children. Under Thread mode
-            // every thread shares the parent's fd table — the close
-            // makes every worker's pipe fd `EBADF`, and (worse) if
-            // the kernel reuses the freed fd numbers for a subsequent
-            // `open()`, threads then write 1-byte garbage to whatever
-            // unrelated file inherited the fd. Reject at spawn time
-            // with an actionable diagnostic; CloneMode::Fork is the
-            // correct choice for WakeChain wake=Pipe.
-            if group_chain_depth.is_some() && matches!(dispatch, Dispatch::Thread) {
-                anyhow::bail!(
-                    "WakeChain wake=Pipe is not supported under CloneMode::Thread \
-                     (group {}) — the spawn-side closes chain pipe fds via \
-                     SpawnGuard::Drop after spawn returns; threads share the \
-                     parent fd table and would observe EBADF or, post-fd-reuse, \
-                     write to the wrong file. Use CloneMode::Fork.",
-                    group.group_idx,
-                );
-            }
+            // WakeChain `wake: WakeMechanism::Pipe` runs under both
+            // [`CloneMode::Fork`] and [`CloneMode::Thread`].
+            // [`SpawnGuard::into_handle`] transfers `chain_pipes` to
+            // the [`WorkloadHandle`], whose `Drop` closes the pipe
+            // fds AFTER worker shutdown completes — so Thread-mode
+            // workers (which share the parent's fd table) finish
+            // their pipe ops before the close runs. Fork mode is
+            // unaffected: each child holds its own fd-table copy
+            // via `fork()`, and the parent's late close is a no-op
+            // for the child's view (its own copy was closed by the
+            // post-fork close-other-fds block in spawn_group).
             // WakeChain `wake: WakeMechanism::Pipe` with depth=1 deadlocks at fork:
             // prev_stage and stage collapse to 0, so the post-fork
             // close-other-fds block closes BOTH ends of the worker's
@@ -3978,11 +4014,13 @@ impl WorkloadHandle {
             iter_offset += group.num_workers;
         }
 
-        // Success: transfer live resources (children, futex_ptrs,
-        // iter_counters) to the handle. The guard's subsequent Drop
-        // closes the inter-worker `pipe_pairs` — the parent never
-        // uses them post-fork, and they were never owned by the
-        // handle.
+        // Success: transfer every live resource (children, threads,
+        // futex_ptrs, iter_counters, pipe_pairs, chain_pipes) into
+        // the handle. The guard's subsequent Drop sees empty Vecs
+        // and a null iter_counters pointer — it is a no-op on this
+        // path. Pipe fds are closed by `WorkloadHandle::drop` AFTER
+        // worker shutdown so Thread-mode workers (which share the
+        // parent's fd table) finish their pipe ops before the close.
         Ok(guard.into_handle())
     }
 
@@ -5225,6 +5263,44 @@ impl Drop for WorkloadHandle {
                             "thread worker failed to join within timeout in \
                              WorkloadHandle::drop — leaking the thread"
                         );
+                    }
+                }
+            }
+        }
+        // Close inter-worker pipe pairs and chain pipes AFTER worker
+        // shutdown. Ordering matters for Thread mode: every worker
+        // thread shares the parent's fd table, so closing a pipe fd
+        // before its using thread joins would surface to that thread
+        // as `EBADF` on the next read/write/poll syscall. The
+        // children-reap loop above and the threads-join loop above
+        // both block until their worker is reaped or joined; only
+        // then do these closes run, which is when the workers are
+        // guaranteed to no longer touch their fds. Fork mode is
+        // unaffected either way: each child held its own fd-table
+        // copy via `fork()`, so this close is a no-op for the
+        // child's view (its own copy was closed by the post-fork
+        // close-other-fds block in spawn_group).
+        //
+        // Errors from `close` are logged via `tracing::warn!` rather
+        // than swallowed — `EBADF` here would indicate a double-close
+        // (an aliased ownership bug) and is more diagnostic than the
+        // SpawnGuard early-bail path's silent close. SpawnGuard's
+        // Drop swallows EBADF deliberately because mid-spawn the
+        // guard may share fd ownership with already-closed
+        // half-allocated state; the handle on the other hand has
+        // sole ownership at this point.
+        for (ab, ba) in &self.pipe_pairs {
+            for fd in [ab[0], ab[1], ba[0], ba[1]] {
+                if let Err(e) = close(fd) {
+                    tracing::warn!(fd, %e, "close failed for pipe_pair fd in WorkloadHandle::drop");
+                }
+            }
+        }
+        for chain in &self.chain_pipes {
+            for pipe in chain {
+                for fd in [pipe[0], pipe[1]] {
+                    if let Err(e) = close(fd) {
+                        tracing::warn!(fd, %e, "close failed for chain_pipe fd in WorkloadHandle::drop");
                     }
                 }
             }
@@ -10335,9 +10411,10 @@ mod tests {
                 return 15;
             }
             // Prove the bail arrived via the pipe branch, not a
-            // later mmap or fork. Both pipe-failure paths bail
-            // with "pipe failed".
-            if !err_msg.contains("pipe failed") {
+            // later mmap or fork. Both inter-worker pipe-failure
+            // paths bail with "pipe2 failed: ..." (the
+            // `libc::pipe2` call site at the top of `spawn_group`).
+            if !err_msg.contains("pipe2 failed") {
                 return 14;
             }
             let after = count_open_fds();
@@ -10353,6 +10430,98 @@ mod tests {
             code, 0,
             "child reported cleanup defect (code {code}): see exit-code table above \
              spawn_guard_cleans_up_on_interworker_pipe_emfile"
+        );
+    }
+
+    /// EMFILE on the WakeChain `wake = WakeMechanism::Pipe` chain
+    /// allocation loop: with num_workers=4 and depth=4 (the
+    /// `defaults::WAKE_CHAIN_DEPTH`), the spawn path allocates 1
+    /// chain × 4 pipes × 2 fds = 8 fds in
+    /// [`WorkloadHandle::spawn`]'s spawn_group routine
+    /// (`workload.rs:4070-4100`). Cap RLIMIT_NOFILE at baseline+5 so
+    /// the first 2 chain pipes (4 fds) succeed and the 3rd
+    /// `libc::pipe2` call needs 2 fds against the 1 remaining slot
+    /// — which the kernel rejects with EMFILE. At bail the
+    /// half-built chain holds 2 pipes; the local close loop in
+    /// `spawn_group` closes those 4 fds before `anyhow::bail!`
+    /// returns, and `guard.chain_pipes` stays empty (the chain
+    /// hadn't been pushed yet), so SpawnGuard::Drop has nothing
+    /// extra to clean up. The fd count must return to baseline.
+    ///
+    /// This test mirrors `spawn_guard_cleans_up_on_interworker_pipe_emfile`
+    /// for the chain-pipe path. WakeChain wake=Pipe is the only
+    /// other allocation site in WorkloadHandle::spawn that calls
+    /// `libc::pipe2` per-stage at allocation time (PipeIo /
+    /// CachePipe go through the inter-worker pipe-pair loop tested
+    /// separately above).
+    ///
+    /// Inherits the same harness assumptions:
+    /// - dense fd table (no gaps below baseline)
+    /// - `RUST_BACKTRACE` unset (panic-time fd churn would shift
+    ///   the effective baseline mid-run)
+    #[test]
+    fn spawn_guard_cleans_up_on_wake_chain_pipe_emfile() {
+        let code = run_in_forked_child(|| {
+            let baseline = count_open_fds();
+            // Capture the inherited RLIMIT_NOFILE so the post-bail
+            // restore uses a value the kernel will accept. Same
+            // pattern as spawn_guard_cleans_up_on_interworker_pipe_emfile.
+            let mut original_rlimit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut original_rlimit) } != 0 {
+                return 13;
+            }
+            // baseline + 5: pipes 1 + 2 succeed (4 fds), pipe 3
+            // needs 2 against 1 free slot and fails with EMFILE.
+            let target_cur = (baseline + 5) as u64;
+            let lowered = libc::rlimit {
+                rlim_cur: target_cur,
+                rlim_max: original_rlimit.rlim_max,
+            };
+            if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lowered) } != 0 {
+                return 13;
+            }
+            let config = WorkloadConfig {
+                num_workers: 4,
+                affinity: ResolvedAffinity::None,
+                work_type: WorkType::WakeChain {
+                    depth: 4,
+                    wake: WakeMechanism::Pipe,
+                    work_per_hop: Duration::from_micros(100),
+                },
+                sched_policy: SchedPolicy::Normal,
+                ..Default::default()
+            };
+            let result = WorkloadHandle::spawn(&config);
+            if result.is_ok() {
+                return 10; // Failure did not trigger.
+            }
+            let err_msg = format!("{:#}", result.as_ref().err().unwrap());
+            if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &original_rlimit) } != 0 {
+                return 15;
+            }
+            // Prove the bail came from the chain-pipe allocator,
+            // not from the inter-worker pipe-pair loop, the
+            // per-worker report/start pipe2, or a later mmap. The
+            // exact bail string is at workload.rs:4093-4096.
+            if !err_msg.contains("WakeChain pipe2 allocation failed") {
+                return 14;
+            }
+            let after = count_open_fds();
+            if after > baseline {
+                return 11; // Fd leak.
+            }
+            if any_zombie_child() {
+                return 12;
+            }
+            0
+        });
+        assert_eq!(
+            code, 0,
+            "child reported cleanup defect (code {code}): see exit-code table above \
+             spawn_guard_cleans_up_on_wake_chain_pipe_emfile"
         );
     }
 
@@ -14040,17 +14209,34 @@ mod tests {
         );
     }
 
-    /// `CloneMode::Thread + WorkType::PipeIo` MUST run to
-    /// completion. PipeIo allocates a per-pair `pipe2(O_CLOEXEC)`
-    /// (a kernel-side anon-pipe shared between fork siblings; under
-    /// Thread mode every worker shares the harness's mm so the same
-    /// fds are visible without any extra mapping) and exchanges
-    /// 1-byte messages — pinning that the existing pair-pipe
-    /// plumbing works under Thread mode without the per-worker
-    /// `MAP_SHARED` allocation that Fork mode relies on. Both
-    /// workers in the (0,1) pair must produce work_units > 0;
-    /// either reporting zero would mean the pipe pair-up didn't
-    /// route correctly under thread-shared mm.
+    /// `CloneMode::Thread + WorkType::PipeIo` MUST exchange real
+    /// bytes through the inter-worker pipe pair. Thread workers
+    /// share the parent's fd table, so the pipe fds the workers
+    /// receive are the same kernel-side `pipe2(O_CLOEXEC)`-backed
+    /// objects the parent allocated. Workers exchange 1-byte
+    /// messages via `pipe_exchange` (one `write(byte)` then a
+    /// `poll(POLLIN)` + `read(byte)` round-trip per iteration);
+    /// each successful round-trip pushes a sample into the
+    /// reservoir-sampled `resume_latencies_ns` Vec, so a worker
+    /// reporting an empty `resume_latencies_ns` after the run
+    /// window means its pipe ops never observed a real wake.
+    ///
+    /// Asserting `work_units > 0` would NOT prove pipe routing —
+    /// `pipe_exchange` ignores `libc::write`/`libc::poll` return
+    /// values, and the surrounding worker loop bumps work_units
+    /// per iteration regardless of pipe success. A pipe with
+    /// closed fds returns -1/EBADF and `pipe_exchange` short-
+    /// circuits via `if ret < 0 { break; }` (skipping the latency
+    /// push) but the outer iteration counter advances. Hence the
+    /// invariant the test pins is `resume_latencies_ns.len() > 0`,
+    /// not `work_units > 0`.
+    ///
+    /// Pin two stronger checks alongside the latency-sample
+    /// requirement:
+    ///   - both workers in the (0, 1) pair produce samples (no
+    ///     half-routed pair where only one direction works)
+    ///   - work_units > 0 stays as a smoke check that the worker
+    ///     loop ran at all
     #[test]
     fn spawn_thread_with_pipe_io() {
         let config = WorkloadConfig {
@@ -14068,7 +14254,79 @@ mod tests {
         for r in &reports {
             assert!(
                 r.work_units > 0,
-                "Thread + PipeIo worker tid={} did no work: {:?}",
+                "Thread + PipeIo worker tid={} ran zero iterations: {:?}",
+                r.tid, r,
+            );
+            assert!(
+                !r.resume_latencies_ns.is_empty(),
+                "Thread + PipeIo worker tid={} captured zero wake-latency \
+                 samples — its pipe ops never observed a partner write, \
+                 which under shared-fd-table semantics means the pipe fds \
+                 were closed before the worker reached pipe_exchange. \
+                 work_units={} (bumped regardless of pipe success). Full \
+                 report: {:?}",
+                r.tid, r.work_units, r,
+            );
+        }
+    }
+
+    /// `CloneMode::Thread + WorkType::WakeChain { wake: Pipe }`
+    /// MUST run the chain pipes to completion. After the pipe-fd
+    /// ownership fix (chain_pipes now transferred to
+    /// [`WorkloadHandle`] and closed only at handle Drop), a
+    /// Thread-mode WakeChain wake=Pipe workload must observe each
+    /// stage's predecessor write — verified via
+    /// `resume_latencies_ns` non-empty for at least one stage in
+    /// the chain (the head stage publishes its first wake on the
+    /// bootstrap path; subsequent stages collect samples on the
+    /// post-bootstrap rounds).
+    ///
+    /// Before the fix, this configuration was rejected at spawn
+    /// time with the diagnostic "WakeChain wake=Pipe is not
+    /// supported under CloneMode::Thread"; the rejection arm has
+    /// been deleted, so spawn now succeeds and the workers must
+    /// route real bytes through the chain pipes.
+    #[test]
+    fn spawn_thread_with_wake_chain_pipe() {
+        let config = WorkloadConfig {
+            num_workers: 2,
+            clone_mode: CloneMode::Thread,
+            work_type: WorkType::WakeChain {
+                depth: 2,
+                wake: WakeMechanism::Pipe,
+                work_per_hop: Duration::from_micros(100),
+            },
+            ..Default::default()
+        };
+        let mut h = WorkloadHandle::spawn(&config)
+            .expect("Thread + WakeChain wake=Pipe spawn must succeed");
+        h.start();
+        std::thread::sleep(Duration::from_millis(200));
+        let reports = h.stop_and_collect();
+        assert_eq!(
+            reports.len(),
+            2,
+            "Thread + WakeChain wake=Pipe collects one report per worker"
+        );
+        let total_samples: usize = reports
+            .iter()
+            .map(|r| r.resume_latencies_ns.len())
+            .sum();
+        assert!(
+            total_samples > 0,
+            "Thread + WakeChain wake=Pipe captured zero wake-latency \
+             samples across {} workers — the chain pipes never routed a \
+             stage handoff, which under shared-fd-table semantics means \
+             the pipe fds were closed before the workers reached the \
+             chain handoff site. Per-worker reports: {:?}",
+            reports.len(),
+            reports,
+        );
+        for r in &reports {
+            assert!(
+                r.work_units > 0,
+                "Thread + WakeChain wake=Pipe worker tid={} ran zero \
+                 iterations: {:?}",
                 r.tid, r,
             );
         }
