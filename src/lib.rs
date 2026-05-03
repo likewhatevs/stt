@@ -646,8 +646,9 @@ pub mod prelude {
     pub use crate::vmm::disk_config::{DiskConfig, DiskThrottle, Filesystem};
     pub use crate::vmm::VirtioBlkCounters;
     pub use crate::workload::{
-        AffinityIntent, ResolvedAffinity, CloneMode, MemPolicy, Migration, MpolFlags, Phase,
-        SchedPolicy, WorkSpec, WorkType, WorkerReport, WorkloadConfig, WorkloadHandle, build_nodemask,
+        AffinityIntent, AluWidth, CloneMode, MemPolicy, Migration, MpolFlags, Phase,
+        ResolvedAffinity, SchedPolicy, WorkSpec, WorkType, WorkTypeValidationError, WorkerReport,
+        WorkloadConfig, WorkloadHandle, build_nodemask,
     };
 }
 

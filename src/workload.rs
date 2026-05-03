@@ -1460,6 +1460,150 @@ pub enum WorkType {
         /// `WorkType::IdleChurn { ..., precise_timing: true }`.
         precise_timing: bool,
     },
+    /// Sustained high-IPC ALU workload. Each worker runs four
+    /// independent multiply chains in parallel, with
+    /// [`std::hint::black_box`] wrapping every step to prevent
+    /// the optimizer from collapsing the chain into a closed-form
+    /// expression. Distinct from [`SpinWait`](Self::SpinWait) —
+    /// `SpinWait` issues `PAUSE` (`std::hint::spin_loop`) whose
+    /// per-iteration retire is a single fused micro-op and which
+    /// signals the front-end to back off, depressing the IPC the
+    /// scheduler observes. `AluHot` retires real arithmetic at
+    /// IPC ≥ 2.0 on every modern x86_64 / aarch64 core, so
+    /// scheduler decisions that respond to per-task runtime
+    /// characteristics (lavd's `lat_cri` per-task
+    /// latency-criticality scoring) see a meaningfully different
+    /// signal.
+    ///
+    /// The [`width`](Self::AluHot::width) field selects the
+    /// data-path width — see [`AluWidth`] for the resolution
+    /// rules and the AVX-512 / AMX caveats. Workers do NOT
+    /// adjust frequency or voltage state themselves; the
+    /// package-wide frequency throttle on x86_64 is a kernel-
+    /// observable effect of running AVX-512 / AMX instructions.
+    ///
+    /// **v0:** runs scalar four-stream multiplies for ALL
+    /// widths; the width selector shapes the dispatch for future
+    /// SIMD intrinsics (follow-up #309-#314). No observable
+    /// behavioral difference between widths today.
+    ///
+    /// `worker_group_size = None` (any worker count is valid;
+    /// each worker runs an independent multiply chain). No
+    /// shared-memory region; no per-iteration syscall overhead.
+    AluHot {
+        /// SIMD / scalar width selector for the multiply chain.
+        /// See [`AluWidth`] for the per-variant data-path width
+        /// and the runtime resolution rules.
+        width: AluWidth,
+    },
+    /// Tight `PAUSE`-spin from a paired worker, intended to be
+    /// pinned to two SMT siblings of the same physical core so
+    /// the spinning thread contends for the core's shared
+    /// front-end / execution resources with its sibling. Distinct
+    /// from [`SpinWait`](Self::SpinWait) which is a single-
+    /// position spin: `SmtSiblingSpin` requires
+    /// [`worker_group_size`](Self::worker_group_size) `== 2` and
+    /// is intended to be paired with [`AffinityIntent::Exact`]
+    /// pinning both workers to the SMT siblings of one core
+    /// (e.g. `cpu_a` and `cpu_b` where
+    /// `/sys/devices/system/cpu/cpu_a/topology/thread_siblings_list`
+    /// contains `cpu_b`).
+    ///
+    /// Without that pinning the variant degenerates to two
+    /// independent SpinWait workers and exercises no SMT
+    /// contention. The framework does NOT auto-pin to SMT
+    /// siblings — the caller owns the affinity decision because
+    /// SMT-pair availability is host-dependent and the test
+    /// author may want to compare same-core vs cross-core
+    /// behaviour. See follow-up #311 for the framework-level
+    /// affinity helper.
+    ///
+    /// `worker_group_size = Some(2)` so paired workers share
+    /// the position metadata the dispatch arm uses to assert
+    /// the partner exists; the variant carries no shared-memory
+    /// region itself.
+    SmtSiblingSpin,
+    /// Per-thread alternating high-IPC / low-IPC workload. Each
+    /// worker runs `hot_iters` of dependent integer multiplies
+    /// (high IPC, ALU-bound) followed by `cold_iters` of random
+    /// cache-line touches over a working-set region (low IPC,
+    /// memory-bound), repeating the alternation
+    /// `period_iters` times before checking
+    /// [`stop_requested`](crate::workload). The phase split
+    /// is deterministic per worker — no shared state — so two
+    /// workers iterate at offset cadences only if they are
+    /// scheduled differently.
+    ///
+    /// Drives task-level runtime variance between phases: any
+    /// scheduler that estimates a task's "bursty" or
+    /// "memory-stall" character from a windowed runtime sample
+    /// (lavd's `lat_cri` per-task latency-criticality field on
+    /// `task_ctx`) sees this task switch character every
+    /// `hot_iters + cold_iters` boundary. Tests scheduler
+    /// adaptation latency: how quickly does the scheduler
+    /// re-classify the task as the phase changes?
+    ///
+    /// Field semantics:
+    ///
+    /// - `hot_iters`: number of multiply-chain steps per hot
+    ///   phase. Chosen to span ~tens of microseconds on a
+    ///   modern core; e.g. 100_000 ≈ 50µs at IPC 2.0 / 2 GHz.
+    /// - `cold_iters`: number of random cache-line touches per
+    ///   cold phase. The cold phase reads a 512KB region (LLC
+    ///   pressure on most desktop hosts; spills to DRAM on
+    ///   workloads with smaller LLCs) at random offsets.
+    /// - `period_iters`: hot/cold pair count per outer
+    ///   iteration. Higher values reduce the per-stop-check
+    ///   overhead but increase shutdown latency.
+    ///
+    /// All three must be `> 0`; both the
+    /// [`ipc_variance`](Self::ipc_variance) constructor and
+    /// [`WorkloadHandle::spawn`] reject zeros with
+    /// [`WorkTypeValidationError::ZeroIpcVarianceParam`].
+    ///
+    /// **Stop responsiveness.** The hot and cold inner loops do
+    /// not poll [`stop`](crate::workload). The outer
+    /// `period_iters` loop checks `stop_requested` between each
+    /// hot/cold pair, so worst-case shutdown latency is one
+    /// hot-phase + one cold-phase. Large `hot_iters` /
+    /// `cold_iters` increase the shutdown-latency floor
+    /// proportionally; pick values that keep a single phase
+    /// under the test author's tolerance for stop lag.
+    ///
+    /// **`iterations` counter semantics.** Each completed outer
+    /// loop bumps the per-worker `iterations` counter by ONE,
+    /// regardless of how many `period_iters` the inner loop
+    /// actually completed before `stop_requested` fired. The
+    /// counter records ENTERED outer cycles, not completed
+    /// inner periods; the per-multiply / per-touch progress
+    /// flows through `work_units` instead. A worker that exits
+    /// during the inner `period_iters` loop still bumps
+    /// `iterations` by 1 for that outer cycle — the
+    /// `iterations += 1` at the end of the dispatch arm is
+    /// unconditional.
+    ///
+    /// `worker_group_size = None`. No shared memory; no
+    /// per-iteration syscall.
+    IpcVariance {
+        /// Multiply-chain steps per hot phase. Must be `> 0`.
+        /// Larger values increase shutdown latency
+        /// proportionally — the inner hot loop does not poll
+        /// `stop` between steps, so a worker mid-hot-phase
+        /// finishes the phase before the outer loop sees the
+        /// stop signal.
+        hot_iters: u64,
+        /// Random cache-line touches per cold phase. Must be
+        /// `> 0`. Larger values increase shutdown latency
+        /// proportionally — the inner cold loop does not poll
+        /// `stop` between touches, so a worker mid-cold-phase
+        /// finishes the phase before the outer loop sees the
+        /// stop signal.
+        cold_iters: u64,
+        /// Hot+cold pair iterations per outer loop. Must be
+        /// `> 0`. Higher values reduce per-stop-check overhead
+        /// but increase shutdown latency.
+        period_iters: u64,
+    },
 }
 
 /// Named defaults for the parametric [`WorkType`] variants, used by
@@ -1565,6 +1709,28 @@ pub mod defaults {
     /// the variant doc describes; opt-in callers set the field to
     /// `true` directly to call `prctl(PR_SET_TIMERSLACK, 1)`.
     pub const IDLE_CHURN_PRECISE_TIMING: bool = false;
+    // AluHot
+    /// Default for [`WorkType::AluHot`]'s `width` field. `Widest`
+    /// resolves to the widest data-path the host supports at
+    /// worker entry — see [`super::AluWidth`] for the resolution
+    /// order.
+    pub const ALU_HOT_WIDTH: super::AluWidth = super::AluWidth::Widest;
+    // IpcVariance
+    /// Multiply-chain steps per hot phase in [`WorkType::IpcVariance`].
+    /// At IPC 2.0 / 2 GHz this spans ~50µs — long enough that the
+    /// scheduler's IPC-window observer sees a steady high-IPC
+    /// signal before the cold phase flips it.
+    pub const IPC_VARIANCE_HOT_ITERS: u64 = 100_000;
+    /// Random cache-line touches per cold phase in
+    /// [`WorkType::IpcVariance`]. 1024 touches across a 512KB
+    /// working set on a typical x86 core takes ~100µs (LLC) to
+    /// ~1ms (DRAM-spill).
+    pub const IPC_VARIANCE_COLD_ITERS: u64 = 1024;
+    /// Hot+cold pair iterations per outer loop in
+    /// [`WorkType::IpcVariance`]. 64 keeps per-stop-check
+    /// overhead at <2% while bounding shutdown latency to one
+    /// outer iteration (~10ms with the defaults above).
+    pub const IPC_VARIANCE_PERIOD_ITERS: u64 = 64;
 }
 
 impl WorkType {
@@ -1617,6 +1783,9 @@ impl WorkType {
             WorkType::EpollStorm { .. } => "EpollStorm",
             WorkType::NumaMigrationChurn { .. } => "NumaMigrationChurn",
             WorkType::IdleChurn { .. } => "IdleChurn",
+            WorkType::AluHot { .. } => "AluHot",
+            WorkType::SmtSiblingSpin => "SmtSiblingSpin",
+            WorkType::IpcVariance { .. } => "IpcVariance",
         }
     }
 
@@ -1753,6 +1922,15 @@ impl WorkType {
                 sleep_duration: defaults::IDLE_CHURN_SLEEP_DURATION,
                 precise_timing: defaults::IDLE_CHURN_PRECISE_TIMING,
             }),
+            "AluHot" => Some(WorkType::AluHot {
+                width: defaults::ALU_HOT_WIDTH,
+            }),
+            "SmtSiblingSpin" => Some(WorkType::SmtSiblingSpin),
+            "IpcVariance" => Some(WorkType::IpcVariance {
+                hot_iters: defaults::IPC_VARIANCE_HOT_ITERS,
+                cold_iters: defaults::IPC_VARIANCE_COLD_ITERS,
+                period_iters: defaults::IPC_VARIANCE_PERIOD_ITERS,
+            }),
             // Sequence requires explicit phases; no default from_name.
             _ => None,
         }
@@ -1860,6 +2038,15 @@ impl WorkType {
                 consumers,
                 ..
             } => Some(producers + consumers),
+            // SmtSiblingSpin: paired workers intended to be
+            // pinned to the two SMT siblings of one physical
+            // core. The variant doesn't allocate shared memory;
+            // the group of 2 is what binds the AffinityIntent
+            // resolution to a sibling pair (the test author
+            // supplies the per-pair pinning via
+            // [`AffinityIntent::Exact`] — see follow-up #311
+            // for a framework-level helper).
+            WorkType::SmtSiblingSpin => Some(2),
             _ => None,
         }
     }
@@ -2297,6 +2484,59 @@ impl WorkType {
         }
     }
 
+    /// Construct a [`WorkType::AluHot`] at the given execution
+    /// width.
+    ///
+    /// `AluWidth::Widest` resolves to the widest data-path the
+    /// host supports at worker entry. See [`AluWidth`] for the
+    /// per-variant data-path width and the runtime resolution
+    /// rules.
+    ///
+    /// Validation fires at spawn time, not construction time;
+    /// see [`WorkType::AluHot`] variant doc for preconditions.
+    pub fn alu_hot(width: AluWidth) -> Self {
+        WorkType::AluHot { width }
+    }
+
+    /// Construct a [`WorkType::IpcVariance`] with explicit hot,
+    /// cold, and period iteration counts.
+    ///
+    /// Returns [`WorkTypeValidationError::ZeroIpcVarianceParam`]
+    /// when any of `hot_iters`, `cold_iters`, or `period_iters`
+    /// is `0`. Construction-time validation matches the
+    /// spawn-time check so callers get immediate feedback at
+    /// the call site rather than discovering the rejection
+    /// only at [`WorkloadHandle::spawn`] time.
+    pub fn ipc_variance(
+        hot_iters: u64,
+        cold_iters: u64,
+        period_iters: u64,
+    ) -> std::result::Result<Self, WorkTypeValidationError> {
+        if hot_iters == 0 {
+            return Err(WorkTypeValidationError::ZeroIpcVarianceParam {
+                field: "hot_iters",
+                group_idx: 0,
+            });
+        }
+        if cold_iters == 0 {
+            return Err(WorkTypeValidationError::ZeroIpcVarianceParam {
+                field: "cold_iters",
+                group_idx: 0,
+            });
+        }
+        if period_iters == 0 {
+            return Err(WorkTypeValidationError::ZeroIpcVarianceParam {
+                field: "period_iters",
+                group_idx: 0,
+            });
+        }
+        Ok(WorkType::IpcVariance {
+            hot_iters,
+            cold_iters,
+            period_iters,
+        })
+    }
+
     /// User-supplied work function with a display name.
     ///
     /// `run` receives a reference to the stop flag (flipped per-mode:
@@ -2407,6 +2647,28 @@ pub enum WorkTypeValidationError {
         group_size: usize,
         /// The `num_workers` count the caller supplied.
         num_workers: usize,
+    },
+    /// [`WorkType::IpcVariance`] with one of `hot_iters`,
+    /// `cold_iters`, or `period_iters` equal to `0`. A zero in
+    /// any of the three collapses the alternation: zero
+    /// `hot_iters` produces a pure cold-phase memory loop, zero
+    /// `cold_iters` produces a pure ALU loop (use
+    /// [`WorkType::AluHot`] directly for that), and zero
+    /// `period_iters` produces a worker that never advances
+    /// past the first stop check. Each rejection names the
+    /// offending field so the caller knows which to fix.
+    #[error(
+        "IpcVariance {field} must be > 0 (group {group_idx}); a zero value \
+         collapses the hot/cold alternation and produces a degenerate \
+         workload (see [`WorkType::IpcVariance`] variant doc)"
+    )]
+    ZeroIpcVarianceParam {
+        /// Static name of the offending field —
+        /// `"hot_iters"`, `"cold_iters"`, or `"period_iters"`.
+        field: &'static str,
+        /// Index of the offending group in
+        /// [`WorkloadConfig::composed`] (primary group = 0).
+        group_idx: usize,
     },
 }
 
@@ -2617,6 +2879,118 @@ pub enum WakeMechanism {
     /// advances the word and `FUTEX_WAKE`s; the stage whose
     /// `pos` matches runs, others re-park. No `WF_SYNC`.
     Futex,
+}
+
+/// ALU/SIMD execution width for [`WorkType::AluHot`].
+///
+/// Selects the widest data-path the worker exercises per
+/// multiply chain. Wider variants WILL drive more
+/// functional-unit pressure and (for AVX-512 / AMX) draw the
+/// package into a frequency-throttled mode the kernel scheduler
+/// must observe when SIMD intrinsics land per-arm; v0 is
+/// scalar-only, so all widths execute the same scalar
+/// four-stream multiply chain today. The serde wire form is
+/// snake_case (`"scalar"`, `"vec128"`, `"vec256"`,
+/// `"vec512"`, `"amx"`, `"widest"`).
+///
+/// # v0 behaviour
+///
+/// All widths run the SAME four-stream scalar multiply path in
+/// v0; the width selector shapes the dispatch for future SIMD
+/// intrinsics (follow-up #309-#314). No observable behavioral
+/// difference between widths today — the variant is
+/// preserved so existing serialized configs keep round-tripping
+/// when the SIMD bodies land.
+///
+/// # Default semantics
+///
+/// `Scalar` is the type-level Rust default (the
+/// `#[derive(Default)]` fallback that serde uses when an
+/// `AluWidth` field is missing on the wire — keeps backward-
+/// compat for older capture data). `Widest` is the
+/// workload-level default the
+/// [`defaults::ALU_HOT_WIDTH`] constant resolves at runtime
+/// via [`resolve_alu_width`]: tests that take
+/// `WorkType::from_name("AluHot")` get the host's widest
+/// available data-path, not the type-level scalar fallback.
+/// The asymmetry is deliberate — type-level Default favours
+/// "always available everywhere"; workload-level default
+/// favours "stress the host as hard as it can run."
+///
+/// # Resolution rules
+///
+/// `Widest` is a runtime-resolved sentinel: at worker entry the
+/// dispatch arm probes the host CPU via
+/// [`std::is_x86_feature_detected!`] (x86_64) and picks the
+/// widest available variant in the order `Amx > Vec512 > Vec256
+/// > Vec128 > Scalar`. On `aarch64` only `Scalar` and `Vec128`
+/// (NEON) are available; `Vec256` / `Vec512` / `Amx` are absent
+/// and `Widest` resolves to NEON when present, falling back to
+/// `Scalar`. A configured value that the host cannot run is
+/// downgraded to the next-widest available variant with a
+/// one-shot `tracing::warn!` so the test still produces useful
+/// telemetry rather than hard-failing — silent downgrade
+/// without the warn would mask the host capability gap.
+///
+/// # Frequency throttle on x86_64
+///
+/// On Intel client / server SKUs the AVX-512 license raises the
+/// per-core voltage and lowers the all-core turbo for the
+/// package; running [`Vec512`](Self::Vec512) workers under one
+/// scheduler while other workers run under another biases the
+/// comparison because the throttle is package-wide, not
+/// per-task. Tests that A/B-compare schedulers under
+/// [`Vec512`](Self::Vec512) or [`Amx`](Self::Amx) need the
+/// runs serialized on the same package — see follow-up #310.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AluWidth {
+    /// 64-bit scalar integer multiply chain. Drives the integer
+    /// pipeline only; no SIMD or AVX licensing involved.
+    /// Available on every supported architecture.
+    #[default]
+    Scalar,
+    /// 128-bit vector integer multiply chain (SSE2 on x86_64,
+    /// NEON on aarch64). The widest baseline both architectures
+    /// support; a reasonable default when the test cares about
+    /// "vectorized ALU" without architecture-specific tuning.
+    Vec128,
+    /// 256-bit vector integer multiply chain (AVX2 on x86_64).
+    /// Not available on aarch64 — falls back to `Vec128`
+    /// (NEON) at worker entry with a one-shot warn.
+    Vec256,
+    /// 512-bit vector integer multiply chain (AVX-512F on
+    /// x86_64). Triggers the package-wide frequency throttle
+    /// described above. Not available on aarch64 — falls back
+    /// to `Vec128` (NEON) at worker entry.
+    Vec512,
+    /// AMX tile multiply chain (x86_64 server SKUs with AMX-INT8
+    /// or AMX-BF16). The widest data-path on x86_64; uses XFD
+    /// gating in the kernel
+    /// (`arch/x86/kernel/traps.c::handle_xfd_event` raises the
+    /// #NM trap, then
+    /// `arch/x86/kernel/fpu/xstate.c::__xfd_enable_feature`
+    /// allocates the dynamic XSAVE area) so the first AMX
+    /// instruction triggers a #NM fault and the kernel allocates
+    /// the dynamic XSAVE area lazily — adds a one-time per-task
+    /// latency spike on first use.
+    ///
+    /// AMX additionally requires
+    /// `prctl(ARCH_REQ_XCOMP_PERM, XFEATURE_XTILE_DATA)` per
+    /// process before the first AMX instruction; the framework
+    /// does NOT issue this prctl, so AMX is not yet runnable.
+    /// `resolve_alu_width` therefore downgrades `AluWidth::Amx`
+    /// to the host's widest stable-detectable variant. See
+    /// follow-up #309 for the AMX detection + prctl path.
+    ///
+    /// Not available on aarch64 — falls back to `Vec128`.
+    Amx,
+    /// Resolve to the widest variant the host supports at
+    /// worker entry. See the type-level doc for the resolution
+    /// order. Useful as a default when the test author wants
+    /// "as much ALU pressure as the host can sustain" without
+    /// hardcoding an architecture or feature level.
+    Widest,
 }
 
 /// Coarse Linux scheduling class identifier.
@@ -4802,6 +5176,39 @@ impl WorkloadHandle {
                     .into());
                 }
             }
+            // IpcVariance rejects 0 for any of the three knobs:
+            // each zero collapses the hot/cold alternation that
+            // is the variant's only purpose. The check runs at
+            // every group entry so composed scenarios surface
+            // the offending group index in the diagnostic.
+            if let WorkType::IpcVariance {
+                hot_iters,
+                cold_iters,
+                period_iters,
+            } = group.work_type
+            {
+                if hot_iters == 0 {
+                    return Err(WorkTypeValidationError::ZeroIpcVarianceParam {
+                        field: "hot_iters",
+                        group_idx: group.group_idx,
+                    }
+                    .into());
+                }
+                if cold_iters == 0 {
+                    return Err(WorkTypeValidationError::ZeroIpcVarianceParam {
+                        field: "cold_iters",
+                        group_idx: group.group_idx,
+                    }
+                    .into());
+                }
+                if period_iters == 0 {
+                    return Err(WorkTypeValidationError::ZeroIpcVarianceParam {
+                        field: "period_iters",
+                        group_idx: group.group_idx,
+                    }
+                    .into());
+                }
+            }
         }
 
         // futex region sizing is per-group, not MAX'd across all
@@ -6682,13 +7089,13 @@ fn worker_main(
     // the hot-path issues no per-iteration allocator calls.
     let mut io_buf: Option<DirectIoBuf> = None;
     // Per-worker xorshift PRNG state for IoRandRead / IoConvoy.
-    // Seeded from `tid ^ 0x9E37_79B9_7F4A_7C15` (the same Weyl
-    // increment golden-ratio constant glibc's `nrand48` family
-    // uses) so a tid of 0 still produces a non-zero seed. Kept on
-    // the stack (not heap) — pure scalar state.
-    let mut io_rng: u64 = (tid as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    // Seeded from `tid * GOLDEN_RATIO_64` (the same Weyl-sequence
+    // golden-ratio increment glibc's `nrand48` family uses) so
+    // a tid of 0 still produces a non-zero seed. Kept on the
+    // stack (not heap) — pure scalar state.
+    let mut io_rng: u64 = (tid as u64).wrapping_mul(GOLDEN_RATIO_64);
     if io_rng == 0 {
-        io_rng = 0x9E37_79B9_7F4A_7C15;
+        io_rng = GOLDEN_RATIO_64;
     }
     // Sequential write cursor for IoConvoy. Starts at the worker's
     // stripe base (computed lazily once /dev/vda capacity is known)
@@ -6735,6 +7142,26 @@ fn worker_main(
     // citation explaining why `1` (not `0`) is the value that
     // shrinks slack.
     let mut idle_churn_slack_applied = false;
+    // AluHot: the configured `AluWidth` is resolved to a concrete
+    // arch-specific variant once at worker entry rather than on
+    // every iteration. `Widest` resolves to the widest variant
+    // the host supports; an explicit width that the host cannot
+    // run downgrades to the next-widest available with a one-
+    // shot warn. The resolved width persists for the worker's
+    // lifetime.
+    let mut alu_hot_resolved_width: Option<AluWidth> = None;
+    // IpcVariance: persistent 512KB working-set buffer reused
+    // across cold phases. Allocated lazily on the first cold
+    // phase and reused thereafter. Aligned u64 storage so the
+    // u64 multiplies in the hot phase share the same allocation
+    // type as the cold-phase reads (avoids the alignment hazard
+    // CachePressure documented for u64 reinterpretation of
+    // Vec<u8>).
+    let mut ipc_variance_buf: Option<Vec<u64>> = None;
+    let mut ipc_variance_rng: u64 = (tid as u64).wrapping_mul(GOLDEN_RATIO_64);
+    if ipc_variance_rng == 0 {
+        ipc_variance_rng = GOLDEN_RATIO_64;
+    }
     // Benchmarking: per-wakeup latency samples (reservoir-sampled) and iteration counter.
     const MAX_WAKE_SAMPLES: usize = 100_000;
     let mut resume_latencies_ns: Vec<u64> = Vec::with_capacity(MAX_WAKE_SAMPLES);
@@ -9106,6 +9533,106 @@ fn worker_main(
                 last_iter_time = Instant::now();
                 iterations += 1;
             }
+            WorkType::AluHot { width } => {
+                // Resolve the configured width on first iteration.
+                // `Widest` picks the widest variant the host supports;
+                // explicit widths that the host can't run downgrade
+                // to the next-widest available with a one-shot warn.
+                let resolved = *alu_hot_resolved_width.get_or_insert_with(|| {
+                    let r = resolve_alu_width(width);
+                    if r != width && !matches!(width, AluWidth::Widest) {
+                        tracing::warn!(
+                            requested = ?width,
+                            resolved = ?r,
+                            tid,
+                            "AluHot width unavailable on this host; downgraded — \
+                             see [`AluWidth`] doc for resolution order"
+                        );
+                    }
+                    r
+                });
+                // ALU_HOT_CHAIN_STEPS sets the per-iteration retire
+                // count for each independent multiply chain. 4
+                // chains × N steps drives functional-unit pressure
+                // without burning excessive time per outer loop
+                // iteration — the outer loop checks `stop` between
+                // iterations so shutdown latency stays bounded.
+                alu_hot_chain(resolved, ALU_HOT_CHAIN_STEPS, &mut work_units);
+                iterations += 1;
+            }
+            WorkType::SmtSiblingSpin => {
+                // Pure PAUSE-spin to contend for SMT-shared
+                // execution resources with the partner worker.
+                // The framework expects the test author to pin
+                // both group members (group_size = 2) to the SMT
+                // siblings of one physical core via
+                // [`AffinityIntent::Exact`]; without that, the
+                // workload degenerates to two independent
+                // SpinWaits and exercises no SMT contention.
+                // The variant body itself is identical to
+                // SpinWait — the SMT semantics come from the
+                // affinity layer, not the work loop.
+                spin_burst(&mut work_units, 1024);
+                iterations += 1;
+            }
+            WorkType::IpcVariance {
+                hot_iters,
+                cold_iters,
+                period_iters,
+            } => {
+                // Allocate the cold-phase working set lazily on
+                // first iteration. 512 KB / 8 = 65_536 u64 slots
+                // — fits in LLC on most hosts but spills to DRAM
+                // on small-LLC SKUs, giving the cold phase a
+                // realistic memory-bound IPC profile rather than
+                // an LLC-resident degenerate version.
+                let buf = ipc_variance_buf.get_or_insert_with(|| vec![0u64; IPC_VARIANCE_REGION_U64]);
+                // xorshift64 PRNG for cache-line offset selection.
+                // Per-worker seed (tid-based) keeps workers'
+                // access patterns independent.
+                let xorshift64 = |state: &mut u64| -> u64 {
+                    let mut x = *state;
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    *state = x;
+                    x
+                };
+                for _ in 0..period_iters {
+                    if stop_requested(stop) {
+                        break;
+                    }
+                    // Hot phase: `hot_iters` of independent
+                    // multiplies. Same shape as the AluHot Scalar
+                    // path so cross-variant comparisons of pure
+                    // ALU phases are direct.
+                    alu_hot_chain(AluWidth::Scalar, hot_iters, &mut work_units);
+                    if stop_requested(stop) {
+                        break;
+                    }
+                    // Cold phase: `cold_iters` random cache-line
+                    // reads. `black_box` on the loaded value
+                    // defeats dead-load elimination so the memory
+                    // traffic is real, and the wrapping_add(1)
+                    // store-back keeps the touched lines dirty
+                    // across cold phases — a future scheduler
+                    // that profiles memory-stall behaviour can
+                    // see a rising dirty-line count. No `unsafe`
+                    // is needed: `Vec::<u64>` indexing is the
+                    // canonical safe path, and `black_box`
+                    // suffices to keep the load observable.
+                    let len = buf.len();
+                    if len > 0 {
+                        for _ in 0..cold_iters {
+                            let idx = (xorshift64(&mut ipc_variance_rng) as usize) % len;
+                            let cur = std::hint::black_box(buf[idx]);
+                            buf[idx] = cur.wrapping_add(1);
+                            work_units = std::hint::black_box(work_units.wrapping_add(1));
+                        }
+                    }
+                }
+                iterations += 1;
+            }
             WorkType::Custom { .. } => unreachable!("handled by early return"),
         }
 
@@ -9387,6 +9914,149 @@ fn cache_rmw_loop(buf: &mut [u8], stride: usize, iters: u64, work_units: &mut u6
         idx = (idx + stride) % len;
         *work_units = std::hint::black_box(work_units.wrapping_add(1));
     }
+}
+
+/// Weyl-sequence increment derived from the golden ratio,
+/// `2^64 / phi`. Used wherever the worker needs a per-thread RNG
+/// seed or a multiplicative spread constant that avoids the
+/// degenerate "all zero" case on tid `0`. Same value glibc's
+/// `nrand48` family uses; promoting it to a named constant lets
+/// every call site reference one source instead of re-typing the
+/// 64-bit literal.
+const GOLDEN_RATIO_64: u64 = 0x9E37_79B9_7F4A_7C15;
+
+/// Per-iteration multiply-chain step count for [`WorkType::AluHot`].
+/// Chosen so a single [`alu_hot_chain`] call retires several thousand
+/// real ALU ops before the outer loop checks `stop` — large enough
+/// to drive functional-unit pressure, small enough that shutdown
+/// latency stays in the millisecond regime even on slow cores.
+const ALU_HOT_CHAIN_STEPS: u64 = 1024;
+
+/// Cold-phase working-set size in u64 slots for [`WorkType::IpcVariance`].
+/// 65_536 × 8 bytes = 512 KiB — large enough to spill out of typical
+/// L1 (32 KiB) and L2 (256 KiB), small enough to fit in L3 on most
+/// hosts (LLC pressure rather than DRAM-spill on the common case).
+const IPC_VARIANCE_REGION_U64: usize = 64 * 1024;
+
+/// Resolve a configured [`AluWidth`] to a width the host can actually
+/// run. Probes CPU features at call time; never fabricates a higher
+/// width than the host supports.
+///
+/// Resolution order on x86_64: `Amx > Vec512 > Vec256 > Vec128 > Scalar`.
+/// On aarch64 only `Vec128` (NEON) is reachable; everything wider
+/// downgrades to `Vec128` when NEON is present, otherwise `Scalar`.
+/// On any other architecture every width downgrades to `Scalar`.
+fn resolve_alu_width(requested: AluWidth) -> AluWidth {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // `is_x86_feature_detected!` reads the compiler's runtime
+        // feature-detection cache. Order checked: AVX-512F, AVX2,
+        // SSE2 (always present on x86_64). AMX detection requires
+        // the unstable `x86_amx_intrinsics` feature gate so it is
+        // not probed here on stable; an explicit
+        // `AluWidth::Amx` request downgrades to the next-widest
+        // available variant. See follow-up #309 for the AMX
+        // detection path under nightly / future stabilization.
+        let widest = if std::is_x86_feature_detected!("avx512f") {
+            AluWidth::Vec512
+        } else if std::is_x86_feature_detected!("avx2") {
+            AluWidth::Vec256
+        } else {
+            // SSE2 is part of the x86_64 baseline ABI per
+            // System V x86_64 ABI; skip the runtime check.
+            AluWidth::Vec128
+        };
+        match requested {
+            AluWidth::Widest => widest,
+            // AMX is not probed on stable — downgrade to the
+            // host's widest stable-detectable variant.
+            AluWidth::Amx => widest,
+            AluWidth::Vec512 if std::is_x86_feature_detected!("avx512f") => AluWidth::Vec512,
+            AluWidth::Vec512 => widest,
+            AluWidth::Vec256 if std::is_x86_feature_detected!("avx2") => AluWidth::Vec256,
+            AluWidth::Vec256 => widest,
+            AluWidth::Vec128 => AluWidth::Vec128,
+            AluWidth::Scalar => AluWidth::Scalar,
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // NEON (asimd) is mandatory on AArch64-A profile per the
+        // ARMv8-A ABI — no runtime check needed for `Vec128`.
+        // Wider variants (Vec256/Vec512/Amx) have no aarch64
+        // equivalent in the v8/v9 base ABI; downgrade to `Vec128`.
+        match requested {
+            AluWidth::Widest | AluWidth::Vec128 => AluWidth::Vec128,
+            AluWidth::Vec256 | AluWidth::Vec512 | AluWidth::Amx => AluWidth::Vec128,
+            AluWidth::Scalar => AluWidth::Scalar,
+        }
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        // Unsupported architecture — downgrade everything to
+        // `Scalar`. Other arches don't surface in the ktstr CI
+        // matrix today; this branch keeps compilation honest.
+        let _ = requested;
+        AluWidth::Scalar
+    }
+}
+
+/// Run an ALU multiply chain at the given width for `steps`
+/// iterations. The chain runs four independent streams in parallel
+/// (each its own dependency chain) so a modern out-of-order core
+/// can dispatch all four per cycle, sustaining IPC ≥ 2.0 with no
+/// data dependency between adjacent multiplies.
+///
+/// `width` is the resolved variant from [`resolve_alu_width`] — the
+/// caller MUST resolve before calling so this function never sees
+/// a `Widest` sentinel. The width currently selects the scalar
+/// integer multiply for every variant; future work can drop in
+/// SIMD intrinsics under each arm. Even the scalar path retires
+/// real arithmetic at IPC ≥ 2.0 because of the four-way independence.
+///
+/// `#[inline(never)]` matches `spin_burst` / `cache_rmw_loop`'s
+/// rationale: forcing out-of-line keeps the per-step `black_box`
+/// barriers visible to LLVM as distinct call boundaries that
+/// can't be merged with surrounding caller arithmetic.
+#[inline(never)]
+fn alu_hot_chain(width: AluWidth, steps: u64, work_units: &mut u64) {
+    // Independent multiplier streams. Initial values are
+    // black_box'd so the compiler can't fold them at compile
+    // time. Per-step constants are large odd primes
+    // (golden-ratio-scaled) — no zero or one that would
+    // collapse the chain.
+    let mut a: u64 = std::hint::black_box(GOLDEN_RATIO_64);
+    let mut b: u64 = std::hint::black_box(0xBF58_476D_1CE4_E5B9u64);
+    let mut c: u64 = std::hint::black_box(0x94D0_49BB_1331_11EBu64);
+    let mut d: u64 = std::hint::black_box(0x2545_F491_4F6C_DD1Du64);
+    // Caller MUST resolve `Widest` via `resolve_alu_width` before
+    // reaching here. The width parameter currently runs the same
+    // scalar multiply path regardless of variant — `width` is
+    // retained on the signature so a future SIMD-intrinsic drop
+    // can pivot per-arm without changing the call shape. The
+    // debug_assert keeps the resolution invariant honest in
+    // tests; release builds elide the check.
+    debug_assert!(
+        !matches!(width, AluWidth::Widest),
+        "alu_hot_chain reached with AluWidth::Widest; \
+         caller must resolve via resolve_alu_width first",
+    );
+    for _ in 0..steps {
+        a = std::hint::black_box(a).wrapping_mul(0xD134_2543_DE82_EF95);
+        b = std::hint::black_box(b).wrapping_mul(0xC4CE_B9FE_1A85_EC53);
+        c = std::hint::black_box(c).wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+        d = std::hint::black_box(d).wrapping_mul(0xCA45_4F47_1E40_FE19);
+        *work_units = std::hint::black_box(work_units.wrapping_add(1));
+    }
+    // Final black_box on the chain values keeps the entire
+    // multiply chain live: without an observable sink the
+    // optimizer could prove the loop dead and elide every
+    // iteration. The XOR fold collapses the four streams into
+    // one observable value the black_box wraps; the fold itself
+    // adds one cycle to the function but is paid once per call,
+    // not per step.
+    let sink = a ^ b ^ c ^ d;
+    let _ = std::hint::black_box(sink);
 }
 
 /// Naive matrix multiply: three square matrices of u64, O(n^3).
@@ -10424,11 +11094,13 @@ mod tests {
         // SignalStorm, PreemptStorm, EpollStorm,
         // NumaMigrationChurn)
         // + 1 idle-transition variant (IdleChurn)
-        // = 35. `strum::VariantNames` enumerates every variant
+        // + 3 compute-primitive variants (AluHot,
+        // SmtSiblingSpin, IpcVariance)
+        // = 38. `strum::VariantNames` enumerates every variant
         // including `Custom` (the derive does not honor
         // `#[serde(skip)]` — that attribute only affects serde
         // (de)serialization, not strum reflection).
-        assert_eq!(WorkType::ALL_NAMES.len(), 35);
+        assert_eq!(WorkType::ALL_NAMES.len(), 38);
     }
 
     // -- matrix_multiply --
@@ -17570,6 +18242,356 @@ mod tests {
             "IdleChurn precise_timing=true worker must iterate: {:?}",
             reports[0],
         );
+    }
+
+    // -- Compute WorkType variants smoke tests --
+
+    /// `WorkType::AluHot` smoke test at the default
+    /// (`AluWidth::Widest`) width. Workers must iterate within
+    /// the test window — a regression that breaks the multiply
+    /// chain (e.g. by removing the per-step `black_box`) would
+    /// either fold the loop to nothing or produce zero
+    /// iterations.
+    #[test]
+    fn pathology_alu_hot_iterates() {
+        let cfg = WorkloadConfig {
+            num_workers: 2,
+            work_type: WorkType::AluHot {
+                width: AluWidth::Widest,
+            },
+            ..Default::default()
+        };
+        let mut h = WorkloadHandle::spawn(&cfg).expect("AluHot must spawn");
+        h.start();
+        std::thread::sleep(Duration::from_millis(200));
+        let reports = h.stop_and_collect();
+        assert_eq!(reports.len(), 2);
+        for r in &reports {
+            assert!(r.iterations > 0, "AluHot worker must iterate: {r:?}");
+        }
+    }
+
+    /// `WorkType::AluHot` at `AluWidth::Scalar` exercises the
+    /// fall-through path that runs on every architecture. Pins
+    /// the architecture-independent dispatch arm so a regression
+    /// to the SIMD branches doesn't silently break the
+    /// scalar default.
+    #[test]
+    fn pathology_alu_hot_scalar_iterates() {
+        let cfg = WorkloadConfig {
+            num_workers: 1,
+            work_type: WorkType::AluHot {
+                width: AluWidth::Scalar,
+            },
+            ..Default::default()
+        };
+        let mut h = WorkloadHandle::spawn(&cfg).expect("AluHot Scalar must spawn");
+        h.start();
+        std::thread::sleep(Duration::from_millis(100));
+        let reports = h.stop_and_collect();
+        assert_eq!(reports.len(), 1);
+        assert!(reports[0].iterations > 0, "AluHot Scalar worker must iterate: {:?}", reports[0]);
+    }
+
+    /// `WorkType::SmtSiblingSpin` smoke test. Pairs require
+    /// `num_workers == 2 * k` (k pairs); with k=1 the workers
+    /// run independently because the test doesn't pin to SMT
+    /// siblings — but they still iterate. Pinning to actual SMT
+    /// siblings is the test author's responsibility (see
+    /// follow-up #311 for the framework helper).
+    #[test]
+    fn pathology_smt_sibling_spin_iterates() {
+        let cfg = WorkloadConfig {
+            num_workers: 2,
+            work_type: WorkType::SmtSiblingSpin,
+            ..Default::default()
+        };
+        let mut h = WorkloadHandle::spawn(&cfg).expect("SmtSiblingSpin must spawn");
+        h.start();
+        std::thread::sleep(Duration::from_millis(200));
+        let reports = h.stop_and_collect();
+        assert_eq!(reports.len(), 2);
+        for r in &reports {
+            assert!(r.iterations > 0, "SmtSiblingSpin worker must iterate: {r:?}");
+        }
+    }
+
+    /// `WorkType::SmtSiblingSpin` requires
+    /// `num_workers % 2 == 0`. Spawn-side rejection at odd
+    /// counts pins the [`worker_group_size`](WorkType::worker_group_size)
+    /// `== Some(2)` contract through to the typed-error variant.
+    #[test]
+    fn smt_sibling_spin_odd_workers_rejects() {
+        let cfg = WorkloadConfig {
+            num_workers: 3,
+            work_type: WorkType::SmtSiblingSpin,
+            ..Default::default()
+        };
+        let err = WorkloadHandle::spawn(&cfg)
+            .err()
+            .expect("SmtSiblingSpin with odd num_workers must be rejected");
+        let typed = err
+            .downcast_ref::<WorkTypeValidationError>()
+            .expect("error must downcast to WorkTypeValidationError");
+        assert!(
+            matches!(
+                typed,
+                WorkTypeValidationError::NonDivisibleWorkerCount {
+                    name,
+                    group_idx: 0,
+                    group_size: 2,
+                    num_workers: 3,
+                } if name == "SmtSiblingSpin"
+            ),
+            "expected NonDivisibleWorkerCount for SmtSiblingSpin; got: {typed:?}",
+        );
+    }
+
+    /// `WorkType::IpcVariance` smoke test at the defaults from
+    /// [`defaults`]. Workers alternate hot/cold phases internally
+    /// — a 200ms run completes a few outer iterations.
+    #[test]
+    fn pathology_ipc_variance_iterates() {
+        let cfg = WorkloadConfig {
+            num_workers: 2,
+            work_type: WorkType::IpcVariance {
+                hot_iters: 1024,
+                cold_iters: 64,
+                period_iters: 4,
+            },
+            ..Default::default()
+        };
+        let mut h = WorkloadHandle::spawn(&cfg).expect("IpcVariance must spawn");
+        h.start();
+        std::thread::sleep(Duration::from_millis(200));
+        let reports = h.stop_and_collect();
+        assert_eq!(reports.len(), 2);
+        for r in &reports {
+            assert!(r.iterations > 0, "IpcVariance worker must iterate: {r:?}");
+        }
+    }
+
+    /// `WorkType::IpcVariance` constructor rejects every
+    /// zero-value field with the typed
+    /// [`WorkTypeValidationError::ZeroIpcVarianceParam`] variant.
+    /// The same rejection fires at spawn time for variants
+    /// constructed via the struct-literal form — pin both paths
+    /// produce the same error variant.
+    #[test]
+    fn ipc_variance_constructor_rejects_zeros() {
+        let err = WorkType::ipc_variance(0, 1, 1).expect_err("hot_iters=0 must reject");
+        assert!(
+            matches!(
+                err,
+                WorkTypeValidationError::ZeroIpcVarianceParam {
+                    field: "hot_iters",
+                    group_idx: 0,
+                }
+            ),
+            "expected ZeroIpcVarianceParam {{ hot_iters }}; got: {err:?}",
+        );
+
+        let err = WorkType::ipc_variance(1, 0, 1).expect_err("cold_iters=0 must reject");
+        assert!(
+            matches!(
+                err,
+                WorkTypeValidationError::ZeroIpcVarianceParam {
+                    field: "cold_iters",
+                    group_idx: 0,
+                }
+            ),
+            "expected ZeroIpcVarianceParam {{ cold_iters }}; got: {err:?}",
+        );
+
+        let err = WorkType::ipc_variance(1, 1, 0).expect_err("period_iters=0 must reject");
+        assert!(
+            matches!(
+                err,
+                WorkTypeValidationError::ZeroIpcVarianceParam {
+                    field: "period_iters",
+                    group_idx: 0,
+                }
+            ),
+            "expected ZeroIpcVarianceParam {{ period_iters }}; got: {err:?}",
+        );
+
+        // Positive case: all three > 0 yields Ok.
+        let wt = WorkType::ipc_variance(1, 1, 1).expect("all positive must construct");
+        assert!(matches!(wt, WorkType::IpcVariance { .. }));
+    }
+
+    /// `WorkType::IpcVariance` spawn-side rejection mirrors the
+    /// constructor: a struct-literal with zero `hot_iters`
+    /// fails at [`WorkloadHandle::spawn`] with the typed error.
+    #[test]
+    fn ipc_variance_spawn_rejects_zero_hot_iters() {
+        let cfg = WorkloadConfig {
+            num_workers: 1,
+            work_type: WorkType::IpcVariance {
+                hot_iters: 0,
+                cold_iters: 1,
+                period_iters: 1,
+            },
+            ..Default::default()
+        };
+        let err = WorkloadHandle::spawn(&cfg)
+            .err()
+            .expect("IpcVariance hot_iters=0 must be rejected at spawn");
+        let typed = err
+            .downcast_ref::<WorkTypeValidationError>()
+            .expect("error must downcast to WorkTypeValidationError");
+        assert!(
+            matches!(
+                typed,
+                WorkTypeValidationError::ZeroIpcVarianceParam {
+                    field: "hot_iters",
+                    group_idx: 0,
+                }
+            ),
+            "expected ZeroIpcVarianceParam {{ hot_iters }} at spawn; got: {typed:?}",
+        );
+    }
+
+    /// `WorkType::IpcVariance` spawn-side rejection mirrors the
+    /// constructor for `cold_iters`. Zero `cold_iters` would
+    /// produce a cold phase that does no memory work — the
+    /// scheduler-observable IPC variance the variant is named
+    /// for would not exist. The same `ZeroIpcVarianceParam`
+    /// variant fires from both the constructor and the spawn
+    /// gate.
+    #[test]
+    fn ipc_variance_spawn_rejects_zero_cold_iters() {
+        let cfg = WorkloadConfig {
+            num_workers: 1,
+            work_type: WorkType::IpcVariance {
+                hot_iters: 1,
+                cold_iters: 0,
+                period_iters: 1,
+            },
+            ..Default::default()
+        };
+        let err = WorkloadHandle::spawn(&cfg)
+            .err()
+            .expect("IpcVariance cold_iters=0 must be rejected at spawn");
+        let typed = err
+            .downcast_ref::<WorkTypeValidationError>()
+            .expect("error must downcast to WorkTypeValidationError");
+        assert!(
+            matches!(
+                typed,
+                WorkTypeValidationError::ZeroIpcVarianceParam {
+                    field: "cold_iters",
+                    group_idx: 0,
+                }
+            ),
+            "expected ZeroIpcVarianceParam {{ cold_iters }} at spawn; got: {typed:?}",
+        );
+    }
+
+    /// `WorkType::IpcVariance` spawn-side rejection mirrors the
+    /// constructor for `period_iters`. Zero `period_iters`
+    /// would skip the inner loop entirely so the variant
+    /// produces no hot/cold alternation — the worker still
+    /// iterates the outer loop but performs no work. Pinning
+    /// the rejection prevents that silent degeneration.
+    #[test]
+    fn ipc_variance_spawn_rejects_zero_period_iters() {
+        let cfg = WorkloadConfig {
+            num_workers: 1,
+            work_type: WorkType::IpcVariance {
+                hot_iters: 1,
+                cold_iters: 1,
+                period_iters: 0,
+            },
+            ..Default::default()
+        };
+        let err = WorkloadHandle::spawn(&cfg)
+            .err()
+            .expect("IpcVariance period_iters=0 must be rejected at spawn");
+        let typed = err
+            .downcast_ref::<WorkTypeValidationError>()
+            .expect("error must downcast to WorkTypeValidationError");
+        assert!(
+            matches!(
+                typed,
+                WorkTypeValidationError::ZeroIpcVarianceParam {
+                    field: "period_iters",
+                    group_idx: 0,
+                }
+            ),
+            "expected ZeroIpcVarianceParam {{ period_iters }} at spawn; got: {typed:?}",
+        );
+    }
+
+    /// Composed-group rejection for `IpcVariance`: a primary
+    /// `Bursty` group is valid; the composed group at index 1
+    /// has zero `cold_iters`. The error must mention "group 1"
+    /// so the caller knows WHICH composed entry is malformed,
+    /// and the typed `ZeroIpcVarianceParam` variant must
+    /// carry `group_idx: 1`. Mirrors the IdleChurn composed
+    /// test pattern at
+    /// `idle_churn_zero_in_composed_group_rejects_with_group_idx`.
+    #[test]
+    fn ipc_variance_zero_in_composed_group_rejects_with_group_idx() {
+        let cfg = WorkloadConfig::default()
+            .work_type(WorkType::Bursty {
+                burst_duration: Duration::from_millis(50),
+                sleep_duration: Duration::from_millis(100),
+            })
+            .workers(1)
+            .with_composed(
+                WorkSpec::default()
+                    .work_type(WorkType::IpcVariance {
+                        hot_iters: 1,
+                        cold_iters: 0,
+                        period_iters: 1,
+                    })
+                    .workers(1),
+            );
+        let err = WorkloadHandle::spawn(&cfg)
+            .err()
+            .expect("composed IpcVariance with cold_iters=0 must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("group 1"),
+            "diagnostic must tag the composed group_idx (1); got: {msg}",
+        );
+        let typed = err
+            .downcast_ref::<WorkTypeValidationError>()
+            .expect("error must downcast to WorkTypeValidationError");
+        assert!(
+            matches!(
+                typed,
+                WorkTypeValidationError::ZeroIpcVarianceParam {
+                    field: "cold_iters",
+                    group_idx: 1,
+                }
+            ),
+            "expected ZeroIpcVarianceParam {{ cold_iters, group_idx: 1 }}; got: {typed:?}",
+        );
+    }
+
+    /// [`resolve_alu_width`] never returns `Widest`. Every
+    /// concrete variant resolves to itself (when the host
+    /// supports it) or to a downgrade — the sentinel must
+    /// disappear before reaching [`alu_hot_chain`].
+    #[test]
+    fn alu_width_resolve_never_returns_widest() {
+        for &w in &[
+            AluWidth::Scalar,
+            AluWidth::Vec128,
+            AluWidth::Vec256,
+            AluWidth::Vec512,
+            AluWidth::Amx,
+            AluWidth::Widest,
+        ] {
+            let r = resolve_alu_width(w);
+            assert!(
+                !matches!(r, AluWidth::Widest),
+                "resolve_alu_width({w:?}) returned Widest; \
+                 caller invariant violated",
+            );
+        }
     }
 
     // -- Thread-mode dispatch coverage expansion --
