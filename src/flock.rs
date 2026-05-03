@@ -1970,4 +1970,63 @@ mod tests {
             "None must NOT append the remediation; got: {msg_without}",
         );
     }
+
+    /// Pin the substring contract that
+    /// `crate::test_support::eval::is_flock_timeout_message` keys on
+    /// to classify a flock timeout as
+    /// [`crate::vmm::host_topology::ResourceContention`] (SKIP) vs
+    /// a plain anyhow error (hard FAIL). The seam tests for BOTH
+    /// `"flock LOCK_"` AND `"timed out after"` appearing in the
+    /// rendered error; any wording change in
+    /// [`acquire_flock_with_timeout`]'s bail format that drops
+    /// either substring would silently regress the test-kernel-cache
+    /// flock-timeout path from a clean SKIP to a hard FAIL.
+    ///
+    /// Drives a real contended flock: peer holds `LOCK_EX`, this
+    /// thread requests `LOCK_SH` with a short timeout, the helper
+    /// times out and bails with the literal format produced at
+    /// `acquire_flock_with_timeout`'s deadline arm. Both
+    /// `LOCK_EX → LOCK_SH` (the cache-entry path) and
+    /// `LOCK_EX → LOCK_EX` (the kernel-build path) are exercised so
+    /// a regression that affects only one mode label still trips
+    /// the assertion.
+    #[test]
+    fn acquire_flock_timeout_message_pins_eval_seam_substrings() {
+        use tempfile::TempDir;
+        for mode in [FlockMode::Shared, FlockMode::Exclusive] {
+            let tmp = TempDir::new().expect("tempdir");
+            let lockfile = tmp.path().join(".locks").join("seam.lock");
+            std::fs::create_dir_all(lockfile.parent().unwrap()).unwrap();
+            // Peer holds LOCK_EX so the next acquire (regardless of
+            // mode) must wait. Holding the OwnedFd in scope keeps
+            // the kernel-side flock alive.
+            let _peer = try_flock(&lockfile, FlockMode::Exclusive)
+                .expect("peer flock attempt")
+                .expect("peer must acquire on a fresh lockfile");
+            let err = acquire_flock_with_timeout(
+                &lockfile,
+                mode,
+                std::time::Duration::from_millis(120),
+                "seam-test",
+                None,
+            )
+            .expect_err("acquire must time out under LOCK_EX peer");
+            let msg = format!("{err:#}");
+            // BOTH substrings must appear together — the eval seam
+            // ANDs them. A wording change that splits or removes
+            // either is a contract violation.
+            assert!(
+                msg.contains("flock LOCK_"),
+                "rendered error must include the literal `flock LOCK_` \
+                 prefix that eval.rs::is_flock_timeout_message keys on; \
+                 mode={mode:?} got: {msg}",
+            );
+            assert!(
+                msg.contains("timed out after"),
+                "rendered error must include the literal `timed out \
+                 after` substring that eval.rs::is_flock_timeout_message \
+                 keys on; mode={mode:?} got: {msg}",
+            );
+        }
+    }
 }
