@@ -3937,15 +3937,24 @@ pub struct WorkerReport {
     pub max_gap_cpu: usize,
     /// When the longest gap happened (ms from start).
     pub max_gap_at_ms: u64,
-    /// Per-wakeup latency samples (ns). Measures the interval between
-    /// the call that blocks (any blocking primitive — pipe `read`,
-    /// futex wait, `poll`, `sched_yield`, `nanosleep`, etc.) and the
-    /// wakeup that resumes execution; not a yield-specific measure.
+    /// Per-wakeup latency samples (ns). Measures off-CPU time
+    /// between the call that blocks (any blocking primitive — pipe
+    /// `read`, futex wait, `poll`, `sched_yield`, `nanosleep`, etc.)
+    /// and the wakeup that resumes execution; not a yield-specific
+    /// measure.
     /// Populated for blocking work types: Bursty, PipeIo, FutexPingPong,
     /// FutexFanOut, FanOutCompute, CacheYield, CachePipe, IoSyncWrite,
     /// IoRandRead, IoConvoy, NiceSweep,
     /// AffinityChurn, PolicyChurn, MutexContention, ForkExit (parent's
     /// waitpid wait), Sequence with Sleep/Yield/Io phases.
+    ///
+    /// Distinct from [`iteration_costs_ns`](Self::iteration_costs_ns):
+    /// this field measures the OFF-CPU gap between blocks (scheduler
+    /// resume latency); `iteration_costs_ns` measures the ON-CPU
+    /// burst duration of a single compute iteration. A pure
+    /// compute work type that never blocks reports
+    /// `resume_latencies_ns: vec![]` and populates
+    /// `iteration_costs_ns` instead.
     pub resume_latencies_ns: Vec<u64>,
     /// Total number of wake-latency observations the worker
     /// recorded, INCLUDING any that were dropped by the reservoir
@@ -3957,6 +3966,34 @@ pub struct WorkerReport {
     /// observed" (vs. "entries in the sample") read this field;
     /// percentile / CV computations read `resume_latencies_ns`.
     pub wake_sample_total: u64,
+    /// Per-iteration on-CPU compute-burst duration samples (ns).
+    /// Reservoir-sampled at the same cap (`MAX_WAKE_SAMPLES` =
+    /// 100_000) as [`resume_latencies_ns`](Self::resume_latencies_ns),
+    /// using the same Algorithm-R sampler.
+    ///
+    /// Populated for pure compute work types where the worker
+    /// never blocks: [`WorkType::AluHot`], [`WorkType::SmtSiblingSpin`],
+    /// and [`WorkType::IpcVariance`]. Each sample is the elapsed
+    /// time from the start to the end of one outer-loop iteration's
+    /// compute burst — the duration the worker spent ON-CPU
+    /// retiring instructions, not the off-CPU gap between iterations.
+    ///
+    /// Distinct from [`resume_latencies_ns`](Self::resume_latencies_ns):
+    /// the wake-latency reservoir captures off-CPU time (futex /
+    /// pipe / nanosleep wakeups); this reservoir captures on-CPU
+    /// burst duration. The two are NOT comparable across variants —
+    /// a scheduler-A/B test that wants iteration cost for a compute
+    /// variant reads this field; a test that wants wake latency for
+    /// a blocking variant reads `resume_latencies_ns`.
+    pub iteration_costs_ns: Vec<u64>,
+    /// Total number of iteration-cost observations the worker
+    /// recorded, INCLUDING any that were dropped by the reservoir
+    /// sampler. Mirrors [`wake_sample_total`](Self::wake_sample_total)
+    /// but for [`iteration_costs_ns`](Self::iteration_costs_ns):
+    /// host-side consumers that want "total compute iterations
+    /// observed" read this field; distribution computations read
+    /// `iteration_costs_ns` directly.
+    pub iteration_cost_sample_total: u64,
     /// Outer-loop iteration count.
     pub iterations: u64,
     /// Delta of /proc/self/schedstat field 2 (run_delay) over the work loop.
@@ -7166,6 +7203,13 @@ fn worker_main(
     const MAX_WAKE_SAMPLES: usize = 100_000;
     let mut resume_latencies_ns: Vec<u64> = Vec::with_capacity(MAX_WAKE_SAMPLES);
     let mut wake_sample_count: u64 = 0;
+    // Per-iteration on-CPU compute-burst duration samples
+    // (reservoir-sampled at the same cap as resume_latencies_ns).
+    // Populated by pure compute variants (AluHot, SmtSiblingSpin,
+    // IpcVariance); blocking variants leave it empty since their
+    // ON-CPU burst between blocks is not the load-bearing signal.
+    let mut iteration_costs_ns: Vec<u64> = Vec::with_capacity(MAX_WAKE_SAMPLES);
+    let mut iteration_cost_sample_count: u64 = 0;
     let mut iterations: u64 = 0;
     // AffinityChurn: read effective cpuset once at start via sched_getaffinity.
     // Custom: delegate entirely to the user function. Affinity and
@@ -9557,7 +9601,19 @@ fn worker_main(
                 // without burning excessive time per outer loop
                 // iteration — the outer loop checks `stop` between
                 // iterations so shutdown latency stays bounded.
+                //
+                // Sample iteration cost (ON-CPU burst duration) into
+                // iteration_costs_ns: AluHot never blocks, so the
+                // resume_latencies_ns reservoir would conflate
+                // off-CPU and on-CPU signal if it captured this.
+                let iter_start = Instant::now();
                 alu_hot_chain(resolved, ALU_HOT_CHAIN_STEPS, &mut work_units);
+                reservoir_push(
+                    &mut iteration_costs_ns,
+                    &mut iteration_cost_sample_count,
+                    iter_start.elapsed().as_nanos() as u64,
+                    MAX_WAKE_SAMPLES,
+                );
                 iterations += 1;
             }
             WorkType::SmtSiblingSpin => {
@@ -9572,7 +9628,20 @@ fn worker_main(
                 // The variant body itself is identical to
                 // SpinWait — the SMT semantics come from the
                 // affinity layer, not the work loop.
+                //
+                // Sample iteration cost (ON-CPU burst duration)
+                // into iteration_costs_ns: SmtSiblingSpin never
+                // blocks. Variance across iterations encodes the
+                // SMT-contention signal — sibling activity slows
+                // each spin burst measurably.
+                let iter_start = Instant::now();
                 spin_burst(&mut work_units, 1024);
+                reservoir_push(
+                    &mut iteration_costs_ns,
+                    &mut iteration_cost_sample_count,
+                    iter_start.elapsed().as_nanos() as u64,
+                    MAX_WAKE_SAMPLES,
+                );
                 iterations += 1;
             }
             WorkType::IpcVariance {
@@ -9598,6 +9667,13 @@ fn worker_main(
                     *state = x;
                     x
                 };
+                // Sample iteration cost (ON-CPU burst duration)
+                // covering the full hot+cold loop into
+                // iteration_costs_ns. IpcVariance never blocks;
+                // the cost variance across iterations is the
+                // load-bearing signal that distinguishes hot- vs
+                // cold-phase IPC under different schedulers.
+                let iter_start = Instant::now();
                 for _ in 0..period_iters {
                     if stop_requested(stop) {
                         break;
@@ -9631,6 +9707,12 @@ fn worker_main(
                         }
                     }
                 }
+                reservoir_push(
+                    &mut iteration_costs_ns,
+                    &mut iteration_cost_sample_count,
+                    iter_start.elapsed().as_nanos() as u64,
+                    MAX_WAKE_SAMPLES,
+                );
                 iterations += 1;
             }
             WorkType::Custom { .. } => unreachable!("handled by early return"),
@@ -9740,6 +9822,8 @@ fn worker_main(
         max_gap_at_ms: max_gap_at_ns / 1_000_000,
         resume_latencies_ns,
         wake_sample_total: wake_sample_count,
+        iteration_costs_ns,
+        iteration_cost_sample_total: iteration_cost_sample_count,
         iterations,
         schedstat_run_delay_ns: ss_delay_delta,
         schedstat_run_count: ss_ts_delta,
@@ -11411,6 +11495,8 @@ mod tests {
             max_gap_at_ms: 500,
             resume_latencies_ns: vec![1000, 2000],
             wake_sample_total: 2,
+            iteration_costs_ns: vec![3000, 4000, 5000],
+            iteration_cost_sample_total: 3,
             iterations: 10,
             schedstat_run_delay_ns: 500_000,
             schedstat_run_count: 20,
@@ -11437,6 +11523,8 @@ mod tests {
         assert_eq!(r.cpus_used, r2.cpus_used);
         assert_eq!(r.max_gap_ms, r2.max_gap_ms);
         assert_eq!(r.wake_sample_total, r2.wake_sample_total);
+        assert_eq!(r.iteration_costs_ns, r2.iteration_costs_ns);
+        assert_eq!(r.iteration_cost_sample_total, r2.iteration_cost_sample_total);
         assert_eq!(r.completed, r2.completed);
         assert_eq!(r.is_messenger, r2.is_messenger);
         assert_eq!(r.group_idx, r2.group_idx);
@@ -12926,6 +13014,8 @@ mod tests {
             max_gap_at_ms: 0,
             resume_latencies_ns: vec![],
             wake_sample_total: 0,
+            iteration_costs_ns: vec![],
+            iteration_cost_sample_total: 0,
             iterations: 0,
             schedstat_run_delay_ns: 0,
             schedstat_run_count: 0,
@@ -12958,6 +13048,8 @@ mod tests {
             max_gap_at_ms: u64::MAX,
             resume_latencies_ns: vec![],
             wake_sample_total: u64::MAX,
+            iteration_costs_ns: vec![],
+            iteration_cost_sample_total: u64::MAX,
             iterations: u64::MAX,
             schedstat_run_delay_ns: u64::MAX,
             schedstat_run_count: u64::MAX,
@@ -13542,6 +13634,8 @@ mod tests {
             max_gap_at_ms: 500,
             resume_latencies_ns: vec![],
             wake_sample_total: 0,
+            iteration_costs_ns: vec![],
+            iteration_cost_sample_total: 0,
             iterations: 0,
             schedstat_run_delay_ns: 0,
             schedstat_run_count: 0,
@@ -13599,6 +13693,8 @@ mod tests {
             max_gap_at_ms: 0,
             resume_latencies_ns: vec![],
             wake_sample_total: 0,
+            iteration_costs_ns: vec![],
+            iteration_cost_sample_total: 0,
             iterations: 0,
             schedstat_run_delay_ns: 0,
             schedstat_run_count: 0,
@@ -14299,6 +14395,8 @@ mod tests {
             max_gap_at_ms: 0,
             resume_latencies_ns: vec![],
             wake_sample_total: 0,
+            iteration_costs_ns: vec![],
+            iteration_cost_sample_total: 0,
             iterations: 0,
             schedstat_run_delay_ns: 0,
             schedstat_run_count: 0,
@@ -14347,6 +14445,8 @@ mod tests {
             max_gap_at_ms: 0,
             resume_latencies_ns: vec![],
             wake_sample_total: 0,
+            iteration_costs_ns: vec![],
+            iteration_cost_sample_total: 0,
             iterations: work_units,
             schedstat_run_delay_ns: 0,
             schedstat_run_count: 0,
