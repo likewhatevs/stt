@@ -16441,17 +16441,21 @@ mod proptest_tests {
         ///
         /// # u16 wrap coverage
         ///
-        /// The drained-bucket invariant means EVERY case stalls
-        /// (or rejects pre-throttle), so the rolled-back chain
-        /// always re-pops at the same `next_avail` slot. The
-        /// stall-and-rollback cycle is the wrap-relevant operation
-        /// because `set_next_avail(prev.wrapping_sub(1))` uses
-        /// modular u16 arithmetic. We exercise the wrap edge by
-        /// pre-positioning `next_avail` near `u16::MAX` before the
-        /// notify — a regression that used signed `prev - 1`
-        /// instead of `prev.wrapping_sub(1)` would underflow at
-        /// `prev = 0` and corrupt the cursor; this property fails
-        /// on that input shape.
+        /// `next_avail` rollback uses
+        /// `set_next_avail(prev.wrapping_sub(1))` — the wrap
+        /// arithmetic is covered by the dedicated unit test
+        /// `next_avail_zero_rollback_wraps_to_u16_max` in the
+        /// parent tests module. That test pre-positions the
+        /// cursor at 0 and asserts the post-rollback value is
+        /// u16::MAX, which is the wrap edge case
+        /// `set_next_avail(prev.wrapping_sub(1))` is designed to
+        /// handle. This proptest cannot stress the wrap edge
+        /// because `MockSplitQueue::build_desc_chain` only works
+        /// against a fresh avail ring (the mock plants at
+        /// avail.ring[0] and bumps avail.idx from 0 to 1, which
+        /// would panic with overflow at avail.idx=u16::MAX). The
+        /// proptest therefore runs at next_avail=0 → 1 → 0 and
+        /// focuses on chain-shape variation.
         ///
         /// # Pinned invariants per case
         ///
@@ -16481,58 +16485,33 @@ mod proptest_tests {
         #[test]
         fn throttle_stall_under_random_chain_shapes_holds_invariants(
             chain in well_formed_chain_strategy(),
-            // Stress next_avail wrap: pre-position the cursor at
-            // values near u16::MAX so the post-stall
-            // `set_next_avail(prev.wrapping_sub(1))` exercises
-            // the modular arithmetic path. Bounded set rather
-            // than `any::<u16>()` so failure shrinking lands on
-            // recognisable cursor positions:
-            //   - 0 → wraps to u16::MAX after rollback
-            //   - 1 → rollback to 0
-            //   - u16::MAX → no-wrap, rollback to u16::MAX-1
-            //   - u16::MAX-1 → near-MAX rollback
-            // Other values (e.g. queue size 256) get
-            // representative coverage from the existing fuzz
-            // tests that exercise mid-range cursors.
-            initial_next_avail in prop_oneof![
-                Just(0u16),
-                Just(1u16),
-                Just(u16::MAX),
-                Just(u16::MAX - 1),
-            ],
         ) {
+            // u16-wrap stressor: the dedicated unit test
+            // `next_avail_zero_rollback_wraps_to_u16_max`
+            // (in the parent tests module) pins the modular
+            // arithmetic edge directly via set_next_avail.
+            // This proptest cannot stress the wrap edge because
+            // `MockSplitQueue::build_desc_chain` only operates
+            // on a fresh avail ring (the mock's chain-planting
+            // helper writes to avail.ring[0] and bumps avail.idx
+            // from 0 to 1, which would panic with overflow at
+            // avail.idx=u16::MAX). The proptest therefore runs
+            // at next_avail=0 → 1 → 0 (no wrap) and focuses on
+            // chain-shape variation; the wrap arithmetic is
+            // covered by the dedicated unit test alongside.
             let (mut dev, mem) = build_throttled_fuzz_fixture();
             let mock = MockSplitQueue::create(&mem, GuestAddress(0), 256);
             dev.set_mem(mem.clone());
             wire_fuzz_device(&mut dev, &mock);
 
-            // Pre-position next_avail. After build_desc_chain
-            // bumps it by one (the chain we plant below), the
-            // post-stall rollback must land at this same value
-            // via wrapping_sub.
-            //
-            // Setting via `set_next_avail` directly mutates the
-            // device's view of the queue cursor; the mock side's
-            // `avail.idx` (in guest memory) is independent and
-            // gets bumped by `build_desc_chain`. The invariant
-            // we test is that `pop_descriptor_chain` advances
-            // the device cursor to `initial_next_avail + 1` and
-            // the stall path rewinds it to `initial_next_avail`.
-            dev.worker.queues[REQ_QUEUE].set_next_avail(initial_next_avail);
-
             let status_addr = plant_well_formed_chain(&mem, &mock, &chain);
-            // Mock's avail.idx starts at 1 after build_desc_chain.
-            // The device's next_avail is at `initial_next_avail`.
-            // pop_descriptor_chain reads `avail.ring[next_avail %
-            // queue_size]` and advances next_avail. With one
-            // chain available and the device cursor at
-            // initial_next_avail, the pop succeeds (ring slot 0
-            // holds head_idx=0), and next_avail bumps to
-            // initial_next_avail.wrapping_add(1).
-            //
-            // After the throttle stall, the rollback should land
-            // next_avail back at initial_next_avail — that's the
-            // u16-wrap-aware invariant.
+            // After plant: avail.idx is 1, avail.ring[0] holds
+            // the chain head. The device's pop_descriptor_chain
+            // reads slot 0, advances next_avail from 0 to 1,
+            // hits the throttle gate (iops bucket drained at
+            // construction), and rolls back via
+            // `set_next_avail(prev.wrapping_sub(1))` — landing
+            // back at 0.
 
             let before = snapshot_counters(&dev);
 
@@ -16575,7 +16554,7 @@ mod proptest_tests {
                 throttled_delta + io_errors_delta >= 1,
                 "drained throttle must produce a stall or pre-throttle reject; \
                  throttled_delta={throttled_delta} io_errors_delta={io_errors_delta} \
-                 chain={chain:?} initial_next_avail={initial_next_avail}",
+                 chain={chain:?}",
             );
 
             // No completion: every drained-throttle case must
@@ -16604,23 +16583,20 @@ mod proptest_tests {
                     .expect("read status sentinel");
                 prop_assert_eq!(
                     s[0], 0xEE,
-                    "stalled chain must not write status byte; \
-                     chain={:?} initial_next_avail={}",
-                    chain, initial_next_avail,
+                    "stalled chain must not write status byte; chain={:?}",
+                    chain,
                 );
 
                 // Queue cursor rewound: post-stall next_avail
-                // matches the pre-notify value via wrapping_sub.
-                // pop_descriptor_chain advanced it from
-                // initial_next_avail to (initial_next_avail+1);
+                // matches the pre-notify value (0).
+                // pop_descriptor_chain advanced it from 0 to 1;
                 // the stall rolled it back via wrapping_sub(1)
-                // to initial_next_avail.
+                // to 0.
                 let post_stall_next_avail = dev.worker.queues[REQ_QUEUE].next_avail();
                 prop_assert_eq!(
-                    post_stall_next_avail, initial_next_avail,
-                    "post-stall next_avail must rewind to pre-notify value; \
-                     wrapping arithmetic should land at {} after rollback, got {}",
-                    initial_next_avail, post_stall_next_avail,
+                    post_stall_next_avail, 0u16,
+                    "post-stall next_avail must rewind to 0; got {}",
+                    post_stall_next_avail,
                 );
 
                 // currently_throttled_gauge incremented (false→true).
