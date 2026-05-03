@@ -30,11 +30,10 @@
 //!
 //! This module is the DATA-SHAPE deliverable for the capture path.
 //! The actual periodic-loop binary that drives [`ctprof::capture`]
-//! and the failure trigger pipeline (tp_btf/sched_ext_exit fentry,
-//! per `research_live_host.md` phd-host4) are upstream producers
-//! that emit [`DebugCapture`]; the reproducer generator is
-//! the downstream consumer. Splitting at this module boundary keeps
-//! each side free to evolve independently.
+//! and the failure trigger pipeline (tp_btf/sched_ext_exit fentry)
+//! are upstream producers that emit [`DebugCapture`]; the reproducer
+//! generator is the downstream consumer. Splitting at this module
+//! boundary keeps each side free to evolve independently.
 //!
 //! The fingerprint projection lives here (rather than in the reproducer
 //! generator module) because
@@ -44,7 +43,7 @@
 //!
 //! # Vocabulary alignment with ktstr test primitives
 //!
-//! Per `capture_reproduce_thesis.md`: the capture format must speak
+//! The capture format must speak
 //! the same vocabulary as the test library. Projected hints map
 //! one-to-one with primitive types in `crate::workload`:
 //!
@@ -60,7 +59,7 @@
 //! weighs them against the failure dump and the user's preferences
 //! (e.g. minimal-repro vs full-fidelity reproduction).
 //!
-//! # Filterable presentation per `classifier_design.md`
+//! # Filterable presentation
 //!
 //! The capture format is designed for `ktstr show / compare`-style
 //! consumption: combinable filters by cgroup / CPU / NUMA node /

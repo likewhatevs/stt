@@ -20,8 +20,8 @@
 //!    For each DSQ captures the scalar state (id, nr, seq) and walks
 //!    its `list_head` to enumerate queued tasks. The kernel's own
 //!    `scx_dump_state` does NOT enumerate per-DSQ depths — this
-//!    walker surfaces data even mainline misses (research_debug_probes
-//!    phd-debug7).
+//!    walker surfaces queue depth and per-task ordering that the
+//!    in-tree dump path does not.
 //!
 //! Both walkers are best-effort: any address that fails to translate
 //! (slab page race, PA out of bounds) yields a partial result rather
@@ -133,7 +133,7 @@ pub struct DsqState {
     /// `scx_dispatch_q.seq` — BPF-iter seq counter, used by the
     /// dual-snapshot delta to distinguish dead vs busy DSQs:
     /// `Δnr=0 + Δseq=0` is a dead DSQ; `Δseq>>Δ(seq-nr)` indicates
-    /// unbounded growth (per research_debug_probes phd-debug7).
+    /// unbounded queue growth.
     pub seq: u32,
     /// `task_struct` KVAs walked off the DSQ's `list_head`. Same
     /// shape as [`RqScxState::runnable_task_kvas`] — feeds into

@@ -42,22 +42,20 @@
 //! # Liveness
 //!
 //! The walker uses the per-level `allocated[]` bitmap as the source
-//! of truth, not `tid.idx` or `pool.idx` (the adversary research
-//! flagged both as unreliable: post-free `tid.idx` is reset to 0,
-//! ambiguous with slot 0; `pool.idx` is the pool's high-water mark,
-//! not the live count). `chunk->data[pos]` is also nullable for
-//! pristine slots that the pool never handed out — we skip those
-//! silently.
+//! of truth, not `tid.idx` or `pool.idx` — both are unreliable:
+//! post-free `tid.idx` is reset to 0 (ambiguous with slot 0), and
+//! `pool.idx` is the pool's high-water mark, not the live count.
+//! `chunk->data[pos]` is also nullable for pristine slots that the
+//! pool never handed out — we skip those silently.
 //!
 //! # Race window
 //!
 //! The freeze coordinator pauses every vCPU before this walker runs,
 //! but `scx_alloc_free_idx` zeroes a slot's payload BEFORE clearing
 //! the bitmap. A frozen snapshot captured between those two writes
-//! sees a "live" bitmap bit but a zero-filled payload. Per the
-//! adversary's design ruling we render the zeros as a "zeroed slot"
-//! rather than try to detect mid-free — the consumer can recognise
-//! all-zero payloads as the race.
+//! sees a "live" bitmap bit but a zero-filled payload. We render the
+//! zeros as a "zeroed slot" rather than try to detect mid-free — the
+//! consumer can recognise all-zero payloads as the race.
 
 use serde::{Deserialize, Serialize};
 

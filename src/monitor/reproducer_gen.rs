@@ -16,8 +16,8 @@
 //!
 //! # The translation contract
 //!
-//! Per `capture_reproduce_thesis.md` §SYNTHESIZE, the generator's
-//! job is to take fingerprint HINTS (best-effort projections from
+//! The generator's job is to take fingerprint HINTS (best-effort
+//! projections from
 //! capture data) and emit a test spec the framework will execute.
 //! The generator is NOT a classifier — it does not decide "this
 //! workload is locking-bound" or "this is a cache pressure

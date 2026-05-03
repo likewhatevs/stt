@@ -654,11 +654,10 @@ int BPF_PROG(ktstr_event_tp, const char *name, __s64 delta)
  * `next->pid`, `task_cpu(p)` so a future kernel-internal layout
  * change rebuilds correctly.
  *
- * sched_stat_wait/blocked are deliberately NOT used — per
- * research_debug_probes.md the schedstat tracepoints do not fire
- * for sched_ext tasks. The (sched_switch, sched_wakeup) pair lets
- * userspace reconstruct per-task wait time post-hoc by diffing
- * wake-time and on-cpu time.
+ * sched_stat_wait/blocked are deliberately NOT used — the schedstat
+ * tracepoints do not fire for sched_ext tasks. The (sched_switch,
+ * sched_wakeup) pair lets userspace reconstruct per-task wait time
+ * post-hoc by diffing wake-time and on-cpu time.
  */
 
 SEC("tp_btf/sched_switch")

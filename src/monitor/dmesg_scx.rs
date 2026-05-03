@@ -12,10 +12,9 @@
 //!
 //! # Why parse dmesg
 //!
-//! Per `research_live_host.md` "dmesg parsing": the kernel ALWAYS
-//! emits stack traces for error-class scx exits via `pr_err`
-//! (kernel/sched/ext.c around the `dump_stack` call in the disable
-//! path). The `%pS` format renders kernel addresses as
+//! The kernel ALWAYS emits stack traces for error-class scx exits
+//! via `pr_err` (kernel/sched/ext.c around the `dump_stack` call in
+//! the disable path). The `%pS` format renders kernel addresses as
 //! `funcname+0xoff/0xsz` — readable AND symbolic, so the live-host
 //! pipeline can extract function names without doing its own
 //! kallsyms walk against raw addresses (the alternative path).
@@ -60,8 +59,9 @@ pub enum ScxExitKind {
     Error,
     /// Watchdog-detected stall (`check_rq_for_timeouts` fired).
     /// Stack trace is the watchdog kthread, NOT the BPF scheduler.
-    /// Auto-repro fallback: probe all BPF ops callbacks per
-    /// `research_live_host.md` phd-host4.
+    /// Auto-repro fallback: probe all BPF ops callbacks since the
+    /// causal callback is not directly recoverable from the watchdog
+    /// stack.
     Stall,
     /// Normal disable — ops.exit() called cleanly. No error stack.
     Normal,

@@ -77,10 +77,9 @@ pub struct MetricDef {
     ///
     /// Default `Counter` matches the most common shape — every
     /// kernel monotonic counter (SCX_EV_*, ttwu_count, run_delay,
-    /// cpustat[]) collapses by sum-of-deltas. Per
-    /// [`research_metric_semantics.md`](file://...) ~80% of ktstr
-    /// fields are counters; the field exists so the remaining
-    /// peaks and gauges can opt out of sum-aggregation explicitly.
+    /// cpustat[]) collapses by sum-of-deltas. ~80% of ktstr fields
+    /// are counters; the field exists so the remaining peaks and
+    /// gauges can opt out of sum-aggregation explicitly.
     pub kind: MetricKind,
     pub default_abs: f64,
     pub default_rel: f64,

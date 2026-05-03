@@ -45,9 +45,9 @@
 //! atomic on x86_64; multi-element transactions the scheduler intended
 //! to commit atomically may surface as torn views relative to the
 //! walker. This is identical to the guest-memory backend's torn-read
-//! behavior, just for a different reason. The recommended remedy
-//! (per `research_live_host.md` phd-host3) is two-snapshot in-BPF
-//! capture (bpf_timer + tp_btf) — that lives outside this backend.
+//! behavior, just for a different reason. Two-snapshot in-BPF capture
+//! (bpf_timer + tp_btf) is the recommended remedy and lives outside
+//! this backend.
 
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::ptr;

@@ -200,7 +200,7 @@ encoding_rs = "0.8"
 # `#[derive(thiserror::Error)]` site is explicit. Pinned at the v2
 # series to match what `llama-cpp-2` already pulls in (v2.0.18);
 # v2's `#[source]` attribute matches the structured-error
-# pattern phd-2's analysis recommended.
+# pattern this crate's error-handling design favors.
 thiserror = "2"
 
 # Compiled regex patterns for the token-based pattern_key

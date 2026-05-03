@@ -91,11 +91,11 @@ pub(crate) const NO_HOLDERS_RECORDED: &str = "<none recorded>";
 /// internally; callers never see the libc-specific constants.
 ///
 /// Shared between LLC + per-CPU flocks (`vmm::host_topology`) and
-/// cache-entry flocks (`cache`). A single type prevents the
-/// three-enum drift the convergence review flagged (earlier revisions
-/// had `FlockMode` + `FlockKind` + `LlcLockMode` with identical
-/// shape). `LlcLockMode` remains distinct as the scheduler-intent
-/// layer (perf-mode vs. no-perf-mode request), not a flock operation.
+/// cache-entry flocks (`cache`). A single type prevents three-enum
+/// drift — earlier revisions had `FlockMode` + `FlockKind` +
+/// `LlcLockMode` with identical shape. `LlcLockMode` remains distinct
+/// as the scheduler-intent layer (perf-mode vs. no-perf-mode
+/// request), not a flock operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlockMode {
     /// Exclusive (`LOCK_EX`) — sole access to the lock file.

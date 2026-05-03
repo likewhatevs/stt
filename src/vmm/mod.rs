@@ -8507,8 +8507,8 @@ mod tests {
     /// must total at least 800 ms so a sustained signal storm gets
     /// a real chance to drain instead of starving the ioctl in <1 ms.
     /// Pins the schedule against a regression that re-tunes it
-    /// downwards (the previous schedule was 62 µs total, which
-    /// adv-vm flagged as too short).
+    /// downwards (the previous schedule was 62 µs total — too
+    /// short to outlast a sustained signal storm).
     #[test]
     fn kvm_create_vm_eintr_delays_total_budget() {
         let mut prev = Duration::ZERO;

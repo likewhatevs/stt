@@ -278,8 +278,7 @@ pub struct PerCpuTimeStats {
 /// against another node's row) to extract the test-window delta.
 ///
 /// Diagnostic value for sched_ext stalls is informational only —
-/// the NUMA balancer is not active for ext tasks (per
-/// research_structural_pathology.md "NUMA" section). The rows
+/// the NUMA balancer is not active for ext tasks. The rows
 /// surface here so an operator triaging a NUMA-aware workload
 /// (e.g. a memory-tiering test) can verify the kernel actually
 /// observed the expected node-locality distribution.

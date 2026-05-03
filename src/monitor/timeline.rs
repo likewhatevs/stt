@@ -13,10 +13,10 @@
 //!
 //! 2. **Incremental snapshot ring** ([`SnapshotRing`],
 //!    [`IncrementalCapture`]) — periodic VM-freeze capture of raw
-//!    BPF state bytes for deferred render at trigger time. Per
-//!    `research_debug_probes.md` phd-debug3 Option A: 1 Hz steady,
-//!    10 Hz escalation, 60-entry ring. Render only on trigger
-//!    keeps observer effect to ~0.2-1% wall-time at 5s interval.
+//!    BPF state bytes for deferred render at trigger time. Steady
+//!    cadence is 1 Hz with 10 Hz escalation under stall-proximate
+//!    conditions and a 60-entry ring; rendering only on trigger
+//!    keeps observer effect to ~0.2-1% wall-time at the 5s interval.
 //!
 //! Both surfaces compose into [`super::dump::DumpContext`] as
 //! optional captures so frozen-VM and live-host pipelines can
@@ -271,12 +271,11 @@ pub struct TimelineCapture<'a> {
 // Incremental capture: periodic VM-freeze ring of raw bytes.
 // ---------------------------------------------------------------
 
-/// Default snapshot-ring depth from
-/// `research_debug_probes.md` phd-debug3: "Ring buffer of last 60
-/// snapshots". 60 entries at 1 Hz steady-state covers 60 seconds
-/// of pre-trigger context — long enough for the dual-snapshot
-/// delta to detect slow drift, short enough that the storage cost
-/// stays within the 60-300 MiB envelope phd-debug3 quotes.
+/// Default snapshot-ring depth: 60 entries at 1 Hz steady-state
+/// covers 60 seconds of pre-trigger context — long enough for the
+/// dual-snapshot delta to detect slow drift, short enough that the
+/// storage cost stays within the 60-300 MiB envelope of the per-VM
+/// budget for incremental capture.
 pub const DEFAULT_SNAPSHOT_RING_DEPTH: usize = 60;
 
 /// One incremental snapshot — opaque raw bytes captured at a
@@ -325,8 +324,8 @@ pub struct SnapshotRing {
 
 impl SnapshotRing {
     /// New ring with the requested capacity. Pass
-    /// [`DEFAULT_SNAPSHOT_RING_DEPTH`] for the phd-debug3
-    /// recommended size.
+    /// [`DEFAULT_SNAPSHOT_RING_DEPTH`] for the storage-budget-tuned
+    /// default (60 entries).
     #[allow(dead_code)]
     pub fn new(capacity: usize) -> Self {
         Self {
@@ -661,9 +660,9 @@ mod tests {
         assert_eq!(drained[2].captured_ns, 4);
     }
 
-    /// Default ring depth matches phd-debug3's recommended 60.
+    /// Default ring depth matches the documented 60-entry budget.
     #[test]
-    fn default_ring_depth_matches_research() {
+    fn default_ring_depth_pinned() {
         assert_eq!(DEFAULT_SNAPSHOT_RING_DEPTH, 60);
     }
 

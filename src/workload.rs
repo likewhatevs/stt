@@ -525,8 +525,7 @@ pub enum WorkType {
     /// woken cohort across CPUs without convoying.
     ///
     /// The first worker (index 0) is the waker; the remaining
-    /// `num_workers - 1` are waiters. Per pathology research
-    /// (research_structural_pathology.md P1), structural minimum is
+    /// `num_workers - 1` are waiters. Structural minimum is
     /// `waiters >= 5` to surface convoy effects on a multi-CPU
     /// host. `worker_group_size = num_workers` so every worker
     /// shares the same shared-memory region; reuses the existing
@@ -14268,6 +14267,104 @@ mod tests {
                 r.tid, r.work_units, r,
             );
         }
+    }
+
+    /// `WakeChain { wake: WakeMechanism::Pipe }` must dispatch
+    /// the bootstrap byte ONLY at stage 0. The dispatch site
+    /// (`workload.rs::worker_main` pipe-mode arm) gates the
+    /// first-iteration `libc::write` behind both `iterations == 0`
+    /// AND `pos == 0`. A regression that drops `pos == 0` would
+    /// have every stage fire its bootstrap byte simultaneously at
+    /// iteration 0, putting `depth` bytes in flight on the ring
+    /// instead of one. The chain still runs (each stage's
+    /// predecessor wrote its bootstrap), but throughput rises by
+    /// factor `depth` because each per-stage poll succeeds
+    /// immediately on a pre-queued byte instead of waiting
+    /// `work_per_hop` for its predecessor's CPU burst + write to
+    /// arrive.
+    ///
+    /// Test signature: pin the total iteration count across all
+    /// stages to the wake-bubble throughput ceiling. With
+    /// `depth=4` and `work_per_hop=50ms` over a 1-second window:
+    ///
+    /// - Correct: ~20 iters total across all 4 stages (one wake
+    ///   per `work_per_hop`, summed regardless of which stage
+    ///   produced it). Per-stage rate = 1 / (depth × work_per_hop).
+    /// - Buggy: ~80 iters total (≈ depth × correct). Per-stage
+    ///   rate ≈ 1 / work_per_hop because every stage's poll picks
+    ///   up an already-queued byte from its predecessor's
+    ///   bootstrap write.
+    ///
+    /// Threshold `total ≤ 40` catches any ratio > 2× while
+    /// retaining margin against scheduling jitter on noisy hosts.
+    /// `work_per_hop=50ms` is intentionally an order of magnitude
+    /// above typical scheduling-noise floors so the per-iter rate
+    /// stays bounded by the spin loop, not the kernel scheduler.
+    /// Fork mode is canonical (default) — under Thread mode the
+    /// shared fd table makes the bug behavior identical, and
+    /// Fork covers the production path.
+    ///
+    /// Adversarial-test charter: this test is destructive — its
+    /// job is to prove the bootstrap-once invariant by failing
+    /// catastrophically when the guard is dropped. It does NOT
+    /// validate normal operation in detail; that lives in
+    /// [`spawn_thread_with_wake_chain_pipe`] and similar.
+    #[test]
+    fn wake_chain_pipe_bootstrap_once_invariant() {
+        const DEPTH: usize = 4;
+        const WORK_PER_HOP_MS: u64 = 50;
+        const TEST_WINDOW_MS: u64 = 1000;
+        // 2× margin over the 20-iter correct upper bound, well
+        // below the 80-iter buggy expectation.
+        const TOTAL_ITER_THRESHOLD: u64 = 40;
+
+        let config = WorkloadConfig {
+            num_workers: DEPTH,
+            work_type: WorkType::WakeChain {
+                depth: DEPTH,
+                wake: WakeMechanism::Pipe,
+                work_per_hop: Duration::from_millis(WORK_PER_HOP_MS),
+            },
+            ..Default::default()
+        };
+        let mut h = WorkloadHandle::spawn(&config)
+            .expect("WakeChain wake=Pipe spawn must succeed");
+        h.start();
+        std::thread::sleep(Duration::from_millis(TEST_WINDOW_MS));
+        let reports = h.stop_and_collect();
+        assert_eq!(
+            reports.len(),
+            DEPTH,
+            "WakeChain wake=Pipe collects one report per worker"
+        );
+        let total_iters: u64 = reports.iter().map(|r| r.iterations).sum();
+        assert!(
+            total_iters <= TOTAL_ITER_THRESHOLD,
+            "WakeChain wake=Pipe total iterations across {DEPTH} stages \
+             exceeded {TOTAL_ITER_THRESHOLD} over {TEST_WINDOW_MS}ms with \
+             work_per_hop={WORK_PER_HOP_MS}ms (got {total_iters}). The \
+             bootstrap-once invariant requires only stage 0 to fire the \
+             initial pipe write; if every stage fires a bootstrap byte at \
+             iteration 0, the ring carries {DEPTH} simultaneous bytes and \
+             per-stage throughput rises by factor {DEPTH}. Expected \
+             correct total ~{}; expected buggy total ~{}. Per-worker \
+             reports: {:?}",
+            TEST_WINDOW_MS / WORK_PER_HOP_MS,
+            (TEST_WINDOW_MS / WORK_PER_HOP_MS) * (DEPTH as u64),
+            reports,
+        );
+        // Lower bound: the correct chain MUST make at least some
+        // forward progress over a 1s window with 50ms hops. A
+        // total of zero indicates the chain deadlocked at the
+        // bootstrap site (a different bug than the one this test
+        // primarily guards, but worth surfacing here too).
+        assert!(
+            total_iters > 0,
+            "WakeChain wake=Pipe made zero forward progress over \
+             {TEST_WINDOW_MS}ms — the bootstrap byte never propagated. \
+             Per-worker reports: {:?}",
+            reports,
+        );
     }
 
     /// `CloneMode::Thread + WorkType::WakeChain { wake: Pipe }`

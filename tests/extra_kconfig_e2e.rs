@@ -56,8 +56,9 @@ use std::process::Command;
 ///
 /// Resolved at runtime (the binary doesn't move between compile and
 /// run) so a missing tree produces a clean skip rather than a
-/// `compile_error!`. The team-lead-issued spec uses `../linux`
-/// relative to the ktstr crate root.
+/// `compile_error!`. The convention is `../linux` relative to the
+/// ktstr crate root (matching the kernel build patterns used
+/// throughout the project).
 fn linux_source_dir() -> PathBuf {
     let crate_root = env!("CARGO_MANIFEST_DIR");
     PathBuf::from(crate_root).join("..").join("linux")
