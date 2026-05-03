@@ -139,6 +139,15 @@ pub(crate) struct TokenBucket {
     pub(crate) available: i64,
     pub(crate) last_refill: Instant,
     pub(crate) unlimited: bool,
+    /// Test-only override for `nanos_until_n_tokens`. When `Some(n)`,
+    /// `nanos_until_n_tokens` returns `n` directly, bypassing
+    /// `refill()` and the deficit math. Lets tests pin the
+    /// `wait_nanos == 0` inline-re-drain branch in
+    /// `worker_thread_main` without relying on real-time behaviour
+    /// of `Instant::now()` / `Duration::from_nanos`. Production
+    /// code never sets this — it remains `None` outside tests.
+    #[cfg(test)]
+    pub(crate) forced_nanos_until_n_tokens: Option<u64>,
 }
 
 impl TokenBucket {
@@ -149,6 +158,8 @@ impl TokenBucket {
             available: 0,
             last_refill: Instant::now(),
             unlimited: true,
+            #[cfg(test)]
+            forced_nanos_until_n_tokens: None,
         }
     }
 
@@ -173,6 +184,8 @@ impl TokenBucket {
             available: i64::try_from(capacity).unwrap_or(i64::MAX),
             last_refill: Instant::now(),
             unlimited: false,
+            #[cfg(test)]
+            forced_nanos_until_n_tokens: None,
         }
     }
 
@@ -331,6 +344,18 @@ impl TokenBucket {
     /// `0` shortcut covers the race where the bucket refilled
     /// between the upstream `can_consume` and this call.
     pub(crate) fn nanos_until_n_tokens(&mut self, need: u64) -> u64 {
+        // Test seam: when `forced_nanos_until_n_tokens` is set,
+        // return it directly without touching refill state. Lets
+        // tests pin the worker loop's `wait_nanos == 0` inline
+        // re-drain branch (and any other deficit-driven decision)
+        // without depending on real wall-clock behaviour. The
+        // override is taken even on the unlimited fast path so a
+        // test can simulate "throttled bucket reports zero deficit"
+        // against an unlimited bucket without rebuilding.
+        #[cfg(test)]
+        if let Some(forced) = self.forced_nanos_until_n_tokens {
+            return forced;
+        }
         if self.unlimited || need == 0 {
             return 0;
         }
@@ -378,6 +403,28 @@ impl TokenBucket {
     #[cfg(test)]
     pub(crate) fn set_last_refill_for_test(&mut self, t: Instant) {
         self.last_refill = t;
+    }
+
+    /// Test-only knob: pin the next (and every subsequent)
+    /// `nanos_until_n_tokens` return value to `forced` until
+    /// cleared via `clear_forced_nanos_until_n_tokens_for_test`.
+    /// The override short-circuits before `refill()`, so the
+    /// reported deficit is strictly deterministic regardless of
+    /// `Instant::now()`. Pairs with the worker-loop test seam for
+    /// the `wait_nanos == 0` inline-re-drain branch — a test can
+    /// force one bucket to report zero deficit and assert the
+    /// worker's `StallAction` decision without timing tolerances.
+    #[cfg(test)]
+    pub(crate) fn set_forced_nanos_until_n_tokens_for_test(&mut self, forced: u64) {
+        self.forced_nanos_until_n_tokens = Some(forced);
+    }
+
+    /// Test-only knob: drop a previously-installed
+    /// `forced_nanos_until_n_tokens` override so subsequent calls
+    /// fall through to the refill+deficit math.
+    #[cfg(test)]
+    pub(crate) fn clear_forced_nanos_until_n_tokens_for_test(&mut self) {
+        self.forced_nanos_until_n_tokens = None;
     }
 }
 
