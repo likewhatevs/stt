@@ -145,6 +145,8 @@ use virtio_bindings::virtio_mmio::{
 use virtio_queue::Queue;
 #[cfg(not(test))]
 use virtio_queue::QueueSync;
+use virtio_queue::Error as VirtioQueueError;
+use virtio_queue::QueueOwnedT;
 use virtio_queue::QueueT;
 use vm_memory::{ByteValued, Bytes, GuestAddress, GuestMemoryMmap};
 #[cfg(not(test))]
@@ -967,6 +969,21 @@ pub struct VirtioBlkCounters {
     /// taxonomy" doc for why operators must not conflate the
     /// two.
     pub(crate) currently_throttled_gauge: AtomicU64,
+    /// Cumulative count of `Error::InvalidAvailRingIndex` events
+    /// observed by `drain_bracket_impl`. Bumped each time the
+    /// virtio-queue iter() rejects an avail.idx whose distance
+    /// from `next_avail` exceeds the queue size — a hostile or
+    /// buggy guest condition that, if not detected, would loop
+    /// the worker forever (the swallowed-error livelock fixed by
+    /// the queue_poisoned gate).
+    ///
+    /// Per-event counter (NOT per-request): a single drain pass
+    /// produces at most one bump (the poison flag short-circuits
+    /// further attempts on the same queue). Successive
+    /// QUEUE_NOTIFY kicks against an unresetted poisoned queue
+    /// take the early-return path and produce zero additional
+    /// bumps until the guest performs a virtio reset.
+    pub(crate) invalid_avail_idx_count: AtomicU64,
 }
 
 impl VirtioBlkCounters {
@@ -1101,6 +1118,20 @@ impl VirtioBlkCounters {
         self.currently_throttled_gauge.fetch_sub(1, Ordering::Relaxed);
     }
 
+    /// Record one observed `Error::InvalidAvailRingIndex` event
+    /// from `Queue::iter`. Called by `drain_bracket_impl` when the
+    /// avail ring's `idx` is more than `queue.size` ahead of
+    /// `next_avail` — a virtio-spec violation by the guest. The
+    /// caller also sets `BlkWorkerState::queue_poisoned` so a
+    /// single hostile-guest event produces exactly one bump,
+    /// regardless of how many subsequent kicks land before the
+    /// next reset (subsequent drains short-circuit on the poison
+    /// flag and never re-call `iter`).
+    fn record_invalid_avail_idx(&self) {
+        self.invalid_avail_idx_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Read the cumulative count of successfully completed read
     /// requests for this device's lifetime. Per-request counter:
     /// bumped exactly once per successful read via
@@ -1167,6 +1198,19 @@ impl VirtioBlkCounters {
     /// practice.
     pub fn currently_throttled_gauge(&self) -> u64 {
         self.currently_throttled_gauge.load(Ordering::Relaxed)
+    }
+
+    /// Read the cumulative count of `Error::InvalidAvailRingIndex`
+    /// events the device has observed. Per-event counter (NOT
+    /// per-request): the queue-poison flag short-circuits
+    /// subsequent kicks against the same hostile state, so one
+    /// guest fault produces exactly one bump regardless of how
+    /// many notifications follow before reset. A non-zero value
+    /// means the guest violated virtio-v1.2 §2.7.13.3.1 — the
+    /// device is in the "structurally broken queue" state and
+    /// will not service IO until the guest issues a virtio reset.
+    pub fn invalid_avail_idx_count(&self) -> u64 {
+        self.invalid_avail_idx_count.load(Ordering::Relaxed)
     }
 }
 
@@ -1256,6 +1300,31 @@ struct BlkWorkerState {
     /// without per-worker state. Cfg-independent so both Inline
     /// and Spawned engines maintain the same invariant.
     currently_stalled: bool,
+    /// Sticky "the queue is structurally broken; stop draining"
+    /// flag. Set when the avail-ring iterator returns
+    /// `Error::InvalidAvailRingIndex` — the avail.idx the guest
+    /// published is more than `queue.size` ahead of the device's
+    /// `next_avail`, which the virtio spec forbids
+    /// (virtio-v1.2 §2.7.13.3.1: "the driver MUST NOT add a
+    /// descriptor chain longer than 2^32 bytes in total").
+    /// Without this flag, every subsequent `pop_descriptor_chain`
+    /// would re-trip the same error and `enable_notification`
+    /// would re-arm immediately, looping the worker forever
+    /// against a hostile guest at full vCPU/host CPU cost.
+    ///
+    /// Once set, `drain_bracket_impl` short-circuits to `Done`
+    /// without touching the queue at all — no
+    /// `disable_notification`, no `iter`, no `enable_notification`.
+    /// The flag clears only on a full virtio reset
+    /// (`reset_engine_inline` / `respawn_worker` rebuilds the
+    /// state with `queue_poisoned: false`), matching the device's
+    /// "FAILED status until guest resets" behavior in
+    /// cloud-hypervisor's virtio-blk handler.
+    ///
+    /// Per-worker (not on the shared counters Arc) because only
+    /// the drain thread mutates it. Cfg-independent so both
+    /// Inline and Spawned engines maintain the same invariant.
+    queue_poisoned: bool,
 }
 
 /// Wraps the request-processing engine. In Inline mode (cfg(test))
@@ -1504,6 +1573,7 @@ impl VirtioBlk {
             read_only,
             counters: Arc::clone(&counters),
             currently_stalled: false,
+            queue_poisoned: false,
         };
 
         let interrupt_status = Arc::new(AtomicU32::new(0));
@@ -1947,6 +2017,36 @@ fn drain_bracket_impl(
             return DrainOutcome::Done;
         }
 
+        // Hostile-guest defense gate. A previous drain observed
+        // `Error::InvalidAvailRingIndex` from `Queue::iter` (the
+        // guest's avail.idx was more than `queue.size` ahead of
+        // `next_avail`, violating virtio-v1.2 §2.7.13.3.1). The
+        // structural invariant the iterator depends on is broken;
+        // every subsequent `iter()` call would re-trip the same
+        // error, and `enable_notification` would re-arm
+        // immediately, looping the worker forever at full
+        // vCPU/host-CPU cost.
+        //
+        // Returning `Done` without touching the queue:
+        // - skips `disable_notification` (no spurious used.flags
+        //   write — the guest already poisoned the queue, more
+        //   side effects make the symptom worse, not better),
+        // - skips `iter()` (no second `invalid_avail_idx_count`
+        //   bump per kick — the counter is per-event, the flag
+        //   makes it event-once),
+        // - skips `enable_notification` (no Ok(true) re-loop and
+        //   no irqfd write).
+        //
+        // The flag clears only on a full virtio reset
+        // (`reset_engine_inline` / `respawn_worker` rebuilds the
+        // state with `queue_poisoned: false`). Until then the
+        // device will not service IO — the guest's blk-mq layer
+        // observes hangs and the operator sees a non-zero
+        // `invalid_avail_idx_count` in the failure dump.
+        if state.queue_poisoned {
+            return DrainOutcome::Done;
+        }
+
         // The request loop calls handlers (which take `&` borrows
         // of state.backing/state.counters) plus throttle bucket
         // mutation (`&mut state.ops_bucket` / `&mut state.bytes_bucket`).
@@ -2002,10 +2102,104 @@ fn drain_bracket_impl(
                 tracing::warn!(%e, "virtio-blk disable_notification failed");
             }
         loop {
-            let q = &mut queues[REQ_QUEUE];
-            let Some(chain) = q.pop_descriptor_chain(mem) else {
-                break;
+            // Pop one chain via `Queue::iter` so we can OBSERVE
+            // `Error::InvalidAvailRingIndex` instead of swallowing
+            // it (the default `pop_descriptor_chain` impl logs the
+            // error and returns None — see queue.rs:573-587 — which
+            // would let `enable_notification` re-arm immediately and
+            // loop the worker forever against a hostile guest).
+            //
+            // `iter()` is on `QueueOwnedT`, which only the bare
+            // `Queue` implements; we reach it via `q.lock()` which
+            // returns `&mut Queue` for `Queue` (cfg(test) alias) and
+            // `MutexGuard<Queue>` for `QueueSync` (cfg(not(test))) —
+            // both deref to `Queue`. The guard scope is kept tight
+            // so `add_used` etc. can re-borrow the queue downstream.
+            //
+            // The returned `DescriptorChain<M>` holds its own
+            // `mem.clone()` (queue.rs:761-766) — it does NOT borrow
+            // from the iterator or the guard, so we can drop both
+            // and walk the chain independently.
+            // Pop one chain via `iter()`/`.next()` so we OBSERVE
+            // `Error::InvalidAvailRingIndex` instead of swallowing
+            // it. The bare `Queue::pop_descriptor_chain` impl
+            // (queue.rs:573-587) calls iter() internally, logs any
+            // error, and returns None — masking the structural
+            // violation as "no chain available" and letting
+            // `enable_notification` re-arm immediately, looping
+            // the worker forever against a hostile guest.
+            //
+            // Two-step extraction to keep the borrow tight: take
+            // the iter inside a block and capture only the
+            // outcome (Some(chain) / None / Err(_)) before
+            // dropping the lock guard. The chain itself owns its
+            // own `mem.clone()` (queue.rs:761-766), so it does not
+            // borrow from the iter or the guard — we can walk it
+            // freely after the guard drops.
+            //
+            // `iter()` is on `QueueOwnedT`, which only the bare
+            // `Queue` implements; we reach it via `q.lock()` —
+            // returns `&mut Queue` for `Queue` (cfg(test)) and
+            // `MutexGuard<Queue>` for `QueueSync` (cfg(not(test))).
+            // Both deref to `Queue`, so `guard.iter(mem)` compiles
+            // for both alias targets.
+            let iter_outcome = {
+                let q = &mut queues[REQ_QUEUE];
+                let mut guard = q.lock();
+                match guard.iter(mem) {
+                    Ok(mut iter) => Ok(iter.next()),
+                    Err(e) => Err(e),
+                }
             };
+            let chain = match iter_outcome {
+                Ok(Some(c)) => c,
+                Ok(None) => break,
+                Err(VirtioQueueError::InvalidAvailRingIndex) => {
+                    // Hostile-guest poison. The avail.idx is more
+                    // than `queue.size` ahead of the device's
+                    // `next_avail` (virtio-v1.2 §2.7.13.3.1
+                    // violation; check sits at queue.rs:707-709
+                    // in `AvailIter::new`). Mark the queue dead
+                    // so future drains short-circuit, bump the
+                    // per-event counter (gated by the flag —
+                    // exactly one bump per poison event
+                    // regardless of re-kicks), and bail without
+                    // calling `enable_notification`. Re-enabling
+                    // notifications would arm the next kick to
+                    // re-trip the same error — a livelock. A full
+                    // virtio reset is the only path back to
+                    // service.
+                    state.queue_poisoned = true;
+                    state.counters.record_invalid_avail_idx();
+                    tracing::warn!(
+                        "virtio-blk avail.idx exceeds next_avail by more \
+                         than queue.size (virtio-v1.2 §2.7.13.3.1 \
+                         violation); poisoning queue until guest reset"
+                    );
+                    break 'outer;
+                }
+                Err(e) => {
+                    // Other iter() errors: `QueueNotReady` (the
+                    // `ready()` gate above already filtered this;
+                    // would only fire on a TOCTOU race with a
+                    // vCPU-side reset MMIO write) or
+                    // address-overflow on `avail_idx`. Log and
+                    // bail — the kick is wasted but the device
+                    // recovers on the next legitimate notify. Do
+                    // NOT poison: these are not
+                    // structural-invariant violations the way
+                    // InvalidAvailRingIndex is, so a future
+                    // legitimate kick may succeed.
+                    tracing::warn!(%e, "virtio-blk iter() failed");
+                    break 'outer;
+                }
+            };
+            // Re-bind `q` after the iter-scoped guard drops so the
+            // downstream `add_used` / `set_next_avail` /
+            // `publish_completion` callers can hold a fresh mutable
+            // borrow (the guard above released its lock when its
+            // block expression returned).
+            let q = &mut queues[REQ_QUEUE];
             let head = chain.head_index();
 
             // Walk the chain. Layout per virtio-v1.2 §5.2.6:
@@ -3999,6 +4193,13 @@ impl VirtioBlk {
             engine.state.currently_stalled = false;
             engine.state.counters.record_throttle_pending_dec();
         }
+        // Clear hostile-guest poison: the guest issued a virtio
+        // reset, which is the only documented escape from the
+        // queue-poisoned state. The `invalid_avail_idx_count`
+        // counter is intentionally NOT cleared here — operators
+        // need cumulative-event visibility across resets to detect
+        // repeated hostile-guest behavior.
+        engine.state.queue_poisoned = false;
     }
 
     /// Production engine reset: stop the worker, join, q.reset(),
@@ -4035,11 +4236,53 @@ impl VirtioBlk {
     }
 
     /// Production: send STOP_TOKEN to the worker, join the
-    /// thread, return the worker state. Returns `None` if the
-    /// worker had already been joined (Option already taken — a
-    /// second `reset()` after a torn-down engine, or a concurrent
-    /// Drop racing the MMIO writer; both are operator bugs but
-    /// must not panic the vCPU thread).
+    /// thread with a [`RESET_JOIN_TIMEOUT`] budget, return the
+    /// worker state. Returns `None` if the worker had already been
+    /// joined (Option already taken — a second `reset()` after a
+    /// torn-down engine, or a concurrent Drop racing the MMIO
+    /// writer; both are operator bugs but must not panic the vCPU
+    /// thread), if the worker panicked, OR if the join timed out
+    /// or the helper machinery itself failed.
+    ///
+    /// # vCPU thread protection
+    ///
+    /// The unbounded `handle.join()` this function previously used
+    /// would block the vCPU thread that received the `STATUS = 0`
+    /// MMIO write through any wedged backing-IO path the worker
+    /// hit (NFS stall, slow page cache, hung block device). The
+    /// freeze coordinator's SIGRTMIN-based rendezvous (30 s wall
+    /// budget at the coordinator level) targets that same vCPU
+    /// thread; an unbounded reset block would either time out the
+    /// rendezvous empty or arrive minutes late. Routing through
+    /// [`join_worker_with_timeout`] caps the vCPU's pre-rendezvous
+    /// overhead at [`RESET_JOIN_TIMEOUT`] (1 s) — the same
+    /// invariant `Drop` enforces via [`DROP_JOIN_TIMEOUT`].
+    ///
+    /// # Outcomes
+    ///
+    /// - [`JoinWithTimeoutOutcome::Joined`] → return `Some(state)`;
+    ///   reset proceeds to `q.reset()` + respawn.
+    /// - [`JoinWithTimeoutOutcome::Panicked`] → log structured
+    ///   error (matching Drop's diagnostic), return `None`. Device
+    ///   enters permanent-workerless state.
+    /// - [`JoinWithTimeoutOutcome::TimedOut`] → log structured
+    ///   warn (worker is wedged in a blocking syscall that does
+    ///   not check stop_fd), return `None`. Helper retains the
+    ///   `JoinHandle` and the underlying `BlkWorkerState`; the
+    ///   wedged worker keeps running until its blocking syscall
+    ///   returns. Device enters permanent-workerless state — the
+    ///   resource-retention trade documented at
+    ///   [`join_worker_with_timeout`] applies here too.
+    /// - [`JoinWithTimeoutOutcome::HelperSpawnFailed`] /
+    ///   [`JoinWithTimeoutOutcome::HelperDisconnected`] → log
+    ///   structured error, return `None`. Outer worker is
+    ///   detached.
+    ///
+    /// All four non-Joined outcomes funnel through the
+    /// "permanent device death" path documented at
+    /// [`VirtioBlk::reset_engine_spawned`] — `reclaimed = None`
+    /// skips the respawn and the device serves no further IO
+    /// until reconstruction.
     #[cfg(not(test))]
     fn stop_worker_and_reclaim_state(&mut self) -> Option<BlkWorkerState> {
         let WorkerEngine::Spawned(eng) = &mut self.worker.engine;
@@ -4049,20 +4292,79 @@ impl VirtioBlk {
         // `respawn_worker` allocates a fresh `stop_fd`. If EAGAIN
         // ever occurs (e.g. a regression hands the worker a
         // long-lived stop_fd whose counter accumulated stale
-        // writes), the subsequent `handle.join()` blocks until the
-        // worker observes a kick or timer wakeup and re-checks
-        // stop_fd; a follow-up adds a join timeout to surface that
-        // stall.
+        // writes), the subsequent join's RESET_JOIN_TIMEOUT
+        // budget bounds the wait to 1 s and surfaces the stall
+        // through the TimedOut diagnostic below.
         let _ = eng.stop_fd.write(1);
+        // Capture device-identifier fields before the
+        // `eng.handle.take()` consumes the Option, so the
+        // diagnostic warns can name the wedged device without
+        // re-borrowing `self`.
+        let stop_fd = eng.stop_fd.as_raw_fd();
+        let capacity_sectors = self.capacity_sectors;
+        let instance_id = self.instance_id;
+        // Re-borrow eng after the immutable reads above — needed
+        // because `take()` mutates the Option.
+        let WorkerEngine::Spawned(eng) = &mut self.worker.engine;
         let handle = eng.handle.take()?;
-        match handle.join() {
-            Ok(state) => Some(state),
-            Err(e) => {
+        match join_worker_with_timeout(handle, RESET_JOIN_TIMEOUT) {
+            JoinWithTimeoutOutcome::Joined(state) => Some(state),
+            JoinWithTimeoutOutcome::Panicked(payload) => {
                 tracing::error!(
-                    ?e,
+                    panic = panic_payload_str(&*payload),
+                    stop_fd,
+                    capacity_sectors,
+                    instance_id,
                     "virtio-blk worker thread panicked during reset; \
                      no state to reclaim — device will not service IO \
                      until a fresh VirtioBlk is constructed"
+                );
+                None
+            }
+            JoinWithTimeoutOutcome::TimedOut => {
+                tracing::warn!(
+                    timeout_s = RESET_JOIN_TIMEOUT.as_secs_f32(),
+                    stop_fd,
+                    capacity_sectors,
+                    instance_id,
+                    "virtio-blk worker did not exit within \
+                     RESET_JOIN_TIMEOUT of stop_fd during reset; \
+                     leaking the worker thread to avoid blocking the \
+                     vCPU thread (which the freeze coordinator may \
+                     target with SIGRTMIN). Device enters the \
+                     permanent-workerless state — guests will hang \
+                     on every request until \
+                     kernel.hung_task_timeout_secs (default 120 s) \
+                     fires, and only constructing a fresh VirtioBlk \
+                     recovers IO service. \
+                     hint: identify the wedged device by stop_fd / \
+                     instance_id / capacity_sectors above. \
+                     hint: check `dmesg` for the backing fd's \
+                     storage path stalling on I/O, or kill -USR1 \
+                     the host process to dump worker thread \
+                     backtraces."
+                );
+                None
+            }
+            JoinWithTimeoutOutcome::HelperSpawnFailed => {
+                tracing::error!(
+                    stop_fd,
+                    capacity_sectors,
+                    instance_id,
+                    "virtio-blk reset helper thread spawn failed; \
+                     detaching worker without join — device enters \
+                     the permanent-workerless state"
+                );
+                None
+            }
+            JoinWithTimeoutOutcome::HelperDisconnected => {
+                tracing::error!(
+                    stop_fd,
+                    capacity_sectors,
+                    instance_id,
+                    "virtio-blk reset helper thread terminated \
+                     without forwarding the worker join result; \
+                     device enters the permanent-workerless state"
                 );
                 None
             }
@@ -4120,6 +4422,12 @@ impl VirtioBlk {
             state.currently_stalled = false;
             state.counters.record_throttle_pending_dec();
         }
+        // Clear hostile-guest poison: the guest issued a virtio
+        // reset, which is the only documented escape from the
+        // queue-poisoned state. `invalid_avail_idx_count` stays
+        // because it tracks cumulative events across the device's
+        // lifetime, not per-rebind state.
+        state.queue_poisoned = false;
 
         // Build fresh kick/stop fds — the previous worker's
         // counter values are stale (a kick that arrived during
@@ -4237,6 +4545,51 @@ impl VirtioBlk {
 /// latency on warm caches and small enough to keep the `Drop`
 /// completion well below the rendezvous threshold.
 const DROP_JOIN_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Upper bound on how long [`VirtioBlk::reset`] (production
+/// `WorkerEngine::Spawned` path) will block while joining the
+/// outgoing worker thread before declaring it wedged and entering
+/// the permanent-device-death state documented at
+/// [`VirtioBlk::reset_engine_spawned`].
+///
+/// The same budget as [`DROP_JOIN_TIMEOUT`] (1 s) and for the same
+/// reasons: a `reset()` runs on the vCPU thread that received the
+/// `STATUS = 0` MMIO write, and that vCPU thread can be the next
+/// SIGRTMIN target the freeze coordinator picks for a
+/// failure-dump rendezvous (30 s wall budget at the coordinator
+/// level — see `FREEZE_RENDEZVOUS_TIMEOUT` in
+/// `src/vmm/mod.rs`). An unbounded `handle.join()` here would
+/// block the vCPU through the worker's wedged `pread`/`pwrite`
+/// (NFS stall, slow page cache, hung block device) and the freeze
+/// would either time out empty or arrive minutes late. Capping at
+/// the same 1 s the Drop path uses keeps the "reset takes ≤ 1 s
+/// of vCPU time" invariant uniform — a guest issuing a re-bind
+/// burst (multiple resets in flight from a confused driver) does
+/// not compound the per-reset cap into a multi-second freeze
+/// blocker.
+///
+/// Below 1 s would fire false-positive timeouts on healthy resets
+/// where the worker is mid-sync on a contended disk; above 1 s
+/// would let a single hung worker pin the vCPU past the freeze
+/// coordinator's rendezvous tolerance.
+///
+/// On timeout the device enters the same permanent-workerless
+/// state described in [`VirtioBlk::respawn_worker`]'s "Failure
+/// consequences" section: future kicks land on a stale `kick_fd`
+/// and the guest hangs on every request until
+/// `kernel.hung_task_timeout_secs` (default 120 s) fires. Only
+/// constructing a fresh `VirtioBlk` recovers IO service. This is
+/// the explicit trade chosen over blocking a vCPU thread
+/// indefinitely — the same trade [`DROP_JOIN_TIMEOUT`] makes for
+/// the destructor path.
+///
+/// Visible to `cfg(test)` builds so the unit-test module can pin
+/// the constant's value via [`reset_join_timeout_matches_drop_budget`]
+/// without duplicating the literal. The production callsite in
+/// [`VirtioBlk::stop_worker_and_reclaim_state`] is itself
+/// `cfg(not(test))`, so the const stays unread in test builds —
+/// the test module references it explicitly.
+const RESET_JOIN_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Outcome of a bounded join attempt by [`join_worker_with_timeout`].
 ///
@@ -5004,6 +5357,178 @@ mod tests {
             c.throttled_count.load(Ordering::Relaxed),
             pre_throttled,
             "throttled_count must persist across reset",
+        );
+    }
+
+    /// Hostile-guest avail.idx defense. The virtio spec
+    /// (virtio-v1.2 §2.7.13.3.1) forbids the guest from making more
+    /// descriptor chain heads available than `queue.size`. The
+    /// virtio-queue crate's `AvailIter::new` enforces this with
+    /// `(idx - queue.next_avail).0 > queue.size` → returns
+    /// `Error::InvalidAvailRingIndex` (queue.rs:707-709).
+    ///
+    /// The crate's `pop_descriptor_chain` SWALLOWS that error
+    /// (queue.rs:573-587), so a naive drain loop would observe
+    /// `None`, fall through to `enable_notification` which re-reads
+    /// the same hostile avail.idx, returns `Ok(true)`, and the
+    /// outer loop would re-iterate forever — burning a host CPU on
+    /// the worker thread. This test pins the defense:
+    ///
+    ///   1. Plant a bogus avail.idx (1000, well above the device's
+    ///      queue.size of 256).
+    ///   2. Kick QUEUE_NOTIFY → drain runs, calls `Queue::iter` via
+    ///      `q.lock()`, observes `InvalidAvailRingIndex`, sets
+    ///      `queue_poisoned=true`, bumps `invalid_avail_idx_count`,
+    ///      returns Done WITHOUT calling enable_notification.
+    ///   3. Re-kick the poisoned queue → early-return at the top of
+    ///      drain produces ZERO additional bumps (per-event
+    ///      counter).
+    ///   4. No reads completed in either kick (the malformed chain
+    ///      is never popped).
+    ///   5. A virtio reset clears the poison: rebind, build a real
+    ///      chain, kick → it services normally and bumps
+    ///      `reads_completed`.
+    ///
+    /// The test is the only mechanical guarantee that an unbounded
+    /// adversarial guest cannot livelock the device.
+    #[test]
+    fn hostile_avail_idx_poisons_queue_until_reset() {
+        let cap = 4096u64;
+        let f = make_backed_file_with_pattern(cap, 0xAB);
+        let mut dev = VirtioBlk::new(f, cap, DiskThrottle::default());
+        let mem = make_chain_test_mem();
+        // MockSplitQueue size and the device's negotiated queue
+        // size are independent. The mock's allocations only need to
+        // hold descriptor table entries for the planted chain; the
+        // poison threshold is set by the device's negotiated
+        // queue.size, which `wire_device_to_mock` sets to
+        // `QUEUE_MAX_SIZE` (256). Pick a mock size that holds the
+        // 3-descriptor chain we plant for the post-reset success
+        // case.
+        let mock = MockSplitQueue::create(&mem, GuestAddress(0), 16);
+        let header_addr = GuestAddress(0x4000);
+        let data_addr = GuestAddress(0x5000);
+        let status_addr = GuestAddress(0x6000);
+        write_blk_header(&mem, header_addr, VIRTIO_BLK_T_IN, 0);
+        let descs = [
+            RawDescriptor::from(SplitDescriptor::new(
+                header_addr.0,
+                VIRTIO_BLK_OUTHDR_SIZE as u32,
+                virtio_bindings::bindings::virtio_ring::VRING_DESC_F_NEXT as u16,
+                1,
+            )),
+            RawDescriptor::from(SplitDescriptor::new(
+                data_addr.0,
+                512,
+                VRING_DESC_F_WRITE as u16
+                    | virtio_bindings::bindings::virtio_ring::VRING_DESC_F_NEXT as u16,
+                2,
+            )),
+            RawDescriptor::from(SplitDescriptor::new(
+                status_addr.0,
+                1,
+                VRING_DESC_F_WRITE as u16,
+                0,
+            )),
+        ];
+        // Build a real chain so the descriptor table is populated.
+        // We'll then overwrite the avail.idx with a bogus value to
+        // trigger the bounds check; the chain's actual contents are
+        // irrelevant because the poison fires before iter() yields
+        // a chain head.
+        mock.build_desc_chain(&descs).expect("build chain (consumed by hostile-idx test)");
+        dev.set_mem(mem.clone());
+        wire_device_to_mock(&mut dev, &mock);
+
+        // Phase A — sanity: counter starts at zero.
+        assert_eq!(
+            dev.counters().invalid_avail_idx_count(),
+            0,
+            "fresh device must have zero InvalidAvailRingIndex events",
+        );
+
+        // Phase B — plant a bogus avail.idx. avail.idx lives at
+        // avail_addr + 2 (after the 2-byte flags field), per
+        // virtio-v1.2 §2.7.6. The device's negotiated queue.size is
+        // 256 (QUEUE_MAX_SIZE); planting 1000 makes the bounds
+        // check `(1000 - next_avail).0 > 256` fire — even the
+        // smallest possible difference (next_avail = 1 from the
+        // build_desc_chain bump) gives 999 > 256, well clear of
+        // the threshold.
+        let avail_idx_addr = mock.avail_addr().checked_add(2).unwrap();
+        mem.write_obj(1000u16, avail_idx_addr).unwrap();
+
+        // Phase C — kick. The drain loop must detect the poison,
+        // bump the counter, set the flag, and bail without looping.
+        let pre_reads = dev.counters().reads_completed();
+        write_reg(&mut dev, VIRTIO_MMIO_QUEUE_NOTIFY, REQ_QUEUE as u32);
+        assert_eq!(
+            dev.counters().invalid_avail_idx_count(),
+            1,
+            "first hostile-idx kick must bump invalid_avail_idx_count exactly once",
+        );
+        assert_eq!(
+            dev.counters().reads_completed(),
+            pre_reads,
+            "no reads must be serviced — the poisoned queue is structurally broken",
+        );
+
+        // Phase D — re-kick the poisoned queue. The early-return
+        // gate at the top of drain_bracket_impl must short-circuit
+        // before re-reading avail.idx, so the counter does NOT
+        // re-bump.
+        write_reg(&mut dev, VIRTIO_MMIO_QUEUE_NOTIFY, REQ_QUEUE as u32);
+        assert_eq!(
+            dev.counters().invalid_avail_idx_count(),
+            1,
+            "subsequent kicks against a poisoned queue MUST NOT \
+             re-bump the counter — the per-event semantics rely on \
+             the queue_poisoned flag short-circuiting before the \
+             iter() call",
+        );
+
+        // Phase E — virtio reset clears the poison. Model the
+        // guest's re-bind: zero avail.idx and used.idx in guest
+        // memory (per virtio-v1.2 §2.7.6/§2.7.8 ring layouts), walk
+        // the FSM back to DRIVER_OK, plant a fresh chain, and kick.
+        // The drain must service the chain normally — no poison,
+        // no counter bumps for InvalidAvailRingIndex.
+        write_reg(&mut dev, VIRTIO_MMIO_STATUS, 0);
+        let used_idx_addr = mock.used_addr().checked_add(2).unwrap();
+        mem.write_obj(0u16, avail_idx_addr).unwrap();
+        mem.write_obj(0u16, used_idx_addr).unwrap();
+        // Plant a fresh status sentinel so we can detect the
+        // post-reset write.
+        mem.write_slice(&[0xEEu8], status_addr).unwrap();
+        // Re-build the chain. With avail.idx zeroed,
+        // build_desc_chain stores the chain at avail.ring[0] and
+        // bumps avail.idx to 1 — what a freshly re-bound guest
+        // does.
+        mock.build_desc_chain(&descs).expect("build chain post-reset");
+        wire_device_to_mock(&mut dev, &mock);
+        write_reg(&mut dev, VIRTIO_MMIO_QUEUE_NOTIFY, REQ_QUEUE as u32);
+
+        let mut s = [0u8; 1];
+        mem.read_slice(&mut s, status_addr).unwrap();
+        assert_eq!(
+            s[0],
+            VIRTIO_BLK_S_OK as u8,
+            "post-reset chain must complete S_OK — the queue_poisoned \
+             flag must have cleared in reset_engine_inline",
+        );
+        assert_eq!(
+            dev.counters().reads_completed(),
+            pre_reads + 1,
+            "post-reset chain must bump reads_completed",
+        );
+        // The cumulative counter for poison events persists across
+        // reset — operators need lifetime-event visibility to detect
+        // repeated hostile behavior.
+        assert_eq!(
+            dev.counters().invalid_avail_idx_count(),
+            1,
+            "invalid_avail_idx_count is cumulative across reset; only \
+             the per-worker poison flag clears",
         );
     }
 
@@ -11035,6 +11560,216 @@ mod tests {
         );
     }
 
+    /// Companion to `enable_notification_err_breaks_outer_and_fires_irqfd_fail_safe`:
+    /// pins the OTHER `enable_notification` call site, the
+    /// post-stall arm. When the chain stalls on throttle exhaustion,
+    /// the inner pop loop breaks WITHOUT publishing
+    /// (`signal_needed` stays false), the outer-loop stall arm calls
+    /// `enable_notification` to re-arm guest-side wakeups, and on
+    /// Err logs a warn and breaks 'outer cleanly. Distinct from the
+    /// Done-path enable_notification (covered above) because the
+    /// stall path skips the post-drain `signal_needed` block — no
+    /// `interrupt_status` bit set, no irqfd write, no `add_used`.
+    ///
+    /// Setup mirrors the Done-path test for guest-memory layout —
+    /// multi-region GuestMemoryMmap with a hole at the
+    /// `avail_event` GPA, used ring placed via `used_override_addr`
+    /// so its trailing 2-byte `avail_event` write lands in the
+    /// unmapped hole — but adds a drained 1-iops throttle so the
+    /// chain stalls instead of completing. The single chain pops,
+    /// the throttle gate fails, the stall path calls
+    /// `enable_notification` whose `set_avail_event` write hits
+    /// the hole and returns InvalidGuestAddress.
+    ///
+    /// Stall-path invariants:
+    ///
+    ///   - `throttled_count` == 1 — the stall event was recorded.
+    ///   - `currently_throttled_gauge` == 1 — the false→true
+    ///     transition fired (per the gauge transition table).
+    ///   - `state.currently_stalled` == true — the head is pinned
+    ///     in the avail ring awaiting refill.
+    ///   - used.idx == 0 (no add_used).
+    ///   - irq_evt unsignalled — `signal_needed` stayed false, so
+    ///     the post-drain V8 block was not entered.
+    ///   - interrupt_status MMIO bit clear (same reason).
+    ///   - status sentinel survives — no publish_completion ran.
+    ///   - Queue cursor rewound to 0 (set_next_avail rolled the
+    ///     pop back so the chain re-pops on retry).
+    ///
+    /// A regression that propagated the enable_notification Err
+    /// instead of swallowing-and-breaking would either re-enter the
+    /// outer loop (livelock) or fail to record the stall counter —
+    /// both observable via the assertions below.
+    #[test]
+    fn enable_notification_err_on_stall_path_breaks_outer_cleanly() {
+        let cap = 4096u64;
+        let f = make_backed_file_with_pattern(cap, 0xAB);
+        let throttle = DiskThrottle {
+            iops: std::num::NonZeroU64::new(1),
+            bytes_per_sec: None,
+            iops_burst_capacity: None,
+            bytes_burst_capacity: None,
+        };
+        let mut dev = VirtioBlk::new(f, cap, throttle);
+
+        // Multi-region mem: [0, 0x20000) and [0x30000, 0x40000).
+        // The hole [0x20000, 0x30000) covers the avail_event GPA.
+        // Same layout as the Done-path test so the
+        // `avail_event = used_addr + 132` (size=16) calculation
+        // produces 0x20000 — the boundary, in the hole.
+        let mem = GuestMemoryMmap::from_ranges(&[
+            (GuestAddress(0), 0x20000),
+            (GuestAddress(0x30000), 0x10000),
+        ])
+        .expect("create multi-region guest mem");
+        let qsize = 16u16;
+        let mock = MockSplitQueue::create(&mem, GuestAddress(0), qsize);
+
+        let header_addr = GuestAddress(0x4000);
+        let data_addr = GuestAddress(0x5000);
+        let status_addr = GuestAddress(0x6000);
+        // Plant a sentinel at the status byte — survival of this
+        // byte through the stall is the key invariant (no
+        // publish_completion ran).
+        mem.write_slice(&[0xEEu8], status_addr).unwrap();
+        write_blk_header(&mem, header_addr, VIRTIO_BLK_T_IN, 0);
+        let descs = [
+            RawDescriptor::from(SplitDescriptor::new(
+                header_addr.0,
+                VIRTIO_BLK_OUTHDR_SIZE as u32,
+                0,
+                0,
+            )),
+            RawDescriptor::from(SplitDescriptor::new(
+                data_addr.0,
+                512,
+                VRING_DESC_F_WRITE as u16,
+                0,
+            )),
+            RawDescriptor::from(SplitDescriptor::new(
+                status_addr.0,
+                1,
+                VRING_DESC_F_WRITE as u16,
+                0,
+            )),
+        ];
+        mock.build_desc_chain(&descs).expect("build chain");
+        dev.set_mem(mem.clone());
+        // used_override = 0x1FF7C: with size=16, the used-ring body
+        // (4-byte header + 16 * 8-byte elements = 132 bytes) ends
+        // at exactly 0x20000, and the trailing avail_event u16
+        // store at 0x20000..0x20002 lies in the unmapped hole.
+        // Same address as the Done-path test by design.
+        wire_device_to_mock_with_event_idx(
+            &mut dev,
+            &mock,
+            qsize,
+            GuestAddress(0x1FF7C),
+        );
+
+        // Drain the iops bucket so the chain stalls. With iops=1
+        // and capacity=1, a single consume(1) takes the only token;
+        // pin last_refill so the next can_consume sees an empty
+        // bucket (no passive wall-clock refill in microseconds
+        // between this setup and the QUEUE_NOTIFY).
+        let now = std::time::Instant::now();
+        dev.worker
+            .state_mut()
+            .ops_bucket
+            .set_last_refill_for_test(now);
+        assert!(dev.worker.state_mut().ops_bucket.consume(1));
+        dev.worker
+            .state_mut()
+            .ops_bucket
+            .set_last_refill_for_test(now);
+        assert!(
+            !dev.worker.state_mut().ops_bucket.can_consume(1),
+            "precondition: ops bucket must be drained so the chain stalls",
+        );
+
+        // Pre-notify: every observable surface is at its baseline.
+        let c = dev.counters();
+        assert_eq!(c.throttled_count.load(Ordering::Relaxed), 0);
+        assert_eq!(c.currently_throttled_gauge.load(Ordering::Relaxed), 0);
+        assert_eq!(c.reads_completed.load(Ordering::Relaxed), 0);
+        assert_eq!(c.io_errors.load(Ordering::Relaxed), 0);
+        assert!(!dev.worker.state().currently_stalled);
+        assert!(
+            dev.irq_evt.read().is_err(),
+            "irq_evt must be unsignalled before notify",
+        );
+
+        // Fire QUEUE_NOTIFY. Inner pop returns the chain, throttle
+        // gate fails, stall_outcome = Some(_), break inner. Outer
+        // stall arm calls enable_notification → Err on the unmapped
+        // avail_event store → log warn, break 'outer. No
+        // publish_completion ran; signal_needed stayed false; the
+        // post-drain V8 block did not fire. If the bail were
+        // missing (continued outer loop on persistent Err), this
+        // call would hang.
+        write_reg(&mut dev, VIRTIO_MMIO_QUEUE_NOTIFY, REQ_QUEUE as u32);
+
+        // Status sentinel survives — no publish_completion ran.
+        let mut s = [0u8; 1];
+        mem.read_slice(&mut s, status_addr).unwrap();
+        assert_eq!(
+            s[0], 0xEE,
+            "status byte must remain at sentinel — stall must not write status",
+        );
+
+        // used.idx unchanged at 0 — no add_used.
+        let used_idx: u16 = mem
+            .read_obj(GuestAddress(0x1FF7C).checked_add(2).unwrap())
+            .expect("read device used.idx at override addr");
+        assert_eq!(
+            used_idx, 0,
+            "used.idx must be 0 — stall must skip add_used",
+        );
+
+        // Stall counters: event recorded, gauge incremented on
+        // false→true, reads_completed untouched.
+        assert_eq!(
+            c.throttled_count.load(Ordering::Relaxed),
+            1,
+            "stall event must be recorded once",
+        );
+        assert_eq!(
+            c.currently_throttled_gauge.load(Ordering::Relaxed),
+            1,
+            "gauge must increment on the false→true transition",
+        );
+        assert_eq!(c.reads_completed.load(Ordering::Relaxed), 0);
+        assert_eq!(c.io_errors.load(Ordering::Relaxed), 0);
+        assert!(
+            dev.worker.state().currently_stalled,
+            "currently_stalled flag must be true post-stall",
+        );
+
+        // V8 post-drain block did not run — signal_needed stayed
+        // false. interrupt_status bit clear, irqfd unsignalled.
+        assert_eq!(
+            dev.interrupt_status.load(Ordering::Acquire) & VIRTIO_MMIO_INT_VRING,
+            0,
+            "interrupt_status bit must be clear — stall does not \
+             enter the V8 post-drain block",
+        );
+        assert!(
+            dev.irq_evt.read().is_err(),
+            "irq_evt must be unsignalled — stall does not fire irqfd",
+        );
+
+        // Queue cursor rewound: stall path runs
+        // `set_next_avail(prev.wrapping_sub(1))` so the next pop
+        // returns the same head. After one pop+rewind on a queue
+        // with one chain, next_avail is back at 0.
+        assert_eq!(
+            dev.worker.queues[REQ_QUEUE].next_avail(),
+            0,
+            "queue cursor must be rewound to 0 — set_next_avail \
+             rolled the pop back so the chain re-pops on retry",
+        );
+    }
+
     /// Fragmented header. The first descriptor is shorter
     /// than VIRTIO_BLK_OUTHDR_SIZE — the device cannot read a
     /// full header from desc[0] and must reject. Chain layout:
@@ -12910,6 +13645,7 @@ mod tests {
             read_only: false,
             counters: Arc::new(VirtioBlkCounters::default()),
             currently_stalled: false,
+            queue_poisoned: false,
         }
     }
 
@@ -13020,6 +13756,120 @@ mod tests {
             JoinWithTimeoutOutcome::HelperSpawnFailed => "HelperSpawnFailed",
             JoinWithTimeoutOutcome::HelperDisconnected => "HelperDisconnected",
         }
+    }
+
+    /// `RESET_JOIN_TIMEOUT` matches `DROP_JOIN_TIMEOUT` (1 s) so a
+    /// reset on the vCPU thread cannot block longer than the
+    /// destructor would. Pin the equality so a future tweak that
+    /// shortens one but not the other surfaces here. The "must
+    /// match" framing matters because the freeze coordinator's
+    /// SIGRTMIN rendezvous (30 s wall budget at the coordinator
+    /// level — see `FREEZE_RENDEZVOUS_TIMEOUT` in `src/vmm/mod.rs`)
+    /// is sensitive to vCPU-thread blocking budgets; both
+    /// `Drop` and `reset()` paths run on a vCPU thread, so
+    /// asymmetric budgets would let one path miss the rendezvous
+    /// while the other doesn't.
+    #[test]
+    fn reset_join_timeout_matches_drop_budget() {
+        assert_eq!(
+            RESET_JOIN_TIMEOUT, DROP_JOIN_TIMEOUT,
+            "RESET_JOIN_TIMEOUT must equal DROP_JOIN_TIMEOUT — both \
+             paths run on a vCPU thread that the freeze coordinator \
+             may target with SIGRTMIN; asymmetric budgets would let \
+             reset() miss a rendezvous Drop wouldn't, or vice versa",
+        );
+        // Pin the absolute value so a future refactor that lifts
+        // both into a single shared symbol (or shortens both
+        // together) still flags here. 1 s is the documented value
+        // — see RESET_JOIN_TIMEOUT and DROP_JOIN_TIMEOUT doc
+        // comments for the rationale.
+        assert_eq!(RESET_JOIN_TIMEOUT, Duration::from_secs(1));
+    }
+
+    /// Stand-in for the production `reset()` join behaviour: when
+    /// the worker thread is wedged in a blocking syscall and
+    /// doesn't observe `stop_fd`, `join_worker_with_timeout` with
+    /// the production `RESET_JOIN_TIMEOUT` budget MUST return
+    /// `TimedOut` rather than blocking the calling thread
+    /// indefinitely. The vCPU-protection invariant in
+    /// `stop_worker_and_reclaim_state` rests on this.
+    ///
+    /// Why this isn't a direct `reset()` test:
+    /// `stop_worker_and_reclaim_state` is `cfg(not(test))`-only,
+    /// because in `cfg(test)` the device runs in `Inline` engine
+    /// mode (no worker thread, no `stop_fd`). Driving the
+    /// production `reset()` path from a unit test would require
+    /// stitching cfgs together — instead we exercise the
+    /// underlying mechanism (`join_worker_with_timeout`) at the
+    /// budget the production path uses, so a regression that
+    /// shrunk the budget below realistic worker drain times would
+    /// surface here as a flake; a regression that removed the
+    /// timeout entirely would surface as a test hang past the
+    /// nextest per-test ceiling.
+    ///
+    /// To keep the test fast (nextest budget ≪ 1 s per test on
+    /// typical CI), this uses a child timeout < `RESET_JOIN_TIMEOUT`
+    /// — the upper-bound assertion below pins the actual production
+    /// budget against what `RESET_JOIN_TIMEOUT` enforces.
+    /// `reset_join_timeout_matches_drop_budget` (above) pins the
+    /// 1 s value separately.
+    #[test]
+    fn reset_join_timeout_against_wedged_worker_returns_timed_out() {
+        use std::sync::mpsc as test_mpsc;
+
+        // Worker thread that never exits — blocks on a channel
+        // receive whose sender is held by this test until the
+        // test's scope drops (after the assertion). `stop_fd` has
+        // no analogue in this test harness, so the wedge models
+        // a worker stuck in `pread`/`pwrite` that doesn't check
+        // `stop_fd`.
+        let (_keep_alive_tx, wedge_rx) = test_mpsc::channel::<()>();
+        let handle = std::thread::Builder::new()
+            .name("ktstr-vblk-test-wedged-reset".to_string())
+            .spawn(move || -> BlkWorkerState {
+                // Block forever (until test scope drops _keep_alive_tx).
+                let _ = wedge_rx.recv();
+                dummy_worker_state()
+            })
+            .expect("spawn wedged worker");
+
+        // Use a SHORT budget for the test to keep nextest fast,
+        // but assert below that the budget is strictly less than
+        // RESET_JOIN_TIMEOUT (so the test can never accidentally
+        // outlast the production budget).
+        const TEST_TIMEOUT: Duration = Duration::from_millis(100);
+        assert!(
+            TEST_TIMEOUT < RESET_JOIN_TIMEOUT,
+            "test budget must be smaller than RESET_JOIN_TIMEOUT \
+             so the test stays fast; a future RESET_JOIN_TIMEOUT \
+             tightening below 100 ms would require updating \
+             TEST_TIMEOUT here",
+        );
+
+        let start = Instant::now();
+        let outcome = join_worker_with_timeout(handle, TEST_TIMEOUT);
+        let elapsed = start.elapsed();
+
+        // The wedged worker did not exit; outcome must be TimedOut.
+        assert!(
+            matches!(outcome, JoinWithTimeoutOutcome::TimedOut),
+            "wedged worker must yield TimedOut, got {:?}",
+            outcome_label(&outcome)
+        );
+        // The bounded join MUST have returned within the budget,
+        // not blocked indefinitely. Allow up to 2x slack for
+        // recv_timeout's underlying clock + thread scheduling
+        // jitter on slow CI.
+        assert!(
+            elapsed < TEST_TIMEOUT * 2,
+            "join_worker_with_timeout took {elapsed:?} for a \
+             wedged worker (budget {TEST_TIMEOUT:?}); the bound \
+             must hold so the production reset() path doesn't \
+             pin the vCPU thread when the worker is stuck"
+        );
+        // _keep_alive_tx drops here, releasing the wedge channel
+        // so the worker thread can finally exit and reclaim its
+        // resources for the test process.
     }
 
     // ----------------------------------------------------------------
@@ -14064,6 +14914,317 @@ mod tests {
             "no chain completed; reads_completed must stay 0",
         );
     }
+
+    /// Hostile-guest defense: avail.idx more than queue.size ahead
+    /// of next_avail must trip `Error::InvalidAvailRingIndex`
+    /// from `Queue::iter` (the structural-invariant check at
+    /// queue.rs:707-709), poison the queue, bump
+    /// `invalid_avail_idx_count`, and bail without calling
+    /// `enable_notification`. Subsequent kicks against the
+    /// poisoned queue are no-ops — the counter stays at 1 and
+    /// the worker does NOT spin (the original livelock the
+    /// `pop_descriptor_chain` swallowed-error pattern produced).
+    #[test]
+    fn inflated_avail_idx_poisons_queue_no_livelock() {
+        use std::num::Wrapping;
+        let cap = 4096u64;
+        let f = make_backed_file_with_pattern(cap, 0xAB);
+        let mut dev = VirtioBlk::new(f, cap, DiskThrottle::default());
+        let mem = make_chain_test_mem();
+        let queue_size: u16 = 16;
+        let mock = MockSplitQueue::create(&mem, GuestAddress(0), queue_size);
+        // Plant one well-formed chain so the avail ring has real
+        // content (build_desc_chain writes the ring entry), then
+        // OVERWRITE avail.idx to > next_avail + queue_size. The
+        // `iter()` invariant `idx - next_avail <= queue.size`
+        // (queue.rs:707) trips on that mismatch.
+        let header_addr = GuestAddress(0x4000);
+        let data_addr = GuestAddress(0x5000);
+        let status_addr = GuestAddress(0x6000);
+        write_blk_header(&mem, header_addr, VIRTIO_BLK_T_IN, 0);
+        let descs = [
+            RawDescriptor::from(SplitDescriptor::new(
+                header_addr.0,
+                VIRTIO_BLK_OUTHDR_SIZE as u32,
+                0,
+                0,
+            )),
+            RawDescriptor::from(SplitDescriptor::new(
+                data_addr.0,
+                512,
+                VRING_DESC_F_WRITE as u16,
+                0,
+            )),
+            RawDescriptor::from(SplitDescriptor::new(
+                status_addr.0,
+                1,
+                VRING_DESC_F_WRITE as u16,
+                0,
+            )),
+        ];
+        mock.build_desc_chain(&descs).expect("build chain");
+        dev.set_mem(mem.clone());
+        wire_device_to_mock(&mut dev, &mock);
+
+        // Hostile poison: avail.idx = next_avail + queue.size + 1
+        // (the strict-greater-than threshold in
+        // `AvailIter::new`, queue.rs:707). The DEVICE's
+        // negotiated queue.size is `QUEUE_MAX_SIZE` (256, set by
+        // wire_device_to_mock via QUEUE_NUM), independent of the
+        // mock's avail-ring length (16). The check fires before
+        // any ring read, so we don't need a 257-element mock
+        // ring — only the avail.idx field needs to land out of
+        // bounds relative to the device's 256-sized window.
+        let bad_idx = Wrapping(0u16) + Wrapping(QUEUE_MAX_SIZE) + Wrapping(1u16);
+        mock.avail().idx().store(u16::to_le(bad_idx.0));
+
+        // Fire QUEUE_NOTIFY — `process_requests` calls the inline
+        // drain, which observes InvalidAvailRingIndex from
+        // `iter()`, poisons the queue, bumps the counter, and
+        // bails. MUST return without spinning. (cfg(test) drains
+        // synchronously, so a livelock would hang the test until
+        // the harness timeout.)
+        write_reg(&mut dev, VIRTIO_MMIO_QUEUE_NOTIFY, REQ_QUEUE as u32);
+
+        let c = dev.counters();
+        assert_eq!(
+            c.invalid_avail_idx_count.load(Ordering::Relaxed),
+            1,
+            "first hostile drain must bump invalid_avail_idx_count once",
+        );
+        assert!(
+            dev.worker.state().queue_poisoned,
+            "queue_poisoned must be set after InvalidAvailRingIndex",
+        );
+        // No IO completed.
+        assert_eq!(c.reads_completed.load(Ordering::Relaxed), 0);
+        assert_eq!(c.writes_completed.load(Ordering::Relaxed), 0);
+        // No throttle stall counted (we never reached the throttle).
+        assert_eq!(c.throttled_count.load(Ordering::Relaxed), 0);
+        assert_eq!(c.currently_throttled_gauge.load(Ordering::Relaxed), 0);
+
+        // Subsequent kicks must be NO-OPs: the poison gate at the
+        // top of `drain_bracket_impl` short-circuits without
+        // calling `iter()`, so the counter does NOT advance and
+        // the worker does NOT loop.
+        for _ in 0..5 {
+            write_reg(&mut dev, VIRTIO_MMIO_QUEUE_NOTIFY, REQ_QUEUE as u32);
+        }
+        assert_eq!(
+            c.invalid_avail_idx_count.load(Ordering::Relaxed),
+            1,
+            "poisoned queue must reject subsequent kicks without re-bumping \
+             the counter (per-event semantic + flag short-circuit)",
+        );
+        assert!(
+            dev.worker.state().queue_poisoned,
+            "poison flag stays set across re-kicks",
+        );
+    }
+
+    /// A virtio reset is the only documented escape from the
+    /// queue-poisoned state. After reset, the device must accept
+    /// fresh chains and bump per-IO counters again — but
+    /// `invalid_avail_idx_count` is intentionally cumulative
+    /// across resets so operators can detect repeated hostile
+    /// behavior.
+    #[test]
+    fn poisoned_queue_clears_on_reset() {
+        use std::num::Wrapping;
+        let cap = 4096u64;
+        let f = make_backed_file_with_pattern(cap, 0xAB);
+        let mut dev = VirtioBlk::new(f, cap, DiskThrottle::default());
+        let mem = make_chain_test_mem();
+        let queue_size: u16 = 16;
+        let mock = MockSplitQueue::create(&mem, GuestAddress(0), queue_size);
+        // Plant one valid chain so avail-ring entries exist.
+        let header_addr = GuestAddress(0x4000);
+        let data_addr = GuestAddress(0x5000);
+        let status_addr = GuestAddress(0x6000);
+        write_blk_header(&mem, header_addr, VIRTIO_BLK_T_IN, 0);
+        let descs = [
+            RawDescriptor::from(SplitDescriptor::new(
+                header_addr.0,
+                VIRTIO_BLK_OUTHDR_SIZE as u32,
+                0,
+                0,
+            )),
+            RawDescriptor::from(SplitDescriptor::new(
+                data_addr.0,
+                512,
+                VRING_DESC_F_WRITE as u16,
+                0,
+            )),
+            RawDescriptor::from(SplitDescriptor::new(
+                status_addr.0,
+                1,
+                VRING_DESC_F_WRITE as u16,
+                0,
+            )),
+        ];
+        mock.build_desc_chain(&descs).expect("build chain");
+        dev.set_mem(mem.clone());
+        wire_device_to_mock(&mut dev, &mock);
+
+        // Trip the poison. The DEVICE's negotiated queue.size is
+        // QUEUE_MAX_SIZE (set by wire_device_to_mock via QUEUE_NUM),
+        // not the mock's avail-ring length — overshoot QUEUE_MAX_SIZE
+        // so `AvailIter::new`'s `idx - next_avail > queue.size`
+        // check fires on the device's view of the queue.
+        let bad_idx = Wrapping(0u16) + Wrapping(QUEUE_MAX_SIZE) + Wrapping(1u16);
+        mock.avail().idx().store(u16::to_le(bad_idx.0));
+        write_reg(&mut dev, VIRTIO_MMIO_QUEUE_NOTIFY, REQ_QUEUE as u32);
+        assert!(dev.worker.state().queue_poisoned);
+        let c = dev.counters();
+        assert_eq!(c.invalid_avail_idx_count.load(Ordering::Relaxed), 1);
+
+        // Drive the device through a virtio reset (status=0 walks
+        // the FSM back to driver-init state and runs
+        // `reset_engine_inline` which clears `queue_poisoned`).
+        write_reg(&mut dev, VIRTIO_MMIO_STATUS, 0);
+        assert!(
+            !dev.worker.state().queue_poisoned,
+            "reset must clear queue_poisoned",
+        );
+        // The cumulative counter survives the reset (operator
+        // visibility across resets).
+        assert_eq!(
+            c.invalid_avail_idx_count.load(Ordering::Relaxed),
+            1,
+            "invalid_avail_idx_count is cumulative across resets",
+        );
+
+        // Re-wire to a fresh mock with a single legitimate chain.
+        // After reset the device's `next_avail` is back to 0 and
+        // the queue config is re-published via wire_device_to_mock.
+        let mock2 = MockSplitQueue::create(&mem, GuestAddress(0), queue_size);
+        let header_addr2 = GuestAddress(0x7000);
+        let data_addr2 = GuestAddress(0x8000);
+        let status_addr2 = GuestAddress(0x9000);
+        write_blk_header(&mem, header_addr2, VIRTIO_BLK_T_IN, 0);
+        let descs2 = [
+            RawDescriptor::from(SplitDescriptor::new(
+                header_addr2.0,
+                VIRTIO_BLK_OUTHDR_SIZE as u32,
+                0,
+                0,
+            )),
+            RawDescriptor::from(SplitDescriptor::new(
+                data_addr2.0,
+                512,
+                VRING_DESC_F_WRITE as u16,
+                0,
+            )),
+            RawDescriptor::from(SplitDescriptor::new(
+                status_addr2.0,
+                1,
+                VRING_DESC_F_WRITE as u16,
+                0,
+            )),
+        ];
+        mock2.build_desc_chain(&descs2).expect("build chain after reset");
+        wire_device_to_mock(&mut dev, &mock2);
+        write_reg(&mut dev, VIRTIO_MMIO_QUEUE_NOTIFY, REQ_QUEUE as u32);
+
+        // The fresh chain completed: poison gate cleared, IO
+        // serviced, no new poison events.
+        assert_eq!(c.reads_completed.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            c.invalid_avail_idx_count.load(Ordering::Relaxed),
+            1,
+            "post-reset legitimate IO must NOT re-trip poison counter",
+        );
+        assert!(
+            !dev.worker.state().queue_poisoned,
+            "queue stays unpoisoned across legitimate post-reset IO",
+        );
+    }
+
+    /// The poison gate sits at the TOP of `drain_bracket_impl`,
+    /// BEFORE `disable_notification` and BEFORE `iter()`. A
+    /// regression that moves the gate below
+    /// `disable_notification` would re-set
+    /// `VRING_USED_F_NO_NOTIFY` on the legacy path on every kick
+    /// — observable as `used.flags` flipping across kicks against
+    /// a poisoned queue. This test pins the expected
+    /// `used.flags` stability post-poison: subsequent kicks must
+    /// not modify the field.
+    #[test]
+    fn poisoned_queue_kicks_dont_touch_used_flags() {
+        use std::num::Wrapping;
+        let cap = 4096u64;
+        let f = make_backed_file_with_pattern(cap, 0xAB);
+        let mut dev = VirtioBlk::new(f, cap, DiskThrottle::default());
+        let mem = make_chain_test_mem();
+        let queue_size: u16 = 16;
+        let mock = MockSplitQueue::create(&mem, GuestAddress(0), queue_size);
+        let header_addr = GuestAddress(0x4000);
+        let data_addr = GuestAddress(0x5000);
+        let status_addr = GuestAddress(0x6000);
+        write_blk_header(&mem, header_addr, VIRTIO_BLK_T_IN, 0);
+        let descs = [
+            RawDescriptor::from(SplitDescriptor::new(
+                header_addr.0,
+                VIRTIO_BLK_OUTHDR_SIZE as u32,
+                0,
+                0,
+            )),
+            RawDescriptor::from(SplitDescriptor::new(
+                data_addr.0,
+                512,
+                VRING_DESC_F_WRITE as u16,
+                0,
+            )),
+            RawDescriptor::from(SplitDescriptor::new(
+                status_addr.0,
+                1,
+                VRING_DESC_F_WRITE as u16,
+                0,
+            )),
+        ];
+        mock.build_desc_chain(&descs).expect("build chain");
+        dev.set_mem(mem.clone());
+        wire_device_to_mock(&mut dev, &mock);
+
+        // Trip the poison. The DEVICE's negotiated queue.size is
+        // QUEUE_MAX_SIZE (set by wire_device_to_mock via QUEUE_NUM),
+        // not the mock's avail-ring length — overshoot QUEUE_MAX_SIZE
+        // so `AvailIter::new`'s `idx - next_avail > queue.size`
+        // check fires on the device's view of the queue.
+        let bad_idx = Wrapping(0u16) + Wrapping(QUEUE_MAX_SIZE) + Wrapping(1u16);
+        mock.avail().idx().store(u16::to_le(bad_idx.0));
+        write_reg(&mut dev, VIRTIO_MMIO_QUEUE_NOTIFY, REQ_QUEUE as u32);
+        assert!(dev.worker.state().queue_poisoned);
+
+        // After the poison drain, used.flags is whatever the FINAL
+        // state of the (now-bailed) outer bracket left it. Snapshot
+        // it here and pin its STABILITY across the subsequent
+        // re-kicks.
+        let used_flags_after_poison: u16 = mem
+            .read_obj(mock.used_addr())
+            .expect("read used.flags");
+
+        // Kick five more times. Each must short-circuit at the
+        // poison gate without re-touching used.flags.
+        for _ in 0..5 {
+            write_reg(&mut dev, VIRTIO_MMIO_QUEUE_NOTIFY, REQ_QUEUE as u32);
+            let f: u16 = mem
+                .read_obj(mock.used_addr())
+                .expect("read used.flags post-kick");
+            assert_eq!(
+                f, used_flags_after_poison,
+                "poisoned queue kicks must not modify used.flags \
+                 (regression: gate moved below disable_notification)",
+            );
+        }
+
+        let c = dev.counters();
+        assert_eq!(
+            c.invalid_avail_idx_count.load(Ordering::Relaxed),
+            1,
+            "no additional poison events from re-kicks",
+        );
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -14096,16 +15257,18 @@ mod tests {
 mod proptest_tests {
     use super::{
         DiskThrottle, REQ_QUEUE, VIRTIO_BLK_OUTHDR_SIZE, VIRTIO_BLK_S_IOERR,
-        VIRTIO_BLK_S_OK, VIRTIO_BLK_S_UNSUPP, VIRTIO_MMIO_QUEUE_NOTIFY, VirtioBlk,
-        VirtioBlkOutHdr,
+        VIRTIO_BLK_S_OK, VIRTIO_BLK_S_UNSUPP, VIRTIO_BLK_T_FLUSH, VIRTIO_BLK_T_IN,
+        VIRTIO_BLK_T_OUT, VIRTIO_MMIO_QUEUE_NOTIFY, VirtioBlk, VirtioBlkOutHdr,
     };
     use proptest::prelude::*;
+    use std::num::NonZeroU64;
     use std::os::unix::fs::FileExt;
     use std::sync::atomic::Ordering;
     use tempfile::tempfile;
     use virtio_bindings::bindings::virtio_ring::{VRING_DESC_F_NEXT, VRING_DESC_F_WRITE};
     use virtio_queue::desc::{RawDescriptor, split::Descriptor as SplitDescriptor};
     use virtio_queue::mock::MockSplitQueue;
+    use virtio_queue::QueueT;
     use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryMmap};
 
     /// Shape of one random descriptor. `flags` is restricted to the three
@@ -14265,6 +15428,210 @@ mod proptest_tests {
             throttled: c.throttled_count.load(Ordering::Relaxed),
             io_errors: c.io_errors.load(Ordering::Relaxed),
         }
+    }
+
+    /// Build a fuzz fixture whose throttle is configured at iops=1
+    /// AND drained-at-construction so any chain reaching the
+    /// per-request throttle gate stalls. Used by the throttle-stall
+    /// proptest below to exercise the rollback path
+    /// (`set_next_avail` rewind, `currently_stalled` true→true /
+    /// false→true transitions, `throttled_count` event recording)
+    /// against random well-formed chains.
+    ///
+    /// Mirrors `build_fuzz_fixture` but swaps the throttle and
+    /// drains the bucket via the test-only `set_last_refill_for_test`
+    /// + `consume(1)` seam used by the hand-curated stall tests.
+    fn build_throttled_fuzz_fixture() -> (VirtioBlk, GuestMemoryMmap) {
+        let cap = 4096u64;
+        let f = tempfile().expect("create tempfile for throttled fuzz backing");
+        f.set_len(cap)
+            .expect("set tempfile length to fuzz cap");
+        f.write_at(&[0xAB; 4096], 0).expect("seed backing pattern");
+        let throttle = DiskThrottle {
+            iops: NonZeroU64::new(1),
+            bytes_per_sec: None,
+            iops_burst_capacity: None,
+            bytes_burst_capacity: None,
+        };
+        let mut dev = VirtioBlk::new(f, cap, throttle);
+        // Drain the bucket and pin last_refill so refill on the
+        // next consume yields 0 tokens. The proptest fires a
+        // single QUEUE_NOTIFY per case; pinning here keeps the
+        // bucket empty for the duration of the case regardless of
+        // how long the test runs.
+        let now = std::time::Instant::now();
+        dev.worker
+            .state_mut()
+            .ops_bucket
+            .set_last_refill_for_test(now);
+        assert!(dev.worker.state_mut().ops_bucket.consume(1));
+        dev.worker
+            .state_mut()
+            .ops_bucket
+            .set_last_refill_for_test(now);
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 1 << 20)])
+            .expect("create proptest guest mem");
+        (dev, mem)
+    }
+
+    /// One well-formed virtio-blk request chain shape: a request
+    /// type plus 1..=8 data segments. The proptest strategy
+    /// `well_formed_chain_strategy` materialises this into a
+    /// header + N data + status descriptor sequence in guest
+    /// memory at deterministic, well-mapped addresses.
+    ///
+    /// Distinct from `FuzzDesc` — that strategy generates
+    /// arbitrary RAW descriptors (random `addr`/`len`/`flags`/`next`)
+    /// to fuzz the chain-shape parser. This strategy instead
+    /// generates VALID chain shapes with random multiplicities
+    /// to fuzz the post-parse stall path: every chain produced
+    /// here is well-formed, so the throttle gate is the
+    /// dominant rejection point.
+    #[derive(Debug, Clone)]
+    struct WellFormedChain {
+        /// Request type. Restricted to T_IN/T_OUT/T_FLUSH so the
+        /// chain has predictable direction-flag requirements.
+        /// T_GET_ID is omitted because it's a metadata read with
+        /// a fixed 20-byte payload requirement that doesn't
+        /// stress the throttle dimensions tested here.
+        req_type: u32,
+        /// Starting sector. Bounded at `0..8` since the fuzz
+        /// fixture's capacity is 4096 bytes = 8 sectors. Out-of-
+        /// range sectors would surface as IOERR from the handler
+        /// (after throttle), but the throttle gate runs BEFORE
+        /// the handler — so an out-of-range sector still exercises
+        /// the stall path. Bounding the strategy keeps the fuzz
+        /// signal focused.
+        sector: u64,
+        /// Data-segment count. 1..=8 is the practical range that
+        /// stresses the data-length aggregation (`data_len.iter().sum()`)
+        /// and the throttle's bytes-bucket path. T_FLUSH ignores
+        /// this — it gets header + status only.
+        ///
+        /// Capped at 8 because the fuzz fixture's 4 KiB capacity
+        /// limits useful payload to 8 sectors (8 * 512 = 4096
+        /// bytes); larger counts would either overlap addresses
+        /// or trip the data-len > capacity gate before the
+        /// throttle fires.
+        n_data_segments: u32,
+        /// Per-segment length in 512-byte sectors (1..=4). The
+        /// total payload is bounded above by 8 sectors via the
+        /// strategy's interaction (n_data_segments × seg_sectors
+        /// ≤ 8 enforced at materialisation time by clamping the
+        /// final segment).
+        seg_sectors: u32,
+    }
+
+    fn well_formed_chain_strategy() -> impl Strategy<Value = WellFormedChain> {
+        // Use prop_oneof so each case has a clean mapping from
+        // the random input to a request type — distributing across
+        // the three types we care about uniformly.
+        let req_type = prop_oneof![
+            Just(VIRTIO_BLK_T_IN),
+            Just(VIRTIO_BLK_T_OUT),
+            Just(VIRTIO_BLK_T_FLUSH),
+        ];
+        (req_type, 0u64..8u64, 1u32..=8u32, 1u32..=4u32).prop_map(
+            |(req_type, sector, n_data_segments, seg_sectors)| WellFormedChain {
+                req_type,
+                sector,
+                n_data_segments,
+                seg_sectors,
+            },
+        )
+    }
+
+    /// Plant a `WellFormedChain` into guest memory + the mock
+    /// queue's descriptor table at well-mapped addresses. Returns
+    /// the status descriptor's GPA so the caller can verify
+    /// post-notify whether the device wrote to it (sentinel
+    /// survival).
+    ///
+    /// Memory layout (deterministic so failure shrinking is
+    /// reproducible):
+    ///   - 0x4000: header (16 bytes)
+    ///   - 0x5000: data segments (back-to-back, 0x200-aligned)
+    ///   - 0xC000: status byte (sentinel-pre-fill 0xEE)
+    ///
+    /// All within the 1 MiB guest memory region so the device
+    /// reaches the throttle gate without earlier guest-memory
+    /// rejection paths firing.
+    fn plant_well_formed_chain(
+        mem: &GuestMemoryMmap,
+        mock: &MockSplitQueue<GuestMemoryMmap>,
+        chain: &WellFormedChain,
+    ) -> GuestAddress {
+        let header_addr = GuestAddress(0x4000);
+        let status_addr = GuestAddress(0xC000);
+        // Plant the header.
+        let hdr = VirtioBlkOutHdr {
+            type_: chain.req_type,
+            _ioprio: 0,
+            sector: chain.sector,
+        };
+        mem.write_obj(hdr, header_addr).expect("plant header");
+        // Plant the status sentinel so post-notify we can
+        // detect whether the device wrote to it.
+        mem.write_slice(&[0xEEu8], status_addr)
+            .expect("plant status sentinel");
+
+        // Build the descriptor list. T_FLUSH carries no data
+        // segments — header + status only. T_IN/T_OUT carry
+        // chain.n_data_segments data descriptors of
+        // chain.seg_sectors * 512 bytes each, capped at the fuzz
+        // fixture's 4 KiB capacity.
+        let mut descs: Vec<RawDescriptor> = Vec::new();
+        let header_link_to = if chain.req_type == VIRTIO_BLK_T_FLUSH {
+            // Flush: header → status, single link.
+            1u16
+        } else {
+            // Read/write: header → data[0] → ... → data[N-1] → status.
+            1u16
+        };
+        descs.push(RawDescriptor::from(SplitDescriptor::new(
+            header_addr.0,
+            VIRTIO_BLK_OUTHDR_SIZE as u32,
+            VRING_DESC_F_NEXT as u16,
+            header_link_to,
+        )));
+
+        if chain.req_type != VIRTIO_BLK_T_FLUSH {
+            // Cap total payload at 8 sectors (4 KiB). The fuzz
+            // fixture's capacity is 4096 bytes; a chain whose
+            // data_len exceeds capacity would IOERR before the
+            // throttle gate. Keep the throttle gate as the
+            // dominant rejection so the test signal is clean.
+            let max_seg_count =
+                (8u32).saturating_div(chain.seg_sectors).max(1).min(chain.n_data_segments);
+            // Direction flag: T_IN data segments are device-
+            // writable; T_OUT data segments are device-readable.
+            let data_flag = if chain.req_type == VIRTIO_BLK_T_IN {
+                VRING_DESC_F_WRITE as u16
+            } else {
+                0u16
+            };
+            for i in 0..max_seg_count {
+                let seg_addr = 0x5000u64 + (i as u64 * 0x800);
+                let seg_len = chain.seg_sectors * 512;
+                let next_idx = i + 2; // header is 0, data starts at 1
+                descs.push(RawDescriptor::from(SplitDescriptor::new(
+                    seg_addr,
+                    seg_len,
+                    data_flag | VRING_DESC_F_NEXT as u16,
+                    next_idx as u16,
+                )));
+            }
+        }
+        // Status descriptor — always device-writable, length 1.
+        descs.push(RawDescriptor::from(SplitDescriptor::new(
+            status_addr.0,
+            1,
+            VRING_DESC_F_WRITE as u16,
+            0,
+        )));
+
+        mock.build_desc_chain(&descs).expect("build chain");
+        status_addr
     }
 
     proptest! {
@@ -14660,6 +16027,233 @@ mod proptest_tests {
                 used_delta,
                 counter_delta,
             );
+        }
+
+        /// Throttle-stall property: a well-formed chain dispatched
+        /// against a drained iops=1 throttle MUST stall (or be
+        /// rejected by a pre-throttle gate) without panicking,
+        /// without livelocking, and without publishing a status
+        /// byte — and the queue cursor MUST be rewound so the
+        /// chain re-pops on the next refill.
+        ///
+        /// This complements the hand-curated stall tests
+        /// (`enable_notification_err_on_stall_path_breaks_outer_cleanly`,
+        /// the `apply_ops`-style throttle tests) by sweeping the
+        /// chain-shape parameter space — varying request type
+        /// (T_IN/T_OUT/T_FLUSH), sector value, segment count, and
+        /// per-segment length — to surface invariant violations
+        /// only specific shape combinations would expose.
+        ///
+        /// # u16 wrap coverage
+        ///
+        /// The drained-bucket invariant means EVERY case stalls
+        /// (or rejects pre-throttle), so the rolled-back chain
+        /// always re-pops at the same `next_avail` slot. The
+        /// stall-and-rollback cycle is the wrap-relevant operation
+        /// because `set_next_avail(prev.wrapping_sub(1))` uses
+        /// modular u16 arithmetic. We exercise the wrap edge by
+        /// pre-positioning `next_avail` near `u16::MAX` before the
+        /// notify — a regression that used signed `prev - 1`
+        /// instead of `prev.wrapping_sub(1)` would underflow at
+        /// `prev = 0` and corrupt the cursor; this property fails
+        /// on that input shape.
+        ///
+        /// # Pinned invariants per case
+        ///
+        /// 1. `dev.mmio_write(QUEUE_NOTIFY, ...)` returns within
+        ///    the proptest wall-clock budget (no infinite loop).
+        ///    A panic propagates up and shrinks to the minimal
+        ///    offending chain; a hang surfaces as the proptest
+        ///    runner's per-case timeout.
+        /// 2. `throttled_count` advanced by 1 if the chain reached
+        ///    the throttle gate, OR `io_errors` advanced by 1 if a
+        ///    pre-throttle gate (zero-data, sub-sector, direction)
+        ///    rejected it first. Either outcome is correct under
+        ///    the hostile-shape framing — what matters is that
+        ///    SOME counter moved, no silent stall.
+        /// 3. `reads_completed`, `writes_completed`,
+        ///    `flushes_completed` UNCHANGED (the bucket is drained
+        ///    so no chain successfully consumed tokens).
+        /// 4. If throttled_count fired: status sentinel (0xEE)
+        ///    UNCHANGED at status_addr (no publish_completion
+        ///    ran); used.idx UNCHANGED (no add_used); next_avail
+        ///    rewound to the pre-notify cursor value (the
+        ///    wrap-aware rollback).
+        /// 5. If io_errors fired (pre-throttle gate): status byte
+        ///    is one of {0xEE sentinel if status_addr drop path,
+        ///    S_IOERR otherwise}, and used.idx advanced by AT MOST
+        ///    1.
+        #[test]
+        fn throttle_stall_under_random_chain_shapes_holds_invariants(
+            chain in well_formed_chain_strategy(),
+            // Stress next_avail wrap: pre-position the cursor at
+            // values near u16::MAX so the post-stall
+            // `set_next_avail(prev.wrapping_sub(1))` exercises
+            // the modular arithmetic path. Bounded set rather
+            // than `any::<u16>()` so failure shrinking lands on
+            // recognisable cursor positions:
+            //   - 0 → wraps to u16::MAX after rollback
+            //   - 1 → rollback to 0
+            //   - u16::MAX → no-wrap, rollback to u16::MAX-1
+            //   - u16::MAX-1 → near-MAX rollback
+            // Other values (e.g. queue size 256) get
+            // representative coverage from the existing fuzz
+            // tests that exercise mid-range cursors.
+            initial_next_avail in prop_oneof![
+                Just(0u16),
+                Just(1u16),
+                Just(u16::MAX),
+                Just(u16::MAX - 1),
+            ],
+        ) {
+            let (mut dev, mem) = build_throttled_fuzz_fixture();
+            let mock = MockSplitQueue::create(&mem, GuestAddress(0), 256);
+            dev.set_mem(mem.clone());
+            wire_fuzz_device(&mut dev, &mock);
+
+            // Pre-position next_avail. After build_desc_chain
+            // bumps it by one (the chain we plant below), the
+            // post-stall rollback must land at this same value
+            // via wrapping_sub.
+            //
+            // Setting via `set_next_avail` directly mutates the
+            // device's view of the queue cursor; the mock side's
+            // `avail.idx` (in guest memory) is independent and
+            // gets bumped by `build_desc_chain`. The invariant
+            // we test is that `pop_descriptor_chain` advances
+            // the device cursor to `initial_next_avail + 1` and
+            // the stall path rewinds it to `initial_next_avail`.
+            dev.worker.queues[REQ_QUEUE].set_next_avail(initial_next_avail);
+
+            let status_addr = plant_well_formed_chain(&mem, &mock, &chain);
+            // Mock's avail.idx starts at 1 after build_desc_chain.
+            // The device's next_avail is at `initial_next_avail`.
+            // pop_descriptor_chain reads `avail.ring[next_avail %
+            // queue_size]` and advances next_avail. With one
+            // chain available and the device cursor at
+            // initial_next_avail, the pop succeeds (ring slot 0
+            // holds head_idx=0), and next_avail bumps to
+            // initial_next_avail.wrapping_add(1).
+            //
+            // After the throttle stall, the rollback should land
+            // next_avail back at initial_next_avail — that's the
+            // u16-wrap-aware invariant.
+
+            let before = snapshot_counters(&dev);
+
+            // Fire QUEUE_NOTIFY. process_requests under a drained
+            // throttle either stalls (most cases) or rejects
+            // pre-throttle (cases that violate a pre-throttle
+            // gate, e.g. T_OUT with zero data segments because
+            // chain.n_data_segments was clamped).
+            //
+            // A panic propagates and proptest shrinks; a hang
+            // surfaces as the per-case timeout. Counter
+            // monotonicity and rollback-correctness are pinned
+            // by the assertions below.
+            dev.mmio_write(
+                VIRTIO_MMIO_QUEUE_NOTIFY as u64,
+                &(REQ_QUEUE as u32).to_le_bytes(),
+            );
+
+            let after = snapshot_counters(&dev);
+
+            // Counter monotonicity (parity with the existing
+            // fuzz tests).
+            prop_assert!(after.reads >= before.reads);
+            prop_assert!(after.writes >= before.writes);
+            prop_assert!(after.flushes >= before.flushes);
+            prop_assert!(after.bytes_read >= before.bytes_read);
+            prop_assert!(after.bytes_written >= before.bytes_written);
+            prop_assert!(after.throttled >= before.throttled);
+            prop_assert!(after.io_errors >= before.io_errors);
+
+            let throttled_delta = after.throttled - before.throttled;
+            let io_errors_delta = after.io_errors - before.io_errors;
+
+            // Forward progress: SOME counter moved. A drained
+            // throttle MUST cause the chain to either stall
+            // (throttled++) or reject pre-throttle (io_errors++);
+            // a silent no-op would mean the chain was popped and
+            // forgotten without observability.
+            prop_assert!(
+                throttled_delta + io_errors_delta >= 1,
+                "drained throttle must produce a stall or pre-throttle reject; \
+                 throttled_delta={throttled_delta} io_errors_delta={io_errors_delta} \
+                 chain={chain:?} initial_next_avail={initial_next_avail}",
+            );
+
+            // No completion: every drained-throttle case must
+            // leave the success counters at zero, regardless of
+            // whether the rejection was throttle or pre-throttle.
+            prop_assert_eq!(
+                after.reads - before.reads, 0,
+                "drained throttle must not produce a successful read"
+            );
+            prop_assert_eq!(
+                after.writes - before.writes, 0,
+                "drained throttle must not produce a successful write"
+            );
+            prop_assert_eq!(
+                after.flushes - before.flushes, 0,
+                "drained throttle must not produce a successful flush"
+            );
+
+            // Stall-only invariants (apply when the throttle gate
+            // fired, not when a pre-throttle gate fired).
+            if throttled_delta == 1 {
+                // Status sentinel survives — no publish_completion
+                // ran on a throttle stall.
+                let mut s = [0u8; 1];
+                mem.read_slice(&mut s, status_addr)
+                    .expect("read status sentinel");
+                prop_assert_eq!(
+                    s[0], 0xEE,
+                    "stalled chain must not write status byte; \
+                     chain={:?} initial_next_avail={}",
+                    chain, initial_next_avail,
+                );
+
+                // Queue cursor rewound: post-stall next_avail
+                // matches the pre-notify value via wrapping_sub.
+                // pop_descriptor_chain advanced it from
+                // initial_next_avail to (initial_next_avail+1);
+                // the stall rolled it back via wrapping_sub(1)
+                // to initial_next_avail.
+                let post_stall_next_avail = dev.worker.queues[REQ_QUEUE].next_avail();
+                prop_assert_eq!(
+                    post_stall_next_avail, initial_next_avail,
+                    "post-stall next_avail must rewind to pre-notify value; \
+                     wrapping arithmetic should land at {} after rollback, got {}",
+                    initial_next_avail, post_stall_next_avail,
+                );
+
+                // currently_throttled_gauge incremented (false→true).
+                let gauge = dev.counters().currently_throttled_gauge.load(Ordering::Relaxed);
+                prop_assert_eq!(
+                    gauge, 1,
+                    "stalled-chain gauge must show 1 (false→true transition)",
+                );
+            }
+
+            // Pre-throttle reject invariants (when io_errors
+            // fired but throttled didn't).
+            if io_errors_delta >= 1 && throttled_delta == 0 {
+                // Pre-throttle rejection writes status byte
+                // S_IOERR via publish_completion (when
+                // status_addr is mapped, which it always is in
+                // this fixture). used.idx advances by 1.
+                let mut s = [0u8; 1];
+                mem.read_slice(&mut s, status_addr)
+                    .expect("read status byte");
+                prop_assert!(
+                    s[0] == VIRTIO_BLK_S_IOERR as u8 || s[0] == VIRTIO_BLK_S_OK as u8
+                        || s[0] == VIRTIO_BLK_S_UNSUPP as u8,
+                    "pre-throttle reject must write a defined virtio-blk status; \
+                     got status={:#x} chain={:?}",
+                    s[0], chain,
+                );
+            }
         }
     }
 }
