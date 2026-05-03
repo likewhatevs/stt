@@ -1795,19 +1795,25 @@ pub(crate) fn trim_settle_samples(
 /// ("add your user to the kvm group") before the VM builder starts
 /// allocating memory / fetching kernels.
 ///
-/// Errno classification on open failure:
-/// - `ENOMEM` / `EBUSY` — transient host pressure (kernel memory
-///   allocator under load, or the kvm misc-device's per-CPU init
-///   contended). Routed through
+/// Errno classification on open failure (two branches):
+/// - Transient host pressure (`ENOMEM` / `EBUSY` / `EMFILE` / `ENFILE`
+///   / `EAGAIN`, mirroring the `TRANSIENT_HOST_ERRNOS` set used by
+///   [`crate::vmm::map_transient_to_contention`]): kernel memory
+///   allocator under load, the kvm misc-device's per-CPU init
+///   contended, the calling process exhausting its `RLIMIT_NOFILE`
+///   (`EMFILE`), the system fd table full (`ENFILE`), or a kernel
+///   subsystem signalling "try again" (`EAGAIN`). Routed through
 ///   [`crate::vmm::host_topology::ResourceContention`] so the
-///   `#[ktstr_test]` macro SKIPs the run instead of failing it.
-/// - `EACCES` / `ENOENT` — infrastructure misconfiguration: the
-///   device is missing entirely, or the user lacks permission. The
-///   operator must fix their host setup; SKIP-classifying it would
-///   silently mask a misconfigured runner. Surfaced as a hard error
-///   with the actionable hint above.
-/// - Any other errno — surfaced as a hard error with the same hint;
-///   the rendered `io::Error` carries the raw errno for triage.
+///   `#[ktstr_test]` macro SKIPs the run instead of failing it. The
+///   `EMFILE` / `ENFILE` arms specifically prevent fd-table pressure
+///   on `/dev/kvm` open from surfacing as a hard error with a
+///   misleading "kvm group" hint.
+/// - Everything else (`EACCES` / `ENOENT` / `EINVAL` / etc.):
+///   infrastructure misconfiguration or a real fault — the device is
+///   missing, the user lacks permission, or the kernel returned an
+///   unexpected errno. Surfaced as a hard error with the actionable
+///   "kvm group" hint; SKIP-classifying these would silently mask a
+///   misconfigured runner.
 fn ensure_kvm() -> Result<()> {
     match std::fs::OpenOptions::new()
         .read(true)
@@ -1817,11 +1823,21 @@ fn ensure_kvm() -> Result<()> {
         Ok(_) => Ok(()),
         Err(e) => {
             let errno = e.raw_os_error();
-            if matches!(errno, Some(libc::ENOMEM) | Some(libc::EBUSY)) {
+            if matches!(
+                errno,
+                Some(libc::ENOMEM)
+                    | Some(libc::EBUSY)
+                    | Some(libc::EMFILE)
+                    | Some(libc::ENFILE)
+                    | Some(libc::EAGAIN)
+            ) {
                 let snapshot = vmm::host_resource_snapshot();
                 let errno_label = match errno {
                     Some(libc::ENOMEM) => "ENOMEM",
                     Some(libc::EBUSY) => "EBUSY",
+                    Some(libc::EMFILE) => "EMFILE",
+                    Some(libc::ENFILE) => "ENFILE",
+                    Some(libc::EAGAIN) => "EAGAIN",
                     _ => unreachable!(),
                 };
                 Err(anyhow::Error::new(
@@ -2089,6 +2105,25 @@ pub fn resolve_test_kernel() -> Result<PathBuf> {
     }))
 }
 
+/// Detection seam for the [`crate::flock`] helper's timeout-bail
+/// message shape.
+///
+/// Returns `true` iff `rendered` contains BOTH `"timed out after"` and
+/// `"flock LOCK_"`. The two substrings together are the helper's
+/// internal contract for a flock-acquisition timeout — see
+/// `flock.rs`'s bail format
+/// `"flock {LOCK_EX|LOCK_SH} on {context} timed out after ..."`.
+///
+/// Pinned via the unit test
+/// `flock_timeout_substring_classification_pins_seam` so a
+/// rewording of the bail message that drops either substring is
+/// caught at test time before
+/// [`acquire_test_kernel_lock_if_cached`] starts misclassifying
+/// timeouts as plain anyhow errors.
+fn is_flock_timeout_message(rendered: &str) -> bool {
+    rendered.contains("timed out after") && rendered.contains("flock LOCK_")
+}
+
 /// If `kernel_path` resolves to an image inside a cache entry, hold a
 /// `LOCK_SH` on that entry's coordination lockfile for the duration of
 /// the returned guard. Prevents a concurrent
@@ -2184,7 +2219,7 @@ pub(crate) fn acquire_test_kernel_lock_if_cached(
         Ok(guard) => Ok(Some(guard)),
         Err(e) => {
             let rendered = format!("{e:#}");
-            if rendered.contains("timed out after") && rendered.contains("flock LOCK_") {
+            if is_flock_timeout_message(&rendered) {
                 let snapshot = crate::vmm::host_resource_snapshot();
                 Err(anyhow::Error::new(
                     crate::vmm::host_topology::ResourceContention {
@@ -3817,6 +3852,64 @@ mod tests {
             guard.is_none(),
             "path outside {} must skip locking, got guard",
             cache.path().display(),
+        );
+    }
+
+    /// `acquire_test_kernel_lock_if_cached`'s detection seam matches a
+    /// flock-timeout-shaped error string iff it contains BOTH the
+    /// substrings `"timed out after"` and `"flock LOCK_"`. Pin the
+    /// substring contract so a rewording in
+    /// `crate::flock`'s bail message that drops either substring is
+    /// caught here rather than silently degrading flock-timeout
+    /// classification (a SKIP-able `ResourceContention`) into a
+    /// hard-error plain anyhow.
+    ///
+    /// The test feeds the seam a representative shared-lock-timeout
+    /// rendering (matching the literal format produced at
+    /// `flock.rs::try_flock_with_deadline` — `"flock LOCK_SH on
+    /// {context} timed out after {timeout:?}"`) and the
+    /// exclusive-lock equivalent. A negative-control string lacking
+    /// the `"flock LOCK_"` marker must NOT match — that protects
+    /// against a future seam rewrite that overfits the timeout
+    /// substring and accepts unrelated timeouts.
+    #[test]
+    fn flock_timeout_substring_classification_pins_seam() {
+        let shared_rendering = "flock LOCK_SH on /tmp/cache/.locks/key.lock \
+                                timed out after 30s (lockfile \
+                                /tmp/cache/.locks/key.lock, holders: pid=42)";
+        assert!(
+            super::is_flock_timeout_message(shared_rendering),
+            "shared-lock timeout rendering must classify as flock timeout: {shared_rendering}",
+        );
+
+        let exclusive_rendering = "flock LOCK_EX on /tmp/cache/.locks/key.lock \
+                                   timed out after 30s (lockfile \
+                                   /tmp/cache/.locks/key.lock, holders: pid=99)";
+        assert!(
+            super::is_flock_timeout_message(exclusive_rendering),
+            "exclusive-lock timeout rendering must classify as flock timeout: \
+             {exclusive_rendering}",
+        );
+
+        // Negative control: a different timeout (e.g. cgroup write)
+        // contains "timed out after" but not "flock LOCK_". The seam
+        // must reject it so non-flock timeouts are not laundered as
+        // ResourceContention.
+        let unrelated_timeout = "cgroup write to /sys/fs/cgroup/foo timed out after 5000ms";
+        assert!(
+            !super::is_flock_timeout_message(unrelated_timeout),
+            "non-flock timeout must NOT classify as flock timeout: {unrelated_timeout}",
+        );
+
+        // Negative control: a flock error that is NOT a timeout
+        // (e.g. an EBADF on the descriptor) lacks "timed out after"
+        // and must reject so non-timeout flock errors fall through to
+        // the hard-error arm rather than being SKIP-classified.
+        let flock_non_timeout =
+            "flock LOCK_SH on /tmp/cache/.locks/key.lock failed: Bad file descriptor (os error 9)";
+        assert!(
+            !super::is_flock_timeout_message(flock_non_timeout),
+            "flock non-timeout error must NOT classify as flock timeout: {flock_non_timeout}",
         );
     }
 

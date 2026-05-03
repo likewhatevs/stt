@@ -239,6 +239,61 @@ pub(crate) fn host_resource_snapshot() -> String {
     )
 }
 
+/// Extract the boolean value of the `near_limit=` field from a
+/// [`host_resource_snapshot`] string and return `true` iff that field
+/// is exactly `false`.
+///
+/// Consumed by [`map_transient_to_contention`] to gate the
+/// `KTSTR_CONTENTION_BYPASS=1` opt-in: the bypass triggers only when
+/// the snapshot positively confirms the host has headroom
+/// (`near_limit=false`), so any failure to parse the value
+/// conservatively keeps the classifier in its default
+/// `ResourceContention` SKIP path. Equivalent in observable behaviour
+/// to the prior `snapshot.contains("near_limit=false")` test for
+/// well-formed snapshots; the helper differs only in that it parses
+/// the `near_limit=...` value instead of pattern-matching the literal
+/// substring `"near_limit=false"` anywhere in the string. That
+/// matters if a future field appended to the snapshot (e.g.
+/// `vmpeak=10000`) ever embeds the substring `near_limit=false` as
+/// part of an unrelated value (`prev_near_limit=false-positive`,
+/// say). The parser-based form pins the field rather than the
+/// substring.
+///
+/// Returns `true` only on a parsed `near_limit=false`; every other
+/// outcome (missing field, malformed value, `near_limit=true`,
+/// snapshot is empty) returns `false`. This is the conservative
+/// default — bypass stays OFF unless the snapshot positively
+/// asserts the host has headroom.
+///
+/// The parser is forgiving on whitespace and tolerates trailing
+/// commas/spaces — the snapshot format puts each `key=value` pair
+/// on a comma-separated single line, but tests construct snapshots
+/// without that exact shape and the helper accepts both.
+pub(crate) fn snapshot_near_limit_is_false(snapshot: &str) -> bool {
+    // Walk every `key=value` token. The snapshot format is
+    // `fds=N, vmrss=X, threads=Y, near_limit=Z` so splitting on
+    // commas yields one token per field; trimming whitespace handles
+    // both the format's `, ` separator and any test-supplied
+    // variation. The first whitespace-delimited subtoken of `value`
+    // is the actual boolean — discard any trailing punctuation a
+    // future format extension might add.
+    for token in snapshot.split(',') {
+        let token = token.trim();
+        let Some(value) = token.strip_prefix("near_limit=") else {
+            continue;
+        };
+        // Strip any trailing whitespace/punctuation a caller might
+        // append. `value.split_whitespace().next()` returns `None`
+        // only when the value is empty after trimming — fold to a
+        // sentinel that does not match `"false"` so empty values
+        // return false from the helper.
+        let value = value.split_whitespace().next().unwrap_or("");
+        return value == "false";
+    }
+    // No `near_limit=` field present — conservative default.
+    false
+}
+
 /// Map a kvm_ioctls / vmm_sys_util `errno::Error` to a
 /// [`host_topology::ResourceContention`] when its errno appears in
 /// [`TRANSIENT_HOST_ERRNOS`]; otherwise return the error wrapped in
@@ -370,7 +425,7 @@ pub(crate) fn map_transient_to_contention(
             .ok()
             .as_deref()
             == Some("1");
-        let near_limit_false = snapshot.contains("near_limit=false");
+        let near_limit_false = snapshot_near_limit_is_false(&snapshot);
         if bypass_requested && near_limit_false {
             return anyhow::Error::new(e).context(format!(
                 "{context}: KVM errno {errno} ({errno_name}) — errno looks transient \
@@ -8420,6 +8475,88 @@ mod tests {
         assert!(
             s.contains("near_limit=true") || s.contains("near_limit=false"),
             "near_limit must be boolean; got: {s}",
+        );
+    }
+
+    /// `snapshot_near_limit_is_false` returns `true` only when the
+    /// snapshot positively asserts `near_limit=false`. Every other
+    /// outcome (missing field, malformed value, `near_limit=true`,
+    /// empty input) returns `false` — the conservative default that
+    /// keeps `KTSTR_CONTENTION_BYPASS` OFF unless we can prove the
+    /// host has headroom.
+    ///
+    /// Pins the parser against four regressions:
+    /// 1. A field rename in [`host_resource_snapshot`] (e.g.
+    ///    `near_limit` → `at_capacity`) silently flips every
+    ///    snapshot to "no headroom" and disables the bypass.
+    /// 2. A future field whose name embeds `near_limit=false` as a
+    ///    substring (e.g. `prev_near_limit=false_positive`) tricks
+    ///    the substring-match form but not the parser-based form.
+    /// 3. A malformed value (`near_limit=maybe`) is treated as
+    ///    "headroom unconfirmed" rather than parsed-as-false.
+    /// 4. A trailing word in the value (`near_limit=false ;`) is
+    ///    handled by the whitespace-token extractor.
+    #[test]
+    fn snapshot_near_limit_is_false_parses_field_value() {
+        // Realistic snapshot shape: the field is at the end after a
+        // `, ` separator. Must parse to true.
+        let realistic =
+            "fds=64, vmrss=24 kB, threads=8, near_limit=false";
+        assert!(
+            super::snapshot_near_limit_is_false(realistic),
+            "realistic near_limit=false must parse: {realistic}",
+        );
+
+        // Same shape with `near_limit=true`. Must parse to false.
+        let near_limit_true =
+            "fds=64, vmrss=24 kB, threads=8, near_limit=true";
+        assert!(
+            !super::snapshot_near_limit_is_false(near_limit_true),
+            "near_limit=true must NOT classify as headroom: {near_limit_true}",
+        );
+
+        // Field absent entirely (early-bail snapshot, future
+        // shortened format). Must parse to false (conservative).
+        let no_field = "fds=64, vmrss=24 kB, threads=8";
+        assert!(
+            !super::snapshot_near_limit_is_false(no_field),
+            "missing near_limit field must NOT classify as headroom: {no_field}",
+        );
+
+        // Empty snapshot. Conservative default.
+        assert!(
+            !super::snapshot_near_limit_is_false(""),
+            "empty snapshot must NOT classify as headroom",
+        );
+
+        // Malformed value. Conservative default — only the literal
+        // `false` token unlocks the bypass.
+        let malformed = "fds=64, near_limit=maybe";
+        assert!(
+            !super::snapshot_near_limit_is_false(malformed),
+            "malformed near_limit value must NOT classify as headroom: {malformed}",
+        );
+
+        // Substring-collision negative control: a future field whose
+        // name happens to contain `near_limit=false` as a substring
+        // would fool a `snapshot.contains("near_limit=false")` test.
+        // The parser-based helper rejects it because the field name
+        // `prev_near_limit` does not have the prefix `near_limit=`
+        // after token splitting.
+        let substring_collision =
+            "fds=64, prev_near_limit=false_positive, near_limit=true";
+        assert!(
+            !super::snapshot_near_limit_is_false(substring_collision),
+            "substring collision must NOT classify as headroom: {substring_collision}",
+        );
+
+        // Trailing whitespace + punctuation tolerance — the
+        // whitespace-token extractor strips anything past the first
+        // whitespace block in the value.
+        let trailing = "fds=64, near_limit=false  ";
+        assert!(
+            super::snapshot_near_limit_is_false(trailing),
+            "trailing whitespace must not block parsing: {trailing}",
         );
     }
 
