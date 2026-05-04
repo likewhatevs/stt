@@ -391,6 +391,19 @@ impl ListedEntry {
     }
 }
 
+/// Trailing literal of every "image_missing" reason string. Pinned
+/// here so [`format_image_missing_reason`] (the producer) and
+/// [`classify_corrupt_reason`] (the consumer) reference the same
+/// constant — the exact-suffix match in the classifier's
+/// `image_missing` arm cannot drift if a future edit changes the
+/// trailing wording without updating both sites.
+pub(crate) const IMAGE_MISSING_SUFFIX: &str = " missing from entry directory";
+
+/// Leading literal of every "image_missing" reason string. Pinned
+/// alongside [`IMAGE_MISSING_SUFFIX`] so both the producer and the
+/// classifier key on the same constants.
+pub(crate) const IMAGE_MISSING_PREFIX: &str = "image file ";
+
 /// Format the canonical "image_missing" reason string emitted by
 /// [`crate::cache::CacheDir::list`] when an entry's
 /// `metadata.json` is parseable but the boot image it names is
@@ -398,12 +411,14 @@ impl ListedEntry {
 ///
 /// Centralised here so the producer site (`cache_dir.rs`'s
 /// `list` corrupt-entry arm) and the classifier
-/// [`classify_corrupt_reason`] cannot drift out of lockstep — both
-/// the literal `"image file "` prefix and the substring `"missing"`
-/// appear in the result, so the `starts_with(…) && contains(…)`
-/// classification predicate continues to match by construction.
+/// [`classify_corrupt_reason`] cannot drift out of lockstep —
+/// the result begins with [`IMAGE_MISSING_PREFIX`] and ends with
+/// [`IMAGE_MISSING_SUFFIX`], so the classifier's exact prefix +
+/// exact suffix predicate matches by construction without
+/// admitting unrelated reasons that merely happen to contain
+/// either literal.
 pub(crate) fn format_image_missing_reason(image_name: &str) -> String {
-    format!("image file {image_name} missing from entry directory")
+    format!("{IMAGE_MISSING_PREFIX}{image_name}{IMAGE_MISSING_SUFFIX}")
 }
 
 /// Shared prefix → `error_kind` classifier.
@@ -416,16 +431,25 @@ pub(crate) fn format_image_missing_reason(image_name: &str) -> String {
 ///
 /// Reason-prefix → kind mapping (matched in this order):
 ///
-/// | Reason (prefix or exact)               | `error_kind`     |
-/// |----------------------------------------|------------------|
-/// | `"metadata.json missing"` (exact)      | `"missing"`      |
-/// | `"metadata.json unreadable: …"`        | `"unreadable"`   |
-/// | `"metadata.json schema drift: …"`      | `"schema_drift"` |
-/// | `"metadata.json malformed: …"`         | `"malformed"`    |
-/// | `"metadata.json truncated: …"`         | `"truncated"`    |
-/// | `"metadata.json parse error: …"`       | `"parse_error"`  |
-/// | `"image file …"` containing `"missing"`| `"image_missing"`|
-/// | (anything else)                        | `"unknown"`      |
+/// | Reason (prefix or exact)                     | `error_kind`     |
+/// |----------------------------------------------|------------------|
+/// | `"metadata.json missing"` (exact)            | `"missing"`      |
+/// | `"metadata.json unreadable: …"`              | `"unreadable"`   |
+/// | `"metadata.json schema drift: …"`            | `"schema_drift"` |
+/// | `"metadata.json malformed: …"`               | `"malformed"`    |
+/// | `"metadata.json truncated: …"`               | `"truncated"`    |
+/// | `"metadata.json parse error: …"`             | `"parse_error"`  |
+/// | `"image file <name> missing from entry directory"` | `"image_missing"`|
+/// | (anything else)                              | `"unknown"`      |
+///
+/// The `image_missing` arm matches on the exact prefix
+/// [`IMAGE_MISSING_PREFIX`] AND the exact suffix
+/// [`IMAGE_MISSING_SUFFIX`] — both literals are produced verbatim
+/// by [`format_image_missing_reason`]. A loose `contains("missing")`
+/// would also match unrelated future reasons that happen to mention
+/// "missing" inside an `image file …` prefix (e.g. an "image file X
+/// missing checksum field" reason), so the dispatcher pins both ends
+/// of the canonical form.
 ///
 /// The producer in [`super::housekeeping::read_metadata`] is the
 /// authoritative source of these prefixes. If a new failure mode is
@@ -445,7 +469,10 @@ pub(crate) fn classify_corrupt_reason(reason: &str) -> &'static str {
         "truncated"
     } else if reason.starts_with("metadata.json parse error: ") {
         "parse_error"
-    } else if reason.starts_with("image file ") && reason.contains("missing") {
+    } else if reason.starts_with(IMAGE_MISSING_PREFIX)
+        && reason.ends_with(IMAGE_MISSING_SUFFIX)
+        && reason.len() > IMAGE_MISSING_PREFIX.len() + IMAGE_MISSING_SUFFIX.len()
+    {
         "image_missing"
     } else {
         "unknown"
@@ -726,6 +753,65 @@ mod tests {
                 classify_corrupt_reason(reason),
                 *expected,
                 "reason `{reason}` should classify as `{expected}`",
+            );
+        }
+    }
+
+    /// The `image_missing` arm requires BOTH the canonical prefix
+    /// AND the canonical trailing literal — strings that share only
+    /// one half (or that would have matched the legacy loose
+    /// `starts_with("image file ") && contains("missing")` predicate)
+    /// must drop into `unknown`. Locks the tightening described on
+    /// [`classify_corrupt_reason`].
+    #[test]
+    fn classify_corrupt_reason_image_missing_requires_exact_suffix() {
+        // Loose predicate would match (prefix + the substring
+        // "missing" in the wrong position). The tightened predicate
+        // rejects it because the suffix isn't the canonical
+        // ` missing from entry directory`.
+        assert_eq!(
+            classify_corrupt_reason("image file bzImage missing checksum field"),
+            "unknown",
+            "non-canonical 'image file … missing X' reason must NOT \
+             classify as `image_missing` — only the exact \
+             format_image_missing_reason() form is accepted",
+        );
+        // Suffix matches but prefix doesn't — must not classify.
+        assert_eq!(
+            classify_corrupt_reason("foo bzImage missing from entry directory"),
+            "unknown",
+            "suffix-only match without the canonical prefix must classify as unknown",
+        );
+        // Empty image name produces a degenerate prefix+suffix abut —
+        // the length guard rejects it so a future bug that emits
+        // `format_image_missing_reason("")` cannot silently classify.
+        assert_eq!(
+            classify_corrupt_reason("image file  missing from entry directory"),
+            "unknown",
+            "prefix+suffix with no image_name in between must classify as unknown",
+        );
+    }
+
+    /// Producer→consumer round trip: every reason produced by
+    /// [`format_image_missing_reason`] must classify as
+    /// `image_missing`, regardless of the image_name value
+    /// (alphanumerics, dots, dashes, multi-word names).
+    #[test]
+    fn classify_corrupt_reason_accepts_every_format_image_missing_output() {
+        for image_name in [
+            "bzImage",
+            "Image",
+            "vmlinuz-6.14.2",
+            "kernel.bin",
+            "image_with_underscores",
+            "name-with-many-dashes",
+        ] {
+            let reason = format_image_missing_reason(image_name);
+            assert_eq!(
+                classify_corrupt_reason(&reason),
+                "image_missing",
+                "every produced reason (image_name={image_name:?}) must \
+                 classify as image_missing — got reason {reason:?}",
             );
         }
     }

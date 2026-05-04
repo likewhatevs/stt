@@ -32,11 +32,12 @@
 //!   `CacheDir::new` and `CacheDir::default_root` flow through.
 //!
 //! Reader/writer asymmetry: shared (reader) lock blocks 10 s,
-//! exclusive (writer) lock blocks 60 s. Writer must outlast every
-//! concurrent test reader; reader bails fast on a stuck writer.
-//! See [`SHARED_LOCK_DEFAULT_TIMEOUT`] and
-//! [`STORE_EXCLUSIVE_LOCK_TIMEOUT`] for the literal durations and
-//! their rationale.
+//! exclusive (writer) lock blocks 5 minutes (overridable via
+//! the [`STORE_EXCLUSIVE_LOCK_TIMEOUT_ENV`] environment variable).
+//! Writer must outlast every concurrent test reader; reader bails
+//! fast on a stuck writer. See [`SHARED_LOCK_DEFAULT_TIMEOUT`] and
+//! [`STORE_EXCLUSIVE_LOCK_DEFAULT_TIMEOUT`] for the literal
+//! durations and their rationale.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -59,8 +60,58 @@ use crate::flock::{FlockMode, acquire_flock_with_timeout};
 /// Default wall-clock timeout for [`CacheDir::acquire_shared_lock`].
 const SHARED_LOCK_DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Timeout for [`CacheDir::store`]'s internal `LOCK_EX` acquire.
-const STORE_EXCLUSIVE_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// Default timeout for [`CacheDir::store`]'s internal `LOCK_EX`
+/// acquire when [`STORE_EXCLUSIVE_LOCK_TIMEOUT_ENV`] is unset.
+///
+/// 5 minutes covers a `store` peer's full critical section in the
+/// worst case: under heavy parallelism N concurrent runners may
+/// contend on the SAME `cache_key`, where the head writer holds
+/// `LOCK_EX` while it copies the boot image, runs the 3-stage
+/// vmlinux strip pipeline ([`super::vmlinux_strip::strip_vmlinux_debug`]),
+/// writes `metadata.json`, and finishes the
+/// [`super::housekeeping::atomic_swap_dirs`] swap. A real vmlinux
+/// strip on a debug-symbol-rich build can spend tens of seconds
+/// inside the strip pipeline alone, and stacking N peers in series
+/// behind that producer scales the wait linearly. 60 s was tight
+/// enough that 5–10 contending peers reliably timed out before
+/// the head writer finished. The new 5-minute default leaves
+/// headroom for ~50 contending peers behind a slow strip without
+/// losing the "fail loud rather than block forever" property of a
+/// finite timeout.
+const STORE_EXCLUSIVE_LOCK_DEFAULT_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(300);
+
+/// Environment variable name that overrides
+/// [`STORE_EXCLUSIVE_LOCK_DEFAULT_TIMEOUT`]. Parsed via
+/// [`humantime::parse_duration`] so operators can tune with
+/// human-readable units (`30s`, `2m`, `10min`, `1h`). An invalid
+/// value falls back to the default with a `warn!` so a typo never
+/// silently disables the lock — the operator can see the
+/// fall-through in their tracing output and fix the setting.
+const STORE_EXCLUSIVE_LOCK_TIMEOUT_ENV: &str = "KTSTR_CACHE_STORE_LOCK_TIMEOUT";
+
+/// Resolve the per-store `LOCK_EX` acquire timeout, honoring the
+/// [`STORE_EXCLUSIVE_LOCK_TIMEOUT_ENV`] override. Pure function so
+/// tests can exercise the parse/fall-through branches without
+/// driving a full `store()` cycle.
+fn store_exclusive_lock_timeout() -> std::time::Duration {
+    match std::env::var(STORE_EXCLUSIVE_LOCK_TIMEOUT_ENV) {
+        Ok(v) if !v.is_empty() => match humantime::parse_duration(&v) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(
+                    env = %STORE_EXCLUSIVE_LOCK_TIMEOUT_ENV,
+                    value = %v,
+                    err = %e,
+                    "invalid cache-store lock timeout env value; \
+                     falling back to default timeout",
+                );
+                STORE_EXCLUSIVE_LOCK_DEFAULT_TIMEOUT
+            }
+        },
+        _ => STORE_EXCLUSIVE_LOCK_DEFAULT_TIMEOUT,
+    }
+}
 
 /// Handle to the kernel image cache directory.
 #[derive(Debug)]
@@ -92,6 +143,66 @@ fn warn_if_unstripped_vmlinux(entry: &CacheEntry) {
 /// Pure decision logic for [`warn_if_unstripped_vmlinux`].
 pub(crate) fn should_warn_unstripped(entry: &CacheEntry) -> bool {
     entry.metadata.has_vmlinux() && !entry.metadata.vmlinux_stripped()
+}
+
+/// Whether the existing `cached` cache entry already satisfies a
+/// caller's intent to `store` an artifact under the same cache key.
+///
+/// Pure decision logic for [`CacheDir::store`]'s in-lock re-lookup
+/// (step 3 of the docs). When N concurrent peers race on the same
+/// `cache_key` they all miss the pre-lock cache check, serialise
+/// behind `LOCK_EX`, and would otherwise each repeat the head
+/// writer's copy / strip / atomic-publish work. This predicate
+/// answers the post-lock question: "is the head writer's output
+/// byte-equivalent to what I'd publish?" If yes, the late peers
+/// short-circuit — only the head writer pays the publish cost.
+///
+/// Compares only the metadata fields that drive the on-disk bytes
+/// `store()` would write:
+///
+/// - `config_hash` (CRC32 of the final `.config`) — pins the
+///   kernel image identity.
+/// - `ktstr_kconfig_hash` (CRC32 of `ktstr.kconfig`) — kconfig
+///   fragment that produced the build.
+/// - `extra_kconfig_hash` (CRC32 of the user `--extra-kconfig`
+///   fragment) — same.
+/// - `caller_has_vmlinux` — whether the caller passed a vmlinux
+///   sidecar in `CacheArtifacts`. This is the actual switch
+///   `store()` keys on (it overwrites `metadata.has_vmlinux`
+///   from the artifacts argument), so the predicate compares
+///   against the artifacts shape, not the caller's metadata
+///   field.
+///
+/// Excludes:
+///
+/// - `built_at` — wall-clock timestamp that drifts every build;
+///   pinning it would break the early-return and serialise every
+///   peer through a redundant publish.
+/// - `version` — display-only string, not a byte-difference.
+/// - `source` — acquire-time provenance (Tarball / Git / Local +
+///   payload). Two peers may publish the same image under
+///   different `source` payloads (e.g. one from a tarball mirror,
+///   one from a git checkout) and still produce byte-equivalent
+///   bytes. The kconfig hash is the authoritative content key.
+/// - `arch`, `image_name` — fixed by the cache key shape.
+/// - `vmlinux_stripped` — set by `store()` based on
+///   strip pipeline success/failure, not caller intent. The head
+///   writer either succeeded (stripped) or fell back (unstripped);
+///   late peers would just observe the head writer's outcome.
+/// - `source_vmlinux_size`, `source_vmlinux_mtime_secs` —
+///   DWARF-routing hints, not cached content.
+///
+/// Pure function so a unit test can pin every accept/reject branch
+/// without driving a full `store()` cycle through a temp cache.
+pub(crate) fn cache_content_matches(
+    cached: &KernelMetadata,
+    caller: &KernelMetadata,
+    caller_has_vmlinux: bool,
+) -> bool {
+    cached.config_hash == caller.config_hash
+        && cached.ktstr_kconfig_hash == caller.ktstr_kconfig_hash
+        && cached.extra_kconfig_hash == caller.extra_kconfig_hash
+        && cached.has_vmlinux() == caller_has_vmlinux
 }
 
 impl CacheDir {
@@ -220,23 +331,45 @@ impl CacheDir {
     ///    [`validate_filename`] rejects path-separator characters in
     ///    the image basename. Invalid input fails before any I/O.
     /// 2. **Acquire the per-key store lock.** `LOCK_EX` on
-    ///    `<root>/.locks/<cache_key>.lock` with a
-    ///    [`STORE_EXCLUSIVE_LOCK_TIMEOUT`]-second budget (currently
-    ///    60s). The lock excludes other writers for the same key
-    ///    while letting readers and writers for unrelated keys
-    ///    proceed. Timeout produces an error rather than blocking
-    ///    forever — a hung writer cannot indefinitely block a fresh
-    ///    rebuild attempt.
-    /// 3. **Stage into a temp directory.** `<root>/.tmp-<key>-<pid>`
+    ///    `<root>/.locks/<cache_key>.lock`. Timeout defaults to
+    ///    [`STORE_EXCLUSIVE_LOCK_DEFAULT_TIMEOUT`] (5 minutes) and
+    ///    can be overridden via [`STORE_EXCLUSIVE_LOCK_TIMEOUT_ENV`]
+    ///    for environments where a slow vmlinux strip stacks many
+    ///    contending peers behind the head writer. The lock
+    ///    excludes other writers for the same key while letting
+    ///    readers and writers for unrelated keys proceed. Timeout
+    ///    produces an error rather than blocking forever — a hung
+    ///    writer cannot indefinitely block a fresh rebuild attempt.
+    /// 3. **Double-checked re-lookup inside the lock.** After
+    ///    acquiring `LOCK_EX`, re-run [`Self::lookup`] for
+    ///    `cache_key`. When N peers race to publish the same key
+    ///    they all miss the pre-lock cache check, queue on
+    ///    `LOCK_EX`, and serialise behind the head writer. Without
+    ///    this recheck, every peer re-runs the full copy + strip +
+    ///    publish steps in series even though the head writer's
+    ///    output already satisfies them. The recheck early-returns
+    ///    when the existing cached entry's content-defining metadata
+    ///    fields ([`cache_content_matches`] — config_hash,
+    ///    ktstr_kconfig_hash, extra_kconfig_hash, has_vmlinux) match
+    ///    the caller's intent for this publish, so only the head
+    ///    writer pays the strip/copy/rename cost. Cache-relevant
+    ///    differences (a fresh kconfig hash, a different vmlinux
+    ///    presence) bypass the early-return and proceed to a real
+    ///    overwrite-publish. Cache-irrelevant differences (a fresh
+    ///    `built_at` timestamp, a different `version` display
+    ///    string) trigger the early-return — the on-disk bytes the
+    ///    overwrite would write are byte-equivalent to what's
+    ///    already cached, so the publish is redundant.
+    /// 4. **Stage into a temp directory.** `<root>/.tmp-<key>-<pid>`
     ///    is created (or pruned and recreated if a previous attempt
     ///    by the same PID exists), with [`TmpDirGuard`] enrolling the
     ///    path for cleanup on any subsequent error. A best-effort
     ///    [`clean_orphaned_tmp_dirs`] pass also runs here so dead
     ///    sibling temp directories from crashed PIDs are GC'd before
     ///    we add another one.
-    /// 4. **Copy the boot image.** `metadata.image_name` lands at
+    /// 5. **Copy the boot image.** `metadata.image_name` lands at
     ///    `tmp/<image_name>` via `fs::copy`.
-    /// 5. **Strip and copy vmlinux (if supplied).** When
+    /// 6. **Strip and copy vmlinux (if supplied).** When
     ///    `artifacts.vmlinux` is `Some`, [`strip_vmlinux_debug`]
     ///    runs the 3-stage strip pipeline and the result is written
     ///    to `tmp/vmlinux`. **Strip-fallback rationale:** if the
@@ -251,12 +384,12 @@ impl CacheDir {
     ///    that need rebuilding once the strip-failure root cause is
     ///    fixed. A hard failure here would be worse: it would
     ///    effectively brick the cache for that build.
-    /// 6. **Write `metadata.json`.** A pretty-printed serde dump of
+    /// 7. **Write `metadata.json`.** A pretty-printed serde dump of
     ///    `KernelMetadata` (with `has_vmlinux` and `vmlinux_stripped`
-    ///    set from step 5) at `tmp/metadata.json`. Pretty-print is
+    ///    set from step 6) at `tmp/metadata.json`. Pretty-print is
     ///    intentional — operators inspect this file directly when
     ///    debugging cache state.
-    /// 7. **Atomic publish.** `fs::rename(tmp → final)` if `final`
+    /// 8. **Atomic publish.** `fs::rename(tmp → final)` if `final`
     ///    does not exist; otherwise [`atomic_swap_dirs`] uses
     ///    `renameat2(RENAME_EXCHANGE)` to swap the two directories
     ///    in a single atomic syscall. Either way, no reader observes
@@ -272,7 +405,27 @@ impl CacheDir {
         validate_filename(&metadata.image_name)?;
 
         let _store_lock =
-            self.acquire_exclusive_lock_blocking(cache_key, STORE_EXCLUSIVE_LOCK_TIMEOUT)?;
+            self.acquire_exclusive_lock_blocking(cache_key, store_exclusive_lock_timeout())?;
+
+        // Double-checked re-lookup inside LOCK_EX: when N peers race
+        // on the same cache_key they all miss the pre-lock cache
+        // check, queue on the lock, and would otherwise repeat the
+        // head writer's copy/strip/publish work in series. The
+        // recheck early-returns when the existing entry's
+        // content-defining metadata fields match what we'd publish
+        // (see [`cache_content_matches`] for the predicate). The
+        // matched entry is returned to the caller verbatim — its
+        // on-disk bytes are byte-equivalent to what we would write,
+        // so no overwrite-publish is needed.
+        if let Some(existing) = self.lookup(cache_key)
+            && cache_content_matches(&existing.metadata, metadata, artifacts.vmlinux.is_some())
+        {
+            tracing::debug!(
+                cache_key = cache_key,
+                "cache.store: in-lock recheck hit; skipping copy/strip/publish",
+            );
+            return Ok(existing);
+        }
 
         let final_dir = self.root.join(cache_key);
         let tmp_dir = self.root.join(format!(
@@ -406,7 +559,10 @@ impl CacheDir {
     }
 
     /// Acquire `LOCK_EX` on the cache-entry lockfile, blocking up
-    /// to `timeout`.
+    /// to `timeout`. On timeout, the error message surfaces the
+    /// [`STORE_EXCLUSIVE_LOCK_TIMEOUT_ENV`] override so an operator
+    /// hitting a contended `store()` discovers the env-var
+    /// remediation without reading the docs.
     pub fn acquire_exclusive_lock_blocking(
         &self,
         cache_key: &str,
@@ -419,7 +575,7 @@ impl CacheDir {
             FlockMode::Exclusive,
             timeout,
             &format!("cache entry {cache_key:?}"),
-            None,
+            Some("override the timeout via KTSTR_CACHE_STORE_LOCK_TIMEOUT (humantime: 30s, 2m, 1h)"),
         )?;
         Ok(ExclusiveLockGuard { fd })
     }
@@ -591,6 +747,7 @@ mod tests {
 
         let meta1 = KernelMetadata {
             built_at: "2026-04-12T10:00:00Z".to_string(),
+            config_hash: Some("hash-v1".to_string()),
             ..test_metadata("6.14.2")
         };
         cache
@@ -601,8 +758,13 @@ mod tests {
             )
             .unwrap();
 
+        // Bump config_hash so the in-lock recheck classifies meta2's
+        // intent as a real overwrite (different on-disk contents);
+        // bumping only built_at would now early-return — see
+        // cache_content_matches.
         let meta2 = KernelMetadata {
             built_at: "2026-04-12T11:00:00Z".to_string(),
+            config_hash: Some("hash-v2".to_string()),
             ..test_metadata("6.14.2")
         };
         cache
@@ -615,6 +777,7 @@ mod tests {
 
         let found = cache.lookup("6.14.2-tarball-x86_64").unwrap();
         assert_eq!(found.metadata.built_at, "2026-04-12T11:00:00Z");
+        assert_eq!(found.metadata.config_hash.as_deref(), Some("hash-v2"));
     }
 
     #[test]
@@ -1106,6 +1269,7 @@ mod tests {
         fs::write(&image_a, b"version-a").unwrap();
         let mut meta_a = test_metadata("6.14.2");
         meta_a.built_at = "2026-04-10T00:00:00Z".to_string();
+        meta_a.config_hash = Some("hash-a".to_string());
         let entry_a = cache
             .store("collide", &CacheArtifacts::new(&image_a), &meta_a)
             .unwrap();
@@ -1119,6 +1283,10 @@ mod tests {
         fs::write(&image_b, b"version-b").unwrap();
         let mut meta_b = test_metadata("6.14.2");
         meta_b.built_at = "2026-04-18T00:00:00Z".to_string();
+        // Distinct config_hash forces the in-lock recheck to bypass
+        // the early-return and proceed through the real overwrite
+        // path — the test exercises atomic publish, not recheck.
+        meta_b.config_hash = Some("hash-b".to_string());
         let entry_b = cache
             .store("collide", &CacheArtifacts::new(&image_b), &meta_b)
             .unwrap();
@@ -1130,6 +1298,7 @@ mod tests {
         );
         let installed_meta = read_metadata(&entry_b.path).expect("metadata.json");
         assert_eq!(installed_meta.built_at, "2026-04-18T00:00:00Z");
+        assert_eq!(installed_meta.config_hash.as_deref(), Some("hash-b"));
 
         for dirent in fs::read_dir(&cache_root).unwrap() {
             let name = dirent.unwrap().file_name().to_string_lossy().into_owned();
@@ -1602,6 +1771,11 @@ mod tests {
             "acquire should have waited ~timeout (150ms lower bound); \
              got {elapsed:?}",
         );
+        assert!(
+            msg.contains("KTSTR_CACHE_STORE_LOCK_TIMEOUT"),
+            "timeout error must surface the env-var override so \
+             operators discover the remediation without reading docs: {msg}",
+        );
         release_tx.send(()).unwrap();
         reader.join().expect("reader thread panicked");
     }
@@ -1811,6 +1985,398 @@ mod tests {
                     .is_none(),
             ".locks/ must be empty if it exists at all — validator \
              rejects before lockfile creation",
+        );
+    }
+
+    // -- try_acquire_exclusive_lock happy path --
+
+    /// Uncontended `try_acquire_exclusive_lock` returns the
+    /// `ExclusiveLockGuard` and materializes the lockfile under
+    /// `.locks/`.
+    #[test]
+    fn try_acquire_exclusive_lock_succeeds_when_uncontended() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().to_path_buf());
+
+        let guard = cache
+            .try_acquire_exclusive_lock("happy-path-key")
+            .expect("uncontended try_acquire_exclusive_lock must succeed");
+
+        let lockfile = tmp.path().join(".locks").join("happy-path-key.lock");
+        assert!(
+            lockfile.exists(),
+            "happy-path acquire must materialize the lockfile at \
+             {} — without it, /proc/locks lookup of contention \
+             diagnostics fails to attribute the holder",
+            lockfile.display(),
+        );
+        assert!(
+            tmp.path().join(".locks").is_dir(),
+            ".locks/ subdirectory must exist after a happy-path \
+             acquire (lazy materialization)",
+        );
+
+        drop(guard);
+
+        let guard2 = cache
+            .try_acquire_exclusive_lock("happy-path-key")
+            .expect("second acquire on same key must succeed after the first guard drops");
+        drop(guard2);
+    }
+
+    /// `try_acquire_exclusive_lock` rejects path-traversal keys
+    /// before opening any lockfile, mirroring the
+    /// `acquire_shared_lock` rejection contract.
+    #[test]
+    fn try_acquire_exclusive_lock_rejects_invalid_key() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().to_path_buf());
+        let err = cache
+            .try_acquire_exclusive_lock("../escape")
+            .expect_err("invalid key must be rejected before lockfile open");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("path"),
+            "validator must surface a path-related diagnostic: {msg}",
+        );
+    }
+
+    /// `try_acquire_exclusive_lock` succeeds against the same key on
+    /// distinct `CacheDir` roots concurrently — the lock is keyed on
+    /// the per-root `.locks/<key>.lock` inode, not the bare key
+    /// string.
+    #[test]
+    fn try_acquire_exclusive_lock_distinct_roots_dont_contend() {
+        let tmp_a = TempDir::new().unwrap();
+        let tmp_b = TempDir::new().unwrap();
+        let cache_a = CacheDir::with_root(tmp_a.path().to_path_buf());
+        let cache_b = CacheDir::with_root(tmp_b.path().to_path_buf());
+
+        let guard_a = cache_a
+            .try_acquire_exclusive_lock("shared-name")
+            .expect("acquire under root A must succeed");
+        let guard_b = cache_b
+            .try_acquire_exclusive_lock("shared-name")
+            .expect(
+                "acquire on the same key under root B must NOT \
+                 contend with A — different lockfiles, different OFDs",
+            );
+
+        drop(guard_a);
+        drop(guard_b);
+    }
+
+    // -- in-lock double-checked re-lookup (cache_content_matches) --
+    //
+    // Direct unit coverage of the predicate:
+    // identical-content-different-built_at must hit, distinct
+    // config_hash must miss, distinct ktstr_kconfig_hash must miss,
+    // distinct extra_kconfig_hash must miss, mismatched
+    // caller_has_vmlinux must miss. Plus an end-to-end test that
+    // proves the in-lock recheck observably skips the publish step
+    // by leaving the cached `built_at` intact when only `built_at`
+    // differs.
+
+    /// Identical hashes + identical vmlinux presence: predicate
+    /// matches even when built_at and version differ.
+    #[test]
+    fn cache_content_matches_when_only_built_at_differs() {
+        let mut cached = test_metadata("6.14.2");
+        cached.built_at = "2026-04-12T10:00:00Z".to_string();
+        let mut caller = test_metadata("6.14.2");
+        caller.built_at = "2026-04-12T11:00:00Z".to_string();
+        assert!(
+            cache_content_matches(&cached, &caller, false),
+            "identical content hashes (config_hash, ktstr_kconfig_hash, \
+             extra_kconfig_hash) and identical vmlinux presence must \
+             classify as content-equal — built_at is just a timestamp",
+        );
+    }
+
+    /// Distinct config_hash → real overwrite intent → predicate misses.
+    #[test]
+    fn cache_content_matches_when_config_hash_differs() {
+        let mut cached = test_metadata("6.14.2");
+        cached.config_hash = Some("hash-cached".to_string());
+        let mut caller = test_metadata("6.14.2");
+        caller.config_hash = Some("hash-caller".to_string());
+        assert!(
+            !cache_content_matches(&cached, &caller, false),
+            "distinct config_hash must classify as content-different \
+             — the .config differs, so the boot image bytes differ",
+        );
+    }
+
+    /// Distinct ktstr_kconfig_hash → real overwrite intent.
+    #[test]
+    fn cache_content_matches_when_ktstr_kconfig_hash_differs() {
+        let mut cached = test_metadata("6.14.2");
+        cached.ktstr_kconfig_hash = Some("kc-cached".to_string());
+        let mut caller = test_metadata("6.14.2");
+        caller.ktstr_kconfig_hash = Some("kc-caller".to_string());
+        assert!(
+            !cache_content_matches(&cached, &caller, false),
+            "distinct ktstr_kconfig_hash means the kconfig fragment \
+             changed → built differently → content-different",
+        );
+    }
+
+    /// Distinct extra_kconfig_hash → real overwrite intent.
+    #[test]
+    fn cache_content_matches_when_extra_kconfig_hash_differs() {
+        let mut cached = test_metadata("6.14.2");
+        cached.extra_kconfig_hash = Some("xc-cached".to_string());
+        let mut caller = test_metadata("6.14.2");
+        caller.extra_kconfig_hash = Some("xc-caller".to_string());
+        assert!(
+            !cache_content_matches(&cached, &caller, false),
+            "distinct extra_kconfig_hash means the user fragment \
+             changed → built differently → content-different",
+        );
+    }
+
+    /// Caller wants vmlinux but cached entry lacks it (or vice
+    /// versa) → publish is required to add/remove the sidecar.
+    #[test]
+    fn cache_content_matches_when_vmlinux_presence_differs() {
+        let cached_with = {
+            let mut m = test_metadata("6.14.2");
+            m.set_has_vmlinux(true);
+            m
+        };
+        let caller = test_metadata("6.14.2");
+        assert!(
+            !cache_content_matches(&cached_with, &caller, false),
+            "cached has vmlinux, caller lacks vmlinux artifact — \
+             content-different (publish must drop the sidecar)",
+        );
+
+        let cached_without = test_metadata("6.14.2");
+        assert!(
+            !cache_content_matches(&cached_without, &caller, true),
+            "cached lacks vmlinux, caller supplies one — \
+             content-different (publish must add the sidecar)",
+        );
+    }
+
+    /// End-to-end: a second `store()` that only bumps `built_at`
+    /// must hit the in-lock recheck and short-circuit, leaving the
+    /// FIRST publish's metadata intact on disk. Without the
+    /// recheck the second publish would land and the assertion on
+    /// `built_at` would flip to the second timestamp.
+    #[test]
+    fn store_in_lock_recheck_short_circuits_on_built_at_only_change() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+
+        let meta1 = KernelMetadata {
+            built_at: "2026-04-12T10:00:00Z".to_string(),
+            ..test_metadata("6.14.2")
+        };
+        cache
+            .store("recheck-key", &CacheArtifacts::new(&image), &meta1)
+            .unwrap();
+
+        // Same content (same hashes, no vmlinux), bumped built_at —
+        // the recheck must classify this as content-equivalent and
+        // skip the publish.
+        let meta2 = KernelMetadata {
+            built_at: "2026-04-13T10:00:00Z".to_string(),
+            ..test_metadata("6.14.2")
+        };
+        let returned = cache
+            .store("recheck-key", &CacheArtifacts::new(&image), &meta2)
+            .unwrap();
+
+        assert_eq!(
+            returned.metadata.built_at, "2026-04-12T10:00:00Z",
+            "the in-lock recheck must short-circuit and return the \
+             EXISTING cached entry — the returned built_at must \
+             match meta1, not meta2. If this flips to meta2, the \
+             recheck did not fire and every concurrent peer is \
+             redundantly republishing.",
+        );
+
+        let on_disk = cache.lookup("recheck-key").unwrap();
+        assert_eq!(
+            on_disk.metadata.built_at, "2026-04-12T10:00:00Z",
+            "the on-disk metadata must also remain meta1 — the \
+             recheck must skip the rename/swap step",
+        );
+    }
+
+    /// End-to-end: when a second `store()` carries a real content
+    /// change (distinct config_hash), the recheck miss-and-bypass
+    /// must publish the new content. Pins the recheck does NOT
+    /// silently lose legitimate overwrites.
+    #[test]
+    fn store_in_lock_recheck_bypasses_when_content_actually_differs() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+
+        let meta1 = KernelMetadata {
+            built_at: "2026-04-12T10:00:00Z".to_string(),
+            config_hash: Some("hash-v1".to_string()),
+            ..test_metadata("6.14.2")
+        };
+        cache
+            .store("bypass-key", &CacheArtifacts::new(&image), &meta1)
+            .unwrap();
+
+        let meta2 = KernelMetadata {
+            built_at: "2026-04-13T10:00:00Z".to_string(),
+            config_hash: Some("hash-v2".to_string()),
+            ..test_metadata("6.14.2")
+        };
+        let returned = cache
+            .store("bypass-key", &CacheArtifacts::new(&image), &meta2)
+            .unwrap();
+
+        assert_eq!(
+            returned.metadata.config_hash.as_deref(),
+            Some("hash-v2"),
+            "distinct config_hash must bypass the recheck and \
+             publish meta2; the returned entry's config_hash must \
+             be meta2's",
+        );
+        assert_eq!(
+            returned.metadata.built_at, "2026-04-13T10:00:00Z",
+            "with content actually changing, the publish must \
+             land meta2's built_at",
+        );
+    }
+
+    /// End-to-end: N concurrent peers race to `store()` the same
+    /// content under the same key. With the recheck, only the head
+    /// writer's publish lands; every late peer hits the in-lock
+    /// re-lookup and short-circuits. Observable through the
+    /// returned `CacheEntry::metadata.built_at` — every late peer
+    /// sees the head writer's timestamp regardless of what they
+    /// passed in.
+    #[test]
+    fn store_in_lock_recheck_serialises_concurrent_peers() {
+        use std::sync::Arc;
+        use std::sync::Barrier;
+        use std::thread;
+
+        let tmp = TempDir::new().unwrap();
+        let cache = Arc::new(CacheDir::with_root(tmp.path().join("cache")));
+        let src_dir = TempDir::new().unwrap();
+        let image = src_dir.path().join("bzImage");
+        std::fs::write(&image, b"shared image bytes").unwrap();
+
+        const PEER_COUNT: usize = 8;
+        let barrier = Arc::new(Barrier::new(PEER_COUNT));
+        let mut handles = Vec::with_capacity(PEER_COUNT);
+        for i in 0..PEER_COUNT {
+            let cache = Arc::clone(&cache);
+            let barrier = Arc::clone(&barrier);
+            let image = image.clone();
+            handles.push(thread::spawn(move || {
+                let mut meta = test_metadata("6.14.2");
+                // Each peer claims a distinct built_at — but
+                // identical hashes → recheck-equivalent.
+                meta.built_at = format!("2026-04-12T10:00:{i:02}Z");
+                barrier.wait();
+                cache
+                    .store("race-key", &CacheArtifacts::new(&image), &meta)
+                    .expect("every peer's store must succeed")
+            }));
+        }
+        let entries: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        // Exactly one distinct built_at across all returned
+        // entries — the head writer's. If the recheck didn't fire,
+        // each peer's publish would land in turn and we'd see N
+        // distinct values.
+        let timestamps: std::collections::BTreeSet<_> =
+            entries.iter().map(|e| e.metadata.built_at.clone()).collect();
+        assert_eq!(
+            timestamps.len(),
+            1,
+            "every peer must observe the same head-writer timestamp \
+             after the in-lock recheck short-circuits theirs; \
+             distinct timestamps means the recheck didn't fire and \
+             every peer redundantly republished. Got: {timestamps:?}",
+        );
+
+        // The on-disk entry must still match what every peer
+        // observed — a sanity check that no half-publish landed.
+        let final_entry = cache.lookup("race-key").expect("entry must exist");
+        let head_timestamp = timestamps.iter().next().unwrap();
+        assert_eq!(
+            &final_entry.metadata.built_at, head_timestamp,
+            "the cached entry's built_at must match what every peer \
+             returned — proves the head writer's publish landed and \
+             every late peer short-circuited to the same on-disk \
+             state",
+        );
+    }
+
+    // -- store_exclusive_lock_timeout env override --
+
+    /// Unset env var → default timeout.
+    #[test]
+    fn store_exclusive_lock_timeout_returns_default_when_unset() {
+        let _lock = lock_env();
+        let _g = EnvVarGuard::remove(STORE_EXCLUSIVE_LOCK_TIMEOUT_ENV);
+        assert_eq!(
+            store_exclusive_lock_timeout(),
+            STORE_EXCLUSIVE_LOCK_DEFAULT_TIMEOUT,
+            "absent env var must return the default timeout",
+        );
+    }
+
+    /// Empty env var → default timeout (mirrors KTSTR_CACHE_DIR's
+    /// "empty falls through" cascade behaviour for consistency).
+    #[test]
+    fn store_exclusive_lock_timeout_returns_default_when_empty() {
+        let _lock = lock_env();
+        let _g = EnvVarGuard::set(STORE_EXCLUSIVE_LOCK_TIMEOUT_ENV, "");
+        assert_eq!(
+            store_exclusive_lock_timeout(),
+            STORE_EXCLUSIVE_LOCK_DEFAULT_TIMEOUT,
+            "empty env var must fall through to the default",
+        );
+    }
+
+    /// Valid humantime string → parsed duration.
+    #[test]
+    fn store_exclusive_lock_timeout_parses_humantime() {
+        let _lock = lock_env();
+        for (input, want_secs) in [
+            ("30s", 30),
+            ("2m", 120),
+            ("10min", 600),
+            ("1h", 3600),
+            ("90s", 90),
+        ] {
+            let _g = EnvVarGuard::set(STORE_EXCLUSIVE_LOCK_TIMEOUT_ENV, input);
+            assert_eq!(
+                store_exclusive_lock_timeout(),
+                std::time::Duration::from_secs(want_secs),
+                "input `{input}` must parse to {want_secs}s",
+            );
+        }
+    }
+
+    /// Invalid env var value → fall through to default (the warn!
+    /// is emitted but the timeout is still safe). A typo never
+    /// silently drops the lock entirely.
+    #[test]
+    fn store_exclusive_lock_timeout_falls_through_on_parse_error() {
+        let _lock = lock_env();
+        let _g = EnvVarGuard::set(STORE_EXCLUSIVE_LOCK_TIMEOUT_ENV, "not-a-duration");
+        assert_eq!(
+            store_exclusive_lock_timeout(),
+            STORE_EXCLUSIVE_LOCK_DEFAULT_TIMEOUT,
+            "unparseable env value must fall back to the default \
+             rather than zero / disabled — a typo must not silently \
+             remove the timeout",
         );
     }
 }

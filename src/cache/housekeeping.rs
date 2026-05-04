@@ -545,4 +545,325 @@ mod tests {
         assert!(validate_filename("bzImage").is_ok());
         assert!(validate_filename("Image").is_ok());
     }
+
+    // -- atomic_swap_dirs direct unit tests --
+    //
+    // The swap is the publish step of `CacheDir::store` when the
+    // destination cache_key already exists; it must atomically
+    // swap two existing directory inodes via
+    // renameat2(RENAME_EXCHANGE) so a concurrent reader never sees
+    // a partial state. Direct coverage exercises the kernel
+    // syscall's semantics (both sides materialised, neither lost,
+    // contents preserved by reference rather than copy) without
+    // the `store()` orchestration on top.
+
+    /// Happy path: two existing directories swap their on-disk
+    /// contents in a single atomic operation. Verifies both the
+    /// content-swap observable AND that the underlying directory
+    /// inodes are preserved across the swap (renameat2 swaps
+    /// dentries, not contents — a regression to a copy-based
+    /// fallback would observably change the inode numbers).
+    #[test]
+    #[cfg(unix)]
+    fn atomic_swap_dirs_exchanges_two_existing_directories() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = TempDir::new().unwrap();
+        let a = tmp.path().join("alpha");
+        let b = tmp.path().join("bravo");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(a.join("payload"), b"alpha-bytes").unwrap();
+        std::fs::write(b.join("payload"), b"bravo-bytes").unwrap();
+        let a_ino_before = std::fs::metadata(&a).unwrap().ino();
+        let b_ino_before = std::fs::metadata(&b).unwrap().ino();
+
+        atomic_swap_dirs(&a, &b).expect("happy-path swap must succeed");
+
+        assert_eq!(
+            std::fs::read(a.join("payload")).unwrap(),
+            b"bravo-bytes",
+            "after RENAME_EXCHANGE, the path `a` must reference the \
+             contents that were under `b` before the swap",
+        );
+        assert_eq!(
+            std::fs::read(b.join("payload")).unwrap(),
+            b"alpha-bytes",
+            "after RENAME_EXCHANGE, the path `b` must reference the \
+             contents that were under `a` before the swap",
+        );
+        let a_ino_after = std::fs::metadata(&a).unwrap().ino();
+        let b_ino_after = std::fs::metadata(&b).unwrap().ino();
+        assert_eq!(
+            a_ino_after, b_ino_before,
+            "inode at path `a` must equal the pre-swap inode at `b` — \
+             a copy-based fallback would assign a fresh inode here",
+        );
+        assert_eq!(
+            b_ino_after, a_ino_before,
+            "inode at path `b` must equal the pre-swap inode at `a` — \
+             a copy-based fallback would assign a fresh inode here",
+        );
+    }
+
+    /// `RENAME_EXCHANGE` requires BOTH endpoints to exist. A
+    /// missing source must surface as an error rather than silently
+    /// creating one or losing data — the diagnostic must name both
+    /// paths so the operator can pinpoint the missing side.
+    #[test]
+    fn atomic_swap_dirs_missing_source_surfaces_error() {
+        let tmp = TempDir::new().unwrap();
+        let nonexistent = tmp.path().join("never-created");
+        let dst = tmp.path().join("dst");
+        std::fs::create_dir_all(&dst).unwrap();
+        let err = atomic_swap_dirs(&nonexistent, &dst)
+            .expect_err("missing source must produce an Err");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(&nonexistent.display().to_string()),
+            "diagnostic must name the missing source path: {msg}",
+        );
+        assert!(
+            msg.contains(&dst.display().to_string()),
+            "diagnostic must also name the destination path: {msg}",
+        );
+        assert!(
+            dst.exists(),
+            "destination must remain in place when the swap fails",
+        );
+    }
+
+    /// Symmetric: a missing destination must produce an actionable
+    /// error rather than a silent rename.
+    #[test]
+    fn atomic_swap_dirs_missing_destination_surfaces_error() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let nonexistent = tmp.path().join("never-created");
+        let err = atomic_swap_dirs(&src, &nonexistent)
+            .expect_err("missing destination must produce an Err");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(&src.display().to_string())
+                && msg.contains(&nonexistent.display().to_string()),
+            "diagnostic must name BOTH endpoints so the operator \
+             can attribute the failure: {msg}",
+        );
+        assert!(
+            src.exists(),
+            "source must remain in place when the swap fails",
+        );
+    }
+
+    /// Swap preserves arbitrary subtree shape — multiple files,
+    /// nested subdirs — by inode reference rather than recursive
+    /// copy. A regression that fell back to copy-then-rename would
+    /// be observable through changes to inode identity (file
+    /// metadata.ino()) but the simpler observable check is that
+    /// the swap is fast and doesn't traverse contents: we rely on
+    /// content equality post-swap as the proxy assertion.
+    #[test]
+    fn atomic_swap_dirs_preserves_subtree_shape() {
+        let tmp = TempDir::new().unwrap();
+        let a = tmp.path().join("alpha");
+        let b = tmp.path().join("bravo");
+        std::fs::create_dir_all(a.join("nested/deep")).unwrap();
+        std::fs::create_dir_all(b.join("other")).unwrap();
+        std::fs::write(a.join("nested/deep/leaf"), b"alpha-leaf").unwrap();
+        std::fs::write(a.join("top"), b"alpha-top").unwrap();
+        std::fs::write(b.join("other/file"), b"bravo-file").unwrap();
+
+        atomic_swap_dirs(&a, &b).expect("subtree swap must succeed");
+
+        assert_eq!(
+            std::fs::read(a.join("other/file")).unwrap(),
+            b"bravo-file",
+            "post-swap, `a` must contain the original `b` subtree",
+        );
+        assert_eq!(
+            std::fs::read(b.join("nested/deep/leaf")).unwrap(),
+            b"alpha-leaf",
+            "post-swap, `b` must contain the original `a` subtree",
+        );
+        assert_eq!(
+            std::fs::read(b.join("top")).unwrap(),
+            b"alpha-top",
+            "all files in the swapped subtree must remain reachable",
+        );
+    }
+
+    // -- read_metadata direct unit tests --
+    //
+    // `read_metadata` is the producer half of the prefix→kind
+    // contract documented on `metadata::classify_corrupt_reason`.
+    // The per-failure-mode prefixes are surfaced as `error_kind`
+    // strings via `kernel list --json`, so each prefix is part of
+    // the JSON contract and needs direct coverage that doesn't
+    // require driving a full `CacheDir::list` cycle.
+
+    /// Happy path: a valid metadata.json deserializes into a
+    /// `KernelMetadata` whose required fields round-trip.
+    #[test]
+    fn read_metadata_happy_path_parses_valid_json() {
+        use super::super::metadata::KernelSource;
+        let tmp = TempDir::new().unwrap();
+        let entry_dir = tmp.path().join("entry");
+        std::fs::create_dir_all(&entry_dir).unwrap();
+        let meta = KernelMetadata::new(
+            KernelSource::Tarball,
+            "x86_64".to_string(),
+            "bzImage".to_string(),
+            "2026-04-12T10:00:00Z".to_string(),
+        );
+        let json = serde_json::to_string(&meta).unwrap();
+        std::fs::write(entry_dir.join("metadata.json"), &json).unwrap();
+
+        let parsed = read_metadata(&entry_dir).expect("valid metadata must parse");
+        assert_eq!(parsed.image_name, "bzImage");
+        assert_eq!(parsed.arch, "x86_64");
+        assert_eq!(parsed.built_at, "2026-04-12T10:00:00Z");
+    }
+
+    /// Missing metadata.json → exact reason string `"metadata.json
+    /// missing"`. The string is the input the classifier dispatches
+    /// on for the `"missing"` error_kind, so the EXACT spelling is
+    /// part of the JSON contract.
+    #[test]
+    fn read_metadata_missing_returns_exact_missing_reason() {
+        let tmp = TempDir::new().unwrap();
+        let entry_dir = tmp.path().join("entry");
+        std::fs::create_dir_all(&entry_dir).unwrap();
+
+        let reason = read_metadata(&entry_dir)
+            .expect_err("absent metadata.json must produce an Err");
+        assert_eq!(
+            reason, "metadata.json missing",
+            "exact missing reason is the classifier dispatch key for `missing`",
+        );
+    }
+
+    /// metadata.json shaped as a directory rather than a file →
+    /// `"metadata.json unreadable: …"` prefix. `read_to_string` on
+    /// a directory returns `EISDIR`, surfaced through the
+    /// `Err(_) => "unreadable"` arm of the producer.
+    #[test]
+    fn read_metadata_unreadable_returns_unreadable_prefix() {
+        let tmp = TempDir::new().unwrap();
+        let entry_dir = tmp.path().join("entry");
+        std::fs::create_dir_all(&entry_dir).unwrap();
+        // Materialise metadata.json as a DIRECTORY — read_to_string
+        // surfaces EISDIR which is neither NotFound nor a successful
+        // read. Drives the `Err(e) => unreadable` arm.
+        std::fs::create_dir_all(entry_dir.join("metadata.json")).unwrap();
+
+        let reason = read_metadata(&entry_dir)
+            .expect_err("metadata.json shaped as a directory must produce an Err");
+        assert!(
+            reason.starts_with("metadata.json unreadable: "),
+            "EISDIR-on-read must surface under the `unreadable` prefix \
+             so the classifier dispatches to error_kind=unreadable; \
+             got: {reason}",
+        );
+    }
+
+    /// Malformed JSON (`Category::Syntax`) → `"metadata.json
+    /// malformed: "` prefix. The exact prefix is documented on
+    /// `metadata::classify_corrupt_reason` as the dispatch key for
+    /// the `"malformed"` error_kind.
+    #[test]
+    fn read_metadata_malformed_json_returns_malformed_prefix() {
+        let tmp = TempDir::new().unwrap();
+        let entry_dir = tmp.path().join("entry");
+        std::fs::create_dir_all(&entry_dir).unwrap();
+        std::fs::write(entry_dir.join("metadata.json"), b"not valid json {[").unwrap();
+
+        let reason = read_metadata(&entry_dir).expect_err("malformed JSON must produce an Err");
+        assert!(
+            reason.starts_with("metadata.json malformed: "),
+            "syntax-error JSON must surface under the `malformed` prefix; \
+             got: {reason}",
+        );
+    }
+
+    /// Truncated JSON (`Category::Eof`) → `"metadata.json
+    /// truncated: "` prefix.
+    #[test]
+    fn read_metadata_truncated_json_returns_truncated_prefix() {
+        let tmp = TempDir::new().unwrap();
+        let entry_dir = tmp.path().join("entry");
+        std::fs::create_dir_all(&entry_dir).unwrap();
+        // Truncated mid-value — Category::Eof.
+        std::fs::write(entry_dir.join("metadata.json"), br#"{"source":"#).unwrap();
+
+        let reason = read_metadata(&entry_dir).expect_err("truncated JSON must produce an Err");
+        assert!(
+            reason.starts_with("metadata.json truncated: "),
+            "EOF-mid-parse must surface under the `truncated` prefix; \
+             got: {reason}",
+        );
+    }
+
+    /// Missing required field (`Category::Data`) → `"metadata.json
+    /// schema drift: "` prefix.
+    #[test]
+    fn read_metadata_schema_drift_returns_schema_drift_prefix() {
+        let tmp = TempDir::new().unwrap();
+        let entry_dir = tmp.path().join("entry");
+        std::fs::create_dir_all(&entry_dir).unwrap();
+        // Valid JSON, but missing every required `KernelMetadata`
+        // field — Category::Data.
+        std::fs::write(entry_dir.join("metadata.json"), br#"{"version": "6.14"}"#).unwrap();
+
+        let reason = read_metadata(&entry_dir)
+            .expect_err("incomplete JSON must produce an Err");
+        assert!(
+            reason.starts_with("metadata.json schema drift: "),
+            "missing required field must surface under the `schema drift` \
+             prefix; got: {reason}",
+        );
+    }
+
+    /// Producer-classifier round-trip: every direct producer call
+    /// surfaces a prefix that the classifier dispatches into a
+    /// non-`unknown` `error_kind`. Locks the documented contract
+    /// at the producer side without dragging in the consumer-side
+    /// table-driven test.
+    #[test]
+    fn read_metadata_every_failure_mode_is_classifier_recognised() {
+        use super::super::metadata::classify_corrupt_reason;
+        let tmp = TempDir::new().unwrap();
+
+        // missing
+        let entry = tmp.path().join("absent");
+        std::fs::create_dir_all(&entry).unwrap();
+        let reason = read_metadata(&entry).unwrap_err();
+        assert_eq!(classify_corrupt_reason(&reason), "missing");
+
+        // unreadable
+        let entry = tmp.path().join("isdir");
+        std::fs::create_dir_all(entry.join("metadata.json")).unwrap();
+        let reason = read_metadata(&entry).unwrap_err();
+        assert_eq!(classify_corrupt_reason(&reason), "unreadable");
+
+        // malformed
+        let entry = tmp.path().join("malformed");
+        std::fs::create_dir_all(&entry).unwrap();
+        std::fs::write(entry.join("metadata.json"), b"not valid json {[").unwrap();
+        let reason = read_metadata(&entry).unwrap_err();
+        assert_eq!(classify_corrupt_reason(&reason), "malformed");
+
+        // truncated
+        let entry = tmp.path().join("truncated");
+        std::fs::create_dir_all(&entry).unwrap();
+        std::fs::write(entry.join("metadata.json"), br#"{"source":"#).unwrap();
+        let reason = read_metadata(&entry).unwrap_err();
+        assert_eq!(classify_corrupt_reason(&reason), "truncated");
+
+        // schema_drift
+        let entry = tmp.path().join("schema-drift");
+        std::fs::create_dir_all(&entry).unwrap();
+        std::fs::write(entry.join("metadata.json"), br#"{"version":"6.14"}"#).unwrap();
+        let reason = read_metadata(&entry).unwrap_err();
+        assert_eq!(classify_corrupt_reason(&reason), "schema_drift");
+    }
 }
