@@ -567,8 +567,10 @@ fn cmdline_contains_token(cmdline: &str, token: &str) -> bool {
 fn run_disk_template_mode() -> i32 {
     redirect_stdio_to_com2();
     // The mkfs.btrfs binary is packed at `bin/mkfs.btrfs` by
-    // [`crate::vmm::disk_template::ensure_template`] when it
-    // assembles the template-VM initramfs.
+    // [`crate::vmm::disk_template::build_template_via_vm`] via
+    // `include_files`; that function — not `ensure_template` — is
+    // the host-side site that assembles the template-VM
+    // initramfs.
     const MKFS: &str = "/bin/mkfs.btrfs";
     // `-f` forces overwrite of any existing signature so a leftover
     // ext4 magic from a host that recycled the staging file does
@@ -578,7 +580,7 @@ fn run_disk_template_mode() -> i32 {
     //
     // No `--metadata DUP` override: btrfs picks DUP metadata by
     // default on a single-device fs, which is the desired
-    // production format. The 256 MB minimum capacity (see
+    // production format. The 256 MiB minimum capacity (see
     // VIRTIO_BLK_DEFAULT_CAPACITY_BYTES doc) accommodates DUP.
     tracing::info!(mkfs = MKFS, target = "/dev/vda", "running mkfs.btrfs");
     let status = Command::new(MKFS)

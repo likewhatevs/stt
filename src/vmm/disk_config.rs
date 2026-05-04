@@ -86,6 +86,22 @@ impl Filesystem {
     /// variant that forgets to declare a binary surfaces as a
     /// non-exhaustive-match build error rather than as a runtime
     /// "binary not found" diagnostic at template-build time.
+    ///
+    /// # Two wiring points per variant
+    ///
+    /// Adding a new `Filesystem` variant that requires pre-formatting
+    /// requires updating BOTH `Filesystem::mkfs_binary_name` (here)
+    /// AND `mkfs_package_hint` in `src/vmm/disk_template.rs` (the
+    /// private companion fn used by
+    /// [`crate::vmm::disk_template::locate_host_mkfs`]). The latter
+    /// is the distro-package hint surfaced in the "binary not
+    /// found" diagnostic (e.g. `btrfs-progs` for `Btrfs`). Both are
+    /// exhaustive matches over `Filesystem`, so adding a variant
+    /// without filling in `mkfs_package_hint` is a
+    /// non-exhaustive-match build error; this paragraph exists so
+    /// an implementer reading the `mkfs_binary_name` definition
+    /// sees the second wiring point up front rather than
+    /// discovering it at compile time.
     pub(crate) fn mkfs_binary_name(self) -> Option<&'static str> {
         match self {
             Filesystem::Raw => None,
@@ -393,7 +409,7 @@ impl DiskThrottle {
     }
 }
 
-/// Per-disk config. `Default` is raw 256 MB device on `/dev/vda`;
+/// Per-disk config. `Default` is raw 256 MiB device on `/dev/vda`;
 /// formatting and auto-mount are deferred.
 ///
 /// No backing-file path field: the framework owns the per-test
@@ -401,10 +417,13 @@ impl DiskThrottle {
 /// for `Btrfs`). See module docs.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct DiskConfig {
-    /// Advertised capacity in megabytes. 256 MB default capacity.
-    /// Sized to accommodate common guest filesystem formatters;
-    /// smaller values are accepted but may cause `mkfs` failures
-    /// inside the template VM (see
+    /// Advertised capacity in mebibytes (MiB; the field name retains
+    /// the historical `_mb` suffix for serde compatibility, but the
+    /// unit is binary mebibytes — `capacity_bytes()` computes
+    /// `capacity_mb << 20`). 256 MiB default capacity. Sized to
+    /// accommodate common guest filesystem formatters; smaller
+    /// values are accepted but may cause `mkfs` failures inside
+    /// the template VM (see
     /// [`crate::vmm::disk_template::build_template_via_vm`]) for
     /// `Filesystem::Btrfs`.
     pub capacity_mb: u32,
@@ -438,7 +457,7 @@ pub struct DiskConfig {
 }
 
 impl Default for DiskConfig {
-    /// 256 MB, [`Filesystem::Raw`], no throttle. The `Raw` default
+    /// 256 MiB, [`Filesystem::Raw`], no throttle. The `Raw` default
     /// keeps the on-host cost minimal — no template-VM build, no
     /// cache directory required — and the per-test backing is a
     /// fresh sparse `tempfile()` per VM (see
@@ -446,11 +465,11 @@ impl Default for DiskConfig {
     ///
     /// # Memory footprint
     ///
-    /// The 256 MB sparse file lives under the host's `TMPDIR`
+    /// The 256 MiB sparse file lives under the host's `TMPDIR`
     /// (`tempfile()`); actual host disk/RAM consumption equals the
     /// bytes the guest writes, not the advertised capacity. On
     /// tmpfs-backed `TMPDIR` (the default on most Linux distros), a
-    /// fully-written disk consumes 256 MB of host **RAM** per test
+    /// fully-written disk consumes 256 MiB of host **RAM** per test
     /// — operators running large topologies should size host memory
     /// accordingly or override `TMPDIR` to a disk-backed path.
     fn default() -> Self {
@@ -466,7 +485,10 @@ impl Default for DiskConfig {
 }
 
 impl DiskConfig {
-    /// Set capacity in megabytes.
+    /// Set capacity in mebibytes (MiB). The argument is interpreted
+    /// as binary mebibytes per [`Self::capacity_bytes`], not decimal
+    /// megabytes; the method name retains the `_mb` suffix for
+    /// historical / serde-compat reasons.
     #[must_use = "builder methods consume self; bind the result"]
     pub fn capacity_mb(mut self, mb: u32) -> Self {
         self.capacity_mb = mb;
@@ -1270,8 +1292,9 @@ mod tests {
     /// site, which doesn't exist in-tree yet.
     ///
     /// The chain wraps with `.context(...)` to mirror the production
-    /// shape at `mod.rs:2557-2570` so the downcast walks through the
-    /// same context layer real callers see.
+    /// shape at [`crate::vmm::KtstrVm::init_virtio_blk`] (in
+    /// `src/vmm/setup.rs`) so the downcast walks through the same
+    /// context layer real callers see.
     #[test]
     fn disk_throttle_validation_error_downcasts_through_anyhow() {
         let typed = DiskConfig::default()
@@ -1281,7 +1304,8 @@ mod tests {
             .validate()
             .expect_err("burst < iops rejected");
         // Wrap in anyhow exactly like the production callsite does
-        // (mod.rs:2557-2570 — anyhow!(e).context("...")).
+        // (KtstrVm::init_virtio_blk in src/vmm/setup.rs:
+        // anyhow!(e).context("invalid disk throttle")).
         let wrapped = anyhow::anyhow!(typed).context("invalid disk throttle");
         // The typed variant must be reachable through the anyhow
         // chain via downcast_ref. Walk every cause.

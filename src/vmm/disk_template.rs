@@ -1,11 +1,11 @@
 //! Disk-template cache and per-test fan-out.
 //!
 //! This module ships the cache and clone primitives — the
-//! `(Filesystem, capacity)` keyed lookup, atomic-rename publish,
-//! per-key flock coordination, statfs-based btrfs/xfs gate at the
-//! cache root, FICLONE per-test fan-out, host mkfs locator (see
-//! [`Filesystem::mkfs_binary_name`] and [`locate_host_mkfs`]),
-//! AND the host-side template-VM driver in
+//! `(Filesystem, capacity, mkfs version)` keyed lookup,
+//! atomic-rename publish, per-key flock coordination, statfs-based
+//! btrfs/xfs gate at the cache root, FICLONE per-test fan-out,
+//! host mkfs locator (see [`Filesystem::mkfs_binary_name`] and
+//! [`locate_host_mkfs`]), AND the host-side template-VM driver in
 //! [`build_template_via_vm`] that boots a one-shot guest to run
 //! the variant's `mkfs.<fstype>` against a sparse staging image
 //! (`mkfs.btrfs /dev/vda` for `Filesystem::Btrfs`). The
@@ -22,10 +22,12 @@
 //! # Lifecycle
 //!
 //! 1. **Cache lookup.** [`ensure_template`] is called by
-//!    [`crate::vmm::init_virtio_blk`] (or callers that pre-warm the
-//!    cache). The lookup keys off
-//!    `(Filesystem::cache_tag, capacity_bytes)`. Hit → return the
-//!    template path.
+//!    [`crate::vmm::KtstrVm::init_virtio_blk`] (or callers that
+//!    pre-warm the cache). The lookup keys off
+//!    `(Filesystem::cache_tag, capacity_mib, mkfs_version_fingerprint)`.
+//!    Hit → return the template path. The mkfs-version fingerprint
+//!    component (see [`mkfs_version_fingerprint`]) ensures an mkfs
+//!    upgrade rotates the key and forces a fresh template build.
 //! 2. **Lockfile.** Miss → acquire an exclusive flock under
 //!    `<cache>/disk_templates/.locks/<key>.lock`. If a peer process is
 //!    already populating the cache, this blocks until they finish (or
@@ -156,6 +158,28 @@ const FICLONE_IOCTL: libc::c_ulong = 0x4004_9409;
 /// cleanup is always available.
 const TEMPLATE_LOCK_TIMEOUT: Duration = Duration::from_secs(600);
 
+// Reject 32-bit targets at compile time. `statfs.f_type` is
+// `__fsword_t` — `i64` on 64-bit Linux (LP64) and `i32` on 32-bit
+// Linux. Bit 31 of `BTRFS_SUPER_MAGIC` (`0x9123_683e`) is set, so
+// on 32-bit `__fsword_t` is a negative `i32` value. A subsequent
+// `as u64` cast sign-extends the negative bit pattern into the high
+// 32 bits (`0xFFFFFFFF_9123_683E`) and silently breaks the magic
+// comparison — a btrfs cache directory would be rejected as
+// "wrong filesystem". `XFS_SUPER_MAGIC` (`0x5846_5342`) has bit 31
+// clear and would survive a 32-bit port, so the failure mode is
+// asymmetric (btrfs always fails, xfs always passes). Reject the
+// 32-bit build at compile time rather than ship a silently-wrong
+// magic comparison.
+#[cfg(not(target_pointer_width = "64"))]
+compile_error!(
+    "ktstr's disk-template f_type comparison requires a 64-bit \
+     target. On 32-bit Linux `__fsword_t` is `i32`; sign-extension \
+     of `BTRFS_SUPER_MAGIC` (bit 31 set) into u64 silently breaks \
+     the magic comparison and rejects valid btrfs cache directories. \
+     Porting to 32-bit requires casting through u32 to clear the \
+     high bits before widening to u64."
+);
+
 /// btrfs `statfs.f_type` magic per `linux/magic.h`. `libc::BTRFS_SUPER_MAGIC`
 /// covers GNU but is gated on Linux; pinning the constant defends
 /// against a future libc minor release that drops/renames it.
@@ -163,19 +187,11 @@ const TEMPLATE_LOCK_TIMEOUT: Duration = Duration::from_secs(600);
 /// Stored as `u64` so the comparison expression has matching unsigned
 /// types. `statfs.f_type` is `__fsword_t` — `i64` on 64-bit Linux
 /// (LP64), and ktstr only targets 64-bit Linux (`x86_64-unknown-linux-*`
-/// and `aarch64-unknown-linux-*`). The call-site `as u64` cast
-/// preserves the bit pattern of an `i64` source, so the comparison
-/// against `0x9123_683e` matches the on-disk magic correctly on every
-/// supported target. Bit 31 of `BTRFS_SUPER_MAGIC` IS set
-/// (`0x9123_683e` = `1001 0001 ...`); on a hypothetical 32-bit Linux
-/// port where `__fsword_t` is `i32`, the `as u64` cast would
-/// sign-extend the negative value into the high 32 bits and break
-/// the comparison. ktstr does not support 32-bit targets, so the
-/// sign-extension trap is unreachable in practice. `XFS_SUPER_MAGIC`
-/// (`0x5846_5342`) has bit 31 clear and would survive that
-/// hypothetical 32-bit port; the asymmetry is documented here so a
-/// future 32-bit attempt fails loudly on btrfs rather than silently
-/// rejecting valid btrfs cache directories.
+/// and `aarch64-unknown-linux-*`); the `compile_error!` above rejects
+/// 32-bit builds before they reach the cast. The call-site `as u64`
+/// cast preserves the bit pattern of an `i64` source, so the
+/// comparison against `0x9123_683e` matches the on-disk magic
+/// correctly on every supported target.
 const BTRFS_SUPER_MAGIC: u64 = 0x9123_683e;
 /// xfs `statfs.f_type` magic per `linux/magic.h`. Same reasoning as
 /// `BTRFS_SUPER_MAGIC`.
@@ -300,18 +316,122 @@ pub(crate) fn verify_cache_dir_supports_reflink(dir: &Path) -> Result<()> {
 }
 
 /// Cache key for one template flavor (filesystem variant +
-/// capacity).
+/// capacity + mkfs version fingerprint).
 ///
-/// Renders as `"{tag}-{capacity_mib}m"`, e.g. `"btrfs-256m"`. The
-/// rendering is stable across rebuilds — capacity is forced into MiB
-/// (rather than raw bytes) so every entry has the same magnitude
-/// regardless of compiler-side rounding, and the `m` suffix
-/// disambiguates from any future GiB/sector-count keying. New
-/// `Filesystem` variants must pick a new `cache_tag` (see the
-/// `cache_tag` doc).
-pub(crate) fn template_cache_key(fs: Filesystem, capacity_bytes: u64) -> String {
+/// Renders as `"{tag}-{capacity_mib}m-{version_fp}"`, e.g.
+/// `"btrfs-256m-a1b2c3d4e5f6a7b8"`. The components:
+///
+/// - `tag` is the [`Filesystem::cache_tag`] short identifier.
+/// - `capacity_mib` forces the capacity into MiB (rather than raw
+///   bytes) so every entry has the same magnitude regardless of
+///   compiler-side rounding; the `m` suffix disambiguates from any
+///   future GiB/sector-count keying.
+/// - `version_fp` is a 16-hex-char SHA-256 prefix derived from the
+///   host `mkfs.<fstype> --version` output (see
+///   [`mkfs_version_fingerprint`]). It captures the on-disk format
+///   the host's mkfs binary produces; an mkfs upgrade that changes
+///   the version output rotates the fingerprint and forces a fresh
+///   template build. Without this component the cache would silently
+///   reuse stale templates whose internal format the new kernel may
+///   reject ([`clean_all`] is the operator-driven escape hatch when
+///   the fingerprint somehow misses a relevant change). Variants
+///   whose [`Filesystem::mkfs_binary_name`] returns `None` (today
+///   only `Raw`) pass `version_fp = "noversion"` because there is no
+///   formatter to fingerprint.
+///
+/// The rendering is stable across rebuilds for a given
+/// `(fs, capacity, mkfs version)` triple. New `Filesystem` variants
+/// must pick a new `cache_tag` (see the `cache_tag` doc).
+pub(crate) fn template_cache_key(fs: Filesystem, capacity_bytes: u64, version_fp: &str) -> String {
     let mib = capacity_bytes / (1024 * 1024);
-    format!("{tag}-{mib}m", tag = fs.cache_tag())
+    let tag = fs.cache_tag();
+    format!("{tag}-{mib}m-{version_fp}")
+}
+
+/// Sentinel `version_fp` for filesystem variants that have no
+/// userspace formatter ([`Filesystem::mkfs_binary_name`] returns
+/// `None`). [`Filesystem::Raw`] is the only such variant today;
+/// the production cache only ever sees this sentinel through unit
+/// tests that call [`template_cache_key`] with `Filesystem::Raw`
+/// (no real path computes a `Raw` template). Pinning the sentinel
+/// as a named constant keeps the test fixture in lockstep with the
+/// production fallback in [`ensure_template`].
+const NOVERSION_FP: &str = "noversion";
+
+/// Compute a 16-hex-char SHA-256 prefix of the `mkfs.<fstype>
+/// --version` output.
+///
+/// Used by [`template_cache_key`]: the fingerprint participates in
+/// the cache key so an mkfs upgrade rotates the key and forces a
+/// fresh template build. Without the fingerprint, an upgraded mkfs
+/// (e.g. `btrfs-progs v6.5 → v6.10` introducing a new on-disk
+/// feature flag default) would silently reuse the stale template
+/// whose internal format the new kernel may reject.
+///
+/// The fingerprint is the SHA-256 hash of the binary's stdout
+/// concatenated with stderr from a single `--version` invocation,
+/// truncated to the first 16 hex characters. Both streams are
+/// included because some `mkfs.<fstype>` builds emit version
+/// information on stderr (e.g. when stdout is reserved for
+/// machine-readable output). 16 hex chars (~64 bits) is well below
+/// the birthday-collision threshold for the dozens-to-hundreds of
+/// versions a single host will see across its lifetime.
+///
+/// The full output is captured via `Command::output` (no shell, no
+/// PATH search — `mkfs_path` is the canonicalized path returned by
+/// [`locate_host_mkfs`]). Failure paths surface as bail messages
+/// naming the binary path so an operator can rerun by hand.
+///
+/// # Output stability
+///
+/// `mkfs.btrfs --version` and `mkfs.xfs --version` write a short
+/// banner that includes a version string and a build-info tail.
+/// Different distros may patch the banner; the SHA-256 hash absorbs
+/// that without parsing. As long as a given binary produces
+/// deterministic output for `--version` (no timestamp, no
+/// random-id), the fingerprint is stable across runs of the same
+/// binary — verified by the
+/// [`mkfs_version_fingerprint_is_deterministic`] unit test.
+///
+/// # When the version output is non-deterministic
+///
+/// A buggy mkfs that emits a timestamp on `--version` would rotate
+/// the fingerprint on every call and defeat caching. This case is
+/// not defended against in code — a fingerprint that changes per
+/// invocation just causes the cache to behave like a no-cache.
+/// Operators who suspect this should run
+/// `<mkfs> --version | sha256sum` twice in a row and compare.
+fn mkfs_version_fingerprint(mkfs_path: &Path) -> Result<String> {
+    use sha2::Digest;
+    let output = std::process::Command::new(mkfs_path)
+        .arg("--version")
+        .output()
+        .with_context(|| {
+            format!(
+                "spawn {mkfs_path:?} --version for cache-key fingerprint"
+            )
+        })?;
+    // Don't gate on exit code: some mkfs binaries return non-zero on
+    // --version (e.g. exit 1 when stdout is not a tty). The hash
+    // covers both stdout and stderr regardless of exit status, so the
+    // fingerprint is well-defined as long as the binary produced any
+    // bytes at all.
+    if output.stdout.is_empty() && output.stderr.is_empty() {
+        bail!(
+            "{mkfs_path:?} --version produced no output \
+             (stdout/stderr both empty, status={status:?}). Cannot \
+             fingerprint the binary for the disk-template cache \
+             key — the binary may be a stub or corrupted.",
+            status = output.status,
+        );
+    }
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(&output.stdout);
+    hasher.update(&output.stderr);
+    let digest = hasher.finalize();
+    // 16 hex chars = 64 bits. Birthday collision around ~2^32
+    // distinct versions; vastly more than any host will ever see.
+    Ok(hex::encode(&digest[..8]))
 }
 
 /// Path to the template image for the given key, relative to the
@@ -554,6 +674,31 @@ pub(crate) fn acquire_template_lock(key: &str) -> Result<std::os::fd::OwnedFd> {
 /// time out at [`acquire_template_lock`] long before any per-test
 /// fan-out runs, surfacing as a holder-list bail with the lockfile
 /// path — a visibly different diagnostic than the `EEXIST` here.
+///
+/// # Distinct from `store_atomic`'s EEXIST surface
+///
+/// [`store_atomic`] also has a "destination already exists" surface
+/// — its `final_dir.exists()` check on the published cache entry —
+/// but that surface is **absorbed**, not propagated: when the
+/// `<cache>/<key>/` directory already exists, `store_atomic`
+/// returns the existing template path as `Ok(...)` (idempotent
+/// no-op publish, because two concurrent peers building the same
+/// `(fs, capacity, mkfs version)` key produce byte-identical
+/// templates by construction). Operators do NOT see an `EEXIST`
+/// error from `store_atomic` in the steady state.
+///
+/// The `EEXIST` surface in `clone_to_per_test` here is fundamentally
+/// different: it is **propagated** as a hard error because two
+/// per-test fan-out files at the same path are NOT byte-identical
+/// (each test writes its own per-test mutations on top of the
+/// reflink clone). Silently overwriting would lose the leftover
+/// peer's data; absorbing as a no-op would hand the new test a
+/// stale per-test image. Hard error is the only correct disposition.
+///
+/// In short: `store_atomic` EEXIST = "two peers raced and that's
+/// fine, the template is the same"; `clone_to_per_test` EEXIST =
+/// "leftover debris, investigate the predecessor". Never confuse
+/// the two when triaging.
 pub(crate) fn clone_to_per_test(src_path: &Path, dest_path: &Path) -> Result<File> {
     let src = OpenOptions::new()
         .read(true)
@@ -599,16 +744,27 @@ pub(crate) fn clone_to_per_test(src_path: &Path, dest_path: &Path) -> Result<Fil
 /// signal to install the corresponding distro package (e.g.
 /// `btrfs-progs` for `Btrfs`) before using that filesystem.
 ///
-/// The host binary is NOT exec'd at template-build time — it is
-/// embedded into the template-VM initramfs and exec'd by guest init
-/// inside the VM. The kernel inside the VM is the on-disk-format
-/// authority; the host binary just provides the `mkfs.<fstype>`
-/// userspace driver to drive the kernel into formatting.
-pub(crate) fn locate_host_mkfs(fs: Filesystem) -> Result<Option<PathBuf>> {
+/// The returned tuple carries BOTH the canonicalized binary path
+/// AND the `mkfs.<fstype>` name. Callers that pack the binary into
+/// the template-VM initramfs need both: the path to read the bytes
+/// off disk, the name to compose the in-archive path
+/// (`bin/<name>`). Returning both in a single call lets the caller
+/// avoid a redundant [`Filesystem::mkfs_binary_name`] dispatch — a
+/// caller that already has the path always has the matching name
+/// without going back to the typed accessor.
+///
+/// The host binary is NOT exec'd at template-build time for
+/// formatting — it is embedded into the template-VM initramfs and
+/// exec'd by guest init inside the VM. The kernel inside the VM is
+/// the on-disk-format authority; the host binary just provides the
+/// `mkfs.<fstype>` userspace driver to drive the kernel into
+/// formatting.
+pub(crate) fn locate_host_mkfs(fs: Filesystem) -> Result<Option<(PathBuf, &'static str)>> {
     let Some(name) = fs.mkfs_binary_name() else {
         return Ok(None);
     };
-    locate_host_binary(name, mkfs_package_hint(fs)).map(Some)
+    let path = locate_host_binary(name, mkfs_package_hint(fs))?;
+    Ok(Some((path, name)))
 }
 
 /// Distro package hint for the formatter binary returned by
@@ -688,11 +844,70 @@ fn locate_host_binary(name: &str, package_hint: &str) -> Result<PathBuf> {
 /// Misses acquire the per-key flock, re-check, then build the
 /// template via [`build_template_via_vm`] and atomically install it.
 ///
-/// Callers (typically [`crate::vmm::init_virtio_blk`]) then pass
-/// the returned path to [`clone_to_per_test`] for the per-test
-/// reflink clone.
+/// The cache key includes a fingerprint derived from
+/// `mkfs.<fstype> --version` (see [`mkfs_version_fingerprint`]) so
+/// an mkfs upgrade rotates the key and forces a fresh template
+/// build. The version query runs once per [`ensure_template`] call;
+/// the cache lookup short-circuits on hit before any further work.
+///
+/// # Tradeoff: hit path needs the formatter present (formatter-dependent variants only)
+///
+/// This tradeoff applies ONLY to filesystem variants that have a
+/// userspace formatter — variants whose
+/// [`Filesystem::mkfs_binary_name`] returns `Some(_)` (today
+/// `Filesystem::Btrfs`). For those variants, the fingerprint is
+/// required to construct the cache key, so every call to
+/// `ensure_template` (cache hit or miss) must locate the host
+/// formatter and query its version. If the formatter binary is
+/// removed from PATH after the cache is populated,
+/// `ensure_template` bails even on cache hits — the lookup cannot
+/// run without a key, and the key cannot be built without the
+/// fingerprint. The bail surfaces from
+/// [`locate_host_mkfs`]'s "binary not found" diagnostic with the
+/// distro-package install hint.
+///
+/// `Filesystem::Raw` is **exempt** from this tradeoff: its
+/// [`Filesystem::mkfs_binary_name`] returns `None`,
+/// [`locate_host_mkfs`] returns `None` without consulting PATH,
+/// and the `version_fp` falls back to the [`NOVERSION_FP`]
+/// sentinel. There is no PATH dependency at all for `Raw`. (In
+/// practice the production path never reaches `ensure_template`
+/// for `Raw` — the gate at
+/// [`crate::vmm::KtstrVm::init_virtio_blk`] short-circuits first —
+/// but the fallback exists for defensive/test invocations.)
+///
+/// Operators hitting the formatter-removed bail on a
+/// formatter-dependent variant must reinstall the formatter (e.g.
+/// `apt install btrfs-progs` for `Filesystem::Btrfs`) OR run
+/// [`clean_all`] and switch the test config to `Filesystem::Raw`,
+/// which bypasses the template lifecycle entirely (no formatter
+/// required, no FICLONE clone, fresh sparse tempfile per test).
+/// The framework does NOT silently fall back to a stale-key
+/// lookup when the formatter is missing — the cache key would be
+/// ambiguous, so refusal is the correct disposition.
+///
+/// Callers (typically [`crate::vmm::KtstrVm::init_virtio_blk`])
+/// then pass the returned path to [`clone_to_per_test`] for the
+/// per-test reflink clone.
 pub(crate) fn ensure_template(fs: Filesystem, capacity_bytes: u64) -> Result<PathBuf> {
-    let key = template_cache_key(fs, capacity_bytes);
+    // Resolve the host mkfs binary up front and query its version
+    // fingerprint so the cache key reflects which mkfs would build
+    // the template if we miss. The PATH lookup here is cheap (one
+    // stat per PATH entry until found); the `--version` invocation
+    // is one fork+exec per ensure_template call. Running it on
+    // every call (including hits) is the price of a key that
+    // self-invalidates on mkfs upgrade. Variants whose
+    // [`Filesystem::mkfs_binary_name`] returns `None` (today only
+    // [`Filesystem::Raw`]) skip the fingerprint and use the
+    // `noversion` sentinel; the production path never builds a
+    // template for `Raw` (the gate at
+    // [`crate::vmm::KtstrVm::init_virtio_blk`] short-circuits
+    // first), so this branch is defensive.
+    let version_fp = match locate_host_mkfs(fs)? {
+        Some((mkfs_path, _name)) => mkfs_version_fingerprint(&mkfs_path)?,
+        None => NOVERSION_FP.to_string(),
+    };
+    let key = template_cache_key(fs, capacity_bytes, &version_fp);
     if let Some(hit) = lookup(&key)? {
         return Ok(hit);
     }
@@ -741,13 +956,14 @@ pub(crate) fn ensure_template(fs: Filesystem, capacity_bytes: u64) -> Result<Pat
 /// The filename includes BOTH the cache key and the pid because the
 /// per-key flock only serialises peers within a single key — the
 /// same process holds different per-key flocks concurrently across
-/// distinct `(fs, capacity)` pairs (cross-key concurrency is
-/// permitted). Without the key in the filename, two simultaneous
-/// in-flight builds for `btrfs-256m` and `btrfs-1024m` from the
-/// same pid would collide on `template.img.in-flight.<pid>` — the
-/// second open would truncate the first's image while it boots,
-/// corrupting the template the first build is formatting. Including
-/// the key makes the filename unique per `(key, pid)`.
+/// distinct `(fs, capacity, mkfs version)` triples (cross-key
+/// concurrency is permitted). Without the key in the filename, two
+/// simultaneous in-flight builds for `btrfs-256m-<fp>` and
+/// `btrfs-1024m-<fp>` from the same pid would collide on
+/// `template.img.in-flight.<pid>` — the second open would truncate
+/// the first's image while it boots, corrupting the template the
+/// first build is formatting. Including the key makes the filename
+/// unique per `(key, pid)`.
 ///
 /// Pulled out as a free fn so the uniqueness invariant has a
 /// dedicated test (`staging_image_path_is_unique_per_key_and_pid`).
@@ -859,7 +1075,13 @@ fn build_template_via_vm(
     // `None` result means a caller bypassed the gate in
     // [`crate::vmm::KtstrVm::init_virtio_blk`]; reject with an
     // actionable diagnostic.
-    let mkfs = locate_host_mkfs(fs)?.ok_or_else(|| {
+    //
+    // The returned tuple carries both the canonicalized path AND
+    // the in-archive name — the consolidated return shape avoids
+    // calling [`Filesystem::mkfs_binary_name`] twice (once via
+    // `locate_host_mkfs`, once for the archive path). One typed
+    // dispatch, one match arm.
+    let (mkfs, mkfs_name) = locate_host_mkfs(fs)?.ok_or_else(|| {
         anyhow!(
             "build_template_via_vm called with Filesystem::{fs:?} — \
              this filesystem variant has no userspace formatter \
@@ -870,14 +1092,6 @@ fn build_template_via_vm(
              in init_virtio_blk."
         )
     })?;
-    // mkfs_name comes from the same accessor; reuse it for the
-    // in-archive path so the host-PATH lookup name and the in-
-    // archive path stay in lockstep without a parallel match arm.
-    // Safe to unwrap because `locate_host_mkfs` only returns Some
-    // when `mkfs_binary_name()` was Some.
-    let mkfs_name = fs
-        .mkfs_binary_name()
-        .expect("locate_host_mkfs returned Some only when mkfs_binary_name is Some");
 
     // Resolve a kernel image so the template-build VM can boot.
     // Reuses the same KTSTR_KERNEL / cache / sysroot cascade the
@@ -896,6 +1110,17 @@ fn build_template_via_vm(
     // rename(2) into place is on the same filesystem.
     std::fs::create_dir_all(cache_root)
         .with_context(|| format!("create cache root {cache_root:?} for staging image"))?;
+    // Re-verify reflink support against the materialized cache root.
+    // [`ensure_template`] performs this check too, but
+    // `build_template_via_vm` is also reachable from direct callers
+    // (tests, future operator-driven flows). Without this check, a
+    // direct caller that staged a non-reflink-capable cache_root would
+    // produce a template image whose subsequent
+    // [`clone_to_per_test`] fan-out would fail at FICLONE time —
+    // wasting the whole template-VM boot cost on a doomed run.
+    // Re-verifying here closes the gate at the earliest point that
+    // can detect the mismatch.
+    verify_cache_dir_supports_reflink(cache_root)?;
     let staging_path = staging_image_path(cache_root, cache_key, std::process::id());
     create_and_size_staging_image(&staging_path, capacity_bytes)?;
 
@@ -914,15 +1139,27 @@ fn build_template_via_vm(
     // unformatted device exactly as expected for the staging
     // image (the whole point of this VM is to format it).
     //
-    // `mkfs_name` was non-None at the function-entry gate above
-    // (the only `None` variant — Raw — bails before reaching this
-    // point), so reusing it for the archive path is sound. Driving
-    // the archive path off the same accessor keeps the host-PATH
-    // lookup name and the in-archive path in lockstep without a
-    // parallel match arm to drift.
+    // `mkfs_name` came from the same [`locate_host_mkfs`] tuple
+    // that produced the canonicalized binary path above; the
+    // host-PATH lookup name and the in-archive path are guaranteed
+    // to stay in lockstep without a parallel match arm to drift.
     let mkfs_archive_path = format!("bin/{mkfs_name}");
+    // `capacity_mb` is u32; an `as u32` cast on `capacity_bytes /
+    // (1024 * 1024)` would silently truncate any input above 4 TiB
+    // (u32::MAX MiB). `try_from` surfaces the overflow as an
+    // actionable error naming the offending value, so a caller
+    // that passes an oversized capacity learns about it explicitly
+    // rather than seeing a corrupted disk size in the guest.
+    let capacity_mb = u32::try_from(capacity_bytes / (1024 * 1024)).with_context(|| {
+        format!(
+            "capacity_mb overflow: capacity_bytes={capacity_bytes} \
+             yields {} MiB which exceeds u32::MAX. DiskConfig::capacity_mb \
+             is u32; use a smaller capacity.",
+            capacity_bytes / (1024 * 1024),
+        )
+    })?;
     let disk = crate::vmm::disk_config::DiskConfig::default()
-        .capacity_mb((capacity_bytes / (1024 * 1024)) as u32)
+        .capacity_mb(capacity_mb)
         .filesystem(Filesystem::Raw);
     // VM-level timeout for the template build. 120s = 2 minutes,
     // chosen as the inner bound that lets the outer
@@ -1057,6 +1294,45 @@ fn build_template_via_vm(
 /// pattern match. Published cache entries (`<cache_key>/`) are
 /// left untouched — they have no pid suffix and don't match either
 /// debris shape.
+///
+/// # When to call this
+///
+/// **Library code (the steady state):** [`clean_all`] invokes this
+/// before walking published entries, and the framework can also
+/// call it opportunistically before a `store_atomic` to keep the
+/// cache root tidy. Library callers do NOT need to invoke this
+/// directly to make a workload run — `ensure_template` does not
+/// trip on stale debris because each new build picks a unique
+/// `(cache_key, pid)` filename via [`staging_image_path`].
+///
+/// **Operator-driven (the rare case):** call this from a host
+/// admin tool or a CI cleanup hook when:
+/// - The host has hosted long-running ktstr peers that crashed
+///   without graceful shutdown (SIGKILL, kernel oops, OOM kill,
+///   panic) and the cache root is accumulating
+///   `template.img.in-flight.*` / `*.tmp.*` entries.
+/// - Disk pressure is rising and an inventory of the cache root
+///   shows debris files significantly outweigh published entries.
+/// - You're scripting a "clean cache" subcommand that does NOT
+///   want to remove published entries (use [`clean_all`] for that).
+///
+/// **What this does NOT do:**
+/// - Does not remove published cache entries — those have no pid
+///   suffix and are filtered out by the prefix patterns. Use
+///   [`clean_all`] when you want a full cache wipe.
+/// - Does not remove the `.locks/` subdirectory — lockfile inodes
+///   may be held by live peers and dropping them would orphan
+///   their fds.
+/// - Does not coordinate with live peers via flock — the pid-
+///   liveness probe (`kill(pid, None)` returning `ESRCH`) is the
+///   only synchronization. A peer in the brief window between
+///   pid allocation and store_atomic completion may have its
+///   debris removed mid-transaction; the pid-liveness probe
+///   protects against this by reporting "live" until the peer
+///   actually exits.
+///
+/// Returns the count of removed debris entries (info-level
+/// tracing also logs each removal).
 pub fn clean_orphaned_tmp_dirs(cache_root: &Path) -> Result<usize> {
     if !cache_root.is_dir() {
         // Cache root not yet materialised — nothing to sweep.
@@ -1181,14 +1457,59 @@ pub fn clean_orphaned_tmp_dirs(cache_root: &Path) -> Result<usize> {
 /// count of entries actually removed.
 ///
 /// Mirrors [`crate::cache::CacheDir::clean_all`] in `src/cache.rs`.
-/// Operators run this after a host `mkfs.<fstype>` upgrade that
-/// invalidates the on-disk format the cached templates were
-/// formatted with: today the cache key is `(fs_tag, capacity_mib)`
-/// only — it does NOT capture the mkfs binary version — so a
-/// post-upgrade run would silently reuse stale templates whose
-/// internal format the new kernel may reject. Until the cache key
-/// learns the mkfs version (tracked separately in #566), `clean_all`
-/// is the operator-driven escape hatch.
+///
+/// # When to call this
+///
+/// **Operator-driven only.** No production code path calls
+/// `clean_all` automatically — the framework's runtime path is
+/// `ensure_template` → cache hit / build, never a full sweep.
+/// Operators reach for `clean_all` in three scenarios:
+///
+/// 1. **Disk-pressure escape hatch.** A long-running host has
+///    accumulated dozens of cache entries across distinct
+///    `(fs, capacity, mkfs version)` triples (each capacity-mb
+///    setting and each mkfs upgrade rotates the key). When disk
+///    pressure rises, `clean_all` is the nuclear option — wipe
+///    every published template and let the next test run rebuild
+///    only what it needs.
+///
+/// 2. **Defense against a fingerprint-blind upgrade.** The cache
+///    key includes a fingerprint derived from
+///    [`mkfs_version_fingerprint`] (the SHA-256 prefix of
+///    `mkfs.<fstype> --version` output), so an mkfs upgrade that
+///    changes the version banner rotates the key automatically
+///    and the cache self-invalidates. `clean_all` remains the
+///    fallback when the version banner does NOT change across an
+///    upgrade (a downstream patch that bumps the on-disk format
+///    without bumping `--version`) — a rare distro-specific case
+///    that operators discover via "the new kernel rejects the
+///    cached template" failures.
+///
+/// 3. **Cleanup before benchmarking.** Empty cache state lets a
+///    benchmark measure the full `(template build + clone)` cost
+///    deterministically. `clean_all` followed by `ensure_template`
+///    is the canonical "cold cache" sequence.
+///
+/// **What this does NOT do:**
+/// - Does not remove the `.locks/` subdirectory — lockfile inodes
+///   may be held by live peers and dropping them would orphan
+///   their fds (see "What gets skipped" below).
+/// - Does not block on live peers — entries whose flock is held
+///   by a live peer are skipped (logged at `info`); only quiescent
+///   entries are removed.
+/// - Does not fall back to a per-key wipe loop on a busy cache —
+///   if every entry is locked the function returns 0, not an
+///   error. Operators who need to force-remove a locked entry
+///   should kill the holder and re-run.
+///
+/// # Companion: stale-debris sweep
+///
+/// `clean_all` calls [`clean_orphaned_tmp_dirs`] up front so a
+/// rebuilding peer that hits the freshly-empty cache doesn't trip
+/// on stale staging debris from a crashed predecessor during its
+/// first `store_atomic`. Operators who want ONLY the debris sweep
+/// (without removing published entries) should call
+/// [`clean_orphaned_tmp_dirs`] directly.
 ///
 /// # Concurrency
 ///
@@ -1213,8 +1534,9 @@ pub fn clean_orphaned_tmp_dirs(cache_root: &Path) -> Result<usize> {
 /// The lockfile inode itself is NOT removed — other peers may
 /// have it open, and dropping the file while peers wait on it
 /// would orphan their fds. Lockfile inodes are sized at a few
-/// bytes each and accumulate at the rate of distinct `(fs,
-/// capacity)` keys; leaving them is bounded growth, not a leak.
+/// bytes each and accumulate at the rate of distinct
+/// `(fs, capacity, mkfs version)` keys; leaving them is bounded
+/// growth, not a leak.
 ///
 /// # Sweeps debris first
 ///
@@ -1408,23 +1730,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cache_key_renders_capacity_in_mib() {
-        let key = template_cache_key(Filesystem::Btrfs, 256 * 1024 * 1024);
-        assert_eq!(key, "btrfs-256m");
-        let key = template_cache_key(Filesystem::Raw, 1024 * 1024 * 1024);
-        assert_eq!(key, "raw-1024m");
+    fn cache_key_renders_capacity_in_mib_and_version_fp() {
+        let key = template_cache_key(Filesystem::Btrfs, 256 * 1024 * 1024, "deadbeef");
+        assert_eq!(key, "btrfs-256m-deadbeef");
+        let key = template_cache_key(Filesystem::Raw, 1024 * 1024 * 1024, NOVERSION_FP);
+        assert_eq!(key, "raw-1024m-noversion");
     }
 
     #[test]
     fn cache_key_truncates_sub_mib_capacity_to_zero() {
         // Capacity less than 1 MiB rounds down to 0m. This is
-        // intentional — DiskConfig's capacity is u32 megabytes (see
+        // intentional — DiskConfig's capacity is u32 mebibytes (see
         // capacity_mb), so the only way to hit this is constructing
         // capacity_bytes by hand below 2^20. Pinning the rendering
         // for that corner so a future bug that rounds up silently
         // is caught.
-        let key = template_cache_key(Filesystem::Btrfs, 1024);
-        assert_eq!(key, "btrfs-0m");
+        let key = template_cache_key(Filesystem::Btrfs, 1024, "deadbeef");
+        assert_eq!(key, "btrfs-0m-deadbeef");
+    }
+
+    #[test]
+    fn cache_key_rotates_with_version_fp() {
+        // Two different mkfs versions produce two different keys for
+        // the same (fs, capacity) pair. Pins the cache-key
+        // self-invalidation on mkfs upgrade — without this property
+        // the cache would silently reuse stale templates whose
+        // internal format the new kernel may reject.
+        let v1 = template_cache_key(Filesystem::Btrfs, 256 * 1024 * 1024, "fp_v1");
+        let v2 = template_cache_key(Filesystem::Btrfs, 256 * 1024 * 1024, "fp_v2");
+        assert_ne!(v1, v2, "cache key must rotate when version_fp changes");
+        assert_eq!(v1, "btrfs-256m-fp_v1");
+        assert_eq!(v2, "btrfs-256m-fp_v2");
     }
 
     #[test]
@@ -1516,6 +1852,114 @@ mod tests {
         assert!(
             msg.contains("imagined-package"),
             "error names the package hint: {msg}",
+        );
+    }
+
+    /// `locate_host_mkfs(Filesystem::Raw)` returns `Ok(None)` without
+    /// touching `PATH`. Pin the short-circuit branch so a regression
+    /// that always falls through to [`locate_host_binary`] for `Raw`
+    /// surfaces here — that regression would either bail spuriously
+    /// (no `mkfs.raw` on PATH) or, worse, locate an unrelated binary
+    /// named `<empty>` and pack it into the template-VM initramfs.
+    /// This test exercises the `Raw` arm of
+    /// [`Filesystem::mkfs_binary_name`]'s `match` via the
+    /// [`locate_host_mkfs`] entry point.
+    ///
+    /// PATH is forced to an empty tempdir so a `Some(_)` result
+    /// would have to come from a phantom PATH walk that ignores the
+    /// `None` short-circuit; the empty-tempdir override removes the
+    /// possibility that the test passes for the wrong reason.
+    #[test]
+    fn locate_host_mkfs_raw_returns_none() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let _path_guard =
+            crate::test_support::test_helpers::EnvVarGuard::set("PATH", tmp.path());
+        let result = locate_host_mkfs(Filesystem::Raw)
+            .expect("Raw must short-circuit before any PATH walk");
+        assert!(
+            result.is_none(),
+            "Filesystem::Raw has no userspace formatter; \
+             locate_host_mkfs must return Ok(None) without consulting \
+             PATH. Got: {result:?}",
+        );
+    }
+
+    /// [`mkfs_version_fingerprint`] is deterministic for the same
+    /// binary: two invocations against the same path produce
+    /// byte-identical fingerprints. Pin the determinism contract so
+    /// a regression that includes a timestamp / random nonce in the
+    /// fingerprint would surface here. Without this property the
+    /// cache key would rotate on every call and defeat caching
+    /// entirely.
+    ///
+    /// Searches `PATH` for a series of binaries known to emit a
+    /// stable `--version` banner (coreutils `cat`, `ls`, `true`).
+    /// At least one of these is on every Linux distro ktstr
+    /// supports; the first to produce non-empty output for
+    /// `--version` wins. We don't care WHAT the fingerprint says,
+    /// only that it's stable across two invocations.
+    ///
+    /// Skips when none of the candidate binaries produces output
+    /// for `--version` (extremely rare — would require a
+    /// busybox-only system that strips `--version` from every
+    /// candidate).
+    #[test]
+    fn mkfs_version_fingerprint_is_deterministic() {
+        let path_var = match std::env::var_os("PATH") {
+            Some(p) => p,
+            None => return,
+        };
+        // Try several candidates; the first to produce non-empty
+        // `--version` output wins. `cat`/`ls` are GNU coreutils
+        // mainstays that emit a multi-line banner on `--version`;
+        // even on busybox, `cat --version` typically emits a
+        // banner-shaped one-liner.
+        let mut working_binary: Option<PathBuf> = None;
+        for name in &["cat", "ls", "true"] {
+            for dir in std::env::split_paths(&path_var) {
+                let candidate = dir.join(name);
+                if !std::fs::metadata(&candidate)
+                    .map(|m| m.is_file())
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                // Probe: does `--version` produce any output?
+                let probe = std::process::Command::new(&candidate)
+                    .arg("--version")
+                    .output();
+                let Ok(output) = probe else {
+                    continue;
+                };
+                if !output.stdout.is_empty() || !output.stderr.is_empty() {
+                    working_binary = Some(candidate);
+                    break;
+                }
+            }
+            if working_binary.is_some() {
+                break;
+            }
+        }
+        let Some(binary_path) = working_binary else {
+            return;
+        };
+        let fp1 = mkfs_version_fingerprint(&binary_path)
+            .expect("first --version invocation must succeed");
+        let fp2 = mkfs_version_fingerprint(&binary_path)
+            .expect("second --version invocation must succeed");
+        assert_eq!(
+            fp1, fp2,
+            "fingerprint must be deterministic across repeated \
+             invocations of the same binary"
+        );
+        assert_eq!(
+            fp1.len(),
+            16,
+            "fingerprint must render as 16 hex chars (64 bits): {fp1}",
+        );
+        assert!(
+            fp1.chars().all(|c| c.is_ascii_hexdigit()),
+            "fingerprint must be hex-only: {fp1}",
         );
     }
 
@@ -1842,54 +2286,65 @@ mod tests {
     /// inequality across two distinct btrfs subvolumes is the
     /// reason `f_fsid` is compared in addition to `f_type`).
     ///
-    /// Probes `tempfile::tempdir()` (typically `TMPDIR` /
-    /// `/tmp`, often tmpfs) against `/proc` (procfs). On almost
-    /// every Linux host these land on different filesystems —
-    /// procfs has a synthetic `f_fsid` distinct from any real
-    /// backing filesystem. The test guards against the rare host
-    /// where the two probed paths happen to share an `f_fsid`
-    /// (e.g. a minimal container without `/proc` mounted, where
-    /// `/proc` is fabricated by the rootfs): if both probes
-    /// resolve to byte-identical `f_fsid` AND byte-identical
-    /// `f_type`, the cross-fs distinguishability is genuinely
-    /// not exercised on this host and we skip the inequality
-    /// assertion rather than fail noisily.
-    ///
-    /// The skip-arm is the standard hermetic-test guard
-    /// (see `verify_cache_dir_walks_through_dangling_symlink` for
-    /// the same pattern in this module): we cannot demand a
-    /// specific filesystem layout in CI, but when the layout
-    /// holds we pin the property.
+    /// Probes `tempfile::tempdir()` against a list of standard
+    /// pseudo filesystems (`/proc`, `/sys`, `/dev`, `/`) ordered
+    /// most-likely-distinct first. The first candidate whose
+    /// statfs differs from the tempdir's exercises the
+    /// distinguishability invariant; the test asserts inequality
+    /// loudly and returns. If NO candidate produces a different
+    /// f_type-or-fsid, the test fails LOUDLY because silent-skip
+    /// would falsely report green when the cross-fs property at
+    /// `store_atomic` was never exercised. Probe outcomes
+    /// (per-candidate "same fs" / statfs error reasons) are
+    /// surfaced in the panic message so the operator can see WHY
+    /// no candidate distinguished — e.g. a minimal container with
+    /// every probe collapsed onto the rootfs.
     #[test]
     fn fsid_bytes_distinguishes_different_filesystems() {
         let tmp = tempfile::tempdir().expect("create tempdir");
         let tmp_buf = statfs_path(tmp.path()).expect("statfs tempdir");
-        let proc_buf = match statfs_path(std::path::Path::new("/proc")) {
-            Ok(b) => b,
-            Err(_) => {
-                // /proc not mounted (rare — minimal containers,
-                // chroots without procfs). The cross-fs property
-                // cannot be exercised here; skip rather than fail.
-                return;
-            }
-        };
         let tmp_fsid = fsid_bytes(&tmp_buf);
-        let proc_fsid = fsid_bytes(&proc_buf);
-        // f_type alone discriminates tmpfs from procfs; if it
-        // matches AND f_fsid matches, the two probes resolved to
-        // the same filesystem and the cross-fs property is not
-        // exercised on this host.
-        if tmp_buf.f_type == proc_buf.f_type && tmp_fsid == proc_fsid {
-            return;
+
+        // Most-likely-distinct first; rootfs `/` last (collapses on
+        // minimal containers).
+        let candidates: &[&str] = &["/proc", "/sys", "/dev", "/"];
+        let mut probe_outcomes: Vec<String> = Vec::with_capacity(candidates.len());
+        for cand in candidates {
+            let path = std::path::Path::new(cand);
+            match statfs_path(path) {
+                Ok(buf) => {
+                    let fsid = fsid_bytes(&buf);
+                    if buf.f_type != tmp_buf.f_type || fsid != tmp_fsid {
+                        assert_ne!(
+                            tmp_fsid, fsid,
+                            "fsid_bytes must differ across distinct filesystems \
+                             (tempdir f_type=0x{:x}, {cand} f_type=0x{:x}); a match \
+                             would indicate the bytewise f_fsid read is producing a \
+                             constant byte pattern instead of the real fsid_t — \
+                             e.g. reading from a wrong offset within libc::statfs",
+                            tmp_buf.f_type, buf.f_type,
+                        );
+                        return;
+                    }
+                    probe_outcomes.push(format!(
+                        "{cand}: same fs (f_type=0x{:x}, fsid==tempdir)",
+                        buf.f_type,
+                    ));
+                }
+                Err(e) => {
+                    probe_outcomes.push(format!("{cand}: statfs error ({e})"));
+                }
+            }
         }
-        assert_ne!(
-            tmp_fsid, proc_fsid,
-            "fsid_bytes must differ across distinct filesystems \
-             (tempdir f_type=0x{:x}, /proc f_type=0x{:x}); a match \
-             would indicate the bytewise f_fsid read is producing a \
-             constant byte pattern instead of the real fsid_t — \
-             e.g. reading from a wrong offset within libc::statfs",
-            tmp_buf.f_type, proc_buf.f_type,
+        panic!(
+            "fsid_bytes_distinguishes_different_filesystems found no candidate path \
+             that resolves to a different filesystem from tempdir (f_type=0x{:x}). \
+             At least one of the standard pseudo filesystems should mount \
+             independently of /tmp; the absence of any distinguishing path is \
+             anomalous — the cross-fs property at store_atomic depends on \
+             distinguishability, so silent-skip would falsely report green. \
+             Probe outcomes: {probe_outcomes:?}",
+            tmp_buf.f_type,
         );
     }
 
