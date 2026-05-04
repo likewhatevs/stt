@@ -26,6 +26,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
+use super::super::CTPROF_METRICS;
 use super::super::columns::{Column, Section};
 use super::super::diff_types::{CtprofDiff, DiffRow};
 use super::super::options::GroupBy;
@@ -33,7 +34,6 @@ use super::super::render::{
     cgroup_parent_leaf, color_diff_cell, colored_header_with_sort, render_diff_row_cells,
 };
 use super::super::runner::DisplayOptions;
-use super::super::CTPROF_METRICS;
 
 /// Cgroup-tree heading color by depth — green at the root,
 /// cyan at level 1, dark grey thereafter. Shared with
@@ -87,7 +87,14 @@ pub(super) fn write_primary_section<W: fmt::Write>(
         .collect();
 
     if group_by == GroupBy::All {
-        write_primary_all(w, &primary_rows, columns, display, global_max_widths, diff.sort_metric_name)?;
+        write_primary_all(
+            w,
+            &primary_rows,
+            columns,
+            display,
+            global_max_widths,
+            diff.sort_metric_name,
+        )?;
     } else if group_by == GroupBy::Cgroup {
         write_primary_cgroup(w, &primary_rows, columns, display, diff.sort_metric_name)?;
     } else {
@@ -302,7 +309,8 @@ fn write_primary_all<W: fmt::Write>(
     table.set_header(colored_header_with_sort(columns, "comm", sort_metric_name));
 
     for h in &hier {
-        if let Some(new_segments) = emit_cgroup_segments(&mut table, h.cgroup, &last_segments, columns)
+        if let Some(new_segments) =
+            emit_cgroup_segments(&mut table, h.cgroup, &last_segments, columns)
         {
             last_segments = new_segments;
             last_pcomm = "";
@@ -379,7 +387,11 @@ fn write_primary_cgroup<W: fmt::Write>(
         writeln!(w)?;
         writeln!(w, "\x1b[1;32m## {parent}\x1b[0m")?;
         let mut table = display.new_table();
-        table.set_header(colored_header_with_sort(columns, "cgroup", sort_metric_name));
+        table.set_header(colored_header_with_sort(
+            columns,
+            "cgroup",
+            sort_metric_name,
+        ));
         let cg_limit = if display.section_line_limit > 0 {
             &rows[..rows.len().min(display.section_line_limit)]
         } else {
@@ -423,11 +435,15 @@ fn write_primary_flat<W: fmt::Write>(
 ) -> fmt::Result {
     writeln!(w, "## Primary metrics")?;
     let mut table = display.new_table();
-    table.set_header(colored_header_with_sort(columns, group_header, sort_metric_name));
+    table.set_header(colored_header_with_sort(
+        columns,
+        group_header,
+        sort_metric_name,
+    ));
     let limit_iter = if display.section_line_limit > 0 {
         &primary_rows[..primary_rows.len().min(display.section_line_limit)]
     } else {
-        &primary_rows[..]
+        primary_rows
     };
     for row in limit_iter {
         let string_cells = render_diff_row_cells(row, columns);

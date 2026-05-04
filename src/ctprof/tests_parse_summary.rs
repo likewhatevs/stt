@@ -5,10 +5,10 @@
 
 #![cfg(test)]
 
+use super::tests_helpers::stage_synthetic_proc;
 use super::*;
 use crate::metric_types::MonotonicCount;
 use std::path::Path;
-use super::tests_helpers::stage_synthetic_proc;
 
 // ------------------------------------------------------------
 // T28 — CtprofParseSummary: per-file read-failure tally
@@ -190,8 +190,7 @@ fn parse_summary_excludes_ghost_filtered_tids() {
     let mut tally = ParseTally::default();
     let mut tally_opt: Option<&mut ParseTally> = Some(&mut tally);
     tally_opt.as_mut().unwrap().tids_walked += 1;
-    let t =
-        capture_thread_at_with_tally(proc_tmp.path(), tgid, tid, "", "", false, &mut tally_opt);
+    let t = capture_thread_at_with_tally(proc_tmp.path(), tgid, tid, "", "", false, &mut tally_opt);
     // Ghost filter: empty comm + zero start_time → discard.
     if t.comm.is_empty() && t.start_time_clock_ticks == 0 {
         tally_opt.as_mut().unwrap().discard_pending();

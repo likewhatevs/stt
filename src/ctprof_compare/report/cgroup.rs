@@ -31,7 +31,7 @@ use super::super::render::{
     cgroup_cell, format_psi_avg_cell, psi_resource_accessors, psi_resource_has_data,
 };
 use super::super::runner::DisplayOptions;
-use super::super::scale::{cgroup_limits_cell, cgroup_optional_limit_cell, ScaleLadder};
+use super::super::scale::{ScaleLadder, cgroup_limits_cell, cgroup_optional_limit_cell};
 use crate::ctprof::CgroupStats;
 
 pub(super) fn write_cgroup_sections<W: fmt::Write>(

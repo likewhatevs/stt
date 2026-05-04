@@ -7,7 +7,6 @@
 
 use super::*;
 
-
 /// `ThreadState::default()` produces `'~'` (not `'\0'`) for
 /// the `state` char so the absent-value sentinel matches the
 /// capture-time `unwrap_or_else(default_state_char)`

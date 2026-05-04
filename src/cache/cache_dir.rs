@@ -52,9 +52,10 @@ use super::housekeeping::{
     TmpDirGuard, atomic_swap_dirs, clean_orphaned_tmp_dirs, read_metadata, validate_cache_key,
     validate_filename,
 };
+#[cfg(test)]
+use super::metadata::KconfigStatus;
 use super::metadata::{
-    CacheArtifacts, CacheEntry, KconfigStatus, KernelMetadata, ListedEntry,
-    format_image_missing_reason,
+    CacheArtifacts, CacheEntry, KernelMetadata, ListedEntry, format_image_missing_reason,
 };
 use super::resolve::resolve_cache_root;
 use super::vmlinux_strip::strip_vmlinux_debug;
@@ -665,7 +666,9 @@ impl CacheDir {
             FlockMode::Exclusive,
             timeout,
             &format!("cache entry {cache_key:?}"),
-            Some("override the timeout via KTSTR_CACHE_STORE_LOCK_TIMEOUT (humantime: 30s, 2m, 1h)"),
+            Some(
+                "override the timeout via KTSTR_CACHE_STORE_LOCK_TIMEOUT (humantime: 30s, 2m, 1h)",
+            ),
         )?;
         Ok(ExclusiveLockGuard { fd })
     }
@@ -2313,12 +2316,10 @@ mod tests {
         let guard_a = cache_a
             .try_acquire_exclusive_lock("shared-name")
             .expect("acquire under root A must succeed");
-        let guard_b = cache_b
-            .try_acquire_exclusive_lock("shared-name")
-            .expect(
-                "acquire on the same key under root B must NOT \
+        let guard_b = cache_b.try_acquire_exclusive_lock("shared-name").expect(
+            "acquire on the same key under root B must NOT \
                  contend with A — different lockfiles, different OFDs",
-            );
+        );
 
         drop(guard_a);
         drop(guard_b);
@@ -2819,8 +2820,10 @@ mod tests {
         // entries — the head writer's. If the recheck didn't fire,
         // each peer's publish would land in turn and we'd see N
         // distinct values.
-        let timestamps: std::collections::BTreeSet<_> =
-            entries.iter().map(|e| e.metadata.built_at.clone()).collect();
+        let timestamps: std::collections::BTreeSet<_> = entries
+            .iter()
+            .map(|e| e.metadata.built_at.clone())
+            .collect();
         assert_eq!(
             timestamps.len(),
             1,
@@ -3361,12 +3364,11 @@ mod tests {
 
         // list: the same entry surfaces as Corrupt with a reason.
         let entries = cache.list().unwrap();
-        let listed = entries
-            .iter()
-            .find(|e| e.key() == "corrupt-entry")
-            .expect("list MUST surface the corrupt entry — the \
+        let listed = entries.iter().find(|e| e.key() == "corrupt-entry").expect(
+            "list MUST surface the corrupt entry — the \
                      operator needs to see and decide what to do \
-                     about it (clean? investigate?)");
+                     about it (clean? investigate?)",
+        );
         // Pin the EXACT Corrupt classification rather than the
         // weaker `as_valid().is_none()` check — `as_valid()` only
         // distinguishes Valid from non-Valid, so a future variant
@@ -3620,7 +3622,9 @@ mod tests {
         let corrupt = cache_root.join("corrupt-1");
         std::fs::create_dir_all(&corrupt).unwrap();
 
-        let removed = cache.clean_all().expect("clean_all must succeed on a clean fs");
+        let removed = cache
+            .clean_all()
+            .expect("clean_all must succeed on a clean fs");
         assert_eq!(
             removed, 3,
             "clean_all MUST report a count equal to the listed \

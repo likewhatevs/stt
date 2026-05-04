@@ -2496,10 +2496,10 @@ fn polarity_from_expr(expr: &syn::Expr) -> syn::Result<proc_macro2::TokenStream>
 /// caller uses an alias — acceptable in v1 because the project's
 /// stats structs all use the canonical `BTreeSet` / `Vec` names.
 fn is_path_named(ty: &syn::Type, name: &str) -> bool {
-    if let syn::Type::Path(tp) = ty {
-        if let Some(seg) = tp.path.segments.last() {
-            return seg.ident == name;
-        }
+    if let syn::Type::Path(tp) = ty
+        && let Some(seg) = tp.path.segments.last()
+    {
+        return seg.ident == name;
     }
     false
 }

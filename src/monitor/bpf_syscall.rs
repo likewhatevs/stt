@@ -57,8 +57,9 @@ use btf_rs::Btf;
 
 use super::arena::{ArenaPage, ArenaSnapshot, BpfArenaOffsets};
 use super::bpf_map::{
-    BPF_MAP_TYPE_ARENA, BPF_MAP_TYPE_ARRAY, BPF_MAP_TYPE_HASH, BPF_MAP_TYPE_PERCPU_ARRAY,
-    BpfMapAccessor, BpfMapInfo,
+    BPF_MAP_TYPE_ARENA, BPF_MAP_TYPE_ARRAY, BPF_MAP_TYPE_HASH, BPF_MAP_TYPE_LRU_HASH,
+    BPF_MAP_TYPE_LRU_PERCPU_HASH, BPF_MAP_TYPE_PERCPU_ARRAY, BPF_MAP_TYPE_PERCPU_HASH,
+    BPF_MAP_TYPE_STRUCT_OPS, BpfMapAccessor, BpfMapInfo,
 };
 
 /// `BPF_MAP_LOOKUP_ELEM` — read one map value into a userspace buffer.
@@ -492,6 +493,15 @@ fn obj_get_info_map(fd: RawFd) -> Result<(BpfMapInfo, u64)> {
             // `BPF_BTF_GET_FD_BY_ID` instead.
             btf_kva: u64::from(info.btf_id),
             btf_value_type_id: info.btf_value_type_id,
+            // bpf(2) `BPF_OBJ_GET_INFO_BY_FD` does not surface
+            // `btf_vmlinux_value_type_id` directly; the live-host
+            // backend would need a parallel resolution path
+            // (BPF_BTF_GET_INFO_BY_ID + walk the wrapper) to expose
+            // it. Until that lands, leave 0 — the dump's STRUCT_OPS
+            // arm falls through to hex on a zero id, matching the
+            // behavior on guest-memory maps without struct_ops
+            // BTF support.
+            btf_vmlinux_value_type_id: 0,
             btf_key_type_id: info.btf_key_type_id,
         },
         info.map_extra,
@@ -506,19 +516,30 @@ impl BpfMapAccessor for BpfSyscallAccessor {
     fn read_value(&self, map: &BpfMapInfo, offset: usize, len: usize) -> Option<Vec<u8>> {
         let pinned = self.pinned_for(map)?;
 
-        // The live-host backend supports value reads on ARRAY and
-        // PERCPU_ARRAY (via dedicated method) — not HASH (use
-        // iter_hash_map) and not ARENA (use read_arena_pages). For
-        // ARRAY at key 0, the kernel returns `value_size` bytes,
-        // covering the whole .bss when the array is the global
-        // .bss section that sched_ext schedulers commonly use.
-        if map.map_type != BPF_MAP_TYPE_ARRAY {
+        // The live-host backend supports single-buffer value reads on
+        // ARRAY (key=0 returns inline value bytes) and STRUCT_OPS
+        // (key=0 returns the populated `bpf_struct_ops_value`). HASH
+        // goes through `iter_hash_map`; PERCPU_ARRAY through
+        // `read_percpu_array`; ARENA through `read_arena_pages`. Any
+        // other type falls through to None so the dump renderer can
+        // surface a specific reason.
+        //
+        // STRUCT_OPS quirk: the in-kernel
+        // `bpf_struct_ops_map_lookup_elem` returns -EINVAL
+        // (`kernel/bpf/bpf_struct_ops.c:518`), but the syscall path
+        // `bpf_struct_ops_map_sys_lookup_elem`
+        // (`kernel/bpf/bpf_struct_ops.c::struct_ops_map_sys_lookup_elem`)
+        // implements its own lookup, copying the kernel's
+        // `bpf_struct_ops_value` (refcnt + state + the registered
+        // kernel struct) into the userspace buffer. The kernel-only
+        // `lookup_elem` call is the in-program path; userspace
+        // syscalls reach the sys variant.
+        if map.map_type != BPF_MAP_TYPE_ARRAY && map.map_type != BPF_MAP_TYPE_STRUCT_OPS {
             return None;
         }
 
-        // Build the lookup. ARRAY maps use a single u32 key; we
-        // always look up key=0 here because the failure-dump path's
-        // .bss reads slice into the resulting buffer.
+        // Build the lookup. ARRAY and STRUCT_OPS both use a u32 key;
+        // STRUCT_OPS only ever has one entry (key=0).
         let mut key: u32 = 0;
         let mut buf = vec![0u8; map.value_size as usize];
         let attr = BpfAttrMapElem {
@@ -549,7 +570,13 @@ impl BpfMapAccessor for BpfSyscallAccessor {
         let Some(pinned) = self.pinned_for(map) else {
             return Vec::new();
         };
-        if map.map_type != BPF_MAP_TYPE_HASH {
+        // HASH and LRU_HASH share the inline-value `htab_elem` layout
+        // (`kernel/bpf/hashtab.c::htab_elem_value`), and the kernel
+        // syscall path returns the value bytes directly for both —
+        // `bpf_map_copy_value` falls into the generic `map_lookup_elem`
+        // arm for them. Reject other map types so callers route
+        // PERCPU_HASH/LRU_PERCPU_HASH to `iter_percpu_hash_map` instead.
+        if map.map_type != BPF_MAP_TYPE_HASH && map.map_type != BPF_MAP_TYPE_LRU_HASH {
             return Vec::new();
         }
 
@@ -675,6 +702,92 @@ impl BpfMapAccessor for BpfSyscallAccessor {
         out
     }
 
+    fn iter_percpu_hash_map(
+        &self,
+        map: &BpfMapInfo,
+        num_cpus: u32,
+    ) -> super::bpf_map::PerCpuHashEntries {
+        let Some(pinned) = self.pinned_for(map) else {
+            return Vec::new();
+        };
+        if map.map_type != BPF_MAP_TYPE_PERCPU_HASH && map.map_type != BPF_MAP_TYPE_LRU_PERCPU_HASH
+        {
+            return Vec::new();
+        }
+
+        let key_sz = map.key_size as usize;
+        let val_sz = map.value_size as usize;
+        // Kernel returns nr_cpus * round_up_8(value_size) bytes per
+        // lookup (`bpf_percpu_hash_copy` -> `pcpu_copy_value`); same
+        // 8-byte stride as PERCPU_ARRAY. The buffer must be sized to
+        // the full stride or the kernel writes past it.
+        let stride = (val_sz + 7) & !7;
+        let buf_total = (num_cpus as usize).saturating_mul(stride);
+        let mut out: super::bpf_map::PerCpuHashEntries = Vec::new();
+
+        let mut cur_key = vec![0u8; key_sz];
+        let mut next_key = vec![0u8; key_sz];
+
+        let cap = (map.max_entries as usize).saturating_mul(2).max(1);
+        let mut got_first = false;
+        for _ in 0..cap {
+            let attr = BpfAttrMapElem {
+                map_fd: pinned.fd.as_raw_fd() as u32,
+                _pad0: 0,
+                key: if got_first {
+                    cur_key.as_ptr() as u64
+                } else {
+                    0
+                },
+                value_or_next_key: next_key.as_mut_ptr() as u64,
+                flags: 0,
+            };
+            let ret = unsafe {
+                bpf_syscall(
+                    BPF_MAP_GET_NEXT_KEY,
+                    &raw const attr as *const u8,
+                    std::mem::size_of::<BpfAttrMapElem>(),
+                )
+            };
+            if ret < 0 {
+                break;
+            }
+            got_first = true;
+
+            let mut value_buf = vec![0u8; buf_total];
+            let lookup_attr = BpfAttrMapElem {
+                map_fd: pinned.fd.as_raw_fd() as u32,
+                _pad0: 0,
+                key: next_key.as_ptr() as u64,
+                value_or_next_key: value_buf.as_mut_ptr() as u64,
+                flags: 0,
+            };
+            let lret = unsafe {
+                bpf_syscall(
+                    BPF_MAP_LOOKUP_ELEM,
+                    &raw const lookup_attr as *const u8,
+                    std::mem::size_of::<BpfAttrMapElem>(),
+                )
+            };
+            if lret >= 0 {
+                let mut per_cpu = Vec::with_capacity(num_cpus as usize);
+                for cpu in 0..num_cpus as usize {
+                    let start = cpu * stride;
+                    let end = start + val_sz;
+                    if end > value_buf.len() {
+                        per_cpu.push(None);
+                    } else {
+                        per_cpu.push(Some(value_buf[start..end].to_vec()));
+                    }
+                }
+                out.push((next_key.clone(), per_cpu));
+            }
+            cur_key.copy_from_slice(&next_key);
+        }
+
+        out
+    }
+
     fn read_arena_pages(
         &self,
         map: &BpfMapInfo,
@@ -693,12 +806,24 @@ impl BpfMapAccessor for BpfSyscallAccessor {
         let span_capped = declared_bytes_raw > MAX_ARENA_BYTES;
         let declared_bytes = declared_bytes_raw.min(MAX_ARENA_BYTES);
         let declared_pages = declared_bytes / ARENA_PAGE_SIZE as u64;
+
+        // Use map_extra as the user_vm_start anchor. BPF programs
+        // see arena addresses at this base (lib/arena_map.h hardcodes
+        // it: x86 `1<<44`, aarch64 `1<<32`). Operators correlating
+        // arena pointers want the same base in the snapshot.
+        // Lifted above the early returns so every snapshot — empty
+        // or populated — carries the anchor in `user_vm_start`; the
+        // pointer-chasing reader needs it to classify arena addresses
+        // even when the page set is empty.
+        let user_vm_start = pinned.map_extra;
+
         if declared_pages == 0 {
             return ArenaSnapshot {
                 pages: Vec::new(),
                 truncated: false,
                 declared_pages: 0,
                 span_capped,
+                user_vm_start,
                 ..Default::default()
             };
         }
@@ -721,12 +846,6 @@ impl BpfMapAccessor for BpfSyscallAccessor {
         let walk_pages = declared_pages.min(MAX_ARENA_PAGES);
         let walk_bytes = (walk_pages as usize) * ARENA_PAGE_SIZE;
         let truncated = declared_pages > walk_pages;
-
-        // Use map_extra as the user_vm_start anchor. BPF programs
-        // see arena addresses at this base (lib/arena_map.h hardcodes
-        // it: x86 `1<<44`, aarch64 `1<<32`). Operators correlating
-        // arena pointers want the same base in the snapshot.
-        let user_vm_start = pinned.map_extra;
 
         // SAFETY: mmap with PROT_READ + MAP_SHARED on the arena fd
         // is exactly what the kernel exports for arena maps. The
@@ -751,6 +870,7 @@ impl BpfMapAccessor for BpfSyscallAccessor {
                 truncated,
                 declared_pages,
                 span_capped,
+                user_vm_start,
                 ..Default::default()
             };
         }
@@ -802,6 +922,7 @@ impl BpfMapAccessor for BpfSyscallAccessor {
             truncated,
             declared_pages,
             span_capped,
+            user_vm_start,
             ..Default::default()
         }
     }

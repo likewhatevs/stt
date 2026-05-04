@@ -258,7 +258,7 @@ pub(crate) fn make_vm_result(
         crash_message: None,
         cleanup_duration: None,
         virtio_blk_counters: None,
-            virtio_net_counters: None,
+        virtio_net_counters: None,
     }
 }
 

@@ -14,14 +14,12 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
+use super::super::CTPROF_DERIVED_METRICS;
 use super::super::columns::{Column, Section};
 use super::super::diff_types::{CtprofDiff, DerivedRow};
 use super::super::options::GroupBy;
-use super::super::render::{
-    color_diff_cell, colored_header_with_sort, render_derived_row_cells,
-};
+use super::super::render::{color_diff_cell, colored_header_with_sort, render_derived_row_cells};
 use super::super::runner::DisplayOptions;
-use super::super::CTPROF_DERIVED_METRICS;
 use super::primary::{build_primary_hier, emit_cgroup_segments, emit_pcomm_heading};
 
 /// Render the `## Derived metrics` table when either
@@ -193,11 +191,15 @@ fn write_derived_flat<W: fmt::Write>(
     writeln!(w)?;
     writeln!(w, "## Derived metrics")?;
     let mut dt = display.new_table();
-    dt.set_header(colored_header_with_sort(columns, group_header, sort_metric_name));
+    dt.set_header(colored_header_with_sort(
+        columns,
+        group_header,
+        sort_metric_name,
+    ));
     let d_limit = if display.section_line_limit > 0 {
         &derived_rows[..derived_rows.len().min(display.section_line_limit)]
     } else {
-        &derived_rows[..]
+        derived_rows
     };
     for row in d_limit {
         let string_cells = render_derived_row_cells(row, columns);
@@ -211,23 +213,9 @@ fn write_derived_flat<W: fmt::Write>(
                         Some(pct) => format!("{pct:.0}%"),
                         None => "-".to_string(),
                     };
-                    color_diff_cell(
-                        text,
-                        *col,
-                        row.delta,
-                        row.delta_pct,
-                        up,
-                        row.sort_by_delta,
-                    )
+                    color_diff_cell(text, *col, row.delta, row.delta_pct, up, row.sort_by_delta)
                 } else {
-                    color_diff_cell(
-                        s,
-                        *col,
-                        row.delta,
-                        row.delta_pct,
-                        up,
-                        row.sort_by_delta,
-                    )
+                    color_diff_cell(s, *col, row.delta, row.delta_pct, up, row.sort_by_delta)
                 }
             })
             .collect();

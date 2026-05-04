@@ -76,8 +76,17 @@ fn format_cpumask_display(cpumask_words: &[u64; 4], nr_cpus: Option<u32>) -> Str
     }
 }
 
-/// Extract the substring between `start` and `end` sentinels, or
-/// return an empty string when either sentinel is missing.
+/// Extract the substring between `start` and `end` sentinels.
+///
+/// Returns an empty string when the `start` sentinel is missing.
+/// When `start` is present but `end` is missing, returns everything
+/// from after `start` to end-of-buffer — this is intentional and the
+/// truncated-payload recovery path in
+/// [`crate::test_support::probe::extract_probe_output`] depends on
+/// it: when the repro VM dies mid-`println!`, COM2 captures the
+/// `start` sentinel plus a partial JSON object but never gets to
+/// emit `end`, and the parser must still see the partial bytes to
+/// salvage what it can.
 // Used by test_support.rs; #[allow] suppresses false positive from binary crate.
 #[allow(dead_code)]
 pub(crate) fn extract_section(text: &str, start: &str, end: &str) -> String {
@@ -105,20 +114,34 @@ fn resolve_addrs_from_elf(
         Err(_) => return Vec::new(),
     };
 
+    // Build a `name -> st_value` HashMap once. The previous code
+    // scanned every ELF symbol for every requested name, paying
+    // O(funcs × symtab) — a vmlinux symtab carries ~hundreds of
+    // thousands of entries, so even a few hundred requested funcs
+    // burned tens of millions of compares per call. A single linear
+    // pass over `elf.syms` populates the map; the per-name probes
+    // below are then O(1) HashMap lookups.
+    //
+    // First-symbol-wins matches the original `break` semantics
+    // (early-out at the first matching symbol) — `or_insert` keeps
+    // whichever entry the symbol iterator visits first when a name
+    // collides.
+    let mut by_name: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
+    for sym in elf.syms.iter() {
+        if sym.st_size == 0 {
+            continue;
+        }
+        let sym_name = match elf.strtab.get_at(sym.st_name) {
+            Some(n) => n,
+            None => continue,
+        };
+        by_name.entry(sym_name).or_insert(sym.st_value);
+    }
+
     let mut result = Vec::new();
     for (_, name) in func_names {
-        for sym in elf.syms.iter() {
-            if sym.st_size == 0 {
-                continue;
-            }
-            let sym_name = match elf.strtab.get_at(sym.st_name) {
-                Some(n) => n,
-                None => continue,
-            };
-            if sym_name == name {
-                result.push((name.clone(), sym.st_value));
-                break;
-            }
+        if let Some(&addr) = by_name.get(name.as_str()) {
+            result.push((name.clone(), addr));
         }
     }
     result

@@ -32,7 +32,7 @@ use super::super::diff_types::CtprofDiff;
 use super::super::options::GroupBy;
 use super::super::render::{color_diff_cell, colored_header_with_sort};
 use super::super::runner::DisplayOptions;
-use super::super::scale::{format_delta_cell, format_scaled_u64, ScaleLadder};
+use super::super::scale::{ScaleLadder, format_delta_cell, format_scaled_u64};
 use super::primary::depth_color;
 
 pub(super) fn write_smaps_section<W: fmt::Write>(
@@ -97,8 +97,7 @@ pub(super) fn write_smaps_section<W: fmt::Write>(
     let any_delta = sorted_process_keys.iter().any(|pkey| {
         let a = diff.smaps_rollup_a.get(*pkey);
         let b = diff.smaps_rollup_b.get(*pkey);
-        let mut keys: BTreeSet<&String> =
-            a.map(|m| m.keys().collect()).unwrap_or_default();
+        let mut keys: BTreeSet<&String> = a.map(|m| m.keys().collect()).unwrap_or_default();
         if let Some(m) = b {
             keys.extend(m.keys());
         }
@@ -133,7 +132,11 @@ pub(super) fn write_smaps_section<W: fmt::Write>(
     // the column carries that.
     let is_compound = group_by == GroupBy::All;
     let group_header = if is_compound { "comm" } else { "pcomm" };
-    st.set_header(colored_header_with_sort(columns, group_header, diff.sort_metric_name));
+    st.set_header(colored_header_with_sort(
+        columns,
+        group_header,
+        diff.sort_metric_name,
+    ));
 
     // For All mode, re-sort by cgroup hierarchy (keys are
     // compound cgroup\x00pcomm). Track segments for tree headings.
@@ -182,8 +185,7 @@ pub(super) fn write_smaps_section<W: fmt::Write>(
 
         let a = diff.smaps_rollup_a.get(*pkey);
         let b = diff.smaps_rollup_b.get(*pkey);
-        let mut keys_union: BTreeSet<&String> =
-            a.map(|m| m.keys().collect()).unwrap_or_default();
+        let mut keys_union: BTreeSet<&String> = a.map(|m| m.keys().collect()).unwrap_or_default();
         if let Some(m) = b {
             keys_union.extend(m.keys());
         }

@@ -305,6 +305,125 @@ pub enum Op {
     /// Writes `"0"` to the cgroup's `cgroup.freeze` file. Inverse of
     /// [`Op::FreezeCgroup`]. Idempotent.
     UnfreezeCgroup { cgroup: Cow<'static, str> },
+    /// Capture a host-side diagnostic snapshot under `name`. The
+    /// freeze coordinator pauses every vCPU long enough to read
+    /// the BPF map state, vCPU registers, and per-CPU
+    /// counters into a
+    /// [`FailureDumpReport`](crate::monitor::dump::FailureDumpReport),
+    /// then resumes the guest. The report is keyed by `name` on
+    /// the active
+    /// [`SnapshotBridge`](crate::scenario::snapshot::SnapshotBridge);
+    /// downstream test code reads it via
+    /// [`Snapshot`](crate::scenario::snapshot::Snapshot).
+    ///
+    /// On-demand snapshots are orthogonal to the error-class
+    /// freeze trigger — the request flows through a separate
+    /// channel, does not transition the coordinator's
+    /// `freeze_state`, and is serviced even after `Done`. The only
+    /// scheduling rule: at most one capture in flight at a time
+    /// (each request waits for the previous freeze's vCPUs to
+    /// fully resume before issuing).
+    ///
+    /// **Guest → host wire.** Locked at an in-kernel ioeventfd
+    /// doorbell at a dedicated MMIO GPA inside the MMIO gap
+    /// (e.g. `MMIO_GAP_START + 0x3000`). The guest writes the tag
+    /// into a small SHM-resident slot and then writes the doorbell
+    /// GPA via the existing `/dev/mem` mmap pattern that the SHM
+    /// ring already uses. KVM dispatches in-kernel
+    /// (`KVM_IOEVENTFD`) without a vCPU userspace exit, the
+    /// freeze coordinator wakes on `eventfd_signal`, and the
+    /// installed `CaptureCallback` returns the resulting report
+    /// through a paired reply completion. See
+    /// [`CaptureCallback`](crate::scenario::snapshot::CaptureCallback)
+    /// for the full protocol.
+    ///
+    /// **No active bridge ⇒ no-op.** When the executor runs in a
+    /// context with no installed
+    /// [`SnapshotBridge`](crate::scenario::snapshot::SnapshotBridge)
+    /// (e.g. unit tests that exercise the executor without
+    /// spinning up a VM), this op emits a `tracing::warn!` and
+    /// continues. Existing scenarios that never declare snapshot
+    /// ops keep their behavior unchanged.
+    ///
+    /// # Example
+    ///
+    /// Declare a snapshot mid-step, fetch the captured report
+    /// after the scenario completes, and assert against a
+    /// BTF-rendered field:
+    ///
+    /// ```ignore
+    /// use ktstr::scenario::ops::{CgroupDef, HoldSpec, Op, Step, execute_steps};
+    /// use ktstr::scenario::snapshot::{Snapshot, SnapshotBridge};
+    ///
+    /// // Wire up the bridge before execute_steps runs (host-side
+    /// // VM setup typically performs this step automatically).
+    /// let bridge = SnapshotBridge::new(/* capture callback */);
+    /// let _guard = bridge.clone().set_thread_local();
+    ///
+    /// let steps = vec![Step {
+    ///     setup: vec![CgroupDef::named("workers").workers(2)].into(),
+    ///     ops: vec![Op::snapshot("after_spawn")],
+    ///     hold: HoldSpec::FULL,
+    /// }];
+    /// execute_steps(ctx, steps)?;
+    ///
+    /// // Inspection.
+    /// let captured = bridge.drain();
+    /// let report = captured.get("after_spawn").expect("snapshot recorded");
+    /// let snap = Snapshot::new(report);
+    /// let nr_cpus = snap.var("nr_cpus_onln").as_u64()?;
+    /// assert!(nr_cpus > 0, "snapshot captured live nr_cpus_onln");
+    /// ```
+    Snapshot { name: Cow<'static, str> },
+    /// Capture a snapshot whenever the guest writes to the named
+    /// kernel symbol. The snapshot is tagged with the symbol path
+    /// itself; one fire = one capture.
+    ///
+    /// Symbol resolution at scenario setup uses the freeze
+    /// coordinator's BTF + kallsyms pipeline:
+    /// - `"bss.<obj>.<field>"` → scheduler program BTF Datasec
+    ///   walk + per-section offset → guest KVA.
+    /// - `"kernel.<symbol>[.<field>...]"` → vmlinux BTF +
+    ///   kallsyms (+ per-CPU offset for per-CPU symbols) → KVA.
+    ///
+    /// # Guard rails
+    ///
+    /// - **Maximum of 3 watch ops per scenario.** The KVM
+    ///   hardware-watchpoint plumbing reserves DR0 for the existing
+    ///   `*scx_root->exit_kind` trigger (used by the error-trigger
+    ///   path); only DR1 / DR2 / DR3 are available for on-demand
+    ///   watches. Scenarios that exceed three watches fail at
+    ///   scenario-setup time with an actionable error before the
+    ///   first vCPU runs.
+    /// - **Symbol resolution failures bail immediately.** A
+    ///   missing field / symbol / unaligned address surfaces as
+    ///   an `Err` from `execute_steps` so the test author
+    ///   notices the watch did not attach. Silent degradation
+    ///   would leave the scenario running with no captures and
+    ///   look identical to a healthy passing run.
+    /// - **DR_LEN_4 alignment.** The resolved KVA must be 4-byte
+    ///   aligned per Intel SDM Vol. 3B Chapter 17 (DR_LEN_4
+    ///   requires `addr & 0x3 == 0`). Mis-aligned addresses bail
+    ///   at setup with the resolved KVA in the error.
+    ///
+    /// **Guest → host wire.** The registration request rides the
+    /// same ioeventfd doorbell as [`Op::Snapshot`] (separate tag
+    /// namespace), so symbol resolution + DR1-3 allocation +
+    /// `KVM_SET_GUEST_DEBUG` arming happen on the host without a
+    /// vCPU userspace exit. Once armed, the
+    /// `KVM_EXIT_DEBUG` dispatch path drives the resulting
+    /// captures directly into the freeze coordinator (no
+    /// per-fire doorbell write needed). See
+    /// [`WatchRegisterCallback`](crate::scenario::snapshot::WatchRegisterCallback)
+    /// for the full protocol.
+    ///
+    /// Note: high-frequency variables (rq counters, jiffies)
+    /// will fire watches every few microseconds and produce
+    /// thousands of snapshots; the framework does not
+    /// rate-limit captures, so the test author owns the
+    /// frequency choice. Use [`Op::Snapshot`] for time-driven
+    /// captures when frequency is the concern.
+    WatchSnapshot { symbol: Cow<'static, str> },
 }
 
 /// How to compute a cpuset from topology.
@@ -1447,6 +1566,8 @@ impl OpKind {
             OpKind::KillPayload => 12,
             OpKind::FreezeCgroup => 13,
             OpKind::UnfreezeCgroup => 14,
+            OpKind::Snapshot => 15,
+            OpKind::WatchSnapshot => 16,
         }
     }
 }
@@ -1624,6 +1745,23 @@ impl Op {
     pub fn unfreeze_cgroup(cgroup: impl Into<Cow<'static, str>>) -> Self {
         Op::UnfreezeCgroup {
             cgroup: cgroup.into(),
+        }
+    }
+
+    /// Capture a host-side diagnostic snapshot under `name`. See
+    /// [`Op::Snapshot`] for the full request/reply protocol and
+    /// no-bridge fallback semantics.
+    pub fn snapshot(name: impl Into<Cow<'static, str>>) -> Self {
+        Op::Snapshot { name: name.into() }
+    }
+
+    /// Register a write-driven snapshot watch on `symbol`. See
+    /// [`Op::WatchSnapshot`] for the symbol-resolution rules and
+    /// guard rails (max 3 watches per scenario, BTF + kallsyms +
+    /// per-CPU resolution, DR_LEN_4 alignment requirement).
+    pub fn watch_snapshot(symbol: impl Into<Cow<'static, str>>) -> Self {
+        Op::WatchSnapshot {
+            symbol: symbol.into(),
         }
     }
 }

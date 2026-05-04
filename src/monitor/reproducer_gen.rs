@@ -114,7 +114,7 @@ use crate::workload::{AffinityIntent, SchedPolicy, WorkType, WorkloadConfig};
 /// The framework can execute the `config` directly. The `notes` and
 /// `cgroup_hints` fields surface low-confidence projections so the
 /// caller (or generated source) can flag them for the user.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[allow(dead_code)] // wired by the (separate) cargo ktstr capture-
 // reproduce subcommand; library lands the type.
 pub struct ReproducerSpec {
@@ -144,17 +144,6 @@ pub struct ReproducerSpec {
     /// Lets the generated test pick the right scheduler binary
     /// to attach.
     pub scheduler_name: String,
-}
-
-impl Default for ReproducerSpec {
-    fn default() -> Self {
-        Self {
-            config: WorkloadConfig::default(),
-            cgroup_hints: Vec::new(),
-            notes: Vec::new(),
-            scheduler_name: String::new(),
-        }
-    }
 }
 
 /// Diagnostic note attached to a [`ReproducerSpec`].
@@ -313,10 +302,9 @@ pub fn generate_spec(capture: &DebugCapture) -> ReproducerSpec {
     // Carry fingerprint gaps forward — the user sees them so they
     // know where to refine the capture or hand-edit the spec.
     for gap in &capture.fingerprint.gaps {
-        spec.notes
-            .push(ReproducerNote::Informational(format!(
-                "fingerprint gap: {gap}"
-            )));
+        spec.notes.push(ReproducerNote::Informational(format!(
+            "fingerprint gap: {gap}"
+        )));
     }
 
     spec
@@ -459,9 +447,12 @@ fn map_topology_aware_affinity(
     spec: &mut ReproducerSpec,
 ) -> AffinityIntent {
     if cpus.is_empty() {
-        spec.notes.push(ReproducerNote::UnresolvedAffinity(
-            topology_aware_note(variant, engine_action, hand_edit_target),
-        ));
+        spec.notes
+            .push(ReproducerNote::UnresolvedAffinity(topology_aware_note(
+                variant,
+                engine_action,
+                hand_edit_target,
+            )));
         topology_intent
     } else {
         spec.notes
@@ -1051,7 +1042,8 @@ mod tests {
         assert!(
             spec.notes
                 .iter()
-                .any(|n| n.message().contains("AffinityHint::Exact") && n.message().contains("with resolved CPUs")),
+                .any(|n| n.message().contains("AffinityHint::Exact")
+                    && n.message().contains("with resolved CPUs")),
             "populated Exact must emit a resolved-collapse note for surface consistency: {:?}",
             spec.notes,
         );
@@ -1083,14 +1075,15 @@ mod tests {
         assert!(
             spec.notes
                 .iter()
-                .any(|n| n.message().contains("AffinityHint::Exact") && n.message().contains("no CPUs")),
+                .any(|n| n.message().contains("AffinityHint::Exact")
+                    && n.message().contains("no CPUs")),
             "empty Exact must surface a hand-edit-required note: {:?}",
             spec.notes,
         );
         assert!(
-            spec.notes
-                .iter()
-                .any(|n| n.message().contains("AffinityIntent::exact([<cpu_0>, <cpu_1>, ...])")),
+            spec.notes.iter().any(|n| n
+                .message()
+                .contains("AffinityIntent::exact([<cpu_0>, <cpu_1>, ...])")),
             "empty Exact note must include paste-ready Rust hand-edit target: {:?}",
             spec.notes,
         );
@@ -1229,9 +1222,9 @@ mod tests {
             spec.notes,
         );
         assert!(
-            spec.notes
-                .iter()
-                .any(|n| n.message().contains("AffinityIntent::exact([<llc_cpu_0>, <llc_cpu_1>, ...])")),
+            spec.notes.iter().any(|n| n
+                .message()
+                .contains("AffinityIntent::exact([<llc_cpu_0>, <llc_cpu_1>, ...])")),
             "unresolved LlcAligned note must include paste-ready Rust hand-edit target: {:?}",
             spec.notes,
         );
@@ -1291,7 +1284,8 @@ mod tests {
         assert!(
             spec.notes
                 .iter()
-                .any(|n| n.message().contains("AffinityHint::SingleCpu") && n.message().contains("with resolved CPUs")),
+                .any(|n| n.message().contains("AffinityHint::SingleCpu")
+                    && n.message().contains("with resolved CPUs")),
             "resolved SingleCpu must surface a resolved-collapse note: {:?}",
             spec.notes,
         );
@@ -1342,9 +1336,10 @@ mod tests {
             other => panic!("expected Exact, got {other:?}"),
         }
         assert!(
-            spec.notes.iter().any(
-                |n| n.message().contains("AffinityHint::CrossCgroup") && n.message().contains("with resolved CPUs")
-            ),
+            spec.notes
+                .iter()
+                .any(|n| n.message().contains("AffinityHint::CrossCgroup")
+                    && n.message().contains("with resolved CPUs")),
         );
     }
 
@@ -1370,9 +1365,9 @@ mod tests {
             spec.notes,
         );
         assert!(
-            spec.notes
-                .iter()
-                .any(|n| n.message().contains("AffinityIntent::exact([<cpu_0>, <cpu_1>, ...])")),
+            spec.notes.iter().any(|n| n
+                .message()
+                .contains("AffinityIntent::exact([<cpu_0>, <cpu_1>, ...])")),
             "unresolved CrossCgroup note must include paste-ready Rust hand-edit target: {:?}",
             spec.notes,
         );
@@ -1592,9 +1587,9 @@ mod tests {
             spec.notes,
         );
         assert!(
-            spec.notes
-                .iter()
-                .any(|n| n.message().contains("AffinityIntent::exact([<sibling_a>, <sibling_b>])")),
+            spec.notes.iter().any(|n| n
+                .message()
+                .contains("AffinityIntent::exact([<sibling_a>, <sibling_b>])")),
             "unresolved SmtSiblingPair note must include paste-ready Rust hand-edit target: {:?}",
             spec.notes,
         );
@@ -2125,14 +2120,8 @@ mod tests {
         // refactor that accidentally flips every variant onto one
         // side of the split fails this test instead of silently
         // passing a one-sided assertion sweep.
-        assert!(
-            runnable_count > 0,
-            "runnable partition must not be empty",
-        );
-        assert!(
-            unmapped_count > 0,
-            "unmapped partition must not be empty",
-        );
+        assert!(runnable_count > 0, "runnable partition must not be empty",);
+        assert!(unmapped_count > 0, "unmapped partition must not be empty",);
     }
 
     /// Manually-constructed [`ReproducerSpec`] with an unmapped

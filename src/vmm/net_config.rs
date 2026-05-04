@@ -26,9 +26,7 @@
 /// locally-administered MAC. Override the MAC with [`Self::mac`] to
 /// pin a value across runs (useful for log correlation against
 /// AF_PACKET captures).
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
-)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct NetConfig {
     /// MAC address advertised to the guest via `VIRTIO_NET_F_MAC`.
     /// The locally-administered bit (0x02) is set in the default to

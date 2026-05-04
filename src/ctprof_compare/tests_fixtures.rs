@@ -137,8 +137,8 @@ pub(super) fn smaps_thread(pcomm: &str, tgid: u32, rss_kb: u64, pss_kb: u64) -> 
 /// fudge depends on).
 pub(super) const FUDGE_WORDS: &[&str] = &[
     "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta", "iota", "kappa",
-    "lambda", "mu", "nu", "xi", "omicron", "pi", "rho", "sigma", "tau", "upsilon", "phi",
-    "chi", "psi", "omega",
+    "lambda", "mu", "nu", "xi", "omicron", "pi", "rho", "sigma", "tau", "upsilon", "phi", "chi",
+    "psi", "omega",
 ];
 
 pub(super) fn fudge_snap(cgroup: &str, n: usize, _pcomm_prefix: &str) -> CtprofSnapshot {
@@ -217,4 +217,3 @@ pub(super) fn fudge_threads_with<F: FnMut(&mut ThreadState)>(
 pub(super) fn _fudge_helpers_used() {
     let _ = fudge_compose;
 }
-

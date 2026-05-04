@@ -33,6 +33,18 @@ const VENDOR_ID: u32 = 0;
 /// MMIO region size: 4 KB (one page).
 pub const VIRTIO_MMIO_SIZE: u64 = 0x1000;
 
+/// RX wake byte: host pushed a SHM dump request. The guest's
+/// `shm_poll_loop` blocks on `/dev/hvc0`; on any byte it re-checks the
+/// SHM control bytes (`DUMP_REQ_OFFSET`, `STALL_REQ_OFFSET`, signal
+/// slot 0). The byte VALUE is informational only — any non-zero byte
+/// would trigger the same re-check. Distinct values let stack traces
+/// and tcpdump-style captures distinguish the trigger source.
+pub const SIGNAL_VC_DUMP: u8 = 0xD1;
+
+/// RX wake byte: host pushed a graceful-shutdown request via SHM
+/// signal slot 0 (`SIGNAL_SHUTDOWN_REQ`).
+pub const SIGNAL_VC_SHUTDOWN: u8 = 0xD3;
+
 const NUM_QUEUES: usize = 2;
 const QUEUE_MAX_SIZE: u16 = 256;
 
@@ -76,7 +88,27 @@ pub struct VirtioConsole {
     tx_buf: Vec<u8>,
     /// Pending host input that could not be delivered because the guest
     /// RX queue had no available buffers. Drained on RX queue notify.
+    ///
+    /// Unbounded: test framework must never lose host→guest data. A
+    /// host-side OOM is preferable to a silent dropped byte that makes
+    /// a wake signal disappear or a shell paste truncate. Bursts are
+    /// already bounded by the producer (kernel scheduler bytes,
+    /// terminal paste limits, SHM control bytes that fire at most a
+    /// few times per VM run); a hostile guest cannot grow this
+    /// unboundedly because the host alone produces the bytes.
     pending_rx: VecDeque<u8>,
+    /// Per-device reusable scratch buffer for RX delivery. Sized via
+    /// `clear` + `extend_from_slice` on each descriptor; underlying
+    /// capacity grows monotonically up to the largest descriptor seen.
+    /// `drain_pending_rx` previously allocated a fresh `Vec<u8>` per
+    /// descriptor (`pending_rx.drain(..chunk).collect()`) — at high
+    /// console burst rates that path was every-RX-descriptor heap
+    /// churn. Reusing this scratch keeps the steady-state allocation
+    /// cost amortised to zero while preserving the rollback semantics
+    /// of the prior code (we drain `pending_rx` only after
+    /// `mem.write_slice` succeeds, mirroring the original behaviour
+    /// without ever allocating per-call).
+    rx_scratch: Vec<u8>,
 }
 
 impl Default for VirtioConsole {
@@ -109,6 +141,7 @@ impl VirtioConsole {
             mem: None,
             tx_buf: Vec::new(),
             pending_rx: VecDeque::new(),
+            rx_scratch: Vec::new(),
         }
     }
 
@@ -172,6 +205,19 @@ impl VirtioConsole {
     /// TX descriptors are device-readable (guest wrote them). The device
     /// writes nothing back, so add_used len is 0.
     fn process_tx(&mut self) {
+        // Spec gate: virtio-v1.2 §3.1.1 forbids the device from
+        // accessing virtqueue memory before DRIVER_OK. A QUEUE_NOTIFY
+        // arriving in a transient state (e.g. driver wrote
+        // QUEUE_READY but hasn't reached the DRIVER_OK status write)
+        // would otherwise let the device read addresses the guest
+        // hasn't validated.
+        if self.device_status & VIRTIO_CONFIG_S_DRIVER_OK == 0 {
+            tracing::debug!(
+                status = self.device_status,
+                "virtio-console process_tx: DRIVER_OK not set; ignoring notify"
+            );
+            return;
+        }
         let mem = match self.mem.as_ref() {
             Some(m) => m,
             None => return,
@@ -186,13 +232,24 @@ impl VirtioConsole {
                     let dlen = (desc.len() as usize).min(TX_DESC_MAX);
                     let start = self.tx_buf.len();
                     self.tx_buf.resize(start + dlen, 0);
-                    if mem
-                        .read_slice(&mut self.tx_buf[start..], guest_addr)
-                        .is_ok()
-                    {
-                        had_data = true;
-                    } else {
+                    if let Err(e) = mem.read_slice(&mut self.tx_buf[start..], guest_addr) {
+                        // Drop the descriptor's bytes from the
+                        // accumulator and log so a structurally
+                        // broken TX descriptor address surfaces in
+                        // tracing rather than silently disappearing.
+                        // Mirrors the warn pattern on write_slice
+                        // failure in `drain_pending_rx`.
                         self.tx_buf.truncate(start);
+                        tracing::warn!(
+                            head,
+                            dlen,
+                            %e,
+                            "virtio-console process_tx: read_slice failed \
+                             (descriptor addr likely unmapped); dropping \
+                             segment from this chain"
+                        );
+                    } else {
+                        had_data = true;
                     }
                 }
             }
@@ -247,6 +304,9 @@ impl VirtioConsole {
     /// Push host data into guest RX buffers. Any data that cannot be
     /// delivered (RX queue exhausted) is stored in `pending_rx` and
     /// drained when the guest provides new buffers (RX queue notify).
+    ///
+    /// Unbounded `pending_rx`: test framework must never lose
+    /// host→guest data. See the field's doc for why.
     pub fn queue_input(&mut self, data: &[u8]) {
         tracing::debug!(bytes = data.len(), "virtio-console queue_input");
         self.pending_rx.extend(data);
@@ -257,6 +317,20 @@ impl VirtioConsole {
     /// and on RX queue notify (guest posted new buffers).
     fn drain_pending_rx(&mut self) {
         if self.pending_rx.is_empty() {
+            return;
+        }
+        // Spec gate: virtio-v1.2 §3.1.1 forbids the device from
+        // accessing virtqueue memory before DRIVER_OK is set. The
+        // guest hasn't validated descriptor addresses yet, and the
+        // queue ready flag may be set in a transient state during
+        // initialization. Mirror the queue_config_allowed pattern
+        // for status so we never push into half-initialized rings.
+        if self.device_status & VIRTIO_CONFIG_S_DRIVER_OK == 0 {
+            tracing::debug!(
+                pending = self.pending_rx.len(),
+                status = self.device_status,
+                "virtio-console drain_pending_rx: DRIVER_OK not set; deferring"
+            );
             return;
         }
         let mem = match self.mem.as_ref() {
@@ -283,45 +357,121 @@ impl VirtioConsole {
                 break;
             };
             let head = chain.head_index();
+            // `consumed_offset` accumulates bytes successfully
+            // staged into guest memory for THIS chain. We do NOT
+            // drain `pending_rx` until BOTH `write_slice` AND
+            // `add_used` succeed for the chain — otherwise the
+            // guest never observes the descriptor's used flag and
+            // the bytes would silently disappear. Reading from the
+            // deque is offset-based via `as_slices` so re-reading
+            // past consumed bytes is safe; the actual `drain` only
+            // runs once the chain is fully published below.
+            let mut consumed_offset = 0usize;
             let mut written = 0u32;
+            let mut chain_torn = false;
             for desc in chain {
-                if desc.is_write_only() && !self.pending_rx.is_empty() {
+                if desc.is_write_only() && consumed_offset < self.pending_rx.len() {
                     let guest_addr = desc.addr();
                     let avail = desc.len() as usize;
-                    let chunk = self.pending_rx.len().min(avail);
-                    // VecDeque may not be contiguous; drain into a
-                    // contiguous slice for write_slice.
-                    let bytes: Vec<u8> = self.pending_rx.drain(..chunk).collect();
-                    if mem.write_slice(&bytes, guest_addr).is_ok() {
-                        written += chunk as u32;
+                    let remaining = self.pending_rx.len() - consumed_offset;
+                    let chunk = remaining.min(avail);
+                    // Stage the next `chunk` bytes from `pending_rx`
+                    // (starting at `consumed_offset`) into the
+                    // per-device reusable scratch via
+                    // `VecDeque::as_slices`, which exposes the deque's
+                    // ring as up to two contiguous slices (head + tail
+                    // wraparound) without any drain or allocation.
+                    // `extend_from_slice` reuses `rx_scratch`'s
+                    // capacity across calls, so the steady-state cost
+                    // is zero allocations per descriptor — replaces
+                    // the prior `pending_rx.drain(..chunk).collect()`
+                    // that produced a fresh `Vec<u8>` on every RX
+                    // descriptor (every-burst heap churn).
+                    self.rx_scratch.clear();
+                    let (head_slice, tail_slice) = self.pending_rx.as_slices();
+                    // Skip `consumed_offset` bytes already written
+                    // in earlier descriptors of THIS chain. The
+                    // `pending_rx` deque is not drained yet; we
+                    // index into it relative to its current head.
+                    let head_skip = consumed_offset.min(head_slice.len());
+                    let tail_skip = consumed_offset - head_skip;
+                    let head_avail = &head_slice[head_skip..];
+                    let tail_avail = if tail_skip < tail_slice.len() {
+                        &tail_slice[tail_skip..]
                     } else {
-                        // Write failed — push bytes back to front.
-                        for &b in bytes.iter().rev() {
-                            self.pending_rx.push_front(b);
-                        }
+                        &[][..]
+                    };
+                    let h = head_avail.len().min(chunk);
+                    self.rx_scratch.extend_from_slice(&head_avail[..h]);
+                    if h < chunk {
+                        let t = (chunk - h).min(tail_avail.len());
+                        self.rx_scratch.extend_from_slice(&tail_avail[..t]);
+                    }
+                    if mem.write_slice(&self.rx_scratch, guest_addr).is_ok() {
+                        let n = self.rx_scratch.len();
+                        consumed_offset += n;
+                        written += n as u32;
+                    } else {
+                        // Mid-chain write_slice failure: BREAK out
+                        // of the descriptor loop. Continuing to
+                        // later descriptors would publish a
+                        // partial-fill chain, which corrupts guest
+                        // reads (a guest expecting N bytes from N
+                        // descriptors gets a shorter prefix +
+                        // unspecified bytes from the failed slot).
+                        // The unwritten bytes stay in `pending_rx`
+                        // (we have not drained yet) and the next
+                        // chain re-tries from the head.
+                        // Same hostile-guest defense pattern as
+                        // virtio-blk: never emit a torn-read view.
+                        tracing::warn!(
+                            head,
+                            written,
+                            "virtio-console drain_pending_rx: write_slice failed \
+                             mid-chain; breaking out to avoid partial-fill \
+                             corruption"
+                        );
+                        chain_torn = true;
+                        break;
                     }
                 }
             }
-            total_written += written;
-            // RX add_used: on failure the guest never observes
-            // the bytes we just wrote; the descriptor leaks and
-            // the RX path eventually starves. Log so a structurally
-            // broken used-ring address surfaces in tracing rather
-            // than silently disappearing. The bytes themselves are
-            // already consumed from `pending_rx` (we don't push
-            // back here because the guest-memory write succeeded —
-            // the failure is on the publish side, not the data
-            // delivery).
+            // Only publish (add_used + drain pending_rx) when the
+            // chain wrote cleanly. If the chain was torn mid-way,
+            // we already logged a warning and the bytes stay in
+            // pending_rx for retry on the next drain cycle.
+            if chain_torn {
+                break;
+            }
+            // add_used BEFORE draining pending_rx: if add_used
+            // fails the guest never observes the descriptor's
+            // used flag, so the just-written guest-memory bytes
+            // are unobservable. Keeping bytes in pending_rx lets
+            // the next drain cycle retry from the same head — the
+            // alternative (drain-then-add_used as the prior code
+            // did) silently dropped bytes when add_used failed
+            // (the descriptor leaks AND the data is gone). This
+            // matches the write_slice failure path which also
+            // preserves bytes for retry.
             if let Err(e) = q.add_used(mem, head, written) {
                 tracing::warn!(
                     head,
                     written,
                     %e,
                     "virtio-console RX add_used failed (used-ring address \
-                     likely unmapped); guest will not observe the just-\
-                     delivered bytes and RX queue will eventually starve"
+                     likely unmapped); bytes preserved in pending_rx for \
+                     retry on the next drain cycle"
                 );
+                // Stop publishing: subsequent chains would just
+                // hit the same failure mode. Bytes remain in
+                // pending_rx; queue_input or the next QUEUE_NOTIFY
+                // re-enters this function.
+                break;
             }
+            // Both write_slice and add_used succeeded: now safe
+            // to consume from pending_rx.
+            self.pending_rx.drain(..consumed_offset);
+            total_written += written;
         }
         if total_written > 0 {
             tracing::debug!(
@@ -329,16 +479,13 @@ impl VirtioConsole {
                 pending = self.pending_rx.len(),
                 "virtio-console drain_pending_rx: delivered to guest",
             );
+            // signal_used both sets VRING in interrupt_status and
+            // writes irq_evt — one notify per QUEUE_NOTIFY pass, in
+            // line with QEMU's virtio_notify which fires exactly
+            // once per write_to_port. A second irq_evt write here
+            // would not improve latency (irqfd is level-coalesced
+            // by KVM) and would burn extra cycles on every drain.
             self.signal_used();
-            // If data remains in pending_rx (all descriptors consumed),
-            // signal again to prompt the guest to replenish RX buffers
-            // sooner. Without this, large pastes stall until the guest
-            // independently reads from hvc0.
-            if !self.pending_rx.is_empty()
-                && let Err(e) = self.irq_evt.write(1)
-            {
-                tracing::warn!(%e, "virtio-console irq_evt.write failed");
-            }
         }
     }
 
@@ -501,6 +648,14 @@ impl VirtioConsole {
         if valid {
             self.device_status = val;
             tracing::debug!(old, new = val, "virtio-console set_status: accepted");
+            // Once DRIVER_OK lands, drain any host bytes that
+            // arrived during initialization. The DRIVER_OK gate in
+            // `drain_pending_rx` deferred them; without this drain
+            // call the bytes would wait until the guest's first
+            // QUEUE_NOTIFY on RXQ, which can be much later.
+            if new_bits == VIRTIO_CONFIG_S_DRIVER_OK {
+                self.drain_pending_rx();
+            }
         } else {
             tracing::warn!(
                 old,

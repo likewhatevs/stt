@@ -388,7 +388,6 @@ fn thread_integration_mutex_contention(ctx: &Ctx) -> Result<AssertResult> {
 fn failing_result(msg: String) -> AssertResult {
     let mut r = AssertResult::pass();
     r.passed = false;
-    r.details
-        .push(AssertDetail::new(DetailKind::Other, msg));
+    r.details.push(AssertDetail::new(DetailKind::Other, msg));
     r
 }

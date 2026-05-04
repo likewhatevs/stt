@@ -686,6 +686,12 @@ impl DiskConfig {
     }
 
     /// Capacity in 512-byte sectors.
+    ///
+    /// `dead_code` allow: only the in-file `#[cfg(test)]` tests
+    /// consume this; the production virtio-blk path uses
+    /// [`Self::capacity_bytes`] and divides by `VIRTIO_BLK_SECTOR_SIZE`
+    /// at the device layer.
+    #[allow(dead_code)]
     pub(crate) fn capacity_sectors(&self) -> u64 {
         self.capacity_bytes() / 512
     }

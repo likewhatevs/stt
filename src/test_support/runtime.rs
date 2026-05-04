@@ -107,10 +107,22 @@ pub(crate) fn append_base_sched_args(entry: &KtstrTestEntry, args: &mut Vec<Stri
     args.extend(entry.extra_sched_args.iter().map(|s| s.to_string()));
 }
 
-/// Host-side watchdog applied to every ktstr_test VM. Kept as a
-/// single const so a bump in one path cannot drift against the
-/// auto-repro path.
-pub(crate) const KTSTR_VM_TIMEOUT: Duration = Duration::from_secs(60);
+/// Headroom added to the test's base duration to derive the
+/// host-side VM kill timer. Must exceed the freeze-coordinator
+/// rendezvous timeout (30s) plus dump render + probe collection
+/// so the host doesn't kill the VM mid-dump.
+const VM_TIMEOUT_HEADROOM: Duration = Duration::from_secs(45);
+
+/// Derive the host-side VM timeout from the test entry's watchdog
+/// and duration. The VM should die shortly after the stall fires
+/// and the dump completes — not linger for a hardcoded 60s.
+pub(crate) fn vm_timeout_from_entry(entry: &super::entry::KtstrTestEntry) -> Duration {
+    let base = entry
+        .watchdog_timeout
+        .max(entry.duration)
+        .max(Duration::from_secs(1));
+    base + VM_TIMEOUT_HEADROOM
+}
 
 /// Configure the ktstr_test VM builder prefix shared by the main
 /// test path ([`super::eval::run_ktstr_test_inner`]) and the
@@ -158,7 +170,7 @@ pub(crate) fn build_vm_builder_base(
         .cmdline(cmdline_extra)
         .shm_size(KTSTR_TEST_SHM_SIZE)
         .run_args(guest_args)
-        .timeout(KTSTR_VM_TIMEOUT)
+        .timeout(vm_timeout_from_entry(entry))
         .no_perf_mode(no_perf_mode);
 
     if let Some(sched_path) = scheduler {
@@ -555,5 +567,70 @@ mod tests {
             msg.contains("build_vm_builder_base_test_scheduler"),
             "expected the fake scheduler path to appear, got: {msg}",
         );
+    }
+
+    // -- vm_timeout_from_entry tests --
+
+    /// VM timeout = max(watchdog, duration, 1s) + VM_TIMEOUT_HEADROOM.
+    /// Watchdog dominates when it's the largest.
+    #[test]
+    fn vm_timeout_from_entry_uses_watchdog_when_largest() {
+        let entry = KtstrTestEntry {
+            name: "wdog",
+            watchdog_timeout: Duration::from_secs(60),
+            duration: Duration::from_secs(30),
+            ..KtstrTestEntry::DEFAULT
+        };
+        // base = max(60, 30, 1) = 60s, plus 45s headroom = 105s.
+        assert_eq!(vm_timeout_from_entry(&entry), Duration::from_secs(105));
+    }
+
+    /// Duration dominates when it's larger than the watchdog.
+    #[test]
+    fn vm_timeout_from_entry_uses_duration_when_largest() {
+        let entry = KtstrTestEntry {
+            name: "dur",
+            watchdog_timeout: Duration::from_secs(5),
+            duration: Duration::from_secs(120),
+            ..KtstrTestEntry::DEFAULT
+        };
+        // base = max(5, 120, 1) = 120s, plus 45s headroom = 165s.
+        assert_eq!(vm_timeout_from_entry(&entry), Duration::from_secs(165));
+    }
+
+    /// Both watchdog and duration well under 1s → 1s floor + headroom.
+    /// The .max(Duration::from_secs(1)) clause prevents tests with
+    /// micro-second values from producing a sub-headroom timeout.
+    #[test]
+    fn vm_timeout_from_entry_floor_when_both_small() {
+        let entry = KtstrTestEntry {
+            name: "tiny",
+            watchdog_timeout: Duration::from_millis(10),
+            duration: Duration::from_millis(50),
+            ..KtstrTestEntry::DEFAULT
+        };
+        // base = max(10ms, 50ms, 1s) = 1s, plus 45s headroom = 46s.
+        assert_eq!(vm_timeout_from_entry(&entry), Duration::from_secs(46));
+    }
+
+    /// VM_TIMEOUT_HEADROOM constant is exactly 45s — pin the value
+    /// because the doc comment refers to it as covering the
+    /// freeze-coordinator rendezvous (30s) plus dump render +
+    /// probe collection. A drift would silently undercut the
+    /// dump-completion budget.
+    #[test]
+    fn vm_timeout_headroom_is_45_seconds() {
+        assert_eq!(VM_TIMEOUT_HEADROOM, Duration::from_secs(45));
+    }
+
+    /// Default entry: watchdog_timeout=4s, duration=2s → base=4s,
+    /// timeout = 4 + 45 = 49s.
+    #[test]
+    fn vm_timeout_from_default_entry() {
+        let entry = KtstrTestEntry {
+            name: "default",
+            ..KtstrTestEntry::DEFAULT
+        };
+        assert_eq!(vm_timeout_from_entry(&entry), Duration::from_secs(49));
     }
 }

@@ -9,6 +9,31 @@
 //!
 //! In the single-phase path, all probes attach after the scheduler is
 //! up.
+//!
+//! ## Two-phase sync mechanism
+//!
+//! Phase A runs on a probe worker thread. Caller and worker
+//! synchronize via two `Latch`es and one mpsc channel:
+//!
+//! 1. Caller spawns the probe worker, which loads the skeleton and
+//!    attaches kprobes + trigger + kernel fexit, then signals the
+//!    `probes_ready` latch (see `ready.set()` below). The worker
+//!    then enters the ringbuf poll loop.
+//! 2. Caller waits on `probes_ready`. After it fires, the caller
+//!    starts the scheduler — the scheduler launches with Phase A
+//!    probes already attached, so the trigger and any kprobes that
+//!    fire during scheduler init are observed.
+//! 3. After the scheduler is up, the caller discovers BPF programs
+//!    by scheduler pid (see `discover_bpf_symbols` /
+//!    `expand_bpf_to_kernel_callers`) and sends a [`PhaseBInput`]
+//!    over the channel. The Phase B input includes BPF program FDs
+//!    held open while the scheduler is alive.
+//! 4. The probe worker's poll loop calls `try_recv` on the channel
+//!    every 100 ms; on receipt it attaches BPF fentry/fexit + extra
+//!    kprobes for kernel callers, then signals the `done` latch on
+//!    the [`PhaseBInput`].
+//! 5. Caller waits on `done` and proceeds to the test scenario with
+//!    full instrumentation in place.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -52,6 +77,12 @@ const EVENT_TRIGGER: u32 = 2;
 /// Ring buffer event type for an SCX_EV_* counter delta event from
 /// the `tp_btf/sched_ext_event` kernel tracepoint (matches
 /// `EVENT_SCX_EVENT` in `intf.h`).
+///
+/// `dead_code` allow: the BPF C side pushes these entries; the
+/// Rust ring-buffer callback currently dispatches only
+/// `EVENT_TRIGGER`. Kept here so the dispatch path can match this
+/// type once the SCX_EV_* delta consumer ships.
+#[allow(dead_code)]
 const EVENT_SCX_EVENT: u32 = 3;
 
 /// Maximum string length carried in a probe_event entry (matches
@@ -94,25 +125,29 @@ pub struct ProbeDiagnostics {
     /// Error from tp_btf/sched_ext_exit attach failure.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trigger_attach_error: Option<String>,
-    /// BPF-side kprobe fire count (from BSS ktstr_probe_count).
+    /// BPF-side kprobe fire count (cross-CPU sum of the
+    /// `KTSTR_PCPU_PROBE_COUNT` slot in `ktstr_pcpu_counters`).
     pub bpf_kprobe_fires: u64,
-    /// BPF-side kprobe commit count (from BSS ktstr_kprobe_returns).
+    /// BPF-side kprobe commit count (cross-CPU sum of the
+    /// `KTSTR_PCPU_KPROBE_RETURNS` slot).
     /// `bpf_kprobe_fires - bpf_kprobe_returns` is the number of
     /// kprobe fires that bailed before pushing into `probe_data`
     /// (meta-map miss or scratch-slot miss).
     #[serde(default)]
     pub bpf_kprobe_returns: u64,
-    /// BPF-side trigger fire count (from BSS ktstr_trigger_count).
+    /// BPF-side trigger fire count (cross-CPU sum of the
+    /// `KTSTR_PCPU_TRIGGER_COUNT` slot).
     pub bpf_trigger_fires: u64,
-    /// BPF-side func_meta_map misses (IP not found in map).
+    /// BPF-side func_meta_map misses (cross-CPU sum of the
+    /// `KTSTR_PCPU_META_MISS` slot — IP not found in map).
     pub bpf_meta_misses: u64,
     /// IPs that missed func_meta_map lookup (from BSS ktstr_miss_log).
     pub bpf_miss_ips: Vec<u64>,
     /// BPF-side `bpf_ringbuf_reserve` failures inside the trigger
-    /// handler (from BSS ktstr_ringbuf_drops). Non-zero means the
-    /// userspace consumer fell behind on the events ringbuf, so
-    /// auto-repro will see a missing trigger event even though the
-    /// scheduler did fire.
+    /// handler (cross-CPU sum of `KTSTR_PCPU_RINGBUF_DROPS`).
+    /// Non-zero means the userspace consumer fell behind on the
+    /// events ringbuf, so auto-repro will see a missing trigger
+    /// event even though the scheduler did fire.
     #[serde(default)]
     pub bpf_ringbuf_drops: u64,
     /// Nanosecond timestamp captured by the BPF trigger handler on
@@ -121,38 +156,41 @@ pub struct ProbeDiagnostics {
     #[serde(default)]
     pub bpf_first_trigger_ns: u64,
     /// Cumulative count of `tp_btf/sched_ext_event` tracepoint
-    /// fires observed by the probe BPF program (from BSS
-    /// ktstr_event_tp_count). Zero on a kernel without
-    /// `tp_btf/sched_ext_event` (pre-6.16) or when the tracepoint
-    /// never fired during the run. Distinguishes "tracepoint
-    /// available but quiet" (zero) from "tracepoint missing"
-    /// (attach failure recorded elsewhere).
+    /// fires observed by the probe BPF program (cross-CPU sum of
+    /// the `KTSTR_PCPU_EVENT_TP_COUNT` slot). Zero on a kernel
+    /// without `tp_btf/sched_ext_event` (pre-6.16) or when the
+    /// tracepoint never fired during the run. Distinguishes
+    /// "tracepoint available but quiet" (zero) from "tracepoint
+    /// missing" (attach failure recorded elsewhere).
     #[serde(default)]
     pub bpf_scx_event_tp_count: u64,
     /// `bpf_ringbuf_reserve` failures inside the
-    /// `tp_btf/sched_ext_event` handler (from BSS
-    /// ktstr_event_ringbuf_drops). Non-zero means the userspace
-    /// consumer fell behind on the events ringbuf during a hot
-    /// SCX_EV_* fire — auto-repro will see fewer per-event
-    /// timeline entries than the kernel actually produced.
+    /// `tp_btf/sched_ext_event` handler (cross-CPU sum of
+    /// `KTSTR_PCPU_EVENT_RINGBUF_DROPS`). Non-zero means the
+    /// userspace consumer fell behind on the events ringbuf
+    /// during a hot SCX_EV_* fire — auto-repro will see fewer
+    /// per-event timeline entries than the kernel actually
+    /// produced.
     #[serde(default)]
     pub bpf_scx_event_drops: u64,
     /// Cumulative count of `tp_btf/sched_switch +
     /// sched_migrate_task + sched_wakeup` records committed into
     /// the dedicated `timeline_events` ringbuf by the timeline
-    /// handlers. Read from BSS `ktstr_timeline_count`. Zero
-    /// before any of those tracepoints fire; otherwise grows
-    /// continuously while the probe runs. Combined with
-    /// `bpf_timeline_drops` it lets an operator tell whether a
-    /// failure-time drain saw the full window or only the tail.
+    /// handlers (cross-CPU sum of the
+    /// `KTSTR_PCPU_TIMELINE_COUNT` slot). Zero before any of
+    /// those tracepoints fire; otherwise grows continuously
+    /// while the probe runs. Combined with `bpf_timeline_drops`
+    /// it lets an operator tell whether a failure-time drain
+    /// saw the full window or only the tail.
     #[serde(default)]
     pub bpf_timeline_count: u64,
     /// `bpf_ringbuf_reserve` failures across the three timeline
     /// tracepoint handlers (sched_switch / sched_migrate_task /
-    /// sched_wakeup), aggregated in BSS `ktstr_timeline_drops`.
-    /// Each drop is one new event lost — the ring's existing
-    /// contents are NOT evicted on overflow, so the drain on
-    /// failure recovers the OLDEST captured events first.
+    /// sched_wakeup), aggregated as cross-CPU sum of the
+    /// `KTSTR_PCPU_TIMELINE_DROPS` slot. Each drop is one new
+    /// event lost — the ring's existing contents are NOT evicted
+    /// on overflow, so the drain on failure recovers the OLDEST
+    /// captured events first.
     #[serde(default)]
     pub bpf_timeline_drops: u64,
 }
@@ -614,8 +652,11 @@ pub fn run_probe_skeleton(
 
     let mut diag = ProbeDiagnostics::default();
 
-    // Open skeleton
+    // Open skeleton. Two MaybeUninit slots: the first backs the
+    // initial load attempt; the second backs the fallback retry when
+    // optional programs cause ESRCH. Both must outlive `skel`.
     let mut open_object = std::mem::MaybeUninit::uninit();
+    let mut open_object_fallback = std::mem::MaybeUninit::uninit();
     let builder = ProbeSkelBuilder::default();
     let mut open_skel = match builder.open(&mut open_object) {
         Ok(s) => s,
@@ -632,20 +673,93 @@ pub fn run_probe_skeleton(
         rodata.ktstr_enabled = true;
     }
 
-    // Load skeleton
-    let skel = match open_skel.load() {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!(%e, "probe skeleton load failed");
-            diag.trigger_attach_error = Some(format!("skeleton load: {e}"));
-            ready.set();
-            return (None, diag, Vec::new());
+    // Load skeleton. Try with all programs first; if a missing tp_btf
+    // target causes ESRCH, re-open with optional programs disabled.
+    // The fallback unconditionally fires on any load error, not
+    // strictly ESRCH — libbpf doesn't surface a stable errno through
+    // its Error type, so an exact ESRCH match is brittle. The retry
+    // is cheap (re-open + load with autoload disabled on the optional
+    // set), so the broader gate is acceptable. When the retry ALSO
+    // fails, we surface BOTH errors so the operator sees the original
+    // root cause alongside the retry failure — a verifier rejection
+    // on a non-optional program would otherwise be masked by the
+    // retry's unrelated error.
+    let (skel, optional_programs_loaded) = match open_skel.load() {
+        Ok(s) => (s, true),
+        Err(first_err) => {
+            tracing::debug!(
+                %first_err,
+                "probe skeleton load failed with all programs; \
+                 retrying with optional programs disabled"
+            );
+            let builder2 = ProbeSkelBuilder::default();
+            let mut open_skel2 = match builder2.open(&mut open_object_fallback) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!(%e, "probe skeleton re-open failed");
+                    diag.trigger_attach_error = Some(format!(
+                        "skeleton open (retry): {e}; original load error: {first_err}"
+                    ));
+                    ready.set();
+                    return (None, diag, Vec::new());
+                }
+            };
+            if let Some(rodata) = open_skel2.maps.rodata_data.as_mut() {
+                rodata.ktstr_enabled = true;
+            }
+            open_skel2.progs.ktstr_event_tp.set_autoload(false);
+            open_skel2.progs.ktstr_pi_fentry.set_autoload(false);
+            open_skel2.progs.ktstr_pi_fexit.set_autoload(false);
+            open_skel2.progs.ktstr_lock_contend.set_autoload(false);
+            open_skel2
+                .progs
+                .ktstr_preempt_disable_tp
+                .set_autoload(false);
+            open_skel2.progs.ktstr_preempt_enable_tp.set_autoload(false);
+            match open_skel2.load() {
+                Ok(s) => (s, false),
+                Err(e) => {
+                    tracing::error!(
+                        %e, %first_err,
+                        "probe skeleton load failed (retry); \
+                         surfacing both original and retry errors"
+                    );
+                    diag.trigger_attach_error = Some(format!(
+                        "skeleton load (retry): {e}; original error before retry: {first_err}"
+                    ));
+                    ready.set();
+                    return (None, diag, Vec::new());
+                }
+            }
         }
     };
 
     // Populate func_meta_map with function IPs and metadata
     let mut func_ips: Vec<(u32, u64, String)> = Vec::new(); // (idx, ip, display_name)
     let mut bpf_funcs: Vec<(u32, &StackFunction)> = Vec::new(); // BPF functions for fentry
+
+    // Load vmlinux BTF once and reuse across every kprobe meta
+    // population in the loop below. The previous code called
+    // `resolve_field_specs(_, None)` per function, which re-parsed
+    // the multi-MB vmlinux BTF on every iteration (>1 s per kernel
+    // with thousands of kprobed functions). Loading once turns the
+    // hot path into pure type lookups against a borrowed handle.
+    // `None` (load failure) leaves `cached_btf` empty and downstream
+    // call sites fall back to the no-BTF path — same behaviour as
+    // the previous per-call `Err(...) -> Vec::new()` branch.
+    let cached_btf = crate::monitor::btf_offsets::load_btf_from_path(std::path::Path::new(
+        "/sys/kernel/btf/vmlinux",
+    ))
+    .map_err(|e| {
+        tracing::warn!(
+            %e,
+            "process: failed to pre-load /sys/kernel/btf/vmlinux for \
+             kprobe meta population — field specs will be empty for \
+             this batch"
+        );
+        e
+    })
+    .ok();
 
     for (idx, func) in functions.iter().enumerate() {
         if func.is_bpf {
@@ -668,7 +782,10 @@ pub fn run_probe_skeleton(
 
         // Populate field specs from BTF-resolved offsets.
         if let Some(btf_func) = btf_funcs.iter().find(|f| f.name == func.raw_name) {
-            let field_specs = super::btf::resolve_field_specs(btf_func, None);
+            let field_specs = match cached_btf.as_ref() {
+                Some(btf) => super::btf::resolve_field_specs_with_btf(btf_func, btf),
+                None => Vec::new(),
+            };
             populate_field_specs(&mut meta, &field_specs);
             // Detect char * params for string capture.
             meta.str_param_idx = detect_str_param(btf_func);
@@ -944,7 +1061,10 @@ pub fn run_probe_skeleton(
                     // Try vmlinux BTF first (for known struct params like
                     // task_struct and auto-discovered vmlinux fields),
                     // then BPF program BTF (for BPF-local types like task_ctx).
-                    let mut field_specs = super::btf::resolve_field_specs(btf_func, None);
+                    let mut field_specs = match cached_btf.as_ref() {
+                        Some(btf) => super::btf::resolve_field_specs_with_btf(btf_func, btf),
+                        None => Vec::new(),
+                    };
                     if field_specs.is_empty()
                         && let Some(prog_id) = functions
                             .iter()
@@ -1168,6 +1288,46 @@ pub fn run_probe_skeleton(
         }
     }
 
+    // Attach timeline programs (loaded by the skeleton but not
+    // auto-attached — they need explicit attach_trace calls).
+    match skel.progs.ktstr_tl_switch.attach_trace() {
+        Ok(link) => links.push((link, "tp_btf/sched_switch".to_string())),
+        Err(e) => tracing::warn!(%e, "timeline sched_switch attach failed"),
+    }
+    match skel.progs.ktstr_tl_migrate.attach_trace() {
+        Ok(link) => links.push((link, "tp_btf/sched_migrate_task".to_string())),
+        Err(e) => tracing::warn!(%e, "timeline sched_migrate_task attach failed"),
+    }
+    match skel.progs.ktstr_tl_wakeup.attach_trace() {
+        Ok(link) => links.push((link, "tp_btf/sched_wakeup".to_string())),
+        Err(e) => tracing::warn!(%e, "timeline sched_wakeup attach failed"),
+    }
+
+    // Attach optional programs. When the first load succeeded (all
+    // targets present), they were loaded and just need attachment.
+    // When the fallback path ran, they were not loaded — attach
+    // returns an error that we silently absorb.
+    if optional_programs_loaded {
+        if let Ok(link) = skel.progs.ktstr_event_tp.attach_trace() {
+            links.push((link, "tp_btf/sched_ext_event".to_string()));
+        }
+        if let Ok(link) = skel.progs.ktstr_pi_fentry.attach_trace() {
+            links.push((link, "fentry/rt_mutex_setprio".to_string()));
+        }
+        if let Ok(link) = skel.progs.ktstr_pi_fexit.attach_trace() {
+            links.push((link, "fexit/rt_mutex_setprio".to_string()));
+        }
+        if let Ok(link) = skel.progs.ktstr_lock_contend.attach_trace() {
+            links.push((link, "tp_btf/contention_begin".to_string()));
+        }
+        if let Ok(link) = skel.progs.ktstr_preempt_disable_tp.attach_trace() {
+            links.push((link, "tp_btf/preempt_disable".to_string()));
+        }
+        if let Ok(link) = skel.progs.ktstr_preempt_enable_tp.attach_trace() {
+            links.push((link, "tp_btf/preempt_enable".to_string()));
+        }
+    }
+
     // Set up ring buffer
     let events: std::sync::Arc<std::sync::Mutex<Vec<ProbeEvent>>> =
         std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1196,7 +1356,7 @@ pub fn run_probe_skeleton(
     }
 
     let mut rb_builder = RingBufferBuilder::new();
-    if let Err(e) = rb_builder.add(&skel.maps.events, move |data: &[u8]| {
+    if let Err(e) = rb_builder.add(&skel.maps.ktstr_events, move |data: &[u8]| {
         if data.len() < std::mem::size_of::<RbEvent>() {
             return 0;
         }
@@ -1306,36 +1466,104 @@ pub fn run_probe_skeleton(
                     }
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    // Channel sender dropped without delivering Phase B
+                    // input. Without a Phase B payload there is nothing
+                    // left for this probe loop to attach; if `stop` is
+                    // also set, return empty diagnostics rather than
+                    // poll an empty ringbuf for the rest of the timeout.
                     tracing::debug!("Phase B channel disconnected");
                     phase_b_done = true;
                     phase_b_rx = None;
+                    if stop.load(Ordering::Relaxed) {
+                        return (None, diag, Vec::new());
+                    }
                 }
             }
         }
 
-        if triggered.load(Ordering::Acquire) || stop.load(Ordering::Acquire) {
-            diag.trigger_fired = triggered.load(Ordering::Acquire);
+        // Also check BSS err_exit_detected: stall exits skip the
+        // ring buffer (bpf_get_current_task is unrelated to the
+        // stall cause) but still latch the BSS flag. Volatile read
+        // because the BPF program writes via the kernel-side mmap
+        // and Rust's aliasing rules let the compiler hoist a normal
+        // read out of the loop.
+        let bss_triggered = skel.maps.bss_data.as_ref().is_some_and(|bss| unsafe {
+            std::ptr::read_volatile(&bss.ktstr_err_exit_detected as *const u32) != 0
+        });
+        if triggered.load(Ordering::Acquire) || bss_triggered || stop.load(Ordering::Acquire) {
+            diag.trigger_fired = triggered.load(Ordering::Acquire) || bss_triggered;
 
-            // Read BPF-side diagnostic counters from BSS.
+            // Read BPF-side diagnostic counters from BSS. The hot
+            // counters live in the per-CPU `ktstr_pcpu_counters`
+            // 2D array (`[MAX_CPUS][KTSTR_PCPU_NR]`); each per-CPU
+            // slot is a cacheline-aligned `pcpu_counter { long
+            // value; }`. Sum across CPUs to recover the cumulative
+            // count — see `enum ktstr_pcpu_idx` in
+            // src/bpf/probe.bpf.c for the slot indices.
             if let Some(bss) = skel.maps.bss_data.as_ref() {
-                diag.bpf_kprobe_fires = bss.ktstr_probe_count;
-                diag.bpf_kprobe_returns = bss.ktstr_kprobe_returns;
-                diag.bpf_trigger_fires = bss.ktstr_trigger_count;
-                diag.bpf_meta_misses = bss.ktstr_meta_miss;
+                // Slot indices must match `enum ktstr_pcpu_idx`. A
+                // reorder in the BPF source breaks every reader; the
+                // explicit constants here surface that drift at the
+                // call site instead of silently aliasing two
+                // counters.
+                const PCPU_PROBE_COUNT: usize = 0;
+                const PCPU_KPROBE_RETURNS: usize = 1;
+                const PCPU_META_MISS: usize = 2;
+                const PCPU_RINGBUF_DROPS: usize = 3;
+                const PCPU_EVENT_TP_COUNT: usize = 4;
+                const PCPU_EVENT_RINGBUF_DROPS: usize = 5;
+                const PCPU_TIMELINE_COUNT: usize = 6;
+                const PCPU_TIMELINE_DROPS: usize = 7;
+                const PCPU_TRIGGER_COUNT: usize = 16;
+                let counters = &bss.ktstr_pcpu_counters;
+                let sum_pcpu = |idx: usize| -> u64 {
+                    counters
+                        .iter()
+                        .map(|cpu_slots| cpu_slots[idx].value as u64)
+                        .sum()
+                };
+                diag.bpf_kprobe_fires = sum_pcpu(PCPU_PROBE_COUNT);
+                diag.bpf_kprobe_returns = sum_pcpu(PCPU_KPROBE_RETURNS);
+                diag.bpf_trigger_fires = sum_pcpu(PCPU_TRIGGER_COUNT);
+                diag.bpf_meta_misses = sum_pcpu(PCPU_META_MISS);
                 let n = (bss.ktstr_miss_log_idx as usize).min(bss.ktstr_miss_log.len());
                 diag.bpf_miss_ips = bss.ktstr_miss_log[..n].to_vec();
-                diag.bpf_ringbuf_drops = bss.ktstr_ringbuf_drops;
+                diag.bpf_ringbuf_drops = sum_pcpu(PCPU_RINGBUF_DROPS);
                 diag.bpf_first_trigger_ns = bss.ktstr_last_trigger_ts;
-                diag.bpf_scx_event_tp_count = bss.ktstr_event_tp_count;
-                diag.bpf_scx_event_drops = bss.ktstr_event_ringbuf_drops;
-                diag.bpf_timeline_count = bss.ktstr_timeline_count;
-                diag.bpf_timeline_drops = bss.ktstr_timeline_drops;
+                diag.bpf_scx_event_tp_count = sum_pcpu(PCPU_EVENT_TP_COUNT);
+                diag.bpf_scx_event_drops = sum_pcpu(PCPU_EVENT_RINGBUF_DROPS);
+                diag.bpf_timeline_count = sum_pcpu(PCPU_TIMELINE_COUNT);
+                diag.bpf_timeline_drops = sum_pcpu(PCPU_TIMELINE_DROPS);
             }
 
             let key_size = std::mem::size_of::<types::probe_key>();
             let mut probe_events = Vec::new();
             let mut total_keys = 0u32;
             let mut unmatched_ips = 0u32;
+
+            // Build IP → (func_idx, display_name) lookup once. The
+            // event-drain loop below would otherwise scan every entry
+            // in `func_ips` per probe_data key — O(events × funcs).
+            // With thousands of funcs and tens of thousands of events
+            // on a normal run, the linear scan dominates dump time.
+            // HashMap turns the per-event lookup into O(1).
+            let func_ips_by_ip: std::collections::HashMap<u64, (u32, &str)> = func_ips
+                .iter()
+                .map(|(idx, ip, name)| (*ip, (*idx, name.as_str())))
+                .collect();
+
+            // Pre-compute per-function `field_keys_hints` once. The
+            // previous code recomputed `build_field_keys` for every
+            // event, even when many events share the same function —
+            // O(events × funcs) field-key construction. Building the
+            // map keyed by function name turns the per-event work
+            // into a single HashMap lookup.
+            let field_keys_by_func: std::collections::HashMap<&str, Vec<(String, RenderHint)>> =
+                btf_funcs
+                    .iter()
+                    .chain(phase_b_btf.iter())
+                    .map(|f| (f.name.as_str(), build_field_keys(f)))
+                    .collect();
 
             for key_bytes in skel.maps.probe_data.keys() {
                 if key_bytes.len() < key_size {
@@ -1346,9 +1574,8 @@ pub fn run_probe_skeleton(
                     unsafe { &*(key_bytes.as_ptr() as *const types::probe_key) };
 
                 // Find which function this IP belongs to.
-                let func_entry = func_ips.iter().find(|(_, ip, _)| *ip == key.func_ip);
-                let (func_idx, display_name) = match func_entry {
-                    Some((idx, _, name)) => (*idx, name.as_str()),
+                let (func_idx, display_name) = match func_ips_by_ip.get(&key.func_ip) {
+                    Some(&(idx, name)) => (idx, name),
                     None => {
                         unmatched_ips += 1;
                         continue;
@@ -1363,12 +1590,12 @@ pub fn run_probe_skeleton(
                         continue;
                     }
 
-                    let field_keys_hints: Vec<(String, RenderHint)> = btf_funcs
-                        .iter()
-                        .chain(phase_b_btf.iter())
-                        .find(|f| f.name == display_name)
-                        .map(build_field_keys)
-                        .unwrap_or_default();
+                    // Borrow the pre-computed hints for this function;
+                    // an empty slice for unknown funcs preserves the
+                    // previous `unwrap_or_default()` behaviour.
+                    let empty: Vec<(String, RenderHint)> = Vec::new();
+                    let field_keys_hints: &Vec<(String, RenderHint)> =
+                        field_keys_by_func.get(display_name).unwrap_or(&empty);
 
                     let nr = (entry.nr_fields as usize).min(16);
                     let fields: Vec<(String, u64)> = entry.fields[..nr]
@@ -1563,6 +1790,26 @@ fn attach_phase_b_fentry(
 
     let offset = pb.func_idx_offset;
 
+    // Pre-load vmlinux BTF once for the Phase B kprobe + fentry
+    // loops below. Same rationale as the Phase A path in
+    // `run_probe_skeleton`: per-call `resolve_field_specs(_, None)`
+    // would re-parse the multi-MB vmlinux BTF on every iteration,
+    // dominating Phase B attach time on a kernel with thousands of
+    // probed functions.
+    let cached_btf = crate::monitor::btf_offsets::load_btf_from_path(std::path::Path::new(
+        "/sys/kernel/btf/vmlinux",
+    ))
+    .map_err(|e| {
+        tracing::warn!(
+            %e,
+            "phase_b: failed to pre-load /sys/kernel/btf/vmlinux for \
+             kprobe/fentry meta population — field specs will be empty \
+             for this batch"
+        );
+        e
+    })
+    .ok();
+
     // --- Phase B kernel functions: kprobes + func_meta ---
     for (i, func) in pb.functions.iter().enumerate() {
         if func.is_bpf {
@@ -1584,7 +1831,10 @@ fn attach_phase_b_fentry(
         };
 
         if let Some(btf_func) = pb.btf_funcs.iter().find(|f| f.name == func.raw_name) {
-            let field_specs = super::btf::resolve_field_specs(btf_func, None);
+            let field_specs = match cached_btf.as_ref() {
+                Some(btf) => super::btf::resolve_field_specs_with_btf(btf_func, btf),
+                None => Vec::new(),
+            };
             populate_field_specs(&mut meta, &field_specs);
             meta.str_param_idx = detect_str_param(btf_func);
         }
@@ -1909,7 +2159,10 @@ fn attach_phase_b_fentry(
             };
 
             if let Some(btf_func) = pb.btf_funcs.iter().find(|f| f.name == t.name) {
-                let mut field_specs = super::btf::resolve_field_specs(btf_func, None);
+                let mut field_specs = match cached_btf.as_ref() {
+                    Some(btf) => super::btf::resolve_field_specs_with_btf(btf_func, btf),
+                    None => Vec::new(),
+                };
                 if field_specs.is_empty()
                     && let Some(prog_id) = pb
                         .functions

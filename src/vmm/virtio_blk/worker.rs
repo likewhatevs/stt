@@ -390,6 +390,7 @@ pub(crate) fn worker_thread_main(
     kick_fd: EventFd,
     stop_fd: EventFd,
     pause_fd: EventFd,
+    parked_evt_slot: Arc<std::sync::Mutex<Option<Arc<EventFd>>>>,
 ) -> BlkWorkerState {
     // Apply the configured CPU placement before any other syscall.
     // perf-mode pins to a single CPU (cache locality + isolation
@@ -638,6 +639,44 @@ pub(crate) fn worker_thread_main(
                     // the vCPU rendezvous's `parked.store(Release)`
                     // pattern in [`exit_dispatch::handle_freeze`].
                     paused.store(true, Ordering::Release);
+                    // Wake the freeze coordinator's rendezvous poll
+                    // by writing to the shared parked_evt AFTER the
+                    // Release store. The ordering is load-bearing:
+                    // the coordinator's Acquire load on `paused`
+                    // happens-after this Release, so its subsequent
+                    // guest-memory reads observe every queue
+                    // mutation the worker performed before park.
+                    // EAGAIN under EFD_NONBLOCK from a saturated
+                    // counter is benign — the AtomicBool is the
+                    // source of truth.
+                    // Recover from a poisoned mutex (a prior holder
+                    // panicked). The slot itself is plain data
+                    // (Option<Arc<EventFd>>); proceeding past the
+                    // panic only risks reading the most-recent
+                    // value, which is exactly what we need to wake
+                    // the coordinator. Silently skipping on
+                    // poisoning would suppress the parked_evt write
+                    // and force the coordinator to wait the full
+                    // FREEZE_RENDEZVOUS_TIMEOUT before observing
+                    // `paused` via its periodic poll.
+                    let guard = match parked_evt_slot.lock() {
+                        Ok(g) => g,
+                        Err(poisoned) => {
+                            tracing::warn!(
+                                "virtio-blk worker: parked_evt_slot lock poisoned; \
+                                 recovering inner data via PoisonError::into_inner"
+                            );
+                            poisoned.into_inner()
+                        }
+                    };
+                    if let Some(ref evt) = *guard
+                        && let Err(e) = evt.write(1)
+                    {
+                        tracing::debug!(
+                            err = %e,
+                            "virtio-blk worker: parked_evt write failed (EAGAIN expected on counter saturation)"
+                        );
+                    }
                     // Park until the coordinator clears the flag.
                     // `park_timeout(10ms)` is the same poll cadence
                     // the vCPU rendezvous uses — short enough that

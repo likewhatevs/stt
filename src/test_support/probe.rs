@@ -32,7 +32,9 @@ use super::output::{extract_sched_ext_dump, print_assert_result};
 use super::profraw::try_flush_profraw;
 use super::runtime::{config_file_parts, verbose};
 use super::{KtstrTestEntry, TopoOverride};
-use crate::verifier::{SCHED_OUTPUT_END, SCHED_OUTPUT_START, parse_sched_output};
+use crate::verifier::{
+    SCHED_OUTPUT_END, SCHED_OUTPUT_START, parse_sched_output, parse_sched_output_partial,
+};
 
 /// Sentinel value for `--ktstr-probe-stack` when no crash stack functions
 /// were extracted. Triggers the guest-side probe path so
@@ -108,9 +110,13 @@ fn format_tail(text: &str, n: usize, header: &str) -> Option<String> {
 /// file-IO + tail-header wrapper.
 fn render_failure_dump_file(path: &std::path::Path) -> Option<String> {
     use crate::monitor::dump::FailureDumpReportAny;
+    use std::fmt::Write;
     let json = std::fs::read_to_string(path).ok()?;
     let any = FailureDumpReportAny::from_json(&json)?;
-    Some(format!("--- repro VM failure dump ---\n{any}"))
+    let mut buf = String::with_capacity(json.len());
+    buf.push_str("--- repro VM failure dump ---\n");
+    let _ = write!(buf, "{any}");
+    Some(buf)
 }
 
 /// Classify the repro VM outcome into a single human-readable status
@@ -227,6 +233,13 @@ fn extract_not_attached_reason(output: &str) -> Option<&str> {
 /// `console_output` is COM1 kernel console text, used when COM2 has no
 /// extractable functions (e.g. scheduler died before writing output).
 /// Returns `None` if repro cannot be attempted or yields no data.
+///
+/// `too_many_arguments` allow: each parameter is independent test
+/// fixture state (test entry, kernel/scheduler/ktstr binaries, the
+/// two console captures, optional topology override, active probe
+/// flags). Bundling into a struct would build a struct used at
+/// exactly one call site.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn attempt_auto_repro(
     entry: &KtstrTestEntry,
     kernel: &Path,
@@ -235,17 +248,23 @@ pub(crate) fn attempt_auto_repro(
     first_vm_output: &str,
     console_output: &str,
     topo: Option<&TopoOverride>,
+    active_flags: &[String],
 ) -> Option<String> {
     use crate::probe::stack::extract_stack_functions_all;
 
     // Extract scheduler log from COM2 output.
+    let has_sched_start = first_vm_output.contains(SCHED_OUTPUT_START);
+    let has_sched_end = first_vm_output.contains(SCHED_OUTPUT_END);
     eprintln!(
-        "ktstr_test: auto-repro: COM2 length={} has_sched_start={} has_sched_end={}",
+        "ktstr_test: auto-repro: COM2 length={} has_sched_start={has_sched_start} has_sched_end={has_sched_end}",
         first_vm_output.len(),
-        first_vm_output.contains(SCHED_OUTPUT_START),
-        first_vm_output.contains(SCHED_OUTPUT_END),
     );
-    let sched_output = parse_sched_output(first_vm_output);
+    // `parse_sched_output_partial` accepts a missing SCHED_OUTPUT_END
+    // (scheduler crashed mid-run, never wrote the closing delimiter)
+    // and falls back to the slice from SCHED_OUTPUT_START to end of
+    // buffer. Discarding partial COM2 output and skipping straight to
+    // COM1 would lose the crash stack the probe pipeline needs.
+    let sched_output = parse_sched_output_partial(first_vm_output);
 
     // Extract function names from COM2 scheduler log first, then
     // fall back to COM1 kernel console (which has kernel backtraces
@@ -253,9 +272,23 @@ pub(crate) fn attempt_auto_repro(
     let stack_funcs = if let Some(sched) = sched_output {
         let funcs = extract_stack_functions_all(sched);
         if funcs.is_empty() {
-            eprintln!("ktstr_test: auto-repro: no functions from COM2, trying COM1");
+            if has_sched_start && !has_sched_end {
+                eprintln!(
+                    "ktstr_test: auto-repro: no functions from partial COM2 (missing \
+                     SCHED_OUTPUT_END), trying COM1",
+                );
+            } else {
+                eprintln!("ktstr_test: auto-repro: no functions from COM2, trying COM1");
+            }
             extract_stack_functions_all(console_output)
         } else {
+            if has_sched_start && !has_sched_end {
+                eprintln!(
+                    "ktstr_test: auto-repro: extracted {} functions from partial COM2 \
+                     (missing SCHED_OUTPUT_END)",
+                    funcs.len(),
+                );
+            }
             funcs
         }
     } else {
@@ -330,16 +363,65 @@ pub(crate) fn attempt_auto_repro(
     // gate is a builder field rather than a path-string match so
     // a future caller invoking the repro logic with a different
     // `.failure_dump_path()` keeps working without surprise.
-    builder = builder.dual_snapshot(true);
+    builder = builder
+        .dual_snapshot(true)
+        .performance_mode(entry.performance_mode);
+
+    if let Some(crate::test_support::entry::SchedulerSpec::KernelBuiltin { enable, disable }) =
+        entry.scheduler.scheduler_binary()
+    {
+        builder = builder.sched_enable_cmds(enable);
+        builder = builder.sched_disable_cmds(disable);
+    }
+
+    let merged_assert = crate::assert::Assert::default_checks()
+        .merge(entry.scheduler.assert())
+        .merge(&entry.assert);
+    if entry.scheduler.has_active_scheduling() {
+        builder = builder.monitor_thresholds(merged_assert.monitor_thresholds());
+    }
 
     {
         let mut args: Vec<String> = Vec::new();
+
+        let declarative_specs: Vec<std::path::PathBuf> = entry
+            .all_include_files()
+            .into_iter()
+            .map(std::path::PathBuf::from)
+            .collect();
+        let mut resolved_includes: Vec<(String, std::path::PathBuf, &'static str)> =
+            if declarative_specs.is_empty() {
+                Vec::new()
+            } else {
+                match crate::cli::resolve_include_files(&declarative_specs) {
+                    Ok(v) => v.into_iter().map(|(a, h)| (a, h, "declarative")).collect(),
+                    Err(e) => {
+                        eprintln!("ktstr_test: auto-repro: include_files resolve: {e:#}");
+                        Vec::new()
+                    }
+                }
+            };
         if let Some((archive_path, host_path, guest_path)) = config_file_parts(entry) {
-            builder = builder.include_files(vec![(archive_path, host_path)]);
+            resolved_includes.push((archive_path, host_path, "scheduler config_file"));
             args.push("--config".to_string());
             args.push(guest_path);
         }
+        match super::eval::dedupe_include_files(&resolved_includes) {
+            Ok(unioned) if !unioned.is_empty() => {
+                builder = builder.include_files(unioned);
+            }
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("ktstr_test: auto-repro: include_files dedupe: {e:#}");
+            }
+        }
+
         super::runtime::append_base_sched_args(entry, &mut args);
+        for flag_name in active_flags {
+            if let Some(flag_args) = entry.scheduler.flag_args(flag_name) {
+                args.extend(flag_args.iter().map(|s| s.to_string()));
+            }
+        }
         if !args.is_empty() {
             builder = builder.sched_args(&args);
         }
@@ -394,7 +476,20 @@ pub(crate) fn attempt_auto_repro(
         .map(|dir| crate::cache::prefer_source_tree_for_dwarf(&dir).unwrap_or(dir))
         .and_then(|p| p.to_str().map(String::from));
     let kernel_dir_str = kernel_dir.as_deref();
-    let probe_section = extract_probe_output(&repro_result.output, kernel_dir_str);
+    // Sibling of `repro_dump_path` for the truncated-payload sink: when
+    // the repro VM dies mid-`println!` of the probe payload (e.g. KVM
+    // EFAULT, panic-before-PROBE_OUTPUT_END), `extract_probe_output`
+    // writes the raw extracted JSON here so the operator can inspect
+    // the truncated bytes. Pre-clear so a previous run's stale
+    // partial doesn't get mistaken for this run's output.
+    let probe_payload_partial_path = super::sidecar::sidecar_dir()
+        .join(format!("{}.repro.probe-payload.partial.json", entry.name));
+    let _ = std::fs::remove_file(&probe_payload_partial_path);
+    let probe_section = extract_probe_output(
+        &repro_result.output,
+        kernel_dir_str,
+        Some(probe_payload_partial_path.as_path()),
+    );
 
     // Build diagnostic tails from the repro VM's output.
     const REPRO_TAIL_LINES: usize = 40;
@@ -468,18 +563,24 @@ pub(crate) fn attempt_auto_repro(
 
 /// Extract probe JSON from guest COM2, deserialize, and format on the
 /// host where vmlinux (DWARF) is available for source locations.
-pub(crate) fn extract_probe_output(output: &str, kernel_dir: Option<&str>) -> Option<String> {
+///
+/// `partial_dump_path` (when `Some`) names a file under the sidecar
+/// dir where the raw extracted JSON gets written if deserialization
+/// fails for any reason — truncation, syntax, or schema mismatch.
+/// Truncation in particular is expected when the repro VM dies mid-
+/// `println!` of the probe payload (e.g. KVM EFAULT, panic before
+/// `PROBE_OUTPUT_END`); the partial-dump file lets the operator
+/// inspect whatever the guest managed to write.
+pub(crate) fn extract_probe_output(
+    output: &str,
+    kernel_dir: Option<&str>,
+    partial_dump_path: Option<&Path>,
+) -> Option<String> {
     let json = crate::probe::output::extract_section(output, PROBE_OUTPUT_START, PROBE_OUTPUT_END);
     if json.is_empty() {
         return None;
     }
-    let payload: ProbeBytes = match serde_json::from_str(&json) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("ktstr_test: probe payload deserialize failed: {e}");
-            return None;
-        }
-    };
+    let payload = parse_probe_payload(&json, partial_dump_path)?;
     let mut out = String::new();
 
     // Append pipeline diagnostics if present.
@@ -503,6 +604,179 @@ pub(crate) fn extract_probe_output(output: &str, kernel_dir: Option<&str>) -> Op
         &payload.render_hints,
     ));
     Some(out)
+}
+
+/// Try to deserialize the probe payload, recovering as much data as
+/// possible when the guest truncated mid-write.
+///
+/// Strategy:
+/// 1. Strict `serde_json::from_str::<ProbeBytes>` succeeds → return
+///    the full payload.
+/// 2. EOF / truncation error (`Category::Eof`) → walk the JSON,
+///    locate the `"events":[ ... ]` array, and parse leading
+///    `ProbeEvent` objects until one fails to deserialize. Return a
+///    `ProbeBytes` whose `events` field carries the recovered events
+///    and every other field is empty / `None`. Empty `func_names`
+///    means the formatter will print `unknown` for func names, which
+///    is degraded but still surfaces ts/args/fields/kstack.
+/// 3. Any non-EOF deserialize error (syntax, schema mismatch) →
+///    return `None`.
+///
+/// On any failure path, when `partial_dump_path` is `Some` the raw
+/// extracted JSON is written there verbatim so the operator can
+/// inspect the truncated bytes manually. Write errors are logged but
+/// do not affect the return value.
+fn parse_probe_payload(json: &str, partial_dump_path: Option<&Path>) -> Option<ProbeBytes> {
+    match serde_json::from_str::<ProbeBytes>(json) {
+        Ok(payload) => Some(payload),
+        Err(e) => {
+            // Surface byte position + total length so the operator
+            // sees how far the guest got before truncation.
+            let total_len = json.len();
+            let category = if e.is_eof() { "truncated" } else { "malformed" };
+            eprintln!(
+                "ktstr_test: probe payload {category}: {e} \
+                 (line {}, column {}, total {total_len} bytes)",
+                e.line(),
+                e.column(),
+            );
+            // Always persist the raw payload when we have a sink, so
+            // the operator can grep / re-parse / diff against the
+            // emitter format. We write before attempting recovery:
+            // recovery may itself fail, but the raw bytes are the
+            // ground truth either way.
+            if let Some(path) = partial_dump_path {
+                match std::fs::write(path, json) {
+                    Ok(()) => eprintln!(
+                        "ktstr_test: probe payload: wrote raw bytes to {}",
+                        path.display(),
+                    ),
+                    Err(write_err) => eprintln!(
+                        "ktstr_test: probe payload: failed to write raw bytes to {}: {write_err}",
+                        path.display(),
+                    ),
+                }
+            }
+            if !e.is_eof() {
+                return None;
+            }
+            // EOF path: try to salvage events.
+            let recovered = recover_partial_events(json);
+            if recovered.is_empty() {
+                return None;
+            }
+            eprintln!(
+                "ktstr_test: probe payload: recovered {} event(s) from truncated input",
+                recovered.len(),
+            );
+            Some(ProbeBytes {
+                events: recovered,
+                func_names: Vec::new(),
+                bpf_source_locs: Default::default(),
+                diagnostics: None,
+                nr_cpus: None,
+                param_names: Default::default(),
+                render_hints: Default::default(),
+            })
+        }
+    }
+}
+
+/// Walk a (possibly truncated) `ProbeBytes` JSON payload and parse
+/// as many leading `ProbeEvent` objects from the `events` array as
+/// will deserialize cleanly. Stops at the first parse failure or
+/// when the array's closing `]` is reached.
+///
+/// The walk is depth-tracking byte scanning rather than full JSON
+/// parsing: we locate `"events":` then `[`, and from there split the
+/// remainder into balanced `{...}` chunks (honoring string escapes
+/// so braces inside strings don't unbalance the count). Each chunk
+/// is fed to `serde_json::from_str::<ProbeEvent>` — a partial
+/// trailing event therefore gets dropped at the splitter (`None`
+/// from `find_balanced_object_end`), or, if it is balanced but
+/// internally malformed, at the `from_str` step.
+fn recover_partial_events(json: &str) -> Vec<crate::probe::process::ProbeEvent> {
+    // Locate the start of the events array. ProbeBytes is serialized
+    // with `events` as the first field, so this match is at the
+    // beginning of the payload in normal output, but `find` is robust
+    // to any field order serde_json might choose in the future.
+    let key = "\"events\":";
+    let Some(key_idx) = json.find(key) else {
+        return Vec::new();
+    };
+    let after_key = &json[key_idx + key.len()..];
+    let Some(open_offset) = after_key.find('[') else {
+        return Vec::new();
+    };
+    let mut events = Vec::new();
+    let mut cur = &after_key[open_offset + 1..];
+    loop {
+        cur = cur.trim_start();
+        // Optional comma between elements (not before the first).
+        if let Some(rest) = cur.strip_prefix(',') {
+            cur = rest.trim_start();
+        }
+        // Closing bracket means a clean array end — no truncation.
+        // Empty / non-`{` head means we hit the truncation boundary
+        // mid-event (or before the first event was emitted).
+        if cur.is_empty() || cur.starts_with(']') || !cur.starts_with('{') {
+            break;
+        }
+        let Some(end) = find_balanced_object_end(cur) else {
+            break;
+        };
+        let chunk = &cur[..end];
+        let Ok(ev) = serde_json::from_str::<crate::probe::process::ProbeEvent>(chunk) else {
+            break;
+        };
+        events.push(ev);
+        cur = &cur[end..];
+    }
+    events
+}
+
+/// Return the byte length of the leading balanced `{...}` object in
+/// `s`, or `None` if `s` does not start with `{` or the object is
+/// truncated. Honors JSON string escaping so quoted braces don't
+/// unbalance the depth count.
+///
+/// Used only by [`recover_partial_events`]; the input is the
+/// remainder of an events-array body, so the first non-whitespace
+/// byte is `{` for any non-truncated event.
+fn find_balanced_object_end(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    if bytes.first() != Some(&b'{') {
+        return None;
+    }
+    let mut depth: u32 = 0;
+    let mut in_string = false;
+    let mut escape = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        if in_string {
+            if escape {
+                escape = false;
+            } else if b == b'\\' {
+                escape = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'{' => depth += 1,
+            b'}' => {
+                // depth started at 0, was bumped to 1 by the leading
+                // `{`, so depth==1 here means the matching close.
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Format probe pipeline diagnostics into a human-readable summary.
@@ -877,9 +1151,7 @@ pub(crate) fn maybe_dispatch_vm_test_with_args(args: &[String]) -> Option<i32> {
                 &pnames_thread,
                 &rhints_thread,
             );
-            thread_pipeline
-                .output_done
-                .store(true, std::sync::atomic::Ordering::Release);
+            thread_pipeline.output_done.set();
             (events, diag, accumulated_fn_names)
         });
 
@@ -949,7 +1221,7 @@ struct ProbeHandle {
     thread: std::thread::JoinHandle<ProbeThreadResult>,
     func_names: Vec<(u32, String)>,
     pipeline_diag: PipelineDiagnostics,
-    output_done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    output_done: std::sync::Arc<crate::sync::Latch>,
     param_names: std::collections::HashMap<String, Vec<(String, String)>>,
     render_hints: std::collections::HashMap<String, crate::probe::btf::RenderHint>,
 }
@@ -961,18 +1233,18 @@ struct ProbeHandle {
 /// down), `output_done` (probe thread tells the main thread it has
 /// already emitted `PROBE_PAYLOAD_*`), and `probes_ready` (probe
 /// thread signals the main thread that kprobes/kfentries have
-/// attached). `stop` and `output_done` remain `AtomicBool` because
-/// they are consulted inside the probe-thread's ring-buffer poll loop
-/// where a blocking wait would stall diagnostics collection;
-/// `probes_ready` uses [`crate::sync::Latch`] so the
-/// dispatch path blocks on a condvar instead of sleep-polling.
-/// [`Clone`] is the expected way to produce the thread-side view
-/// before calling `std::thread::spawn` — each clone bumps refcounts
-/// only.
+/// attached). `stop` is an `AtomicBool` because the probe thread's
+/// ring-buffer poll loop checks it via `load(Acquire)` between
+/// events — a blocking wait would stall diagnostics collection.
+/// `output_done` and `probes_ready` use [`crate::sync::Latch`] so
+/// the dispatch path and the early-bail drain path block on a
+/// condvar instead of sleep-polling. [`Clone`] is the expected way
+/// to produce the thread-side view before calling
+/// `std::thread::spawn` — each clone bumps refcounts only.
 #[derive(Clone, Default)]
 pub(crate) struct ProbePipeline {
     pub stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    pub output_done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub output_done: std::sync::Arc<crate::sync::Latch>,
     pub probes_ready: std::sync::Arc<crate::sync::Latch>,
 }
 
@@ -1097,9 +1369,7 @@ pub(crate) fn start_probe_phase_a(args: &[String]) -> Option<ProbePhaseAState> {
             &pnames,
             &rhints,
         );
-        thread_pipeline
-            .output_done
-            .store(true, std::sync::atomic::Ordering::Release);
+        thread_pipeline.output_done.set();
         (events, diag, accumulated_fn_names)
     });
 
@@ -1420,7 +1690,7 @@ fn collect_and_print_probe_data(
     // The probe thread already emitted output on trigger/stop.
     // Only emit here if it somehow didn't (e.g. thread panicked
     // before reaching emit_probe_payload).
-    if !ph.output_done.load(std::sync::atomic::Ordering::Acquire) {
+    if !ph.output_done.is_set() {
         emit_probe_payload(
             &events,
             effective_fn_names,
@@ -1459,7 +1729,7 @@ mod tests {
         };
         let json = serde_json::to_string(&payload).unwrap();
         let output = format!("noise\n{PROBE_OUTPUT_START}\n{json}\n{PROBE_OUTPUT_END}\nmore");
-        let parsed = extract_probe_output(&output, None);
+        let parsed = extract_probe_output(&output, None, None);
         assert!(parsed.is_some());
         let formatted = parsed.unwrap();
         assert!(
@@ -1474,19 +1744,24 @@ mod tests {
 
     #[test]
     fn extract_probe_output_missing() {
-        assert!(extract_probe_output("no markers", None).is_none());
+        assert!(extract_probe_output("no markers", None, None).is_none());
     }
 
     #[test]
     fn extract_probe_output_empty() {
         let output = format!("{PROBE_OUTPUT_START}\n\n{PROBE_OUTPUT_END}");
-        assert!(extract_probe_output(&output, None).is_none());
+        assert!(extract_probe_output(&output, None, None).is_none());
     }
 
     #[test]
     fn extract_probe_output_invalid_json() {
+        // Non-EOF malformed input: `recover_partial_events` finds no
+        // `"events":` key so recovery yields nothing and the function
+        // returns None. The raw bytes still get written to
+        // `partial_dump_path` when one is supplied, which the
+        // truncated-input tests below exercise.
         let output = format!("{PROBE_OUTPUT_START}\nnot valid json\n{PROBE_OUTPUT_END}");
-        assert!(extract_probe_output(&output, None).is_none());
+        assert!(extract_probe_output(&output, None, None).is_none());
     }
 
     #[test]
@@ -1530,7 +1805,7 @@ mod tests {
         };
         let json = serde_json::to_string(&payload).unwrap();
         let output = format!("{PROBE_OUTPUT_START}\n{json}\n{PROBE_OUTPUT_END}");
-        let formatted = extract_probe_output(&output, None).unwrap();
+        let formatted = extract_probe_output(&output, None, None).unwrap();
 
         // Decoded fields present (not raw args).
         assert!(formatted.contains("pid"), "pid field: {formatted}");
@@ -1564,6 +1839,557 @@ mod tests {
             formatted.contains("pick_task_scx"),
             "func pick_task_scx: {formatted}"
         );
+    }
+
+    // -- truncated probe payload recovery --
+    //
+    // When the repro VM dies before the probe emitter finishes its
+    // `println!` of the JSON payload, COM2 captures a half-written
+    // object and `PROBE_OUTPUT_END` is missing entirely.
+    // `extract_section` returns the truncated JSON (stops at end-of-
+    // buffer when no end sentinel is present). These tests pin
+    // `parse_probe_payload` / `recover_partial_events` /
+    // `find_balanced_object_end` against that wire reality.
+
+    /// Build a `ProbeBytes` JSON serialization, then truncate it at
+    /// `cut_after` bytes. Used to manufacture the wire shape the bug
+    /// report describes ("EOF while parsing a string at line 1
+    /// column N").
+    fn truncate_probe_json(payload: &ProbeBytes, cut_after: usize) -> String {
+        let json = serde_json::to_string(payload).expect("serialize ProbeBytes");
+        json[..cut_after.min(json.len())].to_string()
+    }
+
+    #[test]
+    fn extract_probe_output_truncated_recovers_complete_events() {
+        use crate::probe::process::ProbeEvent;
+        // Three complete events, then we'll lop off the rest of the
+        // payload mid-event so only the first two recover cleanly
+        // (the third event gets cut while serializing its kstack
+        // string).
+        let payload = ProbeBytes {
+            events: vec![
+                ProbeEvent {
+                    func_idx: 0,
+                    task_ptr: 0xa,
+                    ts: 100,
+                    args: [0; 6],
+                    fields: vec![("p:task_struct.pid".to_string(), 11)],
+                    kstack: vec![],
+                    str_val: None,
+                    ..Default::default()
+                },
+                ProbeEvent {
+                    func_idx: 1,
+                    task_ptr: 0xb,
+                    ts: 200,
+                    args: [0; 6],
+                    fields: vec![("p:task_struct.pid".to_string(), 22)],
+                    kstack: vec![],
+                    str_val: None,
+                    ..Default::default()
+                },
+                ProbeEvent {
+                    func_idx: 2,
+                    task_ptr: 0xc,
+                    ts: 300,
+                    args: [0; 6],
+                    fields: vec![("p:task_struct.pid".to_string(), 33)],
+                    kstack: vec![],
+                    str_val: None,
+                    ..Default::default()
+                },
+            ],
+            func_names: vec![
+                (0, "first".to_string()),
+                (1, "second".to_string()),
+                (2, "third".to_string()),
+            ],
+            bpf_source_locs: Default::default(),
+            diagnostics: None,
+            nr_cpus: None,
+            param_names: Default::default(),
+            render_hints: Default::default(),
+        };
+        let full = serde_json::to_string(&payload).unwrap();
+        // Find the start of the third event's `{` and truncate
+        // halfway into it. We locate the third event by counting
+        // top-level `{` occurrences inside `"events":[...]`.
+        let events_start = full.find("\"events\":[").unwrap() + "\"events\":[".len();
+        let mut depth: u32 = 0;
+        let mut in_string = false;
+        let mut escape = false;
+        let mut event_starts: Vec<usize> = Vec::new();
+        for (i, b) in full.bytes().enumerate().skip(events_start) {
+            if in_string {
+                if escape {
+                    escape = false;
+                } else if b == b'\\' {
+                    escape = true;
+                } else if b == b'"' {
+                    in_string = false;
+                }
+                continue;
+            }
+            match b {
+                b'"' => in_string = true,
+                b'{' => {
+                    if depth == 0 {
+                        event_starts.push(i);
+                    }
+                    depth += 1;
+                }
+                b'}' => depth -= 1,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            event_starts.len(),
+            3,
+            "test fixture should produce 3 events"
+        );
+        // Cut a few bytes into the third event's body. That kills
+        // the third event AND everything after (including the
+        // closing `]` and trailing fields), so recovery must yield
+        // exactly the first two complete events.
+        let cut = event_starts[2] + 5;
+        let truncated = &full[..cut];
+        let output = format!("{PROBE_OUTPUT_START}\n{truncated}\n");
+        // No PROBE_OUTPUT_END — exactly what the buggy path sees.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let partial = dir.path().join("payload.partial.json");
+        let formatted = extract_probe_output(&output, None, Some(&partial))
+            .expect("recovery must surface partial events");
+        // First two events' func indices are 0 and 1; the recovery
+        // path leaves func_names empty, so the formatter falls back
+        // to the literal `unknown` for every event header.
+        assert!(
+            formatted.contains("unknown"),
+            "recovered events should print under `unknown` func header (no func_names): {formatted}",
+        );
+        assert!(
+            formatted.contains("11"),
+            "first event's pid value should appear: {formatted}",
+        );
+        assert!(
+            formatted.contains("22"),
+            "second event's pid value should appear: {formatted}",
+        );
+        assert!(
+            !formatted.contains("33"),
+            "third (truncated) event's pid value must NOT appear: {formatted}",
+        );
+        // Partial dump file written.
+        assert!(
+            partial.exists(),
+            "raw truncated payload must be written to partial dump path",
+        );
+        let dumped = std::fs::read_to_string(&partial).expect("read partial dump");
+        // Dumped bytes match what extract_section returned — that's
+        // the trimmed json between START and end-of-buffer.
+        assert_eq!(
+            dumped.trim(),
+            truncated.trim(),
+            "partial dump must contain the raw extracted JSON verbatim",
+        );
+    }
+
+    #[test]
+    fn extract_probe_output_truncated_no_complete_events_returns_none() {
+        // Truncate inside the FIRST event's body. No complete events
+        // recoverable, so `parse_probe_payload` returns None.
+        // `extract_probe_output` therefore returns None as well —
+        // BUT the partial dump file still gets written, since the
+        // bug report's "operator can inspect manually" requirement
+        // applies even when no events survive.
+        use crate::probe::process::ProbeEvent;
+        let payload = ProbeBytes {
+            events: vec![ProbeEvent {
+                func_idx: 0,
+                task_ptr: 0xa,
+                ts: 100,
+                args: [0; 6],
+                fields: vec![("p:task_struct.pid".to_string(), 11)],
+                kstack: vec![],
+                str_val: None,
+                ..Default::default()
+            }],
+            func_names: vec![(0, "first".to_string())],
+            bpf_source_locs: Default::default(),
+            diagnostics: None,
+            nr_cpus: None,
+            param_names: Default::default(),
+            render_hints: Default::default(),
+        };
+        let full = serde_json::to_string(&payload).unwrap();
+        // Truncate halfway through the events array (after `[` plus
+        // a few bytes into the first event).
+        let events_open = full.find("\"events\":[").unwrap() + "\"events\":[".len();
+        let cut = events_open + 5;
+        let truncated = &full[..cut];
+        let output = format!("{PROBE_OUTPUT_START}\n{truncated}\n");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let partial = dir.path().join("payload.partial.json");
+        let result = extract_probe_output(&output, None, Some(&partial));
+        assert!(
+            result.is_none(),
+            "no complete events recoverable should yield None: {result:?}",
+        );
+        assert!(
+            partial.exists(),
+            "partial dump must be written even when recovery yields zero events",
+        );
+        let dumped = std::fs::read_to_string(&partial).expect("read partial dump");
+        assert_eq!(dumped.trim(), truncated.trim());
+    }
+
+    #[test]
+    fn extract_probe_output_truncated_string_value_recovers_prior() {
+        // The bug report's exact failure: "EOF while parsing a string
+        // at line 1 column 1078". Truncate inside a string value so
+        // serde_json reports `EofWhileParsingString`. The events
+        // before the truncated string still recover.
+        use crate::probe::process::ProbeEvent;
+        let payload = ProbeBytes {
+            events: vec![
+                ProbeEvent {
+                    func_idx: 0,
+                    task_ptr: 0xa,
+                    ts: 100,
+                    args: [0; 6],
+                    fields: vec![("p:task_struct.pid".to_string(), 11)],
+                    kstack: vec![],
+                    str_val: None,
+                    ..Default::default()
+                },
+                // Long string value: a partially-written `str_val`
+                // is the realistic shape a mid-`println!` truncation
+                // produces.
+                ProbeEvent {
+                    func_idx: 1,
+                    task_ptr: 0xb,
+                    ts: 200,
+                    args: [0; 6],
+                    fields: vec![],
+                    kstack: vec![],
+                    str_val: Some("a".repeat(200)),
+                    ..Default::default()
+                },
+            ],
+            func_names: vec![(0, "first".to_string()), (1, "second".to_string())],
+            bpf_source_locs: Default::default(),
+            diagnostics: None,
+            nr_cpus: None,
+            param_names: Default::default(),
+            render_hints: Default::default(),
+        };
+        let full = serde_json::to_string(&payload).unwrap();
+        // Truncate inside the long `aaa...` string of the second
+        // event. We locate the run of `a` characters and chop near
+        // its midpoint.
+        let needle = "aaaaaaaaaa"; // first 10 chars of the str_val
+        let idx = full
+            .find(needle)
+            .expect("fixture must contain the long string");
+        let cut = idx + needle.len() + 50; // ~50 `a`s into the string
+        let truncated = &full[..cut];
+        let output = format!("{PROBE_OUTPUT_START}\n{truncated}\n");
+        let formatted = extract_probe_output(&output, None, None)
+            .expect("recovery must surface the first complete event");
+        assert!(
+            formatted.contains("11"),
+            "first event's pid must survive truncation in the second event: {formatted}",
+        );
+    }
+
+    #[test]
+    fn extract_probe_output_truncated_partial_dump_path_none_skips_write() {
+        // When the caller passes None for partial_dump_path, no file
+        // gets written — and no panic / error. The recovery path
+        // still surfaces partial events.
+        use crate::probe::process::ProbeEvent;
+        let payload = ProbeBytes {
+            events: vec![
+                ProbeEvent {
+                    func_idx: 0,
+                    task_ptr: 0xa,
+                    ts: 100,
+                    args: [0; 6],
+                    fields: vec![("p:task_struct.pid".to_string(), 11)],
+                    kstack: vec![],
+                    str_val: None,
+                    ..Default::default()
+                },
+                ProbeEvent {
+                    func_idx: 1,
+                    task_ptr: 0xb,
+                    ts: 200,
+                    args: [0; 6],
+                    fields: vec![],
+                    kstack: vec![],
+                    str_val: None,
+                    ..Default::default()
+                },
+            ],
+            func_names: vec![(0, "f0".to_string()), (1, "f1".to_string())],
+            bpf_source_locs: Default::default(),
+            diagnostics: None,
+            nr_cpus: None,
+            param_names: Default::default(),
+            render_hints: Default::default(),
+        };
+        let full = serde_json::to_string(&payload).unwrap();
+        // Truncate after the close-brace of the first event, mid-
+        // serializing the second.
+        let first_close = full.find("},{").expect("two events present");
+        let cut = first_close + 3; // include the `,{` so recovery sees a starting `{`
+        let truncated = &full[..cut];
+        let output = format!("{PROBE_OUTPUT_START}\n{truncated}\n");
+        let formatted = extract_probe_output(&output, None, None)
+            .expect("recovery must yield the first event without a dump path");
+        assert!(
+            formatted.contains("11"),
+            "first event recovered: {formatted}"
+        );
+    }
+
+    #[test]
+    fn parse_probe_payload_strict_success() {
+        // Direct unit test for the helper: a complete payload
+        // round-trips without touching the recovery path.
+        use crate::probe::process::ProbeEvent;
+        let payload = ProbeBytes {
+            events: vec![ProbeEvent {
+                func_idx: 0,
+                task_ptr: 0xa,
+                ts: 100,
+                args: [0; 6],
+                fields: vec![],
+                kstack: vec![],
+                str_val: None,
+                ..Default::default()
+            }],
+            func_names: vec![(0, "schedule".to_string())],
+            bpf_source_locs: Default::default(),
+            diagnostics: None,
+            nr_cpus: None,
+            param_names: Default::default(),
+            render_hints: Default::default(),
+        };
+        let json = serde_json::to_string(&payload).unwrap();
+        let parsed = parse_probe_payload(&json, None).expect("strict parse must succeed");
+        assert_eq!(parsed.events.len(), 1);
+        assert_eq!(parsed.func_names.len(), 1);
+    }
+
+    #[test]
+    fn parse_probe_payload_eof_with_dump_path_writes_file_returns_recovered() {
+        use crate::probe::process::ProbeEvent;
+        let payload = ProbeBytes {
+            events: vec![ProbeEvent {
+                func_idx: 0,
+                task_ptr: 0xa,
+                ts: 100,
+                args: [0; 6],
+                fields: vec![],
+                kstack: vec![],
+                str_val: None,
+                ..Default::default()
+            }],
+            func_names: vec![],
+            bpf_source_locs: Default::default(),
+            diagnostics: None,
+            nr_cpus: None,
+            param_names: Default::default(),
+            render_hints: Default::default(),
+        };
+        // Truncate mid-array, after the first event's closing `}`
+        // but before the `]` and trailing fields.
+        let full = serde_json::to_string(&payload).unwrap();
+        let first_close = full.find("}]").expect("single-event array ends with `}]`");
+        let truncated = &full[..first_close + 1]; // include the `}` only
+        let dir = tempfile::tempdir().expect("tempdir");
+        let partial = dir.path().join("dump.json");
+        let parsed = parse_probe_payload(truncated, Some(&partial))
+            .expect("EOF with one complete event must recover");
+        assert_eq!(parsed.events.len(), 1);
+        // Recovery path zeroes out non-events fields.
+        assert!(parsed.func_names.is_empty());
+        assert!(parsed.diagnostics.is_none());
+        // Partial dump written verbatim.
+        assert!(partial.exists());
+        assert_eq!(std::fs::read_to_string(&partial).unwrap(), truncated);
+    }
+
+    #[test]
+    fn parse_probe_payload_non_eof_error_returns_none_and_dumps() {
+        // Garbage JSON: serde_json reports a syntax error, NOT a
+        // category Eof error. We still write the raw bytes to the
+        // dump path, but recovery is not attempted.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let partial = dir.path().join("dump.json");
+        let result = parse_probe_payload("not json", Some(&partial));
+        assert!(result.is_none());
+        assert!(partial.exists());
+        assert_eq!(std::fs::read_to_string(&partial).unwrap(), "not json");
+    }
+
+    #[test]
+    fn parse_probe_payload_truncated_no_dump_path_still_recovers() {
+        // Recovery works without a dump-path sink — the partial-
+        // payload-on-disk feature is independent of in-memory event
+        // recovery.
+        use crate::probe::process::ProbeEvent;
+        let payload = ProbeBytes {
+            events: vec![ProbeEvent {
+                func_idx: 0,
+                task_ptr: 1,
+                ts: 100,
+                args: [0; 6],
+                fields: vec![],
+                kstack: vec![],
+                str_val: None,
+                ..Default::default()
+            }],
+            func_names: vec![],
+            bpf_source_locs: Default::default(),
+            diagnostics: None,
+            nr_cpus: None,
+            param_names: Default::default(),
+            render_hints: Default::default(),
+        };
+        let full = serde_json::to_string(&payload).unwrap();
+        let first_close = full.find("}]").unwrap();
+        let truncated = &full[..first_close + 1];
+        let parsed = parse_probe_payload(truncated, None).expect("recovery without dump path");
+        assert_eq!(parsed.events.len(), 1);
+    }
+
+    // -- recover_partial_events --
+
+    #[test]
+    fn recover_partial_events_no_events_key_returns_empty() {
+        // A JSON payload that does not contain `"events":` cannot be
+        // recovered. Helper short-circuits.
+        assert!(recover_partial_events(r#"{"foo":1}"#).is_empty());
+        assert!(recover_partial_events("").is_empty());
+    }
+
+    #[test]
+    fn recover_partial_events_empty_array() {
+        // `"events":[]` produces zero events, even when truncated
+        // immediately after.
+        assert!(recover_partial_events(r#"{"events":[]"#).is_empty());
+        assert!(recover_partial_events(r#"{"events":["#).is_empty());
+    }
+
+    #[test]
+    fn recover_partial_events_handles_braces_in_strings() {
+        // Brace characters inside string fields must not unbalance
+        // the depth counter. Build an event whose `str_val` carries
+        // literal `{`/`}` and confirm the splitter still finds the
+        // event boundary.
+        use crate::probe::process::ProbeEvent;
+        let event = ProbeEvent {
+            func_idx: 0,
+            task_ptr: 1,
+            ts: 100,
+            args: [0; 6],
+            fields: vec![],
+            kstack: vec![],
+            str_val: Some("contains {nested} and \\\"quoted\\\"".to_string()),
+            ..Default::default()
+        };
+        let event_json = serde_json::to_string(&event).unwrap();
+        let payload = format!(r#"{{"events":[{event_json}]}}"#);
+        // Truncate after the first event so recovery walks exactly
+        // one chunk.
+        let cut = payload.find(']').unwrap();
+        let truncated = &payload[..cut];
+        let recovered = recover_partial_events(truncated);
+        assert_eq!(
+            recovered.len(),
+            1,
+            "one event should recover: {recovered:?}"
+        );
+        // Round-trip: the original `str_val` runtime value contained
+        // a literal `\` followed by `"` (Rust source `\\\"` = `\` +
+        // `"`). After serde serialize → splitter → serde deserialize
+        // we expect the same runtime bytes back.
+        assert_eq!(
+            recovered[0].str_val.as_deref(),
+            Some("contains {nested} and \\\"quoted\\\""),
+        );
+    }
+
+    // -- find_balanced_object_end --
+
+    #[test]
+    fn find_balanced_object_end_simple_object() {
+        assert_eq!(find_balanced_object_end("{}"), Some(2));
+        assert_eq!(find_balanced_object_end("{}rest"), Some(2));
+    }
+
+    #[test]
+    fn find_balanced_object_end_nested_objects() {
+        assert_eq!(find_balanced_object_end(r#"{"a":{"b":{}}}"#), Some(14));
+    }
+
+    #[test]
+    fn find_balanced_object_end_braces_in_strings_ignored() {
+        // `{` and `}` inside a quoted string must not unbalance the
+        // depth count.
+        assert_eq!(find_balanced_object_end(r#"{"x":"{{}}"}"#), Some(12));
+    }
+
+    #[test]
+    fn find_balanced_object_end_escaped_quote_does_not_close_string() {
+        // Escaped `\"` inside a string keeps the parser inside the
+        // string until a real, unescaped `"` is seen.
+        let s = r#"{"x":"\"}"}"#;
+        assert_eq!(find_balanced_object_end(s), Some(s.len()));
+    }
+
+    #[test]
+    fn find_balanced_object_end_truncated_returns_none() {
+        // Missing closing brace → None.
+        assert_eq!(find_balanced_object_end(r#"{"a":1"#), None);
+    }
+
+    #[test]
+    fn find_balanced_object_end_truncated_in_string_returns_none() {
+        // Truncated mid-string (no closing `"`) → in_string never
+        // resets so the trailing `}` isn't seen → None.
+        assert_eq!(find_balanced_object_end(r#"{"a":"hello"#), None);
+    }
+
+    #[test]
+    fn find_balanced_object_end_non_object_returns_none() {
+        assert_eq!(find_balanced_object_end("[1,2]"), None);
+        assert_eq!(find_balanced_object_end(""), None);
+        assert_eq!(find_balanced_object_end("null"), None);
+    }
+
+    // truncate_probe_json is a fixture helper — exercise it once so
+    // its `min` clamp is pinned and a future caller passing an
+    // out-of-range cut doesn't silently read garbage.
+    #[test]
+    fn truncate_probe_json_clamps_to_full_length() {
+        let payload = ProbeBytes {
+            events: vec![],
+            func_names: vec![],
+            bpf_source_locs: Default::default(),
+            diagnostics: None,
+            nr_cpus: None,
+            param_names: Default::default(),
+            render_hints: Default::default(),
+        };
+        let full = serde_json::to_string(&payload).unwrap();
+        // Cut past end → returns the full string unchanged.
+        let s = truncate_probe_json(&payload, full.len() + 1024);
+        assert_eq!(s, full);
+        // Cut at zero → empty string.
+        assert_eq!(truncate_probe_json(&payload, 0), "");
     }
 
     // -- format_tail --
@@ -1951,6 +2777,7 @@ mod tests {
             late: FailureDumpReport::default(),
             early_max_age_jiffies: 0,
             early_threshold_jiffies: 0,
+            early_skipped_reason: None,
         };
         let json = serde_json::to_string(&dual).expect("serialize dual");
         let tmp = tempfile::NamedTempFile::new().expect("tempfile");

@@ -285,6 +285,16 @@ pub(super) fn decompress_capped(bytes: &[u8], max_decompressed: u64) -> anyhow::
 // ---------------------------------------------------------------
 
 /// Canonical file extension for a serialized snapshot.
+///
+/// `dead_code` allow: referenced from doc comments in
+/// `monitor::debug_capture` and the `metric_types` overview. The
+/// extension is hardcoded as the literal `"ctprof.zst"` at every
+/// production write/load site (the CLI accepts any path the
+/// operator supplies and the renderer reads via
+/// [`CtprofSnapshot::load`]). Kept as a named constant so a future
+/// caller that needs to construct paths from scratch has the
+/// canonical token available without re-typing the literal.
+#[allow(dead_code)]
 pub const SNAPSHOT_EXTENSION: &str = "ctprof.zst";
 
 /// Decompressed-size ceiling for [`CtprofSnapshot::load`].

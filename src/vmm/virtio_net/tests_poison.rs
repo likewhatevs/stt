@@ -33,9 +33,7 @@
 
 use super::device::*;
 use crate::vmm::net_config::NetConfig;
-use virtio_bindings::virtio_config::{
-    VIRTIO_CONFIG_S_NEEDS_RESET, VIRTIO_F_VERSION_1,
-};
+use virtio_bindings::virtio_config::{VIRTIO_CONFIG_S_NEEDS_RESET, VIRTIO_F_VERSION_1};
 use virtio_bindings::virtio_mmio::{
     VIRTIO_MMIO_DRIVER_FEATURES, VIRTIO_MMIO_DRIVER_FEATURES_SEL, VIRTIO_MMIO_INT_CONFIG,
     VIRTIO_MMIO_INTERRUPT_STATUS, VIRTIO_MMIO_QUEUE_AVAIL_LOW, VIRTIO_MMIO_QUEUE_DESC_LOW,
@@ -116,9 +114,8 @@ fn program_queues(dev: &mut VirtioNet) {
 }
 
 fn build_fixture() -> (VirtioNet, GuestMemoryMmap) {
-    let mem =
-        GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), GUEST_MEM_SIZE)])
-            .expect("create poison-test guest mem");
+    let mem = GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), GUEST_MEM_SIZE)])
+        .expect("create poison-test guest mem");
     let mut dev = VirtioNet::new(NetConfig::default());
     dev.set_mem(mem.clone());
     init_until_features_ok(&mut dev);
@@ -152,10 +149,14 @@ fn write_desc(
 /// covers a 12-byte virtio header + 12-byte payload at TX_FRAME_BUF.
 fn place_tx_chain(mem: &GuestMemoryMmap) {
     let zero_hdr = [0u8; VIRTIO_NET_HDR_LEN];
-    mem.write_slice(&zero_hdr, GuestAddress(TX_FRAME_BUF)).unwrap();
-    let payload: [u8; 12] = [0xAA; 12];
-    mem.write_slice(&payload, GuestAddress(TX_FRAME_BUF + VIRTIO_NET_HDR_LEN as u64))
+    mem.write_slice(&zero_hdr, GuestAddress(TX_FRAME_BUF))
         .unwrap();
+    let payload: [u8; 12] = [0xAA; 12];
+    mem.write_slice(
+        &payload,
+        GuestAddress(TX_FRAME_BUF + VIRTIO_NET_HDR_LEN as u64),
+    )
+    .unwrap();
     let total = (VIRTIO_NET_HDR_LEN + payload.len()) as u32;
     write_desc(mem, TX_DESC_BASE, 0, TX_FRAME_BUF, total, 0, 0);
     // Publish via avail ring at ring_pos=0, idx=1.
@@ -332,9 +333,11 @@ fn tx_hostile_avail_idx_poisons_queue_and_signals() {
     program_queues(&mut dev);
     write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_OK);
     // Clear the prior planted avail.idx fields and re-publish.
-    mem.write_obj(0u16, GuestAddress(TX_AVAIL_BASE + 2)).unwrap();
+    mem.write_obj(0u16, GuestAddress(TX_AVAIL_BASE + 2))
+        .unwrap();
     mem.write_obj(0u16, GuestAddress(TX_USED_BASE + 2)).unwrap();
-    mem.write_obj(0u16, GuestAddress(RX_AVAIL_BASE + 2)).unwrap();
+    mem.write_obj(0u16, GuestAddress(RX_AVAIL_BASE + 2))
+        .unwrap();
     mem.write_obj(0u16, GuestAddress(RX_USED_BASE + 2)).unwrap();
     place_tx_chain(&mem);
     place_rx_chain(&mem);
@@ -532,10 +535,7 @@ fn rx_poison_signal_sequence_sets_needs_reset_and_int_config() {
         0,
         "INT_CONFIG must be set alongside NEEDS_RESET",
     );
-    assert!(
-        dev.irq_evt().read().is_ok(),
-        "irq_evt must be signaled",
-    );
+    assert!(dev.irq_evt().read().is_ok(), "irq_evt must be signaled",);
 
     // Reset clears both bits and the per-queue flag.
     write_reg(&mut dev, VIRTIO_MMIO_STATUS, 0);

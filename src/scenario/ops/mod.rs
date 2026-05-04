@@ -670,11 +670,11 @@ pub fn execute_steps_with(
     execute_scenario_with(ctx, backdrop::Backdrop::EMPTY, steps, checks)
 }
 
-/// Compute the union of cgroup v2 controllers required by a Backdrop
-/// + Step sequence. Walks every [`CgroupDef`] declaration and every
-/// [`Op`] variant, returning the smallest set of controllers that
-/// must be enabled in `cgroup.subtree_control` for the scenario's
-/// per-knob writes to land.
+/// Compute the union of cgroup v2 controllers required by a
+/// Backdrop and Step sequence. Walks every [`CgroupDef`] declaration
+/// and every [`Op`] variant, returning the smallest set of
+/// controllers that must be enabled in `cgroup.subtree_control` for
+/// the scenario's per-knob writes to land.
 ///
 /// Mapping:
 /// - [`CgroupDef::cpuset`] / [`CgroupDef::cpuset_mems`] → [`Controller::Cpuset`]
@@ -939,6 +939,7 @@ fn run_scenario(
         }
 
         let mut step_state = StepState::empty(ctx);
+        let mut sched_died_during_hold = false;
         let step_res = run_step(
             ctx,
             step,
@@ -948,6 +949,7 @@ fn run_scenario(
             shm.as_ref(),
             scenario_start,
             effective_checks,
+            &mut sched_died_during_hold,
         );
 
         // Per-Step teardown ALWAYS runs — on success and on error.
@@ -982,6 +984,27 @@ fn run_scenario(
             ));
             return Ok(r);
         }
+
+        // Scheduler exited during the step's hold-period sleep —
+        // [`run_step`] cut the hold short and stamped
+        // `sched_died_during_hold`. Emit the in-step
+        // sched-died message before continuing to the next step
+        // boundary; otherwise the post-loop probe would fire after
+        // the full scenario duration and stamp a misleading elapsed
+        // time. Same Backdrop-then-step merge order as the
+        // inter-step path above so detail ordering stays consistent.
+        if sched_died_during_hold {
+            let mut r = collect_backdrop(&mut backdrop_state, effective_checks, ctx.topo);
+            r.merge(result);
+            r.passed = false;
+            r.details.push(crate::assert::AssertDetail::new(
+                crate::assert::DetailKind::SchedulerDied,
+                crate::assert::format_sched_died_during_workload(
+                    scenario_start.elapsed().as_secs_f64(),
+                ),
+            ));
+            return Ok(r);
+        }
     }
 
     // ScenarioEnd marker.
@@ -1012,10 +1035,183 @@ fn run_scenario(
     Ok(result)
 }
 
+/// Sleep up to `dur`, returning early if `sched_pid` exits.
+///
+/// Returns `true` the first time the scheduler is observed dead,
+/// `false` if the full duration elapsed with no death observed.
+/// When `sched_pid` is `None` (kernel-default scheduling, no
+/// scheduler process to monitor), behaves exactly like
+/// [`thread::sleep`] and always returns `false`.
+///
+/// Implementation uses `pidfd_open(2)` + `epoll_wait` so the waiter
+/// is kernel-blocked on the pidfd until either the scheduler exits
+/// (pidfd becomes readable) or the per-step hold elapses. This
+/// drops crash-detection latency from one poll-tick (the previous
+/// 100 ms cadence) to ~0: the kernel wakes the epoll waiter as
+/// soon as the task transitions to EXIT_ZOMBIE. Mirrors
+/// [`crate::scenario::payload_run`]'s `wait_with_deadline` shape.
+/// Minimum kernel: Linux 5.3.
+///
+/// Deadline honoring: the `epoll_wait` timeout is re-derived from
+/// `saturating_duration_since` each iteration so `EINTR` restarts
+/// narrow the remaining window rather than extending it.
+///
+/// Failure handling: if `pidfd_open` returns `ESRCH`, the scheduler
+/// is already gone — return `true` immediately without sleeping. If
+/// it returns any other unexpected errno (e.g. on a kernel without
+/// `pidfd_open` support), log a warning and fall back to a
+/// `thread::sleep` for the full duration plus a final
+/// [`process_alive`] check. The fallback loses sub-poll-tick
+/// detection latency but preserves the boolean contract.
+///
+/// Scheduling jitter under load can leave the actual elapsed time
+/// modestly above `dur`.
+fn sleep_or_sched_died(dur: Duration, sched_pid: Option<libc::pid_t>) -> bool {
+    use nix::sys::epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags, EpollTimeout};
+    use std::os::fd::{AsFd, FromRawFd, OwnedFd};
+
+    if dur.is_zero() {
+        return sched_pid.is_some_and(|pid| !process_alive(pid));
+    }
+    let Some(pid) = sched_pid else {
+        thread::sleep(dur);
+        return false;
+    };
+
+    // `pidfd_open(pid, 0)`: returns an fd that becomes readable when
+    // the pid exits. Only meaningful on a thread-group leader, which
+    // every `sched_pid` already is (it is the scheduler binary's
+    // top-level pid as recorded in `Ctx::sched_pid`). No
+    // `PIDFD_NONBLOCK` flag — epoll is the gate.
+    let pidfd_raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0i32) };
+    if pidfd_raw < 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ESRCH) {
+            // pidfd_open observed the pid as gone before we could
+            // even attach a waiter — sched is already dead.
+            return true;
+        }
+        // Unexpected pidfd_open failure — fall back to a single
+        // sleep + final liveness probe. Logged so unexpected errnos
+        // don't disappear silently.
+        tracing::warn!(
+            target: "ktstr::scenario",
+            pid,
+            error = %err,
+            "pidfd_open failed; falling back to sleep + final process_alive check"
+        );
+        thread::sleep(dur);
+        return !process_alive(pid);
+    }
+    // SAFETY: the syscall succeeded and returned a fresh fd; it is
+    // not registered with any other owner.
+    let pidfd: OwnedFd = unsafe { OwnedFd::from_raw_fd(pidfd_raw as i32) };
+
+    // epoll setup. EPOLL_CLOEXEC matches `wait_with_deadline` to
+    // avoid leaking the epoll fd into any post-fork descendant.
+    let epoll = match Epoll::new(EpollCreateFlags::EPOLL_CLOEXEC) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!(
+                target: "ktstr::scenario",
+                pid,
+                error = %e,
+                "epoll_create1 failed for pidfd waiter; falling back to sleep + final process_alive check"
+            );
+            drop(pidfd);
+            thread::sleep(dur);
+            return !process_alive(pid);
+        }
+    };
+    // `data` field is unused — we only ever watch one fd. The add()
+    // syscall still needs an `EpollEvent` with populated events.
+    let event = EpollEvent::new(EpollFlags::EPOLLIN, 0);
+    if let Err(e) = epoll.add(pidfd.as_fd(), event) {
+        tracing::warn!(
+            target: "ktstr::scenario",
+            pid,
+            error = %e,
+            "epoll_ctl ADD pidfd failed; falling back to sleep + final process_alive check"
+        );
+        drop(pidfd);
+        thread::sleep(dur);
+        return !process_alive(pid);
+    }
+
+    let deadline = std::time::Instant::now() + dur;
+    let mut events = [EpollEvent::empty()];
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            // Hold elapsed without a wakeup. Re-probe once via
+            // `process_alive` to catch a race where the pid exited
+            // between the last `epoll_wait` return and the deadline
+            // check (e.g. during EINTR re-entry).
+            return !process_alive(pid);
+        }
+
+        // `PollTimeout` (aliased as `EpollTimeout`) stores the value
+        // as `i32`, so `TryFrom<u32>` rejects any input larger than
+        // `i32::MAX` (~24.8 days of milliseconds). Clamp `u128 →
+        // u32` and then `u32 → i32`-range so a `Duration::MAX`
+        // remainder saturates to the max accepted value instead of
+        // bubbling up a conversion error.
+        let ms_u32 = u32::try_from(remaining.as_millis()).unwrap_or(u32::MAX);
+        let ms_u32 = std::cmp::min(ms_u32, i32::MAX as u32);
+        let timeout_param = match EpollTimeout::try_from(ms_u32) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(
+                    target: "ktstr::scenario",
+                    pid,
+                    error = %e,
+                    "epoll timeout conversion failed; falling back to sleep + final process_alive check"
+                );
+                thread::sleep(remaining);
+                return !process_alive(pid);
+            }
+        };
+
+        match epoll.wait(&mut events, timeout_param) {
+            Ok(0) => {
+                // Timeout fired with no ready events. Loop back so
+                // `remaining.is_zero()` at the top handles the
+                // deadline path uniformly.
+            }
+            Ok(_) => {
+                // pidfd became readable — task transitioned to
+                // EXIT_ZOMBIE. Scheduler is dead.
+                return true;
+            }
+            Err(nix::errno::Errno::EINTR) => {
+                // Signal interrupted the wait; loop and re-compute
+                // the remaining window.
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "ktstr::scenario",
+                    pid,
+                    error = %e,
+                    "epoll_wait failed; falling back to sleep + final process_alive check"
+                );
+                thread::sleep(remaining);
+                return !process_alive(pid);
+            }
+        }
+    }
+}
+
 /// Run a single step's setup + ops + hold against step-local state.
 ///
 /// On error, the caller is expected to invoke `collect_step` for
 /// per-step teardown (which runs regardless) and then propagate.
+///
+/// `sched_died_during_hold` is set to `true` when the hold-period
+/// liveness poll observes the scheduler process exiting; the caller
+/// uses this to emit [`crate::assert::format_sched_died_during_workload`]
+/// instead of waiting for the post-loop probe to fire (which would
+/// stamp the message with the full scenario duration even though
+/// the death happened mid-step).
 #[allow(clippy::too_many_arguments)]
 fn run_step<'a>(
     ctx: &Ctx,
@@ -1026,6 +1222,7 @@ fn run_step<'a>(
     shm: Option<&ShmWriter>,
     scenario_start: std::time::Instant,
     _effective_checks: &crate::assert::Assert,
+    sched_died_during_hold: &mut bool,
 ) -> Result<()> {
     let mut scenario = ScenarioState::new(step_state, backdrop_state);
 
@@ -1054,12 +1251,16 @@ fn run_step<'a>(
                 drain_on_err!(scenario, apply_setup(ctx, &mut scenario, &defs));
             }
             // Loop mode: apply ops repeatedly at interval until
-            // the remaining scenario time is exhausted.
+            // the remaining scenario time is exhausted, or the
+            // scheduler process exits — whichever fires first.
             let deadline = scenario_start + ctx.duration;
             while std::time::Instant::now() < deadline {
                 drain_on_err!(scenario, apply_ops(ctx, &mut scenario, &step.ops));
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-                thread::sleep(remaining.min(*interval));
+                if sleep_or_sched_died(remaining.min(*interval), ctx.sched_pid) {
+                    *sched_died_during_hold = true;
+                    return Ok(());
+                }
             }
         }
         _ => {
@@ -1085,7 +1286,10 @@ fn run_step<'a>(
                 HoldSpec::Fixed(d) => *d,
                 HoldSpec::Loop { .. } => unreachable!(),
             };
-            thread::sleep(hold_dur);
+            if sleep_or_sched_died(hold_dur, ctx.sched_pid) {
+                *sched_died_during_hold = true;
+                return Ok(());
+            }
         }
     }
 
@@ -1491,14 +1695,14 @@ fn apply_setup(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, defs: &[CgroupDef])
             if cpu.max_period_us == 0 {
                 anyhow::bail!("cgroup '{}': cpu.max period must be > 0 (got 0)", def.name,);
             }
-            if let Some(q) = cpu.max_quota_us {
-                if q == 0 {
-                    anyhow::bail!(
-                        "cgroup '{}': cpu.max quota must be > 0 when set; \
-                         use cpu_unlimited() to remove the cap",
-                        def.name,
-                    );
-                }
+            if let Some(q) = cpu.max_quota_us
+                && q == 0
+            {
+                anyhow::bail!(
+                    "cgroup '{}': cpu.max quota must be > 0 when set; \
+                     use cpu_unlimited() to remove the cap",
+                    def.name,
+                );
             }
             // Always emit the cpu.max write so the period field is
             // recorded even when quota is None. Aligns with the
@@ -1531,16 +1735,16 @@ fn apply_setup(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, defs: &[CgroupDef])
                 ctx.cgroups.set_memory_swap_max(&def.name, mem.swap_max)?;
             }
         }
-        if let Some(ref io) = def.io {
-            if let Some(w) = io.weight {
-                if !(1..=10_000).contains(&w) {
-                    anyhow::bail!(
-                        "cgroup '{}': io.weight {w} out of range 1..=10000",
-                        def.name,
-                    );
-                }
-                ctx.cgroups.set_io_weight(&def.name, w)?;
+        if let Some(ref io) = def.io
+            && let Some(w) = io.weight
+        {
+            if !(1..=10_000).contains(&w) {
+                anyhow::bail!(
+                    "cgroup '{}': io.weight {w} out of range 1..=10000",
+                    def.name,
+                );
             }
+            ctx.cgroups.set_io_weight(&def.name, w)?;
         }
         if let Some(ref pids) = def.pids {
             // pids.max: zero is a foot-cannon (no fork ever), so
@@ -2056,6 +2260,71 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                 ctx.cgroups
                     .set_freeze(cgroup, false)
                     .with_context(|| format!("Op::UnfreezeCgroup: cgroup '{cgroup}'"))?;
+            }
+            Op::Snapshot { name } => {
+                // Drive the active SnapshotBridge if one is
+                // installed for this thread. The bridge calls back
+                // into the host's freeze coordinator (via its
+                // capture callback), waits for the report, and
+                // stores it under `name`. No bridge ⇒ skip with a
+                // warn so existing scenarios that never declared
+                // snapshot ops keep working unchanged.
+                let invoked = crate::scenario::snapshot::with_active_bridge(|b| {
+                    let captured = b.capture(name);
+                    if captured {
+                        tracing::info!(
+                            name = %name,
+                            stored = b.len(),
+                            "Op::Snapshot: captured diagnostic snapshot"
+                        );
+                    }
+                    captured
+                });
+                if invoked.is_none() {
+                    tracing::warn!(
+                        name = %name,
+                        "Op::Snapshot: no SnapshotBridge installed on the executor's \
+                         thread — skipping capture (host wires the bridge before \
+                         execute_steps; in-guest / no-VM scenarios cannot capture)"
+                    );
+                }
+            }
+            Op::WatchSnapshot { symbol } => {
+                // Register the watch with the active bridge. The
+                // bridge owns the BTF + kallsyms resolution and
+                // the DR1-3 allocation; on success the host
+                // arms a hardware data-write watchpoint and
+                // wires its `KVM_EXIT_DEBUG` dispatch to the
+                // capture pipeline tagged by the symbol path.
+                //
+                // Per the Op::WatchSnapshot doc, registration
+                // failures (max-3 exceeded, symbol unresolved,
+                // DR_LEN_4 misaligned) bail out of the scenario
+                // immediately — silent degradation would leave
+                // the test running with no captures.
+                let registered =
+                    crate::scenario::snapshot::with_active_bridge(|b| b.register_watch(symbol));
+                match registered {
+                    Some(Ok(())) => {
+                        tracing::info!(
+                            symbol = %symbol,
+                            "Op::WatchSnapshot: registered hardware-watchpoint snapshot"
+                        );
+                    }
+                    Some(Err(err)) => {
+                        anyhow::bail!(
+                            "Op::WatchSnapshot: register watch on '{symbol}' failed: {err}",
+                        );
+                    }
+                    None => {
+                        tracing::warn!(
+                            symbol = %symbol,
+                            "Op::WatchSnapshot: no SnapshotBridge installed on the \
+                             executor's thread — skipping watch registration (host \
+                             wires the bridge before execute_steps)"
+                        );
+                    }
+                }
             }
         }
     }
@@ -2623,6 +2892,12 @@ mod tests {
             },
             Op::FreezeCgroup { cgroup: "a".into() },
             Op::UnfreezeCgroup { cgroup: "a".into() },
+            Op::Snapshot {
+                name: "snap".into(),
+            },
+            Op::WatchSnapshot {
+                symbol: "kernel.x".into(),
+            },
         ];
         let mut seen = std::collections::BTreeSet::new();
         for op in &ops {
@@ -2689,6 +2964,20 @@ mod tests {
         );
         assert_eq!(Op::FreezeCgroup { cgroup: "a".into() }.discriminant(), 13,);
         assert_eq!(Op::UnfreezeCgroup { cgroup: "a".into() }.discriminant(), 14,);
+        assert_eq!(
+            Op::Snapshot {
+                name: "snap".into()
+            }
+            .discriminant(),
+            15,
+        );
+        assert_eq!(
+            Op::WatchSnapshot {
+                symbol: "kernel.x".into()
+            }
+            .discriminant(),
+            16,
+        );
     }
 
     // -- seeded_rng tests --
@@ -6224,13 +6513,15 @@ mod tests {
             Op::kill_payload_in_cgroup("constructor-test", "a"),
             Op::freeze_cgroup("a"),
             Op::unfreeze_cgroup("a"),
+            Op::snapshot("constructor-test"),
+            Op::watch_snapshot("kernel.constructor_test"),
         ];
 
         // Track which variants we observed. Adding a variant to `Op`
         // without a constructor call above leaves one slot `false`,
         // and adding a variant without a match arm below fails to
         // compile (no `_ =>` on purpose).
-        let mut seen = [false; 15];
+        let mut seen = [false; 17];
         for op in &constructed {
             let idx = match op {
                 Op::AddCgroup { .. } => 0,
@@ -6248,6 +6539,8 @@ mod tests {
                 Op::KillPayload { .. } => 12,
                 Op::FreezeCgroup { .. } => 13,
                 Op::UnfreezeCgroup { .. } => 14,
+                Op::Snapshot { .. } => 15,
+                Op::WatchSnapshot { .. } => 16,
             };
             seen[idx] = true;
         }

@@ -63,8 +63,8 @@ use anyhow::{Context, Result};
 use btf_rs::{Btf, Type};
 
 use super::Kva;
-use super::btf_offsets::{find_struct, member_byte_offset};
-use super::btf_render::{RenderedValue, render_value};
+use super::btf_offsets::{StructOrFwd, find_struct_or_fwd, member_byte_offset};
+use super::btf_render::{MemReader, RenderedValue, render_value_with_mem};
 use super::dump::hex_dump;
 use super::guest::GuestKernel;
 
@@ -92,12 +92,16 @@ pub const MAX_SDT_ALLOC_ENTRIES: usize = 4096;
 
 /// Width of `union sdt_id` in bytes — 8: `s32 idx + s32 genn`.
 ///
-/// The kernel layout in `sdt_task_defs.h` makes this a hard part of
-/// the wire format. The walker reads the actual offset via
-/// [`SdtAllocOffsets::data_header_size`] (resolved from BTF); this
-/// constant exists so unit tests can pin the expected value against
+/// The kernel layout in `lib/sdt_task_defs.h` makes this a hard part
+/// of the wire format: `union sdt_id { s64 val; struct { s32 idx; s32
+/// genn; }; }` is exactly 8 bytes, and `struct sdt_data { union sdt_id
+/// tid; u64 payload[]; }` has no other non-flex-array member, so
+/// `sizeof(struct sdt_data) == 8` for every kernel that ships
+/// sdt_alloc. [`SdtAllocOffsets::from_btf`] uses this as the fallback
+/// for `data_header_size` when the scheduler's program BTF surfaces
+/// `sdt_data` as a `BTF_KIND_FWD` forward declaration (no struct body
+/// from which `.size()` could be read); unit tests pin it against
 /// upstream layout drift.
-#[cfg(test)]
 const SIZEOF_SDT_ID: usize = 8;
 
 /// Sanity cap on `pool.elem_size` (allocation slot stride) the walker
@@ -165,35 +169,74 @@ impl SdtAllocOffsets {
     /// into its BPF object. The dump pipeline treats this as "no
     /// sdt_alloc state to surface" and skips the walk silently rather
     /// than aborting, since not every scheduler uses the allocator.
+    ///
+    /// # `BTF_KIND_FWD` handling
+    ///
+    /// BPF program BTFs emit `BTF_KIND_FWD` (forward declaration, no
+    /// body) for any struct the program references only by pointer.
+    /// The four "structural" types — `scx_allocator`, `sdt_pool`,
+    /// `sdt_desc`, `sdt_chunk` — must surface as full struct
+    /// definitions: the walker derives member offsets from each, and
+    /// a forward declaration carries no member information. A Fwd for
+    /// any of those four is surfaced as `Err` so the dump pipeline
+    /// records a clear diagnostic instead of crashing on missing
+    /// members.
+    ///
+    /// `sdt_data` is the exception: lavd and other schedulers that
+    /// only consume opaque allocator-returned pointers emit `sdt_data`
+    /// as a `BTF_KIND_FWD`. The walker only needs the size of the
+    /// header (the leading `union sdt_id`, 8 bytes; the `payload[]`
+    /// flex-array contributes 0), so [`SIZEOF_SDT_ID`] is used as the
+    /// fallback when `sdt_data` is a Fwd. The kernel header
+    /// `lib/sdt_task_defs.h` makes this size invariant (it's the only
+    /// non-flex-array member), so the fallback is correct without BTF
+    /// involvement.
     pub fn from_btf(btf: &Btf) -> Result<Self> {
-        let (allocator, _) = find_struct(btf, "scx_allocator")
-            .context("btf: struct scx_allocator not found (scheduler doesn't link sdt_alloc?)")?;
+        let allocator = require_full_struct(btf, "scx_allocator").context(
+            "btf: struct scx_allocator unavailable (scheduler doesn't link sdt_alloc, or BTF only carries a forward declaration)"
+        )?;
         let allocator_pool = member_byte_offset(btf, &allocator, "pool")?;
         let allocator_root = member_byte_offset(btf, &allocator, "root")?;
         let allocator_size = allocator.size();
 
-        let (pool, _) = find_struct(btf, "sdt_pool").context("btf: struct sdt_pool not found")?;
+        let pool = require_full_struct(btf, "sdt_pool")
+            .context("btf: struct sdt_pool unavailable for member offsets")?;
         let pool_elem_size = member_byte_offset(btf, &pool, "elem_size")?;
 
-        let (desc, _) = find_struct(btf, "sdt_desc").context("btf: struct sdt_desc not found")?;
+        let desc = require_full_struct(btf, "sdt_desc")
+            .context("btf: struct sdt_desc unavailable for member offsets")?;
         let desc_allocated = member_byte_offset(btf, &desc, "allocated")?;
         let desc_nr_free = member_byte_offset(btf, &desc, "nr_free")?;
         let desc_chunk = member_byte_offset(btf, &desc, "chunk")?;
 
-        let (chunk, _) =
-            find_struct(btf, "sdt_chunk").context("btf: struct sdt_chunk not found")?;
-        // The first member of the anonymous union — `descs` for
-        // internal nodes, `data` for leaves — sits at offset 0 of the
-        // chunk in every kernel that ships sdt_alloc, but we resolve
-        // through the union member rather than hardcode 0 so a future
-        // restructure that introduces a header above the union doesn't
-        // silently mis-read.
-        let chunk_union = chunk_union_offset(btf, &chunk)?;
+        // sdt_chunk is another type schedulers commonly emit as
+        // BTF_KIND_FWD — it's only accessed internally by the
+        // sdt_alloc library helpers. The struct contains a single
+        // anonymous union at offset 0 (descs[] for internal nodes,
+        // data[] for leaves). When only a Fwd is available, hardcode
+        // chunk_union = 0 matching the kernel layout at
+        // lib/sdt_task_defs.h.
+        let chunk_union = match find_struct_or_fwd(btf, "sdt_chunk")
+            .context("btf: struct sdt_chunk not found")?
+        {
+            StructOrFwd::Full(chunk) => chunk_union_offset(btf, &chunk)?,
+            StructOrFwd::Fwd => 0,
+        };
 
-        let (data, _) = find_struct(btf, "sdt_data").context("btf: struct sdt_data not found")?;
-        // Flex-array tail (`payload[]`) contributes 0 bytes; the size
-        // of `sdt_data` is just the `tid` header.
-        let data_header_size = data.size();
+        // `sdt_data` is the one type the walker tolerates as a
+        // `BTF_KIND_FWD`. The scheduler program never accesses its
+        // members directly (the lib/sdt_alloc.bpf.c helpers do, in lib
+        // BTF that may not be linked into the program BTF), so lavd
+        // and similar schedulers emit it as a forward declaration.
+        // The size is fixed by `lib/sdt_task_defs.h` at 8 bytes (the
+        // `union sdt_id` header; `payload[]` is a flex-array
+        // contributing 0 bytes), so we fall back to [`SIZEOF_SDT_ID`]
+        // when the body is absent.
+        let data_header_size =
+            match find_struct_or_fwd(btf, "sdt_data").context("btf: struct sdt_data not found")? {
+                StructOrFwd::Full(data) => data.size(),
+                StructOrFwd::Fwd => SIZEOF_SDT_ID,
+            };
 
         Ok(Self {
             allocator_pool,
@@ -206,6 +249,24 @@ impl SdtAllocOffsets {
             chunk_union,
             data_header_size,
         })
+    }
+}
+
+/// Resolve a struct that the walker requires by member offset.
+///
+/// Wraps [`find_struct_or_fwd`] and rejects forward declarations with
+/// an explicit "fwd, no body" diagnostic — distinct from "not found at
+/// all" so an operator can tell whether the scheduler links sdt_alloc
+/// at all (Err: not found) versus whether the program BTF stripped the
+/// struct body (Err: fwd only). Returning a Fwd from this helper would
+/// mean propagating an unusable struct handle whose `member_byte_offset`
+/// calls would then fail with a misleading "field 'X' not found" error.
+fn require_full_struct(btf: &Btf, name: &str) -> Result<btf_rs::Struct> {
+    match find_struct_or_fwd(btf, name)? {
+        StructOrFwd::Full(s) => Ok(s),
+        StructOrFwd::Fwd => anyhow::bail!(
+            "btf: struct {name} present only as BTF_KIND_FWD forward declaration; member offsets unavailable"
+        ),
     }
 }
 
@@ -389,6 +450,7 @@ pub fn walk_sdt_allocator(
     payload_btf_type_id: u32,
     payload_type_reason: impl Into<String>,
     allocator_name: impl Into<String>,
+    mem: &dyn MemReader,
 ) -> SdtAllocatorSnapshot {
     let mut snap = SdtAllocatorSnapshot {
         allocator_name: allocator_name.into(),
@@ -439,6 +501,7 @@ pub fn walk_sdt_allocator(
         btf,
         payload_btf_type_id,
         payload_size,
+        mem,
         out: &mut snap,
     };
     walker.descend(root_ptr, 0);
@@ -488,23 +551,42 @@ pub fn discover_payload_btf_id(btf: &Btf, payload_size: usize) -> PayloadTypeCho
     }
     let mut size_matches: Vec<(u32, String)> = Vec::new();
 
-    // btf-rs has no "list all types" iterator, so probe ids 1..N.
-    // BTF can have sparse id gaps — a single unresolvable id does
-    // NOT mean the table is exhausted. Continue past failures up to
-    // [`MAX_BTF_ID_PROBE`] (100k) which is well above the largest
-    // program-BTF tables ktstr sees in practice.
+    // btf-rs 1.1.1 has no public "list all types" iterator, so probe
+    // ids 1..N. BTF type ids are dense within a single object's BTF
+    // section (libbpf assigns them sequentially during compile), and
+    // for split BTF the program-BTF ids start at `base_nr_types + 1`
+    // contiguously. A run of CONSECUTIVE_FAIL_CAP failed lookups
+    // indicates the table is exhausted; bailing early is the
+    // performance fix for the prior pattern that walked all
+    // MAX_BTF_ID_PROBE (100k) ids when only a few hundred existed.
+    //
+    // The hard ceiling [`MAX_BTF_ID_PROBE`] still bounds the worst
+    // case (sparse-id table, defensive). Real ktstr program BTFs
+    // top out in the low thousands of types; 64 consecutive failures
+    // is generous (a sparse gap of 64 in a contiguous BTF means the
+    // generator is broken in a way the heuristic can't help with).
+    const CONSECUTIVE_FAIL_CAP: u32 = 64;
+
     let mut tid: u32 = 1;
+    let mut consecutive_fail: u32 = 0;
     while tid < MAX_BTF_ID_PROBE {
-        let Ok(ty) = btf.resolve_type_by_id(tid) else {
-            tid += 1;
-            continue;
-        };
-        if let Type::Struct(s) = ty
-            && s.size() == payload_size
-            && let Ok(name) = btf.resolve_name(&s)
-            && !name.is_empty()
-        {
-            size_matches.push((tid, name));
+        match btf.resolve_type_by_id(tid) {
+            Ok(ty) => {
+                consecutive_fail = 0;
+                if let Type::Struct(s) = ty
+                    && s.size() == payload_size
+                    && let Ok(name) = btf.resolve_name(&s)
+                    && !name.is_empty()
+                {
+                    size_matches.push((tid, name));
+                }
+            }
+            Err(_) => {
+                consecutive_fail += 1;
+                if consecutive_fail >= CONSECUTIVE_FAIL_CAP {
+                    break;
+                }
+            }
         }
         tid += 1;
     }
@@ -575,6 +657,12 @@ struct TreeWalker<'a> {
     btf: &'a Btf,
     payload_btf_type_id: u32,
     payload_size: usize,
+    /// `MemReader` used by [`render_value_with_mem`] when rendering
+    /// each leaf payload — lets the BTF renderer chase `__arena`
+    /// pointers within the payload (e.g. an entry holding a pointer
+    /// to another arena struct) into typed contents instead of
+    /// emitting raw hex.
+    mem: &'a dyn MemReader,
     out: &'a mut SdtAllocatorSnapshot,
 }
 
@@ -705,7 +793,7 @@ impl<'a> TreeWalker<'a> {
         }
 
         let payload = if self.payload_btf_type_id != 0 {
-            render_value(self.btf, self.payload_btf_type_id, &payload_bytes)
+            render_value_with_mem(self.btf, self.payload_btf_type_id, &payload_bytes, self.mem)
         } else {
             RenderedValue::Bytes {
                 hex: hex_dump(&payload_bytes),

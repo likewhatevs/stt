@@ -741,7 +741,7 @@ mod tests {
     /// Display output. Pins the chain
     /// `ProgRuntimeStats::fmt` (bpf_prog.rs) →
     /// `FailureDumpReport::fmt::std::fmt::Display::fmt(stats, f)`
-    /// (dump.rs `prog_runtime_stats:` arm).
+    /// (dump/display.rs `prog_runtime_stats:` arm).
     ///
     /// The standalone `prog_runtime_stats_display_format` test pins
     /// the inner Display in isolation; the dump-side

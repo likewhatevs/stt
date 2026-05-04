@@ -14,14 +14,22 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// `join_thread_with_timeout` returns the join result when the
-/// thread completes within the deadline.
+/// thread completes within the deadline. The exit eventfd is
+/// bumped from inside the closure to mirror production's
+/// `WorkerExitSignal` Drop guard.
 #[test]
 fn join_thread_with_timeout_returns_result_on_quick_completion() {
-    let join = std::thread::spawn(|| WorkerReport {
-        tid: 7,
-        ..WorkerReport::default()
+    use std::sync::Arc;
+    let exit_evt = Arc::new(vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK).unwrap());
+    let exit_evt_thread = Arc::clone(&exit_evt);
+    let join = std::thread::spawn(move || {
+        let _ = exit_evt_thread.write(1);
+        WorkerReport {
+            tid: 7,
+            ..WorkerReport::default()
+        }
     });
-    let r = join_thread_with_timeout(join, Duration::from_secs(2));
+    let r = join_thread_with_timeout(join, &exit_evt, Duration::from_secs(2));
     match r {
         Some(Ok(report)) => assert_eq!(report.tid, 7),
         Some(Err(_)) => panic!("clean thread must not produce join Err"),
@@ -35,13 +43,15 @@ fn join_thread_with_timeout_returns_result_on_quick_completion() {
 /// upper-bound sleep.
 #[test]
 fn join_thread_with_timeout_returns_none_on_timeout() {
+    use std::sync::Arc;
+    let exit_evt = Arc::new(vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK).unwrap());
     let join = std::thread::spawn(|| {
         // Sleep WELL past the 100ms timeout so the polling
         // helper definitely observes is_finished()==false.
         std::thread::sleep(Duration::from_millis(800));
         WorkerReport::default()
     });
-    let r = join_thread_with_timeout(join, Duration::from_millis(100));
+    let r = join_thread_with_timeout(join, &exit_evt, Duration::from_millis(100));
     assert!(r.is_none(), "100ms timeout vs 800ms thread must time out");
 }
 /// Defense-in-depth: `ThreadWorker::drop` MUST join its
@@ -73,6 +83,8 @@ fn thread_worker_drop_joins_handle() {
     let (start_tx, start_rx) = mpsc::sync_channel::<()>(0);
     let tid = Arc::new(AtomicI32::new(0));
     let tid_thread = Arc::clone(&tid);
+    let exit_evt = Arc::new(vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK).unwrap());
+    let exit_evt_thread = Arc::clone(&exit_evt);
 
     let join = std::thread::spawn(move || {
         tid_thread.store(
@@ -88,6 +100,7 @@ fn thread_worker_drop_joins_handle() {
             std::thread::sleep(Duration::from_millis(20));
         }
         observed_thread.store(true, Ordering::Relaxed);
+        let _ = exit_evt_thread.write(1);
         WorkerReport::default()
     });
 
@@ -96,6 +109,7 @@ fn thread_worker_drop_joins_handle() {
         stop,
         start_tx: Some(start_tx),
         join: Some(join),
+        exit_evt,
     };
     // Send the start signal so the worker proceeds to its
     // stop-check loop. (The Drop will also drop start_tx but

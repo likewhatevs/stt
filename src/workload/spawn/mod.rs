@@ -542,29 +542,90 @@ pub(super) fn extract_panic_payload(payload: Box<dyn std::any::Any + Send>) -> S
 /// post-loop cleanup (NUMA stat reads, schedstat snapshots).
 pub(super) const THREAD_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Poll [`std::thread::JoinHandle::is_finished`] until it returns
-/// `true` or `timeout` elapses. Returns `Some(thread_result)` on
-/// successful join, `None` on timeout.
+/// Block until `join` reports finished or `timeout` elapses.
+/// Returns `Some(thread_result)` on successful join, `None` on
+/// timeout.
 ///
-/// Std lacks a native timed-join API; the polling-based shape here
-/// is the simplest non-leaking pattern. A side-thread "joiner +
-/// channel" alternative would orphan the joiner on timeout
+/// Implementation: wait on `exit_evt` (the worker's "I'm about to
+/// return" eventfd, bumped from a Drop guard inside the thread
+/// closure) via `epoll_wait` with a `timerfd` for the safety
+/// deadline. A spurious wake (e.g. EINTR or a stale eventfd-counter
+/// drain) loops back into the wait without orphaning the worker —
+/// the timerfd carries the absolute deadline.
+///
+/// Std lacks a native timed-join API; an alternative side-thread
+/// "joiner + channel" pattern would orphan the joiner on timeout
 /// (joining is non-cancellable in std), which keeps the thread
 /// alive past `WorkloadHandle::drop` and prevents process exit.
-/// Polling avoids that orphan cost at the price of a 10ms wakeup
-/// cadence — fine for the 5s budget this is paired with.
+/// The eventfd path replaces the previous 10ms sleep-poll loop
+/// without that orphan cost.
 pub(super) fn join_thread_with_timeout(
     join: std::thread::JoinHandle<WorkerReport>,
+    exit_evt: &vmm_sys_util::eventfd::EventFd,
     timeout: Duration,
 ) -> Option<std::thread::Result<WorkerReport>> {
-    let deadline = Instant::now() + timeout;
-    while !join.is_finished() {
-        if Instant::now() >= deadline {
+    use std::os::unix::io::AsRawFd;
+    use vmm_sys_util::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
+    use vmm_sys_util::timerfd::TimerFd;
+
+    if join.is_finished() {
+        return Some(join.join());
+    }
+
+    let epoll = match Epoll::new() {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!(%e, "join_thread_with_timeout: epoll_create1 failed");
             return None;
         }
-        std::thread::sleep(Duration::from_millis(10));
+    };
+    if let Err(e) = epoll.ctl(
+        ControlOperation::Add,
+        exit_evt.as_raw_fd(),
+        EpollEvent::new(EventSet::IN, 0),
+    ) {
+        tracing::warn!(%e, "join_thread_with_timeout: add exit_evt to epoll");
+        return None;
     }
-    Some(join.join())
+    let mut timer = match TimerFd::new() {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(%e, "join_thread_with_timeout: timerfd_create failed");
+            return None;
+        }
+    };
+    if let Err(e) = timer.reset(timeout, None) {
+        tracing::warn!(%e, "join_thread_with_timeout: timerfd_settime failed");
+        return None;
+    }
+    if let Err(e) = epoll.ctl(
+        ControlOperation::Add,
+        timer.as_raw_fd(),
+        EpollEvent::new(EventSet::IN, 1),
+    ) {
+        tracing::warn!(%e, "join_thread_with_timeout: add timerfd to epoll");
+        return None;
+    }
+
+    let deadline = Instant::now() + timeout;
+    let mut events = [EpollEvent::default(); 2];
+    loop {
+        if join.is_finished() {
+            return Some(join.join());
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        match epoll.wait(-1, &mut events) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                tracing::warn!(%e, "join_thread_with_timeout: epoll_wait failed");
+                return None;
+            }
+        }
+    }
 }
 
 /// `worker_main`'s loop-check predicate: returns `true` when the
@@ -626,6 +687,14 @@ pub(super) struct ThreadWorker {
     stop: std::sync::Arc<AtomicBool>,
     pub(super) start_tx: Option<std::sync::mpsc::SyncSender<()>>,
     join: Option<std::thread::JoinHandle<WorkerReport>>,
+    /// Eventfd bumped by the worker thread's `WorkerExitSignal` Drop
+    /// guard before the thread returns from its closure. Lets
+    /// [`join_thread_with_timeout`] block in `epoll_wait` instead of
+    /// sleep-polling [`std::thread::JoinHandle::is_finished`]. Counter
+    /// mode (not semaphore) — the value never matters; only the edge
+    /// from 0 to non-zero does. The Arc is cloned into the closure
+    /// for the Drop guard; the parent retains the original here.
+    exit_evt: std::sync::Arc<vmm_sys_util::eventfd::EventFd>,
 }
 
 /// Defense-in-depth Drop for [`ThreadWorker`]. Rust's
@@ -648,7 +717,7 @@ impl Drop for ThreadWorker {
         if let Some(j) = self.join.take() {
             self.stop.store(true, Ordering::Relaxed);
             self.start_tx.take();
-            let _ = join_thread_with_timeout(j, THREAD_JOIN_TIMEOUT);
+            let _ = join_thread_with_timeout(j, &self.exit_evt, THREAD_JOIN_TIMEOUT);
         }
     }
 }
@@ -927,7 +996,7 @@ impl Drop for SpawnGuard {
                 // mid-spawn path has nothing to assert against beyond
                 // not leaking, and the spawn-side bail message has
                 // already named the failure mode that triggered cleanup.
-                let _ = join_thread_with_timeout(j, THREAD_JOIN_TIMEOUT);
+                let _ = join_thread_with_timeout(j, &tw.exit_evt, THREAD_JOIN_TIMEOUT);
             }
         }
         // Early-bail pipe close. On the success path, into_handle
@@ -1316,12 +1385,23 @@ pub(super) fn spawn_thread_worker(
     let (start_tx, start_rx) = mpsc::sync_channel::<()>(0);
     let stop = Arc::new(AtomicBool::new(false));
     let tid = Arc::new(AtomicI32::new(0));
+    // Per-worker exit eventfd: bumped by a Drop guard inside the
+    // closure right before the thread returns its `WorkerReport`. The
+    // parent's `join_thread_with_timeout` blocks in `epoll_wait` on
+    // this fd instead of sleep-polling `is_finished`. Created with
+    // `EFD_NONBLOCK` so the Drop-time `write` cannot block; counter
+    // mode so a missed read just accumulates without losing the edge.
+    let exit_evt = Arc::new(
+        vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK)
+            .context("create thread-worker exit eventfd")?,
+    );
 
     // Clone Arcs for the closure. The thread takes ownership of the
     // closure-side handles; the parent retains the originals via
     // ThreadWorker for stop signaling and tid reading.
     let stop_thread = Arc::clone(&stop);
     let tid_thread = Arc::clone(&tid);
+    let exit_evt_thread = Arc::clone(&exit_evt);
     let work_type = group.work_type.clone();
     let sched_policy = group.sched_policy;
     let mem_policy = group.mem_policy.clone();
@@ -1343,6 +1423,23 @@ pub(super) fn spawn_thread_worker(
     let join = std::thread::Builder::new()
         .name(format!("ktstr-worker-g{group_idx}-{}", guard.threads.len()))
         .spawn(move || {
+            // Drop guard: signal the exit eventfd as the closure
+            // unwinds, regardless of whether `worker_main` returned
+            // normally or panicked. The parent's
+            // `join_thread_with_timeout` blocks in `epoll_wait` on
+            // this fd; a panic that bypassed the explicit signal
+            // would otherwise leave the parent waiting until the
+            // safety timerfd fires. Drop runs even under unwinding,
+            // so this guard captures both the normal and panic
+            // paths.
+            struct WorkerExitSignal(std::sync::Arc<vmm_sys_util::eventfd::EventFd>);
+            impl Drop for WorkerExitSignal {
+                fn drop(&mut self) {
+                    let _ = self.0.write(1);
+                }
+            }
+            let _exit_signal = WorkerExitSignal(exit_evt_thread);
+
             // Publish gettid() so the parent can address this task
             // for sched_setaffinity and report it from worker_pids.
             // gettid() is the kernel TID; getpid() would return the
@@ -1403,6 +1500,7 @@ pub(super) fn spawn_thread_worker(
         stop,
         start_tx: Some(start_tx),
         join: Some(join),
+        exit_evt,
     });
     Ok(())
 }
@@ -2809,7 +2907,7 @@ impl WorkloadHandle {
             tw.start_tx.take();
             let tid = tw.tid.load(Ordering::Acquire);
             if let Some(j) = tw.join.take() {
-                match join_thread_with_timeout(j, THREAD_JOIN_TIMEOUT) {
+                match join_thread_with_timeout(j, &tw.exit_evt, THREAD_JOIN_TIMEOUT) {
                     Some(Ok(report)) => reports.push(report),
                     Some(Err(payload)) => {
                         let msg = extract_panic_payload(payload);
@@ -2896,7 +2994,7 @@ impl Drop for WorkloadHandle {
             tw.start_tx.take();
             if let Some(j) = tw.join.take() {
                 let tid = tw.tid.load(Ordering::Acquire);
-                match join_thread_with_timeout(j, THREAD_JOIN_TIMEOUT) {
+                match join_thread_with_timeout(j, &tw.exit_evt, THREAD_JOIN_TIMEOUT) {
                     Some(Ok(_)) => {}
                     Some(Err(e)) => {
                         let payload = extract_panic_payload(e);

@@ -60,6 +60,97 @@ pub(crate) fn mmap_devmem(
     })
 }
 
+/// Cached pointer to the snapshot doorbell MMIO page inside the
+/// guest's `/dev/mem` mapping. Initialised lazily on the first
+/// [`doorbell_fire`] call and reused for the lifetime of the guest
+/// process. Pointer addresses a single 4-byte slot at the host's
+/// `DOORBELL_MMIO_GPA`; the host registers an in-kernel ioeventfd
+/// at that GPA so a single 4-byte write dispatches in-kernel and
+/// signals the freeze coordinator without a userspace exit.
+#[allow(dead_code)] // Called via SnapshotBridge wiring (added by a follow-up).
+struct DoorbellPtr {
+    ptr: *mut u8,
+}
+unsafe impl Send for DoorbellPtr {}
+unsafe impl Sync for DoorbellPtr {}
+
+#[allow(dead_code)] // Called via SnapshotBridge wiring (added by a follow-up).
+static DOORBELL_PTR: std::sync::OnceLock<DoorbellPtr> = std::sync::OnceLock::new();
+
+/// Guest-only. Lazily mmap the snapshot doorbell MMIO page via
+/// `/dev/mem` and write `request_id` into the doorbell slot.
+///
+/// The host VMM registers an in-kernel ioeventfd at
+/// [`DOORBELL_MMIO_GPA`](crate::vmm::kvm::DOORBELL_MMIO_GPA) via
+/// `KVM_IOEVENTFD` with `NoDatamatch`, so any 4-byte write to this
+/// GPA dispatches inside KVM and signals the host coordinator's
+/// eventfd. The vCPU thread does NOT exit to userspace for the
+/// write itself. `request_id` is opaque to the host's eventfd
+/// dispatch (datamatch is disabled) — the value is observable to
+/// the host only via guest-memory reads of the SHM ring; this
+/// helper writes it through to the doorbell page so a future tag
+/// channel can read it back.
+///
+/// On failure (`/dev/mem` open / mmap rejected), logs a
+/// `tracing::warn!` and returns without firing — the caller's
+/// reply path will time out rather than blocking forever. This
+/// is the same recovery shape the SHM-side helpers use.
+#[allow(dead_code)] // Called via SnapshotBridge wiring (added by a follow-up).
+pub fn doorbell_fire(request_id: u32) {
+    let ptr = match DOORBELL_PTR.get() {
+        Some(p) => p.ptr,
+        None => {
+            let fd = match std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("/dev/mem")
+            {
+                Ok(f) => f,
+                Err(e) => {
+                    tracing::warn!(error = %e, "doorbell_fire: /dev/mem open failed");
+                    return;
+                }
+            };
+            // The doorbell occupies a single 4-byte slot at the
+            // host's MMIO_GAP_START + 0x3000 (x86_64) or
+            // VIRTIO_NET_MMIO_BASE + VIRTIO_MMIO_SIZE (aarch64);
+            // mmap one page so the kernel page-aligns the request.
+            let m = match mmap_devmem(
+                std::os::unix::io::AsRawFd::as_raw_fd(&fd),
+                crate::vmm::kvm::DOORBELL_MMIO_GPA,
+                4096,
+            ) {
+                Some(m) => m,
+                None => {
+                    tracing::warn!(
+                        error = %std::io::Error::last_os_error(),
+                        "doorbell_fire: /dev/mem mmap failed"
+                    );
+                    return;
+                }
+            };
+            // Cache the page pointer; munmap on process exit is
+            // implicit. If two threads race the OnceLock the loser's
+            // mmap leaks (one page) — acceptable for an init-time
+            // path, mirroring the SHM ring's lazy-init pattern.
+            let _ = DOORBELL_PTR.set(DoorbellPtr { ptr: m.ptr });
+            // The owned File `fd` drops here; the mmap holds its
+            // own reference to the underlying inode (Linux mmap
+            // semantics) so closing the fd does not unmap the page.
+            DOORBELL_PTR.get().map(|p| p.ptr).unwrap_or(m.ptr)
+        }
+    };
+    // SAFETY: `ptr` addresses a 4-byte aligned MMIO slot inside a
+    // page-sized mmap of `/dev/mem` covering the host-registered
+    // ioeventfd target. The write_volatile is the architecture's
+    // standard MMIO store; KVM intercepts and dispatches via the
+    // ioeventfd registered by `KtstrVm::run_vm`. No alias hazard:
+    // the host coordinator polls the eventfd, never the GPA itself.
+    unsafe {
+        std::ptr::write_volatile(ptr as *mut u32, request_id);
+    }
+}
+
 /// Magic value identifying a valid SHM ring header.
 pub const SHM_RING_MAGIC: u32 = 0x5354_4d52; // "STMR"
 
@@ -215,6 +306,17 @@ pub fn wait_for(slot: u8, timeout: std::time::Duration) -> anyhow::Result<()> {
         if atom.load(std::sync::atomic::Ordering::Acquire) != 0 {
             return Ok(());
         }
+        // Guest-side SHM signals are host-DRAM writes with no
+        // kernel-side event source — the host writes the byte into
+        // guest physical memory and there is no notification
+        // mechanism for guest-physical-memory mutations. KVM's MMIO
+        // / IOEVENT path doesn't apply here because the host is not
+        // invoking a vCPU exit; it's directly modifying the mapped
+        // region. Polling at 50 ms cadence is the supported
+        // mechanism. A virtio-console RX byte from the host could
+        // replace this poll, but that would require allocating a
+        // VirtioConsole on every test VM and plumbing it through —
+        // out of scope for this site.
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
     anyhow::bail!("signal slot {slot} timed out after {timeout:?}")

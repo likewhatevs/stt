@@ -554,3 +554,437 @@ static __KTSTR_ENTRY_FAILURE_DUMP_BSS: ktstr::test_support::KtstrTestEntry =
         expect_err: true,
         ..ktstr::test_support::KtstrTestEntry::DEFAULT
     };
+
+/// Asserts that the freeze coordinator's host-side capture modules
+/// (`crate::vmm::capture_scx`, `crate::vmm::capture_tasks`,
+/// `crate::vmm::capture_numa`) populate
+/// [`crate::monitor::dump::FailureDumpReport`] with non-default
+/// data when the `--stall-after=1` SCX_EXIT_ERROR_STALL path
+/// triggers a freeze.
+///
+/// User-facing test bar (per project memory): "captures must
+/// always produce data" — when scx-ktstr is loaded and tasks are
+/// runnable, the dump should carry per-CPU rq->scx state, at
+/// least the global DSQ, the scx_sched scalar state, and at
+/// least one task enrichment record. NUMA stats either populate
+/// (CONFIG_NUMA=y kernel) or carry the diagnostic reason that
+/// explains why they didn't.
+///
+/// Distinct from `scenario_failure_dump_renders_bss_fields`:
+/// that test exercises the BTF / arena render path; this one
+/// exercises the live-walker captures wired into freeze_coord
+/// at #68/#69/#70.
+fn scenario_failure_dump_renders_capture_modules(
+    ctx: &ktstr::scenario::Ctx,
+) -> Result<AssertResult> {
+    let dump_path = failure_dump_path("failure_dump_renders_capture_modules");
+    let num_cpus = ctx.topo.total_cpus();
+
+    let steps = vec![Step {
+        setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
+        ops: vec![],
+        hold: HoldSpec::FULL,
+    }];
+    let mut result = execute_steps(ctx, steps)?;
+
+    let json = match std::fs::read_to_string(&dump_path) {
+        Ok(s) => s,
+        Err(e) => {
+            result.passed = false;
+            result.details.push(ktstr::assert::AssertDetail::new(
+                ktstr::assert::DetailKind::Other,
+                format!(
+                    "failure dump file missing at {}: {e} (freeze coordinator did \
+                     not write — either the SCX_EXIT_ERROR_STALL latch did not \
+                     fire or the file write failed silently)",
+                    dump_path.display()
+                ),
+            ));
+            anyhow::bail!(
+                "failure dump file missing at {} — freeze coordinator did not \
+                 write the JSON dump",
+                dump_path.display()
+            );
+        }
+    };
+
+    let value: serde_json::Value = serde_json::from_str(&json)
+        .map_err(|e| anyhow::anyhow!("dump file is not valid JSON: {e}"))?;
+
+    // -- scx_walker capture (rq_scx_states / dsq_states / scx_sched_state) --
+    //
+    // The walker pushes one entry per CPU whose rq + scx_rq + task
+    // sub-group offsets resolved. With CONFIG_SCHED_CLASS_EXT=y and
+    // a debug-info kernel (per ktstr.kconfig) every CPU resolves, so
+    // the vec length must equal num_cpus. Surface the absent /
+    // partial state diagnostic when the walker fails so the failure
+    // mode is identifiable from the dump alone.
+    if let Some(reason) = value.get("scx_walker_unavailable").and_then(|r| r.as_str()) {
+        anyhow::bail!(
+            "scx_walker_unavailable={reason:?} — capture_scx::build returned \
+             None or the walker reached no state. Captures must always \
+             produce data when scx-ktstr is loaded. Full JSON: {json}"
+        );
+    }
+    let rq_scx_states = value
+        .get("rq_scx_states")
+        .and_then(|s| s.as_array())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "dump JSON missing `rq_scx_states` array — capture_scx \
+                 wiring did not populate the field. Full JSON: {json}"
+            )
+        })?;
+    if rq_scx_states.len() != num_cpus {
+        anyhow::bail!(
+            "rq_scx_states.len()={} but expected num_cpus={num_cpus} — \
+             walk_rq_scx skipped some CPUs (sub-group offset resolution \
+             failed or per-CPU rq translate failed). Full rq_scx_states: \
+             {rq_scx_states:?}",
+            rq_scx_states.len(),
+        );
+    }
+    // At least one CPU must show evidence of scheduler activity:
+    // either a non-zero `nr_running` (tasks queued on rq->scx) or a
+    // non-zero `flags` (any scx_rq.flags bit set). Both being zero
+    // across every CPU would mean the walker ran but read pre-init
+    // state — an empty walker is no better than no walker.
+    let any_active = rq_scx_states.iter().any(|s| {
+        let nr = s.get("nr_running").and_then(|v| v.as_u64()).unwrap_or(0);
+        let flags = s.get("flags").and_then(|v| v.as_u64()).unwrap_or(0);
+        nr > 0 || flags != 0
+    });
+    if !any_active {
+        anyhow::bail!(
+            "no rq_scx_states entry has nr_running>0 OR flags!=0 — every \
+             CPU's rq->scx scalar read came back zero, meaning the walker \
+             ran but every per-CPU scx_rq is empty. Either no scx tasks \
+             were ever runnable or the rq_pa translate produced wrong \
+             addresses. Full rq_scx_states: {rq_scx_states:?}"
+        );
+    }
+
+    let dsq_states = value
+        .get("dsq_states")
+        .and_then(|s| s.as_array())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "dump JSON missing `dsq_states` array — capture_scx \
+                 wiring did not populate the field. Full JSON: {json}"
+            )
+        })?;
+    if dsq_states.is_empty() {
+        anyhow::bail!(
+            "dsq_states is empty — walk_dsqs reached no DSQs. The \
+             global DSQ (SCX_DSQ_GLOBAL per-node) must always be \
+             reachable when *scx_root is non-null. Full JSON: {json}"
+        );
+    }
+
+    if value.get("scx_sched_state").is_none()
+        || value.get("scx_sched_state").is_some_and(|v| v.is_null())
+    {
+        anyhow::bail!(
+            "scx_sched_state is absent or null — read_scx_sched_state \
+             returned None. *scx_root was unreadable or the BTF offsets \
+             didn't resolve. Full JSON: {json}"
+        );
+    }
+
+    // -- task_enrichments capture --
+    //
+    // The runnable_list walker pushes one entry per task on each
+    // CPU's rq->scx.runnable_list. With workers_per_cgroup=2 driving
+    // active workloads, at least one task should be runnable at the
+    // freeze instant. An empty enrichment vec when scx-ktstr is
+    // loaded means the walker missed every task — a real defect.
+    if let Some(reason) = value
+        .get("task_enrichments_unavailable")
+        .and_then(|r| r.as_str())
+    {
+        anyhow::bail!(
+            "task_enrichments_unavailable={reason:?} — capture_tasks::build \
+             returned None or the walker yielded zero tasks. Captures \
+             must always produce data when scx tasks are runnable. Full \
+             JSON: {json}"
+        );
+    }
+    let task_enrichments = value
+        .get("task_enrichments")
+        .and_then(|s| s.as_array())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "dump JSON missing `task_enrichments` array — \
+                 capture_tasks wiring did not populate the field. \
+                 Full JSON: {json}"
+            )
+        })?;
+    if task_enrichments.is_empty() {
+        anyhow::bail!(
+            "task_enrichments is empty — runnable_list walker found no \
+             tasks. With workers_per_cgroup>0 driving load, at least \
+             one task must be runnable at freeze time. Full JSON: {json}"
+        );
+    }
+    // At least one enrichment must carry an identity that proves the
+    // task_struct read produced live data: non-empty comm AND pid > 0.
+    // pid==0 is the swapper / idle task — possible but not proof of
+    // liveness; insist on a real userspace task slip through the
+    // walker. comm is null-terminated and skipped when zero-length
+    // wouldn't be skip-serialized but a zero-byte read would surface
+    // as an empty string, not absent.
+    let has_real_task = task_enrichments.iter().any(|t| {
+        let pid = t.get("pid").and_then(|v| v.as_i64()).unwrap_or(0);
+        let comm = t.get("comm").and_then(|v| v.as_str()).unwrap_or("");
+        pid > 0 && !comm.is_empty()
+    });
+    if !has_real_task {
+        anyhow::bail!(
+            "no task_enrichment entry has pid>0 AND non-empty comm — \
+             every task_struct read produced pid<=0 or empty comm, \
+             meaning the slab translate fell back to garbage memory. \
+             Full task_enrichments: {task_enrichments:?}"
+        );
+    }
+
+    // -- per_node_numa capture --
+    //
+    // ktstr.kconfig sets CONFIG_NUMA=y, so capture_numa::build runs.
+    // With nr_nodes=1 (default topology) it walks node 0 and emits
+    // one PerNodeNumaStats row. If for any reason the walker bails
+    // (symbol absent, BTF offsets unresolved, pgdat translate failed),
+    // per_node_numa stays empty and per_node_numa_unavailable carries
+    // the diagnostic. Both shapes are acceptable; what's NOT
+    // acceptable is the empty vec without a diagnostic.
+    let per_node_numa = value
+        .get("per_node_numa")
+        .and_then(|s| s.as_array())
+        .map(|a| a.as_slice())
+        .unwrap_or(&[]);
+    let per_node_numa_unavailable = value
+        .get("per_node_numa_unavailable")
+        .and_then(|r| r.as_str());
+    if per_node_numa.is_empty() && per_node_numa_unavailable.is_none() {
+        anyhow::bail!(
+            "per_node_numa is empty AND per_node_numa_unavailable is \
+             absent — the dump pipeline broke its own contract that \
+             one of the two must be populated. Full JSON: {json}"
+        );
+    }
+
+    result.details.push(ktstr::assert::AssertDetail::new(
+        ktstr::assert::DetailKind::Other,
+        format!(
+            "failure-dump file at {} contains capture-module data: \
+             rq_scx_states.len()={} (num_cpus={num_cpus}), \
+             dsq_states.len()={}, scx_sched_state present, \
+             task_enrichments.len()={}, per_node_numa.len()={} \
+             (unavailable={:?})",
+            dump_path.display(),
+            rq_scx_states.len(),
+            dsq_states.len(),
+            task_enrichments.len(),
+            per_node_numa.len(),
+            per_node_numa_unavailable,
+        ),
+    ));
+
+    Ok(result)
+}
+
+#[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+#[linkme(crate = ktstr::__private::linkme)]
+static __KTSTR_ENTRY_FAILURE_DUMP_CAPTURES: ktstr::test_support::KtstrTestEntry =
+    ktstr::test_support::KtstrTestEntry {
+        name: "failure_dump_renders_capture_modules",
+        func: scenario_failure_dump_renders_capture_modules,
+        scheduler: &KTSTR_SCHED_PAYLOAD,
+        // --stall-after=1 makes the scheduler return early from
+        // dispatch after 1 second of operation, triggering
+        // SCX_EXIT_ERROR_STALL via the kernel watchdog.
+        extra_sched_args: &["--stall-after=1"],
+        // Watchdog timeout snug to the stall budget so the run
+        // teardown stays under the test duration.
+        watchdog_timeout: std::time::Duration::from_secs(3),
+        duration: std::time::Duration::from_secs(10),
+        workers_per_cgroup: 2,
+        // The scenario returns a non-failed AssertResult on success
+        // (the stall is the expected trigger that produces the dump);
+        // any capture defect is reported via anyhow::bail! and bubbles
+        // up as an Err. expect_err inverts the AssertResult fail-on-stall
+        // to a pass.
+        expect_err: true,
+        ..ktstr::test_support::KtstrTestEntry::DEFAULT
+    };
+
+/// Asserts that the failure dump's `probe_counters` field captures
+/// non-zero `trigger_count` after an SCX_EXIT_ERROR_STALL fires.
+///
+/// User-facing test bar (per project memory): the BPF probe's
+/// per-CPU diagnostic counters must surface in the failure dump
+/// with values that prove each tracepoint actually fired during
+/// the run. After the per-CPU conversion landed (replacing N
+/// shared-global counters with a `[MAX_CPUS][KTSTR_PCPU_NR]`
+/// 2D array in `.bss`), this test pins:
+///   1. `probe_counters` is present and structured (not absent /
+///      null in the JSON);
+///   2. `probe_counters.trigger_count > 0` — the
+///      `tp_btf/sched_ext_exit` handler fired at least once during
+///      the stall, which proves the per-CPU sum reaches the host;
+///   3. `probe_counters.probe_count > 0` — kprobes attached and
+///      fired (confirms the host-side sum walks the array, since
+///      a stub-empty array would produce 0 even on a working run).
+///
+/// Distinct from `scenario_failure_dump_renders_bss_fields` (which
+/// asserts the scheduler's own `.bss` BTF render) and
+/// `scenario_failure_dump_renders_capture_modules` (which asserts
+/// the live walker captures): this test exercises the host-side
+/// host-side `decode_probe_counters_snapshot` reader specifically.
+fn scenario_failure_dump_renders_probe_counters(
+    ctx: &ktstr::scenario::Ctx,
+) -> Result<AssertResult> {
+    let dump_path = failure_dump_path("failure_dump_renders_probe_counters");
+
+    let steps = vec![Step {
+        setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
+        ops: vec![],
+        hold: HoldSpec::FULL,
+    }];
+    let mut result = execute_steps(ctx, steps)?;
+
+    let json = match std::fs::read_to_string(&dump_path) {
+        Ok(s) => s,
+        Err(e) => {
+            result.passed = false;
+            result.details.push(ktstr::assert::AssertDetail::new(
+                ktstr::assert::DetailKind::Other,
+                format!(
+                    "failure dump file missing at {}: {e} (freeze coordinator did \
+                     not write — either the SCX_EXIT_ERROR_STALL latch did not \
+                     fire or the file write failed silently)",
+                    dump_path.display()
+                ),
+            ));
+            anyhow::bail!(
+                "failure dump file missing at {} — freeze coordinator did not \
+                 write the JSON dump",
+                dump_path.display()
+            );
+        }
+    };
+
+    let value: serde_json::Value = serde_json::from_str(&json)
+        .map_err(|e| anyhow::anyhow!("dump file is not valid JSON: {e}"))?;
+
+    // `probe_counters` is `skip_serializing_if = "Option::is_none"`,
+    // so its absence in the JSON means the host-side decoder
+    // returned None. That's a regression — when the probe has
+    // attached and fired (which the stall scenario guarantees),
+    // the decoder must produce a populated struct.
+    let probe_counters = value.get("probe_counters").ok_or_else(|| {
+        anyhow::anyhow!(
+            "dump JSON missing `probe_counters` field — \
+             decode_probe_counters_snapshot returned None. \
+             Probe `.bss` map absent, BTF lookup failed, or the \
+             `ktstr_pcpu_counters` array offset didn't resolve. \
+             Full JSON: {json}"
+        )
+    })?;
+    if probe_counters.is_null() {
+        anyhow::bail!(
+            "`probe_counters` is null — decoder ran but produced None; \
+             same prerequisite-missing failure modes as above. \
+             Full JSON: {json}"
+        );
+    }
+
+    // `trigger_count` is the structural assertion — a stall
+    // scenario is guaranteed to fire `tp_btf/sched_ext_exit`
+    // (the SCX kernel emits SCX_EXIT_ERROR_STALL through the
+    // tracepoint), so a zero value here means either (a) the
+    // probe didn't attach the trigger handler, (b) the handler
+    // fired but the per-CPU slot bump didn't land, or (c) the
+    // host-side cross-CPU sum walked the wrong slot index.
+    let trigger_count = probe_counters
+        .get("trigger_count")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "`probe_counters.trigger_count` missing or non-numeric — \
+                 ProbeBssCounters serde shape changed. \
+                 probe_counters: {probe_counters}"
+            )
+        })?;
+    if trigger_count == 0 {
+        anyhow::bail!(
+            "`probe_counters.trigger_count == 0` — `tp_btf/sched_ext_exit` \
+             never fired (or the per-CPU slot didn't increment). The stall \
+             scenario must produce at least one tracepoint fire. \
+             probe_counters: {probe_counters}"
+        );
+    }
+
+    // `probe_count` cross-validates the array walk: the kprobe
+    // handler is attached to multiple kernel functions (sched
+    // entry / dispatch path) and fires throughout the run, so a
+    // healthy stall scenario produces hundreds-to-millions of
+    // fires. A non-zero value here proves the host-side reader
+    // walked the per-CPU slots (rather than reading a stub-zero
+    // value from index 0 of an empty array).
+    let probe_count = probe_counters
+        .get("probe_count")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "`probe_counters.probe_count` missing or non-numeric — \
+                 ProbeBssCounters serde shape changed. \
+                 probe_counters: {probe_counters}"
+            )
+        })?;
+    if probe_count == 0 {
+        anyhow::bail!(
+            "`probe_counters.probe_count == 0` — kprobe path never fired \
+             across the run. Either probe attach failed, ktstr_enabled \
+             never flipped to true, or the host-side sum walked the wrong \
+             slot index. probe_counters: {probe_counters}"
+        );
+    }
+
+    result.details.push(ktstr::assert::AssertDetail::new(
+        ktstr::assert::DetailKind::Other,
+        format!(
+            "failure-dump file at {} contains probe_counters with \
+             trigger_count={trigger_count}, probe_count={probe_count} \
+             (per-CPU sum walked across CPUs in `.bss` \
+             `ktstr_pcpu_counters` array)",
+            dump_path.display(),
+        ),
+    ));
+
+    Ok(result)
+}
+
+#[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+#[linkme(crate = ktstr::__private::linkme)]
+static __KTSTR_ENTRY_FAILURE_DUMP_PROBE_COUNTERS: ktstr::test_support::KtstrTestEntry =
+    ktstr::test_support::KtstrTestEntry {
+        name: "failure_dump_renders_probe_counters",
+        func: scenario_failure_dump_renders_probe_counters,
+        scheduler: &KTSTR_SCHED_PAYLOAD,
+        // --stall-after=1 fires SCX_EXIT_ERROR_STALL on watchdog
+        // timeout. The probe's tp_btf/sched_ext_exit handler
+        // bumps `KTSTR_PCPU_TRIGGER_COUNT` on every fire, so a
+        // single stall produces a non-zero cross-CPU sum.
+        extra_sched_args: &["--stall-after=1"],
+        // Watchdog timeout snug to the stall budget so the run
+        // teardown stays under the test duration.
+        watchdog_timeout: std::time::Duration::from_secs(3),
+        duration: std::time::Duration::from_secs(10),
+        workers_per_cgroup: 2,
+        // Stall scenarios surface as a failed AssertResult — the
+        // test framework's `expect_err: true` flips that into a
+        // pass, so the scenario itself only returns Err when the
+        // dump renders incorrectly (missing/zero counter).
+        expect_err: true,
+        ..ktstr::test_support::KtstrTestEntry::DEFAULT
+    };

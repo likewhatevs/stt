@@ -33,7 +33,13 @@ pub(super) fn write_orphans_section<W: fmt::Write>(
 ) -> fmt::Result {
     write_fudged_pairs(w, diff)?;
     write_only_list(w, "baseline", baseline_path, &diff.only_baseline, group_by)?;
-    write_only_list(w, "candidate", candidate_path, &diff.only_candidate, group_by)?;
+    write_only_list(
+        w,
+        "candidate",
+        candidate_path,
+        &diff.only_candidate,
+        group_by,
+    )?;
     Ok(())
 }
 

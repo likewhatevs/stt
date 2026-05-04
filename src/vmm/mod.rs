@@ -61,16 +61,19 @@ pub mod topology;
 
 // `pub(crate) mod` — crate-internal sub-modules.
 pub(crate) mod builder;
+pub(crate) mod capture_numa;
+pub(crate) mod capture_scx;
+pub(crate) mod capture_tasks;
 pub(crate) mod contention;
 pub(crate) mod exit_dispatch;
 pub(crate) mod freeze_coord;
 pub(crate) mod initramfs_cache;
+pub(crate) mod net_config;
 pub(crate) mod numa_mem;
 pub(crate) mod result;
 pub(crate) mod rust_init;
 pub(crate) mod setup;
 pub(crate) mod vcpu;
-pub(crate) mod net_config;
 pub(crate) mod virtio_blk;
 pub(crate) mod virtio_console;
 pub(crate) mod virtio_net;
@@ -532,6 +535,15 @@ impl KtstrVm {
         let (wakeup_r, wakeup_w) = nix::unistd::pipe().context("create stdin wakeup pipe")?;
 
         let kill = Arc::new(AtomicBool::new(false));
+        // Companion eventfd for `kill`. The interactive shell has no
+        // epoll consumer for it (kicks land via `pthread_kill` +
+        // `immediate_exit`), but spawn_ap_threads requires a non-None
+        // eventfd in its signature; allocate a sentinel and let it
+        // drop with the function frame.
+        let kill_evt = Arc::new(
+            vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK)
+                .context("create shell kill eventfd")?,
+        );
         // Interactive shell does not arm the failure-dump freeze
         // pipeline (no monitor thread requesting freezes). Construct
         // sentinel flags that stay false for the lifetime of the
@@ -539,6 +551,13 @@ impl KtstrVm {
         // freeze=false on every iteration and never enter the park
         // path.
         let freeze = Arc::new(AtomicBool::new(false));
+        // Interactive shell never runs the freeze coordinator, so
+        // `request_kva` stays 0 and `self_arm_watchpoint` is a no-op
+        // on every iteration. Allocated only to satisfy the
+        // spawn_ap_threads / run_bsp_loop signatures shared with the
+        // failure-dump path.
+        let watchpoint =
+            Arc::new(vcpu::WatchpointArm::new().context("create WatchpointArm.hit_evt EventFd")?);
         let bsp_parked = Arc::new(AtomicBool::new(false));
         let bsp_regs: Arc<std::sync::Mutex<Option<exit_dispatch::VcpuRegSnapshot>>> =
             Arc::new(std::sync::Mutex::new(None));
@@ -559,8 +578,14 @@ impl KtstrVm {
         // the spawn signature is honored without producing values
         // anything reads.
         let n_aps = vcpus.len();
-        let ap_tid_slots: Vec<Arc<AtomicI32>> =
-            (0..n_aps).map(|_| Arc::new(AtomicI32::new(0))).collect();
+        let ap_tid_slots: Vec<(Arc<AtomicI32>, Arc<crate::sync::Latch>)> = (0..n_aps)
+            .map(|_| {
+                (
+                    Arc::new(AtomicI32::new(0)),
+                    Arc::new(crate::sync::Latch::new()),
+                )
+            })
+            .collect();
         let (ap_threads, _ap_freeze) = self.spawn_ap_threads(
             vcpus,
             has_immediate_exit,
@@ -570,10 +595,19 @@ impl KtstrVm {
             virtio_blk.as_ref(),
             virtio_net.as_ref(),
             &kill,
+            &kill_evt,
             &freeze,
+            &watchpoint,
             &ap_pins,
             no_perf_mask,
             &ap_tid_slots,
+            // Interactive shell does not run a freeze coordinator,
+            // so no parked_evt / thaw_evt to plumb. The
+            // `vcpu_run_loop_unified` honours `freeze` only when it
+            // flips, which never happens in this path; the
+            // eventfds remain unused.
+            None,
+            None,
         )?;
 
         // BSP kick handles for the stdin escape sequence. The stdin thread
@@ -796,40 +830,99 @@ impl KtstrVm {
         // Optional dmesg thread: COM1 -> stderr in real-time.
         // Only spawned when --dmesg is active. Gives the user kernel
         // messages (including virtio probe results) alongside the shell.
-        let dmesg_thread = if self.dmesg {
+        //
+        // The thread blocks in `epoll_wait` on two fds:
+        //   * `data_evt` — bumped by `Serial::handle_out` whenever a
+        //     guest port write appends a byte to COM1's captured-output
+        //     buffer (see `Serial::install_data_evt`). Fires on every
+        //     guest-side console write.
+        //   * `dmesg_wakeup_evt` — a shutdown wakeup the BSP-cleanup
+        //     code below pulses after flipping `kill` so the thread
+        //     exits the wait promptly without sleep-polling.
+        // Replaces a 50ms sleep+poll loop on `drain_output`.
+        let (dmesg_thread, dmesg_wakeup_evt) = if self.dmesg {
+            use std::os::unix::io::AsRawFd;
+            use vmm_sys_util::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
+            use vmm_sys_util::eventfd::{EFD_NONBLOCK, EventFd};
+
+            let data_evt = com1
+                .lock()
+                .install_data_evt()
+                .context("install COM1 dmesg data eventfd")?;
+            let wakeup_evt =
+                Arc::new(EventFd::new(EFD_NONBLOCK).context("create dmesg wakeup eventfd")?);
             let com1_for_dmesg = com1.clone();
             let kill_for_dmesg = kill.clone();
-            Some(
-                std::thread::Builder::new()
-                    .name("interactive-dmesg".into())
-                    .spawn(move || {
-                        use std::io::Write;
-                        // Lock stderr per-write, not for the whole loop.
-                        // Holding the lock blocks Ctrl+A X's eprintln.
-                        loop {
-                            if kill_for_dmesg.load(Ordering::Acquire) {
+            let wakeup_for_thread = wakeup_evt.clone();
+            const DATA_TOKEN: u64 = 0;
+            const WAKEUP_TOKEN: u64 = 1;
+            let handle = std::thread::Builder::new()
+                .name("interactive-dmesg".into())
+                .spawn(move || {
+                    use std::io::Write;
+                    let epoll = match Epoll::new() {
+                        Ok(e) => e,
+                        Err(e) => {
+                            tracing::warn!(%e, "interactive-dmesg: epoll_create1 failed");
+                            return;
+                        }
+                    };
+                    if let Err(e) = epoll.ctl(
+                        ControlOperation::Add,
+                        data_evt.as_raw_fd(),
+                        EpollEvent::new(EventSet::IN, DATA_TOKEN),
+                    ) {
+                        tracing::warn!(%e, "interactive-dmesg: add data_evt to epoll");
+                        return;
+                    }
+                    if let Err(e) = epoll.ctl(
+                        ControlOperation::Add,
+                        wakeup_for_thread.as_raw_fd(),
+                        EpollEvent::new(EventSet::IN, WAKEUP_TOKEN),
+                    ) {
+                        tracing::warn!(%e, "interactive-dmesg: add wakeup to epoll");
+                        return;
+                    }
+                    let mut events = [EpollEvent::default(); 2];
+                    // Lock stderr per-write, not for the whole loop.
+                    // Holding the lock blocks Ctrl+A X's eprintln.
+                    loop {
+                        if kill_for_dmesg.load(Ordering::Acquire) {
+                            break;
+                        }
+                        match epoll.wait(-1, &mut events) {
+                            Ok(_) => {}
+                            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                            Err(e) => {
+                                tracing::warn!(%e, "interactive-dmesg: epoll_wait failed");
                                 break;
                             }
-                            std::thread::sleep(std::time::Duration::from_millis(50));
-                            let data = com1_for_dmesg.lock().drain_output();
-                            if !data.is_empty() {
-                                let mut stderr = std::io::stderr().lock();
-                                let _ = stderr.write_all(&data);
-                                let _ = stderr.flush();
-                            }
                         }
-                        // Final drain.
+                        // Drain both eventfd counters (counter mode —
+                        // a single read returns the accumulated count
+                        // and resets it; spurious EAGAIN from a racing
+                        // refill is harmless).
+                        let _ = data_evt.read();
+                        let _ = wakeup_for_thread.read();
                         let data = com1_for_dmesg.lock().drain_output();
                         if !data.is_empty() {
                             let mut stderr = std::io::stderr().lock();
                             let _ = stderr.write_all(&data);
                             let _ = stderr.flush();
                         }
-                    })
-                    .context("spawn dmesg thread")?,
-            )
+                    }
+                    // Final drain.
+                    let data = com1_for_dmesg.lock().drain_output();
+                    if !data.is_empty() {
+                        let mut stderr = std::io::stderr().lock();
+                        let _ = stderr.write_all(&data);
+                        let _ = stderr.flush();
+                    }
+                })
+                .context("spawn dmesg thread")?;
+            (Some(handle), Some(wakeup_evt))
         } else {
-            None
+            (None, None)
         };
 
         // BSP run loop (same shutdown detection as run()).
@@ -857,11 +950,20 @@ impl KtstrVm {
             virtio_net.as_ref(),
             &kill,
             &freeze,
+            &watchpoint,
             &bsp_parked,
             &bsp_regs,
             has_immediate_exit,
             start,
             interactive_timeout,
+            // Interactive shell never sets `freeze`, so the
+            // handle_freeze branch is unreachable in this path.
+            // Pass None for the wake-fd handles — the legacy
+            // park_timeout cadence is the safe-by-construction
+            // fallback.
+            None,
+            None,
+            None,
         );
 
         // Shutdown.
@@ -870,6 +972,15 @@ impl KtstrVm {
         // Wake the stdin reader so it exits poll() and can be joined.
         let _ = nix::unistd::write(&wakeup_w, &[0u8]);
         drop(wakeup_w);
+
+        // Wake the dmesg thread so it exits epoll_wait promptly and
+        // can be joined. The kill load above the loop short-circuits
+        // any pending iteration; this bump ensures the wait returns
+        // immediately rather than blocking on the next byte from the
+        // guest after teardown.
+        if let Some(ref evt) = dmesg_wakeup_evt {
+            let _ = evt.write(1);
+        }
 
         for vt in &ap_threads {
             if !vt.exited.load(Ordering::Acquire) {
@@ -886,6 +997,7 @@ impl KtstrVm {
         if let Some(dt) = dmesg_thread {
             let _ = dt.join();
         }
+        drop(dmesg_wakeup_evt);
 
         // _raw_guard drops here, restoring terminal and signal handlers.
         drop(_raw_guard);

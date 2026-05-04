@@ -85,8 +85,10 @@ enum event_type {
  * runtime cost on the success path (host side never wakes the
  * consumer until the error latch fires). When the ringbuf fills
  * before drain, `bpf_ringbuf_reserve` returns NULL and the BPF
- * handler bumps `ktstr_timeline_drops` instead of submitting —
- * dropping the newest event and surfacing the loss to userspace. */
+ * handler bumps the `KTSTR_PCPU_TIMELINE_DROPS` per-CPU slot in
+ * `ktstr_pcpu_counters` instead of submitting — dropping the
+ * newest event and surfacing the loss to userspace via the
+ * cross-CPU sum. */
 #define TL_EVT_SWITCH  1
 #define TL_EVT_MIGRATE 2
 #define TL_EVT_WAKEUP  3
@@ -108,12 +110,12 @@ enum event_type {
  *     b              = `newprio` (s32 widened to u64)
  *
  * Class transitions are tracked separately — the
- * pi_class_changes counter (ktstr_pi_class_change_count below)
- * increments whenever fexit observes `next_class != prev_class`,
- * surfacing the class-flip count without bloating the per-event
- * wire shape. A future expansion can emit a dedicated
- * TL_EVT_CLASS_TRANSITION record once the host-side renderer
- * needs per-event class tracking.
+ * pi_class_changes counter (`KTSTR_PCPU_PI_CLASS_CHANGE_COUNT`
+ * slot in `ktstr_pcpu_counters`) increments whenever fexit
+ * observes `next_class != prev_class`, surfacing the class-flip
+ * count without bloating the per-event wire shape. A future
+ * expansion can emit a dedicated TL_EVT_CLASS_TRANSITION record
+ * once the host-side renderer needs per-event class tracking.
  */
 #define TL_EVT_PI_BOOST 4
 /* Lock contention begin event from `lock:contention_begin`

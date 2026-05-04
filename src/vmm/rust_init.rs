@@ -9,6 +9,7 @@
 /// cmdline).
 use std::fs;
 use std::io::{Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -55,8 +56,13 @@ const SYSFS_SCHED_EXT_ROOT_OPS: &str = "/sys/kernel/sched_ext/root/ops";
 /// Reboot immediately. Used for fatal init errors and normal shutdown.
 fn force_reboot() -> ! {
     let _ = reboot(RebootMode::RB_AUTOBOOT);
+    // The kernel is rebooting — no event will ever fire. Park the
+    // thread forever; this is cheaper than a sleep loop because
+    // `park` blocks in the kernel without a wake-up timer attached.
+    // No `unpark` call exists in this path; the process dies when
+    // the reboot syscall completes.
     loop {
-        std::thread::sleep(std::time::Duration::from_secs(1));
+        std::thread::park();
     }
 }
 
@@ -83,11 +89,15 @@ pub(crate) fn ktstr_guest_init() -> ! {
         let _ = fs::write(COM1, &msg);
         let _ = std::io::stdout().flush();
         let _ = std::io::stderr().flush();
+        // tcdrain is synchronous on the vCPU exit: when the syscall
+        // returns in the guest, every byte is already in the host's
+        // Serial writer Vec (PIO/MMIO is committed inside KVM_RUN
+        // before userspace returns). No host-side post-drain wait
+        // is needed.
         unsafe {
             libc::tcdrain(1);
             libc::tcdrain(2);
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
         force_reboot();
     }));
 
@@ -224,7 +234,9 @@ pub(crate) fn ktstr_guest_init() -> ! {
                 libc::tcdrain(com2.as_raw_fd());
             }
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        // tcdrain is synchronous on the vCPU exit — bytes are in the
+        // host writer the moment it returns. No additional wait
+        // needed before reboot.
         force_reboot();
     }
 
@@ -293,15 +305,16 @@ pub(crate) fn ktstr_guest_init() -> ! {
             );
             let _ = std::io::stdout().flush();
             let _ = std::io::stderr().flush();
-            // Drain the tty and allow the host stdout thread time to
-            // read the virtio TX queue before reboot tears it down.
+            // tcdrain is synchronous on the vCPU exit: when these
+            // syscalls return, every byte is already in the host's
+            // serial writer Vec (or virtio-console TX path). No
+            // additional wait needed before reboot.
             unsafe {
                 libc::tcdrain(1);
             }
             unsafe {
                 libc::tcdrain(2);
             }
-            std::thread::sleep(std::time::Duration::from_millis(100));
             force_reboot();
         }
 
@@ -370,7 +383,18 @@ pub(crate) fn ktstr_guest_init() -> ! {
     let _s_phase3 = tracing::debug_span!("phase3_scheduler_start").entered();
     create_cgroup_parent_from_sched_args();
     exec_shell_script("/sched_enable");
-    let (mut sched_child, sched_log_path) = start_scheduler();
+    // Plumb the probe pipeline's `stop` + `output_done` into
+    // `start_scheduler` so the early-bail paths (Died / not
+    // attached / spawn error) can drain probe JSON to COM2 before
+    // calling `force_reboot()`. Without the drain, every path that
+    // crashes the scheduler before the test dispatches loses its
+    // probe payload to the reboot — exactly the diagnostic the
+    // probes were attached to capture.
+    let probe_drain = probe_phase_a.as_ref().map(|pa| ProbeDrain {
+        stop: pa.pipeline.stop.clone(),
+        output_done: pa.pipeline.output_done.clone(),
+    });
+    let (mut sched_child, sched_log_path) = start_scheduler(probe_drain);
     drop(_s_phase3);
 
     // Phase 4: SHM polling + trace pipe (background threads).
@@ -391,10 +415,14 @@ pub(crate) fn ktstr_guest_init() -> ! {
     // When probes are active, suppress COM2 log dump to avoid
     // interleaving with probe JSON output on the same serial port.
     let suppress_com2 = Arc::new(AtomicBool::new(probes_active));
+    let probe_output_done = probe_phase_a
+        .as_ref()
+        .map(|pa| pa.pipeline.output_done.clone());
     let sched_exit_stop = start_sched_exit_monitor(
         sched_child.as_ref().map(|c| c.id()),
         sched_log_path.as_deref(),
         suppress_com2,
+        probe_output_done,
     );
 
     // Phase 5: Dispatch.
@@ -493,13 +521,14 @@ pub(crate) fn ktstr_guest_init() -> ! {
     ));
 
     // Drain COM2 UART after writing the exit sentinel.
+    // tcdrain is synchronous on the vCPU exit: when it returns,
+    // every byte is already in the host's COM2 writer Vec.
     if let Ok(com2) = fs::OpenOptions::new().write(true).open(COM2) {
         use std::os::unix::io::AsRawFd;
         unsafe {
             libc::tcdrain(com2.as_raw_fd());
         }
     }
-    std::thread::sleep(std::time::Duration::from_millis(100));
 
     force_reboot()
 }
@@ -1255,6 +1284,28 @@ fn poll_scx_attached(
 ) -> ScxAttachStatus {
     let start = std::time::Instant::now();
     let mut ever_read_ok = false;
+    // Try to open the attribute fd once and use poll(POLLPRI) for
+    // sysfs/kernfs notifications. kernfs supports POLLPRI on
+    // attribute-content changes via `sysfs_notify` (kernel/fs/kernfs/file.c
+    // `kernfs_fop_poll`). The kernel-side `scx_alloc_and_add_sched`
+    // path doesn't currently emit `sysfs_notify` for this attribute,
+    // but if the kernel ever adds it (or a future patch introduces
+    // the call), we get instant wakeup; without it we fall back to
+    // the unconditional sleep cadence below — same behaviour as
+    // before, with the upper bound on detection latency unchanged.
+    //
+    // sysfs/kernfs does not reliably emit inotify/epoll events for
+    // attribute content changes — the producer (kernel callsite)
+    // must explicitly call `sysfs_notify`. Polling at `interval`
+    // cadence is the supported mechanism for attributes whose
+    // producer doesn't notify, so the fallback is mandatory.
+    let attr_fd = unsafe {
+        libc::open(
+            c"/sys/kernel/sched_ext/root/ops".as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC,
+        )
+    };
+    let interval_ms_clamped = interval.as_millis().min(i32::MAX as u128) as i32;
     loop {
         // The kernel populates `sch->ops.name` before the kobject is
         // added, so the file becomes readable and non-empty the
@@ -1266,6 +1317,13 @@ fn poll_scx_attached(
             Ok(contents) => {
                 ever_read_ok = true;
                 if !contents.trim().is_empty() {
+                    if attr_fd >= 0 {
+                        // SAFETY: attr_fd opened above by this
+                        // function; not used after close.
+                        unsafe {
+                            libc::close(attr_fd);
+                        }
+                    }
                     return ScxAttachStatus::Attached;
                 }
             }
@@ -1275,50 +1333,183 @@ fn poll_scx_attached(
                 // at least one success flipped the flag.
             }
         }
-        if start.elapsed() >= timeout {
+        let now = std::time::Instant::now();
+        if now.duration_since(start) >= timeout {
+            if attr_fd >= 0 {
+                // SAFETY: attr_fd opened above by this function;
+                // not used after close.
+                unsafe {
+                    libc::close(attr_fd);
+                }
+            }
             return if ever_read_ok {
                 ScxAttachStatus::Timeout
             } else {
                 ScxAttachStatus::SysfsAbsent
             };
         }
-        std::thread::sleep(interval);
-    }
-}
-
-/// Poll a freshly-spawned child at `interval` cadence for up to
-/// `timeout`. Returns as soon as the child exits (detecting early
-/// failure faster than a single `sleep(timeout)`) or when the window
-/// closes with the child still running.
-///
-/// Replaces an unconditional `sleep(1s)` — most healthy schedulers
-/// stay up indefinitely, so the poll never shortens the happy path,
-/// but an instant-death case now surfaces within one interval
-/// instead of a full second.
-fn poll_startup(
-    child: &mut Child,
-    interval: std::time::Duration,
-    timeout: std::time::Duration,
-) -> StartupStatus {
-    let start = std::time::Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return StartupStatus::Died,
-            Ok(None) => {
-                if start.elapsed() >= timeout {
-                    return StartupStatus::Alive;
-                }
-                std::thread::sleep(interval);
-            }
-            Err(e) => return StartupStatus::WaitError(e),
+        let remaining_ms = (start + timeout - now)
+            .as_millis()
+            .min(interval_ms_clamped as u128) as i32;
+        if attr_fd >= 0 {
+            // poll(POLLPRI) is the kernfs notification mechanism
+            // for attribute content changes. Cap the wait at the
+            // requested polling interval so we never exceed the
+            // caller's responsiveness contract — kernfs may not
+            // emit POLLPRI for this attribute (the kernel-side
+            // callsite must explicitly call `sysfs_notify`), in
+            // which case poll returns 0 at `interval_ms_clamped`
+            // and we re-read.
+            //
+            // sysfs/kernfs does not reliably emit inotify/epoll
+            // events for attribute content changes; this poll is
+            // the supported mechanism per `kernfs_fop_poll` plus
+            // the read-fallback that catches changes the producer
+            // didn't notify on.
+            let mut pfd = libc::pollfd {
+                fd: attr_fd,
+                events: libc::POLLPRI,
+                revents: 0,
+            };
+            // SAFETY: pfd is a single-element pollfd; nfds is 1.
+            // Return value not consulted — the loop re-reads the
+            // file each iteration regardless of poll outcome.
+            let _ = unsafe { libc::poll(&mut pfd, 1, remaining_ms) };
+        } else {
+            // Open failed (e.g. attribute not present yet). Sleep
+            // the polling cadence — sysfs does not provide an
+            // event source for "attribute appears", so we have to
+            // re-attempt the open via `read_to_string` at the
+            // interval the caller requested.
+            //
+            // sysfs/kernfs does not provide an event source for
+            // attribute appearance; polling is the supported
+            // mechanism.
+            std::thread::sleep(std::time::Duration::from_millis(remaining_ms.max(0) as u64));
         }
     }
 }
 
+/// Block on `pidfd` becoming readable for up to `timeout`. Returns
+/// as soon as the child exits (pidfd POLLIN edge fires
+/// microseconds after the kernel reaps), or when the deadline
+/// elapses with the child still alive.
+///
+/// Replaces a 50 ms sleep-and-`try_wait` loop. `pidfd_open` has been
+/// available since kernel 5.3 (2019); ktstr targets 6.16+ where it
+/// is unconditionally present. The interval parameter is unused
+/// here because `poll(2)` blocks until the fd becomes readable or
+/// the absolute deadline elapses — there is nothing to "poll
+/// faster" inside the wait. The deadline is enforced via
+/// `Instant::now()` re-checks across loop iterations because
+/// `poll(2)` may return EINTR (e.g. SIGCHLD coalescing); the outer
+/// re-check rebuilds the remaining timeout against the absolute
+/// deadline.
+fn poll_startup(
+    child: &mut Child,
+    _interval: std::time::Duration,
+    timeout: std::time::Duration,
+) -> StartupStatus {
+    // SAFETY: `pidfd_open(2)` accepts any process the caller can
+    // signal. We just spawned `child`; its pid is owned by this
+    // process, so the syscall is safe to issue with no other
+    // synchronisation. Failure (rare — e.g. very tight pid reuse,
+    // sandbox restriction) falls back to `try_wait` which is
+    // identical to the original poll behaviour.
+    let pidfd = unsafe {
+        libc::syscall(libc::SYS_pidfd_open, child.id() as libc::c_int, 0u32) as libc::c_int
+    };
+    if pidfd < 0 {
+        // pidfd_open unsupported on this kernel — try_wait once
+        // synchronously and report Alive; subsequent observation
+        // of an instantly-dead scheduler still reaches the host
+        // via the start_sched_exit_monitor pidfd path.
+        return match child.try_wait() {
+            Ok(Some(_)) => StartupStatus::Died,
+            Ok(None) => StartupStatus::Alive,
+            Err(e) => StartupStatus::WaitError(e),
+        };
+    }
+    let start = std::time::Instant::now();
+    let result = loop {
+        let now = std::time::Instant::now();
+        if now >= start + timeout {
+            break match child.try_wait() {
+                Ok(Some(_)) => StartupStatus::Died,
+                Ok(None) => StartupStatus::Alive,
+                Err(e) => StartupStatus::WaitError(e),
+            };
+        }
+        let remaining_ms = (start + timeout - now).as_millis().min(i32::MAX as u128) as i32;
+        let mut pfd = libc::pollfd {
+            fd: pidfd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `pfd` is a single-element pollfd; nfds is 1.
+        // Every poll outcome (ready, timeout, EINTR, error) loops
+        // back to the deadline check above, which rebuilds
+        // `remaining_ms` against the absolute start+timeout so
+        // EINTR cannot extend the wait past the requested
+        // duration.
+        let rc = unsafe { libc::poll(&mut pfd, 1, remaining_ms) };
+        if rc > 0 && pfd.revents & libc::POLLIN != 0 {
+            break match child.try_wait() {
+                Ok(Some(_)) => StartupStatus::Died,
+                Ok(None) => StartupStatus::Alive,
+                Err(e) => StartupStatus::WaitError(e),
+            };
+        }
+        // rc == 0 (timeout) or rc < 0 (EINTR/error) re-checks the
+        // deadline at the top of the loop. EINTR with remaining
+        // budget loops once more; deadline-exhausted falls into
+        // the elapsed branch above.
+    };
+    // SAFETY: pidfd is owned by this function and not used after
+    // close.
+    unsafe {
+        libc::close(pidfd);
+    }
+    result
+}
+
+/// Probe-pipeline drain handles passed to [`start_scheduler`] so the
+/// early-bail paths (scheduler Died, not Attached, spawn Err) can
+/// flush probe output to COM2 before calling `force_reboot()`. The
+/// success path's drain runs in [`start_sched_exit_monitor`]
+/// instead — it sees the scheduler exit notification and waits on
+/// `output_done` there.
+struct ProbeDrain {
+    /// Probe-thread stop request. Setting this wakes the probe
+    /// thread out of its ring-buffer poll loop; the thread then
+    /// emits its payload and sets `output_done`.
+    stop: Arc<AtomicBool>,
+    /// One-shot signal: set by the probe thread after writing
+    /// `PROBE_PAYLOAD_END` to COM2. Waited on event-driven; the
+    /// outer VM wall-clock timeout is the only safety net for a
+    /// hung probe (per the queue-management policy: don't add
+    /// arbitrary local timeouts when an event source exists).
+    output_done: Arc<crate::sync::Latch>,
+}
+
+/// Drain the probe pipeline: signal stop, then block on
+/// `output_done`. Called from each early-bail path in
+/// [`start_scheduler`] before `force_reboot()` so the probe
+/// payload (or the diagnostic-only payload the probe thread emits
+/// on a forced stop) reaches COM2's host-side capture buffer.
+///
+/// `drain` is `None` when no probe stack was supplied — every
+/// caller is a no-op in that case.
+fn drain_probe_pipeline(drain: Option<&ProbeDrain>) {
+    let Some(d) = drain else { return };
+    d.stop.store(true, Ordering::Release);
+    d.output_done.wait();
+}
+
 /// Start the scheduler binary if it exists. Returns the child process
 /// and the path to its log file.
-#[tracing::instrument]
-fn start_scheduler() -> (Option<Child>, Option<String>) {
+#[tracing::instrument(skip(probe_drain))]
+fn start_scheduler(probe_drain: Option<ProbeDrain>) -> (Option<Child>, Option<String>) {
     if !Path::new("/scheduler").exists() {
         return (None, None);
     }
@@ -1384,6 +1575,10 @@ fn start_scheduler() -> (Option<Child>, Option<String>) {
                         "{prefix}1",
                         prefix = crate::test_support::SENTINEL_EXIT_PREFIX,
                     ));
+                    // Drain the probe pipeline so PROBE_OUTPUT_END
+                    // hits COM2 before force_reboot rips the VM.
+                    // No-op when no probe stack was supplied.
+                    drain_probe_pipeline(probe_drain.as_ref());
                     force_reboot();
                 }
                 StartupStatus::Alive => {
@@ -1417,6 +1612,9 @@ fn start_scheduler() -> (Option<Child>, Option<String>) {
                             "{prefix}1",
                             prefix = crate::test_support::SENTINEL_EXIT_PREFIX,
                         ));
+                        // Drain the probe pipeline before reboot —
+                        // see Died-arm comment.
+                        drain_probe_pipeline(probe_drain.as_ref());
                         force_reboot();
                     }
                     (Some(child), Some(log_path.to_string()))
@@ -1437,6 +1635,9 @@ fn start_scheduler() -> (Option<Child>, Option<String>) {
                 "{prefix}1",
                 prefix = crate::test_support::SENTINEL_EXIT_PREFIX,
             ));
+            // Drain the probe pipeline before reboot — see
+            // Died-arm comment.
+            drain_probe_pipeline(probe_drain.as_ref());
             force_reboot();
         }
     }
@@ -1585,13 +1786,27 @@ fn start_shm_poll(trace_stop: Option<Arc<AtomicBool>>) -> Option<Arc<AtomicBool>
     Some(stop)
 }
 
-/// Poll /dev/mem for dump and stall request bytes.
+/// Poll /dev/mem for dump request bytes.
 /// Maps the full SHM region so signal slots are accessible via
 /// `shm_ring::init_shm_ptr`.
 ///
 /// On graceful shutdown (SIGNAL_SHUTDOWN_REQ), sets `trace_stop` and
 /// disables tracing so the trace_pipe reader drains all buffered data
 /// before exiting.
+///
+/// Wake source: opens `/dev/hvc0` non-blocking (`O_NONBLOCK`) and
+/// `poll()`s the fd with `POLLIN` at a 1000 ms safety timeout. The
+/// host pushes a byte via `VirtioConsole::queue_input` whenever it
+/// writes a SHM control byte (`DUMP_REQ`, signal slot 0
+/// `SIGNAL_SHUTDOWN_REQ`); the poll wakes within microseconds of
+/// that push, drains the byte, and re-checks SHM. The 1 s timeout
+/// bounds teardown observation of the external `stop` flag —
+/// sufficient because graceful shutdown also pushes a wake byte via
+/// virtio-console, and `kill` / teardown cases tolerate sub-second
+/// latency. The `STALL_REQ` byte at `STALL_REQ_OFFSET` is also
+/// re-checked on every wake but has no production host-side writer
+/// in this codebase; it is a debugging affordance for out-of-band
+/// SHM pokes.
 fn shm_poll_loop(shm_base: u64, shm_size: u64, stop: &AtomicBool, trace_stop: Option<&AtomicBool>) {
     use std::os::unix::io::AsRawFd;
 
@@ -1626,6 +1841,24 @@ fn shm_poll_loop(shm_base: u64, shm_size: u64, stop: &AtomicBool, trace_stop: Op
 
     let dump_offset = crate::vmm::shm_ring::DUMP_REQ_OFFSET;
     let stall_offset = crate::vmm::shm_ring::STALL_REQ_OFFSET;
+
+    // Open `/dev/hvc0` for non-blocking reads via `O_NONBLOCK` +
+    // `poll(POLLIN)`. The host pushes a byte via
+    // `VirtioConsole::queue_input` whenever it writes a SHM
+    // control byte (`DUMP_REQ`, signal slot 0
+    // `SIGNAL_SHUTDOWN_REQ`); the poll wakes within microseconds
+    // of that push. The 1000 ms safety timeout bounds teardown
+    // observation of the `stop` flag. `expect()` panics if the
+    // device is missing — `ktstr.kconfig` mandates
+    // `CONFIG_VIRTIO_CONSOLE=y` so the kernel is required to expose
+    // `/dev/hvc0`; an absent device here would mean a broken kernel
+    // build, not a runtime fallback condition.
+    let hvc0 = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(HVC0)
+        .expect("ktstr.kconfig requires CONFIG_VIRTIO_CONSOLE=y; /dev/hvc0 must exist");
+    let poll_timeout_ms: PollTimeout = 1000u16.into();
 
     while !stop.load(Ordering::Acquire) {
         unsafe {
@@ -1664,7 +1897,24 @@ fn shm_poll_loop(shm_base: u64, shm_size: u64, stop: &AtomicBool, trace_stop: Op
             break;
         }
 
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        // Wake source: `poll()` on `/dev/hvc0` with a 1000 ms
+        // safety timeout. The host pushes a byte into virtio-console
+        // RX after every SHM control-byte write (`DUMP_REQ`,
+        // `SIGNAL_SHUTDOWN_REQ`); this thread wakes within
+        // microseconds of the push, drains the byte (so the next
+        // iteration's poll re-arms cleanly), and re-checks SHM. The
+        // byte VALUE is not inspected — any byte forces the SHM
+        // re-read above. `STALL_REQ` is also re-checked but has no
+        // production host-side writer (debug-only).
+        let borrowed = unsafe { BorrowedFd::borrow_raw(hvc0.as_raw_fd()) };
+        let mut fds = [PollFd::new(borrowed, PollFlags::POLLIN)];
+        match poll(&mut fds, poll_timeout_ms) {
+            Ok(_) | Err(nix::errno::Errno::EINTR) => {}
+            Err(_) => break,
+        }
+        let mut buf = [0u8; 16];
+        let mut hvc_ref: &fs::File = &hvc0;
+        let _ = hvc_ref.read(&mut buf);
     }
 
     // Do NOT munmap here. SHM_PTR (OnceLock) retains the mmap pointer
@@ -1692,6 +1942,7 @@ fn start_sched_exit_monitor(
     sched_pid: Option<u32>,
     log_path: Option<&str>,
     suppress_com2: Arc<AtomicBool>,
+    probe_output_done: Option<Arc<crate::sync::Latch>>,
 ) -> Option<Arc<AtomicBool>> {
     let pid = sched_pid?;
     let proc_path = format!("/proc/{pid}");
@@ -1702,30 +1953,101 @@ fn start_sched_exit_monitor(
     std::thread::Builder::new()
         .name("sched-exit-mon".into())
         .spawn(move || {
+            // pidfd_open lets us block on SIGCHLD-equivalent
+            // notification for the scheduler process exit instead
+            // of polling /proc/{pid} on a sleep cadence.
+            // SAFETY: pid is the scheduler's stable pid for the
+            // run; pidfd_open(2) accepts any process the caller
+            // can signal (we are pid 1). pidfd_open has been
+            // available since kernel 5.3 (2019); ktstr targets
+            // 6.16+ where it is unconditionally present, so the
+            // procfs fallback is dead code. A failure here means
+            // the kernel rejected the syscall entirely (sandbox /
+            // seccomp filter); abort the monitor rather than
+            // fabricate a polling fallback that hides the
+            // configuration error.
+            let pidfd = unsafe {
+                libc::syscall(libc::SYS_pidfd_open, pid as libc::c_int, 0u32) as libc::c_int
+            };
+            if pidfd < 0 {
+                eprintln!(
+                    "ktstr-init: pidfd_open failed for sched pid {pid}: {} \
+                     — sched exit monitor disabled",
+                    std::io::Error::last_os_error(),
+                );
+                return;
+            }
             while !stop_clone.load(Ordering::Acquire) {
-                if !Path::new(&proc_path).exists() {
-                    // Scheduler process is gone.
+                let exited = {
+                    // pidfd is readable when the process exits.
+                    // Block on poll(POLLIN) so we wake within
+                    // microseconds of exit. Re-check stop every
+                    // 250 ms via timeout so a stop request
+                    // arriving while the scheduler is alive still
+                    // unblocks the loop quickly.
                     //
-                    // When probes are active (repro VM), suppress
-                    // both the SHM signal and COM2 dump. The SHM
-                    // MSG_TYPE_SCHED_EXIT tells the host to kill
-                    // the VM early — but the probe thread needs
-                    // time to read probe_data and emit JSON. The
-                    // probe pipeline handles crash detection via
-                    // tp_btf/sched_ext_exit instead.
-                    if !suppress_com2.load(Ordering::Acquire) {
-                        let exit_code: i32 = 1;
-                        crate::vmm::shm_ring::write_msg(
-                            crate::vmm::shm_ring::MSG_TYPE_SCHED_EXIT,
-                            &exit_code.to_ne_bytes(),
-                        );
-                        if let Some(ref path) = log_path {
-                            dump_sched_output(path);
+                    // 250 ms timeout: pidfd POLLIN fires at exit
+                    // time; the timeout exists only as the
+                    // upper-bound cadence at which the loop
+                    // re-checks `stop` (no event-source yet for
+                    // stop on this thread). Re-checking proc_path
+                    // is a belt-and-suspenders against the rare
+                    // "pidfd was opened but the kernel reaped
+                    // before we entered poll" race.
+                    let mut pfd = libc::pollfd {
+                        fd: pidfd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    // SAFETY: pfd is a single-element pollfd; nfds
+                    // is 1. Return value not consulted — the loop
+                    // re-checks the stop flag and the proc path
+                    // each iteration regardless.
+                    let _ = unsafe { libc::poll(&mut pfd, 1, 250) };
+                    !Path::new(&proc_path).exists()
+                };
+                if exited {
+                    if suppress_com2.load(Ordering::Acquire) {
+                        // Probes active: wait event-driven on the
+                        // probe thread's `output_done` latch.
+                        // Outer wall-clock VM timeout is the
+                        // safety net for a hung probe — adding a
+                        // local timer would cap teardown latency
+                        // but also truncate slow-but-progressing
+                        // probe drains, which is the exact bug
+                        // we're avoiding here.
+                        if let Some(ref done) = probe_output_done {
+                            done.wait();
                         }
+                    } else if let Some(ref path) = log_path {
+                        dump_sched_output(path);
+                    }
+                    // Signal SCHED_EXIT after the optional probe
+                    // drain (above) and the optional COM2 dump.
+                    // The host kills the VM on SCHED_EXIT, so
+                    // issuing it AFTER the probe pipeline finishes
+                    // ensures probe JSON has hit COM2 before
+                    // teardown. The probe thread sets
+                    // `output_done` only after writing
+                    // PROBE_PAYLOAD_END, so a successful wait
+                    // guarantees the marker has landed in COM2's
+                    // host-side capture buffer.
+                    let exit_code: i32 = 1;
+                    crate::vmm::shm_ring::write_msg(
+                        crate::vmm::shm_ring::MSG_TYPE_SCHED_EXIT,
+                        &exit_code.to_ne_bytes(),
+                    );
+                    // SAFETY: pidfd is owned by this thread
+                    // and is no longer used after close.
+                    unsafe {
+                        libc::close(pidfd);
                     }
                     return;
                 }
-                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            // SAFETY: same as above — close on exit path.
+            unsafe {
+                libc::close(pidfd);
             }
         })
         .ok();

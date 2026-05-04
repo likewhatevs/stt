@@ -1441,13 +1441,17 @@ mod tests {
         .expect("create_fdt with has_pmu=false must still produce a valid DTB");
         let props = parse_dtb_props(&dtb);
 
-        let pmu_compat = props.iter().find(|(n, p, _)| n == "pmu" && p == "compatible");
+        let pmu_compat = props
+            .iter()
+            .find(|(n, p, _)| n == "pmu" && p == "compatible");
         assert!(
             pmu_compat.is_none(),
             "pmu node must be absent when has_pmu=false; found compatible={:?}",
             pmu_compat,
         );
-        let pmu_intr = props.iter().find(|(n, p, _)| n == "pmu" && p == "interrupts");
+        let pmu_intr = props
+            .iter()
+            .find(|(n, p, _)| n == "pmu" && p == "interrupts");
         assert!(
             pmu_intr.is_none(),
             "pmu interrupts property must be absent when has_pmu=false; found={:?}",

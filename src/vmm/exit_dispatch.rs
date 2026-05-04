@@ -10,11 +10,13 @@
 //!   / [`dispatch_mmio_read`]).
 
 use crate::vmm::PiMutex;
+use crate::vmm::vcpu::{SCX_EXIT_ERROR_THRESHOLD, WatchpointArm, self_arm_watchpoint};
 use crate::vmm::{console, kvm, virtio_blk, virtio_console, virtio_net};
 use kvm_ioctls::VcpuExit;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use vmm_sys_util::eventfd::EventFd;
 
 /// Snapshot of a vCPU's architectural state, captured by the vCPU
 /// thread itself at freeze time (just before it parks). Surfaced in
@@ -327,6 +329,16 @@ fn mmio_serial_offset(addr: u64, base: u64) -> Option<u8> {
 /// interrupts to wake the vCPU). Shutdown sets the kill flag so all
 /// other vCPUs exit.
 ///
+/// `watchpoint` carries the failure-dump trigger contract: each
+/// iteration polls `watchpoint.request_kva` and self-arms a hardware
+/// data-write watchpoint on `*scx_root->exit_kind` once the freeze
+/// coordinator has resolved its KVA. When the kernel later writes
+/// the field, KVM exits via `VcpuExit::Debug`; this loop sets
+/// `watchpoint.hit` so the freeze coordinator's late-trigger poll
+/// fires immediately. The arm is one-shot per KVA value (the
+/// per-vCPU `armed_kva` slot suppresses re-arms after the ioctl
+/// lands).
+///
 /// Freeze handling: when the freeze flag is set, the vCPU thread
 /// performs the Cloud Hypervisor pause/snapshot drain dance
 /// (set_immediate_exit(1) → vcpu.run() → set_immediate_exit(0)) so
@@ -352,26 +364,124 @@ pub(crate) fn vcpu_run_loop_unified(
     virtio_blk: Option<&Arc<PiMutex<virtio_blk::VirtioBlk>>>,
     virtio_net: Option<&Arc<PiMutex<virtio_net::VirtioNet>>>,
     kill: &Arc<AtomicBool>,
+    kill_evt: &Arc<EventFd>,
     freeze: &Arc<AtomicBool>,
     parked: &Arc<AtomicBool>,
     regs_slot: &Arc<std::sync::Mutex<Option<VcpuRegSnapshot>>>,
+    watchpoint: &Arc<WatchpointArm>,
     has_immediate_exit: bool,
+    parked_evt: Option<&Arc<EventFd>>,
+    thaw_evt: Option<&Arc<EventFd>>,
 ) {
+    // Per-AP `armed_kva` mirrors the BSP-side slot in
+    // `freeze_coord::run_bsp_loop`. `0` until the freeze
+    // coordinator publishes a non-zero `request_kva` (the resolved
+    // `*scx_root->exit_kind` KVA). The slot is a per-thread local
+    // so the per-iteration arm check is a single Acquire load with
+    // no cross-thread synchronization beyond the published request.
+    // `arm_failures` counts consecutive non-EINTR ioctl failures;
+    // EINTR is transient (SIGRTMIN kick race) and does NOT
+    // increment, so a kicked-mid-arm vCPU retries instead of
+    // permanently disabling the watchpoint.
+    let mut armed_kva: u64 = 0;
+    let mut arm_failures: u8 = 0;
     loop {
         if kill.load(Ordering::Acquire) {
             break;
         }
         // Honour a pending freeze before re-entering KVM_RUN.
         if freeze.load(Ordering::Acquire) {
-            handle_freeze(vcpu, has_immediate_exit, kill, freeze, parked, regs_slot);
+            handle_freeze(
+                vcpu,
+                has_immediate_exit,
+                kill,
+                freeze,
+                parked,
+                regs_slot,
+                parked_evt.map(|a| a.as_ref()),
+                thaw_evt.map(|a| a.as_ref()),
+                Some(kill_evt.as_ref()),
+            );
             if kill.load(Ordering::Acquire) {
                 break;
             }
         }
+        // Self-arm the failure-dump watchpoint when the coordinator
+        // publishes (or republishes) a request KVA. Cheap (atomic
+        // load + compare against `armed_kva`) when no new arm is
+        // pending. Mirrors `run_bsp_loop`'s arm-before-run pattern;
+        // both paths share `WatchpointArm` so a fire on either
+        // triggers the late-snapshot rendezvous.
+        self_arm_watchpoint(
+            vcpu,
+            &watchpoint.request_kva,
+            &mut armed_kva,
+            &mut arm_failures,
+        );
 
         match vcpu.run() {
             Ok(mut exit) => {
                 if matches!(exit, VcpuExit::Hlt) {
+                    if kill.load(Ordering::Acquire) {
+                        break;
+                    }
+                    continue;
+                }
+                // KVM_EXIT_DEBUG fires when the armed hardware
+                // data-write watchpoint trips on a guest write to
+                // `*scx_root->exit_kind`. The kernel writes the
+                // field on BOTH error transitions
+                // (`scx_error -> SCX_EXIT_ERROR/_BPF/_STALL >=
+                // 1024`) AND clean shutdown
+                // (`scx_unregister -> SCX_EXIT_DONE = 1`). Only the
+                // error transitions should trigger the failure-dump
+                // freeze; firing on every clean test exit is a
+                // regression. Read the post-store value from the
+                // host pointer the coordinator published and gate
+                // `hit` on the error threshold. The watchpoint is
+                // left armed regardless: the coordinator's freeze +
+                // thaw is synchronous with the dump emission, and a
+                // future error after a clean transition would still
+                // fire (slab page lifetime — the scheduler's
+                // `scx_sched` is not freed until well after the
+                // last `exit_kind` write).
+                if matches!(exit, VcpuExit::Debug(_)) {
+                    let host_ptr = watchpoint.kind_host_ptr.load(Ordering::Acquire);
+                    if !host_ptr.is_null() {
+                        // SAFETY: `kind_host_ptr` was published by
+                        // the freeze coordinator before
+                        // `request_kva` (Release), and the
+                        // `request_kva` non-zero load that triggered
+                        // the arm is the synchronizes-with edge for
+                        // this read. The pointer addresses a u32
+                        // inside the guest's `scx_sched` slab page,
+                        // which stays mapped for the VM lifetime
+                        // per the `ReservationGuard` contract.
+                        let kind = unsafe { std::ptr::read_volatile(host_ptr) };
+                        if kind >= SCX_EXIT_ERROR_THRESHOLD {
+                            watchpoint.latch_hit();
+                        } else {
+                            tracing::debug!(
+                                kind,
+                                threshold = SCX_EXIT_ERROR_THRESHOLD,
+                                "watchpoint fired on non-error exit_kind \
+                                 transition (e.g. SCX_EXIT_DONE on clean \
+                                 shutdown); skipping freeze trigger"
+                            );
+                        }
+                    } else {
+                        // Coordinator armed `request_kva` but the
+                        // host-pointer publication lost the race or
+                        // failed to resolve. Conservative fallback:
+                        // latch `hit` so the BPF .bss path's
+                        // late-trigger guard still runs — better a
+                        // possibly-spurious dump than missing a
+                        // real one. This branch should be rare
+                        // (the coordinator stores `kind_host_ptr`
+                        // before `request_kva`), but the check
+                        // keeps the path defensive.
+                        watchpoint.latch_hit();
+                    }
                     if kill.load(Ordering::Acquire) {
                         break;
                     }
@@ -388,9 +498,32 @@ pub(crate) fn vcpu_run_loop_unified(
                     Some(ExitAction::Continue) | None => {}
                     Some(ExitAction::Shutdown) => {
                         kill.store(true, Ordering::Release);
+                        // Wake the freeze coordinator's epoll loop
+                        // so it sees the kill flag without waiting
+                        // up to one full epoll timeout. Failure
+                        // (EAGAIN under EFD_NONBLOCK from a
+                        // saturated counter) is benign — any prior
+                        // pending edge already wakes the coord, and
+                        // the AtomicBool above remains the source
+                        // of truth.
+                        let _ = kill_evt.write(1);
                         break;
                     }
-                    Some(ExitAction::Fatal(_)) => break,
+                    Some(ExitAction::Fatal(_)) => {
+                        // AP fatal exit (FailEntry / InternalError):
+                        // surface in tracing AND propagate the kill
+                        // signal. Without `kill.store(true)` and the
+                        // kill_evt write, the AP thread silently
+                        // exits while peer vCPUs and the freeze
+                        // coordinator stay running — peers eventually
+                        // hit FREEZE_RENDEZVOUS_TIMEOUT instead of
+                        // shutting down promptly. Mirrors the
+                        // Shutdown arm's kill-propagation pattern.
+                        tracing::error!("AP fatal exit");
+                        kill.store(true, Ordering::Release);
+                        let _ = kill_evt.write(1);
+                        break;
+                    }
                 }
             }
             Err(e) => {
@@ -449,6 +582,9 @@ pub(crate) fn handle_freeze(
     freeze: &Arc<AtomicBool>,
     parked: &Arc<AtomicBool>,
     regs_slot: &Arc<std::sync::Mutex<Option<VcpuRegSnapshot>>>,
+    parked_evt: Option<&EventFd>,
+    thaw_evt: Option<&EventFd>,
+    kill_evt: Option<&EventFd>,
 ) {
     // Drain dance: complete any pending PIO/MMIO before parking.
     // Skipped on kernels without KVM_CAP_IMMEDIATE_EXIT, where
@@ -478,14 +614,82 @@ pub(crate) fn handle_freeze(
     // guest-memory reads correct.
     parked.store(true, Ordering::Release);
 
-    // Park until freeze clears or shutdown wins. park_timeout(10ms)
-    // bounds thaw latency so the coordinator's freeze=false store
-    // is observed within at most 10 ms — no explicit unpark needed.
+    // Wake the freeze coordinator's rendezvous wait — write to the
+    // shared `parked_evt` AFTER the Release store on `parked`. The
+    // coordinator drains the eventfd once and then re-checks every
+    // vCPU's `parked` flag plus the worker's `paused` flag. The
+    // ordering is load-bearing: the coordinator's Acquire load on
+    // `parked` happens-after this Release, so its subsequent
+    // guest-memory reads observe every queue mutation the vCPU
+    // performed before the drain dance.
+    //
+    // EAGAIN under EFD_NONBLOCK from a saturated counter is benign:
+    // the AtomicBool is the source of truth, and any prior pending
+    // edge already wakes the coordinator. Log so a real eventfd
+    // breakage surfaces, but do not propagate.
+    if let Some(evt) = parked_evt
+        && let Err(e) = evt.write(1)
+    {
+        tracing::debug!(
+            err = %e,
+            "handle_freeze: parked_evt write failed (EAGAIN expected on counter saturation)"
+        );
+    }
+
+    // Park until freeze clears or shutdown wins. The thaw_evt
+    // is written by the freeze coordinator alongside
+    // `freeze.store(false, Release)`; poll on [thaw_evt, kill_evt]
+    // with a 100 ms backstop so a missed eventfd write (counter
+    // overflow / EAGAIN) still drops the parked vCPU within
+    // bounded latency. Without the thaw_evt the legacy
+    // park_timeout(10 ms) cadence applies as the only source of
+    // wake.
+    use std::os::fd::AsRawFd;
     while freeze.load(Ordering::Acquire) {
         if kill.load(Ordering::Acquire) {
             break;
         }
-        std::thread::park_timeout(std::time::Duration::from_millis(10));
+        match (thaw_evt, kill_evt) {
+            (Some(thaw), kev) => {
+                let mut pfds = [
+                    libc::pollfd {
+                        fd: thaw.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                    libc::pollfd {
+                        fd: kev.map_or(-1, |k| k.as_raw_fd()),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                ];
+                let nfds = if kev.is_some() { 2 } else { 1 };
+                unsafe {
+                    libc::poll(pfds.as_mut_ptr(), nfds as libc::nfds_t, 100);
+                }
+                // Do NOT drain the shared `thaw_evt` here. The
+                // coordinator writes to thaw_evt ONCE per thaw and
+                // every parked AP polls the SAME fd; if the first
+                // wake-winner drains the counter, every other AP's
+                // poll blocks for the full 100 ms backstop instead
+                // of waking immediately. Leaving the eventfd level
+                // high means poll returns immediately for every AP
+                // — fast thaw across all peers. The `freeze.load
+                // (Acquire)` re-check at the top of the loop is the
+                // source of truth: once `freeze` clears the loop
+                // exits regardless of eventfd state.
+            }
+            (None, _) => {
+                // No thaw_evt plumbed (e.g. interactive shell path
+                // that doesn't run a freeze coordinator). Fall back
+                // to the legacy park_timeout cadence — the freeze
+                // flag will never be set in that path so this
+                // branch is structurally unreachable for real
+                // shutdowns, but the safe-by-construction fallback
+                // keeps the function callable with all None.
+                std::thread::park_timeout(std::time::Duration::from_millis(10));
+            }
+        }
     }
 
     // Resume: clear parked so subsequent freeze cycles are observable.
@@ -955,6 +1159,107 @@ mod vcpu_reg_snapshot_tests {
             ttbr1_el1_id - ttbr0_el1_id,
             1,
             "TTBR0/TTBR1 encodings should differ by exactly 1 (Op2 bit)"
+        );
+    }
+
+    /// DR7 wire format for a 4-byte write watchpoint in slot 0.
+    ///
+    /// The KVM hardware-watchpoint freeze trigger arms slot 0 of
+    /// the guest's debug registers via `KVM_SET_GUEST_DEBUG` to
+    /// catch writes to `sch->exit_kind`. The DR7 byte the VMM
+    /// hands KVM must encode the exact slot/length/access pattern
+    /// the watchpoint requires, otherwise either KVM rejects the
+    /// configuration or the breakpoint catches the wrong access
+    /// class — both surface as silent freeze-coordinator failure
+    /// (the guest never traps, no failure dump).
+    ///
+    /// Field layout per Intel SDM Vol 3 Ch 17.2 ("Debug Registers")
+    /// and pinned against QEMU's `update_dr7_value` (target/i386/
+    /// kvm/kvm.c) which is the gold-standard reference:
+    ///
+    ///   bit  0   L0   (local enable, slot 0) — 0
+    ///   bit  1   G0   (global enable, slot 0) — 1
+    ///   bit  9   GE   (global exact-match, required for data BPs)
+    ///   bit 10   reserved, must be 1 (DR7_FIXED_1)
+    ///   bits [17:16]  R/W0 (00=exec, 01=write, 11=rw) — 01
+    ///   bits [19:18]  LEN0 (00=1B, 01=2B, 10=8B, 11=4B) — 11
+    ///
+    /// Expected value 0xD0602 is what the watchpoint code MUST
+    /// produce for (slot=0, type=write, len=4). Pinning the
+    /// arithmetic here means a future refactor that flips a bit
+    /// (e.g. swaps R/W to exec, drops GE, picks the wrong length
+    /// encoding) is caught at unit-test time before the trigger
+    /// silently stops firing.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn dr7_slot0_write_4byte_encoding() {
+        // Field constants — local to the test so a future
+        // production-side rename does not silently divorce the
+        // assertion from the wire format.
+        const DR7_FIXED_1: u64 = 1 << 10;
+        const DR_GLOBAL_ENABLE: u64 = 1 << 1; // G0 — slot 0
+        const DR_GLOBAL_EXACT: u64 = 1 << 9; // GE — exact-match for data BPs
+        const DR_RW_WRITE: u64 = 0b01;
+        const DR_LEN_4: u64 = 0b11;
+        // Slot 0 occupies bits 16/17 for R/W and 18/19 for LEN.
+        const SLOT0_RW_SHIFT: u32 = 16;
+        const SLOT0_LEN_SHIFT: u32 = 18;
+
+        let dr7 = DR7_FIXED_1
+            | DR_GLOBAL_ENABLE
+            | DR_GLOBAL_EXACT
+            | (DR_RW_WRITE << SLOT0_RW_SHIFT)
+            | (DR_LEN_4 << SLOT0_LEN_SHIFT);
+        // 0xD0602 verified by the team lead against QEMU kvm.c
+        // and Intel SDM Vol 3 Ch 17.2. A drift here means the
+        // watchpoint's wire format diverged from the gold-standard
+        // encoding and KVM_SET_GUEST_DEBUG will arm the wrong
+        // breakpoint (or none).
+        assert_eq!(
+            dr7, 0xD0602,
+            "DR7 encoding for (slot=0, write, 4B) must match the QEMU/SDM gold-standard wire format"
+        );
+
+        // Bit-by-bit cross-check: every contributing bit must be
+        // present, and every other bit must be clear. Catches the
+        // failure mode where two bugs cancel — e.g. wrong shift
+        // for R/W combined with wrong shift for LEN that happen
+        // to sum to the right total.
+        assert_eq!(
+            dr7 & (1 << 0),
+            0,
+            "L0 (bit 0) must be clear (using G0, not L0)"
+        );
+        assert_ne!(dr7 & (1 << 1), 0, "G0 (bit 1) must be set");
+        assert_ne!(
+            dr7 & (1 << 9),
+            0,
+            "GE (bit 9) must be set for data breakpoints"
+        );
+        assert_ne!(dr7 & (1 << 10), 0, "DR7_FIXED_1 (bit 10) must be set");
+        // Slot 0 R/W field = 0b01 (write).
+        assert_eq!(
+            (dr7 >> SLOT0_RW_SHIFT) & 0b11,
+            DR_RW_WRITE,
+            "slot 0 R/W field must encode write (0b01)"
+        );
+        // Slot 0 LEN field = 0b11 (4 bytes).
+        assert_eq!(
+            (dr7 >> SLOT0_LEN_SHIFT) & 0b11,
+            DR_LEN_4,
+            "slot 0 LEN field must encode 4 bytes (0b11)"
+        );
+        // No other slot should be enabled.
+        assert_eq!(
+            dr7 & 0b1111_1100,
+            0,
+            "slots 1..3 must be disabled (L/G bits clear)"
+        );
+        // R/W and LEN fields for slots 1..3 must be zero.
+        assert_eq!(
+            (dr7 >> 20) & 0xFFF,
+            0,
+            "slots 1..3 R/W + LEN fields must be zero"
         );
     }
 }

@@ -406,11 +406,7 @@ fn mkfs_version_fingerprint(mkfs_path: &Path) -> Result<String> {
     let output = std::process::Command::new(mkfs_path)
         .arg("--version")
         .output()
-        .with_context(|| {
-            format!(
-                "spawn {mkfs_path:?} --version for cache-key fingerprint"
-            )
-        })?;
+        .with_context(|| format!("spawn {mkfs_path:?} --version for cache-key fingerprint"))?;
     // Don't gate on exit code: some mkfs binaries return non-zero on
     // --version (e.g. exit 1 when stdout is not a tty). The hash
     // covers both stdout and stderr regardless of exit status, so the
@@ -1333,6 +1329,11 @@ fn build_template_via_vm(
 ///
 /// Returns the count of removed debris entries (info-level
 /// tracing also logs each removal).
+///
+/// `dead_code` allow: kept as the operator-facing entry point
+/// for a future `cargo ktstr clean` subcommand and the
+/// opportunistic in-process sweep before `store_atomic`.
+#[allow(dead_code)]
 pub fn clean_orphaned_tmp_dirs(cache_root: &Path) -> Result<usize> {
     if !cache_root.is_dir() {
         // Cache root not yet materialised — nothing to sweep.
@@ -1558,6 +1559,11 @@ pub fn clean_orphaned_tmp_dirs(cache_root: &Path) -> Result<usize> {
 /// - Files at the cache root (only directories are cache entries;
 ///   `clean_orphaned_tmp_dirs` already swept the staging-image
 ///   files before we got here).
+///
+/// `dead_code` allow: kept as the operator-facing entry point
+/// for a future `cargo ktstr clean --all` subcommand; not yet
+/// wired into any command surface.
+#[allow(dead_code)]
 pub fn clean_all() -> Result<usize> {
     let root = cache_root()?;
     if !root.is_dir() {
@@ -1872,10 +1878,9 @@ mod tests {
     #[test]
     fn locate_host_mkfs_raw_returns_none() {
         let tmp = tempfile::tempdir().expect("create tempdir");
-        let _path_guard =
-            crate::test_support::test_helpers::EnvVarGuard::set("PATH", tmp.path());
-        let result = locate_host_mkfs(Filesystem::Raw)
-            .expect("Raw must short-circuit before any PATH walk");
+        let _path_guard = crate::test_support::test_helpers::EnvVarGuard::set("PATH", tmp.path());
+        let result =
+            locate_host_mkfs(Filesystem::Raw).expect("Raw must short-circuit before any PATH walk");
         assert!(
             result.is_none(),
             "Filesystem::Raw has no userspace formatter; \

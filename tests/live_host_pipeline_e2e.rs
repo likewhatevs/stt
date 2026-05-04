@@ -232,7 +232,9 @@ fn live_host_pipeline_e2e_empty_capture_falls_back_to_defaults() {
     // The fall-back reasons land in notes so a user sees WHY the
     // generated test is parameterless.
     assert!(
-        spec.notes.iter().any(|n| n.message().contains("workload group")),
+        spec.notes
+            .iter()
+            .any(|n| n.message().contains("workload group")),
         "absent workload-group hint must surface a note: {:?}",
         spec.notes,
     );

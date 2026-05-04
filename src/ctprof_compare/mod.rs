@@ -75,8 +75,6 @@ mod report;
 pub use report::write_diff;
 
 #[cfg(test)]
-mod tests_fixtures;
-#[cfg(test)]
 mod tests_aggregate;
 #[cfg(test)]
 mod tests_cgroup_merge;
@@ -86,6 +84,8 @@ mod tests_columns;
 mod tests_compare;
 #[cfg(test)]
 mod tests_diff_types;
+#[cfg(test)]
+mod tests_fixtures;
 #[cfg(test)]
 mod tests_groups;
 #[cfg(test)]

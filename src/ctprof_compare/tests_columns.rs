@@ -6,11 +6,10 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use super::*;
 use super::aggregate::{format_cpu_range, merge_aggregated_into};
 use super::cgroup_merge::{
-    merge_cgroup_cpu, merge_cgroup_memory, merge_cgroup_pids, merge_kv_counters,
-    merge_max_option, merge_memory_stat, merge_min_option, merge_psi,
+    merge_cgroup_cpu, merge_cgroup_memory, merge_cgroup_pids, merge_kv_counters, merge_max_option,
+    merge_memory_stat, merge_min_option, merge_psi,
 };
 use super::columns::{compare_columns_for, format_cgroup_only_section_warning};
 use super::compare::sort_diff_rows_by_keys;
@@ -23,6 +22,7 @@ use super::pattern::{
 use super::render::psi_pair_has_data;
 use super::scale::{auto_scale, format_delta_cell};
 use super::tests_fixtures::*;
+use super::*;
 use crate::ctprof::{CgroupStats, CtprofSnapshot, Psi, ThreadState};
 use crate::metric_types::{
     Bytes, CategoricalString, CpuSet, MonotonicCount, MonotonicNs, OrdinalI32, PeakNs,
@@ -229,8 +229,7 @@ fn parse_sections_rejects_empty_entry() {
 /// reorder.
 #[test]
 fn parse_sections_accepts_multiple_in_input_order() {
-    let secs =
-        parse_sections("derived,primary,host-pressure").expect("multi-section spec parses");
+    let secs = parse_sections("derived,primary,host-pressure").expect("multi-section spec parses");
     assert_eq!(
         secs,
         vec![Section::Derived, Section::Primary, Section::HostPressure],
@@ -244,8 +243,7 @@ fn parse_sections_accepts_multiple_in_input_order() {
 /// the parser body.
 #[test]
 fn parse_sections_trims_whitespace_around_entries() {
-    let secs =
-        parse_sections("  primary , derived  ").expect("whitespace-tolerant spec parses");
+    let secs = parse_sections("  primary , derived  ").expect("whitespace-tolerant spec parses");
     assert_eq!(secs, vec![Section::Primary, Section::Derived]);
 }
 
@@ -399,8 +397,8 @@ fn parse_metrics_accepts_primary_and_derived_in_input_order() {
     // `run_time_ns` is a primary metric, `cpu_efficiency`
     // is a derived metric — both well-known names that
     // exist in the live registry.
-    let parsed = parse_metrics("cpu_efficiency,run_time_ns")
-        .expect("mixed primary+derived spec must parse");
+    let parsed =
+        parse_metrics("cpu_efficiency,run_time_ns").expect("mixed primary+derived spec must parse");
     assert_eq!(parsed.len(), 2);
     assert_eq!(parsed[0], "cpu_efficiency");
     assert_eq!(parsed[1], "run_time_ns");
@@ -782,4 +780,3 @@ fn parse_columns_accepts_show_side_metric_value() {
     let cols = parse_columns("metric,value", false).expect("metric,value is show-side valid");
     assert_eq!(cols, vec![Column::Metric, Column::Value]);
 }
-

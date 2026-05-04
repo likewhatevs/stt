@@ -43,6 +43,41 @@ impl Latch {
             guard = self.cv.wait(guard).unwrap();
         }
     }
+
+    /// Non-blocking check: return `true` iff the latch is currently
+    /// set. The check briefly acquires the underlying mutex; callers
+    /// on a hot path should prefer `wait` / `wait_timeout` (which
+    /// block on the condvar) over polling this in a busy loop. The
+    /// non-blocking variant exists for places that need to "branch
+    /// on already-emitted" without committing to a blocking wait —
+    /// e.g. a tail handler that re-emits only when the producer
+    /// thread didn't already do it.
+    pub fn is_set(&self) -> bool {
+        *self.set.lock().unwrap()
+    }
+
+    /// Block until `set` is called or `timeout` elapses. Returns
+    /// `true` if the latch was set within the deadline, `false` on
+    /// timeout. `Condvar::wait_timeout` may return spuriously, so the
+    /// loop re-checks the flag and recomputes the remaining duration
+    /// against an absolute deadline.
+    pub fn wait_timeout(&self, timeout: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut guard = self.set.lock().unwrap();
+        while !*guard {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let remaining = deadline - now;
+            let (g, res) = self.cv.wait_timeout(guard, remaining).unwrap();
+            guard = g;
+            if res.timed_out() && !*guard {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 #[cfg(test)]

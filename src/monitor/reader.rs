@@ -19,8 +19,12 @@ use super::{
     CpuSnapshot, Kva, MonitorSample, RqSchedstat, SchedDomainSnapshot, SchedDomainStats,
     ScxEventCounters,
 };
+use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+use vmm_sys_util::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
+use vmm_sys_util::eventfd::EventFd;
+use vmm_sys_util::timerfd::TimerFd;
 
 /// Per-NUMA-node host memory region within a GuestMem.
 #[derive(Debug, Clone, Copy)]
@@ -162,6 +166,37 @@ impl GuestMem {
         }
     }
 
+    /// Public host-pointer accessor for a DRAM-relative PA, returning
+    /// `None` when the PA is out of bounds or the field would straddle
+    /// a multi-region boundary.
+    ///
+    /// Used by callers that need a raw pointer for `read_volatile` /
+    /// `write_volatile` outside the regular `read_*` / `write_*`
+    /// helpers — most notably the failure-dump watchpoint, which
+    /// caches a `*const u32` on the `WatchpointArm` so the vCPU
+    /// thread can read `exit_kind` post-store without owning its own
+    /// `GuestMem` clone. `field_size` is the width the caller will
+    /// access; the returned pointer is rejected when it would walk
+    /// past the resolved region's mmap, mirroring the bounds-check
+    /// `read_scalar` performs.
+    ///
+    /// SAFETY of the returned pointer: valid for the lifetime of
+    /// the underlying mapping (`ReservationGuard` outlives every
+    /// `GuestMem` access). Callers MUST NOT cache the pointer past
+    /// the VM run; cross-thread use requires the caller's own
+    /// publication ordering (`AtomicPtr` Release/Acquire pair).
+    pub fn host_ptr_for_pa(&self, pa: u64, field_size: u64) -> Option<*mut u8> {
+        let end = pa.checked_add(field_size)?;
+        if end > self.size {
+            return None;
+        }
+        let (ptr, region_avail) = self.resolve_ptr(pa)?;
+        if field_size > region_avail {
+            return None;
+        }
+        Some(ptr)
+    }
+
     /// Resolve a DRAM-relative byte offset to a host pointer plus the
     /// number of bytes remaining in the resolved region (i.e. how far
     /// the returned pointer can be advanced before leaving the mmap).
@@ -185,16 +220,30 @@ impl GuestMem {
         }
     }
 
-    /// Read `N` volatile bytes from `ptr`. Each byte is read via
-    /// `read_volatile` so the compiler cannot cache or elide across
-    /// the loop (the guest writes to this memory concurrently and
-    /// those writes are invisible to Rust's model). Returning a
-    /// `[u8; N]` lets callers recompose the fundamental integer via
-    /// `from_ne_bytes` without needing pointer alignment to match.
+    /// Read `N` volatile bytes from `ptr`. The compiler must not
+    /// cache or elide across the read (the guest writes to this
+    /// memory concurrently and those writes are invisible to Rust's
+    /// model). Returning a `[u8; N]` lets callers recompose the
+    /// fundamental integer via `from_ne_bytes` without needing the
+    /// caller's pointer alignment to match.
     ///
-    /// Handles the alignment case: even if `ptr` is not aligned for
-    /// `T`, per-byte `read_volatile` has 1-byte alignment and is
-    /// always safe.
+    /// Performance: when `N == 1, 2, 4, or 8` AND `ptr` is naturally
+    /// aligned for that width, this issues a single
+    /// `read_volatile::<uN>` instead of `N` per-byte volatiles. Misaligned
+    /// pointers and other widths fall back to the per-byte loop —
+    /// `read_volatile` requires natural alignment per the std
+    /// contract, so misaligned u64 access would be UB (the original
+    /// per-byte loop trades performance for portability across all
+    /// alignments). Per-byte volatile reads have 1-byte alignment
+    /// and are always safe; the fast paths preserve this guarantee
+    /// by gating on `ptr.align_offset` returning 0.
+    ///
+    /// The fast path matters because the freeze coordinator runs
+    /// dozens of `read_u64` calls per page-walk and per task in the
+    /// dump path; reducing 8 volatile reads to 1 cuts that hot-path
+    /// cost by ~8x. Most reads go through `host_ptr` plus a
+    /// statically-known struct offset, so the alignment check
+    /// resolves at runtime in the common case.
     ///
     /// # Safety
     /// `ptr..ptr+N` must be a valid, readable range in the mapped
@@ -202,6 +251,61 @@ impl GuestMem {
     /// checks before resolving the pointer.
     #[inline]
     unsafe fn read_volatile_bytes<const N: usize>(ptr: *const u8) -> [u8; N] {
+        // Width-specific fast paths. The const arms compile-time
+        // resolve so a non-matching `N` collapses straight to the
+        // per-byte fallback with no branch in the generated code.
+        match N {
+            1 => {
+                // SAFETY: 1-byte alignment is universal; ptr..ptr+1
+                // is in-bounds per caller's check.
+                let v = unsafe { std::ptr::read_volatile(ptr) };
+                let mut bytes = [0u8; N];
+                bytes[0] = v;
+                return bytes;
+            }
+            2 => {
+                if ptr.align_offset(std::mem::align_of::<u16>()) == 0 {
+                    // SAFETY: align_offset == 0 proves ptr is u16-
+                    // aligned; ptr..ptr+2 is in-bounds per caller's
+                    // check; read_volatile::<u16> reads exactly 2
+                    // bytes natively.
+                    let v: u16 = unsafe { std::ptr::read_volatile(ptr as *const u16) };
+                    let src = v.to_ne_bytes();
+                    let mut bytes = [0u8; N];
+                    bytes[..2].copy_from_slice(&src);
+                    return bytes;
+                }
+            }
+            4 => {
+                if ptr.align_offset(std::mem::align_of::<u32>()) == 0 {
+                    // SAFETY: align_offset == 0 proves ptr is u32-
+                    // aligned; ptr..ptr+4 is in-bounds per caller's
+                    // check.
+                    let v: u32 = unsafe { std::ptr::read_volatile(ptr as *const u32) };
+                    let src = v.to_ne_bytes();
+                    let mut bytes = [0u8; N];
+                    bytes[..4].copy_from_slice(&src);
+                    return bytes;
+                }
+            }
+            8 => {
+                if ptr.align_offset(std::mem::align_of::<u64>()) == 0 {
+                    // SAFETY: align_offset == 0 proves ptr is u64-
+                    // aligned; ptr..ptr+8 is in-bounds per caller's
+                    // check.
+                    let v: u64 = unsafe { std::ptr::read_volatile(ptr as *const u64) };
+                    let src = v.to_ne_bytes();
+                    let mut bytes = [0u8; N];
+                    bytes[..8].copy_from_slice(&src);
+                    return bytes;
+                }
+            }
+            _ => {}
+        }
+        // Fallback: per-byte volatile read. Always correct
+        // regardless of alignment, but slow on the hot path.
+        // Used for misaligned scalar reads and non-power-of-two
+        // widths.
         let mut bytes = [0u8; N];
         for (i, slot) in bytes.iter_mut().enumerate() {
             // SAFETY: ptr..ptr+N is in-bounds per caller's check.
@@ -211,13 +315,52 @@ impl GuestMem {
     }
 
     /// Write `N` volatile bytes to `ptr`. Mirror of
-    /// [`read_volatile_bytes`] for the store path.
+    /// [`read_volatile_bytes`] for the store path, including the
+    /// width-aligned fast paths.
     ///
     /// # Safety
     /// `ptr..ptr+N` must be a valid, writable range in the mapped
     /// guest region.
     #[inline]
     unsafe fn write_volatile_bytes<const N: usize>(ptr: *mut u8, bytes: [u8; N]) {
+        match N {
+            1 => {
+                // SAFETY: 1-byte alignment is universal.
+                unsafe { std::ptr::write_volatile(ptr, bytes[0]) };
+                return;
+            }
+            2 => {
+                if ptr.align_offset(std::mem::align_of::<u16>()) == 0 {
+                    let mut le = [0u8; 2];
+                    le.copy_from_slice(&bytes[..2]);
+                    let v = u16::from_ne_bytes(le);
+                    // SAFETY: alignment proven by align_offset == 0.
+                    unsafe { std::ptr::write_volatile(ptr as *mut u16, v) };
+                    return;
+                }
+            }
+            4 => {
+                if ptr.align_offset(std::mem::align_of::<u32>()) == 0 {
+                    let mut le = [0u8; 4];
+                    le.copy_from_slice(&bytes[..4]);
+                    let v = u32::from_ne_bytes(le);
+                    // SAFETY: alignment proven.
+                    unsafe { std::ptr::write_volatile(ptr as *mut u32, v) };
+                    return;
+                }
+            }
+            8 => {
+                if ptr.align_offset(std::mem::align_of::<u64>()) == 0 {
+                    let mut le = [0u8; 8];
+                    le.copy_from_slice(&bytes[..8]);
+                    let v = u64::from_ne_bytes(le);
+                    // SAFETY: alignment proven.
+                    unsafe { std::ptr::write_volatile(ptr as *mut u64, v) };
+                    return;
+                }
+            }
+            _ => {}
+        }
         for (i, &byte) in bytes.iter().enumerate() {
             // SAFETY: ptr..ptr+N is in-bounds per caller's check.
             unsafe { std::ptr::write_volatile(ptr.add(i), byte) };
@@ -1018,6 +1161,16 @@ pub(crate) struct DumpTrigger {
     pub shm_base_pa: u64,
     /// Thresholds for violation detection.
     pub thresholds: super::MonitorThresholds,
+    /// Optional virtio-console handle. When `Some`, the monitor pushes
+    /// a wake byte (`SIGNAL_VC_DUMP`) into the device's RX queue
+    /// immediately after writing the SHM dump-request byte. The
+    /// guest's `shm_poll_loop` blocks on `/dev/hvc0` and re-checks
+    /// the SHM control bytes on any byte received, so the wake
+    /// arrives within microseconds of the SHM write rather than at
+    /// the legacy 200 ms poll cadence. `None` falls back to legacy
+    /// polling.
+    pub virtio_con:
+        Option<std::sync::Arc<crate::vmm::PiMutex<crate::vmm::virtio_console::VirtioConsole>>>,
 }
 
 /// Override for the scheduler watchdog timeout, written every monitor
@@ -1138,12 +1291,22 @@ pub(crate) struct MonitorConfig<'a> {
 /// the collected per-interval samples, a final drain of the
 /// guest-to-host SHM ring, and — when a watchdog override was
 /// installed — the post-run `WatchdogObservation` read-back.
+///
+/// The cadence is driven by a `CLOCK_MONOTONIC` `timerfd` armed at
+/// `interval`; an external `kill_evt` write breaks out of the
+/// `epoll_wait` immediately rather than waiting up to one full
+/// interval. `kill` (the atomic) and `kill_evt` (the eventfd) carry
+/// the same shutdown signal: external setters should flip both so
+/// the wait returns within microseconds of the flip and the
+/// `kill.load(Acquire)` re-check at the top of the loop body
+/// observes the new state.
 pub(crate) fn monitor_loop(
     mem: &GuestMem,
     rq_pas: &[u64],
     offsets: &KernelOffsets,
     interval: Duration,
     kill: &AtomicBool,
+    kill_evt: &EventFd,
     run_start: Instant,
     cfg: &MonitorConfig<'_>,
 ) -> MonitorLoopResult {
@@ -1179,6 +1342,91 @@ pub(crate) fn monitor_loop(
     let mut shm_entries: Vec<crate::vmm::shm_ring::ShmEntry> = Vec::new();
     let mut shm_drops: u64 = 0;
     let mut watchdog_observation: Option<super::WatchdogObservation> = None;
+
+    // Cadence + wake plumbing. `tick_tfd` is a periodic
+    // `CLOCK_MONOTONIC` timerfd that fires every `interval` so the
+    // sampling cadence matches the previous `thread::sleep(interval)`
+    // contract. `kill_evt` is the shutdown wake — external setters
+    // (collect_results, vCPU shutdown classifier, panic hook) write
+    // to it so the wait returns within microseconds of the kill
+    // flip rather than waiting up to one full interval.
+    //
+    // EpollEvent data is the source fd so the post-wait dispatch can
+    // tell which fd fired without reading the timerfd counter (which
+    // we drain unconditionally on the timer branch).
+    let tick_tfd = match TimerFd::new() {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(err = %e, "monitor: timerfd_create failed");
+            return MonitorLoopResult {
+                samples,
+                drain: crate::vmm::shm_ring::ShmDrainResult {
+                    entries: shm_entries,
+                    drops: shm_drops,
+                },
+                watchdog_observation,
+            };
+        }
+    };
+    let mut tick_tfd = tick_tfd;
+    if let Err(e) = tick_tfd.reset(interval, Some(interval)) {
+        tracing::warn!(err = %e, "monitor: timerfd_settime failed");
+        return MonitorLoopResult {
+            samples,
+            drain: crate::vmm::shm_ring::ShmDrainResult {
+                entries: shm_entries,
+                drops: shm_drops,
+            },
+            watchdog_observation,
+        };
+    }
+    let epoll = match Epoll::new() {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!(err = %e, "monitor: epoll_create1 failed");
+            return MonitorLoopResult {
+                samples,
+                drain: crate::vmm::shm_ring::ShmDrainResult {
+                    entries: shm_entries,
+                    drops: shm_drops,
+                },
+                watchdog_observation,
+            };
+        }
+    };
+    let tick_fd = tick_tfd.as_raw_fd();
+    let kill_fd = kill_evt.as_raw_fd();
+    if let Err(e) = epoll.ctl(
+        ControlOperation::Add,
+        tick_fd,
+        EpollEvent::new(EventSet::IN, tick_fd as u64),
+    ) {
+        tracing::warn!(err = %e, "monitor: epoll_ctl add timerfd failed");
+        return MonitorLoopResult {
+            samples,
+            drain: crate::vmm::shm_ring::ShmDrainResult {
+                entries: shm_entries,
+                drops: shm_drops,
+            },
+            watchdog_observation,
+        };
+    }
+    if let Err(e) = epoll.ctl(
+        ControlOperation::Add,
+        kill_fd,
+        EpollEvent::new(EventSet::IN, kill_fd as u64),
+    ) {
+        tracing::warn!(err = %e, "monitor: epoll_ctl add kill_evt failed");
+        return MonitorLoopResult {
+            samples,
+            drain: crate::vmm::shm_ring::ShmDrainResult {
+                entries: shm_entries,
+                drops: shm_drops,
+            },
+            watchdog_observation,
+        };
+    }
+    let mut epoll_buf = [EpollEvent::default(); 2];
 
     loop {
         if kill.load(Ordering::Acquire) {
@@ -1343,6 +1591,15 @@ pub(crate) fn monitor_loop(
                     crate::vmm::shm_ring::DUMP_REQ_OFFSET,
                     crate::vmm::shm_ring::DUMP_REQ_SYSRQ_D,
                 );
+                // Wake the guest's shm-poll thread via virtio-console
+                // RX so it re-reads the SHM dump byte within
+                // microseconds rather than at the legacy 200 ms poll
+                // cadence. Pushed AFTER the SHM write so the guest
+                // observes the new value when it re-checks.
+                if let Some(ref vc) = trigger.virtio_con {
+                    vc.lock()
+                        .queue_input(&[crate::vmm::virtio_console::SIGNAL_VC_DUMP]);
+                }
                 dump_requested = true;
             }
         }
@@ -1386,7 +1643,36 @@ pub(crate) fn monitor_loop(
             shm_entries.extend(drain.entries);
         }
 
-        std::thread::sleep(interval);
+        // Block until the next tick or a kill_evt write. -1 timeout
+        // is OK because both fds carry hard wakes — a missing
+        // kill_evt write means the sampler keeps running on the
+        // timerfd cadence and the kill atomic check at the top of
+        // the loop body still terminates within one tick.
+        match epoll.wait(-1, &mut epoll_buf) {
+            Ok(n) => {
+                for ev in &epoll_buf[..n] {
+                    if ev.fd() == tick_fd {
+                        // Drain the timerfd counter so the next
+                        // epoll_wait blocks again. The expiry count
+                        // is informational only — we always run one
+                        // sampling pass per loop iteration whether
+                        // 1 or 5 ticks accumulated, matching the
+                        // legacy `thread::sleep(interval)` cadence.
+                        let _ = tick_tfd.wait();
+                    }
+                    // kill_fd has nothing to drain at the EventFd
+                    // level — `kill.load(Acquire)` at the top of
+                    // the loop is the source of truth and the
+                    // EventFd counter never gets read.
+                }
+            }
+            Err(e) => {
+                if e.raw_os_error() != Some(libc::EINTR) {
+                    tracing::warn!(err = %e, "monitor: epoll_wait failed");
+                    break;
+                }
+            }
+        }
     }
     let shm_result = crate::vmm::shm_ring::ShmDrainResult {
         entries: shm_entries,
@@ -1476,6 +1762,17 @@ mod tests {
         // so preempted is always false (stall path always fires).
         assert!(!evaluate_preempted(Some(100), Some(100), 0));
         assert!(!evaluate_preempted(Some(100), Some(200), 0));
+    }
+
+    /// Test helper: build a fresh `EventFd` for the `kill_evt`
+    /// parameter. Tests that flip the `kill` atomic from a helper
+    /// thread don't strictly need to write to this — the timerfd
+    /// tick (typically 10 ms in tests) wakes `epoll_wait` within
+    /// one interval — but production callers MUST write so the
+    /// shutdown latency stays in the microsecond range.
+    fn test_kill_evt() -> vmm_sys_util::eventfd::EventFd {
+        vmm_sys_util::eventfd::EventFd::new(vmm_sys_util::eventfd::EFD_NONBLOCK)
+            .expect("create kill EventFd")
     }
 
     fn test_config() -> MonitorConfig<'static> {
@@ -1617,12 +1914,14 @@ mod tests {
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let kill = AtomicBool::new(true);
+        let kill_evt = test_kill_evt();
         let MonitorLoopResult { samples, .. } = monitor_loop(
             &mem,
             &[0],
             &offsets,
             Duration::from_millis(10),
             &kill,
+            &kill_evt,
             Instant::now(),
             &test_config(),
         );
@@ -1637,6 +1936,7 @@ mod tests {
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let kill = std::sync::Arc::new(AtomicBool::new(false));
+        let kill_evt = test_kill_evt();
 
         let handle = {
             let kill = std::sync::Arc::clone(&kill);
@@ -1652,6 +1952,7 @@ mod tests {
             &offsets,
             Duration::from_millis(10),
             &kill,
+            &kill_evt,
             Instant::now(),
             &test_config(),
         );
@@ -1732,6 +2033,7 @@ mod tests {
         // array) whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(combined.as_ptr() as *mut u8, combined.len() as u64) };
         let kill = std::sync::Arc::new(AtomicBool::new(false));
+        let kill_evt = test_kill_evt();
 
         let handle = {
             let kill = std::sync::Arc::clone(&kill);
@@ -1747,6 +2049,7 @@ mod tests {
             &offsets,
             Duration::from_millis(10),
             &kill,
+            &kill_evt,
             Instant::now(),
             &test_config(),
         );
@@ -1773,6 +2076,7 @@ mod tests {
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let kill = std::sync::Arc::new(AtomicBool::new(false));
+        let kill_evt = test_kill_evt();
 
         let handle = {
             let kill = std::sync::Arc::clone(&kill);
@@ -1788,6 +2092,7 @@ mod tests {
             &offsets,
             Duration::from_millis(10),
             &kill,
+            &kill_evt,
             Instant::now(),
             &test_config(),
         );
@@ -2009,6 +2314,7 @@ mod tests {
         // array) whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(combined.as_ptr() as *mut u8, combined.len() as u64) };
         let kill = std::sync::Arc::new(AtomicBool::new(false));
+        let kill_evt = test_kill_evt();
 
         let handle = {
             let kill = std::sync::Arc::clone(&kill);
@@ -2029,6 +2335,7 @@ mod tests {
             &offsets,
             Duration::from_millis(10),
             &kill,
+            &kill_evt,
             Instant::now(),
             &cfg,
         );
@@ -2051,6 +2358,7 @@ mod tests {
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let kill = std::sync::Arc::new(AtomicBool::new(false));
+        let kill_evt = test_kill_evt();
 
         let handle = {
             let kill = std::sync::Arc::clone(&kill);
@@ -2066,6 +2374,7 @@ mod tests {
             &offsets,
             Duration::from_millis(10),
             &kill,
+            &kill_evt,
             Instant::now(),
             &test_config(),
         );
@@ -2112,6 +2421,7 @@ mod tests {
         // array) whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(combined.as_mut_ptr(), combined.len() as u64) };
         let kill = std::sync::Arc::new(AtomicBool::new(false));
+        let kill_evt = test_kill_evt();
 
         let wd = WatchdogOverride::ScxSched {
             scx_root_pa,
@@ -2142,6 +2452,7 @@ mod tests {
             &offsets,
             Duration::from_millis(10),
             &kill,
+            &kill_evt,
             Instant::now(),
             &cfg,
         );
@@ -2173,6 +2484,7 @@ mod tests {
         // array) whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(combined.as_mut_ptr(), combined.len() as u64) };
         let kill = std::sync::Arc::new(AtomicBool::new(false));
+        let kill_evt = test_kill_evt();
         let wd = WatchdogOverride::ScxSched {
             scx_root_pa,
             watchdog_offset: 16,
@@ -2201,6 +2513,7 @@ mod tests {
             &offsets,
             Duration::from_millis(10),
             &kill,
+            &kill_evt,
             Instant::now(),
             &cfg,
         );
@@ -2231,6 +2544,7 @@ mod tests {
         // array) whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(combined.as_mut_ptr(), combined.len() as u64) };
         let kill = std::sync::Arc::new(AtomicBool::new(false));
+        let kill_evt = test_kill_evt();
 
         let wd = WatchdogOverride::StaticGlobal {
             watchdog_timeout_pa: watchdog_pa,
@@ -2259,6 +2573,7 @@ mod tests {
             &offsets,
             Duration::from_millis(10),
             &kill,
+            &kill_evt,
             Instant::now(),
             &cfg,
         );
@@ -2293,6 +2608,7 @@ mod tests {
         // array) whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(combined.as_mut_ptr(), combined.len() as u64) };
         let kill = std::sync::Arc::new(AtomicBool::new(false));
+        let kill_evt = test_kill_evt();
 
         let trigger = DumpTrigger {
             shm_base_pa: shm_pa,
@@ -2302,6 +2618,7 @@ mod tests {
                 fail_on_stall: false,
                 ..Default::default()
             },
+            virtio_con: None,
         };
 
         let handle = {
@@ -2322,6 +2639,7 @@ mod tests {
             &offsets,
             Duration::from_millis(10),
             &kill,
+            &kill_evt,
             Instant::now(),
             &cfg,
         );
@@ -2356,6 +2674,7 @@ mod tests {
         // array) whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(combined.as_mut_ptr(), combined.len() as u64) };
         let kill = std::sync::Arc::new(AtomicBool::new(false));
+        let kill_evt = test_kill_evt();
 
         let trigger = DumpTrigger {
             shm_base_pa: shm_pa,
@@ -2366,6 +2685,7 @@ mod tests {
                 sustained_samples: 2,
                 ..Default::default()
             },
+            virtio_con: None,
         };
 
         let handle = {
@@ -2386,6 +2706,7 @@ mod tests {
             &offsets,
             Duration::from_millis(10),
             &kill,
+            &kill_evt,
             Instant::now(),
             &cfg,
         );
@@ -2421,6 +2742,7 @@ mod tests {
         // array) whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(combined.as_mut_ptr(), combined.len() as u64) };
         let kill = std::sync::Arc::new(AtomicBool::new(false));
+        let kill_evt = test_kill_evt();
 
         let trigger = DumpTrigger {
             shm_base_pa: shm_pa,
@@ -2431,6 +2753,7 @@ mod tests {
                 sustained_samples: 1,
                 ..Default::default()
             },
+            virtio_con: None,
         };
 
         let handle = {
@@ -2451,6 +2774,7 @@ mod tests {
             &offsets,
             Duration::from_millis(10),
             &kill,
+            &kill_evt,
             Instant::now(),
             &cfg,
         );
@@ -2482,6 +2806,7 @@ mod tests {
         // array) whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(combined.as_mut_ptr(), combined.len() as u64) };
         let kill = std::sync::Arc::new(AtomicBool::new(false));
+        let kill_evt = test_kill_evt();
 
         let sleeper_kill = std::sync::Arc::new(AtomicBool::new(false));
         let sleeper_kill_clone = sleeper_kill.clone();
@@ -2506,6 +2831,7 @@ mod tests {
                 sustained_samples: 1,
                 ..Default::default()
             },
+            virtio_con: None,
         };
 
         let handle = {
@@ -2528,6 +2854,7 @@ mod tests {
             &offsets,
             Duration::from_millis(30),
             &kill,
+            &kill_evt,
             Instant::now(),
             &cfg,
         );
@@ -2562,6 +2889,7 @@ mod tests {
         // array) whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(combined.as_mut_ptr(), combined.len() as u64) };
         let kill = std::sync::Arc::new(AtomicBool::new(false));
+        let kill_evt = test_kill_evt();
 
         let spinner_kill = std::sync::Arc::new(AtomicBool::new(false));
         let spinner_kill_clone = spinner_kill.clone();
@@ -2586,6 +2914,7 @@ mod tests {
                 sustained_samples: 2,
                 ..Default::default()
             },
+            virtio_con: None,
         };
 
         let handle = {
@@ -2608,6 +2937,7 @@ mod tests {
             &offsets,
             Duration::from_millis(30),
             &kill,
+            &kill_evt,
             Instant::now(),
             &cfg,
         );
@@ -2650,6 +2980,7 @@ mod tests {
         // array) whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(combined.as_mut_ptr(), combined.len() as u64) };
         let kill = std::sync::Arc::new(AtomicBool::new(false));
+        let kill_evt = test_kill_evt();
 
         let thresholds = super::super::MonitorThresholds {
             max_imbalance_ratio: 100.0,
@@ -2662,6 +2993,7 @@ mod tests {
         let trigger = DumpTrigger {
             shm_base_pa: shm_pa,
             thresholds,
+            virtio_con: None,
         };
 
         let handle = {
@@ -2682,6 +3014,7 @@ mod tests {
             &offsets,
             Duration::from_millis(10),
             &kill,
+            &kill_evt,
             Instant::now(),
             &cfg,
         );
@@ -2734,6 +3067,7 @@ mod tests {
         // array) whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(combined.as_mut_ptr(), combined.len() as u64) };
         let kill = std::sync::Arc::new(AtomicBool::new(false));
+        let kill_evt = test_kill_evt();
 
         let thresholds = super::super::MonitorThresholds {
             max_imbalance_ratio: 100.0,
@@ -2746,6 +3080,7 @@ mod tests {
         let trigger = DumpTrigger {
             shm_base_pa: shm_pa,
             thresholds,
+            virtio_con: None,
         };
 
         let handle = {
@@ -2766,6 +3101,7 @@ mod tests {
             &offsets,
             Duration::from_millis(10),
             &kill,
+            &kill_evt,
             Instant::now(),
             &cfg,
         );
@@ -2908,6 +3244,7 @@ mod tests {
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let kill = std::sync::Arc::new(AtomicBool::new(false));
+        let kill_evt = test_kill_evt();
 
         let handle = {
             let kill = std::sync::Arc::clone(&kill);
@@ -2923,6 +3260,7 @@ mod tests {
             &offsets,
             Duration::from_millis(10),
             &kill,
+            &kill_evt,
             Instant::now(),
             &test_config(),
         );
@@ -2945,6 +3283,7 @@ mod tests {
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let kill = std::sync::Arc::new(AtomicBool::new(false));
+        let kill_evt = test_kill_evt();
 
         let handle = {
             let kill = std::sync::Arc::clone(&kill);
@@ -2960,6 +3299,7 @@ mod tests {
             &offsets,
             Duration::from_millis(10),
             &kill,
+            &kill_evt,
             Instant::now(),
             &test_config(),
         );

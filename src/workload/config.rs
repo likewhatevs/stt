@@ -422,15 +422,16 @@ pub enum WakeMechanism {
 /// `Widest` is a runtime-resolved sentinel: at worker entry the
 /// dispatch arm probes the host CPU via
 /// [`std::is_x86_feature_detected!`] (x86_64) and picks the
-/// widest available variant in the order `Amx > Vec512 > Vec256
-/// > Vec128 > Scalar`. On `aarch64` only `Scalar` and `Vec128`
-/// (NEON) are available; `Vec256` / `Vec512` / `Amx` are absent
-/// and `Widest` resolves to NEON when present, falling back to
-/// `Scalar`. A configured value that the host cannot run is
-/// downgraded to the next-widest available variant with a
-/// one-shot `tracing::warn!` so the test still produces useful
-/// telemetry rather than hard-failing — silent downgrade
-/// without the warn would mask the host capability gap.
+/// widest available variant in the order
+/// `Amx > Vec512 > Vec256 > Vec128 > Scalar`. On `aarch64` only
+/// `Scalar` and `Vec128` (NEON) are available; `Vec256` /
+/// `Vec512` / `Amx` are absent and `Widest` resolves to NEON
+/// when present, falling back to `Scalar`. A configured value
+/// that the host cannot run is downgraded to the next-widest
+/// available variant with a one-shot `tracing::warn!` so the
+/// test still produces useful telemetry rather than
+/// hard-failing — silent downgrade without the warn would
+/// mask the host capability gap.
 ///
 /// # Frequency throttle on x86_64
 ///

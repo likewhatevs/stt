@@ -261,9 +261,10 @@ pub struct TimelineCapture<'a> {
     /// `size_of::<TimelineEventRaw>()` (40); trailing partial
     /// records are silently dropped at parse time.
     pub records: &'a [u8],
-    /// `ktstr_timeline_drops` BSS counter at drain time. Non-zero
-    /// indicates the BPF producer hit a full ringbuf and dropped
-    /// the newest event(s) on submit.
+    /// `KTSTR_PCPU_TIMELINE_DROPS` per-CPU slot (summed across
+    /// CPUs) at drain time. Non-zero indicates the BPF producer
+    /// hit a full ringbuf and dropped the newest event(s) on
+    /// submit.
     pub drops: u64,
 }
 

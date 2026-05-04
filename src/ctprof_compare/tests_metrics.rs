@@ -6,11 +6,10 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use super::*;
 use super::aggregate::{format_cpu_range, merge_aggregated_into};
 use super::cgroup_merge::{
-    merge_cgroup_cpu, merge_cgroup_memory, merge_cgroup_pids, merge_kv_counters,
-    merge_max_option, merge_memory_stat, merge_min_option, merge_psi,
+    merge_cgroup_cpu, merge_cgroup_memory, merge_cgroup_pids, merge_kv_counters, merge_max_option,
+    merge_memory_stat, merge_min_option, merge_psi,
 };
 use super::columns::{compare_columns_for, format_cgroup_only_section_warning};
 use super::compare::sort_diff_rows_by_keys;
@@ -23,6 +22,7 @@ use super::pattern::{
 use super::render::psi_pair_has_data;
 use super::scale::{auto_scale, format_delta_cell};
 use super::tests_fixtures::*;
+use super::*;
 use crate::ctprof::{CgroupStats, CtprofSnapshot, Psi, ThreadState};
 use crate::metric_types::{
     Bytes, CategoricalString, CpuSet, MonotonicCount, MonotonicNs, OrdinalI32, PeakNs,
@@ -872,8 +872,7 @@ fn derived_avg_delay_ns_returns_none_on_missing_input() {
 /// accidentally collides surfaces here.
 #[test]
 fn registry_and_derived_names_disjoint() {
-    let primary: std::collections::BTreeSet<&str> =
-        CTPROF_METRICS.iter().map(|m| m.name).collect();
+    let primary: std::collections::BTreeSet<&str> = CTPROF_METRICS.iter().map(|m| m.name).collect();
     for d in CTPROF_DERIVED_METRICS {
         assert!(
             !primary.contains(d.name),
@@ -1648,4 +1647,3 @@ fn sort_diff_rows_by_keys_nan_delta_does_not_panic() {
         "NaN delta must not drop or duplicate any group",
     );
 }
-

@@ -46,6 +46,31 @@ pub(crate) fn parse_sched_output(output: &str) -> Option<&str> {
     Some(content)
 }
 
+/// Extract scheduler log content even when the closing delimiter is
+/// absent. Tries [`parse_sched_output`] first (well-formed
+/// open+close); on failure, returns the slice from
+/// [`SCHED_OUTPUT_START`] to the end of `output` when only the start
+/// marker is present. Returns `None` only when neither marker is
+/// found or every candidate slice is empty after trimming.
+///
+/// Used by the auto-repro path: a scheduler that crashes mid-run
+/// emits SCHED_OUTPUT_START but never reaches the post-scenario
+/// shutdown that writes SCHED_OUTPUT_END. The partial content still
+/// holds the stack frames the probe pipeline needs to seed kprobe
+/// targets, so discarding it would lose the only crash signal.
+pub(crate) fn parse_sched_output_partial(output: &str) -> Option<&str> {
+    if let Some(content) = parse_sched_output(output) {
+        return Some(content);
+    }
+    let start = output.find(SCHED_OUTPUT_START)?;
+    let after_marker = start + SCHED_OUTPUT_START.len();
+    let content = output[after_marker..].trim();
+    if content.is_empty() {
+        return None;
+    }
+    Some(content)
+}
+
 /// Parsed verifier stats from the kernel log line:
 /// `processed N insns (limit M) max_states_per_insn X total_states Y peak_states Z mark_read W`
 pub struct VerifierStats {
@@ -1603,5 +1628,49 @@ processed 42 insns (limit 1000000) max_states_per_insn 1 total_states 10 peak_st
             parsed.contains("fake"),
             "content before the embedded marker must also survive: {parsed:?}"
         );
+    }
+
+    // -- parse_sched_output_partial --
+
+    #[test]
+    fn parse_sched_output_partial_well_formed_matches_strict() {
+        // When both delimiters are present, the partial parser
+        // returns the same content as the strict parser.
+        let output = format!(
+            "noise\n{SCHED_OUTPUT_START}\nscheduler log line 1\nline 2\n{SCHED_OUTPUT_END}\nmore"
+        );
+        assert_eq!(
+            parse_sched_output_partial(&output),
+            parse_sched_output(&output),
+        );
+    }
+
+    #[test]
+    fn parse_sched_output_partial_missing_end_returns_partial() {
+        // When SCHED_OUTPUT_END is absent (scheduler crashed mid-run
+        // before writing the closing delimiter), the partial parser
+        // returns content from after SCHED_OUTPUT_START to end of
+        // buffer. The strict parser returns None for the same input.
+        let output = format!("{SCHED_OUTPUT_START}\nstack frame 1\nstack frame 2");
+        assert!(parse_sched_output(&output).is_none());
+        let partial = parse_sched_output_partial(&output).unwrap();
+        assert!(partial.contains("stack frame 1"));
+        assert!(partial.contains("stack frame 2"));
+    }
+
+    #[test]
+    fn parse_sched_output_partial_missing_start_returns_none() {
+        // No start marker → no content recoverable. The end-marker-
+        // only case is unrecoverable: we cannot infer where the log
+        // begins.
+        let output = format!("garbage\n{SCHED_OUTPUT_END}\n");
+        assert!(parse_sched_output_partial(&output).is_none());
+    }
+
+    #[test]
+    fn parse_sched_output_partial_empty_content_returns_none() {
+        // Start marker present but no payload after it.
+        let output = format!("{SCHED_OUTPUT_START}\n");
+        assert!(parse_sched_output_partial(&output).is_none());
     }
 }

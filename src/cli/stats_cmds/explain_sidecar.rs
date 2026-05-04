@@ -620,8 +620,10 @@ fn render_explain_sidecar_json(
 
 #[cfg(test)]
 mod tests {
+    use super::super::super::testing::{
+        SIDECAR_VEC_FIELDS, make_test_run, write_corrupt_sidecar, write_sidecar,
+    };
     use super::*;
-    use super::super::super::testing::{SIDECAR_VEC_FIELDS, make_test_run, write_corrupt_sidecar, write_sidecar};
 
     /// Drift guard: every `Option<T>` field on `SidecarResult` must
     /// have a matching catalog entry in `SIDECAR_NONE_CATALOG`, and
@@ -905,9 +907,22 @@ mod tests {
                 .get("some_count")
                 .and_then(|v| v.as_u64())
                 .unwrap_or_else(|| panic!("missing some_count for {}", entry.field));
-            assert_eq!(none_count, 1, "fixture: none_count must be 1 for {}", entry.field);
-            assert_eq!(some_count, 0, "fixture: some_count must be 0 for {}", entry.field);
-            assert_eq!(none_count + some_count, 1, "sum invariant for {}", entry.field);
+            assert_eq!(
+                none_count, 1,
+                "fixture: none_count must be 1 for {}",
+                entry.field
+            );
+            assert_eq!(
+                some_count, 0,
+                "fixture: some_count must be 0 for {}",
+                entry.field
+            );
+            assert_eq!(
+                none_count + some_count,
+                1,
+                "sum invariant for {}",
+                entry.field
+            );
             assert_eq!(
                 f.get("classification").and_then(|v| v.as_str()),
                 Some(entry.classification.as_str()),
@@ -1096,8 +1111,14 @@ mod tests {
         .unwrap();
         std::fs::write(run_dir.join("b-0000000000000000.ktstr.json"), "garbage{").unwrap();
         let out = explain_sidecar("run-mixed-parse", Some(tmp.path()), false).unwrap();
-        assert!(out.contains("walked 2"), "walker must visit both files: {out}");
-        assert!(out.contains("parsed 1"), "only the valid file parses: {out}");
+        assert!(
+            out.contains("walked 2"),
+            "walker must visit both files: {out}"
+        );
+        assert!(
+            out.contains("parsed 1"),
+            "only the valid file parses: {out}"
+        );
     }
 
     /// Walker recurses one level into subdirectories.
@@ -1115,7 +1136,10 @@ mod tests {
         .unwrap();
         let out = explain_sidecar("run-sub", Some(tmp.path()), false).unwrap();
         assert!(out.contains("walked 1"), "must walk into job-x: {out}");
-        assert!(out.contains("parsed 1"), "must parse the nested file: {out}");
+        assert!(
+            out.contains("parsed 1"),
+            "must parse the nested file: {out}"
+        );
     }
 
     /// Walker MUST ignore non-`.ktstr.json` files.
@@ -1312,7 +1336,10 @@ mod tests {
         let path = std::path::Path::new("/tmp/example-run/sidecar.ktstr.json");
         let enriched = crate::test_support::enriched_parse_error_message_for_test(path, raw)
             .expect("host-missing pattern must produce enrichment prose");
-        assert!(enriched.contains("host"), "enrichment must mention host: {enriched}");
+        assert!(
+            enriched.contains("host"),
+            "enrichment must mention host: {enriched}"
+        );
         assert!(
             enriched.contains("re-run"),
             "enrichment must point at the re-run remediation: {enriched}",
@@ -1325,7 +1352,10 @@ mod tests {
         let raw_generic = "expected ident at line 1 column 2";
         let no_enrichment =
             crate::test_support::enriched_parse_error_message_for_test(path, raw_generic);
-        assert!(no_enrichment.is_none(), "generic parse error must produce no enrichment");
+        assert!(
+            no_enrichment.is_none(),
+            "generic parse error must produce no enrichment"
+        );
     }
 
     /// All-corrupt run renders structured JSON with `valid: 0`,
@@ -1417,8 +1447,14 @@ mod tests {
         let header_pos = out.find("walked 2 sidecar file(s)").unwrap();
         let test_block_pos = out.find("test: valid_test").unwrap();
         let corrupt_pos = out.find("corrupt sidecars (1):").unwrap();
-        assert!(header_pos < test_block_pos, "header must precede per-sidecar blocks");
-        assert!(test_block_pos < corrupt_pos, "per-sidecar blocks must precede trailing corrupt block");
+        assert!(
+            header_pos < test_block_pos,
+            "header must precede per-sidecar blocks"
+        );
+        assert!(
+            test_block_pos < corrupt_pos,
+            "per-sidecar blocks must precede trailing corrupt block"
+        );
     }
 
     /// Corrupt-sidecars block is suppressed when zero parse failures.
@@ -1803,9 +1839,8 @@ mod tests {
     fn explain_sidecar_rejects_parent_dir_traversal_in_run() {
         let tmp = tempfile::tempdir().unwrap();
         for traversal in ["../escape", "subdir/../../escape"] {
-            let err = explain_sidecar(traversal, Some(tmp.path()), false).expect_err(
-                "path-traversal `..` in --run must be rejected",
-            );
+            let err = explain_sidecar(traversal, Some(tmp.path()), false)
+                .expect_err("path-traversal `..` in --run must be rejected");
             let msg = format!("{err:#}");
             assert!(
                 msg.contains("path-traversal"),
@@ -1830,8 +1865,8 @@ mod tests {
     #[test]
     fn explain_sidecar_rejects_empty_run() {
         let tmp = tempfile::tempdir().unwrap();
-        let err = explain_sidecar("", Some(tmp.path()), false)
-            .expect_err("empty --run must be rejected");
+        let err =
+            explain_sidecar("", Some(tmp.path()), false).expect_err("empty --run must be rejected");
         let msg = format!("{err:#}");
         assert!(msg.contains("must not be empty"));
     }
@@ -1840,8 +1875,8 @@ mod tests {
     #[test]
     fn explain_sidecar_rejects_curdir_run() {
         let tmp = tempfile::tempdir().unwrap();
-        let err = explain_sidecar(".", Some(tmp.path()), false)
-            .expect_err("`.` --run must be rejected");
+        let err =
+            explain_sidecar(".", Some(tmp.path()), false).expect_err("`.` --run must be rejected");
         let msg = format!("{err:#}");
         assert!(msg.contains("path-traversal"));
     }

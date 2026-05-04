@@ -16,12 +16,17 @@ The "spread" (max off-CPU% - min off-CPU%) must be below a threshold
 (15% in release builds, 35% in debug). Violations report the spread
 and per-cgroup statistics.
 
-**Scheduling gaps** -- the longest time between work iterations. Gaps
-above a threshold (2000ms release, 3000ms debug) indicate the scheduler
-dropped a task. Reports include the gap duration, CPU, and timing.
+**Scheduling gaps** -- the longest wall-clock gap observed at
+work-unit checkpoints. Gaps above a threshold (2000ms release, 3000ms
+debug) indicate the scheduler dropped a task. Reports include the gap
+duration, CPU, and timing.
 
 **Cpuset isolation** -- workers must only run on CPUs in their assigned
-cpuset. Any execution on an unexpected CPU fails the test.
+cpuset. Any execution on an unexpected CPU fails the test. Opt-in via
+`isolation = true` on the `#[ktstr_test]` attribute or via
+`Assert::check_isolation()`; `Assert::default_checks()` leaves this
+`None`, so the runtime merge resolves to `false` and the check is
+skipped unless explicitly enabled.
 
 **Throughput parity** -- `assert_throughput_parity()` checks that
 workers produce similar throughput (work_units per CPU-second). Two

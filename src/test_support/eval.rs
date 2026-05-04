@@ -641,7 +641,7 @@ fn validate_metric_bounds(
 /// appended first. Extracted from `run_ktstr_test_inner` so the
 /// policy can be unit-tested without constructing a whole
 /// KtstrTestEntry + VmBuilder.
-fn dedupe_include_files(
+pub(crate) fn dedupe_include_files(
     resolved: &[(String, std::path::PathBuf, &'static str)],
 ) -> Result<Vec<(String, std::path::PathBuf)>> {
     let mut seen: std::collections::BTreeMap<String, (std::path::PathBuf, &'static str)> =
@@ -756,6 +756,60 @@ fn run_ktstr_test_inner_impl(
     entry.validate().context("KtstrTestEntry validation")?;
     if let Some(t) = topo {
         t.validate().context("TopoOverride validation")?;
+    }
+    // Pin rayon's global thread pool to the test's allowed CPUs.
+    // The pool is created lazily on first rayon use (initramfs
+    // build) — configuring it here ensures workers inherit the
+    // test's cpuset instead of spreading across all host CPUs.
+    //
+    // `build_global` succeeds only once per process. Track the
+    // first call's cpuset in a `OnceLock<Vec<usize>>`; subsequent
+    // tests with a DIFFERENT cpuset can't repin the pool, so emit
+    // a warning so the operator sees that the second test's
+    // workers may run on the first test's CPUs.
+    static FIRST_RAYON_CPUSET: std::sync::OnceLock<Vec<usize>> = std::sync::OnceLock::new();
+    let host_cpus = crate::vmm::host_topology::host_allowed_cpus();
+    if !host_cpus.is_empty() {
+        let cpus = host_cpus.clone();
+        let n = cpus.len();
+        let range = format!("{}-{}", cpus[0], cpus[n - 1]);
+        let cpus_for_handler = cpus.clone();
+        let built = rayon::ThreadPoolBuilder::new()
+            .num_threads(n.min(32))
+            .start_handler(move |_idx| {
+                let mut cpuset = nix::sched::CpuSet::new();
+                for &cpu in &cpus_for_handler {
+                    let _ = cpuset.set(cpu);
+                }
+                let _ = nix::sched::sched_setaffinity(nix::unistd::Pid::from_raw(0), &cpuset);
+            })
+            .build_global()
+            .is_ok();
+        if built {
+            // First successful pin in this process. Record the
+            // cpuset so later tests can compare.
+            let _ = FIRST_RAYON_CPUSET.set(cpus);
+            eprintln!("no_perf_mode: rayon pool pinned to {n} CPUs ({range})");
+        } else if let Some(first) = FIRST_RAYON_CPUSET.get()
+            && first != &host_cpus
+        {
+            // build_global fails on every call after the first.
+            // When the second test's cpuset differs, warn — the
+            // pool is still pinned to `first`, not to the
+            // requested `host_cpus`, so workers run on a stale
+            // cpuset until process exit.
+            let first_n = first.len();
+            let first_range = if first_n > 0 {
+                format!("{}-{}", first[0], first[first_n - 1])
+            } else {
+                "empty".to_string()
+            };
+            eprintln!(
+                "no_perf_mode: WARNING: rayon pool already pinned to {first_n} CPUs \
+                 ({first_range}); requested {n} CPUs ({range}) won't take effect — \
+                 build_global is one-shot per process",
+            );
+        }
     }
     if entry.performance_mode && std::env::var("KTSTR_NO_PERF_MODE").is_ok() {
         // One canonical reason string for both the stderr banner
@@ -1140,7 +1194,7 @@ fn run_ktstr_test_inner_impl(
     // `set_thread_cpumask` itself if the syscall fails.
     let host_cpus = crate::vmm::host_topology::host_allowed_cpus();
     if !host_cpus.is_empty() {
-        crate::vmm::set_thread_cpumask(&host_cpus, "host-side LlmExtract inference");
+        crate::vmm::set_thread_cpumask(&host_cpus, "test");
     }
 
     // Log verifier stats count for visibility.
@@ -1256,6 +1310,7 @@ fn run_ktstr_test_inner_impl(
             output,
             &result.stderr,
             topo,
+            active_flags,
         );
         // When auto-repro was attempted but produced no data, return a
         // diagnostic so the user knows it was tried.

@@ -6,11 +6,10 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use super::*;
 use super::aggregate::{format_cpu_range, merge_aggregated_into};
 use super::cgroup_merge::{
-    merge_cgroup_cpu, merge_cgroup_memory, merge_cgroup_pids, merge_kv_counters,
-    merge_max_option, merge_memory_stat, merge_min_option, merge_psi,
+    merge_cgroup_cpu, merge_cgroup_memory, merge_cgroup_pids, merge_kv_counters, merge_max_option,
+    merge_memory_stat, merge_min_option, merge_psi,
 };
 use super::columns::{compare_columns_for, format_cgroup_only_section_warning};
 use super::compare::sort_diff_rows_by_keys;
@@ -23,6 +22,7 @@ use super::pattern::{
 use super::render::psi_pair_has_data;
 use super::scale::{auto_scale, format_delta_cell};
 use super::tests_fixtures::*;
+use super::*;
 use crate::ctprof::{CgroupStats, CtprofSnapshot, Psi, ThreadState};
 use crate::metric_types::{
     Bytes, CategoricalString, CpuSet, MonotonicCount, MonotonicNs, OrdinalI32, PeakNs,
@@ -138,8 +138,7 @@ fn group_by_comm_aggregates_across_processes() {
 /// broad and narrow patterns.
 #[test]
 fn flatten_first_match_wins_over_later_pattern() {
-    let pats =
-        compile_flatten_patterns(&["/kubepods/*/workload".into(), "/kubepods/**".into()]);
+    let pats = compile_flatten_patterns(&["/kubepods/*/workload".into(), "/kubepods/**".into()]);
     assert_eq!(
         flatten_cgroup_path("/kubepods/pod-abc/workload", &pats),
         "/kubepods/*/workload",
@@ -891,4 +890,3 @@ fn fudge_only_runs_under_group_by_all() {
         diff.fudged_pairs.len(),
     );
 }
-

@@ -528,4 +528,3 @@ pub(super) fn setup_bytes_only_drained_chain(
         .set_last_refill_for_test(now1);
     dev
 }
-

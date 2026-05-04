@@ -390,8 +390,14 @@ mod tests {
             return;
         };
         let out = show_thresholds(entry.name).expect("show_thresholds must resolve known test");
-        assert!(out.contains("Test:"), "output missing `Test:` header: {out}");
-        assert!(out.contains("Scheduler:"), "output missing `Scheduler:` header: {out}");
+        assert!(
+            out.contains("Test:"),
+            "output missing `Test:` header: {out}"
+        );
+        assert!(
+            out.contains("Scheduler:"),
+            "output missing `Scheduler:` header: {out}"
+        );
         assert!(
             out.contains("Resolved assertion thresholds:"),
             "output missing thresholds section: {out}",
@@ -474,10 +480,7 @@ mod tests {
     fn suggest_closest_run_key_returns_none_for_distant_query() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir(tmp.path().join("6.14-abc1234")).expect("plant run dir");
-        assert_eq!(
-            suggest_closest_run_key("xxxxxxxxxxxxx", tmp.path()),
-            None,
-        );
+        assert_eq!(suggest_closest_run_key("xxxxxxxxxxxxx", tmp.path()), None,);
     }
 
     /// `suggest_closest_run_key` — empty root returns None.

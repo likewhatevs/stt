@@ -6,11 +6,10 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use super::*;
 use super::aggregate::{format_cpu_range, merge_aggregated_into};
 use super::cgroup_merge::{
-    merge_cgroup_cpu, merge_cgroup_memory, merge_cgroup_pids, merge_kv_counters,
-    merge_max_option, merge_memory_stat, merge_min_option, merge_psi,
+    merge_cgroup_cpu, merge_cgroup_memory, merge_cgroup_pids, merge_kv_counters, merge_max_option,
+    merge_memory_stat, merge_min_option, merge_psi,
 };
 use super::columns::{compare_columns_for, format_cgroup_only_section_warning};
 use super::compare::sort_diff_rows_by_keys;
@@ -23,6 +22,7 @@ use super::pattern::{
 use super::render::psi_pair_has_data;
 use super::scale::{auto_scale, format_delta_cell};
 use super::tests_fixtures::*;
+use super::*;
 use crate::ctprof::{CgroupStats, CtprofSnapshot, Psi, ThreadState};
 use crate::metric_types::{
     Bytes, CategoricalString, CpuSet, MonotonicCount, MonotonicNs, OrdinalI32, PeakNs,
@@ -956,4 +956,3 @@ fn cgroup_skeleton_tokens_handles_bracketed_segments() {
         "skeleton must preserve separators including brackets; got {skeleton:?}",
     );
 }
-

@@ -2046,7 +2046,6 @@ pub struct SchedExtSysfs {
 mod parse;
 use parse::*;
 
-
 /// Capture one thread's procfs-derived profile under an arbitrary
 /// procfs root. Each procfs reader returns `Option`; the assembled
 /// [`ThreadState`] coerces `None` to the field's default per the
@@ -2883,7 +2882,8 @@ fn capture_with(
             let pool_result = rayon::ThreadPoolBuilder::new()
                 .num_threads(max_threads)
                 .build();
-            let work = || tgids
+            let work = || {
+                tgids
                 .par_iter()
                 .copied()
                 .filter(|&tgid| tgid != self_pid)
@@ -3036,7 +3036,8 @@ fn capture_with(
                     };
                     (tgid, probe)
                 })
-                .collect();
+                .collect()
+            };
             match pool_result {
                 Ok(pool) => pool.install(work),
                 Err(e) => {
@@ -3464,7 +3465,6 @@ pub fn capture_to(path: &Path) -> Result<()> {
     snap.write(path)
         .with_context(|| format!("write ctprof snapshot to {}", path.display()))
 }
-
 
 // Test modules — alphabetized.
 #[cfg(test)]

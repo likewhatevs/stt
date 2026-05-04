@@ -37,6 +37,17 @@ pub struct Serial {
     #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
     base: u16,
     inner: vm_superio::Serial<EventFdTrigger, vm_superio::serial::NoEvents, Vec<u8>>,
+    /// Optional notifier for "captured-output buffer grew." When set,
+    /// every register write that pushes a byte into the inner writer
+    /// (DATA register stores, sans DLAB) bumps this eventfd's counter
+    /// so an external consumer (e.g. the interactive dmesg drain
+    /// thread) can `epoll_wait` for new bytes instead of sleep-polling
+    /// `drain_output`. Spurious wakes are harmless: a consumer that
+    /// observes the eventfd then drains an empty buffer simply
+    /// re-blocks. `None` when no consumer has installed a notifier
+    /// (the run_vm path that consumes output via the COM2 stdout
+    /// writer thread does not need the eventfd).
+    data_evt: Option<std::sync::Arc<vmm_sys_util::eventfd::EventFd>>,
 }
 
 impl Default for Serial {
@@ -52,12 +63,38 @@ impl Serial {
         Serial {
             base,
             inner: vm_superio::Serial::new(EventFdTrigger(evt), Vec::new()),
+            data_evt: None,
         }
+    }
+
+    /// Install (or replace) the captured-output notifier. The returned
+    /// eventfd is bumped each time a byte is appended to the inner
+    /// writer, letting a consumer block in `epoll_wait` instead of
+    /// sleep-polling. Counter mode (not semaphore) — a single read
+    /// returns the accumulated count and resets it.
+    pub fn install_data_evt(
+        &mut self,
+    ) -> std::io::Result<std::sync::Arc<vmm_sys_util::eventfd::EventFd>> {
+        let evt = std::sync::Arc::new(vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK)?);
+        self.data_evt = Some(std::sync::Arc::clone(&evt));
+        Ok(evt)
     }
 
     /// Return the interrupt eventfd for registering with KVM's irqfd.
     pub fn irq_evt(&self) -> &vmm_sys_util::eventfd::EventFd {
         &self.inner.interrupt_evt().0
+    }
+
+    /// Bump the captured-output eventfd if the writer grew during
+    /// the most recent inner.write call. Helper to keep the offset/
+    /// register-decoding ladder out of every call site.
+    #[inline]
+    fn signal_if_writer_grew(&self, pre_len: usize) {
+        if self.inner.writer().len() > pre_len {
+            if let Some(evt) = &self.data_evt {
+                let _ = evt.write(1);
+            }
+        }
     }
 
     /// Handle a port I/O write from the guest. Returns true if the port
@@ -68,7 +105,9 @@ impl Serial {
             return false;
         };
         if let Some(&byte) = data.first() {
+            let pre = self.inner.writer().len();
             let _ = self.inner.write(offset, byte);
+            self.signal_if_writer_grew(pre);
         }
         true
     }
@@ -90,7 +129,9 @@ impl Serial {
     /// Used by MMIO dispatch where the offset is computed externally.
     #[cfg(target_arch = "aarch64")]
     pub(crate) fn inner_write(&mut self, offset: u8, byte: u8) {
+        let pre = self.inner.writer().len();
         let _ = self.inner.write(offset, byte);
+        self.signal_if_writer_grew(pre);
     }
 
     /// Read a byte from a register at the given offset.
@@ -115,6 +156,23 @@ impl Serial {
     /// Get all captured output as a string.
     pub fn output(&self) -> String {
         String::from_utf8_lossy(self.inner.writer()).to_string()
+    }
+
+    /// Return true when the captured output contains `needle` as a
+    /// contiguous byte sequence. Searches the underlying writer in
+    /// place via `windows`; allocates nothing. Used by the freeze
+    /// coordinator's post-thaw COM2 marker poll, where the output()
+    /// String copy would burn the buffer on every poll iteration
+    /// during the grace window.
+    pub fn output_contains(&self, needle: &[u8]) -> bool {
+        if needle.is_empty() {
+            return true;
+        }
+        let writer: &[u8] = self.inner.writer();
+        if writer.len() < needle.len() {
+            return false;
+        }
+        writer.windows(needle.len()).any(|w| w == needle)
     }
 
     /// Clear captured output.
@@ -523,5 +581,32 @@ mod tests {
         let mut lsr = [0u8; 1];
         s.handle_in(COM1_BASE + LSR, &mut lsr);
         assert_ne!(lsr[0] & LSR_DR, 0, "data should be ready after queue_input");
+    }
+
+    #[test]
+    fn output_contains_empty_buffer() {
+        let s = Serial::default();
+        assert!(!s.output_contains(b"x"));
+        // Empty needle is vacuously contained.
+        assert!(s.output_contains(b""));
+    }
+
+    #[test]
+    fn output_contains_finds_marker() {
+        let mut s = Serial::default();
+        for c in b"prefix===END===suffix" {
+            s.handle_out(COM1_BASE, &[*c]);
+        }
+        assert!(s.output_contains(b"===END==="));
+        assert!(s.output_contains(b"prefix"));
+        assert!(s.output_contains(b"suffix"));
+        assert!(!s.output_contains(b"missing"));
+    }
+
+    #[test]
+    fn output_contains_needle_longer_than_buffer() {
+        let mut s = Serial::default();
+        s.handle_out(COM1_BASE, b"a");
+        assert!(!s.output_contains(b"abcdef"));
     }
 }

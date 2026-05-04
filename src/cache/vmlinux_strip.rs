@@ -1498,6 +1498,11 @@ mod tests {
             syms.scx_watchdog_timeout.is_some(),
             "strip changed scx_watchdog_timeout presence"
         );
+        assert_eq!(
+            source_syms.scx_watchdog_timestamp.is_some(),
+            syms.scx_watchdog_timestamp.is_some(),
+            "strip changed scx_watchdog_timestamp presence"
+        );
 
         let source_data = fs::read(&path).unwrap();
         let source_elf = goblin::elf::Elf::parse(&source_data).unwrap();

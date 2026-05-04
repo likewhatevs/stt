@@ -608,8 +608,7 @@ fn read_sched_ext_sysfs_at_partial_files_default_zero() {
     // absent.
     std::fs::write(scx_dir.join("state"), "disabled\n").unwrap();
     std::fs::write(scx_dir.join("nr_rejected"), "100\n").unwrap();
-    let scx =
-        read_sched_ext_sysfs_at(sys_root.path()).expect("directory exists → returns Some");
+    let scx = read_sched_ext_sysfs_at(sys_root.path()).expect("directory exists → returns Some");
     assert_eq!(scx.state, "disabled");
     assert_eq!(scx.nr_rejected, 100);
     assert_eq!(scx.switch_all, 0, "absent file → default 0");

@@ -332,14 +332,15 @@ impl KtstrVmBuilder {
     /// deltas across a stall window.
     ///
     /// Default off — two reasons:
-    /// 1. **Scanner cost.** The early-trigger path walks every
-    ///    per-CPU `rq->scx.runnable_list` once per 100 ms poll
-    ///    cycle, reading each task's
-    ///    `task_struct.scx.runnable_at` via direct-mapped guest
-    ///    memory. On a 64-vCPU host with hundreds of runnable
-    ///    tasks the steady-state cost is non-negligible — a primary
-    ///    VM doesn't pay it unless the run already failed and an
-    ///    auto-repro is being attempted.
+    /// 1. **Scanner cost.** The early-trigger path walks the
+    ///    kernel's global `scx_tasks` list AND every per-CPU
+    ///    `rq->scx.runnable_list` once per scan tick (250 ms),
+    ///    reading each task's `task_struct.scx.runnable_at` via
+    ///    direct-mapped guest memory. On a 64-vCPU host with
+    ///    hundreds of runnable tasks the steady-state cost is
+    ///    non-negligible — a primary VM doesn't pay it unless
+    ///    the run already failed and an auto-repro is being
+    ///    attempted.
     /// 2. **Consumer compatibility.** The on-disk shape changes
     ///    from [`crate::monitor::dump::FailureDumpReport`] to
     ///    [`crate::monitor::dump::DualFailureDumpReport`], a
@@ -493,6 +494,13 @@ impl KtstrVmBuilder {
     ///
     /// v0 supports a single device; calling this method twice
     /// overwrites the prior `NetConfig`.
+    ///
+    /// `dead_code` allow: kept as the public builder entry point
+    /// for attaching a virtio-net device; the production VM-bring-up
+    /// path in [`super::setup`] currently never enables networking
+    /// for a test, but the device, builder field, and config type
+    /// are all wired so a scenario can opt in.
+    #[allow(dead_code)]
     pub fn network(mut self, config: net_config::NetConfig) -> Self {
         self.network = Some(config);
         self

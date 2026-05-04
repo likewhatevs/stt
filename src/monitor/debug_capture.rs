@@ -318,7 +318,7 @@ pub enum AffinityHint {
     /// `thread_siblings_list` entry. Popcount == 1 →
     /// [`Self::SingleCpu`]. Popcount == 2 but the CPUs are NOT
     /// siblings → [`Self::Exact`]. Partial sibling sets (popcount
-    /// > 1 but < `threads_per_core` on SMT-N>2 hosts) project to
+    /// `> 1` but `< threads_per_core` on SMT-N>2 hosts) project to
     /// [`Self::Exact`], not `SmtSiblingPair`.
     SmtSiblingPair {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -715,7 +715,7 @@ fn project_sched_policy_hints(dump: &FailureDumpReport) -> Vec<SchedPolicyHint> 
                 // projected `SchedPolicyHint::Other { nice }` is
                 // spawnable by the reproducer generator without
                 // further sanitisation.
-                let raw = (task.static_prio as i32) - 120;
+                let raw = task.static_prio - 120;
                 let nice = raw.clamp(-20, 19);
                 SchedPolicyHint::Other { nice }
             }

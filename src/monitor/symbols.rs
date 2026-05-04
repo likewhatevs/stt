@@ -89,6 +89,18 @@ pub(crate) struct KernelSymbols {
     /// (older `scx_ops` API predates `scx_root`), and kernels built
     /// without sched_ext.
     pub scx_root: Option<u64>,
+    /// Kernel virtual address of `scx_tasks` — the global LIST_HEAD
+    /// (`kernel/sched/ext.c:47`) every scx-managed task is linked
+    /// into via `task_struct.scx.tasks_node`. The host walker uses
+    /// this anchor to enumerate every task owned by an scx_sched
+    /// across ALL CPUs in one walk, surviving the per-rq
+    /// runnable_list drain that `scx_bypass`
+    /// (`kernel/sched/ext.c:5304-5404`) triggers during scheduler
+    /// teardown — `scx_tasks` outlives runnable_list because tasks
+    /// only leave it via `sched_ext_dead`
+    /// (`kernel/sched/ext.c:3792`). `None` when the symbol is
+    /// absent (kernel without sched_ext, or stripped vmlinux).
+    pub scx_tasks: Option<u64>,
     /// Kernel virtual address of the top-level page table.
     /// `init_top_pgt` (older kernels) or `swapper_pg_dir` (newer kernels).
     /// Used to derive CR3 for page table walks when KVM SREGS are unavailable.
@@ -105,6 +117,20 @@ pub(crate) struct KernelSymbols {
     /// file-scope static rather than a field on `struct scx_sched`.
     /// None on 7.1+ or when the symbol is absent.
     pub scx_watchdog_timeout: Option<u64>,
+    /// Kernel virtual address of `scx_watchdog_timestamp` (file-scope
+    /// static `unsigned long` declared at `kernel/sched/ext.c:94`).
+    /// Updated to `jiffies` by `scx_watchdog_workfn`
+    /// (`kernel/sched/ext.c:3383`) each time the workqueue runs;
+    /// `scx_tick` (`kernel/sched/ext.c:3409`) reads it via `READ_ONCE`
+    /// and fires `SCX_EXIT_ERROR_STALL` when
+    /// `jiffies > timestamp + root->watchdog_timeout`. Reading it at
+    /// scan time gives the dual-snapshot path the same global stall
+    /// signal `scx_tick` checks, regardless of whether any task is
+    /// stuck on a per-rq runnable_list. None when the symbol is absent
+    /// (kernel without sched_ext or stripped vmlinux). Lives in
+    /// `.data` (file-scope static), so resolution uses
+    /// [`text_kva_to_pa`].
+    pub scx_watchdog_timestamp: Option<u64>,
     /// Kernel virtual address of `jiffies_64` (`u64` global maintained
     /// by the timer subsystem). Used by the dual-snapshot freeze
     /// coordinator to compare each runnable task's `p->scx.runnable_at`
@@ -133,6 +159,21 @@ pub(crate) struct KernelSymbols {
     /// symbol; the dump path then skips that field per
     /// [`super::btf_offsets::CpuTimeOffsets::tick_sched_iowait_sleeptime`].
     pub tick_cpu_sched: Option<u64>,
+    /// Kernel virtual address of `node_data[]` (declared in
+    /// `include/linux/numa.h` as `extern struct pglist_data *node_data[];`).
+    /// On a NUMA build the array holds `MAX_NUMNODES` `pglist_data *`
+    /// pointers; on a UMA build the symbol may be absent. Used by the
+    /// per-node NUMA event walker to reach each node's `pglist_data`.
+    /// `None` when the symbol is absent (UMA build, stripped vmlinux,
+    /// or kernel built without `CONFIG_NUMA`).
+    ///
+    /// Stub-stage `dead_code` suppression: the consumer
+    /// ([`crate::vmm::capture_numa::build`]) is wired but returns
+    /// `None` until the implementer fills in the walker. Removing
+    /// this attribute is the natural marker for "the producer has
+    /// landed" — drop it the moment a real reader appears.
+    #[allow(dead_code)]
+    pub node_data: Option<u64>,
 }
 
 impl KernelSymbols {
@@ -162,6 +203,11 @@ impl KernelSymbols {
         let page_offset_base_kva = sym_addr("page_offset_base");
 
         let scx_root = sym_addr("scx_root");
+        // scx_tasks is `static LIST_HEAD(scx_tasks)` in
+        // kernel/sched/ext.c:47. Static globals carry lowercase 't'
+        // in `nm` output but are still present in `.symtab` —
+        // sym_addr resolves them by name, no st_bind filtering.
+        let scx_tasks = sym_addr("scx_tasks");
 
         let init_top_pgt = sym_addr("init_top_pgt").or_else(|| sym_addr("swapper_pg_dir"));
 
@@ -170,6 +216,13 @@ impl KernelSymbols {
         let prog_idr = sym_addr("prog_idr");
 
         let scx_watchdog_timeout = sym_addr("scx_watchdog_timeout");
+
+        // scx_watchdog_timestamp is a file-scope static
+        // (`static unsigned long scx_watchdog_timestamp` in
+        // kernel/sched/ext.c) — like other static globals it appears in
+        // .symtab with lowercase 'd' in `nm` output but is still
+        // resolvable by name. Absent on kernels without sched_ext.
+        let scx_watchdog_timestamp = sym_addr("scx_watchdog_timestamp");
 
         let jiffies_64 = sym_addr("jiffies_64");
 
@@ -186,19 +239,27 @@ impl KernelSymbols {
         let kstat = sym_addr("kstat");
         let tick_cpu_sched = sym_addr("tick_cpu_sched");
 
+        // node_data is the `extern struct pglist_data *node_data[]`
+        // global; absent on UMA builds and on kernels built without
+        // CONFIG_NUMA. Walker gates capture on Some.
+        let node_data = sym_addr("node_data");
+
         Ok(Self {
             runqueues,
             per_cpu_offset,
             page_offset_base_kva,
             scx_root,
+            scx_tasks,
             init_top_pgt,
             pgtable_l5_enabled,
             prog_idr,
             scx_watchdog_timeout,
+            scx_watchdog_timestamp,
             jiffies_64,
             kernel_cpustat,
             kstat,
             tick_cpu_sched,
+            node_data,
         })
     }
 }
@@ -495,14 +556,17 @@ mod tests {
             per_cpu_offset: 0,
             page_offset_base_kva: Some(pob_kva),
             scx_root: None,
+            scx_tasks: None,
             init_top_pgt: None,
             pgtable_l5_enabled: None,
             prog_idr: None,
             scx_watchdog_timeout: None,
+            scx_watchdog_timestamp: None,
             jiffies_64: None,
             kernel_cpustat: None,
             kstat: None,
             tick_cpu_sched: None,
+            node_data: None,
         };
 
         assert_eq!(resolve_page_offset(&mem, &symbols), expected_page_offset);
@@ -521,14 +585,17 @@ mod tests {
             per_cpu_offset: 0,
             page_offset_base_kva: None,
             scx_root: None,
+            scx_tasks: None,
             init_top_pgt: None,
             pgtable_l5_enabled: None,
             prog_idr: None,
             scx_watchdog_timeout: None,
+            scx_watchdog_timestamp: None,
             jiffies_64: None,
             kernel_cpustat: None,
             kstat: None,
             tick_cpu_sched: None,
+            node_data: None,
         };
 
         assert_eq!(resolve_page_offset(&mem, &symbols), DEFAULT_PAGE_OFFSET);
@@ -549,14 +616,17 @@ mod tests {
             per_cpu_offset: 0,
             page_offset_base_kva: Some(pob_kva),
             scx_root: None,
+            scx_tasks: None,
             init_top_pgt: None,
             pgtable_l5_enabled: None,
             prog_idr: None,
             scx_watchdog_timeout: None,
+            scx_watchdog_timestamp: None,
             jiffies_64: None,
             kernel_cpustat: None,
             kstat: None,
             tick_cpu_sched: None,
+            node_data: None,
         };
 
         assert_eq!(resolve_page_offset(&mem, &symbols), DEFAULT_PAGE_OFFSET);
@@ -580,14 +650,17 @@ mod tests {
             per_cpu_offset: 0,
             page_offset_base_kva: Some(pob_kva),
             scx_root: None,
+            scx_tasks: None,
             init_top_pgt: None,
             pgtable_l5_enabled: None,
             prog_idr: None,
             scx_watchdog_timeout: None,
+            scx_watchdog_timestamp: None,
             jiffies_64: None,
             kernel_cpustat: None,
             kstat: None,
             tick_cpu_sched: None,
+            node_data: None,
         };
 
         assert_eq!(resolve_page_offset(&mem, &symbols), DEFAULT_PAGE_OFFSET);
@@ -614,14 +687,17 @@ mod tests {
             per_cpu_offset: 0,
             page_offset_base_kva: Some(pob_kva),
             scx_root: None,
+            scx_tasks: None,
             init_top_pgt: None,
             pgtable_l5_enabled: None,
             prog_idr: None,
             scx_watchdog_timeout: None,
+            scx_watchdog_timestamp: None,
             jiffies_64: None,
             kernel_cpustat: None,
             kstat: None,
             tick_cpu_sched: None,
+            node_data: None,
         };
 
         assert_eq!(resolve_page_offset(&mem, &symbols), randomized_page_offset);
@@ -644,14 +720,17 @@ mod tests {
             per_cpu_offset: 0,
             page_offset_base_kva: None,
             scx_root: None,
+            scx_tasks: None,
             init_top_pgt: None,
             pgtable_l5_enabled: Some(l5_kva),
             prog_idr: None,
             scx_watchdog_timeout: None,
+            scx_watchdog_timestamp: None,
             jiffies_64: None,
             kernel_cpustat: None,
             kstat: None,
             tick_cpu_sched: None,
+            node_data: None,
         };
 
         assert!(resolve_pgtable_l5(&mem, &symbols));
@@ -674,14 +753,17 @@ mod tests {
             per_cpu_offset: 0,
             page_offset_base_kva: None,
             scx_root: None,
+            scx_tasks: None,
             init_top_pgt: None,
             pgtable_l5_enabled: Some(l5_kva),
             prog_idr: None,
             scx_watchdog_timeout: None,
+            scx_watchdog_timestamp: None,
             jiffies_64: None,
             kernel_cpustat: None,
             kstat: None,
             tick_cpu_sched: None,
+            node_data: None,
         };
 
         assert!(!resolve_pgtable_l5(&mem, &symbols));
@@ -700,14 +782,17 @@ mod tests {
             per_cpu_offset: 0,
             page_offset_base_kva: None,
             scx_root: None,
+            scx_tasks: None,
             init_top_pgt: None,
             pgtable_l5_enabled: None,
             prog_idr: None,
             scx_watchdog_timeout: None,
+            scx_watchdog_timestamp: None,
             jiffies_64: None,
             kernel_cpustat: None,
             kstat: None,
             tick_cpu_sched: None,
+            node_data: None,
         };
 
         assert!(!resolve_pgtable_l5(&mem, &symbols));

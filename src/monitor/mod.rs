@@ -990,10 +990,13 @@ impl MonitorSummary {
         let first_progs = first.prog_stats.as_ref()?;
         let last_progs = last.prog_stats.as_ref()?;
 
+        let first_by_name: std::collections::HashMap<&str, &bpf_prog::ProgRuntimeStats> =
+            first_progs.iter().map(|p| (p.name.as_str(), p)).collect();
+
         let deltas: Vec<ProgStatsDelta> = last_progs
             .iter()
             .map(|lp| {
-                let fp = first_progs.iter().find(|p| p.name == lp.name);
+                let fp = first_by_name.get(lp.name.as_str()).copied();
                 let cnt = lp.cnt.saturating_sub(fp.map_or(0, |p| p.cnt));
                 let nsecs = lp.nsecs.saturating_sub(fp.map_or(0, |p| p.nsecs));
                 let nsecs_per_call = if cnt > 0 {

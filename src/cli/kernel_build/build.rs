@@ -964,12 +964,11 @@ mod tests {
         // Acquiring path B while path A's lock is still held must
         // ALSO succeed — they hash to different lockfiles, so
         // there's no contention.
-        let fd_b = acquire_source_tree_lock(&path_b, "test")
-            .expect(
-                "path B acquire must succeed concurrently with A — \
+        let fd_b = acquire_source_tree_lock(&path_b, "test").expect(
+            "path B acquire must succeed concurrently with A — \
                  distinct canonical paths must hash to distinct \
                  lockfiles so unrelated builds don't serialize",
-            );
+        );
         let hash_a = crate::fetch::canonical_path_hash(&path_a);
         let hash_b = crate::fetch::canonical_path_hash(&path_b);
         assert_ne!(

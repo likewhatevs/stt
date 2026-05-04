@@ -4,7 +4,8 @@
 //! decision.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use virtio_bindings::virtio_config::{
     VIRTIO_CONFIG_S_ACKNOWLEDGE, VIRTIO_CONFIG_S_DRIVER, VIRTIO_CONFIG_S_DRIVER_OK,
@@ -497,6 +498,7 @@ pub struct VirtioNet {
     ///     spec-compliance and cross-VMM convergence. Operators
     ///     can also detect poison out-of-band via `mmio_read(STATUS)
     ///     & NEEDS_RESET` plus the host counter.
+    ///
     /// Cleared by the guest's `INTERRUPT_ACK` writes. Plain
     /// `u32` for the same single-thread reason as `device_status`
     /// — see that field's doc for the invariant and the
@@ -517,8 +519,26 @@ pub struct VirtioNet {
     config_generation: u32,
     /// Eventfd for KVM irqfd — signals guest interrupt.
     irq_evt: EventFd,
-    /// Guest memory reference. Set before starting vCPUs.
-    mem: Option<GuestMemoryMmap>,
+    /// Guest memory reference. Set once at VM init by `set_mem` before
+    /// any vCPU runs (and therefore before any QUEUE_NOTIFY can fire).
+    /// Wrapped in `Arc<OnceLock<…>>` to mirror virtio-blk's pattern:
+    /// `set_mem` runs once, post-init reads on the TX kick path are
+    /// lock-free `OnceLock::get` calls returning `&GuestMemoryMmap`,
+    /// and a future TAP / AF_PACKET / threaded-NAPI worker can cheaply
+    /// share the same handle by cloning the outer `Arc`. The previous
+    /// `Option<GuestMemoryMmap>` shape forced a full
+    /// `GuestMemoryMmap::clone` on every `process_tx_loopback` call —
+    /// the inner `Arc<RegionMmap>` chain is cheap to clone but it is
+    /// still atomic refcount traffic per TX kick, which is pure
+    /// overhead for a value the device never mutates after init.
+    mem: Arc<OnceLock<GuestMemoryMmap>>,
+    /// One-shot guard so the "queue notify before set_mem" warning
+    /// fires at most once per device instance. Mirrors the virtio-blk
+    /// `mem_unset_warned` field. Latched with `Relaxed` because the
+    /// log message ordering is not correctness-critical. Without it, a
+    /// buggy caller that issues N notifies before `set_mem` would
+    /// flood the log with N copies of the same line.
+    mem_unset_warned: Arc<AtomicBool>,
     /// Static config-space content (mac + zeroed STATUS/MQ/MTU).
     /// Built at construction from `NetConfig`; the bytes are
     /// `byte_valued` and copied directly into the MMIO read response
@@ -622,7 +642,8 @@ impl VirtioNet {
             interrupt_status: 0,
             config_generation: 0,
             irq_evt,
-            mem: None,
+            mem: Arc::new(OnceLock::new()),
+            mem_unset_warned: Arc::new(AtomicBool::new(false)),
             config: VirtioNetConfig {
                 mac: config.mac,
                 status: 0,
@@ -640,9 +661,22 @@ impl VirtioNet {
         &self.irq_evt
     }
 
-    /// Set guest memory reference. Must be called before starting vCPUs.
+    /// Set guest memory reference. Must be called before starting
+    /// vCPUs. `OnceLock::set` returns `Err` if the slot is already
+    /// populated; the production wiring (`init_virtio_net`) calls
+    /// `set_mem` exactly once per device, so the `Err` branch is
+    /// unreachable in normal operation. Log on `Err` rather than panic
+    /// so a future re-wire bug surfaces as a warning instead of
+    /// aborting (a panic here could land mid-teardown when the caller
+    /// is already unwinding). Mirrors virtio-blk's `set_mem`.
     pub fn set_mem(&mut self, mem: GuestMemoryMmap) {
-        self.mem = Some(mem);
+        if self.mem.set(mem).is_err() {
+            tracing::warn!(
+                "virtio-net: set_mem called on already-initialised \
+                 device; guest memory binding unchanged (mem is set \
+                 once at boot and preserved across reset())"
+            );
+        }
     }
 
     /// Cloneable handle to the host-observability counters. The
@@ -781,15 +815,13 @@ impl VirtioNet {
     /// not yet reached DRIVER_OK — the window where queue config is
     /// valid.
     fn queue_config_allowed(&self) -> bool {
-        self.device_status & S_FEAT == S_FEAT
-            && self.device_status & VIRTIO_CONFIG_S_DRIVER_OK == 0
+        self.device_status & S_FEAT == S_FEAT && self.device_status & VIRTIO_CONFIG_S_DRIVER_OK == 0
     }
 
     /// True when driver features may be written: DRIVER set,
     /// FEATURES_OK not yet set.
     fn features_write_allowed(&self) -> bool {
-        self.device_status & S_DRV == S_DRV
-            && self.device_status & VIRTIO_CONFIG_S_FEATURES_OK == 0
+        self.device_status & S_DRV == S_DRV && self.device_status & VIRTIO_CONFIG_S_FEATURES_OK == 0
     }
 
     // ------------------------------------------------------------------
@@ -824,7 +856,25 @@ impl VirtioNet {
         if self.device_status & VIRTIO_CONFIG_S_DRIVER_OK == 0 {
             return;
         }
-        let Some(mem) = self.mem.clone() else {
+        // Clone the `Arc<OnceLock>` once per kick (cheap atomic
+        // refcount bump) so the subsequent `OnceLock::get` borrows
+        // from this local rather than from `self.mem` — which would
+        // freeze every other field for the lifetime of `mem`. The
+        // helpers below need `&mut self.queues[...]` and
+        // `&mut self.tx_frame_scratch`, so the disjoint-field reborrow
+        // through `mem_arc` is what lets the borrow checker see
+        // `self.mem` is not aliased while we work the queues. Replaces
+        // the prior `self.mem.clone()` (a full
+        // `GuestMemoryMmap::clone` traversing every region's inner
+        // `Arc<RegionMmap>`); only one atomic bump now per kick.
+        let mem_arc = Arc::clone(&self.mem);
+        let Some(mem) = mem_arc.get() else {
+            if !self.mem_unset_warned.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    "virtio-net: queue notify before set_mem; \
+                     dropping TX kick until guest memory is wired"
+                );
+            }
             return;
         };
         // Per-queue poison gating: NO entry-level short-circuit on
@@ -869,7 +919,7 @@ impl VirtioNet {
         // `try_loopback_to_rx` (taking the RX borrow), then close
         // the loop iteration with a TX `add_used`.
         loop {
-            let pop_outcome = self.pop_and_capture_tx(&mem);
+            let pop_outcome = self.pop_and_capture_tx(mem);
             let chain_outcome = match pop_outcome {
                 TxPopOutcome::Empty => break,
                 TxPopOutcome::JustPoisoned => {
@@ -896,7 +946,7 @@ impl VirtioNet {
                 // count we use for rx_bytes (truncation vs full),
                 // and the TX add_used at the end of this iteration
                 // determines whether tx_packets bumps at all.
-                match self.try_loopback_to_rx(&mem, len) {
+                match self.try_loopback_to_rx(mem, len) {
                     LoopbackOutcome::Delivered { l2_bytes_written } => {
                         // RX add_used Ok, used-ring advanced.
                         // `l2_bytes_written` reflects actual bytes
@@ -982,7 +1032,7 @@ impl VirtioNet {
             // `tx_add_used_failures` instead, keeping the per-event
             // counter taxonomy 1:1 with observable events.
             let q = &mut self.queues[TXQ];
-            match q.add_used(&mem, head, 0) {
+            match q.add_used(mem, head, 0) {
                 Ok(()) => {
                     if let Some(len) = frame_len {
                         self.counters.record_tx_completed(len as u64);
@@ -1262,7 +1312,10 @@ impl VirtioNet {
             // virtio-v1.2 §5.1.6.5 ("A driver MUST set num_buffers
             // to 0" — implies the header is present in full).
             self.counters.record_tx_chain_invalid();
-            return TxPopOutcome::Chain(TxChainOutcome { head, frame_len: None });
+            return TxPopOutcome::Chain(TxChainOutcome {
+                head,
+                frame_len: None,
+            });
         }
 
         TxPopOutcome::Chain(TxChainOutcome {
@@ -1284,11 +1337,7 @@ impl VirtioNet {
     ///
     /// Returns one of [`LoopbackOutcome`]'s variants — see the
     /// enum doc for the per-variant routing rules.
-    fn try_loopback_to_rx(
-        &mut self,
-        mem: &GuestMemoryMmap,
-        frame_len: usize,
-    ) -> LoopbackOutcome {
+    fn try_loopback_to_rx(&mut self, mem: &GuestMemoryMmap, frame_len: usize) -> LoopbackOutcome {
         // Per-queue poison gate (RX side). If the RX queue's flag
         // is already set, return `RxAlreadyPoisoned` without
         // touching the queue — no iter(), no add_used, no counter

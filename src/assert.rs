@@ -275,6 +275,23 @@ pub(crate) fn format_sched_died_after_all_steps(total_steps: usize, elapsed_s: f
     )
 }
 
+/// Format the scheduler-died detail message for the in-step
+/// liveness probe (the scheduler ESRCH'd during a step's hold-period
+/// sleep, before the step completed).
+///
+/// Begins with [`SCHED_DIED_PREFIX`] verbatim; shares the prefix
+/// invariant documented on [`format_sched_died_after_step`].
+/// Structural routing is via [`DetailKind::SchedulerDied`] on the
+/// emitted detail. Emitted by `run_scenario` when the
+/// liveness-poll inside `run_step`'s hold sleep observes
+/// `process_alive(sched_pid) == false`, replacing the prior
+/// behavior that waited for the post-loop probe to fire (which
+/// stamped the message with the full scenario duration even when
+/// the scheduler had died seconds earlier).
+pub(crate) fn format_sched_died_during_workload(elapsed_s: f64) -> String {
+    format!("{SCHED_DIED_PREFIX} unexpectedly during workload ({elapsed_s:.1}s into test)")
+}
+
 /// A single diagnostic message from an assertion, paired with a
 /// structural [`DetailKind`] so filtering is robust to wording changes.
 ///
@@ -7230,6 +7247,15 @@ numa_miss 5";
         );
     }
 
+    #[test]
+    fn format_sched_died_during_workload_has_expected_template() {
+        let msg = format_sched_died_during_workload(2.04);
+        assert_eq!(
+            msg,
+            "scheduler process died unexpectedly during workload (2.0s into test)",
+        );
+    }
+
     /// Every `format_sched_died_*` helper output begins with
     /// [`SCHED_DIED_PREFIX`]. Operators grepping stderr for the
     /// prefix rely on this invariant; pin it against a regression
@@ -7240,6 +7266,7 @@ numa_miss 5";
         for msg in [
             format_sched_died_after_step(1, 1, 0.0),
             format_sched_died_after_all_steps(1, 0.0),
+            format_sched_died_during_workload(0.0),
         ] {
             assert!(
                 msg.starts_with(SCHED_DIED_PREFIX),

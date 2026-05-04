@@ -53,7 +53,9 @@ pub(crate) use vm_memory::{ByteValued, Bytes, GuestAddress, GuestMemoryMmap};
 // `EpollEvent` / `EventSet` are re-exported because tests for the
 // always-compiled `worker_dispatch_event` helper construct EventSet
 // values directly via `super::*`, and the helper itself accepts an
-// EventSet argument.
+// EventSet argument. clippy --lib doesn't see the test consumers,
+// so the re-export looks unused without the allow.
+#[allow(unused_imports)]
 pub(crate) use vmm_sys_util::epoll::{EpollEvent, EventSet};
 pub(crate) use vmm_sys_util::eventfd::EventFd;
 
@@ -104,6 +106,11 @@ pub const VIRTIO_BLK_SECTOR_SIZE: u32 = 512;
 /// ~109 MB for single-profile metadata and ~256 MB if it picks DUP
 /// metadata (which is the default on a single-device fs). Sized
 /// below 256 MB risks `mkfs.btrfs` failing at template-build time.
+///
+/// `dead_code` allow: only consumed by `#[cfg(test)]` modules
+/// (every virtio_blk test fixture passes this as the device's
+/// capacity); clippy --lib doesn't see those references.
+#[allow(dead_code)]
 pub const VIRTIO_BLK_DEFAULT_CAPACITY_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Maximum number of data segments per request the device supports.
@@ -320,6 +327,13 @@ use super::worker::worker_thread_main;
 ///
 /// `label` is included in any tracing::warn from this function so
 /// operators can identify which gate triggered the publish.
+///
+/// `too_many_arguments` allow: every parameter is independent
+/// per-request state (queue/memory binding, head index, status
+/// address+byte, used-len, label) sourced from a different point
+/// in the chain-handling pipeline. Bundling would build a struct
+/// for one call seam.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn publish_completion<Q: QueueT>(
     mem: &GuestMemoryMmap,
     q: &mut Q,
@@ -1133,6 +1147,16 @@ pub struct VirtioBlk {
     /// observes the clear within 10 ms and resumes its `epoll_wait`
     /// loop.
     pub(crate) paused: Arc<AtomicBool>,
+    /// Optional shared parked_evt the worker writes to alongside
+    /// the `paused.store(true, Release)` so the freeze
+    /// coordinator's rendezvous wakes within microseconds of the
+    /// last parker rather than spinning. `None` when no freeze
+    /// coordinator is plumbed (test paths). The freeze coordinator
+    /// sets this on every device via [`Self::set_parked_evt`]
+    /// before the first `pause()` call. Counter-mode EventFd
+    /// (NOT EFD_SEMAPHORE): a single drain absorbs any number of
+    /// coalesced parker writes.
+    pub(crate) parked_evt: Arc<std::sync::Mutex<Option<Arc<EventFd>>>>,
     /// Per-thread CPU placement applied at the top of
     /// `worker_thread_main` before the worker enters its `epoll_wait`
     /// loop. Mirrors the host topology's perf-mode (`pin_target`) and
@@ -1169,6 +1193,11 @@ impl VirtioBlk {
     /// `capacity_bytes` is the disk capacity advertised to the
     /// guest (rounded down to sector boundary). `throttle` carries
     /// optional IOPS / bandwidth limits.
+    ///
+    /// `dead_code` allow: only consumed by `#[cfg(test)]` modules;
+    /// production callers go through [`Self::with_options`] to set
+    /// the read-only flag explicitly.
+    #[allow(dead_code)]
     pub fn new(backing: File, capacity_bytes: u64, throttle: DiskThrottle) -> Self {
         Self::with_options(backing, capacity_bytes, throttle, false)
     }
@@ -1234,8 +1263,7 @@ impl VirtioBlk {
         // (the test-mode worker is inline, so they observe the
         // same eventfd state without an active worker thread).
         let pause_evt = Arc::new(
-            EventFd::new(libc::EFD_NONBLOCK)
-                .expect("failed to create virtio-blk pause eventfd"),
+            EventFd::new(libc::EFD_NONBLOCK).expect("failed to create virtio-blk pause eventfd"),
         );
         // Initialise to `true` so the freeze coordinator's
         // `is_paused()` poll passes vacuously while no worker is
@@ -1337,7 +1365,27 @@ impl VirtioBlk {
             instance_id: VIRTIO_BLK_INSTANCE_COUNTER.fetch_add(1, Ordering::Relaxed),
             pause_evt,
             paused,
+            parked_evt: Arc::new(std::sync::Mutex::new(None)),
             worker_placement: WorkerPlacement::default(),
+        }
+    }
+
+    /// Plumb the freeze coordinator's shared parked_evt into this
+    /// device. The worker writes to this fd alongside its
+    /// `paused.store(true, Release)` so the coordinator's
+    /// rendezvous wakes within microseconds of the worker
+    /// parking. Called once by `run_vm` before any pause()/resume()
+    /// fires; subsequent worker respawns pick up the same fd via
+    /// the shared `Arc`.
+    ///
+    /// `None` is the default — test paths and any future device
+    /// without a freeze coordinator skip the wake. The worker
+    /// reads through this slot lazily so a setter call AFTER worker
+    /// spawn (e.g. plumbing arrives late) still takes effect on
+    /// the next pause cycle.
+    pub fn set_parked_evt(&self, evt: Arc<EventFd>) {
+        if let Ok(mut guard) = self.parked_evt.lock() {
+            *guard = Some(evt);
         }
     }
 
@@ -1400,6 +1448,12 @@ impl VirtioBlk {
     }
 
     /// Advertised capacity in 512-byte sectors.
+    ///
+    /// `dead_code` allow: kept for forward use by callers that
+    /// need to read back the rounded-to-sector capacity; the lib
+    /// pipeline currently consumes the `capacity_bytes` input
+    /// directly through the config-space rendering path.
+    #[allow(dead_code)]
     pub fn capacity_sectors(&self) -> u64 {
         self.capacity_sectors
     }
@@ -2314,7 +2368,7 @@ pub(crate) fn drain_bracket_impl(
             // backing-file accounting do not expect. Reject up
             // front so the throttle bucket is never charged.
             if matches!(req_type, VIRTIO_BLK_T_IN | VIRTIO_BLK_T_OUT)
-                && data_len % VIRTIO_BLK_SECTOR_SIZE as u64 != 0
+                && !data_len.is_multiple_of(VIRTIO_BLK_SECTOR_SIZE as u64)
             {
                 tracing::warn!(
                     head,
@@ -2776,6 +2830,12 @@ impl VirtioBlk {
     /// `add_used`. A `&self`-method would have to borrow the whole
     /// receiver and conflict with the queue mutation in
     /// `process_requests`.
+    ///
+    /// `too_many_arguments` allow: deliberate disjoint-borrow
+    /// shape — every parameter is a separate `&self` field that
+    /// must be passed by reference so the caller can hold a
+    /// concurrent mutable borrow of the queues vec.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn handle_read_impl(
         backing: &File,
         capacity_bytes: u64,
@@ -2865,6 +2925,10 @@ impl VirtioBlk {
     /// to the status descriptor and gates `add_used` on a
     /// successful status write. `checked_mul` matches
     /// `handle_read_impl` — same overflow concern.
+    ///
+    /// `too_many_arguments` allow: same disjoint-borrow shape as
+    /// [`Self::handle_read_impl`].
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn handle_write_impl(
         backing: &File,
         capacity_bytes: u64,
@@ -3197,7 +3261,7 @@ impl VirtioBlk {
     ///   - 0x08..0x0C: size_max (u32 LE) — VIRTIO_BLK_F_SIZE_MAX
     ///   - 0x0C..0x10: seg_max (u32 LE) — VIRTIO_BLK_F_SEG_MAX
     ///   - 0x10..0x14: geometry (4 bytes) — VIRTIO_BLK_F_GEOMETRY (zero;
-    ///                  feature bit not advertised)
+    ///     feature bit not advertised)
     ///   - 0x14..0x18: blk_size (u32 LE) — VIRTIO_BLK_F_BLK_SIZE
     ///
     /// Reads at offsets `>= VIRTIO_BLK_CONFIG_SIZE` return zero per
@@ -4320,6 +4384,7 @@ impl VirtioBlk {
         let worker_device_status = Arc::clone(&self.device_status);
         let worker_warned = Arc::clone(&self.mem_unset_warned);
         let worker_paused = Arc::clone(&self.paused);
+        let worker_parked_evt_slot = Arc::clone(&self.parked_evt);
         // Snapshot the placement at spawn time. A subsequent
         // `set_worker_placement` call only takes effect on the
         // NEXT respawn; the running worker observes the placement
@@ -4343,6 +4408,7 @@ impl VirtioBlk {
                     worker_kick,
                     worker_stop,
                     pause_fd,
+                    worker_parked_evt_slot,
                 )
             }) {
             Ok(h) => h,

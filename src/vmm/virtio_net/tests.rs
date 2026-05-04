@@ -221,7 +221,11 @@ fn features_ok_rejected_without_version_1() {
     write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_DRV);
     // Write some bits, but NOT VIRTIO_F_VERSION_1.
     write_reg(&mut dev, VIRTIO_MMIO_DRIVER_FEATURES_SEL, 0);
-    write_reg(&mut dev, VIRTIO_MMIO_DRIVER_FEATURES, 1u32 << VIRTIO_NET_F_MAC);
+    write_reg(
+        &mut dev,
+        VIRTIO_MMIO_DRIVER_FEATURES,
+        1u32 << VIRTIO_NET_F_MAC,
+    );
     write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_FEAT);
     let status = read_reg(&dev, VIRTIO_MMIO_STATUS);
     assert_eq!(
@@ -306,11 +310,7 @@ fn config_space_serves_zeros_past_layout() {
     assert_eq!(buf, [0, 0, 0, 0], "reads past populated layout return zero");
     let mut buf = [0u8; 8];
     dev.mmio_read(0x100 + VIRTIO_NET_CONFIG_SIZE as u64 + 16, &mut buf);
-    assert_eq!(
-        buf,
-        [0u8; 8],
-        "reads far past populated layout return zero"
-    );
+    assert_eq!(buf, [0u8; 8], "reads far past populated layout return zero");
 }
 
 #[test]
@@ -442,7 +442,15 @@ fn program_queues(dev: &mut VirtioNet, layout: &TestLayout) {
 
 /// virtio split-ring descriptor layout (16 bytes per entry):
 /// addr u64 | len u32 | flags u16 | next u16
-fn write_desc(mem: &GuestMemoryMmap, table_base: u64, idx: u16, addr: u64, len: u32, flags: u16, next: u16) {
+fn write_desc(
+    mem: &GuestMemoryMmap,
+    table_base: u64,
+    idx: u16,
+    addr: u64,
+    len: u32,
+    flags: u16,
+    next: u16,
+) {
     let off = table_base + (idx as u64) * 16;
     let mut buf = [0u8; 16];
     buf[0..8].copy_from_slice(&addr.to_le_bytes());
@@ -477,8 +485,11 @@ fn place_tx_chain(mem: &GuestMemoryMmap, layout: &TestLayout, payload: &[u8]) {
     let zero_hdr = [0u8; VIRTIO_NET_HDR_LEN];
     mem.write_slice(&zero_hdr, GuestAddress(layout.tx_frame_buf))
         .unwrap();
-    mem.write_slice(payload, GuestAddress(layout.tx_frame_buf + VIRTIO_NET_HDR_LEN as u64))
-        .unwrap();
+    mem.write_slice(
+        payload,
+        GuestAddress(layout.tx_frame_buf + VIRTIO_NET_HDR_LEN as u64),
+    )
+    .unwrap();
     // Single read-only descriptor (flags=0, no NEXT) covering both.
     let total = (VIRTIO_NET_HDR_LEN + payload.len()) as u32;
     write_desc(mem, layout.tx_desc, 0, layout.tx_frame_buf, total, 0, 0);
@@ -566,7 +577,11 @@ fn loopback_drops_tx_when_rx_queue_empty() {
     // at zero. The conservation identity holds:
     //   tx_packets (1) = rx_packets (0) + tx_dropped_no_rx_buffer (1)
     //                  + rx_chain_invalid (0) + rx_add_used_failures (0)
-    assert_eq!(counters.tx_packets(), 1, "TX add_used succeeded → tx_packets bumps");
+    assert_eq!(
+        counters.tx_packets(),
+        1,
+        "TX add_used succeeded → tx_packets bumps"
+    );
     assert_eq!(counters.tx_bytes(), payload.len() as u64);
     assert_eq!(counters.rx_packets(), 0, "no RX delivery when queue empty");
     assert_eq!(counters.rx_bytes(), 0);
@@ -575,7 +590,11 @@ fn loopback_drops_tx_when_rx_queue_empty() {
         1,
         "must record TX drop when RX queue empty"
     );
-    assert_eq!(counters.rx_chain_invalid(), 0, "queue was empty, not malformed");
+    assert_eq!(
+        counters.rx_chain_invalid(),
+        0,
+        "queue was empty, not malformed"
+    );
     assert_eq!(counters.tx_add_used_failures(), 0);
     assert_eq!(counters.rx_add_used_failures(), 0);
     // The TX add_used DID advance the used-ring (TX completion is
@@ -705,7 +724,11 @@ fn rx_chain_with_read_only_descriptor_marked_invalid() {
     // double-bump on tx_dropped_no_rx_buffer — a chain WAS popped,
     // just rejected for shape; the queue was not empty). The
     // failure-classification taxonomy stays 1:1 with events.
-    assert_eq!(counters.rx_chain_invalid(), 1, "RX direction violation must be flagged");
+    assert_eq!(
+        counters.rx_chain_invalid(),
+        1,
+        "RX direction violation must be flagged"
+    );
     assert_eq!(
         counters.tx_dropped_no_rx_buffer(),
         0,
@@ -713,9 +736,17 @@ fn rx_chain_with_read_only_descriptor_marked_invalid() {
     );
     // tx_packets advances because TX add_used succeeded; rx_packets
     // does NOT advance because the RX delivery itself failed.
-    assert_eq!(counters.tx_packets(), 1, "TX add_used succeeded → tx_packets bumps");
+    assert_eq!(
+        counters.tx_packets(),
+        1,
+        "TX add_used succeeded → tx_packets bumps"
+    );
     assert_eq!(counters.rx_packets(), 0, "no successful RX delivery");
-    assert_eq!(counters.rx_add_used_failures(), 0, "RX add_used succeeded (recycled with len=0)");
+    assert_eq!(
+        counters.rx_add_used_failures(),
+        0,
+        "RX add_used succeeded (recycled with len=0)"
+    );
     // The malformed-RX path issued add_used(head, 0) successfully
     // to recycle the descriptor — that advances the used-ring, so
     // the guest's NAPI must wake to observe the empty completion.
@@ -763,9 +794,13 @@ fn loopback_two_frames_in_one_kick() {
     // TX chain 1: separate buffer at 0x5800 (still inside guest mem)
     let chain1_buf = layout.tx_frame_buf + 0x800;
     let payload1: Vec<u8> = (50..70u8).collect();
-    mem.write_slice(&zero_hdr, GuestAddress(chain1_buf)).unwrap();
-    mem.write_slice(&payload1, GuestAddress(chain1_buf + VIRTIO_NET_HDR_LEN as u64))
+    mem.write_slice(&zero_hdr, GuestAddress(chain1_buf))
         .unwrap();
+    mem.write_slice(
+        &payload1,
+        GuestAddress(chain1_buf + VIRTIO_NET_HDR_LEN as u64),
+    )
+    .unwrap();
     write_desc(
         &mem,
         layout.tx_desc,
@@ -779,7 +814,8 @@ fn loopback_two_frames_in_one_kick() {
     // Publish both heads.
     let avail_idx_off = layout.tx_avail + 2;
     let ring_off = layout.tx_avail + 4;
-    mem.write_slice(&0u16.to_le_bytes(), GuestAddress(ring_off)).unwrap();
+    mem.write_slice(&0u16.to_le_bytes(), GuestAddress(ring_off))
+        .unwrap();
     mem.write_slice(&1u16.to_le_bytes(), GuestAddress(ring_off + 2))
         .unwrap();
     mem.write_slice(&2u16.to_le_bytes(), GuestAddress(avail_idx_off))
@@ -790,7 +826,8 @@ fn loopback_two_frames_in_one_kick() {
     write_desc(&mem, layout.rx_desc, 1, layout.rx_buf + 0x400, 256, 2, 0);
     let avail_idx_off = layout.rx_avail + 2;
     let ring_off = layout.rx_avail + 4;
-    mem.write_slice(&0u16.to_le_bytes(), GuestAddress(ring_off)).unwrap();
+    mem.write_slice(&0u16.to_le_bytes(), GuestAddress(ring_off))
+        .unwrap();
     mem.write_slice(&1u16.to_le_bytes(), GuestAddress(ring_off + 2))
         .unwrap();
     mem.write_slice(&2u16.to_le_bytes(), GuestAddress(avail_idx_off))
@@ -808,7 +845,8 @@ fn loopback_two_frames_in_one_kick() {
 
     // Verify RX0 holds payload0, RX1 holds payload1.
     let mut rx0 = vec![0u8; VIRTIO_NET_HDR_LEN + payload0.len()];
-    mem.read_slice(&mut rx0, GuestAddress(layout.rx_buf)).unwrap();
+    mem.read_slice(&mut rx0, GuestAddress(layout.rx_buf))
+        .unwrap();
     assert_eq!(&rx0[VIRTIO_NET_HDR_LEN..], payload0.as_slice());
 
     let mut rx1 = vec![0u8; VIRTIO_NET_HDR_LEN + payload1.len()];
@@ -932,7 +970,11 @@ fn tx_add_used_failures_distinct_from_tx_chain_invalid() {
     write_reg(&mut dev, VIRTIO_MMIO_QUEUE_NOTIFY, TXQ as u32);
 
     let counters = dev.counters();
-    assert_eq!(counters.tx_chain_invalid(), 1, "chain-shape rejection counted");
+    assert_eq!(
+        counters.tx_chain_invalid(),
+        1,
+        "chain-shape rejection counted"
+    );
     assert_eq!(
         counters.tx_add_used_failures(),
         0,
@@ -961,7 +1003,11 @@ fn features_ok_rejected_when_driver_accepts_unoffered_bit() {
     // Negotiate VERSION_1 (so the VERSION_1 gate would not fire) +
     // F_MQ (which we did NOT offer) — the subset gate must catch this.
     write_reg(&mut dev, VIRTIO_MMIO_DRIVER_FEATURES_SEL, 0);
-    write_reg(&mut dev, VIRTIO_MMIO_DRIVER_FEATURES, 1u32 << VIRTIO_NET_F_MQ);
+    write_reg(
+        &mut dev,
+        VIRTIO_MMIO_DRIVER_FEATURES,
+        1u32 << VIRTIO_NET_F_MQ,
+    );
     write_reg(&mut dev, VIRTIO_MMIO_DRIVER_FEATURES_SEL, 1);
     write_reg(
         &mut dev,
@@ -993,7 +1039,11 @@ fn features_ok_accepted_with_only_offered_bits() {
     write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_ACK);
     write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_DRV);
     write_reg(&mut dev, VIRTIO_MMIO_DRIVER_FEATURES_SEL, 0);
-    write_reg(&mut dev, VIRTIO_MMIO_DRIVER_FEATURES, 1u32 << VIRTIO_NET_F_MAC);
+    write_reg(
+        &mut dev,
+        VIRTIO_MMIO_DRIVER_FEATURES,
+        1u32 << VIRTIO_NET_F_MAC,
+    );
     write_reg(&mut dev, VIRTIO_MMIO_DRIVER_FEATURES_SEL, 1);
     write_reg(
         &mut dev,
@@ -1103,7 +1153,11 @@ fn tx_kick_before_driver_ok_ignored() {
     write_reg(&mut dev, VIRTIO_MMIO_QUEUE_NOTIFY, TXQ as u32);
 
     let counters = dev.counters();
-    assert_eq!(counters.tx_packets(), 0, "kick before DRIVER_OK must not advance counters");
+    assert_eq!(
+        counters.tx_packets(),
+        0,
+        "kick before DRIVER_OK must not advance counters"
+    );
     assert_eq!(counters.rx_packets(), 0);
     assert_eq!(counters.tx_chain_invalid(), 0);
     assert_eq!(counters.rx_chain_invalid(), 0);

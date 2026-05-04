@@ -58,6 +58,8 @@ use std::sync::Arc;
 use std::sync::Once;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use vmm_sys_util::eventfd::EventFd;
+
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 
@@ -107,6 +109,22 @@ fn make_hook(prev: Box<PanicHook>) -> Box<PanicHook> {
             if let Some(ctx) = slot.borrow().as_ref() {
                 ctx.kill.store(true, Ordering::Release);
                 ctx.exited.store(true, Ordering::Release);
+                // Wake the freeze coordinator's epoll loop. EventFd
+                // writes are not async-signal-safe per spec, but a
+                // panic hook is not a signal handler — it runs on
+                // the panicking thread under normal Rust runtime
+                // context. WouldBlock (counter overflow) is
+                // swallowed: the coordinator has at least one wake
+                // pending in that case, so missing this one is
+                // harmless. Any other error is logged but non-fatal
+                // — under panic=abort the kill flag itself is
+                // observed via the watchdog's atomic-load fallback.
+                if let Some(ref evt) = ctx.kill_evt {
+                    let _ = evt.write(1);
+                }
+                if let Some(ref evt) = ctx.exited_evt {
+                    let _ = evt.write(1);
+                }
             }
         });
         prev(info);
@@ -162,6 +180,28 @@ pub(crate) struct VcpuPanicCtx {
     /// `libc::abort` call returns to the kernel, so the parent can
     /// record "vcpu-N exited" in its failure ledger.
     pub(crate) exited: Arc<AtomicBool>,
+    /// Companion eventfd for `kill`. When `Some`, the panic hook
+    /// writes `1` after the `kill.store(true)` so any thread
+    /// blocked in `epoll_wait` (notably the freeze coordinator)
+    /// wakes immediately rather than waiting for its next epoll
+    /// timeout. None on paths that have no epoll listener (the
+    /// interactive shell wires kill via signal-based kicks instead).
+    /// EventFd::write is async-signal-unsafe by spec, but a panic
+    /// hook is not a signal handler — it runs synchronously on the
+    /// panicking thread before `libc::abort`, in normal Rust
+    /// runtime context. The write is allocation-free and panic-free
+    /// (`write_all` on a non-blocking eventfd either succeeds, or
+    /// returns `WouldBlock`, which we swallow because the
+    /// coordinator already has at least one wake pending).
+    pub(crate) kill_evt: Option<Arc<EventFd>>,
+    /// Companion eventfd for `exited`. Same rationale as `kill_evt`
+    /// but bound to the per-thread `exited` flag. For the BSP
+    /// thread `exited` IS `bsp_done`, so this is the bsp_done_evt
+    /// the freeze coordinator polls; for AP threads the freeze
+    /// coordinator does not poll per-AP exited via epoll (joins
+    /// happen after `run.kill = true` covers all APs), so AP
+    /// callers leave this `None`.
+    pub(crate) exited_evt: Option<Arc<EventFd>>,
 }
 
 static HOOK_ONCE: Once = Once::new();
@@ -284,6 +324,8 @@ mod tests {
         let ctx = VcpuPanicCtx {
             kill: Arc::new(AtomicBool::new(false)),
             exited: Arc::new(AtomicBool::new(false)),
+            kill_evt: None,
+            exited_evt: None,
         };
         std::thread::spawn(move || {
             with_vcpu_panic_ctx(ctx, || {});
@@ -312,6 +354,8 @@ mod tests {
         let ctx = VcpuPanicCtx {
             kill: Arc::new(AtomicBool::new(false)),
             exited: Arc::new(AtomicBool::new(false)),
+            kill_evt: None,
+            exited_evt: None,
         };
         std::thread::spawn(move || {
             let _ = catch_unwind(AssertUnwindSafe(|| {
@@ -340,6 +384,8 @@ mod tests {
         let ctx = VcpuPanicCtx {
             kill: kill.clone(),
             exited: exited.clone(),
+            kill_evt: None,
+            exited_evt: None,
         };
         let kill_c = kill.clone();
         let exited_c = exited.clone();
@@ -405,6 +451,8 @@ mod tests {
         let ctx = VcpuPanicCtx {
             kill: kill.clone(),
             exited: exited.clone(),
+            kill_evt: None,
+            exited_evt: None,
         };
         std::thread::spawn(move || {
             let _ = catch_unwind(AssertUnwindSafe(|| {

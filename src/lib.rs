@@ -619,6 +619,22 @@ pub mod prelude {
     };
     pub use crate::scenario::payload_run::{PayloadHandle, PayloadRun};
     pub use crate::scenario::scenarios;
+    // Snapshot accessor surface and the underlying report shapes
+    // a test author needs to inspect the captured BTF-rendered
+    // bytes. The renderer types come from monitor::btf_render and
+    // monitor::dump (otherwise crate-private modules); re-exported
+    // here so an out-of-crate caller can build synthetic
+    // FailureDumpReports for unit-testing their assertions
+    // against the snapshot accessor without booting a VM.
+    pub use crate::monitor::btf_render::{RenderedMember, RenderedValue};
+    pub use crate::monitor::dump::{
+        FailureDumpEntry, FailureDumpMap, FailureDumpPercpuEntry, FailureDumpPercpuHashEntry,
+        FailureDumpReport, SCHEMA_DUAL, SCHEMA_SINGLE,
+    };
+    pub use crate::scenario::snapshot::{
+        BridgeGuard, CaptureCallback, MAX_WATCH_SNAPSHOTS, Snapshot, SnapshotBridge, SnapshotEntry,
+        SnapshotError, SnapshotField, SnapshotMap, SnapshotResult, WatchRegisterCallback,
+    };
     pub use crate::scenario::{CgroupGroup, Ctx, collect_all, spawn_diverse};
     pub use crate::test_support::{
         BpfMapWrite, CgroupPath, MemSideCache, Metric, MetricBounds, MetricCheck, MetricHint,

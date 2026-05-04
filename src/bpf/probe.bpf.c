@@ -7,6 +7,63 @@
 
 char _license[] SEC("license") = "GPL";
 
+/* Per-CPU counter infrastructure. Each hot counter is a slot in a
+ * cacheline-aligned per-CPU array in `.bss`, indexed by
+ * `bpf_get_smp_processor_id() & CPU_MASK`. Replaces N independent
+ * `__sync_fetch_and_add(&ktstr_<name>, 1)` against shared globals,
+ * which caused full cacheline bounces on every fire from per-CPU
+ * tracepoint handlers (preempt_disable / preempt_enable in
+ * particular). The struct is forced to 128-byte alignment so each
+ * slot occupies its own cacheline (every common host arch ktstr
+ * targets has cachelines <= 128 bytes); the array shape
+ * `[MAX_CPUS][KTSTR_PCPU_NR]` keeps each CPU's counters
+ * contiguous, which the host-side reader sums over by walking the
+ * `.bss` Datasec via BTF.
+ *
+ * MAX_CPUS = 256 covers every realistic ktstr VM (host topology
+ * far exceeds guest vCPU counts; ktstr's own kconfig caps the
+ * guest CPU count well below 256). The CPU_MASK & operation is a
+ * cheap saturating fold for the impossible case where
+ * `bpf_get_smp_processor_id()` returns >= MAX_CPUS — the slot
+ * still hits a valid array entry; cross-CPU collisions on the
+ * folded slot are benign because the atomic add still preserves
+ * counter monotonicity. */
+#define CPU_MASK 255
+#define MAX_CPUS (CPU_MASK + 1)
+
+struct pcpu_counter {
+	long value;
+} __attribute__((aligned(128)));
+
+enum ktstr_pcpu_idx {
+	KTSTR_PCPU_PROBE_COUNT = 0,
+	KTSTR_PCPU_KPROBE_RETURNS,
+	KTSTR_PCPU_META_MISS,
+	KTSTR_PCPU_RINGBUF_DROPS,
+	KTSTR_PCPU_EVENT_TP_COUNT,
+	KTSTR_PCPU_EVENT_RINGBUF_DROPS,
+	KTSTR_PCPU_TIMELINE_COUNT,
+	KTSTR_PCPU_TIMELINE_DROPS,
+	KTSTR_PCPU_PI_COUNT,
+	KTSTR_PCPU_PI_ORPHAN_FEXITS,
+	KTSTR_PCPU_PI_CLASS_CHANGE_COUNT,
+	KTSTR_PCPU_PI_DROPS,
+	KTSTR_PCPU_LOCK_CONTEND_COUNT,
+	KTSTR_PCPU_LOCK_CONTEND_DROPS,
+	KTSTR_PCPU_PREEMPT_DISABLE_COUNT,
+	KTSTR_PCPU_PREEMPT_ENABLE_COUNT,
+	KTSTR_PCPU_TRIGGER_COUNT,
+	KTSTR_PCPU_NR
+};
+
+struct pcpu_counter ktstr_pcpu_counters[MAX_CPUS][KTSTR_PCPU_NR];
+
+static __always_inline void ktstr_pcpu_inc(u32 idx)
+{
+	u32 cpu = bpf_get_smp_processor_id() & CPU_MASK;
+	__sync_add_and_fetch(&ktstr_pcpu_counters[cpu][idx].value, 1);
+}
+
 /* Userspace-populated: maps func_ip -> func_meta. */
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
@@ -38,11 +95,14 @@ struct {
 	__uint(max_entries, 1);
 } probe_scratch SEC(".maps");
 
-/* Ring buffer for events to userspace. */
+/* Ring buffer for events to userspace. Prefixed `ktstr_` so the
+ * failure-dump renderer's bare-name skip list can drop the
+ * framework's own ringbuf without colliding with a user
+ * scheduler's map literally named `events`. */
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
 	__uint(max_entries, 256 * 1024);
-} events SEC(".maps");
+} ktstr_events SEC(".maps");
 
 /* Dedicated timeline ringbuf for the sched_switch /
  * sched_migrate_task / sched_wakeup tracepoint handlers (#27). Sized
@@ -50,9 +110,10 @@ struct {
  * record = ~26k events of headroom (~a few seconds of full-tilt
  * scheduler activity on a small VM). On overflow, the producer's
  * `bpf_ringbuf_reserve` returns NULL, the new event is dropped, and
- * `ktstr_timeline_drops` is incremented. The host-side consumer
- * polls this ringbuf only after the error-exit latch fires (see
- * `ktstr_err_exit_detected`) — zero syscall traffic / consumer
+ * the `KTSTR_PCPU_TIMELINE_DROPS` slot in `ktstr_pcpu_counters` is
+ * incremented (host-side reader sums across CPUs). The host-side
+ * consumer polls this ringbuf only after the error-exit latch fires
+ * (see `ktstr_err_exit_detected`) — zero syscall traffic / consumer
  * wakeups during a passing test. */
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -150,27 +211,12 @@ volatile const bool ktstr_enabled = false;
  */
 volatile u32 ktstr_err_exit_detected = 0;
 
-/* Diagnostic counters — readable from userspace after drain.
- * ktstr_trigger_count counts ALL sched_ext_exit fires (including
- * non-error kinds like DONE/UNREG), not just error-class exits. */
-u64 ktstr_trigger_count = 0;
-u64 ktstr_probe_count = 0;
-u64 ktstr_meta_miss = 0;
-
-/* Counts kprobe runs that completed past the meta lookup, scratch
- * lookup, and arg/field reads, and committed an entry to probe_data.
- * Pairs with ktstr_probe_count: (probe_count - kprobe_returns) is the
- * number of kprobe fires that bailed early (meta miss / scratch miss).
- * The timeline sampler reads this alongside ktstr_probe_count so an
- * operator sees commit-rate vs fire-rate at every tick. */
-u64 ktstr_kprobe_returns = 0;
-
-/* Number of times the trigger handler's bpf_ringbuf_reserve() failed.
- * A ringbuf full at error-exit time means the userspace consumer
- * fell behind, so the auto-repro path will see a missing event;
- * surfacing the drop count distinguishes "scheduler did not error"
- * from "scheduler errored but the event never made it to userspace". */
-u64 ktstr_ringbuf_drops = 0;
+/* Diagnostic counters live in the per-CPU `ktstr_pcpu_counters`
+ * array above; see the `enum ktstr_pcpu_idx` declaration for the
+ * slot-to-name mapping. The host-side reader sums each slot across
+ * CPUs to recover the cumulative count. The previous global
+ * `__sync_fetch_and_add(&ktstr_<name>, 1)` pattern is replaced by
+ * `ktstr_pcpu_inc(KTSTR_PCPU_<NAME>)` at every fire site. */
 
 /* Nanosecond timestamp (bpf_ktime_get_ns) of the first error-class
  * sched_ext_exit fire — written exactly once when the latch flips
@@ -198,87 +244,102 @@ u64 ktstr_last_trigger_ts = 0;
  * write to keep the snapshot causally tied to the first error. */
 struct scx_event_stats ktstr_exit_event_stats = {};
 
-/* Cumulative count of `tp_btf/sched_ext_event` tracepoint fires
- * since probe attach. Each fire bumps a single SCX_EV_* counter
- * kernel-side; the trigger-side aggregation in
- * `ktstr_exit_event_stats` shows the totals at exit, but
- * `ktstr_event_tp_count` lets a host-side observer see whether the
- * tracepoint is firing at all (vs. a kernel without
- * `CONFIG_TRACEPOINTS` or with `tp_btf/sched_ext_event` absent —
- * pre-6.16 kernels). Bumped via `__sync_fetch_and_add` because
- * the tracepoint fires in arbitrary CPU contexts. */
-u64 ktstr_event_tp_count = 0;
+/* `KTSTR_PCPU_EVENT_TP_COUNT` and `KTSTR_PCPU_EVENT_RINGBUF_DROPS`
+ * are per-CPU slots in the array above (see `enum ktstr_pcpu_idx`).
+ * Replaced the prior `ktstr_event_tp_count` /
+ * `ktstr_event_ringbuf_drops` globals to avoid cross-CPU cacheline
+ * bouncing on the `tp_btf/sched_ext_event` hot path — the
+ * tracepoint fires whenever any SCX_EV_* counter increments, which
+ * on a busy scheduler is millions of times per second. */
 
-/* Number of times the per-event ringbuf reserve failed inside
- * `ktstr_event_tp`. Distinguishes "events tracepoint fired but
- * userspace fell behind" from "events tracepoint never fires". */
-u64 ktstr_event_ringbuf_drops = 0;
-
-/* Cumulative count of timeline events submitted into the
- * `timeline_events` ringbuf since probe attach (sched_switch +
- * sched_migrate_task + sched_wakeup combined). Lets a host-side
- * observer read commit volume even before any drain — a non-zero
- * count proves the tracepoints are firing and the BPF programs are
+/* `KTSTR_PCPU_TIMELINE_COUNT` / `KTSTR_PCPU_TIMELINE_DROPS` are
+ * per-CPU slots in the array above. The timeline producers
+ * (sched_switch, sched_migrate_task, sched_wakeup) fire on every
+ * scheduler decision per CPU — turning the previous shared-global
+ * counter into a per-CPU slot eliminates the cacheline bounce that
+ * was the steady-state cost of having the timeline ringbuf
  * attached. */
-u64 ktstr_timeline_count = 0;
 
-/* Cumulative count of timeline-event submissions that failed
- * because the dedicated `timeline_events` ringbuf was full. Each
- * drop is a NEW event lost — the ring's existing contents stay
- * intact (BPF ringbuf reserve does not evict on overflow). The
- * "drained only on test failure" design implies steady-state fill
- * during long passing tests; userspace surfaces this counter so an
- * operator can tell whether a post-failure drain saw the full
- * window or only the tail. */
-u64 ktstr_timeline_drops = 0;
+/* PI fentry/fexit counters live in the per-CPU array as
+ * `KTSTR_PCPU_PI_COUNT`, `KTSTR_PCPU_PI_ORPHAN_FEXITS`,
+ * `KTSTR_PCPU_PI_CLASS_CHANGE_COUNT`, and `KTSTR_PCPU_PI_DROPS`.
+ * `rt_mutex_setprio` is a sparse kernel path so the steady-state
+ * fire rate is low, but moving it into the per-CPU array keeps
+ * the hot-path counter pattern uniform across every event class
+ * — a future tracepoint addition just appends another slot to
+ * `enum ktstr_pcpu_idx` instead of reintroducing a shared
+ * global. */
 
-/* Cumulative count of priority-inheritance transitions captured
- * via `fentry/fexit` on `rt_mutex_setprio` (#61). Sparse — the
- * kernel function is called only when an rt_mutex waiter chain
- * changes a task's effective priority, so a value of 0 is the
- * common steady state on any test that does not exercise PI.
- * Bumped on the fexit path after the timeline record commits, so
- * the count mirrors successful submissions; drops bump
- * `ktstr_pi_drops` instead. */
-u64 ktstr_pi_count = 0;
+/* `KTSTR_PCPU_LOCK_CONTEND_COUNT` /
+ * `KTSTR_PCPU_LOCK_CONTEND_DROPS` are per-CPU slots in the array
+ * above. `tp_btf/contention_begin` fires from every contended-
+ * lock waiter path on every CPU, so per-CPU storage is critical:
+ * a lock-storm test on a CONFIG_LOCK_STAT-enabled kernel can
+ * generate hundreds of millions of fires across the run. */
 
-/* Cumulative count of fexit fires that lost their entry-side
- * snapshot — fentry never recorded an entry for the same
- * task pointer (e.g. an attach-time race where fexit fired before
- * fentry on the same call, or pi_scratch overflow rejected the
- * entry). Stays 0 in steady state on any well-formed run. */
-u64 ktstr_pi_orphan_fexits = 0;
+/* Sticky scx_sched-state snapshot taken at the same atomic moment as
+ * the `ktstr_err_exit_detected` latch (BEFORE the publishing CAS, so
+ * a host observer that polls the latch and sees `1` is guaranteed to
+ * also see populated snapshot fields). The host-side dump renderer
+ * resolves these vars by name via the probe's BTF Datasec walk and
+ * uses them as a fallback for `read_scx_sched_state` when the live
+ * `*scx_root` deref returns NULL — which happens during the narrow
+ * teardown window where `scx_unregister` has already nulled the
+ * root pointer but the failure dump is still in flight.
+ *
+ * The kernel writes `*scx_root` to NULL during scheduler teardown
+ * (kernel/sched/ext.c::scx_unregister); a freeze that fires AFTER
+ * the err exit but BEFORE the kernel reaches the next idle would
+ * still see the populated `*scx_root` and read live state. A freeze
+ * delayed past `scx_unregister` (slow guest, contended lock, etc.)
+ * would observe `*scx_root == 0` and lose every scheduler scalar —
+ * `aborting`, `bypass_depth`, `exit_kind`, `watchdog_timeout`. The
+ * snapshot below is captured BEFORE the scheduler reaches the
+ * teardown path because the BPF tp_btf handler fires from inside
+ * `scx_claim_exit` (kernel/sched/ext.c:9210) — well before
+ * `scx_unregister` runs. So the values written here represent the
+ * scheduler at the instant it errored out, even if `*scx_root` has
+ * been nulled by the time the host reads guest memory.
+ *
+ * All five fields are sticky: written exactly once when the latch
+ * flips 0 -> 1. Subsequent error-class fires (racing scx_sched
+ * instances) skip the writes to keep the snapshot causally tied to
+ * the first error — same rule as `ktstr_exit_event_stats` /
+ * `ktstr_last_trigger_ts`.
+ */
 
-/* Cumulative count of priority-inheritance transitions where the
- * task's `sched_class` changed from fentry to fexit (e.g. PI
- * promoted a CFS task into the RT class via `rt_mutex_setprio`'s
- * `__setscheduler_class` call). Bumped on the fexit path BEFORE
- * the timeline record commits, so the count tracks observed
- * class-flip events even if a subsequent ringbuf reserve drops
- * the timeline record. The companion timeline record carries
- * only the prio pair; this counter is the structural surface for
- * "did any class transition happen during the test?" without
- * forcing a per-event wire bump. */
-u64 ktstr_pi_class_change_count = 0;
+/* `scx_sched.aborting` at the moment the first error-class exit
+ * fired. Mirrors the 1-byte bool in `struct scx_sched`; written via
+ * `BPF_CORE_READ` so a kernel build with the bit at a different
+ * offset (debug vs release) still resolves correctly. */
+bool ktstr_exit_aborting = false;
 
-/* Cumulative count of TL_EVT_PI_BOOST submissions that failed
- * because the dedicated `timeline_events` ringbuf was full when
- * the PI fexit handler tried to commit. Distinct from
- * `ktstr_timeline_drops` so an operator can tell which producer
- * fell behind on the drain. */
-u64 ktstr_pi_drops = 0;
+/* `scx_sched.bypass_depth` at the same instant. Non-zero indicates
+ * the kernel was in bypass mode (dispatching tasks without the BPF
+ * scheduler) when the error fired. */
+s32 ktstr_exit_bypass_depth = 0;
 
-/* Cumulative count of `lock:contention_begin` tracepoint fires
- * that committed a TL_EVT_LOCK_CONTEND timeline record (#63).
- * The tracepoint is unconditionally available in mainline (see
- * include/trace/events/lock.h); CONFIG_LOCK_STAT is NOT a gate.
- * A non-zero count proves the tracepoint attached and a real
- * lock-contention waiter path was hit during the run. */
-u64 ktstr_lock_contend_count = 0;
+/* The `kind` argument the tp_btf handler received. Stored even when
+ * `*scx_root` is NULL (no BPF_CORE_READ chain needed) so the
+ * fallback path always has the SCX_EXIT_* class even when every
+ * scheduler-scalar read fails. */
+u32 ktstr_exit_kind_snap = 0;
 
-/* Cumulative count of TL_EVT_LOCK_CONTEND timeline-event
- * submissions that failed because the ringbuf was full. */
-u64 ktstr_lock_contend_drops = 0;
+/* The kernel virtual address of the `scx_sched` instance the kernel
+ * read `*scx_root` to at the snapshot instant. Zero when
+ * `*scx_root == 0` already (the BPF program reads `&scx_root` via
+ * `bpf_probe_read_kernel`, then dereferences). The host renderer
+ * uses this to confirm the snapshot's scope when multiple scheds
+ * are loaded. */
+u64 ktstr_exit_sched_kva = 0;
+
+/* `scx_sched.watchdog_timeout` (jiffies) at the same instant. Lets
+ * the dump report the kernel's observed timeout setting independent
+ * of the host-side `KtstrTestEntry.watchdog_timeout` plumbing — a
+ * scheduler that runtime-overrode the timeout (e.g. via
+ * `scx_sched.watchdog_timeout` write in init) is captured as it
+ * was. */
+u64 ktstr_exit_watchdog_timeout = 0;
 
 /* Per-task scratch map for `rt_mutex_setprio` fentry/fexit
  * pairing (#61). Keyed by `p` (the boosted task's `task_struct *`),
@@ -291,8 +352,8 @@ u64 ktstr_lock_contend_drops = 0;
  * ktstr scenario.
  *
  * BPF_MAP_TYPE_HASH (not LRU) so an orphan entry that fexit never
- * paired stays around and surfaces as `ktstr_pi_orphan_fexits` on
- * the next fentry that reuses the slot — LRU silent-eviction
+ * paired stays around and surfaces via `KTSTR_PCPU_PI_ORPHAN_FEXITS`
+ * on the next fentry that reuses the slot — LRU silent-eviction
  * would mask the producer bug. The fexit handler always deletes
  * the entry after a successful pair, so steady-state map
  * occupancy stays at the in-flight count. */
@@ -327,6 +388,52 @@ u32 ktstr_miss_log_idx = 0;
 extern void scx_bpf_events(struct scx_event_stats *events,
 			   __u64 events__sz) __ksym;
 
+/* `scx_root` data-symbol extern. The kernel definition is a global
+ * `struct scx_sched __rcu *scx_root` (kernel/sched/ext.c:22). Taking
+ * `&scx_root` gives the kernel virtual address of the pointer
+ * variable; the BPF tp_btf handler reads through that with
+ * `bpf_probe_read_kernel` to get the live `*scx_root` (the actual
+ * scx_sched* the kernel currently has attached).
+ *
+ * Declared `__weak` so a kernel image without `scx_root` exported
+ * (pre-6.16, stripped vmlinux, sched_ext-disabled config) still
+ * loads the probe — the loader resolves &scx_root to NULL and the
+ * tp_btf handler skips the snapshot capture rather than failing the
+ * BPF program load. The host-side `read_scx_sched_state` path stays
+ * as fallback in those cases. The snapshot is the strict subset of
+ * scheduler state the host renderer needs when `*scx_root == 0` at
+ * dump time — a scenario impossible to recover from purely
+ * host-side. */
+extern struct scx_sched *scx_root __ksym __weak;
+
+/* CO-RE forward-compat shadow of `struct scx_sched`. The three fields
+ * captured into the error-exit snapshot (`aborting`, `bypass_depth`,
+ * `watchdog_timeout`) were added to `struct scx_sched` after 6.14/7.0:
+ * `aborting` and `bypass_depth` migrated from globals; `watchdog_timeout`
+ * was made sub-sched-aware in 2026 (Tejun Heo, "sched_ext: Make
+ * watchdog sub-sched aware"). On older kernels whose vmlinux.h still
+ * predates those moves, `BPF_CORE_READ(sched, aborting)` fails to
+ * compile because the C struct emitted by `vmlinux_gen` lacks the
+ * member entirely.
+ *
+ * The `___fwd` suffix is the libbpf CO-RE convention for "match this
+ * shadow against the un-suffixed type in the target kernel BTF":
+ * `___fwd` is stripped on relocation, so `BPF_CORE_READ` calls cast
+ * through this shadow get rewritten against `struct scx_sched`'s real
+ * layout at load time. `preserve_access_index` annotates every member
+ * access so CO-RE knows to relocate the offset.
+ *
+ * Each access site is gated with `bpf_core_field_exists(struct
+ * scx_sched___fwd, <field>)` — on a kernel BTF lacking the field, the
+ * built-in returns 0, the gate skips the read, and the host-side
+ * snapshot field stays at its 0/false default (the host renderer
+ * treats those as "snapshot unavailable, fall back to live read"). */
+struct scx_sched___fwd {
+	bool aborting;
+	s32 bypass_depth;
+	unsigned long watchdog_timeout;
+} __attribute__((preserve_access_index));
+
 #define EVENT_NAME_MAX 32
 
 /*
@@ -340,14 +447,14 @@ int ktstr_probe(struct pt_regs *ctx)
 	if (!ktstr_enabled)
 		return 0;
 
-	__sync_fetch_and_add(&ktstr_probe_count, 1);
+	ktstr_pcpu_inc(KTSTR_PCPU_PROBE_COUNT);
 
 	u64 ip = bpf_get_func_ip(ctx);
 	u64 task_ptr = (u64)bpf_get_current_task();
 
 	struct func_meta *meta = bpf_map_lookup_elem(&func_meta_map, &ip);
 	if (!meta) {
-		__sync_fetch_and_add(&ktstr_meta_miss, 1);
+		ktstr_pcpu_inc(KTSTR_PCPU_META_MISS);
 		u32 idx = __sync_fetch_and_add(&ktstr_miss_log_idx, 1);
 		if (idx < MAX_MISS_LOG)
 			ktstr_miss_log[idx] = ip;
@@ -420,7 +527,7 @@ int ktstr_probe(struct pt_regs *ctx)
 	struct probe_key key = { .func_ip = ip, .task_ptr = task_ptr };
 	bpf_map_update_elem(&probe_data, &key, entry, BPF_ANY);
 
-	__sync_fetch_and_add(&ktstr_kprobe_returns, 1);
+	ktstr_pcpu_inc(KTSTR_PCPU_KPROBE_RETURNS);
 	return 0;
 }
 
@@ -436,7 +543,7 @@ int ktstr_probe(struct pt_regs *ctx)
 SEC("tp_btf/sched_ext_exit")
 int BPF_PROG(ktstr_trigger_tp, unsigned int kind)
 {
-	__sync_fetch_and_add(&ktstr_trigger_count, 1);
+	ktstr_pcpu_inc(KTSTR_PCPU_TRIGGER_COUNT);
 
 	/*
 	 * Skip non-error exits (kind < SCX_EXIT_ERROR). The error-exit
@@ -501,6 +608,68 @@ int BPF_PROG(ktstr_trigger_tp, unsigned int kind)
 	 */
 	scx_bpf_events(&ktstr_exit_event_stats,
 		       sizeof(ktstr_exit_event_stats));
+
+	/*
+	 * Snapshot scheduler scalars BEFORE the latch CAS so a host-side
+	 * observer that polls `ktstr_err_exit_detected` and sees `1` is
+	 * guaranteed to also see populated snapshot fields. Same
+	 * happens-before edge as the `ts` and `event_stats` stores
+	 * above: the CAS below provides release semantics over the prior
+	 * plain stores.
+	 *
+	 * `kind` is always recorded — it's the tracepoint argument and
+	 * does not depend on `*scx_root` being non-NULL. The four
+	 * scheduler-state fields require a successful `*scx_root`
+	 * dereference; on a kernel image where the `__weak` resolution
+	 * left `&scx_root == NULL` (no scx_root symbol exported), the
+	 * pointer-read short-circuits and the four fields stay at their
+	 * 0/false defaults — the host renderer treats those as "snapshot
+	 * unavailable, fall back to live read".
+	 *
+	 * Use `bpf_probe_read_kernel` to read the live `*scx_root`
+	 * pointer rather than a direct dereference — the kernel pointer
+	 * could be racing with `scx_unregister`'s NULL store. The probe
+	 * read returns the pointer value at the read instant; the
+	 * subsequent BPF_CORE_READ chain on `sched` then reads the
+	 * scheduler scalars via the same atomicity guarantee.
+	 *
+	 * Sticky: each store is a plain assignment so the natural
+	 * "last-writer wins" semantic on racing fires applies. The
+	 * happens-before contract relies on the CAS below — every
+	 * snapshot field is published before any consumer can observe
+	 * `latch == 1`, so the consumer reads a coherent snapshot
+	 * regardless of which racing fire's values landed.
+	 */
+	ktstr_exit_kind_snap = kind;
+	if (&scx_root != NULL) {
+		struct scx_sched *sched = NULL;
+		int r = bpf_probe_read_kernel(&sched, sizeof(sched),
+					      &scx_root);
+		if (r == 0 && sched != NULL) {
+			ktstr_exit_sched_kva = (u64)sched;
+			/* Forward-compat reads via shadow struct:
+			 * `aborting` / `bypass_depth` / `watchdog_timeout`
+			 * may be absent in pre-2026 kernel BTF. The
+			 * `bpf_core_field_exists` gate evaluates the
+			 * relocation at BPF load time against the running
+			 * kernel — when the field is missing the gate
+			 * skips the read and the snapshot field stays at
+			 * its 0/false default (host renderer treats those
+			 * as "snapshot unavailable"). */
+			struct scx_sched___fwd *sched_fwd =
+				(struct scx_sched___fwd *)sched;
+			if (bpf_core_field_exists(sched_fwd->aborting))
+				ktstr_exit_aborting =
+					BPF_CORE_READ(sched_fwd, aborting);
+			if (bpf_core_field_exists(sched_fwd->bypass_depth))
+				ktstr_exit_bypass_depth =
+					BPF_CORE_READ(sched_fwd, bypass_depth);
+			if (bpf_core_field_exists(sched_fwd->watchdog_timeout))
+				ktstr_exit_watchdog_timeout =
+					BPF_CORE_READ(sched_fwd, watchdog_timeout);
+		}
+	}
+
 	__sync_val_compare_and_swap(&ktstr_err_exit_detected, 0u, 1u);
 
 	/*
@@ -518,10 +687,10 @@ int BPF_PROG(ktstr_trigger_tp, unsigned int kind)
 
 	u32 tid = (u32)bpf_get_current_pid_tgid();
 
-	struct probe_event *event = bpf_ringbuf_reserve(&events,
+	struct probe_event *event = bpf_ringbuf_reserve(&ktstr_events,
 							sizeof(*event), 0);
 	if (!event) {
-		__sync_fetch_and_add(&ktstr_ringbuf_drops, 1);
+		ktstr_pcpu_inc(KTSTR_PCPU_RINGBUF_DROPS);
 		return 0;
 	}
 
@@ -571,7 +740,7 @@ int BPF_PROG(ktstr_trigger_tp, unsigned int kind)
  * `include/trace/events/sched_ext.h`); the BPF prototype here mirrors
  * it via BPF_PROG's typed args.
  *
- * Pushes one EVENT_SCX_EVENT entry into the existing `events`
+ * Pushes one EVENT_SCX_EVENT entry into the existing `ktstr_events`
  * ringbuf per fire. Each entry carries the ktime, the counter
  * name (NUL-terminated, capped at MAX_STR_LEN), and the delta as
  * args[0]. Userspace stitches the sequence into the per-event
@@ -588,12 +757,12 @@ int BPF_PROG(ktstr_event_tp, const char *name, __s64 delta)
 	if (!ktstr_enabled)
 		return 0;
 
-	__sync_fetch_and_add(&ktstr_event_tp_count, 1);
+	ktstr_pcpu_inc(KTSTR_PCPU_EVENT_TP_COUNT);
 
-	struct probe_event *event = bpf_ringbuf_reserve(&events,
+	struct probe_event *event = bpf_ringbuf_reserve(&ktstr_events,
 							sizeof(*event), 0);
 	if (!event) {
-		__sync_fetch_and_add(&ktstr_event_ringbuf_drops, 1);
+		ktstr_pcpu_inc(KTSTR_PCPU_EVENT_RINGBUF_DROPS);
 		return 0;
 	}
 
@@ -670,7 +839,7 @@ int BPF_PROG(ktstr_tl_switch, bool preempt, struct task_struct *prev,
 	struct timeline_event *e = bpf_ringbuf_reserve(&timeline_events,
 						       sizeof(*e), 0);
 	if (!e) {
-		__sync_fetch_and_add(&ktstr_timeline_drops, 1);
+		ktstr_pcpu_inc(KTSTR_PCPU_TIMELINE_DROPS);
 		return 0;
 	}
 
@@ -683,7 +852,7 @@ int BPF_PROG(ktstr_tl_switch, bool preempt, struct task_struct *prev,
 	e->b        = (u64)preempt;
 
 	bpf_ringbuf_submit(e, 0);
-	__sync_fetch_and_add(&ktstr_timeline_count, 1);
+	ktstr_pcpu_inc(KTSTR_PCPU_TIMELINE_COUNT);
 	return 0;
 }
 
@@ -696,7 +865,7 @@ int BPF_PROG(ktstr_tl_migrate, struct task_struct *p, int dest_cpu)
 	struct timeline_event *e = bpf_ringbuf_reserve(&timeline_events,
 						       sizeof(*e), 0);
 	if (!e) {
-		__sync_fetch_and_add(&ktstr_timeline_drops, 1);
+		ktstr_pcpu_inc(KTSTR_PCPU_TIMELINE_DROPS);
 		return 0;
 	}
 
@@ -715,7 +884,7 @@ int BPF_PROG(ktstr_tl_migrate, struct task_struct *p, int dest_cpu)
 	e->b        = (u64)BPF_CORE_READ(p, wake_cpu);
 
 	bpf_ringbuf_submit(e, 0);
-	__sync_fetch_and_add(&ktstr_timeline_count, 1);
+	ktstr_pcpu_inc(KTSTR_PCPU_TIMELINE_COUNT);
 	return 0;
 }
 
@@ -728,7 +897,7 @@ int BPF_PROG(ktstr_tl_wakeup, struct task_struct *p)
 	struct timeline_event *e = bpf_ringbuf_reserve(&timeline_events,
 						       sizeof(*e), 0);
 	if (!e) {
-		__sync_fetch_and_add(&ktstr_timeline_drops, 1);
+		ktstr_pcpu_inc(KTSTR_PCPU_TIMELINE_DROPS);
 		return 0;
 	}
 
@@ -745,7 +914,7 @@ int BPF_PROG(ktstr_tl_wakeup, struct task_struct *p)
 	e->b        = 0;
 
 	bpf_ringbuf_submit(e, 0);
-	__sync_fetch_and_add(&ktstr_timeline_count, 1);
+	ktstr_pcpu_inc(KTSTR_PCPU_TIMELINE_COUNT);
 	return 0;
 }
 
@@ -765,8 +934,8 @@ int BPF_PROG(ktstr_tl_wakeup, struct task_struct *p)
  * (newprio, next_class) at exit, stitched via the `pi_scratch` map
  * keyed by `p`. The fexit handler emits a TL_EVT_PI_BOOST timeline
  * record carrying the prio pair; class flips bump
- * `ktstr_pi_class_change_count` separately so the wire shape stays
- * compatible with the existing `struct timeline_event`.
+ * `KTSTR_PCPU_PI_CLASS_CHANGE_COUNT` separately so the wire shape
+ * stays compatible with the existing `struct timeline_event`.
  *
  * Both probes gate on `ktstr_enabled` so PI events only land once
  * userspace has finished probe attach — fentry/fexit are
@@ -808,7 +977,7 @@ int BPF_PROG(ktstr_pi_fexit, struct task_struct *p,
 	u64 key = (u64)p;
 	struct pi_entry *entry = bpf_map_lookup_elem(&pi_scratch, &key);
 	if (!entry) {
-		__sync_fetch_and_add(&ktstr_pi_orphan_fexits, 1);
+		ktstr_pcpu_inc(KTSTR_PCPU_PI_ORPHAN_FEXITS);
 		return 0;
 	}
 
@@ -819,13 +988,13 @@ int BPF_PROG(ktstr_pi_fexit, struct task_struct *p,
 	 * drop on the wire still surfaces the structural class-
 	 * transition fact via the counter. */
 	if (next_class != entry->prev_class) {
-		__sync_fetch_and_add(&ktstr_pi_class_change_count, 1);
+		ktstr_pcpu_inc(KTSTR_PCPU_PI_CLASS_CHANGE_COUNT);
 	}
 
 	struct timeline_event *e = bpf_ringbuf_reserve(&timeline_events,
 						       sizeof(*e), 0);
 	if (!e) {
-		__sync_fetch_and_add(&ktstr_pi_drops, 1);
+		ktstr_pcpu_inc(KTSTR_PCPU_PI_DROPS);
 		bpf_map_delete_elem(&pi_scratch, &key);
 		return 0;
 	}
@@ -843,7 +1012,7 @@ int BPF_PROG(ktstr_pi_fexit, struct task_struct *p,
 	e->b        = (u64)(s64)newprio;
 
 	bpf_ringbuf_submit(e, 0);
-	__sync_fetch_and_add(&ktstr_pi_count, 1);
+	ktstr_pcpu_inc(KTSTR_PCPU_PI_COUNT);
 
 	bpf_map_delete_elem(&pi_scratch, &key);
 	return 0;
@@ -878,7 +1047,7 @@ int BPF_PROG(ktstr_lock_contend, void *lock, unsigned int flags)
 	struct timeline_event *e = bpf_ringbuf_reserve(&timeline_events,
 						       sizeof(*e), 0);
 	if (!e) {
-		__sync_fetch_and_add(&ktstr_lock_contend_drops, 1);
+		ktstr_pcpu_inc(KTSTR_PCPU_LOCK_CONTEND_DROPS);
 		return 0;
 	}
 
@@ -891,7 +1060,7 @@ int BPF_PROG(ktstr_lock_contend, void *lock, unsigned int flags)
 	e->b        = (u64)flags;
 
 	bpf_ringbuf_submit(e, 0);
-	__sync_fetch_and_add(&ktstr_lock_contend_count, 1);
+	ktstr_pcpu_inc(KTSTR_PCPU_LOCK_CONTEND_COUNT);
 	return 0;
 }
 
@@ -950,18 +1119,13 @@ struct {
 	__uint(max_entries, 1);
 } preempt_disabled_per_cpu SEC(".maps");
 
-/* Cumulative count of `tp_btf/preempt_disable` fires that
- * recorded an enter_ts (#64). Sums across all CPUs since the
- * map is per-CPU. A non-zero count proves the tp_btf attached;
- * zero means CONFIG_TRACE_PREEMPT_TOGGLE was missing and the
- * tracepoint never fired. */
-u64 ktstr_preempt_disable_count = 0;
-
-/* Cumulative count of `tp_btf/preempt_enable` fires that
- * computed a duration (#64). Mirrors `ktstr_preempt_disable_count`;
- * the difference between disable_count and enable_count surfaces
- * unmatched fires (e.g. a CPU went offline mid-disable). */
-u64 ktstr_preempt_enable_count = 0;
+/* `KTSTR_PCPU_PREEMPT_DISABLE_COUNT` /
+ * `KTSTR_PCPU_PREEMPT_ENABLE_COUNT` are per-CPU slots in the
+ * array above. The preempt_disable / preempt_enable tracepoints
+ * fire on every spinlock acquisition outermost transition, so
+ * the per-CPU storage is mandatory — the prior shared-global
+ * counter generated a multi-million-per-second cacheline bounce
+ * across every busy CPU on a contended lock test. */
 
 SEC("tp_btf/preempt_disable")
 int BPF_PROG(ktstr_preempt_disable_tp, unsigned long ip,
@@ -977,7 +1141,7 @@ int BPF_PROG(ktstr_preempt_disable_tp, unsigned long ip,
 		return 0;
 
 	st->enter_ts = bpf_ktime_get_ns();
-	__sync_fetch_and_add(&ktstr_preempt_disable_count, 1);
+	ktstr_pcpu_inc(KTSTR_PCPU_PREEMPT_DISABLE_COUNT);
 	return 0;
 }
 
@@ -1006,6 +1170,6 @@ int BPF_PROG(ktstr_preempt_enable_tp, unsigned long ip,
 	st->enter_ts = 0;
 	if (dur > st->max_ns)
 		st->max_ns = dur;
-	__sync_fetch_and_add(&ktstr_preempt_enable_count, 1);
+	ktstr_pcpu_inc(KTSTR_PCPU_PREEMPT_ENABLE_COUNT);
 	return 0;
 }

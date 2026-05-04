@@ -2989,6 +2989,7 @@ dependencies = [
  "humantime",
  "indicatif",
  "insta",
+ "itoa",
  "ktstr-macros",
  "kvm-bindings",
  "kvm-ioctls",

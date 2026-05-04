@@ -393,11 +393,7 @@ impl CgroupManager {
     /// gate stays — if the parent is outside the supplied root,
     /// directory creation still happens but no subtree_control walk
     /// fires (matches the existing "non-cgroup-mount" early-bail).
-    fn setup_under_root(
-        &self,
-        controllers: &BTreeSet<Controller>,
-        root: &Path,
-    ) -> Result<()> {
+    fn setup_under_root(&self, controllers: &BTreeSet<Controller>, root: &Path) -> Result<()> {
         if !self.parent.exists() {
             fs::create_dir_all(&self.parent)
                 .with_context(|| format!("mkdir {}", self.parent.display()))?;
@@ -436,17 +432,16 @@ impl CgroupManager {
             for c in rel.components() {
                 let sc = cur.join("cgroup.subtree_control");
                 if sc.exists() {
-                    write_with_timeout(&sc, &line, CGROUP_WRITE_TIMEOUT).with_context(
-                        || format!("enable controllers '{line}' at {}", sc.display()),
-                    )?;
+                    write_with_timeout(&sc, &line, CGROUP_WRITE_TIMEOUT).with_context(|| {
+                        format!("enable controllers '{line}' at {}", sc.display())
+                    })?;
                 }
                 cur = cur.join(c);
             }
             let sc = self.parent.join("cgroup.subtree_control");
             if sc.exists() {
-                write_with_timeout(&sc, &line, CGROUP_WRITE_TIMEOUT).with_context(
-                    || format!("enable controllers '{line}' at {}", sc.display()),
-                )?;
+                write_with_timeout(&sc, &line, CGROUP_WRITE_TIMEOUT)
+                    .with_context(|| format!("enable controllers '{line}' at {}", sc.display()))?;
             }
         }
         Ok(())
@@ -1488,8 +1483,7 @@ mod tests {
     /// harder to diagnose than "controller X not available".
     #[test]
     fn setup_rejects_unavailable_controller() {
-        let root = std::env::temp_dir()
-            .join(format!("ktstr-setup-unavail-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("ktstr-setup-unavail-{}", std::process::id()));
         let parent = root.join("ktstr");
         fs::create_dir_all(&parent).unwrap();
         // Advertise only memory; request cpuset.

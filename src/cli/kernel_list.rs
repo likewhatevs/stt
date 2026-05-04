@@ -602,10 +602,12 @@ fn partition_clean_candidates<'a>(
     corrupt_only: bool,
 ) -> Vec<&'a crate::cache::ListedEntry> {
     let skip = keep.unwrap_or(0);
-    let mut bucket_kept: std::collections::HashMap<
-        (Option<String>, Option<String>, Option<String>),
-        usize,
-    > = std::collections::HashMap::new();
+    // Bucket key groups Valid entries by `(version,
+    // ktstr_kconfig_hash, extra_kconfig_hash)` — three optional
+    // strings, distinct shapes need distinct retention counters.
+    type BucketKey = (Option<String>, Option<String>, Option<String>);
+    let mut bucket_kept: std::collections::HashMap<BucketKey, usize> =
+        std::collections::HashMap::new();
     let mut to_remove: Vec<&'a crate::cache::ListedEntry> = Vec::new();
     for listed in entries {
         match listed {

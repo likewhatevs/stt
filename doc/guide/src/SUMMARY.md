@@ -6,6 +6,7 @@
 # Guide
 
 - [Getting Started](getting-started.md)
+- [Zero to ktstr](tutorial.md)
 - [Running Tests](running-tests.md)
   - [Single Scenario](running-tests/single-scenario.md)
   - [Gauntlet](running-tests/gauntlet.md)

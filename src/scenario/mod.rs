@@ -33,6 +33,7 @@ pub mod ops;
 pub mod payload_run;
 pub mod performance;
 pub mod scenarios;
+pub mod snapshot;
 pub mod stress;
 
 pub use backdrop::Backdrop;
@@ -1879,10 +1880,7 @@ mod tests {
         fn parent_path(&self) -> &std::path::Path {
             &self.parent
         }
-        fn setup(
-            &self,
-            _: &std::collections::BTreeSet<crate::cgroup::Controller>,
-        ) -> Result<()> {
+        fn setup(&self, _: &std::collections::BTreeSet<crate::cgroup::Controller>) -> Result<()> {
             Ok(())
         }
         fn create_cgroup(&self, _: &str) -> Result<()> {

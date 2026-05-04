@@ -303,6 +303,16 @@ pub(crate) struct VmRunState {
     pub(crate) com1: Arc<PiMutex<console::Serial>>,
     pub(crate) com2: Arc<PiMutex<console::Serial>>,
     pub(crate) kill: Arc<AtomicBool>,
+    /// Wake fd paired with `kill`. Setters that flip `kill`
+    /// (`collect_results`, vCPU shutdown classifier, panic hook)
+    /// also write to this EventFd so any consumer blocked in
+    /// `epoll_wait` (notably the freeze coordinator and the
+    /// monitor sampler) wakes within microseconds of the flip
+    /// rather than waiting up to one full poll interval. The
+    /// AtomicBool above remains the source of truth — the EventFd
+    /// is purely a wake signal. EFD_NONBLOCK so a saturated
+    /// counter never stalls the writer.
+    pub(crate) kill_evt: Arc<vmm_sys_util::eventfd::EventFd>,
     /// Broadcast freeze flag for the failure-dump coordinator. When the
     /// coordinator receives a guest-side error-exit signal it sets this
     /// to true, kicks every vCPU, waits for all `parked` flags to flip
@@ -339,6 +349,28 @@ pub(crate) struct VmRunState {
     /// onto [`VmResult::virtio_net_counters`]. Same Arc-handoff
     /// pattern as `virtio_blk_counters` above.
     pub(crate) virtio_net_counters: Option<Arc<VirtioNetCounters>>,
+    /// Host-side handle to the snapshot doorbell EventFd registered
+    /// with KVM via `KVM_IOEVENTFD` at
+    /// [`kvm::DOORBELL_MMIO_GPA`](super::kvm::DOORBELL_MMIO_GPA).
+    /// Cloning this fd (via `try_clone`) yields an additional
+    /// handle on the same kernel counter — a `write(8 bytes)` on
+    /// any clone signals the freeze coordinator's poll loop, which
+    /// runs `freeze_and_capture(false)` and writes a tagged
+    /// `failure_dump.on_demand_<n>.json` file. Used by host-side
+    /// code that wants to trigger an on-demand capture without an
+    /// in-guest write to the doorbell GPA — e.g. test scaffolding
+    /// running on the host while the guest is still in KVM_RUN.
+    /// `None` only for VMs whose construction predates the
+    /// doorbell wiring; in current code every successful
+    /// `KtstrVm::run_vm` populates it.
+    ///
+    /// In-tree readers go through the SnapshotBridge wiring path
+    /// added by a follow-up; the lib build sees no current
+    /// readers because the bridge's host-side `CaptureCallback`
+    /// installation has not landed yet — keep `dead_code` quiet
+    /// until then.
+    #[allow(dead_code)]
+    pub(crate) doorbell_evt: Option<vmm_sys_util::eventfd::EventFd>,
 }
 #[cfg(test)]
 mod tests {

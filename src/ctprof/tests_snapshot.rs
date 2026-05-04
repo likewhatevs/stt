@@ -8,7 +8,6 @@
 use super::*;
 use crate::metric_types::{CategoricalString, CpuSet, MonotonicNs, OrdinalI32};
 
-
 fn thread(pcomm: &str, comm: &str, run_time_ns: u64) -> ThreadState {
     ThreadState {
         tid: 1,

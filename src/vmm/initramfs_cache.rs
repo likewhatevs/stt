@@ -48,8 +48,8 @@ pub(crate) struct BaseKey(pub(crate) u64);
 pub(crate) fn hash_file(path: &Path) -> Result<u64> {
     use siphasher::sip::SipHasher13;
     use std::hash::Hasher;
-    let contents = std::fs::read(path)
-        .with_context(|| format!("read for hash: {}", path.display()))?;
+    let contents =
+        std::fs::read(path).with_context(|| format!("read for hash: {}", path.display()))?;
     let mut hasher = SipHasher13::new_with_keys(0, 0);
     hasher.write(&contents);
     Ok(hasher.finish())

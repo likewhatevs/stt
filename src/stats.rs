@@ -174,6 +174,13 @@ pub enum GaugeAgg {
 ///   - `Gauge(Max)` → max of finite samples.
 ///   - `Peak` → max of finite samples.
 ///   - `Timestamp` → last finite sample.
+///
+/// `dead_code` allow: pinned via in-file unit tests; no
+/// production caller folds samples through this entry point yet,
+/// but the regression-comparison path that consumes
+/// [`MetricKind`] semantics will land here once the multi-snapshot
+/// gauntlet comparison ships.
+#[allow(dead_code)]
 pub fn aggregate_samples(samples: &[f64], kind: MetricKind) -> Option<f64> {
     let finite: Vec<f64> = samples.iter().copied().filter(|x| x.is_finite()).collect();
     if finite.is_empty() {

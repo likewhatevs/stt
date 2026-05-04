@@ -938,13 +938,7 @@ fn parse_stats_compare_with_no_average() {
         policy,
         dir,
         ..
-    } = parse_compare(&[
-        "--a-kernel",
-        "6.14",
-        "--b-kernel",
-        "6.15",
-        "--no-average",
-    ])
+    } = parse_compare(&["--a-kernel", "6.14", "--b-kernel", "6.15", "--no-average"])
     else {
         unreachable!()
     };
@@ -1443,12 +1437,7 @@ fn parse_stats_compare_with_run_source_per_side() {
         a_run_source,
         b_run_source,
         ..
-    } = parse_compare(&[
-        "--a-run-source",
-        "ci",
-        "--b-run-source",
-        "local",
-    ])
+    } = parse_compare(&["--a-run-source", "ci", "--b-run-source", "local"])
     else {
         unreachable!()
     };
@@ -2597,10 +2586,7 @@ fn parse_model_missing_subcommand_rejected() {
 #[test]
 fn parse_model_unknown_subcommand_rejected() {
     let rejected = Cargo::try_parse_from(["cargo", "ktstr", "model", "wat"]);
-    assert!(
-        rejected.is_err(),
-        "model must reject unknown subcommands",
-    );
+    assert!(rejected.is_err(), "model must reject unknown subcommands",);
 }
 
 // -- try_get_matches_from: funify subcommand --
@@ -2615,8 +2601,7 @@ fn parse_model_unknown_subcommand_rejected() {
 fn parse_funify_bare() {
     let Cargo {
         command: CargoSub::Ktstr(k),
-    } = Cargo::try_parse_from(["cargo", "ktstr", "funify"])
-        .unwrap_or_else(|e| panic!("{e}"));
+    } = Cargo::try_parse_from(["cargo", "ktstr", "funify"]).unwrap_or_else(|e| panic!("{e}"));
     let KtstrCommand::Funify {
         input,
         seed,
@@ -2636,13 +2621,8 @@ fn parse_funify_bare() {
 fn parse_funify_with_input_path() {
     let Cargo {
         command: CargoSub::Ktstr(k),
-    } = Cargo::try_parse_from([
-        "cargo",
-        "ktstr",
-        "funify",
-        "/tmp/dump.json",
-    ])
-    .unwrap_or_else(|e| panic!("{e}"));
+    } = Cargo::try_parse_from(["cargo", "ktstr", "funify", "/tmp/dump.json"])
+        .unwrap_or_else(|e| panic!("{e}"));
     let KtstrCommand::Funify { input, .. } = k.command else {
         panic!("expected Funify");
     };
@@ -2658,15 +2638,8 @@ fn parse_funify_with_input_path() {
 fn parse_funify_with_seed_and_pretty() {
     let Cargo {
         command: CargoSub::Ktstr(k),
-    } = Cargo::try_parse_from([
-        "cargo",
-        "ktstr",
-        "funify",
-        "--seed",
-        "demo",
-        "--pretty",
-    ])
-    .unwrap_or_else(|e| panic!("{e}"));
+    } = Cargo::try_parse_from(["cargo", "ktstr", "funify", "--seed", "demo", "--pretty"])
+        .unwrap_or_else(|e| panic!("{e}"));
     let KtstrCommand::Funify {
         input,
         seed,
@@ -2688,8 +2661,7 @@ fn parse_funify_with_seed_and_pretty() {
 fn parse_funify_costume_alias_dispatches_to_funify() {
     let Cargo {
         command: CargoSub::Ktstr(k),
-    } = Cargo::try_parse_from(["cargo", "ktstr", "costume"])
-        .unwrap_or_else(|e| panic!("{e}"));
+    } = Cargo::try_parse_from(["cargo", "ktstr", "costume"]).unwrap_or_else(|e| panic!("{e}"));
     assert!(
         matches!(k.command, KtstrCommand::Funify { .. }),
         "`costume` alias must dispatch to the Funify variant",
@@ -2731,7 +2703,10 @@ fn parse_funify_costume_alias_with_seed_and_pretty() {
         "costume alias must round-trip the positional INPUT",
     );
     assert_eq!(seed.as_deref(), Some("demo"));
-    assert!(pretty, "--pretty must lift the flag to true on costume alias");
+    assert!(
+        pretty,
+        "--pretty must lift the flag to true on costume alias"
+    );
 }
 
 /// `cargo ktstr funify -` round-trips the dash sentinel into
@@ -2744,8 +2719,7 @@ fn parse_funify_costume_alias_with_seed_and_pretty() {
 fn parse_funify_with_dash_input() {
     let Cargo {
         command: CargoSub::Ktstr(k),
-    } = Cargo::try_parse_from(["cargo", "ktstr", "funify", "-"])
-        .unwrap_or_else(|e| panic!("{e}"));
+    } = Cargo::try_parse_from(["cargo", "ktstr", "funify", "-"]).unwrap_or_else(|e| panic!("{e}"));
     let KtstrCommand::Funify { input, .. } = k.command else {
         panic!("expected Funify");
     };
@@ -2787,8 +2761,14 @@ fn parse_export_with_test_arg() {
         panic!("expected Export");
     };
     assert_eq!(test, "preempt_regression_fault_under_load");
-    assert!(output.is_none(), "bare export must default --output to None");
-    assert!(package.is_none(), "bare export must default --package to None");
+    assert!(
+        output.is_none(),
+        "bare export must default --output to None"
+    );
+    assert!(
+        package.is_none(),
+        "bare export must default --package to None"
+    );
     assert!(!release, "bare export must default --release to false");
 }
 
@@ -2857,15 +2837,8 @@ fn parse_export_with_output_long_form() {
 fn parse_export_with_package_short_form() {
     let Cargo {
         command: CargoSub::Ktstr(k),
-    } = Cargo::try_parse_from([
-        "cargo",
-        "ktstr",
-        "export",
-        "test_fn",
-        "-p",
-        "ktstr",
-    ])
-    .unwrap_or_else(|e| panic!("{e}"));
+    } = Cargo::try_parse_from(["cargo", "ktstr", "export", "test_fn", "-p", "ktstr"])
+        .unwrap_or_else(|e| panic!("{e}"));
     let KtstrCommand::Export { package, .. } = k.command else {
         panic!("expected Export");
     };
@@ -2910,8 +2883,7 @@ fn parse_export_extra_arg_rejected() {
 fn parse_locks_bare() {
     let Cargo {
         command: CargoSub::Ktstr(k),
-    } = Cargo::try_parse_from(["cargo", "ktstr", "locks"])
-        .unwrap_or_else(|e| panic!("{e}"));
+    } = Cargo::try_parse_from(["cargo", "ktstr", "locks"]).unwrap_or_else(|e| panic!("{e}"));
     let KtstrCommand::Locks { json, watch } = k.command else {
         panic!("expected Locks");
     };
@@ -2960,15 +2932,8 @@ fn parse_locks_with_watch_duration() {
 fn parse_locks_with_watch_and_json() {
     let Cargo {
         command: CargoSub::Ktstr(k),
-    } = Cargo::try_parse_from([
-        "cargo",
-        "ktstr",
-        "locks",
-        "--watch",
-        "5s",
-        "--json",
-    ])
-    .unwrap_or_else(|e| panic!("{e}"));
+    } = Cargo::try_parse_from(["cargo", "ktstr", "locks", "--watch", "5s", "--json"])
+        .unwrap_or_else(|e| panic!("{e}"));
     let KtstrCommand::Locks { json, watch } = k.command else {
         panic!("expected Locks");
     };
@@ -2986,8 +2951,7 @@ fn parse_locks_with_watch_and_json() {
 /// turned the field into a raw String / unbounded text input.
 #[test]
 fn parse_locks_watch_rejects_malformed_duration() {
-    let rejected =
-        Cargo::try_parse_from(["cargo", "ktstr", "locks", "--watch", "not-a-duration"]);
+    let rejected = Cargo::try_parse_from(["cargo", "ktstr", "locks", "--watch", "not-a-duration"]);
     assert!(
         rejected.is_err(),
         "--watch must reject malformed humantime input via the \
@@ -3035,8 +2999,7 @@ fn parse_shell_memory_mb_at_range_floor() {
 /// bound surfaces here.
 #[test]
 fn parse_shell_memory_mb_below_range_rejected() {
-    let rejected =
-        Cargo::try_parse_from(["cargo", "ktstr", "shell", "--memory-mb", "64"]);
+    let rejected = Cargo::try_parse_from(["cargo", "ktstr", "shell", "--memory-mb", "64"]);
     assert!(
         rejected.is_err(),
         "--memory-mb 64 must be rejected — value_parser range floor is 128",
@@ -3049,8 +3012,7 @@ fn parse_shell_memory_mb_below_range_rejected() {
 /// constraint.
 #[test]
 fn parse_shell_memory_mb_negative_rejected() {
-    let rejected =
-        Cargo::try_parse_from(["cargo", "ktstr", "shell", "--memory-mb", "-1"]);
+    let rejected = Cargo::try_parse_from(["cargo", "ktstr", "shell", "--memory-mb", "-1"]);
     assert!(
         rejected.is_err(),
         "--memory-mb -1 must be rejected — the field is u32",
@@ -3064,14 +3026,8 @@ fn parse_shell_memory_mb_negative_rejected() {
 fn parse_shell_with_exec() {
     let Cargo {
         command: CargoSub::Ktstr(k),
-    } = Cargo::try_parse_from([
-        "cargo",
-        "ktstr",
-        "shell",
-        "--exec",
-        "uname -a",
-    ])
-    .unwrap_or_else(|e| panic!("{e}"));
+    } = Cargo::try_parse_from(["cargo", "ktstr", "shell", "--exec", "uname -a"])
+        .unwrap_or_else(|e| panic!("{e}"));
     let KtstrCommand::Shell { exec, .. } = k.command else {
         panic!("expected Shell");
     };
@@ -3097,8 +3053,7 @@ fn parse_shell_with_dmesg() {
 fn parse_shell_dmesg_and_exec_default_unset() {
     let Cargo {
         command: CargoSub::Ktstr(k),
-    } = Cargo::try_parse_from(["cargo", "ktstr", "shell"])
-        .unwrap_or_else(|e| panic!("{e}"));
+    } = Cargo::try_parse_from(["cargo", "ktstr", "shell"]).unwrap_or_else(|e| panic!("{e}"));
     let KtstrCommand::Shell { dmesg, exec, .. } = k.command else {
         panic!("expected Shell");
     };
@@ -3121,13 +3076,7 @@ fn parse_test_kernel_repeatable() {
     let Cargo {
         command: CargoSub::Ktstr(k),
     } = Cargo::try_parse_from([
-        "cargo",
-        "ktstr",
-        "test",
-        "--kernel",
-        "6.14.2",
-        "--kernel",
-        "6.15-rc3",
+        "cargo", "ktstr", "test", "--kernel", "6.14.2", "--kernel", "6.15-rc3",
     ])
     .unwrap_or_else(|e| panic!("{e}"));
     let KtstrCommand::Test { kernel, .. } = k.command else {
@@ -3147,13 +3096,7 @@ fn parse_coverage_kernel_repeatable() {
     let Cargo {
         command: CargoSub::Ktstr(k),
     } = Cargo::try_parse_from([
-        "cargo",
-        "ktstr",
-        "coverage",
-        "--kernel",
-        "6.14.2",
-        "--kernel",
-        "6.15-rc3",
+        "cargo", "ktstr", "coverage", "--kernel", "6.14.2", "--kernel", "6.15-rc3",
     ])
     .unwrap_or_else(|e| panic!("{e}"));
     let KtstrCommand::Coverage { kernel, .. } = k.command else {
@@ -3173,13 +3116,7 @@ fn parse_llvm_cov_kernel_repeatable() {
     let Cargo {
         command: CargoSub::Ktstr(k),
     } = Cargo::try_parse_from([
-        "cargo",
-        "ktstr",
-        "llvm-cov",
-        "--kernel",
-        "6.14.2",
-        "--kernel",
-        "6.15-rc3",
+        "cargo", "ktstr", "llvm-cov", "--kernel", "6.14.2", "--kernel", "6.15-rc3",
     ])
     .unwrap_or_else(|e| panic!("{e}"));
     let KtstrCommand::LlvmCov { kernel, .. } = k.command else {
@@ -3229,14 +3166,7 @@ fn parse_verifier_kernel_repeatable() {
 /// matching git URL — ambiguous at the dispatch layer.
 #[test]
 fn parse_kernel_build_ref_requires_git() {
-    let result = Cargo::try_parse_from([
-        "cargo",
-        "ktstr",
-        "kernel",
-        "build",
-        "--ref",
-        "v6.14",
-    ]);
+    let result = Cargo::try_parse_from(["cargo", "ktstr", "kernel", "build", "--ref", "v6.14"]);
     match result {
         Ok(_) => panic!("--ref without --git must be rejected at parse time"),
         Err(err) => assert_eq!(
@@ -3266,10 +3196,7 @@ fn parse_completions_binary_default_is_cargo() {
     let KtstrCommand::Completions { binary, .. } = k.command else {
         panic!("expected Completions");
     };
-    assert_eq!(
-        binary, "cargo",
-        "default --binary must be `cargo`",
-    );
+    assert_eq!(binary, "cargo", "default --binary must be `cargo`",);
 }
 
 /// `cargo ktstr completions bash --binary X` overrides the
@@ -3278,15 +3205,8 @@ fn parse_completions_binary_default_is_cargo() {
 fn parse_completions_binary_override() {
     let Cargo {
         command: CargoSub::Ktstr(k),
-    } = Cargo::try_parse_from([
-        "cargo",
-        "ktstr",
-        "completions",
-        "bash",
-        "--binary",
-        "ktstr",
-    ])
-    .unwrap_or_else(|e| panic!("{e}"));
+    } = Cargo::try_parse_from(["cargo", "ktstr", "completions", "bash", "--binary", "ktstr"])
+        .unwrap_or_else(|e| panic!("{e}"));
     let KtstrCommand::Completions { binary, .. } = k.command else {
         panic!("expected Completions");
     };
@@ -3314,12 +3234,7 @@ fn parse_stats_compare_with_per_side_topology() {
         a_topology,
         b_topology,
         ..
-    } = parse_compare(&[
-        "--a-topology",
-        "1n2l4c2t",
-        "--b-topology",
-        "1n4l2c1t",
-    ])
+    } = parse_compare(&["--a-topology", "1n2l4c2t", "--b-topology", "1n4l2c1t"])
     else {
         unreachable!()
     };
@@ -3340,12 +3255,7 @@ fn parse_stats_compare_with_per_side_scheduler() {
         a_scheduler,
         b_scheduler,
         ..
-    } = parse_compare(&[
-        "--a-scheduler",
-        "scx_alpha",
-        "--b-scheduler",
-        "scx_beta",
-    ])
+    } = parse_compare(&["--a-scheduler", "scx_alpha", "--b-scheduler", "scx_beta"])
     else {
         unreachable!()
     };

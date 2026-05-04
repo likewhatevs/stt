@@ -17,14 +17,20 @@
 //! `LlmExtract` pipeline (which broadens its own mask after a
 //! perf-mode VM run).
 
+use std::os::unix::io::AsRawFd;
 use std::os::unix::thread::JoinHandleExt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use vmm_sys_util::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
+use vmm_sys_util::eventfd::{EFD_NONBLOCK, EventFd};
+use vmm_sys_util::timerfd::TimerFd;
+
 use super::exit_dispatch;
 use crate::monitor;
+use crate::sync::Latch;
 
 // ---------------------------------------------------------------------------
 // ImmediateExitHandle — cross-thread access to kvm_run.immediate_exit
@@ -289,9 +295,43 @@ pub(crate) fn set_thread_cpumask(cpus: &[usize], label: &str) {
         );
         return;
     }
+    let n = applied.len();
+    // Range-collapse the CPU list so contiguous spans render as
+    // "a-b" and non-contiguous CPUs render with explicit
+    // commas: [0,1,2,5,7,8] → "0-2,5,7-8". A bare min-max range
+    // ("0-8") would be misleading when CPUs 3, 4, 6 are excluded.
+    // `applied` is sorted by construction in the loop above
+    // (each `cpu` is pushed in iteration order from a sorted
+    // `cpus` slice).
+    let cpu_list_str = {
+        let mut parts: Vec<String> = Vec::new();
+        let mut start = applied[0];
+        let mut end = applied[0];
+        for &cpu in &applied[1..] {
+            if cpu == end + 1 {
+                end = cpu;
+            } else {
+                if start == end {
+                    parts.push(format!("{start}"));
+                } else {
+                    parts.push(format!("{start}-{end}"));
+                }
+                start = cpu;
+                end = cpu;
+            }
+        }
+        if start == end {
+            parts.push(format!("{start}"));
+        } else {
+            parts.push(format!("{start}-{end}"));
+        }
+        parts.join(",")
+    };
     match nix::sched::sched_setaffinity(nix::unistd::Pid::from_raw(0), &cpuset) {
-        Ok(()) => eprintln!("no_perf_mode: mask {label} to host CPUs {applied:?}"),
-        Err(e) => eprintln!("no_perf_mode: WARNING: mask {label} to {applied:?}: {e}"),
+        Ok(()) => eprintln!("no_perf_mode: mask {label} to {n} CPUs ({cpu_list_str})"),
+        Err(e) => {
+            eprintln!("no_perf_mode: WARNING: mask {label} to {n} CPUs ({cpu_list_str}): {e}")
+        }
     }
 }
 
@@ -334,30 +374,39 @@ pub(crate) fn set_rt_priority(priority: i32, label: &str) {
 /// twice the perf slots and produce two slightly-different time
 /// bases.
 ///
-/// `vcpu_tid_slots[i]` is the AP-thread-published TID for vCPU `i`
-/// (0 = BSP, written synchronously before this function runs). AP
-/// slots may still be `0` if an AP hasn't reached its
-/// `tid_slot.store` yet; poll up to 1s. Any slot still `0` at the
-/// deadline is treated as "no perf data for that vCPU"; the whole
-/// capture returns `None` so the timeline + freeze paths consume
-/// `Option::as_ref()` and emit `None` per-CPU.
+/// `vcpu_tid_slots[i]` pairs the AP-thread-published TID for vCPU
+/// `i` with a [`Latch`] the producer fires after storing the TID
+/// (0 = BSP, written synchronously before this function runs and
+/// shipped with a pre-set latch). The function blocks each slot's
+/// latch with a shared 1 s deadline instead of sleep-polling the
+/// `AtomicI32`. Any slot still 0 at the deadline is treated as "no
+/// perf data for that vCPU"; the whole capture returns `None` so
+/// the timeline + freeze paths consume `Option::as_ref()` and emit
+/// `None` per-CPU.
 ///
 /// Failure paths (perf_event_paranoid too high, missing
 /// CAP_PERFMON, hardware lacks the requested counter) log a warning
 /// via `tracing::warn!` and return `None`. The dump pipeline still
 /// runs without per-vCPU perf data.
 pub(crate) fn open_vcpu_perf_capture(
-    vcpu_tid_slots: &[Arc<AtomicI32>],
+    vcpu_tid_slots: &[(Arc<AtomicI32>, Arc<Latch>)],
 ) -> Option<monitor::perf_counters::PerfCountersCapture> {
-    let perf_deadline = Instant::now() + Duration::from_secs(1);
+    let overall_deadline = Instant::now() + Duration::from_secs(1);
     let mut tids: Vec<libc::pid_t> = Vec::with_capacity(vcpu_tid_slots.len());
-    for slot in vcpu_tid_slots {
-        let mut v = slot.load(Ordering::Acquire);
-        while v == 0 && Instant::now() < perf_deadline {
-            std::thread::sleep(Duration::from_millis(10));
-            v = slot.load(Ordering::Acquire);
+    for (slot, latch) in vcpu_tid_slots {
+        // Block until the AP publishes its TID (or the deadline
+        // elapses). The producer side stores the TID with `Release`
+        // ordering before calling `Latch::set`, so a successful
+        // `Latch::wait_timeout` happens-before the `slot.load`
+        // observes the published value.
+        let now = Instant::now();
+        let remaining = overall_deadline.saturating_duration_since(now);
+        if remaining.is_zero() {
+            tids.push(slot.load(Ordering::Acquire));
+            continue;
         }
-        tids.push(v);
+        latch.wait_timeout(remaining);
+        tids.push(slot.load(Ordering::Acquire));
     }
     if !tids.iter().all(|&t| t > 0) {
         let missing: Vec<usize> = tids
@@ -395,6 +444,15 @@ pub(crate) struct VcpuThread {
     /// Handle to set `kvm_run.immediate_exit` from outside the vCPU thread.
     /// `None` when KVM_CAP_IMMEDIATE_EXIT is not available.
     pub(crate) immediate_exit: Option<ImmediateExitHandle>,
+    /// Eventfd bumped after `exited.store(true)` so
+    /// [`Self::wait_for_exit`] can block in `epoll_wait` instead of
+    /// sleep-polling the atomic. The same eventfd is signaled from
+    /// the panic hook (see `vcpu_panic`'s `VcpuPanicCtx`) so the
+    /// parent observes both the normal-exit and panic-classified
+    /// shutdown paths through a single fd. Counter mode (not
+    /// semaphore) — the value is unused; only the edge from 0 to
+    /// non-zero matters.
+    pub(crate) exit_evt: Arc<EventFd>,
 }
 
 /// Per-AP freeze-rendezvous state held outside `VcpuThread`. Cloned
@@ -422,6 +480,265 @@ pub(crate) struct ApFreezeHandles {
     pub(crate) regs: Vec<Arc<std::sync::Mutex<Option<exit_dispatch::VcpuRegSnapshot>>>>,
 }
 
+/// Shared watchpoint-arming and hit-detection state for the
+/// failure-dump freeze trigger.
+///
+/// Adds a hardware data-write watchpoint on `*scx_root->exit_kind`
+/// (the kernel's authoritative SCX_EXIT_* latch) as the primary
+/// late-trigger signal, alongside the existing
+/// `ktstr_err_exit_detected` BPF .bss poll which remains active as
+/// fallback. The freeze coordinator resolves the field's KVA lazily
+/// (after `*scx_root` becomes non-NULL) and publishes it via
+/// [`Self::request_kva`]; each vCPU thread polls this slot before
+/// each `KVM_RUN` and self-arms by calling `set_guest_debug` with
+/// `debugreg[0] = exit_kind_kva` and `debugreg[7]` configured for
+/// "trap on 4-byte writes" (DR7 control bits: 0x000D0402 = bit 10
+/// reserved-1, bit 1 G0 enable, bits 16-17 R/W0 = write-only, bits
+/// 18-19 LEN0 = 4-byte). Once armed, a guest store to the field
+/// traps via `KVM_EXIT_DEBUG`; the dispatch path sets [`Self::hit`],
+/// which the freeze coordinator polls alongside the BPF .bss latch.
+///
+/// Why a hardware watchpoint: the BPF .bss poll requires a full
+/// guest-memory page-walk every 100 ms iteration AND a parallel BPF
+/// program writing the latch. The watchpoint is delivered
+/// synchronously by hardware the instant the kernel sets `exit_kind`
+/// (e.g. `kernel/sched/ext.c` `scx_exit` path), with no host-side
+/// polling overhead and no dependency on the probe BPF program being
+/// loaded. It also fires on ANY exit_kind transition — including
+/// SCX_EXIT_BPF / SCX_EXIT_STALL paths the .bss probe might miss
+/// when its tp_btf hook ran before the kernel teardown.
+/// The .bss path remains because the watchpoint can be unavailable
+/// (no `scx_root` symbol on pre-6.16, BTF stripped of `scx_sched`,
+/// or `KVM_SET_GUEST_DEBUG` rejected by the host).
+pub(crate) struct WatchpointArm {
+    /// KVA the freeze coordinator wants armed in `debugreg[0]`. `0`
+    /// means "no arm requested yet" — the coordinator publishes this
+    /// once it has resolved `*scx_root + exit_kind_offset`. After
+    /// publication the value is monotonic for the VM run (the kernel
+    /// scx_sched lifetime spans every err_exit transition we care
+    /// about).
+    pub(crate) request_kva: AtomicU64,
+    /// Host pointer to the same `exit_kind` field. Published by the
+    /// coordinator alongside `request_kva` so the vCPU thread can
+    /// `read_volatile` the post-store value at fire time without
+    /// needing its own `GuestMem` plumbing. `null_mut` until the
+    /// coordinator publishes; valid for the VM lifetime once set
+    /// (the underlying guest-DRAM page is mapped through
+    /// `vm.guest_mem`, which is dropped only by `collect_results`
+    /// AFTER every vCPU thread has joined — so the host mapping
+    /// strictly outlives every reader of this pointer).
+    ///
+    /// SAFETY: deref is sound only after a paired `Acquire` load on
+    /// `request_kva` returns non-zero — the coordinator's
+    /// `Release` store on `request_kva` orders this pointer's
+    /// publication. After that point the host-side guest-DRAM
+    /// mapping at this address stays mapped for the VM run because
+    /// `vm.guest_mem` is dropped only after `collect_results` joins
+    /// every vCPU thread (so no read can outlive the unmap), and
+    /// the kernel's `scx_sched` slab page is not freed until well
+    /// after the `exit_kind != 0` transition we care about. The
+    /// vCPU only ever reads (`read_volatile`), never writes, so
+    /// there is no torn-update concern beyond the guest's own
+    /// `atomic_set` write — which is the ONE write the watchpoint
+    /// catches.
+    pub(crate) kind_host_ptr: AtomicPtr<u32>,
+    /// Set by the vCPU thread that observed `KVM_EXIT_DEBUG` AND
+    /// confirmed the post-store `exit_kind` value indicates an
+    /// error-class exit (`>= SCX_EXIT_ERROR == 1024`). The
+    /// `KIND -> SCX_EXIT_DONE` transition on a clean shutdown
+    /// (`scx_unregister`) also writes `exit_kind` and trips the
+    /// watchpoint, but its post-store value is `1` (`SCX_EXIT_DONE`)
+    /// and MUST NOT trigger the failure-dump freeze — emitting a
+    /// dump on every clean test exit is a regression. The freeze
+    /// coordinator polls `hit` with Acquire ordering once the
+    /// watchpoint is armed; the vCPU's prior Release store
+    /// synchronizes-with that load. Mirrors the prior
+    /// `cached_bss_pa != 0` poll semantics so the late-trigger
+    /// state machine stays unchanged.
+    pub(crate) hit: AtomicBool,
+    /// EventFd written alongside every `hit.store(true, Release)` so
+    /// the freeze coordinator's epoll set wakes immediately on a
+    /// late-trigger fire instead of waiting for the next epoll
+    /// timeout. EFD_NONBLOCK so spurious additional writes never
+    /// stall the writer (an overflowing counter would only happen if
+    /// the coordinator never drained — in which case it's already
+    /// servicing the trigger). The vCPU thread's `Release` store on
+    /// `hit` happens-before the eventfd write to libc; an Acquire
+    /// load on `hit` after the coordinator drains the eventfd
+    /// observes the store on weakly-ordered architectures.
+    pub(crate) hit_evt: EventFd,
+}
+
+/// `SCX_EXIT_ERROR` from `enum scx_exit_kind` in
+/// `kernel/sched/ext_internal.h`. Values below this threshold are
+/// clean-exit classes (`SCX_EXIT_NONE = 0`, `SCX_EXIT_DONE = 1`,
+/// `SCX_EXIT_UNREG = 64`, etc.) — the kernel writes them to
+/// `sch->exit_kind` during normal `scx_unregister` flow. Values
+/// `>= 1024` are error classes (`SCX_EXIT_ERROR`,
+/// `SCX_EXIT_ERROR_BPF`, `SCX_EXIT_ERROR_STALL`) and are the only
+/// transitions the failure-dump freeze cares about. Pinned per
+/// `kernel/sched/ext_internal.h::scx_exit_kind::SCX_EXIT_ERROR =
+/// 1024`.
+pub(crate) const SCX_EXIT_ERROR_THRESHOLD: u32 = 1024;
+
+impl WatchpointArm {
+    pub(crate) fn new() -> std::io::Result<Self> {
+        Ok(Self {
+            request_kva: AtomicU64::new(0),
+            kind_host_ptr: AtomicPtr::new(std::ptr::null_mut()),
+            hit: AtomicBool::new(false),
+            hit_evt: EventFd::new(EFD_NONBLOCK)?,
+        })
+    }
+
+    /// Latch `hit=true` AND wake the freeze coordinator's epoll loop.
+    /// Used on every `KVM_EXIT_DEBUG` site that confirms an
+    /// error-class write to `*scx_root->exit_kind`. The Release on
+    /// `hit` synchronizes-with the coordinator's Acquire load; the
+    /// eventfd write fires the epoll wakeup so the late-trigger
+    /// rendezvous starts immediately instead of waiting for the
+    /// epoll timeout. A failed write is logged but non-fatal — the
+    /// `hit` flag still trips the next epoll tick (timerfd or
+    /// timeout), so the trigger eventually fires either way.
+    pub(crate) fn latch_hit(&self) {
+        self.hit.store(true, Ordering::Release);
+        if let Err(e) = self.hit_evt.write(1) {
+            tracing::warn!(
+                error = %e,
+                "WatchpointArm::latch_hit: eventfd write failed; \
+                 coordinator will still trip on next epoll timeout"
+            );
+        }
+    }
+}
+
+/// Maximum consecutive non-EINTR failures from `KVM_SET_GUEST_DEBUG`
+/// before the watchpoint arm path gives up and stops retrying. EINTR
+/// failures (transient — signal interrupted the ioctl, e.g.
+/// SIGRTMIN-driven kick race) do NOT count toward this cap. Only
+/// permanent errors (unsupported cap, EINVAL on the debug struct,
+/// hardware DR0 unavailable on this host) accumulate. Three is the
+/// retry budget the freeze-coord watchpoint suggests in CLAUDE.md;
+/// after that the BPF .bss fallback carries the trigger and the
+/// watchpoint stays disabled for the rest of the run.
+pub(crate) const WATCHPOINT_MAX_NON_EINTR_FAILURES: u8 = 3;
+
+/// Self-arm a hardware data-write watchpoint on `kva` if the per-vCPU
+/// state shows the requested KVA changed.
+///
+/// `armed` tracks the KVA currently programmed into the vCPU's
+/// `debugreg[0]` (`0` = no watchpoint armed yet). `request` is the
+/// shared atomic the coordinator publishes the resolved
+/// `exit_kind_kva` into. When the two diverge, this issues
+/// `KVM_SET_GUEST_DEBUG`; once successful, `*armed` is updated to
+/// match `request` so the next call is a no-op.
+///
+/// `failures` counts consecutive non-EINTR failures. EINTR (signal
+/// race against `SIGRTMIN`-driven kicks) is transient and does NOT
+/// stamp `*armed`; the next iteration retries. Other errors are
+/// counted; once `*failures >= WATCHPOINT_MAX_NON_EINTR_FAILURES`
+/// we stamp `*armed = req` so the loop stops re-issuing the doomed
+/// ioctl. A successful arm resets `*failures` to 0.
+///
+/// Returns `true` if the call landed a new arm, `false` if no work
+/// was needed or the ioctl failed (callers may surface a single
+/// warn — failure is non-fatal: the BPF .bss fallback continues to
+/// work).
+///
+/// x86_64 only — the DR0/DR7 layout is Intel SDM Vol. 3B Chapter 17.
+/// aarch64 has its own `WCRn`/`WVRn` registers; this helper would
+/// need a separate implementation. The freeze coordinator gates the
+/// publish path on x86_64 too, so the no-op aarch64 stub keeps the
+/// rest of the run loop arch-agnostic.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn self_arm_watchpoint(
+    vcpu: &mut kvm_ioctls::VcpuFd,
+    request: &AtomicU64,
+    armed: &mut u64,
+    failures: &mut u8,
+) -> bool {
+    let req = request.load(Ordering::Acquire);
+    if req == *armed {
+        return false;
+    }
+    if req == 0 {
+        return false;
+    }
+    use kvm_bindings::{KVM_GUESTDBG_ENABLE, KVM_GUESTDBG_USE_HW_BP, kvm_guest_debug};
+    let mut debug_struct = kvm_guest_debug {
+        control: KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_USE_HW_BP,
+        pad: 0,
+        arch: kvm_bindings::kvm_guest_debug_arch::default(),
+    };
+    debug_struct.arch.debugreg[0] = req;
+    // DR7 layout (Intel SDM Vol. 3B 17.2.4) — pinned against QEMU's
+    // `update_dr7_value` (target/i386/kvm/kvm.c) and the
+    // `dr7_slot0_write_4byte_encoding` test in `exit_dispatch.rs`:
+    //   bit 1     = G0      → globally enable DR0 across task switches
+    //   bit 9     = GE      → global exact-match, required for data BPs
+    //   bit 10    = MBS     → reserved, must be set to 1
+    //   bits 16-17 = R/W0   = 0b01 → trap on data writes only
+    //   bits 18-19 = LEN0   = 0b11 → 4-byte length
+    // Combined: 0x000D_0602. The GE bit (0x200) is required for data
+    // breakpoints — without it the SDM only guarantees instruction
+    // breakpoints fire reliably, and KVM follows the SDM verbatim.
+    debug_struct.arch.debugreg[7] = 0x400 | 0x200 | 0x2 | (0x1 << 16) | (0xC << 16);
+    match vcpu.set_guest_debug(&debug_struct) {
+        Ok(()) => {
+            *armed = req;
+            *failures = 0;
+            true
+        }
+        Err(e) => {
+            // EINTR is transient (SIGRTMIN kick raced the ioctl).
+            // Do NOT stamp `armed` and do NOT increment `failures`
+            // — the next iteration's call retries the same KVA.
+            // The kvm_ioctls::Error wrapper exposes the underlying
+            // errno via `errno()`.
+            if e.errno() == libc::EINTR {
+                tracing::debug!(
+                    err = %e,
+                    kva = format_args!("{:#x}", req),
+                    "self_arm_watchpoint: EINTR — will retry next iteration"
+                );
+                return false;
+            }
+            *failures = failures.saturating_add(1);
+            tracing::warn!(
+                err = %e,
+                kva = format_args!("{:#x}", req),
+                failures = *failures,
+                "self_arm_watchpoint: KVM_SET_GUEST_DEBUG failed"
+            );
+            if *failures >= WATCHPOINT_MAX_NON_EINTR_FAILURES {
+                tracing::warn!(
+                    kva = format_args!("{:#x}", req),
+                    failures = *failures,
+                    "self_arm_watchpoint: hit retry cap, suppressing further \
+                     attempts; falling back to BPF .bss poll for failure-dump \
+                     trigger"
+                );
+                *armed = req;
+            }
+            false
+        }
+    }
+}
+
+/// aarch64 stub. The freeze coordinator only publishes
+/// `request_kva` on x86_64; this stub keeps the call site
+/// arch-agnostic while documenting that aarch64 watchpoint
+/// arming is not yet implemented.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn self_arm_watchpoint(
+    _vcpu: &mut kvm_ioctls::VcpuFd,
+    _request: &AtomicU64,
+    _armed: &mut u64,
+    _failures: &mut u8,
+) -> bool {
+    false
+}
+
 impl VcpuThread {
     /// Kick a vCPU out of KVM_RUN. If immediate_exit is available, sets the
     /// flag before sending the signal (Firecracker pattern). Otherwise falls
@@ -442,19 +759,89 @@ impl VcpuThread {
     }
 
     /// Wait for the thread to exit, retrying the kick periodically.
-    /// Cloud Hypervisor pattern: poll exited flag, re-kick every 10ms.
+    /// Cloud Hypervisor pattern: re-kick every 10ms until the thread
+    /// observes `immediate_exit` and breaks out of `KVM_RUN`.
+    ///
+    /// Implementation: blocks in `epoll_wait` on `self.exit_evt`
+    /// (bumped by the AP thread after `exited.store(true)` and by
+    /// the panic hook on a panic-classified shutdown) plus a
+    /// 10ms-interval `timerfd` for the periodic re-kick. The outer
+    /// `start.elapsed()` deadline caps the total wait at `timeout`
+    /// without an explicit timeout fd. A spurious wake (EINTR or a
+    /// stale eventfd-counter drain) loops back without dropping the
+    /// kick cadence.
     pub(crate) fn wait_for_exit(&self, timeout: Duration) {
+        if self.exited.load(Ordering::Acquire) {
+            return;
+        }
+
+        let epoll = match Epoll::new() {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(%e, "wait_for_exit: epoll_create1 failed");
+                return;
+            }
+        };
+        const EXIT_TOKEN: u64 = 0;
+        const KICK_TOKEN: u64 = 1;
+        if let Err(e) = epoll.ctl(
+            ControlOperation::Add,
+            self.exit_evt.as_raw_fd(),
+            EpollEvent::new(EventSet::IN, EXIT_TOKEN),
+        ) {
+            tracing::warn!(%e, "wait_for_exit: add exit_evt to epoll");
+            return;
+        }
+        let mut kick_timer = match TimerFd::new() {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(%e, "wait_for_exit: timerfd_create failed");
+                return;
+            }
+        };
+        let kick_interval = Duration::from_millis(10);
+        if let Err(e) = kick_timer.reset(kick_interval, Some(kick_interval)) {
+            tracing::warn!(%e, "wait_for_exit: timerfd_settime failed");
+            return;
+        }
+        if let Err(e) = epoll.ctl(
+            ControlOperation::Add,
+            kick_timer.as_raw_fd(),
+            EpollEvent::new(EventSet::IN, KICK_TOKEN),
+        ) {
+            tracing::warn!(%e, "wait_for_exit: add timerfd to epoll");
+            return;
+        }
+
         let start = Instant::now();
-        let mut last_kick = Instant::now();
-        while !self.exited.load(Ordering::Acquire) {
-            if start.elapsed() > timeout {
-                break;
+        let mut events = [EpollEvent::default(); 2];
+        loop {
+            if self.exited.load(Ordering::Acquire) {
+                return;
             }
-            if last_kick.elapsed() > Duration::from_millis(10) {
-                self.kick();
-                last_kick = Instant::now();
+            let elapsed = start.elapsed();
+            if elapsed >= timeout {
+                return;
             }
-            std::thread::yield_now();
+            let remaining_ms = (timeout - elapsed).as_millis().min(i32::MAX as u128) as i32;
+            match epoll.wait(remaining_ms, &mut events) {
+                Ok(0) => return, // overall timeout
+                Ok(n) => {
+                    for ev in &events[..n] {
+                        if ev.data() == KICK_TOKEN {
+                            // Drain timerfd expiry counter (counter
+                            // mode); the read value is uninteresting.
+                            let _ = kick_timer.wait();
+                            self.kick();
+                        }
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    tracing::warn!(%e, "wait_for_exit: epoll_wait failed");
+                    return;
+                }
+            }
         }
     }
 }

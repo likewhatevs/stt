@@ -1252,10 +1252,7 @@ mod tests {
         fn parent_path(&self) -> &Path {
             Path::new("/mock")
         }
-        fn setup(
-            &self,
-            _: &std::collections::BTreeSet<crate::cgroup::Controller>,
-        ) -> Result<()> {
+        fn setup(&self, _: &std::collections::BTreeSet<crate::cgroup::Controller>) -> Result<()> {
             self.record("setup");
             Ok(())
         }

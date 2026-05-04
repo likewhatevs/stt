@@ -1,6 +1,7 @@
-//! Host-side rq->scx + DSQ enumeration walkers for the failure dump.
+//! Host-side rq->scx + DSQ + task enumeration walkers for the
+//! failure dump.
 //!
-//! Two entry points:
+//! Entry points:
 //!
 //! 1. [`walk_rq_scx`] — for one CPU's `struct rq.scx`, captures the
 //!    scalar fields the kernel's own `scx_dump_state` reads
@@ -11,19 +12,33 @@
 //!    these feed directly into the per-task enrichment capture
 //!    pipeline.
 //!
-//! 2. [`walk_dsqs`] — enumerates every dispatch queue reachable from
-//!    `*scx_root`:
-//!    - per-node global DSQs via `scx_sched.pnode[node]->global_dsq`
-//!    - per-CPU local DSQs via `rq->scx.local_dsq`
+//! 2. [`walk_local_dsqs`] — per-CPU local DSQs at
+//!    `rq->scx.local_dsq`. Runs unconditionally — local DSQs are
+//!    initialized at boot (`init_dsq` at `kernel/sched/ext.c:7772`
+//!    for every possible CPU) and exist whether or not a scheduler
+//!    is attached, so this surfaces local-DSQ state even when
+//!    `*scx_root == 0`.
+//!
+//! 3. [`walk_dsqs`] — sched-rooted DSQs reachable from `*scx_root`
+//!    (excluding per-CPU local DSQs, which [`walk_local_dsqs`]
+//!    handles separately):
 //!    - per-CPU bypass DSQs via `scx_sched_pcpu.bypass_dsq`
+//!    - per-node global DSQs via `scx_sched.pnode[node]->global_dsq`
 //!    - user-allocated DSQs via the `scx_sched.dsq_hash` rhashtable
+//!
 //!    For each DSQ captures the scalar state (id, nr, seq) and walks
 //!    its `list_head` to enumerate queued tasks. The kernel's own
 //!    `scx_dump_state` does NOT enumerate per-DSQ depths — this
 //!    walker surfaces queue depth and per-task ordering that the
 //!    in-tree dump path does not.
 //!
-//! Both walkers are best-effort: any address that fails to translate
+//! 4. [`walk_scx_tasks_global`] — walks the kernel's global
+//!    `scx_tasks` LIST_HEAD via each task's `scx.tasks_node`.
+//!    Surfaces every task owned by an scx_sched, surviving the
+//!    per-rq runnable_list drain that scheduler teardown
+//!    (`scx_bypass`, `kernel/sched/ext.c:5304-5404`) triggers.
+//!
+//! All walkers are best-effort: any address that fails to translate
 //! (slab page race, PA out of bounds) yields a partial result rather
 //! than aborting. Cycle protection is per-list (MAX_NODES_PER_LIST);
 //! the rhashtable walk caps total bucket-table chain length at
@@ -87,12 +102,26 @@ pub struct RqScxState {
     pub cpu_released: bool,
     /// `rq->scx.ops_qseq`.
     pub ops_qseq: u64,
-    /// `rq->scx.kick_sync`.
-    pub kick_sync: u64,
+    /// `rq->scx.kick_sync` — present on post-v7.0-rc5 kernels. None
+    /// when the BTF lookup of the field returns absent (v6.14 and
+    /// v7.0 release-line layouts predate the `kick_sync` member).
+    /// Skipped on serde when None so older dumps stay tight.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kick_sync: Option<u64>,
     /// `rq->scx.nr_immed` — count of ENQ_IMMED tasks on local_dsq.
-    pub nr_immed: u32,
-    /// `rq->clock` — per-CPU rq clock at the freeze instant.
-    pub rq_clock: u64,
+    /// Same kernel-version provenance as [`Self::kick_sync`]: the
+    /// field is post-v7.0-rc5 and absent on the v6.14/v7.0 CI matrix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nr_immed: Option<u32>,
+    /// `rq->scx.clock` — per-CPU scx_rq clock (the value
+    /// `scx_bpf_now()` returns) at the freeze instant. Optional
+    /// because the field was added by the `scx_bpf_now()` series in
+    /// v6.14 (commit 3a9910b5904d); v6.12 and v6.13 release kernels
+    /// have no equivalent member on `struct scx_rq`. None when the
+    /// BTF lookup of `rq->scx.clock` resolves absent — consumers
+    /// that need the value gate on Some.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rq_clock: Option<u64>,
     /// `rq->curr->pid` — the currently-running task. `None` when
     /// the curr pointer didn't translate (idle or torn read).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -161,6 +190,37 @@ pub struct ScxSchedState {
     /// match `enum scx_exit_kind` in
     /// `include/linux/sched/ext.h`.
     pub exit_kind: u32,
+    /// `scx_sched.watchdog_timeout` (jiffies) at the snapshot
+    /// instant. `None` when the field was not captured — either
+    /// because the live `read_scx_sched_state` path was taken on a
+    /// kernel that still exposes `watchdog_timeout` only via the
+    /// monitor's `WatchdogOverride` plumbing (not as a BTF field on
+    /// every release), or because the BPF .bss fallback was used
+    /// without the snapshot var set. Some when populated via the
+    /// probe BPF .bss snapshot
+    /// (`ktstr_exit_watchdog_timeout`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watchdog_timeout: Option<u64>,
+    /// Provenance tag identifying which path produced this state.
+    /// `None` for the default-built / serde-deserialized case where
+    /// the source isn't recorded; `Some("live")` when populated by
+    /// `read_scx_sched_state` reading `*scx_root` directly;
+    /// `Some("bss_snapshot")` when populated from the probe BPF
+    /// .bss snapshot fallback (the `ktstr_exit_*` vars). Lets the
+    /// dump consumer distinguish "scheduler was alive at freeze
+    /// time" from "scheduler had already torn down and we read the
+    /// pre-teardown snapshot the BPF probe latched".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Kernel virtual address of the `scx_sched` instance these
+    /// values describe. `None` when not captured. Same provenance
+    /// rule as [`Self::source`]: live path stamps the resolved
+    /// `*scx_root` value; the BPF .bss snapshot stamps the
+    /// `ktstr_exit_sched_kva` field. Lets a consumer correlate
+    /// dumps across reloads (a different scx_sched instance has a
+    /// different KVA).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sched_kva: Option<u64>,
 }
 
 /// Walk one CPU's `rq->scx` state. Reads the scalar fields and
@@ -206,9 +266,26 @@ pub fn walk_rq_scx(
     let flags = mem.read_u32(rq_pa, scx_off + scx_rq_offs.flags);
     let cpu_released = mem.read_u8(rq_pa, scx_off + scx_rq_offs.cpu_released) != 0;
     let ops_qseq = mem.read_u64(rq_pa, scx_off + scx_rq_offs.ops_qseq);
-    let kick_sync = mem.read_u64(rq_pa, scx_off + scx_rq_offs.kick_sync);
-    let nr_immed = mem.read_u32(rq_pa, scx_off + scx_rq_offs.nr_immed);
-    let rq_clock = mem.read_u64(rq_pa, scx_off + scx_rq_offs.clock);
+    // kick_sync / nr_immed are post-v7.0-rc5 fields; offsets resolve
+    // as None on v6.14 and v7.0 release-line BTFs. Gate the read on
+    // Some so we don't fabricate a u64/u32 from rq_pa+0 (which would
+    // alias the local_dsq head pointer — a non-zero garbage read
+    // that the dump would render as legitimate kernel state).
+    let kick_sync = scx_rq_offs
+        .kick_sync
+        .map(|off| mem.read_u64(rq_pa, scx_off + off));
+    let nr_immed = scx_rq_offs
+        .nr_immed
+        .map(|off| mem.read_u32(rq_pa, scx_off + off));
+    // rq->scx.clock added in v6.14 (commit 3a9910b5904d). Gate the
+    // read on Some(off): on v6.12/v6.13 the offset is None and the
+    // walker must NOT fall back to rq_pa+0 (would alias local_dsq's
+    // raw_spinlock — non-zero junk rendered as a legitimate clock
+    // reading). The downstream RqScxState carries an Option<u64> so
+    // the JSON elides scx_rq_clock on unsupported kernels.
+    let rq_clock = scx_rq_offs
+        .clock
+        .map(|off| mem.read_u64(rq_pa, scx_off + off));
 
     // curr task — pointer follow.
     let curr_kva = mem.read_u64(rq_pa, rq_offs.curr);
@@ -286,32 +363,80 @@ pub fn walk_rq_scx(
 /// `*scx_root` points at the active `struct scx_sched`. Returns
 /// `None` when scx_root is unset (no scheduler attached), the read
 /// fails, or the `scx_sched` offset sub-group is missing from BTF.
+///
+/// Emits `tracing::debug!` at each gate that returns `None` so an
+/// operator parsing the failure-dump trace can pinpoint exactly
+/// where the read aborted: BTF sub-group missing, scx_root_kva
+/// zero, dereferenced sched_kva zero, or sched_kva translate
+/// failure.
 #[allow(dead_code)]
 pub fn read_scx_sched_state(
     kernel: &GuestKernel<'_>,
     scx_root_kva: u64,
     offsets: &ScxWalkerOffsets,
 ) -> Option<(u64, ScxSchedState)> {
-    let sched_offs = offsets.sched.as_ref()?;
+    let Some(sched_offs) = offsets.sched.as_ref() else {
+        tracing::debug!(
+            "read_scx_sched_state: ScxSchedOffsets BTF sub-group missing — \
+             vmlinux lacks `struct scx_sched` (kernel without sched_ext or stripped vmlinux)",
+        );
+        return None;
+    };
 
     let mem = kernel.mem();
     let cr3_pa = kernel.cr3_pa();
     let page_offset = kernel.page_offset();
     let l5 = kernel.l5();
 
+    if scx_root_kva == 0 {
+        tracing::debug!(
+            "read_scx_sched_state: scx_root_kva is 0 — vmlinux had no \
+             `scx_root` symbol (pre-6.16 kernel or stripped vmlinux)",
+        );
+        return None;
+    }
+
     let root_pa = super::symbols::text_kva_to_pa(scx_root_kva);
     let sched_kva = mem.read_u64(root_pa, 0);
     if sched_kva == 0 {
+        tracing::debug!(
+            scx_root_kva = format_args!("{:#x}", scx_root_kva),
+            root_pa = format_args!("{:#x}", root_pa),
+            "read_scx_sched_state: *scx_root == 0 — no scheduler attached at the freeze instant",
+        );
         return None;
     }
-    let sched_pa = translate_any_kva(mem, cr3_pa, page_offset, sched_kva, l5)?;
+    let Some(sched_pa) = translate_any_kva(mem, cr3_pa, page_offset, sched_kva, l5) else {
+        tracing::debug!(
+            sched_kva = format_args!("{:#x}", sched_kva),
+            "read_scx_sched_state: translate_any_kva failed for sched_kva — \
+             page-table walk yielded no PA (slab page race or torn read)",
+        );
+        return None;
+    };
 
-    let aborting = mem.read_u8(sched_pa, sched_offs.aborting) != 0;
-    let bypass_depth = mem.read_u32(sched_pa, sched_offs.bypass_depth) as i32;
+    // `aborting` and `bypass_depth` are dev-only fields (absent on
+    // every release tag in our supported range). Gate each read on
+    // its offset being Some — falling back to 0 / false matches the
+    // semantics of reading from a kernel that never had the field
+    // (no in-flight abort, no bypass nesting). The downstream
+    // ScxSchedState carries plain bool/i32 because those defaults
+    // are meaningful and serializable; an Option wrapper would just
+    // complicate every consumer for no extra signal on release
+    // kernels.
+    let aborting = sched_offs
+        .aborting
+        .map(|off| mem.read_u8(sched_pa, off) != 0)
+        .unwrap_or(false);
+    let bypass_depth = sched_offs
+        .bypass_depth
+        .map(|off| mem.read_u32(sched_pa, off) as i32)
+        .unwrap_or(0);
     // `exit_kind` is `atomic_t`; the value lives in the `counter`
     // field at offset 0 of atomic_t. We're already at the
     // outer-struct offset of `exit_kind`, so a u32 read at that
-    // offset reads the `counter` directly.
+    // offset reads the `counter` directly. Mandatory on every
+    // kernel that has `scx_sched`.
     let exit_kind = mem.read_u32(sched_pa, sched_offs.exit_kind);
 
     Some((
@@ -320,25 +445,295 @@ pub fn read_scx_sched_state(
             aborting,
             bypass_depth,
             exit_kind,
+            // Live read from `*scx_root` doesn't capture
+            // `watchdog_timeout`. The BTF sub-group does not carry
+            // an offset for the field today (it would need to be
+            // added to `ScxSchedOffsets`), and the host tracks the
+            // configured timeout via the `WatchdogOverride` plumbing
+            // anyway. Leave None; the BPF .bss snapshot's
+            // `ktstr_exit_watchdog_timeout` path populates this when
+            // the live read is unavailable.
+            watchdog_timeout: None,
+            source: Some(SCX_SCHED_STATE_SOURCE_LIVE.to_string()),
+            sched_kva: Some(sched_kva),
         },
     ))
 }
 
-/// Walk every DSQ reachable from a `scx_sched` and produce one
+/// Provenance tag for [`ScxSchedState::source`] when the state was
+/// read directly from `*scx_root` via `read_scx_sched_state`. The
+/// scheduler was alive at freeze time and the host walked its slab
+/// page directly. Pinned as a constant so the dump's display layer
+/// and tests reference the same string without drift.
+pub const SCX_SCHED_STATE_SOURCE_LIVE: &str = "live";
+
+/// Provenance tag for [`ScxSchedState::source`] when the state was
+/// reconstructed from the probe BPF program's `.bss` snapshot
+/// (`ktstr_exit_*` vars). The scheduler had already torn down by
+/// freeze time (`*scx_root == 0`), so the live walker returned None
+/// and the host fell back to the snapshot the BPF tp_btf handler
+/// captured at err-exit time.
+pub const SCX_SCHED_STATE_SOURCE_BSS: &str = "bss_snapshot";
+
+/// `SCX_TASK_CURSOR` flag value (`1 << 31`) on `sched_ext_entity.flags`.
+/// Cursor entries are stack-allocated `sched_ext_entity` placeholders
+/// that `scx_task_iter_start` (`kernel/sched/ext.c:843-846`) inserts
+/// into `scx_tasks` to mark the iterator's progress; they are NOT
+/// embedded in any `task_struct` so the global walker must skip them
+/// to avoid container_of producing a bogus task KVA. Pinned per
+/// `include/linux/sched/ext.h:142::SCX_TASK_CURSOR`.
+const SCX_TASK_CURSOR: u32 = 1 << 31;
+/// Walk the kernel's global `scx_tasks` LIST_HEAD and recover every
+/// task linked into it via `task_struct.scx.tasks_node`.
+///
+/// `scx_tasks` is `static LIST_HEAD(scx_tasks)` at
+/// `kernel/sched/ext.c:47`. Tasks are added on
+/// `scx_init_task` (`kernel/sched/ext.c:3742` —
+/// `list_add_tail(&p->scx.tasks_node, &scx_tasks)`) and removed on
+/// `sched_ext_dead` (`kernel/sched/ext.c:3803` —
+/// `list_del_init(&p->scx.tasks_node)`). The list outlives the
+/// per-rq `runnable_list` because `scx_bypass`
+/// (`kernel/sched/ext.c:5304-5404`) drains runnable_list during
+/// scheduler teardown without touching `scx_tasks` — making this
+/// the durable task source for failure-dump enrichment.
+///
+/// Cursor entries (`scx_task_iter_start` inserts a stack-allocated
+/// `sched_ext_entity` with `flags = SCX_TASK_CURSOR` into
+/// `scx_tasks` while iterating) are skipped via the
+/// `tasks_node_off_in_see` parameter — the walker reads
+/// `sched_ext_entity.flags` for each list entry and skips entries
+/// whose flag is set.
+///
+/// `scx_tasks_kva` is the symbol KVA of the global LIST_HEAD;
+/// `tasks_node_off_in_task` is the byte offset of `tasks_node`
+/// within `task_struct` (`task.scx + see.tasks_node`);
+/// `tasks_node_off_in_see` is the byte offset of `tasks_node`
+/// within `sched_ext_entity` (`see.tasks_node` alone — used to
+/// recover the see base for cursor-flag testing on entries that
+/// are not embedded in a `task_struct`); `flags_off_in_see` is the
+/// byte offset of `flags` within `sched_ext_entity`.
+///
+/// Returns an empty vec when `scx_tasks_kva` is 0 (symbol absent —
+/// stripped vmlinux or kernel without sched_ext) or when the list
+/// head reads as empty (tasks_node points at itself).
+///
+/// Bounded by [`MAX_NODES_PER_LIST`] to protect against a corrupt
+/// chain.
+#[allow(dead_code)]
+pub fn walk_scx_tasks_global(
+    kernel: &GuestKernel<'_>,
+    scx_tasks_kva: u64,
+    tasks_node_off_in_task: usize,
+    tasks_node_off_in_see: usize,
+    flags_off_in_see: usize,
+) -> Vec<u64> {
+    if scx_tasks_kva == 0 {
+        tracing::debug!(
+            "walk_scx_tasks_global: scx_tasks_kva is 0 — vmlinux had no \
+             `scx_tasks` symbol (kernel without sched_ext or stripped vmlinux)",
+        );
+        return Vec::new();
+    }
+    let mem = kernel.mem();
+    let cr3_pa = kernel.cr3_pa();
+    let page_offset = kernel.page_offset();
+    let l5 = kernel.l5();
+
+    // The LIST_HEAD lives in the kernel text/.data mapping; convert
+    // KVA → PA via text_kva_to_pa. The first u64 at that PA is
+    // list_head.next (the LIST_HEAD struct's first field).
+    let head_kva = scx_tasks_kva;
+    let head_pa = super::symbols::text_kva_to_pa(scx_tasks_kva);
+
+    let mut task_kvas: Vec<u64> = Vec::new();
+    let mut node_kva = mem.read_u64(head_pa, 0);
+    if node_kva == 0 {
+        tracing::debug!(
+            scx_tasks_kva = format_args!("{:#x}", scx_tasks_kva),
+            head_pa = format_args!("{:#x}", head_pa),
+            "walk_scx_tasks_global: head.next read as 0 — list-head bytes \
+             unmapped or torn read; no tasks harvested",
+        );
+        return task_kvas;
+    }
+
+    let mut visited: u32 = 0;
+    while node_kva != head_kva {
+        if visited >= MAX_NODES_PER_LIST {
+            return task_kvas;
+        }
+        visited += 1;
+
+        // Recover the sched_ext_entity base for this list entry so we
+        // can read its `flags`. For task-embedded entries this base is
+        // inside a task_struct (`task_kva + task.scx`); for cursor
+        // entries this base is a stack-allocated sched_ext_entity.
+        // Either way, `see_kva = node_kva - see.tasks_node`.
+        let see_kva = node_kva.wrapping_sub(tasks_node_off_in_see as u64);
+        let cursor = match translate_any_kva(mem, cr3_pa, page_offset, see_kva, l5) {
+            Some(see_pa) => {
+                let flags = mem.read_u32(see_pa, flags_off_in_see);
+                flags & SCX_TASK_CURSOR != 0
+            }
+            // Translate failure on the see base — be conservative and
+            // treat as not-cursor so the entry surfaces; downstream
+            // walk_task_enrichment will revalidate via translate and
+            // drop it cleanly if the address is bogus.
+            None => false,
+        };
+
+        if !cursor {
+            // container_of: task_kva = node_kva - tasks_node_off_in_task.
+            let task_kva = node_kva.wrapping_sub(tasks_node_off_in_task as u64);
+            task_kvas.push(task_kva);
+        }
+
+        // Advance to the next node via the list_head.next pointer
+        // at offset 0 of the tasks_node list_head.
+        let Some(node_pa) = translate_any_kva(mem, cr3_pa, page_offset, node_kva, l5) else {
+            return task_kvas;
+        };
+        let next_kva = mem.read_u64(node_pa, 0);
+        if next_kva == 0 {
+            return task_kvas;
+        }
+        node_kva = next_kva;
+    }
+    task_kvas
+}
+
+/// Walk every per-CPU local DSQ — the DSQs embedded in `rq->scx.local_dsq`.
+///
+/// This is a strict subset of [`walk_dsqs`]'s pass 1, extracted so
+/// the dump path can call it INDEPENDENTLY of `*scx_root`. Per-CPU
+/// local DSQs are kernel-initialized at boot (`init_dsq` from
+/// `kernel/sched/ext.c:7772`, called for every possible CPU in the
+/// `__init` path), so they exist even when no scheduler is attached
+/// (`*scx_root == NULL`) and survive scheduler teardown's bypass
+/// drain.
+///
+/// Returns one `DsqState` per CPU whose translate succeeds, plus a
+/// flat vec of [`TaskWalkerEntry`] for the per-task enrichment
+/// pipeline (these entries carry `is_runnable_in_scx: false` —
+/// tasks queued on a DSQ are staged for dispatch, not yet runnable
+/// in the rq->scx sense).
+///
+/// `rq_kvas` and `rq_pas` index by CPU id (parallel arrays, same
+/// shape `walk_rq_scx` consumes). Empty arrays mean "no CPUs walked
+/// successfully"; the caller's freeze-path retry guard normally
+/// rejects an empty `per_cpu_offsets` array before reaching this
+/// pass.
+///
+/// `None` return when any required offset sub-group is missing
+/// (`rq`, `scx_rq`, `dsq`, `dsq_lnode`, `task`, `see` — the same
+/// leaf set [`walk_dsqs`]'s pass 1 needs). A partial offset set
+/// is the same gating condition that blinds every other DSQ pass.
+#[allow(dead_code)]
+pub fn walk_local_dsqs(
+    kernel: &GuestKernel<'_>,
+    rq_kvas: &[u64],
+    rq_pas: &[u64],
+    offsets: &ScxWalkerOffsets,
+) -> Option<(Vec<DsqState>, Vec<TaskWalkerEntry>)> {
+    let Some(rq_offs) = offsets.rq.as_ref() else {
+        tracing::debug!(
+            "walk_local_dsqs: ScxWalkerOffsets.rq sub-group missing — \
+             local DSQ pass blinded",
+        );
+        return None;
+    };
+    let Some(scx_rq_offs) = offsets.scx_rq.as_ref() else {
+        tracing::debug!(
+            "walk_local_dsqs: ScxWalkerOffsets.scx_rq sub-group missing — \
+             local DSQ pass blinded",
+        );
+        return None;
+    };
+    let Some(dsq_offs) = offsets.dsq.as_ref() else {
+        tracing::debug!(
+            "walk_local_dsqs: ScxWalkerOffsets.dsq sub-group missing — \
+             local DSQ pass blinded",
+        );
+        return None;
+    };
+    let Some(dsq_lnode_offs) = offsets.dsq_lnode.as_ref() else {
+        tracing::debug!(
+            "walk_local_dsqs: ScxWalkerOffsets.dsq_lnode sub-group missing — \
+             local DSQ pass blinded",
+        );
+        return None;
+    };
+    let Some(task_offs) = offsets.task.as_ref() else {
+        tracing::debug!(
+            "walk_local_dsqs: ScxWalkerOffsets.task sub-group missing — \
+             local DSQ pass blinded",
+        );
+        return None;
+    };
+    let Some(see_offs) = offsets.see.as_ref() else {
+        tracing::debug!(
+            "walk_local_dsqs: ScxWalkerOffsets.see sub-group missing — \
+             local DSQ pass blinded",
+        );
+        return None;
+    };
+
+    let mem = kernel.mem();
+    let cr3_pa = kernel.cr3_pa();
+    let page_offset = kernel.page_offset();
+    let l5 = kernel.l5();
+
+    let mut states: Vec<DsqState> = Vec::new();
+    let mut entries: Vec<TaskWalkerEntry> = Vec::new();
+
+    for (cpu, (&rq_kva, &rq_pa)) in rq_kvas.iter().zip(rq_pas.iter()).enumerate() {
+        let local_dsq_off = rq_offs.scx + scx_rq_offs.local_dsq;
+        let dsq_kva = rq_kva.wrapping_add(local_dsq_off as u64);
+        let dsq_pa = rq_pa.wrapping_add(local_dsq_off as u64);
+        if let Some((state, e)) = walk_one_dsq(
+            mem,
+            cr3_pa,
+            page_offset,
+            l5,
+            dsq_kva,
+            dsq_pa,
+            format!("local cpu {cpu}"),
+            dsq_offs,
+            dsq_lnode_offs,
+            task_offs,
+            see_offs,
+        ) {
+            entries.extend(e);
+            states.push(state);
+        }
+    }
+
+    Some((states, entries))
+}
+
+/// Walk every DSQ reachable from a `scx_sched` (the bypass / global
+/// / user-hash passes — NOT per-CPU local DSQs) and produce one
 /// `DsqState` per DSQ plus a flat vec of `TaskWalkerEntry` rows for
 /// the per-task enrichment pipeline.
 ///
+/// Per-CPU local DSQs (`rq->scx.local_dsq`) are NOT walked here —
+/// they live in each rq independently of `*scx_root`, so callers
+/// invoke [`walk_local_dsqs`] separately and unconditionally for
+/// the local pass. This split lets the dump path surface local DSQ
+/// state even when no scheduler is attached
+/// (`*scx_root == NULL`) — the local_dsq struct is initialized at
+/// boot per `init_dsq` (`kernel/sched/ext.c:7772`) for every
+/// possible CPU, so it has well-defined contents long before any
+/// scheduler attaches.
+///
 /// Walks (in this order, gated on the relevant sub-group offsets
 /// being present):
-///   1. Per-CPU local DSQs at `rq->scx.local_dsq` for every CPU
-///      (needs `rq`, `scx_rq`, `dsq`, `dsq_lnode`, `task`, `see`).
-///   2. Per-CPU bypass DSQs at `scx_sched_pcpu.bypass_dsq` for
-///      every CPU (needs `sched`, `sched_pcpu`, plus the leaf set
-///      above).
-///   3. Per-node global DSQs at `scx_sched.pnode[node]->global_dsq`
+///   1. Per-CPU bypass DSQs at `scx_sched_pcpu.bypass_dsq` for
+///      every CPU (needs `sched`, `sched_pcpu`, plus the leaf set).
+///   2. Per-node global DSQs at `scx_sched.pnode[node]->global_dsq`
 ///      for every NUMA node (needs `sched`, `sched_pnode`, plus
 ///      leaf set).
-///   4. User-allocated DSQs walked through `scx_sched.dsq_hash`
+///   3. User-allocated DSQs walked through `scx_sched.dsq_hash`
 ///      (needs `sched`, `rht`, plus leaf set).
 ///
 /// Each pass is independent: missing offsets for one pass blind
@@ -348,8 +743,6 @@ pub fn read_scx_sched_state(
 pub fn walk_dsqs(
     kernel: &GuestKernel<'_>,
     sched_pa: u64,
-    rq_kvas: &[u64],
-    rq_pas: &[u64],
     per_cpu_offsets: &[u64],
     nr_nodes: u32,
     offsets: &ScxWalkerOffsets,
@@ -362,7 +755,7 @@ pub fn walk_dsqs(
     let mut dsq_states: Vec<DsqState> = Vec::new();
     let mut all_entries: Vec<TaskWalkerEntry> = Vec::new();
 
-    // Leaf offsets common to every pass — all four DSQ-walking
+    // Leaf offsets common to every pass — all three DSQ-walking
     // passes feed `walk_one_dsq` which needs these. If any leaf
     // group is missing, no pass can run.
     let (Some(dsq_offs), Some(dsq_lnode_offs), Some(task_offs), Some(see_offs)) = (
@@ -374,39 +767,22 @@ pub fn walk_dsqs(
         return (dsq_states, all_entries);
     };
 
-    // Pass 1: per-CPU local DSQs. Needs rq + scx_rq sub-groups for
-    // the local_dsq embedded in each rq.
-    if let (Some(rq_offs), Some(scx_rq_offs)) = (offsets.rq.as_ref(), offsets.scx_rq.as_ref()) {
-        for (cpu, (&rq_kva, &rq_pa)) in rq_kvas.iter().zip(rq_pas.iter()).enumerate() {
-            let dsq_kva = rq_kva.wrapping_add((rq_offs.scx + scx_rq_offs.local_dsq) as u64);
-            let dsq_pa = rq_pa.wrapping_add((rq_offs.scx + scx_rq_offs.local_dsq) as u64);
-            if let Some((state, entries)) = walk_one_dsq(
-                mem,
-                cr3_pa,
-                page_offset,
-                l5,
-                dsq_kva,
-                dsq_pa,
-                format!("local cpu {cpu}"),
-                dsq_offs,
-                dsq_lnode_offs,
-                task_offs,
-                see_offs,
-            ) {
-                all_entries.extend(entries);
-                dsq_states.push(state);
-            }
-        }
-    }
-
-    // Pass 2: per-CPU bypass DSQs. The percpu base lives at
+    // Pass 1: per-CPU bypass DSQs. The percpu base lives at
     // sched->pcpu, dereferenced as a __percpu pointer; each CPU's
     // address is `pcpu_base + per_cpu_offset[cpu] +
     // scx_sched_pcpu.bypass_dsq`.
+    //
+    // Both `sched_offs.pcpu` (v6.18+) and `pcpu_offs.bypass_dsq`
+    // (dev-only) are kernel-version-gated. Skip the entire pass
+    // unless both offsets resolved — partial state would compute
+    // a bogus DSQ KVA from `sched_pa + 0` (aliasing dsq_hash) and
+    // surface phantom DSQ entries.
     if let (Some(sched_offs), Some(pcpu_offs)) =
         (offsets.sched.as_ref(), offsets.sched_pcpu.as_ref())
+        && let (Some(sched_pcpu_off), Some(bypass_dsq_off)) =
+            (sched_offs.pcpu, pcpu_offs.bypass_dsq)
     {
-        let pcpu_kva = mem.read_u64(sched_pa, sched_offs.pcpu);
+        let pcpu_kva = mem.read_u64(sched_pa, sched_pcpu_off);
         if pcpu_kva != 0 {
             for (cpu, &cpu_off) in per_cpu_offsets.iter().enumerate() {
                 // Skip out-of-range CPUs — same heuristic as
@@ -417,7 +793,7 @@ pub fn walk_dsqs(
                 }
                 let dsq_kva = pcpu_kva
                     .wrapping_add(cpu_off)
-                    .wrapping_add(pcpu_offs.bypass_dsq as u64);
+                    .wrapping_add(bypass_dsq_off as u64);
                 if let Some(dsq_pa) = translate_any_kva(mem, cr3_pa, page_offset, dsq_kva, l5)
                     && let Some((state, entries)) = walk_one_dsq(
                         mem,
@@ -440,12 +816,16 @@ pub fn walk_dsqs(
         }
     }
 
-    // Pass 3: per-node global DSQs. `sched->pnode` is a pointer
+    // Pass 2: per-node global DSQs. `sched->pnode` is a pointer
     // to an array of `struct scx_sched_pnode *` of length nr_nodes.
+    // Both `sched_offs.pnode` and `pnode_offs.global_dsq` are
+    // dev-only — skip the pass unless both resolved.
     if let (Some(sched_offs), Some(pnode_offs)) =
         (offsets.sched.as_ref(), offsets.sched_pnode.as_ref())
+        && let (Some(sched_pnode_off), Some(global_dsq_off)) =
+            (sched_offs.pnode, pnode_offs.global_dsq)
     {
-        let pnode_kva = mem.read_u64(sched_pa, sched_offs.pnode);
+        let pnode_kva = mem.read_u64(sched_pa, sched_pnode_off);
         if pnode_kva != 0
             && let Some(pnode_arr_pa) = translate_any_kva(mem, cr3_pa, page_offset, pnode_kva, l5)
         {
@@ -458,8 +838,8 @@ pub fn walk_dsqs(
                 else {
                     continue;
                 };
-                let dsq_kva = pnode_ptr_kva.wrapping_add(pnode_offs.global_dsq as u64);
-                let dsq_pa = pnode_pa.wrapping_add(pnode_offs.global_dsq as u64);
+                let dsq_kva = pnode_ptr_kva.wrapping_add(global_dsq_off as u64);
+                let dsq_pa = pnode_pa.wrapping_add(global_dsq_off as u64);
                 if let Some((state, entries)) = walk_one_dsq(
                     mem,
                     cr3_pa,
@@ -480,7 +860,7 @@ pub fn walk_dsqs(
         }
     }
 
-    // Pass 4: user-allocated DSQs via the scx_sched.dsq_hash
+    // Pass 3: user-allocated DSQs via the scx_sched.dsq_hash
     // rhashtable. Walks at most MAX_RHT_NODES nodes total across
     // all buckets.
     if let (Some(sched_offs), Some(rht_offs)) = (offsets.sched.as_ref(), offsets.rht.as_ref()) {
@@ -639,6 +1019,13 @@ fn walk_list_head_for_task_kvas(
 /// Walk a DSQ's `list` chain (a list of `scx_dsq_list_node.node`
 /// entries embedded in `sched_ext_entity.dsq_list`). Skips iterator
 /// cursor entries marked with `SCX_DSQ_LNODE_ITER_CURSOR`.
+///
+/// `too_many_arguments` allow: every parameter is independent
+/// state (page-walk context, list head, container offset, lnode
+/// offsets) sourced from a different upstream resolver. Bundling
+/// would require a wrapper struct with 8 fields used only for this
+/// one call site — pure churn.
+#[allow(clippy::too_many_arguments)]
 fn walk_list_head_for_dsq_task_kvas(
     mem: &GuestMem,
     cr3_pa: u64,
@@ -824,9 +1211,9 @@ mod tests {
             flags: 0x10,
             cpu_released: false,
             ops_qseq: 100,
-            kick_sync: 50,
-            nr_immed: 0,
-            rq_clock: 1234567,
+            kick_sync: Some(50),
+            nr_immed: None,
+            rq_clock: Some(1234567),
             curr_pid: None,
             curr_comm: None,
             runnable_task_kvas: vec![],
@@ -836,6 +1223,14 @@ mod tests {
         assert!(!json.contains("curr_pid"));
         assert!(!json.contains("curr_comm"));
         assert!(!json.contains("runnable_truncated"));
+        // nr_immed is None — must skip via skip_serializing_if so
+        // dumps from v6.14/v7.0 (no kick_sync / nr_immed fields)
+        // stay tight.
+        assert!(!json.contains("nr_immed"));
+        // kick_sync is Some — must serialize the inner value, not
+        // a `{ "Some": ... }` shape (Option<T> with default serde
+        // serializes the wrapped value bare).
+        assert!(json.contains("\"kick_sync\":50"));
         assert!(json.contains("\"cpu\":3"));
         assert!(json.contains("\"nr_running\":4"));
     }
@@ -855,9 +1250,9 @@ mod tests {
             flags: 0x1,
             cpu_released: true,
             ops_qseq: 42,
-            kick_sync: 17,
-            nr_immed: 1,
-            rq_clock: 999_999,
+            kick_sync: Some(17),
+            nr_immed: Some(1),
+            rq_clock: Some(999_999),
             curr_pid: Some(1234),
             curr_comm: Some("ktstr".into()),
             runnable_task_kvas: vec![0xffff_ffff_8000_1000, 0xffff_ffff_8000_2000],
@@ -885,9 +1280,16 @@ mod tests {
         crate::claim!(v, parsed_flags).eq(0x1u32);
         crate::claim!(v, parsed_cpu_released).eq(true);
         crate::claim!(v, parsed_ops_qseq).eq(42u64);
-        crate::claim!(v, parsed_kick_sync).eq(17u64);
-        crate::claim!(v, parsed_nr_immed).eq(1u32);
-        crate::claim!(v, parsed_rq_clock).eq(999_999u64);
+        // kick_sync / nr_immed are now Option<…>; the populated test
+        // fixture sets both Some(…), so equality on the unwrapped
+        // shape is the same correctness check the prior assertions
+        // gave on the bare types.
+        let kick_sync_match = parsed_kick_sync == Some(17u64);
+        let nr_immed_match = parsed_nr_immed == Some(1u32);
+        let rq_clock_match = parsed_rq_clock == Some(999_999u64);
+        crate::claim!(v, kick_sync_match).eq(true);
+        crate::claim!(v, nr_immed_match).eq(true);
+        crate::claim!(v, rq_clock_match).eq(true);
         // Option<T> doesn't impl Display, so claim on the unwrapped
         // values via match-against-known-shape: bake the expected
         // outcome ("present + value matches") into a single bool.
@@ -955,6 +1357,7 @@ mod tests {
             bypass_depth: 2,
             // SCX_EXIT_ERROR_BPF per include/linux/sched/ext.h
             exit_kind: 1027,
+            ..Default::default()
         };
         let json = serde_json::to_string(&s).unwrap();
         let parsed: ScxSchedState = serde_json::from_str(&json).unwrap();
@@ -1100,9 +1503,9 @@ mod tests {
                 flags: 100,
                 cpu_released: 104,
                 ops_qseq: 112,
-                kick_sync: 120,
-                nr_immed: 128,
-                clock: 136,
+                kick_sync: Some(120),
+                nr_immed: Some(128),
+                clock: Some(136),
             }),
             task: Some(TaskStructCoreOffsets {
                 comm: 100,
@@ -1121,6 +1524,7 @@ mod tests {
                 dsq_flags: 76,
                 sticky_cpu: 80,
                 holding_cpu: 84,
+                tasks_node: 88,
             }),
             dsq_lnode: Some(ScxDsqListNodeOffsets { node: 0, flags: 16 }),
             dsq: Some(ScxDispatchQOffsets {
@@ -1132,14 +1536,18 @@ mod tests {
             }),
             sched: Some(ScxSchedOffsets {
                 dsq_hash: 0,
-                pnode: 64,
-                pcpu: 72,
-                aborting: 80,
-                bypass_depth: 84,
+                pnode: Some(64),
+                pcpu: Some(72),
+                aborting: Some(80),
+                bypass_depth: Some(84),
                 exit_kind: 88,
             }),
-            sched_pnode: Some(ScxSchedPnodeOffsets { global_dsq: 0 }),
-            sched_pcpu: Some(ScxSchedPcpuOffsets { bypass_dsq: 0 }),
+            sched_pnode: Some(ScxSchedPnodeOffsets {
+                global_dsq: Some(0),
+            }),
+            sched_pcpu: Some(ScxSchedPcpuOffsets {
+                bypass_dsq: Some(0),
+            }),
             rht: Some(RhashtableOffsets {
                 tbl: 0,
                 nelems: 8,
@@ -1178,9 +1586,9 @@ mod tests {
             flags: 0x1,
             cpu_released: false,
             ops_qseq: 4242,
-            kick_sync: 100,
-            nr_immed: 0,
-            rq_clock: 999_999,
+            kick_sync: Some(100),
+            nr_immed: Some(0),
+            rq_clock: Some(999_999),
             curr_pid: Some(1234),
             curr_comm: Some("ktstr-w".into()),
             runnable_task_kvas: vec![0xffff_ffff_8000_1000, 0xffff_ffff_8000_2000],
@@ -1222,9 +1630,9 @@ mod tests {
             flags: 0,
             cpu_released: false,
             ops_qseq: 0,
-            kick_sync: 0,
-            nr_immed: 0,
-            rq_clock: 0,
+            kick_sync: None,
+            nr_immed: None,
+            rq_clock: None,
             curr_pid: None,
             curr_comm: None,
             runnable_task_kvas: vec![],
@@ -1303,6 +1711,7 @@ mod tests {
             aborting: false,
             bypass_depth: 0,
             exit_kind: 0,
+            ..Default::default()
         };
         let mut v = Verdict::new();
         crate::claim!(v, healthy.aborting).eq(false);
@@ -1318,10 +1727,705 @@ mod tests {
             bypass_depth: 4,
             // SCX_EXIT_ERROR_BPF (1027) per include/linux/sched/ext.h.
             exit_kind: 1027,
+            ..Default::default()
         };
         let mut v = Verdict::new();
         crate::claim!(v, aborted.exit_kind).eq(0u32);
         let r = v.into_result();
         assert!(!r.passed, "exit_kind=1027 must fail eq(0)");
+    }
+
+    /// `walk_scx_tasks_global` returns an empty vec when the
+    /// `scx_tasks` symbol KVA is 0 — kernel without sched_ext or
+    /// stripped vmlinux. The walk must NOT attempt to read at PA 0
+    /// (which would alias the boot-page region and surface bogus
+    /// task entries).
+    #[test]
+    fn walk_scx_tasks_global_zero_kva_returns_empty() {
+        let mut buf = vec![0u8; 0x1000];
+        // Pre-populate buf at offset 0 to make the difference visible:
+        // a buggy implementation that read from PA 0 would surface
+        // 0xdead_beef as a task_kva (after container_of subtraction).
+        buf[0..8].copy_from_slice(&0xdead_beef_u64.to_le_bytes());
+        let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
+        let kernel = crate::monitor::guest::GuestKernel::new_for_test(
+            &mem,
+            std::collections::HashMap::new(),
+            0,
+            0,
+            false,
+        );
+
+        let kvas = walk_scx_tasks_global(&kernel, 0, 0x10, 0x60, 0x44);
+        assert!(
+            kvas.is_empty(),
+            "scx_tasks_kva=0 must short-circuit before any read"
+        );
+    }
+
+    /// `walk_scx_tasks_global` walks an empty global list (head.next
+    /// points back at the head itself — kernel's empty-list
+    /// invariant). Walker returns no task KVAs.
+    #[test]
+    fn walk_scx_tasks_global_empty_list_returns_empty() {
+        // page_offset = 0 makes text_kva_to_pa return KVA itself for
+        // KVAs >= __START_KERNEL_map. The KVA we choose is in the
+        // text mapping range so text_kva_to_pa lands at a sensible
+        // offset within our test buffer.
+        let head_kva = crate::monitor::symbols::START_KERNEL_MAP + 0x100;
+        let head_pa = head_kva.wrapping_sub(crate::monitor::symbols::START_KERNEL_MAP) as usize;
+        let mut buf = vec![0u8; 0x1000];
+        // head.next = head_kva (empty list invariant)
+        buf[head_pa..head_pa + 8].copy_from_slice(&head_kva.to_le_bytes());
+        let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
+        let kernel = crate::monitor::guest::GuestKernel::new_for_test(
+            &mem,
+            std::collections::HashMap::new(),
+            0, // page_offset = 0; kva_to_pa identity
+            0,
+            false,
+        );
+
+        let kvas = walk_scx_tasks_global(&kernel, head_kva, 0x10, 0x60, 0x44);
+        assert!(kvas.is_empty(), "empty global list must yield no tasks");
+    }
+
+    /// `walk_scx_tasks_global` recovers task KVAs via
+    /// `task_kva = node_kva - tasks_node_off_in_task`. Two-task list
+    /// with the head in the kernel text mapping; the per-task
+    /// see/tasks_node lives in a directly-mapped region. Verifies
+    /// the container_of math against the kernel's container_of
+    /// pattern.
+    #[test]
+    fn walk_scx_tasks_global_two_tasks_round_trip() {
+        // Layout (page_offset = 0 so direct-map kva == pa for the
+        // task entries; head lives in the text mapping region so
+        // text_kva_to_pa reaches the buffer):
+        //   head_kva = START_KERNEL_MAP + 0x100   → head_pa = 0x100
+        //   t1_node_kva = 0x800                   → t1_pa = 0x800
+        //   t2_node_kva = 0x900                   → t2_pa = 0x900
+        // tasks_node_off_in_task = 0x40 (so task_kva = node_kva - 0x40).
+        // Linkage:
+        //   head.next = t1_node_kva
+        //   t1.next   = t2_node_kva
+        //   t2.next   = head_kva (close the list)
+        let head_kva = crate::monitor::symbols::START_KERNEL_MAP + 0x100;
+        let head_pa = 0x100usize;
+        let t1_node_kva: u64 = 0x800;
+        let t2_node_kva: u64 = 0x900;
+        let tasks_node_off_in_task: usize = 0x40;
+        let tasks_node_off_in_see: usize = 0x60;
+        let flags_off_in_see: usize = 0x44;
+
+        let mut buf = vec![0u8; 0x1000];
+        buf[head_pa..head_pa + 8].copy_from_slice(&t1_node_kva.to_le_bytes());
+        let t1_pa = t1_node_kva as usize;
+        let t2_pa = t2_node_kva as usize;
+        buf[t1_pa..t1_pa + 8].copy_from_slice(&t2_node_kva.to_le_bytes());
+        buf[t2_pa..t2_pa + 8].copy_from_slice(&head_kva.to_le_bytes());
+
+        // Both task entries are NOT cursors. Their see.flags slot
+        // stays zero (the buf is zero-initialized) so the walker's
+        // cursor-flag check passes through. The flags slot for each
+        // entry sits at `see_kva + flags_off_in_see` =
+        // `(node_kva - tasks_node_off_in_see) + flags_off_in_see`.
+        // For t1: see_kva = 0x800 - 0x60 = 0x7a0 → flags @ 0x7a0+0x44=0x7e4.
+        // For t2: see_kva = 0x900 - 0x60 = 0x8a0 → flags @ 0x8a0+0x44=0x8e4.
+        // Both already 0 from buf init, so the cursor bit is unset.
+
+        let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
+        let kernel = crate::monitor::guest::GuestKernel::new_for_test(
+            &mem,
+            std::collections::HashMap::new(),
+            0,
+            0,
+            false,
+        );
+
+        let kvas = walk_scx_tasks_global(
+            &kernel,
+            head_kva,
+            tasks_node_off_in_task,
+            tasks_node_off_in_see,
+            flags_off_in_see,
+        );
+        assert_eq!(kvas.len(), 2, "two-task list must yield two task kvas");
+        // container_of: task_kva = node_kva - tasks_node_off_in_task.
+        assert_eq!(
+            kvas[0],
+            t1_node_kva.wrapping_sub(tasks_node_off_in_task as u64)
+        );
+        assert_eq!(
+            kvas[1],
+            t2_node_kva.wrapping_sub(tasks_node_off_in_task as u64)
+        );
+    }
+
+    /// `walk_local_dsqs` returns `None` when any required offset
+    /// sub-group is missing — the gate must NOT fabricate partial
+    /// state when offsets are incomplete.
+    #[test]
+    fn walk_local_dsqs_none_when_offsets_missing() {
+        let mut buf = vec![0u8; 0x1000];
+        let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
+        let kernel = crate::monitor::guest::GuestKernel::new_for_test(
+            &mem,
+            std::collections::HashMap::new(),
+            0,
+            0,
+            false,
+        );
+
+        let offsets = ScxWalkerOffsets {
+            rq: None, // missing → walk_local_dsqs gates to None
+            scx_rq: None,
+            task: None,
+            see: None,
+            dsq_lnode: None,
+            dsq: None,
+            sched: None,
+            sched_pnode: None,
+            sched_pcpu: None,
+            rht: None,
+        };
+
+        let r = walk_local_dsqs(&kernel, &[], &[], &offsets);
+        assert!(r.is_none(), "missing offsets must gate to None");
+    }
+
+    /// `walk_local_dsqs` runs unconditionally — even when
+    /// `*scx_root` would be 0 (no scheduler attached). With a
+    /// well-formed empty per-CPU local_dsq fixture, the walker
+    /// returns `Some(([DsqState{empty list}], []))` for each CPU.
+    /// Confirms the new dump-path independence: the local-DSQ
+    /// pass surfaces every CPU's DSQ state regardless of
+    /// scheduler attachment.
+    #[test]
+    fn walk_local_dsqs_runs_without_scheduler() {
+        // Layout: one CPU. rq fixture lives at PA 0x100 (page_offset=0,
+        // identity translation). scx_rq embedded at offset 0; the
+        // scx_dispatch_q within scx_rq.local_dsq lives at offset 0
+        // of the rq (rq.scx + scx_rq.local_dsq = 0). The DSQ's
+        // list_head sits at dsq + dsq.list = 0 + 0 = 0. An empty
+        // list means head.next == head_kva.
+        let rq_kva: u64 = 0x100;
+        let rq_pa: u64 = 0x100;
+        let mut buf = vec![0u8; 0x1000];
+        // head.next = rq_kva (empty list)
+        buf[rq_pa as usize..rq_pa as usize + 8].copy_from_slice(&rq_kva.to_le_bytes());
+        let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
+        let kernel = crate::monitor::guest::GuestKernel::new_for_test(
+            &mem,
+            std::collections::HashMap::new(),
+            0,
+            0,
+            false,
+        );
+
+        let offsets = ScxWalkerOffsets {
+            rq: Some(crate::monitor::btf_offsets::RqStructOffsets { scx: 0, curr: 8 }),
+            scx_rq: Some(crate::monitor::btf_offsets::ScxRqOffsets {
+                local_dsq: 0,
+                runnable_list: 0,
+                nr_running: 96,
+                flags: 100,
+                cpu_released: 104,
+                ops_qseq: 112,
+                kick_sync: None,
+                nr_immed: None,
+                clock: None,
+            }),
+            task: Some(crate::monitor::btf_offsets::TaskStructCoreOffsets {
+                comm: 100,
+                pid: 200,
+                scx: 0,
+            }),
+            see: Some(crate::monitor::btf_offsets::SchedExtEntityOffsets {
+                runnable_node: 0,
+                runnable_at: 16,
+                weight: 24,
+                slice: 32,
+                dsq_vtime: 40,
+                dsq: 48,
+                dsq_list: 56,
+                flags: 72,
+                dsq_flags: 76,
+                sticky_cpu: 80,
+                holding_cpu: 84,
+                tasks_node: 88,
+            }),
+            dsq_lnode: Some(crate::monitor::btf_offsets::ScxDsqListNodeOffsets {
+                node: 0,
+                flags: 16,
+            }),
+            dsq: Some(crate::monitor::btf_offsets::ScxDispatchQOffsets {
+                list: 0,
+                nr: 16,
+                seq: 20,
+                id: 24,
+                hash_node: 32,
+            }),
+            sched: None,
+            sched_pnode: None,
+            sched_pcpu: None,
+            rht: None,
+        };
+
+        let (states, entries) = walk_local_dsqs(&kernel, &[rq_kva], &[rq_pa], &offsets)
+            .expect("offsets present, should yield Some");
+        assert_eq!(states.len(), 1, "one CPU → one DSQ state");
+        assert_eq!(states[0].origin, "local cpu 0");
+        // Empty list → no entries.
+        assert!(entries.is_empty());
+    }
+
+    /// `walk_scx_tasks_global` skips cursor entries — list nodes
+    /// whose enclosing `sched_ext_entity.flags` has `SCX_TASK_CURSOR`
+    /// (1<<31) set. Inserts a cursor BETWEEN two real task entries
+    /// and asserts the cursor's container_of result is NOT in the
+    /// returned vec, but both real tasks are.
+    #[test]
+    fn walk_scx_tasks_global_skips_cursor_entries() {
+        let head_kva = crate::monitor::symbols::START_KERNEL_MAP + 0x100;
+        let head_pa = 0x100usize;
+        let t1_node_kva: u64 = 0x800;
+        let cursor_node_kva: u64 = 0xa00;
+        let t2_node_kva: u64 = 0xc00;
+        let tasks_node_off_in_task: usize = 0x40;
+        let tasks_node_off_in_see: usize = 0x60;
+        let flags_off_in_see: usize = 0x44;
+
+        let mut buf = vec![0u8; 0x1000];
+        buf[head_pa..head_pa + 8].copy_from_slice(&t1_node_kva.to_le_bytes());
+        let t1_pa = t1_node_kva as usize;
+        let cursor_pa = cursor_node_kva as usize;
+        let t2_pa = t2_node_kva as usize;
+        buf[t1_pa..t1_pa + 8].copy_from_slice(&cursor_node_kva.to_le_bytes());
+        buf[cursor_pa..cursor_pa + 8].copy_from_slice(&t2_node_kva.to_le_bytes());
+        buf[t2_pa..t2_pa + 8].copy_from_slice(&head_kva.to_le_bytes());
+
+        // Stamp SCX_TASK_CURSOR (1<<31) into the cursor entry's
+        // sched_ext_entity.flags. flags slot lives at
+        // (cursor_node_kva - tasks_node_off_in_see) + flags_off_in_see.
+        let cursor_see_kva = cursor_node_kva.wrapping_sub(tasks_node_off_in_see as u64);
+        let cursor_flags_pa = (cursor_see_kva as usize).wrapping_add(flags_off_in_see);
+        let cursor_flags: u32 = 1 << 31;
+        buf[cursor_flags_pa..cursor_flags_pa + 4].copy_from_slice(&cursor_flags.to_le_bytes());
+
+        let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
+        let kernel = crate::monitor::guest::GuestKernel::new_for_test(
+            &mem,
+            std::collections::HashMap::new(),
+            0,
+            0,
+            false,
+        );
+
+        let kvas = walk_scx_tasks_global(
+            &kernel,
+            head_kva,
+            tasks_node_off_in_task,
+            tasks_node_off_in_see,
+            flags_off_in_see,
+        );
+        assert_eq!(
+            kvas.len(),
+            2,
+            "cursor entry must be filtered; only 2 real tasks remain"
+        );
+        let cursor_task_kva = cursor_node_kva.wrapping_sub(tasks_node_off_in_task as u64);
+        assert!(
+            !kvas.contains(&cursor_task_kva),
+            "cursor's container_of result must NOT appear in the task list"
+        );
+        assert_eq!(
+            kvas[0],
+            t1_node_kva.wrapping_sub(tasks_node_off_in_task as u64)
+        );
+        assert_eq!(
+            kvas[1],
+            t2_node_kva.wrapping_sub(tasks_node_off_in_task as u64)
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // walk_dsqs partial-pass + read_scx_sched_state degradation tests
+    //
+    // The fix for dsq=0 / sched=absent requires that every walker
+    // produces what data IT can, even when sibling walkers can't run.
+    // Pre-fix, a single missing offset blinded the whole DSQ surface;
+    // the contract these tests pin is "each pass independent — missing
+    // offsets for one pass blind only that pass."
+    // ---------------------------------------------------------------
+
+    /// Build a fully-populated `ScxWalkerOffsets` for DSQ walker
+    /// fixtures. All leaf groups present so walk_dsqs's outer
+    /// short-circuit doesn't fire.
+    fn dsq_test_offsets() -> ScxWalkerOffsets {
+        use super::super::btf_offsets::{
+            RhashtableOffsets, RqStructOffsets, SchedExtEntityOffsets, ScxDispatchQOffsets,
+            ScxDsqListNodeOffsets, ScxRqOffsets, ScxSchedOffsets, ScxSchedPcpuOffsets,
+            ScxSchedPnodeOffsets, TaskStructCoreOffsets,
+        };
+        ScxWalkerOffsets {
+            rq: Some(RqStructOffsets { scx: 0, curr: 8 }),
+            scx_rq: Some(ScxRqOffsets {
+                local_dsq: 0,
+                runnable_list: 0,
+                nr_running: 96,
+                flags: 100,
+                cpu_released: 104,
+                ops_qseq: 112,
+                kick_sync: None,
+                nr_immed: None,
+                clock: None,
+            }),
+            task: Some(TaskStructCoreOffsets {
+                comm: 100,
+                pid: 200,
+                scx: 0,
+            }),
+            see: Some(SchedExtEntityOffsets {
+                runnable_node: 0,
+                runnable_at: 16,
+                weight: 24,
+                slice: 32,
+                dsq_vtime: 40,
+                dsq: 48,
+                dsq_list: 56,
+                flags: 72,
+                dsq_flags: 76,
+                sticky_cpu: 80,
+                holding_cpu: 84,
+                tasks_node: 88,
+            }),
+            dsq_lnode: Some(ScxDsqListNodeOffsets { node: 0, flags: 16 }),
+            dsq: Some(ScxDispatchQOffsets {
+                list: 0,
+                nr: 16,
+                seq: 20,
+                id: 24,
+                hash_node: 32,
+            }),
+            sched: Some(ScxSchedOffsets {
+                dsq_hash: 0x40,
+                pnode: Some(0x80),
+                pcpu: Some(0x88),
+                aborting: Some(0x90),
+                bypass_depth: Some(0x94),
+                exit_kind: 0x98,
+            }),
+            sched_pnode: Some(ScxSchedPnodeOffsets {
+                global_dsq: Some(0),
+            }),
+            sched_pcpu: Some(ScxSchedPcpuOffsets {
+                bypass_dsq: Some(0),
+            }),
+            rht: Some(RhashtableOffsets {
+                tbl: 0,
+                nelems: 8,
+                bucket_table_size: 0,
+                bucket_table_buckets: 16,
+                rhash_head_next: 0,
+            }),
+        }
+    }
+
+    /// REQ 1 / partial passes: leaves all present, sched_pcpu present
+    /// (Pass 1 runs), sched_pnode None (Pass 2 skipped), rht None
+    /// (Pass 3 skipped). Result must contain Pass 1's bypass DSQ
+    /// entries — pinning the "each pass independent" contract.
+    #[test]
+    fn walk_dsqs_partial_passes_yield_partial_results() {
+        // Layout (page_offset = 0; kva_to_pa identity):
+        //   sched_pa = 0x100
+        //   pcpu_kva = 0x300 (placed at sched_pa + sched.pcpu = 0x100 + 0x88 = 0x188)
+        //   per_cpu_offsets = [0]
+        //   bypass_dsq_kva for cpu 0 = pcpu_kva + 0 + bypass_dsq_off = 0x300 + 0 + 0 = 0x300
+        //   bypass DSQ list head at dsq + dsq.list = 0x300 + 0 = 0x300
+        //   We write head.next = head_kva to make the list empty so
+        //   walk_one_dsq returns Some with task_kvas = [].
+        let mut buf = vec![0u8; 0x2000];
+        let sched_pa: u64 = 0x100;
+        let pcpu_kva: u64 = 0x300;
+        // Place pcpu_kva at sched_pa + sched.pcpu (0x88)
+        buf[(sched_pa + 0x88) as usize..(sched_pa + 0x88) as usize + 8]
+            .copy_from_slice(&pcpu_kva.to_le_bytes());
+        // Empty DSQ at pcpu_kva: head.next = pcpu_kva (head_kva)
+        buf[pcpu_kva as usize..pcpu_kva as usize + 8].copy_from_slice(&pcpu_kva.to_le_bytes());
+
+        let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
+        let kernel = super::super::guest::GuestKernel::new_for_test(
+            &mem,
+            std::collections::HashMap::new(),
+            0,
+            0,
+            false,
+        );
+
+        let mut offsets = dsq_test_offsets();
+        // Disable pass 2 + pass 3 by Noneing their offset groups.
+        offsets.sched_pnode = None;
+        offsets.rht = None;
+
+        let (states, entries) = walk_dsqs(&kernel, sched_pa, &[0u64], 0, &offsets);
+        assert_eq!(states.len(), 1, "pass 1 produces one bypass DSQ entry");
+        assert_eq!(states[0].origin, "bypass cpu 0");
+        assert!(entries.is_empty(), "empty bypass DSQ → no task entries");
+    }
+
+    /// REQ 4 / 6.12+ compat: leaves present, ALL three "advanced"
+    /// offset groups (sched_pcpu, sched_pnode, rht) None. Result is
+    /// (vec![], vec![]) — no panic, no garbage reads. This is the
+    /// 6.12-kernel reality: scx_sched_pcpu didn't land until v6.18,
+    /// rhashtable shape varies across kernels, and sched_pnode is
+    /// dev-only. Without sched layer, walker must NOT crash.
+    #[test]
+    fn walk_dsqs_all_advanced_offsets_none_yields_empty() {
+        let mut buf = vec![0u8; 0x1000];
+        // Pre-populate buf at sched_pa to ensure a buggy walker that
+        // bypassed the offset gates would surface garbage. With
+        // every advanced offset None, the walker must NOT read here.
+        let sched_pa: u64 = 0x100;
+        buf[sched_pa as usize..sched_pa as usize + 8]
+            .copy_from_slice(&0xdead_beef_dead_beef_u64.to_le_bytes());
+        let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
+        let kernel = super::super::guest::GuestKernel::new_for_test(
+            &mem,
+            std::collections::HashMap::new(),
+            0,
+            0,
+            false,
+        );
+
+        let mut offsets = dsq_test_offsets();
+        offsets.sched_pcpu = None;
+        offsets.sched_pnode = None;
+        offsets.rht = None;
+
+        let (states, entries) = walk_dsqs(&kernel, sched_pa, &[0u64], 1, &offsets);
+        assert!(
+            states.is_empty(),
+            "all advanced offsets None → no DSQ states"
+        );
+        assert!(entries.is_empty());
+    }
+
+    /// REQ 1 / not-all-or-nothing: 2 CPUs, local-DSQ pass produces
+    /// one DsqState row per CPU regardless of whether that CPU's
+    /// list has tasks. CPU 0 has 1 queued task; CPU 1 is empty. The
+    /// result must have 2 DsqState rows — not 0, not 1. This pins
+    /// the production guarantee that walk_local_dsqs surfaces every
+    /// CPU's DSQ regardless of queue depth.
+    #[test]
+    fn walk_local_dsqs_one_cpu_empty_one_populated() {
+        // Layout (page_offset = 0; identity translation):
+        //   CPU 0: rq_kva = rq_pa = 0x100. local_dsq head at
+        //          rq + 0 = 0x100. head.next = task1 (0x800).
+        //          dsq_lnode at task1 (0x800), dsq_lnode.flags at 0x10
+        //          → set to 0 (not cursor).
+        //          task1.dsq_lnode.next = head_kva (0x100, terminator).
+        //   CPU 1: rq_kva = rq_pa = 0x300. local_dsq head at
+        //          rq + 0 = 0x300. head.next = head_kva (empty list).
+        //
+        // dsq.{nr,seq,id} fields read from rq_pa+{16,20,24}.
+        let mut buf = vec![0u8; 0x2000];
+        let cpu0_rq: u64 = 0x100;
+        let cpu1_rq: u64 = 0x300;
+        let task1: u64 = 0x800;
+
+        // CPU 0 list: head.next = task1, task1.next = head_kva.
+        buf[cpu0_rq as usize..cpu0_rq as usize + 8].copy_from_slice(&task1.to_le_bytes());
+        buf[task1 as usize..task1 as usize + 8].copy_from_slice(&cpu0_rq.to_le_bytes());
+
+        // Stamp DSQ scalars on CPU 0 (id=0xa, nr=1, seq=10).
+        buf[(cpu0_rq + 16) as usize..(cpu0_rq + 16) as usize + 4]
+            .copy_from_slice(&1u32.to_le_bytes()); // nr
+        buf[(cpu0_rq + 20) as usize..(cpu0_rq + 20) as usize + 4]
+            .copy_from_slice(&10u32.to_le_bytes()); // seq
+        buf[(cpu0_rq + 24) as usize..(cpu0_rq + 24) as usize + 8]
+            .copy_from_slice(&0xau64.to_le_bytes()); // id
+
+        // CPU 1 list: head.next = head_kva (empty list).
+        buf[cpu1_rq as usize..cpu1_rq as usize + 8].copy_from_slice(&cpu1_rq.to_le_bytes());
+
+        let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
+        let kernel = super::super::guest::GuestKernel::new_for_test(
+            &mem,
+            std::collections::HashMap::new(),
+            0,
+            0,
+            false,
+        );
+
+        let offsets = dsq_test_offsets();
+        let (states, entries) =
+            walk_local_dsqs(&kernel, &[cpu0_rq, cpu1_rq], &[cpu0_rq, cpu1_rq], &offsets)
+                .expect("offsets present, should yield Some");
+
+        assert_eq!(
+            states.len(),
+            2,
+            "two CPUs → two DSQ rows, regardless of queue depth"
+        );
+        let cpu0 = states.iter().find(|s| s.origin == "local cpu 0").unwrap();
+        let cpu1 = states.iter().find(|s| s.origin == "local cpu 1").unwrap();
+        assert_eq!(cpu0.task_kvas.len(), 1, "CPU 0 has one queued task");
+        assert!(cpu1.task_kvas.is_empty(), "CPU 1 is empty");
+        assert_eq!(cpu0.id, 0xa);
+        assert_eq!(cpu0.nr, 1);
+        assert_eq!(cpu0.seq, 10);
+        // entries vec contains exactly the CPU 0 task.
+        assert_eq!(entries.len(), 1);
+    }
+
+    /// REQ 2: read_scx_sched_state with `offsets.sched = None` —
+    /// the walker MUST short-circuit before any guest-memory read.
+    /// Pre-populating sched_pa with a value that would surface as a
+    /// bogus aborting/bypass_depth ensures the gate fires correctly:
+    /// a regression that read despite None offsets would emit a
+    /// state with the bogus values; the None-return contract pins
+    /// "no fabricated state."
+    #[test]
+    fn read_scx_sched_state_offsets_sched_none_returns_none() {
+        let mut buf = vec![0u8; 0x1000];
+        // Pre-populate: a buggy walker reading at PA 0 would surface
+        // the magic value as exit_kind / bypass_depth.
+        buf[0..8].copy_from_slice(&0xdead_beef_u64.to_le_bytes());
+        let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
+        let kernel = super::super::guest::GuestKernel::new_for_test(
+            &mem,
+            std::collections::HashMap::new(),
+            0,
+            0,
+            false,
+        );
+
+        let mut offsets = dsq_test_offsets();
+        offsets.sched = None;
+        let scx_root_kva = super::super::symbols::START_KERNEL_MAP + 0x10;
+        let r = read_scx_sched_state(&kernel, scx_root_kva, &offsets);
+        assert!(r.is_none(), "sched=None must short-circuit before read");
+    }
+
+    /// REQ 2 / *scx_root unset: scx_root_kva resolves but the
+    /// pointer it points to reads as 0 (no scheduler attached).
+    /// read_scx_sched_state must return None — pinning the
+    /// "scheduler not attached" diagnosis without surfacing bogus
+    /// state.
+    #[test]
+    fn read_scx_sched_state_scx_root_pointer_zero_returns_none() {
+        // Layout: scx_root_kva is in the text mapping. We choose
+        // START_KERNEL_MAP + 0x100 so text_kva_to_pa(scx_root_kva) =
+        // 0x100. Stamp 0 at that PA. The walker reads sched_kva = 0
+        // and returns None.
+        let scx_root_kva = super::super::symbols::START_KERNEL_MAP + 0x100;
+        let scx_root_pa = 0x100usize;
+        let mut buf = vec![0u8; 0x1000];
+        buf[scx_root_pa..scx_root_pa + 8].copy_from_slice(&0u64.to_le_bytes());
+
+        let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
+        let kernel = super::super::guest::GuestKernel::new_for_test(
+            &mem,
+            std::collections::HashMap::new(),
+            0,
+            0,
+            false,
+        );
+
+        let offsets = dsq_test_offsets();
+        let r = read_scx_sched_state(&kernel, scx_root_kva, &offsets);
+        assert!(
+            r.is_none(),
+            "*scx_root == 0 (no scheduler) → None, no state surfaced"
+        );
+    }
+
+    /// REQ 4 / dev-only field None: sched.aborting offset is
+    /// Option<usize>. On release kernels the field is absent. The
+    /// walker must NOT read at sched_pa+0 as a fallback (that would
+    /// alias dsq_hash). Pinning: with aborting=None, the returned
+    /// state has aborting=false.
+    #[test]
+    fn read_scx_sched_state_aborting_offset_none_defaults_false() {
+        // Layout:
+        //   scx_root_kva = START_KERNEL_MAP + 0x100
+        //   *scx_root → sched_kva (we put it in direct mapping at 0x800)
+        //   sched_pa = 0x800 (page_offset = 0; identity)
+        //   exit_kind at sched_pa + 0x98 = 0
+        //
+        // Stamp a magic value at sched_pa + 0 to detect any bogus
+        // fallback read for `aborting`. Without aborting=None being
+        // honored, a buggy walker reading that location would
+        // surface aborting=true.
+        let scx_root_kva = super::super::symbols::START_KERNEL_MAP + 0x100;
+        let scx_root_pa: usize = 0x100;
+        let sched_pa: u64 = 0x800;
+        let mut buf = vec![0u8; 0x1000];
+        // *scx_root = sched_kva (direct mapping; sched_kva == sched_pa here)
+        buf[scx_root_pa..scx_root_pa + 8].copy_from_slice(&sched_pa.to_le_bytes());
+        // Stamp 0xff at sched_pa+0 — non-zero, would be true if read as bool.
+        buf[sched_pa as usize] = 0xff;
+
+        let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
+        let kernel = super::super::guest::GuestKernel::new_for_test(
+            &mem,
+            std::collections::HashMap::new(),
+            0,
+            0,
+            false,
+        );
+
+        let mut offsets = dsq_test_offsets();
+        // Mark aborting offset absent — release-kernel reality.
+        if let Some(s) = offsets.sched.as_mut() {
+            s.aborting = None;
+        }
+
+        let (sched_kva_out, state) = read_scx_sched_state(&kernel, scx_root_kva, &offsets)
+            .expect("should yield Some when sched offsets present");
+        assert_eq!(sched_kva_out, sched_pa);
+        assert!(
+            !state.aborting,
+            "aborting=None must default to false, NOT read sched_pa+0"
+        );
+    }
+
+    /// REQ 4 / dev-only field None: sched.bypass_depth offset is
+    /// Option<usize>. Same shape as aborting — None means the
+    /// kernel doesn't have the field; walker must default to 0
+    /// without reading.
+    #[test]
+    fn read_scx_sched_state_bypass_depth_offset_none_defaults_zero() {
+        let scx_root_kva = super::super::symbols::START_KERNEL_MAP + 0x100;
+        let scx_root_pa: usize = 0x100;
+        let sched_pa: u64 = 0x800;
+        let mut buf = vec![0u8; 0x1000];
+        buf[scx_root_pa..scx_root_pa + 8].copy_from_slice(&sched_pa.to_le_bytes());
+        // Stamp a magic at sched_pa+0 (would surface as bypass_depth
+        // if a buggy walker read there as fallback).
+        buf[sched_pa as usize..sched_pa as usize + 4]
+            .copy_from_slice(&0xdead_beef_u32.to_le_bytes());
+
+        let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
+        let kernel = super::super::guest::GuestKernel::new_for_test(
+            &mem,
+            std::collections::HashMap::new(),
+            0,
+            0,
+            false,
+        );
+
+        let mut offsets = dsq_test_offsets();
+        if let Some(s) = offsets.sched.as_mut() {
+            s.bypass_depth = None;
+        }
+
+        let (_, state) = read_scx_sched_state(&kernel, scx_root_kva, &offsets)
+            .expect("should yield Some when sched offsets present");
+        assert_eq!(
+            state.bypass_depth, 0,
+            "bypass_depth=None must default to 0, NOT read sched_pa+0"
+        );
     }
 }

@@ -127,51 +127,32 @@ pub struct FieldSpec {
     pub ptr_offset: u32,
 }
 
-/// Resolve struct field offsets from BTF for a single function.
+/// One-shot wrapper that loads vmlinux BTF then delegates to
+/// [`resolve_field_specs_with_btf`].
+///
+/// Reserved for callers that do NOT have a pre-parsed BTF handle in
+/// scope; hot-path callers that resolve fields for many functions
+/// must call [`resolve_field_specs_with_btf`] directly so the
+/// multi-MB vmlinux BTF parse is paid once per call site rather
+/// than once per function.
 ///
 /// `vmlinux_path` accepts either a raw BTF blob (e.g.
 /// `/sys/kernel/btf/vmlinux`) or an ELF vmlinux — both formats are
 /// recognized by [`crate::monitor::btf_offsets::load_btf_from_path`].
 /// `None` falls back to the host's `/sys/kernel/btf/vmlinux`, which
 /// is the host kernel's BTF and does not match the guest kernel
-/// under test; a warning is emitted in that case.
-///
-/// Handles both STRUCT_FIELDS entries (curated fields with known output
-/// keys) and auto-discovered fields from [`discover_vmlinux_struct_fields`]
-/// (stored in `BtfParam::auto_fields`). STRUCT_FIELDS entries consume
-/// field slots first; auto-discovered fields fill remaining budget up to
-/// MAX_FIELDS (16). Warns when auto-discovered fields are truncated.
-///
-/// Handles chained pointer dereferences (e.g. `->cpus_ptr->bits[0]`)
-/// by reading through intermediate pointers.
+/// under test; the wrapper does not warn in that case (the new
+/// hot-path API forces the caller to be explicit about BTF source).
+#[allow(dead_code)]
 pub fn resolve_field_specs(btf_func: &BtfFunc, vmlinux_path: Option<&str>) -> Vec<FieldSpec> {
-    let btf_path = match vmlinux_path {
-        Some(p) => p,
-        None => {
-            tracing::warn!(
-                "resolve_field_specs: no vmlinux_path; falling back to host \
-                 /sys/kernel/btf/vmlinux — host/guest kernel mismatch will \
-                 produce wrong field offsets"
-            );
-            "/sys/kernel/btf/vmlinux"
-        }
-    };
-    let btf = match crate::monitor::btf_offsets::load_btf_from_path(std::path::Path::new(btf_path))
-    {
-        Ok(b) => b,
-        Err(e) => {
-            tracing::error!(
-                %e,
-                path = btf_path,
-                func = %btf_func.name,
-                "resolve_field_specs: BTF parse failed; returning empty Vec \
-                 (caller will receive no field specs — distinct from an empty \
-                 result due to no struct fields matching)"
-            );
-            return Vec::new();
-        }
-    };
+    let path = vmlinux_path.unwrap_or("/sys/kernel/btf/vmlinux");
+    match crate::monitor::btf_offsets::load_btf_from_path(std::path::Path::new(path)) {
+        Ok(btf) => resolve_field_specs_with_btf(btf_func, &btf),
+        Err(_) => Vec::new(),
+    }
+}
 
+pub fn resolve_field_specs_with_btf(btf_func: &BtfFunc, btf: &btf_rs::Btf) -> Vec<FieldSpec> {
     let mut specs = Vec::new();
     let mut field_idx: u32 = 0;
 

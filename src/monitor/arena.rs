@@ -227,6 +227,25 @@ pub struct ArenaSnapshot {
     /// the base"), so suppressing it would mask the failure. Mirrors
     /// the policy used for the sibling `declared_pages` field.
     pub kern_vm_start: u64,
+    /// User-side base of the arena window: the value of
+    /// `bpf_arena.user_vm_start`, the address space the BPF program
+    /// (and any captured `__arena` pointer) sees. `[user_vm_start ..
+    /// user_vm_start + 4 GiB)` is the kernel-enforced upper bound
+    /// (`bpf_arena_alloc_pages` clamps to `SZ_4G`). Consumers use it
+    /// to classify a pointer as "lives in this arena" before chasing
+    /// into [`Self::pages`].
+    ///
+    /// `0` when the snapshot bailed before reading
+    /// `arena.user_vm_start` (e.g. `arena_pa` translate failed). On
+    /// the syscall backend this comes from `bpf_map.map_extra` which
+    /// the kernel pins at create time (`lib/arena_map.h` hardcodes
+    /// `1<<44` on x86, `1<<32` on aarch64). On the guest-memory
+    /// backend it's read directly from
+    /// `bpf_arena.user_vm_start` via the resolved offset.
+    ///
+    /// Always serialized for the same diagnostic reason as
+    /// [`Self::kern_vm_start`].
+    pub user_vm_start: u64,
 }
 
 /// Walk the arena's mapped pages and return a snapshot.
@@ -266,8 +285,18 @@ pub fn snapshot_arena(
 
     let user_vm_start = mem.read_u64(arena_pa, offsets.arena_user_vm_start);
     let kern_vm_kva = mem.read_u64(arena_pa, offsets.arena_kern_vm);
+    // Preserve `user_vm_start` even when the kern-side walk fails:
+    // the `MemReader::is_arena_addr` consumer needs it to classify
+    // an `__arena` pointer as in-window (vs. a kernel kptr) so the
+    // Ptr-deref path returns `None` cleanly instead of falling
+    // through to the kernel-kptr cpumask probe. Without the anchor,
+    // an arena pointer would be misread as a slab address — at best
+    // garbage hex, at worst a translate against an unmapped page.
     if kern_vm_kva == 0 {
-        return ArenaSnapshot::default();
+        return ArenaSnapshot {
+            user_vm_start,
+            ..ArenaSnapshot::default()
+        };
     }
 
     // vm_struct lives in the kernel's slab/kmalloc area; direct or
@@ -275,11 +304,17 @@ pub fn snapshot_arena(
     let Some(vm_struct_pa) =
         super::idr::translate_any_kva(mem, cr3_pa, page_offset, kern_vm_kva, l5)
     else {
-        return ArenaSnapshot::default();
+        return ArenaSnapshot {
+            user_vm_start,
+            ..ArenaSnapshot::default()
+        };
     };
     let vm_addr = mem.read_u64(vm_struct_pa, offsets.vm_struct_addr);
     if vm_addr == 0 {
-        return ArenaSnapshot::default();
+        return ArenaSnapshot {
+            user_vm_start,
+            ..ArenaSnapshot::default()
+        };
     }
     let kern_vm_start = vm_addr.wrapping_add(GUARD_HALF);
 
@@ -293,12 +328,30 @@ pub fn snapshot_arena(
         declared_pages: plan.declared_pages,
         span_capped: plan.span_capped,
         kern_vm_start,
+        user_vm_start,
     };
+
+    // Reusable scratch buffer for the per-page read. Sized once at
+    // PAGE_SIZE and reused across every captured page: on success
+    // the buffer is moved into `ArenaPage` (one allocation per
+    // captured page is unavoidable since each page owns its bytes),
+    // then a fresh allocation refills the scratch on the next
+    // `resize`. The win is the SKIP path — every translate-failure
+    // or short-read pgoff used to allocate-and-discard a 4 KiB
+    // zero-initialised buffer; now those paths reuse the existing
+    // scratch capacity. On a sparse arena window (most pgoffs
+    // unmapped) this collapses thousands of doomed allocations into
+    // one. The hot path (freeze coordinator's dump pipeline) used
+    // to dominate freeze-time wallclock on arenas with declared
+    // pages > captured pages.
+    let mut scratch: Vec<u8> = Vec::with_capacity(PAGE_SIZE as usize);
 
     // Closure: translate one pgoff to a page-content read; push
     // onto `snapshot.pages` if the translate + read succeed.
-    // Captures `mem`, `cr3_pa`, `l5`, `kern_vm_start`, `user_vm_start`.
-    let try_capture_page = |pgoff: u64, pages: &mut Vec<ArenaPage>| {
+    // Captures `mem`, `cr3_pa`, `l5`, `kern_vm_start`, `user_vm_start`,
+    // and `scratch` (mutable — drained into the captured page on
+    // success).
+    let mut try_capture_page = |pgoff: u64, pages: &mut Vec<ArenaPage>| {
         // user_vm_start + pgoff*PAGE_SIZE is a 64-bit value, but the
         // kernel composes the kern-VA from the LOW 32 bits only —
         // `uaddr32 = (u32)(arena->user_vm_start + pgoff * PAGE_SIZE)`
@@ -316,21 +369,31 @@ pub fn snapshot_arena(
         if pa + PAGE_SIZE > mem.size() {
             return;
         }
-        let mut buf = vec![0u8; PAGE_SIZE as usize];
+        // Resize the reusable scratch to PAGE_SIZE and zero-fill.
+        // After a previous capture moved the inner Vec out via
+        // `mem::take`, `scratch` is empty with PAGE_SIZE capacity;
+        // resize allocates exactly the new buffer's bytes, but
+        // skipping iterations that hit the early returns above
+        // never reach this line so their alloc is avoided entirely.
+        scratch.clear();
+        scratch.resize(PAGE_SIZE as usize, 0);
         // `GuestMem::read_bytes` returns the actual byte count copied
         // (may be short when the PA crosses end-of-DRAM, even after
         // the bounds check above — DRAM can have non-contiguous
         // regions). Truncate the buffer to that count so consumers
         // never see the zero-init tail of an unwritten range as
         // legitimate page bytes.
-        let n = mem.read_bytes(pa, &mut buf);
-        buf.truncate(n);
-        if buf.is_empty() {
+        let n = mem.read_bytes(pa, &mut scratch);
+        scratch.truncate(n);
+        if scratch.is_empty() {
             return;
         }
+        // Move the populated buffer into the captured page; the
+        // scratch falls back to empty (capacity preserved) for the
+        // next iteration.
         pages.push(ArenaPage {
             user_addr,
-            bytes: buf,
+            bytes: std::mem::take(&mut scratch),
         });
     };
 
@@ -425,7 +488,7 @@ mod tests {
         };
         // Skip when find_test_vmlinux returns the raw BTF blob — the
         // vmlinux-ELF parse path inside `from_vmlinux` would fail on
-        // it, but `from_btf` works directly. Tests in btf_offsets.rs
+        // it, but `from_btf` works directly. Tests in btf_offsets/tests.rs
         // skip the same way for the same reason.
         if path.starts_with("/sys/") {
             crate::report::test_skip("vmlinux is raw BTF (skipping ELF-only path)");

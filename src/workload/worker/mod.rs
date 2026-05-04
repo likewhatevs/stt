@@ -2347,13 +2347,13 @@ pub(super) fn worker_main(
                                     node_cpus.push(parse_cpulist_inline(s.trim()));
                                 }
                             }
-                        } else if let Ok(n) = part.parse::<usize>() {
-                            if let Ok(s) = std::fs::read_to_string(format!(
+                        } else if let Ok(n) = part.parse::<usize>()
+                            && let Ok(s) = std::fs::read_to_string(format!(
                                 "/sys/devices/system/node/node{}/cpulist",
                                 n
-                            )) {
-                                node_cpus.push(parse_cpulist_inline(s.trim()));
-                            }
+                            ))
+                        {
+                            node_cpus.push(parse_cpulist_inline(s.trim()));
                         }
                     }
                     if node_cpus.is_empty() {

@@ -178,8 +178,7 @@ fn host_likely_has_pmu_decode(
 ) -> bool {
     // "GenuineIntel" = EBX:0x756e6547 EDX:0x49656e69 ECX:0x6c65746e —
     // matches `detect_vendor` in src/vmm/x86_64/topology.rs.
-    let intel = (leaf0_ebx, leaf0_edx, leaf0_ecx)
-        == (0x756e_6547, 0x4965_6e69, 0x6c65_746e);
+    let intel = (leaf0_ebx, leaf0_edx, leaf0_ecx) == (0x756e_6547, 0x4965_6e69, 0x6c65_746e);
     if !intel {
         return false;
     }
@@ -229,12 +228,10 @@ enum PerfOpenResult {
 ///     Fail.
 fn classify_perf_open_errno(raw: i32) -> PerfOpenResult {
     match raw {
-        libc::EACCES | libc::EPERM => PerfOpenResult::Skip(
-            "EACCES/EPERM = perf_event_paranoid > 2 or missing CAP_PERFMON",
-        ),
-        libc::ENOSYS => PerfOpenResult::Skip(
-            "ENOSYS = kernel without CONFIG_PERF_EVENTS",
-        ),
+        libc::EACCES | libc::EPERM => {
+            PerfOpenResult::Skip("EACCES/EPERM = perf_event_paranoid > 2 or missing CAP_PERFMON")
+        }
+        libc::ENOSYS => PerfOpenResult::Skip("ENOSYS = kernel without CONFIG_PERF_EVENTS"),
         _ => PerfOpenResult::Fail(
             "EINVAL/ENODEV/EOPNOTSUPP indicate the synthesized PMU surface \
              did not bind to a backend — check src/vmm/x86_64/topology.rs::leaf 0xa \

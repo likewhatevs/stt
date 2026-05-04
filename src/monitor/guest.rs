@@ -82,6 +82,43 @@ impl<'a> GuestKernel<'a> {
         })
     }
 
+    /// Construct a `GuestKernel` for unit tests, bypassing the
+    /// vmlinux ELF parse and paging-state resolution.
+    ///
+    /// Cross-module tests (e.g. `monitor::dump::tests`,
+    /// `monitor::bpf_map::tests`) need to drive the production
+    /// read paths over synthetic guest memory. Those tests cannot
+    /// construct a `GuestKernel` via `::new` (no real vmlinux on
+    /// hand) and the bare struct fields are private to this module
+    /// so field-literal construction is unavailable. This
+    /// constructor takes an explicit symbol map and pre-resolved
+    /// paging state and stitches them into a `GuestKernel` whose
+    /// public methods behave identically to one produced by
+    /// `::new`.
+    ///
+    /// `symbols` typically carries entries the rest of the test
+    /// stack will look up (e.g. `map_idr` for the BPF map walker;
+    /// `init_top_pgt` is unused in synthetic-memory tests). Pass
+    /// `cr3_pa = 0` and `page_offset = DEFAULT_PAGE_OFFSET` for
+    /// direct-mapped synthetic buffers; callers that build a
+    /// page-table buffer pass their `cr3_pa` instead.
+    #[cfg(test)]
+    pub(crate) fn new_for_test(
+        mem: &'a GuestMem,
+        symbols: HashMap<String, u64>,
+        page_offset: u64,
+        cr3_pa: u64,
+        l5: bool,
+    ) -> Self {
+        Self {
+            mem,
+            symbols,
+            page_offset,
+            cr3_pa,
+            l5,
+        }
+    }
+
     /// Look up a kernel symbol KVA by name.
     pub fn symbol_kva(&self, name: &str) -> Option<u64> {
         self.symbols.get(name).copied()
@@ -293,7 +330,7 @@ mod tests {
 
     // Since GuestKernel::new() requires a real vmlinux, we test the
     // methods by constructing GuestKernel manually (bypassing ::new).
-    // Page table walk tests are in bpf_map.rs.
+    // Page table walk tests are in bpf_map/tests.rs.
 
     #[test]
     fn text_kva_to_pa_and_read() {

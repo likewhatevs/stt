@@ -714,8 +714,8 @@ mod tests {
         let nonexistent = tmp.path().join("never-created");
         let dst = tmp.path().join("dst");
         std::fs::create_dir_all(&dst).unwrap();
-        let err = atomic_swap_dirs(&nonexistent, &dst)
-            .expect_err("missing source must produce an Err");
+        let err =
+            atomic_swap_dirs(&nonexistent, &dst).expect_err("missing source must produce an Err");
         let msg = format!("{err:#}");
         assert!(
             msg.contains(&nonexistent.display().to_string()),
@@ -833,8 +833,8 @@ mod tests {
         let entry_dir = tmp.path().join("entry");
         std::fs::create_dir_all(&entry_dir).unwrap();
 
-        let reason = read_metadata(&entry_dir)
-            .expect_err("absent metadata.json must produce an Err");
+        let reason =
+            read_metadata(&entry_dir).expect_err("absent metadata.json must produce an Err");
         assert_eq!(
             reason, "metadata.json missing",
             "exact missing reason is the classifier dispatch key for `missing`",
@@ -913,8 +913,7 @@ mod tests {
         // field — Category::Data.
         std::fs::write(entry_dir.join("metadata.json"), br#"{"version": "6.14"}"#).unwrap();
 
-        let reason = read_metadata(&entry_dir)
-            .expect_err("incomplete JSON must produce an Err");
+        let reason = read_metadata(&entry_dir).expect_err("incomplete JSON must produce an Err");
         assert!(
             reason.starts_with("metadata.json schema drift: "),
             "missing required field must surface under the `schema drift` \

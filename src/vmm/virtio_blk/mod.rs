@@ -130,9 +130,20 @@
 // see every item without per-name re-export bookkeeping.
 
 mod throttle;
+// `pub(crate) use throttle::*;` feeds the `cfg(test)` modules
+// (tests_drain, tests_atomics, tests_handler, etc.) via their
+// `use super::*;`. The lib build doesn't reference these symbols
+// from this glob (device.rs has its own `use super::throttle::*;`),
+// so clippy --lib would otherwise flag the re-export as unused.
+#[allow(unused_imports)]
 pub(crate) use throttle::*;
 
 mod worker;
+// `pub(crate) use worker::*;` feeds the `cfg(test)` modules and
+// is referenced from device.rs via direct `use super::worker::*;`
+// or per-name imports; clippy --lib otherwise flags this as
+// unused for the same reason as throttle above.
+#[allow(unused_imports)]
 pub(crate) use worker::*;
 
 mod device;
@@ -146,6 +157,12 @@ mod device;
 // and the explicit listing upgrades the re-export from the glob's
 // `pub(crate)` to `pub` for those names only.
 pub(crate) use device::*;
+// `VIRTIO_BLK_DEFAULT_CAPACITY_BYTES` and `VIRTIO_BLK_SECTOR_SIZE`
+// are kept in the `pub` re-export so external consumers can pin
+// the same defaults the lib uses internally; the lib's current
+// callers reach the constants directly via the device module, so
+// the public re-export looks unused in clippy --lib.
+#[allow(unused_imports)]
 pub use device::{
     VIRTIO_BLK_DEFAULT_CAPACITY_BYTES, VIRTIO_BLK_SECTOR_SIZE, VIRTIO_MMIO_SIZE, VirtioBlk,
     VirtioBlkCounters, WorkerPlacement,
@@ -177,4 +194,3 @@ mod tests_fsm;
 
 #[cfg(test)]
 mod tests_poison;
-

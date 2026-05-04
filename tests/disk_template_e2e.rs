@@ -135,8 +135,7 @@ fn scenario_btrfs_filesystem_visible_at_dev_vda(
     // The auto-mount path is `/mnt/disk0` for an unnamed disk
     // (per `DiskConfig::auto_mount_path`). Statfs the mount point
     // and verify f_type == BTRFS_SUPER_MAGIC.
-    let mount_point = CString::new("/mnt/disk0")
-        .expect("/mnt/disk0 contains no nul bytes");
+    let mount_point = CString::new("/mnt/disk0").expect("/mnt/disk0 contains no nul bytes");
     // SAFETY: statfs writes into a stack-allocated zero-initialized
     // buffer of the correct layout. The CString is NUL-terminated
     // for the duration of the call. The kernel returns 0 on success
@@ -225,9 +224,7 @@ fn scenario_btrfs_filesystem_visible_at_dev_vda(
 /// FICLONE clone path (returning a zeroed file instead, sharing
 /// the template directly, etc.) would surface here as either a
 /// write failure or an unexpected pre-existing file.
-fn scenario_ficlone_clone_writable_and_fresh(
-    _ctx: &ktstr::scenario::Ctx,
-) -> Result<AssertResult> {
+fn scenario_ficlone_clone_writable_and_fresh(_ctx: &ktstr::scenario::Ctx) -> Result<AssertResult> {
     use std::fs;
 
     let mount = std::path::Path::new("/mnt/disk0");

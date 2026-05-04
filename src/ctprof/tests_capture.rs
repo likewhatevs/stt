@@ -5,10 +5,9 @@
 
 #![cfg(test)]
 
+use super::tests_helpers::stage_synthetic_proc;
 use super::*;
 use crate::metric_types::Bytes;
-use super::tests_helpers::stage_synthetic_proc;
-
 
 /// Ghost-thread filter: a tid whose directory exists but
 /// carries ZERO readable procfs files (classic mid-capture
@@ -577,9 +576,7 @@ fn capture_with_corrupt_stat_file_zeroes_stat_fields_only() {
         "corrupt stat → start_time_clock_ticks default 0; got {}",
         t.start_time_clock_ticks
     );
-    use crate::metric_types::{
-        Bytes, CategoricalString, ClockTicks, MonotonicCount, OrdinalI32,
-    };
+    use crate::metric_types::{Bytes, CategoricalString, ClockTicks, MonotonicCount, OrdinalI32};
     assert_eq!(
         t.nice,
         OrdinalI32(0),
@@ -1224,7 +1221,13 @@ fn capture_with_nr_threads_dedup_populates_leader_only() {
 
     // Stage the leader thread fully — `Threads: 2` lands on
     // the leader's status file.
-    stage_synthetic_proc(proc_tmp.path(), tgid, leader_tid, "leader-pcomm", "leader-comm");
+    stage_synthetic_proc(
+        proc_tmp.path(),
+        tgid,
+        leader_tid,
+        "leader-pcomm",
+        "leader-comm",
+    );
     let leader_status_path = proc_tmp
         .path()
         .join(tgid.to_string())
@@ -1244,7 +1247,13 @@ fn capture_with_nr_threads_dedup_populates_leader_only() {
     // the kernel-shared field). Distinct comm so the test can
     // tell the two ThreadState entries apart in the output
     // vector.
-    stage_synthetic_proc(proc_tmp.path(), tgid, worker_tid, "leader-pcomm", "worker-comm");
+    stage_synthetic_proc(
+        proc_tmp.path(),
+        tgid,
+        worker_tid,
+        "leader-pcomm",
+        "worker-comm",
+    );
     let worker_status_path = proc_tmp
         .path()
         .join(tgid.to_string())
@@ -1354,10 +1363,7 @@ fn capture_with_ghost_filter_four_corner_keeps_nonzero_halves() {
     std::fs::create_dir_all(&task_dir).unwrap();
     // tgid /comm
     std::fs::write(
-        proc_tmp
-            .path()
-            .join(tgid_no_stat.to_string())
-            .join("comm"),
+        proc_tmp.path().join(tgid_no_stat.to_string()).join("comm"),
         "parseable-pcomm\n",
     )
     .unwrap();
@@ -1442,8 +1448,7 @@ fn smaps_rollup_bytes_saturating_mul_clamps_at_u64_max() {
     let near_max_kb = u64::MAX / 1024;
     t.smaps_rollup_kb.insert("Anonymous".into(), near_max_kb);
 
-    let map: std::collections::BTreeMap<&String, Bytes> =
-        t.smaps_rollup_bytes().collect();
+    let map: std::collections::BTreeMap<&String, Bytes> = t.smaps_rollup_bytes().collect();
 
     let rss_key = "Rss".to_string();
     let pss_key = "Pss".to_string();
