@@ -58,6 +58,13 @@ pub(crate) const VIRTIO_BLK_MMIO_BASE: u64 =
 /// SPI interrupt for virtio-block. SPI 36.
 pub(crate) const VIRTIO_BLK_IRQ: u32 = 36;
 
+/// Virtio-net MMIO base. Placed after virtio-block.
+pub(crate) const VIRTIO_NET_MMIO_BASE: u64 =
+    VIRTIO_BLK_MMIO_BASE + crate::vmm::virtio_blk::VIRTIO_MMIO_SIZE;
+
+/// SPI interrupt for virtio-net. SPI 37.
+pub(crate) const VIRTIO_NET_IRQ: u32 = 37;
+
 /// Kernel Image load address. 2 MB aligned per arm64 boot protocol.
 /// Relative to DRAM_START — the kernel is loaded at DRAM_START + text_offset,
 /// but the PE loader base address must be DRAM_START (2 MB aligned).
@@ -75,11 +82,10 @@ pub(crate) const SERIAL_IRQ: u32 = 33;
 pub(crate) const SERIAL2_IRQ: u32 = 34;
 
 /// PMU overflow interrupt — PPI number in the GIC PPI namespace (0..15).
-/// PPI 7 is the standard arm,armv8-pmuv3 binding (matches qemu virt
-/// hw/arm/virt.c VIRTUAL_PMU_IRQ and cloud-hypervisor AARCH64_PMU_IRQ).
-/// The FDT pmu node references PMU_PPI directly. KVM_ARM_VCPU_PMU_V3_IRQ
-/// expects the global intid namespace (PPI + VGIC_NR_SGIS = 7 + 16 = 23),
-/// exposed as PMU_INTID for the irq_is_ppi check in
+/// PPI 7 is the standard arm,armv8-pmuv3 binding. The FDT pmu node
+/// references PMU_PPI directly. KVM_ARM_VCPU_PMU_V3_IRQ expects the
+/// global intid namespace (PPI + VGIC_NR_SGIS = 7 + 16 = 23), exposed
+/// as PMU_INTID for the irq_is_ppi check in
 /// arch/arm64/kvm/pmu-emul.c pmu_irq_is_valid.
 pub(crate) const PMU_PPI: u32 = 7;
 pub(crate) const PMU_INTID: u32 = PMU_PPI + 16;
@@ -394,7 +400,13 @@ impl KtstrKvm {
     /// We must explicitly route GSI numbers to GIC SPI pins via
     /// KVM_SET_GSI_ROUTING before register_irqfd will deliver interrupts.
     fn setup_gsi_routing(vm_fd: &VmFd) -> Result<()> {
-        let irqs = [SERIAL_IRQ, SERIAL2_IRQ, VIRTIO_CONSOLE_IRQ, VIRTIO_BLK_IRQ];
+        let irqs = [
+            SERIAL_IRQ,
+            SERIAL2_IRQ,
+            VIRTIO_CONSOLE_IRQ,
+            VIRTIO_BLK_IRQ,
+            VIRTIO_NET_IRQ,
+        ];
         let mut routing = KvmIrqRouting::new(irqs.len()).context("create KvmIrqRouting")?;
         for (i, &irq) in irqs.iter().enumerate() {
             routing.as_mut_slice()[i] = kvm_irq_routing_entry {
@@ -581,5 +593,45 @@ mod tests {
         };
         const { assert!(VIRTIO_BLK_MMIO_BASE < DRAM_START) };
         const { assert!(VIRTIO_BLK_MMIO_BASE + crate::vmm::virtio_blk::VIRTIO_MMIO_SIZE <= DRAM_START) };
+        const { assert!(VIRTIO_NET_MMIO_BASE < DRAM_START) };
+        const { assert!(VIRTIO_NET_MMIO_BASE + crate::vmm::virtio_net::VIRTIO_MMIO_SIZE <= DRAM_START) };
+    }
+
+    /// PMU_PPI must reside in the GIC PPI namespace (0..15). Values
+    /// outside that range would be rejected by the kernel's
+    /// pmu_irq_is_valid (`arch/arm64/kvm/pmu-emul.c`), which gates the
+    /// IRQ on `irq_is_ppi(irq)` (`include/kvm/arm_vgic.h` —
+    /// `VGIC_NR_SGIS <= irq < VGIC_NR_PRIVATE_IRQS`, i.e. 16..32 in
+    /// the global intid namespace, equivalently 0..15 in the FDT
+    /// per-CPU PPI namespace).
+    #[test]
+    fn pmu_ppi_in_ppi_namespace() {
+        // GIC PPIs occupy intids 16..32; PMU_PPI is the per-CPU
+        // PPI form (0..15) used in the FDT cell.
+        const { assert!(PMU_PPI < 16) };
+    }
+
+    /// PMU_INTID is the global-intid form KVM_ARM_VCPU_PMU_V3_IRQ
+    /// expects. The kernel's pmu_irq_is_valid takes the global intid
+    /// and runs `irq_is_ppi(irq)` which checks `16 <= irq < 32`. The
+    /// const constraint here pins the namespace mapping in lockstep
+    /// with the kernel's expected range — a regression that flipped
+    /// PMU_INTID to e.g. PMU_PPI alone (no offset) or PMU_PPI + 32
+    /// (SPI namespace) would surface here at compile time, before the
+    /// per-vCPU `set_device_attr` ioctl returns -EINVAL.
+    #[test]
+    fn pmu_intid_in_ppi_intid_range() {
+        const { assert!(PMU_INTID >= 16) };
+        const { assert!(PMU_INTID < 32) };
+    }
+
+    /// PMU_INTID == PMU_PPI + VGIC_NR_SGIS. VGIC_NR_SGIS is 16 on
+    /// arm64 (`include/kvm/arm_vgic.h`); a regression that flipped
+    /// either constant out of step would surface as the kernel
+    /// rejecting the IRQ via pmu_irq_is_valid before the second
+    /// PMU_V3_INIT attr write lands.
+    #[test]
+    fn pmu_intid_offset_from_ppi() {
+        const { assert!(PMU_INTID == PMU_PPI + 16) };
     }
 }

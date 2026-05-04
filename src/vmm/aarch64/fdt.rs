@@ -6,12 +6,13 @@ use crate::vmm::kvm::{
     DRAM_START, FDT_MAX_SIZE, GIC_DIST_BASE, GIC_DIST_SIZE, GIC_REDIST_BASE,
     GIC_REDIST_SIZE_PER_CPU, PMU_PPI, SERIAL_IRQ, SERIAL_MMIO_BASE, SERIAL_MMIO_SIZE, SERIAL2_IRQ,
     SERIAL2_MMIO_BASE, VIRTIO_BLK_IRQ, VIRTIO_BLK_MMIO_BASE, VIRTIO_CONSOLE_IRQ,
-    VIRTIO_CONSOLE_MMIO_BASE,
+    VIRTIO_CONSOLE_MMIO_BASE, VIRTIO_NET_IRQ, VIRTIO_NET_MMIO_BASE,
 };
 use crate::vmm::numa_mem::NumaMemoryLayout;
 use crate::vmm::topology::Topology;
 use crate::vmm::virtio_blk;
 use crate::vmm::virtio_console;
+use crate::vmm::virtio_net;
 
 /// GIC phandle — unique identifier referenced by interrupt-parent properties.
 const GIC_PHANDLE: u32 = 1;
@@ -67,6 +68,7 @@ pub fn create_fdt(
     guest_l1_unified: bool,
     numa_layout: &NumaMemoryLayout,
     has_virtio_blk: bool,
+    has_virtio_net: bool,
     has_pmu: bool,
 ) -> Result<Vec<u8>> {
     // SHM base address (top of guest DRAM minus SHM size).
@@ -143,6 +145,18 @@ pub fn create_fdt(
             VIRTIO_BLK_MMIO_BASE,
             virtio_blk::VIRTIO_MMIO_SIZE,
             VIRTIO_BLK_IRQ,
+        )?;
+    }
+
+    // /virtio_mmio — virtio-net (only when the builder attached a
+    // `NetConfig`; absent FDT node leaves the slot dark so the
+    // guest does not probe a non-existent device).
+    if has_virtio_net {
+        write_virtio_mmio(
+            &mut fdt,
+            VIRTIO_NET_MMIO_BASE,
+            virtio_net::VIRTIO_MMIO_SIZE,
+            VIRTIO_NET_IRQ,
         )?;
     }
 
@@ -633,6 +647,7 @@ mod tests {
             hw_cache_level,
             guest_l1_unified,
             &layout,
+            false,
             false,
             true,
         )
@@ -1392,6 +1407,117 @@ mod tests {
         assert_eq!(
             irq[2], IRQ_TYPE_LEVEL_HIGH,
             "pmu interrupt flags must be level-high"
+        );
+    }
+
+    /// `has_pmu = false` MUST omit the pmu node entirely. Pinning the
+    /// omission proves the no-PMU-host gating in `create_fdt` honors
+    /// the threaded boolean: on a host where KVM masks
+    /// KVM_ARM_VCPU_PMU_V3 out of vcpu_init, advertising the FDT node
+    /// would have the guest pmuv3 driver attach to PPI 23, fail to
+    /// receive any events, and log a noisy attach failure. The test
+    /// drives `create_fdt` directly with `has_pmu=false` because the
+    /// `test_fdt` shim hard-codes `true`.
+    #[test]
+    fn fdt_no_pmu_node_when_has_pmu_false() {
+        let topo = default_topo();
+        let mpidrs = fake_mpidrs(topo.total_cpus());
+        let layout = test_layout(&topo, 256);
+        let dtb = create_fdt(
+            &topo,
+            &mpidrs,
+            256,
+            "console=ttyS0",
+            None,
+            None,
+            0,
+            0,
+            false,
+            &layout,
+            false,
+            false,
+            false,
+        )
+        .expect("create_fdt with has_pmu=false must still produce a valid DTB");
+        let props = parse_dtb_props(&dtb);
+
+        let pmu_compat = props.iter().find(|(n, p, _)| n == "pmu" && p == "compatible");
+        assert!(
+            pmu_compat.is_none(),
+            "pmu node must be absent when has_pmu=false; found compatible={:?}",
+            pmu_compat,
+        );
+        let pmu_intr = props.iter().find(|(n, p, _)| n == "pmu" && p == "interrupts");
+        assert!(
+            pmu_intr.is_none(),
+            "pmu interrupts property must be absent when has_pmu=false; found={:?}",
+            pmu_intr,
+        );
+    }
+
+    /// PMU_PPI lives in the GIC PPI namespace (0..15), distinct from the
+    /// global intid namespace KVM_ARM_VCPU_PMU_V3_IRQ takes. The FDT's
+    /// `interrupts` cell carries the PPI form (cell[1]); the in-kernel
+    /// vCPU init in `kvm.rs::init_pmuv3` writes the intid form
+    /// (PMU_INTID = PPI + 16). Pin the relationship between the two
+    /// constants here so a regression that drifts either form trips
+    /// before the kernel rejects the IRQ via pmu_irq_is_valid.
+    #[test]
+    fn fdt_pmu_ppi_matches_intid_namespace_relationship() {
+        use crate::vmm::aarch64::kvm::PMU_INTID;
+        // PMU_PPI is the FDT cell value; PMU_INTID is the global intid
+        // (PPI + VGIC_NR_SGIS where VGIC_NR_SGIS = 16). Crossing into
+        // the SPI range (intid 32+) would mis-route the IRQ.
+        assert_eq!(
+            PMU_INTID,
+            PMU_PPI + 16,
+            "PMU_INTID must equal PMU_PPI + 16 (VGIC_NR_SGIS)",
+        );
+        assert!(
+            PMU_PPI < 16,
+            "PMU_PPI must be in the PPI namespace (0..16); got {}",
+            PMU_PPI,
+        );
+        assert!(
+            (16..32).contains(&PMU_INTID),
+            "PMU_INTID must land in the PPI intid range (16..32); got {}",
+            PMU_INTID,
+        );
+    }
+
+    /// FDT `interrupts` cell[1] for the pmu node is the bare PPI value
+    /// (PMU_PPI = 7), NOT the global intid (PMU_INTID = 23). Pin this
+    /// distinction explicitly so a refactor that conflates the two
+    /// namespaces (e.g. writing PMU_INTID into the FDT cell) trips
+    /// here even if the per-vCPU init still works correctly.
+    #[test]
+    fn fdt_pmu_interrupt_cell_is_ppi_not_intid() {
+        use crate::vmm::aarch64::kvm::PMU_INTID;
+        let topo = default_topo();
+        let mpidrs = fake_mpidrs(topo.total_cpus());
+        let dtb = test_fdt(
+            &topo,
+            &mpidrs,
+            256,
+            "console=ttyS0",
+            None,
+            None,
+            0,
+            0,
+            false,
+        )
+        .unwrap();
+        let props = parse_dtb_props(&dtb);
+        let irq = prop_u32_array(&props, "pmu", "interrupts").expect("pmu interrupts must exist");
+        assert_eq!(
+            irq[1], PMU_PPI,
+            "FDT pmu interrupts cell[1] must carry PMU_PPI (PPI namespace), \
+             not PMU_INTID (global intid namespace)",
+        );
+        assert_ne!(
+            irq[1], PMU_INTID,
+            "FDT pmu interrupts cell[1] must NOT be the global intid value — \
+             KVM_ARM_VCPU_PMU_V3_IRQ takes the intid; the FDT takes the PPI",
         );
     }
 }
