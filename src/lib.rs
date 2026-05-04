@@ -426,7 +426,8 @@ pub mod live_host {
     };
     pub use crate::monitor::live_host_kernel::{KallsymsTable, LiveHostKernelEnv, uname_release};
     pub use crate::monitor::reproducer_gen::{
-        ReproducerSpec, generate_spec, render_ktstr_test_source, render_run_file_source,
+        ReproducerNote, ReproducerSpec, generate_spec, render_ktstr_test_source,
+        render_run_file_source,
     };
     pub use crate::monitor::timeline::{
         DEFAULT_SNAPSHOT_RING_DEPTH, IncrementalCapture, IncrementalSnapshot, SnapshotRing,
@@ -641,9 +642,11 @@ pub mod prelude {
     // `resolve_scheduler`, `resolve_test_kernel`.
     pub use crate::topology::{LlcInfo, NodeMemInfo, TestTopology};
     pub use crate::vmm::VirtioBlkCounters;
+    pub use crate::vmm::VirtioNetCounters;
     pub use crate::vmm::disk_config::{
         DiskConfig, DiskThrottle, DiskThrottleValidationError, Filesystem, ThrottleDimension,
     };
+    pub use crate::vmm::net_config::NetConfig;
     pub use crate::workload::{
         AffinityIntent, AluWidth, CloneMode, MemPolicy, Migration, MpolFlags, Phase,
         ResolvedAffinity, SchedPolicy, WorkSpec, WorkType, WorkTypeValidationError, WorkerReport,

@@ -134,7 +134,12 @@ pub struct ReproducerSpec {
     /// Notes about projection quality — ambiguous mappings,
     /// unmapped variants, low-confidence hints (sample size = 1,
     /// fingerprint gaps cited in input).
-    pub notes: Vec<String>,
+    ///
+    /// Each entry is a typed [`ReproducerNote`] whose kind
+    /// (`Informational` / `Resolved` / `UnresolvedAffinity` /
+    /// `UnmappedWorkType`) drives [`Self::is_runnable`] and
+    /// [`Self::unresolved_count`] without substring matching.
+    pub notes: Vec<ReproducerNote>,
     /// The scheduler name the capture was running, when known.
     /// Lets the generated test pick the right scheduler binary
     /// to attach.
@@ -152,33 +157,83 @@ impl Default for ReproducerSpec {
     }
 }
 
-/// Substring marker [`map_affinity`] embeds in every hand-edit-required
-/// affinity note (the topology-aware unresolved-fallback notes, the
-/// empty-`Exact` placeholder note, and the unresolved-`RandomSubset`
-/// placeholder note). Used by [`ReproducerSpec::is_runnable`] and
-/// [`ReproducerSpec::unresolved_count`] as one programmatic
-/// "spawn-time gate would reject this spec" signal so callers don't
-/// have to rerun the spawn-time gate just to check.
+/// Diagnostic note attached to a [`ReproducerSpec`].
 ///
-/// The marker INCLUDES the `rejects` verb so it does NOT match the
-/// resolved-`RandomSubset` informational note ("the spawn-time
-/// affinity gate accepts it without hand-editing") — that note is a
-/// confirmation of runnability, not a hand-edit prompt.
+/// The variant classifies the note's effect on runnability:
+/// `UnresolvedAffinity` and `UnmappedWorkType` are the only kinds
+/// that block [`ReproducerSpec::is_runnable`]; `Informational` and
+/// `Resolved` are zero-cost surface for the generated source's
+/// comment block. Replaced an earlier substring-marker scheme that
+/// probed the rendered text — see [`Self::is_unresolved`] for the
+/// runnability filter.
 ///
-/// Companion to [`WORK_TYPE_TODO_NOTE_MARKER`] (work-type unmapped
-/// variants); both are checked by
-/// [`ReproducerSpec::unresolved_count`].
-const UNRESOLVED_NOTE_MARKER: &str = "spawn-time affinity gate rejects";
+/// Each variant carries the rendered text the generator emits — the
+/// text format is unchanged from the prior `Vec<String>` shape, so
+/// tests that match on note wording continue to work via
+/// [`Self::message`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "message", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ReproducerNote {
+    /// Default-projection or fingerprint-gap context. Does NOT
+    /// affect runnability. Examples: "no workload groups in
+    /// fingerprint — defaulting num_workers=1", "additional
+    /// affinity hints not modeled: ...", "fingerprint gap: ...",
+    /// "SchedPolicyHint::Ext observed; framework defaults to scx
+    /// routing — no policy override emitted".
+    Informational(String),
+    /// A topology-aware [`AffinityHint`] carried resolved CPUs and
+    /// the generator collapsed it to [`AffinityIntent::Exact`], OR
+    /// a populated `RandomSubset` whose pool the spawn-time gate
+    /// accepts directly. Does NOT block runnability — the rendered
+    /// spec runs without scenario-engine resolution.
+    Resolved(String),
+    /// An affinity hint whose projection produces a placeholder the
+    /// spawn-time affinity gate REJECTS. Spec is NOT runnable until
+    /// the user hand-edits the rendered source (or switches to
+    /// `AffinityIntent::Inherit`). Counted by
+    /// [`ReproducerSpec::unresolved_count`].
+    UnresolvedAffinity(String),
+    /// The projected [`WorkType`] is one [`render_work_type`]
+    /// dispatches to [`render_work_type_todo`] (renders as
+    /// `WorkType::SpinWait /* TODO: ... */`). Spec is NOT runnable
+    /// until the user replaces the placeholder with a real builder
+    /// call. Counted by [`ReproducerSpec::unresolved_count`].
+    UnmappedWorkType(String),
+}
 
-/// Substring marker [`map_work_type`] embeds in the hand-edit-required
-/// note pushed when the projected [`WorkType`] would render as a
-/// `WorkType::SpinWait /* TODO: ... */` placeholder via
-/// [`render_work_type_todo`] (i.e. no fingerprint mapping exists for
-/// the variant yet). The marker lets [`ReproducerSpec::is_runnable`] /
-/// [`ReproducerSpec::unresolved_count`] count work-type hand-edit
-/// prompts uniformly with the affinity ones, so a spec carrying an
-/// unmapped variant cannot silently appear runnable.
-const WORK_TYPE_TODO_NOTE_MARKER: &str = "no fingerprint mapping for WorkType";
+impl ReproducerNote {
+    /// The rendered note text — the same string the prior
+    /// `Vec<String>` field carried directly. Drives the comment
+    /// block in [`render_run_file_source`] and lets test assertions
+    /// match wording through `note.message().contains("...")`.
+    #[allow(dead_code)]
+    pub fn message(&self) -> &str {
+        match self {
+            ReproducerNote::Informational(s)
+            | ReproducerNote::Resolved(s)
+            | ReproducerNote::UnresolvedAffinity(s)
+            | ReproducerNote::UnmappedWorkType(s) => s,
+        }
+    }
+
+    /// `true` for the kinds [`ReproducerSpec::unresolved_count`]
+    /// counts — `UnresolvedAffinity` and `UnmappedWorkType`. Both
+    /// signal "the rendered spec is NOT runnable until the user
+    /// hand-edits".
+    fn is_unresolved(&self) -> bool {
+        matches!(
+            self,
+            ReproducerNote::UnresolvedAffinity(_) | ReproducerNote::UnmappedWorkType(_)
+        )
+    }
+}
+
+impl std::fmt::Display for ReproducerNote {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
 
 impl ReproducerSpec {
     /// Returns `true` when the spec is runnable as-is (the spawn-time
@@ -192,9 +247,10 @@ impl ReproducerSpec {
     /// The check is the union of two signals:
     ///
     /// 1. Hand-edit-required notes — counted via
-    ///    [`Self::unresolved_count`] using [`UNRESOLVED_NOTE_MARKER`]
-    ///    (affinity) and [`WORK_TYPE_TODO_NOTE_MARKER`] (work-type
-    ///    TODO).
+    ///    [`Self::unresolved_count`], which sums every
+    ///    [`ReproducerNote::UnresolvedAffinity`] and
+    ///    [`ReproducerNote::UnmappedWorkType`] entry by enum kind
+    ///    (no substring matching).
     /// 2. Direct check on [`Self::config`]'s `work_type` —
     ///    [`is_unmapped_work_type`] returns `true` for variants that
     ///    [`render_work_type`] dispatches to [`render_work_type_todo`].
@@ -202,21 +258,21 @@ impl ReproducerSpec {
     ///    [`generate_spec`] / [`map_work_type`] (e.g. callers that set
     ///    `config.work_type` directly), so a manually-built spec with
     ///    `WorkType::CacheYield { .. }` is correctly classified as
-    ///    NOT runnable even though no marker note was pushed.
+    ///    NOT runnable even though no unresolved note was pushed.
     ///
-    /// Resolved-collapse notes (`topology_resolved_note`) and
-    /// informational notes (fingerprint gaps, "additional X hints
-    /// observed", etc.) do not contain either marker.
+    /// `Informational` and `Resolved` notes do not affect the
+    /// outcome — they are surfaced in the rendered comment block but
+    /// carry no runnability-blocking semantic.
     #[allow(dead_code)]
     pub fn is_runnable(&self) -> bool {
         self.unresolved_count() == 0 && !is_unmapped_work_type(&self.config.work_type)
     }
 
     /// Number of hand-edit-required notes in [`Self::notes`]. Counts
-    /// notes carrying [`UNRESOLVED_NOTE_MARKER`] (affinity hand-edit
-    /// prompts) OR [`WORK_TYPE_TODO_NOTE_MARKER`] (work-type TODO
-    /// prompts); useful for surfacing "this reproducer needs N edits"
-    /// messaging in `cargo ktstr` tooling.
+    /// every [`ReproducerNote::UnresolvedAffinity`] (affinity
+    /// hand-edit prompts) and [`ReproducerNote::UnmappedWorkType`]
+    /// (work-type TODO prompts); useful for surfacing "this
+    /// reproducer needs N edits" messaging in `cargo ktstr` tooling.
     ///
     /// Does NOT include the `is_unmapped_work_type` direct-config
     /// signal that [`Self::is_runnable`] folds in — that path
@@ -224,12 +280,7 @@ impl ReproducerSpec {
     /// outside the "count of edit prompts" semantic.
     #[allow(dead_code)]
     pub fn unresolved_count(&self) -> usize {
-        self.notes
-            .iter()
-            .filter(|n| {
-                n.contains(UNRESOLVED_NOTE_MARKER) || n.contains(WORK_TYPE_TODO_NOTE_MARKER)
-            })
-            .count()
+        self.notes.iter().filter(|n| n.is_unresolved()).count()
     }
 }
 
@@ -262,7 +313,10 @@ pub fn generate_spec(capture: &DebugCapture) -> ReproducerSpec {
     // Carry fingerprint gaps forward — the user sees them so they
     // know where to refine the capture or hand-edit the spec.
     for gap in &capture.fingerprint.gaps {
-        spec.notes.push(format!("fingerprint gap: {gap}"));
+        spec.notes
+            .push(ReproducerNote::Informational(format!(
+                "fingerprint gap: {gap}"
+            )));
     }
 
     spec
@@ -282,8 +336,9 @@ fn failure_scheduler_name(capture: &DebugCapture) -> String {
 
 fn map_workload_groups(fp: &WorkloadFingerprint, spec: &mut ReproducerSpec) {
     let Some(primary) = fp.workload_groups.first() else {
-        spec.notes
-            .push("no workload groups in fingerprint — defaulting num_workers=1".into());
+        spec.notes.push(ReproducerNote::Informational(
+            "no workload groups in fingerprint — defaulting num_workers=1".into(),
+        ));
         return;
     };
     spec.config.num_workers = primary.thread_count.max(1) as usize;
@@ -307,11 +362,20 @@ fn map_workload_groups(fp: &WorkloadFingerprint, spec: &mut ReproducerSpec) {
 /// `header` is the lead phrase before the colon (e.g.
 /// `"additional affinity hints not modeled"`). `entries` is an
 /// iterator of pre-rendered `String` descriptions for each
-/// secondary entry.
-fn push_extras_note(notes: &mut Vec<String>, header: &str, entries: impl Iterator<Item = String>) {
+/// secondary entry. The pushed note is classified
+/// [`ReproducerNote::Informational`] — secondary-hint enumeration
+/// is descriptive context, never a runnability blocker.
+fn push_extras_note(
+    notes: &mut Vec<ReproducerNote>,
+    header: &str,
+    entries: impl Iterator<Item = String>,
+) {
     let alts: Vec<String> = entries.collect();
     if !alts.is_empty() {
-        notes.push(format!("{header}: {}", alts.join(", ")));
+        notes.push(ReproducerNote::Informational(format!(
+            "{header}: {}",
+            alts.join(", ")
+        )));
     }
 }
 
@@ -331,14 +395,14 @@ fn push_extras_note(notes: &mut Vec<String>, header: &str, entries: impl Iterato
 /// so the generated note can be copied into a test file with minimal
 /// editing.
 fn topology_aware_note(variant: &str, engine_action: &str, hand_edit_target: &str) -> String {
-    // Every unresolved-fallback note embeds the
-    // [`UNRESOLVED_NOTE_MARKER`] substring (currently
-    // `"spawn-time affinity gate rejects"`) so
-    // [`ReproducerSpec::is_runnable`] /
-    // [`ReproducerSpec::unresolved_count`] can count
-    // hand-edit-required notes uniformly across the topology-aware,
-    // empty-`Exact`, and unresolved-`RandomSubset` paths. The marker
-    // string here must stay in sync with the const definition.
+    // The pushed note is classified
+    // [`ReproducerNote::UnresolvedAffinity`] at the call site
+    // ([`map_topology_aware_affinity`]); the typed variant — not
+    // the wording — is what
+    // [`ReproducerSpec::unresolved_count`] uses to count
+    // hand-edit-required notes. The "spawn-time affinity gate
+    // rejects" wording survives so existing reproducer-output
+    // consumers see the same human-facing diagnostic.
     format!(
         "AffinityHint::{variant} observed without resolved CPUs; \
          emitting AffinityIntent::{variant} — the scenario engine \
@@ -395,14 +459,15 @@ fn map_topology_aware_affinity(
     spec: &mut ReproducerSpec,
 ) -> AffinityIntent {
     if cpus.is_empty() {
-        spec.notes.push(topology_aware_note(
-            variant,
-            engine_action,
-            hand_edit_target,
+        spec.notes.push(ReproducerNote::UnresolvedAffinity(
+            topology_aware_note(variant, engine_action, hand_edit_target),
         ));
         topology_intent
     } else {
-        spec.notes.push(topology_resolved_note(variant, cpus));
+        spec.notes
+            .push(ReproducerNote::Resolved(topology_resolved_note(
+                variant, cpus,
+            )));
         AffinityIntent::Exact(cpus_to_set(cpus))
     }
 }
@@ -455,7 +520,7 @@ fn map_affinity(fp: &WorkloadFingerprint, spec: &mut ReproducerSpec) {
             // empty Exact is the malformed shape; a populated Exact
             // is the runnable shape.
             if cpus.is_empty() {
-                spec.notes.push(
+                spec.notes.push(ReproducerNote::UnresolvedAffinity(
                     "AffinityHint::Exact observed with no CPUs; emitting \
                      AffinityIntent::Exact(empty) — the spawn-time \
                      affinity gate rejects an empty Exact set, so this \
@@ -464,15 +529,18 @@ fn map_affinity(fp: &WorkloadFingerprint, spec: &mut ReproducerSpec) {
                      with the observed CPUs, or change to \
                      AffinityIntent::Inherit."
                         .into(),
-                );
+                ));
             } else {
-                spec.notes.push(topology_resolved_note("Exact", cpus));
+                spec.notes
+                    .push(ReproducerNote::Resolved(topology_resolved_note(
+                        "Exact", cpus,
+                    )));
             }
             AffinityIntent::Exact(cpus_to_set(cpus))
         }
         AffinityHint::RandomSubset { from, count } => {
             if from.is_empty() || *count == 0 {
-                spec.notes.push(
+                spec.notes.push(ReproducerNote::UnresolvedAffinity(
                     "AffinityHint::RandomSubset observed without a \
                      resolved pool / count; emitting \
                      AffinityIntent::RandomSubset { from: empty, count: 0 } \
@@ -483,19 +551,19 @@ fn map_affinity(fp: &WorkloadFingerprint, spec: &mut ReproducerSpec) {
                      sample size before running, or change to \
                      AffinityIntent::Inherit."
                         .into(),
-                );
+                ));
                 AffinityIntent::RandomSubset {
                     from: BTreeSet::new(),
                     count: 0,
                 }
             } else {
-                spec.notes.push(format!(
+                spec.notes.push(ReproducerNote::Resolved(format!(
                     "AffinityHint::RandomSubset observed with resolved \
                      pool {from:?} count={count}; emitting \
                      AffinityIntent::RandomSubset directly so the \
                      spawn-time affinity gate accepts it without \
                      hand-editing",
-                ));
+                )));
                 AffinityIntent::RandomSubset {
                     from: cpus_to_set(from),
                     count: *count as usize,
@@ -513,14 +581,14 @@ fn map_affinity(fp: &WorkloadFingerprint, spec: &mut ReproducerSpec) {
 
 fn map_work_type(fp: &WorkloadFingerprint, spec: &mut ReproducerSpec) {
     let Some(primary) = fp.work_type_hints.first() else {
-        spec.notes.push(
+        spec.notes.push(ReproducerNote::Informational(
             "no work-type hint in fingerprint — defaulting to \
              WorkType::SpinWait"
                 .into(),
-        );
+        ));
         return;
     };
-    spec.config.work_type = match primary {
+    let work_type = match primary {
         WorkTypeHint::SpinWait => WorkType::SpinWait,
         WorkTypeHint::YieldHeavy => WorkType::YieldHeavy,
         WorkTypeHint::Mixed => WorkType::Mixed,
@@ -541,32 +609,42 @@ fn map_work_type(fp: &WorkloadFingerprint, spec: &mut ReproducerSpec) {
         WorkTypeHint::IoRandRead => WorkType::IoRandRead,
         WorkTypeHint::IoConvoy => WorkType::IoConvoy,
     };
-
-    // Surface a hand-edit-required note when the projected WorkType
-    // is one [`render_work_type`] dispatches to
-    // [`render_work_type_todo`]. No current [`WorkTypeHint`] variant
-    // projects there, but the safety net keeps
-    // [`ReproducerSpec::is_runnable`] honest the moment a future
-    // hint variant lands on a TODO arm — the guarantee is that any
-    // spec with an unmapped work_type carries the marker note rather
-    // than silently rendering as a `SpinWait` placeholder. The note
-    // text embeds [`WORK_TYPE_TODO_NOTE_MARKER`] so the runnability
-    // counter picks it up uniformly with the affinity markers.
-    if is_unmapped_work_type(&spec.config.work_type) {
-        spec.notes.push(format!(
-            "no fingerprint mapping for WorkType::{:?} — \
-             render_run_file_source emits a TODO-decorated \
-             SpinWait placeholder; hand-edit the rendered source to \
-             a real builder call before running",
-            spec.config.work_type,
-        ));
-    }
+    record_work_type(work_type, spec);
 
     push_extras_note(
         &mut spec.notes,
         "additional work-type hints observed",
         fp.work_type_hints.iter().skip(1).map(|w| format!("{w:?}")),
     );
+}
+
+/// Assign `work_type` to `spec.config.work_type` and push a
+/// [`ReproducerNote::UnmappedWorkType`] note when the assigned variant
+/// is one [`render_work_type`] dispatches to [`render_work_type_todo`].
+///
+/// Extracted from [`map_work_type`] so the unmapped-projection branch
+/// has a production code path that tests can drive directly. Calling
+/// this with `WorkType::ForkExit` (or any other variant
+/// [`is_unmapped_work_type`] returns `true` for) exercises the
+/// safety-net branch end-to-end — the test is no longer a manual
+/// re-construction of the same logic.
+///
+/// No current [`WorkTypeHint`] variant projects to an unmapped
+/// [`WorkType`], so the unmapped branch is reachable today only via
+/// this helper. When a future hint variant lands on a TODO arm the
+/// existing call site in [`map_work_type`] starts firing the branch
+/// automatically — no duplicated logic to keep in sync.
+fn record_work_type(work_type: WorkType, spec: &mut ReproducerSpec) {
+    spec.config.work_type = work_type;
+    if is_unmapped_work_type(&spec.config.work_type) {
+        spec.notes.push(ReproducerNote::UnmappedWorkType(format!(
+            "no fingerprint mapping for WorkType::{:?} — \
+             render_run_file_source emits a TODO-decorated \
+             SpinWait placeholder; hand-edit the rendered source to \
+             a real builder call before running",
+            spec.config.work_type,
+        )));
+    }
 }
 
 /// Return `true` when `w` is a [`WorkType`] variant that
@@ -661,11 +739,11 @@ fn map_sched_policy(fp: &WorkloadFingerprint, spec: &mut ReproducerSpec) {
             // No SchedPolicy mapping for SCHED_EXT — the harness
             // routes tasks through scx by default. Note for the
             // generated source.
-            spec.notes.push(
+            spec.notes.push(ReproducerNote::Informational(
                 "SchedPolicyHint::Ext observed; framework defaults to \
                  scx routing — no policy override emitted"
                     .into(),
-            );
+            ));
         }
     }
 
@@ -925,8 +1003,16 @@ mod tests {
         assert_eq!(spec.config.num_workers, 1);
         assert!(matches!(spec.config.affinity, AffinityIntent::Inherit));
         assert!(matches!(spec.config.work_type, WorkType::SpinWait));
-        assert!(spec.notes.iter().any(|n| n.contains("no workload groups")));
-        assert!(spec.notes.iter().any(|n| n.contains("no work-type hint")));
+        assert!(
+            spec.notes
+                .iter()
+                .any(|n| n.message().contains("no workload groups"))
+        );
+        assert!(
+            spec.notes
+                .iter()
+                .any(|n| n.message().contains("no work-type hint"))
+        );
     }
 
     /// Workload-group hint with thread_count=8 → num_workers=8.
@@ -965,7 +1051,7 @@ mod tests {
         assert!(
             spec.notes
                 .iter()
-                .any(|n| n.contains("AffinityHint::Exact") && n.contains("with resolved CPUs")),
+                .any(|n| n.message().contains("AffinityHint::Exact") && n.message().contains("with resolved CPUs")),
             "populated Exact must emit a resolved-collapse note for surface consistency: {:?}",
             spec.notes,
         );
@@ -997,14 +1083,14 @@ mod tests {
         assert!(
             spec.notes
                 .iter()
-                .any(|n| n.contains("AffinityHint::Exact") && n.contains("no CPUs")),
+                .any(|n| n.message().contains("AffinityHint::Exact") && n.message().contains("no CPUs")),
             "empty Exact must surface a hand-edit-required note: {:?}",
             spec.notes,
         );
         assert!(
             spec.notes
                 .iter()
-                .any(|n| n.contains("AffinityIntent::exact([<cpu_0>, <cpu_1>, ...])")),
+                .any(|n| n.message().contains("AffinityIntent::exact([<cpu_0>, <cpu_1>, ...])")),
             "empty Exact note must include paste-ready Rust hand-edit target: {:?}",
             spec.notes,
         );
@@ -1065,7 +1151,7 @@ mod tests {
         assert!(
             spec.notes
                 .iter()
-                .any(|n| n.contains("additional work-type hints"))
+                .any(|n| n.message().contains("additional work-type hints"))
         );
     }
 
@@ -1117,7 +1203,7 @@ mod tests {
         assert!(
             spec.notes
                 .iter()
-                .any(|n| n.contains("affinity hint backed by 1 sample"))
+                .any(|n| n.message().contains("affinity hint backed by 1 sample"))
         );
     }
 
@@ -1137,15 +1223,15 @@ mod tests {
         assert!(
             spec.notes
                 .iter()
-                .any(|n| n.contains("AffinityHint::LlcAligned")
-                    && n.contains("without resolved CPUs")),
+                .any(|n| n.message().contains("AffinityHint::LlcAligned")
+                    && n.message().contains("without resolved CPUs")),
             "unresolved LlcAligned must surface a topology-aware-fallback note: {:?}",
             spec.notes,
         );
         assert!(
             spec.notes
                 .iter()
-                .any(|n| n.contains("AffinityIntent::exact([<llc_cpu_0>, <llc_cpu_1>, ...])")),
+                .any(|n| n.message().contains("AffinityIntent::exact([<llc_cpu_0>, <llc_cpu_1>, ...])")),
             "unresolved LlcAligned note must include paste-ready Rust hand-edit target: {:?}",
             spec.notes,
         );
@@ -1179,8 +1265,8 @@ mod tests {
         assert!(
             spec.notes
                 .iter()
-                .any(|n| n.contains("AffinityHint::LlcAligned")
-                    && n.contains("with resolved CPUs")),
+                .any(|n| n.message().contains("AffinityHint::LlcAligned")
+                    && n.message().contains("with resolved CPUs")),
             "resolved LlcAligned must surface a resolved-collapse note: {:?}",
             spec.notes,
         );
@@ -1205,7 +1291,7 @@ mod tests {
         assert!(
             spec.notes
                 .iter()
-                .any(|n| n.contains("AffinityHint::SingleCpu") && n.contains("with resolved CPUs")),
+                .any(|n| n.message().contains("AffinityHint::SingleCpu") && n.message().contains("with resolved CPUs")),
             "resolved SingleCpu must surface a resolved-collapse note: {:?}",
             spec.notes,
         );
@@ -1225,13 +1311,13 @@ mod tests {
         assert!(
             spec.notes
                 .iter()
-                .any(|n| n.contains("AffinityHint::SingleCpu")
-                    && n.contains("without resolved CPUs")),
+                .any(|n| n.message().contains("AffinityHint::SingleCpu")
+                    && n.message().contains("without resolved CPUs")),
         );
         assert!(
             spec.notes
                 .iter()
-                .any(|n| n.contains("AffinityIntent::exact([<cpu>])")),
+                .any(|n| n.message().contains("AffinityIntent::exact([<cpu>])")),
             "unresolved SingleCpu note must include paste-ready Rust hand-edit target: {:?}",
             spec.notes,
         );
@@ -1257,7 +1343,7 @@ mod tests {
         }
         assert!(
             spec.notes.iter().any(
-                |n| n.contains("AffinityHint::CrossCgroup") && n.contains("with resolved CPUs")
+                |n| n.message().contains("AffinityHint::CrossCgroup") && n.message().contains("with resolved CPUs")
             ),
         );
     }
@@ -1278,15 +1364,15 @@ mod tests {
         assert!(
             spec.notes
                 .iter()
-                .any(|n| n.contains("AffinityHint::CrossCgroup")
-                    && n.contains("without resolved CPUs")),
+                .any(|n| n.message().contains("AffinityHint::CrossCgroup")
+                    && n.message().contains("without resolved CPUs")),
             "unresolved CrossCgroup must surface a topology-aware-fallback note: {:?}",
             spec.notes,
         );
         assert!(
             spec.notes
                 .iter()
-                .any(|n| n.contains("AffinityIntent::exact([<cpu_0>, <cpu_1>, ...])")),
+                .any(|n| n.message().contains("AffinityIntent::exact([<cpu_0>, <cpu_1>, ...])")),
             "unresolved CrossCgroup note must include paste-ready Rust hand-edit target: {:?}",
             spec.notes,
         );
@@ -1315,8 +1401,8 @@ mod tests {
         assert!(
             spec.notes
                 .iter()
-                .any(|n| n.contains("AffinityHint::RandomSubset")
-                    && n.contains("with resolved pool")),
+                .any(|n| n.message().contains("AffinityHint::RandomSubset")
+                    && n.message().contains("with resolved pool")),
         );
     }
 
@@ -1345,8 +1431,8 @@ mod tests {
         assert!(
             spec.notes
                 .iter()
-                .any(|n| n.contains("AffinityHint::RandomSubset")
-                    && n.contains("without a resolved pool")),
+                .any(|n| n.message().contains("AffinityHint::RandomSubset")
+                    && n.message().contains("without a resolved pool")),
         );
     }
 
@@ -1378,8 +1464,8 @@ mod tests {
         assert!(
             spec.notes
                 .iter()
-                .any(|n| n.contains("AffinityHint::RandomSubset")
-                    && n.contains("without a resolved pool")),
+                .any(|n| n.message().contains("AffinityHint::RandomSubset")
+                    && n.message().contains("without a resolved pool")),
             "(non_empty, 0) must surface unresolved-pool note: {:?}",
             spec.notes,
         );
@@ -1411,8 +1497,8 @@ mod tests {
         assert!(
             spec.notes
                 .iter()
-                .any(|n| n.contains("AffinityHint::RandomSubset")
-                    && n.contains("without a resolved pool")),
+                .any(|n| n.message().contains("AffinityHint::RandomSubset")
+                    && n.message().contains("without a resolved pool")),
             "([], non_zero) must surface unresolved-pool note: {:?}",
             spec.notes,
         );
@@ -1446,8 +1532,8 @@ mod tests {
         assert!(
             spec.notes
                 .iter()
-                .any(|n| n.contains("AffinityHint::RandomSubset")
-                    && n.contains("with resolved pool")),
+                .any(|n| n.message().contains("AffinityHint::RandomSubset")
+                    && n.message().contains("with resolved pool")),
             "count > pool.len() must take the resolved path: {:?}",
             spec.notes,
         );
@@ -1471,8 +1557,8 @@ mod tests {
         assert!(
             spec.notes
                 .iter()
-                .any(|n| n.contains("AffinityHint::SmtSiblingPair")
-                    && n.contains("with resolved CPUs")),
+                .any(|n| n.message().contains("AffinityHint::SmtSiblingPair")
+                    && n.message().contains("with resolved CPUs")),
             "resolved SmtSiblingPair must surface a resolved-collapse note: {:?}",
             spec.notes,
         );
@@ -1500,15 +1586,15 @@ mod tests {
         assert!(
             spec.notes
                 .iter()
-                .any(|n| n.contains("AffinityHint::SmtSiblingPair")
-                    && n.contains("without resolved CPUs")),
+                .any(|n| n.message().contains("AffinityHint::SmtSiblingPair")
+                    && n.message().contains("without resolved CPUs")),
             "unresolved SmtSiblingPair must surface a topology-aware-fallback note: {:?}",
             spec.notes,
         );
         assert!(
             spec.notes
                 .iter()
-                .any(|n| n.contains("AffinityIntent::exact([<sibling_a>, <sibling_b>])")),
+                .any(|n| n.message().contains("AffinityIntent::exact([<sibling_a>, <sibling_b>])")),
             "unresolved SmtSiblingPair note must include paste-ready Rust hand-edit target: {:?}",
             spec.notes,
         );
@@ -1653,12 +1739,15 @@ mod tests {
     /// [`ReproducerSpec::is_runnable`] returns `true` for a
     /// fully-resolved `RandomSubset` (non-empty `from`, non-zero
     /// `count`). The spawn-time affinity gate accepts that shape, so
-    /// the resolved note ("...accepts it without hand-editing")
-    /// must NOT match the [`UNRESOLVED_NOTE_MARKER`] substring even
-    /// though both notes share the "spawn-time affinity gate" prefix.
-    /// This test pins the narrow-marker contract: a regression that
-    /// reverts the marker to the prefix-only form (matching the
-    /// "...accepts" note) would surface here as `is_runnable() == false`.
+    /// the resolved note ("...accepts it without hand-editing") must
+    /// be classified [`ReproducerNote::Resolved`] — NOT
+    /// [`ReproducerNote::UnresolvedAffinity`] — even though both
+    /// notes share the "spawn-time affinity gate" prefix. This test
+    /// pins the typed-classification contract: a regression that
+    /// pushed the resolved-collapse note as
+    /// `ReproducerNote::UnresolvedAffinity` (e.g. wrong variant at
+    /// the call site) would surface here as
+    /// `is_runnable() == false`.
     #[test]
     fn is_runnable_resolved_random_subset() {
         let mut cap = DebugCapture::default();
@@ -1677,9 +1766,9 @@ mod tests {
 
     /// [`ReproducerSpec::is_runnable`] returns `false` for an
     /// unresolved `SingleCpu` (empty `cpus`). Pins that the
-    /// topology-aware unresolved-fallback note carries the
-    /// hand-edit-required marker so callers can detect the
-    /// runnability gap without re-parsing the rendered source.
+    /// topology-aware unresolved-fallback note is classified
+    /// [`ReproducerNote::UnresolvedAffinity`] so callers can detect
+    /// the runnability gap without re-parsing the rendered source.
     #[test]
     fn is_runnable_unresolved_single_cpu() {
         let mut cap = DebugCapture::default();
@@ -1695,7 +1784,7 @@ mod tests {
 
     /// [`ReproducerSpec::is_runnable`] returns `false` for an
     /// empty-`Exact` projection. Pins that the empty-`Exact` note
-    /// carries the hand-edit-required marker.
+    /// is classified [`ReproducerNote::UnresolvedAffinity`].
     #[test]
     fn is_runnable_empty_exact() {
         let mut cap = DebugCapture::default();
@@ -1711,7 +1800,8 @@ mod tests {
 
     /// [`ReproducerSpec::is_runnable`] returns `false` for an
     /// unresolved `RandomSubset` (empty pool, zero count). Pins that
-    /// the placeholder note carries the hand-edit-required marker.
+    /// the placeholder note is classified
+    /// [`ReproducerNote::UnresolvedAffinity`].
     #[test]
     fn is_runnable_unresolved_random_subset() {
         let mut cap = DebugCapture::default();
@@ -2049,48 +2139,42 @@ mod tests {
         assert_eq!(
             spec.unresolved_count(),
             0,
-            "unresolved_count covers note markers only; got {}",
+            "unresolved_count covers typed unresolved notes only; got {}",
             spec.unresolved_count(),
         );
     }
 
-    /// [`map_work_type`] is the projection-time path. When a future
-    /// [`WorkTypeHint`] variant projects to an unmapped [`WorkType`],
-    /// the function must push a hand-edit-required note carrying the
-    /// [`WORK_TYPE_TODO_NOTE_MARKER`] substring so
-    /// [`ReproducerSpec::unresolved_count`] picks it up. Today no hint
-    /// projects to a TODO variant, so we exercise the helper directly
-    /// against a hand-built spec to pin the post-assignment check
-    /// against silent removal.
+    /// [`record_work_type`] is the production path that
+    /// [`map_work_type`] funnels every projected [`WorkType`] through.
+    /// When the assigned variant is one [`render_work_type`]
+    /// dispatches to [`render_work_type_todo`], the helper must push a
+    /// [`ReproducerNote::UnmappedWorkType`] entry that
+    /// [`ReproducerSpec::unresolved_count`] picks up. Today no
+    /// [`WorkTypeHint`] variant projects to a TODO variant, so the
+    /// branch is reachable from production code only via this helper —
+    /// the test drives [`record_work_type`] directly with
+    /// [`WorkType::ForkExit`] to exercise the live branch (rather than
+    /// a hand-rolled re-implementation of the same logic).
     #[test]
-    fn map_work_type_emits_note_for_unmapped_projection() {
-        // Manually drive the post-assignment branch of map_work_type
-        // by simulating the same sequence: assign an unmapped
-        // WorkType to spec.config.work_type, then push the marker
-        // note via the same fn the projection path uses.
-        // (`map_work_type` is tested as a unit through `generate_spec`
-        // for the runnable-projection path; the unmapped-projection
-        // path has no hint that fires today, so we exercise the
-        // detection helper + marker contract directly here.)
+    fn record_work_type_emits_note_for_unmapped_projection() {
         let mut spec = ReproducerSpec::default();
-        spec.config.work_type = WorkType::ForkExit;
-        if is_unmapped_work_type(&spec.config.work_type) {
-            spec.notes.push(format!(
-                "no fingerprint mapping for WorkType::{:?} — marker test",
-                spec.config.work_type,
-            ));
-        }
+        record_work_type(WorkType::ForkExit, &mut spec);
+
+        assert!(
+            matches!(spec.config.work_type, WorkType::ForkExit),
+            "record_work_type must assign the variant to spec.config.work_type",
+        );
         assert!(
             spec.notes
                 .iter()
-                .any(|n| n.contains(WORK_TYPE_TODO_NOTE_MARKER)),
-            "marker substring must appear in the pushed note: {:?}",
+                .any(|n| matches!(n, ReproducerNote::UnmappedWorkType(_))),
+            "unmapped projection must push a ReproducerNote::UnmappedWorkType: {:?}",
             spec.notes,
         );
         assert_eq!(
             spec.unresolved_count(),
             1,
-            "unresolved_count must include the work-type TODO marker",
+            "unresolved_count must include the UnmappedWorkType note",
         );
         assert!(
             !spec.is_runnable(),
@@ -2098,35 +2182,110 @@ mod tests {
         );
     }
 
+    /// [`record_work_type`] does NOT push an
+    /// [`ReproducerNote::UnmappedWorkType`] note when the assigned
+    /// variant is one [`render_work_type`] renders as a runnable
+    /// builder call. Pins the runnable / TODO split through the
+    /// production code path — a regression that flips a runnable
+    /// variant onto the TODO arm of [`is_unmapped_work_type`] would
+    /// surface here as a spurious unmapped note.
+    #[test]
+    fn record_work_type_does_not_emit_note_for_runnable_projection() {
+        let mut spec = ReproducerSpec::default();
+        record_work_type(WorkType::SpinWait, &mut spec);
+
+        assert!(
+            spec.notes.is_empty(),
+            "runnable projection must NOT push an unmapped note: {:?}",
+            spec.notes,
+        );
+        assert_eq!(spec.unresolved_count(), 0);
+    }
+
     /// `is_runnable()` for a spec with an unmapped work_type AND a
     /// pre-existing affinity hand-edit note returns `false` and the
-    /// counts compose correctly: each marker contributes one unit to
-    /// `unresolved_count`. Pins that the two markers don't shadow each
-    /// other and that `is_runnable` ANDs both signals.
+    /// counts compose correctly: each note contributes one unit to
+    /// `unresolved_count`. Drives the unmapped-projection branch via
+    /// [`record_work_type`] (the production code path) rather than a
+    /// hand-rolled note insertion — composes the two unresolved-note
+    /// kinds end-to-end.
     #[test]
     fn is_runnable_combines_work_type_and_affinity_signals() {
-        // Empty Exact — produces an affinity hand-edit note carrying
-        // UNRESOLVED_NOTE_MARKER.
+        // Empty Exact — produces an affinity hand-edit note typed
+        // ReproducerNote::UnresolvedAffinity.
         let mut cap = DebugCapture::default();
         cap.fingerprint.affinity_hints = vec![AffinityHint::Exact { cpus: Vec::new() }];
         let mut spec = generate_spec(&cap);
-        // Inject an unmapped work_type post-projection, plus a
-        // matching marker note (mirroring map_work_type's future
-        // unmapped-projection branch).
-        spec.config.work_type = WorkType::ForkExit;
-        spec.notes.push(format!(
-            "no fingerprint mapping for WorkType::{:?} — composed test",
-            spec.config.work_type,
-        ));
+        // Drive the unmapped-work-type branch via the production
+        // helper so the composed test exercises both production paths.
+        record_work_type(WorkType::ForkExit, &mut spec);
 
         assert!(!spec.is_runnable());
         assert_eq!(
             spec.unresolved_count(),
             2,
-            "expected 2 markers (1 affinity + 1 work-type), got {}: {:?}",
+            "expected 2 unresolved notes (1 affinity + 1 work-type), got {}: {:?}",
             spec.unresolved_count(),
             spec.notes,
         );
+    }
+
+    /// [`ReproducerNote`] serializes to a snake_case wire format —
+    /// `kind` field values are `informational` / `resolved` /
+    /// `unresolved_affinity` / `unmapped_work_type`. Pins the
+    /// `#[serde(rename_all = "snake_case")]` attribute on the enum
+    /// so a regression that drops the attribute (which would silently
+    /// revert to PascalCase variant names like `UnresolvedAffinity`)
+    /// surfaces here as a wire-format mismatch.
+    ///
+    /// Asserts BOTH directions: the serialized text contains the
+    /// snake_case `kind` literal, AND deserialization round-trips
+    /// back to the same variant. The roundtrip path catches the
+    /// asymmetric-rename failure mode (where serialization and
+    /// deserialization disagree on the wire format), which a
+    /// one-direction assertion would miss.
+    #[test]
+    fn reproducer_note_wire_format_is_snake_case() {
+        let cases: &[(ReproducerNote, &str)] = &[
+            (
+                ReproducerNote::Informational("info".into()),
+                "informational",
+            ),
+            (ReproducerNote::Resolved("res".into()), "resolved"),
+            (
+                ReproducerNote::UnresolvedAffinity("ua".into()),
+                "unresolved_affinity",
+            ),
+            (
+                ReproducerNote::UnmappedWorkType("uwt".into()),
+                "unmapped_work_type",
+            ),
+        ];
+        for (note, expected_kind) in cases {
+            let json = serde_json::to_string(note)
+                .expect("ReproducerNote must serialize via the derive impl");
+            let kind_pin = format!(r#""kind":"{expected_kind}""#);
+            assert!(
+                json.contains(&kind_pin),
+                "wire format must encode kind={expected_kind:?} (snake_case) — \
+                 a regression that drops `#[serde(rename_all = \"snake_case\")]` \
+                 from the enum would revert to PascalCase. note={note:?}, json={json}",
+            );
+            let round_tripped: ReproducerNote = serde_json::from_str(&json)
+                .expect("ReproducerNote must deserialize from its own serialized form");
+            assert_eq!(
+                std::mem::discriminant(note),
+                std::mem::discriminant(&round_tripped),
+                "roundtrip must preserve the variant — asymmetric rename \
+                 between Serialize and Deserialize would surface here. \
+                 sent={note:?}, got={round_tripped:?}",
+            );
+            assert_eq!(
+                note.message(),
+                round_tripped.message(),
+                "roundtrip must preserve the message payload",
+            );
+        }
     }
 
     /// `render_run_file_source` output compiles as valid Rust.
@@ -2156,6 +2315,20 @@ mod tests {
     /// rendered source mentions. A regression in the renderer (typo,
     /// extra brace, drifted field name) surfaces as a `rustc` failure
     /// with the rendered source attached for diagnostic.
+    ///
+    /// # Precondition
+    ///
+    /// Requires `rustc` to be invocable. The test resolves the
+    /// compiler via `$RUSTC` first, falling back to `rustc` on
+    /// `$PATH`. Cargo always exports `$RUSTC` when running tests, so
+    /// the standard `cargo nextest run` / `cargo ktstr test`
+    /// invocation always satisfies the precondition. A missing
+    /// `rustc` produces a panic with a precondition-explicit message
+    /// pointing the operator at the likely cause (running tests
+    /// outside of cargo without `$PATH` covering `rustc`); the test
+    /// does NOT silently no-op when the compiler is absent —
+    /// silent-skip would give the false signal of green when the
+    /// rendered-source compile-check was never exercised.
     #[test]
     fn render_run_file_source_compiles_via_rustc() {
         // Spec covering: parameterized WorkType, populated Exact
@@ -2284,7 +2457,17 @@ mod ktstr { pub mod workload {
             .arg(out_dir.path())
             .arg(tmp.path())
             .output()
-            .expect("invoke rustc to compile rendered source");
+            .unwrap_or_else(|e| {
+                panic!(
+                    "render_run_file_source_compiles_via_rustc requires rustc \
+                     (resolved via $RUSTC, then $PATH) — failed to spawn {rustc:?}: {e}. \
+                     Cargo sets $RUSTC for cargo-test / cargo-nextest invocations; if \
+                     you are running this test outside of cargo, ensure rustc is on \
+                     $PATH or set $RUSTC explicitly. The test does NOT silently skip \
+                     when rustc is missing — silent-skip would falsely report green \
+                     when the rendered-source compile-check never ran.",
+                )
+            });
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);

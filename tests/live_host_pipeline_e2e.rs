@@ -151,14 +151,14 @@ fn live_host_pipeline_e2e_kmsg_to_reproducer_spec_to_source() {
     assert!(
         spec.notes
             .iter()
-            .any(|n| n.contains("affinity hint backed by 1 sample")),
+            .any(|n| n.message().contains("affinity hint backed by 1 sample")),
         "gaps must propagate to notes: {:?}",
         spec.notes,
     );
     assert!(
         spec.notes
             .iter()
-            .any(|n| n.contains("additional work-type hints")),
+            .any(|n| n.message().contains("additional work-type hints")),
         "secondary work-type hint must surface as a note: {:?}",
         spec.notes,
     );
@@ -239,7 +239,7 @@ fn live_host_pipeline_e2e_empty_capture_falls_back_to_defaults() {
     // The fall-back reasons land in notes so a user sees WHY the
     // generated test is parameterless.
     assert!(
-        spec.notes.iter().any(|n| n.contains("workload group")),
+        spec.notes.iter().any(|n| n.message().contains("workload group")),
         "absent workload-group hint must surface a note: {:?}",
         spec.notes,
     );
