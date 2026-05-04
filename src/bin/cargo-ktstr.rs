@@ -12,7 +12,10 @@
 //!                completion generation.
 //! - [`kernel`] — `--kernel <SPEC>` resolution shared by the `shell`,
 //!                `verifier`, and gauntlet-expansion code paths, plus
-//!                the `kernel build` subcommand dispatcher.
+//!                the `kernel build` subcommand dispatcher. Pure
+//!                wire-format helpers (label emission, `KTSTR_KERNEL_LIST`
+//!                encoding, dedup, collision detection) live in the
+//!                inner [`kernel::wire_format`] submodule.
 //! - [`run_cargo`] — `test`, `coverage`, `llvm-cov` dispatchers that
 //!                wrap `cargo nextest` with the kernel/topology
 //!                gauntlet wire format.
@@ -22,9 +25,9 @@
 //! - [`verifier`] — `verifier` subcommand that runs each scheduler
 //!                profile under the BPF-stats verifier and renders
 //!                per-profile output.
-//! - [`misc`]   — smaller subcommand dispatchers (`shell`,
-//!                `completions`, `funify`, `model {fetch,status,clean}`,
-//!                `export`) that fit in one file each.
+//! - [`misc`]   — smaller subcommand dispatchers, one submodule per
+//!                CLI verb: `shell`, `completions`, `funify`,
+//!                `model {fetch,status,clean}`, `export`.
 //! - `parse_tests` (test-only) — clap parse-shape coverage: every
 //!                `KtstrCommand` variant gets at least one test that
 //!                pins flag wiring + conflict/requires constraints.
@@ -40,9 +43,9 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 #[path = "cargo_ktstr/cli.rs"]
 mod cli;
-#[path = "cargo_ktstr/kernel.rs"]
+#[path = "cargo_ktstr/kernel/mod.rs"]
 mod kernel;
-#[path = "cargo_ktstr/misc.rs"]
+#[path = "cargo_ktstr/misc/mod.rs"]
 mod misc;
 #[path = "cargo_ktstr/run_cargo.rs"]
 mod run_cargo;

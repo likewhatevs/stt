@@ -1246,7 +1246,7 @@ mod tests {
     // ---------------------------------------------------------------
     //
     // Error paths (nonexistent path, not-a-source-tree) live next to
-    // [`resolve_path_kernel`] in `bin/cargo_ktstr/kernel.rs`. The success
+    // [`resolve_path_kernel`] in `bin/cargo_ktstr/kernel/mod.rs`. The success
     // paths exercise the full resolve → cache-lookup → outcome
     // pipeline with a real Makefile / Kconfig fixture, an
     // isolated `KTSTR_CACHE_DIR`, and a pre-populated cache entry

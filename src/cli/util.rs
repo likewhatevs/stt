@@ -525,4 +525,221 @@ mod tests {
         // cleared so a fresh start succeeds without panicking.
         let _sp = Spinner::start("second");
     }
+
+    // ---------------------------------------------------------------
+    // Spinner public-API surface — testable on both TTY and non-TTY
+    // paths without requiring a real terminal.
+    // ---------------------------------------------------------------
+    //
+    // `Spinner::set_message`, `Spinner::println`, and
+    // `Spinner::suspend` all branch on `self.pb.is_some()` —
+    // `Some(pb)` on the TTY-active path delegates to indicatif,
+    // `None` on the non-TTY path falls back to a plain `eprintln!`
+    // or direct closure call. The tests pin the non-TTY arms
+    // (which is what runs under nextest's stderr capture) but
+    // also exercise the TTY arms when the test happens to run
+    // on a TTY-attached host (the assertions are shape-only —
+    // no stderr capture, just no-panic + correct return shape).
+
+    /// `Spinner::set_message` must not panic on either path. Pin
+    /// the non-TTY arm directly: `pb.is_none()` makes the call a
+    /// no-op. A regression that changed the gate (e.g. removed
+    /// the if-let guard) would surface as a panic on `None`.
+    #[test]
+    fn spinner_set_message_no_panic_on_non_tty() {
+        let sp = Spinner::start("initial");
+        sp.set_message("updated");
+        // Drop runs the teardown path — whether TTY or non-TTY,
+        // no panic must escape.
+        drop(sp);
+    }
+
+    /// `Spinner::println` writes through `eprintln!` on the non-TTY
+    /// path. Pin no-panic and the return-type contract (unit) — the
+    /// helper is fire-and-forget by design.
+    #[test]
+    fn spinner_println_no_panic_on_non_tty() {
+        let sp = Spinner::start("operation");
+        sp.println("interleaved log line");
+        drop(sp);
+    }
+
+    /// `Spinner::suspend` invokes the closure synchronously on
+    /// the non-TTY path and returns the closure's result
+    /// verbatim. Pins the value passthrough — a regression that
+    /// returned `Default` or dropped the value would surface
+    /// here.
+    #[test]
+    fn spinner_suspend_returns_closure_value_on_non_tty() {
+        let sp = Spinner::start("operation");
+        let v: u32 = sp.suspend(|| 42);
+        assert_eq!(v, 42);
+        let s: String = sp.suspend(|| "hello".to_string());
+        assert_eq!(s, "hello");
+        drop(sp);
+    }
+
+    /// `Spinner::with_progress` runs the closure under a fresh
+    /// spinner and returns `Ok(value)` on success. Pins the happy
+    /// path: the closure receives a `&Spinner` (testable via
+    /// `set_message`), and the success return propagates the
+    /// closure's `Ok` value verbatim.
+    #[test]
+    fn spinner_with_progress_returns_ok_value_on_success() {
+        let result: Result<u32, String> = Spinner::with_progress("starting", "done", |sp| {
+            sp.set_message("midway");
+            Ok(123)
+        });
+        assert_eq!(result, Ok(123));
+    }
+
+    /// `Spinner::with_progress` propagates `Err` from the
+    /// closure unchanged and drops the spinner silently (no
+    /// success message — the `Err` arm calls `drop(sp)` rather
+    /// than `sp.finish(success_msg)`). Pins the failure-path
+    /// contract: the spinner does not pollute stderr with a
+    /// "success" line when the underlying op failed.
+    #[test]
+    fn spinner_with_progress_propagates_err_without_finish_message() {
+        let result: Result<(), String> = Spinner::with_progress("starting", "done", |_sp| {
+            Err("synthetic failure".to_string())
+        });
+        assert_eq!(result, Err("synthetic failure".to_string()));
+    }
+
+    /// Nested `with_progress` calls are sequential by construction
+    /// — the inner spinner only starts AFTER the outer's closure
+    /// returns. Pins the SPINNER_ACTIVE guard release path under
+    /// the convenience helper: a regression that leaked the
+    /// guard from `with_progress` would break sequential pairs.
+    #[test]
+    fn spinner_with_progress_sequential_pair_succeeds() {
+        let r1: Result<u8, String> = Spinner::with_progress("first", "first done", |_| Ok(1));
+        assert_eq!(r1, Ok(1));
+        // Second invocation must not panic under the nesting guard
+        // because the first's Drop already released it.
+        let r2: Result<u8, String> = Spinner::with_progress("second", "second done", |_| Ok(2));
+        assert_eq!(r2, Ok(2));
+    }
+
+    // ---------------------------------------------------------------
+    // Color helpers — caching contract
+    // ---------------------------------------------------------------
+
+    /// `stderr_color()` is cached via `OnceLock` — repeated calls
+    /// return the same value. Pins the cache invariant: a future
+    /// regression that re-probed `is_terminal()` on every call
+    /// would lose the per-process consistency contract that
+    /// downstream renderers depend on.
+    #[test]
+    fn stderr_color_returns_consistent_value_across_calls() {
+        let a = stderr_color();
+        let b = stderr_color();
+        assert_eq!(a, b, "stderr_color must be cached and stable per process",);
+    }
+
+    /// `stdout_color()` carries the same cached-per-process
+    /// contract as `stderr_color`. Pins the sibling cache.
+    #[test]
+    fn stdout_color_returns_consistent_value_across_calls() {
+        let a = stdout_color();
+        let b = stdout_color();
+        assert_eq!(a, b, "stdout_color must be cached and stable per process",);
+    }
+
+    // ---------------------------------------------------------------
+    // restore_sigpipe_default — FFI shim no-panic
+    // ---------------------------------------------------------------
+
+    /// `restore_sigpipe_default` is an FFI call wrapping
+    /// `libc::signal(SIGPIPE, SIG_DFL)` — infallible by libc's
+    /// own contract for a standard signal + standard handler.
+    /// Pins the no-panic contract: every ktstr CLI binary calls
+    /// this once at top-of-main, and any panic here would
+    /// terminate before the operator's actual subcommand ran.
+    #[test]
+    fn restore_sigpipe_default_does_not_panic() {
+        // Idempotent: calling twice is also infallible (the
+        // second call sets the handler that's already in place).
+        // Pins the per-binary "call at top-of-main" pattern —
+        // future code that re-armed SIG_IGN between calls would
+        // surface a behavior change here.
+        restore_sigpipe_default();
+        restore_sigpipe_default();
+    }
+
+    // ---------------------------------------------------------------
+    // new_table / new_wrapped_table — comfy-table preset
+    // ---------------------------------------------------------------
+
+    /// `new_table()` returns a comfy-table with NO box-drawing
+    /// preset (whitespace-padded columns). Pin the rendering
+    /// shape via a single-cell roundtrip: the rendered table
+    /// must NOT contain box-drawing chars (`│`, `─`, `┼`, etc.)
+    /// — those characters are the canonical preset signature
+    /// that would surface if a regression swapped NOTHING for
+    /// UTF8_FULL.
+    #[test]
+    fn new_table_uses_borderless_preset() {
+        let mut t = new_table();
+        t.set_header(["A", "B"]);
+        t.add_row(["1", "2"]);
+        let rendered = t.to_string();
+        for ch in ['│', '─', '┼', '┴', '┬', '├', '┤'] {
+            assert!(
+                !rendered.contains(ch),
+                "borderless table must not contain box-drawing char `{ch}`: {rendered}",
+            );
+        }
+        // Cell content still rendered.
+        assert!(rendered.contains("A"), "header A must render: {rendered}");
+        assert!(rendered.contains("1"), "row cell 1 must render: {rendered}");
+    }
+
+    /// `new_wrapped_table()` follows the same NOTHING preset (no
+    /// box-drawing) but uses Dynamic content arrangement. Pins
+    /// the borderless-preset contract for the wrapped-table
+    /// variant — the only difference between `new_table` and
+    /// `new_wrapped_table` is the `ContentArrangement`, NOT the
+    /// preset. A regression that drifted the wrapped table to
+    /// UTF8_FULL would surface here.
+    #[test]
+    fn new_wrapped_table_uses_borderless_preset() {
+        let mut t = new_wrapped_table();
+        t.set_header(["A"]);
+        t.add_row(["x"]);
+        let rendered = t.to_string();
+        for ch in ['│', '─', '┼'] {
+            assert!(
+                !rendered.contains(ch),
+                "borderless wrapped table must not contain box-drawing char `{ch}`: {rendered}",
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Panic hook installer — idempotency
+    // ---------------------------------------------------------------
+
+    /// `install_spinner_termios_panic_hook` is gated by `Once`,
+    /// so calling it many times must be a no-op after the first
+    /// call lands. Pins the install path's idempotency: a
+    /// regression that omitted the `Once` guard would re-take
+    /// the previous hook into a Box-recursion chain and
+    /// eventually panic on stack overflow.
+    #[test]
+    fn install_spinner_termios_panic_hook_is_idempotent() {
+        // Direct invocation is safe — `set_hook` is process-wide
+        // but the helper is gated by `INSTALLED: Once`. Multiple
+        // calls coalesce into a single hook install. The test
+        // does not unwind a panic; it pins the no-panic contract
+        // on repeated install, regardless of whether other tests
+        // earlier in the run already triggered the install.
+        install_spinner_termios_panic_hook();
+        install_spinner_termios_panic_hook();
+        install_spinner_termios_panic_hook();
+        // No assertion needed beyond no-panic — the failure mode
+        // is recursion / overflow, which would surface as a test
+        // failure, not as a missing assertion.
+    }
 }

@@ -52,17 +52,12 @@ pub struct KernelBuildResult {
 /// depending on kernel source, enabling integration tests that
 /// exercise the reservation logic against synthetic topologies.
 ///
-/// Drop order is load-bearing: `_sandbox` drops BEFORE `plan`
-/// because struct fields drop in declaration order and
-/// `_sandbox` is declared after `plan` (swapped relative to the
-/// prior inline let-bindings in `kernel_build_pipeline` — the
-/// inline form relied on LIFO binding-drop order, so the LATER
-/// binding dropped FIRST; the struct form relies on IN-ORDER
-/// field-drop, so the LATER field also drops FIRST. Same
-/// outcome, different mechanism). The sandbox's cgroup rmdir
-/// must run while the LLC flocks are still held; otherwise a
-/// peer could observe the LLC released before the cgroup is
-/// gone and mint a conflicting plan.
+/// Drop order is load-bearing: `_sandbox` is declared first and
+/// drops first per Rust's declaration-order field-drop rule;
+/// this ensures the cgroup sandbox is removed before the LLC
+/// flock is released. Otherwise a peer could observe the LLC
+/// released before the cgroup is gone and mint a conflicting
+/// plan.
 #[derive(Debug)]
 pub(crate) struct BuildReservation {
     /// cgroup v2 sandbox. `None` when `plan` is `None` (no reservation
@@ -89,9 +84,10 @@ pub(crate) struct BuildReservation {
 /// kernel source tree.
 ///
 /// Returns a `BuildReservation` whose fields are the three values
-/// `kernel_build_pipeline` used to bind inline; Drop order
-/// matches the prior inline let-bindings so the LIFO cgroup-
-/// rmdir-before-LLC-unlock invariant is preserved.
+/// `kernel_build_pipeline` used to bind inline. `_sandbox` is
+/// declared first and drops first per Rust's declaration-order
+/// field-drop rule; this ensures the cgroup sandbox is removed
+/// before the LLC flock is released.
 ///
 /// `cli_label` prefixes operator-facing error text.
 ///
@@ -106,12 +102,10 @@ pub(crate) fn acquire_build_reservation(
     let bypass = std::env::var("KTSTR_BYPASS_LLC_LOCKS")
         .ok()
         .is_some_and(|v| !v.is_empty());
-    // INVARIANT: `plan` is the first field of BuildReservation but
-    // Drop runs fields in declaration order — we therefore list
-    // `plan` BEFORE `_sandbox` in the struct def and rely on the
-    // LIFO Drop-on-the-struct to drop `_sandbox` first. This
-    // mirrors the original inline let-bindings (plan declared
-    // first, sandbox after) — reordering either would either
+    // INVARIANT: `_sandbox` is declared first and drops first per
+    // Rust's declaration-order field-drop rule; this ensures the
+    // cgroup sandbox is removed before the LLC flock is released.
+    // Reordering either would either
     // (a) unlock LLCs while the sandbox still enforces the
     // cpuset — a concurrent peer could claim the LLC and stomp
     // gcc children that haven't exited — or (b) leave the cgroup
@@ -326,9 +320,9 @@ pub fn kernel_build_pipeline(
     // cpu+mem sets to the plan's CPUs + NUMA nodes so the
     // parallelism hint is enforced, not just advisory.
     //
-    // Binding order is load-bearing: `plan` is declared BEFORE
-    // `_sandbox` so the sandbox's Drop runs FIRST (LIFO), which
-    // migrates the build pid out of the cgroup and rmdirs the
+    // Binding order is load-bearing: `_sandbox` is declared first
+    // and drops first per Rust's declaration-order field-drop rule,
+    // which migrates the build pid out of the cgroup and rmdirs the
     // child while the LLC flocks are still held. Otherwise a peer
     // could observe the LLC released before the cgroup is gone,
     // mint a new plan against the same LLCs, and see an orphan
@@ -354,7 +348,7 @@ pub fn kernel_build_pipeline(
     // `_plan` + `_sandbox` are kept alive via RAII — their Drops
     // release the LLC flocks and cgroup on scope exit. Struct
     // field order in BuildReservation ensures `_sandbox` drops
-    // BEFORE `plan`, matching the inline LIFO invariant.
+    // BEFORE `plan`, per Rust's declaration-order field-drop rule.
     let BuildReservation {
         plan: _plan,
         _sandbox,
@@ -880,5 +874,202 @@ mod tests {
                 eprintln!("acquire_build_reservation unavailable on this host: {e:#}");
             }
         }
+    }
+
+    /// `acquire_build_reservation` plain bypass (no `--cpu-cap`)
+    /// must NOT touch the sysfs probe. The test sets the bypass and
+    /// confirms no error escapes, even on a host whose
+    /// `HostTopology::from_sysfs()` would otherwise fail (the
+    /// bypass branch is taken FIRST in the function, before the
+    /// sysfs probe is attempted). Pins the "bypass short-circuits
+    /// the topology probe" branch shape — a regression that
+    /// re-ordered the bypass check below the sysfs probe would
+    /// surface as a sysfs-error escape.
+    #[test]
+    fn acquire_build_reservation_bypass_does_not_touch_sysfs() {
+        let _lock = bypass_env_lock();
+        let _env = BypassGuard::set("1");
+        let r = acquire_build_reservation("test", None)
+            .expect("bypass must succeed regardless of sysfs availability");
+        // The bypass branch produces (None, None, None) by
+        // construction — no further state to assert beyond the
+        // sibling tests that already pin the field shape.
+        assert!(r.plan.is_none());
+        assert!(r._sandbox.is_none());
+        assert!(r.make_jobs.is_none());
+    }
+
+    // ---------------------------------------------------------------
+    // acquire_source_tree_lock — per-source-tree flock that
+    // serializes parallel builds against the same on-disk source.
+    // ---------------------------------------------------------------
+    //
+    // Tests use `isolated_cache_dir()` to point `KTSTR_CACHE_DIR` at
+    // a tempdir for the test's lifetime, so the production
+    // `CacheDir::new()` resolves into the tempdir without touching
+    // the operator's real cache directory. The lockfile path is
+    // deterministic (cache_root/.locks/source-{path_hash}.lock) so
+    // we can re-derive it from the canonical input path and assert
+    // its presence.
+
+    /// `acquire_source_tree_lock` on a fresh canonical path under
+    /// an isolated cache root succeeds (no peer holding the lock)
+    /// and creates the lockfile under `cache_root/.locks/`. Pins
+    /// the lockfile placement: a regression that moved the lockfile
+    /// to `/tmp/` (where `tmpwatch` could sweep it under an active
+    /// holder) would surface here as the assertion failing on
+    /// "lockfile not found at expected path."
+    #[test]
+    fn acquire_source_tree_lock_succeeds_on_fresh_path() {
+        use crate::test_support::test_helpers::{isolated_cache_dir, lock_env};
+        let _env_lock = lock_env();
+        let cache = isolated_cache_dir();
+        let canonical = std::path::PathBuf::from("/tmp/fake-source-tree-for-test");
+        let fd = acquire_source_tree_lock(&canonical, "test")
+            .expect("fresh-path acquire must succeed under isolated cache");
+        // Lockfile must land under the isolated cache root's
+        // `.locks/` subdirectory. The naming is `source-{hash}.lock`
+        // where `{hash}` is `canonical_path_hash(canonical)`.
+        let path_hash = crate::fetch::canonical_path_hash(&canonical);
+        let expected = cache
+            .path()
+            .join(crate::flock::LOCK_DIR_NAME)
+            .join(format!("source-{path_hash}.lock"));
+        assert!(
+            expected.exists(),
+            "lockfile must exist at {} after acquire",
+            expected.display(),
+        );
+        // Drop the FD explicitly to release the flock before the
+        // tempdir cleanup races with it.
+        drop(fd);
+    }
+
+    /// `acquire_source_tree_lock` returns the SAME lockfile path
+    /// for two different canonical inputs IFF they share the same
+    /// `canonical_path_hash`. Two distinct inputs (`/srv/linux-a`
+    /// and `/srv/linux-b`) must produce DIFFERENT lockfiles so
+    /// concurrent builds against unrelated source trees don't
+    /// serialize against each other. Pins the per-tree
+    /// disambiguation contract.
+    #[test]
+    fn acquire_source_tree_lock_distinct_paths_yield_distinct_lockfiles() {
+        use crate::test_support::test_helpers::{isolated_cache_dir, lock_env};
+        let _env_lock = lock_env();
+        let cache = isolated_cache_dir();
+        let path_a = std::path::PathBuf::from("/tmp/fake-source-a");
+        let path_b = std::path::PathBuf::from("/tmp/fake-source-b");
+        let fd_a = acquire_source_tree_lock(&path_a, "test")
+            .expect("path A acquire must succeed under isolated cache");
+        // Acquiring path B while path A's lock is still held must
+        // ALSO succeed — they hash to different lockfiles, so
+        // there's no contention.
+        let fd_b = acquire_source_tree_lock(&path_b, "test")
+            .expect(
+                "path B acquire must succeed concurrently with A — \
+                 distinct canonical paths must hash to distinct \
+                 lockfiles so unrelated builds don't serialize",
+            );
+        let hash_a = crate::fetch::canonical_path_hash(&path_a);
+        let hash_b = crate::fetch::canonical_path_hash(&path_b);
+        assert_ne!(
+            hash_a, hash_b,
+            "distinct canonical paths must produce distinct CRC32 hashes",
+        );
+        let lock_a = cache
+            .path()
+            .join(crate::flock::LOCK_DIR_NAME)
+            .join(format!("source-{hash_a}.lock"));
+        let lock_b = cache
+            .path()
+            .join(crate::flock::LOCK_DIR_NAME)
+            .join(format!("source-{hash_b}.lock"));
+        assert!(lock_a.exists());
+        assert!(lock_b.exists());
+        assert_ne!(lock_a, lock_b);
+        drop(fd_a);
+        drop(fd_b);
+    }
+
+    /// `acquire_source_tree_lock` on a path whose lockfile is
+    /// already held by a peer in this process returns an error
+    /// citing the source tree path AND the actionable
+    /// `cargo ktstr locks` hint. Pins the EWOULDBLOCK diagnostic
+    /// shape — a regression that swallowed the actionable hint or
+    /// degraded to a blocking acquire would surface here.
+    ///
+    /// We simulate "concurrent peer" by holding the first FD in
+    /// the same process: `try_flock` is non-blocking, so a second
+    /// acquire of the same lockfile returns `Ok(None)` and the
+    /// helper bails with the actionable error.
+    #[test]
+    fn acquire_source_tree_lock_contention_returns_actionable_error() {
+        use crate::test_support::test_helpers::{isolated_cache_dir, lock_env};
+        let _env_lock = lock_env();
+        let _cache = isolated_cache_dir();
+        let canonical = std::path::PathBuf::from("/tmp/fake-source-contention");
+        let _holder = acquire_source_tree_lock(&canonical, "test")
+            .expect("first acquire must succeed under isolated cache");
+        // Second acquire of the same path — must fail because the
+        // first FD still holds the exclusive flock. Note: flock(2)
+        // semantics mean two acquire attempts in the same process
+        // CAN collide because each acquire opens a fresh fd
+        // (different FDs are distinct from the kernel's POV).
+        let err = acquire_source_tree_lock(&canonical, "test")
+            .expect_err("second acquire must fail while the first holds the lock");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("source tree"),
+            "error must name the source tree: {msg}",
+        );
+        assert!(
+            msg.contains("cargo ktstr locks"),
+            "error must point at `cargo ktstr locks` for diagnosis: {msg}",
+        );
+        // The cli_label must surface in the diagnostic so the
+        // operator sees which binary's invocation surfaced it.
+        assert!(
+            msg.contains("test"),
+            "error must include the cli_label `test`: {msg}",
+        );
+    }
+
+    /// `BuildReservation` field declaration order is load-bearing:
+    /// `_sandbox` MUST be declared BEFORE `plan` so Rust's
+    /// in-declaration-order field-drop runs the sandbox cgroup
+    /// rmdir BEFORE the LLC flock release.
+    ///
+    /// A regression that swapped the field order would mean
+    /// LLC flocks release first, which lets a peer claim the LLC
+    /// while gcc children are still bound to a cgroup whose rmdir
+    /// hasn't run yet.
+    ///
+    /// We can't assert drop ORDER directly without exotic
+    /// machinery, but we can assert the field order is what we
+    /// expect via the `Debug` derive: `_sandbox` appears in the
+    /// formatted struct BEFORE `plan` IFF the field declaration
+    /// order matches the Drop-order requirement. The field-name
+    /// regex is enough to pin the order without depending on the
+    /// inner field shapes (which evolve as the planner / sandbox
+    /// types add or rename their own fields).
+    #[test]
+    fn build_reservation_field_order_pins_drop_invariant() {
+        let r = BuildReservation {
+            _sandbox: None,
+            plan: None,
+            make_jobs: None,
+        };
+        let dbg = format!("{r:?}");
+        let sandbox_pos = dbg
+            .find("_sandbox")
+            .expect("Debug output must mention _sandbox field");
+        let plan_pos = dbg
+            .find("plan")
+            .expect("Debug output must mention plan field");
+        assert!(
+            sandbox_pos < plan_pos,
+            "_sandbox MUST be declared before plan so cgroup rmdir \
+             runs BEFORE LLC flock release on Drop. Debug: {dbg}",
+        );
     }
 }
