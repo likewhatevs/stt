@@ -13,9 +13,10 @@ use virtio_queue::mock::MockSplitQueue;
 use vm_memory::Address;
 
     /// Hostile-guest avail.idx defense. The virtio spec
-    /// (virtio-v1.2 §2.7.13.3.1) forbids the guest from making more
-    /// descriptor chain heads available than `queue.size`. The
-    /// virtio-queue crate's `AvailIter::new` enforces this with
+    /// (virtio-v1.2 §2.7.13.3) requires `avail.idx` to advance
+    /// monotonically and stay at most `queue.size` ahead of the
+    /// device's `next_avail` cursor. The virtio-queue crate's
+    /// `AvailIter::new` enforces this with
     /// `(idx - queue.next_avail).0 > queue.size` → returns
     /// `Error::InvalidAvailRingIndex` (queue.rs:707-709).
     ///

@@ -173,6 +173,57 @@ pub(crate) fn decide_stall_action(outcome: DrainOutcome) -> StallAction {
     }
 }
 
+/// Final action the worker loop applies after the inline-re-drain
+/// step has resolved. Strictly a subset of [`StallAction`] —
+/// `ReDrain` is excluded by construction so the apply site cannot
+/// observe an un-handled inline-retry leak.
+///
+/// Distinction from `StallAction`: the latter is the raw policy
+/// output that may include `ReDrain` (the wait_nanos==0 trigger);
+/// `WorkerAction` is what the worker loop ACTS on after the
+/// bounded-recursion inline retry has converted any leaked
+/// `ReDrain` into `Sleep { nanos: 1 }`. Splitting the type makes
+/// the `match` at the apply site exhaustive without a defensive
+/// arm — a regression that drops the bounded-recursion downgrade
+/// would surface as a compile error in `resolve_action` rather
+/// than as a runtime `debug_assert!`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkerAction {
+    Continue,
+    Sleep { nanos: u64 },
+}
+
+/// Resolve a [`StallAction`] into the apply-site [`WorkerAction`],
+/// performing the bounded-recursion inline retry on `ReDrain`.
+///
+/// `redrain` is the closure the worker invokes when the first
+/// outcome was `ReDrain`: it must call `drain_bracket_impl` once
+/// and return the resulting [`DrainOutcome`]. If the second drain
+/// ALSO produces `ReDrain`, this function downgrades to
+/// `Sleep { nanos: 1 }` so the loop never spins (a stall→retry
+/// →stall pattern would otherwise starve STOP_TOKEN/KICK_TOKEN).
+/// `clamp_retry_nanos(0) == 1`, so the downgrade preserves the
+/// `it_value` the timerfd_settime path would have produced for a
+/// fresh `wait_nanos == 0` outcome.
+///
+/// Free function so tests can drive every (first, second) outcome
+/// pair without spawning a worker thread or constructing an
+/// `Epoll`.
+pub(crate) fn resolve_action(
+    first: StallAction,
+    redrain: impl FnOnce() -> DrainOutcome,
+) -> WorkerAction {
+    match first {
+        StallAction::Continue => WorkerAction::Continue,
+        StallAction::Sleep { nanos } => WorkerAction::Sleep { nanos },
+        StallAction::ReDrain => match decide_stall_action(redrain()) {
+            StallAction::Continue => WorkerAction::Continue,
+            StallAction::Sleep { nanos } => WorkerAction::Sleep { nanos },
+            StallAction::ReDrain => WorkerAction::Sleep { nanos: 1 },
+        },
+    }
+}
+
 /// Worker-thread epoll dispatch tokens. Hoisted to module scope
 /// so the testable `worker_dispatch_event` helper (and its unit
 /// tests under `cfg(test)`) can name them without duplicating
@@ -588,34 +639,25 @@ pub(crate) fn worker_thread_main(
         // round-trip for a state where the next drain is
         // guaranteed to succeed.
         //
-        // Re-call `drain_bracket_impl` immediately, bounded at
-        // depth 1, so a refill that arrived between
-        // can_consume and the arm decision is observed
-        // synchronously without giving up the CPU. If the
-        // inline retry STILL stalls, fall through to the
-        // timerfd path with `Sleep { nanos: 1 }` —
-        // bounded recursion prevents a stall→retry→stall spin
-        // from starving STOP_TOKEN/KICK_TOKEN. `clamp_retry_nanos`
-        // would have produced the same 1 ns floor for the
-        // second `wait_nanos == 0` outcome, so the downgrade
-        // preserves the original `it_value`.
-        let action = match decide_stall_action(outcome) {
-            StallAction::ReDrain => {
-                tracing::trace!("virtio-blk worker: wait_nanos==0 inline re-drain");
-                let outcome2 = drain_bracket_impl(
-                    &mut state,
-                    &mut queues,
-                    mem_ref,
-                    &irq_evt,
-                    &interrupt_status,
-                );
-                match decide_stall_action(outcome2) {
-                    StallAction::ReDrain => StallAction::Sleep { nanos: 1 },
-                    other => other,
-                }
-            }
-            other => other,
-        };
+        // `resolve_action` performs the bounded-recursion inline
+        // retry: a `ReDrain` outcome triggers exactly one extra
+        // `drain_bracket_impl` call, and a second `ReDrain` is
+        // downgraded to `Sleep { nanos: 1 }` so the loop never
+        // spins (a stall→retry→stall pattern would otherwise
+        // starve STOP_TOKEN/KICK_TOKEN). The `WorkerAction`
+        // return type encodes that bound at the type level —
+        // the apply-site match below is exhaustive over
+        // `Continue` and `Sleep` only.
+        let action = resolve_action(decide_stall_action(outcome), || {
+            tracing::trace!("virtio-blk worker: wait_nanos==0 inline re-drain");
+            drain_bracket_impl(
+                &mut state,
+                &mut queues,
+                mem_ref,
+                &irq_evt,
+                &interrupt_status,
+            )
+        });
         // Apply the decided action. The `Sleep` arm arms the retry
         // timerfd; `Continue` clears `last_known_blocked` so
         // subsequent kicks aren't suppressed (the gauge dec already
@@ -628,7 +670,7 @@ pub(crate) fn worker_thread_main(
         // `kernel.hung_task_timeout_secs` default of 120 s —
         // virtio_blk has no `mq_ops->timeout`).
         match action {
-            StallAction::Sleep { nanos } => {
+            WorkerAction::Sleep { nanos } => {
                 // Cache the blocked state so the next KICK_TOKEN
                 // skips the drain (see is_blocked skip above). The
                 // flag is cleared on THROTTLE_TOKEN; if a fresh
@@ -666,18 +708,8 @@ pub(crate) fn worker_thread_main(
                     );
                 }
             }
-            StallAction::Continue => {
+            WorkerAction::Continue => {
                 last_known_blocked = false;
-            }
-            StallAction::ReDrain => {
-                // Unreachable — the second-drain match above
-                // converts any `ReDrain` outcome from the second
-                // pass into `Sleep { nanos: 1 }`, so the worker
-                // loop only ever applies `Sleep` or `Continue`.
-                // Defensive: treat as `Sleep { nanos: 1 }` to
-                // arm the timer and stay live.
-                debug_assert!(false, "ReDrain leaked past bounded recursion");
-                last_known_blocked = true;
             }
         }
     }
@@ -899,6 +931,108 @@ mod tests {
         // outcome — so the bounded-recursion arm produces the
         // same it_value as the legacy code (which always passed
         // through clamp_retry_nanos before arming the timerfd).
+        assert_eq!(clamp_retry_nanos(0), 1);
+    }
+
+    /// `resolve_action` on `Continue` skips the inline-retry
+    /// closure entirely and returns `WorkerAction::Continue`.
+    /// Pins the happy-path contract: a successful drain must
+    /// not invoke the redrain closure (which in production would
+    /// re-call `drain_bracket_impl`).
+    #[test]
+    fn resolve_action_continue_skips_redrain() {
+        let mut redrain_called = false;
+        let action = resolve_action(StallAction::Continue, || {
+            redrain_called = true;
+            DrainOutcome::Done
+        });
+        assert_eq!(action, WorkerAction::Continue);
+        assert!(
+            !redrain_called,
+            "Continue must NOT invoke the inline-retry closure",
+        );
+    }
+
+    /// `resolve_action` on `Sleep { nanos }` skips the inline-retry
+    /// closure and returns `WorkerAction::Sleep { nanos }` with
+    /// the same value. The clamp was applied by `decide_stall_action`
+    /// upstream — `resolve_action` is a pass-through here.
+    #[test]
+    fn resolve_action_sleep_skips_redrain() {
+        let mut redrain_called = false;
+        let action = resolve_action(StallAction::Sleep { nanos: 12345 }, || {
+            redrain_called = true;
+            DrainOutcome::Done
+        });
+        assert_eq!(action, WorkerAction::Sleep { nanos: 12345 });
+        assert!(
+            !redrain_called,
+            "Sleep must NOT invoke the inline-retry closure",
+        );
+    }
+
+    /// `resolve_action` on `ReDrain` invokes the closure exactly
+    /// once and converts a `Done` second outcome into `Continue`.
+    /// Pins the inline-retry success path: the wait_nanos==0
+    /// trigger fires → second drain succeeds → loop continues
+    /// without arming the timerfd.
+    #[test]
+    fn resolve_action_redrain_done_is_continue() {
+        let mut call_count = 0;
+        let action = resolve_action(StallAction::ReDrain, || {
+            call_count += 1;
+            DrainOutcome::Done
+        });
+        assert_eq!(action, WorkerAction::Continue);
+        assert_eq!(
+            call_count, 1,
+            "ReDrain must invoke the inline-retry closure exactly once",
+        );
+    }
+
+    /// `resolve_action` on `ReDrain` invokes the closure once and
+    /// passes through a `Sleep` outcome from the second drain. Pins
+    /// the path where the inline retry stalls with a non-zero
+    /// deficit — the worker arms the timerfd at that deficit
+    /// rather than re-recursing.
+    #[test]
+    fn resolve_action_redrain_sleep_passes_through() {
+        let mut call_count = 0;
+        let action = resolve_action(StallAction::ReDrain, || {
+            call_count += 1;
+            DrainOutcome::ThrottleStalled {
+                wait_nanos: 500_000_000,
+            }
+        });
+        assert_eq!(action, WorkerAction::Sleep { nanos: 500_000_000 });
+        assert_eq!(
+            call_count, 1,
+            "ReDrain must invoke the inline-retry closure exactly once",
+        );
+    }
+
+    /// `resolve_action` on `ReDrain` followed by a second `ReDrain`
+    /// (wait_nanos==0 again) is downgraded to `Sleep { nanos: 1 }`.
+    /// Pins the bounded-recursion contract: the loop never spins
+    /// because the type system disallows a third inline retry.
+    /// `clamp_retry_nanos(0) == 1`, so the downgrade preserves the
+    /// `it_value` the legacy code produced.
+    #[test]
+    fn resolve_action_redrain_redrain_downgrades_to_sleep_one_ns() {
+        let mut call_count = 0;
+        let action = resolve_action(StallAction::ReDrain, || {
+            call_count += 1;
+            DrainOutcome::ThrottleStalled { wait_nanos: 0 }
+        });
+        assert_eq!(action, WorkerAction::Sleep { nanos: 1 });
+        assert_eq!(
+            call_count, 1,
+            "ReDrain followed by ReDrain must invoke the closure \
+             exactly once — the downgrade prevents a third call",
+        );
+        // Sanity: the 1-ns downgrade matches the floor that
+        // clamp_retry_nanos imposes on a fresh wait_nanos==0
+        // outcome.
         assert_eq!(clamp_retry_nanos(0), 1);
     }
 

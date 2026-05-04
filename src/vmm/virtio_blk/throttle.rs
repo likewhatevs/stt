@@ -410,10 +410,15 @@ impl TokenBucket {
     /// cleared via `clear_forced_nanos_until_n_tokens_for_test`.
     /// The override short-circuits before `refill()`, so the
     /// reported deficit is strictly deterministic regardless of
-    /// `Instant::now()`. Pairs with the worker-loop test seam for
-    /// the `wait_nanos == 0` inline-re-drain branch — a test can
-    /// force one bucket to report zero deficit and assert the
-    /// worker's `StallAction` decision without timing tolerances.
+    /// `Instant::now()`. The injected value is unconstrained —
+    /// `0` exercises the worker-loop's `wait_nanos == 0`
+    /// inline-re-drain branch; non-zero values pin a specific
+    /// `Sleep { nanos: clamp_retry_nanos(forced) }` outcome
+    /// for `decide_stall_action` and any caller that depends on
+    /// a deterministic deficit (e.g. the gauge-transition tests
+    /// that need the bucket to report a specific wait without
+    /// `set_last_refill_for_test` racing against wall-clock
+    /// refills).
     #[cfg(test)]
     pub(crate) fn set_forced_nanos_until_n_tokens_for_test(&mut self, forced: u64) {
         self.forced_nanos_until_n_tokens = Some(forced);

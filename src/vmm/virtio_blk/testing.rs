@@ -8,10 +8,10 @@
 //! tests in `mod.rs`) without leaking outside the `virtio_blk` module.
 //!
 //! No test bodies live here — only fixtures. Tests that own a fixture
-//! exclusively (e.g. `setup_iops1_drained_chain` is read by 6 gauge
-//! tests in `device::tests`) still live here because `pub(super)` keeps
-//! the door open for a future test in another sibling to consume the
-//! same fixture without a copy.
+//! exclusively (e.g. `setup_iops1_drained_chain` is read by the
+//! gauge-transition tests in `tests_atomics`) still live here because
+//! `pub(super)` keeps the door open for a future test in another sibling
+//! to consume the same fixture without a copy.
 //!
 //! `cfg(test)` gated at the module-declaration site (`mod testing;`
 //! in `mod.rs`); this file itself is not gated so rust-analyzer can
@@ -316,13 +316,13 @@ pub(super) fn setup_blk<'a>(
 /// ring, FSM walked to DRIVER_OK, and `last_refill` pinned at
 /// `Instant::now()` so any in-place refill yields zero tokens.
 ///
-/// Six gauge tests share this exact setup; extracting it here
-/// prevents drift between them — when the gauge invariant or
-/// the chain shape changes, this one site updates instead of
-/// six. Each call site adds only the per-test action sequence
-/// (MMIO QUEUE_NOTIFY versus direct `drain_bracket_impl`,
-/// pre-write of a status sentinel, reset, etc.) and the
-/// per-test assertions.
+/// Multiple gauge-transition tests share this exact setup;
+/// extracting it here prevents drift between them — when the
+/// gauge invariant or the chain shape changes, this one site
+/// updates instead of every call site. Each call site adds only
+/// the per-test action sequence (MMIO QUEUE_NOTIFY versus direct
+/// `drain_bracket_impl`, pre-write of a status sentinel, reset,
+/// etc.) and the per-test assertions.
 ///
 /// Why iops=1 (not iops=N): a 1-token bucket plus a planted
 /// 1-sector READ chain forces the second consume-attempt to
@@ -411,10 +411,118 @@ pub(super) fn setup_iops1_drained_chain(mem: &GuestMemoryMmap) -> VirtioBlk {
     dev
 }
 
-/// Suppress the silent-drop reference: `setup_blk` returns a
-/// `MockSplitQueue` lifetime'd to `mem`. Some tests want to
-/// drop the mock immediately (used only for FSM wiring) and
-/// keep just the device; this is a no-op shim that helps the
-/// compiler infer `mem` is still borrowed by `dev`.
-#[allow(dead_code)]
-pub(super) fn _suppress_silent_drop<T>(_value: T) {}
+/// Build a `VirtioBlk` ready to drive the throttle-stall gauge
+/// path on the BYTES bucket (the iops bucket has tokens). Mirror
+/// of `setup_iops1_drained_chain` for the bytes-only variant —
+/// extracted so the bytes-only gauge tests share the same
+/// chain-shape and pin-points as their iops-only counterparts,
+/// preventing drift between the two transition surfaces.
+///
+/// Parameters:
+/// * `iops_rate`: tokens/sec for the iops bucket. Must be large
+///   enough to satisfy `consume(1)` against any reasonable wall
+///   time (16/sec is plenty — the 1-token-per-request charge
+///   never exhausts the bucket in tests).
+/// * `bytes_rate`: tokens/sec for the bytes bucket. The bucket
+///   is pre-drained via `consume(bytes_rate)` so the next
+///   `consume(bytes_rate)` stalls; pick a value matching the
+///   chain's `data_len` to land the deficit math at exactly
+///   `1_000_000_000 ns` (deficit==capacity, rate==capacity → 1 s).
+///
+/// The chain is a 1-segment T_IN read of `bytes_rate` bytes:
+/// header at `0x4000`, data at `0x5000`, status at `0x6000`.
+/// Both buckets' `last_refill` are pinned at `Instant::now()`
+/// after the FSM walk so the elapsed wall time during MMIO
+/// writes does not passively grant tokens before the first
+/// drain.
+///
+/// Why bytes_rate matters for the deficit math:
+/// `nanos_until_n_tokens(bytes_rate)` against an empty bucket
+/// at `refill_rate=bytes_rate` returns `bytes_rate * 1e9 /
+/// bytes_rate = 1_000_000_000` ns. A test that pins
+/// `wait_nanos=1_000_000_000` depends on this equality.
+pub(super) fn setup_bytes_only_drained_chain(
+    mem: &GuestMemoryMmap,
+    iops_rate: u64,
+    bytes_rate: u64,
+) -> VirtioBlk {
+    let throttle = DiskThrottle {
+        iops: std::num::NonZeroU64::new(iops_rate),
+        bytes_per_sec: std::num::NonZeroU64::new(bytes_rate),
+        iops_burst_capacity: None,
+        bytes_burst_capacity: None,
+    };
+    let (mut dev, mock) = setup_blk(mem, false, throttle);
+
+    // Drain ONLY the bytes bucket so the first drain stalls on
+    // bytes alone. Pin both buckets' last_refill so the
+    // bucket arithmetic doesn't passively grant or revoke
+    // tokens between assertions.
+    let now0 = std::time::Instant::now();
+    dev.worker
+        .state_mut()
+        .ops_bucket
+        .set_last_refill_for_test(now0);
+    dev.worker
+        .state_mut()
+        .bytes_bucket
+        .set_last_refill_for_test(now0);
+    assert!(
+        dev.worker.state_mut().bytes_bucket.consume(bytes_rate),
+        "drain the bytes bucket on the freshly-built device",
+    );
+    // Re-pin AFTER consume so the next can_consume sees the
+    // drained state at exactly t=now0.
+    dev.worker
+        .state_mut()
+        .bytes_bucket
+        .set_last_refill_for_test(now0);
+
+    // Plant the standard 3-desc T_IN chain. data_len matches
+    // bytes_rate so the chain's bytes-bucket charge equals the
+    // bucket capacity — landing the deficit at 1_000_000_000 ns
+    // when the bucket is empty.
+    let header_addr = GuestAddress(0x4000);
+    let data_addr = GuestAddress(0x5000);
+    let status_addr = GuestAddress(0x6000);
+    write_blk_header(mem, header_addr, VIRTIO_BLK_T_IN, 0);
+    let data_len_u32 =
+        u32::try_from(bytes_rate).expect("bytes_rate fits in a single descriptor for tests");
+    let descs = [
+        RawDescriptor::from(SplitDescriptor::new(
+            header_addr.0,
+            VIRTIO_BLK_OUTHDR_SIZE as u32,
+            0,
+            0,
+        )),
+        RawDescriptor::from(SplitDescriptor::new(
+            data_addr.0,
+            data_len_u32,
+            VRING_DESC_F_WRITE as u16,
+            0,
+        )),
+        RawDescriptor::from(SplitDescriptor::new(
+            status_addr.0,
+            1,
+            VRING_DESC_F_WRITE as u16,
+            0,
+        )),
+    ];
+    mock.build_desc_chain(&descs).expect("build chain");
+    dev.set_mem(mem.clone());
+    wire_device_to_mock(&mut dev, &mock);
+
+    // Re-pin both buckets after the FSM walk — wire_device_to_mock's
+    // MMIO writes take measurable wall time.
+    let now1 = std::time::Instant::now();
+    dev.worker
+        .state_mut()
+        .ops_bucket
+        .set_last_refill_for_test(now1);
+    dev.worker
+        .state_mut()
+        .bytes_bucket
+        .set_last_refill_for_test(now1);
+    dev
+}
+

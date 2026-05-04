@@ -22,6 +22,7 @@ use super::pi_mutex::PiMutex;
 use super::shm_ring;
 use super::vcpu::VcpuThread;
 use super::virtio_blk::VirtioBlkCounters;
+use super::virtio_net::VirtioNetCounters;
 use crate::monitor;
 
 /// Result of a VM execution.
@@ -81,20 +82,25 @@ pub struct VmResult {
     /// has exited. `Some(_)` when the builder attached a disk via
     /// [`super::KtstrVmBuilder::disk`]; `None` when no disk was
     /// configured and [`super::KtstrVm::init_virtio_blk`] returned
-    /// `None`. The Arc is the same handle the device increments on
-    /// the vCPU thread during request processing — by the time
-    /// `collect_results` constructs the [`VmResult`] every vCPU has
-    /// joined and no further mutation occurs, so a single
+    /// `None`. The Arc is the same handle the device increments
+    /// from `drain_bracket_impl` (production cfg: on the dedicated
+    /// `ktstr-vblk` worker thread; cfg(test): inline on the test
+    /// thread) — by the time `collect_results` constructs the
+    /// [`VmResult`] every vCPU and the worker have joined and no
+    /// further mutation occurs, so a single
     /// `.load(Ordering::Relaxed)` per field on the consumer side
     /// observes the final cumulative totals.
     ///
-    /// The counter struct exposes seven `AtomicU64` fields, each
-    /// bumped from `process_requests`:
+    /// The counter struct exposes nine `AtomicU64` fields, each
+    /// bumped from `drain_bracket_impl` (in `src/vmm/virtio_blk/device.rs`)
+    /// via the `VirtioBlkCounters::record_*` helpers. Per-request
+    /// cumulative counters, per-event cumulative counters, and
+    /// per-request live gauges are kept distinct per the
+    /// counter-taxonomy doc on `VirtioBlkCounters`:
     ///
     ///   - `reads_completed` — count of `VIRTIO_BLK_T_IN` requests
     ///     that returned `S_OK` to the guest. Bumped together with
-    ///     `bytes_read` per [`VirtioBlkCounters::record_read`] in
-    ///     `src/vmm/virtio_blk.rs`.
+    ///     `bytes_read` per [`VirtioBlkCounters::record_read`].
     ///   - `writes_completed` — count of `VIRTIO_BLK_T_OUT` requests
     ///     that returned `S_OK`. Bumped together with `bytes_written`.
     ///   - `flushes_completed` — count of `VIRTIO_BLK_T_FLUSH`
@@ -104,17 +110,36 @@ pub struct VmResult {
     ///     completed reads.
     ///   - `bytes_written` — total bytes accepted from the guest for
     ///     completed writes.
-    ///   - `throttled_count` — token-bucket stalls. The chain is
-    ///     rolled back and the worker arms a retry timerfd; the
-    ///     guest does not see `S_IOERR` for a stall (the request
-    ///     is deferred until the bucket refills). This counter is
-    ///     separate from `io_errors` so operators can distinguish
-    ///     "throttle bucket drained, request deferred" from "real
-    ///     IO problem".
+    ///   - `throttled_count` — cumulative token-bucket **stall events**
+    ///     for the device's lifetime. The chain is rolled back and
+    ///     the worker arms a retry timerfd; the guest does not see
+    ///     `S_IOERR` for a stall (the request is deferred until the
+    ///     bucket refills). This counter is separate from `io_errors`
+    ///     so operators can distinguish "throttle bucket drained,
+    ///     request deferred" from "real IO problem". Per-event (NOT
+    ///     per-request): a single chain that stalls twice produces
+    ///     two bumps.
     ///   - `io_errors` — every path that reports `S_IOERR`:
     ///     spec violations, backend `pread`/`pwrite` errors,
     ///     malformed chains, `add_used` failures.
     ///     Stalls do not report `S_IOERR`; see `throttled_count`.
+    ///   - `currently_throttled_gauge` — **live gauge**: how many
+    ///     requests are RIGHT NOW waiting for throttle tokens.
+    ///     Increments when a chain transitions into stalled,
+    ///     decrements on retry success or reset. Bounded at 0 or 1
+    ///     on this single-queue device. NOT cumulative — answers
+    ///     "what's stuck now," distinct from `throttled_count`
+    ///     which answers "how many stall events happened over
+    ///     time."
+    ///   - `invalid_avail_idx_count` — cumulative count of
+    ///     `Error::InvalidAvailRingIndex` events observed by
+    ///     `drain_bracket_impl` (avail.idx more than `queue.size`
+    ///     ahead of `next_avail` — a virtio-v1.2 §2.7.13.3
+    ///     avail.idx-distance violation by the guest). Per-event
+    ///     counter; the `queue_poisoned` flag short-circuits
+    ///     subsequent kicks so one guest fault produces exactly
+    ///     one bump regardless of how many notifications follow
+    ///     before reset.
     ///
     /// Counters are cumulative for the device's lifetime. A guest
     /// driver re-bind (writing `STATUS=0` to `VIRTIO_MMIO_STATUS`
@@ -126,10 +151,9 @@ pub struct VmResult {
     /// Reading example:
     ///
     /// ```ignore
-    /// use std::sync::atomic::Ordering;
     /// let r: VmResult = builder.run()?;
     /// let c = r.virtio_blk_counters.expect("disk attached");
-    /// assert!(c.reads_completed.load(Ordering::Relaxed) > 0);
+    /// assert!(c.reads_completed() > 0);
     /// ```
     ///
     /// `#[allow(dead_code)]` mirrors `stimulus_events` above: the
@@ -140,6 +164,47 @@ pub struct VmResult {
     /// live in unit tests.
     #[allow(dead_code)]
     pub virtio_blk_counters: Option<Arc<VirtioBlkCounters>>,
+    /// Host-side virtio-net device counters, sampled after the guest
+    /// has exited. `Some(_)` when the builder attached a network via
+    /// [`super::KtstrVmBuilder::network`]; `None` when no network was
+    /// configured and [`super::KtstrVm::init_virtio_net`] returned
+    /// `None`. The Arc is the same handle the device increments on
+    /// the vCPU thread inside `process_tx_loopback` — by the time
+    /// `collect_results` constructs the [`VmResult`] every vCPU has
+    /// joined and no further mutation occurs, so a single
+    /// `.load(Ordering::Relaxed)` per field on the consumer side
+    /// observes the final cumulative totals.
+    ///
+    /// The counter struct exposes nine `AtomicU64` fields, each
+    /// bumped from `process_tx_loopback`:
+    ///
+    ///   - `tx_packets` — count of TX chains the device accepted
+    ///     and marked used; advances per parsed chain regardless of
+    ///     downstream RX outcome.
+    ///   - `tx_bytes` — bytes of L2 frame data captured from
+    ///     successfully parsed TX chains (excludes the 12-byte
+    ///     virtio header).
+    ///   - `rx_packets` / `rx_bytes` — count + bytes of RX chains
+    ///     successfully written and marked used. In v0's pure-
+    ///     loopback mode the steady-state expectation is
+    ///     `rx_packets == tx_packets - tx_dropped_no_rx_buffer`;
+    ///     asymmetric counts surface RX-side breakage.
+    ///   - `tx_dropped_no_rx_buffer` — successfully-captured TX
+    ///     frames the device could not deliver because the RX queue
+    ///     was empty (back-pressure event).
+    ///   - `tx_chain_invalid` / `rx_chain_invalid` — chains rejected
+    ///     for malformed shape (short header, wrong direction).
+    ///   - `tx_add_used_failures` / `rx_add_used_failures` —
+    ///     `add_used` failures, indicating the queue's used-ring
+    ///     address itself is unmapped or otherwise inaccessible.
+    ///     Distinct from the `*_chain_invalid` counters so an
+    ///     operator can tell "guest sent malformed frame" from
+    ///     "queue itself is broken".
+    ///
+    /// Counters are cumulative for the device's lifetime — a guest
+    /// driver re-bind (writing `STATUS=0`) does NOT zero them.
+    #[allow(dead_code)]
+    pub virtio_net_counters: Option<Arc<VirtioNetCounters>>,
 }
 
 impl VmResult {
@@ -180,6 +245,7 @@ impl VmResult {
             crash_message: None,
             cleanup_duration: None,
             virtio_blk_counters: None,
+            virtio_net_counters: None,
         }
     }
 }
@@ -267,6 +333,12 @@ pub(crate) struct VmRunState {
     /// thread has joined, so the Arc holds the final cumulative
     /// totals.
     pub(crate) virtio_blk_counters: Option<Arc<VirtioBlkCounters>>,
+    /// Cloned counter handle from [`super::KtstrVm::init_virtio_net`]
+    /// when a network was attached, captured before the device-arc is
+    /// dropped so [`super::KtstrVm::collect_results`] can plumb it
+    /// onto [`VmResult::virtio_net_counters`]. Same Arc-handoff
+    /// pattern as `virtio_blk_counters` above.
+    pub(crate) virtio_net_counters: Option<Arc<VirtioNetCounters>>,
 }
 #[cfg(test)]
 mod tests {
@@ -290,6 +362,7 @@ mod tests {
             crash_message: None,
             cleanup_duration: Some(Duration::from_millis(50)),
             virtio_blk_counters: None,
+            virtio_net_counters: None,
         };
         assert!(r.success);
         assert_eq!(r.exit_code, 0);
@@ -321,6 +394,7 @@ mod tests {
             crash_message: None,
             cleanup_duration: None,
             virtio_blk_counters: Some(Arc::new(VirtioBlkCounters::default())),
+            virtio_net_counters: None,
         };
         assert!(!r2.success);
         assert_eq!(r2.exit_code, 1);
@@ -363,6 +437,7 @@ mod tests {
             crash_message: None,
             cleanup_duration: None,
             virtio_blk_counters: None,
+            virtio_net_counters: None,
         };
         assert!(r.monitor.is_none());
         // Output and exit_code must still be accessible.
@@ -402,6 +477,7 @@ mod tests {
             crash_message: None,
             cleanup_duration: None,
             virtio_blk_counters: None,
+            virtio_net_counters: None,
         };
         let mon = r.monitor.as_ref().unwrap();
         assert_eq!(mon.summary.total_samples, 5);

@@ -957,13 +957,36 @@ use virtio_queue::mock::MockSplitQueue;
         let mem = make_chain_test_mem();
         let mut dev = setup_iops1_drained_chain(&mem);
 
+        // Pin the deficit deterministically via the
+        // `forced_nanos_until_n_tokens` seam rather than relying on
+        // `set_last_refill_for_test`. With wall-time pinning a
+        // post-pin syscall delay can cross a refill-rate boundary
+        // (refill_rate=1/sec → 1-second elapsed grants a token via
+        // the `(refill_rate * elapsed_ns) / 1_000_000_000` math),
+        // and the assertion against `wait_nanos==1_000_000_000`
+        // would observe a smaller deficit. The seam short-circuits
+        // before `refill()` so the deficit is pinned regardless of
+        // wall-clock state. Leaving `last_refill` pinning in place
+        // for `consume()` (which has no seam) is fine because the
+        // gating `can_consume` ALSO short-circuits the deficit
+        // computation through the seam; the consume that follows
+        // a successful gate is unconditional on Instant.
+        dev.worker
+            .state_mut()
+            .ops_bucket
+            .set_forced_nanos_until_n_tokens_for_test(1_000_000_000);
+
         let mem_ref = dev.mem.get().expect("mem set above");
 
-        // First call — stall, gauge 0→1. Pin the exact wait_nanos
-        // value the bucket math produces (1_000_000_000 ns from
-        // capacity=1, rate=1, deficit=1). Production's wait_nanos==0
-        // inline re-drain trigger is unreachable from cfg(test) —
-        // see follow-up #454.
+        // First call — stall, gauge 0→1. The wait_nanos value the
+        // assertion below pins (1_000_000_000) is anchored by the
+        // forced-nanos seam, NOT by the natural deficit math. The
+        // setup_iops1_drained_chain fixture leaves the bucket
+        // drained so the can_consume gate fails as before;
+        // the forced-nanos seam only governs the
+        // nanos_until_n_tokens path that produces wait_nanos.
+        // Production's wait_nanos==0 inline re-drain trigger is
+        // unreachable from cfg(test) — see follow-up #454.
         let outcome1 = {
             let WorkerEngine::Inline(engine) = &mut dev.worker.engine;
             drain_bracket_impl(
@@ -985,11 +1008,8 @@ use virtio_queue::mock::MockSplitQueue;
         assert!(dev.worker.state().currently_stalled);
         assert_eq!(c.throttled_count.load(Ordering::Relaxed), 1);
 
-        // Re-pin so the second drain ALSO sees an empty bucket.
-        dev.worker
-            .state_mut()
-            .ops_bucket
-            .set_last_refill_for_test(std::time::Instant::now());
+        // The forced-nanos seam pinned the deficit on outcome1 and
+        // remains in effect for outcome2 — no re-pinning needed.
 
         // Second back-to-back call — re-stall (no refill).
         let outcome2 = {
@@ -1003,7 +1023,9 @@ use virtio_queue::mock::MockSplitQueue;
             )
         };
         // Same pinned wait_nanos as outcome1 — re-stall on an
-        // unchanged bucket repeats the same deficit math.
+        // unchanged bucket repeats the same deficit math, and the
+        // forced-nanos seam holds the value steady regardless of
+        // wall-time elapsed between the two drains.
         assert!(
             matches!(
                 outcome2,
@@ -1388,39 +1410,18 @@ use virtio_queue::mock::MockSplitQueue;
     ///   wait_nanos value the assertion below references.
     #[test]
     fn currently_throttled_gauge_bytes_only_stall_and_retry() {
-        let cap = 4096u64;
-        let f = make_backed_file_with_pattern(cap, 0xAB);
-        let throttle = DiskThrottle {
-            iops: NonZeroU64::new(16),
-            bytes_per_sec: NonZeroU64::new(512),
-            iops_burst_capacity: None,
-            bytes_burst_capacity: None,
-        };
-        let mut dev = VirtioBlk::new(f, cap, throttle);
         let mem = make_chain_test_mem();
-        let mock = MockSplitQueue::create(&mem, GuestAddress(0), 16);
+        // iops_rate=16 leaves the iops bucket non-empty (request
+        // costs 1 token); bytes_rate=512 matches the chain's
+        // 1-segment 512-byte data so the bucket drains exactly to
+        // the 1_000_000_000 ns deficit on stall.
+        let mut dev = setup_bytes_only_drained_chain(&mem, 16, 512);
 
-        // Drain ONLY the bytes bucket so the first drain stalls on
-        // bytes alone. Pin both buckets' last_refill so the
-        // bucket arithmetic doesn't passively grant or revoke
-        // tokens between assertions.
-        let now0 = Instant::now();
-        dev.worker
-            .state_mut()
-            .ops_bucket
-            .set_last_refill_for_test(now0);
-        dev.worker
-            .state_mut()
-            .bytes_bucket
-            .set_last_refill_for_test(now0);
-        assert!(dev.worker.state_mut().bytes_bucket.consume(512));
-        // Re-pin AFTER consume so the next can_consume sees the
-        // drained state at exactly t=now0.
-        dev.worker
-            .state_mut()
-            .bytes_bucket
-            .set_last_refill_for_test(now0);
-        // Sanity: iops can grant 1, bytes cannot grant 512.
+        // Sanity: iops can grant 1, bytes cannot grant 512. The
+        // helper above already pinned both buckets and drained
+        // bytes; these assertions pin the post-helper state so a
+        // regression in the fixture surfaces here, before the
+        // chain-level drain assertions further down.
         assert!(
             dev.worker.state_mut().ops_bucket.can_consume(1),
             "iops bucket must NOT be drained — only bytes is the stall trigger",
@@ -1429,47 +1430,6 @@ use virtio_queue::mock::MockSplitQueue;
             !dev.worker.state_mut().bytes_bucket.can_consume(512),
             "bytes bucket must be drained so the chain stalls on bytes alone",
         );
-
-        let header_addr = GuestAddress(0x4000);
-        let data_addr = GuestAddress(0x5000);
-        let status_addr = GuestAddress(0x6000);
-        write_blk_header(&mem, header_addr, VIRTIO_BLK_T_IN, 0);
-        let descs = [
-            RawDescriptor::from(SplitDescriptor::new(
-                header_addr.0,
-                VIRTIO_BLK_OUTHDR_SIZE as u32,
-                0,
-                0,
-            )),
-            RawDescriptor::from(SplitDescriptor::new(
-                data_addr.0,
-                512,
-                VRING_DESC_F_WRITE as u16,
-                0,
-            )),
-            RawDescriptor::from(SplitDescriptor::new(
-                status_addr.0,
-                1,
-                VRING_DESC_F_WRITE as u16,
-                0,
-            )),
-        ];
-        mock.build_desc_chain(&descs).expect("build chain");
-        dev.set_mem(mem.clone());
-        wire_device_to_mock(&mut dev, &mock);
-
-        // wire_device_to_mock walked the FSM; pin both buckets
-        // again so the elapsed wall time during the FSM walk
-        // doesn't passively grant tokens before the first drain.
-        let now1 = Instant::now();
-        dev.worker
-            .state_mut()
-            .ops_bucket
-            .set_last_refill_for_test(now1);
-        dev.worker
-            .state_mut()
-            .bytes_bucket
-            .set_last_refill_for_test(now1);
 
         let mem_ref = dev.mem.get().expect("mem set above");
         let outcome1 = {

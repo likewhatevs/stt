@@ -728,7 +728,7 @@ impl VirtioBlkCounters {
     /// subsequent kicks against the same hostile state, so one
     /// guest fault produces exactly one bump regardless of how
     /// many notifications follow before reset. A non-zero value
-    /// means the guest violated virtio-v1.2 §2.7.13.3.1 — the
+    /// means the guest violated virtio-v1.2 §2.7.13.3 — the
     /// device is in the "structurally broken queue" state and
     /// will not service IO until the guest issues a virtio reset.
     pub fn invalid_avail_idx_count(&self) -> u64 {
@@ -827,8 +827,10 @@ pub(crate) struct BlkWorkerState {
     /// `Error::InvalidAvailRingIndex` — the avail.idx the guest
     /// published is more than `queue.size` ahead of the device's
     /// `next_avail`, which the virtio spec forbids
-    /// (virtio-v1.2 §2.7.13.3.1: "the driver MUST NOT add a
-    /// descriptor chain longer than 2^32 bytes in total").
+    /// (virtio-v1.2 §2.7.13.3: avail.idx advances monotonically
+    /// at most `queue.size` ahead of the device-side cursor; an
+    /// excursion beyond that distance is the structural-invariant
+    /// violation `iter()` reports as `InvalidAvailRingIndex`).
     /// Without this flag, every subsequent `pop_descriptor_chain`
     /// would re-trip the same error and `enable_notification`
     /// would re-arm immediately, looping the worker forever
@@ -949,6 +951,53 @@ pub(crate) struct SpawnedEngine {
     /// returned state with `let _ = handle.join()`. Both paths
     /// observe the same return value; only the consumer differs.
     pub(crate) handle: Option<thread::JoinHandle<BlkWorkerState>>,
+    /// State reclaimed from a quiesced worker, awaiting respawn at
+    /// the next DRIVER_OK transition. `Some(_)` between
+    /// `reset_engine_spawned` (which joins the old worker, captures
+    /// its state, and stashes it here) and the guest's subsequent
+    /// `STATUS = DRIVER_OK` MMIO write (which `set_status` consumes
+    /// to re-spawn a fresh worker). `None` in all other steady
+    /// states.
+    ///
+    /// # Why deferred
+    ///
+    /// Between `reset()` and DRIVER_OK the guest is rebinding —
+    /// queue addresses are zeroed, `QUEUE_READY` is false, and any
+    /// kick that lands hits the `queues[REQ_QUEUE].ready()` early
+    /// return in `drain_bracket_impl`. A worker spawned eagerly in
+    /// `reset()` would sit in `epoll_wait` consuming a thread for
+    /// an indeterminate window — the guest's rebind sequence may
+    /// take milliseconds to seconds depending on driver
+    /// implementation. Deferring the spawn until DRIVER_OK lifts
+    /// the cost only when there is real work to service. This
+    /// matches cloud-hypervisor's "kill on reset, respawn on
+    /// DRIVER_OK" pattern.
+    ///
+    /// # Race-free invariant
+    ///
+    /// Both `reset_engine_spawned` and `set_status` execute on the
+    /// vCPU thread that received the MMIO write — `reset()` from
+    /// `STATUS = 0` and `set_status` from `STATUS = …`. The two
+    /// run sequentially within a single vCPU thread context, so
+    /// the `respawn_pending` field has no concurrent reader/writer.
+    /// A regression that moved either path off the vCPU thread
+    /// would need to add explicit synchronisation.
+    ///
+    /// # Failure consequences
+    ///
+    /// If `reset_engine_spawned` populated `respawn_pending` but
+    /// `respawn_worker` (called from `set_status` on DRIVER_OK)
+    /// fails to construct fresh fds or spawn the thread, the
+    /// device enters the same permanent-workerless state described
+    /// in `respawn_worker`'s "Failure consequences" section. A
+    /// reset that produces `respawn_pending = None` (the
+    /// `stop_worker_and_reclaim_state` non-Joined outcomes) means
+    /// no state to respawn from; the device is permanently dead.
+    /// In either case `set_status` clears `respawn_pending` to
+    /// avoid a stale state holding scratch buffers and the
+    /// backing-file `File` handle alive past the device's
+    /// effective lifetime.
+    pub(crate) respawn_pending: Option<BlkWorkerState>,
 }
 
 /// Process-wide monotonic counter for VirtioBlk instance IDs. Used
@@ -1169,6 +1218,7 @@ impl VirtioBlk {
                 kick_fd,
                 stop_fd,
                 handle: Some(handle),
+                respawn_pending: None,
             })
         };
 
@@ -1542,7 +1592,8 @@ pub(crate) fn drain_bracket_impl(
     // Hostile-guest defense gate. A previous drain observed
     // `Error::InvalidAvailRingIndex` from `Queue::iter` (the
     // guest's avail.idx was more than `queue.size` ahead of
-    // `next_avail`, violating virtio-v1.2 §2.7.13.3.1). The
+    // `next_avail`, violating virtio-v1.2 §2.7.13.3 avail.idx
+    // semantics). The
     // structural invariant the iterator depends on is broken;
     // every subsequent `iter()` call would re-trip the same
     // error, and `enable_notification` would re-arm
@@ -1679,24 +1730,25 @@ pub(crate) fn drain_bracket_impl(
                 Err(VirtioQueueError::InvalidAvailRingIndex) => {
                     // Hostile-guest poison. The avail.idx is more
                     // than `queue.size` ahead of the device's
-                    // `next_avail` (virtio-v1.2 §2.7.13.3.1
-                    // violation; check sits at queue.rs:707-709
-                    // in `AvailIter::new`). Mark the queue dead
-                    // so future drains short-circuit, bump the
-                    // per-event counter (gated by the flag —
-                    // exactly one bump per poison event
-                    // regardless of re-kicks), and bail without
-                    // calling `enable_notification`. Re-enabling
-                    // notifications would arm the next kick to
-                    // re-trip the same error — a livelock. A full
-                    // virtio reset is the only path back to
-                    // service.
+                    // `next_avail` (virtio-v1.2 §2.7.13.3
+                    // avail.idx-distance violation; check sits at
+                    // queue.rs:707-709 in `AvailIter::new`). Mark
+                    // the queue dead so future drains
+                    // short-circuit, bump the per-event counter
+                    // (gated by the flag — exactly one bump per
+                    // poison event regardless of re-kicks), and
+                    // bail without calling `enable_notification`.
+                    // Re-enabling notifications would arm the
+                    // next kick to re-trip the same error — a
+                    // livelock. A full virtio reset is the only
+                    // path back to service.
                     state.queue_poisoned = true;
                     state.counters.record_invalid_avail_idx();
                     tracing::warn!(
                         "virtio-blk avail.idx exceeds next_avail by more \
-                         than queue.size (virtio-v1.2 §2.7.13.3.1 \
-                         violation); poisoning queue until guest reset"
+                         than queue.size (virtio-v1.2 §2.7.13.3 \
+                         avail.idx-distance violation); poisoning queue \
+                         until guest reset"
                     );
                     break 'outer;
                 }
@@ -1776,8 +1828,13 @@ pub(crate) fn drain_bracket_impl(
                     // writes the 1-byte status to the LAST byte of
                     // the descriptor (`last.addr + last.len - 1`)
                     // so the actual status-bearing position lines
-                    // up with the kernel driver's `virtio_blk_outhdr`
-                    // expectation regardless of leading padding.
+                    // up with the kernel driver's `in_hdr` (the
+                    // device-writable trailing buffer of the
+                    // virtio_blk request, distinct from the
+                    // device-readable `out_hdr` at desc[0]) per
+                    // multi-byte in_hdr formats handled by
+                    // `virtblk_vbr_status` at
+                    // drivers/block/virtio_blk.c:329-332.
                     //
                     // `checked_add` defends against a hostile guest
                     // submitting `last.addr + last.len` near
@@ -3080,14 +3137,58 @@ impl VirtioBlk {
     /// driver bind surfaces -ENODEV without descending into queue
     /// config.
     ///
-    /// Both rejection cases emit a `tracing::warn!` with the
-    /// `driver_features` payload and the offending mask so an operator
-    /// debugging a failed-bind can see which bit broke the negotiation.
+    /// Every rejection path emits a `tracing::warn!` with the
+    /// `device_status` / requested `val` / `new_bits` payload so an
+    /// operator debugging a failed-bind can see which step the FSM
+    /// rejected — clearing-bit attempts, ordering violations, multi-
+    /// bit transitions, and unknown bits all surface explicitly
+    /// rather than as a silent return.
+    ///
+    /// Idempotent re-writes (the requested `val` equals the
+    /// current `device_status`) are a NO-OP, not a rejection: the
+    /// monotone-bit gate accepts them (no bits cleared) and the
+    /// new_bits-zero short-circuit returns without logging.
+    /// Standard drivers go through `virtio_add_status`
+    /// (drivers/virtio/virtio.c:196-200), which writes
+    /// `STATUS = old | NEW_BIT`; `virtio_features_ok`
+    /// (drivers/virtio/virtio.c:230) re-reads via `get_status`
+    /// to confirm the bit stuck. Warning on idempotent re-writes
+    /// would pollute operator logs without surfacing real bugs.
     pub(crate) fn set_status(&mut self, val: u32) {
         if val & self.device_status != self.device_status {
+            // The driver attempted to clear a previously-set bit
+            // without going through the STATUS=0 reset path. Per
+            // virtio-v1.2 §3.1.1 status bits are monotone within
+            // a driver session — clearing requires a full reset.
+            // Logging ensures a buggy driver that "regresses" the
+            // FSM (e.g. clearing FEATURES_OK while keeping
+            // ACKNOWLEDGE) surfaces in the operator's log instead
+            // of vanishing silently.
+            tracing::warn!(
+                device_status = self.device_status,
+                requested = val,
+                "virtio-blk set_status rejected — attempted to clear \
+                 a previously-set status bit without a full reset \
+                 (virtio-v1.2 §3.1.1: status bits are monotone within \
+                 a driver session)"
+            );
             return;
         }
         let new_bits = val & !self.device_status;
+        // Idempotent re-write of the current device_status: the
+        // monotone-bit gate above passed (val is a superset) AND
+        // the requested value adds no new bits. This is a
+        // legitimate driver pattern — the kernel's
+        // `virtio_add_status` (drivers/virtio/virtio.c:196-200)
+        // writes `STATUS = old | NEW_BIT` and a subsequent
+        // `virtio_features_ok` (drivers/virtio/virtio.c:230)
+        // `get_status` read may race a duplicate set, plus an
+        // MMIO probe path may issue a duplicate STATUS write.
+        // Treat as a no-op rather than a rejection so the
+        // rejection-warn path stays a true signal.
+        if new_bits == 0 {
+            return;
+        }
         let valid = match new_bits {
             VIRTIO_CONFIG_S_ACKNOWLEDGE => self.device_status == 0,
             VIRTIO_CONFIG_S_DRIVER => self.device_status == S_ACK,
@@ -3116,15 +3217,40 @@ impl VirtioBlk {
             {
                 self.worker.queues[REQ_QUEUE].set_event_idx(true);
             }
-        } else if new_bits == VIRTIO_CONFIG_S_FEATURES_OK && self.device_status == S_DRV {
-            // Rejection diagnostics on the FEATURES_OK transition
-            // when the driver was otherwise in a legal state to
-            // attempt it (S_DRV reached). Order is significant:
-            // VIRTIO_F_VERSION_1 missing is the most common failure
-            // mode (transitional/legacy driver), so report it first.
-            // Unadvertised-bit rejection cites the exact mask so the
-            // operator can identify the offending feature without
-            // re-deriving `device_features()`.
+            // DRIVER_OK transition: consume any deferred respawn
+            // state stashed by `reset_engine_spawned`. By the time
+            // the guest reaches DRIVER_OK it has walked ACK →
+            // DRIVER → FEATURES_OK, and the queue_config_allowed
+            // gate (S_FEAT && !DRIVER_OK) admitted any
+            // DESC/AVAIL/USED address writes plus QUEUE_NUM /
+            // QUEUE_READY between FEATURES_OK and now. The kernel
+            // virtio-mmio driver's `vm_setup_vq`
+            // (drivers/virtio/virtio_mmio.c:346-444) publishes the
+            // queue addresses and writes `QUEUE_READY=1` in that
+            // window before the DRIVER_OK MMIO write, so the
+            // worker spawned here will find a fully-configured
+            // queue on its first drain attempt.
+            // Production cfg only — the inline-engine test build
+            // has no respawn machinery. See the
+            // `SpawnedEngine::respawn_pending` doc for the full
+            // rationale and race-free invariant.
+            #[cfg(not(test))]
+            if new_bits == VIRTIO_CONFIG_S_DRIVER_OK {
+                self.consume_pending_respawn();
+            }
+            return;
+        }
+        // Rejection paths. The FEATURES_OK case has the richest
+        // diagnostic because it's the only transition with
+        // sub-conditions beyond simple ordering (subset rule +
+        // VERSION_1 mandate); other rejections cite the FSM
+        // ordering violation directly.
+        if new_bits == VIRTIO_CONFIG_S_FEATURES_OK && self.device_status == S_DRV {
+            // FEATURES_OK with the right ordering but the driver
+            // failed the feature-set rules. Report VERSION_1
+            // missing first (most common failure mode for a
+            // legacy/transitional driver); fall through to the
+            // unadvertised-bit case if VERSION_1 is fine.
             if self.driver_features & (1u64 << VIRTIO_F_VERSION_1) == 0 {
                 tracing::warn!(
                     driver_features = ?self.driver_features,
@@ -3144,6 +3270,22 @@ impl VirtioBlk {
                     );
                 }
             }
+        } else {
+            // Generic ordering or unknown-bit rejection: ACK without
+            // device_status==0, DRIVER without ACK, FEATURES_OK from
+            // the wrong predecessor, DRIVER_OK without FEATURES_OK,
+            // or any new_bits that aren't a single virtio-v1.2 status
+            // bit (multi-bit transitions, reserved bits set). Citing
+            // device_status + new_bits lets an operator identify the
+            // ordering violation without rederiving the FSM.
+            tracing::warn!(
+                device_status = self.device_status,
+                requested = val,
+                new_bits = new_bits,
+                "virtio-blk set_status rejected — illegal FSM transition \
+                 (virtio-v1.2 §3.1.1 ordering: ACK → DRIVER → FEATURES_OK \
+                 → DRIVER_OK, one bit at a time)",
+            );
         }
     }
 
@@ -3164,19 +3306,27 @@ impl VirtioBlk {
     ///   running `q.reset()` and re-spawning a fresh worker
     ///   against the post-reset queue.
     ///
-    ///   We diverge here from cloud-hypervisor (which kills the
-    ///   worker on reset and respawns on the next `DRIVER_OK`
-    ///   transition) and firecracker (whose virtio-block device
-    ///   does not implement reset at all — `Reset` returns `None`
-    ///   from the device shim and the transport marks the device
-    ///   FAILED). Respawning eagerly inside `reset()` keeps the
-    ///   device serviceable across a re-bind without a deferred
-    ///   `DRIVER_OK` step; the post-reset window before the guest
-    ///   calls `set_ready(true)` is harmlessly idle because
-    ///   `drain_bracket_impl` is gated on
-    ///   `queues[REQ_QUEUE].ready()` (kicks that land before the
-    ///   guest re-publishes queue addresses are no-ops, not GPA-0
-    ///   writes).
+    ///   We converge with cloud-hypervisor's pattern of stopping
+    ///   the worker on reset and deferring the respawn to the
+    ///   guest's next `DRIVER_OK` transition. We still diverge
+    ///   from firecracker (whose virtio-block device does not
+    ///   implement reset at all — `Reset` returns `None` from the
+    ///   device shim and the transport marks the device FAILED).
+    ///   The reclaimed `BlkWorkerState` is parked in
+    ///   `SpawnedEngine::respawn_pending` until `set_status`
+    ///   observes the `STATUS = DRIVER_OK` MMIO write and calls
+    ///   `consume_pending_respawn`, which builds fresh kick/stop
+    ///   eventfds and a fresh worker thread against the
+    ///   re-bound queue. Between reset and DRIVER_OK no worker
+    ///   thread is alive, so kicks landing on the stale
+    ///   (now-detached) `kick_fd` accumulate harmlessly until the
+    ///   re-bind completes — the fresh worker will iter() over
+    ///   chains the guest enqueued, since chain state lives in
+    ///   guest memory, not the eventfd counter. Deferring saves
+    ///   a thread sitting in `epoll_wait` for the duration of the
+    ///   guest's rebind sequence (queue addresses zeroed,
+    ///   `QUEUE_READY` false) — a window driver implementations
+    ///   can stretch into milliseconds.
     ///
     /// - **Tests (`cfg(test)`):** Inline mode runs `drain_inline`
     ///   synchronously on the caller thread, so by the time
@@ -3252,11 +3402,12 @@ impl VirtioBlk {
         // previous lifetime).
         self.mem_unset_warned.store(false, Ordering::Relaxed);
 
-        // Phase 2 — engine-specific quiesce, queue reset, and
-        // worker respawn (production) or in-place state reset
-        // (test). Both paths leave the engine in a state where no
-        // worker is currently mutating `interrupt_status` /
-        // `irq_evt`.
+        // Phase 2 — engine-specific quiesce and queue reset
+        // (production); respawn deferred to DRIVER_OK via
+        // `consume_pending_respawn`. The `cfg(test)` Inline path
+        // performs an in-place state reset on the caller thread.
+        // Both paths leave the engine in a state where no worker
+        // is currently mutating `interrupt_status` / `irq_evt`.
         #[cfg(test)]
         self.reset_engine_inline();
         #[cfg(not(test))]
@@ -3323,36 +3474,60 @@ impl VirtioBlk {
     }
 
     /// Production engine reset: stop the worker, join, q.reset(),
-    /// rebuild fresh `BlkWorkerState`, respawn. The reclaimed
-    /// state contributes its long-lived resources (backing File,
-    /// scratch capacities, capacity_bytes, read_only, counters
-    /// Arc) — only the throttle buckets are rebuilt from the
-    /// captured `DiskThrottle`.
+    /// stash the reclaimed state in `respawn_pending` for
+    /// `set_status` to consume on the next DRIVER_OK transition.
+    /// The reclaimed state contributes its long-lived resources
+    /// (backing File, scratch capacities, capacity_bytes,
+    /// read_only, counters Arc) — only the throttle buckets are
+    /// rebuilt by `respawn_worker` once DRIVER_OK fires.
+    ///
+    /// Why defer the respawn: between `reset()` and DRIVER_OK
+    /// the guest is rebinding (queue addresses zeroed,
+    /// QUEUE_READY false). A worker spawned eagerly here would
+    /// sit in `epoll_wait` doing nothing for the duration of the
+    /// rebind. See the `SpawnedEngine::respawn_pending` doc for
+    /// the full rationale and race-free invariant.
     #[cfg(not(test))]
     pub(crate) fn reset_engine_spawned(&mut self) {
-        let reclaimed = self.stop_worker_and_reclaim_state();
+        // Detect a back-to-back reset (the guest issued STATUS=0
+        // twice without an intervening DRIVER_OK). The first
+        // reset stashed state in respawn_pending and joined the
+        // worker; the second reset has no live worker to stop
+        // and must NOT overwrite the pending state (the second
+        // `stop_worker_and_reclaim_state` would return None and
+        // clobber the first reset's reclaimed state — the
+        // backing File and counter Arc would be lost). Skip the
+        // worker-quiesce step in that case; the queue reset
+        // below still runs because the guest expects a fresh
+        // queue cursor.
+        let already_pending = {
+            let WorkerEngine::Spawned(eng) = &self.worker.engine;
+            eng.respawn_pending.is_some()
+        };
+        if !already_pending {
+            let reclaimed = self.stop_worker_and_reclaim_state();
+            // Stash the reclaimed state for the deferred respawn.
+            // `set_status` consumes it on the next valid DRIVER_OK
+            // transition. `None` (worker had panicked / timed out /
+            // helper failed) means no state to respawn from — the
+            // device is permanently workerless from this point. The
+            // diagnostic was already logged by
+            // `stop_worker_and_reclaim_state`; the WorkerEngine
+            // remains in `Spawned` form with `handle: None` and
+            // `respawn_pending: None`, so future kicks land on the
+            // stale `kick_fd` and accumulate harmlessly until the
+            // device is destroyed. Only constructing a fresh
+            // `VirtioBlk` recovers IO service.
+            let WorkerEngine::Spawned(eng) = &mut self.worker.engine;
+            eng.respawn_pending = reclaimed;
+        }
         // q.reset() runs uncontested: the worker thread is joined
-        // and no new one has been spawned yet, so the QueueSync
-        // mutex has no other holder.
+        // (or was never alive in the back-to-back-reset case) and
+        // no new one has been spawned yet, so the QueueSync mutex
+        // has no other holder.
         for q in &mut self.worker.queues {
             q.reset();
         }
-        if let Some(state) = reclaimed {
-            self.respawn_worker(state);
-        }
-        // Permanent device death path. If `reclaimed` is None the
-        // previous worker had already been joined (handle Option
-        // emptied) — typical causes: an earlier reset already
-        // tore the worker down, or the worker panicked and
-        // `handle.join()` returned `Err`. There is no state to
-        // recycle, so we cannot respawn. The device is now
-        // permanently workerless: future kicks land on the stale
-        // `kick_fd` of the old (now-empty) `SpawnedEngine` and
-        // accumulate harmlessly, but no IO completes — guests
-        // hang on every request until
-        // `kernel.hung_task_timeout_secs` (default 120 s) fires.
-        // Only constructing a fresh `VirtioBlk` recovers IO
-        // service. Logged in `stop_worker_and_reclaim_state`.
     }
 
     /// Production: send STOP_TOKEN to the worker, join the
@@ -3406,16 +3581,6 @@ impl VirtioBlk {
     #[cfg(not(test))]
     pub(crate) fn stop_worker_and_reclaim_state(&mut self) -> Option<BlkWorkerState> {
         let WorkerEngine::Spawned(eng) = &mut self.worker.engine;
-        // EAGAIN is implausible on a fresh counter-0 eventfd —
-        // saturation requires u64::MAX-1 unbalanced writes, which
-        // does not happen because each `reset()` paired with
-        // `respawn_worker` allocates a fresh `stop_fd`. If EAGAIN
-        // ever occurs (e.g. a regression hands the worker a
-        // long-lived stop_fd whose counter accumulated stale
-        // writes), the subsequent join's RESET_JOIN_TIMEOUT
-        // budget bounds the wait to 1 s and surfaces the stall
-        // through the TimedOut diagnostic below.
-        let _ = eng.stop_fd.write(1);
         // Capture device-identifier fields before the
         // `eng.handle.take()` consumes the Option, so the
         // diagnostic warns can name the wedged device without
@@ -3423,6 +3588,14 @@ impl VirtioBlk {
         let stop_fd = eng.stop_fd.as_raw_fd();
         let capacity_sectors = self.capacity_sectors;
         let instance_id = self.instance_id;
+        // Signal the worker to exit via the stop_fd helper, which
+        // retries on EAGAIN (eventfd counter saturation) up to
+        // STOP_FD_WRITE_MAX_RETRIES times before giving up. On
+        // exhaustion the worker may not observe the stop signal;
+        // the subsequent join's RESET_JOIN_TIMEOUT budget bounds
+        // the wait to 1 s and surfaces the stall through the
+        // TimedOut diagnostic below.
+        signal_worker_stop(&eng.stop_fd, stop_fd, instance_id, capacity_sectors);
         // Re-borrow eng after the immutable reads above — needed
         // because `take()` mutates the Option.
         let WorkerEngine::Spawned(eng) = &mut self.worker.engine;
@@ -3491,6 +3664,33 @@ impl VirtioBlk {
         }
     }
 
+    /// Drain any state stashed in `SpawnedEngine::respawn_pending`
+    /// by a prior `reset_engine_spawned` call and pass it to
+    /// `respawn_worker`. Called by `set_status` on the DRIVER_OK
+    /// transition — the only legal point at which the guest has
+    /// finished publishing fresh queue addresses and the worker
+    /// has real work to service.
+    ///
+    /// `respawn_pending` is `take()`-ed unconditionally even when
+    /// `respawn_worker` itself fails to construct fresh fds or
+    /// spawn the thread. This avoids leaving stale state holding
+    /// scratch buffers and the backing-file `File` handle alive
+    /// past the device's effective lifetime — the failure
+    /// diagnostics from `respawn_worker` already document the
+    /// permanent-workerless outcome. A second DRIVER_OK with no
+    /// pending state (e.g. the guest re-binds without an
+    /// intervening reset) is a no-op.
+    #[cfg(not(test))]
+    pub(crate) fn consume_pending_respawn(&mut self) {
+        let pending = {
+            let WorkerEngine::Spawned(eng) = &mut self.worker.engine;
+            eng.respawn_pending.take()
+        };
+        if let Some(state) = pending {
+            self.respawn_worker(state);
+        }
+    }
+
     /// Production: build a fresh `SpawnedEngine` (new kick_fd,
     /// stop_fd, worker thread) seeded with the reclaimed
     /// `BlkWorkerState`, and replace `self.worker.engine`. The
@@ -3556,6 +3756,27 @@ impl VirtioBlk {
         // already incremented), and a hung vCPU mid-write to the
         // old kick_fd has nothing to coalesce against. Fresh fds
         // give a clean slate.
+        //
+        // The OLD worker's timerfd is owned by `worker_thread_main`'s
+        // stack frame and dropped on STOP_TOKEN exit; we do NOT
+        // need to migrate it. By the time this respawn runs:
+        //   * `q.reset()` (called by the parent `reset_engine_spawned`
+        //     just above this respawn) cleared the queue cursor —
+        //     any chain that was rolled back via `set_next_avail`
+        //     is gone from the device's perspective.
+        //   * `state.ops_bucket` and `state.bytes_bucket` are
+        //     rebuilt from `self.throttle` to full capacity, so
+        //     the new worker's first drain attempt will not stall
+        //     on a refill deficit (no timerfd needs to be armed
+        //     for a chain that never re-stalls).
+        //   * The guest must rebind (publish fresh queue addresses
+        //     and set `QUEUE_READY = 1`) before any kick can fire.
+        //     Until then `drain_bracket_impl` short-circuits on
+        //     the `queues[REQ_QUEUE].ready()` gate — no drain, no
+        //     stall, no need for a pending timerfd.
+        // The clean-state contract above means a new timerfd
+        // arms naturally on the first post-rebind stall, exactly
+        // when one is needed.
         let kick_fd = match EventFd::new(libc::EFD_NONBLOCK) {
             Ok(fd) => fd,
             Err(e) => {
@@ -3640,8 +3861,94 @@ impl VirtioBlk {
             kick_fd,
             stop_fd,
             handle: Some(handle),
+            respawn_pending: None,
         };
     }
+}
+
+/// Maximum number of retries [`signal_worker_stop`] performs when
+/// `EventFd::write` returns `WouldBlock` (EAGAIN). The eventfd
+/// counter saturates at `u64::MAX - 1`; reaching that value
+/// requires `~2^64` unbalanced writes, which the device never
+/// emits — each `reset()`/`Drop` writes the stop_fd exactly once
+/// per fresh fd allocation. The retry loop exists strictly as
+/// defense-in-depth against a future regression that re-uses a
+/// long-lived stop_fd (or any other path that could let the
+/// counter accumulate). 4 retries with `thread::yield_now`
+/// between each gives the worker thread (running on the same
+/// CPU under contention) a chance to drain the counter via its
+/// `epoll_wait → read` cycle.
+#[cfg(not(test))]
+const STOP_FD_WRITE_MAX_RETRIES: u32 = 4;
+
+/// Best-effort signal to the worker thread to exit by writing 1
+/// to its `stop_fd`. Retries up to [`STOP_FD_WRITE_MAX_RETRIES`]
+/// times on `WouldBlock` (EAGAIN — counter saturation),
+/// yielding the scheduler between attempts so a co-located
+/// worker can drain the eventfd counter. Logs the per-attempt
+/// failure so the operator can see the rare path even when the
+/// retry succeeds.
+///
+/// On exhaustion: log a structured warn and return — the caller
+/// (`Drop` / `stop_worker_and_reclaim_state`) proceeds to the
+/// join-with-timeout path. If the stop signal never reaches the
+/// worker the join will time out and the existing
+/// permanent-workerless diagnostic surfaces. The retry exists to
+/// surface the failure-path itself; it does NOT promise the
+/// worker will exit (only the join timeout does).
+///
+/// `device_id` is the per-device tracing tuple (stop_fd raw fd,
+/// instance_id, capacity_sectors) so a warn can correlate to
+/// the wedged device without the caller plumbing the same
+/// fields through. Free function (not method) so the borrow is
+/// limited to the EventFd reference; the caller still owns
+/// `&mut self.worker.engine`.
+#[cfg(not(test))]
+pub(crate) fn signal_worker_stop(
+    stop_fd: &EventFd,
+    raw_fd: std::os::unix::io::RawFd,
+    instance_id: u64,
+    capacity_sectors: u64,
+) {
+    for attempt in 0..STOP_FD_WRITE_MAX_RETRIES {
+        match stop_fd.write(1) {
+            Ok(()) => return,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                tracing::warn!(
+                    attempt,
+                    stop_fd = raw_fd,
+                    instance_id,
+                    capacity_sectors,
+                    "virtio-blk stop_fd write returned WouldBlock; \
+                     eventfd counter likely saturated. Yielding and retrying"
+                );
+                std::thread::yield_now();
+            }
+            Err(e) => {
+                tracing::error!(
+                    attempt,
+                    stop_fd = raw_fd,
+                    instance_id,
+                    capacity_sectors,
+                    %e,
+                    "virtio-blk stop_fd write failed with non-EAGAIN error; \
+                     worker may not observe the stop signal — \
+                     downstream join will surface the timeout"
+                );
+                return;
+            }
+        }
+    }
+    tracing::error!(
+        max_retries = STOP_FD_WRITE_MAX_RETRIES,
+        stop_fd = raw_fd,
+        instance_id,
+        capacity_sectors,
+        "virtio-blk stop_fd write exhausted retries on WouldBlock; \
+         worker did not consume the eventfd counter in time — \
+         downstream join will surface the timeout and the device \
+         enters the permanent-workerless state"
+    );
 }
 
 /// Upper bound on how long [`VirtioBlk::drop`] will block while
@@ -3925,10 +4232,11 @@ impl Drop for VirtioBlk {
         //
         // The cfg(test) Inline arm doesn't consume these
         // snapshots; the `let _ = (capacity_sectors, instance_id);`
-        // reference inside that arm is what keeps cfg(test)
-        // builds free of `unused_variables` lints. (`stop_fd` is
-        // read inside the cfg(not(test)) Spawned arm directly,
-        // so it doesn't need the same dead-code dance.)
+        // reference inside that arm satisfies the
+        // `unused_variables` lint under cfg(test) where the
+        // Spawned arm is excluded. (`stop_fd` is read inside the
+        // cfg(not(test)) Spawned arm directly, so it doesn't
+        // need the same dead-code dance.)
         let capacity_sectors = self.capacity_sectors;
         let instance_id = self.instance_id;
         match &mut self.worker.engine {
@@ -3941,15 +4249,16 @@ impl Drop for VirtioBlk {
             }
             #[cfg(not(test))]
             WorkerEngine::Spawned(eng) => {
-                // Signal the worker to exit. The eventfd write is
-                // non-blocking; if it fails (EAGAIN — counter
-                // saturated) the worker is already in the act of
-                // being woken so a missed write is benign.
-                let _ = eng.stop_fd.write(1);
                 // The third device-identifier field (`stop_fd`
                 // raw fd) is only meaningful in the Spawned
                 // arm — Inline mode has no eventfd to name.
                 let stop_fd = eng.stop_fd.as_raw_fd();
+                // Signal the worker to exit via the stop_fd
+                // helper, which retries on EAGAIN (eventfd
+                // counter saturation) up to STOP_FD_WRITE_MAX_RETRIES
+                // times before giving up. On exhaustion the join
+                // below absorbs the failure via DROP_JOIN_TIMEOUT.
+                signal_worker_stop(&eng.stop_fd, stop_fd, instance_id, capacity_sectors);
                 if let Some(handle) = eng.handle.take() {
                     match join_worker_with_timeout(handle, DROP_JOIN_TIMEOUT) {
                         JoinWithTimeoutOutcome::Joined(_state) => {

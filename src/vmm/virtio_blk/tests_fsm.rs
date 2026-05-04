@@ -1492,6 +1492,113 @@ use vm_memory::Address;
         assert_eq!(dev.device_status, 0);
     }
 
+    /// Idempotent re-write of the current `device_status` is a
+    /// no-op — the value is unchanged AND no rejection diagnostic
+    /// fires. Standard drivers (the kernel virtio_mmio /
+    /// virtio_pci `vp_finalize_features` path) write
+    /// `STATUS = old | NEW_BIT` and re-read; an MMIO probe path
+    /// may also issue a duplicate write of the current status.
+    /// Pinning this contract prevents a spurious "illegal FSM
+    /// transition" warn from polluting operator logs on a
+    /// well-formed driver. Distinct from
+    /// `status_skip_acknowledge_rejected` which exercises a true
+    /// ordering violation.
+    #[tracing_test::traced_test]
+    #[test]
+    fn status_idempotent_rewrite_is_noop() {
+        let mut dev = make_device(VIRTIO_BLK_DEFAULT_CAPACITY_BYTES, DiskThrottle::default());
+        // Reach S_ACK first via a legal transition.
+        write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_ACK);
+        assert_eq!(dev.device_status, S_ACK);
+        // Idempotent re-write of the same value: state unchanged,
+        // no warn emitted.
+        write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_ACK);
+        assert_eq!(
+            dev.device_status, S_ACK,
+            "idempotent re-write must NOT alter device_status",
+        );
+        assert!(
+            !logs_contain("illegal FSM transition"),
+            "idempotent re-write must NOT emit the illegal-transition warn",
+        );
+        assert!(
+            !logs_contain("attempted to clear"),
+            "idempotent re-write must NOT emit the clear-bit warn",
+        );
+        // Same idempotence at later FSM states. Walk to S_DRV and
+        // re-write S_DRV.
+        write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_DRV);
+        assert_eq!(dev.device_status, S_DRV);
+        write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_DRV);
+        assert_eq!(dev.device_status, S_DRV);
+        assert!(
+            !logs_contain("illegal FSM transition"),
+            "S_DRV re-write must NOT emit the illegal-transition warn",
+        );
+    }
+
+    /// Writing a multi-bit transition (two new bits at once, e.g.
+    /// `S_DRV | S_FEAT` from `S_ACK` instead of one step at a
+    /// time) is rejected by the FSM and emits a warn. Per virtio-v1.2
+    /// §3.1.1 the driver must walk the FSM one bit at a time so
+    /// the device can validate each step's preconditions.
+    #[tracing_test::traced_test]
+    #[test]
+    fn status_multi_bit_transition_rejected_and_logged() {
+        let mut dev = make_device(VIRTIO_BLK_DEFAULT_CAPACITY_BYTES, DiskThrottle::default());
+        write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_ACK);
+        // From S_ACK, a single legal transition is to S_DRV. Two
+        // bits at once (S_DRV | VIRTIO_CONFIG_S_FEATURES_OK) is a
+        // multi-bit transition the FSM must reject.
+        write_reg(
+            &mut dev,
+            VIRTIO_MMIO_STATUS,
+            S_ACK | VIRTIO_CONFIG_S_DRIVER | VIRTIO_CONFIG_S_FEATURES_OK,
+        );
+        assert_eq!(
+            dev.device_status, S_ACK,
+            "multi-bit transition must NOT advance device_status",
+        );
+        assert!(
+            logs_contain("illegal FSM transition"),
+            "multi-bit transition must emit the illegal-transition warn so \
+             a buggy driver surfaces in the operator log",
+        );
+    }
+
+    /// Attempting to clear a previously-set status bit (without a
+    /// full STATUS=0 reset) is rejected by the monotone-bit gate
+    /// at the head of `set_status` and emits the dedicated
+    /// "attempted to clear" warn. Per virtio-v1.2 §3.1.1 status
+    /// bits are monotone within a driver session — the only path
+    /// from a higher state back to lower is STATUS=0.
+    #[tracing_test::traced_test]
+    #[test]
+    fn status_clear_bit_rejected_and_logged() {
+        let mut dev = make_device(VIRTIO_BLK_DEFAULT_CAPACITY_BYTES, DiskThrottle::default());
+        // Walk to S_DRV (S_ACK | S_DRIVER set).
+        write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_ACK);
+        write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_DRV);
+        assert_eq!(dev.device_status, S_DRV);
+        // Attempt to drop S_DRIVER while keeping S_ACKNOWLEDGE.
+        // val = S_ACK; val & device_status = S_ACK != device_status
+        // (S_DRV) → fails the monotone-bit gate.
+        write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_ACK);
+        assert_eq!(
+            dev.device_status, S_DRV,
+            "clear-bit attempt must NOT alter device_status",
+        );
+        assert!(
+            logs_contain("attempted to clear"),
+            "clear-bit attempt must emit the dedicated clear-bit warn",
+        );
+        assert!(
+            !logs_contain("illegal FSM transition"),
+            "clear-bit path must NOT emit the generic illegal-transition warn — \
+             the dedicated clear-bit warn is the right diagnostic",
+        );
+    }
+
     /// Once `DRIVER_OK` is set, queue config writes (here
     /// `QUEUE_NUM`) MUST be rejected by `queue_config_allowed`. The
     /// FSM gate is `S_FEAT && !DRIVER_OK`, so a `QUEUE_NUM` write
