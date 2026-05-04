@@ -429,7 +429,23 @@ impl<'a> CgroupGroup<'a> {
     }
 
     /// Create a cgroup and set its cpuset. The cgroup is tracked for cleanup on drop.
+    ///
+    /// Auto-enables [`Controller::Cpuset`](crate::cgroup::Controller::Cpuset)
+    /// on the parent's `cgroup.subtree_control` before creating the
+    /// child so the child's `cpuset.cpus` file is exposed and the
+    /// subsequent [`set_cpuset`](crate::cgroup::CgroupOps::set_cpuset)
+    /// write lands. Direct CgroupGroup users (the `custom_*` scenarios
+    /// in [`crate::scenario::nested`] / [`crate::scenario::stress`])
+    /// don't go through [`run_scenario`](crate::scenario::ops::execute_steps)'s
+    /// controller-resolution hook, so the controller enable has to
+    /// happen here. The setup call is idempotent on real cgroupfs (a
+    /// `+cpuset` write into `cgroup.subtree_control` that already
+    /// contains `cpuset` is a no-op at the kernel level per
+    /// `cgroup_subtree_control_write` in kernel/cgroup/cgroup.c).
     pub fn add_cgroup(&mut self, name: &str, cpuset: &BTreeSet<usize>) -> Result<()> {
+        let mut required = BTreeSet::new();
+        required.insert(crate::cgroup::Controller::Cpuset);
+        self.cgroups.setup(&required)?;
         self.cgroups.create_cgroup(name)?;
         self.cgroups.set_cpuset(name, cpuset)?;
         self.names.push(name.to_string());
@@ -437,6 +453,16 @@ impl<'a> CgroupGroup<'a> {
     }
 
     /// Create a cgroup without a cpuset. The cgroup is tracked for cleanup on drop.
+    ///
+    /// No controller enablement: callers explicitly opting out of a
+    /// cpuset signal that they don't need any cgroup v2 controller
+    /// surface beyond the cgroup-core knobs (`cgroup.procs`,
+    /// `cgroup.freeze`) which are ungated. If a future caller needs
+    /// e.g. memory limits on a no-cpuset cgroup, add a
+    /// `with_controllers` overload rather than auto-enabling — the
+    /// "no-cpuset" name is load-bearing for the absent-controller
+    /// behavior pinned by tests in
+    /// [`crate::scenario::nested::custom_nested_cgroup_no_ctrl`].
     pub fn add_cgroup_no_cpuset(&mut self, name: &str) -> Result<()> {
         self.cgroups.create_cgroup(name)?;
         self.names.push(name.to_string());
@@ -1853,7 +1879,10 @@ mod tests {
         fn parent_path(&self) -> &std::path::Path {
             &self.parent
         }
-        fn setup(&self, _: bool) -> Result<()> {
+        fn setup(
+            &self,
+            _: &std::collections::BTreeSet<crate::cgroup::Controller>,
+        ) -> Result<()> {
             Ok(())
         }
         fn create_cgroup(&self, _: &str) -> Result<()> {

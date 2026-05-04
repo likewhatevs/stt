@@ -670,6 +670,81 @@ pub fn execute_steps_with(
     execute_scenario_with(ctx, backdrop::Backdrop::EMPTY, steps, checks)
 }
 
+/// Compute the union of cgroup v2 controllers required by a Backdrop
+/// + Step sequence. Walks every [`CgroupDef`] declaration and every
+/// [`Op`] variant, returning the smallest set of controllers that
+/// must be enabled in `cgroup.subtree_control` for the scenario's
+/// per-knob writes to land.
+///
+/// Mapping:
+/// - [`CgroupDef::cpuset`] / [`CgroupDef::cpuset_mems`] → [`Controller::Cpuset`]
+/// - [`CgroupDef::cpu`] → [`Controller::Cpu`]
+/// - [`CgroupDef::memory`] → [`Controller::Memory`]
+/// - [`CgroupDef::pids`] → [`Controller::Pids`]
+/// - [`CgroupDef::io`] → [`Controller::Io`]
+/// - [`Op::SetCpuset`] / [`Op::ClearCpuset`] / [`Op::SwapCpusets`] /
+///   [`Op::SetAffinity`] → [`Controller::Cpuset`]
+/// - Every other [`Op`] variant ([`Op::FreezeCgroup`],
+///   [`Op::AddCgroup`], [`Op::Spawn`], [`Op::MoveAllTasks`], etc.)
+///   touches cgroup-core knobs (`cgroup.freeze`, `cgroup.procs`,
+///   `mkdir`/`rmdir`) which are ungated by any controller and
+///   contribute nothing to this set.
+///
+/// Returning the SMALLEST set lets a test that intentionally
+/// requires the absence of a controller (e.g. testing behavior on
+/// a kernel without `+cpu`) get an empty subtree_control write.
+fn required_controllers(
+    ctx: &Ctx,
+    backdrop: &backdrop::Backdrop,
+    steps: &[Step],
+) -> BTreeSet<crate::cgroup::Controller> {
+    use crate::cgroup::Controller;
+    fn absorb_def(set: &mut BTreeSet<Controller>, def: &CgroupDef) {
+        if def.cpuset.is_some() || def.cpuset_mems.is_some() {
+            set.insert(Controller::Cpuset);
+        }
+        if def.cpu.is_some() {
+            set.insert(Controller::Cpu);
+        }
+        if def.memory.is_some() {
+            set.insert(Controller::Memory);
+        }
+        if def.io.is_some() {
+            set.insert(Controller::Io);
+        }
+        if def.pids.is_some() {
+            set.insert(Controller::Pids);
+        }
+    }
+    fn absorb_op(set: &mut BTreeSet<Controller>, op: &Op) {
+        if matches!(
+            op,
+            Op::SetCpuset { .. }
+                | Op::ClearCpuset { .. }
+                | Op::SwapCpusets { .. }
+                | Op::SetAffinity { .. }
+        ) {
+            set.insert(Controller::Cpuset);
+        }
+    }
+    let mut set = BTreeSet::new();
+    for def in &backdrop.cgroups {
+        absorb_def(&mut set, def);
+    }
+    for op in &backdrop.ops {
+        absorb_op(&mut set, op);
+    }
+    for step in steps {
+        for def in step.setup.resolve(ctx) {
+            absorb_def(&mut set, &def);
+        }
+        for op in &step.ops {
+            absorb_op(&mut set, op);
+        }
+    }
+    set
+}
+
 /// Internal driver: runs Backdrop setup, the Step loop with
 /// per-Step teardown, and final Backdrop teardown.
 fn run_scenario(
@@ -721,6 +796,16 @@ fn run_scenario(
         }
     }
     let effective_checks = checks.unwrap_or(&ctx.assert);
+
+    // Enable the controllers this scenario actually needs in
+    // `cgroup.subtree_control` BEFORE any cgroupfs writes land. The
+    // union is computed from every CgroupDef and Op declared in the
+    // backdrop+steps; tests that declare no controller-gated knobs
+    // get an empty set (parent dir created, no subtree_control walk).
+    let required = required_controllers(ctx, &backdrop, &steps);
+    ctx.cgroups
+        .setup(&required)
+        .context("enable cgroup controllers in subtree_control")?;
 
     let mut backdrop_state = BackdropState::empty(ctx);
     let mut result = AssertResult::pass();
@@ -4092,7 +4177,7 @@ mod tests {
     /// because PIDs are unpredictable between runs.
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum CgroupCall {
-        Setup(bool),
+        Setup(BTreeSet<crate::cgroup::Controller>),
         CreateCgroup(String),
         RemoveCgroup(String),
         SetCpuset(String, BTreeSet<usize>),
@@ -4169,8 +4254,8 @@ mod tests {
         fn parent_path(&self) -> &Path {
             &self.parent
         }
-        fn setup(&self, enable_cpu_controller: bool) -> Result<()> {
-            self.record(CgroupCall::Setup(enable_cpu_controller))
+        fn setup(&self, controllers: &BTreeSet<crate::cgroup::Controller>) -> Result<()> {
+            self.record(CgroupCall::Setup(controllers.clone()))
         }
         fn create_cgroup(&self, name: &str) -> Result<()> {
             self.record(CgroupCall::CreateCgroup(name.to_string()))

@@ -701,9 +701,13 @@ fn build_dispatch_ctx_parts(
     };
     let cgroup_root = resolve_cgroup_root(args);
     let cgroups = crate::cgroup::CgroupManager::new(&cgroup_root);
-    if let Err(e) = cgroups.setup(false) {
-        eprintln!("ktstr_test: cgroup setup failed: {e}");
-    }
+    // Setup is deferred to `apply_setup` in the scenario runtime: it
+    // walks the test's CgroupDef declarations to compute the controller
+    // set the test actually needs, then invokes `cgroups.setup(&controllers)`
+    // with that exact set. Calling setup() here would either over-enable
+    // controllers (a test that requires the absence of a controller
+    // would fail) or under-enable them (the test's set_cpuset/set_memory
+    // call would fail with bare ENOENT/EACCES at the knob-write site).
     let sched_pid = std::env::var("SCHED_PID")
         .ok()
         .and_then(|s| s.parse::<libc::pid_t>().ok())

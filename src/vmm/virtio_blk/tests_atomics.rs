@@ -496,7 +496,7 @@ use virtio_queue::mock::MockSplitQueue;
         let counters = Arc::new(VirtioBlkCounters::default());
         const NUM_WRITERS: u32 = 8;
         const ITERATIONS_PER_WRITER: u32 = 5_000;
-        let barrier = Arc::new(Barrier::new(NUM_WRITERS as usize + 1));
+        let barrier = Arc::new(Barrier::new(NUM_WRITERS as usize + 2));
         let mut handles = Vec::with_capacity(NUM_WRITERS as usize);
         for _ in 0..NUM_WRITERS {
             let c_w = Arc::clone(&counters);

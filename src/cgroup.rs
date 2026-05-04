@@ -40,12 +40,60 @@
 //! validates it before any filesystem write.
 
 use crate::topology::TestTopology;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
+
+/// Cgroup v2 controllers that [`CgroupManager::setup`] can enable in
+/// `cgroup.subtree_control`.
+///
+/// Each variant maps to a literal token the kernel parses in
+/// `cgroup_subtree_control_write`. The enum is exhaustive over the
+/// controllers the framework's [`CgroupOps`] surface actually writes
+/// to (cpuset, cpu, memory, pids, io); cgroup-core knobs
+/// (`cgroup.freeze`, `cgroup.procs`) are not gated by any controller
+/// and never appear here.
+///
+/// Callers pass a `BTreeSet<Controller>` to `setup` — sets compose
+/// naturally across nested CgroupDef declarations and the deterministic
+/// `BTreeSet` iteration order keeps the rendered subtree_control write
+/// stable between runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Controller {
+    /// `+cpuset` — gates `cpuset.cpus`, `cpuset.cpus.effective`,
+    /// `cpuset.mems`, `cpuset.mems.effective` files on every child.
+    Cpuset,
+    /// `+cpu` — gates `cpu.max`, `cpu.weight`, `cpu.weight.nice`,
+    /// `cpu.stat`, `cpu.pressure` files on every child.
+    Cpu,
+    /// `+memory` — gates `memory.max`, `memory.high`, `memory.low`,
+    /// `memory.min`, `memory.current`, `memory.swap.max`,
+    /// `memory.events`, `memory.stat`, `memory.pressure` files.
+    Memory,
+    /// `+pids` — gates `pids.max`, `pids.current`, `pids.events` files.
+    Pids,
+    /// `+io` — gates `io.max`, `io.weight`, `io.bfq.weight`,
+    /// `io.stat`, `io.pressure` files.
+    Io,
+}
+
+impl Controller {
+    /// Kernel token written to `cgroup.subtree_control` (the bare name
+    /// without the `+`/`-` prefix; see [`Self::as_subtree_control_add`]
+    /// for the full token).
+    pub fn name(self) -> &'static str {
+        match self {
+            Controller::Cpuset => "cpuset",
+            Controller::Cpu => "cpu",
+            Controller::Memory => "memory",
+            Controller::Pids => "pids",
+            Controller::Io => "io",
+        }
+    }
+}
 
 /// Default timeout for cgroup filesystem writes. Normally <1ms; 2s catches
 /// real hangs without waiting so long the test result is meaningless.
@@ -213,6 +261,75 @@ fn is_ebusy(err: &anyhow::Error) -> bool {
     anyhow_first_io_errno(err) == Some(libc::EBUSY)
 }
 
+/// Snapshot the cgroup-tree state at the moment a cpuset.cpus
+/// write fails, for diagnostic attachment to the returned error.
+///
+/// Captures (per the diagnostic contract on
+/// [`CgroupManager::set_cpuset`]):
+/// - the parent's `cgroup.controllers` (controllers AVAILABLE for
+///   children — confirms whether subtree_control already
+///   propagated to this child)
+/// - the parent's `cgroup.subtree_control` (controllers ENABLED
+///   for children — what setup() last wrote)
+/// - the child's `cgroup.controllers` (the set children of the
+///   CHILD inherit — useful for nested cgroups)
+/// - whether `cpuset.cpus` exists at the child (distinguishes a
+///   "controller never propagated" failure mode from a
+///   "kernel rejected this specific value" failure mode)
+/// - the child's directory listing (so an unexpected presence/
+///   absence of any cgroupfs knob is visible)
+///
+/// Read failures inside the snapshot are folded into the snapshot
+/// string as `<read failed: {err}>` rather than propagating —
+/// the caller's error path is what the caller cares about; the
+/// snapshot is best-effort instrumentation.
+fn capture_cpuset_state(parent: &Path, name: &str) -> String {
+    let child = parent.join(name);
+    let parent_controllers = read_or_label(&parent.join("cgroup.controllers"));
+    let parent_subtree_control = read_or_label(&parent.join("cgroup.subtree_control"));
+    let child_controllers = read_or_label(&child.join("cgroup.controllers"));
+    let cpuset_cpus_exists = child.join("cpuset.cpus").exists();
+    let child_listing = match fs::read_dir(&child) {
+        Ok(entries) => {
+            let mut names: Vec<String> = entries
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort_unstable();
+            format!("[{}]", names.join(", "))
+        }
+        Err(e) => format!("<read_dir failed: {e}>"),
+    };
+    format!(
+        "cgroup-state-snapshot: \
+         parent={} name={} \
+         parent.cgroup.controllers={:?} \
+         parent.cgroup.subtree_control={:?} \
+         child.cgroup.controllers={:?} \
+         child.cpuset.cpus.exists={} \
+         child.listing={}",
+        parent.display(),
+        name,
+        parent_controllers,
+        parent_subtree_control,
+        child_controllers,
+        cpuset_cpus_exists,
+        child_listing,
+    )
+}
+
+/// Read `path` to a string for snapshotting, returning a
+/// `<...>` placeholder if the read fails. Used by
+/// [`capture_cpuset_state`] so a missing or permission-denied
+/// snapshot field shows up as a labeled placeholder rather than
+/// killing the whole snapshot.
+fn read_or_label(path: &Path) -> String {
+    match fs::read_to_string(path) {
+        Ok(s) => s.trim().to_string(),
+        Err(e) => format!("<read failed: {e}>"),
+    }
+}
+
 /// RAII manager for cgroup v2 filesystem operations.
 ///
 /// Creates, configures, and removes cgroups under a parent directory.
@@ -234,23 +351,39 @@ impl CgroupManager {
         &self.parent
     }
 
-    /// Create the parent directory and enable cgroup controllers
-    /// (cpuset, optionally cpu, plus memory + pids + io unconditionally).
+    /// Create the parent directory and enable the requested cgroup
+    /// controllers in every ancestor `cgroup.subtree_control` between
+    /// `/sys/fs/cgroup` and `self.parent`.
     ///
-    /// `enable_cpu_controller` gates `+cpu` only — the memory, pids, and
-    /// io controllers are always enabled because the test framework's
-    /// CgroupDef builders (examples include memory_max, pids_max, io_weight,
-    /// memory_swap_max) can land on any cgroup the test author defines,
-    /// and per-write lazy enablement would race against concurrent new
-    /// sibling cgroup creation where controller files would not yet exist.
-    /// Per the cgroup v2
-    /// docs ("Documentation/admin-guide/cgroup-v2.rst"), `+memory`
-    /// enables memory controller files including `memory.max`,
-    /// `memory.high`, `memory.swap.max`; `+pids` enables `pids.max`;
-    /// `+io` enables `io.weight`. `cgroup.freeze` is a cgroup-core file
-    /// not gated by any controller.
-    pub fn setup(&self, enable_cpu_controller: bool) -> Result<()> {
-        self.setup_under_root(enable_cpu_controller, &PathBuf::from("/sys/fs/cgroup"))
+    /// Pass the controllers the test actually needs — empty set means
+    /// "create the parent dir, write nothing to subtree_control". The
+    /// scenario runtime computes the controller union from
+    /// [`CgroupDef`](crate::scenario::ops::CgroupDef) declarations
+    /// (cpuset/cpuset_mems → [`Controller::Cpuset`], cpu →
+    /// [`Controller::Cpu`], memory → [`Controller::Memory`], pids →
+    /// [`Controller::Pids`], io → [`Controller::Io`]) so a test
+    /// that never sets a memory limit never enables `+memory` and
+    /// vice versa. `cgroup.freeze` and `cgroup.procs` are
+    /// cgroup-core, ungated by any controller, and need no entry.
+    ///
+    /// # Availability check
+    ///
+    /// Each requested controller is verified against
+    /// `/sys/fs/cgroup/cgroup.controllers` before any write. A
+    /// requested controller missing from the kernel's available set
+    /// surfaces as `controller {ctrl} not available; cgroup.controllers
+    /// = {available:?}` rather than the bare ENOENT/EACCES the
+    /// downstream `set_*` write would otherwise emit.
+    ///
+    /// # Error propagation
+    ///
+    /// All filesystem writes propagate via `?`. A user inspecting
+    /// `RUST_BACKTRACE=1` output sees the exact subtree_control path
+    /// that failed and the underlying errno, instead of a swallowed
+    /// `tracing::warn!` followed by a downstream EACCES at the
+    /// controller-knob write site.
+    pub fn setup(&self, controllers: &BTreeSet<Controller>) -> Result<()> {
+        self.setup_under_root(controllers, &PathBuf::from("/sys/fs/cgroup"))
     }
 
     /// Inner setup that takes the cgroup-fs root as an explicit
@@ -260,32 +393,60 @@ impl CgroupManager {
     /// gate stays — if the parent is outside the supplied root,
     /// directory creation still happens but no subtree_control walk
     /// fires (matches the existing "non-cgroup-mount" early-bail).
-    fn setup_under_root(&self, enable_cpu_controller: bool, root: &Path) -> Result<()> {
+    fn setup_under_root(
+        &self,
+        controllers: &BTreeSet<Controller>,
+        root: &Path,
+    ) -> Result<()> {
         if !self.parent.exists() {
             fs::create_dir_all(&self.parent)
                 .with_context(|| format!("mkdir {}", self.parent.display()))?;
         }
-        let controllers = if enable_cpu_controller {
-            "+cpuset +cpu +memory +pids +io"
-        } else {
-            "+cpuset +memory +pids +io"
-        };
+        if controllers.is_empty() {
+            return Ok(());
+        }
         if let Ok(rel) = self.parent.strip_prefix(root) {
+            let available_path = root.join("cgroup.controllers");
+            if available_path.exists() {
+                let raw = fs::read_to_string(&available_path).with_context(|| {
+                    format!("read cgroup.controllers: {}", available_path.display())
+                })?;
+                let available: BTreeSet<&str> = raw.split_whitespace().collect();
+                for c in controllers {
+                    if !available.contains(c.name()) {
+                        return Err(anyhow!(
+                            "cgroup controller '{}' not available at {}; \
+                             cgroup.controllers reports {:?}. CONFIG_{}_CONTROLLER \
+                             may be unset, or the controller is masked at this \
+                             level of the hierarchy",
+                            c.name(),
+                            available_path.display(),
+                            available,
+                            c.name().to_uppercase(),
+                        ));
+                    }
+                }
+            }
+            let line: String = controllers
+                .iter()
+                .map(|c| format!("+{}", c.name()))
+                .collect::<Vec<_>>()
+                .join(" ");
             let mut cur = root.to_path_buf();
             for c in rel.components() {
                 let sc = cur.join("cgroup.subtree_control");
-                if sc.exists()
-                    && let Err(e) = write_with_timeout(&sc, controllers, CGROUP_WRITE_TIMEOUT)
-                {
-                    tracing::warn!(path = %sc.display(), err = %e, "failed to enable controllers");
+                if sc.exists() {
+                    write_with_timeout(&sc, &line, CGROUP_WRITE_TIMEOUT).with_context(
+                        || format!("enable controllers '{line}' at {}", sc.display()),
+                    )?;
                 }
                 cur = cur.join(c);
             }
             let sc = self.parent.join("cgroup.subtree_control");
-            if sc.exists()
-                && let Err(e) = write_with_timeout(&sc, controllers, CGROUP_WRITE_TIMEOUT)
-            {
-                tracing::warn!(path = %sc.display(), err = %e, "failed to enable controllers at parent");
+            if sc.exists() {
+                write_with_timeout(&sc, &line, CGROUP_WRITE_TIMEOUT).with_context(
+                    || format!("enable controllers '{line}' at {}", sc.display()),
+                )?;
             }
         }
         Ok(())
@@ -416,10 +577,27 @@ impl CgroupManager {
     }
 
     /// Write `cpuset.cpus` for a child cgroup.
+    ///
+    /// On write failure, captures and emits a snapshot of the
+    /// cgroup-tree state at the moment of failure: the parent's
+    /// `cgroup.controllers` (controllers AVAILABLE to children),
+    /// the parent's `cgroup.subtree_control` (controllers ENABLED
+    /// for children), the child's `cgroup.controllers` (the
+    /// inheritance ROOT for children of the child), the
+    /// `cpuset.cpus` file's existence, and a directory listing of
+    /// the child cgroup's knob files. The capture lets a kernel /
+    /// hierarchy-state bug surface as a focused diagnostic instead
+    /// of a bare `EACCES` at the write site.
     pub fn set_cpuset(&self, name: &str, cpus: &BTreeSet<usize>) -> Result<()> {
         validate_cgroup_name(name)?;
         let p = self.parent.join(name).join("cpuset.cpus");
-        write_with_timeout(&p, &TestTopology::cpuset_string(cpus), CGROUP_WRITE_TIMEOUT)
+        match write_with_timeout(&p, &TestTopology::cpuset_string(cpus), CGROUP_WRITE_TIMEOUT) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let snapshot = capture_cpuset_state(&self.parent, name);
+                Err(e.context(snapshot))
+            }
+        }
     }
 
     /// Enable `+cpuset` on `cgroup.subtree_control` for each ancestor
@@ -827,7 +1005,7 @@ pub trait CgroupOps {
     fn parent_path(&self) -> &Path;
     /// Create the parent directory and enable controllers. See
     /// [`CgroupManager::setup`].
-    fn setup(&self, enable_cpu_controller: bool) -> Result<()>;
+    fn setup(&self, controllers: &BTreeSet<Controller>) -> Result<()>;
     /// Create a child cgroup. See [`CgroupManager::create_cgroup`].
     fn create_cgroup(&self, name: &str) -> Result<()>;
     /// Drain and remove a child cgroup. See
@@ -888,8 +1066,8 @@ impl CgroupOps for CgroupManager {
     fn parent_path(&self) -> &Path {
         CgroupManager::parent_path(self)
     }
-    fn setup(&self, enable_cpu_controller: bool) -> Result<()> {
-        CgroupManager::setup(self, enable_cpu_controller)
+    fn setup(&self, controllers: &BTreeSet<Controller>) -> Result<()> {
+        CgroupManager::setup(self, controllers)
     }
     fn create_cgroup(&self, name: &str) -> Result<()> {
         CgroupManager::create_cgroup(self, name)
@@ -1228,77 +1406,106 @@ mod tests {
 
     #[test]
     fn setup_non_cgroup_path() {
-        // setup() on a non-cgroup path should still create the dir
+        // setup() on a non-cgroup path should still create the dir.
+        // Empty controller set skips the subtree_control walk entirely.
         let dir = std::env::temp_dir().join(format!("ktstr-setup-{}", std::process::id()));
         let cg = CgroupManager::new(dir.to_str().unwrap());
-        cg.setup(true).unwrap();
+        cg.setup(&BTreeSet::new()).unwrap();
         assert!(dir.exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// `setup` writes every expected controller (`+cpuset +cpu
-    /// +memory +pids +io`) to the parent cgroup's
-    /// `cgroup.subtree_control`. Without this assertion, a future
-    /// edit that drops `+pids` (or any other controller) from the
-    /// expansion would silently land — apply_setup's pids/swap_max
-    /// writes would then fail with ENOENT at scenario-execution
-    /// time, NOT at framework-setup time.
+    /// `setup` writes only the controllers the caller requested to
+    /// `cgroup.subtree_control`. Pinning a focused minimum
+    /// (cpuset + memory) catches regressions where the rendered
+    /// `+token` list grows past what the caller asked for.
     ///
     /// Path: drives [`setup_under_root`] against a tmpdir-rooted
     /// "cgroup tree" (parent dir + pre-created
-    /// `cgroup.subtree_control` file at the leaf), then reads the
-    /// file back and asserts every controller token is present.
+    /// `cgroup.controllers` advertising both controllers +
+    /// `cgroup.subtree_control` at root and leaf), then reads the
+    /// leaf back and asserts both requested tokens land while
+    /// non-requested controllers do not.
     #[test]
-    fn setup_writes_all_controllers() {
+    fn setup_writes_requested_controllers_only() {
         let root =
             std::env::temp_dir().join(format!("ktstr-setup-controllers-{}", std::process::id()));
         let parent = root.join("ktstr");
         fs::create_dir_all(&parent).unwrap();
-        // Pre-create the subtree_control file so the strip-prefix
-        // walk in setup_under_root's leaf-write branch sees it
-        // exist (the production setup() also depends on the file
-        // existing — cgroup v2 creates it at mount time).
+        // Pre-create cgroup.controllers at root so the availability
+        // check in setup_under_root passes for the requested
+        // controllers. Production cgroup v2 mount populates this file.
+        fs::write(root.join("cgroup.controllers"), "cpuset cpu memory pids io").unwrap();
+        // Pre-create the subtree_control file at root and leaf so
+        // the strip-prefix walk's exists() gate sees them.
+        fs::write(root.join("cgroup.subtree_control"), "").unwrap();
         fs::write(parent.join("cgroup.subtree_control"), "").unwrap();
 
         let cg = CgroupManager::new(parent.to_str().unwrap());
-        cg.setup_under_root(true, &root).unwrap();
+        let mut requested = BTreeSet::new();
+        requested.insert(Controller::Cpuset);
+        requested.insert(Controller::Memory);
+        cg.setup_under_root(&requested, &root).unwrap();
 
         let written = fs::read_to_string(parent.join("cgroup.subtree_control")).unwrap();
-        for token in ["+cpuset", "+cpu", "+memory", "+pids", "+io"] {
-            assert!(
-                written.contains(token),
-                "subtree_control must contain {token}; got: {written:?}",
-            );
-        }
-
-        // enable_cpu_controller=false drops only +cpu; the other
-        // four must still appear.
-        fs::write(parent.join("cgroup.subtree_control"), "").unwrap();
-        cg.setup_under_root(false, &root).unwrap();
-        let written = fs::read_to_string(parent.join("cgroup.subtree_control")).unwrap();
-        assert!(written.contains("+cpuset"));
-        assert!(written.contains("+memory"));
-        assert!(written.contains("+pids"));
-        assert!(written.contains("+io"));
         assert!(
-            !written.contains("+cpu "),
-            "+cpu must be absent when enable_cpu_controller=false; got: {written:?}",
+            written.contains("+cpuset"),
+            "subtree_control must contain +cpuset; got: {written:?}",
         );
-        // Distinguish "+cpu " (token bound) from "+cpuset" / "+cpu"
-        // tail-without-space: the only +cpu* tokens we expect when
-        // enable_cpu_controller=false are +cpuset. Verify the raw
-        // string ends without a bare +cpu by asserting the position
-        // of "+cpu" only matches the +cpuset prefix.
+        assert!(
+            written.contains("+memory"),
+            "subtree_control must contain +memory; got: {written:?}",
+        );
+        // Non-requested controllers must NOT appear.
+        assert!(
+            !written.contains("+pids"),
+            "+pids must be absent when not requested; got: {written:?}",
+        );
+        assert!(
+            !written.contains("+io"),
+            "+io must be absent when not requested; got: {written:?}",
+        );
+        // +cpu must be absent. Distinguish from +cpuset by walking
+        // every +cpu* match position and asserting it's the +cpuset
+        // prefix.
         let cpu_positions: Vec<usize> = written.match_indices("+cpu").map(|(i, _)| i).collect();
         for pos in cpu_positions {
             let suffix = &written[pos..];
             assert!(
                 suffix.starts_with("+cpuset"),
-                "every +cpu* token must be +cpuset when enable_cpu_controller=false; \
+                "+cpu must be absent when not requested (only +cpuset allowed); \
                  got '{suffix}' at pos {pos} in {written:?}",
             );
         }
 
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// `setup` rejects an unavailable controller with a clear error
+    /// citing both the requested controller name and the kernel's
+    /// advertised set. Without the gate, the downstream
+    /// `set_*` write would fail with bare ENOENT/EACCES — much
+    /// harder to diagnose than "controller X not available".
+    #[test]
+    fn setup_rejects_unavailable_controller() {
+        let root = std::env::temp_dir()
+            .join(format!("ktstr-setup-unavail-{}", std::process::id()));
+        let parent = root.join("ktstr");
+        fs::create_dir_all(&parent).unwrap();
+        // Advertise only memory; request cpuset.
+        fs::write(root.join("cgroup.controllers"), "memory").unwrap();
+        fs::write(root.join("cgroup.subtree_control"), "").unwrap();
+        fs::write(parent.join("cgroup.subtree_control"), "").unwrap();
+
+        let cg = CgroupManager::new(parent.to_str().unwrap());
+        let mut requested = BTreeSet::new();
+        requested.insert(Controller::Cpuset);
+        let err = cg.setup_under_root(&requested, &root).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("cpuset") && msg.contains("not available"),
+            "error must cite missing 'cpuset' and 'not available'; got {msg:?}",
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -1714,7 +1921,9 @@ mod tests {
         // `outside.strip_prefix(unrelated_root)` returns Err.
         fs::create_dir_all(&unrelated_root).unwrap();
         let cg = CgroupManager::new(outside.to_str().unwrap());
-        cg.setup_under_root(true, &unrelated_root).unwrap();
+        let mut requested = BTreeSet::new();
+        requested.insert(Controller::Cpuset);
+        cg.setup_under_root(&requested, &unrelated_root).unwrap();
         assert!(outside.exists(), "setup must create the parent directory");
         assert!(
             !outside.join("cgroup.subtree_control").exists(),
