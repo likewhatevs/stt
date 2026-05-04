@@ -642,6 +642,29 @@ fn try_attach_probe_for_tgid_at_debugs_on_non_jemalloc_target() {
     // /bin/sleep is a coreutils binary not linked against
     // jemalloc; attach_jemalloc walks its /proc/<pid>/maps,
     // finds no TSD symbol, and returns JemallocNotFound.
+    //
+    // Sleep duration choice: 3 s. Budget breakdown for the
+    // child-process critical section:
+    // - Up to 1 s waiting for `/proc/<pid>/exe` readability
+    //   (the deadline below). Worst case on a contended
+    //   runner.
+    // - The `try_attach_probe_for_tgid_at` call itself reads
+    //   /proc/<pid>/maps and walks ELF/DWARF only when the
+    //   binary is jemalloc-linked. /bin/sleep is not, so it
+    //   short-circuits with JemallocNotFound before any heavy
+    //   work — on the order of milliseconds.
+    // - The `child.kill()` + `child.wait()` reap below
+    //   completes in microseconds.
+    //
+    // Total expected wall-clock: well under 1.5 s. The 3 s
+    // budget gives ~2x headroom for CI runners under
+    // load — enough that an unexpectedly slow procfs read
+    // doesn't let the child exit before the attach call
+    // (which would race the test into a "pid vanished" path
+    // with PidMissing instead of the JemallocNotFound the
+    // test pins). 5 s would be excessive (extra wall-clock
+    // for every test run); 1 s would be too tight (the 1 s
+    // exe-readability deadline alone could exhaust it).
     let mut child = match std::process::Command::new("sleep")
         .arg("3")
         .stdin(std::process::Stdio::null())

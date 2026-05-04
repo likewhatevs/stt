@@ -975,6 +975,35 @@ fn fudge_n_to_one_merge_max_of_maxes_for_max_metrics() {
     );
 }
 
+/// P1: N:1 merge unions Aggregated::OrdinalRange bounds.
+/// Fudge two candidates with disjoint nice ranges; the
+/// merged range spans both.
+#[test]
+fn fudge_n_to_one_merge_unions_ordinal_range() {
+    let threads_a = fudge_threads_with("/svc", 10, |t| {
+        t.nice = OrdinalI32(0);
+    });
+    let mut threads_b = fudge_threads_with("/svc-a", 10, |t| {
+        t.nice = OrdinalI32(-5);
+    });
+    threads_b.extend(fudge_threads_with("/svc-b", 10, |t| {
+        t.nice = OrdinalI32(5);
+    }));
+    let diff = fudge_compare(&snap_with(threads_a), &snap_with(threads_b));
+    let r = diff
+        .rows
+        .iter()
+        .find(|r| r.metric_name == "nice" && r.group_key.contains("alpha"))
+        .expect("nice alpha row must surface");
+    match &r.candidate {
+        Aggregated::OrdinalRange { min, max } => {
+            assert_eq!(*min, -5, "merged candidate nice range min must be -5");
+            assert_eq!(*max, 5, "merged candidate nice range max must be 5");
+        }
+        other => panic!("expected OrdinalRange for nice; got {other:?}"),
+    }
+}
+
 /// P1: N:1 merge unions Aggregated::Affinity cpusets. Two
 /// candidates with different uniform cpusets merge to a
 /// non-uniform Affinity whose min_cpus / max_cpus span

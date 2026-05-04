@@ -822,3 +822,58 @@ fn write_diff_smaps_literal_mode_renders_pcomm_tgid_keys() {
     );
 }
 
+/// Smaps render primary sort key: absolute Rss delta
+/// (descending). When two processes have different absolute
+/// Rss deltas, the larger-delta process must render first
+/// regardless of max-Rss or alphabetical order. Pin the
+/// primary-key contract by constructing a case where
+/// max-Rss and alpha both prefer the WRONG order, isolating
+/// the abs-delta primary sort.
+#[test]
+fn write_diff_smaps_abs_rss_delta_is_primary_sort_key() {
+    let mut diff = CtprofDiff::default();
+    // alpha_proc: small delta, BIG max-Rss.
+    // The alpha-sort fallback would put alpha_proc first
+    // (alphabetically before zoomed); the max-Rss tiebreak
+    // would also prefer alpha_proc (240 MiB > 60 MiB max).
+    // Only the abs-delta primary sort places zoomed first.
+    let mut a = BTreeMap::new();
+    a.insert("Rss".to_string(), 200 * 1024 * 1024);
+    let mut a_b = BTreeMap::new();
+    a_b.insert("Rss".to_string(), 240 * 1024 * 1024);
+    // zoomed: HUGE delta (+50 MiB), small max-Rss (60 MiB).
+    let mut z = BTreeMap::new();
+    z.insert("Rss".to_string(), 10 * 1024 * 1024);
+    let mut z_b = BTreeMap::new();
+    z_b.insert("Rss".to_string(), 60 * 1024 * 1024);
+    diff.smaps_rollup_a.insert("alpha_proc".into(), a);
+    diff.smaps_rollup_b.insert("alpha_proc".into(), a_b);
+    diff.smaps_rollup_a.insert("zoomed".into(), z);
+    diff.smaps_rollup_b.insert("zoomed".into(), z_b);
+
+    let mut out = String::new();
+    write_diff(
+        &mut out,
+        &diff,
+        Path::new("a"),
+        Path::new("b"),
+        GroupBy::Pcomm,
+        &DisplayOptions::default(),
+    )
+    .unwrap();
+    let smaps_at = out
+        .find("## smaps_rollup")
+        .expect("smaps section must render");
+    let after = &out[smaps_at..];
+    let zoomed_pos = after.find("zoomed").expect("zoomed key must appear");
+    let alpha_pos = after
+        .find("alpha_proc")
+        .expect("alpha_proc key must appear");
+    assert!(
+        zoomed_pos < alpha_pos,
+        "abs-delta primary sort must place larger-delta process (zoomed: \
+         +50 MiB) ahead of smaller-delta process (alpha_proc: +40 MiB), \
+         regardless of max-Rss or alpha; got zoomed@{zoomed_pos} \
+         alpha_proc@{alpha_pos}",
+    );
+}

@@ -235,3 +235,211 @@ fn cancelled_write_bytes_field_pinned_to_bytes() {
     let t = ThreadState::default();
     let _: crate::metric_types::Bytes = t.cancelled_write_bytes;
 }
+
+/// `PsiHalf::avg10_percent` divides the centi-percent
+/// representation by 100 to yield the percentage. Pin
+/// representative values across the documented range
+/// (0.00..=100.99 per the kernel-EWMA-rounding bound on
+/// the struct doc) so a regression that swapped the divisor
+/// (e.g. `* 100.0` instead of `/ 100.0`) or that dropped a
+/// digit of precision surfaces here. Mirrors the
+/// `format_psi_avg_centi_percent` pin in tests_render.rs but
+/// at the typed-conversion boundary that downstream
+/// consumers of the centi-percent storage cross.
+#[test]
+fn psi_half_avg10_percent_converts_centi_percent_to_percent() {
+    // 0 → 0.0 %
+    let zero = PsiHalf {
+        avg10: 0,
+        avg60: 0,
+        avg300: 0,
+        total_usec: 0,
+    };
+    assert_eq!(zero.avg10_percent(), 0.0);
+
+    // 1 (one centi-percent) → 0.01 %
+    let one = PsiHalf {
+        avg10: 1,
+        ..PsiHalf::default()
+    };
+    assert!(
+        (one.avg10_percent() - 0.01).abs() < f64::EPSILON,
+        "avg10=1 must convert to 0.01 %, got {}",
+        one.avg10_percent(),
+    );
+
+    // 100 (one full percent worth of centi-percent) → 1.0 %
+    let one_pct = PsiHalf {
+        avg10: 100,
+        ..PsiHalf::default()
+    };
+    assert!(
+        (one_pct.avg10_percent() - 1.0).abs() < f64::EPSILON,
+        "avg10=100 must convert to 1.0 %, got {}",
+        one_pct.avg10_percent(),
+    );
+
+    // 5050 → 50.50 % (mid-range typical value)
+    let mid = PsiHalf {
+        avg10: 5050,
+        ..PsiHalf::default()
+    };
+    assert!(
+        (mid.avg10_percent() - 50.50).abs() < 1e-9,
+        "avg10=5050 must convert to 50.50 %, got {}",
+        mid.avg10_percent(),
+    );
+
+    // 10000 → 100.00 %
+    let max = PsiHalf {
+        avg10: 10000,
+        ..PsiHalf::default()
+    };
+    assert!(
+        (max.avg10_percent() - 100.0).abs() < f64::EPSILON,
+        "avg10=10000 must convert to 100.0 %, got {}",
+        max.avg10_percent(),
+    );
+
+    // 10099 → 100.99 % (kernel's EWMA-rounding upper bound
+    // documented on the struct).
+    let over = PsiHalf {
+        avg10: 10099,
+        ..PsiHalf::default()
+    };
+    assert!(
+        (over.avg10_percent() - 100.99).abs() < 1e-9,
+        "avg10=10099 must convert to 100.99 %, got {}",
+        over.avg10_percent(),
+    );
+
+    // u16::MAX → 655.35 %. Exercises the upper boundary of
+    // the storage type (the kernel's EWMA cannot legitimately
+    // produce this, but the conversion must not panic or
+    // wrap; defensive pin).
+    let umax = PsiHalf {
+        avg10: u16::MAX,
+        ..PsiHalf::default()
+    };
+    assert!(
+        (umax.avg10_percent() - (u16::MAX as f64 / 100.0)).abs() < 1e-6,
+        "avg10=u16::MAX must convert to {} %, got {}",
+        u16::MAX as f64 / 100.0,
+        umax.avg10_percent(),
+    );
+}
+
+/// `PsiHalf::avg60_percent` is the 60-second analogue of
+/// `avg10_percent` and uses the same centi-percent → percent
+/// conversion. Pin a representative subset so a regression
+/// that diverged the two methods (e.g. copy-paste error
+/// reading `self.avg10` from the avg60 method) surfaces
+/// here independent of the avg10 test.
+#[test]
+fn psi_half_avg60_percent_uses_avg60_field() {
+    // Distinct centi-percent values per field so a regression
+    // that read the wrong field surfaces as the wrong output.
+    let p = PsiHalf {
+        avg10: 1234,
+        avg60: 5678,
+        avg300: 9012,
+        total_usec: 0,
+    };
+    assert!(
+        (p.avg60_percent() - 56.78).abs() < 1e-9,
+        "avg60=5678 must convert to 56.78 % (NOT avg10's 12.34); got {}",
+        p.avg60_percent(),
+    );
+    // Boundary
+    let zero = PsiHalf::default();
+    assert_eq!(zero.avg60_percent(), 0.0);
+    let max = PsiHalf {
+        avg60: 10000,
+        ..PsiHalf::default()
+    };
+    assert!(
+        (max.avg60_percent() - 100.0).abs() < f64::EPSILON,
+        "avg60=10000 must convert to 100.0 %, got {}",
+        max.avg60_percent(),
+    );
+}
+
+/// `PsiHalf::avg300_percent` is the 300-second analogue.
+/// Same pattern as the avg60 test — pin distinct field
+/// values so a regression that read the wrong field is
+/// directly visible.
+#[test]
+fn psi_half_avg300_percent_uses_avg300_field() {
+    let p = PsiHalf {
+        avg10: 1234,
+        avg60: 5678,
+        avg300: 9012,
+        total_usec: 0,
+    };
+    assert!(
+        (p.avg300_percent() - 90.12).abs() < 1e-9,
+        "avg300=9012 must convert to 90.12 % (NOT avg10/avg60's values); got {}",
+        p.avg300_percent(),
+    );
+    // Boundary
+    let zero = PsiHalf::default();
+    assert_eq!(zero.avg300_percent(), 0.0);
+    let max = PsiHalf {
+        avg300: 10000,
+        ..PsiHalf::default()
+    };
+    assert!(
+        (max.avg300_percent() - 100.0).abs() < f64::EPSILON,
+        "avg300=10000 must convert to 100.0 %, got {}",
+        max.avg300_percent(),
+    );
+}
+
+/// All three percent methods round-trip the kernel-emission
+/// shape `LOAD_INT.LOAD_FRAC` losslessly. The kernel writes
+/// each average as a 2-decimal-digit percentage at
+/// `kernel/sched/psi.c:1284`; the centi-percent storage at
+/// the [`PsiHalf`] field captures both digits as a single
+/// integer (`int * 100 + frac`). Pin that the percent method
+/// reproduces both digits with float precision.
+#[test]
+fn psi_half_percent_methods_preserve_kernel_two_decimal_precision() {
+    // (int, frac) → centi-percent storage value
+    // → expected percentage f64 to 2 decimal places.
+    let cases: &[(u16, u16, u16, f64)] = &[
+        (3, 14, 314, 3.14),
+        (42, 7, 4207, 42.07),
+        (87, 50, 8750, 87.50),
+        (99, 99, 9999, 99.99),
+    ];
+    for (int_part, frac_part, stored, expected) in cases {
+        // Sanity check the test fixture: int * 100 + frac
+        // matches the stored value.
+        assert_eq!(
+            (*int_part as u32) * 100 + (*frac_part as u32),
+            *stored as u32,
+            "fixture: int*100+frac must equal stored",
+        );
+        let p = PsiHalf {
+            avg10: *stored,
+            avg60: *stored,
+            avg300: *stored,
+            total_usec: 0,
+        };
+        assert!(
+            (p.avg10_percent() - *expected).abs() < 1e-9,
+            "stored={stored} → expected {expected}, got avg10={}",
+            p.avg10_percent(),
+        );
+        assert!(
+            (p.avg60_percent() - *expected).abs() < 1e-9,
+            "stored={stored} → expected {expected}, got avg60={}",
+            p.avg60_percent(),
+        );
+        assert!(
+            (p.avg300_percent() - *expected).abs() < 1e-9,
+            "stored={stored} → expected {expected}, got avg300={}",
+            p.avg300_percent(),
+        );
+    }
+}

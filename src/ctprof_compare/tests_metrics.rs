@@ -141,11 +141,12 @@ fn ctprof_metric_names_are_unique() {
     }
 }
 
-/// `metric_display_name` of a fully-ungated metric returns
-/// the bare name with no trailing tags. Pins the
-/// no-decoration short-circuit for the typical case, and
-/// verifies that the borrowed-Cow path is taken (no
-/// allocation when nothing decorates).
+/// `metric_display_name` returns the bare metric name as a
+/// `&'static str` borrowed from the registry; `metric_tags`
+/// renders the bracketed gate/class suffix separately. For an
+/// ungated metric, `metric_tags` is empty so the rendered cell
+/// has no trailing decoration. Pins both halves of the
+/// pair-rendering contract used by every metric-list call site.
 #[test]
 fn metric_display_name_no_gates_returns_bare_name() {
     let policy = lookup_metric("policy");
@@ -162,7 +163,7 @@ fn metric_display_name_no_gates_returns_bare_name() {
 /// `kernel/sched/fair.c::wake_affine` is the only call site
 /// for the underlying `__schedstat_inc`. The config gate
 /// renders compact (`[SCHEDSTATS]` not `[CONFIG_SCHEDSTATS]`)
-/// per the strip rule on `metric_display_name`. Pins both
+/// per the strip rule on `metric_tags`. Pins both
 /// decoration paths against drift.
 #[test]
 fn metric_tags_renders_class_and_config_tags() {
@@ -195,11 +196,11 @@ fn metric_tags_class_only_no_config_gate() {
     assert_eq!(metric_tags(fair), "[fair-policy]");
 }
 
-/// Compact rendering: `metric_display_name` strips the
+/// Compact rendering: `metric_tags` strips the
 /// `CONFIG_` prefix from each `config_gate` before emission.
 /// The data field stays full so an operator can grep their
 /// kconfig directly. Pin the rule explicitly so a refactor
-/// of `metric_display_name` does not silently regress the
+/// of `metric_tags` does not silently regress the
 /// strip behavior.
 #[test]
 fn metric_tags_strips_config_prefix() {
@@ -232,7 +233,7 @@ fn metric_tags_strips_config_prefix() {
 /// `is_dead: true` entries (the previously-registered dead
 /// counters were dropped). Pin the rendering on a synthetic
 /// `CtprofMetricDef` so a regression that drops the
-/// `[dead]` clause from `metric_display_name` surfaces here
+/// `[dead]` clause from `metric_tags` surfaces here
 /// rather than waiting for a future kernel quirk that
 /// resurrects the tag.
 #[test]
@@ -779,50 +780,6 @@ fn write_diff_renders_non_ext_metric_cell() {
     );
 }
 
-/// Show-side `parse_columns` accepts the `metric,value`
-/// pair — the show-only allowed vocabulary. Pins that the
-/// show-side path actually parses both names rather than
-/// silently rejecting `value` as if it were compare-only.
-#[test]
-fn parse_columns_accepts_show_side_metric_value() {
-    let cols = parse_columns("metric,value", false).expect("metric,value is show-side valid");
-    assert_eq!(cols, vec![Column::Metric, Column::Value]);
-}
-
-/// Empty `metrics` Vec on [`DisplayOptions`] means "every
-/// metric is enabled" — the no-filter default. Pins the
-/// short-circuit in `is_metric_enabled` so a regression
-/// that flipped the empty case to "no metric enabled"
-/// surfaces here.
-#[test]
-fn is_metric_enabled_empty_treats_all_as_on() {
-    let opts = DisplayOptions::default();
-    // Sample a primary and a derived metric — both must
-    // be enabled under the empty default.
-    assert!(opts.is_metric_enabled("run_time_ns"));
-    assert!(opts.is_metric_enabled("cpu_efficiency"));
-    // Even a name not in any registry returns true under
-    // the empty filter. is_metric_enabled is the gate at
-    // render time; parse_metrics enforces validity at CLI
-    // parse time, so these two checks compose to "filter
-    // restricts only when populated."
-    assert!(opts.is_metric_enabled("anything_under_empty_filter"));
-}
-
-/// Non-empty `metrics` Vec restricts rendering to the
-/// listed names — names IN the filter return true, names
-/// NOT in the filter return false. Pins the contains
-/// membership check.
-#[test]
-fn is_metric_enabled_non_empty_restricts_to_listed() {
-    let mut opts = DisplayOptions::default();
-    opts.metrics = vec!["run_time_ns", "wait_sum"];
-    assert!(opts.is_metric_enabled("run_time_ns"));
-    assert!(opts.is_metric_enabled("wait_sum"));
-    assert!(!opts.is_metric_enabled("nr_wakeups"));
-    assert!(!opts.is_metric_enabled("cpu_efficiency"));
-}
-
 /// Registry no longer exposes `voluntary_sleep_sum` as a
 /// derived metric — the capture-side `voluntary_sleep_ns`
 /// field replaced it. Pin the absence so a future
@@ -907,17 +864,6 @@ fn derived_avg_delay_ns_returns_none_on_missing_input() {
          input is missing — exercised here with compact_delay_total_ns \
          omitted from the metrics map",
     );
-}
-
-/// `--sort-by` accepts derived metric names. Three groups
-/// with distinct cpu_efficiency values: sort descending puts
-/// the highest first.
-#[test]
-fn parse_sort_by_accepts_derived_metric_name() {
-    let keys = parse_sort_by("cpu_efficiency").expect("derived name parses");
-    assert_eq!(keys.len(), 1);
-    assert_eq!(keys[0].metric, "cpu_efficiency");
-    assert!(keys[0].descending);
 }
 
 /// Primary and derived metric namespaces are disjoint — a
@@ -1248,103 +1194,6 @@ fn max_metric_accessors_read_expected_field() {
     }
 }
 
-/// Bare metric name surrounded by whitespace (no colon, no
-/// direction) parses as a single descending key. Pins the
-/// metric-side trim path on the `None` arm of the
-/// `split_once(':')` match — `entry.trim()` runs first to
-/// strip the entry-level whitespace, then the `None` arm
-/// passes the trimmed string straight through. A regression
-/// that dropped either trim layer would surface here as a
-/// failed registry lookup on the literal `"  wait_sum  "`.
-#[test]
-fn parse_sort_by_bare_metric_with_whitespace_no_colon() {
-    let keys = parse_sort_by("  wait_sum  ").expect("bare-metric whitespace must parse");
-    assert_eq!(keys.len(), 1);
-    assert_eq!(keys[0].metric, "wait_sum");
-    assert!(keys[0].descending);
-}
-
-/// Metric name with trailing colon and no direction
-/// (`"wait_sum:"`) splits to (`"wait_sum"`, `""`). The
-/// empty direction is not `asc` or `desc`, so the
-/// bad-direction arm fires. A regression that treated empty
-/// direction as the default `desc` would silently accept
-/// the typo.
-#[test]
-fn parse_sort_by_rejects_metric_colon_no_direction() {
-    let err = parse_sort_by("wait_sum:").unwrap_err();
-    let msg = format!("{err:#}");
-    assert!(
-        msg.contains("invalid direction"),
-        "metric-colon-no-direction must surface as invalid-direction error, got: {msg}"
-    );
-}
-
-/// Unknown-metric error message lists the valid registry
-/// entries as a sorted comma-separated list (not a
-/// `BTreeSet` debug dump). Pins the operator-facing shape:
-/// the diagnostic is copy-pasteable and the names appear in
-/// alphabetical order so the operator can scan for the one
-/// they meant.
-#[test]
-fn parse_sort_by_unknown_metric_lists_valid_names_sorted() {
-    let err = parse_sort_by("not_a_real_metric").unwrap_err();
-    let msg = format!("{err:#}");
-    // The list is comma-separated. Find two known-adjacent
-    // names from the sorted set and pin their relative
-    // order in the diagnostic.
-    // In alphabetical order, "nice" comes before
-    // "policy" and "policy" before "run_time_ns" (registry
-    // names live mostly under the `n…` / `p…` / `r…`
-    // namespaces). Pick a triple whose alphabetical order
-    // is unambiguous.
-    let nice_at = msg
-        .find("nice")
-        .expect("error must list 'nice' from the registry");
-    let policy_at = msg
-        .find("policy")
-        .expect("error must list 'policy' from the registry");
-    let run_time_at = msg
-        .find("run_time_ns")
-        .expect("error must list 'run_time_ns' from the registry");
-    assert!(
-        nice_at < policy_at,
-        "names must appear in alphabetical order: \
-         nice@{nice_at} < policy@{policy_at}\nmsg: {msg}",
-    );
-    assert!(
-        policy_at < run_time_at,
-        "names must appear in alphabetical order: \
-         policy@{policy_at} < run_time_ns@{run_time_at}\nmsg: {msg}",
-    );
-    // Format must be comma-separated, not BTreeSet debug
-    // (`{...}`). Pin the absence of the debug-set delimiters.
-    assert!(
-        !msg.contains("{\""),
-        "error must use comma-separated list, not BTreeSet debug dump:\n{msg}"
-    );
-}
-
-/// Multi-key sort spec preserves entry order in the
-/// returned Vec (left-to-right). Pins the documented
-/// "lexicographic in input order" contract — a reordering
-/// regression would silently rank by the second key first.
-#[test]
-fn parse_sort_by_multi_key_preserves_order() {
-    // Three keys, distinct names — pick one each from the
-    // ns / unitless / count axes so the entries are visibly
-    // distinct.
-    let keys =
-        parse_sort_by("run_time_ns:desc,nr_wakeups:asc,wait_time_ns:desc").expect("parse");
-    assert_eq!(keys.len(), 3);
-    assert_eq!(keys[0].metric, "run_time_ns");
-    assert!(keys[0].descending);
-    assert_eq!(keys[1].metric, "nr_wakeups");
-    assert!(!keys[1].descending);
-    assert_eq!(keys[2].metric, "wait_time_ns");
-    assert!(keys[2].descending);
-}
-
 /// Multi-key sort: groups rank by the requested metrics'
 /// deltas in tuple order. Big regression on the FIRST key
 /// dominates regardless of the second key.
@@ -1489,50 +1338,6 @@ fn sort_diff_rows_by_keys_respects_ascending_direction() {
     let groups_in_order: Vec<&str> = rows.iter().map(|r| r.group_key.as_str()).collect();
     // B (100) < C (500) < A (1000) under asc.
     assert_eq!(groups_in_order, vec!["B", "C", "A"]);
-}
-
-/// End-to-end: `compare()` with a non-empty sort_by uses the
-/// multi-key path. Pin that two groups with different
-/// run_time_ns deltas surface in the operator-requested
-/// order, regardless of which group has the larger
-/// |delta_pct| (which would have won under the default sort).
-#[test]
-fn compare_uses_sort_by_when_set() {
-    let mut a_pre = make_thread("alpha", "w");
-    a_pre.run_time_ns = MonotonicNs(1_000_000_000); // 1B baseline → big abs but tiny pct change
-    let mut a_post = make_thread("alpha", "w");
-    a_post.run_time_ns = MonotonicNs(1_000_000_500); // +500 abs; +5e-5 % change
-    let mut b_pre = make_thread("bravo", "w");
-    b_pre.run_time_ns = MonotonicNs(100);
-    let mut b_post = make_thread("bravo", "w");
-    b_post.run_time_ns = MonotonicNs(200); // +100 abs; +100% change
-    // Default sort: bravo wins by |delta_pct|. With
-    // sort_by=run_time_ns:desc, alpha wins by absolute delta
-    // (500 > 100).
-    let diff = compare(
-        &snap_with(vec![a_pre, b_pre]),
-        &snap_with(vec![a_post, b_post]),
-        &CompareOptions {
-            group_by: GroupBy::Pcomm.into(),
-            cgroup_flatten: vec![],
-            no_thread_normalize: false,
-            no_cg_normalize: false,
-            sort_by: vec![SortKey {
-                metric: "run_time_ns",
-                descending: true,
-            }],
-        },
-    );
-    let run_rows: Vec<&DiffRow> = diff
-        .rows
-        .iter()
-        .filter(|r| r.metric_name == "run_time_ns")
-        .collect();
-    assert_eq!(
-        run_rows[0].group_key, "alpha",
-        "sort_by abs delta picks alpha"
-    );
-    assert_eq!(run_rows[1].group_key, "bravo");
 }
 
 /// Final tie-break: when every sort-key value matches across
@@ -1844,147 +1649,3 @@ fn sort_diff_rows_by_keys_nan_delta_does_not_panic() {
     );
 }
 
-/// `compare()` with empty `sort_by` routes through the
-/// default `delta_pct desc` sort, NOT `sort_diff_rows_by_keys`.
-/// Pin the routing branch by exercising the same data
-/// shape under both `sort_by: empty` and `sort_by: [...]`
-/// and confirming they produce *different* orderings.
-/// Together with `compare_uses_sort_by_when_set` (the
-/// non-empty branch above), this pins both arms of the
-/// `if opts.sort_by.is_empty()` check inside `compare()`.
-#[test]
-fn compare_uses_default_sort_when_sort_by_empty() {
-    // `alpha` has 1B baseline, +500 delta → tiny |delta_pct|.
-    // `bravo` has 100 baseline, +100 delta → +100% delta_pct.
-    // Default sort ranks by |delta_pct| desc → bravo first.
-    let mut a_pre = make_thread("alpha", "w");
-    a_pre.run_time_ns = MonotonicNs(1_000_000_000);
-    let mut a_post = make_thread("alpha", "w");
-    a_post.run_time_ns = MonotonicNs(1_000_000_500);
-    let mut b_pre = make_thread("bravo", "w");
-    b_pre.run_time_ns = MonotonicNs(100);
-    let mut b_post = make_thread("bravo", "w");
-    b_post.run_time_ns = MonotonicNs(200);
-
-    // Empty sort_by → default delta_pct desc.
-    let diff_default = compare(
-        &snap_with(vec![a_pre.clone(), b_pre.clone()]),
-        &snap_with(vec![a_post.clone(), b_post.clone()]),
-        &CompareOptions {
-            group_by: GroupBy::Pcomm.into(),
-            cgroup_flatten: vec![],
-            no_thread_normalize: false,
-            no_cg_normalize: false,
-            sort_by: Vec::new(),
-        },
-    );
-    let default_order: Vec<&str> = diff_default
-        .rows
-        .iter()
-        .filter(|r| r.metric_name == "run_time_ns")
-        .map(|r| r.group_key.as_str())
-        .collect();
-    assert_eq!(
-        default_order,
-        vec!["bravo", "alpha"],
-        "empty sort_by must use default delta_pct desc sort \
-         (bravo's +100% beats alpha's +5e-5 %)",
-    );
-
-    // Non-empty sort_by → multi-key. Picks alpha first by
-    // absolute delta (+500 > +100).
-    let diff_sort = compare(
-        &snap_with(vec![a_pre, b_pre]),
-        &snap_with(vec![a_post, b_post]),
-        &CompareOptions {
-            group_by: GroupBy::Pcomm.into(),
-            cgroup_flatten: vec![],
-            no_thread_normalize: false,
-            no_cg_normalize: false,
-            sort_by: vec![SortKey {
-                metric: "run_time_ns",
-                descending: true,
-            }],
-        },
-    );
-    let sort_order: Vec<&str> = diff_sort
-        .rows
-        .iter()
-        .filter(|r| r.metric_name == "run_time_ns")
-        .map(|r| r.group_key.as_str())
-        .collect();
-    assert_eq!(
-        sort_order,
-        vec!["alpha", "bravo"],
-        "non-empty sort_by must use multi-key path (alpha's +500 abs beats bravo's +100)",
-    );
-
-    // The two orderings differ — pins that the routing
-    // actually swaps paths, not just produces the same
-    // result by coincidence.
-    assert_ne!(
-        default_order, sort_order,
-        "empty vs non-empty sort_by must produce different orderings on this fixture",
-    );
-}
-
-/// Auto-scale edge case: zero values render as bare
-/// `0<unit>` across all five unit families. Pin that the
-/// `abs() >= threshold` chain short-circuits to "no
-/// step-up" at zero and the integer fast-path renders
-/// `0ns`, `0µs`, `0B`, `0ticks`, and `0` (the empty-unit
-/// case). A regression that flipped the threshold to `>`
-/// (so `abs >= 0` matches and the chain over-steps to the
-/// largest unit) would surface here.
-#[test]
-fn format_scaled_u64_zero_renders_at_base_unit_for_all_families() {
-    assert_eq!(format_scaled_u64(0, ScaleLadder::Ns), "0ns");
-    assert_eq!(format_scaled_u64(0, ScaleLadder::Us), "0µs");
-    assert_eq!(format_scaled_u64(0, ScaleLadder::Bytes), "0B");
-    assert_eq!(format_scaled_u64(0, ScaleLadder::Ticks), "0ticks");
-    // Empty unit: format prints just the integer with no
-    // suffix. This is the canonical unitless render path.
-    assert_eq!(format_scaled_u64(0, ScaleLadder::Unitless), "0");
-}
-
-/// `format_delta_cell` on a negative µs delta auto-scales
-/// AND keeps the explicit minus sign. Pin both sides:
-/// magnitude is reported in seconds (`-1.500s`, not
-/// `-1500000µs`), and the leading `-` survives the scale
-/// step.
-#[test]
-fn format_delta_cell_negative_microseconds_scales_to_seconds() {
-    let cell = format_delta_cell(-1_500_000.0, ScaleLadder::Us);
-    assert_eq!(cell, "-1.500s");
-}
-
-/// `format_delta_cell` on a negative byte delta auto-scales
-/// AND keeps the explicit minus sign. Pin the IEC binary
-/// path on the negative side; the existing positive-byte
-/// path is exercised by other tests but the negative-byte
-/// branch was unpinned.
-#[test]
-fn format_delta_cell_negative_bytes_scales_to_gib() {
-    let two_gib_neg = -(2.0 * 1024.0 * 1024.0 * 1024.0);
-    let cell = format_delta_cell(two_gib_neg, ScaleLadder::Bytes);
-    assert_eq!(cell, "-2.000GiB");
-}
-
-/// Asymmetric threshold-crossing: each cell of a
-/// `cgroup_cell` triple scales independently. A baseline
-/// just below the µs→ms threshold renders as bare µs while
-/// the candidate (just above) jumps to ms — and the delta
-/// (their difference) picks its own scale based on its own
-/// magnitude. Pin that the three cells don't bleed scales
-/// into each other.
-#[test]
-fn cgroup_cell_each_cell_scales_independently() {
-    // Baseline 999 µs (below 1000-µs ms threshold) →
-    // renders as `999µs`. Candidate 2000 µs (above) → `2.000ms`.
-    // Delta +1001 µs (above) → `+1.001ms`.
-    let cell = cgroup_cell(Some(999), Some(2000), ScaleLadder::Us);
-    assert_eq!(
-        cell, "999µs → 2.000ms (+1.001ms)",
-        "asymmetric scaling: each cell must pick its own prefix",
-    );
-}

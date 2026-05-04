@@ -367,3 +367,120 @@ fn parse_sort_by_multi_key_preserves_order() {
     assert!(keys[2].descending);
 }
 
+/// Empty `metrics` Vec on [`DisplayOptions`] means "every
+/// metric is enabled" — the no-filter default. Pins the
+/// short-circuit in `is_metric_enabled` so a regression
+/// that flipped the empty case to "no metric enabled"
+/// surfaces here.
+#[test]
+fn is_metric_enabled_empty_treats_all_as_on() {
+    let opts = DisplayOptions::default();
+    // Sample a primary and a derived metric — both must
+    // be enabled under the empty default.
+    assert!(opts.is_metric_enabled("run_time_ns"));
+    assert!(opts.is_metric_enabled("cpu_efficiency"));
+    // Even a name not in any registry returns true under
+    // the empty filter. is_metric_enabled is the gate at
+    // render time; parse_metrics enforces validity at CLI
+    // parse time, so these two checks compose to "filter
+    // restricts only when populated."
+    assert!(opts.is_metric_enabled("anything_under_empty_filter"));
+}
+
+/// Non-empty `metrics` Vec restricts rendering to the
+/// listed names — names IN the filter return true, names
+/// NOT in the filter return false. Pins the contains
+/// membership check.
+#[test]
+fn is_metric_enabled_non_empty_restricts_to_listed() {
+    let mut opts = DisplayOptions::default();
+    opts.metrics = vec!["run_time_ns", "wait_sum"];
+    assert!(opts.is_metric_enabled("run_time_ns"));
+    assert!(opts.is_metric_enabled("wait_sum"));
+    assert!(!opts.is_metric_enabled("nr_wakeups"));
+    assert!(!opts.is_metric_enabled("cpu_efficiency"));
+}
+
+/// `--sort-by` accepts derived metric names. Three groups
+/// with distinct cpu_efficiency values: sort descending puts
+/// the highest first.
+#[test]
+fn parse_sort_by_accepts_derived_metric_name() {
+    let keys = parse_sort_by("cpu_efficiency").expect("derived name parses");
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0].metric, "cpu_efficiency");
+    assert!(keys[0].descending);
+}
+
+/// Bare metric name surrounded by whitespace (no colon, no
+/// direction) parses as a single descending key. Pins the
+/// metric-side trim path on the `None` arm of the
+/// `split_once(':')` match — `entry.trim()` runs first to
+/// strip the entry-level whitespace, then the `None` arm
+/// passes the trimmed string straight through. A regression
+/// that dropped either trim layer would surface here as a
+/// failed registry lookup on the literal `"  wait_sum  "`.
+#[test]
+fn parse_sort_by_bare_metric_with_whitespace_no_colon() {
+    let keys = parse_sort_by("  wait_sum  ").expect("bare-metric whitespace must parse");
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0].metric, "wait_sum");
+    assert!(keys[0].descending);
+}
+
+/// Metric name with trailing colon and no direction
+/// (`"wait_sum:"`) splits to (`"wait_sum"`, `""`). The
+/// empty direction is not `asc` or `desc`, so the
+/// bad-direction arm fires. A regression that treated empty
+/// direction as the default `desc` would silently accept
+/// the typo.
+#[test]
+fn parse_sort_by_rejects_metric_colon_no_direction() {
+    let err = parse_sort_by("wait_sum:").unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("invalid direction"),
+        "metric-colon-no-direction must surface as invalid-direction error, got: {msg}"
+    );
+}
+
+/// Unknown-metric error message lists the valid registry
+/// entries as a sorted comma-separated list (not a
+/// `BTreeSet` debug dump). Pins the operator-facing shape:
+/// the diagnostic is copy-pasteable and the names appear in
+/// alphabetical order so the operator can scan for the one
+/// they meant.
+#[test]
+fn parse_sort_by_unknown_metric_lists_valid_names_sorted() {
+    let err = parse_sort_by("not_a_real_metric").unwrap_err();
+    let msg = format!("{err:#}");
+    // The list is comma-separated. Find two known-adjacent
+    // names from the sorted set and pin their relative
+    // order in the diagnostic.
+    let nice_at = msg
+        .find("nice")
+        .expect("error must list 'nice' from the registry");
+    let policy_at = msg
+        .find("policy")
+        .expect("error must list 'policy' from the registry");
+    let run_time_at = msg
+        .find("run_time_ns")
+        .expect("error must list 'run_time_ns' from the registry");
+    assert!(
+        nice_at < policy_at,
+        "names must appear in alphabetical order: \
+         nice@{nice_at} < policy@{policy_at}\nmsg: {msg}",
+    );
+    assert!(
+        policy_at < run_time_at,
+        "names must appear in alphabetical order: \
+         policy@{policy_at} < run_time_ns@{run_time_at}\nmsg: {msg}",
+    );
+    // Format must be comma-separated, not BTreeSet debug
+    // (`{...}`). Pin the absence of the debug-set delimiters.
+    assert!(
+        !msg.contains("{\""),
+        "error must use comma-separated list, not BTreeSet debug dump:\n{msg}"
+    );
+}
+

@@ -1197,3 +1197,292 @@ fn parse_cgroup_v2_root_only_path_returns_slash() {
     let raw = "12:cpuset:/legacy/path\n0::/\n5:freezer:/legacy\n";
     assert_eq!(parse_cgroup_v2(raw), Some("/".to_string()));
 }
+
+/// `nr_threads` leader-dedup: only the thread leader
+/// (tid == tgid) carries the `signal_struct->nr_threads`
+/// snapshot; non-leader threads zero the field. Pin the
+/// `tid == tgid` gate at the [`ThreadState`] construction
+/// site so a regression that populated nr_threads on every
+/// thread would surface here as a Sum-rule aggregator
+/// multiplying the count by itself across the bucket.
+///
+/// Stages two threads under one tgid: the leader (tid ==
+/// tgid) and a worker (tid != tgid). `/proc/<tid>/status`
+/// for both carries `Threads: 2` (every thread of the
+/// process sees the same kernel-emitted value), but only
+/// the leader's [`ThreadState::nr_threads`] reads 2; the
+/// worker reads 0.
+#[test]
+fn capture_with_nr_threads_dedup_populates_leader_only() {
+    use crate::metric_types::GaugeCount;
+    let proc_tmp = tempfile::TempDir::new().unwrap();
+    let cgroup_tmp = tempfile::TempDir::new().unwrap();
+    let sys_tmp = tempfile::TempDir::new().unwrap();
+    let tgid: i32 = 7000;
+    let leader_tid: i32 = 7000;
+    let worker_tid: i32 = 7001;
+
+    // Stage the leader thread fully — `Threads: 2` lands on
+    // the leader's status file.
+    stage_synthetic_proc(proc_tmp.path(), tgid, leader_tid, "leader-pcomm", "leader-comm");
+    let leader_status_path = proc_tmp
+        .path()
+        .join(tgid.to_string())
+        .join("task")
+        .join(leader_tid.to_string())
+        .join("status");
+    let leader_status = "Name:\tfoo\n\
+        State:\tR (running)\n\
+        voluntary_ctxt_switches:\t1\n\
+        nonvoluntary_ctxt_switches:\t1\n\
+        Cpus_allowed_list:\t0\n\
+        Threads:\t2\n";
+    std::fs::write(&leader_status_path, leader_status).unwrap();
+
+    // Stage the worker thread under the same tgid. Same
+    // `Threads: 2` value (every thread of the process reads
+    // the kernel-shared field). Distinct comm so the test can
+    // tell the two ThreadState entries apart in the output
+    // vector.
+    stage_synthetic_proc(proc_tmp.path(), tgid, worker_tid, "leader-pcomm", "worker-comm");
+    let worker_status_path = proc_tmp
+        .path()
+        .join(tgid.to_string())
+        .join("task")
+        .join(worker_tid.to_string())
+        .join("status");
+    let worker_status = "Name:\tfoo\n\
+        State:\tR (running)\n\
+        voluntary_ctxt_switches:\t1\n\
+        nonvoluntary_ctxt_switches:\t1\n\
+        Cpus_allowed_list:\t0\n\
+        Threads:\t2\n";
+    std::fs::write(&worker_status_path, worker_status).unwrap();
+
+    let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), sys_tmp.path(), false);
+    assert_eq!(snap.threads.len(), 2, "two threads under tgid {tgid}");
+
+    let leader = snap
+        .threads
+        .iter()
+        .find(|t| t.tid == leader_tid as u32)
+        .expect("leader thread present");
+    let worker = snap
+        .threads
+        .iter()
+        .find(|t| t.tid == worker_tid as u32)
+        .expect("worker thread present");
+
+    assert_eq!(leader.tid, leader.tgid, "leader: tid == tgid");
+    assert_ne!(worker.tid, worker.tgid, "worker: tid != tgid");
+
+    // Leader carries the kernel-emitted count.
+    assert_eq!(
+        leader.nr_threads,
+        GaugeCount(2),
+        "leader.nr_threads must carry the parsed Threads: value (2); \
+         got {:?}",
+        leader.nr_threads,
+    );
+    // Worker zeros the field.
+    assert_eq!(
+        worker.nr_threads,
+        GaugeCount(0),
+        "worker.nr_threads must zero out under leader-dedup; \
+         got {:?} — populating non-leaders would let any Sum-style \
+         aggregator multiply the count by itself across the bucket",
+        worker.nr_threads,
+    );
+}
+
+/// Ghost filter four-corner matrix: pin each of the four
+/// (comm, start_time) corners. The filter at the capture
+/// pipeline tail reads:
+///
+/// ```ignore
+/// if t.comm.is_empty() && t.start_time_clock_ticks == 0 { drop }
+/// ```
+///
+/// AND-semantics — both halves must be empty/zero for the
+/// filter to fire. The other three corners must surface in
+/// the output.
+///
+/// Existing coverage:
+/// - (empty, 0) is pinned by
+///   `capture_with_filters_ghost_threads_with_empty_comm_and_zero_start`
+/// - (empty, nonzero) is pinned by
+///   `capture_with_empty_comm_nonzero_start_time_keeps_thread`
+///
+/// This test fills the remaining corners:
+/// - (nonempty, 0): a thread with a parseable comm but a
+///   missing/zero start_time field (e.g. malformed stat
+///   line that the parser couldn't lift `starttime` out of)
+///   must NOT be filtered — comm alone keeps it alive.
+/// - (nonempty, nonzero): the canonical live thread; pin
+///   that the standard well-formed-procfs path lands a
+///   thread with both halves populated.
+#[test]
+fn capture_with_ghost_filter_four_corner_keeps_nonzero_halves() {
+    let proc_tmp = tempfile::TempDir::new().unwrap();
+    let cgroup_tmp = tempfile::TempDir::new().unwrap();
+    let sys_tmp = tempfile::TempDir::new().unwrap();
+
+    // Corner (nonempty comm, nonzero start) — canonical live
+    // thread under tgid 8000. Ghost filter must not fire.
+    let tgid_alive: i32 = 8000;
+    let tid_alive: i32 = 8001;
+    stage_synthetic_proc(
+        proc_tmp.path(),
+        tgid_alive,
+        tid_alive,
+        "alive-pcomm",
+        "alive-comm",
+    );
+
+    // Corner (nonempty comm, zero start) — comm reads
+    // `parseable-comm` but `/proc/<tid>/stat` is missing so
+    // every parsed field defaults to zero, including
+    // start_time_clock_ticks. Ghost filter must NOT fire on
+    // this corner — comm alone is non-empty.
+    let tgid_no_stat: i32 = 8002;
+    let tid_no_stat: i32 = 8003;
+    let task_dir = proc_tmp
+        .path()
+        .join(tgid_no_stat.to_string())
+        .join("task")
+        .join(tid_no_stat.to_string());
+    std::fs::create_dir_all(&task_dir).unwrap();
+    // tgid /comm
+    std::fs::write(
+        proc_tmp
+            .path()
+            .join(tgid_no_stat.to_string())
+            .join("comm"),
+        "parseable-pcomm\n",
+    )
+    .unwrap();
+    // task/<tid>/comm — non-empty so the AND-clause's first
+    // half is false and the filter must skip the thread.
+    std::fs::write(task_dir.join("comm"), "parseable-comm\n").unwrap();
+    // No stat / schedstat / status / sched / io / cgroup
+    // files: every read returns the parser's default (zero
+    // for numeric fields, empty for strings). start_time
+    // therefore lands at 0.
+
+    let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), sys_tmp.path(), false);
+
+    // The `(nonempty, nonzero)` corner — alive thread.
+    let alive = snap
+        .threads
+        .iter()
+        .find(|t| t.tid == tid_alive as u32)
+        .expect("alive thread (nonempty comm, nonzero start) must surface");
+    assert!(
+        !alive.comm.is_empty(),
+        "alive thread carries non-empty comm",
+    );
+    assert_ne!(
+        alive.start_time_clock_ticks, 0,
+        "alive thread carries non-zero start_time",
+    );
+
+    // The `(nonempty, 0)` corner — comm alone keeps the
+    // thread alive even when start_time is zero.
+    let comm_only = snap
+        .threads
+        .iter()
+        .find(|t| t.tid == tid_no_stat as u32)
+        .expect(
+            "comm-only thread must surface; ghost filter is AND-gated, \
+             so non-empty comm with zero start_time must NOT be filtered",
+        );
+    assert_eq!(
+        comm_only.comm, "parseable-comm",
+        "comm-only thread surfaces with the parsed non-empty comm",
+    );
+    assert_eq!(
+        comm_only.start_time_clock_ticks, 0,
+        "comm-only thread has zero start_time (no stat file staged)",
+    );
+}
+
+/// `ThreadState::smaps_rollup_bytes` saturating boundary:
+/// a kilobyte value of `u64::MAX` clamps to `u64::MAX` bytes
+/// after the `* 1024` conversion rather than overflowing. Pin
+/// the `saturating_mul(1024)` arm at the upper boundary so a
+/// regression that flipped to `wrapping_mul` or unchecked
+/// multiplication would silently corrupt the rendered byte
+/// count (a snapshot file with `u64::MAX` Rss kB would render
+/// as a tiny number after wraparound).
+///
+/// Also pin the lower boundary: a 0 kB value converts to 0
+/// bytes (no saturation needed, but the field's expected zero
+/// behaviour is part of the contract).
+#[test]
+fn smaps_rollup_bytes_saturating_mul_clamps_at_u64_max() {
+    use crate::metric_types::Bytes;
+    let mut t = ThreadState {
+        tid: 1,
+        tgid: 1,
+        ..ThreadState::default()
+    };
+    // Boundary: u64::MAX kB. saturating_mul(1024) clamps to
+    // u64::MAX rather than wrapping. The rendered Bytes
+    // wrapper carries u64::MAX so the auto-scale ladder caps
+    // at the largest representable byte count.
+    t.smaps_rollup_kb.insert("Rss".into(), u64::MAX);
+    // Below-saturation reference value: 4 KiB → 4 * 1024 =
+    // 4096 bytes, no saturation.
+    t.smaps_rollup_kb.insert("Pss".into(), 4);
+    // Lower boundary: 0 kB → 0 bytes.
+    t.smaps_rollup_kb.insert("Shared_Clean".into(), 0);
+    // Just below saturation: floor((u64::MAX - 1) / 1024)
+    // multiplied by 1024 must NOT saturate. Pick the largest
+    // value whose * 1024 conversion fits in u64.
+    let near_max_kb = u64::MAX / 1024;
+    t.smaps_rollup_kb.insert("Anonymous".into(), near_max_kb);
+
+    let map: std::collections::BTreeMap<&String, Bytes> =
+        t.smaps_rollup_bytes().collect();
+
+    let rss_key = "Rss".to_string();
+    let pss_key = "Pss".to_string();
+    let shared_key = "Shared_Clean".to_string();
+    let anon_key = "Anonymous".to_string();
+
+    assert_eq!(
+        map[&rss_key],
+        Bytes(u64::MAX),
+        "u64::MAX kB must saturate at u64::MAX bytes; got {:?}",
+        map[&rss_key],
+    );
+    assert_eq!(
+        map[&pss_key],
+        Bytes(4 * 1024),
+        "4 kB must convert to 4096 bytes; got {:?}",
+        map[&pss_key],
+    );
+    assert_eq!(
+        map[&shared_key],
+        Bytes(0),
+        "0 kB must convert to 0 bytes; got {:?}",
+        map[&shared_key],
+    );
+    // near_max_kb * 1024 fits inside u64 — no saturation
+    // (saturating_mul returns the exact product when it
+    // doesn't overflow).
+    let expected_anon = near_max_kb.saturating_mul(1024);
+    assert_eq!(
+        map[&anon_key],
+        Bytes(expected_anon),
+        "below-saturation kB value must convert exactly; \
+         got {:?}, expected {:?}",
+        map[&anon_key],
+        Bytes(expected_anon),
+    );
+    assert!(
+        expected_anon < u64::MAX,
+        "test fixture: near_max_kb * 1024 must NOT saturate \
+         so the boundary distinction is meaningful; got {expected_anon}",
+    );
+}

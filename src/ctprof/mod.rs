@@ -2547,6 +2547,20 @@ fn attach_probe_for_tgid_at(proc_root: &Path, tgid: i32) -> AttachOutcome {
         // `worker-panic` attach tag without crashing the snapshot.
         let injected = PANIC_INJECT_TGID.load(std::sync::atomic::Ordering::Acquire);
         if injected != 0 && injected == tgid {
+            // Non-string payload variant: when the bool seam is
+            // armed, panic with a typed payload so the
+            // `downcast_ref::<&str>` and `downcast_ref::<String>`
+            // arms in `capture_with` both miss and the
+            // `unwrap_or("<non-string panic payload>")` fallback
+            // arm fires. Pinned by
+            // `capture_with_rayon_worker_panic_non_string_payload_falls_back`.
+            if PANIC_INJECT_NON_STRING.load(std::sync::atomic::Ordering::Acquire) {
+                // u64 is `'static + Send`, so it satisfies the
+                // `Box<dyn Any + Send>` payload bound but neither
+                // downcasts to `&str` nor `String` — exactly the
+                // shape the fallback arm guards against.
+                std::panic::panic_any(0xDEADBEEFu64);
+            }
             panic!("test: injected attach worker panic for tgid {tgid}");
         }
     }
@@ -2565,6 +2579,20 @@ fn attach_probe_for_tgid_at(proc_root: &Path, tgid: i32) -> AttachOutcome {
 /// surface.
 #[cfg(test)]
 static PANIC_INJECT_TGID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// Test-only companion seam for [`PANIC_INJECT_TGID`]: when
+/// armed (`true`) before calling `capture_with`, the injected
+/// panic uses a typed non-string payload (`std::panic::panic_any`
+/// over a `u64`) instead of the default formatted-message
+/// `panic!`. Lets a test exercise the
+/// `unwrap_or("<non-string panic payload>")` fallback arm in
+/// `capture_with`'s panic-handling block — the `downcast_ref`
+/// chain misses both `&str` and `String` for non-string
+/// payloads and must fall back rather than panicking on
+/// `unwrap()`.
+#[cfg(test)]
+static PANIC_INJECT_NON_STRING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Stateful half of the per-tgid attach: apply `outcome` to
 /// `summary` and emit one tracing event. Two attach-error tags
@@ -2794,6 +2822,32 @@ fn capture_with(
     // ELF parse + DWARF walk runs concurrently across tgids, with
     // an inode cache (Mutex-wrapped) so duplicate binaries are
     // resolved only once. The result is a map of tgid → probe.
+    //
+    // Cache key shape: `(st_dev, st_ino)` of `/proc/<tgid>/exe`'s
+    // metadata. Two tgids whose exes resolve to the same
+    // `(dev, ino)` share a cache entry.
+    //
+    // Overlay-fs / container collision note: the kernel exposes
+    // overlayfs files with the OVERLAY MOUNT's superblock device
+    // (`dentry->d_sb->s_dev`, the overlayfs `struct super_block`
+    // anonymous device number) and a synthetic `st_ino`. The
+    // mapping happens in `fs/overlayfs/inode.c::ovl_map_dev_ino`
+    // — both fields come from the overlay superblock's view, NOT
+    // the underlying upper or lower layer. Two unrelated mounts
+    // produce DIFFERENT `s_dev` values (each gets its own
+    // anonymous bdev); two containers sharing a single mount of
+    // the same lower-layer image-store path see the same `s_dev`
+    // and the same hashed `st_ino` for that file. In the
+    // shared-mount case a cached jemalloc attach result is
+    // reused across containers — BENIGN, because the cached value
+    // records "is this binary jemalloc-linked, and at what TSD
+    // offset", which is a property of the ELF bytes and identical
+    // across container instances of the same image. Mutable-
+    // overlay writes (an upper-layer write that copies-up the
+    // lower ELF) produce a NEW `(s_dev, st_ino)` pair within the
+    // SAME overlay mount — `ovl_map_dev_ino` rehashes against
+    // the new upper-layer inode — so the cache misses correctly
+    // and re-resolves the rewritten binary.
     let tgids = iter_tgids_at(proc_root);
     let probe_cache: std::sync::Mutex<
         std::collections::HashMap<(u64, u64), Option<crate::host_thread_probe::JemallocProbe>>,

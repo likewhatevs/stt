@@ -413,6 +413,47 @@ fn build_groups_pcomm_singleton_reverts_to_literal() {
     assert_eq!(groups.len(), 1);
 }
 
+/// `--no-thread-normalize` under [`GroupBy::Pcomm`] preserves
+/// literal pcomm grouping — `worker-7` and `worker-15` stay in
+/// distinct buckets. Mirrors
+/// [`no_thread_normalize_uses_literal_comm`] for the Pcomm axis.
+#[test]
+fn no_thread_normalize_uses_literal_pcomm() {
+    let snap_a = snap_with(vec![
+        make_thread("worker-7", "t0"),
+        make_thread("worker-15", "t1"),
+    ]);
+    let snap_b = snap_with(vec![
+        make_thread("worker-7", "t0"),
+        make_thread("worker-15", "t1"),
+    ]);
+    let diff = compare(
+        &snap_a,
+        &snap_b,
+        &CompareOptions {
+            group_by: GroupBy::Pcomm.into(),
+            cgroup_flatten: vec![],
+            no_thread_normalize: true,
+            no_cg_normalize: false,
+            sort_by: Vec::new(),
+        },
+    );
+    let group_keys: std::collections::BTreeSet<&str> =
+        diff.rows.iter().map(|r| r.group_key.as_str()).collect();
+    assert!(
+        group_keys.contains("worker-7"),
+        "literal worker-7 missing under no_thread_normalize: {group_keys:?}",
+    );
+    assert!(
+        group_keys.contains("worker-15"),
+        "literal worker-15 missing under no_thread_normalize: {group_keys:?}",
+    );
+    assert!(
+        !group_keys.contains("worker-{N}"),
+        "no normalized bucket under no_thread_normalize on Pcomm: {group_keys:?}",
+    );
+}
+
 /// Conservation: the sum of an aggregated counter across every
 /// pattern bucket equals the sum across every input thread.
 /// Pcomm pattern-aggregation must be bookkeeping-neutral —

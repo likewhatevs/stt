@@ -773,3 +773,13 @@ fn write_diff_cgroup_enrichment_section_for_cgroup_mode() {
     );
 }
 
+/// Show-side `parse_columns` accepts the `metric,value`
+/// pair — the show-only allowed vocabulary. Pins that the
+/// show-side path actually parses both names rather than
+/// silently rejecting `value` as if it were compare-only.
+#[test]
+fn parse_columns_accepts_show_side_metric_value() {
+    let cols = parse_columns("metric,value", false).expect("metric,value is show-side valid");
+    assert_eq!(cols, vec![Column::Metric, Column::Value]);
+}
+

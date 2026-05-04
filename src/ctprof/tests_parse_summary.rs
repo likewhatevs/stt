@@ -973,3 +973,96 @@ fn capture_with_rayon_worker_panic_is_caught_and_surfaced() {
         summary.dominant_failure,
     );
 }
+
+/// Non-string panic payload: a rayon worker that panics with
+/// a typed payload (not `&'static str` or `String`) must
+/// still be absorbed by the `catch_unwind` guard, surface as
+/// a `worker-panic` attach tag, and let the surviving tgid's
+/// threads land in the snapshot. Pins the
+/// `unwrap_or("<non-string panic payload>")` fallback arm in
+/// `capture_with`'s panic-handling block — without it, an
+/// unwrap on the `downcast_ref` chain would re-panic and tear
+/// down the worker.
+///
+/// The injection seam (`PANIC_INJECT_NON_STRING`) routes the
+/// panic through `std::panic::panic_any(0xDEADBEEFu64)` so
+/// the payload is a typed `u64` whose `Box<dyn Any + Send>`
+/// downcasts to neither `&str` nor `String` — exactly the
+/// case the fallback arm guards against.
+///
+/// Asserts that the snapshot lands cleanly, the worker-panic
+/// tag bumps once, and the survivor tgid's threads still walk.
+/// Companion to
+/// `capture_with_rayon_worker_panic_is_caught_and_surfaced`,
+/// which exercises the formatted-message (String) panic path.
+#[test]
+fn capture_with_rayon_worker_panic_non_string_payload_falls_back() {
+    // Serialize against any other panic-hook test in the crate.
+    static PANIC_INJECT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = PANIC_INJECT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let proc_tmp = tempfile::TempDir::new().unwrap();
+    let cgroup_tmp = tempfile::TempDir::new().unwrap();
+    let sys_tmp = tempfile::TempDir::new().unwrap();
+    std::fs::write(proc_tmp.path().join("loadavg"), "0.0 0.0 0.0 1/1 1\n").unwrap();
+
+    let survivor_tgid: i32 = 99100;
+    let survivor_tid: i32 = 99102;
+    let panic_tgid: i32 = 99101;
+    let panic_tid: i32 = 99103;
+    stage_synthetic_proc(
+        proc_tmp.path(),
+        survivor_tgid,
+        survivor_tid,
+        "ok-pcomm",
+        "ok-comm",
+    );
+    stage_synthetic_proc(
+        proc_tmp.path(),
+        panic_tgid,
+        panic_tid,
+        "panic-pcomm",
+        "panic-comm",
+    );
+
+    let saved_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_info| {}));
+
+    PANIC_INJECT_TGID.store(panic_tgid, std::sync::atomic::Ordering::Release);
+    PANIC_INJECT_NON_STRING.store(true, std::sync::atomic::Ordering::Release);
+    let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), sys_tmp.path(), true);
+    PANIC_INJECT_NON_STRING.store(false, std::sync::atomic::Ordering::Release);
+    PANIC_INJECT_TGID.store(0, std::sync::atomic::Ordering::Release);
+
+    std::panic::set_hook(saved_hook);
+
+    // Both tgids' threads walked through phase 2 — the panic
+    // in phase 1 must not block phase 2 even when the payload
+    // is non-string.
+    assert_eq!(
+        snap.threads.len(),
+        2,
+        "non-string-payload panic must not block phase 2; got {} threads",
+        snap.threads.len(),
+    );
+
+    let summary = snap
+        .probe_summary
+        .expect("use_syscall_affinity=true populates probe_summary");
+    assert!(
+        summary.failed >= 1,
+        "non-string-payload worker-panic must count as a failure; got failed={}",
+        summary.failed,
+    );
+    assert_eq!(
+        summary.dominant_failure.as_deref(),
+        Some("worker-panic"),
+        "non-string-payload panic must still surface as a \
+         `worker-panic` tag — the fallback arm produced the \
+         placeholder string but the bookkeeping path is \
+         unchanged. Got {:?}",
+        summary.dominant_failure,
+    );
+}

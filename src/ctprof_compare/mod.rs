@@ -91,8 +91,6 @@ mod tests_groups;
 #[cfg(test)]
 mod tests_metrics;
 #[cfg(test)]
-mod tests_metrics2;
-#[cfg(test)]
 mod tests_options;
 #[cfg(test)]
 mod tests_pattern;

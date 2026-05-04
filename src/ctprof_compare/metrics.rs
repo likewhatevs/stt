@@ -1556,39 +1556,46 @@ pub static CTPROF_DERIVED_METRICS: &[DerivedMetricDef] = &[
     },
 ];
 
-/// Render a metric's display name with gating tags appended.
-/// Format: `<name> [<tag1>] [<tag2>] ...` when sched_class is
-/// `Some` OR config_gates is non-empty OR is_dead is true; or
-/// just `<name>` when none of those conditions hold. Tags emit
-/// in stable order: `sched_class` first (one slot), then
-/// `[dead]` if `is_dead`, then each `config_gate` in
-/// registry-declared order.
+/// Borrow the metric's bare name from the registry. The
+/// `&'static str` lifetime piggybacks on
+/// [`CtprofMetricDef::name`]'s static-string storage —
+/// callers may borrow the static name without allocation;
+/// render sites that need owned `String`s allocate at the
+/// table-cell boundary (see [`super::render`] at the
+/// `metric_display_name(metric_def).to_string()` call site
+/// and [`super::runner::write_metric_list`]).
+///
+/// Companion to [`metric_tags`], which renders the bracketed
+/// `[<class>] [<tag>] ...` suffix separately. Render sites
+/// concatenate the two into the final display column.
+pub fn metric_display_name(metric: &CtprofMetricDef) -> &'static str {
+    metric.name
+}
+
+/// Render a metric's bracketed gating tags as a single
+/// space-separated string. Returns the empty string when
+/// `sched_class` is `None`, `is_dead` is false, AND
+/// `config_gates` is empty.
+///
+/// Tag emission order: `[<sched_class>]` first when
+/// `sched_class` is `Some`, then `[dead]` when `is_dead`, then
+/// each `config_gate` in registry-declared order. Examples:
+/// - `nr_wakeups_affine` → `[cfs-only] [SCHEDSTATS]`
+/// - `core_forceidle_sum` → `[SCHED_CORE] [SCHEDSTATS]`
+/// - `fair_slice_ns` → `[fair-policy]`
 ///
 /// Compact rendering: each `config_gate` is stripped of its
 /// `CONFIG_` prefix before emission so the rendered cell stays
 /// scannable in narrow tables. The data field
-/// [`CtprofMetricDef::config_gates`] keeps the full
-/// `CONFIG_X` spelling so an operator can grep their kconfig
-/// directly. Examples:
-/// - `wait_sum [CONFIG_SCHEDSTATS]` → `wait_sum [SCHEDSTATS]`
-/// - `core_forceidle_sum [CONFIG_SCHED_CORE] [CONFIG_SCHEDSTATS]`
-///   → `core_forceidle_sum [SCHED_CORE] [SCHEDSTATS]`
-///
+/// [`CtprofMetricDef::config_gates`] keeps the full `CONFIG_X`
+/// spelling so an operator can grep their kconfig directly.
 /// `sched_class` tags are rendered as-is (already short, e.g.
 /// `[cfs-only]`, `[fair-policy]`, `[non-ext]`).
-///
-/// Returns `Cow::Borrowed(metric.name)` on the no-decoration
-/// short-circuit so the typical-case path skips a heap
-/// allocation; tagged metrics return `Cow::Owned(String)`.
 ///
 /// Pure formatting layer — does not interpret tag values; the
 /// metric's own [`CtprofMetricDef::sched_class`] /
 /// [`CtprofMetricDef::config_gates`] / [`CtprofMetricDef::is_dead`]
 /// docs are the source of truth for what each spelling means.
-pub fn metric_display_name(metric: &CtprofMetricDef) -> &'static str {
-    metric.name
-}
-
 pub fn metric_tags(metric: &CtprofMetricDef) -> String {
     let mut out = String::new();
     if let Some(class) = metric.sched_class {
