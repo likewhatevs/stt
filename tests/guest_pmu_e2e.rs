@@ -60,13 +60,16 @@ struct CpuidLeafA {
 /// Read CPUID leaf 0xA on the current CPU. Uses `core::arch::x86_64::__cpuid_count`
 /// — guest-side userspace code can issue cpuid directly because
 /// VMX (Intel) and SVM (AMD) both intercept it and KVM writes
-/// the synthesized values into the guest's GP registers.
+/// the synthesized values into the guest's GP registers. The
+/// `__cpuid_count` intrinsic is a safe wrapper around an internal
+/// `asm!` block (see `core_arch/src/x86/cpuid.rs`), so no `unsafe`
+/// block is needed at the call site.
 ///
 /// On non-x86_64 architectures this is unreachable (the test
 /// scenario short-circuits before calling this helper).
 #[cfg(target_arch = "x86_64")]
 fn read_cpuid_leaf_a() -> CpuidLeafA {
-    let r = unsafe { core::arch::x86_64::__cpuid_count(0xa, 0) };
+    let r = core::arch::x86_64::__cpuid_count(0xa, 0);
     CpuidLeafA {
         version: r.eax & 0xff,
         num_gp: (r.eax >> 8) & 0xff,
@@ -93,14 +96,162 @@ fn read_cpuid_leaf_a() -> CpuidLeafA {
     }
 }
 
+/// Best-effort host-PMU presence probe accessible from inside the
+/// guest. Returns `true` when independent CPUID signals indicate the
+/// underlying host CPU has a PMU with PEBS support, distinct from
+/// leaf 0xA itself.
+///
+/// Why this matters: when leaf 0xA reports version=0, we cannot
+/// trivially distinguish "host has no PMU / kvm.enable_pmu=0" (the
+/// synthesizer correctly preserves the zero) from "synthesizer
+/// regressed silently" (it should have written v2 but didn't).
+/// Without an independent signal, a regression in
+/// `src/vmm/x86_64/topology.rs::leaf 0xa` would produce a silent
+/// pass — the test would report version=0, classify it as "no PMU",
+/// and never fail.
+///
+/// The probe combines two signals KVM passes through independently
+/// of leaf 0xA's vendor-plus-version gate:
+///   - CPUID leaf 0 vendor (EBX:EDX:ECX). KVM's `do_host_cpuid`
+///     in `arch/x86/kvm/cpuid.c` calls `cpuid_count` directly on
+///     the host CPU for leaf 0 and the leaf-0 case in
+///     `__do_cpuid_func` only updates the max-leaf field, leaving
+///     the vendor string unchanged.
+///   - CPUID leaf 1 EDX bit 21 (DS, "dts" in /proc/cpuinfo).
+///     Filtered by KVM through `cpuid_entry_override(entry,
+///     CPUID_1_EDX)` against `kvm_cpu_caps`. DS is set in
+///     `kvm_cpu_caps` only when `vmx_pebs_supported()` is true at
+///     `arch/x86/kvm/vmx/vmx.c::vmx_set_cpu_caps`
+///     (`kvm_cpu_cap_check_and_set(X86_FEATURE_DS)` inside the
+///     `if (vmx_pebs_supported())` arm). `vmx_pebs_supported()` in
+///     `arch/x86/kvm/vmx/capabilities.h` checks
+///     `boot_cpu_has(X86_FEATURE_PEBS) && kvm_pmu_cap.pebs_ept &&
+///     !enable_mediated_pmu`, and `kvm_pmu_cap` is zeroed under
+///     `!enable_pmu` (see `arch/x86/kvm/pmu.c::kvm_init_pmu_capability`,
+///     `if (!enable_pmu) { memset(&kvm_pmu_cap, 0, ...); return; }`).
+///     So DS clears under `!enable_pmu` AND under `!PEBS`.
+///
+/// Returns `true` iff vendor=GenuineIntel AND DS=1. The probe is an
+/// Intel + PEBS + PMU positive signal: when it returns `true`, the
+/// host has PMU enabled with PEBS hardware and KVM passing it
+/// through, so leaf 0xA version=0 in that environment must be a
+/// synthesizer regression (no other path produces this combination
+/// inside the guest). PMU-without-PEBS hosts (e.g. older Intel
+/// without `boot_cpu_has(X86_FEATURE_PEBS)`, or hosts without
+/// `pebs_ept`), `kvm.enable_pmu=0`, hosts with mediated vPMU
+/// (`enable_mediated_pmu=1`, which short-circuits
+/// `vmx_pebs_supported()` to `false`), and AMD all produce a false
+/// negative — the probe returns `false` and the test falls back to
+/// the conservative non-failing skip. This means the probe makes
+/// the test stricter than the prior silent pass on Intel+PEBS
+/// hosts, while staying silent on the configurations where it
+/// can't disambiguate.
+#[cfg(target_arch = "x86_64")]
+fn host_likely_has_pmu() -> bool {
+    // `__cpuid` is a safe wrapper around an internal `asm!` block
+    // (see `core_arch/src/x86/cpuid.rs`). cpuid is unprivileged on
+    // x86_64; KVM intercepts and writes the synthesized result
+    // into the guest GPRs.
+    let leaf0 = core::arch::x86_64::__cpuid(0);
+    let leaf1 = core::arch::x86_64::__cpuid(1);
+    host_likely_has_pmu_decode(leaf0.ebx, leaf0.edx, leaf0.ecx, leaf1.edx)
+}
+
+/// Stub for non-x86_64. Always returns `false` — aarch64 PMUv3
+/// presence is verified by `src/vmm/aarch64/{kvm,fdt}.rs` unit
+/// tests; the leaf-0xA test short-circuits on non-x86 hosts before
+/// calling this helper.
+#[cfg(not(target_arch = "x86_64"))]
+fn host_likely_has_pmu() -> bool {
+    false
+}
+
+/// Pure decode helper extracted from [`host_likely_has_pmu`] so the
+/// vendor + DS-bit logic is unit-testable without mocking CPUID.
+/// Returns `true` iff the leaf-0 vendor is "GenuineIntel" AND leaf 1
+/// EDX bit 21 (DS) is set.
+fn host_likely_has_pmu_decode(
+    leaf0_ebx: u32,
+    leaf0_edx: u32,
+    leaf0_ecx: u32,
+    leaf1_edx: u32,
+) -> bool {
+    // "GenuineIntel" = EBX:0x756e6547 EDX:0x49656e69 ECX:0x6c65746e —
+    // matches `detect_vendor` in src/vmm/x86_64/topology.rs.
+    let intel = (leaf0_ebx, leaf0_edx, leaf0_ecx)
+        == (0x756e_6547, 0x4965_6e69, 0x6c65_746e);
+    if !intel {
+        return false;
+    }
+    // CPUID leaf 1 EDX bit 21 = DS (Debug Store). Set when the host
+    // has the DS feature and KVM exposes it. Strongly correlated
+    // with PMU presence on Intel CPUs.
+    (leaf1_edx >> 21) & 1 == 1
+}
+
+/// Outcome of classifying a `perf_event_open(2)` errno on the
+/// PMU-pipeline test. Either a non-failing skip (host-config errors
+/// the test cannot fix) or a fail (errnos that point at the
+/// synthesized PMU surface).
+#[derive(Debug, PartialEq, Eq)]
+enum PerfOpenResult {
+    /// Host-policy / kernel-config error. The errno does not
+    /// indicate a synthesizer bug; the test reports a non-failing
+    /// `AssertDetail` and skips the counter assertion. Carries a
+    /// short reason describing the cause.
+    Skip(&'static str),
+    /// Synthesizer-regression error. The errno indicates the
+    /// synthesized PMU surface failed to bind to a backend; the
+    /// test fails. Carries a short reason describing what the
+    /// errno typically maps to.
+    Fail(&'static str),
+}
+
+/// Classify a raw errno from `perf_event_open(2)` into a
+/// [`PerfOpenResult`]. Extracted so each errno path is unit-testable
+/// without booting a guest.
+///
+/// Mapping:
+///   - `EACCES` / `EPERM`: host-policy denial
+///     (`kernel.perf_event_paranoid > 2` or missing `CAP_PERFMON`).
+///     Skip.
+///   - `ENOSYS`: kernel built without `CONFIG_PERF_EVENTS`. Skip.
+///   - everything else (notably `EINVAL`, `ENODEV`, `EOPNOTSUPP`):
+///     the synthesized PMU surface failed to bind to a backend.
+///     `EINVAL` fires when the kernel rejects the requested
+///     event/type pair against an empty backend (e.g.
+///     `intel_pmu_init` returning `-ENODEV` upstream of
+///     `perf_event_open` surfaces as `EINVAL` on the syscall —
+///     see `kernel/events/core.c::perf_event_open`'s `return
+///     -EINVAL` arms). A regression in
+///     `src/vmm/x86_64/topology.rs::leaf 0xa` that drops the
+///     synthesized v2 surface would surface as exactly that.
+///     Fail.
+fn classify_perf_open_errno(raw: i32) -> PerfOpenResult {
+    match raw {
+        libc::EACCES | libc::EPERM => PerfOpenResult::Skip(
+            "EACCES/EPERM = perf_event_paranoid > 2 or missing CAP_PERFMON",
+        ),
+        libc::ENOSYS => PerfOpenResult::Skip(
+            "ENOSYS = kernel without CONFIG_PERF_EVENTS",
+        ),
+        _ => PerfOpenResult::Fail(
+            "EINVAL/ENODEV/EOPNOTSUPP indicate the synthesized PMU surface \
+             did not bind to a backend — check src/vmm/x86_64/topology.rs::leaf 0xa \
+             for x86 or src/vmm/aarch64/kvm.rs::init_pmuv3 for aarch64",
+        ),
+    }
+}
+
 /// Asserts the synthesized PMU-v2 surface is visible to the guest
 /// via CPUID leaf 0xA. When the host has no PMU
 /// (kvm.enable_pmu=0 or PMU-less hardware), the synthesizer in
 /// `src/vmm/x86_64/topology.rs` leaves the leaf zeroed; under that
-/// condition the test cannot meaningfully assert the v2 surface
-/// and reports a non-failing AssertDetail describing the
-/// observation. Hosts with a PMU advertise version >= 1; the
-/// synthesizer overwrites with v2.
+/// condition the test consults [`host_likely_has_pmu`] (an
+/// independent CPUID probe via vendor + DS feature bit) to
+/// distinguish "host has no PMU — expected" from "synthesizer
+/// regressed silently — fail." Hosts with a PMU advertise
+/// version >= 1; the synthesizer overwrites with v2.
 ///
 /// On non-x86 hosts the test short-circuits with a non-failing
 /// AssertDetail — CPUID is x86-only; the analogous aarch64
@@ -122,13 +273,46 @@ fn guest_pmu_cpuid_leaf_a_synthesized(_ctx: &Ctx) -> Result<AssertResult> {
     let leaf = read_cpuid_leaf_a();
     let mut result = AssertResult::pass();
     if leaf.version == 0 {
-        // Host has no PMU; the leaf is zeroed by design — the
-        // synthesizer skips it on a zero-version base. This is
-        // the expected behavior on a no-PMU host; report it
-        // without failing the test.
+        // The synthesizer in src/vmm/x86_64/topology.rs gates leaf
+        // 0xA synthesis on `entry.eax & 0xff != 0` — version=0 in
+        // the guest means KVM passed through 0 (host has no PMU,
+        // kvm.enable_pmu=0, or vendor=AMD which doesn't define
+        // leaf 0xA), OR the synthesizer regressed.
+        //
+        // Probe an independent host-PMU signal (vendor + DS bit;
+        // see `host_likely_has_pmu`). DS=1 only when KVM ran the
+        // `vmx_pebs_supported()` arm in vmx_set_cpu_caps, which
+        // requires enable_pmu=1 (kvm_pmu_cap is zeroed under
+        // !enable_pmu) AND host PEBS hardware AND
+        // kvm_pmu_cap.pebs_ept AND !enable_mediated_pmu. So when
+        // the probe returns true, the only path that produces
+        // version=0 in the guest is a synthesizer regression —
+        // fail the test instead of silently passing.
+        if host_likely_has_pmu() {
+            result.passed = false;
+            result.details.push(AssertDetail::new(
+                DetailKind::Other,
+                "CPUID leaf 0xA reports version=0 but the host \
+                 appears PMU-capable (vendor=GenuineIntel and \
+                 leaf 1 EDX bit 21 (DS) is set, which on a \
+                 KVM guest requires enable_pmu=1 + host PEBS). \
+                 src/vmm/x86_64/topology.rs::leaf 0xa regressed: \
+                 the synthesizer should have written PMU v2 but \
+                 the guest sees version=0, which breaks \
+                 scx_layered/scx_cosmos perf-counter reads."
+                    .to_string(),
+            ));
+            return Ok(result);
+        }
+        // Host appears to have no PMU; the leaf is zeroed by
+        // design — the synthesizer skips it on a zero-version
+        // base. This is the expected behavior on a no-PMU host
+        // (AMD, ancient Intel without DS, or PMU-less hardware);
+        // report it without failing the test.
         result.details.push(AssertDetail::new(
             DetailKind::Other,
-            "CPUID leaf 0xA reports version=0 (host has no PMU); \
+            "CPUID leaf 0xA reports version=0 and the host probe \
+             (vendor + DS bit) does not indicate a PMU; \
              synthesizer correctly preserved the zeroed leaf"
                 .to_string(),
         ));
@@ -287,43 +471,39 @@ fn guest_pmu_perf_event_open_counts_instructions(_ctx: &Ctx) -> Result<AssertRes
     let fd = unsafe { pes::perf_event_open(&mut attr, 0, -1, -1, 0) };
     if fd < 0 {
         let errno = std::io::Error::last_os_error();
-        let raw = errno.raw_os_error();
-        // Skip-only set: host-policy denials and missing kernel support.
-        // Any other errno indicates the synthesized PMU surface failed
-        // to bind to a backend — a real regression we MUST surface.
-        let is_host_config = matches!(
-            raw,
-            Some(libc::EACCES) | Some(libc::EPERM) | Some(libc::ENOSYS)
-        );
-        if is_host_config {
-            let mut result = AssertResult::pass();
-            result.details.push(AssertDetail::new(
-                DetailKind::Other,
-                format!(
-                    "perf_event_open failed with host-config errno \
-                     ({errno}, raw={raw:?}); skipping counter assertion. \
-                     EACCES/EPERM = perf_event_paranoid > 2 or missing \
-                     CAP_PERFMON; ENOSYS = kernel without CONFIG_PERF_EVENTS."
-                ),
-            ));
-            return Ok(result);
+        // raw_os_error returns Some for OS errors raised via
+        // last_os_error; unwrap_or(0) maps the unreachable None
+        // arm to 0, which falls into the catch-all Fail branch
+        // and surfaces the original `errno` Display in the
+        // diagnostic.
+        let raw = errno.raw_os_error().unwrap_or(0);
+        match classify_perf_open_errno(raw) {
+            PerfOpenResult::Skip(reason) => {
+                let mut result = AssertResult::pass();
+                result.details.push(AssertDetail::new(
+                    DetailKind::Other,
+                    format!(
+                        "perf_event_open failed with host-config errno \
+                         ({errno}, raw={raw}); skipping counter assertion. \
+                         {reason}.",
+                    ),
+                ));
+                return Ok(result);
+            }
+            PerfOpenResult::Fail(reason) => {
+                let mut result = AssertResult::pass();
+                result.passed = false;
+                result.details.push(AssertDetail::new(
+                    DetailKind::Other,
+                    format!(
+                        "perf_event_open(PERF_TYPE_HARDWARE, \
+                         PERF_COUNT_HW_INSTRUCTIONS) failed with errno {errno} \
+                         (raw={raw}). {reason}.",
+                    ),
+                ));
+                return Ok(result);
+            }
         }
-        // Fail on EINVAL / ENODEV / EOPNOTSUPP and any other unmapped
-        // errno: the synthesized PMU surface is the prime suspect.
-        let mut result = AssertResult::pass();
-        result.passed = false;
-        result.details.push(AssertDetail::new(
-            DetailKind::Other,
-            format!(
-                "perf_event_open(PERF_TYPE_HARDWARE, \
-                 PERF_COUNT_HW_INSTRUCTIONS) failed with errno {errno} \
-                 (raw={raw:?}). EINVAL/ENODEV/EOPNOTSUPP indicate the \
-                 synthesized PMU surface did not bind to a backend — \
-                 check src/vmm/x86_64/topology.rs::leaf_0xa for x86 or \
-                 src/vmm/aarch64/kvm.rs::init_pmuv3 for aarch64."
-            ),
-        ));
-        return Ok(result);
     }
     // SAFETY: the kernel returned a non-negative fd; we own it.
     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
@@ -417,4 +597,206 @@ fn guest_pmu_perf_event_open_counts_instructions(_ctx: &Ctx) -> Result<AssertRes
         ),
     ));
     Ok(result)
+}
+
+// ----------------------------------------------------------------------------
+// Unit tests for the pure helpers extracted above.
+//
+// Plain `#[test]` functions in a `ktstr_test` integration-test
+// binary are visible to nextest because the early-dispatch ctor's
+// `--list` path falls through to libtest after printing gauntlet
+// names (see `list_plain_tests` in
+// `src/test_support/dispatch.rs`). The `parse_stall_duration_test.rs`
+// file uses the same top-level pattern.
+// ----------------------------------------------------------------------------
+
+#[test]
+fn classify_perf_open_errno_eacces_skips() {
+    match classify_perf_open_errno(libc::EACCES) {
+        PerfOpenResult::Skip(reason) => {
+            assert!(
+                reason.contains("EACCES") || reason.contains("perf_event_paranoid"),
+                "EACCES skip reason should mention EACCES/EPERM or paranoid: got {reason:?}",
+            );
+        }
+        other => panic!("EACCES should be Skip, got {other:?}"),
+    }
+}
+
+#[test]
+fn classify_perf_open_errno_eperm_skips() {
+    match classify_perf_open_errno(libc::EPERM) {
+        PerfOpenResult::Skip(reason) => {
+            assert!(
+                reason.contains("EPERM") || reason.contains("CAP_PERFMON"),
+                "EPERM skip reason should mention EPERM or CAP_PERFMON: got {reason:?}",
+            );
+        }
+        other => panic!("EPERM should be Skip, got {other:?}"),
+    }
+}
+
+#[test]
+fn classify_perf_open_errno_enosys_skips() {
+    match classify_perf_open_errno(libc::ENOSYS) {
+        PerfOpenResult::Skip(reason) => {
+            assert!(
+                reason.contains("ENOSYS") || reason.contains("CONFIG_PERF_EVENTS"),
+                "ENOSYS skip reason should mention ENOSYS or CONFIG_PERF_EVENTS: got {reason:?}",
+            );
+        }
+        other => panic!("ENOSYS should be Skip, got {other:?}"),
+    }
+}
+
+#[test]
+fn classify_perf_open_errno_einval_fails() {
+    match classify_perf_open_errno(libc::EINVAL) {
+        PerfOpenResult::Fail(reason) => {
+            assert!(
+                reason.contains("synthesized PMU surface"),
+                "EINVAL fail reason should reference the synthesized PMU surface: got {reason:?}",
+            );
+        }
+        other => panic!("EINVAL should be Fail, got {other:?}"),
+    }
+}
+
+#[test]
+fn classify_perf_open_errno_enodev_fails() {
+    match classify_perf_open_errno(libc::ENODEV) {
+        PerfOpenResult::Fail(reason) => {
+            assert!(
+                reason.contains("synthesized PMU surface"),
+                "ENODEV fail reason should reference the synthesized PMU surface: got {reason:?}",
+            );
+        }
+        other => panic!("ENODEV should be Fail, got {other:?}"),
+    }
+}
+
+#[test]
+fn classify_perf_open_errno_eopnotsupp_fails() {
+    match classify_perf_open_errno(libc::EOPNOTSUPP) {
+        PerfOpenResult::Fail(reason) => {
+            assert!(
+                reason.contains("synthesized PMU surface"),
+                "EOPNOTSUPP fail reason should reference the synthesized PMU surface: got {reason:?}",
+            );
+        }
+        other => panic!("EOPNOTSUPP should be Fail, got {other:?}"),
+    }
+}
+
+#[test]
+fn classify_perf_open_errno_unknown_falls_into_fail() {
+    // Catch-all branch: any unmapped errno should land in Fail so a
+    // novel kernel/KVM divergence surfaces as a real test failure
+    // instead of being silently mapped to Skip. 9999 is well past
+    // any defined errno on Linux (max errno < 200).
+    match classify_perf_open_errno(9999) {
+        PerfOpenResult::Fail(reason) => {
+            assert!(
+                reason.contains("synthesized PMU surface"),
+                "unknown errno fail reason should reference the synthesized PMU surface: \
+                 got {reason:?}",
+            );
+        }
+        other => panic!("unknown errno (9999) should be Fail, got {other:?}"),
+    }
+}
+
+#[test]
+fn classify_perf_open_errno_zero_falls_into_fail() {
+    // raw_os_error returning None (mapped to 0 at the call site)
+    // hits the catch-all Fail branch.
+    match classify_perf_open_errno(0) {
+        PerfOpenResult::Fail(_) => {}
+        other => panic!("errno=0 should be Fail (catch-all), got {other:?}"),
+    }
+}
+
+#[test]
+fn host_likely_has_pmu_decode_intel_with_ds_returns_true() {
+    // "GenuineIntel" = EBX:0x756e6547 EDX:0x49656e69 ECX:0x6c65746e.
+    // Leaf 1 EDX bit 21 set = DS feature present.
+    let leaf1_edx_with_ds = 1u32 << 21;
+    assert!(host_likely_has_pmu_decode(
+        0x756e_6547,
+        0x4965_6e69,
+        0x6c65_746e,
+        leaf1_edx_with_ds,
+    ));
+}
+
+#[test]
+fn host_likely_has_pmu_decode_intel_without_ds_returns_false() {
+    // GenuineIntel vendor but DS bit clear → not enough signal to
+    // call the host PMU-capable. Bit 20 set, bit 21 clear.
+    let leaf1_edx_no_ds = 1u32 << 20;
+    assert!(!host_likely_has_pmu_decode(
+        0x756e_6547,
+        0x4965_6e69,
+        0x6c65_746e,
+        leaf1_edx_no_ds,
+    ));
+}
+
+#[test]
+fn host_likely_has_pmu_decode_amd_with_ds_returns_false() {
+    // "AuthenticAMD" = EBX:0x68747541 EDX:0x69746e65 ECX:0x444d4163.
+    // AMD does not define leaf 0xA; treat version=0 as expected
+    // regardless of leaf 1 EDX bit 21.
+    let leaf1_edx_with_ds = 1u32 << 21;
+    assert!(!host_likely_has_pmu_decode(
+        0x6874_7541,
+        0x6974_6e65,
+        0x444d_4163,
+        leaf1_edx_with_ds,
+    ));
+}
+
+#[test]
+fn host_likely_has_pmu_decode_unknown_vendor_returns_false() {
+    // Unknown vendor (zeroed EBX/EDX/ECX) → no Intel-specific PMU
+    // claim, so false even with DS asserted.
+    let leaf1_edx_with_ds = 1u32 << 21;
+    assert!(!host_likely_has_pmu_decode(0, 0, 0, leaf1_edx_with_ds));
+}
+
+#[test]
+fn host_likely_has_pmu_decode_intel_all_other_bits_set_but_ds_clear() {
+    // Stress: every leaf-1-EDX bit set EXCEPT bit 21. Verifies the
+    // shift+mask isolates bit 21 and does not accidentally accept
+    // adjacent bits as a positive signal.
+    let leaf1_edx_no_ds = !(1u32 << 21);
+    assert!(!host_likely_has_pmu_decode(
+        0x756e_6547,
+        0x4965_6e69,
+        0x6c65_746e,
+        leaf1_edx_no_ds,
+    ));
+}
+
+#[test]
+fn host_likely_has_pmu_decode_intel_only_ds_bit_set() {
+    // Inverse stress: only bit 21 set. Verifies the function reads
+    // bit 21 (not bit 20 or bit 22) — a one-off in the shift would
+    // make this case return false.
+    let leaf1_edx_only_ds = 1u32 << 21;
+    assert!(host_likely_has_pmu_decode(
+        0x756e_6547,
+        0x4965_6e69,
+        0x6c65_746e,
+        leaf1_edx_only_ds,
+    ));
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[test]
+fn host_likely_has_pmu_stub_returns_false_off_x86() {
+    // Non-x86_64 stub. Confirms the leaf-0xA test will hit the
+    // existing non-x86 short-circuit branch first; this test only
+    // pins the stub's value when the short-circuit ever drops.
+    assert!(!host_likely_has_pmu());
 }

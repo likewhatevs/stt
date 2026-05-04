@@ -31,16 +31,20 @@
 //! - [`super::resolve`] — env-cascade root resolution that
 //!   `CacheDir::new` and `CacheDir::default_root` flow through.
 //!
-//! Reader/writer asymmetry: shared (reader) lock blocks 10 s,
-//! exclusive (writer) lock blocks 5 minutes (overridable via
-//! the [`STORE_EXCLUSIVE_LOCK_TIMEOUT_ENV`] environment variable).
-//! Writer must outlast every concurrent test reader; reader bails
-//! fast on a stuck writer. See [`SHARED_LOCK_DEFAULT_TIMEOUT`] and
+//! Reader/writer asymmetry: shared (reader) lock blocks 10 s — the
+//! reader timeout is fixed and not operator-tunable. The exclusive
+//! (writer) lock blocks 5 minutes by default but is the ONLY one
+//! overridable, via the [`STORE_EXCLUSIVE_LOCK_TIMEOUT_ENV`]
+//! environment variable. Writer must outlast every concurrent test
+//! reader; reader bails fast on a stuck writer. See
+//! [`SHARED_LOCK_DEFAULT_TIMEOUT`] and
 //! [`STORE_EXCLUSIVE_LOCK_DEFAULT_TIMEOUT`] for the literal
 //! durations and their rationale.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::Context;
 
@@ -120,8 +124,57 @@ pub struct CacheDir {
     root: PathBuf,
 }
 
+/// Process-level dedup set for the unstripped-vmlinux warning.
+///
+/// `lookup()` is the user-visible entry point and may be called many
+/// times per CLI invocation against the same cache_key (for example,
+/// a multi-kernel gauntlet does N lookups of the same stale entry
+/// across its scenario fan-out). Without dedup, every lookup would
+/// re-emit the strip-fallback warn — N copies of the same line drowns
+/// out unrelated diagnostics. The set holds every cache_key for which
+/// the warn has already fired in this process; on hit, the warn
+/// helper skips re-emission.
+///
+/// `OnceLock` rather than `LazyLock` to keep the lazy init explicit.
+/// The mutex is held only across an O(1) HashSet insert; contention
+/// under realistic lookup fan-out is negligible.
+fn warned_keys() -> &'static Mutex<HashSet<String>> {
+    static SET: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    SET.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Pure dedup-gate logic for [`warn_if_unstripped_vmlinux`].
+///
+/// Returns `true` iff a fresh `tracing::warn!` should fire for this
+/// entry: `should_warn_unstripped` accepts the entry AND the entry's
+/// cache_key is being recorded in `set` for the first time. Returns
+/// `false` if the entry does not need warning at all OR if the key
+/// was already in the set (already-warned suppression).
+///
+/// Takes `&Mutex<HashSet<String>>` rather than reaching into the
+/// process-wide [`warned_keys`] static so tests can drive the gate
+/// against a fresh per-test mutex without polluting (or being
+/// polluted by) the global set. Production callers pass
+/// `warned_keys()`; the bool return decouples the side effect (the
+/// `tracing::warn!`) from the decision so the latter is unit-testable.
+fn should_emit_unstripped_warn(entry: &CacheEntry, set: &Mutex<HashSet<String>>) -> bool {
+    if !should_warn_unstripped(entry) {
+        return false;
+    }
+    let mut guard = set.lock().unwrap_or_else(|e| e.into_inner());
+    guard.insert(entry.key.clone())
+}
+
 /// Emit a per-lookup warning when a cache entry was created with an
 /// unstripped vmlinux.
+///
+/// **Once per cache_key per process.** A `static` HashSet (see
+/// [`warned_keys`]) records every key for which the warn has already
+/// fired; subsequent calls for the same key are silent. Suppression
+/// covers callers that lookup the same stale entry repeatedly within
+/// one CLI invocation (e.g. multi-kernel gauntlet). The dedup
+/// decision is delegated to [`should_emit_unstripped_warn`], which
+/// is independently unit-tested.
 ///
 /// Uses [`tracing::warn!`] so the message routes through the same
 /// observability pipeline as every other cache-layer diagnostic
@@ -130,8 +183,13 @@ pub struct CacheDir {
 /// `eprintln!` would bypass that pipeline and force every consumer
 /// to live with raw-stderr output regardless of their tracing
 /// configuration.
+///
+/// The mutex is held only across the O(1) HashSet insert inside
+/// `should_emit_unstripped_warn`; the `tracing::warn!` macro fires
+/// AFTER lock release so a slow tracing subscriber cannot serialise
+/// concurrent lookups.
 fn warn_if_unstripped_vmlinux(entry: &CacheEntry) {
-    if should_warn_unstripped(entry) {
+    if should_emit_unstripped_warn(entry, warned_keys()) {
         tracing::warn!(
             cache_key = %entry.key,
             "cache: using unstripped vmlinux (strip failed on a prior build; \
@@ -228,7 +286,29 @@ impl CacheDir {
     }
 
     /// Look up a cached kernel by cache key.
+    ///
+    /// On hit, emits a `tracing::warn!` via
+    /// [`warn_if_unstripped_vmlinux`] when the cached entry took the
+    /// strip-failure fallback (see [`should_warn_unstripped`] for the
+    /// exact predicate). Caller-facing call sites want the warning;
+    /// internal call sites that look the entry up only to compare
+    /// against caller intent (notably [`Self::store`]'s in-lock
+    /// recheck) use [`Self::lookup_silent`] to avoid double-emitting
+    /// the same warning the caller will see on its next `lookup`.
     pub fn lookup(&self, cache_key: &str) -> Option<CacheEntry> {
+        let entry = self.lookup_silent(cache_key)?;
+        warn_if_unstripped_vmlinux(&entry);
+        Some(entry)
+    }
+
+    /// Look up a cached kernel without emitting the unstripped-vmlinux
+    /// warning. Internal callers that consume the entry's metadata
+    /// without surfacing it to the user — specifically the in-lock
+    /// recheck inside [`Self::store`] — use this variant so a recheck
+    /// hit on a strip-fallback entry does not log a duplicate warning
+    /// that the user-facing [`Self::lookup`] will already log on their
+    /// next call.
+    fn lookup_silent(&self, cache_key: &str) -> Option<CacheEntry> {
         if let Err(e) = validate_cache_key(cache_key) {
             tracing::warn!("invalid cache key: {e}");
             return None;
@@ -241,13 +321,11 @@ impl CacheDir {
         if !entry_dir.join(&metadata.image_name).exists() {
             return None;
         }
-        let entry = CacheEntry {
+        Some(CacheEntry {
             key: cache_key.to_string(),
             path: entry_dir,
             metadata,
-        };
-        warn_if_unstripped_vmlinux(&entry);
-        Some(entry)
+        })
     }
 
     /// List all cached kernel entries, sorted by build time (newest
@@ -262,21 +340,20 @@ impl CacheDir {
         for dir_entry in read_dir {
             let dir_entry = dir_entry?;
             let path = dir_entry.path();
-            let file_name = dir_entry.file_name();
-            let name_hint = file_name.to_string_lossy();
-            // Skip dotfile children — `.locks/` and `.tmp-*` are
-            // reserved for ktstr's own bookkeeping.
-            if name_hint.starts_with('.') {
-                continue;
-            }
-            if !path.is_dir() {
-                continue;
-            }
             let name = match dir_entry.file_name().into_string() {
                 Ok(n) => n,
                 Err(_) => continue,
             };
-            if name.starts_with(TMP_DIR_PREFIX) {
+            // Skip every dotfile child — ktstr reserves all
+            // dot-prefixed names (current uses: `.locks/`, `.tmp-*`).
+            // `validate_cache_key` rejects leading-dot inputs, so a
+            // dotfile in the cache root is either ktstr bookkeeping or
+            // an external artifact; either way `list()` must not
+            // surface it as a cache entry.
+            if name.starts_with('.') {
+                continue;
+            }
+            if !path.is_dir() {
                 continue;
             }
             match read_metadata(&path) {
@@ -327,7 +404,9 @@ impl CacheDir {
     /// # Steps (in order)
     ///
     /// 1. **Validate inputs.** [`validate_cache_key`] rejects
-    ///    `..`, slashes, NUL, and the `TMP_DIR_PREFIX` reservation;
+    ///    `..`, slashes, NUL, leading-dot keys (the `TMP_DIR_PREFIX`
+    ///    reservation plus any other dotfile-shaped key, since
+    ///    `list()` skips every dotfile child);
     ///    [`validate_filename`] rejects path-separator characters in
     ///    the image basename. Invalid input fails before any I/O.
     /// 2. **Acquire the per-key store lock.** `LOCK_EX` on
@@ -341,7 +420,7 @@ impl CacheDir {
     ///    produces an error rather than blocking forever — a hung
     ///    writer cannot indefinitely block a fresh rebuild attempt.
     /// 3. **Double-checked re-lookup inside the lock.** After
-    ///    acquiring `LOCK_EX`, re-run [`Self::lookup`] for
+    ///    acquiring `LOCK_EX`, re-run [`Self::lookup_silent`] for
     ///    `cache_key`. When N peers race to publish the same key
     ///    they all miss the pre-lock cache check, queue on
     ///    `LOCK_EX`, and serialise behind the head writer. Without
@@ -417,7 +496,20 @@ impl CacheDir {
         // matched entry is returned to the caller verbatim — its
         // on-disk bytes are byte-equivalent to what we would write,
         // so no overwrite-publish is needed.
-        if let Some(existing) = self.lookup(cache_key)
+        //
+        // The recheck-hit early-return BYPASSES the orphan tempdir
+        // sweep at step 4. That is intentional: every orphan-sweep
+        // call costs an opendir + readdir + N kill(pid, 0) probes,
+        // and the recheck-hit path is the hot path for serialised
+        // peer fan-out — adding the sweep here would charge every
+        // late peer a syscall budget the head writer already paid.
+        // Orphans accumulate only on the cache-miss / overwrite
+        // path, which is also where new tempdirs are created, so
+        // the GC runs proportionally to tempdir creation. Uses the
+        // private `lookup_silent` variant (no warn) so the recheck
+        // does not double-emit the unstripped-vmlinux warn that
+        // store()'s caller would see again on its next lookup().
+        if let Some(existing) = self.lookup_silent(cache_key)
             && cache_content_matches(&existing.metadata, metadata, artifacts.vmlinux.is_some())
         {
             tracing::debug!(
@@ -457,15 +549,12 @@ impl CacheDir {
                     (true, true)
                 }
                 Err(e) => {
-                    eprintln!(
-                        "cache: vmlinux strip failed for {cache_key} ({e:#}); \
-                         caching unstripped (larger on-disk payload). \
-                         See `ktstr cache list --json` vmlinux_stripped field.",
-                    );
                     tracing::warn!(
                         cache_key = cache_key,
                         err = %format!("{e:#}"),
-                        "vmlinux strip failed, caching unstripped",
+                        "vmlinux strip failed, caching unstripped \
+                         (larger on-disk payload). See \
+                         `ktstr cache list --json` vmlinux_stripped field.",
                     );
                     fs::copy(vmlinux, &vmlinux_dest)
                         .map_err(|e| anyhow::anyhow!("copy vmlinux to cache: {e}"))?;
@@ -586,6 +675,9 @@ impl CacheDir {
         cache_key: &str,
     ) -> anyhow::Result<ExclusiveLockGuard> {
         validate_cache_key(cache_key)?;
+        // try_flock doesn't lazily create the parent directory like
+        // acquire_flock_with_timeout does — must materialise .locks/
+        // here so the open(O_CREAT) inside try_flock has a parent.
         self.ensure_lock_dir()?;
         let path = self.lock_path(cache_key);
         match crate::flock::try_flock(&path, crate::flock::FlockMode::Exclusive)? {
@@ -1303,8 +1395,8 @@ mod tests {
         for dirent in fs::read_dir(&cache_root).unwrap() {
             let name = dirent.unwrap().file_name().to_string_lossy().into_owned();
             assert!(
-                !name.starts_with(".evict-") && !name.starts_with(".tmp-"),
-                "unexpected leftover directory under cache_root: {name}"
+                !name.starts_with(".tmp-"),
+                "unexpected leftover .tmp- directory under cache_root: {name}"
             );
         }
     }
@@ -1428,8 +1520,8 @@ mod tests {
         for dirent in fs::read_dir(&cache_root).unwrap() {
             let name = dirent.unwrap().file_name().to_string_lossy().into_owned();
             assert!(
-                !name.starts_with(".evict-") && !name.starts_with(".tmp-"),
-                "unexpected leftover directory under cache_root: {name}",
+                !name.starts_with(".tmp-"),
+                "unexpected leftover .tmp- directory under cache_root: {name}",
             );
         }
     }
@@ -1546,6 +1638,133 @@ mod tests {
         assert!(
             !should_warn_unstripped(&entry),
             "has_vmlinux=false must not warn (no vmlinux to worry about)"
+        );
+    }
+
+    // -- should_emit_unstripped_warn dedup gate --
+    //
+    // The gate combines `should_warn_unstripped` (does this entry
+    // need warning at all?) with the once-per-key dedup set
+    // (have we already warned for this key in this process?).
+    // Tests use a fresh per-test `Mutex<HashSet<String>>` so the
+    // process-wide `warned_keys()` static is not polluted across
+    // unit tests.
+
+    /// Helper: build a CacheEntry with `has_vmlinux=true,
+    /// vmlinux_stripped=false` (the "stale entry needs warn" shape)
+    /// under a caller-chosen cache_key, so a single test can drive
+    /// the dedup gate against multiple keys.
+    fn make_stale_entry_with_key(key: &str) -> CacheEntry {
+        let mut meta = KernelMetadata::new(
+            super::super::metadata::KernelSource::Tarball,
+            "x86_64".to_string(),
+            "bzImage".to_string(),
+            "2026-04-24T12:00:00Z".to_string(),
+        );
+        meta.set_has_vmlinux(true);
+        meta.set_vmlinux_stripped(false);
+        CacheEntry {
+            key: key.to_string(),
+            path: PathBuf::from("/nonexistent/entry"),
+            metadata: meta,
+        }
+    }
+
+    /// First call against a fresh dedup set with a stale entry must
+    /// return `true` — the warn has not fired yet for this key, so
+    /// the caller should emit it now.
+    #[test]
+    fn should_emit_unstripped_warn_first_call_returns_true() {
+        let set = Mutex::new(HashSet::new());
+        let entry = make_stale_entry_with_key("first-call-key");
+        assert!(
+            should_emit_unstripped_warn(&entry, &set),
+            "first call against an empty set must return true so the \
+             caller emits the warn",
+        );
+        // After the call the key must be recorded.
+        let recorded = set.lock().unwrap().contains("first-call-key");
+        assert!(
+            recorded,
+            "first call must insert the key into the dedup set so \
+             subsequent calls suppress",
+        );
+    }
+
+    /// Second call with the SAME key against the same set must
+    /// return `false` — the dedup gate suppresses.
+    #[test]
+    fn should_emit_unstripped_warn_repeat_call_same_key_returns_false() {
+        let set = Mutex::new(HashSet::new());
+        let entry = make_stale_entry_with_key("dedup-key");
+        let first = should_emit_unstripped_warn(&entry, &set);
+        let second = should_emit_unstripped_warn(&entry, &set);
+        assert!(first, "first call must return true (warn fires)");
+        assert!(
+            !second,
+            "second call for the same key must return false (dedup \
+             suppression — the warn already fired in this process)",
+        );
+    }
+
+    /// A different key against the SAME set must still return
+    /// `true` — dedup is per-key, not global. Pins that two stale
+    /// entries with distinct keys each get their own warn.
+    #[test]
+    fn should_emit_unstripped_warn_distinct_keys_each_warn_once() {
+        let set = Mutex::new(HashSet::new());
+        let entry_a = make_stale_entry_with_key("key-a");
+        let entry_b = make_stale_entry_with_key("key-b");
+        assert!(
+            should_emit_unstripped_warn(&entry_a, &set),
+            "key-a's first call must return true",
+        );
+        assert!(
+            should_emit_unstripped_warn(&entry_b, &set),
+            "key-b is distinct from key-a, so its first call must \
+             also return true (per-key dedup, not global)",
+        );
+        // Now repeat each — both should return false.
+        assert!(
+            !should_emit_unstripped_warn(&entry_a, &set),
+            "key-a's second call must dedup",
+        );
+        assert!(
+            !should_emit_unstripped_warn(&entry_b, &set),
+            "key-b's second call must dedup",
+        );
+    }
+
+    /// Even if the dedup set is empty, an entry that does NOT need
+    /// warning (e.g. has_vmlinux=false, or vmlinux_stripped=true)
+    /// must return `false` and must NOT be inserted into the set —
+    /// the dedup set should only track keys for which the warn
+    /// actually fires, not every key the gate looks at.
+    #[test]
+    fn should_emit_unstripped_warn_no_warn_needed_skips_dedup_insert() {
+        let set = Mutex::new(HashSet::new());
+        // has_vmlinux=false → no warn needed.
+        let no_vmlinux = make_warn_test_entry(false, false);
+        assert!(
+            !should_emit_unstripped_warn(&no_vmlinux, &set),
+            "an entry that doesn't need warning must return false",
+        );
+        assert!(
+            set.lock().unwrap().is_empty(),
+            "no-warn-needed path must NOT pollute the dedup set; \
+             the gate must short-circuit before the insert",
+        );
+
+        // has_vmlinux=true + vmlinux_stripped=true → no warn needed.
+        let stripped = make_warn_test_entry(true, true);
+        assert!(
+            !should_emit_unstripped_warn(&stripped, &set),
+            "an entry whose vmlinux WAS stripped must return false",
+        );
+        assert!(
+            set.lock().unwrap().is_empty(),
+            "stripped-vmlinux entry must also leave the dedup set \
+             empty — only stale entries get recorded",
         );
     }
 
@@ -2247,6 +2466,274 @@ mod tests {
             returned.metadata.built_at, "2026-04-13T10:00:00Z",
             "with content actually changing, the publish must \
              land meta2's built_at",
+        );
+    }
+
+    /// End-to-end: race peers carrying a MIX of recheck-equivalent
+    /// and recheck-different content under the same cache key. The
+    /// content-defining axis is `config_hash` — peers split into two
+    /// groups: half publish hash "A", half publish hash "B". Each
+    /// group's peers are recheck-equivalent within the group, so
+    /// only one head writer per group pays the publish cost — but
+    /// the cross-group peers must NOT collapse into one another's
+    /// state. The final on-disk entry must match exactly one of the
+    /// two distinct content states (whichever group's late writer
+    /// won the rename), and every per-peer return must be one of the
+    /// two on-disk states (never torn, never a third).
+    ///
+    /// Each peer's `built_at` is the secondary observable: the
+    /// recheck path returns the EXISTING entry verbatim, so a peer
+    /// that short-circuits inherits the head writer's built_at
+    /// rather than its own. Peer i carries
+    /// `built_at = 2026-04-12T10:00:{i:02}Z`, so group A's
+    /// timestamps are `{:00, :02, :04, :06}` and group B's are
+    /// `{:01, :03, :05, :07}` — DISJOINT sets. A group-A peer's
+    /// returned built_at must therefore live inside group A's input
+    /// set: cross-group bleed (group A peer returning a group-B
+    /// timestamp) would prove the recheck collapsed across the
+    /// content-divergence axis, which is the bug this test guards.
+    ///
+    /// This pins THREE properties:
+    ///   1. recheck-bypass on cross-group divergence — a recheck
+    ///      miss MUST proceed to a real publish, not silently fold
+    ///      into the prior group's state.
+    ///   2. atomic publish across overlapping writers — the cache
+    ///      root never carries a half-written state mid-race.
+    ///   3. recheck-collapse on within-group equivalence — the
+    ///      built_at axis pins that late peers borrow the head
+    ///      writer's timestamp from THEIR group's input set, never
+    ///      from the other group.
+    ///
+    /// Note on non-determinism: scheduling decides whether multiple
+    ///  peers in a group successfully short-circuit on the same
+    ///  head writer (collapse fires) or whether cross-group
+    ///  overwrites force every group-X peer to publish its own
+    ///  timestamp afresh. The test asserts the deterministic
+    ///  invariants (cross-group separation, valid input-set
+    ///  membership) as hard checks, and the probabilistic
+    ///  collapse-fired observation as a softer informational
+    ///  check that can fail under adversarial scheduling without
+    ///  bricking the test — pinning the WEAKER invariant is the
+    ///  correct trade per CLAUDE.md (probabilistic flakes mask
+    ///  real regressions).
+    ///
+    /// Sibling of `store_in_lock_recheck_serialises_concurrent_peers`
+    /// (which exercises only recheck-equivalent peers). Together the
+    /// two tests cover both branches of `cache_content_matches`.
+    #[test]
+    fn store_in_lock_recheck_mixed_content_peers_publish_one_per_group() {
+        use std::collections::BTreeSet;
+        use std::sync::Arc;
+        use std::sync::Barrier;
+        use std::thread;
+        let tmp = TempDir::new().unwrap();
+        let cache = Arc::new(CacheDir::with_root(tmp.path().join("cache")));
+        let src_dir = TempDir::new().unwrap();
+        let image = src_dir.path().join("bzImage");
+        std::fs::write(&image, b"shared image bytes").unwrap();
+
+        const PEER_COUNT: usize = 8;
+        // Disjoint per-group input timestamp sets — group A holds
+        // every even-index `:NN`, group B every odd-index. The hard
+        // cross-group separation invariant rides on this disjointness.
+        let group_a_inputs: BTreeSet<String> = (0..PEER_COUNT)
+            .filter(|i| i % 2 == 0)
+            .map(|i| format!("2026-04-12T10:00:{i:02}Z"))
+            .collect();
+        let group_b_inputs: BTreeSet<String> = (0..PEER_COUNT)
+            .filter(|i| i % 2 == 1)
+            .map(|i| format!("2026-04-12T10:00:{i:02}Z"))
+            .collect();
+        assert!(
+            group_a_inputs.is_disjoint(&group_b_inputs),
+            "test setup invariant: per-group input timestamps must \
+             be disjoint so the cross-group bleed assertion below is \
+             well-defined",
+        );
+
+        let barrier = Arc::new(Barrier::new(PEER_COUNT));
+        let mut handles = Vec::with_capacity(PEER_COUNT);
+        for i in 0..PEER_COUNT {
+            let cache = Arc::clone(&cache);
+            let barrier = Arc::clone(&barrier);
+            let image = image.clone();
+            handles.push(thread::spawn(move || {
+                let mut meta = test_metadata("6.14.2");
+                // Half the peers publish config_hash="hash-a",
+                // half publish config_hash="hash-b" — distinct
+                // content-defining axis means the two groups MUST
+                // not recheck-collapse into one another. Peers
+                // within a group share the same hash and so are
+                // recheck-equivalent (only one head writer per
+                // group pays the publish cost).
+                let (label, hash) = if i % 2 == 0 {
+                    ("a", "hash-a")
+                } else {
+                    ("b", "hash-b")
+                };
+                meta.built_at = format!("2026-04-12T10:00:{i:02}Z");
+                meta.config_hash = Some(hash.to_string());
+                barrier.wait();
+                let entry = cache
+                    .store("mixed-key", &CacheArtifacts::new(&image), &meta)
+                    .expect("every peer's store must succeed");
+                (
+                    label,
+                    entry.metadata.config_hash.clone(),
+                    entry.metadata.built_at.clone(),
+                )
+            }));
+        }
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        // Every peer's returned entry must carry one of the two
+        // valid content states — never a torn third state, never
+        // None. The exact set of returned config_hash values
+        // depends on the interleaving (a single state if one group
+        // finished entirely before the other started, two states
+        // otherwise) but every observed value MUST belong to
+        // {Some("hash-a"), Some("hash-b")}.
+        for (label, observed_hash, observed_built_at) in &results {
+            let observed_hash_str = observed_hash.as_deref();
+            assert!(
+                matches!(observed_hash_str, Some("hash-a") | Some("hash-b")),
+                "peer (group={label}) observed an invalid \
+                 config_hash {observed_hash:?} — recheck must never \
+                 produce a third state, only return one of the two \
+                 published group hashes",
+            );
+
+            // Label↔hash correspondence (HARD invariant, deterministic).
+            // Each peer's LABEL was computed locally from its loop
+            // index BEFORE the store() call, and the local `hash`
+            // it published was derived directly from that label.
+            // After the round-trip the returned config_hash MUST
+            // therefore still match the label's expected hash. A
+            // regression that loosened `cache_content_matches` so a
+            // group-B peer collapses onto group-A's published entry
+            // would let this assertion catch the cross-hash
+            // collapse (peer label "b" returning Some("hash-a")) —
+            // the cross-group bleed check below pins built_at, this
+            // pins the hash itself.
+            let expected_hash = match *label {
+                "a" => "hash-a",
+                "b" => "hash-b",
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                observed_hash_str,
+                Some(expected_hash),
+                "peer (group={label}) returned config_hash \
+                 {observed_hash:?} — expected {expected_hash}; \
+                 cross-group recheck collapse detected (a recheck \
+                 hit MUST require matching content-defining hashes)",
+            );
+
+            // Cross-group bleed check (HARD invariant, deterministic).
+            // The returned config_hash and built_at must agree on
+            // their group. A group-A peer that short-circuits
+            // borrows the head writer's published state — and the
+            // head writer that produced an entry with hash-X drew
+            // its built_at from group-X's input set. So the
+            // returned (hash, built_at) pair must be group-coherent.
+            let observed_hash_bytes = observed_hash_str.unwrap_or("");
+            let in_a = group_a_inputs.contains(observed_built_at);
+            let in_b = group_b_inputs.contains(observed_built_at);
+            assert!(
+                in_a || in_b,
+                "peer (group={label}) returned built_at \
+                 {observed_built_at:?} that is NOT one of the \
+                 precomputed input timestamps — recheck must \
+                 never synthesize a fresh timestamp",
+            );
+            match observed_hash_bytes {
+                "hash-a" => assert!(
+                    in_a && !in_b,
+                    "config_hash=hash-a entry returned built_at \
+                     {observed_built_at:?} which lives in group B's \
+                     input set — recheck-bypass on cross-group \
+                     divergence broke and a group-A return is \
+                     carrying a group-B timestamp",
+                ),
+                "hash-b" => assert!(
+                    in_b && !in_a,
+                    "config_hash=hash-b entry returned built_at \
+                     {observed_built_at:?} which lives in group A's \
+                     input set — recheck-bypass on cross-group \
+                     divergence broke and a group-B return is \
+                     carrying a group-A timestamp",
+                ),
+                _ => unreachable!(),
+            }
+        }
+
+        // Soft observation: at least one group SHOULD show
+        // recheck collapse (multiple peers sharing the same
+        // built_at). Logged not asserted — under adversarial
+        // scheduling, cross-group overwrites can prevent any
+        // within-group peer from successfully short-circuiting,
+        // and asserting collapse would be a flake. The hard
+        // invariants above are sufficient to prove the recheck
+        // semantics; this is informational.
+        let group_a_built_ats: BTreeSet<&String> = results
+            .iter()
+            .filter(|(label, _, _)| *label == "a")
+            .map(|(_, _, built_at)| built_at)
+            .collect();
+        let group_b_built_ats: BTreeSet<&String> = results
+            .iter()
+            .filter(|(label, _, _)| *label == "b")
+            .map(|(_, _, built_at)| built_at)
+            .collect();
+        let group_a_size = results.iter().filter(|(l, _, _)| *l == "a").count();
+        let group_b_size = results.iter().filter(|(l, _, _)| *l == "b").count();
+        let collapse_fired_a = group_a_built_ats.len() < group_a_size;
+        let collapse_fired_b = group_b_built_ats.len() < group_b_size;
+        if !(collapse_fired_a || collapse_fired_b) {
+            // Not a panic — would be a flake under adversarial
+            // scheduling. Surface via the test's stderr so an
+            // operator running with --no-capture sees that
+            // collapse did not fire on this run.
+            eprintln!(
+                "store_in_lock_recheck_mixed_content_peers: \
+                 collapse did not fire on this run (group_a \
+                 distinct={}, size={}; group_b distinct={}, \
+                 size={}). Hard invariants still hold; collapse \
+                 firing is probabilistic under cross-group churn.",
+                group_a_built_ats.len(),
+                group_a_size,
+                group_b_built_ats.len(),
+                group_b_size,
+            );
+        }
+
+        // The final on-disk entry must match exactly one of the two
+        // valid states (whichever cross-group writer won the last
+        // publish). A torn or absent on-disk state means the
+        // atomic-publish guarantee broke under cross-group churn.
+        let final_entry = cache.lookup("mixed-key").expect("entry must exist");
+        let final_hash = final_entry.metadata.config_hash.as_deref();
+        assert!(
+            matches!(final_hash, Some("hash-a") | Some("hash-b")),
+            "final on-disk config_hash {final_hash:?} must be one \
+             of the two published group hashes — anything else \
+             means publish was not atomic across overlapping writers",
+        );
+        // Final built_at must also obey the cross-group separation
+        // rule: it must come from the input set of whichever
+        // group's hash won the final rename.
+        let final_built_at = &final_entry.metadata.built_at;
+        let expected_set = match final_hash {
+            Some("hash-a") => &group_a_inputs,
+            Some("hash-b") => &group_b_inputs,
+            _ => unreachable!(),
+        };
+        assert!(
+            expected_set.contains(final_built_at),
+            "final on-disk built_at {final_built_at:?} must come \
+             from the input set of the winning group ({final_hash:?}) — \
+             a foreign timestamp would prove recheck wrote across \
+             the content-divergence axis",
         );
     }
 

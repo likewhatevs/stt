@@ -2041,69 +2041,98 @@ mod tests {
     /// in lock-step with [`render_work_type`] — adding a new variant
     /// to one match arm without updating the other shows up here as
     /// a failed expectation.
+    ///
+    /// Exhaustive: drives every entry in [`WorkType::ALL_NAMES`]
+    /// through [`WorkType::from_name`] (which auto-tracks new
+    /// variants via `strum::VariantNames`) plus the two
+    /// [`from_name`](WorkType::from_name) explicitly skips
+    /// (`Sequence` requires explicit phases, `Custom` requires a
+    /// function pointer) so a future variant can't slip through
+    /// without flipping both [`is_unmapped_work_type`] and
+    /// [`render_work_type`] together.
     #[test]
     fn is_unmapped_work_type_split_matches_render() {
-        // Sample one of each runnable variant — both nullary
-        // (`SpinWait`) and parameterized (`Bursty` / `CachePressure`)
-        // forms must classify as runnable.
-        let runnable_samples: Vec<WorkType> = vec![
-            WorkType::SpinWait,
-            WorkType::YieldHeavy,
-            WorkType::Mixed,
-            WorkType::IoSyncWrite,
-            WorkType::IoRandRead,
-            WorkType::IoConvoy,
-            WorkType::Bursty {
-                burst_duration: Duration::from_millis(5),
-                sleep_duration: Duration::from_millis(95),
-            },
-            WorkType::PipeIo { burst_iters: 1024 },
-            WorkType::FutexPingPong { spin_iters: 1024 },
-            WorkType::CachePressure {
-                size_kb: 256,
-                stride: 64,
-            },
-        ];
-        for w in &runnable_samples {
-            assert!(
-                !is_unmapped_work_type(w),
-                "{w:?} renders as a runnable builder call — \
-                 is_unmapped_work_type must return false",
-            );
-            // Each runnable variant must NOT pass through
-            // render_work_type_todo, so the rendered output must NOT
-            // carry the TODO marker substring.
-            let rendered = render_work_type(w);
-            assert!(
-                !rendered.contains("/* TODO:"),
-                "{w:?} must render without a TODO placeholder: {rendered}",
-            );
+        use crate::workload::{Phase, WorkerReport};
+        use std::sync::atomic::AtomicBool;
+
+        // Stub fn pointer for the `Custom` variant — `WorkType::Custom`
+        // carries a fn pointer and stub_custom_fn is the cheapest
+        // closure that satisfies the type without spawning a worker.
+        fn stub_custom_fn(_: &AtomicBool) -> WorkerReport {
+            WorkerReport::default()
         }
 
-        // Sample several TODO variants — the TODO arms must classify
-        // as unmapped and render through render_work_type_todo
-        // (visible via the `/* TODO:` substring).
-        let unmapped_samples: Vec<WorkType> = vec![
-            WorkType::CacheYield {
-                size_kb: 256,
-                stride: 64,
-            },
-            WorkType::ForkExit,
-            WorkType::SmtSiblingSpin,
-            WorkType::NiceSweep,
-        ];
-        for w in &unmapped_samples {
-            assert!(
-                is_unmapped_work_type(w),
-                "{w:?} renders as a TODO placeholder — \
-                 is_unmapped_work_type must return true",
-            );
+        // Drive every name strum's `VariantNames` exposed (i.e. every
+        // enum variant, including `Sequence` and `Custom`) through
+        // `from_name`. `from_name` returns `None` for the two variants
+        // that lack default parameters; those are appended below so
+        // every `WorkType` variant is exercised.
+        let mut all_variants: Vec<WorkType> = WorkType::ALL_NAMES
+            .iter()
+            .filter_map(|n| WorkType::from_name(n))
+            .collect();
+        all_variants.push(WorkType::Sequence {
+            first: Phase::Spin(Duration::from_millis(1)),
+            rest: Vec::new(),
+        });
+        all_variants.push(WorkType::Custom {
+            name: "stub-custom".into(),
+            run: stub_custom_fn,
+        });
+
+        // Exhaustiveness gate: every entry in `ALL_NAMES` must
+        // resolve to exactly one constructed variant. A future
+        // strum-included variant added without either a `from_name`
+        // case or a hand-constructed entry above trips this assertion
+        // before the partition checks run.
+        assert_eq!(
+            all_variants.len(),
+            WorkType::ALL_NAMES.len(),
+            "every WorkType variant must be constructed; \
+             ALL_NAMES = {:?}, constructed {} variants",
+            WorkType::ALL_NAMES,
+            all_variants.len(),
+        );
+
+        // Partition by [`is_unmapped_work_type`] and assert the
+        // [`render_work_type`] dispatch matches — runnable variants
+        // must not carry the TODO marker; unmapped variants must
+        // render through [`render_work_type_todo`] (visible via the
+        // `/* TODO:` substring).
+        let mut runnable_count = 0usize;
+        let mut unmapped_count = 0usize;
+        for w in &all_variants {
             let rendered = render_work_type(w);
-            assert!(
-                rendered.contains("/* TODO:"),
-                "{w:?} must render through render_work_type_todo: {rendered}",
-            );
+            if is_unmapped_work_type(w) {
+                unmapped_count += 1;
+                assert!(
+                    rendered.contains("/* TODO:"),
+                    "{w:?} classifies as unmapped — render_work_type \
+                     must dispatch through render_work_type_todo: {rendered}",
+                );
+            } else {
+                runnable_count += 1;
+                assert!(
+                    !rendered.contains("/* TODO:"),
+                    "{w:?} classifies as runnable — render_work_type \
+                     must produce a builder call without a TODO \
+                     placeholder: {rendered}",
+                );
+            }
         }
+
+        // Sanity: both partitions must be non-empty so a future
+        // refactor that accidentally flips every variant onto one
+        // side of the split fails this test instead of silently
+        // passing a one-sided assertion sweep.
+        assert!(
+            runnable_count > 0,
+            "runnable partition must not be empty",
+        );
+        assert!(
+            unmapped_count > 0,
+            "unmapped partition must not be empty",
+        );
     }
 
     /// Manually-constructed [`ReproducerSpec`] with an unmapped

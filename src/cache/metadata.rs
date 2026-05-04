@@ -537,6 +537,103 @@ mod tests {
         ));
     }
 
+    /// Every `Option<…>` field on the `KernelMetadata` wrapper struct
+    /// (not on its `KernelSource` payload — that is covered by
+    /// `kernel_source_*` tests) serializes as an explicit `null` when
+    /// `None` and deserializes back as `None`. Pins the post-shim
+    /// wire shape: with `serde(default)` and `skip_serializing_if`
+    /// removed, `None` round-trips through a literal `null` token in
+    /// the JSON, never an absent key.
+    ///
+    /// Built via `KernelMetadata::new` with `KernelSource::Tarball` —
+    /// the constructor sets every `Option` field to `None`, so the
+    /// `is_none()` assertions confirm both that the constructor is
+    /// the canonical path to an all-`None` value and that the wire
+    /// shape preserves it across a round-trip.
+    #[test]
+    fn kernel_metadata_option_fields_serialize_as_explicit_null() {
+        let meta = KernelMetadata::new(
+            KernelSource::Tarball,
+            "x86_64".to_string(),
+            "bzImage".to_string(),
+            "2026-04-12T10:00:00Z".to_string(),
+        );
+        let json = serde_json::to_string(&meta).unwrap();
+        for null_key in [
+            r#""version":null"#,
+            r#""config_hash":null"#,
+            r#""ktstr_kconfig_hash":null"#,
+            r#""extra_kconfig_hash":null"#,
+            r#""source_vmlinux_size":null"#,
+            r#""source_vmlinux_mtime_secs":null"#,
+        ] {
+            assert!(
+                json.contains(null_key),
+                "serialized JSON must contain explicit `{null_key}` \
+                 — None must round-trip as null, not as an absent \
+                 key. Got: {json}",
+            );
+        }
+        // Round-trip back: every Option must still be None.
+        let parsed: KernelMetadata = serde_json::from_str(&json).unwrap();
+        assert!(parsed.version.is_none(), "version must round-trip None");
+        assert!(
+            parsed.config_hash.is_none(),
+            "config_hash must round-trip None"
+        );
+        assert!(
+            parsed.ktstr_kconfig_hash.is_none(),
+            "ktstr_kconfig_hash must round-trip None"
+        );
+        assert!(
+            parsed.extra_kconfig_hash.is_none(),
+            "extra_kconfig_hash must round-trip None"
+        );
+        assert!(
+            parsed.source_vmlinux_size.is_none(),
+            "source_vmlinux_size must round-trip None"
+        );
+        assert!(
+            parsed.source_vmlinux_mtime_secs.is_none(),
+            "source_vmlinux_mtime_secs must round-trip None"
+        );
+    }
+
+    /// Every `Option<…>` wrapper field with a Some(...) value
+    /// round-trips byte-equal through serialize → deserialize.
+    /// Pins the populated branch of every Option, complementing the
+    /// all-None test.
+    ///
+    /// Built via `KernelMetadata::new` followed by every chainable
+    /// setter for the six `Option` fields (`with_version`,
+    /// `with_config_hash`, `with_ktstr_kconfig_hash`,
+    /// `with_extra_kconfig_hash`, `with_source_vmlinux_stat` covers
+    /// both `source_vmlinux_size` and `source_vmlinux_mtime_secs`),
+    /// so this test also pins that the builder API can produce a
+    /// fully-populated value without touching the struct directly.
+    #[test]
+    fn kernel_metadata_all_option_fields_populated_roundtrip() {
+        let meta = KernelMetadata::new(
+            KernelSource::Tarball,
+            "x86_64".to_string(),
+            "bzImage".to_string(),
+            "2026-04-12T10:00:00Z".to_string(),
+        )
+        .with_version(Some("6.14.2".to_string()))
+        .with_config_hash(Some("cfg-hash".to_string()))
+        .with_ktstr_kconfig_hash(Some("ktstr-hash".to_string()))
+        .with_extra_kconfig_hash(Some("extra-hash".to_string()))
+        .with_source_vmlinux_stat(123_456_789, 1_700_000_000);
+        let json = serde_json::to_string(&meta).unwrap();
+        let parsed: KernelMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.version.as_deref(), Some("6.14.2"));
+        assert_eq!(parsed.config_hash.as_deref(), Some("cfg-hash"));
+        assert_eq!(parsed.ktstr_kconfig_hash.as_deref(), Some("ktstr-hash"));
+        assert_eq!(parsed.extra_kconfig_hash.as_deref(), Some("extra-hash"));
+        assert_eq!(parsed.source_vmlinux_size, Some(123_456_789));
+        assert_eq!(parsed.source_vmlinux_mtime_secs, Some(1_700_000_000));
+    }
+
     #[test]
     fn cache_metadata_serde_local_with_source_tree() {
         let meta = KernelMetadata {

@@ -53,7 +53,7 @@ pub(crate) use wire_format::{
 ///     subsequent clean rebuild of the same tree.
 ///
 /// Both directory shapes are valid inputs to
-/// [`crate::kernel_path::find_image_in_dir`]'s child consumers;
+/// [`ktstr::kernel_path::find_image_in_dir`]'s child consumers;
 /// the cache-entry layout (`<dir>/<image_name>`) and source-tree
 /// layout (`<dir>/arch/<arch>/boot/<image_name>`) are both probed.
 ///
@@ -69,7 +69,7 @@ pub(crate) use wire_format::{
 /// `KTSTR_KERNEL_HINT` so the diagnostic shape matches the
 /// behaviour the previous inline `canonicalize` call provided.
 /// The single canonicalize then lives inside
-/// [`crate::fetch::local_source`] (called via
+/// [`ktstr::fetch::local_source`] (called via
 /// [`cli::resolve_kernel_dir_to_entry`]); doing it twice in this
 /// function and again in `local_source` produced redundant
 /// syscalls without changing the resulting path.
@@ -171,9 +171,9 @@ pub(crate) fn canonicalize_cache_dir(cache_dir: PathBuf) -> PathBuf {
     std::fs::canonicalize(&cache_dir).unwrap_or(cache_dir)
 }
 
-/// Resolve one already-validated [`KernelId`] (NOT `Range` — the
-/// caller fans Range out to per-version `Version` ids before
-/// calling here) to a `(label, dir)` tuple.
+/// Resolve one already-validated [`ktstr::kernel_path::KernelId`]
+/// (NOT `Range` — the caller fans Range out to per-version
+/// `Version` ids before calling here) to a `(label, dir)` tuple.
 ///
 /// Extracted from `resolve_kernel_set`'s rayon body so the per-
 /// spec match arm is one function call rather than five inline
@@ -313,10 +313,9 @@ pub(crate) fn resolve_one(id: ktstr::kernel_path::KernelId) -> Result<(String, P
 /// - Git → `git_{owner}_{repo}_{ref}` extracted from the URL +
 ///   git ref.
 ///
-/// The downstream `sanitize_kernel_label` in
-/// [`crate::test_support::dispatch`] applies the `kernel_` prefix
-/// and `[a-z0-9_]+` normalisation; this label is the human-meaningful
-/// payload it operates on.
+/// The downstream [`ktstr::test_support::sanitize_kernel_label`]
+/// applies the `kernel_` prefix and `[a-z0-9_]+` normalisation; this
+/// label is the human-meaningful payload it operates on.
 pub(crate) fn resolve_kernel_set(specs: &[String]) -> Result<Vec<(String, PathBuf)>, String> {
     use ktstr::kernel_path::KernelId;
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
@@ -535,13 +534,13 @@ pub(crate) fn resolve_kernel_set(specs: &[String]) -> Result<Vec<(String, PathBu
 /// patch in that series), or `START..END` for a range that expands
 /// against kernel.org's `releases.json` to every `stable` /
 /// `longterm` release inside the inclusive interval. A range is
-/// detected via [`KernelId::parse`] and dispatched here to
-/// [`kernel_build_one`] per resolved version, sharing the
-/// download / cache-lookup / build pipeline that single-version
-/// invocations use. Range mode collects per-version errors as a
-/// best-effort summary: a build failure on one version is reported
-/// and the iteration continues to the next, so a stale endpoint
-/// doesn't block the rest of the range from caching.
+/// detected via [`ktstr::kernel_path::KernelId::parse`] and
+/// dispatched here to [`kernel_build_one`] per resolved version,
+/// sharing the download / cache-lookup / build pipeline that
+/// single-version invocations use. Range mode collects per-version
+/// errors as a best-effort summary: a build failure on one version
+/// is reported and the iteration continues to the next, so a stale
+/// endpoint doesn't block the rest of the range from caching.
 ///
 /// `--git` and `--source` paths bypass range expansion (range
 /// applies to tarball downloads only) and forward unchanged to
@@ -889,7 +888,6 @@ mod tests {
     /// Nonexistent path: the source-tree validation
     /// (`Makefile + Kconfig` exist) fails inside
     /// [`cli::resolve_kernel_dir_to_entry`] (via
-    /// [`cli::resolve_kernel_dir_to_entry`] →
     /// `acquire_local_source_tree`), and `resolve_path_kernel`
     /// re-wraps the error with the user's raw input + the
     /// standard hint. Pins the `--kernel {raw}: ...` prefix and

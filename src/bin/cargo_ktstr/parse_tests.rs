@@ -10,11 +10,15 @@
 //!
 //! # Coverage shape
 //!
-//! Each [`KtstrCommand`] variant gets at least one positive test
-//! that exercises every `#[arg]` attribute on it (long name, short
-//! alias, value-name, possible-values, default), plus at least one
-//! negative test for any `requires` / `conflicts_with` /
-//! `value_parser` constraint that clap enforces at parse time.
+//! Most [`KtstrCommand`] variants have at least one positive test
+//! that round-trips an argument through clap into the variant's
+//! fields, plus negative tests for `requires` / `conflicts_with` /
+//! `value_parser` constraints clap enforces at parse time.
+//!
+//! Variants WITHOUT a positive parse test as of this revision:
+//! `Model`, `Funify`, `Export`, `Locks`. Their parse-shape
+//! coverage is filed as a follow-up; until then a clap regression
+//! that reshapes one of those variants will not surface here.
 //!
 //! Sections are separated by `// -- <theme> --` banners.
 //!
@@ -47,8 +51,7 @@ use crate::cli::{Cargo, CargoSub, KtstrCommand, StatsCommand};
 
 // -- structural validation --
 
-/// Run clap's structural self-check on the entire derived
-/// [`Cargo`] / [`CargoSub`] / [`Ktstr`] / [`KtstrCommand`] tree.
+/// Run clap's structural self-check on the entire [`Cargo`] derive tree.
 ///
 /// `clap::Command::debug_assert` walks every subcommand, every
 /// arg, every group, and every relationship (`conflicts_with`,
@@ -106,6 +109,7 @@ fn parse_test_with_release_flag() {
     }
 }
 
+/// Pin `trailing_var_arg` args forwarded verbatim after `--`.
 #[test]
 fn parse_test_with_passthrough_args() {
     let Cargo {
@@ -121,7 +125,24 @@ fn parse_test_with_passthrough_args() {
     ])
     .unwrap_or_else(|e| panic!("{e}"));
     match k.command {
-        KtstrCommand::Test { args, .. } => {
+        KtstrCommand::Test {
+            kernel,
+            no_perf_mode,
+            release,
+            args,
+        } => {
+            assert!(
+                kernel.is_empty(),
+                "bare `--` passthrough must not spuriously populate --kernel",
+            );
+            assert!(
+                !no_perf_mode,
+                "bare `--` passthrough must not spuriously set --no-perf-mode",
+            );
+            assert!(
+                !release,
+                "bare `--` passthrough must not spuriously set --release",
+            );
             assert_eq!(args, vec!["-p", "ktstr", "--no-capture"]);
         }
         _ => panic!("expected Test"),
@@ -243,6 +264,7 @@ fn parse_coverage_with_release_flag() {
     }
 }
 
+/// Pin `trailing_var_arg` args forwarded verbatim after `--`.
 #[test]
 fn parse_coverage_with_passthrough_args() {
     let Cargo {
@@ -328,6 +350,7 @@ fn parse_llvm_cov_with_kernel() {
     }
 }
 
+/// Pin `trailing_var_arg` args forwarded verbatim after `--`.
 #[test]
 fn parse_llvm_cov_with_passthrough_args() {
     let Cargo {
@@ -458,6 +481,7 @@ fn parse_shell_default_topology() {
     }
 }
 
+/// Pin `-i` / `--include-files` `ArgAction::Append` round-trip with ordering.
 #[test]
 fn parse_shell_include_files() {
     let Cargo {
@@ -466,7 +490,14 @@ fn parse_shell_include_files() {
         .unwrap_or_else(|e| panic!("{e}"));
     match k.command {
         KtstrCommand::Shell { include_files, .. } => {
-            assert_eq!(include_files.len(), 2);
+            assert_eq!(
+                include_files,
+                vec![
+                    std::path::PathBuf::from("/tmp/a"),
+                    std::path::PathBuf::from("/tmp/b"),
+                ],
+                "-i flag must accumulate paths in order via ArgAction::Append",
+            );
         }
         _ => panic!("expected Shell"),
     }
@@ -1660,15 +1691,24 @@ fn parse_kernel_build_source() {
 /// tree" hint from a "fetch this version" hint at runtime.
 #[test]
 fn parse_kernel_build_source_conflicts_with_version() {
-    let m = Cargo::try_parse_from([
+    let result = Cargo::try_parse_from([
         "cargo", "ktstr", "kernel", "build", "--source", "../linux", "6.14.2",
     ]);
-    assert!(m.is_err());
+    match result {
+        Ok(_) => panic!("--source + positional VERSION must be rejected at parse time"),
+        Err(err) => assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::ArgumentConflict,
+            "expected ArgumentConflict — a different ErrorKind would \
+             signal that the conflicts_with attribute regressed in a way \
+             the bare is_err() pin would silently mask. Full err: {err}",
+        ),
+    }
 }
 
 #[test]
 fn parse_kernel_build_git_requires_ref() {
-    let m = Cargo::try_parse_from([
+    let result = Cargo::try_parse_from([
         "cargo",
         "ktstr",
         "kernel",
@@ -1676,7 +1716,18 @@ fn parse_kernel_build_git_requires_ref() {
         "--git",
         "https://example.com/linux.git",
     ]);
-    assert!(m.is_err());
+    match result {
+        Ok(_) => panic!("--git without --ref must be rejected at parse time"),
+        Err(err) => assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument,
+            "expected MissingRequiredArgument — `--git` carries \
+             `requires = \"git_ref\"` (clap uses the field name, not \
+             the long flag name), so a regression that dropped the \
+             attribute would surface as a different ErrorKind that \
+             the bare is_err() pin would silently mask. Full err: {err}",
+        ),
+    }
 }
 
 #[test]
@@ -1703,7 +1754,7 @@ fn parse_kernel_build_git_with_ref() {
 /// argument-conflict error.
 #[test]
 fn parse_kernel_build_git_conflicts_with_source() {
-    let m = Cargo::try_parse_from([
+    let result = Cargo::try_parse_from([
         "cargo",
         "ktstr",
         "kernel",
@@ -1715,7 +1766,16 @@ fn parse_kernel_build_git_conflicts_with_source() {
         "--source",
         "../linux",
     ]);
-    assert!(m.is_err());
+    match result {
+        Ok(_) => panic!("--git + --source must be rejected at parse time"),
+        Err(err) => assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::ArgumentConflict,
+            "expected ArgumentConflict — a different ErrorKind would \
+             signal that the conflicts_with attribute regressed in a way \
+             the bare is_err() pin would silently mask. Full err: {err}",
+        ),
+    }
 }
 
 /// `kernel build VERSION --extra-kconfig PATH` round-trips to
@@ -2048,7 +2108,7 @@ fn parse_verifier_with_scheduler_bin() {
 
 #[test]
 fn parse_verifier_scheduler_conflicts_with_scheduler_bin() {
-    let m = Cargo::try_parse_from([
+    let result = Cargo::try_parse_from([
         "cargo",
         "ktstr",
         "verifier",
@@ -2057,7 +2117,16 @@ fn parse_verifier_scheduler_conflicts_with_scheduler_bin() {
         "--scheduler-bin",
         "/tmp/sched",
     ]);
-    assert!(m.is_err());
+    match result {
+        Ok(_) => panic!("--scheduler + --scheduler-bin must be rejected at parse time"),
+        Err(err) => assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::ArgumentConflict,
+            "expected ArgumentConflict — a different ErrorKind would \
+             signal that the conflicts_with attribute regressed in a way \
+             the bare is_err() pin would silently mask. Full err: {err}",
+        ),
+    }
 }
 
 #[test]
@@ -2121,46 +2190,6 @@ fn parse_missing_subcommand() {
 fn parse_unknown_subcommand() {
     let m = Cargo::try_parse_from(["cargo", "ktstr", "nonexistent"]);
     assert!(m.is_err());
-}
-
-// -- topology parsing --
-
-#[test]
-fn topology_valid() {
-    let parts: Vec<&str> = "1,2,4,1".split(',').collect();
-    assert_eq!(parts.len(), 4);
-    assert!(parts[0].parse::<u32>().is_ok());
-    assert!(parts[1].parse::<u32>().is_ok());
-    assert!(parts[2].parse::<u32>().is_ok());
-    assert!(parts[3].parse::<u32>().is_ok());
-}
-
-#[test]
-fn topology_invalid_one_component() {
-    let parts: Vec<&str> = "abc".split(',').collect();
-    assert_ne!(parts.len(), 4);
-}
-
-#[test]
-fn topology_invalid_non_numeric() {
-    let parts: Vec<&str> = "a,b,c,d".split(',').collect();
-    assert_eq!(parts.len(), 4);
-    assert!(parts[0].parse::<u32>().is_err());
-}
-
-#[test]
-fn topology_invalid_three_components() {
-    let parts: Vec<&str> = "1,2,1".split(',').collect();
-    assert_ne!(parts.len(), 4);
-}
-
-#[test]
-fn topology_invalid_zero_component() {
-    // run_shell rejects zero values.
-    let parts: Vec<&str> = "0,1,1,1".split(',').collect();
-    assert_eq!(parts.len(), 4);
-    let val: u32 = parts[0].parse().unwrap();
-    assert_eq!(val, 0);
 }
 
 // -- completions --
@@ -2251,10 +2280,10 @@ fn store_test_entry(cache: &CacheDir, key: &str, meta: &KernelMetadata) -> Cache
 // The (Matches / Stale / Untracked) × (not-EOL / EOL) outcome
 // matrix plus the `version == None` → "-" dash-render branch are
 // pinned by `format_entry_row_renders_eol_kconfig_matrix` in
-// `src/cli/kernel_list.rs` tests (cases c1-c7). The test below
-// covers a distinct corner the matrix does not: `KernelSource::Local`
-// rendering through format_entry_row, since the matrix uses
-// `Tarball` exclusively for determinism.
+// `src/cli/kernel_list.rs` — see that test for the full case
+// list. The test below covers a distinct corner the matrix does
+// not: `KernelSource::Local` rendering through format_entry_row,
+// since the matrix uses `Tarball` exclusively for determinism.
 
 #[test]
 fn format_entry_row_no_version() {
@@ -2271,7 +2300,22 @@ fn format_entry_row_no_version() {
     );
     let entry = store_test_entry(&cache, "local-key", &meta);
     let row = cli::format_entry_row(&entry, "hash", &[]);
-    assert!(row.contains("-"), "missing version should show dash");
+    // Anchor the dash to the version COLUMN. The row format is
+    // `"  {key:<48} {version:<12} {source:<8} {arch:<7} {built_at}{tags}"`
+    // (see `format_entry_row` in src/cli/kernel_list.rs). A bare
+    // `row.contains("-")` would also match the `-` in the timestamp
+    // `2026-04-12T10:00:00Z` even if the version dash were missing.
+    // Splitting on whitespace and inspecting the second token isolates
+    // the version slot — token 0 is the key, token 1 is the version.
+    let tokens: Vec<&str> = row.split_whitespace().collect();
+    assert!(
+        tokens.len() >= 2,
+        "row must have at least key + version columns: {row:?}",
+    );
+    assert_eq!(
+        tokens[1], "-",
+        "missing version must render as `-` in the version column: {row:?}",
+    );
 }
 
 // Corrupt-entry formatting moved inline into the caller iteration
@@ -2415,16 +2459,21 @@ fn embedded_kconfig_hash_matches_manual_crc32() {
 // -- show-host --
 
 /// `cargo ktstr show-host` parses with no arguments and maps to
-/// the `ShowHost` variant. A stray positional argument must be
-/// rejected (clap default) so a typo like
-/// `cargo ktstr show-host host_context` is caught at parse time.
+/// the `ShowHost` variant.
 #[test]
 fn parse_show_host_minimal() {
     let Cargo {
         command: CargoSub::Ktstr(k),
     } = Cargo::try_parse_from(["cargo", "ktstr", "show-host"]).unwrap_or_else(|e| panic!("{e}"));
     assert!(matches!(k.command, KtstrCommand::ShowHost));
+}
 
+/// A stray positional argument on `show-host` must be rejected at
+/// parse time (clap default) so a typo like
+/// `cargo ktstr show-host host_context` fails loudly instead of
+/// silently looking like success.
+#[test]
+fn parse_show_host_rejects_positional() {
     let rejected = Cargo::try_parse_from(["cargo", "ktstr", "show-host", "stray"]);
     assert!(
         rejected.is_err(),
@@ -2627,14 +2676,15 @@ fn parse_shell_no_perf_mode_without_cpu_cap_succeeds() {
 // through `ktstr::cli::KERNEL_LIST_LONG_ABOUT`.
 
 /// Pins that every range-mode JSON top-level field name appears
-/// in the help copy by exact substring. Range-mode emits
+/// in the help copy by its column-aligned row. Range-mode emits
 /// `{ range, start, end, versions }` per the schema block in
-/// `KERNEL_LIST_LONG_ABOUT` (`src/cli/kernel_cmd.rs`). Bare-word
-/// substring match is sufficient because the help copy embeds
-/// the field names in column-aligned table form (e.g.
-/// `  range     literal range string`) — distinct from the
-/// cache-walk schema's nullable-marker pattern which uses
-/// `{field} (nullable)` substrings.
+/// `KERNEL_LIST_LONG_ABOUT` (`src/cli/kernel_cmd.rs`). Each field
+/// is pinned against its column-aligned row prefix (e.g.
+/// `  range     literal`) rather than the bare word, since
+/// `start` / `end` / `range` appear elsewhere in the help copy
+/// (e.g. "parsed start endpoint", "the inclusive range") and a
+/// bare-word substring would match the prose, masking a regression
+/// that dropped the actual schema row.
 ///
 /// Co-update contract: when the JSON schema changes (field
 /// added, renamed, removed, or its emission site moves), three
@@ -2644,40 +2694,64 @@ fn parse_shell_no_perf_mode_without_cpu_cap_succeeds() {
 ///   2. the help-copy schema block — `KERNEL_LIST_LONG_ABOUT`
 ///      in `src/cli/kernel_cmd.rs` (the column-aligned table
 ///      this test reads), and
-///   3. this test's `range_field` array.
+///   3. this test's column-aligned assertions.
 /// Updating any one without the others either silently breaks
 /// scripted consumers (1 without 2) or surfaces a misleading
 /// stale assertion (2 without 3).
 #[test]
 fn kernel_list_long_about_exposes_range_mode_json_keys() {
     let about = ktstr::cli::KERNEL_LIST_LONG_ABOUT;
-    for range_field in ["range", "start", "end", "versions"] {
-        assert!(
-            about.contains(range_field),
-            "KERNEL_LIST_LONG_ABOUT must mention range-mode JSON \
-             field `{range_field}` so scripted consumers discover \
-             the schema without `cargo doc`; got: {about:?}",
-        );
-    }
-    // Stronger pin: the help copy must explicitly distinguish
-    // range-mode from cache-walk-mode by mentioning that the
-    // range-mode shape "never carries cache metadata" (the
-    // dispatch-on-key contract). A regression that dropped the
-    // range-mode block entirely while keeping the cache-walk
-    // block (or vice versa) would pass the bare-word checks
-    // above (`start` / `end` could match unrelated copy) but
-    // fail this one.
+    // Column-aligned rows from kernel_cmd.rs's range-mode schema
+    // block — each begins with two spaces, the field name, and
+    // padding to the description column. Pinning against this
+    // exact prefix shape rejects matches inside surrounding prose.
+    assert!(
+        about.contains("  range     literal"),
+        "KERNEL_LIST_LONG_ABOUT must carry the `range` row from the \
+         range-mode schema block: got: {about:?}",
+    );
+    assert!(
+        about.contains("  start     parsed start endpoint"),
+        "KERNEL_LIST_LONG_ABOUT must carry the `start` row from the \
+         range-mode schema block: got: {about:?}",
+    );
+    assert!(
+        about.contains("  end       parsed end endpoint"),
+        "KERNEL_LIST_LONG_ABOUT must carry the `end` row from the \
+         range-mode schema block: got: {about:?}",
+    );
+    assert!(
+        about.contains("  versions  array of resolved version strings"),
+        "KERNEL_LIST_LONG_ABOUT must carry the `versions` row from the \
+         range-mode schema block: got: {about:?}",
+    );
+    // The help copy must explicitly distinguish range-mode from
+    // cache-walk-mode by mentioning that the range-mode shape
+    // "never carries cache metadata" (the dispatch-on-key contract).
+    assert!(
+        about.contains("Range-mode output never carries cache metadata"),
+        "KERNEL_LIST_LONG_ABOUT must call out the `Range-mode output \
+         never carries cache metadata` contract so scripted consumers \
+         know to dispatch on the presence of the `range` key versus \
+         the `entries` key: got: {about:?}",
+    );
     assert!(
         about.contains("--range"),
         "KERNEL_LIST_LONG_ABOUT must reference the `--range` flag \
          so a `kernel list --help` reader sees the range-mode \
          entry point: got: {about:?}",
     );
+    // The exact phrase from kernel_cmd.rs:416 splits across a
+    // line break (`...range-preview\nmode...`), so pin the
+    // unambiguous hyphenated token directly. Plain "range mode"
+    // also appears in surrounding prose (e.g. help text — see
+    // `the `range` key (range mode) versus `entries` key (list mode)`
+    // at kernel_cmd.rs:437) so a disjunction would re-introduce
+    // false-positive risk.
     assert!(
-        about.contains("range-preview") || about.contains("range mode"),
-        "KERNEL_LIST_LONG_ABOUT must explain that --range switches \
-         to a structurally-different output shape so scripted \
-         consumers know to dispatch on the presence of the \
+        about.contains("range-preview"),
+        "KERNEL_LIST_LONG_ABOUT must use the `range-preview` term so \
+         scripted consumers know to dispatch on the presence of the \
          `range` key: got: {about:?}",
     );
 }

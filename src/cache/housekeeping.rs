@@ -41,10 +41,20 @@ use std::path::Path;
 use super::TMP_DIR_PREFIX;
 use super::metadata::KernelMetadata;
 
-/// Rejects empty keys, whitespace-only keys, keys starting with
-/// `.tmp-` (reserved for in-progress stores), and keys containing
-/// path separators (`/`, `\`), parent-directory traversal (`..`),
-/// or null bytes. Returns `Ok(())` on valid keys.
+/// Rejects empty keys, whitespace-only keys, keys starting with `.`
+/// (reserved for ktstr bookkeeping — `.locks/`, `.tmp-*`), and keys
+/// containing path separators (`/`, `\`), parent-directory traversal
+/// (`..`), or null bytes. Returns `Ok(())` on valid keys.
+///
+/// The leading-dot rejection mirrors `CacheDir::list`'s dotfile
+/// filter: every name starting with `.` is treated as ktstr
+/// bookkeeping and skipped at list-time, so admitting a dotfile key
+/// at store-time would create a silent divergence (the entry is
+/// stored on disk but invisible to `list`). Reject up front to make
+/// the divergence impossible by construction. The `.tmp-` arm is
+/// retained as a more-specific error message because the
+/// `TMP_DIR_PREFIX` reservation is the externally-documented contract
+/// and operator-facing diagnostics name it explicitly.
 pub(crate) fn validate_cache_key(key: &str) -> anyhow::Result<()> {
     if key.is_empty() || key.trim().is_empty() {
         anyhow::bail!("cache key must not be empty or whitespace-only");
@@ -63,6 +73,12 @@ pub(crate) fn validate_cache_key(key: &str) -> anyhow::Result<()> {
     }
     if key.starts_with(TMP_DIR_PREFIX) {
         anyhow::bail!("cache key must not start with {TMP_DIR_PREFIX} (reserved): {key:?}",);
+    }
+    if key.starts_with('.') {
+        anyhow::bail!(
+            "cache key must not start with `.` (reserved for ktstr \
+             bookkeeping; `list` skips every dotfile child): {key:?}",
+        );
     }
     Ok(())
 }
@@ -89,6 +105,7 @@ pub(crate) struct TmpDirGuard<'a>(pub(crate) &'a Path);
 
 impl Drop for TmpDirGuard<'_> {
     fn drop(&mut self) {
+        // silent: clean_orphaned_tmp_dirs sweeps any leftover on the next store()
         let _ = fs::remove_dir_all(self.0);
     }
 }
@@ -240,6 +257,11 @@ mod tests {
     #[test]
     fn clean_orphaned_tmp_dirs_removes_dead_pid_tempdir() {
         let tmp = TempDir::new().unwrap();
+        // pid_t::MAX (i32::MAX = 2147483647) is well beyond Linux's
+        // PID_MAX_LIMIT (4194304 on 64-bit). No real PID can match,
+        // so kill(MAX, 0) returns ESRCH deterministically. Same
+        // sentinel is reused at the other dead-pid sites in this
+        // module.
         let dead_pid = libc::pid_t::MAX;
         let orphan = tmp
             .path()
@@ -343,6 +365,8 @@ mod tests {
     #[test]
     fn clean_orphaned_tmp_dirs_mixed_entries() {
         let tmp = TempDir::new().unwrap();
+        // pid_t::MAX sentinel — see comment in
+        // `clean_orphaned_tmp_dirs_removes_dead_pid_tempdir` above.
         let dead_pid = libc::pid_t::MAX;
         let live_pid = unsafe { libc::getpid() };
         let dead = tmp.path().join(format!("{TMP_DIR_PREFIX}a-{dead_pid}"));
@@ -369,8 +393,8 @@ mod tests {
         assert!(
             entry.exists(),
             "pid=0 suffix must be preserved — `pid <= 0` filter \
-             skips the entry before kill(0, None)'s pgrp-broadcast \
-             ambiguity can reach the liveness probe",
+             skips before the liveness probe so non-positive parses \
+             cannot reach kill()",
         );
     }
 
@@ -409,6 +433,8 @@ mod tests {
     #[test]
     fn clean_orphaned_tmp_dirs_leaves_regular_file_entry() {
         let tmp = TempDir::new().unwrap();
+        // pid_t::MAX sentinel — see comment in
+        // `clean_orphaned_tmp_dirs_removes_dead_pid_tempdir` above.
         let dead_pid = libc::pid_t::MAX;
         let file_entry = tmp
             .path()
@@ -433,6 +459,8 @@ mod tests {
         let target_file = target_root.path().join("sentinel.txt");
         std::fs::write(&target_file, b"must-not-be-deleted").unwrap();
 
+        // pid_t::MAX sentinel — see comment in
+        // `clean_orphaned_tmp_dirs_removes_dead_pid_tempdir` above.
         let dead_pid = libc::pid_t::MAX;
         let symlink = tmp
             .path()
@@ -500,6 +528,23 @@ mod tests {
             err.to_string().contains(".tmp-"),
             "expected .tmp- rejection, got: {err}"
         );
+    }
+
+    /// Any leading-dot key (not just `.tmp-`) is rejected because
+    /// `CacheDir::list`'s dotfile filter would skip it — admitting it
+    /// at store-time would produce an entry that exists on disk but
+    /// is invisible to `list`. The error message names the
+    /// bookkeeping reservation so an operator who hits the rejection
+    /// understands why their key was refused.
+    #[test]
+    fn cache_validate_key_rejects_other_leading_dots() {
+        for bad in [".locks", ".bookkeeping", ".my-key"] {
+            let err = validate_cache_key(bad).unwrap_err();
+            assert!(
+                err.to_string().contains("must not start with `.`"),
+                "expected leading-dot rejection for {bad:?}, got: {err}",
+            );
+        }
     }
 
     #[test]

@@ -91,24 +91,17 @@ fn live_host_pipeline_e2e_kmsg_to_reproducer_spec_to_source() {
         "scx_watchdog_workfn frame missing from parsed stack: {:?}",
         event.stack,
     );
-    // The classifier — Stall vs Error vs Normal — runs independently
-    // of `parse_kmsg_window`'s structural extraction; the parser
-    // returns Unclassified for the structural pass. We don't pin
-    // a specific classifier outcome here because that's covered by
-    // dmesg_scx's own unit tests; the integration assertion is
-    // simply that the kind is one of the well-known variants.
-    let kind_is_known = matches!(
+    // `parse_kmsg_window` runs `classify_exit_kind` inline, so this
+    // fixture's `scx_watchdog_workfn` stack frame plus the "stuck on
+    // cpu" message body must classify as Stall. Pinning the specific
+    // variant (rather than accepting any well-known one) catches
+    // regressions where the classifier silently downgrades a stall
+    // to Other / Error.
+    assert_eq!(
         event.kind,
-        ScxExitKind::Unclassified
-            | ScxExitKind::Error
-            | ScxExitKind::Stall
-            | ScxExitKind::Normal
-            | ScxExitKind::Other,
-    );
-    assert!(
-        kind_is_known,
-        "kind must be a well-known variant: {:?}",
-        event.kind
+        ScxExitKind::Stall,
+        "watchdog stack + stuck-task message must classify as Stall: {:?}",
+        event.kind,
     );
 
     // -- Phase 2: synthesize a DebugCapture from the parsed event +
