@@ -159,5 +159,5 @@ fn scenario_yield_heavy(ctx: &Ctx) -> Result<AssertResult> {
 Run manually to see full output:
 
 ```sh
-cargo nextest run --run-ignored ignored-only -E 'test(demo_host_crash_auto_repro)'
+cargo ktstr test --kernel ../linux -- --run-ignored ignored-only -E 'test(demo_host_crash_auto_repro)'
 ```

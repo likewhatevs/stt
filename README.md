@@ -65,7 +65,8 @@ ktstr = { version = "0.4" }
 ```
 
 This is all test authors need -- run with
-[cargo-nextest](https://nexte.st/) or `cargo test`.
+`cargo ktstr test --kernel ../linux` (wraps
+[cargo-nextest](https://nexte.st/) with kernel resolution).
 The `anyhow::Result` referenced in examples below is re-exported
 through `ktstr::prelude`; no separate `anyhow` dev-dependency needed.
 
@@ -172,6 +173,7 @@ declare the binary, default topology, and feature flags:
 use ktstr::prelude::*;
 
 #[derive(Scheduler)]
+// topology(1, 2, 4, 1): 1 NUMA node, 2 LLCs, 4 cores/LLC, 1 thread/core
 #[scheduler(name = "my_sched", binary = "scx_my_sched", topology(1, 2, 4, 1))]
 enum MySchedFlag {
     #[flag(args = ["--enable-llc"])]
@@ -259,7 +261,7 @@ reference it via `payload = ...` (primary slot) or
 // tests/common/fixtures.rs. Bring it into scope alongside the
 // fixtures module's other re-exports (SCHBENCH_HINTED,
 // SCHBENCH_JSON, etc.) before the test references it.
-mod common;
+mod common; // requires tests/common/fixtures.rs setup -- see tests/common/ in the repo
 use common::fixtures::*;
 
 #[ktstr_test(scheduler = MY_SCHED_PAYLOAD, payload = SCHBENCH)]
@@ -281,6 +283,11 @@ for the `#[derive(Payload)]` macro and the full field surface
 ```sh
 cargo ktstr test --kernel ../linux
 ```
+
+`--kernel` accepts a kernel source tree path (e.g. `../linux`,
+auto-built on first use), a version (`6.14.2`, or `6.14` for
+latest patch), a cache key (see `kernel list`), a version
+range (`6.12..6.14`), or a git source (`git+URL#REF`).
 
 `cargo ktstr test` wraps `cargo nextest run` with kernel
 resolution (source tree, version, or cache key), kconfig

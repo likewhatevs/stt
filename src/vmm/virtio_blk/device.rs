@@ -1796,24 +1796,6 @@ pub(crate) fn drain_bracket_impl(
             tracing::warn!(%e, "virtio-blk disable_notification failed");
         }
         loop {
-            // Pop one chain via `Queue::iter` so we can OBSERVE
-            // `Error::InvalidAvailRingIndex` instead of swallowing
-            // it (the default `pop_descriptor_chain` impl logs the
-            // error and returns None — see queue.rs:573-587 — which
-            // would let `enable_notification` re-arm immediately and
-            // loop the worker forever against a hostile guest).
-            //
-            // `iter()` is on `QueueOwnedT`, which only the bare
-            // `Queue` implements; we reach it via `q.lock()` which
-            // returns `&mut Queue` for `Queue` (cfg(test) alias) and
-            // `MutexGuard<Queue>` for `QueueSync` (cfg(not(test))) —
-            // both deref to `Queue`. The guard scope is kept tight
-            // so `add_used` etc. can re-borrow the queue downstream.
-            //
-            // The returned `DescriptorChain<M>` holds its own
-            // `mem.clone()` (queue.rs:761-766) — it does NOT borrow
-            // from the iterator or the guard, so we can drop both
-            // and walk the chain independently.
             // Pop one chain via `iter()`/`.next()` so we OBSERVE
             // `Error::InvalidAvailRingIndex` instead of swallowing
             // it. The bare `Queue::pop_descriptor_chain` impl
@@ -1823,20 +1805,20 @@ pub(crate) fn drain_bracket_impl(
             // `enable_notification` re-arm immediately, looping
             // the worker forever against a hostile guest.
             //
-            // Two-step extraction to keep the borrow tight: take
-            // the iter inside a block and capture only the
-            // outcome (Some(chain) / None / Err(_)) before
-            // dropping the lock guard. The chain itself owns its
-            // own `mem.clone()` (queue.rs:761-766), so it does not
-            // borrow from the iter or the guard — we can walk it
-            // freely after the guard drops.
-            //
             // `iter()` is on `QueueOwnedT`, which only the bare
             // `Queue` implements; we reach it via `q.lock()` —
-            // returns `&mut Queue` for `Queue` (cfg(test)) and
+            // `&mut Queue` for `Queue` (cfg(test) alias) and
             // `MutexGuard<Queue>` for `QueueSync` (cfg(not(test))).
             // Both deref to `Queue`, so `guard.iter(mem)` compiles
-            // for both alias targets.
+            // for both alias targets. Two-step extraction keeps
+            // the borrow tight: take the iter inside a block and
+            // capture only the outcome (Some(chain)/None/Err(_))
+            // before dropping the lock guard. The
+            // `DescriptorChain<M>` owns its own `mem.clone()`
+            // (queue.rs:761-766), so it does not borrow from the
+            // iter or the guard — we can walk it freely after the
+            // guard drops, and `add_used` etc. can re-borrow the
+            // queue downstream.
             let iter_outcome = {
                 let q = &mut queues[REQ_QUEUE];
                 let mut guard = q.lock();
@@ -3773,8 +3755,11 @@ impl VirtioBlk {
     /// backing-speed assumption documented at the module level
     /// (tmpfs / warm page cache). A `reset()` issued during a slow
     /// IO can stretch beyond the freeze coordinator's rendezvous
-    /// timeout — a follow-up adds a join timeout to surface the
-    /// stall instead of hanging the rendezvous.
+    /// timeout, so `reset()` caps the worker join at
+    /// [`RESET_JOIN_TIMEOUT`] (1 s) via [`join_worker_with_timeout`]
+    /// (see [`Self::stop_worker_and_reclaim_state`]); on timeout
+    /// the worker is leaked into the permanent-workerless state
+    /// rather than hanging the rendezvous indefinitely.
     pub(crate) fn reset(&mut self) {
         // Phase 1 — clear MMIO-side scalar device state. These
         // fields live on `VirtioBlk` only (not shared with the
@@ -4618,7 +4603,7 @@ pub(crate) const DROP_JOIN_TIMEOUT: Duration = Duration::from_secs(1);
 /// SIGRTMIN target the freeze coordinator picks for a
 /// failure-dump rendezvous (30 s wall budget at the coordinator
 /// level — see `FREEZE_RENDEZVOUS_TIMEOUT` in
-/// `src/vmm/mod.rs`). An unbounded `handle.join()` here would
+/// `src/vmm/freeze_coord.rs`). An unbounded `handle.join()` here would
 /// block the vCPU through the worker's wedged `pread`/`pwrite`
 /// (NFS stall, slow page cache, hung block device) and the freeze
 /// would either time out empty or arrive minutes late. Capping at
@@ -4794,21 +4779,19 @@ pub(crate) fn join_worker_with_timeout(
 ///
 /// # Bounded join
 ///
-/// The Spawned arm delegates to [`join_worker_with_timeout`] with
-/// a [`DROP_JOIN_TIMEOUT`] budget. On timeout the helper thread
-/// retains the `JoinHandle` and the calling thread returns without
-/// blocking further. See that function's docs for full outcome
-/// semantics and resource-retention notes, and `DROP_JOIN_TIMEOUT`
-/// for why the budget is set where it is.
-/// `Drop` quiesces the worker thread (production
+/// The Spawned arm quiesces the worker thread (production
 /// `WorkerEngine::Spawned` path) by writing the `stop_fd` and
 /// joining the thread with [`DROP_JOIN_TIMEOUT`] via
-/// [`join_worker_with_timeout`]. The match arms log
-/// per-outcome diagnostics — every error arm emits a structured
-/// `tracing` event so the operator can correlate a missing-VM
-/// teardown against the originating device.
-/// `JoinWithTimeoutOutcome::Joined` is silent (clean shutdown
-/// is not logged).
+/// [`join_worker_with_timeout`]. On timeout the helper thread
+/// retains the `JoinHandle` and the calling thread returns
+/// without blocking further. The match arms log per-outcome
+/// diagnostics — every error arm emits a structured `tracing`
+/// event so the operator can correlate a missing-VM teardown
+/// against the originating device. `JoinWithTimeoutOutcome::Joined`
+/// is silent (clean shutdown is not logged). See
+/// [`join_worker_with_timeout`] for full outcome semantics and
+/// resource-retention notes, and [`DROP_JOIN_TIMEOUT`] for why
+/// the budget is set where it is.
 ///
 /// # Resource retention on `TimedOut`
 ///

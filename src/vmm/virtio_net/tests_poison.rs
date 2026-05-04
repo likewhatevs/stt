@@ -200,9 +200,13 @@ fn poison_avail_idx(mem: &GuestMemoryMmap, avail_base: u64, bogus_idx: u16) {
 /// irqfd. A virtio reset MUST clear the poison and the device must
 /// resume servicing kicks.
 ///
-/// INT_CONFIG is intentionally NOT set — see the module-level
-/// divergence-from-virtio-blk doc. The test asserts INT_CONFIG
-/// stays 0 throughout to pin the kernel-source-grounded decision.
+/// INT_CONFIG is set alongside NEEDS_RESET on the poison signal
+/// — spec-compliant per virtio-v1.2 (config interrupt paired
+/// with NEEDS_RESET) and matches cloud-hypervisor's
+/// hostile-guest shutdown signal. The test asserts both bits
+/// transition from 0 → set on the poison kick, then verifies
+/// re-kicks against the already-poisoned queue do NOT re-fire
+/// the irqfd, and that a STATUS=0 reset clears both bits.
 #[test]
 fn tx_hostile_avail_idx_poisons_queue_and_signals() {
     let (mut dev, mem) = build_fixture();
@@ -254,18 +258,17 @@ fn tx_hostile_avail_idx_poisons_queue_and_signals() {
         0,
         "queue-poison path must set VIRTIO_CONFIG_S_NEEDS_RESET",
     );
-    // INT_CONFIG must remain 0 — virtio-net doesn't advertise
-    // F_STATUS so the kernel callback would no-op anyway.
-    // Pinning this keeps the divergence-from-virtio-blk
-    // intentional (catches a regression that copy-pasted blk's
-    // INT_CONFIG-set into virtio-net by mistake).
-    assert_eq!(
+    // INT_CONFIG must be set — paired with NEEDS_RESET on the
+    // poison signal, spec-compliant per virtio-v1.2 and matching
+    // cloud-hypervisor's hostile-guest shutdown signal. Catches
+    // a regression that drops the bit-set from
+    // signal_queue_poisoned.
+    assert_ne!(
         read_reg(&dev, VIRTIO_MMIO_INTERRUPT_STATUS) & VIRTIO_MMIO_INT_CONFIG,
         0,
-        "virtio-net poison path must NOT set INT_CONFIG (kernel \
-         driver doesn't negotiate F_STATUS; setting INT_CONFIG \
-         would just produce a wasted vCPU exit — see \
-         signal_queue_poisoned doc)",
+        "queue-poison path must set VIRTIO_MMIO_INT_CONFIG \
+         alongside NEEDS_RESET (spec-compliant config-interrupt \
+         pairing)",
     );
     // irqfd: one Ok read drains the counter set by the poison signal.
     assert!(
@@ -306,13 +309,13 @@ fn tx_hostile_avail_idx_poisons_queue_and_signals() {
         0,
         "STATUS=0 reset must clear NEEDS_RESET",
     );
-    // INT_CONFIG was never set on the poison path (virtio-net
-    // divergence from virtio-blk); reset just clears
-    // interrupt_status to zero on principle.
+    // reset() clears interrupt_status, so INT_CONFIG (which the
+    // poison signal had set) is back to 0.
     assert_eq!(
         read_reg(&dev, VIRTIO_MMIO_INTERRUPT_STATUS) & VIRTIO_MMIO_INT_CONFIG,
         0,
-        "INT_CONFIG must be 0 post-reset (it was never set)",
+        "STATUS=0 reset must clear INT_CONFIG (interrupt_status \
+         zeroed on reset)",
     );
     // The cumulative counter persists across reset — operators
     // need lifetime-event visibility to detect repeated hostile
@@ -393,12 +396,12 @@ fn rx_hostile_avail_idx_poisons_queue_and_signals() {
         0,
         "RX poison must set NEEDS_RESET",
     );
-    // INT_CONFIG must remain 0 — see module-level
-    // divergence-from-virtio-blk doc.
-    assert_eq!(
+    // INT_CONFIG must be set — paired with NEEDS_RESET on the
+    // poison signal. Same expectation as the TX-side test.
+    assert_ne!(
         read_reg(&dev, VIRTIO_MMIO_INTERRUPT_STATUS) & VIRTIO_MMIO_INT_CONFIG,
         0,
-        "virtio-net poison path must NOT set INT_CONFIG",
+        "RX poison path must set INT_CONFIG alongside NEEDS_RESET",
     );
     // irqfd was written by signal_used (TX completion) and
     // signal_queue_poisoned. counter-mode coalesces both writes
@@ -424,17 +427,16 @@ fn rx_hostile_avail_idx_poisons_queue_and_signals() {
 }
 
 // ---------------------------------------------------------------------------
-// Per-queue independence (F17-2)
+// Per-queue independence
 // ---------------------------------------------------------------------------
 
-/// Adversarial PhD F17-2 invariant: per-queue poison flags allow
-/// TX to keep servicing kicks while RX is poisoned. With a
-/// device-level flag, this scenario would short-circuit BOTH
-/// halves and the operator would lose visibility on which queue
-/// was actually broken. With per-queue flags, the post-RX-poison
-/// kick still drains the TX side; tx_packets advances and the
-/// guest sees TX completions — RX delivery is the only thing that
-/// stops working.
+/// Per-queue poison flags allow TX to keep servicing kicks while
+/// RX is poisoned. With a device-level flag, this scenario would
+/// short-circuit BOTH halves and the operator would lose
+/// visibility on which queue was actually broken. With per-queue
+/// flags, the post-RX-poison kick still drains the TX side;
+/// tx_packets advances and the guest sees TX completions — RX
+/// delivery is the only thing that stops working.
 #[test]
 fn rx_poison_does_not_halt_tx_progress() {
     let (mut dev, mem) = build_fixture();
@@ -497,23 +499,21 @@ fn rx_poison_does_not_halt_tx_progress() {
 }
 
 // ---------------------------------------------------------------------------
-// Poison signal-sequence shape (kernel-source-grounded divergence)
+// Poison signal-sequence shape (parity with virtio-blk)
 // ---------------------------------------------------------------------------
 
-/// The poison signal sequence on virtio-net is INTENTIONALLY
-/// shorter than virtio-blk's: NEEDS_RESET in device_status +
-/// irqfd write, and that's it. virtio-blk additionally sets
-/// `VIRTIO_MMIO_INT_CONFIG` so its `vp_config_changed` callback
-/// runs and inspects (e.g.) capacity. virtio-net does NOT
-/// negotiate `VIRTIO_NET_F_STATUS`, so the kernel's
-/// `virtnet_config_changed_work` (drivers/net/virtio_net.c:6208-6239)
-/// `virtio_cread_feature(F_STATUS, ...)`-fails and bails;
-/// raising INT_CONFIG would just produce a wasted vCPU exit.
-/// This test pins that divergence: a regression that copy-pasted
-/// virtio-blk's INT_CONFIG-set into virtio-net's poison path
-/// would fail this assertion.
+/// The poison signal sequence sets THREE effects: NEEDS_RESET in
+/// device_status, INT_CONFIG in interrupt_status, and writes the
+/// irqfd. Spec-compliant per virtio-v1.2 (config interrupt
+/// paired with NEEDS_RESET) and matches cloud-hypervisor's
+/// hostile-guest shutdown signal. virtio-net's kernel callback
+/// `virtnet_config_changed_work` cread-fails the F_STATUS gate
+/// and no-ops (we don't advertise F_STATUS), so the INT_CONFIG
+/// dispatch costs one harmless guest workqueue wake on device
+/// death — accepted cost for spec-compliance and cross-VMM
+/// convergence.
 #[test]
-fn rx_poison_signal_sequence_no_int_config() {
+fn rx_poison_signal_sequence_sets_needs_reset_and_int_config() {
     let (mut dev, mem) = build_fixture();
 
     place_tx_chain(&mem);
@@ -522,32 +522,22 @@ fn rx_poison_signal_sequence_no_int_config() {
 
     write_reg(&mut dev, VIRTIO_MMIO_QUEUE_NOTIFY, TXQ as u32);
 
-    // Two signal effects on the device side:
-    //   1. NEEDS_RESET set in device_status (operator detects via
-    //      mmio_read(STATUS))
-    //   2. irqfd written
-    // INT_VRING also gets set by signal_used because the TX
-    // chain completed before the RX poison, but that's per-event,
-    // not part of the poison sequence per se.
     assert_ne!(
         read_reg(&dev, VIRTIO_MMIO_STATUS) & VIRTIO_CONFIG_S_NEEDS_RESET,
         0,
         "NEEDS_RESET must be set",
     );
-    // INT_CONFIG must remain 0 — kernel-source-grounded decision
-    // (virtnet_config_changed_work cread-fails F_STATUS).
-    assert_eq!(
+    assert_ne!(
         read_reg(&dev, VIRTIO_MMIO_INTERRUPT_STATUS) & VIRTIO_MMIO_INT_CONFIG,
         0,
-        "virtio-net poison path must NOT set INT_CONFIG (divergence \
-         from virtio-blk; see signal_queue_poisoned doc)",
+        "INT_CONFIG must be set alongside NEEDS_RESET",
     );
     assert!(
         dev.irq_evt().read().is_ok(),
         "irq_evt must be signaled",
     );
 
-    // Reset clears NEEDS_RESET and the per-queue flag.
+    // Reset clears both bits and the per-queue flag.
     write_reg(&mut dev, VIRTIO_MMIO_STATUS, 0);
     assert_eq!(
         read_reg(&dev, VIRTIO_MMIO_STATUS) & VIRTIO_CONFIG_S_NEEDS_RESET,

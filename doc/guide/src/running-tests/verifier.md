@@ -33,7 +33,7 @@ See [cargo-ktstr verifier](cargo-ktstr.md#verifier) for all flags.
 
 ```sh
 # Run the verifier pipeline test
-cargo nextest run -E 'test(verifier_)'
+cargo ktstr test --kernel ../linux -- -E 'test(verifier_)'
 ```
 
 ## How it works

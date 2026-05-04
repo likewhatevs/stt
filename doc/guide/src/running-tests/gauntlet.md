@@ -6,13 +6,13 @@ ignored by default.
 
 ```sh
 # Run only base tests (default)
-cargo nextest run
+cargo ktstr test --kernel ../linux
 
 # Run only gauntlet variants
-cargo nextest run --run-ignored ignored-only -E 'test(gauntlet/)'
+cargo ktstr test --kernel ../linux -- --run-ignored ignored-only -E 'test(gauntlet/)'
 
 # Run everything
-cargo nextest run --run-ignored all
+cargo ktstr test --kernel ../linux -- --run-ignored all
 ```
 
 Entries with `host_only = true` never produce gauntlet variants
@@ -44,7 +44,7 @@ path basename).
 To run a single variant:
 
 ```sh
-cargo nextest run --run-ignored ignored-only \
+cargo ktstr test --kernel ../linux -- --run-ignored ignored-only \
   -E 'test(=gauntlet/my_test/smt-2llc/default)'
 ```
 

@@ -183,6 +183,7 @@ optional cpuset, and workload specification into a single declaration.
 This is the most common custom test pattern:
 
 ```rust,ignore
+use std::time::Duration;
 use ktstr::prelude::*;
 
 #[ktstr_test(llcs = 1, cores = 2, threads = 1)]
@@ -191,8 +192,11 @@ fn my_test(ctx: &Ctx) -> Result<AssertResult> {
         CgroupDef::named("cg_0").workers(4),
         CgroupDef::named("cg_1")
             .workers(2)
-            // bursty(50, 100): CPU burst for 50 ms, sleep for 100 ms, repeat.
-            .work_type(WorkType::bursty(50, 100)),
+            // CPU burst for 50 ms, sleep for 100 ms, repeat.
+            .work_type(WorkType::bursty(
+                Duration::from_millis(50),
+                Duration::from_millis(100),
+            )),
     ])
 }
 ```

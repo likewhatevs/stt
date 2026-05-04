@@ -172,17 +172,23 @@ readiness gates between host and guest.
 </details>
 
 <details>
-<summary><b>20 work types</b> — configurable workload profiles for different scheduling pressures</summary>
+<summary><b>38 work types</b> — configurable workload profiles for different scheduling pressures</summary>
 
 Workers are `fork()`ed processes placed in cgroups:
 
 - `SpinWait` — tight CPU spin loop
 - `YieldHeavy` — repeated sched_yield with minimal CPU work
 - `Mixed` — CPU spin burst followed by sched_yield
-- `IoSync` — 64 KB write + 100 us sleep (simulated blocking I/O)
-- `Bursty` — CPU burst then sleep (parameterized)
+- `AluHot` — dependent integer multiply chain at high IPC (≥ 2.0)
+- `SmtSiblingSpin` — paired PAUSE-spin pinned across two SMT siblings
+- `IpcVariance` — alternating high-IPC (multiplies) / low-IPC (cache touches) phases
+- `IoSyncWrite` — 16 × 4 KB pwrites + fdatasync per iteration (O_SYNC)
+- `IoRandRead` — 4 KB random pread (O_DIRECT)
+- `IoConvoy` — interleaved sequential pwrite + random pread with periodic fdatasync (O_DIRECT)
+- `Bursty` — CPU burst then sleep (parameterized via `Duration`)
+- `IdleChurn` — CPU burst then `nanosleep` (hrtimer + idle-class path)
 - `PipeIo` — CPU burst then pipe exchange (cross-CPU wake placement)
-- `FutexPingPong` — paired futex wait/wake
+- `FutexPingPong` — paired futex wait/wake (non-WF_SYNC)
 - `FutexFanOut` — 1:N fan-out wake
 - `CachePressure` — strided RMW sized to pressure L1
 - `CacheYield` — cache pressure + sched_yield
@@ -191,13 +197,25 @@ Workers are `fork()`ed processes placed in cgroups:
 - `ForkExit` — rapid fork+_exit cycling
 - `NiceSweep` — cycle nice level from -20 to 19
 - `AffinityChurn` — rapid self-directed sched_setaffinity
-- `PolicyChurn` — cycle through scheduling policies
+- `PolicyChurn` — cycle SCHED_OTHER → BATCH → IDLE (→ FIFO/RR with CAP_SYS_NICE)
+- `NumaMigrationChurn` — rotate sched_setaffinity across NUMA nodes
+- `CgroupChurn` — cycle cgroup membership between sibling cgroups
 - `FanOutCompute` — messenger/worker fan-out with matrix-multiply compute
+- `AsymmetricWaker` — paired workers in mismatched scheduling classes share one futex word
+- `WakeChain` — ring of waker-wakee hops (Pipe with WF_SYNC, or Futex)
+- `EpollStorm` — eventfd producers + epoll_wait consumers
+- `ThunderingHerd` — N waiters on one global futex word; broadcast wake
 - `PageFaultChurn` — rapid mmap/fault/MADV_DONTNEED cycling
+- `NumaWorkingSetSweep` — rotate working-set memory across NUMA nodes via mbind
 - `MutexContention` — N-way futex mutex contention
+- `PriorityInversion` — three-tier lock contention (Pi or Plain futex)
+- `ProducerConsumerImbalance` — unbalanced producer/consumer pipeline (queue grows)
+- `SignalStorm` — paired workers fire kill(partner, SIGUSR1) between CPU bursts
+- `PreemptStorm` — one SCHED_FIFO worker preempts CFS spinners at ~kHz
+- `RtStarvation` — SCHED_FIFO workers monopolise CPU; SCHED_NORMAL workers starve
 - `Custom` — user-supplied work function
 
-See [WorkSpec Types](concepts/work-types.md).
+See [WorkType](concepts/work-types.md).
 
 </details>
 
@@ -349,8 +367,8 @@ guest and host coverage for unified `cargo llvm-cov` reports.
 
 Wraps `cargo nextest run` with automatic kernel resolution.
 Subcommands (in `--help` order): `test`, `coverage`, `llvm-cov`,
-`stats`, `kernel`, `model`, `verifier`, `completions`, `show-host`,
-`show-thresholds`, `cleanup`, `locks`, `shell`.
+`stats`, `kernel`, `model`, `verifier`, `funify`, `completions`,
+`show-host`, `show-thresholds`, `export`, `locks`, `shell`.
 See [`cargo-ktstr`](running-tests/cargo-ktstr.md).
 
 </details>

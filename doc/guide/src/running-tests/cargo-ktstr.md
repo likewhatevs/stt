@@ -3,8 +3,8 @@
 `cargo ktstr` is a cargo plugin for kernel build, cache, and test
 workflow. Subcommands in `--help` order: `test` (alias: `nextest`),
 `coverage`, `llvm-cov`, `stats`, `kernel`, `model`, `verifier`,
-`completions`, `show-host`, `show-thresholds`, `export`, `locks`,
-`shell`.
+`funify` (alias: `costume`), `completions`, `show-host`,
+`show-thresholds`, `export`, `locks`, `shell`.
 
 ## test
 

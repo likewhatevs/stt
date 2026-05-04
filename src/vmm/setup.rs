@@ -57,7 +57,7 @@ fn aarch64_initrd_addr(memory_mb: u32, shm_size: u64, initrd_max_size: u64) -> u
 /// set.
 ///
 /// Free fn so cfg(test) unit tests cover all branches without
-/// driving a full `KtstrVmBuilder::build` call.
+/// driving a full `setup_memory` call.
 ///
 /// Token contract (consumed by
 /// [`crate::vmm::rust_init::auto_mount_data_disks`]):
@@ -1065,7 +1065,7 @@ impl KtstrVm {
                 kvm::VIRTIO_BLK_MMIO_BASE,
                 kvm::VIRTIO_BLK_IRQ,
             ));
-            // Auto-mount handshake (#437). Emit a `KTSTR_DISK0_FS=<tag>`
+            // Auto-mount handshake. Emit a `KTSTR_DISK0_FS=<tag>`
             // token whenever the first disk has been pre-formatted so
             // the guest init at
             // [`crate::vmm::rust_init::auto_mount_data_disks`]
@@ -1527,8 +1527,8 @@ mod tests {
     /// Pin the leading-space cmdline-concatenation contract. The
     /// returned tokens MUST start with a space when non-empty so
     /// they can be appended directly to the cmdline buffer in
-    /// `KtstrVmBuilder::build`. A regression that drops the
-    /// leading space would create a glued-together token like
+    /// `setup_memory`. A regression that drops the leading space
+    /// would create a glued-together token like
     /// `virtio_mmio.device=...KTSTR_DISK0_FS=btrfs` which the
     /// kernel cmdline parser would mis-classify as a single token.
     #[test]

@@ -64,7 +64,7 @@ for version selection and local source builds.
 ## 4. Run
 
 ```sh
-cargo nextest run
+cargo ktstr test --kernel ../linux
 ```
 
 ## 5. Check BPF complexity (optional)

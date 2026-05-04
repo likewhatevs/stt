@@ -142,6 +142,11 @@ impl VirtioConsole {
     // splits the two because it negotiates EVENT_IDX.
     fn signal_used(&mut self) {
         self.interrupt_status |= VIRTIO_MMIO_INT_VRING;
+        // Success path is silent (high-volume hot path: signal_used
+        // fires per drained chain, tens to hundreds of times per
+        // console burst); failure logs once per occurrence so a
+        // genuine eventfd-write breakage surfaces in tracing rather
+        // than silently disappearing.
         if let Err(e) = self.irq_evt.write(1) {
             tracing::warn!(%e, "virtio-console irq_evt.write failed");
         }
@@ -199,6 +204,13 @@ impl VirtioConsole {
                 "virtio-console process_tx: data received"
             );
             self.signal_used();
+            // tx_evt is a wake hint to the host stdout thread;
+            // a missed write means the host poll absorbs the
+            // latency next cycle — not a correctness failure.
+            // Silent swallow is intentional (in contrast to
+            // signal_used's irq_evt write, which logs because
+            // a missed IRQ stalls the GUEST, not just a host
+            // poll cadence).
             let _ = self.tx_evt.write(1);
         }
     }

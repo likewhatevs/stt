@@ -9,7 +9,7 @@ Rerun the failing test with `RUST_BACKTRACE=1` before digging into
 individual sections:
 
 ```sh
-RUST_BACKTRACE=1 cargo nextest run -E 'test(my_test)'
+RUST_BACKTRACE=1 cargo ktstr test --kernel ../linux -- -E 'test(my_test)'
 ```
 
 Setting `RUST_BACKTRACE=1` unconditionally appends the

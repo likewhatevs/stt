@@ -217,7 +217,7 @@ not populate any telemetry fields for Custom -- migration tracking,
 gap detection, schedstat deltas, NUMA page counts, and iteration
 counters are only present if the user's `run` function fills them.
 
-## WorkSpec-conservation watchdog
+## Worker-progress watchdog
 
 Workers send SIGUSR2 to the scheduler when stuck > 2 seconds. The
 default POSIX disposition terminates the scheduler process, which ktstr

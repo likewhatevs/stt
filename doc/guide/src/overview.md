@@ -74,9 +74,12 @@ Two principles drive ktstr's architecture:
 
 **Fidelity without overhead** -- every test boots a real Linux kernel
 in a KVM VM with real cgroups and real BPF programs. No mocking, no
-containers, no shared state. The VMM is minimal: no disks, no network
-devices, no PCI. The device model is two serial ports (COM1 for kernel
-console, COM2 for application I/O) and a shared-memory ring buffer.
+containers, no shared state. The VMM is minimal and PCI-free: two
+16550 serial ports (COM1 for kernel console, COM2 for application
+I/O), a shared-memory ring buffer, and three virtio-MMIO devices
+(virtio-console for guest console I/O, virtio-blk for file-backed
+block storage with optional btrfs templates, virtio-net for in-VMM
+L2 loopback used by network workload tests).
 
 **Direct access over tooling layers** -- the host-side monitor reads
 guest memory directly via BTF (BPF Type Format)-resolved struct

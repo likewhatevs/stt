@@ -14,11 +14,6 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-// serde(default) is stripped from cache types so an old metadata.json
-// missing a required non-Option field (e.g. has_vmlinux) fails at
-// deserialize time → ListedEntry::Corrupt. Option fields tolerate
-// absent keys via serde_json's native handling.
-
 /// How a cached kernel's source was acquired, with per-variant
 /// payload (git details for `Git`, source-tree path and git hash for
 /// `Local`).
@@ -468,6 +463,18 @@ pub(crate) fn classify_corrupt_reason(reason: &str) -> &'static str {
     } else if reason.starts_with("metadata.json truncated: ") {
         "truncated"
     } else if reason.starts_with("metadata.json parse error: ") {
+        // Forward-compat slot: no live producer in the current
+        // codebase. `read_metadata` uses `serde_json::from_str`
+        // which cannot return `Category::Io` (the arm is pinned
+        // `unreachable!` — see housekeeping.rs). The classifier
+        // arm is retained so a future producer that switches to
+        // `from_reader` (or any path that genuinely surfaces an
+        // I/O error during JSON decode) can emit the canonical
+        // prefix and have it route to the same stable
+        // `error_kind` value scripted consumers already dispatch
+        // on. Removing the arm now would force such a producer
+        // to either invent a new prefix (breaking the contract)
+        // or land in `unknown` (losing dispatch fidelity).
         "parse_error"
     } else if reason.starts_with(IMAGE_MISSING_PREFIX)
         && reason.ends_with(IMAGE_MISSING_SUFFIX)

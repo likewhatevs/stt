@@ -1,42 +1,170 @@
-# WorkSpec Types
+# WorkType
 
 `WorkType` controls what each worker process does during a scenario.
 
+The `WorkType` enum in `ktstr::workload` is the source of truth.
+The variants below are grouped by intent; each one-line summary is
+the leading sentence of the variant's rustdoc. Run `cargo doc --open`
+for full per-variant semantics, parameter ranges, and kernel-path
+citations — this page reproduces only the high-level shape.
+
 ```rust,ignore
 pub enum WorkType {
-    SpinWait,
-    YieldHeavy,
-    Mixed,
-    IoSync,
-    Bursty { burst_ms: u64, sleep_ms: u64 },
-    PipeIo { burst_iters: u64 },
-    FutexPingPong { spin_iters: u64 },
-    CachePressure { size_kb: usize, stride: usize },
-    CacheYield { size_kb: usize, stride: usize },
-    CachePipe { size_kb: usize, burst_iters: u64 },
-    FutexFanOut { fan_out: usize, spin_iters: u64 },
-    FanOutCompute { fan_out: usize, cache_footprint_kb: usize, operations: usize, sleep_usec: u64 },
-    Sequence { first: Phase, rest: Vec<Phase> },
-    ForkExit,
-    NiceSweep,
-    AffinityChurn { spin_iters: u64 },
-    PolicyChurn { spin_iters: u64 },
-    PageFaultChurn { region_kb: usize, touches_per_cycle: usize, spin_iters: u64 },
-    MutexContention { contenders: usize, hold_iters: u64, work_iters: u64 },
-    Custom { name: &'static str, run: fn(&AtomicBool) -> WorkerReport },
+    // CPU primitives
+    SpinWait,                            // Tight CPU spin loop (1024 iterations per cycle).
+    YieldHeavy,                          // Repeated sched_yield with minimal CPU work.
+    Mixed,                               // CPU spin burst followed by sched_yield.
+    AluHot { width: AluWidth },          // Dependent integer multiply chain at high IPC (>= 2.0); optional SIMD width.
+    SmtSiblingSpin,                      // Tight PAUSE-spin from a paired worker pinned to two SMT siblings.
+    IpcVariance {                        // Alternating high-IPC (multiplies) / low-IPC (random cache touches) phases.
+        hot_iters: u64,
+        cold_iters: u64,
+        period_iters: u64,
+    },
+
+    // Block-device I/O (operates on /dev/vda; falls back to per-worker tempfile when absent)
+    IoSyncWrite,                         // 16 x 4 KB pwrites + fdatasync per iteration (O_SYNC).
+    IoRandRead,                          // Single 4 KB pread at a random sector-aligned offset (O_DIRECT).
+    IoConvoy,                            // Interleaved sequential pwrite + random pread with periodic fdatasync (O_DIRECT).
+
+    // Burst-and-sleep
+    Bursty {                             // CPU burst for `burst_duration`, sleep for `sleep_duration`, repeat.
+        burst_duration: Duration,
+        sleep_duration: Duration,
+    },
+    IdleChurn {                          // CPU burst then `nanosleep` (exercises hrtimer + idle-class path).
+        burst_duration: Duration,
+        sleep_duration: Duration,
+        precise_timing: bool,
+    },
+
+    // Cache pressure
+    CachePressure { size_kb: usize, stride: usize },    // Strided RMW sized to pressure L1.
+    CacheYield { size_kb: usize, stride: usize },       // Cache pressure burst then sched_yield().
+
+    // Wake-placement / cross-CPU paths
+    PipeIo { burst_iters: u64 },                        // CPU burst then 1-byte pipe exchange with a partner worker.
+    FutexPingPong { spin_iters: u64 },                  // Paired futex wait/wake between partner workers (non-WF_SYNC).
+    CachePipe { size_kb: usize, burst_iters: u64 },     // Cache-hot working set + pipe wake.
+    FutexFanOut { fan_out: usize, spin_iters: u64 },    // 1:N fan-out wake (one messenger, N receivers).
+    FanOutCompute {                                     // Messenger/worker fan-out with matrix-multiply compute per receiver.
+        fan_out: usize,
+        cache_footprint_kb: usize,
+        operations: usize,
+        sleep_usec: u64,
+    },
+    AsymmetricWaker {                                   // Paired workers in mismatched scheduling classes share one futex word.
+        waker_class: SchedClass,
+        wakee_class: SchedClass,
+        burst_iters: u64,
+    },
+    WakeChain {                                         // Ring of waker-wakee hops via Pipe (WF_SYNC) or Futex wake.
+        depth: usize,
+        wake: WakeMechanism,
+        work_per_hop: Duration,
+    },
+    EpollStorm {                                        // eventfd producers + epoll_wait consumers (exclusive autoremove wake).
+        producers: usize,
+        consumers: usize,
+        events_per_burst: u64,
+    },
+    ThunderingHerd {                                    // N waiters on ONE global futex word; broadcast FUTEX_WAKE rouses the herd.
+        waiters: usize,
+        batches: u64,
+        inter_batch_ms: u64,
+    },
+
+    // Compound / sequence
+    Sequence { first: Phase, rest: Vec<Phase> },        // Loop through ordered phases (Spin / Sleep / Yield / Io).
+
+    // Lifecycle / scheduling-class churn
+    ForkExit,                                           // Rapid fork+_exit cycling; parent waitpid's then repeats.
+    NiceSweep,                                          // Cycle nice level from -20 to 19 across iterations.
+    AffinityChurn { spin_iters: u64 },                  // Rapid self-directed sched_setaffinity to random CPUs.
+    PolicyChurn { spin_iters: u64 },                    // Cycle SCHED_OTHER -> BATCH -> IDLE (-> FIFO/RR if CAP_SYS_NICE).
+    NumaMigrationChurn { period_ms: u64 },              // Rotate sched_setaffinity across NUMA nodes.
+    CgroupChurn { groups: usize, cycle_ms: u64 },       // Cycle cgroup membership between sibling cgroups.
+
+    // Memory pressure / NUMA
+    PageFaultChurn {                                    // mmap NOHUGEPAGE -> touch random pages -> MADV_DONTNEED, repeat.
+        region_kb: usize,
+        touches_per_cycle: usize,
+        spin_iters: u64,
+    },
+    NumaWorkingSetSweep {                               // Rotate the working-set memory across NUMA nodes via mbind.
+        region_kb: usize,
+        sweep_period_ms: u64,
+        target_nodes: Vec<usize>,
+    },
+
+    // Lock contention
+    MutexContention {                                   // N-way futex mutex contention (CAS acquire / FUTEX_WAIT on failure).
+        contenders: usize,
+        hold_iters: u64,
+        work_iters: u64,
+    },
+    PriorityInversion {                                 // Three priority tiers contending for one shared lock (Pi or Plain futex).
+        high_count: usize,
+        medium_count: usize,
+        low_count: usize,
+        hold_iters: u64,
+        work_iters: u64,
+        pi_mode: FutexLockMode,
+    },
+
+    // Producer/consumer + signal/preempt pressure
+    ProducerConsumerImbalance {                         // Producer / consumer pipeline with deliberately-unbalanced rates.
+        producers: usize,
+        consumers: usize,
+        produce_rate_hz: u64,
+        consume_iters: u64,
+        queue_depth_target: u64,
+    },
+    SignalStorm {                                       // Paired workers fire kill(partner, SIGUSR1) between CPU bursts.
+        signals_per_iter: u64,
+        work_iters: u64,
+    },
+    PreemptStorm {                                      // One SCHED_FIFO worker preempts CFS spinners on the same CPU at ~kHz rate.
+        cfs_workers: usize,
+        rt_burst_iters: u64,
+        rt_sleep_us: u64,
+    },
+    RtStarvation {                                      // SCHED_FIFO workers monopolise the CPU at 100%; CFS workers starve.
+        rt_workers: usize,
+        cfs_workers: usize,
+        rt_priority: i32,
+        burst_iters: u64,
+    },
+
+    // User-supplied
+    Custom {                                            // User-supplied work function (name + fn pointer).
+        name: String,
+        run: fn(&AtomicBool) -> WorkerReport,
+    },
 }
 ```
 
-Parameterized variants have convenience constructors:
-`WorkType::bursty(50, 100)`, `WorkType::pipe_io(1024)`,
-`WorkType::futex_ping_pong(1024)`, `WorkType::cache_pressure(32, 64)`,
-`WorkType::cache_yield(32, 64)`, `WorkType::cache_pipe(32, 1024)`,
-`WorkType::futex_fan_out(4, 1024)`,
-`WorkType::fan_out_compute(4, 256, 5, 100)`,
-`WorkType::affinity_churn(1024)`, `WorkType::policy_churn(1024)`,
-`WorkType::page_fault_churn(4096, 256, 64)`,
-`WorkType::mutex_contention(4, 256, 1024)`,
-`WorkType::custom("my_work", my_fn)`.
+Parameterized variants have snake-case convenience constructors —
+e.g. `WorkType::bursty(burst_duration, sleep_duration)`,
+`WorkType::pipe_io(burst_iters)`,
+`WorkType::cache_pressure(size_kb, stride)`,
+`WorkType::page_fault_churn(region_kb, touches_per_cycle, spin_iters)`,
+`WorkType::mutex_contention(contenders, hold_iters, work_iters)`,
+`WorkType::priority_inversion(high_count, medium_count, low_count,
+hold_iters, work_iters, pi_mode)`,
+`WorkType::wake_chain(depth, wake, work_per_hop)`,
+`WorkType::custom(name, run)`. Every parameterised variant has one;
+see `cargo doc --open` on `WorkType` for the full constructor list
+and parameter validation rules.
+
+`Bursty`, `IdleChurn`, and `WakeChain` take `Duration` parameters
+(humantime-serialised in captured configs) — pass
+`Duration::from_millis(N)` or
+`Duration::from_micros(N)` from `std::time` rather than raw integers.
+`IpcVariance`, `ProducerConsumerImbalance`, `RtStarvation`,
+`PriorityInversion`, `EpollStorm`, `PreemptStorm`, and
+`ThunderingHerd` reject zero-valued counters at spawn time
+(`WorkTypeValidationError::*`).
 
 ## Choosing a work type
 
@@ -69,14 +197,28 @@ scheduler wake/sleep paths.
 **`Mixed`** -- 1024 spin iterations then yield. Combines CPU and
 voluntary preemption.
 
-**`IoSync`** -- writes 64 KB to a temp file then sleeps 100 us to
-simulate I/O completion latency. On tmpfs (which ktstr VMs use), fsync
-is a kernel no-op and writes go to page cache, so the sleep provides
-the blocking that real disk I/O would cause. Exercises scheduler
-dequeue/requeue paths and page allocator pressure.
+**`IoSyncWrite`** -- 16 × 4 KB pwrites totaling 64 KB at the worker's
+stripe offset (per-worker striping prevents fdatasync from coalescing
+across writers), then `fdatasync()`. Drives fsync-heavy D-state cycles.
+Opens `/dev/vda` with `O_SYNC`; falls back to a per-worker tempfile
+when `/dev/vda` is absent (host-side unit tests).
 
-**`Bursty`** -- CPU burst for `burst_ms`, then sleep for `sleep_ms`.
-Frees CPUs during sleep, exercising CPU borrowing.
+**`IoRandRead`** -- single 4 KB pread at a sector-aligned random
+offset within the device capacity. Opens `/dev/vda` with `O_DIRECT`
+(tempfile fallback); drives high-IOPS short-D-state cycles. Per-worker
+xorshift PRNG seeded from `tid`.
+
+**`IoConvoy`** -- alternates 4 KB pwrite at the worker's monotonic
+sequential cursor with 4 KB pread at a random offset; `fdatasync()`
+runs every 16 iterations. `/dev/vda` opened `O_DIRECT` (tempfile
+fallback). Currently uses direct IO so the pathology surface is the
+synchronous flush + IO-mix latency rather than page-cache convoy
+build-up.
+
+**`Bursty`** -- CPU burst for `burst_duration`, sleep for
+`sleep_duration`, repeat. Both fields are `Duration` (humantime-
+serialised); pass `Duration::from_millis(N)` from `std::time`. Frees
+CPUs during sleep, exercising CPU borrowing.
 
 **`PipeIo`** -- CPU burst then 1-byte pipe exchange with a partner
 worker. Workers are paired: (0,1), (2,3), etc. Sleep duration depends
@@ -256,7 +398,7 @@ and `MutexContention` use shared mmap pages with futex wait/wake.
 ## Default values
 
 `WorkType::from_name()` uses these defaults:
-- `Bursty`: `burst_ms=50`, `sleep_ms=100`
+- `Bursty`: `burst_duration=50ms`, `sleep_duration=100ms`
 - `PipeIo`: `burst_iters=1024`
 - `FutexPingPong`: `spin_iters=1024`
 - `CachePressure`: `size_kb=32`, `stride=64`

@@ -3,13 +3,13 @@
 ## Running a specific test
 
 ```sh
-cargo nextest run -E 'test(sched_basic_proportional)'
+cargo ktstr test --kernel ../linux -- -E 'test(sched_basic_proportional)'
 ```
 
 ## Running with verbose output
 
 ```sh
-RUST_BACKTRACE=1 cargo nextest run -E 'test(sched_basic_proportional)'
+RUST_BACKTRACE=1 cargo ktstr test --kernel ../linux -- -E 'test(sched_basic_proportional)'
 ```
 
 ## Investigating failures
@@ -18,7 +18,7 @@ Run one test with verbose output to see scheduler logs and kernel
 console:
 
 ```sh
-RUST_BACKTRACE=1 cargo nextest run -E 'test(cover_cgroup_cpuset_cross_llc_race)'
+RUST_BACKTRACE=1 cargo ktstr test --kernel ../linux -- -E 'test(cover_cgroup_cpuset_cross_llc_race)'
 ```
 
 ## VM topology

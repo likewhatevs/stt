@@ -322,15 +322,23 @@ impl KtstrVm {
         //      store after the drain dance, providing the happens-
         //      before edge that makes guest-memory reads correct on
         //      weakly-ordered architectures)
-        //   6. (follow-up batch) call dump_state to read BPF map state
+        //   6. call dump_state to read BPF map state, vCPU regs,
+        //      and per-CPU prog/cputime captures into a
+        //      FailureDumpReport, then emit the report as JSON
+        //      via tracing::error and the optional file sink
         //   7. clear freeze=false; each parked vCPU polling on
         //      park_timeout(10ms) observes the clear within 10 ms
         //      and resumes — no explicit unpark needed
         //
-        // DMA caveat: a guest with active DMA continues to mutate
-        // memory after vCPUs park. This is irrelevant for sched_ext
-        // BPF map reads (CPU-only) but a future feature reading
-        // DMA-affected pages should drain the device path first.
+        // DMA quiescence: virtio-blk's independent worker thread
+        // is paused before the vCPU SIGRTMIN kick (see
+        // `blk.lock().pause()` in freeze_and_capture below); the
+        // rendezvous waits for the worker's paused ack alongside
+        // the vCPU parked acks. virtio-net (v0) and virtio-console
+        // run synchronously on the vCPU thread, so they freeze
+        // automatically once the vCPU rendezvous completes. A
+        // future device with its own worker thread would need to
+        // be added to the pause sequence.
         let freeze_coord_freeze = freeze.clone();
         let freeze_coord_kill = kill.clone();
         // Optional virtio-blk handle for the failure-dump
@@ -1304,14 +1312,12 @@ impl KtstrVm {
                                         event_counter_capture: None,
                                         // Per-CPU rq->scx + DSQ walker.
                                         // Library-ready; the freeze
-                                        // coordinator hasn't yet resolved
-                                        // ScxWalkerOffsets nor built the
-                                        // rq_kvas/rq_pas arrays
+                                        // coordinator does not currently
+                                        // resolve ScxWalkerOffsets nor
+                                        // build the rq_kvas/rq_pas arrays
                                         // outside the dual_snapshot
-                                        // scan_ctx path. A follow-up wires
-                                        // the resolved offsets + rq arrays
-                                        // through. Until then, the dump
-                                        // emits empty rq_scx_states /
+                                        // scan_ctx path. The dump emits
+                                        // empty rq_scx_states /
                                         // dsq_states with
                                         // `scx_walker_unavailable: Some(
                                         // "no scx walker capture")`.

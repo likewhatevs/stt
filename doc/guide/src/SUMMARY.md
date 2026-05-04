@@ -17,7 +17,7 @@
 - [Core Concepts](concepts.md)
   - [Scenarios](concepts/scenarios.md)
   - [Flags](concepts/flags.md)
-  - [WorkSpec Types](concepts/work-types.md)
+  - [WorkType](concepts/work-types.md)
   - [Checking](concepts/checking.md)
   - [Ops and Steps](concepts/ops.md)
   - [TestTopology](concepts/topology.md)

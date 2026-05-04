@@ -554,7 +554,8 @@ impl CacheDir {
                         err = %format!("{e:#}"),
                         "vmlinux strip failed, caching unstripped \
                          (larger on-disk payload). See \
-                         `ktstr cache list --json` vmlinux_stripped field.",
+                         `cargo ktstr kernel list --json` \
+                         vmlinux_stripped field.",
                     );
                     fs::copy(vmlinux, &vmlinux_dest)
                         .map_err(|e| anyhow::anyhow!("copy vmlinux to cache: {e}"))?;
@@ -2995,10 +2996,10 @@ mod tests {
         assert!(
             msg.starts_with("copy kernel image to cache:"),
             "diagnostic must START with the exact `copy kernel image \
-             to cache:` prefix from cache_dir.rs:541 so an operator \
-             can attribute the failure to the image-copy step (vs \
-             the stripped-vmlinux arm at :548 or the fallback-vmlinux \
-             arm at :560); got: {msg}",
+             to cache:` prefix so an operator can attribute the \
+             failure to the image-copy step (vs the stripped-vmlinux \
+             `copy stripped vmlinux to cache:` arm or the \
+             fallback-vmlinux `copy vmlinux to cache:` arm); got: {msg}",
         );
 
         // Cleanup obligation: the TmpDirGuard must remove the
@@ -3016,18 +3017,18 @@ mod tests {
 
     /// `fs::copy` of the unstripped vmlinux on the strip-fallback
     /// path fails when the source vmlinux does not exist. Pins the
-    /// EXACT error-context prefix `"copy vmlinux to cache:"` from
-    /// cache_dir.rs:560 so a future refactor that reroutes the
-    /// fallback (e.g. moves to a separate helper) but drops the
-    /// context prefix is caught immediately. The test exercises the
-    /// strip-fallback fs::copy arm specifically — strip_vmlinux_debug
-    /// errors first on the missing read, store() falls through to
-    /// the raw-bytes fallback copy, which then ALSO errors with
-    /// ENOENT against the same missing source. The final error
-    /// surfaced to the caller MUST carry the exact "copy vmlinux to
-    /// cache:" prefix that distinguishes this arm from the
-    /// "copy stripped vmlinux to cache:" success-path arm and the
-    /// "copy kernel image to cache:" image-copy arm.
+    /// EXACT error-context prefix `"copy vmlinux to cache:"` so a
+    /// future refactor that reroutes the fallback (e.g. moves to a
+    /// separate helper) but drops the context prefix is caught
+    /// immediately. The test exercises the strip-fallback fs::copy
+    /// arm specifically — strip_vmlinux_debug errors first on the
+    /// missing read, store() falls through to the raw-bytes
+    /// fallback copy, which then ALSO errors with ENOENT against
+    /// the same missing source. The final error surfaced to the
+    /// caller MUST carry the exact "copy vmlinux to cache:" prefix
+    /// that distinguishes this arm from the "copy stripped vmlinux
+    /// to cache:" success-path arm and the "copy kernel image to
+    /// cache:" image-copy arm.
     #[test]
     fn store_vmlinux_copy_failure_uses_exact_error_prefix() {
         let tmp = TempDir::new().unwrap();
@@ -3048,13 +3049,12 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(
             msg.starts_with("copy vmlinux to cache:"),
-            "the fallback fs::copy arm at cache_dir.rs:560 wraps \
-             with the exact prefix `copy vmlinux to cache:` — this \
-             distinguishes it from the success-path stripped-copy \
-             at cache_dir.rs:548 (`copy stripped vmlinux to cache:`) \
-             and the kernel-image arm at cache_dir.rs:541 (`copy \
-             kernel image to cache:`); a regression that drops the \
-             context wrapping or rewords the prefix would lose the \
+            "the fallback fs::copy arm wraps with the exact prefix \
+             `copy vmlinux to cache:` — this distinguishes it from \
+             the success-path stripped-copy `copy stripped vmlinux \
+             to cache:` and the kernel-image arm `copy kernel image \
+             to cache:`; a regression that drops the context \
+             wrapping or rewords the prefix would lose the \
              arm-attribution diagnostic. Got: {msg}",
         );
 
@@ -3122,7 +3122,7 @@ mod tests {
 
     // -- store: pre-existing tmp_dir as a regular FILE --
     //
-    // store() at cache_dir.rs:529 does:
+    // store()'s pre-stage cleanup does:
     //   if tmp_dir.exists() {
     //       fs::remove_dir_all(&tmp_dir)?;
     //   }
@@ -3290,9 +3290,9 @@ mod tests {
     /// caller's hash content. A regression that special-cased
     /// `current == ""` to short-circuit to Matches would mistake
     /// a pre-tracking-format entry for a clean cache hit. Pins
-    /// the `None` short-circuit at metadata.rs:322 — the inner
-    /// match arm `None => KconfigStatus::Untracked` MUST fire
-    /// before any string-equality check on `current`.
+    /// the `None` short-circuit in `CacheEntry::kconfig_status` —
+    /// the inner match arm `None => KconfigStatus::Untracked`
+    /// MUST fire before any string-equality check on `current`.
     #[test]
     fn kconfig_status_none_cached_returns_untracked_regardless_of_current() {
         let tmp = TempDir::new().unwrap();
@@ -3384,7 +3384,7 @@ mod tests {
 
     // -- cache_content_matches all-None --
     //
-    // `test_metadata` (shared_test_helpers.rs:15) sets
+    // The shared `test_metadata` fixture sets
     // `config_hash = Some("abc123")` and
     // `ktstr_kconfig_hash = Some("def456")` but
     // `extra_kconfig_hash = None`. The match-all test
@@ -3571,18 +3571,22 @@ mod tests {
 
     // -- remove_entries reports the input size as count --
     //
-    // Cleaner finding: `clean_keep`/`clean_all` collect the input
-    // iterator into a Vec, capture `count = len()`, then loop
-    // `fs::remove_dir_all`. The returned count is the input size,
-    // not the number of entries actually removed. This test pins
-    // that the count reflects the LIST of candidates passed to
-    // the loop — so a future caller that relies on the count for
-    // "removed N entries" reporting at least sees the correct
-    // input cardinality on the success path. (Partial-failure
-    // semantics under root — which bypasses DAC permission
-    // checks — cannot be reliably tested via permission tricks;
-    // the cleaner-finding case is documented for follow-up
-    // refactor instead.)
+    // `clean_keep`/`clean_all` collect the input iterator into a
+    // Vec, capture `count = len()`, then loop `fs::remove_dir_all`.
+    // The returned count is the input size, not the number of
+    // entries actually removed. This test pins the success-path
+    // contract that count reflects the LIST of candidates passed
+    // to the loop, so an operator-facing "removed N entries"
+    // diagnostic at least carries the correct input cardinality.
+    //
+    // Partial-failure semantics (a remove_dir_all mid-loop error
+    // returning Err while count already encoded the full list)
+    // are not directly testable here: the test process runs as
+    // root, and CAP_DAC_OVERRIDE bypasses every chmod-based
+    // permission denial used to engineer such a failure. Any
+    // alternative trigger (immutable attributes, read-only
+    // mounts, exotic filesystem error codes) is non-portable and
+    // would flake across CI environments.
     #[test]
     fn clean_all_count_matches_listed_entry_count() {
         let tmp = TempDir::new().unwrap();

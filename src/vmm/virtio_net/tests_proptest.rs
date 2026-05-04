@@ -331,9 +331,13 @@ fn snapshot_counters(dev: &VirtioNet) -> CounterSnapshot {
     }
 }
 
-/// Total observable progress across all counters. A regression that
-/// added a silent-drop path (no counter, no used.idx) would leave this
-/// at zero, failing the forward-progress invariant.
+/// Total observable progress across all event counters (excludes
+/// paired byte aggregates `tx_bytes` / `rx_bytes` which would
+/// double-count — every successful packet bumps `tx_packets` /
+/// `rx_packets` AND adds to `tx_bytes` / `rx_bytes`, so summing
+/// both pairs would inflate the delta). A regression that added a
+/// silent-drop path (no counter, no used.idx) would leave this at
+/// zero, failing the forward-progress invariant.
 fn counter_delta(before: &CounterSnapshot, after: &CounterSnapshot) -> u64 {
     (after.tx_packets - before.tx_packets)
         + (after.rx_packets - before.rx_packets)

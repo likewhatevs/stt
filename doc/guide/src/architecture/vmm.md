@@ -82,6 +82,30 @@ payloads (`MSG_TYPE_CRASH`), profraw coverage data (`MSG_TYPE_PROFRAW`),
 and per-payload-invocation metrics (`MSG_TYPE_PAYLOAD_METRICS`). Each
 entry has a CRC32 for integrity checking.
 
+## Virtio devices
+
+The VMM implements three virtio-MMIO devices in addition to the
+serial console + SHM channels above. All three speak the virtio
+1.x MMIO transport (virtio-v1.2 §4.2.2) with `VIRTIO_F_VERSION_1`
+and use irqfd (eventfd → KVM GSI) for interrupt delivery.
+
+- **virtio-blk** (`vmm::virtio_blk`) -- file-backed block device
+  with a single request virtqueue and a token-bucket throttle.
+  Used to give workloads real on-disk filesystems (per-test images
+  cloned from a btrfs template). Advertises
+  `VIRTIO_BLK_F_BLK_SIZE`, `VIRTIO_BLK_F_SEG_MAX`,
+  `VIRTIO_BLK_F_SIZE_MAX`, `VIRTIO_BLK_F_FLUSH`, and
+  `VIRTIO_RING_F_EVENT_IDX`, plus `VIRTIO_BLK_F_RO` when configured
+  read-only.
+- **virtio-net** (`vmm::virtio_net`) -- two-virtqueue (RX, TX) NIC
+  with an in-VMM L2 loopback backend. Used by network-shaped
+  workloads (TCP/UDP throughput, latency) without depending on the
+  host's network stack. Advertises `VIRTIO_NET_F_MAC` so the guest
+  binds a deterministic MAC.
+- **virtio-console** (`vmm::virtio_console`) -- single-port console
+  with two virtqueues (RX, TX). Provides guest console I/O at
+  virtio fidelity alongside the COM1/COM2 16550 serial ports.
+
 ## Performance mode
 
 When `performance_mode` is enabled, the VMM applies host-side

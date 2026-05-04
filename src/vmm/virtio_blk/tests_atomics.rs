@@ -150,7 +150,7 @@ use virtio_queue::mock::MockSplitQueue;
     /// shortens one but not the other surfaces here. The "must
     /// match" framing matters because the freeze coordinator's
     /// SIGRTMIN rendezvous (30 s wall budget at the coordinator
-    /// level — see `FREEZE_RENDEZVOUS_TIMEOUT` in `src/vmm/mod.rs`)
+    /// level — see `FREEZE_RENDEZVOUS_TIMEOUT` in `src/vmm/freeze_coord.rs`)
     /// is sensitive to vCPU-thread blocking budgets; both
     /// `Drop` and `reset()` paths run on a vCPU thread, so
     /// asymmetric budgets would let one path miss the rendezvous
@@ -863,7 +863,9 @@ use virtio_queue::mock::MockSplitQueue;
         //
         // Note: production's wait_nanos==0 inline re-drain trigger
         // (worker_thread_main) is unreachable from cfg(test) without
-        // a TokenBucket seam — see follow-up #454. These tests pin
+        // a TokenBucket test seam (refactoring TokenBucket to expose
+        // the deficit-computation timing for direct injection would
+        // make the trigger driveable from a test). These tests pin
         // the gauge invariants under back-to-back drain_bracket_impl,
         // not the production trigger condition itself.
         assert!(
@@ -988,7 +990,9 @@ use virtio_queue::mock::MockSplitQueue;
         // the forced-nanos seam only governs the
         // nanos_until_n_tokens path that produces wait_nanos.
         // Production's wait_nanos==0 inline re-drain trigger is
-        // unreachable from cfg(test) — see follow-up #454.
+        // unreachable from cfg(test); a TokenBucket test seam
+        // exposing the deficit-timing path would enable direct
+        // coverage.
         let outcome1 = {
             let WorkerEngine::Inline(engine) = &mut dev.worker.engine;
             drain_bracket_impl(
@@ -1388,8 +1392,9 @@ use virtio_queue::mock::MockSplitQueue;
     /// `worker_thread_main` wait_nanos==0 inline-redrain branch.
     /// `wait_nanos` here is 1_000_000_000 (the deficit-driven
     /// value), not 0; the production inline-redrain trigger
-    /// requires a TokenBucket test seam (see #454) that the
-    /// cfg(test) surface doesn't expose. The previous name
+    /// requires a TokenBucket test seam (a refactor exposing the
+    /// deficit-computation timing for direct injection) that the
+    /// cfg(test) surface doesn't currently provide. The previous name
     /// (`..._inline_redrain_..._decrements_once`) overclaimed —
     /// renamed to match what the test actually does.
     ///
@@ -1796,12 +1801,21 @@ use virtio_queue::mock::MockSplitQueue;
 
     /// Deterministic test: when device_status already carries
     /// `NEEDS_RESET` (set by the worker's queue-poison fetch_or),
-    /// the production `set_status` MUST reject the next FSM advance
-    /// via the monotone-bit gate and leave NEEDS_RESET set. This
-    /// pins the production CAS path without race timing — a
-    /// regression to plain `store(val, Release)` inside set_status
-    /// would clobber NEEDS_RESET deterministically and fail this
-    /// test on every run.
+    /// the production `set_status` MUST reject the next FSM
+    /// advance via the monotone-bit gate and leave NEEDS_RESET
+    /// set.
+    ///
+    /// Scope: this test pins the MONOTONE-BIT GATE behavior — the
+    /// `val & current != current` check that fires BEFORE the
+    /// CAS/store at the bottom of set_status. The CAS-specific
+    /// race-tolerance is pinned by
+    /// `set_status_cas_preserves_concurrent_needs_reset` below;
+    /// here, both `compare_exchange` and a hypothetical regression
+    /// to `store(val, Release)` would behave identically because
+    /// the gate already returned. This test catches gate
+    /// regressions (e.g. a refactor that loosened the
+    /// monotone-bit check to admit advances despite NEEDS_RESET);
+    /// the contention test catches CAS regressions.
     #[test]
     fn set_status_preserves_needs_reset_when_already_set() {
         use std::sync::atomic::Ordering;
@@ -1821,21 +1835,32 @@ use virtio_queue::mock::MockSplitQueue;
             "pre-condition: NEEDS_RESET planted, no FSM bits set"
         );
 
-        // Production set_status call. The CAS retry loop's
-        // monotone-bit gate observes NEEDS_RESET in the snapshot,
-        // sees that `val = ACK` does not include NEEDS_RESET
+        // Production set_status call. The monotone-bit gate
+        // observes NEEDS_RESET in the snapshot, sees that
+        // `val = ACK` does not include NEEDS_RESET
         // (`val & current != current`), and rejects via the
-        // NEEDS_RESET-aware warn arm without modifying
-        // device_status. A regression to `store(val, Release)`
-        // would unconditionally write `ACK` and lose NEEDS_RESET.
+        // NEEDS_RESET-aware warn arm BEFORE reaching the
+        // CAS/store at the bottom of set_status. NEEDS_RESET is
+        // preserved, ACK is not committed.
+        //
+        // What this test pins: the monotone-bit gate's
+        // NEEDS_RESET-aware behavior. The gate fires BEFORE the
+        // CAS, so a regression that swapped `compare_exchange`
+        // back to `store(val, Release)` would NOT be caught here
+        // (the gate already returned). The CAS-specific
+        // regression-detection lives in the concurrent contention
+        // test (`set_status_cas_preserves_concurrent_needs_reset`),
+        // where the worker's fetch_or lands AFTER the snapshot
+        // and BEFORE the store/CAS commit — the only timing where
+        // store-vs-CAS produces an observable difference.
         dev.set_status(VIRTIO_CONFIG_S_ACKNOWLEDGE);
 
         let observed = dev.device_status.load(Ordering::Acquire);
         assert_ne!(
             observed & VIRTIO_CONFIG_S_NEEDS_RESET,
             0,
-            "set_status must NOT clobber NEEDS_RESET; got device_status={:#x} \
-             — a regression to store(val, Release) would produce this failure",
+            "set_status must NOT clobber NEEDS_RESET via the \
+             monotone-bit gate path; got device_status={:#x}",
             observed,
         );
         assert_eq!(

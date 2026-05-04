@@ -14,14 +14,24 @@ pub struct CgroupManager {
 ## Construction
 
 ```rust,ignore
+use std::collections::BTreeSet;
+
 let cgroups = CgroupManager::new("/sys/fs/cgroup/ktstr");
-cgroups.setup(true)?; // create parent dir, enable cpuset + cpu controllers
+let mut controllers = BTreeSet::new();
+controllers.insert(Controller::Cpuset);
+controllers.insert(Controller::Cpu);
+cgroups.setup(&controllers)?; // create parent dir, enable cpuset + cpu controllers
 ```
 
-`new()` sets the parent path. `setup()` creates the parent directory
-if it does not exist and enables cgroup controllers (`+cpuset`, and
-optionally `+cpu`) on every ancestor from `/sys/fs/cgroup` down to the
-parent by writing to each level's `cgroup.subtree_control`.
+`new()` sets the parent path. `setup()` takes a
+`&BTreeSet<Controller>` (variants: `Cpuset`, `Cpu`, `Memory`,
+`Pids`, `Io`), creates the parent directory if it does not exist,
+and enables the requested controllers on every ancestor from
+`/sys/fs/cgroup` down to the parent by writing to each level's
+`cgroup.subtree_control`. An empty set creates the directory and
+returns without touching `subtree_control`. The deterministic
+`BTreeSet` iteration order keeps the rendered subtree_control
+write stable between runs.
 
 ## Methods
 

@@ -1,6 +1,6 @@
 # Runs
 
-Each `cargo nextest run` of ktstr tests writes per-test result
+Each `cargo ktstr test --kernel ../linux` invocation writes per-test result
 sidecars into a *run directory* under
 `{CARGO_TARGET_DIR or "target"}/ktstr/`. The directory is the
 record of the latest test run for that (kernel, project commit)

@@ -33,7 +33,12 @@
 //!   `clean_orphaned_tmp_dirs` walks.
 //!
 //! No public API in this module is `pub` — every helper is
-//! `pub(crate)` and only reachable through `super::cache_dir`.
+//! `pub(crate)` and intended to be reached only through
+//! `super::cache_dir`. Other crate-internal callers can technically
+//! see these symbols, but the orchestration contract (lock
+//! acquisition, atomic-rename publish, post-store recheck) lives
+//! in `super::cache_dir::CacheDir` and bypassing it would skip
+//! those guarantees.
 
 use std::fs;
 use std::path::Path;
