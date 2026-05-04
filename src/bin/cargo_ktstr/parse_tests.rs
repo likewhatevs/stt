@@ -16,18 +16,16 @@
 //! negative test for any `requires` / `conflicts_with` /
 //! `value_parser` constraint that clap enforces at parse time.
 //!
-//! Sections within the file are separated by `// -- <theme> --`
-//! banners so a reader can navigate by `KtstrCommand` arm.
-//! Conflict / requires fixtures live alongside their owning
-//! subcommand block.
+//! Sections are separated by `// -- <theme> --` banners.
 //!
 //! # External pins
 //!
-//! The `parse_kernel_list` fixtures co-pin the
-//! [`ktstr::cache::CacheEntry`] / [`ktstr::cache::KernelMetadata`]
-//! schema; if the cache types' `serde` shape changes, those tests
-//! must be updated in lockstep with the production deserializer
-//! in [`crate::kernel`].
+//! The `kconfig_status_*` and `format_entry_row_*` fixtures
+//! co-pin the [`ktstr::cache::CacheEntry`] /
+//! [`ktstr::cache::KernelMetadata`] shape; if the cache types'
+//! constructors, methods, or variants change, those tests must
+//! be updated in lockstep with the production types in
+//! [`ktstr::cache`].
 //!
 //! # Why parse-only
 //!
@@ -874,22 +872,25 @@ fn parse_stats_compare_with_policy() {
     }
 }
 
-/// `--threshold` and `--policy` are mutually exclusive via
-/// clap `conflicts_with`. Passing both must be rejected at
-/// parse time, NOT reach the dispatch-level `unreachable!()`
-/// branch. A regression that dropped the `conflicts_with`
-/// attribute on either field would turn the `unreachable!()`
-/// into a panic at runtime instead of a parse error at parse
-/// time — this test catches that at compile-time parse
-/// behaviour.
+/// Conflict pin: `--threshold` and `--policy` are mutually
+/// exclusive at clap parse time. A regression that dropped the
+/// `conflicts_with` attribute on either field would turn the
+/// dispatch-level `unreachable!()` branch into a runtime panic
+/// instead of a parse-time error.
+///
+/// Matches on [`clap::error::ErrorKind::ArgumentConflict`] rather
+/// than the generic `is_err()` so a regression that produces a
+/// DIFFERENT clap error (e.g. `MissingRequiredArgument` from a
+/// renamed flag, or `UnknownArgument` from a typo'd attribute)
+/// surfaces here as the wrong-kind diagnostic instead of being
+/// silently masked by a less-specific success-on-any-error pin.
+///
+/// Uses a match-on-result form rather than `expect_err`/`unwrap_err`
+/// because [`Cargo`] does not derive `Debug` — the unwrap helpers
+/// require `T: Debug` for their failure-render path, while a direct
+/// match avoids the bound entirely.
 #[test]
-fn parse_stats_compare_rejects_both_threshold_and_policy() {
-    // Avoid `expect_err` / `unwrap_err` because they require
-    // the `Ok` type (`Cargo`) to implement `Debug`, which the
-    // clap `Parser` derive does not add. A direct `match`
-    // sidesteps the bound and keeps the test compiling
-    // independently of whether `Cargo` gains `#[derive(Debug)]`
-    // elsewhere.
+fn parse_stats_compare_threshold_conflicts_with_policy() {
     let result = Cargo::try_parse_from([
         "cargo",
         "ktstr",
@@ -904,22 +905,16 @@ fn parse_stats_compare_rejects_both_threshold_and_policy() {
         "--policy",
         "/tmp/policy.json",
     ]);
-    let err = match result {
-        Err(e) => e,
-        Ok(_) => panic!(
-            "clap conflicts_with must reject both --threshold \
-             and --policy being set together"
+    match result {
+        Ok(_) => panic!("--threshold + --policy must be rejected at parse time"),
+        Err(err) => assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::ArgumentConflict,
+            "expected ArgumentConflict — a different ErrorKind would \
+             signal that the conflicts_with attribute regressed in a way \
+             the bare is_err() pin would silently mask. Full err: {err}",
         ),
-    };
-    let rendered = err.to_string();
-    assert!(
-        rendered
-            .to_ascii_lowercase()
-            .contains("cannot be used with")
-            || rendered.to_ascii_lowercase().contains("conflict"),
-        "clap error must surface the conflict between \
-         --threshold and --policy; got: {rendered}",
-    );
+    }
 }
 
 /// Bare `compare` defaults `--no-average` to `false` —
@@ -1141,7 +1136,7 @@ fn parse_stats_compare_with_kernel_commit_single() {
 
 /// `--kernel-commit A --kernel-commit B` produces a Vec with
 /// two entries via `ArgAction::Append`. Mirrors
-/// `parse_stats_compare_with_commit_repeatable` for the
+/// `parse_stats_compare_with_project_commit_repeatable` for the
 /// kernel-commit dimension.
 #[test]
 fn parse_stats_compare_with_kernel_commit_repeatable() {
@@ -1965,7 +1960,7 @@ fn parse_extra_kconfig_passes_through_test_subcommand_to_args_vec() {
                  subprocess will reject it as an unknown flag downstream."
             );
         }
-        _ => panic!("expected KernelCommand::Test"),
+        _ => panic!("expected KtstrCommand::Test"),
     }
 }
 
@@ -2256,8 +2251,8 @@ fn store_test_entry(cache: &CacheDir, key: &str, meta: &KernelMetadata) -> Cache
 // The (Matches / Stale / Untracked) × (not-EOL / EOL) outcome
 // matrix plus the `version == None` → "-" dash-render branch are
 // pinned by `format_entry_row_renders_eol_kconfig_matrix` in
-// `src/cli.rs` tests (cases c1-c7). The test below covers a
-// distinct corner the matrix does not: `KernelSource::Local`
+// `src/cli/kernel_list.rs` tests (cases c1-c7). The test below
+// covers a distinct corner the matrix does not: `KernelSource::Local`
 // rendering through format_entry_row, since the matrix uses
 // `Tarball` exclusively for determinism.
 
@@ -2285,9 +2280,11 @@ fn format_entry_row_no_version() {
 
 // -- kconfig_status (via CacheEntry method) --
 
-/// Sibling of `format_entry_row_stale_kconfig`: that test pins the
-/// `(stale kconfig)` tag emitted by `cli::format_entry_row` for a
-/// hash-mismatch entry; this test pins the enum variant
+/// Companion to the stale-kconfig case in
+/// `format_entry_row_renders_eol_kconfig_matrix` (in
+/// `src/cli/kernel_list.rs`): that test pins the `(stale kconfig)`
+/// tag emitted by `cli::format_entry_row` for a hash-mismatch entry;
+/// this test pins the enum variant
 /// (`KconfigStatus::Stale { cached, current }`) returned by
 /// `CacheEntry::kconfig_status` that drives the tag.
 #[test]
@@ -2305,11 +2302,12 @@ fn kconfig_status_reports_stale_on_hash_mismatch() {
     );
 }
 
-/// Sibling of `format_entry_row_matching_kconfig`: that test pins
-/// the no-tag contract emitted by `cli::format_entry_row` when the
-/// hashes agree; this test pins the `KconfigStatus::Matches`
-/// variant returned by `CacheEntry::kconfig_status` that drives
-/// the no-tag branch.
+/// Companion to the matching-kconfig case in
+/// `format_entry_row_renders_eol_kconfig_matrix` (in
+/// `src/cli/kernel_list.rs`): that test pins the no-tag contract
+/// emitted by `cli::format_entry_row` when the hashes agree; this
+/// test pins the `KconfigStatus::Matches` variant returned by
+/// `CacheEntry::kconfig_status` that drives the no-tag branch.
 #[test]
 fn kconfig_status_reports_matches_on_hash_equality() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -2322,12 +2320,13 @@ fn kconfig_status_reports_matches_on_hash_equality() {
     );
 }
 
-/// Sibling of
-/// `format_entry_row_untracked_kconfig_tagged_distinctly_from_stale`:
-/// that test pins the `(untracked kconfig)` tag emitted by
-/// `cli::format_entry_row` when an entry has no recorded hash;
-/// this test pins the `KconfigStatus::Untracked` variant returned
-/// by `CacheEntry::kconfig_status` that drives the tag.
+/// Companion to the untracked-kconfig case in
+/// `format_entry_row_renders_eol_kconfig_matrix` (in
+/// `src/cli/kernel_list.rs`): that test pins the
+/// `(untracked kconfig)` tag emitted by `cli::format_entry_row`
+/// when an entry has no recorded hash; this test pins the
+/// `KconfigStatus::Untracked` variant returned by
+/// `CacheEntry::kconfig_status` that drives the tag.
 #[test]
 fn kconfig_status_reports_untracked_when_entry_has_no_hash() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -2622,28 +2621,29 @@ fn parse_shell_no_perf_mode_without_cpu_cap_succeeds() {
 // a range-mode field could ship without a matching help update
 // and silently break dispatch-on-key consumers. The sibling
 // `kernel_list_long_about_exposes_json_schema` test in
-// `src/cli.rs` covers cache-walk mode; this companion fills
-// the range-mode gap from the cargo-ktstr binary's perspective
-// and exercises the same `pub const` re-exported through
-// `ktstr::cli::KERNEL_LIST_LONG_ABOUT`.
+// `src/cli/kernel_cmd.rs` covers cache-walk mode; this companion
+// fills the range-mode gap from the cargo-ktstr binary's
+// perspective and exercises the same `pub const` re-exported
+// through `ktstr::cli::KERNEL_LIST_LONG_ABOUT`.
 
 /// Pins that every range-mode JSON top-level field name appears
 /// in the help copy by exact substring. Range-mode emits
-/// `{ range, start, end, versions }` per the schema block at
-/// `cli.rs:337-346`. Bare-word substring match is sufficient
-/// because the help copy embeds the field names in column-
-/// aligned table form (e.g. `  range     literal range string`)
-/// — distinct from the cache-walk schema's nullable-marker
-/// pattern which uses `{field} (nullable)` substrings.
+/// `{ range, start, end, versions }` per the schema block in
+/// `KERNEL_LIST_LONG_ABOUT` (`src/cli/kernel_cmd.rs`). Bare-word
+/// substring match is sufficient because the help copy embeds
+/// the field names in column-aligned table form (e.g.
+/// `  range     literal range string`) — distinct from the
+/// cache-walk schema's nullable-marker pattern which uses
+/// `{field} (nullable)` substrings.
 ///
 /// Co-update contract: when the JSON schema changes (field
 /// added, renamed, removed, or its emission site moves), three
 /// updates land in the same commit:
 ///   1. the JSON emitter — `cli::kernel_list` /
-///      `kernel_list_range_preview` in `src/cli.rs`,
+///      `kernel_list_range_preview` in `src/cli/kernel_list.rs`,
 ///   2. the help-copy schema block — `KERNEL_LIST_LONG_ABOUT`
-///      in `src/cli.rs` (the column-aligned table this test
-///      reads), and
+///      in `src/cli/kernel_cmd.rs` (the column-aligned table
+///      this test reads), and
 ///   3. this test's `range_field` array.
 /// Updating any one without the others either silently breaks
 /// scripted consumers (1 without 2) or surfaces a misleading
