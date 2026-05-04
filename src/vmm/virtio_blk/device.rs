@@ -1034,13 +1034,16 @@ pub struct VirtioBlk {
     /// `irq_evt.write(1)` poison-signal sequence; the vCPU thread
     /// reads `STATUS` via `load(Acquire)` from `mmio_read` and writes
     /// it via the FSM in `set_status` / `reset`. Atomic ordering
-    /// taxonomy: vCPU writes use `store(val, Release)` (set_status,
-    /// reset); vCPU reads use `load(Acquire)` (mmio_read,
-    /// queue_config_allowed, features_write_allowed); the worker
-    /// uses `fetch_or(NEEDS_RESET, SeqCst)` on the queue-poison
-    /// path. The reset path is a single `store(0, Release)` —
-    /// device_status has no AcqRel RMW site. Mirrors the
-    /// [`Self::interrupt_status`] shape and rationale.
+    /// taxonomy: `set_status` uses
+    /// `compare_exchange(_, _, Release, Acquire)` for race-safe
+    /// FSM advance against the worker's concurrent
+    /// `fetch_or(NEEDS_RESET)` (the only RMW write site on
+    /// device_status from the vCPU thread); `reset` uses
+    /// `store(0, Release)`; vCPU reads use `load(Acquire)`
+    /// (mmio_read, queue_config_allowed, features_write_allowed);
+    /// the worker uses `fetch_or(NEEDS_RESET, SeqCst)` on the
+    /// queue-poison path. Mirrors the [`Self::interrupt_status`]
+    /// shape and rationale.
     pub(crate) device_status: Arc<AtomicU32>,
     /// Worker may be on a separate thread (production cfg) and the
     /// vCPU MMIO reader may race the worker's bit-set, so the value
@@ -1914,12 +1917,48 @@ pub(crate) fn drain_bracket_impl(
                     // kick, so re-kicks never re-enter this arm.
                     //
                     // SeqCst on the device_status fetch_or pairs
-                    // with the vCPU MMIO read of STATUS via
-                    // load(Acquire) so the post-poison read reflects
-                    // the bit. The interrupt_status fetch_or uses
-                    // Release ordering to mirror the existing
-                    // INT_VRING write-side discipline at the V8
-                    // publish-path INTERRUPT_STATUS bit-set.
+                    // with two reader sites:
+                    //   1. The vCPU MMIO read of STATUS via
+                    //      `load(Acquire)` in `mmio_read` — the
+                    //      post-poison read reflects the bit so the
+                    //      guest's STATUS query sees NEEDS_RESET.
+                    //   2. `set_status`'s CAS retry loop. The
+                    //      `compare_exchange` failure-side Acquire
+                    //      synchronizes-with this SeqCst write so
+                    //      the retry iteration's re-snapshot sees
+                    //      the NEEDS_RESET bit and the monotone-bit
+                    //      gate rejects the FSM advance instead of
+                    //      clobbering the bit. This is the
+                    //      load-bearing pairing — without it, a
+                    //      vCPU set_status racing this fetch_or
+                    //      would silently drop NEEDS_RESET on the
+                    //      next FSM advance.
+                    // The interrupt_status fetch_or uses Release
+                    // ordering to mirror the existing INT_VRING
+                    // write-side discipline at the V8 publish-path
+                    // INTERRUPT_STATUS bit-set.
+                    //
+                    // INVARIANT: the worker may ONLY `fetch_or`
+                    // `VIRTIO_CONFIG_S_NEEDS_RESET` into
+                    // device_status — never `store`,
+                    // `fetch_and`, `fetch_xor`, or `fetch_or` any
+                    // OTHER bit. Termination of `set_status`'s
+                    // CAS retry loop is bounded at AT MOST ONE
+                    // worker-induced retry: NEEDS_RESET fetch_or
+                    // is idempotent after the first call, so the
+                    // worker can change `device_status` from one
+                    // observable state to one other state and
+                    // never again from the device side. The
+                    // single-bit constraint makes that bound
+                    // auditable; a future worker fetch_or'ing a
+                    // different bit (e.g. a hypothetical
+                    // VIRTIO_CONFIG_S_DEVICE_NEEDS_RESET-like
+                    // extension) would expand the retry universe
+                    // and the bound. A worker that cleared bits —
+                    // store/fetch_and/fetch_xor — would let the
+                    // retry loop spin indefinitely as the
+                    // snapshot re-enters the previously-rejected
+                    // state.
                     device_status.fetch_or(VIRTIO_CONFIG_S_NEEDS_RESET, Ordering::SeqCst);
                     interrupt_status.fetch_or(VIRTIO_MMIO_INT_CONFIG, Ordering::Release);
                     // SAFETY: EAGAIN requires counter saturation at
@@ -3371,155 +3410,296 @@ impl VirtioBlk {
     /// to confirm the bit stuck. Warning on idempotent re-writes
     /// would pollute operator logs without surfacing real bugs.
     pub(crate) fn set_status(&mut self, val: u32) {
-        // Snapshot the current FSM state once. `set_status` runs on
-        // the vCPU thread that received the MMIO write and mutates
-        // device_status sequentially within this function. The
+        // Snapshot the current FSM state. `set_status` runs on the
+        // vCPU thread that received the MMIO write; the FSM walk
+        // through ACK → DRIVER → FEATURES_OK → DRIVER_OK happens
+        // sequentially within and across calls on that thread. The
         // production worker thread's only write site to
         // device_status is the `fetch_or(NEEDS_RESET, SeqCst)` on
-        // the queue-poison path — and the worker's lifecycle
-        // invariant forbids that write from racing with set_status:
-        // the worker is alive only between DRIVER_OK and the next
-        // reset (set_status spawning it via `consume_pending_respawn`,
-        // reset_engine_spawned joining it before any further FSM
-        // movement). During the rebind window between reset() and
-        // the next DRIVER_OK there is no live worker, so the FSM
-        // walk through ACK → DRIVER → FEATURES_OK observes a
-        // single-writer device_status. The Acquire load is
-        // defense-in-depth ordering against any future cross-thread
-        // writer; today the snapshot is correct purely because of
-        // the lifecycle gate.
-        let current_status = self.device_status.load(Ordering::Acquire);
-        if val & current_status != current_status {
-            // The driver attempted to clear a previously-set bit
-            // without going through the STATUS=0 reset path. Per
-            // virtio-v1.2 §3.1.1 status bits are monotone within
-            // a driver session — clearing requires a full reset.
-            // Logging ensures a buggy driver that "regresses" the
-            // FSM (e.g. clearing FEATURES_OK while keeping
-            // ACKNOWLEDGE) surfaces in the operator's log instead
-            // of vanishing silently.
-            tracing::warn!(
-                device_status = current_status,
-                requested = val,
-                "virtio-blk set_status rejected — attempted to clear \
-                 a previously-set status bit without a full reset \
-                 (virtio-v1.2 §3.1.1: status bits are monotone within \
-                 a driver session)"
-            );
-            return;
-        }
-        let new_bits = val & !current_status;
-        // Idempotent re-write of the current device_status: the
-        // monotone-bit gate above passed (val is a superset) AND
-        // the requested value adds no new bits. This is a
-        // legitimate driver pattern — the kernel's
-        // `virtio_add_status` (drivers/virtio/virtio.c:196-200)
-        // writes `STATUS = old | NEW_BIT` and a subsequent
-        // `virtio_features_ok` (drivers/virtio/virtio.c:230)
-        // `get_status` read may race a duplicate set, plus an
-        // MMIO probe path may issue a duplicate STATUS write.
-        // Treat as a no-op rather than a rejection so the
-        // rejection-warn path stays a true signal.
-        if new_bits == 0 {
-            return;
-        }
-        let valid = match new_bits {
-            VIRTIO_CONFIG_S_ACKNOWLEDGE => current_status == 0,
-            VIRTIO_CONFIG_S_DRIVER => current_status == S_ACK,
-            VIRTIO_CONFIG_S_FEATURES_OK => {
-                current_status == S_DRV
-                    && self.driver_features & (1u64 << VIRTIO_F_VERSION_1) != 0
-                    && self.driver_features & !self.device_features() == 0
-            }
-            VIRTIO_CONFIG_S_DRIVER_OK => current_status == S_FEAT,
-            _ => false,
-        };
-        if valid {
-            self.device_status.store(val, Ordering::Release);
-            // Once FEATURES_OK is committed, feature negotiation is
-            // closed (virtio-v1.2 §3.1.1) — the negotiated set lives
-            // in `driver_features` and the device may rely on it.
-            // If VIRTIO_RING_F_EVENT_IDX was negotiated, enable
-            // event-idx tracking on the request queue so
-            // `Queue::needs_notification` consults the guest's
-            // `used_event` threshold instead of always returning
-            // true. `QueueT::event_idx_enabled` is documented to
-            // return the correct value only after FEATURES_OK, so
-            // this is the earliest legal moment to flip it on.
-            if new_bits == VIRTIO_CONFIG_S_FEATURES_OK
-                && self.driver_features & (1u64 << VIRTIO_RING_F_EVENT_IDX) != 0
-            {
-                self.worker.queues[REQ_QUEUE].set_event_idx(true);
-            }
-            // DRIVER_OK transition: consume any deferred respawn
-            // state stashed by `reset_engine_spawned`. By the time
-            // the guest reaches DRIVER_OK it has walked ACK →
-            // DRIVER → FEATURES_OK, and the queue_config_allowed
-            // gate (S_FEAT && !DRIVER_OK) admitted any
-            // DESC/AVAIL/USED address writes plus QUEUE_NUM /
-            // QUEUE_READY between FEATURES_OK and now. The kernel
-            // virtio-mmio driver's `vm_setup_vq`
-            // (drivers/virtio/virtio_mmio.c:346-444) publishes the
-            // queue addresses and writes `QUEUE_READY=1` in that
-            // window before the DRIVER_OK MMIO write, so the
-            // worker spawned here will find a fully-configured
-            // queue on its first drain attempt.
-            // Production cfg only — the inline-engine test build
-            // has no respawn machinery. See the
-            // `SpawnedEngine::respawn_pending` doc for the full
-            // rationale and race-free invariant.
-            #[cfg(not(test))]
-            if new_bits == VIRTIO_CONFIG_S_DRIVER_OK {
-                self.consume_pending_respawn();
-            }
-            return;
-        }
-        // Rejection paths. The FEATURES_OK case has the richest
-        // diagnostic because it's the only transition with
-        // sub-conditions beyond simple ordering (subset rule +
-        // VERSION_1 mandate); other rejections cite the FSM
-        // ordering violation directly.
-        if new_bits == VIRTIO_CONFIG_S_FEATURES_OK && current_status == S_DRV {
-            // FEATURES_OK with the right ordering but the driver
-            // failed the feature-set rules. Report VERSION_1
-            // missing first (most common failure mode for a
-            // legacy/transitional driver); fall through to the
-            // unadvertised-bit case if VERSION_1 is fine.
-            if self.driver_features & (1u64 << VIRTIO_F_VERSION_1) == 0 {
-                tracing::warn!(
-                    driver_features = ?self.driver_features,
-                    "FEATURES_OK rejected — VIRTIO_F_VERSION_1 not negotiated; \
-                     legacy/transitional driver against modern-only device",
-                );
-            } else {
-                let unadvertised = self.driver_features & !self.device_features();
-                if unadvertised != 0 {
+        // the queue-poison path. Whether that write can race the
+        // vCPU's FSM-advance store depends on the worker's
+        // lifecycle:
+        //
+        // - **Pre-DRIVER_OK** (initial spawn deferred to the first
+        //   `STATUS = DRIVER_OK` per `consume_pending_respawn`):
+        //   no worker thread is alive yet, so no concurrent
+        //   `fetch_or` can land. Single-writer device_status.
+        // - **Between DRIVER_OK and reset**: the worker is alive
+        //   and may queue-poison at any point; a vCPU-side
+        //   set_status arriving in this window can race its
+        //   `fetch_or(NEEDS_RESET)`.
+        // - **Between reset and the next DRIVER_OK**: the worker
+        //   has been joined (`reset_engine_spawned` →
+        //   `stop_worker_and_reclaim_state`); single-writer.
+        //
+        // The middle bucket is the race that motivates the CAS
+        // below. A naive `store(val, Release)` after the snapshot
+        // would clobber a NEEDS_RESET bit the worker had just
+        // fetch_or'd in — silently lying to the guest by reporting
+        // a healthy FSM after the device had already declared
+        // itself broken. The CAS below is **load-bearing for race
+        // safety**, not defense-in-depth: the worker's
+        // `fetch_or(NEEDS_RESET, SeqCst)` can set bits between this
+        // load and the CAS attempt, and the CAS is the mechanism
+        // that detects the contention. Replacing the store with a
+        // compare_exchange against the snapshot detects the race:
+        // if the worker advanced device_status concurrently, the
+        // CAS fails and we re-snapshot + re-validate. Either the
+        // re-validated transition still passes (worker added bits
+        // we are about to set anyway — proceed) or it fails
+        // (worker added NEEDS_RESET, which is not a legal
+        // FSM-advance bit; the new snapshot rejects with the
+        // monotone-bit gate or the `valid` match). The Acquire
+        // load and the CAS's failure-side Acquire ordering
+        // synchronise-with the worker's SeqCst fetch_or at
+        // `drain_bracket_impl`'s queue-poison arm — Acquire
+        // observation pairs with the SeqCst write side because
+        // SeqCst is at least Release on the writer.
+        //
+        // Snapshot loaded outside the loop; on a CAS failure the
+        // `Err(observed)` branch updates `current_status` directly
+        // without re-issuing a `load` — saving one redundant
+        // atomic read per retry while preserving the same
+        // happens-before chain.
+        let mut current_status = self.device_status.load(Ordering::Acquire);
+        // CAS retry loop. Each iteration re-validates the proposed
+        // transition against the freshly-snapshotted `current_status`
+        // and attempts a `compare_exchange` to commit. On contention
+        // (the worker fetch_or'd NEEDS_RESET between snapshot and
+        // commit), the CAS returns `Err(observed)` and we restart
+        // the loop with the observed value as the new snapshot.
+        // Termination is bounded at AT MOST ONE worker-induced
+        // retry: by the worker invariant (see the worker's
+        // queue-poison fetch_or site), the worker may only
+        // fetch_or `VIRTIO_CONFIG_S_NEEDS_RESET` and the operation
+        // is idempotent after the first call. So the worker can
+        // transition `device_status` from one observable state
+        // (`current_status`) to one other state
+        // (`current_status | NEEDS_RESET`) and never to a third
+        // value while this set_status is running. After that
+        // single retry the snapshot is stable: either the second
+        // CAS succeeds, or the monotone-bit gate fires because
+        // the new snapshot has NEEDS_RESET and `val` does not
+        // include it.
+        loop {
+            if val & current_status != current_status {
+                // CORRECT behavior — do NOT "fix" this gate to admit
+                // the advance. After the worker's queue-poison path
+                // fetch_or'd `VIRTIO_CONFIG_S_NEEDS_RESET` into
+                // `current_status`, every subsequent guest STATUS
+                // write whose `val` does NOT include the NEEDS_RESET
+                // bit (drivers never set it — it is device-emitted
+                // per virtio-v1.2 §2.1.1 bit 0x40) trips this check
+                // and is rejected. That is the spec-mandated
+                // behaviour: the device is dead until a STATUS=0
+                // reset, and the kernel's `virtio_features_ok`-style
+                // post-write `get_status` re-read sees the FSM bit
+                // never stuck (because we rejected here) and
+                // surfaces -ENODEV to the bind path. A future
+                // refactor that loosens this gate to "allow the
+                // advance and clear NEEDS_RESET silently" would
+                // restore the silent-corruption hazard the CAS
+                // exists to prevent.
+                //
+                // Distinguish the two failure modes that both surface
+                // here as `val & current_status != current_status`:
+                //
+                // 1. NEEDS_RESET bit (0x40) is set in `current_status`
+                //    but not in `val`. This happens when the worker's
+                //    queue-poison path fetch_or'd NEEDS_RESET — either
+                //    before this set_status call or during a CAS
+                //    retry. The driver did NOT try to regress; the
+                //    device set NEEDS_RESET on its own. Cite the
+                //    queue-poison cause and the STATUS=0 recovery
+                //    path so an operator reading the log knows the
+                //    fix is a full reset, not a driver bug.
+                //
+                // 2. Otherwise: the driver attempted to clear a
+                //    previously-set bit (per virtio-v1.2 §3.1.1
+                //    status bits are monotone within a driver
+                //    session) — a regress that surfaces a buggy
+                //    driver clearing FEATURES_OK while keeping
+                //    ACKNOWLEDGE.
+                if current_status & VIRTIO_CONFIG_S_NEEDS_RESET != 0 {
                     tracing::warn!(
-                        driver_features = ?self.driver_features,
-                        device_features = ?self.device_features(),
-                        unadvertised = ?unadvertised,
-                        "FEATURES_OK rejected — driver acked unadvertised \
-                         feature bits; subset rule (virtio-v1.2 §3.1.1) \
-                         violated",
+                        device_status = current_status,
+                        requested = val,
+                        "virtio-blk set_status rejected — device in \
+                         NEEDS_RESET state from prior queue poison; \
+                         guest must write STATUS=0 to reset before any \
+                         further FSM advance can succeed"
+                    );
+                } else {
+                    tracing::warn!(
+                        device_status = current_status,
+                        requested = val,
+                        "virtio-blk set_status rejected — attempted to clear \
+                         a previously-set status bit without a full reset \
+                         (virtio-v1.2 §3.1.1: status bits are monotone within \
+                         a driver session)"
                     );
                 }
+                return;
             }
-        } else {
-            // Generic ordering or unknown-bit rejection: ACK without
-            // device_status==0, DRIVER without ACK, FEATURES_OK from
-            // the wrong predecessor, DRIVER_OK without FEATURES_OK,
-            // or any new_bits that aren't a single virtio-v1.2 status
-            // bit (multi-bit transitions, reserved bits set). Citing
-            // device_status + new_bits lets an operator identify the
-            // ordering violation without rederiving the FSM.
-            tracing::warn!(
-                device_status = current_status,
-                requested = val,
-                new_bits = new_bits,
-                "virtio-blk set_status rejected — illegal FSM transition \
-                 (virtio-v1.2 §3.1.1 ordering: ACK → DRIVER → FEATURES_OK \
-                 → DRIVER_OK, one bit at a time)",
-            );
+            let new_bits = val & !current_status;
+            // Idempotent re-write of the current device_status: the
+            // monotone-bit gate above passed (val is a superset) AND
+            // the requested value adds no new bits. This is a
+            // legitimate driver pattern — the kernel's
+            // `virtio_add_status` (drivers/virtio/virtio.c:196-200)
+            // writes `STATUS = old | NEW_BIT` and a subsequent
+            // `virtio_features_ok` (drivers/virtio/virtio.c:230)
+            // `get_status` read may race a duplicate set, plus an
+            // MMIO probe path may issue a duplicate STATUS write.
+            // Treat as a no-op rather than a rejection so the
+            // rejection-warn path stays a true signal.
+            if new_bits == 0 {
+                return;
+            }
+            let valid = match new_bits {
+                VIRTIO_CONFIG_S_ACKNOWLEDGE => current_status == 0,
+                VIRTIO_CONFIG_S_DRIVER => current_status == S_ACK,
+                VIRTIO_CONFIG_S_FEATURES_OK => {
+                    current_status == S_DRV
+                        && self.driver_features & (1u64 << VIRTIO_F_VERSION_1) != 0
+                        && self.driver_features & !self.device_features() == 0
+                }
+                VIRTIO_CONFIG_S_DRIVER_OK => current_status == S_FEAT,
+                _ => false,
+            };
+            if valid {
+                // compare_exchange against the snapshot. On success
+                // the store lands with Release ordering (mirroring
+                // the pre-CAS `store(val, Release)` semantics for
+                // any vCPU reader doing `load(Acquire)`). On failure
+                // the worker raced an additional bit (NEEDS_RESET on
+                // queue poison) and we restart the outer loop with
+                // the observed value. Acquire on the failure side
+                // synchronizes-with the worker's SeqCst fetch_or
+                // (which is at least Release on the writer side) so
+                // the next iteration's re-validation sees the
+                // worker's NEEDS_RESET bit.
+                match self.device_status.compare_exchange(
+                    current_status,
+                    val,
+                    Ordering::Release,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => {}
+                    Err(observed) => {
+                        current_status = observed;
+                        continue;
+                    }
+                }
+                // Once FEATURES_OK is committed, feature negotiation
+                // is closed (virtio-v1.2 §3.1.1) — the negotiated set
+                // lives in `driver_features` and the device may rely
+                // on it. If VIRTIO_RING_F_EVENT_IDX was negotiated,
+                // enable event-idx tracking on the request queue so
+                // `Queue::needs_notification` consults the guest's
+                // `used_event` threshold instead of always returning
+                // true. `QueueT::event_idx_enabled` is documented to
+                // return the correct value only after FEATURES_OK,
+                // so this is the earliest legal moment to flip it
+                // on.
+                if new_bits == VIRTIO_CONFIG_S_FEATURES_OK
+                    && self.driver_features & (1u64 << VIRTIO_RING_F_EVENT_IDX) != 0
+                {
+                    self.worker.queues[REQ_QUEUE].set_event_idx(true);
+                }
+                // DRIVER_OK transition: consume any deferred respawn
+                // state stashed by `reset_engine_spawned`. By the
+                // time the guest reaches DRIVER_OK it has walked ACK
+                // → DRIVER → FEATURES_OK, and the
+                // queue_config_allowed gate (S_FEAT && !DRIVER_OK)
+                // admitted any DESC/AVAIL/USED address writes plus
+                // QUEUE_NUM / QUEUE_READY between FEATURES_OK and
+                // now. The kernel virtio-mmio driver's `vm_setup_vq`
+                // (drivers/virtio/virtio_mmio.c:346-444) publishes
+                // the queue addresses and writes `QUEUE_READY=1` in
+                // that window before the DRIVER_OK MMIO write, so
+                // the worker spawned here will find a
+                // fully-configured queue on its first drain attempt.
+                // Production cfg only — the inline-engine test build
+                // has no respawn machinery. See the
+                // `SpawnedEngine::respawn_pending` doc for the full
+                // rationale and race-free invariant.
+                #[cfg(not(test))]
+                if new_bits == VIRTIO_CONFIG_S_DRIVER_OK {
+                    self.consume_pending_respawn();
+                }
+                return;
+            }
+            // Rejection paths. The FEATURES_OK case has the richest
+            // diagnostic because it's the only transition with
+            // sub-conditions beyond simple ordering (subset rule +
+            // VERSION_1 mandate); other rejections cite the FSM
+            // ordering violation directly.
+            if new_bits == VIRTIO_CONFIG_S_FEATURES_OK && current_status == S_DRV {
+                // FEATURES_OK with the right ordering but the driver
+                // failed the feature-set rules. Report VERSION_1
+                // missing first (most common failure mode for a
+                // legacy/transitional driver); fall through to the
+                // unadvertised-bit case if VERSION_1 is fine.
+                if self.driver_features & (1u64 << VIRTIO_F_VERSION_1) == 0 {
+                    tracing::warn!(
+                        driver_features = ?self.driver_features,
+                        "FEATURES_OK rejected — VIRTIO_F_VERSION_1 not negotiated; \
+                         legacy/transitional driver against modern-only device",
+                    );
+                } else {
+                    let unadvertised = self.driver_features & !self.device_features();
+                    if unadvertised != 0 {
+                        tracing::warn!(
+                            driver_features = ?self.driver_features,
+                            device_features = ?self.device_features(),
+                            unadvertised = ?unadvertised,
+                            "FEATURES_OK rejected — driver acked unadvertised \
+                             feature bits; subset rule (virtio-v1.2 §3.1.1) \
+                             violated",
+                        );
+                    }
+                }
+            } else if current_status & VIRTIO_CONFIG_S_NEEDS_RESET != 0 {
+                // NEEDS_RESET-specific diagnostic — defense in depth
+                // alongside the same gate at the monotone-bit branch
+                // above. The monotone-bit branch fires for the
+                // typical race (val omits NEEDS_RESET, current_status
+                // has it), but a future caller that constructed
+                // `val` to include NEEDS_RESET (e.g. an internal
+                // helper that shouldn't exist but might be added)
+                // would slip past the monotone-bit gate and reach
+                // this rejection arm. Cite the queue-poison cause
+                // here too so the diagnostic taxonomy stays
+                // consistent.
+                tracing::warn!(
+                    device_status = current_status,
+                    requested = val,
+                    new_bits = new_bits,
+                    "virtio-blk set_status rejected — device in \
+                     NEEDS_RESET state from prior queue poison; \
+                     guest must write STATUS=0 to reset before any \
+                     further FSM advance can succeed",
+                );
+            } else {
+                // Generic ordering or unknown-bit rejection: ACK
+                // without device_status==0, DRIVER without ACK,
+                // FEATURES_OK from the wrong predecessor, DRIVER_OK
+                // without FEATURES_OK, or any new_bits that aren't a
+                // single virtio-v1.2 status bit (multi-bit
+                // transitions, reserved bits set). Citing
+                // device_status + new_bits lets an operator identify
+                // the ordering violation without rederiving the FSM.
+                tracing::warn!(
+                    device_status = current_status,
+                    requested = val,
+                    new_bits = new_bits,
+                    "virtio-blk set_status rejected — illegal FSM transition \
+                     (virtio-v1.2 §3.1.1 ordering: ACK → DRIVER → FEATURES_OK \
+                     → DRIVER_OK, one bit at a time)",
+                );
+            }
+            return;
         }
     }
 

@@ -312,6 +312,7 @@ struct CounterSnapshot {
     rx_chain_invalid: u64,
     tx_add_used_failures: u64,
     rx_add_used_failures: u64,
+    invalid_avail_idx_count: u64,
 }
 
 fn snapshot_counters(dev: &VirtioNet) -> CounterSnapshot {
@@ -326,6 +327,7 @@ fn snapshot_counters(dev: &VirtioNet) -> CounterSnapshot {
         rx_chain_invalid: c.rx_chain_invalid.load(Ordering::Relaxed),
         tx_add_used_failures: c.tx_add_used_failures.load(Ordering::Relaxed),
         rx_add_used_failures: c.rx_add_used_failures.load(Ordering::Relaxed),
+        invalid_avail_idx_count: c.invalid_avail_idx_count.load(Ordering::Relaxed),
     }
 }
 
@@ -340,6 +342,7 @@ fn counter_delta(before: &CounterSnapshot, after: &CounterSnapshot) -> u64 {
         + (after.rx_chain_invalid - before.rx_chain_invalid)
         + (after.tx_add_used_failures - before.tx_add_used_failures)
         + (after.rx_add_used_failures - before.rx_add_used_failures)
+        + (after.invalid_avail_idx_count - before.invalid_avail_idx_count)
 }
 
 /// Assert the monotonicity invariant — every counter only ever increases.
@@ -359,6 +362,7 @@ fn assert_counter_monotonicity(
     prop_assert!(after.rx_chain_invalid >= before.rx_chain_invalid);
     prop_assert!(after.tx_add_used_failures >= before.tx_add_used_failures);
     prop_assert!(after.rx_add_used_failures >= before.rx_add_used_failures);
+    prop_assert!(after.invalid_avail_idx_count >= before.invalid_avail_idx_count);
     Ok(())
 }
 
@@ -382,12 +386,23 @@ proptest! {
     /// produce forward progress: for every notify, at least one of
     /// `used.idx` advance (TX or RX), `tx_packets`, `rx_packets`,
     /// `tx_chain_invalid`, `rx_chain_invalid`,
-    /// `tx_dropped_no_rx_buffer`, `tx_add_used_failures`, or
-    /// `rx_add_used_failures` must show movement. A chain that left
-    /// every counter and used.idx static would represent a silent
-    /// stall — the guest's network-stack equivalent of virtio_blk's
-    /// hung-task watchdog (the kernel's tx_hang detection) would
-    /// eventually fire, but the host has no visibility until then.
+    /// `tx_dropped_no_rx_buffer`, `tx_add_used_failures`,
+    /// `rx_add_used_failures`, or `invalid_avail_idx_count` must
+    /// show movement. A chain that left every counter and used.idx
+    /// static would represent a silent stall — the guest's
+    /// network-stack equivalent of virtio_blk's hung-task watchdog
+    /// (the kernel's tx_hang detection) would eventually fire, but
+    /// the host has no visibility until then.
+    ///
+    /// `invalid_avail_idx_count` is included because the queue-poison
+    /// path returns from `process_tx_loopback` after only setting
+    /// the per-queue poison flag, bumping that counter, and firing
+    /// signal_queue_poisoned — `tx_packets` / `rx_packets` /
+    /// `*_chain_invalid` stay static on a poisoned-iter() drain.
+    /// (In practice the proptest fixture's `publish_avail` writes
+    /// avail.idx=1 against queue.size=16, so the poison gate never
+    /// fires; the inclusion is defense-in-depth for shrunken cases
+    /// that might trip a future iter() error path.)
     ///
     /// Critically: this also pins panic-freeness. The proptest runner
     /// catches panics; a panic in `process_tx_loopback` or

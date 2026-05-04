@@ -8,21 +8,22 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use virtio_bindings::virtio_config::{
     VIRTIO_CONFIG_S_ACKNOWLEDGE, VIRTIO_CONFIG_S_DRIVER, VIRTIO_CONFIG_S_DRIVER_OK,
-    VIRTIO_CONFIG_S_FAILED, VIRTIO_CONFIG_S_FEATURES_OK, VIRTIO_F_VERSION_1,
+    VIRTIO_CONFIG_S_FAILED, VIRTIO_CONFIG_S_FEATURES_OK, VIRTIO_CONFIG_S_NEEDS_RESET,
+    VIRTIO_F_VERSION_1,
 };
 use virtio_bindings::virtio_ids::VIRTIO_ID_NET;
 use virtio_bindings::virtio_mmio::{
     VIRTIO_MMIO_CONFIG_GENERATION, VIRTIO_MMIO_DEVICE_FEATURES, VIRTIO_MMIO_DEVICE_FEATURES_SEL,
     VIRTIO_MMIO_DEVICE_ID, VIRTIO_MMIO_DRIVER_FEATURES, VIRTIO_MMIO_DRIVER_FEATURES_SEL,
-    VIRTIO_MMIO_INT_VRING, VIRTIO_MMIO_INTERRUPT_ACK, VIRTIO_MMIO_INTERRUPT_STATUS,
-    VIRTIO_MMIO_MAGIC_VALUE, VIRTIO_MMIO_QUEUE_AVAIL_HIGH, VIRTIO_MMIO_QUEUE_AVAIL_LOW,
-    VIRTIO_MMIO_QUEUE_DESC_HIGH, VIRTIO_MMIO_QUEUE_DESC_LOW, VIRTIO_MMIO_QUEUE_NOTIFY,
-    VIRTIO_MMIO_QUEUE_NUM, VIRTIO_MMIO_QUEUE_NUM_MAX, VIRTIO_MMIO_QUEUE_READY,
-    VIRTIO_MMIO_QUEUE_SEL, VIRTIO_MMIO_QUEUE_USED_HIGH, VIRTIO_MMIO_QUEUE_USED_LOW,
-    VIRTIO_MMIO_STATUS, VIRTIO_MMIO_VENDOR_ID, VIRTIO_MMIO_VERSION,
+    VIRTIO_MMIO_INT_CONFIG, VIRTIO_MMIO_INT_VRING, VIRTIO_MMIO_INTERRUPT_ACK,
+    VIRTIO_MMIO_INTERRUPT_STATUS, VIRTIO_MMIO_MAGIC_VALUE, VIRTIO_MMIO_QUEUE_AVAIL_HIGH,
+    VIRTIO_MMIO_QUEUE_AVAIL_LOW, VIRTIO_MMIO_QUEUE_DESC_HIGH, VIRTIO_MMIO_QUEUE_DESC_LOW,
+    VIRTIO_MMIO_QUEUE_NOTIFY, VIRTIO_MMIO_QUEUE_NUM, VIRTIO_MMIO_QUEUE_NUM_MAX,
+    VIRTIO_MMIO_QUEUE_READY, VIRTIO_MMIO_QUEUE_SEL, VIRTIO_MMIO_QUEUE_USED_HIGH,
+    VIRTIO_MMIO_QUEUE_USED_LOW, VIRTIO_MMIO_STATUS, VIRTIO_MMIO_VENDOR_ID, VIRTIO_MMIO_VERSION,
 };
 use virtio_bindings::virtio_net::VIRTIO_NET_F_MAC;
-use virtio_queue::{Queue, QueueT};
+use virtio_queue::{Error as VirtioQueueError, Queue, QueueOwnedT, QueueT};
 use vm_memory::{Address, ByteValued, Bytes, GuestMemoryMmap};
 use vmm_sys_util::eventfd::EventFd;
 
@@ -270,6 +271,35 @@ pub struct VirtioNetCounters {
     /// `add_used` fails — both branches mean the device tried to
     /// publish a used-ring entry and the publish itself failed.
     pub(crate) rx_add_used_failures: AtomicU64,
+    /// Cumulative count of `Error::InvalidAvailRingIndex` events
+    /// observed across both queues. Bumped each time the
+    /// virtio-queue iter() rejects an avail.idx whose distance from
+    /// `next_avail` exceeds the queue size — a hostile or buggy
+    /// guest condition.
+    ///
+    /// Per-event counter (NOT per-request): the per-queue poison
+    /// flag short-circuits further attempts on the same queue, so
+    /// the false→true transition produces exactly one bump per
+    /// poison event. Without the flag, every QUEUE_NOTIFY kick
+    /// would re-enter `iter()`, observe the same error, log via
+    /// `error!()`, return None from the swallowing default impl,
+    /// and re-bump this counter — three concrete problems:
+    /// (a) the per-event counter taxonomy is violated (counter
+    /// reflects kick rate rather than poison event rate),
+    /// (b) the operator has no signal that the device is wedged
+    /// (no NEEDS_RESET, no STATUS bit change), and (c) every kick
+    /// floods the host log with the same error line. The poison
+    /// flag fixes all three. Note: this is NOT a "livelock" —
+    /// virtio-net has no enable_notification/disable_notification
+    /// bracket, so each kick re-trips the error ONCE per MMIO
+    /// exit, then returns. The harm is observability + log spam,
+    /// not unbounded CPU consumption.
+    ///
+    /// Successive QUEUE_NOTIFY kicks against an unresetted
+    /// poisoned queue take the entry-gate short-circuit and
+    /// produce zero additional bumps until the guest performs a
+    /// virtio reset.
+    pub(crate) invalid_avail_idx_count: AtomicU64,
 }
 
 impl VirtioNetCounters {
@@ -337,6 +367,19 @@ impl VirtioNetCounters {
         self.rx_add_used_failures.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record one observed `Error::InvalidAvailRingIndex` event
+    /// from `Queue::iter`. Called by `process_tx_loopback` /
+    /// `try_loopback_to_rx` when the avail ring's `idx` is more
+    /// than `queue.size` ahead of `next_avail` — a virtio-spec
+    /// violation by the guest. The caller also sets
+    /// `VirtioNet::queue_poisoned` so a single hostile-guest event
+    /// produces exactly one bump regardless of how many subsequent
+    /// kicks land before the next reset (subsequent drains
+    /// short-circuit on the poison flag and never re-call `iter`).
+    pub(crate) fn record_invalid_avail_idx(&self) {
+        self.invalid_avail_idx_count.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Read the cumulative count of TX chains successfully looped to
     /// RX. Per-event counter: bumped exactly once per TX chain that
     /// completed both halves of the loopback.
@@ -395,6 +438,19 @@ impl VirtioNetCounters {
     pub fn rx_add_used_failures(&self) -> u64 {
         self.rx_add_used_failures.load(Ordering::Relaxed)
     }
+
+    /// Read the cumulative count of `Error::InvalidAvailRingIndex`
+    /// events the device has observed. Per-event counter (NOT
+    /// per-request): the queue-poison flag short-circuits subsequent
+    /// kicks against the same hostile state, so one guest fault
+    /// produces exactly one bump regardless of how many notifications
+    /// follow before reset. A non-zero value means the guest violated
+    /// virtio-v1.2 §2.7.13.3 — the device is in the "structurally
+    /// broken queue" state and will not service IO until the guest
+    /// issues a virtio reset.
+    pub fn invalid_avail_idx_count(&self) -> u64 {
+        self.invalid_avail_idx_count.load(Ordering::Relaxed)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -414,8 +470,50 @@ pub struct VirtioNet {
     device_features_sel: u32,
     driver_features_sel: u32,
     driver_features: u64,
+    /// FSM state bits per virtio-v1.2 §3.1.1 plus the
+    /// `VIRTIO_CONFIG_S_NEEDS_RESET` bit set on the queue-poison
+    /// path. Plain `u32` (not `AtomicU32`): virtio-net processes
+    /// every MMIO write inline on the vCPU thread that took the
+    /// kick, and there is no worker thread in v0, so all reads
+    /// and writes of `device_status` happen on that single
+    /// thread. A future TAP / AF_PACKET / threaded-NAPI backend
+    /// that moves the drain off-thread would need to convert this
+    /// (along with `interrupt_status` and `queue_poisoned`) to
+    /// atomic types as part of that migration. virtio-blk's
+    /// equivalent uses `Arc<AtomicU32>` because its worker thread
+    /// can race-fire `fetch_or(NEEDS_RESET)` with the vCPU's FSM
+    /// walk; that race does not exist here.
     device_status: u32,
+    /// MMIO interrupt-status register. Two bits set by this
+    /// device:
+    ///   - `VIRTIO_MMIO_INT_VRING`: on used-ring publish via
+    ///     `signal_used` (every drain that advances either
+    ///     queue's used.idx).
+    ///   - `VIRTIO_MMIO_INT_CONFIG`: on the queue-poison path via
+    ///     `signal_queue_poisoned` (paired with NEEDS_RESET in
+    ///     `device_status`). Spec-compliant per virtio-v1.2 and
+    ///     matches cloud-hypervisor's hostile-guest shutdown
+    ///     signal. The kernel callback
+    ///     `virtnet_config_changed_work` bails when
+    ///     `VIRTIO_NET_F_STATUS` isn't negotiated, so the
+    ///     INT_CONFIG dispatch is effectively a one-time
+    ///     workqueue-wake on device death — accepted cost for
+    ///     spec-compliance and cross-VMM convergence. Operators
+    ///     can also detect poison out-of-band via `mmio_read(STATUS)
+    ///     & NEEDS_RESET` plus the host counter.
+    /// Cleared by the guest's `INTERRUPT_ACK` writes. Plain
+    /// `u32` for the same single-thread reason as `device_status`
+    /// — see that field's doc for the invariant and the
+    /// future-migration note.
     interrupt_status: u32,
+    /// v0 holds this at zero. The kernel driver's
+    /// `virtio_config_changed` callback (`virtnet_config_changed` in
+    /// `drivers/net/virtio_net.c`) is the only consumer; nothing in
+    /// this device mutates config-space content after construction
+    /// (MAC is fixed at `new()`, STATUS/MQ/MTU stay zero), so the
+    /// generation field never advances. Future runtime config
+    /// updates (e.g. link-status changes if `VIRTIO_NET_F_STATUS`
+    /// is later advertised) would `fetch_add(1, Release)` here.
     config_generation: AtomicU32,
     /// Eventfd for KVM irqfd — signals guest interrupt.
     irq_evt: EventFd,
@@ -436,6 +534,74 @@ pub struct VirtioNet {
     /// at which point all subsequent TX is amortized to zero
     /// allocation.
     tx_frame_scratch: Vec<u8>,
+    /// Per-queue sticky "this queue's avail-ring iterator is
+    /// structurally broken; stop calling `iter()` on it" flags,
+    /// indexed by `RXQ` / `TXQ`. Set ONLY when the corresponding
+    /// queue's avail-ring iterator returns `Err(_)` — most commonly
+    /// `Error::InvalidAvailRingIndex` (avail.idx more than
+    /// `queue.size` ahead of `next_avail`, virtio-v1.2 §2.7.13.3
+    /// violation; check sits at queue.rs:707-709 in
+    /// `AvailIter::new`), but any structural queue error is
+    /// treated identically (cloud-hypervisor convergence — all
+    /// `iter()` Err variants represent driver-side state
+    /// corruption that cannot recover without a virtio reset).
+    ///
+    /// **`add_used` failures do NOT poison.** A failed `add_used`
+    /// (TX or RX, success or recycle paths) is a transient
+    /// used-ring GPA mapping problem — the next QUEUE_NOTIFY may
+    /// find the GPA mapped (e.g. if the guest re-binds the used
+    /// ring). Counting via `tx_add_used_failures` /
+    /// `rx_add_used_failures` gives operator visibility without
+    /// permanently halting the queue. virtio-blk follows the same
+    /// rule: add_used failures bump io_errors but do NOT set
+    /// NEEDS_RESET. Poison is reserved for structural avail.idx
+    /// violations.
+    ///
+    /// Without these flags, every subsequent `pop_descriptor_chain`
+    /// (the default `QueueT` impl that swallows the error and
+    /// returns `None` — virtio-queue queue.rs:573-587) would let
+    /// the next QUEUE_NOTIFY re-trip the same error. virtio-net
+    /// has NO `enable_notification` / `disable_notification`
+    /// bracket around the drain (no EVENT_IDX negotiated), so the
+    /// re-trip happens once per MMIO exit and the function
+    /// returns — NOT a livelock at full vCPU cost. The harm
+    /// without the flag is concrete but bounded: (a) the
+    /// per-event counter taxonomy is violated (counter reflects
+    /// kick rate rather than poison-event rate), (b) operators
+    /// have no `mmio_read(STATUS)`-visible signal that the device
+    /// is wedged, and (c) every kick floods the host log with the
+    /// same error line. The flags fix all three.
+    ///
+    /// **Per-queue, not per-device.** A hostile guest can poison
+    /// RX without poisoning TX (or vice versa). Per-queue flags
+    /// let the operator's failure-dump distinguish "RX poisoned,
+    /// TX fine" from "TX poisoned" from "both poisoned" — a
+    /// device-level flag would conflate the three failure modes
+    /// and hide which queue the guest broke. The drain consults
+    /// the matching flag at each pop site (TX in
+    /// `pop_and_capture_tx`, RX in `try_loopback_to_rx`); it does
+    /// NOT short-circuit the whole drain on a one-side poison.
+    /// When EITHER flag is set the device reports
+    /// `VIRTIO_CONFIG_S_NEEDS_RESET` to the guest (single bit, no
+    /// per-queue NEEDS_RESET in the virtio-v1.2 spec) but the
+    /// per-queue flags govern internal short-circuit behavior.
+    ///
+    /// Both flags clear only on `VirtioNet::reset()`, matching the
+    /// device's `VIRTIO_CONFIG_S_NEEDS_RESET` (virtio-v1.2 §2.1.1
+    /// bit 0x40) behaviour: the only escape is a STATUS=0 MMIO
+    /// write.
+    ///
+    /// Single-thread invariant: virtio-net processes all
+    /// MMIO/QUEUE_NOTIFY traffic inline on the vCPU thread that
+    /// took the kick (no worker thread in v0). All reads and
+    /// writes of these flags happen on that thread, so plain
+    /// `bool`s are sufficient — no atomics needed. Same rationale
+    /// `device_status` and `interrupt_status` use plain `u32`. A
+    /// future TAP / AF_PACKET / threaded-NAPI backend that moves
+    /// the drain off-thread would need to convert these flags
+    /// (along with `device_status` and `interrupt_status`) to
+    /// atomic types as part of that migration.
+    queue_poisoned: [bool; NUM_QUEUES],
 }
 
 impl VirtioNet {
@@ -465,6 +631,7 @@ impl VirtioNet {
             },
             counters: Arc::new(VirtioNetCounters::default()),
             tx_frame_scratch: Vec::with_capacity(MAX_FRAME_SIZE),
+            queue_poisoned: [false; NUM_QUEUES],
         }
     }
 
@@ -515,6 +682,14 @@ impl VirtioNet {
     // multiple chain advances under one IRQ is correct and reduces
     // vCPU exits proportional to the burst size.
     //
+    // `signal_used` only sets `VIRTIO_MMIO_INT_VRING`. The
+    // INT_CONFIG bit is set by the orthogonal `signal_queue_poisoned`
+    // path (paired with NEEDS_RESET in device_status) — see that
+    // function's doc. Per-event taxonomy: VRING reflects regular
+    // used-ring publishes (TX completion, RX delivery, malformed-
+    // chain recycle), CONFIG reflects the one-shot device-death
+    // signal.
+    //
     // The eventfd write below has two possible errno paths,
     // both recoverable:
     //
@@ -540,6 +715,66 @@ impl VirtioNet {
         self.interrupt_status |= VIRTIO_MMIO_INT_VRING;
         if let Err(e) = self.irq_evt.write(1) {
             tracing::warn!(%e, "virtio-net irq_evt.write failed");
+        }
+    }
+
+    /// Surface the queue-poison state to the guest:
+    ///   1. Set `VIRTIO_CONFIG_S_NEEDS_RESET` in `device_status`
+    ///      (virtio-v1.2 §2.1.1 bit 0x40) so the guest's STATUS
+    ///      read sees "device needs reset before it can service
+    ///      IO." Cloud-hypervisor uses the same bit for its
+    ///      hostile-guest shutdown path. Distinct from the orthogonal
+    ///      `VIRTIO_CONFIG_S_FAILED` (bit 0x80, set by
+    ///      `set_status` on driver-side feature-negotiation
+    ///      violations) — NEEDS_RESET is the device asking for
+    ///      help, FAILED is the driver giving up. There is no
+    ///      per-queue NEEDS_RESET bit in the spec — the
+    ///      device-level bit is the only signal even when only
+    ///      one of the two queues is poisoned (per-queue state
+    ///      lives in `queue_poisoned[]` and
+    ///      `invalid_avail_idx_count`).
+    ///   2. Set `VIRTIO_MMIO_INT_CONFIG` in `interrupt_status` so
+    ///      the guest's `vm_interrupt` handler dispatches the
+    ///      config-change callback alongside the NEEDS_RESET bit.
+    ///      Spec-compliant per virtio-v1.2 (config interrupt
+    ///      paired with NEEDS_RESET) and matches cloud-hypervisor's
+    ///      hostile-guest shutdown signal. virtio-net's kernel
+    ///      callback (`virtnet_config_changed_work` in
+    ///      `drivers/net/virtio_net.c`) bails when
+    ///      `VIRTIO_NET_F_STATUS` isn't negotiated — making the
+    ///      callback a no-op rather than productive — so the
+    ///      INT_CONFIG dispatch costs one harmless guest-side
+    ///      vCPU exit + workqueue wake on device death. That's
+    ///      acceptable: the device is already wedged, the cost
+    ///      runs once, and the spec-compliance / cross-VMM
+    ///      convergence wins outweigh the single wasted exit.
+    ///   3. Write the irqfd so KVM delivers the GSI. The
+    ///      `vm_interrupt` handler reads INTERRUPT_STATUS and
+    ///      dispatches via the set bits.
+    ///
+    /// **Caller responsibility**: gate this on the false→true
+    /// poison transition for a queue. The function itself does
+    /// NOT check the flag — callers (TX-side and RX-side poison
+    /// arms) must only invoke it when they just transitioned a
+    /// queue from clean to poisoned. Re-poisoning an
+    /// already-poisoned queue MUST NOT call this — re-firing the
+    /// irqfd would generate spurious wakes (counter already
+    /// drained by the guest's prior IRQ handler). This matches
+    /// the F17-6 adversarial finding that the counter and signal
+    /// must be event-once per transition.
+    fn signal_queue_poisoned(&mut self) {
+        self.device_status |= VIRTIO_CONFIG_S_NEEDS_RESET;
+        self.interrupt_status |= VIRTIO_MMIO_INT_CONFIG;
+        // SAFETY: EAGAIN requires counter saturation at u64::MAX-1
+        // (~1.8e19 unobserved kicks) — implausible. EBADF means
+        // the fd closed during shutdown. The NEEDS_RESET +
+        // INT_CONFIG bits above are the enduring guest-visible
+        // signals: even if this write fails, the operator's
+        // `mmio_read(STATUS)` still surfaces NEEDS_RESET. We log
+        // any errno so a failed write surfaces in tracing rather
+        // than silently disappearing.
+        if let Err(e) = self.irq_evt.write(1) {
+            tracing::warn!(%e, "virtio-net irq_evt.write failed (poison signal)");
         }
     }
 
@@ -593,6 +828,16 @@ impl VirtioNet {
         let Some(mem) = self.mem.clone() else {
             return;
         };
+        // Per-queue poison gating: NO entry-level short-circuit on
+        // `queue_poisoned`. The helpers (`pop_and_capture_tx`,
+        // `try_loopback_to_rx`) consult their own queue's flag at
+        // their pop sites. That gives the per-queue independence
+        // adversarial review F17-2 demands: a poisoned RX must not
+        // stop the TX path from continuing to drain (the guest can
+        // still get TX completions even when its RX side is broken),
+        // and a poisoned TX returns Empty so the loop just breaks
+        // naturally — no need for a special outer gate.
+        //
         // `had_used_ring_publish` tracks whether ANY queue's
         // used-ring index advanced during this drain (TX add_used
         // OR RX add_used succeeded somewhere). The irqfd kick at
@@ -602,6 +847,19 @@ impl VirtioNet {
         // never observes the empty completion and the descriptor
         // sits unrecycled in the used ring until a virtio reset.
         let mut had_used_ring_publish = false;
+        // `tx_just_poisoned` / `rx_just_poisoned`: the false→true
+        // transition observed during THIS drain. The signal +
+        // counter bump are gated on the transition, not on the
+        // current state of the flag — re-kicks against an already-
+        // poisoned queue must NOT re-fire the signal or re-bump
+        // the counter (F17-6). Each helper sets its corresponding
+        // flag if it just transitioned; the flags are inspected
+        // post-loop to fire signal_queue_poisoned exactly once per
+        // transition, AFTER any pending used-ring publishes have
+        // been kicked (F17-7 ordering: signal poison only after the
+        // guest can observe the prior completions).
+        let mut tx_just_poisoned = false;
+        let mut rx_just_poisoned = false;
 
         // Borrow-split: the TX queue iterator and the RX queue side
         // both need `&mut self.queues[...]` at non-overlapping times.
@@ -610,8 +868,23 @@ impl VirtioNet {
         // `try_loopback_to_rx` (taking the RX borrow), then close
         // the loop iteration with a TX `add_used`.
         loop {
-            let Some(chain_outcome) = self.pop_and_capture_tx(&mem) else {
-                break;
+            let pop_outcome = self.pop_and_capture_tx(&mem);
+            let chain_outcome = match pop_outcome {
+                TxPopOutcome::Empty => break,
+                TxPopOutcome::JustPoisoned => {
+                    // Hostile-guest TX-side iter() error —
+                    // `pop_and_capture_tx` performed the false→true
+                    // transition, bumped the counter, and set
+                    // `queue_poisoned[TXQ] = true`. No chain was
+                    // popped. Break the drain (TX cannot make
+                    // forward progress until reset). Signal handled
+                    // post-loop alongside any RX poison transition,
+                    // ordered after the used-ring kick so the guest
+                    // observes prior completions.
+                    tx_just_poisoned = true;
+                    break;
+                }
+                TxPopOutcome::Chain(c) => c,
             };
             let TxChainOutcome { head, frame_len } = chain_outcome;
 
@@ -636,11 +909,37 @@ impl VirtioNet {
                     LoopbackOutcome::DeliveredButAddUsedFailed => {
                         // Header + frame DID land in the descriptor
                         // but the trailing `add_used` failed.
-                        // `rx_add_used_failures` was already bumped
-                        // inside try_loopback_to_rx. Do NOT bump
-                        // rx_packets — the guest never observes the
-                        // publish — and do NOT mark the used-ring
-                        // as advanced (it didn't).
+                        // `rx_add_used_failures` was bumped inside
+                        // `try_loopback_to_rx`. Do NOT bump
+                        // rx_packets (guest never observes the
+                        // publish) and do NOT mark the used-ring as
+                        // advanced (it didn't). Do NOT poison the
+                        // queue — add_used failure is a transient
+                        // used-ring GPA mapping issue, not a
+                        // structural avail.idx violation. Continue
+                        // the drain; TX `add_used` below still
+                        // completes for this chain.
+                    }
+                    LoopbackOutcome::RxAlreadyPoisoned => {
+                        // Already-poisoned RX queue (re-kick after
+                        // a prior poison, OR a prior iteration of
+                        // this drain already triggered the
+                        // false→true transition for RX). Drop the
+                        // captured frame; do NOT re-bump counter,
+                        // do NOT re-fire signal. TX add_used below
+                        // still runs.
+                    }
+                    LoopbackOutcome::JustRxQueuePoisoned => {
+                        // RX-side `iter()` first-time error.
+                        // `try_loopback_to_rx` performed the
+                        // false→true RX poison transition, bumped
+                        // the counter, and set `queue_poisoned[RXQ]
+                        // = true`. The TX-captured frame is dropped
+                        // (nothing to deliver into). TX add_used
+                        // below still runs so the in-flight TX
+                        // request doesn't hang. RX poison signal is
+                        // fired post-loop after the used-ring kick.
+                        rx_just_poisoned = true;
                     }
                     LoopbackOutcome::NoRxBuffer => {
                         // No chain popped — the RX queue was empty
@@ -656,6 +955,11 @@ impl VirtioNet {
                         // it did, the guest's NAPI must wake to see
                         // the empty completion (otherwise the buffer
                         // sits unrecycled until a virtio reset).
+                        // Recycle-add_used failure is NOT a poison
+                        // event — that's a transient used-ring GPA
+                        // issue, not a structural avail.idx
+                        // violation. `rx_add_used_failures` was
+                        // bumped inside the helper for visibility.
                         if add_used_ok {
                             had_used_ring_publish = true;
                         }
@@ -685,6 +989,17 @@ impl VirtioNet {
                     had_used_ring_publish = true;
                 }
                 Err(e) => {
+                    // Bump tx_add_used_failures for operator
+                    // visibility. Do NOT poison the queue: this is
+                    // a transient used-ring GPA mapping problem,
+                    // not a structural avail.idx violation. The
+                    // next QUEUE_NOTIFY may succeed if the guest
+                    // re-binds. Same rationale as the RX-side
+                    // add_used handling in `try_loopback_to_rx` —
+                    // poison is reserved for `iter()` errors
+                    // (cloud-hypervisor convergence). virtio-blk
+                    // follows the same rule: add_used failures
+                    // bump io_errors but never set NEEDS_RESET.
                     self.counters.record_tx_add_used_failure();
                     tracing::warn!(
                         head,
@@ -695,19 +1010,53 @@ impl VirtioNet {
                     );
                 }
             }
+
+            // Partial-RX-poison handling: if the RX-side `iter()`
+            // just transitioned false→true this iteration (set by
+            // the JustRxQueuePoisoned arm above), break the drain.
+            // The in-flight TX chain has been honestly completed
+            // via add_used above (steps 1-2 of the partial-poison
+            // flow); the per-queue flag was set inside
+            // `try_loopback_to_rx` and the post-loop signal will
+            // fire NEEDS_RESET + irqfd (steps 3-5). Subsequent
+            // kicks against a still-poisoned RX take the entry
+            // gate inside `try_loopback_to_rx`
+            // (`RxAlreadyPoisoned`), so TX continues servicing
+            // kicks across drains — the per-queue independence
+            // (F17-2) is preserved at the kick boundary, while
+            // within this drain we stop after honestly completing
+            // the in-flight TX chain. No need to also check
+            // `tx_just_poisoned` — the TX-side `JustPoisoned`
+            // outcome breaks earlier (no chain was popped).
+            if rx_just_poisoned {
+                break;
+            }
         }
 
-        // Single irqfd kick after the full drain. Gated on
-        // `had_used_ring_publish` rather than on RX delivery alone:
-        // ANY used-ring advance (TX completion, RX delivery, or RX
-        // malformed-chain recycle) must be observed by the guest's
-        // NAPI; otherwise the guest waits indefinitely on a
-        // descriptor sitting in the used ring. Without
-        // VIRTIO_RING_F_EVENT_IDX, the kernel's `vring_interrupt`
-        // always wakes NAPI, so coalescing multiple advances into
-        // one irqfd write is correct (NAPI polls until empty).
+        // Post-loop ordered signal sequence (F17-7):
+        //   1. signal_used() if any used-ring advance happened, so
+        //      the guest's NAPI wakes to observe TX completions and
+        //      RX deliveries from THIS drain. Must come BEFORE the
+        //      poison signal — a missed signal_used would strand
+        //      whatever completions the guest could still consume
+        //      (TX completions are still actionable even if RX is
+        //      poisoned).
+        //   2. signal_queue_poisoned() exactly once if either side
+        //      transitioned false→true during this drain. Sets
+        //      NEEDS_RESET in device_status + INT_CONFIG in
+        //      interrupt_status (both idempotent under bitwise-OR
+        //      — single call is correct whether one or both
+        //      queues just poisoned), and writes the irqfd.
+        //      Spec-compliant per virtio-v1.2 (config interrupt
+        //      paired with NEEDS_RESET) and matches
+        //      cloud-hypervisor. counter-mode irqfd coalesces
+        //      signal_used + signal_queue_poisoned into a single
+        //      guest-visible IRQ when they both fire.
         if had_used_ring_publish {
             self.signal_used();
+        }
+        if tx_just_poisoned || rx_just_poisoned {
+            self.signal_queue_poisoned();
         }
     }
 
@@ -715,16 +1064,115 @@ impl VirtioNet {
     /// 12-byte virtio header) into `self.tx_frame_scratch`, and
     /// return the chain head index plus the captured frame length.
     ///
-    /// Returns `None` when the TX queue is empty (caller breaks the
-    /// drain loop). Returns `Some(TxChainOutcome { frame_len: None })`
-    /// when the chain is malformed — the caller must still
-    /// `add_used` the head so the guest doesn't hang. Returns
-    /// `Some(TxChainOutcome { frame_len: Some(n) })` on success;
+    /// Returns `Empty` when the TX queue is empty OR when the
+    /// per-queue `queue_poisoned[TXQ]` flag is already set (the
+    /// entry gate short-circuits with `Empty` rather than a
+    /// dedicated "AlreadyPoisoned" variant — the drain loop's
+    /// only legal action is to break, and `Empty` already conveys
+    /// that). Returns `JustPoisoned` when the TX `iter()`
+    /// observed any structural error for the FIRST time —
+    /// `invalid_avail_idx_count` is bumped and
+    /// `queue_poisoned[TXQ]` is set; the caller breaks the drain
+    /// and the post-loop signal handler fires.
+    /// Returns `Chain(TxChainOutcome { frame_len: None })` when the
+    /// chain is malformed — the caller must still `add_used` the
+    /// head so the guest doesn't hang. Returns
+    /// `Chain(TxChainOutcome { frame_len: Some(n) })` on success;
     /// `self.tx_frame_scratch[..n]` holds the captured bytes.
-    fn pop_and_capture_tx(&mut self, mem: &GuestMemoryMmap) -> Option<TxChainOutcome> {
-        let q = &mut self.queues[TXQ];
-        let chain = q.pop_descriptor_chain(mem)?;
-        let head = chain.head_index();
+    ///
+    /// Uses `iter()`/`.next()` directly so we OBSERVE
+    /// `Error::InvalidAvailRingIndex` instead of swallowing it —
+    /// the default `pop_descriptor_chain` impl in
+    /// `virtio_queue::QueueT` (queue.rs:573-587) logs the error
+    /// and returns `None`, which masks the structural violation as
+    /// "no chain available" and lets every subsequent kick re-trip
+    /// the same error. Mirror of the virtio-blk drain pattern.
+    fn pop_and_capture_tx(&mut self, mem: &GuestMemoryMmap) -> TxPopOutcome {
+        // Per-queue poison gate. If the TX queue's flag is already
+        // set, return Empty so the drain loop breaks naturally —
+        // no iter() call (avoids re-tripping the same error and
+        // re-bumping the per-event counter), no signal (the
+        // false→true transition fired on the original poison and
+        // the bits/counter remain set), no add_used. This is the
+        // F17-6 transition gate: counter and signal happen only on
+        // the false→true crossing, not on every kick. Re-kicks are
+        // benign no-ops.
+        if self.queue_poisoned[TXQ] {
+            return TxPopOutcome::Empty;
+        }
+        // Step 1: pull one chain out of the queue. The chain holds
+        // its own `mem.clone()` (queue.rs:761-766) so it does NOT
+        // borrow from the iter or the queue — we collect it into a
+        // tight scope, drop the queue borrow before touching any
+        // other field of `self`, then walk the chain afterwards
+        // (which needs `&mut self.tx_frame_scratch` and
+        // `&self.counters`).
+        //
+        // Two-step extraction so the queue borrow is strictly
+        // scoped to one statement: (a) call `iter().next()` and
+        // collect either the chain, an empty marker, or any
+        // iter()-error marker; (b) drop the queue borrow; (c)
+        // re-borrow `self` to bump counters / set the poison flag.
+        //
+        // Any iter() error → poison. cloud-hypervisor's pattern
+        // for hostile-guest defense: `InvalidAvailRingIndex` is
+        // the most specific structural violation the
+        // virtio-queue crate currently reports, but the broader
+        // `QueueT::iter` contract returns `Err` only for queue
+        // state the driver has corrupted (avail-ring read
+        // overflow, etc.). All such errors are non-recoverable
+        // without a virtio reset; treating them uniformly as
+        // poison keeps the failure-classification taxonomy
+        // simple and converges with the upstream pattern. Future
+        // virtio-queue versions may add new Error variants — they
+        // funnel through this arm without code change.
+        enum IterStep<C> {
+            Chain(C),
+            Empty,
+            Poisoned(VirtioQueueError),
+        }
+        let step: IterStep<_> = {
+            let q = &mut self.queues[TXQ];
+            match q.iter(mem) {
+                Ok(mut iter) => match iter.next() {
+                    Some(c) => IterStep::Chain(c),
+                    None => IterStep::Empty,
+                },
+                Err(e) => IterStep::Poisoned(e),
+            }
+        };
+        let (chain, head) = match step {
+            IterStep::Empty => return TxPopOutcome::Empty,
+            IterStep::Chain(c) => {
+                let h = c.head_index();
+                (c, h)
+            }
+            IterStep::Poisoned(err) => {
+                // Hostile- or buggy-guest poison — first time. The
+                // avail-ring iterator failed with a structural
+                // error — most commonly `InvalidAvailRingIndex`
+                // (virtio-v1.2 §2.7.13.3 violation: avail.idx more
+                // than `queue.size` ahead of next_avail; check
+                // sits at queue.rs:707-709 in `AvailIter::new`),
+                // but any `iter()` Err is treated identically.
+                // Perform the false→true transition: mark the
+                // queue dead so future drains short-circuit at
+                // the entry gate above, bump the per-event
+                // counter, log the error. Return JustPoisoned so
+                // the caller breaks the drain and the post-loop
+                // signal handler fires `signal_queue_poisoned`
+                // exactly once.
+                self.queue_poisoned[TXQ] = true;
+                self.counters.record_invalid_avail_idx();
+                tracing::warn!(
+                    err = %err,
+                    "virtio-net TX iter() failed; poisoning TX queue until \
+                     guest reset (any structural queue error is \
+                     non-recoverable; cloud-hypervisor convergence)"
+                );
+                return TxPopOutcome::JustPoisoned;
+            }
+        };
 
         // Reset scratch; capacity stays. `clear` is O(1) — it just
         // zeroes the len.
@@ -813,10 +1261,10 @@ impl VirtioNet {
             // virtio-v1.2 §5.1.6.5 ("A driver MUST set num_buffers
             // to 0" — implies the header is present in full).
             self.counters.record_tx_chain_invalid();
-            return Some(TxChainOutcome { head, frame_len: None });
+            return TxPopOutcome::Chain(TxChainOutcome { head, frame_len: None });
         }
 
-        Some(TxChainOutcome {
+        TxPopOutcome::Chain(TxChainOutcome {
             head,
             frame_len: Some(total_data_bytes),
         })
@@ -826,34 +1274,82 @@ impl VirtioNet {
     /// with a 12-byte virtio header (num_buffers=1, all other fields
     /// zero) prepended.
     ///
-    /// Returns one of three outcomes per [`LoopbackOutcome`] so the
-    /// caller can route to the correct counter:
-    ///   - `Delivered`: RX chain popped, header + frame written,
-    ///     `add_used` issued.
-    ///   - `NoRxBuffer`: RX queue not ready or empty — caller bumps
-    ///     `tx_dropped_no_rx_buffer`.
-    ///   - `RxChainInvalid`: chain popped but malformed (read-only
-    ///     direction, write failure) — this fn bumps
-    ///     `rx_chain_invalid` AND marks the chain used so the guest
-    ///     doesn't hang. Caller does NOT also bump
-    ///     `tx_dropped_no_rx_buffer` (the two failure modes are
-    ///     mutually exclusive).
+    /// Uses `iter()`/`.next()` directly on the RX queue so we OBSERVE
+    /// `Error::InvalidAvailRingIndex` instead of swallowing it (the
+    /// default `pop_descriptor_chain` impl in
+    /// `virtio_queue::QueueT` queue.rs:573-587 logs and returns
+    /// `None`). Mirror of the TX-side `pop_and_capture_tx` and
+    /// virtio-blk drain pattern.
+    ///
+    /// Returns one of [`LoopbackOutcome`]'s variants — see the
+    /// enum doc for the per-variant routing rules.
     fn try_loopback_to_rx(
         &mut self,
         mem: &GuestMemoryMmap,
         frame_len: usize,
     ) -> LoopbackOutcome {
-        let q = &mut self.queues[RXQ];
-        if !q.ready() {
-            // Driver hasn't published RX buffers yet (init not
-            // complete). Drop the frame; future TX after RX is set
-            // up will succeed.
-            return LoopbackOutcome::NoRxBuffer;
+        // Per-queue poison gate (RX side). If the RX queue's flag
+        // is already set, return `RxAlreadyPoisoned` without
+        // touching the queue — no iter(), no add_used, no counter
+        // bump, no signal. Mirror of `pop_and_capture_tx`'s entry
+        // gate; supports the F17-2 invariant that RX poison must
+        // not stop TX from continuing to drain (the caller still
+        // does TX add_used in this iteration even when RX is
+        // poisoned).
+        if self.queue_poisoned[RXQ] {
+            return LoopbackOutcome::RxAlreadyPoisoned;
         }
-        let Some(chain) = q.pop_descriptor_chain(mem) else {
-            return LoopbackOutcome::NoRxBuffer;
+        // Pull one chain out of the RX queue. Same two-step
+        // iter()-then-drop pattern as `pop_and_capture_tx`. Any
+        // iter() error → poison (cloud-hypervisor convergence;
+        // see the rationale on the TX-side variant).
+        enum IterStep<C> {
+            Chain(C),
+            NoBuffer,
+            Poisoned(VirtioQueueError),
+        }
+        let step: IterStep<_> = {
+            let q = &mut self.queues[RXQ];
+            if !q.ready() {
+                // Driver hasn't published RX buffers yet (init not
+                // complete). Drop the frame; future TX after RX is
+                // set up will succeed.
+                return LoopbackOutcome::NoRxBuffer;
+            }
+            match q.iter(mem) {
+                Ok(mut iter) => match iter.next() {
+                    Some(c) => IterStep::Chain(c),
+                    None => IterStep::NoBuffer,
+                },
+                Err(e) => IterStep::Poisoned(e),
+            }
         };
-        let head = chain.head_index();
+        let (chain, head) = match step {
+            IterStep::NoBuffer => return LoopbackOutcome::NoRxBuffer,
+            IterStep::Chain(c) => {
+                let h = c.head_index();
+                (c, h)
+            }
+            IterStep::Poisoned(err) => {
+                // Hostile- or buggy-guest poison on the RX queue —
+                // first time. Mirror the TX-side handling: perform
+                // the false→true transition (set
+                // `queue_poisoned[RXQ]`, bump the per-event counter,
+                // log), return `JustRxQueuePoisoned`. Re-kicks
+                // against the now-poisoned queue take the entry
+                // gate above (returns `RxAlreadyPoisoned`) so the
+                // counter and signal are event-once.
+                self.queue_poisoned[RXQ] = true;
+                self.counters.record_invalid_avail_idx();
+                tracing::warn!(
+                    err = %err,
+                    "virtio-net RX iter() failed; poisoning RX queue until \
+                     guest reset (any structural queue error is \
+                     non-recoverable; cloud-hypervisor convergence)"
+                );
+                return LoopbackOutcome::JustRxQueuePoisoned;
+            }
+        };
 
         // Walk RX descriptors. Must be device-writable. Place the
         // 12-byte zero header first, then the captured frame bytes.
@@ -981,7 +1477,15 @@ impl VirtioNet {
             // decide whether to kick: if `add_used` succeeded the
             // used-ring advanced and the guest's NAPI must wake to
             // observe the empty completion and recycle the buffer.
-            let add_used_ok = match q.add_used(mem, head, 0) {
+            //
+            // Do NOT poison on add_used failure — that's a
+            // transient used-ring GPA issue, not a structural
+            // avail.idx violation. Same rule as the success branch
+            // (post-walk add_used path below) and virtio-blk:
+            // poison is reserved for `iter()` errors only. See the
+            // doc on the success-branch add_used match for the
+            // full rationale.
+            let add_used_ok = match self.queues[RXQ].add_used(mem, head, 0) {
                 Ok(()) => true,
                 Err(e) => {
                     self.counters.record_rx_add_used_failure();
@@ -1037,7 +1541,22 @@ impl VirtioNet {
         // never observes the publish. A counter that lies during
         // queue-state breakage would mislead operators into
         // thinking delivery worked.
-        match q.add_used(mem, head, bytes_written) {
+        //
+        // Do NOT poison the queue on `add_used` failure. Unlike
+        // an avail-ring iterator error (which means the guest's
+        // avail.idx is structurally inconsistent — a virtio-spec
+        // violation that cannot be recovered without reset), an
+        // add_used failure is a transient used-ring GPA mapping
+        // problem. The next QUEUE_NOTIFY may find the GPA mapped
+        // (e.g. if the guest re-binds the used ring). Counting
+        // the failure via `rx_add_used_failures` gives the
+        // operator visibility without permanently halting the
+        // RX side. virtio-blk follows the same convention:
+        // add_used failures bump io_errors but do NOT set
+        // NEEDS_RESET. Poison is reserved for `iter()` errors
+        // (cloud-hypervisor convergence: structural avail.idx
+        // violations only).
+        match self.queues[RXQ].add_used(mem, head, bytes_written) {
             Ok(()) => LoopbackOutcome::Delivered {
                 l2_bytes_written: l2_bytes,
             },
@@ -1047,9 +1566,8 @@ impl VirtioNet {
                     head,
                     %e,
                     "virtio-net RX add_used failed after successful frame \
-                     write (used-ring address likely unmapped); guest will \
-                     see the frame in its descriptor but not in the ring; \
-                     bumped rx_add_used_failures, will NOT bump rx_packets"
+                     write (used-ring address likely unmapped); bumped \
+                     rx_add_used_failures, will NOT bump rx_packets"
                 );
                 LoopbackOutcome::DeliveredButAddUsedFailed
             }
@@ -1065,39 +1583,75 @@ impl VirtioNet {
 /// Variants:
 ///   - `Delivered { l2_bytes_written }`: header + frame written,
 ///     `add_used` returned Ok, used-ring advanced. Caller bumps
-///     `rx_packets` / `rx_bytes` and kicks the guest. The byte
-///     count is the actual L2 bytes (i.e. total descriptor bytes
-///     minus the 12-byte virtio header), NOT the source frame
-///     length, so a too-small RX buffer reports the truncated
-///     count truthfully.
-///   - `DeliveredButAddUsedFailed`: header + frame DID land in
+///     `rx_packets` / `rx_bytes` and kicks the guest.
+///   - `DeliveredButAddUsedFailed`: header + frame landed in
 ///     the descriptor but the trailing `add_used` failed —
-///     used-ring did NOT advance. `rx_add_used_failures` was
-///     already bumped inside the function. Caller does NOT bump
-///     `rx_packets` (the guest never observes the publish) and
-///     does NOT kick (there's nothing in the ring to kick about).
+///     queue-state breakage. `rx_add_used_failures` was bumped.
+///     The queue is NOT poisoned (add_used failure is a
+///     transient used-ring GPA problem, not a structural
+///     avail.idx violation; the next kick may find the GPA
+///     mapped). Caller does NOT bump `rx_packets` (guest never
+///     observes the publish) and does NOT mark the used-ring
+///     advanced. TX add_used for this chain still runs.
 ///   - `NoRxBuffer`: RX queue not ready or empty, no chain
-///     popped. Caller bumps `tx_dropped_no_rx_buffer`. No kick
-///     (no descriptor was used).
+///     popped. Caller bumps `tx_dropped_no_rx_buffer`.
 ///   - `RxChainInvalid { add_used_ok }`: chain popped but
 ///     malformed (read-only direction or write failure).
-///     `rx_chain_invalid` was already bumped. The function tried
-///     `add_used(head, 0)` to recycle the descriptor:
-///     - If `add_used_ok = true`, the used-ring advanced — caller
-///       must kick so the guest's NAPI observes the empty
-///       completion and recycles the buffer, otherwise the guest
-///       waits indefinitely.
-///     - If `add_used_ok = false`, the publish failed too,
-///       `rx_add_used_failures` was bumped, and there is nothing
-///       to kick about.
+///     `rx_chain_invalid` was bumped. The recycle
+///     `add_used(head, 0)` was attempted:
+///     - If `add_used_ok = true`, the used-ring advanced —
+///       caller must kick.
+///     - If `add_used_ok = false`, the recycle add_used itself
+///       failed, `rx_add_used_failures` was bumped. As with
+///       `DeliveredButAddUsedFailed`, the queue is NOT poisoned
+///       (transient GPA issue).
+///   - `JustRxQueuePoisoned`: RX `iter()` returned any `Err`
+///     (most commonly `InvalidAvailRingIndex`; cloud-hypervisor
+///     pattern treats every structural queue error uniformly).
+///     `invalid_avail_idx_count` was bumped and
+///     `queue_poisoned[RXQ]` JUST transitioned false→true.
+///     Caller records the transition; post-loop signal fires.
+///     This is the ONLY path that poisons the RX queue.
+///   - `RxAlreadyPoisoned`: RX queue's poison flag was already
+///     true on entry to `try_loopback_to_rx`. NO counter bump,
+///     NO transition. The TX-captured frame is silently dropped
+///     and the caller's TX add_used still runs. Returned
+///     instead of `NoRxBuffer` so an operator reading the trace
+///     log can distinguish "RX queue empty" from "RX queue
+///     poisoned, gated short-circuit".
 enum LoopbackOutcome {
     Delivered { l2_bytes_written: u64 },
     DeliveredButAddUsedFailed,
     NoRxBuffer,
     RxChainInvalid { add_used_ok: bool },
+    JustRxQueuePoisoned,
+    RxAlreadyPoisoned,
 }
 
 /// Outcome of `pop_and_capture_tx`.
+///   - `Empty`: TX queue empty (no chain available, or TX queue
+///     is already poisoned and the gate short-circuited at
+///     entry). Drain loop should break.
+///   - `JustPoisoned`: TX `iter()` returned any `Err` (most
+///     commonly `InvalidAvailRingIndex`; cloud-hypervisor pattern
+///     treats every structural queue error uniformly).
+///     `invalid_avail_idx_count` was bumped and
+///     `queue_poisoned[TXQ]` JUST transitioned false→true. The
+///     caller breaks the drain loop and the post-loop signal
+///     handler fires `signal_queue_poisoned`. Re-kicks against
+///     an already-poisoned TX queue return `Empty` (not
+///     `JustPoisoned`) so the counter and signal stay event-once.
+///   - `Chain(TxChainOutcome)`: a chain was popped (whether
+///     well-formed or not) — the caller proceeds with the
+///     per-chain processing and `add_used`.
+enum TxPopOutcome {
+    Empty,
+    JustPoisoned,
+    Chain(TxChainOutcome),
+}
+
+/// Per-chain inner outcome of `pop_and_capture_tx` (carried inside
+/// [`TxPopOutcome::Chain`]).
 struct TxChainOutcome {
     head: u16,
     /// `Some(n)` when the chain was valid and `n` L2 bytes (excluding
@@ -1244,6 +1798,17 @@ impl VirtioNet {
                 // RXQ notify.
             }
             VIRTIO_MMIO_INTERRUPT_ACK => {
+                // Clear the bits the guest ACKed in `interrupt_status`.
+                // No `virtio_update_irq` equivalent is needed: the
+                // irqfd is edge-triggered (each `irq_evt.write(1)`
+                // raises one GSI delivery; KVM's `kvm_irqfd_resampler`
+                // is not wired here because we never claim shared
+                // legacy IRQs). The kernel's
+                // `vm_interrupt`+`vp_modern_get_status` handshake
+                // (drivers/virtio/virtio_mmio.c) does NOT need a
+                // device-side notification on ACK — it just clears
+                // its own view of the bits and moves on. virtio-blk
+                // and virtio-console use the same shape.
                 self.interrupt_status &= !val;
             }
             VIRTIO_MMIO_STATUS => {
@@ -1321,6 +1886,19 @@ impl VirtioNet {
     /// STATUS read-back and aborts probe with `-ENODEV`. The FAILED
     /// bit we set is informational; the kernel's check is
     /// `!(status & FEATURES_OK)`, not `status & FAILED`.
+    ///
+    /// **Divergence from QEMU**: QEMU's `virtio-net` accepts a
+    /// FEATURES_OK write that the driver-features check would
+    /// otherwise reject by silently masking the unoffered bits in
+    /// the negotiated set instead of refusing the transition. This
+    /// implementation rejects the transition outright and sets
+    /// FAILED. Intentional hardening: a hostile or buggy driver
+    /// that asked for an unadvertised feature has lost track of
+    /// its own state, and silently downgrading produces a
+    /// driver-vs-device feature divergence that's invisible to the
+    /// operator. Surfacing the rejection via FAILED + warn is
+    /// preferable to silent acceptance — matches firecracker and
+    /// cloud-hypervisor.
     fn set_status(&mut self, val: u32) {
         let old = self.device_status;
         // Driver must not clear bits (except via reset, which writes 0).
@@ -1389,6 +1967,15 @@ impl VirtioNet {
     /// status) and rebuilds the queues. Counters are NOT zeroed —
     /// they persist across re-binds for monotonic operator
     /// observability, matching the virtio-blk pattern.
+    ///
+    /// Clears `queue_poisoned[..]` for both queues: the guest
+    /// issued a virtio reset, which is the only documented escape
+    /// from a poisoned-queue state (per the field's invariant —
+    /// see [`Self::queue_poisoned`]). The
+    /// `invalid_avail_idx_count` counter is intentionally NOT
+    /// cleared — operators need cumulative-event visibility
+    /// across resets to detect repeated hostile-guest behavior.
+    /// Same rationale virtio-blk's `reset_engine_inline` uses.
     fn reset(&mut self) {
         self.device_status = 0;
         self.interrupt_status = 0;
@@ -1397,6 +1984,7 @@ impl VirtioNet {
         self.driver_features_sel = 0;
         self.driver_features = 0;
         self.tx_frame_scratch.clear();
+        self.queue_poisoned = [false; NUM_QUEUES];
         for q in &mut self.queues {
             q.reset();
         }

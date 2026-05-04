@@ -85,6 +85,9 @@ mod device;
 mod tests;
 
 #[cfg(test)]
+mod tests_poison;
+
+#[cfg(test)]
 mod tests_proptest;
 
 // Glob `pub(crate) use device::*` makes test sub-files (`tests.rs`)

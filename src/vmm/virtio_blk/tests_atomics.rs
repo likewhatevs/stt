@@ -1793,3 +1793,175 @@ use virtio_queue::mock::MockSplitQueue;
             "three coalesced pause() calls must accumulate to 3 in counter mode"
         );
     }
+
+    /// Deterministic test: when device_status already carries
+    /// `NEEDS_RESET` (set by the worker's queue-poison fetch_or),
+    /// the production `set_status` MUST reject the next FSM advance
+    /// via the monotone-bit gate and leave NEEDS_RESET set. This
+    /// pins the production CAS path without race timing — a
+    /// regression to plain `store(val, Release)` inside set_status
+    /// would clobber NEEDS_RESET deterministically and fail this
+    /// test on every run.
+    #[test]
+    fn set_status_preserves_needs_reset_when_already_set() {
+        use std::sync::atomic::Ordering;
+        use virtio_bindings::virtio_config::{
+            VIRTIO_CONFIG_S_ACKNOWLEDGE, VIRTIO_CONFIG_S_NEEDS_RESET,
+        };
+
+        let mut dev = make_device(VIRTIO_BLK_DEFAULT_CAPACITY_BYTES, DiskThrottle::default());
+        // Plant NEEDS_RESET via the same fetch_or the worker would
+        // use on queue poison. The bit ends up alongside the
+        // initial 0 FSM state.
+        dev.device_status
+            .fetch_or(VIRTIO_CONFIG_S_NEEDS_RESET, Ordering::SeqCst);
+        assert_eq!(
+            dev.device_status.load(Ordering::Acquire),
+            VIRTIO_CONFIG_S_NEEDS_RESET,
+            "pre-condition: NEEDS_RESET planted, no FSM bits set"
+        );
+
+        // Production set_status call. The CAS retry loop's
+        // monotone-bit gate observes NEEDS_RESET in the snapshot,
+        // sees that `val = ACK` does not include NEEDS_RESET
+        // (`val & current != current`), and rejects via the
+        // NEEDS_RESET-aware warn arm without modifying
+        // device_status. A regression to `store(val, Release)`
+        // would unconditionally write `ACK` and lose NEEDS_RESET.
+        dev.set_status(VIRTIO_CONFIG_S_ACKNOWLEDGE);
+
+        let observed = dev.device_status.load(Ordering::Acquire);
+        assert_ne!(
+            observed & VIRTIO_CONFIG_S_NEEDS_RESET,
+            0,
+            "set_status must NOT clobber NEEDS_RESET; got device_status={:#x} \
+             — a regression to store(val, Release) would produce this failure",
+            observed,
+        );
+        assert_eq!(
+            observed & VIRTIO_CONFIG_S_ACKNOWLEDGE,
+            0,
+            "ACK must NOT be committed when NEEDS_RESET is set — the \
+             monotone-bit gate rejects the advance; got device_status={:#x}",
+            observed,
+        );
+    }
+
+    /// Concurrent CAS contention test for the production
+    /// `set_status` method. Calls `dev.set_status(...)` from the
+    /// main thread while a poison thread does
+    /// `fetch_or(NEEDS_RESET, SeqCst)` in a tight loop. The
+    /// contention loop exercises the CAS retry path under real
+    /// concurrent fetch_or — surfacing any retry-path bug that
+    /// only fires when the first attempt loses the race — but
+    /// the load-bearing assertion runs AFTER the contention loop
+    /// via deterministic injection rather than relying on
+    /// scheduler timing.
+    ///
+    /// Phase A (contention):
+    ///   1. Pre-position device_status to 0 (mirrors a post-reset
+    ///      starting state). The poison thread will subsequently
+    ///      fetch_or NEEDS_RESET back in.
+    ///   2. Yield once so the poison thread has a chance to fire
+    ///      before the production set_status call.
+    ///   3. Call `dev.set_status(VIRTIO_CONFIG_S_ACKNOWLEDGE)` —
+    ///      the production CAS retry loop is exercised. Across
+    ///      1024 iterations the race interleaves at random
+    ///      scheduler timings, exposing any retry-path bug that
+    ///      depends on the second CAS attempt seeing the
+    ///      worker's freshly-fetched bit.
+    ///
+    /// Phase B (deterministic injection, BEFORE stopping the
+    /// poison thread so the main thread still owns scheduling):
+    ///   4. `dev.device_status.fetch_or(NEEDS_RESET, SeqCst)` —
+    ///      forces NEEDS_RESET into the state regardless of
+    ///      where the poison thread last stopped. This makes the
+    ///      assertion race-free: we KNOW NEEDS_RESET is set
+    ///      before the assertion, independent of scheduler
+    ///      luck.
+    ///   5. `dev.set_status(VIRTIO_CONFIG_S_ACKNOWLEDGE)` — the
+    ///      production CAS path. The monotone-bit gate observes
+    ///      NEEDS_RESET in the snapshot, sees ACK doesn't include
+    ///      it, and rejects the advance. NEEDS_RESET stays set.
+    ///   6. Assert `device_status & NEEDS_RESET != 0`. A
+    ///      regression to `store(val, Release)` inside set_status
+    ///      would clobber NEEDS_RESET in step 5 — caught
+    ///      deterministically here.
+    ///
+    /// The deterministic assertion in Phase B duplicates the
+    /// regression-detection guarantee from
+    /// `set_status_preserves_needs_reset_when_already_set`; the
+    /// purpose of this test is to wrap that guarantee in a
+    /// contention soak loop so race-only bugs (e.g. an off-by-one
+    /// in the CAS retry that fails only on the second attempt)
+    /// surface alongside the deterministic regression check.
+    #[test]
+    fn set_status_cas_preserves_concurrent_needs_reset() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        use virtio_bindings::virtio_config::{
+            VIRTIO_CONFIG_S_ACKNOWLEDGE, VIRTIO_CONFIG_S_NEEDS_RESET,
+        };
+
+        let mut dev = make_device(VIRTIO_BLK_DEFAULT_CAPACITY_BYTES, DiskThrottle::default());
+        let device_status_handle = Arc::clone(&dev.device_status);
+
+        let iters: u32 = 1024;
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = Arc::clone(&stop);
+
+        let poison_thread = std::thread::Builder::new()
+            .name("ktstr-vblk-cas-poison".to_string())
+            .spawn(move || {
+                while !stop_thread.load(Ordering::Acquire) {
+                    device_status_handle
+                        .fetch_or(VIRTIO_CONFIG_S_NEEDS_RESET, Ordering::SeqCst);
+                    std::thread::yield_now();
+                }
+            })
+            .expect("spawn cas-poison thread");
+
+        for _ in 0..iters {
+            // Pre-position: clear device_status directly.
+            dev.device_status.store(0, Ordering::Release);
+            // Yield to give the poison thread a chance to fire
+            // BEFORE the production set_status call.
+            std::thread::yield_now();
+            // Production set_status call — exercises the CAS
+            // retry loop. A regression to store(val, Release)
+            // would silently lose NEEDS_RESET on the iterations
+            // where the poison thread raced.
+            dev.set_status(VIRTIO_CONFIG_S_ACKNOWLEDGE);
+        }
+
+        // Final deterministic injection check, BEFORE stopping the
+        // poison thread, so the assertion is race-free. If the
+        // production CAS-based set_status correctly preserves
+        // NEEDS_RESET, this final check should see either
+        // NEEDS_RESET alone (monotone-bit reject) or
+        // NEEDS_RESET | ACK (CAS race-tolerated commit). A
+        // regression to store(val, Release) would clobber
+        // NEEDS_RESET when ACK commits — caught here as
+        // NEEDS_RESET == 0.
+        //
+        // We force NEEDS_RESET into the state via a direct
+        // fetch_or before this check (rather than relying on the
+        // poison thread to have just-fired) so the assertion is
+        // deterministic regardless of scheduler timing.
+        dev.device_status
+            .fetch_or(VIRTIO_CONFIG_S_NEEDS_RESET, Ordering::SeqCst);
+        dev.set_status(VIRTIO_CONFIG_S_ACKNOWLEDGE);
+        let final_status = dev.device_status.load(Ordering::Acquire);
+        assert_ne!(
+            final_status & VIRTIO_CONFIG_S_NEEDS_RESET,
+            0,
+            "final deterministic check: set_status must NOT clobber \
+             NEEDS_RESET; got device_status={:#x}",
+            final_status,
+        );
+
+        stop.store(true, Ordering::Release);
+        poison_thread
+            .join()
+            .expect("poison thread should not panic");
+    }
