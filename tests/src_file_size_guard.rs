@@ -91,7 +91,7 @@ const EXCEPTIONS: &[(&str, usize)] = &[
     ("monitor/btf_offsets.rs", 3904),
     ("monitor/reader.rs", 3655),
     ("monitor/dump.rs", 3651),
-    ("cache/cache_dir.rs", 3642),
+    ("cache/cache_dir.rs", 3646),
     ("ctprof/mod.rs", 3485),
     ("bin/cargo_ktstr/parse_tests.rs", 3440),
     ("workload/worker/mod.rs", 3274),

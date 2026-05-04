@@ -196,7 +196,21 @@ impl VirtioConsole {
                     }
                 }
             }
-            let _ = q.add_used(mem, head, 0);
+            // TX add_used: on failure the descriptor leaks
+            // (guest's TX queue eventually starves and stdout
+            // stops). Log so the silent-stop is observable in
+            // tracing rather than disappearing into a swallowed
+            // Result. Matches virtio-blk's `publish_completion`
+            // and virtio-net's TX add_used logging pattern.
+            if let Err(e) = q.add_used(mem, head, 0) {
+                tracing::warn!(
+                    head,
+                    %e,
+                    "virtio-console TX add_used failed (used-ring address \
+                     likely unmapped); guest TX queue will eventually \
+                     starve and stdout will stop"
+                );
+            }
         }
         if had_data {
             tracing::debug!(
@@ -289,7 +303,25 @@ impl VirtioConsole {
                 }
             }
             total_written += written;
-            let _ = q.add_used(mem, head, written);
+            // RX add_used: on failure the guest never observes
+            // the bytes we just wrote; the descriptor leaks and
+            // the RX path eventually starves. Log so a structurally
+            // broken used-ring address surfaces in tracing rather
+            // than silently disappearing. The bytes themselves are
+            // already consumed from `pending_rx` (we don't push
+            // back here because the guest-memory write succeeded —
+            // the failure is on the publish side, not the data
+            // delivery).
+            if let Err(e) = q.add_used(mem, head, written) {
+                tracing::warn!(
+                    head,
+                    written,
+                    %e,
+                    "virtio-console RX add_used failed (used-ring address \
+                     likely unmapped); guest will not observe the just-\
+                     delivered bytes and RX queue will eventually starve"
+                );
+            }
         }
         if total_written > 0 {
             tracing::debug!(
@@ -447,10 +479,14 @@ impl VirtioConsole {
         let old = self.device_status;
         // Driver must not clear bits (except via reset, which writes 0).
         if val & self.device_status != self.device_status {
-            tracing::debug!(
+            tracing::warn!(
                 old,
                 val,
-                "virtio-console set_status: rejected (clears bits)"
+                "virtio-console set_status: rejected (clears bits) — \
+                 virtio-v1.2 §3.1.1 status bits are monotone within a \
+                 driver session. Hostile-guest FSM violations surface at \
+                 this log level (matches virtio-blk's set_status \
+                 rejection-warn pattern)."
             );
             return;
         }
@@ -466,10 +502,13 @@ impl VirtioConsole {
             self.device_status = val;
             tracing::debug!(old, new = val, "virtio-console set_status: accepted");
         } else {
-            tracing::debug!(
+            tracing::warn!(
                 old,
                 val,
-                "virtio-console set_status: rejected (invalid transition)"
+                "virtio-console set_status: rejected (invalid transition) — \
+                 virtio-v1.2 §3.1.1 ordering: ACK → DRIVER → FEATURES_OK \
+                 → DRIVER_OK, one bit at a time. Hostile-guest FSM \
+                 violations surface at this log level."
             );
         }
     }
