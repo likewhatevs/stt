@@ -354,6 +354,7 @@ pub(crate) fn worker_thread_main(
     mem: Arc<OnceLock<GuestMemoryMmap>>,
     irq_evt: Arc<EventFd>,
     interrupt_status: Arc<AtomicU32>,
+    device_status: Arc<AtomicU32>,
     mem_unset_warned: Arc<AtomicBool>,
     kick_fd: EventFd,
     stop_fd: EventFd,
@@ -627,6 +628,7 @@ pub(crate) fn worker_thread_main(
             mem_ref,
             &irq_evt,
             &interrupt_status,
+            &device_status,
         );
         // Inline re-drain on wait_nanos == 0. When
         // `nanos_until_n_tokens` returns 0 — bucket already
@@ -656,6 +658,7 @@ pub(crate) fn worker_thread_main(
                 mem_ref,
                 &irq_evt,
                 &interrupt_status,
+                &device_status,
             )
         });
         // Apply the decided action. The `Sleep` arm arms the retry

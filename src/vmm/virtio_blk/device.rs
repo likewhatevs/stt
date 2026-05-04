@@ -28,18 +28,18 @@ pub(crate) use virtio_bindings::virtio_blk::{
 };
 pub(crate) use virtio_bindings::virtio_config::{
     VIRTIO_CONFIG_S_ACKNOWLEDGE, VIRTIO_CONFIG_S_DRIVER, VIRTIO_CONFIG_S_DRIVER_OK,
-    VIRTIO_CONFIG_S_FEATURES_OK, VIRTIO_F_VERSION_1,
+    VIRTIO_CONFIG_S_FEATURES_OK, VIRTIO_CONFIG_S_NEEDS_RESET, VIRTIO_F_VERSION_1,
 };
 pub(crate) use virtio_bindings::virtio_ids::VIRTIO_ID_BLOCK;
 pub(crate) use virtio_bindings::virtio_mmio::{
     VIRTIO_MMIO_CONFIG_GENERATION, VIRTIO_MMIO_DEVICE_FEATURES, VIRTIO_MMIO_DEVICE_FEATURES_SEL,
     VIRTIO_MMIO_DEVICE_ID, VIRTIO_MMIO_DRIVER_FEATURES, VIRTIO_MMIO_DRIVER_FEATURES_SEL,
-    VIRTIO_MMIO_INT_VRING, VIRTIO_MMIO_INTERRUPT_ACK, VIRTIO_MMIO_INTERRUPT_STATUS,
-    VIRTIO_MMIO_MAGIC_VALUE, VIRTIO_MMIO_QUEUE_AVAIL_HIGH, VIRTIO_MMIO_QUEUE_AVAIL_LOW,
-    VIRTIO_MMIO_QUEUE_DESC_HIGH, VIRTIO_MMIO_QUEUE_DESC_LOW, VIRTIO_MMIO_QUEUE_NOTIFY,
-    VIRTIO_MMIO_QUEUE_NUM, VIRTIO_MMIO_QUEUE_NUM_MAX, VIRTIO_MMIO_QUEUE_READY,
-    VIRTIO_MMIO_QUEUE_SEL, VIRTIO_MMIO_QUEUE_USED_HIGH, VIRTIO_MMIO_QUEUE_USED_LOW,
-    VIRTIO_MMIO_STATUS, VIRTIO_MMIO_VENDOR_ID, VIRTIO_MMIO_VERSION,
+    VIRTIO_MMIO_INT_CONFIG, VIRTIO_MMIO_INT_VRING, VIRTIO_MMIO_INTERRUPT_ACK,
+    VIRTIO_MMIO_INTERRUPT_STATUS, VIRTIO_MMIO_MAGIC_VALUE, VIRTIO_MMIO_QUEUE_AVAIL_HIGH,
+    VIRTIO_MMIO_QUEUE_AVAIL_LOW, VIRTIO_MMIO_QUEUE_DESC_HIGH, VIRTIO_MMIO_QUEUE_DESC_LOW,
+    VIRTIO_MMIO_QUEUE_NOTIFY, VIRTIO_MMIO_QUEUE_NUM, VIRTIO_MMIO_QUEUE_NUM_MAX,
+    VIRTIO_MMIO_QUEUE_READY, VIRTIO_MMIO_QUEUE_SEL, VIRTIO_MMIO_QUEUE_USED_HIGH,
+    VIRTIO_MMIO_QUEUE_USED_LOW, VIRTIO_MMIO_STATUS, VIRTIO_MMIO_VENDOR_ID, VIRTIO_MMIO_VERSION,
 };
 pub(crate) use virtio_bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 pub(crate) use virtio_queue::Error as VirtioQueueError;
@@ -842,8 +842,14 @@ pub(crate) struct BlkWorkerState {
     /// The flag clears only on a full virtio reset
     /// (`reset_engine_inline` / `respawn_worker` rebuilds the
     /// state with `queue_poisoned: false`), matching the device's
-    /// "FAILED status until guest resets" behavior in
-    /// cloud-hypervisor's virtio-blk handler.
+    /// `VIRTIO_CONFIG_S_NEEDS_RESET` (virtio-v1.2 §2.1.1 bit 0x40)
+    /// behaviour: the device tells the guest "I need a reset before
+    /// I can service IO" and the only escape is a STATUS=0 MMIO
+    /// write. This converges with cloud-hypervisor's NEEDS_RESET
+    /// path on hostile-guest queue corruption (NOT the FAILED status
+    /// = 0x80, which is the orthogonal "driver gives up" exit per
+    /// virtio-v1.2 §2.1.1 bit 0x80 — the framework is signalling
+    /// "device needs reset", not "driver gave up").
     ///
     /// Per-worker (not on the shared counters Arc) because only
     /// the drain thread mutates it. Cfg-independent so both
@@ -1016,7 +1022,22 @@ pub struct VirtioBlk {
     pub(crate) device_features_sel: u32,
     pub(crate) driver_features_sel: u32,
     pub(crate) driver_features: u64,
-    pub(crate) device_status: u32,
+    /// FSM state bits per virtio-v1.2 §3.1.1 plus the
+    /// `VIRTIO_CONFIG_S_NEEDS_RESET` bit set by `drain_bracket_impl`
+    /// when the avail ring becomes structurally invalid (the
+    /// queue-poison path). `Arc<AtomicU32>` so the worker thread can
+    /// fetch_or the NEEDS_RESET bit alongside its INT_CONFIG +
+    /// `irq_evt.write(1)` poison-signal sequence; the vCPU thread
+    /// reads `STATUS` via `load(Acquire)` from `mmio_read` and writes
+    /// it via the FSM in `set_status` / `reset`. Atomic ordering
+    /// taxonomy: vCPU writes use `store(val, Release)` (set_status,
+    /// reset); vCPU reads use `load(Acquire)` (mmio_read,
+    /// queue_config_allowed, features_write_allowed); the worker
+    /// uses `fetch_or(NEEDS_RESET, SeqCst)` on the queue-poison
+    /// path. The reset path is a single `store(0, Release)` —
+    /// device_status has no AcqRel RMW site. Mirrors the
+    /// [`Self::interrupt_status`] shape and rationale.
+    pub(crate) device_status: Arc<AtomicU32>,
     /// Worker may be on a separate thread (production cfg) and the
     /// vCPU MMIO reader may race the worker's bit-set, so the value
     /// is wrapped in an `Arc` and updated with atomic ops. Worker
@@ -1148,6 +1169,7 @@ impl VirtioBlk {
         };
 
         let interrupt_status = Arc::new(AtomicU32::new(0));
+        let device_status = Arc::new(AtomicU32::new(0));
         let mem = Arc::new(OnceLock::new());
         let mem_unset_warned = Arc::new(AtomicBool::new(false));
 
@@ -1198,6 +1220,7 @@ impl VirtioBlk {
             let worker_mem = Arc::clone(&mem);
             let worker_irq = Arc::clone(&irq_evt);
             let worker_status = Arc::clone(&interrupt_status);
+            let worker_device_status = Arc::clone(&device_status);
             let worker_warned = Arc::clone(&mem_unset_warned);
             let handle = thread::Builder::new()
                 .name("ktstr-vblk".to_string())
@@ -1208,6 +1231,7 @@ impl VirtioBlk {
                         worker_mem,
                         worker_irq,
                         worker_status,
+                        worker_device_status,
                         worker_warned,
                         worker_kick,
                         worker_stop,
@@ -1234,7 +1258,7 @@ impl VirtioBlk {
             device_features_sel: 0,
             driver_features_sel: 0,
             driver_features: 0,
-            device_status: 0,
+            device_status,
             interrupt_status,
             config_generation: AtomicU32::new(0),
             irq_evt,
@@ -1360,11 +1384,13 @@ impl VirtioBlk {
     }
 
     pub(crate) fn queue_config_allowed(&self) -> bool {
-        self.device_status & S_FEAT == S_FEAT && self.device_status & VIRTIO_CONFIG_S_DRIVER_OK == 0
+        let status = self.device_status.load(Ordering::Acquire);
+        status & S_FEAT == S_FEAT && status & VIRTIO_CONFIG_S_DRIVER_OK == 0
     }
 
     pub(crate) fn features_write_allowed(&self) -> bool {
-        self.device_status & S_DRV == S_DRV && self.device_status & VIRTIO_CONFIG_S_FEATURES_OK == 0
+        let status = self.device_status.load(Ordering::Acquire);
+        status & S_DRV == S_DRV && status & VIRTIO_CONFIG_S_FEATURES_OK == 0
     }
 
     /// Classify a request type into a "pre-throttle terminal status"
@@ -1494,6 +1520,7 @@ impl VirtioBlk {
             mem,
             &self.irq_evt,
             &self.interrupt_status,
+            &self.device_status,
         );
     }
 }
@@ -1567,6 +1594,7 @@ pub(crate) fn drain_bracket_impl(
     mem: &GuestMemoryMmap,
     irq_evt: &EventFd,
     interrupt_status: &AtomicU32,
+    device_status: &AtomicU32,
 ) -> DrainOutcome {
     // Pre-rebind / post-reset gate. After `q.reset()` clears the
     // queue (zeroing desc/avail/used GPAs and `ready`), there is
@@ -1750,6 +1778,85 @@ pub(crate) fn drain_bracket_impl(
                          avail.idx-distance violation); poisoning queue \
                          until guest reset"
                     );
+                    // Surface the structural failure as an
+                    // observability signal:
+                    //
+                    // 1. NEEDS_RESET in the device_status FSM is
+                    //    visible to the guest via
+                    //    `mmio_read(VIRTIO_MMIO_STATUS)` and to the
+                    //    host operator via sysfs / failure-dump. It
+                    //    is the spec-compliant way (virtio-v1.2
+                    //    §2.1.1, bit 0x40) for a device to advertise
+                    //    "I need to be reset before I can service
+                    //    IO." Cloud-hypervisor uses the same bit for
+                    //    its hostile-guest shutdown path.
+                    // 2. INT_CONFIG + irq_evt.write trigger the
+                    //    guest IRQ path through
+                    //    `vm_interrupt → virtio_config_changed →
+                    //    __virtio_config_changed → drv->config_changed`
+                    //    (drivers/virtio/virtio_mmio.c). For
+                    //    virtio_blk the `config_changed` callback
+                    //    (`virtblk_config_changed`) only re-reads
+                    //    config-space CAPACITY — it does NOT
+                    //    automatically surface NEEDS_RESET to blk-mq
+                    //    or fail in-flight requests. So this
+                    //    sequence is a SIGNAL to the guest, not a
+                    //    recovery primitive: the guest's behavior
+                    //    on a poisoned queue depends on whatever
+                    //    higher-layer logic reads STATUS.
+                    //
+                    // The actual request-stopping defense is the
+                    // `state.queue_poisoned` gate at the top of
+                    // `drain_bracket_impl`: every subsequent drain
+                    // short-circuits to `Done`, so no chain ever
+                    // gets `add_used`-published. In-flight requests
+                    // hang until the guest's hung-task watchdog
+                    // fires (default 120 s, virtio_blk has no
+                    // `mq_ops->timeout`) or a reset arrives. The
+                    // NEEDS_RESET signal here gives operators the
+                    // STATUS-read tool to detect the wedged state
+                    // before the watchdog fires; it does not
+                    // unwedge anything on its own.
+                    //
+                    // Fired exactly once at the poison transition:
+                    // the queue_poisoned gate above this arm's
+                    // entry returns `Done` for every subsequent
+                    // kick, so re-kicks never re-enter this arm.
+                    //
+                    // SeqCst on the device_status fetch_or pairs
+                    // with the vCPU MMIO read of STATUS via
+                    // load(Acquire) so the post-poison read reflects
+                    // the bit. The interrupt_status fetch_or uses
+                    // Release ordering to mirror the existing
+                    // INT_VRING write-side discipline at the V8
+                    // publish-path INTERRUPT_STATUS bit-set.
+                    device_status.fetch_or(VIRTIO_CONFIG_S_NEEDS_RESET, Ordering::SeqCst);
+                    interrupt_status.fetch_or(VIRTIO_MMIO_INT_CONFIG, Ordering::Release);
+                    // SAFETY: EAGAIN requires counter saturation at
+                    // u64::MAX-1 (~1.8e19 unobserved kicks) —
+                    // implausible. EBADF means the fd closed during
+                    // shutdown. The simultaneously-set INT_CONFIG
+                    // bit above is the enduring guest-visible
+                    // signal: `vm_interrupt`
+                    // (drivers/virtio/virtio_mmio.c) reads
+                    // INTERRUPT_STATUS on the next IRQ delivery and
+                    // dispatches via the bit set — but on the
+                    // poison path NO subsequent device IRQ fires.
+                    // The queue_poisoned gate makes every later
+                    // drain short-circuit to `Done` without ever
+                    // calling `add_used` or triggering another
+                    // signal, so a missed irqfd write here means
+                    // the operator's only path to seeing the
+                    // NEEDS_RESET state is `mmio_read(STATUS)` —
+                    // which still works because the bit is on
+                    // device_status. The guest's actual recovery
+                    // path is a STATUS=0 reset, driven by the
+                    // hung-task watchdog or operator action. We log
+                    // any errno so a failed write surfaces in
+                    // tracing rather than silently disappearing.
+                    if let Err(e) = irq_evt.write(1) {
+                        tracing::warn!(%e, "virtio-blk irq_evt.write failed");
+                    }
                     break 'outer;
                 }
                 Err(e) => {
@@ -2462,12 +2569,14 @@ pub(crate) fn drain_bracket_impl(
     }
     if signal_needed {
         // V8: always set the interrupt_status MMIO bit when
-        // anything was published. The bit is the guest-visible
-        // "there's pending work in the used ring" indicator,
-        // independent of the irqfd delivery decision. Holding
-        // the bit set across a suppressed eventfd is harmless:
-        // the next genuine IRQ delivers and the guest's ISR
-        // reads-then-clears via VIRTIO_MMIO_INTERRUPT_ACK.
+        // anything was published. The bit-set on `interrupt_status`
+        // is the IRQ-handler handshake target — `vm_interrupt`
+        // (drivers/virtio/virtio_mmio.c) reads and acks it on each
+        // IRQ delivery. The guest does NOT poll this register; it
+        // only consults it from inside the IRQ handler. If the irqfd
+        // write fails, the guest never enters `vm_interrupt` and the
+        // queue stalls — the bit remaining set is harmless on its
+        // own; only IRQ delivery makes the guest read it.
         // Release-ordered fetch_or so the bit-set happens-after
         // the chain's add_used publish. The SeqCst fence inside
         // needs_notification then orders all prior writes
@@ -2507,7 +2616,24 @@ pub(crate) fn drain_bracket_impl(
             )
             .unwrap_or(true)
         {
-            let _ = irq_evt.write(1);
+            // SAFETY: EAGAIN requires counter saturation at u64::MAX-1
+            // (~1.8e19 unobserved kicks) — implausible. EBADF means
+            // the fd closed during shutdown. The simultaneously-set
+            // INT_VRING bit at the `interrupt_status.fetch_or` above
+            // is the next IRQ handler's read target — but only if a
+            // SUBSEQUENT request fires `irq_evt.write` successfully.
+            // For the last chain in a burst with no follow-on
+            // traffic, a missed write means the queue stalls until
+            // hung_task_timeout (default 120s; virtio_blk has no
+            // `mq_ops->timeout`). The recovery path here is the
+            // next add_used + needs_notification cycle (the next
+            // request's publish reaches this site again), NOT a
+            // kernel timer (virtio_mmio has no periodic wake
+            // mechanism). We log any errno so a failed write
+            // surfaces in tracing rather than silently disappearing.
+            if let Err(e) = irq_evt.write(1) {
+                tracing::warn!(%e, "virtio-blk irq_evt.write failed");
+            }
         }
     }
     match stall_outcome {
@@ -2947,7 +3073,7 @@ impl VirtioBlk {
                 .map(|i| self.worker.queues[i].ready() as u32)
                 .unwrap_or(0),
             VIRTIO_MMIO_INTERRUPT_STATUS => self.interrupt_status.load(Ordering::Acquire),
-            VIRTIO_MMIO_STATUS => self.device_status,
+            VIRTIO_MMIO_STATUS => self.device_status.load(Ordering::Acquire),
             VIRTIO_MMIO_CONFIG_GENERATION => self.config_generation.load(Ordering::Acquire),
             _ => 0,
         };
@@ -3155,7 +3281,25 @@ impl VirtioBlk {
     /// to confirm the bit stuck. Warning on idempotent re-writes
     /// would pollute operator logs without surfacing real bugs.
     pub(crate) fn set_status(&mut self, val: u32) {
-        if val & self.device_status != self.device_status {
+        // Snapshot the current FSM state once. `set_status` runs on
+        // the vCPU thread that received the MMIO write and mutates
+        // device_status sequentially within this function. The
+        // production worker thread's only write site to
+        // device_status is the `fetch_or(NEEDS_RESET, SeqCst)` on
+        // the queue-poison path — and the worker's lifecycle
+        // invariant forbids that write from racing with set_status:
+        // the worker is alive only between DRIVER_OK and the next
+        // reset (set_status spawning it via `consume_pending_respawn`,
+        // reset_engine_spawned joining it before any further FSM
+        // movement). During the rebind window between reset() and
+        // the next DRIVER_OK there is no live worker, so the FSM
+        // walk through ACK → DRIVER → FEATURES_OK observes a
+        // single-writer device_status. The Acquire load is
+        // defense-in-depth ordering against any future cross-thread
+        // writer; today the snapshot is correct purely because of
+        // the lifecycle gate.
+        let current_status = self.device_status.load(Ordering::Acquire);
+        if val & current_status != current_status {
             // The driver attempted to clear a previously-set bit
             // without going through the STATUS=0 reset path. Per
             // virtio-v1.2 §3.1.1 status bits are monotone within
@@ -3165,7 +3309,7 @@ impl VirtioBlk {
             // ACKNOWLEDGE) surfaces in the operator's log instead
             // of vanishing silently.
             tracing::warn!(
-                device_status = self.device_status,
+                device_status = current_status,
                 requested = val,
                 "virtio-blk set_status rejected — attempted to clear \
                  a previously-set status bit without a full reset \
@@ -3174,7 +3318,7 @@ impl VirtioBlk {
             );
             return;
         }
-        let new_bits = val & !self.device_status;
+        let new_bits = val & !current_status;
         // Idempotent re-write of the current device_status: the
         // monotone-bit gate above passed (val is a superset) AND
         // the requested value adds no new bits. This is a
@@ -3190,18 +3334,18 @@ impl VirtioBlk {
             return;
         }
         let valid = match new_bits {
-            VIRTIO_CONFIG_S_ACKNOWLEDGE => self.device_status == 0,
-            VIRTIO_CONFIG_S_DRIVER => self.device_status == S_ACK,
+            VIRTIO_CONFIG_S_ACKNOWLEDGE => current_status == 0,
+            VIRTIO_CONFIG_S_DRIVER => current_status == S_ACK,
             VIRTIO_CONFIG_S_FEATURES_OK => {
-                self.device_status == S_DRV
+                current_status == S_DRV
                     && self.driver_features & (1u64 << VIRTIO_F_VERSION_1) != 0
                     && self.driver_features & !self.device_features() == 0
             }
-            VIRTIO_CONFIG_S_DRIVER_OK => self.device_status == S_FEAT,
+            VIRTIO_CONFIG_S_DRIVER_OK => current_status == S_FEAT,
             _ => false,
         };
         if valid {
-            self.device_status = val;
+            self.device_status.store(val, Ordering::Release);
             // Once FEATURES_OK is committed, feature negotiation is
             // closed (virtio-v1.2 §3.1.1) — the negotiated set lives
             // in `driver_features` and the device may rely on it.
@@ -3245,7 +3389,7 @@ impl VirtioBlk {
         // sub-conditions beyond simple ordering (subset rule +
         // VERSION_1 mandate); other rejections cite the FSM
         // ordering violation directly.
-        if new_bits == VIRTIO_CONFIG_S_FEATURES_OK && self.device_status == S_DRV {
+        if new_bits == VIRTIO_CONFIG_S_FEATURES_OK && current_status == S_DRV {
             // FEATURES_OK with the right ordering but the driver
             // failed the feature-set rules. Report VERSION_1
             // missing first (most common failure mode for a
@@ -3279,7 +3423,7 @@ impl VirtioBlk {
             // device_status + new_bits lets an operator identify the
             // ordering violation without rederiving the FSM.
             tracing::warn!(
-                device_status = self.device_status,
+                device_status = current_status,
                 requested = val,
                 new_bits = new_bits,
                 "virtio-blk set_status rejected — illegal FSM transition \
@@ -3369,7 +3513,11 @@ impl VirtioBlk {
         // NOT cleared here because the worker thread (production)
         // may still race-fire `irq_evt.write(1)` and bit-set
         // INT_VRING; we clear it only after the worker is joined.
-        self.device_status = 0;
+        // `device_status` is also deferred to Phase 3 for the same
+        // reason: the worker's queue-poison path can fetch_or
+        // NEEDS_RESET concurrently with this reset(), and clearing
+        // it before the worker is joined would let a phantom
+        // NEEDS_RESET bit re-set itself between Phase 1 and Phase 2.
         self.queue_select = 0;
         self.device_features_sel = 0;
         self.driver_features_sel = 0;
@@ -3415,14 +3563,20 @@ impl VirtioBlk {
 
         // Phase 3 — quiesce the IRQ path. With the worker stopped
         // (production) or never-active (test), no new
-        // `irq_evt.write(1)` or `interrupt_status` bit-set can
-        // race us. Drain the eventfd's pending counter so a stale
-        // worker write (delivered between the last add_used and
-        // the stop signal) doesn't fire a phantom IRQ at the
-        // post-reset guest, and zero `interrupt_status` so the
-        // guest's MMIO read of INTERRUPT_STATUS observes a clean
-        // slate. Release-ordered store pairs with the `mmio_read`
-        // Acquire load.
+        // `irq_evt.write(1)`, `interrupt_status` bit-set, or
+        // `device_status` fetch_or(NEEDS_RESET) can race us. Drain
+        // the eventfd's pending counter so a stale worker write
+        // (delivered between the last add_used and the stop signal)
+        // doesn't fire a phantom IRQ at the post-reset guest; zero
+        // `interrupt_status` so the guest's MMIO read of
+        // INTERRUPT_STATUS observes a clean slate; zero
+        // `device_status` so the guest re-reads STATUS=0 and walks
+        // the FSM from scratch (per virtio-v1.2 §3.1.1: a reset
+        // returns the device to its initial state including all FSM
+        // bits — the NEEDS_RESET bit set by the worker's
+        // queue-poison path is part of that state and clears here).
+        // Both stores are Release-ordered to pair with their
+        // respective `mmio_read` Acquire loads.
         //
         // Race window: a worker that completed `add_used` +
         // `irq_evt.write(1)` after the vCPU latched STATUS=0 but
@@ -3431,9 +3585,18 @@ impl VirtioBlk {
         // GSI to the guest after reset, with the used ring now
         // empty (post-`q.reset()`), causing the guest's
         // `virtblk_done` to spin chasing a non-existent
-        // completion. Draining here closes that window.
+        // completion. Draining here closes that window. The
+        // device_status store deferral closes the parallel window
+        // for the queue-poison path: a worker that ran
+        // `fetch_or(NEEDS_RESET)` after Phase 1 but before being
+        // joined would otherwise leave the bit set after reset,
+        // and the guest's FSM walk from STATUS=0 → ACK → DRIVER →
+        // FEATURES_OK → DRIVER_OK would silently transition
+        // through a "device still says NEEDS_RESET" state visible
+        // through `mmio_read(STATUS)`.
         let _ = self.irq_evt.read();
         self.interrupt_status.store(0, Ordering::Release);
+        self.device_status.store(0, Ordering::Release);
     }
 
     /// Test-mode engine reset: queue mutation and bucket rebuild
@@ -3830,6 +3993,7 @@ impl VirtioBlk {
         let worker_mem = Arc::clone(&self.mem);
         let worker_irq = Arc::clone(&self.irq_evt);
         let worker_status = Arc::clone(&self.interrupt_status);
+        let worker_device_status = Arc::clone(&self.device_status);
         let worker_warned = Arc::clone(&self.mem_unset_warned);
 
         let handle = match thread::Builder::new()
@@ -3841,6 +4005,7 @@ impl VirtioBlk {
                     worker_mem,
                     worker_irq,
                     worker_status,
+                    worker_device_status,
                     worker_warned,
                     worker_kick,
                     worker_stop,

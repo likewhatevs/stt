@@ -68,8 +68,25 @@ impl KtstrVm {
         let com2 = Arc::new(PiMutex::new(console::Serial::new(console::COM2_BASE)));
 
         // Register serial EventFds with KVM's irqfd for interrupt-driven TX.
+        // Split-irqchip mode lacks IOAPIC routing (LAPIC-only kernel
+        // emulation; PIC/IOAPIC live in userspace and the framework
+        // does not implement the userspace IOAPIC dispatch). Without
+        // an IRQ delivery path the guest's serial driver hangs on the
+        // first TX/RX wake — the kernel uart driver has no polling
+        // fallback. Reject loudly so test setups exceeding the
+        // 8-bit xAPIC limit (max APIC ID > 254) are caught here
+        // instead of producing a silent guest hang.
         #[cfg(target_arch = "x86_64")]
-        if !vm.split_irqchip {
+        if vm.split_irqchip {
+            anyhow::bail!(
+                "serial COM1/COM2 require irqfd; split-irqchip mode \
+                 has no IOAPIC and the kernel uart driver has no \
+                 polling fallback — reduce topology so all APIC IDs \
+                 are at or below 254 (MAX_XAPIC_ID)",
+            );
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
             vm.vm_fd
                 .register_irqfd(com1.lock().irq_evt(), console::COM1_IRQ)
                 .context("register COM1 irqfd")?;

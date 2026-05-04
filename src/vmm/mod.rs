@@ -454,8 +454,20 @@ impl KtstrVm {
         vc.set_mem((*vm.guest_mem).clone());
         let virtio_con = Arc::new(PiMutex::new(vc));
 
+        // Split-irqchip rejection: see freeze_coord.rs run_vm for the
+        // full rationale. Without an IOAPIC, COM1/COM2/virtio-console
+        // have no IRQ delivery path and the guest hangs on first I/O.
         #[cfg(target_arch = "x86_64")]
-        if !vm.split_irqchip {
+        if vm.split_irqchip {
+            anyhow::bail!(
+                "interactive shell requires irqfd; split-irqchip mode \
+                 has no IOAPIC and the guest's serial / virtio-console \
+                 drivers have no polling fallback — reduce topology \
+                 so all APIC IDs are at or below 254 (MAX_XAPIC_ID)",
+            );
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
             vm.vm_fd
                 .register_irqfd(com1.lock().irq_evt(), console::COM1_IRQ)
                 .context("register COM1 irqfd")?;

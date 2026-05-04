@@ -343,7 +343,7 @@ use vm_memory::Address;
 
         // Phase B — reset.
         write_reg(&mut dev, VIRTIO_MMIO_STATUS, 0);
-        assert_eq!(dev.device_status, 0, "device_status must zero on reset");
+        assert_eq!(dev.device_status.load(Ordering::Acquire), 0, "device_status must zero on reset");
 
         // Phase C — model the guest's re-bind: zero the guest's
         // avail.idx and used.idx in guest memory. avail.idx lives
@@ -701,7 +701,7 @@ use vm_memory::Address;
         write_reg(&mut dev, VIRTIO_MMIO_STATUS, 0);
         // device_status is now 0; queue_config_allowed returns
         // false (requires S_FEAT set + DRIVER_OK clear).
-        assert_eq!(dev.device_status, 0);
+        assert_eq!(dev.device_status.load(Ordering::Acquire), 0);
         // Attempt a queue config write without re-running the
         // FSM. Must be silently dropped.
         write_reg(&mut dev, VIRTIO_MMIO_QUEUE_DESC_LOW, 0xCAFE_BABE);
@@ -1012,7 +1012,7 @@ use vm_memory::Address;
         write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_DRV);
         // Skipping FEATURES_OK is rejected.
         write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_OK);
-        assert_eq!(dev.device_status, S_DRV);
+        assert_eq!(dev.device_status.load(Ordering::Acquire), S_DRV);
     }
 
     /// FEATURES_OK transition rejected when VIRTIO_F_VERSION_1 is
@@ -1048,7 +1048,7 @@ use vm_memory::Address;
         // Attempt FEATURES_OK without VIRTIO_F_VERSION_1: rejected.
         write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_FEAT);
         assert_eq!(
-            dev.device_status, S_DRV,
+            dev.device_status.load(Ordering::Acquire), S_DRV,
             "FEATURES_OK must be rejected when VIRTIO_F_VERSION_1 is not negotiated",
         );
 
@@ -1063,7 +1063,7 @@ use vm_memory::Address;
         );
         write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_FEAT);
         assert_eq!(
-            dev.device_status, S_FEAT,
+            dev.device_status.load(Ordering::Acquire), S_FEAT,
             "FEATURES_OK must be accepted once VIRTIO_F_VERSION_1 is in driver_features",
         );
     }
@@ -1073,7 +1073,7 @@ use vm_memory::Address;
         let mut dev = make_device(VIRTIO_BLK_DEFAULT_CAPACITY_BYTES, DiskThrottle::default());
         write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_ACK);
         write_reg(&mut dev, VIRTIO_MMIO_STATUS, 0);
-        assert_eq!(dev.device_status, 0);
+        assert_eq!(dev.device_status.load(Ordering::Acquire), 0);
     }
 
     #[test]
@@ -1304,14 +1304,15 @@ use vm_memory::Address;
     /// matching the bits set in the value written. Mirrors
     /// `virtio_console::interrupt_ack_clears_bits`.
     ///
-    /// virtio-blk does not currently use `VIRTIO_MMIO_INT_CONFIG` —
-    /// the device has no config-change events because the capacity
-    /// is fixed for the device's lifetime (set once in `new()`,
-    /// never mutated; `reset()` bumps `config_generation` only as
-    /// defense-in-depth against a hypothetical future resize path).
-    /// ACK semantics are still tested with a synthetic INT_CONFIG
-    /// bit so a future config-change path drops in without breaking
-    /// the mask logic.
+    /// virtio-blk fires `VIRTIO_MMIO_INT_CONFIG` on the
+    /// queue-poison path: when `drain_bracket_impl` observes
+    /// `Error::InvalidAvailRingIndex` (a hostile-guest avail.idx
+    /// distance violation per virtio-v1.2 §2.7.13.3), it sets
+    /// NEEDS_RESET in `device_status` and signals the guest via
+    /// the INT_CONFIG bit + irqfd. ACK semantics are exercised
+    /// here with both INT_VRING and INT_CONFIG bits set so the
+    /// mask-clear path covers the production poison-path
+    /// signalling AND the ordinary publish-path INT_VRING bit.
     #[test]
     fn interrupt_ack_clears_bits() {
         use virtio_bindings::virtio_mmio::VIRTIO_MMIO_INT_CONFIG;
@@ -1489,7 +1490,7 @@ use vm_memory::Address;
         let mut dev = make_device(VIRTIO_BLK_DEFAULT_CAPACITY_BYTES, DiskThrottle::default());
         // Skipping ACKNOWLEDGE, going straight to DRIVER.
         write_reg(&mut dev, VIRTIO_MMIO_STATUS, VIRTIO_CONFIG_S_DRIVER);
-        assert_eq!(dev.device_status, 0);
+        assert_eq!(dev.device_status.load(Ordering::Acquire), 0);
     }
 
     /// Idempotent re-write of the current `device_status` is a
@@ -1509,12 +1510,12 @@ use vm_memory::Address;
         let mut dev = make_device(VIRTIO_BLK_DEFAULT_CAPACITY_BYTES, DiskThrottle::default());
         // Reach S_ACK first via a legal transition.
         write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_ACK);
-        assert_eq!(dev.device_status, S_ACK);
+        assert_eq!(dev.device_status.load(Ordering::Acquire), S_ACK);
         // Idempotent re-write of the same value: state unchanged,
         // no warn emitted.
         write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_ACK);
         assert_eq!(
-            dev.device_status, S_ACK,
+            dev.device_status.load(Ordering::Acquire), S_ACK,
             "idempotent re-write must NOT alter device_status",
         );
         assert!(
@@ -1528,9 +1529,9 @@ use vm_memory::Address;
         // Same idempotence at later FSM states. Walk to S_DRV and
         // re-write S_DRV.
         write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_DRV);
-        assert_eq!(dev.device_status, S_DRV);
+        assert_eq!(dev.device_status.load(Ordering::Acquire), S_DRV);
         write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_DRV);
-        assert_eq!(dev.device_status, S_DRV);
+        assert_eq!(dev.device_status.load(Ordering::Acquire), S_DRV);
         assert!(
             !logs_contain("illegal FSM transition"),
             "S_DRV re-write must NOT emit the illegal-transition warn",
@@ -1556,7 +1557,7 @@ use vm_memory::Address;
             S_ACK | VIRTIO_CONFIG_S_DRIVER | VIRTIO_CONFIG_S_FEATURES_OK,
         );
         assert_eq!(
-            dev.device_status, S_ACK,
+            dev.device_status.load(Ordering::Acquire), S_ACK,
             "multi-bit transition must NOT advance device_status",
         );
         assert!(
@@ -1579,13 +1580,13 @@ use vm_memory::Address;
         // Walk to S_DRV (S_ACK | S_DRIVER set).
         write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_ACK);
         write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_DRV);
-        assert_eq!(dev.device_status, S_DRV);
+        assert_eq!(dev.device_status.load(Ordering::Acquire), S_DRV);
         // Attempt to drop S_DRIVER while keeping S_ACKNOWLEDGE.
         // val = S_ACK; val & device_status = S_ACK != device_status
         // (S_DRV) → fails the monotone-bit gate.
         write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_ACK);
         assert_eq!(
-            dev.device_status, S_DRV,
+            dev.device_status.load(Ordering::Acquire), S_DRV,
             "clear-bit attempt must NOT alter device_status",
         );
         assert!(
@@ -1616,7 +1617,7 @@ use vm_memory::Address;
     fn queue_config_rejected_after_driver_ok() {
         let mut dev = make_device(VIRTIO_BLK_DEFAULT_CAPACITY_BYTES, DiskThrottle::default());
         init_device(&mut dev);
-        assert_eq!(dev.device_status, S_OK);
+        assert_eq!(dev.device_status.load(Ordering::Acquire), S_OK);
 
         // After DRIVER_OK, queue config is rejected.
         write_reg(&mut dev, VIRTIO_MMIO_QUEUE_SEL, 0);

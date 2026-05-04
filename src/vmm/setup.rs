@@ -248,12 +248,26 @@ impl KtstrVm {
         let blk_arc = Arc::new(PiMutex::new(blk));
 
         // irqfd registration. On x86_64 with split irqchip, IOAPIC
-        // routing is unavailable; matches the virtio-console
-        // constraint and we simply skip the irqfd in that case (the
-        // guest still polls via the interrupt-status MMIO register;
-        // throughput is degraded but functional).
+        // routing is unavailable: the kernel's split-irqchip mode
+        // emulates the LAPIC in-kernel and leaves PIC/IOAPIC to
+        // userspace. The framework does not implement userspace IOAPIC
+        // dispatch for virtio-mmio, and the kernel virtio_blk driver
+        // has no `mq_ops->timeout` (drivers/block/virtio_blk.c) and no
+        // polling fallback — without an IRQ delivery path, blk-mq
+        // hangs on every request until the hung-task watchdog fires
+        // (default 120 s). Reject loudly here so a topology that
+        // exceeds the 8-bit xAPIC limit (max APIC ID > 254) surfaces
+        // immediately instead of producing a silent guest hang.
         #[cfg(target_arch = "x86_64")]
-        if !vm.split_irqchip {
+        if vm.split_irqchip {
+            anyhow::bail!(
+                "virtio-blk requires irqfd; split-irqchip mode has no \
+                 IOAPIC and the kernel virtio_mmio driver has no polling \
+                 fallback — reduce topology so all APIC IDs are at or below 254 (MAX_XAPIC_ID)",
+            );
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
             vm.vm_fd
                 .register_irqfd(blk_arc.lock().irq_evt(), kvm::VIRTIO_BLK_IRQ)
                 .context("register virtio-blk irqfd")?;
@@ -276,8 +290,8 @@ impl KtstrVm {
     ///   - the configured MAC baked into config space,
     ///   - guest memory set so subsequent `process_tx_loopback` calls
     ///     can read TX descriptor data and write into RX descriptors,
-    ///   - the irqfd registered with the VM (skipped on x86 split
-    ///     irqchip, matching virtio-blk).
+    ///   - the irqfd registered with the VM (rejected on x86 split
+    ///     irqchip via `bail!()` at line ~318, matching virtio-blk).
     ///
     /// The framework reserves a single MMIO base + IRQ pair
     /// (`VIRTIO_NET_MMIO_BASE` / `VIRTIO_NET_IRQ`); the builder's
@@ -294,13 +308,21 @@ impl KtstrVm {
         dev.set_mem((*vm.guest_mem).clone());
         let net_arc = Arc::new(PiMutex::new(dev));
 
-        // irqfd registration. On x86_64 with split irqchip, IOAPIC
-        // routing is unavailable; matches the virtio-console /
-        // virtio-blk constraint and we skip the irqfd in that case
-        // (the device still functions but the guest must rely on
-        // INT_STATUS polling for completion).
+        // irqfd registration. Same split-irqchip rejection rationale
+        // as virtio-blk above: the kernel virtio_net driver depends
+        // on IRQ-driven NAPI to wake on RX, and an undelivered IRQ
+        // produces a silent guest hang. Reject loudly so the test
+        // setup is caught here.
         #[cfg(target_arch = "x86_64")]
-        if !vm.split_irqchip {
+        if vm.split_irqchip {
+            anyhow::bail!(
+                "virtio-net requires irqfd; split-irqchip mode has no \
+                 IOAPIC and the kernel virtio_mmio driver has no polling \
+                 fallback — reduce topology so all APIC IDs are at or below 254 (MAX_XAPIC_ID)",
+            );
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
             vm.vm_fd
                 .register_irqfd(net_arc.lock().irq_evt(), kvm::VIRTIO_NET_IRQ)
                 .context("register virtio-net irqfd")?;

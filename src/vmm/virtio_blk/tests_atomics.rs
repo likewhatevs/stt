@@ -852,6 +852,7 @@ use virtio_queue::mock::MockSplitQueue;
                 mem_ref,
                 &dev.irq_evt,
                 &dev.interrupt_status,
+                &dev.device_status,
             )
         };
         // Pin the exact wait_nanos value the bucket math produces:
@@ -906,6 +907,7 @@ use virtio_queue::mock::MockSplitQueue;
                 mem_ref,
                 &dev.irq_evt,
                 &dev.interrupt_status,
+                &dev.device_status,
             )
         };
         assert_eq!(
@@ -995,6 +997,7 @@ use virtio_queue::mock::MockSplitQueue;
                 mem_ref,
                 &dev.irq_evt,
                 &dev.interrupt_status,
+                &dev.device_status,
             )
         };
         assert!(matches!(
@@ -1020,6 +1023,7 @@ use virtio_queue::mock::MockSplitQueue;
                 mem_ref,
                 &dev.irq_evt,
                 &dev.interrupt_status,
+                &dev.device_status,
             )
         };
         // Same pinned wait_nanos as outcome1 — re-stall on an
@@ -1440,6 +1444,7 @@ use virtio_queue::mock::MockSplitQueue;
                 mem_ref,
                 &dev.irq_evt,
                 &dev.interrupt_status,
+                &dev.device_status,
             )
         };
         // bytes bucket: capacity=512, rate=512, available=0,
@@ -1497,6 +1502,7 @@ use virtio_queue::mock::MockSplitQueue;
                 mem_ref,
                 &dev.irq_evt,
                 &dev.interrupt_status,
+                &dev.device_status,
             )
         };
         assert_eq!(
@@ -1673,7 +1679,7 @@ use virtio_queue::mock::MockSplitQueue;
         // STATUS read-back surfaces the failure.
         write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_FEAT);
         assert_eq!(
-            dev.device_status, S_DRV,
+            dev.device_status.load(Ordering::Acquire), S_DRV,
             "FEATURES_OK must be rejected when driver acked an \
              unadvertised feature bit (subset rule violation)",
         );
@@ -1703,7 +1709,7 @@ use virtio_queue::mock::MockSplitQueue;
         write_reg(&mut dev, VIRTIO_MMIO_DRIVER_FEATURES, 0);
         write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_FEAT);
         assert_eq!(
-            dev.device_status, S_FEAT,
+            dev.device_status.load(Ordering::Acquire), S_FEAT,
             "FEATURES_OK must be accepted once driver_features is \
              a subset of device_features (only VERSION_1 set)",
         );

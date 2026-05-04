@@ -515,8 +515,8 @@ impl VirtioNet {
     // multiple chain advances under one IRQ is correct and reduces
     // vCPU exits proportional to the burst size.
     //
-    // The `let _ = self.irq_evt.write(1)` swallow has two
-    // possible errno paths and both are safe to ignore here:
+    // The eventfd write below has two possible errno paths,
+    // both recoverable:
     //
     //   - `EAGAIN` is impossible at runtime. The eventfd is created
     //     in counter mode (no `EFD_SEMAPHORE`) with `EFD_NONBLOCK`,
@@ -530,12 +530,17 @@ impl VirtioNet {
     //     was unregistered or the EventFd dropped. There is no
     //     useful recovery — the VM is shutting down.
     //
-    // Either way, no counter bump or warn-log is appropriate; the
-    // bit-set on `interrupt_status` is the enduring signal the
-    // guest can poll if the irqfd path ever stalls.
+    // Either way, the bit-set on `interrupt_status` is the
+    // IRQ-handler handshake target — `vm_interrupt`
+    // (drivers/virtio/virtio_mmio.c) reads and acks it on each IRQ
+    // delivery. The guest does NOT poll this register. We log any
+    // errno so a failed write surfaces in tracing rather than
+    // silently disappearing.
     fn signal_used(&mut self) {
         self.interrupt_status |= VIRTIO_MMIO_INT_VRING;
-        let _ = self.irq_evt.write(1);
+        if let Err(e) = self.irq_evt.write(1) {
+            tracing::warn!(%e, "virtio-net irq_evt.write failed");
+        }
     }
 
     /// True when device_status has progressed past FEATURES_OK but
@@ -1305,16 +1310,17 @@ impl VirtioNet {
     ///      we never tested (e.g. setting the F_MQ bit even though
     ///      we didn't advertise multiqueue would have the kernel
     ///      driver read `max_virtqueue_pairs` from config space,
-    ///      which we leave at zero — the guest then falls into
-    ///      `if (max_queue_pairs < VIRTIO_NET_CTRL_MQ_VQ_PAIRS_MIN
-    ///      || ...)` and ignores its own un-offered acceptance,
-    ///      but the principle stands).
+    ///      which we leave at zero — the kernel's `if
+    ///      (max_queue_pairs < MIN || max_queue_pairs > MAX)` branch
+    ///      then resets it to 1, but the principle stands).
     ///
     /// On either violation the device sets `VIRTIO_CONFIG_S_FAILED`
     /// and refuses to advance to FEATURES_OK. The kernel driver's
-    /// `virtio_finalize_features` path observes the FAILED bit and
-    /// aborts probe with `-EIO` (`drivers/virtio/virtio.c:
-    /// virtio_finalize_features`).
+    /// `virtio_features_ok` path (drivers/virtio/virtio.c:204-235)
+    /// observes that FEATURES_OK didn't stick on the post-write
+    /// STATUS read-back and aborts probe with `-ENODEV`. The FAILED
+    /// bit we set is informational; the kernel's check is
+    /// `!(status & FEATURES_OK)`, not `status & FAILED`.
     fn set_status(&mut self, val: u32) {
         let old = self.device_status;
         // Driver must not clear bits (except via reset, which writes 0).

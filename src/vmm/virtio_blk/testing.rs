@@ -21,6 +21,7 @@
 
 use std::fs::File;
 use std::io::{Seek, Write};
+use std::sync::atomic::Ordering;
 
 use tempfile::tempfile;
 use virtio_bindings::bindings::virtio_ring::VRING_DESC_F_WRITE;
@@ -163,11 +164,12 @@ pub(super) fn wire_device_to_mock(dev: &mut VirtioBlk, mock: &MockSplitQueue<Gue
     // transition would otherwise leave the device wedged at
     // FEATURES_OK and every chain test downstream would see
     // an empty queue.
+    let status_now = dev.device_status.load(Ordering::Acquire);
     assert_eq!(
-        dev.device_status, S_OK,
+        status_now, S_OK,
         "wire_device_to_mock: FSM did not reach DRIVER_OK \
          (got {:#x}) — feature negotiation likely regressed",
-        dev.device_status,
+        status_now,
     );
 }
 
@@ -239,11 +241,12 @@ pub(super) fn wire_device_to_mock_with_event_idx(
     write_reg(dev, VIRTIO_MMIO_QUEUE_USED_HIGH, (used >> 32) as u32);
     write_reg(dev, VIRTIO_MMIO_QUEUE_READY, 1);
     write_reg(dev, VIRTIO_MMIO_STATUS, S_OK);
+    let status_now = dev.device_status.load(Ordering::Acquire);
     assert_eq!(
-        dev.device_status, S_OK,
+        status_now, S_OK,
         "wire_device_to_mock_with_event_idx: FSM did not reach \
          DRIVER_OK (got {:#x})",
-        dev.device_status,
+        status_now,
     );
     // Sanity: the device must have observed and stored the
     // EVENT_IDX bit. Without this assertion, a regression in
