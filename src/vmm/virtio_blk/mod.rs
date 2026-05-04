@@ -148,7 +148,7 @@ mod device;
 pub(crate) use device::*;
 pub use device::{
     VIRTIO_BLK_DEFAULT_CAPACITY_BYTES, VIRTIO_BLK_SECTOR_SIZE, VIRTIO_MMIO_SIZE, VirtioBlk,
-    VirtioBlkCounters,
+    VirtioBlkCounters, WorkerPlacement,
 };
 
 #[cfg(test)]

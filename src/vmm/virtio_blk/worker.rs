@@ -61,7 +61,7 @@ use vmm_sys_util::eventfd::EventFd;
 
 use super::DrainOutcome;
 #[cfg(not(test))]
-use super::{BlkQueue, BlkWorkerState, NUM_QUEUES, drain_bracket_impl};
+use super::{BlkQueue, BlkWorkerState, NUM_QUEUES, WorkerPlacement, drain_bracket_impl};
 
 /// Cap the throttle retry timer so a pathological refill rate (e.g.
 /// tens of millions of bytes per second backing a single very large
@@ -231,6 +231,7 @@ pub(crate) fn resolve_action(
 pub(crate) const KICK_TOKEN: u64 = 1;
 pub(crate) const STOP_TOKEN: u64 = 2;
 pub(crate) const THROTTLE_TOKEN: u64 = 3;
+pub(crate) const PAUSE_TOKEN: u64 = 4;
 
 /// Outcome of one epoll-event dispatch decision. Lifted to a
 /// dedicated enum so `worker_thread_main` and its unit tests
@@ -245,6 +246,21 @@ pub(crate) enum WorkerDispatchAction {
     /// just expired and the rolled-back chain may now be
     /// satisfiable.
     Drain { throttle_token_fired: bool },
+    /// PAUSE_TOKEN observed — drain the eventfd counter, set the
+    /// shared `paused` flag (Release), and park in a 10 ms
+    /// `park_timeout` loop until the freeze coordinator clears the
+    /// flag. The worker loop's existing `last_known_blocked` and
+    /// drain state survive across the pause: a stalled chain that
+    /// was rolled back stays in the avail ring; the throttle
+    /// timerfd may fire while parked but its expiry is observed on
+    /// the next `epoll_wait` iteration after resume.
+    /// Cloud-hypervisor pattern (epoll_helper.rs `pause_evt` +
+    /// `paused: Arc<AtomicBool>`): the coordinator writes 1 to the
+    /// pause eventfd, the worker observes it on `epoll_wait`, and
+    /// the rendezvous-side load on `paused` synchronizes-with the
+    /// worker's Release store so the host's subsequent guest-memory
+    /// reads happen-after the worker's last queue mutation.
+    Pause,
     /// Unknown token — log and continue without draining.
     Skip,
 }
@@ -316,6 +332,7 @@ pub(crate) fn worker_dispatch_event(event_set: EventSet, token: u64) -> WorkerDi
         THROTTLE_TOKEN => WorkerDispatchAction::Drain {
             throttle_token_fired: true,
         },
+        PAUSE_TOKEN => WorkerDispatchAction::Pause,
         _ => {
             tracing::warn!(?event_set, token, "virtio-blk worker: unknown epoll token");
             WorkerDispatchAction::Skip
@@ -330,14 +347,18 @@ pub(crate) fn worker_dispatch_event(event_set: EventSet, token: u64) -> WorkerDi
 /// at which point the loop exits and the thread terminates.
 ///
 /// Per-iteration:
-///   1. Block in `epoll_wait` until kick_fd, stop_fd, or the
-///      throttle retry timerfd is readable.
+///   1. Block in `epoll_wait` until kick_fd, stop_fd, the
+///      throttle retry timerfd, or pause_fd is readable.
 ///   2. If stop_fd readable → return (drop everything cleanly).
-///   3. If timer_fd readable (THROTTLE_TOKEN) → consume the expiry
+///   3. If pause_fd readable (PAUSE_TOKEN) → drain the eventfd
+///      counter, store `paused=true` (Release), and park in a
+///      10 ms `park_timeout` loop until the freeze coordinator
+///      clears the flag via `VirtioBlk::resume`.
+///   4. If timer_fd readable (THROTTLE_TOKEN) → consume the expiry
 ///      count (counter-mode timerfd) and fall through to drain so
 ///      the rolled-back chain can re-pop now that the bucket has
 ///      refilled.
-///   4. If kick_fd readable (KICK_TOKEN) → drain the eventfd
+///   5. If kick_fd readable (KICK_TOKEN) → drain the eventfd
 ///      counter (one read consumes any number of coalesced kicks
 ///      per the eventfd counter-mode semantics — see eventfd(2))
 ///      and run one drain iteration via `drain_bracket_impl`.
@@ -347,7 +368,15 @@ pub(crate) fn worker_dispatch_event(event_set: EventSet, token: u64) -> WorkerDi
 /// lock-free `OnceLock::get`. When `mem` is unset (kick fired before
 /// set_mem — a wiring bug), the `mem_unset_warned` latch fires once
 /// and the kick is silently dropped.
+///
+/// `placement` is applied via `pin_current_thread` /
+/// `set_thread_cpumask` BEFORE epoll setup so the entire worker
+/// lifecycle (epoll setup, drain calls, syscalls) inherits the
+/// chosen affinity. Both `service_cpu` and `no_perf_cpus` `None`
+/// means inherit the parent thread's affinity (the no-topology
+/// default); the topology layer guarantees at most one is `Some`.
 #[cfg(not(test))]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn worker_thread_main(
     mut state: BlkWorkerState,
     mut queues: [BlkQueue; NUM_QUEUES],
@@ -356,11 +385,45 @@ pub(crate) fn worker_thread_main(
     interrupt_status: Arc<AtomicU32>,
     device_status: Arc<AtomicU32>,
     mem_unset_warned: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
+    placement: WorkerPlacement,
     kick_fd: EventFd,
     stop_fd: EventFd,
+    pause_fd: EventFd,
 ) -> BlkWorkerState {
-    // epoll setup. KICK_TOKEN, STOP_TOKEN, THROTTLE_TOKEN are the
-    // `EpollEvent::data` discriminators we'll match on after
+    // Apply the configured CPU placement before any other syscall.
+    // perf-mode pins to a single CPU (cache locality + isolation
+    // from the workload-measured cpuset); `--cpu-cap` no-perf
+    // applies an LLC mask so the worker shares the LLC with the
+    // vCPUs but stays out of the workload-measured CPUs. Both
+    // `None` means the worker inherits whatever affinity the
+    // spawning thread had — typically the BSP's mask, which is
+    // already constrained to the test's resource budget. The two
+    // helpers log success / failure via eprintln; failures do NOT
+    // abort the worker (`pin_current_thread` and
+    // `set_thread_cpumask` both swallow errors after logging) so
+    // a missing CAP_SYS_NICE on a development host degrades
+    // gracefully to "shared affinity" rather than killing the
+    // device.
+    if let Some(cpu) = placement.service_cpu {
+        crate::vmm::vcpu::pin_current_thread(cpu, "virtio-blk worker");
+    } else if let Some(ref cpus) = placement.no_perf_cpus {
+        crate::vmm::vcpu::set_thread_cpumask(cpus, "virtio-blk worker");
+    }
+    // Clear the "construction-time paused" sentinel now that the
+    // worker is fully wired up and about to enter `epoll_wait`.
+    // `VirtioBlk::with_options` initialises `paused = true` so
+    // pre-spawn freezes pass the rendezvous vacuously instead of
+    // timing out waiting for a worker that does not exist; this
+    // store is the single point at which the rendezvous begins
+    // observing real worker state. Release ordering pairs with the
+    // freeze coordinator's `is_paused()` Acquire-load so a freeze
+    // that races construction sees either `true` (sentinel — pass)
+    // or `false` (worker is live — proceed to the real
+    // pause-rendezvous path). There is no third "halfway" state.
+    paused.store(false, Ordering::Release);
+    // epoll setup. KICK_TOKEN, STOP_TOKEN, THROTTLE_TOKEN, PAUSE_TOKEN
+    // are the `EpollEvent::data` discriminators we'll match on after
     // `epoll_wait` returns. Using opaque 64-bit tokens (rather than
     // the raw fd numbers, which would also work) makes the dispatch
     // intent explicit at the read site.
@@ -394,6 +457,14 @@ pub(crate) fn worker_thread_main(
         EpollEvent::new(EventSet::IN, STOP_TOKEN),
     ) {
         tracing::error!(%e, "virtio-blk worker: failed to add stop_fd to epoll; exiting");
+        return state;
+    }
+    if let Err(e) = epoll.ctl(
+        ControlOperation::Add,
+        pause_fd.as_raw_fd(),
+        EpollEvent::new(EventSet::IN, PAUSE_TOKEN),
+    ) {
+        tracing::error!(%e, "virtio-blk worker: failed to add pause_fd to epoll; exiting");
         return state;
     }
     // Throttle retry timerfd. CLOCK_MONOTONIC matches `Instant`'s
@@ -436,10 +507,10 @@ pub(crate) fn worker_thread_main(
         return state;
     }
 
-    // Three-element scratch — kick_fd, stop_fd, timer_fd are the
-    // only fds registered, so `epoll_wait` can return at most 3
-    // events per call.
-    let mut events = [EpollEvent::default(); 3];
+    // Four-element scratch — kick_fd, stop_fd, timer_fd, pause_fd
+    // are the only fds registered, so `epoll_wait` can return at
+    // most 4 events per call.
+    let mut events = [EpollEvent::default(); 4];
     // Worker-local "we know the throttle is blocked" flag.
     // Set when `drain_bracket_impl` returns ThrottleStalled and
     // we arm the retry timerfd; cleared when THROTTLE_TOKEN
@@ -555,6 +626,67 @@ pub(crate) fn worker_thread_main(
                         // larger than capacity).
                         last_known_blocked = false;
                     }
+                }
+                WorkerDispatchAction::Pause => {
+                    // Signal the freeze coordinator we are parked.
+                    // Release ordering pairs with the coordinator's
+                    // `paused.load(Acquire)` rendezvous poll: the
+                    // load synchronizes-with this store, so the
+                    // coordinator's subsequent guest-memory reads
+                    // happen-after every queue mutation the worker
+                    // performed before this point. This mirrors
+                    // the vCPU rendezvous's `parked.store(Release)`
+                    // pattern in [`exit_dispatch::handle_freeze`].
+                    paused.store(true, Ordering::Release);
+                    // Park until the coordinator clears the flag.
+                    // `park_timeout(10ms)` is the same poll cadence
+                    // the vCPU rendezvous uses — short enough that
+                    // resume is responsive, long enough that an
+                    // unwoken park does not spin-burn the worker
+                    // CPU. Acquire-load synchronizes-with the
+                    // coordinator's `paused.store(false, Release)`
+                    // in [`VirtioBlk::resume`].
+                    while paused.load(Ordering::Acquire) {
+                        std::thread::park_timeout(std::time::Duration::from_millis(10));
+                    }
+                    // Drain the pause eventfd counter AFTER the
+                    // park completes so a multi-coordinator race —
+                    // a second `pause()` write that lands between
+                    // a hypothetical drain-before-park and the
+                    // `paused.store(true)` — cannot leave a stale
+                    // `1` in the counter. By the time we reach this
+                    // read, the rendezvous has cleared `paused`
+                    // (Release-store from `resume()`), so any new
+                    // pause-side write would have already produced
+                    // a fresh PAUSE_TOKEN that we'll observe on the
+                    // next `epoll_wait` — which only matters if a
+                    // counter is left readable. Reading here drains
+                    // every coalesced `1` accumulated during the
+                    // park (counter mode: single read returns the
+                    // accumulated value and resets to 0), so the
+                    // next iteration's `epoll_wait` blocks
+                    // correctly until a fresh pause/kick/stop
+                    // arrives. Cloud-hypervisor's epoll_helper.rs
+                    // uses the same drain-after-resume ordering.
+                    match pause_fd.read() {
+                        Ok(_) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(e) => {
+                            tracing::warn!(
+                                %e,
+                                "virtio-blk worker: pause_fd read failed",
+                            );
+                        }
+                    }
+                    // Resume: continue the outer loop iteration.
+                    // We do NOT set should_drain here; if a kick
+                    // landed during the pause window, KICK_TOKEN
+                    // re-fired in the same `events[..n]` batch
+                    // (epoll readiness is level-triggered) and
+                    // `should_drain` is already true from that arm.
+                    // If no kick landed, the next epoll_wait blocks
+                    // until a real event fires. Either way the
+                    // pause arm is correct without forcing a drain.
                 }
                 WorkerDispatchAction::Skip => {
                     // Unknown token already logged by
@@ -1083,13 +1215,49 @@ mod tests {
         );
     }
 
+    /// `worker_dispatch_event` routes PAUSE_TOKEN with EventSet::IN
+    /// to `Pause`. The pause action drives the freeze-coordinator
+    /// rendezvous: the worker drains pause_fd, stores `paused=true`
+    /// (Release), and parks until the coordinator clears the flag.
+    /// Pins the dispatch contract so a regression that drops the
+    /// PAUSE_TOKEN arm (or routes it to `Skip`) breaks this test
+    /// before the freeze rendezvous breaks in production.
+    #[test]
+    fn worker_dispatch_pause_token_clean() {
+        assert_eq!(
+            worker_dispatch_event(EventSet::IN, PAUSE_TOKEN),
+            WorkerDispatchAction::Pause,
+        );
+    }
+
+    /// EPOLLERR | IN on PAUSE_TOKEN still pauses. eventfd EPOLLERR
+    /// fires only on counter saturation (count == ULLONG_MAX), which
+    /// is implausible for the pause path because every `pause()` is
+    /// paired with a `resume()`-side counter drain. Mirrors the
+    /// KICK/STOP/THROTTLE EPOLLERR sibling tests so a future change
+    /// that short-circuits on EPOLLERR before reaching the token
+    /// match would break this test before it broke the rendezvous.
+    #[test]
+    fn worker_dispatch_pause_token_with_epollerr_still_pauses() {
+        let event_set = EventSet::IN | EventSet::ERROR;
+        assert_eq!(
+            worker_dispatch_event(event_set, PAUSE_TOKEN),
+            WorkerDispatchAction::Pause,
+            "EPOLLERR on pause_fd must fall through to the pause arm \
+             so the post-park drain clears the saturated counter",
+        );
+    }
+
     /// Unknown token dispatches to `Skip` and the worker loop
     /// continues without draining. Defends against a future
     /// regression that registers an additional fd on the same
     /// epoll without extending the dispatch match.
+    /// Tokens 0 and 5..=u64::MAX are guaranteed unknown; tokens
+    /// 1..=4 are KICK_TOKEN/STOP_TOKEN/THROTTLE_TOKEN/PAUSE_TOKEN
+    /// respectively and are excluded.
     #[test]
     fn worker_dispatch_unknown_token_skips() {
-        for token in [0u64, 4, 99, u64::MAX] {
+        for token in [0u64, 5, 99, u64::MAX] {
             assert_eq!(
                 worker_dispatch_event(EventSet::IN, token),
                 WorkerDispatchAction::Skip,

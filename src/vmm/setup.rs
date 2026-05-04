@@ -244,6 +244,25 @@ impl KtstrVm {
 
         let mut blk =
             virtio_blk::VirtioBlk::with_options(backing, capacity, disk.throttle, disk.read_only);
+        // Worker placement extracted from the host-topology plan.
+        // Perf-mode produces `pinning_plan.service_cpu` (a dedicated
+        // host CPU reserved away from vCPU pins) — the worker pins
+        // there to keep its cache footprint out of the workload-
+        // measured cpuset. Non-perf + `--cpu-cap` produces
+        // `no_perf_plan.cpus` (the LLC mask shared with vCPUs); the
+        // worker shares the LLC but stays inside the resource budget.
+        // The two paths are orthogonal (perf-mode never has
+        // `no_perf_plan` and vice versa); both `None` means inherit
+        // the parent's affinity (degraded-sysfs / non-cap-set
+        // fallback). The setter only takes effect on the next worker
+        // spawn — `with_options` deferred initial spawn to DRIVER_OK
+        // (matching the respawn path), so this call lands inside the
+        // window and the first worker observes the placement.
+        let placement = virtio_blk::WorkerPlacement {
+            service_cpu: self.pinning_plan.as_ref().and_then(|p| p.service_cpu),
+            no_perf_cpus: self.no_perf_plan.as_ref().map(|p| p.cpus.clone()),
+        };
+        blk.set_worker_placement(placement);
         blk.set_mem((*vm.guest_mem).clone());
         let blk_arc = Arc::new(PiMutex::new(blk));
 
@@ -291,7 +310,7 @@ impl KtstrVm {
     ///   - guest memory set so subsequent `process_tx_loopback` calls
     ///     can read TX descriptor data and write into RX descriptors,
     ///   - the irqfd registered with the VM (rejected on x86 split
-    ///     irqchip via `bail!()` at line ~318, matching virtio-blk).
+    ///     irqchip via `bail!()` below, matching virtio-blk).
     ///
     /// The framework reserves a single MMIO base + IRQ pair
     /// (`VIRTIO_NET_MMIO_BASE` / `VIRTIO_NET_IRQ`); the builder's

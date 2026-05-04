@@ -87,7 +87,7 @@ const EXCEPTIONS: &[(&str, usize)] = &[
     ("vmm/host_topology.rs", 4906),
     ("monitor/bpf_map.rs", 4829),
     ("monitor/mod.rs", 4361),
-    ("vmm/virtio_blk/device.rs", 4488),
+    ("vmm/virtio_blk/device.rs", 4774),
     ("monitor/btf_offsets.rs", 3904),
     ("monitor/reader.rs", 3655),
     ("monitor/dump.rs", 3651),

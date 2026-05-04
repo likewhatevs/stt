@@ -933,6 +933,10 @@ impl BlkWorker {
 /// Spawned-mode engine state (production only). The mutable
 /// `BlkWorkerState` lives entirely on the worker thread; the device
 /// retains only a kick eventfd, a stop eventfd, and the join handle.
+/// The pause-eventfd write side lives on `VirtioBlk::pause_evt`
+/// (cfg-independent) so `pause()` / `resume()` compile in `cfg(test)`
+/// without an engine match — the worker's read clone is taken at
+/// spawn time and consumed by `worker_thread_main`'s frame.
 #[cfg(not(test))]
 pub(crate) struct SpawnedEngine {
     /// Eventfd written by `mmio_write(QUEUE_NOTIFY, …)`; the worker
@@ -1108,6 +1112,50 @@ pub struct VirtioBlk {
     /// log correlation: pointers fingerprint the host's ASLR
     /// layout, an integer counter does not.
     pub(crate) instance_id: u64,
+    /// Pause eventfd (host-side handle). [`Self::pause`] writes 1 to
+    /// signal the worker; the worker reads the counter and parks on
+    /// [`Self::paused`]. Shared `Arc` because the worker owns a clone
+    /// for its epoll registration and the device retains this handle
+    /// for `pause()`/`resume()` calls from the freeze coordinator.
+    /// Cfg-independent so [`Self::pause`] / [`Self::resume`] compile
+    /// in `cfg(test)` builds (where the inline engine is a no-op
+    /// because the worker thread does not exist).
+    pub(crate) pause_evt: Arc<EventFd>,
+    /// Worker-parked indicator. Set to `true` by the worker thread
+    /// after it drains `pause_fd` and is parked in the
+    /// `park_timeout`-loop; the freeze coordinator polls this with
+    /// `load(Acquire)` to confirm the worker has reached its parked
+    /// state before reading guest memory. Cleared by [`Self::resume`]
+    /// (Release-store of `false`); the worker's `park_timeout(10ms)`
+    /// observes the clear within 10 ms and resumes its `epoll_wait`
+    /// loop.
+    pub(crate) paused: Arc<AtomicBool>,
+    /// Per-thread CPU placement applied at the top of
+    /// `worker_thread_main` before the worker enters its `epoll_wait`
+    /// loop. Mirrors the host topology's perf-mode (`pin_target`) and
+    /// `--cpu-cap` no-perf (`no_perf_cpus`) split: at most one of the
+    /// two is `Some`, both `None` means inherit the parent thread's
+    /// affinity (no placement applied). Set via
+    /// [`Self::set_worker_placement`] after `with_options`; defaults
+    /// to all-`None` so the device works in test fixtures and call
+    /// sites that don't supply topology data.
+    pub(crate) worker_placement: WorkerPlacement,
+}
+
+/// CPU placement for the virtio-blk worker thread. Threaded into
+/// `worker_thread_main` and applied via `pin_current_thread` /
+/// `set_thread_cpumask` at the top of the worker before entering
+/// `epoll_wait`. Mutually exclusive: perf-mode picks a single CPU,
+/// `--cpu-cap` no-perf picks an LLC mask, both `None` means inherit
+/// the parent thread's affinity (the test/inline path).
+#[derive(Debug, Clone, Default)]
+pub struct WorkerPlacement {
+    /// Single CPU pin (perf-mode). Equivalent to
+    /// `pin_current_thread(cpu, "virtio-blk worker")`.
+    pub service_cpu: Option<usize>,
+    /// CPU mask (no-perf + `--cpu-cap`). Equivalent to
+    /// `set_thread_cpumask(cpus, "virtio-blk worker")`.
+    pub no_perf_cpus: Option<Vec<usize>>,
 }
 
 impl VirtioBlk {
@@ -1172,6 +1220,36 @@ impl VirtioBlk {
         let device_status = Arc::new(AtomicU32::new(0));
         let mem = Arc::new(OnceLock::new());
         let mem_unset_warned = Arc::new(AtomicBool::new(false));
+        // Pause primitives (failure-dump rendezvous). The
+        // `pause_evt` host handle is kept on the `VirtioBlk` for
+        // `pause()`/`resume()`; in production a clone of its read
+        // side becomes the `pause_fd` registered in the worker's
+        // epoll. `paused` is the worker-set / coordinator-cleared
+        // ack flag the freeze rendezvous polls. Both Arcs are
+        // cfg-independent so the test-mode `pause`/`resume`
+        // accessors compile without engine-conditional plumbing
+        // (the test-mode worker is inline, so they observe the
+        // same eventfd state without an active worker thread).
+        let pause_evt = Arc::new(
+            EventFd::new(libc::EFD_NONBLOCK)
+                .expect("failed to create virtio-blk pause eventfd"),
+        );
+        // Initialise to `true` so the freeze coordinator's
+        // `is_paused()` poll passes vacuously while no worker is
+        // alive — the initial spawn is deferred to DRIVER_OK
+        // (see `respawn_pending` engine plumbing below), so any
+        // freeze that fires between `with_options` and the first
+        // DRIVER_OK MMIO write would otherwise time out at
+        // FREEZE_RENDEZVOUS_TIMEOUT (30 s) waiting for a worker
+        // that does not exist. The worker's first action inside
+        // `worker_thread_main` (after affinity setup, before
+        // entering `epoll_wait`) is a Release-store of `false`,
+        // which makes the rendezvous start observing real
+        // worker state from the moment the worker is genuinely
+        // ready to service kicks. Cloud-hypervisor uses the
+        // same "paused on construction, cleared by activate"
+        // invariant in epoll_helper.rs.
+        let paused = Arc::new(AtomicBool::new(true));
 
         // Build the queue. Production uses `QueueSync` (Arc<Mutex<Queue>>
         // internally) so the vCPU MMIO config writes and the worker
@@ -1202,47 +1280,33 @@ impl VirtioBlk {
                 EventFd::new(libc::EFD_NONBLOCK).expect("failed to create virtio-blk kick eventfd");
             let stop_fd =
                 EventFd::new(libc::EFD_NONBLOCK).expect("failed to create virtio-blk stop eventfd");
-            // The worker thread needs read-side fds for kick/stop and
-            // write-side fds for irq_evt; clone all eventfd handles so
-            // the device-side and worker-side own distinct File objects
-            // pointing at the same underlying eventfd.
-            let worker_kick = kick_fd
-                .try_clone()
-                .expect("clone virtio-blk kick eventfd for worker");
-            let worker_stop = stop_fd
-                .try_clone()
-                .expect("clone virtio-blk stop eventfd for worker");
-            // The worker thread receives a clone of the QueueSync
-            // (cheap — Arc<Mutex<Queue>> internally), an Arc'd irq
-            // eventfd it writes to fire the IRQ, and Arcs for the
-            // shared atomic and mem slot.
-            let worker_queues = [queues[REQ_QUEUE].clone()];
-            let worker_mem = Arc::clone(&mem);
-            let worker_irq = Arc::clone(&irq_evt);
-            let worker_status = Arc::clone(&interrupt_status);
-            let worker_device_status = Arc::clone(&device_status);
-            let worker_warned = Arc::clone(&mem_unset_warned);
-            let handle = thread::Builder::new()
-                .name("ktstr-vblk".to_string())
-                .spawn(move || {
-                    worker_thread_main(
-                        state,
-                        worker_queues,
-                        worker_mem,
-                        worker_irq,
-                        worker_status,
-                        worker_device_status,
-                        worker_warned,
-                        worker_kick,
-                        worker_stop,
-                    )
-                })
-                .expect("spawn virtio-blk worker thread");
+            // Defer the initial worker spawn to the guest's first
+            // DRIVER_OK transition (set_status → consume_pending_respawn
+            // → respawn_worker). Stashing the seed `BlkWorkerState` in
+            // `respawn_pending` collapses the initial-spawn path into
+            // the existing respawn path, which `respawn_worker` already
+            // implements correctly (placement applied via
+            // `self.worker_placement` clone, fresh kick/stop/pause fds
+            // built per spawn). This gives `set_worker_placement` a
+            // race-free window between construction and DRIVER_OK in
+            // which to override the default placement; without
+            // deferral the initial worker would spawn with the default
+            // placement before setup.rs's setter call could land.
+            //
+            // Pre-DRIVER_OK kicks land on the now-detached `kick_fd`
+            // and accumulate harmlessly; the first post-DRIVER_OK
+            // worker observes the queue's `ready()` flag and processes
+            // any pre-existing chain state. The kernel's virtio-mmio
+            // bind sequence (drivers/virtio/virtio_mmio.c
+            // `virtio_mmio_probe` → `vp_finalize_features` →
+            // `vm_setup_vq` → `STATUS=DRIVER_OK`) does not fire
+            // QUEUE_NOTIFY before DRIVER_OK, so accumulation is
+            // bounded at zero in the production path.
             WorkerEngine::Spawned(SpawnedEngine {
                 kick_fd,
                 stop_fd,
-                handle: Some(handle),
-                respawn_pending: None,
+                handle: None,
+                respawn_pending: Some(state),
             })
         };
 
@@ -1268,7 +1332,33 @@ impl VirtioBlk {
             mem_unset_warned,
             throttle,
             instance_id: VIRTIO_BLK_INSTANCE_COUNTER.fetch_add(1, Ordering::Relaxed),
+            pause_evt,
+            paused,
+            worker_placement: WorkerPlacement::default(),
         }
+    }
+
+    /// Configure the per-thread CPU placement applied at the top of
+    /// the worker's main loop. Mirrors the `set_mem` setter pattern:
+    /// called once after `with_options` / `new`, before the device
+    /// starts servicing kicks. The placement is captured by the
+    /// next worker-thread spawn — and because the initial spawn is
+    /// DEFERRED to the guest's first `STATUS = DRIVER_OK` MMIO
+    /// write (the seed `BlkWorkerState` lives in `respawn_pending`
+    /// until then), a setter call between `with_options` and that
+    /// DRIVER_OK transition lands on the very first worker. After
+    /// the worker has started, calling this has no effect on the
+    /// running thread — only respawned workers pick up the new
+    /// placement, matching cloud-hypervisor's "topology applied at
+    /// thread start" pattern.
+    ///
+    /// `WorkerPlacement::service_cpu` and `no_perf_cpus` are mutually
+    /// exclusive — the topology layer (perf-mode vs `--cpu-cap`)
+    /// produces at most one. Both `None` means inherit the parent
+    /// thread's affinity (the test/inline path and the no-topology
+    /// fallback for ad-hoc fixtures).
+    pub fn set_worker_placement(&mut self, placement: WorkerPlacement) {
+        self.worker_placement = placement;
     }
 
     /// Eventfd for KVM irqfd registration.
@@ -3595,6 +3685,20 @@ impl VirtioBlk {
         // through a "device still says NEEDS_RESET" state visible
         // through `mmio_read(STATUS)`.
         let _ = self.irq_evt.read();
+        // Drain the pause eventfd counter so any `pause()` writes
+        // that landed during this reset cycle (e.g. a freeze
+        // coordinator that fired between `reset_engine_spawned`'s
+        // join and this Phase 3) do not carry a stale tick across
+        // the rebind. Without this drain, the next
+        // `worker_thread_main` (spawned at the next DRIVER_OK)
+        // would observe PAUSE_TOKEN on its first `epoll_wait`,
+        // park immediately, and starve the guest's first kicks
+        // until the coordinator's eventual `resume()`. The read
+        // is best-effort — a `WouldBlock` (counter already 0)
+        // is normal, any other error means the eventfd is
+        // already torn down which the next worker spawn will
+        // re-create.
+        let _ = self.pause_evt.read();
         self.interrupt_status.store(0, Ordering::Release);
         self.device_status.store(0, Ordering::Release);
     }
@@ -3668,7 +3772,37 @@ impl VirtioBlk {
             eng.respawn_pending.is_some()
         };
         if !already_pending {
+            // If a freeze coordinator paused the worker via
+            // `pause()` and a STATUS=0 reset arrives before
+            // `resume()`, the worker is parked in its
+            // `park_timeout(10ms)` Acquire-load loop and does NOT
+            // observe `stop_fd` — `epoll_wait` is unreachable from
+            // the park. Clear `paused` (Release) and unpark BEFORE
+            // writing `stop_fd` so the worker wakes within 10 ms
+            // (or immediately on the unpark hint), exits the park
+            // loop, returns to `epoll_wait`, and observes
+            // STOP_TOKEN. Without this, the
+            // `join_worker_with_timeout(RESET_JOIN_TIMEOUT, 1s)`
+            // would always fire the TimedOut diagnostic when reset
+            // races a paused worker. Cloud-hypervisor's epoll-helper
+            // teardown follows the same unpause-before-stop ordering
+            // (clear the paused flag and wake before signalling the
+            // kill eventfd) so a parked worker observes the kill on
+            // its first epoll-wake rather than after a 10 ms
+            // park-timeout tick.
+            self.resume();
             let reclaimed = self.stop_worker_and_reclaim_state();
+            // Re-arm the construction-time "paused" sentinel so a
+            // freeze that fires between this stop and the next
+            // DRIVER_OK respawn passes the rendezvous vacuously
+            // (mirrors the `with_options` initialisation). Without
+            // this, the prior `resume()` left `paused=false`, and
+            // the rendezvous would block until the 30 s timeout
+            // waiting for a worker that does not yet exist — the
+            // freeze coordinator's failure-dump path would lose
+            // the dump for any STALL_DETECTED that lands in the
+            // rebind window.
+            self.paused.store(true, Ordering::Release);
             // Stash the reclaimed state for the deferred respawn.
             // `set_status` consumes it on the next valid DRIVER_OK
             // transition. `None` (worker had panicked / timed out /
@@ -3986,6 +4120,31 @@ impl VirtioBlk {
                 return;
             }
         };
+        // Worker-side read clone of the host-owned `pause_evt`.
+        // `try_clone` is `dup(2)`: it produces a new file descriptor
+        // that points at the SAME underlying eventfd kernel object,
+        // so the counter and any pending POLLIN readiness are shared
+        // with `self.pause_evt`. The clone exists not to give the
+        // worker a private counter (it can't — the kernel object is
+        // shared) but because each fd can be registered in only one
+        // epoll set: the worker's epoll holds this fd, while the
+        // host side keeps `self.pause_evt` for `pause()` /
+        // `is_paused()`. Counter cleanliness across respawns is
+        // handled separately by `reset_engine_spawned`'s Phase 3
+        // `pause_evt.read()` drain (V3) — a stale `1` from a
+        // pre-stop write would otherwise carry across to the new
+        // worker and trigger an immediate spurious park.
+        let pause_fd = match self.pause_evt.try_clone() {
+            Ok(fd) => fd,
+            Err(e) => {
+                tracing::error!(
+                    %e,
+                    "virtio-blk reset: pause eventfd clone failed; \
+                     leaving device without a worker"
+                );
+                return;
+            }
+        };
         // Clone the queue handles and Arcs the worker needs.
         // QueueSync is internally an `Arc<Mutex<Queue>>` so the
         // clone is cheap (refcount bump).
@@ -3995,6 +4154,13 @@ impl VirtioBlk {
         let worker_status = Arc::clone(&self.interrupt_status);
         let worker_device_status = Arc::clone(&self.device_status);
         let worker_warned = Arc::clone(&self.mem_unset_warned);
+        let worker_paused = Arc::clone(&self.paused);
+        // Snapshot the placement at spawn time. A subsequent
+        // `set_worker_placement` call only takes effect on the
+        // NEXT respawn; the running worker observes the placement
+        // captured here. This matches cloud-hypervisor's "topology
+        // applied at activate()" pattern.
+        let worker_placement = self.worker_placement.clone();
 
         let handle = match thread::Builder::new()
             .name("ktstr-vblk".to_string())
@@ -4007,8 +4173,11 @@ impl VirtioBlk {
                     worker_status,
                     worker_device_status,
                     worker_warned,
+                    worker_paused,
+                    worker_placement,
                     worker_kick,
                     worker_stop,
+                    pause_fd,
                 )
             }) {
             Ok(h) => h,
@@ -4028,6 +4197,125 @@ impl VirtioBlk {
             handle: Some(handle),
             respawn_pending: None,
         };
+    }
+
+    /// Signal the worker thread to park for a failure-dump
+    /// rendezvous. Writes 1 to `pause_evt`; the worker's
+    /// `epoll_wait` resumes on PAUSE_TOKEN, drains the eventfd
+    /// counter, stores `paused=true` (Release), and parks in a
+    /// 10 ms `park_timeout` loop until [`Self::resume`] clears
+    /// the flag.
+    ///
+    /// The freeze coordinator polls `paused.load(Acquire)` after
+    /// calling this to confirm the worker has reached the parked
+    /// state before reading guest memory. The Release/Acquire
+    /// pair provides the happens-before edge that makes the
+    /// host-side post-rendezvous reads observe every queue
+    /// mutation the worker performed pre-pause.
+    ///
+    /// Cfg-independent: `cfg(test)` builds use the inline engine,
+    /// so `pause()` writes to the host eventfd but no worker is
+    /// blocked on it; the test harness can inspect
+    /// `self.paused.load()` directly to verify the host-side
+    /// rendezvous machinery without a worker thread.
+    ///
+    /// On EAGAIN (counter saturation at u64::MAX-1) or EBADF
+    /// (closed fd during shutdown), we log via `tracing::warn!`
+    /// and return — the caller's downstream `paused.load(Acquire)`
+    /// poll either succeeds (a prior pause ack is still latched) or
+    /// times out at the 30s rendezvous deadline. Saturation is
+    /// implausible in practice (every `pause()` is paired with a
+    /// `resume()` that does NOT increment the counter; the worker's
+    /// drain reads it back to 0 each cycle).
+    pub fn pause(&self) {
+        // No-live-worker fast path. With the deferred-spawn lifecycle
+        // (initial worker created on the first DRIVER_OK), there is a
+        // window between `with_options` and the guest's bind where no
+        // thread is reading `pause_fd`. Writing the eventfd is still
+        // safe — counter just accumulates harmlessly, and `reset`'s
+        // Phase 3 drain (V3) clears it before the next worker spawns —
+        // but the counter would otherwise carry a stale tick across
+        // a respawn, and the rendezvous already passes vacuously
+        // because `paused` was initialised to `true` and is never
+        // cleared until the worker actually starts. Skip the write
+        // and log at `debug` level so a misuse (pause without a
+        // worker) is observable but not noisy.
+        #[cfg(not(test))]
+        {
+            let WorkerEngine::Spawned(eng) = &self.worker.engine;
+            if eng.handle.is_none() {
+                tracing::debug!(
+                    "virtio-blk pause() with no live worker; \
+                     `paused` is already `true` from construction \
+                     (or post-stop), rendezvous will pass vacuously"
+                );
+                return;
+            }
+        }
+        if let Err(e) = self.pause_evt.write(1) {
+            tracing::warn!(%e, "virtio-blk pause_evt.write failed");
+        }
+    }
+
+    /// Clear the worker's parked state. Stores `paused=false`
+    /// (Release); the worker's 10 ms `park_timeout` Acquire-load
+    /// observes the clear within 10 ms and resumes its
+    /// `epoll_wait` loop. The `unpark` call is a hint — the
+    /// `park_timeout` already wakes periodically so a missed
+    /// unpark is bounded at 10 ms latency, not unbounded.
+    ///
+    /// Cfg-independent for the same reason as [`Self::pause`].
+    /// Returns `true` if a worker thread is alive and was
+    /// unparked; `false` if the engine has no live worker (test
+    /// mode, post-stop, post-failed-respawn). Callers use the
+    /// return value to skip a `resume()` that has nothing to
+    /// resume.
+    pub fn resume(&self) -> bool {
+        // No-live-worker fast path. Mirrors `pause()`'s early-return:
+        // when the engine has no live thread (pre-DRIVER_OK, post-stop,
+        // post-failed-respawn), preserve the V1 sentinel by RE-ARMING
+        // `paused = true` instead of clearing it. Without this, a
+        // dual-snapshot freeze (early + late) that calls
+        // pause()/resume() across the rebind window would clear the
+        // sentinel on the first resume(), and the second freeze's
+        // is_paused() poll would observe `false` and time out at
+        // FREEZE_RENDEZVOUS_TIMEOUT waiting for a worker that does
+        // not exist. Re-arming preserves the vacuous-pass invariant
+        // across consecutive freezes.
+        #[cfg(not(test))]
+        {
+            let WorkerEngine::Spawned(eng) = &self.worker.engine;
+            if let Some(ref handle) = eng.handle {
+                self.paused.store(false, Ordering::Release);
+                handle.thread().unpark();
+                return true;
+            }
+            // No live worker — re-arm the sentinel.
+            self.paused.store(true, Ordering::Release);
+            false
+        }
+        #[cfg(test)]
+        {
+            // Inline engine: no worker thread to unpark; the
+            // store(Release) above is the entire resume side. A
+            // test harness driving pause/resume observes the
+            // updated `paused` flag directly.
+            self.paused.store(false, Ordering::Release);
+            false
+        }
+    }
+
+    /// Return `true` when the worker has acknowledged a prior
+    /// [`Self::pause`] call by parking. The freeze coordinator's
+    /// rendezvous loop uses this to wait for the worker's parked
+    /// state before reading guest memory. Acquire ordering pairs
+    /// with the worker's `paused.store(true, Release)` so the
+    /// host-side reads happen-after every queue mutation the
+    /// worker performed pre-pause.
+    ///
+    /// Cfg-independent for the same reason as [`Self::pause`].
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Acquire)
     }
 }
 
@@ -4418,6 +4706,21 @@ impl Drop for VirtioBlk {
                 // raw fd) is only meaningful in the Spawned
                 // arm — Inline mode has no eventfd to name.
                 let stop_fd = eng.stop_fd.as_raw_fd();
+                // Unpause first so a parked worker observes the
+                // upcoming stop signal. Same rationale as
+                // `reset_engine_spawned`: a worker stuck in its
+                // `park_timeout(10ms)` Acquire-load loop is
+                // unreachable from `epoll_wait`, so STOP_TOKEN
+                // would block until the 10 ms tick + Acquire-load
+                // sees the cleared flag. Clearing here makes the
+                // worker exit the park within 10 ms (faster on
+                // the unpark hint) so the join timeout window
+                // (DROP_JOIN_TIMEOUT, 1 s) is not consumed by
+                // park latency alone.
+                self.paused.store(false, Ordering::Release);
+                if let Some(ref handle) = eng.handle {
+                    handle.thread().unpark();
+                }
                 // Signal the worker to exit via the stop_fd
                 // helper, which retries on EAGAIN (eventfd
                 // counter saturation) up to STOP_FD_WRITE_MAX_RETRIES

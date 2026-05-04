@@ -1714,3 +1714,82 @@ use virtio_queue::mock::MockSplitQueue;
              a subset of device_features (only VERSION_1 set)",
         );
     }
+
+    /// `pause()` writes 1 to `pause_evt` and `resume()` clears
+    /// `paused`. The test exercises the host-side machinery without
+    /// the worker thread (cfg(test) builds use the inline engine, so
+    /// no thread observes the eventfd write — but the device-side
+    /// `pause_evt` and `paused` state are cfg-independent and
+    /// inspectable). Pins the resume()→paused.store(false, Release)
+    /// contract the freeze coordinator depends on.
+    #[test]
+    fn pause_writes_evt_and_resume_clears_paused() {
+        let dev = make_device(VIRTIO_BLK_DEFAULT_CAPACITY_BYTES, DiskThrottle::default());
+        // Initial state: paused=true (V1 deferred-spawn sentinel —
+        // a freeze that fires before the first DRIVER_OK passes the
+        // rendezvous vacuously instead of timing out waiting for a
+        // worker that does not yet exist; the worker clears the
+        // sentinel via Release-store at the top of
+        // worker_thread_main, after affinity setup, before
+        // entering epoll_wait). pause_evt counter starts at 0.
+        assert!(
+            dev.is_paused(),
+            "freshly constructed device must start with the V1 \
+             paused=true sentinel — initial spawn is deferred to \
+             DRIVER_OK and the rendezvous must pass vacuously \
+             until the worker actually starts"
+        );
+        // Simulate the worker clearing the sentinel: in production
+        // worker_thread_main does this Release-store as its first
+        // action after affinity setup. From this point the test
+        // exercises the real pause/resume machinery (counter +
+        // store(true) ack pattern), not the construction-time
+        // sentinel.
+        dev.paused.store(false, Ordering::Release);
+        assert!(
+            !dev.is_paused(),
+            "after the worker clears the sentinel, is_paused() \
+             must observe the Release-store of false"
+        );
+        // Simulate the worker's PAUSE_TOKEN handler: it would
+        // store(true) after parking. Force the host-side ack
+        // directly so the rendezvous-machinery test does not
+        // depend on a worker thread.
+        dev.paused.store(true, Ordering::Release);
+        assert!(
+            dev.is_paused(),
+            "is_paused must observe the worker's Release store"
+        );
+        // resume() clears the flag (Release). In cfg(test) the
+        // inline engine has no worker thread to unpark, so resume()
+        // returns false; the host-observable state of `paused` is
+        // still cleared.
+        let unparked = dev.resume();
+        assert!(
+            !unparked,
+            "cfg(test) inline engine has no worker thread; resume() returns false"
+        );
+        assert!(
+            !dev.is_paused(),
+            "resume() must clear the paused flag (Release store)"
+        );
+        // pause() writes 1 to pause_evt. Read it back to confirm the
+        // counter advanced. EventFd::read returns the accumulated
+        // count and resets to 0 (counter mode).
+        dev.pause();
+        let count = dev.pause_evt.read().expect("pause_evt should be readable after pause()");
+        assert_eq!(
+            count, 1,
+            "pause() must write exactly 1 to pause_evt for a single pause request"
+        );
+        // Multiple pause() calls coalesce in the eventfd counter —
+        // a healthy worker would drain them in one read.
+        dev.pause();
+        dev.pause();
+        dev.pause();
+        let count3 = dev.pause_evt.read().expect("pause_evt readable after 3 pauses");
+        assert_eq!(
+            count3, 3,
+            "three coalesced pause() calls must accumulate to 3 in counter mode"
+        );
+    }

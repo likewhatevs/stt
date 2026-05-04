@@ -333,6 +333,20 @@ impl KtstrVm {
         // DMA-affected pages should drain the device path first.
         let freeze_coord_freeze = freeze.clone();
         let freeze_coord_kill = kill.clone();
+        // Optional virtio-blk handle for the failure-dump
+        // worker-pause rendezvous. None when no disk is attached.
+        // Cloned into the closure so the dump path can call
+        // `dev.lock().pause()` BEFORE kicking the vCPUs and
+        // `dev.lock().resume()` after the dump completes — without
+        // this, the worker thread would continue mutating the
+        // backing file (and the avail/used rings) while the host
+        // reads guest memory for the dump. Only virtio-blk has an
+        // independent worker thread; virtio-net (v0) and
+        // virtio-console run synchronously on the vCPU thread and
+        // are automatically frozen when the vCPU rendezvous
+        // completes (their `mmio_write` handlers must have already
+        // returned for the vCPU to reach the parked state).
+        let freeze_coord_virtio_blk = virtio_blk.clone();
         let freeze_coord_bsp_parked = bsp_parked.clone();
         let freeze_coord_bsp_regs = bsp_regs.clone();
         let freeze_coord_bsp_done = bsp_done.clone();
@@ -1029,6 +1043,33 @@ impl KtstrVm {
                                 "freeze-coord: freezing vCPUs for snapshot"
                             );
                             freeze_coord_freeze.store(true, Ordering::Release);
+                            // Pass 0: signal every device worker to
+                            // pause. virtio-blk has an independent
+                            // worker thread that must be parked
+                            // before we read guest memory — otherwise
+                            // it can race-mutate the avail/used rings
+                            // and the backing file mid-dump,
+                            // producing a torn view of in-flight
+                            // requests. Other devices (virtio-net,
+                            // virtio-console) run on the vCPU thread
+                            // and freeze automatically at the vCPU
+                            // rendezvous below.
+                            //
+                            // The worker may be in `pread`/`pwrite`
+                            // when this lands; the eventfd write
+                            // returns immediately (counter mode +
+                            // EFD_NONBLOCK) and the syscall completes
+                            // before the worker reaches the next
+                            // `epoll_wait` and observes PAUSE_TOKEN.
+                            // The rendezvous loop below polls each
+                            // worker's `paused` flag with the same
+                            // FREEZE_RENDEZVOUS_TIMEOUT budget that
+                            // bounds the vCPU wait — workers ack
+                            // within ~1 ms in healthy state and the
+                            // 30 s ceiling absorbs sick-system stalls.
+                            if let Some(ref blk) = freeze_coord_virtio_blk {
+                                blk.lock().pause();
+                            }
                             // Pass 1: set every immediate_exit=1.
                             // Each ImmediateExitHandle::set is a
                             // single-byte write_volatile into the
@@ -1077,7 +1118,19 @@ impl KtstrVm {
                                     .iter()
                                     .all(|p| p.load(Ordering::Acquire));
                                 let bsp_p = freeze_coord_bsp_parked.load(Ordering::Acquire);
-                                if aps_parked && bsp_p {
+                                // Worker pause ack. None-or-paused:
+                                // when no virtio-blk is attached the
+                                // condition is vacuously true. The
+                                // Acquire load synchronizes-with the
+                                // worker's `paused.store(true,
+                                // Release)` so the host's subsequent
+                                // guest-memory reads happen-after
+                                // every queue mutation the worker
+                                // performed pre-pause.
+                                let blk_parked = freeze_coord_virtio_blk
+                                    .as_ref()
+                                    .is_none_or(|d| d.lock().is_paused());
+                                if aps_parked && bsp_p && blk_parked {
                                     all_parked = true;
                                     break;
                                 }
@@ -1089,7 +1142,15 @@ impl KtstrVm {
                                     tracing::error!(
                                         ?ap_states,
                                         bsp_parked = bsp_p,
-                                        "freeze-coord: timed out waiting for vCPUs to park"
+                                        blk_parked,
+                                        "freeze-coord: timed out waiting for vCPUs / worker to park. \
+                                         If blk_parked=false, the worker is most likely stuck in a \
+                                         slow pread/pwrite against the backing file — verify the \
+                                         vCPU-blocking-budget assumption (tmpfs / warm page cache \
+                                         per CLAUDE.md 'vCPU thread blocking budget' invariant). \
+                                         The worker observes PAUSE_TOKEN only between blocking \
+                                         syscalls, so a long pread/pwrite delays the park-ack \
+                                         until the syscall returns."
                                     );
                                     break;
                                 }
@@ -1392,6 +1453,21 @@ impl KtstrVm {
                             // Thaw whether or not we got a report:
                             // the freeze flag was set unconditionally,
                             // and a stuck rendezvous already logged.
+                            // Resume the worker BEFORE clearing the
+                            // freeze flag: the worker's
+                            // `paused.load(Acquire)` poll is the only
+                            // path out of its `park_timeout(10ms)`
+                            // loop, so a freeze flag clear without a
+                            // resume() leaves the worker parked
+                            // indefinitely. The freeze flag governs
+                            // the vCPU rendezvous, which is
+                            // orthogonal — vCPUs poll `freeze`, the
+                            // worker polls `paused`. Order:
+                            // resume()→freeze.store(false) means
+                            // both wake paths land cleanly.
+                            if let Some(ref blk) = freeze_coord_virtio_blk {
+                                blk.lock().resume();
+                            }
                             freeze_coord_freeze.store(false, Ordering::Release);
                             freeze_state = FreezeState::TookEarly;
                         }
@@ -1412,6 +1488,12 @@ impl KtstrVm {
                         // Thaw before emission so a slow JSON
                         // serialise doesn't keep vCPUs parked any
                         // longer than the dump strictly needs.
+                        // Resume worker first — see early-snapshot
+                        // path doc for the freeze-vs-paused
+                        // ordering rationale.
+                        if let Some(ref blk) = freeze_coord_virtio_blk {
+                            blk.lock().resume();
+                        }
                         freeze_coord_freeze.store(false, Ordering::Release);
                         if let Some(late) = late_report {
                             if freeze_coord_dual_snapshot {
