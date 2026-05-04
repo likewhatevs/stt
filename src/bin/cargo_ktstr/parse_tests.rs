@@ -10,15 +10,10 @@
 //!
 //! # Coverage shape
 //!
-//! Most [`KtstrCommand`] variants have at least one positive test
+//! Every [`KtstrCommand`] variant has at least one positive test
 //! that round-trips an argument through clap into the variant's
 //! fields, plus negative tests for `requires` / `conflicts_with` /
 //! `value_parser` constraints clap enforces at parse time.
-//!
-//! Variants WITHOUT a positive parse test as of this revision:
-//! `Model`, `Funify`, `Export`, `Locks`. Their parse-shape
-//! coverage is filed as a follow-up; until then a clap regression
-//! that reshapes one of those variants will not surface here.
 //!
 //! Sections are separated by `// -- <theme> --` banners.
 //!
@@ -47,7 +42,131 @@ use ktstr::cache::{CacheArtifacts, CacheDir, CacheEntry, KernelMetadata};
 use ktstr::cli;
 use ktstr::cli::KernelCommand;
 
-use crate::cli::{Cargo, CargoSub, KtstrCommand, StatsCommand};
+use crate::cli::{Cargo, CargoSub, KtstrCommand, ModelCommand, StatsCommand};
+
+// -- DRY helpers for the parse-only test surface --
+//
+// These helpers collapse the ~30-line boilerplate that every
+// destructuring parse test repeats — build args, `try_parse_from`,
+// destructure the `Cargo { CargoSub::Ktstr } -> KtstrCommand`
+// outer chrome, and panic with a recognisable "expected X"
+// message on a wrong-variant parse.
+//
+// Helpers panic on the wrong variant rather than returning
+// `Result` because every call site is already in a `#[test]`
+// where the panic IS the failure mode. Returning the variant
+// by value (not by reference) lets the call site bind owned
+// fields with a let-else destructure rather than yet another
+// indirection.
+
+/// Parse a `cargo ktstr stats compare` invocation with the given
+/// trailing arguments and return the [`StatsCommand`] variant
+/// guaranteed to be `Compare { .. }`. Panics if clap rejects the
+/// invocation or the parsed variant is anything else.
+///
+/// Call sites bind the Compare fields with a `let-else`:
+///
+/// ```ignore
+/// let StatsCommand::Compare { threshold, filter, .. } =
+///     parse_compare(&["--a-kernel", "6.14", "--b-kernel", "6.15"])
+/// else {
+///     unreachable!()
+/// };
+/// ```
+fn parse_compare(extra: &[&str]) -> StatsCommand {
+    let mut argv: Vec<&str> = vec!["cargo", "ktstr", "stats", "compare"];
+    argv.extend(extra.iter().copied());
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from(argv).unwrap_or_else(|e| panic!("{e}"));
+    let KtstrCommand::Stats {
+        command: Some(sc), ..
+    } = k.command
+    else {
+        panic!("expected Stats");
+    };
+    assert!(
+        matches!(sc, StatsCommand::Compare { .. }),
+        "expected Stats Compare",
+    );
+    sc
+}
+
+/// Build a `cargo ktstr <subcommand> -- <passthrough...>` invocation,
+/// parse it, and assert that the trailing args round-trip verbatim
+/// into the variant's `args` Vec without spuriously populating any
+/// of the named flags (`--kernel`, `--no-perf-mode`, `--release`).
+///
+/// `subcommand` must be one of the passthrough-bearing subcommands:
+/// `test`, `nextest` (alias), `coverage`, `llvm-cov`. Other
+/// subcommands panic with an actionable error.
+fn assert_passthrough_args(subcommand: &str, passthrough: &[&str]) {
+    let mut argv: Vec<&str> = vec!["cargo", "ktstr", subcommand, "--"];
+    argv.extend(passthrough.iter().copied());
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from(argv).unwrap_or_else(|e| panic!("{e}"));
+
+    let expected: Vec<String> = passthrough.iter().map(|s| s.to_string()).collect();
+    match k.command {
+        KtstrCommand::Test {
+            kernel,
+            no_perf_mode,
+            release,
+            args,
+        } => {
+            assert!(
+                kernel.is_empty(),
+                "bare `--` passthrough must not spuriously populate --kernel",
+            );
+            assert!(
+                !no_perf_mode,
+                "bare `--` passthrough must not spuriously set --no-perf-mode",
+            );
+            assert!(
+                !release,
+                "bare `--` passthrough must not spuriously set --release",
+            );
+            assert_eq!(args, expected);
+        }
+        KtstrCommand::Coverage {
+            kernel,
+            no_perf_mode,
+            release,
+            args,
+        } => {
+            assert!(
+                kernel.is_empty(),
+                "bare `--` passthrough must not spuriously populate --kernel",
+            );
+            assert!(
+                !no_perf_mode,
+                "bare `--` passthrough must not spuriously set --no-perf-mode",
+            );
+            assert!(
+                !release,
+                "bare `--` passthrough must not spuriously set --release",
+            );
+            assert_eq!(args, expected);
+        }
+        KtstrCommand::LlvmCov {
+            kernel,
+            no_perf_mode,
+            args,
+        } => {
+            assert!(
+                kernel.is_empty(),
+                "bare `--` passthrough must not spuriously populate --kernel",
+            );
+            assert!(
+                !no_perf_mode,
+                "bare `--` passthrough must not spuriously set --no-perf-mode",
+            );
+            assert_eq!(args, expected);
+        }
+        _ => panic!("expected passthrough-bearing variant for `{subcommand}`"),
+    }
+}
 
 // -- structural validation --
 
@@ -101,52 +220,16 @@ fn parse_test_with_release_flag() {
         command: CargoSub::Ktstr(k),
     } = Cargo::try_parse_from(["cargo", "ktstr", "test", "--release"])
         .unwrap_or_else(|e| panic!("{e}"));
-    match k.command {
-        KtstrCommand::Test { release, .. } => {
-            assert!(release, "`--release` must set `release=true`");
-        }
-        _ => panic!("expected Test"),
-    }
+    let KtstrCommand::Test { release, .. } = k.command else {
+        panic!("expected Test");
+    };
+    assert!(release, "`--release` must set `release=true`");
 }
 
 /// Pin `trailing_var_arg` args forwarded verbatim after `--`.
 #[test]
 fn parse_test_with_passthrough_args() {
-    let Cargo {
-        command: CargoSub::Ktstr(k),
-    } = Cargo::try_parse_from([
-        "cargo",
-        "ktstr",
-        "test",
-        "--",
-        "-p",
-        "ktstr",
-        "--no-capture",
-    ])
-    .unwrap_or_else(|e| panic!("{e}"));
-    match k.command {
-        KtstrCommand::Test {
-            kernel,
-            no_perf_mode,
-            release,
-            args,
-        } => {
-            assert!(
-                kernel.is_empty(),
-                "bare `--` passthrough must not spuriously populate --kernel",
-            );
-            assert!(
-                !no_perf_mode,
-                "bare `--` passthrough must not spuriously set --no-perf-mode",
-            );
-            assert!(
-                !release,
-                "bare `--` passthrough must not spuriously set --release",
-            );
-            assert_eq!(args, vec!["-p", "ktstr", "--no-capture"]);
-        }
-        _ => panic!("expected Test"),
-    }
+    assert_passthrough_args("test", &["-p", "ktstr", "--no-capture"]);
 }
 
 // -- try_get_matches_from: `test` visible alias `nextest` --
@@ -175,24 +258,7 @@ fn parse_nextest_alias_dispatches_to_test() {
 /// here rather than in runtime dispatch.
 #[test]
 fn parse_nextest_alias_with_passthrough_args() {
-    let Cargo {
-        command: CargoSub::Ktstr(k),
-    } = Cargo::try_parse_from([
-        "cargo",
-        "ktstr",
-        "nextest",
-        "--",
-        "-p",
-        "ktstr",
-        "--no-capture",
-    ])
-    .unwrap_or_else(|e| panic!("{e}"));
-    match k.command {
-        KtstrCommand::Test { args, .. } => {
-            assert_eq!(args, vec!["-p", "ktstr", "--no-capture"]);
-        }
-        _ => panic!("expected Test (via `nextest` alias)"),
-    }
+    assert_passthrough_args("nextest", &["-p", "ktstr", "--no-capture"]);
 }
 
 /// Verify the `nextest` alias preserves all Test fields in a
@@ -214,20 +280,19 @@ fn parse_nextest_alias_with_kernel_and_no_perf_mode() {
         "--no-perf-mode",
     ])
     .unwrap_or_else(|e| panic!("{e}"));
-    match k.command {
-        KtstrCommand::Test {
-            kernel,
-            no_perf_mode,
-            release,
-            args,
-        } => {
-            assert_eq!(kernel, vec!["6.14.2".to_string()]);
-            assert!(no_perf_mode);
-            assert!(!release, "bare invocation must default --release to false");
-            assert!(args.is_empty());
-        }
-        _ => panic!("expected Test (via `nextest` alias)"),
-    }
+    let KtstrCommand::Test {
+        kernel,
+        no_perf_mode,
+        release,
+        args,
+    } = k.command
+    else {
+        panic!("expected Test (via `nextest` alias)");
+    };
+    assert_eq!(kernel, vec!["6.14.2".to_string()]);
+    assert!(no_perf_mode);
+    assert!(!release, "bare invocation must default --release to false");
+    assert!(args.is_empty());
 }
 
 // -- try_get_matches_from: coverage subcommand --
@@ -256,39 +321,19 @@ fn parse_coverage_with_release_flag() {
         command: CargoSub::Ktstr(k),
     } = Cargo::try_parse_from(["cargo", "ktstr", "coverage", "--release"])
         .unwrap_or_else(|e| panic!("{e}"));
-    match k.command {
-        KtstrCommand::Coverage { release, .. } => {
-            assert!(release, "`--release` must set `release=true`");
-        }
-        _ => panic!("expected Coverage"),
-    }
+    let KtstrCommand::Coverage { release, .. } = k.command else {
+        panic!("expected Coverage");
+    };
+    assert!(release, "`--release` must set `release=true`");
 }
 
 /// Pin `trailing_var_arg` args forwarded verbatim after `--`.
 #[test]
 fn parse_coverage_with_passthrough_args() {
-    let Cargo {
-        command: CargoSub::Ktstr(k),
-    } = Cargo::try_parse_from([
-        "cargo",
-        "ktstr",
+    assert_passthrough_args(
         "coverage",
-        "--",
-        "--workspace",
-        "--lcov",
-        "--output-path",
-        "lcov.info",
-    ])
-    .unwrap_or_else(|e| panic!("{e}"));
-    match k.command {
-        KtstrCommand::Coverage { args, .. } => {
-            assert_eq!(
-                args,
-                vec!["--workspace", "--lcov", "--output-path", "lcov.info"]
-            );
-        }
-        _ => panic!("expected Coverage"),
-    }
+        &["--workspace", "--lcov", "--output-path", "lcov.info"],
+    );
 }
 
 /// Combined round-trip for Coverage: `--kernel`, `--no-perf-mode`,
@@ -312,20 +357,19 @@ fn parse_coverage_with_kernel_and_no_perf_mode() {
         "--workspace",
     ])
     .unwrap_or_else(|e| panic!("{e}"));
-    match k.command {
-        KtstrCommand::Coverage {
-            kernel,
-            no_perf_mode,
-            release,
-            args,
-        } => {
-            assert_eq!(kernel, vec!["6.14.2".to_string()]);
-            assert!(no_perf_mode);
-            assert!(!release, "bare invocation must default --release to false");
-            assert_eq!(args, vec!["--workspace"]);
-        }
-        _ => panic!("expected Coverage"),
-    }
+    let KtstrCommand::Coverage {
+        kernel,
+        no_perf_mode,
+        release,
+        args,
+    } = k.command
+    else {
+        panic!("expected Coverage");
+    };
+    assert_eq!(kernel, vec!["6.14.2".to_string()]);
+    assert!(no_perf_mode);
+    assert!(!release, "bare invocation must default --release to false");
+    assert_eq!(args, vec!["--workspace"]);
 }
 
 // -- try_get_matches_from: llvm-cov raw passthrough subcommand --
@@ -342,36 +386,19 @@ fn parse_llvm_cov_with_kernel() {
         command: CargoSub::Ktstr(k),
     } = Cargo::try_parse_from(["cargo", "ktstr", "llvm-cov", "--kernel", "6.14.2"])
         .unwrap_or_else(|e| panic!("{e}"));
-    match k.command {
-        KtstrCommand::LlvmCov { kernel, .. } => {
-            assert_eq!(kernel, vec!["6.14.2".to_string()]);
-        }
-        _ => panic!("expected LlvmCov"),
-    }
+    let KtstrCommand::LlvmCov { kernel, .. } = k.command else {
+        panic!("expected LlvmCov");
+    };
+    assert_eq!(kernel, vec!["6.14.2".to_string()]);
 }
 
 /// Pin `trailing_var_arg` args forwarded verbatim after `--`.
 #[test]
 fn parse_llvm_cov_with_passthrough_args() {
-    let Cargo {
-        command: CargoSub::Ktstr(k),
-    } = Cargo::try_parse_from([
-        "cargo",
-        "ktstr",
+    assert_passthrough_args(
         "llvm-cov",
-        "--",
-        "report",
-        "--lcov",
-        "--output-path",
-        "lcov.info",
-    ])
-    .unwrap_or_else(|e| panic!("{e}"));
-    match k.command {
-        KtstrCommand::LlvmCov { args, .. } => {
-            assert_eq!(args, vec!["report", "--lcov", "--output-path", "lcov.info"]);
-        }
-        _ => panic!("expected LlvmCov"),
-    }
+        &["report", "--lcov", "--output-path", "lcov.info"],
+    );
 }
 
 /// Combined round-trip: `--kernel`, `--no-perf-mode`, AND
@@ -394,18 +421,17 @@ fn parse_llvm_cov_with_kernel_and_no_perf_mode() {
         "--lcov",
     ])
     .unwrap_or_else(|e| panic!("{e}"));
-    match k.command {
-        KtstrCommand::LlvmCov {
-            kernel,
-            no_perf_mode,
-            args,
-        } => {
-            assert_eq!(kernel, vec!["6.14.2".to_string()]);
-            assert!(no_perf_mode);
-            assert_eq!(args, vec!["report", "--lcov"]);
-        }
-        _ => panic!("expected LlvmCov"),
-    }
+    let KtstrCommand::LlvmCov {
+        kernel,
+        no_perf_mode,
+        args,
+    } = k.command
+    else {
+        panic!("expected LlvmCov");
+    };
+    assert_eq!(kernel, vec!["6.14.2".to_string()]);
+    assert!(no_perf_mode);
+    assert_eq!(args, vec!["report", "--lcov"]);
 }
 
 /// Negative pin: the variant is `LlvmCov`, and clap derive's
@@ -460,12 +486,10 @@ fn parse_shell_with_topology() {
         command: CargoSub::Ktstr(k),
     } = Cargo::try_parse_from(["cargo", "ktstr", "shell", "--topology", "1,2,4,1"])
         .unwrap_or_else(|e| panic!("{e}"));
-    match k.command {
-        KtstrCommand::Shell { topology, .. } => {
-            assert_eq!(topology, "1,2,4,1");
-        }
-        _ => panic!("expected Shell"),
-    }
+    let KtstrCommand::Shell { topology, .. } = k.command else {
+        panic!("expected Shell");
+    };
+    assert_eq!(topology, "1,2,4,1");
 }
 
 #[test]
@@ -473,12 +497,10 @@ fn parse_shell_default_topology() {
     let Cargo {
         command: CargoSub::Ktstr(k),
     } = Cargo::try_parse_from(["cargo", "ktstr", "shell"]).unwrap_or_else(|e| panic!("{e}"));
-    match k.command {
-        KtstrCommand::Shell { topology, .. } => {
-            assert_eq!(topology, "1,1,1,1");
-        }
-        _ => panic!("expected Shell"),
-    }
+    let KtstrCommand::Shell { topology, .. } = k.command else {
+        panic!("expected Shell");
+    };
+    assert_eq!(topology, "1,1,1,1");
 }
 
 /// Pin `-i` / `--include-files` `ArgAction::Append` round-trip with ordering.
@@ -488,19 +510,17 @@ fn parse_shell_include_files() {
         command: CargoSub::Ktstr(k),
     } = Cargo::try_parse_from(["cargo", "ktstr", "shell", "-i", "/tmp/a", "-i", "/tmp/b"])
         .unwrap_or_else(|e| panic!("{e}"));
-    match k.command {
-        KtstrCommand::Shell { include_files, .. } => {
-            assert_eq!(
-                include_files,
-                vec![
-                    std::path::PathBuf::from("/tmp/a"),
-                    std::path::PathBuf::from("/tmp/b"),
-                ],
-                "-i flag must accumulate paths in order via ArgAction::Append",
-            );
-        }
-        _ => panic!("expected Shell"),
-    }
+    let KtstrCommand::Shell { include_files, .. } = k.command else {
+        panic!("expected Shell");
+    };
+    assert_eq!(
+        include_files,
+        vec![
+            std::path::PathBuf::from("/tmp/a"),
+            std::path::PathBuf::from("/tmp/b"),
+        ],
+        "-i flag must accumulate paths in order via ArgAction::Append",
+    );
 }
 
 /// `cargo ktstr shell --disk 256mib` parses; the disk arg lands as
@@ -515,12 +535,10 @@ fn parse_shell_disk_arg() {
         command: CargoSub::Ktstr(k),
     } = Cargo::try_parse_from(["cargo", "ktstr", "shell", "--disk", "256mib"])
         .unwrap_or_else(|e| panic!("{e}"));
-    match k.command {
-        KtstrCommand::Shell { disk, .. } => {
-            assert_eq!(disk.as_deref(), Some("256mib"));
-        }
-        _ => panic!("expected Shell"),
-    }
+    let KtstrCommand::Shell { disk, .. } = k.command else {
+        panic!("expected Shell");
+    };
+    assert_eq!(disk.as_deref(), Some("256mib"));
 }
 
 /// Omitting `--disk` produces `None`, matching the no-disk default
@@ -530,12 +548,10 @@ fn parse_shell_disk_arg_omitted() {
     let Cargo {
         command: CargoSub::Ktstr(k),
     } = Cargo::try_parse_from(["cargo", "ktstr", "shell"]).unwrap_or_else(|e| panic!("{e}"));
-    match k.command {
-        KtstrCommand::Shell { disk, .. } => {
-            assert!(disk.is_none(), "no --disk must produce None");
-        }
-        _ => panic!("expected Shell"),
-    }
+    let KtstrCommand::Shell { disk, .. } = k.command else {
+        panic!("expected Shell");
+    };
+    assert!(disk.is_none(), "no --disk must produce None");
 }
 
 // -- try_get_matches_from: stats subcommand --
@@ -560,18 +576,17 @@ fn parse_stats_list_metrics_bare() {
         command: CargoSub::Ktstr(k),
     } = Cargo::try_parse_from(["cargo", "ktstr", "stats", "list-metrics"])
         .unwrap_or_else(|e| panic!("{e}"));
-    match k.command {
-        KtstrCommand::Stats {
-            command: Some(StatsCommand::ListMetrics { json }),
-            ..
-        } => {
-            assert!(
-                !json,
-                "bare `list-metrics` must default to text mode (json=false)",
-            );
-        }
-        _ => panic!("expected Stats ListMetrics"),
-    }
+    let KtstrCommand::Stats {
+        command: Some(StatsCommand::ListMetrics { json }),
+        ..
+    } = k.command
+    else {
+        panic!("expected Stats ListMetrics");
+    };
+    assert!(
+        !json,
+        "bare `list-metrics` must default to text mode (json=false)",
+    );
 }
 
 /// `cargo ktstr stats list-metrics --json` sets `json=true`.
@@ -584,15 +599,14 @@ fn parse_stats_list_metrics_json() {
         command: CargoSub::Ktstr(k),
     } = Cargo::try_parse_from(["cargo", "ktstr", "stats", "list-metrics", "--json"])
         .unwrap_or_else(|e| panic!("{e}"));
-    match k.command {
-        KtstrCommand::Stats {
-            command: Some(StatsCommand::ListMetrics { json }),
-            ..
-        } => {
-            assert!(json, "--json must set the flag true");
-        }
-        _ => panic!("expected Stats ListMetrics"),
-    }
+    let KtstrCommand::Stats {
+        command: Some(StatsCommand::ListMetrics { json }),
+        ..
+    } = k.command
+    else {
+        panic!("expected Stats ListMetrics");
+    };
+    assert!(json, "--json must set the flag true");
 }
 
 /// `list-metrics` takes no positional args — a stray positional
@@ -617,19 +631,18 @@ fn parse_stats_list_values_bare() {
         command: CargoSub::Ktstr(k),
     } = Cargo::try_parse_from(["cargo", "ktstr", "stats", "list-values"])
         .unwrap_or_else(|e| panic!("{e}"));
-    match k.command {
-        KtstrCommand::Stats {
-            command: Some(StatsCommand::ListValues { json, dir }),
-            ..
-        } => {
-            assert!(!json, "bare `list-values` must default to text mode");
-            assert!(
-                dir.is_none(),
-                "bare `list-values` must default to no --dir override"
-            );
-        }
-        _ => panic!("expected Stats ListValues"),
-    }
+    let KtstrCommand::Stats {
+        command: Some(StatsCommand::ListValues { json, dir }),
+        ..
+    } = k.command
+    else {
+        panic!("expected Stats ListValues");
+    };
+    assert!(!json, "bare `list-values` must default to text mode");
+    assert!(
+        dir.is_none(),
+        "bare `list-values` must default to no --dir override"
+    );
 }
 
 /// `cargo ktstr stats list-values --json` sets `json=true`.
@@ -641,15 +654,14 @@ fn parse_stats_list_values_json() {
         command: CargoSub::Ktstr(k),
     } = Cargo::try_parse_from(["cargo", "ktstr", "stats", "list-values", "--json"])
         .unwrap_or_else(|e| panic!("{e}"));
-    match k.command {
-        KtstrCommand::Stats {
-            command: Some(StatsCommand::ListValues { json, .. }),
-            ..
-        } => {
-            assert!(json, "--json must set the flag true");
-        }
-        _ => panic!("expected Stats ListValues"),
-    }
+    let KtstrCommand::Stats {
+        command: Some(StatsCommand::ListValues { json, .. }),
+        ..
+    } = k.command
+    else {
+        panic!("expected Stats ListValues");
+    };
+    assert!(json, "--json must set the flag true");
 }
 
 /// `cargo ktstr stats list-values --dir PATH` round-trips the
@@ -668,20 +680,19 @@ fn parse_stats_list_values_with_dir() {
         "/tmp/archived-runs",
     ])
     .unwrap_or_else(|e| panic!("{e}"));
-    match k.command {
-        KtstrCommand::Stats {
-            command: Some(StatsCommand::ListValues { dir, json }),
-            ..
-        } => {
-            assert_eq!(
-                dir.as_deref(),
-                Some(std::path::Path::new("/tmp/archived-runs")),
-                "--dir must round-trip to Some(PathBuf)",
-            );
-            assert!(!json, "bare --dir must not spuriously set --json");
-        }
-        _ => panic!("expected Stats ListValues"),
-    }
+    let KtstrCommand::Stats {
+        command: Some(StatsCommand::ListValues { dir, json }),
+        ..
+    } = k.command
+    else {
+        panic!("expected Stats ListValues");
+    };
+    assert_eq!(
+        dir.as_deref(),
+        Some(std::path::Path::new("/tmp/archived-runs")),
+        "--dir must round-trip to Some(PathBuf)",
+    );
+    assert!(!json, "bare --dir must not spuriously set --json");
 }
 
 /// `list-values` takes no positional args — clap must reject
@@ -720,13 +731,15 @@ fn parse_stats_compare() {
 
 #[test]
 fn parse_stats_compare_with_filter() {
-    let Cargo {
-        command: CargoSub::Ktstr(k),
-    } = Cargo::try_parse_from([
-        "cargo",
-        "ktstr",
-        "stats",
-        "compare",
+    let StatsCommand::Compare {
+        filter,
+        threshold,
+        policy,
+        dir,
+        a_kernel,
+        b_kernel,
+        ..
+    } = parse_compare(&[
         "--a-kernel",
         "6.14",
         "--b-kernel",
@@ -734,41 +747,22 @@ fn parse_stats_compare_with_filter() {
         "-E",
         "cgroup_steady",
     ])
-    .unwrap_or_else(|e| panic!("{e}"));
-    match k.command {
-        KtstrCommand::Stats {
-            command:
-                Some(StatsCommand::Compare {
-                    filter,
-                    threshold,
-                    policy,
-                    dir,
-                    a_kernel,
-                    b_kernel,
-                    ..
-                }),
-            ..
-        } => {
-            assert_eq!(a_kernel, vec!["6.14"]);
-            assert_eq!(b_kernel, vec!["6.15"]);
-            assert_eq!(filter.as_deref(), Some("cgroup_steady"));
-            assert!(threshold.is_none());
-            assert!(policy.is_none());
-            assert!(dir.is_none());
-        }
-        _ => panic!("expected Stats Compare"),
-    }
+    else {
+        unreachable!()
+    };
+    assert_eq!(a_kernel, vec!["6.14"]);
+    assert_eq!(b_kernel, vec!["6.15"]);
+    assert_eq!(filter.as_deref(), Some("cgroup_steady"));
+    assert!(threshold.is_none());
+    assert!(policy.is_none());
+    assert!(dir.is_none());
 }
 
 #[test]
 fn parse_stats_compare_with_threshold() {
-    let Cargo {
-        command: CargoSub::Ktstr(k),
-    } = Cargo::try_parse_from([
-        "cargo",
-        "ktstr",
-        "stats",
-        "compare",
+    let StatsCommand::Compare {
+        threshold, filter, ..
+    } = parse_compare(&[
         "--a-kernel",
         "6.14",
         "--b-kernel",
@@ -776,20 +770,11 @@ fn parse_stats_compare_with_threshold() {
         "--threshold",
         "5.0",
     ])
-    .unwrap_or_else(|e| panic!("{e}"));
-    match k.command {
-        KtstrCommand::Stats {
-            command:
-                Some(StatsCommand::Compare {
-                    threshold, filter, ..
-                }),
-            ..
-        } => {
-            assert_eq!(threshold, Some(5.0));
-            assert!(filter.is_none());
-        }
-        _ => panic!("expected Stats Compare"),
-    }
+    else {
+        unreachable!()
+    };
+    assert_eq!(threshold, Some(5.0));
+    assert!(filter.is_none());
 }
 
 /// Proves the `dir: Option<PathBuf>` field is wired on
@@ -806,13 +791,13 @@ fn parse_stats_compare_with_threshold() {
 /// from the raw argument, full stop.
 #[test]
 fn parse_stats_compare_with_dir() {
-    let Cargo {
-        command: CargoSub::Ktstr(k),
-    } = Cargo::try_parse_from([
-        "cargo",
-        "ktstr",
-        "stats",
-        "compare",
+    let StatsCommand::Compare {
+        filter,
+        threshold,
+        policy,
+        dir,
+        ..
+    } = parse_compare(&[
         "--a-kernel",
         "6.14",
         "--b-kernel",
@@ -820,41 +805,28 @@ fn parse_stats_compare_with_dir() {
         "--dir",
         "/tmp/archived-runs",
     ])
-    .unwrap_or_else(|e| panic!("{e}"));
-    match k.command {
-        KtstrCommand::Stats {
-            command:
-                Some(StatsCommand::Compare {
-                    filter,
-                    threshold,
-                    policy,
-                    dir,
-                    ..
-                }),
-            ..
-        } => {
-            assert_eq!(
-                dir.as_deref(),
-                Some(std::path::Path::new("/tmp/archived-runs")),
-                "--dir must round-trip to Some(PathBuf); \
-                 parse-scope only — resolver coverage lives \
-                 with compare_partitions' own tests",
-            );
-            assert!(
-                filter.is_none(),
-                "bare --dir must not spuriously populate filter",
-            );
-            assert!(
-                threshold.is_none(),
-                "bare --dir must not spuriously populate threshold",
-            );
-            assert!(
-                policy.is_none(),
-                "bare --dir must not spuriously populate policy",
-            );
-        }
-        _ => panic!("expected Stats Compare"),
-    }
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        dir.as_deref(),
+        Some(std::path::Path::new("/tmp/archived-runs")),
+        "--dir must round-trip to Some(PathBuf); \
+         parse-scope only — resolver coverage lives \
+         with compare_partitions' own tests",
+    );
+    assert!(
+        filter.is_none(),
+        "bare --dir must not spuriously populate filter",
+    );
+    assert!(
+        threshold.is_none(),
+        "bare --dir must not spuriously populate threshold",
+    );
+    assert!(
+        policy.is_none(),
+        "bare --dir must not spuriously populate policy",
+    );
 }
 
 /// Positive parse pin: `--policy PATH` round-trips to
@@ -866,13 +838,9 @@ fn parse_stats_compare_with_dir() {
 /// dispatch.
 #[test]
 fn parse_stats_compare_with_policy() {
-    let Cargo {
-        command: CargoSub::Ktstr(k),
-    } = Cargo::try_parse_from([
-        "cargo",
-        "ktstr",
-        "stats",
-        "compare",
+    let StatsCommand::Compare {
+        threshold, policy, ..
+    } = parse_compare(&[
         "--a-kernel",
         "6.14",
         "--b-kernel",
@@ -880,27 +848,18 @@ fn parse_stats_compare_with_policy() {
         "--policy",
         "/tmp/policy.json",
     ])
-    .unwrap_or_else(|e| panic!("{e}"));
-    match k.command {
-        KtstrCommand::Stats {
-            command:
-                Some(StatsCommand::Compare {
-                    threshold, policy, ..
-                }),
-            ..
-        } => {
-            assert_eq!(
-                policy.as_deref(),
-                Some(std::path::Path::new("/tmp/policy.json")),
-                "--policy must round-trip to Some(PathBuf); got {policy:?}",
-            );
-            assert!(
-                threshold.is_none(),
-                "bare --policy must not populate --threshold",
-            );
-        }
-        _ => panic!("expected Stats Compare"),
-    }
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        policy.as_deref(),
+        Some(std::path::Path::new("/tmp/policy.json")),
+        "--policy must round-trip to Some(PathBuf); got {policy:?}",
+    );
+    assert!(
+        threshold.is_none(),
+        "bare --policy must not populate --threshold",
+    );
 }
 
 /// Conflict pin: `--threshold` and `--policy` are mutually
@@ -953,33 +912,17 @@ fn parse_stats_compare_threshold_conflicts_with_policy() {
 /// for "keep each sidecar distinct" semantics.
 #[test]
 fn parse_stats_compare_no_average_default_false() {
-    let Cargo {
-        command: CargoSub::Ktstr(k),
-    } = Cargo::try_parse_from([
-        "cargo",
-        "ktstr",
-        "stats",
-        "compare",
-        "--a-kernel",
-        "6.14",
-        "--b-kernel",
-        "6.15",
-    ])
-    .unwrap_or_else(|e| panic!("{e}"));
-    match k.command {
-        KtstrCommand::Stats {
-            command: Some(StatsCommand::Compare { no_average, .. }),
-            ..
-        } => {
-            assert!(
-                !no_average,
-                "bare compare must default --no-average to false so \
-                 averaging-on remains the default — operators get \
-                 trial-set folding without an explicit flag.",
-            );
-        }
-        _ => panic!("expected Stats Compare"),
-    }
+    let StatsCommand::Compare { no_average, .. } =
+        parse_compare(&["--a-kernel", "6.14", "--b-kernel", "6.15"])
+    else {
+        unreachable!()
+    };
+    assert!(
+        !no_average,
+        "bare compare must default --no-average to false so \
+         averaging-on remains the default — operators get \
+         trial-set folding without an explicit flag.",
+    );
 }
 
 /// `--no-average` parses as a bare flag (no value) and lifts
@@ -989,48 +932,35 @@ fn parse_stats_compare_no_average_default_false() {
 /// made it take a value lands at parse time.
 #[test]
 fn parse_stats_compare_with_no_average() {
-    let Cargo {
-        command: CargoSub::Ktstr(k),
-    } = Cargo::try_parse_from([
-        "cargo",
-        "ktstr",
-        "stats",
-        "compare",
+    let StatsCommand::Compare {
+        no_average,
+        threshold,
+        policy,
+        dir,
+        ..
+    } = parse_compare(&[
         "--a-kernel",
         "6.14",
         "--b-kernel",
         "6.15",
         "--no-average",
     ])
-    .unwrap_or_else(|e| panic!("{e}"));
-    match k.command {
-        KtstrCommand::Stats {
-            command:
-                Some(StatsCommand::Compare {
-                    no_average,
-                    threshold,
-                    policy,
-                    dir,
-                    ..
-                }),
-            ..
-        } => {
-            assert!(no_average, "--no-average must lift the flag to true");
-            assert!(
-                threshold.is_none(),
-                "bare --no-average must not spuriously populate --threshold",
-            );
-            assert!(
-                policy.is_none(),
-                "bare --no-average must not spuriously populate --policy",
-            );
-            assert!(
-                dir.is_none(),
-                "bare --no-average must not spuriously populate --dir",
-            );
-        }
-        _ => panic!("expected Stats Compare"),
-    }
+    else {
+        unreachable!()
+    };
+    assert!(no_average, "--no-average must lift the flag to true");
+    assert!(
+        threshold.is_none(),
+        "bare --no-average must not spuriously populate --threshold",
+    );
+    assert!(
+        policy.is_none(),
+        "bare --no-average must not spuriously populate --policy",
+    );
+    assert!(
+        dir.is_none(),
+        "bare --no-average must not spuriously populate --dir",
+    );
 }
 
 /// `--project-commit V` round-trips to `Compare { project_commit:
@@ -1040,13 +970,12 @@ fn parse_stats_compare_with_no_average() {
 /// dropped its `ArgAction::Append` would land here at parse time.
 #[test]
 fn parse_stats_compare_with_project_commit_single() {
-    let Cargo {
-        command: CargoSub::Ktstr(k),
-    } = Cargo::try_parse_from([
-        "cargo",
-        "ktstr",
-        "stats",
-        "compare",
+    let StatsCommand::Compare {
+        project_commit,
+        a_project_commit,
+        b_project_commit,
+        ..
+    } = parse_compare(&[
         "--project-commit",
         "abc1234",
         "--a-kernel",
@@ -1054,30 +983,18 @@ fn parse_stats_compare_with_project_commit_single() {
         "--b-kernel",
         "6.15",
     ])
-    .unwrap_or_else(|e| panic!("{e}"));
-    match k.command {
-        KtstrCommand::Stats {
-            command:
-                Some(StatsCommand::Compare {
-                    project_commit,
-                    a_project_commit,
-                    b_project_commit,
-                    ..
-                }),
-            ..
-        } => {
-            assert_eq!(project_commit, vec!["abc1234"]);
-            assert!(
-                a_project_commit.is_empty(),
-                "shared --project-commit must not populate --a-project-commit",
-            );
-            assert!(
-                b_project_commit.is_empty(),
-                "shared --project-commit must not populate --b-project-commit",
-            );
-        }
-        _ => panic!("expected Stats Compare"),
-    }
+    else {
+        unreachable!()
+    };
+    assert_eq!(project_commit, vec!["abc1234"]);
+    assert!(
+        a_project_commit.is_empty(),
+        "shared --project-commit must not populate --a-project-commit",
+    );
+    assert!(
+        b_project_commit.is_empty(),
+        "shared --project-commit must not populate --b-project-commit",
+    );
 }
 
 /// `--project-commit A --project-commit B` produces a Vec with two
@@ -1087,13 +1004,7 @@ fn parse_stats_compare_with_project_commit_single() {
 /// drop the first occurrence.
 #[test]
 fn parse_stats_compare_with_project_commit_repeatable() {
-    let Cargo {
-        command: CargoSub::Ktstr(k),
-    } = Cargo::try_parse_from([
-        "cargo",
-        "ktstr",
-        "stats",
-        "compare",
+    let StatsCommand::Compare { project_commit, .. } = parse_compare(&[
         "--project-commit",
         "a",
         "--project-commit",
@@ -1102,17 +1013,10 @@ fn parse_stats_compare_with_project_commit_repeatable() {
         "6.14",
         "--b-kernel",
         "6.15",
-    ])
-    .unwrap_or_else(|e| panic!("{e}"));
-    match k.command {
-        KtstrCommand::Stats {
-            command: Some(StatsCommand::Compare { project_commit, .. }),
-            ..
-        } => {
-            assert_eq!(project_commit, vec!["a", "b"]);
-        }
-        _ => panic!("expected Stats Compare"),
-    }
+    ]) else {
+        unreachable!()
+    };
+    assert_eq!(project_commit, vec!["a", "b"]);
 }
 
 /// `--kernel-commit V` round-trips to `Compare {
@@ -1125,13 +1029,12 @@ fn parse_stats_compare_with_project_commit_repeatable() {
 /// `kernel_commit` dimension.
 #[test]
 fn parse_stats_compare_with_kernel_commit_single() {
-    let Cargo {
-        command: CargoSub::Ktstr(k),
-    } = Cargo::try_parse_from([
-        "cargo",
-        "ktstr",
-        "stats",
-        "compare",
+    let StatsCommand::Compare {
+        kernel_commit,
+        a_kernel_commit,
+        b_kernel_commit,
+        ..
+    } = parse_compare(&[
         "--kernel-commit",
         "abc1234",
         "--a-kernel",
@@ -1139,30 +1042,18 @@ fn parse_stats_compare_with_kernel_commit_single() {
         "--b-kernel",
         "6.15",
     ])
-    .unwrap_or_else(|e| panic!("{e}"));
-    match k.command {
-        KtstrCommand::Stats {
-            command:
-                Some(StatsCommand::Compare {
-                    kernel_commit,
-                    a_kernel_commit,
-                    b_kernel_commit,
-                    ..
-                }),
-            ..
-        } => {
-            assert_eq!(kernel_commit, vec!["abc1234"]);
-            assert!(
-                a_kernel_commit.is_empty(),
-                "shared --kernel-commit must not populate --a-kernel-commit",
-            );
-            assert!(
-                b_kernel_commit.is_empty(),
-                "shared --kernel-commit must not populate --b-kernel-commit",
-            );
-        }
-        _ => panic!("expected Stats Compare"),
-    }
+    else {
+        unreachable!()
+    };
+    assert_eq!(kernel_commit, vec!["abc1234"]);
+    assert!(
+        a_kernel_commit.is_empty(),
+        "shared --kernel-commit must not populate --a-kernel-commit",
+    );
+    assert!(
+        b_kernel_commit.is_empty(),
+        "shared --kernel-commit must not populate --b-kernel-commit",
+    );
 }
 
 /// `--kernel-commit A --kernel-commit B` produces a Vec with
@@ -1171,13 +1062,7 @@ fn parse_stats_compare_with_kernel_commit_single() {
 /// kernel-commit dimension.
 #[test]
 fn parse_stats_compare_with_kernel_commit_repeatable() {
-    let Cargo {
-        command: CargoSub::Ktstr(k),
-    } = Cargo::try_parse_from([
-        "cargo",
-        "ktstr",
-        "stats",
-        "compare",
+    let StatsCommand::Compare { kernel_commit, .. } = parse_compare(&[
         "--kernel-commit",
         "a",
         "--kernel-commit",
@@ -1186,17 +1071,10 @@ fn parse_stats_compare_with_kernel_commit_repeatable() {
         "6.14",
         "--b-kernel",
         "6.15",
-    ])
-    .unwrap_or_else(|e| panic!("{e}"));
-    match k.command {
-        KtstrCommand::Stats {
-            command: Some(StatsCommand::Compare { kernel_commit, .. }),
-            ..
-        } => {
-            assert_eq!(kernel_commit, vec!["a", "b"]);
-        }
-        _ => panic!("expected Stats Compare"),
-    }
+    ]) else {
+        unreachable!()
+    };
+    assert_eq!(kernel_commit, vec!["a", "b"]);
 }
 
 /// `--scheduler A --scheduler B` produces a Vec with two
@@ -1211,13 +1089,7 @@ fn parse_stats_compare_with_kernel_commit_repeatable() {
 /// once" diagnostic.
 #[test]
 fn parse_stats_compare_with_scheduler_repeatable() {
-    let Cargo {
-        command: CargoSub::Ktstr(k),
-    } = Cargo::try_parse_from([
-        "cargo",
-        "ktstr",
-        "stats",
-        "compare",
+    let StatsCommand::Compare { scheduler, .. } = parse_compare(&[
         "--scheduler",
         "scx_alpha",
         "--scheduler",
@@ -1226,17 +1098,10 @@ fn parse_stats_compare_with_scheduler_repeatable() {
         "6.14",
         "--b-kernel",
         "6.15",
-    ])
-    .unwrap_or_else(|e| panic!("{e}"));
-    match k.command {
-        KtstrCommand::Stats {
-            command: Some(StatsCommand::Compare { scheduler, .. }),
-            ..
-        } => {
-            assert_eq!(scheduler, vec!["scx_alpha", "scx_beta"]);
-        }
-        _ => panic!("expected Stats Compare"),
-    }
+    ]) else {
+        unreachable!()
+    };
+    assert_eq!(scheduler, vec!["scx_alpha", "scx_beta"]);
 }
 
 /// `--topology A --topology B` produces a Vec with two
@@ -1246,13 +1111,7 @@ fn parse_stats_compare_with_scheduler_repeatable() {
 /// label that flows verbatim through clap into this Vec.
 #[test]
 fn parse_stats_compare_with_topology_repeatable() {
-    let Cargo {
-        command: CargoSub::Ktstr(k),
-    } = Cargo::try_parse_from([
-        "cargo",
-        "ktstr",
-        "stats",
-        "compare",
+    let StatsCommand::Compare { topology, .. } = parse_compare(&[
         "--topology",
         "1n2l4c2t",
         "--topology",
@@ -1261,17 +1120,10 @@ fn parse_stats_compare_with_topology_repeatable() {
         "6.14",
         "--b-kernel",
         "6.15",
-    ])
-    .unwrap_or_else(|e| panic!("{e}"));
-    match k.command {
-        KtstrCommand::Stats {
-            command: Some(StatsCommand::Compare { topology, .. }),
-            ..
-        } => {
-            assert_eq!(topology, vec!["1n2l4c2t", "1n4l2c1t"]);
-        }
-        _ => panic!("expected Stats Compare"),
-    }
+    ]) else {
+        unreachable!()
+    };
+    assert_eq!(topology, vec!["1n2l4c2t", "1n4l2c1t"]);
 }
 
 /// `--work-type A --work-type B` produces a Vec with two
@@ -1283,13 +1135,7 @@ fn parse_stats_compare_with_topology_repeatable() {
 /// underscored field after a hyphenated invocation.
 #[test]
 fn parse_stats_compare_with_work_type_repeatable() {
-    let Cargo {
-        command: CargoSub::Ktstr(k),
-    } = Cargo::try_parse_from([
-        "cargo",
-        "ktstr",
-        "stats",
-        "compare",
+    let StatsCommand::Compare { work_type, .. } = parse_compare(&[
         "--work-type",
         "SpinWait",
         "--work-type",
@@ -1298,17 +1144,10 @@ fn parse_stats_compare_with_work_type_repeatable() {
         "6.14",
         "--b-kernel",
         "6.15",
-    ])
-    .unwrap_or_else(|e| panic!("{e}"));
-    match k.command {
-        KtstrCommand::Stats {
-            command: Some(StatsCommand::Compare { work_type, .. }),
-            ..
-        } => {
-            assert_eq!(work_type, vec!["SpinWait", "PageFaultChurn"]);
-        }
-        _ => panic!("expected Stats Compare"),
-    }
+    ]) else {
+        unreachable!()
+    };
+    assert_eq!(work_type, vec!["SpinWait", "PageFaultChurn"]);
 }
 
 /// `--a-kernel-commit X --b-kernel-commit Y` populates the
@@ -1320,40 +1159,27 @@ fn parse_stats_compare_with_work_type_repeatable() {
 /// kernel HEAD.
 #[test]
 fn parse_stats_compare_with_per_side_kernel_commit() {
-    let Cargo {
-        command: CargoSub::Ktstr(k),
-    } = Cargo::try_parse_from([
-        "cargo",
-        "ktstr",
-        "stats",
-        "compare",
+    let StatsCommand::Compare {
+        kernel_commit,
+        a_kernel_commit,
+        b_kernel_commit,
+        ..
+    } = parse_compare(&[
         "--a-kernel-commit",
         "abc1234",
         "--b-kernel-commit",
         "def5678",
     ])
-    .unwrap_or_else(|e| panic!("{e}"));
-    match k.command {
-        KtstrCommand::Stats {
-            command:
-                Some(StatsCommand::Compare {
-                    kernel_commit,
-                    a_kernel_commit,
-                    b_kernel_commit,
-                    ..
-                }),
-            ..
-        } => {
-            assert!(
-                kernel_commit.is_empty(),
-                "per-side --a-kernel-commit / --b-kernel-commit must not \
-                 populate the shared --kernel-commit vec",
-            );
-            assert_eq!(a_kernel_commit, vec!["abc1234"]);
-            assert_eq!(b_kernel_commit, vec!["def5678"]);
-        }
-        _ => panic!("expected Stats Compare"),
-    }
+    else {
+        unreachable!()
+    };
+    assert!(
+        kernel_commit.is_empty(),
+        "per-side --a-kernel-commit / --b-kernel-commit must not \
+         populate the shared --kernel-commit vec",
+    );
+    assert_eq!(a_kernel_commit, vec!["abc1234"]);
+    assert_eq!(b_kernel_commit, vec!["def5678"]);
 }
 
 /// `cargo ktstr stats show-host --run X` parses to
@@ -1364,16 +1190,15 @@ fn parse_stats_show_host_with_run() {
         command: CargoSub::Ktstr(k),
     } = Cargo::try_parse_from(["cargo", "ktstr", "stats", "show-host", "--run", "my-run-id"])
         .unwrap_or_else(|e| panic!("{e}"));
-    match k.command {
-        KtstrCommand::Stats {
-            command: Some(StatsCommand::ShowHost { run, dir }),
-            ..
-        } => {
-            assert_eq!(run, "my-run-id");
-            assert!(dir.is_none(), "bare --run must not populate --dir");
-        }
-        _ => panic!("expected Stats ShowHost"),
-    }
+    let KtstrCommand::Stats {
+        command: Some(StatsCommand::ShowHost { run, dir }),
+        ..
+    } = k.command
+    else {
+        panic!("expected Stats ShowHost");
+    };
+    assert_eq!(run, "my-run-id");
+    assert!(dir.is_none(), "bare --run must not populate --dir");
 }
 
 /// `cargo ktstr stats show-host --run X --dir PATH` carries
@@ -1395,19 +1220,18 @@ fn parse_stats_show_host_with_dir() {
         "/tmp/archived-runs",
     ])
     .unwrap_or_else(|e| panic!("{e}"));
-    match k.command {
-        KtstrCommand::Stats {
-            command: Some(StatsCommand::ShowHost { run, dir }),
-            ..
-        } => {
-            assert_eq!(run, "archive-2024-01-15");
-            assert_eq!(
-                dir.as_deref(),
-                Some(std::path::Path::new("/tmp/archived-runs")),
-            );
-        }
-        _ => panic!("expected Stats ShowHost"),
-    }
+    let KtstrCommand::Stats {
+        command: Some(StatsCommand::ShowHost { run, dir }),
+        ..
+    } = k.command
+    else {
+        panic!("expected Stats ShowHost");
+    };
+    assert_eq!(run, "archive-2024-01-15");
+    assert_eq!(
+        dir.as_deref(),
+        Some(std::path::Path::new("/tmp/archived-runs")),
+    );
 }
 
 /// `cargo ktstr stats show-host` WITHOUT `--run` must fail at
@@ -1438,17 +1262,16 @@ fn parse_stats_explain_sidecar_with_run() {
         "my-run-id",
     ])
     .unwrap_or_else(|e| panic!("{e}"));
-    match k.command {
-        KtstrCommand::Stats {
-            command: Some(StatsCommand::ExplainSidecar { run, dir, json }),
-            ..
-        } => {
-            assert_eq!(run, "my-run-id");
-            assert!(dir.is_none(), "bare --run must not populate --dir");
-            assert!(!json, "default output is text, not json");
-        }
-        _ => panic!("expected Stats ExplainSidecar"),
-    }
+    let KtstrCommand::Stats {
+        command: Some(StatsCommand::ExplainSidecar { run, dir, json }),
+        ..
+    } = k.command
+    else {
+        panic!("expected Stats ExplainSidecar");
+    };
+    assert_eq!(run, "my-run-id");
+    assert!(dir.is_none(), "bare --run must not populate --dir");
+    assert!(!json, "default output is text, not json");
 }
 
 /// `cargo ktstr stats explain-sidecar --run X --dir PATH
@@ -1471,20 +1294,19 @@ fn parse_stats_explain_sidecar_with_dir_and_json() {
         "--json",
     ])
     .unwrap_or_else(|e| panic!("{e}"));
-    match k.command {
-        KtstrCommand::Stats {
-            command: Some(StatsCommand::ExplainSidecar { run, dir, json }),
-            ..
-        } => {
-            assert_eq!(run, "archive-2024-01-15");
-            assert_eq!(
-                dir.as_deref(),
-                Some(std::path::Path::new("/tmp/archived-runs")),
-            );
-            assert!(json, "--json must toggle aggregate JSON output");
-        }
-        _ => panic!("expected Stats ExplainSidecar"),
-    }
+    let KtstrCommand::Stats {
+        command: Some(StatsCommand::ExplainSidecar { run, dir, json }),
+        ..
+    } = k.command
+    else {
+        panic!("expected Stats ExplainSidecar");
+    };
+    assert_eq!(run, "archive-2024-01-15");
+    assert_eq!(
+        dir.as_deref(),
+        Some(std::path::Path::new("/tmp/archived-runs")),
+    );
+    assert!(json, "--json must toggle aggregate JSON output");
 }
 
 /// `cargo ktstr stats explain-sidecar` WITHOUT `--run` must
@@ -1527,21 +1349,19 @@ fn parse_kernel_list_range() {
         command: CargoSub::Ktstr(k),
     } = Cargo::try_parse_from(["cargo", "ktstr", "kernel", "list", "--range", "6.12..6.14"])
         .unwrap_or_else(|e| panic!("{e}"));
-    match k.command {
-        KtstrCommand::Kernel { command } => match command {
-            KernelCommand::List { json, range } => {
-                assert!(!json, "bare --range must not enable --json");
-                assert_eq!(
-                    range.as_deref(),
-                    Some("6.12..6.14"),
-                    "--range must round-trip the literal spec for \
-                     dispatch to pass to `expand_kernel_range`",
-                );
-            }
-            other => panic!("expected KernelCommand::List, got {other:?}"),
-        },
-        _ => panic!("expected Kernel"),
-    }
+    let KtstrCommand::Kernel { command } = k.command else {
+        panic!("expected Kernel");
+    };
+    let KernelCommand::List { json, range } = command else {
+        panic!("expected KernelCommand::List, got {command:?}");
+    };
+    assert!(!json, "bare --range must not enable --json");
+    assert_eq!(
+        range.as_deref(),
+        Some("6.12..6.14"),
+        "--range must round-trip the literal spec for \
+         dispatch to pass to `expand_kernel_range`",
+    );
 }
 
 /// `kernel list --range R --json` round-trips both flags.
@@ -1562,16 +1382,14 @@ fn parse_kernel_list_range_with_json() {
         "--json",
     ])
     .unwrap_or_else(|e| panic!("{e}"));
-    match k.command {
-        KtstrCommand::Kernel { command } => match command {
-            KernelCommand::List { json, range } => {
-                assert!(json, "--json must round-trip alongside --range");
-                assert_eq!(range.as_deref(), Some("6.12..6.14"));
-            }
-            other => panic!("expected KernelCommand::List, got {other:?}"),
-        },
-        _ => panic!("expected Kernel"),
-    }
+    let KtstrCommand::Kernel { command } = k.command else {
+        panic!("expected Kernel");
+    };
+    let KernelCommand::List { json, range } = command else {
+        panic!("expected KernelCommand::List, got {command:?}");
+    };
+    assert!(json, "--json must round-trip alongside --range");
+    assert_eq!(range.as_deref(), Some("6.12..6.14"));
 }
 
 /// `--run-source V` round-trips to `Compare { run_source: vec![V],
@@ -1581,13 +1399,12 @@ fn parse_kernel_list_range_with_json() {
 /// `--b-run-source` are covered by the `_per_side` sibling below.
 #[test]
 fn parse_stats_compare_with_run_source_single() {
-    let Cargo {
-        command: CargoSub::Ktstr(k),
-    } = Cargo::try_parse_from([
-        "cargo",
-        "ktstr",
-        "stats",
-        "compare",
+    let StatsCommand::Compare {
+        run_source,
+        a_run_source,
+        b_run_source,
+        ..
+    } = parse_compare(&[
         "--a-kernel",
         "6.14",
         "--b-kernel",
@@ -1595,34 +1412,22 @@ fn parse_stats_compare_with_run_source_single() {
         "--run-source",
         "ci",
     ])
-    .unwrap_or_else(|e| panic!("{e}"));
-    match k.command {
-        KtstrCommand::Stats {
-            command:
-                Some(StatsCommand::Compare {
-                    run_source,
-                    a_run_source,
-                    b_run_source,
-                    ..
-                }),
-            ..
-        } => {
-            assert_eq!(
-                run_source,
-                vec!["ci".to_string()],
-                "shared --run-source must populate the shared vec",
-            );
-            assert!(
-                a_run_source.is_empty(),
-                "shared --run-source must not populate --a-run-source",
-            );
-            assert!(
-                b_run_source.is_empty(),
-                "shared --run-source must not populate --b-run-source",
-            );
-        }
-        _ => panic!("expected Stats Compare"),
-    }
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        run_source,
+        vec!["ci".to_string()],
+        "shared --run-source must populate the shared vec",
+    );
+    assert!(
+        a_run_source.is_empty(),
+        "shared --run-source must not populate --a-run-source",
+    );
+    assert!(
+        b_run_source.is_empty(),
+        "shared --run-source must not populate --b-run-source",
+    );
 }
 
 /// `--a-run-source A --b-run-source B` round-trips to populated
@@ -1633,39 +1438,26 @@ fn parse_stats_compare_with_run_source_single() {
 /// here.
 #[test]
 fn parse_stats_compare_with_run_source_per_side() {
-    let Cargo {
-        command: CargoSub::Ktstr(k),
-    } = Cargo::try_parse_from([
-        "cargo",
-        "ktstr",
-        "stats",
-        "compare",
+    let StatsCommand::Compare {
+        run_source,
+        a_run_source,
+        b_run_source,
+        ..
+    } = parse_compare(&[
         "--a-run-source",
         "ci",
         "--b-run-source",
         "local",
     ])
-    .unwrap_or_else(|e| panic!("{e}"));
-    match k.command {
-        KtstrCommand::Stats {
-            command:
-                Some(StatsCommand::Compare {
-                    run_source,
-                    a_run_source,
-                    b_run_source,
-                    ..
-                }),
-            ..
-        } => {
-            assert!(
-                run_source.is_empty(),
-                "per-side flags must not populate the shared --run-source vec",
-            );
-            assert_eq!(a_run_source, vec!["ci".to_string()]);
-            assert_eq!(b_run_source, vec!["local".to_string()]);
-        }
-        _ => panic!("expected Stats Compare"),
-    }
+    else {
+        unreachable!()
+    };
+    assert!(
+        run_source.is_empty(),
+        "per-side flags must not populate the shared --run-source vec",
+    );
+    assert_eq!(a_run_source, vec!["ci".to_string()]);
+    assert_eq!(b_run_source, vec!["local".to_string()]);
 }
 
 // -- try_get_matches_from: kernel build --
@@ -1800,24 +1592,23 @@ fn parse_kernel_build_with_extra_kconfig() {
         "/tmp/extra.kconfig",
     ])
     .unwrap_or_else(|e| panic!("{e}"));
-    match k.command {
-        KtstrCommand::Kernel {
-            command:
-                KernelCommand::Build {
-                    version,
-                    extra_kconfig,
-                    ..
-                },
-        } => {
-            assert_eq!(version.as_deref(), Some("6.14.2"));
-            assert_eq!(
+    let KtstrCommand::Kernel {
+        command:
+            KernelCommand::Build {
+                version,
                 extra_kconfig,
-                Some(std::path::PathBuf::from("/tmp/extra.kconfig")),
-                "--extra-kconfig must round-trip the literal path",
-            );
-        }
-        _ => panic!("expected KernelCommand::Build"),
-    }
+                ..
+            },
+    } = k.command
+    else {
+        panic!("expected KernelCommand::Build");
+    };
+    assert_eq!(version.as_deref(), Some("6.14.2"));
+    assert_eq!(
+        extra_kconfig,
+        Some(std::path::PathBuf::from("/tmp/extra.kconfig")),
+        "--extra-kconfig must round-trip the literal path",
+    );
 }
 
 /// Bare `kernel build VERSION` (no `--extra-kconfig`) parses to
@@ -1829,17 +1620,16 @@ fn parse_kernel_build_without_extra_kconfig_is_none() {
         command: CargoSub::Ktstr(k),
     } = Cargo::try_parse_from(["cargo", "ktstr", "kernel", "build", "6.14.2"])
         .unwrap_or_else(|e| panic!("{e}"));
-    match k.command {
-        KtstrCommand::Kernel {
-            command: KernelCommand::Build { extra_kconfig, .. },
-        } => {
-            assert!(
-                extra_kconfig.is_none(),
-                "no --extra-kconfig must produce None, got {extra_kconfig:?}",
-            );
-        }
-        _ => panic!("expected KernelCommand::Build"),
-    }
+    let KtstrCommand::Kernel {
+        command: KernelCommand::Build { extra_kconfig, .. },
+    } = k.command
+    else {
+        panic!("expected KernelCommand::Build");
+    };
+    assert!(
+        extra_kconfig.is_none(),
+        "no --extra-kconfig must produce None, got {extra_kconfig:?}",
+    );
 }
 
 /// Range expansion + --extra-kconfig composes at the parse
@@ -1865,23 +1655,22 @@ fn parse_kernel_build_range_with_extra_kconfig() {
         "/tmp/range-extra.kconfig",
     ])
     .unwrap_or_else(|e| panic!("{e}"));
-    match k.command {
-        KtstrCommand::Kernel {
-            command:
-                KernelCommand::Build {
-                    version,
-                    extra_kconfig,
-                    ..
-                },
-        } => {
-            assert_eq!(version.as_deref(), Some("6.14.2..6.14.4"));
-            assert_eq!(
+    let KtstrCommand::Kernel {
+        command:
+            KernelCommand::Build {
+                version,
                 extra_kconfig,
-                Some(std::path::PathBuf::from("/tmp/range-extra.kconfig")),
-            );
-        }
-        _ => panic!("expected KernelCommand::Build"),
-    }
+                ..
+            },
+    } = k.command
+    else {
+        panic!("expected KernelCommand::Build");
+    };
+    assert_eq!(version.as_deref(), Some("6.14.2..6.14.4"));
+    assert_eq!(
+        extra_kconfig,
+        Some(std::path::PathBuf::from("/tmp/range-extra.kconfig")),
+    );
 }
 
 /// --force + --clean + --extra-kconfig orthogonality. None of
@@ -1906,32 +1695,31 @@ fn parse_kernel_build_force_clean_and_extra_kconfig_compose() {
         "/tmp/extra.kconfig",
     ])
     .unwrap_or_else(|e| panic!("{e}"));
-    match k.command {
-        KtstrCommand::Kernel {
-            command:
-                KernelCommand::Build {
-                    force,
-                    clean,
-                    extra_kconfig,
-                    ..
-                },
-        } => {
-            assert!(
+    let KtstrCommand::Kernel {
+        command:
+            KernelCommand::Build {
                 force,
-                "--force must round-trip alongside --clean and --extra-kconfig"
-            );
-            assert!(
                 clean,
-                "--clean must round-trip alongside --force and --extra-kconfig"
-            );
-            assert_eq!(
                 extra_kconfig,
-                Some(std::path::PathBuf::from("/tmp/extra.kconfig")),
-                "--extra-kconfig must round-trip when combined with --force + --clean",
-            );
-        }
-        _ => panic!("expected KernelCommand::Build"),
-    }
+                ..
+            },
+    } = k.command
+    else {
+        panic!("expected KernelCommand::Build");
+    };
+    assert!(
+        force,
+        "--force must round-trip alongside --clean and --extra-kconfig"
+    );
+    assert!(
+        clean,
+        "--clean must round-trip alongside --force and --extra-kconfig"
+    );
+    assert_eq!(
+        extra_kconfig,
+        Some(std::path::PathBuf::from("/tmp/extra.kconfig")),
+        "--extra-kconfig must round-trip when combined with --force + --clean",
+    );
 }
 
 /// Non-build subcommands that accept `--extra-kconfig` would
@@ -2010,18 +1798,16 @@ fn parse_extra_kconfig_passes_through_test_subcommand_to_args_vec() {
         "/tmp/x.kconfig",
     ])
     .unwrap_or_else(|e| panic!("{e}"));
-    match k.command {
-        KtstrCommand::Test { args, .. } => {
-            assert_eq!(
-                args,
-                vec!["--extra-kconfig", "/tmp/x.kconfig"],
-                "--extra-kconfig must passthrough into `args` Vec on test \
-                 subcommand (trailing_var_arg = true). The cargo nextest \
-                 subprocess will reject it as an unknown flag downstream."
-            );
-        }
-        _ => panic!("expected KtstrCommand::Test"),
-    }
+    let KtstrCommand::Test { args, .. } = k.command else {
+        panic!("expected KtstrCommand::Test");
+    };
+    assert_eq!(
+        args,
+        vec!["--extra-kconfig", "/tmp/x.kconfig"],
+        "--extra-kconfig must passthrough into `args` Vec on test \
+         subcommand (trailing_var_arg = true). The cargo nextest \
+         subprocess will reject it as an unknown flag downstream."
+    );
 }
 
 /// `--extra-kconfig` works alongside `--source` (local source
@@ -2043,23 +1829,22 @@ fn parse_kernel_build_extra_kconfig_with_source() {
         "/tmp/extra.kconfig",
     ])
     .unwrap_or_else(|e| panic!("{e}"));
-    match k.command {
-        KtstrCommand::Kernel {
-            command:
-                KernelCommand::Build {
-                    source,
-                    extra_kconfig,
-                    ..
-                },
-        } => {
-            assert_eq!(source, Some(std::path::PathBuf::from("../linux")));
-            assert_eq!(
+    let KtstrCommand::Kernel {
+        command:
+            KernelCommand::Build {
+                source,
                 extra_kconfig,
-                Some(std::path::PathBuf::from("/tmp/extra.kconfig")),
-            );
-        }
-        _ => panic!("expected KernelCommand::Build"),
-    }
+                ..
+            },
+    } = k.command
+    else {
+        panic!("expected KernelCommand::Build");
+    };
+    assert_eq!(source, Some(std::path::PathBuf::from("../linux")));
+    assert_eq!(
+        extra_kconfig,
+        Some(std::path::PathBuf::from("/tmp/extra.kconfig")),
+    );
 }
 
 // -- try_get_matches_from: kernel clean --
@@ -2076,14 +1861,13 @@ fn parse_kernel_clean_keep() {
         command: CargoSub::Ktstr(k),
     } = Cargo::try_parse_from(["cargo", "ktstr", "kernel", "clean", "--keep", "3"])
         .unwrap_or_else(|e| panic!("{e}"));
-    match k.command {
-        KtstrCommand::Kernel {
-            command: KernelCommand::Clean { keep, .. },
-        } => {
-            assert_eq!(keep, Some(3));
-        }
-        _ => panic!("expected Kernel Clean"),
-    }
+    let KtstrCommand::Kernel {
+        command: KernelCommand::Clean { keep, .. },
+    } = k.command
+    else {
+        panic!("expected Kernel Clean");
+    };
+    assert_eq!(keep, Some(3));
 }
 
 // -- try_get_matches_from: verifier --
@@ -2156,12 +1940,10 @@ fn parse_verifier_profiles_filter() {
         "default,llc,llc+steal",
     ])
     .unwrap_or_else(|e| panic!("{e}"));
-    match k.command {
-        KtstrCommand::Verifier { profiles, .. } => {
-            assert_eq!(profiles, vec!["default", "llc", "llc+steal"]);
-        }
-        _ => panic!("expected Verifier"),
-    }
+    let KtstrCommand::Verifier { profiles, .. } = k.command else {
+        panic!("expected Verifier");
+    };
+    assert_eq!(profiles, vec!["default", "llc", "llc+steal"]);
 }
 
 // -- try_get_matches_from: completions --
@@ -2492,12 +2274,10 @@ fn parse_show_thresholds_with_test_arg() {
         command: CargoSub::Ktstr(k),
     } = Cargo::try_parse_from(["cargo", "ktstr", "show-thresholds", "my_test_fn"])
         .unwrap_or_else(|e| panic!("{e}"));
-    match k.command {
-        KtstrCommand::ShowThresholds { test } => {
-            assert_eq!(test, "my_test_fn");
-        }
-        _ => panic!("expected ShowThresholds"),
-    }
+    let KtstrCommand::ShowThresholds { test } = k.command else {
+        panic!("expected ShowThresholds");
+    };
+    assert_eq!(test, "my_test_fn");
 }
 
 /// `show-thresholds` without the test-name argument must fail
@@ -2592,17 +2372,16 @@ fn parse_shell_cpu_cap_with_no_perf_mode_succeeds() {
         "--no-perf-mode",
     ])
     .unwrap_or_else(|e| panic!("{e}"));
-    match k.command {
-        KtstrCommand::Shell {
-            cpu_cap,
-            no_perf_mode,
-            ..
-        } => {
-            assert_eq!(cpu_cap, Some(4));
-            assert!(no_perf_mode, "--no-perf-mode must be set");
-        }
-        _ => panic!("expected Shell"),
-    }
+    let KtstrCommand::Shell {
+        cpu_cap,
+        no_perf_mode,
+        ..
+    } = k.command
+    else {
+        panic!("expected Shell");
+    };
+    assert_eq!(cpu_cap, Some(4));
+    assert!(no_perf_mode, "--no-perf-mode must be set");
 }
 
 /// `cargo ktstr shell --cpu-cap 4` without `--no-perf-mode`
@@ -2644,17 +2423,16 @@ fn parse_shell_no_perf_mode_without_cpu_cap_succeeds() {
         command: CargoSub::Ktstr(k),
     } = Cargo::try_parse_from(["cargo", "ktstr", "shell", "--no-perf-mode"])
         .unwrap_or_else(|e| panic!("{e}"));
-    match k.command {
-        KtstrCommand::Shell {
-            cpu_cap,
-            no_perf_mode,
-            ..
-        } => {
-            assert_eq!(cpu_cap, None, "no --cpu-cap must produce None");
-            assert!(no_perf_mode);
-        }
-        _ => panic!("expected Shell"),
-    }
+    let KtstrCommand::Shell {
+        cpu_cap,
+        no_perf_mode,
+        ..
+    } = k.command
+    else {
+        panic!("expected Shell");
+    };
+    assert_eq!(cpu_cap, None, "no --cpu-cap must produce None");
+    assert!(no_perf_mode);
 }
 
 // ---------------------------------------------------------------
@@ -2754,4 +2532,909 @@ fn kernel_list_long_about_exposes_range_mode_json_keys() {
          scripted consumers know to dispatch on the presence of the \
          `range` key: got: {about:?}",
     );
+}
+
+// -- try_get_matches_from: model subcommand --
+//
+// `cargo ktstr model <fetch|status|clean>` pins each
+// `ModelCommand` variant — a regression that renamed a subcommand
+// or restructured the enum surfaces here at parse time.
+
+/// `cargo ktstr model fetch` resolves to `ModelCommand::Fetch`.
+#[test]
+fn parse_model_fetch() {
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from(["cargo", "ktstr", "model", "fetch"])
+        .unwrap_or_else(|e| panic!("{e}"));
+    let KtstrCommand::Model { command } = k.command else {
+        panic!("expected Model");
+    };
+    assert!(matches!(command, ModelCommand::Fetch));
+}
+
+/// `cargo ktstr model status` resolves to `ModelCommand::Status`.
+#[test]
+fn parse_model_status() {
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from(["cargo", "ktstr", "model", "status"])
+        .unwrap_or_else(|e| panic!("{e}"));
+    let KtstrCommand::Model { command } = k.command else {
+        panic!("expected Model");
+    };
+    assert!(matches!(command, ModelCommand::Status));
+}
+
+/// `cargo ktstr model clean` resolves to `ModelCommand::Clean`.
+#[test]
+fn parse_model_clean() {
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from(["cargo", "ktstr", "model", "clean"])
+        .unwrap_or_else(|e| panic!("{e}"));
+    let KtstrCommand::Model { command } = k.command else {
+        panic!("expected Model");
+    };
+    assert!(matches!(command, ModelCommand::Clean));
+}
+
+/// `cargo ktstr model` without a subcommand must fail at parse
+/// time — the enum carries no Option<ModelCommand>, so clap
+/// requires one of the three.
+#[test]
+fn parse_model_missing_subcommand_rejected() {
+    let rejected = Cargo::try_parse_from(["cargo", "ktstr", "model"]);
+    assert!(
+        rejected.is_err(),
+        "model must require a subcommand (fetch/status/clean)",
+    );
+}
+
+/// `cargo ktstr model unknown` rejects unknown subcommand names —
+/// pins the closed enum shape so a typo doesn't fall through to
+/// a different code path.
+#[test]
+fn parse_model_unknown_subcommand_rejected() {
+    let rejected = Cargo::try_parse_from(["cargo", "ktstr", "model", "wat"]);
+    assert!(
+        rejected.is_err(),
+        "model must reject unknown subcommands",
+    );
+}
+
+// -- try_get_matches_from: funify subcommand --
+//
+// `cargo ktstr funify` (alias `costume`) reads JSON from stdin
+// or a file and emits a deterministic petname-substituted
+// transformation. Tests pin the input/seed/pretty fields plus
+// the `costume` visible alias dispatch.
+
+/// `cargo ktstr funify` parses bare with all fields default.
+#[test]
+fn parse_funify_bare() {
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from(["cargo", "ktstr", "funify"])
+        .unwrap_or_else(|e| panic!("{e}"));
+    let KtstrCommand::Funify {
+        input,
+        seed,
+        pretty,
+    } = k.command
+    else {
+        panic!("expected Funify");
+    };
+    assert!(input.is_none(), "bare funify must default --input to None");
+    assert!(seed.is_none(), "bare funify must default --seed to None");
+    assert!(!pretty, "bare funify must default --pretty to false");
+}
+
+/// `cargo ktstr funify <PATH>` round-trips the positional input
+/// path into `Funify { input: Some(PathBuf), .. }`.
+#[test]
+fn parse_funify_with_input_path() {
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from([
+        "cargo",
+        "ktstr",
+        "funify",
+        "/tmp/dump.json",
+    ])
+    .unwrap_or_else(|e| panic!("{e}"));
+    let KtstrCommand::Funify { input, .. } = k.command else {
+        panic!("expected Funify");
+    };
+    assert_eq!(
+        input,
+        Some(std::path::PathBuf::from("/tmp/dump.json")),
+        "positional INPUT must round-trip to Some(PathBuf)",
+    );
+}
+
+/// `cargo ktstr funify --seed S --pretty` round-trips both flags.
+#[test]
+fn parse_funify_with_seed_and_pretty() {
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from([
+        "cargo",
+        "ktstr",
+        "funify",
+        "--seed",
+        "demo",
+        "--pretty",
+    ])
+    .unwrap_or_else(|e| panic!("{e}"));
+    let KtstrCommand::Funify {
+        input,
+        seed,
+        pretty,
+    } = k.command
+    else {
+        panic!("expected Funify");
+    };
+    assert!(input.is_none(), "no positional INPUT must produce None");
+    assert_eq!(seed.as_deref(), Some("demo"));
+    assert!(pretty, "--pretty must lift the flag to true");
+}
+
+/// The `costume` visible alias dispatches to the same `Funify`
+/// variant. `visible_alias = "costume"` on the variant makes the
+/// alias user-facing; a regression that dropped or renamed it
+/// surfaces here as an unknown-subcommand parse error.
+#[test]
+fn parse_funify_costume_alias_dispatches_to_funify() {
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from(["cargo", "ktstr", "costume"])
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert!(
+        matches!(k.command, KtstrCommand::Funify { .. }),
+        "`costume` alias must dispatch to the Funify variant",
+    );
+}
+
+/// Sibling pin to [`parse_funify_costume_alias_dispatches_to_funify`]:
+/// the `costume` alias inherits the canonical `Funify` variant's full
+/// arg surface (positional INPUT, `--seed`, `--pretty`). Mirrors the
+/// `nextest` alias coverage — the alias path must NOT regress to a
+/// distinct parse tree that silently drops fields. A clap regression
+/// that re-generated the costume subcommand without inheriting the
+/// Funify variant's args would surface here at parse time.
+#[test]
+fn parse_funify_costume_alias_with_seed_and_pretty() {
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from([
+        "cargo",
+        "ktstr",
+        "costume",
+        "/tmp/dump.json",
+        "--seed",
+        "demo",
+        "--pretty",
+    ])
+    .unwrap_or_else(|e| panic!("{e}"));
+    let KtstrCommand::Funify {
+        input,
+        seed,
+        pretty,
+    } = k.command
+    else {
+        panic!("expected Funify (via `costume` alias)");
+    };
+    assert_eq!(
+        input,
+        Some(std::path::PathBuf::from("/tmp/dump.json")),
+        "costume alias must round-trip the positional INPUT",
+    );
+    assert_eq!(seed.as_deref(), Some("demo"));
+    assert!(pretty, "--pretty must lift the flag to true on costume alias");
+}
+
+/// `cargo ktstr funify -` round-trips the dash sentinel into
+/// `Funify { input: Some(PathBuf("-")), .. }`. The dispatch site
+/// (`funify.rs`) keys on this exact form for stdin mode — without a
+/// pin here, a future `value_parser` mapping `-` to `None` would
+/// silently dead-code the stdin path while the help text still
+/// promised `Pass `-` (or omit) to read from stdin`.
+#[test]
+fn parse_funify_with_dash_input() {
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from(["cargo", "ktstr", "funify", "-"])
+        .unwrap_or_else(|e| panic!("{e}"));
+    let KtstrCommand::Funify { input, .. } = k.command else {
+        panic!("expected Funify");
+    };
+    assert_eq!(
+        input,
+        Some(std::path::PathBuf::from("-")),
+        "the `-` stdin sentinel must round-trip as Some(PathBuf(\"-\")), \
+         NOT collapse to None — the dispatch path keys on this exact form",
+    );
+}
+
+// -- try_get_matches_from: export subcommand --
+//
+// `cargo ktstr export <test>` produces a self-extracting `.run`
+// reproducer for a registered test. Tests pin the positional
+// test name plus the `--output`, `--package`, and `--release`
+// flags.
+
+/// `cargo ktstr export <test>` round-trips the bare positional
+/// test name with all option fields defaulting to None/false.
+#[test]
+fn parse_export_with_test_arg() {
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from([
+        "cargo",
+        "ktstr",
+        "export",
+        "preempt_regression_fault_under_load",
+    ])
+    .unwrap_or_else(|e| panic!("{e}"));
+    let KtstrCommand::Export {
+        test,
+        output,
+        package,
+        release,
+    } = k.command
+    else {
+        panic!("expected Export");
+    };
+    assert_eq!(test, "preempt_regression_fault_under_load");
+    assert!(output.is_none(), "bare export must default --output to None");
+    assert!(package.is_none(), "bare export must default --package to None");
+    assert!(!release, "bare export must default --release to false");
+}
+
+/// `cargo ktstr export <test> -o PATH --package P --release`
+/// round-trips every flag plus the positional argument.
+#[test]
+fn parse_export_with_all_flags() {
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from([
+        "cargo",
+        "ktstr",
+        "export",
+        "my_test_fn",
+        "-o",
+        "/tmp/out.run",
+        "--package",
+        "scx_rusty",
+        "--release",
+    ])
+    .unwrap_or_else(|e| panic!("{e}"));
+    let KtstrCommand::Export {
+        test,
+        output,
+        package,
+        release,
+    } = k.command
+    else {
+        panic!("expected Export");
+    };
+    assert_eq!(test, "my_test_fn");
+    assert_eq!(
+        output,
+        Some(std::path::PathBuf::from("/tmp/out.run")),
+        "-o must round-trip to Some(PathBuf)",
+    );
+    assert_eq!(package.as_deref(), Some("scx_rusty"));
+    assert!(release, "--release must lift the flag to true");
+}
+
+/// `cargo ktstr export --output PATH ...` (long form of `-o`)
+/// must work identically. Pins the long-form spelling so a
+/// regression that dropped the long-form attribute surfaces here.
+#[test]
+fn parse_export_with_output_long_form() {
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from([
+        "cargo",
+        "ktstr",
+        "export",
+        "test_fn",
+        "--output",
+        "/tmp/long.run",
+    ])
+    .unwrap_or_else(|e| panic!("{e}"));
+    let KtstrCommand::Export { output, .. } = k.command else {
+        panic!("expected Export");
+    };
+    assert_eq!(output, Some(std::path::PathBuf::from("/tmp/long.run")));
+}
+
+/// `cargo ktstr export -p PKG ...` (short form of `--package`)
+/// must work identically.
+#[test]
+fn parse_export_with_package_short_form() {
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from([
+        "cargo",
+        "ktstr",
+        "export",
+        "test_fn",
+        "-p",
+        "ktstr",
+    ])
+    .unwrap_or_else(|e| panic!("{e}"));
+    let KtstrCommand::Export { package, .. } = k.command else {
+        panic!("expected Export");
+    };
+    assert_eq!(package.as_deref(), Some("ktstr"));
+}
+
+/// `cargo ktstr export` without a positional test name must fail
+/// at parse time — the test name is required.
+#[test]
+fn parse_export_missing_test_arg_rejected() {
+    let rejected = Cargo::try_parse_from(["cargo", "ktstr", "export"]);
+    assert!(
+        rejected.is_err(),
+        "export must require a positional test-name argument",
+    );
+}
+
+/// `cargo ktstr export <a> <b>` is rejected — `export` accepts
+/// exactly one positional test name. A variadic regression would
+/// silently drop the second arg (or reinterpret it as a flag value
+/// like `--package b`), masking the operator's typo. Mirrors
+/// `parse_show_thresholds_extra_arg_rejected` for the export
+/// subcommand.
+#[test]
+fn parse_export_extra_arg_rejected() {
+    let rejected = Cargo::try_parse_from(["cargo", "ktstr", "export", "a", "b"]);
+    assert!(
+        rejected.is_err(),
+        "export must accept exactly one positional arg",
+    );
+}
+
+// -- try_get_matches_from: locks subcommand --
+//
+// `cargo ktstr locks` snapshots ktstr flock state under
+// `/tmp/ktstr-*.lock` and `{cache_root}/.locks/*.lock` for
+// `--cpu-cap` contention diagnosis. Tests pin the `--json` and
+// `--watch` flags plus the `humantime` value parser on `--watch`.
+
+/// `cargo ktstr locks` parses bare with both fields default.
+#[test]
+fn parse_locks_bare() {
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from(["cargo", "ktstr", "locks"])
+        .unwrap_or_else(|e| panic!("{e}"));
+    let KtstrCommand::Locks { json, watch } = k.command else {
+        panic!("expected Locks");
+    };
+    assert!(!json, "bare locks must default --json to false");
+    assert!(watch.is_none(), "bare locks must default --watch to None");
+}
+
+/// `cargo ktstr locks --json` lifts the json field to true.
+#[test]
+fn parse_locks_with_json() {
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from(["cargo", "ktstr", "locks", "--json"])
+        .unwrap_or_else(|e| panic!("{e}"));
+    let KtstrCommand::Locks { json, watch } = k.command else {
+        panic!("expected Locks");
+    };
+    assert!(json, "--json must lift the flag to true");
+    assert!(watch.is_none(), "bare --json must not populate --watch");
+}
+
+/// `cargo ktstr locks --watch <DURATION>` round-trips a humantime
+/// duration through the `value_parser =
+/// humantime::parse_duration` attribute.
+#[test]
+fn parse_locks_with_watch_duration() {
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from(["cargo", "ktstr", "locks", "--watch", "500ms"])
+        .unwrap_or_else(|e| panic!("{e}"));
+    let KtstrCommand::Locks { json, watch } = k.command else {
+        panic!("expected Locks");
+    };
+    assert!(!json, "bare --watch must not populate --json");
+    assert_eq!(
+        watch,
+        Some(std::time::Duration::from_millis(500)),
+        "--watch 500ms must round-trip to Duration::from_millis(500)",
+    );
+}
+
+/// `cargo ktstr locks --watch 5s --json` round-trips both flags
+/// in combination — the `--watch` redraw mode emits ndjson when
+/// `--json` is also set.
+#[test]
+fn parse_locks_with_watch_and_json() {
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from([
+        "cargo",
+        "ktstr",
+        "locks",
+        "--watch",
+        "5s",
+        "--json",
+    ])
+    .unwrap_or_else(|e| panic!("{e}"));
+    let KtstrCommand::Locks { json, watch } = k.command else {
+        panic!("expected Locks");
+    };
+    assert!(json, "--json must lift the flag to true alongside --watch");
+    assert_eq!(
+        watch,
+        Some(std::time::Duration::from_secs(5)),
+        "--watch 5s must round-trip to Duration::from_secs(5)",
+    );
+}
+
+/// `cargo ktstr locks --watch <BAD>` rejects malformed duration
+/// strings at parse time via humantime's `parse_duration`. Catches
+/// a regression that dropped the `value_parser` attribute and
+/// turned the field into a raw String / unbounded text input.
+#[test]
+fn parse_locks_watch_rejects_malformed_duration() {
+    let rejected =
+        Cargo::try_parse_from(["cargo", "ktstr", "locks", "--watch", "not-a-duration"]);
+    assert!(
+        rejected.is_err(),
+        "--watch must reject malformed humantime input via the \
+         value_parser = humantime::parse_duration attribute",
+    );
+}
+
+// -- try_get_matches_from: shell --memory-mb / --exec / --dmesg --
+
+/// `cargo ktstr shell --memory-mb 256` round-trips the value
+/// through clap's `value_parser!(u32).range(128..)` attribute.
+#[test]
+fn parse_shell_memory_mb_valid() {
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from(["cargo", "ktstr", "shell", "--memory-mb", "256"])
+        .unwrap_or_else(|e| panic!("{e}"));
+    let KtstrCommand::Shell { memory_mb, .. } = k.command else {
+        panic!("expected Shell");
+    };
+    assert_eq!(memory_mb, Some(256), "--memory-mb 256 must round-trip");
+}
+
+/// `cargo ktstr shell --memory-mb 128` accepts the range floor —
+/// the clap range is `128..` (inclusive).
+#[test]
+fn parse_shell_memory_mb_at_range_floor() {
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from(["cargo", "ktstr", "shell", "--memory-mb", "128"])
+        .unwrap_or_else(|e| panic!("{e}"));
+    let KtstrCommand::Shell { memory_mb, .. } = k.command else {
+        panic!("expected Shell");
+    };
+    assert_eq!(
+        memory_mb,
+        Some(128),
+        "--memory-mb 128 must succeed at the inclusive range floor",
+    );
+}
+
+/// `cargo ktstr shell --memory-mb 64` is rejected — below the
+/// `value_parser!(u32).range(128..)` floor. Pins the constraint:
+/// a regression that dropped the range or relaxed the lower
+/// bound surfaces here.
+#[test]
+fn parse_shell_memory_mb_below_range_rejected() {
+    let rejected =
+        Cargo::try_parse_from(["cargo", "ktstr", "shell", "--memory-mb", "64"]);
+    assert!(
+        rejected.is_err(),
+        "--memory-mb 64 must be rejected — value_parser range floor is 128",
+    );
+}
+
+/// `cargo ktstr shell --memory-mb -1` is rejected at parse time —
+/// the field is `u32`, so a signed value cannot satisfy the
+/// type-level value parser. Pins the unsigned-integer
+/// constraint.
+#[test]
+fn parse_shell_memory_mb_negative_rejected() {
+    let rejected =
+        Cargo::try_parse_from(["cargo", "ktstr", "shell", "--memory-mb", "-1"]);
+    assert!(
+        rejected.is_err(),
+        "--memory-mb -1 must be rejected — the field is u32",
+    );
+}
+
+/// `cargo ktstr shell --exec "uname -a"` round-trips the command
+/// string through clap into `Shell { exec: Some(..), .. }`. The
+/// dispatch site forwards the string into the VM's init line.
+#[test]
+fn parse_shell_with_exec() {
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from([
+        "cargo",
+        "ktstr",
+        "shell",
+        "--exec",
+        "uname -a",
+    ])
+    .unwrap_or_else(|e| panic!("{e}"));
+    let KtstrCommand::Shell { exec, .. } = k.command else {
+        panic!("expected Shell");
+    };
+    assert_eq!(exec.as_deref(), Some("uname -a"));
+}
+
+/// `cargo ktstr shell --dmesg` lifts the dmesg field to true.
+#[test]
+fn parse_shell_with_dmesg() {
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from(["cargo", "ktstr", "shell", "--dmesg"])
+        .unwrap_or_else(|e| panic!("{e}"));
+    let KtstrCommand::Shell { dmesg, .. } = k.command else {
+        panic!("expected Shell");
+    };
+    assert!(dmesg, "--dmesg must lift the flag to true");
+}
+
+/// Bare `cargo ktstr shell` defaults `--dmesg` to false and
+/// `--exec` to None. Pins that neither flag is implicitly set.
+#[test]
+fn parse_shell_dmesg_and_exec_default_unset() {
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from(["cargo", "ktstr", "shell"])
+        .unwrap_or_else(|e| panic!("{e}"));
+    let KtstrCommand::Shell { dmesg, exec, .. } = k.command else {
+        panic!("expected Shell");
+    };
+    assert!(!dmesg, "bare shell must default --dmesg to false");
+    assert!(exec.is_none(), "bare shell must default --exec to None");
+}
+
+// -- try_get_matches_from: --kernel ArgAction::Append on every
+// `Vec<String> kernel` subcommand. Repeats fan out the gauntlet
+// across kernels at the dispatch layer; a regression that lost
+// `ArgAction::Append` would either reject the second occurrence
+// outright (`Vec<String>` derive without the action would fail
+// "the argument was supplied more than once") or silently keep
+// only the last value.
+
+/// `cargo ktstr test --kernel A --kernel B` accumulates both
+/// values into the `kernel` Vec via `ArgAction::Append`.
+#[test]
+fn parse_test_kernel_repeatable() {
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from([
+        "cargo",
+        "ktstr",
+        "test",
+        "--kernel",
+        "6.14.2",
+        "--kernel",
+        "6.15-rc3",
+    ])
+    .unwrap_or_else(|e| panic!("{e}"));
+    let KtstrCommand::Test { kernel, .. } = k.command else {
+        panic!("expected Test");
+    };
+    assert_eq!(
+        kernel,
+        vec!["6.14.2".to_string(), "6.15-rc3".to_string()],
+        "test --kernel must accumulate via ArgAction::Append",
+    );
+}
+
+/// `cargo ktstr coverage --kernel A --kernel B` accumulates both
+/// values via `ArgAction::Append`.
+#[test]
+fn parse_coverage_kernel_repeatable() {
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from([
+        "cargo",
+        "ktstr",
+        "coverage",
+        "--kernel",
+        "6.14.2",
+        "--kernel",
+        "6.15-rc3",
+    ])
+    .unwrap_or_else(|e| panic!("{e}"));
+    let KtstrCommand::Coverage { kernel, .. } = k.command else {
+        panic!("expected Coverage");
+    };
+    assert_eq!(
+        kernel,
+        vec!["6.14.2".to_string(), "6.15-rc3".to_string()],
+        "coverage --kernel must accumulate via ArgAction::Append",
+    );
+}
+
+/// `cargo ktstr llvm-cov --kernel A --kernel B` accumulates both
+/// values via `ArgAction::Append`.
+#[test]
+fn parse_llvm_cov_kernel_repeatable() {
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from([
+        "cargo",
+        "ktstr",
+        "llvm-cov",
+        "--kernel",
+        "6.14.2",
+        "--kernel",
+        "6.15-rc3",
+    ])
+    .unwrap_or_else(|e| panic!("{e}"));
+    let KtstrCommand::LlvmCov { kernel, .. } = k.command else {
+        panic!("expected LlvmCov");
+    };
+    assert_eq!(
+        kernel,
+        vec!["6.14.2".to_string(), "6.15-rc3".to_string()],
+        "llvm-cov --kernel must accumulate via ArgAction::Append",
+    );
+}
+
+/// `cargo ktstr verifier --kernel A --kernel B` accumulates both
+/// values via `ArgAction::Append`.
+#[test]
+fn parse_verifier_kernel_repeatable() {
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from([
+        "cargo",
+        "ktstr",
+        "verifier",
+        "--scheduler",
+        "scx_rustland",
+        "--kernel",
+        "6.14.2",
+        "--kernel",
+        "6.15-rc3",
+    ])
+    .unwrap_or_else(|e| panic!("{e}"));
+    let KtstrCommand::Verifier { kernel, .. } = k.command else {
+        panic!("expected Verifier");
+    };
+    assert_eq!(
+        kernel,
+        vec!["6.14.2".to_string(), "6.15-rc3".to_string()],
+        "verifier --kernel must accumulate via ArgAction::Append",
+    );
+}
+
+// -- try_get_matches_from: kernel build --ref/--git symmetry --
+
+/// Symmetric pin to [`parse_kernel_build_git_requires_ref`]:
+/// `--ref REF` without `--git URL` must also fail at parse time.
+/// `git_ref` carries `requires = "git"`, so a regression that
+/// dropped that attribute would let `--ref` be set without a
+/// matching git URL — ambiguous at the dispatch layer.
+#[test]
+fn parse_kernel_build_ref_requires_git() {
+    let result = Cargo::try_parse_from([
+        "cargo",
+        "ktstr",
+        "kernel",
+        "build",
+        "--ref",
+        "v6.14",
+    ]);
+    match result {
+        Ok(_) => panic!("--ref without --git must be rejected at parse time"),
+        Err(err) => assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument,
+            "expected MissingRequiredArgument — `--ref` carries \
+             `requires = \"git\"` (clap uses the field name, not \
+             the long flag name), so a regression that dropped the \
+             attribute would surface as a different ErrorKind that \
+             the bare is_err() pin would silently mask. Full err: {err}",
+        ),
+    }
+}
+
+// -- try_get_matches_from: completions --binary default --
+
+/// `cargo ktstr completions bash` defaults `--binary` to `cargo`
+/// per the `default_value = "cargo"` attribute on the field.
+/// A regression that dropped or changed the default surfaces
+/// here.
+#[test]
+fn parse_completions_binary_default_is_cargo() {
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from(["cargo", "ktstr", "completions", "bash"])
+        .unwrap_or_else(|e| panic!("{e}"));
+    let KtstrCommand::Completions { binary, .. } = k.command else {
+        panic!("expected Completions");
+    };
+    assert_eq!(
+        binary, "cargo",
+        "default --binary must be `cargo`",
+    );
+}
+
+/// `cargo ktstr completions bash --binary X` overrides the
+/// default. Pins the override path.
+#[test]
+fn parse_completions_binary_override() {
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from([
+        "cargo",
+        "ktstr",
+        "completions",
+        "bash",
+        "--binary",
+        "ktstr",
+    ])
+    .unwrap_or_else(|e| panic!("{e}"));
+    let KtstrCommand::Completions { binary, .. } = k.command else {
+        panic!("expected Completions");
+    };
+    assert_eq!(binary, "ktstr");
+}
+
+// -- try_get_matches_from: per-side compare flags coverage --
+//
+// The shared/per-side `--X` / `--a-X` / `--b-X` shape on `stats
+// compare` is exercised for `kernel`, `kernel_commit`,
+// `project_commit`, and `run_source` above. The siblings below
+// pin the SAME shape for the remaining slicing dimensions —
+// `topology`, `scheduler`, `work_type`, and `flag` — so a
+// regression that lost the per-side derive on any one of them
+// surfaces here at parse time rather than at the dispatch layer
+// where "more-specific replaces" semantics fold per-side into
+// the BuildCompareFilters bundle.
+
+/// `--a-topology A --b-topology B` round-trips into the per-side
+/// vecs without touching the shared `topology` vec.
+#[test]
+fn parse_stats_compare_with_per_side_topology() {
+    let StatsCommand::Compare {
+        topology,
+        a_topology,
+        b_topology,
+        ..
+    } = parse_compare(&[
+        "--a-topology",
+        "1n2l4c2t",
+        "--b-topology",
+        "1n4l2c1t",
+    ])
+    else {
+        unreachable!()
+    };
+    assert!(
+        topology.is_empty(),
+        "per-side --a-topology / --b-topology must not populate the shared --topology vec",
+    );
+    assert_eq!(a_topology, vec!["1n2l4c2t".to_string()]);
+    assert_eq!(b_topology, vec!["1n4l2c1t".to_string()]);
+}
+
+/// `--a-scheduler A --b-scheduler B` round-trips into the per-side
+/// vecs without touching the shared `scheduler` vec.
+#[test]
+fn parse_stats_compare_with_per_side_scheduler() {
+    let StatsCommand::Compare {
+        scheduler,
+        a_scheduler,
+        b_scheduler,
+        ..
+    } = parse_compare(&[
+        "--a-scheduler",
+        "scx_alpha",
+        "--b-scheduler",
+        "scx_beta",
+    ])
+    else {
+        unreachable!()
+    };
+    assert!(
+        scheduler.is_empty(),
+        "per-side --a-scheduler / --b-scheduler must not populate the shared --scheduler vec",
+    );
+    assert_eq!(a_scheduler, vec!["scx_alpha".to_string()]);
+    assert_eq!(b_scheduler, vec!["scx_beta".to_string()]);
+}
+
+/// `--a-work-type A --b-work-type B` round-trips into the per-side
+/// vecs without touching the shared `work_type` vec.
+#[test]
+fn parse_stats_compare_with_per_side_work_type() {
+    let StatsCommand::Compare {
+        work_type,
+        a_work_type,
+        b_work_type,
+        ..
+    } = parse_compare(&[
+        "--a-work-type",
+        "SpinWait",
+        "--b-work-type",
+        "PageFaultChurn",
+    ])
+    else {
+        unreachable!()
+    };
+    assert!(
+        work_type.is_empty(),
+        "per-side --a-work-type / --b-work-type must not populate the shared --work-type vec",
+    );
+    assert_eq!(a_work_type, vec!["SpinWait".to_string()]);
+    assert_eq!(b_work_type, vec!["PageFaultChurn".to_string()]);
+}
+
+/// `--a-project-commit A --b-project-commit B` round-trips into
+/// the per-side vecs without touching the shared `project_commit`
+/// vec.
+#[test]
+fn parse_stats_compare_with_per_side_project_commit() {
+    let StatsCommand::Compare {
+        project_commit,
+        a_project_commit,
+        b_project_commit,
+        ..
+    } = parse_compare(&[
+        "--a-project-commit",
+        "abc1234",
+        "--b-project-commit",
+        "def5678",
+    ])
+    else {
+        unreachable!()
+    };
+    assert!(
+        project_commit.is_empty(),
+        "per-side --a-project-commit / --b-project-commit must not \
+         populate the shared --project-commit vec",
+    );
+    assert_eq!(a_project_commit, vec!["abc1234".to_string()]);
+    assert_eq!(b_project_commit, vec!["def5678".to_string()]);
+}
+
+/// `--flag F --a-flag G --b-flag H` round-trips each into its
+/// respective vec — the shared `flags` vec accumulates the
+/// AND-combined filter that applies to BOTH sides, while the
+/// per-side `a_flags` / `b_flags` vecs apply only to their
+/// respective side.
+#[test]
+fn parse_stats_compare_with_flag_per_side() {
+    let StatsCommand::Compare {
+        flags,
+        a_flags,
+        b_flags,
+        ..
+    } = parse_compare(&[
+        "--flag",
+        "shared_flag",
+        "--a-flag",
+        "a_only_flag",
+        "--b-flag",
+        "b_only_flag",
+    ])
+    else {
+        unreachable!()
+    };
+    assert_eq!(flags, vec!["shared_flag".to_string()]);
+    assert_eq!(a_flags, vec!["a_only_flag".to_string()]);
+    assert_eq!(b_flags, vec!["b_only_flag".to_string()]);
 }
