@@ -28,7 +28,7 @@ use super::vcpu::{
     register_vcpu_signal_handler, set_rt_priority, set_thread_cpumask, vcpu_signal,
 };
 use super::vmlinux::find_vmlinux;
-use super::{KtstrVm, console, shm_ring, vcpu_panic, virtio_blk, virtio_console};
+use super::{KtstrVm, console, shm_ring, vcpu_panic, virtio_blk, virtio_console, virtio_net};
 
 #[cfg(target_arch = "aarch64")]
 use super::aarch64::kvm;
@@ -93,6 +93,11 @@ impl KtstrVm {
         // can still read `vm.guest_mem` and the irqchip state.
         let virtio_blk = self.init_virtio_blk(&vm)?;
 
+        // Optional virtio-net: `None` when the builder has no
+        // `NetConfig` attached, `Some` when configured. Same
+        // construction-before-vcpu-takedown rule as virtio-blk.
+        let virtio_net = self.init_virtio_net(&vm)?;
+
         let kill = Arc::new(AtomicBool::new(false));
         // Failure-dump freeze rendezvous: broadcast `freeze` flag plus a
         // per-vCPU `parked` ACK, parallel to the existing `kill` +
@@ -155,6 +160,7 @@ impl KtstrVm {
             &com2,
             None,
             virtio_blk.as_ref(),
+            virtio_net.as_ref(),
             &kill,
             &freeze,
             &ap_pins,
@@ -1531,6 +1537,7 @@ impl KtstrVm {
                     &com2,
                     None,
                     virtio_blk.as_ref(),
+                    virtio_net.as_ref(),
                     &kill,
                     &freeze,
                     &bsp_parked,
@@ -1575,6 +1582,7 @@ impl KtstrVm {
         // it to `VmResult` without holding the device alive past
         // its current ownership.
         let virtio_blk_counters = virtio_blk.as_ref().map(|d| d.lock().counters());
+        let virtio_net_counters = virtio_net.as_ref().map(|d| d.lock().counters());
 
         Ok(VmRunState {
             exit_code,
@@ -1590,6 +1598,7 @@ impl KtstrVm {
             vm,
             cleanup_start,
             virtio_blk_counters,
+            virtio_net_counters,
         })
     }
 
@@ -1616,6 +1625,7 @@ impl KtstrVm {
         com2: &Arc<PiMutex<console::Serial>>,
         virtio_con: Option<&Arc<PiMutex<virtio_console::VirtioConsole>>>,
         virtio_blk: Option<&Arc<PiMutex<virtio_blk::VirtioBlk>>>,
+        virtio_net: Option<&Arc<PiMutex<virtio_net::VirtioNet>>>,
         kill: &Arc<AtomicBool>,
         freeze: &Arc<AtomicBool>,
         pin_targets: &[Option<usize>],
@@ -1645,6 +1655,7 @@ impl KtstrVm {
             let com2_clone = com2.clone();
             let vc_clone = virtio_con.cloned();
             let vblk_clone = virtio_blk.cloned();
+            let vnet_clone = virtio_net.cloned();
             let exited = Arc::new(AtomicBool::new(false));
             let exited_clone = exited.clone();
             let parked = Arc::new(AtomicBool::new(false));
@@ -1690,6 +1701,7 @@ impl KtstrVm {
                             &com2_clone,
                             vc_clone.as_ref(),
                             vblk_clone.as_ref(),
+                            vnet_clone.as_ref(),
                             &kill_clone,
                             &freeze_clone,
                             &parked_clone,
@@ -2149,6 +2161,7 @@ impl KtstrVm {
         com2: &Arc<PiMutex<console::Serial>>,
         virtio_con: Option<&Arc<PiMutex<virtio_console::VirtioConsole>>>,
         virtio_blk: Option<&Arc<PiMutex<virtio_blk::VirtioBlk>>>,
+        virtio_net: Option<&Arc<PiMutex<virtio_net::VirtioNet>>>,
         kill: &Arc<AtomicBool>,
         freeze: &Arc<AtomicBool>,
         bsp_parked: &Arc<AtomicBool>,
@@ -2199,6 +2212,7 @@ impl KtstrVm {
                         com2,
                         virtio_con.map(|a| a.as_ref()),
                         virtio_blk.map(|a| a.as_ref()),
+                        virtio_net.map(|a| a.as_ref()),
                         &mut exit,
                     ) {
                         Some(ExitAction::Continue) | None => {}
@@ -2396,6 +2410,7 @@ impl KtstrVm {
             crash_message,
             cleanup_duration,
             virtio_blk_counters: run.virtio_blk_counters,
+            virtio_net_counters: run.virtio_net_counters,
         })
     }
 

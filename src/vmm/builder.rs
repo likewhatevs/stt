@@ -19,6 +19,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use super::host_topology;
+use super::net_config;
 use super::topology::{self, Topology};
 use super::vcpu::BpfMapWriteParams;
 use super::{KtstrVm, disk_config};
@@ -66,6 +67,12 @@ pub struct KtstrVmBuilder {
     /// Vec retained for future multi-disk expansion. See
     /// [`super::KtstrVm::disks`].
     disks: Vec<disk_config::DiskConfig>,
+    /// Optional network device. `None` skips virtio-net entirely
+    /// (no FDT node, no MMIO range, no IRQ). `Some(_)` attaches one
+    /// virtio-net device with the given config; the in-VMM loopback
+    /// backend echoes TX bytes back to RX. v0 supports a single
+    /// device. See [`super::KtstrVm::network`].
+    network: Option<net_config::NetConfig>,
     busybox: bool,
     dmesg: bool,
     exec_cmd: Option<String>,
@@ -138,6 +145,7 @@ impl Default for KtstrVmBuilder {
             sched_disable_cmds: Vec::new(),
             include_files: Vec::new(),
             disks: Vec::new(),
+            network: None,
             busybox: false,
             dmesg: false,
             exec_cmd: None,
@@ -473,6 +481,23 @@ impl KtstrVmBuilder {
         self
     }
 
+    /// Attach one virtio-net device with the given configuration. The
+    /// v0 backend is in-VMM loopback: TX bytes are echoed back into
+    /// the RX queue inside the VMM, generating real virtio TX kicks
+    /// and real `vring_interrupt` → `NET_RX_SOFTIRQ` activity that
+    /// scheduler-test scenarios can observe. There is no host
+    /// networking — IP-layer self-traffic is intercepted by the
+    /// guest kernel's `RTN_LOCAL` route onto `lo`, so AF_PACKET raw
+    /// sockets bound by `ifindex` are the path that exercises the
+    /// virtio device.
+    ///
+    /// v0 supports a single device; calling this method twice
+    /// overwrites the prior `NetConfig`.
+    pub fn network(mut self, config: net_config::NetConfig) -> Self {
+        self.network = Some(config);
+        self
+    }
+
     /// Override [`super::KtstrVm::init_virtio_blk`]'s per-test
     /// backing-file allocation with `path`. Internal-only: this is
     /// the seam the disk-template-build VM driver
@@ -726,6 +751,7 @@ impl KtstrVmBuilder {
             sched_disable_cmds: self.sched_disable_cmds,
             include_files: self.include_files,
             disks: self.disks,
+            network: self.network,
             busybox: self.busybox,
             dmesg: self.dmesg,
             exec_cmd: self.exec_cmd,

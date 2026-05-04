@@ -46,6 +46,10 @@ pub(crate) const VIRTIO_CONSOLE_MMIO_BASE: u64 = MMIO_GAP_START;
 /// Each virtio-mmio device occupies `VIRTIO_MMIO_SIZE = 0x1000`.
 pub(crate) const VIRTIO_BLK_MMIO_BASE: u64 = MMIO_GAP_START + 0x1000;
 
+/// Virtio-net MMIO base: one page above virtio-blk.
+/// Each virtio-mmio device occupies `VIRTIO_MMIO_SIZE = 0x1000`.
+pub(crate) const VIRTIO_NET_MMIO_BASE: u64 = MMIO_GAP_START + 0x2000;
+
 /// IRQ for virtio-console (GSI routed through IOAPIC).
 /// Uses IRQ 5 — available with full IRQ chip. With split IRQ chip
 /// (no IOAPIC), MSI would be needed; not supported for now.
@@ -56,6 +60,11 @@ pub(crate) const VIRTIO_CONSOLE_IRQ: u32 = 5;
 /// limit leaves ample free slots for additional virtio devices
 /// after COM1=4, COM2=3, virtio-console=5, virtio-blk=6.
 pub(crate) const VIRTIO_BLK_IRQ: u32 = 6;
+
+/// IRQ for virtio-net (GSI 7, full IRQ chip). Same constraints as
+/// virtio-blk — split-irqchip not supported. Still well within the
+/// IOAPIC's 24-line cap.
+pub(crate) const VIRTIO_NET_IRQ: u32 = 7;
 
 /// E820 memory type: usable RAM.
 pub(crate) const E820_RAM: u32 = 1;

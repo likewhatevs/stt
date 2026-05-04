@@ -3377,6 +3377,7 @@ mod tests {
             crash_message: None,
             cleanup_duration: None,
             virtio_blk_counters: None,
+            virtio_net_counters: None,
         };
         let assertions = crate::assert::Assert::default_checks();
         let msg = format!(
@@ -3685,6 +3686,7 @@ mod tests {
             crash_message: None,
             cleanup_duration: None,
             virtio_blk_counters: None,
+            virtio_net_counters: None,
         };
         let assertions = crate::assert::Assert::NO_OVERRIDES;
         let msg = format!(
@@ -3770,6 +3772,7 @@ mod tests {
             crash_message: None,
             cleanup_duration: None,
             virtio_blk_counters: None,
+            virtio_net_counters: None,
         };
         let assertions = crate::assert::Assert::default_checks();
         let msg = format!(

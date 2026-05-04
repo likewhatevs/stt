@@ -20,7 +20,9 @@ use super::KtstrVm;
 use super::initramfs_cache::{BaseKey, BaseRef, get_or_build_base};
 use super::memory_budget::{MemoryBudget, initramfs_min_memory_mb, read_kernel_init_size};
 use super::pi_mutex::PiMutex;
-use super::{disk_config, disk_template, host_topology, initramfs, shm_ring, virtio_blk};
+use super::{
+    disk_config, disk_template, host_topology, initramfs, shm_ring, virtio_blk, virtio_net,
+};
 
 #[cfg(target_arch = "aarch64")]
 use super::aarch64;
@@ -264,6 +266,53 @@ impl KtstrVm {
         }
 
         Ok(Some(blk_arc))
+    }
+
+    /// Construct the optional virtio-net device for the configured
+    /// network in `self.network`. Returns `Ok(None)` when no network
+    /// is attached.
+    ///
+    /// On `Ok(Some(_))`, the returned `Arc<PiMutex<VirtioNet>>` has:
+    ///   - the configured MAC baked into config space,
+    ///   - guest memory set so subsequent `process_tx_loopback` calls
+    ///     can read TX descriptor data and write into RX descriptors,
+    ///   - the irqfd registered with the VM (skipped on x86 split
+    ///     irqchip, matching virtio-blk).
+    ///
+    /// The framework reserves a single MMIO base + IRQ pair
+    /// (`VIRTIO_NET_MMIO_BASE` / `VIRTIO_NET_IRQ`); the builder's
+    /// `.network()` enforces the single-device constraint by
+    /// overwriting any previous network on each call.
+    pub(super) fn init_virtio_net(
+        &self,
+        vm: &kvm::KtstrKvm,
+    ) -> Result<Option<Arc<PiMutex<virtio_net::VirtioNet>>>> {
+        let Some(cfg) = self.network else {
+            return Ok(None);
+        };
+        let mut dev = virtio_net::VirtioNet::new(cfg);
+        dev.set_mem((*vm.guest_mem).clone());
+        let net_arc = Arc::new(PiMutex::new(dev));
+
+        // irqfd registration. On x86_64 with split irqchip, IOAPIC
+        // routing is unavailable; matches the virtio-console /
+        // virtio-blk constraint and we skip the irqfd in that case
+        // (the device still functions but the guest must rely on
+        // INT_STATUS polling for completion).
+        #[cfg(target_arch = "x86_64")]
+        if !vm.split_irqchip {
+            vm.vm_fd
+                .register_irqfd(net_arc.lock().irq_evt(), kvm::VIRTIO_NET_IRQ)
+                .context("register virtio-net irqfd")?;
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            vm.vm_fd
+                .register_irqfd(net_arc.lock().irq_evt(), kvm::VIRTIO_NET_IRQ)
+                .context("register virtio-net irqfd")?;
+        }
+
+        Ok(Some(net_arc))
     }
 
     /// Create the KVM VM and optionally load the kernel.
@@ -1007,6 +1056,20 @@ impl KtstrVm {
             let disk = &self.disks[0];
             cmdline.push_str(&disk_auto_mount_cmdline_tokens(disk));
         }
+        // Virtio-net MMIO device — appended only when the builder
+        // attached a `NetConfig`. The kernel's virtio_mmio_cmdline
+        // parser registers a MMIO transport per `virtio_mmio.device=`
+        // token; placing this after virtio-blk does not affect device
+        // ordering on the guest's network stack (ifindex is assigned
+        // independently of cmdline order).
+        if self.network.is_some() {
+            cmdline.push_str(&format!(
+                " virtio_mmio.device={:#x}@{:#x}:{}",
+                virtio_net::VIRTIO_MMIO_SIZE,
+                kvm::VIRTIO_NET_MMIO_BASE,
+                kvm::VIRTIO_NET_IRQ,
+            ));
+        }
         if self.shm_size > 0 {
             let mem_size = (memory_mb as u64) << 20;
             let shm_base = mem_size - self.shm_size;
@@ -1285,6 +1348,7 @@ impl KtstrVm {
                  allocate_and_register_memory in src/vmm/aarch64/kvm.rs",
             ),
             !self.disks.is_empty(),
+            self.network.is_some(),
             vm.has_pmu,
         )
         .context("create FDT")?;

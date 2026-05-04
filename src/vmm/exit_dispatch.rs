@@ -10,7 +10,7 @@
 //!   / [`dispatch_mmio_read`]).
 
 use crate::vmm::PiMutex;
-use crate::vmm::{console, kvm, virtio_blk, virtio_console};
+use crate::vmm::{console, kvm, virtio_blk, virtio_console, virtio_net};
 use kvm_ioctls::VcpuExit;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -227,11 +227,13 @@ impl std::fmt::Display for VcpuRegSnapshot {
 /// Dispatch an MMIO write to serial and virtio devices.
 /// Returns `true` if the caller should exit (shutdown detected).
 #[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn dispatch_mmio_write(
     com1: &PiMutex<console::Serial>,
     com2: &PiMutex<console::Serial>,
     virtio_con: Option<&PiMutex<virtio_console::VirtioConsole>>,
     virtio_blk: Option<&PiMutex<virtio_blk::VirtioBlk>>,
+    virtio_net: Option<&PiMutex<virtio_net::VirtioNet>>,
     addr: u64,
     data: &[u8],
 ) -> bool {
@@ -255,17 +257,24 @@ pub(crate) fn dispatch_mmio_write(
             .contains(&addr)
     {
         vb.lock().mmio_write(addr - kvm::VIRTIO_BLK_MMIO_BASE, data);
+    } else if let Some(vn) = virtio_net
+        && (kvm::VIRTIO_NET_MMIO_BASE..kvm::VIRTIO_NET_MMIO_BASE + virtio_net::VIRTIO_MMIO_SIZE)
+            .contains(&addr)
+    {
+        vn.lock().mmio_write(addr - kvm::VIRTIO_NET_MMIO_BASE, data);
     }
     false
 }
 
 /// Dispatch an MMIO read from serial and virtio-console devices.
 #[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn dispatch_mmio_read(
     com1: &PiMutex<console::Serial>,
     com2: &PiMutex<console::Serial>,
     virtio_con: Option<&PiMutex<virtio_console::VirtioConsole>>,
     virtio_blk: Option<&PiMutex<virtio_blk::VirtioBlk>>,
+    virtio_net: Option<&PiMutex<virtio_net::VirtioNet>>,
     addr: u64,
     data: &mut [u8],
 ) {
@@ -289,6 +298,11 @@ pub(crate) fn dispatch_mmio_read(
             .contains(&addr)
     {
         vb.lock().mmio_read(addr - kvm::VIRTIO_BLK_MMIO_BASE, data);
+    } else if let Some(vn) = virtio_net
+        && (kvm::VIRTIO_NET_MMIO_BASE..kvm::VIRTIO_NET_MMIO_BASE + virtio_net::VIRTIO_MMIO_SIZE)
+            .contains(&addr)
+    {
+        vn.lock().mmio_read(addr - kvm::VIRTIO_NET_MMIO_BASE, data);
     } else {
         for b in data.iter_mut() {
             *b = 0xff;
@@ -336,6 +350,7 @@ pub(crate) fn vcpu_run_loop_unified(
     com2: &Arc<PiMutex<console::Serial>>,
     virtio_con: Option<&Arc<PiMutex<virtio_console::VirtioConsole>>>,
     virtio_blk: Option<&Arc<PiMutex<virtio_blk::VirtioBlk>>>,
+    virtio_net: Option<&Arc<PiMutex<virtio_net::VirtioNet>>>,
     kill: &Arc<AtomicBool>,
     freeze: &Arc<AtomicBool>,
     parked: &Arc<AtomicBool>,
@@ -367,6 +382,7 @@ pub(crate) fn vcpu_run_loop_unified(
                     com2,
                     virtio_con.map(|a| a.as_ref()),
                     virtio_blk.map(|a| a.as_ref()),
+                    virtio_net.map(|a| a.as_ref()),
                     &mut exit,
                 ) {
                     Some(ExitAction::Continue) | None => {}
@@ -501,11 +517,13 @@ pub(crate) enum ExitAction {
 ///
 /// On aarch64, serial and virtio-console are dispatched via MMIO.
 /// On x86_64, serial is dispatched via port I/O; virtio-console via MMIO.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn classify_exit(
     com1: &PiMutex<console::Serial>,
     com2: &PiMutex<console::Serial>,
     virtio_con: Option<&PiMutex<virtio_console::VirtioConsole>>,
     virtio_blk: Option<&PiMutex<virtio_blk::VirtioBlk>>,
+    virtio_net: Option<&PiMutex<virtio_net::VirtioNet>>,
     exit: &mut VcpuExit,
 ) -> Option<ExitAction> {
     match exit {
@@ -524,7 +542,7 @@ pub(crate) fn classify_exit(
         }
         #[cfg(target_arch = "aarch64")]
         VcpuExit::MmioWrite(addr, data) => {
-            if dispatch_mmio_write(com1, com2, virtio_con, virtio_blk, *addr, data) {
+            if dispatch_mmio_write(com1, com2, virtio_con, virtio_blk, virtio_net, *addr, data) {
                 Some(ExitAction::Shutdown)
             } else {
                 Some(ExitAction::Continue)
@@ -532,7 +550,7 @@ pub(crate) fn classify_exit(
         }
         #[cfg(target_arch = "aarch64")]
         VcpuExit::MmioRead(addr, data) => {
-            dispatch_mmio_read(com1, com2, virtio_con, virtio_blk, *addr, data);
+            dispatch_mmio_read(com1, com2, virtio_con, virtio_blk, virtio_net, *addr, data);
             Some(ExitAction::Continue)
         }
         VcpuExit::Hlt => None,
@@ -562,6 +580,13 @@ pub(crate) fn classify_exit(
                     return Some(ExitAction::Continue);
                 }
             }
+            if let Some(vn) = virtio_net {
+                let base = kvm::VIRTIO_NET_MMIO_BASE;
+                if *addr >= base && *addr < base + virtio_net::VIRTIO_MMIO_SIZE {
+                    vn.lock().mmio_read(*addr - base, data);
+                    return Some(ExitAction::Continue);
+                }
+            }
             for b in data.iter_mut() {
                 *b = 0xff;
             }
@@ -580,6 +605,13 @@ pub(crate) fn classify_exit(
                 let base = kvm::VIRTIO_BLK_MMIO_BASE;
                 if *addr >= base && *addr < base + virtio_blk::VIRTIO_MMIO_SIZE {
                     vb.lock().mmio_write(*addr - base, data);
+                    return Some(ExitAction::Continue);
+                }
+            }
+            if let Some(vn) = virtio_net {
+                let base = kvm::VIRTIO_NET_MMIO_BASE;
+                if *addr >= base && *addr < base + virtio_net::VIRTIO_MMIO_SIZE {
+                    vn.lock().mmio_write(*addr - base, data);
                     return Some(ExitAction::Continue);
                 }
             }

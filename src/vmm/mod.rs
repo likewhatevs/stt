@@ -70,8 +70,10 @@ pub(crate) mod result;
 pub(crate) mod rust_init;
 pub(crate) mod setup;
 pub(crate) mod vcpu;
+pub(crate) mod net_config;
 pub(crate) mod virtio_blk;
 pub(crate) mod virtio_console;
+pub(crate) mod virtio_net;
 
 // `mod` — file-private helpers.
 mod memory_budget;
@@ -87,7 +89,20 @@ mod vmlinux;
 // signatures. The defining module stays `pub(crate)` because the
 // device implementation is internal — this is the single public
 // surface for the counters type.
+// Re-export `NetConfig` and `VirtioNetCounters` for the same reason
+// as `VirtioBlkCounters` below: user-facing test code holds a
+// `VmResult` whose `virtio_net_counters` field carries the device's
+// counter Arc, and `NetConfig` is the builder-side configuration
+// type, so both names must be reachable from the public path. The
+// in-tree readers go through the prelude path
+// `crate::vmm::net_config::NetConfig`, so the lib build sees no
+// direct readers of these names; allow unused-imports locally to
+// keep `cargo check` quiet while preserving the public re-export.
+#[allow(unused_imports)]
+pub use net_config::NetConfig;
 pub use virtio_blk::VirtioBlkCounters;
+#[allow(unused_imports)]
+pub use virtio_net::VirtioNetCounters;
 
 // Re-export public result types from the new submodule.
 // `KVM_INTERESTING_STATS` is part of the public surface for stats
@@ -264,6 +279,11 @@ pub struct KtstrVm {
     /// [`Self::template_staging_image`] so it can format a
     /// host-staged image without re-entering its own cache.
     pub(crate) disks: Vec<disk_config::DiskConfig>,
+    /// Optional network device. `None` skips virtio-net entirely:
+    /// no FDT node, no MMIO range, no IRQ. `Some(_)` attaches one
+    /// virtio-net device whose backend is the in-VMM loopback (TX
+    /// bytes echoed back into RX). v0 supports a single device.
+    pub(crate) network: Option<net_config::NetConfig>,
     /// Internal-only override for `init_virtio_blk`'s per-test
     /// backing-file allocation. `Some(path)` makes the device open
     /// `path` directly instead of allocating a fresh `tempfile()`
@@ -463,6 +483,10 @@ impl KtstrVm {
         // has no disks attached.
         let virtio_blk = self.init_virtio_blk(&vm)?;
 
+        // Optional virtio-net for shell mode. `None` when the builder
+        // has no `NetConfig` attached.
+        let virtio_net = self.init_virtio_net(&vm)?;
+
         // Non-interactive exec mode (--exec) does not need a TTY.
         let exec_mode = self.exec_cmd.is_some();
 
@@ -532,6 +556,7 @@ impl KtstrVm {
             &com2,
             Some(&virtio_con),
             virtio_blk.as_ref(),
+            virtio_net.as_ref(),
             &kill,
             &freeze,
             &ap_pins,
@@ -817,6 +842,7 @@ impl KtstrVm {
             &com2,
             Some(&virtio_con),
             virtio_blk.as_ref(),
+            virtio_net.as_ref(),
             &kill,
             &freeze,
             &bsp_parked,
