@@ -84,6 +84,9 @@ mod device;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod tests_proptest;
+
 // Glob `pub(crate) use device::*` makes test sub-files (`tests.rs`)
 // reach internal items (`S_ACK`, `S_OK`, `RXQ`, `TXQ`,
 // `VIRTIO_NET_CONFIG_SIZE`, etc.) via `super::device::*` without

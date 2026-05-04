@@ -330,7 +330,7 @@ pub(crate) enum KtstrCommand {
     /// For historical drift between archived runs, use
     /// `cargo ktstr stats compare` — its host-delta section
     /// reports which host-context fields changed between run A
-    /// and run B using the same [`HostContext::diff`] logic.
+    /// and run B using the same [`ktstr::host_context::HostContext::diff`] logic.
     ShowHost,
     /// Print the resolved assertion thresholds for the named test.
     ///
@@ -765,7 +765,7 @@ pub(crate) enum StatsCommand {
         /// series without naming every patch release. A
         /// three-or-more-segment value (`--kernel 6.14.2`,
         /// `--kernel 6.15-rc3`) is STRICT EQUALITY — `6.14.2` does
-        /// NOT match `6.14.20`. See [`kernel_filter_matches`] in
+        /// NOT match `6.14.20`. See `kernel_filter_matches` in
         /// stats.rs for the cutoff implementation.
         ///
         /// Repeatable: `--kernel A --kernel B` keeps rows whose
@@ -958,7 +958,7 @@ pub(crate) enum StatsCommand {
         /// every patch release in that series; a three-or-more-
         /// segment value (`6.14.2`, `6.15-rc3`) is strict
         /// equality. NOT strict equality across the board — see
-        /// [`kernel_filter_matches`] for the cutoff implementation.
+        /// `kernel_filter_matches` for the cutoff implementation.
         #[arg(long = "a-kernel", action = ArgAction::Append)]
         a_kernel: Vec<String>,
         #[arg(long = "a-project-commit", action = ArgAction::Append)]
@@ -986,7 +986,7 @@ pub(crate) enum StatsCommand {
         /// every patch release in that series; a three-or-more-
         /// segment value (`6.14.2`, `6.15-rc3`) is strict
         /// equality. NOT strict equality across the board — see
-        /// [`kernel_filter_matches`] for the cutoff implementation.
+        /// `kernel_filter_matches` for the cutoff implementation.
         #[arg(long = "b-kernel", action = ArgAction::Append)]
         b_kernel: Vec<String>,
         #[arg(long = "b-project-commit", action = ArgAction::Append)]

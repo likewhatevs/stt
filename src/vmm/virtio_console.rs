@@ -142,7 +142,9 @@ impl VirtioConsole {
     // splits the two because it negotiates EVENT_IDX.
     fn signal_used(&mut self) {
         self.interrupt_status |= VIRTIO_MMIO_INT_VRING;
-        let _ = self.irq_evt.write(1);
+        if let Err(e) = self.irq_evt.write(1) {
+            tracing::warn!(%e, "virtio-console irq_evt.write failed");
+        }
     }
 
     /// True when device_status has progressed past FEATURES_OK but not
@@ -288,8 +290,10 @@ impl VirtioConsole {
             // signal again to prompt the guest to replenish RX buffers
             // sooner. Without this, large pastes stall until the guest
             // independently reads from hvc0.
-            if !self.pending_rx.is_empty() {
-                let _ = self.irq_evt.write(1);
+            if !self.pending_rx.is_empty()
+                && let Err(e) = self.irq_evt.write(1)
+            {
+                tracing::warn!(%e, "virtio-console irq_evt.write failed");
             }
         }
     }
