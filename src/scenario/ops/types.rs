@@ -344,7 +344,17 @@ pub enum Op {
 /// convention for *production* call sites, not a hard constraint.
 /// Inside this crate, matchers obey the pattern-side rule above;
 /// constructors obey this rule.
-#[derive(Clone, Debug)]
+///
+/// `Clone + Debug + PartialEq`. `Eq` / `Hash` are impossible
+/// because [`Range`](Self::Range) and [`Overlap`](Self::Overlap)
+/// carry `f64` fractions; `Default` has no honest value (`Llc(0)`
+/// vs. `Range(0..1)` vs. `Exact(empty)` are all different
+/// "no-op" semantics).
+///
+/// Note: `f64::NAN != f64::NAN` per IEEE 754, so a `CpusetSpec`
+/// containing NaN fractions will not equal a clone of itself;
+/// `validate()` rejects NaN inputs.
+#[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum CpusetSpec {
     /// All CPUs in a given LLC index.
@@ -588,6 +598,30 @@ pub struct MemoryLimits {
 /// `--cpu N`). Tests with composed `WorkSpec` groups must sum
 /// across every group — the framework does NOT auto-derive a
 /// budget from the work spec.
+///
+/// # Parent-cgroup hierarchical charging
+///
+/// `pids.max` is a per-cgroup ceiling, but every fork/clone
+/// charges every ancestor up to (but not including) the
+/// unified-hierarchy root. The kernel's `pids_can_fork` calls
+/// `pids_try_charge`, which loops
+/// `for (p = pids; parent_pids(p); p = parent_pids(p))` and
+/// charges each level (kernel/cgroup/pids.c) — root is NOT
+/// charged per the loop's `parent_pids(p)` termination
+/// condition. EAGAIN propagates from the FIRST level
+/// (leaf-to-root traversal order) whose post-charge counter
+/// exceeds its limit, so a child cgroup with `pids.max = 1024`
+/// still hits EAGAIN when a parent two levels up sits at its
+/// own ceiling.
+///
+/// Sizing rule for nested test trees: the *effective* limit is
+/// `min(pids.max)` along the path from the test cgroup up to the
+/// pids-controlled root, NOT just the value set on the test
+/// cgroup itself. When ktstr runs under a delegated parent slice
+/// (systemd `user.slice`, container runtime cgroup, ktstr's own
+/// build sandbox), inspect the parent's `pids.max` before sizing
+/// the test cgroup — a generous test-cgroup setting is silently
+/// shadowed by a tighter ancestor.
 ///
 /// # `pids.max(0)` is rejected at apply_setup, not type-level
 ///
