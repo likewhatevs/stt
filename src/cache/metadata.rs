@@ -980,4 +980,364 @@ mod tests {
     fn kconfig_status_display_untracked_renders_lowercase_word() {
         assert_eq!(KconfigStatus::Untracked.to_string(), "untracked");
     }
+
+    // -- KconfigStatus predicates --
+    //
+    // `is_stale()` and `is_untracked()` collapse the variant pattern
+    // match into a bool, which the kernel-build pipeline keys on for
+    // its rebuild decision. The predicates are independent of the
+    // Display impl tested above — the pipeline never round-trips
+    // through Display, it dispatches on the bool. A regression that
+    // flipped either predicate's polarity (e.g. `Stale` returning
+    // false from `is_stale`) would invisibly change the rebuild
+    // policy.
+
+    /// `Matches` is neither stale nor untracked.
+    #[test]
+    fn kconfig_status_matches_is_neither_stale_nor_untracked() {
+        let s = KconfigStatus::Matches;
+        assert!(!s.is_stale(), "Matches must not be stale");
+        assert!(!s.is_untracked(), "Matches must not be untracked");
+    }
+
+    /// `Stale` is stale and not untracked — the two predicates are
+    /// mutually exclusive on this variant.
+    #[test]
+    fn kconfig_status_stale_is_stale_only() {
+        let s = KconfigStatus::Stale {
+            cached: "old".to_string(),
+            current: "new".to_string(),
+        };
+        assert!(s.is_stale(), "Stale variant must report is_stale=true");
+        assert!(
+            !s.is_untracked(),
+            "Stale must NOT report is_untracked — the two predicates \
+             discriminate distinct variants",
+        );
+    }
+
+    /// `Untracked` is untracked and not stale — pre-tracking-format
+    /// entries must NOT trigger a rebuild via the stale-check.
+    #[test]
+    fn kconfig_status_untracked_is_untracked_only() {
+        let s = KconfigStatus::Untracked;
+        assert!(
+            s.is_untracked(),
+            "Untracked variant must report is_untracked=true"
+        );
+        assert!(
+            !s.is_stale(),
+            "Untracked must NOT report is_stale — pre-tracking-format \
+             entries are unknown, not stale; treating them as stale \
+             would force a rebuild on every old cache hit",
+        );
+    }
+
+    // -- KernelSource::as_local_git_hash --
+    //
+    // The accessor exists for kernel_build_pipeline's post-build
+    // dirty re-check (see cli/kernel_build/build.rs:557): it
+    // compares the post-build HEAD hash against the acquire-time
+    // hash to detect mid-build commits. The accessor MUST return
+    // the inner `git_hash` for `Local` variant only and `None` for
+    // every other variant — a regression that returned `git_hash`
+    // for `Git` (which has its own `git_hash` field at a different
+    // role) would silently corrupt the dirty-check.
+
+    /// `Local` with `git_hash: Some(...)` returns the borrowed hash.
+    /// Borrows rather than clones — a regression that owned the
+    /// returned string would force the caller to allocate.
+    #[test]
+    fn as_local_git_hash_returns_local_hash() {
+        let src = KernelSource::Local {
+            source_tree_path: Some(PathBuf::from("/tmp/linux")),
+            git_hash: Some("deadbee".to_string()),
+        };
+        assert_eq!(
+            src.as_local_git_hash(),
+            Some("deadbee"),
+            "Local with git_hash=Some must surface the inner str",
+        );
+    }
+
+    /// `Local` with `git_hash: None` (dirty / non-git tree at acquire
+    /// time) returns `None`. The caller distinguishes "we have a
+    /// hash to compare" from "we have no anchor" — collapsing both
+    /// into `Some("")` would mislead the dirty-check.
+    #[test]
+    fn as_local_git_hash_returns_none_when_local_has_no_hash() {
+        let src = KernelSource::Local {
+            source_tree_path: Some(PathBuf::from("/tmp/linux")),
+            git_hash: None,
+        };
+        assert_eq!(
+            src.as_local_git_hash(),
+            None,
+            "Local with git_hash=None must surface None — the dirty \
+             check has no anchor on a non-git or dirty tree",
+        );
+    }
+
+    /// `Tarball` returns `None` — tarball builds have no git anchor
+    /// and the accessor must NOT borrow from the wrong variant's
+    /// payload (Tarball has no payload at all, so a regression
+    /// reaching for one would produce a compile error rather than a
+    /// silent bug — but pin the contract anyway).
+    #[test]
+    fn as_local_git_hash_returns_none_for_tarball() {
+        let src = KernelSource::Tarball;
+        assert_eq!(
+            src.as_local_git_hash(),
+            None,
+            "Tarball variant has no git_hash and must surface None",
+        );
+    }
+
+    /// `Git` variant returns `None` even though it has its own
+    /// `git_hash` field — the accessor is `as_local_git_hash`, not
+    /// `as_git_hash`. Pins that the accessor does NOT cross-wire
+    /// the Git variant's `git_hash` (which describes the cloned
+    /// commit, a different role from the Local variant's
+    /// `git_hash` which describes the acquire-time HEAD).
+    #[test]
+    fn as_local_git_hash_returns_none_for_git_even_with_hash_field() {
+        let src = KernelSource::Git {
+            git_hash: Some("a1b2c3d".to_string()),
+            git_ref: Some("main".to_string()),
+        };
+        assert_eq!(
+            src.as_local_git_hash(),
+            None,
+            "Git variant has its own git_hash field but the \
+             accessor is named as_LOCAL_git_hash — it MUST NOT \
+             surface the Git variant's hash, since the Git hash \
+             describes the cloned commit (acquire-time) and the \
+             Local hash describes the operator's working tree HEAD \
+             (a different role with different semantics)",
+        );
+    }
+
+    // -- format_image_missing_reason --
+    //
+    // The producer pairs with `classify_corrupt_reason`'s
+    // `image_missing` arm via the [`IMAGE_MISSING_PREFIX`] /
+    // [`IMAGE_MISSING_SUFFIX`] constants. Direct producer coverage
+    // pins the canonical literal so a future edit to the format!
+    // string can't drift the producer side without breaking the
+    // round-trip test in `classify_corrupt_reason_accepts_every_format_image_missing_output`.
+
+    /// Producer composes prefix + image_name + suffix verbatim.
+    #[test]
+    fn format_image_missing_reason_uses_canonical_prefix_and_suffix() {
+        let reason = format_image_missing_reason("bzImage");
+        assert_eq!(
+            reason, "image file bzImage missing from entry directory",
+            "the produced reason MUST be the exact prefix + image_name + \
+             suffix concatenation — any drift breaks the classifier's \
+             exact-match predicate",
+        );
+        assert!(
+            reason.starts_with(IMAGE_MISSING_PREFIX),
+            "produced reason must start with IMAGE_MISSING_PREFIX",
+        );
+        assert!(
+            reason.ends_with(IMAGE_MISSING_SUFFIX),
+            "produced reason must end with IMAGE_MISSING_SUFFIX",
+        );
+    }
+
+    /// Empty image_name produces a degenerate prefix+suffix abut
+    /// (the prefix's trailing space and the suffix's leading space
+    /// become adjacent, giving `"file  missing"` with two consecutive
+    /// spaces). The classifier's length-guard rejects the result.
+    /// The producer itself does NOT validate (image_name is supposed
+    /// to come from already-validated metadata.image_name), so the
+    /// empty case still produces the verbatim concatenation — but the
+    /// classifier MUST reject the result. Pins the contract that
+    /// degenerate producer output is consumer-rejected, not silently
+    /// classified as image_missing.
+    #[test]
+    fn format_image_missing_reason_with_empty_image_name() {
+        let reason = format_image_missing_reason("");
+        assert_eq!(
+            reason, "image file  missing from entry directory",
+            "empty image_name must produce a verbatim concatenation \
+             (prefix trailing-space + suffix leading-space → two \
+             consecutive spaces between `file` and `missing`); the \
+             producer does not validate (validation is at \
+             validate_filename time), so the degenerate concatenation \
+             is the documented behaviour",
+        );
+        // The classifier MUST reject this degenerate form via its
+        // length-guard arm so the empty case classifies as `unknown`
+        // rather than `image_missing`.
+        assert_eq!(
+            classify_corrupt_reason(&reason),
+            "unknown",
+            "the classifier's length-guard MUST reject the \
+             prefix+suffix-with-empty-image-name form — a regression \
+             that loosened the guard would let a future bug emit \
+             format_image_missing_reason(\"\") and silently classify \
+             it as image_missing, hiding the real defect (empty \
+             image_name in metadata)",
+        );
+    }
+
+    // -- CacheEntry::disk_template_path --
+    //
+    // The accessor names the canonical filename for the per-entry
+    // btrfs disk template (`<entry>/disk-template.img`) that
+    // `vmm/disk_template.rs` writes and reads. The contract is
+    // path-only: no I/O, no validation. Pin the literal so a
+    // future rename (`disk-template.img` → `disk.img`) is caught
+    // by the test rather than only at runtime when the VMM tries
+    // to read a path that no longer exists.
+    #[test]
+    fn cache_entry_disk_template_path_joins_canonical_filename() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+        let entry = cache
+            .store(
+                "disk-tmpl-key",
+                &CacheArtifacts::new(&image),
+                &test_metadata("6.14.2"),
+            )
+            .unwrap();
+        assert_eq!(
+            entry.disk_template_path(),
+            entry.path.join("disk-template.img"),
+            "disk_template_path() MUST resolve to <entry>/disk-template.img — \
+             the literal `disk-template.img` is the canonical filename the \
+             VMM disk_template module writes/reads",
+        );
+        // The accessor is path-only; the file does NOT have to
+        // exist for the path to be returned. Pin that the file
+        // is absent immediately after store() (since store() does
+        // not create the disk template — that's a separate
+        // pipeline step in vmm/disk_template.rs).
+        assert!(
+            !entry.disk_template_path().exists(),
+            "disk_template_path() must be path-only — store() does not \
+             create the file; absence is the expected post-store state",
+        );
+    }
+
+    // -- CacheEntry::has_extra_kconfig --
+    //
+    // Predicate that wraps `metadata.extra_kconfig_hash.is_some()`.
+    // Pin both branches so a regression that flipped the polarity
+    // (returning `is_none()`) would surface here rather than only
+    // in downstream consumers that select rebuild policies on the
+    // bool.
+
+    /// `extra_kconfig_hash: Some(...)` → predicate returns true.
+    #[test]
+    fn cache_entry_has_extra_kconfig_true_when_hash_present() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+        let meta = test_metadata("6.14.2")
+            .with_extra_kconfig_hash(Some("user-fragment-hash".to_string()));
+        let entry = cache
+            .store("with-extra", &CacheArtifacts::new(&image), &meta)
+            .unwrap();
+        assert!(
+            entry.has_extra_kconfig(),
+            "extra_kconfig_hash=Some MUST report has_extra_kconfig()=true — \
+             a regression that flipped polarity would invert the \
+             rebuild-on-fragment-change policy",
+        );
+    }
+
+    /// `extra_kconfig_hash: None` → predicate returns false.
+    #[test]
+    fn cache_entry_has_extra_kconfig_false_when_hash_absent() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+        // test_metadata sets extra_kconfig_hash=None by default.
+        let meta = test_metadata("6.14.2");
+        assert!(
+            meta.extra_kconfig_hash.is_none(),
+            "test_metadata default must keep extra_kconfig_hash=None \
+             so this test exercises the false branch",
+        );
+        let entry = cache
+            .store("no-extra", &CacheArtifacts::new(&image), &meta)
+            .unwrap();
+        assert!(
+            !entry.has_extra_kconfig(),
+            "extra_kconfig_hash=None MUST report has_extra_kconfig()=false",
+        );
+    }
+
+    // -- ListedEntry::path accessor --
+    //
+    // The accessor abstracts over the variant — Valid carries the
+    // path inside its boxed CacheEntry, Corrupt carries it as a
+    // direct field. Existing list() tests reach into the variant
+    // and read the field, so the accessor itself is uncovered.
+    // Pin both branches.
+
+    /// `Valid` variant: path() returns the inner CacheEntry's path.
+    #[test]
+    fn listed_entry_path_accessor_returns_valid_entry_path() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+        let entry = cache
+            .store(
+                "valid-path-test",
+                &CacheArtifacts::new(&image),
+                &test_metadata("6.14.2"),
+            )
+            .unwrap();
+        let expected_path = entry.path.clone();
+        let entries = cache.list().unwrap();
+        let listed = entries
+            .iter()
+            .find(|e| e.key() == "valid-path-test")
+            .expect("the just-stored entry must be in the list");
+        assert!(
+            matches!(listed, ListedEntry::Valid(_)),
+            "precondition: stored entry must surface as Valid",
+        );
+        assert_eq!(
+            listed.path(),
+            expected_path,
+            "ListedEntry::path() on Valid must return the inner \
+             CacheEntry's path — accessor MUST forward, not synthesize",
+        );
+    }
+
+    /// `Corrupt` variant: path() returns the per-variant path field.
+    #[test]
+    fn listed_entry_path_accessor_returns_corrupt_entry_path() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
+        // Create a corrupt-shaped entry (directory exists but no
+        // metadata.json), so list() classifies it as Corrupt.
+        let entry_dir = tmp.path().join("cache").join("corrupt-path-test");
+        std::fs::create_dir_all(&entry_dir).unwrap();
+        let entries = cache.list().unwrap();
+        let listed = entries
+            .iter()
+            .find(|e| e.key() == "corrupt-path-test")
+            .expect("corrupt-shaped entry must be in the list");
+        assert!(
+            matches!(listed, ListedEntry::Corrupt { .. }),
+            "precondition: missing-metadata entry must surface as Corrupt",
+        );
+        assert_eq!(
+            listed.path(),
+            entry_dir,
+            "ListedEntry::path() on Corrupt must return the variant's \
+             `path` field — accessor MUST forward, not synthesize",
+        );
+    }
 }

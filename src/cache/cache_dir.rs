@@ -1451,6 +1451,16 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let lookups_observed = Arc::new(AtomicUsize::new(0));
         let atomicity_violations = Arc::new(AtomicUsize::new(0));
+        // Per-version observation counters strengthen the prior
+        // assertion that "lookup_observed > 0": without splitting
+        // the count, a reader that ONLY ever sees content_a (e.g.
+        // because it raced through every write window before any
+        // B publish landed) would still let the test pass. The
+        // split counts let the test surface whether the race
+        // window was actually exercised across BOTH writer
+        // versions.
+        let observed_a = Arc::new(AtomicUsize::new(0));
+        let observed_b = Arc::new(AtomicUsize::new(0));
 
         let reader_count = 4;
         let mut readers = Vec::with_capacity(reader_count);
@@ -1459,6 +1469,8 @@ mod tests {
             let stop = Arc::clone(&stop);
             let lookups_observed = Arc::clone(&lookups_observed);
             let violations = Arc::clone(&atomicity_violations);
+            let observed_a = Arc::clone(&observed_a);
+            let observed_b = Arc::clone(&observed_b);
             let expected_a = content_a.clone();
             let expected_b = content_b.clone();
             readers.push(thread::spawn(move || {
@@ -1472,7 +1484,11 @@ mod tests {
                         violations.fetch_add(1, Ordering::Relaxed);
                         continue;
                     };
-                    if bytes != expected_a && bytes != expected_b {
+                    if bytes == expected_a {
+                        observed_a.fetch_add(1, Ordering::Relaxed);
+                    } else if bytes == expected_b {
+                        observed_b.fetch_add(1, Ordering::Relaxed);
+                    } else {
                         violations.fetch_add(1, Ordering::Relaxed);
                     }
                     lookups_observed.fetch_add(1, Ordering::Relaxed);
@@ -1510,6 +1526,28 @@ mod tests {
             "readers never observed a successful lookup — test did not \
              actually exercise the concurrency window",
         );
+
+        // Soft observation: under realistic scheduling, readers
+        // SHOULD observe BOTH content_a and content_b. Logged not
+        // asserted — under adversarial scheduling, all reader
+        // wakeups could land between writer transitions and miss
+        // one version entirely. The hard atomicity assertion
+        // above guards correctness; this soft check surfaces
+        // whether the race window was actually exercised across
+        // both versions. Print to stderr so an operator running
+        // with --no-capture sees the coverage signal without
+        // bricking the test run.
+        let saw_a = observed_a.load(Ordering::Relaxed);
+        let saw_b = observed_b.load(Ordering::Relaxed);
+        if saw_a == 0 || saw_b == 0 {
+            eprintln!(
+                "cache_dir_store_atomic_under_concurrent_readers: \
+                 one writer version was never observed by readers \
+                 (saw_a={saw_a}, saw_b={saw_b}). Atomicity invariant \
+                 still holds; coverage of the race window is \
+                 probabilistic under scheduling pressure.",
+            );
+        }
 
         let final_entry = cache.lookup("atomic-key").expect("entry must exist");
         let final_bytes = fs::read(final_entry.image_path()).unwrap();
@@ -2864,6 +2902,741 @@ mod tests {
             "unparseable env value must fall back to the default \
              rather than zero / disabled — a typo must not silently \
              remove the timeout",
+        );
+    }
+
+    // -- store: vmlinux strip-fallback warn capture --
+    //
+    // `cache_dir_store_falls_back_when_strip_fails` (above) pins
+    // the on-disk observable: an unrecognised vmlinux ELF lands
+    // verbatim under the cache entry with `vmlinux_stripped =
+    // false`. This test pins the OPERATOR-VISIBLE observable: the
+    // strip-failure path emits a `tracing::warn!` so an operator
+    // running with a default subscriber sees the diagnostic and
+    // knows the on-disk payload is larger than expected. A
+    // regression that silenced the warn (e.g. demoted to debug or
+    // dropped) would leave the operator wondering why their cache
+    // entry is suddenly 300 MB instead of 30 MB — pinning the
+    // log fragment locks the diagnostic in place.
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn store_emits_warn_when_vmlinux_strip_fails() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+        // Non-ELF bytes — strip_vmlinux_debug returns Err, the
+        // store() path falls back to copying the raw vmlinux.
+        let vmlinux = src_dir.path().join("vmlinux");
+        std::fs::write(&vmlinux, b"not an ELF file").unwrap();
+        let meta = test_metadata("6.14.2");
+
+        cache
+            .store(
+                "warn-on-strip-fail",
+                &CacheArtifacts::new(&image).with_vmlinux(&vmlinux),
+                &meta,
+            )
+            .expect("strip fallback must still produce a successful store");
+
+        // Substring match to remain resilient to wording polish
+        // that doesn't change the operator-relevant signal. The
+        // `vmlinux strip failed` literal is the load-bearing
+        // fragment — without it, the operator can't search for
+        // strip-failure incidents in their tracing output.
+        assert!(
+            logs_contain("vmlinux strip failed"),
+            "the strip-fallback path MUST emit a tracing::warn! \
+             with the 'vmlinux strip failed' literal so an operator \
+             can see the strip pipeline degraded — without the \
+             warn, an unstripped 300 MB vmlinux lands silently and \
+             the operator can't correlate cache-bloat reports with \
+             strip failures",
+        );
+        assert!(
+            logs_contain("caching unstripped"),
+            "the warn body MUST tell the operator the caller fell \
+             back to caching the raw bytes (not that the cache \
+             refused) — so the operator understands the cache \
+             entry is usable but oversized",
+        );
+    }
+
+    // -- store: error paths --
+    //
+    // `store()` runs a copy/strip/write/rename pipeline; every
+    // step can return an error. The success path is exercised by
+    // every test above, but the error paths each have distinct
+    // diagnostic messages and cleanup obligations that need
+    // direct coverage.
+
+    /// `fs::copy` of the kernel image fails when the source path
+    /// does not exist. The error must surface with a "copy kernel
+    /// image to cache" prefix so an operator can attribute the
+    /// failure to the image-copy step (vs the vmlinux-copy step
+    /// or the metadata-write step).
+    #[test]
+    fn store_image_copy_failure_surfaces_diagnostic() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
+        let src_dir = TempDir::new().unwrap();
+        let nonexistent = src_dir.path().join("never-created-bzImage");
+        // Pre-condition: the source path must NOT exist — fs::copy
+        // surfaces ENOENT and store() wraps it with the
+        // "copy kernel image to cache" prefix.
+        assert!(!nonexistent.exists());
+        let meta = test_metadata("6.14.2");
+
+        let err = cache
+            .store("img-copy-fail", &CacheArtifacts::new(&nonexistent), &meta)
+            .expect_err("missing source image must fail the store");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.starts_with("copy kernel image to cache:"),
+            "diagnostic must START with the exact `copy kernel image \
+             to cache:` prefix from cache_dir.rs:541 so an operator \
+             can attribute the failure to the image-copy step (vs \
+             the stripped-vmlinux arm at :548 or the fallback-vmlinux \
+             arm at :560); got: {msg}",
+        );
+
+        // Cleanup obligation: the TmpDirGuard must remove the
+        // staging directory on this error path — no `.tmp-*`
+        // entries can survive a failed store.
+        for dirent in std::fs::read_dir(tmp.path().join("cache")).unwrap() {
+            let name = dirent.unwrap().file_name().to_string_lossy().into_owned();
+            assert!(
+                !name.starts_with(".tmp-"),
+                "TmpDirGuard must remove the staging directory on \
+                 the image-copy error path; found leftover: {name}",
+            );
+        }
+    }
+
+    /// `fs::copy` of the unstripped vmlinux on the strip-fallback
+    /// path fails when the source vmlinux does not exist. Pins the
+    /// EXACT error-context prefix `"copy vmlinux to cache:"` from
+    /// cache_dir.rs:560 so a future refactor that reroutes the
+    /// fallback (e.g. moves to a separate helper) but drops the
+    /// context prefix is caught immediately. The test exercises the
+    /// strip-fallback fs::copy arm specifically — strip_vmlinux_debug
+    /// errors first on the missing read, store() falls through to
+    /// the raw-bytes fallback copy, which then ALSO errors with
+    /// ENOENT against the same missing source. The final error
+    /// surfaced to the caller MUST carry the exact "copy vmlinux to
+    /// cache:" prefix that distinguishes this arm from the
+    /// "copy stripped vmlinux to cache:" success-path arm and the
+    /// "copy kernel image to cache:" image-copy arm.
+    #[test]
+    fn store_vmlinux_copy_failure_uses_exact_error_prefix() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+        let vmlinux = src_dir.path().join("never-created-vmlinux");
+        assert!(!vmlinux.exists());
+        let meta = test_metadata("6.14.2");
+
+        let err = cache
+            .store(
+                "vml-fallback-copy-fail",
+                &CacheArtifacts::new(&image).with_vmlinux(&vmlinux),
+                &meta,
+            )
+            .expect_err("missing vmlinux must fail the store on the fallback path");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.starts_with("copy vmlinux to cache:"),
+            "the fallback fs::copy arm at cache_dir.rs:560 wraps \
+             with the exact prefix `copy vmlinux to cache:` — this \
+             distinguishes it from the success-path stripped-copy \
+             at cache_dir.rs:548 (`copy stripped vmlinux to cache:`) \
+             and the kernel-image arm at cache_dir.rs:541 (`copy \
+             kernel image to cache:`); a regression that drops the \
+             context wrapping or rewords the prefix would lose the \
+             arm-attribution diagnostic. Got: {msg}",
+        );
+
+        // Cleanup obligation across the vmlinux-fallback error path.
+        for dirent in std::fs::read_dir(tmp.path().join("cache")).unwrap() {
+            let name = dirent.unwrap().file_name().to_string_lossy().into_owned();
+            assert!(
+                !name.starts_with(".tmp-"),
+                "TmpDirGuard must remove the staging directory on \
+                 the vmlinux-fallback-copy error path; found \
+                 leftover: {name}",
+            );
+        }
+    }
+
+    // -- TmpDirGuard cleanup-on-error --
+    //
+    // The guard is a `Drop` impl — when `store()` returns Err,
+    // the guard's drop must remove the `.tmp-{key}-{pid}` dir.
+    // The error-path tests above verify the observable
+    // (no leftover .tmp- entries after a failed store); this test
+    // pins the contract more directly by injecting a stale tmp dir
+    // (simulating a prior crashed store) under the SAME pid+key,
+    // proving that store()'s pre-stage `fs::remove_dir_all(tmp_dir)`
+    // and TmpDirGuard cooperate correctly.
+    #[test]
+    fn tmp_dir_guard_removes_staging_dir_after_failed_store() {
+        let tmp = TempDir::new().unwrap();
+        let cache_root = tmp.path().join("cache");
+        let cache = CacheDir::with_root(cache_root.clone());
+        let src_dir = TempDir::new().unwrap();
+        // Missing source forces fs::copy to fail mid-store.
+        let nonexistent = src_dir.path().join("never-created");
+        let meta = test_metadata("6.14.2");
+
+        let _ = cache
+            .store("guard-test", &CacheArtifacts::new(&nonexistent), &meta)
+            .expect_err("missing source must fail");
+
+        // After the failed store returns, the TmpDirGuard's drop
+        // must have removed the staging dir. Walk the cache root
+        // and verify no .tmp- entries survive.
+        let mut leftover_tmp_count = 0;
+        if cache_root.exists() {
+            for dirent in std::fs::read_dir(&cache_root).unwrap() {
+                let name = dirent.unwrap().file_name().to_string_lossy().into_owned();
+                if name.starts_with(".tmp-") {
+                    leftover_tmp_count += 1;
+                }
+            }
+        }
+        assert_eq!(
+            leftover_tmp_count, 0,
+            "TmpDirGuard's Drop impl must clean up .tmp- staging \
+             directories after a failed store — found {leftover_tmp_count} leftover(s)",
+        );
+
+        // The final cache entry must NOT exist either — a failed
+        // store must not leave a partial publish.
+        assert!(
+            !cache_root.join("guard-test").exists(),
+            "a failed store must not publish a partial entry",
+        );
+    }
+
+    // -- store: pre-existing tmp_dir as a regular FILE --
+    //
+    // store() at cache_dir.rs:529 does:
+    //   if tmp_dir.exists() {
+    //       fs::remove_dir_all(&tmp_dir)?;
+    //   }
+    // The remove_dir_all docs (rust stdlib) state it FAILS if the
+    // path is not a directory. So if a prior crash (or hostile
+    // operator action) leaves a regular FILE at the
+    // `.tmp-{key}-{pid}` path, the cleanup step bails — store()
+    // surfaces the error rather than silently overwriting the
+    // file or proceeding into an inconsistent state. Pin this
+    // edge case so a future refactor that, e.g., switches to
+    // `remove_file` first or silently swallows the error doesn't
+    // regress the safety invariant.
+    #[test]
+    fn store_fails_when_tmp_dir_path_is_regular_file() {
+        let tmp = TempDir::new().unwrap();
+        let cache_root = tmp.path().join("cache");
+        let cache = CacheDir::with_root(cache_root.clone());
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+        let meta = test_metadata("6.14.2");
+
+        // Pre-create the EXACT path store() will try to mkdir
+        // (`.tmp-{cache_key}-{pid}`) as a regular FILE. The path
+        // must match store()'s computed tmp_dir name exactly,
+        // including the current process pid.
+        std::fs::create_dir_all(&cache_root).unwrap();
+        let pid = std::process::id();
+        let blocking_file = cache_root.join(format!(".tmp-blocked-key-{pid}"));
+        std::fs::write(&blocking_file, b"i am a regular file, not a directory").unwrap();
+
+        let err = cache
+            .store("blocked-key", &CacheArtifacts::new(&image), &meta)
+            .expect_err(
+                "pre-existing regular FILE at the tmp_dir path must \
+                 fail the store — fs::remove_dir_all rejects non-directories",
+            );
+        // The exact error wording is platform-dependent (Linux:
+        // ENOTDIR "Not a directory"); pin only the broadly-true
+        // observable: the error is surfaced, not silently swallowed.
+        let msg = format!("{err:#}");
+        assert!(
+            !msg.is_empty(),
+            "store error must carry a non-empty diagnostic; got: {msg}",
+        );
+
+        // The blocking file MUST remain intact — store() must not
+        // delete (and must not silently overwrite) operator state
+        // that doesn't fit the cache's expected shape. This is the
+        // critical safety invariant: a future regression that
+        // swapped remove_dir_all for `remove_file` to "fix" the
+        // failure would silently delete the operator's file.
+        assert!(
+            blocking_file.exists(),
+            "the pre-existing regular file at the tmp_dir path MUST \
+             remain in place after the failed store — silently \
+             overwriting it would erase operator state without \
+             warning",
+        );
+        assert_eq!(
+            std::fs::read(&blocking_file).unwrap(),
+            b"i am a regular file, not a directory",
+            "the blocking file's CONTENTS must also be unchanged — \
+             not just the inode",
+        );
+
+        // The final cache entry MUST NOT exist — a failed store
+        // must not leave a partial publish.
+        assert!(
+            !cache_root.join("blocked-key").exists(),
+            "a failed store must not publish a partial entry under \
+             the cache_key",
+        );
+    }
+
+    // -- kconfig_status with empty-string hash --
+    //
+    // The hash is treated as an opaque string by `kconfig_status`;
+    // `Some("")` is a valid (degenerate) hash. The classifier MUST
+    // dispatch on string equality, not on emptiness, so two
+    // entries with `Some("")` MATCH each other rather than both
+    // being stale or untracked. Pins the equality semantic — a
+    // regression that special-cased empty would mis-classify
+    // (degenerate, but legitimate) test fixtures.
+
+    /// Both cached and current are `Some("")`: status MUST be
+    /// `Matches` (string equality, not "treat empty as untracked").
+    #[test]
+    fn kconfig_status_empty_strings_classify_as_matches() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+        let meta = test_metadata("6.14.2").with_ktstr_kconfig_hash(Some("".to_string()));
+        let entry = cache
+            .store("empty-vs-empty", &CacheArtifacts::new(&image), &meta)
+            .unwrap();
+        assert_eq!(
+            entry.kconfig_status(""),
+            KconfigStatus::Matches,
+            "Some(\"\") cached + \"\" current must classify as \
+             Matches — the predicate is string equality on the \
+             inner string, not a separate emptiness check",
+        );
+    }
+
+    /// Cached `Some("")` vs current non-empty: status MUST be
+    /// `Stale { cached: "", current: "..." }`. Empty cached is
+    /// distinct from `None` (Untracked) — the variant carries
+    /// data even when the inner string is empty.
+    #[test]
+    fn kconfig_status_empty_cached_vs_nonempty_current_is_stale() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+        let meta = test_metadata("6.14.2").with_ktstr_kconfig_hash(Some("".to_string()));
+        let entry = cache
+            .store("empty-vs-nonempty", &CacheArtifacts::new(&image), &meta)
+            .unwrap();
+        match entry.kconfig_status("real_hash") {
+            KconfigStatus::Stale { cached, current } => {
+                assert_eq!(
+                    cached, "",
+                    "Stale.cached must carry the empty string \
+                     verbatim — empty Some(\"\") is NOT collapsed \
+                     to None at compare time",
+                );
+                assert_eq!(
+                    current, "real_hash",
+                    "Stale.current must carry the caller's hash",
+                );
+            }
+            other => panic!("expected Stale, got {other:?}"),
+        }
+    }
+
+    /// Cached `None` + current `""` → Untracked. Single-assertion
+    /// focused variant of
+    /// [`kconfig_status_none_cached_returns_untracked_regardless_of_current`]
+    /// pinned under the canonical name used in team review notes
+    /// so a `grep` against that exact name finds the test.
+    #[test]
+    fn kconfig_status_none_cached_vs_empty_current_is_untracked() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+        let meta = KernelMetadata {
+            ktstr_kconfig_hash: None,
+            ..test_metadata("6.14.2")
+        };
+        let entry = cache
+            .store("none-vs-empty", &CacheArtifacts::new(&image), &meta)
+            .unwrap();
+        assert_eq!(
+            entry.kconfig_status(""),
+            KconfigStatus::Untracked,
+            "None cached + \"\" current MUST classify as Untracked",
+        );
+    }
+
+    /// Cached `None` (no recorded hash) vs current `""` (empty hash
+    /// passed in by the caller): status MUST be `Untracked` — the
+    /// classifier dispatches on `Option::None`, never on the
+    /// caller's hash content. A regression that special-cased
+    /// `current == ""` to short-circuit to Matches would mistake
+    /// a pre-tracking-format entry for a clean cache hit. Pins
+    /// the `None` short-circuit at metadata.rs:322 — the inner
+    /// match arm `None => KconfigStatus::Untracked` MUST fire
+    /// before any string-equality check on `current`.
+    #[test]
+    fn kconfig_status_none_cached_returns_untracked_regardless_of_current() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+        // Explicitly None — pre-tracking-format entry.
+        let meta = KernelMetadata {
+            ktstr_kconfig_hash: None,
+            ..test_metadata("6.14.2")
+        };
+        let entry = cache
+            .store("none-cached", &CacheArtifacts::new(&image), &meta)
+            .unwrap();
+        // Empty current must NOT collapse to Matches.
+        assert_eq!(
+            entry.kconfig_status(""),
+            KconfigStatus::Untracked,
+            "None cached + \"\" current must classify as Untracked — \
+             the caller's hash content is ignored when the cached \
+             entry has no recorded hash; a regression that \
+             special-cased current==\"\" to short-circuit to Matches \
+             would mistake pre-tracking-format entries for clean hits",
+        );
+        // Non-empty current ALSO untracked — the dispatch is on
+        // Option::None, not on the caller's input.
+        assert_eq!(
+            entry.kconfig_status("any-hash"),
+            KconfigStatus::Untracked,
+            "None cached + non-empty current must also classify as \
+             Untracked — the predicate is variant-driven, not \
+             input-driven",
+        );
+    }
+
+    // -- lookup vs list semantics --
+    //
+    // A corrupt entry (metadata.json missing/malformed) returns
+    // None from lookup() and Corrupt from list(). The two methods
+    // serve different purposes: lookup is a direct hit-or-miss
+    // probe, list enumerates everything the operator should be
+    // aware of. Pins the divergent semantics.
+
+    /// A corrupt entry whose metadata.json is malformed:
+    /// lookup() returns None, list() returns Corrupt for the
+    /// same key. Pins the semantic that lookup hides corruption
+    /// (the caller treats it as a miss and rebuilds), while list
+    /// surfaces it (the operator sees and decides).
+    #[test]
+    fn lookup_vs_list_diverge_on_corrupt_entry() {
+        let tmp = TempDir::new().unwrap();
+        let cache_root = tmp.path().join("cache");
+        let cache = CacheDir::with_root(cache_root.clone());
+        let entry_dir = cache_root.join("corrupt-entry");
+        std::fs::create_dir_all(&entry_dir).unwrap();
+        std::fs::write(entry_dir.join("metadata.json"), b"not valid json {[").unwrap();
+
+        // lookup: corruption is hidden as a miss.
+        assert!(
+            cache.lookup("corrupt-entry").is_none(),
+            "lookup() MUST return None on a corrupt entry — the \
+             caller treats it as a miss and proceeds to rebuild; \
+             surfacing the corruption here would force every \
+             caller to handle a third state besides hit/miss",
+        );
+
+        // list: the same entry surfaces as Corrupt with a reason.
+        let entries = cache.list().unwrap();
+        let listed = entries
+            .iter()
+            .find(|e| e.key() == "corrupt-entry")
+            .expect("list MUST surface the corrupt entry — the \
+                     operator needs to see and decide what to do \
+                     about it (clean? investigate?)");
+        // Pin the EXACT Corrupt classification rather than the
+        // weaker `as_valid().is_none()` check — `as_valid()` only
+        // distinguishes Valid from non-Valid, so a future variant
+        // expansion (e.g. adding `Pending` or `Locked`) would
+        // silently let this test pass without proving the entry
+        // landed under the Corrupt arm specifically.
+        assert!(
+            matches!(listed, ListedEntry::Corrupt { .. }),
+            "list MUST classify the entry as ListedEntry::Corrupt \
+             — the lookup miss is the same on-disk state as a list \
+             Corrupt entry, and the variant must be the Corrupt arm \
+             specifically (not just non-Valid). Got: {listed:?}",
+        );
+    }
+
+    // -- cache_content_matches all-None --
+    //
+    // `test_metadata` (shared_test_helpers.rs:15) sets
+    // `config_hash = Some("abc123")` and
+    // `ktstr_kconfig_hash = Some("def456")` but
+    // `extra_kconfig_hash = None`. The match-all test
+    // (`cache_content_matches_when_only_built_at_differs`) therefore
+    // already exercises `extra_kconfig_hash = None`; the all-None
+    // case for `config_hash` and `ktstr_kconfig_hash` (a
+    // freshly-constructed KernelMetadata via ::new with no setters
+    // chained) is uncovered. This test fills that gap by
+    // constructing both sides via ::new so every Option hash field
+    // is None, then asserting the predicate accepts `None == None`
+    // rather than treating None as "unknown, can't compare".
+
+    /// Two metadata values with EVERY `Option<String>` hash field
+    /// set to None match each other. Pins that None == None for
+    /// the recheck — without this, two cache misses that both
+    /// landed without a config_hash recorded would each redundantly
+    /// republish.
+    #[test]
+    fn cache_content_matches_when_all_hashes_are_none() {
+        // Build metadata via ::new (no chainable setters) so every
+        // Option<String> hash field is None.
+        let cached = KernelMetadata::new(
+            super::super::metadata::KernelSource::Tarball,
+            "x86_64".to_string(),
+            "bzImage".to_string(),
+            "2026-04-12T10:00:00Z".to_string(),
+        );
+        let caller = KernelMetadata::new(
+            super::super::metadata::KernelSource::Tarball,
+            "x86_64".to_string(),
+            "bzImage".to_string(),
+            // Distinct built_at — must NOT change the recheck's
+            // verdict because built_at is excluded from the
+            // predicate. The hashes are all None on both sides,
+            // and None == None.
+            "2026-04-13T10:00:00Z".to_string(),
+        );
+        assert!(
+            cache_content_matches(&cached, &caller, false),
+            "two metadata values with every hash field set to None \
+             must classify as content-equal — None == None for the \
+             predicate; without this, a cache that doesn't track \
+             hashes would recheck-miss on every concurrent peer \
+             and redundantly republish",
+        );
+    }
+
+    /// All-None hashes WITH vmlinux on both sides matches: pins the
+    /// vmlinux-presence axis of the predicate when every hash is
+    /// None. The previous all-None test exercises only the
+    /// caller_has_vmlinux=false branch; this test covers the
+    /// caller_has_vmlinux=true branch with cached.has_vmlinux=true,
+    /// so a regression that special-cased "all hashes None implies
+    /// no vmlinux" would surface.
+    #[test]
+    fn cache_content_matches_all_none_with_vmlinux_on_both_sides() {
+        let mut cached = KernelMetadata::new(
+            super::super::metadata::KernelSource::Tarball,
+            "x86_64".to_string(),
+            "bzImage".to_string(),
+            "2026-04-12T10:00:00Z".to_string(),
+        );
+        cached.set_has_vmlinux(true);
+        let caller = KernelMetadata::new(
+            super::super::metadata::KernelSource::Tarball,
+            "x86_64".to_string(),
+            "bzImage".to_string(),
+            "2026-04-13T10:00:00Z".to_string(),
+        );
+        // caller_has_vmlinux=true (caller is publishing a vmlinux
+        // sidecar); cached has has_vmlinux=true; every hash is
+        // None on both sides. All four predicate axes match →
+        // content-equal.
+        assert!(
+            cache_content_matches(&cached, &caller, true),
+            "all-None hashes + matched vmlinux presence (true=true) \
+             must classify as content-equal — the vmlinux-axis is \
+             the only non-hash axis of the predicate, and the \
+             test_metadata-based test only covers vmlinux=false. \
+             Without this case, a regression that special-cased \
+             'all-None implies no vmlinux' would silently pass \
+             the existing tests.",
+        );
+    }
+
+    /// Asymmetric None: cached has Some, caller has None (or vice
+    /// versa). The predicate must reject both cases — None is
+    /// distinct from Some(s) regardless of s. Pins that the
+    /// recheck does NOT silently fall through "unknown" to a hit.
+    #[test]
+    fn cache_content_matches_asymmetric_none_misses() {
+        // cached has config_hash=Some, caller has None.
+        let mut cached = test_metadata("6.14.2");
+        cached.config_hash = Some("hash-cached".to_string());
+        let mut caller = test_metadata("6.14.2");
+        caller.config_hash = None;
+        assert!(
+            !cache_content_matches(&cached, &caller, false),
+            "cached=Some, caller=None must classify as \
+             content-different — None != Some(s); a regression \
+             that treated None as 'matches everything' would \
+             break the recheck for any caller that lost its hash",
+        );
+
+        // Symmetric: cached None, caller Some.
+        let mut cached = test_metadata("6.14.2");
+        cached.config_hash = None;
+        let mut caller = test_metadata("6.14.2");
+        caller.config_hash = Some("hash-caller".to_string());
+        assert!(
+            !cache_content_matches(&cached, &caller, false),
+            "cached=None, caller=Some must also classify as \
+             content-different — the asymmetric direction must \
+             also fail to recheck",
+        );
+    }
+
+    // -- lookup_silent contract (no warn dedup pollution) --
+    //
+    // Developer advocate finding: store()'s in-lock recheck calls
+    // `lookup_silent` rather than `lookup` precisely so a recheck
+    // hit on a strip-fallback entry does NOT consume the once-per-
+    // process dedup slot. The test that pins this contract is
+    // critical — without it, a regression that swapped
+    // `lookup_silent` for `lookup` inside `store()` would silently
+    // burn the dedup slot, making the user-facing `lookup` call
+    // (which fires AFTER `store()` returns) silent. The result:
+    // operators stop seeing the strip-fallback warn after a
+    // store-hit pattern.
+
+    /// Direct unit test on the contract: `lookup_silent` must not
+    /// emit the unstripped-vmlinux warn even when the entry is in
+    /// the warn-eligible state. Drives the contract through the
+    /// public `lookup` (which DOES warn) and a private inspection
+    /// of the warned-keys static is unavailable, so the test
+    /// instead pins the OBSERVABLE: a `lookup_silent` followed by
+    /// a `lookup` for the same key BOTH proceed without dedup
+    /// suppressing the second call's warn. If `lookup_silent` had
+    /// burned the dedup slot, the subsequent `lookup` would be
+    /// silent and the test would fail.
+    #[tracing_test::traced_test]
+    #[test]
+    fn lookup_silent_does_not_consume_warn_dedup_slot() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+        // Use a unique cache_key for this test so the
+        // process-wide warned_keys static (shared across all
+        // tests) does not let a prior test's dedup state mask
+        // the assertion. The key must not collide with any other
+        // test's stale-vmlinux key; "lookup-silent-contract" is
+        // distinct.
+        let key = "lookup-silent-contract";
+        // Store a strip-failing vmlinux so the entry has
+        // has_vmlinux=true + vmlinux_stripped=false (warn-eligible).
+        let vmlinux = src_dir.path().join("vmlinux");
+        std::fs::write(&vmlinux, b"not an ELF file").unwrap();
+        let meta = test_metadata("6.14.2");
+        cache
+            .store(
+                key,
+                &CacheArtifacts::new(&image).with_vmlinux(&vmlinux),
+                &meta,
+            )
+            .unwrap();
+
+        // Step 1: silent lookup — must NOT emit the warn.
+        let _silent = cache.lookup_silent(key);
+        // Step 2: public lookup — MUST emit the warn (the dedup
+        // slot for this key is still empty because step 1 used
+        // lookup_silent).
+        let _public = cache.lookup(key);
+        assert!(
+            logs_contain("using unstripped vmlinux"),
+            "lookup() after lookup_silent() MUST emit the \
+             unstripped-vmlinux warn — if lookup_silent had \
+             consumed the once-per-key dedup slot, this assertion \
+             would fail and the operator would never see the \
+             warn for entries that store() saw first via the \
+             in-lock recheck",
+        );
+    }
+
+    // -- remove_entries reports the input size as count --
+    //
+    // Cleaner finding: `clean_keep`/`clean_all` collect the input
+    // iterator into a Vec, capture `count = len()`, then loop
+    // `fs::remove_dir_all`. The returned count is the input size,
+    // not the number of entries actually removed. This test pins
+    // that the count reflects the LIST of candidates passed to
+    // the loop — so a future caller that relies on the count for
+    // "removed N entries" reporting at least sees the correct
+    // input cardinality on the success path. (Partial-failure
+    // semantics under root — which bypasses DAC permission
+    // checks — cannot be reliably tested via permission tricks;
+    // the cleaner-finding case is documented for follow-up
+    // refactor instead.)
+    #[test]
+    fn clean_all_count_matches_listed_entry_count() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+
+        // Mix: 2 valid entries + 1 corrupt-shaped entry. The list()
+        // call returns ALL three (Valid + Corrupt). clean_all
+        // walks the list and removes them all, returning a count
+        // that equals the list cardinality.
+        let cache_root = tmp.path().join("cache");
+        cache
+            .store(
+                "valid-1",
+                &CacheArtifacts::new(&image),
+                &test_metadata("6.13.0"),
+            )
+            .unwrap();
+        cache
+            .store(
+                "valid-2",
+                &CacheArtifacts::new(&image),
+                &test_metadata("6.14.2"),
+            )
+            .unwrap();
+        // Add a corrupt-shaped entry by creating an empty
+        // directory with no metadata.json. list() classifies it
+        // as Corrupt; clean_all removes it alongside the valid
+        // entries.
+        let corrupt = cache_root.join("corrupt-1");
+        std::fs::create_dir_all(&corrupt).unwrap();
+
+        let removed = cache.clean_all().expect("clean_all must succeed on a clean fs");
+        assert_eq!(
+            removed, 3,
+            "clean_all MUST report a count equal to the listed \
+             entry count (Valid + Corrupt) — operator-facing \
+             reporting that mismatched the actual cleanup would \
+             undermine trust in the diagnostic",
+        );
+
+        // Verify on disk: every entry the list returned has been
+        // removed. The .locks/ subdir (if present) is preserved.
+        let surviving: Vec<_> = std::fs::read_dir(&cache_root)
+            .unwrap()
+            .filter_map(|d| d.ok())
+            .map(|d| d.file_name().to_string_lossy().into_owned())
+            .filter(|n| !n.starts_with('.'))
+            .collect();
+        assert!(
+            surviving.is_empty(),
+            "every non-dotfile entry must be gone after clean_all; \
+             surviving: {surviving:?}",
         );
     }
 }

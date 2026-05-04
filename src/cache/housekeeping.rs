@@ -132,7 +132,7 @@ pub(crate) fn atomic_swap_dirs(src: &Path, dst: &Path) -> anyhow::Result<()> {
 ///
 /// On failure returns a human-readable reason with a distinct prefix
 /// per failure mode (missing / unreadable / schema-drift / malformed
-/// / truncated / parse error). Prefix consumers key on
+/// / truncated). Prefix consumers key on
 /// [`super::metadata::classify_corrupt_reason`].
 ///
 /// **Producer↔classifier contract.** The reason strings emitted
@@ -161,13 +161,20 @@ pub(crate) fn read_metadata(dir: &Path) -> Result<KernelMetadata, String> {
         serde_json::error::Category::Data => format!("metadata.json schema drift: {e}"),
         serde_json::error::Category::Syntax => format!("metadata.json malformed: {e}"),
         serde_json::error::Category::Eof => format!("metadata.json truncated: {e}"),
-        serde_json::error::Category::Io => {
-            tracing::error!(
-                err = %e,
-                "serde_json::from_str returned Category::Io — unexpected for in-memory input",
-            );
-            format!("metadata.json parse error: {e}")
-        }
+        // Category::Io is only produced by `from_reader` when the
+        // underlying io::Read fails. `from_str` operates on an
+        // already-loaded `&str` — there is no I/O surface left for
+        // serde_json to fault on, so this arm is dead. Pinned via
+        // `unreachable!` so a future swap of `from_str` for
+        // `from_reader` (or a serde_json upgrade that broadens the
+        // semantics) surfaces here loudly rather than silently
+        // landing in a catch-all `parse_error` bucket. The
+        // serde_json source itself uses the same `unreachable!()`
+        // pattern in its `From<Error> for io::Error` impl.
+        serde_json::error::Category::Io => unreachable!(
+            "serde_json::from_str cannot return Category::Io — \
+             from_str operates on &str, no I/O surface present"
+        ),
     })
 }
 
@@ -358,6 +365,28 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let never_created = tmp.path().join("never-created");
         clean_orphaned_tmp_dirs(&never_created).unwrap();
+    }
+
+    /// `clean_orphaned_tmp_dirs` against a path that EXISTS but is
+    /// NOT a directory (e.g. a regular file at the cache_root path)
+    /// returns `Ok(())` rather than erroring. The early `is_dir()`
+    /// guard short-circuits so a misconfigured cache_root pointing
+    /// at a stray file does not poison the store() pipeline. Pins
+    /// the soft-fail semantic — a hard failure here would brick
+    /// every store call until the operator manually fixed the
+    /// stray file.
+    #[test]
+    fn clean_orphaned_tmp_dirs_returns_ok_when_root_is_a_file() {
+        let tmp = TempDir::new().unwrap();
+        let stray_file = tmp.path().join("stray-file");
+        std::fs::write(&stray_file, b"not a directory").unwrap();
+        clean_orphaned_tmp_dirs(&stray_file)
+            .expect("file-shaped cache_root must surface as Ok via the is_dir guard");
+        assert!(
+            stray_file.exists(),
+            "the file must remain in place — clean_orphaned_tmp_dirs \
+             must not delete a non-directory cache_root",
+        );
     }
 
     /// Multi-entry mix: a DEAD-pid orphan and a LIVE-pid tempdir
@@ -589,6 +618,26 @@ mod tests {
     fn cache_validate_filename_accepts_valid() {
         assert!(validate_filename("bzImage").is_ok());
         assert!(validate_filename("Image").is_ok());
+    }
+
+    /// `validate_filename` rejects null-byte input. The validator
+    /// guards against C-string boundary corruption in any callee
+    /// that hands the name to a C API (`open`, `mkdir`,
+    /// `renameat2` — every cache-store path eventually crosses a
+    /// libc boundary, where a null byte truncates the path
+    /// silently). Without the guard, a name like `"foo\0/etc"`
+    /// would land on disk as `"foo"` and the truncation would
+    /// be invisible.
+    #[test]
+    fn cache_validate_filename_rejects_null_byte() {
+        let err = validate_filename("foo\0evil").unwrap_err();
+        assert!(
+            err.to_string().contains("null"),
+            "validator must surface a null-related diagnostic — \
+             without the guard a name like 'foo\\0/evil' would \
+             truncate to 'foo' inside libc, silently losing the \
+             trailing path; got: {err}",
+        );
     }
 
     // -- atomic_swap_dirs direct unit tests --
