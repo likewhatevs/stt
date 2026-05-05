@@ -37,6 +37,7 @@
 
 use anyhow::Result;
 use ktstr::assert::AssertResult;
+use ktstr::ktstr_test;
 use ktstr::scenario::ops::{CgroupDef, HoldSpec, Op, Step, execute_steps};
 use ktstr::test_support::{Payload, Scheduler, SchedulerSpec, sidecar_dir};
 
@@ -77,9 +78,14 @@ fn snapshot_tagged_path(test_name: &str, tag: &str) -> std::path::PathBuf {
 // AND a non-zero `nr_cpus_onln` field rendered through real BTF.
 // --------------------------------------------------------------------
 
-fn scenario_op_snapshot_captures_real_bpf_state(
-    ctx: &ktstr::scenario::Ctx,
-) -> Result<AssertResult> {
+#[ktstr_test(
+    scheduler = KTSTR_SCHED_PAYLOAD,
+    duration_s = 4,
+    watchdog_timeout_s = 15,
+    workers_per_cgroup = 2,
+    auto_repro = false,
+)]
+fn snapshot_real_capture_op_snapshot(ctx: &ktstr::scenario::Ctx) -> Result<AssertResult> {
     let dump_path = snapshot_tagged_path("snapshot_real_capture_op_snapshot", "mid_run");
 
     // Hold the workload long enough that the BPF arena allocator has
@@ -176,9 +182,9 @@ fn scenario_op_snapshot_captures_real_bpf_state(
              produced an empty rendering"
         );
     }
-    let has_ktstr_enabled = members.iter().any(|m| {
-        m.get("name").and_then(|n| n.as_str()) == Some("ktstr_enabled")
-    });
+    let has_ktstr_enabled = members
+        .iter()
+        .any(|m| m.get("name").and_then(|n| n.as_str()) == Some("ktstr_enabled"));
     if !has_ktstr_enabled {
         anyhow::bail!(
             "captured `.bss` has {} members but `ktstr_enabled` is \
@@ -204,26 +210,6 @@ fn scenario_op_snapshot_captures_real_bpf_state(
     Ok(result)
 }
 
-#[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::__private::linkme)]
-static __KTSTR_ENTRY_REAL_CAPTURE_OP_SNAPSHOT: ktstr::test_support::KtstrTestEntry =
-    ktstr::test_support::KtstrTestEntry {
-        name: "snapshot_real_capture_op_snapshot",
-        func: scenario_op_snapshot_captures_real_bpf_state,
-        scheduler: &KTSTR_SCHED_PAYLOAD,
-        // No --stall-after — the scenario fires Op::Snapshot
-        // mid-run while the scheduler is healthy. Holding the
-        // scenario's full duration lets the workload populate
-        // arena pages before the capture.
-        duration: std::time::Duration::from_secs(4),
-        watchdog_timeout: std::time::Duration::from_secs(15),
-        workers_per_cgroup: 2,
-        // Skip auto-repro: the scenario passes (no stall); a
-        // probe-attached repro VM adds runtime without value.
-        auto_repro: false,
-        ..ktstr::test_support::KtstrTestEntry::DEFAULT
-    };
-
 // --------------------------------------------------------------------
 // Test 2: Op::WatchSnapshot end-to-end on a known kernel symbol.
 //
@@ -236,9 +222,14 @@ static __KTSTR_ENTRY_REAL_CAPTURE_OP_SNAPSHOT: ktstr::test_support::KtstrTestEnt
 // `jiffies_64`.
 // --------------------------------------------------------------------
 
-fn scenario_op_watch_snapshot_fires_on_kernel_write(
-    ctx: &ktstr::scenario::Ctx,
-) -> Result<AssertResult> {
+#[ktstr_test(
+    scheduler = KTSTR_SCHED_PAYLOAD,
+    duration_s = 2,
+    watchdog_timeout_s = 15,
+    workers_per_cgroup = 2,
+    auto_repro = false,
+)]
+fn snapshot_real_capture_op_watch_snapshot(ctx: &ktstr::scenario::Ctx) -> Result<AssertResult> {
     let dump_path = snapshot_tagged_path("snapshot_real_capture_op_watch_snapshot", "jiffies_64");
 
     // Register the hardware watchpoint on `jiffies_64`. Every
@@ -284,7 +275,9 @@ fn scenario_op_watch_snapshot_fires_on_kernel_write(
     let bss_map = maps.iter().find(|m| {
         m.get("name")
             .and_then(|n| n.as_str())
-            .map(|n| n.ends_with(".bss") && !n.starts_with("probe_bp.") && !n.starts_with("fentry_p."))
+            .map(|n| {
+                n.ends_with(".bss") && !n.starts_with("probe_bp.") && !n.starts_with("fentry_p.")
+            })
             .unwrap_or(false)
     });
     if bss_map.is_none() {
@@ -309,9 +302,9 @@ fn scenario_op_watch_snapshot_fires_on_kernel_write(
         );
     }
     let members = members.unwrap();
-    let has_ktstr_enabled = members.iter().any(|m| {
-        m.get("name").and_then(|n| n.as_str()) == Some("ktstr_enabled")
-    });
+    let has_ktstr_enabled = members
+        .iter()
+        .any(|m| m.get("name").and_then(|n| n.as_str()) == Some("ktstr_enabled"));
     if !has_ktstr_enabled {
         anyhow::bail!(
             "Op::WatchSnapshot captured `.bss` with {} members but \
@@ -334,21 +327,3 @@ fn scenario_op_watch_snapshot_fires_on_kernel_write(
     ));
     Ok(result)
 }
-
-#[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::__private::linkme)]
-static __KTSTR_ENTRY_REAL_CAPTURE_OP_WATCH_SNAPSHOT: ktstr::test_support::KtstrTestEntry =
-    ktstr::test_support::KtstrTestEntry {
-        name: "snapshot_real_capture_op_watch_snapshot",
-        func: scenario_op_watch_snapshot_fires_on_kernel_write,
-        scheduler: &KTSTR_SCHED_PAYLOAD,
-        // Long enough for at least one timer tick to fire. On a
-        // CONFIG_HZ=100 kernel that's 10ms minimum; holding for 2s
-        // guarantees ~200 fires across all CPUs.
-        duration: std::time::Duration::from_secs(2),
-        watchdog_timeout: std::time::Duration::from_secs(15),
-        workers_per_cgroup: 2,
-        // Skip auto-repro: the scenario passes (no stall).
-        auto_repro: false,
-        ..ktstr::test_support::KtstrTestEntry::DEFAULT
-    };
