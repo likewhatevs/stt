@@ -659,6 +659,12 @@ pub mod prelude {
     pub use crate::topology::{LlcInfo, NodeMemInfo, TestTopology};
     pub use crate::vmm::VirtioBlkCounters;
     pub use crate::vmm::VirtioNetCounters;
+    // `VmResult` is the host-side return value from booting a VM.
+    // Surfaced for `#[ktstr_test(post_vm = ...)]` callbacks: the
+    // hook signature is `fn(&VmResult) -> anyhow::Result<()>`, and
+    // a test author writing the callback needs the type in scope
+    // to declare the parameter.
+    pub use crate::vmm::VmResult;
     pub use crate::vmm::disk_config::{
         DiskConfig, DiskThrottle, DiskThrottleValidationError, Filesystem, ThrottleDimension,
     };

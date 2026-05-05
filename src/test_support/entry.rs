@@ -711,6 +711,16 @@ pub struct KtstrTestEntry {
     /// `validate` rejects the combination because `host_only`
     /// skips the VM boot that owns the disk lifecycle.
     pub disk: Option<crate::vmm::disk_config::DiskConfig>,
+    /// Host-side callback invoked after `vm.run()` returns, with
+    /// access to the full `VmResult`. Runs on the HOST, not inside
+    /// the guest. Use for assertions that need host-side state
+    /// (e.g., `VmResult.snapshot_bridge` content after a snapshot
+    /// capture pipeline fires inside the VM).
+    ///
+    /// `None` (the default) skips the callback. When `Some`, the
+    /// closure receives `&VmResult` and returns `Result<()>` — an
+    /// `Err` fails the test with the returned message.
+    pub post_vm: Option<fn(&crate::vmm::VmResult) -> Result<()>>,
 }
 
 /// Placeholder function for [`KtstrTestEntry::DEFAULT`].
@@ -782,6 +792,7 @@ impl KtstrTestEntry {
         extra_include_files: &[],
         cleanup_budget: None,
         disk: None,
+        post_vm: None,
     };
 
     /// Reject values that would boot a broken VM or leave assertions

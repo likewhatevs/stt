@@ -1224,35 +1224,51 @@ pub(crate) fn detect_kernel_version() -> Option<String> {
 /// depends on the cwd at test launch (which crate is exercising
 /// ktstr), not the build host.
 pub(crate) fn detect_project_commit() -> Option<String> {
-    // Per-process memoization: the cwd is stable for the lifetime
-    // of a test process (no caller mutates it), and the project
-    // tree's HEAD plus dirty state cannot change underneath us
-    // without an explicit user action that's outside the scope
-    // of any individual sidecar write. Gauntlet runs invoke this
-    // function once per sidecar — thousands of times per process
-    // — so caching the result behind a `OnceLock` collapses every
-    // post-first call to a `Clone`. The probe itself does
-    // ~3 syscalls (gix discover + head_id + status) which dominate
-    // the sidecar-write critical path; eliminating that cost is
-    // the only meaningful perf win available here.
+    // Per-process memoization of the SUCCESS case only.
     //
-    // The cache is `Option<String>` so `None` (probe failure: no
-    // git repo, unborn HEAD, etc.) also memoizes — repeating the
-    // failing probe yields the same `None`, no point re-running.
+    // The cwd is stable for the lifetime of a test process (no
+    // caller mutates it), and the project tree's HEAD plus dirty
+    // state cannot change underneath us without an explicit user
+    // action that's outside the scope of any individual sidecar
+    // write. Gauntlet runs invoke this function once per sidecar —
+    // thousands of times per process — so caching the resolved
+    // hash collapses every post-first successful call to a
+    // `Clone`. The probe itself does ~3 syscalls (gix discover +
+    // head_id + status) which dominate the sidecar-write critical
+    // path; eliminating that cost on the hot path is the only
+    // meaningful perf win available here.
     //
-    // CACHE DOES NOT INVALIDATE: a user who commits / amends /
-    // resets the project tree mid-run and expects the new HEAD
-    // to surface in subsequent sidecars will see stale values.
-    // This is acceptable per CLAUDE.md guidance — the project
-    // tree is treated as stable-enough for a single suite run;
-    // callers mutating the tree during a run own the consequences.
-    static PROJECT_COMMIT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    PROJECT_COMMIT
-        .get_or_init(|| {
-            let cwd = std::env::current_dir().ok()?;
-            detect_commit_at(&cwd)
-        })
-        .clone()
+    // FAILURE IS NOT CACHED: a `None` probe outcome (no git repo
+    // discoverable from cwd, unborn HEAD, transient FS / gix open
+    // failure) does NOT seed the OnceLock. A FIRST call from a
+    // momentarily-broken context (e.g. a test that swapped CWD via
+    // some indirect path before ever calling
+    // `detect_project_commit`, or a transient I/O hiccup during
+    // `gix::discover`) would otherwise lock in `None` for the
+    // rest of the process — every subsequent sidecar would land
+    // under `target/ktstr/{kernel}-unknown/` even though the
+    // commit IS resolvable from a healthy cwd. Retrying on failure
+    // costs the same ~3 syscalls the success case pays once; the
+    // re-probe only fires while the answer is still unknown.
+    //
+    // CACHE DOES NOT INVALIDATE on success: a user who commits /
+    // amends / resets the project tree mid-run and expects the
+    // new HEAD to surface in subsequent sidecars will see stale
+    // values. This is acceptable per CLAUDE.md guidance — the
+    // project tree is treated as stable-enough for a single suite
+    // run; callers mutating the tree during a run own the
+    // consequences.
+    static PROJECT_COMMIT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    if let Some(cached) = PROJECT_COMMIT.get() {
+        return Some(cached.clone());
+    }
+    let cwd = std::env::current_dir().ok()?;
+    let probed = detect_commit_at(&cwd)?;
+    // `set` on a hot OnceLock is a no-op `Err` — safe to ignore.
+    // First successful caller wins; a second concurrent caller's
+    // identical hash discards harmlessly.
+    let _ = PROJECT_COMMIT.set(probed.clone());
+    Some(probed)
 }
 
 /// Path-taking core of [`detect_project_commit`]. Factored out so
@@ -1449,15 +1465,15 @@ pub fn repo_is_dirty(repo: &gix::Repository) -> Option<bool> {
 /// "treat as clean" rather than aborting the probe, because
 /// metadata must not gate sidecar writes.
 pub(crate) fn detect_kernel_commit(kernel_dir: &std::path::Path) -> Option<String> {
-    // Per-process, path-keyed memoization. Same rationale as
-    // `detect_project_commit`: gauntlet runs invoke this function
-    // once per sidecar — thousands of times — and the kernel
-    // tree's HEAD plus dirty state cannot change underneath us
-    // mid-suite without an explicit user action outside any
-    // sidecar's control. The path key handles the fixture-test
-    // case where unit tests rotate through synthetic
-    // `tempfile::TempDir` kernel paths in the same process; each
-    // distinct path memoizes independently.
+    // Per-process, path-keyed memoization of the SUCCESS case
+    // only. Same rationale as `detect_project_commit`: gauntlet
+    // runs invoke this function once per sidecar — thousands of
+    // times — and the kernel tree's HEAD plus dirty state cannot
+    // change underneath us mid-suite without an explicit user
+    // action outside any sidecar's control. The path key handles
+    // the fixture-test case where unit tests rotate through
+    // synthetic `tempfile::TempDir` kernel paths in the same
+    // process; each distinct path memoizes independently.
     //
     // `Mutex<HashMap>` rather than `OnceLock` because the input
     // is parameterized on `kernel_dir` — a `OnceLock` collapses
@@ -1468,16 +1484,26 @@ pub(crate) fn detect_kernel_commit(kernel_dir: &std::path::Path) -> Option<Strin
     // ONE kernel per process), and the mutex is held only for
     // the duration of the lookup + insert.
     //
+    // FAILURE IS NOT CACHED: a `None` probe outcome (kernel_dir
+    // is not a git repo, unborn HEAD, transient `gix::open`
+    // failure) does NOT seed the cache. Caching `None` would lock
+    // in `unknown` for every subsequent sidecar even after the
+    // condition resolves (e.g. a kernel directory that becomes a
+    // valid checkout mid-suite, or a flaky FS that recovers).
+    // Re-probing on failure costs the same gix-open + dirt-walk
+    // the success case pays once; the re-probe only fires while
+    // the answer is still unknown for that path.
+    //
     // Mutex poisoning recovery: a panic mid-probe could poison
     // the lock; the `unwrap_or_else(|e| e.into_inner())` pattern
     // recovers the guard so a future caller doesn't fail
     // catastrophically. The cached map is just a HashMap of
-    // owned types; no invariant beyond "key→value mapping" can
+    // owned strings; no invariant beyond "key→value mapping" can
     // be broken by an interrupted probe.
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::{Mutex, OnceLock};
-    static KERNEL_COMMIT_CACHE: OnceLock<Mutex<HashMap<PathBuf, Option<String>>>> = OnceLock::new();
+    static KERNEL_COMMIT_CACHE: OnceLock<Mutex<HashMap<PathBuf, String>>> = OnceLock::new();
     // Canonicalize the cache key so two paths that resolve to the
     // same on-disk directory share one entry. Without this, a
     // symlinked alias (`./linux` symlinked to `/abs/.../linux`)
@@ -1487,17 +1513,17 @@ pub(crate) fn detect_kernel_commit(kernel_dir: &std::path::Path) -> Option<Strin
     // collapses `..` / `.`, and yields the absolute path the
     // kernel actually lives at. Falls back to the raw path on
     // canonicalize failure (e.g. caller passed a non-existent
-    // `kernel_dir`) — gix::open will fail downstream and the
-    // cache entry will memoize the `None` result against the raw
-    // path, which is the correct behavior for a path that doesn't
-    // exist (no symlink alias is possible).
+    // `kernel_dir`) — gix::open will fail downstream and re-probe
+    // each call until the path becomes resolvable.
     let cache_key = kernel_dir
         .canonicalize()
         .unwrap_or_else(|_| kernel_dir.to_path_buf());
     let cache = KERNEL_COMMIT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(cached) = guard.get(&cache_key) {
-        return cached.clone();
+    {
+        let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(cached) = guard.get(&cache_key) {
+            return Some(cached.clone());
+        }
     }
     // `gix::open` (NOT `gix::discover`) — `kernel_dir` must BE the
     // repo root. Without this the parent walk could resolve to the
@@ -1517,7 +1543,14 @@ pub(crate) fn detect_kernel_commit(kernel_dir: &std::path::Path) -> Option<Strin
     let result = gix::open(kernel_dir)
         .ok()
         .and_then(|repo| commit_with_dirty_suffix(&repo));
-    guard.insert(cache_key, result.clone());
+    if let Some(ref hash) = result {
+        let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        // First successful caller wins; a concurrent caller's
+        // identical hash would overwrite harmlessly because
+        // success is deterministic for a given (canonicalized
+        // path, HEAD, dirty state) tuple.
+        guard.insert(cache_key, hash.clone());
+    }
     result
 }
 
@@ -6807,23 +6840,30 @@ mod tests {
     /// process-wide [`std::sync::OnceLock`] (declared on the
     /// function body). Two consecutive calls in the same process
     /// must therefore return identical [`Option<String>`] results
-    /// — the first call seeds the cache with a probe of cwd; the
-    /// second collapses to a `Clone` of the cached entry.
+    /// — the first successful call seeds the cache with a probe
+    /// of cwd; subsequent calls collapse to a `Clone` of the
+    /// cached short-hash.
     ///
     /// The OnceLock is process-global and writes during the FIRST
-    /// call observed by the test process — that may be this test
-    /// or any sibling that ran earlier, since the cache survives
-    /// across test functions in a single binary. Either way, the
-    /// public-API contract this test pins is "consecutive calls
-    /// agree", which holds whether the cache is hot from a
-    /// previous test or warmed by the first call here.
+    /// SUCCESSFUL call observed by the test process — that may be
+    /// this test or any sibling that ran earlier, since the cache
+    /// survives across test functions in a single binary. Either
+    /// way, the public-API contract this test pins is
+    /// "consecutive calls agree", which holds whether the cache
+    /// is hot from a previous test or warmed by the first call
+    /// here.
     ///
-    /// `Option<String>::None` (cwd outside any git repo) memoizes
-    /// the same way as `Some` per the function's own commentary
-    /// — repeating the failing probe yields the same `None`. The
-    /// test does not constrain whether the result is Some or None
-    /// because the cwd at test-runner launch is environmental;
-    /// equality across the two calls is the testable contract.
+    /// `None` is NOT cached — a probe failure (cwd outside any
+    /// git repo, transient I/O hiccup) leaves the OnceLock
+    /// unset, and the next call retries from scratch. Two
+    /// consecutive calls still agree because (a) each call
+    /// reads the same cwd, and (b) the same cwd produces the
+    /// same probe outcome (modulo the rare transient-failure
+    /// window the failure-retry behavior is designed to recover
+    /// from). The test does not constrain whether the result is
+    /// Some or None because the cwd at test-runner launch is
+    /// environmental; equality across the two calls is the
+    /// testable contract.
     #[test]
     fn detect_project_commit_memoizes_across_consecutive_calls() {
         let first = super::detect_project_commit();
@@ -6845,18 +6885,23 @@ mod tests {
         );
     }
 
-    /// `detect_kernel_commit` memoizes its probe behind a
-    /// process-wide [`std::sync::Mutex<HashMap<PathBuf,
-    /// Option<String>>>`] keyed on the input path. Two
-    /// consecutive calls with the SAME path must return identical
-    /// results — the first call seeds the cache; the second
-    /// returns a clone of the cached entry without re-probing.
+    /// `detect_kernel_commit` memoizes its successful probes
+    /// behind a process-wide
+    /// [`std::sync::Mutex<HashMap<PathBuf, String>>`] keyed on
+    /// the canonicalized input path. Two consecutive calls with
+    /// the SAME path must return identical results — the first
+    /// successful call seeds the cache with the resolved short
+    /// hash; the second returns a clone of the cached entry
+    /// without re-probing.
+    ///
+    /// `None` outcomes are NOT cached; a re-probe fires on every
+    /// call until the path resolves successfully.
     ///
     /// Uses a fresh tempdir so the cache key is unique to this
     /// test (no collision with other test functions in the same
-    /// binary). The hashmap key is `PathBuf::to_path_buf()` of
-    /// `&Path`, so a stable path argument across calls produces
-    /// a cache hit on the second invocation.
+    /// binary). The hashmap key is the canonicalized path, so a
+    /// stable path argument across calls produces a cache hit on
+    /// the second invocation.
     #[test]
     fn detect_kernel_commit_memoizes_across_consecutive_calls_same_path() {
         let tmp = tempfile::TempDir::new().expect("tempdir");

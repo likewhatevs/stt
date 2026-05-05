@@ -1,22 +1,15 @@
 //! End-to-end tests for the snapshot capture pipeline.
 //!
-//! Each `#[ktstr_test]` scenario fires a snapshot op
-//! (`Op::snapshot` or `Op::watch_snapshot`) from inside a real
-//! guest VM and verifies the SHM reply status via `execute_steps`.
-//! The guest cannot read the captured `FailureDumpReport` because
-//! the bridge that owns it lives in HOST memory, populated by the
-//! freeze coordinator's doorbell handler. Content assertions
-//! against the captured bridge therefore live host-side in
-//! [`crate::test_support::eval::run_ktstr_test_inner_impl`] (in
-//! `src/test_support/eval.rs`), which drains
-//! [`VmResult::snapshot_bridge`] after `vm.run()` and walks every
-//! captured report — verifying the scheduler's `.bss` map is
-//! present and that `ktstr_enabled` (the always-present probe gate
-//! variable) appears in the BTF render's `RenderedMember` list.
+//! Each `#[ktstr_test]` scenario fires a snapshot op from inside a
+//! real guest VM. The guest verifies the SHM round-trip succeeded
+//! (Op returned Ok). The `post_vm` callback runs on the HOST after
+//! `vm.run()` returns and asserts the captured `FailureDumpReport`
+//! on the `SnapshotBridge` contains real BTF-rendered BPF state.
 
 use anyhow::Result;
 use ktstr::assert::AssertResult;
 use ktstr::ktstr_test;
+use ktstr::prelude::{RenderedValue, VmResult};
 use ktstr::scenario::ops::{CgroupDef, HoldSpec, Op, Step, execute_steps};
 use ktstr::test_support::{Payload, Scheduler, SchedulerSpec};
 
@@ -24,11 +17,44 @@ const KTSTR_SCHED: Scheduler =
     Scheduler::new("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
 const KTSTR_SCHED_PAYLOAD: Payload = Payload::from_scheduler(&KTSTR_SCHED);
 
-// --------------------------------------------------------------------
-// In-VM scenarios: verify the SHM/doorbell pipeline fires without
-// error. The guest can't read host files, so content assertions
-// happen on the host side below.
-// --------------------------------------------------------------------
+/// Host-side content assertion: verify the bridge has a capture
+/// with probe_bp.bss containing ktstr_enabled.
+fn assert_bridge_has_real_capture(result: &VmResult) -> Result<()> {
+    let captured = result.snapshot_bridge.drain();
+    anyhow::ensure!(
+        !captured.is_empty(),
+        "snapshot bridge is empty — no captures reached the host"
+    );
+    for (tag, report) in &captured {
+        anyhow::ensure!(
+            !report.maps.is_empty(),
+            "snapshot '{tag}' has 0 maps — capture produced nothing"
+        );
+        let probe_bss = report.maps.iter().find(|m| m.name == "probe_bp.bss");
+        anyhow::ensure!(
+            probe_bss.is_some(),
+            "snapshot '{tag}' has {} maps but no probe_bp.bss",
+            report.maps.len()
+        );
+        let bss = probe_bss.unwrap();
+        let has_ktstr_enabled = bss
+            .value
+            .as_ref()
+            .and_then(|v| match v {
+                RenderedValue::Struct { members, .. } => {
+                    Some(members.iter().any(|m| m.name == "ktstr_enabled"))
+                }
+                _ => None,
+            })
+            .unwrap_or(false);
+        anyhow::ensure!(
+            has_ktstr_enabled,
+            "snapshot '{tag}' probe_bp.bss missing ktstr_enabled — \
+             BTF render did not produce real probe globals"
+        );
+    }
+    Ok(())
+}
 
 #[ktstr_test(
     scheduler = KTSTR_SCHED_PAYLOAD,
@@ -36,6 +62,7 @@ const KTSTR_SCHED_PAYLOAD: Payload = Payload::from_scheduler(&KTSTR_SCHED);
     watchdog_timeout_s = 15,
     workers_per_cgroup = 2,
     auto_repro = false,
+    post_vm = assert_bridge_has_real_capture,
 )]
 fn snapshot_real_capture_op_snapshot(ctx: &ktstr::scenario::Ctx) -> Result<AssertResult> {
     let steps = vec![Step {
@@ -57,6 +84,7 @@ fn snapshot_real_capture_op_snapshot(ctx: &ktstr::scenario::Ctx) -> Result<Asser
     watchdog_timeout_s = 15,
     workers_per_cgroup = 2,
     auto_repro = false,
+    post_vm = assert_bridge_has_real_capture,
 )]
 fn snapshot_real_capture_op_watch_snapshot(ctx: &ktstr::scenario::Ctx) -> Result<AssertResult> {
     let steps = vec![Step {
