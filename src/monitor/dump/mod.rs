@@ -2282,11 +2282,18 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
     // post-loop only to be unusable for per-entry payload chase.
     let mut sched_bss_bytes: Option<(Vec<u8>, u64)> = None; // (bytes, btf_kva)
     for info in &maps {
-        if info.name.starts_with("probe_bp.")
-            || info.name.starts_with("fentry_p.")
-            || info.name == "probe_bp"
-            || info.name == "fentry_p"
-            || KTSTR_INTERNAL_MAPS.contains(&info.name.as_str())
+        // Match the main render loop's `is_probe_bss` carve-out so
+        // `probe_bp.bss` / `fentry_p.bss` get their program BTF
+        // loaded here — without it, the render pass falls through
+        // to a hex-only render and the gate variable (`ktstr_enabled`)
+        // surfaces as bytes rather than a named struct member.
+        let is_probe_bss = info.name == "probe_bp.bss" || info.name == "fentry_p.bss";
+        if !is_probe_bss
+            && (info.name.starts_with("probe_bp.")
+                || info.name.starts_with("fentry_p.")
+                || info.name == "probe_bp"
+                || info.name == "fentry_p"
+                || KTSTR_INTERNAL_MAPS.contains(&info.name.as_str()))
         {
             continue;
         }
@@ -2296,7 +2303,14 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
         {
             program_btfs.insert(info.btf_kva, loaded);
         }
-        if sched_bss_bytes.is_none()
+        // The scheduler's `.bss` is the one carrying user-visible
+        // scheduler state for the sdt_alloc walk below; the probe's
+        // `.bss` (carved out above for BTF load only) must NOT be
+        // mistaken for it. Filter explicitly so the probe `.bss`
+        // doesn't accidentally win the `is_none()` race when the
+        // probe map sorts ahead of the scheduler's in `maps`.
+        if !is_probe_bss
+            && sched_bss_bytes.is_none()
             && info.map_type == BPF_MAP_TYPE_ARRAY
             && info.btf_kva != 0
             && info.name.ends_with(".bss")
@@ -2439,19 +2453,24 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
     let mut maps_rendered: usize = 0;
     let mut maps_truncated: usize = 0;
     for info in maps {
-        // Skip ktstr's own framework maps so the report only shows
+        // Skip ktstr's own framework maps so the report focuses on
         // the scheduler-under-test's state. Three distinct shapes
         // need filtering:
         //
         // 1. Global-section maps from the probe skeleton: libbpf
-        //    composes `<obj_name>.<section>` so `probe_bp.bss`,
-        //    `probe_bp.data`, `probe_bp.rodata` all match the
-        //    `probe_bp.` prefix. (`probe_bp` matching the bare obj
-        //    name covers any single-name section the kernel might
-        //    surface, though libbpf today always adds the suffix.)
+        //    composes `<obj_name>.<section>` so `probe_bp.data`,
+        //    `probe_bp.rodata` match the `probe_bp.` prefix. The
+        //    `.bss` carve-out below preserves the always-present
+        //    probe gate variable (`ktstr_enabled`) plus the probe's
+        //    runtime counters so a Snapshot consumer can prove the
+        //    probe was loaded and active at capture time —
+        //    `probe_bp.data` (which mostly carries the
+        //    skeleton-internal allocator state) and
+        //    `probe_bp.rodata` (which is config bytes the operator
+        //    already knows from launch) stay filtered.
         // 2. Global-section maps from the fentry skeleton, named
-        //    with the `fentry_p.` prefix following the same
-        //    libbpf convention.
+        //    with the `fentry_p.` prefix following the same libbpf
+        //    convention. Same `.bss` carve-out for the same reason.
         // 3. Bare-named maps declared via `SEC(".maps")` in
         //    src/bpf/probe.bpf.c — these don't get an obj prefix
         //    because they're not from a global section. The
@@ -2462,11 +2481,13 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
         // (the program-attachment ID list pinned to each map), but
         // name-based filtering is enough today and avoids loading
         // the full prog_idr walk on the freeze hot path.
-        if info.name.starts_with("probe_bp.")
-            || info.name.starts_with("fentry_p.")
-            || info.name == "probe_bp"
-            || info.name == "fentry_p"
-            || KTSTR_INTERNAL_MAPS.contains(&info.name.as_str())
+        let is_probe_bss = info.name == "probe_bp.bss" || info.name == "fentry_p.bss";
+        if !is_probe_bss
+            && (info.name.starts_with("probe_bp.")
+                || info.name.starts_with("fentry_p.")
+                || info.name == "probe_bp"
+                || info.name == "fentry_p"
+                || KTSTR_INTERNAL_MAPS.contains(&info.name.as_str()))
         {
             continue;
         }
