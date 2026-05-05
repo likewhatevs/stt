@@ -395,6 +395,13 @@ struct TestLayout {
     tx_desc: u64,
     tx_avail: u64,
     tx_used: u64,
+    // `dead_code` allow: populated by `test_layout()` for
+    // symmetry with the rest of the layout constants. No
+    // current test reads this through the struct (callers
+    // reference `TX_HEADER_BUF` directly when needed). Kept
+    // so the struct remains a complete inventory of
+    // guest-memory regions for tests that grow into using it.
+    #[allow(dead_code)]
     tx_hdr_buf: u64,
     tx_frame_buf: u64,
     rx_desc: u64,

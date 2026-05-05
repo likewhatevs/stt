@@ -1175,6 +1175,11 @@ pub struct VirtioBlk {
 /// `epoll_wait`. Mutually exclusive: perf-mode picks a single CPU,
 /// `--cpu-cap` no-perf picks an LLC mask, both `None` means inherit
 /// the parent thread's affinity (the test/inline path).
+// Fields are read by `worker_thread_main` which is itself
+// `#[cfg(not(test))]` (worker.rs), so under `cargo check
+// --tests` no reader exists and the fields look dead. The
+// production path consumes them — keep the allow.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub struct WorkerPlacement {
     /// Single CPU pin (perf-mode). Equivalent to
@@ -1875,6 +1880,14 @@ pub(crate) fn drain_bracket_impl(
             // queue downstream.
             let iter_outcome = {
                 let q = &mut queues[REQ_QUEUE];
+                // `mut` is required for the cfg(not(test)) alias
+                // (`MutexGuard<QueueState>`) so `guard.iter()` can
+                // call `iter(&mut self)` via `DerefMut`. In the
+                // cfg(test) alias (`Queue`, returning `&mut
+                // QueueState` directly), the binding is already a
+                // mutable reference and the `mut` keyword is
+                // redundant — hence `unused_mut` here.
+                #[allow(unused_mut)]
                 let mut guard = q.lock();
                 match guard.iter(mem) {
                     Ok(mut iter) => Ok(iter.next()),
@@ -4712,6 +4725,12 @@ pub(crate) const RESET_JOIN_TIMEOUT: Duration = Duration::from_secs(1);
 /// thread (timeout, helper failure).
 pub(crate) enum JoinWithTimeoutOutcome {
     /// Worker exited normally and yielded its `BlkWorkerState`.
+    /// `dead_code` allow: the carried state is consumed only by
+    /// `stop_worker_and_reclaim_state` (cfg(not(test))). Under
+    /// `cargo check --tests` no reader exists, but
+    /// `join_worker_with_timeout` still constructs the variant
+    /// and the value matters for production reset.
+    #[allow(dead_code)]
     Joined(BlkWorkerState),
     /// Worker panicked. The variant carries the panic payload
     /// returned by `JoinHandle::join` so the caller can render it

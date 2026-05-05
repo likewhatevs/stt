@@ -430,6 +430,7 @@ impl BpfSyscallAccessor {
 
     /// Number of pinned maps currently held. Test helper.
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn pinned_count(&self) -> usize {
         self.maps.len()
     }

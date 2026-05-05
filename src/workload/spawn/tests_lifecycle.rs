@@ -157,9 +157,12 @@ fn extract_panic_payload_handles_all_canonical_shapes() {
     assert_eq!(extract_panic_payload(string_panic), "formatted panic");
 
     // Anything else — e.g. a custom panic payload type — folds
-    // to the sentinel without crashing the extractor.
+    // to the sentinel without crashing the extractor. The
+    // payload value (`42`) is never observed — only the type
+    // identity matters for the &str / String downcast misses
+    // — so silence the dead-field lint.
     #[derive(Clone)]
-    struct CustomPayload(u32);
+    struct CustomPayload(#[allow(dead_code)] u32);
     let custom: Box<dyn std::any::Any + Send> = Box::new(CustomPayload(42));
     assert_eq!(extract_panic_payload(custom), "<non-string panic payload>");
 }
