@@ -675,14 +675,6 @@ pub(crate) fn dedupe_include_files(
         .collect())
 }
 
-/// Walk every captured snapshot in `captured` and bail with a
-/// descriptive error if any report failed to render the scheduler's
-/// `.bss` section through real BTF.
-///
-/// Pure over `(tag, FailureDumpReport)` pairs so the policy can be
-/// unit-tested with synthetic reports. The producer in the calling
-/// path is [`crate::scenario::snapshot::SnapshotBridge::drain`] off
-/// `result.snapshot_bridge` — that drain is destructive, so the
 // ---------------------------------------------------------------------------
 // Host-state save/restore guards for the VM-run path
 // ---------------------------------------------------------------------------
@@ -1163,17 +1155,18 @@ fn run_ktstr_test_inner_impl(
             return Err(e.context("run ktstr_test VM"));
         }
     };
-    // Verify snapshot captures have real content. Runs on the
-    // HOST after the VM exits — the bridge lives in host memory,
-    // populated by the freeze coordinator's doorbell handler. The
-    // `#[ktstr_test]` scenario function runs INSIDE the guest VM
-    // and cannot read host filesystem paths, so any content
-    // assertion against the captured `FailureDumpReport` belongs
-    // here, after `vm.run()` returns to the host process.
-    //
-    // Drains the bridge so the assertion is destructive — no
-    // downstream consumer reads `result.snapshot_bridge` after
-    // this point in the lib build.
+    // Run the test entry's optional host-side `post_vm` callback.
+    // The `#[ktstr_test]` scenario function (`entry.func`) runs
+    // INSIDE the guest VM and cannot read host-side state — most
+    // notably `VmResult.snapshot_bridge`, which the freeze
+    // coordinator populates on every `Op::Snapshot` /
+    // `Op::WatchSnapshot` fire. The `post_vm` hook closes that
+    // gap: it runs on the HOST after `vm.run()` returns, with
+    // direct access to the full `VmResult`. An `Err` from the
+    // callback short-circuits the dispatch as a test failure with
+    // the returned diagnostic, before sidecar write or
+    // `evaluate_vm_result`. Tests that don't set `post_vm`
+    // (the default) bypass this branch.
     if let Some(post_vm) = entry.post_vm {
         post_vm(&result)?;
     }
