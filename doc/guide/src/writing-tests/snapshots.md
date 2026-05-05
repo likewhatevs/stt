@@ -4,8 +4,8 @@ A **snapshot** is a frozen record of guest BPF map state and scheduler
 globals captured at a specific point in a scenario. The freeze
 coordinator pauses every vCPU long enough to walk the kernel's BPF
 maps, BTF-render every captured value, and bundle the result into a
-[`FailureDumpReport`] keyed by a name you choose. Test code then reads
-it back via the [`Snapshot`] accessor for typed traversal.
+`FailureDumpReport` keyed by a name you choose. Test code then reads
+it back via the [`Snapshot`](#reading-the-captured-report) accessor for typed traversal.
 
 `Op::snapshot("name")` is the **on-demand** capture trigger. Use it to
 ask "what does the scheduler look like *right now*?" at a precise
@@ -14,8 +14,8 @@ specific symbol, see [Watch Snapshots](watch-snapshots.md).
 
 ## Issuing a snapshot
 
-`Op::snapshot(name)` is a single op in a [`Step`]'s op list. The
-executor invokes the active [`SnapshotBridge`]'s capture callback,
+`Op::snapshot(name)` is a single op in a [`Step`](../concepts/ops.md)'s op list. The
+executor invokes the active [`SnapshotBridge`](#wiring-the-bridge)'s capture callback,
 which performs the freeze rendezvous and returns the report; the
 bridge stores the report under `name`.
 
@@ -63,10 +63,13 @@ let captured = bridge_handle.drain();
 let report = captured.get("after_spawn").expect("snapshot recorded");
 ```
 
-`set_thread_local` returns a [`BridgeGuard`] that restores the prior
+`set_thread_local` returns a [`BridgeGuard`](#wiring-the-bridge) that restores the prior
 bridge on drop, so a nested scenario inside an outer one cannot leak
-its bridge into the outer scope. Bind the guard to a name (the leading
-`_` is sufficient) — `must_use` will warn otherwise.
+its bridge into the outer scope. Bind the guard to an
+underscore-prefixed identifier such as `_guard` so the binding lives
+for the scope of the scenario — a bare `let _ = bridge.set_thread_local()`
+drops the guard immediately and clears the bridge before any op runs.
+`must_use` will warn if the return value is discarded entirely.
 
 If no bridge is installed, `Op::snapshot` is a no-op with a
 `tracing::warn!` and the scenario continues. If the capture callback
@@ -76,8 +79,8 @@ snapshot ops keep working unchanged.
 
 ## Reading the captured report
 
-[`Snapshot::new(report)`] builds a borrowed view over a
-[`FailureDumpReport`]. The view does not copy the report; accessor
+[`Snapshot::new(report)`](#reading-the-captured-report) builds a borrowed view over a
+`FailureDumpReport`. The view does not copy the report; accessor
 methods walk the report in place and return further borrowed views.
 
 ### Map-name lookup
@@ -100,7 +103,7 @@ let nr_cpus = snap.var("nr_cpus_onln").as_u64()?;
 
 `Snapshot::var(name)` walks every `*.bss`, `*.data`, and `*.rodata`
 global-section map for a top-level member named `name` and returns the
-first hit as a [`SnapshotField`]. A miss yields
+first hit as a [`SnapshotField`](#terminal-accessors). A miss yields
 `SnapshotError::VarNotFound { requested, available }` with the union
 of every section's top-level member names.
 
@@ -173,7 +176,7 @@ The dotted-path walker:
    `get` calls: `entry.get("ctx.weight")` ≡
    `entry.get("ctx").get("weight")`.
 
-   Note that [`Snapshot::var`] does **not** split — it treats the full
+   Note that [`Snapshot::var`](#top-level-globals-bss--data--rodata) does **not** split — it treats the full
    string as one global name. To walk into a struct, use
    `snap.var("ctx").get("weight")`.
 
@@ -197,7 +200,7 @@ actual, path }` — for example, `as_str()` on a `Uint` reports
 
 ## Error handling
 
-[`SnapshotError`] is the unified error type for every fallible
+[`SnapshotError`](#error-handling) is the unified error type for every fallible
 accessor. Each variant carries the path or available alternatives
 needed to fix the call site without re-running the test:
 
@@ -313,14 +316,14 @@ discoverability (scheduler loaded), polls the SHM ring for
 scenario start, then writes the configured u32 at the configured
 offset. Only `BPF_MAP_TYPE_ARRAY` maps are supported; the framework
 finds the map by `map_name_suffix` (e.g. `".bss"`) via
-`BpfMapAccessor::find_map`. See [Monitor → BPF map writes][monitor]
+`BpfMapAccessor::find_map`. See [Monitor → BPF map writes](../architecture/monitor.md)
 for the prerequisites (vmlinux, `nokaslr`) and the full host-side
 contract.
 
 Read+write workflows then compose naturally: the test pre-seeds
 guest state with `bpf_map_write`, lets the scheduler run, and
 asserts on the resulting state with `Op::snapshot` + the
-[`Snapshot`] accessor:
+[`Snapshot`](#reading-the-captured-report) accessor:
 
 1. **Write (pre-scenario)** — `bpf_map_write` flips a `.bss` flag
    the scheduler reads.
@@ -340,14 +343,3 @@ state mutation is reserved for cases where the scheduler itself
 exports a writable interface (sysfs, debugfs, BPF map command
 interface) and the test invokes that interface from a workload
 process.
-
-[monitor]: ../architecture/monitor.md
-[`FailureDumpReport`]: ../architecture/monitor.md
-[`Snapshot::new(report)`]: #reading-the-captured-report
-[`Snapshot`]: #reading-the-captured-report
-[`SnapshotBridge`]: #wiring-the-bridge
-[`SnapshotError`]: #error-handling
-[`SnapshotField`]: #terminal-accessors
-[`Step`]: ../concepts/ops.md
-[`BridgeGuard`]: #wiring-the-bridge
-[`Snapshot::var`]: #top-level-globals-bss--data--rodata

@@ -25,6 +25,10 @@ stay compatible across ktstr version bumps that add new variants:
 | `RunPayload` | Spawn a binary-kind [`Payload`](../writing-tests/scheduler-definitions.md#derive-payload) in the background and track its `PayloadHandle` under the step's payload set. Subsequent `WaitPayload` / `KillPayload` address it by `(payload.name, cgroup)`. Scheduler-kind payloads are rejected at apply time. |
 | `WaitPayload` | Block until the named payload exits naturally, evaluate its checks, and record metrics to the per-test sidecar. Target lookup is by `(name, cgroup)` composite key; `cgroup: None` resolves to the unique live copy. No timeout — pair with a bounded `HoldSpec` or the payload's own `--runtime` for time-boxed runs. |
 | `KillPayload` | SIGKILL the named payload, reap the child, evaluate checks, and record metrics. Same `(name, cgroup)` lookup rules as `WaitPayload`. Mirrors step-teardown drain for an explicitly-targeted payload. |
+| `FreezeCgroup` | Freeze every task in the named cgroup via `cgroup.freeze` (kernel-side asynchronous freeze; not a SIGSTOP). Idempotent for already-frozen cgroups. Pair with `UnfreezeCgroup` to release; teardown auto-unfreezes. See [Snapshots](../writing-tests/snapshots.md) for the observer-cgroup deadlock warning. |
+| `UnfreezeCgroup` | Unfreeze every task in the named cgroup via `cgroup.freeze`. Inverse of `FreezeCgroup`. Idempotent. |
+| `Snapshot` | Capture a host-side diagnostic snapshot under `name` via the freeze coordinator: pauses every vCPU, reads BPF map state, vCPU registers, and per-CPU counters into a `FailureDumpReport`, then resumes. The report is keyed by `name` on the active `SnapshotBridge`. No active bridge is a no-op with `tracing::warn!`. See [Snapshots](../writing-tests/snapshots.md). |
+| `WatchSnapshot` | Capture a snapshot whenever the guest writes to the named kernel symbol; one fire = one capture tagged with the symbol path. Symbol resolution at op execution time uses BTF + kallsyms (`bss.<obj>.<field>` or `kernel.<symbol>[.<field>...]`). Maximum 3 watch ops per scenario (DR1-3; DR0 reserved). See [Watch Snapshots](../writing-tests/watch-snapshots.md). |
 
 Op constructors accept string literals directly (no `.into()` needed):
 
@@ -35,6 +39,10 @@ Op::stop_cgroup("cg_0")
 Op::spawn("cg_0", WorkSpec::default().workers(4))
 Op::set_affinity("cg_0", AffinityIntent::RandomSubset)
 Op::spawn_host(WorkSpec::default().workers(4))
+Op::freeze_cgroup("cg_0")
+Op::unfreeze_cgroup("cg_0")
+Op::snapshot("after_spawn")
+Op::watch_snapshot("bss.scx_ktstr.alloc_count")
 ```
 
 `SpawnHost` creates workers in the parent cgroup, not in a managed
@@ -46,12 +54,14 @@ managed cgroups.
 `OpKind` is a payload-free discriminant enum generated from `Op` via
 `#[strum_discriminants]`. It carries the same variant set as `Op`
 (`AddCgroup`, `RemoveCgroup`, ..., `RunPayload`, `WaitPayload`,
-`KillPayload`) with none of the inner fields, so it is cheap to copy
-and use as a map key. Framework code uses `OpKind` when it only cares
-WHICH operation ran (per-op statistics, stimulus-event tagging,
-verifier/monitor bookkeeping) without the payload. Test authors
-rarely spell `OpKind` directly — the `strum::EnumIter` derive also
-lets tooling enumerate every `OpKind` variant for coverage checks.
+`KillPayload`, `FreezeCgroup`, `UnfreezeCgroup`, `Snapshot`,
+`WatchSnapshot`) with none of the inner fields, so it is cheap to
+copy and use as a map key. Framework code uses `OpKind` when it
+only cares WHICH operation ran (per-op statistics, stimulus-event
+tagging, verifier/monitor bookkeeping) without the payload. Test
+authors rarely spell `OpKind` directly — the `strum::EnumIter`
+derive also lets tooling enumerate every `OpKind` variant for
+coverage checks.
 
 `OpKind` shares `Op`'s `#[non_exhaustive]` attribute: external
 pattern matches over `OpKind` must end with `..`.

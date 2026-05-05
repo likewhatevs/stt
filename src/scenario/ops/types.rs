@@ -379,7 +379,7 @@ pub enum Op {
     /// kernel symbol. The snapshot is tagged with the symbol path
     /// itself; one fire = one capture.
     ///
-    /// Symbol resolution at scenario setup uses the freeze
+    /// Symbol resolution at op execution time uses the freeze
     /// coordinator's BTF + kallsyms pipeline:
     /// - `"bss.<obj>.<field>"` → scheduler program BTF Datasec
     ///   walk + per-section offset → guest KVA.
@@ -392,9 +392,9 @@ pub enum Op {
     ///   hardware-watchpoint plumbing reserves DR0 for the existing
     ///   `*scx_root->exit_kind` trigger (used by the error-trigger
     ///   path); only DR1 / DR2 / DR3 are available for on-demand
-    ///   watches. Scenarios that exceed three watches fail at
-    ///   scenario-setup time with an actionable error before the
-    ///   first vCPU runs.
+    ///   watches. The bridge's `register_watch` rejects a 4th
+    ///   `Op::WatchSnapshot` and fails the step when the cap is
+    ///   exceeded.
     /// - **Symbol resolution failures bail immediately.** A
     ///   missing field / symbol / unaligned address surfaces as
     ///   an `Err` from `execute_steps` so the test author
@@ -418,11 +418,12 @@ pub enum Op {
     /// for the full protocol.
     ///
     /// Note: high-frequency variables (rq counters, jiffies)
-    /// will fire watches every few microseconds and produce
-    /// thousands of snapshots; the framework does not
-    /// rate-limit captures, so the test author owns the
-    /// frequency choice. Use [`Op::Snapshot`] for time-driven
-    /// captures when frequency is the concern.
+    /// will fire watches every few microseconds and fire
+    /// thousands of times (each overwriting the prior capture
+    /// under the same tag); the framework does not rate-limit
+    /// captures, so the test author owns the frequency choice.
+    /// Use [`Op::Snapshot`] for time-driven captures when
+    /// frequency is the concern.
     WatchSnapshot { symbol: Cow<'static, str> },
 }
 
