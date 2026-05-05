@@ -357,7 +357,7 @@ u64 ktstr_exit_watchdog_timeout = 0;
  * would mask the producer bug. The fexit handler always deletes
  * the entry after a successful pair, so steady-state map
  * occupancy stays at the in-flight count. */
-struct pi_entry {
+struct ktstr_pi_entry {
 	unsigned long long ts;
 	int oldprio;
 	unsigned long long prev_class;  /* `p->sched_class` kva at entry */
@@ -366,7 +366,7 @@ struct pi_entry {
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__type(key, u64);
-	__type(value, struct pi_entry);
+	__type(value, struct ktstr_pi_entry);
 	__uint(max_entries, 1024);
 } pi_scratch SEC(".maps");
 
@@ -957,7 +957,7 @@ int BPF_PROG(ktstr_pi_fentry, struct task_struct *p,
 	if (!ktstr_enabled)
 		return 0;
 
-	struct pi_entry entry = {};
+	struct ktstr_pi_entry entry = {};
 	entry.ts = bpf_ktime_get_ns();
 	entry.oldprio = BPF_CORE_READ(p, prio);
 	entry.prev_class = (u64)BPF_CORE_READ(p, sched_class);
@@ -975,7 +975,7 @@ int BPF_PROG(ktstr_pi_fexit, struct task_struct *p,
 		return 0;
 
 	u64 key = (u64)p;
-	struct pi_entry *entry = bpf_map_lookup_elem(&pi_scratch, &key);
+	struct ktstr_pi_entry *entry = bpf_map_lookup_elem(&pi_scratch, &key);
 	if (!entry) {
 		ktstr_pcpu_inc(KTSTR_PCPU_PI_ORPHAN_FEXITS);
 		return 0;
