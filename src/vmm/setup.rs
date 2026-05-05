@@ -72,6 +72,7 @@ fn aarch64_initrd_addr(memory_mb: u32, shm_size: u64, initrd_max_size: u64) -> u
 ///   (matches the host-side virtio-blk F_RO advertisement). The
 ///   guest sets `MS_RDONLY` proactively rather than letting the
 ///   kernel fail with -EROFS when bdev RO meets RW mount.
+#[allow(dead_code)]
 pub(crate) fn disk_auto_mount_cmdline_tokens(disk: &disk_config::DiskConfig) -> String {
     if disk.filesystem == disk_config::Filesystem::Raw || disk.no_auto_mount {
         return String::new();

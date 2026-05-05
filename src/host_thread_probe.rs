@@ -1359,6 +1359,7 @@ const TCB_SIZE_AARCH64: u64 = 16;
 /// Variant II TLS address (x86_64). The thread pointer points to the
 /// END of the static TLS block; the executable's TLS image sits at
 /// `fs_base - tls_image_aligned_size`.
+#[cfg(target_arch = "x86_64")]
 fn compute_tls_address_variant_ii(
     fs_base: u64,
     tls_image_aligned_size: u64,

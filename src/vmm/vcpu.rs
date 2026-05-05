@@ -621,6 +621,7 @@ impl WatchpointArm {
 /// retry budget the freeze-coord watchpoint suggests in CLAUDE.md;
 /// after that the BPF .bss fallback carries the trigger and the
 /// watchpoint stays disabled for the rest of the run.
+#[allow(dead_code)]
 pub(crate) const WATCHPOINT_MAX_NON_EINTR_FAILURES: u8 = 3;
 
 /// Self-arm a hardware data-write watchpoint on `kva` if the per-vCPU
