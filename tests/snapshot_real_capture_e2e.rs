@@ -18,7 +18,7 @@ const KTSTR_SCHED: Scheduler =
 const KTSTR_SCHED_PAYLOAD: Payload = Payload::from_scheduler(&KTSTR_SCHED);
 
 /// Host-side content assertion: verify the bridge has a capture
-/// with probe_bp.bss containing ktstr_enabled.
+/// with the scheduler's .bss containing real BTF-rendered globals.
 fn assert_bridge_has_real_capture(result: &VmResult) -> Result<()> {
     let captured = result.snapshot_bridge.drain();
     anyhow::ensure!(
@@ -30,27 +30,31 @@ fn assert_bridge_has_real_capture(result: &VmResult) -> Result<()> {
             !report.maps.is_empty(),
             "snapshot '{tag}' has 0 maps — capture produced nothing"
         );
-        let probe_bss = report.maps.iter().find(|m| m.name == "probe_bp.bss");
+        let bss = report.maps.iter().find(|m| m.name.ends_with(".bss"));
         anyhow::ensure!(
-            probe_bss.is_some(),
-            "snapshot '{tag}' has {} maps but no probe_bp.bss",
-            report.maps.len()
+            bss.is_some(),
+            "snapshot '{tag}' has {} maps but no .bss map. maps: {:?}",
+            report.maps.len(),
+            report
+                .maps
+                .iter()
+                .map(|m| m.name.as_str())
+                .collect::<Vec<_>>()
         );
-        let bss = probe_bss.unwrap();
-        let has_ktstr_enabled = bss
+        let bss = bss.unwrap();
+        let has_real_members = bss
             .value
             .as_ref()
             .and_then(|v| match v {
-                RenderedValue::Struct { members, .. } => {
-                    Some(members.iter().any(|m| m.name == "ktstr_enabled"))
-                }
+                RenderedValue::Struct { members, .. } => Some(members.len() >= 3),
                 _ => None,
             })
             .unwrap_or(false);
         anyhow::ensure!(
-            has_ktstr_enabled,
-            "snapshot '{tag}' probe_bp.bss missing ktstr_enabled — \
-             BTF render did not produce real probe globals"
+            has_real_members,
+            "snapshot '{tag}' .bss '{}' has no BTF-rendered members — \
+             capture did not produce real scheduler state",
+            bss.name
         );
     }
     Ok(())

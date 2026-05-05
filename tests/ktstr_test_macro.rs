@@ -122,6 +122,45 @@ fn entry_host_only_attr() {
     assert!(entry.host_only);
 }
 
+/// Stub `post_vm` callback used by the
+/// `post_vm_attr_compile` macro test below. The macro must
+/// accept a path-valued `post_vm = NAME` attribute and route
+/// it onto `KtstrTestEntry.post_vm`. The callback never runs in
+/// the host-only attribute test (host_only short-circuits the
+/// VM-boot path), so the body is a trivial Ok — this stub exists
+/// only to give the macro a function path to wire.
+fn macro_post_vm_stub(_result: &ktstr::prelude::VmResult) -> Result<()> {
+    Ok(())
+}
+
+/// `ktstr_test` with `post_vm = NAME` to check the macro
+/// accepts the attribute and wires it into
+/// `KtstrTestEntry.post_vm`. Host-only so nextest discovery does
+/// not drag the test through a VM boot — the post_vm field
+/// itself is the unit under test, not the VM-side dispatch.
+#[ktstr_test(host_only = true, post_vm = macro_post_vm_stub)]
+fn post_vm_attr_compile(ctx: &Ctx) -> Result<AssertResult> {
+    let _ = ctx;
+    Ok(AssertResult::pass())
+}
+
+/// Check that `post_vm = NAME` is threaded into
+/// `KtstrTestEntry.post_vm` as `Some(NAME)` and the default
+/// (no `post_vm = ...` attribute) leaves the field at `None`.
+#[test]
+fn entry_post_vm_attr() {
+    let with_post = ktstr::test_support::find_test("post_vm_attr_compile").unwrap();
+    assert!(
+        with_post.post_vm.is_some(),
+        "post_vm = NAME must wire onto KtstrTestEntry.post_vm as Some(_)",
+    );
+    let without_post = ktstr::test_support::find_test("default_attrs_compile").unwrap();
+    assert!(
+        without_post.post_vm.is_none(),
+        "post_vm omitted from #[ktstr_test] must leave KtstrTestEntry.post_vm = None",
+    );
+}
+
 /// Scheduler that exercises the sysctls + kargs derive attributes.
 #[derive(ktstr::Scheduler)]
 #[scheduler(
