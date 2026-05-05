@@ -10,7 +10,9 @@
 //!   / [`dispatch_mmio_read`]).
 
 use crate::vmm::PiMutex;
-use crate::vmm::vcpu::{SCX_EXIT_ERROR_THRESHOLD, WatchpointArm, self_arm_watchpoint};
+use crate::vmm::vcpu::{WatchpointArm, self_arm_watchpoint};
+#[cfg(target_arch = "x86_64")]
+use crate::vmm::vcpu::SCX_EXIT_ERROR_THRESHOLD;
 use crate::vmm::{console, kvm, virtio_blk, virtio_console, virtio_net};
 use kvm_ioctls::VcpuExit;
 use serde::{Deserialize, Serialize};
