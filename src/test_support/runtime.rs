@@ -43,9 +43,16 @@ pub(crate) fn config_file_parts(entry: &KtstrTestEntry) -> Option<(String, PathB
 
 /// Build the shared `cmdline=` string appended to every ktstr_test
 /// guest boot. `iomem=relaxed`, per-scheduler sysctls, per-scheduler
-/// kargs, and `RUST_BACKTRACE` / `RUST_LOG` propagation — anything
-/// the two VM-launch sites (`run_ktstr_test_inner` and
-/// `attempt_auto_repro`) previously re-implemented side-by-side.
+/// kargs, `RUST_BACKTRACE` / `RUST_LOG` propagation, and the host-
+/// resolved `KTSTR_SIDECAR_DIR` so the guest's `sidecar_dir()`
+/// returns the SAME path the host's freeze coordinator writes to.
+/// Without that propagation, host and guest each compute the run
+/// directory independently — the host walks `gix::discover` from a
+/// real workspace cwd and produces `{kernel}-{commit}` whereas the
+/// guest's cwd is `/` (no git repo, no kernel env), yielding the
+/// `unknown-unknown` fallback. Anything the two VM-launch sites
+/// (`run_ktstr_test_inner` and `attempt_auto_repro`) previously
+/// re-implemented side-by-side lives here.
 pub(crate) fn build_cmdline_extra(entry: &KtstrTestEntry) -> String {
     let mut parts = vec!["iomem=relaxed".to_string()];
     for s in entry.scheduler.sysctls() {
@@ -59,6 +66,39 @@ pub(crate) fn build_cmdline_extra(entry: &KtstrTestEntry) -> String {
     }
     if let Ok(log) = std::env::var("RUST_LOG") {
         parts.push(format!("RUST_LOG={log}"));
+    }
+    // Propagate the host-resolved sidecar dir so the guest scenario
+    // computes the same path the host's freeze coordinator wrote to
+    // (e.g. when a test reads `sidecar_dir().join("foo.json")` from
+    // inside the guest, the path matches the host's writer site).
+    // The host resolves via the OnceLock-cached project commit walk
+    // from the workspace cwd; the guest's cwd is `/` and would
+    // otherwise fall back to `unknown-unknown`. Sidecar dir paths
+    // are filesystem-safe ASCII (kernel version + 7-char hex
+    // commit, optional `-dirty` suffix), so the cmdline-as-token
+    // shape is sound — no escaping needed for whitespace.
+    //
+    // Absolutize via `current_dir().join()` when the resolved path
+    // is relative (the default-branch shape:
+    // `target/ktstr/{kernel}-{commit}` against the host cwd). The
+    // guest's cwd is `/`, so a relative token would resolve there
+    // instead of at the host's workspace root — the propagation
+    // must carry the FULL absolute path so the guest's
+    // `sidecar_dir()` reports the same string the host's writer
+    // site used. Falls back to the raw resolved path when the cwd
+    // probe fails (extremely rare; happens only when the process's
+    // cwd was rmdir'd while alive — a metadata probe has no
+    // recourse, leave the path as-is).
+    let resolved = super::sidecar::sidecar_dir();
+    let absolute = if resolved.is_absolute() {
+        resolved
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(&resolved))
+            .unwrap_or(resolved)
+    };
+    if let Some(s) = absolute.to_str() {
+        parts.push(format!("KTSTR_SIDECAR_DIR={s}"));
     }
     parts.join(" ")
 }
@@ -303,13 +343,18 @@ mod tests {
         // RUST_LOG entries that would break the default assertion.
         let _env_bt = EnvVarGuard::remove("RUST_BACKTRACE");
         let _env_log = EnvVarGuard::remove("RUST_LOG");
+        // Pin KTSTR_SIDECAR_DIR so the propagation token shape is
+        // stable across tests; without the override, the call falls
+        // through to the `{kernel}-{commit}` resolver whose output
+        // depends on the test process's git state.
+        let _env_sd = EnvVarGuard::set("KTSTR_SIDECAR_DIR", "/tmp/ktstr-test");
 
         let entry = KtstrTestEntry {
             name: "cmdline_test",
             ..KtstrTestEntry::DEFAULT
         };
         let out = build_cmdline_extra(&entry);
-        assert_eq!(out, "iomem=relaxed");
+        assert_eq!(out, "iomem=relaxed KTSTR_SIDECAR_DIR=/tmp/ktstr-test");
     }
 
     #[test]
@@ -317,6 +362,7 @@ mod tests {
         let _lock = lock_env();
         let _env_bt = EnvVarGuard::remove("RUST_BACKTRACE");
         let _env_log = EnvVarGuard::remove("RUST_LOG");
+        let _env_sd = EnvVarGuard::set("KTSTR_SIDECAR_DIR", "/tmp/ktstr-test");
 
         static SYSCTLS: &[Sysctl] = &[Sysctl::new("kernel.foo", "1")];
         static SCHED: Scheduler = Scheduler::new("s").sysctls(SYSCTLS).kargs(&["quiet"]);
@@ -327,7 +373,10 @@ mod tests {
             ..KtstrTestEntry::DEFAULT
         };
         let out = build_cmdline_extra(&entry);
-        assert_eq!(out, "iomem=relaxed sysctl.kernel.foo=1 quiet");
+        assert_eq!(
+            out,
+            "iomem=relaxed sysctl.kernel.foo=1 quiet KTSTR_SIDECAR_DIR=/tmp/ktstr-test"
+        );
     }
 
     #[test]
@@ -335,6 +384,7 @@ mod tests {
         let _lock = lock_env();
         let _env_bt = EnvVarGuard::set("RUST_BACKTRACE", "1");
         let _env_log = EnvVarGuard::set("RUST_LOG", "debug");
+        let _env_sd = EnvVarGuard::set("KTSTR_SIDECAR_DIR", "/tmp/ktstr-test");
 
         let entry = KtstrTestEntry {
             name: "cmd",
@@ -349,6 +399,29 @@ mod tests {
             out.contains("RUST_LOG=debug"),
             "expected RUST_LOG propagation: {out}"
         );
+        assert!(
+            out.contains("KTSTR_SIDECAR_DIR=/tmp/ktstr-test"),
+            "expected KTSTR_SIDECAR_DIR propagation: {out}"
+        );
+    }
+
+    #[test]
+    fn build_cmdline_extra_propagates_sidecar_dir() {
+        let _lock = lock_env();
+        let _env_bt = EnvVarGuard::remove("RUST_BACKTRACE");
+        let _env_log = EnvVarGuard::remove("RUST_LOG");
+        // Explicit override path proves the token shape is exactly
+        // `KTSTR_SIDECAR_DIR=<path>` and uses the override verbatim
+        // (host's `sidecar_dir()` honours the env var as the
+        // operator-chosen override slot).
+        let _env_sd = EnvVarGuard::set("KTSTR_SIDECAR_DIR", "/explicit/sidecar/dir");
+
+        let entry = KtstrTestEntry {
+            name: "cmd",
+            ..KtstrTestEntry::DEFAULT
+        };
+        let out = build_cmdline_extra(&entry);
+        assert_eq!(out, "iomem=relaxed KTSTR_SIDECAR_DIR=/explicit/sidecar/dir");
     }
 
     // -- resolve_vm_topology --

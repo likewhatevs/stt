@@ -7086,8 +7086,7 @@ mod tests {
         // surface here as `second.is_none()` — the cache would
         // short-circuit the re-probe and the new commit would be
         // invisible.
-        let blob_id: gix::ObjectId =
-            repo.write_blob(b"original\n").expect("write blob").detach();
+        let blob_id: gix::ObjectId = repo.write_blob(b"original\n").expect("write blob").detach();
         let tree = gix::objs::Tree {
             entries: vec![gix::objs::tree::Entry {
                 mode: gix::objs::tree::EntryKind::Blob.into(),

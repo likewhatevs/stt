@@ -67,10 +67,24 @@ pub(crate) fn propagate_rust_env_from_cmdline() {
 }
 
 /// Pure parser for the cmdline side of `propagate_rust_env_from_cmdline`.
-/// Returns `(key, value)` pairs for every `RUST_BACKTRACE=...` or
-/// `RUST_LOG=...` token found in whitespace-split `cmdline`, in the
-/// order they appear. Split from the env-mutating wrapper so the
-/// parse logic is testable without touching the process environment.
+/// Returns `(key, value)` pairs for every `RUST_BACKTRACE=...`,
+/// `RUST_LOG=...`, or `KTSTR_SIDECAR_DIR=...` token found in
+/// whitespace-split `cmdline`, in the order they appear. Split from
+/// the env-mutating wrapper so the parse logic is testable without
+/// touching the process environment.
+///
+/// `KTSTR_SIDECAR_DIR` propagation: the host writes its resolved
+/// `sidecar_dir()` into the kernel cmdline at boot so the guest's
+/// `sidecar_dir()` returns the same override path. Without this,
+/// host and guest each compute the run directory independently —
+/// the host's `gix::discover` walks the workspace tree and produces
+/// `{kernel}-{commit}` while the guest's cwd is `/` and falls back
+/// to `unknown-unknown`. With the override propagated, both sides
+/// agree on the path so a guest scenario reading
+/// `sidecar_dir().join(...)` resolves to the same string the host's
+/// freeze coordinator writes to (the file itself still lives on the
+/// host filesystem; this only aligns the path computation, not
+/// cross-process file access).
 fn parse_rust_env_from_cmdline(cmdline: &str) -> Vec<(&'static str, &str)> {
     let mut out = Vec::new();
     for token in cmdline.split_whitespace() {
@@ -78,6 +92,8 @@ fn parse_rust_env_from_cmdline(cmdline: &str) -> Vec<(&'static str, &str)> {
             out.push(("RUST_BACKTRACE", val));
         } else if let Some(val) = token.strip_prefix("RUST_LOG=") {
             out.push(("RUST_LOG", val));
+        } else if let Some(val) = token.strip_prefix("KTSTR_SIDECAR_DIR=") {
+            out.push(("KTSTR_SIDECAR_DIR", val));
         }
     }
     out
@@ -2479,6 +2495,37 @@ mod tests {
         // Tokens that merely contain the key substring but do not
         // start with it are ignored (e.g. `xRUST_LOG=...`).
         assert!(parse_rust_env_from_cmdline("xRUST_LOG=x").is_empty());
+    }
+
+    #[test]
+    fn parse_rust_env_sidecar_dir() {
+        // `KTSTR_SIDECAR_DIR` is propagated alongside RUST_BACKTRACE
+        // / RUST_LOG so the guest's `sidecar_dir()` returns the
+        // host's resolved override path.
+        let parsed = parse_rust_env_from_cmdline(
+            "console=ttyS0 KTSTR_SIDECAR_DIR=/host/target/ktstr/run-key ro",
+        );
+        assert_eq!(
+            parsed,
+            vec![("KTSTR_SIDECAR_DIR", "/host/target/ktstr/run-key")]
+        );
+    }
+
+    #[test]
+    fn parse_rust_env_all_three_keys() {
+        // Order-preserving across all three keys — the guest applies
+        // them in the order they appear, matching cmdline composition
+        // semantics.
+        let parsed =
+            parse_rust_env_from_cmdline("RUST_LOG=info KTSTR_SIDECAR_DIR=/dir RUST_BACKTRACE=1");
+        assert_eq!(
+            parsed,
+            vec![
+                ("RUST_LOG", "info"),
+                ("KTSTR_SIDECAR_DIR", "/dir"),
+                ("RUST_BACKTRACE", "1")
+            ]
+        );
     }
 
     // -- extract_not_attached_reason --

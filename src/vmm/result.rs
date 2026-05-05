@@ -209,16 +209,19 @@ pub struct VmResult {
     /// run's lifetime. Every `Op::Snapshot` and `Op::WatchSnapshot`
     /// fire stores a `FailureDumpReport` keyed by its tag.
     ///
-    /// The `#[ktstr_test]` host-side wrapper (in
-    /// `src/test_support/eval.rs::run_ktstr_test_inner_impl`)
-    /// calls [`crate::scenario::snapshot::SnapshotBridge::drain`]
-    /// after `vm.run()` returns and walks every captured report —
-    /// verifying the scheduler `.bss` map is present and the
-    /// `RenderedMember` list contains the always-present probe
-    /// gate variable. Out-of-tree consumers can drain the bridge
-    /// directly off `VmResult` and traverse it via
+    /// `#[ktstr_test]` test bodies whose scenario fires snapshot
+    /// ops in the guest assert on the captured reports through a
+    /// `post_vm = NAME` attribute. The named callback runs on the
+    /// HOST after `vm.run()` returns (see
+    /// [`crate::test_support::KtstrTestEntry::post_vm`]) and
+    /// receives `&VmResult`; it calls
+    /// [`crate::scenario::snapshot::SnapshotBridge::drain`] on
+    /// this field to take ownership of the stored reports and
+    /// walks them — typically through
     /// [`crate::scenario::snapshot::Snapshot::new`] for typed
-    /// access to map values and per-CPU entries.
+    /// access to map values, per-CPU entries, and scalar
+    /// variables. Out-of-tree consumers can drain the bridge the
+    /// same way: `VmResult` is in `ktstr::prelude`.
     ///
     /// Always present after a successful `run_vm`; `None`-equivalent
     /// (empty) when the VM crashed before any snapshot fired.
