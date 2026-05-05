@@ -636,13 +636,13 @@ pub struct ProbeBssCounters {
     /// fires past the `ktstr_enabled` gate.
     pub probe_count: u64,
     /// `KTSTR_PCPU_KPROBE_RETURNS` summed across CPUs — kprobe fires
-    /// that committed an entry to `probe_data` (past meta lookup
-    /// and scratch-slot allocation).
+    /// that committed an entry to `probe_data` (past `func_meta_map`
+    /// lookup and scratch-slot allocation).
     pub kprobe_returns: u64,
     /// `KTSTR_PCPU_META_MISS` summed across CPUs — kprobe fires
     /// whose IP missed `func_meta_map`. `probe_count -
     /// kprobe_returns` is the total bail count; `meta_miss` is the
-    /// subset whose bail came from the meta lookup specifically.
+    /// subset whose bail came from the `func_meta_map` lookup.
     pub meta_miss: u64,
     /// `KTSTR_PCPU_RINGBUF_DROPS` summed across CPUs — failed
     /// `bpf_ringbuf_reserve` calls inside the trigger handler.

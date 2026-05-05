@@ -1036,11 +1036,6 @@ impl KtstrVm {
         let freeze_coord_doorbell = doorbell_evt_for_coord;
         let freeze_coord_on_demand_in_flight = on_demand_in_flight.clone();
         let freeze_coord_snapshot_bridge = snapshot_bridge.clone();
-        // Path to the kernel ELF so the coordinator can resolve
-        // user-supplied symbols (Op::WatchSnapshot) by name through
-        // a fresh ELF parse on each registration. Cheap; the kernel
-        // image is on disk, the host page cache covers re-reads.
-        let _freeze_coord_kernel_path = self.kernel.clone();
         // Wake-fd handles for the coord epoll loop. `kill_evt` and
         // `bsp_done_evt` are written by every thread that flips the
         // matching AtomicBool (vCPU shutdown classifier, BSP panic
