@@ -11,34 +11,28 @@ like *whenever the kernel touches X*?" rather than "what does it
 look like at this point in my scenario?". For time-driven capture,
 use [`Op::snapshot`](snapshots.md) instead.
 
-## Status: registration tested, hardware fire path is a follow-up
+## How it works
 
-The pieces that are exercised end-to-end in `tests/snapshot_e2e.rs`:
+The full pipeline is implemented and tested end-to-end:
 
-- `Op::watch_snapshot(symbol)` drives the bridge's
-  `register_watch` callback, in the order the ops appear, with the
-  symbol string passed through verbatim.
-- The per-scenario cap of [`MAX_WATCH_SNAPSHOTS`] (= 3) is enforced.
-  A 4th `Op::watch_snapshot` in the same scenario fails the step
-  with a "cap exceeded" message.
-- Symbol-resolution failures returned by the register callback bail
-  the step immediately (`anyhow::bail!`) so a typo or absent symbol
-  surfaces visibly instead of leaving the scenario running with no
-  captures.
-- `bridge.watch_count()` reflects the number of successfully-armed
-  watchpoints.
+1. `Op::watch_snapshot(symbol)` registers the symbol via SHM.
+2. The freeze coordinator resolves the KVA from the vmlinux ELF,
+   validates 4-byte alignment, and arms a DR1/DR2/DR3 slot via
+   `KVM_SET_GUEST_DEBUG`.
+3. When the guest writes to the watched address, `KVM_EXIT_DEBUG`
+   fires with the corresponding `dr6` bit set.
+4. The coordinator captures via `freeze_and_capture` and stores
+   the report in the `SnapshotBridge` under the symbol tag.
+5. The report is also mirrored to a sidecar JSON file for
+   post-hoc inspection.
 
-The pieces that are **not** yet exercised end-to-end:
+The per-scenario cap of [`MAX_WATCH_SNAPSHOTS`] (= 3) is enforced
+(DR0 is reserved for the error-class exit_kind trigger; DR1-3 are
+available for user watches). A 4th `Op::watch_snapshot` fails the
+step with a "cap exceeded" message. Symbol-resolution failures
+bail immediately so a typo surfaces visibly.
 
-- The KVM hardware-watchpoint plumbing
-  (`KVM_SET_GUEST_DEBUG` arming + `KVM_EXIT_DEBUG` dispatch into
-  the freeze coordinator). The in-VM watch-snapshot test
-  (`scenario_watch_snapshot_op_captures_exit_state` in
-  `tests/snapshot_e2e.rs`) drives `bridge.capture(...)` manually
-  instead of relying on a hardware fire — its comment notes the
-  hardware path is a follow-up.
-
-Plan accordingly: today, `Op::watch_snapshot` is reliable for
+`Op::watch_snapshot` is reliable for
 covering the registration surface (cap enforcement, symbol
 propagation, error bailing). Until the hardware fire path lands, an
 on-write capture must be simulated by an explicit
