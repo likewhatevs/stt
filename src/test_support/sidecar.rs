@@ -7041,6 +7041,83 @@ mod tests {
         );
     }
 
+    /// `detect_kernel_commit` does NOT cache `None` outcomes. The
+    /// first call against a path that fails (here: an unborn HEAD
+    /// from a fresh `gix::init`) returns `None`, but a SECOND call
+    /// after the same path becomes a valid checkout (a commit was
+    /// made in between) must return the resolved short hash —
+    /// proof that the failure did NOT poison the per-path cache.
+    ///
+    /// Pins the failure-retry contract: a transient probe failure
+    /// (FS hiccup, race against an in-flight checkout, unborn HEAD
+    /// resolved later in the same process) must not lock in
+    /// `unknown` for that path's entire process lifetime. The
+    /// observable invariant is "the same path's outcome can change
+    /// from None to Some without process restart"; the regression
+    /// guarded against is "first None gets cached and the path is
+    /// stuck at None until the process exits."
+    ///
+    /// SCOPE: this test guards the FAILURE-RETRY half of the cache
+    /// contract. The success-side memoization is pinned by
+    /// `detect_kernel_commit_memoizes_across_consecutive_calls_same_path`
+    /// and `detect_kernel_commit_canonicalizes_symlink_aliases` —
+    /// once the cache holds Some, mutations to the underlying repo
+    /// do NOT invalidate the entry.
+    #[test]
+    fn detect_kernel_commit_failure_does_not_poison_cache() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        // First call: unborn HEAD — `gix::open` succeeds but
+        // `head_id()` fails, so `commit_with_dirty_suffix` returns
+        // None. Pre-fix this would seed the cache with None.
+        let mut repo = gix::init(tmp.path()).expect("gix::init");
+        let _ = repo
+            .committer_or_set_generic_fallback()
+            .expect("committer fallback");
+        set_test_author_fallback(&mut repo);
+        let first = super::detect_kernel_commit(tmp.path());
+        assert!(
+            first.is_none(),
+            "fixture precondition: unborn HEAD probe must return \
+             None; got {first:?}",
+        );
+
+        // Materialize a commit so the path now resolves to a real
+        // hash. A regression that cached the first None would
+        // surface here as `second.is_none()` — the cache would
+        // short-circuit the re-probe and the new commit would be
+        // invisible.
+        let blob_id: gix::ObjectId =
+            repo.write_blob(b"original\n").expect("write blob").detach();
+        let tree = gix::objs::Tree {
+            entries: vec![gix::objs::tree::Entry {
+                mode: gix::objs::tree::EntryKind::Blob.into(),
+                filename: "file.txt".into(),
+                oid: blob_id,
+            }],
+        };
+        let tree_id: gix::ObjectId = repo.write_object(&tree).expect("write tree").detach();
+        let head: gix::ObjectId = repo
+            .commit("HEAD", "init", tree_id, std::iter::empty::<gix::ObjectId>())
+            .expect("commit")
+            .detach();
+        let mut idx = repo.index_from_tree(&tree_id).expect("index_from_tree");
+        idx.write(gix::index::write::Options::default())
+            .expect("write index");
+        std::fs::write(tmp.path().join("file.txt"), b"original\n").expect("write worktree file");
+
+        let second = super::detect_kernel_commit(tmp.path());
+        let expected = head.to_hex_with_len(7).to_string();
+        assert_eq!(
+            second.as_deref(),
+            Some(expected.as_str()),
+            "second call after the path becomes a valid checkout \
+             must return the resolved short hash {expected:?} — a \
+             regression that cached the first None would surface as \
+             None here, locking the path at `unknown` for the rest \
+             of the process. got {second:?}",
+        );
+    }
+
     /// `detect_kernel_commit` canonicalizes its cache key so two
     /// path spellings that resolve to the same on-disk repo share
     /// one cache entry. Without canonicalization a symlink alias
