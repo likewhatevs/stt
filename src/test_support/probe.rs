@@ -2318,9 +2318,11 @@ mod tests {
         };
         let event_json = serde_json::to_string(&event).unwrap();
         let payload = format!(r#"{{"events":[{event_json}]}}"#);
-        // Truncate after the first event so recovery walks exactly
-        // one chunk.
-        let cut = payload.find(']').unwrap();
+        // Truncate before the events array's closing `]` so the
+        // splitter sees a complete event without the array terminator.
+        // Use rfind to skip `]` characters inside the event itself
+        // (e.g. from `args:[0,0,0,0,0,0]`).
+        let cut = payload.rfind(']').unwrap();
         let truncated = &payload[..cut];
         let recovered = recover_partial_events(truncated);
         assert_eq!(

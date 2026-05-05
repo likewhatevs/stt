@@ -2870,13 +2870,14 @@ mod tests {
             partial: Box::new(partial),
         };
         let out = format!("{v}");
-        // Outer truncation marker + partial struct on the same
-        // line. The partial Struct collapses onto a single line
-        // as `Type{f=v, f=v}` (no `struct` keyword, no space
-        // before brace, `=` separator).
-        assert!(out.starts_with("<truncated needed=8 had=4> partial_struct{"));
+        // Outer truncation marker then breadcrumb form (the
+        // Truncated member `b` prevents inline collapsing).
+        assert!(
+            out.starts_with("<truncated needed=8 had=4> partial_struct:"),
+            "expected breadcrumb form, got: {out}"
+        );
         assert!(out.contains("a=7"));
-        assert!(out.contains("b=<truncated needed=4 had=0>"));
+        assert!(out.contains("b <truncated needed=4 had=0>"));
     }
 
     // ---- partial-render contract -------------------------------------

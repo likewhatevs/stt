@@ -813,6 +813,13 @@ fn write_runfile(path: &Path, preamble: &str, archive: &[u8]) -> Result<()> {
         f.write_all(b"\n").context("write newline")?;
     }
     f.sync_all().context("fsync runfile")?;
+    drop(f);
+    let mut perms = std::fs::metadata(path)
+        .with_context(|| format!("stat {}", path.display()))?
+        .permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(path, perms)
+        .with_context(|| format!("chmod 755 {}", path.display()))?;
     Ok(())
 }
 
