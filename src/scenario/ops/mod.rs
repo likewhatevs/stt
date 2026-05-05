@@ -2262,13 +2262,21 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                     .with_context(|| format!("Op::UnfreezeCgroup: cgroup '{cgroup}'"))?;
             }
             Op::Snapshot { name } => {
-                // Drive the active SnapshotBridge if one is
-                // installed for this thread. The bridge calls back
-                // into the host's freeze coordinator (via its
-                // capture callback), waits for the report, and
-                // stores it under `name`. No bridge ⇒ skip with a
-                // warn so existing scenarios that never declared
-                // snapshot ops keep working unchanged.
+                // Two execution contexts:
+                //   1. Test fixture: a thread-local SnapshotBridge is
+                //      installed (e.g. by the `snapshot_e2e.rs`
+                //      smoke tests). Drive its capture callback
+                //      directly — no SHM, no doorbell — so the
+                //      pure-host unit tests still exercise the
+                //      executor + bridge wiring.
+                //   2. Production: the scenario runs inside the
+                //      guest VM. The freeze coordinator owns the
+                //      bridge on the host. Publish a request
+                //      through SHM, fire the doorbell, and wait
+                //      for the host to stamp a matching reply id.
+                //      The host's coordinator stores the captured
+                //      report on its bridge; the test code drains
+                //      the bridge after VM exit.
                 let invoked = crate::scenario::snapshot::with_active_bridge(|b| {
                     let captured = b.capture(name);
                     if captured {
@@ -2281,27 +2289,60 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                     captured
                 });
                 if invoked.is_none() {
-                    tracing::warn!(
-                        name = %name,
-                        "Op::Snapshot: no SnapshotBridge installed on the executor's \
-                         thread — skipping capture (host wires the bridge before \
-                         execute_steps; in-guest / no-VM scenarios cannot capture)"
-                    );
+                    if crate::vmm::shm_ring::is_guest() {
+                        let timeout = std::time::Duration::from_secs(30);
+                        match crate::vmm::shm_ring::snapshot_request(
+                            crate::vmm::shm_ring::SHM_SNAPSHOT_KIND_CAPTURE,
+                            name,
+                            timeout,
+                        ) {
+                            crate::vmm::shm_ring::SnapshotRequestResult::Ok => {
+                                tracing::info!(
+                                    name = %name,
+                                    "Op::Snapshot: host captured diagnostic snapshot via SHM doorbell"
+                                );
+                            }
+                            crate::vmm::shm_ring::SnapshotRequestResult::HostError { reason } => {
+                                anyhow::bail!(
+                                    "Op::Snapshot('{name}'): host rejected capture: {reason}"
+                                );
+                            }
+                            crate::vmm::shm_ring::SnapshotRequestResult::TransportError {
+                                reason,
+                            } => {
+                                anyhow::bail!(
+                                    "Op::Snapshot('{name}'): SHM/doorbell transport failure: {reason}"
+                                );
+                            }
+                        }
+                    } else {
+                        tracing::warn!(
+                            name = %name,
+                            "Op::Snapshot: no SnapshotBridge installed on the executor's \
+                             thread and not running in a guest VM — skipping capture"
+                        );
+                    }
                 }
             }
             Op::WatchSnapshot { symbol } => {
-                // Register the watch with the active bridge. The
-                // bridge owns the BTF + kallsyms resolution and
-                // the DR1-3 allocation; on success the host
-                // arms a hardware data-write watchpoint and
-                // wires its `KVM_EXIT_DEBUG` dispatch to the
-                // capture pipeline tagged by the symbol path.
-                //
-                // Per the Op::WatchSnapshot doc, registration
-                // failures (max-3 exceeded, symbol unresolved,
-                // DR_LEN_4 misaligned) bail out of the scenario
-                // immediately — silent degradation would leave
-                // the test running with no captures.
+                // Two execution contexts mirroring `Op::Snapshot`:
+                //   1. Test fixture: thread-local SnapshotBridge
+                //      drives the register callback directly.
+                //   2. Production: in-guest scenario sends a
+                //      `SHM_SNAPSHOT_KIND_WATCH` request through
+                //      SHM. The host coordinator resolves the
+                //      symbol via the parsed vmlinux ELF +
+                //      direct-mapping translation, allocates a
+                //      free DR1..=DR3 slot, programs the hardware
+                //      watchpoint via `KVM_SET_GUEST_DEBUG` on
+                //      every vCPU, and replies OK. A future guest
+                //      write to the resolved KVA fires
+                //      `KVM_EXIT_DEBUG`; the vCPU dispatcher reads
+                //      DR6, identifies the slot, and latches
+                //      `WatchpointSlot::hit`. The coordinator then
+                //      runs `freeze_and_capture(false)` and
+                //      stores the report on the bridge keyed by
+                //      the symbol path.
                 let registered =
                     crate::scenario::snapshot::with_active_bridge(|b| b.register_watch(symbol));
                 match registered {
@@ -2317,12 +2358,41 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                         );
                     }
                     None => {
-                        tracing::warn!(
-                            symbol = %symbol,
-                            "Op::WatchSnapshot: no SnapshotBridge installed on the \
-                             executor's thread — skipping watch registration (host \
-                             wires the bridge before execute_steps)"
-                        );
+                        if crate::vmm::shm_ring::is_guest() {
+                            let timeout = std::time::Duration::from_secs(30);
+                            match crate::vmm::shm_ring::snapshot_request(
+                                crate::vmm::shm_ring::SHM_SNAPSHOT_KIND_WATCH,
+                                symbol,
+                                timeout,
+                            ) {
+                                crate::vmm::shm_ring::SnapshotRequestResult::Ok => {
+                                    tracing::info!(
+                                        symbol = %symbol,
+                                        "Op::WatchSnapshot: host armed hardware-watchpoint via SHM doorbell"
+                                    );
+                                }
+                                crate::vmm::shm_ring::SnapshotRequestResult::HostError {
+                                    reason,
+                                } => {
+                                    anyhow::bail!(
+                                        "Op::WatchSnapshot('{symbol}'): host rejected: {reason}"
+                                    );
+                                }
+                                crate::vmm::shm_ring::SnapshotRequestResult::TransportError {
+                                    reason,
+                                } => {
+                                    anyhow::bail!(
+                                        "Op::WatchSnapshot('{symbol}'): SHM/doorbell transport failure: {reason}"
+                                    );
+                                }
+                            }
+                        } else {
+                            tracing::warn!(
+                                symbol = %symbol,
+                                "Op::WatchSnapshot: no SnapshotBridge installed and not in \
+                                 guest VM — skipping watch registration"
+                            );
+                        }
                     }
                 }
             }

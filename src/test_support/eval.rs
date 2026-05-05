@@ -3433,6 +3433,10 @@ mod tests {
             cleanup_duration: None,
             virtio_blk_counters: None,
             virtio_net_counters: None,
+            snapshot_bridge: {
+                let cb: crate::scenario::snapshot::CaptureCallback = std::sync::Arc::new(|_| None);
+                crate::scenario::snapshot::SnapshotBridge::new(cb)
+            },
         };
         let assertions = crate::assert::Assert::default_checks();
         let msg = format!(
@@ -3742,6 +3746,10 @@ mod tests {
             cleanup_duration: None,
             virtio_blk_counters: None,
             virtio_net_counters: None,
+            snapshot_bridge: {
+                let cb: crate::scenario::snapshot::CaptureCallback = std::sync::Arc::new(|_| None);
+                crate::scenario::snapshot::SnapshotBridge::new(cb)
+            },
         };
         let assertions = crate::assert::Assert::NO_OVERRIDES;
         let msg = format!(
@@ -3828,6 +3836,10 @@ mod tests {
             cleanup_duration: None,
             virtio_blk_counters: None,
             virtio_net_counters: None,
+            snapshot_bridge: {
+                let cb: crate::scenario::snapshot::CaptureCallback = std::sync::Arc::new(|_| None);
+                crate::scenario::snapshot::SnapshotBridge::new(cb)
+            },
         };
         let assertions = crate::assert::Assert::default_checks();
         let msg = format!(

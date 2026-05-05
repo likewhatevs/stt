@@ -567,6 +567,52 @@ pub(crate) struct WatchpointArm {
     /// load on `hit` after the coordinator drains the eventfd
     /// observes the store on weakly-ordered architectures.
     pub(crate) hit_evt: EventFd,
+    /// Per-DR{1,2,3} user-watchpoint slot state. Index 0 of the
+    /// array maps to DR1; index 1 to DR2; index 2 to DR3. DR0 is
+    /// owned by the existing `*scx_root->exit_kind` trigger above
+    /// and never appears in this array.
+    ///
+    /// Each slot is updated by `Op::WatchSnapshot` after the freeze
+    /// coordinator publishes the resolved KVA; the vCPU's
+    /// `self_arm_watchpoint` arms every requested slot on the next
+    /// loop iteration. A `KVM_EXIT_DEBUG` reads `dr6` to identify
+    /// which slot fired and stores `true` into the corresponding
+    /// `hit` flag.
+    pub(crate) user: [WatchpointSlot; 3],
+}
+
+/// Per-user-DR slot state. One slot per DR1, DR2, DR3.
+pub(crate) struct WatchpointSlot {
+    /// Resolved KVA the coordinator wants armed. `0` = unallocated.
+    /// Published by the freeze coordinator's
+    /// [`KtstrVm::register_watch_symbol`] handler after it resolves
+    /// the symbol path through BTF + kallsyms. Once non-zero, every
+    /// vCPU thread arms its corresponding DR slot on its next loop
+    /// iteration.
+    pub(crate) request_kva: AtomicU64,
+    /// Set by a vCPU when it observes a `KVM_EXIT_DEBUG` whose
+    /// `dr6.B{1,2,3}` matches this slot. The freeze coordinator's
+    /// epoll loop polls all three `hit` flags with Acquire on each
+    /// `WATCHPOINT` token wake, runs `freeze_and_capture(false)` on
+    /// any trip, and stores the report under the registered tag in
+    /// the bridge.
+    pub(crate) hit: AtomicBool,
+    /// Snapshot tag the bridge stores the captured report under.
+    /// Mutex-locked so the host-side watch-register handler can
+    /// publish the tag alongside the request_kva atomically. The
+    /// coordinator reads this when latching a fire to look up the
+    /// bridge key. `String::new()` until the slot is allocated.
+    pub(crate) tag: std::sync::Mutex<String>,
+}
+
+impl WatchpointSlot {
+    fn new() -> Self {
+        Self {
+            request_kva: AtomicU64::new(0),
+            hit: AtomicBool::new(false),
+            tag: std::sync::Mutex::new(String::new()),
+        }
+    }
 }
 
 /// `SCX_EXIT_ERROR` from `enum scx_exit_kind` in
@@ -588,6 +634,11 @@ impl WatchpointArm {
             kind_host_ptr: AtomicPtr::new(std::ptr::null_mut()),
             hit: AtomicBool::new(false),
             hit_evt: EventFd::new(EFD_NONBLOCK)?,
+            user: [
+                WatchpointSlot::new(),
+                WatchpointSlot::new(),
+                WatchpointSlot::new(),
+            ],
         })
     }
 
@@ -606,6 +657,24 @@ impl WatchpointArm {
             tracing::warn!(
                 error = %e,
                 "WatchpointArm::latch_hit: eventfd write failed; \
+                 coordinator will still trip on next epoll timeout"
+            );
+        }
+    }
+
+    /// Latch a user-watchpoint slot fire. `idx` selects the DR1/DR2/DR3
+    /// slot (0..=2 mapping to DR1..=DR3). Sets `user[idx].hit` and
+    /// fires `hit_evt` so the freeze coordinator wakes immediately
+    /// and runs `freeze_and_capture(false)` against the slot's tag.
+    pub(crate) fn latch_user_hit(&self, idx: usize) {
+        if idx < self.user.len() {
+            self.user[idx].hit.store(true, Ordering::Release);
+        }
+        if let Err(e) = self.hit_evt.write(1) {
+            tracing::warn!(
+                error = %e,
+                idx,
+                "WatchpointArm::latch_user_hit: eventfd write failed; \
                  coordinator will still trip on next epoll timeout"
             );
         }
@@ -651,18 +720,26 @@ pub(crate) const WATCHPOINT_MAX_NON_EINTR_FAILURES: u8 = 3;
 /// need a separate implementation. The freeze coordinator gates the
 /// publish path on x86_64 too, so the no-op aarch64 stub keeps the
 /// rest of the run loop arch-agnostic.
+///
+/// Arms ALL requested DR slots (DR0 for `*scx_root->exit_kind`, plus
+/// DR1/DR2/DR3 for user `Op::WatchSnapshot` registrations) in a
+/// single `KVM_SET_GUEST_DEBUG` ioctl. `armed_slots` tracks the
+/// currently-armed KVA in each of `debugreg[0..=3]`; whenever any
+/// slot's `request_kva` differs from its `armed_slots` entry the
+/// helper rebuilds the full debugreg + DR7 and re-issues the ioctl.
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn self_arm_watchpoint(
     vcpu: &mut kvm_ioctls::VcpuFd,
-    request: &AtomicU64,
-    armed: &mut u64,
+    watchpoint: &WatchpointArm,
+    armed_slots: &mut [u64; 4],
     failures: &mut u8,
 ) -> bool {
-    let req = request.load(Ordering::Acquire);
-    if req == *armed {
-        return false;
+    let mut requests = [0u64; 4];
+    requests[0] = watchpoint.request_kva.load(Ordering::Acquire);
+    for i in 0..3 {
+        requests[i + 1] = watchpoint.user[i].request_kva.load(Ordering::Acquire);
     }
-    if req == 0 {
+    if requests == *armed_slots {
         return false;
     }
     use kvm_bindings::{KVM_GUESTDBG_ENABLE, KVM_GUESTDBG_USE_HW_BP, kvm_guest_debug};
@@ -671,35 +748,54 @@ pub(crate) fn self_arm_watchpoint(
         pad: 0,
         arch: kvm_bindings::kvm_guest_debug_arch::default(),
     };
-    debug_struct.arch.debugreg[0] = req;
-    // DR7 layout (Intel SDM Vol. 3B 17.2.4) — pinned against QEMU's
-    // `update_dr7_value` (target/i386/kvm/kvm.c) and the
-    // `dr7_slot0_write_4byte_encoding` test in `exit_dispatch.rs`:
-    //   bit 1     = G0      → globally enable DR0 across task switches
-    //   bit 9     = GE      → global exact-match, required for data BPs
-    //   bit 10    = MBS     → reserved, must be set to 1
-    //   bits 16-17 = R/W0   = 0b01 → trap on data writes only
-    //   bits 18-19 = LEN0   = 0b11 → 4-byte length
-    // Combined: 0x000D_0602. The GE bit (0x200) is required for data
-    // breakpoints — without it the SDM only guarantees instruction
-    // breakpoints fire reliably, and KVM follows the SDM verbatim.
-    debug_struct.arch.debugreg[7] = 0x400 | 0x200 | 0x2 | (0x1 << 16) | (0xC << 16);
+    // DR7 base: GE (0x200) + MBS (0x400) + LE (0x100). Per-DR enable
+    // and R/W/LEN encodings get OR'd in for each requested slot.
+    let mut dr7: u64 = 0x400 | 0x200 | 0x100;
+    let mut any_armed = false;
+    for (i, kva) in requests.iter().enumerate() {
+        if *kva == 0 {
+            continue;
+        }
+        debug_struct.arch.debugreg[i] = *kva;
+        // Per-slot DR7 layout (Intel SDM Vol. 3B 17.2.4):
+        //   bit 2*i     = L<i>        → local enable across task switches
+        //   bit 2*i+1   = G<i>        → global enable
+        //   bits 16+4*i .. 17+4*i = R/W<i> = 0b01 (trap on data writes only)
+        //   bits 18+4*i .. 19+4*i = LEN<i> = 0b11 (4-byte length)
+        // 4-byte LEN matches the existing DR0 setup (the kernel writes
+        // `*scx_root->exit_kind` as a u32; user-arm targets are also
+        // u32 / u64-aligned scalars). Mismatched access widths still
+        // fire a watchpoint when ANY byte of the access overlaps the
+        // DR_LEN range, so 4-byte LEN catches u32 / u64 / pointer-width
+        // writes equally.
+        dr7 |= (0b11) << (2 * i); // L<i> + G<i>
+        dr7 |= (0b01) << (16 + 4 * i); // R/W<i> = data-write
+        dr7 |= (0b11) << (18 + 4 * i); // LEN<i> = 4-byte
+        any_armed = true;
+    }
+    if !any_armed {
+        // Every slot was cleared since last arm — disarm via
+        // KVM_SET_GUEST_DEBUG with cleared DR7. Without this a stale
+        // arm would keep firing indefinitely after the test
+        // completes.
+        debug_struct.arch.debugreg[7] = 0;
+    } else {
+        debug_struct.arch.debugreg[7] = dr7;
+    }
     match vcpu.set_guest_debug(&debug_struct) {
         Ok(()) => {
-            *armed = req;
+            *armed_slots = requests;
             *failures = 0;
             true
         }
         Err(e) => {
             // EINTR is transient (SIGRTMIN kick raced the ioctl).
             // Do NOT stamp `armed` and do NOT increment `failures`
-            // — the next iteration's call retries the same KVA.
-            // The kvm_ioctls::Error wrapper exposes the underlying
-            // errno via `errno()`.
+            // — the next iteration's call retries the same KVAs.
             if e.errno() == libc::EINTR {
                 tracing::debug!(
                     err = %e,
-                    kva = format_args!("{:#x}", req),
+                    requests = ?requests,
                     "self_arm_watchpoint: EINTR — will retry next iteration"
                 );
                 return false;
@@ -707,19 +803,19 @@ pub(crate) fn self_arm_watchpoint(
             *failures = failures.saturating_add(1);
             tracing::warn!(
                 err = %e,
-                kva = format_args!("{:#x}", req),
+                requests = ?requests,
                 failures = *failures,
                 "self_arm_watchpoint: KVM_SET_GUEST_DEBUG failed"
             );
             if *failures >= WATCHPOINT_MAX_NON_EINTR_FAILURES {
                 tracing::warn!(
-                    kva = format_args!("{:#x}", req),
+                    requests = ?requests,
                     failures = *failures,
                     "self_arm_watchpoint: hit retry cap, suppressing further \
                      attempts; falling back to BPF .bss poll for failure-dump \
                      trigger"
                 );
-                *armed = req;
+                *armed_slots = requests;
             }
             false
         }
@@ -733,8 +829,8 @@ pub(crate) fn self_arm_watchpoint(
 #[cfg(target_arch = "aarch64")]
 pub(crate) fn self_arm_watchpoint(
     _vcpu: &mut kvm_ioctls::VcpuFd,
-    _request: &AtomicU64,
-    _armed: &mut u64,
+    _watchpoint: &WatchpointArm,
+    _armed_slots: &mut [u64; 4],
     _failures: &mut u8,
 ) -> bool {
     false

@@ -210,7 +210,8 @@ phasing happens *within* each `phased_worker` worker's loop, while
 `HoldSpec::FULL`. To express phasing across cgroups (e.g. add
 `phased_worker` only for the second half of the run), use
 `execute_steps` with multiple `Step` entries -- see
-[Ops and Steps](concepts/ops.md).
+[Ops and Steps](concepts/ops.md). Step 8 below adds an `Op::snapshot`
+capture into a step's op list.
 
 ## Step 5: Tune execution
 
@@ -394,7 +395,38 @@ stats line emitted by [`test_support::eval::evaluate_vm_result`].
 For the full run lifecycle, sidecar layout, and analysis workflow,
 see [Running Tests](running-tests.md).
 
-## Step 8: Gauntlet expansion
+## Step 8: Capture a snapshot
+
+Threshold-based assertions tell you something is off; snapshots tell
+you *what* the scheduler's state actually was. `Op::snapshot(name)`
+asks the host to freeze every vCPU long enough to read the BPF map
+state, vCPU registers, and per-CPU counters into a
+`FailureDumpReport` keyed by `name`, then resumes the guest.
+
+Drop a snapshot into the step's `ops` list, then walk the captured
+report by name with `Snapshot::var(...)`:
+
+```rust,ignore
+use ktstr::prelude::*;
+
+// Inside a Step's ops:
+ops: vec![Op::snapshot("after_workload")],
+```
+
+After the scenario completes, the captured report is keyed by name
+on the active `SnapshotBridge`; downstream test code drains it and
+walks scalar variables with the dotted-path accessor — e.g.
+`snap.var("nr_cpus_onln").as_u64()?` reads a scheduler `.bss`
+global as a `u64`.
+
+For the bridge wiring, the full traversal API
+(`Snapshot::map`, `SnapshotEntry::get`, per-CPU narrowing,
+error variants), and the symbol-driven
+[`Op::watch_snapshot`](writing-tests/watch-snapshots.md) variant
+that fires whenever the guest writes a kernel symbol, see
+[Snapshots](writing-tests/snapshots.md).
+
+## Step 9: Gauntlet expansion
 
 The `#[ktstr_test]` macro doesn't just emit a single test -- it
 also generates a **gauntlet** of variants that run the same body
@@ -460,6 +492,14 @@ cargo ktstr test --kernel ../linux -- -E 'test(mixed_workloads)'
   Rust logic between phases.
 - [Ops and Steps](concepts/ops.md) -- multi-phase scenarios:
   add/remove cgroups, swap cpusets, freeze, resume.
+- [Snapshots](writing-tests/snapshots.md) -- on-demand
+  `Op::snapshot("name")` mid-scenario captures of guest BPF map
+  state plus the typed `Snapshot` accessor for walking BTF-rendered
+  values along dotted paths with structured per-field errors.
+- [Watch Snapshots](writing-tests/watch-snapshots.md) --
+  `Op::watch_snapshot("symbol")` registers a hardware data-write
+  watchpoint (up to 3 per scenario; DR0 is reserved for the
+  error-class exit_kind trigger).
 - [MemPolicy](concepts/mem-policy.md) -- NUMA-aware tests that bind
   memory allocations to specific nodes and check page locality.
 - [Performance Mode](concepts/performance-mode.md) -- pinned vCPUs,

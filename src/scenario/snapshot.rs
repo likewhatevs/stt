@@ -495,15 +495,24 @@ impl SnapshotBridge {
             );
             return false;
         };
+        self.store(name, report);
+        true
+    }
+
+    /// Store a pre-built [`FailureDumpReport`] under `name`,
+    /// bypassing the capture callback. Used by the host-side freeze
+    /// coordinator after it runs `freeze_and_capture(false)` and
+    /// wants to publish the resulting report on the bridge for the
+    /// test author to drain post-VM-exit.
+    pub fn store(&self, name: &str, report: FailureDumpReport) {
         let mut map = self.snapshots.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(existing) = map.insert(name.to_string(), report) {
             tracing::warn!(
                 name,
                 schema = %existing.schema,
-                "SnapshotBridge::capture: name already had a stored report; overwriting prior capture"
+                "SnapshotBridge::store: name already had a stored report; overwriting prior capture"
             );
         }
-        true
     }
 
     /// Snapshot count for diagnostic logging.

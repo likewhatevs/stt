@@ -151,6 +151,190 @@ pub fn doorbell_fire(request_id: u32) {
     }
 }
 
+/// Outcome of a guest-driven snapshot request: ok, error with reason,
+/// or transport failure (timeout / SHM unavailable / not in guest).
+#[derive(Debug)]
+pub enum SnapshotRequestResult {
+    /// Host completed the request. For
+    /// [`SHM_SNAPSHOT_KIND_CAPTURE`] this means the report was stored
+    /// on the bridge under the supplied tag; for
+    /// [`SHM_SNAPSHOT_KIND_WATCH`] this means the hardware watchpoint
+    /// was armed.
+    Ok,
+    /// Host accepted the request but completed it as a failure. The
+    /// reason carries the host-supplied diagnostic text (truncated to
+    /// [`SHM_SNAPSHOT_TAG_MAX`] bytes).
+    HostError { reason: String },
+    /// Transport failed (no SHM, called from host context, doorbell
+    /// not reachable, host did not reply within `timeout`). The
+    /// supplied diagnostic names the underlying cause.
+    TransportError { reason: String },
+}
+
+/// Monotonic guest-side request id counter. Bumped by every call to
+/// [`snapshot_request`] before publishing the request slot.
+/// `AtomicU32` so concurrent requests from different guest threads do
+/// not produce duplicate ids. Wraparound past `u32::MAX` is
+/// theoretically possible after billions of requests; the host's
+/// reply-id pairing tolerates it because the comparison is equality
+/// against the issuer's most-recent value, not a monotonicity check.
+static SNAPSHOT_REQUEST_COUNTER: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(1);
+
+/// Mutex serialising guest-side snapshot requests. Without this two
+/// guest threads issuing `Op::Snapshot` concurrently could
+/// interleave their tag writes into the single SHM tag slot and
+/// observe each other's reply ids. The freeze coordinator's
+/// `on_demand_in_flight` latch already collapses doorbell floods to
+/// one capture per thaw on the host side; this lock keeps the
+/// guest-side request slot consistent.
+static SNAPSHOT_REQUEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Guest-only. Publish a snapshot request through the SHM control
+/// slot, fire the doorbell, and block until the host stamps a
+/// matching `snapshot_reply_id` (or `timeout` elapses).
+///
+/// `kind` selects the dispatch path on the host:
+/// [`SHM_SNAPSHOT_KIND_CAPTURE`] for a capture-now request,
+/// [`SHM_SNAPSHOT_KIND_WATCH`] for a hardware-watchpoint registration.
+///
+/// `tag` is copied into the SHM tag buffer up to
+/// [`SHM_SNAPSHOT_TAG_MAX`] bytes. Tags exceeding the bound are
+/// truncated; the host still treats the byte sequence as the request
+/// payload (the truncation is observable to the bridge as a shorter
+/// stored key for capture, or as a possibly-unresolvable symbol path
+/// for watch).
+///
+/// Returns one of [`SnapshotRequestResult`] variants. The serialised
+/// guest lock ensures only one in-flight request per process — this
+/// matches the host coordinator's `on_demand_in_flight` invariant.
+pub fn snapshot_request(
+    kind: u32,
+    tag: &str,
+    timeout: std::time::Duration,
+) -> SnapshotRequestResult {
+    if !is_guest() {
+        return SnapshotRequestResult::TransportError {
+            reason: "snapshot_request called from host context (no SHM mapped, no doorbell GPA)"
+                .into(),
+        };
+    }
+    let Ok((ptr, size)) = shm_ptr() else {
+        return SnapshotRequestResult::TransportError {
+            reason: "SHM region not initialised yet on this guest".into(),
+        };
+    };
+    if size
+        < SNAPSHOT_REASON_OFFSET
+            .checked_add(SHM_SNAPSHOT_TAG_MAX)
+            .unwrap_or(usize::MAX)
+    {
+        return SnapshotRequestResult::TransportError {
+            reason: format!(
+                "SHM region size {size} too small for snapshot reason buffer at offset \
+                 {SNAPSHOT_REASON_OFFSET}+{SHM_SNAPSHOT_TAG_MAX}"
+            ),
+        };
+    }
+    let _guard = SNAPSHOT_REQUEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    // Allocate a request id. Skip 0 so the wait loop's `reply_id ==
+    // request_id` check cannot match the freshly-zeroed reply slot
+    // before the host has actually replied (the host writes the
+    // request_id back; the slot starts at 0 in `ShmRingHeader::new`).
+    let mut request_id = SNAPSHOT_REQUEST_COUNTER.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    if request_id == 0 {
+        request_id = SNAPSHOT_REQUEST_COUNTER.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+    let tag_bytes = tag.as_bytes();
+    let tag_len = tag_bytes.len().min(SHM_SNAPSHOT_TAG_MAX);
+    // SAFETY: `ptr` points to a `size`-byte mapping; the offsets
+    // checked above are all <= size. Volatile writes serialise
+    // against the host's volatile reads. We deliberately sequence
+    // the writes so the host never observes a partial request:
+    //   1. clear reply slot (so the wait loop cannot trip on a
+    //      stale reply id);
+    //   2. write tag bytes + trailing zeros to fill the buffer;
+    //   3. write kind;
+    //   4. write request_id last (the host's doorbell read keys
+    //      off the request_id; observing a non-zero request_id
+    //      with a stale tag/kind would dispatch the wrong handler).
+    unsafe {
+        // Clear reply id + status first.
+        ptr::write_volatile(ptr.add(SNAPSHOT_REPLY_ID_OFFSET) as *mut u32, 0);
+        ptr::write_volatile(ptr.add(SNAPSHOT_STATUS_OFFSET) as *mut u32, 0);
+        // Clear the reason buffer so a stale reason from a previous
+        // request cannot leak into a successful path's diagnostic.
+        for i in 0..SHM_SNAPSHOT_TAG_MAX {
+            ptr::write_volatile(ptr.add(SNAPSHOT_REASON_OFFSET + i), 0);
+        }
+        // Tag: write supplied bytes then zero-pad the rest of the
+        // buffer (NUL-terminator + leftover bytes from a previous
+        // longer tag).
+        for (i, b) in tag_bytes.iter().take(tag_len).enumerate() {
+            ptr::write_volatile(ptr.add(SNAPSHOT_TAG_OFFSET + i), *b);
+        }
+        for i in tag_len..SHM_SNAPSHOT_TAG_MAX {
+            ptr::write_volatile(ptr.add(SNAPSHOT_TAG_OFFSET + i), 0);
+        }
+        ptr::write_volatile(ptr.add(SNAPSHOT_KIND_OFFSET) as *mut u32, kind);
+        // Release fence so the request_id store cannot be reordered
+        // ahead of the tag/kind writes — the host's doorbell handler
+        // reads request_id first, then tag/kind, so the publishing
+        // order matters.
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+        ptr::write_volatile(ptr.add(SNAPSHOT_REQUEST_ID_OFFSET) as *mut u32, request_id);
+    }
+    doorbell_fire(request_id);
+    // Wait for reply.
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        // SAFETY: ptr + offset is in-bounds per the size check above.
+        let reply_id =
+            unsafe { ptr::read_volatile(ptr.add(SNAPSHOT_REPLY_ID_OFFSET) as *const u32) };
+        if reply_id == request_id {
+            std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+            let status =
+                unsafe { ptr::read_volatile(ptr.add(SNAPSHOT_STATUS_OFFSET) as *const u32) };
+            return match status {
+                SHM_SNAPSHOT_STATUS_OK => SnapshotRequestResult::Ok,
+                SHM_SNAPSHOT_STATUS_ERR => {
+                    let mut reason_bytes = [0u8; SHM_SNAPSHOT_TAG_MAX];
+                    for i in 0..SHM_SNAPSHOT_TAG_MAX {
+                        // SAFETY: in-bounds per size check.
+                        reason_bytes[i] =
+                            unsafe { ptr::read_volatile(ptr.add(SNAPSHOT_REASON_OFFSET + i)) };
+                    }
+                    let len = reason_bytes
+                        .iter()
+                        .position(|&b| b == 0)
+                        .unwrap_or(SHM_SNAPSHOT_TAG_MAX);
+                    let reason = String::from_utf8_lossy(&reason_bytes[..len]).to_string();
+                    SnapshotRequestResult::HostError { reason }
+                }
+                other => SnapshotRequestResult::TransportError {
+                    reason: format!(
+                        "host reply with unknown status {other} (expected OK={SHM_SNAPSHOT_STATUS_OK} \
+                         or ERR={SHM_SNAPSHOT_STATUS_ERR})"
+                    ),
+                },
+            };
+        }
+        // Short sleep keeps the busy-wait off the host vCPU thread
+        // budget. The host signals reply within rendezvous + dump
+        // budget (capped at watchdog/2 by the freeze coordinator),
+        // so 5 ms cadence never adds material latency.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    SnapshotRequestResult::TransportError {
+        reason: format!(
+            "host did not stamp matching reply id within {timeout:?} \
+             (request_id={request_id}, kind={kind})"
+        ),
+    }
+}
+
 /// Magic value identifying a valid SHM ring header.
 pub const SHM_RING_MAGIC: u32 = 0x5354_4d52; // "STMR"
 
@@ -591,14 +775,44 @@ pub(crate) fn parse_shm_params_from_str(cmdline: &str) -> Option<(u64, u64)> {
     Some((base, size))
 }
 
+/// Maximum length, in bytes, of a guest-supplied snapshot tag (name or
+/// symbol path) carried through the SHM snapshot request slot. The
+/// guest writes a UTF-8 tag, NUL-terminates if shorter than this
+/// bound, and truncates to this size if longer (the host treats the
+/// first NUL as the boundary, or stops at this size if no NUL is
+/// present).
+pub const SHM_SNAPSHOT_TAG_MAX: usize = 64;
+
+/// Snapshot request kind: one of [`SHM_SNAPSHOT_KIND_NONE`],
+/// [`SHM_SNAPSHOT_KIND_CAPTURE`], or [`SHM_SNAPSHOT_KIND_WATCH`].
+/// Written by the guest into [`ShmRingHeader::snapshot_kind`] before
+/// firing the doorbell so the host can dispatch the right handler.
+pub const SHM_SNAPSHOT_KIND_NONE: u32 = 0;
+/// Capture-now request: host runs `freeze_and_capture(false)`,
+/// stores the report on the bridge keyed by the snapshot tag, and
+/// signals reply.
+pub const SHM_SNAPSHOT_KIND_CAPTURE: u32 = 1;
+/// Hardware-watchpoint registration request: host resolves the
+/// symbol path through BTF + kallsyms, allocates a free DR slot
+/// (DR1..=DR3), arms the watchpoint, and signals reply. A future
+/// guest write to the resolved KVA fires KVM_EXIT_DEBUG and runs a
+/// synchronous capture tagged by the symbol path.
+pub const SHM_SNAPSHOT_KIND_WATCH: u32 = 2;
+
+/// Reply status: success — the host completed the requested action
+/// (capture stored, or watchpoint armed).
+pub const SHM_SNAPSHOT_STATUS_OK: u32 = 1;
+/// Reply status: failure — the host rejected or could not complete
+/// the request. The reason is delivered via the snapshot reason slot
+/// (UTF-8, NUL-terminated, max [`SHM_SNAPSHOT_TAG_MAX`] bytes).
+pub const SHM_SNAPSHOT_STATUS_ERR: u32 = 2;
+
 /// Ring buffer header at the start of the SHM region.
 ///
 /// write_ptr and read_ptr are monotonically increasing byte offsets into
 /// the data area. Actual position = ptr % capacity.
 #[repr(C)]
-#[derive(
-    Clone, Copy, Default, FromBytes, IntoBytes, zerocopy::Immutable, zerocopy::KnownLayout,
-)]
+#[derive(Clone, Copy, FromBytes, IntoBytes, zerocopy::Immutable, zerocopy::KnownLayout)]
 pub struct ShmRingHeader {
     pub magic: u32,
     pub version: u32,
@@ -636,9 +850,78 @@ pub struct ShmRingHeader {
     /// observable bytes for paths that should never fire in practice,
     /// so the single counter is the right tradeoff.
     pub drops: u64,
+    /// Snapshot request id — monotonic counter the guest bumps before
+    /// each doorbell write. The host stamps the same value into
+    /// `snapshot_reply_id` after completing the request so the guest
+    /// can pair its wait against the original request without a
+    /// dedicated wait queue.
+    pub snapshot_request_id: u32,
+    /// Request kind. One of [`SHM_SNAPSHOT_KIND_NONE`],
+    /// [`SHM_SNAPSHOT_KIND_CAPTURE`], [`SHM_SNAPSHOT_KIND_WATCH`].
+    /// Read by the host's freeze coordinator on each doorbell event.
+    pub snapshot_kind: u32,
+    /// Snapshot reply id — host writes the matching `snapshot_request_id`
+    /// here after the request completes. Guest polls this slot and
+    /// breaks out of its wait when the value equals the id it sent.
+    pub snapshot_reply_id: u32,
+    /// Reply status. One of [`SHM_SNAPSHOT_STATUS_OK`] /
+    /// [`SHM_SNAPSHOT_STATUS_ERR`]. Valid only after
+    /// `snapshot_reply_id == snapshot_request_id`.
+    pub snapshot_status: u32,
+    /// Snapshot tag — UTF-8, NUL-terminated when shorter than the
+    /// fixed buffer; truncated to `SHM_SNAPSHOT_TAG_MAX` bytes when
+    /// longer. For [`SHM_SNAPSHOT_KIND_CAPTURE`] the tag is the
+    /// snapshot name (key the bridge stores the report under); for
+    /// [`SHM_SNAPSHOT_KIND_WATCH`] the tag is the symbol path the
+    /// host resolves through BTF + kallsyms.
+    pub snapshot_tag: [u8; SHM_SNAPSHOT_TAG_MAX],
+    /// Reply reason buffer — when `snapshot_status ==
+    /// SHM_SNAPSHOT_STATUS_ERR`, the host writes a UTF-8 reason here
+    /// (NUL-terminated when shorter, truncated to
+    /// [`SHM_SNAPSHOT_TAG_MAX`] when longer). The guest renders this
+    /// as the bail-out message in the `Op::Snapshot` /
+    /// `Op::WatchSnapshot` dispatcher.
+    pub snapshot_reason: [u8; SHM_SNAPSHOT_TAG_MAX],
 }
 
-const _HEADER_SIZE: () = assert!(std::mem::size_of::<ShmRingHeader>() == 40);
+const _HEADER_SIZE: () =
+    assert!(std::mem::size_of::<ShmRingHeader>() == 40 + 16 + SHM_SNAPSHOT_TAG_MAX * 2);
+
+/// Byte offset within the SHM region of `snapshot_request_id`.
+pub const SNAPSHOT_REQUEST_ID_OFFSET: usize = 40;
+/// Byte offset within the SHM region of `snapshot_kind`.
+pub const SNAPSHOT_KIND_OFFSET: usize = 44;
+/// Byte offset within the SHM region of `snapshot_reply_id`.
+pub const SNAPSHOT_REPLY_ID_OFFSET: usize = 48;
+/// Byte offset within the SHM region of `snapshot_status`.
+pub const SNAPSHOT_STATUS_OFFSET: usize = 52;
+/// Byte offset within the SHM region of `snapshot_tag`.
+pub const SNAPSHOT_TAG_OFFSET: usize = 56;
+/// Byte offset within the SHM region of `snapshot_reason`.
+pub const SNAPSHOT_REASON_OFFSET: usize = SNAPSHOT_TAG_OFFSET + SHM_SNAPSHOT_TAG_MAX;
+
+impl Default for ShmRingHeader {
+    /// Manual `Default` because `[u8; 64]` does not auto-derive
+    /// `Default` for arrays larger than 32 elements on stable Rust.
+    /// Pinned: every numeric field zeroes; both byte buffers zero-fill.
+    fn default() -> Self {
+        Self {
+            magic: 0,
+            version: 0,
+            capacity: 0,
+            control_bytes: 0,
+            write_ptr: 0,
+            read_ptr: 0,
+            drops: 0,
+            snapshot_request_id: 0,
+            snapshot_kind: SHM_SNAPSHOT_KIND_NONE,
+            snapshot_reply_id: 0,
+            snapshot_status: 0,
+            snapshot_tag: [0; SHM_SNAPSHOT_TAG_MAX],
+            snapshot_reason: [0; SHM_SNAPSHOT_TAG_MAX],
+        }
+    }
+}
 
 impl ShmRingHeader {
     /// Build a fresh ring header for an SHM region of `shm_size` bytes.
@@ -663,6 +946,12 @@ impl ShmRingHeader {
             write_ptr: 0,
             read_ptr: 0,
             drops: 0,
+            snapshot_request_id: 0,
+            snapshot_kind: SHM_SNAPSHOT_KIND_NONE,
+            snapshot_reply_id: 0,
+            snapshot_status: 0,
+            snapshot_tag: [0; SHM_SNAPSHOT_TAG_MAX],
+            snapshot_reason: [0; SHM_SNAPSHOT_TAG_MAX],
         }
     }
 }
@@ -1318,8 +1607,36 @@ mod tests {
     // Compile-time size assertions (also present above, but explicit tests
     // for visibility in test output).
     #[test]
-    fn header_size_is_40() {
-        assert_eq!(std::mem::size_of::<ShmRingHeader>(), 40);
+    fn header_size_matches_field_offsets() {
+        // Pre-snapshot fields: 40 bytes (magic, version, capacity,
+        // control_bytes, write_ptr, read_ptr, drops). Snapshot
+        // request slot adds: request_id+kind+reply_id+status (4×u32
+        // = 16) + tag + reason (2 × SHM_SNAPSHOT_TAG_MAX bytes).
+        let expected = 40 + 16 + SHM_SNAPSHOT_TAG_MAX * 2;
+        assert_eq!(std::mem::size_of::<ShmRingHeader>(), expected);
+        assert_eq!(HEADER_SIZE, expected);
+    }
+
+    #[test]
+    fn snapshot_offsets_within_header_and_distinct() {
+        // The request slot fields must occupy distinct, contiguous,
+        // in-bounds byte ranges. A regression that shifted any of
+        // them would alias with the legacy ring fields (capacity at
+        // 8, write_ptr at 16, read_ptr at 24, drops at 32) or with
+        // each other, silently corrupting both halves.
+        assert!(SNAPSHOT_REQUEST_ID_OFFSET >= 40);
+        assert_eq!(SNAPSHOT_KIND_OFFSET, SNAPSHOT_REQUEST_ID_OFFSET + 4);
+        assert_eq!(SNAPSHOT_REPLY_ID_OFFSET, SNAPSHOT_KIND_OFFSET + 4);
+        assert_eq!(SNAPSHOT_STATUS_OFFSET, SNAPSHOT_REPLY_ID_OFFSET + 4);
+        assert_eq!(SNAPSHOT_TAG_OFFSET, SNAPSHOT_STATUS_OFFSET + 4);
+        assert_eq!(
+            SNAPSHOT_REASON_OFFSET,
+            SNAPSHOT_TAG_OFFSET + SHM_SNAPSHOT_TAG_MAX
+        );
+        assert_eq!(
+            SNAPSHOT_REASON_OFFSET + SHM_SNAPSHOT_TAG_MAX,
+            std::mem::size_of::<ShmRingHeader>()
+        );
     }
 
     #[test]
@@ -1843,6 +2160,7 @@ mod tests {
             write_ptr: 0x1122_3344_5566_7788,
             read_ptr: 0xAABB_CCDD_EEFF_0011,
             drops: 42,
+            ..ShmRingHeader::default()
         };
         buf[..HEADER_SIZE].copy_from_slice(hdr.as_bytes());
 

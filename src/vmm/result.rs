@@ -205,6 +205,25 @@ pub struct VmResult {
     /// driver re-bind (writing `STATUS=0`) does NOT zero them.
     #[allow(dead_code)]
     pub virtio_net_counters: Option<Arc<VirtioNetCounters>>,
+    /// Snapshot bridge populated by the freeze coordinator over the
+    /// run's lifetime. Every `Op::Snapshot` and `Op::WatchSnapshot`
+    /// fire stores a `FailureDumpReport` keyed by its tag. Test
+    /// code calls [`crate::scenario::snapshot::SnapshotBridge::drain`]
+    /// to take ownership of the stored reports and walks them via
+    /// [`crate::scenario::snapshot::Snapshot::new`].
+    ///
+    /// Always present after a successful `run_vm`; `None`-equivalent
+    /// (empty) when the VM crashed before any snapshot fired.
+    ///
+    /// `#[allow(dead_code)]` mirrors `stimulus_events` /
+    /// `virtio_blk_counters`: the field is part of the public API
+    /// surface and read by user test code outside `lib.rs`, but the
+    /// lib build doesn't see any in-tree readers because no lib
+    /// code path calls `.snapshot_bridge` on a `VmResult`. The
+    /// in-tree readers live in integration tests (e.g.
+    /// `tests/snapshot_real_capture_e2e.rs`).
+    #[allow(dead_code)]
+    pub snapshot_bridge: crate::scenario::snapshot::SnapshotBridge,
 }
 
 impl VmResult {
@@ -246,8 +265,22 @@ impl VmResult {
             cleanup_duration: None,
             virtio_blk_counters: None,
             virtio_net_counters: None,
+            snapshot_bridge: empty_snapshot_bridge_for_tests(),
         }
     }
+}
+
+/// Build an empty `SnapshotBridge` whose capture callback always
+/// returns `None`. Used by `VmResult::test_fixture` and the legacy
+/// `VmResult` literal constructions in unit tests so they still
+/// compile after the snapshot_bridge field landed. Production
+/// `run_vm` constructs its own bridge whose callback is
+/// intentionally unused — the freeze coordinator stores reports
+/// directly via `bridge.store(name, report)`.
+#[cfg(test)]
+pub(crate) fn empty_snapshot_bridge_for_tests() -> crate::scenario::snapshot::SnapshotBridge {
+    let cb: crate::scenario::snapshot::CaptureCallback = std::sync::Arc::new(|_| None);
+    crate::scenario::snapshot::SnapshotBridge::new(cb)
 }
 
 /// Per-vCPU KVM stats read after VM exit. Each map holds cumulative
@@ -363,14 +396,18 @@ pub(crate) struct VmRunState {
     /// `None` only for VMs whose construction predates the
     /// doorbell wiring; in current code every successful
     /// `KtstrVm::run_vm` populates it.
-    ///
-    /// In-tree readers go through the SnapshotBridge wiring path
-    /// added by a follow-up; the lib build sees no current
-    /// readers because the bridge's host-side `CaptureCallback`
-    /// installation has not landed yet — keep `dead_code` quiet
-    /// until then.
     #[allow(dead_code)]
     pub(crate) doorbell_evt: Option<vmm_sys_util::eventfd::EventFd>,
+    /// Snapshot bridge owning every report captured during the run.
+    /// The freeze coordinator clones this bridge into its closure
+    /// state; on every `Op::Snapshot`-driven doorbell event it
+    /// runs `freeze_and_capture(false)` and stores the resulting
+    /// `FailureDumpReport` here keyed by the snapshot name. After
+    /// VM exit, [`super::KtstrVm::collect_results`] forwards the
+    /// bridge onto [`VmResult::snapshot_bridge`] so the test code
+    /// can drain captured snapshots and walk them via the
+    /// [`crate::scenario::snapshot::Snapshot`] accessor surface.
+    pub(crate) snapshot_bridge: crate::scenario::snapshot::SnapshotBridge,
 }
 #[cfg(test)]
 mod tests {
@@ -395,6 +432,7 @@ mod tests {
             cleanup_duration: Some(Duration::from_millis(50)),
             virtio_blk_counters: None,
             virtio_net_counters: None,
+            snapshot_bridge: empty_snapshot_bridge_for_tests(),
         };
         assert!(r.success);
         assert_eq!(r.exit_code, 0);
@@ -427,6 +465,7 @@ mod tests {
             cleanup_duration: None,
             virtio_blk_counters: Some(Arc::new(VirtioBlkCounters::default())),
             virtio_net_counters: None,
+            snapshot_bridge: empty_snapshot_bridge_for_tests(),
         };
         assert!(!r2.success);
         assert_eq!(r2.exit_code, 1);
@@ -470,6 +509,7 @@ mod tests {
             cleanup_duration: None,
             virtio_blk_counters: None,
             virtio_net_counters: None,
+            snapshot_bridge: empty_snapshot_bridge_for_tests(),
         };
         assert!(r.monitor.is_none());
         // Output and exit_code must still be accessible.
@@ -510,6 +550,7 @@ mod tests {
             cleanup_duration: None,
             virtio_blk_counters: None,
             virtio_net_counters: None,
+            snapshot_bridge: empty_snapshot_bridge_for_tests(),
         };
         let mon = r.monitor.as_ref().unwrap();
         assert_eq!(mon.summary.total_samples, 5);

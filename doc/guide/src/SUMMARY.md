@@ -30,6 +30,8 @@
   - [Custom Scenarios](writing-tests/custom-scenarios.md)
   - [Scheduler Definitions](writing-tests/scheduler-definitions.md)
   - [Gauntlet Tests](writing-tests/gauntlet-tests.md)
+  - [Snapshots](writing-tests/snapshots.md)
+  - [Watch Snapshots](writing-tests/watch-snapshots.md)
 
 # Recipes
 

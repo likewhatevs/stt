@@ -463,6 +463,36 @@ impl GuestMem {
         self.write_scalar::<8>(pa, offset, val.to_ne_bytes());
     }
 
+    /// Write `data` into DRAM starting at offset `pa`. Bounds-clipped
+    /// the same way as [`Self::read_bytes`]: writes that would
+    /// extend past the end of the resolved region are truncated.
+    /// Used by the freeze coordinator's snapshot doorbell handler
+    /// to stamp the reply reason buffer (UTF-8 NUL-terminated) into
+    /// the guest's SHM tag area when a CAPTURE / WATCH request
+    /// fails. Returns the number of bytes actually written.
+    pub fn write_bytes(&self, pa: u64, data: &[u8]) -> usize {
+        let len = data.len() as u64;
+        if pa >= self.size {
+            return 0;
+        }
+        let avail = (self.size - pa).min(len) as usize;
+        match self.resolve_ptr(pa) {
+            Some((ptr, region_avail)) => {
+                let copy_len = avail.min(region_avail as usize);
+                // SAFETY: `copy_len <= region_avail`, so the write stays
+                // within the mmap that `ptr` points into. The mapping
+                // is shared MAP_SHARED with the guest; writes are
+                // observable through `ptr::read_volatile` on the
+                // guest side.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(data.as_ptr(), ptr as *mut u8, copy_len);
+                }
+                copy_len
+            }
+            None => 0,
+        }
+    }
+
     /// Read `len` bytes from DRAM offset `pa` into `buf`.
     /// Returns the number of bytes actually read (may be less than `len`
     /// if the read would go past the end of guest memory or the end of
@@ -489,8 +519,10 @@ impl GuestMem {
         }
     }
 
-    /// Test helper — write a u32 at DRAM offset `pa + offset`.
-    #[cfg(test)]
+    /// Write a u32 at DRAM offset `pa + offset`. Used by the freeze
+    /// coordinator's snapshot doorbell handler to stamp the reply id
+    /// and status fields back into the guest's SHM region after a
+    /// CAPTURE / WATCH request completes.
     pub fn write_u32(&self, pa: u64, offset: usize, val: u32) {
         self.write_scalar::<4>(pa, offset, val.to_ne_bytes());
     }

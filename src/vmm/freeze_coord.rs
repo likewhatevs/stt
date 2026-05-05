@@ -53,6 +53,166 @@ use super::DRAM_BASE;
 /// `immediate_exit` kick failed to interrupt.
 const FREEZE_RENDEZVOUS_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Decoded contents of the SHM snapshot request slot. Read by the
+/// freeze coordinator's doorbell handler each time the doorbell
+/// eventfd fires; identifies which dispatch path (CAPTURE / WATCH /
+/// unknown) the guest requested and carries the correlated
+/// `request_id` the host stamps back into `snapshot_reply_id`.
+struct SnapshotRequest {
+    request_id: u32,
+    kind: u32,
+    tag: String,
+}
+
+/// Read the snapshot request slot from the guest's SHM region.
+/// Returns `Some(SnapshotRequest)` when a populated request is
+/// present (`request_id != 0`); `None` when the SHM region is not
+/// configured, the request_id is zero, or the kind is NONE — that
+/// last case being the "host-side trigger fired the doorbell
+/// without a guest request" path.
+fn read_snapshot_request(
+    mem: Option<&monitor::reader::GuestMem>,
+    shm_base: Option<u64>,
+) -> Option<SnapshotRequest> {
+    let mem = mem?;
+    let shm_base = shm_base?;
+    let request_id = mem.read_u32(shm_base, shm_ring::SNAPSHOT_REQUEST_ID_OFFSET);
+    let kind = mem.read_u32(shm_base, shm_ring::SNAPSHOT_KIND_OFFSET);
+    if request_id == 0 || kind == shm_ring::SHM_SNAPSHOT_KIND_NONE {
+        return None;
+    }
+    let mut tag_bytes = [0u8; shm_ring::SHM_SNAPSHOT_TAG_MAX];
+    for (i, b) in tag_bytes.iter_mut().enumerate() {
+        *b = mem.read_u8(shm_base, shm_ring::SNAPSHOT_TAG_OFFSET + i);
+    }
+    let len = tag_bytes
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(shm_ring::SHM_SNAPSHOT_TAG_MAX);
+    let tag = String::from_utf8_lossy(&tag_bytes[..len]).to_string();
+    Some(SnapshotRequest {
+        request_id,
+        kind,
+        tag,
+    })
+}
+
+/// Stamp a reply into the SHM snapshot reply slot. Writes the reason
+/// buffer first (so the guest's Acquire load on `snapshot_reply_id`
+/// observes the reason atomically), then the status, then the
+/// reply_id last — mirroring the guest's publish ordering on the
+/// request side.
+fn write_snapshot_reply(
+    mem: Option<&monitor::reader::GuestMem>,
+    shm_base: Option<u64>,
+    request_id: u32,
+    status: u32,
+    reason: &str,
+) {
+    let Some(mem) = mem else {
+        return;
+    };
+    let Some(shm_base) = shm_base else {
+        return;
+    };
+    // Reason buffer: NUL-terminated UTF-8, truncated to the buffer
+    // size. Pad the trailing bytes with zeros so a stale reason
+    // from a prior request does not bleed through.
+    let reason_bytes = reason.as_bytes();
+    let len = reason_bytes.len().min(shm_ring::SHM_SNAPSHOT_TAG_MAX);
+    if len > 0 {
+        mem.write_bytes(
+            shm_base + shm_ring::SNAPSHOT_REASON_OFFSET as u64,
+            &reason_bytes[..len],
+        );
+    }
+    // Trailing zero pad (always at least one byte after the truncated
+    // text so `from_utf8_lossy` stops cleanly on the guest side).
+    let mut zero = [0u8; shm_ring::SHM_SNAPSHOT_TAG_MAX];
+    zero[..shm_ring::SHM_SNAPSHOT_TAG_MAX - len].copy_from_slice(
+        &[0u8; shm_ring::SHM_SNAPSHOT_TAG_MAX][..shm_ring::SHM_SNAPSHOT_TAG_MAX - len],
+    );
+    if len < shm_ring::SHM_SNAPSHOT_TAG_MAX {
+        mem.write_bytes(
+            shm_base + (shm_ring::SNAPSHOT_REASON_OFFSET + len) as u64,
+            &zero[..shm_ring::SHM_SNAPSHOT_TAG_MAX - len],
+        );
+    }
+    // Status, then reply_id last (publish order).
+    mem.write_u32(shm_base, shm_ring::SNAPSHOT_STATUS_OFFSET, status);
+    std::sync::atomic::fence(Ordering::Release);
+    mem.write_u32(shm_base, shm_ring::SNAPSHOT_REPLY_ID_OFFSET, request_id);
+}
+
+/// Resolve a kernel symbol by name from the vmlinux ELF and arm a
+/// user-watchpoint slot (DR1..=DR3) on it. Returns the slot index
+/// (0..=2 mapping to DR1..=DR3) on success, or a host-side
+/// diagnostic on failure.
+///
+/// The vCPU thread's `self_arm_watchpoint` notices the change on
+/// the next loop iteration (Acquire load on the slot's
+/// `request_kva`) and reprograms `KVM_SET_GUEST_DEBUG` with the
+/// new DR layout.
+fn arm_user_watchpoint(
+    watchpoint: &Arc<super::vcpu::WatchpointArm>,
+    kernel_path: &std::path::Path,
+    symbol: &str,
+) -> std::result::Result<usize, String> {
+    // Check cap and find a free slot.
+    let mut free_slot: Option<usize> = None;
+    for (i, slot) in watchpoint.user.iter().enumerate() {
+        if slot.request_kva.load(Ordering::Acquire) == 0 {
+            free_slot = Some(i);
+            break;
+        }
+    }
+    let Some(idx) = free_slot else {
+        return Err(format!(
+            "no free DR slot — DR1..=DR3 all occupied by prior \
+             Op::WatchSnapshot registrations (cap = {})",
+            watchpoint.user.len()
+        ));
+    };
+    // Resolve the symbol via vmlinux ELF parse.
+    let data = std::fs::read(kernel_path)
+        .map_err(|e| format!("read vmlinux at {}: {e}", kernel_path.display()))?;
+    let elf = goblin::elf::Elf::parse(&data).map_err(|e| format!("parse vmlinux ELF: {e}"))?;
+    let kva = elf
+        .syms
+        .iter()
+        .find(|s| s.st_value != 0 && elf.strtab.get_at(s.st_name) == Some(symbol))
+        .map(|s| s.st_value)
+        .ok_or_else(|| format!("symbol '{symbol}' not found in vmlinux symtab"))?;
+    if kva & 0x3 != 0 {
+        return Err(format!(
+            "symbol '{symbol}' KVA {kva:#x} is not 4-byte aligned \
+             (Intel SDM Vol. 3B Chapter 17 requires DR_LEN_4 \
+             alignment for hardware watchpoints)"
+        ));
+    }
+    // Publish tag first, then KVA last (the vCPU's Acquire load on
+    // request_kva synchronises-with this Release; the tag must be
+    // visible by the time the vCPU latches a hit on this slot).
+    {
+        let mut tag_guard = watchpoint.user[idx]
+            .tag
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *tag_guard = symbol.to_string();
+    }
+    watchpoint.user[idx]
+        .request_kva
+        .store(kva, Ordering::Release);
+    // Pre-emptively kick every vCPU out of KVM_RUN so it reaches
+    // self_arm_watchpoint promptly. The watchpoint's hit_evt is the
+    // cleanest available wake fd; a write here causes any vCPU
+    // currently inside the run loop to (best-effort) re-check the
+    // slot on its next iteration. There is no per-slot kick; the
+    // existing kick mechanism (immediate_exit + SIGRTMIN) is
+    // reserved for the freeze rendezvous.
+    Ok(idx)
+}
+
 /// Build a tagged sibling path for an on-demand snapshot dump. Given
 /// `failure_dump.json` and counter `0`, returns
 /// `failure_dump.on_demand_0.json`; with no extension, returns
@@ -65,6 +225,38 @@ fn on_demand_tagged_path(base: &std::path::Path, counter: u32) -> std::path::Pat
     let new_name = match ext {
         Some(ext) => format!("{stem}.on_demand_{counter}.{ext}"),
         None => format!("{stem}.on_demand_{counter}"),
+    };
+    tagged.set_file_name(new_name);
+    tagged
+}
+
+/// Build a name-tagged sibling path for a CAPTURE-class on-demand
+/// snapshot. Given `{base}/{stem}.failure-dump.json` and tag
+/// `mid_run`, returns `{base}/{stem}.snapshot.mid_run.json`. Used by
+/// the freeze coordinator's CAPTURE handler so the test's
+/// post-scenario reader can find the file by snapshot tag without
+/// guessing the on-demand counter.
+///
+/// The tag is sanitised: any byte that is not `[A-Za-z0-9._-]` is
+/// replaced with `_` to keep the resulting filename safe across
+/// filesystems regardless of what UTF-8 the guest passed.
+fn snapshot_tagged_path(base: &std::path::Path, tag: &str) -> std::path::PathBuf {
+    let mut tagged = base.to_path_buf();
+    let stem = base.file_stem().and_then(|s| s.to_str()).unwrap_or("dump");
+    let ext = base.extension().and_then(|e| e.to_str());
+    let safe_tag: String = tag
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let new_name = match ext {
+        Some(ext) => format!("{stem}.snapshot.{safe_tag}.{ext}"),
+        None => format!("{stem}.snapshot.{safe_tag}"),
     };
     tagged.set_file_name(new_name);
     tagged
@@ -201,6 +393,19 @@ impl KtstrVm {
         // service even when `freeze_state == Done` so post-failure
         // `Op::Snapshot` calls still work.
         let on_demand_in_flight = Arc::new(AtomicBool::new(false));
+
+        // Host-side snapshot bridge. Owned by the freeze coordinator
+        // and exposed back through `VmRunState` so test code can
+        // drain captured reports after the VM exits. The bridge's
+        // capture callback returns `None` — the coordinator never
+        // calls `bridge.capture()`; instead it runs
+        // `freeze_and_capture(false)` directly and stores the
+        // resulting report via `bridge.store(name, report)` so the
+        // host owns the entire capture pipeline.
+        let snapshot_bridge = {
+            let cb: crate::scenario::snapshot::CaptureCallback = Arc::new(|_| None);
+            crate::scenario::snapshot::SnapshotBridge::new(cb)
+        };
 
         // Probes-ready broadcast EventFd. Shared between the monitor
         // thread's slot-1 wait and the bpf-map-write thread's
@@ -718,6 +923,21 @@ impl KtstrVm {
                 }
             }
         };
+        // SHM base offset within `freeze_coord_mem`. The on-demand
+        // doorbell handler reads the snapshot request slot (request
+        // id, kind, tag) from this base + the snapshot offsets
+        // declared in `shm_ring`; failure dispatch (CAPTURE vs WATCH)
+        // and the reply write target the same slot. `0` when no
+        // SHM region is configured — the doorbell handler then
+        // skips request-driven dispatch and falls back to the
+        // legacy "any doorbell == capture-now without tag"
+        // semantics tagged with a placeholder name.
+        let freeze_coord_shm_base = if self.shm_size > 0 {
+            freeze_coord_mem.as_ref().map(|m| m.size() - self.shm_size)
+        } else {
+            None
+        };
+
         // Extract a fresh ImmediateExitHandle for the freeze coord —
         // the watchdog grabs another one below for its own kick path.
         // Both views address the same kvm_run.immediate_exit byte
@@ -768,6 +988,12 @@ impl KtstrVm {
         // calls `freeze_and_capture(false)` on every pending event.
         let freeze_coord_doorbell = doorbell_evt_for_coord;
         let freeze_coord_on_demand_in_flight = on_demand_in_flight.clone();
+        let freeze_coord_snapshot_bridge = snapshot_bridge.clone();
+        // Path to the kernel ELF so the coordinator can resolve
+        // user-supplied symbols (Op::WatchSnapshot) by name through
+        // a fresh ELF parse on each registration. Cheap; the kernel
+        // image is on disk, the host page cache covers re-reads.
+        let freeze_coord_kernel_path = self.kernel.clone();
         // Wake-fd handles for the coord epoll loop. `kill_evt` and
         // `bsp_done_evt` are written by every thread that flips the
         // matching AtomicBool (vCPU shutdown classifier, BSP panic
@@ -2683,145 +2909,334 @@ impl KtstrVm {
                     // against itself via `on_demand_in_flight`: a
                     // pending capture short-circuits a doorbell write
                     // that arrives mid-rendezvous, so doorbell floods
-                    // (multiple `Op::Snapshot` calls in quick
-                    // succession) collapse to one capture per thaw.
+                    // collapse to one capture per thaw.
                     //
-                    // Tags: each on-demand emission writes to a
-                    // sibling path of `freeze_coord_dump_path` with
-                    // `.on_demand_{counter}.json` interposed before
-                    // the existing extension. The counter survives
-                    // for the run so a scenario with three on-demand
-                    // snapshots produces three distinct files; the
-                    // error-class trigger keeps the unmodified base
-                    // path. Kept as a closure so the post-thaw COM2
-                    // grace window and the existing emit_json path
-                    // are not touched.
+                    // Reads the snapshot request slot from SHM (kind,
+                    // tag, request_id) and dispatches CAPTURE vs
+                    // WATCH. CAPTURE runs `freeze_and_capture(false)`
+                    // and stores the report on the bridge under the
+                    // tag. WATCH resolves the symbol via the kernel
+                    // ELF, allocates a free DR1..=DR3 slot, publishes
+                    // the resolved KVA + tag into `WatchpointArm`,
+                    // and replies OK so every vCPU's
+                    // `self_arm_watchpoint` picks up the new arm
+                    // before its next KVM_RUN.
                     if doorbell_pending
                         && !freeze_coord_on_demand_in_flight
                             .swap(true, Ordering::AcqRel)
                     {
-                        tracing::info!(
-                            "freeze-coord: doorbell pending; running on-demand capture"
+                        let request = read_snapshot_request(
+                            freeze_coord_mem.as_ref(),
+                            freeze_coord_shm_base,
                         );
-                        // The doorbell arrives without an exit_kind
-                        // precondition — pass `false` to skip the
-                        // gate. The host coordinator's
-                        // `freeze_and_capture` returns None on
-                        // rendezvous timeout; we still thaw afterwards
-                        // (worker resume → freeze=false) so the on-
-                        // demand path can never deadlock the run.
+                        match request {
+                            Some(SnapshotRequest {
+                                request_id,
+                                kind: shm_ring::SHM_SNAPSHOT_KIND_CAPTURE,
+                                tag,
+                            }) => {
+                                tracing::info!(
+                                    request_id,
+                                    %tag,
+                                    "freeze-coord: doorbell CAPTURE request"
+                                );
+                                let on_demand = freeze_and_capture(false);
+                                if let Some(ref blk) = freeze_coord_virtio_blk {
+                                    blk.lock().resume();
+                                }
+                                freeze_coord_freeze.store(false, Ordering::Release);
+                                let _ = freeze_coord_thaw_evt.write(1);
+                                let mut reply_status =
+                                    shm_ring::SHM_SNAPSHOT_STATUS_OK;
+                                let mut reply_reason = String::new();
+                                if let Some((report, capture_start)) = on_demand {
+                                    let map_count = report.maps.len();
+                                    let vcpu_regs_count =
+                                        report.vcpu_regs.len();
+                                    let tasks_enriched =
+                                        report.task_enrichments.len();
+                                    // Persist the captured report on
+                                    // the bridge under the
+                                    // guest-supplied tag. The test
+                                    // code drains the bridge after VM
+                                    // exit and walks the reports via
+                                    // the public `Snapshot` accessor.
+                                    freeze_coord_snapshot_bridge
+                                        .store(&tag, report.clone());
+                                    // File mirror for
+                                    // operator inspection AND for
+                                    // the in-guest scenario to read
+                                    // back via `sidecar_dir()` —
+                                    // `{base}.snapshot.{tag}.json`
+                                    // is deterministic from the
+                                    // guest-supplied tag, no
+                                    // counter race.
+                                    if let Some(ref base_path) =
+                                        freeze_coord_dump_path
+                                    {
+                                        let tagged = snapshot_tagged_path(
+                                            base_path, &tag,
+                                        );
+                                        if let Some(parent) = tagged.parent() {
+                                            let _ = std::fs::create_dir_all(parent);
+                                        }
+                                        match serde_json::to_string_pretty(
+                                            &report,
+                                        ) {
+                                            Ok(json) => {
+                                                if let Err(e) =
+                                                    std::fs::write(&tagged, &json)
+                                                {
+                                                    tracing::warn!(
+                                                        path = %tagged.display(),
+                                                        error = %e,
+                                                        "freeze-coord: on-demand dump file write failed"
+                                                    );
+                                                }
+                                            }
+                                            Err(e) => tracing::error!(
+                                                error = %e,
+                                                map_count,
+                                                vcpu_regs_count,
+                                                "freeze-coord: on-demand dump (JSON serialization failed)"
+                                            ),
+                                        }
+                                    }
+                                    let elapsed_ms = capture_start
+                                        .elapsed()
+                                        .as_millis() as u64;
+                                    tracing::info!(
+                                        target: "ktstr::failure_dump",
+                                        kind = "on_demand_capture",
+                                        request_id,
+                                        %tag,
+                                        map_count,
+                                        vcpu_regs_count,
+                                        tasks_enriched,
+                                        elapsed_ms,
+                                        "freeze-coord: snapshot captured and stored on bridge"
+                                    );
+                                } else {
+                                    reply_status =
+                                        shm_ring::SHM_SNAPSHOT_STATUS_ERR;
+                                    reply_reason =
+                                        "freeze rendezvous timed out (vCPU stuck \
+                                         in KVM_RUN past FREEZE_RENDEZVOUS_TIMEOUT)"
+                                            .to_string();
+                                    tracing::warn!(
+                                        request_id,
+                                        %tag,
+                                        "freeze-coord: on-demand capture failed (rendezvous timeout)"
+                                    );
+                                }
+                                write_snapshot_reply(
+                                    freeze_coord_mem.as_ref(),
+                                    freeze_coord_shm_base,
+                                    request_id,
+                                    reply_status,
+                                    &reply_reason,
+                                );
+                            }
+                            Some(SnapshotRequest {
+                                request_id,
+                                kind: shm_ring::SHM_SNAPSHOT_KIND_WATCH,
+                                tag,
+                            }) => {
+                                tracing::info!(
+                                    request_id,
+                                    %tag,
+                                    "freeze-coord: doorbell WATCH request"
+                                );
+                                let arm_result = arm_user_watchpoint(
+                                    &freeze_coord_watchpoint,
+                                    freeze_coord_kernel_path.as_path(),
+                                    &tag,
+                                );
+                                let (status, reason) = match arm_result {
+                                    Ok(slot_idx) => {
+                                        tracing::info!(
+                                            request_id,
+                                            %tag,
+                                            slot_idx,
+                                            "freeze-coord: hardware watchpoint armed"
+                                        );
+                                        (
+                                            shm_ring::SHM_SNAPSHOT_STATUS_OK,
+                                            String::new(),
+                                        )
+                                    }
+                                    Err(reason) => {
+                                        tracing::warn!(
+                                            request_id,
+                                            %tag,
+                                            %reason,
+                                            "freeze-coord: WATCH register failed"
+                                        );
+                                        (
+                                            shm_ring::SHM_SNAPSHOT_STATUS_ERR,
+                                            reason,
+                                        )
+                                    }
+                                };
+                                write_snapshot_reply(
+                                    freeze_coord_mem.as_ref(),
+                                    freeze_coord_shm_base,
+                                    request_id,
+                                    status,
+                                    &reason,
+                                );
+                            }
+                            Some(SnapshotRequest {
+                                request_id,
+                                kind,
+                                tag,
+                            }) => {
+                                tracing::warn!(
+                                    request_id,
+                                    %tag,
+                                    kind,
+                                    "freeze-coord: doorbell with unknown kind"
+                                );
+                                write_snapshot_reply(
+                                    freeze_coord_mem.as_ref(),
+                                    freeze_coord_shm_base,
+                                    request_id,
+                                    shm_ring::SHM_SNAPSHOT_STATUS_ERR,
+                                    &format!("unknown snapshot kind {kind}"),
+                                );
+                            }
+                            None => {
+                                // Doorbell fired without an SHM
+                                // request slot populated — most
+                                // likely a host-side trigger via
+                                // `doorbell_evt.write(1)` outside
+                                // any guest-driven flow. Fall back
+                                // to the legacy "anonymous capture"
+                                // behaviour, storing under the same
+                                // synthetic tag the file mirror
+                                // uses.
+                                tracing::info!(
+                                    "freeze-coord: doorbell fired without SHM request \
+                                     (host-side trigger?); running anonymous capture"
+                                );
+                                let on_demand = freeze_and_capture(false);
+                                if let Some(ref blk) = freeze_coord_virtio_blk {
+                                    blk.lock().resume();
+                                }
+                                freeze_coord_freeze.store(false, Ordering::Release);
+                                let _ = freeze_coord_thaw_evt.write(1);
+                                if let Some((report, _)) = on_demand {
+                                    let counter = on_demand_counter;
+                                    on_demand_counter =
+                                        on_demand_counter.wrapping_add(1);
+                                    let synth_tag =
+                                        format!("anonymous_{counter}");
+                                    freeze_coord_snapshot_bridge
+                                        .store(&synth_tag, report.clone());
+                                    if let Some(ref base_path) =
+                                        freeze_coord_dump_path
+                                    {
+                                        let tagged = on_demand_tagged_path(
+                                            base_path, counter,
+                                        );
+                                        if let Some(parent) = tagged.parent() {
+                                            let _ = std::fs::create_dir_all(parent);
+                                        }
+                                        if let Ok(json) =
+                                            serde_json::to_string_pretty(&report)
+                                            && let Err(e) =
+                                                std::fs::write(&tagged, &json)
+                                        {
+                                            tracing::warn!(
+                                                path = %tagged.display(),
+                                                error = %e,
+                                                "freeze-coord: anonymous on-demand dump file write failed"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        freeze_coord_on_demand_in_flight
+                            .store(false, Ordering::Release);
+                    }
+                    // After every doorbell-driven path runs, also
+                    // service any user-watchpoint hits on DR1..=DR3.
+                    // The vCPU's KVM_EXIT_DEBUG handler latches the
+                    // matching slot's `hit` flag and writes hit_evt;
+                    // the coordinator's epoll fires WATCHPOINT, the
+                    // hit_evt drain at the top of the loop already
+                    // ran. Walk every slot and dispatch a capture
+                    // for each hit.
+                    for slot_idx in 0..3 {
+                        if !freeze_coord_watchpoint.user[slot_idx]
+                            .hit
+                            .swap(false, Ordering::AcqRel)
+                        {
+                            continue;
+                        }
+                        let tag = freeze_coord_watchpoint.user[slot_idx]
+                            .tag
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .clone();
+                        if freeze_coord_on_demand_in_flight
+                            .swap(true, Ordering::AcqRel)
+                        {
+                            // A capture is already in flight (e.g.
+                            // CAPTURE doorbell handler is running).
+                            // Re-arm the slot's hit flag so the next
+                            // epoll iteration handles it.
+                            freeze_coord_watchpoint.user[slot_idx]
+                                .hit
+                                .store(true, Ordering::Release);
+                            break;
+                        }
+                        tracing::info!(
+                            slot_idx,
+                            %tag,
+                            "freeze-coord: user watchpoint fire; capturing"
+                        );
                         let on_demand = freeze_and_capture(false);
-                        // Thaw immediately after the rendezvous
-                        // completes so a slow JSON serialise can't
-                        // keep vCPUs parked any longer than the dump
-                        // strictly needs. Mirrors the late-trigger
-                        // path's resume()→freeze.store(false) ordering
-                        // so the worker observes the unpause before
-                        // the freeze flag clears.
                         if let Some(ref blk) = freeze_coord_virtio_blk {
                             blk.lock().resume();
                         }
                         freeze_coord_freeze.store(false, Ordering::Release);
-                        // Wake every parked vCPU's poll wait. The
-                        // Release on `freeze` synchronizes-with the
-                        // vCPU's Acquire-load that exits the park
-                        // loop; the eventfd write is the wake hint
-                        // that drops poll latency from up to 100 ms
-                        // to microseconds. EAGAIN (counter
-                        // saturation) is benign — the AtomicBool
-                        // remains the source of truth.
                         let _ = freeze_coord_thaw_evt.write(1);
                         if let Some((report, capture_start)) = on_demand {
                             let map_count = report.maps.len();
-                            let vcpu_regs_count = report.vcpu_regs.len();
-                            let tasks_enriched = report.task_enrichments.len();
-                            let truncated_at_us = report.dump_truncated_at_us;
-                            match serde_json::to_string_pretty(&report) {
-                                Ok(json) => {
-                                    // Build the tagged on-demand path.
-                                    // `failure_dump.json` ->
-                                    // `failure_dump.on_demand_<n>.json`.
-                                    // For paths without an extension,
-                                    // the suffix is appended.
-                                    let counter = on_demand_counter;
-                                    on_demand_counter =
-                                        on_demand_counter.wrapping_add(1);
-                                    let path_str: Option<String> =
-                                        freeze_coord_dump_path
-                                            .as_ref()
-                                            .and_then(|p| {
-                                                let tagged =
-                                                    on_demand_tagged_path(
-                                                        p, counter,
-                                                    );
-                                                if let Some(parent) =
-                                                    tagged.parent()
-                                                {
-                                                    let _ = std::fs::create_dir_all(
-                                                        parent,
-                                                    );
-                                                }
-                                                match std::fs::write(
-                                                    &tagged, &json,
-                                                ) {
-                                                    Ok(()) => Some(
-                                                        tagged
-                                                            .display()
-                                                            .to_string(),
-                                                    ),
-                                                    Err(e) => {
-                                                        tracing::warn!(
-                                                            path = %tagged.display(),
-                                                            error = %e,
-                                                            "freeze-coord: on-demand dump file write failed"
-                                                        );
-                                                        None
-                                                    }
-                                                }
-                                            });
-                                    let json_bytes = json.len();
-                                    let path_part = path_str
-                                        .as_deref()
-                                        .map(|p| format!(" -> {p}"))
-                                        .unwrap_or_else(|| {
-                                            " (no file sink)".to_string()
-                                        });
-                                    let trunc_part = truncated_at_us
-                                        .map(|us| {
-                                            format!(" (truncated at {us}us)")
-                                        })
-                                        .unwrap_or_default();
-                                    let elapsed_ms = capture_start
-                                        .elapsed()
-                                        .as_millis()
-                                        as u64;
-                                    tracing::info!(
-                                        target: "ktstr::failure_dump",
-                                        kind = "on_demand",
-                                        counter,
-                                        map_count,
-                                        vcpu_regs_count,
-                                        tasks_enriched,
-                                        json_bytes,
-                                        elapsed_ms,
-                                        truncated_at_us,
-                                        path = path_str.as_deref(),
-                                        "freeze-coord: on-demand dump complete{trunc_part}, {map_count} maps, {tasks_enriched} tasks enriched, {elapsed_ms}ms freeze, {json_bytes} bytes{path_part}"
+                            freeze_coord_snapshot_bridge
+                                .store(&tag, report.clone());
+                            if let Some(ref base_path) = freeze_coord_dump_path
+                            {
+                                let tagged =
+                                    snapshot_tagged_path(base_path, &tag);
+                                if let Some(parent) = tagged.parent() {
+                                    let _ = std::fs::create_dir_all(parent);
+                                }
+                                if let Ok(json) =
+                                    serde_json::to_string_pretty(&report)
+                                    && let Err(e) = std::fs::write(&tagged, &json)
+                                {
+                                    tracing::warn!(
+                                        path = %tagged.display(),
+                                        error = %e,
+                                        "freeze-coord: user-watchpoint dump file write failed"
                                     );
                                 }
-                                Err(e) => tracing::error!(
-                                    error = %e,
-                                    map_count,
-                                    vcpu_regs_count,
-                                    "freeze-coord: on-demand dump (JSON serialization failed)"
-                                ),
                             }
+                            let elapsed_ms =
+                                capture_start.elapsed().as_millis() as u64;
+                            tracing::info!(
+                                target: "ktstr::failure_dump",
+                                kind = "user_watchpoint",
+                                slot_idx,
+                                %tag,
+                                map_count,
+                                elapsed_ms,
+                                "freeze-coord: user-watchpoint snapshot captured"
+                            );
                         }
-                        // Release the in-flight latch only after the
-                        // dump has been emitted (or failed) so a
-                        // racing doorbell write triggers a fresh
-                        // capture rather than aliasing onto the
-                        // current one.
                         freeze_coord_on_demand_in_flight
                             .store(false, Ordering::Release);
                     }
@@ -3670,6 +4085,11 @@ impl KtstrVm {
             // same kernel counter via `dup(2)`, so a write to either
             // wakes the coordinator's read.
             doorbell_evt: Some(doorbell_evt),
+            // Snapshot bridge owning every report stored by the
+            // freeze coordinator's doorbell handler over the run's
+            // lifetime. Forwarded to `VmResult::snapshot_bridge`
+            // by `collect_results`.
+            snapshot_bridge,
         })
     }
 
@@ -4399,15 +4819,16 @@ impl KtstrVm {
         kill_evt: Option<&Arc<EventFd>>,
     ) -> (i32, bool) {
         let mut exit_code: i32 = -1;
-        // Per-BSP `armed_kva` mirrors the AP-side slot — see
-        // [`super::vcpu::self_arm_watchpoint`]. `0` until the
-        // coordinator publishes a non-zero `request_kva`.
-        // `arm_failures` counts consecutive non-EINTR ioctl
-        // failures; transient EINTR (signal race with the SIGRTMIN
-        // kick path) does NOT increment so a kicked-mid-arm vCPU
-        // keeps retrying instead of giving up after the first
-        // racey iteration.
-        let mut armed_kva: u64 = 0;
+        // Per-BSP `armed_slots` mirrors the AP-side slots — see
+        // [`super::vcpu::self_arm_watchpoint`]. Index 0 = DR0
+        // (err_exit watchpoint); 1..=3 = DR1/DR2/DR3 (user
+        // `Op::WatchSnapshot` arms). All `0` until the coordinator
+        // publishes resolved KVAs. `arm_failures` counts consecutive
+        // non-EINTR ioctl failures; transient EINTR (signal race
+        // with the SIGRTMIN kick path) does NOT increment so a
+        // kicked-mid-arm vCPU keeps retrying instead of giving up
+        // after the first racey iteration.
+        let mut armed_slots: [u64; 4] = [0; 4];
         let mut arm_failures: u8 = 0;
 
         loop {
@@ -4440,12 +4861,7 @@ impl KtstrVm {
             // Self-arm the failure-dump watchpoint when the
             // coordinator has resolved a new KVA. Cheap (atomic load
             // and compare) when no new arm is pending.
-            self_arm_watchpoint(
-                bsp,
-                &watchpoint.request_kva,
-                &mut armed_kva,
-                &mut arm_failures,
-            );
+            self_arm_watchpoint(bsp, watchpoint, &mut armed_slots, &mut arm_failures);
 
             match bsp.run() {
                 Ok(mut exit) => {
@@ -4473,35 +4889,45 @@ impl KtstrVm {
                     // regardless — see the AP-side
                     // `vcpu_run_loop_unified` for the same
                     // rationale.
-                    if matches!(exit, VcpuExit::Debug(_)) {
-                        let host_ptr = watchpoint.kind_host_ptr.load(Ordering::Acquire);
-                        if !host_ptr.is_null() {
-                            // SAFETY: see the AP-side handler in
-                            // `exit_dispatch::vcpu_run_loop_unified`.
-                            // Same publication ordering on
-                            // `kind_host_ptr` Release →
-                            // `request_kva` Release; arming the
-                            // watchpoint required a non-null
-                            // `request_kva` load, which
-                            // synchronizes-with this read.
-                            let kind = unsafe { std::ptr::read_volatile(host_ptr) };
-                            if kind >= super::vcpu::SCX_EXIT_ERROR_THRESHOLD {
-                                watchpoint.latch_hit();
+                    if let VcpuExit::Debug(debug_arch) = &exit {
+                        let dr6 = debug_arch.dr6;
+                        let dr0_hit = (dr6 & (1 << 0)) != 0;
+                        let dr1_hit = (dr6 & (1 << 1)) != 0;
+                        let dr2_hit = (dr6 & (1 << 2)) != 0;
+                        let dr3_hit = (dr6 & (1 << 3)) != 0;
+                        if dr0_hit {
+                            let host_ptr = watchpoint.kind_host_ptr.load(Ordering::Acquire);
+                            if !host_ptr.is_null() {
+                                // SAFETY: see the AP-side handler in
+                                // `exit_dispatch::vcpu_run_loop_unified`.
+                                let kind = unsafe { std::ptr::read_volatile(host_ptr) };
+                                if kind >= super::vcpu::SCX_EXIT_ERROR_THRESHOLD {
+                                    watchpoint.latch_hit();
+                                } else {
+                                    tracing::debug!(
+                                        kind,
+                                        threshold = super::vcpu::SCX_EXIT_ERROR_THRESHOLD,
+                                        "BSP watchpoint fired on non-error \
+                                         exit_kind transition (e.g. \
+                                         SCX_EXIT_DONE on clean shutdown); \
+                                         skipping freeze trigger"
+                                    );
+                                }
                             } else {
-                                tracing::debug!(
-                                    kind,
-                                    threshold = super::vcpu::SCX_EXIT_ERROR_THRESHOLD,
-                                    "BSP watchpoint fired on non-error \
-                                     exit_kind transition (e.g. \
-                                     SCX_EXIT_DONE on clean shutdown); \
-                                     skipping freeze trigger"
-                                );
+                                // Conservative fallback when
+                                // host_ptr is null — see the AP
+                                // handler for rationale.
+                                watchpoint.latch_hit();
                             }
-                        } else {
-                            // Conservative fallback when host_ptr
-                            // is null — see the AP handler for
-                            // rationale.
-                            watchpoint.latch_hit();
+                        }
+                        if dr1_hit {
+                            watchpoint.latch_user_hit(0);
+                        }
+                        if dr2_hit {
+                            watchpoint.latch_user_hit(1);
+                        }
+                        if dr3_hit {
+                            watchpoint.latch_user_hit(2);
                         }
                         if kill.load(Ordering::Acquire) {
                             break;
@@ -4735,6 +5161,7 @@ impl KtstrVm {
             cleanup_duration,
             virtio_blk_counters: run.virtio_blk_counters,
             virtio_net_counters: run.virtio_net_counters,
+            snapshot_bridge: run.snapshot_bridge,
         })
     }
 

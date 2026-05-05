@@ -373,17 +373,18 @@ pub(crate) fn vcpu_run_loop_unified(
     parked_evt: Option<&Arc<EventFd>>,
     thaw_evt: Option<&Arc<EventFd>>,
 ) {
-    // Per-AP `armed_kva` mirrors the BSP-side slot in
-    // `freeze_coord::run_bsp_loop`. `0` until the freeze
-    // coordinator publishes a non-zero `request_kva` (the resolved
-    // `*scx_root->exit_kind` KVA). The slot is a per-thread local
-    // so the per-iteration arm check is a single Acquire load with
-    // no cross-thread synchronization beyond the published request.
-    // `arm_failures` counts consecutive non-EINTR ioctl failures;
-    // EINTR is transient (SIGRTMIN kick race) and does NOT
+    // Per-AP `armed_slots` mirrors the BSP-side slot array in
+    // `freeze_coord::run_bsp_loop`. Index 0 = DR0 (err_exit watchpoint
+    // for `*scx_root->exit_kind`); indices 1..=3 = DR1/DR2/DR3 (user
+    // `Op::WatchSnapshot` arms). All start at `0` until the freeze
+    // coordinator publishes resolved KVAs. The array is a per-thread
+    // local so the per-iteration arm check is four Acquire loads
+    // with no cross-thread synchronization beyond the published
+    // requests. `arm_failures` counts consecutive non-EINTR ioctl
+    // failures; EINTR is transient (SIGRTMIN kick race) and does NOT
     // increment, so a kicked-mid-arm vCPU retries instead of
     // permanently disabling the watchpoint.
-    let mut armed_kva: u64 = 0;
+    let mut armed_slots: [u64; 4] = [0; 4];
     let mut arm_failures: u8 = 0;
     loop {
         if kill.load(Ordering::Acquire) {
@@ -412,12 +413,7 @@ pub(crate) fn vcpu_run_loop_unified(
         // pending. Mirrors `run_bsp_loop`'s arm-before-run pattern;
         // both paths share `WatchpointArm` so a fire on either
         // triggers the late-snapshot rendezvous.
-        self_arm_watchpoint(
-            vcpu,
-            &watchpoint.request_kva,
-            &mut armed_kva,
-            &mut arm_failures,
-        );
+        self_arm_watchpoint(vcpu, watchpoint, &mut armed_slots, &mut arm_failures);
 
         match vcpu.run() {
             Ok(mut exit) => {
@@ -445,42 +441,61 @@ pub(crate) fn vcpu_run_loop_unified(
                 // fire (slab page lifetime — the scheduler's
                 // `scx_sched` is not freed until well after the
                 // last `exit_kind` write).
-                if matches!(exit, VcpuExit::Debug(_)) {
-                    let host_ptr = watchpoint.kind_host_ptr.load(Ordering::Acquire);
-                    if !host_ptr.is_null() {
-                        // SAFETY: `kind_host_ptr` was published by
-                        // the freeze coordinator before
-                        // `request_kva` (Release), and the
-                        // `request_kva` non-zero load that triggered
-                        // the arm is the synchronizes-with edge for
-                        // this read. The pointer addresses a u32
-                        // inside the guest's `scx_sched` slab page,
-                        // which stays mapped for the VM lifetime
-                        // per the `ReservationGuard` contract.
-                        let kind = unsafe { std::ptr::read_volatile(host_ptr) };
-                        if kind >= SCX_EXIT_ERROR_THRESHOLD {
-                            watchpoint.latch_hit();
+                if let VcpuExit::Debug(debug_arch) = &exit {
+                    // DR6 layout (Intel SDM Vol. 3B 17.2.5): bits 0-3
+                    // (B0..B3) indicate which DR fired. Bit 14 (BS)
+                    // signals single-step. We read the bottom four
+                    // bits and dispatch each set slot.
+                    let dr6 = debug_arch.dr6;
+                    let dr0_hit = (dr6 & (1 << 0)) != 0;
+                    let dr1_hit = (dr6 & (1 << 1)) != 0;
+                    let dr2_hit = (dr6 & (1 << 2)) != 0;
+                    let dr3_hit = (dr6 & (1 << 3)) != 0;
+                    if dr0_hit {
+                        let host_ptr = watchpoint.kind_host_ptr.load(Ordering::Acquire);
+                        if !host_ptr.is_null() {
+                            // SAFETY: `kind_host_ptr` was published by
+                            // the freeze coordinator before
+                            // `request_kva` (Release), and the
+                            // `request_kva` non-zero load that
+                            // triggered the arm is the synchronizes-
+                            // with edge for this read. The pointer
+                            // addresses a u32 inside the guest's
+                            // `scx_sched` slab page, which stays
+                            // mapped for the VM lifetime per the
+                            // `ReservationGuard` contract.
+                            let kind = unsafe { std::ptr::read_volatile(host_ptr) };
+                            if kind >= SCX_EXIT_ERROR_THRESHOLD {
+                                watchpoint.latch_hit();
+                            } else {
+                                tracing::debug!(
+                                    kind,
+                                    threshold = SCX_EXIT_ERROR_THRESHOLD,
+                                    "watchpoint fired on non-error exit_kind \
+                                     transition (e.g. SCX_EXIT_DONE on clean \
+                                     shutdown); skipping freeze trigger"
+                                );
+                            }
                         } else {
-                            tracing::debug!(
-                                kind,
-                                threshold = SCX_EXIT_ERROR_THRESHOLD,
-                                "watchpoint fired on non-error exit_kind \
-                                 transition (e.g. SCX_EXIT_DONE on clean \
-                                 shutdown); skipping freeze trigger"
-                            );
+                            // Coordinator armed `request_kva` but
+                            // the host-pointer publication lost the
+                            // race or failed to resolve.
+                            // Conservative fallback: latch `hit` so
+                            // the BPF .bss path's late-trigger guard
+                            // still runs — better a possibly-spurious
+                            // dump than missing a real one.
+                            watchpoint.latch_hit();
                         }
-                    } else {
-                        // Coordinator armed `request_kva` but the
-                        // host-pointer publication lost the race or
-                        // failed to resolve. Conservative fallback:
-                        // latch `hit` so the BPF .bss path's
-                        // late-trigger guard still runs — better a
-                        // possibly-spurious dump than missing a
-                        // real one. This branch should be rare
-                        // (the coordinator stores `kind_host_ptr`
-                        // before `request_kva`), but the check
-                        // keeps the path defensive.
-                        watchpoint.latch_hit();
+                    }
+                    // User watchpoint slots (DR1..=DR3 → user[0..=2]).
+                    if dr1_hit {
+                        watchpoint.latch_user_hit(0);
+                    }
+                    if dr2_hit {
+                        watchpoint.latch_user_hit(1);
+                    }
+                    if dr3_hit {
+                        watchpoint.latch_user_hit(2);
                     }
                     if kill.load(Ordering::Acquire) {
                         break;
