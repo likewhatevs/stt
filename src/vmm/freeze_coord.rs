@@ -3049,9 +3049,20 @@ impl KtstrVm {
                                     %tag,
                                     "freeze-coord: doorbell WATCH request"
                                 );
+                                let Some(ref vmlinux) = freeze_coord_vmlinux else {
+                                    write_snapshot_reply(
+                                        freeze_coord_mem.as_ref(),
+                                        freeze_coord_shm_base,
+                                        request_id,
+                                        shm_ring::SHM_SNAPSHOT_STATUS_ERR,
+                                        "vmlinux not found in kernel dir",
+                                    );
+                                    on_demand_in_flight.store(false, Ordering::Release);
+                                    continue;
+                                };
                                 let arm_result = arm_user_watchpoint(
                                     &freeze_coord_watchpoint,
-                                    freeze_coord_kernel_path.as_path(),
+                                    vmlinux.as_path(),
                                     &tag,
                                 );
                                 let (status, reason) = match arm_result {
