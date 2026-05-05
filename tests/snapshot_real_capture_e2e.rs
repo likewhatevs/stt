@@ -1,12 +1,18 @@
 //! End-to-end tests for the snapshot capture pipeline.
 //!
-//! Two test types:
-//! 1. `#[ktstr_test]` VM scenarios that verify Op::snapshot and
-//!    Op::watch_snapshot fire successfully inside a real VM (the guest
-//!    verifies the SHM reply status via execute_steps).
-//! 2. Host-side `#[test]` functions that boot a VM, run a scenario
-//!    with snapshot ops, then read `VmResult.snapshot_bridge` to
-//!    verify the captured content has real BTF-rendered BPF state.
+//! Each `#[ktstr_test]` scenario fires a snapshot op
+//! (`Op::snapshot` or `Op::watch_snapshot`) from inside a real
+//! guest VM and verifies the SHM reply status via `execute_steps`.
+//! The guest cannot read the captured `FailureDumpReport` because
+//! the bridge that owns it lives in HOST memory, populated by the
+//! freeze coordinator's doorbell handler. Content assertions
+//! against the captured bridge therefore live host-side in
+//! [`crate::test_support::eval::run_ktstr_test_inner_impl`] (in
+//! `src/test_support/eval.rs`), which drains
+//! [`VmResult::snapshot_bridge`] after `vm.run()` and walks every
+//! captured report — verifying the scheduler's `.bss` map is
+//! present and that `ktstr_enabled` (the always-present probe gate
+//! variable) appears in the BTF render's `RenderedMember` list.
 
 use anyhow::Result;
 use ktstr::assert::AssertResult;

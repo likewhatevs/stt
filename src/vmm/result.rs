@@ -207,22 +207,21 @@ pub struct VmResult {
     pub virtio_net_counters: Option<Arc<VirtioNetCounters>>,
     /// Snapshot bridge populated by the freeze coordinator over the
     /// run's lifetime. Every `Op::Snapshot` and `Op::WatchSnapshot`
-    /// fire stores a `FailureDumpReport` keyed by its tag. Test
-    /// code calls [`crate::scenario::snapshot::SnapshotBridge::drain`]
-    /// to take ownership of the stored reports and walks them via
-    /// [`crate::scenario::snapshot::Snapshot::new`].
+    /// fire stores a `FailureDumpReport` keyed by its tag.
+    ///
+    /// The `#[ktstr_test]` host-side wrapper (in
+    /// `src/test_support/eval.rs::run_ktstr_test_inner_impl`)
+    /// calls [`crate::scenario::snapshot::SnapshotBridge::drain`]
+    /// after `vm.run()` returns and walks every captured report —
+    /// verifying the scheduler `.bss` map is present and the
+    /// `RenderedMember` list contains the always-present probe
+    /// gate variable. Out-of-tree consumers can drain the bridge
+    /// directly off `VmResult` and traverse it via
+    /// [`crate::scenario::snapshot::Snapshot::new`] for typed
+    /// access to map values and per-CPU entries.
     ///
     /// Always present after a successful `run_vm`; `None`-equivalent
     /// (empty) when the VM crashed before any snapshot fired.
-    ///
-    /// `#[allow(dead_code)]` mirrors `stimulus_events` /
-    /// `virtio_blk_counters`: the field is part of the public API
-    /// surface and read by user test code outside `lib.rs`, but the
-    /// lib build doesn't see any in-tree readers because no lib
-    /// code path calls `.snapshot_bridge` on a `VmResult`. The
-    /// in-tree readers live in integration tests (e.g.
-    /// `tests/snapshot_real_capture_e2e.rs`).
-    #[allow(dead_code)]
     pub snapshot_bridge: crate::scenario::snapshot::SnapshotBridge,
 }
 

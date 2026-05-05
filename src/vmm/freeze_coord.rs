@@ -53,6 +53,51 @@ use super::DRAM_BASE;
 /// `immediate_exit` kick failed to interrupt.
 const FREEZE_RENDEZVOUS_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Why [`KtstrVm::run_bsp_loop`] exited. Logged at break time so an
+/// operator reading stderr (`BSP: loop exit reason=...`) can
+/// diagnose a `code=-1` exit without correlating to peer-vCPU
+/// stderr or `tracing` output.
+///
+/// Mapping to the BSP loop's exit_code:
+///   - [`Shutdown`](Self::Shutdown) → exit_code = 0 (the only path
+///     that overwrites the local `-1` sentinel).
+///   - Every other variant → exit_code = -1, but
+///     [`super::KtstrVm::collect_results`] re-derives the final
+///     [`super::result::VmResult::exit_code`] from the SHM
+///     `MSG_TYPE_EXIT` payload (or COM2 `KTSTR_EXIT:` sentinel) when
+///     either is present, so a `-1` from the BSP run-loop is not
+///     authoritative for caller-visible test outcome.
+#[derive(Debug, Clone, Copy)]
+enum BspExitReason {
+    /// `kill.load(Acquire)` returned `true` at the top of the loop —
+    /// some peer (an AP that observed [`ExitAction::Shutdown`] or
+    /// [`ExitAction::Fatal`], the panic hook, the monitor thread on
+    /// `MSG_TYPE_SCHED_EXIT`, or `collect_results`) flipped the flag.
+    /// In particular, on a clean test exit where the kernel's i8042
+    /// reset OUT is dispatched to a non-BSP vCPU, the AP path sets
+    /// `kill` and the BSP exits via this branch. The default value
+    /// for the local — every break path that does not explicitly
+    /// reassign falls into this case.
+    ExternalKill,
+    /// BSP itself observed [`ExitAction::Shutdown`] from
+    /// `classify_exit` (i8042 reset on x86_64, PSCI SystemEvent /
+    /// `VcpuExit::Shutdown` on aarch64). The only path that sets
+    /// exit_code to 0.
+    Shutdown,
+    /// BSP itself observed [`ExitAction::Fatal`] from `classify_exit`
+    /// (`VcpuExit::FailEntry` or `VcpuExit::InternalError`). Kill
+    /// flag is propagated to peers before break.
+    Fatal,
+    /// `bsp.run()` returned a non-EINTR/EAGAIN errno. Indicates a
+    /// permanent KVM_RUN failure on the BSP vCPU fd.
+    RunError,
+    /// The wall-clock timeout (`run_start.elapsed() > timeout`) ran
+    /// out before any other exit condition fired. Returned with
+    /// `timed_out=true`. Logged from the early-return branch at the
+    /// top of the loop.
+    Timeout,
+}
+
 /// Decoded contents of the SHM snapshot request slot. Read by the
 /// freeze coordinator's doorbell handler each time the doorbell
 /// eventfd fires; identifies which dispatch path (CAPTURE / WATCH /
@@ -995,7 +1040,7 @@ impl KtstrVm {
         // user-supplied symbols (Op::WatchSnapshot) by name through
         // a fresh ELF parse on each registration. Cheap; the kernel
         // image is on disk, the host page cache covers re-reads.
-        let freeze_coord_kernel_path = self.kernel.clone();
+        let _freeze_coord_kernel_path = self.kernel.clone();
         // Wake-fd handles for the coord epoll loop. `kill_evt` and
         // `bsp_done_evt` are written by every thread that flips the
         // matching AtomicBool (vCPU shutdown classifier, BSP panic
@@ -4053,7 +4098,17 @@ impl KtstrVm {
         // `Instant::now()` at the end and the difference becomes
         // `VmResult::cleanup_duration`.
         let cleanup_start = Instant::now();
-        eprintln!("BSP: exited run loop, code={exit_code} timed_out={timed_out}");
+        // `code` here is the run-loop sentinel (0 only on a BSP-
+        // observed `ExitAction::Shutdown`, -1 otherwise — see
+        // [`BspExitReason`] and the preceding `BSP: loop exit
+        // reason=...` line). The caller-visible exit code is
+        // derived from SHM `MSG_TYPE_EXIT` or the COM2 `KTSTR_EXIT:`
+        // sentinel inside [`KtstrVm::collect_results`], not from
+        // this value.
+        eprintln!(
+            "BSP: exited run loop, code={exit_code} timed_out={timed_out} \
+             (run-loop sentinel — final exit code comes from SHM/COM2 in collect_results)"
+        );
 
         // Join the watchdog before dropping `bsp`. The watchdog holds an
         // ImmediateExitHandle pointing into bsp's kvm_run mmap. If bsp is
@@ -4787,7 +4842,28 @@ impl KtstrVm {
         Ok(Some(handle))
     }
 
-    /// Unified BSP KVM_RUN loop. Returns (exit_code, timed_out).
+    /// Unified BSP KVM_RUN loop. Returns `(exit_code, timed_out)`.
+    ///
+    /// `exit_code` semantics:
+    ///   - `0` only when the BSP itself observed
+    ///     [`ExitAction::Shutdown`] from `classify_exit` (i8042 reset
+    ///     on x86_64, PSCI SystemEvent on aarch64, or
+    ///     `VcpuExit::Shutdown`).
+    ///   - `-1` is a sentinel meaning "BSP exited the loop without
+    ///     observing Shutdown itself." This does NOT necessarily
+    ///     indicate a failure — a peer vCPU that observed Shutdown
+    ///     first sets the shared `kill` flag, and the BSP then exits
+    ///     via the `kill.load(Acquire)` check at the top of the loop.
+    ///     [`super::KtstrVm::collect_results`] overrides the run-loop
+    ///     `exit_code` with the SHM `MSG_TYPE_EXIT` payload (or the
+    ///     COM2 `KTSTR_EXIT:` sentinel) before constructing
+    ///     [`super::result::VmResult`], so the value caller-visible
+    ///     code reads is the guest's reported exit code, not this
+    ///     local sentinel. [`BspExitReason`] is logged at break time
+    ///     so an operator reading stderr can distinguish
+    ///     "AP saw Shutdown first" from "BSP itself saw Fatal" or
+    ///     "BSP run() returned a permanent error" without correlating
+    ///     to other diagnostics.
     ///
     /// Handles arch-specific I/O dispatch (port I/O on x86_64, MMIO on
     /// aarch64). HLT/WFI checks the kill flag and continues (both arches).
@@ -4832,6 +4908,13 @@ impl KtstrVm {
         kill_evt: Option<&Arc<EventFd>>,
     ) -> (i32, bool) {
         let mut exit_code: i32 = -1;
+        // Track which path drove the BSP out of the loop so the
+        // post-loop log line is actionable. Without this, an operator
+        // sees `code=-1 timed_out=false` and cannot distinguish
+        // "external kill propagated from a peer vCPU's Shutdown" from
+        // "BSP itself saw Fatal" — every non-Shutdown exit produces
+        // the same `code=-1` sentinel.
+        let mut exit_reason = BspExitReason::ExternalKill;
         // Per-BSP `armed_slots` mirrors the AP-side slots — see
         // [`super::vcpu::self_arm_watchpoint`]. Index 0 = DR0
         // (err_exit watchpoint); 1..=3 = DR1/DR2/DR3 (user
@@ -4846,6 +4929,10 @@ impl KtstrVm {
 
         loop {
             if run_start.elapsed() > timeout {
+                eprintln!(
+                    "BSP: loop exit reason={reason:?} (timed_out)",
+                    reason = BspExitReason::Timeout
+                );
                 return (exit_code, true);
             }
             if kill.load(Ordering::Acquire) {
@@ -4958,6 +5045,7 @@ impl KtstrVm {
                         Some(ExitAction::Continue) | None => {}
                         Some(ExitAction::Shutdown) => {
                             exit_code = 0;
+                            exit_reason = BspExitReason::Shutdown;
                             break;
                         }
                         Some(ExitAction::Fatal(reason)) => {
@@ -4981,6 +5069,7 @@ impl KtstrVm {
                             if let Some(kev) = kill_evt {
                                 let _ = kev.write(1);
                             }
+                            exit_reason = BspExitReason::Fatal;
                             break;
                         }
                     }
@@ -4993,11 +5082,13 @@ impl KtstrVm {
                         continue;
                     }
                     tracing::error!(%e, "BSP run failed");
+                    exit_reason = BspExitReason::RunError;
                     break;
                 }
             }
         }
 
+        eprintln!("BSP: loop exit reason={exit_reason:?}");
         (exit_code, false)
     }
 

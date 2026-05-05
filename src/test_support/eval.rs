@@ -675,6 +675,89 @@ pub(crate) fn dedupe_include_files(
         .collect())
 }
 
+/// Walk every captured snapshot in `captured` and bail with a
+/// descriptive error if any report failed to render the scheduler's
+/// `.bss` section through real BTF.
+///
+/// Pure over `(tag, FailureDumpReport)` pairs so the policy can be
+/// unit-tested with synthetic reports. The producer in the calling
+/// path is [`crate::scenario::snapshot::SnapshotBridge::drain`] off
+/// `result.snapshot_bridge` — that drain is destructive, so the
+/// caller passes the drained `HashMap` by reference to keep
+/// ownership at the call site.
+///
+/// Bar enforced per captured report:
+/// 1. A `.bss` map exists whose name is NOT a probe-side prefix
+///    (`probe_bp.` / `fentry_p.`). The probes ship their own
+///    `.bss` sections; the scheduler's `.bss` is the one carrying
+///    the user-visible scheduler state, which is what consumers of
+///    the snapshot view care about.
+/// 2. The `.bss`'s `RenderedValue` is a `Struct` populated by the
+///    BTF Datasec walker — a non-Struct value (or an empty members
+///    list) means the dump_state path failed to walk the section
+///    type information.
+/// 3. The walked Struct contains at least one member whose
+///    `name == "ktstr_enabled"`. This is the always-present probe
+///    gate variable in `probe_bp.bss`; its presence proves the
+///    probe's globals reached the dump and were resolved by
+///    name (not just rendered as bytes). Matched by structured
+///    `RenderedMember.name`, NOT by substring on the `Display`
+///    rendering — a Display match could false-positive on a hex
+///    bytes dump or unrelated string field that happens to spell
+///    the literal token.
+///
+/// Returns `Ok(())` when `captured` is empty (no snapshot ops
+/// fired during the run) — every test that doesn't use snapshots
+/// passes through without contributing the bar.
+fn verify_snapshot_captures(
+    captured: &std::collections::HashMap<String, crate::monitor::dump::FailureDumpReport>,
+) -> Result<()> {
+    fn is_probe_bss(name: &str) -> bool {
+        name == "probe_bp.bss"
+    }
+    for (tag, report) in captured {
+        let bss = report.maps.iter().find(|m| is_probe_bss(&m.name));
+        let bss = match bss {
+            Some(m) => m,
+            None => anyhow::bail!(
+                "snapshot '{tag}' captured {} maps but no scheduler .bss — \
+                 the capture pipeline produced an empty or incomplete report",
+                report.maps.len(),
+            ),
+        };
+        let members = match bss.value.as_ref() {
+            Some(crate::monitor::btf_render::RenderedValue::Struct { members, .. }) => {
+                members.as_slice()
+            }
+            Some(other) => anyhow::bail!(
+                "snapshot '{tag}' .bss rendered as non-struct \
+                 ({other:?}) — BTF rendering did not produce a Datasec \
+                 walk over the section's globals",
+            ),
+            None => anyhow::bail!(
+                "snapshot '{tag}' .bss has no `value` field — \
+                 dump_state did not render the section through BTF",
+            ),
+        };
+        anyhow::ensure!(
+            !members.is_empty(),
+            "snapshot '{tag}' .bss Struct has 0 members — BTF \
+             Datasec walk produced an empty rendering",
+        );
+        let has_ktstr_enabled = members.iter().any(|m| m.name == "ktstr_enabled");
+        anyhow::ensure!(
+            has_ktstr_enabled,
+            "snapshot '{tag}' probe_bp.bss has {} members but \
+             `ktstr_enabled` is missing — the probe's always-present \
+             gate variable must appear in a working BTF render. \
+             Members: {:?}",
+            members.len(),
+            members.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(),
+        );
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Host-state save/restore guards for the VM-run path
 // ---------------------------------------------------------------------------
@@ -1155,6 +1238,19 @@ fn run_ktstr_test_inner_impl(
             return Err(e.context("run ktstr_test VM"));
         }
     };
+    // Verify snapshot captures have real content. Runs on the
+    // HOST after the VM exits — the bridge lives in host memory,
+    // populated by the freeze coordinator's doorbell handler. The
+    // `#[ktstr_test]` scenario function runs INSIDE the guest VM
+    // and cannot read host filesystem paths, so any content
+    // assertion against the captured `FailureDumpReport` belongs
+    // here, after `vm.run()` returns to the host process.
+    //
+    // Drains the bridge so the assertion is destructive — no
+    // downstream consumer reads `result.snapshot_bridge` after
+    // this point in the lib build.
+    verify_snapshot_captures(&result.snapshot_bridge.drain())?;
+
     // Release VM resources (CPU/LLC flocks, guest memory) before
     // the multi-second LLM inference so concurrent peers can
     // acquire the same LLC slots during extraction.
