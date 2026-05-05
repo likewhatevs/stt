@@ -176,12 +176,27 @@ fn scenario_op_snapshot_captures_real_bpf_state(
              produced an empty rendering"
         );
     }
+    let has_ktstr_enabled = members.iter().any(|m| {
+        m.get("name").and_then(|n| n.as_str()) == Some("ktstr_enabled")
+    });
+    if !has_ktstr_enabled {
+        anyhow::bail!(
+            "captured `.bss` has {} members but `ktstr_enabled` is \
+             missing — the probe's always-present gate variable must \
+             appear in a working BTF render. members: {:?}",
+            members.len(),
+            members
+                .iter()
+                .filter_map(|m| m.get("name").and_then(|n| n.as_str()))
+                .collect::<Vec<_>>()
+        );
+    }
 
     result.details.push(ktstr::assert::AssertDetail::new(
         ktstr::assert::DetailKind::Other,
         format!(
             "Op::Snapshot('mid_run') captured {} maps with `.bss` containing \
-             {} BTF-resolved field(s) — real-capture pipeline OK",
+             `ktstr_enabled` + {} total field(s) — real-capture pipeline OK",
             maps.len(),
             members.len()
         ),
@@ -285,11 +300,24 @@ fn scenario_op_watch_snapshot_fires_on_kernel_write(
         .get("value")
         .and_then(|v| v.get("members"))
         .and_then(|m| m.as_array());
-    if members.map(|m| m.is_empty()).unwrap_or(true) {
+    let members = members.filter(|m| !m.is_empty());
+    if members.is_none() {
         anyhow::bail!(
             "Op::WatchSnapshot captured `.bss` but it has no \
              BTF-resolved members — watchpoint-triggered capture \
              must produce meaningful scheduler state"
+        );
+    }
+    let members = members.unwrap();
+    let has_ktstr_enabled = members.iter().any(|m| {
+        m.get("name").and_then(|n| n.as_str()) == Some("ktstr_enabled")
+    });
+    if !has_ktstr_enabled {
+        anyhow::bail!(
+            "Op::WatchSnapshot captured `.bss` with {} members but \
+             `ktstr_enabled` is missing — the probe's always-present \
+             gate variable must appear in a working BTF render",
+            members.len()
         );
     }
 
@@ -297,10 +325,11 @@ fn scenario_op_watch_snapshot_fires_on_kernel_write(
         ktstr::assert::DetailKind::Other,
         format!(
             "Op::WatchSnapshot('jiffies_64') fired and captured a \
-             dump with {} maps, `.bss` has {} BTF-resolved field(s) \
-             — DR1..=DR3 hardware-watchpoint pipeline OK",
+             dump with {} maps, `.bss` has `ktstr_enabled` + {} \
+             total field(s) — DR1..=DR3 hardware-watchpoint \
+             pipeline OK",
             maps.len(),
-            members.unwrap().len()
+            members.len()
         ),
     ));
     Ok(result)
