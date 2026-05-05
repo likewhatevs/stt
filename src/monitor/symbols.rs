@@ -12,9 +12,18 @@ use std::path::Path;
 /// Used to convert kernel data/bss symbol VAs to guest-memory offsets
 /// for the bootstrap read of `page_offset_base`.
 ///
-/// x86-64: `__START_KERNEL_map` = 0xffff_ffff_8000_0000.
-/// aarch64 48-bit VA: `KIMAGE_VADDR` = _PAGE_END(48) + SZ_2G
-///   = 0xffff_8000_8000_0000.
+/// x86-64: `__START_KERNEL_map` = 0xffff_ffff_8000_0000. Constant
+/// across paging modes (4-level / 5-level both place the kernel
+/// image at the same VA).
+///
+/// aarch64: VA-width-dependent. The default constant assumes the
+/// 48-bit VA layout (`VA_BITS=48`, T1SZ=16): `KIMAGE_VADDR =
+/// _PAGE_END(48) + SZ_2G = 0xffff_8000_8000_0000`. Kernels with
+/// `VA_BITS=47` (16 KB granule, e.g. Apple Silicon) place the
+/// image at `0xffff_c000_8000_0000`. Production aarch64 paths
+/// must derive the runtime base from `tcr_el1` via
+/// [`start_kernel_map_for_tcr`]; the constant is the test-only
+/// fallback and the bootstrap value before TCR_EL1 is read.
 #[cfg(target_arch = "x86_64")]
 pub(crate) const START_KERNEL_MAP: u64 = 0xffff_ffff_8000_0000;
 #[cfg(target_arch = "aarch64")]
@@ -54,8 +63,8 @@ pub(crate) const VMLINUX_KEEP_SECTIONS: &[&[u8]] = &[
 /// stored `st_value` becomes a guest PA differs by section:
 ///
 /// - `.data`: `st_value` is a kernel VA. `kva_to_pa` (direct mapping)
-///   or `text_kva_to_pa` (text mapping) translates it to a PA that
-///   [`super::reader::GuestMem`] reads directly.
+///   or `text_kva_to_pa_with_base` (text mapping) translates it to a PA
+///   that [`super::reader::GuestMem`] reads directly.
 /// - `.data..percpu`: `sh_addr = 0` on this section, so `st_value` is
 ///   a section-relative offset, NOT a KVA. The per-CPU KVA for CPU
 ///   `n` is `st_value + __per_cpu_offset[n]`; [`compute_rq_pas`]
@@ -129,7 +138,7 @@ pub(crate) struct KernelSymbols {
     /// stuck on a per-rq runnable_list. None when the symbol is absent
     /// (kernel without sched_ext or stripped vmlinux). Lives in
     /// `.data` (file-scope static), so resolution uses
-    /// [`text_kva_to_pa`].
+    /// [`text_kva_to_pa_with_base`].
     pub scx_watchdog_timestamp: Option<u64>,
     /// Kernel virtual address of `jiffies_64` (`u64` global maintained
     /// by the timer subsystem). Used by the dual-snapshot freeze
@@ -267,16 +276,23 @@ impl KernelSymbols {
 /// Read the runtime value of PAGE_OFFSET from guest memory.
 ///
 /// If the vmlinux contains a `page_offset_base` symbol, converts its
-/// KVA to a guest physical address via `__START_KERNEL_map` (the kernel
-/// text mapping), then reads the u64 stored there by the guest kernel.
+/// KVA to a guest physical address via the kernel image base (the
+/// kernel text mapping), then reads the u64 stored there by the guest
+/// kernel. `start_kernel_map` is the runtime base resolved by the
+/// caller (x86_64: [`START_KERNEL_MAP`]; aarch64: derived from
+/// `tcr_el1` via [`start_kernel_map_for_tcr`]).
 ///
 /// Falls back to the compile-time default (0xffff888000000000, x86-64
 /// 4-level paging) when the symbol is absent.
-pub(crate) fn resolve_page_offset(mem: &super::reader::GuestMem, symbols: &KernelSymbols) -> u64 {
+pub(crate) fn resolve_page_offset(
+    mem: &super::reader::GuestMem,
+    symbols: &KernelSymbols,
+    start_kernel_map: u64,
+) -> u64 {
     let Some(pob_kva) = symbols.page_offset_base_kva else {
         return DEFAULT_PAGE_OFFSET;
     };
-    let pob_pa = text_kva_to_pa(pob_kva);
+    let pob_pa = text_kva_to_pa_with_base(pob_kva, start_kernel_map);
     let val = mem.read_u64(pob_pa, 0);
     // Valid PAGE_OFFSET has bit 63 set (upper-half virtual address).
     // Kernels with CONFIG_RANDOMIZE_MEMORY use values like
@@ -293,11 +309,17 @@ pub(crate) fn resolve_page_offset(mem: &super::reader::GuestMem, symbols: &Kerne
 ///
 /// Returns `true` when the guest kernel uses 5-level paging (LA57),
 /// `false` when the symbol is absent or the value is 0.
-pub(crate) fn resolve_pgtable_l5(mem: &super::reader::GuestMem, symbols: &KernelSymbols) -> bool {
+/// `start_kernel_map` is the runtime kernel image base used to
+/// translate the symbol KVA — see [`resolve_page_offset`].
+pub(crate) fn resolve_pgtable_l5(
+    mem: &super::reader::GuestMem,
+    symbols: &KernelSymbols,
+    start_kernel_map: u64,
+) -> bool {
     let Some(kva) = symbols.pgtable_l5_enabled else {
         return false;
     };
-    let pa = text_kva_to_pa(kva);
+    let pa = text_kva_to_pa_with_base(kva, start_kernel_map);
     mem.read_u32(pa, 0) != 0
 }
 
@@ -331,8 +353,104 @@ pub(crate) fn kva_to_pa(kva: u64, page_offset: u64) -> u64 {
 /// `GPA - DRAM_START = VA - KIMAGE_VADDR`. The two cancel.
 ///
 /// Both cases require `nokaslr` on the guest cmdline.
-pub(crate) fn text_kva_to_pa(kva: u64) -> u64 {
-    kva.wrapping_sub(START_KERNEL_MAP)
+///
+/// `start_kernel_map` is the runtime kernel image base — pass
+/// [`START_KERNEL_MAP`] on x86_64 and the value derived via
+/// [`start_kernel_map_for_tcr`] on aarch64. Most callers funnel
+/// through [`super::guest::GuestKernel::text_kva_to_pa`] which
+/// carries the resolved base alongside the symbol map.
+pub(crate) fn text_kva_to_pa_with_base(kva: u64, start_kernel_map: u64) -> u64 {
+    kva.wrapping_sub(start_kernel_map)
+}
+
+/// Derive the aarch64 kernel image base (`KIMAGE_VADDR`) from
+/// `TCR_EL1`.
+///
+/// Mirrors the kernel's `KIMAGE_VADDR = _PAGE_END(VA_BITS_MIN) + SZ_2G`
+/// (`arch/arm64/include/asm/memory.h`), where `VA_BITS_MIN` depends
+/// on both the compile-time `VA_BITS` and the granule. The runtime
+/// values reachable from `TCR_EL1`:
+/// - `T1SZ` (bits [21:16]) → `VA_BITS_runtime = 64 - T1SZ`
+/// - `TG1` (bits [31:30]) → granule (0b01=16 KB, 0b10=4 KB,
+///   0b11=64 KB; 0b00 reserved)
+///
+/// `VA_BITS_MIN` reconstruction (`asm/memory.h:56-64`):
+/// - if `VA_BITS_runtime <= 48`: `VA_BITS_MIN = VA_BITS_runtime`
+///   (per `#else #define VA_BITS_MIN (VA_BITS)`)
+/// - else (52-bit VA): 47 on 16 KB granule, 48 otherwise
+///
+/// Examples (each mapping `_PAGE_END(VA_BITS_MIN) + SZ_2G`):
+/// - `T1SZ=16` (48-bit, 4 KB): `VA_BITS_MIN=48` → `0xFFFF_8000_8000_0000`
+/// - `T1SZ=17` (47-bit, 16 KB Apple Silicon): `VA_BITS_MIN=47` →
+///   `0xFFFF_C000_8000_0000`
+/// - `T1SZ=12` (52-bit, 16 KB): `VA_BITS_MIN=47` →
+///   `0xFFFF_C000_8000_0000`
+/// - `T1SZ=12` (52-bit, 4 KB): `VA_BITS_MIN=48` →
+///   `0xFFFF_8000_8000_0000`
+///
+/// Returns `None` when `tcr_el1 == 0` (BSP loop has not yet read
+/// the register), when `T1SZ == 0` (high-half disabled), when TG1
+/// holds the reserved `0b00` encoding, or when the derived
+/// `VA_BITS` would underflow `_PAGE_END`. Callers in retry loops
+/// should treat `None` as "TCR not ready, retry".
+///
+/// On x86_64 `tcr_el1` is ignored and the compile-time
+/// [`START_KERNEL_MAP`] is returned wrapped in `Some` — the kernel
+/// image lives at the same VA regardless of paging mode (4-level /
+/// 5-level), so the derivation is degenerate.
+pub(crate) fn start_kernel_map_for_tcr(tcr_el1: u64) -> Option<u64> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let _ = tcr_el1;
+        Some(START_KERNEL_MAP)
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if tcr_el1 == 0 {
+            return None;
+        }
+        let t1sz = (tcr_el1 >> 16) & 0x3F;
+        if t1sz == 0 {
+            return None;
+        }
+        let tg1 = (tcr_el1 >> 30) & 0x3;
+        // TG1=0b00 is reserved per Arm ARM D17.2.139; without a
+        // valid granule we cannot determine `VA_BITS_MIN` for the
+        // 52-bit branch.
+        if tg1 == 0 {
+            return None;
+        }
+        let va_bits_runtime: u32 = (64u32).saturating_sub(t1sz as u32);
+        let is_16k_granule = tg1 == 0b01;
+        // VA_BITS_MIN reconstruction. Cap at 48 because
+        // _PAGE_END(VA_BITS_MIN) is what fixes the kernel image
+        // base, and VA_BITS_MIN is always <=48 on current kernels.
+        // Kernels that compile with VA_BITS=52 still place
+        // KIMAGE_VADDR using VA_BITS_MIN (47 with 16 KB pages, 48
+        // otherwise), regardless of whether the runtime activates
+        // 52-bit VA (T1SZ=12).
+        let va_bits_min: u32 = if va_bits_runtime <= 48 {
+            va_bits_runtime
+        } else if is_16k_granule {
+            47
+        } else {
+            48
+        };
+        // _PAGE_END(va) = -(1 << (va - 1)). Reject va==0 (would
+        // shift by -1 / underflow) and va > 64 (shift overflow);
+        // the bounded derivation above guarantees va_bits_min in
+        // [1, 48] on legitimate inputs.
+        if va_bits_min == 0 || va_bits_min > 64 {
+            return None;
+        }
+        let page_end = 0u64.wrapping_sub(1u64 << (va_bits_min - 1));
+        Some(page_end.wrapping_add(0x8000_0000))
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        let _ = tcr_el1;
+        compile_error!("unsupported architecture for start_kernel_map_for_tcr")
+    }
 }
 
 /// Read the `__per_cpu_offset` array from guest memory.
@@ -416,6 +534,83 @@ mod tests {
         let pas = compute_rq_pas(runqueues, &offsets, page_offset);
         assert_eq!(pas[0], 0x20_0000);
         assert_eq!(pas[1], 0x24_0000);
+    }
+
+    #[test]
+    fn start_kernel_map_for_tcr_returns_none_on_zero() {
+        // tcr_el1 = 0 means the BSP loop has not yet read the
+        // register; the derivation cannot proceed and the result
+        // must be None so retry loops keep polling.
+        assert_eq!(start_kernel_map_for_tcr(0), None);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn start_kernel_map_for_tcr_x86_64_constant() {
+        // x86_64 kernel image base does not depend on TCR_EL1
+        // (the register does not exist); the derivation returns
+        // the compile-time constant for any input.
+        assert_eq!(start_kernel_map_for_tcr(0x12345), Some(START_KERNEL_MAP));
+        assert_eq!(start_kernel_map_for_tcr(u64::MAX), Some(START_KERNEL_MAP));
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn start_kernel_map_for_tcr_aarch64_48bit() {
+        // VA_BITS=48, T1SZ=16, TG1=0b10 (4 KB granule).
+        // VA_BITS_MIN=48 → KIMAGE_VADDR = -(1<<47) + 0x8000_0000
+        //               = 0xFFFF_8000_8000_0000.
+        let tcr = (0b10u64 << 30) | (16u64 << 16);
+        assert_eq!(start_kernel_map_for_tcr(tcr), Some(0xFFFF_8000_8000_0000));
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn start_kernel_map_for_tcr_aarch64_47bit_16k() {
+        // VA_BITS=47, T1SZ=17, TG1=0b01 (16 KB granule, Apple Silicon).
+        // VA_BITS_MIN=47 → KIMAGE_VADDR = -(1<<46) + 0x8000_0000
+        //               = 0xFFFF_C000_8000_0000.
+        let tcr = (0b01u64 << 30) | (17u64 << 16);
+        assert_eq!(start_kernel_map_for_tcr(tcr), Some(0xFFFF_C000_8000_0000));
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn start_kernel_map_for_tcr_aarch64_52bit_4k() {
+        // VA_BITS=52, T1SZ=12, TG1=0b10 (4 KB granule, runtime 52-bit).
+        // The kernel image base still uses VA_BITS_MIN=48 (the 4 KB
+        // branch in asm/memory.h:60), so the result matches the
+        // 48-bit layout regardless of T1SZ=12 activating 52-bit VA.
+        let tcr = (0b10u64 << 30) | (12u64 << 16);
+        assert_eq!(start_kernel_map_for_tcr(tcr), Some(0xFFFF_8000_8000_0000));
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn start_kernel_map_for_tcr_aarch64_52bit_16k() {
+        // VA_BITS=52, T1SZ=12, TG1=0b01 (16 KB granule, runtime 52-bit).
+        // VA_BITS_MIN=47 (the 16 KB branch in asm/memory.h:58).
+        let tcr = (0b01u64 << 30) | (12u64 << 16);
+        assert_eq!(start_kernel_map_for_tcr(tcr), Some(0xFFFF_C000_8000_0000));
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn start_kernel_map_for_tcr_aarch64_rejects_reserved_tg1() {
+        // TG1=0b00 is reserved per Arm ARM D17.2.139; without a
+        // valid granule the VA_BITS_MIN derivation cannot pick the
+        // right branch for VA_BITS>48 kernels.
+        let tcr = (0b00u64 << 30) | (16u64 << 16);
+        assert_eq!(start_kernel_map_for_tcr(tcr), None);
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn start_kernel_map_for_tcr_aarch64_rejects_t1sz_zero() {
+        // T1SZ=0 means the high half is disabled; nothing useful
+        // to derive. TG1=0b10 (4 KB) so only T1SZ is the failure.
+        let tcr = 0b10u64 << 30;
+        assert_eq!(start_kernel_map_for_tcr(tcr), None);
     }
 
     #[test]
@@ -504,9 +699,15 @@ mod tests {
     }
 
     #[test]
-    fn text_kva_to_pa_basic() {
-        assert_eq!(text_kva_to_pa(START_KERNEL_MAP + 0x10_0000), 0x10_0000);
-        assert_eq!(text_kva_to_pa(START_KERNEL_MAP), 0);
+    fn text_kva_to_pa_with_base_basic() {
+        assert_eq!(
+            text_kva_to_pa_with_base(START_KERNEL_MAP + 0x10_0000, START_KERNEL_MAP),
+            0x10_0000
+        );
+        assert_eq!(
+            text_kva_to_pa_with_base(START_KERNEL_MAP, START_KERNEL_MAP),
+            0
+        );
     }
 
     #[test]
@@ -569,7 +770,10 @@ mod tests {
             node_data: None,
         };
 
-        assert_eq!(resolve_page_offset(&mem, &symbols), expected_page_offset);
+        assert_eq!(
+            resolve_page_offset(&mem, &symbols, START_KERNEL_MAP),
+            expected_page_offset
+        );
     }
 
     #[test]
@@ -598,7 +802,10 @@ mod tests {
             node_data: None,
         };
 
-        assert_eq!(resolve_page_offset(&mem, &symbols), DEFAULT_PAGE_OFFSET);
+        assert_eq!(
+            resolve_page_offset(&mem, &symbols, START_KERNEL_MAP),
+            DEFAULT_PAGE_OFFSET
+        );
     }
 
     #[test]
@@ -629,7 +836,10 @@ mod tests {
             node_data: None,
         };
 
-        assert_eq!(resolve_page_offset(&mem, &symbols), DEFAULT_PAGE_OFFSET);
+        assert_eq!(
+            resolve_page_offset(&mem, &symbols, START_KERNEL_MAP),
+            DEFAULT_PAGE_OFFSET
+        );
     }
 
     #[test]
@@ -663,7 +873,10 @@ mod tests {
             node_data: None,
         };
 
-        assert_eq!(resolve_page_offset(&mem, &symbols), DEFAULT_PAGE_OFFSET);
+        assert_eq!(
+            resolve_page_offset(&mem, &symbols, START_KERNEL_MAP),
+            DEFAULT_PAGE_OFFSET
+        );
     }
 
     #[test]
@@ -700,7 +913,10 @@ mod tests {
             node_data: None,
         };
 
-        assert_eq!(resolve_page_offset(&mem, &symbols), randomized_page_offset);
+        assert_eq!(
+            resolve_page_offset(&mem, &symbols, START_KERNEL_MAP),
+            randomized_page_offset
+        );
     }
 
     #[test]
@@ -733,7 +949,7 @@ mod tests {
             node_data: None,
         };
 
-        assert!(resolve_pgtable_l5(&mem, &symbols));
+        assert!(resolve_pgtable_l5(&mem, &symbols, START_KERNEL_MAP));
     }
 
     #[test]
@@ -766,7 +982,7 @@ mod tests {
             node_data: None,
         };
 
-        assert!(!resolve_pgtable_l5(&mem, &symbols));
+        assert!(!resolve_pgtable_l5(&mem, &symbols, START_KERNEL_MAP));
     }
 
     #[test]
@@ -795,6 +1011,6 @@ mod tests {
             node_data: None,
         };
 
-        assert!(!resolve_pgtable_l5(&mem, &symbols));
+        assert!(!resolve_pgtable_l5(&mem, &symbols, START_KERNEL_MAP));
     }
 }

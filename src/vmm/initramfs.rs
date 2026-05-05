@@ -975,10 +975,21 @@ pub fn build_suffix(base_len: usize, params: &SuffixParams<'_>) -> Result<Vec<u8
 // POSIX shared-memory cache for base initramfs
 // ---------------------------------------------------------------------------
 
+/// Target arch tag embedded in shm segment names so caches built on
+/// a host running a foreign-arch ktstr binary (cross-arch developer
+/// boxes that share `/dev/shm`) cannot collide with ours. Selected
+/// at compile time so a single binary always emits one tag.
+#[cfg(target_arch = "x86_64")]
+pub(crate) const SHM_ARCH_TAG: &str = "x86_64";
+#[cfg(target_arch = "aarch64")]
+pub(crate) const SHM_ARCH_TAG: &str = "aarch64";
+
 /// Derive an shm segment name from a content hash. Each distinct
 /// combination of payload + scheduler binaries gets its own segment.
+/// The target arch is included so an x86_64 binary cannot mmap a
+/// segment written by an aarch64 binary on the same host.
 pub(crate) fn shm_segment_name(content_hash: u64) -> String {
-    format!("/ktstr-base-{content_hash:016x}")
+    format!("/ktstr-base-{SHM_ARCH_TAG}-{content_hash:016x}")
 }
 
 /// Read-only mmap of a POSIX shared-memory segment. The mapping stays
@@ -1253,17 +1264,17 @@ pub(crate) fn shm_unlink_base(content_hash: u64) {
 
 /// Segment name for the LZ4-compressed version of a base initramfs.
 /// Uses `lz4` prefix to avoid collisions with segments written by
-/// previous compression formats (zstd, gzip).
-#[cfg(target_arch = "x86_64")]
+/// previous compression formats (zstd, gzip). The target arch tag
+/// keeps cross-arch caches separate on hosts where both ktstr
+/// binaries share `/dev/shm`.
 fn shm_lz4_segment_name(content_hash: u64) -> String {
-    format!("/ktstr-lz4-{content_hash:016x}")
+    format!("/ktstr-lz4-{SHM_ARCH_TAG}-{content_hash:016x}")
 }
 
 /// Open the compressed SHM segment and return a held OwnedFd + size.
 /// The fd has a shared flock held; drop the OwnedFd (via
 /// [`shm_close_fd`] or scope exit) to release the lock and close.
 /// Returns `None` on miss or error.
-#[cfg(target_arch = "x86_64")]
 pub(crate) fn shm_open_lz4(content_hash: u64) -> Option<(std::os::fd::OwnedFd, usize)> {
     let name = shm_lz4_segment_name(content_hash);
     let fd = rustix::shm::open(
@@ -1282,7 +1293,6 @@ pub(crate) fn shm_open_lz4(content_hash: u64) -> Option<(std::os::fd::OwnedFd, u
 }
 
 /// Store compressed initramfs data into an LZ4 SHM segment.
-#[cfg(target_arch = "x86_64")]
 pub(crate) fn shm_store_lz4(content_hash: u64, data: &[u8]) -> Result<()> {
     shm_store(&shm_lz4_segment_name(content_hash), data)
 }
@@ -1303,19 +1313,16 @@ pub(crate) fn shm_store_lz4(content_hash: u64, data: &[u8]) -> Result<()> {
 /// (e.g. `ReservationGuard` in the VMM) and is munmapped when that
 /// reservation drops — which must happen BEFORE this guard drops,
 /// so the lock protects the mapping right up until tear-down.
-#[cfg(target_arch = "x86_64")]
 pub(crate) struct CowOverlayGuard {
     fd: std::os::fd::OwnedFd,
 }
 
-#[cfg(target_arch = "x86_64")]
 impl CowOverlayGuard {
     fn new(fd: std::os::fd::OwnedFd) -> Self {
         Self { fd }
     }
 }
 
-#[cfg(target_arch = "x86_64")]
 impl Drop for CowOverlayGuard {
     fn drop(&mut self) {
         // fd was obtained via shm_open in the COW overlay path; release
@@ -1356,7 +1363,6 @@ impl Drop for CowOverlayGuard {
 /// level. The caller is also responsible for ensuring `shm_fd` is a
 /// valid, open file descriptor with `LOCK_SH` already held (the
 /// guard inherits both).
-#[cfg(target_arch = "x86_64")]
 pub(crate) unsafe fn cow_overlay(
     host_addr: *mut u8,
     len: usize,
@@ -1388,7 +1394,6 @@ pub(crate) unsafe fn cow_overlay(
 }
 
 /// Close a SHM fd and release its shared flock.
-#[cfg(target_arch = "x86_64")]
 pub(crate) fn shm_close_fd(fd: std::os::fd::OwnedFd) {
     // Explicit flock-unlock so a cooperating writer waiting on LOCK_EX
     // observes ordering with our earlier reads (LOCK_SH); the OwnedFd
@@ -1452,20 +1457,6 @@ pub(crate) fn lz4_legacy_compress(data: &[u8]) -> Vec<u8> {
         out.extend_from_slice(chunk);
     }
     out
-}
-
-/// Concatenate `base` and `suffix` into a single buffer and compress it
-/// with [`lz4_legacy_compress`]. Used by the aarch64 path, which loads
-/// initramfs as one compressed blob rather than streaming per-part.
-/// The body is arch-neutral (concat + compress). The sole current
-/// caller is the aarch64 loader; the helper stays available for
-/// cross-arch tests or a future x86_64 caller.
-#[allow(dead_code)] // called only from aarch64 loader paths; no cfg-arch gate so x86_64 tests keep it buildable.
-pub(crate) fn lz4_compress_combined(base: &[u8], suffix: &[u8]) -> Vec<u8> {
-    let mut full = Vec::with_capacity(base.len() + suffix.len());
-    full.extend_from_slice(base);
-    full.extend_from_slice(suffix);
-    lz4_legacy_compress(&full)
 }
 
 #[cfg(test)]
@@ -1763,41 +1754,6 @@ mod tests {
         assert!(!names.iter().any(|n| n == "sched_enable"));
         assert!(!names.iter().any(|n| n == "sched_disable"));
         assert!(!names.iter().any(|n| n == "exec_cmd"));
-    }
-
-    #[test]
-    fn lz4_compress_combined_roundtrips() {
-        // The aarch64 loader ships base+suffix as a single compressed
-        // blob rather than streaming per-part (unlike x86_64, which
-        // concatenates pre-compressed parts). Pin the concat+compress
-        // semantic: decompression must yield exactly base ++ suffix,
-        // and the output must start with the LZ4 legacy magic so the
-        // kernel's initramfs decompressor accepts it.
-        let base = b"this is the base initramfs bytes".repeat(64);
-        let suffix = b"and here is the suffix with cpio trailer".repeat(32);
-
-        let compressed = lz4_compress_combined(&base, &suffix);
-        assert_eq!(
-            &compressed[..4],
-            &LZ4_LEGACY_MAGIC,
-            "output must start with LZ4 legacy magic for the kernel decompressor",
-        );
-
-        // Legacy frame: [magic 4B] [chunk_size LE u32] [chunk bytes]...
-        // Input fits in one LZ4_CHUNK_SIZE chunk, so a single chunk suffices.
-        let chunk_size = u32::from_le_bytes(compressed[4..8].try_into().unwrap()) as usize;
-        let expected_uncompressed = base.len() + suffix.len();
-        let decompressed =
-            lz4_flex::block::decompress(&compressed[8..8 + chunk_size], expected_uncompressed)
-                .expect("lz4 block decompress failed");
-
-        let mut concatenated = Vec::with_capacity(expected_uncompressed);
-        concatenated.extend_from_slice(&base);
-        concatenated.extend_from_slice(&suffix);
-        assert_eq!(
-            decompressed, concatenated,
-            "decompressed blob must equal base ++ suffix",
-        );
     }
 
     #[test]

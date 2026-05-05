@@ -190,8 +190,8 @@ fn write_snapshot_reply(
 }
 
 /// Resolve a kernel symbol by name from the vmlinux ELF and arm a
-/// user-watchpoint slot (DR1..=DR3) on it. Returns the slot index
-/// (0..=2 mapping to DR1..=DR3) on success, or a host-side
+/// user watchpoint slot (slots 1..=3) on it. Returns the slot index
+/// (0..=2 mapping to slots 1..=3) on success, or a host-side
 /// diagnostic on failure.
 ///
 /// The vCPU thread's `self_arm_watchpoint` notices the change on
@@ -213,7 +213,7 @@ fn arm_user_watchpoint(
     }
     let Some(idx) = free_slot else {
         return Err(format!(
-            "no free DR slot — DR1..=DR3 all occupied by prior \
+            "no free user watchpoint slot — slots 1..=3 all occupied by prior \
              Op::WatchSnapshot registrations (cap = {})",
             watchpoint.user.len()
         ));
@@ -230,9 +230,11 @@ fn arm_user_watchpoint(
         .ok_or_else(|| format!("symbol '{symbol}' not found in vmlinux symtab"))?;
     if kva & 0x3 != 0 {
         return Err(format!(
-            "symbol '{symbol}' KVA {kva:#x} is not 4-byte aligned \
-             (Intel SDM Vol. 3B Chapter 17 requires DR_LEN_4 \
-             alignment for hardware watchpoints)"
+            "symbol '{symbol}' KVA {kva:#x} is not 4-byte aligned. \
+             x86_64 DR_LEN_4 watchpoints (Intel SDM Vol. 3B Ch. 17) \
+             and aarch64 DBGWVR (ARM ARM D7.3.10, requires VA[1:0] = \
+             00) both require 4-byte aligned targets for the 4-byte \
+             write-watch the failure-dump trigger uses"
         ));
     }
     // Publish tag first, then KVA last (the vCPU's Acquire load on
@@ -526,13 +528,13 @@ impl KtstrVm {
         // path always emits the device's MMIO node on the kernel
         // cmdline (x86_64) / FDT (aarch64), so the kernel's
         // `virtio_mmio` driver probes for the device unconditionally.
-        // Without a corresponding host-side dispatch the probe times
-        // out and the guest falls back to the legacy 200 ms SHM poll;
-        // wiring the device here lets the guest's `shm_poll_loop`
-        // block on `/dev/hvc0` and wake within microseconds when the
-        // host pushes a byte. Coordinator and watchdog use this as the
-        // "ping" channel paired with the SHM control-byte writes
-        // (`DUMP_REQ_OFFSET`, `STALL_REQ_OFFSET`, signal slot 0).
+        // The guest's `shm_poll_loop` blocks on `/dev/hvc0` and wakes
+        // within microseconds when the host pushes a byte. The
+        // coordinator and watchdog use this as the host→guest signal
+        // channel: the monitor pushes `SIGNAL_VC_DUMP` paired with
+        // the SHM `DUMP_REQ_OFFSET` byte for SysRq-D dump requests,
+        // and the watchdog pushes `SIGNAL_VC_SHUTDOWN` for graceful
+        // shutdown.
         let mut vc = virtio_console::VirtioConsole::new();
         vc.set_mem((*vm.guest_mem).clone());
         let virtio_con = Arc::new(PiMutex::new(vc));
@@ -703,6 +705,18 @@ impl KtstrVm {
         // consumer's `as_ref()` chain produces None for that field.
         let perf_capture = Arc::new(open_vcpu_perf_capture(&vcpu_tid_slots));
 
+        // aarch64 TCR_EL1 cache. Populated by the BSP loop on first
+        // successful read post-MMU-bringup. `None` on x86_64 (the
+        // register does not exist there). Threads that build a
+        // `GuestKernel` for page-table walks (monitor, BPF map
+        // writer, freeze coordinator's scan_tick path,
+        // collect_verifier_stats) load this atomic.
+        #[cfg(target_arch = "aarch64")]
+        let tcr_el1_cache: Option<Arc<std::sync::atomic::AtomicU64>> =
+            Some(Arc::new(std::sync::atomic::AtomicU64::new(0)));
+        #[cfg(target_arch = "x86_64")]
+        let tcr_el1_cache: Option<Arc<std::sync::atomic::AtomicU64>> = None;
+
         let monitor_handle = self.start_monitor(
             &vm,
             &kill,
@@ -712,10 +726,17 @@ impl KtstrVm {
             perf_capture.clone(),
             probes_ready_evt_for_monitor,
             Some(virtio_con.clone()),
+            tcr_el1_cache.clone(),
         )?;
 
         // BPF map write thread: sleeps, discovers a BPF map, writes a value.
-        let bpf_write_handle = self.start_bpf_map_write(&vm, &kill, probes_ready_evt_for_bpf)?;
+        let bpf_write_handle = self.start_bpf_map_write(
+            &vm,
+            &kill,
+            probes_ready_evt_for_bpf,
+            tcr_el1_cache.clone(),
+            virtio_con.clone(),
+        )?;
 
         // Run BSP on this thread.
         register_vcpu_signal_handler();
@@ -747,51 +768,11 @@ impl KtstrVm {
         let rt_watchdog = self.performance_mode;
         let wd_service_cpu = self.pinning_plan.as_ref().and_then(|p| p.service_cpu);
         // Clone the virtio-console Arc into the watchdog so the
-        // soft-deadline path can push a wake byte to `/dev/hvc0`
-        // alongside the SHM `SIGNAL_SHUTDOWN_REQ` write. The guest's
-        // `shm_poll_loop` blocks on the device read; without the byte
-        // it observes the SHM signal only at the legacy 200 ms poll
-        // cadence.
+        // soft-deadline path can push `SIGNAL_VC_SHUTDOWN` to
+        // `/dev/hvc0` for graceful shutdown. The guest's
+        // `shm_poll_loop` blocks on the device read and recognises
+        // the byte directly — no SHM signal slot involved.
         let wd_virtio_con = virtio_con.clone();
-
-        // Build GuestMem for the watchdog's graceful shutdown handshake.
-        let wd_shm = if self.shm_size > 0 {
-            let mem = match vm.numa_layout.as_ref() {
-                Some(layout) => monitor::reader::GuestMem::from_layout(layout, &vm.guest_mem),
-                None => {
-                    use vm_memory::GuestMemoryRegion;
-                    let host_base = vm
-                        .guest_mem
-                        .get_host_address(GuestAddress(DRAM_BASE))
-                        .context("resolve guest DRAM base host address (watchdog)")?;
-                    // Size of the first contiguous region only.
-                    // host_base addresses that single mapping; using the
-                    // sum of all region lengths would extend past the
-                    // mapping into host heap when multiple regions exist.
-                    // `guest_mem` is constructed with at least one region
-                    // by every `KtstrKvm` constructor; surfacing this as
-                    // an error rather than `expect()` keeps the
-                    // VM-builder path panic-free even if a future refactor
-                    // introduces a degenerate zero-region path.
-                    let mem_size = vm
-                        .guest_mem
-                        .iter()
-                        .next()
-                        .context("guest_mem must have at least one region (watchdog)")?
-                        .len();
-                    // SAFETY: host_base came from GuestMemoryMmap's
-                    // get_host_address, mapping is owned by vm.guest_mem
-                    // which outlives this GuestMem (both captured by
-                    // the surrounding closure and used only while the
-                    // VM runs).
-                    unsafe { monitor::reader::GuestMem::new(host_base, mem_size) }
-                }
-            };
-            let shm_base = mem.size() - self.shm_size;
-            Some((mem, shm_base))
-        } else {
-            None
-        };
 
         // Freeze coordinator thread: triggers a failure-dump freeze when
         // the BPF probe's `ktstr_err_exit_detected` .bss latch fires
@@ -896,6 +877,25 @@ impl KtstrVm {
         // completes (their `mmio_write` handlers must have already
         // returned for the vCPU to reach the parked state).
         let freeze_coord_virtio_blk = virtio_blk.clone();
+        // Clone the virtio-console Arc into the coordinator so it
+        // can drain port-1 bulk TLV bytes as the guest writes them
+        // (event-driven via the tx_evt eventfd registered into the
+        // coord's epoll set below). Bytes are accumulated into
+        // `coord_bulk_buf` and parsed at the end of the run; an
+        // early SCHED_EXIT TLV flips `kill` so the watchdog and
+        // BSP loop exit promptly.
+        let freeze_coord_virtio_con = virtio_con.clone();
+        // Clone the virtio-console tx_evt so the coord epoll wakes
+        // immediately whenever the guest publishes a TX descriptor
+        // chain on either port (port 0 console or port 1 bulk).
+        // The tx_evt is a per-device counter — both ports share it,
+        // but a spurious wake on port-0 traffic is harmless: the
+        // coord just calls `drain_bulk()` and finds an empty buffer.
+        let freeze_coord_tx_evt = virtio_con
+            .lock()
+            .tx_evt()
+            .try_clone()
+            .context("clone virtio-console tx_evt for coordinator")?;
         let freeze_coord_bsp_parked = bsp_parked.clone();
         let freeze_coord_bsp_regs = bsp_regs.clone();
         let freeze_coord_bsp_done = bsp_done.clone();
@@ -1048,6 +1048,12 @@ impl KtstrVm {
         // for the lifetime of the run — `collect_results` joins
         // the coord BEFORE the eventfds drop.
         let freeze_coord_kill_evt = kill_evt.clone();
+        // aarch64 TCR_EL1 cache populated by the BSP loop. Threaded
+        // into `GuestKernel::new` constructions inside the
+        // freeze-coord scan_tick closure (BPF map accessor and
+        // prog accessor) so vmalloc-backed kernel reads succeed
+        // post-MMU-bringup. None on x86_64.
+        let freeze_coord_tcr_el1 = tcr_el1_cache.clone();
         let freeze_coord_bsp_done_evt = bsp_done_evt.clone();
         // Clone the WatchpointArm.hit_evt for the epoll set. EventFd
         // clones share the underlying counter via dup(2), so the
@@ -1067,6 +1073,61 @@ impl KtstrVm {
         // poll wakes within microseconds rather than waiting on the
         // legacy 10ms park_timeout cadence.
         let freeze_coord_thaw_evt = thaw_evt.clone();
+        // Shared bulk-message buffer: the TOKEN_TX handler in the
+        // coordinator parses port-1 TLV bytes via `HostAssembler`
+        // and drains the per-frame `BulkMessage` values. Without
+        // this buffer those messages would be discarded after the
+        // SCHED_EXIT scan, leaving `collect_results` blind to every
+        // EXIT / TEST / PAYLOAD_METRICS / RAW_PAYLOAD_OUTPUT /
+        // PROFRAW frame the guest already published mid-run. The
+        // post-exit `drain_bulk()` only catches what arrived AFTER
+        // the coordinator stopped draining — not the bulk of a
+        // typical run. The Mutex serialises the coord's pushes
+        // against `collect_results`'s drain; both occur strictly
+        // after the closure spawns and strictly before the
+        // coordinator joins, so contention is rare.
+        let freeze_coord_bulk_messages: Arc<std::sync::Mutex<Vec<crate::vmm::wire::ShmEntry>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let freeze_coord_bulk_messages_for_closure = freeze_coord_bulk_messages.clone();
+
+        // One-time probe of the host's hardware-watchpoint slot
+        // count via `KVM_CHECK_EXTENSION(KVM_CAP_GUEST_DEBUG_HW_WPS)`.
+        // The slot 0 reservation for `*scx_root->exit_kind` plus
+        // [`crate::scenario::snapshot::MAX_WATCH_SNAPSHOTS`] user
+        // slots means the framework needs at least 4 hardware
+        // watchpoint slots to arm every requested
+        // [`crate::scenario::ops::Op::WatchSnapshot`]. KVM returns
+        // the count via `check_extension_int`; `<= 0` means the
+        // capability is unavailable. Log only — do not block VM
+        // creation: a kernel without the capability still runs
+        // tests, just without the watch-driven snapshots, and a
+        // probe failure surfacing here is more actionable than a
+        // silent `KVM_SET_GUEST_DEBUG` rejection later.
+        let hw_wps = vm.vm_fd.check_extension_int(kvm_ioctls::Cap::DebugHwWps);
+        if hw_wps <= 0 {
+            tracing::warn!(
+                "KVM_CAP_GUEST_DEBUG_HW_WPS unavailable on this host \
+                 (returned {hw_wps}); Op::WatchSnapshot triggers may \
+                 not arm — falling back to BPF .bss poll for the \
+                 error-class freeze trigger"
+            );
+        } else {
+            tracing::info!(
+                "KVM host advertises {hw_wps} hardware watchpoint \
+                 slots via KVM_CAP_GUEST_DEBUG_HW_WPS"
+            );
+            if hw_wps < 4 {
+                tracing::warn!(
+                    "KVM host advertises only {hw_wps} hardware \
+                     watchpoint slots; the framework reserves slot 0 \
+                     for the *scx_root->exit_kind error-class trigger \
+                     plus up to {} user slots for Op::WatchSnapshot \
+                     — some watch_snapshot arms may fail",
+                    crate::scenario::snapshot::MAX_WATCH_SNAPSHOTS,
+                );
+            }
+        }
+
         let freeze_coord_handle = std::thread::Builder::new()
             .name("vmm-freeze-coord".into())
             .spawn(move || {
@@ -1081,7 +1142,8 @@ impl KtstrVm {
                 struct RunnableScanCtx {
                     /// KVA of the kernel's global `scx_tasks` LIST_HEAD
                     /// (`kernel/sched/ext.c:47`). The walker reads
-                    /// `scx_tasks.next` via `text_kva_to_pa` and
+                    /// `scx_tasks.next` via the runtime kernel image
+                    /// base ([`Self::start_kernel_map`]) and
                     /// container_of's each list entry back to its
                     /// `task_struct`.
                     scx_tasks_kva: u64,
@@ -1110,9 +1172,18 @@ impl KtstrVm {
                     /// sched_ext or stripped vmlinux); per-rq /
                     /// global walks still cover the per-task case.
                     watchdog_timestamp_pa: Option<u64>,
-                    cr3_pa: u64,
-                    page_offset: u64,
-                    l5: bool,
+                    /// Paging context (cr3_pa / page_offset / l5 /
+                    /// tcr_el1) threaded into the runnable_scan helpers.
+                    walk: crate::monitor::reader::WalkContext,
+                    /// Runtime kernel image base
+                    /// (`__START_KERNEL_map` on x86_64,
+                    /// `KIMAGE_VADDR` on aarch64). Threaded into the
+                    /// runnable_scan helpers so `scx_tasks` and other
+                    /// kernel-text-mapped symbols translate via the
+                    /// VA-bits-aware base resolved from `TCR_EL1` —
+                    /// matches the [`super::super::monitor::guest::GuestKernel`]
+                    /// the surrounding accessors share.
+                    start_kernel_map: u64,
                 }
                 // Lazy-construct BpfMapAccessorOwned. The constructor
                 // parses vmlinux ELF (goblin) and BTF (~MB-scale
@@ -1238,8 +1309,10 @@ impl KtstrVm {
                 // `dump_cpu_time_symbols.scx_tasks` and `runqueues`
                 // feed RunnableScanCtx construction below — the
                 // global walker reads `scx_tasks` directly via
-                // text_kva_to_pa, the per-rq walker uses `runqueues`
-                // + `__per_cpu_offset` to address each CPU's `rq`.
+                // `text_kva_to_pa_with_base` (or
+                // `GuestKernel::text_kva_to_pa`), the per-rq walker uses
+                // `runqueues` + `__per_cpu_offset` to address each
+                // CPU's `rq`.
                 let scan_offsets = dump_btf.as_ref().and_then(|btf| {
                     crate::monitor::btf_offsets::RunnableScanOffsets::from_btf(btf).ok()
                 });
@@ -1273,8 +1346,8 @@ impl KtstrVm {
                 //   1. read scx_root_kva from KernelSymbols (resolved
                 //      once at coord-start via vmlinux);
                 //   2. translate scx_root_kva → root_pa via
-                //      `text_kva_to_pa` (it lives in the kernel text
-                //      mapping, not vmalloc);
+                //      `GuestKernel::text_kva_to_pa` (it lives in the
+                //      kernel text mapping, not vmalloc);
                 //   3. read u64 at root_pa to get sched_kva (the
                 //      vmalloc-allocated `struct scx_sched`);
                 //   4. when sched_kva is non-zero AND the BTF
@@ -1450,6 +1523,15 @@ impl KtstrVm {
                 const TOKEN_DOORBELL: u64 = 2;
                 const TOKEN_WATCHPOINT: u64 = 3;
                 const TOKEN_SCANNER: u64 = 4;
+                /// virtio-console tx_evt — wakes whenever the guest
+                /// publishes a TX descriptor chain on EITHER port.
+                /// The coordinator drains port-1 bulk TLV bytes and
+                /// promotes a SCHED_EXIT entry into the run-wide
+                /// `kill` flag. Port-0 (console) TX wakes are
+                /// harmless: the coord drain returns an empty
+                /// buffer and the byte stays in the host stdout
+                /// thread's `drain_output` slot.
+                const TOKEN_TX: u64 = 5;
                 let epoll = match Epoll::new() {
                     Ok(e) => e,
                     Err(e) => {
@@ -1499,6 +1581,7 @@ impl KtstrVm {
                         "watchpoint_hit_evt",
                     ),
                     (scanner_tfd.as_raw_fd(), TOKEN_SCANNER, "scanner_tfd"),
+                    (freeze_coord_tx_evt.as_raw_fd(), TOKEN_TX, "virtio_console_tx_evt"),
                 ] {
                     if let Err(e) = epoll.ctl(
                         ControlOperation::Add,
@@ -1513,7 +1596,23 @@ impl KtstrVm {
                         return;
                     }
                 }
-                let mut events_buf = [EpollEvent::default(); 5];
+                let mut events_buf = [EpollEvent::default(); 6];
+                // Accumulator for partially-received TLV bulk frames.
+                // The kernel's virtio_console TX path issues
+                // descriptor chains as the guest writes; a single
+                // logical TLV frame can span multiple wakes if the
+                // guest's `write_all` was split across pages or
+                // descriptor sizes. The streaming
+                // [`crate::vmm::bulk::HostAssembler`] retains partial
+                // bytes across `feed` calls so a frame split across
+                // multiple TX wakes is recovered without loss.
+                //
+                // SCHED_EXIT promotion: every drained message is
+                // inspected for [`wire::MSG_TYPE_SCHED_EXIT`]; when
+                // observed, the run-wide `kill` flag flips so the
+                // BSP run loop and the watchdog exit promptly
+                // instead of waiting for the watchdog deadline.
+                let mut bulk_assembler = crate::vmm::bulk::HostAssembler::new();
                 // First iteration always runs scan-tick work so
                 // boot-race lazy resolution attempts fire
                 // immediately rather than waiting up to 100 ms for
@@ -1527,9 +1626,9 @@ impl KtstrVm {
                 let mut scan_tick: bool;
                 let mut first_iter = true;
                 let mut doorbell_pending_from_epoll = false;
-                while !freeze_coord_kill.load(Ordering::Acquire) {
+                'coord: while !freeze_coord_kill.load(Ordering::Acquire) {
                     if freeze_coord_bsp_done.load(Ordering::Acquire) {
-                        return;
+                        break 'coord;
                     }
                     if first_iter {
                         scan_tick = true;
@@ -1544,7 +1643,7 @@ impl KtstrVm {
                                     error = %e,
                                     "freeze-coord: epoll_wait failed; exiting coordinator"
                                 );
-                                return;
+                                break 'coord;
                             }
                         };
                         // Drain every fd that fired. Tokens map
@@ -1566,11 +1665,11 @@ impl KtstrVm {
                                     // of truth and the outer
                                     // `while` re-checks it.
                                     let _ = freeze_coord_kill_evt.read();
-                                    return;
+                                    break 'coord;
                                 }
                                 TOKEN_BSP_DONE => {
                                     let _ = freeze_coord_bsp_done_evt.read();
-                                    return;
+                                    break 'coord;
                                 }
                                 TOKEN_SCANNER => {
                                     // Drain the timerfd's expiry
@@ -1606,6 +1705,79 @@ impl KtstrVm {
                                     // re-loads it with Acquire.
                                     let _ = freeze_coord_hit_evt.read();
                                 }
+                                TOKEN_TX => {
+                                    // Drain the tx_evt counter so
+                                    // a subsequent epoll_wait
+                                    // doesn't immediately re-fire
+                                    // on the same edge. The drain
+                                    // below uses the device's TX
+                                    // buffer (port1_tx_buf) as the
+                                    // source of truth — bytes the
+                                    // device accumulated since the
+                                    // last wake are returned by
+                                    // `drain_bulk` and threaded
+                                    // through `bulk_assembler`. A
+                                    // counter overflow under
+                                    // EFD_NONBLOCK is benign
+                                    // because the buffer state is
+                                    // authoritative.
+                                    let _ = freeze_coord_tx_evt.read();
+                                    let bytes = freeze_coord_virtio_con.lock().drain_bulk();
+                                    let drained = bulk_assembler.feed(&bytes);
+                                    for msg in &drained.messages {
+                                        // Promote a guest-side
+                                        // SCHED_EXIT into the
+                                        // run-wide kill flag so
+                                        // the BSP loop and the
+                                        // watchdog exit promptly
+                                        // instead of running until
+                                        // the watchdog deadline.
+                                        // CRC failures DO NOT
+                                        // promote — a torn frame
+                                        // would otherwise let a
+                                        // hostile guest force a
+                                        // false early exit. Only
+                                        // crc_ok messages count.
+                                        if msg.msg_type
+                                            == crate::vmm::wire::MSG_TYPE_SCHED_EXIT
+                                            && msg.crc_ok
+                                        {
+                                            freeze_coord_kill.store(true, Ordering::Release);
+                                            let _ = freeze_coord_kill_evt.write(1);
+                                        }
+                                    }
+                                    // Stash the parsed messages on
+                                    // the shared buffer so
+                                    // `collect_results` can merge
+                                    // them into the final
+                                    // `ShmDrainResult`. Without
+                                    // this stash, every TLV frame
+                                    // the guest published mid-run
+                                    // (EXIT, TEST, PAYLOAD_METRICS,
+                                    // RAW_PAYLOAD_OUTPUT, PROFRAW)
+                                    // is silently dropped — only
+                                    // late-arriving bytes that
+                                    // landed in `port1_tx_buf`
+                                    // after the coord stopped
+                                    // polling reach the verdict.
+                                    // `BulkMessage` and `ShmEntry`
+                                    // share the same field shape
+                                    // (msg_type / payload / crc_ok)
+                                    // so the conversion is a
+                                    // direct field copy.
+                                    if !drained.messages.is_empty() {
+                                        let mut buf = freeze_coord_bulk_messages_for_closure
+                                            .lock()
+                                            .unwrap_or_else(|e| e.into_inner());
+                                        buf.extend(drained.messages.iter().map(|m| {
+                                            crate::vmm::wire::ShmEntry {
+                                                msg_type: m.msg_type,
+                                                payload: m.payload.clone(),
+                                                crc_ok: m.crc_ok,
+                                            }
+                                        }));
+                                    }
+                                }
                                 _ => {}
                             }
                         }
@@ -1616,10 +1788,10 @@ impl KtstrVm {
                         // the eventfd (counter overflow under
                         // EFD_NONBLOCK).
                         if freeze_coord_kill.load(Ordering::Acquire) {
-                            return;
+                            break 'coord;
                         }
                         if freeze_coord_bsp_done.load(Ordering::Acquire) {
-                            return;
+                            break 'coord;
                         }
                     }
                     // Lazy retry: the accessor's GuestKernel walk
@@ -1635,8 +1807,14 @@ impl KtstrVm {
                         && let (Some(mem), Some(vmlinux)) =
                             (freeze_coord_mem.as_ref(), freeze_coord_vmlinux.as_ref())
                     {
-                        owned_accessor =
-                            crate::monitor::bpf_map::GuestMemMapAccessorOwned::new(mem, vmlinux).ok();
+                        let tcr_val = freeze_coord_tcr_el1
+                            .as_ref()
+                            .map(|c| c.load(Ordering::Acquire))
+                            .unwrap_or(0);
+                        owned_accessor = crate::monitor::bpf_map::GuestMemMapAccessorOwned::new(
+                            mem, vmlinux, tcr_val,
+                        )
+                        .ok();
                     }
                     // Lazy retry for the prog-side accessor. Same
                     // pattern as `owned_accessor` above: the
@@ -1649,8 +1827,15 @@ impl KtstrVm {
                         && let (Some(mem), Some(vmlinux)) =
                             (freeze_coord_mem.as_ref(), freeze_coord_vmlinux.as_ref())
                     {
+                        let tcr_val = freeze_coord_tcr_el1
+                            .as_ref()
+                            .map(|c| c.load(Ordering::Acquire))
+                            .unwrap_or(0);
                         owned_prog_accessor =
-                            crate::monitor::bpf_prog::GuestMemProgAccessorOwned::new(mem, vmlinux).ok();
+                            crate::monitor::bpf_prog::GuestMemProgAccessorOwned::new(
+                                mem, vmlinux, tcr_val,
+                            )
+                            .ok();
                     }
                     // Resolve the per-CPU offset array once the prog
                     // accessor lands. Reads `__per_cpu_offset` from
@@ -1668,8 +1853,16 @@ impl KtstrVm {
                         && let Ok(syms) =
                             crate::monitor::symbols::KernelSymbols::from_vmlinux(vmlinux)
                     {
-                        let pco_pa = crate::monitor::symbols::text_kva_to_pa(
+                        let tcr_val = freeze_coord_tcr_el1
+                            .as_ref()
+                            .map(|c| c.load(Ordering::Acquire))
+                            .unwrap_or(0);
+                        let start_kernel_map =
+                            crate::monitor::symbols::start_kernel_map_for_tcr(tcr_val)
+                                .unwrap_or(crate::monitor::symbols::START_KERNEL_MAP);
+                        let pco_pa = crate::monitor::symbols::text_kva_to_pa_with_base(
                             syms.per_cpu_offset,
+                            start_kernel_map,
                         );
                         let offsets = crate::monitor::symbols::read_per_cpu_offsets(
                             mem,
@@ -1748,9 +1941,7 @@ impl KtstrVm {
                             // repetition was noisy at the freeze hot
                             // path's read site.
                             let kernel = owned.guest_kernel();
-                            let cr3_pa = kernel.cr3_pa();
-                            let page_offset = kernel.page_offset();
-                            let l5 = kernel.l5();
+                            let walk = kernel.walk_context();
                             // BTF-driven offset: load the probe's
                             // program BTF and walk its `.bss`
                             // Datasec for the named global. The
@@ -1802,10 +1993,11 @@ impl KtstrVm {
                             let bss_field_offset = cached_bss_offset.unwrap_or(0);
                             if let Some(translated) = crate::monitor::idr::translate_any_kva(
                                 mem,
-                                cr3_pa,
-                                page_offset,
+                                walk.cr3_pa,
+                                walk.page_offset,
                                 value_kva,
-                                l5,
+                                walk.l5,
+                                walk.tcr_el1,
                             ) {
                                 cached_bss_pa =
                                     Some(translated.wrapping_add(bss_field_offset as u64));
@@ -1847,11 +2039,16 @@ impl KtstrVm {
                         && let Some(ref sched_offs) = scx_offsets.sched
                         && let Some(ref mem) = freeze_coord_mem
                     {
-                        // scx_root is a kernel-text-mapped pointer:
-                        // text_kva_to_pa is the same translation
-                        // `read_scx_sched_state` performs (see
-                        // `monitor/scx_walker.rs::read_scx_sched_state`).
-                        let root_pa = crate::monitor::symbols::text_kva_to_pa(scx_root_kva);
+                        // scx_root is a kernel-text-mapped pointer.
+                        // The owned_accessor's GuestKernel carries the
+                        // VA-bits-aware kernel image base resolved from
+                        // TCR_EL1 (mirrors `read_scx_sched_state` in
+                        // `monitor/scx_walker.rs`).
+                        let kernel_for_root = owned_accessor
+                            .as_ref()
+                            .expect("owned_accessor.is_some() gate above")
+                            .guest_kernel();
+                        let root_pa = kernel_for_root.text_kva_to_pa(scx_root_kva);
                         let sched_kva = mem.read_u64(root_pa, 0);
                         if sched_kva != 0 {
                             // exit_kind field KVA = base of scx_sched
@@ -1891,12 +2088,14 @@ impl KtstrVm {
                                 .as_ref()
                                 .map(|o| o.guest_kernel());
                             let resolve = kernel.and_then(|k| {
+                                let walk = k.walk_context();
                                 let kind_pa = crate::monitor::idr::translate_any_kva(
                                     mem,
-                                    k.cr3_pa(),
-                                    k.page_offset(),
+                                    walk.cr3_pa,
+                                    walk.page_offset,
                                     exit_kind_kva,
-                                    k.l5(),
+                                    walk.l5,
+                                    walk.tcr_el1,
                                 )?;
                                 let host_ptr =
                                     mem.host_ptr_for_pa(kind_pa, 4)? as *mut u32;
@@ -2011,15 +2210,13 @@ impl KtstrVm {
                                 .as_ref()
                                 .ok_or("GuestMem unavailable")?;
                             let kernel = owned.guest_kernel();
-                            let cr3_pa = kernel.cr3_pa();
-                            let page_offset = kernel.page_offset();
-                            let l5 = kernel.l5();
+                            let walk = kernel.walk_context();
                             // Translate jiffies_64's KVA to a PA.
-                            // Lives in the kernel text/data mapping
-                            // (text_kva_to_pa) — same as scx_root
-                            // et al.
-                            let jiffies_64_pa =
-                                crate::monitor::symbols::text_kva_to_pa(jiffies_64_kva);
+                            // Lives in the kernel text/data mapping —
+                            // same as scx_root et al. Use the
+                            // GuestKernel-resident base so VA_BITS=47
+                            // hosts translate correctly.
+                            let jiffies_64_pa = kernel.text_kva_to_pa(jiffies_64_kva);
                             // Compute per-CPU rq PAs for the per-rq
                             // runnable_list walker. The KernelOffsets
                             // schema guarantees `runqueues != 0` (see
@@ -2038,9 +2235,7 @@ impl KtstrVm {
                             // the walk for the online ones. Empty
                             // rq_pas falls back to "global walk only"
                             // through `max_runnable_age`'s wrapper.
-                            let pco_pa = crate::monitor::symbols::text_kva_to_pa(
-                                syms.per_cpu_offset,
-                            );
+                            let pco_pa = kernel.text_kva_to_pa(syms.per_cpu_offset);
                             let pco_offsets = crate::monitor::symbols::read_per_cpu_offsets(
                                 mem,
                                 pco_pa,
@@ -2049,7 +2244,7 @@ impl KtstrVm {
                             let rq_pas = crate::monitor::symbols::compute_rq_pas(
                                 syms.runqueues,
                                 &pco_offsets,
-                                page_offset,
+                                walk.page_offset,
                             );
                             // scx_watchdog_timestamp is a `.data`
                             // file-scope static — same text-mapping
@@ -2061,18 +2256,15 @@ impl KtstrVm {
                             // stripped vmlinux; max_runnable_age
                             // skips the contribution when None.
                             let watchdog_timestamp_pa =
-                                syms.scx_watchdog_timestamp.map(
-                                    crate::monitor::symbols::text_kva_to_pa,
-                                );
+                                syms.scx_watchdog_timestamp.map(|kva| kernel.text_kva_to_pa(kva));
                             Ok(RunnableScanCtx {
                                 scx_tasks_kva,
                                 rq_pas,
                                 offsets: scan_offsets,
                                 jiffies_64_pa,
                                 watchdog_timestamp_pa,
-                                cr3_pa,
-                                page_offset,
-                                l5,
+                                walk,
+                                start_kernel_map: kernel.start_kernel_map(),
                             })
                         };
                         match try_resolve() {
@@ -2565,11 +2757,14 @@ impl KtstrVm {
                                     }
                                     (kva, Some(owned), Some(mem)) => {
                                         let kernel = owned.guest_kernel();
-                                        let cr3_pa = kernel.cr3_pa();
-                                        let page_offset = kernel.page_offset();
-                                        let l5 = kernel.l5();
+                                        let walk = kernel.walk_context();
                                         match crate::monitor::idr::translate_any_kva(
-                                            mem, cr3_pa, page_offset, kva, l5,
+                                            mem,
+                                            walk.cr3_pa,
+                                            walk.page_offset,
+                                            kva,
+                                            walk.l5,
+                                            walk.tcr_el1,
                                         ) {
                                             Some(pa) => {
                                                 let kind = mem.read_u32(pa, 0);
@@ -2958,7 +3153,7 @@ impl KtstrVm {
                     // WATCH. CAPTURE runs `freeze_and_capture(false)`
                     // and stores the report on the bridge under the
                     // tag. WATCH resolves the symbol via the kernel
-                    // ELF, allocates a free DR1..=DR3 slot, publishes
+                    // ELF, allocates a free user watchpoint slot, publishes
                     // the resolved KVA + tag into `WatchpointArm`,
                     // and replies OK so every vCPU's
                     // `self_arm_watchpoint` picks up the new arm
@@ -3214,7 +3409,7 @@ impl KtstrVm {
                             .store(false, Ordering::Release);
                     }
                     // After every doorbell-driven path runs, also
-                    // service any user-watchpoint hits on DR1..=DR3.
+                    // service any user-watchpoint hits on slots 1..=3.
                     // The vCPU's KVM_EXIT_DEBUG handler latches the
                     // matching slot's `hit` flag and writes hit_evt;
                     // the coordinator's epoll fires WATCHPOINT, the
@@ -3332,10 +3527,9 @@ impl KtstrVm {
                             &ctx.rq_pas,
                             &ctx.offsets,
                             jiffies,
-                            ctx.cr3_pa,
-                            ctx.page_offset,
-                            ctx.l5,
+                            ctx.walk,
                             ctx.watchdog_timestamp_pa,
+                            ctx.start_kernel_map,
                         );
                         // Track scan trajectory for the diagnostic
                         // logged when err_triggered fires before the
@@ -3523,10 +3717,9 @@ impl KtstrVm {
                                     &ctx.rq_pas,
                                     &ctx.offsets,
                                     jiffies,
-                                    ctx.cr3_pa,
-                                    ctx.page_offset,
-                                    ctx.l5,
+                                    ctx.walk,
                                     ctx.watchdog_timestamp_pa,
+                                    ctx.start_kernel_map,
                                 );
                             if backstop_max_age >= half_threshold_jiffies {
                                 tracing::info!(
@@ -3855,6 +4048,23 @@ impl KtstrVm {
                     // `scan_tick`, which only fires on the SCANNER
                     // timerfd edge (every 100 ms).
                 }
+                // Flush any partial-frame bytes the bulk_assembler
+                // is still buffering back into the device's
+                // `port1_tx_buf`. The assembler retains tail bytes
+                // when a TLV frame straddles two TX wakes — without
+                // this push-back the residual is dropped on the
+                // floor when the assembler is dropped at closure
+                // exit, and `collect_results`'s end-of-run
+                // `drain_bulk` + `parse_tlv_stream` path never sees
+                // them. Pushing them back means
+                // `collect_results`'s drain returns the residual
+                // alongside any bytes the device accumulated after
+                // the last coordinator drain, and `parse_tlv_stream`
+                // completes the frame.
+                let residual = bulk_assembler.take_residual();
+                if !residual.is_empty() {
+                    freeze_coord_virtio_con.lock().push_back_bulk(&residual);
+                }
             })
             .context("spawn freeze coordinator thread")?;
 
@@ -3971,31 +4181,17 @@ impl KtstrVm {
                         eprintln!("watchdog: BSP kicked");
                         return;
                     }
-                    // Soft deadline: request graceful shutdown via SHM.
-                    // The BSP keeps running so the guest can flush serial
-                    // and reboot normally.
+                    // Soft deadline: request graceful shutdown by
+                    // pushing `SIGNAL_VC_SHUTDOWN` into virtio-console
+                    // RX. The guest's `shm_poll_loop` blocks on
+                    // `/dev/hvc0` and recognises the byte directly —
+                    // no SHM signal slot needed. The BSP keeps running
+                    // so the guest can flush serial and reboot
+                    // normally.
                     if !soft_fired && soft_deadline.is_some_and(|d| Instant::now() >= d) {
                         soft_fired = true;
-                        if let Some((ref mem, shm_base)) = wd_shm {
-                            eprintln!("watchdog: soft deadline, requesting graceful shutdown");
-                            shm_ring::signal_guest_value(
-                                mem,
-                                shm_base,
-                                0,
-                                shm_ring::SIGNAL_SHUTDOWN_REQ,
-                            );
-                        }
-                        // Wake the guest's shm-poll thread by pushing
-                        // a byte into virtio-console RX. The byte
-                        // value is informational only — any byte
-                        // forces the guest to re-read the SHM signal
-                        // slot and the dump/stall control bytes.
-                        // Pushed AFTER the SHM write so the guest
-                        // observes the new signal value when it
-                        // re-checks.
-                        wd_virtio_con
-                            .lock()
-                            .queue_input(&[virtio_console::SIGNAL_VC_SHUTDOWN]);
+                        eprintln!("watchdog: soft deadline, requesting graceful shutdown");
+                        super::host_comms::request_shutdown(&wd_virtio_con);
                     }
                     // Block until the next tick or a kill_evt /
                     // bsp_done_evt write. -1 timeout: deadlines
@@ -4073,6 +4269,7 @@ impl KtstrVm {
                     Some(&parked_evt),
                     Some(&thaw_evt),
                     Some(&kill_evt),
+                    tcr_el1_cache.as_ref(),
                 )
             },
         );
@@ -4127,6 +4324,20 @@ impl KtstrVm {
         let virtio_blk_counters = virtio_blk.as_ref().map(|d| d.lock().counters());
         let virtio_net_counters = virtio_net.as_ref().map(|d| d.lock().counters());
 
+        // Best-effort final TCR_EL1 read from the post-exit BSP.
+        // The BSP loop's lazy CAS already populates `tcr_el1_cache`
+        // via `read_tcr_el1`; this final read covers the (rare)
+        // case where the loop exited before the kernel programmed
+        // the MMU (early-boot crash). On x86_64 `read_tcr_el1`
+        // returns None and the cache stays None.
+        if let Some(ref cache) = tcr_el1_cache
+            && cache.load(Ordering::Acquire) == 0
+            && let Some(val) = exit_dispatch::read_tcr_el1(&mut bsp)
+            && val != 0
+        {
+            cache.store(val, Ordering::Release);
+        }
+
         Ok(VmRunState {
             exit_code,
             timed_out,
@@ -4153,6 +4364,20 @@ impl KtstrVm {
             // lifetime. Forwarded to `VmResult::snapshot_bridge`
             // by `collect_results`.
             snapshot_bridge,
+            tcr_el1: tcr_el1_cache,
+            // Virtio-console handle threaded into `collect_results`
+            // for the post-exit `drain_bulk()` call. Carries any
+            // port-1 TLV bytes the guest wrote that the freeze
+            // coordinator's tx_evt-driven mid-run drain did not
+            // already consume; the merge into `shm_data` keeps
+            // existing readers (eval.rs, sidecar) working without
+            // any per-message-type code change.
+            virtio_con,
+            // Mid-run TLV entries the freeze coordinator already
+            // consumed. `collect_results` merges these with the
+            // post-exit drain and the SHM CRASH ring drain so
+            // every frame the guest published reaches the verdict.
+            bulk_messages: freeze_coord_bulk_messages,
         })
     }
 
@@ -4370,8 +4595,9 @@ impl KtstrVm {
         run_start: Instant,
         vcpu_pthreads: Vec<libc::pthread_t>,
         perf_capture: Arc<Option<monitor::perf_counters::PerfCountersCapture>>,
-        probes_ready_evt: EventFd,
+        _probes_ready_evt: EventFd,
         virtio_con: Option<Arc<PiMutex<virtio_console::VirtioConsole>>>,
+        tcr_el1: Option<Arc<std::sync::atomic::AtomicU64>>,
     ) -> Result<Option<JoinHandle<monitor::reader::MonitorLoopResult>>> {
         let Some(vmlinux) = find_vmlinux(&self.kernel) else {
             return Ok(None);
@@ -4463,10 +4689,37 @@ impl KtstrVm {
                 //     race.
                 // The 500 ms delay bought nothing.
 
-                let page_offset = monitor::symbols::resolve_page_offset(&mem, &symbols);
+                // Resolve the kernel image base. On x86_64 this is
+                // the compile-time constant; on aarch64 it depends
+                // on `VA_BITS_MIN` derived from `TCR_EL1.T1SZ` and
+                // `TCR_EL1.TG1` (granule). The `tcr_el1` cache is
+                // populated lazily by the BSP loop on first
+                // successful read post-MMU bringup — if it's still
+                // 0 here, fall back to the const (48-bit VA), which
+                // is correct on aarch64 with T1SZ=16. VA_BITS=47
+                // (16 KB granule) hosts produce the wrong base in
+                // that race window; the post-wait re-derive below
+                // catches up once TCR_EL1 lands.
+                let start_kernel_map_for_thread =
+                    monitor::symbols::start_kernel_map_for_tcr(
+                        tcr_el1
+                            .as_ref()
+                            .map(|c| c.load(std::sync::atomic::Ordering::Acquire))
+                            .unwrap_or(0),
+                    )
+                    .unwrap_or(monitor::symbols::START_KERNEL_MAP);
+
+                let page_offset = monitor::symbols::resolve_page_offset(
+                    &mem,
+                    &symbols,
+                    start_kernel_map_for_thread,
+                );
 
                 // __per_cpu_offset is a kernel data symbol: use text mapping.
-                let pco_pa = monitor::symbols::text_kva_to_pa(symbols.per_cpu_offset);
+                let pco_pa = monitor::symbols::text_kva_to_pa_with_base(
+                    symbols.per_cpu_offset,
+                    start_kernel_map_for_thread,
+                );
                 let offsets_arr = monitor::symbols::read_per_cpu_offsets(&mem, pco_pa, num_cpus);
                 // Per-CPU addresses (runqueues + offset) are in the
                 // direct mapping: use PAGE_OFFSET.
@@ -4479,7 +4732,10 @@ impl KtstrVm {
                         .scx_root
                         .zip(offsets.watchdog_offsets.as_ref())
                     {
-                        let scx_root_pa = monitor::symbols::text_kva_to_pa(scx_root_kva);
+                        let scx_root_pa = monitor::symbols::text_kva_to_pa_with_base(
+                            scx_root_kva,
+                            start_kernel_map_for_thread,
+                        );
                         return Some(monitor::reader::WatchdogOverride::ScxSched {
                             scx_root_pa,
                             watchdog_offset: wd_offs.scx_sched_watchdog_timeout_off,
@@ -4489,7 +4745,10 @@ impl KtstrVm {
                     }
                     // Pre-7.1 fallback: direct write to scx_watchdog_timeout static global.
                     if let Some(wdt_kva) = symbols.scx_watchdog_timeout {
-                        let watchdog_timeout_pa = monitor::symbols::text_kva_to_pa(wdt_kva);
+                        let watchdog_timeout_pa = monitor::symbols::text_kva_to_pa_with_base(
+                            wdt_kva,
+                            start_kernel_map_for_thread,
+                        );
                         return Some(monitor::reader::WatchdogOverride::StaticGlobal {
                             watchdog_timeout_pa,
                             jiffies,
@@ -4508,7 +4767,10 @@ impl KtstrVm {
                     .zip(offsets.event_offsets.as_ref())
                     .and_then(|(scx_root_kva, ev)| {
                         // scx_root is a kernel data symbol: use text mapping.
-                        let scx_root_pa = monitor::symbols::text_kva_to_pa(scx_root_kva);
+                        let scx_root_pa = monitor::symbols::text_kva_to_pa_with_base(
+                            scx_root_kva,
+                            start_kernel_map_for_thread,
+                        );
                         monitor::reader::resolve_event_pcpu_pas(
                             &mem,
                             scx_root_pa,
@@ -4522,42 +4784,53 @@ impl KtstrVm {
                     pthreads: vcpu_pthreads,
                 };
 
-                // Wait for the guest to signal slot 1 (scheduler loaded)
-                // before discovering struct_ops programs. Without this,
-                // discovery races with scheduler BPF program registration.
-                //
-                // Sleeping is replaced by `poll(POLLIN)` against the
-                // shared `probes_ready_evt`: ANY waiter that detects
-                // its own readiness condition writes 1 to the eventfd
-                // and the level stays high (we never `read` here), so
-                // every other waiter wakes immediately and re-checks.
-                // The 100 ms timeout preserves the prior cadence as
-                // an upper bound for kill / deadline observation when
-                // no other detector has fired yet. On detection here
-                // we write 1 ourselves, fanning out to the
-                // bpf-map-write thread's pollers.
-                if let Some(base) = shm_base_pa {
-                    let slot_pa = base + shm_ring::SIGNAL_SLOT_BASE as u64 + 1;
-                    let deadline = run_start + Duration::from_secs(30);
-                    while std::time::Instant::now() < deadline {
-                        if kill_clone.load(std::sync::atomic::Ordering::Relaxed) {
-                            break;
-                        }
-                        if mem.read_u8(slot_pa, 0) != 0 {
-                            let _ = probes_ready_evt.write(1);
-                            break;
-                        }
-                        poll_eventfd_until_ready_or_timeout(&probes_ready_evt, 100);
-                    }
-                }
+                // The legacy SHM signal slot 1 (`SIGNAL_PROBES_READY`)
+                // gate before struct_ops discovery has been removed
+                // along with the SHM signal-slot infrastructure. The
+                // discovery walker tolerates an empty IDR (returns an
+                // empty `Vec` when no struct_ops programs are loaded
+                // yet) and re-runs every monitor sample, so a race
+                // with scheduler BPF program registration recovers on
+                // the next cycle.
 
                 // Discover struct_ops programs for per-cycle stats.
                 // `cr3_pa` and `l5` are shared with `discover_struct_ops_stats`
                 // and `ProgStatsCtx` so per-CPU `bpf_prog_stats` reads can
                 // page-walk vmalloc-backed percpu.
-                let cr3_pa =
-                    monitor::symbols::text_kva_to_pa(symbols.init_top_pgt.unwrap_or(0));
-                let l5 = monitor::symbols::resolve_pgtable_l5(&mem, &symbols);
+                //
+                // Re-derive the kernel image base at this point: we
+                // just blocked on the guest's slot-1 signal, so the
+                // BSP loop has had time to populate the TCR_EL1
+                // cache even if it was still 0 at thread start.
+                // This is the value that flows into ProgStatsCtx
+                // and the GuestKernel constructions below, so a
+                // late re-read here gets aarch64 VA_BITS=47 hosts
+                // out of the early-boot fallback window.
+                let start_kernel_map_post_wait = monitor::symbols::start_kernel_map_for_tcr(
+                    tcr_el1
+                        .as_ref()
+                        .map(|c| c.load(std::sync::atomic::Ordering::Acquire))
+                        .unwrap_or(0),
+                )
+                .unwrap_or(start_kernel_map_for_thread);
+                let cr3_pa = monitor::symbols::text_kva_to_pa_with_base(
+                    symbols.init_top_pgt.unwrap_or(0),
+                    start_kernel_map_post_wait,
+                );
+                let l5 = monitor::symbols::resolve_pgtable_l5(
+                    &mem,
+                    &symbols,
+                    start_kernel_map_post_wait,
+                );
+                // aarch64 TCR_EL1 (granule + T1SZ) for the
+                // page-table walker. Threaded through ProgStatsCtx
+                // so vmalloc-backed percpu `bpf_prog_stats`
+                // translations succeed once the BSP populates the
+                // cache. Always 0 on x86_64.
+                let tcr_el1_val = tcr_el1
+                    .as_ref()
+                    .map(|c| c.load(std::sync::atomic::Ordering::Acquire))
+                    .unwrap_or(0);
                 let prog_stats_ctx =
                     monitor::btf_offsets::BpfProgOffsets::from_vmlinux(&vmlinux_clone)
                         .ok()
@@ -4576,11 +4849,15 @@ impl KtstrVm {
                             // those cycles.
                             Some(monitor::reader::ProgStatsCtx {
                                 per_cpu_offsets: offsets_arr.clone(),
-                                cr3_pa,
-                                page_offset,
-                                l5,
+                                walk: monitor::reader::WalkContext {
+                                    cr3_pa,
+                                    page_offset,
+                                    l5,
+                                    tcr_el1: tcr_el1_val,
+                                },
                                 prog_idr_kva,
                                 offsets: prog_offsets,
+                                start_kernel_map: start_kernel_map_post_wait,
                             })
                         });
 
@@ -4599,6 +4876,7 @@ impl KtstrVm {
                     shm_base_pa,
                     prog_stats_ctx: prog_stats_ctx.as_ref(),
                     page_offset,
+                    start_kernel_map: start_kernel_map_post_wait,
                 };
                 monitor::reader::monitor_loop(
                     &mem,
@@ -4621,18 +4899,28 @@ impl KtstrVm {
     /// Event-driven sequence:
     /// 1. Poll `BpfMapAccessorOwned::new` until kernel page tables are up
     /// 2. Poll `find_map` until the scheduler's BPF maps are discoverable
-    /// 3. Write the crash value and signal guest via SHM slot 0
+    /// 3. Write each queued value, then push `SIGNAL_BPF_WRITE_DONE`
+    ///    through virtio-console RX so the guest's `shm_poll_loop`
+    ///    sets the `bpf_map_write_done` latch; the scenario's
+    ///    `wait_for_map_write` gate (`Ctx::wait_for_map_write=true`)
+    ///    blocks on that latch until this thread fires.
     ///
     /// `probes_ready_evt` is the broadcast EventFd shared with the
     /// monitor thread (see [`run_vm`]); each phase below `poll`s it
     /// instead of bare-sleeping, and writes 1 to it on detection so
     /// the monitor (and any future waiter) wakes immediately to
     /// re-check its own readiness condition.
+    ///
+    /// `virtio_con` is the shared virtio-console device used to push
+    /// the host→guest wake byte after the writes land. Replaces the
+    /// legacy SHM signal slot 0 notification.
     pub(super) fn start_bpf_map_write(
         &self,
         vm: &kvm::KtstrKvm,
         kill: &Arc<AtomicBool>,
         probes_ready_evt: EventFd,
+        tcr_el1: Option<Arc<std::sync::atomic::AtomicU64>>,
+        virtio_con: Arc<PiMutex<virtio_console::VirtioConsole>>,
     ) -> Result<Option<JoinHandle<()>>> {
         if self.bpf_map_writes.is_empty() {
             return Ok(None);
@@ -4668,7 +4956,6 @@ impl KtstrVm {
         };
         let kill_clone = kill.clone();
         let writes = self.bpf_map_writes.clone();
-        let shm_size = self.shm_size;
 
         let handle = std::thread::Builder::new()
             .name("bpf-map-write".into())
@@ -4694,7 +4981,11 @@ impl KtstrVm {
                 let phase1_deadline =
                     std::time::Instant::now() + std::time::Duration::from_secs(30);
                 let owned = loop {
-                    match monitor::bpf_map::GuestMemMapAccessorOwned::new(&mem, &vmlinux) {
+                    let tcr_val = tcr_el1
+                        .as_ref()
+                        .map(|c| c.load(std::sync::atomic::Ordering::Acquire))
+                        .unwrap_or(0);
+                    match monitor::bpf_map::GuestMemMapAccessorOwned::new(&mem, &vmlinux, tcr_val) {
                         Ok(a) => {
                             let _ = probes_ready_evt.write(1);
                             break a;
@@ -4760,39 +5051,14 @@ impl KtstrVm {
                     resolved.push((params.clone(), map_info));
                 }
 
-                // Phase 3: wait for probes ready, run every queued
-                // write, signal guest once all writes complete.
+                // Phase 3: run every queued write.
                 //
-                // The guest signals slot 1 with SIGNAL_PROBES_READY after
-                // the probe pipeline attaches and the scenario is starting.
-                // Without this gate, the crash fires during scheduler load
-                // before probes capture any events.
-                //
-                // Same `poll(POLLIN)` pattern as phases 1 and 2: wake
-                // on a sibling detection, fall back to the 100 ms
-                // cadence for kill / deadline coverage; write 1 on
-                // detection to fan the wake out to the monitor.
-                if shm_size > 0 {
-                    let shm_base = mem.size() - shm_size;
-                    let ready_deadline =
-                        std::time::Instant::now() + std::time::Duration::from_secs(30);
-                    loop {
-                        if kill_clone.load(Ordering::Acquire) {
-                            return;
-                        }
-                        if std::time::Instant::now() >= ready_deadline {
-                            eprintln!("bpf_map_write: timed out waiting for probes ready");
-                            return;
-                        }
-                        let val = mem.read_u8(shm_base, shm_ring::SIGNAL_SLOT_BASE + 1);
-                        if val >= shm_ring::SIGNAL_PROBES_READY {
-                            let _ = probes_ready_evt.write(1);
-                            break;
-                        }
-                        poll_eventfd_until_ready_or_timeout(&probes_ready_evt, 100);
-                    }
-                    eprintln!("bpf_map_write: guest probes ready, applying queued writes");
-                }
+                // The legacy SHM signal slot 1 (`SIGNAL_PROBES_READY`)
+                // gate that waited for the guest's probe pipeline to
+                // attach has been removed along with the SHM
+                // signal-slot infrastructure. The writes now race
+                // against probe attachment; replacing the rendezvous
+                // with a virtio-console signal is a follow-up.
 
                 // Log all maps for diagnostic visibility.
                 let all_maps = accessor.maps();
@@ -4806,7 +5072,6 @@ impl KtstrVm {
                         .join(", "),
                 );
 
-                let mut all_ok = true;
                 for (params, map_info) in &resolved {
                     let before = accessor.read_value_u32(map_info, params.offset);
                     let ok = accessor.write_value_u32(map_info, params.offset, params.value);
@@ -4815,22 +5080,18 @@ impl KtstrVm {
                         "bpf_map_write: map '{}' write={} (value={} offset={} before={:?} after={:?})",
                         map_info.name, ok, params.value, params.offset, before, after,
                     );
-                    all_ok &= ok;
                 }
 
-                // Signal the guest once every queued write has been
-                // applied. Partial success (one failing write) still
-                // suppresses the signal so the guest proceeds under
-                // its own timeout rather than observing half-applied
-                // state.
-                if all_ok && shm_size > 0 {
-                    let shm_base = mem.size() - shm_size;
-                    shm_ring::signal_guest(&mem, shm_base, 0);
-                    eprintln!(
-                        "bpf_map_write: signaled slot 0 after {} write(s)",
-                        resolved.len(),
-                    );
-                }
+                // Notify the guest that every queued write landed by
+                // pushing `SIGNAL_BPF_WRITE_DONE` into virtio-console
+                // RX. The guest's `shm_poll_loop` blocks on
+                // `/dev/hvc0`, recognises the byte, and sets the
+                // `bpf_map_write_done` latch. A scenario blocked on
+                // [`crate::scenario::Ctx::wait_for_map_write`] resumes
+                // when the latch fires. Replaces the legacy SHM signal
+                // slot 0 notification.
+                super::host_comms::request_bpf_map_write_done(&virtio_con);
+                let _ = (&kill_clone, &probes_ready_evt, &mem);
             })
             .context("spawn bpf-map-write thread")?;
 
@@ -4881,6 +5142,13 @@ impl KtstrVm {
     /// late-trigger poll fires immediately. The arm is one-shot per
     /// KVA value (the per-vCPU `armed_kva` slot suppresses re-arms
     /// after the ioctl lands).
+    ///
+    /// `tcr_el1_cache` (aarch64 only) is populated lazily on first
+    /// successful sysreg read after the guest kernel programs the
+    /// MMU; subsequent iterations short-circuit on a non-zero
+    /// cached value. Threads that build a `GuestKernel` for
+    /// page-table walks load this atomic to feed the
+    /// granule-agnostic walker.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn run_bsp_loop(
         &self,
@@ -4901,6 +5169,7 @@ impl KtstrVm {
         parked_evt: Option<&Arc<EventFd>>,
         thaw_evt: Option<&Arc<EventFd>>,
         kill_evt: Option<&Arc<EventFd>>,
+        tcr_el1_cache: Option<&Arc<std::sync::atomic::AtomicU64>>,
     ) -> (i32, bool) {
         let mut exit_code: i32 = -1;
         // Track which path drove the BSP out of the loop so the
@@ -4911,9 +5180,9 @@ impl KtstrVm {
         // the same `code=-1` sentinel.
         let mut exit_reason = BspExitReason::ExternalKill;
         // Per-BSP `armed_slots` mirrors the AP-side slots — see
-        // [`super::vcpu::self_arm_watchpoint`]. Index 0 = DR0
-        // (err_exit watchpoint); 1..=3 = DR1/DR2/DR3 (user
-        // `Op::WatchSnapshot` arms). All `0` until the coordinator
+        // [`super::vcpu::self_arm_watchpoint`]. Index 0 = slot 0
+        // (exit_kind watchpoint); 1..=3 = user watchpoint slots
+        // (`Op::WatchSnapshot` arms). All `0` until the coordinator
         // publishes resolved KVAs. `arm_failures` counts consecutive
         // non-EINTR ioctl failures; transient EINTR (signal race
         // with the SIGRTMIN kick path) does NOT increment so a
@@ -4921,6 +5190,23 @@ impl KtstrVm {
         // after the first racey iteration.
         let mut armed_slots: [u64; 4] = [0; 4];
         let mut arm_failures: u8 = 0;
+        // aarch64 watchpoint single-step bookkeeping — mirrors the
+        // AP-side state in
+        // [`super::exit_dispatch::vcpu_run_loop_unified`]. The
+        // aarch64 hardware watchpoint trap is taken BEFORE the
+        // offending store retires (ARM ARM D2.10.5), so re-entering
+        // KVM_RUN replays the same instruction unless we disable
+        // the fired slot's WCR.E and assert
+        // KVM_GUESTDBG_SINGLESTEP for one KVM_RUN; the next
+        // KVM_EXIT_DEBUG carries EC=ESR_ELx_EC_SOFTSTP_LOW (0x32),
+        // at which point the dispatch helper clears the flag and
+        // `self_arm_watchpoint` restores WCR.E=1. Inert on x86_64
+        // (the trap is taken AFTER the store, so re-entry advances
+        // normally); the locals still pass through to keep the
+        // per-arch helper signatures shared.
+        let mut single_step_pending: bool = false;
+        let mut single_step_slot: usize = 0;
+        let mut armed_single_step: bool = false;
 
         loop {
             if run_start.elapsed() > timeout {
@@ -4932,6 +5218,21 @@ impl KtstrVm {
             }
             if kill.load(Ordering::Acquire) {
                 break;
+            }
+            // Lazy TCR_EL1 cache populate (aarch64). On x86_64
+            // `read_tcr_el1` returns None and the early-exit keeps
+            // the atomic untouched. The kernel writes TCR_EL1 in
+            // its boot-time MMU bring-up; before that the read
+            // returns 0. Skip on subsequent iterations once the
+            // atomic carries a non-zero value (CAS prevents races
+            // with peer reads from other threads constructing a
+            // `GuestKernel`).
+            if let Some(cache) = tcr_el1_cache
+                && cache.load(Ordering::Acquire) == 0
+                && let Some(val) = exit_dispatch::read_tcr_el1(bsp)
+                && val != 0
+            {
+                let _ = cache.compare_exchange(0, val, Ordering::Release, Ordering::Relaxed);
             }
             // Honour a pending freeze before re-entering KVM_RUN.
             // Same drain-dance + park pattern as the AP run loop —
@@ -4955,8 +5256,23 @@ impl KtstrVm {
             }
             // Self-arm the failure-dump watchpoint when the
             // coordinator has resolved a new KVA. Cheap (atomic load
-            // and compare) when no new arm is pending.
-            self_arm_watchpoint(bsp, watchpoint, &mut armed_slots, &mut arm_failures);
+            // and compare) when no new arm is pending. Also drives
+            // the aarch64 watchpoint single-step transition: when
+            // `single_step_pending` is set by the prior watchpoint
+            // exit, this call reissues KVM_SET_GUEST_DEBUG with the
+            // fired slot's WCR.E cleared and KVM_GUESTDBG_SINGLESTEP
+            // asserted; when the SOFTSTP_LOW exit clears the flag,
+            // the next call restores WCR.E=1 and drops the
+            // singlestep bit.
+            self_arm_watchpoint(
+                bsp,
+                watchpoint,
+                &mut armed_slots,
+                &mut arm_failures,
+                single_step_pending,
+                single_step_slot,
+                &mut armed_single_step,
+            );
 
             match bsp.run() {
                 Ok(mut exit) => {
@@ -4985,45 +5301,13 @@ impl KtstrVm {
                     // `vcpu_run_loop_unified` for the same
                     // rationale.
                     if let VcpuExit::Debug(debug_arch) = &exit {
-                        let dr6 = debug_arch.dr6;
-                        let dr0_hit = (dr6 & (1 << 0)) != 0;
-                        let dr1_hit = (dr6 & (1 << 1)) != 0;
-                        let dr2_hit = (dr6 & (1 << 2)) != 0;
-                        let dr3_hit = (dr6 & (1 << 3)) != 0;
-                        if dr0_hit {
-                            let host_ptr = watchpoint.kind_host_ptr.load(Ordering::Acquire);
-                            if !host_ptr.is_null() {
-                                // SAFETY: see the AP-side handler in
-                                // `exit_dispatch::vcpu_run_loop_unified`.
-                                let kind = unsafe { std::ptr::read_volatile(host_ptr) };
-                                if kind >= super::vcpu::SCX_EXIT_ERROR_THRESHOLD {
-                                    watchpoint.latch_hit();
-                                } else {
-                                    tracing::debug!(
-                                        kind,
-                                        threshold = super::vcpu::SCX_EXIT_ERROR_THRESHOLD,
-                                        "BSP watchpoint fired on non-error \
-                                         exit_kind transition (e.g. \
-                                         SCX_EXIT_DONE on clean shutdown); \
-                                         skipping freeze trigger"
-                                    );
-                                }
-                            } else {
-                                // Conservative fallback when
-                                // host_ptr is null — see the AP
-                                // handler for rationale.
-                                watchpoint.latch_hit();
-                            }
-                        }
-                        if dr1_hit {
-                            watchpoint.latch_user_hit(0);
-                        }
-                        if dr2_hit {
-                            watchpoint.latch_user_hit(1);
-                        }
-                        if dr3_hit {
-                            watchpoint.latch_user_hit(2);
-                        }
+                        exit_dispatch::dispatch_watchpoint_hit(
+                            watchpoint,
+                            debug_arch,
+                            &armed_slots,
+                            &mut single_step_pending,
+                            &mut single_step_slot,
+                        );
                         if kill.load(Ordering::Acquire) {
                             break;
                         }
@@ -5163,9 +5447,43 @@ impl KtstrVm {
             let _ = h.join();
         }
 
-        // Merge mid-flight drain (from monitor thread) with post-mortem
-        // drain (snapshot after VM exit). Mid-flight entries come first
-        // since they were drained during execution.
+        // Drain the virtio-console port-1 TX accumulator: the guest
+        // wrote bulk TLV-framed messages (STIMULUS, EXIT, SCHED_EXIT,
+        // PAYLOAD_METRICS, RAW_PAYLOAD_OUTPUT, etc.) to
+        // `/dev/vport0p1`; the host side accumulated them into
+        // `port1_tx_buf` and we parse them here through
+        // `parse_tlv_stream` (same TLV format the SHM ring uses, so
+        // the rest of `collect_results` consumes them via the
+        // existing `ShmDrainResult` shape). Port-1 carries no drops
+        // — virtio_console TX backpressure replaces ring-full drops
+        // — so the merged `drops` count comes solely from the
+        // mid-flight + post-mortem SHM CRASH-only ring.
+        let bulk_bytes = run.virtio_con.lock().drain_bulk();
+        let mut bulk_drain = shm_ring::parse_tlv_stream(&bulk_bytes);
+        // Prepend the entries the freeze coordinator already parsed
+        // mid-run. The coord's TOKEN_TX handler streams port-1
+        // bytes through `HostAssembler` so a SCHED_EXIT can flip
+        // the run-wide kill flag without waiting for VM exit;
+        // those parsed frames stash here on every drain so
+        // `collect_results` can recover them after the coord has
+        // joined. Without this merge every guest-side EXIT / TEST
+        // / PAYLOAD_METRICS / RAW_PAYLOAD_OUTPUT / PROFRAW frame
+        // consumed mid-run would be silently lost — `drain_bulk()`
+        // above only catches what arrived AFTER the coord stopped
+        // polling, which on a typical run is empty. Mid-run
+        // entries come first so the merged stream stays in
+        // chronological order.
+        let mut mid_run_bulk = match run.bulk_messages.lock() {
+            Ok(mut g) => std::mem::take(&mut *g),
+            Err(p) => std::mem::take(&mut *p.into_inner()),
+        };
+        mid_run_bulk.extend(bulk_drain.entries);
+        bulk_drain.entries = mid_run_bulk;
+
+        // Merge mid-flight drain (from monitor thread, port-1 byte
+        // stream) with post-mortem SHM CRASH ring drain. Mid-flight
+        // entries come first since they were drained during
+        // execution.
         let (shm_data, stimulus_events) = if (self.shm_size as usize) >= shm_ring::HEADER_SIZE {
             let mem_size = (self.effective_memory_mb(&run.vm.guest_mem) as u64) << 20;
             let shm_base = DRAM_BASE + mem_size - self.shm_size;
@@ -5175,9 +5493,15 @@ impl KtstrVm {
                 .guest_mem
                 .read_slice(&mut shm_buf, GuestAddress(shm_base))
                 .context("read SHM region")?;
+            // Post-mortem SHM drain catches the panic-hook
+            // MSG_TYPE_CRASH path (the only writer that still uses
+            // SHM directly via `write_msg_nonblocking` — see
+            // `shm_ring::write_msg` doc) plus any pre-port-open
+            // early-boot fallback writes.
             let post_mortem = shm_ring::shm_drain(&shm_buf, 0);
 
             let mut all_entries = mid_flight_drain.entries;
+            all_entries.extend(bulk_drain.entries);
             all_entries.extend(post_mortem.entries);
             let drops = mid_flight_drain.drops.max(post_mortem.drops);
 
@@ -5190,6 +5514,24 @@ impl KtstrVm {
                 Some(shm_ring::ShmDrainResult {
                     entries: all_entries,
                     drops,
+                }),
+                events,
+            )
+        } else if !bulk_drain.entries.is_empty() {
+            // SHM region is too small or absent (e.g. tests that
+            // exercise the bulk-port path without provisioning SHM).
+            // Build the result purely from port-1 entries.
+            let mut all_entries = mid_flight_drain.entries;
+            all_entries.extend(bulk_drain.entries);
+            let events: Vec<shm_ring::StimulusEvent> = all_entries
+                .iter()
+                .filter(|e| e.msg_type == shm_ring::MSG_TYPE_STIMULUS && e.crc_ok)
+                .filter_map(|e| shm_ring::StimulusEvent::from_payload(&e.payload))
+                .collect();
+            (
+                Some(shm_ring::ShmDrainResult {
+                    entries: all_entries,
+                    drops: mid_flight_drain.drops,
                 }),
                 events,
             )
@@ -5231,7 +5573,7 @@ impl KtstrVm {
         });
 
         // Collect BPF verifier stats from host-side memory reads.
-        let verifier_stats = self.collect_verifier_stats(&run.vm);
+        let verifier_stats = self.collect_verifier_stats(&run.vm, run.tcr_el1.as_ref());
 
         // Sample cleanup elapsed AFTER every blocking step that runs on
         // the post-BSP-exit critical path so the duration captures the
@@ -5271,6 +5613,7 @@ impl KtstrVm {
     pub(super) fn collect_verifier_stats(
         &self,
         vm: &kvm::KtstrKvm,
+        tcr_el1: Option<&Arc<std::sync::atomic::AtomicU64>>,
     ) -> Vec<monitor::bpf_prog::ProgVerifierStats> {
         let vmlinux = match find_vmlinux(&self.kernel) {
             Some(v) => v,
@@ -5298,7 +5641,18 @@ impl KtstrVm {
                 unsafe { monitor::reader::GuestMem::new(host_base, mem_size) }
             }
         };
-        let kernel = match monitor::guest::GuestKernel::new(&mem, &vmlinux) {
+        // TCR_EL1 (aarch64) drives the granule-agnostic page-table
+        // walker. The BSP populates this Arc<AtomicU64> on first
+        // successful read post-MMU-bringup; by collect_verifier_stats
+        // time it is either set (kernel booted) or 0 (kernel never
+        // brought MMU up, e.g. early boot crash). The walker treats
+        // 0 as "no TCR available — translation unsupported", which
+        // matches the boot-crash case where verifier stats are
+        // unavailable anyway.
+        let tcr_val = tcr_el1
+            .map(|c| c.load(std::sync::atomic::Ordering::Acquire))
+            .unwrap_or(0);
+        let kernel = match monitor::guest::GuestKernel::new(&mem, &vmlinux, tcr_val) {
             Ok(k) => k,
             Err(_) => return Vec::new(),
         };

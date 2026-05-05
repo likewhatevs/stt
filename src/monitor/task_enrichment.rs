@@ -301,11 +301,16 @@ pub fn walk_task_enrichment(
     pc: Option<u64>,
 ) -> Option<TaskEnrichment> {
     let mem = kernel.mem();
-    let cr3_pa = kernel.cr3_pa();
-    let page_offset = kernel.page_offset();
-    let l5 = kernel.l5();
+    let walk = kernel.walk_context();
 
-    let task_pa = translate_any_kva(mem, cr3_pa, page_offset, task_kva, l5)?;
+    let task_pa = translate_any_kva(
+        mem,
+        walk.cr3_pa,
+        walk.page_offset,
+        task_kva,
+        walk.l5,
+        walk.tcr_el1,
+    )?;
 
     // Identity.
     let pid = mem.read_u32(task_pa, offsets.task_struct_pid) as i32;
@@ -338,21 +343,13 @@ pub fn walk_task_enrichment(
 
     // Pointer follows: group_leader, real_parent, signal.
     let group_leader_kva = mem.read_u64(task_pa, offsets.task_struct_group_leader);
-    let group_leader_pid = follow_task_for_pid(
-        mem,
-        cr3_pa,
-        page_offset,
-        l5,
-        group_leader_kva,
-        offsets.task_struct_pid,
-    );
+    let group_leader_pid =
+        follow_task_for_pid(mem, walk, group_leader_kva, offsets.task_struct_pid);
 
     let real_parent_kva = mem.read_u64(task_pa, offsets.task_struct_real_parent);
     let (real_parent_pid, real_parent_comm) = follow_task_for_pid_and_comm(
         mem,
-        cr3_pa,
-        page_offset,
-        l5,
+        walk,
         real_parent_kva,
         offsets.task_struct_pid,
         offsets.task_struct_comm,
@@ -362,7 +359,14 @@ pub fn walk_task_enrichment(
     let (nr_threads, signal_nvcsw, signal_nivcsw, pgid, sid) = if signal_kva == 0 {
         (None, None, None, None, None)
     } else {
-        match translate_any_kva(mem, cr3_pa, page_offset, signal_kva, l5) {
+        match translate_any_kva(
+            mem,
+            walk.cr3_pa,
+            walk.page_offset,
+            signal_kva,
+            walk.l5,
+            walk.tcr_el1,
+        ) {
             None => (None, None, None, None, None),
             Some(signal_pa) => {
                 let nr_threads_v = mem.read_u32(signal_pa, offsets.signal_struct_nr_threads) as i32;
@@ -374,9 +378,7 @@ pub fn walk_task_enrichment(
                 // pid number.
                 let pgid_v = read_pid_nr_at_index(
                     mem,
-                    cr3_pa,
-                    page_offset,
-                    l5,
+                    walk,
                     signal_pa,
                     offsets.signal_struct_pids,
                     pid_type::PGID,
@@ -386,9 +388,7 @@ pub fn walk_task_enrichment(
                 );
                 let sid_v = read_pid_nr_at_index(
                     mem,
-                    cr3_pa,
-                    page_offset,
-                    l5,
+                    walk,
                     signal_pa,
                     offsets.signal_struct_pids,
                     pid_type::SID,
@@ -448,9 +448,7 @@ fn read_comm(mem: &super::reader::GuestMem, task_pa: u64, comm_off: usize) -> St
 /// `(pid, comm)`. Returns `(None, None)` on any failure.
 fn follow_task_for_pid_and_comm(
     mem: &super::reader::GuestMem,
-    cr3_pa: u64,
-    page_offset: u64,
-    l5: bool,
+    walk: super::reader::WalkContext,
     task_kva: u64,
     pid_off: usize,
     comm_off: usize,
@@ -458,7 +456,14 @@ fn follow_task_for_pid_and_comm(
     if task_kva == 0 {
         return (None, None);
     }
-    let Some(task_pa) = translate_any_kva(mem, cr3_pa, page_offset, task_kva, l5) else {
+    let Some(task_pa) = translate_any_kva(
+        mem,
+        walk.cr3_pa,
+        walk.page_offset,
+        task_kva,
+        walk.l5,
+        walk.tcr_el1,
+    ) else {
         return (None, None);
     };
     let pid = mem.read_u32(task_pa, pid_off) as i32;
@@ -469,16 +474,21 @@ fn follow_task_for_pid_and_comm(
 /// Translate a `task_struct *` and read just the pid.
 fn follow_task_for_pid(
     mem: &super::reader::GuestMem,
-    cr3_pa: u64,
-    page_offset: u64,
-    l5: bool,
+    walk: super::reader::WalkContext,
     task_kva: u64,
     pid_off: usize,
 ) -> Option<i32> {
     if task_kva == 0 {
         return None;
     }
-    let task_pa = translate_any_kva(mem, cr3_pa, page_offset, task_kva, l5)?;
+    let task_pa = translate_any_kva(
+        mem,
+        walk.cr3_pa,
+        walk.page_offset,
+        task_kva,
+        walk.l5,
+        walk.tcr_el1,
+    )?;
     Some(mem.read_u32(task_pa, pid_off) as i32)
 }
 
@@ -496,9 +506,7 @@ fn follow_task_for_pid(
 #[allow(clippy::too_many_arguments)]
 fn read_pid_nr_at_index(
     mem: &super::reader::GuestMem,
-    cr3_pa: u64,
-    page_offset: u64,
-    l5: bool,
+    walk: super::reader::WalkContext,
     signal_pa: u64,
     pids_off: usize,
     idx: usize,
@@ -510,7 +518,14 @@ fn read_pid_nr_at_index(
     if pid_kva == 0 {
         return None;
     }
-    let pid_pa = translate_any_kva(mem, cr3_pa, page_offset, pid_kva, l5)?;
+    let pid_pa = translate_any_kva(
+        mem,
+        walk.cr3_pa,
+        walk.page_offset,
+        pid_kva,
+        walk.l5,
+        walk.tcr_el1,
+    )?;
     // numbers[0] is at offset `numbers_off`; subsequent levels are at
     // `numbers_off + level * upid_size`. We always read level 0
     // (root pid namespace) per the kernel's `pid_nr` contract.

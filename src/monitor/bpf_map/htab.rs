@@ -129,7 +129,14 @@ pub(super) fn iter_percpu_htab_entries(
                     continue;
                 }
                 let cpu_kva = percpu_base.wrapping_add(cpu_off);
-                match translate_any_kva(ctx.mem, ctx.cr3_pa.0, ctx.page_offset.0, cpu_kva, ctx.l5) {
+                match translate_any_kva(
+                    ctx.mem,
+                    ctx.cr3_pa.0,
+                    ctx.page_offset.0,
+                    cpu_kva,
+                    ctx.l5,
+                    ctx.tcr_el1,
+                ) {
                     // `checked_add` against a pathological cpu_pa
                     // + value_size that would wrap u64 — without
                     // the guard, a wrap would silently make
@@ -170,9 +177,14 @@ where
     // bpf_htab embeds bpf_map at offset 0, so map_kva == htab_kva.
     let htab_kva = map.map_kva;
 
-    let Some(htab_pa) =
-        translate_any_kva(ctx.mem, ctx.cr3_pa.0, ctx.page_offset.0, htab_kva, ctx.l5)
-    else {
+    let Some(htab_pa) = translate_any_kva(
+        ctx.mem,
+        ctx.cr3_pa.0,
+        ctx.page_offset.0,
+        htab_kva,
+        ctx.l5,
+        ctx.tcr_el1,
+    ) else {
         return Vec::new();
     };
     let n_buckets = ctx.mem.read_u32(htab_pa, htab.htab_n_buckets);
@@ -198,9 +210,14 @@ where
 
     for i in 0..n_buckets {
         let bucket_kva = buckets_kva + (i as u64) * (htab.bucket_size as u64);
-        let Some(bucket_pa) =
-            translate_any_kva(ctx.mem, ctx.cr3_pa.0, ctx.page_offset.0, bucket_kva, ctx.l5)
-        else {
+        let Some(bucket_pa) = translate_any_kva(
+            ctx.mem,
+            ctx.cr3_pa.0,
+            ctx.page_offset.0,
+            bucket_kva,
+            ctx.l5,
+            ctx.tcr_el1,
+        ) else {
             continue;
         };
 
@@ -221,9 +238,14 @@ where
             // node_ptr == KVA of the hlist_nulls_node == htab_elem
             // (hash_node first in the union).
             let elem_kva = node_ptr;
-            let Some(elem_pa) =
-                translate_any_kva(ctx.mem, ctx.cr3_pa.0, ctx.page_offset.0, elem_kva, ctx.l5)
-            else {
+            let Some(elem_pa) = translate_any_kva(
+                ctx.mem,
+                ctx.cr3_pa.0,
+                ctx.page_offset.0,
+                elem_kva,
+                ctx.l5,
+                ctx.tcr_el1,
+            ) else {
                 break;
             };
 

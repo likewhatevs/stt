@@ -17,7 +17,7 @@ use crate::monitor::btf_offsets::{NR_VM_NUMA_EVENT_ITEMS, NumaStatsOffsets};
 use crate::monitor::dump::PerNodeNumaStats;
 use crate::monitor::guest::GuestKernel;
 use crate::monitor::idr::translate_any_kva;
-use crate::monitor::symbols::{KernelSymbols, text_kva_to_pa};
+use crate::monitor::symbols::KernelSymbols;
 
 /// `MAX_NR_ZONES` upper bound from `include/linux/mmzone.h`. With
 /// `CONFIG_ZONE_DEVICE` the kernel exposes 5 zones (ZONE_DMA,
@@ -68,7 +68,7 @@ pub(crate) fn build(
 /// non-null and reachable.
 ///
 /// The `node_data` array lives in the kernel image (`.data`/`.bss`),
-/// so its slots are read at `text_kva_to_pa(node_data_kva + i*8)`.
+/// so its slots are read at `kernel.text_kva_to_pa(node_data_kva) + i*8`.
 /// Each slot value is a direct-mapping kernel virtual address
 /// (`__va(nd_pa)`); per-zone reads use [`translate_any_kva`] which
 /// tries the direct-mapping translation first, then the page-table
@@ -80,7 +80,7 @@ fn walk_node_data(
     nr_nodes: u32,
 ) -> Vec<PerNodeNumaStats> {
     let mut out = Vec::with_capacity(nr_nodes as usize);
-    let node_data_pa = text_kva_to_pa(node_data_kva);
+    let node_data_pa = kernel.text_kva_to_pa(node_data_kva);
     let mem = kernel.mem();
     for node in 0..nr_nodes {
         let pgdat_kva = mem.read_u64(node_data_pa, (node as usize) * 8);
@@ -107,12 +107,14 @@ fn read_per_node_stats(
     node: u32,
 ) -> Option<PerNodeNumaStats> {
     let mem = kernel.mem();
+    let walk = kernel.walk_context();
     let pgdat_pa = translate_any_kva(
         mem,
-        kernel.cr3_pa(),
-        kernel.page_offset(),
+        walk.cr3_pa,
+        walk.page_offset,
         pgdat_kva,
-        kernel.l5(),
+        walk.l5,
+        walk.tcr_el1,
     )?;
 
     let mut sums = [0u64; NR_VM_NUMA_EVENT_ITEMS];
@@ -153,7 +155,9 @@ fn read_per_node_stats(
 mod tests {
     use super::*;
     use crate::monitor::reader::GuestMem;
-    use crate::monitor::symbols::{DEFAULT_PAGE_OFFSET, START_KERNEL_MAP};
+    use crate::monitor::symbols::{
+        DEFAULT_PAGE_OFFSET, START_KERNEL_MAP, text_kva_to_pa_with_base,
+    };
     use std::collections::HashMap;
 
     /// Layout helper for synthetic walks. Builds a buffer with
@@ -268,7 +272,8 @@ mod tests {
     #[test]
     fn offline_node_skipped() {
         let mut layout = NumaLayout::build(2);
-        let node_data_pa = text_kva_to_pa(layout.node_data_kva) as usize;
+        let node_data_pa =
+            text_kva_to_pa_with_base(layout.node_data_kva, START_KERNEL_MAP) as usize;
         for b in &mut layout.buf[node_data_pa + 8..node_data_pa + 16] {
             *b = 0;
         }

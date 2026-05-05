@@ -5,8 +5,9 @@
 //! `read_bytes` uses `copy_nonoverlapping` for bulk copies. Multi-region
 //! NUMA layouts are supported: each read/write resolves the target
 //! region via binary search. It also implements 4-level and 5-level
-//! x86-64 page table walks and 3-level aarch64 walks (64KB granule)
-//! for vmalloc'd addresses.
+//! x86-64 page table walks and a granule-agnostic aarch64 walker (4 KB
+//! / 16 KB / 64 KB, level count derived from TCR_EL1.T1SZ and TG1) for
+//! vmalloc'd addresses.
 //!
 //! The monitor loop (`monitor_loop`) periodically reads per-CPU
 //! runqueue state from guest memory and collects `MonitorSample`s.
@@ -35,6 +36,42 @@ pub(crate) struct MemRegion {
     pub(crate) offset: u64,
     /// Size in bytes.
     pub(crate) size: u64,
+}
+
+/// Bundle of guest paging state threaded through every host-side KVA
+/// translation call: the top-level page-table PA, the direct-map base,
+/// the x86 5-level paging flag, and the cached aarch64 TCR_EL1.
+///
+/// Replaces the four-parameter fan (`cr3_pa`, `page_offset`, `l5`,
+/// `tcr_el1`) that previously rode every page-walking signature in
+/// [`super::bpf_prog`], [`super::task_enrichment`],
+/// [`super::runnable_scan`], [`super::scx_walker`], and the freeze
+/// coordinator's task / numa capture paths. The leaf walkers
+/// [`GuestMem::translate_kva`] and [`super::idr::translate_any_kva`]
+/// retain their unbundled signatures; intermediate callers pass
+/// [`WalkContext`] and destructure at the leaf invocation. All four
+/// fields originate in [`super::guest::GuestKernel`] (via its
+/// accessors) and travel together; bundling them keeps signatures
+/// terse without changing the values being passed.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct WalkContext {
+    /// Guest physical address of the top-level page-table page (CR3 on
+    /// x86, TTBR1 on aarch64). Threaded into [`GuestMem::translate_kva`]
+    /// for vmalloc / module / per-CPU-percpu translations.
+    pub cr3_pa: u64,
+    /// Kernel direct-map base (`PAGE_OFFSET` on x86_64, linear-map
+    /// base on aarch64). Adding this to a DRAM offset yields a KVA;
+    /// subtracting it from a KVA yields the DRAM offset that
+    /// [`GuestMem::read_bytes`] consumes.
+    pub page_offset: u64,
+    /// 5-level paging flag (x86 LA57). True when the guest enabled
+    /// CR4.LA57 and CR3 points at a PML5 root. Ignored on aarch64.
+    pub l5: bool,
+    /// Cached aarch64 TCR_EL1 register (granule + T1SZ). Drives the
+    /// page-table walker's granule and high-half-VA-width decoding.
+    /// Always 0 on x86_64 where the register does not exist; the
+    /// walker ignores the field on that arch.
+    pub tcr_el1: u64,
 }
 
 /// Host pointer to the start of guest DRAM. Offsets passed to read/write
@@ -531,19 +568,30 @@ impl GuestMem {
     /// page table walk.
     ///
     /// x86-64: supports 4-level (PGD -> PUD -> PMD -> PTE) and 5-level
-    /// (PML5 -> P4D -> PUD -> PMD -> PTE) paging.
+    /// (PML5 -> P4D -> PUD -> PMD -> PTE) paging. `tcr_el1` is ignored.
     ///
-    /// aarch64: 3-level walk with AArch64 translation table descriptors
-    /// (64KB granule, 48-bit VA). `l5` is ignored.
+    /// aarch64: granule-agnostic walker driven by TCR_EL1.TG1
+    /// (4 KB / 16 KB / 64 KB) and TCR_EL1.T1SZ (high-half VA size).
+    /// Handles block descriptors at intermediate levels (huge pages).
+    /// `l5` is ignored.
     ///
     /// `cr3_pa` is the physical address of the top-level page table.
     /// `l5` selects 5-level paging (x86 LA57); use `resolve_pgtable_l5`
-    /// to detect the guest's mode at runtime.
+    /// to detect the guest's mode at runtime. `tcr_el1` is the
+    /// guest's TCR_EL1 register (aarch64 only); read it via
+    /// `KVM_GET_ONE_REG` once at coordinator start.
     /// Returns `None` if any level is not present or the address is
     /// out of guest memory bounds.
-    pub(crate) fn translate_kva(&self, cr3_pa: u64, kva: Kva, l5: bool) -> Option<u64> {
+    pub(crate) fn translate_kva(
+        &self,
+        cr3_pa: u64,
+        kva: Kva,
+        l5: bool,
+        tcr_el1: u64,
+    ) -> Option<u64> {
         #[cfg(target_arch = "x86_64")]
         {
+            let _ = tcr_el1; // aarch64-only register; ignored on x86_64
             if l5 {
                 self.walk_5level(cr3_pa, kva)
             } else {
@@ -552,8 +600,8 @@ impl GuestMem {
         }
         #[cfg(target_arch = "aarch64")]
         {
-            let _ = l5; // x86-only flag; aarch64 here always uses the 3-level 64KB granule path
-            self.walk_3level_aarch64_64k(cr3_pa, kva)
+            let _ = l5; // x86-only flag; aarch64 reads TCR_EL1 instead
+            self.walk_aarch64(cr3_pa, kva, tcr_el1)
         }
     }
 
@@ -613,102 +661,195 @@ impl GuestMem {
         Some((ptee & ADDR_MASK) | page_off)
     }
 
-    /// aarch64 page table walk (64KB granule, 3-level, 48-bit VA).
+    /// aarch64 page table walk, granule-agnostic.
     ///
-    /// TTBR_EL1 -> PGD -> PMD -> PTE.
-    /// With 64KB pages and 48-bit VA, the kernel uses 3 levels:
-    ///   PGD: bits [47:42] = 6 bits, 64 entries
-    ///   PMD: bits [41:29] = 13 bits, 8192 entries
-    ///   PTE: bits [28:16] = 13 bits, 8192 entries
-    ///   page offset: bits [15:0] = 16 bits
+    /// Reads TCR_EL1.TG1 to select the granule (4 KB / 16 KB / 64 KB)
+    /// and TCR_EL1.T1SZ for the high-half VA size, then iterates the
+    /// translation tables with the matching stride/level configuration.
+    /// Handles block descriptors at intermediate levels for huge pages.
+    ///
+    /// TG1 encoding (TCR_EL1[31:30], distinct from TG0[15:14]):
+    /// `0b01` = 16 KB (stride 11), `0b10` = 4 KB (stride 9),
+    /// `0b11` = 64 KB (stride 13). `0b00` is reserved per Arm ARM
+    /// D17.2.139 and the walker rejects it as unmapped. T1SZ in bits
+    /// [21:16]; VA width = `64 - T1SZ`. Starting level computed as
+    /// `4 - (va_width - 4) / stride` — the bottom of the descriptor
+    /// cascade is always level 3.
     ///
     /// Descriptor format (ARMv8 D5.3):
     /// - bits [1:0] = 0b00: invalid
-    /// - bits [1:0] = 0b01: block descriptor (PGD/PMD levels)
-    /// - bits [1:0] = 0b11: table descriptor (PGD/PMD) or page (PTE)
-    /// - bits [47:16]: output address for 64KB granule
+    /// - bits [1:0] = 0b01: block descriptor (intermediate levels) or
+    ///   reserved (level 3, treated as invalid)
+    /// - bits [1:0] = 0b11: table descriptor (intermediate levels) or
+    ///   page descriptor (level 3)
+    /// - high-order OA bits depend on the granule (48-bit OA assumed
+    ///   for FEAT_LPA / FEAT_LPA2 disabled; ktstr's kconfig fragment
+    ///   does not enable `CONFIG_ARM64_VA_BITS_52`, so the OA stays in
+    ///   bits [47:granule_log2]).
     ///
-    /// Page table entries contain guest physical addresses (GPAs). Since
-    /// GuestMem is mapped at DRAM_START, all GPAs are adjusted by
-    /// subtracting DRAM_START to produce offsets into the memory region.
+    /// Page table entries contain guest physical addresses (GPAs).
+    /// Since GuestMem offsets are DRAM-relative on aarch64 (DRAM_BASE
+    /// at offset 0), every GPA is adjusted by `checked_sub(DRAM_START)`
+    /// before use — descriptors whose payloads fall below DRAM_START
+    /// (corrupt or attacker-controlled) are rejected as "not present"
+    /// rather than silently wrapping to near-`u64::MAX`.
     ///
-    /// # 52-bit VA (`CONFIG_ARM64_VA_BITS_52`) is unsupported.
+    /// `ttbr_pa` is the DRAM-relative offset of the top-level table
+    /// (typically `text_kva_to_pa_with_base(swapper_pg_dir_kva,
+    /// start_kernel_map)` for the kernel-half pgd at boot).
     ///
-    /// Pinning to 48-bit VA: with 52-bit VA the kernel uses extended
-    /// addressing where the PGD index spans bits [51:42] (10 bits, 1024
-    /// entries) AND the OA in each descriptor splices the high VA bits
-    /// [51:48] into bits [15:12] of the descriptor word — the address
-    /// mask `0x0000_FFFF_FFFF_0000` would silently lose those bits and
-    /// the walker would produce wrong PAs without crashing. ktstr's
-    /// kconfig fragment (`ktstr.kconfig`) does not enable
-    /// `CONFIG_ARM64_VA_BITS_52`, and `CONFIG_ARM64_64K_PAGES` is also
-    /// not enabled — so the practical assumption is 48-bit VA. If a
-    /// future user pins `CONFIG_ARM64_VA_BITS_52=y`, this walker must
-    /// be replaced with a 52-bit-aware variant before the monitor
-    /// reads guest page tables on that kernel.
+    /// 52-bit VA / FEAT_LPA / FEAT_LPA2 are NOT supported. `ktstr.kconfig`
+    /// does not enable `CONFIG_ARM64_VA_BITS_52`, so the high-OA splice
+    /// path required for those configs is intentionally absent. If a
+    /// future user pins `CONFIG_ARM64_VA_BITS_52=y`, this walker must be
+    /// extended with the LPA / LPA2 high-OA bit handling before the
+    /// monitor reads guest page tables on that kernel.
     #[cfg(target_arch = "aarch64")]
-    fn walk_3level_aarch64_64k(&self, ttbr_pa: u64, kva: Kva) -> Option<u64> {
-        use crate::vmm::kvm::DRAM_START;
+    fn walk_aarch64(&self, ttbr_pa: u64, kva: Kva, tcr_el1: u64) -> Option<u64> {
+        use crate::vmm::aarch64::kvm::DRAM_START;
 
-        const VALID: u64 = 1;
-        // 0b11 means "table descriptor" at PGD/PMD levels and "page
-        // descriptor" at the PTE level. Same encoding, role-dependent
-        // interpretation per ARMv8-A.
-        const TABLE: u64 = 0b11;
-        const BLOCK: u64 = 0b01;
-        const DESC_MASK: u64 = 0b11;
-        // OA mask for 64KB granule: bits [47:16]
-        const ADDR_MASK: u64 = 0x0000_FFFF_FFFF_0000;
+        // TCR_EL1.T1SZ — high-half VA size offset. Bits [21:16].
+        let t1sz = (tcr_el1 >> 16) & 0x3F;
+        // TCR_EL1.TG1 — high-half granule. Bits [31:30].
+        // Encoding: 0b01=16K, 0b10=4K, 0b11=64K.
+        let tg1 = (tcr_el1 >> 30) & 0x3;
+        if t1sz == 0 {
+            // T1SZ=0 means the high-half region is disabled. The
+            // monitor only reads kernel-half KVAs, so without a valid
+            // T1SZ we cannot walk; treat as unmapped.
+            return None;
+        }
 
-        // Convert a guest physical address to a DRAM-relative offset.
+        let stride: u64 = match tg1 {
+            0b11 => 13,       // 64 KB granule
+            0b01 => 11,       // 16 KB granule
+            0b10 => 9,        // 4 KB granule
+            _ => return None, // 0b00 is reserved per ARMv8 D17.2.139
+        };
+
+        // VA width = 64 - T1SZ; starting level computed so the cascade
+        // ends at level 3. Level numbering follows the ARM ARM:
+        // level 0 is the topmost table for 4 KB / 4-level, level 3 is
+        // the leaf.
+        let va_width = 64 - t1sz;
+        // Guard the `va_width - 4` subtraction against underflow when
+        // T1SZ is pathologically large (>60). Architecturally T1SZ is
+        // bounded but the field comes from a guest register; reject
+        // configurations the walker cannot represent rather than
+        // wrapping around.
+        if va_width < 4 {
+            return None;
+        }
+        let levels_below = (va_width - 4) / stride;
+        // The starting level is `4 - levels_below`. Two failure modes:
+        // - `levels_below == 0` means the cascade starts at level 4,
+        //   one level beyond the leaf at level 3. The walker would
+        //   then compose a nonsense 8-byte "page" from the descriptor's
+        //   low bits without ever touching a translation table. Reject.
+        // - `levels_below > 4` means the cascade needs more than 4
+        //   levels and would underflow `4 - levels_below`. Reject
+        //   before the subtraction wraps.
+        if levels_below == 0 || levels_below > 4 {
+            return None;
+        }
+        let mut level: u64 = 4 - levels_below;
+
+        // Per-level index width = stride bits; descriptor entry is 8
+        // bytes (3 low bits). `indexmask_grainsize` = (1 << (stride+3)) - 1
+        // — covers the byte index inside one table.
+        let indexmask_grainsize: u64 = (!0u64) >> (64 - (stride + 3));
+        // First-level index width is the residual VA above the
+        // remaining levels: VA_width - stride * (3 - level).
+        // Restated as `va_width - stride*(4-level)` matches the
+        // cloud-hypervisor formulation.
+        let mut indexmask: u64 = (!0u64) >> (64 - (va_width - stride * (4 - level)));
+        // Descriptor address mask: descriptor bits [47:granule_log2]
+        // hold the next-level table or output address. Top-bit mask is
+        // `(1 << 48) - 1` (48-bit OA without LPA/LPA2). The low
+        // granule bits are cleared via `& !indexmask_grainsize`.
+        let descaddrmask: u64 = ((!0u64) >> (64 - 48)) & !indexmask_grainsize;
+
+        // Translation table base: TTBR1_EL1 bits [47:0] — but the caller
+        // already passed a DRAM-relative offset (text_kva_to_pa_with_base
+        // of the pgd symbol), so we treat `ttbr_pa` directly as the
+        // table's GuestMem offset and only mask off any ASID-style high
+        // bits.
+        let mut descaddr: u64 = ttbr_pa & ((!0u64) >> (64 - 48));
+
+        // Convert a descriptor's GPA payload to a DRAM-relative offset.
         // `checked_sub` rejects descriptors whose payload addresses fall
         // below DRAM_START — a malicious or corrupted descriptor that
         // wraps would otherwise produce a near-u64::MAX offset and cause
         // out-of-bounds reads. Treat underflow as "not present" (None).
         let to_offset = |gpa: u64| -> Option<u64> { gpa.checked_sub(DRAM_START) };
 
-        // 3-level walk for 64KB granule, 48-bit VA.
         let kva_bits = kva.0;
-        let pgd_idx = (kva_bits >> 42) & 0x3F; // bits [47:42], 6 bits
-        let pmd_idx = (kva_bits >> 29) & 0x1FFF; // bits [41:29], 13 bits
-        let pte_idx = (kva_bits >> 16) & 0x1FFF; // bits [28:16], 13 bits
-        let page_off = kva_bits & 0xFFFF; // bits [15:0], 16 bits
 
-        // PGD — ttbr_pa is already a GuestMem offset.
-        let pgd_off = (ttbr_pa & ADDR_MASK) + pgd_idx * 8;
-        let pgde = self.read_u64(pgd_off, 0);
-        if pgde & VALID == 0 {
-            return None;
-        }
-        // PGD block: 4TB region (unlikely but spec-allowed)
-        if pgde & DESC_MASK == BLOCK {
-            let base = pgde & 0x0000_FC00_0000_0000;
-            return Some(to_offset(base)? | (kva_bits & 0x3FF_FFFF_FFFF));
+        // Descriptor cascade. Each iteration reads one 8-byte table
+        // entry, and either descends (table descriptor) or terminates
+        // (block descriptor, page descriptor, or invalid).
+        loop {
+            let table_offset: u64 = (kva_bits >> (stride * (4 - level))) & indexmask;
+            // Compose the byte offset of this level's descriptor inside
+            // the table. The `& !7` aligns to 8-byte boundary; on the
+            // first iteration `descaddr` is the (DRAM-relative) table
+            // base, on subsequent iterations it's already the
+            // descriptor's table base extracted from the previous
+            // descriptor.
+            descaddr |= table_offset;
+            descaddr &= !7u64;
+
+            let descriptor = self.read_u64(descaddr, 0);
+            // bits [1:0] = 0b00 → invalid; 0b01 at level 3 is
+            // reserved (also treated as invalid for kernel-half KVAs).
+            if descriptor & 1 == 0 {
+                return None;
+            }
+            // ARMv8 D5.3: at level 3, descriptor bit 1 must be set
+            // (0b11 = page descriptor). 0b01 is reserved at the leaf
+            // level and would be misread as a "block at level 3" by
+            // the descend/leaf logic below — reject it explicitly.
+            if level == 3 && (descriptor & 2) == 0 {
+                return None;
+            }
+
+            // Extract the next-level / output address. For a 48-bit
+            // OA, `descaddrmask` already strips both the high bits
+            // beyond [47:0] and the low granule bits.
+            let next = descriptor & descaddrmask;
+
+            // Bit 1 distinguishes table (1) from block (0) at
+            // intermediate levels; at level 3, bit 1 is always 1
+            // (page descriptor) — a leaf entry.
+            //
+            // Per ARM ARM D5.3, level 0 is table-only for the 4 KB
+            // granule (no 512 GB block descriptors). The fall-through
+            // below would still treat a level-0 block descriptor as a
+            // leaf, but Linux never generates that pattern — the
+            // walker stays correct in practice.
+            if (descriptor & 2) != 0 && level < 3 {
+                // Table descriptor — descend. The next iteration will
+                // index into the table whose base GPA is `next`,
+                // converted to a DRAM-relative offset.
+                descaddr = to_offset(next)?;
+                level += 1;
+                indexmask = indexmask_grainsize;
+                continue;
+            }
+
+            // Leaf entry: either a block descriptor at level 1 / 2
+            // (huge page) or a page descriptor at level 3.
+            descaddr = next;
+            break;
         }
 
-        // PMD
-        let pmd_off = to_offset(pgde & ADDR_MASK)? + pmd_idx * 8;
-        let pmde = self.read_u64(pmd_off, 0);
-        if pmde & VALID == 0 {
-            return None;
-        }
-        // PMD block: 512MB region
-        if pmde & DESC_MASK == BLOCK {
-            let base = pmde & 0x0000_FFFF_E000_0000;
-            return Some(to_offset(base)? | (kva_bits & 0x1FFF_FFFF));
-        }
-
-        // PTE — page descriptor (bits [1:0] = 0b11)
-        let pte_off = to_offset(pmde & ADDR_MASK)? + pte_idx * 8;
-        let ptee = self.read_u64(pte_off, 0);
-        if ptee & VALID == 0 {
-            return None;
-        }
-        if ptee & DESC_MASK != TABLE {
-            return None;
-        }
-
-        Some(to_offset(ptee & ADDR_MASK)? | page_off)
+        // Compose the final guest physical address: page-aligned
+        // descriptor output OR'd with the in-page offset of `kva`.
+        // `page_size` covers the level's translation granularity:
+        // 4 KB at level 3, larger blocks higher up.
+        let page_size: u64 = 1u64 << ((stride * (4 - level)) + 3);
+        let pa_gpa = (descaddr & !(page_size - 1)) | (kva_bits & (page_size - 1));
+        to_offset(pa_gpa)
     }
 
     /// 5-level page table walk: CR3 -> PML5 -> P4D -> PUD -> PMD -> PTE.
@@ -871,17 +1012,26 @@ fn read_sd_stats(mem: &GuestMem, sd_pa: u64, so: &SchedDomainStatsOffsets) -> Sc
 ///
 /// `sd->name` is a `char *` pointer to a static string in kernel rodata.
 /// Rodata lives in the text mapping (`__START_KERNEL_map`), so
-/// `text_kva_to_pa` is tried first. Falls back to direct mapping
-/// (`kva_to_pa`) for kernels that place topology name strings
-/// differently. Returns an empty string if the pointer is null or
-/// translation fails.
-fn read_sd_name(mem: &GuestMem, sd_pa: u64, name_offset: usize, page_offset: u64) -> String {
+/// `text_kva_to_pa_with_base` is tried first. Falls back to direct
+/// mapping (`kva_to_pa`) for kernels that place topology name strings
+/// differently. `start_kernel_map` is the runtime kernel image base
+/// (`__START_KERNEL_map` on x86_64; derived from `TCR_EL1.T1SZ` on
+/// aarch64) so VA_BITS=47 hosts read the right rodata bytes.
+/// Returns an empty string if the pointer is null or translation
+/// fails.
+fn read_sd_name(
+    mem: &GuestMem,
+    sd_pa: u64,
+    name_offset: usize,
+    page_offset: u64,
+    start_kernel_map: u64,
+) -> String {
     let name_kva = mem.read_u64(sd_pa, name_offset);
     if name_kva == 0 {
         return String::new();
     }
     // Try text mapping first (rodata), then direct mapping.
-    let text_pa = super::symbols::text_kva_to_pa(name_kva);
+    let text_pa = super::symbols::text_kva_to_pa_with_base(name_kva, start_kernel_map);
     let name_pa = if text_pa < mem.size() {
         text_pa
     } else {
@@ -904,7 +1054,9 @@ fn read_sd_name(mem: &GuestMem, sd_pa: u64, name_offset: usize, page_offset: u64
 /// Starts at `rq->sd` (the lowest-level domain), walks `sd->parent`
 /// until NULL. Each domain is kmalloc'd and lives in the direct mapping.
 ///
-/// `page_offset` is the runtime `PAGE_OFFSET` for direct-mapping translation.
+/// `page_offset` is the runtime `PAGE_OFFSET` for direct-mapping translation;
+/// `start_kernel_map` is the runtime kernel image base used by
+/// [`read_sd_name`] to translate `sd->name` rodata pointers.
 ///
 /// Returns `None` if `rq->sd` is null (domain not yet built, or CPU
 /// offline). Returns an empty `Vec` if the first domain pointer cannot
@@ -918,6 +1070,7 @@ pub(crate) fn read_sched_domain_tree(
     rq_pa: u64,
     sd_offsets: &SchedDomainOffsets,
     page_offset: u64,
+    start_kernel_map: u64,
 ) -> Option<Vec<SchedDomainSnapshot>> {
     const MAX_DEPTH: usize = 8;
 
@@ -952,7 +1105,13 @@ pub(crate) fn read_sched_domain_tree(
         }
 
         let level = mem.read_u32(sd_pa, sd_offsets.sd_level) as i32;
-        let name = read_sd_name(mem, sd_pa, sd_offsets.sd_name, page_offset);
+        let name = read_sd_name(
+            mem,
+            sd_pa,
+            sd_offsets.sd_name,
+            page_offset,
+            start_kernel_map,
+        );
         let flags = mem.read_u32(sd_pa, sd_offsets.sd_flags) as i32;
         let span_weight = mem.read_u32(sd_pa, sd_offsets.sd_span_weight);
 
@@ -1249,24 +1408,24 @@ pub(crate) struct ProgStatsCtx {
     /// Per-CPU offset table (`__per_cpu_offset[]`) used to translate
     /// each program's percpu stats pointer into a concrete KVA.
     pub per_cpu_offsets: Vec<u64>,
-    /// Guest physical address of the top-level page table. Threaded
-    /// through to [`super::bpf_prog::walk_struct_ops_runtime_stats`]
-    /// so per-CPU `bpf_prog_stats` allocations that fall outside the
-    /// direct mapping (vmalloc-backed percpu) translate via a
-    /// page-table walk instead of being silently dropped.
-    pub cr3_pa: u64,
-    /// Runtime `PAGE_OFFSET` used for direct-mapping KVA translation.
-    pub page_offset: u64,
-    /// 5-level paging flag — true when the guest uses 5-level page
-    /// tables (LA57). Threaded into `translate_kva` calls along with
-    /// `cr3_pa`.
-    pub l5: bool,
+    /// Paging context ([`WalkContext`]) threaded into
+    /// [`super::bpf_prog::walk_struct_ops_runtime_stats`] so per-CPU
+    /// `bpf_prog_stats` allocations that fall outside the direct
+    /// mapping (vmalloc-backed percpu) translate via a page-table
+    /// walk instead of being silently dropped.
+    pub walk: WalkContext,
     /// `prog_idr` symbol KVA (kernel BSS). Read each sample to walk
     /// all loaded BPF programs.
     pub prog_idr_kva: u64,
     /// BTF offsets for the `bpf_prog` + related struct fields read
     /// while summing stats.
     pub offsets: super::btf_offsets::BpfProgOffsets,
+    /// Runtime kernel image base (`__START_KERNEL_map` on x86_64,
+    /// derived `KIMAGE_VADDR` on aarch64). Threaded into
+    /// [`super::bpf_prog::walk_struct_ops_runtime_stats`] so
+    /// `prog_idr` symbol KVAs translate correctly even on aarch64
+    /// kernels with VA_BITS != 48.
+    pub start_kernel_map: u64,
 }
 
 /// Samples, SHM drain, and optional watchdog observation returned by
@@ -1316,6 +1475,12 @@ pub(crate) struct MonitorConfig<'a> {
     /// sched_domain tree walking to translate `rq->sd` and `sd->parent`
     /// pointers.
     pub page_offset: u64,
+    /// Runtime kernel image base (`__START_KERNEL_map` on x86_64,
+    /// `KIMAGE_VADDR` on aarch64). Threaded into [`read_sd_name`] so
+    /// the rodata-string fast path translates `sd->name` correctly on
+    /// aarch64 hosts where the base depends on `VA_BITS` (16 KB-granule
+    /// kernels with VA_BITS=47 vs the 48-bit default).
+    pub start_kernel_map: u64,
 }
 
 /// Run the monitor loop, sampling all CPUs at the given interval
@@ -1352,6 +1517,7 @@ pub(crate) fn monitor_loop(
     let shm_base_pa = cfg.shm_base_pa;
     let prog_stats_ctx = cfg.prog_stats_ctx;
     let page_offset = cfg.page_offset;
+    let start_kernel_map = cfg.start_kernel_map;
     let preemption_threshold_ns = if preemption_threshold_ns > 0 {
         preemption_threshold_ns
     } else {
@@ -1522,7 +1688,8 @@ pub(crate) fn monitor_loop(
         if let Some(sd) = &offsets.sched_domain_offsets {
             for (i, cpu) in cpus.iter_mut().enumerate() {
                 if let Some(&rq_pa) = rq_pas.get(i) {
-                    cpu.sched_domains = read_sched_domain_tree(mem, rq_pa, sd, page_offset);
+                    cpu.sched_domains =
+                        read_sched_domain_tree(mem, rq_pa, sd, page_offset, start_kernel_map);
                 }
             }
         }
@@ -1619,19 +1786,25 @@ pub(crate) fn monitor_loop(
                     .any(|s| s.sustained(t.sustained_samples));
 
             if sustained {
-                mem.write_u8(
-                    trigger.shm_base_pa,
-                    crate::vmm::shm_ring::DUMP_REQ_OFFSET,
-                    crate::vmm::shm_ring::DUMP_REQ_SYSRQ_D,
-                );
-                // Wake the guest's shm-poll thread via virtio-console
-                // RX so it re-reads the SHM dump byte within
-                // microseconds rather than at the legacy 200 ms poll
-                // cadence. Pushed AFTER the SHM write so the guest
-                // observes the new value when it re-checks.
+                // Combined SHM-byte-then-wake-byte sequence via the
+                // typed [`crate::vmm::host_comms::request_dump`]
+                // helper. The helper enforces the load-bearing
+                // ordering (SHM byte first so the guest's
+                // shm_poll_loop sees the new value when it re-checks
+                // after the wake).
                 if let Some(ref vc) = trigger.virtio_con {
-                    vc.lock()
-                        .queue_input(&[crate::vmm::virtio_console::SIGNAL_VC_DUMP]);
+                    crate::vmm::host_comms::request_dump(mem, trigger.shm_base_pa, vc);
+                } else {
+                    // No virtio-console attached — write the SHM
+                    // byte alone; the guest's poll loop catches it
+                    // on the next 200 ms cycle. This branch is
+                    // legacy-test scaffolding; production runs
+                    // always populate trigger.virtio_con.
+                    mem.write_u8(
+                        trigger.shm_base_pa,
+                        crate::vmm::shm_ring::DUMP_REQ_OFFSET,
+                        crate::vmm::shm_ring::DUMP_REQ_SYSRQ_D,
+                    );
                 }
                 dump_requested = true;
             }
@@ -1640,12 +1813,11 @@ pub(crate) fn monitor_loop(
         let prog_stats = prog_stats_ctx.map(|ctx| {
             super::bpf_prog::walk_struct_ops_runtime_stats(
                 mem,
-                ctx.cr3_pa,
-                ctx.page_offset,
+                ctx.walk,
                 ctx.prog_idr_kva,
                 &ctx.offsets,
-                ctx.l5,
                 &ctx.per_cpu_offsets,
+                ctx.start_kernel_map,
             )
         });
 
@@ -1819,6 +1991,7 @@ mod tests {
             shm_base_pa: None,
             prog_stats_ctx: None,
             page_offset: 0,
+            start_kernel_map: super::super::symbols::START_KERNEL_MAP,
         }
     }
 
@@ -3442,7 +3615,7 @@ mod tests {
         // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-        let result = read_sched_domain_tree(&mem, 0, &sd_off, 0);
+        let result = read_sched_domain_tree(&mem, 0, &sd_off, 0, 0);
         assert!(result.is_none());
     }
 
@@ -3475,7 +3648,7 @@ mod tests {
         // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-        let domains = read_sched_domain_tree(&mem, 0, &sd_off, 0).unwrap();
+        let domains = read_sched_domain_tree(&mem, 0, &sd_off, 0, 0).unwrap();
 
         assert_eq!(domains.len(), 1);
         assert_eq!(domains[0].level, 0);
@@ -3518,7 +3691,7 @@ mod tests {
         // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-        let domains = read_sched_domain_tree(&mem, 0, &sd_off, 0).unwrap();
+        let domains = read_sched_domain_tree(&mem, 0, &sd_off, 0, 0).unwrap();
 
         assert_eq!(domains.len(), 2);
         // First = lowest level (SMT).
@@ -3560,7 +3733,7 @@ mod tests {
         // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-        let domains = read_sched_domain_tree(&mem, 0, &sd_off, 0).unwrap();
+        let domains = read_sched_domain_tree(&mem, 0, &sd_off, 0, 0).unwrap();
 
         assert_eq!(
             domains.len(),
@@ -3616,7 +3789,7 @@ mod tests {
         // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-        let domains = read_sched_domain_tree(&mem, 0, &sd_off, 0).unwrap();
+        let domains = read_sched_domain_tree(&mem, 0, &sd_off, 0, 0).unwrap();
 
         assert_eq!(
             domains.len(),
@@ -3642,7 +3815,7 @@ mod tests {
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         // page_offset=0 -> PA = bad_kva which is > buf.len().
-        let domains = read_sched_domain_tree(&mem, 0, &sd_off, 0);
+        let domains = read_sched_domain_tree(&mem, 0, &sd_off, 0, 0);
 
         // Should return Some(empty vec) — non-null sd but untranslatable.
         assert!(domains.is_some());
@@ -3675,7 +3848,7 @@ mod tests {
         // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-        let domains = read_sched_domain_tree(&mem, 0, &sd_off, 0).unwrap();
+        let domains = read_sched_domain_tree(&mem, 0, &sd_off, 0, 0).unwrap();
 
         assert_eq!(domains.len(), 1);
         assert_eq!(domains[0].level, 0);

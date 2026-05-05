@@ -423,14 +423,14 @@ fn evaluate(
         exit_code: output.exit_code,
     };
 
-    emit_payload_metrics_to_shm(&payload_metrics);
+    emit_payload_metrics(&payload_metrics);
 
     let result = evaluate_checks(checks, &payload_metrics, &output.stderr);
     (result, payload_metrics)
 }
 
 /// Serialize a [`PayloadMetrics`] to JSON and emit it on the
-/// guest-to-host SHM ring under
+/// guest-to-host bulk data channel (virtio-console port 1) under
 /// [`MSG_TYPE_PAYLOAD_METRICS`](crate::vmm::shm_ring::MSG_TYPE_PAYLOAD_METRICS).
 ///
 /// The `serde_json::to_vec` call is infallible in practice for
@@ -444,34 +444,31 @@ fn evaluate(
 /// `#[serde(with = "...")]` custom serializer) rather than any
 /// currently-reachable failure path.
 ///
-/// A full SHM ring is handled silently by `write_msg` itself —
-/// the writer drops the payload when no ring space is left. This
-/// function does not re-handle ring pressure; it only handles the
-/// serialize step.
-fn emit_payload_metrics_to_shm(pm: &PayloadMetrics) {
+/// Backpressure is handled inside `write_msg`: a busy port-1
+/// virtqueue blocks the writer until the host's `add_used` rate
+/// catches up. The pre-port-open SHM ring fallback drops on a full
+/// ring; this function does not re-handle that pressure here, it
+/// only handles the serialize step.
+fn emit_payload_metrics(pm: &PayloadMetrics) {
     match serde_json::to_vec(pm) {
-        Ok(bytes) => {
-            crate::vmm::shm_ring::write_msg(crate::vmm::shm_ring::MSG_TYPE_PAYLOAD_METRICS, &bytes)
-        }
+        Ok(bytes) => crate::vmm::guest_comms::send_metrics(&bytes),
         Err(e) => eprintln!("ktstr: serialize PayloadMetrics for SHM emit: {e}"),
     }
 }
 
 /// Serialize a [`RawPayloadOutput`] and emit it on the guest-to-host
-/// SHM ring under
+/// bulk data channel (virtio-console port 1) under
 /// [`MSG_TYPE_RAW_PAYLOAD_OUTPUT`](crate::vmm::shm_ring::MSG_TYPE_RAW_PAYLOAD_OUTPUT).
 ///
-/// Mirrors [`emit_payload_metrics_to_shm`]'s shape: the same
+/// Mirrors [`emit_payload_metrics`]'s shape: the same
 /// `serde_json::to_vec` infallibility argument applies (all fields
 /// owned `String` / `Option<String>` / `i32`), the defensive
-/// `eprintln!` guards a future fallible-serializer addition, and a
-/// full ring is handled silently by `write_msg`.
-fn emit_raw_payload_output_to_shm(raw: &crate::test_support::RawPayloadOutput) {
+/// `eprintln!` guards a future fallible-serializer addition, and
+/// backpressure is handled inside `write_msg` (port-1 blocks; the
+/// pre-port-open SHM ring fallback drops).
+fn emit_raw_payload_output(raw: &crate::test_support::RawPayloadOutput) {
     match serde_json::to_vec(raw) {
-        Ok(bytes) => crate::vmm::shm_ring::write_msg(
-            crate::vmm::shm_ring::MSG_TYPE_RAW_PAYLOAD_OUTPUT,
-            &bytes,
-        ),
+        Ok(bytes) => crate::vmm::guest_comms::send_raw_output(&bytes),
         Err(e) => eprintln!("ktstr: serialize RawPayloadOutput for SHM emit: {e}"),
     }
 }
@@ -578,14 +575,14 @@ fn evaluate_llm_extract_deferred(
         // skips the bounds-validation pass for this entry.
         metric_bounds: metric_bounds.copied(),
     };
-    emit_raw_payload_output_to_shm(&raw);
+    emit_raw_payload_output(&raw);
 
     let payload_metrics = PayloadMetrics {
         payload_index,
         metrics: Vec::new(),
         exit_code,
     };
-    emit_payload_metrics_to_shm(&payload_metrics);
+    emit_payload_metrics(&payload_metrics);
 
     let mut result = AssertResult::pass();
     if let Some(detail) = exit_code_mismatch_detail(checks, exit_code, &raw.stderr) {
@@ -3842,13 +3839,13 @@ mod tests {
     }
 
     #[test]
-    fn emit_payload_metrics_to_shm_no_panic_without_shm() {
+    fn emit_payload_metrics_no_panic_without_shm() {
         let pm = PayloadMetrics {
             payload_index: 0,
             metrics: Vec::new(),
             exit_code: 0,
         };
-        emit_payload_metrics_to_shm(&pm);
+        emit_payload_metrics(&pm);
     }
 
     // -- PayloadHandle double-consume returns Err, not panic --

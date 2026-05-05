@@ -819,10 +819,12 @@ impl<'a> TreeWalker<'a> {
             return None;
         }
         let kva = self.kern_vm_start.wrapping_add(ptr & 0xFFFF_FFFF);
-        let pa =
-            self.kernel
-                .mem()
-                .translate_kva(self.kernel.cr3_pa(), Kva(kva), self.kernel.l5())?;
+        let pa = self.kernel.mem().translate_kva(
+            self.kernel.cr3_pa(),
+            Kva(kva),
+            self.kernel.l5(),
+            self.kernel.tcr_el1(),
+        )?;
         // Bounds-check the PA: a corrupt PTE could point past
         // end-of-DRAM. Translate guarantees page alignment but not
         // DRAM membership beyond the first page.

@@ -51,8 +51,12 @@
 //!
 //! 1. Host registers an ioeventfd at a dedicated MMIO GPA inside
 //!    the existing MMIO gap (e.g. `MMIO_GAP_START + 0x3000`) via
-//!    `KVM_IOEVENTFD`. The fd is owned by the freeze coordinator
-//!    and polled alongside its existing wake sources.
+//!    `KVM_IOEVENTFD`. The exact GPA is arch-dependent —
+//!    `MMIO_GAP_START + 0x3000` on x86_64,
+//!    `VIRTIO_NET_MMIO_BASE + VIRTIO_MMIO_SIZE` on aarch64 — and
+//!    the canonical value is exposed as `vmm::kvm::DOORBELL_MMIO_GPA`.
+//!    The fd is owned by the freeze coordinator and polled
+//!    alongside its existing wake sources.
 //! 2. Guest [`Op::Snapshot`](crate::scenario::ops::Op::Snapshot)
 //!    handler `mmap`s `/dev/mem` to reach the doorbell GPA (same
 //!    pattern the SHM ring already uses) and writes the tag value
@@ -76,8 +80,9 @@
 //! drives the `CaptureCallback` from the guest side. The guest
 //! [`Op::WatchSnapshot`](crate::scenario::ops::Op::WatchSnapshot)
 //! registration uses the same doorbell at scenario setup
-//! (separate tag namespace) so symbol resolution + DR1-3 arm
-//! happen on the host without a vCPU userspace exit.
+//! (separate tag namespace) so symbol resolution + user
+//! watchpoint slot allocation happen on the host without a vCPU
+//! userspace exit.
 //!
 //! # No-bridge fallback
 //!
@@ -332,32 +337,32 @@ pub type CaptureCallback = Arc<dyn Fn(&str) -> Option<FailureDumpReport> + Send 
 /// Closure type the bridge invokes to register a hardware-watchpoint
 /// snapshot.
 ///
-/// Implementations resolve the symbol path through the freeze
-/// coordinator's BTF + kallsyms pipeline, allocate a free DR
-/// register (DR1-3 on x86_64; DR0 is reserved for the existing
-/// `*scx_root->exit_kind` trigger), arm the watchpoint via
-/// `KVM_SET_GUEST_DEBUG`, and wire the corresponding
-/// `KVM_EXIT_DEBUG` dispatch to a capture tagged with the
-/// supplied symbol path.
+/// This callback is the host-side unit-testing seam — it lets
+/// in-process executor tests record the symbol and return without
+/// arming any hardware. In a booted VM the bridge's
+/// `register_watch` is **not** installed; the in-guest
+/// `Op::WatchSnapshot` arm rings an SHM doorbell and the host's
+/// freeze coordinator runs `arm_user_watchpoint`
+/// (`src/vmm/freeze_coord.rs`), which resolves the symbol via a
+/// verbatim match against the vmlinux ELF symtab, allocates a
+/// free user watchpoint slot (3 user slots are available; slot 0
+/// is reserved for the existing `*scx_root->exit_kind` trigger),
+/// and arms the hardware watchpoint via `KVM_SET_GUEST_DEBUG`.
 ///
-/// **Guest → host wire.** Registration shares the on-demand
-/// ioeventfd doorbell described on [`CaptureCallback`]: the guest
-/// `Op::WatchSnapshot` arm writes the symbol string into the
-/// shared slot and rings the doorbell at scenario-setup time. The
-/// freeze coordinator does symbol resolution + DR allocation +
-/// `KVM_SET_GUEST_DEBUG` on receipt, then signals the reply
-/// completion with `Ok(())` or `Err(reason)`. Once armed, the
-/// capture tagged with the symbol fires on every guest write
-/// without any further userspace round-trip — `KVM_EXIT_DEBUG`
-/// dispatches into the freeze coordinator directly, mirroring the
-/// existing DR0 path the error-class trigger already uses.
+/// Once armed, the capture tagged with the symbol fires on every
+/// guest write without any further userspace round-trip — the
+/// debug exit dispatches into the freeze coordinator directly,
+/// mirroring the existing reserved-slot path the error-class
+/// trigger already uses.
 ///
 /// Returns `Err(reason)` when:
-///   - The symbol path does not resolve (BTF lookup miss,
-///     kallsyms miss, per-CPU offset unavailable).
-///   - The resolved KVA is not 4-byte aligned (DR_LEN_4
-///     requirement per Intel SDM Vol. 3B Chapter 17).
-///   - All three available DR registers (DR1-3) are already
+///   - The symbol does not match any vmlinux ELF symtab entry
+///     (typo, symbol stripped from the build, or a non-ELF kernel
+///     image).
+///   - The resolved KVA is not 4-byte aligned (the 4-byte watch
+///     length the framework arms requires `addr & 0x3 == 0` on
+///     every supported architecture).
+///   - All three available user watchpoint slots are already
 ///     allocated.
 ///   - `KVM_SET_GUEST_DEBUG` rejected the arm (host kernel
 ///     limitation).
@@ -373,12 +378,24 @@ pub type WatchRegisterCallback =
 /// runs; the executor's `Op::Snapshot` arm calls
 /// [`Self::capture`] with the op's name.
 /// Maximum number of [`Op::WatchSnapshot`](crate::scenario::ops::Op::WatchSnapshot)
-/// ops a single scenario may register. Tied to the available
-/// hardware debug registers on x86_64: DR0 is reserved for the
-/// existing `*scx_root->exit_kind` watchpoint that drives the
-/// error-class freeze trigger; DR1, DR2, DR3 are the three slots
-/// the on-demand watch path may use. Per Intel SDM Vol. 3B
-/// Chapter 17.
+/// ops a single scenario may register.
+///
+/// This is the framework's per-scenario cap on user watchpoint slots
+/// across every supported host architecture, not a count of debug
+/// registers on any specific arch. One additional slot (slot 0) is
+/// always reserved internally for the `*scx_root->exit_kind`
+/// watchpoint that drives the error-class freeze trigger, so a host
+/// must expose at least 4 hardware watchpoint slots through
+/// `KVM_SET_GUEST_DEBUG` for every user [`Op::WatchSnapshot`] to arm.
+/// Common x86_64 and aarch64 hosts meet that bar.
+///
+/// The actual host slot count is probed once during VM bring-up via
+/// `KVM_CHECK_EXTENSION(KVM_CAP_GUEST_DEBUG_HW_WPS)` in
+/// [`crate::vmm::freeze_coord`] (search for `Cap::DebugHwWps`); a
+/// host returning `<= 0` or fewer than 4 slots logs a `tracing::warn!`
+/// at coordinator setup. Per-arm failures surface as `tracing::warn!`
+/// from `self_arm_watchpoint` with per-vCPU retry capping at
+/// `WATCHPOINT_MAX_NON_EINTR_FAILURES`.
 pub const MAX_WATCH_SNAPSHOTS: usize = 3;
 
 #[derive(Clone)]
@@ -429,7 +446,7 @@ impl SnapshotBridge {
 
     /// Install a watch-register callback so [`Op::WatchSnapshot`](crate::scenario::ops::Op::WatchSnapshot)
     /// ops can attach hardware-watchpoint snapshots. The callback
-    /// is responsible for symbol resolution, DR allocation, and
+    /// is responsible for symbol resolution, watchpoint slot allocation, and
     /// `KVM_SET_GUEST_DEBUG` arming.
     pub fn with_watch_register(mut self, register: WatchRegisterCallback) -> Self {
         self.register_watch = Some(register);
@@ -441,7 +458,8 @@ impl SnapshotBridge {
     /// Enforces the per-scenario [`MAX_WATCH_SNAPSHOTS`] cap before
     /// invoking the host's watch-register callback. Returns
     /// `Err(reason)` when:
-    /// - The cap has been reached (DR0 reserved + DR1-3 allocated).
+    /// - The cap has been reached (slot 0 reserved + 3 user slots
+    ///   allocated).
     /// - No watch-register callback was installed via
     ///   [`Self::with_watch_register`].
     /// - The host's callback rejected the request (symbol unresolved,
@@ -456,9 +474,10 @@ impl SnapshotBridge {
                 .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             return Err(format!(
                 "Op::WatchSnapshot cap exceeded: scenario already registered \
-                 {MAX_WATCH_SNAPSHOTS} watchpoints (DR1-3 occupied; DR0 reserved \
-                 for the error-class exit_kind trigger). Drop a watch or use \
-                 Op::Snapshot for a time-driven capture instead."
+                 {MAX_WATCH_SNAPSHOTS} watchpoints ({MAX_WATCH_SNAPSHOTS} user \
+                 watchpoint slots occupied; slot 0 reserved for the error-class \
+                 exit_kind trigger). Drop a watch or use Op::Snapshot for a \
+                 time-driven capture instead."
             ));
         }
         let Some(register) = self.register_watch.as_ref() else {

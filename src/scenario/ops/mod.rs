@@ -76,138 +76,6 @@ use crate::vmm::shm_ring::{self, StimulusPayload};
 use crate::workload::{MemPolicy, WorkSpec, WorkloadConfig, WorkloadHandle};
 
 // ---------------------------------------------------------------------------
-// SHM writer for stimulus events
-// ---------------------------------------------------------------------------
-
-/// SHM ring writer for guest-to-host data transfer.
-///
-/// Prefers mmap of /dev/mem for zero-copy access. Falls back to
-/// pread/pwrite when mmap of the E820 gap fails (common on kernels
-/// that restrict mmap of non-RAM physical ranges).
-enum ShmWriter {
-    /// mmap succeeded — direct pointer access.
-    Mapped {
-        ptr: *mut u8,
-        map_base: *mut libc::c_void,
-        map_size: usize,
-        shm_size: usize,
-    },
-    /// mmap failed — use pread/pwrite on the /dev/mem fd.
-    Fd {
-        fd: std::fs::File,
-        shm_base: u64,
-        shm_size: usize,
-    },
-}
-
-impl ShmWriter {
-    /// Try to open the SHM region. Returns None if SHM params are absent
-    /// from /proc/cmdline or /dev/mem cannot be opened.
-    fn try_open() -> Option<Self> {
-        let cmdline = std::fs::read_to_string("/proc/cmdline").ok()?;
-        let (shm_base, shm_size) = shm_ring::parse_shm_params_from_str(&cmdline)?;
-
-        use std::fs::OpenOptions;
-        use std::os::unix::fs::OpenOptionsExt;
-
-        let fd = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(libc::O_SYNC)
-            .open("/dev/mem")
-            .ok()?;
-
-        match shm_ring::mmap_devmem(
-            std::os::unix::io::AsRawFd::as_raw_fd(&fd),
-            shm_base,
-            shm_size,
-        ) {
-            Some(m) => Some(ShmWriter::Mapped {
-                ptr: m.ptr,
-                map_base: m.map_base,
-                map_size: m.map_size,
-                shm_size: shm_size as usize,
-            }),
-            None => {
-                eprintln!(
-                    "ktstr: SHM mmap failed ({}), using pread/pwrite fallback",
-                    std::io::Error::last_os_error(),
-                );
-                Some(ShmWriter::Fd {
-                    fd,
-                    shm_base,
-                    shm_size: shm_size as usize,
-                })
-            }
-        }
-    }
-
-    /// Write a TLV message to the SHM ring.
-    ///
-    /// Acquires `SHM_WRITE_LOCK` to serialize against concurrent writers
-    /// (sched-exit-mon thread via `write_msg`).
-    fn write(&self, msg_type: u32, payload: &[u8]) {
-        // Recover from poisoning: the ring is fully overwritten on
-        // each write, so a panicking writer does not leave shared
-        // invariants in a bad state.
-        let _guard = shm_ring::SHM_WRITE_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        match self {
-            ShmWriter::Mapped { ptr, shm_size, .. } => {
-                let buf = unsafe { std::slice::from_raw_parts_mut(*ptr, *shm_size) };
-                shm_ring::shm_write(buf, 0, msg_type, payload);
-            }
-            ShmWriter::Fd {
-                fd,
-                shm_base,
-                shm_size,
-            } => {
-                use std::os::unix::io::AsRawFd;
-
-                // Read current SHM state, apply the ring write, write back.
-                let mut buf = vec![0u8; *shm_size];
-                let n = unsafe {
-                    libc::pread(
-                        fd.as_raw_fd(),
-                        buf.as_mut_ptr() as *mut libc::c_void,
-                        buf.len(),
-                        *shm_base as libc::off_t,
-                    )
-                };
-                if n < 0 {
-                    return;
-                }
-
-                shm_ring::shm_write(&mut buf, 0, msg_type, payload);
-
-                unsafe {
-                    libc::pwrite(
-                        fd.as_raw_fd(),
-                        buf.as_ptr() as *const libc::c_void,
-                        buf.len(),
-                        *shm_base as libc::off_t,
-                    );
-                }
-            }
-        }
-    }
-}
-
-impl Drop for ShmWriter {
-    fn drop(&mut self) {
-        if let ShmWriter::Mapped {
-            map_base, map_size, ..
-        } = self
-        {
-            unsafe {
-                libc::munmap(*map_base, *map_size);
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Step executor
 // ---------------------------------------------------------------------------
 
@@ -810,29 +678,42 @@ fn run_scenario(
     let mut backdrop_state = BackdropState::empty(ctx);
     let mut result = AssertResult::pass();
 
-    // Open SHM once for the entire step sequence. No-op outside a VM.
-    let shm = ShmWriter::try_open();
-
     let scenario_start = std::time::Instant::now();
 
-    // ScenarioStart marker.
-    if let Some(ref w) = shm {
-        w.write(shm_ring::MSG_TYPE_SCENARIO_START, &[]);
+    // ScenarioStart marker. `is_guest` short-circuits in host
+    // contexts (unit tests) where the bulk port and SHM ring are
+    // both absent and `send_scenario_start` would log a no-op warning.
+    if shm_ring::is_guest() {
+        crate::vmm::guest_comms::send_scenario_start();
     }
 
-    // When a host-side BPF map write is configured, signal the host that
-    // probes are attached and the scenario is starting, then wait for the
-    // host to complete the write before starting the workload.
-    if ctx.wait_for_map_write {
-        shm_ring::signal_value(1, shm_ring::SIGNAL_PROBES_READY);
-        match shm_ring::wait_for(0, std::time::Duration::from_secs(10)) {
-            Ok(()) => {
-                // Brief delay for the crash trigger to propagate.
-                std::thread::sleep(std::time::Duration::from_millis(500));
-            }
-            Err(e) => {
-                eprintln!("ktstr: signal slot 0 wait failed: {e} — proceeding without sync");
-            }
+    // When a host-side BPF map write is configured the test framework
+    // sets `wait_for_map_write=true`; in that case block until the
+    // guest's `shm_poll_loop` observes
+    // [`crate::vmm::virtio_console::SIGNAL_BPF_WRITE_DONE`] (pushed by
+    // the host's `bpf-map-write` thread after every queued
+    // `bpf_map_write` lands) and fires the `bpf_map_write_done` latch.
+    // Without this gate the workload phase races against the host's
+    // map writes and may observe a stale BPF map value.
+    //
+    // Guest-only path. On the host (unit tests) the latch is never
+    // armed, so we skip the wait entirely. The 60 s timeout matches
+    // the bpf-map-write thread's combined phase 1 + phase 2 budget
+    // (30 s accessor init + 30 s map discovery in
+    // `freeze_coord::start_bpf_map_write`); a real timeout means the
+    // host failed to resolve a map. The scenario continues anyway
+    // (rather than `bail!`) because the legacy rendezvous also let
+    // the guest proceed under its own timeout, and a bail here would
+    // mask the underlying host-side resolution failure with a
+    // test-side `Err`.
+    if ctx.wait_for_map_write && shm_ring::is_guest() {
+        let latch = crate::vmm::rust_init::bpf_map_write_done_latch();
+        if !latch.wait_timeout(Duration::from_secs(60)) {
+            tracing::warn!(
+                "wait_for_map_write timed out after 60s — host bpf-map-write \
+                 thread may have failed to resolve a queued map; proceeding \
+                 with the workload regardless"
+            );
         }
     }
 
@@ -946,7 +827,6 @@ fn run_scenario(
             step_idx,
             &mut step_state,
             &mut backdrop_state,
-            shm.as_ref(),
             scenario_start,
             effective_checks,
             &mut sched_died_during_hold,
@@ -1007,10 +887,11 @@ fn run_scenario(
         }
     }
 
-    // ScenarioEnd marker.
-    if let Some(ref w) = shm {
-        let elapsed = scenario_start.elapsed().as_millis() as u32;
-        w.write(shm_ring::MSG_TYPE_SCENARIO_END, &elapsed.to_ne_bytes());
+    // ScenarioEnd marker. Routes through `send_scenario_end`
+    // (virtio-console port-1 with COM2 fallback for early-boot).
+    if shm_ring::is_guest() {
+        let elapsed = scenario_start.elapsed().as_millis() as u64;
+        crate::vmm::guest_comms::send_scenario_end(elapsed);
     }
 
     // Final liveness check. sched_pid == None ⇒ no scheduler
@@ -1219,7 +1100,6 @@ fn run_step<'a>(
     step_idx: usize,
     step_state: &mut StepState<'a>,
     backdrop_state: &mut BackdropState<'a>,
-    shm: Option<&ShmWriter>,
     scenario_start: std::time::Instant,
     _effective_checks: &crate::assert::Assert,
     sched_died_during_hold: &mut bool,
@@ -1272,13 +1152,14 @@ fn run_step<'a>(
                 drain_on_err!(scenario, apply_setup(ctx, &mut scenario, &defs));
             }
 
-            // Write stimulus event after applying ops.
-            if let Some(w) = shm {
+            // Write stimulus event after applying ops. Routes through
+            // `crate::vmm::guest_comms::send_stimulus` (virtio-console
+            // port-1 bulk channel). `is_guest` keeps the
+            // `build_stimulus` walk off the host where the write would
+            // no-op.
+            if shm_ring::is_guest() {
                 let payload = build_stimulus(&scenario_start, step_idx, &step.ops, &scenario);
-                w.write(
-                    shm_ring::MSG_TYPE_STIMULUS,
-                    zerocopy::IntoBytes::as_bytes(&payload),
-                );
+                crate::vmm::guest_comms::send_stimulus(zerocopy::IntoBytes::as_bytes(&payload));
             }
 
             let hold_dur = match &step.hold {
@@ -2046,7 +1927,15 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                             crate::workload::ResolvedAffinity::None => {}
                             crate::workload::ResolvedAffinity::Fixed(cpus) => {
                                 for idx in 0..handle.worker_pids().len() {
-                                    let _ = handle.set_affinity(idx, cpus);
+                                    if let Err(e) = handle.set_affinity(idx, cpus) {
+                                        tracing::warn!(
+                                            cgroup = %cgroup,
+                                            idx,
+                                            err = %format!("{e:#}"),
+                                            "Op::SetAffinity Fixed: handle.set_affinity failed; \
+                                             worker keeps prior affinity"
+                                        );
+                                    }
                                 }
                             }
                             crate::workload::ResolvedAffinity::Random { from, count }
@@ -2057,7 +1946,15 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                                 for idx in 0..handle.worker_pids().len() {
                                     let chosen: BTreeSet<usize> =
                                         v.sample(&mut rand::rng(), *count).copied().collect();
-                                    let _ = handle.set_affinity(idx, &chosen);
+                                    if let Err(e) = handle.set_affinity(idx, &chosen) {
+                                        tracing::warn!(
+                                            cgroup = %cgroup,
+                                            idx,
+                                            err = %format!("{e:#}"),
+                                            "Op::SetAffinity Random: handle.set_affinity failed; \
+                                             worker keeps prior affinity"
+                                        );
+                                    }
                                 }
                             }
                             // Empty pool OR count == 0: divergence from
@@ -2076,7 +1973,16 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                             crate::workload::ResolvedAffinity::SingleCpu(cpu) => {
                                 let cpus: BTreeSet<usize> = [*cpu].into_iter().collect();
                                 for idx in 0..handle.worker_pids().len() {
-                                    let _ = handle.set_affinity(idx, &cpus);
+                                    if let Err(e) = handle.set_affinity(idx, &cpus) {
+                                        tracing::warn!(
+                                            cgroup = %cgroup,
+                                            idx,
+                                            cpu = *cpu,
+                                            err = %format!("{e:#}"),
+                                            "Op::SetAffinity SingleCpu: handle.set_affinity failed; \
+                                             worker keeps prior affinity"
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -2291,7 +2197,7 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                 if invoked.is_none() {
                     if crate::vmm::shm_ring::is_guest() {
                         let timeout = std::time::Duration::from_secs(30);
-                        match crate::vmm::shm_ring::snapshot_request(
+                        match crate::vmm::guest_comms::request_snapshot(
                             crate::vmm::shm_ring::SHM_SNAPSHOT_KIND_CAPTURE,
                             name,
                             timeout,
@@ -2333,16 +2239,16 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                 //      SHM. The host coordinator resolves the
                 //      symbol via the parsed vmlinux ELF +
                 //      direct-mapping translation, allocates a
-                //      free DR1..=DR3 slot, programs the hardware
-                //      watchpoint via `KVM_SET_GUEST_DEBUG` on
-                //      every vCPU, and replies OK. A future guest
-                //      write to the resolved KVA fires
-                //      `KVM_EXIT_DEBUG`; the vCPU dispatcher reads
-                //      DR6, identifies the slot, and latches
-                //      `WatchpointSlot::hit`. The coordinator then
-                //      runs `freeze_and_capture(false)` and
-                //      stores the report on the bridge keyed by
-                //      the symbol path.
+                //      free user watchpoint slot, programs the
+                //      hardware watchpoint via
+                //      `KVM_SET_GUEST_DEBUG` on every vCPU, and
+                //      replies OK. A future guest write to the
+                //      resolved KVA fires the corresponding debug
+                //      exit; the vCPU dispatcher identifies the
+                //      slot and latches `WatchpointSlot::hit`. The
+                //      coordinator then runs
+                //      `freeze_and_capture(false)` and stores the
+                //      report on the bridge keyed by the symbol.
                 let registered =
                     crate::scenario::snapshot::with_active_bridge(|b| b.register_watch(symbol));
                 match registered {
@@ -2360,7 +2266,7 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                     None => {
                         if crate::vmm::shm_ring::is_guest() {
                             let timeout = std::time::Duration::from_secs(30);
-                            match crate::vmm::shm_ring::snapshot_request(
+                            match crate::vmm::guest_comms::request_snapshot(
                                 crate::vmm::shm_ring::SHM_SNAPSHOT_KIND_WATCH,
                                 symbol,
                                 timeout,

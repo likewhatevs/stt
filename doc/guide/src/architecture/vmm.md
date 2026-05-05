@@ -102,9 +102,14 @@ and use irqfd (eventfd → KVM GSI) for interrupt delivery.
   workloads (TCP/UDP throughput, latency) without depending on the
   host's network stack. Advertises `VIRTIO_NET_F_MAC` so the guest
   binds a deterministic MAC.
-- **virtio-console** (`vmm::virtio_console`) -- single-port console
-  with two virtqueues (RX, TX). Provides guest console I/O at
-  virtio fidelity alongside the COM1/COM2 16550 serial ports.
+- **virtio-console** (`vmm::virtio_console`) -- two-port multiport
+  console with six virtqueues (per virtio-v1.2 §5.3.5: two console
+  queues, two control queues, two bulk queues). Port 0 carries the
+  interactive `/dev/hvc0` console alongside the COM1/COM2 16550
+  serial ports; port 1 carries the guest-to-host TLV stream that
+  delivers exit code, test result, per-payload metrics, raw payload
+  outputs, profraw, and scheduler exit notifications. Advertises
+  `VIRTIO_CONSOLE_F_MULTIPORT`.
 
 ## Performance mode
 

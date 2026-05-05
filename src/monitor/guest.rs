@@ -6,11 +6,11 @@
 //! and caches paging configuration.
 //!
 //! Scalar reads and writes use volatile semantics (the guest kernel
-//! modifies memory concurrently). Bulk byte reads differ:
-//! `read_symbol_bytes` and `read_direct_bytes` delegate to
+//! modifies memory concurrently). Bulk byte reads delegate to
 //! `GuestMem::read_bytes` which uses `copy_nonoverlapping`;
-//! `read_kva_bytes` does per-byte volatile reads across page
-//! boundaries.
+//! `read_kva_bytes_chunked` adds page-boundary chunking on top so
+//! large vmalloc'd reads (BTF blobs) translate once per page rather
+//! than once per byte.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -19,7 +19,10 @@ use anyhow::{Context, Result};
 
 use super::Kva;
 use super::reader::GuestMem;
-use super::symbols::{kva_to_pa, resolve_page_offset, resolve_pgtable_l5, text_kva_to_pa};
+use super::symbols::{
+    kva_to_pa, resolve_page_offset, resolve_pgtable_l5, start_kernel_map_for_tcr,
+    text_kva_to_pa_with_base,
+};
 
 /// Host-side accessor for kernel memory in a running guest VM.
 ///
@@ -40,6 +43,22 @@ pub struct GuestKernel<'a> {
     cr3_pa: u64,
     /// 5-level paging flag — true when the guest uses 5-level page tables (LA57).
     l5: bool,
+    /// Cached TCR_EL1 register (aarch64). Drives the page-table walker's
+    /// granule and VA-width decoding. Always 0 on x86_64 where the
+    /// register does not exist; the walker ignores the field on that
+    /// arch.
+    tcr_el1: u64,
+    /// Kernel image base (`__START_KERNEL_map` on x86_64, `KIMAGE_VADDR`
+    /// on aarch64). Resolved at construction time:
+    /// - x86_64: the compile-time constant
+    ///   [`crate::monitor::symbols::START_KERNEL_MAP`].
+    /// - aarch64: derived from `tcr_el1` via
+    ///   [`crate::monitor::symbols::start_kernel_map_for_tcr`],
+    ///   reading both T1SZ (VA width) and TG1 (granule) so kernels
+    ///   built with `VA_BITS=47` (16 KB granule, e.g. Apple Silicon)
+    ///   and 52-bit-VA configurations both translate symbol KVAs to
+    ///   the right PAs.
+    start_kernel_map: u64,
 }
 
 #[allow(dead_code)]
@@ -49,7 +68,25 @@ impl<'a> GuestKernel<'a> {
     /// Parses the ELF symbol table and resolves paging configuration
     /// from guest memory. Requires `init_top_pgt` (or `swapper_pg_dir`)
     /// for page table walks.
-    pub fn new(mem: &'a GuestMem, vmlinux: &Path) -> Result<Self> {
+    ///
+    /// `tcr_el1` is the guest's TCR_EL1 register value, used by the
+    /// aarch64 page-table walker to determine the granule (4 KB / 16 KB
+    /// / 64 KB) and high-half VA width. Callers on aarch64 should read
+    /// it once via `KVM_GET_ONE_REG` from any vCPU after the kernel
+    /// finished its boot-time MMU configuration. Pass 0 on x86_64 where
+    /// the register does not exist.
+    ///
+    /// On aarch64, fails with `Err` when `tcr_el1 == 0` or when the
+    /// register's T1SZ / TG1 fields cannot be decoded (T1SZ=0 means
+    /// the high half is disabled; TG1=0b00 is reserved). The kernel
+    /// image base (`KIMAGE_VADDR`) depends on `VA_BITS_MIN`, which is
+    /// only knowable from `TCR_EL1.T1SZ` plus `TCR_EL1.TG1`; without
+    /// it the symbol-PA translation defaults to the 48-bit VA layout
+    /// and reads the wrong bytes for 47-bit kernels (16 KB granule,
+    /// e.g. Apple Silicon). Callers in retry contexts (the freeze
+    /// coordinator's lazy-retry loops) must keep polling until
+    /// `tcr_el1` has been populated by the BSP loop.
+    pub fn new(mem: &'a GuestMem, vmlinux: &Path, tcr_el1: u64) -> Result<Self> {
         let data = std::fs::read(vmlinux)
             .with_context(|| format!("read vmlinux: {}", vmlinux.display()))?;
         let elf = goblin::elf::Elf::parse(&data).context("parse vmlinux ELF")?;
@@ -64,14 +101,25 @@ impl<'a> GuestKernel<'a> {
             }
         }
 
+        // Resolve the kernel image base (`__START_KERNEL_map` on
+        // x86_64, `KIMAGE_VADDR` on aarch64). On x86_64 this is the
+        // compile-time constant; on aarch64 it depends on
+        // `VA_BITS_MIN`, derived from `tcr_el1` so VA_BITS=47 kernels
+        // (16 KB granule, e.g. Apple Silicon) translate symbols
+        // correctly. The aarch64 derivation requires both T1SZ and
+        // TG1; both come out of `start_kernel_map_for_tcr`.
+        let start_kernel_map = start_kernel_map_for_tcr(tcr_el1).ok_or_else(|| {
+            anyhow::anyhow!("could not derive kernel image base from tcr_el1=0x{tcr_el1:x}")
+        })?;
+
         // Resolve paging state using the same logic as KernelSymbols.
         let kern_syms = super::symbols::KernelSymbols::from_vmlinux(vmlinux)?;
         let init_top_pgt_kva = kern_syms
             .init_top_pgt
             .ok_or_else(|| anyhow::anyhow!("init_top_pgt symbol not found in vmlinux"))?;
-        let cr3_pa = text_kva_to_pa(init_top_pgt_kva);
-        let page_offset = resolve_page_offset(mem, &kern_syms);
-        let l5 = resolve_pgtable_l5(mem, &kern_syms);
+        let cr3_pa = text_kva_to_pa_with_base(init_top_pgt_kva, start_kernel_map);
+        let page_offset = resolve_page_offset(mem, &kern_syms, start_kernel_map);
+        let l5 = resolve_pgtable_l5(mem, &kern_syms, start_kernel_map);
 
         Ok(Self {
             mem,
@@ -79,6 +127,8 @@ impl<'a> GuestKernel<'a> {
             page_offset,
             cr3_pa,
             l5,
+            tcr_el1,
+            start_kernel_map,
         })
     }
 
@@ -116,6 +166,13 @@ impl<'a> GuestKernel<'a> {
             page_offset,
             cr3_pa,
             l5,
+            tcr_el1: 0,
+            // Tests construct synthetic memory layouts assuming the
+            // compile-time constant. None of the test fixtures exercise
+            // the VA_BITS=47 path; production aarch64 paths come
+            // through `::new` where the value is derived from
+            // `tcr_el1`.
+            start_kernel_map: super::symbols::START_KERNEL_MAP,
         }
     }
 
@@ -144,30 +201,73 @@ impl<'a> GuestKernel<'a> {
         self.l5
     }
 
+    /// Cached TCR_EL1 register (aarch64). Always 0 on x86_64. Use with
+    /// [`super::reader::GuestMem::translate_kva`] to drive the
+    /// granule-agnostic aarch64 page-table walker.
+    pub fn tcr_el1(&self) -> u64 {
+        self.tcr_el1
+    }
+
+    /// Bundle of the four paging fields ([`super::reader::WalkContext`])
+    /// threaded through every host-side KVA translation: `cr3_pa`,
+    /// `page_offset`, `l5`, `tcr_el1`. Replaces the four-parameter fan
+    /// at every call site that walks guest memory through this
+    /// kernel handle.
+    pub fn walk_context(&self) -> super::reader::WalkContext {
+        super::reader::WalkContext {
+            cr3_pa: self.cr3_pa,
+            page_offset: self.page_offset,
+            l5: self.l5,
+            tcr_el1: self.tcr_el1,
+        }
+    }
+
+    /// Resolved kernel image base (`__START_KERNEL_map` on x86_64,
+    /// `KIMAGE_VADDR` on aarch64). Use [`Self::text_kva_to_pa`] for
+    /// the actual translation; this accessor exists for callers that
+    /// need to forward the base into helpers (e.g. cross-module
+    /// readers that build their own translation).
+    pub fn start_kernel_map(&self) -> u64 {
+        self.start_kernel_map
+    }
+
+    /// Translate a kernel text/data/bss symbol VA to a DRAM-relative
+    /// offset using the runtime kernel image base resolved at
+    /// construction time. Wraps
+    /// [`super::symbols::text_kva_to_pa_with_base`] with the cached
+    /// `start_kernel_map` so callers don't have to re-derive it. On
+    /// aarch64 with VA_BITS=47 (16 KB granule, e.g. Apple Silicon)
+    /// the cached base is the right one; a constant-based helper
+    /// would translate to the wrong offset on those hosts.
+    pub fn text_kva_to_pa(&self, kva: u64) -> u64 {
+        text_kva_to_pa_with_base(kva, self.start_kernel_map)
+    }
+
     // ---------------------------------------------------------------
     // Text/data/bss symbol reads (statically-linked kernel variables)
     // ---------------------------------------------------------------
 
     /// Read a u32 from a kernel text/data/bss symbol.
     ///
-    /// Translates via `__START_KERNEL_map` (not PAGE_OFFSET).
+    /// Translates via the runtime kernel image base
+    /// ([`Self::start_kernel_map`]), not PAGE_OFFSET.
     pub fn read_symbol_u32(&self, name: &str) -> Result<u32> {
         let kva = self.require_symbol(name)?;
-        let pa = text_kva_to_pa(kva);
+        let pa = self.text_kva_to_pa(kva);
         Ok(self.mem.read_u32(pa, 0))
     }
 
     /// Read a u64 from a kernel text/data/bss symbol.
     pub fn read_symbol_u64(&self, name: &str) -> Result<u64> {
         let kva = self.require_symbol(name)?;
-        let pa = text_kva_to_pa(kva);
+        let pa = self.text_kva_to_pa(kva);
         Ok(self.mem.read_u64(pa, 0))
     }
 
     /// Read bytes from a kernel text/data/bss symbol.
     pub fn read_symbol_bytes(&self, name: &str, len: usize) -> Result<Vec<u8>> {
         let kva = self.require_symbol(name)?;
-        let pa = text_kva_to_pa(kva);
+        let pa = self.text_kva_to_pa(kva);
         let mut buf = vec![0u8; len];
         self.mem.read_bytes(pa, &mut buf);
         Ok(buf)
@@ -176,7 +276,7 @@ impl<'a> GuestKernel<'a> {
     /// Write a u64 to a kernel text/data/bss symbol.
     pub fn write_symbol_u64(&self, name: &str, val: u64) -> Result<()> {
         let kva = self.require_symbol(name)?;
-        let pa = text_kva_to_pa(kva);
+        let pa = self.text_kva_to_pa(kva);
         self.mem.write_u64(pa, 0, val);
         Ok(())
     }
@@ -215,29 +315,18 @@ impl<'a> GuestKernel<'a> {
     ///
     /// Translates via page table walk. Returns `None` if unmapped.
     pub fn read_kva_u32(&self, kva: u64) -> Option<u32> {
-        let pa = self.mem.translate_kva(self.cr3_pa, Kva(kva), self.l5)?;
+        let pa = self
+            .mem
+            .translate_kva(self.cr3_pa, Kva(kva), self.l5, self.tcr_el1)?;
         Some(self.mem.read_u32(pa, 0))
     }
 
     /// Read a u64 from a vmalloc'd kernel virtual address.
     pub fn read_kva_u64(&self, kva: u64) -> Option<u64> {
-        let pa = self.mem.translate_kva(self.cr3_pa, Kva(kva), self.l5)?;
+        let pa = self
+            .mem
+            .translate_kva(self.cr3_pa, Kva(kva), self.l5, self.tcr_el1)?;
         Some(self.mem.read_u64(pa, 0))
-    }
-
-    /// Read bytes from a vmalloc'd kernel virtual address range.
-    ///
-    /// Reads byte-by-byte across page boundaries. Returns `None`
-    /// if any page is unmapped.
-    pub fn read_kva_bytes(&self, kva: u64, len: usize) -> Option<Vec<u8>> {
-        let mut buf = vec![0u8; len];
-        for (i, byte) in buf.iter_mut().enumerate() {
-            let pa = self
-                .mem
-                .translate_kva(self.cr3_pa, Kva(kva + i as u64), self.l5)?;
-            *byte = self.mem.read_u8(pa, 0);
-        }
-        Some(buf)
     }
 
     /// Read bytes from a vmalloc'd kernel virtual address range,
@@ -247,15 +336,14 @@ impl<'a> GuestKernel<'a> {
     /// one bulk [`super::reader::GuestMem::read_bytes`] per 4 KiB
     /// page rather than per byte; required for reads above ~hundreds
     /// of bytes (e.g. a BPF program's BTF blob is typically tens of
-    /// KB, vmlinux BTF up to several MB) where the byte-wise variant
-    /// in [`Self::read_kva_bytes`] is prohibitively slow.
+    /// KB, vmlinux BTF up to several MB).
     ///
     /// Returns `None` when any page in the requested range fails to
     /// translate **or** when a chunk's bulk read returns fewer bytes
     /// than the chunk's expected length (DRAM end before the chunk
-    /// completes); that's the all-or-nothing semantics
-    /// [`Self::read_kva_bytes`] also follows so callers don't need to
-    /// special-case the chunked path.
+    /// completes); the all-or-nothing contract lets callers (e.g. the
+    /// BTF-blob loader) treat any non-`None` return as a fully
+    /// populated buffer.
     pub fn read_kva_bytes_chunked(&self, kva: u64, len: usize) -> Option<Vec<u8>> {
         let mut buf = vec![0u8; len];
         const PAGE: u64 = 4096;
@@ -263,7 +351,9 @@ impl<'a> GuestKernel<'a> {
         let total = len as u64;
         while consumed < total {
             let cur_kva = kva.wrapping_add(consumed);
-            let pa = self.mem.translate_kva(self.cr3_pa, Kva(cur_kva), self.l5)?;
+            let pa = self
+                .mem
+                .translate_kva(self.cr3_pa, Kva(cur_kva), self.l5, self.tcr_el1)?;
             // Advance to the next page boundary so the next translate
             // lands on a fresh resolved page.
             let page_end = (cur_kva & !(PAGE - 1)).wrapping_add(PAGE);
@@ -283,32 +373,6 @@ impl<'a> GuestKernel<'a> {
             consumed += chunk_len as u64;
         }
         Some(buf)
-    }
-
-    /// Write a u8 to a vmalloc'd kernel virtual address.
-    /// Returns false if the address is unmapped.
-    pub fn write_kva_u8(&self, kva: u64, val: u8) -> bool {
-        let Some(pa) = self.mem.translate_kva(self.cr3_pa, Kva(kva), self.l5) else {
-            return false;
-        };
-        self.mem.write_u8(pa, 0, val);
-        true
-    }
-
-    /// Write bytes to a vmalloc'd kernel virtual address range.
-    /// Writes byte-by-byte across page boundaries. Returns false
-    /// if any page is unmapped.
-    pub fn write_kva_bytes(&self, kva: u64, data: &[u8]) -> bool {
-        for (i, &byte) in data.iter().enumerate() {
-            let Some(pa) = self
-                .mem
-                .translate_kva(self.cr3_pa, Kva(kva + i as u64), self.l5)
-            else {
-                return false;
-            };
-            self.mem.write_u8(pa, 0, byte);
-        }
-        true
     }
 
     // ---------------------------------------------------------------
@@ -336,7 +400,7 @@ mod tests {
     fn text_kva_to_pa_and_read() {
         let start_kernel_map: u64 = START_KERNEL_MAP;
         let sym_kva = start_kernel_map + 0x1000;
-        let pa = text_kva_to_pa(sym_kva);
+        let pa = text_kva_to_pa_with_base(sym_kva, start_kernel_map);
         assert_eq!(pa, 0x1000);
 
         let mut buf = vec![0u8; 0x2000];
@@ -384,6 +448,8 @@ mod tests {
             page_offset: 0xFFFF_8880_0000_0000,
             cr3_pa: 0,
             l5: false,
+            tcr_el1: 0,
+            start_kernel_map: START_KERNEL_MAP,
         };
         assert_eq!(kernel.symbol_kva("test_sym"), Some(0xFFFF_FFFF_8000_1000));
         assert_eq!(kernel.symbol_kva("missing"), None);
@@ -411,6 +477,8 @@ mod tests {
             page_offset: 0xFFFF_8880_0000_0000,
             cr3_pa: 0,
             l5: false,
+            tcr_el1: 0,
+            start_kernel_map: START_KERNEL_MAP,
         };
         assert_eq!(kernel.read_symbol_u32("my_counter").unwrap(), 99);
     }
@@ -434,6 +502,8 @@ mod tests {
             page_offset: 0xFFFF_8880_0000_0000,
             cr3_pa: 0,
             l5: false,
+            tcr_el1: 0,
+            start_kernel_map: START_KERNEL_MAP,
         };
         assert_eq!(
             kernel.read_symbol_u64("my_u64").unwrap(),
@@ -460,6 +530,8 @@ mod tests {
             page_offset: 0xFFFF_8880_0000_0000,
             cr3_pa: 0,
             l5: false,
+            tcr_el1: 0,
+            start_kernel_map: START_KERNEL_MAP,
         };
         assert_eq!(
             kernel.read_symbol_bytes("my_bytes", 5).unwrap(),
@@ -480,6 +552,8 @@ mod tests {
             page_offset: 0xFFFF_8880_0000_0000,
             cr3_pa: 0,
             l5: false,
+            tcr_el1: 0,
+            start_kernel_map: START_KERNEL_MAP,
         };
         assert!(kernel.read_symbol_u32("nonexistent").is_err());
         assert!(kernel.read_symbol_u64("nonexistent").is_err());
@@ -504,6 +578,8 @@ mod tests {
             page_offset: 0xFFFF_8880_0000_0000,
             cr3_pa: 0,
             l5: false,
+            tcr_el1: 0,
+            start_kernel_map: START_KERNEL_MAP,
         };
         kernel.write_symbol_u64("my_var", 0xCAFE_BABE).unwrap();
         assert_eq!(kernel.read_symbol_u64("my_var").unwrap(), 0xCAFE_BABE);
@@ -531,6 +607,8 @@ mod tests {
             page_offset,
             cr3_pa: 0,
             l5: false,
+            tcr_el1: 0,
+            start_kernel_map: START_KERNEL_MAP,
         };
         assert_eq!(kernel.read_direct_u32(kva), 77);
         assert_eq!(kernel.read_direct_u64(kva + 8), 0xAAAA_BBBB);
@@ -550,6 +628,8 @@ mod tests {
             page_offset: 0x1234,
             cr3_pa: 0x5678,
             l5: true,
+            tcr_el1: 0,
+            start_kernel_map: START_KERNEL_MAP,
         };
         assert_eq!(kernel.page_offset(), 0x1234);
         assert_eq!(kernel.cr3_pa(), 0x5678);
@@ -568,14 +648,14 @@ mod tests {
         if path.starts_with("/sys/") {
             skip!("vmlinux is raw BTF (not ELF), cannot parse symbols");
         }
-        // Allocate a buffer large enough for text_kva_to_pa reads.
+        // Allocate a buffer large enough for kernel-text-mapped reads.
         // GuestKernel::new reads page_offset_base and pgtable_l5_enabled
         // from guest memory; a zeroed buffer causes safe fallbacks.
         let mut buf = vec![0u8; 64 << 20];
         // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
-        let kernel = match GuestKernel::new(&mem, &path) {
+        let kernel = match GuestKernel::new(&mem, &path, 0) {
             Ok(k) => k,
             Err(e) => {
                 // init_top_pgt missing in some kernel configs.
@@ -590,6 +670,38 @@ mod tests {
             kernel.symbol_kva("runqueues").unwrap(),
             0,
             "runqueues address should be nonzero"
+        );
+    }
+
+    /// `GuestKernel::new` must reject `tcr_el1 == 0` on aarch64
+    /// because `start_kernel_map_for_tcr` cannot derive the kernel
+    /// image base without a populated TCR_EL1 (T1SZ for VA_BITS,
+    /// TG1 for granule). Silently falling back to the 48-bit
+    /// constant would mis-read every symbol on a 47-bit kernel
+    /// (16 KB granule, e.g. Apple Silicon).
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn guest_kernel_rejects_tcr_zero_aarch64() {
+        let path = match crate::monitor::find_test_vmlinux() {
+            Some(p) => p,
+            None => return,
+        };
+        // find_test_vmlinux may return /sys/kernel/btf/vmlinux (raw BTF,
+        // not an ELF), which GuestKernel cannot parse; the goblin
+        // parse failure would mask the tcr_el1 check we want to
+        // exercise. Skip in that case.
+        if path.starts_with("/sys/") {
+            skip!("vmlinux is raw BTF (not ELF), cannot parse symbols");
+        }
+        let mut buf = vec![0u8; 64 << 20];
+        // SAFETY: buf outlives mem.
+        let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
+        let result = GuestKernel::new(&mem, &path, 0);
+        let err = result.expect_err("tcr_el1=0 must be rejected on aarch64");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("tcr_el1"),
+            "error message must mention tcr_el1; got: {msg}"
         );
     }
 }

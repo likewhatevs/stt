@@ -89,10 +89,27 @@ pub fn custom_nested_cgroup_rapid_churn(ctx: &Ctx) -> Result<AssertResult> {
             let deep = format!("{path}/deep");
             ctx.cgroups.create_cgroup(&deep)?;
             thread::sleep(Duration::from_millis(50));
-            let _ = ctx.cgroups.remove_cgroup(&deep);
+            // Best-effort teardown of the nested 'deep' child
+            // before its parent: a transient EBUSY from the
+            // kernel's drain path or ENOENT if the parent's
+            // removal below races and reaps it leaves the path
+            // for the parent to clean up. The setup_cgroups
+            // guard reaps any leaked cgroups at scenario
+            // teardown.
+            if let Err(e) = ctx.cgroups.remove_cgroup(&deep) {
+                tracing::warn!(cgroup = %deep, err = %format!("{e:#}"), "nested churn: remove_cgroup(deep) failed; parent removal or guard Drop will reap");
+            }
         }
         thread::sleep(Duration::from_millis(50));
-        let _ = ctx.cgroups.remove_cgroup(&path);
+        // Parent removal in the same churn loop. EBUSY (a child
+        // 'deep' cgroup is still being torn down by its own
+        // remove_cgroup above) or ENOENT (already gone) here
+        // leaves the cgroup for the guard's Drop to reap on
+        // scenario teardown. Bailing would truncate the churn
+        // workload mid-run and mask hierarchy races.
+        if let Err(e) = ctx.cgroups.remove_cgroup(&path) {
+            tracing::warn!(cgroup = %path, err = %format!("{e:#}"), "nested churn: remove_cgroup(path) failed; guard Drop will reap on scenario teardown");
+        }
         i += 1;
     }
     Ok(collect_all(handles, &ctx.assert))

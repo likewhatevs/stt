@@ -5,11 +5,11 @@
 //! surface useful diagnostics:
 //!
 //! - **AssertResult JSON** on stdout/COM2, bracketed by
-//!   [`RESULT_START`] / [`RESULT_END`] — and also on the SHM ring with
-//!   `MSG_TYPE_TEST_RESULT` for the primary transport. See
-//!   [`print_assert_result`] (guest emit), [`parse_assert_result`]
+//!   [`RESULT_START`] / [`RESULT_END`] — and also on the bulk data
+//!   channel with `MSG_TYPE_TEST_RESULT` for the primary transport.
+//!   See [`print_assert_result`] (guest emit), [`parse_assert_result`]
 //!   (host parse from COM2 string), and [`parse_assert_result_shm`]
-//!   (host parse from SHM drain).
+//!   (host parse from the merged bulk drain).
 //! - **Scheduler log** on COM2, bracketed by
 //!   [`SCHED_OUTPUT_START`](crate::verifier::SCHED_OUTPUT_START) /
 //!   [`SCHED_OUTPUT_END`](crate::verifier::SCHED_OUTPUT_END) — both
@@ -45,10 +45,11 @@ use crate::vmm;
 pub(crate) const RESULT_START: &str = "===KTSTR_TEST_RESULT_START===";
 pub(crate) const RESULT_END: &str = "===KTSTR_TEST_RESULT_END===";
 
-/// Write AssertResult to SHM (primary) and stdout/COM2 (fallback).
+/// Write AssertResult to the bulk data channel (primary) and
+/// stdout/COM2 (fallback).
 pub(crate) fn print_assert_result(r: &AssertResult) {
     if let Ok(json) = serde_json::to_string(r) {
-        vmm::shm_ring::write_msg(vmm::shm_ring::MSG_TYPE_TEST_RESULT, json.as_bytes());
+        vmm::guest_comms::send_test_result(json.as_bytes());
         println!("{RESULT_START}");
         println!("{json}");
         println!("{RESULT_END}");

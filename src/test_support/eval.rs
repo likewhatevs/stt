@@ -151,25 +151,24 @@ pub(crate) fn record_skip_sidecar(entry: &KtstrTestEntry, active_flags: &[String
 /// `shm_drops` is the
 /// [`crate::vmm::shm_ring::ShmDrainResult::drops`] counter — total
 /// messages the guest's `shm_write` dropped (ring full, or
-/// overflow paths that should not fire in practice). The header's
-/// counter conflates every message type, so we cannot tell whether
-/// a dropped message was an LlmExtract pair or some other type
-/// (profraw, stimulus, payload metrics for a different test). The
-/// safe interpretation: when ANY drops occurred AND the test used
-/// LlmExtract (`raw_outputs` non-empty), surface a host-actionable
-/// detail. The dropped message MAY have been an LlmExtract
-/// `RawPayloadOutput` — losing one silently would make extracted
-/// metrics quietly incomplete — and a multi-MB workload output
-/// (dmesg flood, large schbench latency table) is the most
-/// plausible victim.
+/// overflow paths that should not fire in practice). Post-multiport,
+/// the SHM ring carries only `MSG_TYPE_CRASH` (panic-hook fallback)
+/// plus any pre-port-open early-boot writes — `RawPayloadOutput`
+/// and `PayloadMetrics` travel via the virtio-console bulk port
+/// which uses backpressure rather than drops. So a non-zero
+/// `shm_drops` no longer indicates LlmExtract data loss; it means
+/// the SHM CRASH channel overflowed. The detail still surfaces
+/// when `raw_outputs` is non-empty so an LlmExtract test author
+/// sees the CRASH-channel signal alongside the rest of their
+/// extraction failures, but the failure framing has shifted from
+/// "LlmExtract truncation" to "CRASH ring overflow."
 ///
 /// Failure shape:
-/// - SHM ring overflow with LlmExtract in use: a single detail
-///   naming the drops counter so the test author knows to either
-///   shrink the workload's stdout/stderr or expand the SHM ring
-///   capacity. The detail does NOT block the rest of the host-side
-///   extraction path — the raw outputs that DID arrive still get
-///   processed.
+/// - SHM CRASH ring overflow with LlmExtract in use: a single detail
+///   naming the drops counter so the test author knows to investigate
+///   guest panics or expand the SHM region. The detail does NOT
+///   block the rest of the host-side extraction path — the raw
+///   outputs that DID arrive still get processed.
 /// - Model load fails (e.g. `KTSTR_MODEL_OFFLINE=1` with cold cache,
 ///   SHA mismatch on a corrupted cached GGUF): append a single
 ///   `LlmExtract model load failed: <reason>` detail. metrics
@@ -217,28 +216,26 @@ fn host_side_llm_extract(
         return failures;
     }
     // SHM ring overflow with LlmExtract in use: surface BEFORE the
-    // pairing loop so the operator sees the drops first. The
-    // counter conflates every message type, so this fires even if
-    // the dropped message was a profraw entry rather than a raw
-    // output — but the dominant cause of drops with LlmExtract in
-    // play is a multi-MB workload output blowing the ring's
-    // capacity, and a false positive (drops for some other type)
-    // is preferable to silent metric loss.
+    // pairing loop so the operator sees the drops first. Post-
+    // multiport, RAW_PAYLOAD_OUTPUT and PAYLOAD_METRICS travel via
+    // the virtio-console bulk port — backpressure replaces drops,
+    // so a non-zero `shm_drops` no longer means LlmExtract data was
+    // lost. The SHM ring now carries only MSG_TYPE_CRASH (panic
+    // hook fallback) plus any pre-port-open early-boot writes, so
+    // we surface the overflow as a CRASH-channel signal rather than
+    // an LlmExtract truncation.
     if shm_drops > 0 {
         failures.push(crate::assert::AssertDetail::new(
             crate::assert::DetailKind::Other,
             format!(
-                "SHM ring overflow: {shm_drops} message(s) dropped while LlmExtract was in use. \
-                 The test's stdout/stderr may have exceeded the ring's configured capacity, \
-                 silently truncating the input the host's extract_via_llm received. \
-                 Shrink the workload's output volume (e.g. trim the latency table, \
-                 disable verbose logging, redirect noisy stderr to /dev/null), or \
-                 expand the SHM ring via the VMM's shm_size config so all guest \
-                 emissions fit. The drops counter conflates message types, so the \
-                 dropped message may be a profraw or stimulus entry rather than \
-                 an LlmExtract payload — but the test cannot prove the LlmExtract \
-                 raw-output stream is complete with a non-zero counter, and silently \
-                 truncated metrics propagate as flaky regressions downstream."
+                "SHM CRASH ring overflow: {shm_drops} message(s) dropped on the SHM ring. \
+                 Post-multiport, RAW_PAYLOAD_OUTPUT and PAYLOAD_METRICS travel via the \
+                 virtio-console bulk port (/dev/vport0p1) which uses backpressure rather \
+                 than drops, so this counter no longer indicates LlmExtract data loss. \
+                 The SHM ring now carries only MSG_TYPE_CRASH (panic-hook fallback) plus \
+                 any pre-port-open early-boot writes, so a non-zero drops count means \
+                 the guest crash channel overflowed. Investigate concurrent guest \
+                 panics or expand the SHM region via the VMM's shm_size config."
             ),
         ));
     }
@@ -688,8 +685,36 @@ pub(crate) fn dedupe_include_files(
 // panics) cannot bypass the restore.
 //
 // The x86_64 definition saves XSAVE area + FS/GS_BASE + PKRU
-// (each CPUID-gated) plus sigmask + SIGRTMIN sigaction. The
-// non-x86_64 definition saves only sigmask + SIGRTMIN.
+// (each CPUID-gated) plus sigmask + SIGRTMIN sigaction.
+//
+// The aarch64 definition saves V0..V31 + FPCR + FPSR (the FPSIMD
+// register file plus the two control/status registers that are the
+// MXCSR analog) plus sigmask + SIGRTMIN sigaction. The kernel's
+// `kvm_arch_vcpu_load_fp` / `kvm_arch_vcpu_put_fp`
+// (arch/arm64/kvm/fpsimd.c) pair drives a
+// `fpsimd_save_and_flush_cpu_state()` save plus `TIF_FOREIGN_FPSTATE`
+// reload at return-to-userspace through `task_fpsimd_load`
+// (arch/arm64/kernel/fpsimd.c) — so in the absence of a kernel bug
+// our restore is redundant. The same was true on x86_64 for MXCSR
+// before the PE-flag leak surfaced; this guard is the same
+// defense-in-depth on arm64.
+//
+// SVE Z0..Z31 / P0..P15 / FFR are deliberately NOT saved here. The
+// kernel's `task_fpsimd_load` reloads them from
+// `current->thread.sve_state` when `TIF_SVE` is set on the eval
+// thread, so the same defense covers SVE in the no-bug case. Saving
+// them in user space requires `.arch_extension sve` inline asm with
+// dynamic vector-length sizing (`prctl(PR_SVE_GET_VL)`) plus a
+// per-thread allocation; running an SVE store on a thread with
+// `TIF_SVE` clear would itself trip `do_sve_acc` and flip the flag
+// as an observer effect, so naive saving is incorrect. If a kernel
+// bug surfaces in the SVE restore path analogous to the MXCSR PE
+// leak, this guard expands to cover it then.
+//
+// The bare-fallback arm covers any future host arch that slips
+// past the build's x86_64+aarch64 expectation; it preserves the
+// sigmask + SIGRTMIN restore so the SIGRTMIN stop-vcpu trampoline
+// never leaks into the test runner's main loop.
 
 /// Public-crate entry point. Thin wrapper around
 /// [`run_ktstr_test_inner_impl`] that records a skip sidecar as a
@@ -1039,13 +1064,119 @@ fn run_ktstr_test_inner_impl(
             }
         }
     }
-    // sigmask + SIGRTMIN save/restore is arch-independent.
-    #[cfg(not(target_arch = "x86_64"))]
+    // FPSIMD V0..V31 occupy 32 * 16 = 512 bytes when stored as q
+    // registers. `repr(C, align(16))` matches the alignment that
+    // `stp q0, q1, [x0]` requires (16-byte for SIMD&FP load/store
+    // pairs per ARM ARM C3.3.13). FPCR/FPSR are 32-bit
+    // architecturally; `mrs` writes the full 64-bit destination
+    // with the upper bits RES0, so a u64 slot is the natural size.
+    #[cfg(target_arch = "aarch64")]
+    #[repr(C, align(16))]
+    struct FpsimdState {
+        v: [u128; 32],
+        fpcr: u64,
+        fpsr: u64,
+    }
+    // Pin the field offsets the inline asm hardcodes (#0..#520).
+    // The save/restore asm writes/reads at these literal byte
+    // offsets; if `repr(C)` layout ever drifts (e.g. a future
+    // u128 alignment bump or padding insertion) the asserts here
+    // fire at compile time instead of producing silent
+    // wrong-register reads.
+    #[cfg(target_arch = "aarch64")]
+    const _: () = {
+        assert!(std::mem::offset_of!(FpsimdState, v) == 0);
+        assert!(std::mem::offset_of!(FpsimdState, fpcr) == 512);
+        assert!(std::mem::offset_of!(FpsimdState, fpsr) == 520);
+        assert!(std::mem::align_of::<FpsimdState>() == 16);
+    };
+    #[cfg(target_arch = "aarch64")]
+    struct CpuStateGuard {
+        // None when the host CPU lacks FEAT_FP. AArch64 Linux
+        // requires FPSIMD in practice, but
+        // `is_aarch64_feature_detected!("fp")` keeps us correct on
+        // any future trimmed-down host configuration.
+        fpsimd: Option<Box<FpsimdState>>,
+        sigmask: libc::sigset_t,
+        sigrtmin_action: libc::sigaction,
+    }
+    #[cfg(target_arch = "aarch64")]
+    impl Drop for CpuStateGuard {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(fp) = self.fpsimd.as_deref() {
+                    let ptr = fp as *const FpsimdState as *const u8;
+                    // Restore V0..V31 (32 * 16 bytes) then FPCR
+                    // and FPSR. Keeping the load order identical
+                    // to the save order means a partial restore
+                    // (e.g. on instruction trap mid-block) leaves
+                    // the same prefix coherent rather than mixing
+                    // V regs with stale FPCR/FPSR.
+                    //
+                    // The 32 `out("vN") _` declarations tell the
+                    // compiler every V register is clobbered after
+                    // the asm; without them V8..V15 (the bottom-64
+                    // callee-saved slice per AAPCS64) could carry
+                    // a compiler-managed value across the asm and
+                    // be silently overwritten with our saved
+                    // value. FPCR/FPSR have no Rust-level register
+                    // class, so writing them via `msr` is opaque
+                    // to the compiler — that is the desired
+                    // behavior here (the registers control IEEE
+                    // rounding/exception state, not register
+                    // liveness).
+                    core::arch::asm!(
+                        "ldp q0, q1, [{p}, #0]",
+                        "ldp q2, q3, [{p}, #32]",
+                        "ldp q4, q5, [{p}, #64]",
+                        "ldp q6, q7, [{p}, #96]",
+                        "ldp q8, q9, [{p}, #128]",
+                        "ldp q10, q11, [{p}, #160]",
+                        "ldp q12, q13, [{p}, #192]",
+                        "ldp q14, q15, [{p}, #224]",
+                        "ldp q16, q17, [{p}, #256]",
+                        "ldp q18, q19, [{p}, #288]",
+                        "ldp q20, q21, [{p}, #320]",
+                        "ldp q22, q23, [{p}, #352]",
+                        "ldp q24, q25, [{p}, #384]",
+                        "ldp q26, q27, [{p}, #416]",
+                        "ldp q28, q29, [{p}, #448]",
+                        "ldp q30, q31, [{p}, #480]",
+                        "ldr {tmp}, [{p}, #512]",
+                        "msr FPCR, {tmp}",
+                        "ldr {tmp}, [{p}, #520]",
+                        "msr FPSR, {tmp}",
+                        p = in(reg) ptr,
+                        tmp = out(reg) _,
+                        out("v0") _, out("v1") _, out("v2") _, out("v3") _,
+                        out("v4") _, out("v5") _, out("v6") _, out("v7") _,
+                        out("v8") _, out("v9") _, out("v10") _, out("v11") _,
+                        out("v12") _, out("v13") _, out("v14") _, out("v15") _,
+                        out("v16") _, out("v17") _, out("v18") _, out("v19") _,
+                        out("v20") _, out("v21") _, out("v22") _, out("v23") _,
+                        out("v24") _, out("v25") _, out("v26") _, out("v27") _,
+                        out("v28") _, out("v29") _, out("v30") _, out("v31") _,
+                        options(nostack, readonly),
+                    );
+                }
+                libc::pthread_sigmask(libc::SIG_SETMASK, &self.sigmask, std::ptr::null_mut());
+                libc::sigaction(
+                    libc::SIGRTMIN(),
+                    &self.sigrtmin_action,
+                    std::ptr::null_mut(),
+                );
+            }
+        }
+    }
+    // sigmask + SIGRTMIN save/restore is arch-independent — covers
+    // any host arch outside the x86_64 + aarch64 set the build
+    // expects (no compile_error guard local to this file).
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     struct CpuStateGuard {
         sigmask: libc::sigset_t,
         sigrtmin_action: libc::sigaction,
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     impl Drop for CpuStateGuard {
         fn drop(&mut self) {
             unsafe {
@@ -1121,7 +1252,66 @@ fn run_ktstr_test_inner_impl(
             sigrtmin_action,
         }
     };
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
+    let _cpu_guard = unsafe {
+        // FEAT_FP is implied by FEAT_AdvSIMD ("neon") and is
+        // mandatory on every AArch64 Linux kernel observed in
+        // practice; the runtime check survives a hypothetical
+        // FP-stripped host without raising SIGILL on the `mrs`
+        // and `stp q*` instructions below.
+        let fpsimd = if std::arch::is_aarch64_feature_detected!("fp") {
+            let mut state = Box::new(FpsimdState {
+                v: [0u128; 32],
+                fpcr: 0,
+                fpsr: 0,
+            });
+            let ptr = state.as_mut() as *mut FpsimdState as *mut u8;
+            // Save V0..V31 (32 * 16 bytes), then FPCR and FPSR.
+            // The same offsets the Drop path's `ldp`/`ldr` chain
+            // reads back from. `mrs` of FPCR/FPSR writes the full
+            // 64-bit destination with the upper bits architectural
+            // RES0, so the u64 slot captures the entire defined
+            // state.
+            core::arch::asm!(
+                "stp q0, q1, [{p}, #0]",
+                "stp q2, q3, [{p}, #32]",
+                "stp q4, q5, [{p}, #64]",
+                "stp q6, q7, [{p}, #96]",
+                "stp q8, q9, [{p}, #128]",
+                "stp q10, q11, [{p}, #160]",
+                "stp q12, q13, [{p}, #192]",
+                "stp q14, q15, [{p}, #224]",
+                "stp q16, q17, [{p}, #256]",
+                "stp q18, q19, [{p}, #288]",
+                "stp q20, q21, [{p}, #320]",
+                "stp q22, q23, [{p}, #352]",
+                "stp q24, q25, [{p}, #384]",
+                "stp q26, q27, [{p}, #416]",
+                "stp q28, q29, [{p}, #448]",
+                "stp q30, q31, [{p}, #480]",
+                "mrs {tmp}, FPCR",
+                "str {tmp}, [{p}, #512]",
+                "mrs {tmp}, FPSR",
+                "str {tmp}, [{p}, #520]",
+                p = in(reg) ptr,
+                tmp = out(reg) _,
+                options(nostack),
+            );
+            Some(state)
+        } else {
+            None
+        };
+        let mut sigmask: libc::sigset_t = std::mem::zeroed();
+        libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), &mut sigmask);
+        let mut sigrtmin_action: libc::sigaction = std::mem::zeroed();
+        libc::sigaction(libc::SIGRTMIN(), std::ptr::null(), &mut sigrtmin_action);
+        CpuStateGuard {
+            fpsimd,
+            sigmask,
+            sigrtmin_action,
+        }
+    };
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     let _cpu_guard = unsafe {
         let mut sigmask: libc::sigset_t = std::mem::zeroed();
         libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), &mut sigmask);
@@ -4736,8 +4926,10 @@ mod tests {
         let failures = host_side_llm_extract(&mut pm, &raws, 7);
         let messages: Vec<&str> = failures.iter().map(|d| d.message.as_str()).collect();
         assert!(
-            messages.iter().any(|m| m.contains("SHM ring overflow")),
-            "drops > 0 with LlmExtract in use must surface 'SHM ring overflow': {messages:?}",
+            messages
+                .iter()
+                .any(|m| m.contains("SHM CRASH ring overflow")),
+            "drops > 0 with LlmExtract in use must surface 'SHM CRASH ring overflow': {messages:?}",
         );
         assert!(
             messages.iter().any(|m| m.contains("7 message(s) dropped")),
@@ -5351,5 +5543,74 @@ mod tests {
         // surfaces here.
         assert_eq!(restored.payload_index, original.payload_index);
         assert_eq!(restored.hint.as_deref(), Some("focus"));
+    }
+
+    /// Bulk-channel wire-frame round-trip mirror of
+    /// [`raw_payload_output_shm_wire_round_trip_preserves_both_streams`].
+    /// The new transport is the virtio-console port-1 TLV stream
+    /// parsed by [`crate::vmm::shm_ring::parse_tlv_stream`] (the
+    /// host-side reader called from `collect_results`); this test
+    /// exercises the same property — stdout / stderr never get
+    /// swapped or merged on the bulk wire — through that parser
+    /// instead of `shm_drain`.
+    ///
+    /// The assertions are identical to the SHM-ring sibling: the
+    /// underlying wire format is the same (16-byte ShmMessage
+    /// header + payload), but verifying the PARSER end produces a
+    /// distinct regression guard for the bulk path. A future
+    /// schema change to the bulk frame layout that did not also
+    /// touch the SHM frame layout would surface here without
+    /// regressing the SHM test.
+    #[test]
+    fn raw_payload_output_bulk_wire_round_trip_preserves_both_streams() {
+        use crate::vmm::shm_ring;
+
+        const STDOUT_MARKER: &str = "STDOUT_MARKER_BULK_E2E_a1b2c3";
+        const STDERR_MARKER: &str = "STDERR_MARKER_BULK_E2E_x9y8z7";
+
+        let original = crate::test_support::RawPayloadOutput {
+            payload_index: 21,
+            stdout: STDOUT_MARKER.to_string(),
+            stderr: STDERR_MARKER.to_string(),
+            hint: Some("bulk-focus".to_string()),
+            metric_hints: Vec::new(),
+            metric_bounds: None,
+        };
+        let payload = serde_json::to_vec(&original).expect("serialize RawPayloadOutput");
+
+        // Build a single TLV frame in the same format the guest
+        // writer emits to /dev/vport0p1: 16-byte ShmMessage header
+        // followed by `payload.len()` bytes.
+        use zerocopy::IntoBytes;
+        let hdr = shm_ring::ShmMessage {
+            msg_type: shm_ring::MSG_TYPE_RAW_PAYLOAD_OUTPUT,
+            length: payload.len() as u32,
+            crc32: crc32fast::hash(&payload),
+            _pad: 0,
+        };
+        let mut frame: Vec<u8> = Vec::with_capacity(shm_ring::MSG_HEADER_SIZE + payload.len());
+        frame.extend_from_slice(hdr.as_bytes());
+        frame.extend_from_slice(&payload);
+
+        let drained = shm_ring::parse_tlv_stream(&frame);
+        assert_eq!(
+            drained.entries.len(),
+            1,
+            "exactly one entry expected from bulk parse",
+        );
+        assert_eq!(drained.drops, 0, "bulk path does not produce drops");
+
+        let entry = &drained.entries[0];
+        assert_eq!(entry.msg_type, shm_ring::MSG_TYPE_RAW_PAYLOAD_OUTPUT,);
+        assert!(entry.crc_ok, "bulk CRC must match");
+
+        let restored: crate::test_support::RawPayloadOutput =
+            serde_json::from_slice(&entry.payload).expect("decode RawPayloadOutput from bulk");
+        assert_eq!(restored.stdout, STDOUT_MARKER);
+        assert_eq!(restored.stderr, STDERR_MARKER);
+        assert!(!restored.stdout.contains(STDERR_MARKER));
+        assert!(!restored.stderr.contains(STDOUT_MARKER));
+        assert_eq!(restored.payload_index, original.payload_index);
+        assert_eq!(restored.hint.as_deref(), Some("bulk-focus"));
     }
 }

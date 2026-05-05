@@ -113,6 +113,12 @@ pub(super) fn worker_main(
     //   accept.
     let tid: libc::pid_t = unsafe { libc::syscall(libc::SYS_gettid) as libc::pid_t };
 
+    // Soft-fail on EPERM (no CAP_SYS_NICE) — the worker continues
+    // with the inherited affinity/class so the test reports a
+    // visible failure mode in WorkerReport rather than crashing
+    // before any work is done. apply_nice and the per-pos
+    // set_sched_policy sites later in this function follow the
+    // same policy.
     if let Some(ref cpus) = affinity {
         let _ = set_thread_affinity(tid, cpus);
     }
@@ -766,6 +772,18 @@ pub(super) fn worker_main(
                                 PhaseIoTempfile { file, path }
                             });
                             let f = &mut tf.file;
+                            // Phase::Io drives the legacy tempfile-on-tmpfs
+                            // IO scenario (separate from IoSyncWrite /
+                            // IoRandRead / IoConvoy on /dev/vda). All four
+                            // operations below are best-effort: the loop
+                            // is bounded by `end` and `stop_requested`,
+                            // and a transient ENOSPC / EIO surfaces as
+                            // reduced work_units (the visible failure
+                            // mode for this test) rather than aborting
+                            // the worker. The set_len/seek pair resets
+                            // the file pointer for the next 16-write
+                            // burst — neither failure prevents the
+                            // bursts from making forward progress.
                             while Instant::now() < end && !stop_requested(stop) {
                                 let _ = f.set_len(0);
                                 let _ = f.seek(std::io::SeekFrom::Start(0));
@@ -1388,6 +1406,15 @@ pub(super) fn worker_main(
                             continue;
                         }
                         let one = [0u8; 1];
+                        // Bootstrap write: best-effort. EAGAIN is
+                        // impossible (a fresh anon pipe has full
+                        // buffer); EPIPE means the successor
+                        // already exited (shutdown is in-flight)
+                        // and the next outer-iteration
+                        // stop_requested check unwinds the chain.
+                        // Either way the failure mode is "chain
+                        // doesn't bootstrap this run" — surfaces
+                        // as zero work_units, not a crash.
                         let _ = unsafe {
                             libc::write(write_fd, one.as_ptr() as *const libc::c_void, 1)
                         };
@@ -1458,6 +1485,12 @@ pub(super) fn worker_main(
                         continue;
                     }
                     let one = [0u8; 1];
+                    // Chain-advance write: same best-effort policy
+                    // as the bootstrap above. EPIPE on a successor
+                    // exit unwinds via the outer stop_requested
+                    // check; EAGAIN cannot occur on a 1-byte write
+                    // to a pipe that the predecessor's poll-then-
+                    // read just drained.
                     let _ =
                         unsafe { libc::write(write_fd, one.as_ptr() as *const libc::c_void, 1) };
                     last_iter_time = Instant::now();
@@ -2043,6 +2076,14 @@ pub(super) fn worker_main(
                     // MPOL_MF_MOVE = 1 << 1 (include/uapi/linux/mempolicy.h).
                     // MPOL_BIND from libc.
                     const MPOL_MF_MOVE: libc::c_ulong = 1 << 1;
+                    // Best-effort migration: a single-node host or
+                    // a node missing from the system rejects with
+                    // EINVAL; CAP_SYS_NICE absence rejects MOVE
+                    // with EPERM. Both leave pages on their current
+                    // nodes — the page-touch loop below still runs
+                    // and the test surfaces "no cross-node
+                    // migration observed" as its visible failure
+                    // mode rather than aborting the worker.
                     let _ = unsafe {
                         libc::syscall(
                             libc::SYS_mbind,

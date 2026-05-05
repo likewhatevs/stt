@@ -384,6 +384,7 @@ fn report_display_includes_vcpu_regs_section() {
                 stack_pointer: 0x2,
                 page_table_root: 0x3,
                 user_page_table_root: None,
+                tcr_el1: None,
             }),
             None,
             Some(VcpuRegSnapshot {
@@ -391,6 +392,7 @@ fn report_display_includes_vcpu_regs_section() {
                 stack_pointer: 0xb,
                 page_table_root: 0xc,
                 user_page_table_root: None,
+                tcr_el1: None,
             }),
         ],
         sdt_allocations: Vec::new(),
@@ -432,6 +434,7 @@ fn report_display_pairs_maps_and_vcpu_regs_with_blank_line() {
             stack_pointer: 0x2,
             page_table_root: 0x3,
             user_page_table_root: None,
+            tcr_el1: None,
         })],
         sdt_allocations: Vec::new(),
         prog_runtime_stats: Vec::new(),
@@ -506,6 +509,7 @@ fn report_display_partial_with_populated_regs_and_empty_maps() {
             stack_pointer: 0xbeef,
             page_table_root: 0xcafe,
             user_page_table_root: None,
+            tcr_el1: None,
         })],
         sdt_allocations: Vec::new(),
         prog_runtime_stats: Vec::new(),
@@ -3216,7 +3220,6 @@ fn failure_dump_display_scx_walker_unavailable() {
 /// `BpfRingbufOffsets` / `BpfStackmapOffsets` instances so a test
 /// can borrow `&BpfMapOffsets` for a `GuestMemMapAccessor` without
 /// each test re-stitching the offset substructs.
-#[cfg(target_arch = "x86_64")]
 struct RenderScene {
     buf: Vec<u8>,
     page_offset: u64,
@@ -3229,7 +3232,6 @@ struct RenderScene {
 /// Direct-mapping KVA from a host PA: `kva = pa + page_offset`. The
 /// production `translate_any_kva` reverses this with `kva - page_offset`
 /// and bounds-checks against `mem.size()`.
-#[cfg(target_arch = "x86_64")]
 fn pa_to_kva(pa: u64, page_offset: u64) -> u64 {
     page_offset.wrapping_add(pa)
 }
@@ -3239,7 +3241,6 @@ fn pa_to_kva(pa: u64, page_offset: u64) -> u64 {
 /// pointer); the bpf_ringbuf struct lays out
 /// mask/consumer_pos/producer_pos/pending_pos one per cacheline so
 /// the production reader exercises the per-field translate.
-#[cfg(target_arch = "x86_64")]
 fn synth_ringbuf_offsets() -> super::super::btf_offsets::BpfRingbufOffsets {
     super::super::btf_offsets::BpfRingbufOffsets {
         rbm_rb: 0,
@@ -3253,7 +3254,6 @@ fn synth_ringbuf_offsets() -> super::super::btf_offsets::BpfRingbufOffsets {
 /// Build a `BpfMapOffsets` carrying only the ringbuf substruct.
 /// Other walkers/render helpers do not consult these other fields,
 /// so they stay zero-valued.
-#[cfg(target_arch = "x86_64")]
 fn synth_ringbuf_map_offsets() -> crate::monitor::btf_offsets::BpfMapOffsets {
     let mut o = crate::monitor::btf_offsets::BpfMapOffsets::EMPTY;
     o.ringbuf_offsets = Some(synth_ringbuf_offsets());
@@ -3269,7 +3269,6 @@ fn synth_ringbuf_map_offsets() -> crate::monitor::btf_offsets::BpfMapOffsets {
 /// `rb_kva_override = Some(0)` writes a NULL rb pointer (exercises
 /// the rb-NULL error path); `Some(other_kva)` writes an unmapped
 /// pointer; `None` writes the rb's real KVA.
-#[cfg(target_arch = "x86_64")]
 fn build_ringbuf_scene(
     mask: u64,
     consumer_pos: u64,
@@ -3322,7 +3321,6 @@ fn build_ringbuf_scene(
 }
 
 /// Build a `BpfMapInfo` for ringbuf tests with the given map_kva.
-#[cfg(target_arch = "x86_64")]
 fn ringbuf_map_info(map_kva: u64) -> super::super::bpf_map::BpfMapInfo {
     super::super::bpf_map::BpfMapInfo {
         map_pa: 0,
@@ -3347,7 +3345,6 @@ fn ringbuf_map_info(map_kva: u64) -> super::super::bpf_map::BpfMapInfo {
 /// `BpfMapOffsets::ringbuf_offsets` is None (kernel built without
 /// ringbuf, or BTF stripped).
 #[test]
-#[cfg(target_arch = "x86_64")]
 fn render_ringbuf_no_offsets_returns_err() {
     let (scene, map_kva) = build_ringbuf_scene(0xFFFF, 0x100, 0x200, 0x180, None);
     let info = ringbuf_map_info(map_kva);
@@ -3377,7 +3374,6 @@ fn render_ringbuf_no_offsets_returns_err() {
 /// `render_ringbuf_state` returns the unmapped-map_kva error when
 /// `info.map_kva` falls outside the synthetic memory window.
 #[test]
-#[cfg(target_arch = "x86_64")]
 fn render_ringbuf_unmapped_map_kva_returns_err() {
     let (scene, _map_kva) = build_ringbuf_scene(0xFFFF, 0x100, 0x200, 0x180, None);
     // Use a KVA that translates outside the buf.
@@ -3404,7 +3400,6 @@ fn render_ringbuf_unmapped_map_kva_returns_err() {
 /// `render_ringbuf_state` returns the rb-pointer-NULL error when
 /// the bpf_ringbuf_map.rb field reads as 0.
 #[test]
-#[cfg(target_arch = "x86_64")]
 fn render_ringbuf_null_rb_returns_err() {
     let (scene, map_kva) = build_ringbuf_scene(0xFFFF, 0x100, 0x200, 0x180, Some(0));
     let info = ringbuf_map_info(map_kva);
@@ -3429,7 +3424,6 @@ fn render_ringbuf_null_rb_returns_err() {
 /// `render_ringbuf_state` returns the rb-fields-unmapped error when
 /// the bpf_ringbuf pointer translates outside the buffer.
 #[test]
-#[cfg(target_arch = "x86_64")]
 fn render_ringbuf_unmapped_rb_returns_err() {
     let (scene, map_kva) = build_ringbuf_scene(
         0xFFFF,
@@ -3459,7 +3453,6 @@ fn render_ringbuf_unmapped_rb_returns_err() {
 
 /// Happy path: capacity = mask + 1, pending_bytes = producer - consumer.
 #[test]
-#[cfg(target_arch = "x86_64")]
 fn render_ringbuf_basic_capacity_and_pending() {
     // 64 KiB ring (mask = 0xFFFF, capacity = 0x10000), consumer at
     // 0x100, producer at 0x300, pending = 0x200.
@@ -3490,7 +3483,6 @@ fn render_ringbuf_basic_capacity_and_pending() {
 /// Wraparound: producer < consumer in absolute terms => unsigned
 /// wraparound subtraction yields a meaningful pending count.
 #[test]
-#[cfg(target_arch = "x86_64")]
 fn render_ringbuf_wraparound_pending_bytes() {
     // consumer beyond producer by 100; wrap subtraction yields
     // u64::MAX - 99.
@@ -3524,7 +3516,6 @@ fn render_ringbuf_wraparound_pending_bytes() {
 /// the helper bails with an explicit error rather than producing a
 /// nonsense capacity = 0.
 #[test]
-#[cfg(target_arch = "x86_64")]
 fn render_ringbuf_mask_max_returns_err() {
     let (scene, map_kva) = build_ringbuf_scene(u64::MAX, 0, 0, 0, None);
     let info = ringbuf_map_info(map_kva);
@@ -3548,7 +3539,6 @@ fn render_ringbuf_mask_max_returns_err() {
 
 // -- #53 stack-trace render tests ---------------------------------
 
-#[cfg(target_arch = "x86_64")]
 fn synth_stackmap_offsets() -> super::super::btf_offsets::BpfStackmapOffsets {
     super::super::btf_offsets::BpfStackmapOffsets {
         smap_n_buckets: 0,
@@ -3558,7 +3548,6 @@ fn synth_stackmap_offsets() -> super::super::btf_offsets::BpfStackmapOffsets {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
 fn synth_stackmap_map_offsets() -> crate::monitor::btf_offsets::BpfMapOffsets {
     let mut o = crate::monitor::btf_offsets::BpfMapOffsets::EMPTY;
     o.stackmap_offsets = Some(synth_stackmap_offsets());
@@ -3570,7 +3559,6 @@ fn synth_stackmap_map_offsets() -> crate::monitor::btf_offsets::BpfMapOffsets {
 /// the layout writes a `bpf_stack_map` with `n_buckets` and
 /// `buckets[]` flex array, plus per-bucket `stack_map_bucket`
 /// structs containing `nr` + `data[]`.
-#[cfg(target_arch = "x86_64")]
 fn build_stackmap_scene(
     bucket_pc_lists: &[Vec<u64>],
     map_flags: u32,
@@ -3660,7 +3648,6 @@ fn build_stackmap_scene(
 /// `render_stack_traces` returns the BTF-lacks error when
 /// stackmap_offsets is None.
 #[test]
-#[cfg(target_arch = "x86_64")]
 fn render_stack_traces_no_offsets_returns_err() {
     let (mut scene, info) = build_stackmap_scene(&[vec![]], 0);
     scene.offsets.stackmap_offsets = None;
@@ -3687,7 +3674,6 @@ fn render_stack_traces_no_offsets_returns_err() {
 /// `render_stack_traces` returns the unmapped-map_kva error when
 /// info.map_kva translates outside the buffer.
 #[test]
-#[cfg(target_arch = "x86_64")]
 fn render_stack_traces_unmapped_map_kva_returns_err() {
     let (scene, _info) = build_stackmap_scene(&[vec![]], 0);
     let mut info = _info;
@@ -3713,7 +3699,6 @@ fn render_stack_traces_unmapped_map_kva_returns_err() {
 /// All-empty buckets: walker returns Ok with `n_buckets` set, an
 /// empty entries vec, and `truncated=false`.
 #[test]
-#[cfg(target_arch = "x86_64")]
 fn render_stack_traces_empty_returns_no_entries() {
     let (scene, info) = build_stackmap_scene(&[vec![], vec![], vec![], vec![]], 0);
     let mem = unsafe {
@@ -3738,7 +3723,6 @@ fn render_stack_traces_empty_returns_no_entries() {
 
 /// Populated buckets surface their PCs in `entries[].pcs`.
 #[test]
-#[cfg(target_arch = "x86_64")]
 fn render_stack_traces_populated_pcs() {
     let (scene, info) = build_stackmap_scene(
         &[
@@ -3780,7 +3764,6 @@ fn render_stack_traces_populated_pcs() {
 /// Build-id mode: pcs vector stays empty (per-entry shape is
 /// bpf_stack_build_id, not u64), data_hex carries raw bytes.
 #[test]
-#[cfg(target_arch = "x86_64")]
 fn render_stack_traces_build_id_mode_pcs_empty() {
     const BPF_F_STACK_BUILD_ID: u32 = 1 << 5;
     // One bucket with one "PC slot" (treated as 8 bytes of raw data
@@ -3812,7 +3795,6 @@ fn render_stack_traces_build_id_mode_pcs_empty() {
 
 // -- #53 fd-array render tests ------------------------------------
 
-#[cfg(target_arch = "x86_64")]
 fn synth_fd_array_offsets() -> crate::monitor::btf_offsets::BpfMapOffsets {
     let mut o = crate::monitor::btf_offsets::BpfMapOffsets::EMPTY;
     // Place ptrs[] at offset 16 within the synthetic bpf_array.
@@ -3823,7 +3805,6 @@ fn synth_fd_array_offsets() -> crate::monitor::btf_offsets::BpfMapOffsets {
 /// Build a synthetic FD-array scene. `populated_indices` lists the
 /// slot indices that should be non-zero. `max_entries` controls the
 /// scan upper bound.
-#[cfg(target_arch = "x86_64")]
 fn build_fd_array_scene(
     map_type: u32,
     max_entries: u32,
@@ -3883,7 +3864,6 @@ fn build_fd_array_scene(
 /// PROG_ARRAY with three populated slots: walker reports
 /// populated=3, indices=[indexes].
 #[test]
-#[cfg(target_arch = "x86_64")]
 fn render_fd_array_populated_indices() {
     let (scene, info) = build_fd_array_scene(
         super::super::bpf_map::BPF_MAP_TYPE_PROG_ARRAY,
@@ -3918,7 +3898,6 @@ fn render_fd_array_populated_indices() {
 /// HASH-shaped FD families (SOCKHASH / DEVMAP_HASH / HASH_OF_MAPS)
 /// short-circuit to populated=0/scanned=0/empty.
 #[test]
-#[cfg(target_arch = "x86_64")]
 fn render_fd_array_hash_shaped_returns_empty() {
     let (scene, info) = build_fd_array_scene(
         super::super::bpf_map::BPF_MAP_TYPE_SOCKHASH,
@@ -3953,7 +3932,6 @@ fn render_fd_array_hash_shaped_returns_empty() {
 /// `max_entries > MAX_FD_ARRAY_SLOTS` triggers the truncation flag.
 /// Walker still reports populated/indices for the slots it scanned.
 #[test]
-#[cfg(target_arch = "x86_64")]
 fn render_fd_array_max_entries_truncation() {
     // max_entries one above the cap. Skip populating slots — the
     // truncation flag fires regardless of population state. Build a
@@ -4001,7 +3979,6 @@ fn render_fd_array_max_entries_truncation() {
 /// must NOT silently read with `data_off = 0` against a wrapper-
 /// inclusive `value_size`.
 #[test]
-#[cfg(target_arch = "x86_64")]
 fn render_map_struct_ops_no_offsets_returns_error() {
     let mut offsets = crate::monitor::btf_offsets::BpfMapOffsets::EMPTY;
     // No struct_ops_offsets resolution.
@@ -4063,7 +4040,6 @@ fn render_map_struct_ops_no_offsets_returns_error() {
 /// `value_kva` translating outside the buffer surfaces the
 /// "value region unmapped" diagnostic.
 #[test]
-#[cfg(target_arch = "x86_64")]
 fn render_map_struct_ops_unmapped_value_returns_error() {
     let mut offsets = crate::monitor::btf_offsets::BpfMapOffsets::EMPTY;
     offsets.struct_ops_offsets = Some(super::super::btf_offsets::StructOpsOffsets {
@@ -4147,7 +4123,6 @@ fn struct_ops_value_kva_math_kvalue_plus_data() {
 /// the divergence on `indices_truncated` so a downstream consumer
 /// can see at a glance that the indices list is partial.
 #[test]
-#[cfg(target_arch = "x86_64")]
 fn render_fd_array_indices_capped_at_max_indices() {
     let cap = super::render_map::MAX_FD_ARRAY_INDICES as u32;
     // Populate cap + 5 slots; expect populated=cap+5, indices=cap.

@@ -61,7 +61,7 @@ use super::btf_offsets::{RHT_PTR_LOCK_BIT, SCX_DSQ_LNODE_ITER_CURSOR, ScxWalkerO
 use super::dump::TaskWalkerEntry;
 use super::guest::GuestKernel;
 use super::idr::translate_any_kva;
-use super::reader::GuestMem;
+use super::reader::{GuestMem, WalkContext};
 
 /// Maximum entries any single list_head walk visits before bailing
 /// with what's been collected. Bounds CPU + memory cost on a
@@ -255,9 +255,7 @@ pub fn walk_rq_scx(
     let task_offs = offsets.task.as_ref()?;
 
     let mem = kernel.mem();
-    let cr3_pa = kernel.cr3_pa();
-    let page_offset = kernel.page_offset();
-    let l5 = kernel.l5();
+    let walk = kernel.walk_context();
 
     let scx_off = rq_offs.scx;
 
@@ -289,15 +287,8 @@ pub fn walk_rq_scx(
 
     // curr task — pointer follow.
     let curr_kva = mem.read_u64(rq_pa, rq_offs.curr);
-    let (curr_pid, curr_comm) = read_task_pid_comm(
-        mem,
-        cr3_pa,
-        page_offset,
-        l5,
-        curr_kva,
-        task_offs.pid,
-        task_offs.comm,
-    );
+    let (curr_pid, curr_comm) =
+        read_task_pid_comm(mem, walk, curr_kva, task_offs.pid, task_offs.comm);
 
     // Walk runnable_list when sched_ext_entity offsets are available.
     // Without `see` we can still report scalar state but cannot
@@ -311,15 +302,7 @@ pub fn walk_rq_scx(
         // is at task + task_struct.scx + see.runnable_node.
         let runnable_node_off_in_task = task_offs.scx + see_offs.runnable_node;
 
-        walk_list_head_for_task_kvas(
-            mem,
-            cr3_pa,
-            page_offset,
-            l5,
-            head_kva,
-            head_pa,
-            runnable_node_off_in_task,
-        )
+        walk_list_head_for_task_kvas(mem, walk, head_kva, head_pa, runnable_node_off_in_task)
     } else {
         (Vec::new(), false)
     };
@@ -384,9 +367,7 @@ pub fn read_scx_sched_state(
     };
 
     let mem = kernel.mem();
-    let cr3_pa = kernel.cr3_pa();
-    let page_offset = kernel.page_offset();
-    let l5 = kernel.l5();
+    let walk = kernel.walk_context();
 
     if scx_root_kva == 0 {
         tracing::debug!(
@@ -396,7 +377,7 @@ pub fn read_scx_sched_state(
         return None;
     }
 
-    let root_pa = super::symbols::text_kva_to_pa(scx_root_kva);
+    let root_pa = kernel.text_kva_to_pa(scx_root_kva);
     let sched_kva = mem.read_u64(root_pa, 0);
     if sched_kva == 0 {
         tracing::debug!(
@@ -406,7 +387,14 @@ pub fn read_scx_sched_state(
         );
         return None;
     }
-    let Some(sched_pa) = translate_any_kva(mem, cr3_pa, page_offset, sched_kva, l5) else {
+    let Some(sched_pa) = translate_any_kva(
+        mem,
+        walk.cr3_pa,
+        walk.page_offset,
+        sched_kva,
+        walk.l5,
+        walk.tcr_el1,
+    ) else {
         tracing::debug!(
             sched_kva = format_args!("{:#x}", sched_kva),
             "read_scx_sched_state: translate_any_kva failed for sched_kva — \
@@ -535,15 +523,14 @@ pub fn walk_scx_tasks_global(
         return Vec::new();
     }
     let mem = kernel.mem();
-    let cr3_pa = kernel.cr3_pa();
-    let page_offset = kernel.page_offset();
-    let l5 = kernel.l5();
+    let walk = kernel.walk_context();
 
     // The LIST_HEAD lives in the kernel text/.data mapping; convert
-    // KVA → PA via text_kva_to_pa. The first u64 at that PA is
-    // list_head.next (the LIST_HEAD struct's first field).
+    // KVA → PA via the GuestKernel's runtime kernel image base. The
+    // first u64 at that PA is list_head.next (the LIST_HEAD struct's
+    // first field).
     let head_kva = scx_tasks_kva;
-    let head_pa = super::symbols::text_kva_to_pa(scx_tasks_kva);
+    let head_pa = kernel.text_kva_to_pa(scx_tasks_kva);
 
     let mut task_kvas: Vec<u64> = Vec::new();
     let mut node_kva = mem.read_u64(head_pa, 0);
@@ -570,7 +557,14 @@ pub fn walk_scx_tasks_global(
         // entries this base is a stack-allocated sched_ext_entity.
         // Either way, `see_kva = node_kva - see.tasks_node`.
         let see_kva = node_kva.wrapping_sub(tasks_node_off_in_see as u64);
-        let cursor = match translate_any_kva(mem, cr3_pa, page_offset, see_kva, l5) {
+        let cursor = match translate_any_kva(
+            mem,
+            walk.cr3_pa,
+            walk.page_offset,
+            see_kva,
+            walk.l5,
+            walk.tcr_el1,
+        ) {
             Some(see_pa) => {
                 let flags = mem.read_u32(see_pa, flags_off_in_see);
                 flags & SCX_TASK_CURSOR != 0
@@ -590,7 +584,14 @@ pub fn walk_scx_tasks_global(
 
         // Advance to the next node via the list_head.next pointer
         // at offset 0 of the tasks_node list_head.
-        let Some(node_pa) = translate_any_kva(mem, cr3_pa, page_offset, node_kva, l5) else {
+        let Some(node_pa) = translate_any_kva(
+            mem,
+            walk.cr3_pa,
+            walk.page_offset,
+            node_kva,
+            walk.l5,
+            walk.tcr_el1,
+        ) else {
             return task_kvas;
         };
         let next_kva = mem.read_u64(node_pa, 0);
@@ -679,9 +680,7 @@ pub fn walk_local_dsqs(
     };
 
     let mem = kernel.mem();
-    let cr3_pa = kernel.cr3_pa();
-    let page_offset = kernel.page_offset();
-    let l5 = kernel.l5();
+    let walk = kernel.walk_context();
 
     let mut states: Vec<DsqState> = Vec::new();
     let mut entries: Vec<TaskWalkerEntry> = Vec::new();
@@ -692,9 +691,7 @@ pub fn walk_local_dsqs(
         let dsq_pa = rq_pa.wrapping_add(local_dsq_off as u64);
         if let Some((state, e)) = walk_one_dsq(
             mem,
-            cr3_pa,
-            page_offset,
-            l5,
+            walk,
             dsq_kva,
             dsq_pa,
             format!("local cpu {cpu}"),
@@ -748,9 +745,7 @@ pub fn walk_dsqs(
     offsets: &ScxWalkerOffsets,
 ) -> (Vec<DsqState>, Vec<TaskWalkerEntry>) {
     let mem = kernel.mem();
-    let cr3_pa = kernel.cr3_pa();
-    let page_offset = kernel.page_offset();
-    let l5 = kernel.l5();
+    let walk = kernel.walk_context();
 
     let mut dsq_states: Vec<DsqState> = Vec::new();
     let mut all_entries: Vec<TaskWalkerEntry> = Vec::new();
@@ -794,21 +789,24 @@ pub fn walk_dsqs(
                 let dsq_kva = pcpu_kva
                     .wrapping_add(cpu_off)
                     .wrapping_add(bypass_dsq_off as u64);
-                if let Some(dsq_pa) = translate_any_kva(mem, cr3_pa, page_offset, dsq_kva, l5)
-                    && let Some((state, entries)) = walk_one_dsq(
-                        mem,
-                        cr3_pa,
-                        page_offset,
-                        l5,
-                        dsq_kva,
-                        dsq_pa,
-                        format!("bypass cpu {cpu}"),
-                        dsq_offs,
-                        dsq_lnode_offs,
-                        task_offs,
-                        see_offs,
-                    )
-                {
+                if let Some(dsq_pa) = translate_any_kva(
+                    mem,
+                    walk.cr3_pa,
+                    walk.page_offset,
+                    dsq_kva,
+                    walk.l5,
+                    walk.tcr_el1,
+                ) && let Some((state, entries)) = walk_one_dsq(
+                    mem,
+                    walk,
+                    dsq_kva,
+                    dsq_pa,
+                    format!("bypass cpu {cpu}"),
+                    dsq_offs,
+                    dsq_lnode_offs,
+                    task_offs,
+                    see_offs,
+                ) {
                     all_entries.extend(entries);
                     dsq_states.push(state);
                 }
@@ -827,24 +825,35 @@ pub fn walk_dsqs(
     {
         let pnode_kva = mem.read_u64(sched_pa, sched_pnode_off);
         if pnode_kva != 0
-            && let Some(pnode_arr_pa) = translate_any_kva(mem, cr3_pa, page_offset, pnode_kva, l5)
+            && let Some(pnode_arr_pa) = translate_any_kva(
+                mem,
+                walk.cr3_pa,
+                walk.page_offset,
+                pnode_kva,
+                walk.l5,
+                walk.tcr_el1,
+            )
         {
             for node in 0..nr_nodes as u64 {
                 let pnode_ptr_kva = mem.read_u64(pnode_arr_pa, (node * 8) as usize);
                 if pnode_ptr_kva == 0 {
                     continue;
                 }
-                let Some(pnode_pa) = translate_any_kva(mem, cr3_pa, page_offset, pnode_ptr_kva, l5)
-                else {
+                let Some(pnode_pa) = translate_any_kva(
+                    mem,
+                    walk.cr3_pa,
+                    walk.page_offset,
+                    pnode_ptr_kva,
+                    walk.l5,
+                    walk.tcr_el1,
+                ) else {
                     continue;
                 };
                 let dsq_kva = pnode_ptr_kva.wrapping_add(global_dsq_off as u64);
                 let dsq_pa = pnode_pa.wrapping_add(global_dsq_off as u64);
                 if let Some((state, entries)) = walk_one_dsq(
                     mem,
-                    cr3_pa,
-                    page_offset,
-                    l5,
+                    walk,
                     dsq_kva,
                     dsq_pa,
                     format!("global node {node}"),
@@ -868,17 +877,21 @@ pub fn walk_dsqs(
         // dsq_hash is embedded in scx_sched (not a pointer); rht_kva
         // here is a KVA we can translate directly. The walker reads
         // it via the rht sub-group offsets.
-        let user_dsqs =
-            walk_user_dsq_hash(mem, cr3_pa, page_offset, l5, rht_kva, rht_offs, dsq_offs);
+        let user_dsqs = walk_user_dsq_hash(mem, walk, rht_kva, rht_offs, dsq_offs);
         for dsq_kva in user_dsqs {
-            let Some(dsq_pa) = translate_any_kva(mem, cr3_pa, page_offset, dsq_kva, l5) else {
+            let Some(dsq_pa) = translate_any_kva(
+                mem,
+                walk.cr3_pa,
+                walk.page_offset,
+                dsq_kva,
+                walk.l5,
+                walk.tcr_el1,
+            ) else {
                 continue;
             };
             if let Some((state, entries)) = walk_one_dsq(
                 mem,
-                cr3_pa,
-                page_offset,
-                l5,
+                walk,
                 dsq_kva,
                 dsq_pa,
                 "user".to_string(),
@@ -901,9 +914,7 @@ pub fn walk_dsqs(
 #[allow(clippy::too_many_arguments)]
 fn walk_one_dsq(
     mem: &GuestMem,
-    cr3_pa: u64,
-    page_offset: u64,
-    l5: bool,
+    walk: WalkContext,
     dsq_kva: u64,
     dsq_pa: u64,
     origin: String,
@@ -931,9 +942,7 @@ fn walk_one_dsq(
 
     let (task_kvas, truncated) = walk_list_head_for_dsq_task_kvas(
         mem,
-        cr3_pa,
-        page_offset,
-        l5,
+        walk,
         head_kva,
         head_pa,
         dsq_node_off_in_task,
@@ -979,9 +988,7 @@ fn walk_one_dsq(
 /// the head.
 fn walk_list_head_for_task_kvas(
     mem: &GuestMem,
-    cr3_pa: u64,
-    page_offset: u64,
-    l5: bool,
+    walk: WalkContext,
     head_kva: u64,
     head_pa: u64,
     runnable_node_off_in_task: usize,
@@ -1004,7 +1011,14 @@ fn walk_list_head_for_task_kvas(
         task_kvas.push(task_kva);
 
         // Step to next node — translate node_kva, read .next at offset 0.
-        let Some(node_pa) = translate_any_kva(mem, cr3_pa, page_offset, node_kva, l5) else {
+        let Some(node_pa) = translate_any_kva(
+            mem,
+            walk.cr3_pa,
+            walk.page_offset,
+            node_kva,
+            walk.l5,
+            walk.tcr_el1,
+        ) else {
             return (task_kvas, false);
         };
         let next_kva = mem.read_u64(node_pa, 0);
@@ -1019,18 +1033,9 @@ fn walk_list_head_for_task_kvas(
 /// Walk a DSQ's `list` chain (a list of `scx_dsq_list_node.node`
 /// entries embedded in `sched_ext_entity.dsq_list`). Skips iterator
 /// cursor entries marked with `SCX_DSQ_LNODE_ITER_CURSOR`.
-///
-/// `too_many_arguments` allow: every parameter is independent
-/// state (page-walk context, list head, container offset, lnode
-/// offsets) sourced from a different upstream resolver. Bundling
-/// would require a wrapper struct with 8 fields used only for this
-/// one call site — pure churn.
-#[allow(clippy::too_many_arguments)]
 fn walk_list_head_for_dsq_task_kvas(
     mem: &GuestMem,
-    cr3_pa: u64,
-    page_offset: u64,
-    l5: bool,
+    walk: WalkContext,
     head_kva: u64,
     head_pa: u64,
     dsq_node_off_in_task: usize,
@@ -1057,12 +1062,25 @@ fn walk_list_head_for_dsq_task_kvas(
         let lnode_kva = node_kva.wrapping_sub(dsq_lnode_offs.node as u64);
 
         // Read the lnode's flags to skip iterator-cursor entries.
-        if let Some(lnode_pa) = translate_any_kva(mem, cr3_pa, page_offset, lnode_kva, l5) {
+        if let Some(lnode_pa) = translate_any_kva(
+            mem,
+            walk.cr3_pa,
+            walk.page_offset,
+            lnode_kva,
+            walk.l5,
+            walk.tcr_el1,
+        ) {
             let lnode_flags = mem.read_u32(lnode_pa, dsq_lnode_offs.flags);
             if lnode_flags & SCX_DSQ_LNODE_ITER_CURSOR != 0 {
                 // Cursor entry — advance without recording.
-                let Some(node_pa) = translate_any_kva(mem, cr3_pa, page_offset, node_kva, l5)
-                else {
+                let Some(node_pa) = translate_any_kva(
+                    mem,
+                    walk.cr3_pa,
+                    walk.page_offset,
+                    node_kva,
+                    walk.l5,
+                    walk.tcr_el1,
+                ) else {
                     return (task_kvas, false);
                 };
                 let next_kva = mem.read_u64(node_pa, 0);
@@ -1080,7 +1098,14 @@ fn walk_list_head_for_dsq_task_kvas(
         let task_kva = node_kva.wrapping_sub(dsq_node_off_in_task as u64);
         task_kvas.push(task_kva);
 
-        let Some(node_pa) = translate_any_kva(mem, cr3_pa, page_offset, node_kva, l5) else {
+        let Some(node_pa) = translate_any_kva(
+            mem,
+            walk.cr3_pa,
+            walk.page_offset,
+            node_kva,
+            walk.l5,
+            walk.tcr_el1,
+        ) else {
             return (task_kvas, false);
         };
         let next_kva = mem.read_u64(node_pa, 0);
@@ -1106,16 +1131,21 @@ fn walk_list_head_for_dsq_task_kvas(
 /// - total nodes visited at [`MAX_RHT_NODES`]
 fn walk_user_dsq_hash(
     mem: &GuestMem,
-    cr3_pa: u64,
-    page_offset: u64,
-    l5: bool,
+    walk: WalkContext,
     rht_kva: u64,
     rht_offs: &super::btf_offsets::RhashtableOffsets,
     dsq_offs: &super::btf_offsets::ScxDispatchQOffsets,
 ) -> Vec<u64> {
     let mut dsq_kvas = Vec::new();
 
-    let Some(rht_pa) = translate_any_kva(mem, cr3_pa, page_offset, rht_kva, l5) else {
+    let Some(rht_pa) = translate_any_kva(
+        mem,
+        walk.cr3_pa,
+        walk.page_offset,
+        rht_kva,
+        walk.l5,
+        walk.tcr_el1,
+    ) else {
         return dsq_kvas;
     };
 
@@ -1123,7 +1153,14 @@ fn walk_user_dsq_hash(
     if tbl_kva == 0 {
         return dsq_kvas;
     }
-    let Some(tbl_pa) = translate_any_kva(mem, cr3_pa, page_offset, tbl_kva, l5) else {
+    let Some(tbl_pa) = translate_any_kva(
+        mem,
+        walk.cr3_pa,
+        walk.page_offset,
+        tbl_kva,
+        walk.l5,
+        walk.tcr_el1,
+    ) else {
         return dsq_kvas;
     };
 
@@ -1154,7 +1191,14 @@ fn walk_user_dsq_hash(
             total_nodes += 1;
             let dsq_kva = node_kva.wrapping_sub(dsq_offs.hash_node as u64);
             dsq_kvas.push(dsq_kva);
-            let Some(node_pa) = translate_any_kva(mem, cr3_pa, page_offset, node_kva, l5) else {
+            let Some(node_pa) = translate_any_kva(
+                mem,
+                walk.cr3_pa,
+                walk.page_offset,
+                node_kva,
+                walk.l5,
+                walk.tcr_el1,
+            ) else {
                 break;
             };
             let next_raw = mem.read_u64(node_pa, rht_offs.rhash_head_next);
@@ -1175,9 +1219,7 @@ fn walk_user_dsq_hash(
 /// translate. Returns `(None, None)` on NULL or untranslatable.
 fn read_task_pid_comm(
     mem: &GuestMem,
-    cr3_pa: u64,
-    page_offset: u64,
-    l5: bool,
+    walk: WalkContext,
     task_kva: u64,
     pid_off: usize,
     comm_off: usize,
@@ -1185,7 +1227,14 @@ fn read_task_pid_comm(
     if task_kva == 0 {
         return (None, None);
     }
-    let Some(task_pa) = translate_any_kva(mem, cr3_pa, page_offset, task_kva, l5) else {
+    let Some(task_pa) = translate_any_kva(
+        mem,
+        walk.cr3_pa,
+        walk.page_offset,
+        task_kva,
+        walk.l5,
+        walk.tcr_el1,
+    ) else {
         return (None, None);
     };
     let pid = mem.read_u32(task_pa, pid_off) as i32;
@@ -1408,9 +1457,7 @@ mod tests {
         let runnable_node_off = 0x10usize;
         let (kvas, truncated) = walk_list_head_for_task_kvas(
             &mem,
-            0,
-            0,
-            false,
+            WalkContext::default(),
             head as u64,
             head as u64,
             runnable_node_off,
@@ -1431,8 +1478,13 @@ mod tests {
 
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
 
-        let (kvas, truncated) =
-            walk_list_head_for_task_kvas(&mem, 0, 0, false, head as u64, head as u64, 0x10);
+        let (kvas, truncated) = walk_list_head_for_task_kvas(
+            &mem,
+            WalkContext::default(),
+            head as u64,
+            head as u64,
+            0x10,
+        );
         assert!(!truncated);
         assert!(kvas.is_empty());
     }
@@ -1447,8 +1499,13 @@ mod tests {
         buf[head..head + 8].copy_from_slice(&0u64.to_le_bytes());
 
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-        let (kvas, truncated) =
-            walk_list_head_for_task_kvas(&mem, 0, 0, false, head as u64, head as u64, 0x10);
+        let (kvas, truncated) = walk_list_head_for_task_kvas(
+            &mem,
+            WalkContext::default(),
+            head as u64,
+            head as u64,
+            0x10,
+        );
         assert!(!truncated);
         assert!(kvas.is_empty());
     }
@@ -1768,10 +1825,10 @@ mod tests {
     /// invariant). Walker returns no task KVAs.
     #[test]
     fn walk_scx_tasks_global_empty_list_returns_empty() {
-        // page_offset = 0 makes text_kva_to_pa return KVA itself for
-        // KVAs >= __START_KERNEL_map. The KVA we choose is in the
-        // text mapping range so text_kva_to_pa lands at a sensible
-        // offset within our test buffer.
+        // page_offset = 0 makes the GuestKernel's text_kva_to_pa
+        // return KVA itself for KVAs >= __START_KERNEL_map. The KVA
+        // we choose is in the text mapping range so the translation
+        // lands at a sensible offset within our test buffer.
         let head_kva = crate::monitor::symbols::START_KERNEL_MAP + 0x100;
         let head_pa = head_kva.wrapping_sub(crate::monitor::symbols::START_KERNEL_MAP) as usize;
         let mut buf = vec![0u8; 0x1000];
@@ -1800,7 +1857,7 @@ mod tests {
     fn walk_scx_tasks_global_two_tasks_round_trip() {
         // Layout (page_offset = 0 so direct-map kva == pa for the
         // task entries; head lives in the text mapping region so
-        // text_kva_to_pa reaches the buffer):
+        // text_kva_to_pa_with_base reaches the buffer):
         //   head_kva = START_KERNEL_MAP + 0x100   → head_pa = 0x100
         //   t1_node_kva = 0x800                   → t1_pa = 0x800
         //   t2_node_kva = 0x900                   → t2_pa = 0x900
@@ -2316,8 +2373,8 @@ mod tests {
     #[test]
     fn read_scx_sched_state_scx_root_pointer_zero_returns_none() {
         // Layout: scx_root_kva is in the text mapping. We choose
-        // START_KERNEL_MAP + 0x100 so text_kva_to_pa(scx_root_kva) =
-        // 0x100. Stamp 0 at that PA. The walker reads sched_kva = 0
+        // START_KERNEL_MAP + 0x100 so kernel.text_kva_to_pa(scx_root_kva)
+        // = 0x100. Stamp 0 at that PA. The walker reads sched_kva = 0
         // and returns None.
         let scx_root_kva = super::super::symbols::START_KERNEL_MAP + 0x100;
         let scx_root_pa = 0x100usize;

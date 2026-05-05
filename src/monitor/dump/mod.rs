@@ -1997,10 +1997,15 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
                         // Translate sched_kva → PA (slab/vmalloc; use
                         // translate_any_kva via the GuestKernel handle).
                         let mem = cap.kernel.mem();
-                        let cr3_pa = cap.kernel.cr3_pa();
-                        let po = cap.kernel.page_offset();
-                        let l5 = cap.kernel.l5();
-                        let pa = super::idr::translate_any_kva(mem, cr3_pa, po, sched_kva, l5);
+                        let walk = cap.kernel.walk_context();
+                        let pa = super::idr::translate_any_kva(
+                            mem,
+                            walk.cr3_pa,
+                            walk.page_offset,
+                            sched_kva,
+                            walk.l5,
+                            walk.tcr_el1,
+                        );
                         (pa, Some(state))
                     }
                     None => {
@@ -2738,15 +2743,17 @@ pub(super) fn load_program_btf_kva(
     let kernel = accessor.kernel();
     let offsets = accessor.offsets();
     let mem = kernel.mem();
+    let walk = kernel.walk_context();
 
     // `struct btf` may be kmalloc'd (direct map) or vmalloc'd; use
     // translate_any_kva.
     let btf_pa = super::idr::translate_any_kva(
         mem,
-        kernel.cr3_pa(),
-        kernel.page_offset(),
+        walk.cr3_pa,
+        walk.page_offset,
         btf_kva,
-        kernel.l5(),
+        walk.l5,
+        walk.tcr_el1,
     )?;
     let data_kva = mem.read_u64(btf_pa, offsets.btf_data);
     let data_size = mem.read_u32(btf_pa, offsets.btf_data_size) as usize;

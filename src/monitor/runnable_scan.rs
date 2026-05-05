@@ -79,12 +79,12 @@
 //! [`super::idr::translate_any_kva`] (the same direct-mapping +
 //! page-walk code path the BPF map dump uses). The `scx_tasks`
 //! LIST_HEAD itself lives in the kernel text/.data mapping
-//! (`text_kva_to_pa`); each `task_struct` is a slab object inside
-//! the kernel direct map, so the walk is page-walk-light: one
-//! translate per task to read its runnable_at, plus one translate
-//! per node to step `next`.
+//! (`text_kva_to_pa_with_base`); each `task_struct` is a slab
+//! object inside the kernel direct map, so the walk is
+//! page-walk-light: one translate per task to read its
+//! runnable_at, plus one translate per node to step `next`.
 
-use super::reader::GuestMem;
+use super::reader::{GuestMem, WalkContext};
 use crate::monitor::btf_offsets::RunnableScanOffsets;
 
 /// `SCX_TASK_CURSOR` flag value (`1 << 31`) on `sched_ext_entity.flags`.
@@ -180,23 +180,15 @@ pub fn max_runnable_age(
     rq_pas: &[u64],
     offsets: &RunnableScanOffsets,
     jiffies: u64,
-    cr3_pa: u64,
-    page_offset: u64,
-    l5: bool,
+    walk: WalkContext,
     watchdog_timestamp_pa: Option<u64>,
+    start_kernel_map: u64,
 ) -> u64 {
-    let global = max_runnable_age_global(
-        mem,
-        scx_tasks_kva,
-        offsets,
-        jiffies,
-        cr3_pa,
-        page_offset,
-        l5,
-    );
+    let global =
+        max_runnable_age_global(mem, scx_tasks_kva, offsets, jiffies, walk, start_kernel_map);
     let mut per_rq_max: u64 = 0;
     for &rq_pa in rq_pas {
-        let age = max_runnable_age_per_rq(mem, rq_pa, offsets, jiffies, cr3_pa, page_offset, l5);
+        let age = max_runnable_age_per_rq(mem, rq_pa, offsets, jiffies, walk);
         if age > per_rq_max {
             per_rq_max = age;
         }
@@ -298,18 +290,17 @@ pub fn max_runnable_age_global(
     scx_tasks_kva: u64,
     offsets: &RunnableScanOffsets,
     jiffies: u64,
-    cr3_pa: u64,
-    page_offset: u64,
-    l5: bool,
+    walk: WalkContext,
+    start_kernel_map: u64,
 ) -> u64 {
     if scx_tasks_kva == 0 {
         return 0;
     }
     // The LIST_HEAD lives in the kernel text/.data mapping; convert
-    // KVA → PA via text_kva_to_pa. The first u64 at that PA is
-    // list_head.next (the LIST_HEAD struct's first field).
+    // KVA → PA via text_kva_to_pa_with_base. The first u64 at that PA
+    // is list_head.next (the LIST_HEAD struct's first field).
     let head_kva = scx_tasks_kva;
-    let head_pa = super::symbols::text_kva_to_pa(scx_tasks_kva);
+    let head_pa = super::symbols::text_kva_to_pa_with_base(scx_tasks_kva, start_kernel_map);
 
     // Read head.next. struct list_head { next; prev; } — `next` at
     // offset 0. Empty list: head.next == &head, so the loop exits
@@ -364,18 +355,24 @@ pub fn max_runnable_age_global(
         // but the walk continues. The next-node step below still
         // runs and the rest of the list is scanned.
         let see_kva = node_kva.wrapping_sub(tasks_node_off_in_see as u64);
-        let (cursor, queued, reset_runnable_at) =
-            match super::idr::translate_any_kva(mem, cr3_pa, page_offset, see_kva, l5) {
-                Some(see_pa) => {
-                    let flags = mem.read_u32(see_pa, flags_off_in_see);
-                    (
-                        flags & SCX_TASK_CURSOR != 0,
-                        flags & SCX_TASK_QUEUED != 0,
-                        flags & SCX_TASK_RESET_RUNNABLE_AT != 0,
-                    )
-                }
-                None => (false, false, false),
-            };
+        let (cursor, queued, reset_runnable_at) = match super::idr::translate_any_kva(
+            mem,
+            walk.cr3_pa,
+            walk.page_offset,
+            see_kva,
+            walk.l5,
+            walk.tcr_el1,
+        ) {
+            Some(see_pa) => {
+                let flags = mem.read_u32(see_pa, flags_off_in_see);
+                (
+                    flags & SCX_TASK_CURSOR != 0,
+                    flags & SCX_TASK_QUEUED != 0,
+                    flags & SCX_TASK_RESET_RUNNABLE_AT != 0,
+                )
+            }
+            None => (false, false, false),
+        };
 
         // Skip QUEUED tasks whose `runnable_at` is stale per
         // `clr_task_runnable(_, reset_runnable_at=true)`. The kernel
@@ -396,9 +393,14 @@ pub fn max_runnable_age_global(
             // some BPF arenas / vmalloc-backed slabs require a page
             // walk. Use translate_any_kva so the latter still resolves.
             let runnable_at_kva = task_kva.wrapping_add(runnable_at_off_in_task as u64);
-            if let Some(runnable_at_pa) =
-                super::idr::translate_any_kva(mem, cr3_pa, page_offset, runnable_at_kva, l5)
-            {
+            if let Some(runnable_at_pa) = super::idr::translate_any_kva(
+                mem,
+                walk.cr3_pa,
+                walk.page_offset,
+                runnable_at_kva,
+                walk.l5,
+                walk.tcr_el1,
+            ) {
                 let runnable_at = mem.read_u64(runnable_at_pa, 0);
                 // Skip the age contribution when `runnable_at == 0`.
                 // The kernel stamps `p->scx.runnable_at = jiffies` in
@@ -438,7 +440,14 @@ pub fn max_runnable_age_global(
         // Translate the node KVA to PA each step — successive
         // task_structs live in different slab pages, so caching a
         // single PA does not help.
-        let node_pa = match super::idr::translate_any_kva(mem, cr3_pa, page_offset, node_kva, l5) {
+        let node_pa = match super::idr::translate_any_kva(
+            mem,
+            walk.cr3_pa,
+            walk.page_offset,
+            node_kva,
+            walk.l5,
+            walk.tcr_el1,
+        ) {
             Some(pa) => pa,
             None => return max_age,
         };
@@ -488,9 +497,7 @@ pub fn max_runnable_age_per_rq(
     rq_pa: u64,
     offsets: &RunnableScanOffsets,
     jiffies: u64,
-    cr3_pa: u64,
-    page_offset: u64,
-    l5: bool,
+    walk: WalkContext,
 ) -> u64 {
     if rq_pa == 0 {
         return 0;
@@ -518,7 +525,7 @@ pub fn max_runnable_age_per_rq(
     // back to the head" the same way the global walker does.
     // Per-rq head lives in the percpu direct-map; KVA = PA +
     // page_offset.
-    let head_kva = head_pa.wrapping_add(page_offset);
+    let head_kva = head_pa.wrapping_add(walk.page_offset);
 
     let runnable_node_off_in_task =
         offsets.task_struct_scx + offsets.sched_ext_entity_runnable_node;
@@ -541,9 +548,14 @@ pub fn max_runnable_age_per_rq(
         // set_task_runnable stamps a non-zero jiffies).
         let task_kva = node_kva.wrapping_sub(runnable_node_off_in_task as u64);
         let runnable_at_kva = task_kva.wrapping_add(runnable_at_off_in_task as u64);
-        if let Some(runnable_at_pa) =
-            super::idr::translate_any_kva(mem, cr3_pa, page_offset, runnable_at_kva, l5)
-        {
+        if let Some(runnable_at_pa) = super::idr::translate_any_kva(
+            mem,
+            walk.cr3_pa,
+            walk.page_offset,
+            runnable_at_kva,
+            walk.l5,
+            walk.tcr_el1,
+        ) {
             let runnable_at = mem.read_u64(runnable_at_pa, 0);
             if runnable_at != 0 {
                 // saturating_sub: same wraparound rationale as the
@@ -564,7 +576,14 @@ pub fn max_runnable_age_per_rq(
         // Step to next node. Read node.next at offset 0 of the
         // list_head. Translate the node KVA to PA each step —
         // successive task_structs live in different slab pages.
-        let node_pa = match super::idr::translate_any_kva(mem, cr3_pa, page_offset, node_kva, l5) {
+        let node_pa = match super::idr::translate_any_kva(
+            mem,
+            walk.cr3_pa,
+            walk.page_offset,
+            node_kva,
+            walk.l5,
+            walk.tcr_el1,
+        ) {
             Some(pa) => pa,
             None => return max_age,
         };
@@ -632,15 +651,22 @@ mod tests {
         // SAFETY: buf outlives mem.
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
         let offsets = test_offsets(0, 0, 16, 8);
-        let age = max_runnable_age_global(&mem, 0, &offsets, 1_000, 0, 0, false);
+        let age = max_runnable_age_global(
+            &mem,
+            0,
+            &offsets,
+            1_000,
+            WalkContext::default(),
+            START_KERNEL_MAP,
+        );
         assert_eq!(age, 0);
     }
 
     /// Empty list: head.next == &head. Returns 0.
     #[test]
     fn empty_list_returns_zero() {
-        // Place head in the text mapping (text_kva_to_pa subtracts
-        // START_KERNEL_MAP). Layout:
+        // Place head in the text mapping (text_kva_to_pa_with_base
+        // subtracts START_KERNEL_MAP). Layout:
         //   PA 0: head — head.next = &head (self-loop terminator).
         let mut buf = vec![0u8; 4096];
         let head_pa = 0u64;
@@ -653,7 +679,17 @@ mod tests {
         // page_offset chosen so kva_to_pa(direct_kva, page_offset) =
         // pa for any task we lay out below.
         let page_offset = 0xffff_8880_0000_0000u64;
-        let age = max_runnable_age_global(&mem, head_kva, &offsets, 10_000, 0, page_offset, false);
+        let age = max_runnable_age_global(
+            &mem,
+            head_kva,
+            &offsets,
+            10_000,
+            WalkContext {
+                page_offset,
+                ..Default::default()
+            },
+            START_KERNEL_MAP,
+        );
         assert_eq!(age, 0, "empty list must return age 0");
     }
 
@@ -667,7 +703,7 @@ mod tests {
         let flags_off = 8usize;
 
         // page_offset chosen so kva_to_pa(task_kva, page_offset) =
-        // task_pa (direct mapping). text_kva_to_pa subtracts
+        // task_pa (direct mapping). text_kva_to_pa_with_base subtracts
         // START_KERNEL_MAP, so the head sits in the text region while
         // task slabs sit in the direct-map region.
         let page_offset = 0xffff_8880_0000_0000u64;
@@ -700,7 +736,17 @@ mod tests {
         // SAFETY: buf outlives mem.
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
         let offsets = test_offsets(task_scx, tasks_node_off, runnable_at_off, flags_off);
-        let age = max_runnable_age_global(&mem, head_kva, &offsets, jiffies, 0, page_offset, false);
+        let age = max_runnable_age_global(
+            &mem,
+            head_kva,
+            &offsets,
+            jiffies,
+            WalkContext {
+                page_offset,
+                ..Default::default()
+            },
+            START_KERNEL_MAP,
+        );
         assert_eq!(age, 50);
     }
 
@@ -736,7 +782,17 @@ mod tests {
         // SAFETY: buf outlives mem.
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
         let offsets = test_offsets(task_scx, tasks_node_off, runnable_at_off, flags_off);
-        let age = max_runnable_age_global(&mem, head_kva, &offsets, jiffies, 0, page_offset, false);
+        let age = max_runnable_age_global(
+            &mem,
+            head_kva,
+            &offsets,
+            jiffies,
+            WalkContext {
+                page_offset,
+                ..Default::default()
+            },
+            START_KERNEL_MAP,
+        );
         assert_eq!(age, 0, "future runnable_at must saturate to age 0");
     }
 
@@ -776,7 +832,17 @@ mod tests {
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
         let offsets = test_offsets(task_scx, tasks_node_off, runnable_at_off, flags_off);
         let jiffies = 1_000u64;
-        let age = max_runnable_age_global(&mem, head_kva, &offsets, jiffies, 0, page_offset, false);
+        let age = max_runnable_age_global(
+            &mem,
+            head_kva,
+            &offsets,
+            jiffies,
+            WalkContext {
+                page_offset,
+                ..Default::default()
+            },
+            START_KERNEL_MAP,
+        );
         assert_eq!(
             age, 0,
             "runnable_at == 0 must be skipped, not treated as a 1000-jiffy stall"
@@ -824,7 +890,17 @@ mod tests {
         // SAFETY: buf outlives mem.
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
         let offsets = test_offsets(task_scx, tasks_node_off, runnable_at_off, flags_off);
-        let age = max_runnable_age_global(&mem, head_kva, &offsets, jiffies, 0, page_offset, false);
+        let age = max_runnable_age_global(
+            &mem,
+            head_kva,
+            &offsets,
+            jiffies,
+            WalkContext {
+                page_offset,
+                ..Default::default()
+            },
+            START_KERNEL_MAP,
+        );
         assert_eq!(age, 70, "scan must take the max across the global list");
     }
 
@@ -883,7 +959,17 @@ mod tests {
         // SAFETY: buf outlives mem.
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
         let offsets = test_offsets(task_scx, tasks_node_off, runnable_at_off, flags_off);
-        let age = max_runnable_age_global(&mem, head_kva, &offsets, jiffies, 0, page_offset, false);
+        let age = max_runnable_age_global(
+            &mem,
+            head_kva,
+            &offsets,
+            jiffies,
+            WalkContext {
+                page_offset,
+                ..Default::default()
+            },
+            START_KERNEL_MAP,
+        );
         assert_eq!(
             age, 30,
             "cursor entry must be skipped — only task A's age 30 contributes"
@@ -922,7 +1008,17 @@ mod tests {
         // SAFETY: buf outlives mem.
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
         let offsets = test_offsets(task_scx, tasks_node_off, runnable_at_off, flags_off);
-        let age = max_runnable_age_global(&mem, head_kva, &offsets, jiffies, 0, page_offset, false);
+        let age = max_runnable_age_global(
+            &mem,
+            head_kva,
+            &offsets,
+            jiffies,
+            WalkContext {
+                page_offset,
+                ..Default::default()
+            },
+            START_KERNEL_MAP,
+        );
         // Walker visited the task at least once, so it captured age 5
         // before bailing out; the test confirms termination (no
         // panic, no infinite loop) AND a sensible reading.
@@ -974,7 +1070,17 @@ mod tests {
         // SAFETY: buf outlives mem.
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
         let offsets = test_offsets(task_scx, tasks_node_off, runnable_at_off, flags_off);
-        let age = max_runnable_age_global(&mem, head_kva, &offsets, jiffies, 0, page_offset, false);
+        let age = max_runnable_age_global(
+            &mem,
+            head_kva,
+            &offsets,
+            jiffies,
+            WalkContext {
+                page_offset,
+                ..Default::default()
+            },
+            START_KERNEL_MAP,
+        );
         assert_eq!(
             age, 80,
             "zero-runnable_at task must not abort the walk; \
@@ -1038,7 +1144,17 @@ mod tests {
         // SAFETY: buf outlives mem.
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
         let offsets = test_offsets(task_scx, tasks_node_off, runnable_at_off, flags_off);
-        let age = max_runnable_age_global(&mem, head_kva, &offsets, jiffies, 0, page_offset, false);
+        let age = max_runnable_age_global(
+            &mem,
+            head_kva,
+            &offsets,
+            jiffies,
+            WalkContext {
+                page_offset,
+                ..Default::default()
+            },
+            START_KERNEL_MAP,
+        );
         assert_eq!(
             age, 42,
             "container_of must subtract task.scx + see.tasks_node, \
@@ -1094,7 +1210,17 @@ mod tests {
         // SAFETY: buf outlives mem.
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
         let offsets = test_offsets(task_scx, tasks_node_off, runnable_at_off, flags_off);
-        let age = max_runnable_age_global(&mem, head_kva, &offsets, jiffies, 0, page_offset, false);
+        let age = max_runnable_age_global(
+            &mem,
+            head_kva,
+            &offsets,
+            jiffies,
+            WalkContext {
+                page_offset,
+                ..Default::default()
+            },
+            START_KERNEL_MAP,
+        );
         assert_eq!(
             age, 0,
             "non-queued task must not contribute to max_age \
@@ -1147,7 +1273,17 @@ mod tests {
         // SAFETY: buf outlives mem.
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
         let offsets = test_offsets(task_scx, tasks_node_off, runnable_at_off, flags_off);
-        let age = max_runnable_age_global(&mem, head_kva, &offsets, jiffies, 0, page_offset, false);
+        let age = max_runnable_age_global(
+            &mem,
+            head_kva,
+            &offsets,
+            jiffies,
+            WalkContext {
+                page_offset,
+                ..Default::default()
+            },
+            START_KERNEL_MAP,
+        );
         assert_eq!(
             age, 50,
             "queued task age must win over an unqueued task's \
@@ -1184,7 +1320,16 @@ mod tests {
             rq_scx_off,
             scx_rq_runnable_list_off,
         );
-        let age = max_runnable_age_per_rq(&mem, rq_pa, &offsets, 1_000, 0, page_offset, false);
+        let age = max_runnable_age_per_rq(
+            &mem,
+            rq_pa,
+            &offsets,
+            1_000,
+            WalkContext {
+                page_offset,
+                ..Default::default()
+            },
+        );
         assert_eq!(age, 0, "empty per-rq runnable_list must return 0");
     }
 
@@ -1243,7 +1388,16 @@ mod tests {
             rq_scx_off,
             scx_rq_runnable_list_off,
         );
-        let age = max_runnable_age_per_rq(&mem, rq_pa, &offsets, jiffies, 0, page_offset, false);
+        let age = max_runnable_age_per_rq(
+            &mem,
+            rq_pa,
+            &offsets,
+            jiffies,
+            WalkContext {
+                page_offset,
+                ..Default::default()
+            },
+        );
         assert_eq!(
             age, 75,
             "per-rq walker must compose rq.scx + scx_rq.runnable_list to find the head, \
@@ -1272,7 +1426,16 @@ mod tests {
         // Caller passes rq_pa == 0 — should short-circuit and not
         // read anything despite the buf containing a "valid-looking"
         // pointer at the address the head would otherwise compute.
-        let age = max_runnable_age_per_rq(&mem, 0, &offsets, 1_000, 0, page_offset, false);
+        let age = max_runnable_age_per_rq(
+            &mem,
+            0,
+            &offsets,
+            1_000,
+            WalkContext {
+                page_offset,
+                ..Default::default()
+            },
+        );
         assert_eq!(age, 0, "rq_pa == 0 must short-circuit the per-rq walker");
     }
 
@@ -1355,10 +1518,12 @@ mod tests {
             &rq_pas,
             &offsets,
             jiffies,
-            0,
-            page_offset,
-            false,
+            WalkContext {
+                page_offset,
+                ..Default::default()
+            },
             None,
+            START_KERNEL_MAP,
         );
         assert_eq!(
             age, 70,
@@ -1406,10 +1571,12 @@ mod tests {
             &[],
             &offsets,
             jiffies,
-            0,
-            page_offset,
-            false,
+            WalkContext {
+                page_offset,
+                ..Default::default()
+            },
             None,
+            START_KERNEL_MAP,
         );
         assert_eq!(
             age, 42,
@@ -1454,10 +1621,12 @@ mod tests {
             &[],
             &offsets,
             jiffies,
-            0,
-            page_offset,
-            false,
+            WalkContext {
+                page_offset,
+                ..Default::default()
+            },
             Some(watchdog_pa),
+            START_KERNEL_MAP,
         );
         assert_eq!(
             age, 800,
@@ -1495,10 +1664,12 @@ mod tests {
             &[],
             &offsets,
             jiffies,
-            0,
-            page_offset,
-            false,
+            WalkContext {
+                page_offset,
+                ..Default::default()
+            },
             Some(watchdog_pa),
+            START_KERNEL_MAP,
         );
         assert_eq!(
             age, 0,
@@ -1543,10 +1714,12 @@ mod tests {
             &[],
             &offsets,
             jiffies,
-            0,
-            page_offset,
-            false,
+            WalkContext {
+                page_offset,
+                ..Default::default()
+            },
             Some(watchdog_pa),
+            START_KERNEL_MAP,
         );
         assert_eq!(
             age, 0,
@@ -1587,10 +1760,12 @@ mod tests {
             &[],
             &offsets,
             jiffies,
-            0,
-            page_offset,
-            false,
+            WalkContext {
+                page_offset,
+                ..Default::default()
+            },
             Some(watchdog_pa),
+            START_KERNEL_MAP,
         );
         assert_eq!(age, 0, "future watchdog_timestamp must saturate to age 0",);
     }

@@ -56,6 +56,7 @@ pub mod disk_config;
 pub mod disk_template;
 pub mod host_topology;
 pub mod initramfs;
+pub(crate) mod kvm_stats;
 pub mod shm_ring;
 pub mod topology;
 
@@ -77,6 +78,20 @@ pub(crate) mod vcpu;
 pub(crate) mod virtio_blk;
 pub(crate) mod virtio_console;
 pub(crate) mod virtio_net;
+
+// Bulk transport modules — split out from `shm_ring` so the wire
+// format (`wire`), the host-side streaming assembler (`bulk`), the
+// guest-side typed senders (`guest_comms`), and the host-side typed
+// consumers (`host_comms`) each carry a single responsibility. The
+// SHM ring's only remaining customer is the panic-hook crash path
+// (`write_msg_nonblocking` → MSG_TYPE_CRASH) plus the snapshot
+// doorbell + signal-slot control plane; production data
+// (STIMULUS / EXIT / SCHED_EXIT / PAYLOAD_METRICS / RAW_PAYLOAD_OUTPUT
+// / SCENARIO_*) flows through the virtio-console port-1 TLV stream.
+pub(crate) mod bulk;
+pub(crate) mod guest_comms;
+pub(crate) mod host_comms;
+pub mod wire;
 
 // `mod` — file-private helpers.
 mod memory_budget;
@@ -146,8 +161,6 @@ pub use x86_64::acpi;
 pub use x86_64::boot;
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::kvm;
-#[cfg(target_arch = "x86_64")]
-pub use x86_64::kvm_stats;
 #[cfg(target_arch = "x86_64")]
 #[allow(unused_imports)]
 pub use x86_64::mptable;
@@ -390,9 +403,9 @@ impl KtstrVm {
         // Open persistent stats fds before vCPUs move to threads.
         // Stats fds hold kernel references independent of VcpuFd ownership.
         // Read once after VM exit to capture cumulative totals.
-        #[cfg(target_arch = "x86_64")]
+        // KVM_GET_STATS_FD is generic uapi (include/uapi/linux/kvm.h),
+        // so this works on every KVM-supported architecture.
         let stats_ctx = kvm_stats::open_stats_context(&vm.vcpus);
-        #[cfg(target_arch = "x86_64")]
         if stats_ctx.is_none() {
             tracing::debug!("KVM_GET_STATS_FD not supported, skipping stats collection");
         }
@@ -408,12 +421,9 @@ impl KtstrVm {
 
         let run = self.run_vm(run_start, vm)?;
 
-        // mut needed on x86_64 for kvm_stats assignment below.
-        #[allow(unused_mut)]
         let mut result = self.collect_results(start, run)?;
 
         // Read cumulative KVM stats after VM exit.
-        #[cfg(target_arch = "x86_64")]
         if let Some(ctx) = stats_ctx {
             result.kvm_stats = Some(ctx.read_stats());
         }
@@ -964,6 +974,10 @@ impl KtstrVm {
             None,
             None,
             None,
+            // Interactive shell does not construct a GuestKernel
+            // for monitor / BPF map writes, so no TCR_EL1 cache
+            // is needed.
+            None,
         );
 
         // Shutdown.
@@ -1185,7 +1199,6 @@ mod tests {
     /// with a static watchdog_timeout symbol (pre-7.1); if present,
     /// the write/read roundtrip must match.
     #[test]
-    #[cfg(target_arch = "x86_64")]
     fn boot_kernel_with_monitor() {
         let kernel = crate::test_support::require_kernel();
         let _vmlinux = crate::test_support::require_vmlinux(&kernel);
@@ -1339,7 +1352,7 @@ mod tests {
                 .kernel(&kernel)
                 .topology(1, 1, 2, 1)
                 .memory_mb(256)
-                .timeout(Duration::from_secs(15))
+                .timeout(Duration::from_secs(30))
                 .scheduler_binary(&sched_bin)
                 .watchdog_timeout(Duration::from_secs(300))
                 .build()
@@ -1412,7 +1425,6 @@ mod tests {
     /// (CONFIG_SCHEDSTATS enabled), asserts sched_count is in a
     /// plausible range.
     #[test]
-    #[cfg(target_arch = "x86_64")]
     fn monitor_reads_runqueue_data_with_scheduler() {
         let kernel = crate::test_support::require_kernel();
         let vmlinux = crate::test_support::require_vmlinux(&kernel);
@@ -1430,7 +1442,7 @@ mod tests {
                 .kernel(&kernel)
                 .topology(1, 1, 2, 1)
                 .memory_mb(256)
-                .timeout(Duration::from_secs(15))
+                .timeout(Duration::from_secs(30))
                 .scheduler_binary(&sched_bin)
                 .build()
         );
@@ -1451,9 +1463,12 @@ mod tests {
         // first sample where ANY CPU reports a rq_clock past the
         // early-boot noise floor (1 ms in ns). `all` flaked on CI
         // where one vCPU can remain near rq_clock=0 throughout
-        // a short run (15s timeout, 2 vCPUs, scheduler loaded late).
-        // A single populated CPU proves the monitor reads real rq
-        // data — the code path is identical per-CPU.
+        // a short run; coverage-instrumented builds compound this
+        // by slowing every code path ~10x. The 30s timeout gives
+        // the VM enough time to boot, load the scheduler, and emit
+        // multiple monitor samples even under coverage. A single
+        // populated CPU proves the monitor reads real rq data —
+        // the code path is identical per-CPU.
         let populated = report
             .samples
             .iter()
@@ -1505,7 +1520,6 @@ mod tests {
     /// asserting, matching the watchdog test's approach to
     /// scheduler-attach timing.
     #[test]
-    #[cfg(target_arch = "x86_64")]
     fn event_counters_populated_with_scheduler() {
         let kernel = crate::test_support::require_kernel();
         let vmlinux = crate::test_support::require_vmlinux(&kernel);
@@ -1530,7 +1544,7 @@ mod tests {
                 .kernel(&kernel)
                 .topology(1, 1, 2, 1)
                 .memory_mb(256)
-                .timeout(Duration::from_secs(15))
+                .timeout(Duration::from_secs(30))
                 .scheduler_binary(&sched_bin)
                 .build()
         );
@@ -1610,7 +1624,6 @@ mod tests {
     /// Gates on sched_domain_offsets BTF availability. Uses a 2-CPU
     /// topology so the domain tree spans multiple CPUs.
     #[test]
-    #[cfg(target_arch = "x86_64")]
     fn sched_domain_data_populated() {
         let kernel = crate::test_support::require_kernel();
         let vmlinux = crate::test_support::require_vmlinux(&kernel);

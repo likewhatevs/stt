@@ -137,13 +137,21 @@ pub struct KtstrKvm {
     /// Owns the VA reservation for per-node MAP_FIXED mmaps.
     /// Drop munmaps the entire reservation.
     _reservation: Option<ReservationGuard>,
+    /// RAII guards for COW-overlayed initramfs segments. Each guard
+    /// holds the lz4 SHM fd with `LOCK_SH`; dropping it releases the
+    /// flock and closes the fd. Must drop AFTER `_reservation` so the
+    /// COW VMAs are torn down (via the reservation's munmap) before
+    /// the flock is released — otherwise a concurrent writer could
+    /// take `LOCK_EX` and truncate the segment while the guest still
+    /// holds pages that fault through the backing file.
+    pub(crate) cow_overlay_guards: Vec<crate::vmm::initramfs::CowOverlayGuard>,
 }
 
 impl Drop for KtstrKvm {
     fn drop(&mut self) {
         unsafe {
             // Ordered teardown: vCPU fds → GICv3 device fd → VM fd →
-            // guest memory → VA reservation → /dev/kvm.
+            // guest memory → VA reservation → COW flock guards → /dev/kvm.
             //
             // Closing VmFd triggers kvm_destroy_vm which calls
             // mmu_notifier_unregister (synchronous SRCU wait). All
@@ -157,6 +165,8 @@ impl Drop for KtstrKvm {
             ManuallyDrop::drop(&mut self.guest_mem);
             let reservation = self._reservation.take();
             drop(reservation);
+            let cow_guards = std::mem::take(&mut self.cow_overlay_guards);
+            drop(cow_guards);
             ManuallyDrop::drop(&mut self.kvm);
         }
     }
@@ -331,6 +341,7 @@ impl KtstrKvm {
             use_hugepages,
             performance_mode,
             _reservation: reservation,
+            cow_overlay_guards: Vec::new(),
         })
     }
 

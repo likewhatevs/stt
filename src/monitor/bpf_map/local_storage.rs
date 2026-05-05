@@ -107,9 +107,14 @@ pub(super) fn iter_local_storage_entries(
     // (include/linux/bpf_local_storage.h struct bpf_local_storage_map
     // declaration), so map_kva == smap_kva.
     let smap_kva = map.map_kva;
-    let Some(smap_pa) =
-        translate_any_kva(ctx.mem, ctx.cr3_pa.0, ctx.page_offset.0, smap_kva, ctx.l5)
-    else {
+    let Some(smap_pa) = translate_any_kva(
+        ctx.mem,
+        ctx.cr3_pa.0,
+        ctx.page_offset.0,
+        smap_kva,
+        ctx.l5,
+        ctx.tcr_el1,
+    ) else {
         return Vec::new();
     };
 
@@ -149,9 +154,14 @@ pub(super) fn iter_local_storage_entries(
 
     for i in 0..n_buckets {
         let bucket_kva = buckets_kva + (i as u64) * (ts.bucket_size as u64);
-        let Some(bucket_pa) =
-            translate_any_kva(ctx.mem, ctx.cr3_pa.0, ctx.page_offset.0, bucket_kva, ctx.l5)
-        else {
+        let Some(bucket_pa) = translate_any_kva(
+            ctx.mem,
+            ctx.cr3_pa.0,
+            ctx.page_offset.0,
+            bucket_kva,
+            ctx.l5,
+            ctx.tcr_el1,
+        ) else {
             continue;
         };
 
@@ -175,9 +185,14 @@ pub(super) fn iter_local_storage_entries(
             // BTF resolver asserts this), so the elem KVA equals the
             // node KVA — no container_of subtraction.
             let elem_kva = node_ptr;
-            let Some(elem_pa) =
-                translate_any_kva(ctx.mem, ctx.cr3_pa.0, ctx.page_offset.0, elem_kva, ctx.l5)
-            else {
+            let Some(elem_pa) = translate_any_kva(
+                ctx.mem,
+                ctx.cr3_pa.0,
+                ctx.page_offset.0,
+                elem_kva,
+                ctx.l5,
+                ctx.tcr_el1,
+            ) else {
                 break;
             };
 
@@ -194,6 +209,7 @@ pub(super) fn iter_local_storage_entries(
                     ctx.page_offset.0,
                     local_storage_kva,
                     ctx.l5,
+                    ctx.tcr_el1,
                 ) {
                     Some(ls_pa) => ctx.mem.read_u64(ls_pa, ts.ls_owner),
                     None => 0,

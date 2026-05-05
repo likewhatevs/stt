@@ -230,7 +230,15 @@ pub fn custom_cgroup_dynamic_workload_variety(ctx: &Ctx) -> Result<AssertResult>
     if let Some(h) = handles.pop() {
         h.stop_and_collect();
     }
-    let _ = ctx.cgroups.remove_cgroup("cg_3");
+    // Best-effort early teardown: the CgroupGroup guard's Drop
+    // skips missing cgroups, so a transient ENOENT (already
+    // unwound by a sibling step) or EBUSY (drain races a stray
+    // task migration) here is a no-op for cleanup correctness.
+    // Bailing would abort the scenario before the final 1/3
+    // hold runs.
+    if let Err(e) = ctx.cgroups.remove_cgroup("cg_3") {
+        tracing::warn!(err = %format!("{e:#}"), "stress: early remove_cgroup(cg_3) failed; guard Drop will retry on scenario teardown");
+    }
     thread::sleep(ctx.duration / 3);
     Ok(collect_all(handles, &ctx.assert))
 }
@@ -292,14 +300,31 @@ pub fn custom_cgroup_cpuset_cross_llc_race(ctx: &Ctx) -> Result<AssertResult> {
     let deadline = Instant::now() + ctx.duration;
     let mut flip = false;
     while Instant::now() < deadline {
+        // Best-effort cpuset flips: a transient EBUSY (kernel
+        // updating the same hierarchy in-flight) or ENOENT (cgroup
+        // removed by a sibling step) on either write leaves the
+        // cgroup on its prior cpuset for this iteration. The next
+        // 200ms iteration retries with a fresh write, so a single
+        // dropped flip is observed by the scheduler as a longer
+        // hold on the prior layout — exactly the cross-LLC race
+        // pathology this scenario probes. Bailing on the first
+        // failed write would mask the race rather than expose it.
         if flip {
             // cg_0 on LLC1 CPUs, cg_1 on LLC0 CPUs — cross-LLC
-            let _ = ctx.cgroups.set_cpuset("cg_0", &cross0);
-            let _ = ctx.cgroups.set_cpuset("cg_1", &cross1);
+            if let Err(e) = ctx.cgroups.set_cpuset("cg_0", &cross0) {
+                tracing::warn!(err = %format!("{e:#}"), "cross-LLC race: set_cpuset cg_0 cross0 failed; flip skipped");
+            }
+            if let Err(e) = ctx.cgroups.set_cpuset("cg_1", &cross1) {
+                tracing::warn!(err = %format!("{e:#}"), "cross-LLC race: set_cpuset cg_1 cross1 failed; flip skipped");
+            }
         } else {
             // cg_0 on LLC0 CPUs, cg_1 on LLC1 CPUs — aligned
-            let _ = ctx.cgroups.set_cpuset("cg_0", &llc0);
-            let _ = ctx.cgroups.set_cpuset("cg_1", &llc1);
+            if let Err(e) = ctx.cgroups.set_cpuset("cg_0", &llc0) {
+                tracing::warn!(err = %format!("{e:#}"), "cross-LLC race: set_cpuset cg_0 llc0 failed; flip skipped");
+            }
+            if let Err(e) = ctx.cgroups.set_cpuset("cg_1", &llc1) {
+                tracing::warn!(err = %format!("{e:#}"), "cross-LLC race: set_cpuset cg_1 llc1 failed; flip skipped");
+            }
         }
         flip = !flip;
         // Short sleep to let rebalancing/reconfiguration run between flips.

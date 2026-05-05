@@ -10,8 +10,8 @@
 //! - **Same-process tests**: a `HashMap<BaseKey, Arc<Vec<u8>>>`
 //!   keeps the in-flight blob hot without a syscall.
 //! - **Cross-process tests / nextest workers**: an `O_CREAT|O_EXCL`
-//!   race over a `/dev/shm/ktstr-base-<hash>` segment elects a
-//!   single builder; losers `LOCK_SH`-block on the segment until
+//!   race over a `/dev/shm/ktstr-base-<arch>-<hash>` segment elects
+//!   a single builder; losers `LOCK_SH`-block on the segment until
 //!   the winner finishes, then `mmap` it zero-copy.
 //!
 //! The `BaseKey` content-hash spans every byte the build consumes
@@ -325,7 +325,10 @@ pub(crate) fn get_or_build_base(
 
 /// Remove stale SHM segments from `/dev/shm` that don't match `current`.
 /// Scans for `ktstr-base-*`, `ktstr-lz4-*`, and legacy `ktstr-gz-*`
-/// entries and unlinks any whose hash suffix differs from the current key.
+/// entries and unlinks any whose `<arch>-<hash>` suffix differs from
+/// the current key. Segments without an arch tag (pre-arch-aware
+/// builds) never match the new format and are unconditionally treated
+/// as stale.
 ///
 /// Only unlinks segments that are not held by another process. Tries
 /// `LOCK_EX | LOCK_NB` on each candidate — if the lock succeeds, no
@@ -333,7 +336,7 @@ pub(crate) fn get_or_build_base(
 /// fails (`EWOULDBLOCK`), another process is actively using the
 /// segment and it is skipped.
 fn cleanup_stale_shm(current: &BaseKey) {
-    let current_suffix = format!("{:016x}", current.0);
+    let current_suffix = format!("{}-{:016x}", initramfs::SHM_ARCH_TAG, current.0);
     let shm_dir = match std::fs::read_dir("/dev/shm") {
         Ok(d) => d,
         Err(_) => return,
@@ -343,7 +346,7 @@ fn cleanup_stale_shm(current: &BaseKey) {
         let Some(name_str) = name.to_str() else {
             continue;
         };
-        let hash_suffix = if let Some(s) = name_str.strip_prefix("ktstr-base-") {
+        let suffix = if let Some(s) = name_str.strip_prefix("ktstr-base-") {
             s
         } else if let Some(s) = name_str.strip_prefix("ktstr-lz4-") {
             s
@@ -353,7 +356,7 @@ fn cleanup_stale_shm(current: &BaseKey) {
         } else {
             continue;
         };
-        if hash_suffix == current_suffix {
+        if suffix == current_suffix {
             continue;
         }
         let shm_name = format!("/{name_str}");

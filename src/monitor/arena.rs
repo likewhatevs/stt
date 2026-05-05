@@ -270,16 +270,20 @@ pub fn snapshot_arena(
     }
 
     let mem = kernel.mem();
-    let cr3_pa = kernel.cr3_pa();
-    let page_offset = kernel.page_offset();
-    let l5 = kernel.l5();
+    let walk = kernel.walk_context();
 
     // bpf_arena embeds bpf_map at offset 0, so map_kva == arena_kva.
     let arena_kva = info.map_kva;
     // Translate the arena struct itself — it may be kmalloc'd
     // (direct map) or vmalloc'd (`bpf_map_area_alloc`).
-    let Some(arena_pa) = super::idr::translate_any_kva(mem, cr3_pa, page_offset, arena_kva, l5)
-    else {
+    let Some(arena_pa) = super::idr::translate_any_kva(
+        mem,
+        walk.cr3_pa,
+        walk.page_offset,
+        arena_kva,
+        walk.l5,
+        walk.tcr_el1,
+    ) else {
         return ArenaSnapshot::default();
     };
 
@@ -301,9 +305,14 @@ pub fn snapshot_arena(
 
     // vm_struct lives in the kernel's slab/kmalloc area; direct or
     // vmalloc, so use translate_any_kva.
-    let Some(vm_struct_pa) =
-        super::idr::translate_any_kva(mem, cr3_pa, page_offset, kern_vm_kva, l5)
-    else {
+    let Some(vm_struct_pa) = super::idr::translate_any_kva(
+        mem,
+        walk.cr3_pa,
+        walk.page_offset,
+        kern_vm_kva,
+        walk.l5,
+        walk.tcr_el1,
+    ) else {
         return ArenaSnapshot {
             user_vm_start,
             ..ArenaSnapshot::default()
@@ -348,8 +357,8 @@ pub fn snapshot_arena(
 
     // Closure: translate one pgoff to a page-content read; push
     // onto `snapshot.pages` if the translate + read succeed.
-    // Captures `mem`, `cr3_pa`, `l5`, `kern_vm_start`, `user_vm_start`,
-    // and `scratch` (mutable — drained into the captured page on
+    // Captures `mem`, `walk`, `kern_vm_start`, `user_vm_start`, and
+    // `scratch` (mutable — drained into the captured page on
     // success).
     let mut try_capture_page = |pgoff: u64, pages: &mut Vec<ArenaPage>| {
         // user_vm_start + pgoff*PAGE_SIZE is a 64-bit value, but the
@@ -360,7 +369,7 @@ pub fn snapshot_arena(
         // span uniquely. Match the same truncation here.
         let user_addr = user_vm_start.wrapping_add(pgoff * PAGE_SIZE);
         let kaddr = kern_vm_start.wrapping_add(user_addr & 0xFFFF_FFFF);
-        let Some(pa) = mem.translate_kva(cr3_pa, Kva(kaddr), l5) else {
+        let Some(pa) = mem.translate_kva(walk.cr3_pa, Kva(kaddr), walk.l5, walk.tcr_el1) else {
             return;
         };
         // Translate guarantees a 4 KiB page-aligned PA; bound-check

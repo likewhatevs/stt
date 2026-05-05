@@ -118,12 +118,24 @@
 //   (`decide_stall_action`, `worker_dispatch_event`, `clamp_retry_nanos`)
 //   are always-compiled so the test block here can drive every
 //   variant without spawning a worker.
-// - `device`: MMIO read/write, the FSM, `VirtioBlkCounters`, the
-//   request-state structs, the `VirtioBlk` device, the
-//   handle/reset/respawn impls, and `Drop`. Tests live here in
-//   `mod.rs` because they reach into device internals via `super::*`
-//   and span both the inline-mode (cfg(test)) drain path and the
-//   pure helpers from `worker`.
+// - `counters`: `VirtioBlkCounters` struct + `record_*` mutators
+//   and `pub fn` readers. The counter taxonomy doc (events vs
+//   requests vs gauges) and the per-helper invariants live next
+//   to the type they describe.
+// - `device`: MMIO read/write, the FSM, the request-state structs,
+//   the `VirtioBlk` device, the engine plumbing
+//   (handle/reset/respawn), and `Drop`.
+// - `handlers`: an `impl VirtioBlk` block with the four
+//   `handle_*_impl` per-request-type handlers (T_IN / T_OUT /
+//   T_FLUSH / T_GET_ID) and their `cfg(test)` `&self` wrappers.
+//   Pure per-request logic with no MMIO/FSM/lifecycle concern.
+// - `drain`: `DrainOutcome` and `drain_bracket_impl` — the chain
+//   validation, throttle gate, handler dispatch, and completion
+//   publish pipeline that runs once per kick.
+//
+// Tests live in sibling `tests_*.rs` files and reach into module
+// internals via `super::*;` — re-exports below glob-route the
+// names through `mod.rs`.
 //
 // Re-exports use `pub(crate) use submodule::*;` so the test modules
 // (and `worker.rs`, which `use super::*;` for cross-module references)
@@ -146,27 +158,50 @@ mod worker;
 #[allow(unused_imports)]
 pub(crate) use worker::*;
 
+mod counters;
+// `VirtioBlkCounters` is the only pub item in `counters.rs`; it is
+// re-exported as `pub` below for upstream consumers (vmm/mod.rs and
+// lib.rs). Internal references reach it via `super::VirtioBlkCounters`
+// from device/handlers/drain — Rust resolves through the same `pub`
+// re-export, so a separate `pub(crate) use counters::*;` glob would be
+// redundant (clippy --lib flags it as unused).
+
 mod device;
 // The glob is `pub(crate)` so internal items (cfg-test test fixtures,
-// `pub(crate)` helpers like `drain_bracket_impl`) reach sibling
-// submodules and the test sub-files without leaking outside the
-// crate. The `pub use` block below itemizes the symbols that need
-// full `pub` visibility for upstream re-exports (vmm/mod.rs and
-// lib.rs re-publish VirtioBlkCounters and the public-facing
-// constants); these symbols are themselves `pub` inside device.rs,
-// and the explicit listing upgrades the re-export from the glob's
-// `pub(crate)` to `pub` for those names only.
+// `pub(crate)` helpers) reach sibling submodules and the test sub-files
+// without leaking outside the crate. The `pub use` block below
+// itemizes the symbols that need full `pub` visibility for upstream
+// re-exports (vmm/mod.rs and lib.rs re-publish the public-facing
+// constants and types); these symbols are themselves `pub` inside
+// device.rs, and the explicit listing upgrades the re-export from the
+// glob's `pub(crate)` to `pub` for those names only.
 pub(crate) use device::*;
 // `VIRTIO_BLK_DEFAULT_CAPACITY_BYTES` and `VIRTIO_BLK_SECTOR_SIZE`
 // are kept in the `pub` re-export so external consumers can pin
 // the same defaults the lib uses internally; the lib's current
 // callers reach the constants directly via the device module, so
 // the public re-export looks unused in clippy --lib.
+pub use counters::VirtioBlkCounters;
 #[allow(unused_imports)]
 pub use device::{
     VIRTIO_BLK_DEFAULT_CAPACITY_BYTES, VIRTIO_BLK_SECTOR_SIZE, VIRTIO_MMIO_SIZE, VirtioBlk,
-    VirtioBlkCounters, WorkerPlacement,
+    WorkerPlacement,
 };
+
+mod handlers;
+// `handlers.rs` adds an `impl VirtioBlk` block with the four
+// `handle_*_impl` request-type handlers and their `cfg(test)`
+// `&self` wrappers. No symbols to re-export — the `impl` block
+// extends the type that lives in `device.rs`. `mod handlers;`
+// alone wires the file into the build.
+
+mod drain;
+// `pub(crate) use drain::*;` exposes `DrainOutcome` and
+// `drain_bracket_impl` to `worker.rs` (which references both via
+// `super::DrainOutcome` and `super::drain_bracket_impl`) and to
+// the test sub-files. The lib build references both via these
+// paths, so the glob is consumed without `#[allow(unused_imports)]`.
+pub(crate) use drain::*;
 
 #[cfg(test)]
 mod testing;

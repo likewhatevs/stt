@@ -15,7 +15,10 @@ use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+use crate::sync::Latch;
 
 use nix::mount::{MsFlags, mount};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
@@ -73,18 +76,27 @@ fn force_reboot() -> ! {
 pub(crate) fn ktstr_guest_init() -> ! {
     let t0 = std::time::Instant::now();
 
-    // Panic hook: write crash diagnostic to COM2 then reboot.
+    // Panic hook: write crash diagnostic to SHM (memcpy, no
+    // virtio backpressure) and ALWAYS to COM2 (the canonical
+    // crash-diagnostic transport, survives a wedged virtio
+    // port). The bulk-virtio path is intentionally NOT used here
+    // because the kernel virtio_console TX path can block on
+    // host backpressure, and blocking inside a panic hook would
+    // deadlock the guest before the crash diagnostic reaches the
+    // host. The SHM nonblocking write via
+    // [`crate::vmm::guest_comms::send_crash`] is bounded
+    // by SHM_WRITE_LOCK contention only.
     std::panic::set_hook(Box::new(|info| {
         let bt = std::backtrace::Backtrace::force_capture();
         let msg = format!("PANIC: {info}\n{bt}\n");
-        // SHM write (instant memcpy, no serial bottleneck). Uses
-        // try_lock to avoid deadlock if the panicking thread already
-        // holds SHM_WRITE_LOCK. No-op if SHM is not initialized.
-        crate::vmm::shm_ring::write_msg_nonblocking(
-            crate::vmm::shm_ring::MSG_TYPE_CRASH,
-            msg.as_bytes(),
-        );
-        // Serial fallback for panics before SHM init.
+        // SHM (CRASH-only fallback) — non-blocking memcpy. No-op
+        // if SHM is not yet initialised inside the guest.
+        crate::vmm::guest_comms::send_crash(msg.as_bytes());
+        // COM2 / COM1 serial fallback. Always written even when
+        // the SHM write succeeds because COM2 is the canonical
+        // crash log destination for the host's serial-capture
+        // path; a panic before SHM init reaches the host through
+        // this branch alone.
         let _ = fs::write(COM2, &msg);
         let _ = fs::write(COM1, &msg);
         let _ = std::io::stdout().flush();
@@ -403,10 +415,6 @@ pub(crate) fn ktstr_guest_init() -> ! {
     let shm_stop = start_shm_poll(trace_stop.clone());
     drop(_s_phase4);
 
-    // Signal the host that the scheduler is loaded and BPF programs
-    // are ready for enumeration.
-    crate::vmm::shm_ring::signal(1);
-
     // Phase 4b: Scheduler death monitor.
     // Spawn a thread that polls /proc/{pid}. If the scheduler exits during
     // the test, the thread writes MSG_TYPE_SCHED_EXIT to SHM so the host
@@ -510,11 +518,12 @@ pub(crate) fn ktstr_guest_init() -> ! {
         libc::tcdrain(1);
     }
 
-    // Write exit code to SHM (primary) and COM2 (fallback).
-    crate::vmm::shm_ring::write_msg(
-        crate::vmm::shm_ring::MSG_TYPE_EXIT,
-        &(code as i32).to_ne_bytes(),
-    );
+    // Write exit code via the typed guest API. The virtio-console
+    // port-1 path is primary; the COM2 SENTINEL_EXIT_PREFIX line
+    // below is the fallback the host's `collect_results` walks
+    // when no `MSG_TYPE_EXIT` frame arrived (e.g. a panic before
+    // bulk port open).
+    crate::vmm::guest_comms::send_exit(code as i32);
     write_com2(&format!(
         "{prefix}{code}",
         prefix = crate::test_support::SENTINEL_EXIT_PREFIX,
@@ -1762,10 +1771,38 @@ fn start_trace_pipe() -> (Option<Arc<AtomicBool>>, Option<std::thread::JoinHandl
     }
 }
 
-/// Start the SHM polling loop for dump/stall requests.
+/// Process-wide latch fired by the guest's `shm_poll_loop` when the
+/// host's `bpf-map-write` thread pushes `SIGNAL_BPF_WRITE_DONE` through
+/// virtio-console RX.
+///
+/// Producer: [`shm_poll_loop`] (this file). Consumer: the scenario
+/// executor's [`crate::scenario::Ctx::wait_for_map_write`] gate
+/// (in `scenario::ops`). A test that declares `bpf_map_write` on
+/// its `KtstrTestEntry` flips `wait_for_map_write=true`; the
+/// scenario runner then blocks on this latch's
+/// [`Latch::wait_timeout`] before starting the workload phase, so
+/// the workload never observes a stale BPF map value.
+///
+/// `OnceLock` so the first caller materialises the [`Latch`] and
+/// every subsequent caller (producer or consumer) shares the same
+/// instance. `Arc` so callers can hold the latch across
+/// thread-spawn boundaries without re-resolving the static.
+static BPF_MAP_WRITE_DONE_LATCH: OnceLock<Arc<Latch>> = OnceLock::new();
+
+/// Lazily materialise and return the shared `bpf_map_write_done`
+/// latch. Both the producer (`shm_poll_loop`) and consumer (scenario
+/// `wait_for_map_write` gate) reach for this — the first caller
+/// installs the [`Latch`] into [`BPF_MAP_WRITE_DONE_LATCH`], every
+/// subsequent caller observes the same instance.
+pub(crate) fn bpf_map_write_done_latch() -> Arc<Latch> {
+    BPF_MAP_WRITE_DONE_LATCH
+        .get_or_init(|| Arc::new(Latch::new()))
+        .clone()
+}
+
+/// Start the SHM polling loop for dump requests.
 /// Reads KTSTR_SHM_BASE and KTSTR_SHM_SIZE from /proc/cmdline and polls
-/// /dev/mem. Also initializes the SHM signal slot pointer for
-/// `shm_ring::wait_for` / `shm_ring::signal`.
+/// /dev/mem. Initializes the SHM mmap pointer for `shm_ring` writers.
 ///
 /// `trace_stop` is the trace_pipe reader's stop flag. The graceful
 /// shutdown handler sets it so the reader enters drain mode.
@@ -1786,27 +1823,35 @@ fn start_shm_poll(trace_stop: Option<Arc<AtomicBool>>) -> Option<Arc<AtomicBool>
     Some(stop)
 }
 
-/// Poll /dev/mem for dump request bytes.
-/// Maps the full SHM region so signal slots are accessible via
-/// `shm_ring::init_shm_ptr`.
+/// Poll /dev/mem for dump request bytes and `/dev/hvc0` for
+/// host→guest wake bytes.
 ///
-/// On graceful shutdown (SIGNAL_SHUTDOWN_REQ), sets `trace_stop` and
-/// disables tracing so the trace_pipe reader drains all buffered data
-/// before exiting.
+/// Maps the full SHM region so the SHM ring writers can use the
+/// cached pointer (`shm_ring::init_shm_ptr`).
 ///
 /// Wake source: opens `/dev/hvc0` non-blocking (`O_NONBLOCK`) and
 /// `poll()`s the fd with `POLLIN` at a 1000 ms safety timeout. The
 /// host pushes a byte via `VirtioConsole::queue_input` whenever it
-/// writes a SHM control byte (`DUMP_REQ`, signal slot 0
-/// `SIGNAL_SHUTDOWN_REQ`); the poll wakes within microseconds of
-/// that push, drains the byte, and re-checks SHM. The 1 s timeout
-/// bounds teardown observation of the external `stop` flag —
-/// sufficient because graceful shutdown also pushes a wake byte via
-/// virtio-console, and `kill` / teardown cases tolerate sub-second
-/// latency. The `STALL_REQ` byte at `STALL_REQ_OFFSET` is also
-/// re-checked on every wake but has no production host-side writer
-/// in this codebase; it is a debugging affordance for out-of-band
-/// SHM pokes.
+/// requests a dump (`SIGNAL_VC_DUMP` paired with the SHM
+/// `DUMP_REQ_OFFSET` byte), a graceful shutdown
+/// (`SIGNAL_VC_SHUTDOWN`), or a `bpf-map-write`-complete notification
+/// (`SIGNAL_BPF_WRITE_DONE`). The poll wakes within microseconds of
+/// the push.
+///
+/// On any wake the loop:
+///   1. re-reads the SHM `DUMP_REQ_OFFSET` byte; if it equals
+///      `DUMP_REQ_SYSRQ_D`, triggers SysRq-D and clears the byte.
+///   2. scans every drained hvc0 byte for `SIGNAL_BPF_WRITE_DONE`;
+///      on observing one, fires [`bpf_map_write_done_latch`] so the
+///      scenario's `wait_for_map_write` gate resumes.
+///   3. scans every drained hvc0 byte for `SIGNAL_VC_SHUTDOWN`; on
+///      observing one, drives graceful shutdown (set `trace_stop`,
+///      disable tracing, flush stdio + serial) and breaks.
+///
+/// The 1 s safety timeout bounds teardown observation of the
+/// `stop` flag — sufficient because every wake source pushes a
+/// hvc0 byte and `kill` / teardown cases tolerate sub-second
+/// latency.
 fn shm_poll_loop(shm_base: u64, shm_size: u64, stop: &AtomicBool, trace_stop: Option<&AtomicBool>) {
     use std::os::unix::io::AsRawFd;
 
@@ -1835,19 +1880,16 @@ fn shm_poll_loop(shm_base: u64, shm_size: u64, stop: &AtomicBool, trace_stop: Op
 
     let shm_ptr = m.ptr;
 
-    // Initialize the signal slot pointer so shm_ring::wait_for and
-    // shm_ring::signal can use this mmap.
+    // Cache the SHM mmap pointer for guest-side ring writers.
     crate::vmm::shm_ring::init_shm_ptr(shm_ptr, shm_size as usize);
 
     let dump_offset = crate::vmm::shm_ring::DUMP_REQ_OFFSET;
-    let stall_offset = crate::vmm::shm_ring::STALL_REQ_OFFSET;
 
     // Open `/dev/hvc0` for non-blocking reads via `O_NONBLOCK` +
-    // `poll(POLLIN)`. The host pushes a byte via
-    // `VirtioConsole::queue_input` whenever it writes a SHM
-    // control byte (`DUMP_REQ`, signal slot 0
-    // `SIGNAL_SHUTDOWN_REQ`); the poll wakes within microseconds
-    // of that push. The 1000 ms safety timeout bounds teardown
+    // `poll(POLLIN)`. The host pushes one of `SIGNAL_VC_DUMP` /
+    // `SIGNAL_VC_SHUTDOWN` whenever it requests a dump or a
+    // graceful shutdown; the poll wakes within microseconds of
+    // that push. The 1000 ms safety timeout bounds teardown
     // observation of the `stop` flag. `expect()` panics if the
     // device is missing — `ktstr.kconfig` mandates
     // `CONFIG_VIRTIO_CONSOLE=y` so the kernel is required to expose
@@ -1867,16 +1909,37 @@ fn shm_poll_loop(shm_base: u64, shm_size: u64, stop: &AtomicBool, trace_stop: Op
                 let _ = fs::write("/proc/sysrq-trigger", "D");
                 *(shm_ptr.add(dump_offset)) = 0;
             }
-
-            let stall_byte = *(shm_ptr.add(stall_offset));
-            if stall_byte == crate::vmm::shm_ring::STALL_REQ_ACTIVATE {
-                let _ = fs::File::create("/tmp/ktstr_stall");
-                *(shm_ptr.add(stall_offset)) = 0;
-            }
         }
 
-        // Check for graceful shutdown request from host.
-        if crate::vmm::shm_ring::read_signal(0) == crate::vmm::shm_ring::SIGNAL_SHUTDOWN_REQ {
+        // Wake source: `poll()` on `/dev/hvc0` with a 1000 ms
+        // safety timeout. The host pushes a byte into virtio-console
+        // RX after every dump, shutdown, or `bpf-map-write`-complete
+        // request; this thread wakes within microseconds of the
+        // push, drains the bytes (so the next iteration's poll
+        // re-arms cleanly), and inspects them for the typed wake
+        // bytes. `SIGNAL_VC_DUMP` and any other byte simply force
+        // the SHM `DUMP_REQ_OFFSET` re-read above.
+        let borrowed = unsafe { BorrowedFd::borrow_raw(hvc0.as_raw_fd()) };
+        let mut fds = [PollFd::new(borrowed, PollFlags::POLLIN)];
+        match poll(&mut fds, poll_timeout_ms) {
+            Ok(_) | Err(nix::errno::Errno::EINTR) => {}
+            Err(_) => break,
+        }
+        let mut buf = [0u8; 16];
+        let mut hvc_ref: &fs::File = &hvc0;
+        let n = hvc_ref.read(&mut buf).unwrap_or(0);
+        // BPF map-write done notification: the host's
+        // `bpf-map-write` thread finished applying every queued
+        // `bpf_map_write` to the kernel BPF maps. Set the latch so
+        // a scenario blocked on `wait_for_map_write` resumes. Set
+        // BEFORE the shutdown check so a back-to-back DONE+SHUTDOWN
+        // burst (host signalled completion, then triggered teardown
+        // immediately) still releases any waiter before the loop
+        // breaks out for the shutdown branch.
+        if buf[..n].contains(&crate::vmm::virtio_console::SIGNAL_BPF_WRITE_DONE) {
+            bpf_map_write_done_latch().set();
+        }
+        if buf[..n].contains(&crate::vmm::virtio_console::SIGNAL_VC_SHUTDOWN) {
             eprintln!("ktstr-init: shutdown request received, draining");
             if let Some(ts) = trace_stop {
                 ts.store(true, Ordering::Release);
@@ -1896,25 +1959,6 @@ fn shm_poll_loop(shm_base: u64, shm_size: u64, stop: &AtomicBool, trace_stop: Op
             }
             break;
         }
-
-        // Wake source: `poll()` on `/dev/hvc0` with a 1000 ms
-        // safety timeout. The host pushes a byte into virtio-console
-        // RX after every SHM control-byte write (`DUMP_REQ`,
-        // `SIGNAL_SHUTDOWN_REQ`); this thread wakes within
-        // microseconds of the push, drains the byte (so the next
-        // iteration's poll re-arms cleanly), and re-checks SHM. The
-        // byte VALUE is not inspected — any byte forces the SHM
-        // re-read above. `STALL_REQ` is also re-checked but has no
-        // production host-side writer (debug-only).
-        let borrowed = unsafe { BorrowedFd::borrow_raw(hvc0.as_raw_fd()) };
-        let mut fds = [PollFd::new(borrowed, PollFlags::POLLIN)];
-        match poll(&mut fds, poll_timeout_ms) {
-            Ok(_) | Err(nix::errno::Errno::EINTR) => {}
-            Err(_) => break,
-        }
-        let mut buf = [0u8; 16];
-        let mut hvc_ref: &fs::File = &hvc0;
-        let _ = hvc_ref.read(&mut buf);
     }
 
     // Do NOT munmap here. SHM_PTR (OnceLock) retains the mmap pointer
@@ -2033,10 +2077,7 @@ fn start_sched_exit_monitor(
                     // guarantees the marker has landed in COM2's
                     // host-side capture buffer.
                     let exit_code: i32 = 1;
-                    crate::vmm::shm_ring::write_msg(
-                        crate::vmm::shm_ring::MSG_TYPE_SCHED_EXIT,
-                        &exit_code.to_ne_bytes(),
-                    );
+                    crate::vmm::guest_comms::send_sched_exit(exit_code);
                     // SAFETY: pidfd is owned by this thread
                     // and is no longer used after close.
                     unsafe {

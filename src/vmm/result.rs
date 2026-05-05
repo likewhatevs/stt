@@ -47,14 +47,19 @@ pub struct VmResult {
     /// verdicts, and SCX event deltas. `None` when the monitor did
     /// not run (host-only tests, early VM failure).
     pub monitor: Option<monitor::MonitorReport>,
-    /// Data drained from the SHM ring buffer after VM exit.
+    /// TLV messages drained after VM exit. Merges three streams in
+    /// arrival order: mid-flight bytes the monitor pulled off
+    /// virtio-console port 1 during the run, the final port-1
+    /// `port1_tx_buf` flush, and a post-mortem read of the SHM ring
+    /// (which still carries `MSG_TYPE_CRASH` and any pre-port-open
+    /// fallback writes).
     pub shm_data: Option<shm_ring::ShmDrainResult>,
     /// Stimulus events extracted from SHM ring entries.
     #[allow(dead_code)]
     pub stimulus_events: Vec<shm_ring::StimulusEvent>,
     /// BPF verifier stats collected from host-side memory reads.
     pub verifier_stats: Vec<monitor::bpf_prog::ProgVerifierStats>,
-    /// KVM per-vCPU cumulative stats (requires Linux >= 5.15, x86_64 only).
+    /// KVM per-vCPU cumulative stats (requires Linux >= 5.14).
     pub kvm_stats: Option<KvmStatsTotals>,
     /// Crash message from SHM (MSG_TYPE_CRASH). Reliable delivery via
     /// memcpy unlike serial which truncates large backtraces.
@@ -298,6 +303,14 @@ pub struct KvmStatsTotals {
 /// Covers VM exit rate, halt-polling behavior, preemption notifications,
 /// signal-driven exits, and hypercall counts; all fields scheduler
 /// authors typically correlate with scx decisions.
+///
+/// Per-arch availability: `halt_exits`, `preemption_reported`, and
+/// `hypercalls` are published by KVM only on x86. On aarch64 the
+/// kernel does not expose these stats via `KVM_GET_STATS_FD`; they
+/// are absent from the per-vCPU map and read as `0` from
+/// [`KvmStatsTotals::sum`] / [`KvmStatsTotals::avg`]. The remaining
+/// names (`exits`, `halt_successful_poll`, `halt_attempted_poll`,
+/// `halt_wait_ns`, `signal_exits`) are published on both arches.
 #[allow(dead_code)]
 pub const KVM_INTERESTING_STATS: &[&str] = &[
     "exits",
@@ -410,6 +423,35 @@ pub(crate) struct VmRunState {
     /// can drain captured snapshots and walk them via the
     /// [`crate::scenario::snapshot::Snapshot`] accessor surface.
     pub(crate) snapshot_bridge: crate::scenario::snapshot::SnapshotBridge,
+    /// Cached aarch64 TCR_EL1 register, populated lazily by the BSP
+    /// once the guest kernel programs the MMU. Always `None` on
+    /// x86_64 (the register does not exist). Threads that construct
+    /// a `GuestKernel` for page-table walks (monitor, BPF map writer,
+    /// freeze coordinator, post-exit verifier-stats collector) read
+    /// this atomic to feed the granule-agnostic walker (4 KB / 16 KB
+    /// / 64 KB). A 0 reading on aarch64 means "kernel hasn't reached
+    /// MMU bring-up yet"; the walker's T1SZ=0 gate rejects walks in
+    /// that state and the affected lookup returns `None` cleanly.
+    pub(crate) tcr_el1: Option<Arc<std::sync::atomic::AtomicU64>>,
+    /// Virtio-console device shared with vCPU threads. Carries the
+    /// port-1 (`/dev/vport0p1`) bulk TLV stream from guest to host;
+    /// `collect_results` calls `drain_bulk()` after the run to feed
+    /// `parse_tlv_stream` and produce the `ShmDrainResult` that
+    /// `VmResult.shm_data` exposes to test verdicts.
+    pub(crate) virtio_con: Arc<crate::vmm::PiMutex<crate::vmm::virtio_console::VirtioConsole>>,
+    /// Bulk TLV entries the freeze coordinator parsed from
+    /// `port1_tx_buf` mid-run. The coord's TOKEN_TX handler reads
+    /// the device's accumulated bulk bytes, feeds them through
+    /// [`crate::vmm::bulk::HostAssembler`], and stashes every parsed
+    /// frame here so [`super::KtstrVm::collect_results`] can merge
+    /// them into `VmResult::shm_data` alongside the post-exit
+    /// `drain_bulk` and the post-mortem SHM CRASH-ring drain.
+    /// Without this stash every EXIT / TEST / PAYLOAD_METRICS /
+    /// RAW_PAYLOAD_OUTPUT / PROFRAW frame consumed by the coord
+    /// would vanish — only the leftover bytes that arrived on
+    /// `port1_tx_buf` after the coord exited would reach the
+    /// verdict, and a typical run would surface no metrics.
+    pub(crate) bulk_messages: Arc<std::sync::Mutex<Vec<crate::vmm::shm_ring::ShmEntry>>>,
 }
 #[cfg(test)]
 mod tests {

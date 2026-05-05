@@ -188,12 +188,14 @@ struct AccessorMemReader<'a> {
 
 impl MemReader for AccessorMemReader<'_> {
     fn read_kva(&self, kva: u64, len: usize) -> Option<Vec<u8>> {
+        let walk = self.kernel.walk_context();
         let pa = super::super::idr::translate_any_kva(
             self.kernel.mem(),
-            self.kernel.cr3_pa(),
-            self.kernel.page_offset(),
+            walk.cr3_pa,
+            walk.page_offset,
             kva,
-            self.kernel.l5(),
+            walk.l5,
+            walk.tcr_el1,
         )?;
         let mut buf = vec![0u8; len];
         let read = self.kernel.mem().read_bytes(pa, &mut buf);
@@ -1460,15 +1462,20 @@ pub(super) fn render_ringbuf_state(
 
     let kernel = accessor.kernel();
     let mem = kernel.mem();
-    let cr3_pa = kernel.cr3_pa();
-    let po = kernel.page_offset();
-    let l5 = kernel.l5();
+    let walk = kernel.walk_context();
 
     // Step 1+2: read `bpf_ringbuf_map.rb` as u64 (kernel pointer).
-    let map_pa = super::super::idr::translate_any_kva(mem, cr3_pa, po, info.map_kva, l5)
-        .ok_or_else(|| {
-            "RINGBUF map_kva unmapped during freeze (concurrent destruction race?)".to_string()
-        })?;
+    let map_pa = super::super::idr::translate_any_kva(
+        mem,
+        walk.cr3_pa,
+        walk.page_offset,
+        info.map_kva,
+        walk.l5,
+        walk.tcr_el1,
+    )
+    .ok_or_else(|| {
+        "RINGBUF map_kva unmapped during freeze (concurrent destruction race?)".to_string()
+    })?;
     let rb_kva = mem.read_u64(map_pa, rb_offs.rbm_rb);
     if rb_kva == 0 {
         return Err(
@@ -1487,7 +1494,14 @@ pub(super) fn render_ringbuf_state(
     // does one translate + one scalar read per field.
     let read_at = |off: usize| -> Option<u64> {
         let kva = rb_kva.wrapping_add(off as u64);
-        let pa = super::super::idr::translate_any_kva(mem, cr3_pa, po, kva, l5)?;
+        let pa = super::super::idr::translate_any_kva(
+            mem,
+            walk.cr3_pa,
+            walk.page_offset,
+            kva,
+            walk.l5,
+            walk.tcr_el1,
+        )?;
         Some(mem.read_u64(pa, 0))
     };
 
@@ -1562,12 +1576,17 @@ pub(super) fn render_stack_traces(
 
     let kernel = accessor.kernel();
     let mem = kernel.mem();
-    let cr3_pa = kernel.cr3_pa();
-    let po = kernel.page_offset();
-    let l5 = kernel.l5();
+    let walk = kernel.walk_context();
 
-    let map_pa = super::super::idr::translate_any_kva(mem, cr3_pa, po, info.map_kva, l5)
-        .ok_or_else(|| "STACK_TRACE map_kva unmapped during freeze".to_string())?;
+    let map_pa = super::super::idr::translate_any_kva(
+        mem,
+        walk.cr3_pa,
+        walk.page_offset,
+        info.map_kva,
+        walk.l5,
+        walk.tcr_el1,
+    )
+    .ok_or_else(|| "STACK_TRACE map_kva unmapped during freeze".to_string())?;
 
     let n_buckets = mem.read_u32(map_pa, sm_offs.smap_n_buckets);
     let scan_buckets = n_buckets.min(MAX_STACK_TRACE_BUCKETS);
@@ -1598,8 +1617,14 @@ pub(super) fn render_stack_traces(
             .map_kva
             .wrapping_add(sm_offs.smap_buckets as u64)
             .wrapping_add((bucket_id as u64) * 8);
-        let Some(slot_pa) = super::super::idr::translate_any_kva(mem, cr3_pa, po, slot_kva, l5)
-        else {
+        let Some(slot_pa) = super::super::idr::translate_any_kva(
+            mem,
+            walk.cr3_pa,
+            walk.page_offset,
+            slot_kva,
+            walk.l5,
+            walk.tcr_el1,
+        ) else {
             // Bucket array spans across pages on large maps; an
             // unmapped page in the array itself is exotic but
             // possible. Skip rather than abort.
@@ -1611,8 +1636,14 @@ pub(super) fn render_stack_traces(
         }
 
         // Dereference the bucket: read nr (u32) and the data[] head.
-        let Some(bucket_pa) = super::super::idr::translate_any_kva(mem, cr3_pa, po, bucket_kva, l5)
-        else {
+        let Some(bucket_pa) = super::super::idr::translate_any_kva(
+            mem,
+            walk.cr3_pa,
+            walk.page_offset,
+            bucket_kva,
+            walk.l5,
+            walk.tcr_el1,
+        ) else {
             continue;
         };
         let nr = mem.read_u32(bucket_pa, sm_offs.smb_nr);
@@ -1641,8 +1672,14 @@ pub(super) fn render_stack_traces(
         let mut data_ok = true;
         while consumed < total {
             let cur_kva = data_kva.wrapping_add(consumed);
-            let Some(pa) = super::super::idr::translate_any_kva(mem, cr3_pa, po, cur_kva, l5)
-            else {
+            let Some(pa) = super::super::idr::translate_any_kva(
+                mem,
+                walk.cr3_pa,
+                walk.page_offset,
+                cur_kva,
+                walk.l5,
+                walk.tcr_el1,
+            ) else {
                 data_ok = false;
                 break;
             };
@@ -1714,9 +1751,7 @@ pub(super) fn render_fd_array_slots(
 ) -> FailureDumpFdArray {
     let kernel = accessor.kernel();
     let mem = kernel.mem();
-    let cr3_pa = kernel.cr3_pa();
-    let po = kernel.page_offset();
-    let l5 = kernel.l5();
+    let walk = kernel.walk_context();
     let array_value_off = accessor.offsets().array_value;
 
     let scan = info.max_entries.min(MAX_FD_ARRAY_SLOTS);
@@ -1751,8 +1786,14 @@ pub(super) fn render_fd_array_slots(
             .map_kva
             .wrapping_add(array_value_off as u64)
             .wrapping_add((idx as u64) * 8);
-        let Some(slot_pa) = super::super::idr::translate_any_kva(mem, cr3_pa, po, slot_kva, l5)
-        else {
+        let Some(slot_pa) = super::super::idr::translate_any_kva(
+            mem,
+            walk.cr3_pa,
+            walk.page_offset,
+            slot_kva,
+            walk.l5,
+            walk.tcr_el1,
+        ) else {
             continue;
         };
         let ptr = mem.read_u64(slot_pa, 0);

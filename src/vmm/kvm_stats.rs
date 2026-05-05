@@ -8,6 +8,17 @@
 //! Stats fds have `noop_llseek` but `FMODE_PREAD`. The initial
 //! sequential read works (position starts at 0); subsequent reads
 //! use pread.
+//!
+//! `KVM_GET_STATS_FD` and `struct kvm_stats_desc` live in the generic
+//! `include/uapi/linux/kvm.h` and are available on every KVM-supported
+//! architecture. The descriptor schema (per-stat names, sizes, offsets)
+//! is published by each arch's `kvm_vcpu_stats_desc[]` (e.g.
+//! `arch/x86/kvm/x86.c`, `arch/arm64/kvm/guest.c`). The reader below
+//! parses whatever descriptors the kernel publishes; arch-specific
+//! stat names that don't appear in a given kernel's descriptor list
+//! are silently absent from the resulting map and consumers that look
+//! them up via [`crate::vmm::KvmStatsTotals::sum`] /
+//! [`crate::vmm::KvmStatsTotals::avg`] return 0.
 
 use std::collections::HashMap;
 use std::os::fd::OwnedFd;
@@ -212,20 +223,26 @@ pub(crate) fn open_stats_context(vcpus: &[kvm_ioctls::VcpuFd]) -> Option<StatsCo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vmm::kvm::KtstrKvm;
     use crate::vmm::topology::Topology;
-    use crate::vmm::x86_64::kvm::KtstrKvm;
 
-    #[test]
-    fn stats_fd_returns_some_on_modern_kernel() {
-        let topo = Topology {
+    /// Single-LLC, single-NUMA topology for stats-fd unit tests.
+    /// `cores_per_llc` is the only dimension the call sites vary;
+    /// every other field stays at the minimum value KtstrKvm accepts.
+    fn test_topo(cores_per_llc: u32) -> Topology {
+        Topology {
             llcs: 1,
-            cores_per_llc: 1,
+            cores_per_llc,
             threads_per_core: 1,
             numa_nodes: 1,
             nodes: None,
             distances: None,
-        };
-        let vm = KtstrKvm::new(topo, 64, false).unwrap();
+        }
+    }
+
+    #[test]
+    fn stats_fd_returns_some_on_modern_kernel() {
+        let vm = KtstrKvm::new(test_topo(1), 64, false).unwrap();
         if let Some(fd) = get_stats_fd(&*vm.vm_fd) {
             assert!(fd.as_raw_fd() >= 0);
         }
@@ -233,15 +250,7 @@ mod tests {
 
     #[test]
     fn vcpu_stats_fd_returns_some() {
-        let topo = Topology {
-            llcs: 1,
-            cores_per_llc: 1,
-            threads_per_core: 1,
-            numa_nodes: 1,
-            nodes: None,
-            distances: None,
-        };
-        let vm = KtstrKvm::new(topo, 64, false).unwrap();
+        let vm = KtstrKvm::new(test_topo(1), 64, false).unwrap();
         if let Some(fd) = get_stats_fd(&vm.vcpus[0]) {
             assert!(fd.as_raw_fd() >= 0);
         }
@@ -249,15 +258,7 @@ mod tests {
 
     #[test]
     fn parse_meta_from_vcpu() {
-        let topo = Topology {
-            llcs: 1,
-            cores_per_llc: 1,
-            threads_per_core: 1,
-            numa_nodes: 1,
-            nodes: None,
-            distances: None,
-        };
-        let vm = KtstrKvm::new(topo, 64, false).unwrap();
+        let vm = KtstrKvm::new(test_topo(1), 64, false).unwrap();
         if let Some(fd) = get_stats_fd(&vm.vcpus[0]) {
             let buf = read_initial(fd.as_raw_fd()).unwrap();
             let meta = parse_meta_from_buf(&buf).unwrap();
@@ -268,15 +269,7 @@ mod tests {
 
     #[test]
     fn pread_data_after_initial_read() {
-        let topo = Topology {
-            llcs: 1,
-            cores_per_llc: 1,
-            threads_per_core: 1,
-            numa_nodes: 1,
-            nodes: None,
-            distances: None,
-        };
-        let vm = KtstrKvm::new(topo, 64, false).unwrap();
+        let vm = KtstrKvm::new(test_topo(1), 64, false).unwrap();
         if let Some(fd) = get_stats_fd(&vm.vcpus[0]) {
             let buf = read_initial(fd.as_raw_fd()).unwrap();
             let meta = parse_meta_from_buf(&buf).unwrap();
@@ -288,15 +281,7 @@ mod tests {
 
     #[test]
     fn vcpu_reader_opens_and_reads() {
-        let topo = Topology {
-            llcs: 1,
-            cores_per_llc: 2,
-            threads_per_core: 1,
-            numa_nodes: 1,
-            nodes: None,
-            distances: None,
-        };
-        let vm = KtstrKvm::new(topo, 64, false).unwrap();
+        let vm = KtstrKvm::new(test_topo(2), 64, false).unwrap();
         if let Some(reader) = VcpuStatsReader::open(&vm.vcpus[0]) {
             let snap = reader.read_snapshot();
             assert!(snap.contains_key("exits"), "should contain 'exits'");
@@ -305,15 +290,7 @@ mod tests {
 
     #[test]
     fn stats_context_opens_and_reads() {
-        let topo = Topology {
-            llcs: 1,
-            cores_per_llc: 2,
-            threads_per_core: 1,
-            numa_nodes: 1,
-            nodes: None,
-            distances: None,
-        };
-        let vm = KtstrKvm::new(topo, 64, false).unwrap();
+        let vm = KtstrKvm::new(test_topo(2), 64, false).unwrap();
         if let Some(ctx) = open_stats_context(&vm.vcpus) {
             assert_eq!(ctx.readers.len(), 2);
             let stats = ctx.read_stats();

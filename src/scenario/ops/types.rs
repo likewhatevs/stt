@@ -376,41 +376,54 @@ pub enum Op {
     /// ```
     Snapshot { name: Cow<'static, str> },
     /// Capture a snapshot whenever the guest writes to the named
-    /// kernel symbol. The snapshot is tagged with the symbol path
+    /// kernel symbol. The snapshot is tagged with the symbol
     /// itself; one fire = one capture.
     ///
-    /// Symbol resolution at op execution time uses the freeze
-    /// coordinator's BTF + kallsyms pipeline:
-    /// - `"bss.<obj>.<field>"` → scheduler program BTF Datasec
-    ///   walk + per-section offset → guest KVA.
-    /// - `"kernel.<symbol>[.<field>...]"` → vmlinux BTF +
-    ///   kallsyms (+ per-CPU offset for per-CPU symbols) → KVA.
+    /// Symbol resolution at op execution time is a verbatim match
+    /// against the vmlinux ELF symbol table: the freeze coordinator
+    /// walks `Elf::syms` and accepts the symbol whose strtab entry
+    /// equals the requested string byte-for-byte. There is no
+    /// prefix stripping, BTF lookup, kallsyms walk, or per-CPU
+    /// offset arithmetic — the string must match an entry that
+    /// `nm vmlinux` would print (e.g. `"jiffies_64"`,
+    /// `"scx_watchdog_timestamp"`).
+    ///
+    /// The `register_watch` callback on a host-side
+    /// [`SnapshotBridge`](crate::scenario::snapshot::SnapshotBridge)
+    /// is for **host-side unit testing only** — it lets in-process
+    /// executor tests record the symbol and return without arming
+    /// any hardware. Production in-VM scenarios run via the SHM
+    /// doorbell and the host coordinator's `arm_user_watchpoint`
+    /// path (`src/vmm/freeze_coord.rs`); the thread-local bridge
+    /// is never installed inside the guest.
     ///
     /// # Guard rails
     ///
     /// - **Maximum of 3 watch ops per scenario.** The KVM
-    ///   hardware-watchpoint plumbing reserves DR0 for the existing
-    ///   `*scx_root->exit_kind` trigger (used by the error-trigger
-    ///   path); only DR1 / DR2 / DR3 are available for on-demand
-    ///   watches. The bridge's `register_watch` rejects a 4th
+    ///   hardware-watchpoint plumbing reserves slot 0 for the
+    ///   existing `*scx_root->exit_kind` trigger (used by the
+    ///   error-trigger path); only the remaining three user
+    ///   watchpoint slots are available for on-demand watches. The
+    ///   bridge's `register_watch` rejects a 4th
     ///   `Op::WatchSnapshot` and fails the step when the cap is
     ///   exceeded.
     /// - **Symbol resolution failures bail immediately.** A
-    ///   missing field / symbol / unaligned address surfaces as
-    ///   an `Err` from `execute_steps` so the test author
-    ///   notices the watch did not attach. Silent degradation
-    ///   would leave the scenario running with no captures and
-    ///   look identical to a healthy passing run.
-    /// - **DR_LEN_4 alignment.** The resolved KVA must be 4-byte
-    ///   aligned per Intel SDM Vol. 3B Chapter 17 (DR_LEN_4
-    ///   requires `addr & 0x3 == 0`). Mis-aligned addresses bail
-    ///   at setup with the resolved KVA in the error.
+    ///   missing symbol or unaligned address surfaces as an `Err`
+    ///   from `execute_steps` so the test author notices the
+    ///   watch did not attach. Silent degradation would leave the
+    ///   scenario running with no captures and look identical to
+    ///   a healthy passing run.
+    /// - **4-byte alignment.** The resolved KVA must be 4-byte
+    ///   aligned: the framework arms 4-byte data-write watches,
+    ///   which require `addr & 0x3 == 0` on every supported
+    ///   architecture. Mis-aligned addresses bail at setup with
+    ///   the resolved KVA in the error.
     ///
     /// **Guest → host wire.** The registration request rides the
     /// same ioeventfd doorbell as [`Op::Snapshot`] (separate tag
-    /// namespace), so symbol resolution + DR1-3 allocation +
-    /// `KVM_SET_GUEST_DEBUG` arming happen on the host without a
-    /// vCPU userspace exit. Once armed, the
+    /// namespace), so symbol resolution + user watchpoint slot
+    /// allocation + `KVM_SET_GUEST_DEBUG` arming happen on the host
+    /// without a vCPU userspace exit. Once armed, the
     /// `KVM_EXIT_DEBUG` dispatch path drives the resulting
     /// captures directly into the freeze coordinator (no
     /// per-fire doorbell write needed). See
@@ -1758,8 +1771,8 @@ impl Op {
 
     /// Register a write-driven snapshot watch on `symbol`. See
     /// [`Op::WatchSnapshot`] for the symbol-resolution rules and
-    /// guard rails (max 3 watches per scenario, BTF + kallsyms +
-    /// per-CPU resolution, DR_LEN_4 alignment requirement).
+    /// guard rails (max 3 watches per scenario, verbatim vmlinux
+    /// ELF symtab match, 4-byte alignment requirement).
     pub fn watch_snapshot(symbol: impl Into<Cow<'static, str>>) -> Self {
         Op::WatchSnapshot {
             symbol: symbol.into(),

@@ -166,9 +166,7 @@ pub(crate) fn build(
 
     let kernel = owned_accessor.guest_kernel();
     let mem = kernel.mem();
-    let cr3_pa = kernel.cr3_pa();
-    let page_offset = kernel.page_offset();
-    let l5 = kernel.l5();
+    let walk = kernel.walk_context();
 
     // Field offsets within task_struct for both list linkages:
     //   - tasks_node: links into the kernel's global `scx_tasks`
@@ -245,15 +243,7 @@ pub(crate) fn build(
         let head_kva = rq_kva.wrapping_add(runnable_list_off as u64);
         let head_pa = rq_pa.wrapping_add(runnable_list_off as u64);
 
-        let task_kvas = walk_runnable_list(
-            mem,
-            cr3_pa,
-            page_offset,
-            l5,
-            head_kva,
-            head_pa,
-            runnable_node_off_in_task,
-        );
+        let task_kvas = walk_runnable_list(mem, walk, head_kva, head_pa, runnable_node_off_in_task);
 
         for task_kva in task_kvas {
             // Stamp running_pc only on the curr task — every other
@@ -337,9 +327,7 @@ pub(crate) fn build(
 /// when the next pointer is NULL, or when the visited cap is hit.
 fn walk_runnable_list(
     mem: &GuestMem,
-    cr3_pa: u64,
-    page_offset: u64,
-    l5: bool,
+    walk: crate::monitor::reader::WalkContext,
     head_kva: u64,
     head_pa: u64,
     runnable_node_off_in_task: usize,
@@ -361,7 +349,14 @@ fn walk_runnable_list(
         let task_kva = node_kva.wrapping_sub(runnable_node_off_in_task as u64);
         task_kvas.push(task_kva);
 
-        let Some(node_pa) = translate_any_kva(mem, cr3_pa, page_offset, node_kva, l5) else {
+        let Some(node_pa) = translate_any_kva(
+            mem,
+            walk.cr3_pa,
+            walk.page_offset,
+            node_kva,
+            walk.l5,
+            walk.tcr_el1,
+        ) else {
             return task_kvas;
         };
         let next_kva = mem.read_u64(node_pa, 0);
@@ -472,7 +467,13 @@ mod tests {
 
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
 
-        let kvas = walk_runnable_list(&mem, 0, 0, false, head as u64, head as u64, 0);
+        let kvas = walk_runnable_list(
+            &mem,
+            crate::monitor::reader::WalkContext::default(),
+            head as u64,
+            head as u64,
+            0,
+        );
         assert_eq!(kvas, vec![n1 as u64, n2 as u64]);
     }
 
@@ -485,7 +486,13 @@ mod tests {
         buf[head..head + 8].copy_from_slice(&(head as u64).to_le_bytes());
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
 
-        let kvas = walk_runnable_list(&mem, 0, 0, false, head as u64, head as u64, 0);
+        let kvas = walk_runnable_list(
+            &mem,
+            crate::monitor::reader::WalkContext::default(),
+            head as u64,
+            head as u64,
+            0,
+        );
         assert!(kvas.is_empty());
     }
 
@@ -499,7 +506,13 @@ mod tests {
         buf[head..head + 8].copy_from_slice(&0u64.to_le_bytes());
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
 
-        let kvas = walk_runnable_list(&mem, 0, 0, false, head as u64, head as u64, 0);
+        let kvas = walk_runnable_list(
+            &mem,
+            crate::monitor::reader::WalkContext::default(),
+            head as u64,
+            head as u64,
+            0,
+        );
         assert!(kvas.is_empty());
     }
 
@@ -520,7 +533,13 @@ mod tests {
         buf[n1..n1 + 8].copy_from_slice(&(head as u64).to_le_bytes());
 
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
-        let kvas = walk_runnable_list(&mem, 0, 0, false, head as u64, head as u64, off);
+        let kvas = walk_runnable_list(
+            &mem,
+            crate::monitor::reader::WalkContext::default(),
+            head as u64,
+            head as u64,
+            off,
+        );
         assert_eq!(kvas, vec![(n1 - off) as u64]);
     }
 
@@ -542,7 +561,13 @@ mod tests {
         buf[n2..n2 + 8].copy_from_slice(&(n1 as u64).to_le_bytes());
 
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
-        let kvas = walk_runnable_list(&mem, 0, 0, false, head as u64, head as u64, 0);
+        let kvas = walk_runnable_list(
+            &mem,
+            crate::monitor::reader::WalkContext::default(),
+            head as u64,
+            head as u64,
+            0,
+        );
         assert_eq!(kvas.len() as u32, MAX_NODES_PER_LIST);
     }
 
@@ -575,7 +600,13 @@ mod tests {
         buf[n1..n1 + 8].copy_from_slice(&garbage_next.to_le_bytes());
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
 
-        let kvas = walk_runnable_list(&mem, 0, 0, false, head as u64, head as u64, 0);
+        let kvas = walk_runnable_list(
+            &mem,
+            crate::monitor::reader::WalkContext::default(),
+            head as u64,
+            head as u64,
+            0,
+        );
         assert_eq!(kvas, vec![n1 as u64, garbage_next]);
     }
 
@@ -599,8 +630,20 @@ mod tests {
 
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
 
-        let kvas0 = walk_runnable_list(&mem, 0, 0, false, cpu0_head as u64, cpu0_head as u64, 0);
-        let kvas1 = walk_runnable_list(&mem, 0, 0, false, cpu1_head as u64, cpu1_head as u64, 0);
+        let kvas0 = walk_runnable_list(
+            &mem,
+            crate::monitor::reader::WalkContext::default(),
+            cpu0_head as u64,
+            cpu0_head as u64,
+            0,
+        );
+        let kvas1 = walk_runnable_list(
+            &mem,
+            crate::monitor::reader::WalkContext::default(),
+            cpu1_head as u64,
+            cpu1_head as u64,
+            0,
+        );
 
         let mut combined: Vec<u64> = Vec::new();
         combined.extend(kvas0);
@@ -672,9 +715,7 @@ mod tests {
         assert_eq!(runnable_list_off, 0);
         let kvas = walk_runnable_list(
             &mem,
-            0,
-            0,
-            false,
+            crate::monitor::reader::WalkContext::default(),
             head as u64,
             head as u64,
             runnable_node_off_in_task,
@@ -1049,7 +1090,13 @@ mod tests {
         );
 
         // Runnable_list walk produces n1.
-        let runnable_kvas = walk_runnable_list(&mem, 0, 0, false, head as u64, head as u64, 0);
+        let runnable_kvas = walk_runnable_list(
+            &mem,
+            crate::monitor::reader::WalkContext::default(),
+            head as u64,
+            head as u64,
+            0,
+        );
         assert_eq!(runnable_kvas, vec![n1 as u64]);
 
         let runnable_per_cpu: Vec<(u64, u64)> =
@@ -1221,7 +1268,13 @@ mod tests {
 
         // Runnable_list walk surfaces n1 (task.scx + see.runnable_node = 0
         // here, so task_kva == node_kva).
-        let runnable_kvas = walk_runnable_list(&mem, 0, 0, false, head as u64, head as u64, 0);
+        let runnable_kvas = walk_runnable_list(
+            &mem,
+            crate::monitor::reader::WalkContext::default(),
+            head as u64,
+            head as u64,
+            0,
+        );
         assert_eq!(runnable_kvas, vec![n1 as u64]);
 
         // Merge: task on runnable_list but not on global list must

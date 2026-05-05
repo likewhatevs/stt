@@ -14,6 +14,8 @@ fn value_ctx<'a>(mem: &'a GuestMem, cr3_pa: u64, l5: bool) -> AccessorCtx<'a> {
         page_offset: PageOffset(0),
         offsets: &BpfMapOffsets::EMPTY,
         l5,
+        tcr_el1: 0,
+        start_kernel_map: START_KERNEL_MAP,
     }
 }
 
@@ -30,6 +32,8 @@ pub(super) fn lookup_ctx<'a>(
         page_offset: PageOffset(page_offset),
         offsets,
         l5,
+        tcr_el1: 0,
+        start_kernel_map: START_KERNEL_MAP,
     }
 }
 
@@ -99,7 +103,7 @@ fn translate_kva_basic() {
     // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
     // whose backing storage outlives the GuestMem use.
     let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-    let pa = mem.translate_kva(cr3_pa, Kva(kva), false);
+    let pa = mem.translate_kva(cr3_pa, Kva(kva), false, 0);
     assert_eq!(pa, Some(data_pa));
     // Read through the translated PA to verify correctness.
     assert_eq!(mem.read_u64(pa.unwrap(), 0), 0xDEAD_BEEF_CAFE_1234);
@@ -113,7 +117,7 @@ fn translate_kva_with_offset() {
     // whose backing storage outlives the GuestMem use.
     let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
     // KVA + 0x100 should map to data_pa + 0x100
-    let pa = mem.translate_kva(cr3_pa, Kva(kva + 0x100), false);
+    let pa = mem.translate_kva(cr3_pa, Kva(kva + 0x100), false, 0);
     assert_eq!(pa, Some(data_pa + 0x100));
 }
 
@@ -125,7 +129,7 @@ fn translate_kva_unmapped() {
     // whose backing storage outlives the GuestMem use.
     let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
     // A completely different address that has no PGD entry.
-    let pa = mem.translate_kva(cr3_pa, Kva(0xFFFF_FFFF_8000_0000), false);
+    let pa = mem.translate_kva(cr3_pa, Kva(0xFFFF_FFFF_8000_0000), false, 0);
     assert_eq!(pa, None);
 }
 
@@ -138,7 +142,7 @@ fn translate_kva_unmapped_pte() {
     let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
     // Same PGD/PUD/PMD but next PTE index — not mapped.
     let unmapped_kva = kva + 0x1000;
-    let pa = mem.translate_kva(cr3_pa, Kva(unmapped_kva), false);
+    let pa = mem.translate_kva(cr3_pa, Kva(unmapped_kva), false, 0);
     assert_eq!(pa, None);
 }
 
@@ -185,12 +189,12 @@ fn translate_kva_2mb_huge_page() {
     // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
     // whose backing storage outlives the GuestMem use.
     let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-    let pa = mem.translate_kva(pgd_pa, Kva(kva), false);
+    let pa = mem.translate_kva(pgd_pa, Kva(kva), false, 0);
     assert_eq!(pa, Some(huge_page_pa));
     assert_eq!(mem.read_u64(pa.unwrap(), 0), 0xCAFE_BABE_1234_5678);
 
     // Offset within the 2MB page.
-    let pa_off = mem.translate_kva(pgd_pa, Kva(kva + 0x1000), false);
+    let pa_off = mem.translate_kva(pgd_pa, Kva(kva + 0x1000), false, 0);
     assert_eq!(pa_off, Some(huge_page_pa + 0x1000));
 }
 
@@ -231,11 +235,11 @@ fn translate_kva_1gb_huge_page() {
     // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
     // whose backing storage outlives the GuestMem use.
     let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-    let pa = mem.translate_kva(pgd_pa, Kva(kva), false);
+    let pa = mem.translate_kva(pgd_pa, Kva(kva), false, 0);
     assert_eq!(pa, Some(huge_page_pa));
 
     // Offset within the 1GB page.
-    let pa_off = mem.translate_kva(pgd_pa, Kva(kva + 0x1234_5678), false);
+    let pa_off = mem.translate_kva(pgd_pa, Kva(kva + 0x1234_5678), false, 0);
     assert_eq!(pa_off, Some(huge_page_pa + 0x1234_5678));
 }
 
@@ -258,7 +262,7 @@ fn translate_kva_pgd_not_present() {
     // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
     // whose backing storage outlives the GuestMem use.
     let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-    assert_eq!(mem.translate_kva(pgd_pa, Kva(kva), false), None);
+    assert_eq!(mem.translate_kva(pgd_pa, Kva(kva), false, 0), None);
 }
 
 #[test]
@@ -285,7 +289,7 @@ fn translate_kva_pud_not_present() {
     // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
     // whose backing storage outlives the GuestMem use.
     let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-    assert_eq!(mem.translate_kva(pgd_pa, Kva(kva), false), None);
+    assert_eq!(mem.translate_kva(pgd_pa, Kva(kva), false, 0), None);
 }
 
 #[test]
@@ -314,7 +318,7 @@ fn translate_kva_pmd_not_present() {
     // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
     // whose backing storage outlives the GuestMem use.
     let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-    assert_eq!(mem.translate_kva(pgd_pa, Kva(kva), false), None);
+    assert_eq!(mem.translate_kva(pgd_pa, Kva(kva), false, 0), None);
 }
 
 #[test]
@@ -346,7 +350,7 @@ fn translate_kva_pte_not_present() {
     // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
     // whose backing storage outlives the GuestMem use.
     let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-    assert_eq!(mem.translate_kva(pgd_pa, Kva(kva), false), None);
+    assert_eq!(mem.translate_kva(pgd_pa, Kva(kva), false, 0), None);
 }
 
 // -- write_bpf_map_value tests --
@@ -570,7 +574,7 @@ fn xa_load_multi_entry_multiple_slots() {
 /// Build a buffer with a mock IDR + bpf_map for find_bpf_map testing.
 ///
 /// Layout:
-/// - IDR at idr_pa (BSS region, translated via text_kva_to_pa)
+/// - IDR at idr_pa (BSS region, translated via text_kva_to_pa_with_base)
 /// - bpf_map at map_pa (vmalloc'd, translated via page table walk)
 /// - Page table mapping map_kva -> map_pa
 #[cfg(target_arch = "x86_64")]
@@ -663,9 +667,10 @@ fn setup_find_bpf_map(
     let name_pa = map_pa + offsets.map_name as u64;
     buf[name_pa as usize..name_pa as usize + name_bytes.len()].copy_from_slice(name_bytes);
 
-    // IDR KVA: idr is in BSS, so text_kva_to_pa(idr_kva) = idr_pa.
-    // text_kva_to_pa(kva) = kva - START_KERNEL_MAP.
-    // So idr_kva = idr_pa + START_KERNEL_MAP.
+    // IDR KVA: idr is in BSS, so
+    // text_kva_to_pa_with_base(idr_kva, START_KERNEL_MAP) = idr_pa.
+    // The translation subtracts the base, so
+    // idr_kva = idr_pa + START_KERNEL_MAP.
     let start_kernel_map: u64 = START_KERNEL_MAP;
     let idr_kva = idr_pa + start_kernel_map;
 
@@ -829,7 +834,7 @@ fn translate_kva_5level_basic() {
     // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
     // whose backing storage outlives the GuestMem use.
     let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-    let pa = mem.translate_kva(cr3_pa, Kva(kva), true);
+    let pa = mem.translate_kva(cr3_pa, Kva(kva), true, 0);
     assert_eq!(pa, Some(data_pa));
     assert_eq!(mem.read_u64(pa.unwrap(), 0), 0x5555_AAAA_1234_5678);
 }
@@ -841,7 +846,7 @@ fn translate_kva_5level_with_offset() {
     // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
     // whose backing storage outlives the GuestMem use.
     let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-    let pa = mem.translate_kva(cr3_pa, Kva(kva + 0x100), true);
+    let pa = mem.translate_kva(cr3_pa, Kva(kva + 0x100), true, 0);
     assert_eq!(pa, Some(data_pa + 0x100));
 }
 
@@ -854,7 +859,7 @@ fn translate_kva_5level_unmapped_pml5() {
     let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
     // Different PML5 index — no entry mapped.
     let unmapped_kva: u64 = 0xFF22_8880_0000_5000;
-    assert_eq!(mem.translate_kva(cr3_pa, Kva(unmapped_kva), true), None);
+    assert_eq!(mem.translate_kva(cr3_pa, Kva(unmapped_kva), true, 0), None);
 }
 
 #[test]
@@ -869,9 +874,9 @@ fn translate_kva_5level_vs_4level_same_buffer() {
     let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
     // 4-level walk uses bits 47:39 for PGD, not bits 56:48 for PML5.
     // The PGD index into our PML5 table won't find the right entry.
-    let pa_4level = mem.translate_kva(cr3_pa, Kva(kva), false);
+    let pa_4level = mem.translate_kva(cr3_pa, Kva(kva), false, 0);
     // Should either be None (unmapped) or a different PA than 5-level.
-    let pa_5level = mem.translate_kva(cr3_pa, Kva(kva), true);
+    let pa_5level = mem.translate_kva(cr3_pa, Kva(kva), true, 0);
     assert_ne!(pa_4level, pa_5level);
 }
 
@@ -1416,7 +1421,7 @@ fn translate_kva_5level_p4d_not_present() {
     // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
     // whose backing storage outlives the GuestMem use.
     let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-    assert_eq!(mem.translate_kva(pml5_pa, Kva(kva), true), None);
+    assert_eq!(mem.translate_kva(pml5_pa, Kva(kva), true, 0), None);
 }
 
 // -- 5-level: 2MB huge page --
@@ -1457,10 +1462,10 @@ fn translate_kva_5level_2mb_huge_page() {
     // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
     // whose backing storage outlives the GuestMem use.
     let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-    let pa = mem.translate_kva(pml5_pa, Kva(kva), true);
+    let pa = mem.translate_kva(pml5_pa, Kva(kva), true, 0);
     assert_eq!(pa, Some(huge_page_pa));
 
-    let pa_off = mem.translate_kva(pml5_pa, Kva(kva + 0x1234), true);
+    let pa_off = mem.translate_kva(pml5_pa, Kva(kva + 0x1234), true, 0);
     assert_eq!(pa_off, Some(huge_page_pa + 0x1234));
 }
 
@@ -1499,10 +1504,10 @@ fn translate_kva_5level_1gb_huge_page() {
     // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
     // whose backing storage outlives the GuestMem use.
     let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-    let pa = mem.translate_kva(pml5_pa, Kva(kva), true);
+    let pa = mem.translate_kva(pml5_pa, Kva(kva), true, 0);
     assert_eq!(pa, Some(huge_page_pa));
 
-    let pa_off = mem.translate_kva(pml5_pa, Kva(kva + 0x1234_5678), true);
+    let pa_off = mem.translate_kva(pml5_pa, Kva(kva + 0x1234_5678), true, 0);
     assert_eq!(pa_off, Some(huge_page_pa + 0x1234_5678));
 }
 
@@ -2856,7 +2861,7 @@ fn translate_kva_l0_index_256() {
     // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
     // whose backing storage outlives the GuestMem use.
     let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-    let pa = mem.translate_kva(cr3_pa, Kva(kva), false);
+    let pa = mem.translate_kva(cr3_pa, Kva(kva), false, 0);
     assert_eq!(
         pa,
         Some(data_pa),
@@ -2872,7 +2877,7 @@ fn translate_kva_l0_index_256_with_offset() {
     // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
     // whose backing storage outlives the GuestMem use.
     let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-    let pa = mem.translate_kva(cr3_pa, Kva(kva + 0x100), false);
+    let pa = mem.translate_kva(cr3_pa, Kva(kva + 0x100), false, 0);
     assert_eq!(pa, Some(data_pa + 0x100));
 }
 
@@ -2884,13 +2889,42 @@ fn translate_kva_l0_index_256_unmapped_neighbor() {
     // whose backing storage outlives the GuestMem use.
     let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
     let kva_257 = kva + (1u64 << 39);
-    assert_eq!(mem.translate_kva(cr3_pa, Kva(kva_257), false), None);
+    assert_eq!(mem.translate_kva(cr3_pa, Kva(kva_257), false, 0), None);
 }
 
-// -- aarch64 64KB granule vmalloc region tests --
+// -- aarch64 granule-agnostic walker tests --
+//
+// The new walker (`walk_aarch64`) reads TCR_EL1 to determine the
+// granule (4 KB / 16 KB / 64 KB) and high-half VA width from TG1
+// and T1SZ respectively. Each test below builds a synthetic page
+// table for one granule + level configuration and verifies the
+// walker resolves it correctly. TCR_EL1 encodings:
+//   TG1 (bits [31:30]): 0b01=16 KB, 0b10=4 KB, 0b11=64 KB
+//                       (distinct from TG0[15:14], confirmed
+//                        against Arm ARM D17.2.139)
+//   T1SZ (bits [21:16]): high-half VA size offset (`64 - T1SZ`
+//                        gives VA width)
+// The reference implementation (cloud-hypervisor vmm/src/cpu.rs)
+// drives the same algorithm. Tests use `target_arch = "aarch64"`
+// because the walker requires DRAM_START which is aarch64-only.
 
-/// Build a 3-level page table for 64KB granule mapping KVA
-/// 0xFFFF_8000_8400_0000 (KIMAGE_VADDR region, PGD index 32).
+/// TCR_EL1 with TG1=0b11 (64 KB) and T1SZ=16 (48-bit VA).
+#[cfg(target_arch = "aarch64")]
+const TCR_EL1_64K_48BIT: u64 = (0b11_u64 << 30) | (16u64 << 16);
+/// TCR_EL1 with TG1=0b10 (4 KB) and T1SZ=16 (48-bit VA).
+#[cfg(target_arch = "aarch64")]
+const TCR_EL1_4K_48BIT: u64 = (0b10_u64 << 30) | (16u64 << 16);
+/// TCR_EL1 with TG1=0b01 (16 KB) and T1SZ=17 (47-bit VA).
+/// 16 KB granule needs `(va_width - 4) / stride = (47-4)/11 = 3`
+/// levels under the start-level formula `4 - levels`, landing
+/// the first table at level 1 (matches cloud-hypervisor's
+/// 16 KB / 47-bit VA layout).
+#[cfg(target_arch = "aarch64")]
+const TCR_EL1_16K_47BIT: u64 = (0b01_u64 << 30) | (17u64 << 16);
+
+/// Build a 3-level 64 KB page table mapping `kva` to a data page.
+/// Used both by the existing vmalloc tests and the new explicit
+/// 64 KB granule test.
 #[cfg(target_arch = "aarch64")]
 fn setup_page_table_vmalloc_64k() -> (Vec<u8>, u64, u64, u64) {
     let kva: u64 = 0xFFFF_8000_8400_0000;
@@ -2928,7 +2962,7 @@ fn translate_kva_vmalloc_64k() {
     // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
     // whose backing storage outlives the GuestMem use.
     let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-    let pa = mem.translate_kva(cr3_pa, Kva(kva), false);
+    let pa = mem.translate_kva(cr3_pa, Kva(kva), false, TCR_EL1_64K_48BIT);
     assert_eq!(pa, Some(data_pa), "64KB vmalloc walk should resolve");
     assert_eq!(mem.read_u64(pa.unwrap(), 0), 0x1234_5678_ABCD_EF00);
 }
@@ -2940,7 +2974,7 @@ fn translate_kva_vmalloc_64k_with_offset() {
     // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
     // whose backing storage outlives the GuestMem use.
     let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-    let pa = mem.translate_kva(cr3_pa, Kva(kva + 0x100), false);
+    let pa = mem.translate_kva(cr3_pa, Kva(kva + 0x100), false, TCR_EL1_64K_48BIT);
     assert_eq!(pa, Some(data_pa + 0x100));
 }
 
@@ -2952,7 +2986,492 @@ fn translate_kva_vmalloc_64k_unmapped_neighbor() {
     // whose backing storage outlives the GuestMem use.
     let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
     let unmapped = kva + (1u64 << 42);
-    assert_eq!(mem.translate_kva(cr3_pa, Kva(unmapped), false), None);
+    assert_eq!(
+        mem.translate_kva(cr3_pa, Kva(unmapped), false, TCR_EL1_64K_48BIT),
+        None
+    );
+}
+
+// -- 4 KB granule (the default kernel config) --
+
+/// Build a 4-level 4 KB page table mapping a single 4 KB page.
+/// Indices for KVA 0xFFFF_8880_0000_5000:
+///   PGD: bits [47:39] = 0x110 (272)
+///   PUD: bits [38:30] = 0x100 (256)
+///   PMD: bits [29:21] = 0x0
+///   PTE: bits [20:12] = 0x5
+#[cfg(target_arch = "aarch64")]
+fn setup_page_table_4k() -> (Vec<u8>, u64, u64, u64) {
+    let kva: u64 = 0xFFFF_8880_0000_5000;
+    let pgd_idx = (kva >> 39) & 0x1FF;
+    let pud_idx = (kva >> 30) & 0x1FF;
+    let pmd_idx = (kva >> 21) & 0x1FF;
+    let pte_idx = (kva >> 12) & 0x1FF;
+
+    // 4 KB tables: 512 entries × 8 bytes each = 4 KB. Page-aligned.
+    let pgd_pa: u64 = 0x10000;
+    let pud_pa: u64 = pgd_pa + 0x1000;
+    let pmd_pa: u64 = pud_pa + 0x1000;
+    let pte_pa: u64 = pmd_pa + 0x1000;
+    let data_pa: u64 = pte_pa + 0x1000;
+
+    let size = (data_pa + 0x1000) as usize;
+    let mut buf = vec![0u8; size];
+
+    let write_entry = |buf: &mut Vec<u8>, base: u64, idx: u64, val: u64| {
+        let off = (base + idx * 8) as usize;
+        buf[off..off + 8].copy_from_slice(&val.to_ne_bytes());
+    };
+
+    // bits [1:0] = 0b11 = table descriptor at intermediate levels,
+    // page descriptor at the leaf level. AF bit (10) and AP bits
+    // are ignored by the walker — only [1:0] and OA matter.
+    write_entry(&mut buf, pgd_pa, pgd_idx, (pud_pa + PTE_BASE) | 0x03);
+    write_entry(&mut buf, pud_pa, pud_idx, (pmd_pa + PTE_BASE) | 0x03);
+    write_entry(&mut buf, pmd_pa, pmd_idx, (pte_pa + PTE_BASE) | 0x03);
+    write_entry(&mut buf, pte_pa, pte_idx, (data_pa + PTE_BASE) | 0x03);
+
+    buf[data_pa as usize..data_pa as usize + 8]
+        .copy_from_slice(&0xDEAD_BEEF_CAFE_1234u64.to_ne_bytes());
+
+    (buf, pgd_pa, kva, data_pa)
+}
+
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn translate_kva_aarch64_4k_4level() {
+    // 4 KB granule, 4-level walk — the default config, including
+    // Apple Silicon CI hosts. Pre-fix the walker hardcoded 64 KB
+    // and silently produced wrong PAs on every read.
+    let (buf, cr3_pa, kva, data_pa) = setup_page_table_4k();
+    // SAFETY: buf outlives mem.
+    let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
+    let pa = mem.translate_kva(cr3_pa, Kva(kva), false, TCR_EL1_4K_48BIT);
+    assert_eq!(pa, Some(data_pa), "4 KB 4-level walk should resolve");
+    assert_eq!(mem.read_u64(pa.unwrap(), 0), 0xDEAD_BEEF_CAFE_1234);
+}
+
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn translate_kva_aarch64_4k_4level_offset() {
+    let (buf, cr3_pa, kva, data_pa) = setup_page_table_4k();
+    // SAFETY: buf outlives mem.
+    let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
+    let pa = mem.translate_kva(cr3_pa, Kva(kva + 0x123), false, TCR_EL1_4K_48BIT);
+    assert_eq!(pa, Some(data_pa + 0x123));
+}
+
+// -- 16 KB granule (Apple Silicon CI default) --
+
+/// Build a 4-level 16 KB page table mapping a single 16 KB page.
+/// 16 KB granule with T1SZ=17 (47-bit VA) yields `start_level = 4 -
+/// (47-4)/11 = 4 - 3 = 1` per the cloud-hypervisor formula. Each
+/// table holds 2048 entries (`1 << 11 = 2048`), 8 bytes each =
+/// 16 KB / table.
+///   level 1 index: bits [46:36], 11 bits
+///   level 2 index: bits [35:25], 11 bits
+///   level 3 (leaf): bits [24:14], 11 bits
+///   page offset: bits [13:0], 14 bits
+#[cfg(target_arch = "aarch64")]
+fn setup_page_table_16k() -> (Vec<u8>, u64, u64, u64) {
+    // KVA in the high half so bit 55 is set; T1SZ=17 limits the VA
+    // span to 47 bits (high half = bits [46:0] above the sign-
+    // extension; the kernel-side mapping puts symbols at
+    // 0xFFFF_8... above the high 0xFFFF prefix).
+    let kva: u64 = 0xFFFF_8000_0000_4000;
+    let l1_idx = (kva >> 36) & 0x7FF;
+    let l2_idx = (kva >> 25) & 0x7FF;
+    let l3_idx = (kva >> 14) & 0x7FF;
+
+    // 16 KB tables: 2048 × 8 bytes = 16 KB / table.
+    let l1_pa: u64 = 0x10000;
+    let l2_pa: u64 = l1_pa + 0x4000;
+    let l3_pa: u64 = l2_pa + 0x4000;
+    let data_pa: u64 = l3_pa + 0x4000;
+
+    let size = (data_pa + 0x4000) as usize;
+    let mut buf = vec![0u8; size];
+
+    let write_entry = |buf: &mut Vec<u8>, base: u64, idx: u64, val: u64| {
+        let off = (base + idx * 8) as usize;
+        buf[off..off + 8].copy_from_slice(&val.to_ne_bytes());
+    };
+
+    write_entry(&mut buf, l1_pa, l1_idx, (l2_pa + PTE_BASE) | 0x03);
+    write_entry(&mut buf, l2_pa, l2_idx, (l3_pa + PTE_BASE) | 0x03);
+    write_entry(&mut buf, l3_pa, l3_idx, (data_pa + PTE_BASE) | 0x03);
+
+    buf[data_pa as usize..data_pa as usize + 8]
+        .copy_from_slice(&0xFEED_FACE_C0DE_BABEu64.to_ne_bytes());
+
+    (buf, l1_pa, kva, data_pa)
+}
+
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn translate_kva_aarch64_16k_granule() {
+    // 16 KB granule, the Apple Silicon CI case. TG1=0b01 maps to
+    // stride=11 in the walker — distinct from TG0's encoding,
+    // which is the easy bug to introduce.
+    let (buf, cr3_pa, kva, data_pa) = setup_page_table_16k();
+    // SAFETY: buf outlives mem.
+    let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
+    let pa = mem.translate_kva(cr3_pa, Kva(kva), false, TCR_EL1_16K_47BIT);
+    assert_eq!(pa, Some(data_pa), "16 KB granule walk should resolve");
+    assert_eq!(mem.read_u64(pa.unwrap(), 0), 0xFEED_FACE_C0DE_BABE);
+}
+
+// -- TG1 decode coverage --
+
+/// Verify the TG1 bit decode for all three encodings the walker
+/// supports. The encoding is distinct from TG0 (which lives at
+/// bits [15:14] with 0b00=4K, 0b01=64K, 0b10=16K) — confusing the
+/// two would silently flip granule selection on every aarch64
+/// monitor read. Pin the encoding here rather than in a doc
+/// comment so a regression surfaces as a test failure.
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn translate_kva_aarch64_tg1_decode_distinct_from_tg0() {
+    // TG1 = 0b10 → 4 KB granule. T1SZ=16 → 48-bit VA.
+    let (buf, cr3_pa, kva, data_pa) = setup_page_table_4k();
+    // SAFETY: buf outlives mem.
+    let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
+    let tcr = (0b10_u64 << 30) | (16u64 << 16);
+    assert_eq!(
+        mem.translate_kva(cr3_pa, Kva(kva), false, tcr),
+        Some(data_pa),
+        "TG1=0b10 must decode as 4 KB granule"
+    );
+    // TG1 = 0b11 → 64 KB granule. The 4 KB page table layout will
+    // not resolve under a 64 KB walk (different stride, different
+    // index extraction); the walker should produce None or the
+    // wrong PA — assert it does NOT match the 4 KB data_pa.
+    let tcr_64k = (0b11_u64 << 30) | (16u64 << 16);
+    assert_ne!(
+        mem.translate_kva(cr3_pa, Kva(kva), false, tcr_64k),
+        Some(data_pa),
+        "TG1=0b11 must NOT resolve a 4 KB-laid-out table to the same PA"
+    );
+
+    // TG1 = 0b01 → 16 KB granule. Same expectation as TG1=0b11
+    // versus a 4 KB layout.
+    let tcr_16k = (0b01_u64 << 30) | (16u64 << 16);
+    assert_ne!(
+        mem.translate_kva(cr3_pa, Kva(kva), false, tcr_16k),
+        Some(data_pa),
+        "TG1=0b01 must NOT resolve a 4 KB-laid-out table to the same PA"
+    );
+}
+
+// -- block descriptor at intermediate level (huge page) --
+
+/// Build a 4 KB / 4-level page table where the PMD entry is a
+/// block descriptor (bit 1 == 0) for a 2 MB region. The walker
+/// should terminate at the PMD level and compose the final PA
+/// from the block's 2 MB-aligned base + the in-2 MB page offset.
+#[cfg(target_arch = "aarch64")]
+fn setup_page_table_4k_huge_pmd() -> (Vec<u8>, u64, u64, u64) {
+    // 2 MB-aligned KVA so the block-PA + offset arithmetic is
+    // unambiguous.
+    let kva: u64 = 0xFFFF_8880_0020_0000;
+    let pgd_idx = (kva >> 39) & 0x1FF;
+    let pud_idx = (kva >> 30) & 0x1FF;
+    let pmd_idx = (kva >> 21) & 0x1FF;
+
+    let pgd_pa: u64 = 0x10000;
+    let pud_pa: u64 = pgd_pa + 0x1000;
+    let pmd_pa: u64 = pud_pa + 0x1000;
+    let huge_page_pa: u64 = 0x20_0000; // 2 MB-aligned
+
+    let size = (huge_page_pa + 0x20_0000) as usize;
+    let mut buf = vec![0u8; size];
+
+    let write_entry = |buf: &mut Vec<u8>, base: u64, idx: u64, val: u64| {
+        let off = (base + idx * 8) as usize;
+        buf[off..off + 8].copy_from_slice(&val.to_ne_bytes());
+    };
+
+    // PGD → PUD (table descriptor, bits [1:0] = 0b11 = 0x03).
+    write_entry(&mut buf, pgd_pa, pgd_idx, (pud_pa + PTE_BASE) | 0x03);
+    // PUD → PMD (table descriptor).
+    write_entry(&mut buf, pud_pa, pud_idx, (pmd_pa + PTE_BASE) | 0x03);
+    // PMD entry as a 2 MB block descriptor: bit 0 = valid, bit 1 = 0
+    // means "block" at intermediate levels per ARMv8 D5.3 / Arm ARM.
+    write_entry(&mut buf, pmd_pa, pmd_idx, (huge_page_pa + PTE_BASE) | 0x01);
+
+    // Marker at the start of the huge page so the walker's
+    // composed PA can be read back.
+    buf[huge_page_pa as usize..huge_page_pa as usize + 8]
+        .copy_from_slice(&0xCAFE_BABE_1234_5678u64.to_ne_bytes());
+
+    (buf, pgd_pa, kva, huge_page_pa)
+}
+
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn translate_kva_aarch64_4k_pmd_block() {
+    // 2 MB block descriptor at the PMD level — the walker must
+    // terminate at level 2 (block at intermediate) and compose
+    // `(block_base & ~(2MB-1)) | (kva & (2MB-1))`.
+    let (buf, cr3_pa, kva, huge_page_pa) = setup_page_table_4k_huge_pmd();
+    // SAFETY: buf outlives mem.
+    let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
+    let pa = mem.translate_kva(cr3_pa, Kva(kva), false, TCR_EL1_4K_48BIT);
+    assert_eq!(
+        pa,
+        Some(huge_page_pa),
+        "PMD block descriptor must terminate the walk and resolve to the 2 MB base"
+    );
+    assert_eq!(mem.read_u64(pa.unwrap(), 0), 0xCAFE_BABE_1234_5678);
+
+    // In-2 MB-page offset must add to the PA correctly.
+    let pa_off = mem.translate_kva(cr3_pa, Kva(kva + 0x12_3456), false, TCR_EL1_4K_48BIT);
+    assert_eq!(
+        pa_off,
+        Some(huge_page_pa + 0x12_3456),
+        "in-block offset must compose with the 2 MB-aligned base"
+    );
+}
+
+// -- aarch64 walker rejection paths --
+//
+// These tests cover the defensive checks in `walk_aarch64`
+// (`reader.rs:walk_aarch64`) that reject malformed or attacker-
+// controlled TCR_EL1 values and descriptors. Without coverage a
+// regression that loosens any of these guards would silently
+// allow OOB reads or wrap-around translations.
+
+/// T1SZ=61 yields va_width = 64 - 61 = 3; the walker rejects this
+/// before computing `(va_width - 4) / stride` which would underflow.
+/// TG1=0b10 (4 KB) is set so the t1sz check is the only thing that
+/// can produce None — pinning the rejection to the va_width guard.
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn walk_aarch64_rejects_t1sz_underflow() {
+    // Build a valid 4 KB / 4-level page table; the walker should
+    // reject the TCR_EL1 before consulting any descriptor.
+    let (buf, cr3_pa, kva, _) = setup_page_table_4k();
+    // SAFETY: buf outlives mem.
+    let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
+    // TG1=0b10 (4 KB), T1SZ=61 → va_width = 3.
+    let tcr = (0b10_u64 << 30) | (61u64 << 16);
+    assert_eq!(
+        mem.translate_kva(cr3_pa, Kva(kva), false, tcr),
+        None,
+        "T1SZ=61 (va_width=3) must trip the va_width<4 guard"
+    );
+}
+
+/// 4 KB granule (stride=9) with T1SZ=15 yields va_width=49,
+/// levels_below = (49 - 4) / 9 = 5. Since `levels_below > 4`, the
+/// starting level `4 - levels_below` would underflow — the walker
+/// must reject before computing it.
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn walk_aarch64_rejects_levels_overflow() {
+    let (buf, cr3_pa, kva, _) = setup_page_table_4k();
+    // SAFETY: buf outlives mem.
+    let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
+    // TG1=0b10 (4 KB, stride=9), T1SZ=15 → va_width=49,
+    // levels_below = (49 - 4) / 9 = 5.
+    let tcr = (0b10_u64 << 30) | (15u64 << 16);
+    assert_eq!(
+        mem.translate_kva(cr3_pa, Kva(kva), false, tcr),
+        None,
+        "levels_below=5 must trip the levels_below>4 guard"
+    );
+}
+
+/// TG1=0b00 is reserved per Arm ARM D17.2.139. The walker must
+/// reject rather than fall through to a default stride. T1SZ is
+/// set to a valid value so the rejection is unambiguously the
+/// TG1 dispatch.
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn walk_aarch64_rejects_tg1_reserved_zero() {
+    let (buf, cr3_pa, kva, _) = setup_page_table_4k();
+    // SAFETY: buf outlives mem.
+    let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
+    // TG1=0b00 (reserved), T1SZ=16 (48-bit VA, valid).
+    let tcr = (0b00_u64 << 30) | (16u64 << 16);
+    assert_eq!(
+        mem.translate_kva(cr3_pa, Kva(kva), false, tcr),
+        None,
+        "TG1=0b00 must be rejected as reserved"
+    );
+}
+
+/// At level 3, descriptor bits[1:0]=0b01 is reserved (page
+/// descriptors are encoded as 0b11). The walker must reject
+/// rather than treating it as a "block at level 3" which would
+/// fall through to the leaf-composition path with stale state.
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn walk_aarch64_rejects_level3_reserved_descriptor() {
+    // Clone the 4 KB / 4-level layout but write the leaf as 0b01.
+    let kva: u64 = 0xFFFF_8880_0000_5000;
+    let pgd_idx = (kva >> 39) & 0x1FF;
+    let pud_idx = (kva >> 30) & 0x1FF;
+    let pmd_idx = (kva >> 21) & 0x1FF;
+    let pte_idx = (kva >> 12) & 0x1FF;
+
+    let pgd_pa: u64 = 0x10000;
+    let pud_pa: u64 = pgd_pa + 0x1000;
+    let pmd_pa: u64 = pud_pa + 0x1000;
+    let pte_pa: u64 = pmd_pa + 0x1000;
+    let data_pa: u64 = pte_pa + 0x1000;
+
+    let size = (data_pa + 0x1000) as usize;
+    let mut buf = vec![0u8; size];
+
+    let write_entry = |buf: &mut Vec<u8>, base: u64, idx: u64, val: u64| {
+        let off = (base + idx * 8) as usize;
+        buf[off..off + 8].copy_from_slice(&val.to_ne_bytes());
+    };
+
+    // Intermediate levels valid (table descriptors).
+    write_entry(&mut buf, pgd_pa, pgd_idx, (pud_pa + PTE_BASE) | 0x03);
+    write_entry(&mut buf, pud_pa, pud_idx, (pmd_pa + PTE_BASE) | 0x03);
+    write_entry(&mut buf, pmd_pa, pmd_idx, (pte_pa + PTE_BASE) | 0x03);
+    // Level 3 leaf with bits[1:0]=0b01 — reserved at the leaf.
+    write_entry(&mut buf, pte_pa, pte_idx, (data_pa + PTE_BASE) | 0x01);
+
+    // SAFETY: buf outlives mem.
+    let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
+    assert_eq!(
+        mem.translate_kva(pgd_pa, Kva(kva), false, TCR_EL1_4K_48BIT),
+        None,
+        "level 3 descriptor 0b01 (reserved) must be rejected"
+    );
+}
+
+/// Build a 4 KB / 4-level page table whose leaf descriptor's
+/// output address falls below DRAM_START. The walker must reject
+/// the translation via `to_offset` (`checked_sub(DRAM_START)`)
+/// rather than wrapping to a near-u64::MAX offset and triggering
+/// an out-of-bounds read.
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn walk_aarch64_rejects_sub_dram_start_descriptor() {
+    use crate::vmm::aarch64::kvm::DRAM_START;
+
+    let kva: u64 = 0xFFFF_8880_0000_5000;
+    let pgd_idx = (kva >> 39) & 0x1FF;
+    let pud_idx = (kva >> 30) & 0x1FF;
+    let pmd_idx = (kva >> 21) & 0x1FF;
+    let pte_idx = (kva >> 12) & 0x1FF;
+
+    let pgd_pa: u64 = 0x10000;
+    let pud_pa: u64 = pgd_pa + 0x1000;
+    let pmd_pa: u64 = pud_pa + 0x1000;
+    let pte_pa: u64 = pmd_pa + 0x1000;
+
+    // OA below DRAM_START — `checked_sub(DRAM_START)` underflows,
+    // forcing `to_offset` to return None.
+    let bad_oa: u64 = 0x1000;
+    assert!(
+        bad_oa < DRAM_START,
+        "test requires OA below DRAM_START to exercise checked_sub guard"
+    );
+
+    let size = (pte_pa + 0x1000) as usize;
+    let mut buf = vec![0u8; size];
+
+    let write_entry = |buf: &mut Vec<u8>, base: u64, idx: u64, val: u64| {
+        let off = (base + idx * 8) as usize;
+        buf[off..off + 8].copy_from_slice(&val.to_ne_bytes());
+    };
+
+    // Intermediate levels valid; leaf points to a sub-DRAM_START PA.
+    write_entry(&mut buf, pgd_pa, pgd_idx, (pud_pa + PTE_BASE) | 0x03);
+    write_entry(&mut buf, pud_pa, pud_idx, (pmd_pa + PTE_BASE) | 0x03);
+    write_entry(&mut buf, pmd_pa, pmd_idx, (pte_pa + PTE_BASE) | 0x03);
+    write_entry(&mut buf, pte_pa, pte_idx, bad_oa | 0x03);
+
+    // SAFETY: buf outlives mem.
+    let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
+    assert_eq!(
+        mem.translate_kva(pgd_pa, Kva(kva), false, TCR_EL1_4K_48BIT),
+        None,
+        "leaf OA below DRAM_START must be rejected by checked_sub guard"
+    );
+}
+
+// -- start_kernel_map_for_tcr decode --
+//
+// These cover the kernel-image-base derivation used by
+// `GuestKernel::new` to pick the correct `KIMAGE_VADDR` on
+// aarch64 (48-bit kernels at 0xFFFF_8000_8000_0000, 47-bit /
+// 16 KB-granule kernels at 0xFFFF_C000_8000_0000). A regression
+// in `start_kernel_map_for_tcr` silently translates symbols to
+// the wrong PA on Apple Silicon hosts.
+
+/// 47-bit VA / 16 KB granule (Apple Silicon): T1SZ=17, TG1=0b01.
+/// _PAGE_END(47) = -(1 << 46) = 0xFFFF_C000_0000_0000; the kernel
+/// image sits SZ_2G (0x8000_0000) above that base, so the
+/// expected value is 0xFFFF_C000_8000_0000.
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn start_kernel_map_for_va_bits_47() {
+    use crate::monitor::symbols::start_kernel_map_for_tcr;
+    // T1SZ=17 → VA_BITS_runtime=47; TG1=0b01 → 16 KB granule.
+    // For VA_BITS_runtime <= 48 the function returns
+    // _PAGE_END(VA_BITS_runtime) + SZ_2G directly.
+    let tcr = (0b01_u64 << 30) | (17u64 << 16);
+    assert_eq!(start_kernel_map_for_tcr(tcr), Some(0xFFFF_C000_8000_0000));
+}
+
+/// 48-bit VA (default aarch64): T1SZ=16, TG1 any non-reserved.
+/// _PAGE_END(48) = -(1 << 47) = 0xFFFF_8000_0000_0000;
+/// + SZ_2G = 0xFFFF_8000_8000_0000.
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn start_kernel_map_for_va_bits_48() {
+    use crate::monitor::symbols::start_kernel_map_for_tcr;
+    // T1SZ=16 → VA_BITS_runtime=48; TG1=0b10 → 4 KB granule.
+    let tcr = (0b10_u64 << 30) | (16u64 << 16);
+    assert_eq!(start_kernel_map_for_tcr(tcr), Some(0xFFFF_8000_8000_0000));
+}
+
+/// `start_kernel_map_for_tcr` derives `VA_BITS` from `T1SZ`
+/// internally; this test pins the decoding behaviour for several
+/// T1SZ values plus the `tcr_el1 == 0` sentinel that callers in
+/// retry contexts depend on.
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn va_bits_from_tcr_decode() {
+    use crate::monitor::symbols::start_kernel_map_for_tcr;
+    // T1SZ=16 → VA_BITS_runtime=48; TG1=0b10 (4 KB).
+    // Image base = _PAGE_END(48) + SZ_2G = 0xFFFF_8000_8000_0000.
+    let tcr_48 = (0b10_u64 << 30) | (16u64 << 16);
+    assert_eq!(
+        start_kernel_map_for_tcr(tcr_48),
+        Some(0xFFFF_8000_8000_0000)
+    );
+    // T1SZ=17 → VA_BITS_runtime=47; TG1=0b01 (16 KB).
+    // Image base = _PAGE_END(47) + SZ_2G = 0xFFFF_C000_8000_0000.
+    let tcr_47 = (0b01_u64 << 30) | (17u64 << 16);
+    assert_eq!(
+        start_kernel_map_for_tcr(tcr_47),
+        Some(0xFFFF_C000_8000_0000)
+    );
+    // T1SZ=25 → VA_BITS_runtime=39 (3-level walk); TG1=0b10 (4 KB).
+    // Image base = _PAGE_END(39) + SZ_2G; _PAGE_END(39) =
+    // -(1 << 38) = 0xFFFF_FFC0_0000_0000.
+    // + 0x8000_0000 = 0xFFFF_FFC0_8000_0000.
+    let tcr_39 = (0b10_u64 << 30) | (25u64 << 16);
+    assert_eq!(
+        start_kernel_map_for_tcr(tcr_39),
+        Some(0xFFFF_FFC0_8000_0000)
+    );
+    // T1SZ=0 (high half disabled) — even with a valid TG1 the
+    // function returns None because the high-half region is
+    // disabled and `KIMAGE_VADDR` cannot be derived.
+    let tcr_t1sz_zero = 0b10_u64 << 30; // TG1=0b10 (4 KB), T1SZ=0.
+    assert_eq!(start_kernel_map_for_tcr(tcr_t1sz_zero), None);
+    // tcr_el1 == 0 (TCR not yet readable) likewise returns None;
+    // callers in retry loops treat None as "TCR not ready".
+    assert_eq!(start_kernel_map_for_tcr(0), None);
 }
 
 mod htab_tests;

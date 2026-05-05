@@ -186,7 +186,7 @@ pub(crate) fn try_flush_profraw() {
         return;
     }
 
-    vmm::shm_ring::write_msg(MSG_TYPE_PROFRAW, &buf);
+    vmm::guest_comms::send_profraw(&buf);
 }
 
 /// Resolve multiple symbol virtual addresses in a single pass through

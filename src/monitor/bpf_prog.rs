@@ -7,8 +7,8 @@
 
 use super::btf_offsets::BpfProgOffsets;
 use super::idr::{translate_any_kva, xa_load};
-use super::reader::GuestMem;
-use super::symbols::text_kva_to_pa;
+use super::reader::{GuestMem, WalkContext};
+use super::symbols::text_kva_to_pa_with_base;
 
 /// BPF_PROG_TYPE_STRUCT_OPS from include/uapi/linux/bpf.h.
 const BPF_PROG_TYPE_STRUCT_OPS: u32 = 27;
@@ -30,16 +30,17 @@ pub struct ProgVerifierStats {
 ///
 /// Reads `prog_idr` from guest memory, walks the xarray, and for
 /// each `bpf_prog` with `type == BPF_PROG_TYPE_STRUCT_OPS`, reads
-/// `aux->verified_insns` and `aux->name`.
+/// `aux->verified_insns` and `aux->name`. `start_kernel_map` is the
+/// runtime kernel image base used to translate `prog_idr_kva` to a
+/// guest physical address.
 pub(crate) fn find_struct_ops_progs(
     mem: &GuestMem,
-    cr3_pa: u64,
-    page_offset: u64,
+    walk: WalkContext,
     prog_idr_kva: u64,
     offsets: &BpfProgOffsets,
-    l5: bool,
+    start_kernel_map: u64,
 ) -> Vec<ProgVerifierStats> {
-    let idr_pa = text_kva_to_pa(prog_idr_kva);
+    let idr_pa = text_kva_to_pa_with_base(prog_idr_kva, start_kernel_map);
 
     let xa_head = mem.read_u64(idr_pa, offsets.idr_xa_head);
     if xa_head == 0 {
@@ -52,7 +53,7 @@ pub(crate) fn find_struct_ops_progs(
     for id in 0..idr_next {
         let Some(entry) = xa_load(
             mem,
-            page_offset,
+            walk.page_offset,
             xa_head,
             id as u64,
             offsets.xa_node_slots,
@@ -65,7 +66,14 @@ pub(crate) fn find_struct_ops_progs(
         }
 
         // bpf_prog is SLAB-allocated or vmalloc'd.
-        let Some(prog_pa) = translate_any_kva(mem, cr3_pa, page_offset, entry, l5) else {
+        let Some(prog_pa) = translate_any_kva(
+            mem,
+            walk.cr3_pa,
+            walk.page_offset,
+            entry,
+            walk.l5,
+            walk.tcr_el1,
+        ) else {
             continue;
         };
 
@@ -80,7 +88,14 @@ pub(crate) fn find_struct_ops_progs(
         }
 
         // bpf_prog_aux is kmalloc'd (SLAB, direct mapping).
-        let Some(aux_pa) = translate_any_kva(mem, cr3_pa, page_offset, aux_kva, l5) else {
+        let Some(aux_pa) = translate_any_kva(
+            mem,
+            walk.cr3_pa,
+            walk.page_offset,
+            aux_kva,
+            walk.l5,
+            walk.tcr_el1,
+        ) else {
             continue;
         };
 
@@ -217,14 +232,13 @@ impl std::fmt::Display for ProgRuntimeStats {
 /// correctly alongside direct-mapping percpu allocations.
 pub(crate) fn walk_struct_ops_runtime_stats(
     mem: &GuestMem,
-    cr3_pa: u64,
-    page_offset: u64,
+    walk: WalkContext,
     prog_idr_kva: u64,
     offsets: &BpfProgOffsets,
-    l5: bool,
     per_cpu_offsets: &[u64],
+    start_kernel_map: u64,
 ) -> Vec<ProgRuntimeStats> {
-    let idr_pa = text_kva_to_pa(prog_idr_kva);
+    let idr_pa = text_kva_to_pa_with_base(prog_idr_kva, start_kernel_map);
 
     let xa_head = mem.read_u64(idr_pa, offsets.idr_xa_head);
     if xa_head == 0 {
@@ -237,7 +251,7 @@ pub(crate) fn walk_struct_ops_runtime_stats(
     for id in 0..idr_next {
         let Some(entry) = xa_load(
             mem,
-            page_offset,
+            walk.page_offset,
             xa_head,
             id as u64,
             offsets.xa_node_slots,
@@ -249,7 +263,14 @@ pub(crate) fn walk_struct_ops_runtime_stats(
             continue;
         }
 
-        let Some(prog_pa) = translate_any_kva(mem, cr3_pa, page_offset, entry, l5) else {
+        let Some(prog_pa) = translate_any_kva(
+            mem,
+            walk.cr3_pa,
+            walk.page_offset,
+            entry,
+            walk.l5,
+            walk.tcr_el1,
+        ) else {
             continue;
         };
 
@@ -262,7 +283,14 @@ pub(crate) fn walk_struct_ops_runtime_stats(
         if aux_kva == 0 {
             continue;
         }
-        let Some(aux_pa) = translate_any_kva(mem, cr3_pa, page_offset, aux_kva, l5) else {
+        let Some(aux_pa) = translate_any_kva(
+            mem,
+            walk.cr3_pa,
+            walk.page_offset,
+            aux_kva,
+            walk.l5,
+            walk.tcr_el1,
+        ) else {
             continue;
         };
 
@@ -288,8 +316,14 @@ pub(crate) fn walk_struct_ops_runtime_stats(
         let mut misses: u64 = 0;
         for &cpu_off in per_cpu_offsets {
             let stats_kva = stats_percpu_kva.wrapping_add(cpu_off);
-            if let Some(stats_pa) = translate_any_kva(mem, cr3_pa, page_offset, stats_kva, l5)
-                && stats_pa < mem.size()
+            if let Some(stats_pa) = translate_any_kva(
+                mem,
+                walk.cr3_pa,
+                walk.page_offset,
+                stats_kva,
+                walk.l5,
+                walk.tcr_el1,
+            ) && stats_pa < mem.size()
             {
                 cnt = cnt.saturating_add(mem.read_u64(stats_pa, offsets.stats_cnt));
                 nsecs = nsecs.saturating_add(mem.read_u64(stats_pa, offsets.stats_nsecs));
@@ -372,11 +406,10 @@ impl BpfProgAccessor for GuestMemProgAccessor<'_> {
     fn struct_ops_progs(&self) -> Vec<ProgVerifierStats> {
         find_struct_ops_progs(
             self.kernel.mem(),
-            self.kernel.cr3_pa(),
-            self.kernel.page_offset(),
+            self.kernel.walk_context(),
             self.prog_idr_kva,
             self.offsets,
-            self.kernel.l5(),
+            self.kernel.start_kernel_map(),
         )
     }
 
@@ -392,12 +425,11 @@ impl BpfProgAccessor for GuestMemProgAccessor<'_> {
     fn struct_ops_runtime_stats(&self, per_cpu_offsets: &[u64]) -> Vec<ProgRuntimeStats> {
         walk_struct_ops_runtime_stats(
             self.kernel.mem(),
-            self.kernel.cr3_pa(),
-            self.kernel.page_offset(),
+            self.kernel.walk_context(),
             self.prog_idr_kva,
             self.offsets,
-            self.kernel.l5(),
             per_cpu_offsets,
+            self.kernel.start_kernel_map(),
         )
     }
 }
@@ -433,8 +465,9 @@ impl<'a> GuestMemProgAccessorOwned<'a> {
     pub fn new(
         mem: &'a super::reader::GuestMem,
         vmlinux: &std::path::Path,
+        tcr_el1: u64,
     ) -> anyhow::Result<Self> {
-        let kernel = super::guest::GuestKernel::new(mem, vmlinux)?;
+        let kernel = super::guest::GuestKernel::new(mem, vmlinux, tcr_el1)?;
         let offsets = BpfProgOffsets::from_vmlinux(vmlinux)?;
         let prog_idr_kva = kernel
             .symbol_kva("prog_idr")

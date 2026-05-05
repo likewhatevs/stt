@@ -20,9 +20,14 @@ use zerocopy::{FromBytes, IntoBytes};
 pub(crate) struct ShmMmap {
     /// Pointer to the start of the SHM region (page-offset adjusted).
     pub ptr: *mut u8,
-    /// Base address passed to munmap (page-aligned).
+    /// Base address passed to munmap (page-aligned). Held so the
+    /// caller can perform a manual munmap if needed; the lib path
+    /// never invokes munmap explicitly because the mapping
+    /// outlives every guest thread (set once via `OnceLock`).
+    #[allow(dead_code)]
     pub map_base: *mut libc::c_void,
-    /// Size passed to munmap.
+    /// Size passed to munmap. Same rationale as `map_base`.
+    #[allow(dead_code)]
     pub map_size: usize,
 }
 
@@ -33,7 +38,7 @@ pub(crate) fn mmap_devmem(
     shm_base: u64,
     shm_size: u64,
 ) -> Option<ShmMmap> {
-    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+    let page_size = super::setup::host_page_size();
     let aligned_base = shm_base & !(page_size - 1);
     let offset_in_page = (shm_base - aligned_base) as usize;
     let map_size = shm_size as usize + offset_in_page;
@@ -60,150 +65,186 @@ pub(crate) fn mmap_devmem(
     })
 }
 
-/// Cached pointer to the snapshot doorbell MMIO page inside the
-/// guest's `/dev/mem` mapping. Initialised lazily on the first
-/// [`doorbell_fire`] call and reused for the lifetime of the guest
-/// process. Pointer addresses a single 4-byte slot at the host's
-/// `DOORBELL_MMIO_GPA`; the host registers an in-kernel ioeventfd
-/// at that GPA so a single 4-byte write dispatches in-kernel and
-/// signals the freeze coordinator without a userspace exit.
-#[allow(dead_code)] // Called via SnapshotBridge wiring (added by a follow-up).
-struct DoorbellPtr {
-    ptr: *mut u8,
-}
-unsafe impl Send for DoorbellPtr {}
-unsafe impl Sync for DoorbellPtr {}
-
-#[allow(dead_code)] // Called via SnapshotBridge wiring (added by a follow-up).
-static DOORBELL_PTR: std::sync::OnceLock<DoorbellPtr> = std::sync::OnceLock::new();
-
-/// Guest-only. Lazily mmap the snapshot doorbell MMIO page via
-/// `/dev/mem` and write `request_id` into the doorbell slot.
-///
-/// The host VMM registers an in-kernel ioeventfd at
-/// [`DOORBELL_MMIO_GPA`](crate::vmm::kvm::DOORBELL_MMIO_GPA) via
-/// `KVM_IOEVENTFD` with `NoDatamatch`, so any 4-byte write to this
-/// GPA dispatches inside KVM and signals the host coordinator's
-/// eventfd. The vCPU thread does NOT exit to userspace for the
-/// write itself. `request_id` is opaque to the host's eventfd
-/// dispatch (datamatch is disabled) — the value is observable to
-/// the host only via guest-memory reads of the SHM ring; this
-/// helper writes it through to the doorbell page so a future tag
-/// channel can read it back.
-///
-/// On failure (`/dev/mem` open / mmap rejected), logs a
-/// `tracing::warn!` and returns without firing — the caller's
-/// reply path will time out rather than blocking forever. This
-/// is the same recovery shape the SHM-side helpers use.
-#[allow(dead_code)] // Called via SnapshotBridge wiring (added by a follow-up).
-pub fn doorbell_fire(request_id: u32) {
-    let ptr = match DOORBELL_PTR.get() {
-        Some(p) => p.ptr,
-        None => {
-            let fd = match std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open("/dev/mem")
-            {
-                Ok(f) => f,
-                Err(e) => {
-                    tracing::warn!(error = %e, "doorbell_fire: /dev/mem open failed");
-                    return;
-                }
-            };
-            // The doorbell occupies a single 4-byte slot at the
-            // host's MMIO_GAP_START + 0x3000 (x86_64) or
-            // VIRTIO_NET_MMIO_BASE + VIRTIO_MMIO_SIZE (aarch64);
-            // mmap one page so the kernel page-aligns the request.
-            let m = match mmap_devmem(
-                std::os::unix::io::AsRawFd::as_raw_fd(&fd),
-                crate::vmm::kvm::DOORBELL_MMIO_GPA,
-                4096,
-            ) {
-                Some(m) => m,
-                None => {
-                    tracing::warn!(
-                        error = %std::io::Error::last_os_error(),
-                        "doorbell_fire: /dev/mem mmap failed"
-                    );
-                    return;
-                }
-            };
-            // Cache the page pointer; munmap on process exit is
-            // implicit. If two threads race the OnceLock the loser's
-            // mmap leaks (one page) — acceptable for an init-time
-            // path, mirroring the SHM ring's lazy-init pattern.
-            let _ = DOORBELL_PTR.set(DoorbellPtr { ptr: m.ptr });
-            // The owned File `fd` drops here; the mmap holds its
-            // own reference to the underlying inode (Linux mmap
-            // semantics) so closing the fd does not unmap the page.
-            DOORBELL_PTR.get().map(|p| p.ptr).unwrap_or(m.ptr)
-        }
-    };
-    // SAFETY: `ptr` addresses a 4-byte aligned MMIO slot inside a
-    // page-sized mmap of `/dev/mem` covering the host-registered
-    // ioeventfd target. The write_volatile is the architecture's
-    // standard MMIO store; KVM intercepts and dispatches via the
-    // ioeventfd registered by `KtstrVm::run_vm`. No alias hazard:
-    // the host coordinator polls the eventfd, never the GPA itself.
-    unsafe {
-        std::ptr::write_volatile(ptr as *mut u32, request_id);
-    }
-}
-
 /// Outcome of a guest-driven snapshot request: ok, error with reason,
-/// or transport failure (timeout / SHM unavailable / not in guest).
+/// or transport failure (port unavailable / not in guest / timeout).
 #[derive(Debug)]
 pub enum SnapshotRequestResult {
     /// Host completed the request. For
-    /// [`SHM_SNAPSHOT_KIND_CAPTURE`] this means the report was stored
-    /// on the bridge under the supplied tag; for
-    /// [`SHM_SNAPSHOT_KIND_WATCH`] this means the hardware watchpoint
-    /// was armed.
+    /// [`super::wire::SNAPSHOT_KIND_CAPTURE`] this means the report
+    /// was stored on the bridge under the supplied tag; for
+    /// [`super::wire::SNAPSHOT_KIND_WATCH`] this means the hardware
+    /// watchpoint was armed.
     Ok,
     /// Host accepted the request but completed it as a failure. The
     /// reason carries the host-supplied diagnostic text (truncated to
-    /// [`SHM_SNAPSHOT_TAG_MAX`] bytes).
+    /// [`super::wire::SNAPSHOT_REASON_MAX`] bytes).
     HostError { reason: String },
-    /// Transport failed (no SHM, called from host context, doorbell
-    /// not reachable, host did not reply within `timeout`). The
-    /// supplied diagnostic names the underlying cause.
+    /// Transport failed (called from host context, port not yet open,
+    /// host did not reply within `timeout`, malformed reply frame).
+    /// The supplied diagnostic names the underlying cause.
     TransportError { reason: String },
 }
 
 /// Monotonic guest-side request id counter. Bumped by every call to
-/// [`snapshot_request`] before publishing the request slot.
+/// [`snapshot_request`] before publishing the request frame.
 /// `AtomicU32` so concurrent requests from different guest threads do
 /// not produce duplicate ids. Wraparound past `u32::MAX` is
 /// theoretically possible after billions of requests; the host's
-/// reply-id pairing tolerates it because the comparison is equality
+/// reply pairing tolerates it because the comparison is equality
 /// against the issuer's most-recent value, not a monotonicity check.
 static SNAPSHOT_REQUEST_COUNTER: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(1);
 
 /// Mutex serialising guest-side snapshot requests. Without this two
-/// guest threads issuing `Op::Snapshot` concurrently could
-/// interleave their tag writes into the single SHM tag slot and
-/// observe each other's reply ids. The freeze coordinator's
-/// `on_demand_in_flight` latch already collapses doorbell floods to
-/// one capture per thaw on the host side; this lock keeps the
-/// guest-side request slot consistent.
+/// guest threads issuing `Op::Snapshot` concurrently could interleave
+/// their TX writes and read each other's replies. The freeze
+/// coordinator's `on_demand_in_flight` latch already collapses
+/// doorbell floods to one capture per thaw on the host side; this
+/// lock keeps the guest-side request/reply pairing well-defined too.
 static SNAPSHOT_REQUEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Guest-only. Publish a snapshot request through the SHM control
-/// slot, fire the doorbell, and block until the host stamps a
-/// matching `snapshot_reply_id` (or `timeout` elapses).
+/// Cached read-side handle on `/dev/vport0p1`. Reused across snapshot
+/// requests so the kernel's port-1 read queue refills only once per
+/// guest process. `OnceLock<Option<File>>` so a not-yet-ready open
+/// (multiport handshake still in flight) does not pin the slot to
+/// None — the next call retries.
+static BULK_PORT_READ_FD: std::sync::OnceLock<std::sync::Mutex<Option<std::fs::File>>> =
+    std::sync::OnceLock::new();
+
+/// Try to open `/dev/vport0p1` for reading (read-only, blocking).
+/// Returns `None` when the device is not yet present; the multiport
+/// handshake completes asynchronously so the read-side handle may
+/// not be available on the first `snapshot_request`.
+fn try_open_bulk_port_read() -> Option<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .open("/dev/vport0p1")
+        .ok()
+}
+
+/// Read a single TLV frame (16-byte header + payload bytes) from
+/// `/dev/vport0p1`. Returns the parsed message type and payload on
+/// success.
+///
+/// Reads the header with `read_exact`, decodes the length, then
+/// reads the payload with `read_exact`. On any I/O failure
+/// (premature EOF, EINTR, etc.) the cached handle is dropped so a
+/// subsequent call retries the open.
+///
+/// `deadline` bounds total wait time across header + payload reads:
+/// the read fd is set to non-blocking before each `read` and a
+/// `poll(POLLIN)` waits up to the remaining budget; on timeout the
+/// function returns `Err` so the caller can surface a transport
+/// failure rather than blocking forever on a wedged host.
+fn read_bulk_port_frame(
+    f: &mut std::fs::File,
+    deadline: std::time::Instant,
+) -> std::io::Result<(u32, Vec<u8>)> {
+    let mut header = [0u8; std::mem::size_of::<ShmMessage>()];
+    bounded_read_exact(f, &mut header, deadline)?;
+    let msg = ShmMessage::read_from_bytes(&header).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "ShmMessage::read_from_bytes failed (header underflow)",
+        )
+    })?;
+    let length = msg.length as usize;
+    let mut payload = vec![0u8; length];
+    if length > 0 {
+        bounded_read_exact(f, &mut payload, deadline)?;
+    }
+    let computed = crc32fast::hash(&payload);
+    if computed != msg.crc32 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "TLV CRC mismatch: header crc=0x{:08x} computed=0x{computed:08x} length={length}",
+                msg.crc32
+            ),
+        ));
+    }
+    Ok((msg.msg_type, payload))
+}
+
+/// Read exactly `buf.len()` bytes from `f`, bounded by `deadline`.
+/// Uses `poll(POLLIN)` between reads to wait without blocking past
+/// the deadline. Returns `ErrorKind::TimedOut` when the deadline
+/// expires before the read completes.
+fn bounded_read_exact(
+    f: &mut std::fs::File,
+    buf: &mut [u8],
+    deadline: std::time::Instant,
+) -> std::io::Result<()> {
+    use std::io::Read;
+    use std::os::unix::io::AsRawFd;
+    let fd = f.as_raw_fd();
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "snapshot reply deadline elapsed after reading {filled} of {} header/payload bytes",
+                    buf.len()
+                ),
+            ));
+        }
+        let remaining_ms = (deadline - now).as_millis().min(i32::MAX as u128) as i32;
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: pfd is a valid &mut to a single pollfd; nfds is 1.
+        // Every poll outcome (ready, timeout, EINTR, error) loops
+        // back to the read attempt; EINTR is harmless because the
+        // outer loop re-evaluates the deadline on every iteration.
+        let pr = unsafe { libc::poll(&mut pfd, 1, remaining_ms) };
+        if pr < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        if pr == 0 {
+            // poll timeout — re-check deadline at the loop head.
+            continue;
+        }
+        match f.read(&mut buf[filled..]) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "snapshot reply read returned 0 after {filled} of {} bytes",
+                        buf.len()
+                    ),
+                ));
+            }
+            Ok(n) => {
+                filled += n;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Guest-only. Publish a snapshot request via the virtio-console
+/// port-1 TLV stream and block reading port 1 RX until a matching
+/// [`super::wire::MsgType::SnapshotReply`] arrives (or `timeout`
+/// elapses).
 ///
 /// `kind` selects the dispatch path on the host:
-/// [`SHM_SNAPSHOT_KIND_CAPTURE`] for a capture-now request,
-/// [`SHM_SNAPSHOT_KIND_WATCH`] for a hardware-watchpoint registration.
+/// [`super::wire::SNAPSHOT_KIND_CAPTURE`] for a capture-now request,
+/// [`super::wire::SNAPSHOT_KIND_WATCH`] for a hardware-watchpoint
+/// registration.
 ///
-/// `tag` is copied into the SHM tag buffer up to
-/// [`SHM_SNAPSHOT_TAG_MAX`] bytes. Tags exceeding the bound are
-/// truncated; the host still treats the byte sequence as the request
-/// payload (the truncation is observable to the bridge as a shorter
-/// stored key for capture, or as a possibly-unresolvable symbol path
-/// for watch).
+/// `tag` is copied into the request payload's tag buffer up to
+/// [`super::wire::SNAPSHOT_TAG_MAX`] bytes. Longer tags are
+/// truncated.
 ///
 /// Returns one of [`SnapshotRequestResult`] variants. The serialised
 /// guest lock ensures only one in-flight request per process — this
@@ -213,194 +254,186 @@ pub fn snapshot_request(
     tag: &str,
     timeout: std::time::Duration,
 ) -> SnapshotRequestResult {
+    use super::wire::{
+        MSG_TYPE_SNAPSHOT_REPLY, MsgType, SNAPSHOT_REASON_MAX, SNAPSHOT_STATUS_ERR,
+        SNAPSHOT_STATUS_OK, SNAPSHOT_TAG_MAX, SnapshotReplyPayload, SnapshotRequestPayload,
+    };
+    use zerocopy::IntoBytes;
+
     if !is_guest() {
         return SnapshotRequestResult::TransportError {
-            reason: "snapshot_request called from host context (no SHM mapped, no doorbell GPA)"
+            reason: "snapshot_request called from host context (virtio-console port 1 \
+                     is reachable only from inside the guest)"
                 .into(),
-        };
-    }
-    let Ok((ptr, size)) = shm_ptr() else {
-        return SnapshotRequestResult::TransportError {
-            reason: "SHM region not initialised yet on this guest".into(),
-        };
-    };
-    if size < SNAPSHOT_REASON_OFFSET.saturating_add(SHM_SNAPSHOT_TAG_MAX) {
-        return SnapshotRequestResult::TransportError {
-            reason: format!(
-                "SHM region size {size} too small for snapshot reason buffer at offset \
-                 {SNAPSHOT_REASON_OFFSET}+{SHM_SNAPSHOT_TAG_MAX}"
-            ),
         };
     }
     let _guard = SNAPSHOT_REQUEST_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    // Allocate a request id. Skip 0 so the wait loop's `reply_id ==
-    // request_id` check cannot match the freshly-zeroed reply slot
-    // before the host has actually replied (the host writes the
-    // request_id back; the slot starts at 0 in `ShmRingHeader::new`).
+    // Allocate a request id. Skip 0 so the wait loop's `reply.request_id
+    // == request_id` check cannot accidentally match a zero-initialised
+    // reply payload from an earlier protocol version.
     let mut request_id = SNAPSHOT_REQUEST_COUNTER.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     if request_id == 0 {
         request_id = SNAPSHOT_REQUEST_COUNTER.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
+    // Build the request payload.
     let tag_bytes = tag.as_bytes();
-    let tag_len = tag_bytes.len().min(SHM_SNAPSHOT_TAG_MAX);
-    // SAFETY: `ptr` points to a `size`-byte mapping; the offsets
-    // checked above are all <= size. Volatile writes serialise
-    // against the host's volatile reads. We deliberately sequence
-    // the writes so the host never observes a partial request:
-    //   1. clear reply slot (so the wait loop cannot trip on a
-    //      stale reply id);
-    //   2. write tag bytes + trailing zeros to fill the buffer;
-    //   3. write kind;
-    //   4. write request_id last (the host's doorbell read keys
-    //      off the request_id; observing a non-zero request_id
-    //      with a stale tag/kind would dispatch the wrong handler).
-    unsafe {
-        // Clear reply id + status first.
-        ptr::write_volatile(ptr.add(SNAPSHOT_REPLY_ID_OFFSET) as *mut u32, 0);
-        ptr::write_volatile(ptr.add(SNAPSHOT_STATUS_OFFSET) as *mut u32, 0);
-        // Clear the reason buffer so a stale reason from a previous
-        // request cannot leak into a successful path's diagnostic.
-        for i in 0..SHM_SNAPSHOT_TAG_MAX {
-            ptr::write_volatile(ptr.add(SNAPSHOT_REASON_OFFSET + i), 0);
+    let tag_len = tag_bytes.len().min(SNAPSHOT_TAG_MAX);
+    let mut tag_buf = [0u8; SNAPSHOT_TAG_MAX];
+    tag_buf[..tag_len].copy_from_slice(&tag_bytes[..tag_len]);
+    let payload = SnapshotRequestPayload {
+        request_id,
+        kind,
+        tag: tag_buf,
+    };
+    // Send via the existing port-1 TX writer. `write_msg` already
+    // takes `SHM_WRITE_LOCK` internally, so this serialises with
+    // every other guest TLV producer.
+    let bytes = payload.as_bytes();
+    write_msg(MsgType::SnapshotRequest.wire_value(), bytes);
+    // Open the read side of the bulk port. Lazy because the
+    // multiport handshake completes asynchronously; the first
+    // `snapshot_request` may arrive before `/dev/vport0p1` is
+    // creatable.
+    let read_slot = BULK_PORT_READ_FD.get_or_init(|| std::sync::Mutex::new(None));
+    let mut read_guard = read_slot.lock().unwrap_or_else(|e| e.into_inner());
+    if read_guard.is_none() {
+        match try_open_bulk_port_read() {
+            Some(f) => *read_guard = Some(f),
+            None => {
+                return SnapshotRequestResult::TransportError {
+                    reason: "/dev/vport0p1 not yet readable on this guest \
+                             (multiport handshake still in flight); retry shortly"
+                        .into(),
+                };
+            }
         }
-        // Tag: write supplied bytes then zero-pad the rest of the
-        // buffer (NUL-terminator + leftover bytes from a previous
-        // longer tag).
-        for (i, b) in tag_bytes.iter().take(tag_len).enumerate() {
-            ptr::write_volatile(ptr.add(SNAPSHOT_TAG_OFFSET + i), *b);
-        }
-        for i in tag_len..SHM_SNAPSHOT_TAG_MAX {
-            ptr::write_volatile(ptr.add(SNAPSHOT_TAG_OFFSET + i), 0);
-        }
-        ptr::write_volatile(ptr.add(SNAPSHOT_KIND_OFFSET) as *mut u32, kind);
-        // Release fence so the request_id store cannot be reordered
-        // ahead of the tag/kind writes — the host's doorbell handler
-        // reads request_id first, then tag/kind, so the publishing
-        // order matters.
-        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-        ptr::write_volatile(ptr.add(SNAPSHOT_REQUEST_ID_OFFSET) as *mut u32, request_id);
     }
-    doorbell_fire(request_id);
-    // Wait for reply.
+    let f = read_guard
+        .as_mut()
+        .expect("bulk port read handle just installed");
+    // Read TLV reply frames until we observe one whose payload
+    // request_id matches ours. Frames addressed to other request ids
+    // (none in current protocol — the host only writes replies in
+    // response to a specific request) or unknown msg_types are
+    // logged + dropped.
     let deadline = std::time::Instant::now() + timeout;
-    while std::time::Instant::now() < deadline {
-        // SAFETY: ptr + offset is in-bounds per the size check above.
-        let reply_id =
-            unsafe { ptr::read_volatile(ptr.add(SNAPSHOT_REPLY_ID_OFFSET) as *const u32) };
-        if reply_id == request_id {
-            std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
-            let status =
-                unsafe { ptr::read_volatile(ptr.add(SNAPSHOT_STATUS_OFFSET) as *const u32) };
-            return match status {
-                SHM_SNAPSHOT_STATUS_OK => SnapshotRequestResult::Ok,
-                SHM_SNAPSHOT_STATUS_ERR => {
-                    let mut reason_bytes = [0u8; SHM_SNAPSHOT_TAG_MAX];
-                    for (i, byte) in reason_bytes.iter_mut().enumerate() {
-                        // SAFETY: in-bounds per size check.
-                        *byte = unsafe { ptr::read_volatile(ptr.add(SNAPSHOT_REASON_OFFSET + i)) };
-                    }
-                    let len = reason_bytes
-                        .iter()
-                        .position(|&b| b == 0)
-                        .unwrap_or(SHM_SNAPSHOT_TAG_MAX);
-                    let reason = String::from_utf8_lossy(&reason_bytes[..len]).to_string();
-                    SnapshotRequestResult::HostError { reason }
-                }
-                other => SnapshotRequestResult::TransportError {
-                    reason: format!(
-                        "host reply with unknown status {other} (expected OK={SHM_SNAPSHOT_STATUS_OK} \
-                         or ERR={SHM_SNAPSHOT_STATUS_ERR})"
-                    ),
-                },
+    loop {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return SnapshotRequestResult::TransportError {
+                reason: format!(
+                    "host did not deliver matching snapshot reply within {timeout:?} \
+                     (request_id={request_id}, kind={kind})"
+                ),
             };
         }
-        // Short sleep keeps the busy-wait off the host vCPU thread
-        // budget. The host signals reply within rendezvous + dump
-        // budget (capped at watchdog/2 by the freeze coordinator),
-        // so 5 ms cadence never adds material latency.
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
-    SnapshotRequestResult::TransportError {
-        reason: format!(
-            "host did not stamp matching reply id within {timeout:?} \
-             (request_id={request_id}, kind={kind})"
-        ),
+        let frame = match read_bulk_port_frame(f, deadline) {
+            Ok(frame) => frame,
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                return SnapshotRequestResult::TransportError {
+                    reason: format!(
+                        "snapshot reply deadline elapsed before frame complete \
+                         (request_id={request_id}, kind={kind}): {e}"
+                    ),
+                };
+            }
+            Err(e) => {
+                // I/O error on the read fd — drop the cached
+                // handle so the next call retries the open and
+                // surface the failure to the caller.
+                *read_guard = None;
+                return SnapshotRequestResult::TransportError {
+                    reason: format!(
+                        "snapshot reply read failed (request_id={request_id}): {e}"
+                    ),
+                };
+            }
+        };
+        let (msg_type, frame_payload) = frame;
+        if msg_type != MSG_TYPE_SNAPSHOT_REPLY {
+            tracing::warn!(
+                msg_type,
+                len = frame_payload.len(),
+                request_id,
+                "snapshot_request: ignoring unexpected TLV on port 1 RX (only \
+                 SnapshotReply is expected on this transport in current protocol)"
+            );
+            continue;
+        }
+        if frame_payload.len() != std::mem::size_of::<SnapshotReplyPayload>() {
+            tracing::warn!(
+                request_id,
+                got = frame_payload.len(),
+                want = std::mem::size_of::<SnapshotReplyPayload>(),
+                "snapshot_request: malformed reply payload size; ignoring"
+            );
+            continue;
+        }
+        let reply = match SnapshotReplyPayload::read_from_bytes(&frame_payload) {
+            Ok(r) => r,
+            Err(_) => {
+                tracing::warn!(
+                    request_id,
+                    "snapshot_request: SnapshotReplyPayload::read_from_bytes failed; ignoring"
+                );
+                continue;
+            }
+        };
+        if reply.request_id != request_id {
+            tracing::warn!(
+                expected = request_id,
+                got = reply.request_id,
+                "snapshot_request: stale reply id (likely a leftover from a prior \
+                 request that timed out on the guest side); ignoring"
+            );
+            continue;
+        }
+        return match reply.status {
+            SNAPSHOT_STATUS_OK => SnapshotRequestResult::Ok,
+            SNAPSHOT_STATUS_ERR => {
+                let len = reply
+                    .reason
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(SNAPSHOT_REASON_MAX);
+                let reason = String::from_utf8_lossy(&reply.reason[..len]).to_string();
+                SnapshotRequestResult::HostError { reason }
+            }
+            other => SnapshotRequestResult::TransportError {
+                reason: format!(
+                    "host reply with unknown status {other} \
+                     (expected OK={SNAPSHOT_STATUS_OK} or ERR={SNAPSHOT_STATUS_ERR})"
+                ),
+            },
+        };
     }
 }
 
 /// Magic value identifying a valid SHM ring header.
 pub const SHM_RING_MAGIC: u32 = 0x5354_4d52; // "STMR"
 
-/// Message type for stimulus events written by the guest step executor.
-pub const MSG_TYPE_STIMULUS: u32 = 0x5354_494D; // "STIM"
-
-/// Message type for scenario start marker.
-pub const MSG_TYPE_SCENARIO_START: u32 = 0x5343_5354; // "SCST"
-
-/// Message type for scenario end marker.
-pub const MSG_TYPE_SCENARIO_END: u32 = 0x5343_454E; // "SCEN"
-
-/// Message type for guest exit code (payload: 4-byte i32).
-pub const MSG_TYPE_EXIT: u32 = 0x4558_4954; // "EXIT"
-
-/// Message type for test result (payload: JSON-encoded AssertResult).
-pub const MSG_TYPE_TEST_RESULT: u32 = 0x5445_5354; // "TEST"
-
-/// Message type for scheduler process exit (payload: 4-byte i32 exit code).
-/// Written by the guest init when the scheduler child process terminates
-/// during test execution. The host monitor thread can detect this via
-/// mid-flight SHM drain and terminate the VM early instead of waiting
-/// for the full watchdog timeout.
-pub const MSG_TYPE_SCHED_EXIT: u32 = 0x5343_4458; // "SCDX"
-
-/// Message type for guest crash (payload: UTF-8 panic message + backtrace).
-/// Written by the panic hook in rust_init.rs. SHM delivery is reliable
-/// (memcpy to mapped memory) unlike serial which truncates large backtraces
-/// because the UART cannot drain fast enough before reboot.
-pub const MSG_TYPE_CRASH: u32 = 0x4352_5348; // "CRSH"
-
-/// Message type for per-payload-invocation metrics (payload: JSON-encoded
-/// [`PayloadMetrics`](crate::test_support::PayloadMetrics)). One entry
-/// per terminal `.run()` / `.wait()` / `.kill()` / `.try_wait()` on a
-/// [`PayloadRun`](crate::scenario::payload_run::PayloadRun) or
-/// [`PayloadHandle`](crate::scenario::payload_run::PayloadHandle). The
-/// host-side eval loop drains every `MSG_TYPE_PAYLOAD_METRICS` entry
-/// in order and feeds the resulting `Vec<PayloadMetrics>` to the
-/// sidecar writer so per-invocation provenance is preserved across
-/// composed payload runs.
-///
-/// For [`OutputFormat::LlmExtract`](crate::test_support::OutputFormat::LlmExtract)
-/// payloads, this carries an empty `metrics` vec — extraction runs
-/// host-side post-VM-exit on the paired
-/// [`MSG_TYPE_RAW_PAYLOAD_OUTPUT`] entry and replaces the empty vec
-/// with the extracted metrics before sidecar write.
-pub const MSG_TYPE_PAYLOAD_METRICS: u32 = 0x504d_4554; // "PMET"
-
-/// Message type for raw stdout/stderr captured from a payload that
-/// declared [`OutputFormat::LlmExtract`](crate::test_support::OutputFormat::LlmExtract).
-/// Payload: JSON-encoded
-/// [`RawPayloadOutput`](crate::test_support::RawPayloadOutput).
-///
-/// Emitted ALONGSIDE [`MSG_TYPE_PAYLOAD_METRICS`] (with empty
-/// `metrics`) so the host can pair them by `payload_index`
-/// equality. Both messages carry the same per-invocation
-/// `payload_index` allocated from the guest's per-process
-/// counter; the host's drain loop builds a
-/// `HashMap<payload_index, slot>` over `PayloadMetrics` and looks
-/// up each `RawPayloadOutput`'s index in O(1) — no reliance on SHM
-/// emission order, which would conflate a `Json` payload that
-/// produced zero numeric leaves with an LlmExtract placeholder.
-/// The host then runs `extract_via_llm` on the captured text
-/// stdout-primary with stderr-fallback, and replaces the matched
-/// PayloadMetrics' empty `metrics` vec with the extracted result.
-///
-/// LLM extraction NEVER runs in the guest: the model (~2.4 GiB) does
-/// not fit in the guest VM's available RAM, and the cache lives on
-/// the host. The guest captures raw text only and ships it across
-/// the SHM ring for host-side resolution.
-pub const MSG_TYPE_RAW_PAYLOAD_OUTPUT: u32 = 0x5241_574f; // "RAWO"
+// Message-type discriminants are defined in [`super::wire`]; the
+// SHM ring shares the same TLV format as the virtio-console bulk
+// stream so a single source of truth keeps both transports in
+// sync. These re-exports preserve the legacy `shm_ring::MSG_TYPE_*`
+// import paths used throughout the host-side drain code (eval,
+// reader, output, freeze coord). New call sites should import from
+// `super::wire` directly; the re-exports stay until the in-tree
+// migration completes.
+//
+// `#[allow(unused_imports)]` mirrors the pattern on the `NetConfig` /
+// `KVM_INTERESTING_STATS` re-exports in `vmm/mod.rs`: the lib build
+// doesn't see internal readers of every name (PROFRAW, SCENARIO_END,
+// SCENARIO_START flow only through `crate::vmm::wire` post-migration),
+// but the public path must remain reachable.
+#[allow(unused_imports)]
+pub use super::wire::{
+    MSG_TYPE_CRASH, MSG_TYPE_EXIT, MSG_TYPE_PAYLOAD_METRICS, MSG_TYPE_PROFRAW,
+    MSG_TYPE_RAW_PAYLOAD_OUTPUT, MSG_TYPE_SCENARIO_END, MSG_TYPE_SCENARIO_START,
+    MSG_TYPE_SCHED_EXIT, MSG_TYPE_STIMULUS, MSG_TYPE_TEST_RESULT,
+};
 
 /// Current header version.
 pub const SHM_RING_VERSION: u32 = 1;
@@ -429,128 +462,6 @@ pub const DUMP_REQ_OFFSET: usize = 12;
 
 /// Value written to DUMP_REQ_OFFSET to request a SysRq-D dump.
 pub const DUMP_REQ_SYSRQ_D: u8 = b'D';
-
-/// Byte offset within the SHM region for the host-to-guest stall request flag.
-/// Occupies the second byte of the `control_bytes` field in ShmRingHeader (offset 13).
-/// Host writes `STALL_REQ_ACTIVATE` to request a scheduler stall; guest polls
-/// this byte, creates /tmp/ktstr_stall, and clears it back to 0.
-pub const STALL_REQ_OFFSET: usize = 13;
-
-/// Value written to STALL_REQ_OFFSET to request a scheduler stall.
-///
-/// Consumed by the guest-side poll in `rust_init::shm_poll_loop`
-/// (src/vmm/rust_init.rs). No production host-side writer exists yet
-/// — the stall is activated by out-of-band pokes to the SHM byte
-/// during debugging sessions. The const is kept in the lib crate (not
-/// `#[cfg(test)]`) so the guest reader can reference it by name,
-/// giving the wire protocol a single source of truth: a future
-/// byte-value change at this definition automatically reaches the
-/// reader without a hand-sync step.
-pub const STALL_REQ_ACTIVATE: u8 = b'S';
-
-/// Base offset within the SHM region for numbered signal slots.
-/// Slots occupy bytes starting at offset 14 (third byte of `control_bytes`)
-/// and extending into byte 15 (fourth byte of `control_bytes`), providing
-/// 2 slots (0..1). AtomicU8 with Acquire/Release ordering.
-pub const SIGNAL_SLOT_BASE: usize = 14;
-
-/// Number of available signal slots.
-const SIGNAL_SLOT_COUNT: usize = 2;
-
-/// Value written to signal slot 0 by the host to request graceful shutdown.
-/// Distinct from the BPF map write signal (value 1) so the guest poll loop
-/// can differentiate.
-pub const SIGNAL_SHUTDOWN_REQ: u8 = 0xDD;
-
-/// Value written to slot 1 by the guest when probes are attached and the
-/// scenario is about to start. The `start_bpf_map_write` thread polls for
-/// this value before writing the crash trigger, ensuring probes capture
-/// the crash rather than missing it.
-pub const SIGNAL_PROBES_READY: u8 = 2;
-
-/// Guest-side: poll SHM slot until non-zero or timeout.
-/// Reads via AtomicU8 with Acquire ordering. The SHM mmap pointer
-/// is cached in a OnceLock, initialized from /proc/cmdline during
-/// the first call (or from `init_shm_ptr`).
-pub fn wait_for(slot: u8, timeout: std::time::Duration) -> anyhow::Result<()> {
-    assert!(
-        (slot as usize) < SIGNAL_SLOT_COUNT,
-        "signal slot {slot} out of range"
-    );
-    let (ptr, _) = shm_ptr()?;
-    let offset = SIGNAL_SLOT_BASE + slot as usize;
-    let atom = unsafe { &*(ptr.add(offset) as *const std::sync::atomic::AtomicU8) };
-    let deadline = std::time::Instant::now() + timeout;
-    while std::time::Instant::now() < deadline {
-        if atom.load(std::sync::atomic::Ordering::Acquire) != 0 {
-            return Ok(());
-        }
-        // Guest-side SHM signals are host-DRAM writes with no
-        // kernel-side event source — the host writes the byte into
-        // guest physical memory and there is no notification
-        // mechanism for guest-physical-memory mutations. KVM's MMIO
-        // / IOEVENT path doesn't apply here because the host is not
-        // invoking a vCPU exit; it's directly modifying the mapped
-        // region. Polling at 50 ms cadence is the supported
-        // mechanism. A virtio-console RX byte from the host could
-        // replace this poll, but that would require allocating a
-        // VirtioConsole on every test VM and plumbing it through —
-        // out of scope for this site.
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    anyhow::bail!("signal slot {slot} timed out after {timeout:?}")
-}
-
-/// Guest-side: set a slot to non-zero.
-/// Writes via AtomicU8 with Release ordering.
-pub fn signal(slot: u8) {
-    signal_value(slot, 1);
-}
-
-/// Host-side: write 1 to a signal slot in guest memory.
-/// `mem` provides direct access to guest DRAM;
-/// `shm_base` is the DRAM-relative offset of the SHM region.
-pub fn signal_guest(mem: &crate::monitor::reader::GuestMem, shm_base: u64, slot: u8) {
-    signal_guest_value(mem, shm_base, slot, 1);
-}
-
-/// Host-side: write an arbitrary value to a signal slot in guest memory.
-pub fn signal_guest_value(
-    mem: &crate::monitor::reader::GuestMem,
-    shm_base: u64,
-    slot: u8,
-    value: u8,
-) {
-    assert!(
-        (slot as usize) < SIGNAL_SLOT_COUNT,
-        "signal slot {slot} out of range"
-    );
-    mem.write_u8(shm_base, SIGNAL_SLOT_BASE + slot as usize, value);
-}
-
-/// Guest-side: read the current value of a signal slot.
-pub fn read_signal(slot: u8) -> u8 {
-    assert!(
-        (slot as usize) < SIGNAL_SLOT_COUNT,
-        "signal slot {slot} out of range"
-    );
-    let Ok((ptr, _)) = shm_ptr() else { return 0 };
-    let offset = SIGNAL_SLOT_BASE + slot as usize;
-    let atom = unsafe { &*(ptr.add(offset) as *const std::sync::atomic::AtomicU8) };
-    atom.load(std::sync::atomic::Ordering::Acquire)
-}
-
-/// Guest-side: set a slot to a specific value.
-pub fn signal_value(slot: u8, value: u8) {
-    assert!(
-        (slot as usize) < SIGNAL_SLOT_COUNT,
-        "signal slot {slot} out of range"
-    );
-    let Ok((ptr, _)) = shm_ptr() else { return };
-    let offset = SIGNAL_SLOT_BASE + slot as usize;
-    let atom = unsafe { &*(ptr.add(offset) as *const std::sync::atomic::AtomicU8) };
-    atom.store(value, std::sync::atomic::Ordering::Release);
-}
 
 /// Set the cached SHM base pointer and region size. Called from
 /// `shm_poll_loop` (spawned by `start_shm_poll`) in the guest init
@@ -652,25 +563,43 @@ fn assert_guest_context(fn_name: &str, msg_type: u32) -> bool {
 
 /// Guest-only. Host-side code must use `GuestMem::write_*` instead.
 ///
-/// Write a TLV message to the SHM ring using the cached mmap pointer.
-/// No-op (with a tracing warning) if invoked from a host context, and a
-/// silent no-op if SHM is not yet initialized inside the guest.
+/// Write a TLV-framed message to the host through the bulk channel
+/// (virtio-console port 1, `/dev/vport0p1`). The frame format is
+/// identical to the legacy SHM ring: 16-byte `ShmMessage` header
+/// followed by `payload.len()` bytes; the host parses the same byte
+/// stream via [`parse_tlv_stream`].
 ///
-/// Acquires `SHM_WRITE_LOCK` to serialize against concurrent writers
-/// (sched-exit-mon thread and step executor). Operates on the raw
-/// mmap pointer via volatile reads/writes — never materializes a
-/// `&mut [u8]` over the SHM region. The host monitor thread reads
-/// the same memory concurrently (`shm_drain_live`), so a `&mut [u8]`
-/// would alias the host's `&` view and violate Rust's reference
-/// rules, even though the lock serializes guest-side writers.
+/// Backpressure: the kernel's virtio_console TX path (`hvc_push` /
+/// `port_fops_write`) blocks the writer until the host's
+/// `add_used` rate catches up. There is no drop path on a full ring
+/// here — that was the SHM ring's drop semantics; port 1 trades
+/// drops for blocking writes. Callers that cannot block (panic hook,
+/// signal handlers, anything called from a critical section) MUST
+/// use [`write_msg_nonblocking`] (CRASH-only SHM fallback) instead.
+///
+/// Falls back to [`shm_write_raw`] on the SHM ring when
+/// `/dev/vport0p1` is not yet available — the bulk port appears only
+/// after the multiport handshake completes inside the kernel
+/// virtio_console driver. Early-boot writers (before the port opens)
+/// land in SHM and the host's `bulk_drain` merger picks them up via
+/// the same TLV parser.
+///
+/// `assert_guest_context` rejects host-context invocations with a
+/// `tracing::warn` so a host-side caller surfaces in the log instead
+/// of silently no-op'ing.
 pub fn write_msg(msg_type: u32, payload: &[u8]) {
     if !assert_guest_context("write_msg", msg_type) {
         return;
     }
-    let Ok((ptr, size)) = shm_ptr() else { return };
-    // Safe to re-enter: write_ptr advances only after header + payload
-    // land, so a mid-write panic cannot corrupt committed messages.
     let _guard = SHM_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if write_to_bulk_port(msg_type, payload) {
+        return;
+    }
+    // Bulk port unavailable — fall back to SHM. Same path as the
+    // historical implementation: the host's bulk_drain merges
+    // port-1 bytes with the SHM ring drain, so messages that
+    // landed here during early boot still reach the test verdict.
+    let Ok((ptr, size)) = shm_ptr() else { return };
     // SAFETY: `ptr` points to a `size`-byte mmap region that outlives
     // every guest thread (set once via `OnceLock` during init).
     unsafe { shm_write_raw(ptr, size, msg_type, payload) };
@@ -678,7 +607,16 @@ pub fn write_msg(msg_type: u32, payload: &[u8]) {
 
 /// Guest-only. Host-side code must use `GuestMem::write_*` instead.
 ///
-/// Try to write a TLV message without blocking.
+/// Try to write a TLV message without blocking. Used by the panic
+/// hook (`MSG_TYPE_CRASH`) and other critical-section callers that
+/// cannot afford to block on virtio TX backpressure.
+///
+/// Always writes to the SHM ring (NOT port 1): the kernel's
+/// virtio_console write path can block on host TX backpressure, and
+/// blocking inside a panic hook would deadlock the guest before the
+/// crash diagnostic reaches the host. SHM is shared memory with no
+/// kernel-side wait, so writes are bounded by `SHM_WRITE_LOCK`
+/// contention only.
 ///
 /// Uses `try_lock()` on `SHM_WRITE_LOCK`. If the lock is held (e.g.,
 /// the panic occurred on the thread that holds it), silently returns
@@ -705,6 +643,190 @@ pub fn write_msg_nonblocking(msg_type: u32, payload: &[u8]) -> bool {
     true
 }
 
+/// Cached `/dev/vport0p1` writer. Opened lazily on the first
+/// successful `write_to_bulk_port` call after the kernel's
+/// virtio_console driver creates the device node (post multiport
+/// handshake). `OnceLock<Option<...>>` so repeated open failures
+/// (port not yet ready) do not pin the slot to None permanently —
+/// instead we re-attempt until `try_open_bulk_port` succeeds, then
+/// cache the file handle for the rest of the process.
+static BULK_PORT_FD: std::sync::OnceLock<std::sync::Mutex<Option<std::fs::File>>> =
+    std::sync::OnceLock::new();
+
+/// Try to write a TLV-framed message to `/dev/vport0p1`. Returns
+/// true when the message was fully written, false when the bulk
+/// port is not yet available (caller should fall back to SHM) or
+/// the write failed.
+///
+/// Lazy-open semantics: the multiport handshake completes asynchronously
+/// during kernel virtio_console init, so the device node may appear
+/// any time after the first `write_msg` call. We retry the open on
+/// every call until it succeeds; once cached, subsequent writes go
+/// through the cached `File`.
+///
+/// The header and payload are submitted via `writev` with two
+/// `iovec` slices, avoiding a per-call concat allocation. `SHM_WRITE_LOCK`
+/// (held by the caller) plus the per-handle `BULK_PORT_FD` mutex
+/// serialise writers, so the in-stream order of bytes on port 1 is
+/// `[header][payload]` even though the kernel's virtio-console driver
+/// only exposes `.write` (not `.write_iter`) and `vfs_writev` therefore
+/// loops `port_fops_write` once per iovec. The host's
+/// [`super::bulk::HostAssembler`] tolerates partial frames in the byte
+/// stream, so the per-iovec virtqueue submissions reassemble correctly.
+fn write_to_bulk_port(msg_type: u32, payload: &[u8]) -> bool {
+    let slot = BULK_PORT_FD.get_or_init(|| std::sync::Mutex::new(None));
+    let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.is_none() {
+        match try_open_bulk_port() {
+            Some(f) => *guard = Some(f),
+            None => return false,
+        }
+    }
+    let f = guard.as_mut().expect("bulk port handle just installed");
+    let Ok(length_u32) = u32::try_from(payload.len()) else {
+        tracing::warn!(
+            len = payload.len(),
+            msg_type,
+            "write_to_bulk_port: payload exceeds u32::MAX; dropping"
+        );
+        return false;
+    };
+    let msg = ShmMessage {
+        msg_type,
+        length: length_u32,
+        crc32: crc32fast::hash(payload),
+        _pad: 0,
+    };
+    let header_bytes = msg.as_bytes();
+    let total = header_bytes.len() + payload.len();
+    let fd = std::os::unix::io::AsRawFd::as_raw_fd(f);
+    let mut iovs = [
+        std::io::IoSlice::new(header_bytes),
+        std::io::IoSlice::new(payload),
+    ];
+    let mut bufs: &mut [std::io::IoSlice<'_>] = &mut iovs[..];
+    let mut written: usize = 0;
+    while !bufs.is_empty() {
+        // SAFETY: `bufs` is a non-empty slice of `IoSlice<'_>`, which
+        // is `#[repr(transparent)]` over `libc::iovec` on unix targets.
+        // Casting `*const IoSlice` to `*const libc::iovec` is sound.
+        // `fd` is a borrowed raw fd from the cached `File`; the
+        // `File` outlives the syscall because `guard` keeps it owned.
+        let r = unsafe {
+            libc::writev(
+                fd,
+                bufs.as_ptr() as *const libc::iovec,
+                bufs.len() as libc::c_int,
+            )
+        };
+        if r < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            tracing::warn!(
+                %err,
+                msg_type,
+                len = payload.len(),
+                "write_to_bulk_port: writev failed"
+            );
+            // Drop the cached handle so the next call retries the open
+            // (the device may have transiently closed during a guest
+            // reset path).
+            *guard = None;
+            return false;
+        }
+        if r == 0 {
+            // `writev` returning 0 with no error is unexpected for a
+            // char device; treat as an EOF-like failure.
+            tracing::warn!(
+                msg_type,
+                len = payload.len(),
+                written,
+                total,
+                "write_to_bulk_port: writev returned 0"
+            );
+            *guard = None;
+            return false;
+        }
+        let n = r as usize;
+        written += n;
+        std::io::IoSlice::advance_slices(&mut bufs, n);
+    }
+    debug_assert_eq!(written, total);
+    true
+}
+
+/// Try to open `/dev/vport0p1` for writing. Returns None when the
+/// device is not yet present — the kernel virtio_console driver
+/// creates it only after the host emits PORT_OPEN on the c_ivq for
+/// port 1 and the kernel's `find_port_by_id` resolves the
+/// `/sys/class/virtio-ports/vport0p1` entry.
+///
+/// Open mode: write-only, blocking. The kernel's `port_fops_write`
+/// path blocks the writer when the host's `add_used` rate lags;
+/// that's the backpressure mechanism we want — it replaces the SHM
+/// ring's drop semantics.
+fn try_open_bulk_port() -> Option<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/vport0p1")
+        .ok()
+}
+
+/// Host-side TLV parser for the bulk-port byte stream. The guest
+/// emits frames identical to the SHM ring's format: 16-byte
+/// `ShmMessage` header (msg_type, length, crc32, _pad) followed by
+/// `length` payload bytes. This walks the buffer end-to-end and
+/// returns a [`ShmDrainResult`] with one [`ShmEntry`] per complete
+/// frame, leaving partial trailing frames untouched. The freeze
+/// coordinator pushes its `bulk_assembler`'s residual partial-frame
+/// bytes back into the device's `port1_tx_buf` before exit (see
+/// [`super::virtio_console::VirtioConsole::push_back_bulk`]); the
+/// end-of-run `drain_bulk` here therefore returns those residual
+/// bytes plus any bytes the guest wrote after the last mid-run
+/// drain, and this walker assembles them in order.
+///
+/// Per-frame CRC is computed and compared against the guest's
+/// stored value. A CRC mismatch sets `crc_ok=false` on that entry
+/// but does not break the walk — subsequent frames are still
+/// parsed.
+///
+/// `drops` is always 0: the bulk port has no drop semantics
+/// (backpressure replaces them). The field is kept on
+/// `ShmDrainResult` so existing host-side consumers compile; SHM
+/// drains still report ring-full drops where applicable.
+pub fn parse_tlv_stream(buf: &[u8]) -> ShmDrainResult {
+    let mut entries = Vec::new();
+    let mut pos = 0usize;
+    while pos.saturating_add(MSG_HEADER_SIZE) <= buf.len() {
+        let hdr_end = pos + MSG_HEADER_SIZE;
+        let hdr_slice = &buf[pos..hdr_end];
+        let Ok(msg) = ShmMessage::read_from_bytes(hdr_slice) else {
+            // Cannot happen — slice is exactly MSG_HEADER_SIZE bytes
+            // and ShmMessage is FromBytes. Defensive break.
+            break;
+        };
+        // Reject torn-frame lengths the same way `shm_drain` does:
+        // any length larger than the buffer remainder cannot be a
+        // complete frame from the writer (`write_all` is atomic per
+        // call), so stop parsing rather than allocating a huge vec.
+        if (msg.length as usize) > buf.len().saturating_sub(hdr_end) {
+            break;
+        }
+        let payload_end = hdr_end + msg.length as usize;
+        let payload = buf[hdr_end..payload_end].to_vec();
+        let computed_crc = crc32fast::hash(&payload);
+        entries.push(ShmEntry {
+            msg_type: msg.msg_type,
+            payload,
+            crc_ok: computed_crc == msg.crc32,
+        });
+        pos = payload_end;
+    }
+    ShmDrainResult { entries, drops: 0 }
+}
+
 /// Wrapper for a raw pointer + size that is Send+Sync.
 /// SAFETY: The SHM pointer is set once via OnceLock during init and
 /// points into a /dev/mem mmap that outlives all guest threads.
@@ -718,9 +840,10 @@ unsafe impl Sync for ShmPtr {}
 /// Cached SHM mmap pointer for guest-side signal operations.
 static SHM_PTR: std::sync::OnceLock<ShmPtr> = std::sync::OnceLock::new();
 
-/// Mutex serializing guest-side SHM ring writes. Prevents the sched-exit-mon
-/// thread (write_msg) and the step executor (ShmWriter::write) from
-/// concurrently modifying the ring's write_ptr.
+/// Mutex serializing guest-side SHM ring writes. Every guest writer
+/// (`write_msg`, `write_msg_nonblocking`) takes this lock before
+/// touching `write_ptr`, so the SHM-ring fallback path is safe across
+/// the sched-exit-mon thread, the step executor, and the panic hook.
 pub static SHM_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Get the cached SHM mmap pointer and size, initializing from
@@ -815,12 +938,12 @@ pub struct ShmRingHeader {
     pub capacity: u32,
     /// Packed host→guest control bytes — NOT padding despite being
     /// declared as `u32` for alignment. Byte 0 = `DUMP_REQ_OFFSET`
-    /// (SysRq-D dump trigger), byte 1 = `STALL_REQ_OFFSET` (scheduler
-    /// stall trigger), bytes 2-3 = `SIGNAL_SLOT_BASE + {0, 1}` (2
-    /// indexed `AtomicU8` signal slots). Read/written byte-wise with
-    /// `Acquire`/`Release` ordering via the `*_OFFSET` / `*_BASE`
-    /// constants above; the `u32` spelling exists only so the header
-    /// remains a plain POD for zerocopy derive.
+    /// (SysRq-D dump trigger). Bytes 1-3 are unused; every other
+    /// host→guest signal travels via the virtio-console wake-byte
+    /// channel rather than packed SHM bytes. Byte 0 is read/written
+    /// byte-wise via the `DUMP_REQ_OFFSET` constant above; the `u32`
+    /// spelling exists only so the header remains a plain POD for
+    /// zerocopy derive.
     pub control_bytes: u32,
     /// Total bytes written by the guest (monotonic).
     pub write_ptr: u64,
@@ -951,36 +1074,16 @@ impl ShmRingHeader {
     }
 }
 
-/// TLV message header preceding each payload in the ring.
-///
-/// CRC32 covers only the payload bytes (not this header).
-#[repr(C)]
-#[derive(
-    Clone, Copy, Default, FromBytes, IntoBytes, zerocopy::Immutable, zerocopy::KnownLayout,
-)]
-pub struct ShmMessage {
-    pub msg_type: u32,
-    pub length: u32,
-    pub crc32: u32,
-    pub _pad: u32,
-}
-
-const _MSG_SIZE: () = assert!(std::mem::size_of::<ShmMessage>() == 16);
+// `ShmMessage` and `ShmEntry` live in [`super::wire`]. The SHM ring
+// uses the same TLV header layout as the virtio-console bulk
+// stream, so a single source of truth keeps both transports in
+// sync. Re-export under the legacy `shm_ring::` paths.
+pub use super::wire::{ShmEntry, ShmMessage};
 
 /// Size of the ShmRingHeader.
 pub const HEADER_SIZE: usize = std::mem::size_of::<ShmRingHeader>();
 /// Size of the ShmMessage TLV header.
 pub const MSG_HEADER_SIZE: usize = std::mem::size_of::<ShmMessage>();
-
-/// A parsed message from the ring buffer.
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct ShmEntry {
-    pub msg_type: u32,
-    pub payload: Vec<u8>,
-    /// True if the CRC32 matched.
-    pub crc_ok: bool,
-}
 
 /// Result of draining the ring buffer.
 #[derive(Debug, Clone, Default)]
@@ -2186,12 +2289,6 @@ mod tests {
     }
 
     #[test]
-    fn stall_req_offset_in_control_bytes() {
-        assert_eq!(STALL_REQ_OFFSET, 13);
-        assert_eq!(STALL_REQ_ACTIVATE, b'S');
-    }
-
-    #[test]
     fn stimulus_event_from_exact_size_payload() {
         let payload = StimulusPayload {
             elapsed_ms: 42,
@@ -2365,105 +2462,6 @@ mod tests {
         let result = shm_drain(&buf, 0);
         assert_eq!(result.entries.len(), 3);
         assert_eq!(result.drops, 1);
-    }
-
-    // ---- signal_guest_value edge-case offsets ---------------------
-    //
-    // `signal_guest_value` writes one byte at
-    // `shm_base + SIGNAL_SLOT_BASE + slot` via `GuestMem::write_u8`,
-    // which is the bounds-checked entry point. These tests pin the
-    // host-side signal API against the boundary cases of the
-    // GuestMem mapping it sits inside.
-
-    #[test]
-    fn signal_guest_value_writes_to_correct_slot() {
-        // Lay out: [pre-shm bytes] [SHM region]. shm_base is the
-        // offset of the SHM region within the GuestMem mapping.
-        // Slot 0 lands at shm_base + SIGNAL_SLOT_BASE; slot 1 lands
-        // at the next byte.
-        let shm_base: u64 = 64;
-        let total: u64 = shm_base + 32;
-        let mut buf = vec![0u8; total as usize];
-        // SAFETY: buf outlives the GuestMem use.
-        let mem = unsafe { crate::monitor::reader::GuestMem::new(buf.as_mut_ptr(), total) };
-        signal_guest_value(&mem, shm_base, 0, SIGNAL_SHUTDOWN_REQ);
-        signal_guest_value(&mem, shm_base, 1, SIGNAL_PROBES_READY);
-        assert_eq!(
-            buf[shm_base as usize + SIGNAL_SLOT_BASE],
-            SIGNAL_SHUTDOWN_REQ
-        );
-        assert_eq!(
-            buf[shm_base as usize + SIGNAL_SLOT_BASE + 1],
-            SIGNAL_PROBES_READY
-        );
-    }
-
-    #[test]
-    fn signal_guest_value_at_zero_shm_base() {
-        // shm_base = 0: slot bytes land at SIGNAL_SLOT_BASE and
-        // SIGNAL_SLOT_BASE + 1 from the start of the mapping.
-        let mut buf = vec![0u8; 32];
-        let len = buf.len() as u64;
-        // SAFETY: buf outlives the GuestMem use.
-        let mem = unsafe { crate::monitor::reader::GuestMem::new(buf.as_mut_ptr(), len) };
-        signal_guest_value(&mem, 0, 0, 0xAB);
-        signal_guest_value(&mem, 0, 1, 0xCD);
-        assert_eq!(buf[SIGNAL_SLOT_BASE], 0xAB);
-        assert_eq!(buf[SIGNAL_SLOT_BASE + 1], 0xCD);
-    }
-
-    #[test]
-    fn signal_guest_value_at_exact_boundary_succeeds() {
-        // GuestMem sized so the last slot byte is the very last
-        // byte of the mapping. write_u8's bounds check
-        // (`addr + 1 > size`) admits exactly this position.
-        let shm_base: u64 = 0;
-        // Last slot is at SIGNAL_SLOT_BASE + 1 (slot index 1).
-        // Size the mapping so that byte sits at size - 1.
-        let total: u64 = (SIGNAL_SLOT_BASE + 2) as u64;
-        let mut buf = vec![0u8; total as usize];
-        // SAFETY: buf outlives the GuestMem use.
-        let mem = unsafe { crate::monitor::reader::GuestMem::new(buf.as_mut_ptr(), total) };
-        signal_guest_value(&mem, shm_base, 1, 0xEE);
-        assert_eq!(buf[SIGNAL_SLOT_BASE + 1], 0xEE);
-    }
-
-    #[test]
-    fn signal_guest_value_past_boundary_is_noop() {
-        // shm_base places the slot byte past the GuestMem size.
-        // GuestMem.write_u8 silently noops; the backing buffer is
-        // unmodified. This covers the defensive path: a misconfigured
-        // shm_base must not corrupt host memory past the declared
-        // GuestMem size.
-        let total: u64 = 32;
-        let mut buf = vec![0xAAu8; (total + 64) as usize]; // sentinel
-        // Declare a mapping smaller than the underlying buffer so we
-        // can detect any write that would have escaped the bounds.
-        // SAFETY: buf is larger than `total`; the in-bounds writes
-        // stay within `buf` and the out-of-bounds case must noop.
-        let mem = unsafe { crate::monitor::reader::GuestMem::new(buf.as_mut_ptr(), total) };
-        // shm_base 32 + SIGNAL_SLOT_BASE 14 + slot 0 = 46, which
-        // is past the declared size of 32.
-        signal_guest_value(&mem, 32, 0, 0xFF);
-        // Buffer bytes past the declared size remain at their
-        // sentinel value 0xAA — write_u8 dropped silently.
-        assert!(buf.iter().all(|&b| b == 0xAA));
-    }
-
-    #[test]
-    fn signal_guest_value_offset_only_partially_in_bounds_is_noop() {
-        // shm_base is in-bounds, but shm_base + SIGNAL_SLOT_BASE +
-        // slot crosses the boundary. write_u8 must combine pa and
-        // offset before the bounds check, not check pa alone.
-        let total: u64 = (SIGNAL_SLOT_BASE + 1) as u64; // 15
-        let mut buf = vec![0u8; (total + 64) as usize];
-        // SAFETY: buf is larger than `total`; in-bounds writes are
-        // within buf and out-of-bounds writes are dropped.
-        let mem = unsafe { crate::monitor::reader::GuestMem::new(buf.as_mut_ptr(), total) };
-        // shm_base = 1, SIGNAL_SLOT_BASE = 14, slot = 0
-        // -> addr 15, addr + 1 = 16 > 15 -> noop.
-        signal_guest_value(&mem, 1, 0, 0x77);
-        assert!(buf.iter().all(|&b| b == 0));
     }
 
     // ---- read_ring_volatile multi-region routing -------------------

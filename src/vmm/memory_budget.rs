@@ -364,6 +364,59 @@ mod tests {
         assert!(result.is_err(), "truncated file must fail; got: {result:?}",);
     }
 
+    /// `read_kernel_init_size` on aarch64 reads a raw PE Image: 8 bytes
+    /// of `image_size` at file offset 16 (after `code0` at 0 and
+    /// `text_offset` at 8). Construct a tempfile that does NOT begin
+    /// with the gzip magic (0x1f 0x8b) so the function takes the raw
+    /// PE Image branch, then assert the function returns the value at
+    /// offset 16 as u64 little-endian. Pins the byte-offset and width
+    /// against a future drift in the arm64 image header layout
+    /// (Documentation/arch/arm64/booting.rst, struct arm64_image_header
+    /// in arch/arm64/include/asm/image.h).
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn read_kernel_init_size_aarch64_reads_offset_16() {
+        use std::io::Write;
+
+        let mut f = tempfile::NamedTempFile::new().expect("tempfile");
+        // First 16 bytes: code0 + text_offset, neither of which is the
+        // gzip magic 0x1f 0x8b. Use a recognizable non-gzip prefix so
+        // a wrong-branch read (decompressing as gzip) would error
+        // immediately.
+        let prefix = [0u8; 16];
+        f.write_all(&prefix).expect("write prefix");
+        // Distinct value, large enough that a wrong-offset read would
+        // yield zero (the surrounding zero pad).
+        let image_size: u64 = 0x1234_5678_9abc_def0;
+        f.write_all(&image_size.to_le_bytes())
+            .expect("write image_size");
+        f.flush().expect("flush");
+
+        let got = read_kernel_init_size(f.path()).expect("read image_size");
+        assert_eq!(got, image_size);
+    }
+
+    /// Reading a file shorter than 24 bytes (offset 16 + 8 bytes of
+    /// image_size) on aarch64 must surface an error rather than
+    /// silently returning 0. Mirror of the x86_64 short-file test:
+    /// pin the failure shape so a future "graceful-fallback" refactor
+    /// that swallows truncated-Image errors can't slip past review.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn read_kernel_init_size_aarch64_short_file_errors() {
+        use std::io::Write;
+
+        let mut f = tempfile::NamedTempFile::new().expect("tempfile");
+        // Only 8 bytes — well short of the 24 needed (offset 16 + 8).
+        // Also avoids the gzip magic so the raw-Image branch fires.
+        let truncated = vec![0u8; 8];
+        f.write_all(&truncated).expect("write truncated");
+        f.flush().expect("flush");
+
+        let result = read_kernel_init_size(f.path());
+        assert!(result.is_err(), "truncated file must fail; got: {result:?}",);
+    }
+
     /// Helper: an all-zero MemoryBudget for spread-syntax in tests.
     fn zero_budget() -> MemoryBudget {
         MemoryBudget {

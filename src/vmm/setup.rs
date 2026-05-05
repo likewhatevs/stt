@@ -42,11 +42,46 @@ const INITRD_ADDR: u64 = 0x800_0000; // 128 MB
 /// Compute initramfs load address at the high end of DRAM, just below
 /// the FDT. Matches Firecracker/Cloud Hypervisor placement pattern —
 /// avoids conflicts with early kernel allocations near the kernel image.
+///
+/// Aligned to the host page size (not a hardcoded 4 KB). On Apple
+/// Silicon hosts the kernel runs with 16 KB pages and the COW
+/// `MAP_FIXED` mmap rejects targets that aren't host-page-aligned
+/// with `EINVAL` — a 4 KB-aligned guest address that happens to fall
+/// mid-host-page would clobber unrelated mappings if the kernel
+/// accepted it, so the kernel correctly refuses. Round down here so
+/// the overlay path reaches `mmap` with a valid alignment regardless
+/// of host page size.
 #[cfg(target_arch = "aarch64")]
 fn aarch64_initrd_addr(memory_mb: u32, shm_size: u64, initrd_max_size: u64) -> u64 {
     let fdt_addr = aarch64::fdt::fdt_address(memory_mb, shm_size);
-    // Place initrd just below FDT, page-aligned.
-    (fdt_addr - initrd_max_size) & !0xFFF
+    let page_size = host_page_size();
+    let mask = !(page_size - 1);
+    // Place initrd just below FDT, host-page-aligned.
+    let load_addr = (fdt_addr - initrd_max_size) & mask;
+    assert!(
+        load_addr >= kvm::DRAM_START,
+        "initrd load address underflows DRAM_START"
+    );
+    load_addr
+}
+
+/// Host page size in bytes. Reads from `sysconf(_SC_PAGESIZE)` once
+/// per process and caches the result via `OnceLock`; subsequent calls
+/// hit the cache. The kernel reports the actual MMU page size (4 KB
+/// on x86_64 / common aarch64, 16 KB on Apple Silicon and some
+/// aarch64 server SKUs). Falls back to 4 KB only when `sysconf`
+/// returns an error code (≤0), which would itself indicate a libc bug
+/// — the fallback exists so a downstream alignment computation never
+/// produces 0.
+pub(crate) fn host_page_size() -> u64 {
+    static CACHED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        // SAFETY: sysconf is a thread-safe libc function that takes a
+        // constant integer argument and returns a long. No invariants
+        // on the caller side.
+        let sz = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if sz > 0 { sz as u64 } else { 0x1000 }
+    })
 }
 
 /// Build the auto-mount cmdline tokens for one disk. Returns an
@@ -511,7 +546,6 @@ impl KtstrVm {
     /// guard onto `vm` transfers ownership to the VM, where Drop
     /// order is structurally enforced (guard drops AFTER
     /// `_reservation` munmaps the COW VMAs).
-    #[cfg(target_arch = "x86_64")]
     fn compress_and_load_initrd(
         &self,
         vm: &mut kvm::KtstrKvm,
@@ -618,6 +652,13 @@ impl KtstrVm {
     /// Join the initramfs thread and load the result into guest memory.
     /// Memory must already be allocated (non-deferred path). Validates
     /// that allocated memory is sufficient for the initramfs.
+    ///
+    /// x86_64-only: aarch64 uses
+    /// [`Self::join_and_load_initramfs_aarch64`], which computes the
+    /// FDT-relative load address from the compressed size after the
+    /// suffix is built (the address depends on `memory_mb` AND the
+    /// total compressed size, neither of which is known until after
+    /// the suffix and compression run).
     #[cfg(target_arch = "x86_64")]
     fn join_and_load_initramfs(
         &self,
@@ -681,6 +722,12 @@ impl KtstrVm {
     /// size, allocate guest memory, then load initramfs.
     ///
     /// Returns `(initrd_addr, initrd_size, memory_mb)`.
+    ///
+    /// x86_64-only: aarch64 uses
+    /// [`Self::join_compute_memory_and_load_aarch64`], which orders
+    /// the load_addr computation after `allocate_and_register_memory`
+    /// (the FDT-relative initrd address depends on `memory_mb`,
+    /// which is itself computed from the post-compress total size).
     #[cfg(target_arch = "x86_64")]
     fn join_compute_memory_and_load(
         &self,
@@ -762,7 +809,6 @@ impl KtstrVm {
 
     /// Get or build the compressed base. Checks LZ4 SHM first, then
     /// compresses and stores.
-    #[cfg(target_arch = "x86_64")]
     fn get_or_compress_base(&self, base_bytes: &[u8], key: &BaseKey) -> Result<Vec<u8>> {
         // Try loading compressed base from LZ4 SHM.
         if let Some((fd, len)) = initramfs::shm_open_lz4(key.0) {
@@ -815,7 +861,6 @@ impl KtstrVm {
     /// (typically the VM lifetime). Validates the segment starts with
     /// LZ4 legacy magic to reject stale data from a previous
     /// compression format.
-    #[cfg(target_arch = "x86_64")]
     fn try_cow_overlay(
         &self,
         guest_mem: &GuestMemoryMmap,
@@ -872,18 +917,70 @@ impl KtstrVm {
             initramfs::shm_close_fd(fd);
             return None;
         }
-        // Bounds-check [load_addr, load_addr + len) against guest
-        // memory BEFORE the MAP_FIXED mmap. `get_host_address` only
-        // validates the start address — without a length check,
+        // The MAP_FIXED mmap rounds `len` up to the next host page
+        // boundary internally — Apple Silicon kernels run with 16 KB
+        // pages, so a 5000-byte segment mapped against a 16 KB-page
+        // host actually clobbers 16384 bytes of host VA. Bounds-check
+        // against the rounded-up length so we don't accept a mapping
+        // that overruns the guest region, and reject load_addr that
+        // isn't host-page-aligned (mmap returns EINVAL otherwise).
+        #[cfg(target_arch = "aarch64")]
+        let host_page = host_page_size();
+        // x86_64 hosts always run with 4 KB pages, and the call sites
+        // page-align load_addr to 4 KB; the rounded-up length matches
+        // `len` exactly. Use the constant instead of paying for a
+        // sysconf(2) on every overlay attempt.
+        #[cfg(target_arch = "x86_64")]
+        let host_page: u64 = 0x1000;
+        if load_addr & (host_page - 1) != 0 {
+            tracing::debug!(
+                load_addr = format!("{:#x}", load_addr),
+                host_page,
+                "cow_overlay: load_addr not host-page-aligned, falling back"
+            );
+            initramfs::shm_close_fd(fd);
+            return None;
+        }
+        let rounded_len = (len as u64)
+            .checked_add(host_page - 1)
+            .map(|v| v & !(host_page - 1));
+        let Some(rounded_len) = rounded_len else {
+            tracing::debug!(
+                load_addr = format!("{:#x}", load_addr),
+                len,
+                "cow_overlay: rounded length overflows u64, falling back"
+            );
+            initramfs::shm_close_fd(fd);
+            return None;
+        };
+        // Bounds-check [load_addr, load_addr + rounded_len) against
+        // guest memory BEFORE the MAP_FIXED mmap. `get_host_address`
+        // only validates the start address — without a length check,
         // MAP_FIXED would silently overwrite whatever host VA happens
         // to follow the region (other guest regions, reserved VA, or
         // unrelated mappings). `get_slice` fails if the range extends
         // past the region's end or spans a region boundary, which is
         // exactly the guarantee MAP_FIXED needs.
-        if guest_mem.get_slice(GuestAddress(load_addr), len).is_err() {
+        let rounded_usize = match usize::try_from(rounded_len) {
+            Ok(v) => v,
+            Err(_) => {
+                tracing::debug!(
+                    load_addr = format!("{:#x}", load_addr),
+                    rounded_len,
+                    "cow_overlay: rounded length exceeds usize, falling back"
+                );
+                initramfs::shm_close_fd(fd);
+                return None;
+            }
+        };
+        if guest_mem
+            .get_slice(GuestAddress(load_addr), rounded_usize)
+            .is_err()
+        {
             tracing::debug!(
                 load_addr = format!("{:#x}", load_addr),
                 len,
+                rounded_len,
                 "cow_overlay: range exceeds guest memory region, falling back"
             );
             initramfs::shm_close_fd(fd);
@@ -1208,6 +1305,16 @@ impl KtstrVm {
 impl KtstrVm {
     /// Allocate and register guest memory regions for aarch64, including
     /// NUMA-aware placement.
+    ///
+    /// Uses the same LZ4 SHM compress cache and COW overlay path as the
+    /// x86_64 [`Self::setup_memory`] flow. The shared helpers
+    /// ([`Self::get_or_compress_base`], [`Self::compress_and_load_initrd`],
+    /// [`Self::try_cow_overlay`]) are arch-neutral; this function differs
+    /// from the x86_64 driver only in (a) computing the initrd load
+    /// address from the dynamic FDT placement (`aarch64_initrd_addr`)
+    /// instead of the fixed `INITRD_ADDR`, and (b) handing off to
+    /// `finish_aarch64_setup` for FDT writing instead of boot_params /
+    /// ACPI emission.
     pub(super) fn setup_memory_aarch64(
         &self,
         vm: &mut kvm::KtstrKvm,
@@ -1215,90 +1322,189 @@ impl KtstrVm {
         initramfs_handle: Option<JoinHandle<Result<(BaseRef, BaseKey)>>>,
     ) -> Result<boot::KernelLoadResult> {
         // Deferred memory path for aarch64.
-        let kernel_result = if let Some(kr) = kernel_result {
-            kr
+        let (kernel_result, initrd_addr, initrd_size) = if let Some(kr) = kernel_result {
+            // Non-deferred: memory already allocated, kernel already loaded.
+            // compress_and_load_initrd transfers the CowOverlayGuard
+            // directly onto vm.cow_overlay_guards before any fallible
+            // operation, so a mid-function `?` cannot drop the guard
+            // before the COW VMAs are torn down.
+            let (initrd_addr, initrd_size) = match initramfs_handle {
+                Some(handle) => {
+                    // `self.memory_mb` is required on the non-deferred
+                    // path: deferred boots take the early-return branch
+                    // below, so we only reach this site after the builder
+                    // accepted a concrete `memory_mb`. Surface it as an
+                    // error rather than `unwrap()` so a future refactor
+                    // that drops the deferred guard fails loudly with an
+                    // actionable diagnostic instead of an opaque panic.
+                    let memory_mb = self.memory_mb.context(
+                        "internal: non-deferred aarch64 path requires memory_mb to be set",
+                    )?;
+                    self.join_and_load_initramfs_aarch64(vm, handle, memory_mb)?
+                }
+                None => (None, None),
+            };
+            (kr, initrd_addr, initrd_size)
         } else {
-            // Join initramfs to learn actual size, then allocate memory.
-            if let Some(handle) = initramfs_handle {
-                let (base, _key) = handle
-                    .join()
-                    .map_err(|_| anyhow::anyhow!("initramfs-resolve thread panicked"))??;
-                let base_bytes: &[u8] = base.as_ref();
-                let suffix = initramfs::build_suffix(base_bytes.len(), &self.suffix_params())?;
-                let uncompressed_size = base_bytes.len() + suffix.len();
+            // Deferred memory path: join initramfs first to learn its
+            // size, allocate memory, then load kernel and initramfs.
+            let (initrd_addr, initrd_size) = match initramfs_handle {
+                Some(handle) => self.join_compute_memory_and_load_aarch64(vm, handle)?,
+                None => {
+                    // No initramfs — allocate minimum memory.
+                    let memory_mb = 256u32;
+                    vm.allocate_and_register_memory(memory_mb)
+                        .context("allocate deferred memory (no initramfs, aarch64)")?;
+                    (None, None)
+                }
+            };
 
-                // Compress before computing memory so the formula uses
-                // actual compressed size.
-                let initrd_data = initramfs::lz4_compress_combined(base_bytes, &suffix);
-                let total_size = initrd_data.len() as u64;
+            // Load kernel into the freshly allocated memory.
+            let t0 = Instant::now();
+            let kr =
+                boot::load_kernel(&vm.guest_mem, &self.kernel).context("load kernel (aarch64)")?;
+            tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "load_kernel");
 
-                let kernel_init_size = read_kernel_init_size(&self.kernel).unwrap_or(0);
-                let budget = MemoryBudget {
-                    uncompressed_initramfs_bytes: uncompressed_size as u64,
-                    compressed_initrd_bytes: total_size,
-                    kernel_init_size,
-                    shm_bytes: self.shm_size,
-                };
-                let memory_mb = initramfs_min_memory_mb(&budget).max(self.memory_min_mb);
-
-                vm.allocate_and_register_memory(memory_mb)
-                    .with_context(|| {
-                        format!("allocate deferred memory ({memory_mb}MB, aarch64)")
-                    })?;
-
-                // Load kernel.
-                let kr = boot::load_kernel(&vm.guest_mem, &self.kernel)
-                    .context("load kernel (aarch64)")?;
-                let load_addr = aarch64_initrd_addr(memory_mb, self.shm_size, total_size);
-                initramfs::load_initramfs_parts(&vm.guest_mem, &[&initrd_data], load_addr)?;
-
-                // Early-return into finish_aarch64_setup so the
-                // deferred path shares the cmdline / FDT assembly
-                // with the non-deferred branch below. The shared
-                // helper takes the kernel_result + initrd metadata
-                // we just produced and writes the cmdline, FDT, and
-                // SHM ring on the same code path the non-deferred
-                // case takes after its `let kernel_result = if ...`
-                // bind resolves.
-                return self.finish_aarch64_setup(vm, kr, Some(load_addr), Some(total_size as u32));
-            } else {
-                let memory_mb = 256u32;
-                vm.allocate_and_register_memory(memory_mb)
-                    .context("allocate deferred memory (no initramfs, aarch64)")?;
-                let kr = boot::load_kernel(&vm.guest_mem, &self.kernel)
-                    .context("load kernel (aarch64)")?;
-                return self.finish_aarch64_setup(vm, kr, None, None);
-            }
-        };
-
-        // Non-deferred path: memory already allocated, kernel already loaded.
-        let (initrd_addr, initrd_size) = match initramfs_handle {
-            Some(handle) => {
-                // `self.memory_mb` is required on the non-deferred
-                // path: deferred boots take the early-return branches
-                // above, so we only reach this site after the builder
-                // accepted a concrete `memory_mb`. Surface it as an
-                // error rather than `unwrap()` so a future refactor
-                // that drops the deferred guard fails loudly with an
-                // actionable diagnostic instead of an opaque panic.
-                let memory_mb = self
-                    .memory_mb
-                    .context("internal: non-deferred aarch64 path requires memory_mb to be set")?;
-                let (base, _key) = handle
-                    .join()
-                    .map_err(|_| anyhow::anyhow!("initramfs-resolve thread panicked"))??;
-                let base_bytes: &[u8] = base.as_ref();
-                let suffix = initramfs::build_suffix(base_bytes.len(), &self.suffix_params())?;
-                let initrd_data = initramfs::lz4_compress_combined(base_bytes, &suffix);
-                let total_size = initrd_data.len() as u64;
-                let load_addr = aarch64_initrd_addr(memory_mb, self.shm_size, total_size);
-                initramfs::load_initramfs_parts(&vm.guest_mem, &[&initrd_data], load_addr)?;
-                (Some(load_addr), Some(total_size as u32))
-            }
-            None => (None, None),
+            (kr, initrd_addr, initrd_size)
         };
 
         self.finish_aarch64_setup(vm, kernel_result, initrd_addr, initrd_size)
+    }
+
+    /// Non-deferred aarch64 initramfs load: join handle, build suffix,
+    /// compress base+suffix via the LZ4 SHM cache to learn the
+    /// compressed size, validate that `memory_mb` is sufficient, compute
+    /// the FDT-relative load address, then COW-or-copy the compressed
+    /// stream into guest memory via the shared
+    /// [`Self::compress_and_load_initrd`] path.
+    fn join_and_load_initramfs_aarch64(
+        &self,
+        vm: &mut kvm::KtstrKvm,
+        handle: JoinHandle<Result<(BaseRef, BaseKey)>>,
+        memory_mb: u32,
+    ) -> Result<(Option<u64>, Option<u32>)> {
+        let t0 = Instant::now();
+        let (base, key) = handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("initramfs-resolve thread panicked"))??;
+        tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "initramfs_join");
+        let base_bytes: &[u8] = base.as_ref();
+
+        let t0 = Instant::now();
+        let suffix = initramfs::build_suffix(base_bytes.len(), &self.suffix_params())?;
+        let uncompressed_size = base_bytes.len() + suffix.len();
+        tracing::debug!(
+            elapsed_us = t0.elapsed().as_micros(),
+            base_bytes = base_bytes.len(),
+            suffix_bytes = suffix.len(),
+            "build_suffix",
+        );
+
+        // Compress to learn the compressed size for the load_addr
+        // calculation. Primes the LZ4 SHM cache so the subsequent
+        // compress_and_load_initrd call hits the cache instead of
+        // recompressing.
+        let lz4_base = self.get_or_compress_base(base_bytes, &key)?;
+        let lz4_suffix = initramfs::lz4_legacy_compress(&suffix);
+        let compressed_size = lz4_base.len() + lz4_suffix.len();
+
+        // Validate the operator-supplied memory_mb against the
+        // initramfs budget. Mirrors the x86_64 join_and_load_initramfs
+        // contract: a builder with too-small memory_mb fails fast here
+        // instead of OOMing during boot.
+        let kernel_init_size = read_kernel_init_size(&self.kernel).unwrap_or(0) as u64;
+        let budget = MemoryBudget {
+            uncompressed_initramfs_bytes: uncompressed_size as u64,
+            compressed_initrd_bytes: compressed_size as u64,
+            kernel_init_size,
+            shm_bytes: self.shm_size,
+        };
+        let min_mb = initramfs_min_memory_mb(&budget);
+        if memory_mb < min_mb {
+            anyhow::bail!(
+                "VM memory {}MB insufficient for initramfs \
+                 (uncompressed={}MB, compressed={}MB, \
+                 init_size={}MB): need {}MB",
+                memory_mb,
+                uncompressed_size >> 20,
+                compressed_size >> 20,
+                kernel_init_size >> 20,
+                min_mb,
+            );
+        }
+
+        let load_addr = aarch64_initrd_addr(memory_mb, self.shm_size, compressed_size as u64);
+        let size = self.compress_and_load_initrd(vm, base_bytes, &suffix, &key, load_addr)?;
+        Ok((Some(load_addr), Some(size)))
+    }
+
+    /// Deferred aarch64 initramfs load: join handle, build suffix,
+    /// compress (priming the LZ4 SHM cache), compute memory budget,
+    /// allocate guest memory, then load initramfs via the shared
+    /// COW-overlay path. Returns `(Some(load_addr), Some(size))`.
+    fn join_compute_memory_and_load_aarch64(
+        &self,
+        vm: &mut kvm::KtstrKvm,
+        handle: JoinHandle<Result<(BaseRef, BaseKey)>>,
+    ) -> Result<(Option<u64>, Option<u32>)> {
+        let t0 = Instant::now();
+        let (base, key) = handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("initramfs-resolve thread panicked"))??;
+        tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "initramfs_join");
+        let base_bytes: &[u8] = base.as_ref();
+
+        let t0 = Instant::now();
+        let suffix = initramfs::build_suffix(base_bytes.len(), &self.suffix_params())?;
+        let uncompressed_size = base_bytes.len() + suffix.len();
+        tracing::debug!(
+            elapsed_us = t0.elapsed().as_micros(),
+            base_bytes = base_bytes.len(),
+            suffix_bytes = suffix.len(),
+            "build_suffix",
+        );
+
+        // Compress before computing memory so the budget formula uses
+        // actual compressed size. Primes the LZ4 SHM cache so the
+        // subsequent compress_and_load_initrd call hits it.
+        let t0_compress = Instant::now();
+        let lz4_base = self.get_or_compress_base(base_bytes, &key)?;
+        let lz4_suffix = initramfs::lz4_legacy_compress(&suffix);
+        let compressed_size = lz4_base.len() + lz4_suffix.len();
+        tracing::debug!(
+            elapsed_us = t0_compress.elapsed().as_micros(),
+            uncompressed = uncompressed_size,
+            compressed = compressed_size,
+            ratio = format!("{:.1}x", uncompressed_size as f64 / compressed_size as f64),
+            "deferred_lz4_compress",
+        );
+
+        let kernel_init_size = read_kernel_init_size(&self.kernel).unwrap_or(0) as u64;
+        let budget = MemoryBudget {
+            uncompressed_initramfs_bytes: uncompressed_size as u64,
+            compressed_initrd_bytes: compressed_size as u64,
+            kernel_init_size,
+            shm_bytes: self.shm_size,
+        };
+        let memory_mb = initramfs_min_memory_mb(&budget).max(self.memory_min_mb);
+        tracing::debug!(
+            uncompressed_mb = uncompressed_size >> 20,
+            compressed_mb = compressed_size >> 20,
+            init_size_mb = kernel_init_size >> 20,
+            memory_min_mb = self.memory_min_mb,
+            memory_mb,
+            "deferred_memory_computed",
+        );
+
+        vm.allocate_and_register_memory(memory_mb)
+            .with_context(|| format!("allocate deferred memory ({memory_mb}MB, aarch64)"))?;
+
+        // Compute load_addr only AFTER memory_mb is known (it determines
+        // the FDT position, and the initrd sits just below FDT).
+        let load_addr = aarch64_initrd_addr(memory_mb, self.shm_size, compressed_size as u64);
+
+        let size = self.compress_and_load_initrd(vm, base_bytes, &suffix, &key, load_addr)?;
+        Ok((Some(load_addr), Some(size)))
     }
 
     #[cfg(target_arch = "aarch64")]

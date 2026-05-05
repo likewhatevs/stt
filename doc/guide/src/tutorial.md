@@ -498,7 +498,7 @@ cargo ktstr test --kernel ../linux -- -E 'test(mixed_workloads)'
   values along dotted paths with structured per-field errors.
 - [Watch Snapshots](writing-tests/watch-snapshots.md) --
   `Op::watch_snapshot("symbol")` registers a hardware data-write
-  watchpoint (up to 3 per scenario; DR0 is reserved for the
+  watchpoint (up to 3 per scenario; slot 0 is reserved for the
   error-class exit_kind trigger).
 - [MemPolicy](concepts/mem-policy.md) -- NUMA-aware tests that bind
   memory allocations to specific nodes and check page locality.

@@ -654,6 +654,17 @@ mod tests {
         assert!(has_kernel_artifacts(tmp.path()));
     }
 
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn kernel_path_has_artifacts_image() {
+        // aarch64 build tree layout: arch/arm64/boot/Image.
+        let tmp = TempDir::new().unwrap();
+        let boot = tmp.path().join("arch/arm64/boot");
+        std::fs::create_dir_all(&boot).unwrap();
+        std::fs::write(boot.join("Image"), b"fake").unwrap();
+        assert!(has_kernel_artifacts(tmp.path()));
+    }
+
     #[test]
     fn kernel_path_has_artifacts_empty_dir() {
         let tmp = TempDir::new().unwrap();
@@ -673,6 +684,19 @@ mod tests {
         assert_eq!(result, Some(boot.join("bzImage")));
     }
 
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn kernel_path_find_image_in_dir_image() {
+        // aarch64 build tree layout: find_image_in_dir returns
+        // arch/arm64/boot/Image.
+        let tmp = TempDir::new().unwrap();
+        let boot = tmp.path().join("arch/arm64/boot");
+        std::fs::create_dir_all(&boot).unwrap();
+        std::fs::write(boot.join("Image"), b"fake").unwrap();
+        let result = find_image_in_dir(tmp.path());
+        assert_eq!(result, Some(boot.join("Image")));
+    }
+
     #[test]
     fn kernel_path_find_image_in_dir_empty() {
         let tmp = TempDir::new().unwrap();
@@ -689,6 +713,16 @@ mod tests {
         assert_eq!(result, Some(tmp.path().join("bzImage")));
     }
 
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn kernel_path_find_image_in_dir_cache_layout_image() {
+        // Cache entries store Image at directory root on aarch64.
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("Image"), b"fake").unwrap();
+        let result = find_image_in_dir(tmp.path());
+        assert_eq!(result, Some(tmp.path().join("Image")));
+    }
+
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn kernel_path_find_image_in_dir_prefers_build_tree() {
@@ -702,12 +736,38 @@ mod tests {
         assert_eq!(result, Some(boot.join("bzImage")));
     }
 
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn kernel_path_find_image_in_dir_prefers_build_tree_image() {
+        // When both arch/arm64/boot/Image and root-level Image exist,
+        // prefer the build-tree path. Pins the same precedence on
+        // aarch64 as the x86_64 sibling — the build-tree branch in
+        // `find_image_in_dir` runs before the cache-entry branch on
+        // either arch.
+        let tmp = TempDir::new().unwrap();
+        let boot = tmp.path().join("arch/arm64/boot");
+        std::fs::create_dir_all(&boot).unwrap();
+        std::fs::write(boot.join("Image"), b"build-tree").unwrap();
+        std::fs::write(tmp.path().join("Image"), b"root-level").unwrap();
+        let result = find_image_in_dir(tmp.path());
+        assert_eq!(result, Some(boot.join("Image")));
+    }
+
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn kernel_path_has_artifacts_root_bzimage() {
         // Cache entry layout: bzImage at directory root.
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("bzImage"), b"fake").unwrap();
+        assert!(has_kernel_artifacts(tmp.path()));
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn kernel_path_has_artifacts_root_image() {
+        // Cache entry layout on aarch64: Image at directory root.
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("Image"), b"fake").unwrap();
         assert!(has_kernel_artifacts(tmp.path()));
     }
 
@@ -774,6 +834,21 @@ mod tests {
         assert_eq!(derive_kernel_dir(&image), None);
     }
 
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn derive_kernel_dir_cache_entry_without_vmlinux_aarch64() {
+        // Image at root with no vmlinux sibling — neither the build-
+        // tree suffix nor the cache-entry vmlinux probe applies,
+        // return None. Mirror of the x86_64 sibling so a future
+        // refactor that loosened the predicate on either arch trips
+        // a test rather than silently mapping arbitrary
+        // `Image`-named files to their parent directories.
+        let tmp = TempDir::new().unwrap();
+        let image = tmp.path().join("Image");
+        std::fs::write(&image, b"fake").unwrap();
+        assert_eq!(derive_kernel_dir(&image), None);
+    }
+
     #[test]
     fn derive_kernel_dir_nonexistent_path() {
         // canonicalize fails on a nonexistent path.
@@ -790,6 +865,20 @@ mod tests {
         let sub = tmp.path().join("somewhere/else");
         std::fs::create_dir_all(&sub).unwrap();
         let image = sub.join("bzImage");
+        std::fs::write(&image, b"fake").unwrap();
+        assert_eq!(derive_kernel_dir(&image), None);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn derive_kernel_dir_arbitrary_image_no_vmlinux_sibling_aarch64() {
+        // A file named Image but neither under arch/arm64/boot nor
+        // alongside a vmlinux sibling — no match. Mirror of the
+        // x86_64 sibling.
+        let tmp = TempDir::new().unwrap();
+        let sub = tmp.path().join("somewhere/else");
+        std::fs::create_dir_all(&sub).unwrap();
+        let image = sub.join("Image");
         std::fs::write(&image, b"fake").unwrap();
         assert_eq!(derive_kernel_dir(&image), None);
     }
@@ -835,6 +924,21 @@ mod tests {
         std::fs::write(boot.join("bzImage"), b"fake").unwrap();
         let result = find_image(Some(tmp.path().to_str().unwrap()), None);
         assert_eq!(result, Some(boot.join("bzImage")));
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn kernel_path_find_image_explicit_dir_with_image() {
+        // `find_image(Some(dir), _)` must short-circuit to the
+        // directory-local search and return the build-tree
+        // arch/arm64/boot/Image without falling through to host
+        // fallback paths. Mirror of the x86_64 sibling.
+        let tmp = TempDir::new().unwrap();
+        let boot = tmp.path().join("arch/arm64/boot");
+        std::fs::create_dir_all(&boot).unwrap();
+        std::fs::write(boot.join("Image"), b"fake").unwrap();
+        let result = find_image(Some(tmp.path().to_str().unwrap()), None);
+        assert_eq!(result, Some(boot.join("Image")));
     }
 
     #[test]

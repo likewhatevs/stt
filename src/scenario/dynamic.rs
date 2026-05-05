@@ -85,7 +85,17 @@ pub fn custom_cgroup_rapid_churn(ctx: &Ctx) -> Result<AssertResult> {
         let n = format!("ephemeral_{i}");
         ctx.cgroups.create_cgroup(&n)?;
         thread::sleep(Duration::from_millis(100));
-        let _ = ctx.cgroups.remove_cgroup(&n);
+        // Best-effort teardown: rapid-churn drives cgroup
+        // create/destroy at 10 Hz, racing the freeze/drain path.
+        // EBUSY (kernel still draining from a sibling step) or
+        // ENOENT (already removed by the guard's Drop on early
+        // exit) here leaves the cgroup tree slightly larger than
+        // expected for one iteration; the guard's Drop reaps any
+        // leaked cgroups at scenario teardown. Bailing would
+        // truncate the churn workload and mask the race.
+        if let Err(e) = ctx.cgroups.remove_cgroup(&n) {
+            tracing::warn!(cgroup = %n, err = %format!("{e:#}"), "rapid churn: remove_cgroup failed; guard Drop will reap on scenario teardown");
+        }
         i += 1;
     }
     Ok(collect_all(handles, &ctx.assert))

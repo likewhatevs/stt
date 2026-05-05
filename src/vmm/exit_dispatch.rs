@@ -89,6 +89,16 @@ pub struct VcpuRegSnapshot {
     /// consumers must mask before walking as a physical address.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_page_table_root: Option<u64>,
+    /// aarch64 TCR_EL1 register at freeze time. Drives the
+    /// granule-agnostic page-table walker
+    /// ([`crate::monitor::reader::GuestMem::translate_kva`]):
+    /// TG1 bits [31:30] select the high-half granule (4 KB / 16 KB
+    /// / 64 KB) and T1SZ bits [21:16] determine the high-half VA
+    /// width (`64 - T1SZ`). Stable after kernel MMU bring-up.
+    /// `None` on x86_64 (the register does not exist) and on
+    /// aarch64 if the KVM_GET_ONE_REG read fails mid-shutdown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tcr_el1: Option<u64>,
 }
 
 /// Capture the vCPU's RIP/RSP/CR3 (or PC/SP/TTBR1 on aarch64) on
@@ -113,6 +123,8 @@ pub(crate) fn capture_vcpu_regs(vcpu: &mut kvm_ioctls::VcpuFd) -> Option<VcpuReg
         // x86_64 has a single CR3 covering both halves of the
         // address space; no separate userspace pgd to capture.
         user_page_table_root: None,
+        // TCR_EL1 is an aarch64 register; not present on x86_64.
+        tcr_el1: None,
     })
 }
 
@@ -171,6 +183,9 @@ pub(crate) fn capture_vcpu_regs(vcpu: &mut kvm_ioctls::VcpuFd) -> Option<VcpuReg
     // TTBR1_EL1: Op0=3, Op1=0, CRn=2, CRm=0, Op2=1
     // = (3 << 14) | (0 << 11) | (2 << 7) | (0 << 3) | 1 = 0xC101
     const TTBR1_EL1_ID: u64 = KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM64_SYSREG | 0xC101;
+    // TCR_EL1: Op0=3, Op1=0, CRn=2, CRm=0, Op2=2
+    // = (3 << 14) | (0 << 11) | (2 << 7) | (0 << 3) | 2 = 0xC102
+    const TCR_EL1_ID: u64 = KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM64_SYSREG | 0xC102;
 
     let mut buf = [0u8; 8];
     let pc = vcpu
@@ -197,12 +212,51 @@ pub(crate) fn capture_vcpu_regs(vcpu: &mut kvm_ioctls::VcpuFd) -> Option<VcpuReg
         .get_one_reg(TTBR0_EL1_ID, &mut buf)
         .ok()
         .map(|_| u64::from_le_bytes(buf));
+    // TCR_EL1 carries the granule (TG1[31:30]) and high-half VA
+    // size (T1SZ[21:16]) the page-table walker needs. Best-effort:
+    // a failure leaves None and the walker falls back to the
+    // boot-time cached value the freeze coordinator latched at
+    // GuestKernel construction.
+    let tcr_el1 = vcpu
+        .get_one_reg(TCR_EL1_ID, &mut buf)
+        .ok()
+        .map(|_| u64::from_le_bytes(buf));
     Some(VcpuRegSnapshot {
         instruction_pointer: pc,
         stack_pointer: sp,
         page_table_root: ttbr1,
         user_page_table_root: ttbr0,
+        tcr_el1,
     })
+}
+
+/// Read TCR_EL1 directly from a vCPU. Used at GuestKernel
+/// construction time to feed the page-table walker its granule and
+/// VA-width settings (TG1 in bits [31:30], T1SZ in bits [21:16]).
+///
+/// Returns `None` on x86_64 (the register does not exist) and on
+/// aarch64 if `KVM_GET_ONE_REG` fails. The caller treats `None` as
+/// "no walker context yet"; on aarch64 that surfaces as a 0 stored
+/// in the GuestKernel's `tcr_el1` field — the walker rejects T1SZ=0
+/// and the affected lookups skip cleanly.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn read_tcr_el1(_vcpu: &mut kvm_ioctls::VcpuFd) -> Option<u64> {
+    None
+}
+
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn read_tcr_el1(vcpu: &mut kvm_ioctls::VcpuFd) -> Option<u64> {
+    // Same encoding constants as `capture_vcpu_regs`. TCR_EL1 packs
+    // to (Op0=3, Op1=0, CRn=2, CRm=0, Op2=2) under the
+    // KVM_REG_ARM64_SYSREG namespace.
+    const KVM_REG_ARM64: u64 = 0x6000_0000_0000_0000;
+    const KVM_REG_SIZE_U64: u64 = 0x0030_0000_0000_0000;
+    const KVM_REG_ARM64_SYSREG: u64 = 0x0013_0000;
+    const TCR_EL1_ID: u64 = KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM64_SYSREG | 0xC102;
+    let mut buf = [0u8; 8];
+    vcpu.get_one_reg(TCR_EL1_ID, &mut buf)
+        .ok()
+        .map(|_| u64::from_le_bytes(buf))
 }
 
 impl std::fmt::Display for VcpuRegSnapshot {
@@ -323,6 +377,275 @@ fn mmio_serial_offset(addr: u64, base: u64) -> Option<u8> {
     }
 }
 
+// -- watchpoint hit dispatch ------------------------------------------
+//
+// Shared between the AP (`vcpu_run_loop_unified`) and BSP
+// (`run_bsp_loop`) paths. Identifies which watchpoint slot fired
+// from the per-arch `kvm_debug_exit_arch` payload, gates the slot-0
+// trigger on the post-store `exit_kind` value (so a clean
+// SCX_EXIT_DONE does not generate a failure dump), and latches the
+// matched user slot for the freeze coordinator's epoll loop.
+
+/// `ESR_ELx_EC` decoded value for a watchpoint exception taken from a
+/// lower exception level (the only EC that surfaces guest-side data
+/// watchpoint hits to userspace via `KVM_EXIT_DEBUG`). Pinned per
+/// `arch/arm64/include/asm/esr.h` `ESR_ELx_EC_WATCHPT_LOW = 0x34`.
+///
+/// EL1-only by intent: `WATCHPT_CUR` (EC=0x35, EL0 watchpoints) is
+/// not handled because ktstr arms watchpoints exclusively on kernel
+/// addresses.
+#[cfg(target_arch = "aarch64")]
+const ESR_ELx_EC_WATCHPT_LOW: u32 = 0x34;
+/// `ESR_ELx_EC` decoded value for a software-step exception taken
+/// from a lower exception level. KVM raises this through
+/// `KVM_EXIT_DEBUG` after a `KVM_GUESTDBG_SINGLESTEP`-armed
+/// `KVM_RUN` retires exactly one instruction (kernel
+/// `arch/arm64/kvm/handle_exit.c::kvm_handle_guest_debug` switches
+/// on `ESR_ELx_EC_SOFTSTP_LOW` and toggles `DBG_SPSR_SS`). We use
+/// it to detect "the offending store has retired" after stepping
+/// past a watchpoint trap, so the next `self_arm_watchpoint` call
+/// can restore the slot's WCR.E=1. Pinned per
+/// `arch/arm64/include/asm/esr.h` `ESR_ELx_EC_SOFTSTP_LOW = 0x32`.
+#[cfg(target_arch = "aarch64")]
+const ESR_ELx_EC_SOFTSTP_LOW: u32 = 0x32;
+/// Bit shift of the `ESR_ELx_EC` field within the lower 32 bits of
+/// the ESR_EL2 value KVM hands userspace as
+/// `kvm_debug_exit_arch.hsr`. Pinned per `arch/arm64/include/asm/
+/// esr.h` `ESR_ELx_EC_SHIFT = 26`.
+#[cfg(target_arch = "aarch64")]
+const ESR_ELx_EC_SHIFT: u32 = 26;
+/// Mask applied to `(hsr >> ESR_ELx_EC_SHIFT)` to extract the
+/// 6-bit EC field. Pinned per `ESR_ELx_EC(esr) = (esr & ESR_ELx_
+/// EC_MASK) >> ESR_ELx_EC_SHIFT` in the same kernel header.
+#[cfg(target_arch = "aarch64")]
+const ESR_ELx_EC_MASK: u32 = 0x3F;
+
+/// Dispatch a `KVM_EXIT_DEBUG` watchpoint trap to the matching slot's
+/// latch. Reads the per-arch identifier (DR6 on x86_64; ESR EC + FAR
+/// on aarch64), gates the slot-0 trigger on the post-store
+/// `exit_kind` value, and writes the appropriate `hit` flag for the
+/// freeze coordinator to observe.
+///
+/// `armed_slots` is the per-thread mirror of currently-armed KVAs
+/// (one entry per slot) maintained by `self_arm_watchpoint`. On
+/// aarch64 it carries the original (un-aligned) KVA so the
+/// FAR range check covers the exact 4 bytes the watchpoint targets,
+/// not the 8-byte block DBGWVR addresses. On x86_64 the entry is
+/// also the requested KVA (DR0..DR3 hold full addresses) but is not
+/// used by this helper — DR6 alone identifies which slot fired.
+///
+/// `single_step_pending` and `single_step_slot` are the per-vCPU
+/// loop-local single-step bookkeeping the aarch64 path uses to step
+/// past a fired watchpoint:
+///
+///   - On `EC = ESR_ELx_EC_WATCHPT_LOW (0x34)` with a slot match,
+///     after latching `hit` the helper sets `*single_step_pending =
+///     true` and `*single_step_slot = i`. The next loop iteration's
+///     `self_arm_watchpoint` call notices the flipped flag, reissues
+///     KVM_SET_GUEST_DEBUG with the fired slot's WCR.E cleared and
+///     `KVM_GUESTDBG_SINGLESTEP` asserted, and the following
+///     KVM_RUN executes exactly one instruction past the offending
+///     store.
+///   - On `EC = ESR_ELx_EC_SOFTSTP_LOW (0x32)` with the flag set,
+///     the helper clears `*single_step_pending` (without latching).
+///     The next `self_arm_watchpoint` call restores WCR.E=1 on the
+///     slot and drops the singlestep bit.
+///
+/// Both fields are inert on x86_64 — the x86 watchpoint trap is
+/// taken AFTER the store retires, so re-entry advances normally
+/// without the disable-step-rearm dance.
+pub(crate) fn dispatch_watchpoint_hit(
+    watchpoint: &WatchpointArm,
+    debug_arch: &kvm_bindings::kvm_debug_exit_arch,
+    armed_slots: &[u64; 4],
+    single_step_pending: &mut bool,
+    single_step_slot: &mut usize,
+) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // DR6 layout (Intel SDM Vol. 3B 17.2.5): bits 0-3 (B0..B3)
+        // indicate which DR fired. Bit 14 (BS) signals single-step.
+        // We read the bottom four bits and dispatch each set slot.
+        // Single-step is aarch64-only — consume the unused inputs.
+        let _ = armed_slots;
+        let _ = (&mut *single_step_pending, &mut *single_step_slot);
+        let dr6 = debug_arch.dr6;
+        let mut hits = [false; 4];
+        for (i, hit) in hits.iter_mut().enumerate() {
+            *hit = (dr6 & (1u64 << i)) != 0;
+        }
+        if hits[0] {
+            latch_slot0_with_gate(watchpoint);
+        }
+        for (idx, hit) in hits[1..].iter().enumerate() {
+            if *hit {
+                watchpoint.latch_user_hit(idx);
+            }
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // ARM debug exit payload (kernel
+        // `arch/arm64/kvm/handle_exit.c::kvm_handle_guest_debug`):
+        //   `hsr` = lower 32 bits of ESR_EL2
+        //   `far` = FAR_EL2 (set only when ESR.EC == WATCHPT_LOW)
+        // The EC field at bits [31:26] of ESR distinguishes
+        // watchpoint exceptions from breakpoints / soft-step / BRK.
+        let ec = (debug_arch.hsr >> ESR_ELx_EC_SHIFT) & ESR_ELx_EC_MASK;
+        if ec == ESR_ELx_EC_SOFTSTP_LOW {
+            // Software-step exception following a watchpoint hit.
+            // The kernel sets cpsr.SS in
+            // `kvm_handle_guest_debug` to advertise that exactly
+            // one instruction retired since the prior fire; we
+            // clear `single_step_pending` so the next
+            // `self_arm_watchpoint` call restores the slot's
+            // WCR.E=1 and drops `KVM_GUESTDBG_SINGLESTEP`. Do NOT
+            // latch any `hit` flag here — the original
+            // WATCHPT_LOW exit already latched the freeze
+            // trigger; this exit only signals "one instruction
+            // executed cleanly past the watched store".
+            //
+            // If the flag is NOT set we got a soft-step exit
+            // we did not request (e.g. host kernel quirk, peer
+            // tooling); log and ignore — there is no slot to
+            // restore.
+            if *single_step_pending {
+                *single_step_pending = false;
+            } else {
+                tracing::debug!(
+                    hsr = debug_arch.hsr,
+                    "KVM_EXIT_DEBUG soft-step EC with no \
+                     single-step pending; ignoring (likely \
+                     spurious kernel-side step exit)"
+                );
+            }
+            return;
+        }
+        if ec != ESR_ELx_EC_WATCHPT_LOW {
+            tracing::debug!(
+                hsr = debug_arch.hsr,
+                ec,
+                "KVM_EXIT_DEBUG with non-watchpoint EC; ignoring \
+                 (breakpoint/BRK paths are not used by ktstr)"
+            );
+            return;
+        }
+        let far = debug_arch.far;
+        // ARM ARM D2.10.5: FAR may be imprecise for unaligned
+        // accesses. This exact-range check is correct for atomic_t
+        // writes (aligned 4-byte stores via atomic_set/cmpxchg) but
+        // would miss imprecise hits from unaligned multi-byte
+        // accesses spanning the watched range.
+        //
+        // Range-match FAR against each armed slot's 4-byte
+        // window. `armed_slots[i]` is the requested KVA (un-
+        // aligned); the watch covers `[kva, kva + 4)`. Multiple
+        // slots may match if they overlap, but `arm_user_watchpoint`
+        // rejects duplicate registrations, so at most one slot's
+        // range contains a given FAR in practice. We still iterate
+        // all four and latch every match — overlapping arms are
+        // never silently dropped.
+        let mut any_match = false;
+        let mut last_match_slot: usize = 0;
+        for (i, kva) in armed_slots.iter().enumerate() {
+            if *kva == 0 {
+                continue;
+            }
+            if far >= *kva && far < kva.saturating_add(4) {
+                any_match = true;
+                last_match_slot = i;
+                if i == 0 {
+                    latch_slot0_with_gate(watchpoint);
+                } else {
+                    watchpoint.latch_user_hit(i - 1);
+                }
+            }
+        }
+        if !any_match {
+            tracing::debug!(
+                hsr = debug_arch.hsr,
+                far,
+                armed = ?armed_slots,
+                "KVM_EXIT_DEBUG watchpoint fired but FAR matched no \
+                 armed slot (possible KVM watchpoint match-distance \
+                 fallback or stale arm); not latching"
+            );
+            return;
+        }
+        // The aarch64 watchpoint trap fires BEFORE the offending
+        // store retires (ARM ARM D2.10.5: "the exception is
+        // taken on the instruction that would have made the
+        // access"). Re-entering KVM_RUN without intervention
+        // replays the same store and re-trips the watchpoint
+        // forever. Mirror the kernel's
+        // `arch/arm64/kernel/hw_breakpoint.c` recipe: latch
+        // `single_step_pending` so the next
+        // `self_arm_watchpoint` call disables the fired slot's
+        // WCR.E and asserts `KVM_GUESTDBG_SINGLESTEP`, allowing
+        // exactly one instruction (the watched store) to retire
+        // before the slot is rearmed. Track the last matched
+        // slot — overlapping arms are rejected upstream so this
+        // is also the only matched slot in practice.
+        *single_step_pending = true;
+        *single_step_slot = last_match_slot;
+    }
+}
+
+/// Slot-0 latch with the post-store `exit_kind` value gate. Reads
+/// the host pointer the freeze coordinator published, compares
+/// against [`SCX_EXIT_ERROR_THRESHOLD`], and latches the failure-
+/// trigger only on error-class transitions.
+///
+/// On aarch64 an `Acquire` fence pairs with the guest's store: by
+/// the time KVM_RUN returns `KVM_EXIT_DEBUG` the trap-into-EL2 +
+/// host-context-restore path has already issued an architectural
+/// context-synchronization event (ERET, eret-to-EL1 from the
+/// hypervisor save/restore), but Rust's memory model does not
+/// know about those. The fence makes the `read_volatile` of the
+/// host pointer ordered-after that synchronization in Rust's
+/// happens-before graph, matching what the x86_64 path gets for
+/// free from TSO.
+fn latch_slot0_with_gate(watchpoint: &WatchpointArm) {
+    let host_ptr = watchpoint.kind_host_ptr.load(Ordering::Acquire);
+    if host_ptr.is_null() {
+        // Coordinator armed `request_kva` but the host-pointer
+        // publication lost the race or failed to resolve.
+        // Conservative fallback: latch `hit` so the BPF .bss
+        // path's late-trigger guard still runs — better a
+        // possibly-spurious dump than missing a real one.
+        watchpoint.latch_hit();
+        return;
+    }
+    // Publish ordering: the guest's store is globally visible by
+    // the time KVM exits to userspace, but Rust's memory model
+    // requires an explicit Acquire fence on weakly-ordered hosts
+    // (aarch64) to make the host-pointer read happens-after the
+    // guest store in the Rust abstract machine. On x86_64 TSO
+    // gives us this for free; the explicit fence is a no-op
+    // codegen-wise but keeps the operation ordered in std::sync
+    // terms across both arches.
+    std::sync::atomic::fence(Ordering::Acquire);
+    // SAFETY: `kind_host_ptr` was published by the freeze
+    // coordinator before `request_kva` (Release), and the
+    // `request_kva` non-zero load that triggered the arm is the
+    // synchronizes-with edge for this read. The pointer addresses
+    // a u32 inside the guest's `scx_sched` slab page, which stays
+    // mapped for the VM lifetime per the `ReservationGuard`
+    // contract.
+    let kind = unsafe { std::ptr::read_volatile(host_ptr) };
+    if kind >= SCX_EXIT_ERROR_THRESHOLD {
+        watchpoint.latch_hit();
+    } else {
+        tracing::debug!(
+            kind,
+            threshold = SCX_EXIT_ERROR_THRESHOLD,
+            "watchpoint fired on non-error exit_kind transition \
+             (e.g. SCX_EXIT_DONE on clean shutdown); skipping \
+             freeze trigger"
+        );
+    }
+}
+
 /// Unified per-vCPU KVM_RUN loop for AP threads.
 ///
 /// HLT on APs: check kill + continue on both arches (KVM delivers
@@ -386,6 +709,25 @@ pub(crate) fn vcpu_run_loop_unified(
     // permanently disabling the watchpoint.
     let mut armed_slots: [u64; 4] = [0; 4];
     let mut arm_failures: u8 = 0;
+    // aarch64 watchpoint single-step bookkeeping. On aarch64 the
+    // hardware watchpoint trap is taken BEFORE the offending store
+    // retires (ARM ARM D2.10.5: "the exception is taken on the
+    // instruction that would have made the access"), so re-entering
+    // KVM_RUN replays the same instruction and re-trips the
+    // watchpoint forever. Mirroring the kernel's
+    // `arch/arm64/kernel/hw_breakpoint.c` recipe, we disable the
+    // fired slot's WCR.E and assert KVM_GUESTDBG_SINGLESTEP for
+    // exactly one KVM_RUN; the next KVM_EXIT_DEBUG carries
+    // EC=ESR_ELx_EC_SOFTSTP_LOW (0x32), at which point we clear
+    // `single_step_pending` and `self_arm_watchpoint` reissues
+    // KVM_SET_GUEST_DEBUG with WCR.E restored to 1 and
+    // KVM_GUESTDBG_SINGLESTEP cleared. Inert on x86_64 (the trap
+    // there is taken AFTER the store, so re-entry advances
+    // normally); the locals still pass through to keep the
+    // per-arch helper signatures shared.
+    let mut single_step_pending: bool = false;
+    let mut single_step_slot: usize = 0;
+    let mut armed_single_step: bool = false;
     loop {
         if kill.load(Ordering::Acquire) {
             break;
@@ -412,8 +754,22 @@ pub(crate) fn vcpu_run_loop_unified(
         // load + compare against `armed_kva`) when no new arm is
         // pending. Mirrors `run_bsp_loop`'s arm-before-run pattern;
         // both paths share `WatchpointArm` so a fire on either
-        // triggers the late-snapshot rendezvous.
-        self_arm_watchpoint(vcpu, watchpoint, &mut armed_slots, &mut arm_failures);
+        // triggers the late-snapshot rendezvous. Also drives the
+        // aarch64 watchpoint single-step transition: when
+        // `single_step_pending` is set by the prior watchpoint
+        // exit, this call reissues KVM_SET_GUEST_DEBUG with the
+        // fired slot's WCR.E cleared and KVM_GUESTDBG_SINGLESTEP
+        // asserted; when the SOFTSTP_LOW exit clears the flag, the
+        // next call restores WCR.E=1 and drops the singlestep bit.
+        self_arm_watchpoint(
+            vcpu,
+            watchpoint,
+            &mut armed_slots,
+            &mut arm_failures,
+            single_step_pending,
+            single_step_slot,
+            &mut armed_single_step,
+        );
 
         match vcpu.run() {
             Ok(mut exit) => {
@@ -442,61 +798,13 @@ pub(crate) fn vcpu_run_loop_unified(
                 // `scx_sched` is not freed until well after the
                 // last `exit_kind` write).
                 if let VcpuExit::Debug(debug_arch) = &exit {
-                    // DR6 layout (Intel SDM Vol. 3B 17.2.5): bits 0-3
-                    // (B0..B3) indicate which DR fired. Bit 14 (BS)
-                    // signals single-step. We read the bottom four
-                    // bits and dispatch each set slot.
-                    let dr6 = debug_arch.dr6;
-                    let dr0_hit = (dr6 & (1 << 0)) != 0;
-                    let dr1_hit = (dr6 & (1 << 1)) != 0;
-                    let dr2_hit = (dr6 & (1 << 2)) != 0;
-                    let dr3_hit = (dr6 & (1 << 3)) != 0;
-                    if dr0_hit {
-                        let host_ptr = watchpoint.kind_host_ptr.load(Ordering::Acquire);
-                        if !host_ptr.is_null() {
-                            // SAFETY: `kind_host_ptr` was published by
-                            // the freeze coordinator before
-                            // `request_kva` (Release), and the
-                            // `request_kva` non-zero load that
-                            // triggered the arm is the synchronizes-
-                            // with edge for this read. The pointer
-                            // addresses a u32 inside the guest's
-                            // `scx_sched` slab page, which stays
-                            // mapped for the VM lifetime per the
-                            // `ReservationGuard` contract.
-                            let kind = unsafe { std::ptr::read_volatile(host_ptr) };
-                            if kind >= SCX_EXIT_ERROR_THRESHOLD {
-                                watchpoint.latch_hit();
-                            } else {
-                                tracing::debug!(
-                                    kind,
-                                    threshold = SCX_EXIT_ERROR_THRESHOLD,
-                                    "watchpoint fired on non-error exit_kind \
-                                     transition (e.g. SCX_EXIT_DONE on clean \
-                                     shutdown); skipping freeze trigger"
-                                );
-                            }
-                        } else {
-                            // Coordinator armed `request_kva` but
-                            // the host-pointer publication lost the
-                            // race or failed to resolve.
-                            // Conservative fallback: latch `hit` so
-                            // the BPF .bss path's late-trigger guard
-                            // still runs — better a possibly-spurious
-                            // dump than missing a real one.
-                            watchpoint.latch_hit();
-                        }
-                    }
-                    // User watchpoint slots (DR1..=DR3 → user[0..=2]).
-                    if dr1_hit {
-                        watchpoint.latch_user_hit(0);
-                    }
-                    if dr2_hit {
-                        watchpoint.latch_user_hit(1);
-                    }
-                    if dr3_hit {
-                        watchpoint.latch_user_hit(2);
-                    }
+                    dispatch_watchpoint_hit(
+                        watchpoint,
+                        debug_arch,
+                        &armed_slots,
+                        &mut single_step_pending,
+                        &mut single_step_slot,
+                    );
                     if kill.load(Ordering::Acquire) {
                         break;
                     }
@@ -590,6 +898,7 @@ pub(crate) fn vcpu_run_loop_unified(
 /// `kill` is honoured throughout: a shutdown signal during the park
 /// loop wins over freeze and the function returns to the caller's
 /// kill-check at the top of the loop.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn handle_freeze(
     vcpu: &mut kvm_ioctls::VcpuFd,
     has_immediate_exit: bool,
@@ -1002,6 +1311,7 @@ mod vcpu_reg_snapshot_tests {
             stack_pointer: 0xffff_ffff_8000_0000,
             page_table_root: 0x0123_4567_89ab_cdef,
             user_page_table_root: None,
+            tcr_el1: None,
         };
         let out = format!("{s}");
         assert_eq!(
@@ -1021,6 +1331,7 @@ mod vcpu_reg_snapshot_tests {
             stack_pointer: 0xffff_8000_8000_0000,
             page_table_root: 0x0000_4000_8000_0000,
             user_page_table_root: Some(0x0000_0000_aaaa_bbbb),
+            tcr_el1: Some(0xb510_0010),
         };
         let out = format!("{s}");
         assert_eq!(
@@ -1036,6 +1347,7 @@ mod vcpu_reg_snapshot_tests {
             stack_pointer: 0x2,
             page_table_root: 0x3,
             user_page_table_root: None,
+            tcr_el1: None,
         };
         let json = serde_json::to_string(&s).expect("serialize");
         // Pin the JSON key names so a future field rename is
@@ -1082,6 +1394,7 @@ mod vcpu_reg_snapshot_tests {
             stack_pointer: 0x2,
             page_table_root: 0x3,
             user_page_table_root: Some(0xdead_beef_cafe_d00d),
+            tcr_el1: None,
         };
         let json = serde_json::to_string(&s).expect("serialize");
         assert!(
@@ -1093,12 +1406,65 @@ mod vcpu_reg_snapshot_tests {
     }
 
     #[test]
+    fn vcpu_reg_snapshot_serde_round_trip_tcr_el1() {
+        // Mirrors the user_page_table_root coverage but for tcr_el1:
+        // skip_serializing_if = "Option::is_none" must drop the key
+        // when None and emit + round-trip it when Some. Picks a
+        // representative TCR_EL1 word (T1SZ=0x10 in [21:16] with
+        // TG1=0b10 / 4 KB granule in [31:30]) so the test pins the
+        // wire format the page-table walker actually sees on aarch64.
+        let some_val: u64 = 0x0000_0000_b510_0010;
+
+        let s_some = VcpuRegSnapshot {
+            instruction_pointer: 0x1,
+            stack_pointer: 0x2,
+            page_table_root: 0x3,
+            user_page_table_root: None,
+            tcr_el1: Some(some_val),
+        };
+        let json_some = serde_json::to_string(&s_some).expect("serialize Some");
+        assert!(
+            json_some.contains("\"tcr_el1\""),
+            "tcr_el1 must serialize when Some: {json_some}"
+        );
+
+        let s_none = VcpuRegSnapshot {
+            instruction_pointer: 0x1,
+            stack_pointer: 0x2,
+            page_table_root: 0x3,
+            user_page_table_root: None,
+            tcr_el1: None,
+        };
+        let json_none = serde_json::to_string(&s_none).expect("serialize None");
+        assert!(
+            !json_none.contains("\"tcr_el1\""),
+            "tcr_el1 must skip-serialize when None: {json_none}"
+        );
+
+        // Deserialize Some-flavour JSON back, assert value preserved.
+        let parsed_some: VcpuRegSnapshot =
+            serde_json::from_str(&json_some).expect("deserialize Some");
+        assert_eq!(parsed_some.tcr_el1, Some(some_val));
+
+        // Deserialize JSON without the key (None-flavour); the
+        // serde(default) attribute must yield None rather than
+        // failing because the field is absent.
+        let parsed_none: VcpuRegSnapshot =
+            serde_json::from_str(&json_none).expect("deserialize None");
+        assert!(
+            parsed_none.tcr_el1.is_none(),
+            "missing tcr_el1 must deserialize as None"
+        );
+    }
+
+    #[test]
     fn vcpu_reg_snapshot_zero_renders_zeros() {
         let s = VcpuRegSnapshot {
             instruction_pointer: 0,
             stack_pointer: 0,
             page_table_root: 0,
             user_page_table_root: None,
+            tcr_el1: None,
         };
         // 16 hex digits each — leading zeros preserved so widths
         // line up across rows in multi-vcpu output.
@@ -1189,21 +1555,30 @@ mod vcpu_reg_snapshot_tests {
     /// (the guest never traps, no failure dump).
     ///
     /// Field layout per Intel SDM Vol 3 Ch 17.2 ("Debug Registers")
-    /// and pinned against QEMU's `update_dr7_value` (target/i386/
-    /// kvm/kvm.c) which is the gold-standard reference:
+    /// and pinned against the production
+    /// [`super::super::vcpu::self_arm_watchpoint`] x86_64 path which
+    /// composes DR7 as:
     ///
-    ///   bit  0   L0   (local enable, slot 0) — 0
+    ///   base = `0x400 | 0x200 | 0x100`  (MBS, GE, LE)
+    ///   per slot i: `(0b11) << (2*i)`           (L<i> | G<i>)
+    ///             | `(0b01) << (16 + 4*i)`     (R/W<i> = write)
+    ///             | `(0b11) << (18 + 4*i)`     (LEN<i> = 4-byte)
+    ///
+    /// Bit-by-bit:
+    ///
+    ///   bit  0   L0   (local enable, slot 0) — 1
     ///   bit  1   G0   (global enable, slot 0) — 1
+    ///   bit  8   LE   (local exact-match, required for data BPs)
     ///   bit  9   GE   (global exact-match, required for data BPs)
     ///   bit 10   reserved, must be 1 (DR7_FIXED_1)
     ///   bits [17:16]  R/W0 (00=exec, 01=write, 11=rw) — 01
     ///   bits [19:18]  LEN0 (00=1B, 01=2B, 10=8B, 11=4B) — 11
     ///
-    /// Expected value 0xD0602 is what the watchpoint code MUST
-    /// produce for (slot=0, type=write, len=4). Pinning the
-    /// arithmetic here means a future refactor that flips a bit
-    /// (e.g. swaps R/W to exec, drops GE, picks the wrong length
-    /// encoding) is caught at unit-test time before the trigger
+    /// Expected value 0xD0703 is what the production wire format
+    /// emits for (slot=0, type=write, len=4). Pinning the arithmetic
+    /// here means a future refactor that flips a bit (e.g. swaps R/W
+    /// to exec, drops GE/LE, picks the wrong length encoding, drops
+    /// L0 or G0) is caught at unit-test time before the trigger
     /// silently stops firing.
     #[test]
     #[cfg(target_arch = "x86_64")]
@@ -1212,8 +1587,10 @@ mod vcpu_reg_snapshot_tests {
         // production-side rename does not silently divorce the
         // assertion from the wire format.
         const DR7_FIXED_1: u64 = 1 << 10;
-        const DR_GLOBAL_ENABLE: u64 = 1 << 1; // G0 — slot 0
-        const DR_GLOBAL_EXACT: u64 = 1 << 9; // GE — exact-match for data BPs
+        const DR_LOCAL_EXACT: u64 = 1 << 8; // LE — local exact-match
+        const DR_GLOBAL_EXACT: u64 = 1 << 9; // GE — global exact-match
+        const DR_LOCAL_ENABLE: u64 = 1 << 0; // L0 — slot 0 local
+        const DR_GLOBAL_ENABLE: u64 = 1 << 1; // G0 — slot 0 global
         const DR_RW_WRITE: u64 = 0b01;
         const DR_LEN_4: u64 = 0b11;
         // Slot 0 occupies bits 16/17 for R/W and 18/19 for LEN.
@@ -1221,18 +1598,20 @@ mod vcpu_reg_snapshot_tests {
         const SLOT0_LEN_SHIFT: u32 = 18;
 
         let dr7 = DR7_FIXED_1
-            | DR_GLOBAL_ENABLE
             | DR_GLOBAL_EXACT
+            | DR_LOCAL_EXACT
+            | DR_LOCAL_ENABLE
+            | DR_GLOBAL_ENABLE
             | (DR_RW_WRITE << SLOT0_RW_SHIFT)
             | (DR_LEN_4 << SLOT0_LEN_SHIFT);
-        // 0xD0602 verified by the team lead against QEMU kvm.c
-        // and Intel SDM Vol 3 Ch 17.2. A drift here means the
-        // watchpoint's wire format diverged from the gold-standard
-        // encoding and KVM_SET_GUEST_DEBUG will arm the wrong
-        // breakpoint (or none).
+        // 0xD0703 mirrors what `self_arm_watchpoint` in
+        // `super::super::vcpu` actually programs into KVM. A drift
+        // here means the watchpoint's wire format diverged from the
+        // production encoding and `KVM_SET_GUEST_DEBUG` will arm the
+        // wrong breakpoint (or none).
         assert_eq!(
-            dr7, 0xD0602,
-            "DR7 encoding for (slot=0, write, 4B) must match the QEMU/SDM gold-standard wire format"
+            dr7, 0xD0703,
+            "DR7 encoding for (slot=0, write, 4B) must match the production wire format"
         );
 
         // Bit-by-bit cross-check: every contributing bit must be
@@ -1240,12 +1619,13 @@ mod vcpu_reg_snapshot_tests {
         // failure mode where two bugs cancel — e.g. wrong shift
         // for R/W combined with wrong shift for LEN that happen
         // to sum to the right total.
-        assert_eq!(
-            dr7 & (1 << 0),
-            0,
-            "L0 (bit 0) must be clear (using G0, not L0)"
-        );
+        assert_ne!(dr7 & (1 << 0), 0, "L0 (bit 0) must be set");
         assert_ne!(dr7 & (1 << 1), 0, "G0 (bit 1) must be set");
+        assert_ne!(
+            dr7 & (1 << 8),
+            0,
+            "LE (bit 8) must be set for data breakpoints"
+        );
         assert_ne!(
             dr7 & (1 << 9),
             0,
@@ -1275,6 +1655,369 @@ mod vcpu_reg_snapshot_tests {
             (dr7 >> 20) & 0xFFF,
             0,
             "slots 1..3 R/W + LEN fields must be zero"
+        );
+    }
+
+    /// DBGWCR wire format for a 4-byte write watchpoint at byte
+    /// offset 0 of an 8-byte aligned block. The aarch64 sibling of
+    /// the x86_64 [`dr7_slot0_write_4byte_encoding`] test above —
+    /// pins the exact bit layout that
+    /// [`super::super::vcpu::self_arm_watchpoint`] emits, so a future
+    /// refactor that flips a bit (e.g. swaps LSC to read, drops PAC,
+    /// picks the wrong BAS shift) is caught at unit-test time
+    /// before the trigger silently stops firing.
+    ///
+    /// Field layout per ARM ARM D7.3.11 ("DBGWCR<n>_EL1, Debug
+    /// Watchpoint Control Registers") and pinned against QEMU's
+    /// `insert_hw_watchpoint` in `target/arm/hyp_gdbstub.c`:
+    ///
+    ///   bit 0       E   = 1 (enable)
+    ///   bits [2:1]  PAC = 0b11 (EL0+EL1, any security state)
+    ///   bits [4:3]  LSC = 0b10 (write-only)
+    ///   bits [12:5] BAS = 0xF << byte_offset (4 contiguous bytes)
+    ///   bits [15:13] HMC = 0
+    ///   bits [19:16] SSC = 0
+    ///   bit 20       WT = 0
+    ///   bits [23:21] LBN = 0
+    ///   bits [28:24] MASK = 0
+    ///
+    /// Concrete byte_offset=0 wire format: `0x1F7`.
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn dbgwcr_slot0_write_4byte_encoding_offset0() {
+        let kva: u64 = 0xffff_ffff_8100_1000; // 8-byte aligned (low bits = 0)
+        let byte_offset = (kva & 0x7u64) as u32;
+        let bas: u64 = 0xFu64 << byte_offset;
+        let wcr: u64 = 1u64 | (0b11u64 << 1) | (0b10u64 << 3) | (bas << 5);
+        assert_eq!(
+            wcr, 0x1F7,
+            "DBGWCR encoding for (slot=0, write, 4B, offset=0) must \
+             match the QEMU/ARM ARM gold-standard wire format"
+        );
+        // Bit-by-bit cross-check.
+        assert_eq!(wcr & 1, 1, "E (bit 0) must be set");
+        assert_eq!(
+            (wcr >> 1) & 0b11,
+            0b11,
+            "PAC (bits 2:1) must be 0b11 (EL0+EL1)"
+        );
+        assert_eq!(
+            (wcr >> 3) & 0b11,
+            0b10,
+            "LSC (bits 4:3) must be 0b10 (write-only)"
+        );
+        assert_eq!(
+            (wcr >> 5) & 0xFF,
+            0x0F,
+            "BAS (bits 12:5) must be 0x0F for offset=0 (4 \
+             contiguous low bytes)"
+        );
+        // No other fields must be set.
+        assert_eq!(
+            (wcr >> 13) & 0xF,
+            0,
+            "HMC + low SSC bit (bits 16:13) must be zero"
+        );
+        assert_eq!((wcr >> 20) & 0xF, 0, "WT + LBN must be zero");
+        assert_eq!((wcr >> 24) & 0x1F, 0, "MASK must be zero");
+    }
+
+    /// DBGWCR encoding for a 4-byte write watchpoint at byte offset
+    /// 4 of an 8-byte aligned block. Catches the failure mode where
+    /// a 4-byte aligned but not 8-byte aligned KVA (e.g. a struct
+    /// field at offset 4 inside an 8-byte aligned struct) gets the
+    /// wrong BAS shift. Concrete wire format: `0x1E17`.
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn dbgwcr_slot0_write_4byte_encoding_offset4() {
+        let kva: u64 = 0xffff_ffff_8100_1004; // 4-byte aligned, byte_offset=4
+        let byte_offset = (kva & 0x7u64) as u32;
+        let bas: u64 = 0xFu64 << byte_offset;
+        let wcr: u64 = 1u64 | (0b11u64 << 1) | (0b10u64 << 3) | (bas << 5);
+        assert_eq!(
+            wcr, 0x1E17,
+            "DBGWCR encoding for (slot=0, write, 4B, offset=4) must \
+             match `0x1 | (3<<1) | (2<<3) | (0xF0 << 5)` = 0x1E17"
+        );
+        assert_eq!(
+            (wcr >> 5) & 0xFF,
+            0xF0,
+            "BAS (bits 12:5) must be 0xF0 for offset=4 (4 \
+             contiguous high bytes)"
+        );
+    }
+
+    /// DBGWVR alignment: the WCR/WVR pair always uses an 8-byte
+    /// aligned base and BAS to select the 4 bytes, so a 4-byte
+    /// aligned KVA at offset 4 must yield WVR = `kva & ~0x7` (= the
+    /// containing 8-byte block's base), not `kva` itself.
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn dbgwvr_8byte_aligned_base() {
+        let kva: u64 = 0xffff_ffff_8100_1004;
+        let wvr = kva & !0x7u64;
+        assert_eq!(
+            wvr, 0xffff_ffff_8100_1000,
+            "DBGWVR base must clear the bottom 3 bits (8-byte align) \
+             so BAS picks the 4 watched bytes within the block"
+        );
+        // Round-trip: reconstructing the watched range from WVR + BAS.
+        let byte_offset = (kva & 0x7u64) as u32;
+        let bas: u64 = 0xFu64 << byte_offset;
+        let watched_lo = wvr + (bas.trailing_zeros() as u64);
+        let watched_hi = watched_lo + (bas.count_ones() as u64);
+        assert_eq!(
+            watched_lo, kva,
+            "watched range low must equal the original KVA"
+        );
+        assert_eq!(
+            watched_hi,
+            kva + 4,
+            "watched range high must equal kva + 4 (4 bytes)"
+        );
+    }
+
+    /// FAR-based slot decode for the aarch64 watchpoint exit path.
+    /// Constructs a synthetic `kvm_debug_exit_arch` with EC =
+    /// WATCHPT_LOW and a FAR inside slot 2's 4-byte window, runs
+    /// the dispatch helper, and asserts only `user[1].hit` was
+    /// latched (slot indices in `armed_slots` are 0=DR0/exit_kind,
+    /// 1=DR1/user[0], 2=DR2/user[1], 3=DR3/user[2]). Also pins the
+    /// post-fire single-step bookkeeping: the helper must mark
+    /// `single_step_pending=true` and record the matched slot
+    /// index, so the next `self_arm_watchpoint` call disables that
+    /// slot's WCR.E and asserts `KVM_GUESTDBG_SINGLESTEP` (avoiding
+    /// the aarch64 watchpoint-replay infinite loop).
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn watchpoint_slot_decode_from_far_user_slot() {
+        use crate::vmm::vcpu::WatchpointArm;
+        let watchpoint = WatchpointArm::new().expect("WatchpointArm::new");
+        // Slot 0 unused (request_kva = 0); slots 1..=3 carry
+        // distinct addresses 4 bytes apart so a FAR inside slot 2's
+        // window matches exactly one slot.
+        let armed_slots: [u64; 4] = [
+            0,
+            0xffff_ffff_8100_1000,
+            0xffff_ffff_8100_1004,
+            0xffff_ffff_8100_1008,
+        ];
+        // Construct a synthetic debug-exit payload pointing at the
+        // first byte of slot 2 (DR2 / user[1]).
+        let far = 0xffff_ffff_8100_1004u64;
+        let hsr = (super::ESR_ELx_EC_WATCHPT_LOW) << super::ESR_ELx_EC_SHIFT;
+        let debug_arch = kvm_bindings::kvm_debug_exit_arch {
+            hsr,
+            hsr_high: 0,
+            far,
+        };
+        let mut single_step_pending = false;
+        let mut single_step_slot: usize = 99;
+        super::dispatch_watchpoint_hit(
+            &watchpoint,
+            &debug_arch,
+            &armed_slots,
+            &mut single_step_pending,
+            &mut single_step_slot,
+        );
+        assert!(
+            !watchpoint.hit.load(std::sync::atomic::Ordering::Acquire),
+            "slot 0 (exit_kind) must not latch when a different \
+             slot's range matches FAR"
+        );
+        assert!(
+            !watchpoint.user[0]
+                .hit
+                .load(std::sync::atomic::Ordering::Acquire),
+            "user[0] / slot 1 must not latch — FAR is inside slot 2's \
+             range"
+        );
+        assert!(
+            watchpoint.user[1]
+                .hit
+                .load(std::sync::atomic::Ordering::Acquire),
+            "user[1] / slot 2 must latch — FAR equals the slot's KVA"
+        );
+        assert!(
+            !watchpoint.user[2]
+                .hit
+                .load(std::sync::atomic::Ordering::Acquire),
+            "user[2] / slot 3 must not latch — FAR is outside its \
+             range"
+        );
+        // Single-step bookkeeping: a watchpoint match MUST request
+        // single-step on the matching slot so the next KVM_RUN
+        // advances past the offending store before the slot is
+        // re-armed. Slot 2 (FAR's containing slot) is the index
+        // dispatched into `single_step_slot`.
+        assert!(
+            single_step_pending,
+            "single_step_pending must be set when a watchpoint match \
+             latches; without this the next KVM_RUN replays the same \
+             store and re-trips the watchpoint forever (ARM ARM \
+             D2.10.5)"
+        );
+        assert_eq!(
+            single_step_slot, 2,
+            "single_step_slot must record the matched slot index so \
+             self_arm_watchpoint disables that slot's WCR.E (and \
+             leaves peer slots armed) for the single-step pass"
+        );
+    }
+
+    /// Non-watchpoint EC values must be ignored. KVM_EXIT_DEBUG can
+    /// surface for soft-step (EC = 0x32) or BRK (EC = 0x3C); only
+    /// EC = 0x34 (`ESR_ELx_EC_WATCHPT_LOW`) means a data watchpoint
+    /// fired. Other ECs must not latch any slot. Soft-step (EC =
+    /// 0x32) is treated specially when `single_step_pending` is
+    /// set — it clears the flag so `self_arm_watchpoint` can
+    /// restore the disabled slot's WCR.E. With the flag clear,
+    /// soft-step exits are spurious and must NOT touch any state.
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn watchpoint_dispatch_ignores_non_watchpt_ec() {
+        use crate::vmm::vcpu::WatchpointArm;
+        let watchpoint = WatchpointArm::new().expect("WatchpointArm::new");
+        let armed_slots: [u64; 4] = [
+            0xffff_ffff_8100_1000,
+            0xffff_ffff_8100_1004,
+            0xffff_ffff_8100_1008,
+            0xffff_ffff_8100_100C,
+        ];
+        // EC = 0x32 (software step) with single_step_pending = false
+        // — must NOT latch and must not flip pending state.
+        let hsr = 0x32u32 << super::ESR_ELx_EC_SHIFT;
+        let debug_arch = kvm_bindings::kvm_debug_exit_arch {
+            hsr,
+            hsr_high: 0,
+            far: 0xffff_ffff_8100_1004,
+        };
+        let mut single_step_pending = false;
+        let mut single_step_slot: usize = 99;
+        super::dispatch_watchpoint_hit(
+            &watchpoint,
+            &debug_arch,
+            &armed_slots,
+            &mut single_step_pending,
+            &mut single_step_slot,
+        );
+        assert!(
+            !watchpoint.hit.load(std::sync::atomic::Ordering::Acquire),
+            "soft-step EC must not latch slot 0"
+        );
+        for (i, slot) in watchpoint.user.iter().enumerate() {
+            assert!(
+                !slot.hit.load(std::sync::atomic::Ordering::Acquire),
+                "soft-step EC must not latch user[{i}]"
+            );
+        }
+        assert!(
+            !single_step_pending,
+            "spurious soft-step exit (no pending step) must leave \
+             single_step_pending unchanged"
+        );
+        assert_eq!(
+            single_step_slot, 99,
+            "spurious soft-step exit must not clobber single_step_slot"
+        );
+    }
+
+    /// Soft-step exit AFTER a watchpoint trap is the second half of
+    /// the aarch64 watchpoint-replay-avoidance dance: it signals
+    /// "the offending store has retired, you may rearm the slot
+    /// now". The dispatch helper must clear `single_step_pending`
+    /// (so the next `self_arm_watchpoint` call restores WCR.E=1)
+    /// AND must not latch any new `hit` (the original
+    /// WATCHPT_LOW exit already latched the freeze trigger).
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn watchpoint_softstep_clears_single_step_pending() {
+        use crate::vmm::vcpu::WatchpointArm;
+        let watchpoint = WatchpointArm::new().expect("WatchpointArm::new");
+        let armed_slots: [u64; 4] = [0, 0xffff_ffff_8100_1000, 0, 0];
+        let hsr = super::ESR_ELx_EC_SOFTSTP_LOW << super::ESR_ELx_EC_SHIFT;
+        let debug_arch = kvm_bindings::kvm_debug_exit_arch {
+            hsr,
+            hsr_high: 0,
+            far: 0,
+        };
+        let mut single_step_pending = true;
+        let mut single_step_slot: usize = 1;
+        super::dispatch_watchpoint_hit(
+            &watchpoint,
+            &debug_arch,
+            &armed_slots,
+            &mut single_step_pending,
+            &mut single_step_slot,
+        );
+        assert!(
+            !single_step_pending,
+            "SOFTSTP_LOW with pending step must clear \
+             single_step_pending so the next self_arm_watchpoint \
+             call restores WCR.E=1 and drops KVM_GUESTDBG_SINGLESTEP"
+        );
+        assert!(
+            !watchpoint.hit.load(std::sync::atomic::Ordering::Acquire),
+            "SOFTSTP_LOW must not latch slot 0 (the WATCHPT_LOW \
+             exit that preceded it already did)"
+        );
+        for (i, slot) in watchpoint.user.iter().enumerate() {
+            assert!(
+                !slot.hit.load(std::sync::atomic::Ordering::Acquire),
+                "SOFTSTP_LOW must not latch user[{i}]"
+            );
+        }
+    }
+
+    /// Slot 0 (`exit_kind`) latches via the post-store value gate
+    /// only — the helper must NOT latch when `kind_host_ptr` is
+    /// null (the unresolved-host-pointer fallback path) without
+    /// also latching via that explicit fallback. With no host_ptr
+    /// publication the `latch_slot0_with_gate` helper falls back
+    /// to unconditional `latch_hit` so the BPF .bss path's late-
+    /// trigger guard still runs — this test pins that fallback.
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn watchpoint_slot0_falls_back_when_host_ptr_null() {
+        use crate::vmm::vcpu::WatchpointArm;
+        let watchpoint = WatchpointArm::new().expect("WatchpointArm::new");
+        // host_ptr is null by construction (`AtomicPtr::new(null)`),
+        // so the slot-0 path takes the conservative fallback.
+        let armed_slots: [u64; 4] = [0xffff_ffff_8100_1000, 0, 0, 0];
+        let hsr = (super::ESR_ELx_EC_WATCHPT_LOW) << super::ESR_ELx_EC_SHIFT;
+        let debug_arch = kvm_bindings::kvm_debug_exit_arch {
+            hsr,
+            hsr_high: 0,
+            far: 0xffff_ffff_8100_1000,
+        };
+        let mut single_step_pending = false;
+        let mut single_step_slot: usize = 0;
+        super::dispatch_watchpoint_hit(
+            &watchpoint,
+            &debug_arch,
+            &armed_slots,
+            &mut single_step_pending,
+            &mut single_step_slot,
+        );
+        assert!(
+            watchpoint.hit.load(std::sync::atomic::Ordering::Acquire),
+            "slot 0 fallback must latch hit when kind_host_ptr is \
+             null (BPF .bss path's late-trigger guard reconciles)"
+        );
+        // Slot 0 fired → single-step bookkeeping records slot 0 so
+        // the next self_arm_watchpoint call disables WCR[0].E and
+        // asserts KVM_GUESTDBG_SINGLESTEP, stepping past the
+        // offending store. This applies regardless of which latch
+        // path (gated or fallback) ran above.
+        assert!(
+            single_step_pending,
+            "slot 0 fallback path still requires single-step rearm \
+             (the watchpoint trap fires before the store retires \
+             on aarch64)"
+        );
+        assert_eq!(
+            single_step_slot, 0,
+            "slot 0 fired → single_step_slot must be 0"
         );
     }
 }

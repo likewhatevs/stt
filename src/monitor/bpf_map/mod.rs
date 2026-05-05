@@ -6,7 +6,8 @@
 //! guest physical memory mapping.
 //!
 //! Address translation strategy:
-//! - `map_idr` is a kernel BSS symbol: use `text_kva_to_pa`.
+//! - `map_idr` is a kernel BSS symbol: use `text_kva_to_pa_with_base`
+//!   (or [`super::guest::GuestKernel::text_kva_to_pa`]).
 //! - xa_node structs are SLAB-allocated (direct mapping): use `kva_to_pa`.
 //! - bpf_map/bpf_array may be kmalloc'd or vmalloc'd: use `translate_any_kva`.
 //! - .bss value region is vmalloc'd: use `translate_kva`.
@@ -16,7 +17,7 @@
 use super::btf_offsets::BpfMapOffsets;
 use super::idr::{translate_any_kva, xa_load};
 use super::reader::GuestMem;
-use super::symbols::text_kva_to_pa;
+use super::symbols::text_kva_to_pa_with_base;
 use super::{Cr3Pa, Kva, PageOffset};
 
 mod htab;
@@ -52,6 +53,14 @@ pub(crate) struct AccessorCtx<'a> {
     pub page_offset: PageOffset,
     pub offsets: &'a BpfMapOffsets,
     pub l5: bool,
+    /// Cached TCR_EL1 register; drives the aarch64 page-table walker's
+    /// granule selection. Always 0 on x86_64 (the walker ignores it).
+    pub tcr_el1: u64,
+    /// Runtime kernel image base (`__START_KERNEL_map` on x86_64,
+    /// `KIMAGE_VADDR` on aarch64). Used for translating
+    /// kernel-text/data symbols (e.g. `map_idr`) to physical
+    /// addresses. Mirrors [`super::guest::GuestKernel::start_kernel_map`].
+    pub start_kernel_map: u64,
 }
 
 // Map type discriminants from `enum bpf_map_type` in
@@ -286,7 +295,7 @@ pub struct BpfMapInfo {
 /// ([`iter_htab_entries`] for HASH, [`super::arena::snapshot_arena`]
 /// for ARENA, …).
 pub(crate) fn find_all_bpf_maps(ctx: &AccessorCtx<'_>, map_idr_kva: u64) -> Vec<BpfMapInfo> {
-    let idr_pa = text_kva_to_pa(map_idr_kva);
+    let idr_pa = text_kva_to_pa_with_base(map_idr_kva, ctx.start_kernel_map);
     let offsets = ctx.offsets;
 
     let xa_head = ctx.mem.read_u64(idr_pa, offsets.idr_xa_head);
@@ -315,9 +324,14 @@ pub(crate) fn find_all_bpf_maps(ctx: &AccessorCtx<'_>, map_idr_kva: u64) -> Vec<
             continue;
         }
 
-        let Some(map_pa) =
-            translate_any_kva(ctx.mem, ctx.cr3_pa.0, ctx.page_offset.0, entry, ctx.l5)
-        else {
+        let Some(map_pa) = translate_any_kva(
+            ctx.mem,
+            ctx.cr3_pa.0,
+            ctx.page_offset.0,
+            entry,
+            ctx.l5,
+            ctx.tcr_el1,
+        ) else {
             continue;
         };
 
@@ -458,7 +472,10 @@ where
     let total = len as u64;
     while consumed < total {
         let kva = target_kva + consumed;
-        let Some(pa) = ctx.mem.translate_kva(ctx.cr3_pa.0, Kva(kva), ctx.l5) else {
+        let Some(pa) = ctx
+            .mem
+            .translate_kva(ctx.cr3_pa.0, Kva(kva), ctx.l5, ctx.tcr_el1)
+        else {
             return false;
         };
         // Advance at most to the next page boundary so the next
@@ -624,9 +641,14 @@ fn read_percpu_array_value(
     let pptr_kva = pptrs_kva + (key as u64) * 8;
 
     // bpf_array may be kmalloc'd or vmalloc'd — try direct mapping first.
-    let Some(pptr_pa) =
-        translate_any_kva(ctx.mem, ctx.cr3_pa.0, ctx.page_offset.0, pptr_kva, ctx.l5)
-    else {
+    let Some(pptr_pa) = translate_any_kva(
+        ctx.mem,
+        ctx.cr3_pa.0,
+        ctx.page_offset.0,
+        pptr_kva,
+        ctx.l5,
+        ctx.tcr_el1,
+    ) else {
         return Vec::new();
     };
     let percpu_base = ctx.mem.read_u64(pptr_pa, 0);
@@ -664,7 +686,14 @@ fn read_percpu_array_value(
         // from pcpu_get_vm_areas). `translate_any_kva` tries direct
         // mapping first and falls through to a page-table walk for
         // vmalloc'd percpu, so it covers both.
-        match translate_any_kva(ctx.mem, ctx.cr3_pa.0, ctx.page_offset.0, cpu_kva, ctx.l5) {
+        match translate_any_kva(
+            ctx.mem,
+            ctx.cr3_pa.0,
+            ctx.page_offset.0,
+            cpu_kva,
+            ctx.l5,
+            ctx.tcr_el1,
+        ) {
             Some(cpu_pa)
                 if cpu_pa
                     .checked_add(value_size as u64)
@@ -973,6 +1002,8 @@ impl<'a> GuestMemMapAccessor<'a> {
             page_offset: PageOffset(self.kernel.page_offset()),
             offsets: self.offsets,
             l5: self.kernel.l5(),
+            tcr_el1: self.kernel.tcr_el1(),
+            start_kernel_map: self.kernel.start_kernel_map(),
         }
     }
 
@@ -1044,7 +1075,7 @@ impl BpfMapAccessor for GuestMemMapAccessor<'_> {
         let Some(pco_kva) = self.kernel.symbol_kva("__per_cpu_offset") else {
             return Vec::new();
         };
-        let pco_pa = super::symbols::text_kva_to_pa(pco_kva);
+        let pco_pa = self.kernel.text_kva_to_pa(pco_kva);
         let per_cpu_offsets =
             super::symbols::read_per_cpu_offsets(self.kernel.mem(), pco_pa, num_cpus);
         read_percpu_array_value(&self.ctx(), map, key, &per_cpu_offsets)
@@ -1060,7 +1091,7 @@ impl BpfMapAccessor for GuestMemMapAccessor<'_> {
         let Some(pco_kva) = self.kernel.symbol_kva("__per_cpu_offset") else {
             return Vec::new();
         };
-        let pco_pa = super::symbols::text_kva_to_pa(pco_kva);
+        let pco_pa = self.kernel.text_kva_to_pa(pco_kva);
         let per_cpu_offsets =
             super::symbols::read_per_cpu_offsets(self.kernel.mem(), pco_pa, num_cpus);
         iter_percpu_htab_entries(&self.ctx(), map, &per_cpu_offsets)
@@ -1125,8 +1156,8 @@ impl<'a> GuestMemMapAccessorOwned<'a> {
     /// accessor to own its offsets.
     ///
     /// [`GuestKernel`]: super::guest::GuestKernel
-    pub fn new(mem: &'a GuestMem, vmlinux: &std::path::Path) -> anyhow::Result<Self> {
-        let kernel = super::guest::GuestKernel::new(mem, vmlinux)?;
+    pub fn new(mem: &'a GuestMem, vmlinux: &std::path::Path, tcr_el1: u64) -> anyhow::Result<Self> {
+        let kernel = super::guest::GuestKernel::new(mem, vmlinux, tcr_el1)?;
         let offsets = BpfMapOffsets::from_vmlinux(vmlinux)?;
 
         let map_idr_kva = kernel
