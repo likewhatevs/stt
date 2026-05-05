@@ -266,13 +266,41 @@ fn scenario_op_watch_snapshot_fires_on_kernel_write(
         );
     }
 
+    let bss_map = maps.iter().find(|m| {
+        m.get("name")
+            .and_then(|n| n.as_str())
+            .map(|n| n.ends_with(".bss") && !n.starts_with("probe_bp.") && !n.starts_with("fentry_p."))
+            .unwrap_or(false)
+    });
+    if bss_map.is_none() {
+        anyhow::bail!(
+            "Op::WatchSnapshot captured {} maps but no scheduler \
+             `.bss` — watchpoint-triggered capture must include \
+             scheduler BPF state",
+            maps.len()
+        );
+    }
+    let bss = bss_map.unwrap();
+    let members = bss
+        .get("value")
+        .and_then(|v| v.get("members"))
+        .and_then(|m| m.as_array());
+    if members.map(|m| m.is_empty()).unwrap_or(true) {
+        anyhow::bail!(
+            "Op::WatchSnapshot captured `.bss` but it has no \
+             BTF-resolved members — watchpoint-triggered capture \
+             must produce meaningful scheduler state"
+        );
+    }
+
     result.details.push(ktstr::assert::AssertDetail::new(
         ktstr::assert::DetailKind::Other,
         format!(
             "Op::WatchSnapshot('jiffies_64') fired and captured a \
-             dump with {} maps — DR1..=DR3 hardware-watchpoint \
-             pipeline OK",
-            maps.len()
+             dump with {} maps, `.bss` has {} BTF-resolved field(s) \
+             — DR1..=DR3 hardware-watchpoint pipeline OK",
+            maps.len(),
+            members.unwrap().len()
         ),
     ));
     Ok(result)
