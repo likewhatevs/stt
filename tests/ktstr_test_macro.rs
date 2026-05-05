@@ -68,6 +68,7 @@ fn resolve_func_ip_known_symbol(ctx: &Ctx) -> Result<AssertResult> {
         skipped: false,
         details: vec![format!("schedule address: {ip:?}").into()],
         stats: Default::default(),
+        measurements: Default::default(),
     })
 }
 
