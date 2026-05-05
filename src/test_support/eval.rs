@@ -1155,6 +1155,45 @@ fn run_ktstr_test_inner_impl(
             return Err(e.context("run ktstr_test VM"));
         }
     };
+    // Verify snapshot captures have real content. Runs on the
+    // HOST after the VM exits — the bridge lives in host memory,
+    // populated by the freeze coordinator's doorbell handler.
+    {
+        let captured = result.snapshot_bridge.drain();
+        for (tag, report) in &captured {
+            let has_bss = report.maps.iter().any(|m| {
+                m.name.ends_with(".bss")
+                    && !m.name.starts_with("probe_bp.")
+                    && !m.name.starts_with("fentry_p.")
+            });
+            anyhow::ensure!(
+                !report.maps.is_empty() && has_bss,
+                "snapshot '{tag}' captured {} maps but no scheduler .bss — \
+                 the capture pipeline produced an empty or incomplete report",
+                report.maps.len(),
+            );
+            let bss = report
+                .maps
+                .iter()
+                .find(|m| {
+                    m.name.ends_with(".bss")
+                        && !m.name.starts_with("probe_bp.")
+                        && !m.name.starts_with("fentry_p.")
+                })
+                .unwrap();
+            let has_ktstr_enabled = bss
+                .value
+                .as_ref()
+                .map(|v| format!("{v}").contains("ktstr_enabled"))
+                .unwrap_or(false);
+            anyhow::ensure!(
+                has_ktstr_enabled,
+                "snapshot '{tag}' has .bss but `ktstr_enabled` not found — \
+                 BTF rendering did not produce real probe globals",
+            );
+        }
+    }
+
     // Release VM resources (CPU/LLC flocks, guest memory) before
     // the multi-second LLM inference so concurrent peers can
     // acquire the same LLC slots during extraction.
