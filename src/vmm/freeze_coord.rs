@@ -220,7 +220,8 @@ fn arm_user_watchpoint(
 /// unmodified base path so the two emission paths never alias.
 fn on_demand_tagged_path(base: &std::path::Path, counter: u32) -> std::path::PathBuf {
     let mut tagged = base.to_path_buf();
-    let stem = base.file_stem().and_then(|s| s.to_str()).unwrap_or("dump");
+    let raw_stem = base.file_stem().and_then(|s| s.to_str()).unwrap_or("dump");
+    let stem = raw_stem.strip_suffix(".failure-dump").unwrap_or(raw_stem);
     let ext = base.extension().and_then(|e| e.to_str());
     let new_name = match ext {
         Some(ext) => format!("{stem}.on_demand_{counter}.{ext}"),
@@ -242,7 +243,8 @@ fn on_demand_tagged_path(base: &std::path::Path, counter: u32) -> std::path::Pat
 /// filesystems regardless of what UTF-8 the guest passed.
 fn snapshot_tagged_path(base: &std::path::Path, tag: &str) -> std::path::PathBuf {
     let mut tagged = base.to_path_buf();
-    let stem = base.file_stem().and_then(|s| s.to_str()).unwrap_or("dump");
+    let raw_stem = base.file_stem().and_then(|s| s.to_str()).unwrap_or("dump");
+    let stem = raw_stem.strip_suffix(".failure-dump").unwrap_or(raw_stem);
     let ext = base.extension().and_then(|e| e.to_str());
     let safe_tag: String = tag
         .chars()

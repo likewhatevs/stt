@@ -32,11 +32,9 @@ available for user watches). A 4th `Op::watch_snapshot` fails the
 step with a "cap exceeded" message. Symbol-resolution failures
 bail immediately so a typo surfaces visibly.
 
-`Op::watch_snapshot` is reliable for
-covering the registration surface (cap enforcement, symbol
-propagation, error bailing). Until the hardware fire path lands, an
-on-write capture must be simulated by an explicit
-`bridge.capture(tag)` call.
+`Op::watch_snapshot` covers the full pipeline: registration,
+cap enforcement, symbol resolution, hardware arming, and
+automatic capture on write.
 
 ## Issuing a watch
 
@@ -118,7 +116,7 @@ drives the error-class freeze trigger; DR1, DR2, and DR3 are the
 three slots available for on-demand watches.
 
 A 4th `Op::watch_snapshot` in the same scenario fails the step with
-"cap exceeded" before any vCPU runs:
+"cap exceeded" when the cap is exceeded:
 
 ```rust,ignore
 let steps = vec![Step {
@@ -184,8 +182,7 @@ to demonstrate the full read path.
 
 ## Reading captures
 
-Once a watchpoint fires (or, today, once a manual `bridge.capture(tag)`
-simulates the fire), the resulting report is stored on the bridge
+Once a watchpoint fires, the resulting report is stored on the bridge
 under the tag and read back exactly as `Op::snapshot` captures are.
 Every accessor — `Snapshot::map`, `Snapshot::var`,
 `SnapshotMap::at` / `find` / `filter` / `max_by`, dotted-path walks,
