@@ -441,20 +441,6 @@ pub(crate) fn vcpu_run_loop_unified(
                 // fire (slab page lifetime — the scheduler's
                 // `scx_sched` is not freed until well after the
                 // last `exit_kind` write).
-                // Hardware watchpoint dispatch is x86-only. The
-                // DR0..=DR3/DR6/DR7 debug-register layout is Intel
-                // SDM Vol. 3B Ch. 17.2; aarch64 has its own
-                // WCRn/WVRn/HSR/FAR registers (kvm_debug_exit_arch
-                // exposes `hsr`, `hsr_high`, `far` instead of
-                // `dr6`/`dr7`) and the watchpoint feature is not
-                // implemented for aarch64 (see the
-                // `cfg(target_arch = "aarch64")` stub in
-                // `super::vcpu::self_arm_watchpoint`, which never
-                // arms anything). On aarch64 we therefore never
-                // expect KVM_EXIT_DEBUG; if it fires anyway, log and
-                // fall through to the normal classify path so the
-                // run loop never silently spins.
-                #[cfg(target_arch = "x86_64")]
                 if let VcpuExit::Debug(debug_arch) = &exit {
                     // DR6 layout (Intel SDM Vol. 3B 17.2.5): bits 0-3
                     // (B0..B3) indicate which DR fired. Bit 14 (BS)
@@ -511,24 +497,6 @@ pub(crate) fn vcpu_run_loop_unified(
                     if dr3_hit {
                         watchpoint.latch_user_hit(2);
                     }
-                    if kill.load(Ordering::Acquire) {
-                        break;
-                    }
-                    continue;
-                }
-                #[cfg(target_arch = "aarch64")]
-                if let VcpuExit::Debug(_debug_arch) = &exit {
-                    // aarch64 watchpoint arming is not implemented
-                    // (see the `cfg(target_arch = "aarch64")` stub in
-                    // `super::vcpu::self_arm_watchpoint`). A
-                    // KVM_EXIT_DEBUG here would mean a stale
-                    // KVM_GUESTDBG arm we did not request — log and
-                    // continue rather than silently dropping the
-                    // exit.
-                    tracing::warn!(
-                        "AP: unexpected KVM_EXIT_DEBUG on aarch64 \
-                         (watchpoint arming not implemented); ignoring"
-                    );
                     if kill.load(Ordering::Acquire) {
                         break;
                     }
@@ -622,7 +590,6 @@ pub(crate) fn vcpu_run_loop_unified(
 /// `kill` is honoured throughout: a shutdown signal during the park
 /// loop wins over freeze and the function returns to the caller's
 /// kill-check at the top of the loop.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn handle_freeze(
     vcpu: &mut kvm_ioctls::VcpuFd,
     has_immediate_exit: bool,

@@ -4984,12 +4984,6 @@ impl KtstrVm {
                     // regardless — see the AP-side
                     // `vcpu_run_loop_unified` for the same
                     // rationale.
-                    // Hardware watchpoint dispatch is x86-only. See
-                    // the AP-side handler in
-                    // `exit_dispatch::vcpu_run_loop_unified` for the
-                    // arch-gating rationale and the aarch64 stub in
-                    // `super::vcpu::self_arm_watchpoint`.
-                    #[cfg(target_arch = "x86_64")]
                     if let VcpuExit::Debug(debug_arch) = &exit {
                         let dr6 = debug_arch.dr6;
                         let dr0_hit = (dr6 & (1 << 0)) != 0;
@@ -5030,22 +5024,6 @@ impl KtstrVm {
                         if dr3_hit {
                             watchpoint.latch_user_hit(2);
                         }
-                        if kill.load(Ordering::Acquire) {
-                            break;
-                        }
-                        continue;
-                    }
-                    #[cfg(target_arch = "aarch64")]
-                    if let VcpuExit::Debug(_debug_arch) = &exit {
-                        // aarch64 watchpoint arming is not implemented;
-                        // a KVM_EXIT_DEBUG here would mean a stale
-                        // KVM_GUESTDBG arm we did not request. Log and
-                        // continue rather than silently dropping the
-                        // exit.
-                        tracing::warn!(
-                            "BSP: unexpected KVM_EXIT_DEBUG on aarch64 \
-                             (watchpoint arming not implemented); ignoring"
-                        );
                         if kill.load(Ordering::Acquire) {
                             break;
                         }
