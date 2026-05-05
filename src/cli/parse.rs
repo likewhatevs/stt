@@ -414,8 +414,10 @@ mod tests {
         let got = parse_disk_arg(Some("256mib"))
             .expect("256mib must parse")
             .expect("Some(...) input must yield Some(DiskConfig)");
-        let mut expected = crate::vmm::disk_config::DiskConfig::default();
-        expected.capacity_mb = 256;
+        let expected = crate::vmm::disk_config::DiskConfig {
+            capacity_mb: 256,
+            ..crate::vmm::disk_config::DiskConfig::default()
+        };
         assert_eq!(
             got, expected,
             "parse_disk_arg(\"256mib\") must equal DiskConfig::default() \

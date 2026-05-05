@@ -2462,6 +2462,7 @@ fn parse_shell_no_perf_mode_without_cpu_cap_succeeds() {
 ///      in `src/cli/kernel_cmd.rs` (the column-aligned table
 ///      this test reads), and
 ///   3. this test's column-aligned assertions.
+///
 /// Updating any one without the others either silently breaks
 /// scripted consumers (1 without 2) or surfaces a misleading
 /// stale assertion (2 without 3).

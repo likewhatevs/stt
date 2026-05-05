@@ -545,6 +545,7 @@ pub(crate) fn resolve_kernel_set(specs: &[String]) -> Result<Vec<(String, PathBu
 /// `--git` and `--source` paths bypass range expansion (range
 /// applies to tarball downloads only) and forward unchanged to
 /// [`kernel_build_one`].
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn kernel_build(
     version: Option<String>,
     source: Option<PathBuf>,

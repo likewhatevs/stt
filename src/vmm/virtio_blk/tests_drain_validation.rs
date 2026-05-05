@@ -35,11 +35,11 @@ use vm_memory::Address;
 /// The gate runs AFTER status_addr identification so the
 /// rejection produces a normal IOERR completion (status byte
 /// + add_used) — not a chain drop. Earlier-positioned drop
-/// behaviour was the original design but left the chain stuck
-/// in the avail ring until the guest's hung-task watchdog
-/// fired (`kernel.hung_task_timeout_secs`, default 120 s —
-/// virtio_blk has no `mq_ops->timeout`), hiding the rejection
-/// from operators.
+///   behaviour was the original design but left the chain stuck
+///   in the avail ring until the guest's hung-task watchdog
+///   fired (`kernel.hung_task_timeout_secs`, default 120 s —
+///   virtio_blk has no `mq_ops->timeout`), hiding the rejection
+///   from operators.
 #[test]
 fn seg_max_rejected_with_ioerr() {
     use virtio_bindings::bindings::virtio_ring::VRING_DESC_F_NEXT;
@@ -1614,8 +1614,8 @@ fn outer_loop_drains_two_pre_queued_chains_in_one_call() {
 /// fails with InvalidGuestAddress.
 ///
 /// Layout: `Queue::set_avail_event` writes at
-/// `used_ring + VIRTQ_USED_RING_HEADER_SIZE
-/// + VIRTQ_USED_ELEMENT_SIZE * size = used_ring + 4 + 8 * 16 =
+/// `used_ring + VIRTQ_USED_RING_HEADER_SIZE +
+/// VIRTQ_USED_ELEMENT_SIZE * size = used_ring + 4 + 8 * 16 =
 /// used_ring + 132`.
 #[test]
 fn enable_notification_err_breaks_outer_and_fires_irqfd_fail_safe() {

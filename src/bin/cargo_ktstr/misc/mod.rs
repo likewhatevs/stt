@@ -9,9 +9,9 @@
 //! - [`completions`] — `cargo ktstr completions` (clap_complete dump).
 //! - [`funify`]      — `cargo ktstr funify` (JSON value funification).
 //! - [`model`]       — `cargo ktstr model {fetch,status,clean}` (LLM
-//!                     model cache management).
+//!   model cache management).
 //! - [`export`]      — `cargo ktstr export` (`.run` self-extracting
-//!                     reproducer for a registered test).
+//!   reproducer for a registered test).
 //!
 //! The `--kernel` resolution shim used by `shell` (and re-used by
 //! the verifier subcommand) lives in [`super::kernel`].

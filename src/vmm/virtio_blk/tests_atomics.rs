@@ -613,8 +613,8 @@ fn interrupt_status_is_arc_shareable() {
 
 /// First throttle stall on a chain bumps the gauge from 0 to
 /// 1. Symmetric with `process_requests_throttled_rolls_back_chain`
-/// (which pins the rollback contract); this test specifically
-/// pins the live-gauge inc.
+///    (which pins the rollback contract); this test specifically
+///    pins the live-gauge inc.
 #[test]
 fn currently_throttled_gauge_increments_on_first_stall() {
     let mem = make_chain_test_mem();

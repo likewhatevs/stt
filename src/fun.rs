@@ -1780,12 +1780,12 @@ mod tests {
         let input = json!({
             "wakeups_per_sec": 500.5,
             "fairness_score": 0.75,
-            "anonymous_float": 3.14,
+            "anonymous_float": 4.25,
         });
         let out = funify_json(input.clone(), &f);
         assert_eq!(out["wakeups_per_sec"], json!(500.5));
         assert_eq!(out["fairness_score"], json!(0.75));
-        assert_eq!(out["anonymous_float"], json!(3.14));
+        assert_eq!(out["anonymous_float"], json!(4.25));
     }
 
     /// Cross-reference preservation: two values that share both

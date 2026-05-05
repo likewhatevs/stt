@@ -406,7 +406,7 @@ fn psi_half_percent_methods_preserve_kernel_two_decimal_precision() {
     // (int, frac) → centi-percent storage value
     // → expected percentage f64 to 2 decimal places.
     let cases: &[(u16, u16, u16, f64)] = &[
-        (3, 14, 314, 3.14),
+        (3, 25, 325, 3.25),
         (42, 7, 4207, 42.07),
         (87, 50, 8750, 87.50),
         (99, 99, 9999, 99.99),

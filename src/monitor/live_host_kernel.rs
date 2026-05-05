@@ -409,9 +409,8 @@ ffffffff80105678 T good_symbol
         let result = locate_btf("definitely-not-a-kernel-release-9.99");
         // Either /sys/kernel/btf/vmlinux exists (and we get that)
         // or no fallback path resolves (and we get None).
-        match result {
-            Some(p) => assert_eq!(p, Path::new("/sys/kernel/btf/vmlinux")),
-            None => {}
+        if let Some(p) = result {
+            assert_eq!(p, Path::new("/sys/kernel/btf/vmlinux"))
         }
     }
 }

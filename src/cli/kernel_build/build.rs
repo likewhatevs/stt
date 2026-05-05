@@ -801,7 +801,7 @@ mod tests {
     }
 
     /// `acquire_build_reservation` with `KTSTR_BYPASS_LLC_LOCKS=1`
-    /// + `cpu_cap=None` returns a no-reservation `BuildReservation`:
+    /// plus `cpu_cap=None` returns a no-reservation `BuildReservation`:
     /// plan, sandbox, and make_jobs all None. Pins the "bypass
     /// disables both layers" contract.
     #[test]
@@ -821,7 +821,7 @@ mod tests {
     }
 
     /// `acquire_build_reservation` with `KTSTR_BYPASS_LLC_LOCKS=1`
-    /// + `cpu_cap=Some(_)` must error with the "resource contract"
+    /// plus `cpu_cap=Some(_)` must error with the "resource contract"
     /// substring. Pins the conflict check at the pipeline's
     /// reservation entry point.
     #[test]

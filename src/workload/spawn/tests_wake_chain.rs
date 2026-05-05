@@ -197,7 +197,7 @@ fn wake_chain_pipe_no_repeat_bootstrap_invariant() {
     );
     let total_iters: u64 = reports.iter().map(|r| r.iterations).sum();
     assert!(
-        total_iters >= TOTAL_ITER_LOWER && total_iters <= TOTAL_ITER_UPPER,
+        (TOTAL_ITER_LOWER..=TOTAL_ITER_UPPER).contains(&total_iters),
         "WakeChain wake=Pipe depth=2 total iterations over \
          {TEST_WINDOW_MS}ms with work_per_hop={WORK_PER_HOP_MS}ms must \
          land in [{TOTAL_ITER_LOWER}, {TOTAL_ITER_UPPER}] (got \
@@ -315,7 +315,7 @@ fn wake_chain_pipe_multi_chain_bootstrap_independence() {
 
     for (chain_idx, &chain_total) in per_chain_totals.iter().enumerate() {
         assert!(
-            chain_total >= PER_CHAIN_LOWER && chain_total <= PER_CHAIN_UPPER,
+            (PER_CHAIN_LOWER..=PER_CHAIN_UPPER).contains(&chain_total),
             "WakeChain wake=Pipe multi-chain: chain {chain_idx} total \
              iterations over {TEST_WINDOW_MS}ms with \
              work_per_hop={WORK_PER_HOP_MS}ms must land in \

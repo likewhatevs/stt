@@ -6886,8 +6886,7 @@ mod tests {
         let mut state = StepState::empty(&ctx);
         let defs = vec![CgroupDef::named("cg_bad").cpu_weight(0)];
         let err = apply_setup_test(&ctx, &mut state, &defs)
-            .err()
-            .expect("apply_setup must reject weight=0");
+            .expect_err("apply_setup must reject weight=0");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("cg_bad") && msg.contains("cpu.weight"),
@@ -6908,8 +6907,7 @@ mod tests {
         let defs =
             vec![CgroupDef::named("cg_bad").cpu_quota(Duration::from_millis(50), Duration::ZERO)];
         let err = apply_setup_test(&ctx, &mut state, &defs)
-            .err()
-            .expect("apply_setup must reject period=0");
+            .expect_err("apply_setup must reject period=0");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("cg_bad") && msg.contains("period"),
@@ -7175,8 +7173,7 @@ mod tests {
         let mut state = StepState::empty(&ctx);
         let defs = vec![CgroupDef::named("cg_zero").pids_max(0)];
         let err = apply_setup_test(&ctx, &mut state, &defs)
-            .err()
-            .expect("apply_setup must reject pids_max(0)");
+            .expect_err("apply_setup must reject pids_max(0)");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("cg_zero") && msg.contains("pids.max"),

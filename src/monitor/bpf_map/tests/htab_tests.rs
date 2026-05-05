@@ -1254,7 +1254,7 @@ fn iter_percpu_htab_entries_zero_pptr_returns_empty_per_cpu() {
     map.map_type = BPF_MAP_TYPE_PERCPU_HASH;
     // Overwrite map_type in the buffer too (htab struct read).
     let htab = test_htab_offsets();
-    let map_type_off = (offsets.map_type) as usize;
+    let map_type_off = offsets.map_type;
     buf[map_type_off..map_type_off + 4].copy_from_slice(&BPF_MAP_TYPE_PERCPU_HASH.to_ne_bytes());
     // val at value position is already zero (built with val=0u64).
     let _ = htab;

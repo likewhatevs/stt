@@ -1231,8 +1231,7 @@ fn failure_dump_report_strict_schema_maps_required() {
     );
     let json = serde_json::Value::Object(full).to_string();
     let err = serde_json::from_str::<FailureDumpReport>(&json)
-        .err()
-        .expect("deserialize must reject FailureDumpReport with `maps` removed");
+        .expect_err("deserialize must reject FailureDumpReport with `maps` removed");
     let msg = format!("{err}");
     assert!(
         msg.contains("maps"),
@@ -3083,21 +3082,23 @@ fn dual_dump_display_early_absent_falls_back_when_reason_absent() {
 /// captured. Format: `per_cpu_time: {N} CPUs captured`.
 #[test]
 fn failure_dump_display_per_cpu_time_summary() {
-    let mut report = FailureDumpReport::default();
-    report.per_cpu_time = vec![
-        super::PerCpuTimeStats {
-            cpu: 0,
-            ..super::PerCpuTimeStats::default()
-        },
-        super::PerCpuTimeStats {
-            cpu: 1,
-            ..super::PerCpuTimeStats::default()
-        },
-        super::PerCpuTimeStats {
-            cpu: 2,
-            ..super::PerCpuTimeStats::default()
-        },
-    ];
+    let report = FailureDumpReport {
+        per_cpu_time: vec![
+            super::PerCpuTimeStats {
+                cpu: 0,
+                ..super::PerCpuTimeStats::default()
+            },
+            super::PerCpuTimeStats {
+                cpu: 1,
+                ..super::PerCpuTimeStats::default()
+            },
+            super::PerCpuTimeStats {
+                cpu: 2,
+                ..super::PerCpuTimeStats::default()
+            },
+        ],
+        ..FailureDumpReport::default()
+    };
     let rendered = format!("{report}");
     assert!(
         rendered.contains("per_cpu_time: 3 CPUs captured"),
@@ -3110,17 +3111,19 @@ fn failure_dump_display_per_cpu_time_summary() {
 /// CPU rows were captured.
 #[test]
 fn failure_dump_display_per_node_numa_summary() {
-    let mut report = FailureDumpReport::default();
-    report.per_node_numa = vec![
-        super::PerNodeNumaStats {
-            node: 0,
-            ..super::PerNodeNumaStats::default()
-        },
-        super::PerNodeNumaStats {
-            node: 1,
-            ..super::PerNodeNumaStats::default()
-        },
-    ];
+    let report = FailureDumpReport {
+        per_node_numa: vec![
+            super::PerNodeNumaStats {
+                node: 0,
+                ..super::PerNodeNumaStats::default()
+            },
+            super::PerNodeNumaStats {
+                node: 1,
+                ..super::PerNodeNumaStats::default()
+            },
+        ],
+        ..FailureDumpReport::default()
+    };
     let rendered = format!("{report}");
     assert!(
         rendered.contains("per_node_numa: 2 nodes captured"),
@@ -3137,8 +3140,10 @@ fn failure_dump_display_per_node_numa_summary() {
 /// host-side walker lands).
 #[test]
 fn failure_dump_display_per_node_numa_unavailable() {
-    let mut report = FailureDumpReport::default();
-    report.per_node_numa_unavailable = Some("no NUMA walker".into());
+    let report = FailureDumpReport {
+        per_node_numa_unavailable: Some("no NUMA walker".into()),
+        ..FailureDumpReport::default()
+    };
     let rendered = format!("{report}");
     assert!(
         rendered.contains("per_node_numa: <unavailable: no NUMA walker>"),
@@ -3152,10 +3157,12 @@ fn failure_dump_display_per_node_numa_unavailable() {
 #[test]
 fn failure_dump_display_scx_walker_all_present() {
     use crate::monitor::scx_walker::{DsqState, RqScxState, ScxSchedState};
-    let mut report = FailureDumpReport::default();
-    report.rq_scx_states = vec![RqScxState::default(); 4];
-    report.dsq_states = vec![DsqState::default(); 2];
-    report.scx_sched_state = Some(ScxSchedState::default());
+    let report = FailureDumpReport {
+        rq_scx_states: vec![RqScxState::default(); 4],
+        dsq_states: vec![DsqState::default(); 2],
+        scx_sched_state: Some(ScxSchedState::default()),
+        ..FailureDumpReport::default()
+    };
     let rendered = format!("{report}");
     assert!(
         rendered.contains("scx_walker: rq_scx=4 dsq=2 sched=captured"),
@@ -3169,8 +3176,10 @@ fn failure_dump_display_scx_walker_all_present() {
 #[test]
 fn failure_dump_display_scx_walker_partial() {
     use crate::monitor::scx_walker::RqScxState;
-    let mut report = FailureDumpReport::default();
-    report.rq_scx_states = vec![RqScxState::default()];
+    let report = FailureDumpReport {
+        rq_scx_states: vec![RqScxState::default()],
+        ..FailureDumpReport::default()
+    };
     let rendered = format!("{report}");
     assert!(
         rendered.contains("scx_walker: rq_scx=1 dsq=0 sched=absent"),
@@ -3182,8 +3191,10 @@ fn failure_dump_display_scx_walker_partial() {
 /// could not run (e.g. scx_sched offsets unresolved).
 #[test]
 fn failure_dump_display_scx_walker_unavailable() {
-    let mut report = FailureDumpReport::default();
-    report.scx_walker_unavailable = Some("scx_sched offsets unresolved".into());
+    let report = FailureDumpReport {
+        scx_walker_unavailable: Some("scx_sched offsets unresolved".into()),
+        ..FailureDumpReport::default()
+    };
     let rendered = format!("{report}");
     assert!(
         rendered.contains("scx_walker: <unavailable: scx_sched offsets unresolved>"),
@@ -4194,8 +4205,10 @@ fn report_dump_truncated_at_us_serde() {
     assert_eq!(parsed.dump_truncated_at_us, None);
 
     // Some(us): field present and roundtrips.
-    let mut r = FailureDumpReport::default();
-    r.dump_truncated_at_us = Some(15_000);
+    let r = FailureDumpReport {
+        dump_truncated_at_us: Some(15_000),
+        ..FailureDumpReport::default()
+    };
     let json = serde_json::to_string(&r).unwrap();
     assert!(
         json.contains("\"dump_truncated_at_us\":15000"),

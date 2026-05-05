@@ -243,11 +243,8 @@ mod tests {
             crate::monitor::symbols::compute_rq_pas(runqueues_off, &per_cpu, page_offset);
         assert_eq!(owned.rq_pas, expected_pas);
         // Every rq_kva is the recovered KVA for the same CPU's PA.
-        for cpu in 0..per_cpu.len() {
-            assert_eq!(
-                owned.rq_kvas[cpu],
-                expected_pas[cpu].wrapping_add(page_offset),
-            );
+        for (cpu, expected_pa) in expected_pas.iter().enumerate() {
+            assert_eq!(owned.rq_kvas[cpu], expected_pa.wrapping_add(page_offset),);
         }
     }
 

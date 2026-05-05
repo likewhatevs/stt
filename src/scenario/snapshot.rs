@@ -1905,7 +1905,7 @@ mod tests {
         // Two-segment path equivalent to one chained get.
         let one = snap.var("ctx.weight");
         let chained = snap.var("ctx").get("weight");
-        assert_eq!(one.error().is_some(), false);
+        assert!(one.error().is_none());
         assert_eq!(chained.as_u64().unwrap(), 1024);
         // Snapshot::var does not split — `ctx.weight` is treated
         // as one global variable name by var() (and not present).

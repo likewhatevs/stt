@@ -193,6 +193,7 @@ fn hostile_avail_idx_poisons_queue_until_reset() {
 ///      reads it from `vm_interrupt`).
 ///   3. The eventfd is signaled (irq_evt write succeeded — a
 ///      `read()` returns `Ok(_)` consuming the counter).
+///
 /// Per-event semantics: a re-kick of a poisoned queue MUST
 /// NOT re-fire the signal — the queue_poisoned gate at
 /// drain_bracket_impl's entry short-circuits before the

@@ -224,11 +224,7 @@ pub fn snapshot_request(
             reason: "SHM region not initialised yet on this guest".into(),
         };
     };
-    if size
-        < SNAPSHOT_REASON_OFFSET
-            .checked_add(SHM_SNAPSHOT_TAG_MAX)
-            .unwrap_or(usize::MAX)
-    {
+    if size < SNAPSHOT_REASON_OFFSET.saturating_add(SHM_SNAPSHOT_TAG_MAX) {
         return SnapshotRequestResult::TransportError {
             reason: format!(
                 "SHM region size {size} too small for snapshot reason buffer at offset \
@@ -301,10 +297,9 @@ pub fn snapshot_request(
                 SHM_SNAPSHOT_STATUS_OK => SnapshotRequestResult::Ok,
                 SHM_SNAPSHOT_STATUS_ERR => {
                     let mut reason_bytes = [0u8; SHM_SNAPSHOT_TAG_MAX];
-                    for i in 0..SHM_SNAPSHOT_TAG_MAX {
+                    for (i, byte) in reason_bytes.iter_mut().enumerate() {
                         // SAFETY: in-bounds per size check.
-                        reason_bytes[i] =
-                            unsafe { ptr::read_volatile(ptr.add(SNAPSHOT_REASON_OFFSET + i)) };
+                        *byte = unsafe { ptr::read_volatile(ptr.add(SNAPSHOT_REASON_OFFSET + i)) };
                     }
                     let len = reason_bytes
                         .iter()
@@ -1624,7 +1619,7 @@ mod tests {
         // them would alias with the legacy ring fields (capacity at
         // 8, write_ptr at 16, read_ptr at 24, drops at 32) or with
         // each other, silently corrupting both halves.
-        assert!(SNAPSHOT_REQUEST_ID_OFFSET >= 40);
+        const _: () = assert!(SNAPSHOT_REQUEST_ID_OFFSET >= 40);
         assert_eq!(SNAPSHOT_KIND_OFFSET, SNAPSHOT_REQUEST_ID_OFFSET + 4);
         assert_eq!(SNAPSHOT_REPLY_ID_OFFSET, SNAPSHOT_KIND_OFFSET + 4);
         assert_eq!(SNAPSHOT_STATUS_OFFSET, SNAPSHOT_REPLY_ID_OFFSET + 4);

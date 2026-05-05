@@ -90,10 +90,10 @@ impl Serial {
     /// register-decoding ladder out of every call site.
     #[inline]
     fn signal_if_writer_grew(&self, pre_len: usize) {
-        if self.inner.writer().len() > pre_len {
-            if let Some(evt) = &self.data_evt {
-                let _ = evt.write(1);
-            }
+        if self.inner.writer().len() > pre_len
+            && let Some(evt) = &self.data_evt
+        {
+            let _ = evt.write(1);
         }
     }
 

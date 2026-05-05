@@ -168,7 +168,7 @@ pub fn resolve_field_specs_with_btf(btf_func: &BtfFunc, btf: &btf_rs::Btf) -> Ve
                 None => continue,
             };
 
-            let struct_type = match resolve_struct_type(&btf, struct_name) {
+            let struct_type = match resolve_struct_type(btf, struct_name) {
                 Some(s) => s,
                 None => {
                     // Skip field slots to stay aligned with build_field_keys.
@@ -182,12 +182,12 @@ pub fn resolve_field_specs_with_btf(btf_func: &BtfFunc, btf: &btf_rs::Btf) -> Ve
 
                 if access.contains("->") {
                     let (ptr_member, target) = access.split_once("->").unwrap();
-                    let ptr_off_result = resolve_member_offset(&btf, &struct_type, ptr_member);
+                    let ptr_off_result = resolve_member_offset(btf, &struct_type, ptr_member);
                     if let Some((ptr_off, _)) = ptr_off_result {
-                        let pointed = resolve_pointed_struct(&btf, &struct_type, ptr_member);
+                        let pointed = resolve_pointed_struct(btf, &struct_type, ptr_member);
                         if let Some(pointed_struct) = pointed
                             && let Some((target_off, target_sz)) =
-                                resolve_member_offset(&btf, &pointed_struct, target)
+                                resolve_member_offset(btf, &pointed_struct, target)
                         {
                             specs.push(FieldSpec {
                                 param_idx: param_idx as u32,
@@ -203,17 +203,16 @@ pub fn resolve_field_specs_with_btf(btf_func: &BtfFunc, btf: &btf_rs::Btf) -> Ve
                             "chained deref: member offset not found",
                         );
                     }
-                } else {
-                    if let Some((offset, size)) = resolve_member_offset(&btf, &struct_type, access)
-                    {
-                        specs.push(FieldSpec {
-                            param_idx: param_idx as u32,
-                            offset,
-                            size,
-                            field_idx,
-                            ptr_offset: 0,
-                        });
-                    }
+                } else if let Some((offset, size)) =
+                    resolve_member_offset(btf, &struct_type, access)
+                {
+                    specs.push(FieldSpec {
+                        param_idx: param_idx as u32,
+                        offset,
+                        size,
+                        field_idx,
+                        ptr_offset: 0,
+                    });
                 }
 
                 field_idx += 1;
@@ -230,7 +229,7 @@ pub fn resolve_field_specs_with_btf(btf_func: &BtfFunc, btf: &btf_rs::Btf) -> Ve
                     continue;
                 }
             };
-            let struct_type = match resolve_struct_type(&btf, sname) {
+            let struct_type = match resolve_struct_type(btf, sname) {
                 Some(s) => s,
                 None => {
                     field_idx += param.auto_fields.len() as u32;
@@ -257,12 +256,12 @@ pub fn resolve_field_specs_with_btf(btf_func: &BtfFunc, btf: &btf_rs::Btf) -> Ve
 
                 if access.contains("->") {
                     if let Some((ptr_member, target)) = access.split_once("->") {
-                        let ptr_off_result = resolve_member_offset(&btf, &struct_type, ptr_member);
+                        let ptr_off_result = resolve_member_offset(btf, &struct_type, ptr_member);
                         if let Some((ptr_off, _)) = ptr_off_result {
-                            let pointed = resolve_pointed_struct(&btf, &struct_type, ptr_member);
+                            let pointed = resolve_pointed_struct(btf, &struct_type, ptr_member);
                             if let Some(pointed_struct) = pointed
                                 && let Some((target_off, target_sz)) =
-                                    resolve_member_offset(&btf, &pointed_struct, target)
+                                    resolve_member_offset(btf, &pointed_struct, target)
                             {
                                 specs.push(FieldSpec {
                                     param_idx: param_idx as u32,
@@ -275,7 +274,7 @@ pub fn resolve_field_specs_with_btf(btf_func: &BtfFunc, btf: &btf_rs::Btf) -> Ve
                         }
                     }
                 } else if let Some((offset, size)) =
-                    resolve_member_offset(&btf, &struct_type, access)
+                    resolve_member_offset(btf, &struct_type, access)
                 {
                     specs.push(FieldSpec {
                         param_idx: param_idx as u32,

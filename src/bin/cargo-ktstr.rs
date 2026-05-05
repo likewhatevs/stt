@@ -7,30 +7,30 @@
 //! `src/bin/cargo_ktstr/`:
 //!
 //! - [`cli`]    — clap-derived `Cargo` / `CargoSub` / `Ktstr` /
-//!                `KtstrCommand` / `ModelCommand` / `StatsCommand`
-//!                types that drive argument parsing and shell
-//!                completion generation.
+//!   `KtstrCommand` / `ModelCommand` / `StatsCommand`
+//!   types that drive argument parsing and shell
+//!   completion generation.
 //! - [`kernel`] — `--kernel <SPEC>` resolution shared by the `shell`,
-//!                `verifier`, and gauntlet-expansion code paths, plus
-//!                the `kernel build` subcommand dispatcher. Pure
-//!                wire-format helpers (label emission, `KTSTR_KERNEL_LIST`
-//!                encoding, dedup, collision detection) live in the
-//!                inner [`kernel::wire_format`] submodule.
+//!   `verifier`, and gauntlet-expansion code paths, plus
+//!   the `kernel build` subcommand dispatcher. Pure
+//!   wire-format helpers (label emission, `KTSTR_KERNEL_LIST`
+//!   encoding, dedup, collision detection) live in the
+//!   inner [`kernel::wire_format`] submodule.
 //! - [`run_cargo`] — `test`, `coverage`, `llvm-cov` dispatchers that
-//!                wrap `cargo nextest` with the kernel/topology
-//!                gauntlet wire format.
+//!   wrap `cargo nextest` with the kernel/topology
+//!   gauntlet wire format.
 //! - [`stats`]  — `stats compare` subcommand that diffs
-//!                `target/stats/` JSON across two kernel/scheduler
-//!                build commits or scheduler-flag profiles.
+//!   `target/stats/` JSON across two kernel/scheduler
+//!   build commits or scheduler-flag profiles.
 //! - [`verifier`] — `verifier` subcommand that runs each scheduler
-//!                profile under the BPF-stats verifier and renders
-//!                per-profile output.
+//!   profile under the BPF-stats verifier and renders
+//!   per-profile output.
 //! - [`misc`]   — smaller subcommand dispatchers, one submodule per
-//!                CLI verb: `shell`, `completions`, `funify`,
-//!                `model {fetch,status,clean}`, `export`.
+//!   CLI verb: `shell`, `completions`, `funify`,
+//!   `model {fetch,status,clean}`, `export`.
 //! - `parse_tests` (test-only) — clap parse-shape coverage: every
-//!                `KtstrCommand` variant gets at least one test that
-//!                pins flag wiring + conflict/requires constraints.
+//!   `KtstrCommand` variant gets at least one test that
+//!   pins flag wiring + conflict/requires constraints.
 //!
 //! Each `mod` declaration uses `#[path = "cargo_ktstr/<file>.rs"]`
 //! because rustc derives module file names from the bin's *file*

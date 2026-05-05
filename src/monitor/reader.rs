@@ -485,7 +485,7 @@ impl GuestMem {
                 // observable through `ptr::read_volatile` on the
                 // guest side.
                 unsafe {
-                    std::ptr::copy_nonoverlapping(data.as_ptr(), ptr as *mut u8, copy_len);
+                    std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, copy_len);
                 }
                 copy_len
             }
@@ -1332,6 +1332,7 @@ pub(crate) struct MonitorConfig<'a> {
 /// the wait returns within microseconds of the flip and the
 /// `kill.load(Acquire)` re-check at the top of the loop body
 /// observes the new state.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn monitor_loop(
     mem: &GuestMem,
     rq_pas: &[u64],

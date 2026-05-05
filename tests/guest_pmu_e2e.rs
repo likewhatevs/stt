@@ -448,10 +448,12 @@ fn guest_pmu_perf_event_open_counts_instructions(_ctx: &Ctx) -> Result<AssertRes
     use perf_event_open_sys::bindings::{PERF_COUNT_HW_INSTRUCTIONS, PERF_TYPE_HARDWARE};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-    let mut attr = pes::bindings::perf_event_attr::default();
-    attr.size = std::mem::size_of::<pes::bindings::perf_event_attr>() as u32;
-    attr.type_ = PERF_TYPE_HARDWARE;
-    attr.config = PERF_COUNT_HW_INSTRUCTIONS as u64;
+    let mut attr = pes::bindings::perf_event_attr {
+        size: std::mem::size_of::<pes::bindings::perf_event_attr>() as u32,
+        type_: PERF_TYPE_HARDWARE,
+        config: PERF_COUNT_HW_INSTRUCTIONS as u64,
+        ..Default::default()
+    };
     // disabled=1: don't count until we explicitly enable.
     // exclude_kernel=1: only count guest userspace work, not
     // kernel-side overhead (interrupt handlers, syscall

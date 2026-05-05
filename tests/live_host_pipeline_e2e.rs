@@ -254,7 +254,7 @@ fn live_host_pipeline_e2e_empty_capture_falls_back_to_defaults() {
 
 /// Serialize a DebugCapture, deserialize it back, and assert the
 /// round-trip preserves every field that round-trips (Hint enums
-/// + CgroupHint structs). Pins the on-disk schema for live-host
+/// plus CgroupHint structs). Pins the on-disk schema for live-host
 /// consumers.
 #[test]
 fn live_host_pipeline_e2e_debug_capture_serde_roundtrip() {

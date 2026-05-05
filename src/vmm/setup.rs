@@ -1479,8 +1479,8 @@ mod tests {
 
     /// Read-only Btrfs disk emits the RO token in addition to FS
     /// + MOUNT. The guest's `auto_mount_data_disks` checks
-    /// `KTSTR_DISK0_RO == "1"` and sets `MS_RDONLY` to avoid the
-    /// kernel-side -EROFS path on RW mount of a F_RO bdev.
+    ///   `KTSTR_DISK0_RO == "1"` and sets `MS_RDONLY` to avoid the
+    ///   kernel-side -EROFS path on RW mount of a F_RO bdev.
     #[test]
     fn disk_auto_mount_cmdline_tokens_btrfs_read_only() {
         let disk = disk_config::DiskConfig::default()

@@ -1330,6 +1330,7 @@ fn scx_walker_missing_groups_pins_every_group_name() {
     // matches the canonical name. The pairs below enumerate the
     // 10 sub-groups; a regression adding/removing/renaming a
     // push arm trips here.
+    #[allow(clippy::type_complexity)]
     let cases: &[(fn(&mut ScxWalkerOffsets), &'static str)] = &[
         (
             (|o: &mut ScxWalkerOffsets| o.rq = None) as fn(&mut ScxWalkerOffsets),

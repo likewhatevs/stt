@@ -595,11 +595,11 @@ fn process_requests_multiple_chains_drained_in_one_notify() {
 /// - `throttled_count` ticks, `io_errors` stays at 0,
 /// - irqfd is unsignalled and `INT_VRING` bit is unset
 ///   (the chain is invisible to the guest).
-/// The chain stays in the avail ring until the worker's
-/// retry timer fires; from the test's perspective, calling
-/// `process_requests` again after stepping the bucket
-/// forward via `set_last_refill_for_test` re-pops the same
-/// head (covered by `throttle_stall_then_refill_retry_succeeds`).
+///   The chain stays in the avail ring until the worker's
+///   retry timer fires; from the test's perspective, calling
+///   `process_requests` again after stepping the bucket
+///   forward via `set_last_refill_for_test` re-pops the same
+///   head (covered by `throttle_stall_then_refill_retry_succeeds`).
 #[test]
 fn process_requests_throttled_rolls_back_chain() {
     let cap = 4096u64;

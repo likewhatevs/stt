@@ -114,6 +114,7 @@ struct StorageScene {
     elem_pas: Vec<u64>,
 }
 
+#[allow(clippy::type_complexity)]
 fn build_storage_scene(
     n_buckets: u32,
     bucket_log: u32,
@@ -515,10 +516,9 @@ fn iter_local_storage_unmapped_bucket_continues() {
     // walker translates the elem KVA and bails, breaking the chain
     // for that bucket but continuing into bucket 2.
     let ts = test_task_storage_offsets();
-    let bucket1_first_off = (0x1000u64
-        + 1u64 * (ts.bucket_size as u64)
-        + ts.bucket_list as u64
-        + ts.hlist_head_first as u64) as usize;
+    let bucket1_first_off =
+        (0x1000u64 + (ts.bucket_size as u64) + ts.bucket_list as u64 + ts.hlist_head_first as u64)
+            as usize;
     let unmapped_kva = scene.page_offset + (1u64 << 30);
     scene.buf[bucket1_first_off..bucket1_first_off + 8]
         .copy_from_slice(&unmapped_kva.to_ne_bytes());

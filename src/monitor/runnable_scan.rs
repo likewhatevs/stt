@@ -173,6 +173,7 @@ const MAX_NODES: u32 = 65_536;
 ///
 /// All other parameters mirror [`max_runnable_age_global`] and
 /// [`max_runnable_age_per_rq`].
+#[allow(clippy::too_many_arguments)]
 pub fn max_runnable_age(
     mem: &GuestMem,
     scx_tasks_kva: u64,

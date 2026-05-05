@@ -326,8 +326,8 @@ impl<'a> GuestMemMapAccessor<'a> {
 /// - sizeof(sdt_data)` against program-BTF struct sizes, and
 /// [`super::super::sdt_alloc::SdtAllocOffsets::data_header_size`]
 /// resolves the BTF size of `struct sdt_data` itself (the `union sdt_id
-/// tid` header — `payload[]` flex array contributes 0 bytes per the
-/// kernel layout). `elem_size` is the per-slot stride from
+///   tid` header — `payload[]` flex array contributes 0 bytes per the
+///   kernel layout). `elem_size` is the per-slot stride from
 /// `pool.elem_size`; the renderer reads `elem_size` bytes from the arena
 /// at each entry's `data` pointer, skips `header_size` bytes, and
 /// renders the remaining `payload_size = elem_size - header_size` bytes

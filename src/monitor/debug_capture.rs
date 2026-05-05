@@ -799,21 +799,23 @@ mod tests {
             }
         }
 
-        let mut dump = FailureDumpReport::default();
-        dump.task_enrichments = vec![
-            make_task(100, "rt_sched_class", 50, 0),
-            make_task(101, "ext_sched_class", 0, 0),
-            make_task(102, "fair_sched_class", 0, 120),
-            // Zero-init static_prio + fair-class entry: a failure
-            // dump captured before the kernel populated the field.
-            // Pre-clamp this would project to nice=-120
-            // (`(0 as i32) - 120`) and produce an unspawnable
-            // SchedPolicyHint::Other. The clamp(-20, 19) bound (per
-            // `MIN_NICE`/`MAX_NICE` in
-            // `include/linux/sched/prio.h`) keeps the projected
-            // nice value in the kernel's legal range.
-            make_task(103, "fair_sched_class", 0, 0),
-        ];
+        let dump = FailureDumpReport {
+            task_enrichments: vec![
+                make_task(100, "rt_sched_class", 50, 0),
+                make_task(101, "ext_sched_class", 0, 0),
+                make_task(102, "fair_sched_class", 0, 120),
+                // Zero-init static_prio + fair-class entry: a failure
+                // dump captured before the kernel populated the field.
+                // Pre-clamp this would project to nice=-120
+                // (`(0 as i32) - 120`) and produce an unspawnable
+                // SchedPolicyHint::Other. The clamp(-20, 19) bound (per
+                // `MIN_NICE`/`MAX_NICE` in
+                // `include/linux/sched/prio.h`) keeps the projected
+                // nice value in the kernel's legal range.
+                make_task(103, "fair_sched_class", 0, 0),
+            ],
+            ..FailureDumpReport::default()
+        };
 
         let fp = project_fingerprint(&[], Some(&dump));
         assert_eq!(fp.sched_policy_hints.len(), 4);

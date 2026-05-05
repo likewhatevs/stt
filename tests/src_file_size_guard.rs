@@ -204,7 +204,7 @@ fn no_src_file_exceeds_3000_lines_unless_grandfathered() {
     // file (a) does not exist OR (b) shrank to ≤ DEFAULT_MAX_LINES
     // is now stale and must be removed from the literal.
     let mut stale_exceptions: Vec<(String, Option<usize>)> = Vec::new();
-    for (key, _) in &exceptions {
+    for key in exceptions.keys() {
         let path = src.join(key);
         if !path.is_file() {
             // The file was removed (e.g. split into submodules and
