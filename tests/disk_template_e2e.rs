@@ -159,7 +159,7 @@ fn scenario_btrfs_filesystem_visible_at_dev_vda(
     // x86_64/aarch64 64-bit Linux) avoids the host-side
     // sign-extension trap that motivates the `compile_error!` in
     // `disk_template.rs`.
-    let fs_type = buf.f_type as i64;
+    let fs_type = buf.f_type;
     if fs_type != BTRFS_SUPER_MAGIC {
         anyhow::bail!(
             "/mnt/disk0 has statfs.f_type=0x{fs_type:x}, expected \
