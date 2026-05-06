@@ -350,7 +350,7 @@ impl KtstrVm {
 
         let kill = Arc::new(AtomicBool::new(false));
         // Wake fd paired with the `kill` AtomicBool. Setters that
-        // flip `kill` (collect_results, vCPU shutdown classifier,
+        // flip `kill` (run_vm post-BSP-exit, vCPU shutdown classifier,
         // panic hook) ALSO write to this EventFd so any consumer
         // sleeping on `epoll_wait` returns within microseconds of
         // the flip rather than waiting up to one full poll
@@ -5840,7 +5840,7 @@ impl KtstrVm {
                         // guest. Tests that exit without sending
                         // SYS_RDY (e.g. early-init crash) must wait
                         // here only until either the eventfd fires
-                        // or `collect_results` propagates the kill
+                        // or `run_vm` propagates the kill
                         // flag — the timeout is the fallback for
                         // the case where neither wake arrives, and
                         // tighter is better because the host VM
@@ -6773,7 +6773,7 @@ impl KtstrVm {
                             // Propagate kill to peers and the freeze
                             // coordinator. Unlike the Shutdown arm
                             // (which exits with code=0 and lets
-                            // collect_results drive the kill
+                            // run_vm drive the kill
                             // propagation), Fatal indicates an
                             // unrecoverable hardware/KVM failure and
                             // peers must shut down promptly rather

@@ -80,7 +80,7 @@ slow-timeout = { period = "240s", terminate-after = 2 }
 retries = 0
 
 # EEVDF tests: no sched_ext scheduler attached, so VM lifecycle is
-# bounded by the 60s host watchdog at `runtime.rs::KTSTR_VM_TIMEOUT`
+# bounded by vm_timeout_from_entry (max(watchdog, duration, 1s) + 45s)
 # plus VM setup overhead. 75s gives a margin above that ceiling so
 # nextest does not race the watchdog. retries=0 because a watchdog
 # timeout is never transient — re-running just burns the same time.
