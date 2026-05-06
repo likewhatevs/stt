@@ -1659,6 +1659,31 @@ impl<'a> GuestMemMapAccessorOwned<'a> {
         })
     }
 
+    /// Create from pre-read vmlinux bytes and pre-parsed ELF.
+    ///
+    /// Avoids re-reading + re-parsing vmlinux on every retry in
+    /// the freeze coordinator's BPF map write loop.
+    pub fn from_elf(
+        mem: &'a GuestMem,
+        elf: &goblin::elf::Elf<'_>,
+        data: &[u8],
+        vmlinux: &std::path::Path,
+        tcr_el1: u64,
+        cr3_pa: u64,
+    ) -> anyhow::Result<Self> {
+        let kernel = super::guest::GuestKernel::from_elf(mem, elf, tcr_el1, cr3_pa)?;
+        let offsets = BpfMapOffsets::from_elf(elf, data, vmlinux)?;
+        let map_idr_kva = kernel
+            .symbol_kva("map_idr")
+            .ok_or_else(|| anyhow::anyhow!("map_idr symbol not found in vmlinux"))?;
+        Ok(Self {
+            kernel,
+            map_idr_kva,
+            offsets,
+            per_cpu_offsets_cache: PerCpuOffsetsCache::new(),
+        })
+    }
+
     /// Borrow as a [`GuestMemMapAccessor`] for map operations.
     ///
     /// The returned accessor borrows `self.offsets` and the

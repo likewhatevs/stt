@@ -168,7 +168,7 @@ pub(crate) fn append_base_sched_args(entry: &KtstrTestEntry, args: &mut Vec<Stri
 /// host-side VM kill timer. Must exceed the freeze-coordinator
 /// rendezvous timeout (30s) plus dump render + probe collection
 /// so the host doesn't kill the VM mid-dump.
-const VM_TIMEOUT_HEADROOM: Duration = Duration::from_secs(4);
+const VM_TIMEOUT_HEADROOM: Duration = Duration::ZERO;
 
 /// Derive the host-side VM timeout from the test entry's watchdog
 /// and duration. The VM should die shortly after the stall fires
@@ -703,8 +703,9 @@ mod tests {
     }
 
     #[test]
-    fn vm_timeout_headroom_is_4_seconds() {
-        assert_eq!(VM_TIMEOUT_HEADROOM, Duration::from_secs(4));
+    #[test]
+    fn vm_timeout_headroom_is_zero() {
+        assert_eq!(VM_TIMEOUT_HEADROOM, Duration::ZERO);
     }
 
     #[test]
@@ -713,7 +714,7 @@ mod tests {
             name: "default",
             ..KtstrTestEntry::DEFAULT
         };
-        // max(watchdog=5, duration=12, 1) + 4 = 16
-        assert_eq!(vm_timeout_from_entry(&entry), Duration::from_secs(16));
+        // max(watchdog=5, duration=12, 1) + 0 = 12
+        assert_eq!(vm_timeout_from_entry(&entry), Duration::from_secs(12));
     }
 }

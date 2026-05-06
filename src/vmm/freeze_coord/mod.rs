@@ -6408,6 +6408,20 @@ impl KtstrVm {
                 // detector has fired yet. On successful construction
                 // we write 1 ourselves, fanning the wake out to the
                 // monitor and the later phases.
+                let vmlinux_data = match std::fs::read(&vmlinux) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        eprintln!("bpf_map_write: read vmlinux failed: {e:#}");
+                        return;
+                    }
+                };
+                let vmlinux_elf = match goblin::elf::Elf::parse(&vmlinux_data) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        eprintln!("bpf_map_write: parse vmlinux ELF failed: {e:#}");
+                        return;
+                    }
+                };
                 let phase1_deadline =
                     std::time::Instant::now() + std::time::Duration::from_secs(30);
                 let owned = loop {
@@ -6416,7 +6430,7 @@ impl KtstrVm {
                         .map(|c| c.load(std::sync::atomic::Ordering::Acquire))
                         .unwrap_or(0);
                     let cr3_val = cr3.load(std::sync::atomic::Ordering::Acquire);
-                    match monitor::bpf_map::GuestMemMapAccessorOwned::new(&mem, &vmlinux, tcr_val, cr3_val) {
+                    match monitor::bpf_map::GuestMemMapAccessorOwned::from_elf(&mem, &vmlinux_elf, &vmlinux_data, &vmlinux, tcr_val, cr3_val) {
                         Ok(a) => {
                             let _ = probes_ready_evt.write(1);
                             break a;
