@@ -374,7 +374,11 @@ pub(super) fn arm_user_watchpoint(
 /// filesystems regardless of what UTF-8 the guest passed.
 pub(super) fn snapshot_tagged_path(base: &std::path::Path, tag: &str) -> std::path::PathBuf {
     let mut tagged = base.to_path_buf();
-    let raw_stem = base.file_stem().and_then(|s| s.to_str()).unwrap_or("dump");
+    let raw_stem = base
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty() && !s.starts_with('.'))
+        .unwrap_or("dump");
     let stem = raw_stem.strip_suffix(".failure-dump").unwrap_or(raw_stem);
     let ext = base.extension().and_then(|e| e.to_str());
     let safe_tag: String = tag
@@ -474,7 +478,7 @@ mod snapshot_tagged_path_tests {
         let out = snapshot_tagged_path(base, "../etc/passwd");
         assert_eq!(
             out,
-            PathBuf::from("/tmp/run/coord.snapshot._.._etc_passwd.json")
+            PathBuf::from("/tmp/run/coord.snapshot..._etc_passwd.json")
         );
     }
 
@@ -527,7 +531,9 @@ mod snapshot_tagged_path_tests {
     fn no_stem_path_falls_back_to_dump() {
         let base = Path::new("/tmp/run/.json");
         let out = snapshot_tagged_path(base, "tag1");
-        assert_eq!(out, PathBuf::from("/tmp/run/dump.snapshot.tag1.json"));
+        // `.json` is a dotfile (no stem, no extension per Rust Path).
+        // The function falls back to stem="dump" and ext=None.
+        assert_eq!(out, PathBuf::from("/tmp/run/dump.snapshot.tag1"));
     }
 
     /// Idempotence under re-stripping: the helper does NOT

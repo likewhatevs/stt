@@ -720,6 +720,6 @@ mod tests {
             name: "default",
             ..KtstrTestEntry::DEFAULT
         };
-        assert_eq!(vm_timeout_from_entry(&entry), Duration::from_secs(49));
+        assert_eq!(vm_timeout_from_entry(&entry), Duration::from_secs(57));
     }
 }

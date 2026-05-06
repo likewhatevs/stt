@@ -3692,6 +3692,7 @@ mod tests {
 
         let cfg = MonitorConfig {
             watchdog_override: Some(&wd),
+            page_offset,
             ..test_config()
         };
         let MonitorLoopResult {
