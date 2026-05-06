@@ -1,6 +1,13 @@
 use super::*;
 use crate::monitor::idr::{XA_CHUNK_SIZE, xa_node_shift};
 use crate::monitor::symbols::START_KERNEL_MAP;
+// `pub(super)` re-export so the child modules `tests/htab_tests.rs`
+// and `tests/local_storage_tests.rs` keep their existing
+// `super::name_from_str(...)` call sites compiling without each
+// importing from `crate::monitor::test_util` separately. Single
+// source of truth for the helper lives in
+// [`crate::monitor::test_util`].
+pub(super) use crate::monitor::test_util::name_from_str;
 
 /// Test-only alias: many value-I/O tests don't thread an
 /// `&BpfMapOffsets` through, because `read_value` / `write_value`
@@ -353,6 +360,224 @@ fn translate_kva_pte_not_present() {
     assert_eq!(mem.translate_kva(pgd_pa, Kva(kva), false, 0), None);
 }
 
+// -- translate_kva: TLB cache --
+
+/// Build two minimal 4-level page tables in a single buffer that
+/// resolve the same KVA to different PAs depending on which CR3 is
+/// supplied. Used by the TLB cr3-invalidation test below.
+///
+/// Returns `(buf, cr3_a, cr3_b, kva, data_pa_a, data_pa_b)` where:
+/// - `cr3_a` resolves `kva` -> `data_pa_a`
+/// - `cr3_b` resolves `kva` -> `data_pa_b`
+#[cfg(target_arch = "x86_64")]
+fn setup_two_page_tables() -> (Vec<u8>, u64, u64, u64, u64, u64) {
+    let kva: u64 = 0xFFFF_8880_0000_5000;
+    let pgd_idx = (kva >> 39) & 0x1FF;
+    let pud_idx = (kva >> 30) & 0x1FF;
+    let pmd_idx = (kva >> 21) & 0x1FF;
+    let pte_idx = (kva >> 12) & 0x1FF;
+
+    // Layout: PT_A pgd..pte then data_a, then PT_B pgd..pte then data_b.
+    let pgd_a: u64 = 0x10000;
+    let pud_a: u64 = pgd_a + 0x1000;
+    let pmd_a: u64 = pud_a + 0x1000;
+    let pte_a: u64 = pmd_a + 0x1000;
+    let data_a: u64 = pte_a + 0x1000;
+    let pgd_b: u64 = data_a + 0x1000;
+    let pud_b: u64 = pgd_b + 0x1000;
+    let pmd_b: u64 = pud_b + 0x1000;
+    let pte_b: u64 = pmd_b + 0x1000;
+    let data_b: u64 = pte_b + 0x1000;
+
+    let size = (data_b + 0x1000) as usize;
+    let mut buf = vec![0u8; size];
+
+    let write_entry = |buf: &mut Vec<u8>, base: u64, idx: u64, val: u64| {
+        let off = (base + idx * 8) as usize;
+        buf[off..off + 8].copy_from_slice(&val.to_ne_bytes());
+    };
+
+    write_entry(&mut buf, pgd_a, pgd_idx, (pud_a + PTE_BASE) | 0x63);
+    write_entry(&mut buf, pud_a, pud_idx, (pmd_a + PTE_BASE) | 0x63);
+    write_entry(&mut buf, pmd_a, pmd_idx, (pte_a + PTE_BASE) | 0x63);
+    write_entry(&mut buf, pte_a, pte_idx, (data_a + PTE_BASE) | 0x63);
+
+    write_entry(&mut buf, pgd_b, pgd_idx, (pud_b + PTE_BASE) | 0x63);
+    write_entry(&mut buf, pud_b, pud_idx, (pmd_b + PTE_BASE) | 0x63);
+    write_entry(&mut buf, pmd_b, pmd_idx, (pte_b + PTE_BASE) | 0x63);
+    write_entry(&mut buf, pte_b, pte_idx, (data_b + PTE_BASE) | 0x63);
+
+    // Distinguishable marker bytes so a wrong-CR3 cache hit would
+    // surface as the wrong marker (not just the wrong PA).
+    buf[data_a as usize..data_a as usize + 8]
+        .copy_from_slice(&0xAAAA_AAAA_AAAA_AAAAu64.to_ne_bytes());
+    buf[data_b as usize..data_b as usize + 8]
+        .copy_from_slice(&0xBBBB_BBBB_BBBB_BBBBu64.to_ne_bytes());
+
+    (buf, pgd_a, pgd_b, kva, data_a, data_b)
+}
+
+/// TLB cache hit: a second translate of the same `(cr3, kva)`
+/// returns the cached PA. Verifies the on-page in-page-offset
+/// splice by translating the page-aligned KVA and a +0x100 offset
+/// in sequence: the second call must reuse the cached PA page.
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn translate_kva_tlb_hit_same_page_returns_consistent_pa() {
+    let (buf, cr3_pa, kva, data_pa) = setup_page_table();
+    // SAFETY: buf is a live local buffer whose backing storage
+    // outlives the GuestMem use.
+    let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
+
+    // Cold miss populates the cache.
+    let pa1 = mem.translate_kva(cr3_pa, Kva(kva), false, 0);
+    assert_eq!(pa1, Some(data_pa));
+
+    // Hit: same cr3 + same kva — must return same PA without walking.
+    let pa2 = mem.translate_kva(cr3_pa, Kva(kva), false, 0);
+    assert_eq!(pa2, Some(data_pa));
+
+    // Hit: same cr3, KVA in same 4 KiB page — splice in the in-page
+    // offset and return data_pa+0x100.
+    let pa3 = mem.translate_kva(cr3_pa, Kva(kva + 0x100), false, 0);
+    assert_eq!(pa3, Some(data_pa + 0x100));
+}
+
+/// TLB cache miss: a translate of a different page (different
+/// `kva_page`) does NOT reuse the cached entry from the previous
+/// page. Checks that successive lookups across pages return the
+/// correct PA each time.
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn translate_kva_tlb_miss_different_page_does_not_alias() {
+    let kva_a: u64 = 0xFFFF_8880_0000_5000;
+    let kva_b: u64 = 0xFFFF_8880_0000_6000; // adjacent 4 KiB page
+    let pgd_idx = (kva_a >> 39) & 0x1FF;
+    let pud_idx = (kva_a >> 30) & 0x1FF;
+    let pmd_idx = (kva_a >> 21) & 0x1FF;
+    let pte_idx_a = (kva_a >> 12) & 0x1FF;
+    let pte_idx_b = (kva_b >> 12) & 0x1FF;
+
+    let pgd_pa: u64 = 0x10000;
+    let pud_pa: u64 = pgd_pa + 0x1000;
+    let pmd_pa: u64 = pud_pa + 0x1000;
+    let pte_pa: u64 = pmd_pa + 0x1000;
+    let data_a: u64 = pte_pa + 0x1000;
+    let data_b: u64 = data_a + 0x1000;
+
+    let size = (data_b + 0x1000) as usize;
+    let mut buf = vec![0u8; size];
+
+    let write_entry = |buf: &mut Vec<u8>, base: u64, idx: u64, val: u64| {
+        let off = (base + idx * 8) as usize;
+        buf[off..off + 8].copy_from_slice(&val.to_ne_bytes());
+    };
+
+    write_entry(&mut buf, pgd_pa, pgd_idx, (pud_pa + PTE_BASE) | 0x63);
+    write_entry(&mut buf, pud_pa, pud_idx, (pmd_pa + PTE_BASE) | 0x63);
+    write_entry(&mut buf, pmd_pa, pmd_idx, (pte_pa + PTE_BASE) | 0x63);
+    // Two adjacent PTE entries that map their KVAs to two non-
+    // adjacent data PAs, so a stale cache entry aliasing across the
+    // page boundary would surface as a wrong PA rather than coincidence.
+    write_entry(&mut buf, pte_pa, pte_idx_a, (data_a + PTE_BASE) | 0x63);
+    write_entry(&mut buf, pte_pa, pte_idx_b, (data_b + PTE_BASE) | 0x63);
+
+    // SAFETY: buf is a live local buffer.
+    let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
+
+    // First page populates the cache.
+    let pa_a1 = mem.translate_kva(pgd_pa, Kva(kva_a), false, 0);
+    assert_eq!(pa_a1, Some(data_a));
+
+    // Second page must walk fresh — the cached entry's `kva_page`
+    // does not match.
+    let pa_b = mem.translate_kva(pgd_pa, Kva(kva_b), false, 0);
+    assert_eq!(pa_b, Some(data_b));
+
+    // Re-fetching the first page now returns its real PA — even
+    // though the cache currently holds page B's entry, the lookup
+    // walks again and the result is correct.
+    let pa_a2 = mem.translate_kva(pgd_pa, Kva(kva_a), false, 0);
+    assert_eq!(pa_a2, Some(data_a));
+}
+
+/// TLB cache invalidation on cr3 mismatch: the cache populated by
+/// CR3=A must NOT alias when looking up under CR3=B even when the
+/// KVA is identical. Uses [`setup_two_page_tables`] which maps the
+/// same KVA to distinct PAs under each CR3, so a wrong-CR3 hit
+/// would return the wrong marker bytes.
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn translate_kva_tlb_cr3_mismatch_invalidates() {
+    let (buf, cr3_a, cr3_b, kva, data_a, data_b) = setup_two_page_tables();
+    // SAFETY: buf is a live local buffer.
+    let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
+
+    // Populate the cache under CR3=A.
+    let pa_a1 = mem.translate_kva(cr3_a, Kva(kva), false, 0);
+    assert_eq!(pa_a1, Some(data_a));
+    assert_eq!(mem.read_u64(pa_a1.unwrap(), 0), 0xAAAA_AAAA_AAAA_AAAA);
+
+    // Lookup under CR3=B for the same KVA must walk fresh and
+    // resolve to data_b — the cached A entry's `cr3_pa` does not
+    // match CR3=B, so the cache is bypassed.
+    let pa_b = mem.translate_kva(cr3_b, Kva(kva), false, 0);
+    assert_eq!(pa_b, Some(data_b));
+    assert_eq!(mem.read_u64(pa_b.unwrap(), 0), 0xBBBB_BBBB_BBBB_BBBB);
+
+    // After the CR3=B walk, the cache now holds the B entry.
+    // CR3=A lookup must walk fresh again and resolve to data_a.
+    let pa_a2 = mem.translate_kva(cr3_a, Kva(kva), false, 0);
+    assert_eq!(pa_a2, Some(data_a));
+    assert_eq!(mem.read_u64(pa_a2.unwrap(), 0), 0xAAAA_AAAA_AAAA_AAAA);
+}
+
+/// TLB cache invalidation on l5 mismatch: a `(cr3, kva)` cached
+/// under `l5=false` must not alias under `l5=true`. The L5 walker
+/// reads a PML5 entry at `cr3 + pml5_idx*8` whose bytes have no
+/// reason to match the 4-level walk's PML4 entry; the resulting
+/// translation (success or None) is whatever the L5 walker computes
+/// independently. The invariant the cache key enforces: regardless
+/// of what the L5 walk returns, a subsequent `l5=false` lookup
+/// must still return the original data PA. If the L5 result had
+/// overwritten the cache slot under the same key, the next
+/// `l5=false` lookup would return the L5 walker's PA (or miss and
+/// re-walk to the correct value); with the `l5` field in the key,
+/// the slots are independent and the 4-level result survives.
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn translate_kva_tlb_l5_mismatch_invalidates() {
+    let (buf, cr3_pa, kva, data_pa) = setup_page_table();
+    // SAFETY: buf is a live local buffer.
+    let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
+
+    // Populate cache with l5=false.
+    let pa1 = mem.translate_kva(cr3_pa, Kva(kva), false, 0);
+    assert_eq!(pa1, Some(data_pa));
+
+    // Cross-mode lookup. We do not assert the L5 result itself
+    // because the buffer is not a valid 5-level layout; the walker
+    // may succeed (composing a different chain through the same
+    // bytes) or fail. What matters: the lookup must not be served
+    // from the l5=false cache slot.
+    let _ = mem.translate_kva(cr3_pa, Kva(kva), true, 0);
+
+    // The 4-level result must still be correct. With `l5` in the
+    // cache key the L5 walk wrote a separate slot key (or no slot
+    // at all if it failed), so the original 4-level entry is either
+    // intact or freshly walked — both produce the right PA. Without
+    // the gate, the L5 walk would have evicted the 4-level entry
+    // by writing under the same key, and the next 4-level lookup
+    // would either hit the (wrong) L5-cached PA or miss and re-
+    // walk; both paths return the correct PA from the buffer's
+    // 4-level layout, so this test alone is not sufficient to
+    // observe the bug. Pair with the cr3-mismatch test above which
+    // makes the contamination directly observable through marker
+    // bytes.
+    let pa3 = mem.translate_kva(cr3_pa, Kva(kva), false, 0);
+    assert_eq!(pa3, Some(data_pa));
+}
+
 // -- write_bpf_map_value tests --
 
 #[test]
@@ -366,7 +591,8 @@ fn write_bpf_map_value_u32_roundtrip() {
     let info = BpfMapInfo {
         map_pa: 0,
         map_kva: 0,
-        name: "test.bss".into(),
+        name_bytes: name_from_str("test.bss").0,
+        name_len: name_from_str("test.bss").1,
         map_type: BPF_MAP_TYPE_ARRAY,
         map_flags: 0,
         key_size: 0,
@@ -692,7 +918,7 @@ fn find_bpf_map_discovers_matching_map() {
     );
 
     let info = result.expect("should find the map");
-    assert_eq!(info.name, "mitosis.bss");
+    assert_eq!(info.name(), "mitosis.bss");
     assert_eq!(info.map_type, BPF_MAP_TYPE_ARRAY);
     assert_eq!(info.value_size, 64);
     assert_eq!(info.map_pa, 0x14000);
@@ -893,7 +1119,8 @@ fn write_bpf_map_value_bytes_roundtrip() {
     let info = BpfMapInfo {
         map_pa: 0,
         map_kva: 0,
-        name: "test.bss".into(),
+        name_bytes: name_from_str("test.bss").0,
+        name_len: name_from_str("test.bss").1,
         map_type: BPF_MAP_TYPE_ARRAY,
         map_flags: 0,
         key_size: 0,
@@ -931,7 +1158,8 @@ fn write_bpf_map_value_fails_on_unmapped_kva() {
     let info = BpfMapInfo {
         map_pa: 0,
         map_kva: 0,
-        name: "test.bss".into(),
+        name_bytes: name_from_str("test.bss").0,
+        name_len: name_from_str("test.bss").1,
         map_type: BPF_MAP_TYPE_ARRAY,
         map_flags: 0,
         key_size: 0,
@@ -1230,7 +1458,7 @@ fn find_bpf_map_skips_wrong_name_finds_second() {
         ".bss",
     );
     let info = result.expect("should find second map");
-    assert_eq!(info.name, "mitosis.bss");
+    assert_eq!(info.name(), "mitosis.bss");
     assert_eq!(info.map_pa, 0x15000);
     assert_eq!(info.value_size, 128);
 }
@@ -1253,7 +1481,7 @@ fn find_bpf_map_full_length_name() {
         ".bss",
     );
     let info = result.expect("should find map with 15-char name");
-    assert_eq!(info.name, full_name);
+    assert_eq!(info.name(), full_name);
 }
 
 #[test]
@@ -1299,7 +1527,8 @@ fn write_bpf_map_value_nonzero_offset() {
     let info = BpfMapInfo {
         map_pa: 0,
         map_kva: 0,
-        name: "test.bss".into(),
+        name_bytes: name_from_str("test.bss").0,
+        name_len: name_from_str("test.bss").1,
         map_type: BPF_MAP_TYPE_ARRAY,
         map_flags: 0,
         key_size: 0,
@@ -1341,7 +1570,8 @@ fn write_bpf_map_value_empty_data() {
     let info = BpfMapInfo {
         map_pa: 0,
         map_kva: 0,
-        name: "test.bss".into(),
+        name_bytes: name_from_str("test.bss").0,
+        name_len: name_from_str("test.bss").1,
         map_type: BPF_MAP_TYPE_ARRAY,
         map_flags: 0,
         key_size: 0,
@@ -1376,7 +1606,8 @@ fn write_bpf_map_value_u32_5level() {
     let info = BpfMapInfo {
         map_pa: 0,
         map_kva: 0,
-        name: "test.bss".into(),
+        name_bytes: name_from_str("test.bss").0,
+        name_len: name_from_str("test.bss").1,
         map_type: BPF_MAP_TYPE_ARRAY,
         map_flags: 0,
         key_size: 0,
@@ -1670,7 +1901,7 @@ fn find_bpf_map_5level() {
     );
 
     let info = result.expect("should find map via 5-level walk");
-    assert_eq!(info.name, "test.bss");
+    assert_eq!(info.name(), "test.bss");
     assert_eq!(info.map_pa, map_pa);
     assert_eq!(info.value_size, 96);
     assert_eq!(info.value_kva, Some(map_kva + offsets.array_value as u64));
@@ -1725,7 +1956,8 @@ fn write_bpf_map_value_across_page_boundary() {
     let info = BpfMapInfo {
         map_pa: 0,
         map_kva: 0,
-        name: "test.bss".into(),
+        name_bytes: name_from_str("test.bss").0,
+        name_len: name_from_str("test.bss").1,
         map_type: BPF_MAP_TYPE_ARRAY,
         map_flags: 0,
         key_size: 0,
@@ -1770,7 +2002,8 @@ fn write_bpf_map_value_single_byte_on_second_page() {
     let info = BpfMapInfo {
         map_pa: 0,
         map_kva: 0,
-        name: "test.bss".into(),
+        name_bytes: name_from_str("test.bss").0,
+        name_len: name_from_str("test.bss").1,
         map_type: BPF_MAP_TYPE_ARRAY,
         map_flags: 0,
         key_size: 0,
@@ -1919,7 +2152,7 @@ fn find_bpf_map_skips_untranslatable_finds_translatable() {
     );
 
     let info = result.expect("should skip untranslatable entry and find the second");
-    assert_eq!(info.name, "target.bss");
+    assert_eq!(info.name(), "target.bss");
     assert_eq!(info.map_pa, map2_pa);
     assert_eq!(info.value_size, 200);
 }
@@ -1939,7 +2172,8 @@ fn read_bpf_map_value_u32_roundtrip() {
     let info = BpfMapInfo {
         map_pa: 0,
         map_kva: 0,
-        name: "test.bss".into(),
+        name_bytes: name_from_str("test.bss").0,
+        name_len: name_from_str("test.bss").1,
         map_type: BPF_MAP_TYPE_ARRAY,
         map_flags: 0,
         key_size: 0,
@@ -1968,7 +2202,8 @@ fn read_bpf_map_value_bytes() {
     let info = BpfMapInfo {
         map_pa: 0,
         map_kva: 0,
-        name: "test.bss".into(),
+        name_bytes: name_from_str("test.bss").0,
+        name_len: name_from_str("test.bss").1,
         map_type: BPF_MAP_TYPE_ARRAY,
         map_flags: 0,
         key_size: 0,
@@ -1996,7 +2231,8 @@ fn read_bpf_map_value_empty() {
     let info = BpfMapInfo {
         map_pa: 0,
         map_kva: 0,
-        name: "test.bss".into(),
+        name_bytes: name_from_str("test.bss").0,
+        name_len: name_from_str("test.bss").1,
         map_type: BPF_MAP_TYPE_ARRAY,
         map_flags: 0,
         key_size: 0,
@@ -2024,7 +2260,8 @@ fn read_bpf_map_value_unmapped_returns_none() {
     let info = BpfMapInfo {
         map_pa: 0,
         map_kva: 0,
-        name: "test.bss".into(),
+        name_bytes: name_from_str("test.bss").0,
+        name_len: name_from_str("test.bss").1,
         map_type: BPF_MAP_TYPE_ARRAY,
         map_flags: 0,
         key_size: 0,
@@ -2058,7 +2295,8 @@ fn write_then_read_bpf_map_value_roundtrip() {
     let info = BpfMapInfo {
         map_pa: 0,
         map_kva: 0,
-        name: "test.bss".into(),
+        name_bytes: name_from_str("test.bss").0,
+        name_len: name_from_str("test.bss").1,
         map_type: BPF_MAP_TYPE_ARRAY,
         map_flags: 0,
         key_size: 0,
@@ -2114,7 +2352,8 @@ fn read_bpf_map_value_across_page_boundary() {
     let info = BpfMapInfo {
         map_pa: 0,
         map_kva: 0,
-        name: "test.bss".into(),
+        name_bytes: name_from_str("test.bss").0,
+        name_len: name_from_str("test.bss").1,
         map_type: BPF_MAP_TYPE_ARRAY,
         map_flags: 0,
         key_size: 0,
@@ -2143,7 +2382,8 @@ fn read_bpf_map_value_u32_5level() {
     let info = BpfMapInfo {
         map_pa: 0,
         map_kva: 0,
-        name: "test.bss".into(),
+        name_bytes: name_from_str("test.bss").0,
+        name_len: name_from_str("test.bss").1,
         map_type: BPF_MAP_TYPE_ARRAY,
         map_flags: 0,
         key_size: 0,
@@ -2186,8 +2426,8 @@ fn find_all_bpf_maps_returns_both_types() {
         idr_kva,
     );
     assert_eq!(maps.len(), 2);
-    let hash_map = maps.iter().find(|m| m.name == "other.data");
-    let array_map = maps.iter().find(|m| m.name == "mitosis.bss");
+    let hash_map = maps.iter().find(|m| m.name() == "other.data");
+    let array_map = maps.iter().find(|m| m.name() == "mitosis.bss");
     assert!(hash_map.is_some(), "HASH map should be in results");
     assert!(array_map.is_some(), "ARRAY map should be in results");
     assert_eq!(hash_map.unwrap().map_type, 1); // BPF_MAP_TYPE_HASH
@@ -2209,7 +2449,7 @@ fn find_all_bpf_maps_single_entry() {
         idr_kva,
     );
     assert_eq!(maps.len(), 1);
-    assert_eq!(maps[0].name, "test.bss");
+    assert_eq!(maps[0].name(), "test.bss");
 }
 
 #[test]
@@ -2266,7 +2506,8 @@ fn read_value_returns_none_for_non_array_map() {
     let info = BpfMapInfo {
         map_pa: 0,
         map_kva: 0,
-        name: "hash.map".into(),
+        name_bytes: name_from_str("hash.map").0,
+        name_len: name_from_str("hash.map").1,
         map_type: 1, // HASH
         map_flags: 0,
         key_size: 0,
@@ -2294,7 +2535,8 @@ fn write_value_returns_false_for_non_array_map() {
     let info = BpfMapInfo {
         map_pa: 0,
         map_kva: 0,
-        name: "hash.map".into(),
+        name_bytes: name_from_str("hash.map").0,
+        name_len: name_from_str("hash.map").1,
         map_type: 1, // HASH
         map_flags: 0,
         key_size: 0,
@@ -2480,7 +2722,7 @@ fn find_all_bpf_maps_continues_past_untranslatable_entry() {
     );
 
     // Should find the second map despite the first being untranslatable.
-    let good = maps.iter().find(|m| m.name == "good.bss");
+    let good = maps.iter().find(|m| m.name() == "good.bss");
     assert!(
         good.is_some(),
         "good.bss should be found despite bad entry at slot 0"
@@ -2501,7 +2743,8 @@ fn read_value_rejects_out_of_bounds() {
     let info = BpfMapInfo {
         map_pa: 0,
         map_kva: 0,
-        name: "test.bss".into(),
+        name_bytes: name_from_str("test.bss").0,
+        name_len: name_from_str("test.bss").1,
         map_type: BPF_MAP_TYPE_ARRAY,
         map_flags: 0,
         key_size: 0,
@@ -2535,7 +2778,8 @@ fn write_value_rejects_out_of_bounds() {
     let info = BpfMapInfo {
         map_pa: 0,
         map_kva: 0,
-        name: "test.bss".into(),
+        name_bytes: name_from_str("test.bss").0,
+        name_len: name_from_str("test.bss").1,
         map_type: BPF_MAP_TYPE_ARRAY,
         map_flags: 0,
         key_size: 0,
@@ -2585,7 +2829,8 @@ fn bpf_map_info_btf_fields_default_zero() {
     let info = BpfMapInfo {
         map_pa: 0x1000,
         map_kva: 0,
-        name: "test".into(),
+        name_bytes: name_from_str("test").0,
+        name_len: name_from_str("test").1,
         map_type: BPF_MAP_TYPE_ARRAY,
         map_flags: 0,
         key_size: 0,
@@ -2606,7 +2851,8 @@ fn bpf_map_info_btf_fields_populated() {
     let info = BpfMapInfo {
         map_pa: 0x1000,
         map_kva: 0,
-        name: "test".into(),
+        name_bytes: name_from_str("test").0,
+        name_len: name_from_str("test").1,
         map_type: BPF_MAP_TYPE_ARRAY,
         map_flags: 0,
         key_size: 0,
@@ -2808,9 +3054,9 @@ fn find_all_bpf_maps_respects_idr_next_bound() {
 
     // Only 2 maps should be found (idr_next=2 means scan 0..2).
     assert_eq!(maps.len(), 2);
-    assert!(maps.iter().any(|m| m.name == "first.bss"));
-    assert!(maps.iter().any(|m| m.name == "second.bss"));
-    assert!(!maps.iter().any(|m| m.name == "third.bss"));
+    assert!(maps.iter().any(|m| m.name() == "first.bss"));
+    assert!(maps.iter().any(|m| m.name() == "second.bss"));
+    assert!(!maps.iter().any(|m| m.name() == "third.bss"));
 }
 
 // -- translate_kva in kernel image / vmalloc region --
@@ -3472,6 +3718,293 @@ fn va_bits_from_tcr_decode() {
     // tcr_el1 == 0 (TCR not yet readable) likewise returns None;
     // callers in retry loops treat None as "TCR not ready".
     assert_eq!(start_kernel_map_for_tcr(0), None);
+}
+
+/// `Aarch64WalkParams::from_tcr_el1` must bail when TCR_EL1.DS=1
+/// (FEAT_LPA2). The walker's `descaddrmask` recovers low OA bits
+/// up to bit 49 only; FEAT_LPA2 stores OA bits [51:50] in
+/// descriptor bits [9:8], which the granule-aligned mask drops as
+/// low descriptor metadata. Without the high-OA splice, valid LPA2
+/// PTEs translate to wrong PAs that read attacker-controlled memory
+/// or unmapped addresses. Returning None surfaces "translation
+/// failed" instead of silently corrupt reads.
+///
+/// Use 16 KiB granule because the existing walker rejects
+/// 5-level walks (`levels_below > 4`). With 16 KiB stride=11 and
+/// T1SZ=12 (52-bit VA), `levels_below = (52-4)/11 = 4`, so the
+/// DS-bit gate is the only thing rejecting the LPA2 case — the
+/// matching DS=0 TCR accepts cleanly.
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn aarch64_walk_params_rejects_feat_lpa2() {
+    use crate::monitor::reader::Aarch64WalkParams;
+    // 16 KiB granule, T1SZ=12 (52-bit VA), TCR_EL1.DS=1 (bit 59).
+    // Without the DS gate this would otherwise decode to valid
+    // 4-level walk params and return wrong leaf PAs.
+    let tcr_lpa2_16k = (1u64 << 59) | (0b01u64 << 30) | (12u64 << 16);
+    assert!(
+        Aarch64WalkParams::from_tcr_el1(tcr_lpa2_16k).is_none(),
+        "LPA2 (TCR_EL1.DS=1) must be rejected"
+    );
+    // Same TCR with DS=0 must succeed — pinning the DS-only
+    // rejection (i.e. nothing else changed in the decode path).
+    let tcr_no_ds_16k = (0b01u64 << 30) | (12u64 << 16);
+    assert!(
+        Aarch64WalkParams::from_tcr_el1(tcr_no_ds_16k).is_some(),
+        "DS=0 with otherwise identical TCR must accept"
+    );
+    // 4 KiB granule LPA2 candidate (T1SZ=12). The walker rejects
+    // the 5-level walk via `levels_below > 4` regardless of DS,
+    // so this case is double-protected. Asserting None here pins
+    // that combined behaviour.
+    let tcr_lpa2_4k = (1u64 << 59) | (0b10u64 << 30) | (12u64 << 16);
+    assert!(Aarch64WalkParams::from_tcr_el1(tcr_lpa2_4k).is_none());
+}
+
+// -- MapMetadata fall-through tests --
+//
+// `MapMetadata::read` issues one bulk `read_bytes` covering up to
+// [`MAP_METADATA_SPAN`] (384) bytes starting at `map_pa`. When
+// `map_pa` is near end-of-DRAM, `read_bytes` returns short
+// (`copied < MAP_METADATA_SPAN`); offsets that fall past `copied`
+// must trip the scalar fall-through path on `u32_at` / `u64_at`
+// rather than indexing into the uninitialized scratch tail. The
+// scalar path (`mem.read_u32`/`read_u64`) already bounds-checks and
+// returns 0 for out-of-range addresses, matching the pre-batch
+// behaviour bit-for-bit per the doc on `MapMetadata::u32_at`.
+
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn map_metadata_short_copy_u32_at_falls_through_to_scalar() {
+    // Build a buffer where `map_pa` is positioned so the bulk read
+    // returns fewer than `MAP_METADATA_SPAN` bytes. Pre-fill known
+    // bytes inside the copied window so the in-buffer arm produces
+    // a recognisable u32; then probe an offset past `copied` whose
+    // scalar fall-through reads past end-of-DRAM and returns 0.
+    let total: usize = 256;
+    let map_pa: u64 = 100;
+    // copied = min(MAP_METADATA_SPAN, total - map_pa) = min(384, 156) = 156.
+    let expected_copied = total - map_pa as usize;
+    assert!(
+        expected_copied < MAP_METADATA_SPAN,
+        "test premise: bulk read must truncate"
+    );
+    let mut buf = vec![0u8; total];
+    // Write a known u32 at map_pa + 8 (well inside the copied span).
+    let in_range_off: usize = 8;
+    let in_range_val: u32 = 0xDEAD_BEEF;
+    buf[map_pa as usize + in_range_off..map_pa as usize + in_range_off + 4]
+        .copy_from_slice(&in_range_val.to_ne_bytes());
+    // SAFETY: buf is a live local Vec<u8> whose backing storage
+    // outlives the GuestMem use.
+    let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
+    let meta = MapMetadata::read(&mem, map_pa, &BpfMapOffsets::EMPTY);
+    assert_eq!(
+        meta.copied, expected_copied,
+        "bulk read must short-return when map_pa is near end-of-DRAM"
+    );
+
+    // In-range offset reads from the cached scratch buffer.
+    assert_eq!(
+        meta.u32_at(in_range_off),
+        in_range_val,
+        "in-range u32_at must read from the cached buffer"
+    );
+
+    // Past-`copied` offset falls through to the scalar path. The
+    // scalar `read_u32(map_pa=100, offset=200)` addresses byte 300,
+    // which is past the 256-byte GuestMem; `read_u32` bounds-checks
+    // and returns 0. Matches the doc contract on `MapMetadata::u32_at`
+    // ("bit-for-bit" against the pre-batch scalar path).
+    let past_off: usize = 200;
+    assert!(past_off + 4 > meta.copied, "test premise: must trip scalar");
+    assert_eq!(
+        meta.u32_at(past_off),
+        0,
+        "past-copied u32_at must fall through to scalar; OOB returns 0"
+    );
+}
+
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn map_metadata_short_copy_u64_at_falls_through_to_scalar() {
+    // Mirror of the u32 test for the 8-byte path. Same shape:
+    // in-range read hits the buffer, past-copied read trips the
+    // scalar fall-through which returns 0 (OOB).
+    let total: usize = 200;
+    let map_pa: u64 = 50;
+    let expected_copied = total - map_pa as usize; // 150
+    assert!(
+        expected_copied < MAP_METADATA_SPAN,
+        "test premise: bulk read must truncate"
+    );
+    let mut buf = vec![0u8; total];
+    let in_range_off: usize = 16;
+    let in_range_val: u64 = 0xCAFEBABE_DEAD_F00D;
+    buf[map_pa as usize + in_range_off..map_pa as usize + in_range_off + 8]
+        .copy_from_slice(&in_range_val.to_ne_bytes());
+    // SAFETY: buf is a live local Vec<u8> whose backing storage
+    // outlives the GuestMem use.
+    let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
+    let meta = MapMetadata::read(&mem, map_pa, &BpfMapOffsets::EMPTY);
+    assert_eq!(meta.copied, expected_copied);
+
+    assert_eq!(
+        meta.u64_at(in_range_off),
+        in_range_val,
+        "in-range u64_at must read from the cached buffer"
+    );
+
+    // Past-copied: 8-byte read at offset 152 needs bytes [152..160).
+    // `copied` is 150, so 152+8 > 150 → scalar fall-through. Scalar
+    // address is map_pa(50) + 152 = 202, end 210 > total 200 → 0.
+    let past_off: usize = 152;
+    assert!(past_off + 8 > meta.copied);
+    assert_eq!(
+        meta.u64_at(past_off),
+        0,
+        "past-copied u64_at must fall through to scalar; OOB returns 0"
+    );
+}
+
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn map_metadata_short_copy_u32_at_boundary() {
+    // Boundary: an offset where `off + 4 == copied` exactly. Must
+    // STILL read from the cached buffer (the gate is `<= copied`,
+    // not `<`). One byte further trips the fall-through.
+    let total: usize = 100;
+    let map_pa: u64 = 20;
+    let expected_copied = total - map_pa as usize; // 80
+    let mut buf = vec![0u8; total];
+    // Known u32 at offset (copied - 4).
+    let boundary_off = expected_copied - 4; // 76
+    let boundary_val: u32 = 0x1234_5678;
+    buf[map_pa as usize + boundary_off..map_pa as usize + boundary_off + 4]
+        .copy_from_slice(&boundary_val.to_ne_bytes());
+    // SAFETY: buf is a live local Vec<u8> whose backing storage
+    // outlives the GuestMem use.
+    let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
+    let meta = MapMetadata::read(&mem, map_pa, &BpfMapOffsets::EMPTY);
+    assert_eq!(meta.copied, expected_copied);
+
+    assert_eq!(
+        meta.u32_at(boundary_off),
+        boundary_val,
+        "boundary off+4==copied must read from buffer (gate is `<=`)"
+    );
+    // One byte past: off+4=copied+1 > copied, falls through.
+    // Scalar address map_pa(20) + (boundary_off + 1)(77) = 97,
+    // end 101 > total 100, OOB → 0.
+    assert_eq!(
+        meta.u32_at(boundary_off + 1),
+        0,
+        "one byte past the boundary must fall through to scalar OOB",
+    );
+}
+
+// -- PerCpuOffsetsCache tests --
+//
+// `PerCpuOffsetsCache` is a single-slot cache keyed on the
+// `num_cpus` argument every percpu trait method passes. A repeat
+// call with the same `num_cpus` must return the cached `Arc<Vec<u64>>`
+// without re-running the resolver closure. A call with a different
+// `num_cpus` must drop the prior slot and re-run the closure with
+// the new count.
+
+#[test]
+fn per_cpu_offsets_cache_hit_returns_same_arc() {
+    let cache = PerCpuOffsetsCache::new();
+    // Track invocations so a cache miss surfaces as a second
+    // invocation; cache hit means the closure runs exactly once.
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    let init = || {
+        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        vec![0u64, 0x1000, 0x2000, 0x3000]
+    };
+
+    let first = cache.get_or_init(4, &init);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(first.as_slice(), &[0u64, 0x1000, 0x2000, 0x3000]);
+
+    // Same num_cpus → cache hit. Closure must NOT run again.
+    let second = cache.get_or_init(4, &init);
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "init closure must not run on cache hit",
+    );
+    // The returned Arc must point at the same allocation: the
+    // cache hands out clones of the cached `Arc`, not freshly-built
+    // vecs. `Arc::ptr_eq` compares the underlying pointer so a
+    // regression that rebuilt the vec on every hit (defeating the
+    // amortization) would trip here.
+    assert!(
+        std::sync::Arc::ptr_eq(&first, &second),
+        "repeat call with same num_cpus must return the cached Arc, not a fresh allocation",
+    );
+}
+
+#[test]
+fn per_cpu_offsets_cache_num_cpus_mismatch_refreshes() {
+    let cache = PerCpuOffsetsCache::new();
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    let init = |n: u32| {
+        let calls_ref = &calls;
+        move || {
+            calls_ref.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // Synthesize per-CPU offsets keyed on `n` so the test
+            // can distinguish "cache returned the old vec" from
+            // "cache re-ran the closure for the new num_cpus".
+            (0..n).map(|i| i as u64 * 0x100).collect::<Vec<u64>>()
+        }
+    };
+
+    let first = cache.get_or_init(2, init(2));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(first.as_slice(), &[0u64, 0x100]);
+
+    // Different num_cpus → mismatch on the cache key. The cache
+    // must drop the old slot and re-run the closure with `n=4`.
+    let second = cache.get_or_init(4, init(4));
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "num_cpus change must trigger a fresh init",
+    );
+    assert_eq!(second.as_slice(), &[0u64, 0x100, 0x200, 0x300]);
+
+    // After the refresh, the next call with the new num_cpus
+    // hits again. Pinning this prevents a regression where the
+    // mismatch path forgot to write back the new slot — the
+    // following `get_or_init(4, ...)` would then re-run the
+    // closure a third time.
+    let third = cache.get_or_init(4, init(4));
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "cache must store the refreshed slot so a subsequent same-num_cpus call hits",
+    );
+    assert!(
+        std::sync::Arc::ptr_eq(&second, &third),
+        "subsequent hit on the refreshed num_cpus must return the same Arc",
+    );
+
+    // Reverting to the original num_cpus is also a mismatch
+    // against the currently-cached `n=4` slot — a fresh init runs
+    // and returns a different Arc than `first`. Single-slot
+    // semantics: the cache holds one (num_cpus, vec) pair.
+    let fourth = cache.get_or_init(2, init(2));
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        3,
+        "going back to the prior num_cpus must re-init (single-slot cache)",
+    );
+    assert_eq!(fourth.as_slice(), &[0u64, 0x100]);
+    assert!(
+        !std::sync::Arc::ptr_eq(&first, &fourth),
+        "single-slot cache cannot resurrect the original Arc; the slot was overwritten by `n=4`",
+    );
 }
 
 mod htab_tests;

@@ -677,9 +677,16 @@ fn project_sched_policy_hints(dump: &FailureDumpReport) -> Vec<SchedPolicyHint> 
         // failed (kallsyms unreadable, sched_class symbol not
         // resolved). Treat as Other with nice 0 so the reproducer
         // generator gets at least a generic hint per task.
+        // `SchedClassRegistry::decode` returns the short class name
+        // ("fair", "rt", "dl", "idle", "stop", "ext"); match against
+        // those exact strings, NOT the kernel symbol names
+        // ("rt_sched_class" etc.). A previous regression matched
+        // against the long form and silently routed every rt/dl/ext
+        // task to the `_` arm, projecting them as
+        // `SchedPolicyHint::Other` with a clamped nice value.
         let class = task.sched_class.as_deref().unwrap_or("");
         let policy = match class {
-            "rt_sched_class" if task.rt_priority > 0 => {
+            "rt" if task.rt_priority > 0 => {
                 // SCHED_FIFO and SCHED_RR are both rt_sched_class
                 // — the kernel doesn't distinguish via the class
                 // pointer. Without per-task SCHED_FIFO/RR
@@ -691,13 +698,13 @@ fn project_sched_policy_hints(dump: &FailureDumpReport) -> Vec<SchedPolicyHint> 
                     priority: task.rt_priority,
                 }
             }
-            "dl_sched_class" => SchedPolicyHint::Deadline {
+            "dl" => SchedPolicyHint::Deadline {
                 runtime_ns: 0,
                 deadline_ns: 0,
                 period_ns: 0,
             },
-            "ext_sched_class" => SchedPolicyHint::Ext,
-            "idle_sched_class" => SchedPolicyHint::Idle,
+            "ext" => SchedPolicyHint::Ext,
+            "idle" => SchedPolicyHint::Idle,
             _ => {
                 // Kernel default static_prio for nice 0 is 120
                 // (NICE_TO_PRIO(0) = MAX_RT_PRIO + 20 = 120), so the
@@ -759,7 +766,10 @@ mod tests {
 
     /// Fingerprint computed from a dump with task enrichments
     /// produces sched-policy hints (one per task). Verifies the
-    /// rt_sched_class → Fifo and ext_sched_class → Ext mappings.
+    /// `rt` → Fifo and `ext` → Ext mappings — class names match
+    /// `SchedClassRegistry::decode`'s short-name return values
+    /// ("fair", "rt", "dl", "idle", "stop", "ext"), NOT the kernel
+    /// symbol strings ("rt_sched_class" etc.).
     #[test]
     fn project_sched_policy_hints_from_dump() {
         use crate::monitor::task_enrichment::TaskEnrichment;
@@ -801,9 +811,9 @@ mod tests {
 
         let dump = FailureDumpReport {
             task_enrichments: vec![
-                make_task(100, "rt_sched_class", 50, 0),
-                make_task(101, "ext_sched_class", 0, 0),
-                make_task(102, "fair_sched_class", 0, 120),
+                make_task(100, "rt", 50, 0),
+                make_task(101, "ext", 0, 0),
+                make_task(102, "fair", 0, 120),
                 // Zero-init static_prio + fair-class entry: a failure
                 // dump captured before the kernel populated the field.
                 // Pre-clamp this would project to nice=-120
@@ -812,7 +822,7 @@ mod tests {
                 // `MIN_NICE`/`MAX_NICE` in
                 // `include/linux/sched/prio.h`) keeps the projected
                 // nice value in the kernel's legal range.
-                make_task(103, "fair_sched_class", 0, 0),
+                make_task(103, "fair", 0, 0),
             ],
             ..FailureDumpReport::default()
         };
@@ -839,6 +849,103 @@ mod tests {
                 "static_prio=0 (zero-init) must clamp to MIN_NICE=-20, got nice={nice}",
             ),
             other => panic!("expected Other, got {other:?}"),
+        }
+    }
+
+    /// Regression: every short class name returned by
+    /// `SchedClassRegistry::decode` ("fair", "rt", "dl", "idle",
+    /// "stop", "ext") must match the projection arms; long kernel
+    /// symbol names ("rt_sched_class", "dl_sched_class",
+    /// "ext_sched_class", "idle_sched_class") must NOT match and
+    /// must fall through to the `_` arm (projecting as `Other`).
+    /// Pins the symptom of the previous regression where the
+    /// projection matched against the long form and silently
+    /// misclassified every rt/dl/ext task.
+    #[test]
+    fn project_sched_policy_short_names_match_long_names_fall_through() {
+        use crate::monitor::task_enrichment::TaskEnrichment;
+
+        fn make_task(class: &str, rt_priority: u32, static_prio: i32) -> TaskEnrichment {
+            TaskEnrichment {
+                pid: 0,
+                tgid: 0,
+                comm: String::new(),
+                group_leader_pid: None,
+                real_parent_pid: None,
+                real_parent_comm: None,
+                pgid: None,
+                sid: None,
+                nr_threads: None,
+                weight: 0,
+                prio: 0,
+                static_prio,
+                normal_prio: 0,
+                rt_priority,
+                sched_class: Some(class.to_string()),
+                core_cookie: None,
+                pi_boosted_out_of_scx: false,
+                nvcsw: 0,
+                nivcsw: 0,
+                signal_nvcsw: None,
+                signal_nivcsw: None,
+                lock_slowpath_match: None,
+            }
+        }
+
+        // Short names: each maps to its dedicated SchedPolicyHint
+        // variant (the wired-up cases).
+        let dump = FailureDumpReport {
+            task_enrichments: vec![
+                make_task("rt", 75, 0),
+                make_task("dl", 0, 0),
+                make_task("ext", 0, 0),
+                make_task("idle", 0, 0),
+            ],
+            ..FailureDumpReport::default()
+        };
+        let fp = project_fingerprint(&[], Some(&dump));
+        assert_eq!(fp.sched_policy_hints.len(), 4);
+        assert!(
+            matches!(fp.sched_policy_hints[0], SchedPolicyHint::Fifo { priority: 75 }),
+            "short name 'rt' must project to Fifo, got {:?}",
+            fp.sched_policy_hints[0],
+        );
+        assert!(
+            matches!(fp.sched_policy_hints[1], SchedPolicyHint::Deadline { .. }),
+            "short name 'dl' must project to Deadline, got {:?}",
+            fp.sched_policy_hints[1],
+        );
+        assert!(
+            matches!(fp.sched_policy_hints[2], SchedPolicyHint::Ext),
+            "short name 'ext' must project to Ext, got {:?}",
+            fp.sched_policy_hints[2],
+        );
+        assert!(
+            matches!(fp.sched_policy_hints[3], SchedPolicyHint::Idle),
+            "short name 'idle' must project to Idle, got {:?}",
+            fp.sched_policy_hints[3],
+        );
+
+        // Long kernel symbol names: every one must fall through to
+        // the `_` arm. A regression that re-introduces the long-name
+        // match would surface here as a non-Other variant.
+        let long_names_dump = FailureDumpReport {
+            task_enrichments: vec![
+                make_task("rt_sched_class", 75, 120),
+                make_task("dl_sched_class", 0, 120),
+                make_task("ext_sched_class", 0, 120),
+                make_task("idle_sched_class", 0, 120),
+            ],
+            ..FailureDumpReport::default()
+        };
+        let long_fp = project_fingerprint(&[], Some(&long_names_dump));
+        assert_eq!(long_fp.sched_policy_hints.len(), 4);
+        for (i, hint) in long_fp.sched_policy_hints.iter().enumerate() {
+            assert!(
+                matches!(hint, SchedPolicyHint::Other { .. }),
+                "long kernel symbol name at index {i} must NOT match \
+                 any specialised arm (regression guard); got {hint:?}",
+            );
         }
     }
 

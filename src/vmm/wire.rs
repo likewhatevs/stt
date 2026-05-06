@@ -11,7 +11,7 @@
 //!
 //! Each guest→host bulk message is a 16-byte [`ShmMessage`] header
 //! followed by `length` payload bytes. The host's
-//! [`super::shm_ring::parse_tlv_stream`] consumes this format. CRC32
+//! [`super::host_comms::parse_tlv_stream`] consumes this format. CRC32
 //! covers payload bytes only, not the header.
 //!
 //! ```text
@@ -242,6 +242,71 @@ pub struct ShmEntry {
 }
 
 // ---------------------------------------------------------------------------
+// Stimulus payload — guest step executor → host
+// ---------------------------------------------------------------------------
+
+/// Payload for stimulus events written by the guest step executor.
+///
+/// Compact 24-byte struct describing the state after each step's ops
+/// are applied. The host correlates these with monitor samples to map
+/// scheduler telemetry to scenario phases.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, IntoBytes, zerocopy::Immutable, zerocopy::KnownLayout)]
+pub struct StimulusPayload {
+    /// Milliseconds since scenario start.
+    pub elapsed_ms: u32,
+    /// Index of the step that was just applied.
+    pub step_index: u16,
+    /// Number of ops applied in this step.
+    pub op_count: u16,
+    /// Bitmask of Op variant discriminants present in this step.
+    pub op_kinds: u32,
+    /// Number of live cgroups after this step: sum of step-local
+    /// cgroups (from the current Step's `CgroupDef`s + `Op`s) and
+    /// Backdrop-owned cgroups that persist across every Step.
+    pub cgroup_count: u16,
+    /// Total worker handles after this step: sum of step-local
+    /// workers and Backdrop-spawned workers that persist across
+    /// every Step.
+    pub worker_count: u16,
+    /// Sum of all workers' iteration counts at this step boundary.
+    /// Read from shared MAP_SHARED counters in the step executor.
+    pub total_iterations: u64,
+}
+
+const _STIMULUS_SIZE: () = assert!(std::mem::size_of::<StimulusPayload>() == 24);
+
+/// Deserialized stimulus event.
+#[derive(Debug, Clone)]
+pub struct StimulusEvent {
+    pub elapsed_ms: u32,
+    pub step_index: u16,
+    pub op_count: u16,
+    pub op_kinds: u32,
+    pub cgroup_count: u16,
+    pub worker_count: u16,
+    pub total_iterations: u64,
+}
+
+impl StimulusEvent {
+    /// Deserialize from raw payload bytes.
+    pub fn from_payload(data: &[u8]) -> Option<Self> {
+        if data.len() < std::mem::size_of::<StimulusPayload>() {
+            return None;
+        }
+        Some(StimulusEvent {
+            elapsed_ms: u32::from_ne_bytes(data[0..4].try_into().ok()?),
+            step_index: u16::from_ne_bytes(data[4..6].try_into().ok()?),
+            op_count: u16::from_ne_bytes(data[6..8].try_into().ok()?),
+            op_kinds: u32::from_ne_bytes(data[8..12].try_into().ok()?),
+            cgroup_count: u16::from_ne_bytes(data[12..14].try_into().ok()?),
+            worker_count: u16::from_ne_bytes(data[14..16].try_into().ok()?),
+            total_iterations: u64::from_ne_bytes(data[16..24].try_into().ok()?),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Snapshot request/reply TLV payloads
 // ---------------------------------------------------------------------------
 
@@ -284,6 +349,26 @@ pub const SNAPSHOT_STATUS_OK: u32 = 1;
 /// Reply status: failure — the host rejected or could not complete
 /// the request. The reason buffer carries a UTF-8 diagnostic.
 pub const SNAPSHOT_STATUS_ERR: u32 = 2;
+
+/// Outcome of a guest-driven snapshot request: ok, error with reason,
+/// or transport failure (port unavailable / not in guest / timeout).
+#[derive(Debug)]
+pub enum SnapshotRequestResult {
+    /// Host completed the request. For
+    /// [`SNAPSHOT_KIND_CAPTURE`] this means the report
+    /// was stored on the bridge under the supplied tag; for
+    /// [`SNAPSHOT_KIND_WATCH`] this means the hardware
+    /// watchpoint was armed.
+    Ok,
+    /// Host accepted the request but completed it as a failure. The
+    /// reason carries the host-supplied diagnostic text (truncated to
+    /// [`SNAPSHOT_REASON_MAX`] bytes).
+    HostError { reason: String },
+    /// Transport failed (called from host context, port not yet open,
+    /// host did not reply within `timeout`, malformed reply frame).
+    /// The supplied diagnostic names the underlying cause.
+    TransportError { reason: String },
+}
 
 /// Snapshot request payload (72 bytes).
 ///

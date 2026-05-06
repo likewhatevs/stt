@@ -4,11 +4,12 @@
 //! kernel release, CPU identity, memory size, hugepages config,
 //! transparent-hugepage policy, kernel scheduler tunables, NUMA
 //! node count, and kernel cmdline. Static fields (CPU identity,
-//! total memory, hugepage size, NUMA count, uname triple) are
-//! memoized in [`OnceLock`] across the process; dynamic fields
-//! (sched tunables, hugepages totals, THP policy, cmdline) are
-//! re-read on every call so run-time sysctl changes or hugepage
-//! reservations between tests are not hidden by the cache.
+//! total memory, hugepage size, NUMA count, uname triple,
+//! per-CPU cpufreq governor) are memoized in [`OnceLock`] across
+//! the process; dynamic fields (sched tunables, hugepages totals,
+//! THP policy, cmdline) are re-read on every call so run-time
+//! sysctl changes or hugepage reservations between tests are not
+//! hidden by the cache.
 //!
 //! ## Static-cache staleness under hotplug
 //!
@@ -28,6 +29,17 @@
 //! the original snapshot, `numa_nodes` does not reflect an
 //! added/removed node. `arch` is the only field genuinely immune
 //! (a reboot is required to change architecture).
+//!
+//! `cpufreq_governor` is similarly pinned: the per-CPU
+//! `scaling_governor` map is read once on first
+//! [`collect_host_context`] call and reused thereafter. A test
+//! that writes to `/sys/devices/system/cpu/cpu*/cpufreq/scaling_governor`
+//! mid-process will not see the post-write value reflected in
+//! later snapshots. Governor changes are rare (they typically
+//! happen at boot via `cpupower`, systemd unit, or kernel default)
+//! and the cache trades that rare-mutation visibility for
+//! eliminating up to N × M sysfs reads per process (N = online
+//! CPUs, M = `collect_host_context` invocations).
 //!
 //! Tests that need live-updated values must either (a) avoid
 //! reading HostContext after the hotplug event, or (b) restart
@@ -187,6 +199,13 @@ pub struct HostContext {
     /// unreadable (sysfs absent, container without it mounted)
     /// or when every per-CPU read fails. `skip_serializing_if`
     /// keeps the sidecar compact on hosts without the data.
+    ///
+    /// Cached: the first [`collect_host_context`] call populates a
+    /// process-wide [`OnceLock`] with one read per online CPU;
+    /// subsequent calls clone the cached map. Governor changes
+    /// after first capture are not reflected — see the
+    /// "Static-cache staleness under hotplug" section in the
+    /// module-level docs for the full contract.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub cpufreq_governor: BTreeMap<usize, String>,
     /// Kernel name — `uname.sysname` (typically `"Linux"`).
@@ -702,6 +721,15 @@ impl HostContext {
 /// thp_defrag, kernel_cmdline) are NOT cached — they can shift
 /// between tests via sysctl, hugepage reservation, THP policy flip,
 /// or live kexec, and a cached snapshot would hide that change.
+///
+/// Per-CPU `cpufreq_governor` is cached separately in
+/// [`CPUFREQ_GOVERNORS`] rather than embedded here so the cache
+/// hit on the per-call path does not clone a `BTreeMap<usize, String>`
+/// of up to `online_cpus` entries through the `StaticHostInfo`
+/// clone — `StaticHostInfo` carries only primitive `Option<…>`
+/// fields and stays cheap to clone, while `CPUFREQ_GOVERNORS`
+/// owns the heavyweight collection and is cloned on its own
+/// hit-path.
 #[derive(Clone)]
 struct StaticHostInfo {
     cpu_model: Option<String>,
@@ -716,6 +744,20 @@ struct StaticHostInfo {
 }
 
 static STATIC_HOST_INFO: OnceLock<StaticHostInfo> = OnceLock::new();
+
+/// Process-wide cache for the per-CPU `scaling_governor` map. The
+/// first [`collect_host_context`] call populates this lock by
+/// invoking [`read_cpufreq_governors`]; every later call clones
+/// the cached `BTreeMap` instead of re-reading
+/// `/sys/devices/system/cpu/cpu{N}/cpufreq/scaling_governor` for
+/// every online CPU. With N online CPUs and M sidecar writes per
+/// process, this collapses up to N × M sysfs reads (a 256-CPU
+/// host running a 1000-test session = 256 000 reads) to N. See
+/// the module-level "Static-cache staleness under hotplug"
+/// section for the consequences of pinning the first observed
+/// snapshot — runtime governor changes after first capture are
+/// not reflected.
+static CPUFREQ_GOVERNORS: OnceLock<BTreeMap<usize, String>> = OnceLock::new();
 
 /// Test-only call counter for [`compute_static_host_info`]. Pinned
 /// by `call_counts_*` tests to prove the OnceLock is exercised at
@@ -732,6 +774,14 @@ static STATIC_INIT_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::At
 /// carry the counter.
 #[cfg(test)]
 static MEMINFO_READ_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Test-only call counter for [`read_cpufreq_governors`]. Pinned
+/// by `call_counts_*` tests to prove the [`CPUFREQ_GOVERNORS`]
+/// cache exercises the underlying sysfs walk at most once per
+/// process. Production builds do not carry the counter.
+#[cfg(test)]
+static CPUFREQ_GOVERNORS_READ_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// Capture the host context. Static fields are collected once
 /// and cached; dynamic fields are re-read on every call so
@@ -759,11 +809,14 @@ static MEMINFO_READ_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::A
 ///
 /// Fields fall into two groups by how they are read:
 ///
-/// Static subset (memoised in [`STATIC_HOST_INFO`], identical
-/// across every call in the process, shift only under CPU /
-/// memory / NUMA hotplug): the uname triple, CPU identity
+/// Static subset (memoised in [`STATIC_HOST_INFO`] —
+/// or, for `cpufreq_governor`, the parallel
+/// [`CPUFREQ_GOVERNORS`] cache — identical across every call in
+/// the process, shift only under CPU / memory / NUMA hotplug or
+/// runtime governor change): the uname triple, CPU identity
 /// (`cpu_model` + `cpu_vendor`), `total_memory_kb`,
-/// `hugepages_size_kb`, `online_cpus`, and `numa_nodes`.
+/// `hugepages_size_kb`, `online_cpus`, `numa_nodes`, and
+/// `cpufreq_governor`.
 ///
 /// Dynamic subset (re-read on every call): `kernel_cmdline`,
 /// `hugepages_total`, `hugepages_free`, `thp_enabled`,
@@ -810,7 +863,7 @@ pub fn collect_host_context() -> HostContext {
         sched_tunables: read_sched_tunables(),
         online_cpus: static_info.online_cpus,
         numa_nodes: static_info.numa_nodes,
-        cpufreq_governor: read_cpufreq_governors(),
+        cpufreq_governor: cached_cpufreq_governors(),
         kernel_name: static_info.kernel_name,
         kernel_release: static_info.kernel_release,
         arch: static_info.arch,
@@ -947,6 +1000,19 @@ impl HostContextSnapshots {
     }
 }
 
+/// Return the per-CPU `scaling_governor` map, populating the
+/// process-wide [`CPUFREQ_GOVERNORS`] cache on first call and
+/// cloning the cached value on every subsequent call. A clone of a
+/// `BTreeMap<usize, String>` of even a few hundred entries is
+/// orders of magnitude cheaper than the up to 256 sysfs `read`
+/// syscalls the underlying [`read_cpufreq_governors`] performs on
+/// a 256-CPU host.
+fn cached_cpufreq_governors() -> BTreeMap<usize, String> {
+    CPUFREQ_GOVERNORS
+        .get_or_init(read_cpufreq_governors)
+        .clone()
+}
+
 /// Read `scaling_governor` for every online CPU, keyed by CPU
 /// id. Reads `/sys/devices/system/cpu/cpu{N}/cpufreq/scaling_governor`
 /// for each entry in `/sys/devices/system/cpu/online`. Returns an
@@ -956,7 +1022,16 @@ impl HostContextSnapshots {
 /// kernel, VM without passthrough) contributes no entry — the
 /// missing-key shape is the "no governor reported" signal for
 /// consumers.
+///
+/// Production callers reach this through
+/// [`cached_cpufreq_governors`] which memoises the result in
+/// [`CPUFREQ_GOVERNORS`]; a transient sysfs failure on the very
+/// first call therefore pins an empty map for the remainder of
+/// the process — see the module-level "Static-cache staleness"
+/// section for the contract.
 fn read_cpufreq_governors() -> BTreeMap<usize, String> {
+    #[cfg(test)]
+    CPUFREQ_GOVERNORS_READ_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let Ok(online_raw) = std::fs::read_to_string("/sys/devices/system/cpu/online") else {
         return BTreeMap::new();
     };
@@ -1290,11 +1365,12 @@ mod tests {
 
     /// Stability regression for the STATIC subset: uname triple,
     /// CPU identity, total_memory_kb, hugepages_size_kb,
-    /// online_cpus, numa_nodes. These fields are memoised in
-    /// [`STATIC_HOST_INFO`] and therefore return identical values
-    /// across back-to-back calls regardless of what other tests
-    /// run concurrently — they are safe to assert equality on
-    /// under nextest's parallel-test model.
+    /// online_cpus, numa_nodes, cpufreq_governor. These fields are
+    /// memoised in [`STATIC_HOST_INFO`] (or, for `cpufreq_governor`,
+    /// in [`CPUFREQ_GOVERNORS`]) and therefore return identical
+    /// values across back-to-back calls regardless of what other
+    /// tests run concurrently — they are safe to assert equality
+    /// on under nextest's parallel-test model.
     #[cfg(target_os = "linux")]
     #[test]
     fn collect_host_context_static_subset_is_stable_across_calls() {
@@ -1309,6 +1385,7 @@ mod tests {
         assert_eq!(a.hugepages_size_kb, b.hugepages_size_kb);
         assert_eq!(a.online_cpus, b.online_cpus);
         assert_eq!(a.numa_nodes, b.numa_nodes);
+        assert_eq!(a.cpufreq_governor, b.cpufreq_governor);
     }
 
     /// Stability regression for the DYNAMIC subset: kernel_cmdline,
@@ -2654,7 +2731,8 @@ Hugepagesize:       2048 kB
         );
     }
 
-    /// Pin both caching invariants with a direct call-count probe:
+    /// Pin all three caching invariants with a direct call-count
+    /// probe:
     ///
     /// 1. `compute_static_host_info` runs at MOST once per process
     ///    — the `OnceLock::get_or_init` contract. Across N repeated
@@ -2668,9 +2746,15 @@ Hugepagesize:       2048 kB
     ///    init closure and the per-call path); this test pins the
     ///    dedup so a regression that re-adds a second read inside
     ///    `compute_static_host_info` trips the assertion.
-    /// 3. Cold-init anchor: if `STATIC_HOST_INFO` was not yet
-    ///    populated when the test started, exactly one
-    ///    `compute_static_host_info` call must run during this test.
+    /// 3. `read_cpufreq_governors` runs at MOST once per process —
+    ///    the [`CPUFREQ_GOVERNORS`] `OnceLock::get_or_init`
+    ///    contract. Across N repeated `collect_host_context()`
+    ///    calls, the delta must stay ≤ 1. On a 256-CPU host this
+    ///    collapses up to N × 256 sysfs reads into 256.
+    /// 4. Cold-init anchors: if a cache was not yet populated when
+    ///    the test started, exactly one underlying read must run
+    ///    during this test (one for `compute_static_host_info`, one
+    ///    for `read_cpufreq_governors`).
     ///
     /// Deltas (`load() - before-snapshot`) absorb pre-population
     /// from sibling tests: the test is robust to execution order.
@@ -2683,11 +2767,12 @@ Hugepagesize:       2048 kB
     /// `cargo nextest run`, which spawns a fresh subprocess per
     /// test by default — so each test sees a freshly-initialized
     /// process with its own counters, and the only writers to
-    /// `STATIC_INIT_CALLS` / `MEMINFO_READ_CALLS` during this
-    /// test's window are its own five `collect_host_context()`
-    /// calls. Under `cargo test` (shared-process, thread-parallel)
-    /// a sibling test calling `collect_host_context()` in parallel
-    /// would skew the deltas. The project rule "always use
+    /// `STATIC_INIT_CALLS` / `MEMINFO_READ_CALLS` /
+    /// `CPUFREQ_GOVERNORS_READ_CALLS` during this test's window
+    /// are its own five `collect_host_context()` calls. Under
+    /// `cargo test` (shared-process, thread-parallel) a sibling
+    /// test calling `collect_host_context()` in parallel would
+    /// skew the deltas. The project rule "always use
     /// `cargo nextest run`, never `cargo test`" is what keeps this
     /// assumption load-bearing; a future migration away from
     /// nextest would need to re-assess this test's atomic-delta
@@ -2700,8 +2785,10 @@ Hugepagesize:       2048 kB
         const N: usize = 5;
 
         let static_was_populated_pre = STATIC_HOST_INFO.get().is_some();
+        let cpufreq_was_populated_pre = CPUFREQ_GOVERNORS.get().is_some();
         let init_before = STATIC_INIT_CALLS.load(Ordering::Relaxed);
         let meminfo_before = MEMINFO_READ_CALLS.load(Ordering::Relaxed);
+        let cpufreq_before = CPUFREQ_GOVERNORS_READ_CALLS.load(Ordering::Relaxed);
 
         for _ in 0..N {
             let _ = collect_host_context();
@@ -2709,6 +2796,8 @@ Hugepagesize:       2048 kB
 
         let init_delta = STATIC_INIT_CALLS.load(Ordering::Relaxed) - init_before;
         let meminfo_delta = MEMINFO_READ_CALLS.load(Ordering::Relaxed) - meminfo_before;
+        let cpufreq_delta =
+            CPUFREQ_GOVERNORS_READ_CALLS.load(Ordering::Relaxed) - cpufreq_before;
 
         assert!(
             init_delta <= 1,
@@ -2718,6 +2807,10 @@ Hugepagesize:       2048 kB
             meminfo_delta, N,
             "read_meminfo must run exactly {N} times across {N} collect_host_context calls, ran {meminfo_delta} — the dedup would regress if this trips",
         );
+        assert!(
+            cpufreq_delta <= 1,
+            "read_cpufreq_governors must run at most once across {N} collect_host_context calls, ran {cpufreq_delta} — a regression that bypassed the CPUFREQ_GOVERNORS cache would trip this",
+        );
 
         if !static_was_populated_pre {
             assert_eq!(
@@ -2725,10 +2818,20 @@ Hugepagesize:       2048 kB
                 "cold-init anchor: compute_static_host_info must run exactly once on the populate path, not {init_delta}",
             );
         }
+        if !cpufreq_was_populated_pre {
+            assert_eq!(
+                cpufreq_delta, 1,
+                "cold-init anchor: read_cpufreq_governors must run exactly once on the populate path, not {cpufreq_delta}",
+            );
+        }
 
         assert!(
             STATIC_HOST_INFO.get().is_some(),
             "STATIC_HOST_INFO must be populated after at least one collect_host_context call",
+        );
+        assert!(
+            CPUFREQ_GOVERNORS.get().is_some(),
+            "CPUFREQ_GOVERNORS must be populated after at least one collect_host_context call",
         );
     }
 

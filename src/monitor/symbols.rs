@@ -29,14 +29,84 @@ pub(crate) const START_KERNEL_MAP: u64 = 0xffff_ffff_8000_0000;
 #[cfg(target_arch = "aarch64")]
 pub(crate) const START_KERNEL_MAP: u64 = 0xffff_8000_8000_0000;
 
-/// Default PAGE_OFFSET (non-KASLR).
+/// Default PAGE_OFFSET (non-KASLR), 48-bit VA layout.
 ///
 /// x86-64 4-level paging: 0xffff_8880_0000_0000.
 /// aarch64 48-bit VA: -(1 << 48) = 0xffff_0000_0000_0000.
+///
+/// **The aarch64 value is hardcoded for the 48-bit VA layout** — the
+/// 47-bit layout (16 KiB granule, Apple Silicon style) places
+/// `PAGE_OFFSET` at `-(1 << 47) = 0xffff_8000_0000_0000`. For
+/// runtime correctness on those kernels, use
+/// [`default_page_offset_for_tcr`], which decodes `TCR_EL1.T1SZ`
+/// the same way [`start_kernel_map_for_tcr`] does. The const stays
+/// for tests (synthetic guest memory layouts that pin a known
+/// PAGE_OFFSET) and for the bootstrap window before `tcr_el1` is
+/// populated; production paths funnel through
+/// [`resolve_page_offset`] which prefers the live
+/// `page_offset_base` symbol value over either fallback.
 #[cfg(target_arch = "x86_64")]
 pub(crate) const DEFAULT_PAGE_OFFSET: u64 = 0xffff_8880_0000_0000;
 #[cfg(target_arch = "aarch64")]
 pub(crate) const DEFAULT_PAGE_OFFSET: u64 = 0xffff_0000_0000_0000;
+
+/// Derive the runtime `PAGE_OFFSET` from `TCR_EL1`.
+///
+/// On aarch64 the kernel sets `PAGE_OFFSET = -(1 << VA_BITS)` using
+/// the *compile-time* `VA_BITS` (`arch/arm64/include/asm/memory.h`).
+/// `TCR_EL1` only exposes `vabits_actual = 64 - T1SZ`, which equals
+/// the compile-time `VA_BITS` in every configuration EXCEPT
+/// `CONFIG_ARM64_VA_BITS_52=y` running on hardware without FEAT_LVA
+/// (T1SZ=16, vabits_actual=48, VA_BITS=52). This function uses
+/// `vabits_actual` as a proxy for the compile-time value and
+/// therefore returns `0xffff_0000_0000_0000` (`-(1 << 48)`) on such
+/// kernels, while the live `PAGE_OFFSET` is `0xfff0_0000_0000_0000`
+/// (`-(1 << 52)`); the kernel additionally adjusts `memstart_addr`
+/// (`arch/arm64/mm/init.c:arm64_memblock_init`) to compensate.
+/// Direct-mapped translations using the value this function returns
+/// will be wrong on a `VA_BITS=52` kernel with reduced runtime VA.
+/// On x86_64 the register does not exist and the value is constant
+/// ([`DEFAULT_PAGE_OFFSET`]); the `tcr_el1` argument is ignored.
+///
+/// Returns the [`DEFAULT_PAGE_OFFSET`] fallback when:
+/// - `tcr_el1 == 0` (BSP loop has not yet read the register),
+/// - `T1SZ == 0` (high half disabled),
+/// - `T1SZ > 60` (would underflow `1 << va_bits`).
+///
+/// The fallback matches the 48-bit VA layout — the wrong value for
+/// 47-bit and 52-bit kernels, but only reachable when the live
+/// `page_offset_base` symbol is also absent. `page_offset_base` is
+/// x86_64-only (`arch/x86/mm/kaslr.c`); aarch64 kernels lack the
+/// symbol entirely, so this fallback IS the production path on
+/// aarch64. ktstr.kconfig does not enable `CONFIG_ARM64_VA_BITS_52`,
+/// so the 52-bit-mismatch case is dormant for current usage. See
+/// [`resolve_page_offset`] for the preference chain.
+pub(crate) fn default_page_offset_for_tcr(tcr_el1: u64) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let _ = tcr_el1;
+        DEFAULT_PAGE_OFFSET
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if tcr_el1 == 0 {
+            return DEFAULT_PAGE_OFFSET;
+        }
+        let t1sz = (tcr_el1 >> 16) & 0x3F;
+        if t1sz == 0 || t1sz > 60 {
+            return DEFAULT_PAGE_OFFSET;
+        }
+        let va_bits: u32 = 64u32 - t1sz as u32;
+        // PAGE_OFFSET = -(1 << VA_BITS) using two's complement
+        // wrap on the unsigned `0u64.wrapping_sub(...)`.
+        0u64.wrapping_sub(1u64 << va_bits)
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        let _ = tcr_el1;
+        DEFAULT_PAGE_OFFSET
+    }
+}
 
 /// ELF sections [`KernelSymbols::from_vmlinux`] reads directly.
 ///
@@ -275,22 +345,54 @@ impl KernelSymbols {
 
 /// Read the runtime value of PAGE_OFFSET from guest memory.
 ///
-/// If the vmlinux contains a `page_offset_base` symbol, converts its
-/// KVA to a guest physical address via the kernel image base (the
-/// kernel text mapping), then reads the u64 stored there by the guest
-/// kernel. `start_kernel_map` is the runtime base resolved by the
-/// caller (x86_64: [`START_KERNEL_MAP`]; aarch64: derived from
-/// `tcr_el1` via [`start_kernel_map_for_tcr`]).
+/// Preference chain:
+/// 1. Live `page_offset_base` symbol value (modern kernels with
+///    `CONFIG_RANDOMIZE_MEMORY`).
+/// 2. [`DEFAULT_PAGE_OFFSET`] (48-bit VA hardcoded) as the
+///    fallback when the symbol is absent — wrong for 47-bit
+///    kernels but only reachable on stripped vmlinux. Modern
+///    kernels with `CONFIG_RANDOMIZE_MEMORY=y` always export
+///    the symbol.
 ///
-/// Falls back to the compile-time default (0xffff888000000000, x86-64
-/// 4-level paging) when the symbol is absent.
+/// `start_kernel_map` is the runtime base resolved by the caller
+/// (x86_64: [`START_KERNEL_MAP`]; aarch64: derived from `tcr_el1`
+/// via [`start_kernel_map_for_tcr`]).
+///
+/// For the TCR-aware fallback path that picks the right
+/// `-(1 << VA_BITS)` for 47-bit kernels, see
+/// [`resolve_page_offset_with_tcr`].
+// Production callers replaced by [`resolve_page_offset_with_tcr`];
+// preserved for tests that pin the `tcr_el1 = 0` x86_64 path.
+#[allow(dead_code)]
 pub(crate) fn resolve_page_offset(
     mem: &super::reader::GuestMem,
     symbols: &KernelSymbols,
     start_kernel_map: u64,
 ) -> u64 {
+    resolve_page_offset_with_tcr(mem, symbols, start_kernel_map, 0)
+}
+
+/// Like [`resolve_page_offset`] but uses
+/// [`default_page_offset_for_tcr`] as the fallback so 47-bit
+/// kernels (16 KiB granule, Apple Silicon) read the right
+/// `-(1 << 47)` value when `page_offset_base` is absent.
+/// `tcr_el1` is the guest's register value; pass `0` on x86_64.
+///
+/// On aarch64 the `page_offset_base` symbol is absent
+/// (x86_64-only — see `arch/x86/mm/kaslr.c`) so the fallback IS
+/// the production path on aarch64. The fallback uses
+/// `vabits_actual` from `TCR_EL1` as a proxy for the compile-time
+/// `VA_BITS`; see [`default_page_offset_for_tcr`] for the
+/// `CONFIG_ARM64_VA_BITS_52` ambiguity that ktstr.kconfig avoids
+/// by not enabling that config.
+pub(crate) fn resolve_page_offset_with_tcr(
+    mem: &super::reader::GuestMem,
+    symbols: &KernelSymbols,
+    start_kernel_map: u64,
+    tcr_el1: u64,
+) -> u64 {
     let Some(pob_kva) = symbols.page_offset_base_kva else {
-        return DEFAULT_PAGE_OFFSET;
+        return default_page_offset_for_tcr(tcr_el1);
     };
     let pob_pa = text_kva_to_pa_with_base(pob_kva, start_kernel_map);
     let val = mem.read_u64(pob_pa, 0);
@@ -301,7 +403,7 @@ pub(crate) fn resolve_page_offset(
     if val & (1u64 << 63) != 0 {
         val
     } else {
-        DEFAULT_PAGE_OFFSET
+        default_page_offset_for_tcr(tcr_el1)
     }
 }
 
@@ -368,25 +470,43 @@ pub(crate) fn text_kva_to_pa_with_base(kva: u64, start_kernel_map: u64) -> u64 {
 ///
 /// Mirrors the kernel's `KIMAGE_VADDR = _PAGE_END(VA_BITS_MIN) + SZ_2G`
 /// (`arch/arm64/include/asm/memory.h`), where `VA_BITS_MIN` depends
-/// on both the compile-time `VA_BITS` and the granule. The runtime
+/// on the compile-time `VA_BITS` and the granule. The runtime
 /// values reachable from `TCR_EL1`:
 /// - `T1SZ` (bits [21:16]) → `VA_BITS_runtime = 64 - T1SZ`
 /// - `TG1` (bits [31:30]) → granule (0b01=16 KB, 0b10=4 KB,
 ///   0b11=64 KB; 0b00 reserved)
 ///
 /// `VA_BITS_MIN` reconstruction (`asm/memory.h:56-64`):
-/// - if `VA_BITS_runtime <= 48`: `VA_BITS_MIN = VA_BITS_runtime`
+/// - if compile-time `VA_BITS <= 48`: `VA_BITS_MIN = VA_BITS`
 ///   (per `#else #define VA_BITS_MIN (VA_BITS)`)
-/// - else (52-bit VA): 47 on 16 KB granule, 48 otherwise
+/// - else (compile-time VA_BITS=52): `VA_BITS_MIN=47` on 16 KB
+///   granule, `VA_BITS_MIN=48` otherwise
+///
+/// **Compile-time-vs-runtime ambiguity (KNOWN LIMITATION):**
+/// `TCR_EL1` exposes `vabits_actual = 64 - T1SZ`, NOT the
+/// compile-time `VA_BITS`. They match in every case EXCEPT
+/// `CONFIG_ARM64_VA_BITS_52=y` running on hardware that lacks
+/// FEAT_LVA — there, `VA_BITS=52` (compile) but
+/// `vabits_actual=48` (T1SZ=16). On 16 KB pages this matters:
+/// the kernel still uses `VA_BITS_MIN=47` (compile-time rule),
+/// placing `KIMAGE_VADDR` at `0xFFFF_C000_8000_0000`, but this
+/// function — seeing only `T1SZ=16` — returns `0xFFFF_8000_8000_0000`
+/// (the 48-bit answer). Callers translating text/data symbols on
+/// such a kernel will read the wrong PAs. ktstr.kconfig does not
+/// enable `CONFIG_ARM64_VA_BITS_52`, so the ambiguity is dormant
+/// for current ktstr usage; a future user that pins that config
+/// must disambiguate from a kernel symbol KVA (e.g. `_text`'s high
+/// bits) since `TCR_EL1` alone is insufficient.
 ///
 /// Examples (each mapping `_PAGE_END(VA_BITS_MIN) + SZ_2G`):
-/// - `T1SZ=16` (48-bit, 4 KB): `VA_BITS_MIN=48` → `0xFFFF_8000_8000_0000`
-/// - `T1SZ=17` (47-bit, 16 KB Apple Silicon): `VA_BITS_MIN=47` →
-///   `0xFFFF_C000_8000_0000`
-/// - `T1SZ=12` (52-bit, 16 KB): `VA_BITS_MIN=47` →
-///   `0xFFFF_C000_8000_0000`
-/// - `T1SZ=12` (52-bit, 4 KB): `VA_BITS_MIN=48` →
-///   `0xFFFF_8000_8000_0000`
+/// - `T1SZ=16` (48-bit, 4 KB): assumes VA_BITS=48 →
+///   `VA_BITS_MIN=48` → `0xFFFF_8000_8000_0000`
+/// - `T1SZ=17` (47-bit, 16 KB Apple Silicon): VA_BITS=47 →
+///   `VA_BITS_MIN=47` → `0xFFFF_C000_8000_0000`
+/// - `T1SZ=12` (52-bit, 16 KB): VA_BITS=52, runtime activates →
+///   `VA_BITS_MIN=47` → `0xFFFF_C000_8000_0000`
+/// - `T1SZ=12` (52-bit, 4 KB): VA_BITS=52, runtime activates →
+///   `VA_BITS_MIN=48` → `0xFFFF_8000_8000_0000`
 ///
 /// Returns `None` when `tcr_el1 == 0` (BSP loop has not yet read
 /// the register), when `T1SZ == 0` (high-half disabled), when TG1
@@ -422,13 +542,20 @@ pub(crate) fn start_kernel_map_for_tcr(tcr_el1: u64) -> Option<u64> {
         }
         let va_bits_runtime: u32 = (64u32).saturating_sub(t1sz as u32);
         let is_16k_granule = tg1 == 0b01;
-        // VA_BITS_MIN reconstruction. Cap at 48 because
-        // _PAGE_END(VA_BITS_MIN) is what fixes the kernel image
-        // base, and VA_BITS_MIN is always <=48 on current kernels.
-        // Kernels that compile with VA_BITS=52 still place
-        // KIMAGE_VADDR using VA_BITS_MIN (47 with 16 KB pages, 48
-        // otherwise), regardless of whether the runtime activates
-        // 52-bit VA (T1SZ=12).
+        // VA_BITS_MIN reconstruction. The kernel header derives this
+        // from the compile-time `VA_BITS`, but `TCR_EL1` only exposes
+        // `vabits_actual` (= `va_bits_runtime`). The two diverge ONLY
+        // on `CONFIG_ARM64_VA_BITS_52=y` kernels running on hardware
+        // without FEAT_LVA: VA_BITS=52 (compile) but T1SZ=16
+        // (runtime falls back to 48). The 16 KB-granule case returns
+        // a wrong base in that scenario (see the function-level doc
+        // for the full disambiguation requirement). All other
+        // configurations agree: when `va_bits_runtime <= 48` the
+        // kernel was almost always compiled with that exact VA_BITS,
+        // and the compile-time rule reduces to `VA_BITS_MIN = VA_BITS
+        // = va_bits_runtime`. ktstr.kconfig leaves
+        // `CONFIG_ARM64_VA_BITS_52` unset, so the ambiguous branch
+        // is unreachable for current ktstr usage.
         let va_bits_min: u32 = if va_bits_runtime <= 48 {
             va_bits_runtime
         } else if is_16k_granule {
@@ -611,6 +738,47 @@ mod tests {
         // to derive. TG1=0b10 (4 KB) so only T1SZ is the failure.
         let tcr = 0b10u64 << 30;
         assert_eq!(start_kernel_map_for_tcr(tcr), None);
+    }
+
+    /// `CONFIG_ARM64_VA_BITS_52=y` running on hardware without
+    /// FEAT_LVA: T1SZ=16 (vabits_actual=48) but the kernel was
+    /// compiled with VA_BITS=52, so VA_BITS_MIN follows the
+    /// compile-time rule (47 on 16 KB pages, 48 otherwise). The
+    /// runtime-only signal in `TCR_EL1` cannot distinguish this
+    /// from a plain VA_BITS=48 build, so the function returns the
+    /// 48-bit answer in both cases. This test pins the (known,
+    /// dormant) incorrect behaviour for the 16 KB-page sub-case
+    /// so a future fix that disambiguates via a kernel symbol
+    /// KVA can be detected as a behaviour change. ktstr.kconfig
+    /// does not enable `CONFIG_ARM64_VA_BITS_52`, so this code
+    /// path is unreachable for current ktstr usage; the test
+    /// documents the limitation, it does not assert correctness
+    /// for that compile-time configuration.
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn start_kernel_map_for_tcr_aarch64_va_bits_52_reduced_runtime_returns_48bit() {
+        // VA_BITS=52 (compile), 16 KB pages, T1SZ=16 (HW fallback
+        // to 48-bit VA). Correct VA_BITS_MIN=47 → KIMAGE_VADDR
+        // 0xFFFF_C000_8000_0000, but the function only sees T1SZ=16
+        // and returns the 48-bit answer.
+        let tcr_52_16k_reduced = (0b01u64 << 30) | (16u64 << 16);
+        assert_eq!(
+            start_kernel_map_for_tcr(tcr_52_16k_reduced),
+            Some(0xFFFF_8000_8000_0000),
+            "TCR_EL1 alone cannot distinguish VA_BITS=48 from \
+             VA_BITS=52+16K with HW fallback; 0xFFFF_C000_8000_0000 \
+             would be correct for VA_BITS=52+16K"
+        );
+        // VA_BITS=52 (compile), 4 KB pages, T1SZ=16. Correct
+        // VA_BITS_MIN=48 → KIMAGE_VADDR 0xFFFF_8000_8000_0000.
+        // Function returns the same answer; this case happens to
+        // be correct because 4 KB / 64 KB granules use VA_BITS_MIN=48
+        // regardless of compile-time VA_BITS.
+        let tcr_52_4k_reduced = (0b10u64 << 30) | (16u64 << 16);
+        assert_eq!(
+            start_kernel_map_for_tcr(tcr_52_4k_reduced),
+            Some(0xFFFF_8000_8000_0000)
+        );
     }
 
     #[test]
@@ -1012,5 +1180,43 @@ mod tests {
         };
 
         assert!(!resolve_pgtable_l5(&mem, &symbols, START_KERNEL_MAP));
+    }
+
+    /// `default_page_offset_for_tcr` derives `-(1 << VA_BITS)` from
+    /// `TCR_EL1.T1SZ`. Pin every legitimate VA_BITS encoding plus
+    /// the unset / out-of-range fallback so a regression in the
+    /// bit math surfaces here. On x86_64 the function is constant
+    /// (the register doesn't exist) so all encodings collapse to
+    /// [`DEFAULT_PAGE_OFFSET`].
+    #[test]
+    fn default_page_offset_for_tcr_derives_va_bits() {
+        #[cfg(target_arch = "x86_64")]
+        {
+            // x86_64: tcr_el1 ignored, always returns the constant.
+            assert_eq!(default_page_offset_for_tcr(0), DEFAULT_PAGE_OFFSET);
+            assert_eq!(default_page_offset_for_tcr(0x12345), DEFAULT_PAGE_OFFSET);
+            assert_eq!(default_page_offset_for_tcr(u64::MAX), DEFAULT_PAGE_OFFSET);
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            // VA_BITS=48 (T1SZ=16): -(1 << 48) = 0xffff_0000_0000_0000.
+            let tcr_48 = 16u64 << 16;
+            assert_eq!(default_page_offset_for_tcr(tcr_48), 0xffff_0000_0000_0000);
+            // VA_BITS=47 (T1SZ=17, 16 KiB granule, Apple Silicon):
+            // -(1 << 47) = 0xffff_8000_0000_0000.
+            let tcr_47 = 17u64 << 16;
+            assert_eq!(default_page_offset_for_tcr(tcr_47), 0xffff_8000_0000_0000);
+            // VA_BITS=52 (T1SZ=12): -(1 << 52) = 0xfff0_0000_0000_0000.
+            let tcr_52 = 12u64 << 16;
+            assert_eq!(default_page_offset_for_tcr(tcr_52), 0xfff0_0000_0000_0000);
+            // tcr_el1 == 0 (BSP loop hasn't read register): fallback.
+            assert_eq!(default_page_offset_for_tcr(0), DEFAULT_PAGE_OFFSET);
+            // T1SZ == 0 (high half disabled): fallback.
+            let tcr_t1sz_0 = 0u64;
+            assert_eq!(default_page_offset_for_tcr(tcr_t1sz_0), DEFAULT_PAGE_OFFSET);
+            // T1SZ > 60 (out of range): fallback.
+            let tcr_t1sz_63 = 63u64 << 16;
+            assert_eq!(default_page_offset_for_tcr(tcr_t1sz_63), DEFAULT_PAGE_OFFSET);
+        }
     }
 }

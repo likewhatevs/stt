@@ -180,6 +180,7 @@ fn fault_under_lock(stop: &AtomicBool) -> WorkerReport {
         exit_info: None,
         is_messenger: false,
         group_idx: 0,
+        affinity_error: None,
     }
 }
 
@@ -210,6 +211,7 @@ fn zeroed_report(tid: libc::pid_t, start: Instant) -> WorkerReport {
         exit_info: None,
         is_messenger: false,
         group_idx: 0,
+        affinity_error: None,
     }
 }
 

@@ -41,7 +41,9 @@
 
 use std::borrow::Cow;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread::ThreadId;
 
 use std::time::Duration;
 
@@ -333,7 +335,7 @@ fn payload_binary(payload: &Payload) -> Result<&'static str> {
 ///
 /// 1. Skips [`extract_metrics`] entirely — no model dispatch reaches
 ///    any guest call graph.
-/// 2. Emits a [`MSG_TYPE_RAW_PAYLOAD_OUTPUT`](crate::vmm::shm_ring::MSG_TYPE_RAW_PAYLOAD_OUTPUT)
+/// 2. Emits a [`MSG_TYPE_RAW_PAYLOAD_OUTPUT`](crate::vmm::wire::MSG_TYPE_RAW_PAYLOAD_OUTPUT)
 ///    SHM message carrying both raw stdout and stderr plus the
 ///    payload's hint and exit code.
 /// 3. Emits a paired [`MSG_TYPE_PAYLOAD_METRICS`] SHM message with
@@ -431,7 +433,7 @@ fn evaluate(
 
 /// Serialize a [`PayloadMetrics`] to JSON and emit it on the
 /// guest-to-host bulk data channel (virtio-console port 1) under
-/// [`MSG_TYPE_PAYLOAD_METRICS`](crate::vmm::shm_ring::MSG_TYPE_PAYLOAD_METRICS).
+/// [`MSG_TYPE_PAYLOAD_METRICS`](crate::vmm::wire::MSG_TYPE_PAYLOAD_METRICS).
 ///
 /// The `serde_json::to_vec` call is infallible in practice for
 /// `PayloadMetrics`: every field is an owned, serde-trivial value
@@ -458,7 +460,7 @@ fn emit_payload_metrics(pm: &PayloadMetrics) {
 
 /// Serialize a [`RawPayloadOutput`] and emit it on the guest-to-host
 /// bulk data channel (virtio-console port 1) under
-/// [`MSG_TYPE_RAW_PAYLOAD_OUTPUT`](crate::vmm::shm_ring::MSG_TYPE_RAW_PAYLOAD_OUTPUT).
+/// [`MSG_TYPE_RAW_PAYLOAD_OUTPUT`](crate::vmm::wire::MSG_TYPE_RAW_PAYLOAD_OUTPUT).
 ///
 /// Mirrors [`emit_payload_metrics`]'s shape: the same
 /// `serde_json::to_vec` infallibility argument applies (all fields
@@ -616,6 +618,26 @@ fn evaluate_llm_extract_deferred(
 /// order. `.try_wait()` only records on its terminal branch; an
 /// `Ok(None)` return keeps the handle live and defers the sidecar
 /// write to the next terminal call.
+// DROP-ORDER-CRITICAL: keep `_sigchld` LAST in the field list.
+//
+// Rust drops fields in declaration order, so the LAST field is the
+// LAST to drop. `SigchldScope::drop` re-installs the previously
+// captured disposition; multiple live `SigchldScope`s on the same
+// thread form a LIFO stack whose unwinding is what restores the
+// outermost original disposition. Any field added between `child`
+// and `_sigchld` would still keep `_sigchld` last, but a field
+// added AFTER `_sigchld` would reorder the drop sequence and break
+// the LIFO invariant — drop the new field first, signal-restore
+// path runs second, the disposition handler captured BEFORE the
+// new field was constructed gets restored even though the new
+// field outlived nothing. Also: when the caller holds two
+// `PayloadHandle`s and drops them in non-creation order, the LIFO
+// invariant is preserved by the field-order rule WITHIN each
+// handle but not ACROSS handles — non-LIFO drop across handles
+// will leak `SIG_DFL` into the rest of the process. Test authors
+// must drop handles in reverse creation order; the LIFO test in
+// the unit-test module pins the within-handle field-order rule
+// to catch a future refactor that re-orders the struct.
 #[must_use = "dropping a PayloadHandle SIGKILLs the child's process group; call .wait() or .kill() explicitly"]
 pub struct PayloadHandle {
     /// Live child process. Wrapped in `Option` so consumers can
@@ -629,6 +651,9 @@ pub struct PayloadHandle {
     /// child's eventual `waitpid` sees `SIG_DFL` instead of the
     /// guest init's `SIG_IGN`. See [`SigchldScope`] for the full
     /// rationale.
+    ///
+    /// DROP-ORDER-CRITICAL: keep this field LAST. See struct-level
+    /// note above.
     _sigchld: SigchldScope,
 }
 
@@ -758,18 +783,31 @@ impl PayloadHandle {
                     .child
                     .take()
                     .expect("child still present on terminal branch");
+                // The leader has exited (try_wait returned Some), but
+                // descendants forked off the leader (stress-ng workers,
+                // schbench worker mode, fio --numjobs threads) may
+                // still be alive and holding the inherited
+                // stdout/stderr pipes open. Without first SIGKILLing
+                // the process group, `wait_and_capture` would block
+                // forever on the read syscall waiting for those
+                // descendants to release the pipes. This mirrors the
+                // kill() path at line 726 which always SIGKILLs the
+                // group before draining — the only difference here is
+                // the leader has already exited, so killpg is reaping
+                // descendants only.
+                kill_payload_process_group(
+                    &child,
+                    self.payload.name,
+                    self.payload.uses_parent_pgrp,
+                );
                 match wait_and_capture(&mut child) {
                     Ok(output) => Ok(Some(evaluate(self.payload, &self.checks, output))),
                     Err(e) => {
-                        // Leader exited (try_wait returned Some) but
-                        // pipe drain failed — descendants may still
-                        // hold the pipes. Kill the group to release
-                        // them, then reap the leader zombie.
-                        kill_payload_process_group(
-                            &child,
-                            self.payload.name,
-                            self.payload.uses_parent_pgrp,
-                        );
+                        // killpg + single-pid SIGKILL already ran at
+                        // the top of this branch; the reap or
+                        // pipe-drain failed afterwards. One more
+                        // `wait` clears the zombie so the pid slot is
+                        // freed regardless of the capture error.
                         let _ = child.wait();
                         Err(e).with_context(|| format!("reap payload '{}'", self.payload.name))
                     }
@@ -1083,33 +1121,63 @@ fn evaluate_checks(checks: &[MetricCheck], pm: &PayloadMetrics, stderr: &str) ->
         return result;
     }
     // Metric-path pass.
+    //
+    // Each comparator below routes a NaN observed value through
+    // `nan_metric` BEFORE the bound comparison. IEEE 754 makes
+    // every comparison against NaN evaluate to false (`NaN < x`,
+    // `NaN > x`, and `NaN == x` are all false), which would let
+    // a NaN-valued metric silently pass `Min` / `Max` / `Range` —
+    // exactly the case operators most need to flag, since a NaN
+    // value indicates the payload's metric extraction itself is
+    // broken (a divide-by-zero, an unparsed token, or a typed-
+    // measurement error). Surface NaN as a hard failure with a
+    // dedicated message so the bound check never silently green-
+    // lights an unmeasurable value.
     for check in checks {
         let detail = match check {
             MetricCheck::Min { metric, value } => pm.get(metric).map_or_else(
                 || Some(missing_metric(metric)),
                 |actual| {
-                    (actual < *value).then(|| AssertDetail {
-                        kind: DetailKind::Other,
-                        message: format!("metric '{metric}' = {actual} below minimum {value}"),
-                    })
+                    if actual.is_nan() {
+                        Some(nan_metric(metric))
+                    } else if actual < *value {
+                        Some(AssertDetail {
+                            kind: DetailKind::Other,
+                            message: format!("metric '{metric}' = {actual} below minimum {value}"),
+                        })
+                    } else {
+                        None
+                    }
                 },
             ),
             MetricCheck::Max { metric, value } => pm.get(metric).map_or_else(
                 || Some(missing_metric(metric)),
                 |actual| {
-                    (actual > *value).then(|| AssertDetail {
-                        kind: DetailKind::Other,
-                        message: format!("metric '{metric}' = {actual} exceeds maximum {value}"),
-                    })
+                    if actual.is_nan() {
+                        Some(nan_metric(metric))
+                    } else if actual > *value {
+                        Some(AssertDetail {
+                            kind: DetailKind::Other,
+                            message: format!("metric '{metric}' = {actual} exceeds maximum {value}"),
+                        })
+                    } else {
+                        None
+                    }
                 },
             ),
             MetricCheck::Range { metric, lo, hi } => pm.get(metric).map_or_else(
                 || Some(missing_metric(metric)),
                 |actual| {
-                    ((actual < *lo) || (actual > *hi)).then(|| AssertDetail {
-                        kind: DetailKind::Other,
-                        message: format!("metric '{metric}' = {actual} outside [{lo}, {hi}]"),
-                    })
+                    if actual.is_nan() {
+                        Some(nan_metric(metric))
+                    } else if actual < *lo || actual > *hi {
+                        Some(AssertDetail {
+                            kind: DetailKind::Other,
+                            message: format!("metric '{metric}' = {actual} outside [{lo}, {hi}]"),
+                        })
+                    } else {
+                        None
+                    }
                 },
             ),
             MetricCheck::Exists(metric) => pm.get(metric).is_none().then(|| missing_metric(metric)),
@@ -1120,6 +1188,19 @@ fn evaluate_checks(checks: &[MetricCheck], pm: &PayloadMetrics, stderr: &str) ->
         }
     }
     result
+}
+
+/// Build the NaN-value [`AssertDetail`] surfaced by every
+/// magnitude comparator ([`MetricCheck::Min`], [`MetricCheck::Max`],
+/// [`MetricCheck::Range`]) when a metric extracts as NaN. Pulled
+/// out so the three call sites share one message format — a
+/// renamer-resistant single source of truth that pairs naturally
+/// with [`missing_metric`] for the absent-metric counterpart.
+fn nan_metric(metric: &str) -> AssertDetail {
+    AssertDetail {
+        kind: DetailKind::Other,
+        message: format!("metric '{metric}' value is NaN"),
+    }
 }
 
 fn missing_metric(metric: &str) -> AssertDetail {
@@ -1879,24 +1960,20 @@ fn spawn_error_context(err: std::io::Error, binary: &str) -> anyhow::Error {
 /// between spawn and final disposition. Foreground spawns
 /// (`spawn_and_wait`) scope the guard to the `.output()` call —
 /// the child is reaped inline, no lingering state.
-/// Pins the thread ID of the first `SigchldScope` constructed in
+/// Pins the [`ThreadId`] of the first `SigchldScope` constructed in
 /// this process. Every subsequent construction must come from the
 /// same thread: `libc::signal` is not thread-safe, and concurrent
 /// installs from distinct threads would race on the process-wide
-/// `SIGCHLD` disposition. The field is `AtomicUsize` carrying a
-/// `ThreadId::as_u64()`-style encoding, with `0` meaning
-/// "uninitialized" (no SigchldScope has been constructed yet in
+/// `SIGCHLD` disposition. The unset state of the `OnceLock` means
+/// "uninitialized" (no `SigchldScope` has been constructed yet in
 /// this process).
 ///
-/// Zero is a safe sentinel: `current_thread_id_nonzero()` (the
-/// function that writes into this AtomicUsize) explicitly
-/// squashes a hash result of 0 to 1 before returning — so no
-/// legitimate thread-identity value written here is ever zero,
-/// and the uninitialized AtomicUsize is unambiguous. (The hash
-/// is produced via `DefaultHasher` on `ThreadId`, not via
-/// `ThreadId::as_u64()` which is nightly-only; the squash-to-1
-/// is what guarantees the non-zero invariant, not any property
-/// of `ThreadId` / `NonZeroU64`.)
+/// `ThreadId` is the std-library opaque thread identifier with
+/// guaranteed uniqueness for the lifetime of the process and a
+/// `PartialEq` impl that compares the underlying `NonZero<u64>`
+/// directly. Storing the actual `ThreadId` (instead of a hash of
+/// it) eliminates the collision-window risk that any hash-based
+/// encoding carries, no matter how astronomically unlikely.
 ///
 /// Multiple concurrent `SigchldScope` instances ARE allowed on
 /// the same thread — each `PayloadHandle` carries one, and a
@@ -1906,28 +1983,34 @@ fn spawn_error_context(err: std::io::Error, binary: &str) -> anyhow::Error {
 /// original disposition intact; this is the caller's obligation
 /// (handles dropped in reverse creation order, which is the
 /// default when locals go out of scope).
-static SIGCHLD_SCOPE_OWNER_THREAD: AtomicUsize = AtomicUsize::new(0);
-
-fn current_thread_id_nonzero() -> usize {
-    // `ThreadId::as_u64()` is nightly-only; stable gives no public
-    // integer accessor. We hash the ThreadId instead — collisions
-    // across threads are astronomically unlikely within a single
-    // process, and the check is a debug / soundness guard, not a
-    // cryptographic boundary.
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
-    std::thread::current().id().hash(&mut h);
-    // Squash zero to 1 so the sentinel stays reserved for
-    // "uninitialized". Collision with thread 1's legitimate hash
-    // is acceptable — it only means the check is slightly weaker
-    // for that single thread, never falsely-positive.
-    let id = h.finish() as usize;
-    if id == 0 { 1 } else { id }
-}
+static SIGCHLD_SCOPE_OWNER_THREAD: OnceLock<ThreadId> = OnceLock::new();
 
 struct SigchldScope {
     prev: libc::sighandler_t,
+    /// Marker that makes `SigchldScope` `!Send` AND `!Sync` at the
+    /// type-system level. `libc::sighandler_t` is `size_t` on Linux
+    /// (a plain integer that auto-implements both `Send` and `Sync`),
+    /// so without this marker the struct would be `Send + Sync` and
+    /// the compiler would silently accept a move across thread
+    /// boundaries. The `OnceLock`-based runtime pin in `new` and
+    /// `drop` only catches an actual install/restore on the wrong
+    /// thread; the `PhantomData<*const ()>` adds a compile-time
+    /// barrier so a `thread::spawn(move || { let _ = scope; })`
+    /// fails to type-check instead of relying on the runtime check
+    /// to catch it.
+    ///
+    /// `*const T` carries explicit `!Send` and `!Sync` negative
+    /// impls in `core::marker` (`impl<T: PointeeSized> !Send for
+    /// *const T` at marker.rs:100, `impl<T: PointeeSized> !Sync for
+    /// *const T` at marker.rs:680). `Send` and `Sync` are
+    /// independent auto traits — neither implies the other — and
+    /// `PhantomData<T>` (a generic struct with no manual Send/Sync
+    /// impl) propagates each independently via auto-trait
+    /// inference. So `PhantomData<*const ()>` is `!Send` because
+    /// `*const ()` is `!Send`, AND `!Sync` because `*const ()` is
+    /// `!Sync`. Both come from the marker, not from one implying
+    /// the other.
+    _not_send: std::marker::PhantomData<*const ()>,
 }
 
 impl SigchldScope {
@@ -1944,44 +2027,60 @@ impl SigchldScope {
     /// `libc::signal` is not thread-safe and cross-thread installs
     /// would race on the process-wide SIGCHLD disposition.
     fn new() -> Self {
-        let tid = current_thread_id_nonzero();
+        let tid = std::thread::current().id();
         // Pin the first thread that ever constructs a SigchldScope
-        // in this process. Subsequent threads are rejected.
-        match SIGCHLD_SCOPE_OWNER_THREAD.compare_exchange(
-            0,
-            tid,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        ) {
-            Ok(_) => {
-                // We are the first — thread pinned.
-            }
-            Err(pinned) if pinned == tid => {
-                // Same thread as the first construction — OK.
-            }
-            Err(pinned) => {
-                panic!(
-                    "SigchldScope constructed on a different thread than the first \
-                     owner (pinned thread id hash={pinned}, this thread's hash={tid}). \
-                     libc::signal is not thread-safe; cross-thread installs race on \
-                     the process-wide SIGCHLD disposition."
-                );
-            }
+        // in this process via `OnceLock::get_or_init`, then enforce
+        // the pin on every subsequent construction. `get_or_init`
+        // is internally synchronized: concurrent first-callers
+        // race only on which one's `init` closure runs, and the
+        // others observe the winner's value via the same call. The
+        // returned reference is the canonical pinned ThreadId.
+        let pinned = SIGCHLD_SCOPE_OWNER_THREAD.get_or_init(|| tid);
+        if *pinned != tid {
+            panic!(
+                "SigchldScope constructed on a different thread than the first \
+                 owner (pinned thread id={pinned:?}, this thread's id={tid:?}). \
+                 libc::signal is not thread-safe; cross-thread installs race on \
+                 the process-wide SIGCHLD disposition."
+            );
         }
         // SAFETY: SIGCHLD_SCOPE_OWNER_THREAD pins construction to
         // a single thread across the whole process, so no other
         // thread is concurrently installing a SIGCHLD handler.
-        // Drop must run on the same thread (Rust's dropping
-        // invariants hold if the handle stays !Send, which it is
-        // by default since libc::sighandler_t contains a raw
-        // pointer).
+        // The `_not_send: PhantomData<*const ()>` field below makes
+        // the type `!Send` so a move across threads fails to compile
+        // — Drop is guaranteed to run on the same thread that
+        // constructed the scope.
         let prev = unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL) };
-        SigchldScope { prev }
+        SigchldScope {
+            prev,
+            _not_send: std::marker::PhantomData,
+        }
     }
 }
 
 impl Drop for SigchldScope {
     fn drop(&mut self) {
+        // Defense-in-depth: the `!Send` marker on the struct
+        // prevents a compile-time cross-thread move, but a future
+        // refactor that adds an explicit `unsafe impl Send`
+        // workaround would silently bypass that guard. Re-check the
+        // owner-thread pin at drop time so a wrong-thread restore
+        // panics loudly instead of quietly racing the process-wide
+        // SIGCHLD disposition.
+        let pinned = SIGCHLD_SCOPE_OWNER_THREAD
+            .get()
+            .expect("SIGCHLD_SCOPE_OWNER_THREAD must be initialized — set by SigchldScope::new");
+        assert_eq!(
+            *pinned,
+            std::thread::current().id(),
+            "SigchldScope dropped on a different thread than the pinned owner \
+             (pinned={pinned:?}, this thread={:?}). libc::signal is not \
+             thread-safe and the construct-side `!Send` marker should have \
+             made this impossible at compile time — investigate any \
+             `unsafe impl Send for SigchldScope` that bypassed it.",
+            std::thread::current().id(),
+        );
         // SAFETY: same rationale as `new` — the owner-thread pin
         // guarantees no concurrent installer on another thread.
         // Restoring in LIFO order across nested scopes unwinds
@@ -1992,6 +2091,57 @@ impl Drop for SigchldScope {
         }
     }
 }
+
+// Compile-time pin: `SigchldScope` must be neither `Send` nor `Sync`.
+//
+// `SigchldScope::new` and its `Drop` install/restore the process-wide
+// `SIGCHLD` disposition via `libc::signal`, which is documented as
+// async-signal-safe but not thread-safe with respect to concurrent
+// installs. The `_not_send: PhantomData<*const ()>` field at the
+// struct definition is what makes the type `!Send` AND `!Sync`.
+// `Send` and `Sync` are independent auto traits — neither implies
+// the other. `*const T` carries explicit `!Send` and `!Sync`
+// negative impls in `core::marker` (`impl<T: PointeeSized> !Send
+// for *const T` at marker.rs:100, `impl<T: PointeeSized> !Sync for
+// *const T` at marker.rs:680), and `PhantomData<T>` propagates each
+// independently via auto-trait inference. So `PhantomData<*const
+// ()>` is `!Send` because `*const ()` is `!Send`, AND `!Sync`
+// because `*const ()` is `!Sync` — both from the marker, not from
+// one implying the other. This block re-asserts that invariant at
+// compile time so a future refactor that drops the marker, replaces
+// it with a `Send` type, or adds an explicit `unsafe impl
+// Send`/`unsafe impl Sync` for `SigchldScope` fails to compile here
+// instead of silently allowing a cross-thread move that would race
+// the SIGCHLD install on another thread.
+//
+// Mechanism (mirrors `static_assertions::assert_not_impl_any!`): a
+// blanket `AmbiguousIfImpl<()>` impl applies to every type, while a
+// specialized `AmbiguousIfImpl<Invalid{Send,Sync}>` impl applies only
+// to types that `Send` / `Sync` respectively. If `SigchldScope`
+// implemented either, two impls would match `AmbiguousIfImpl<_>` and
+// type inference for `_` would be ambiguous, producing a compile
+// error. With `SigchldScope: !Send + !Sync`, only the blanket impl
+// matches and the assertion compiles.
+//
+// `static_assertions` is a transitive dep (via `compact_str`) but not
+// a direct dependency; inlining the trick keeps the assertion local
+// without growing the direct dep graph for one use site.
+const _: fn() = || {
+    trait AmbiguousIfImpl<A> {
+        fn some_item() {}
+    }
+    impl<T: ?Sized> AmbiguousIfImpl<()> for T {}
+
+    #[allow(dead_code)]
+    struct InvalidSend;
+    impl<T: ?Sized + Send> AmbiguousIfImpl<InvalidSend> for T {}
+
+    #[allow(dead_code)]
+    struct InvalidSync;
+    impl<T: ?Sized + Sync> AmbiguousIfImpl<InvalidSync> for T {}
+
+    let _ = <SigchldScope as AmbiguousIfImpl<_>>::some_item;
+};
 
 /// Foreground path: spawn + wait + capture. Used by `.run()`.
 ///
@@ -2852,6 +3002,91 @@ mod tests {
         let r = evaluate_checks(&[MetricCheck::range("cpu", 0.0, 100.0)], &pm, "");
         assert!(!r.passed);
         assert!(r.details[0].message.contains("outside"));
+    }
+
+    /// IEEE 754 makes every comparison against NaN evaluate to
+    /// false, so a naive `actual < min` would silently pass a
+    /// `Min` check on a NaN-valued metric — exactly the case
+    /// operators most need to flag, since NaN almost always means
+    /// the metric extraction itself is broken (divide-by-zero,
+    /// unparsed token, typed-measurement error). The fix routes
+    /// NaN through `nan_metric` BEFORE the bound comparison, so
+    /// the failure reads "metric '...' value is NaN" rather than
+    /// silently green-lighting an unmeasurable value.
+    #[test]
+    fn evaluate_checks_min_nan_fails_with_nan_message() {
+        let pm = PayloadMetrics {
+            payload_index: 0,
+            metrics: vec![Metric {
+                name: "iops".to_string(),
+                value: f64::NAN,
+                polarity: Polarity::HigherBetter,
+                unit: String::new(),
+                source: MetricSource::Json,
+                stream: MetricStream::Stdout,
+            }],
+            exit_code: 0,
+        };
+        let r = evaluate_checks(&[MetricCheck::min("iops", 100.0)], &pm, "");
+        assert!(!r.passed, "NaN value must fail Min check");
+        assert!(
+            r.details[0].message.contains("value is NaN"),
+            "NaN failure must surface the dedicated message: {:?}",
+            r.details
+        );
+    }
+
+    /// Sibling of [`evaluate_checks_min_nan_fails_with_nan_message`]
+    /// for the upper-bound path — `actual > max` is also false for
+    /// NaN.
+    #[test]
+    fn evaluate_checks_max_nan_fails_with_nan_message() {
+        let pm = PayloadMetrics {
+            payload_index: 0,
+            metrics: vec![Metric {
+                name: "lat".to_string(),
+                value: f64::NAN,
+                polarity: Polarity::LowerBetter,
+                unit: String::new(),
+                source: MetricSource::Json,
+                stream: MetricStream::Stdout,
+            }],
+            exit_code: 0,
+        };
+        let r = evaluate_checks(&[MetricCheck::max("lat", 500.0)], &pm, "");
+        assert!(!r.passed, "NaN value must fail Max check");
+        assert!(
+            r.details[0].message.contains("value is NaN"),
+            "NaN failure must surface the dedicated message: {:?}",
+            r.details
+        );
+    }
+
+    /// Range gate sees NaN through both `actual < lo` and
+    /// `actual > hi` — both false, so the legacy code accepted
+    /// NaN as in-range. The fix routes NaN through `nan_metric`
+    /// before the range comparison.
+    #[test]
+    fn evaluate_checks_range_nan_fails_with_nan_message() {
+        let pm = PayloadMetrics {
+            payload_index: 0,
+            metrics: vec![Metric {
+                name: "cpu".to_string(),
+                value: f64::NAN,
+                polarity: Polarity::Unknown,
+                unit: String::new(),
+                source: MetricSource::Json,
+                stream: MetricStream::Stdout,
+            }],
+            exit_code: 0,
+        };
+        let r = evaluate_checks(&[MetricCheck::range("cpu", 0.0, 100.0)], &pm, "");
+        assert!(!r.passed, "NaN value must fail Range check");
+        assert!(
+            r.details[0].message.contains("value is NaN"),
+            "NaN failure must surface the dedicated message: {:?}",
+            r.details
+        );
     }
 
     #[test]
@@ -4934,7 +5169,7 @@ mod tests {
     // These tests bypass the actual VM boot by calling `evaluate`
     // directly with a synthetic `SpawnOutput`. SHM emits inside
     // `evaluate` are no-ops in the test process (see
-    // `crate::vmm::shm_ring::write_msg` early-return on
+    // `crate::vmm::guest_comms::write_msg` early-return on
     // uninitialized SHM).
 
     /// LlmExtract payload constant — used by the guest-side
@@ -5194,4 +5429,206 @@ mod tests {
             "panic message must surface the developer-error guidance; got: {msg}",
         );
     }
+
+    /// LIFO-drop pin for [`SigchldScope`]'s save-and-restore chain.
+    ///
+    /// `SigchldScope::new()` installs `SIG_DFL` and captures the
+    /// PREVIOUS disposition into `prev`. When two scopes are
+    /// constructed back-to-back on the same thread, the second
+    /// scope's `prev` is the FIRST scope's `SIG_DFL` install (not
+    /// the original disposition). The original disposition lives in
+    /// the FIRST scope's `prev`.
+    ///
+    /// Drop order therefore matters: LIFO (drop second-constructed
+    /// first) unwinds correctly — second drop restores `SIG_DFL`,
+    /// first drop restores the original. NON-LIFO (drop
+    /// first-constructed first) corrupts the disposition: first
+    /// drop restores the original, second drop overwrites it with
+    /// `SIG_DFL`, and the rest of the process runs with the wrong
+    /// SIGCHLD handler.
+    ///
+    /// `PayloadHandle` keeps `_sigchld` as the LAST struct field so
+    /// per-handle drop is always LIFO with respect to the child it
+    /// guards — the field-order rule documented at the
+    /// `PayloadHandle` definition. This test pins that LIFO drop of
+    /// nested scopes preserves the initial disposition by capturing
+    /// the disposition before, during, and after the scope chain
+    /// unwinds, then asserting only the LIFO ordering produces the
+    /// "after == initial" outcome.
+    ///
+    /// Implementation note: `libc::signal` returns the previous
+    /// handler on every call. We use that as the read mechanism —
+    /// install `SIG_DFL` to read the current handler, then
+    /// immediately restore it. The read itself is destructive, so
+    /// the helper has to put the original back before returning.
+    ///
+    /// The thread-pin in `SigchldScope::new` requires every
+    /// construction in the process to come from the SAME thread.
+    /// Nextest runs each test in its own process (per
+    /// `.config/nextest.toml`), so this test's thread-of-call wins
+    /// the pin and other tests' threads are isolated.
+    #[test]
+    fn sigchld_scope_lifo_drop_restores_initial_disposition() {
+        // Read the current SIGCHLD disposition non-destructively by
+        // saving the value `signal()` returns, then immediately
+        // re-installing it. SAFETY: same as SigchldScope::new — the
+        // thread-pin guarantees no other thread is racing the
+        // process-wide disposition install.
+        fn read_sigchld() -> libc::sighandler_t {
+            // Pin the construction thread BEFORE we install — the
+            // SigchldScope thread-pin is initialized on its first
+            // `new()` call, but this helper runs before any scope
+            // is constructed. Without a separate pin step, the
+            // first scope below would be the one that pins. That
+            // is fine in practice; the helper just has to use the
+            // same thread the scopes do, which is the test thread.
+            let handler = unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL) };
+            // Restore immediately so we don't leak the read-side
+            // SIG_DFL into the rest of the test. Note: this is
+            // observably equivalent to "do nothing" if the
+            // disposition WAS already SIG_DFL, which is the common
+            // case on the host (the guest init's SIG_IGN flip is
+            // not active in the unit-test process).
+            unsafe {
+                libc::signal(libc::SIGCHLD, handler);
+            }
+            handler
+        }
+
+        let initial = read_sigchld();
+        // Construct nested scopes:
+        // - outer.prev = initial; outer's new() installs SIG_DFL.
+        // - inner.prev = SIG_DFL; inner's new() installs SIG_DFL
+        //   (a no-op since outer already did).
+        // After both new() calls, the live disposition is SIG_DFL.
+        let outer = SigchldScope::new();
+        let inner = SigchldScope::new();
+        // LIFO drop: inner (constructed second) first.
+        // - inner.drop() re-installs inner.prev (= SIG_DFL).
+        //   Live disposition: SIG_DFL.
+        // - Read confirms SIG_DFL.
+        // - outer.drop() re-installs outer.prev (= initial).
+        //   Live disposition: initial.
+        // - Read confirms initial.
+        //
+        // Non-LIFO drop (drop outer first, then inner) would
+        // produce: outer.drop() restores initial, inner.drop()
+        // overwrites with SIG_DFL. The final read would see
+        // SIG_DFL != initial. This test pins LIFO by structuring
+        // the drops in LIFO order and asserting initial is
+        // restored at the end. A future refactor that reordered
+        // struct fields or shuffled drops would trip the final
+        // assert.
+        drop(inner);
+        assert_eq!(
+            read_sigchld(),
+            libc::SIG_DFL,
+            "after inner drop, live disposition must be SIG_DFL — \
+             inner.prev was outer's SIG_DFL install, not initial",
+        );
+        drop(outer);
+        assert_eq!(
+            read_sigchld(),
+            initial,
+            "after outer drop, live disposition must equal initial \
+             ({initial:#x}); a non-LIFO drop would leave SIG_DFL \
+             ({:#x}) leaking into the process",
+            libc::SIG_DFL,
+        );
+    }
+
+    /// Drop-side pin for [`PayloadHandle`]: dropping a real handle
+    /// restores the SIGCHLD disposition.
+    ///
+    /// Rust drops struct fields in declaration order. The
+    /// `PayloadHandle` definition (see the `DROP-ORDER-CRITICAL`
+    /// comment block above the struct) requires `_sigchld` to drop
+    /// AFTER `child`: while the child is being reaped on the drop
+    /// path (via `kill_payload_process_group` + `child.wait()` in
+    /// `Drop for PayloadHandle`), the SIGCHLD disposition must still
+    /// be `SIG_DFL` so `waitpid` returns the real exit status instead
+    /// of failing with `ECHILD` under the guest init's `SIGCHLD =
+    /// SIG_IGN`. If `_sigchld` were dropped before `child`, its
+    /// `Drop` would re-install the original (potentially `SIG_IGN`)
+    /// disposition while `child.wait()` was still in flight and the
+    /// reap could fail.
+    ///
+    /// `PayloadHandle::child` is `Option<std::process::Child>`; the
+    /// `Drop for PayloadHandle` body gates its kill-and-reap path on
+    /// `if let Some(mut child) = self.child.take()`, so `child:
+    /// None` is a valid in-test construction whose handle Drop
+    /// path is a no-op for the child branch but still drops every
+    /// field in declaration order. This test constructs a real
+    /// `PayloadHandle` (not a mirror) with `child: None`, a static
+    /// `Payload`, an empty `checks` vec, and a real `SigchldScope`
+    /// and asserts that the SIGCHLD disposition is restored to its
+    /// initial value after the handle drops. Building the real
+    /// struct exercises the actual field declaration order — a
+    /// future refactor that drops `_sigchld` from the field list,
+    /// renames it, or replaces its type compiles ONLY if this test
+    /// is updated in lock-step.
+    ///
+    /// The thread-pin in `SigchldScope::new` requires every
+    /// construction in the process to come from the SAME thread.
+    /// Nextest runs each test in its own process (per
+    /// `.config/nextest.toml`), so this test's thread-of-call wins
+    /// the pin and other tests' threads are isolated.
+    #[test]
+    fn payload_handle_drop_restores_sigchld_disposition() {
+        // Read the current SIGCHLD disposition non-destructively by
+        // saving the value `signal()` returns, then immediately
+        // re-installing it. SAFETY: same as SigchldScope::new — the
+        // thread-pin guarantees no other thread is racing the
+        // process-wide disposition install.
+        fn read_sigchld() -> libc::sighandler_t {
+            let handler = unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL) };
+            unsafe {
+                libc::signal(libc::SIGCHLD, handler);
+            }
+            handler
+        }
+
+        let initial = read_sigchld();
+
+        // Build a real PayloadHandle. `child: None` means the
+        // `Drop for PayloadHandle` body's `if let Some(...)` arm is
+        // not taken, so no kill/reap runs — but every field still
+        // drops in declaration order, so `_sigchld` (declared last)
+        // restores the SIGCHLD disposition. TRUE_BIN is a `&'static
+        // Payload` from this test module.
+        let handle = PayloadHandle {
+            child: None,
+            payload: &TRUE_BIN,
+            checks: Vec::new(),
+            _sigchld: SigchldScope::new(),
+        };
+
+        // After SigchldScope::new(), live disposition is SIG_DFL.
+        assert_eq!(
+            read_sigchld(),
+            libc::SIG_DFL,
+            "SigchldScope::new should have installed SIG_DFL while \
+             the handle is alive",
+        );
+
+        drop(handle);
+
+        // After Drop for PayloadHandle runs, every field has been
+        // dropped — including _sigchld, whose Drop re-installs the
+        // captured `prev` (= initial). If a future refactor removed
+        // _sigchld from the struct (or changed its type to one
+        // whose Drop does not restore the signal), this assertion
+        // fails because the live disposition would still be
+        // SIG_DFL, not initial.
+        assert_eq!(
+            read_sigchld(),
+            initial,
+            "after dropping a real PayloadHandle, live SIGCHLD \
+             disposition must equal initial ({initial:#x}); if the \
+             handle's `_sigchld` field was removed, renamed, or \
+             retyped, the disposition stays at SIG_DFL ({:#x})",
+            libc::SIG_DFL,
+        );
+    }
+
 }

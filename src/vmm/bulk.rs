@@ -18,6 +18,8 @@
 //! instead of waiting for the watchdog. Mid-run frame visibility
 //! requires streaming assembly with partial-frame retention.
 
+use std::sync::Arc;
+
 use crc32fast;
 use zerocopy::FromBytes;
 
@@ -26,15 +28,29 @@ use super::wire::{FRAME_HEADER_SIZE, ShmMessage};
 /// Per-frame payload cap enforced by the host assembler.
 ///
 /// The on-wire `length` field is `u32` so a malformed or hostile guest
-/// can announce a 4 GiB payload. Without this cap [`HostAssembler::feed`]
-/// would buffer the announced bytes (waiting for the frame to complete)
-/// up to that 4 GiB, opening an OOM vector. 256 KiB exceeds every real
-/// payload type — coverage `Profraw` blobs and LLM
-/// `RawPayloadOutput` JSON are well below this — and is large enough
-/// that legitimate guest traffic never trips it. A frame whose
-/// announced length exceeds the cap is dropped and the assembler
-/// resyncs by clearing residue (the announced length cannot be trusted
-/// to advance past the bogus payload).
+/// can announce a 4 GiB payload. 256 KiB exceeds every real payload
+/// type — coverage `Profraw` blobs and LLM `RawPayloadOutput` JSON
+/// are well below this — and is large enough that legitimate guest
+/// traffic never trips it. The cap check fires only after the
+/// complete frame has accumulated in the buffer (header +
+/// `length` payload bytes), so a header arriving ahead of its
+/// payload via split writev is not falsely rejected. Once the full
+/// frame is observed and `length > cap`, the assembler resyncs by
+/// clearing the entire buffer (the announced length cannot be
+/// trusted to advance past the bogus payload). The buffer itself
+/// only grows by bytes the caller fed, never by the announced
+/// length, so a hostile header does not inflate
+/// [`HostAssembler::buf`]'s capacity toward 4 GiB. The
+/// complementary residual-buffer cap inside [`HostAssembler::feed`]
+/// (2 × this value) closes the gap when announced lengths sit
+/// below the per-frame cap but exceed delivered bytes, or when
+/// hostile traffic dribbles many partial frames whose payloads
+/// never arrive.
+///
+/// The same cap also guards [`super::host_comms::parse_tlv_stream`]:
+/// the one-shot parser rejects frames whose announced `length`
+/// exceeds the cap so a corrupt or hostile buffer cannot trigger
+/// an oversized per-frame allocation downstream.
 pub const MAX_BULK_FRAME_PAYLOAD: u32 = 256 * 1024;
 
 /// One complete message extracted from the bulk byte stream.
@@ -45,13 +61,22 @@ pub const MAX_BULK_FRAME_PAYLOAD: u32 = 256 * 1024;
 /// pattern on `VmResult::stimulus_events` and `Snapshot` accessor
 /// types — fields part of the public surface that the lib build
 /// does not internally read.
+///
+/// `payload` is `Arc<[u8]>` so cloning a `BulkMessage` (e.g. when
+/// the freeze coordinator stashes parsed frames into the shared
+/// `bulk_messages` buffer for `collect_results`) is a refcount bump
+/// rather than a heap allocation + memcpy of the full payload bytes.
+/// The single per-frame allocation still occurs inside
+/// [`HostAssembler::feed`] when the assembler materialises the
+/// payload from its accumulator buffer; downstream cloning is
+/// O(1).
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct BulkMessage {
     pub msg_type: u32,
-    pub payload: Vec<u8>,
+    pub payload: Arc<[u8]>,
     /// True when the per-frame CRC matched the recomputed payload
-    /// CRC. Mirrors [`super::shm_ring::ShmEntry::crc_ok`] so the
+    /// CRC. Mirrors [`super::wire::ShmEntry::crc_ok`] so the
     /// downstream consumer can apply the same crc-gate that the
     /// SHM ring path used.
     pub crc_ok: bool,
@@ -74,15 +99,39 @@ pub struct BulkMessages {
 ///
 /// # Memory bounds
 ///
-/// The buffer grows with the largest in-flight payload, capped by
-/// [`MAX_BULK_FRAME_PAYLOAD`]. A frame whose announced `length`
-/// exceeds the cap is dropped (the bogus header plus any buffered
-/// residue is cleared) and the assembler resyncs on the next feed.
-/// Without the cap a hostile guest could announce a 4 GiB payload via
-/// the on-wire `u32` length field and the assembler would buffer up
-/// to that bound waiting for completion — an OOM vector. Mirrors the
-/// `max_payload` gate in [`super::shm_ring::shm_drain`] which rejects
-/// implausible lengths before allocation.
+/// The buffer grows with the bytes the host has actually received,
+/// not with announced frame lengths. Two complementary caps protect
+/// against unbounded growth:
+///
+/// 1. **Per-frame cap** ([`MAX_BULK_FRAME_PAYLOAD`]): a frame whose
+///    announced `length` exceeds the cap is dropped (the header,
+///    payload bytes, and any trailing residue cleared) only after
+///    the full announced length has accumulated — the cap check
+///    fires post-completion so a partial header that arrives ahead
+///    of its payload (split writev: the writer's
+///    `write_to_bulk_port` emits two iovecs and the kernel
+///    virtio_console driver's `port_fops_write` may flush them on
+///    separate trips through the device's `port1_tx_buf`) is not
+///    misclassified as oversized.
+///
+/// 2. **Residual-buffer cap** (`2 × MAX_BULK_FRAME_PAYLOAD`): closes
+///    the gap left by the post-completion check. A hostile guest
+///    can dribble headers (16 bytes each) announcing payloads it
+///    never intends to send, or announce `length` values below the
+///    per-frame cap that exceed what it actually delivers; the
+///    partial-frame retention path would otherwise let the buffer
+///    grow toward `port1_tx_buf`'s capacity. Once the residual
+///    exceeds twice the per-frame cap, the buffer cannot contain a
+///    legitimate single frame plus a partial follow-on — it must
+///    be junk or attack traffic — and the assembler clears it and
+///    resyncs.
+///
+/// The buffer never pre-allocates against the announced length —
+/// `extend_from_slice` only grows by what the caller fed, so a
+/// header announcing 4 GiB does not inflate `Vec::capacity` by
+/// 4 GiB. Mirrors the `MAX_BULK_FRAME_PAYLOAD` cap in
+/// [`super::host_comms::parse_tlv_stream`] which rejects implausible
+/// lengths before allocating the per-frame payload buffer.
 #[derive(Debug, Default)]
 pub struct HostAssembler {
     /// Bytes received but not yet assembled into a complete frame.
@@ -118,12 +167,34 @@ impl HostAssembler {
                 // bytes and ShmMessage is FromBytes. Defensive bail.
                 break;
             };
+            let payload_len = frame.length as usize;
+            let payload_end = hdr_end.saturating_add(payload_len);
+            if payload_end > self.buf.len() {
+                // Incomplete payload — wait for more bytes. Defer the
+                // cap check below until we have observed the full
+                // frame: a partial header arriving via split writev
+                // (the writer's `write_to_bulk_port` emits two iovecs
+                // and the kernel virtio_console driver's
+                // `port_fops_write` may flush them on separate trips
+                // through the device's `port1_tx_buf`) cannot be
+                // distinguished from a corrupt header until the
+                // payload bytes either arrive or fail to. Resyncing
+                // here would discard a legitimate large frame whose
+                // header happens to drain before the rest of its
+                // bytes; legitimate frames have `length` ≤ cap so
+                // the post-completion check will accept them.
+                break;
+            }
             if frame.length > MAX_BULK_FRAME_PAYLOAD {
-                // Hostile-guest defense: an announced length above the
-                // cap (4 GiB max via u32) would buffer until OOM while
-                // we wait for the frame to complete. The announced
-                // length cannot be trusted to advance past the bogus
-                // payload, so drop the entire buffer and resync.
+                // Hostile-guest defense: an announced length above
+                // the cap (4 GiB max via u32) cannot be a legitimate
+                // frame — every real producer's payload sits well
+                // below 256 KiB. We have now seen every byte the
+                // header claimed; drop the entire buffer (header +
+                // payload + any trailing residue) and resync. The
+                // announced length cannot be trusted to advance past
+                // the bogus payload, so partial bytes after this
+                // frame are also unparsable.
                 tracing::warn!(
                     msg_type = frame.msg_type,
                     length = frame.length,
@@ -133,18 +204,38 @@ impl HostAssembler {
                 resync = true;
                 break;
             }
-            let payload_len = frame.length as usize;
-            let payload_end = hdr_end.saturating_add(payload_len);
-            if payload_end > self.buf.len() {
-                // Incomplete payload — wait for more bytes.
-                break;
-            }
-            let payload = self.buf[hdr_end..payload_end].to_vec();
+            // Materialise the payload as `Arc<[u8]>` so subsequent
+            // clones (the freeze coordinator's stash from
+            // `BulkMessage` into the shared `ShmEntry` buffer) are
+            // refcount bumps rather than heap allocations + memcpy.
+            // `Arc::<[u8]>::from(&[u8])` performs a single
+            // allocation + copy of the slice contents into a
+            // refcounted boxed slice — same cost as the previous
+            // `to_vec()`, but every downstream `clone()` becomes
+            // O(1).
+            let payload: Arc<[u8]> = Arc::from(&self.buf[hdr_end..payload_end]);
             let computed = crc32fast::hash(&payload);
+            let crc_ok = computed == frame.crc32;
+            if !crc_ok {
+                // Surface the per-frame CRC mismatch for diagnostics.
+                // Mirrors `parse_tlv_stream`, which writes the same
+                // observation into `ShmEntry::crc_ok`. Downstream
+                // consumers may still filter on `crc_ok`, but the
+                // operator now sees the corruption in the log rather
+                // than learning of it only when a downstream parse
+                // fails.
+                tracing::warn!(
+                    msg_type = frame.msg_type,
+                    length = frame.length,
+                    expected_crc = frame.crc32,
+                    computed_crc = computed,
+                    "bulk assembler: per-frame CRC mismatch; surfacing crc_ok=false"
+                );
+            }
             out.push(BulkMessage {
                 msg_type: frame.msg_type,
                 payload,
-                crc_ok: computed == frame.crc32,
+                crc_ok,
             });
             consumed = payload_end;
         }
@@ -155,6 +246,27 @@ impl HostAssembler {
             self.buf.clear();
         } else if consumed > 0 {
             self.buf.drain(..consumed);
+        }
+        // Hostile-guest defense: bound the assembler's residual
+        // buffer size. The post-completion `length > cap` check
+        // above only fires once a full frame has accumulated; a
+        // hostile guest can announce `length = u32::MAX` (or any
+        // value below the cap but above the bytes it ever intends
+        // to send), then dribble headers without payloads. The
+        // partial-frame retention path would let the buffer grow
+        // unbounded toward `port1_tx_buf`'s capacity. Once the
+        // residual exceeds twice the per-frame cap, the buffer
+        // cannot contain a legitimate single frame plus a
+        // partial follow-on — it must be junk or attack traffic.
+        // Drop everything and resync.
+        if self.buf.len() > 2 * MAX_BULK_FRAME_PAYLOAD as usize {
+            tracing::warn!(
+                pending = self.buf.len(),
+                cap = 2 * MAX_BULK_FRAME_PAYLOAD as usize,
+                "bulk assembler: pending buffer exceeded 2× per-frame cap; \
+                 resyncing to prevent unbounded growth"
+            );
+            self.buf.clear();
         }
         BulkMessages { messages: out }
     }
@@ -225,9 +337,9 @@ mod tests {
         buf.extend(frame_bytes(MSG_TYPE_STIMULUS, b"third"));
         let r = a.feed(&buf);
         assert_eq!(r.messages.len(), 3);
-        assert_eq!(r.messages[0].payload, b"first");
-        assert_eq!(r.messages[1].payload, b"second");
-        assert_eq!(r.messages[2].payload, b"third");
+        assert_eq!(&*r.messages[0].payload, b"first");
+        assert_eq!(&*r.messages[1].payload, b"second");
+        assert_eq!(&*r.messages[2].payload, b"third");
     }
 
     /// A frame split across two feed calls is recovered intact —
@@ -244,7 +356,7 @@ mod tests {
         assert_eq!(a.pending(), split);
         let r2 = a.feed(&bytes[split..]);
         assert_eq!(r2.messages.len(), 1, "completing bytes must yield 1 frame");
-        assert_eq!(r2.messages[0].payload, b"payload-data");
+        assert_eq!(&*r2.messages[0].payload, b"payload-data");
         assert_eq!(a.pending(), 0);
     }
 
@@ -299,7 +411,7 @@ mod tests {
             total.extend(r.messages);
         }
         assert_eq!(total.len(), 1);
-        assert_eq!(total[0].payload, b"hello-world");
+        assert_eq!(&*total[0].payload, b"hello-world");
     }
 
     /// Zero-length payload: header followed by no bytes still
@@ -316,12 +428,17 @@ mod tests {
     }
 
     /// Hostile-guest defense: a frame header announcing
-    /// `length = u32::MAX` must be rejected without growing the
-    /// buffer toward 4 GiB. Without [`MAX_BULK_FRAME_PAYLOAD`] the
-    /// assembler would buffer subsequent bytes until OOM waiting for
-    /// the impossibly large frame to complete.
+    /// `length = u32::MAX` must not pre-allocate the buffer toward
+    /// 4 GiB. The assembler waits for the full frame before
+    /// applying the cap so a header that drains ahead of its
+    /// payload (split writev, partial drain) does not get
+    /// misclassified as oversized; once enough bytes arrive to
+    /// complete a frame whose announced length exceeds the cap,
+    /// the assembler resyncs and drops the buffer. Until then the
+    /// buffer holds only what the host received — no
+    /// `with_capacity(announced_length)` allocation.
     #[test]
-    fn assembler_rejects_enormous_frame_length() {
+    fn assembler_does_not_pre_allocate_for_enormous_frame_length() {
         let mut a = HostAssembler::new();
         // Hand-craft a header with u32::MAX length — exceeds the cap.
         let bad = ShmMessage {
@@ -331,22 +448,23 @@ mod tests {
             _pad: 0,
         };
         let r = a.feed(bad.as_bytes());
-        // No message produced — frame is dropped.
+        // No message produced — payload incomplete (we only fed the
+        // header).
         assert!(
             r.messages.is_empty(),
-            "oversized frame must not yield any message"
+            "header-only feed must not yield any message"
         );
-        // Buffer must not retain the bogus header (otherwise the
-        // assembler would re-warn on every subsequent feed and could
-        // grow without bound as the guest streams more bytes).
+        // Buffer still holds the 16-byte header. The cap check is
+        // deferred until the full frame arrives, so the buffer is
+        // not cleared yet.
         assert_eq!(
             a.pending(),
-            0,
-            "buffer must be cleared after dropping an oversized frame"
+            FRAME_HEADER_SIZE,
+            "header bytes must remain buffered; cap check is deferred"
         );
         // Subsequent bytes must not be appended to a pre-allocated
         // 4 GiB buffer. Even after streaming additional bytes, the
-        // assembler stays bounded — the corrupt frame did not cause
+        // assembler stays bounded — the corrupt header did not cause
         // capacity inflation toward `length`.
         let mut blast = Vec::with_capacity(64 * 1024);
         blast.resize(64 * 1024, 0xAAu8);
@@ -359,9 +477,46 @@ mod tests {
         );
     }
 
-    /// Cap boundary: a frame with `length == MAX_BULK_FRAME_PAYLOAD`
-    /// is accepted; one byte over the cap is rejected. Pins the
-    /// strict-greater-than comparison.
+    /// When a frame whose announced length exceeds the cap is
+    /// completed (header + that many payload bytes accumulated),
+    /// the assembler resyncs and clears the buffer. Pins the
+    /// post-completion cap-check path against an OOM regression
+    /// where the buffer would simply keep growing.
+    #[test]
+    fn assembler_drops_oversized_frame_once_complete() {
+        let mut a = HostAssembler::new();
+        // Choose a `length` that exceeds the cap but is small enough
+        // to fit in test memory (cap + 1 bytes of payload). The
+        // post-completion cap check must reject it.
+        let oversized_len = MAX_BULK_FRAME_PAYLOAD + 1;
+        let bad = ShmMessage {
+            msg_type: MSG_TYPE_EXIT,
+            length: oversized_len,
+            crc32: 0,
+            _pad: 0,
+        };
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(bad.as_bytes());
+        bytes.resize(FRAME_HEADER_SIZE + oversized_len as usize, 0xCC);
+        // Feed the full frame plus residue.
+        bytes.extend_from_slice(b"residue");
+        let r = a.feed(&bytes);
+        assert!(
+            r.messages.is_empty(),
+            "oversized frame must not yield any message"
+        );
+        assert_eq!(
+            a.pending(),
+            0,
+            "resync must clear bogus header, payload, and residue"
+        );
+    }
+
+    /// Cap boundary: a complete frame with
+    /// `length == MAX_BULK_FRAME_PAYLOAD` is accepted; a complete
+    /// frame one byte over the cap is rejected. Pins the
+    /// strict-greater-than comparison applied after frame
+    /// completion.
     #[test]
     fn assembler_accepts_at_cap_rejects_above() {
         let mut a = HostAssembler::new();
@@ -376,27 +531,42 @@ mod tests {
         assert_eq!(r.messages[0].payload.len(), MAX_BULK_FRAME_PAYLOAD as usize);
         assert!(r.messages[0].crc_ok);
 
-        // Now feed a header announcing one byte over the cap.
+        // Now feed a complete frame announcing one byte over the
+        // cap — header + (cap + 1) payload bytes. The
+        // post-completion cap check must reject it and resync the
+        // buffer.
         let mut b = HostAssembler::new();
+        let over_payload = vec![0xAAu8; (MAX_BULK_FRAME_PAYLOAD + 1) as usize];
         let over = ShmMessage {
             msg_type: MSG_TYPE_STIMULUS,
             length: MAX_BULK_FRAME_PAYLOAD + 1,
             crc32: 0,
             _pad: 0,
         };
-        let r2 = b.feed(over.as_bytes());
+        let mut over_bytes = Vec::new();
+        over_bytes.extend_from_slice(over.as_bytes());
+        over_bytes.extend_from_slice(&over_payload);
+        let r2 = b.feed(&over_bytes);
         assert!(
             r2.messages.is_empty(),
             "frame with length == cap + 1 must be rejected"
         );
-        assert_eq!(b.pending(), 0);
+        assert_eq!(
+            b.pending(),
+            0,
+            "resync must clear the bogus frame after observing its full length"
+        );
     }
 
-    /// A valid frame followed by an oversized frame: the valid frame
-    /// is returned, the oversized frame is dropped, and the buffer
-    /// is fully cleared (resync drops residue too).
+    /// A valid frame followed by an oversized-but-incomplete frame:
+    /// the valid frame is returned, and the bogus header bytes plus
+    /// any trailing residue stay buffered (the cap check is deferred
+    /// until the full frame arrives). The valid frame must still
+    /// drain even though the next frame's parse stalls on incomplete
+    /// payload — `consumed` advances past the good frame and the
+    /// `drain(..consumed)` call removes those bytes from the front.
     #[test]
-    fn good_frame_then_bad_frame_returns_good_drops_bad() {
+    fn good_frame_then_oversized_incomplete_frame_returns_good() {
         let mut a = HostAssembler::new();
         let good = frame_bytes(MSG_TYPE_EXIT, b"valid");
         let bad = ShmMessage {
@@ -408,16 +578,133 @@ mod tests {
         let mut combined = Vec::new();
         combined.extend_from_slice(&good);
         combined.extend_from_slice(bad.as_bytes());
-        // Add tail bytes so resync clearing the residue is observable.
+        // Add tail bytes — they cannot satisfy the bogus header's
+        // u32::MAX length, so the loop stalls on incomplete payload.
         combined.extend_from_slice(b"residue-bytes");
         let r = a.feed(&combined);
         assert_eq!(r.messages.len(), 1, "valid frame must still be returned");
-        assert_eq!(r.messages[0].payload, b"valid");
+        assert_eq!(&*r.messages[0].payload, b"valid");
         assert!(r.messages[0].crc_ok);
+        // Buffer retains the bogus 16-byte header plus 13 residue
+        // bytes — the cap check defers until the announced 4 GiB of
+        // payload has arrived (it never will), and the post-good-frame
+        // bytes stay buffered for the next feed without growing the
+        // capacity toward the announced length.
+        assert_eq!(
+            a.pending(),
+            FRAME_HEADER_SIZE + b"residue-bytes".len(),
+            "bogus header + residue stay buffered until the announced length \
+             is observed"
+        );
+        assert!(
+            a.buf.capacity() < 1024 * 1024 * 1024,
+            "buffer capacity must not approach the announced 4 GiB length \
+             (saw {} bytes)",
+            a.buf.capacity()
+        );
+    }
+
+    /// Hostile-guest defense: a hostile producer that announces a
+    /// length far above the per-frame cap (so the parser stalls
+    /// on incomplete payload forever) cannot grow the assembler
+    /// buffer past `2 × MAX_BULK_FRAME_PAYLOAD`. The
+    /// post-completion per-frame cap check (see
+    /// [`good_frame_then_oversized_incomplete_frame_returns_good`])
+    /// only fires on full-length arrival; this test pins the
+    /// complementary residual-buffer cap that closes the gap by
+    /// rejecting buffers that grow past 2× the cap regardless of
+    /// announced length.
+    #[test]
+    fn assembler_clears_buffer_when_residual_exceeds_cap() {
+        let mut a = HostAssembler::new();
+        // Header announcing `u32::MAX` payload — the parser will
+        // stall on incomplete payload indefinitely because no
+        // legitimate `port1_tx_buf` can deliver 4 GiB of bytes.
+        // Without the residual-buffer cap, every subsequent feed
+        // would just grow the buffer.
+        let bad = ShmMessage {
+            msg_type: MSG_TYPE_STIMULUS,
+            length: u32::MAX,
+            crc32: 0,
+            _pad: 0,
+        };
+        let mut buf = Vec::new();
+        buf.extend_from_slice(bad.as_bytes());
+        // Pad past `2 × MAX_BULK_FRAME_PAYLOAD` so the
+        // strict-greater-than residual cap triggers.
+        let target_len = 2 * MAX_BULK_FRAME_PAYLOAD as usize + 1;
+        buf.resize(target_len, 0xCD);
+        let r = a.feed(&buf);
+        assert!(
+            r.messages.is_empty(),
+            "no message produced — payload incomplete from the parser's view"
+        );
         assert_eq!(
             a.pending(),
             0,
-            "resync must clear the bogus header AND the trailing residue"
+            "residual buffer cap must trigger a clear once the buffer \
+             exceeds 2× the per-frame cap"
         );
+    }
+
+    /// Boundary case: residual exactly at `2 × MAX_BULK_FRAME_PAYLOAD`
+    /// must NOT trip the cap. The strict-greater-than comparison is
+    /// load-bearing: a hostile producer that drains the host's
+    /// view of `port1_tx_buf` to exactly `2 × cap` bytes — short
+    /// of triggering the resync — must leave the buffer
+    /// untouched, so a follow-on legitimate frame is not lost
+    /// alongside the attack residue.
+    #[test]
+    fn assembler_accepts_residual_at_2x_cap() {
+        let mut a = HostAssembler::new();
+        // Header announcing `u32::MAX` so the parser stalls on
+        // incomplete payload and does not consume any bytes; pad
+        // the buffer to exactly `2 × cap` total bytes so the
+        // residual sits AT the bound but not above it.
+        let bad = ShmMessage {
+            msg_type: MSG_TYPE_STIMULUS,
+            length: u32::MAX,
+            crc32: 0,
+            _pad: 0,
+        };
+        let total_residual = 2 * MAX_BULK_FRAME_PAYLOAD as usize;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(bad.as_bytes());
+        buf.resize(total_residual, 0xCE);
+        let r = a.feed(&buf);
+        assert!(
+            r.messages.is_empty(),
+            "no message produced — parser stalls on incomplete u32::MAX payload"
+        );
+        assert_eq!(
+            a.pending(),
+            total_residual,
+            "residual at exactly 2× cap must NOT trigger the resync clear"
+        );
+    }
+
+    /// Payload type round-trip: the assembler emits each
+    /// `BulkMessage::payload` as `Arc<[u8]>` so downstream clones
+    /// (e.g. the freeze coordinator's
+    /// `BulkMessage` → `ShmEntry` stash) become refcount bumps
+    /// rather than per-frame heap allocations. Pin the contract
+    /// so a future revert to `Vec<u8>` re-introduces the per-clone
+    /// allocation cost it was migrated away from.
+    #[test]
+    fn payload_is_arc_slice() {
+        let mut a = HostAssembler::new();
+        let bytes = frame_bytes(MSG_TYPE_EXIT, b"arc-payload");
+        let r = a.feed(&bytes);
+        assert_eq!(r.messages.len(), 1);
+        // Clone is a refcount bump; both the original and the
+        // clone point at the same allocation.
+        let m0 = &r.messages[0];
+        let cloned: Arc<[u8]> = m0.payload.clone();
+        assert!(
+            Arc::ptr_eq(&m0.payload, &cloned),
+            "cloning Arc<[u8]> must share the underlying allocation, \
+             not deep-copy the bytes"
+        );
+        assert_eq!(&*cloned, b"arc-payload");
     }
 }

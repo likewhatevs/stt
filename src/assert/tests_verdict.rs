@@ -509,6 +509,7 @@ fn claim_against_worker_report_via_derived_accessors() {
         exit_info: None,
         is_messenger: false,
         group_idx: 0,
+        affinity_error: None,
     };
 
     let mut v = Verdict::new();
@@ -571,6 +572,46 @@ fn verdict_skip_marks_skipped_without_failing() {
         r.details
             .iter()
             .any(|d| { d.kind == DetailKind::Skip && d.message.contains("topology missing") })
+    );
+}
+
+/// `Verdict::skip` MUST NOT mask a prior failed claim. A claim that
+/// failed produced real evidence — a later skip cannot retroactively
+/// erase it. The verdict must surface as failed-and-skipped so gate
+/// callers see both the failure and the reason the scenario stopped.
+///
+/// A prior implementation forced `passed = true` on skip, which let
+/// a missing-precondition skip mask a real failure that had already
+/// been recorded. That is silent data loss: the test would render as
+/// a clean skip and the failure would never surface.
+#[test]
+fn verdict_skip_preserves_prior_failure() {
+    let mut v = Verdict::new();
+    claim!(v, 5u64).at_most(3);
+    assert!(!v.passed(), "prior claim should fail (5 > 3)");
+    v.skip("precondition missing");
+    let r = v.into_result();
+    assert!(
+        !r.passed,
+        "prior failure must NOT be masked by a later skip — got passed={}",
+        r.passed,
+    );
+    assert!(
+        r.skipped,
+        "skip must still mark `skipped=true` so callers see the skip reason",
+    );
+    // The skip reason and the prior failure must both appear in details.
+    assert!(
+        r.details
+            .iter()
+            .any(|d| d.kind == DetailKind::Skip && d.message.contains("precondition missing")),
+        "skip reason must be recorded: {:?}",
+        r.details,
+    );
+    assert!(
+        r.details.iter().any(|d| d.message.contains("at most 3")),
+        "prior claim failure must be retained: {:?}",
+        r.details,
     );
 }
 

@@ -119,9 +119,11 @@ pub(super) fn worker_main(
     // before any work is done. apply_nice and the per-pos
     // set_sched_policy sites later in this function follow the
     // same policy.
-    if let Some(ref cpus) = affinity {
-        let _ = set_thread_affinity(tid, cpus);
-    }
+    let affinity_error: Option<String> = if let Some(ref cpus) = affinity {
+        set_thread_affinity(tid, cpus).err().map(|e| format!("{e:#}"))
+    } else {
+        None
+    };
     let _ = set_sched_policy(tid, sched_policy);
     apply_mempolicy_with_flags(&mem_policy, mpol_flags);
     apply_nice(nice);
@@ -134,6 +136,23 @@ pub(super) fn worker_main(
     let mut last_cpu = sched_getcpu();
     cpus_used.insert(last_cpu);
     let mut last_iter_time = start;
+    // Wall-clock gate for the per-iteration `iter_slot` publish.
+    // Storing the AtomicU64 every iteration churned the cache line
+    // (one cross-CPU coherence round-trip per iter) and dwarfed
+    // worker work for tight variants like SpinWait. Iteration-count
+    // throttling was rejected because a worker with iteration cost
+    // > IT_SLOT_PUBLISH_INTERVAL / batch_size would publish less
+    // often than the host expects, breaking delta-based snapshot
+    // tests that assume forward progress within ~150 ms windows
+    // (see tests_integration.rs's PageFaultChurn delta assertion).
+    // Wall-clock gating decouples the publish cadence from
+    // iteration cost. The interval is a balance: too long produces
+    // stale `snapshot_iterations()` reads, too short defeats the
+    // batching point. 1 ms matches the snapshot test's resolution
+    // ceiling — the 100 ms / 150 ms gaps observe ~150 publishes
+    // worst-case, more than enough for a non-zero delta.
+    let mut last_iter_slot_publish = start;
+    const IT_SLOT_PUBLISH_INTERVAL: Duration = Duration::from_millis(1);
     let mut max_gap_ns: u64 = 0;
     let mut max_gap_cpu: usize = last_cpu;
     let mut max_gap_at_ns: u64 = 0;
@@ -302,6 +321,61 @@ pub(super) fn worker_main(
     } else {
         0
     };
+
+    // CgroupChurn: pre-format the per-target `cgroup.procs` paths and
+    // the `tid\n` write payload once at worker entry so the dispatch
+    // arm avoids the per-iteration `format!()` heap allocation. The
+    // file descriptors themselves are cached lazily inside the
+    // dispatch arm — opening at entry and never re-opening would be
+    // unsafe across an `Op::RemoveCgroup` followed by a recreate at
+    // the same path: a write to the cached fd against the rmdir'd
+    // kernfs node returns -ENODEV (cgroup_kn_lock_live in
+    // kernel/cgroup/cgroup.c rejects a dead cgroup), and the new
+    // cgroup gets a fresh inode the cached fd never observes. The
+    // dispatch arm therefore opens on demand and invalidates the
+    // cached fd on any write/open error, so a recreate is picked up
+    // on the next iteration.
+    let cgroup_churn_paths: Vec<String> =
+        if let WorkType::CgroupChurn { groups, .. } = &work_type {
+            let groups_count = (*groups).max(1);
+            (0..groups_count)
+                .map(|i| format!("/sys/fs/cgroup/wt-cgroup-churn-{i}/cgroup.procs"))
+                .collect()
+        } else {
+            Vec::new()
+        };
+    let cgroup_churn_tid_bytes: Vec<u8> = if matches!(work_type, WorkType::CgroupChurn { .. }) {
+        format!("{tid}\n").into_bytes()
+    } else {
+        Vec::new()
+    };
+    // One slot per target group; each slot is filled on first use
+    // and cleared on write/open failure so the next iteration retries
+    // the open. Sized to match `cgroup_churn_paths.len()` so the
+    // dispatch arm's index-by-`target_idx` is always in-bounds.
+    let mut cgroup_churn_files: Vec<Option<std::fs::File>> =
+        if cgroup_churn_paths.is_empty() {
+            Vec::new()
+        } else {
+            (0..cgroup_churn_paths.len()).map(|_| None).collect()
+        };
+
+    // NumaWorkingSetSweep: pre-compute one (nodemask, maxnode) pair
+    // per entry in `target_nodes`. The dispatch arm rotates through
+    // the slice with `(iterations + tid_phase) % len`; without this
+    // hoist, every outer iteration re-allocates the BTreeSet and
+    // the nodemask Vec inside `build_nodemask`. The masks are
+    // invariant across iterations because `target_nodes` is
+    // captured by reference at worker entry.
+    let numa_sweep_masks: Vec<(Vec<libc::c_ulong>, libc::c_ulong)> =
+        if let WorkType::NumaWorkingSetSweep { ref target_nodes, .. } = work_type {
+            target_nodes
+                .iter()
+                .map(|&node| build_nodemask(&[node].into_iter().collect::<BTreeSet<usize>>()))
+                .collect()
+        } else {
+            Vec::new()
+        };
 
     // Guest-side /proc/vmstat: system-wide in the guest, but the VM is
     // a controlled environment with no other significant processes, so
@@ -743,7 +817,25 @@ pub(super) fn worker_main(
                         }
                         Phase::Yield(dur) => {
                             let end = Instant::now() + *dur;
-                            while Instant::now() < end && !stop_requested(stop) {
+                            // Batch the deadline + stop check every 64
+                            // yields. `yield_now()` is sub-microsecond
+                            // on a healthy scheduler; 63 yields of
+                            // overshoot is far below the millisecond-
+                            // scale `dur` Phase::Yield typically
+                            // carries. The two `Instant::now()` calls
+                            // around `yield_now` (`before_yield` plus
+                            // the `elapsed()` in `reservoir_push`) are
+                            // load-bearing for the resume-latency
+                            // sample — keep them per-yield. Only the
+                            // top-of-loop deadline poll batches.
+                            let mut yield_counter: u64 = 0;
+                            loop {
+                                if yield_counter & 63 == 0
+                                    && (Instant::now() >= end || stop_requested(stop))
+                                {
+                                    break;
+                                }
+                                yield_counter = yield_counter.wrapping_add(1);
                                 work_units = std::hint::black_box(work_units.wrapping_add(1));
                                 let before_yield = Instant::now();
                                 std::thread::yield_now();
@@ -2066,13 +2158,17 @@ pub(super) fn worker_main(
                         (ptr, region_size)
                     }
                 };
-                // Rotate target node based on iteration count.
+                // Rotate target node based on iteration count. The
+                // (mask, maxnode) pair for each entry in
+                // `target_nodes` is precomputed at worker entry into
+                // `numa_sweep_masks` so this hot path avoids both the
+                // `[node].into_iter().collect()` BTreeSet build and
+                // the `build_nodemask` Vec allocation that dominates
+                // the per-iteration cost.
                 if !target_nodes.is_empty() {
                     let phase = (tid as usize) % target_nodes.len();
                     let node_idx = ((iterations as usize).wrapping_add(phase)) % target_nodes.len();
-                    let node = target_nodes[node_idx];
-                    let (mask, maxnode) =
-                        build_nodemask(&[node].into_iter().collect::<BTreeSet<usize>>());
+                    let (mask, maxnode) = &numa_sweep_masks[node_idx];
                     // MPOL_MF_MOVE = 1 << 1 (include/uapi/linux/mempolicy.h).
                     // MPOL_BIND from libc.
                     const MPOL_MF_MOVE: libc::c_ulong = 1 << 1;
@@ -2091,7 +2187,7 @@ pub(super) fn worker_main(
                             region_size as libc::c_ulong,
                             libc::MPOL_BIND as libc::c_ulong,
                             mask.as_ptr(),
-                            maxnode,
+                            *maxnode,
                             MPOL_MF_MOVE,
                         )
                     };
@@ -2128,25 +2224,74 @@ pub(super) fn worker_main(
                 // ops callback. The host-side scenario harness is
                 // responsible for creating the sibling cgroups; if
                 // they are absent the open() fails and the worker
-                // logs once and continues spinning so the variant
-                // is observable but does not panic on a
-                // misconfigured topology.
-                let target_idx = (iterations as usize) % groups.max(1);
-                let path = format!("/sys/fs/cgroup/wt-cgroup-churn-{}/cgroup.procs", target_idx);
-                let tid_str = format!("{}\n", tid);
-                match std::fs::OpenOptions::new().write(true).open(&path) {
-                    Ok(mut f) => {
-                        use std::io::Write;
-                        if let Err(e) = f.write_all(tid_str.as_bytes()) {
-                            tracing::warn!(?e, %path, "CgroupChurn write failed");
+                // logs and continues spinning so the variant is
+                // observable but does not panic on a misconfigured
+                // topology.
+                //
+                // The path strings and the `tid\n` write payload are
+                // pre-formatted at worker entry into
+                // `cgroup_churn_paths` / `cgroup_churn_tid_bytes` so
+                // the hot path issues no per-iteration heap
+                // allocations. The fd cache (`cgroup_churn_files`) is
+                // populated lazily on first use and invalidated on
+                // any write/open failure: a write to a cached fd
+                // whose cgroup was rmdir'd returns -ENODEV (see
+                // `cgroup_kn_lock_live` in kernel/cgroup/cgroup.c
+                // returning NULL on dead cgroups, surfaced through
+                // `__cgroup_procs_write` as -ENODEV), and a recreate
+                // at the same path yields a fresh kernfs inode the
+                // cached fd never observes. Invalidate-on-error keeps
+                // the worker self-healing across mid-test rmdir +
+                // recreate sequences.
+                let path_count = cgroup_churn_paths.len();
+                if path_count == 0 {
+                    let _ = groups; // pattern-binding only; pre-compute
+                    // is gated on this same field so emptiness here
+                    // means a programmer bug bypassed the gate. Skip
+                    // the IO step rather than panicking.
+                } else {
+                    let target_idx = (iterations as usize) % path_count;
+                    if cgroup_churn_files[target_idx].is_none() {
+                        match std::fs::OpenOptions::new()
+                            .write(true)
+                            .open(&cgroup_churn_paths[target_idx])
+                        {
+                            Ok(f) => cgroup_churn_files[target_idx] = Some(f),
+                            Err(e) => {
+                                tracing::warn!(
+                                    ?e,
+                                    path = %cgroup_churn_paths[target_idx],
+                                    "CgroupChurn open failed"
+                                );
+                            }
                         }
                     }
-                    Err(e) => {
-                        // Missing-cgroup is the typical
-                        // misconfiguration. Log once per worker per
-                        // iteration via tracing's rate-limited path
-                        // (best-effort; worker keeps spinning).
-                        tracing::warn!(?e, %path, "CgroupChurn open failed");
+                    // `take()` lifts the cached File out of the slot
+                    // so the inner write borrows nothing of
+                    // `cgroup_churn_files`; success replaces, failure
+                    // drops (closing the fd) so the next iteration
+                    // re-opens. This keeps the borrow checker happy
+                    // and matches the invalidate-on-error contract.
+                    if let Some(f) = cgroup_churn_files[target_idx].take() {
+                        use std::io::Write;
+                        // `&File` implements `Write`; the immutable
+                        // borrow of `f` lives only inside this
+                        // match arm.
+                        match (&f).write_all(&cgroup_churn_tid_bytes) {
+                            Ok(()) => {
+                                cgroup_churn_files[target_idx] = Some(f);
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    ?e,
+                                    path = %cgroup_churn_paths[target_idx],
+                                    "CgroupChurn write failed; invalidating cached fd"
+                                );
+                                // Dropping `f` closes the kernfs fd
+                                // so the next iteration's lazy-open
+                                // observes the recreated kernfs node.
+                            }
+                        }
                     }
                 }
                 if cycle_ms > 0 && !stop_requested(stop) {
@@ -2749,20 +2894,37 @@ pub(super) fn worker_main(
         }
 
         // Publish iteration count to shared memory for host-side
-        // sampling. SAFETY: alignment + atomic-only-access invariant
+        // sampling, gated by IT_SLOT_PUBLISH_INTERVAL so the
+        // AtomicU64 store doesn't churn the cache line every
+        // iteration on tight variants (SpinWait at ~ns/iter
+        // produced one cross-CPU coherence round-trip per spin
+        // cycle). SAFETY: alignment + atomic-only-access invariant
         // established at the iter_counters mmap site in
         // `WorkloadHandle::spawn` and carried by the
         // `*mut AtomicU64` type.
+        //
+        // `now_for_gate` is computed at most once per outer
+        // iteration and reused by the work_units%1024 gap
+        // accounting below. Computing it lazily (only when at least
+        // one consumer needs it) keeps the per-iter clock reads at
+        // 1 in the worst case (down from 2 in a naïve "compute
+        // both gates eagerly" design).
+        let mut now_for_gate: Option<Instant> = None;
         if !iter_slot.is_null() {
-            // Relaxed store: the parent reads this counter via
-            // `snapshot_iterations()` with Relaxed ordering only for
-            // progress-sampling — no cross-field happens-before edge
-            // is required (see that function's ordering rationale).
-            unsafe { &*iter_slot }.store(iterations, Ordering::Relaxed);
+            let now = *now_for_gate.get_or_insert_with(Instant::now);
+            if now.duration_since(last_iter_slot_publish) >= IT_SLOT_PUBLISH_INTERVAL {
+                // Relaxed store: the parent reads this counter via
+                // `snapshot_iterations()` with Relaxed ordering only
+                // for progress-sampling — no cross-field
+                // happens-before edge is required (see that
+                // function's ordering rationale).
+                unsafe { &*iter_slot }.store(iterations, Ordering::Relaxed);
+                last_iter_slot_publish = now;
+            }
         }
 
         if work_units.is_multiple_of(1024) {
-            let now = Instant::now();
+            let now = *now_for_gate.get_or_insert_with(Instant::now);
             let gap = now.duration_since(last_iter_time).as_nanos() as u64;
             if gap > max_gap_ns {
                 max_gap_ns = gap;
@@ -2892,6 +3054,7 @@ pub(super) fn worker_main(
             WorkType::FutexFanOut { .. } | WorkType::FanOutCompute { .. }
         ) && futex.map(|(_, p)| p == 0).unwrap_or(false),
         group_idx,
+        affinity_error,
     }
 }
 
@@ -3289,14 +3452,74 @@ pub(super) fn pipe_exchange(
 /// Record a wake latency sample using reservoir sampling (Algorithm R).
 /// Maintains a uniform random sample of at most `cap` entries from all
 /// observed latencies.
+///
+/// The replacement-index draw uses a thread-local xorshift64 PRNG so
+/// the hot path avoids `rand::rng()`'s ChaCha20 block-RNG seeding
+/// cost (one syscall on first use plus ChaCha20 block computation
+/// every ~64 draws) and the rand crate's documented post-fork
+/// seed-correlation hazard. `ThreadRng` is a non-reseeded handle into
+/// a per-thread `Rc<UnsafeCell<BlockRng<ReseedingCore>>>`
+/// (`rand-0.10/src/rngs/thread.rs`); after `fork(2)` the child
+/// inherits the parent's RNG state, so multiple worker children spawned
+/// in lock-step would draw identical first samples without an explicit
+/// `ThreadRng::reseed()` call (which the rand crate's own doc requires
+/// post-fork). xorshift64 with a tid-derived seed sidesteps the issue
+/// by giving every worker an independent stream from its first call.
+///
+/// Modulo bias for `r % count` where `r` is a uniform u64 and
+/// `count <= MAX_WAKE_SAMPLES = 100_000`: the bias bound is
+/// `count / 2^64 ≈ 5.4e-15`, far below any statistical threshold a
+/// reservoir sampler can resolve. Algorithm R only requires that the
+/// replacement decision be uniform-ish; this bound is orders of
+/// magnitude inside the noise floor.
+///
+/// The seed is derived from `gettid(2)` × `GOLDEN_RATIO_64` on first
+/// use (matching the worker's other PRNG seeds — `io_rng`,
+/// `ipc_variance_rng`, `page_fault_rng_state`) so each thread / forked
+/// worker produces an independent stream. `cell.get() == 0` is the
+/// "uninitialised" sentinel because xorshift64 has 0 as a fixed point.
 pub(super) fn reservoir_push(buf: &mut Vec<u64>, count: &mut u64, sample: u64, cap: usize) {
     *count += 1;
     if buf.len() < cap {
         buf.push(sample);
     } else {
-        // Replace a random element with probability cap/count.
-        use rand::RngExt;
-        let idx = rand::rng().random_range(0..*count) as usize;
+        thread_local! {
+            // `Cell<u64>` is enough — xorshift state is a single u64
+            // with no Drop. `const { ... }` keeps the initialiser a
+            // compile-time constant so first-touch cost on the hot
+            // path is bounded to the seed-from-tid step below, not a
+            // generic thread-local lazy-init.
+            static RESERVOIR_RNG: std::cell::Cell<u64> = const {
+                std::cell::Cell::new(0)
+            };
+        }
+        let r = RESERVOIR_RNG.with(|cell| {
+            let mut s = cell.get();
+            if s == 0 {
+                // Lazy seed on first use. Mirrors the per-worker
+                // seed pattern in `worker_main` for `io_rng` /
+                // `ipc_variance_rng`: tid × golden-ratio Weyl
+                // increment, with a non-zero fallback if the
+                // multiply happened to land on the xorshift fixed
+                // point. SYS_gettid is a vDSO-cached fast path on
+                // glibc + recent kernels; the cost is paid once
+                // per thread.
+                let tid = unsafe { libc::syscall(libc::SYS_gettid) as u64 };
+                s = tid.wrapping_mul(GOLDEN_RATIO_64);
+                if s == 0 {
+                    s = GOLDEN_RATIO_64;
+                }
+            }
+            // xorshift64 — same triple-shift as the inline
+            // PageFaultChurn / IpcVariance helpers and the
+            // `io::xorshift64` re-export.
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            cell.set(s);
+            s
+        });
+        let idx = (r % *count) as usize;
         if idx < cap {
             buf[idx] = sample;
         }

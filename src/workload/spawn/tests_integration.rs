@@ -75,6 +75,7 @@ fn worker_report_serde_roundtrip() {
         // dispatch path tags reports with their group_idx; a
         // silent default-zero on serde would lose that tag.
         group_idx: 7,
+        affinity_error: None,
     };
     let json = serde_json::to_string(&r).unwrap();
     let r2: WorkerReport = serde_json::from_str(&json).unwrap();
@@ -529,6 +530,7 @@ fn worker_report_serde_edge_cases() {
         exit_info: None,
         is_messenger: false,
         group_idx: 0,
+        affinity_error: None,
     };
     let json = serde_json::to_string(&r).unwrap();
     let r2: WorkerReport = serde_json::from_str(&json).unwrap();
@@ -563,6 +565,7 @@ fn worker_report_serde_edge_cases() {
         exit_info: None,
         is_messenger: false,
         group_idx: usize::MAX,
+        affinity_error: None,
     };
     let json = serde_json::to_string(&r).unwrap();
     let r2: WorkerReport = serde_json::from_str(&json).unwrap();
@@ -658,6 +661,7 @@ fn worker_report_debug_shows_field_values() {
         exit_info: None,
         is_messenger: false,
         group_idx: 0,
+        affinity_error: None,
     };
     let s = format!("{:?}", r);
     assert!(s.contains("42"), "must show tid value");
@@ -696,6 +700,7 @@ fn worker_report_off_cpu_ns_calculation() {
         exit_info: None,
         is_messenger: false,
         group_idx: 0,
+        affinity_error: None,
     };
     assert_eq!(r.off_cpu_ns, r.wall_time_ns - r.cpu_time_ns);
 }

@@ -233,10 +233,35 @@ pub struct ProbeEvent {
 }
 
 /// Parse `/proc/kallsyms` into a `name -> address` map. Returns `None`
-/// when the file is unreadable (expected outside a privileged context).
+/// when the file is unreadable (expected outside a privileged context)
+/// OR when every parsed entry has a zero address (see
+/// [`accept_kallsyms_map`] for the kptr_restrict rationale).
 fn load_kallsyms() -> Option<std::collections::HashMap<String, u64>> {
     let raw = std::fs::read_to_string("/proc/kallsyms").ok()?;
-    Some(parse_kallsyms(&raw))
+    accept_kallsyms_map(parse_kallsyms(&raw))
+}
+
+/// Return `Some(map)` when at least one entry has a non-zero address,
+/// otherwise `None`. The all-zero case is what the kernel emits under
+/// `kernel.kptr_restrict=2` for non-CAP_SYSLOG callers — the file is
+/// readable, all symbol names are present, but every line carries
+/// `0000000000000000` for its address. Caching such a map would
+/// poison every later [`resolve_func_ip`] lookup with `Some(0)`,
+/// masking the unprivileged state from the retry-after-sudo path;
+/// treating it as a load failure instead lets the next caller (after
+/// [`RETRY_MIN_INTERVAL`]) try again under the new privilege level.
+fn accept_kallsyms_map(
+    map: std::collections::HashMap<String, u64>,
+) -> Option<std::collections::HashMap<String, u64>> {
+    if !map.values().any(|&a| a != 0) {
+        tracing::warn!(
+            entries = map.len(),
+            "/proc/kallsyms parsed with zero addresses only — kptr_restrict \
+             likely active; declining to cache",
+        );
+        return None;
+    }
+    Some(map)
 }
 
 /// Parse kallsyms-format text (one `HEX TYPE NAME ...` line per
@@ -342,6 +367,56 @@ pub fn resolve_func_ip(name: &str) -> Option<u64> {
 /// Minimum interval between retry attempts when `/proc/kallsyms` is
 /// unreadable; see [`resolve_func_ip`] for the rationale.
 const RETRY_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Build a `func_idx -> task_struct_param_idx` map for stitching by
+/// task pointer. Resolves each function's task-struct argument
+/// position from [`super::stack::BPF_OP_CALLERS`] first, falling back
+/// to the BTF param list (Phase A `btf_funcs` chained with Phase B
+/// `phase_b_btf`).
+///
+/// Entries with `pidx >= 6` are dropped with a warn rather than
+/// stored: the stitch code reads `ProbeEvent::args[pidx]` against a
+/// fixed-size `[u64; 6]` (matching the BPF-side capture limit), so
+/// any larger index would panic. A function with its task_struct
+/// past arg-6 simply cannot be stitched here — the BPF probe never
+/// captured that arg.
+fn build_task_param_idx(
+    func_ips: &[(u32, u64, String)],
+    btf_funcs: &[BtfFunc],
+    phase_b_btf: &[BtfFunc],
+) -> std::collections::HashMap<u32, usize> {
+    func_ips
+        .iter()
+        .filter_map(|(idx, _, name)| {
+            // BPF_OP_CALLERS: (op_fragment, kernel_caller, task_arg_idx)
+            let pidx = if let Some((_, _, tidx)) = super::stack::BPF_OP_CALLERS
+                .iter()
+                .find(|(_, caller, _)| *caller == name.as_str())
+            {
+                *tidx as usize
+            } else {
+                // Fallback: BTF params with task_struct
+                let btf = btf_funcs
+                    .iter()
+                    .chain(phase_b_btf.iter())
+                    .find(|f| f.name == *name)?;
+                btf.params
+                    .iter()
+                    .position(|p| p.struct_name.as_deref() == Some("task_struct"))?
+            };
+            if pidx >= 6 {
+                tracing::warn!(
+                    func = %name,
+                    pidx,
+                    "task_struct param index out of args[6] bounds — \
+                     skipping stitch entry",
+                );
+                return None;
+            }
+            Some((*idx, pidx))
+        })
+        .collect()
+}
 
 /// Populate a `func_meta` with field specs from BTF-resolved offsets.
 /// Shared between kprobe and fentry paths.
@@ -1682,28 +1757,8 @@ pub fn run_probe_skeleton(
             // The filter below therefore drops args[0] == 0 to
             // suppress non-causal probe output: no causal task
             // means no useful stitch chain.
-            let task_param_idx: std::collections::HashMap<u32, usize> = func_ips
-                .iter()
-                .filter_map(|(idx, _, name)| {
-                    // BPF_OP_CALLERS: (op_fragment, kernel_caller, task_arg_idx)
-                    if let Some((_, _, tidx)) = super::stack::BPF_OP_CALLERS
-                        .iter()
-                        .find(|(_, caller, _)| *caller == name.as_str())
-                    {
-                        return Some((*idx, *tidx as usize));
-                    }
-                    // Fallback: BTF params with task_struct
-                    let btf = btf_funcs
-                        .iter()
-                        .chain(phase_b_btf.iter())
-                        .find(|f| f.name == *name)?;
-                    let pos = btf
-                        .params
-                        .iter()
-                        .position(|p| p.struct_name.as_deref() == Some("task_struct"))?;
-                    Some((*idx, pos))
-                })
-                .collect();
+            let task_param_idx =
+                build_task_param_idx(&func_ips, btf_funcs, &phase_b_btf);
 
             // Extract tptr and kstack from the trigger event in one
             // lock acquisition. When the trigger did not fire (stop-
@@ -2662,5 +2717,180 @@ mod tests {
             event.args[1], SCX_EXIT_ERROR_BPF,
             "args[1] must carry the exit kind for diagnostics"
         );
+    }
+
+    // -- accept_kallsyms_map (kptr_restrict=2 cache poison guard) -----
+
+    #[test]
+    fn accept_kallsyms_map_rejects_all_zero_addresses() {
+        // kernel.kptr_restrict=2 makes /proc/kallsyms readable but
+        // zeros every address column. parse_kallsyms accepts the
+        // file and yields a map with every value == 0. caching
+        // that map would have resolve_func_ip return Some(0) for
+        // every later lookup, masking the unprivileged state from
+        // the retry-after-sudo path. accept_kallsyms_map must
+        // collapse this case to None so the caller treats it as a
+        // load failure and the retry clock keeps ticking.
+        let raw = "0000000000000000 T schedule\n\
+                   0000000000000000 T do_exit\n\
+                   0000000000000000 D init_mm\n";
+        let map = parse_kallsyms(raw);
+        assert_eq!(map.len(), 3, "parser still records every line");
+        assert!(
+            map.values().all(|&a| a == 0),
+            "kptr_restrict=2 must yield all-zero addresses",
+        );
+        assert!(
+            accept_kallsyms_map(map).is_none(),
+            "all-zero map must be rejected so the cache is not poisoned",
+        );
+    }
+
+    #[test]
+    fn accept_kallsyms_map_accepts_when_any_nonzero() {
+        // A single non-zero entry is enough to consider the file
+        // genuinely populated — rate-limit pressure makes the
+        // tighter test ("require ALL non-zero") wrong, since
+        // legitimately exported partial dumps always contain a
+        // few zero entries (NULL section markers).
+        let raw = "0000000000000000 T zeroed\n\
+                   ffffffff81000000 T schedule\n";
+        let map = parse_kallsyms(raw);
+        assert_eq!(map.len(), 2);
+        let accepted = accept_kallsyms_map(map).expect("mixed map must be accepted");
+        assert_eq!(accepted["schedule"], 0xffffffff81000000);
+        assert_eq!(accepted["zeroed"], 0);
+    }
+
+    #[test]
+    fn accept_kallsyms_map_rejects_empty_map() {
+        // An empty map is vacuously all-zero — `any(|&a| a != 0)`
+        // returns false on an empty iterator. Treat as a load
+        // failure so the retry clock keeps ticking; otherwise an
+        // empty-on-first-read race would freeze the cache at "no
+        // symbols" forever.
+        let map = std::collections::HashMap::<String, u64>::new();
+        assert!(accept_kallsyms_map(map).is_none());
+    }
+
+    // -- build_task_param_idx out-of-bounds guard ---------------------
+
+    /// Construct a [`BtfFunc`] whose task_struct param sits at
+    /// `task_pos`. Pads earlier params with scalar `void *` entries
+    /// so the iterator's `.position` finds the task at the
+    /// requested index.
+    fn make_btf_with_task_at(name: &str, task_pos: usize) -> BtfFunc {
+        let mut params = Vec::new();
+        for i in 0..task_pos {
+            params.push(super::super::btf::BtfParam {
+                name: format!("a{i}"),
+                struct_name: None,
+                is_ptr: false,
+                ..Default::default()
+            });
+        }
+        params.push(super::super::btf::BtfParam {
+            name: "p".into(),
+            struct_name: Some("task_struct".into()),
+            is_ptr: true,
+            ..Default::default()
+        });
+        BtfFunc {
+            name: name.to_string(),
+            params,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn build_task_param_idx_drops_index_at_six() {
+        // ProbeEvent::args is [u64; 6]. A task_struct param at
+        // pidx=6 (i.e. arg 7) is past the captured slice — the
+        // BPF probe never recorded that arg. Storing pidx=6 in
+        // the stitch map would panic on `e.args[pidx]`, so the
+        // builder MUST drop the entry rather than admit it.
+        let func_ips = vec![(42u32, 0xffff_ffff_8100_0000u64, "novel_callback".to_string())];
+        let btf = vec![make_btf_with_task_at("novel_callback", 6)];
+        let map = build_task_param_idx(&func_ips, &btf, &[]);
+        assert!(
+            map.get(&42).is_none(),
+            "pidx==6 must be dropped (args[6] is out of bounds for [u64; 6])",
+        );
+    }
+
+    #[test]
+    fn build_task_param_idx_drops_index_above_six() {
+        // Same boundary as pidx==6, but with a larger pidx to
+        // catch a future off-by-one swap (`pidx > 6` instead of
+        // `>= 6`) that would silently re-admit pidx=6.
+        let func_ips = vec![(7u32, 0xffff_ffff_8100_0000u64, "wide_signature".to_string())];
+        let btf = vec![make_btf_with_task_at("wide_signature", 9)];
+        let map = build_task_param_idx(&func_ips, &btf, &[]);
+        assert!(map.get(&7).is_none(), "pidx==9 must be dropped");
+    }
+
+    #[test]
+    fn build_task_param_idx_keeps_index_at_five() {
+        // pidx=5 IS the last valid slot (`args[5]`) — must be
+        // kept. This is the boundary partner to the pidx==6
+        // drop test: a regression that swaps `>= 6` to `>= 5`
+        // would discard real, capturable callbacks.
+        let func_ips = vec![(11u32, 0xffff_ffff_8100_0000u64, "tail_task".to_string())];
+        let btf = vec![make_btf_with_task_at("tail_task", 5)];
+        let map = build_task_param_idx(&func_ips, &btf, &[]);
+        assert_eq!(map.get(&11).copied(), Some(5));
+    }
+
+    #[test]
+    fn build_task_param_idx_uses_bpf_op_callers_first() {
+        // `BPF_OP_CALLERS` overrides BTF for the well-known
+        // sched_ext op kernel callers — verifies the BTF fallback
+        // doesn't shadow the canonical mapping. `do_enqueue_task`
+        // is registered with task_arg_idx=1 in the table; the
+        // builder must return 1 even when the BTF (synthesized
+        // here at task_pos=3) would say otherwise.
+        let func_ips = vec![(0u32, 0xffff_ffff_8100_0000u64, "do_enqueue_task".to_string())];
+        let btf = vec![make_btf_with_task_at("do_enqueue_task", 3)];
+        let map = build_task_param_idx(&func_ips, &btf, &[]);
+        assert_eq!(
+            map.get(&0).copied(),
+            Some(1),
+            "BPF_OP_CALLERS task_arg_idx (1) must win over BTF fallback (3)",
+        );
+    }
+
+    #[test]
+    fn build_task_param_idx_phase_b_btf_chained() {
+        // Phase B BTF must be searched as a fallback for funcs
+        // not in the Phase A `btf_funcs` slice — the stitch map
+        // must include Phase B–attached callbacks. Without this,
+        // BPF callbacks discovered after the scheduler started
+        // would never stitch.
+        let func_ips = vec![(33u32, 0xffff_ffff_8100_0000u64, "phase_b_only".to_string())];
+        let phase_b = vec![make_btf_with_task_at("phase_b_only", 2)];
+        let map = build_task_param_idx(&func_ips, &[], &phase_b);
+        assert_eq!(map.get(&33).copied(), Some(2));
+    }
+
+    #[test]
+    fn build_task_param_idx_skips_func_with_no_task_param() {
+        // A function with no task_struct param produces no
+        // entry — the stitch retain() falls back to `e.task_ptr ==
+        // tptr` for those. Test the absence so a future change
+        // that defaults to pidx=0 (silently mis-stitching by
+        // arg[0]) is caught.
+        let func_ips = vec![(99u32, 0xffff_ffff_8100_0000u64, "no_task".to_string())];
+        let btf = vec![BtfFunc {
+            name: "no_task".into(),
+            params: vec![super::super::btf::BtfParam {
+                name: "x".into(),
+                struct_name: None,
+                is_ptr: false,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }];
+        let map = build_task_param_idx(&func_ips, &btf, &[]);
+        assert!(map.get(&99).is_none());
     }
 }

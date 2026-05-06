@@ -1304,6 +1304,73 @@ fn pre_clear_run_dir_once_silent_on_missing_dir() {
     );
 }
 
+/// `pre_clear_run_dir_once` reaps orphaned atomic-write staging
+/// files in the same shallow sweep as live sidecars. Pins the
+/// staging-cleanup invariant documented at
+/// `pre_clear_run_dir_once`'s in-line comment block (line ~2317):
+/// a writer that died between `write` and `rename` in
+/// `serialize_and_write_sidecar` leaves a
+/// `<test>-<hash>.ktstr.json.tmp.<pid>.<run_id>` artifact;
+/// `is_sidecar_filename` rejects these (extension is `<run_id>`,
+/// not `json`), so without the staging sweep neither
+/// `collect_sidecars` nor the next pre-clear pass would ever
+/// reap them. A regression that drops the
+/// `is_sidecar_staging_filename` arm would surface here as the
+/// `.tmp.…` files surviving the pre-clear call.
+#[test]
+fn pre_clear_run_dir_once_wipes_staging_files() {
+    let tmp_dir = tempfile::TempDir::new().unwrap();
+    let tmp = tmp_dir.path();
+    // Two orphaned staging files in the canonical
+    // `<test>-<hash>.ktstr.json.tmp.<pid>.<run_id>` shape.
+    std::fs::write(
+        tmp.join("test_a-0000000000000000.ktstr.json.tmp.12345.0001"),
+        b"{}",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.join("test_b-1111111111111111.ktstr.json.tmp.67890.0002"),
+        b"{}",
+    )
+    .unwrap();
+    // One live sidecar from a prior run that should also be
+    // wiped — the same sweep handles both shapes so the test
+    // exercises the combined cleanup.
+    std::fs::write(tmp.join("test_c-2222222222222222.ktstr.json"), b"{}").unwrap();
+    // One unrelated file that must survive — guards against an
+    // overly-broad sweep that wipes anything containing the
+    // `.ktstr.` infix regardless of suffix shape.
+    std::fs::write(tmp.join("README.md"), b"keep").unwrap();
+    assert_eq!(
+        std::fs::read_dir(tmp).unwrap().count(),
+        4,
+        "fixture precondition: tempdir must contain 2 staging \
+         files, 1 sidecar, and 1 unrelated file",
+    );
+
+    pre_clear_run_dir_once(tmp);
+
+    assert!(
+        !tmp.join("test_a-0000000000000000.ktstr.json.tmp.12345.0001")
+            .exists(),
+        "orphaned staging file (writer crash before rename) must be reaped",
+    );
+    assert!(
+        !tmp.join("test_b-1111111111111111.ktstr.json.tmp.67890.0002")
+            .exists(),
+        "second orphaned staging file must be reaped",
+    );
+    assert!(
+        !tmp.join("test_c-2222222222222222.ktstr.json").exists(),
+        "live sidecar from prior run must also be wiped in the same sweep",
+    );
+    assert!(
+        tmp.join("README.md").exists(),
+        "unrelated file must survive — sweep is shape-scoped, \
+         not a wholesale directory wipe",
+    );
+}
+
 /// Per-directory keying via `Mutex<HashSet<PathBuf>>`: a second
 /// call against the SAME dir is a no-op (newly-written sidecars
 /// after the first pre-clear must NOT be wiped on the second

@@ -81,9 +81,27 @@ pub fn custom_nested_cgroup_task_move(ctx: &Ctx) -> Result<AssertResult> {
 pub fn custom_nested_cgroup_rapid_churn(ctx: &Ctx) -> Result<AssertResult> {
     let (handles, _guard) = setup_cgroups(ctx, 2, &dfl_wl(ctx))?;
     let deadline = Instant::now() + ctx.duration;
-    let mut i = 0;
+    let mut i = 0usize;
+    // Cap on the number of distinct ephemeral cgroup names. The
+    // parent and 'deep' child remove paths are both best-effort
+    // (see comments below); without a cap a long scenario with
+    // persistent EBUSY/ENOENT churn would accumulate one cgroup
+    // per iteration in the cgroupfs tree until the
+    // `setup_cgroups` guard's Drop reaps them at scenario
+    // teardown. Reusing the same 100 names via `i % 100` bounds
+    // the peak resident leaked-cgroup count to at most 100
+    // parents (plus their `deep` children on the every-3rd
+    // iterations) while still exercising the rapid
+    // create→remove churn the test is designed to drive.
+    // `create_cgroup` is idempotent on a name whose dir already
+    // exists (`if !p.exists()` in `CgroupManager::create_cgroup`),
+    // so a cycle that lapped a still-resident sibling is a no-op
+    // re-create rather than an error. Mirrors the cap in the
+    // single-level sibling `custom_cgroup_rapid_churn` in
+    // `scenario/dynamic.rs`.
+    const MAX_EPHEMERAL_NAMES: usize = 100;
     while Instant::now() < deadline {
-        let path = format!("cg_0/churn_{i}");
+        let path = format!("cg_0/churn_{}", i % MAX_EPHEMERAL_NAMES);
         ctx.cgroups.create_cgroup(&path)?;
         if i % 3 == 0 {
             let deep = format!("{path}/deep");
@@ -110,7 +128,7 @@ pub fn custom_nested_cgroup_rapid_churn(ctx: &Ctx) -> Result<AssertResult> {
         if let Err(e) = ctx.cgroups.remove_cgroup(&path) {
             tracing::warn!(cgroup = %path, err = %format!("{e:#}"), "nested churn: remove_cgroup(path) failed; guard Drop will reap on scenario teardown");
         }
-        i += 1;
+        i = i.wrapping_add(1);
     }
     Ok(collect_all(handles, &ctx.assert))
 }

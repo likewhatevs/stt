@@ -11,8 +11,13 @@
 //! caveat — lives there.
 
 pub(crate) use std::fs::File;
-#[cfg(not(test))]
-use std::os::unix::io::AsRawFd;
+// `AsRawFd` is required by the vectored read/write helpers below
+// to extract the raw fd for `libc::preadv` / `libc::pwritev`. The
+// `worker.rs` consumer separately re-uses it (cfg(not(test)) only)
+// for `EventFd::write` accounting; we hoist it to unconditional
+// import so the vectored helpers compile in both `cfg(test)` and
+// production.
+pub(crate) use std::os::unix::io::AsRawFd;
 pub(crate) use std::sync::Arc;
 pub(crate) use std::sync::OnceLock;
 pub(crate) use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -60,7 +65,7 @@ pub(crate) use virtio_queue::QueueOwnedT;
 #[cfg(not(test))]
 use virtio_queue::QueueSync;
 pub(crate) use virtio_queue::QueueT;
-pub(crate) use vm_memory::{ByteValued, Bytes, GuestAddress, GuestMemoryMmap};
+pub(crate) use vm_memory::{ByteValued, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
 
 // `VirtioBlkCounters` lives in `counters.rs`; reach it via `super::*`
 // (sourced from `mod.rs`'s `pub(crate) use counters::*;`).
@@ -1103,10 +1108,11 @@ impl VirtioBlk {
 
     /// Advertised capacity in 512-byte sectors.
     ///
-    /// `dead_code` allow: kept for forward use by callers that
-    /// need to read back the rounded-to-sector capacity; the lib
-    /// pipeline currently consumes the `capacity_bytes` input
-    /// directly through the config-space rendering path.
+    /// `dead_code` allow: used by tests to read back the
+    /// rounded-to-sector capacity; the lib pipeline consumes
+    /// the `capacity_bytes` input directly through the
+    /// config-space rendering path, so the accessor would
+    /// otherwise appear unused at lib-build time.
     #[allow(dead_code)]
     pub fn capacity_sectors(&self) -> u64 {
         self.capacity_sectors
@@ -1117,6 +1123,23 @@ impl VirtioBlk {
     /// the device.
     pub fn counters(&self) -> Arc<VirtioBlkCounters> {
         Arc::clone(&self.worker.counters)
+    }
+
+    /// Cloneable handle to the worker's parked-state flag. The
+    /// freeze coordinator holds an `Arc<AtomicBool>` and polls it in
+    /// the post-thaw barrier and timeout-diagnostic paths without
+    /// taking the device's `PiMutex`. Reading via the device handle
+    /// ([`Self::is_paused`]) requires `Arc<PiMutex<VirtioBlk>>::lock`,
+    /// which contends with every concurrent device operation —
+    /// `mmio_read`/`mmio_write` from the vCPU thread and any other
+    /// freeze-coord call site holding the lock. Since the
+    /// underlying field is already `Arc<AtomicBool>`, exposing it
+    /// directly lets the rendezvous loop poll it lock-free; the
+    /// Acquire/Release ordering on `paused` provides the same
+    /// happens-before edges with the worker's parked-state writes
+    /// that [`Self::is_paused`] does.
+    pub fn paused_handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.paused)
     }
 
     pub(crate) fn device_features(&self) -> u64 {
@@ -1192,6 +1215,448 @@ impl VirtioBlk {
     pub(crate) fn features_write_allowed(&self) -> bool {
         let status = self.device_status.load(Ordering::Acquire);
         status & S_DRV == S_DRV && status & VIRTIO_CONFIG_S_FEATURES_OK == 0
+    }
+
+    /// Service `VIRTIO_BLK_T_IN` (read) using a single `preadv(2)`
+    /// syscall over a vectored iov chain built from the data
+    /// segments. Functionally equivalent to
+    /// [`Self::handle_read_impl`] but coalesces N `pread64` syscalls
+    /// (one per segment) plus N memcpy passes (kernel→scratch then
+    /// scratch→guest) into one syscall reading directly into guest
+    /// memory.
+    ///
+    /// Mirrors the cloud-hypervisor `block::Request::execute_async`
+    /// vectored read path
+    /// (cloud-hypervisor/block/src/lib.rs `iovecs.push(...)` then
+    /// `read_vectored`): one iovec per `VolatileSlice` produced by
+    /// `mem.get_slices(addr, len)`. `get_slices` handles fragmentation
+    /// when a descriptor's `[addr, addr+len)` range spans a guest
+    /// memory region boundary — each contiguous host range becomes
+    /// its own iovec entry.
+    ///
+    /// `data_len` and `sector` are pre-validated by the caller
+    /// (`drain_bracket_impl`): SIZE_MAX, SEG_MAX, sub-sector,
+    /// direction, and out-of-range checks all run upstream. The
+    /// per-segment direction check is repeated here as
+    /// defense-in-depth — matching [`Self::handle_read_impl`] —
+    /// so a future caller that bypasses `drain_bracket_impl` and
+    /// calls this helper directly cannot smuggle a device-readable
+    /// segment into a T_IN chain (which would have `preadv` write
+    /// into a buffer the spec marked read-only from the device's
+    /// perspective).
+    ///
+    /// Short-read handling: `preadv` returns `n` bytes filled
+    /// (`n <= data_len`). When `n < data_len` (only reachable on a
+    /// short read against a backing whose effective length is below
+    /// `capacity_bytes` — pre-validated against `capacity_bytes` by
+    /// the caller, so this path is rare in production) the unfilled
+    /// `[n..data_len)` byte range is zero-padded by walking the
+    /// segments forward from byte `n` and writing zero bytes via
+    /// `mem.write_slice`. This mirrors the existing per-segment
+    /// short-read pad in [`Self::handle_read_impl`] and matches the
+    /// sparse-file semantic the original implementation relied on.
+    ///
+    /// Counter taxonomy is preserved exactly:
+    /// - `record_read(bytes_from_backing)`: bytes ACTUALLY returned
+    ///   by `preadv` (`n`), excluding the zero-pad tail.
+    /// - `used.elem.len = bytes_to_guest + 1`: full `data_len` (data
+    ///   + zero-pad tail) + 1 status byte (virtio-v1.2 §2.7.7.2 —
+    ///   bytes the device wrote into device-writable buffers).
+    ///
+    /// `too_many_arguments` allow: same disjoint-borrow shape as
+    /// [`Self::handle_read_impl`] — every parameter is a separate
+    /// `&self` field that must be passed by reference so the caller
+    /// can hold a concurrent mutable borrow of the queues vec.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn handle_read_vectored_impl(
+        backing: &File,
+        capacity_bytes: u64,
+        counters: &VirtioBlkCounters,
+        mem: &GuestMemoryMmap,
+        sector: u64,
+        data_segments: &[ChainDescriptor],
+        data_len: u64,
+    ) -> (u8, u32) {
+        let Some(base_offset) = sector.checked_mul(VIRTIO_BLK_SECTOR_SIZE as u64) else {
+            counters.record_io_error();
+            return (VIRTIO_BLK_S_IOERR as u8, 1);
+        };
+        if base_offset
+            .checked_add(data_len)
+            .is_none_or(|end| end > capacity_bytes)
+        {
+            counters.record_io_error();
+            return (VIRTIO_BLK_S_IOERR as u8, 1);
+        }
+
+        // Build the iovec chain: one entry per VolatileSlice produced
+        // by `mem.get_slices(addr, len)`. `get_slices` iterates over
+        // the contiguous host ranges that together cover the guest
+        // address span, so a descriptor whose `[addr, addr+len)`
+        // straddles a `GuestMemoryMmap` region boundary contributes
+        // multiple iovec entries — preserving correctness without
+        // requiring the descriptor to fit in a single region.
+        //
+        // The `PtrGuardMut`s returned by `slice.ptr_guard_mut()` are
+        // collected into `_guards` so they remain alive for the
+        // duration of the syscall: with the `xen` feature enabled
+        // they wrap an `MmapXenSlice` whose Drop unmaps the host
+        // mapping; without `xen` the guard is a thin wrapper around
+        // the raw pointer. Either way, holding the guards across
+        // the syscall guarantees the `iov_base` pointers stay valid.
+        //
+        // Local Vec rather than a reusable scratch on `BlkWorkerState`:
+        // `libc::iovec` contains a raw pointer, which is `!Send`, so
+        // storing a `Vec<libc::iovec>` on `BlkWorkerState` would make
+        // the whole struct `!Send` and break the `JoinHandle<…>`
+        // payload. The initial capacity is a `VIRTIO_BLK_SEG_MAX + 2`
+        // hint (one entry per data segment plus header+status); the
+        // Vec grows via reallocation if multi-region descriptors
+        // fragment into more iovec entries. The per-call allocation
+        // is amortized against the single `preadv` syscall it
+        // replaces — a quantum of overhead vastly smaller than the
+        // N kernel-mode syscall transitions the legacy per-segment
+        // path performed.
+        let mut iovecs: Vec<libc::iovec> =
+            Vec::with_capacity(VIRTIO_BLK_SEG_MAX as usize + 2);
+        let mut _guards: Vec<vm_memory::volatile_memory::PtrGuardMut> =
+            Vec::with_capacity(VIRTIO_BLK_SEG_MAX as usize + 2);
+        for seg in data_segments {
+            if !seg.is_write_only {
+                // Spec violation — a T_IN request's data SGs must
+                // be device-writable. Defense-in-depth: the outer
+                // gate in process_requests already rejected this
+                // chain before throttle. Mirrors the same check in
+                // [`Self::handle_read_impl`] so a future caller
+                // that bypasses `drain_bracket_impl` cannot reach
+                // `preadv` with a device-readable buffer.
+                counters.record_io_error();
+                return (VIRTIO_BLK_S_IOERR as u8, 1);
+            }
+            let len = seg.len as usize;
+            if len == 0 {
+                // Zero-length data descriptor: legal per virtio
+                // (qemu/firecracker accept). Skip — preadv with a
+                // zero-length iovec entry is a no-op and skipping
+                // avoids an unnecessary `get_slices` round-trip.
+                continue;
+            }
+            for slice_result in mem.get_slices(seg.addr, len) {
+                let slice = match slice_result {
+                    Ok(s) => s,
+                    Err(_) => {
+                        counters.record_io_error();
+                        return (VIRTIO_BLK_S_IOERR as u8, 1);
+                    }
+                };
+                let guard = slice.ptr_guard_mut();
+                iovecs.push(libc::iovec {
+                    iov_base: guard.as_ptr() as *mut libc::c_void,
+                    iov_len: slice.len(),
+                });
+                _guards.push(guard);
+            }
+        }
+
+        // Empty iovec means data_len == 0 — every data descriptor in
+        // the chain had len == 0. The upstream zero-data gate in
+        // drain.rs gates on `data_segments.is_empty()`, NOT on
+        // `data_len == 0`, so a chain with one or more zero-length
+        // data descriptors passes the gate and reaches here. Linux
+        // `preadv` with iovcnt=0 returns 0 (lib/iov_iter.c
+        // `iovec_from_user`: "Linux has traditionally returned zero
+        // for zero segments"), so a syscall would be harmless —
+        // skipping it just avoids the kernel-mode round-trip on a
+        // path that has nothing to do.
+        let bytes_from_backing: u64 = if iovecs.is_empty() {
+            0
+        } else {
+            // SAFETY: `iovecs` is a non-empty Vec of `libc::iovec`
+            // entries built from valid host pointers (each came from
+            // a `VolatileSlice` produced by `mem.get_slices(...)`
+            // and the corresponding `PtrGuardMut` is alive in
+            // `_guards` for the duration of this call, keeping the
+            // backing pointer valid). `backing.as_raw_fd()` borrows
+            // the `File` which the caller (`drain_bracket_impl`)
+            // owns for the duration of the drain.
+            //
+            // `iovecs.len()` upper bound: `data_segments` has at
+            // most `VIRTIO_BLK_SEG_MAX` (128) entries (enforced
+            // upstream in drain.rs); `mem.get_slices(addr, len)`
+            // can return MULTIPLE slices per descriptor when its
+            // `[addr, addr+len)` range crosses one or more
+            // `GuestMemoryMmap` region boundaries. With multi-region
+            // guest memory each segment can fragment into K slices
+            // (K bounded by the number of regions the segment spans).
+            // The realistic worst case is well under `IOV_MAX = 1024`
+            // (Linux): a 1 MiB SIZE_MAX descriptor over typical
+            // GiB-scale regions produces 1 slice, and even a
+            // pathological boundary-straddle produces 2 — total
+            // bound `~SEG_MAX * regions_per_segment`, kept below
+            // 1024 by realistic region sizing.
+            // `base_offset` is a `u64` validated above to fit in
+            // `[0, capacity_bytes]`; `capacity_bytes` is host-trusted
+            // (constructed in `with_options`) so it cannot exceed
+            // `i64::MAX` for any realistic disk size and fits in
+            // `off_t` losslessly.
+            let r = unsafe {
+                libc::preadv(
+                    backing.as_raw_fd(),
+                    iovecs.as_ptr(),
+                    iovecs.len() as libc::c_int,
+                    base_offset as libc::off_t,
+                )
+            };
+            if r < 0 {
+                let e = std::io::Error::last_os_error();
+                tracing::warn!(sector, %e, "virtio-blk preadv error");
+                counters.record_io_error();
+                return (VIRTIO_BLK_S_IOERR as u8, 1);
+            }
+            r as u64
+        };
+
+        // Short-read pad: zero-fill the unfilled `[n..data_len)`
+        // tail across the data segments. Walks segments forward,
+        // skipping over already-filled bytes (`< n`) and zeroing
+        // any remainder. Matches the per-segment behavior in
+        // `handle_read_impl` (the unfilled tail of the segment that
+        // straddles `n` plus all subsequent segments are zeroed).
+        if bytes_from_backing < data_len {
+            let mut filled = bytes_from_backing;
+            let mut to_zero = data_len - bytes_from_backing;
+            // Stack zero buffer sized to a fixed 64 KiB chunk.
+            // Smaller than `VIRTIO_BLK_SIZE_MAX` (1 MiB) so a single
+            // segment of the maximum size cannot be zeroed in one
+            // pass; the inner `while remaining > 0` loop iterates
+            // up to 16 times per segment, each iteration writing
+            // one 64 KiB chunk via `mem.write_slice`. 64 KiB keeps
+            // the stack footprint small while amortizing the
+            // per-write_slice overhead across multiple sectors.
+            const ZERO_BUF_LEN: usize = 65536;
+            let zeros = [0u8; ZERO_BUF_LEN];
+            for seg in data_segments {
+                if to_zero == 0 {
+                    break;
+                }
+                let seg_len = seg.len as u64;
+                if filled >= seg_len {
+                    // Segment already fully filled by preadv; skip.
+                    filled -= seg_len;
+                    continue;
+                }
+                // Zero from offset `filled` within this segment to
+                // its end (or until `to_zero` runs out, whichever
+                // comes first).
+                let seg_offset = filled as u32;
+                let seg_remaining = (seg_len - filled).min(to_zero) as u32;
+                let Some(zero_addr_u64) = seg.addr.0.checked_add(seg_offset as u64) else {
+                    counters.record_io_error();
+                    return (VIRTIO_BLK_S_IOERR as u8, 1);
+                };
+                let mut zero_addr = GuestAddress(zero_addr_u64);
+                let mut remaining = seg_remaining;
+                while remaining > 0 {
+                    let chunk = (remaining as usize).min(ZERO_BUF_LEN);
+                    if mem
+                        .write_slice(&zeros[..chunk], zero_addr)
+                        .is_err()
+                    {
+                        counters.record_io_error();
+                        return (VIRTIO_BLK_S_IOERR as u8, 1);
+                    }
+                    let Some(next) = zero_addr.0.checked_add(chunk as u64) else {
+                        counters.record_io_error();
+                        return (VIRTIO_BLK_S_IOERR as u8, 1);
+                    };
+                    zero_addr = GuestAddress(next);
+                    remaining -= chunk as u32;
+                }
+                to_zero -= seg_remaining as u64;
+                filled = 0;
+            }
+        }
+
+        counters.record_read(bytes_from_backing);
+        // bytes_to_guest = full data_len (data + zero-pad tail). Cap
+        // at u32::MAX; SEG_MAX (128) × SIZE_MAX (1 MiB) = 128 MiB ≪
+        // u32::MAX, so the cast cannot truncate.
+        let bytes_to_guest = data_len as u32;
+        (VIRTIO_BLK_S_OK as u8, bytes_to_guest + 1)
+    }
+
+    /// Service `VIRTIO_BLK_T_OUT` (write) using a single `pwritev(2)`
+    /// syscall over a vectored iov chain built from the data
+    /// segments. Functionally equivalent to
+    /// [`Self::handle_write_impl`] but coalesces N `pwrite64`
+    /// syscalls plus N memcpy passes into one syscall writing
+    /// directly from guest memory.
+    ///
+    /// Mirrors cloud-hypervisor's vectored write path with the same
+    /// `iovecs.push(...)` build step followed by `write_vectored`.
+    ///
+    /// `data_len` and `sector` are pre-validated by the caller
+    /// (`drain_bracket_impl`): SIZE_MAX, SEG_MAX, sub-sector,
+    /// direction, RO-mode, and out-of-range checks all run upstream.
+    /// The per-segment direction check is repeated here as
+    /// defense-in-depth — matching [`Self::handle_write_impl`] —
+    /// so a future caller that bypasses `drain_bracket_impl` cannot
+    /// smuggle a device-writable segment into a T_OUT chain (which
+    /// would have `pwritev` read from a buffer the spec marked
+    /// device-only-writable from the driver's perspective).
+    ///
+    /// Short-write handling: `pwritev` may return `n < data_len`,
+    /// e.g. on ENOSPC mid-write or a hostile-FS short-write
+    /// signal. Both partial-write (`n < data_len`) and outright
+    /// error (`r < 0`) collapse to S_IOERR + an `io_errors` bump,
+    /// matching the per-segment behavior in
+    /// [`Self::handle_write_impl`] (which rejects on the first
+    /// `Ok(n)` where `n < seg.len`). The host backing-file
+    /// distress signal is preserved.
+    ///
+    /// Counter taxonomy is preserved exactly:
+    /// - `record_write(total_written)`: bytes accepted by the
+    ///   backing file. On success `total_written == data_len`.
+    /// - `used.elem.len = 1` (status byte only — write data is
+    ///   not written back into guest memory).
+    ///
+    /// `too_many_arguments` allow: same disjoint-borrow shape as
+    /// [`Self::handle_read_vectored_impl`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn handle_write_vectored_impl(
+        backing: &File,
+        capacity_bytes: u64,
+        counters: &VirtioBlkCounters,
+        mem: &GuestMemoryMmap,
+        sector: u64,
+        data_segments: &[ChainDescriptor],
+        data_len: u64,
+    ) -> (u8, u32) {
+        let Some(base_offset) = sector.checked_mul(VIRTIO_BLK_SECTOR_SIZE as u64) else {
+            counters.record_io_error();
+            return (VIRTIO_BLK_S_IOERR as u8, 1);
+        };
+        if base_offset
+            .checked_add(data_len)
+            .is_none_or(|end| end > capacity_bytes)
+        {
+            counters.record_io_error();
+            return (VIRTIO_BLK_S_IOERR as u8, 1);
+        }
+
+        // Build the iovec chain. `get_slices` (not `get_slice`) so
+        // a descriptor whose `[addr, addr+len)` straddles a region
+        // boundary contributes multiple iovec entries. See the
+        // `handle_read_vectored_impl` doc for the
+        // `_guards`-keep-alive and per-call-allocation rationale.
+        //
+        // For T_OUT, the iovec entries are read-only with respect to
+        // the syscall (pwritev READS the iov_base pointers), so we
+        // hold `PtrGuard`s rather than `PtrGuardMut`s — no dirty
+        // tracking is needed because we are not modifying guest
+        // memory here.
+        let mut iovecs: Vec<libc::iovec> =
+            Vec::with_capacity(VIRTIO_BLK_SEG_MAX as usize + 2);
+        let mut _guards: Vec<vm_memory::volatile_memory::PtrGuard> =
+            Vec::with_capacity(VIRTIO_BLK_SEG_MAX as usize + 2);
+        for seg in data_segments {
+            if seg.is_write_only {
+                // Spec violation — a T_OUT request's data SGs must
+                // be device-readable. Defense-in-depth: the outer
+                // gate in process_requests already rejected this
+                // chain before throttle. Mirrors the same check in
+                // [`Self::handle_write_impl`] so a future caller
+                // that bypasses `drain_bracket_impl` cannot reach
+                // `pwritev` against a device-writable buffer.
+                counters.record_io_error();
+                return (VIRTIO_BLK_S_IOERR as u8, 1);
+            }
+            let len = seg.len as usize;
+            if len == 0 {
+                continue;
+            }
+            for slice_result in mem.get_slices(seg.addr, len) {
+                let slice = match slice_result {
+                    Ok(s) => s,
+                    Err(_) => {
+                        counters.record_io_error();
+                        return (VIRTIO_BLK_S_IOERR as u8, 1);
+                    }
+                };
+                let guard = slice.ptr_guard();
+                iovecs.push(libc::iovec {
+                    // `iovec.iov_base` is `*mut c_void` regardless of
+                    // direction; the kernel reads from it for
+                    // pwritev and writes to it for preadv. Casting
+                    // the read-only pointer to `*mut` is fine because
+                    // pwritev does not mutate the buffer; the
+                    // mut-ness in the type is a libc convention, not
+                    // a behavior contract.
+                    iov_base: guard.as_ptr() as *mut libc::c_void,
+                    iov_len: slice.len(),
+                });
+                _guards.push(guard);
+            }
+        }
+
+        if iovecs.is_empty() {
+            // data_len == 0 — every data descriptor in the chain had
+            // len == 0. The upstream zero-data gate in drain.rs
+            // gates on `data_segments.is_empty()`, NOT on
+            // `data_len == 0`, so a chain with one or more
+            // zero-length data descriptors passes the gate and
+            // reaches here. Linux `pwritev` with iovcnt=0 returns 0
+            // for the same reason as `preadv` (see the read path
+            // doc), so a syscall would be harmless — skipping it
+            // just avoids the kernel-mode round-trip on a path
+            // that has nothing to do.
+            counters.record_write(0);
+            return (VIRTIO_BLK_S_OK as u8, 1);
+        }
+
+        // SAFETY: identical to the preadv site above. iovecs is
+        // built from live `PtrGuard`s held in `_guards`; the
+        // backing fd is valid for the call (caller owns the File).
+        // `iovecs.len()` upper bound: see the preadv SAFETY comment
+        // — `data_segments` has at most SEG_MAX (128) entries and
+        // `mem.get_slices` may fragment each across region
+        // boundaries, with the realistic worst case well under
+        // `IOV_MAX = 1024` for any sane GuestMemoryMmap region
+        // sizing.
+        let r = unsafe {
+            libc::pwritev(
+                backing.as_raw_fd(),
+                iovecs.as_ptr(),
+                iovecs.len() as libc::c_int,
+                base_offset as libc::off_t,
+            )
+        };
+        if r < 0 {
+            let e = std::io::Error::last_os_error();
+            tracing::warn!(sector, %e, "virtio-blk pwritev error");
+            counters.record_io_error();
+            return (VIRTIO_BLK_S_IOERR as u8, 1);
+        }
+        let total_written = r as u64;
+        if total_written != data_len {
+            // Partial write (`n < data_len`): same failure semantic
+            // as `handle_write_impl`'s per-segment short-write arm.
+            // The guest's request was not fulfilled in full and
+            // there is no retry path inside the device — surface
+            // S_IOERR and let the guest's blk-mq layer decide.
+            tracing::warn!(
+                sector,
+                total_written,
+                data_len,
+                "virtio-blk pwritev short write"
+            );
+            counters.record_io_error();
+            return (VIRTIO_BLK_S_IOERR as u8, 1);
+        }
+        counters.record_write(total_written);
+        // used_len: 1 (status byte only — write data is not
+        // written back into guest memory).
+        (VIRTIO_BLK_S_OK as u8, 1)
     }
 
     /// Classify a request type into a "pre-throttle terminal status"
@@ -2687,6 +3152,9 @@ impl VirtioBlk {
     /// worker performed pre-pause.
     ///
     /// Cfg-independent for the same reason as [`Self::pause`].
+    // Production callers retired with the freeze-coordinator queue
+    // pause path; preserved for `tests_atomics` Acquire/Release pin.
+    #[allow(dead_code)]
     pub fn is_paused(&self) -> bool {
         self.paused.load(Ordering::Acquire)
     }

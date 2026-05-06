@@ -17,8 +17,8 @@
 //! The `BaseKey` content-hash spans every byte the build consumes
 //! (binary content + shared-lib content) so a recompile invalidates
 //! the cache without operator intervention. Stale segments from a
-//! previous compression format are GC'd on every run via a
-//! `LOCK_EX | LOCK_NB` probe.
+//! previous compression format are GC'd once per process on the first
+//! `get_or_build_base` call via a `LOCK_EX | LOCK_NB` probe.
 
 use anyhow::{Context, Result};
 use std::collections::HashMap;
@@ -36,6 +36,26 @@ use super::initramfs;
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct BaseKey(pub(crate) u64);
 
+/// Process-local memoisation key for [`hash_file`]. `(path, dev, ino,
+/// mtime_secs, mtime_nsecs)` identifies a specific file revision: dev
+/// + ino pin the inode (so a path replaced by a different file
+/// invalidates), and mtime catches in-place edits. Same file unchanged
+/// = identical key = HashMap hit, no re-stream.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct HashFileKey {
+    path: PathBuf,
+    dev: u64,
+    ino: u64,
+    mtime_secs: i64,
+    mtime_nsecs: i64,
+}
+
+/// Process-local cache: file identity + mtime → SipHash13 of contents.
+fn hash_file_cache() -> &'static Mutex<HashMap<HashFileKey, u64>> {
+    static CACHE: OnceLock<Mutex<HashMap<HashFileKey, u64>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 /// Hash a file's content for cache keying via streaming reads.
 ///
 /// Uses [`siphasher::sip::SipHasher13`] with fixed zero keys rather
@@ -45,14 +65,54 @@ pub(crate) struct BaseKey(pub(crate) u64);
 /// shift when the compiler was upgraded — invalidating every cached
 /// initramfs blob. SipHash13 with pinned keys is version-stable by
 /// the siphasher crate's contract.
+///
+/// Reads via [`std::io::BufReader`] and feeds the hasher in chunks so
+/// the full file never sits in memory at once — a 50 MB stripped
+/// scheduler binary streams through an 8 KB buffer instead of a 50 MB
+/// `Vec<u8>`. Process-local memoisation keyed on `(path, dev, ino,
+/// mtime)` short-circuits repeat calls within the same run; the
+/// inode-plus-mtime tuple invalidates the cached hash whenever the
+/// underlying file changes.
 pub(crate) fn hash_file(path: &Path) -> Result<u64> {
     use siphasher::sip::SipHasher13;
+    use std::fs::File;
     use std::hash::Hasher;
-    let contents =
-        std::fs::read(path).with_context(|| format!("read for hash: {}", path.display()))?;
+    use std::io::{BufReader, Read};
+    use std::os::unix::fs::MetadataExt;
+
+    let file = File::open(path).with_context(|| format!("open for hash: {}", path.display()))?;
+    let meta = file
+        .metadata()
+        .with_context(|| format!("stat for hash: {}", path.display()))?;
+    let cache_key = HashFileKey {
+        path: path.to_path_buf(),
+        dev: meta.dev(),
+        ino: meta.ino(),
+        mtime_secs: meta.mtime(),
+        mtime_nsecs: meta.mtime_nsec(),
+    };
+    if let Some(cached) = hash_file_cache().lock().unwrap().get(&cache_key).copied() {
+        return Ok(cached);
+    }
+
+    let mut reader = BufReader::new(file);
     let mut hasher = SipHasher13::new_with_keys(0, 0);
-    hasher.write(&contents);
-    Ok(hasher.finish())
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = reader
+            .read(&mut buf)
+            .with_context(|| format!("read for hash: {}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.write(&buf[..n]);
+    }
+    let digest = hasher.finish();
+    hash_file_cache()
+        .lock()
+        .unwrap()
+        .insert(cache_key, digest);
+    Ok(digest)
 }
 
 impl BaseKey {
@@ -239,8 +299,14 @@ pub(crate) fn get_or_build_base(
     busybox: bool,
     key: &BaseKey,
 ) -> Result<BaseRef> {
-    // Clean stale SHM segments from previous runs.
-    cleanup_stale_shm(key);
+    // Clean stale SHM segments from previous runs. The /dev/shm scan
+    // touches every entry once and is keyed off `current` to skip the
+    // segment we are about to use; running it on every call wastes
+    // syscalls when many tests share a process. `OnceLock` gates the
+    // sweep to a single execution per process — the first key wins
+    // and every subsequent call is a free no-op.
+    static CLEANUP_ONCE: OnceLock<()> = OnceLock::new();
+    CLEANUP_ONCE.get_or_init(|| cleanup_stale_shm(key));
 
     // 1. Process-local cache
     if let Some(arc) = base_cache().lock().unwrap().get(key).cloned() {
@@ -335,6 +401,11 @@ pub(crate) fn get_or_build_base(
 /// reader or writer holds it, so it's safe to unlink. If the lock
 /// fails (`EWOULDBLOCK`), another process is actively using the
 /// segment and it is skipped.
+///
+/// Called once per process via the [`OnceLock`] gate in
+/// [`get_or_build_base`]. Sweeping on every call is wasteful when many
+/// tests share a process — the first cache lookup pays for the scan
+/// and every subsequent lookup is free.
 fn cleanup_stale_shm(current: &BaseKey) {
     let current_suffix = format!("{}-{:016x}", initramfs::SHM_ARCH_TAG, current.0);
     let shm_dir = match std::fs::read_dir("/dev/shm") {
@@ -619,12 +690,39 @@ mod tests {
             std::env::temp_dir().join(format!("ktstr-hash-sample-test-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         let f = tmp.join("big");
-        // 16KB file — exercises both head and tail sampling.
+        // 16KB file — exceeds the 8 KB BufReader buffer so the read
+        // loop iterates more than once.
         let data: Vec<u8> = (0..16384).map(|i| (i % 256) as u8).collect();
         std::fs::write(&f, &data).unwrap();
         let h = hash_file(&f).unwrap();
         // Same content should produce same hash.
         assert_eq!(h, hash_file(&f).unwrap());
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// `hash_file` must invalidate its memoisation cache when the file
+    /// changes — same path, new content, must yield a new hash.
+    #[test]
+    fn hash_file_memoisation_invalidates_on_change() {
+        let tmp =
+            std::env::temp_dir().join(format!("ktstr-hash-memo-test-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let f = tmp.join("rev");
+
+        std::fs::write(&f, b"revision-one").unwrap();
+        let h1 = hash_file(&f).unwrap();
+
+        // Sleep past mtime granularity so the second write changes the
+        // mtime tuple. ext4 / btrfs / xfs all expose nanosecond mtime,
+        // but a one-second pause is the portable lower bound.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(&f, b"revision-two-with-different-bytes").unwrap();
+        let h2 = hash_file(&f).unwrap();
+
+        assert_ne!(
+            h1, h2,
+            "mtime change must bypass the memoisation cache"
+        );
         std::fs::remove_dir_all(&tmp).unwrap();
     }
 

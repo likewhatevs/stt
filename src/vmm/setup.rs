@@ -20,9 +20,7 @@ use super::KtstrVm;
 use super::initramfs_cache::{BaseKey, BaseRef, get_or_build_base};
 use super::memory_budget::{MemoryBudget, initramfs_min_memory_mb, read_kernel_init_size};
 use super::pi_mutex::PiMutex;
-use super::{
-    disk_config, disk_template, host_topology, initramfs, shm_ring, virtio_blk, virtio_net,
-};
+use super::{disk_config, disk_template, host_topology, initramfs, virtio_blk, virtio_net};
 
 #[cfg(target_arch = "aarch64")]
 use super::aarch64;
@@ -52,8 +50,8 @@ const INITRD_ADDR: u64 = 0x800_0000; // 128 MB
 /// the overlay path reaches `mmap` with a valid alignment regardless
 /// of host page size.
 #[cfg(target_arch = "aarch64")]
-fn aarch64_initrd_addr(memory_mb: u32, shm_size: u64, initrd_max_size: u64) -> u64 {
-    let fdt_addr = aarch64::fdt::fdt_address(memory_mb, shm_size);
+fn aarch64_initrd_addr(memory_mb: u32, initrd_max_size: u64) -> u64 {
+    let fdt_addr = aarch64::fdt::fdt_address(memory_mb);
     let page_size = host_page_size();
     let mask = !(page_size - 1);
     // Place initrd just below FDT, host-page-aligned.
@@ -73,6 +71,7 @@ fn aarch64_initrd_addr(memory_mb: u32, shm_size: u64, initrd_max_size: u64) -> u
 /// returns an error code (≤0), which would itself indicate a libc bug
 /// — the fallback exists so a downstream alignment computation never
 /// produces 0.
+#[allow(dead_code)]
 pub(crate) fn host_page_size() -> u64 {
     static CACHED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *CACHED.get_or_init(|| {
@@ -698,7 +697,7 @@ impl KtstrVm {
             uncompressed_initramfs_bytes: uncompressed_size as u64,
             compressed_initrd_bytes: compressed_size as u64,
             kernel_init_size,
-            shm_bytes: self.shm_size,
+
         };
         let min_mb = initramfs_min_memory_mb(&budget);
         if memory_mb < min_mb {
@@ -773,7 +772,7 @@ impl KtstrVm {
             uncompressed_initramfs_bytes: uncompressed_size as u64,
             compressed_initrd_bytes: compressed_size as u64,
             kernel_init_size,
-            shm_bytes: self.shm_size,
+
         };
         let memory_mb = initramfs_min_memory_mb(&budget).max(self.memory_min_mb);
         tracing::debug!(
@@ -873,24 +872,27 @@ impl KtstrVm {
             initramfs::shm_close_fd(fd);
             return None;
         }
-        // Validate LZ4 legacy magic before COW-mapping.
+        // Validate LZ4 legacy magic before COW-mapping. pread the
+        // first 4 bytes directly — no need to mmap the entire segment
+        // just to peek at the header.
         use std::os::fd::AsRawFd;
         let mut magic = [0u8; 4];
-        unsafe {
-            let ptr = libc::mmap(
-                std::ptr::null_mut(),
-                len,
-                libc::PROT_READ,
-                libc::MAP_SHARED,
+        // SAFETY: `fd` is owned by `shm_open_lz4` and remains valid
+        // until `shm_close_fd` below; `magic` is a 4-byte stack buffer
+        // and the read length is exactly 4. The fd refers to a SHM
+        // segment with `len >= expected_len` bytes (verified above and
+        // by `shm_open_lz4`'s fstat check).
+        let n = unsafe {
+            libc::pread(
                 fd.as_raw_fd(),
+                magic.as_mut_ptr() as *mut libc::c_void,
+                4,
                 0,
-            );
-            if ptr == libc::MAP_FAILED {
-                initramfs::shm_close_fd(fd);
-                return None;
-            }
-            std::ptr::copy_nonoverlapping(ptr as *const u8, magic.as_mut_ptr(), 4);
-            libc::munmap(ptr, len);
+            )
+        };
+        if n != 4 {
+            initramfs::shm_close_fd(fd);
+            return None;
         }
         if magic != initramfs::LZ4_LEGACY_MAGIC {
             tracing::warn!(
@@ -996,18 +998,7 @@ impl KtstrVm {
         unsafe { initramfs::cow_overlay(host_addr, len, fd) }
     }
 
-    /// Initialize the SHM ring buffer header at `shm_base` in guest memory.
-    fn init_shm_region(&self, guest_mem: &GuestMemoryMmap, shm_base: u64) -> Result<()> {
-        let header = shm_ring::ShmRingHeader::new(self.shm_size as usize);
-        guest_mem
-            .write_slice(
-                zerocopy::IntoBytes::as_bytes(&header),
-                GuestAddress(shm_base),
-            )
-            .context("write SHM header")
-    }
-
-    /// Write cmdline, boot params, SHM header, and topology tables to guest memory.
+    /// Write cmdline, boot params, and topology tables to guest memory.
     ///
     /// When `kernel_result` is `None` (deferred memory mode), this method
     /// first joins the initramfs thread to learn the actual size, allocates
@@ -1081,7 +1072,6 @@ impl KtstrVm {
         //   pci=off              — no PCI devices emulated; shave boot time by skipping the scan.
         //   reboot=k             — use keyboard-controller reset method.
         //   panic=-1             — reboot immediately on panic; host detects via exit.
-        //   iomem=relaxed        — allow guest /dev/mem mmap of the SHM region (see shm_ring.rs).
         //   nokaslr              — deterministic kernel addresses for symbol/offset resolution.
         //   lockdown=none        — permit /dev/mem and unrestricted BPF needed by the test runtime.
         //   sysctl.kernel.unprivileged_bpf_disabled=0 — allow BPF load from the test runtime.
@@ -1121,11 +1111,12 @@ impl KtstrVm {
             "no_timer_check clocksource=kvm-clock ",
             "random.trust_cpu=on swiotlb=noforce ",
             "i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd ",
-            "pci=off reboot=k panic=-1 iomem=relaxed nokaslr lockdown=none ",
+            "pci=off reboot=k panic=-1 nokaslr lockdown=none ",
             "sysctl.kernel.unprivileged_bpf_disabled=0 ",
             "sysctl.kernel.sched_schedstats=1 ",
             "delayacct ",
-            "sysctl.kernel.task_delayacct=1",
+            "sysctl.kernel.task_delayacct=1 ",
+            "KTSTR_GUEST=1",
         )
         .to_string();
         let verbose = std::env::var("KTSTR_VERBOSE")
@@ -1209,14 +1200,6 @@ impl KtstrVm {
                 kvm::VIRTIO_NET_IRQ,
             ));
         }
-        if self.shm_size > 0 {
-            let mem_size = (memory_mb as u64) << 20;
-            let shm_base = mem_size - self.shm_size;
-            cmdline.push_str(&format!(
-                " KTSTR_SHM_BASE={:#x} KTSTR_SHM_SIZE={:#x}",
-                shm_base, self.shm_size
-            ));
-        }
         if self.topology.has_memory_only_nodes() {
             cmdline.push_str(" numa_balancing=enable");
         } else {
@@ -1236,18 +1219,8 @@ impl KtstrVm {
             initrd_addr,
             initrd_size,
             kernel_result.setup_header.as_ref(),
-            self.shm_size,
         )?;
         tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "cmdline_boot_params");
-
-        // Initialize SHM ring buffer.
-        let t0 = Instant::now();
-        if self.shm_size > 0 {
-            let mem_size = (memory_mb as u64) << 20;
-            let shm_base = mem_size - self.shm_size;
-            self.init_shm_region(&vm.guest_mem, shm_base)?;
-        }
-        tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "shm_ring_init");
 
         let t0 = Instant::now();
         mptable::setup_mptable(&vm.guest_mem, &self.topology)?;
@@ -1417,7 +1390,7 @@ impl KtstrVm {
             uncompressed_initramfs_bytes: uncompressed_size as u64,
             compressed_initrd_bytes: compressed_size as u64,
             kernel_init_size,
-            shm_bytes: self.shm_size,
+
         };
         let min_mb = initramfs_min_memory_mb(&budget);
         if memory_mb < min_mb {
@@ -1433,7 +1406,7 @@ impl KtstrVm {
             );
         }
 
-        let load_addr = aarch64_initrd_addr(memory_mb, self.shm_size, compressed_size as u64);
+        let load_addr = aarch64_initrd_addr(memory_mb, compressed_size as u64);
         let size = self.compress_and_load_initrd(vm, base_bytes, &suffix, &key, load_addr)?;
         Ok((Some(load_addr), Some(size)))
     }
@@ -1484,7 +1457,7 @@ impl KtstrVm {
             uncompressed_initramfs_bytes: uncompressed_size as u64,
             compressed_initrd_bytes: compressed_size as u64,
             kernel_init_size,
-            shm_bytes: self.shm_size,
+
         };
         let memory_mb = initramfs_min_memory_mb(&budget).max(self.memory_min_mb);
         tracing::debug!(
@@ -1501,7 +1474,7 @@ impl KtstrVm {
 
         // Compute load_addr only AFTER memory_mb is known (it determines
         // the FDT position, and the initrd sits just below FDT).
-        let load_addr = aarch64_initrd_addr(memory_mb, self.shm_size, compressed_size as u64);
+        let load_addr = aarch64_initrd_addr(memory_mb, compressed_size as u64);
 
         let size = self.compress_and_load_initrd(vm, base_bytes, &suffix, &key, load_addr)?;
         Ok((Some(load_addr), Some(size)))
@@ -1529,11 +1502,12 @@ impl KtstrVm {
             "console=ttyS0 ",
             "nomodules mitigations=off ",
             "random.trust_cpu=on swiotlb=noforce ",
-            "panic=-1 iomem=relaxed nokaslr lockdown=none ",
+            "panic=-1 nokaslr lockdown=none ",
             "sysctl.kernel.unprivileged_bpf_disabled=0 ",
             "sysctl.kernel.sched_schedstats=1 ",
             "delayacct sysctl.kernel.task_delayacct=1 ",
-            "kfence.sample_interval=0",
+            "kfence.sample_interval=0 ",
+            "KTSTR_GUEST=1",
         )
         .to_string();
         // earlycon is always enabled so the kernel has a console from
@@ -1553,14 +1527,6 @@ impl KtstrVm {
         if self.init_binary.is_some() {
             cmdline.push_str(" rdinit=/init initramfs_options=size=90%");
         }
-        if self.shm_size > 0 {
-            let mem_size = (memory_mb as u64) << 20;
-            let shm_base = kvm::DRAM_START + mem_size - self.shm_size;
-            cmdline.push_str(&format!(
-                " KTSTR_SHM_BASE={:#x} KTSTR_SHM_SIZE={:#x}",
-                shm_base, self.shm_size
-            ));
-        }
         if self.topology.has_memory_only_nodes() {
             cmdline.push_str(" numa_balancing=enable");
         } else {
@@ -1574,7 +1540,7 @@ impl KtstrVm {
         let t0 = Instant::now();
         boot::validate_cmdline(&cmdline)?;
 
-        let fdt_addr = aarch64::fdt::fdt_address(memory_mb, self.shm_size);
+        let fdt_addr = aarch64::fdt::fdt_address(memory_mb);
         let mpidrs =
             aarch64::topology::read_mpidrs(&vm.vcpus).context("read vCPU MPIDRs for FDT")?;
         let hw_cache_level = aarch64::topology::host_cache_levels();
@@ -1586,7 +1552,6 @@ impl KtstrVm {
             &cmdline,
             initrd_addr,
             initrd_size,
-            self.shm_size,
             hw_cache_level,
             guest_l1_unified,
             vm.numa_layout.as_ref().expect(
@@ -1610,15 +1575,6 @@ impl KtstrVm {
             "cmdline_fdt",
         );
 
-        // Initialize SHM ring buffer.
-        let t0 = Instant::now();
-        if self.shm_size > 0 {
-            let mem_size = (memory_mb as u64) << 20;
-            let shm_base = kvm::DRAM_START + mem_size - self.shm_size;
-            self.init_shm_region(&vm.guest_mem, shm_base)?;
-        }
-        tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "shm_ring_init");
-
         Ok(kernel_result)
     }
 
@@ -1626,7 +1582,7 @@ impl KtstrVm {
     pub(super) fn setup_vcpus_aarch64(&self, vm: &kvm::KtstrKvm, kernel_entry: u64) -> Result<()> {
         let t0 = Instant::now();
         let memory_mb = self.effective_memory_mb(&vm.guest_mem);
-        let fdt_addr = aarch64::fdt::fdt_address(memory_mb, self.shm_size);
+        let fdt_addr = aarch64::fdt::fdt_address(memory_mb);
         boot::setup_regs(&vm.vcpus[0], kernel_entry, fdt_addr)?;
         tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "bsp_setup");
         // APs start powered off via PSCI — no register setup needed.

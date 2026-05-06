@@ -88,6 +88,12 @@ const TASK_STORAGE_ITER_MAX: usize = 1_000_000;
 ///
 /// Untranslatable buckets and elems are skipped — the corresponding
 /// chain breaks but the walk continues into the next bucket.
+///
+/// Per-element short-read policy: a `read_bytes` call returning fewer
+/// bytes than `value_size` drops the entire entry rather than
+/// surfacing a partially-zeroed value buffer. Mirrors the
+/// [`super::htab::iter_htab_entries`] walker's policy; the renderer
+/// never sees mixed guest-data / scratch bytes for any element.
 pub(super) fn iter_local_storage_entries(
     ctx: &AccessorCtx<'_>,
     map: &BpfMapInfo,
@@ -134,7 +140,7 @@ pub(super) fn iter_local_storage_entries(
     let n_buckets = 1u32.checked_shl(bucket_log).unwrap_or(0);
     if n_buckets == 0 || n_buckets > TASK_STORAGE_BUCKETS_MAX {
         tracing::debug!(
-            map_name = %map.name,
+            map_name = %map.name(),
             bucket_log,
             n_buckets,
             cap = TASK_STORAGE_BUCKETS_MAX,
@@ -151,6 +157,18 @@ pub(super) fn iter_local_storage_entries(
 
     let mut out = Vec::new();
     let mut total_visited = 0usize;
+
+    // Per-walk owner cache: every selem links to a
+    // `bpf_local_storage` whose `owner` field identifies the owning
+    // task/cgroup/inode/sock. A single owner can appear behind many
+    // selems (a task with N local-storage maps under it has N
+    // selems all pointing at the same `bpf_local_storage`). Caching
+    // `local_storage_kva -> owner_kva` for the duration of one walk
+    // eliminates the redundant `translate_any_kva` page-table walk
+    // and the redundant `read_u64(ls_pa, ts.ls_owner)` for repeat
+    // owners. The cache is dropped at function return so a
+    // subsequent dump rebuilds it from the freshly-frozen guest.
+    let mut owner_cache: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
 
     for i in 0..n_buckets {
         let bucket_kva = buckets_kva + (i as u64) * (ts.bucket_size as u64);
@@ -202,8 +220,10 @@ pub(super) fn iter_local_storage_entries(
             let local_storage_kva = ctx.mem.read_u64(elem_pa, ts.elem_local_storage);
             let owner_kva = if local_storage_kva == 0 {
                 0
+            } else if let Some(&cached) = owner_cache.get(&local_storage_kva) {
+                cached
             } else {
-                match translate_any_kva(
+                let resolved = match translate_any_kva(
                     ctx.mem,
                     ctx.cr3_pa.0,
                     ctx.page_offset.0,
@@ -213,14 +233,31 @@ pub(super) fn iter_local_storage_entries(
                 ) {
                     Some(ls_pa) => ctx.mem.read_u64(ls_pa, ts.ls_owner),
                     None => 0,
-                }
+                };
+                owner_cache.insert(local_storage_kva, resolved);
+                resolved
             };
 
-            let mut val_buf = vec![0u8; value_size];
-            ctx.mem
-                .read_bytes(elem_pa + value_off_in_elem as u64, &mut val_buf);
-
-            out.push((owner_kva.to_le_bytes().to_vec(), val_buf));
+            // Skip the `vec![0u8; value_size]` zero-fill — every byte
+            // is overwritten by `read_bytes` below; a short read drops
+            // the entry to avoid handing a partial buffer to the
+            // renderer.
+            let mut val_buf: Vec<u8> = Vec::with_capacity(value_size);
+            // SAFETY: capacity == value_size; we set_len only after
+            // confirming `read_bytes` filled the requested length.
+            let slice =
+                unsafe { std::slice::from_raw_parts_mut(val_buf.as_mut_ptr(), value_size) };
+            let n = ctx
+                .mem
+                .read_bytes(elem_pa + value_off_in_elem as u64, slice);
+            if n == value_size {
+                // SAFETY: `n == value_size`, so every byte in
+                // `0..value_size` of the backing storage was written.
+                unsafe {
+                    val_buf.set_len(value_size);
+                }
+                out.push((owner_kva.to_le_bytes().to_vec(), val_buf));
+            }
 
             // Advance via the hlist link. With map_node at offset 0
             // of the elem, the chain `next` pointer is at

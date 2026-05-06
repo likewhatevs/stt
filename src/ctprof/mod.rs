@@ -2524,6 +2524,29 @@ struct AttachOutcome {
     >,
 }
 
+/// Cache value for the per-`(dev, ino)` probe cache in
+/// [`capture_with`]'s parallel probe phase. Captures BOTH the
+/// `JemallocProbe` (for the success path) and the
+/// `AttachError::tag()` string (for the failure path) so a
+/// cache hit can re-apply the same `attach_tag_counts` /
+/// `failed` bumps that the original miss applied via
+/// [`record_attach_outcome`]. Without `failed_tag`, repeat
+/// hits on a failed binary would credit only `tgids_walked` —
+/// the actionable failure (and its dominant-tag accounting)
+/// would be silently undercounted relative to actual attach
+/// volume.
+#[derive(Clone)]
+struct CachedAttachResult {
+    probe: Option<crate::host_thread_probe::JemallocProbe>,
+    /// `None` for the success path (`probe.is_some()`); `Some`
+    /// for every failure path, even non-actionable tags
+    /// (`jemalloc-not-found`, `readlink-failure`) — the
+    /// dominant-tag filter in [`ProbeSummary::dominant_tag`]
+    /// excludes those, but `attach_tag_counts` itself records
+    /// every tag for diagnostic completeness.
+    failed_tag: Option<&'static str>,
+}
+
 /// Stateless half of the per-tgid attach: read `pcomm` and run
 /// `attach_jemalloc_at` (the expensive ELF parse + DWARF walk).
 /// No summary mutation — the result is paired with `pcomm` and
@@ -2612,14 +2635,17 @@ fn record_attach_outcome(
     tgid: i32,
     outcome: AttachOutcome,
     summary: &mut ProbeSummary,
-) -> Option<crate::host_thread_probe::JemallocProbe> {
+) -> CachedAttachResult {
     summary.tgids_walked += 1;
     let AttachOutcome { pcomm, result } = outcome;
     match result {
         Ok(probe) => {
             summary.jemalloc_detected += 1;
             tracing::debug!(tgid, %pcomm, "ctprof probe: jemalloc detected");
-            Some(probe)
+            CachedAttachResult {
+                probe: Some(probe),
+                failed_tag: None,
+            }
         }
         Err(err) => {
             let tag = err.tag();
@@ -2630,7 +2656,10 @@ fn record_attach_outcome(
                 summary.failed += 1;
                 tracing::warn!(tgid, %pcomm, tag, err = %err, "ctprof probe: attach failed");
             }
-            None
+            CachedAttachResult {
+                probe: None,
+                failed_tag: Some(tag),
+            }
         }
     }
 }
@@ -2647,7 +2676,7 @@ fn try_attach_probe_for_tgid_at(
     summary: &mut ProbeSummary,
 ) -> Option<crate::host_thread_probe::JemallocProbe> {
     let outcome = attach_probe_for_tgid_at(proc_root, tgid);
-    record_attach_outcome(tgid, outcome, summary)
+    record_attach_outcome(tgid, outcome, summary).probe
 }
 
 /// Pull `(allocated_bytes, deallocated_bytes)` for one tid via the
@@ -2849,7 +2878,7 @@ fn capture_with(
     // and re-resolves the rewritten binary.
     let tgids = iter_tgids_at(proc_root);
     let probe_cache: std::sync::Mutex<
-        std::collections::HashMap<(u64, u64), Option<crate::host_thread_probe::JemallocProbe>>,
+        std::collections::HashMap<(u64, u64), CachedAttachResult>,
     > = std::sync::Mutex::new(std::collections::HashMap::new());
     let summary_mutex = std::sync::Mutex::new(ProbeSummary::default());
 
@@ -2939,13 +2968,54 @@ fn capture_with(
                                     .lock()
                                     .unwrap_or_else(|e| e.into_inner());
                                 s.tgids_walked += 1;
-                                if cached_result.is_some() {
-                                    s.jemalloc_detected += 1;
-                                    tracing::debug!(tgid, "ctprof probe: cache hit (jemalloc)");
-                                } else {
-                                    tracing::debug!(tgid, "ctprof probe: cache hit (not jemalloc or prior failure)");
+                                match &cached_result.failed_tag {
+                                    None => {
+                                        // Success path — original miss
+                                        // already credited
+                                        // `jemalloc_detected`. Re-apply
+                                        // here so cache hits stay
+                                        // symmetric with cache misses;
+                                        // without this, only the first
+                                        // sharer of a `(dev, ino)`
+                                        // would count toward
+                                        // `jemalloc_detected` and
+                                        // every subsequent reuse
+                                        // would silently undercount.
+                                        s.jemalloc_detected += 1;
+                                        tracing::debug!(tgid, "ctprof probe: cache hit (jemalloc)");
+                                    }
+                                    Some(tag) => {
+                                        // Failure path — re-apply the
+                                        // SAME bookkeeping
+                                        // [`record_attach_outcome`]
+                                        // applied on the original
+                                        // miss: bump
+                                        // `attach_tag_counts[tag]`
+                                        // unconditionally, and
+                                        // `failed` for actionable
+                                        // tags only (matching the
+                                        // dominant-tag filter in
+                                        // [`ProbeSummary::dominant_tag`]).
+                                        // Without this, repeat hits
+                                        // on a failed binary would
+                                        // credit only `tgids_walked`
+                                        // and the dominant-failure
+                                        // signal would degrade as
+                                        // shared-inode reuse climbs.
+                                        // Logging stays at debug level
+                                        // — the original miss already
+                                        // emitted the warn-level event
+                                        // for actionable tags; spamming
+                                        // a warn per cache hit would
+                                        // drown the operator log.
+                                        *s.attach_tag_counts.entry(tag).or_insert(0) += 1;
+                                        if !matches!(*tag, "jemalloc-not-found" | "readlink-failure") {
+                                            s.failed += 1;
+                                        }
+                                        tracing::debug!(tgid, tag, "ctprof probe: cache hit (prior failure)");
+                                    }
                                 }
-                                cached_result
+                                cached_result.probe
                             } else {
                                 // Stateless attach (the expensive ELF parse +
                                 // DWARF walk) runs OUTSIDE the summary mutex
@@ -2965,11 +3035,12 @@ fn capture_with(
                                     .unwrap_or_else(|e| e.into_inner());
                                 let res = record_attach_outcome(tgid, outcome, &mut s);
                                 drop(s);
+                                let probe = res.probe.clone();
                                 probe_cache
                                     .lock()
                                     .unwrap_or_else(|e| e.into_inner())
-                                    .insert(key, res.clone());
-                                res
+                                    .insert(key, res);
+                                probe
                             }
                         } else {
                             // No cache key — exe symlink unreadable. Same
@@ -2980,7 +3051,7 @@ fn capture_with(
                             let mut s = summary_mutex
                                 .lock()
                                 .unwrap_or_else(|e| e.into_inner());
-                            record_attach_outcome(tgid, outcome, &mut s)
+                            record_attach_outcome(tgid, outcome, &mut s).probe
                         }
                     }));
                     let probe = match result {

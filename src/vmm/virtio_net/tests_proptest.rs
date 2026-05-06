@@ -13,10 +13,11 @@
 //      via vcpu_panic::install_once and tears down the VM mid-test.
 //   2. Forward progress: for every TX kick, at least one of
 //      `used.idx` advance (TX or RX), `tx_packets`, `rx_packets`,
-//      `tx_chain_invalid`, `rx_chain_invalid`, `tx_dropped_no_rx_buffer`,
-//      `tx_add_used_failures`, or `rx_add_used_failures` shows movement.
-//      A silent stall (no advance, no counter) would let a hostile
-//      guest pin the queue indefinitely.
+//      `tx_chain_invalid`, `rx_chain_invalid`, `rx_write_failed`,
+//      `tx_dropped_no_rx_buffer`, `tx_add_used_failures`, or
+//      `rx_add_used_failures` shows movement. A silent stall (no
+//      advance, no counter) would let a hostile guest pin the
+//      queue indefinitely.
 //   3. Counter monotonicity: counters never decrement.
 //   4. Defined post-state: post-notify, the device's queue cursors and
 //      counter Arcs remain consistent with the pinned event taxonomy
@@ -309,6 +310,7 @@ struct CounterSnapshot {
     tx_dropped_no_rx_buffer: u64,
     tx_chain_invalid: u64,
     rx_chain_invalid: u64,
+    rx_write_failed: u64,
     tx_add_used_failures: u64,
     rx_add_used_failures: u64,
     invalid_avail_idx_count: u64,
@@ -324,6 +326,7 @@ fn snapshot_counters(dev: &VirtioNet) -> CounterSnapshot {
         tx_dropped_no_rx_buffer: c.tx_dropped_no_rx_buffer.load(Ordering::Relaxed),
         tx_chain_invalid: c.tx_chain_invalid.load(Ordering::Relaxed),
         rx_chain_invalid: c.rx_chain_invalid.load(Ordering::Relaxed),
+        rx_write_failed: c.rx_write_failed.load(Ordering::Relaxed),
         tx_add_used_failures: c.tx_add_used_failures.load(Ordering::Relaxed),
         rx_add_used_failures: c.rx_add_used_failures.load(Ordering::Relaxed),
         invalid_avail_idx_count: c.invalid_avail_idx_count.load(Ordering::Relaxed),
@@ -343,6 +346,7 @@ fn counter_delta(before: &CounterSnapshot, after: &CounterSnapshot) -> u64 {
         + (after.tx_dropped_no_rx_buffer - before.tx_dropped_no_rx_buffer)
         + (after.tx_chain_invalid - before.tx_chain_invalid)
         + (after.rx_chain_invalid - before.rx_chain_invalid)
+        + (after.rx_write_failed - before.rx_write_failed)
         + (after.tx_add_used_failures - before.tx_add_used_failures)
         + (after.rx_add_used_failures - before.rx_add_used_failures)
         + (after.invalid_avail_idx_count - before.invalid_avail_idx_count)
@@ -363,6 +367,7 @@ fn assert_counter_monotonicity(
     prop_assert!(after.tx_dropped_no_rx_buffer >= before.tx_dropped_no_rx_buffer);
     prop_assert!(after.tx_chain_invalid >= before.tx_chain_invalid);
     prop_assert!(after.rx_chain_invalid >= before.rx_chain_invalid);
+    prop_assert!(after.rx_write_failed >= before.rx_write_failed);
     prop_assert!(after.tx_add_used_failures >= before.tx_add_used_failures);
     prop_assert!(after.rx_add_used_failures >= before.rx_add_used_failures);
     prop_assert!(after.invalid_avail_idx_count >= before.invalid_avail_idx_count);
@@ -388,7 +393,7 @@ proptest! {
     /// Random TX descriptor chains with a well-formed RX target MUST
     /// produce forward progress: for every notify, at least one of
     /// `used.idx` advance (TX or RX), `tx_packets`, `rx_packets`,
-    /// `tx_chain_invalid`, `rx_chain_invalid`,
+    /// `tx_chain_invalid`, `rx_chain_invalid`, `rx_write_failed`,
     /// `tx_dropped_no_rx_buffer`, `tx_add_used_failures`,
     /// `rx_add_used_failures`, or `invalid_avail_idx_count` must
     /// show movement. A chain that left every counter and used.idx
@@ -459,9 +464,12 @@ proptest! {
     /// targets the RX-walk path inside `try_loopback_to_rx`. An
     /// arbitrary RX descriptor (random addr/len/flags) must either
     /// successfully accept the loopback delivery (rx_packets bumps),
-    /// reject it as malformed (rx_chain_invalid bumps), or fail
-    /// add_used (rx_add_used_failures bumps) — but never panic and
-    /// never silently lose the frame.
+    /// reject it as malformed for chain-shape (rx_chain_invalid
+    /// bumps), reject it for guest-memory write failure
+    /// (rx_write_failed bumps — chain shape OK but the
+    /// descriptor's GPA is unmapped), or fail add_used
+    /// (rx_add_used_failures bumps) — but never panic and never
+    /// silently lose the frame.
     #[test]
     fn rx_chain_progress_under_random_descriptors(
         rx_descs in fuzz_chain_strategy(),

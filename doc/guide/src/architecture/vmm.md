@@ -67,20 +67,33 @@ memory, sharing physical pages across concurrent VMs.
 
 ## Guest-host communication
 
-**Serial console** -- COM2 carries guest stdout/stderr and serves as
-a fallback result transport. Delimited test results (between
-`===KTSTR_TEST_RESULT_START===` / `===KTSTR_TEST_RESULT_END===` sentinels)
-and exit codes (`KTSTR_EXIT=N`) are written to COM2 as fallback when
-SHM is unavailable.
+**Serial console** -- COM2 carries guest stdout/stderr, the
+canonical crash diagnostic transport, and a fallback result
+transport. The guest panic hook writes `PANIC: <info>\n<bt>\n` to
+COM2; the host parses it via `extract_panic_message` and surfaces
+the backtrace in test failure output. Delimited test results
+(between `===KTSTR_TEST_RESULT_START===` /
+`===KTSTR_TEST_RESULT_END===` sentinels) and exit codes
+(`KTSTR_EXIT=N`) are also written to COM2 as a fallback when the
+TLV stream is unavailable.
 
-**SHM ring buffer** -- the primary guest-to-host data channel. A shared
-memory ring buffer carries scenario markers (`MSG_TYPE_SCENARIO_START`,
-`MSG_TYPE_SCENARIO_END`), test results (`MSG_TYPE_TEST_RESULT`), exit
-codes (`MSG_TYPE_EXIT`), stimulus events (`MSG_TYPE_STIMULUS`),
-scheduler exit notifications (`MSG_TYPE_SCHED_EXIT`), guest crash
-payloads (`MSG_TYPE_CRASH`), profraw coverage data (`MSG_TYPE_PROFRAW`),
-and per-payload-invocation metrics (`MSG_TYPE_PAYLOAD_METRICS`). Each
-entry has a CRC32 for integrity checking.
+**Virtio-console port 1 TLV stream** -- the primary guest-to-host
+data channel. Carries scenario markers (`MSG_TYPE_SCENARIO_START`,
+`MSG_TYPE_SCENARIO_END`), test results (`MSG_TYPE_TEST_RESULT`),
+exit codes (`MSG_TYPE_EXIT`), stimulus events (`MSG_TYPE_STIMULUS`),
+scheduler exit notifications (`MSG_TYPE_SCHED_EXIT`), profraw
+coverage data (`MSG_TYPE_PROFRAW`), per-payload-invocation metrics
+(`MSG_TYPE_PAYLOAD_METRICS`), and raw LlmExtract output
+(`MSG_TYPE_RAW_PAYLOAD_OUTPUT`). Each TLV frame has a CRC32 for
+integrity checking.
+
+**SHM ring buffer** -- the early-boot fallback for the TLV stream.
+When `/dev/vport0p1` is not yet available (multiport handshake in
+progress), `shm_ring::write_msg` falls back to the SHM ring; the
+host's bulk drain merges port-1 bytes with the SHM ring drain so
+messages emitted before the port came up still reach the test
+verdict. The SHM region also hosts the snapshot doorbell and
+signal-slot control plane.
 
 ## Virtio devices
 

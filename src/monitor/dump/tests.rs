@@ -18,6 +18,12 @@ use super::super::bpf_map::{
 // without this `use`.
 use super::*;
 use crate::monitor::btf_render::MemReader;
+// `name_from_str` is the shared helper that packs a `&str` into the
+// `(name_bytes, name_len)` representation used by
+// [`super::super::bpf_map::BpfMapInfo`]. Single source of truth in
+// [`crate::monitor::test_util`] — replaces the prior local
+// `map_name_bytes` copy that duplicated the logic verbatim.
+use crate::monitor::test_util::name_from_str;
 
 #[test]
 fn hex_dump_basic() {
@@ -3322,10 +3328,12 @@ fn build_ringbuf_scene(
 
 /// Build a `BpfMapInfo` for ringbuf tests with the given map_kva.
 fn ringbuf_map_info(map_kva: u64) -> super::super::bpf_map::BpfMapInfo {
+    let (name_bytes, name_len) = name_from_str("test_ringbuf");
     super::super::bpf_map::BpfMapInfo {
         map_pa: 0,
         map_kva,
-        name: "test_ringbuf".into(),
+        name_bytes,
+        name_len,
         map_type: super::super::bpf_map::BPF_MAP_TYPE_RINGBUF,
         map_flags: 0,
         key_size: 0,
@@ -3619,10 +3627,12 @@ fn build_stackmap_scene(
     }
 
     let map_kva = pa_to_kva(map_pa, page_offset);
+    let (name_bytes, name_len) = name_from_str("test_stack");
     let info = super::super::bpf_map::BpfMapInfo {
         map_pa: 0,
         map_kva,
-        name: "test_stack".into(),
+        name_bytes,
+        name_len,
         map_type: super::super::bpf_map::BPF_MAP_TYPE_STACK_TRACE,
         map_flags,
         key_size: 0,
@@ -3836,10 +3846,12 @@ fn build_fd_array_scene(
     }
 
     let map_kva = pa_to_kva(map_pa, page_offset);
+    let (name_bytes, name_len) = name_from_str("test_fd_array");
     let info = super::super::bpf_map::BpfMapInfo {
         map_pa: 0,
         map_kva,
-        name: "test_fd_array".into(),
+        name_bytes,
+        name_len,
         map_type,
         map_flags: 0,
         key_size: 0,
@@ -4000,10 +4012,12 @@ fn render_map_struct_ops_no_offsets_returns_error() {
     let kernel_ref = unsafe { &*(&kernel as *const _) };
     let accessor =
         super::super::bpf_map::GuestMemMapAccessor::new_for_test(kernel_ref, &offsets, 0);
+    let (name_bytes, name_len) = name_from_str("test_struct_ops");
     let info = super::super::bpf_map::BpfMapInfo {
         map_pa: 0,
         map_kva: pa_to_kva(0x1000, page_offset),
-        name: "test_struct_ops".into(),
+        name_bytes,
+        name_len,
         map_type: super::super::bpf_map::BPF_MAP_TYPE_STRUCT_OPS,
         map_flags: 0,
         key_size: 0,
@@ -4063,10 +4077,12 @@ fn render_map_struct_ops_unmapped_value_returns_error() {
         super::super::bpf_map::GuestMemMapAccessor::new_for_test(kernel_ref, &offsets, 0);
     // value_kva points outside the buffer (page_offset + far) so
     // the read_value translate fails.
+    let (name_bytes, name_len) = name_from_str("test_struct_ops");
     let info = super::super::bpf_map::BpfMapInfo {
         map_pa: 0,
         map_kva: pa_to_kva(0x1000, page_offset),
-        name: "test_struct_ops".into(),
+        name_bytes,
+        name_len,
         map_type: super::super::bpf_map::BPF_MAP_TYPE_STRUCT_OPS,
         map_flags: 0,
         key_size: 0,

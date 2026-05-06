@@ -23,11 +23,6 @@ pub(crate) fn verbose() -> bool {
         .unwrap_or(false)
 }
 
-/// SHM size for ktstr_test VMs: 16 MB. Sized for profraw (1-2 MB),
-/// stimulus events, exit code, and test results with mid-flight drain
-/// headroom.
-pub(crate) const KTSTR_TEST_SHM_SIZE: u64 = 16 * 1024 * 1024;
-
 /// Derive initramfs archive path, host path, and guest path from a
 /// scheduler's `config_file`. Returns `None` when no config file is set.
 pub(crate) fn config_file_parts(entry: &KtstrTestEntry) -> Option<(String, PathBuf, String)> {
@@ -42,19 +37,19 @@ pub(crate) fn config_file_parts(entry: &KtstrTestEntry) -> Option<(String, PathB
 }
 
 /// Build the shared `cmdline=` string appended to every ktstr_test
-/// guest boot. `iomem=relaxed`, per-scheduler sysctls, per-scheduler
-/// kargs, `RUST_BACKTRACE` / `RUST_LOG` propagation, and the host-
-/// resolved `KTSTR_SIDECAR_DIR` so the guest's `sidecar_dir()`
-/// returns the SAME path the host's freeze coordinator writes to.
-/// Without that propagation, host and guest each compute the run
-/// directory independently — the host walks `gix::discover` from a
-/// real workspace cwd and produces `{kernel}-{commit}` whereas the
+/// guest boot. Per-scheduler sysctls, per-scheduler kargs,
+/// `RUST_BACKTRACE` / `RUST_LOG` propagation, and the host-resolved
+/// `KTSTR_SIDECAR_DIR` so the guest's `sidecar_dir()` returns the
+/// SAME path the host's freeze coordinator writes to. Without that
+/// propagation, host and guest each compute the run directory
+/// independently — the host walks `gix::discover` from a real
+/// workspace cwd and produces `{kernel}-{commit}` whereas the
 /// guest's cwd is `/` (no git repo, no kernel env), yielding the
 /// `unknown-unknown` fallback. Anything the two VM-launch sites
 /// (`run_ktstr_test_inner` and `attempt_auto_repro`) previously
 /// re-implemented side-by-side lives here.
 pub(crate) fn build_cmdline_extra(entry: &KtstrTestEntry) -> String {
-    let mut parts = vec!["iomem=relaxed".to_string()];
+    let mut parts: Vec<String> = Vec::new();
     for s in entry.scheduler.sysctls() {
         parts.push(format!("sysctl.{}={}", s.key, s.value));
     }
@@ -208,7 +203,6 @@ pub(crate) fn build_vm_builder_base(
         .with_topology(vm_topology)
         .memory_deferred_min(memory_mb)
         .cmdline(cmdline_extra)
-        .shm_size(KTSTR_TEST_SHM_SIZE)
         .run_args(guest_args)
         .timeout(vm_timeout_from_entry(entry))
         .no_perf_mode(no_perf_mode);
@@ -337,7 +331,7 @@ mod tests {
     use super::super::test_helpers::{EnvVarGuard, lock_env};
 
     #[test]
-    fn build_cmdline_extra_includes_iomem_relaxed_by_default() {
+    fn build_cmdline_extra_default_is_sidecar_only() {
         let _lock = lock_env();
         // Make sure the env does not inject spurious RUST_BACKTRACE /
         // RUST_LOG entries that would break the default assertion.
@@ -354,7 +348,7 @@ mod tests {
             ..KtstrTestEntry::DEFAULT
         };
         let out = build_cmdline_extra(&entry);
-        assert_eq!(out, "iomem=relaxed KTSTR_SIDECAR_DIR=/tmp/ktstr-test");
+        assert_eq!(out, "KTSTR_SIDECAR_DIR=/tmp/ktstr-test");
     }
 
     #[test]
@@ -375,7 +369,7 @@ mod tests {
         let out = build_cmdline_extra(&entry);
         assert_eq!(
             out,
-            "iomem=relaxed sysctl.kernel.foo=1 quiet KTSTR_SIDECAR_DIR=/tmp/ktstr-test"
+            "sysctl.kernel.foo=1 quiet KTSTR_SIDECAR_DIR=/tmp/ktstr-test"
         );
     }
 
@@ -421,7 +415,7 @@ mod tests {
             ..KtstrTestEntry::DEFAULT
         };
         let out = build_cmdline_extra(&entry);
-        assert_eq!(out, "iomem=relaxed KTSTR_SIDECAR_DIR=/explicit/sidecar/dir");
+        assert_eq!(out, "KTSTR_SIDECAR_DIR=/explicit/sidecar/dir");
     }
 
     // -- resolve_vm_topology --

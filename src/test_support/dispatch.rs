@@ -813,6 +813,17 @@ fn run_ktstr_test_with_topo_and_flags(
 /// ResourceContention propagation site so every caller (including
 /// the library entry point `run_ktstr_test`) records it, not just
 /// the nextest dispatch path.
+///
+/// `ResourceContention` detection walks the FULL error chain via
+/// [`is_resource_contention`] (chain-walk predicate) plus a
+/// matching `e.chain().find_map(...)` extraction for the reason
+/// string. The eval-side `eval.rs` `"build ktstr_test VM"` and
+/// `"run ktstr_test VM"` wrappers nest the contention error under
+/// `.context(...)`, so a top-level `downcast_ref` on the outer
+/// error misses the inner cause. Without the chain walk a wrapped
+/// contention would land in the `Err(e)` arm below as a regular
+/// failure (exit 1) rather than the skip path (exit 0), turning
+/// every host-resource-exhausted run into a hard test failure.
 fn result_to_exit_code(result: Result<AssertResult>, expect_err: bool) -> i32 {
     match result {
         Ok(_) if expect_err => {
@@ -820,15 +831,22 @@ fn result_to_exit_code(result: Result<AssertResult>, expect_err: bool) -> i32 {
             1
         }
         Ok(_) => 0,
-        Err(e)
-            if e.downcast_ref::<crate::vmm::host_topology::ResourceContention>()
-                .is_some() =>
-        {
+        Err(e) if is_resource_contention(&e) => {
+            // Pull the reason string out of the same chain
+            // `is_resource_contention` walks. The `find_map` is
+            // total-by-construction here: `is_resource_contention`
+            // returned true iff at least one cause downcasts to
+            // `ResourceContention`, so the iterator below is
+            // guaranteed to yield `Some`. The fallback string is
+            // defensive only and would surface as a crate-internal
+            // bug if it ever appeared.
             let reason = e
-                .downcast_ref::<crate::vmm::host_topology::ResourceContention>()
-                .unwrap()
-                .reason
-                .clone();
+                .chain()
+                .find_map(|c| {
+                    c.downcast_ref::<crate::vmm::host_topology::ResourceContention>()
+                        .map(|rc| rc.reason.clone())
+                })
+                .unwrap_or_else(|| "<unknown>".to_string());
             crate::report::test_skip(format_args!("resource contention: {reason}"));
             0
         }
@@ -848,6 +866,86 @@ fn is_ignored(entry: &KtstrTestEntry) -> bool {
     entry.name.starts_with("demo_")
 }
 
+/// Walk [`KTSTR_TESTS`] once per process and emit a stderr
+/// `warning:` line for every duplicate `name` found.
+///
+/// Two entries with the same name would both match `find_test(name)`
+/// (which returns the FIRST match), so the second registration is
+/// silently shadowed — `cargo ktstr` would dispatch the first entry
+/// and the second entry's body would never run, with no diagnostic
+/// surfaced. The warning surfaces the collision so an operator can
+/// rename one of the `#[ktstr_test]` functions; discovery itself
+/// proceeds (find_test's first-wins behavior continues) so nextest's
+/// `--list` output still lands in stdout. A panic here would abort
+/// the whole listing — nextest would see no tests at all rather
+/// than a partial set with a clear warning. The first-wins
+/// shadowing remains a real bug, but the diagnostic is louder than
+/// silence and the tradeoff (operator sees the warning AND a
+/// usable test list) beats the alternative (operator sees a
+/// panic backtrace and no test list).
+///
+/// `OnceLock<()>` gates the walk to fire EXACTLY ONCE per process:
+/// every gauntlet variant resolves through `list_tests` (under
+/// nextest's discovery and budget paths), so without the gate a
+/// run with N variants would re-walk the slice N times and emit
+/// the same warning N times. Each duplicate name surfaces exactly
+/// once via the inner `seen`/`warned` HashSet pair so a
+/// triple-collision (three entries sharing one name) does not
+/// double-print the warning.
+///
+/// The pure detection logic lives in
+/// [`warn_duplicate_test_names_inner`] so the duplicate-walker
+/// is testable without process-wide global state. This wrapper
+/// only owns the `OnceLock<()>` gate and the
+/// `(KTSTR_TESTS, stderr)` plumbing.
+fn warn_duplicate_test_names_once() {
+    static CHECKED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    CHECKED.get_or_init(|| {
+        warn_duplicate_test_names_inner(KTSTR_TESTS.iter().map(|e| e.name), &mut std::io::stderr());
+    });
+}
+
+/// Pure walker behind [`warn_duplicate_test_names_once`]: walks
+/// the test-name iterator and emits one `warning:` line per
+/// duplicate name to `sink`. Each duplicate name surfaces
+/// exactly once (a triple-collision does NOT double-print)
+/// via the inner `warned` HashSet.
+///
+/// Extracted from the OnceLock-gated wrapper so the duplicate
+/// detection logic is testable without process-wide global
+/// state — the wrapper handles "fire once per process" via its
+/// own `OnceLock<()>` gate; this inner is a pure function over
+/// `(names, sink)`. The wrapper passes
+/// `KTSTR_TESTS.iter().map(|e| e.name)` as the iterator and
+/// `std::io::stderr()` as the sink.
+///
+/// `Result<(), std::io::Error>` is collapsed to ignore-on-write
+/// because the production wrapper writes to stderr where IO
+/// errors are unrecoverable; tests pass a `Vec<u8>` sink which
+/// never errors. The function name says "warn" — diagnostic
+/// channel — and matches the wrapper's pre-existing
+/// `eprintln!` semantics.
+fn warn_duplicate_test_names_inner<'a, W: std::io::Write>(
+    names: impl IntoIterator<Item = &'a str>,
+    sink: &mut W,
+) {
+    use std::collections::HashSet;
+    let names: Vec<&'a str> = names.into_iter().collect();
+    let mut seen: HashSet<&'a str> = HashSet::with_capacity(names.len());
+    let mut warned: HashSet<&'a str> = HashSet::new();
+    for name in names {
+        if !seen.insert(name) && warned.insert(name) {
+            let _ = writeln!(
+                sink,
+                "warning: ktstr_test: duplicate test name {name:?} registered in KTSTR_TESTS — \
+                 two `#[ktstr_test]` entries share this name; the SECOND entry is \
+                 silently shadowed (find_test returns the first registration). \
+                 rename one of the functions to disambiguate.",
+            );
+        }
+    }
+}
+
 /// Collect test names for nextest discovery (--list --format terse).
 ///
 /// Nextest calls the binary twice:
@@ -860,7 +958,15 @@ fn is_ignored(entry: &KtstrTestEntry) -> bool {
 /// When `KTSTR_BUDGET_SECS` is set, applies greedy coverage maximization
 /// to select the subset of tests that maximizes feature coverage within
 /// the time budget. Only selected tests are printed.
+///
+/// Calls [`warn_duplicate_test_names_once`] on the first invocation per
+/// process so duplicate registrations surface a stderr `warning:`
+/// line BEFORE any test name is printed (discovery itself proceeds
+/// — find_test's first-wins behavior continues, but the operator
+/// sees which name collided). Subsequent invocations are no-ops via
+/// the inner `OnceLock` gate.
 fn list_tests(ignored_only: bool) {
+    warn_duplicate_test_names_once();
     let raw = std::env::var("KTSTR_BUDGET_SECS").ok();
     let budget_secs: Option<f64> = raw.as_deref().and_then(|s| match s.parse::<f64>() {
         Ok(v) if v > 0.0 => Some(v),
@@ -1666,6 +1772,148 @@ mod tests {
         // lookup branch.
         let exit = run_gauntlet_test("__unit_test_dummy__/__no_such_preset__/__default__");
         assert_eq!(exit, 1);
+    }
+
+    // ---------------------------------------------------------------
+    // warn_duplicate_test_names_inner — pure duplicate-walker
+    // ---------------------------------------------------------------
+    //
+    // The OnceLock-gated `warn_duplicate_test_names_once` wrapper is
+    // process-wide and reads `KTSTR_TESTS` directly, so its emit-once
+    // semantics aren't observable from a unit test (the gate may
+    // already have fired from the production listing path during
+    // nextest discovery, or from a sibling test in this file). The
+    // pure inner walker is exposed exactly so its detection logic
+    // is testable without that global state — these tests pin the
+    // dedup invariants that actually matter:
+    //   1. No duplicates → no output (zero-emit on clean input).
+    //   2. Each duplicate name surfaces EXACTLY once even when the
+    //      same name appears 3+ times (the warned-set prevents
+    //      double-prints).
+    //   3. The emitted line embeds the offending name in
+    //      double-quoted form (the canonical `{name:?}` debug
+    //      format the production message uses) so tooling can
+    //      grep operator output for the collision.
+    //   4. Distinct duplicate names each produce one line —
+    //      independent collision groups must not blur into one.
+    //   5. An empty input is a no-op (defensive: exhaust early
+    //      before any HashSet alloc).
+
+    /// No duplicates → empty sink. Pins the zero-emit base case.
+    #[test]
+    fn warn_duplicate_test_names_inner_no_duplicates_writes_nothing() {
+        let mut sink = Vec::<u8>::new();
+        warn_duplicate_test_names_inner(["alpha", "beta", "gamma"], &mut sink);
+        assert!(
+            sink.is_empty(),
+            "clean input must produce zero diagnostic bytes; got {:?}",
+            String::from_utf8_lossy(&sink),
+        );
+    }
+
+    /// Empty input → no walking, no output. Defensive against a
+    /// regression that would crash on a zero-element HashSet
+    /// allocation or emit a spurious line on the empty path.
+    #[test]
+    fn warn_duplicate_test_names_inner_empty_input_writes_nothing() {
+        let mut sink = Vec::<u8>::new();
+        warn_duplicate_test_names_inner(std::iter::empty::<&str>(), &mut sink);
+        assert!(
+            sink.is_empty(),
+            "empty input must emit nothing; got {:?}",
+            String::from_utf8_lossy(&sink),
+        );
+    }
+
+    /// One duplicate name appearing twice → exactly one warning
+    /// line containing the duplicated name. Pins the basic
+    /// emit-on-collision contract.
+    #[test]
+    fn warn_duplicate_test_names_inner_emits_warning_for_duplicate() {
+        let mut sink = Vec::<u8>::new();
+        warn_duplicate_test_names_inner(["alpha", "beta", "alpha"], &mut sink);
+        let out = String::from_utf8(sink).expect("sink is utf-8");
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "single duplicate must emit exactly one line; got {lines:?}",
+        );
+        let line = lines[0];
+        assert!(
+            line.contains("warning: ktstr_test:"),
+            "warning prefix must be present (operator-actionable signal); \
+             got line: {line:?}",
+        );
+        // The duplicated name must appear in the canonical `{name:?}`
+        // double-quoted form so grep tooling can pull it out.
+        assert!(
+            line.contains("\"alpha\""),
+            "the duplicated name must appear in quoted form; got: {line:?}",
+        );
+        assert!(
+            !line.contains("\"beta\""),
+            "non-duplicate names must NOT appear in any warning; got: {line:?}",
+        );
+    }
+
+    /// A triple-collision (same name appearing 3 times) emits the
+    /// warning EXACTLY ONCE — the inner `warned` HashSet
+    /// suppresses the second and third occurrences. Pins the
+    /// "one warning per duplicated name" contract documented on
+    /// the public wrapper.
+    #[test]
+    fn warn_duplicate_test_names_inner_triple_collision_emits_once() {
+        let mut sink = Vec::<u8>::new();
+        warn_duplicate_test_names_inner(["dup", "dup", "dup"], &mut sink);
+        let out = String::from_utf8(sink).expect("sink is utf-8");
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "triple-collision must emit exactly one warning, not one-per-extra; \
+             got {lines:?} — a regression that drops the warned-set guard would \
+             surface here as 2 lines (one for the second, one for the third).",
+        );
+        assert!(
+            lines[0].contains("\"dup\""),
+            "warning must name the duplicated entry; got: {:?}",
+            lines[0],
+        );
+    }
+
+    /// Two distinct duplicate names → two warning lines (one per
+    /// collision group). A regression that collapses every
+    /// duplicate into a single warning would surface here as one
+    /// line instead of two.
+    #[test]
+    fn warn_duplicate_test_names_inner_independent_duplicates_each_warn() {
+        let mut sink = Vec::<u8>::new();
+        warn_duplicate_test_names_inner(
+            ["alpha", "beta", "alpha", "gamma", "beta"],
+            &mut sink,
+        );
+        let out = String::from_utf8(sink).expect("sink is utf-8");
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "two independent collision groups must produce two warnings; \
+             got {lines:?}",
+        );
+        let body = lines.join("\n");
+        assert!(
+            body.contains("\"alpha\""),
+            "first duplicate name must appear in output; got: {body:?}",
+        );
+        assert!(
+            body.contains("\"beta\""),
+            "second duplicate name must appear in output; got: {body:?}",
+        );
+        assert!(
+            !body.contains("\"gamma\""),
+            "non-duplicate `gamma` must NOT trigger a warning; got: {body:?}",
+        );
     }
 
     // -- host_capacity --

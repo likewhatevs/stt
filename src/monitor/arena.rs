@@ -46,15 +46,50 @@ use super::bpf_map::{BPF_MAP_TYPE_ARENA, BpfMapInfo};
 use super::btf_offsets::{find_struct, load_btf_from_path, member_byte_offset};
 use super::guest::GuestKernel;
 
-/// Page size assumed by the arena walker.
+/// Page size used by the arena walker, derived from the GUEST
+/// kernel's MMU configuration.
 ///
 /// `arena_alloc_pages` and `arena_vm_fault` both call
-/// `apply_to_page_range` on `PAGE_SIZE`-granular ranges, so 4 KiB is
-/// the kernel's own page-granule for arena. Aarch64 with 16 KiB or
-/// 64 KiB granules would diverge — those configurations are not
-/// supported by ktstr today (see [`super::reader::GuestMem`] page
-/// walker which also assumes 4 KiB lowest-level pages).
-const PAGE_SIZE: u64 = 4096;
+/// `apply_to_page_range` on `PAGE_SIZE`-granular ranges where
+/// `PAGE_SIZE` is the GUEST kernel's own MMU page size. The host's
+/// page size is irrelevant — ktstr can run a 16 KiB-granule guest
+/// on a 4 KiB-granule host (and vice versa), and the arena layout
+/// must match the guest's view.
+///
+/// On x86_64 the guest page granule is fixed at 4 KiB. On aarch64
+/// the granule is encoded in `TCR_EL1.TG1` (bits [31:30]):
+///   - `0b10` → 4 KiB
+///   - `0b01` → 16 KiB
+///   - `0b11` → 64 KiB
+///
+/// Falls back to 4 KiB when the architecture branches reject the
+/// register value (e.g. uninitialized `tcr_el1 == 0` on aarch64);
+/// the fallback is conservative — at worst the walker overscans a
+/// small arena and surfaces extra `pgoff` slots that translate to
+/// `None`. A guest with non-4 KiB granule whose `tcr_el1` reads
+/// zero would be a freeze-path bug elsewhere (the freeze
+/// coordinator polls until `tcr_el1` populates before snapshotting).
+fn guest_page_size(tcr_el1: u64) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let _ = tcr_el1;
+        4096
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        match (tcr_el1 >> 30) & 0x3 {
+            0b10 => 4096,
+            0b01 => 16384,
+            0b11 => 65536,
+            _ => 4096, // 0b00 reserved; conservative fallback
+        }
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        let _ = tcr_el1;
+        4096
+    }
+}
 
 /// `GUARD_SZ / 2` from `kernel/bpf/arena.c`.
 ///
@@ -72,12 +107,9 @@ const PAGE_SIZE: u64 = 4096;
 /// GUARD_SZ/2`, so the kernel-side accessible region starts
 /// `GUARD_HALF` past the raw `vm_struct.addr`. The walker must add
 /// this offset when translating user-VA to kern-VA.
-///
-/// Computed from [`PAGE_SIZE`] so a future granule change at the
-/// constant declaration above propagates without a second edit. Today
-/// ktstr pins PAGE_SIZE = 4 KiB (see the [`PAGE_SIZE`] doc), but the
-/// expression is granule-agnostic for forward compatibility.
-const GUARD_HALF: u64 = (1u64 << 16).next_multiple_of(PAGE_SIZE << 1) / 2;
+fn guard_half(page_size: u64) -> u64 {
+    (1u64 << 16).next_multiple_of(page_size << 1) / 2
+}
 
 /// Maximum number of pages the walker will translate per arena
 /// sequentially.
@@ -106,7 +138,7 @@ const MAX_ARENA_STRIDE_PROBES: u64 = 256;
 
 /// Defensive cap on the arena's address-range span, in bytes.
 ///
-/// The walker computes its span from `info.max_entries * PAGE_SIZE`
+/// The walker computes its span from `info.max_entries * page_size`
 /// (the BPF map's declared page capacity, see [`snapshot_arena`]).
 /// `bpf_arena_init` allows at most 4 GiB worth of pages by design —
 /// the BPF JIT addresses arena pointers via the low 32 bits of the
@@ -115,7 +147,7 @@ const MAX_ARENA_STRIDE_PROBES: u64 = 256;
 /// `kernel/bpf/arena.c`). A torn / corrupt `bpf_map.max_entries` or
 /// a freeze-time race against `arena_init` could yield a wild value;
 /// cap it here so the walker never multiplies a near-`u64::MAX` page
-/// count by `PAGE_SIZE` (overflow) or attempts to walk billions of
+/// count by the page size (overflow) or attempts to walk billions of
 /// pgoffs (live-lock on the freeze path).
 const MAX_VM_RANGE_BYTES: u64 = 0x1_0000_0000;
 
@@ -179,7 +211,13 @@ pub struct ArenaPage {
     /// `arena.user_vm_start`). Operators correlate this with the
     /// pointer values they see in BPF program output.
     pub user_addr: u64,
-    /// 4 KiB of page contents read from the guest.
+    /// One arena page's worth of bytes read from the guest. Length
+    /// matches the guest kernel's MMU page size: 4 KiB on x86_64
+    /// and on aarch64 with `TCR_EL1.TG1=0b10`; 16 KiB on aarch64
+    /// 16 KiB-granule kernels (Apple Silicon style); 64 KiB on
+    /// aarch64 64 KiB-granule kernels. The resolution lives in
+    /// [`guest_page_size`] — the snapshot stamps every captured
+    /// page at that size.
     pub bytes: Vec<u8>,
 }
 
@@ -201,12 +239,14 @@ pub struct ArenaSnapshot {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
     /// Total declared page count. Derived from
-    /// `max_entries * PAGE_SIZE` (the BPF map's declared page
-    /// capacity), not the user_vm window. Reflects any
-    /// [`MAX_VM_RANGE_BYTES`] cap. Surfaced alongside `pages.len()` so
-    /// consumers can see the allocated-vs-declared ratio.
+    /// `max_entries * page_size` (the BPF map's declared page
+    /// capacity, with `page_size` resolved from the guest's
+    /// TCR_EL1 via [`guest_page_size`]), not the user_vm window.
+    /// Reflects any [`MAX_VM_RANGE_BYTES`] cap. Surfaced alongside
+    /// `pages.len()` so consumers can see the
+    /// allocated-vs-declared ratio.
     pub declared_pages: u64,
-    /// True when `max_entries * PAGE_SIZE` exceeded
+    /// True when `max_entries * page_size` exceeded
     /// [`MAX_VM_RANGE_BYTES`] (4 GiB) and the walker capped the span
     /// before computing `declared_pages`. Indicates a torn / corrupt
     /// `bpf_arena` struct or a freeze-time race against initialization;
@@ -271,6 +311,8 @@ pub fn snapshot_arena(
 
     let mem = kernel.mem();
     let walk = kernel.walk_context();
+    let page_size = guest_page_size(walk.tcr_el1);
+    let guard_half_bytes = guard_half(page_size);
 
     // bpf_arena embeds bpf_map at offset 0, so map_kva == arena_kva.
     let arena_kva = info.map_kva;
@@ -325,11 +367,11 @@ pub fn snapshot_arena(
             ..ArenaSnapshot::default()
         };
     }
-    let kern_vm_start = vm_addr.wrapping_add(GUARD_HALF);
+    let kern_vm_start = vm_addr.wrapping_add(guard_half_bytes);
 
     // max_entries is the create-time page capacity; user_vm_end may
     // be 0 for arenas without userspace mmap.
-    let plan = ArenaWalkPlan::new((info.max_entries as u64) * PAGE_SIZE);
+    let plan = ArenaWalkPlan::new((info.max_entries as u64) * page_size, page_size);
 
     let mut snapshot = ArenaSnapshot {
         pages: Vec::new(),
@@ -341,51 +383,51 @@ pub fn snapshot_arena(
     };
 
     // Reusable scratch buffer for the per-page read. Sized once at
-    // PAGE_SIZE and reused across every captured page: on success
+    // `page_size` and reused across every captured page: on success
     // the buffer is moved into `ArenaPage` (one allocation per
     // captured page is unavoidable since each page owns its bytes),
     // then a fresh allocation refills the scratch on the next
     // `resize`. The win is the SKIP path — every translate-failure
-    // or short-read pgoff used to allocate-and-discard a 4 KiB
+    // or short-read pgoff used to allocate-and-discard a page-sized
     // zero-initialised buffer; now those paths reuse the existing
     // scratch capacity. On a sparse arena window (most pgoffs
     // unmapped) this collapses thousands of doomed allocations into
     // one. The hot path (freeze coordinator's dump pipeline) used
     // to dominate freeze-time wallclock on arenas with declared
     // pages > captured pages.
-    let mut scratch: Vec<u8> = Vec::with_capacity(PAGE_SIZE as usize);
+    let mut scratch: Vec<u8> = Vec::with_capacity(page_size as usize);
 
     // Closure: translate one pgoff to a page-content read; push
     // onto `snapshot.pages` if the translate + read succeed.
-    // Captures `mem`, `walk`, `kern_vm_start`, `user_vm_start`, and
-    // `scratch` (mutable — drained into the captured page on
-    // success).
+    // Captures `mem`, `walk`, `kern_vm_start`, `user_vm_start`,
+    // `page_size`, and `scratch` (mutable — drained into the
+    // captured page on success).
     let mut try_capture_page = |pgoff: u64, pages: &mut Vec<ArenaPage>| {
-        // user_vm_start + pgoff*PAGE_SIZE is a 64-bit value, but the
+        // user_vm_start + pgoff*page_size is a 64-bit value, but the
         // kernel composes the kern-VA from the LOW 32 bits only —
         // `uaddr32 = (u32)(arena->user_vm_start + pgoff * PAGE_SIZE)`
         // in arena_alloc_pages — since the user_vm window is capped
         // at SZ_4G and aligned so the low 32 bits cover the whole
         // span uniquely. Match the same truncation here.
-        let user_addr = user_vm_start.wrapping_add(pgoff * PAGE_SIZE);
+        let user_addr = user_vm_start.wrapping_add(pgoff * page_size);
         let kaddr = kern_vm_start.wrapping_add(user_addr & 0xFFFF_FFFF);
         let Some(pa) = mem.translate_kva(walk.cr3_pa, Kva(kaddr), walk.l5, walk.tcr_el1) else {
             return;
         };
-        // Translate guarantees a 4 KiB page-aligned PA; bound-check
+        // Translate guarantees a page-aligned PA; bound-check
         // against guest DRAM size in case a corrupt PTE points
         // past end-of-DRAM.
-        if pa + PAGE_SIZE > mem.size() {
+        if pa + page_size > mem.size() {
             return;
         }
-        // Resize the reusable scratch to PAGE_SIZE and zero-fill.
+        // Resize the reusable scratch to `page_size` and zero-fill.
         // After a previous capture moved the inner Vec out via
-        // `mem::take`, `scratch` is empty with PAGE_SIZE capacity;
+        // `mem::take`, `scratch` is empty with `page_size` capacity;
         // resize allocates exactly the new buffer's bytes, but
         // skipping iterations that hit the early returns above
         // never reach this line so their alloc is avoided entirely.
         scratch.clear();
-        scratch.resize(PAGE_SIZE as usize, 0);
+        scratch.resize(page_size as usize, 0);
         // `GuestMem::read_bytes` returns the actual byte count copied
         // (may be short when the PA crosses end-of-DRAM, even after
         // the bounds check above — DRAM can have non-contiguous
@@ -459,10 +501,10 @@ struct ArenaWalkPlan {
 }
 
 impl ArenaWalkPlan {
-    fn new(raw_span: u64) -> Self {
+    fn new(raw_span: u64, page_size: u64) -> Self {
         let span_capped = raw_span > MAX_VM_RANGE_BYTES;
         let span = raw_span.min(MAX_VM_RANGE_BYTES);
-        let declared_pages = span / PAGE_SIZE;
+        let declared_pages = span / page_size;
         let sequential_to = declared_pages.min(MAX_ARENA_PAGES);
         let truncated = declared_pages > sequential_to;
         let stride = if declared_pages > MAX_ARENA_PAGES {
@@ -542,9 +584,18 @@ mod tests {
     //   - large arena (declared > MAX_ARENA_PAGES) — sequential
     //     prefix + stride sweep
     //   - 4 GiB-cap (raw_span > MAX_VM_RANGE_BYTES) — span_capped flag,
-    //     declared_pages clamped to MAX_VM_RANGE_BYTES / PAGE_SIZE
+    //     declared_pages clamped to MAX_VM_RANGE_BYTES / page_size
     //   - corrupt span (raw_span = u64::MAX) — capped, flag set,
     //     no overflow
+
+    /// Page size used for ArenaWalkPlan unit tests. Production code
+    /// resolves the page size from [`guest_page_size`] (which decodes
+    /// the guest's `TCR_EL1.TG1`); the plan tests pin their math
+    /// against an explicit 4 KiB so they exercise the same shapes
+    /// regardless of the host the test runs on. Granule-specific
+    /// shapes have their own dedicated tests
+    /// (`arena_walk_plan_16k_granule_*`).
+    const TEST_PAGE_SIZE: u64 = 4096;
 
     #[test]
     fn arena_walk_plan_constants_sane() {
@@ -552,7 +603,6 @@ mod tests {
         // Pin them so a future tightening surfaces here, not in
         // snapshot_arena's runtime behavior.
         assert_eq!(MAX_VM_RANGE_BYTES, 0x1_0000_0000);
-        assert_eq!(PAGE_SIZE, 4096);
         assert_eq!(MAX_ARENA_PAGES, 4096);
         assert_eq!(MAX_ARENA_STRIDE_PROBES, 256);
     }
@@ -561,7 +611,7 @@ mod tests {
     fn arena_walk_plan_single_page() {
         // Smallest non-empty arena: one page. Sequential walk covers
         // it; no stride needed; no truncation.
-        let plan = ArenaWalkPlan::new(PAGE_SIZE);
+        let plan = ArenaWalkPlan::new(TEST_PAGE_SIZE, TEST_PAGE_SIZE);
         assert_eq!(plan.declared_pages, 1);
         assert!(!plan.span_capped);
         assert!(!plan.truncated);
@@ -573,7 +623,7 @@ mod tests {
     fn arena_walk_plan_exactly_max_arena_pages() {
         // declared == MAX_ARENA_PAGES: still no stride, no truncation.
         // Boundary case: MAX_ARENA_PAGES walks sequentially.
-        let plan = ArenaWalkPlan::new(MAX_ARENA_PAGES * PAGE_SIZE);
+        let plan = ArenaWalkPlan::new(MAX_ARENA_PAGES * TEST_PAGE_SIZE, TEST_PAGE_SIZE);
         assert_eq!(plan.declared_pages, MAX_ARENA_PAGES);
         assert!(!plan.truncated);
         assert_eq!(plan.sequential_to, MAX_ARENA_PAGES);
@@ -584,7 +634,7 @@ mod tests {
     fn arena_walk_plan_one_page_past_max() {
         // declared = MAX_ARENA_PAGES + 1: stride mode kicks in for
         // the single tail page; stride must be 1 (every page).
-        let plan = ArenaWalkPlan::new((MAX_ARENA_PAGES + 1) * PAGE_SIZE);
+        let plan = ArenaWalkPlan::new((MAX_ARENA_PAGES + 1) * TEST_PAGE_SIZE, TEST_PAGE_SIZE);
         assert_eq!(plan.declared_pages, MAX_ARENA_PAGES + 1);
         assert!(plan.truncated);
         assert_eq!(plan.sequential_to, MAX_ARENA_PAGES);
@@ -597,8 +647,8 @@ mod tests {
         // Sequential covers first 16 MiB; stride sweeps the remaining
         // ~1M-4096 pages with 256 probes -> stride = ceil((1M - 4096) / 256).
         let raw = MAX_VM_RANGE_BYTES;
-        let plan = ArenaWalkPlan::new(raw);
-        assert_eq!(plan.declared_pages, raw / PAGE_SIZE);
+        let plan = ArenaWalkPlan::new(raw, TEST_PAGE_SIZE);
+        assert_eq!(plan.declared_pages, raw / TEST_PAGE_SIZE);
         assert!(!plan.span_capped, "exactly 4 GiB is at the cap, not above");
         assert!(plan.truncated);
         assert_eq!(plan.sequential_to, MAX_ARENA_PAGES);
@@ -613,10 +663,10 @@ mod tests {
     #[test]
     fn arena_walk_plan_caps_at_4gib() {
         // Raw span 8 GiB (corrupt struct): span_capped flag set,
-        // declared_pages clamped to MAX_VM_RANGE_BYTES / PAGE_SIZE.
-        let plan = ArenaWalkPlan::new(2 * MAX_VM_RANGE_BYTES);
+        // declared_pages clamped to MAX_VM_RANGE_BYTES / page_size.
+        let plan = ArenaWalkPlan::new(2 * MAX_VM_RANGE_BYTES, TEST_PAGE_SIZE);
         assert!(plan.span_capped);
-        assert_eq!(plan.declared_pages, MAX_VM_RANGE_BYTES / PAGE_SIZE);
+        assert_eq!(plan.declared_pages, MAX_VM_RANGE_BYTES / TEST_PAGE_SIZE);
         assert!(plan.truncated);
         assert!(plan.stride.is_some());
     }
@@ -625,11 +675,11 @@ mod tests {
     fn arena_walk_plan_caps_corrupt_u64_max_span() {
         // Pathological: raw_span = u64::MAX. The cap must apply
         // BEFORE the span-to-pages division; without the cap,
-        // u64::MAX / PAGE_SIZE = ~4.5 quadrillion pages and the
+        // u64::MAX / page_size = ~4.5 quadrillion pages and the
         // pgoff loop would live-lock.
-        let plan = ArenaWalkPlan::new(u64::MAX);
+        let plan = ArenaWalkPlan::new(u64::MAX, TEST_PAGE_SIZE);
         assert!(plan.span_capped);
-        assert_eq!(plan.declared_pages, MAX_VM_RANGE_BYTES / PAGE_SIZE);
+        assert_eq!(plan.declared_pages, MAX_VM_RANGE_BYTES / TEST_PAGE_SIZE);
         assert!(plan.truncated);
     }
 
@@ -638,7 +688,7 @@ mod tests {
         // Edge: zero span. snapshot_arena can reach this with
         // max_entries=0; the plan must handle zero spans without
         // panicking or computing nonsense bounds.
-        let plan = ArenaWalkPlan::new(0);
+        let plan = ArenaWalkPlan::new(0, TEST_PAGE_SIZE);
         assert_eq!(plan.declared_pages, 0);
         assert!(!plan.span_capped);
         assert!(!plan.truncated);
@@ -652,7 +702,7 @@ mod tests {
         // the sweep walks every remaining page. Verify by simulating
         // the walk and counting positions.
         // declared = MAX_ARENA_PAGES + 50 -> tail = 50 -> stride = 1.
-        let plan = ArenaWalkPlan::new((MAX_ARENA_PAGES + 50) * PAGE_SIZE);
+        let plan = ArenaWalkPlan::new((MAX_ARENA_PAGES + 50) * TEST_PAGE_SIZE, TEST_PAGE_SIZE);
         assert_eq!(plan.stride, Some(1));
         let mut pgoff = plan.sequential_to;
         let mut visited = 0u64;
@@ -668,7 +718,7 @@ mod tests {
         // tail >> MAX_ARENA_STRIDE_PROBES: stride > 1, fewer probes
         // than tail pages. Verify the sweep visits exactly
         // approximately MAX_ARENA_STRIDE_PROBES positions.
-        let plan = ArenaWalkPlan::new(MAX_VM_RANGE_BYTES); // full 4 GiB
+        let plan = ArenaWalkPlan::new(MAX_VM_RANGE_BYTES, TEST_PAGE_SIZE); // full 4 GiB
         let mut pgoff = plan.sequential_to;
         let mut visited = 0u64;
         while pgoff < plan.declared_pages {
@@ -689,5 +739,75 @@ mod tests {
             "visited {visited}, expected ≥ {}-ish probes",
             MAX_ARENA_STRIDE_PROBES - 1
         );
+    }
+
+    /// `guard_half` mirrors the kernel's `bpf_arena_get_kern_vm_start`
+    /// `GUARD_SZ/2` formula. Pin the three legitimate page granules
+    /// (4 KiB, 16 KiB, 64 KiB) against the hand-computed values from
+    /// the doc comment so a regression in the
+    /// `next_multiple_of(page_size << 1)` math surfaces here.
+    #[test]
+    fn guard_half_matches_kernel_formula() {
+        // 4 KiB granule: round_up(65536, 8192) = 65536, /2 = 32768.
+        assert_eq!(guard_half(4096), 32768);
+        // 16 KiB granule: round_up(65536, 32768) = 65536, /2 = 32768.
+        assert_eq!(guard_half(16384), 32768);
+        // 64 KiB granule: round_up(65536, 131072) = 131072, /2 = 65536.
+        assert_eq!(guard_half(65536), 65536);
+    }
+
+    /// `guest_page_size` decodes `TCR_EL1.TG1` (bits [31:30]) into
+    /// the granule size on aarch64; on x86_64 it is fixed at 4 KiB
+    /// regardless of the input. Pin the four encodings + the
+    /// reserved fallback path so a regression in the bit math
+    /// surfaces here.
+    #[test]
+    fn guest_page_size_decodes_tg1() {
+        #[cfg(target_arch = "x86_64")]
+        {
+            // x86_64: page size is always 4 KiB, regardless of the
+            // (ignored) `tcr_el1` argument.
+            assert_eq!(guest_page_size(0), 4096);
+            assert_eq!(guest_page_size(0b01u64 << 30), 4096);
+            assert_eq!(guest_page_size(0b10u64 << 30), 4096);
+            assert_eq!(guest_page_size(0b11u64 << 30), 4096);
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            // TG1=0b10 → 4 KiB
+            assert_eq!(guest_page_size(0b10u64 << 30), 4096);
+            // TG1=0b01 → 16 KiB (Apple Silicon style)
+            assert_eq!(guest_page_size(0b01u64 << 30), 16384);
+            // TG1=0b11 → 64 KiB
+            assert_eq!(guest_page_size(0b11u64 << 30), 65536);
+            // TG1=0b00 (reserved) → conservative 4 KiB fallback
+            assert_eq!(guest_page_size(0), 4096);
+        }
+    }
+
+    /// 16 KiB-granule arena (Apple Silicon kernel build): a single
+    /// declared page is 16 KiB. With raw_span = 16384 the plan must
+    /// report `declared_pages = 1`, no stride. Pre-fix, `PAGE_SIZE`
+    /// was hardcoded to 4096 so 16384 / 4096 = 4 pages — wrong.
+    #[test]
+    fn arena_walk_plan_16k_granule_single_page() {
+        let plan = ArenaWalkPlan::new(16384, 16384);
+        assert_eq!(plan.declared_pages, 1);
+        assert!(!plan.span_capped);
+        assert!(!plan.truncated);
+        assert_eq!(plan.sequential_to, 1);
+        assert_eq!(plan.stride, None);
+    }
+
+    /// 16 KiB-granule arena at the 4 GiB cap: `declared_pages` =
+    /// 4 GiB / 16 KiB = 256 K. Pre-fix, the divisor was 4 KiB so
+    /// the count would have been 4x too large.
+    #[test]
+    fn arena_walk_plan_16k_granule_full_cap() {
+        let plan = ArenaWalkPlan::new(MAX_VM_RANGE_BYTES, 16384);
+        assert_eq!(plan.declared_pages, MAX_VM_RANGE_BYTES / 16384);
+        assert!(!plan.span_capped);
+        assert!(plan.truncated);
+        assert_eq!(plan.sequential_to, MAX_ARENA_PAGES);
     }
 }

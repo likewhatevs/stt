@@ -54,7 +54,7 @@
 //!    `KVM_IOEVENTFD`. The exact GPA is arch-dependent —
 //!    `MMIO_GAP_START + 0x3000` on x86_64,
 //!    `VIRTIO_NET_MMIO_BASE + VIRTIO_MMIO_SIZE` on aarch64 — and
-//!    the canonical value is exposed as `vmm::kvm::DOORBELL_MMIO_GPA`.
+//!    the canonical value is exposed as `an internal MMIO doorbell GPA (deleted)`.
 //!    The fd is owned by the freeze coordinator and polled
 //!    alongside its existing wake sources.
 //! 2. Guest [`Op::Snapshot`](crate::scenario::ops::Op::Snapshot)
@@ -110,7 +110,7 @@
 //! type-mismatched field bubbles up as a recoverable error rather
 //! than panicking.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use crate::monitor::btf_render::{RenderedMember, RenderedValue};
@@ -398,12 +398,44 @@ pub type WatchRegisterCallback =
 /// `WATCHPOINT_MAX_NON_EINTR_FAILURES`.
 pub const MAX_WATCH_SNAPSHOTS: usize = 3;
 
+/// Maximum number of [`FailureDumpReport`]s the bridge keeps. Captures
+/// driven by a Loop step with a unique tag per iteration would
+/// otherwise grow the storage map without bound — every report
+/// renders a full BTF tree (potentially hundreds of KB), so an
+/// uncapped bridge under hostile/runaway capture frequency drains
+/// host memory. The bridge enforces FIFO eviction at this cap so the
+/// most recent captures stay reachable; eviction logs a `tracing::warn!`
+/// naming the dropped tag so the operator sees the truncation.
+pub const MAX_STORED_SNAPSHOTS: usize = 64;
+
+/// Inner storage for [`SnapshotBridge::snapshots`]. Pairs the
+/// HashMap-keyed reports with a [`VecDeque`] tracking insertion
+/// order so the FIFO eviction in [`SnapshotBridge::store`] can pop
+/// the oldest tag in O(1) when the cap is reached.
+struct SnapshotStore {
+    reports: HashMap<String, FailureDumpReport>,
+    /// Insertion order of currently-resident keys. An overwrite of
+    /// an existing key MUST remove the prior entry from this deque
+    /// before pushing the fresh occurrence so the `reports.len()`
+    /// and `order.len()` invariants stay in lock-step.
+    order: VecDeque<String>,
+}
+
+impl SnapshotStore {
+    fn new() -> Self {
+        Self {
+            reports: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+}
+
 #[derive(Clone)]
 #[must_use = "dropping a SnapshotBridge discards the capture pipeline"]
 pub struct SnapshotBridge {
     capture: CaptureCallback,
     register_watch: Option<WatchRegisterCallback>,
-    snapshots: Arc<Mutex<HashMap<String, FailureDumpReport>>>,
+    snapshots: Arc<Mutex<SnapshotStore>>,
     watch_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
@@ -439,7 +471,7 @@ impl SnapshotBridge {
         Self {
             capture,
             register_watch: None,
-            snapshots: Arc::new(Mutex::new(HashMap::new())),
+            snapshots: Arc::new(Mutex::new(SnapshotStore::new())),
             watch_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
@@ -465,20 +497,40 @@ impl SnapshotBridge {
     /// - The host's callback rejected the request (symbol unresolved,
     ///   alignment violation, ioctl failure).
     pub fn register_watch(&self, symbol: &str) -> std::result::Result<(), String> {
-        let prev = self
-            .watch_count
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if prev >= MAX_WATCH_SNAPSHOTS {
-            // Roll back to keep the count accurate.
-            self.watch_count
-                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-            return Err(format!(
-                "Op::WatchSnapshot cap exceeded: scenario already registered \
-                 {MAX_WATCH_SNAPSHOTS} watchpoints ({MAX_WATCH_SNAPSHOTS} user \
-                 watchpoint slots occupied; slot 0 reserved for the error-class \
-                 exit_kind trigger). Drop a watch or use Op::Snapshot for a \
-                 time-driven capture instead."
-            ));
+        // Reserve a slot via compare_exchange so concurrent callers
+        // can never push the count past MAX_WATCH_SNAPSHOTS even
+        // transiently. The previous fetch_add+rollback path let two
+        // concurrent threads observe `prev < MAX` and increment past
+        // the cap before either rolled back, briefly violating the
+        // invariant `watch_count <= MAX_WATCH_SNAPSHOTS`.
+        loop {
+            let prev = self
+                .watch_count
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if prev >= MAX_WATCH_SNAPSHOTS {
+                return Err(format!(
+                    "Op::WatchSnapshot cap exceeded: scenario already registered \
+                     {MAX_WATCH_SNAPSHOTS} watchpoints ({MAX_WATCH_SNAPSHOTS} user \
+                     watchpoint slots occupied; slot 0 reserved for the error-class \
+                     exit_kind trigger). Drop a watch or use Op::Snapshot for a \
+                     time-driven capture instead."
+                ));
+            }
+            if self
+                .watch_count
+                .compare_exchange_weak(
+                    prev,
+                    prev + 1,
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                break;
+            }
+            // Lost the CAS to a concurrent register/unregister; reload
+            // and retry. spurious failures are also retried — that is
+            // why this uses the _weak variant inside a loop.
         }
         let Some(register) = self.register_watch.as_ref() else {
             self.watch_count
@@ -523,14 +575,49 @@ impl SnapshotBridge {
     /// coordinator after it runs `freeze_and_capture(false)` and
     /// wants to publish the resulting report on the bridge for the
     /// test author to drain post-VM-exit.
+    ///
+    /// Storage is capped at [`MAX_STORED_SNAPSHOTS`] entries to bound
+    /// host memory under runaway capture cadence (e.g. a Loop step
+    /// firing `Op::Snapshot` with a unique tag every iteration).
+    /// When the cap is reached, the oldest stored entry is evicted
+    /// with a `tracing::warn!` naming the dropped tag. An overwrite
+    /// of an existing tag also warns and replaces the prior report
+    /// in place without disturbing FIFO ordering of other entries.
     pub fn store(&self, name: &str, report: FailureDumpReport) {
-        let mut map = self.snapshots.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(existing) = map.insert(name.to_string(), report) {
+        let mut store = self.snapshots.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = store.reports.insert(name.to_string(), report) {
             tracing::warn!(
                 name,
                 schema = %existing.schema,
                 "SnapshotBridge::store: name already had a stored report; overwriting prior capture"
             );
+            // Move this tag to the back of the FIFO order so the
+            // overwrite refreshes its position (newest insertion =
+            // farthest from eviction). Without this, a hot-rewritten
+            // tag would still be the oldest and risk eviction even
+            // when actively updated.
+            if let Some(pos) = store.order.iter().position(|k| k == name) {
+                store.order.remove(pos);
+            }
+            store.order.push_back(name.to_string());
+            return;
+        }
+        store.order.push_back(name.to_string());
+        while store.reports.len() > MAX_STORED_SNAPSHOTS {
+            let Some(evicted) = store.order.pop_front() else {
+                // Defensive: if order is empty while reports is over
+                // cap something is desynchronised — clear reports to
+                // restore the invariant rather than loop forever.
+                store.reports.clear();
+                break;
+            };
+            if store.reports.remove(&evicted).is_some() {
+                tracing::warn!(
+                    evicted = %evicted,
+                    cap = MAX_STORED_SNAPSHOTS,
+                    "SnapshotBridge::store: cap reached, evicting oldest captured snapshot"
+                );
+            }
         }
     }
 
@@ -539,6 +626,7 @@ impl SnapshotBridge {
         self.snapshots
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .reports
             .len()
     }
 
@@ -547,14 +635,16 @@ impl SnapshotBridge {
         self.snapshots
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .reports
             .is_empty()
     }
 
     /// Take ownership of the captured snapshots, leaving the bridge
     /// empty.
     pub fn drain(&self) -> HashMap<String, FailureDumpReport> {
-        let mut map = self.snapshots.lock().unwrap_or_else(|e| e.into_inner());
-        std::mem::take(&mut *map)
+        let mut store = self.snapshots.lock().unwrap_or_else(|e| e.into_inner());
+        store.order.clear();
+        std::mem::take(&mut store.reports)
     }
 
     /// Install this bridge as the active bridge for the calling
@@ -1881,6 +1971,130 @@ mod tests {
         let cb: CaptureCallback = Arc::new(|_| None);
         let bridge = SnapshotBridge::new(cb);
         assert_send_sync(&bridge);
+    }
+
+    /// Filling [`SnapshotBridge`] beyond [`MAX_STORED_SNAPSHOTS`]
+    /// must FIFO-evict the oldest tag and keep the newest. Pins
+    /// the cap-and-evict invariant the doc on
+    /// [`SnapshotBridge::store`] claims (see lines 579–598 / 606–
+    /// 621): the `while reports.len() > MAX_STORED_SNAPSHOTS` loop
+    /// pops `order.front()` (the oldest insertion) and removes the
+    /// corresponding entry from `reports`. A regression that drops
+    /// the sweep, replaces FIFO with LIFO, or skips the
+    /// `reports.remove` step would surface here as either an
+    /// over-cap `len()` or the wrong tag missing/present.
+    #[test]
+    fn snapshot_bridge_store_fifo_evicts_oldest() {
+        let cb: CaptureCallback = Arc::new(|_| None);
+        let bridge = SnapshotBridge::new(cb);
+        // Insert exactly MAX_STORED_SNAPSHOTS distinct tags. The
+        // store invariant at the cap is `len() == cap`; nothing
+        // has been evicted yet.
+        for i in 0..MAX_STORED_SNAPSHOTS {
+            bridge.store(&format!("tag_{i:04}"), FailureDumpReport::default());
+        }
+        assert_eq!(
+            bridge.len(),
+            MAX_STORED_SNAPSHOTS,
+            "store at cap must hold exactly {MAX_STORED_SNAPSHOTS} entries",
+        );
+        // Insert one more — `tag_0000` (the oldest) must be the
+        // evicted FIFO front; the freshest tag must now be
+        // resident.
+        let overflow_tag = format!("tag_{MAX_STORED_SNAPSHOTS:04}");
+        bridge.store(&overflow_tag, FailureDumpReport::default());
+        assert_eq!(
+            bridge.len(),
+            MAX_STORED_SNAPSHOTS,
+            "post-overflow len must remain at cap (one in, one out)",
+        );
+        let drained = bridge.drain();
+        assert!(
+            !drained.contains_key("tag_0000"),
+            "FIFO eviction must drop the oldest tag (tag_0000)",
+        );
+        assert!(
+            drained.contains_key(&overflow_tag),
+            "newest tag ({overflow_tag}) must be resident after the overflow store",
+        );
+        // The other 63 originally-inserted tags (tag_0001 ..
+        // tag_0063) must all survive — the FIFO is one-in-one-out,
+        // not a wholesale flush.
+        for i in 1..MAX_STORED_SNAPSHOTS {
+            let tag = format!("tag_{i:04}");
+            assert!(
+                drained.contains_key(&tag),
+                "tag {tag} must survive single-overflow eviction",
+            );
+        }
+    }
+
+    /// Storing the same tag twice must REPLACE the report and
+    /// move the tag to the BACK of the FIFO order — refreshing
+    /// its position so a hot-rewritten tag does not stay near
+    /// the eviction front. Pins the overwrite-refresh invariant
+    /// the doc at lines 593–603 claims: on insert collision the
+    /// loop searches `order` for the existing tag, removes it,
+    /// then `push_back`s the fresh occurrence.
+    ///
+    /// The proof shape: pre-fill to cap with tag_0 .. tag_{cap-1},
+    /// re-store tag_0 (refreshing its position to back), then
+    /// store one fresh overflow tag. If overwrite-refresh
+    /// works, the evicted tag MUST be tag_1 (now the oldest);
+    /// without the refresh, tag_0 would stay at front and be
+    /// evicted instead.
+    #[test]
+    fn snapshot_bridge_store_overwrite_refreshes_position() {
+        let cb: CaptureCallback = Arc::new(|_| None);
+        let bridge = SnapshotBridge::new(cb);
+        for i in 0..MAX_STORED_SNAPSHOTS {
+            bridge.store(&format!("tag_{i:04}"), FailureDumpReport::default());
+        }
+        // Refresh tag_0 by overwriting it. The doc invariant: the
+        // overwrite path moves tag_0 from front to back of `order`
+        // and replaces its report in `reports`. Use a non-default
+        // schema to make the overwrite observable on the value
+        // side too.
+        let refreshed = FailureDumpReport {
+            schema: "refreshed".to_string(),
+            ..Default::default()
+        };
+        bridge.store("tag_0000", refreshed);
+        assert_eq!(
+            bridge.len(),
+            MAX_STORED_SNAPSHOTS,
+            "overwrite must not change resident count",
+        );
+        // Push one fresh overflow tag. With overwrite-refresh,
+        // the evicted entry is tag_0001 (now the FIFO front);
+        // without it, tag_0000 would still be front and would
+        // be evicted instead.
+        let overflow_tag = format!("tag_{MAX_STORED_SNAPSHOTS:04}");
+        bridge.store(&overflow_tag, FailureDumpReport::default());
+        let drained = bridge.drain();
+        assert!(
+            drained.contains_key("tag_0000"),
+            "tag_0000 must survive eviction — overwrite refreshed its FIFO \
+             position to the back. A regression to a no-refresh overwrite \
+             path would evict tag_0000 instead of tag_0001 here.",
+        );
+        assert_eq!(
+            drained
+                .get("tag_0000")
+                .expect("tag_0000 resident after overwrite")
+                .schema,
+            "refreshed",
+            "overwrite must replace the report value, not just refresh order",
+        );
+        assert!(
+            !drained.contains_key("tag_0001"),
+            "tag_0001 must be the evicted tag — refreshed tag_0000 displaced \
+             tag_0001 to the FIFO front",
+        );
+        assert!(
+            drained.contains_key(&overflow_tag),
+            "newest tag ({overflow_tag}) must be resident after the overflow store",
+        );
     }
 
     #[test]

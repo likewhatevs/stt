@@ -74,6 +74,133 @@ pub(crate) struct WalkContext {
     pub tcr_el1: u64,
 }
 
+/// Decoded aarch64 page-table walk parameters derived once from
+/// `TCR_EL1`.
+///
+/// Every aarch64 translate previously re-decoded `T1SZ`, `TG1`,
+/// `va_width`, `levels_below`, `stride`, `descaddrmask`, and the
+/// first-level `indexmask` from a fresh `tcr_el1` argument. Those
+/// fields are deterministic functions of `TCR_EL1`, and `TCR_EL1` is
+/// immutable post-boot on the guest (the kernel writes it once
+/// during early MMU bring-up in `__cpu_setup` and never modifies it
+/// after — see arch/arm64/mm/proc.S). Caching the decoded form on
+/// [`super::guest::GuestKernel`] (alongside the raw `tcr_el1`)
+/// elides the per-call decode — meaningful on the freeze hot path
+/// where each task enrichment performs dozens of translates per
+/// task.
+///
+/// Construction goes through [`Self::from_tcr_el1`], which returns
+/// `None` for the same configurations [`GuestMem::walk_aarch64`]
+/// would reject mid-walk: `tcr_el1 == 0`, `T1SZ == 0`, reserved
+/// `TG1 == 0b00`, `va_width < 4`, or `levels_below` outside `[1, 4]`.
+/// On x86_64 the struct is unused (the walker ignores TCR_EL1) and
+/// callers pass `None` through.
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)] // used only by walk_aarch64; x86_64 builds elide
+pub(crate) struct Aarch64WalkParams {
+    /// Raw `TCR_EL1` value the params were decoded from. Used by
+    /// [`GuestMem::translate_kva_with_aarch64_params`] as part of
+    /// the page-TLB cache key so a translation performed under one
+    /// TCR_EL1 cannot be reused under a different one (relevant on
+    /// a future suspend/resume path that re-runs `__cpu_setup`;
+    /// post-boot the value is immutable). Also lets a downstream
+    /// consumer detect a TCR change by comparing against a fresh
+    /// `tcr_el1` argument.
+    pub tcr_el1: u64,
+    /// Per-level index width in bits. 9 for 4 KiB, 11 for 16 KiB,
+    /// 13 for 64 KiB.
+    pub stride: u64,
+    /// Top-level page-table level (0..=3). The cascade descends from
+    /// here to level 3, the leaf.
+    pub start_level: u64,
+    /// Index mask for the first level: `!0 >> (64 - (va_width -
+    /// stride * (4-start_level)))`.
+    pub first_indexmask: u64,
+    /// Index mask for every subsequent level: `(1 << (stride+3)) - 1`.
+    pub indexmask_grainsize: u64,
+    /// Descriptor address mask: `((1 << 50) - 1) & !indexmask_grainsize`.
+    /// Strips the high attribute / SW bits at [63:50] and the low
+    /// granule bits, preserving the low OA bits [49:granule_log2].
+    /// Mirrors the kernel's `PTE_ADDR_LOW` from
+    /// `arch/arm64/include/asm/pgtable-hwdef.h`
+    /// (`((1 << (50 - PAGE_SHIFT)) - 1) << PAGE_SHIFT`).
+    ///
+    /// On non-LPA / non-LPA2 kernels bits [49:48] are RES0 by
+    /// hardware contract (Arm ARM D5.3), so the wider mask is
+    /// equivalent to a 48-bit mask in practice. The wider mask
+    /// matches the kernel's accessor for forward-compatibility:
+    /// FEAT_LPA on 64 KiB pages (which ktstr.kconfig leaves
+    /// disabled) places OA bits [49:48] in this region, and only
+    /// the high splice (bits [51:48] of OA in descriptor bits
+    /// [15:12]) is then missing. FEAT_LPA2 (TCR_EL1.DS=1) is
+    /// rejected by [`Self::from_tcr_el1`] because its OA encoding
+    /// also requires a separate splice from descriptor bits [9:8].
+    pub descaddrmask: u64,
+}
+
+#[cfg(target_arch = "aarch64")]
+impl Aarch64WalkParams {
+    /// Decode `TCR_EL1` into walk parameters, returning `None` for
+    /// the same configurations [`GuestMem::walk_aarch64`] would
+    /// reject mid-walk.
+    ///
+    /// Rejects FEAT_LPA2 (`TCR_EL1.DS == 1`, bit 59) because the
+    /// walker's [`Self::descaddrmask`] cannot recover OA bits
+    /// [51:50] from descriptor bits [9:8] — those bits are masked
+    /// out as low descriptor metadata. Without that splice, valid
+    /// LPA2 PTEs translate to wrong PAs that read attacker-controlled
+    /// guest memory or out-of-range addresses. Returning `None` here
+    /// makes the walker fail loudly instead — the caller surfaces it
+    /// as "translation failed" rather than reading the wrong page.
+    pub(crate) fn from_tcr_el1(tcr_el1: u64) -> Option<Self> {
+        if tcr_el1 == 0 {
+            return None;
+        }
+        // TCR_EL1.DS (bit 59) selects FEAT_LPA2 when set. The walker
+        // does not support the 52-bit OA splice required for LPA2;
+        // the kernel's `lpa2_is_enabled` (arch/arm64/include/asm/
+        // pgtable-prot.h) reads exactly this bit.
+        if tcr_el1 & (1u64 << 59) != 0 {
+            return None;
+        }
+        let t1sz = (tcr_el1 >> 16) & 0x3F;
+        if t1sz == 0 {
+            return None;
+        }
+        let tg1 = (tcr_el1 >> 30) & 0x3;
+        let stride: u64 = match tg1 {
+            0b11 => 13,       // 64 KiB
+            0b01 => 11,       // 16 KiB
+            0b10 => 9,        // 4 KiB
+            _ => return None, // 0b00 reserved
+        };
+        let va_width = 64u64.saturating_sub(t1sz);
+        if va_width < 4 {
+            return None;
+        }
+        let levels_below = (va_width - 4) / stride;
+        if levels_below == 0 || levels_below > 4 {
+            return None;
+        }
+        let start_level: u64 = 4 - levels_below;
+        let indexmask_grainsize: u64 = (!0u64) >> (64 - (stride + 3));
+        let first_indexmask: u64 =
+            (!0u64) >> (64 - (va_width - stride * (4 - start_level)));
+        // PTE_ADDR_LOW = bits [49:PAGE_SHIFT]. On non-LPA / non-LPA2
+        // kernels bits [49:48] are RES0; matching the kernel's
+        // accessor is forward-compatible at zero behaviour cost.
+        let descaddrmask: u64 = ((!0u64) >> (64 - 50)) & !indexmask_grainsize;
+        Some(Self {
+            tcr_el1,
+            stride,
+            start_level,
+            first_indexmask,
+            indexmask_grainsize,
+            descaddrmask,
+        })
+    }
+}
+
 /// Host pointer to the start of guest DRAM. Offsets passed to read/write
 /// methods are DRAM-relative (x86_64: GPA 0, aarch64: GPA DRAM_START).
 ///
@@ -90,6 +217,66 @@ pub(crate) struct WalkContext {
 pub struct GuestMem {
     size: u64,
     regions: Vec<MemRegion>,
+    /// Software TLB: caches the most recent successful KVA→PA
+    /// translation. Cache key is `(cr3_pa, l5, tcr_el1, kva_page)`
+    /// — every input the walker consumes (page-table root, walk
+    /// mode, page-aligned KVA), see [`TlbEntry`].
+    /// Sequential reads of structs that span a single page (e.g. a
+    /// `bpf_map` struct, a `bpf_htab_elem`, a chained
+    /// `sched_domain` walk) translate the same page repeatedly; the
+    /// TLB collapses N walks into 1 walk + (N-1) compare-and-load.
+    /// Unmapped pages are not cached — only successful walks update
+    /// the slot, so a probe of an unmapped KVA still walks the page
+    /// tables but does not pollute the TLB. A mismatch on any key
+    /// field bypasses the cache.
+    ///
+    /// `Mutex<Option<TlbEntry>>` rather than `RefCell` because
+    /// `GuestMem` is `Sync` (see the unsafe `Sync` impl below) and
+    /// the freeze coordinator's read paths run from multiple
+    /// threads (the monitor sampler, the freeze rendezvous, the
+    /// dump renderer). `RefCell` would require `!Sync` which would
+    /// break every existing caller. The lock is held only for the
+    /// duration of one compare-and-load (lookup) or one struct
+    /// store (populate), so contention is non-existent — the
+    /// freeze coordinator is single-threaded for the per-dump read
+    /// path that dominates this cache.
+    page_tlb: std::sync::Mutex<Option<TlbEntry>>,
+}
+
+/// Single-slot software TLB entry. The walker only caches successful
+/// translations: an unmapped KVA leaves the slot untouched.
+///
+/// The cache key is `(cr3_pa, l5, tcr_el1, kva_page)` — every input
+/// to the underlying page walker that would change the resolution
+/// must match for a hit. Without the walk-mode fields a 4-level
+/// translation would be reused under a 5-level lookup (x86 LA57)
+/// or under a different aarch64 TG1/T1SZ configuration, returning a
+/// PA that the walker would never have produced for the new mode.
+/// In practice `l5` and `tcr_el1` are immutable post-boot, but a
+/// future suspend/resume-and-reconfigure path that re-runs
+/// `__cpu_setup` would land here, and gating on the inputs costs
+/// only two compares per hit.
+#[derive(Debug, Clone, Copy)]
+struct TlbEntry {
+    /// Page-table root the translation was performed against.
+    /// Mismatch with the next walk's `cr3_pa` invalidates the entry.
+    cr3_pa: u64,
+    /// 5-level paging flag (x86 LA57). Mismatch invalidates the
+    /// entry — a PML5-rooted walk does not match a PML4-rooted walk
+    /// even when the top-level table PA happens to coincide.
+    l5: bool,
+    /// Cached aarch64 TCR_EL1 (granule + T1SZ + DS bits). Mismatch
+    /// invalidates the entry — different TG1/T1SZ produce different
+    /// translations for the same KVA. Always 0 on x86_64 where the
+    /// register does not exist; gating still costs nothing because
+    /// every translate passes the same constant 0.
+    tcr_el1: u64,
+    /// Page-aligned KVA (low 12 bits cleared) the entry covers.
+    /// Subsequent translates of any KVA in `[kva_page, kva_page +
+    /// 4 KiB)` reuse the cached PA without walking.
+    kva_page: u64,
+    /// Page-aligned PA the cached KVA's page resolved to.
+    pa_page: u64,
 }
 
 // SAFETY: `MemRegion::host_ptr` values point into KVM mmap'd
@@ -139,6 +326,7 @@ impl GuestMem {
                 offset: 0,
                 size,
             }],
+            page_tlb: std::sync::Mutex::new(None),
         }
     }
 
@@ -162,7 +350,11 @@ impl GuestMem {
             .map(|r| r.offset + r.size)
             .max()
             .expect("non-empty");
-        Self { size, regions }
+        Self {
+            size,
+            regions,
+            page_tlb: std::sync::Mutex::new(None),
+        }
     }
 
     /// Build a multi-region GuestMem from a NUMA memory layout.
@@ -200,6 +392,7 @@ impl GuestMem {
         Self {
             size: total_size,
             regions,
+            page_tlb: std::sync::Mutex::new(None),
         }
     }
 
@@ -232,6 +425,28 @@ impl GuestMem {
             return None;
         }
         Some(ptr)
+    }
+
+    /// Bytes remaining in the [`MemRegion`] that contains `pa`, from
+    /// `pa` to that region's end. Returns 0 when `pa` falls outside
+    /// every region (out-of-bounds PA or in a hole between regions —
+    /// `from_layout` lays out one [`MemRegion`] per NUMA node, which
+    /// can leave gaps in DRAM-relative space if the layout reserves
+    /// holes).
+    ///
+    /// Callers that issue bulk reads / writes against a contiguous
+    /// PA span use this to cap their per-call length so the underlying
+    /// [`Self::read_bytes`] / [`Self::write_bytes`] does not silently
+    /// short-return at a region boundary. The bulk methods clamp to
+    /// the resolved region's `region_avail` themselves; this accessor
+    /// lets callers detect the boundary up front and split their work
+    /// across regions instead of treating the short return as an
+    /// error.
+    pub(crate) fn region_avail(&self, pa: u64) -> u64 {
+        match self.resolve_ptr(pa) {
+            Some((_, avail)) => avail,
+            None => 0,
+        }
     }
 
     /// Resolve a DRAM-relative byte offset to a host pointer plus the
@@ -490,7 +705,12 @@ impl GuestMem {
         self.read_u64(pa, offset) as i64
     }
 
-    /// Write a u8 at DRAM offset `pa + offset`.
+    /// Write a u8 at DRAM offset `pa + offset`. Currently exercised
+    /// only by unit tests that round-trip `read_u8` against the
+    /// shared `write_scalar` path; production no longer writes any
+    /// host→guest byte through this method (the SysRq-D dump
+    /// signal moved to the virtio-console wake byte).
+    #[allow(dead_code)]
     pub fn write_u8(&self, pa: u64, offset: usize, val: u8) {
         self.write_scalar::<1>(pa, offset, val.to_ne_bytes());
     }
@@ -516,11 +736,25 @@ impl GuestMem {
         match self.resolve_ptr(pa) {
             Some((ptr, region_avail)) => {
                 let copy_len = avail.min(region_avail as usize);
-                // SAFETY: `copy_len <= region_avail`, so the write stays
-                // within the mmap that `ptr` points into. The mapping
-                // is shared MAP_SHARED with the guest; writes are
-                // observable through `ptr::read_volatile` on the
-                // guest side.
+                // SAFETY: `copy_len <= region_avail`, so the write
+                // stays within the mmap that `ptr` points into. The
+                // mapping is MAP_SHARED with the guest.
+                //
+                // `copy_nonoverlapping` is NOT a volatile store and
+                // does not by itself synchronize the bytes with a
+                // guest reader: the host compiler is free to reorder
+                // it with surrounding accesses, and there is no
+                // hardware fence. Production callers
+                // (`vmm::freeze_coord::write_snapshot_reply`)
+                // publish these bytes by following the bulk write
+                // with an `std::sync::atomic::fence(Ordering::Release)`
+                // and a volatile `write_u32` of the reply id; the
+                // guest acquires via the matching volatile read of
+                // the reply id, so the bulk bytes are observable
+                // once the reply id transitions. Direct callers
+                // without that downstream publish MUST use the
+                // volatile `write_u32` / `write_u64` scalar helpers
+                // instead.
                 unsafe {
                     std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, copy_len);
                 }
@@ -528,6 +762,34 @@ impl GuestMem {
             }
             None => 0,
         }
+    }
+
+    /// Write `data` into DRAM starting at offset `pa + offset`.
+    ///
+    /// Same bounds-clipping contract as [`Self::write_bytes`]:
+    /// writes that would extend past the end of the resolved region
+    /// are truncated and the returned count reflects what actually
+    /// landed. The bytes go through `copy_nonoverlapping`, NOT a
+    /// volatile store — observability to the guest comes from a
+    /// downstream publish (atomic fence + volatile u32) on the
+    /// caller side; see [`Self::write_bytes`] for the production
+    /// example.
+    ///
+    /// The `offset` parameter is preserved as a kernel-friendly API:
+    /// every translated guest PA is paired with an in-page offset on
+    /// the read path ([`Self::read_bytes`] callers add `offset` to
+    /// `pa` themselves), and `checked_add` here rejects callers
+    /// whose `pa + offset` would wrap. The current production caller
+    /// ([`super::bpf_map::write_bpf_map_value`] via [`super::bpf_map::chunked_kva_io`])
+    /// passes `offset=0` because the chunked walker already returns
+    /// per-page PAs; future callers that already hold a base PA and
+    /// want to splice in a field offset can pass non-zero without
+    /// rewriting the wraparound guard.
+    pub fn write_bytes_at(&self, pa: u64, offset: usize, data: &[u8]) -> usize {
+        let Some(addr) = pa.checked_add(offset as u64) else {
+            return 0;
+        };
+        self.write_bytes(addr, data)
     }
 
     /// Read `len` bytes from DRAM offset `pa` into `buf`.
@@ -556,10 +818,12 @@ impl GuestMem {
         }
     }
 
-    /// Write a u32 at DRAM offset `pa + offset`. Used by the freeze
-    /// coordinator's snapshot doorbell handler to stamp the reply id
-    /// and status fields back into the guest's SHM region after a
-    /// CAPTURE / WATCH request completes.
+    /// Write a u32 at DRAM offset `pa + offset`. Production callers
+    /// retired with the snapshot-doorbell TLV migration; preserved for
+    /// the `write_scalar::<4>` boundary tests below and external test
+    /// fixtures (`bpf_map`, `dump`) that splice u32 fields into mock
+    /// guest memory.
+    #[allow(dead_code)]
     pub fn write_u32(&self, pa: u64, offset: usize, val: u32) {
         self.write_scalar::<4>(pa, offset, val.to_ne_bytes());
     }
@@ -582,6 +846,18 @@ impl GuestMem {
     /// `KVM_GET_ONE_REG` once at coordinator start.
     /// Returns `None` if any level is not present or the address is
     /// out of guest memory bounds.
+    ///
+    /// Successful translations populate the single-slot software TLB
+    /// (`page_tlb`) so the next translate of any KVA in the same
+    /// 4 KiB page returns without walking. The TLB caches only
+    /// successful walks — an unmapped KVA does not pollute the slot,
+    /// so a re-probe of the same address still hits the page-table
+    /// walker. Cross-`cr3_pa` access invalidates the slot implicitly
+    /// (the entry's `cr3_pa` field is compared on lookup); the
+    /// `l5` and `tcr_el1` walk-mode inputs are also part of the
+    /// cache key so a switch between 4-level and 5-level paging
+    /// (or a hypothetical aarch64 TCR_EL1 change) cannot return a
+    /// translation built under a different walk configuration.
     pub(crate) fn translate_kva(
         &self,
         cr3_pa: u64,
@@ -589,20 +865,154 @@ impl GuestMem {
         l5: bool,
         tcr_el1: u64,
     ) -> Option<u64> {
+        // 4 KiB software TLB: caches at the lowest sub-granule
+        // common to every walker. The aarch64 walker's smallest
+        // leaf is 16 KiB or 64 KiB depending on TCR_EL1.TG1, and
+        // the x86 walker's smallest leaf is 4 KiB; caching at 4 KiB
+        // is safe for both because any KVA in a larger leaf
+        // projects 1:1 into the 4 KiB-aligned slice with the same
+        // PA-to-KVA mapping (the leaf is contiguous PA-wise). 2 MiB
+        // / 1 GiB block descriptors and the 16 KiB / 64 KiB
+        // aarch64 granules all satisfy this property, so the
+        // single-slot cache is correct even when the underlying
+        // PTE covers more bytes than the cache key.
+        const PAGE: u64 = 4096;
+        let kva_bits = kva.0;
+        let kva_page = kva_bits & !(PAGE - 1);
+        // Recover from poison rather than silently bypassing the
+        // cache: matches the `maps_cache` /
+        // `per_cpu_offsets_cache` mutex handling in
+        // [`super::bpf_map`]. The TLB is a pure cache of already-
+        // computed PAs; a panic in a previous holder doesn't
+        // corrupt the entry's bytes, and bypass-on-poison would
+        // silently drop every subsequent hit.
+        {
+            let guard = self
+                .page_tlb
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(entry) = guard.as_ref()
+                && entry.cr3_pa == cr3_pa
+                && entry.l5 == l5
+                && entry.tcr_el1 == tcr_el1
+                && entry.kva_page == kva_page
+            {
+                return Some(entry.pa_page | (kva_bits & (PAGE - 1)));
+            }
+        }
+
+        let walk_result;
         #[cfg(target_arch = "x86_64")]
         {
             let _ = tcr_el1; // aarch64-only register; ignored on x86_64
-            if l5 {
+            walk_result = if l5 {
                 self.walk_5level(cr3_pa, kva)
             } else {
                 self.walk_4level(cr3_pa, kva)
-            }
+            };
         }
         #[cfg(target_arch = "aarch64")]
         {
             let _ = l5; // x86-only flag; aarch64 reads TCR_EL1 instead
-            self.walk_aarch64(cr3_pa, kva, tcr_el1)
+            walk_result = self.walk_aarch64(cr3_pa, kva, tcr_el1);
         }
+
+        if let Some(pa) = walk_result {
+            let mut guard = self
+                .page_tlb
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *guard = Some(TlbEntry {
+                cr3_pa,
+                l5,
+                tcr_el1,
+                kva_page,
+                pa_page: pa & !(PAGE - 1),
+            });
+        }
+        walk_result
+    }
+
+    /// Translate a KVA using a pre-decoded [`Aarch64WalkParams`] on
+    /// aarch64; uses the standard 4-level / 5-level walk on x86_64.
+    ///
+    /// The cached caller (`super::guest::GuestKernel`'s
+    /// `read_kva_*` helpers) builds the params once at construction
+    /// from the guest's TCR_EL1 and passes them on every translate
+    /// to elide the per-call `T1SZ`/`TG1` decode. On x86_64 the
+    /// `_params` argument is ignored; the path exists for cross-
+    /// arch callers that build the cache once and want a single
+    /// translate API. Callers without a cache should use
+    /// [`Self::translate_kva`] which decodes from `tcr_el1` per
+    /// call.
+    #[allow(dead_code)]
+    pub(crate) fn translate_kva_with_aarch64_params(
+        &self,
+        cr3_pa: u64,
+        kva: Kva,
+        l5: bool,
+        params: &Aarch64WalkParams,
+    ) -> Option<u64> {
+        // Same 4 KiB software TLB sub-granule as `translate_kva`:
+        // any larger leaf entry projects 1:1 into 4 KiB-aligned
+        // slices with the same PA-to-KVA mapping. The TCR_EL1
+        // captured at params-construction time is used as the cache
+        // key alongside `cr3_pa` and `l5` so a translation
+        // performed under one walk configuration cannot be reused
+        // under a different one.
+        const PAGE: u64 = 4096;
+        let kva_bits = kva.0;
+        let kva_page = kva_bits & !(PAGE - 1);
+        // Recover from poison rather than silently bypass — see
+        // [`Self::translate_kva`] for the rationale.
+        {
+            let guard = self
+                .page_tlb
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(entry) = guard.as_ref()
+                && entry.cr3_pa == cr3_pa
+                && entry.l5 == l5
+                && entry.tcr_el1 == params.tcr_el1
+                && entry.kva_page == kva_page
+            {
+                return Some(entry.pa_page | (kva_bits & (PAGE - 1)));
+            }
+        }
+
+        let walk_result;
+        #[cfg(target_arch = "x86_64")]
+        {
+            // params.tcr_el1 is meaningful only on aarch64; on x86
+            // the field is still part of the cache key (always 0)
+            // and the walker itself ignores it.
+            let _ = params;
+            walk_result = if l5 {
+                self.walk_5level(cr3_pa, kva)
+            } else {
+                self.walk_4level(cr3_pa, kva)
+            };
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            let _ = l5;
+            walk_result = self.walk_aarch64_with_params(cr3_pa, kva, params);
+        }
+
+        if let Some(pa) = walk_result {
+            let mut guard = self
+                .page_tlb
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *guard = Some(TlbEntry {
+                cr3_pa,
+                l5,
+                tcr_el1: params.tcr_el1,
+                kva_page,
+                pa_page: pa & !(PAGE - 1),
+            });
+        }
+        walk_result
     }
 
     /// 4-level page table walk (x86-64).
@@ -682,10 +1092,16 @@ impl GuestMem {
     ///   reserved (level 3, treated as invalid)
     /// - bits [1:0] = 0b11: table descriptor (intermediate levels) or
     ///   page descriptor (level 3)
-    /// - high-order OA bits depend on the granule (48-bit OA assumed
-    ///   for FEAT_LPA / FEAT_LPA2 disabled; ktstr's kconfig fragment
-    ///   does not enable `CONFIG_ARM64_VA_BITS_52`, so the OA stays in
-    ///   bits [47:granule_log2]).
+    /// - OA layout: the walker recovers low OA bits [49:granule_log2]
+    ///   via `descaddrmask` (matching the kernel's `PTE_ADDR_LOW`).
+    ///   On non-LPA / non-LPA2 kernels bits [49:48] are RES0 by
+    ///   hardware so the practical OA range is [47:granule_log2].
+    ///   No high-OA splice is applied. FEAT_LPA2 (`TCR_EL1.DS=1`)
+    ///   is rejected by [`Aarch64WalkParams::from_tcr_el1`] because
+    ///   it requires the [9:8]→[51:50] splice; FEAT_LPA on the 64
+    ///   KiB granule is undetectable from `TCR_EL1` alone but
+    ///   ktstr.kconfig does not enable `CONFIG_ARM64_PA_BITS_52`,
+    ///   so the assumption holds for the kernel under test.
     ///
     /// Page table entries contain guest physical addresses (GPAs).
     /// Since GuestMem offsets are DRAM-relative on aarch64 (DRAM_BASE
@@ -698,76 +1114,52 @@ impl GuestMem {
     /// (typically `text_kva_to_pa_with_base(swapper_pg_dir_kva,
     /// start_kernel_map)` for the kernel-half pgd at boot).
     ///
-    /// 52-bit VA / FEAT_LPA / FEAT_LPA2 are NOT supported. `ktstr.kconfig`
-    /// does not enable `CONFIG_ARM64_VA_BITS_52`, so the high-OA splice
-    /// path required for those configs is intentionally absent. If a
-    /// future user pins `CONFIG_ARM64_VA_BITS_52=y`, this walker must be
-    /// extended with the LPA / LPA2 high-OA bit handling before the
-    /// monitor reads guest page tables on that kernel.
+    /// FEAT_LPA / FEAT_LPA2 / 52-bit VA layouts are NOT supported.
+    /// LPA2 is rejected up front (see `from_tcr_el1`); the others
+    /// require kconfig opt-ins (`CONFIG_ARM64_PA_BITS_52`,
+    /// `CONFIG_ARM64_VA_BITS_52`) that ktstr.kconfig does not enable.
+    /// A future user that pins those configs must extend this walker
+    /// with the high-OA splice (PTE_ADDR_HIGH bits [15:12] for
+    /// FEAT_LPA on 64 KiB pages, [9:8] for FEAT_LPA2 on 4 KiB / 16
+    /// KiB) before the monitor reads guest page tables.
     #[cfg(target_arch = "aarch64")]
     fn walk_aarch64(&self, ttbr_pa: u64, kva: Kva, tcr_el1: u64) -> Option<u64> {
+        // Decode-once-per-call entry: every public translate path
+        // funnels through here. Bookkeeping for the cached path
+        // lives in [`Aarch64WalkParams::from_tcr_el1`], whose
+        // failure modes match the historical short-circuits this
+        // function previously inlined (T1SZ=0, reserved TG1, etc.).
+        let params = Aarch64WalkParams::from_tcr_el1(tcr_el1)?;
+        self.walk_aarch64_with_params(ttbr_pa, kva, &params)
+    }
+
+    /// Aarch64 page-table walk that consumes a pre-decoded
+    /// [`Aarch64WalkParams`] instead of decoding `TCR_EL1` per call.
+    /// The cached caller (`super::guest::GuestKernel`'s
+    /// `read_kva_*` helpers) builds the params once at construction
+    /// and reuses them for every translate, eliding the
+    /// `T1SZ`/`TG1`/`va_width`/`levels_below`/index-mask math from
+    /// the hot path.
+    ///
+    /// `params.tcr_el1` is ignored by the walk itself; it is only
+    /// useful for downstream debugging when the cached value
+    /// disagrees with a fresh `tcr_el1` argument (which would
+    /// indicate an unexpected TCR change post-boot — see the
+    /// `Aarch64WalkParams` doc).
+    #[cfg(target_arch = "aarch64")]
+    fn walk_aarch64_with_params(
+        &self,
+        ttbr_pa: u64,
+        kva: Kva,
+        params: &Aarch64WalkParams,
+    ) -> Option<u64> {
         use crate::vmm::aarch64::kvm::DRAM_START;
 
-        // TCR_EL1.T1SZ — high-half VA size offset. Bits [21:16].
-        let t1sz = (tcr_el1 >> 16) & 0x3F;
-        // TCR_EL1.TG1 — high-half granule. Bits [31:30].
-        // Encoding: 0b01=16K, 0b10=4K, 0b11=64K.
-        let tg1 = (tcr_el1 >> 30) & 0x3;
-        if t1sz == 0 {
-            // T1SZ=0 means the high-half region is disabled. The
-            // monitor only reads kernel-half KVAs, so without a valid
-            // T1SZ we cannot walk; treat as unmapped.
-            return None;
-        }
-
-        let stride: u64 = match tg1 {
-            0b11 => 13,       // 64 KB granule
-            0b01 => 11,       // 16 KB granule
-            0b10 => 9,        // 4 KB granule
-            _ => return None, // 0b00 is reserved per ARMv8 D17.2.139
-        };
-
-        // VA width = 64 - T1SZ; starting level computed so the cascade
-        // ends at level 3. Level numbering follows the ARM ARM:
-        // level 0 is the topmost table for 4 KB / 4-level, level 3 is
-        // the leaf.
-        let va_width = 64 - t1sz;
-        // Guard the `va_width - 4` subtraction against underflow when
-        // T1SZ is pathologically large (>60). Architecturally T1SZ is
-        // bounded but the field comes from a guest register; reject
-        // configurations the walker cannot represent rather than
-        // wrapping around.
-        if va_width < 4 {
-            return None;
-        }
-        let levels_below = (va_width - 4) / stride;
-        // The starting level is `4 - levels_below`. Two failure modes:
-        // - `levels_below == 0` means the cascade starts at level 4,
-        //   one level beyond the leaf at level 3. The walker would
-        //   then compose a nonsense 8-byte "page" from the descriptor's
-        //   low bits without ever touching a translation table. Reject.
-        // - `levels_below > 4` means the cascade needs more than 4
-        //   levels and would underflow `4 - levels_below`. Reject
-        //   before the subtraction wraps.
-        if levels_below == 0 || levels_below > 4 {
-            return None;
-        }
-        let mut level: u64 = 4 - levels_below;
-
-        // Per-level index width = stride bits; descriptor entry is 8
-        // bytes (3 low bits). `indexmask_grainsize` = (1 << (stride+3)) - 1
-        // — covers the byte index inside one table.
-        let indexmask_grainsize: u64 = (!0u64) >> (64 - (stride + 3));
-        // First-level index width is the residual VA above the
-        // remaining levels: VA_width - stride * (3 - level).
-        // Restated as `va_width - stride*(4-level)` matches the
-        // cloud-hypervisor formulation.
-        let mut indexmask: u64 = (!0u64) >> (64 - (va_width - stride * (4 - level)));
-        // Descriptor address mask: descriptor bits [47:granule_log2]
-        // hold the next-level table or output address. Top-bit mask is
-        // `(1 << 48) - 1` (48-bit OA without LPA/LPA2). The low
-        // granule bits are cleared via `& !indexmask_grainsize`.
-        let descaddrmask: u64 = ((!0u64) >> (64 - 48)) & !indexmask_grainsize;
+        let stride = params.stride;
+        let mut level: u64 = params.start_level;
+        let indexmask_grainsize: u64 = params.indexmask_grainsize;
+        let mut indexmask: u64 = params.first_indexmask;
+        let descaddrmask: u64 = params.descaddrmask;
 
         // Translation table base: TTBR1_EL1 bits [47:0] — but the caller
         // already passed a DRAM-relative offset (text_kva_to_pa_with_base
@@ -813,20 +1205,51 @@ impl GuestMem {
                 return None;
             }
 
-            // Extract the next-level / output address. For a 48-bit
-            // OA, `descaddrmask` already strips both the high bits
-            // beyond [47:0] and the low granule bits.
+            // Extract the next-level / output address. `descaddrmask`
+            // matches the kernel's PTE_ADDR_LOW (bits [49:granule_log2]),
+            // stripping high attribute / SW bits at [63:50] and the
+            // low granule bits. FEAT_LPA / FEAT_LPA2 high splices are
+            // not applied here; LPA2 is rejected up front via the
+            // TCR_EL1.DS gate in `Aarch64WalkParams::from_tcr_el1`,
+            // and LPA on 64 KiB pages is undetectable from TCR_EL1
+            // (documented limitation).
             let next = descriptor & descaddrmask;
 
             // Bit 1 distinguishes table (1) from block (0) at
             // intermediate levels; at level 3, bit 1 is always 1
             // (page descriptor) — a leaf entry.
             //
-            // Per ARM ARM D5.3, level 0 is table-only for the 4 KB
-            // granule (no 512 GB block descriptors). The fall-through
-            // below would still treat a level-0 block descriptor as a
-            // leaf, but Linux never generates that pattern — the
-            // walker stays correct in practice.
+            // Per ARM ARM D5.3, block descriptors are allowed at
+            // levels 1 and 2 only — and only for granules where
+            // those levels hold output addresses larger than the
+            // page granule:
+            //   - 4 KiB granule (stride=9): blocks at L1 (1 GiB)
+            //     and L2 (2 MiB); L0 is table-only.
+            //   - 16 KiB granule (stride=11): blocks at L2 only
+            //     (32 MiB); L0 and L1 are table-only.
+            //   - 64 KiB granule (stride=13): blocks at L2 only
+            //     (512 MiB); L1 is table-only.
+            // A descriptor with bit 1 clear at any other level is
+            // reserved per ARM ARM; reject rather than risk
+            // composing a leaf address from a malformed entry.
+            // (At level 3, the earlier check already rejected
+            // bit-1-clear as a reserved encoding.)
+            let is_block = (descriptor & 2) == 0;
+            if is_block && level < 3 {
+                let block_legal = match stride {
+                    // 4 KiB granule: block descriptors valid at L1, L2.
+                    9 => level == 1 || level == 2,
+                    // 16 KiB granule: block descriptors valid at L2 only.
+                    11 => level == 2,
+                    // 64 KiB granule: block descriptors valid at L2 only.
+                    13 => level == 2,
+                    _ => false,
+                };
+                if !block_legal {
+                    return None;
+                }
+            }
+
             if (descriptor & 2) != 0 && level < 3 {
                 // Table descriptor — descend. The next iteration will
                 // index into the table whose base GPA is `next`,
@@ -1345,21 +1768,22 @@ pub(crate) fn is_cpu_stalled(
 
 /// Configuration for reactive SysRq-D dump triggering.
 ///
-/// When provided to `monitor_loop`, the monitor evaluates thresholds inline
-/// and writes the dump request flag to guest SHM on sustained violation.
+/// When provided to `monitor_loop`, the monitor evaluates thresholds
+/// inline and pushes a `SIGNAL_VC_DUMP` wake byte through the
+/// attached virtio-console on sustained violation. The guest's
+/// `hvc0_poll_loop` blocks on `/dev/hvc0`, recognises the byte, and
+/// dispatches SysRq-D directly.
 pub(crate) struct DumpTrigger {
-    /// Physical address of the SHM region base in guest memory.
-    pub shm_base_pa: u64,
     /// Thresholds for violation detection.
     pub thresholds: super::MonitorThresholds,
-    /// Optional virtio-console handle. When `Some`, the monitor pushes
-    /// a wake byte (`SIGNAL_VC_DUMP`) into the device's RX queue
-    /// immediately after writing the SHM dump-request byte. The
-    /// guest's `shm_poll_loop` blocks on `/dev/hvc0` and re-checks
-    /// the SHM control bytes on any byte received, so the wake
-    /// arrives within microseconds of the SHM write rather than at
-    /// the legacy 200 ms poll cadence. `None` falls back to legacy
-    /// polling.
+    /// Virtio-console handle. When `Some`, the monitor pushes a wake
+    /// byte (`SIGNAL_VC_DUMP`) into the device's RX queue on
+    /// sustained violation; the guest wakes within microseconds. When
+    /// `None`, the trigger logs a `tracing::warn!` so the missing
+    /// transport is visible — there is no longer a SHM-byte fallback.
+    /// Production callers always populate this; the field stays
+    /// `Option` only so unit tests that exercise the threshold logic
+    /// without a fully-wired device can pass `None`.
     pub virtio_con:
         Option<std::sync::Arc<crate::vmm::PiMutex<crate::vmm::virtio_console::VirtioConsole>>>,
 }
@@ -1428,14 +1852,17 @@ pub(crate) struct ProgStatsCtx {
     pub start_kernel_map: u64,
 }
 
-/// Samples, SHM drain, and optional watchdog observation returned by
+/// Samples and optional watchdog observation returned by
 /// [`monitor_loop`].
 pub(crate) struct MonitorLoopResult {
     /// Per-interval `MonitorSample`s collected across the run.
     pub(crate) samples: Vec<MonitorSample>,
-    /// Final drain of the guest-to-host SHM ring (stimulus events,
-    /// test results, any residual messages).
-    pub(crate) drain: crate::vmm::shm_ring::ShmDrainResult,
+    /// Mid-flight TLV entries drained from the guest. Empty in this
+    /// loop variant — the freeze coordinator owns the bulk-port
+    /// drain and stashes per-tick parsed entries on its own buffer;
+    /// kept on this struct for compatibility with `collect_results`'s
+    /// merge.
+    pub(crate) drain: crate::vmm::host_comms::BulkDrainResult,
     /// Watchdog read-back, when a watchdog override was installed.
     pub(crate) watchdog_observation: Option<super::WatchdogObservation>,
 }
@@ -1465,9 +1892,6 @@ pub(crate) struct MonitorConfig<'a> {
     /// Preemption threshold in nanoseconds used for stall detection.
     /// Pass 0 to derive it from the guest kernel's CONFIG_HZ.
     pub preemption_threshold_ns: u64,
-    /// Physical address of the guest-side SHM ring region; enables
-    /// mid-flight drain when present.
-    pub shm_base_pa: Option<u64>,
     /// Optional BPF program statistics context; when present, each
     /// sample includes per-program exec counters.
     pub prog_stats_ctx: Option<&'a ProgStatsCtx>,
@@ -1514,7 +1938,6 @@ pub(crate) fn monitor_loop(
     let vcpu_timing = cfg.vcpu_timing;
     let perf_capture = cfg.perf_capture;
     let preemption_threshold_ns = cfg.preemption_threshold_ns;
-    let shm_base_pa = cfg.shm_base_pa;
     let prog_stats_ctx = cfg.prog_stats_ctx;
     let page_offset = cfg.page_offset;
     let start_kernel_map = cfg.start_kernel_map;
@@ -1538,8 +1961,7 @@ pub(crate) fn monitor_loop(
     let mut vcpu_timing_err_reported: Vec<bool> = vcpu_timing
         .map(|vt| vec![false; vt.pthreads.len()])
         .unwrap_or_default();
-    let mut shm_entries: Vec<crate::vmm::shm_ring::ShmEntry> = Vec::new();
-    let mut shm_drops: u64 = 0;
+    let shm_entries: Vec<crate::vmm::wire::ShmEntry> = Vec::new();
     let mut watchdog_observation: Option<super::WatchdogObservation> = None;
 
     // Cadence + wake plumbing. `tick_tfd` is a periodic
@@ -1559,10 +1981,7 @@ pub(crate) fn monitor_loop(
             tracing::warn!(err = %e, "monitor: timerfd_create failed");
             return MonitorLoopResult {
                 samples,
-                drain: crate::vmm::shm_ring::ShmDrainResult {
-                    entries: shm_entries,
-                    drops: shm_drops,
-                },
+                drain: crate::vmm::host_comms::BulkDrainResult { entries: shm_entries },
                 watchdog_observation,
             };
         }
@@ -1572,10 +1991,7 @@ pub(crate) fn monitor_loop(
         tracing::warn!(err = %e, "monitor: timerfd_settime failed");
         return MonitorLoopResult {
             samples,
-            drain: crate::vmm::shm_ring::ShmDrainResult {
-                entries: shm_entries,
-                drops: shm_drops,
-            },
+            drain: crate::vmm::host_comms::BulkDrainResult { entries: shm_entries },
             watchdog_observation,
         };
     }
@@ -1585,10 +2001,7 @@ pub(crate) fn monitor_loop(
             tracing::warn!(err = %e, "monitor: epoll_create1 failed");
             return MonitorLoopResult {
                 samples,
-                drain: crate::vmm::shm_ring::ShmDrainResult {
-                    entries: shm_entries,
-                    drops: shm_drops,
-                },
+                drain: crate::vmm::host_comms::BulkDrainResult { entries: shm_entries },
                 watchdog_observation,
             };
         }
@@ -1603,10 +2016,7 @@ pub(crate) fn monitor_loop(
         tracing::warn!(err = %e, "monitor: epoll_ctl add timerfd failed");
         return MonitorLoopResult {
             samples,
-            drain: crate::vmm::shm_ring::ShmDrainResult {
-                entries: shm_entries,
-                drops: shm_drops,
-            },
+            drain: crate::vmm::host_comms::BulkDrainResult { entries: shm_entries },
             watchdog_observation,
         };
     }
@@ -1618,10 +2028,7 @@ pub(crate) fn monitor_loop(
         tracing::warn!(err = %e, "monitor: epoll_ctl add kill_evt failed");
         return MonitorLoopResult {
             samples,
-            drain: crate::vmm::shm_ring::ShmDrainResult {
-                entries: shm_entries,
-                drops: shm_drops,
-            },
+            drain: crate::vmm::host_comms::BulkDrainResult { entries: shm_entries },
             watchdog_observation,
         };
     }
@@ -1786,24 +2193,26 @@ pub(crate) fn monitor_loop(
                     .any(|s| s.sustained(t.sustained_samples));
 
             if sustained {
-                // Combined SHM-byte-then-wake-byte sequence via the
-                // typed [`crate::vmm::host_comms::request_dump`]
-                // helper. The helper enforces the load-bearing
-                // ordering (SHM byte first so the guest's
-                // shm_poll_loop sees the new value when it re-checks
-                // after the wake).
+                // Push the `SIGNAL_VC_DUMP` wake byte through the
+                // virtio-console RX queue via
+                // [`crate::vmm::host_comms::request_dump`]. The
+                // guest's `hvc0_poll_loop` blocks on `/dev/hvc0`,
+                // recognises the byte, and dispatches SysRq-D
+                // directly — no SHM control byte involved.
                 if let Some(ref vc) = trigger.virtio_con {
-                    crate::vmm::host_comms::request_dump(mem, trigger.shm_base_pa, vc);
+                    crate::vmm::host_comms::request_dump(vc);
                 } else {
-                    // No virtio-console attached — write the SHM
-                    // byte alone; the guest's poll loop catches it
-                    // on the next 200 ms cycle. This branch is
-                    // legacy-test scaffolding; production runs
-                    // always populate trigger.virtio_con.
-                    mem.write_u8(
-                        trigger.shm_base_pa,
-                        crate::vmm::shm_ring::DUMP_REQ_OFFSET,
-                        crate::vmm::shm_ring::DUMP_REQ_SYSRQ_D,
+                    // No virtio-console attached — every production
+                    // path through `start_monitor` always populates
+                    // `trigger.virtio_con` (the device is built
+                    // unconditionally because `ktstr.kconfig`
+                    // mandates `CONFIG_VIRTIO_CONSOLE=y`). Surface
+                    // the missing handle so a host-side caller that
+                    // omits the device sees the wake go nowhere
+                    // instead of falling back silently.
+                    tracing::warn!(
+                        "dump_trigger: no virtio_console attached; \
+                         SIGNAL_VC_DUMP not delivered"
                     );
                 }
                 dump_requested = true;
@@ -1826,27 +2235,6 @@ pub(crate) fn monitor_loop(
             cpus: cpus.clone(),
             prog_stats,
         });
-
-        // Mid-flight SHM drain: advance read_ptr so the guest can
-        // reclaim ring space. Accumulate drained entries for the
-        // caller to merge with the post-mortem drain.
-        if let Some(shm_pa) = shm_base_pa {
-            let drain = crate::vmm::shm_ring::shm_drain_live(mem, shm_pa);
-            shm_drops = shm_drops.max(drain.drops);
-            // Check for scheduler death signal before accumulating.
-            // The guest init writes MSG_TYPE_SCHED_EXIT when the
-            // scheduler process exits during test execution.
-            if drain
-                .entries
-                .iter()
-                .any(|e| e.msg_type == crate::vmm::shm_ring::MSG_TYPE_SCHED_EXIT && e.crc_ok)
-            {
-                shm_entries.extend(drain.entries);
-                kill.store(true, Ordering::Release);
-                break;
-            }
-            shm_entries.extend(drain.entries);
-        }
 
         // Block until the next tick or a kill_evt write. -1 timeout
         // is OK because both fds carry hard wakes — a missing
@@ -1879,10 +2267,7 @@ pub(crate) fn monitor_loop(
             }
         }
     }
-    let shm_result = crate::vmm::shm_ring::ShmDrainResult {
-        entries: shm_entries,
-        drops: shm_drops,
-    };
+    let shm_result = crate::vmm::host_comms::BulkDrainResult { entries: shm_entries };
     MonitorLoopResult {
         samples,
         drain: shm_result,
@@ -1988,7 +2373,6 @@ mod tests {
             vcpu_timing: None,
             perf_capture: None,
             preemption_threshold_ns: 0,
-            shm_base_pa: None,
             prog_stats_ctx: None,
             page_offset: 0,
             start_kernel_map: super::super::symbols::START_KERNEL_MAP,
@@ -2009,6 +2393,19 @@ mod tests {
             sched_domain_offsets: None,
             watchdog_offsets: None,
         }
+    }
+
+    /// Test helper: build a virtio_console handle wrapped in
+    /// `Arc<PiMutex<...>>` so DumpTrigger tests can pass a real
+    /// device and inspect its `pending_rx_bytes()` after the loop
+    /// runs. Without DRIVER_OK on the queue the wake byte stays in
+    /// `port0_pending_rx`, so the test can assert on byte equality
+    /// without driving a full guest handshake.
+    fn test_virtio_console()
+    -> std::sync::Arc<crate::vmm::PiMutex<crate::vmm::virtio_console::VirtioConsole>> {
+        std::sync::Arc::new(crate::vmm::PiMutex::new(
+            crate::vmm::virtio_console::VirtioConsole::new(),
+        ))
     }
 
     /// Build a byte buffer simulating a struct rq with the given field values.
@@ -2806,8 +3203,8 @@ mod tests {
         let pa1 = buf0.len() as u64;
         let mut combined = buf0;
         combined.extend_from_slice(&buf1);
-        // Append SHM region (64 bytes minimum for dump req offset).
-        let shm_pa = combined.len() as u64;
+        // Append SHM region (carried for diagnostics; no longer
+        // touched by the dump path).
         combined.extend(vec![0u8; 64]);
 
         // SAFETY: combined is a live local buffer (Vec<u8> or stack
@@ -2816,15 +3213,15 @@ mod tests {
         let kill = std::sync::Arc::new(AtomicBool::new(false));
         let kill_evt = test_kill_evt();
 
+        let virtio_con = test_virtio_console();
         let trigger = DumpTrigger {
-            shm_base_pa: shm_pa,
             thresholds: super::super::MonitorThresholds {
                 max_imbalance_ratio: 2.0,
                 sustained_samples: 2,
                 fail_on_stall: false,
                 ..Default::default()
             },
-            virtio_con: None,
+            virtio_con: Some(virtio_con.clone()),
         };
 
         let handle = {
@@ -2852,12 +3249,14 @@ mod tests {
         handle.join().unwrap();
 
         assert!(!samples.is_empty());
-        // Check dump request was written to SHM.
-        let dump_byte = combined[shm_pa as usize + crate::vmm::shm_ring::DUMP_REQ_OFFSET];
-        assert_eq!(
-            dump_byte,
-            crate::vmm::shm_ring::DUMP_REQ_SYSRQ_D,
-            "dump request should have been written to SHM"
+        // Check `SIGNAL_VC_DUMP` was queued for the guest. Without
+        // DRIVER_OK on the queue the byte stays in `port0_pending_rx`
+        // — that's the observable for tests.
+        let pending = virtio_con.lock().pending_rx_bytes();
+        assert!(
+            pending.contains(&crate::vmm::virtio_console::SIGNAL_VC_DUMP),
+            "imbalance threshold violation should queue SIGNAL_VC_DUMP; \
+             pending RX bytes: {pending:?}"
         );
     }
 
@@ -2872,7 +3271,6 @@ mod tests {
         // check in from_samples, though monitor_loop's reactive path
         // doesn't use from_samples — it checks inline).
         let buf = make_rq_buffer(&offsets, 2, 1, 1, 5000, 0);
-        let shm_pa = buf.len() as u64;
         let mut combined = buf;
         combined.extend(vec![0u8; 64]);
 
@@ -2882,8 +3280,8 @@ mod tests {
         let kill = std::sync::Arc::new(AtomicBool::new(false));
         let kill_evt = test_kill_evt();
 
+        let virtio_con = test_virtio_console();
         let trigger = DumpTrigger {
-            shm_base_pa: shm_pa,
             thresholds: super::super::MonitorThresholds {
                 max_imbalance_ratio: 100.0,
                 max_local_dsq_depth: 10000,
@@ -2891,7 +3289,7 @@ mod tests {
                 sustained_samples: 2,
                 ..Default::default()
             },
-            virtio_con: None,
+            virtio_con: Some(virtio_con.clone()),
         };
 
         let handle = {
@@ -2925,11 +3323,11 @@ mod tests {
             samples.len()
         );
         // Dump should have fired due to sustained stall.
-        let dump_byte = combined[shm_pa as usize + crate::vmm::shm_ring::DUMP_REQ_OFFSET];
-        assert_eq!(
-            dump_byte,
-            crate::vmm::shm_ring::DUMP_REQ_SYSRQ_D,
-            "stall should trigger dump after sustained_samples=2"
+        let pending = virtio_con.lock().pending_rx_bytes();
+        assert!(
+            pending.contains(&crate::vmm::virtio_console::SIGNAL_VC_DUMP),
+            "stall should trigger SIGNAL_VC_DUMP after sustained_samples=2; \
+             pending RX bytes: {pending:?}"
         );
     }
 
@@ -2940,7 +3338,6 @@ mod tests {
         let offsets = test_offsets();
         // CPU idle: nr_running=0, rq_clock stuck at 5000.
         let buf = make_rq_buffer(&offsets, 0, 0, 0, 5000, 0);
-        let shm_pa = buf.len() as u64;
         let mut combined = buf;
         combined.extend(vec![0u8; 64]);
 
@@ -2950,8 +3347,8 @@ mod tests {
         let kill = std::sync::Arc::new(AtomicBool::new(false));
         let kill_evt = test_kill_evt();
 
+        let virtio_con = test_virtio_console();
         let trigger = DumpTrigger {
-            shm_base_pa: shm_pa,
             thresholds: super::super::MonitorThresholds {
                 max_imbalance_ratio: 100.0,
                 max_local_dsq_depth: 10000,
@@ -2959,7 +3356,7 @@ mod tests {
                 sustained_samples: 1,
                 ..Default::default()
             },
-            virtio_con: None,
+            virtio_con: Some(virtio_con.clone()),
         };
 
         let handle = {
@@ -2992,8 +3389,11 @@ mod tests {
             samples.len()
         );
         // Dump should NOT have fired — idle CPU is exempt.
-        let dump_byte = combined[shm_pa as usize + crate::vmm::shm_ring::DUMP_REQ_OFFSET];
-        assert_eq!(dump_byte, 0, "idle CPU should not trigger dump");
+        let pending = virtio_con.lock().pending_rx_bytes();
+        assert!(
+            !pending.contains(&crate::vmm::virtio_console::SIGNAL_VC_DUMP),
+            "idle CPU should not queue SIGNAL_VC_DUMP; pending RX bytes: {pending:?}"
+        );
     }
 
     #[test]
@@ -3004,7 +3404,6 @@ mod tests {
         // (10ms) avoids host CONFIG_HZ dependency.
         let offsets = test_offsets();
         let buf = make_rq_buffer(&offsets, 2, 1, 1, 5000, 0);
-        let shm_pa = buf.len() as u64;
         let mut combined = buf;
         combined.extend(vec![0u8; 64]);
 
@@ -3028,8 +3427,8 @@ mod tests {
         let pt = sleeper.as_pthread_t() as libc::pthread_t;
         let vcpu_timing = VcpuTiming { pthreads: vec![pt] };
 
+        let virtio_con = test_virtio_console();
         let trigger = DumpTrigger {
-            shm_base_pa: shm_pa,
             thresholds: super::super::MonitorThresholds {
                 max_imbalance_ratio: 100.0,
                 max_local_dsq_depth: 10000,
@@ -3037,7 +3436,7 @@ mod tests {
                 sustained_samples: 1,
                 ..Default::default()
             },
-            virtio_con: None,
+            virtio_con: Some(virtio_con.clone()),
         };
 
         let handle = {
@@ -3073,8 +3472,11 @@ mod tests {
             "need >= 2 samples, got {}",
             samples.len()
         );
-        let dump_byte = combined[shm_pa as usize + crate::vmm::shm_ring::DUMP_REQ_OFFSET];
-        assert_eq!(dump_byte, 0, "preempted vCPU should not trigger dump");
+        let pending = virtio_con.lock().pending_rx_bytes();
+        assert!(
+            !pending.contains(&crate::vmm::virtio_console::SIGNAL_VC_DUMP),
+            "preempted vCPU should not queue SIGNAL_VC_DUMP; pending RX bytes: {pending:?}"
+        );
     }
 
     #[test]
@@ -3087,7 +3489,6 @@ mod tests {
         // gives 40ms threshold, which would mask 30ms of spin time).
         let offsets = test_offsets();
         let buf = make_rq_buffer(&offsets, 2, 1, 1, 5000, 0);
-        let shm_pa = buf.len() as u64;
         let mut combined = buf;
         combined.extend(vec![0u8; 64]);
 
@@ -3111,8 +3512,8 @@ mod tests {
         let pt = spinner.as_pthread_t() as libc::pthread_t;
         let vcpu_timing = VcpuTiming { pthreads: vec![pt] };
 
+        let virtio_con = test_virtio_console();
         let trigger = DumpTrigger {
-            shm_base_pa: shm_pa,
             thresholds: super::super::MonitorThresholds {
                 max_imbalance_ratio: 100.0,
                 max_local_dsq_depth: 10000,
@@ -3120,7 +3521,7 @@ mod tests {
                 sustained_samples: 2,
                 ..Default::default()
             },
-            virtio_con: None,
+            virtio_con: Some(virtio_con.clone()),
         };
 
         let handle = {
@@ -3156,11 +3557,11 @@ mod tests {
             "need >= 3 samples for 2 stall pairs, got {}",
             samples.len()
         );
-        let dump_byte = combined[shm_pa as usize + crate::vmm::shm_ring::DUMP_REQ_OFFSET];
-        assert_eq!(
-            dump_byte,
-            crate::vmm::shm_ring::DUMP_REQ_SYSRQ_D,
-            "real stall (vCPU running, clock stuck, nr_running>0) should trigger dump"
+        let pending = virtio_con.lock().pending_rx_bytes();
+        assert!(
+            pending.contains(&crate::vmm::virtio_console::SIGNAL_VC_DUMP),
+            "real stall (vCPU running, clock stuck, nr_running>0) should queue \
+             SIGNAL_VC_DUMP; pending RX bytes: {pending:?}"
         );
     }
 
@@ -3179,7 +3580,6 @@ mod tests {
         let pa1 = buf0.len() as u64;
         let mut combined = buf0;
         combined.extend_from_slice(&buf1);
-        let shm_pa = combined.len() as u64;
         combined.extend(vec![0u8; 64]);
 
         // SAFETY: combined is a live local buffer (Vec<u8> or stack
@@ -3196,10 +3596,10 @@ mod tests {
             ..Default::default()
         };
 
+        let virtio_con = test_virtio_console();
         let trigger = DumpTrigger {
-            shm_base_pa: shm_pa,
             thresholds,
-            virtio_con: None,
+            virtio_con: Some(virtio_con.clone()),
         };
 
         let handle = {
@@ -3232,9 +3632,10 @@ mod tests {
             samples.len()
         );
 
-        // Reactive path result: check if dump fired.
-        let dump_byte = combined[shm_pa as usize + crate::vmm::shm_ring::DUMP_REQ_OFFSET];
-        let reactive_stall = dump_byte == crate::vmm::shm_ring::DUMP_REQ_SYSRQ_D;
+        // Reactive path result: check if dump fired (via the
+        // SIGNAL_VC_DUMP wake byte queued for the guest).
+        let pending = virtio_con.lock().pending_rx_bytes();
+        let reactive_stall = pending.contains(&crate::vmm::virtio_console::SIGNAL_VC_DUMP);
 
         // Post-hoc evaluate path on the same samples.
         let summary = super::super::MonitorSummary::from_samples(&samples);
@@ -3265,7 +3666,6 @@ mod tests {
         let offsets = test_offsets();
         // nr_running=0, rq_clock stuck.
         let buf = make_rq_buffer(&offsets, 0, 0, 0, 5000, 0);
-        let shm_pa = buf.len() as u64;
         let mut combined = buf;
         combined.extend(vec![0u8; 64]);
 
@@ -3283,10 +3683,10 @@ mod tests {
             ..Default::default()
         };
 
+        let virtio_con = test_virtio_console();
         let trigger = DumpTrigger {
-            shm_base_pa: shm_pa,
             thresholds,
-            virtio_con: None,
+            virtio_con: Some(virtio_con.clone()),
         };
 
         let handle = {
@@ -3319,9 +3719,12 @@ mod tests {
             samples.len()
         );
 
-        // Reactive: dump should NOT fire.
-        let dump_byte = combined[shm_pa as usize + crate::vmm::shm_ring::DUMP_REQ_OFFSET];
-        assert_eq!(dump_byte, 0, "reactive: idle CPU should not trigger dump");
+        // Reactive: dump should NOT fire — no SIGNAL_VC_DUMP queued.
+        let pending = virtio_con.lock().pending_rx_bytes();
+        assert!(
+            !pending.contains(&crate::vmm::virtio_console::SIGNAL_VC_DUMP),
+            "reactive: idle CPU should not queue SIGNAL_VC_DUMP; pending RX: {pending:?}"
+        );
 
         // Evaluate: from_samples should not detect stall.
         let summary = super::super::MonitorSummary::from_samples(&samples);
@@ -4084,11 +4487,11 @@ mod tests {
 
     #[test]
     fn resolve_ptr_multi_region_read_ring_volatile_routes_correctly() {
-        // `read_ring_volatile` (in shm_ring.rs) reads byte-by-byte
-        // via `mem.read_u8`. With a multi-region GuestMem where the
-        // ring's data area sits inside region 1 (past the end of
-        // region 0), each `read_u8` must resolve to region 1's host
-        // pointer — not stale bytes past region 0's end.
+        // Multi-region GuestMem reads route byte-by-byte via
+        // `mem.read_u8`. With a region whose data sits inside
+        // region 1 (past the end of region 0), each `read_u8` must
+        // resolve to region 1's host pointer — not stale bytes past
+        // region 0's end.
         let mut buf0 = [0u8; 64];
         let mut buf1 = [0u8; 64];
         // Plant a known pattern at the start of region 1.

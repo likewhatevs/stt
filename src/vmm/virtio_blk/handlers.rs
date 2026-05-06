@@ -17,6 +17,11 @@
 //! "Why" doc).
 
 use std::fs::File;
+// `FileExt` provides `read_at`/`write_at`, used only by the
+// `handle_read_impl` / `handle_write_impl` cfg(test) variants below;
+// `handle_flush_impl` uses `File::sync_data` from std and does not
+// need this trait in the lib build.
+#[cfg(test)]
 use std::os::unix::fs::FileExt;
 
 // `GuestAddress` is consumed only by the `cfg(test)` `&self` wrapper
@@ -28,9 +33,13 @@ use vm_memory::{Bytes, GuestMemoryMmap};
 
 use virtio_bindings::virtio_blk::{VIRTIO_BLK_ID_BYTES, VIRTIO_BLK_S_IOERR, VIRTIO_BLK_S_OK};
 
-use super::{
-    ChainDescriptor, VIRTIO_BLK_SECTOR_SIZE, VIRTIO_BLK_SERIAL, VirtioBlk, VirtioBlkCounters,
-};
+use super::{ChainDescriptor, VIRTIO_BLK_SERIAL, VirtioBlk, VirtioBlkCounters};
+// `VIRTIO_BLK_SECTOR_SIZE` is consumed only by the cfg(test)
+// `handle_read_impl` / `handle_write_impl` per-segment variants; the
+// production vectored handlers in `device.rs` use the constant
+// directly from the `super` namespace.
+#[cfg(test)]
+use super::VIRTIO_BLK_SECTOR_SIZE;
 
 impl VirtioBlk {
     /// Service `VIRTIO_BLK_T_IN` (read). Reads bytes from the
@@ -61,6 +70,10 @@ impl VirtioBlk {
     /// shape — every parameter is a separate `&self` field that
     /// must be passed by reference so the caller can hold a
     /// concurrent mutable borrow of the queues vec.
+    // Production T_IN goes through [`Self::handle_read_vectored_impl`];
+    // this per-segment variant is reached only by the cfg(test)
+    // `handle_read` wrapper.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn handle_read_impl(
         backing: &File,
@@ -72,7 +85,16 @@ impl VirtioBlk {
         data_len: u64,
         scratch: &mut Vec<u8>,
     ) -> (u8, u32) {
-        let mut total_read: u32 = 0;
+        // Bytes the device wrote into the guest's data segments
+        // (data + any zero-padded short-read tail). Drives the
+        // virtio-spec used.elem.len in the caller's `add_used`.
+        let mut bytes_to_guest: u32 = 0;
+        // Bytes actually returned by `read_at` (i.e. bytes truly
+        // read from the backing file). Drives the `bytes_read`
+        // counter — the zero-pad tail on a short read is delivered
+        // to the guest but not "read" from any source, so the
+        // counter excludes it.
+        let mut bytes_from_backing: u64 = 0;
         let Some(base_offset) = sector.checked_mul(VIRTIO_BLK_SECTOR_SIZE as u64) else {
             counters.record_io_error();
             return (VIRTIO_BLK_S_IOERR as u8, 1);
@@ -95,12 +117,12 @@ impl VirtioBlk {
         // intentional. The for-loop body runs unconditionally so
         // direction-mismatch checks (`!is_write_only`) still
         // apply; `read_at` against a zero-length slice is `Ok(0)`,
-        // so `total_read`/`cur_offset` are unchanged and the chain
-        // proceeds to `S_OK` once all segments are walked. A guest
-        // that submits a zero-length data descriptor has issued a
-        // weird-but-legal request, not a malformed one — qemu and
-        // firecracker behave the same way. This is an explicit
-        // design choice, not an accidental fall-through.
+        // so `bytes_to_guest`/`cur_offset` are unchanged and the
+        // chain proceeds to `S_OK` once all segments are walked.
+        // A guest that submits a zero-length data descriptor has
+        // issued a weird-but-legal request, not a malformed one —
+        // qemu and firecracker behave the same way. This is an
+        // explicit design choice, not an accidental fall-through.
         let mut cur_offset = base_offset;
         for seg in data_segments {
             if !seg.is_write_only {
@@ -110,38 +132,55 @@ impl VirtioBlk {
                 // chain before throttle. Kept in case a future
                 // caller reaches handle_read_impl directly.
                 counters.record_io_error();
-                return (VIRTIO_BLK_S_IOERR as u8, total_read + 1);
+                return (VIRTIO_BLK_S_IOERR as u8, bytes_to_guest + 1);
             }
-            // Reuse the device-owned scratch buffer.
-            // `resize(len, 0)` zero-fills any new tail; the existing
-            // capacity is preserved. Bytes leftover from the prior
-            // segment are overwritten by `read_at`, then
-            // zero-padded only on a short read (below).
-            scratch.resize(seg.len as usize, 0);
+            // Reuse the device-owned scratch buffer. `resize(len, 0)`
+            // zero-fills the buffer, then `read_at` overwrites bytes
+            // [0..n] via pread64. The zero-fill is only paid on this
+            // legacy path — production T_IN goes through
+            // [`Self::handle_read_vectored_impl`], which writes
+            // directly into guest memory via `preadv`. This handler
+            // is retained for the cfg(test) `&self` wrapper and as a
+            // fallback for any future caller that needs the
+            // per-segment loop. A safe fill is preferable to an
+            // uninit `set_len` window on a path where the
+            // zero-fill cost is irrelevant.
+            let len = seg.len as usize;
+            scratch.resize(len, 0);
             match backing.read_at(&mut scratch[..], cur_offset) {
                 Ok(n) => {
-                    if (n as u32) < seg.len {
-                        // Short read — pad with zeros (sparse file
-                        // semantics).
-                        scratch[n..].fill(0);
-                    }
+                    // Short reads leave bytes [n..len] at their
+                    // initial zero from `resize` — sparse-file
+                    // semantics fall out of the safe init.
                     if mem.write_slice(&scratch[..], seg.addr).is_err() {
                         counters.record_io_error();
-                        return (VIRTIO_BLK_S_IOERR as u8, total_read + 1);
+                        return (VIRTIO_BLK_S_IOERR as u8, bytes_to_guest + 1);
                     }
-                    total_read += seg.len;
+                    // Counter: bytes ACTUALLY read from backing,
+                    // excluding the zero-padded short-read tail
+                    // (those bytes were delivered to the guest but
+                    // were not sourced from any read).
+                    bytes_from_backing += n as u64;
+                    // used_len: bytes the device WROTE INTO the
+                    // guest buffer = full seg.len (data + any
+                    // zero-pad tail). virtio-v1.2 §2.7.7.2 defines
+                    // used.elem.len as bytes written to the
+                    // device-writable portion, so the zero-pad
+                    // counts here even though it doesn't count for
+                    // the bytes_read counter.
+                    bytes_to_guest += seg.len;
                     cur_offset += seg.len as u64;
                 }
                 Err(e) => {
                     tracing::warn!(sector, %e, "virtio-blk read error");
                     counters.record_io_error();
-                    return (VIRTIO_BLK_S_IOERR as u8, total_read + 1);
+                    return (VIRTIO_BLK_S_IOERR as u8, bytes_to_guest + 1);
                 }
             }
         }
-        counters.record_read(total_read as u64);
+        counters.record_read(bytes_from_backing);
         // used_len: data bytes written to guest + 1 status byte.
-        (VIRTIO_BLK_S_OK as u8, total_read + 1)
+        (VIRTIO_BLK_S_OK as u8, bytes_to_guest + 1)
     }
 
     /// Service `VIRTIO_BLK_T_OUT` (write). Reads bytes from the
@@ -154,6 +193,10 @@ impl VirtioBlk {
     ///
     /// `too_many_arguments` allow: same disjoint-borrow shape as
     /// [`Self::handle_read_impl`].
+    // Production T_OUT goes through
+    // [`Self::handle_write_vectored_impl`]; this per-segment variant
+    // is reached only by the cfg(test) `handle_write` wrapper.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn handle_write_impl(
         backing: &File,
@@ -198,8 +241,19 @@ impl VirtioBlk {
                 counters.record_io_error();
                 return (VIRTIO_BLK_S_IOERR as u8, 1);
             }
-            // Reuse the device-owned scratch buffer.
-            scratch.resize(seg.len as usize, 0);
+            // Reuse the device-owned scratch buffer. `resize(len, 0)`
+            // zero-fills the buffer, then `mem.read_slice` overwrites
+            // every byte from guest memory. The zero-fill is only
+            // paid on this legacy path — production T_OUT goes
+            // through [`Self::handle_write_vectored_impl`], which
+            // gathers directly from guest memory via `pwritev`. This
+            // handler is retained for the cfg(test) `&self` wrapper
+            // and as a fallback for any future caller that needs
+            // the per-segment loop. A safe fill is preferable to an
+            // uninit `set_len` window on a path where the
+            // zero-fill cost is irrelevant.
+            let len = seg.len as usize;
+            scratch.resize(len, 0);
             if mem.read_slice(&mut scratch[..], seg.addr).is_err() {
                 counters.record_io_error();
                 return (VIRTIO_BLK_S_IOERR as u8, 1);

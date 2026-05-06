@@ -44,6 +44,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -330,13 +331,42 @@ fn read_or_label(path: &Path) -> String {
     }
 }
 
+/// Cap on the number of successive [`CgroupManager::remove_cgroup`]
+/// failures the manager will tolerate before bailing further removes.
+///
+/// A churn workload (rapid create→remove cycles) may legitimately
+/// race the freeze/drain path and see EBUSY/ENOENT on individual
+/// remove calls — those are absorbed and the un-removed cgroup is
+/// counted toward `outstanding_removes`. When the counter exceeds
+/// this cap, subsequent [`CgroupManager::remove_cgroup`] calls
+/// return Err immediately so the loop driving the churn (e.g.
+/// `custom_cgroup_rapid_churn` in scenario/dynamic.rs) can bail
+/// instead of accumulating cgroupfs entries unboundedly. Successful
+/// removes decrement the counter, so a transient stall that
+/// eventually clears does not strand the manager in the bailed
+/// state.
+const MAX_OUTSTANDING_REMOVES: usize = 10;
+
 /// RAII manager for cgroup v2 filesystem operations.
 ///
 /// Creates, configures, and removes cgroups under a parent directory.
 /// Provides cpuset assignment and task migration.
+///
+/// # Outstanding-remove tracking
+///
+/// `outstanding_removes` counts cgroups whose
+/// [`Self::remove_cgroup`] call failed (the directory still exists
+/// in the cgroupfs tree). It increments on every removal failure,
+/// decrements on every removal success, and gates further calls:
+/// once the count exceeds [`MAX_OUTSTANDING_REMOVES`],
+/// [`Self::remove_cgroup`] returns Err without attempting the
+/// underlying writes. The counter is `AtomicUsize` because
+/// scenario code holds the manager behind `&dyn CgroupOps` and
+/// shares it across threads via `&self` borrows.
 #[derive(Debug)]
 pub struct CgroupManager {
     parent: PathBuf,
+    outstanding_removes: AtomicUsize,
 }
 
 impl CgroupManager {
@@ -344,11 +374,21 @@ impl CgroupManager {
     pub fn new(parent: &str) -> Self {
         Self {
             parent: PathBuf::from(parent),
+            outstanding_removes: AtomicUsize::new(0),
         }
     }
     /// Path to the parent cgroup directory.
     pub fn parent_path(&self) -> &std::path::Path {
         &self.parent
+    }
+
+    /// Count of un-removed cgroups currently tracked by this
+    /// manager — incremented when [`Self::remove_cgroup`] fails,
+    /// decremented when it succeeds. Exposed for tests and for
+    /// callers that want to inspect the budget without forcing a
+    /// remove attempt.
+    pub fn outstanding_removes(&self) -> usize {
+        self.outstanding_removes.load(Ordering::Relaxed)
     }
 
     /// Create the parent directory and enable the requested cgroup
@@ -551,12 +591,64 @@ impl CgroupManager {
     /// to a non-hot teardown path; the fixed-window sleep is
     /// simpler and the 50ms tax on a teardown that is already
     /// scheduled to absorb a VM shutdown is immaterial.
+    ///
+    /// # Outstanding-remove cap
+    ///
+    /// A churn workload (rapid create→remove cycles) may legitimately
+    /// race freeze/drain and see EBUSY/ENOENT on individual remove
+    /// calls. Each failed remove increments
+    /// [`Self::outstanding_removes`]; once the counter exceeds
+    /// [`MAX_OUTSTANDING_REMOVES`], the next call returns Err
+    /// without attempting any filesystem writes — bounding the peak
+    /// resident cgroup leak to that cap regardless of how long the
+    /// scenario runs. Successful removes decrement the counter, so a
+    /// transient stall that eventually clears (e.g. RCU drain
+    /// catches up between iterations) does not strand the manager
+    /// in the bailed state.
+    ///
+    /// A `name` whose directory does not exist returns `Ok(())`
+    /// without touching the counter — the cgroup was already
+    /// reaped (e.g. by [`Self::cleanup_all`] or a prior remove),
+    /// so it is not "outstanding".
     pub fn remove_cgroup(&self, name: &str) -> Result<()> {
         validate_cgroup_name(name)?;
+        let outstanding = self.outstanding_removes.load(Ordering::Relaxed);
+        if outstanding > MAX_OUTSTANDING_REMOVES {
+            bail!(
+                "remove_cgroup '{name}' refused: {outstanding} cgroups outstanding \
+                 (cap {MAX_OUTSTANDING_REMOVES}); cgroup.procs draining wedged or \
+                 churn loop outpacing the kernel's RCU grace period — bailing to \
+                 avoid unbounded cgroupfs accumulation"
+            );
+        }
         let p = self.parent.join(name);
         if !p.exists() {
             return Ok(());
         }
+        match self.remove_cgroup_inner(name, &p) {
+            Ok(()) => {
+                // Successful remove: decrement (saturating at 0 so a
+                // remove of a cgroup we never failed-to-remove does
+                // not underflow the counter into usize::MAX).
+                self.outstanding_removes
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                        Some(n.saturating_sub(1))
+                    })
+                    .ok();
+                Ok(())
+            }
+            Err(err) => {
+                self.outstanding_removes.fetch_add(1, Ordering::Relaxed);
+                Err(err)
+            }
+        }
+    }
+
+    /// Inner body of [`Self::remove_cgroup`] — exists so the public
+    /// method can wrap the unfreeze/drain/rmdir result in the
+    /// outstanding-counter bookkeeping without duplicating the
+    /// sequence in success and failure arms.
+    fn remove_cgroup_inner(&self, name: &str, p: &Path) -> Result<()> {
         if let Err(err) = self.set_freeze(name, false)
             && anyhow_first_io_errno(&err) != Some(libc::ENOENT)
         {
@@ -568,7 +660,7 @@ impl CgroupManager {
         }
         self.drain_tasks(name)?;
         std::thread::sleep(std::time::Duration::from_millis(50));
-        fs::remove_dir(&p).with_context(|| format!("rmdir {}", p.display()))
+        fs::remove_dir(p).with_context(|| format!("rmdir {}", p.display()))
     }
 
     /// Write `cpuset.cpus` for a child cgroup.
@@ -641,11 +733,43 @@ impl CgroupManager {
     /// the locked LLCs, avoiding cross-socket DRAM latency for gcc's
     /// symbol tables and linker working sets.
     ///
-    /// Must be called AFTER [`set_cpuset`] and BEFORE any
-    /// [`move_task`]: a task in a cgroup whose `cpuset.mems` is empty
-    /// either fails migration with EINVAL or (if it somehow gets in)
-    /// hits SIGKILL on the next allocation per the kernel's
-    /// `cpuset_update_task_spread` path.
+    /// # Ordering contract
+    ///
+    /// Caller MUST have already called [`Self::set_cpuset`] (or
+    /// equivalent direct write to `cpuset.cpus`) and — when running
+    /// under a parent that may narrow the set — MUST have read back
+    /// `cpuset.cpus.effective` to detect kernel-side narrowing
+    /// BEFORE invoking this method. The per-knob ordering is
+    /// load-bearing: `crate::vmm::cgroup_sandbox::BuildSandbox`
+    /// interleaves `cpuset.cpus.effective` readback between the
+    /// `cpuset.cpus` and `cpuset.mems` writes to abort on narrowing
+    /// under the `--cpu-cap` hard-error contract; folding the two
+    /// writes into a single helper would erase that gate.
+    ///
+    /// A cgroup whose `cpuset.cpus` is set should also have a
+    /// non-empty `cpuset.mems.effective` before any task is migrated
+    /// into it: the half-configured shape (cpus set locally, no
+    /// nodemask anywhere up the hierarchy) is suspicious enough that
+    /// the framework refuses it. The kernel itself does NOT
+    /// SIGKILL on first allocation — `guarantee_online_mems`
+    /// (`kernel/cgroup/cpuset.c`) walks UP via `parent_cs(cs)` until
+    /// `effective_mems` intersects `node_states[N_MEMORY]`, and the
+    /// top cpuset always has online memory, so the walk always finds
+    /// a non-empty mask. The actual kernel behavior under a fully
+    /// empty hierarchy is path-dependent (parent-walk fallback
+    /// generally succeeds; degenerate states without any online
+    /// memory may OOM). cgroup v2's `cpuset_can_attach_check` only
+    /// rejects empty `effective_cpus`, not empty `effective_mems`.
+    /// In cgroup v2, the local `cpuset.mems` file is normally empty
+    /// (the cgroup inherits from its parent via `effective_mems`),
+    /// so reading the local file alone would falsely flag every
+    /// inheriting child. [`Self::move_task`] enforces the gate at
+    /// runtime by reading the cgroup's `cpuset.cpus` and
+    /// `cpuset.mems.effective` files before each migration and
+    /// refusing the write if `cpuset.cpus` is non-empty while
+    /// `cpuset.mems.effective` is empty — surfacing a focused
+    /// error rather than letting a half-configured cgroup through
+    /// to the kernel's path-dependent behavior.
     pub fn set_cpuset_mems(&self, name: &str, nodes: &BTreeSet<usize>) -> Result<()> {
         validate_cgroup_name(name)?;
         let p = self.parent.join(name).join("cpuset.mems");
@@ -836,10 +960,130 @@ impl CgroupManager {
     }
 
     /// Move a single task into a child cgroup via `cgroup.procs`.
+    ///
+    /// `move_task` is host-side scenario orchestration, never
+    /// invoked from a vCPU thread, so the bare `fs::read_to_string`
+    /// reads in [`Self::check_cpuset_ordering`] are not bounded by
+    /// the freeze-rendezvous timeout. A wedged cgroupfs read here
+    /// would stall the orchestrator thread, not a vCPU.
+    ///
+    /// # cpuset ordering gate
+    ///
+    /// Before issuing the `cgroup.procs` write, the method reads the
+    /// destination's `cpuset.cpus` (the local-write knob the caller
+    /// either set or did not) and `cpuset.mems.effective` (the
+    /// kernel's effective view, inheritance-aware). The gate
+    /// refuses migrations into a cgroup whose `cpuset.cpus` is set
+    /// but `cpuset.mems.effective` reads empty — a half-configured
+    /// state we surface as a focused error rather than letting it
+    /// through to the kernel.
+    ///
+    /// The kernel's behavior on the half-configured shape is
+    /// path-dependent: `guarantee_online_mems`
+    /// (`kernel/cgroup/cpuset.c`) walks UP via `parent_cs(cs)`
+    /// until `effective_mems` intersects `node_states[N_MEMORY]`,
+    /// and the top cpuset always has online memory, so the walk
+    /// generally succeeds; the empty-nodemask OOM path is reachable
+    /// only in degenerate hierarchies. cgroup v2's
+    /// `cpuset_can_attach_check` rejects only empty `effective_cpus`
+    /// (not empty `effective_mems`), so a v2 attach into a cgroup
+    /// with empty `effective_mems` is not a hard kernel error
+    /// either. The framework refuses the migration anyway because
+    /// the half-configured shape almost always reflects a missing
+    /// [`Self::set_cpuset_mems`] call; surfacing it directly is
+    /// more debuggable than letting it become whatever the kernel
+    /// happens to do on this particular hierarchy.
+    ///
+    /// # Why `cpuset.mems.effective`, not `cpuset.mems`
+    ///
+    /// In cgroup v2, the local `cpuset.mems` file echoes
+    /// `cs->mems_allowed` — the LOCAL nodemask, which is empty by
+    /// default until the caller explicitly writes it. The kernel's
+    /// allocation path uses `cs->effective_mems` instead, which
+    /// inherits from the parent when the local mask is empty (per
+    /// `cpuset_common_seq_show`'s FILE_EFFECTIVE_MEMLIST branch and
+    /// `guarantee_online_mems`'s `parent_cs(cs)` walk). A gate that
+    /// reads the local file would falsely flag every inheriting
+    /// child as half-configured even though the kernel sees a
+    /// perfectly valid `effective_mems` from the parent. The
+    /// effective view captures both "this cgroup wrote `cpuset.mems`
+    /// directly" and "this cgroup inherits a non-empty mask from
+    /// its parent" without false positives.
+    ///
+    /// Both reads are best-effort — a cgroup without cpuset
+    /// controllers (`cpuset.cpus` does not exist) bypasses the
+    /// gate, matching the kernel's "no cpuset constraints to
+    /// enforce" path. Read errors on either knob are absorbed: the
+    /// gate exists to catch the configured-but-half-configured
+    /// shape, not to fight cgroupfs read failures. If
+    /// `cpuset.mems.effective` cannot be read for any reason, the
+    /// gate degrades to "accept" — it cannot make a sound decision
+    /// without the kernel's effective view.
     pub fn move_task(&self, name: &str, pid: libc::pid_t) -> Result<()> {
         validate_cgroup_name(name)?;
+        self.check_cpuset_ordering(name)?;
         let p = self.parent.join(name).join("cgroup.procs");
         write_with_timeout(&p, &pid.to_string(), CGROUP_WRITE_TIMEOUT)
+    }
+
+    /// Verify that a cgroup's `cpuset.cpus` /
+    /// `cpuset.mems.effective` are in a consistent state before
+    /// admitting a task migration into it.
+    ///
+    /// Returns `Err` only when the destination has `cpuset.cpus`
+    /// non-empty AND `cpuset.mems.effective` reads empty — a
+    /// half-configured shape we surface as a focused error rather
+    /// than letting through. The kernel's behavior in this state is
+    /// path-dependent: `guarantee_online_mems` (`kernel/cgroup/
+    /// cpuset.c`) walks UP via `parent_cs(cs)` until effective_mems
+    /// intersects `node_states[N_MEMORY]` and the top cpuset always
+    /// has online memory, so the parent-walk fallback usually
+    /// succeeds; degenerate hierarchies may OOM. cgroup v2's
+    /// `cpuset_can_attach_check` rejects only empty `effective_cpus`,
+    /// not empty `effective_mems`. All other shapes (no cpuset
+    /// controller, local cpus empty, effective mems non-empty
+    /// whether locally written or parent-inherited) are accepted.
+    ///
+    /// Read failures on either knob are absorbed (the gate degrades
+    /// to "accept" rather than blocking on any cgroupfs read
+    /// error). The effective-view file is the source of truth
+    /// because in cgroup v2 the local `cpuset.mems` is normally
+    /// empty (the cgroup inherits from its parent via
+    /// `effective_mems`); reading the local file would emit false
+    /// positives for every child that inherits a parent's NUMA
+    /// budget without writing its own.
+    fn check_cpuset_ordering(&self, name: &str) -> Result<()> {
+        let cpus_path = self.parent.join(name).join("cpuset.cpus");
+        let mems_effective_path = self.parent.join(name).join("cpuset.mems.effective");
+        let cpus = match fs::read_to_string(&cpus_path) {
+            Ok(s) => s,
+            Err(_) => return Ok(()),
+        };
+        // `cpuset.cpus` is empty when the cgroup inherits from its
+        // parent — no constraint imposed locally, so the
+        // `cpuset.mems` invariant doesn't apply.
+        if cpus.trim().is_empty() {
+            return Ok(());
+        }
+        let mems_effective = match fs::read_to_string(&mems_effective_path) {
+            Ok(s) => s,
+            Err(_) => return Ok(()),
+        };
+        if mems_effective.trim().is_empty() {
+            bail!(
+                "move_task into '{name}' refused: cpuset.cpus is set ({}) \
+                 but cpuset.mems.effective reads empty — half-configured \
+                 cgroup. The kernel's behavior here is path-dependent \
+                 (guarantee_online_mems walks up to find a non-empty \
+                 ancestor mask; the empty-nodemask OOM path is reachable \
+                 only in degenerate hierarchies), but the framework \
+                 surfaces a focused error rather than letting the \
+                 migration through. Call set_cpuset_mems on this cgroup \
+                 or widen an ancestor's cpuset.mems before move_task",
+                cpus.trim(),
+            );
+        }
+        Ok(())
     }
 
     /// Move multiple tasks into a child cgroup by PID.
@@ -2147,6 +2391,278 @@ mod tests {
             "cleanup_recursive must write '0' to cgroup.freeze before draining \
              (mirrors remove_cgroup auto-unfreeze for state hygiene)",
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -- outstanding-removes cap ------------------------------------
+
+    /// `remove_cgroup` increments `outstanding_removes` on every
+    /// failure. Drives a non-existent parent path so the underlying
+    /// `set_freeze` / `drain_tasks` / `rmdir` chain reaches the
+    /// rmdir step and fails (the parent directory is created by the
+    /// test, but the child does not exist on every iteration after
+    /// the first because nothing creates it). Verifies the counter
+    /// rises monotonically as failures accumulate.
+    #[test]
+    fn remove_cgroup_increments_outstanding_on_failure() {
+        let dir =
+            std::env::temp_dir().join(format!("ktstr-cg-outstanding-{}", std::process::id()));
+        let inner = dir.join("cg_x");
+        fs::create_dir_all(&inner).unwrap();
+        // Seed cgroup.procs so drain_tasks succeeds; rmdir will then
+        // fail on tmpfs because cgroup.procs (a regular file the
+        // test created) is still inside the directory and tmpfs
+        // does not auto-unlink children.
+        fs::write(inner.join("cgroup.procs"), "").unwrap();
+        let cg = CgroupManager::new(dir.to_str().unwrap());
+        assert_eq!(cg.outstanding_removes(), 0);
+        // First call: rmdir fails with ENOTEMPTY → counter goes to 1.
+        let _ = cg.remove_cgroup("cg_x");
+        assert_eq!(
+            cg.outstanding_removes(),
+            1,
+            "outstanding_removes must increment when rmdir fails"
+        );
+        // Re-create the seed state (drain_tasks may have left the dir
+        // intact since rmdir failed) so the next remove can fail again.
+        fs::create_dir_all(&inner).unwrap();
+        fs::write(inner.join("cgroup.procs"), "").unwrap();
+        let _ = cg.remove_cgroup("cg_x");
+        assert_eq!(
+            cg.outstanding_removes(),
+            2,
+            "outstanding_removes must increment monotonically on repeat failures"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `remove_cgroup` decrements `outstanding_removes` on success
+    /// (saturating at 0 so a remove of a never-failed cgroup does
+    /// not underflow into usize::MAX). Drives a successful remove
+    /// path through a fully-clean tmpdir (no leftover non-cgroupfs
+    /// files) and verifies the counter drops back from a seeded
+    /// non-zero state.
+    #[test]
+    fn remove_cgroup_decrements_outstanding_on_success() {
+        let dir = std::env::temp_dir().join(format!("ktstr-cg-decrement-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let cg = CgroupManager::new(dir.to_str().unwrap());
+        // Seed the counter to simulate a prior failure.
+        cg.outstanding_removes.store(3, Ordering::Relaxed);
+        // Create + remove a cgroup that has nothing inside but the
+        // directory itself, so rmdir succeeds on tmpfs.
+        let inner = dir.join("cg_clean");
+        fs::create_dir_all(&inner).unwrap();
+        cg.remove_cgroup("cg_clean").unwrap();
+        assert_eq!(
+            cg.outstanding_removes(),
+            2,
+            "successful remove must decrement outstanding_removes by 1"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Once `outstanding_removes` exceeds [`MAX_OUTSTANDING_REMOVES`],
+    /// further [`CgroupManager::remove_cgroup`] calls bail without
+    /// touching the filesystem. Pin the message shape so a regression
+    /// that silences the bail or rephrases the diagnostic surfaces
+    /// here.
+    #[test]
+    fn remove_cgroup_bails_when_cap_exceeded() {
+        let dir = std::env::temp_dir().join(format!("ktstr-cg-cap-{}", std::process::id()));
+        let inner = dir.join("cg_x");
+        fs::create_dir_all(&inner).unwrap();
+        let cg = CgroupManager::new(dir.to_str().unwrap());
+        cg.outstanding_removes
+            .store(MAX_OUTSTANDING_REMOVES + 1, Ordering::Relaxed);
+        let err = cg
+            .remove_cgroup("cg_x")
+            .expect_err("cap-exceeded remove must surface as Err");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("outstanding") && msg.contains("cap"),
+            "error must cite the cap; got: {msg}"
+        );
+        // The cgroup directory must still exist — the bail short-
+        // circuited before any rmdir attempt.
+        assert!(
+            inner.exists(),
+            "cap-exceeded bail must not touch the filesystem"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `remove_cgroup` on a missing directory returns Ok and does
+    /// NOT touch the outstanding counter — the cgroup was already
+    /// reaped (e.g. by an earlier remove or `cleanup_all`), so it
+    /// is not "outstanding" and should not skew the budget.
+    #[test]
+    fn remove_cgroup_missing_dir_does_not_touch_counter() {
+        let cg = CgroupManager::new("/nonexistent/ktstr-missing-counter");
+        cg.outstanding_removes.store(5, Ordering::Relaxed);
+        cg.remove_cgroup("no_such_cgroup").unwrap();
+        assert_eq!(
+            cg.outstanding_removes(),
+            5,
+            "missing-dir early return must not decrement the counter"
+        );
+    }
+
+    // -- move_task cpuset ordering gate -----------------------------
+
+    /// [`CgroupManager::move_task`] refuses migrations into a cgroup
+    /// whose `cpuset.cpus` is set but `cpuset.mems.effective` reads
+    /// empty — a half-configured shape the framework surfaces as a
+    /// focused error rather than letting through to the kernel's
+    /// path-dependent behavior (parent-walk fallback in
+    /// `guarantee_online_mems`, or OOM in degenerate hierarchies).
+    /// The gate keys on `cpuset.mems.effective` (the kernel's
+    /// inheritance-aware view) rather than the local `cpuset.mems`
+    /// because in cgroup v2 the local file is normally empty even
+    /// when the cgroup inherits a valid `effective_mems` from its
+    /// parent. Pin the runtime gate so a regression that drops the
+    /// readback surfaces here.
+    #[test]
+    fn move_task_refuses_when_cpuset_cpus_set_but_effective_mems_empty() {
+        let dir =
+            std::env::temp_dir().join(format!("ktstr-cg-cpuset-gate-{}", std::process::id()));
+        let inner = dir.join("cg_x");
+        fs::create_dir_all(&inner).unwrap();
+        // Configured: cpuset.cpus has bits; cpuset.mems.effective
+        // empty (no inherited nodemask either).
+        fs::write(inner.join("cpuset.cpus"), "0-1").unwrap();
+        fs::write(inner.join("cpuset.mems.effective"), "").unwrap();
+        let cg = CgroupManager::new(dir.to_str().unwrap());
+        let err = cg
+            .move_task("cg_x", 1)
+            .expect_err("half-configured cpuset must refuse move_task");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("cpuset.mems.effective") && msg.contains("set_cpuset_mems"),
+            "error must cite cpuset.mems.effective and direct caller to set_cpuset_mems; got: {msg}"
+        );
+        // No write to cgroup.procs should have landed.
+        let procs_path = inner.join("cgroup.procs");
+        assert!(
+            !procs_path.exists(),
+            "gate must bail before any cgroup.procs write; cgroup.procs exists at {procs_path:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// [`CgroupManager::move_task`] admits migrations when
+    /// `cpuset.cpus` is set locally and `cpuset.mems.effective` is
+    /// non-empty (whether populated by a local `cpuset.mems` write
+    /// or by parent inheritance). Test observes that the gate
+    /// accepts the call by completing the underlying tmpfs write to
+    /// `cgroup.procs` without bailing.
+    #[test]
+    fn move_task_admits_when_cpus_set_and_effective_mems_non_empty() {
+        let dir =
+            std::env::temp_dir().join(format!("ktstr-cg-cpuset-ok-{}", std::process::id()));
+        let inner = dir.join("cg_x");
+        fs::create_dir_all(&inner).unwrap();
+        fs::write(inner.join("cpuset.cpus"), "0-1").unwrap();
+        fs::write(inner.join("cpuset.mems.effective"), "0").unwrap();
+        let cg = CgroupManager::new(dir.to_str().unwrap());
+        // Pre-create cgroup.procs so the underlying write succeeds
+        // on tmpfs (not a real cgroupfs, so the write just appends
+        // to a regular file, but that's fine — the assertion is
+        // that the gate did NOT bail).
+        fs::write(inner.join("cgroup.procs"), "").unwrap();
+        cg.move_task("cg_x", 1)
+            .expect("non-empty effective mems must admit move_task");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// [`CgroupManager::move_task`] admits migrations when the local
+    /// `cpuset.mems` is empty (the v2 default for an inheriting
+    /// child) but `cpuset.mems.effective` is non-empty because the
+    /// parent supplies the nodemask. This is the canonical case the
+    /// previous `cpuset.mems`-based gate would have wrongly refused;
+    /// pin the inheritance-aware path so a regression that reverts
+    /// to reading the local file fails this test.
+    #[test]
+    fn move_task_admits_when_local_mems_empty_but_effective_inherited() {
+        let dir = std::env::temp_dir()
+            .join(format!("ktstr-cg-cpuset-inherit-mems-{}", std::process::id()));
+        let inner = dir.join("cg_x");
+        fs::create_dir_all(&inner).unwrap();
+        fs::write(inner.join("cpuset.cpus"), "0-1").unwrap();
+        // Local cpuset.mems empty: the v2 default for an inheriting
+        // child. The kernel's effective view shows the inherited
+        // nodemask "0" — the gate must use the effective view.
+        fs::write(inner.join("cpuset.mems"), "").unwrap();
+        fs::write(inner.join("cpuset.mems.effective"), "0").unwrap();
+        fs::write(inner.join("cgroup.procs"), "").unwrap();
+        let cg = CgroupManager::new(dir.to_str().unwrap());
+        cg.move_task("cg_x", 1)
+            .expect("inherited effective mems must admit move_task");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// [`CgroupManager::move_task`] admits migrations when
+    /// `cpuset.cpus` is empty (cgroup inherits parent's cpuset —
+    /// no local constraint, so the `cpuset.mems.effective`
+    /// invariant doesn't apply). The kernel allows attach into
+    /// such a cgroup without a local cpus mask.
+    #[test]
+    fn move_task_admits_when_cpuset_cpus_empty() {
+        let dir =
+            std::env::temp_dir().join(format!("ktstr-cg-cpuset-inherit-{}", std::process::id()));
+        let inner = dir.join("cg_x");
+        fs::create_dir_all(&inner).unwrap();
+        fs::write(inner.join("cpuset.cpus"), "").unwrap();
+        // Whether cpuset.mems.effective is set or not is irrelevant
+        // when local cpus is empty — the gate short-circuits before
+        // reading the effective file.
+        fs::write(inner.join("cpuset.mems.effective"), "").unwrap();
+        fs::write(inner.join("cgroup.procs"), "").unwrap();
+        let cg = CgroupManager::new(dir.to_str().unwrap());
+        cg.move_task("cg_x", 1)
+            .expect("inherit-cpuset cgroup must admit move_task");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// [`CgroupManager::move_task`] admits migrations when
+    /// `cpuset.cpus` does not exist at all (cgroup has no cpuset
+    /// controller — the gate has nothing to enforce). Models a
+    /// cgroup tree without `+cpuset` in `subtree_control`.
+    #[test]
+    fn move_task_admits_when_cpuset_files_absent() {
+        let dir = std::env::temp_dir().join(format!("ktstr-cg-no-cpuset-{}", std::process::id()));
+        let inner = dir.join("cg_x");
+        fs::create_dir_all(&inner).unwrap();
+        // Deliberately omit cpuset.cpus / cpuset.mems.effective.
+        fs::write(inner.join("cgroup.procs"), "").unwrap();
+        let cg = CgroupManager::new(dir.to_str().unwrap());
+        cg.move_task("cg_x", 1)
+            .expect("no-cpuset cgroup must admit move_task");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// [`CgroupManager::move_task`] admits migrations when
+    /// `cpuset.cpus` is set but `cpuset.mems.effective` cannot be
+    /// read — the gate absorbs read failures on either knob and
+    /// degrades to "accept" rather than blocking on a transient
+    /// cgroupfs read error. Matches the general "read failures are
+    /// absorbed" contract documented on
+    /// [`CgroupManager::move_task`].
+    #[test]
+    fn move_task_admits_when_effective_mems_file_absent() {
+        let dir = std::env::temp_dir().join(format!(
+            "ktstr-cg-no-effective-mems-{}",
+            std::process::id()
+        ));
+        let inner = dir.join("cg_x");
+        fs::create_dir_all(&inner).unwrap();
+        fs::write(inner.join("cpuset.cpus"), "0-1").unwrap();
+        // Deliberately omit cpuset.mems.effective: read fails,
+        // gate degrades to accept.
+        fs::write(inner.join("cgroup.procs"), "").unwrap();
+        let cg = CgroupManager::new(dir.to_str().unwrap());
+        cg.move_task("cg_x", 1)
+            .expect("missing cpuset.mems.effective must admit move_task (read-failure absorb)");
         let _ = fs::remove_dir_all(&dir);
     }
 }

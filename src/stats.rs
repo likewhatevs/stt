@@ -4,7 +4,7 @@
 //! statistical analysis, regression detection, and run-to-run compare
 //! workflows.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use polars::prelude::*;
 
@@ -570,6 +570,103 @@ pub const WAKE_LATENCY_TAIL_RATIO_MIN_ITERATIONS: u64 = 100;
 /// Look up a metric definition by name.
 pub fn metric_def(name: &str) -> Option<&'static MetricDef> {
     METRICS.iter().find(|m| m.name == name)
+}
+
+/// Infer the regression polarity (`higher_is_worse`) of a metric
+/// not present in [`METRICS`].
+///
+/// Used by [`crate::assert::AssertResult::merge`] when it folds an
+/// `ext_metrics` value whose name is not registered. Returning the
+/// wrong polarity here surfaces as a silent merge bug: a
+/// throughput-shaped metric (`*_iops`, `*_throughput`) folded with
+/// `max` keeps the BETTER value across cgroups instead of the
+/// worst, masking the cgroup that fell behind. The previous
+/// fallback (`unwrap_or(true)` — always max) had this exact bug
+/// for any payload-author metric whose name was not pre-registered
+/// in the static `METRICS` table.
+///
+/// The inference is name-substring based, in the style of the
+/// `Polarity::Unknown` fallback used by `MetricHint`. The token
+/// list mirrors the polarity choices in [`METRICS`] for the
+/// metrics already registered there:
+///
+/// - Tokens that signal HigherBetter (returned `false`):
+///   `iops`, `throughput`, `bandwidth`, `iterations`, `ops_per_sec`,
+///   `locality`, `_score`, `goodput`. The scheduler-test fixture's
+///   `total_iterations` and `worst_iterations_per_worker` already
+///   carry this polarity in the registry; a payload-author metric
+///   like `jobs.0.read.iops` from the schbench LlmExtract path
+///   should fold the same way.
+/// - Tokens that signal LowerBetter (returned `true`):
+///   `latency`, `delay`, `gap`, `stall`, `cv`, `error`, `fail`,
+///   `drop`, `spread`, `_us`, `_ms`, `_ns`, `migration_ratio`,
+///   `imbalance`. These are the polarity signals from the existing
+///   registered LowerBetter entries (`worst_p99_wake_latency_us`,
+///   `worst_run_delay_us`, `worst_gap_ms`, `stall_count`,
+///   `worst_wake_latency_cv`, `worst_spread`, `worst_migration_ratio`,
+///   `max_imbalance_ratio`).
+///
+/// When a name matches no token (e.g. `bogo_ops`, `read_kb`,
+/// `jobs.0.runtime`), returns `true` (LowerBetter). The fallback
+/// is conservative for regression detection: a payload that emits
+/// a not-yet-classifiable metric and then folds an unexpectedly
+/// high value across cgroups is more useful surfaced than silently
+/// kept at the minimum (which would mask the high reading
+/// entirely). Authors who need a different default should register
+/// a [`MetricDef`] in [`METRICS`] or tag the metric via
+/// [`crate::test_support::payload::MetricHint`].
+///
+/// Token order matters when names contain both signals (e.g. the
+/// hypothetical `low_iops_latency_ms` would match `latency` first
+/// and be classified as higher-is-worse). The token lists above
+/// are tested by `infer_higher_is_worse_*` in this module's tests.
+pub fn infer_higher_is_worse(name: &str) -> bool {
+    // First-pass: explicit "higher value is the regression" signals
+    // (latency, delay, error, etc.). Checked first so a name
+    // carrying both kinds of token (rare; e.g. `*_iops_latency_us`)
+    // resolves to the latency interpretation, which matches the
+    // semantics of compound counters/timers.
+    const HIGHER_IS_WORSE_TOKENS: &[&str] = &[
+        "latency",
+        "delay",
+        "_gap",
+        "stall",
+        "_cv",
+        "error",
+        "fail",
+        "drop",
+        "spread",
+        "_us",
+        "_ms",
+        "_ns",
+        "migration_ratio",
+        "imbalance",
+    ];
+    if HIGHER_IS_WORSE_TOKENS.iter().any(|t| name.contains(t)) {
+        return true;
+    }
+    // Second-pass: "higher value is the improvement" signals
+    // (throughput, iops, etc.). Matching here returns `false`
+    // (LowerBetter inverted into HigherBetter, i.e. min is the
+    // worst-case fold).
+    const HIGHER_IS_BETTER_TOKENS: &[&str] = &[
+        "iops",
+        "throughput",
+        "bandwidth",
+        "iterations",
+        "ops_per_sec",
+        "locality",
+        "_score",
+        "goodput",
+    ];
+    if HIGHER_IS_BETTER_TOKENS.iter().any(|t| name.contains(t)) {
+        return false;
+    }
+    // Conservative fallback: treat as higher-is-worse so a folded
+    // value is the maximum across cgroups. Surfacing a maximum is
+    // safer than masking it; payload authors who disagree should
+    // register the metric.
+    true
 }
 
 /// Render the [`METRICS`] registry for `cargo ktstr stats list-metrics`.
@@ -2233,6 +2330,15 @@ fn col_mean_std(df: &DataFrame, name: &str) -> (f64, f64) {
 }
 
 /// Find outlier (scenario, flags) pairs where a metric exceeds 2 sigma.
+///
+/// Builds one combined `group_by(scenario).agg(...)` plan that
+/// computes the per-scenario mean of every relevant metric in a
+/// single pass. Each metric's mean column lands under a unique
+/// `mean__{metric}` alias so the per-metric outlier-emission loop
+/// can look it up by name. The prior implementation issued M
+/// separate lazy plans (one collect per metric); polars's group-by
+/// is not free, and re-grouping the same DataFrame on the same key
+/// for each of the 13 metrics paid the partition cost 13 times.
 fn find_outliers(df: &DataFrame) -> Vec<Outlier> {
     let metrics: &[&str] = &[
         "spread",
@@ -2249,55 +2355,85 @@ fn find_outliers(df: &DataFrame) -> Vec<Outlier> {
         "worst_mean_run_delay_us",
         "worst_run_delay_us",
     ];
+
+    // Pre-compute (overall_mean, overall_std) for every metric and
+    // drop those whose std is below epsilon (or whose column is
+    // absent — `col_mean_std` returns `(0.0, 0.0)` for missing
+    // columns). Only the surviving metrics enter the combined
+    // aggregation plan; including a zero-std metric would still be
+    // correct but pays the per-column aggregation cost for nothing.
+    struct ActiveMetric {
+        name: &'static str,
+        overall_mean: f64,
+        overall_std: f64,
+        threshold: f64,
+        mean_alias: String,
+    }
+    let active: Vec<ActiveMetric> = metrics
+        .iter()
+        .filter_map(|&m| {
+            let (overall_mean, overall_std) = col_mean_std(df, m);
+            if overall_std < f64::EPSILON {
+                return None;
+            }
+            Some(ActiveMetric {
+                name: m,
+                overall_mean,
+                overall_std,
+                threshold: overall_mean + 2.0 * overall_std,
+                mean_alias: format!("mean__{m}"),
+            })
+        })
+        .collect();
+
+    if active.is_empty() {
+        return Vec::new();
+    }
+
+    // Single combined group-by: one `mean(metric).alias(...)` per
+    // active metric, executed in one polars plan instead of M.
+    let aggs: Vec<Expr> = active
+        .iter()
+        .map(|am| col(am.name).mean().alias(am.mean_alias.as_str()))
+        .collect();
+    let grouped = df
+        .clone()
+        .lazy()
+        .group_by([col("scenario")])
+        .agg(aggs)
+        .collect();
+    let grouped = match grouped {
+        Ok(g) => g,
+        Err(_) => return Vec::new(),
+    };
+
+    let scenarios = match col_str(&grouped, "scenario") {
+        Some(s) => s,
+        None => return Vec::new(),
+    };
+
     let mut outliers = Vec::new();
-
-    for &metric in metrics {
-        let (overall_mean, overall_std) = col_mean_std(df, metric);
-        if overall_std < f64::EPSILON {
-            continue;
-        }
-        let threshold = overall_mean + 2.0 * overall_std;
-
-        // Group by scenario, compute mean of metric across topologies.
-        let grouped = df
-            .clone()
-            .lazy()
-            .group_by([col("scenario")])
-            .agg([
-                col(metric).mean().alias("metric_mean"),
-                col(metric).max().alias("metric_max"),
-            ])
-            .collect();
-
-        let grouped = match grouped {
-            Ok(g) => g,
-            Err(_) => continue,
+    for am in &active {
+        let means = match col_f64(&grouped, &am.mean_alias) {
+            Some(m) => m,
+            None => continue,
         };
-
-        let scenarios = col_str(&grouped, "scenario");
-        let means = col_f64(&grouped, "metric_mean");
-
-        let (scenarios, means) = match (scenarios, means) {
-            (Some(s), Some(m)) => (s, m),
-            _ => continue,
-        };
-
         for i in 0..grouped.height() {
             let mean_val = means.get(i).unwrap_or(0.0);
-            if mean_val <= threshold {
+            if mean_val <= am.threshold {
                 continue;
             }
-            let sigma = (mean_val - overall_mean) / overall_std;
+            let sigma = (mean_val - am.overall_mean) / am.overall_std;
             let sc = scenarios.get(i).unwrap_or("");
 
             // Find worst topologies for this scenario.
-            let worst = find_worst_topos(df, sc, metric, threshold);
+            let worst = find_worst_topos(df, sc, am.name, am.threshold);
 
             outliers.push(Outlier {
                 scenario: sc.to_string(),
-                metric,
+                metric: am.name,
                 value: mean_val,
-                overall_mean,
+                overall_mean: am.overall_mean,
                 sigma,
                 worst_topos: worst,
             });
@@ -3090,6 +3226,29 @@ pub(crate) fn compare_rows_by(
 ) -> CompareReport {
     let mut report = CompareReport::default();
 
+    // Build a HashMap<PairingKey, &GauntletRow> from rows_a once so
+    // each row_b lookup is O(1) instead of O(rows_a). `or_insert_with`
+    // preserves first-match semantics from the prior `rows_a.iter().find()`
+    // call: on the rare path where two A-side rows share a key (the
+    // averaging path produces unique keys; the `--no-average` path
+    // bails earlier via `check_no_duplicate_pairing_keys`), the
+    // earlier-iterated row wins.
+    let mut a_by_key: HashMap<PairingKey, &GauntletRow> =
+        HashMap::with_capacity(rows_a.len());
+    for row_a in rows_a {
+        let key = PairingKey::from_row(row_a, pairing_dims);
+        a_by_key.entry(key).or_insert(row_a);
+    }
+
+    // Hoist the per-metric relative threshold out of the row×metric
+    // loop. `policy.rel_threshold(m.name, m.default_rel)` is a pure
+    // function of the metric — recomputing it for every row pair was
+    // O(rows_b × METRICS) BTreeMap probes for nothing.
+    let rel_thresholds: Vec<f64> = METRICS
+        .iter()
+        .map(|m| policy.rel_threshold(m.name, m.default_rel))
+        .collect();
+
     for row_b in rows_b {
         // Dynamic pairing key: scenario + every NON-slicing
         // dimension's value. Two rows pair iff their dynamic keys
@@ -3116,10 +3275,7 @@ pub(crate) fn compare_rows_by(
                 continue;
             }
         }
-        let row_a = rows_a
-            .iter()
-            .find(|r| PairingKey::from_row(r, pairing_dims) == key_b);
-        let Some(row_a) = row_a else {
+        let Some(&row_a) = a_by_key.get(&key_b) else {
             report.new_in_b += 1;
             continue;
         };
@@ -3135,14 +3291,14 @@ pub(crate) fn compare_rows_by(
             continue;
         }
 
-        for m in METRICS {
+        for (i, m) in METRICS.iter().enumerate() {
             let val_a = m.read(row_a).unwrap_or(0.0);
             let val_b = m.read(row_b).unwrap_or(0.0);
             if val_a.abs() < f64::EPSILON && val_b.abs() < f64::EPSILON {
                 continue;
             }
 
-            let rel_thresh = policy.rel_threshold(m.name, m.default_rel);
+            let rel_thresh = rel_thresholds[i];
 
             let delta = val_b - val_a;
             let rel_delta = if val_a.abs() > f64::EPSILON {
@@ -3182,7 +3338,17 @@ pub(crate) fn compare_rows_by(
 
     // Second pass: A-side rows whose key has no match on the B side.
     // Filter applies here too, so rows excluded by the filter never
-    // count as removed.
+    // count as removed. Build a HashSet<PairingKey> from rows_b once
+    // so the existence check is O(1) per row_a; rows_b are inserted
+    // unfiltered to preserve prior behaviour where a row_b that fails
+    // the substring filter still suppresses a same-key row_a's
+    // removed_from_a increment (the substring filter compares against
+    // identity-bearing fields including slicing dims, so two rows
+    // sharing a pairing key can disagree on filter membership).
+    let b_keys: HashSet<PairingKey> = rows_b
+        .iter()
+        .map(|r| PairingKey::from_row(r, pairing_dims))
+        .collect();
     for row_a in rows_a {
         let key_a = PairingKey::from_row(row_a, pairing_dims);
         if let Some(f) = filter {
@@ -3198,10 +3364,7 @@ pub(crate) fn compare_rows_by(
                 continue;
             }
         }
-        let exists_in_b = rows_b
-            .iter()
-            .any(|r| PairingKey::from_row(r, pairing_dims) == key_a);
-        if !exists_in_b {
+        if !b_keys.contains(&key_a) {
             report.removed_from_a += 1;
         }
     }
@@ -3726,13 +3889,23 @@ pub fn compare_partitions(
     // `compare_partitions` uses — picking representative hosts
     // off the partitioned sidecars rather than the full pool so
     // the delta reflects what actually fed the comparison.
+    //
+    // Zip the pool with the pre-computed `rows` (built once above
+    // via `pool.iter().map(sidecar_to_row).collect()`) so the
+    // per-side filter reuses the existing row instead of calling
+    // `sidecar_to_row` a second and third time. `pool` and `rows`
+    // are the same length and same iteration order by construction.
     let sidecars_a: Vec<&crate::test_support::SidecarResult> = pool
         .iter()
-        .filter(|s| filter_a.matches(&sidecar_to_row(s)))
+        .zip(rows.iter())
+        .filter(|(_, r)| filter_a.matches(r))
+        .map(|(s, _)| s)
         .collect();
     let sidecars_b: Vec<&crate::test_support::SidecarResult> = pool
         .iter()
-        .filter(|s| filter_b.matches(&sidecar_to_row(s)))
+        .zip(rows.iter())
+        .filter(|(_, r)| filter_b.matches(r))
+        .map(|(s, _)| s)
         .collect();
     let host_a = sidecars_a.iter().find_map(|s| s.host.as_ref());
     let host_b = sidecars_b.iter().find_map(|s| s.host.as_ref());
@@ -4781,6 +4954,97 @@ mod tests {
     #[test]
     fn metric_def_unknown() {
         assert!(metric_def("nonexistent").is_none());
+    }
+
+    #[test]
+    fn infer_higher_is_worse_latency_shaped() {
+        // Latency / delay / time-unit names are higher-is-worse.
+        // `AssertResult::merge` folds these by `max` (worst case).
+        for name in &[
+            "p99_wake_latency",
+            "wake_latency_us",
+            "scheduling_delay",
+            "task_run_delay_ns",
+            "io_completion_ms",
+            "stall_count",
+            "schedule_jitter_cv",
+            "max_gap_us",
+            "spread",
+            "page_drop_count",
+            "error_rate",
+            "fail_count",
+            "migration_ratio",
+            "imbalance_factor",
+        ] {
+            assert!(
+                infer_higher_is_worse(name),
+                "metric `{name}` must infer higher_is_worse=true \
+                 (latency/error-shaped); a folded max keeps the \
+                 worst case across cgroups"
+            );
+        }
+    }
+
+    #[test]
+    fn infer_higher_is_worse_throughput_shaped() {
+        // Throughput / rate / iteration-shaped names are
+        // higher-is-better. `AssertResult::merge` folds these by
+        // `min` (the cgroup that fell behind is the worst case).
+        for name in &[
+            "read_iops",
+            "write_iops",
+            "throughput_mbps",
+            "bandwidth_kb",
+            "total_iterations",
+            "iterations_per_worker",
+            "ops_per_sec",
+            "page_locality",
+            "pass_score",
+            "goodput",
+        ] {
+            assert!(
+                !infer_higher_is_worse(name),
+                "metric `{name}` must infer higher_is_worse=false \
+                 (throughput-shaped); a folded min surfaces the \
+                 cgroup that fell behind"
+            );
+        }
+    }
+
+    #[test]
+    fn infer_higher_is_worse_unknown_falls_back_to_higher_is_worse() {
+        // Names that don't match either token list fall back to
+        // higher-is-worse. The fold keeps the max — which surfaces
+        // an unexpectedly high reading rather than masking it under
+        // a min collapse.
+        for name in &[
+            "unrelated_field",
+            "random_thing",
+            "metric",
+            "x",
+            "a.b.c",
+        ] {
+            assert!(
+                infer_higher_is_worse(name),
+                "unknown metric `{name}` must fall back to \
+                 higher_is_worse=true (conservative for regression \
+                 detection)"
+            );
+        }
+    }
+
+    #[test]
+    fn infer_higher_is_worse_compound_names_resolve_to_latency() {
+        // Compound names that contain BOTH a latency-shaped token
+        // and a throughput-shaped token resolve to higher-is-worse
+        // (the latency interpretation wins). Pin the order-of-
+        // checks contract so a refactor that swaps the token lists
+        // surfaces here.
+        assert!(
+            infer_higher_is_worse("read_iops_latency_us"),
+            "compound name with `latency` and `iops` must resolve \
+             to higher-is-worse (latency token checked first)"
+        );
     }
 
     #[test]

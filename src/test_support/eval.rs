@@ -25,7 +25,7 @@ use crate::vmm;
 
 use super::output::{
     classify_init_stage, extract_kernel_version, extract_panic_message, extract_sched_ext_dump,
-    format_console_diagnostics, parse_assert_result, parse_assert_result_shm,
+    format_console_diagnostics, parse_assert_result, parse_assert_result_from_drain,
     sched_log_fingerprint,
 };
 use super::probe::attempt_auto_repro;
@@ -48,7 +48,7 @@ use super::runtime::{config_file_parts, verbose};
 
 /// Header body for a timed-out run with no parseable AssertResult.
 /// Pinned by `eval_timeout_no_result` and `eval_timeout_with_sched_includes_diagnostics`.
-pub(crate) const ERR_TIMED_OUT_NO_RESULT: &str = "timed out (no result in SHM or COM2)";
+pub(crate) const ERR_TIMED_OUT_NO_RESULT: &str = "timed out (no result via bulk port or COM2)";
 
 /// Header body for a run whose scenario passed but whose monitor
 /// verdict failed. Pinned by `eval_monitor_fail_has_fingerprint` and
@@ -59,7 +59,7 @@ pub(crate) const ERR_MONITOR_FAILED_AFTER_SCENARIO: &str = "passed scenario but 
 /// received from the guest. Pinned by `eval_sched_exits_no_com2_output`
 /// and `eval_sched_exits_with_sched_log`.
 pub(crate) const ERR_NO_TEST_RESULT_FROM_GUEST: &str = "no test result received from guest \
-     (no AssertResult arrived via SHM or COM2; check kernel log and \
+     (no AssertResult arrived via bulk port or COM2; check kernel log and \
      scheduler exit status)";
 
 /// Reason body when EEVDF (no scheduler) produced no AssertResult.
@@ -69,7 +69,7 @@ pub(crate) const ERR_NO_TEST_FUNCTION_OUTPUT: &str =
 
 /// Prefix for the `guest crashed: ...` reason body. Pinned by
 /// `eval_crash_in_output_says_guest_crashed`, `eval_crash_eevdf_says_guest_crashed`,
-/// and `eval_crash_message_from_shm`.
+/// and `eval_crash_message_from_field`.
 pub(crate) const ERR_GUEST_CRASHED_PREFIX: &str = "guest crashed:";
 
 /// Write a skip sidecar for `entry` + `active_flags`, logging to
@@ -149,26 +149,28 @@ pub(crate) fn record_skip_sidecar(entry: &KtstrTestEntry, active_flags: &[String
 /// metrics (no numeric leaves) with an `LlmExtract` placeholder.
 ///
 /// `shm_drops` is the
-/// [`crate::vmm::shm_ring::ShmDrainResult::drops`] counter — total
+/// [`crate::vmm::host_comms::BulkDrainResult`] counter — total
 /// messages the guest's `shm_write` dropped (ring full, or
-/// overflow paths that should not fire in practice). Post-multiport,
-/// the SHM ring carries only `MSG_TYPE_CRASH` (panic-hook fallback)
-/// plus any pre-port-open early-boot writes — `RawPayloadOutput`
-/// and `PayloadMetrics` travel via the virtio-console bulk port
-/// which uses backpressure rather than drops. So a non-zero
-/// `shm_drops` no longer indicates LlmExtract data loss; it means
-/// the SHM CRASH channel overflowed. The detail still surfaces
-/// when `raw_outputs` is non-empty so an LlmExtract test author
-/// sees the CRASH-channel signal alongside the rest of their
-/// extraction failures, but the failure framing has shifted from
-/// "LlmExtract truncation" to "CRASH ring overflow."
+/// overflow paths that should not fire in practice). Post-multiport
+/// and post-COM2-crash-migration, the SHM ring carries only
+/// pre-port-open early-boot writes from `write_msg`'s fallback path
+/// (panic-hook crash diagnostics now travel via COM2;
+/// `RawPayloadOutput` and `PayloadMetrics` travel via the
+/// virtio-console bulk port which uses backpressure rather than
+/// drops). So a non-zero `shm_drops` no longer indicates LlmExtract
+/// data loss; it means the early-boot SHM channel overflowed. The
+/// detail still surfaces when `raw_outputs` is non-empty so an
+/// LlmExtract test author sees the early-boot signal alongside the
+/// rest of their extraction failures, but the failure framing has
+/// shifted from "LlmExtract truncation" to "early-boot SHM ring
+/// overflow."
 ///
 /// Failure shape:
-/// - SHM CRASH ring overflow with LlmExtract in use: a single detail
-///   naming the drops counter so the test author knows to investigate
-///   guest panics or expand the SHM region. The detail does NOT
-///   block the rest of the host-side extraction path — the raw
-///   outputs that DID arrive still get processed.
+/// - Early-boot SHM ring overflow with LlmExtract in use: a single
+///   detail naming the drops counter so the test author knows to
+///   investigate the early-boot fallback or expand the SHM region.
+///   The detail does NOT block the rest of the host-side extraction
+///   path — the raw outputs that DID arrive still get processed.
 /// - Model load fails (e.g. `KTSTR_MODEL_OFFLINE=1` with cold cache,
 ///   SHA mismatch on a corrupted cached GGUF): append a single
 ///   `LlmExtract model load failed: <reason>` detail. metrics
@@ -209,35 +211,10 @@ pub(crate) fn record_skip_sidecar(entry: &KtstrTestEntry, active_flags: &[String
 fn host_side_llm_extract(
     payload_metrics: &mut [crate::test_support::PayloadMetrics],
     raw_outputs: &[crate::test_support::RawPayloadOutput],
-    shm_drops: u64,
 ) -> Vec<crate::assert::AssertDetail> {
     let mut failures = Vec::new();
     if raw_outputs.is_empty() {
         return failures;
-    }
-    // SHM ring overflow with LlmExtract in use: surface BEFORE the
-    // pairing loop so the operator sees the drops first. Post-
-    // multiport, RAW_PAYLOAD_OUTPUT and PAYLOAD_METRICS travel via
-    // the virtio-console bulk port — backpressure replaces drops,
-    // so a non-zero `shm_drops` no longer means LlmExtract data was
-    // lost. The SHM ring now carries only MSG_TYPE_CRASH (panic
-    // hook fallback) plus any pre-port-open early-boot writes, so
-    // we surface the overflow as a CRASH-channel signal rather than
-    // an LlmExtract truncation.
-    if shm_drops > 0 {
-        failures.push(crate::assert::AssertDetail::new(
-            crate::assert::DetailKind::Other,
-            format!(
-                "SHM CRASH ring overflow: {shm_drops} message(s) dropped on the SHM ring. \
-                 Post-multiport, RAW_PAYLOAD_OUTPUT and PAYLOAD_METRICS travel via the \
-                 virtio-console bulk port (/dev/vport0p1) which uses backpressure rather \
-                 than drops, so this counter no longer indicates LlmExtract data loss. \
-                 The SHM ring now carries only MSG_TYPE_CRASH (panic-hook fallback) plus \
-                 any pre-port-open early-boot writes, so a non-zero drops count means \
-                 the guest crash channel overflowed. Investigate concurrent guest \
-                 panics or expand the SHM region via the VMM's shm_size config."
-            ),
-        ));
     }
     // Build a HashMap from each PayloadMetrics' payload_index to its
     // position in the slice. Last-occurrence wins on duplicate
@@ -1435,7 +1412,7 @@ fn run_ktstr_test_inner_impl(
     let mut stimulus_events = Vec::new();
     let mut payload_metrics: Vec<crate::test_support::PayloadMetrics> = Vec::new();
     let mut raw_outputs: Vec<crate::test_support::RawPayloadOutput> = Vec::new();
-    if let Some(ref shm) = result.shm_data {
+    if let Some(ref shm) = result.guest_messages {
         for entry in &shm.entries {
             if entry.msg_type == MSG_TYPE_PROFRAW
                 && entry.crc_ok
@@ -1444,9 +1421,9 @@ fn run_ktstr_test_inner_impl(
             {
                 eprintln!("ktstr_test: write guest profraw: {e}");
             }
-            if entry.msg_type == crate::vmm::shm_ring::MSG_TYPE_STIMULUS
+            if entry.msg_type == crate::vmm::wire::MSG_TYPE_STIMULUS
                 && entry.crc_ok
-                && let Some(ev) = crate::vmm::shm_ring::StimulusEvent::from_payload(&entry.payload)
+                && let Some(ev) = crate::vmm::wire::StimulusEvent::from_payload(&entry.payload)
             {
                 stimulus_events.push(crate::timeline::StimulusEvent {
                     elapsed_ms: ev.elapsed_ms as u64,
@@ -1463,14 +1440,14 @@ fn run_ktstr_test_inner_impl(
                     },
                 });
             }
-            if entry.msg_type == crate::vmm::shm_ring::MSG_TYPE_PAYLOAD_METRICS && entry.crc_ok {
+            if entry.msg_type == crate::vmm::wire::MSG_TYPE_PAYLOAD_METRICS && entry.crc_ok {
                 match serde_json::from_slice::<crate::test_support::PayloadMetrics>(&entry.payload)
                 {
                     Ok(pm) => payload_metrics.push(pm),
                     Err(e) => eprintln!("ktstr_test: decode payload metrics from SHM: {e}"),
                 }
             }
-            if entry.msg_type == crate::vmm::shm_ring::MSG_TYPE_RAW_PAYLOAD_OUTPUT && entry.crc_ok {
+            if entry.msg_type == crate::vmm::wire::MSG_TYPE_RAW_PAYLOAD_OUTPUT && entry.crc_ok {
                 match serde_json::from_slice::<crate::test_support::RawPayloadOutput>(
                     &entry.payload,
                 ) {
@@ -1495,9 +1472,7 @@ fn run_ktstr_test_inner_impl(
     // Returns a flat `Vec<AssertDetail>` of host-side failures
     // (model unavailable, universal invariant violation, orphan
     // raw outputs) for the test verdict to fold in.
-    let shm_drops = result.shm_data.as_ref().map_or(0, |s| s.drops);
-    let host_extract_failures =
-        host_side_llm_extract(&mut payload_metrics, &raw_outputs, shm_drops);
+    let host_extract_failures = host_side_llm_extract(&mut payload_metrics, &raw_outputs);
 
     // auto_repro is enabled when:
     // - entry.auto_repro is true (default)
@@ -1631,7 +1606,7 @@ fn evaluate_vm_result(
     };
 
     if let Ok(mut check_result) =
-        parse_assert_result_shm(result.shm_data.as_ref()).or_else(|_| parse_assert_result(output))
+        parse_assert_result_from_drain(result.guest_messages.as_ref()).or_else(|_| parse_assert_result(output))
     {
         // Fold host-side LlmExtract failures into the guest's
         // AssertResult before the sidecar write so per-run stats
@@ -3631,7 +3606,7 @@ mod tests {
                 preemption_threshold_ns: 0,
                 watchdog_observation: None,
             }),
-            shm_data: None,
+            guest_messages: None,
             stimulus_events: Vec::new(),
             verifier_stats: Vec::new(),
             kvm_stats: None,
@@ -3838,14 +3813,24 @@ mod tests {
     }
 
     #[test]
-    fn eval_crash_message_from_shm() {
-        let entry = sched_entry("__eval_crash_shm__");
-        let shm_crash = "PANIC: panicked at src/test.rs:42: assertion failed\n   \
+    fn eval_crash_message_from_field() {
+        // `result.crash_message` (the structured-field path)
+        // carries the multiline `PANIC: ... \n   0: <frame>\n`
+        // backtrace populated by `freeze_coord::collect_results`
+        // from COM2's `extract_panic_message`. The eval path uses
+        // the structured field when set, falling back to a fresh
+        // `extract_panic_message(output)` call only when the field
+        // is `None`. The structured-field path renders the multiline
+        // form (`guest crashed:\n{crash}`) so the full backtrace is
+        // visible in the test failure.
+        let entry = sched_entry("__eval_crash_field__");
+        let crash = "PANIC: panicked at src/test.rs:42: assertion failed\n   \
                           0: ktstr::vmm::rust_init::ktstr_guest_init\n";
-        // COM2 also has a PANIC: line (serial fallback). SHM must take priority.
+        // COM2 also has a PANIC: line (serial). The structured
+        // field must take priority and render the multiline form.
         let output = "PANIC: panicked at src/test.rs:42: assertion failed";
         let mut result = make_vm_result(output, "", 1, false);
-        result.crash_message = Some(shm_crash.to_string());
+        result.crash_message = Some(crash.to_string());
         let assertions = crate::assert::Assert::NO_OVERRIDES;
         let err = evaluate_vm_result(
             &entry,
@@ -3866,14 +3851,15 @@ mod tests {
         );
         assert!(
             msg.contains("ktstr_guest_init"),
-            "SHM backtrace content should be present, got: {msg}",
+            "backtrace content should be present, got: {msg}",
         );
-        // SHM path uses "guest crashed:\n{shm_crash}" (multiline),
-        // COM2 path uses "guest crashed: {msg}" (single line).
-        // The backtrace frame proves SHM was used, not COM2.
+        // Structured-field path uses "guest crashed:\n{crash}"
+        // (multiline); the bare-output fallback uses "guest
+        // crashed: {msg}" (single line). The backtrace frame proves
+        // the structured field was used, not the fallback.
         assert!(
             msg.contains("0: ktstr::vmm::rust_init::ktstr_guest_init"),
-            "full backtrace from SHM should appear, got: {msg}",
+            "full backtrace from structured field should appear, got: {msg}",
         );
     }
 
@@ -3944,7 +3930,7 @@ mod tests {
                 preemption_threshold_ns: 0,
                 watchdog_observation: None,
             }),
-            shm_data: None,
+            guest_messages: None,
             stimulus_events: Vec::new(),
             verifier_stats: Vec::new(),
             kvm_stats: None,
@@ -4034,7 +4020,7 @@ mod tests {
                 preemption_threshold_ns: 0,
                 watchdog_observation: None,
             }),
-            shm_data: None,
+            guest_messages: None,
             stimulus_events: Vec::new(),
             verifier_stats: Vec::new(),
             kvm_stats: None,
@@ -4711,7 +4697,7 @@ mod tests {
                 ..crate::test_support::MetricBounds::NONE
             }),
         }];
-        let failures = host_side_llm_extract(&mut pm, &raws, 0);
+        let failures = host_side_llm_extract(&mut pm, &raws);
         // Exactly ONE failure detail — the load-failure. No
         // bounds violation because metrics is empty (placeholder)
         // and the bounds pass is guarded by `if let Some(bounds)`
@@ -4772,7 +4758,7 @@ mod tests {
     #[test]
     fn host_side_llm_extract_empty_raw_outputs_returns_no_failures() {
         let mut pm = vec![empty_pm(0), empty_pm(1)];
-        let failures = host_side_llm_extract(&mut pm, &[], 0);
+        let failures = host_side_llm_extract(&mut pm, &[]);
         assert!(failures.is_empty(), "empty raw outputs → no failures");
     }
 
@@ -4796,7 +4782,7 @@ mod tests {
         // post-pairing orphan-PM scan picks up.
         let mut pm = vec![empty_pm(0)];
         let raws = vec![empty_raw(42)];
-        let failures = host_side_llm_extract(&mut pm, &raws, 0);
+        let failures = host_side_llm_extract(&mut pm, &raws);
         let messages: Vec<&str> = failures.iter().map(|d| d.message.as_str()).collect();
         assert!(
             messages
@@ -4831,7 +4817,7 @@ mod tests {
     fn host_side_llm_extract_multiple_orphans_each_surface() {
         let mut pm = vec![empty_pm(0)];
         let raws = vec![empty_raw(10), empty_raw(20), empty_raw(30)];
-        let failures = host_side_llm_extract(&mut pm, &raws, 0);
+        let failures = host_side_llm_extract(&mut pm, &raws);
         let messages: Vec<&str> = failures.iter().map(|d| d.message.as_str()).collect();
         assert!(
             messages.iter().any(|m| m.contains("payload_index=10")),
@@ -4877,7 +4863,7 @@ mod tests {
     fn host_side_llm_extract_json_zero_leaves_not_conflated_with_llm_placeholder() {
         let mut pm = vec![empty_pm(5)];
         let raws = vec![empty_raw(99)];
-        let failures = host_side_llm_extract(&mut pm, &raws, 0);
+        let failures = host_side_llm_extract(&mut pm, &raws);
         let messages: Vec<&str> = failures.iter().map(|d| d.message.as_str()).collect();
         assert!(
             messages.iter().any(|m| m.contains("payload_index=99")),
@@ -4905,76 +4891,6 @@ mod tests {
         );
     }
 
-    /// SHM ring overflow with LlmExtract in use: a non-zero
-    /// `shm_drops` while raw outputs are present surfaces a
-    /// `SHM ring overflow` detail. Pins the design contract that
-    /// silent metric truncation must propagate as a host-actionable
-    /// failure rather than letting downstream stats see a
-    /// quietly-incomplete metric set.
-    ///
-    /// Constructed with an ORPHAN raw output (payload_index=99
-    /// has no matching `PayloadMetrics` slot) so the pairing
-    /// loop hits the orphan path and SKIPS `extract_via_llm`
-    /// entirely. The overflow detail surfaces from the pre-loop
-    /// drops check independently of whether any matched pairs
-    /// reached the model — this keeps the unit test fast (no
-    /// model load) while still pinning the overflow contract.
-    #[test]
-    fn host_side_llm_extract_shm_drops_with_raw_outputs_surfaces_overflow_detail() {
-        let mut pm = vec![empty_pm(0)];
-        let raws = vec![empty_raw(99)]; // orphan — no matching slot
-        let failures = host_side_llm_extract(&mut pm, &raws, 7);
-        let messages: Vec<&str> = failures.iter().map(|d| d.message.as_str()).collect();
-        assert!(
-            messages
-                .iter()
-                .any(|m| m.contains("SHM CRASH ring overflow")),
-            "drops > 0 with LlmExtract in use must surface 'SHM CRASH ring overflow': {messages:?}",
-        );
-        assert!(
-            messages.iter().any(|m| m.contains("7 message(s) dropped")),
-            "diagnostic must cite the actual drops count, got: {messages:?}",
-        );
-        // Orphan raw output also surfaces its own pairing failure
-        // — both signals coexist; one does not suppress the other.
-        assert!(
-            messages.iter().any(|m| m.contains("payload_index=99")),
-            "orphan pairing failure must still surface alongside overflow: {messages:?}",
-        );
-    }
-
-    /// Zero drops + zero raw outputs: no overflow detail surfaces
-    /// (correctly — there's nothing to report). Pins the
-    /// no-LlmExtract path so a regression that always emits the
-    /// overflow detail (false positive on every run) breaks here.
-    #[test]
-    fn host_side_llm_extract_zero_drops_and_no_raws_no_overflow_detail() {
-        let mut pm = vec![empty_pm(0)];
-        let failures = host_side_llm_extract(&mut pm, &[], 0);
-        assert!(
-            failures.is_empty(),
-            "no LlmExtract + no drops → no failures, got: {failures:?}",
-        );
-    }
-
-    /// Non-zero drops but no raw outputs: no overflow detail
-    /// surfaces. A drops counter > 0 in a Json/ExitCode-only test
-    /// is the VMM's responsibility to surface elsewhere — the
-    /// LlmExtract path owns this detail only when the
-    /// LlmExtract code path was actually exercised. Pins that the
-    /// `raw_outputs.is_empty()` early return short-circuits before
-    /// the drops check, keeping the detail scoped to the LlmExtract
-    /// caller's mental model.
-    #[test]
-    fn host_side_llm_extract_drops_without_raws_skips_overflow_detail() {
-        let mut pm = vec![empty_pm(0)];
-        let failures = host_side_llm_extract(&mut pm, &[], 42);
-        assert!(
-            failures.is_empty(),
-            "drops without LlmExtract raw outputs must not produce LlmExtract-scope detail, got: {failures:?}",
-        );
-    }
-
     // -- orphan-PayloadMetrics scan --
 
     /// An empty-metrics `PayloadMetrics` whose
@@ -4998,7 +4914,7 @@ mod tests {
         // so the orphan-PM scan can fire.
         let mut pm = vec![empty_pm(7), empty_pm(99)];
         let raws = vec![empty_raw(10), empty_raw(20)];
-        let failures = host_side_llm_extract(&mut pm, &raws, 0);
+        let failures = host_side_llm_extract(&mut pm, &raws);
         let messages: Vec<&str> = failures.iter().map(|d| d.message.as_str()).collect();
         // Both PMs (7 and 99) lack matching raws, so both are
         // surfaced in the orphan-PM scan's combined detail.
@@ -5053,7 +4969,7 @@ mod tests {
         // orphan-PM scan does NOT fire when raw_outputs is empty.
         let mut pm = vec![empty_pm(0), empty_pm(1)];
         let raws: Vec<crate::test_support::RawPayloadOutput> = Vec::new();
-        let failures = host_side_llm_extract(&mut pm, &raws, 0);
+        let failures = host_side_llm_extract(&mut pm, &raws);
         assert!(
             failures.is_empty(),
             "with no LlmExtract raws, orphan-PM scan must not fire (test is \
@@ -5113,7 +5029,7 @@ mod tests {
         let _offline = EnvVarGuard::set(crate::test_support::OFFLINE_ENV, "1");
         let mut pm = vec![empty_pm(0)];
         let raws = vec![empty_raw(0)];
-        let failures = host_side_llm_extract(&mut pm, &raws, 0);
+        let failures = host_side_llm_extract(&mut pm, &raws);
         // Under the offline gate, the stdout extract_via_llm call
         // returns Err — the load-failed branch fires. Empty stderr
         // also blocks the fallback, so a single load-failure detail
@@ -5170,7 +5086,7 @@ mod tests {
             metric_hints: Vec::new(),
             metric_bounds: None,
         }];
-        let failures = host_side_llm_extract(&mut pm, &raws, 0);
+        let failures = host_side_llm_extract(&mut pm, &raws);
         assert_eq!(
             failures.len(),
             1,
@@ -5249,7 +5165,7 @@ mod tests {
             metric_hints: Vec::new(),
             metric_bounds: None,
         }];
-        let failures = host_side_llm_extract(&mut pm, &raws, 0);
+        let failures = host_side_llm_extract(&mut pm, &raws);
         // Exactly ONE failure detail — the fallback's `load_err.is_none()`
         // gate blocks a second extract_via_llm call when stdout's
         // result was Err.
@@ -5303,7 +5219,7 @@ mod tests {
                 metric_bounds: None,
             },
         ];
-        let failures = host_side_llm_extract(&mut pm, &raws, 0);
+        let failures = host_side_llm_extract(&mut pm, &raws);
         assert_eq!(
             failures.len(),
             2,
@@ -5356,7 +5272,7 @@ mod tests {
                 metric_bounds: None,
             },
         ];
-        let failures = host_side_llm_extract(&mut pm, &raws, 0);
+        let failures = host_side_llm_extract(&mut pm, &raws);
         assert_eq!(
             failures.len(),
             2,
@@ -5378,192 +5294,23 @@ mod tests {
         );
     }
 
-    /// Drops + offline gate: a non-zero drops counter
-    /// AND a load failure both surface — the overflow detail and
-    /// the load-failure detail are independent. Pins that the
-    /// drops detail emits BEFORE the pair loop (eval.rs:209) and
-    /// is not gated on extraction success.
-    #[test]
-    fn host_side_llm_extract_drops_and_load_failure_compose() {
-        let _env_lock = lock_env();
-        super::super::model::reset();
-        let _cache = isolated_cache_dir();
-        let _offline = EnvVarGuard::set(crate::test_support::OFFLINE_ENV, "1");
-        let mut pm = vec![empty_pm(0)];
-        let raws = vec![crate::test_support::RawPayloadOutput {
-            payload_index: 0,
-            stdout: "matched pair".to_string(),
-            stderr: String::new(),
-            hint: None,
-            metric_hints: Vec::new(),
-            metric_bounds: None,
-        }];
-        let failures = host_side_llm_extract(&mut pm, &raws, 5);
-        assert!(
-            failures.len() >= 2,
-            "drops + load failure must each contribute their own detail; got: {failures:?}",
-        );
-        let messages: Vec<&str> = failures.iter().map(|d| d.message.as_str()).collect();
-        assert!(
-            messages.iter().any(|m| m.contains("SHM ring overflow")),
-            "drops detail must surface: {messages:?}",
-        );
-        assert!(
-            messages
-                .iter()
-                .any(|m| m.contains("LlmExtract model load failed")),
-            "load-failure detail must surface: {messages:?}",
-        );
-    }
-
-    /// SHM wire-frame round-trip: the full
-    /// guest→SHM→host transport for `MSG_TYPE_RAW_PAYLOAD_OUTPUT`
-    /// must preserve BOTH stdout and stderr streams independently.
-    /// A regression that concatenated the streams (e.g. a guest-
-    /// side "merge before serialize" or a host-side "join after
-    /// deserialize") would silently break schbench-style payloads
-    /// that emit metrics on stderr only — the metric extraction
-    /// would land on the merged blob, contaminating both metric
-    /// values and the `MetricStream` tag attribution.
+    /// Bulk-channel wire-frame round-trip: the full
+    /// guest→bulk-port→host transport for
+    /// `MSG_TYPE_RAW_PAYLOAD_OUTPUT` must preserve BOTH stdout and
+    /// stderr streams independently. A regression that concatenated
+    /// the streams (e.g. a guest-side "merge before serialize" or a
+    /// host-side "join after deserialize") would silently break
+    /// schbench-style payloads that emit metrics on stderr only —
+    /// the metric extraction would land on the merged blob,
+    /// contaminating both metric values and the `MetricStream` tag
+    /// attribution.
     ///
-    /// This test exercises the actual TLV transport: it allocates
-    /// a SHM ring buffer, writes a `serde_json`-serialized
-    /// `RawPayloadOutput` under `MSG_TYPE_RAW_PAYLOAD_OUTPUT`
-    /// (mirroring `emit_raw_payload_output_to_shm` at
-    /// src/scenario/payload_run.rs), drains via `shm_drain` (the
-    /// host-side reader), and decodes the entry exactly as
-    /// `run_ktstr_test_inner` does at eval.rs:717-723. Asserts:
-    /// 1. The drained entry's `msg_type` is `MSG_TYPE_RAW_PAYLOAD_OUTPUT`.
-    /// 2. The CRC matches.
-    /// 3. JSON deserialization restores the struct.
-    /// 4. Both stream markers land in their correct fields —
-    ///    stdout marker in `stdout`, stderr marker in `stderr`.
-    /// 5. Markers are NOT swapped, NOT concatenated, NOT merged.
-    ///
-    /// The markers are deliberately distinctive ASCII strings that
-    /// would be trivially detectable in either field if a regression
-    /// merged them, and trivially missing if a regression dropped
-    /// one.
-    #[test]
-    fn raw_payload_output_shm_wire_round_trip_preserves_both_streams() {
-        use crate::vmm::shm_ring;
-
-        const STDOUT_MARKER: &str = "STDOUT_MARKER_DISTINCT_E2E_a1b2c3";
-        const STDERR_MARKER: &str = "STDERR_MARKER_DISTINCT_E2E_x9y8z7";
-
-        // Allocate and initialize a ring buffer large enough for one
-        // serialized RawPayloadOutput with a comfortable margin.
-        // The serialized JSON is on the order of a few hundred bytes
-        // (markers are short); 4 KiB of data area is plenty.
-        const DATA_BYTES: usize = 4096;
-        let shm_size = shm_ring::HEADER_SIZE + DATA_BYTES;
-        let mut buf = vec![0u8; shm_size];
-        shm_ring::shm_init(&mut buf, 0, shm_size);
-
-        // Build the RawPayloadOutput exactly as the guest would —
-        // distinct stdout / stderr markers in their respective fields.
-        let original = crate::test_support::RawPayloadOutput {
-            payload_index: 13,
-            stdout: STDOUT_MARKER.to_string(),
-            stderr: STDERR_MARKER.to_string(),
-            hint: Some("focus".to_string()),
-            metric_hints: Vec::new(),
-            metric_bounds: None,
-        };
-        let payload = serde_json::to_vec(&original).expect("serialize RawPayloadOutput");
-
-        // Write under MSG_TYPE_RAW_PAYLOAD_OUTPUT. shm_write returns
-        // the bytes written (header + payload); a drop returns 0,
-        // which would mean our ring sizing was wrong.
-        let written =
-            shm_ring::shm_write(&mut buf, 0, shm_ring::MSG_TYPE_RAW_PAYLOAD_OUTPUT, &payload);
-        assert_eq!(
-            written,
-            shm_ring::MSG_HEADER_SIZE + payload.len(),
-            "shm_write must place a full TLV; got {written}, expected header+payload",
-        );
-
-        // Host-side drain — what `run_ktstr_test_inner` invokes
-        // at the end of a VM run.
-        let drained = shm_ring::shm_drain(&buf, 0);
-        assert_eq!(drained.entries.len(), 1, "exactly one entry expected");
-        assert_eq!(
-            drained.drops, 0,
-            "no drops expected for a single small message"
-        );
-
-        let entry = &drained.entries[0];
-        assert_eq!(
-            entry.msg_type,
-            shm_ring::MSG_TYPE_RAW_PAYLOAD_OUTPUT,
-            "msg_type must round-trip as MSG_TYPE_RAW_PAYLOAD_OUTPUT; got 0x{:08x}",
-            entry.msg_type,
-        );
-        assert!(
-            entry.crc_ok,
-            "CRC must match — torn payload bytes would produce a CRC mismatch and silently \
-             drop the message host-side (eval.rs:717 gates on `entry.crc_ok`)",
-        );
-
-        // Decode exactly the way eval.rs:718 does.
-        let restored: crate::test_support::RawPayloadOutput =
-            serde_json::from_slice(&entry.payload).expect("decode RawPayloadOutput from SHM");
-
-        // The load-bearing assertions: BOTH stream markers must
-        // survive, in the CORRECT field, NOT swapped.
-        assert_eq!(
-            restored.stdout, STDOUT_MARKER,
-            "stdout marker must round-trip into the stdout field; \
-             a regression that swapped the streams would surface here",
-        );
-        assert_eq!(
-            restored.stderr, STDERR_MARKER,
-            "stderr marker must round-trip into the stderr field; \
-             a regression that swapped the streams would surface here",
-        );
-        // Anti-merge guards: stdout must NOT contain the stderr
-        // marker, and vice versa. A concatenation regression would
-        // land both markers in one field.
-        assert!(
-            !restored.stdout.contains(STDERR_MARKER),
-            "stdout field must NOT contain the stderr marker; \
-             a regression that merged the streams (e.g. stderr appended \
-             to stdout before serialize) would land both markers in \
-             stdout. Got stdout: {:?}",
-            restored.stdout,
-        );
-        assert!(
-            !restored.stderr.contains(STDOUT_MARKER),
-            "stderr field must NOT contain the stdout marker; \
-             symmetric anti-merge guard. Got stderr: {:?}",
-            restored.stderr,
-        );
-        // The other fields ride along — pin them too so a future
-        // wire-format change that drops payload_index or hint
-        // surfaces here.
-        assert_eq!(restored.payload_index, original.payload_index);
-        assert_eq!(restored.hint.as_deref(), Some("focus"));
-    }
-
-    /// Bulk-channel wire-frame round-trip mirror of
-    /// [`raw_payload_output_shm_wire_round_trip_preserves_both_streams`].
     /// The new transport is the virtio-console port-1 TLV stream
-    /// parsed by [`crate::vmm::shm_ring::parse_tlv_stream`] (the
-    /// host-side reader called from `collect_results`); this test
-    /// exercises the same property — stdout / stderr never get
-    /// swapped or merged on the bulk wire — through that parser
-    /// instead of `shm_drain`.
-    ///
-    /// The assertions are identical to the SHM-ring sibling: the
-    /// underlying wire format is the same (16-byte ShmMessage
-    /// header + payload), but verifying the PARSER end produces a
-    /// distinct regression guard for the bulk path. A future
-    /// schema change to the bulk frame layout that did not also
-    /// touch the SHM frame layout would surface here without
-    /// regressing the SHM test.
+    /// parsed by [`crate::vmm::host_comms::parse_tlv_stream`] (the
+    /// host-side reader called from `collect_results`).
     #[test]
     fn raw_payload_output_bulk_wire_round_trip_preserves_both_streams() {
-        use crate::vmm::shm_ring;
+        use crate::vmm::wire;
 
         const STDOUT_MARKER: &str = "STDOUT_MARKER_BULK_E2E_a1b2c3";
         const STDERR_MARKER: &str = "STDERR_MARKER_BULK_E2E_x9y8z7";
@@ -5582,26 +5329,25 @@ mod tests {
         // writer emits to /dev/vport0p1: 16-byte ShmMessage header
         // followed by `payload.len()` bytes.
         use zerocopy::IntoBytes;
-        let hdr = shm_ring::ShmMessage {
-            msg_type: shm_ring::MSG_TYPE_RAW_PAYLOAD_OUTPUT,
+        let hdr = wire::ShmMessage {
+            msg_type: wire::MSG_TYPE_RAW_PAYLOAD_OUTPUT,
             length: payload.len() as u32,
             crc32: crc32fast::hash(&payload),
             _pad: 0,
         };
-        let mut frame: Vec<u8> = Vec::with_capacity(shm_ring::MSG_HEADER_SIZE + payload.len());
+        let mut frame: Vec<u8> = Vec::with_capacity(wire::FRAME_HEADER_SIZE + payload.len());
         frame.extend_from_slice(hdr.as_bytes());
         frame.extend_from_slice(&payload);
 
-        let drained = shm_ring::parse_tlv_stream(&frame);
+        let drained = crate::vmm::host_comms::parse_tlv_stream(&frame);
         assert_eq!(
             drained.entries.len(),
             1,
             "exactly one entry expected from bulk parse",
         );
-        assert_eq!(drained.drops, 0, "bulk path does not produce drops");
 
         let entry = &drained.entries[0];
-        assert_eq!(entry.msg_type, shm_ring::MSG_TYPE_RAW_PAYLOAD_OUTPUT,);
+        assert_eq!(entry.msg_type, wire::MSG_TYPE_RAW_PAYLOAD_OUTPUT,);
         assert!(entry.crc_ok, "bulk CRC must match");
 
         let restored: crate::test_support::RawPayloadOutput =

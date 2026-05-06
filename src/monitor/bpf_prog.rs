@@ -314,7 +314,21 @@ pub(crate) fn walk_struct_ops_runtime_stats(
         let mut cnt: u64 = 0;
         let mut nsecs: u64 = 0;
         let mut misses: u64 = 0;
-        for &cpu_off in per_cpu_offsets {
+        for (cpu_index, &cpu_off) in per_cpu_offsets.iter().enumerate() {
+            // Out-of-range CPU detection: kernel `setup_per_cpu_areas`
+            // only writes `__per_cpu_offset[cpu]` for CPUs in
+            // `for_each_possible_cpu`, leaving slots beyond
+            // `nr_cpu_ids` at the BSS-initialized 0. Real SMP
+            // kernels assign each possible CPU a strictly-positive
+            // offset for `cpu > 0`; only the BSP (cpu_index == 0)
+            // can legitimately observe a zero offset. Skip
+            // `cpu_off == 0 && cpu_index > 0` to avoid double-
+            // counting CPU 0's stats for every BSS-zero tail slot.
+            // Mirrors the guard in
+            // [`super::bpf_map::read_percpu_array_value`].
+            if cpu_off == 0 && cpu_index > 0 {
+                continue;
+            }
             let stats_kva = stats_percpu_kva.wrapping_add(cpu_off);
             if let Some(stats_pa) = translate_any_kva(
                 mem,
@@ -325,9 +339,56 @@ pub(crate) fn walk_struct_ops_runtime_stats(
                 walk.tcr_el1,
             ) && stats_pa < mem.size()
             {
-                cnt = cnt.saturating_add(mem.read_u64(stats_pa, offsets.stats_cnt));
-                nsecs = nsecs.saturating_add(mem.read_u64(stats_pa, offsets.stats_nsecs));
-                misses = misses.saturating_add(mem.read_u64(stats_pa, offsets.stats_misses));
+                // Batch the three u64 stat reads into one bulk
+                // `read_bytes` covering the contiguous span from
+                // `min(cnt, nsecs, misses)` to `max(...) + 8`. The
+                // kernel's `struct bpf_prog_stats` packs `cnt`,
+                // `nsecs`, and `misses` as adjacent u64_stats_t
+                // (8 bytes each) and the BTF resolver accepts only
+                // layouts where the three fields land in 24
+                // contiguous bytes. The bulk read pays one bounds
+                // check + region resolve instead of three per CPU,
+                // and parses the values from the local buffer
+                // without further volatile loads.
+                let lo = offsets
+                    .stats_cnt
+                    .min(offsets.stats_nsecs)
+                    .min(offsets.stats_misses);
+                let hi = offsets
+                    .stats_cnt
+                    .max(offsets.stats_nsecs)
+                    .max(offsets.stats_misses)
+                    + 8;
+                let span = hi - lo;
+                if span <= 64 {
+                    let mut buf = [0u8; 64];
+                    let n = mem.read_bytes(stats_pa + lo as u64, &mut buf[..span]);
+                    if n == span {
+                        let parse = |off: usize| -> u64 {
+                            let i = off - lo;
+                            u64::from_ne_bytes(buf[i..i + 8].try_into().unwrap())
+                        };
+                        cnt = cnt.saturating_add(parse(offsets.stats_cnt));
+                        nsecs = nsecs.saturating_add(parse(offsets.stats_nsecs));
+                        misses = misses.saturating_add(parse(offsets.stats_misses));
+                    } else {
+                        // Partial copy (page straddle / end-of-DRAM)
+                        // — fall back to scalar reads to retain the
+                        // original semantics.
+                        cnt = cnt.saturating_add(mem.read_u64(stats_pa, offsets.stats_cnt));
+                        nsecs = nsecs.saturating_add(mem.read_u64(stats_pa, offsets.stats_nsecs));
+                        misses = misses.saturating_add(mem.read_u64(stats_pa, offsets.stats_misses));
+                    }
+                } else {
+                    // Span exceeds the inline buffer. Should be
+                    // unreachable for the production
+                    // `bpf_prog_stats` layout (24 bytes), but
+                    // tolerate exotic layouts via the scalar path
+                    // rather than panicking.
+                    cnt = cnt.saturating_add(mem.read_u64(stats_pa, offsets.stats_cnt));
+                    nsecs = nsecs.saturating_add(mem.read_u64(stats_pa, offsets.stats_nsecs));
+                    misses = misses.saturating_add(mem.read_u64(stats_pa, offsets.stats_misses));
+                }
             }
         }
 
@@ -505,6 +566,7 @@ impl<'a> GuestMemProgAccessorOwned<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::monitor::symbols::START_KERNEL_MAP;
 
     #[test]
     fn prog_verifier_stats_serde_roundtrip() {
@@ -767,6 +829,182 @@ mod tests {
         // Cross-check: methods still compute correctly.
         assert_eq!(info.ns_per_call(), 2.0);
         assert!((info.miss_rate() - 3.0_f64 / 103.0).abs() < 1e-12);
+    }
+
+    /// Build a minimal `BpfProgOffsets` keyed for the synthetic
+    /// chain test below. The exact field offsets are arbitrary —
+    /// they only need to be consistent with how the test buffer
+    /// is laid out — but `stats_cnt`/`stats_nsecs`/`stats_misses`
+    /// MUST sit within a 24-byte window so the bulk-read path
+    /// fires (`span <= 64`). Drift in these three offsets would
+    /// silently switch the walker to the scalar fallback and
+    /// the bulk-read assertion below would still pass for the
+    /// wrong reason.
+    fn synthetic_prog_offsets() -> BpfProgOffsets {
+        BpfProgOffsets {
+            prog_type: 0,
+            prog_aux: 8,
+            aux_verified_insns: 0,
+            aux_name: 8,
+            xa_node_slots: 16,
+            xa_node_shift: 0,
+            idr_xa_head: 0,
+            idr_next: 8,
+            prog_stats: 16,
+            stats_cnt: 0,
+            stats_nsecs: 8,
+            stats_misses: 16,
+        }
+    }
+
+    /// End-to-end chain test for the bulk 24-byte
+    /// `bpf_prog_stats` read inside
+    /// [`walk_struct_ops_runtime_stats`]. The walker reads `cnt`,
+    /// `nsecs`, and `misses` (three adjacent u64s in the kernel
+    /// `struct bpf_prog_stats`) via one `read_bytes` over the
+    /// `[lo, hi)` span and parses each value from the local
+    /// buffer. This test pins the contract by:
+    ///
+    /// 1. Laying out a synthetic IDR + bpf_prog + bpf_prog_aux
+    ///    + per-CPU stats slot in a flat buffer, using the
+    ///    direct-mapping `kva = page_offset + pa` shortcut so
+    ///    `translate_any_kva` resolves through the direct path
+    ///    without building a page table.
+    /// 2. Writing known u64 values at the three stats offsets.
+    /// 3. Running the walker end-to-end and asserting the parsed
+    ///    `cnt`/`nsecs`/`misses` match the bytes the bulk read
+    ///    consumed.
+    ///
+    /// A regression that swapped two offsets in the parse closure
+    /// (e.g. `parse(stats_nsecs)` returning `cnt`) would surface
+    /// here as a value mismatch, NOT as a silent count-1 sum
+    /// drift that handler-level tests miss.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn walk_struct_ops_runtime_stats_bulk_24byte_read_parses_three_offsets() {
+        use crate::monitor::reader::{GuestMem, WalkContext};
+
+        // Layout (all PAs offset by `page_offset` to form KVAs in
+        // the direct-mapping range, except `prog_idr_kva` which
+        // sits in the kernel-text range and translates via
+        // `text_kva_to_pa_with_base`):
+        //
+        //   0x0000  prog_idr (xa_head + idr_next)
+        //   0x1000  bpf_prog (prog_type, prog_aux, prog_stats)
+        //   0x2000  bpf_prog_aux (verified_insns, name)
+        //   0x3000  per-CPU bpf_prog_stats (cnt, nsecs, misses)
+        let total: usize = 0x4000;
+        let mut buf = vec![0u8; total];
+
+        let page_offset: u64 = 0xFFFF_8880_0000_0000;
+        let pa_to_kva = |pa: u64| -> u64 { page_offset.wrapping_add(pa) };
+
+        let idr_pa: u64 = 0x0000;
+        let prog_pa: u64 = 0x1000;
+        let aux_pa: u64 = 0x2000;
+        let stats_pa: u64 = 0x3000;
+
+        // Single-entry xarray: `xa_head` IS the prog KVA with
+        // bit 1 clear (leaf marker). `pa_to_kva(prog_pa)` has
+        // bit 1 clear because prog_pa is 4 KiB-aligned.
+        let prog_kva = pa_to_kva(prog_pa);
+        assert_eq!(prog_kva & 2, 0, "prog_kva must be a leaf entry");
+
+        let offsets = synthetic_prog_offsets();
+        // Sanity: the bulk-read fast path requires
+        // `span = hi - lo <= 64`. With offsets {0, 8, 16}:
+        // lo = 0, hi = 16 + 8 = 24, span = 24. Pinning here so
+        // a future offset change that pushed `span > 64`
+        // (forcing the scalar fallback) trips the assert
+        // before the test runs.
+        let lo = offsets
+            .stats_cnt
+            .min(offsets.stats_nsecs)
+            .min(offsets.stats_misses);
+        let hi = offsets
+            .stats_cnt
+            .max(offsets.stats_nsecs)
+            .max(offsets.stats_misses)
+            + 8;
+        assert!(
+            hi - lo <= 64,
+            "test premise: stats span must be small enough for the bulk path"
+        );
+
+        let write_u64 = |buf: &mut Vec<u8>, pa: u64, val: u64| {
+            let off = pa as usize;
+            buf[off..off + 8].copy_from_slice(&val.to_ne_bytes());
+        };
+        let write_u32 = |buf: &mut Vec<u8>, pa: u64, val: u32| {
+            let off = pa as usize;
+            buf[off..off + 4].copy_from_slice(&val.to_ne_bytes());
+        };
+
+        // IDR: xa_head = prog_kva, idr_next = 1.
+        write_u64(&mut buf, idr_pa + offsets.idr_xa_head as u64, prog_kva);
+        write_u32(&mut buf, idr_pa + offsets.idr_next as u64, 1);
+
+        // bpf_prog: type = STRUCT_OPS, aux = aux_kva, stats = stats_kva.
+        write_u32(&mut buf, prog_pa + offsets.prog_type as u64, BPF_PROG_TYPE_STRUCT_OPS);
+        write_u64(&mut buf, prog_pa + offsets.prog_aux as u64, pa_to_kva(aux_pa));
+        write_u64(&mut buf, prog_pa + offsets.prog_stats as u64, pa_to_kva(stats_pa));
+
+        // bpf_prog_aux: verified_insns + name. Name must NUL-
+        // terminate within BPF_OBJ_NAME_LEN so the walker's
+        // `position(|&b| b == 0)` finds the end.
+        write_u32(&mut buf, aux_pa + offsets.aux_verified_insns as u64, 12_345);
+        let name = b"bulk_test";
+        let name_pa = (aux_pa + offsets.aux_name as u64) as usize;
+        buf[name_pa..name_pa + name.len()].copy_from_slice(name);
+
+        // Stats: write the three u64 counters at the synthetic
+        // offsets. These are the bytes the bulk read MUST surface
+        // through the parse closure.
+        let known_cnt: u64 = 0x1111_1111_1111_1111;
+        let known_nsecs: u64 = 0x2222_2222_2222_2222;
+        let known_misses: u64 = 0x3333_3333_3333_3333;
+        write_u64(&mut buf, stats_pa + offsets.stats_cnt as u64, known_cnt);
+        write_u64(&mut buf, stats_pa + offsets.stats_nsecs as u64, known_nsecs);
+        write_u64(&mut buf, stats_pa + offsets.stats_misses as u64, known_misses);
+
+        // SAFETY: buf is a live local Vec<u8> whose backing storage
+        // outlives the GuestMem use.
+        let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
+        let walk = WalkContext {
+            cr3_pa: 0,
+            page_offset,
+            l5: false,
+            tcr_el1: 0,
+        };
+        // One CPU. `cpu_off == 0` is allowed at `cpu_index == 0`
+        // (BSP). `stats_kva + 0 = stats_kva`, which translates
+        // through the direct mapping to `stats_pa`.
+        let per_cpu_offsets = vec![0u64];
+
+        let prog_idr_kva = idr_pa + START_KERNEL_MAP;
+        let stats = walk_struct_ops_runtime_stats(
+            &mem,
+            walk,
+            prog_idr_kva,
+            &offsets,
+            &per_cpu_offsets,
+            START_KERNEL_MAP,
+        );
+
+        assert_eq!(stats.len(), 1, "single STRUCT_OPS prog must surface");
+        assert_eq!(stats[0].name, "bulk_test");
+        assert_eq!(
+            stats[0].cnt, known_cnt,
+            "bulk read must parse cnt at offsets.stats_cnt within the 24-byte window",
+        );
+        assert_eq!(
+            stats[0].nsecs, known_nsecs,
+            "bulk read must parse nsecs at offsets.stats_nsecs within the 24-byte window",
+        );
+        assert_eq!(
+            stats[0].misses, known_misses,
+            "bulk read must parse misses at offsets.stats_misses within the 24-byte window",
+        );
     }
 
     /// Format chain integration: the `ProgRuntimeStats` Display

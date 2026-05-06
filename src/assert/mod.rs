@@ -738,15 +738,20 @@ pub struct ScenarioStats {
     /// Routed through `GauntletRow` and the `METRICS` registry;
     /// `stats compare` surfaces this axis in its comparison rows.
     pub worst_wake_latency_tail_ratio: f64,
-    /// Worst per-worker iteration count across cgroups (LOWEST).
+    /// Worst per-worker iteration count across cgroups (LOWEST
+    /// non-zero).
     ///
     /// Per-cgroup [`CgroupStats::iterations_per_worker`] is a
     /// throughput metric; the worst-case (regression-detecting)
-    /// roll-up across cgroups is the MINIMUM, not the maximum —
-    /// a cgroup that fell behind surfaces as the lowest per-worker
-    /// throughput. Mirrors the "lowest non-zero" convention of
-    /// [`Self::worst_page_locality`]. Zero when every cgroup has
-    /// `num_workers == 0`.
+    /// roll-up across cgroups is the lowest non-zero value — a
+    /// cgroup that fell behind surfaces as the lowest per-worker
+    /// throughput. The fold in [`AssertResult::merge`] uses
+    /// `fold_lowest_nonzero` rather than plain `min`: the
+    /// accumulator pattern `AssertResult::pass().merge(real)`
+    /// starts at 0.0 from `Default`, and a plain min would let
+    /// that sentinel destroy any positive reading folded in. 0.0
+    /// is treated as "not reported," matching the sentinel
+    /// convention shared with [`Self::worst_page_locality`].
     ///
     /// Only meaningful across runs of the SAME variant — see
     /// [`CgroupStats::iterations_per_worker`] for the cross-
@@ -858,13 +863,12 @@ impl AssertResult {
         /// This is NOT `f64::min` — a plain min would let an
         /// unreported cgroup (`0.0` sentinel) clobber a real
         /// reading from another cgroup, treating "no data yet" as
-        /// "worst possible." Shared by every lower-is-worse
-        /// aggregate that uses zero as a "not reported" marker
-        /// (currently `worst_page_locality` and
-        /// `worst_iterations_per_worker`). Any future
-        /// lower-is-worse field with the same sentinel convention
-        /// calls this rather than re-open-coding the five-line
-        /// guard.
+        /// "worst possible." The accumulator pattern
+        /// `AssertResult::pass().merge(real)` starts with 0.0 from
+        /// `Default`, and a plain min would destroy any positive
+        /// reading folded in — so every lowest-is-worse rollup
+        /// uses this fold to treat 0.0 as a sentinel rather than a
+        /// real measurement.
         fn fold_lowest_nonzero(self_field: &mut f64, other_field: f64) {
             if other_field > 0.0 && (*self_field == 0.0 || other_field < *self_field) {
                 *self_field = other_field;
@@ -902,10 +906,14 @@ impl AssertResult {
         s.worst_wake_latency_tail_ratio = s
             .worst_wake_latency_tail_ratio
             .max(o.worst_wake_latency_tail_ratio);
-        // Per-worker throughput is lower-is-worse: take the min
-        // across cgroups so a cgroup falling behind wins the
-        // "worst" bucket. Shared lowest-non-zero convention with
-        // `worst_page_locality` — see `fold_lowest_nonzero` above.
+        // Per-worker throughput is lower-is-worse: take the
+        // lowest non-zero reading across cgroups so a cgroup
+        // falling behind wins the "worst" bucket. 0.0 is the
+        // unreported sentinel — the accumulator pattern
+        // `AssertResult::pass().merge(real)` starts at 0.0 from
+        // `Default`, so a plain min would let that sentinel
+        // destroy real measurements. See `fold_lowest_nonzero`
+        // above for the policy.
         fold_lowest_nonzero(
             &mut s.worst_iterations_per_worker,
             o.worst_iterations_per_worker,
@@ -922,9 +930,19 @@ impl AssertResult {
         // Merge extensible metrics: take worst per key according to
         // each metric's polarity in the MetricDef registry. For
         // `higher_is_worse: true` the worst is max; for
-        // `higher_is_worse: false` the worst is min. Unknown metrics
-        // default to max (treat them as higher-is-worse until the
-        // caller registers a MetricDef — conservative for regressions).
+        // `higher_is_worse: false` the worst is min.
+        //
+        // Unregistered metric names fall through to
+        // [`crate::stats::infer_higher_is_worse`], which derives the
+        // polarity from name substrings (e.g. `*_iops`,
+        // `*_latency_us`). Without the inference, a payload-author
+        // throughput metric — e.g. `jobs.0.read.iops` from
+        // `OutputFormat::LlmExtract` — would fold with `max`,
+        // keeping the BETTER (higher) value across cgroups and
+        // masking a cgroup that fell behind. The inference returns a
+        // higher-is-worse default when no token matches, so genuinely
+        // unknown names still surface their max (the safer side of
+        // the regression-vs-improvement misclassification).
         //
         // `or_insert(*v)` rather than `or_insert(0.0)`: the old sentinel
         // clobbered real-but-small values for min-polarity metrics on
@@ -932,7 +950,7 @@ impl AssertResult {
         for (k, v) in &other.stats.ext_metrics {
             let higher_is_worse = crate::stats::metric_def(k)
                 .map(|m| m.higher_is_worse())
-                .unwrap_or(true);
+                .unwrap_or_else(|| crate::stats::infer_higher_is_worse(k));
             let entry = self.stats.ext_metrics.entry(k.clone()).or_insert(*v);
             *entry = if higher_is_worse {
                 entry.max(*v)
@@ -2105,6 +2123,7 @@ pub use claim::{ClaimBuilder, SeqClaim, SetClaim, Verdict};
 /// #     vmstat_numa_pages_migrated: 0,
 /// #     exit_info: None,
 /// #     is_messenger: false,
+/// #     ..Default::default()
 /// # };
 /// let expected: BTreeSet<usize> = [0, 1, 2].into_iter().collect();
 /// assert!(assert_isolation(&[report], &expected).passed);
@@ -2144,6 +2163,7 @@ pub fn assert_isolation(reports: &[WorkerReport], expected: &BTreeSet<usize>) ->
 /// #     vmstat_numa_pages_migrated: 0,
 /// #     exit_info: None,
 /// #     is_messenger: false,
+/// #     ..Default::default()
 /// # };
 /// let r = assert_not_starved(&[report]);
 /// assert!(r.passed);
@@ -2235,7 +2255,16 @@ pub fn assert_not_starved(reports: &[WorkerReport]) -> AssertResult {
         let mut sorted = all_latencies.clone();
         sorted.sort_unstable();
         let p99 = percentile(&sorted, 0.99) as f64 / 1000.0;
-        let median = sorted[sorted.len() / 2] as f64 / 1000.0;
+        // Median routes through `percentile(sorted, 0.5)` so the
+        // nearest-rank algorithm matches every other percentile in
+        // the project (p99, schbench's `lat99`, the BPF latency
+        // histograms). A bare `sorted[n/2]` would pick the upper of
+        // the two middle samples for even `n`, while `percentile`
+        // returns the value at `ceil(n * 0.5) - 1` — the lower of
+        // the two middles — and that lower-bound convention is what
+        // the docs on [`CgroupStats::median_wake_latency_us`] and
+        // the schbench cross-reference promise.
+        let median = percentile(&sorted, 0.5) as f64 / 1000.0;
         let n = all_latencies.len() as f64;
         let mean_ns = all_latencies.iter().sum::<u64>() as f64 / n;
         let cv = if mean_ns > 0.0 {
@@ -2350,6 +2379,13 @@ pub fn assert_not_starved(reports: &[WorkerReport]) -> AssertResult {
         worst_page_locality: 0.0,
         worst_cross_node_migration_ratio: 0.0,
         worst_wake_latency_tail_ratio: cg.wake_latency_tail_ratio(),
+        // `iterations_per_worker()` returns the per-worker
+        // throughput for this cgroup. The merge fold treats 0.0
+        // as the unreported sentinel — the accumulator pattern
+        // `AssertResult::pass().merge(real)` starts at 0.0 from
+        // `Default`, so any positive reading from a real
+        // measurement must override the sentinel rather than be
+        // masked by a plain min.
         worst_iterations_per_worker: cg.iterations_per_worker(),
         ext_metrics: cg.ext_metrics.clone(),
         cgroups: vec![cg],
@@ -2384,6 +2420,7 @@ pub fn assert_not_starved(reports: &[WorkerReport]) -> AssertResult {
 /// #     vmstat_numa_pages_migrated: 0,
 /// #     exit_info: None,
 /// #     is_messenger: false,
+/// #     ..Default::default()
 /// # };
 /// // Equal throughput -> low CV -> passes.
 /// let reports = [mk(1000, 1_000_000_000), mk(1000, 1_000_000_000)];
@@ -2473,6 +2510,7 @@ pub fn assert_throughput_parity(
 /// #     vmstat_numa_pages_migrated: 0,
 /// #     exit_info: None,
 /// #     is_messenger: false,
+/// #     ..Default::default()
 /// # };
 /// // p99 = 500ns, well under 10000ns limit.
 /// assert!(assert_benchmarks(&[report], Some(10000), None, None).passed);

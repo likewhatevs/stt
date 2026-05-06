@@ -736,6 +736,16 @@ fn rx_chain_with_read_only_descriptor_marked_invalid() {
         1,
         "RX direction violation must be flagged"
     );
+    // Mutually-exclusive partner counter `rx_write_failed` MUST
+    // stay at zero — a read-only descriptor is a chain-shape
+    // rejection, not a guest-memory write failure. A regression
+    // that bumped both counters on the same chain would violate
+    // the per-event 1:1 taxonomy.
+    assert_eq!(
+        counters.rx_write_failed(),
+        0,
+        "shape rejection must NOT also bump rx_write_failed",
+    );
     assert_eq!(
         counters.tx_dropped_no_rx_buffer(),
         0,
@@ -765,6 +775,158 @@ fn rx_chain_with_read_only_descriptor_marked_invalid() {
         kicks, 1,
         "used-ring advance from RX recycle + TX completion must trigger one coalesced kick",
     );
+}
+
+#[test]
+fn rx_chain_with_unmapped_gpa_bumps_rx_write_failed() {
+    // RX chain whose shape is valid (write-only flag set) but
+    // whose `addr` points BEYOND the guest-memory region. The
+    // header `write_slice` returns Err on the first attempt, so
+    // the descriptor walk hits the GPA-write-failure path inside
+    // `try_loopback_to_rx`. The split counter must route this to
+    // `rx_write_failed`, NOT `rx_chain_invalid`. This is the
+    // direct regression guard for the counter split: chain-shape
+    // rejection and GPA write failure are now distinct event
+    // counters because operators reading a failure dump need to
+    // tell "guest violated the RX descriptor-direction rule"
+    // from "guest posted a buffer at an unmapped GPA".
+    let (mem, layout) = build_test_memory();
+    let mut dev = VirtioNet::new(NetConfig::default());
+    dev.set_mem(mem.clone());
+    init_until_features_ok(&mut dev);
+    program_queues(&mut dev, &layout);
+    write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_OK);
+
+    place_tx_chain(&mem, &layout, &payload_42_bytes());
+    // Write-only descriptor (correct shape) pointing past the
+    // 1 MiB guest-memory region (`GUEST_MEM_SIZE = 0x10_0000`).
+    // Capacity 256 bytes is large enough that the descriptor's
+    // `addr + take` doesn't overflow u64 — so the chain is NOT
+    // shape-rejected via the address-overflow arm. The
+    // `write_slice` for the 12-byte header is the first observable
+    // failure: the GPA is unmapped, vm-memory's `write_slice`
+    // returns Err. VRING_DESC_F_WRITE = 2.
+    let unmapped_gpa: u64 = (GUEST_MEM_SIZE as u64) + 0x1000;
+    write_desc(&mem, layout.rx_desc, 0, unmapped_gpa, 256, 2, 0);
+    publish_avail(&mem, layout.rx_avail, 0, 0);
+
+    write_reg(&mut dev, VIRTIO_MMIO_QUEUE_NOTIFY, TXQ as u32);
+
+    let counters = dev.counters();
+    assert_eq!(
+        counters.rx_write_failed(),
+        1,
+        "GPA-unmapped header write must bump rx_write_failed",
+    );
+    // Mutually-exclusive partner counter MUST stay at zero —
+    // chain shape was acceptable (write-only flag set, address
+    // didn't overflow). Routing to BOTH counters would violate
+    // the per-event 1:1 taxonomy and mislead operators.
+    assert_eq!(
+        counters.rx_chain_invalid(),
+        0,
+        "GPA write failure must NOT also bump rx_chain_invalid \
+         (chain shape was valid)",
+    );
+    // `tx_dropped_no_rx_buffer` MUST also stay at zero — the RX
+    // queue was non-empty, just write-broken. Same mutual-
+    // exclusion rule the read-only-descriptor test pins.
+    assert_eq!(
+        counters.tx_dropped_no_rx_buffer(),
+        0,
+        "RX queue was non-empty (just write-broken) — must NOT \
+         bump tx_dropped_no_rx_buffer",
+    );
+    // tx_packets advances because the TX add_used path
+    // succeeded; rx_packets does NOT because the RX delivery
+    // failed. Same shape as `rx_chain_with_read_only_descriptor_*`.
+    assert_eq!(
+        counters.tx_packets(),
+        1,
+        "TX add_used succeeded → tx_packets bumps",
+    );
+    assert_eq!(counters.rx_packets(), 0, "no successful RX delivery");
+    // The recycle add_used(head, 0) succeeded (the RX queue's
+    // used ring is in mapped memory; only the descriptor's
+    // payload GPA is unmapped). So rx_add_used_failures stays
+    // at zero and the used-ring advance kicks the guest.
+    assert_eq!(
+        counters.rx_add_used_failures(),
+        0,
+        "RX recycle add_used succeeded — used-ring is in mapped \
+         memory, only the descriptor's payload GPA was unmapped",
+    );
+    let kicks = dev.irq_evt().read().unwrap_or(0);
+    assert_eq!(
+        kicks, 1,
+        "TX completion + RX recycle used-ring advances coalesce \
+         into a single irqfd kick",
+    );
+}
+
+#[test]
+fn rx_chain_with_unmapped_gpa_on_frame_bumps_rx_write_failed() {
+    // Variant of the GPA-unmapped test where the HEADER
+    // write_slice succeeds (descriptor #0 is mapped + 12 bytes
+    // long) but the FRAME write_slice fails on a SECOND
+    // descriptor pointing at unmapped memory. Exercises the
+    // frame-walk write-failure arm distinctly from the
+    // header-walk arm; both arms must route to rx_write_failed,
+    // never to rx_chain_invalid.
+    let (mem, layout) = build_test_memory();
+    let mut dev = VirtioNet::new(NetConfig::default());
+    dev.set_mem(mem.clone());
+    init_until_features_ok(&mut dev);
+    program_queues(&mut dev, &layout);
+    write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_OK);
+
+    place_tx_chain(&mem, &layout, &payload_42_bytes());
+    // Two-descriptor chain. desc 0: mapped, write-only, exactly
+    // 12 bytes (the virtio header lands here cleanly). desc 1:
+    // write-only, NEXT bit clear (terminator), points at
+    // unmapped GPA — frame write_slice fails. VRING_DESC_F_NEXT
+    // = 1, VRING_DESC_F_WRITE = 2.
+    let unmapped_gpa: u64 = (GUEST_MEM_SIZE as u64) + 0x1000;
+    write_desc(
+        &mem,
+        layout.rx_desc,
+        0,
+        layout.rx_buf,
+        VIRTIO_NET_HDR_LEN as u32,
+        1 | 2, // F_NEXT | F_WRITE
+        1,     // next = 1
+    );
+    write_desc(&mem, layout.rx_desc, 1, unmapped_gpa, 256, 2, 0);
+    publish_avail(&mem, layout.rx_avail, 0, 0);
+
+    write_reg(&mut dev, VIRTIO_MMIO_QUEUE_NOTIFY, TXQ as u32);
+
+    let counters = dev.counters();
+    assert_eq!(
+        counters.rx_write_failed(),
+        1,
+        "frame-walk write_slice failure must bump rx_write_failed",
+    );
+    assert_eq!(
+        counters.rx_chain_invalid(),
+        0,
+        "frame-walk write failure must NOT bump rx_chain_invalid \
+         (chain shape was valid)",
+    );
+    assert_eq!(counters.rx_packets(), 0, "no successful RX delivery");
+    // tx_packets bumps because TX add_used succeeded.
+    assert_eq!(counters.tx_packets(), 1);
+}
+
+#[test]
+fn rx_write_failed_initially_zero() {
+    // Pin the new counter's initial state. Distinct from
+    // rx_chain_invalid; operators monitoring guest-memory write
+    // breakage need to see this counter at zero on a healthy
+    // device.
+    let dev = VirtioNet::new(NetConfig::default());
+    let counters = dev.counters();
+    assert_eq!(counters.rx_write_failed(), 0);
 }
 
 #[test]

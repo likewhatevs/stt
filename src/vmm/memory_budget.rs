@@ -23,9 +23,6 @@ pub(crate) struct MemoryBudget {
     /// kernel (init sections and workspace are freed post-boot),
     /// absorbing percpu and misc boot allocations.
     pub kernel_init_size: u64,
-    /// SHM region carved from the top of guest memory (E820 gap on
-    /// x86_64, FDT /reserved-memory and /memreserve/ on aarch64).
-    pub shm_bytes: u64,
 }
 
 /// Read the kernel's declared memory footprint from the image file.
@@ -166,15 +163,6 @@ pub(crate) fn read_kernel_init_size(kernel_path: &Path) -> Result<u64> {
 /// This is a deliberate budget for post-boot workload, not a guess at
 /// kernel overhead.
 ///
-/// ## SHM region
-///
-/// Carved from the top of guest physical memory. Not part of usable
-/// RAM (E820 gap on x86_64, FDT /reserved-memory and /memreserve/ on aarch64).
-///
-/// ```text
-/// total = boot_requirement + 256 + shm
-/// ```
-///
 /// Workload budget (MB): scheduler execution, test scenarios, cgroup
 /// memory, BPF maps, and runtime allocations.
 const WORKLOAD_MB: u64 = 256;
@@ -184,7 +172,6 @@ pub(crate) fn initramfs_min_memory_mb(budget: &MemoryBudget) -> u32 {
 
     let init_size_mb = ceil_mb(budget.kernel_init_size);
     let compressed_mb = ceil_mb(budget.compressed_initrd_bytes);
-    let shm_mb = ceil_mb(budget.shm_bytes);
     let uncompressed_mb = ceil_mb(budget.uncompressed_initramfs_bytes);
 
     // Boot requirement: initramfs_options=size=90% sets the rootfs
@@ -206,8 +193,8 @@ pub(crate) fn initramfs_min_memory_mb(budget: &MemoryBudget) -> u32 {
     // circular dependency. Solve: P = content * 64/63.
     let boot_mb = (content_mb * 64).div_ceil(63);
 
-    // total = computed boot requirement + workload budget + SHM gap.
-    (boot_mb + WORKLOAD_MB + shm_mb) as u32
+    // total = computed boot requirement + workload budget.
+    (boot_mb + WORKLOAD_MB) as u32
 }
 
 #[cfg(test)]
@@ -224,99 +211,74 @@ mod tests {
     }
 
     /// All-zero inputs collapse to just the workload budget — no
-    /// kernel, no initramfs, no shm reservation. Pins the lower
-    /// bound the deferred-memory path always allocates.
+    /// kernel, no initramfs. Pins the lower bound the deferred-memory
+    /// path always allocates.
     #[test]
     fn initramfs_min_memory_mb_zeros_returns_workload_budget() {
         let budget = MemoryBudget {
             uncompressed_initramfs_bytes: 0,
             compressed_initrd_bytes: 0,
             kernel_init_size: 0,
-            shm_bytes: 0,
         };
         assert_eq!(initramfs_min_memory_mb(&budget), WORKLOAD_MB as u32);
-    }
-
-    /// `shm_bytes` is added linearly to the total. Pin the contract
-    /// by varying only the SHM input — the delta in the result must
-    /// exactly equal the SHM contribution rounded up to MiB.
-    #[test]
-    fn initramfs_min_memory_mb_shm_contribution_linear() {
-        let zero = MemoryBudget {
-            uncompressed_initramfs_bytes: 0,
-            compressed_initrd_bytes: 0,
-            kernel_init_size: 0,
-            shm_bytes: 0,
-        };
-        let with_shm = MemoryBudget {
-            shm_bytes: 16 * (1 << 20), // 16 MiB exactly
-            ..zero_budget()
-        };
-        let base = initramfs_min_memory_mb(&zero);
-        let shifted = initramfs_min_memory_mb(&with_shm);
-        assert_eq!(shifted, base + 16);
     }
 
     /// `kernel_init_size` and `compressed_initrd_bytes` flow into
     /// `content_mb` additively, then through the `*64/63` struct-page
     /// circular-dependency factor. Verify the math against a
     /// hand-computed reference. Inputs:
-    ///   uncompressed=10 MiB, init_size=5 MiB, compressed=2 MiB,
-    ///   shm=8 MiB.
+    ///   uncompressed=10 MiB, init_size=5 MiB, compressed=2 MiB.
     /// Hand trace per `initramfs_min_memory_mb`:
     ///   uncompressed_scaled = ceil(10*10/9) = ceil(11.111) = 12
     ///   content_mb         = 12 + 5 + 2 = 19
     ///   boot_mb            = ceil(19*64/63) = ceil(19.301) = 20
-    ///   total              = 20 + 256 (WORKLOAD_MB) + 8 = 284
+    ///   total              = 20 + 256 (WORKLOAD_MB) = 276
     #[test]
     fn initramfs_min_memory_mb_known_input() {
         let budget = MemoryBudget {
             uncompressed_initramfs_bytes: 10 * (1 << 20),
             compressed_initrd_bytes: 2 * (1 << 20),
             kernel_init_size: 5 * (1 << 20),
-            shm_bytes: 8 * (1 << 20),
         };
-        assert_eq!(initramfs_min_memory_mb(&budget), 284);
+        assert_eq!(initramfs_min_memory_mb(&budget), 276);
     }
 
     /// Sub-MiB inputs round up to 1 MiB before participating in the
     /// math. A 1-byte initramfs (degenerate but reachable when test
     /// fixtures construct empty payloads) must not silently round
     /// down to zero and bypass the tmpfs-90% safety factor. With
-    /// uncompressed=1 byte, init=0, compressed=0, shm=0:
+    /// uncompressed=1 byte, init=0, compressed=0:
     ///   uncompressed_scaled = ceil(1*10/9) = 2
     ///   content_mb         = 2 + 0 + 0 = 2
     ///   boot_mb            = ceil(2*64/63) = ceil(2.031) = 3
-    ///   total              = 3 + 256 + 0 = 259
+    ///   total              = 3 + 256 = 259
     #[test]
     fn initramfs_min_memory_mb_subbyte_uncompressed_rounds_up() {
         let budget = MemoryBudget {
             uncompressed_initramfs_bytes: 1,
             compressed_initrd_bytes: 0,
             kernel_init_size: 0,
-            shm_bytes: 0,
         };
         assert_eq!(initramfs_min_memory_mb(&budget), 259);
     }
 
     /// Larger realistic-shape inputs: uncompressed=200 MiB,
-    /// compressed=50 MiB, init_size=30 MiB, shm=16 MiB.
+    /// compressed=50 MiB, init_size=30 MiB.
     /// Verifies the math holds at integration-realistic scales (the
     /// production callers in vmm/mod.rs feed values of this order).
     /// Trace:
     ///   uncompressed_scaled = ceil(200*10/9) = ceil(222.222) = 223
     ///   content_mb         = 223 + 30 + 50 = 303
     ///   boot_mb            = ceil(303*64/63) = ceil(307.809) = 308
-    ///   total              = 308 + 256 + 16 = 580
+    ///   total              = 308 + 256 = 564
     #[test]
     fn initramfs_min_memory_mb_larger_input() {
         let budget = MemoryBudget {
             uncompressed_initramfs_bytes: 200 * (1 << 20),
             compressed_initrd_bytes: 50 * (1 << 20),
             kernel_init_size: 30 * (1 << 20),
-            shm_bytes: 16 * (1 << 20),
         };
-        assert_eq!(initramfs_min_memory_mb(&budget), 580);
+        assert_eq!(initramfs_min_memory_mb(&budget), 564);
     }
 
     /// `read_kernel_init_size` on x86_64 reads 4 little-endian bytes
@@ -417,13 +379,4 @@ mod tests {
         assert!(result.is_err(), "truncated file must fail; got: {result:?}",);
     }
 
-    /// Helper: an all-zero MemoryBudget for spread-syntax in tests.
-    fn zero_budget() -> MemoryBudget {
-        MemoryBudget {
-            uncompressed_initramfs_bytes: 0,
-            compressed_initrd_bytes: 0,
-            kernel_init_size: 0,
-            shm_bytes: 0,
-        }
-    }
 }

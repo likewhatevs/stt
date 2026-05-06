@@ -59,6 +59,15 @@ pub(super) const HTAB_BUCKETS_MAX: u32 = 1 << 16;
 /// struct itself is untranslatable. Untranslatable buckets are skipped;
 /// an untranslatable element breaks the current bucket's chain and
 /// advances to the next bucket.
+///
+/// Per-element short-read policy: `read_bytes` may return fewer bytes
+/// than requested when the resolved PA is near the end of a guest
+/// memory region (multi-region NUMA layouts can have non-contiguous
+/// host mappings). The walker drops the entire element rather than
+/// hand back a partially-zeroed key or value — the renderer never
+/// sees a `(Vec<u8>, Vec<u8>)` whose bytes are a mix of guest data
+/// and uninitialized scratch. The dropped element is silently
+/// omitted; the bucket walk continues to the next chain entry.
 pub(super) fn iter_htab_entries(
     ctx: &AccessorCtx<'_>,
     map: &BpfMapInfo,
@@ -70,10 +79,40 @@ pub(super) fn iter_htab_entries(
         ctx,
         map,
         |elem_pa, key_off_in_elem, value_off_in_elem, key_size, value_size, mem| {
-            let mut key_buf = vec![0u8; key_size];
-            mem.read_bytes(elem_pa + key_off_in_elem as u64, &mut key_buf);
-            let mut val_buf = vec![0u8; value_size];
-            mem.read_bytes(elem_pa + value_off_in_elem as u64, &mut val_buf);
+            // `Vec::with_capacity` skips the zero-fill that
+            // `vec![0u8; n]` would emit; every byte is overwritten by
+            // `read_bytes`, so the scribbled zeros were dead writes.
+            // `set_len` is gated on the read returning the requested
+            // length (mismatch surfaces as a dropped element rather
+            // than a partial buffer reaching the renderer).
+            let mut key_buf: Vec<u8> = Vec::with_capacity(key_size);
+            // SAFETY: capacity is `key_size`; `read_bytes` writes the
+            // full slice when its return equals `key_size`, and we
+            // only `set_len` after asserting that.
+            let key_slice =
+                unsafe { std::slice::from_raw_parts_mut(key_buf.as_mut_ptr(), key_size) };
+            let kn = mem.read_bytes(elem_pa + key_off_in_elem as u64, key_slice);
+            if kn != key_size {
+                return None;
+            }
+            // SAFETY: `kn == key_size`, so every byte in `0..key_size`
+            // of `key_buf`'s backing storage was written.
+            unsafe {
+                key_buf.set_len(key_size);
+            }
+
+            let mut val_buf: Vec<u8> = Vec::with_capacity(value_size);
+            // SAFETY: same contract as the key buffer above.
+            let val_slice =
+                unsafe { std::slice::from_raw_parts_mut(val_buf.as_mut_ptr(), value_size) };
+            let vn = mem.read_bytes(elem_pa + value_off_in_elem as u64, val_slice);
+            if vn != value_size {
+                return None;
+            }
+            // SAFETY: `vn == value_size`, mirror of the key buffer.
+            unsafe {
+                val_buf.set_len(value_size);
+            }
             Some((key_buf, val_buf))
         },
     )
@@ -90,9 +129,17 @@ pub(super) fn iter_htab_entries(
 ///
 /// `per_cpu_values` is one entry per CPU indexed by CPU number.
 /// `Some(bytes)` when that CPU's slot translates and reads; `None`
-/// when the per-CPU page is unmapped or the CPU is out of range
+/// when the per-CPU page is unmapped, the CPU is out of range
 /// (cpu_off==0 && cpu_index>0; same guard as
-/// [`super::read_percpu_array_value`]).
+/// [`super::read_percpu_array_value`]), or `read_bytes` returns
+/// fewer bytes than `value_size` (short-read drop, mirroring the
+/// plain-HASH walker's per-element policy: never hand back a
+/// partially-zeroed value).
+///
+/// The key buffer follows the same short-read drop policy as
+/// [`iter_htab_entries`]: a short key read drops the whole entry
+/// (not just one CPU slot) and the bucket walk advances to the
+/// next chain entry.
 pub(super) fn iter_percpu_htab_entries(
     ctx: &AccessorCtx<'_>,
     map: &BpfMapInfo,
@@ -106,8 +153,23 @@ pub(super) fn iter_percpu_htab_entries(
         ctx,
         map,
         |elem_pa, key_off_in_elem, value_off_in_elem, key_size, _value_size_unused, mem| {
-            let mut key_buf = vec![0u8; key_size];
-            mem.read_bytes(elem_pa + key_off_in_elem as u64, &mut key_buf);
+            // Skip the `vec![0u8; key_size]` zero-fill — the
+            // `read_bytes` call below overwrites the entire slice and
+            // any short read drops the element rather than handing a
+            // partial buffer back to the renderer.
+            let mut key_buf: Vec<u8> = Vec::with_capacity(key_size);
+            // SAFETY: capacity == key_size; we set_len only after
+            // `read_bytes` returns key_size.
+            let key_slice =
+                unsafe { std::slice::from_raw_parts_mut(key_buf.as_mut_ptr(), key_size) };
+            let kn = mem.read_bytes(elem_pa + key_off_in_elem as u64, key_slice);
+            if kn != key_size {
+                return None;
+            }
+            // SAFETY: read_bytes wrote `kn == key_size` bytes.
+            unsafe {
+                key_buf.set_len(key_size);
+            }
 
             // The "value" slot in a PERCPU htab_elem holds a percpu
             // base pointer, not data. Same shape as bpf_array.pptrs[k]
@@ -147,9 +209,25 @@ pub(super) fn iter_percpu_htab_entries(
                             .checked_add(value_size as u64)
                             .is_some_and(|end| end <= ctx.mem.size()) =>
                     {
-                        let mut buf = vec![0u8; value_size];
-                        ctx.mem.read_bytes(cpu_pa, &mut buf);
-                        per_cpu.push(Some(buf));
+                        // Same with-capacity-then-set-len trick as
+                        // the key buffer; a short read leaves the
+                        // slot as `None` so the renderer never sees a
+                        // partially-zeroed value.
+                        let mut buf: Vec<u8> = Vec::with_capacity(value_size);
+                        // SAFETY: capacity == value_size; gated by
+                        // the read returning value_size.
+                        let slice =
+                            unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr(), value_size) };
+                        let n = ctx.mem.read_bytes(cpu_pa, slice);
+                        if n == value_size {
+                            // SAFETY: read_bytes filled value_size bytes.
+                            unsafe {
+                                buf.set_len(value_size);
+                            }
+                            per_cpu.push(Some(buf));
+                        } else {
+                            per_cpu.push(None);
+                        }
                     }
                     _ => per_cpu.push(None),
                 }

@@ -2081,6 +2081,7 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
                         cap.kernel,
                         cap.rq_kvas,
                         cap.rq_pas,
+                        cap.per_cpu_offsets,
                         cap.offsets,
                     )
                 {
@@ -2248,11 +2249,12 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
     let shared_arena_snapshot: Option<(BpfMapInfo, ArenaSnapshot)> =
         arena_offsets.and_then(|off| {
             for info in &maps {
-                if info.name.starts_with("probe_bp.")
-                    || info.name.starts_with("fentry_p.")
-                    || info.name == "probe_bp"
-                    || info.name == "fentry_p"
-                    || KTSTR_INTERNAL_MAPS.contains(&info.name.as_str())
+                let name = info.name();
+                if name.starts_with("probe_bp.")
+                    || name.starts_with("fentry_p.")
+                    || name == "probe_bp"
+                    || name == "fentry_p"
+                    || KTSTR_INTERNAL_MAPS.contains(&name.as_ref())
                 {
                     continue;
                 }
@@ -2287,11 +2289,12 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
     // post-loop only to be unusable for per-entry payload chase.
     let mut sched_bss_bytes: Option<(Vec<u8>, u64)> = None; // (bytes, btf_kva)
     for info in &maps {
-        if info.name.starts_with("probe_bp.")
-            || info.name.starts_with("fentry_p.")
-            || info.name == "probe_bp"
-            || info.name == "fentry_p"
-            || KTSTR_INTERNAL_MAPS.contains(&info.name.as_str())
+        let name = info.name();
+        if name.starts_with("probe_bp.")
+            || name.starts_with("fentry_p.")
+            || name == "probe_bp"
+            || name == "fentry_p"
+            || KTSTR_INTERNAL_MAPS.contains(&name.as_ref())
         {
             continue;
         }
@@ -2304,7 +2307,7 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
         if sched_bss_bytes.is_none()
             && info.map_type == BPF_MAP_TYPE_ARRAY
             && info.btf_kva != 0
-            && info.name.ends_with(".bss")
+            && name.ends_with(".bss")
             && let Some(bytes) = accessor.read_value(info, 0, info.value_size as usize)
         {
             sched_bss_bytes = Some((bytes, info.btf_kva));
@@ -2467,13 +2470,16 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
         // (the program-attachment ID list pinned to each map), but
         // name-based filtering is enough today and avoids loading
         // the full prog_idr walk on the freeze hot path.
-        if info.name.starts_with("probe_bp.")
-            || info.name.starts_with("fentry_p.")
-            || info.name == "probe_bp"
-            || info.name == "fentry_p"
-            || KTSTR_INTERNAL_MAPS.contains(&info.name.as_str())
         {
-            continue;
+            let info_name = info.name();
+            if info_name.starts_with("probe_bp.")
+                || info_name.starts_with("fentry_p.")
+                || info_name == "probe_bp"
+                || info_name == "fentry_p"
+                || KTSTR_INTERNAL_MAPS.contains(&info_name.as_ref())
+            {
+                continue;
+            }
         }
 
         // Deadline check before each map render — bigger maps

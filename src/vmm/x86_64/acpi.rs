@@ -962,7 +962,7 @@ mod tests {
         NumaMemoryLayout::compute(topo, mb, 0).unwrap()
     }
 
-    fn test_setup(mem: &GuestMemoryMmap, topo: &Topology, mb: u32, _shm_size: u64) -> AcpiLayout {
+    fn test_setup(mem: &GuestMemoryMmap, topo: &Topology, mb: u32) -> AcpiLayout {
         let layout = test_layout(topo, mb);
         setup_acpi(mem, topo, &layout).unwrap()
     }
@@ -1022,7 +1022,7 @@ mod tests {
             nodes: None,
             distances: None,
         };
-        let l = test_setup(&mem, &topo, 256, 0);
+        let l = test_setup(&mem, &topo, 256);
         let mut rsdp = [0u8; 20];
         mem.read_slice(&mut rsdp, GuestAddress(l.rsdp_addr))
             .unwrap();
@@ -1042,7 +1042,7 @@ mod tests {
             nodes: None,
             distances: None,
         };
-        let l = test_setup(&mem, &topo, 256, 0);
+        let l = test_setup(&mem, &topo, 256);
         let rsdt = read_table(&mem, l.rsdt_addr);
         assert_eq!(&rsdt[..4], b"RSDT");
         let sum: u8 = rsdt.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
@@ -1060,7 +1060,7 @@ mod tests {
             nodes: None,
             distances: None,
         };
-        let l = test_setup(&mem, &topo, 256, 0);
+        let l = test_setup(&mem, &topo, 256);
         let madt = read_madt(&mem, &l);
         assert_eq!(&madt[..4], b"APIC");
         let sum: u8 = madt.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
@@ -1078,7 +1078,7 @@ mod tests {
             nodes: None,
             distances: None,
         };
-        let l = test_setup(&mem, &topo, 256, 0);
+        let l = test_setup(&mem, &topo, 256);
         let madt = read_madt(&mem, &l);
         let entries = walk_madt_entries(&madt);
         let cpu_count = entries
@@ -1099,7 +1099,7 @@ mod tests {
             nodes: None,
             distances: None,
         };
-        let l = test_setup(&mem, &topo, 256, 0);
+        let l = test_setup(&mem, &topo, 256);
         let madt = read_madt(&mem, &l);
         let entries = walk_madt_entries(&madt);
         let mut cpu_idx = 0u32;
@@ -1132,7 +1132,7 @@ mod tests {
             nodes: None,
             distances: None,
         };
-        let l = test_setup(&mem, &topo, 256, 0);
+        let l = test_setup(&mem, &topo, 256);
         let madt = read_madt(&mem, &l);
         let entries = walk_madt_entries(&madt);
         let ioapic = entries.iter().find(|(t, _, _)| *t == 1);
@@ -1155,7 +1155,7 @@ mod tests {
             nodes: None,
             distances: None,
         };
-        let l = test_setup(&mem, &topo, 256, 0);
+        let l = test_setup(&mem, &topo, 256);
         let mut rsdp = [0u8; 20];
         mem.read_slice(&mut rsdp, GuestAddress(l.rsdp_addr))
             .unwrap();
@@ -1176,7 +1176,7 @@ mod tests {
             nodes: None,
             distances: None,
         };
-        let l = test_setup(&mem, &topo, 256, 0);
+        let l = test_setup(&mem, &topo, 256);
         let mut entry = [0u8; 4];
         mem.read_slice(&mut entry, GuestAddress(l.rsdt_addr + 36))
             .unwrap();
@@ -1203,7 +1203,7 @@ mod tests {
             nodes: None,
             distances: None,
         };
-        let l = test_setup(&mem, &topo, 256, 0);
+        let l = test_setup(&mem, &topo, 256);
         let madt = read_madt(&mem, &l);
         let entries = walk_madt_entries(&madt);
         let iso = entries.iter().find(|(t, _, _)| *t == 2).unwrap();
@@ -1222,7 +1222,7 @@ mod tests {
             nodes: None,
             distances: None,
         };
-        let l = test_setup(&mem, &topo, 256, 0);
+        let l = test_setup(&mem, &topo, 256);
         let madt = read_madt(&mem, &l);
         let entries = walk_madt_entries(&madt);
         assert!(entries.iter().any(|(t, _, _)| *t == 4 || *t == 0x0A));
@@ -1239,7 +1239,7 @@ mod tests {
             nodes: None,
             distances: None,
         };
-        let l = test_setup(&mem, &topo, 256, 0);
+        let l = test_setup(&mem, &topo, 256);
         let madt = read_madt(&mem, &l);
         let entries = walk_madt_entries(&madt);
         assert_eq!(entries.iter().filter(|(t, _, _)| *t == 9).count(), 0);
@@ -1270,7 +1270,7 @@ mod tests {
             }
         }
         assert!(has_low && has_high);
-        let l = test_setup(&mem, &topo, 256, 0);
+        let l = test_setup(&mem, &topo, 256);
         let madt = read_madt(&mem, &l);
         let entries = walk_madt_entries(&madt);
         let lapic_count = entries.iter().filter(|(t, _, _)| *t == 0).count();
@@ -1293,7 +1293,7 @@ mod tests {
             nodes: None,
             distances: None,
         };
-        let l = test_setup(&mem, &topo, 256, 0);
+        let l = test_setup(&mem, &topo, 256);
         let madt = read_madt(&mem, &l);
         let entries = walk_madt_entries(&madt);
         let (_, len, data) = entries.iter().find(|(t, _, _)| *t == 0x0A).unwrap();
@@ -1317,7 +1317,7 @@ mod tests {
             nodes: None,
             distances: None,
         };
-        let l = test_setup(&mem, &topo, 256, 0);
+        let l = test_setup(&mem, &topo, 256);
         let madt = read_madt(&mem, &l);
         let entries = walk_madt_entries(&madt);
         let (_, len, data) = entries.iter().find(|(t, _, _)| *t == 4).unwrap();
@@ -1351,7 +1351,7 @@ mod tests {
                 nodes: None,
                 distances: None,
             };
-            let l = test_setup(&mem, &topo, 256, 0);
+            let l = test_setup(&mem, &topo, 256);
             let madt = read_madt(&mem, &l);
             let sum: u8 = madt.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
             assert_eq!(
@@ -1380,7 +1380,7 @@ mod tests {
                 nodes: None,
                 distances: None,
             };
-            let l = test_setup(&mem, &topo, 256, 0);
+            let l = test_setup(&mem, &topo, 256);
             let madt = read_madt(&mem, &l);
             let entries = walk_madt_entries(&madt);
             let mut cpu_idx = 0u32;
@@ -1415,7 +1415,7 @@ mod tests {
             nodes: None,
             distances: None,
         };
-        let l = test_setup(&mem, &topo, 256, 0);
+        let l = test_setup(&mem, &topo, 256);
         let madt = read_madt(&mem, &l);
         let entries = walk_madt_entries(&madt);
         for (entry_type, entry_len, _) in &entries {
@@ -1443,7 +1443,7 @@ mod tests {
             nodes: None,
             distances: None,
         };
-        let l = test_setup(&mem, &topo, 256, 0);
+        let l = test_setup(&mem, &topo, 256);
         let madt = read_madt(&mem, &l);
         let declared_len = u32::from_le_bytes(madt[4..8].try_into().unwrap()) as usize;
         assert_eq!(declared_len, madt.len());
@@ -1466,7 +1466,7 @@ mod tests {
             nodes: None,
             distances: None,
         };
-        let l = test_setup(&mem, &topo, 256, 0);
+        let l = test_setup(&mem, &topo, 256);
         let madt = read_madt(&mem, &l);
         let entries = walk_madt_entries(&madt);
         for (entry_type, _, data) in &entries {
@@ -1489,7 +1489,7 @@ mod tests {
             nodes: None,
             distances: None,
         };
-        let l = test_setup(&mem, &topo, 256, 0);
+        let l = test_setup(&mem, &topo, 256);
         let mut rsdp = [0u8; 36];
         mem.read_slice(&mut rsdp, GuestAddress(l.rsdp_addr))
             .unwrap();
@@ -1521,7 +1521,7 @@ mod tests {
             nodes: None,
             distances: None,
         };
-        let l = test_setup(&mem, &topo, 256, 0);
+        let l = test_setup(&mem, &topo, 256);
         let xsdt = read_table(&mem, l.xsdt_addr);
         assert_eq!(&xsdt[..4], b"XSDT");
         assert_eq!(xsdt.len(), 68);
@@ -1540,7 +1540,7 @@ mod tests {
             nodes: None,
             distances: None,
         };
-        let l = test_setup(&mem, &topo, 256, 0);
+        let l = test_setup(&mem, &topo, 256);
         let mut entry = [0u8; 8];
         mem.read_slice(&mut entry, GuestAddress(l.xsdt_addr + 36))
             .unwrap();
@@ -1567,7 +1567,7 @@ mod tests {
             nodes: None,
             distances: None,
         };
-        let l = test_setup(&mem, &topo, 256, 0);
+        let l = test_setup(&mem, &topo, 256);
         let mut fadt = [0u8; 276];
         mem.read_slice(&mut fadt, GuestAddress(l.fadt_addr))
             .unwrap();
@@ -1589,7 +1589,7 @@ mod tests {
             nodes: None,
             distances: None,
         };
-        let l = test_setup(&mem, &topo, 256, 0);
+        let l = test_setup(&mem, &topo, 256);
         let mut fadt = [0u8; 276];
         mem.read_slice(&mut fadt, GuestAddress(l.fadt_addr))
             .unwrap();
@@ -1610,7 +1610,7 @@ mod tests {
             nodes: None,
             distances: None,
         };
-        let l = test_setup(&mem, &topo, 256, 0);
+        let l = test_setup(&mem, &topo, 256);
         let mut fadt = [0u8; 276];
         mem.read_slice(&mut fadt, GuestAddress(l.fadt_addr))
             .unwrap();
@@ -1628,7 +1628,7 @@ mod tests {
             nodes: None,
             distances: None,
         };
-        let l = test_setup(&mem, &topo, 256, 0);
+        let l = test_setup(&mem, &topo, 256);
         let mut fadt = [0u8; 276];
         mem.read_slice(&mut fadt, GuestAddress(l.fadt_addr))
             .unwrap();
@@ -1653,7 +1653,7 @@ mod tests {
             nodes: None,
             distances: None,
         };
-        let l = test_setup(&mem, &topo, 256, 0);
+        let l = test_setup(&mem, &topo, 256);
         let mut dsdt = [0u8; 36];
         mem.read_slice(&mut dsdt, GuestAddress(l.dsdt_addr))
             .unwrap();
@@ -1674,7 +1674,7 @@ mod tests {
             nodes: None,
             distances: None,
         };
-        let l = test_setup(&mem, &topo, 256, 0);
+        let l = test_setup(&mem, &topo, 256);
         let mut rsdp = [0u8; 36];
         mem.read_slice(&mut rsdp, GuestAddress(l.rsdp_addr))
             .unwrap();
@@ -1715,7 +1715,7 @@ mod tests {
                 nodes: None,
                 distances: None,
             };
-            let l = test_setup(&mem, &topo, 256, 0);
+            let l = test_setup(&mem, &topo, 256);
             let srat = read_table(&mem, l.srat_addr);
             let entries = walk_srat_entries(&srat);
             let mut cpu_idx = 0u32;
@@ -1755,7 +1755,7 @@ mod tests {
                 distances: None,
             };
             let mem_bytes = 256u64 << 20;
-            let l = test_setup(&mem, &topo, 256, 0);
+            let l = test_setup(&mem, &topo, 256);
             let srat = read_table(&mem, l.srat_addr);
             let entries = walk_srat_entries(&srat);
             let mem_entries: Vec<_> = entries.iter().filter(|(t, _, _)| *t == 1).collect();
@@ -1789,37 +1789,6 @@ mod tests {
     }
 
     #[test]
-    fn srat_memory_split_with_shm_multi_numa() {
-        for (numa_nodes, llcs, shm_size) in
-            [(2, 4, 64 * 1024u64), (3, 6, 1 << 20), (4, 8, 512 * 1024)]
-        {
-            let mem = test_mem(16);
-            let topo = Topology {
-                llcs,
-                cores_per_llc: 2,
-                threads_per_core: 1,
-                numa_nodes,
-                nodes: None,
-                distances: None,
-            };
-            let mem_bytes = 256u64 << 20;
-            let l = test_setup(&mem, &topo, 256, shm_size);
-            let srat = read_table(&mem, l.srat_addr);
-            let entries = walk_srat_entries(&srat);
-            let total: u64 = entries
-                .iter()
-                .filter(|(t, _, _)| *t == 1)
-                .map(|(_, _, data)| u64::from_le_bytes(data[16..24].try_into().unwrap()))
-                .sum();
-            assert_eq!(
-                total, mem_bytes,
-                "shm_size={shm_size}: total {total} != expected {mem_bytes} \
-                 (topo: {numa_nodes}n/{llcs}l)"
-            );
-        }
-    }
-
-    #[test]
     fn slit_distance_matrix_multi_numa() {
         for (numa_nodes, llcs) in [(2, 2), (3, 3), (4, 4), (2, 4), (2, 6), (3, 9)] {
             let mem = test_mem(16);
@@ -1831,7 +1800,7 @@ mod tests {
                 nodes: None,
                 distances: None,
             };
-            let l = test_setup(&mem, &topo, 256, 0);
+            let l = test_setup(&mem, &topo, 256);
             let slit = read_table(&mem, l.slit_addr);
             assert_eq!(&slit[..4], b"SLIT", "SLIT signature mismatch");
             let n = u64::from_le_bytes(slit[36..44].try_into().unwrap());
@@ -1864,7 +1833,7 @@ mod tests {
                 nodes: None,
                 distances: None,
             };
-            let l = test_setup(&mem, &topo, 256, 0);
+            let l = test_setup(&mem, &topo, 256);
             let srat = read_table(&mem, l.srat_addr);
             let srat_sum: u8 = srat.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
             assert_eq!(
@@ -1899,7 +1868,7 @@ mod tests {
         let per_node = (per_node_mb as u64) << 20;
         let last = (memory_mb - per_node_mb * 2) as u64;
         let last_bytes = last << 20;
-        let l = test_setup(&mem, &topo, memory_mb, 0);
+        let l = test_setup(&mem, &topo, memory_mb);
         let srat = read_table(&mem, l.srat_addr);
         let entries = walk_srat_entries(&srat);
         let mem_entries: Vec<_> = entries.iter().filter(|(t, _, _)| *t == 1).collect();
@@ -1928,7 +1897,7 @@ mod tests {
     }
 
     #[test]
-    fn srat_shm_included_in_memory() {
+    fn srat_total_memory() {
         let mem = test_mem(16);
         let topo = Topology {
             llcs: 2,
@@ -1938,8 +1907,7 @@ mod tests {
             nodes: None,
             distances: None,
         };
-        let shm_size: u64 = 64 * 1024;
-        let l = test_setup(&mem, &topo, 256, shm_size);
+        let l = test_setup(&mem, &topo, 256);
         let srat = read_table(&mem, l.srat_addr);
         let entries = walk_srat_entries(&srat);
         let total_mem: u64 = entries
@@ -1972,7 +1940,7 @@ mod tests {
             nodes: None,
             distances: None,
         };
-        let l = test_setup(&mem, &topo, 256, 0);
+        let l = test_setup(&mem, &topo, 256);
         assert_eq!(l.hmat_size, 0, "HMAT must not be emitted for single-node");
     }
 
@@ -1987,7 +1955,7 @@ mod tests {
             nodes: None,
             distances: None,
         };
-        let l = test_setup(&mem, &topo, 256, 0);
+        let l = test_setup(&mem, &topo, 256);
         assert!(l.hmat_size > 0, "HMAT must be emitted for multi-NUMA");
     }
 
@@ -2184,7 +2152,7 @@ mod tests {
     fn no_hmat_rsdt_has_4_entries() {
         let mem = test_mem(16);
         let topo = Topology::new(1, 2, 2, 1);
-        let l = test_setup(&mem, &topo, 256, 0);
+        let l = test_setup(&mem, &topo, 256);
         let rsdt = read_table(&mem, l.rsdt_addr);
         let rsdt_entries = (rsdt.len() - 36) / 4;
         assert_eq!(

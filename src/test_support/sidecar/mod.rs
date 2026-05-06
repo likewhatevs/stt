@@ -1964,14 +1964,28 @@ fn scheduler_fingerprint(entry: &KtstrTestEntry) -> SchedulerFingerprint {
 /// critical section makes the (read_dir + remove_file) +
 /// (serialize + write) sequence atomic with respect to peer
 /// processes targeting the same `{kernel}-{project_commit}`
-/// directory. Without the lock, two concurrent CI jobs sharing
-/// the same key could (a) tear partially-written sidecars
-/// (write fd open while pre-clear's `remove_file` runs) or
-/// (b) interleave pre-clear + write phases, leaving the dir
-/// in a state neither process intended. The override path
-/// skips the lock for the same reason it skips pre-clear:
-/// operator-chosen directories are owned by the operator and
-/// out of scope for the cross-process gate.
+/// directory. The override path skips the lock for the same
+/// reason it skips pre-clear: operator-chosen directories are
+/// owned by the operator, so we do not place a `.locks/` sibling
+/// inside (or above) their custom layout.
+///
+/// PER-FILE ATOMICITY (both branches): the JSON is written to a
+/// `<final>.tmp.<pid>.<run_id>` sibling and then `rename(2)`'d into
+/// place. POSIX `rename` is atomic for same-directory destinations,
+/// so a peer reader (`collect_sidecars`) never observes a partial
+/// JSON payload — either the old contents stay or the new contents
+/// replace them in one filesystem step. Two concurrent writers that
+/// both target the same `{test_name}-{variant_hash}.ktstr.json`
+/// (override path: two CI jobs sharing one operator-chosen dir;
+/// default path: a torn-write window inside the flock body that the
+/// flock would otherwise have to cover) cannot leave a half-written
+/// JSON behind — last-rename-wins, both files are individually
+/// well-formed. The `.tmp.<pid>.<run_id>` discriminator on the
+/// staging name keeps two writers from racing on the same staging
+/// path even when their final destinations collide. The flock on
+/// the default path remains load-bearing for the pre-clear leg
+/// (atomic write only protects the write itself, not the
+/// `read_dir + remove_file` walk that pre-clear runs).
 ///
 /// `label` is a caller-supplied noun for the context message ("skip
 /// sidecar" / "sidecar") so the error chain points at the right call
@@ -2023,7 +2037,36 @@ fn serialize_and_write_sidecar(sidecar: &SidecarResult, label: &str) -> anyhow::
     ));
     let json = serde_json::to_string_pretty(sidecar)
         .with_context(|| format!("serialize {label} for '{}'", sidecar.test_name))?;
-    std::fs::write(&path, json).with_context(|| format!("write {label} {}", path.display()))?;
+    // Atomic write: stage into a `.tmp.<pid>.<run_id>` sibling and
+    // rename(2) into the final path. `rename` is atomic for
+    // same-directory destinations on every filesystem ktstr supports
+    // (ext4, btrfs, xfs, tmpfs, overlayfs); a peer reader never
+    // observes a partial payload. The staging name carries the pid
+    // AND the unique sidecar `run_id` so two writers in the same
+    // process targeting identical final paths (e.g. two threads in
+    // the budget-test stdout-capture path) cannot stomp each other's
+    // staging file before either rename lands. On rename failure the
+    // staging file is removed so a partial sidecar does not survive
+    // as garbage in the run dir; rename success consumes the staging
+    // entry and there is nothing to clean up.
+    let pid = std::process::id();
+    let staging = dir.join(format!(
+        "{}-{:016x}.ktstr.json.tmp.{pid}.{}",
+        sidecar.test_name, variant_hash, sidecar.run_id,
+    ));
+    std::fs::write(&staging, &json)
+        .with_context(|| format!("write {label} staging {}", staging.display()))?;
+    if let Err(e) = std::fs::rename(&staging, &path) {
+        // Best-effort cleanup of the staged payload; ignore the
+        // unlink error so the rename failure is what surfaces
+        // (the rename error names the actual problem).
+        let _ = std::fs::remove_file(&staging);
+        return Err(anyhow::Error::from(e).context(format!(
+            "rename {label} staging {} -> {}",
+            staging.display(),
+            path.display(),
+        )));
+    }
     Ok(())
 }
 
@@ -2249,12 +2292,51 @@ fn pre_clear_run_dir_once(dir: &std::path::Path) {
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_file() && is_sidecar_filename(&path) {
+            if !path.is_file() {
+                continue;
+            }
+            // Two file shapes are wiped per directory entry:
+            // - `<test>-<hash>.ktstr.json` (live sidecars from a
+            //   prior run sharing this `{kernel}-{project_commit}`
+            //   key — see the function-level doc for why
+            //   coexistence is the bug pre-clear prevents);
+            // - `<test>-<hash>.ktstr.json.tmp.<pid>.<run_id>`
+            //   (orphaned staging files from a writer that died
+            //   between `write` and `rename` in
+            //   `serialize_and_write_sidecar`'s atomic-write path).
+            //   Without the staging sweep, every crash mid-write
+            //   would leak a `.tmp.…` artifact that
+            //   `is_sidecar_filename` excludes (extension is
+            //   `<run_id>`, not `json`), so neither
+            //   `collect_sidecars` nor the next pre-clear pass
+            //   would ever reap them. The flock on the default
+            //   path makes wiping in-flight staging files
+            //   impossible — a peer writer either holds the
+            //   lock (we wait) or is between locks (no in-flight
+            //   stage can exist).
+            if is_sidecar_filename(&path) || is_sidecar_staging_filename(&path) {
                 let _ = std::fs::remove_file(&path);
             }
         }
     }
     drop(guard);
+}
+
+/// Predicate: is `path` an atomic-write staging file produced by
+/// [`serialize_and_write_sidecar`]?
+///
+/// True iff the filename matches the `<test>-<hash>.ktstr.json.tmp.…`
+/// shape — `is_sidecar_filename` rejects these because the
+/// extension is `<run_id>` rather than `json`, so a separate
+/// predicate is needed for the [`pre_clear_run_dir_once`] sweep
+/// that reaps orphaned staging files. Filename-component check
+/// (rather than full-path string) for the same load-bearing reason
+/// `is_sidecar_filename` uses `Path::file_name()`: a `.ktstr.json.tmp.`
+/// substring inside an ancestor segment must not match.
+fn is_sidecar_staging_filename(path: &std::path::Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.contains(".ktstr.json.tmp."))
 }
 
 /// Wall-clock timeout for [`acquire_run_dir_flock`] before it gives

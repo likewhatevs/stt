@@ -39,6 +39,9 @@ pub mod timeline;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+pub(crate) mod test_util;
+
 /// Guest physical address of the top-level page-table page (CR3 on x86,
 /// TTBR1 on aarch64). Newtype around `u64` so address kinds can't
 /// accidentally mix — passing a `PageOffset` where a `Cr3Pa` is

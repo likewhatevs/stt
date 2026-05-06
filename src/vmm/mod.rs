@@ -6,7 +6,7 @@
 //! virtual topology, memory, host-side performance options, and
 //! monitor thresholds. Calling `.build()?.run()?` on the result
 //! boots the guest and returns a [`VmResult`] containing exit state,
-//! captured console, monitor samples, and drained SHM ring data.
+//! captured console, monitor samples, and drained guest messages.
 //!
 //! See the [VMM architecture
 //! page](https://likewhatevs.github.io/ktstr/guide/architecture/vmm.html)
@@ -39,9 +39,9 @@
 //! - [`result`] — [`VmResult`], [`KvmStatsTotals`], `VmRunState`.
 
 // `pub mod` — public sub-API surface that downstream callers may name
-// directly (e.g. `crate::vmm::shm_ring::*`). The arch-conditional
-// modules (`aarch64`, `x86_64`) are also `pub` but live below where
-// the cfg-gated re-exports for their contents are kept together.
+// directly. The arch-conditional modules (`aarch64`, `x86_64`) are
+// also `pub` but live below where the cfg-gated re-exports for
+// their contents are kept together.
 //
 // `disk_template` is `pub` for rustdoc cross-link visibility — its
 // items are referenced from `disk_config`, `rust_init`, and the
@@ -57,7 +57,6 @@ pub mod disk_template;
 pub mod host_topology;
 pub mod initramfs;
 pub(crate) mod kvm_stats;
-pub mod shm_ring;
 pub mod topology;
 
 // `pub(crate) mod` — crate-internal sub-modules.
@@ -79,15 +78,13 @@ pub(crate) mod virtio_blk;
 pub(crate) mod virtio_console;
 pub(crate) mod virtio_net;
 
-// Bulk transport modules — split out from `shm_ring` so the wire
-// format (`wire`), the host-side streaming assembler (`bulk`), the
-// guest-side typed senders (`guest_comms`), and the host-side typed
-// consumers (`host_comms`) each carry a single responsibility. The
-// SHM ring's only remaining customer is the panic-hook crash path
-// (`write_msg_nonblocking` → MSG_TYPE_CRASH) plus the snapshot
-// doorbell + signal-slot control plane; production data
-// (STIMULUS / EXIT / SCHED_EXIT / PAYLOAD_METRICS / RAW_PAYLOAD_OUTPUT
-// / SCENARIO_*) flows through the virtio-console port-1 TLV stream.
+// Bulk transport modules. The wire format (`wire`), the host-side
+// streaming assembler (`bulk`), the guest-side typed senders
+// (`guest_comms`), and the host-side typed consumers (`host_comms`)
+// each carry a single responsibility. Production data (STIMULUS /
+// EXIT / SCHED_EXIT / PAYLOAD_METRICS / RAW_PAYLOAD_OUTPUT /
+// SCENARIO_*) flows through the virtio-console port-1 TLV stream,
+// and crash diagnostics travel via COM2.
 pub(crate) mod bulk;
 pub(crate) mod guest_comms;
 pub(crate) mod host_comms;
@@ -221,8 +218,6 @@ pub struct KtstrVm {
     pub(crate) memory_min_mb: u32,
     pub(crate) cmdline_extra: String,
     pub(crate) timeout: Duration,
-    /// Size of the SHM ring buffer region at the top of guest memory. 0 = disabled.
-    pub(crate) shm_size: u64,
     /// Thresholds for reactive SysRq-D dump. When set and the monitor
     /// detects a sustained violation, it writes the dump flag to guest SHM.
     pub(crate) monitor_thresholds: Option<crate::monitor::MonitorThresholds>,

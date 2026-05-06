@@ -255,9 +255,13 @@ fn not_starved_wake_latency_stats() {
         "p99: {}",
         s.worst_p99_wake_latency_us
     );
-    // median of 10 samples: index 5 -> 6000ns = 6.0us
+    // median of 10 samples via `percentile(sorted, 0.5)`:
+    // nearest-rank index = ceil(10 * 0.5) - 1 = 4 →
+    // sorted[4] = 5000ns = 5.0us. The lower-of-two-middles
+    // bound matches the convention documented on
+    // `CgroupStats::median_wake_latency_us`.
     assert!(
-        (s.worst_median_wake_latency_us - 6.0).abs() < 0.1,
+        (s.worst_median_wake_latency_us - 5.0).abs() < 0.1,
         "median: {}",
         s.worst_median_wake_latency_us
     );

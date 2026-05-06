@@ -54,7 +54,6 @@ pub struct KtstrVmBuilder {
     memory_min_mb: u32,
     pub(crate) cmdline_extra: String,
     pub(crate) timeout: Duration,
-    pub(crate) shm_size: u64,
     pub(crate) monitor_thresholds: Option<crate::monitor::MonitorThresholds>,
     pub(crate) watchdog_timeout: Option<Duration>,
     bpf_map_writes: Vec<BpfMapWriteParams>,
@@ -135,7 +134,6 @@ impl Default for KtstrVmBuilder {
             memory_min_mb: 0,
             cmdline_extra: String::new(),
             timeout: Duration::from_secs(60),
-            shm_size: 0,
             monitor_thresholds: None,
             watchdog_timeout: Some(Duration::from_secs(4)),
             bpf_map_writes: Vec::new(),
@@ -275,14 +273,6 @@ impl KtstrVmBuilder {
     /// returned will have `timed_out = true`.
     pub fn timeout(mut self, t: Duration) -> Self {
         self.timeout = t;
-        self
-    }
-
-    /// Size the guest-to-host SHM ring in bytes. `0` lets the builder
-    /// derive a sensible default from the guest payload.
-    #[allow(dead_code)]
-    pub fn shm_size(mut self, bytes: u64) -> Self {
-        self.shm_size = bytes;
         self
     }
 
@@ -746,7 +736,6 @@ impl KtstrVmBuilder {
             memory_min_mb: self.memory_min_mb,
             cmdline_extra: self.cmdline_extra,
             timeout: self.timeout,
-            shm_size: self.shm_size,
             monitor_thresholds: self.monitor_thresholds,
             watchdog_timeout: self.watchdog_timeout,
             bpf_map_writes: self.bpf_map_writes,
@@ -1060,12 +1049,6 @@ mod tests {
         };
         let b = KtstrVmBuilder::default().monitor_thresholds(t);
         assert!(b.monitor_thresholds.is_some());
-    }
-
-    #[test]
-    fn builder_shm_size() {
-        let b = KtstrVmBuilder::default().shm_size(65536);
-        assert_eq!(b.shm_size, 65536);
     }
 
     #[test]

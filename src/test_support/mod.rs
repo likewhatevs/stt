@@ -104,6 +104,7 @@ pub use model::{
 pub(crate) use output::{
     SENTINEL_EXEC_EXIT_PREFIX, SENTINEL_EXIT_PREFIX, SENTINEL_INIT_STARTED,
     SENTINEL_PAYLOAD_STARTING, SENTINEL_SCHEDULER_DIED, SENTINEL_SCHEDULER_NOT_ATTACHED,
+    extract_panic_message,
 };
 pub use payload::{
     Metric, MetricBounds, MetricCheck, MetricHint, MetricSource, MetricStream, OutputFormat,

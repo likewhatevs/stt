@@ -188,8 +188,11 @@ pub struct VirtioNetCounters {
     /// observable outcome: successful loopback delivery (bumps
     /// rx_packets); dropped because the RX queue had no buffer
     /// (bumps tx_dropped_no_rx_buffer); RX chain-shape rejection
-    /// during loopback (bumps rx_chain_invalid); RX `add_used`
-    /// failure (bumps rx_add_used_failures); TX-side chain-shape
+    /// during loopback (bumps rx_chain_invalid); RX guest-memory
+    /// `write_slice` failure during loopback (bumps
+    /// rx_write_failed — chain shape was fine but the
+    /// descriptor's GPA was unmapped); RX `add_used` failure
+    /// (bumps rx_add_used_failures); TX-side chain-shape
     /// rejection at parse time (bumps tx_chain_invalid, no TX
     /// add_used attempted); or TX `add_used` failure (bumps
     /// tx_add_used_failures). `tx_packets` reflects only the
@@ -240,15 +243,46 @@ pub struct VirtioNetCounters {
     pub(crate) tx_chain_invalid: AtomicU64,
     /// Cumulative count of RX chains rejected for malformed shape on
     /// the loopback delivery side: read-only descriptor in RX (RX
-    /// descriptors must be device-writable), or guest-memory
-    /// write-failure on a write-only descriptor. The RX chain is
-    /// still marked used (with `len = 0`) so the guest's network-
-    /// stack equivalent of a hung-task watchdog doesn't fire on a
-    /// stuck request. Per-event counter; bumped exactly once per
-    /// malformed RX chain (the `tx_dropped_no_rx_buffer` counter is
-    /// NOT also bumped — they are mutually exclusive failure modes,
-    /// see [`Self::record_rx_chain_invalid`]).
+    /// descriptors must be device-writable) or attacker-controlled
+    /// `desc.addr() + take` overflow (the descriptor's address itself
+    /// is malformed). The RX chain is still marked used (with
+    /// `len = 0`) so the guest's network-stack equivalent of a
+    /// hung-task watchdog doesn't fire on a stuck request.
+    /// Per-event counter; bumped exactly once per chain rejected for
+    /// shape (the `tx_dropped_no_rx_buffer` counter is NOT also
+    /// bumped — they are mutually exclusive failure modes, see
+    /// [`Self::record_rx_chain_invalid`]).
+    ///
+    /// **Distinct from [`Self::rx_write_failed`]**: a guest-memory
+    /// `write_slice` failure (header or frame bytes) means the
+    /// chain's SHAPE was acceptable but the GPA targeted by a
+    /// device-writable descriptor isn't mapped — that bumps
+    /// `rx_write_failed`, NOT this counter. Operators
+    /// distinguishing "guest sent malformed RX chain" from "guest's
+    /// posted RX buffer points at unmapped memory" need the two
+    /// counters separated.
     pub(crate) rx_chain_invalid: AtomicU64,
+    /// Cumulative count of RX chains where the chain shape was valid
+    /// (every descriptor was device-writable, addresses didn't
+    /// overflow) but a guest-memory `write_slice` to one of the
+    /// descriptors failed — typically because the descriptor's GPA
+    /// is unmapped. Either the 12-byte header `write_slice` or the
+    /// frame-data `write_slice` can fail; both bump this counter.
+    /// The RX chain is still marked used (with `len = 0`) so the
+    /// guest doesn't hang on the request. Per-event counter;
+    /// bumped exactly once per chain whose write actually failed
+    /// (chain-shape rejections route to `rx_chain_invalid`
+    /// instead — the two counters are mutually exclusive per
+    /// chain).
+    ///
+    /// Distinct from `rx_chain_invalid` so an operator's failure
+    /// dump can separate "guest violated the RX descriptor-direction
+    /// rule" from "guest posted a buffer at an unmapped GPA". A
+    /// non-zero `rx_write_failed` with `rx_chain_invalid == 0`
+    /// points at GPA / page-table breakage rather than driver-side
+    /// malformation; the inverse points at driver-side direction
+    /// violations or address-overflow attacks.
+    pub(crate) rx_write_failed: AtomicU64,
     /// Cumulative count of `add_used` failures on the TX queue. A
     /// non-zero value means the queue's used-ring address is
     /// unmapped or otherwise inaccessible — distinct from a chain-
@@ -340,14 +374,31 @@ impl VirtioNetCounters {
     }
 
     /// Record one RX chain rejected for malformed shape on the
-    /// loopback delivery side. Mutually exclusive with
-    /// [`Self::record_tx_dropped_no_rx_buffer`]: a chain is either
-    /// missing entirely (queue empty → `tx_dropped_no_rx_buffer`) or
-    /// present but malformed (this counter). The caller honors that
-    /// invariant by routing each TX→RX delivery failure to exactly
-    /// one of the two counters.
+    /// loopback delivery side (read-only descriptor or
+    /// address-overflow on the descriptor's GPA). Mutually exclusive
+    /// with [`Self::record_tx_dropped_no_rx_buffer`]: a chain is
+    /// either missing entirely (queue empty →
+    /// `tx_dropped_no_rx_buffer`) or present but shape-malformed
+    /// (this counter). Mutually exclusive PER CHAIN with
+    /// [`Self::record_rx_write_failed`]: a chain is either
+    /// shape-rejected (this counter) or write-rejected
+    /// (`rx_write_failed`); the caller routes each malformed RX
+    /// chain to exactly one of the two so the per-event counter
+    /// taxonomy stays 1:1 with chains.
     pub(crate) fn record_rx_chain_invalid(&self) {
         self.rx_chain_invalid.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one RX chain whose shape was valid (every descriptor
+    /// was device-writable, no address overflow) but whose guest-
+    /// memory `write_slice` failed mid-walk — header or frame
+    /// bytes hit an unmapped GPA. Mutually exclusive PER CHAIN with
+    /// [`Self::record_rx_chain_invalid`]: a chain rejected for
+    /// shape NEVER also bumps this counter, and vice versa. The
+    /// caller routes via the `InvalidReason` enum inside
+    /// `try_loopback_to_rx`.
+    pub(crate) fn record_rx_write_failed(&self) {
+        self.rx_write_failed.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record one `add_used` failure on the TX queue. Distinct from
@@ -416,9 +467,24 @@ impl VirtioNetCounters {
     }
 
     /// Read the cumulative count of RX chains rejected for malformed
-    /// shape (write-only direction violated).
+    /// shape (read-only descriptor on the receive side, or
+    /// attacker-controlled address overflow on the descriptor's
+    /// GPA). Distinct from [`Self::rx_write_failed`] (chain shape
+    /// was fine but a guest-memory `write_slice` hit an unmapped
+    /// GPA mid-walk).
     pub fn rx_chain_invalid(&self) -> u64 {
         self.rx_chain_invalid.load(Ordering::Relaxed)
+    }
+
+    /// Read the cumulative count of RX chains whose shape was valid
+    /// but whose guest-memory `write_slice` failed mid-walk
+    /// (header or frame bytes hit an unmapped GPA). Distinct from
+    /// [`Self::rx_chain_invalid`] (chain-shape rejection); the two
+    /// are mutually exclusive per chain so an operator's failure
+    /// dump can separate "guest violated the RX descriptor-direction
+    /// rule" from "guest posted a buffer at an unmapped GPA".
+    pub fn rx_write_failed(&self) -> u64 {
+        self.rx_write_failed.load(Ordering::Relaxed)
     }
 
     /// Read the cumulative count of TX `add_used` failures (queue's
@@ -999,12 +1065,19 @@ impl VirtioNet {
                         self.counters.record_tx_dropped_no_rx_buffer();
                     }
                     LoopbackOutcome::RxChainInvalid { add_used_ok } => {
-                        // Chain shape rejected. `rx_chain_invalid`
-                        // already bumped inside try_loopback_to_rx.
-                        // Whether the used-ring advanced depends on
-                        // whether the recycle-add_used succeeded; if
-                        // it did, the guest's NAPI must wake to see
-                        // the empty completion (otherwise the buffer
+                        // Chain rejected during the descriptor walk.
+                        // Exactly one of `rx_chain_invalid`
+                        // (chain-shape: read-only descriptor or
+                        // address overflow on the descriptor's GPA)
+                        // or `rx_write_failed` (chain shape OK but
+                        // a guest-memory `write_slice` hit an
+                        // unmapped GPA mid-walk) was bumped inside
+                        // `try_loopback_to_rx`; the two are
+                        // mutually exclusive per chain. Whether the
+                        // used-ring advanced depends on whether the
+                        // recycle-add_used succeeded; if it did,
+                        // the guest's NAPI must wake to see the
+                        // empty completion (otherwise the buffer
                         // sits unrecycled until a virtio reset).
                         // Recycle-add_used failure is NOT a poison
                         // event — that's a transient used-ring GPA
@@ -1414,14 +1487,29 @@ impl VirtioNet {
         let mut bytes_written: u32 = 0;
         let mut hdr_remaining: usize = VIRTIO_NET_HDR_LEN;
         let mut frame_pos: usize = 0;
-        let mut chain_invalid = false;
+        // `InvalidReason` distinguishes chain-shape rejection
+        // (read-only descriptor, address overflow on the
+        // descriptor's GPA) from guest-memory `write_slice` failure
+        // (chain shape was fine but a descriptor's GPA is
+        // unmapped). The two failure modes route to distinct
+        // counters (`rx_chain_invalid` vs `rx_write_failed`) so
+        // operators reading the failure dump can separate "guest
+        // violated the RX descriptor-direction rule" from "guest
+        // posted a buffer at an unmapped GPA". `None` = walk
+        // succeeded; the post-loop branch consults this and bumps
+        // exactly one counter (or none, on success).
+        enum InvalidReason {
+            Shape,
+            WriteFailed,
+        }
+        let mut chain_invalid: Option<InvalidReason> = None;
 
         for desc in chain {
             if !desc.is_write_only() {
                 // RX descriptors must be device-writable. A
                 // read-only descriptor in an RX chain is a guest
                 // protocol violation.
-                chain_invalid = true;
+                chain_invalid = Some(InvalidReason::Shape);
                 break;
             }
             let mut desc_addr = desc.addr();
@@ -1459,11 +1547,19 @@ impl VirtioNet {
                 let hdr_start = VIRTIO_NET_HDR_LEN - hdr_remaining;
                 let hdr_slice = &RX_HDR[hdr_start..hdr_start + take];
                 if mem.write_slice(hdr_slice, desc_addr).is_err() {
-                    chain_invalid = true;
+                    // GPA write failure — chain shape was
+                    // acceptable, the descriptor's address just
+                    // points at unmapped memory.
+                    chain_invalid = Some(InvalidReason::WriteFailed);
                     break;
                 }
                 let Some(new_addr) = desc_addr.checked_add(take as u64) else {
-                    chain_invalid = true;
+                    // Descriptor's `addr + take` overflows u64 —
+                    // an attacker-controlled malformed address.
+                    // Routed to chain-shape rejection: the
+                    // descriptor itself is malformed, distinct from
+                    // a write to an unmapped (but well-formed) GPA.
+                    chain_invalid = Some(InvalidReason::Shape);
                     break;
                 };
                 bytes_written = bytes_written
@@ -1487,7 +1583,11 @@ impl VirtioNet {
                 )
                 .is_err()
             {
-                chain_invalid = true;
+                // GPA write failure on the frame-data path. Same
+                // classification as the header `write_slice`
+                // failure above — chain shape was fine, the
+                // descriptor's GPA is unmapped.
+                chain_invalid = Some(InvalidReason::WriteFailed);
                 break;
             }
             bytes_written = bytes_written
@@ -1500,18 +1600,27 @@ impl VirtioNet {
             }
         }
 
-        if chain_invalid {
+        if let Some(reason) = chain_invalid {
             // Malformed RX chain: the frame is dropped, the chain
             // is marked used with `len=0` so the guest can recycle
             // its descriptor (without `add_used` the kernel's
             // virtio core would never recover the buffer until a
-            // virtio reset). `record_rx_chain_invalid` and the
-            // `RxChainInvalid` outcome together signal the caller
-            // NOT to also bump `tx_dropped_no_rx_buffer` — both
-            // counters would mean different things and the
-            // failure-classification taxonomy MUST stay 1:1 with
-            // events.
-            self.counters.record_rx_chain_invalid();
+            // virtio reset). The counter routing distinguishes
+            // shape rejection (`rx_chain_invalid`) from GPA
+            // write-failure (`rx_write_failed`); both still
+            // signal the caller NOT to also bump
+            // `tx_dropped_no_rx_buffer` — those events are
+            // mutually exclusive (chain present but malformed
+            // vs queue empty), and the failure-classification
+            // taxonomy MUST stay 1:1 with chains. Per chain, at
+            // most one of `rx_chain_invalid` / `rx_write_failed`
+            // is bumped — never both — because we set
+            // `chain_invalid` exactly once and break out of the
+            // descriptor walk on the first failure observed.
+            match reason {
+                InvalidReason::Shape => self.counters.record_rx_chain_invalid(),
+                InvalidReason::WriteFailed => self.counters.record_rx_write_failed(),
+            }
             // If `add_used` itself fails after a chain-direction
             // violation, the guest's used-ring is broken at the
             // same address the malformed chain came from. Record
@@ -1645,9 +1754,16 @@ impl VirtioNet {
 ///   - `NoRxBuffer`: RX queue not ready or empty, no chain
 ///     popped. Caller bumps `tx_dropped_no_rx_buffer`.
 ///   - `RxChainInvalid { add_used_ok }`: chain popped but
-///     malformed (read-only direction or write failure).
-///     `rx_chain_invalid` was bumped. The recycle
-///     `add_used(head, 0)` was attempted:
+///     could not be filled. Exactly ONE of two failure-mode
+///     counters was bumped (mutually exclusive per chain):
+///     - `rx_chain_invalid` for chain-shape rejection (read-only
+///       descriptor in an RX chain, or address-overflow on the
+///       descriptor's GPA).
+///     - `rx_write_failed` for guest-memory `write_slice`
+///       failure (chain shape was fine but the descriptor's GPA
+///       is unmapped — header or frame `write_slice` returned
+///       Err).
+///     The recycle `add_used(head, 0)` was attempted:
 ///     - If `add_used_ok = true`, the used-ring advanced —
 ///       caller must kick.
 ///     - If `add_used_ok = false`, the recycle add_used itself

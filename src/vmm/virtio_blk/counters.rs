@@ -160,6 +160,12 @@ impl VirtioBlkCounters {
     /// `bytes` to `bytes_read`. The pairing is enforced — bare
     /// reads_completed bumps without the paired bytes_read add are
     /// caught at refactor time.
+    ///
+    /// `bytes` MUST be the count actually returned by `read_at`
+    /// summed across the request's data segments — NOT the
+    /// descriptor length. On a short read the zero-padded tail is
+    /// delivered to the guest but does not count here; see
+    /// [`Self::bytes_read`] for the rationale.
     pub(crate) fn record_read(&self, bytes: u64) {
         self.reads_completed.fetch_add(1, Ordering::Relaxed);
         self.bytes_read.fetch_add(bytes, Ordering::Relaxed);
@@ -329,9 +335,22 @@ impl VirtioBlkCounters {
         self.flushes_completed.load(Ordering::Relaxed)
     }
 
-    /// Read the cumulative number of bytes successfully read from
-    /// the backing file and delivered to the guest. Per-request
+    /// Read the cumulative number of bytes the device's backing
+    /// file actually returned for read requests. Per-request
     /// counter: incremented in lockstep with `reads_completed`.
+    ///
+    /// This counts the `n` returned by each `read_at` call (i.e.
+    /// the bytes actually sourced from the backing file), NOT the
+    /// full descriptor length delivered to the guest. On a short
+    /// read at backing-file EOF, the device zero-pads the
+    /// remaining bytes of the descriptor (sparse-file semantics)
+    /// and delivers them to the guest, but those zero-pad bytes
+    /// do not count here — they were not "read" from any source.
+    /// The virtio-spec used.elem.len reported via `add_used`
+    /// includes the zero-pad (per virtio-v1.2 §2.7.7.2 it counts
+    /// bytes written to device-writable buffers); operators
+    /// comparing `bytes_read` to guest-side accounting must
+    /// account for the zero-pad gap in sparse-file scenarios.
     pub fn bytes_read(&self) -> u64 {
         self.bytes_read.load(Ordering::Relaxed)
     }

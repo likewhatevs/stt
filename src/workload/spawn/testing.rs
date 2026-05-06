@@ -187,6 +187,7 @@ pub(super) fn stub_custom_fn(_stop: &AtomicBool) -> WorkerReport {
         exit_info: None,
         is_messenger: false,
         group_idx: 0,
+        affinity_error: None,
     }
 }
 pub(super) fn custom_spin_fn(stop: &AtomicBool) -> WorkerReport {
@@ -224,6 +225,7 @@ pub(super) fn custom_spin_fn(stop: &AtomicBool) -> WorkerReport {
         exit_info: None,
         is_messenger: false,
         group_idx: 0,
+        affinity_error: None,
     }
 }
 /// Ready-file path shared between [`ignores_sigusr1_fn`] and

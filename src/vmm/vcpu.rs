@@ -20,7 +20,7 @@
 use std::os::unix::io::AsRawFd;
 use std::os::unix::thread::JoinHandleExt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU8, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -609,6 +609,29 @@ pub(crate) struct WatchpointArm {
     /// match on aarch64) and stores `true` into the corresponding
     /// `hit` flag.
     pub(crate) user: [WatchpointSlot; 3],
+    /// Fast-path gate for `self_arm_watchpoint`. `0` until any
+    /// publisher (the freeze coordinator's err_exit publish or
+    /// `arm_user_watchpoint`) writes a non-zero KVA into ANY slot;
+    /// then flipped to `1` and never reset for the run. The vCPU
+    /// loop loads this once with `Relaxed` before each KVM_RUN and
+    /// short-circuits the four `Acquire` loads on `request_kva`
+    /// when no arm has ever been requested. Without this gate every
+    /// vCPU iteration eats four cross-thread atomic loads even
+    /// before the watchpoint becomes interesting (the common case
+    /// for tests that never trigger sched_ext error transitions
+    /// AND register no `Op::WatchSnapshot` slots).
+    ///
+    /// `Relaxed` is correct here because the gate's only purpose is
+    /// to skip the per-slot `request_kva` reads. When the gate
+    /// flips false→true the publishers also issue a Release store
+    /// on the slot's `request_kva`; once a vCPU sees the gate set,
+    /// it falls through to the `Acquire` load on `request_kva`
+    /// which carries the synchronizes-with edge. The gate itself
+    /// never publishes data — it only authorises the slow path.
+    /// `AtomicU8` instead of `AtomicBool` so a future second flag
+    /// (e.g. "any disarm requested") can pack into the same word
+    /// without touching the call sites.
+    pub(crate) any_armed: AtomicU8,
 }
 
 /// Per-user-watchpoint slot state. One slot per hardware
@@ -673,20 +696,71 @@ impl WatchpointArm {
                 WatchpointSlot::new(),
                 WatchpointSlot::new(),
             ],
+            any_armed: AtomicU8::new(0),
         })
     }
 
-    /// Latch `hit=true` AND wake the freeze coordinator's epoll loop.
-    /// Used on every `KVM_EXIT_DEBUG` site that confirms an
-    /// error-class write to `*scx_root->exit_kind`. The Release on
-    /// `hit` synchronizes-with the coordinator's Acquire load; the
-    /// eventfd write fires the epoll wakeup so the late-trigger
-    /// rendezvous starts immediately instead of waiting for the
-    /// epoll timeout. A failed write is logged but non-fatal — the
-    /// `hit` flag still trips the next epoll tick (timerfd or
-    /// timeout), so the trigger eventually fires either way.
+    /// Mark the arm-fast-path gate as live. Idempotent — every
+    /// publisher (freeze coordinator's err_exit publish,
+    /// `arm_user_watchpoint`) calls this after the Release store on
+    /// `request_kva`. `Relaxed` is sufficient: the gate only
+    /// authorises the per-slot `Acquire` loads in
+    /// `self_arm_watchpoint`, which carry their own
+    /// synchronizes-with edge from the publisher's Release.
+    pub(crate) fn mark_armed(&self) {
+        self.any_armed.store(1, Ordering::Relaxed);
+    }
+
+    /// Latch `hit=true` AND wake the freeze coordinator's epoll loop
+    /// — but only on the false→true transition. Used on every
+    /// `KVM_EXIT_DEBUG` site that confirms an error-class write to
+    /// `*scx_root->exit_kind`.
+    ///
+    /// `compare_exchange` on `hit` makes the latch idempotent
+    /// across two race patterns:
+    ///   - Cross-vCPU concurrent stores: hardware data-write
+    ///     watchpoints trap only on the executing vCPU (DR0..DR3
+    ///     are per-vCPU on x86_64; `dbg_wvr/dbg_wcr` are per-vCPU
+    ///     on aarch64), so a single store cannot fire on more than
+    ///     one vCPU. But two vCPUs writing to the watched address
+    ///     in close succession each produce a `KVM_EXIT_DEBUG`;
+    ///     only the first to win the CAS publishes the eventfd
+    ///     edge. Peer fires see the slot already latched and skip
+    ///     the eventfd write — preventing the freeze coordinator
+    ///     from rendezvousing twice for what should be one logical
+    ///     event.
+    ///   - Re-fires before reset: if a vCPU fires again before the
+    ///     freeze coordinator's reset path runs, the second fire
+    ///     CAS true→true and skips the eventfd write. The
+    ///     coordinator only resets `hit` on the slot-0
+    ///     suppression / rendezvous-timeout path
+    ///     (`freeze_coord.rs::run_coord_loop`, the
+    ///     `None if watchpoint_only_trigger` arm — slot 0 alone
+    ///     resets on suppression so the next genuine error-class
+    ///     write retriggers; on a successful dump slot 0 stays
+    ///     latched and `freeze_state = Done` ends the run); user
+    ///     slots 1..=3 reset via `swap(false)` in the per-iteration
+    ///     user-slot dispatch loop.
+    ///
+    /// `Release` ordering on the success path synchronizes-with
+    /// the coordinator's `Acquire` load on `hit`. `Relaxed` on the
+    /// failure path is safe because the slot is already latched —
+    /// no new data is published.
+    ///
+    /// A failed eventfd write is logged but non-fatal: the `hit`
+    /// flag still trips the next epoll tick (timerfd or timeout),
+    /// so the trigger eventually fires either way.
     pub(crate) fn latch_hit(&self) {
-        self.hit.store(true, Ordering::Release);
+        if self
+            .hit
+            .compare_exchange(false, true, Ordering::Release, Ordering::Relaxed)
+            .is_err()
+        {
+            // Already latched by a peer vCPU or a prior fire on
+            // this vCPU; the eventfd edge is already pending or
+            // has already woken the coordinator.
+            return;
+        }
         if let Err(e) = self.hit_evt.write(1) {
             tracing::warn!(
                 error = %e,
@@ -696,13 +770,28 @@ impl WatchpointArm {
         }
     }
 
-    /// Latch a user-watchpoint slot fire. `idx` selects the DR1/DR2/DR3
-    /// slot (0..=2 mapping to DR1..=DR3). Sets `user[idx].hit` and
-    /// fires `hit_evt` so the freeze coordinator wakes immediately
-    /// and runs `freeze_and_capture(false)` against the slot's tag.
+    /// Latch a user-watchpoint slot fire — but only on the
+    /// false→true transition. `idx` selects the DR1/DR2/DR3 slot
+    /// (0..=2 mapping to DR1..=DR3). Same dedup rationale as
+    /// [`Self::latch_hit`]: cross-vCPU concurrent stores and re-
+    /// fires before the coordinator's `swap(false)` reset all
+    /// converge on a single eventfd edge.
+    ///
+    /// Out-of-range `idx` is a programming error caught at the
+    /// boundary — the helper returns silently (no eventfd write,
+    /// no latch) so a bug in the dispatch loop's index arithmetic
+    /// surfaces as "no fire" in test logs rather than a panic on
+    /// the kernel-boundary path.
     pub(crate) fn latch_user_hit(&self, idx: usize) {
-        if idx < self.user.len() {
-            self.user[idx].hit.store(true, Ordering::Release);
+        if idx >= self.user.len() {
+            return;
+        }
+        if self.user[idx]
+            .hit
+            .compare_exchange(false, true, Ordering::Release, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
         }
         if let Err(e) = self.hit_evt.write(1) {
             tracing::warn!(
@@ -775,14 +864,29 @@ pub(crate) fn self_arm_watchpoint(
     // fires BEFORE the store retires, so re-entering KVM_RUN replays
     // the same instruction → infinite-fire without
     // KVM_GUESTDBG_SINGLESTEP). On x86_64 the trap is taken AFTER the
-    // store and re-entry advances normally, so these inputs are
-    // unused; consume them here to keep the signature shared with the
-    // aarch64 sibling.
+    // store (Intel SDM Vol. 3B 17.2.4) and re-entry advances normally,
+    // so these inputs are unused; consume them here to keep the
+    // signature shared with the aarch64 sibling.
     let _ = (
         single_step_pending,
         single_step_slot,
         &mut *armed_single_step,
     );
+    // Fast-path gate: short-circuit when no publisher has flipped
+    // `any_armed`. The freeze coordinator's err_exit publish and
+    // `arm_user_watchpoint` set the gate (via
+    // `WatchpointArm::mark_armed`) AFTER their Release on
+    // `request_kva`; until then no slot can carry a non-zero KVA
+    // and the per-slot `Acquire` reads below are guaranteed to
+    // return zeros. Skipping them saves four cross-thread atomic
+    // loads per KVM_RUN iteration on every vCPU thread. On x86_64
+    // TSO makes Acquire loads cheap (plain MOV), but the gate
+    // still removes four cache-coherent reads from the run-loop
+    // hot path on the common case where no test arms a
+    // watchpoint.
+    if watchpoint.any_armed.load(Ordering::Relaxed) == 0 {
+        return false;
+    }
     let mut requests = [0u64; 4];
     requests[0] = watchpoint.request_kva.load(Ordering::Acquire);
     for i in 0..3 {
@@ -799,8 +903,15 @@ pub(crate) fn self_arm_watchpoint(
     };
     // DR7 base: GE (0x200) + MBS (0x400) + LE (0x100). Per-DR enable
     // and R/W/LEN encodings get OR'd in for each requested slot.
+    //
+    // The early-return gate above guarantees at least one slot
+    // carries a non-zero `request_kva` — `any_armed` flipped to 1
+    // by `WatchpointArm::mark_armed` only after a publisher's
+    // Release store on a slot, and the gate stays set for the run
+    // lifetime (no slot release path exists). So the per-slot
+    // loop emits at least one non-empty entry; the disarm-all
+    // branch that previously cleared `debugreg[7]` was dead.
     let mut dr7: u64 = 0x400 | 0x200 | 0x100;
-    let mut any_armed = false;
     for (i, kva) in requests.iter().enumerate() {
         if *kva == 0 {
             continue;
@@ -820,17 +931,8 @@ pub(crate) fn self_arm_watchpoint(
         dr7 |= (0b11) << (2 * i); // L<i> + G<i>
         dr7 |= (0b01) << (16 + 4 * i); // R/W<i> = data-write
         dr7 |= (0b11) << (18 + 4 * i); // LEN<i> = 4-byte
-        any_armed = true;
     }
-    if !any_armed {
-        // Every slot was cleared since last arm — disarm via
-        // KVM_SET_GUEST_DEBUG with cleared DR7. Without this a stale
-        // arm would keep firing indefinitely after the test
-        // completes.
-        debug_struct.arch.debugreg[7] = 0;
-    } else {
-        debug_struct.arch.debugreg[7] = dr7;
-    }
+    debug_struct.arch.debugreg[7] = dr7;
     match vcpu.set_guest_debug(&debug_struct) {
         Ok(()) => {
             *armed_slots = requests;
@@ -928,9 +1030,15 @@ pub(crate) fn self_arm_watchpoint(
 ///     non-EINTR failure cap.
 ///   - On hitting `WATCHPOINT_MAX_NON_EINTR_FAILURES`, the
 ///     slot stamps to suppress further retries.
-///   - Disarm uses an all-zero `dbg_wcr/dbg_wvr` payload —
-///     the kernel reloads `external_debug_state` on guest
-///     entry, so a zeroed payload disables every slot.
+///
+/// There is no disarm path: once a publisher flips
+/// `any_armed`, every subsequent `set_guest_debug` carries
+/// `KVM_GUESTDBG_USE_HW` with at least one armed slot for the
+/// run lifetime. `request_kva` is not reset while vCPU
+/// threads are running (only after join at teardown), so
+/// the per-slot loop
+/// always emits at least one populated `dbg_wcr`/`dbg_wvr`
+/// pair.
 #[cfg(target_arch = "aarch64")]
 pub(crate) fn self_arm_watchpoint(
     vcpu: &mut kvm_ioctls::VcpuFd,
@@ -941,17 +1049,37 @@ pub(crate) fn self_arm_watchpoint(
     single_step_slot: usize,
     armed_single_step: &mut bool,
 ) -> bool {
+    // Fast-path gate: short-circuit when no publisher has flipped
+    // `any_armed`. The freeze coordinator's err_exit publish and
+    // `arm_user_watchpoint` set the gate (via
+    // `WatchpointArm::mark_armed`) AFTER their Release on
+    // `request_kva`; until then no slot can carry a non-zero KVA
+    // and the per-slot `Acquire` reads below are guaranteed to
+    // return zeros. Skipping them saves four cross-thread atomic
+    // loads per KVM_RUN iteration on every vCPU thread, which is
+    // material on aarch64 where each load is an `LDAR` with an
+    // associated barrier.
+    //
+    // `Relaxed` is correct: the gate's only role is to authorise
+    // the per-slot `Acquire` loads below. Once the gate is set,
+    // those loads carry the synchronizes-with edge from the
+    // publisher's `Release` on `request_kva` directly. The gate
+    // itself never publishes data — it only signals "the slow
+    // path is now interesting."
+    if watchpoint.any_armed.load(Ordering::Relaxed) == 0 {
+        return false;
+    }
     let mut requests = [0u64; 4];
     requests[0] = watchpoint.request_kva.load(Ordering::Acquire);
     for i in 0..3 {
         requests[i + 1] = watchpoint.user[i].request_kva.load(Ordering::Acquire);
     }
     // Re-issue when EITHER the requested slot KVAs changed OR the
-    // single-step posture flipped (transition INTO step → temporarily
-    // disable the fired slot's WCR.E and assert
-    // KVM_GUESTDBG_SINGLESTEP; transition OUT OF step → restore
-    // WCR.E=1 and drop SINGLESTEP). The two-conditions form keeps
-    // the no-arm fast path intact for the common no-op iteration.
+    // single-step posture flipped (transition INTO step → disable
+    // every matched slot's WCR.E and assert KVM_GUESTDBG_SINGLESTEP;
+    // transition OUT OF step → restore WCR.E=1 on every slot and
+    // drop SINGLESTEP). The two-conditions form keeps the no-arm
+    // fast path intact for the common no-op iteration.
     if requests == *armed_slots && *armed_single_step == single_step_pending {
         return false;
     }
@@ -974,6 +1102,11 @@ pub(crate) fn self_arm_watchpoint(
         pad: 0,
         arch: kvm_bindings::kvm_guest_debug_arch::default(),
     };
+    // `single_step_slot` carries a 4-bit bitmap of slot indices
+    // that fired on this dispatch (bit i set ⇒ slot i was matched
+    // by the FAR range check in `dispatch_watchpoint_hit`).
+    // Truncate to u8 — only the bottom four bits are defined.
+    let step_mask: u8 = (single_step_slot & 0xF) as u8;
     for (i, kva) in requests.iter().enumerate() {
         if *kva == 0 {
             continue;
@@ -995,16 +1128,26 @@ pub(crate) fn self_arm_watchpoint(
         let bas: u64 = 0xFu64 << byte_offset;
         // PAC=0b11 (bits 2:1) | LSC=0b10 (bits 4:3,
         // write-only) | BAS (bits 12:5). The E bit (bit 0) is
-        // cleared on the slot we are stepping past so that
-        // single-step does not re-trip the same watchpoint
-        // before the offending store retires; every other
-        // active slot keeps E=1 so peer watchpoints stay live
-        // during the single-step pass. Mirrors the kernel
-        // hw_breakpoint.c `enable_single_step` /
-        // `toggle_bp_registers` pattern that disables the
-        // fired BP's E bit, executes one instruction in
-        // single-step, then restores E.
-        let e = if single_step_pending && i == single_step_slot {
+        // cleared on EVERY slot whose bit is set in the step
+        // mask — overlapping arms (`arm_user_watchpoint` does
+        // not reject duplicate KVAs) can produce simultaneous
+        // matches, and EVERY matched slot must have WCR.E
+        // cleared during the single-step pass to avoid the
+        // offending store re-tripping the watchpoint on its
+        // replay. Peer slots that did NOT match keep E=1 so
+        // their watches stay live during the step. We diverge
+        // from the kernel `arch/arm64/kernel/hw_breakpoint.c
+        // ::toggle_bp_registers(AARCH64_DBG_REG_WCR, el, 0)`
+        // pattern, which disables WCR.E on EVERY watchpoint
+        // slot at the matching exception level during
+        // single-step regardless of which slot fired. KVM
+        // userspace only programs slots ktstr explicitly arms,
+        // so peer slots are always ktstr's own watches; keeping
+        // them active during the step preserves the post-step
+        // rearm contract (no extra ioctl to restore peer E=1
+        // bits) and the watched store is on a matched slot, so
+        // peer slots cannot re-trip on the replay.
+        let e = if single_step_pending && (step_mask & (1u8 << i)) != 0 {
             0u64
         } else {
             1u64

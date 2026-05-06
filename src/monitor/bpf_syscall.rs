@@ -444,7 +444,9 @@ impl BpfSyscallAccessor {
     /// scheduler instance, names are unique and stable for the
     /// duration of the run.
     fn pinned_for(&self, target: &BpfMapInfo) -> Option<&PinnedMap> {
-        self.maps.iter().find(|p| p.info.name == target.name)
+        self.maps
+            .iter()
+            .find(|p| p.info.name_bytes_active() == target.name_bytes_active())
     }
 }
 
@@ -472,7 +474,8 @@ fn obj_get_info_map(fd: RawFd) -> Result<(BpfMapInfo, u64)> {
         .iter()
         .position(|&b| b == 0)
         .unwrap_or(BPF_OBJ_NAME_LEN);
-    let name = String::from_utf8_lossy(&info.name[..nul]).to_string();
+    let mut name_bytes = [0u8; BPF_OBJ_NAME_LEN];
+    name_bytes.copy_from_slice(&info.name);
 
     Ok((
         BpfMapInfo {
@@ -482,7 +485,8 @@ fn obj_get_info_map(fd: RawFd) -> Result<(BpfMapInfo, u64)> {
             // through the pinned fd, not these fields.
             map_pa: 0,
             map_kva: 0,
-            name,
+            name_bytes,
+            name_len: nul as u8,
             map_type: info.map_type,
             map_flags: info.map_flags,
             key_size: info.key_size,

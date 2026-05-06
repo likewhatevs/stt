@@ -1,8 +1,9 @@
 //! Priority-inheritance mutex via `pthread_mutex` + `PTHREAD_PRIO_INHERIT`.
 //!
 //! Used wherever the host VMM holds a lock that may be contended between
-//! SCHED_FIFO and SCHED_OTHER threads. See [`PiMutex`] for the
-//! degradation contract.
+//! SCHED_FIFO and SCHED_OTHER threads. CONFIG_FUTEX_PI is a hard
+//! requirement on the host kernel — see [`PiMutex`] for the failure
+//! mode when it is not available.
 
 /// Mutex that uses the kernel's priority-inheritance protocol to avoid
 /// priority inversion between RT and non-RT threads.
@@ -12,27 +13,36 @@
 /// priority, ensuring the critical section completes without unbounded
 /// delay.
 ///
-/// Uses `pthread_mutexattr_setprotocol(PTHREAD_PRIO_INHERIT)` which maps
-/// to `FUTEX_LOCK_PI` in the kernel. On systems where the kernel is
-/// built without `CONFIG_FUTEX_PI`, `setprotocol` returns `ENOTSUP`
-/// and the mutex degrades to the default `PTHREAD_PRIO_NONE` protocol
-/// — mutual exclusion is preserved, but priority inheritance is not
-/// active. PI is a performance hint, not a correctness invariant, so
-/// the degraded mode is safe for every caller in this crate.
+/// `pthread_mutexattr_setprotocol(PTHREAD_PRIO_INHERIT)` operates on
+/// a userspace `pthread_mutexattr_t`; it does not enter the kernel and
+/// therefore does not observe the running kernel's config. The kernel
+/// boundary is crossed at lock time via the futex syscall family
+/// (`FUTEX_LOCK_PI` / `FUTEX_LOCK_PI2`), which returns `-ENOSYS` when
+/// the kernel is built without `CONFIG_FUTEX_PI` (kernel/futex/pi.c,
+/// `futex_lock_pi` early return; same gate covers the PI-related
+/// syscalls in `kernel/futex/syscalls.c::do_futex`). When that
+/// surfaces as a nonzero return from `pthread_mutex_lock`, the assert
+/// in [`PiMutex::lock`] panics. There is no graceful degradation in
+/// this path: a host without `CONFIG_FUTEX_PI` cannot run ktstr.
 ///
 /// # Panics
 ///
 /// * `PiMutex::new` panics if `pthread_mutexattr_init` or
 ///   `pthread_mutex_init` fails, or if
 ///   `pthread_mutexattr_setprotocol(PTHREAD_PRIO_INHERIT)` returns any
-///   nonzero value OTHER than `ENOTSUP` — the `ENOTSUP` case is
-///   logged and handled gracefully (see the degradation note above).
+///   nonzero value other than `ENOTSUP`. The `ENOTSUP` branch covers
+///   only a libc-level refusal of the protocol value (e.g. a non-glibc
+///   libc that does not implement PI mutexes); it is not reached on
+///   Linux/glibc when the kernel lacks CONFIG_FUTEX_PI, because that
+///   condition is invisible to glibc until lock time.
 ///   The alternative on real init failures (a partially initialized
 ///   mutex) would have undefined lock/unlock semantics.
-/// * `PiMutex::lock` panics if `pthread_mutex_lock` fails.
-///   Returning a guard on an unlocked mutex would let the caller
-///   obtain `&mut T` without exclusive access — a data race and
-///   undefined behaviour — so this mirrors `std::sync::Mutex`.
+/// * `PiMutex::lock` panics if `pthread_mutex_lock` returns nonzero.
+///   The expected failure mode in practice is `ENOSYS` on a host
+///   kernel without `CONFIG_FUTEX_PI` (the kernel-side gate cited
+///   above). Returning a guard on an unlocked mutex would let the
+///   caller obtain `&mut T` without exclusive access — a data race
+///   and undefined behaviour — so this mirrors `std::sync::Mutex`.
 /// * `PiMutexGuard::drop` calls `libc::abort()` if
 ///   `pthread_mutex_unlock` fails (typical cause: `EPERM` — the
 ///   current thread does not own the mutex, indicating a violated
@@ -58,17 +68,26 @@ impl<T> PiMutex<T> {
             let rc = libc::pthread_mutexattr_init(&mut attr);
             assert_eq!(rc, 0, "pthread_mutexattr_init failed: {rc}");
             let rc = libc::pthread_mutexattr_setprotocol(&mut attr, libc::PTHREAD_PRIO_INHERIT);
-            // PI protocol is a performance hint, not a correctness
-            // invariant for ktstr — priority inversion on the host
-            // only matters when SCHED_FIFO threads are in play. On a
-            // kernel built without CONFIG_FUTEX_PI, `setprotocol`
-            // returns ENOTSUP; degrade silently to the default
-            // PRIO_NONE protocol instead of aborting startup. Any
-            // other nonzero rc is a programmer error (EINVAL from a
-            // bad attr pointer) and is still asserted.
+            // pthread_mutexattr_setprotocol writes a field in the
+            // userspace pthread_mutexattr_t; it does not enter the
+            // kernel and so it cannot observe whether the running
+            // kernel was built with CONFIG_FUTEX_PI. The CONFIG_FUTEX_PI
+            // gate fires at lock time via the FUTEX_LOCK_PI futex op
+            // (kernel/futex/pi.c, futex_lock_pi early return), which
+            // surfaces as a nonzero return from pthread_mutex_lock and
+            // trips the assert in lock() — the process panics.
+            //
+            // The ENOTSUP branch below therefore does not catch the
+            // missing-CONFIG_FUTEX_PI case; it covers only a libc
+            // that refuses PTHREAD_PRIO_INHERIT outright (e.g. a
+            // pthread implementation that lacks PI support). On such
+            // a libc, falling back to the default PRIO_NONE protocol
+            // preserves mutual exclusion and lets the process come
+            // up. Any other nonzero rc is a programmer error (EINVAL
+            // from a bad attr pointer) and is still asserted.
             if rc == libc::ENOTSUP {
                 tracing::warn!(
-                    "PTHREAD_PRIO_INHERIT unsupported (errno {}); PiMutex degrading to non-PI protocol",
+                    "PTHREAD_PRIO_INHERIT unsupported by libc (errno {}); PiMutex degrading to non-PI protocol",
                     rc
                 );
             } else {

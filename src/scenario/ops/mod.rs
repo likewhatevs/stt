@@ -64,6 +64,7 @@ mod types;
 pub use types::*;
 
 use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -72,8 +73,28 @@ use anyhow::{Context, Result};
 use crate::assert::AssertResult;
 use crate::scenario::backdrop;
 use crate::scenario::{CgroupGroup, Ctx, process_alive};
-use crate::vmm::shm_ring::{self, StimulusPayload};
+use crate::vmm::guest_comms;
+use crate::vmm::wire::StimulusPayload;
 use crate::workload::{MemPolicy, WorkSpec, WorkloadConfig, WorkloadHandle};
+
+/// Latched once `Op::Snapshot` / `Op::WatchSnapshot` observes a
+/// [`crate::vmm::wire::SnapshotRequestResult::TransportError`].
+/// Process-scoped because the underlying transport (virtio-console
+/// bulk port + SHM ring) is process-shared: once the host's freeze
+/// coordinator stops draining, every subsequent guest-side request
+/// will time out the same 30-second window. A `Loop` step that
+/// fires `Op::Snapshot` every iteration would otherwise burn 30 s
+/// per iteration on a permanently dead transport. After the first
+/// timeout the flag short-circuits later attempts back to a
+/// `tracing::warn!` no-op so the loop continues exercising the
+/// scheduler workload at near-full cadence.
+///
+/// The flag is never cleared inside `apply_ops` — recovering the
+/// transport requires fresh process state. New scenarios in the
+/// same guest process inherit "transport dead" because the
+/// underlying virtio-console port and host coordinator are the
+/// same instance.
+static SNAPSHOT_TRANSPORT_DEAD: AtomicBool = AtomicBool::new(false);
 
 // ---------------------------------------------------------------------------
 // Step executor
@@ -683,13 +704,13 @@ fn run_scenario(
     // ScenarioStart marker. `is_guest` short-circuits in host
     // contexts (unit tests) where the bulk port and SHM ring are
     // both absent and `send_scenario_start` would log a no-op warning.
-    if shm_ring::is_guest() {
+    if guest_comms::is_guest() {
         crate::vmm::guest_comms::send_scenario_start();
     }
 
     // When a host-side BPF map write is configured the test framework
     // sets `wait_for_map_write=true`; in that case block until the
-    // guest's `shm_poll_loop` observes
+    // guest's `hvc0_poll_loop` observes
     // [`crate::vmm::virtio_console::SIGNAL_BPF_WRITE_DONE`] (pushed by
     // the host's `bpf-map-write` thread after every queued
     // `bpf_map_write` lands) and fires the `bpf_map_write_done` latch.
@@ -706,7 +727,7 @@ fn run_scenario(
     // the guest proceed under its own timeout, and a bail here would
     // mask the underlying host-side resolution failure with a
     // test-side `Err`.
-    if ctx.wait_for_map_write && shm_ring::is_guest() {
+    if ctx.wait_for_map_write && guest_comms::is_guest() {
         let latch = crate::vmm::rust_init::bpf_map_write_done_latch();
         if !latch.wait_timeout(Duration::from_secs(60)) {
             tracing::warn!(
@@ -769,8 +790,9 @@ fn run_scenario(
             // nothing — but collect defensively so a partial-failure
             // path that leaks a non-backdrop write surfaces here
             // rather than disappearing into `StepState::drop`.
-            let mut r = collect_backdrop(&mut backdrop_state, effective_checks, ctx.topo);
-            let staging_result = collect_step(&mut step_staging, effective_checks, ctx.topo);
+            let mut r = collect_backdrop(&mut backdrop_state, effective_checks, ctx.topo, ctx.cgroups);
+            let staging_result =
+                collect_step(&mut step_staging, effective_checks, ctx.topo, ctx.cgroups);
             r.merge(staging_result);
             r.merge(result);
             // step_staging's CgroupGroup RAII still drops here,
@@ -805,7 +827,7 @@ fn run_scenario(
             // Collect backdrop-owned workload handles into the
             // result before reporting the crash so whatever the
             // persistent workers produced is still assertable.
-            let mut r = collect_backdrop(&mut backdrop_state, effective_checks, ctx.topo);
+            let mut r = collect_backdrop(&mut backdrop_state, effective_checks, ctx.topo, ctx.cgroups);
             r.merge(result);
             r.passed = false;
             r.details.push(crate::assert::AssertDetail::new(
@@ -837,7 +859,7 @@ fn run_scenario(
         // cgroups created this step go away, workload handles are
         // collected into the result, payload handles are killed
         // with metric emission. Backdrop state is untouched.
-        let step_result = collect_step(&mut step_state, effective_checks, ctx.topo);
+        let step_result = collect_step(&mut step_state, effective_checks, ctx.topo, ctx.cgroups);
         result.merge(step_result);
 
         // A step-level error is converted into a failure on the
@@ -855,7 +877,7 @@ fn run_scenario(
             // emission) on the error path. Ordering mirrors the
             // scheduler-crash path above so detail order is
             // consistent across both Ok(failed) returns.
-            let mut r = collect_backdrop(&mut backdrop_state, effective_checks, ctx.topo);
+            let mut r = collect_backdrop(&mut backdrop_state, effective_checks, ctx.topo, ctx.cgroups);
             r.merge(result);
             r.passed = false;
             r.details.push(crate::assert::AssertDetail::new(
@@ -874,7 +896,7 @@ fn run_scenario(
         // time. Same Backdrop-then-step merge order as the
         // inter-step path above so detail ordering stays consistent.
         if sched_died_during_hold {
-            let mut r = collect_backdrop(&mut backdrop_state, effective_checks, ctx.topo);
+            let mut r = collect_backdrop(&mut backdrop_state, effective_checks, ctx.topo, ctx.cgroups);
             r.merge(result);
             r.passed = false;
             r.details.push(crate::assert::AssertDetail::new(
@@ -889,7 +911,7 @@ fn run_scenario(
 
     // ScenarioEnd marker. Routes through `send_scenario_end`
     // (virtio-console port-1 with COM2 fallback for early-boot).
-    if shm_ring::is_guest() {
+    if guest_comms::is_guest() {
         let elapsed = scenario_start.elapsed().as_millis() as u64;
         crate::vmm::guest_comms::send_scenario_end(elapsed);
     }
@@ -899,7 +921,7 @@ fn run_scenario(
     let sched_dead = ctx.sched_pid.is_some_and(|pid| !process_alive(pid));
 
     // --- Backdrop teardown ---
-    let backdrop_result = collect_backdrop(&mut backdrop_state, effective_checks, ctx.topo);
+    let backdrop_result = collect_backdrop(&mut backdrop_state, effective_checks, ctx.topo, ctx.cgroups);
     result.merge(backdrop_result);
 
     if sched_dead {
@@ -1157,7 +1179,7 @@ fn run_step<'a>(
             // port-1 bulk channel). `is_guest` keeps the
             // `build_stimulus` walk off the host where the write would
             // no-op.
-            if shm_ring::is_guest() {
+            if guest_comms::is_guest() {
                 let payload = build_stimulus(&scenario_start, step_idx, &step.ops, &scenario);
                 crate::vmm::guest_comms::send_stimulus(zerocopy::IntoBytes::as_bytes(&payload));
             }
@@ -1921,6 +1943,23 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                     cgroup_cpuset.as_ref(),
                     ctx.topo,
                 )?;
+                // Materialise the Random pool into a Vec once before
+                // walking handles. `IndexedRandom::sample` requires
+                // slice indexing, which `BTreeSet` does not provide;
+                // without this hoist the per-handle inner arm would
+                // re-collect the same pool on every matching handle
+                // (and a single cgroup name can carry multiple handles
+                // when a `CgroupDef::works` vec or repeated `Op::Spawn`
+                // populates more than one). The pool is invariant
+                // across handles for a given resolved affinity.
+                let random_pool: Vec<usize> = match &resolved {
+                    crate::workload::ResolvedAffinity::Random { from, count }
+                        if !from.is_empty() && *count > 0 =>
+                    {
+                        from.iter().copied().collect()
+                    }
+                    _ => Vec::new(),
+                };
                 for (name, handle) in state.all_handles() {
                     if name.as_str() == *cgroup {
                         match &resolved {
@@ -1938,14 +1977,15 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                                     }
                                 }
                             }
-                            crate::workload::ResolvedAffinity::Random { from, count }
-                                if !from.is_empty() && *count > 0 =>
+                            crate::workload::ResolvedAffinity::Random { from: _, count }
+                                if !random_pool.is_empty() && *count > 0 =>
                             {
                                 use rand::seq::IndexedRandom;
-                                let v: Vec<usize> = from.iter().copied().collect();
                                 for idx in 0..handle.worker_pids().len() {
-                                    let chosen: BTreeSet<usize> =
-                                        v.sample(&mut rand::rng(), *count).copied().collect();
+                                    let chosen: BTreeSet<usize> = random_pool
+                                        .sample(&mut rand::rng(), *count)
+                                        .copied()
+                                        .collect();
                                     if let Err(e) = handle.set_affinity(idx, &chosen) {
                                         tracing::warn!(
                                             cgroup = %cgroup,
@@ -2195,30 +2235,45 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                     captured
                 });
                 if invoked.is_none() {
-                    if crate::vmm::shm_ring::is_guest() {
-                        let timeout = std::time::Duration::from_secs(30);
-                        match crate::vmm::guest_comms::request_snapshot(
-                            crate::vmm::shm_ring::SHM_SNAPSHOT_KIND_CAPTURE,
-                            name,
-                            timeout,
-                        ) {
-                            crate::vmm::shm_ring::SnapshotRequestResult::Ok => {
-                                tracing::info!(
-                                    name = %name,
-                                    "Op::Snapshot: host captured diagnostic snapshot via SHM doorbell"
-                                );
-                            }
-                            crate::vmm::shm_ring::SnapshotRequestResult::HostError { reason } => {
-                                anyhow::bail!(
-                                    "Op::Snapshot('{name}'): host rejected capture: {reason}"
-                                );
-                            }
-                            crate::vmm::shm_ring::SnapshotRequestResult::TransportError {
-                                reason,
-                            } => {
-                                anyhow::bail!(
-                                    "Op::Snapshot('{name}'): SHM/doorbell transport failure: {reason}"
-                                );
+                    if crate::vmm::guest_comms::is_guest() {
+                        if SNAPSHOT_TRANSPORT_DEAD.load(Ordering::Relaxed) {
+                            // A prior request observed a transport
+                            // failure. Skip the 30 s host-reply wait
+                            // — the latch only flips on
+                            // TransportError, so the host-side
+                            // coordinator is unreachable until the
+                            // process restarts.
+                            tracing::warn!(
+                                name = %name,
+                                "Op::Snapshot: snapshot transport latched dead; skipping host \
+                                 request to avoid the 30 s timeout per attempt"
+                            );
+                        } else {
+                            let timeout = std::time::Duration::from_secs(30);
+                            match crate::vmm::guest_comms::request_snapshot(
+                                crate::vmm::wire::SNAPSHOT_KIND_CAPTURE,
+                                name,
+                                timeout,
+                            ) {
+                                crate::vmm::wire::SnapshotRequestResult::Ok => {
+                                    tracing::info!(
+                                        name = %name,
+                                        "Op::Snapshot: host captured diagnostic snapshot via TLV stream"
+                                    );
+                                }
+                                crate::vmm::wire::SnapshotRequestResult::HostError { reason } => {
+                                    anyhow::bail!(
+                                        "Op::Snapshot('{name}'): host rejected capture: {reason}"
+                                    );
+                                }
+                                crate::vmm::wire::SnapshotRequestResult::TransportError {
+                                    reason,
+                                } => {
+                                    SNAPSHOT_TRANSPORT_DEAD.store(true, Ordering::Relaxed);
+                                    anyhow::bail!(
+                                        "Op::Snapshot('{name}'): port-1 transport failure: {reason}"
+                                    );
+                                }
                             }
                         }
                     } else {
@@ -2235,8 +2290,9 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                 //   1. Test fixture: thread-local SnapshotBridge
                 //      drives the register callback directly.
                 //   2. Production: in-guest scenario sends a
-                //      `SHM_SNAPSHOT_KIND_WATCH` request through
-                //      SHM. The host coordinator resolves the
+                //      `SNAPSHOT_KIND_WATCH` request through the
+                //      virtio-console port-1 TLV stream. The host
+                //      coordinator resolves the
                 //      symbol via the parsed vmlinux ELF +
                 //      direct-mapping translation, allocates a
                 //      free user watchpoint slot, programs the
@@ -2264,32 +2320,41 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                         );
                     }
                     None => {
-                        if crate::vmm::shm_ring::is_guest() {
-                            let timeout = std::time::Duration::from_secs(30);
-                            match crate::vmm::guest_comms::request_snapshot(
-                                crate::vmm::shm_ring::SHM_SNAPSHOT_KIND_WATCH,
-                                symbol,
-                                timeout,
-                            ) {
-                                crate::vmm::shm_ring::SnapshotRequestResult::Ok => {
-                                    tracing::info!(
-                                        symbol = %symbol,
-                                        "Op::WatchSnapshot: host armed hardware-watchpoint via SHM doorbell"
-                                    );
-                                }
-                                crate::vmm::shm_ring::SnapshotRequestResult::HostError {
-                                    reason,
-                                } => {
-                                    anyhow::bail!(
-                                        "Op::WatchSnapshot('{symbol}'): host rejected: {reason}"
-                                    );
-                                }
-                                crate::vmm::shm_ring::SnapshotRequestResult::TransportError {
-                                    reason,
-                                } => {
-                                    anyhow::bail!(
-                                        "Op::WatchSnapshot('{symbol}'): SHM/doorbell transport failure: {reason}"
-                                    );
+                        if crate::vmm::guest_comms::is_guest() {
+                            if SNAPSHOT_TRANSPORT_DEAD.load(Ordering::Relaxed) {
+                                tracing::warn!(
+                                    symbol = %symbol,
+                                    "Op::WatchSnapshot: snapshot transport latched dead; skipping \
+                                     host request to avoid the 30 s timeout per attempt"
+                                );
+                            } else {
+                                let timeout = std::time::Duration::from_secs(30);
+                                match crate::vmm::guest_comms::request_snapshot(
+                                    crate::vmm::wire::SNAPSHOT_KIND_WATCH,
+                                    symbol,
+                                    timeout,
+                                ) {
+                                    crate::vmm::wire::SnapshotRequestResult::Ok => {
+                                        tracing::info!(
+                                            symbol = %symbol,
+                                            "Op::WatchSnapshot: host armed hardware-watchpoint via TLV stream"
+                                        );
+                                    }
+                                    crate::vmm::wire::SnapshotRequestResult::HostError {
+                                        reason,
+                                    } => {
+                                        anyhow::bail!(
+                                            "Op::WatchSnapshot('{symbol}'): host rejected: {reason}"
+                                        );
+                                    }
+                                    crate::vmm::wire::SnapshotRequestResult::TransportError {
+                                        reason,
+                                    } => {
+                                        SNAPSHOT_TRANSPORT_DEAD.store(true, Ordering::Relaxed);
+                                        anyhow::bail!(
+                                            "Op::WatchSnapshot('{symbol}'): port-1 transport failure: {reason}"
+                                        );
+                                    }
                                 }
                             }
                         } else {
@@ -2383,11 +2448,38 @@ fn read_cpuset(ctx: &Ctx, name: &str) -> Option<BTreeSet<usize>> {
 /// iteration, so its `CgroupGroup` drop removes every step-local
 /// cgroup immediately after `run_scenario` propagates the result
 /// of this call.
+///
+/// Before draining handles, every step-local cgroup is unfrozen
+/// (`cgroup.freeze` ← 0). An [`Op::FreezeCgroup`] without a paired
+/// [`Op::UnfreezeCgroup`] would leave step-local tasks frozen at
+/// step boundary; killpg/SIGKILL on a frozen task is queued but
+/// never delivered (the task is parked off the runqueue), so
+/// [`drain_all_payload_handles`] hangs and the subsequent
+/// `CgroupGroup::Drop` rmdir hits EBUSY because workers are still
+/// resident. Pre-emptive unfreeze restores the run-state
+/// precondition every cleanup path expects. Failures are logged
+/// at warn level only — a missing freezer file or a cgroup that
+/// was already torn down is benign at teardown time, and
+/// propagating would mask the real workload result.
 fn collect_step(
     step_state: &mut StepState<'_>,
     checks: &crate::assert::Assert,
     topo: &crate::topology::TestTopology,
+    cgroups: &dyn crate::cgroup::CgroupOps,
 ) -> AssertResult {
+    // Unfreeze every step-local cgroup before draining handles or
+    // letting the CgroupGroup RAII guard rmdir them. A live
+    // `cgroup.freeze == 1` blocks SIGKILL delivery (frozen tasks
+    // are off the runqueue) and EBUSYs the rmdir.
+    for name in step_state.cgroups.names() {
+        if let Err(e) = cgroups.set_freeze(name, false) {
+            tracing::warn!(
+                cgroup = %name,
+                err = %format!("{e:#}"),
+                "collect_step: pre-teardown unfreeze failed; rmdir may EBUSY"
+            );
+        }
+    }
     // Kill any CgroupDef::workload / Op::RunPayload payload binaries
     // still live at step teardown so cgroupfs cleanup does not trip
     // EBUSY. Metrics are emitted to the SHM ring by PayloadHandle::kill
@@ -2407,11 +2499,40 @@ fn collect_step(
 /// scenario end after every Step has torn down. The
 /// `backdrop_state.cgroups` RAII guard drops persistent cgroups
 /// when `backdrop_state` itself drops.
+///
+/// Mirrors [`collect_step`]'s pre-teardown unfreeze pass over every
+/// tracked cgroup. A backdrop cgroup left frozen at scenario end
+/// blocks SIGKILL delivery to its tasks (frozen tasks are off the
+/// runqueue, see `kernel/cgroup/freezer.c::cgroup_freeze_task`),
+/// which then EBUSYs the rmdir issued by the
+/// `BackdropState::cgroups` RAII drop. The asymmetry between
+/// step-local and backdrop teardown — only the former unfreezing —
+/// would surface as backdrop cgroups leaking on every scenario
+/// whose Backdrop froze a cgroup and never unfroze it. Symmetric
+/// unfreeze pre-rmdir is the same bug class
+/// [`super::CgroupGroup::drop`] already prevents at the
+/// CgroupGroup level for the per-step path; this prologue brings
+/// the backdrop path back in line.
 fn collect_backdrop(
     backdrop_state: &mut BackdropState<'_>,
     checks: &crate::assert::Assert,
     topo: &crate::topology::TestTopology,
+    cgroups: &dyn crate::cgroup::CgroupOps,
 ) -> AssertResult {
+    // Unfreeze every backdrop cgroup before draining handles or
+    // letting the CgroupGroup RAII guard rmdir them. Same rationale
+    // as `collect_step`: a live `cgroup.freeze == 1` blocks SIGKILL
+    // delivery (frozen tasks are off the runqueue) and EBUSYs the
+    // rmdir.
+    for name in backdrop_state.cgroups.names() {
+        if let Err(e) = cgroups.set_freeze(name, false) {
+            tracing::warn!(
+                cgroup = %name,
+                err = %format!("{e:#}"),
+                "collect_backdrop: pre-teardown unfreeze failed; rmdir may EBUSY"
+            );
+        }
+    }
     drain_all_payload_handles(&mut backdrop_state.payload_handles);
     let handles = std::mem::take(&mut backdrop_state.handles);
     crate::scenario::collect_handles(
@@ -2485,7 +2606,6 @@ mod tests {
     use std::ops::RangeInclusive;
 
     use super::*;
-    use crate::vmm::shm_ring::parse_shm_params_from_str;
     use crate::workload::{AffinityIntent, WorkType};
     use strum::IntoEnumIterator;
 
@@ -3172,21 +3292,6 @@ mod tests {
         // No panic; result must be non-empty because index/of are valid.
         let result = spec.resolve(&ctx);
         assert!(!result.is_empty());
-    }
-
-    // -- parse_shm_params_from_str (from shm_ring) --
-
-    #[test]
-    fn ops_parse_shm_params_valid() {
-        let cmdline = "console=ttyS0 KTSTR_SHM_BASE=0xfc000000 KTSTR_SHM_SIZE=0x10000 quiet";
-        let (base, size) = parse_shm_params_from_str(cmdline).unwrap();
-        assert_eq!(base, 0xfc000000);
-        assert_eq!(size, 0x10000);
-    }
-
-    #[test]
-    fn ops_parse_shm_params_missing() {
-        assert!(parse_shm_params_from_str("console=ttyS0 quiet").is_none());
     }
 
     // -- CpusetSpec resolution helpers --

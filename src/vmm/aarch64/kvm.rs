@@ -65,20 +65,6 @@ pub(crate) const VIRTIO_NET_MMIO_BASE: u64 =
 /// SPI interrupt for virtio-net. SPI 37.
 pub(crate) const VIRTIO_NET_IRQ: u32 = 37;
 
-/// Snapshot doorbell MMIO GPA. The freeze coordinator registers an
-/// in-kernel ioeventfd at this address via `KVM_IOEVENTFD`; the guest
-/// fires a snapshot capture by `mmap`'ing `/dev/mem` at this GPA and
-/// performing a single 4-byte write. KVM dispatches the write
-/// in-kernel without a userspace exit and signals the eventfd, which
-/// the coordinator polls alongside its other wake sources. See
-/// [`super::super::shm_ring::doorbell_fire`] for the guest-side
-/// helper and `freeze_coord.rs` for the host side.
-///
-/// Placed after virtio-net so a future virtio-mmio device addition
-/// at the next page boundary cannot collide with the doorbell GPA.
-pub(crate) const DOORBELL_MMIO_GPA: u64 =
-    VIRTIO_NET_MMIO_BASE + crate::vmm::virtio_net::VIRTIO_MMIO_SIZE;
-
 /// Kernel Image load address. 2 MB aligned per arm64 boot protocol.
 /// Relative to DRAM_START — the kernel is loaded at DRAM_START + text_offset,
 /// but the PE loader base address must be DRAM_START (2 MB aligned).
@@ -620,11 +606,6 @@ mod tests {
         const { assert!(VIRTIO_BLK_MMIO_BASE + crate::vmm::virtio_blk::VIRTIO_MMIO_SIZE <= DRAM_START) };
         const { assert!(VIRTIO_NET_MMIO_BASE < DRAM_START) };
         const { assert!(VIRTIO_NET_MMIO_BASE + crate::vmm::virtio_net::VIRTIO_MMIO_SIZE <= DRAM_START) };
-        const { assert!(DOORBELL_MMIO_GPA < DRAM_START) };
-        // Snapshot doorbell occupies a single 4-byte slot; one page of
-        // headroom keeps it isolated from any neighbouring MMIO region
-        // and matches the per-page registration of the host ioeventfd.
-        const { assert!(DOORBELL_MMIO_GPA + 0x1000 <= DRAM_START) };
     }
 
     /// PMU_PPI must reside in the GIC PPI namespace (0..15). Values

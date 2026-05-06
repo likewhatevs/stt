@@ -8,7 +8,7 @@
 //!   [`RESULT_START`] / [`RESULT_END`] — and also on the bulk data
 //!   channel with `MSG_TYPE_TEST_RESULT` for the primary transport.
 //!   See [`print_assert_result`] (guest emit), [`parse_assert_result`]
-//!   (host parse from COM2 string), and [`parse_assert_result_shm`]
+//!   (host parse from COM2 string), and [`parse_assert_result_from_drain`]
 //!   (host parse from the merged bulk drain).
 //! - **Scheduler log** on COM2, bracketed by
 //!   [`SCHED_OUTPUT_START`](crate::verifier::SCHED_OUTPUT_START) /
@@ -56,18 +56,18 @@ pub(crate) fn print_assert_result(r: &AssertResult) {
     }
 }
 
-/// Extract AssertResult from SHM drain entries.
-pub(crate) fn parse_assert_result_shm(
-    shm: Option<&vmm::shm_ring::ShmDrainResult>,
+/// Extract AssertResult from a bulk-drain entries.
+pub(crate) fn parse_assert_result_from_drain(
+    drain: Option<&vmm::host_comms::BulkDrainResult>,
 ) -> Result<AssertResult> {
-    let shm = shm.ok_or_else(|| anyhow::anyhow!("no SHM data"))?;
-    let entry = shm
+    let drain = drain.ok_or_else(|| anyhow::anyhow!("no guest messages"))?;
+    let entry = drain
         .entries
         .iter()
         .rev()
-        .find(|e| e.msg_type == vmm::shm_ring::MSG_TYPE_TEST_RESULT && e.crc_ok)
-        .ok_or_else(|| anyhow::anyhow!("no test result in SHM"))?;
-    serde_json::from_slice(&entry.payload).context("parse AssertResult from SHM")
+        .find(|e| e.msg_type == vmm::wire::MSG_TYPE_TEST_RESULT && e.crc_ok)
+        .ok_or_else(|| anyhow::anyhow!("no test result in guest messages"))?;
+    serde_json::from_slice(&entry.payload).context("parse AssertResult from drain")
 }
 
 /// Parse AssertResult from guest COM2 output between delimiters.
@@ -117,16 +117,24 @@ pub(crate) fn extract_kernel_version(console: &str) -> Option<String> {
 
 /// Extract the panic message from guest COM2 output.
 ///
-/// Looks for a line containing "PANIC:" (written by the guest panic hook
-/// in `rust_init.rs`). Returns the trimmed text after the "PANIC:" prefix,
-/// or `None` if no panic line is present.
+/// Looks for a line whose trimmed form starts with `PANIC:` (the
+/// prefix the guest panic hook in `rust_init.rs` writes verbatim).
+/// Returns the text after the prefix with leading whitespace
+/// trimmed; returns `None` when no panic line is present.
+///
+/// The match deliberately requires the prefix to anchor at the
+/// start of a (trimmed) line. A `.contains("PANIC:")` would also
+/// match unrelated mid-line occurrences — a console log that
+/// happened to mention the literal text "PANIC:" inside an info
+/// message ("expected PANIC: from this test") would be
+/// misclassified as the panic line. Guest panic-hook output is
+/// always emitted at the start of a line in `rust_init.rs`, so
+/// the prefix anchor is always satisfied for genuine panics.
 pub(crate) fn extract_panic_message(output: &str) -> Option<&str> {
-    output.lines().find(|l| l.contains("PANIC:")).map(|l| {
-        l.trim()
-            .strip_prefix("PANIC:")
-            .map(|s| s.trim_start())
-            .unwrap_or(l.trim())
-    })
+    output
+        .lines()
+        .map(|l| l.trim())
+        .find_map(|l| l.strip_prefix("PANIC:").map(str::trim_start))
 }
 
 /// Written to COM2 by Rust init after filesystem mounts complete.
@@ -231,13 +239,37 @@ pub(crate) fn format_console_diagnostics(
         let limit = if has_crash { lines.len() } else { TAIL_LINES };
         let start = lines.len().saturating_sub(limit);
         let tail = &lines[start..];
-        let truncated = !console.ends_with('\n');
+        // Two independent truncation conditions:
+        //   - `window_dropped`: the tail window dropped earlier
+        //     lines (more lines existed than fit in TAIL_LINES).
+        //   - `last_line_incomplete`: the captured stream ends
+        //     without a newline, so the final line is partial.
+        // Conflating these — as a single `truncated` flag — would
+        // claim "truncated" on a complete short console that just
+        // happens to lack a trailing newline (e.g. a line buffer
+        // flushed without `\n`), or hide window truncation behind
+        // the same label as a partial last line. Track and report
+        // them separately so the operator knows whether earlier
+        // boot output went missing or only the final line was cut.
+        let window_dropped = start > 0;
+        let last_line_incomplete = !console.ends_with('\n');
+        let header_suffix = match (window_dropped, last_line_incomplete) {
+            (true, true) => ", window-truncated, last line incomplete",
+            (true, false) => ", window-truncated",
+            (false, true) => ", last line incomplete",
+            (false, false) => "",
+        };
+        let body_suffix = if last_line_incomplete {
+            " [partial]"
+        } else {
+            ""
+        };
         parts.push(format!(
             "console ({} lines{}):\n{}{}",
             tail.len(),
-            if truncated { ", truncated" } else { "" },
+            header_suffix,
             tail.join("\n"),
-            if truncated { " [truncated]" } else { "" },
+            body_suffix,
         ));
     }
     format!("\n\n--- diagnostics ---\n{}", parts.join("\n"))
@@ -515,18 +547,25 @@ mod tests {
         assert!(s.contains("console (3 lines)"));
         assert!(s.contains("Kernel panic"));
         assert!(s.contains("stage: payload started"));
-        assert!(!s.contains("truncated"));
+        assert!(!s.contains("window-truncated"));
+        assert!(!s.contains("last line incomplete"));
+        assert!(!s.contains("[partial]"));
     }
 
     #[test]
     fn format_console_diagnostics_truncates_long() {
+        // Window truncation: 50 lines reduces to TAIL_LINES (20)
+        // tail. The header announces `window-truncated`; the body
+        // does NOT carry the per-line `[partial]` marker because
+        // the input ends with `\n` (last line is complete).
         let lines: Vec<String> = (0..50).map(|i| format!("boot line {i}")).collect();
         let console = format!("{}\n", lines.join("\n"));
         let s = format_console_diagnostics(&console, 0, "test");
-        assert!(s.contains("console (20 lines)"));
+        assert!(s.contains("console (20 lines, window-truncated)"));
         assert!(s.contains("boot line 49"));
         assert!(!s.contains("boot line 29"));
-        assert!(!s.contains("truncated"));
+        assert!(!s.contains("last line incomplete"));
+        assert!(!s.contains("[partial]"));
     }
 
     #[test]
@@ -536,7 +575,9 @@ mod tests {
         assert!(s.contains("console (2 lines)"));
         assert!(s.contains("Linux version 6.14.0"));
         assert!(s.contains("booted ok"));
-        assert!(!s.contains("truncated"));
+        assert!(!s.contains("window-truncated"));
+        assert!(!s.contains("last line incomplete"));
+        assert!(!s.contains("[partial]"));
     }
 
     #[test]
@@ -544,16 +585,37 @@ mod tests {
         let console = "line1\nline2\nline3\n";
         let s = format_console_diagnostics(console, 0, "test");
         assert!(s.contains("console (3 lines)"));
-        assert!(!s.contains("truncated"));
-        assert!(!s.contains("[truncated]"));
+        assert!(!s.contains("window-truncated"));
+        assert!(!s.contains("last line incomplete"));
+        assert!(!s.contains("[partial]"));
     }
 
     #[test]
-    fn format_console_diagnostics_truncation_without_trailing_newline() {
+    fn format_console_diagnostics_last_line_incomplete_without_window_drop() {
+        // Three short lines, last one missing trailing newline.
+        // The window does NOT drop anything (3 < TAIL_LINES); only
+        // the last line is partial.
         let console = "line1\nline2\npartial li";
         let s = format_console_diagnostics(console, 0, "test");
-        assert!(s.contains(", truncated)"));
-        assert!(s.contains("partial li [truncated]"));
+        assert!(s.contains("console (3 lines, last line incomplete)"));
+        assert!(s.contains("partial li [partial]"));
+        assert!(!s.contains("window-truncated"));
+    }
+
+    #[test]
+    fn format_console_diagnostics_window_drop_and_last_line_incomplete() {
+        // Both conditions: 50 lines (window drops earlier ones)
+        // AND the input lacks a trailing newline (final line is
+        // partial). Header carries both labels in canonical order;
+        // body marks the partial last line.
+        let lines: Vec<String> = (0..50).map(|i| format!("boot line {i}")).collect();
+        let console = lines.join("\n");
+        let s = format_console_diagnostics(&console, 0, "test");
+        assert!(s.contains(
+            "console (20 lines, window-truncated, last line incomplete)"
+        ));
+        assert!(s.contains("boot line 49 [partial]"));
+        assert!(!s.contains("boot line 29"));
     }
 
     // -- classify_init_stage --
@@ -607,6 +669,37 @@ mod tests {
     #[test]
     fn extract_panic_message_empty() {
         assert!(extract_panic_message("").is_none());
+    }
+
+    /// Mid-line `PANIC:` occurrences must NOT match. The guest's
+    /// panic hook in `rust_init.rs` always emits the prefix at the
+    /// start of a line; a console log that incidentally contains
+    /// the literal `PANIC:` somewhere inside a longer info message
+    /// must not be misclassified as the panic. The previous
+    /// `.contains("PANIC:")` form would have surfaced this fixture
+    /// as a panic by stripping nothing and returning the trimmed
+    /// raw line.
+    #[test]
+    fn extract_panic_message_ignores_midline_occurrences() {
+        let output = "info: expected PANIC: somewhere in test\nmore noise";
+        assert!(
+            extract_panic_message(output).is_none(),
+            "mid-line `PANIC:` must not be matched as a panic prefix",
+        );
+    }
+
+    /// Whitespace-prefixed panic lines DO match — the guest panic
+    /// hook is anchored at column 0 in `rust_init.rs`, but COM2
+    /// transports can insert framing whitespace; the trim before
+    /// `strip_prefix` keeps matching robust against that.
+    #[test]
+    fn extract_panic_message_matches_whitespace_prefixed_line() {
+        let output = "noise\n   PANIC: indented panic\nmore";
+        assert_eq!(
+            extract_panic_message(output),
+            Some("indented panic"),
+            "leading whitespace before `PANIC:` must be trimmed before the prefix check",
+        );
     }
 
     // -- Verdict API integration coverage -------------------------------

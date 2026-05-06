@@ -48,6 +48,20 @@ pub struct Serial {
     /// (the run_vm path that consumes output via the COM2 stdout
     /// writer thread does not need the eventfd).
     data_evt: Option<std::sync::Arc<vmm_sys_util::eventfd::EventFd>>,
+    /// Cursor for [`Self::output_contains`]: `(needle, scanned_len)`
+    /// where `scanned_len` is the writer-buffer length that was
+    /// already searched for `needle` without a hit. The next
+    /// `output_contains(needle)` call resumes from
+    /// `scanned_len.saturating_sub(needle.len() - 1)` so a needle
+    /// straddling the prior cursor still matches. Reset on
+    /// [`Self::drain_output`] / [`Self::clear`] (writer shrinks) and
+    /// invalidated when the caller passes a different needle.
+    ///
+    /// Without this cache the freeze-coordinator's post-thaw COM2
+    /// marker poll re-scanned the whole writer buffer on every
+    /// iteration of the grace-window loop — O(N²) over the buffer
+    /// growth pattern produced by a guest spamming COM2.
+    contains_cursor: Option<(Vec<u8>, usize)>,
 }
 
 impl Default for Serial {
@@ -64,6 +78,7 @@ impl Serial {
             base,
             inner: vm_superio::Serial::new(EventFdTrigger(evt), Vec::new()),
             data_evt: None,
+            contains_cursor: None,
         }
     }
 
@@ -99,29 +114,120 @@ impl Serial {
 
     /// Handle a port I/O write from the guest. Returns true if the port
     /// is in this serial's range.
+    ///
+    /// 16550A registers are byte-wide. The Linux serial driver issues
+    /// `outb` (one byte per access), so KVM hands us `data.len() == 1`
+    /// in normal operation. Multi-byte writes (`outw`/`outl`) to a UART
+    /// register are anomalous: real hardware would step the access across
+    /// adjacent registers in an implementation-defined way, and we have
+    /// no way to recover correct semantics from a guest that violates
+    /// the kernel's own driver contract. Drop the access rather than
+    /// silently corrupting register state.
+    ///
+    /// Reference VMM behaviour for non-byte-width PIO:
+    /// - firecracker (`BusDevice::write` for `SerialWrapper`, `devices/legacy/serial.rs`):
+    ///   bumps `METRICS.missed_write_count` (silent metric, no log).
+    /// - cloud-hypervisor (`BusDevice::write` for `Serial`, `devices/src/legacy/serial.rs`):
+    ///   silent early-return, no metric, no log.
+    /// - libkrun (`BusDevice::write` for `Serial`, x86_64): silent early-return, no
+    ///   metric, no log.
+    /// - qemu (`hw/char/serial.c`): the `serial_io_ops` MemoryRegionOps
+    ///   declare `.impl.min_access_size = .impl.max_access_size = 1`,
+    ///   so qemu's memory dispatch decomposes a wide access into N
+    ///   one-byte calls before reaching the device. qemu's serial
+    ///   never observes a multi-byte access; the kernel decomposes
+    ///   rather than rejecting (a different design choice — qemu
+    ///   would happily service `outw` to a UART by stepping it across
+    ///   two adjacent registers).
+    ///
+    /// We diverge from all four references: a guest issuing a
+    /// non-byte access has violated the Linux driver contract, and we
+    /// emit a debug-level trace rather than a silent counter. Logging
+    /// is debug (not warn) because the port number is guest-driven —
+    /// a hostile guest issuing wide PIO in a tight loop would otherwise
+    /// flood the host log.
     #[cfg(any(target_arch = "x86_64", test))]
     pub fn handle_out(&mut self, port: u16, data: &[u8]) -> bool {
         let Some(offset) = self.offset(port) else {
             return false;
         };
-        if let Some(&byte) = data.first() {
-            let pre = self.inner.writer().len();
-            let _ = self.inner.write(offset, byte);
-            self.signal_if_writer_grew(pre);
+        if data.len() != 1 {
+            tracing::debug!(
+                base = self.base,
+                port,
+                offset,
+                len = data.len(),
+                "serial PIO write with non-byte width dropped",
+            );
+            return true;
         }
+        let pre = self.inner.writer().len();
+        let _ = self.inner.write(offset, data[0]);
+        self.signal_if_writer_grew(pre);
         true
     }
 
     /// Handle a port I/O read from the guest. Returns true if the port
     /// is in this serial's range.
+    ///
+    /// 16550A registers are byte-wide. The Linux serial driver issues
+    /// `inb` (one byte per access). Multi-byte reads (`inw`/`inl`) to a
+    /// UART register are anomalous: real hardware would step the access
+    /// across adjacent registers in an implementation-defined way, and
+    /// some UART register reads have side effects we cannot replay
+    /// coherently across a stepped access. In vm-superio's `Serial::read`
+    /// (vm-superio-0.8.1, src/serial.rs):
+    /// - DATA (offset 0): pops `in_buffer.pop_front()` — RX FIFO byte
+    ///   consumed.
+    /// - IIR (offset 2): calls `reset_iir()` — clears the pending
+    ///   interrupt identification.
+    /// - LSR (offset 5), MSR (offset 6): vm-superio returns the
+    ///   stored register value with no clear-on-read mutation. The
+    ///   16550A datasheet specifies LSR error-bits and MSR delta-bits
+    ///   are cleared on read, but vm-superio does not implement that
+    ///   side effect.
+    ///
+    /// Servicing only the first register would fire DATA/IIR side
+    /// effects on the wrong access and feed the guest one byte of real
+    /// state followed by `data[1..]` bytes the guest treats as
+    /// adjacent-register reads but that we never sourced. Drop the
+    /// access rather than risk that.
+    ///
+    /// Reference VMM behaviour for non-byte-width PIO:
+    /// - firecracker (`BusDevice::read` for `SerialWrapper`, `devices/legacy/serial.rs`):
+    ///   bumps `METRICS.missed_read_count` (silent metric, no log).
+    /// - cloud-hypervisor (`BusDevice::read` for `Serial`, `devices/src/legacy/serial.rs`):
+    ///   silent early-return, no metric, no log.
+    /// - libkrun (`BusDevice::read` for `Serial`, x86_64): silent early-return, no
+    ///   metric, no log.
+    /// - qemu (`hw/char/serial.c`): the `serial_io_ops` MemoryRegionOps
+    ///   declare `.impl.min_access_size = .impl.max_access_size = 1`,
+    ///   so qemu's memory dispatch decomposes a wide access into N
+    ///   one-byte calls before reaching the device — qemu services
+    ///   the access by stepping it across registers (a different
+    ///   design choice from the reject-and-drop pattern above).
+    ///
+    /// We diverge from all four references: emit a debug-level trace
+    /// rather than a silent counter. Logging is debug (not warn)
+    /// because the port number is guest-driven — a hostile guest
+    /// issuing wide PIO in a tight loop would otherwise flood the
+    /// host log.
     #[cfg(any(target_arch = "x86_64", test))]
     pub fn handle_in(&mut self, port: u16, data: &mut [u8]) -> bool {
         let Some(offset) = self.offset(port) else {
             return false;
         };
-        if let Some(first) = data.first_mut() {
-            *first = self.inner.read(offset);
+        if data.len() != 1 {
+            tracing::debug!(
+                base = self.base,
+                port,
+                offset,
+                len = data.len(),
+                "serial PIO read with non-byte width dropped",
+            );
+            return true;
         }
+        data[0] = self.inner.read(offset);
         true
     }
 
@@ -150,6 +256,11 @@ impl Serial {
 
     /// Return and clear accumulated output. O(1) via buffer swap.
     pub fn drain_output(&mut self) -> Vec<u8> {
+        // Drain shrinks the writer to zero — invalidate the
+        // output_contains cursor so the next search starts fresh
+        // rather than skipping bytes that the new buffer hasn't
+        // accumulated yet.
+        self.contains_cursor = None;
         std::mem::take(self.inner.writer_mut())
     }
 
@@ -159,25 +270,74 @@ impl Serial {
     }
 
     /// Return true when the captured output contains `needle` as a
-    /// contiguous byte sequence. Searches the underlying writer in
-    /// place via `windows`; allocates nothing. Used by the freeze
-    /// coordinator's post-thaw COM2 marker poll, where the output()
-    /// String copy would burn the buffer on every poll iteration
-    /// during the grace window.
-    pub fn output_contains(&self, needle: &[u8]) -> bool {
+    /// contiguous byte sequence. Resumes from the prior cursor so
+    /// repeat polls amortize to O(N) over the buffer growth instead
+    /// of O(N²) per call.
+    ///
+    /// Used by the freeze coordinator's post-thaw COM2 marker poll,
+    /// which calls this in a tight loop while the writer grows from
+    /// guest emissions during the grace window. The cursor caches
+    /// `(needle, scanned_len)` after a miss; the next call with the
+    /// same needle skips the prefix already scanned and only
+    /// inspects the newly-appended tail (plus a `needle.len() - 1`
+    /// byte overlap so a needle straddling the cursor still
+    /// matches).
+    ///
+    /// A different needle invalidates the cache (we must scan the
+    /// full buffer for the new pattern). [`Self::drain_output`] /
+    /// [`Self::clear`] also reset the cursor — both shrink the
+    /// writer, after which the absolute byte offsets in the cursor
+    /// no longer correspond to any positions in the new buffer.
+    pub fn output_contains(&mut self, needle: &[u8]) -> bool {
         if needle.is_empty() {
             return true;
         }
         let writer: &[u8] = self.inner.writer();
         if writer.len() < needle.len() {
+            // Below-needle-length means no match is possible; do not
+            // touch the cursor — the writer will grow on subsequent
+            // guest writes and the next call will scan from zero
+            // (cursor stays None).
             return false;
         }
-        writer.windows(needle.len()).any(|w| w == needle)
+        // Resume position: `cursor` is the writer length already
+        // scanned for THIS needle. Start `(needle.len() - 1)` bytes
+        // earlier so a needle straddling the cursor (last byte after
+        // it, first byte before it) still matches. Saturate at zero
+        // for the empty/first-call case.
+        let resume_from = match &self.contains_cursor {
+            Some((cached, scanned_len)) if cached.as_slice() == needle => {
+                scanned_len.saturating_sub(needle.len() - 1)
+            }
+            _ => 0,
+        };
+        // Defensive bound: a stale cursor (caller wrote into the
+        // writer through a path that didn't go through the public
+        // API, then the writer somehow shrank) could push
+        // resume_from past writer.len(). Clamp so the slice index
+        // never panics.
+        let resume_from = resume_from.min(writer.len().saturating_sub(needle.len() - 1));
+        let tail = &writer[resume_from..];
+        let found = tail.windows(needle.len()).any(|w| w == needle);
+        if found {
+            // Cursor is no longer useful — a hit short-circuits any
+            // future poll. Clear it so a subsequent call with a
+            // different needle doesn't carry stale state.
+            self.contains_cursor = None;
+        } else {
+            // Cache the writer length we just scanned so the next
+            // call resumes from there.
+            self.contains_cursor = Some((needle.to_vec(), writer.len()));
+        }
+        found
     }
 
     /// Clear captured output.
     #[cfg(test)]
     pub fn clear(&mut self) {
+        // Mirror drain_output: clearing shrinks the writer, so the
+        // output_contains cursor is no longer valid.
+        self.contains_cursor = None;
         self.inner.writer_mut().clear();
     }
 
@@ -243,11 +403,50 @@ mod tests {
     }
 
     #[test]
-    fn write_thr_multi_byte() {
+    fn write_thr_multi_byte_drops() {
         let mut s = Serial::default();
-        // handle_out only writes first byte
+        // Multi-byte PIO writes to a UART register are anomalous —
+        // the Linux serial driver only issues byte-wide accesses.
+        // handle_out drops the access (after logging at debug level)
+        // so that bytes 1..N never get silently mapped to the wrong
+        // register offset. Diverges from firecracker (bumps a silent
+        // metric) and cloud-hypervisor / libkrun (silent return) by
+        // emitting a trace instead.
         s.handle_out(COM1_BASE, b"Hello");
-        assert_eq!(s.output(), "H");
+        assert_eq!(s.output(), "");
+    }
+
+    #[test]
+    fn read_multi_byte_drops() {
+        let mut s = Serial::default();
+        // Multi-byte PIO reads (inw/inl) to a UART register are
+        // anomalous — DATA pops the RX FIFO and IIR clears the pending
+        // interrupt, side effects that cannot be coherently stepped
+        // across adjacent registers. handle_in drops the access
+        // (after logging at debug level) and returns true.
+        //
+        // Use DATA so the test exercises a register with an observable
+        // side effect: queue a byte, attempt a 2-byte read, then
+        // perform a single-byte DATA read. If the multi-byte read
+        // were serviced, the queued byte would be popped from the RX
+        // FIFO and the subsequent 1-byte read would return 0 instead
+        // of 0x42. Reading from LSR (the prior version of this test)
+        // would not distinguish rejection from servicing because
+        // vm-superio's LSR read has no side effects.
+        s.queue_input(&[0x42]);
+        let mut buf = [0xCDu8; 2];
+        assert!(s.handle_in(COM1_BASE + DATA, &mut buf));
+        assert_eq!(
+            buf,
+            [0xCD, 0xCD],
+            "dropped read must not write any byte of the buffer",
+        );
+        let mut single = [0u8; 1];
+        assert!(s.handle_in(COM1_BASE + DATA, &mut single));
+        assert_eq!(
+            single[0], 0x42,
+            "FIFO byte must remain after a dropped multi-byte read",
+        );
     }
 
     #[test]
@@ -585,7 +784,7 @@ mod tests {
 
     #[test]
     fn output_contains_empty_buffer() {
-        let s = Serial::default();
+        let mut s = Serial::default();
         assert!(!s.output_contains(b"x"));
         // Empty needle is vacuously contained.
         assert!(s.output_contains(b""));
@@ -608,5 +807,110 @@ mod tests {
         let mut s = Serial::default();
         s.handle_out(COM1_BASE, b"a");
         assert!(!s.output_contains(b"abcdef"));
+    }
+
+    #[test]
+    fn output_contains_resumes_after_growth() {
+        // Cursor pattern: first call misses, then bytes arrive that
+        // contain the needle, then the second call must find it.
+        // This is the freeze-coord polling shape — repeat scans while
+        // the buffer grows from guest emissions.
+        let mut s = Serial::default();
+        for c in b"prelude " {
+            s.handle_out(COM1_BASE, &[*c]);
+        }
+        assert!(!s.output_contains(b"MARKER"));
+        for c in b"MARKER appears" {
+            s.handle_out(COM1_BASE, &[*c]);
+        }
+        assert!(s.output_contains(b"MARKER"));
+    }
+
+    #[test]
+    fn output_contains_finds_needle_straddling_cursor() {
+        // Adversarial case: the cursor advanced just into the
+        // beginning of what becomes the needle. The next call must
+        // back up `needle.len() - 1` bytes so the straddle is
+        // detected even though the prior scan scanned past the
+        // first byte.
+        let mut s = Serial::default();
+        for c in b"abcdMA" {
+            s.handle_out(COM1_BASE, &[*c]);
+        }
+        // First poll: writer is "abcdMA"; needle "MARKER" is not
+        // present. Cursor caches scanned_len=6.
+        assert!(!s.output_contains(b"MARKER"));
+        for c in b"RKER!" {
+            s.handle_out(COM1_BASE, &[*c]);
+        }
+        // Writer is now "abcdMARKER!". Resume from
+        // 6 - (6 - 1) = 1, scan "bcdMARKER!" — must hit.
+        assert!(s.output_contains(b"MARKER"));
+    }
+
+    #[test]
+    fn output_contains_different_needle_invalidates_cursor() {
+        // A different needle must scan the full buffer, not skip a
+        // prefix that was scanned for an earlier (different) needle.
+        let mut s = Serial::default();
+        for c in b"foobarbaz" {
+            s.handle_out(COM1_BASE, &[*c]);
+        }
+        // Prime the cursor with one needle (miss).
+        assert!(!s.output_contains(b"missing"));
+        // A different needle that lives in the prefix must be found.
+        assert!(s.output_contains(b"foo"));
+    }
+
+    #[test]
+    fn output_contains_drain_resets_cursor() {
+        // drain_output shrinks the writer to zero. A subsequent
+        // output_contains call must scan the new buffer from byte 0,
+        // not from a stale cursor that points past the (empty)
+        // buffer.
+        let mut s = Serial::default();
+        for c in b"abcdef" {
+            s.handle_out(COM1_BASE, &[*c]);
+        }
+        assert!(!s.output_contains(b"XYZ"));
+        let _ = s.drain_output();
+        // Re-fill with bytes that contain XYZ. The cached cursor
+        // would have scanned_len=6; without invalidation, the new
+        // search would skip into out-of-range territory.
+        for c in b"...XYZ..." {
+            s.handle_out(COM1_BASE, &[*c]);
+        }
+        assert!(s.output_contains(b"XYZ"));
+    }
+
+    #[test]
+    fn output_contains_clear_resets_cursor() {
+        // clear() shrinks the writer the same way drain_output does;
+        // sibling test pinning the same invariant for the
+        // test-only entry point.
+        let mut s = Serial::default();
+        for c in b"abcdef" {
+            s.handle_out(COM1_BASE, &[*c]);
+        }
+        assert!(!s.output_contains(b"XYZ"));
+        s.clear();
+        for c in b"...XYZ..." {
+            s.handle_out(COM1_BASE, &[*c]);
+        }
+        assert!(s.output_contains(b"XYZ"));
+    }
+
+    #[test]
+    fn output_contains_repeat_hit_stable() {
+        // A needle that is already present must still be reported as
+        // present on a second call. The cursor-clearing logic on hit
+        // means the second call rescans from zero — verify that
+        // produces the same answer.
+        let mut s = Serial::default();
+        for c in b"prefix MARKER suffix" {
+            s.handle_out(COM1_BASE, &[*c]);
+        }
+        assert!(s.output_contains(b"MARKER"));
+        assert!(s.output_contains(b"MARKER"));
     }
 }

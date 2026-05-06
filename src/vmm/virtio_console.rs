@@ -5,17 +5,29 @@
 //!   q1 out0 — guest→host, port 0 (console / hvc0 stdout)
 //!   q2 c_ivq — host→guest control (PORT_ADD, PORT_OPEN, etc.)
 //!   q3 c_ovq — guest→host control (DEVICE_READY, PORT_READY, PORT_OPEN ack)
-//!   q4 in1  — host→guest, port 1 (bulk; unused — TLV is guest→host only)
+//!   q4 in1  — host→guest, port 1 (snapshot reply payloads from the
+//!            freeze coordinator; see `queue_input_port1`)
 //!   q5 out1 — guest→host, port 1 (bulk TLV stream)
 //!
 //! Port 0 carries the interactive console (stdout/stdin via `/dev/hvc0`).
-//! Port 1 carries the TLV stream written by `shm_ring::write_msg` —
-//! exit code, test result, per-payload metrics, raw payload outputs,
-//! profraw, scheduler exit notifications. Stimulus events, scenario
-//! start/end markers, and crash payloads still travel over the SHM
-//! ring. Backpressure: the host's `add_used` rate on port 1 TX gates
-//! the guest's writes; when the host lags, the guest blocks in
-//! `wait_port_writable` instead of dropping.
+//! Port 1 carries the TLV stream written by
+//! `guest_comms::send_*` — exit code, test result, per-payload
+//! metrics, raw payload outputs, profraw, scheduler exit
+//! notifications, stimulus events, scenario start/end markers.
+//! Crash payloads travel over COM2. Backpressure is asymmetric:
+//!   * Guest→host TX (port 1): the host's `add_used` rate on port 1
+//!     TX gates the guest's writes; when the host lags, the guest
+//!     blocks in `wait_port_writable` instead of dropping. Per-call
+//!     drain is also capped (`TX_PER_CALL_MAX`) so a hostile guest
+//!     cannot grow the host accumulator without bound on a single
+//!     notify.
+//!   * Host→guest RX (port 0 + port 1): unbounded by design. Pending
+//!     bytes accumulate in `port0_pending_rx` / `port1_pending_rx`
+//!     until a guest descriptor chain is available. The host alone
+//!     produces these bytes (kernel scheduler signals, terminal
+//!     paste, snapshot replies), so a hostile guest cannot grow them.
+//!     Losing a host→guest byte would silently strand a wake signal
+//!     or truncate a reply, which is worse than a host-side OOM.
 //!
 //! Features: `VIRTIO_F_VERSION_1 | VIRTIO_CONSOLE_F_MULTIPORT`.
 //! Config space: `cols=0, rows=0, max_nr_ports=2, emerg_wr=0` (cols/rows
@@ -63,12 +75,12 @@ const VENDOR_ID: u32 = 0;
 /// MMIO region size: 4 KB (one page).
 pub const VIRTIO_MMIO_SIZE: u64 = 0x1000;
 
-/// RX wake byte: host pushed a SHM dump request. The guest's
-/// `shm_poll_loop` blocks on `/dev/hvc0`; on any byte it re-checks
-/// the SHM `DUMP_REQ_OFFSET` byte. The byte VALUE is informational
-/// only — any non-zero byte would trigger the same re-check.
-/// Distinct values let stack traces and tcpdump-style captures
-/// distinguish the trigger source.
+/// RX wake byte: host requested a SysRq-D dump. The guest's
+/// `hvc0_poll_loop` blocks on `/dev/hvc0`, scans every drained byte
+/// for this value, and triggers SysRq-D directly via
+/// `/proc/sysrq-trigger` when it is observed. Distinct from
+/// `SIGNAL_VC_SHUTDOWN` and `SIGNAL_BPF_WRITE_DONE` so stack traces
+/// and tcpdump-style captures can distinguish the trigger source.
 pub const SIGNAL_VC_DUMP: u8 = 0xD1;
 
 /// RX wake byte: host pushed a graceful-shutdown request through
@@ -77,7 +89,7 @@ pub const SIGNAL_VC_SHUTDOWN: u8 = 0xD3;
 
 /// RX wake byte: host's `bpf-map-write` thread finished applying
 /// every queued `bpf_map_write` to the BPF maps inside the guest's
-/// kernel. The guest's `shm_poll_loop` recognises the byte and
+/// kernel. The guest's `hvc0_poll_loop` recognises the byte and
 /// sets the `bpf_map_write_done` latch so a scenario blocked on
 /// [`crate::scenario::Ctx::wait_for_map_write`] resumes. Replaces
 /// the legacy SHM signal-slot rendezvous (host writes slot 0, guest
@@ -123,6 +135,19 @@ const TX_DESC_MAX: usize = 32 * 1024;
 /// the avail ring for the next call.
 const TX_PER_CALL_MAX: usize = 256 * 1024;
 
+/// Maximum control-queue chains drained per `process_control_tx`
+/// call. The c_ovq's payload is a fixed 8-byte
+/// `VirtioConsoleControl` frame — a hostile guest publishing
+/// thousands of small chains would otherwise let one notify hold the
+/// vCPU thread in `process_control_tx` for an unbounded duration and
+/// grow the `events` Vec without bound. Mirrors the TX byte-cap
+/// pattern: chains beyond the cap stay in the avail ring for the
+/// next QUEUE_NOTIFY. 32 is enough headroom for the legitimate
+/// handshake (DEVICE_READY + per-port PORT_READY + per-port
+/// PORT_OPEN = ~5 events) with margin while still bounding the
+/// adversarial case.
+const CONTROL_CHAINS_PER_CALL_MAX: usize = 32;
+
 /// Status bits required before each phase.
 const S_ACK: u32 = VIRTIO_CONFIG_S_ACKNOWLEDGE;
 const S_DRV: u32 = S_ACK | VIRTIO_CONFIG_S_DRIVER;
@@ -165,6 +190,21 @@ const _: () = assert!(VC_CONTROL_SIZE == 8);
 // existing call sites in this module.
 pub use super::wire::PORT1_NAME;
 
+/// Port-0 device-name advertised to the guest. The kernel's
+/// `handle_control_message` PORT_NAME case
+/// (drivers/char/virtio_console.c) creates the sysfs
+/// `/sys/class/virtio-ports/vport0p0/name` attribute when the host
+/// sends PORT_NAME; without that emission the attribute does not
+/// exist and tooling that scans `/sys/class/virtio-ports/*/name` to
+/// disambiguate port 0 (console) from port 1 (bulk) cannot
+/// distinguish them. QEMU's `add_port` (hw/char/virtio-console.c)
+/// sets a name on the chardev (`chardev-id` derived) and the
+/// virtio-serial PORT_NAME emission in
+/// `virtio_serial_post_load_timer_cb` / `send_control_event`
+/// emits it for every port that has one — including the console
+/// port. Mirror that here.
+pub const PORT0_NAME: &str = "ktstr-console";
+
 /// Outbound (host→guest) control payload kinds. The host serialises
 /// these into 8-byte wire frames (plus optional name bytes) for the
 /// c_ivq.
@@ -172,8 +212,17 @@ pub use super::wire::PORT1_NAME;
 enum ControlOut {
     /// Fixed 8-byte command.
     Cmd(VirtioConsoleControl),
-    /// 8-byte PORT_NAME header followed by name bytes (no NUL — the
-    /// kernel pulls the trailing bytes as the name itself).
+    /// 8-byte PORT_NAME header followed by name bytes and a trailing
+    /// NUL terminator. QEMU's PORT_NAME emitter
+    /// (hw/char/virtio-serial-bus.c, `buffer_len = sizeof(cpkt) +
+    /// strlen(port->name) + 1; ... buffer[buffer_len - 1] = 0;`)
+    /// includes the NUL; the kernel parser
+    /// (drivers/char/virtio_console.c `handle_control_message`
+    /// PORT_NAME case) computes `name_size = buf->len - buf->offset
+    /// - sizeof(*cpkt) + 1` and `strscpy`s into a kmalloc'd buffer,
+    /// which works either way but expects the QEMU layout. Sending
+    /// the NUL keeps the wire format byte-identical to QEMU so any
+    /// downstream tooling that snoops the frame sees the same shape.
     Name { id: u32, name: &'static str },
 }
 
@@ -181,7 +230,8 @@ impl ControlOut {
     fn len(&self) -> usize {
         match self {
             ControlOut::Cmd(_) => VC_CONTROL_SIZE,
-            ControlOut::Name { name, .. } => VC_CONTROL_SIZE + name.len(),
+            // +1 for the trailing NUL terminator (see Name doc).
+            ControlOut::Name { name, .. } => VC_CONTROL_SIZE + name.len() + 1,
         }
     }
 
@@ -196,6 +246,8 @@ impl ControlOut {
                 };
                 dst.extend_from_slice(hdr.as_bytes());
                 dst.extend_from_slice(name.as_bytes());
+                // Trailing NUL — matches QEMU's wire layout.
+                dst.push(0);
             }
         }
     }
@@ -229,9 +281,23 @@ pub struct VirtioConsole {
     port0_tx_buf: Vec<u8>,
     /// Accumulated port-1 TX output (guest TLV stream → host bulk
     /// drain). The guest writes TLV-framed messages here; the host
-    /// parses them via `bulk_drain` into the same `ShmDrainResult`
+    /// parses them via `bulk_drain` into the same `BulkDrainResult`
     /// shape that the SHM ring used.
-    port1_tx_buf: Vec<u8>,
+    ///
+    /// `VecDeque` (not `Vec`) so [`Self::push_back_bulk`] can prepend
+    /// the freeze coordinator's `bulk_assembler` residual via
+    /// `push_front` in O(bytes) instead of `Vec::splice(0..0, _)`'s
+    /// O(buf_len + bytes) memmove. Drained to a contiguous `Vec`
+    /// in [`Self::drain_bulk`] via `Vec::from(VecDeque)` (no
+    /// reallocation; at worst an O(N) rotate when the ring is split).
+    port1_tx_buf: VecDeque<u8>,
+    /// Scratch staging for port-1 TX descriptor reads. `read_slice`
+    /// writes into a contiguous `&mut [u8]`; `port1_tx_buf` is a
+    /// `VecDeque` so we read into this scratch first, then `extend`
+    /// the deque from it. Shared mutex with the rest of the device
+    /// (no concurrent TX/RX), so a single per-device scratch is
+    /// safe and avoids per-descriptor heap churn.
+    tx_scratch: Vec<u8>,
     /// Pending port-0 RX (host stdin / wake bytes → guest /dev/hvc0).
     /// Unbounded: test framework must never lose host→guest data on
     /// the console. A host-side OOM is preferable to a silent dropped
@@ -315,7 +381,8 @@ impl VirtioConsole {
             tx_evt,
             mem: None,
             port0_tx_buf: Vec::new(),
-            port1_tx_buf: Vec::new(),
+            port1_tx_buf: VecDeque::new(),
+            tx_scratch: Vec::new(),
             port0_pending_rx: VecDeque::new(),
             port1_pending_rx: VecDeque::new(),
             rx_scratch: Vec::new(),
@@ -367,6 +434,17 @@ impl VirtioConsole {
         }
     }
 
+    /// True iff the driver negotiated `VIRTIO_CONSOLE_F_MULTIPORT`.
+    /// The multiport-only queues (c_ivq, c_ovq, port-1 RX, port-1
+    /// TX) are valid only after this feature is acked. Without
+    /// F_MULTIPORT the kernel's `init_vqs` allocates only the first
+    /// two queues (drivers/char/virtio_console.c — the legacy
+    /// single-console path), so any QUEUE_NOTIFY for queues 2-5 in
+    /// that case is a guest protocol violation.
+    fn multiport_negotiated(&self) -> bool {
+        self.driver_features & (1u64 << (VIRTIO_CONSOLE_F_MULTIPORT as u64)) != 0
+    }
+
     /// True when device_status has progressed past FEATURES_OK but not
     /// yet reached DRIVER_OK — the window where queue config is valid.
     fn queue_config_allowed(&self) -> bool {
@@ -403,6 +481,17 @@ impl VirtioConsole {
             );
             return false;
         }
+        // F_MULTIPORT runtime gate: port 1 TX is multiport-only.
+        // Port 0 TX is valid in both single-console and multiport
+        // configurations, so the gate only applies to PORT1_TXQ.
+        if queue_idx == PORT1_TXQ && !self.multiport_negotiated() {
+            tracing::warn!(
+                port = port_label,
+                "virtio-console process_tx: F_MULTIPORT not \
+                 negotiated; ignoring notify on multiport-only port-1 TX"
+            );
+            return false;
+        }
         let mem = match self.mem.as_ref() {
             Some(m) => m,
             None => return false,
@@ -414,6 +503,16 @@ impl VirtioConsole {
         // chains cannot grow the host buffer without bound on a
         // single notify.
         let mut cumulative_bytes: usize = 0;
+        // Disjoint-field borrows: the queue (`self.queues[queue_idx]`)
+        // and the per-port accumulators (`self.port0_tx_buf`,
+        // `self.port1_tx_buf`, `self.tx_scratch`) are reborrowed
+        // independently inside the loop. The match dispatches each
+        // descriptor's bytes into the matching accumulator — PORT0
+        // is `Vec<u8>` (direct `read_slice` into the appended tail);
+        // PORT1 is `VecDeque<u8>` so we stage in `tx_scratch` and
+        // `extend` the deque. The deque lets `push_back_bulk`
+        // prepend the freeze coordinator's residual in O(bytes)
+        // without an O(buf_len + bytes) `Vec::splice(0..0, _)`.
         let q = &mut self.queues[queue_idx];
         while let Some(chain) = q.pop_descriptor_chain(mem) {
             let head = chain.head_index();
@@ -421,30 +520,66 @@ impl VirtioConsole {
                 if !desc.is_write_only() {
                     let guest_addr = desc.addr();
                     let dlen = (desc.len() as usize).min(TX_DESC_MAX);
-                    // Append into the matching per-port accumulator.
-                    let dst = match queue_idx {
-                        PORT0_TXQ => &mut self.port0_tx_buf,
-                        PORT1_TXQ => &mut self.port1_tx_buf,
+                    let read_ok = match queue_idx {
+                        PORT0_TXQ => {
+                            let dst = &mut self.port0_tx_buf;
+                            let start = dst.len();
+                            dst.resize(start + dlen, 0);
+                            match mem.read_slice(&mut dst[start..], guest_addr) {
+                                Ok(()) => true,
+                                Err(e) => {
+                                    // Drop the descriptor's bytes from
+                                    // the accumulator and log so a
+                                    // structurally broken TX descriptor
+                                    // address surfaces in tracing
+                                    // rather than silently disappearing.
+                                    dst.truncate(start);
+                                    tracing::warn!(
+                                        port = port_label,
+                                        head,
+                                        dlen,
+                                        %e,
+                                        "virtio-console process_tx: read_slice failed \
+                                         (descriptor addr likely unmapped); dropping \
+                                         segment from this chain"
+                                    );
+                                    false
+                                }
+                            }
+                        }
+                        PORT1_TXQ => {
+                            // VecDeque has no contiguous-slice write
+                            // path; read_slice requires `&mut [u8]`.
+                            // Stage in `tx_scratch` then push to the
+                            // deque. `tx_scratch` is reused across
+                            // descriptors so the only per-descriptor
+                            // allocation is when the prior scratch is
+                            // smaller than `dlen`.
+                            self.tx_scratch.clear();
+                            self.tx_scratch.resize(dlen, 0);
+                            match mem.read_slice(&mut self.tx_scratch, guest_addr) {
+                                Ok(()) => {
+                                    self.port1_tx_buf
+                                        .extend(self.tx_scratch.iter().copied());
+                                    true
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        port = port_label,
+                                        head,
+                                        dlen,
+                                        %e,
+                                        "virtio-console process_tx: read_slice failed \
+                                         (descriptor addr likely unmapped); dropping \
+                                         segment from this chain"
+                                    );
+                                    false
+                                }
+                            }
+                        }
                         _ => unreachable!("process_tx_into called on non-tx queue {queue_idx}"),
                     };
-                    let start = dst.len();
-                    dst.resize(start + dlen, 0);
-                    if let Err(e) = mem.read_slice(&mut dst[start..], guest_addr) {
-                        // Drop the descriptor's bytes from the
-                        // accumulator and log so a structurally
-                        // broken TX descriptor address surfaces in
-                        // tracing rather than silently disappearing.
-                        dst.truncate(start);
-                        tracing::warn!(
-                            port = port_label,
-                            head,
-                            dlen,
-                            %e,
-                            "virtio-console process_tx: read_slice failed \
-                             (descriptor addr likely unmapped); dropping \
-                             segment from this chain"
-                        );
-                    } else {
+                    if read_ok {
                         had_data = true;
                         cumulative_bytes = cumulative_bytes.saturating_add(dlen);
                     }
@@ -508,15 +643,31 @@ impl VirtioConsole {
 
     /// Return and clear accumulated port-0 TX output (guest console →
     /// host stdout).
+    ///
+    /// Capacity-preserving swap: the replacement buffer keeps the
+    /// drained buffer's capacity (capped at 256 KiB so a single
+    /// hostile-guest burst that grew the accumulator beyond the
+    /// per-call cap does not retain that capacity for the lifetime
+    /// of the device). Steady-state drains then avoid the
+    /// alloc/free churn that `mem::take` (which leaves a 0-capacity
+    /// `Vec`) would force on every cycle.
     pub fn drain_output(&mut self) -> Vec<u8> {
-        std::mem::take(&mut self.port0_tx_buf)
+        let cap = self.port0_tx_buf.capacity().min(256 * 1024);
+        std::mem::replace(&mut self.port0_tx_buf, Vec::with_capacity(cap))
     }
 
     /// Return and clear accumulated port-1 TX output (guest bulk TLV
-    /// stream). Host-side TLV parsing is in `crate::vmm::shm_ring`'s
-    /// `parse_tlv_stream`.
+    /// stream). Host-side TLV parsing is in
+    /// [`crate::vmm::host_comms::parse_tlv_stream`].
+    ///
+    /// Capacity-preserving swap (see [`Self::drain_output`] for
+    /// rationale). `Vec::from(VecDeque)` reuses the deque's
+    /// allocation when the ring is contiguous (O(1)) and rotates
+    /// in place when it isn't (O(N) but no realloc).
     pub fn drain_bulk(&mut self) -> Vec<u8> {
-        std::mem::take(&mut self.port1_tx_buf)
+        let cap = self.port1_tx_buf.capacity().min(256 * 1024);
+        let old = std::mem::replace(&mut self.port1_tx_buf, VecDeque::with_capacity(cap));
+        Vec::from(old)
     }
 
     /// Push raw bytes back onto the head of the port-1 TX buffer.
@@ -539,14 +690,37 @@ impl VirtioConsole {
         if bytes.is_empty() {
             return;
         }
-        // splice prepends without allocating a new Vec.
-        self.port1_tx_buf.splice(0..0, bytes.iter().copied());
+        // `port1_tx_buf` is a VecDeque — push_front is O(1) per byte
+        // (amortised); iterating in reverse and pushing each lands
+        // `bytes[0]` at the very front of the deque, preserving the
+        // chronological order described by the doc comment above.
+        // This replaces a `Vec::splice(0..0, _)` whose cost was
+        // O(buf_len + bytes) — under bursty TLV traffic that already
+        // grew `port1_tx_buf` to hundreds of KiB the splice would
+        // memmove every byte in the buffer to make room, which a
+        // residual push at the very end of the run was not worth.
+        // `reserve` lifts the capacity once so the push_front loop
+        // does not trigger N small grows.
+        self.port1_tx_buf.reserve(bytes.len());
+        for &b in bytes.iter().rev() {
+            self.port1_tx_buf.push_front(b);
+        }
     }
 
     /// Test helper — return all accumulated port-0 TX output as a string.
     #[cfg(test)]
     pub fn output(&self) -> String {
         String::from_utf8_lossy(&self.port0_tx_buf).to_string()
+    }
+
+    /// Test helper — return a copy of the pending port-0 RX bytes
+    /// (host → guest direction) that have not yet been delivered to
+    /// the guest. Tests that exercise the host-side wake-byte
+    /// pushers without a fully-wired guest queue use this to inspect
+    /// what would have been delivered.
+    #[cfg(test)]
+    pub fn pending_rx_bytes(&self) -> Vec<u8> {
+        self.port0_pending_rx.iter().copied().collect()
     }
 
     // ------------------------------------------------------------------
@@ -646,6 +820,21 @@ impl VirtioConsole {
                 }
             }
             if chain_torn {
+                // Publish the head with len=0 so the guest reclaims
+                // the descriptor instead of leaking it (mirrors the
+                // c_ivq torn-write path). Bytes stay in
+                // `port0_pending_rx` for retry on the next chain.
+                // Without this add_used the chain head is consumed
+                // from avail but never returned to the used ring,
+                // and the descriptor index leaks until reset.
+                if let Err(e) = q.add_used(mem, head, 0) {
+                    tracing::warn!(
+                        head,
+                        %e,
+                        "virtio-console drain_port0_pending_rx: add_used(0) \
+                         after torn write failed; chain head leaked"
+                    );
+                }
                 break;
             }
             if let Err(e) = q.add_used(mem, head, written) {
@@ -683,7 +872,6 @@ impl VirtioConsole {
     /// delivered immediately (no chain available, port not opened
     /// yet, DRIVER_OK not set) accumulate in `port1_pending_rx` and
     /// drain on the next q4 (`PORT1_RXQ`) notify.
-    #[allow(dead_code)]
     pub(crate) fn queue_input_port1(&mut self, data: &[u8]) {
         tracing::debug!(bytes = data.len(), "virtio-console queue_input_port1");
         self.port1_pending_rx.extend(data);
@@ -705,6 +893,19 @@ impl VirtioConsole {
                 pending = self.port1_pending_rx.len(),
                 status = self.device_status,
                 "virtio-console drain_port1_pending_rx: DRIVER_OK not set; deferring"
+            );
+            return;
+        }
+        // F_MULTIPORT runtime gate: port 1 is multiport-only. The
+        // legacy single-console path never sees port 1 traffic, so
+        // any QUEUE_NOTIFY for q4 without F_MULTIPORT is a guest
+        // protocol violation. Bytes stay in `port1_pending_rx` for
+        // a future probe.
+        if !self.multiport_negotiated() {
+            tracing::warn!(
+                pending = self.port1_pending_rx.len(),
+                "virtio-console drain_port1_pending_rx: F_MULTIPORT \
+                 not negotiated; deferring host→guest port-1 bytes"
             );
             return;
         }
@@ -781,6 +982,18 @@ impl VirtioConsole {
                 }
             }
             if chain_torn {
+                // Publish the head with len=0 so the guest reclaims
+                // the descriptor instead of leaking it (mirrors the
+                // port-0 RX and c_ivq torn-write paths). Bytes stay
+                // in `port1_pending_rx` for retry on the next chain.
+                if let Err(e) = q.add_used(mem, head, 0) {
+                    tracing::warn!(
+                        head,
+                        %e,
+                        "virtio-console drain_port1_pending_rx: add_used(0) \
+                         after torn write failed; chain head leaked"
+                    );
+                }
                 break;
             }
             if let Err(e) = q.add_used(mem, head, written) {
@@ -819,6 +1032,17 @@ impl VirtioConsole {
             tracing::debug!("virtio-console c_ovq: DRIVER_OK not set; ignoring notify");
             return;
         }
+        // F_MULTIPORT runtime gate: c_ovq exists only when multiport
+        // is negotiated. A guest that didn't ack F_MULTIPORT but
+        // still fires QUEUE_NOTIFY for queue 3 is misbehaving;
+        // refuse to walk the queue.
+        if !self.multiport_negotiated() {
+            tracing::warn!(
+                "virtio-console c_ovq: F_MULTIPORT not negotiated; \
+                 ignoring notify on multiport-only queue"
+            );
+            return;
+        }
         // Move work into local Vec so we can release the queue borrow
         // before calling back into self for control_out enqueue.
         let mut events: Vec<VirtioConsoleControl> = Vec::new();
@@ -828,6 +1052,7 @@ impl VirtioConsole {
                 None => return,
             };
             let q = &mut self.queues[C_OVQ];
+            let mut chains_drained = 0usize;
             while let Some(chain) = q.pop_descriptor_chain(mem) {
                 let head = chain.head_index();
                 let mut total = 0u32;
@@ -863,6 +1088,22 @@ impl VirtioConsole {
                         "virtio-console c_ovq add_used failed"
                     );
                 }
+                chains_drained += 1;
+                // Per-call chain count cap: bound the per-vCPU
+                // MMIO-handler latency under a hostile guest that
+                // publishes thousands of control chains. Remaining
+                // chains stay in the avail ring; the next
+                // QUEUE_NOTIFY picks them up. Mirrors the
+                // `TX_PER_CALL_MAX` pattern in `process_tx_into`.
+                if chains_drained >= CONTROL_CHAINS_PER_CALL_MAX {
+                    tracing::debug!(
+                        chains_drained,
+                        cap = CONTROL_CHAINS_PER_CALL_MAX,
+                        "virtio-console process_control_tx: per-call chain \
+                         cap reached; remaining chains deferred to next notify"
+                    );
+                    break;
+                }
             }
         }
         for c in events {
@@ -891,26 +1132,52 @@ impl VirtioConsole {
                 // for every port and grow `control_out` without
                 // bound. The kernel sends DEVICE_READY exactly once
                 // per probe (drivers/char/virtio_console.c
-                // `init_vqs`), so any subsequent message is a guest
-                // protocol violation.
+                // `virtcons_probe`), so any subsequent message is a
+                // guest protocol violation.
                 if self.device_ready {
                     tracing::warn!("virtio-console DEVICE_READY repeat ignored");
                     return;
                 }
                 self.device_ready = true;
-                // Send PORT_ADD for every port we expose.
+                // Send PORT_ADD for every port we expose. value=1
+                // matches QEMU (hw/char/virtio-serial-bus.c
+                // `send_control_event(... PORT_ADD, 1)` at the
+                // probe-time fanout); the kernel parser
+                // (`handle_control_message`) ignores `value` for
+                // PORT_ADD but the wire convention pins value=1.
                 for port_id in 0..NUM_PORTS {
                     self.control_out
                         .push_back(ControlOut::Cmd(VirtioConsoleControl {
                             id: port_id,
                             event: VIRTIO_CONSOLE_PORT_ADD,
-                            value: 0,
+                            value: 1,
                         }));
                 }
             }
             VIRTIO_CONSOLE_PORT_READY => {
                 if value != 1 {
-                    tracing::warn!(id, value, "virtio-console PORT_READY != 1");
+                    // value=0 is the kernel's add_port-failed signal
+                    // (drivers/char/virtio_console.c `add_port` fail
+                    // path: `__send_control_msg(portdev, id,
+                    // VIRTIO_CONSOLE_PORT_READY, 0)`). Surface as
+                    // tracing::error so a guest probe failure is
+                    // visible at the host log level rather than
+                    // wedging silently behind a debug log. Other
+                    // values are protocol violations from a
+                    // misbehaving guest; warn covers them.
+                    if value == 0 {
+                        tracing::error!(
+                            id,
+                            "virtio-console PORT_READY value=0: guest \
+                             reports add_port failure for this port \
+                             (kernel virtio_console.c add_port error \
+                             path). The port will not function and the \
+                             control handshake for this port will not \
+                             complete."
+                        );
+                    } else {
+                        tracing::warn!(id, value, "virtio-console PORT_READY != 1");
+                    }
                     return;
                 }
                 if id >= NUM_PORTS {
@@ -931,13 +1198,29 @@ impl VirtioConsole {
                 }
                 self.port_readied[id as usize] = true;
                 if id == 0 {
-                    // Console port: announce and open.
+                    // Console port: announce, name, then open. The
+                    // CONSOLE_PORT marker tells the guest this port
+                    // is the system console (drivers/char/virtio_console.c
+                    // `handle_control_message` CONSOLE_PORT case sets
+                    // `port->cons.hvc` and calls `init_port_console`).
+                    // PORT_NAME creates the sysfs `name` attribute
+                    // (`/sys/class/virtio-ports/vport0p0/name`) so
+                    // tooling that scans port names can find port 0;
+                    // without it the attribute does not exist. PORT_OPEN
+                    // matches QEMU's emission order
+                    // (hw/char/virtio-serial-bus.c — PORT_NAME before
+                    // PORT_OPEN), keeping udev symlink creation ahead
+                    // of any userspace open of `/dev/hvc0`.
                     self.control_out
                         .push_back(ControlOut::Cmd(VirtioConsoleControl {
                             id,
                             event: VIRTIO_CONSOLE_CONSOLE_PORT,
                             value: 1,
                         }));
+                    self.control_out.push_back(ControlOut::Name {
+                        id,
+                        name: PORT0_NAME,
+                    });
                     self.control_out
                         .push_back(ControlOut::Cmd(VirtioConsoleControl {
                             id,
@@ -945,17 +1228,25 @@ impl VirtioConsole {
                             value: 1,
                         }));
                 } else {
-                    // Bulk data port: open + name.
+                    // Bulk data port: name then open. Order matches
+                    // QEMU's PORT_READY handler in
+                    // hw/char/virtio-serial-bus.c (PORT_NAME goes out
+                    // before PORT_OPEN at lines 425 / 430). The
+                    // kernel's `handle_control_message` PORT_NAME
+                    // case creates the sysfs `name` attribute, which
+                    // udev rules consume to symlink the port; sending
+                    // PORT_OPEN first races udev's symlink creation
+                    // against userspace opens of /dev/vport0p1.
+                    self.control_out.push_back(ControlOut::Name {
+                        id,
+                        name: PORT1_NAME,
+                    });
                     self.control_out
                         .push_back(ControlOut::Cmd(VirtioConsoleControl {
                             id,
                             event: VIRTIO_CONSOLE_PORT_OPEN,
                             value: 1,
                         }));
-                    self.control_out.push_back(ControlOut::Name {
-                        id,
-                        name: PORT1_NAME,
-                    });
                 }
             }
             VIRTIO_CONSOLE_PORT_OPEN => {
@@ -1000,6 +1291,20 @@ impl VirtioConsole {
         if self.device_status & VIRTIO_CONFIG_S_DRIVER_OK == 0 {
             return;
         }
+        // F_MULTIPORT runtime gate: c_ivq is multiport-only. Without
+        // negotiation the kernel never allocates this queue, so any
+        // descriptor chain we'd find here is a guest protocol
+        // violation. Defer the messages — they'll wait in
+        // `control_out` until either F_MULTIPORT is negotiated on a
+        // future probe (after reset) or the device is reset.
+        if !self.multiport_negotiated() {
+            tracing::warn!(
+                pending = self.control_out.len(),
+                "virtio-console c_ivq: F_MULTIPORT not negotiated; \
+                 deferring control messages"
+            );
+            return;
+        }
         let mem = match self.mem.as_ref() {
             Some(m) => m,
             None => return,
@@ -1008,7 +1313,12 @@ impl VirtioConsole {
             return;
         }
         let q = &mut self.queues[C_IVQ];
-        let mut total_written = 0u32;
+        // Tracks whether any used-ring entry was published this
+        // call (including add_used(0) for too-small / torn chains)
+        // so signal_used fires. Without this, a sequence of
+        // too-small chains would publish add_used(0) entries that
+        // the guest never sees an interrupt for.
+        let mut any_published = false;
         let mut scratch: Vec<u8> = Vec::with_capacity(64);
         while let Some(msg) = self.control_out.front() {
             let need = msg.len();
@@ -1025,17 +1335,26 @@ impl VirtioConsole {
             if avail < need {
                 // Chain cannot hold this message — push it back via
                 // add_used(0) so the guest reclaims it; the message
-                // stays in `control_out` for the next chain.
+                // stays in `control_out` for the next chain. Try
+                // the next chain instead of breaking out — the guest
+                // may have published a mix of small (single-byte
+                // probe) and properly-sized (PAGE_SIZE) chains, and
+                // a too-small chain at the front of avail must not
+                // strand a large message that a later chain in the
+                // ring could hold.
                 tracing::warn!(
                     head,
                     avail,
                     need,
-                    "virtio-console c_ivq: chain too small for control message"
+                    "virtio-console c_ivq: chain too small for control \
+                     message; trying next chain"
                 );
                 if let Err(e) = q.add_used(mem, head, 0) {
                     tracing::warn!(head, %e, "virtio-console c_ivq add_used(0) failed");
+                } else {
+                    any_published = true;
                 }
-                break;
+                continue;
             }
             scratch.clear();
             msg.write_into(&mut scratch);
@@ -1062,16 +1381,29 @@ impl VirtioConsole {
                 written += chunk as u32;
             }
             if torn {
-                // Torn write: report 0 bytes used so the guest's
-                // virtio_console driver does not parse the partial
-                // frame as a complete control message. Reporting
-                // `written` here would let the guest dispatch on a
-                // truncated header (e.g. PORT_NAME with a half-
-                // copied name) and corrupt its multiport state.
+                // Torn write: publish the head with len=0 so the
+                // guest reclaims the descriptor without leaking it.
+                // The kernel does NOT gate cpkt parsing on buf->len
+                // — drivers/char/virtio_console.c
+                // `handle_control_message` reads `cpkt = (... *)(buf
+                // ->buf + buf->offset)` unconditionally, and
+                // `control_work_handler` only uses `len` to clamp
+                // `buf->len` (used later for PORT_NAME's name_size
+                // computation). The actual protection against
+                // dispatching a truncated frame is `find_port_by_id`
+                // rejecting unknown port ids — for non-PORT_ADD
+                // events with a stale/garbage id the kernel drops
+                // the message before the switch. For PORT_NAME a
+                // buf->len=0 produces an absurd name_size that
+                // typically fails the kmalloc and skips the strscpy.
+                // None of this is bulletproof; the safe path is to
+                // never produce a torn write in the first place.
                 // The control message stays at the front of
                 // `control_out` for retry on the next chain.
                 if let Err(e) = q.add_used(mem, head, 0) {
                     tracing::warn!(head, %e, "virtio-console c_ivq add_used after torn failed");
+                } else {
+                    any_published = true;
                 }
                 break;
             }
@@ -1084,11 +1416,15 @@ impl VirtioConsole {
                 );
                 break;
             }
-            total_written += written;
+            any_published = true;
             // Now safe to consume from the front.
             self.control_out.pop_front();
         }
-        if total_written > 0 {
+        // Fire signal_used whenever any used-ring entry was
+        // published this call. `any_published` covers the data
+        // path AND the add_used(0) paths (too-small / torn) so a
+        // sequence of failures still kicks an irq for the guest.
+        if any_published {
             self.signal_used();
         }
     }
@@ -1341,6 +1677,30 @@ impl VirtioConsole {
             // Once DRIVER_OK lands, drain any host bytes that arrived
             // during initialization.
             if new_bits == VIRTIO_CONFIG_S_DRIVER_OK {
+                // F_MULTIPORT must be negotiated for the multiport
+                // control protocol to function. Without it the
+                // kernel's virtcons_probe (drivers/char/virtio_console.c)
+                // takes the legacy single-console path
+                // (`add_port(portdev, 0)` then no DEVICE_READY) and
+                // never sends a control-queue handshake. Port 1
+                // bytes would then sit in `port1_tx_buf` /
+                // `port1_pending_rx` unconsumed, and the c_ivq /
+                // c_ovq queues would never receive driver buffers.
+                // Surface this loudly so the failure is visible
+                // rather than wedging behind a silent fallback.
+                if self.driver_features & (1u64 << (VIRTIO_CONSOLE_F_MULTIPORT as u64)) == 0 {
+                    tracing::warn!(
+                        driver_features = self.driver_features,
+                        "virtio-console set_status DRIVER_OK: \
+                         F_MULTIPORT (bit 1) not negotiated by \
+                         driver. Multiport control protocol will \
+                         not run; port 1 bulk channel will not \
+                         function. Verify the guest kernel has \
+                         CONFIG_VIRTIO_CONSOLE enabled and that \
+                         feature negotiation completed before \
+                         DRIVER_OK."
+                    );
+                }
                 self.drain_port0_pending_rx();
                 self.drain_control_in();
             }
@@ -1714,7 +2074,8 @@ mod tests {
         init_device(&mut dev);
         dev.interrupt_status = 0xFF;
         dev.port0_tx_buf.extend_from_slice(b"leftover0");
-        dev.port1_tx_buf.extend_from_slice(b"leftover1");
+        // VecDeque has no `extend_from_slice`; copy the byte iterator.
+        dev.port1_tx_buf.extend(b"leftover1".iter().copied());
         dev.port_opened[0] = true;
         dev.port_opened[1] = true;
         dev.device_ready = true;
@@ -1882,8 +2243,13 @@ mod tests {
                 ControlOut::Cmd(c) => {
                     let id = c.id;
                     let event = c.event;
+                    let value = c.value;
                     assert_eq!(id, i as u32);
                     assert_eq!(event, VIRTIO_CONSOLE_PORT_ADD);
+                    // PORT_ADD value=1 matches QEMU
+                    // (hw/char/virtio-serial-bus.c
+                    // `send_control_event(... PORT_ADD, 1)`).
+                    assert_eq!(value, 1);
                 }
                 _ => panic!("unexpected msg variant"),
             }
@@ -1898,10 +2264,14 @@ mod tests {
             event: VIRTIO_CONSOLE_PORT_READY,
             value: 1,
         });
-        assert_eq!(dev.control_out.len(), 2);
-        // CONSOLE_PORT then PORT_OPEN
+        // Order: CONSOLE_PORT, PORT_NAME, PORT_OPEN. PORT_NAME between
+        // CONSOLE_PORT and PORT_OPEN keeps the sysfs `name` attribute
+        // (`/sys/class/virtio-ports/vport0p0/name`) created before any
+        // userspace `/dev/hvc0` open races with udev symlink creation.
+        assert_eq!(dev.control_out.len(), 3);
         let m0 = &dev.control_out[0];
         let m1 = &dev.control_out[1];
+        let m2 = &dev.control_out[2];
         match m0 {
             ControlOut::Cmd(c) => {
                 let event = c.event;
@@ -1912,6 +2282,13 @@ mod tests {
             _ => panic!("expected Cmd"),
         }
         match m1 {
+            ControlOut::Name { id, name } => {
+                assert_eq!(*id, 0);
+                assert_eq!(*name, PORT0_NAME);
+            }
+            _ => panic!("expected Name"),
+        }
+        match m2 {
             ControlOut::Cmd(c) => {
                 let event = c.event;
                 let value = c.value;
@@ -1923,7 +2300,7 @@ mod tests {
     }
 
     #[test]
-    fn handle_port_ready_port1_open_then_name() {
+    fn handle_port_ready_port1_name_then_open() {
         let mut dev = VirtioConsole::new();
         dev.handle_control_event(VirtioConsoleControl {
             id: 1,
@@ -1931,7 +2308,18 @@ mod tests {
             value: 1,
         });
         assert_eq!(dev.control_out.len(), 2);
+        // Order matches QEMU's PORT_READY handler
+        // (hw/char/virtio-serial-bus.c): PORT_NAME first, PORT_OPEN
+        // second. Sending OPEN before NAME would race udev symlink
+        // creation against the userspace open of /dev/vport0p1.
         match &dev.control_out[0] {
+            ControlOut::Name { id, name } => {
+                assert_eq!(*id, 1);
+                assert_eq!(*name, PORT1_NAME);
+            }
+            _ => panic!("expected Name"),
+        }
+        match &dev.control_out[1] {
             ControlOut::Cmd(c) => {
                 let event = c.event;
                 let value = c.value;
@@ -1941,13 +2329,6 @@ mod tests {
                 assert_eq!(value, 1);
             }
             _ => panic!("expected Cmd"),
-        }
-        match &dev.control_out[1] {
-            ControlOut::Name { id, name } => {
-                assert_eq!(*id, 1);
-                assert_eq!(*name, PORT1_NAME);
-            }
-            _ => panic!("expected Name"),
         }
     }
 

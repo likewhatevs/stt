@@ -439,6 +439,30 @@ pub struct WorkerReport {
     /// possibly belong to.
     #[serde(default)]
     pub group_idx: usize,
+    /// Rendered error from the worker's `set_thread_affinity`
+    /// call, or `None` when affinity setup succeeded (or the
+    /// worker had no affinity to apply). Populated by
+    /// `worker_main` when the pre-loop
+    /// `set_thread_affinity(tid, cpus)` returns `Err` — the
+    /// worker continues with the inherited (or kernel-default)
+    /// cpumask so the test still produces an observable outcome,
+    /// but the failure is now surfaced in the report instead of
+    /// being silently dropped via `let _ = …`. The expected
+    /// failure shape is EINVAL from a requested cpu that is
+    /// outside the cpuset cgroup's `cpus.allowed` mask or the
+    /// kernel's online mask; EPERM is reachable when a more
+    /// privileged tracer set the worker's cpus_allowed and a
+    /// container policy denies further widening. Sentinel
+    /// reports synthesised by
+    /// [`WorkloadHandle::stop_and_collect`] leave this field at
+    /// its default `None` — a worker that died before
+    /// `worker_main` ran has no affinity-error observation.
+    ///
+    /// `#[serde(skip_serializing_if = "Option::is_none")]` keeps
+    /// the common success path's pipe payload compact; only
+    /// failed-affinity workers emit the field over the wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub affinity_error: Option<String>,
 }
 
 /// Reason a sentinel [`WorkerReport`] was synthesized — attached to
@@ -2050,6 +2074,61 @@ impl WorkloadHandle {
                     std::io::Error::last_os_error(),
                 );
             }
+            // Grow the report pipe so a worker that produces a worst-
+            // case report (two `Vec<u64>` reservoirs capped at
+            // `MAX_WAKE_SAMPLES` (100_000) entries each, plus
+            // smaller fields) finishes `write_all` without blocking
+            // for the parent to drain. The default pipe capacity on
+            // Linux is 16 pages (64 KiB on 4 KiB pages, 256 KiB on
+            // 16 KiB pages); a JSON-encoded `WorkerReport` with both
+            // reservoirs full is roughly 4–5 MiB. Without this grow,
+            // the worker blocks inside `f.write_all(&json)` (line
+            // ~2562) waiting for the parent's `read_to_end`. The
+            // parent reads workers serially with a shared 5 s
+            // deadline (`stop_and_collect`); if the first worker's
+            // drain consumes the budget, every subsequent worker's
+            // `poll` budget is 0, the parent closes the read fd
+            // without reading, and the child's blocked write returns
+            // EPIPE — the report is lost and the failure surfaces
+            // as a sentinel `WorkerReport`. Sizing the pipe to 8 MiB
+            // lets the child write the full JSON in one
+            // non-blocking burst, exit, and close its write end;
+            // when the parent later polls the read fd, all data is
+            // already buffered in the kernel and `read_to_end`
+            // returns immediately with EOF.
+            //
+            // F_SETPIPE_SZ rounds the requested size up to the next
+            // power of two; unprivileged callers are clamped to
+            // `/proc/sys/fs/pipe-max-size` (typically 1 MiB).
+            // ktstr always runs as root inside the guest, so the
+            // grow succeeds. A best-effort failure (older kernel
+            // without F_SETPIPE_SZ, or an unexpected EPERM) leaves
+            // the default size in place — workers with small
+            // reports still complete; workers with large reports
+            // fall back to the historical blocking-write behaviour.
+            // Logging the failure surfaces the regression without
+            // failing the whole spawn.
+            const REPORT_PIPE_SIZE: libc::c_int = 8 * 1024 * 1024;
+            // SAFETY: `report_fds[1]` is the freshly opened write
+            // end returned by `pipe2` above; F_SETPIPE_SZ accepts
+            // any pipe fd (read or write end — both refer to the
+            // same kernel `struct pipe_inode_info`).
+            let prev_size =
+                unsafe { libc::fcntl(report_fds[1], libc::F_SETPIPE_SZ, REPORT_PIPE_SIZE) };
+            if prev_size < 0 {
+                let err = std::io::Error::last_os_error();
+                tracing::warn!(
+                    worker = i + 1,
+                    num_workers = group.num_workers,
+                    group_idx = group.group_idx,
+                    requested_size = REPORT_PIPE_SIZE,
+                    %err,
+                    "F_SETPIPE_SZ on report pipe failed; falling back to default \
+                     pipe capacity. Workers producing >64 KiB reports may block \
+                     in write_all and have their reports truncated by the \
+                     parent's deadline-driven fd close."
+                );
+            }
             let mut start_fds = [0i32; 2];
             if unsafe { libc::pipe2(start_fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
                 unsafe {
@@ -2065,11 +2144,83 @@ impl WorkloadHandle {
                 );
             }
 
+            // Block SIGUSR1 across fork so the child inherits a
+            // SIGUSR1-blocked mask. Without this, there is a
+            // window between `fork()` returning in the child and
+            // the child installing `sigusr1_handler` below where
+            // SIGUSR1's default disposition (terminate) is in
+            // effect. A `stop_and_collect` call that races against
+            // a worker still in mid-init — e.g. if a sibling
+            // worker spawned just before this one already pushed
+            // its (pid, ...) into `guard.children` and a parent
+            // thread initiated stop signaling — could deliver
+            // SIGUSR1 to this child before its handler is
+            // installed and terminate it via the default action.
+            // The block + post-install unblock pattern queues any
+            // SIGUSR1 sent in the window so the handler observes
+            // it on the unblock; the worker then sets `STOP` and
+            // exits gracefully.
+            //
+            // pthread_sigmask is the multi-threaded equivalent of
+            // sigprocmask: ktstr's parent process is genuinely
+            // multi-threaded (test runner threads, tracing
+            // threads), and `sigprocmask` semantics are unspecified
+            // in MT programs per signal-safety(7) /
+            // pthread_sigmask(3) — pthread_sigmask is the correct
+            // primitive to use here. The fork()-inherited mask is
+            // the calling thread's mask at fork time, exactly what
+            // we want.
+            //
+            // Old mask is captured so the parent path can restore
+            // its prior signal mask after fork — the block must
+            // be transient on the parent side; the parent's
+            // SIGUSR1 stays under whatever disposition the host
+            // application configured (typically the default;
+            // ktstr does not handle SIGUSR1 in the parent
+            // process).
+            let mut old_mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+            let mut block_mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+            // pthread_sigmask returns 0 on success, a positive errno
+            // on failure (per POSIX — does NOT set errno). A non-zero
+            // return here means the SIGUSR1 mask did not actually get
+            // installed: the child would inherit an unblocked SIGUSR1
+            // and the post-fork race window between fork() and the
+            // child's signal() install would terminate the worker on
+            // its default action. Log so the failure surfaces.
+            let psm_block_rc = unsafe {
+                libc::sigemptyset(&mut block_mask);
+                libc::sigaddset(&mut block_mask, libc::SIGUSR1);
+                libc::pthread_sigmask(libc::SIG_BLOCK, &block_mask, &mut old_mask)
+            };
+            if psm_block_rc != 0 {
+                tracing::warn!(
+                    rc = psm_block_rc,
+                    "pthread_sigmask(SIG_BLOCK, SIGUSR1) failed pre-fork; child inherits unblocked SIGUSR1 and may terminate on default action before installing handler"
+                );
+            }
+
             let pid = unsafe { libc::fork() };
             match pid {
                 -1 => {
-                    // Fork failed: close both fresh pipes so they don't
-                    // leak before the guard reaps the already-forked
+                    // Fork failed: restore the parent's previous
+                    // signal mask before bailing so this failure
+                    // doesn't leave SIGUSR1 blocked in the calling
+                    // thread for the rest of the process lifetime.
+                    let psm_restore_rc = unsafe {
+                        libc::pthread_sigmask(
+                            libc::SIG_SETMASK,
+                            &old_mask,
+                            std::ptr::null_mut(),
+                        )
+                    };
+                    if psm_restore_rc != 0 {
+                        tracing::warn!(
+                            rc = psm_restore_rc,
+                            "pthread_sigmask(SIG_SETMASK) failed restoring mask after fork failure; SIGUSR1 may remain blocked in this thread"
+                        );
+                    }
+                    // Close both fresh pipes so they don't leak
+                    // before the guard reaps the already-forked
                     // siblings.
                     unsafe {
                         libc::close(report_fds[0]);
@@ -2176,13 +2327,65 @@ impl WorkloadHandle {
                     unsafe {
                         libc::setpgid(0, 0);
                     }
-                    // Install signal handler FIRST (before start wait)
-                    // to prevent SIGUSR1 killing us before we're ready
+                    // Install signal handler BEFORE unblocking
+                    // SIGUSR1: the parent blocked SIGUSR1 across
+                    // fork so this child inherits a blocked mask;
+                    // any SIGUSR1 sent by `stop_and_collect` while
+                    // the mask is in effect queues until we
+                    // unblock. Once the handler is registered we
+                    // restore the original (pre-block) mask via
+                    // `pthread_sigmask(SIG_SETMASK, …)`, which
+                    // delivers any pending SIGUSR1 directly into
+                    // `sigusr1_handler` and sets `STOP` cleanly —
+                    // the worker proceeds into the start-wait
+                    // poll() with handler armed and any pending
+                    // signal already consumed. Without this two-
+                    // step, SIGUSR1 would fire under its default
+                    // disposition (terminate) during the window
+                    // between `fork()` and `signal()`.
                     STOP.store(false, Ordering::Relaxed);
-                    unsafe {
+                    // libc::signal returns SIG_ERR (cast as
+                    // sighandler_t) on failure with errno set.
+                    // pthread_sigmask returns 0 on success, errno
+                    // value on failure. Both failures here are
+                    // visible defects: signal() fail means SIGUSR1
+                    // keeps default disposition (terminate) and
+                    // stop_and_collect cannot stop the worker
+                    // gracefully — it falls through to the
+                    // killpg/SIGKILL escalation; pthread_sigmask()
+                    // fail means the SIGUSR1 we blocked across
+                    // fork stays blocked, so the parent's stop
+                    // SIGUSR1 queues forever in the child and the
+                    // child runs the full work loop until the
+                    // killpg escalation.
+                    //
+                    // tracing is unsafe in a post-fork child
+                    // before _exit (the parent's tracing
+                    // subscriber may be locked elsewhere); use
+                    // eprintln! which is fork-safe per
+                    // signal-safety(7) (write(2)).
+                    let sig_prev = unsafe {
                         libc::signal(
                             libc::SIGUSR1,
                             sigusr1_handler as *const () as libc::sighandler_t,
+                        )
+                    };
+                    if sig_prev == libc::SIG_ERR {
+                        let errno = std::io::Error::last_os_error();
+                        eprintln!(
+                            "ktstr: signal(SIGUSR1) install failed in worker child: {errno}; graceful stop unavailable, killpg escalation will reap"
+                        );
+                    }
+                    let psm_unblock_rc = unsafe {
+                        libc::pthread_sigmask(
+                            libc::SIG_SETMASK,
+                            &old_mask,
+                            std::ptr::null_mut(),
+                        )
+                    };
+                    if psm_unblock_rc != 0 {
+                        eprintln!(
+                            "ktstr: pthread_sigmask(SIG_SETMASK) unblock failed in worker child: rc={psm_unblock_rc}; SIGUSR1 stays blocked, killpg escalation will reap"
                         );
                     }
                     // Close unused pipe ends
@@ -2318,7 +2521,24 @@ impl WorkloadHandle {
                     //    in the child would interleave garbled output
                     //    with the parent's tracing log and confuse
                     //    downstream parsers. Install a silent hook
-                    //    before catch_unwind.
+                    //    before catch_unwind ONLY under
+                    //    `panic = "unwind"` — under
+                    //    `panic = "abort"` (release / nextest
+                    //    profile) the silent hook would suppress the
+                    //    panic message before SIGABRT fires, leaving
+                    //    operators with zero diagnostic from a
+                    //    crashed worker. Letting the default hook
+                    //    write a backtrace to stderr is the lesser
+                    //    evil under abort: the message may interleave
+                    //    with parent tracing output but at least
+                    //    surfaces the panic site. catch_unwind itself
+                    //    is a no-op under abort (the closure is
+                    //    invoked normally and the abort terminates
+                    //    the child before any Err return), so gating
+                    //    only the hook installation — not the
+                    //    catch_unwind call — keeps the unwind-build
+                    //    fast-path unchanged while restoring
+                    //    release-build observability.
                     //
                     // 2. `_exit(0|1)` after the closure (success or
                     //    catch_unwind Err) — the child never returns
@@ -2349,16 +2569,20 @@ impl WorkloadHandle {
                     //    `stop_and_collect` therefore observes a
                     //    missing WorkerReport and fills in a
                     //    sentinel — that sentinel fallback IS the
-                    //    release-build correctness mechanism.
-                    //    Defenses (1) and (2) still apply unchanged
-                    //    under abort: the silent panic hook
-                    //    suppresses the panic message and the
-                    //    abort itself skips Drops (matching the
-                    //    `_exit` path's no-Drop guarantee). Dev/test
-                    //    builds (cargo test,
-                    //    cargo nextest run — dev profile inherits
-                    //    default unwind semantics) still get a real
-                    //    `catch_unwind` Err → `_exit(1)` fast-path.
+                    //    release-build correctness mechanism. Under
+                    //    abort the silent hook is NOT installed (see
+                    //    item 1) so the default panic handler writes
+                    //    the panic location and message to stderr
+                    //    just before SIGABRT, giving operators the
+                    //    diagnostic they would otherwise have lost.
+                    //    Defense (2) still applies unchanged: abort
+                    //    skips Drops (matching the `_exit` path's
+                    //    no-Drop guarantee). Dev/test builds (cargo
+                    //    test, cargo nextest run — dev profile
+                    //    inherits default unwind semantics) still
+                    //    get a real `catch_unwind` Err → `_exit(1)`
+                    //    fast-path with a silent hook so the
+                    //    backtrace doesn't pollute test output.
                     //
                     //    Global-state safety under unwind, scoped
                     //    to `worker_main`'s reachable code path —
@@ -2392,8 +2616,11 @@ impl WorkloadHandle {
                     // `AssertUnwindSafe` is justified: the child
                     // unconditionally _exits after this block, so no
                     // post-unwind invariant can be observed.
-                    let _ = std::panic::take_hook();
-                    std::panic::set_hook(Box::new(|_| {}));
+                    #[cfg(panic = "unwind")]
+                    {
+                        let _ = std::panic::take_hook();
+                        std::panic::set_hook(Box::new(|_| {}));
+                    }
                     let child_result =
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             // Wait for parent to move us to cgroup before starting work.
@@ -2439,7 +2666,23 @@ impl WorkloadHandle {
                             );
                             let json = serde_json::to_vec(&report).unwrap_or_default();
                             let mut f = unsafe { std::fs::File::from_raw_fd(report_fds[1]) };
-                            let _ = f.write_all(&json);
+                            if let Err(e) = f.write_all(&json) {
+                                // tracing is unsafe in a post-fork child
+                                // (the global subscriber may be holding a
+                                // lock taken in another thread of the
+                                // parent process before fork); eprintln
+                                // goes straight to stderr without locking
+                                // a tracing subscriber. The parent
+                                // observes a partial / empty pipe payload
+                                // and emits a sentinel WorkerReport with
+                                // exit_info populated, but without this
+                                // log line the underlying I/O error
+                                // (EPIPE if the parent closed the read
+                                // end early, EFBIG / ENOSPC on a backing-
+                                // file pipe, EIO on a transient kernel
+                                // failure) is invisible.
+                                eprintln!("ktstr: worker report write_all failed: {e}");
+                            }
                             drop(f);
                         }));
                     let code = if child_result.is_ok() { 0 } else { 1 };
@@ -2448,7 +2691,28 @@ impl WorkloadHandle {
                     }
                 }
                 child_pid => {
-                    // Parent: close unused pipe ends.
+                    // Parent: restore the pre-fork signal mask
+                    // (the block was transient — only the child
+                    // inherits the blocked SIGUSR1, and that
+                    // child unblocks immediately after installing
+                    // its handler). Without this restore, SIGUSR1
+                    // would stay blocked in the calling thread for
+                    // the lifetime of the workload, swallowing any
+                    // signal directed at the parent process.
+                    let psm_parent_restore_rc = unsafe {
+                        libc::pthread_sigmask(
+                            libc::SIG_SETMASK,
+                            &old_mask,
+                            std::ptr::null_mut(),
+                        )
+                    };
+                    if psm_parent_restore_rc != 0 {
+                        tracing::warn!(
+                            rc = psm_parent_restore_rc,
+                            "pthread_sigmask(SIG_SETMASK) failed restoring mask in parent post-fork; SIGUSR1 stays blocked in this thread for the lifetime of the workload"
+                        );
+                    }
+                    // Close unused pipe ends.
                     unsafe {
                         libc::close(report_fds[1]);
                         libc::close(start_fds[0]);
@@ -2785,72 +3049,120 @@ impl WorkloadHandle {
                 let _ = nix::unistd::close(read_fd);
             }
 
-            // Wait for child (WNOHANG first, then SIGKILL if still alive).
-            // `pid` is `libc::pid_t` (= i32 on Linux), which passes
-            // straight into `Pid::from_raw` without a sign cast —
-            // the old u32→i32 session-wide-reap hazard is avoided.
+            // Pre-reap killpg — sweep the worker's process group
+            // BEFORE any WNOHANG so the leader's pid is still in
+            // the kernel's process table when killpg runs. The
+            // previous code path (killpg AFTER WNOHANG) had a
+            // pid-recycling race: a worker that exited cleanly
+            // before the WNOHANG check is reaped by that call,
+            // freeing its pid for reuse; a subsequent
+            // killpg(recycled-pid, SIGKILL) would deliver SIGKILL
+            // to an unrelated process group elsewhere on the
+            // host that happened to inherit the recycled pid via
+            // an unrelated fork+setpgid sequence. Issuing killpg
+            // first closes the race because the leader is
+            // guaranteed to still occupy `npid` at this point —
+            // either alive or as a zombie awaiting our reap, and
+            // in both cases the kernel still reserves the pid.
+            // After this killpg, any descendant forked by the
+            // worker (Custom workloads, ForkExit caught
+            // mid-fork) is dying in parallel; the WNOHANG below
+            // then reaps the leader and the still-alive
+            // escalation path takes over if the leader hasn't
+            // exited yet.
+            //
+            // Behavior preserved: descendants of a graceful-exit
+            // worker are still SIGKILL'd by this sweep, matching
+            // the previous unconditional behavior. The only
+            // observable difference for an already-exited leader
+            // is that killpg now races with the SIGABRT/_exit
+            // sequence the leader was about to complete — but
+            // for an already-zombie leader killpg is a no-op
+            // against its exit status (the kernel does not
+            // re-deliver signals to zombies), and for a
+            // mid-panic leader the close race window is a few
+            // microseconds against a 500ms+ collection deadline.
+            // The sentinel-path tests in `tests_grandchild` that
+            // pin both branches (StillAlive vs graceful) still
+            // observe descendant cleanup.
+            //
+            // ESRCH-convention: this call intentionally discards
+            // the killpg return via `let _ =`. The outcome
+            // depends on the SIGCHLD disposition:
+            //
+            // SIG_DFL / handler (host `cargo test`): the leader
+            // is a zombie occupying its pgid until the WNOHANG
+            // below reaps it, so killpg returns 0 (signals to
+            // zombies are no-ops, not ESRCH).
+            //
+            // SIG_IGN (production guest — PID 1 sets SIG_IGN at
+            // rust_init.rs): the kernel auto-reaps via
+            // `do_notify_parent` → `release_task` →
+            // `__unhash_process`, detaching the leader from
+            // PIDTYPE_PGID before we reach killpg. If the
+            // worker has no descendants, the pgrp is empty and
+            // killpg returns ESRCH. This is the common case in
+            // production.
+            //
+            // Either outcome is acceptable: 0 means the signal
+            // was delivered (no-op to zombie or descendants),
+            // ESRCH means the group is already gone.
+            // Discarding the return preserves the previous
+            // logging behavior on the collect path: Drop
+            // (`WorkloadHandle::drop`) is the place that logs
+            // killpg errors via `tracing::warn!`, since Drop
+            // runs on every handle teardown including panic-
+            // unwind paths and surfacing errors there is more
+            // valuable than on the normal collect flow.
+            //
+            // `pid` is `libc::pid_t` (= i32 on Linux), which
+            // passes straight into `Pid::from_raw` without a
+            // sign cast — the old u32→i32 session-wide-reap
+            // hazard is avoided.
             let npid = nix::unistd::Pid::from_raw(pid);
+            let _ = nix::sys::signal::killpg(npid, nix::sys::signal::Signal::SIGKILL);
+            // Wait for child (WNOHANG first, then SIGKILL the
+            // leader directly if still alive). The killpg above
+            // has already started dying every member of the
+            // pgrp; this WNOHANG is a fast-path reap that
+            // returns the leader's already-set exit status when
+            // the leader had exited gracefully before killpg
+            // arrived (zombie-but-not-yet-reaped — its
+            // `Exited(0)` / `Signaled(SIGABRT)` status survives
+            // the killpg because the kernel does not re-set the
+            // exit status of a zombie).
             let waited = nix::sys::wait::waitpid(npid, Some(nix::sys::wait::WaitPidFlag::WNOHANG));
             let still_running = matches!(waited, Ok(nix::sys::wait::WaitStatus::StillAlive),);
-            // Preserve the reap shape for the sentinel path below:
-            // the WNOHANG attempt tells us "exited / signaled /
-            // still running" on the fast path; the SIGKILL + blocking
-            // waitpid below collapses "still running" into
-            // `WorkerExitInfo::TimedOut` without retaining the final
-            // status (the reap itself is the diagnostic — the child
-            // was past its deadline).
-            //
-            // Unconditional killpg: BOTH branches sweep the worker's
-            // process group so descendants forked by a
-            // [`WorkType::Custom`] body (or any future work type that
-            // spawns helpers) die with the worker. A graceful-exit
-            // worker that forked a long-running grandchild would
-            // otherwise leave the grandchild alive — setpgid(0, 0) at
-            // fork time gives us pgid == worker pid, and killpg is a
-            // no-op (ESRCH) once all members have exited. The
-            // StillAlive branch additionally direct-kills + blocking-
-            // waits the leader; the graceful branch keeps `waited`
-            // because the leader's exit status is already known and
-            // is what classify_wait_outcome should see.
-            //
-            // WNOHANG → killpg race window: between the `waited`
-            // observation above and this killpg call, the leader may
-            // flip from StillAlive to exited (rare but real — the
-            // worker could finish between the two syscalls). If that
-            // happens, the `still_running` boolean is stale (it says
-            // true but the leader is already dead by the time we
-            // issue killpg/kill). The race is tolerated: the killpg
-            // sweep fires against an empty group (ESRCH) and the
-            // follow-up blocking `waitpid(npid, None)` returns the
-            // already-reaped status or ECHILD — either way the
-            // escalation path collapses to `WorkerExitInfo::TimedOut`
-            // without retaining the final code, which is the
-            // documented sentinel semantics. We accept the minor
-            // diagnostic loss (a "timed out" classification for a
-            // leader that actually exited cleanly on the race) in
-            // exchange for not needing a second WNOHANG probe.
-            //
-            // ESRCH-convention: this call intentionally discards the
-            // killpg return via `let _ =`. ESRCH (group gone) is the
-            // expected outcome for the common no-descendants case and
-            // is not worth logging. Contrast `WorkloadHandle::drop`
-            // below, which logs a `tracing::warn!` on non-ESRCH
-            // errors from killpg — Drop runs on every handle teardown
-            // including panic-unwind paths, so surfacing unusual
-            // errors there is more valuable than during the normal
-            // collect flow.
-            let _ = nix::sys::signal::killpg(npid, nix::sys::signal::Signal::SIGKILL);
+            // Preserve the reap shape for the sentinel path
+            // below: the WNOHANG attempt tells us "exited /
+            // signaled / still running" on the fast path; the
+            // SIGKILL + blocking waitpid below collapses "still
+            // running" into `WorkerExitInfo::TimedOut` without
+            // retaining the final status (the reap itself is
+            // the diagnostic — the child was past its deadline).
             let exit_info_source: Result<nix::sys::wait::WaitStatus, nix::errno::Errno> =
                 if still_running {
-                    // Leader still up: direct-kill + blocking reap. The
-                    // killpg above has already started dying descendants
-                    // in parallel; the follow-up `kill` is the single-
-                    // process fallback when the worker's
-                    // `setpgid(0, 0)` at fork time somehow failed.
+                    // Leader still up post-killpg: direct-kill
+                    // the leader as a single-process fallback
+                    // when the worker's `setpgid(0, 0)` at fork
+                    // time somehow failed (so killpg above did
+                    // not reach it), then blocking-reap. `npid`
+                    // is safe here because the leader has not
+                    // been reaped (the WNOHANG observation
+                    // above returned StillAlive), so its pid
+                    // cannot be recycled mid-sequence.
                     let _ = nix::sys::signal::kill(npid, nix::sys::signal::Signal::SIGKILL);
                     let _ = nix::sys::wait::waitpid(npid, None);
                     Ok(nix::sys::wait::WaitStatus::StillAlive)
                 } else {
+                    // Graceful-exit branch: the leader was
+                    // reaped by the WNOHANG above. The pre-reap
+                    // killpg already swept the worker's pgrp
+                    // (including any descendants), so no
+                    // post-reap kill is needed and the
+                    // pid-recycling race is avoided —
+                    // `kill(npid, …)` after a zombie reap could
+                    // hit a recycled pid; that path is gone.
                     waited
                 };
 

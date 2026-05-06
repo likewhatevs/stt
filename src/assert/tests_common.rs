@@ -41,6 +41,7 @@ pub fn rpt(
         exit_info: None,
         is_messenger: false,
         group_idx: 0,
+        affinity_error: None,
     }
 }
 
@@ -76,5 +77,6 @@ pub fn rpt_with_latencies(
         exit_info: None,
         is_messenger: false,
         group_idx: 0,
+        affinity_error: None,
     }
 }

@@ -1,5 +1,5 @@
 //! Host-only typed consumers for the guest-bound bulk TLV stream and
-//! the SHM doorbell + virtio-console wake-byte control plane.
+//! virtio-console wake-byte control plane.
 //!
 //! These helpers run inside the host VMM (the freeze coordinator,
 //! the watchdog, the monitor thread) and never inside a guest.
@@ -16,14 +16,9 @@
 //!   parsing continues for subsequent frames).
 //!
 //! - [`request_dump`] and [`request_shutdown`] push virtio-console
-//!   RX wake bytes that the guest's `shm_poll_loop` recognises
-//!   directly; `request_dump` additionally writes the SHM
-//!   `DUMP_REQ_OFFSET` byte so the SysRq-D path triggers on the
-//!   next loop iteration.
-//!
-//! - [`snapshot_request_id`] reads the SHM doorbell-paired request
-//!   id; the doorbell page itself survives the SHM-ring elimination
-//!   because it is the kernel ioeventfd target.
+//!   RX wake bytes that the guest's `hvc0_poll_loop` recognises
+//!   directly. The SysRq-D dispatch is triggered by the
+//!   `SIGNAL_VC_DUMP` wake byte alone.
 //!
 //! # No drop counter
 //!
@@ -31,25 +26,13 @@
 //! `port_fops_write` blocks the writer until the host's `add_used`
 //! rate catches up. Backpressure replaces drops, so
 //! [`BulkDrainResult`] carries no `drops` field — every byte the
-//! guest emitted is delivered, in order. Compare to the legacy SHM
-//! ring's [`super::shm_ring::ShmDrainResult`] which exposed a `drops`
-//! counter for ring-full conditions.
-//!
-//! The lib build does not yet exercise every public helper in this
-//! module — the freeze coordinator's TX_EVT epoll arm uses the
-//! [`super::bulk::HostAssembler`] streaming path directly, and the
-//! `snapshot_request_id` / `drain_bulk` / `parse_tlv_stream` entries
-//! are present for downstream test code. `#[allow(dead_code)]`
-//! matches the public-surface pattern used on `VmResult` and the
-//! legacy `ShmDrainResult`.
-
-#![allow(dead_code)]
+//! guest emitted is delivered, in order.
 
 use std::sync::Arc;
 use zerocopy::FromBytes;
 
+use super::bulk::MAX_BULK_FRAME_PAYLOAD;
 use super::pi_mutex::PiMutex;
-use super::shm_ring;
 use super::virtio_console::{
     SIGNAL_BPF_WRITE_DONE, SIGNAL_VC_DUMP, SIGNAL_VC_SHUTDOWN, VirtioConsole,
 };
@@ -79,6 +62,7 @@ pub struct BulkDrainResult {
 /// freeze coordinator's mid-run streaming consumer must use
 /// [`super::bulk::HostAssembler`] directly when partial-frame
 /// retention across drains is required.
+#[allow(dead_code)]
 pub fn drain_bulk(dev: &mut VirtioConsole) -> BulkDrainResult {
     let bytes = dev.drain_bulk();
     parse_tlv_stream(&bytes)
@@ -98,6 +82,19 @@ pub fn drain_bulk(dev: &mut VirtioConsole) -> BulkDrainResult {
 /// first incomplete frame. Callers that need partial-frame retention
 /// across multiple drain calls should use
 /// [`super::bulk::HostAssembler`] instead.
+///
+/// # Hostile-input guard
+///
+/// Frames whose announced `length` exceeds
+/// [`MAX_BULK_FRAME_PAYLOAD`] are rejected. The on-wire `length`
+/// field is `u32` so a malformed or hostile guest can announce
+/// up to 4 GiB of payload; the cap rejects such headers before
+/// allocating the per-frame `Vec<u8>` payload. Mirrors the same
+/// check applied by [`super::bulk::HostAssembler`] so the
+/// streaming and one-shot consumers agree on what counts as a
+/// legitimate frame. On rejection, the walk stops — subsequent
+/// bytes cannot be trusted (the announced length cannot be relied
+/// on to advance past the bogus payload).
 pub fn parse_tlv_stream(buf: &[u8]) -> BulkDrainResult {
     let mut entries: Vec<ShmEntry> = Vec::new();
     let mut pos = 0usize;
@@ -110,6 +107,25 @@ pub fn parse_tlv_stream(buf: &[u8]) -> BulkDrainResult {
             // an infinite loop if the invariant is ever violated.
             break;
         };
+        // Hostile-input guard: a `length` above the per-frame cap
+        // cannot come from any legitimate producer (every real
+        // payload sits well below 256 KiB) and would trigger an
+        // oversized `Vec<u8>` allocation. Reject before the
+        // payload-length sanity check below so a malformed
+        // `u32::MAX` length does not even reach the
+        // `saturating_sub` arithmetic. Stop parsing — the
+        // announced length cannot be trusted to advance the
+        // cursor past the bogus payload, so any trailing bytes
+        // are unparseable.
+        if msg.length > MAX_BULK_FRAME_PAYLOAD {
+            tracing::warn!(
+                msg_type = msg.msg_type,
+                length = msg.length,
+                cap = MAX_BULK_FRAME_PAYLOAD,
+                "parse_tlv_stream: dropping oversized frame; stopping walk"
+            );
+            break;
+        }
         // Guard against a torn frame whose `length` claims more
         // payload than the buffer holds. Stop parsing rather than
         // attempting an over-read or oversized allocation.
@@ -119,46 +135,43 @@ pub fn parse_tlv_stream(buf: &[u8]) -> BulkDrainResult {
         let payload_end = hdr_end + msg.length as usize;
         let payload = buf[hdr_end..payload_end].to_vec();
         let computed_crc = crc32fast::hash(&payload);
+        let crc_ok = computed_crc == msg.crc32;
+        if !crc_ok {
+            // Surface per-frame CRC mismatches for diagnostics —
+            // Mirrors the assembly path so a corrupted bulk-stream frame
+            // appears in the operator log instead of being dropped
+            // silently when downstream consumers filter on
+            // `crc_ok`. The walk continues regardless: subsequent
+            // frames are still parsed.
+            tracing::warn!(
+                msg_type = msg.msg_type,
+                length = msg.length,
+                expected_crc = msg.crc32,
+                computed_crc,
+                "parse_tlv_stream: per-frame CRC mismatch; surfacing crc_ok=false"
+            );
+        }
         entries.push(ShmEntry {
             msg_type: msg.msg_type,
             payload,
-            crc_ok: computed_crc == msg.crc32,
+            crc_ok,
         });
         pos = payload_end;
     }
     BulkDrainResult { entries }
 }
 
-/// Push a SysRq-D dump request to the guest. Combines the SHM
-/// control-byte write (`DUMP_REQ_OFFSET`) with a virtio-console
-/// wake byte so the guest's `shm_poll_loop` re-reads the control
-/// byte without waiting for its 200 ms poll cadence.
-///
-/// `mem` is the host's view of guest DRAM (via `GuestMem`).
-/// `shm_base` is the offset of the SHM region.
-/// `virtio_con` carries the wake-byte transport.
-///
-/// Lock acquisition: SHM byte first, then the wake byte; this order
-/// guarantees the guest reads the new control byte after observing
-/// the wake. Reversed order would let the guest re-read the SHM
-/// byte BEFORE we wrote it, miss the new value, and stall until the
-/// next 200 ms poll.
-pub fn request_dump(
-    mem: &crate::monitor::reader::GuestMem,
-    shm_base: u64,
-    virtio_con: &Arc<PiMutex<VirtioConsole>>,
-) {
-    mem.write_u8(
-        shm_base,
-        shm_ring::DUMP_REQ_OFFSET,
-        shm_ring::DUMP_REQ_SYSRQ_D,
-    );
+/// Push a SysRq-D dump request to the guest by sending the
+/// `SIGNAL_VC_DUMP` byte through the virtio-console RX queue. The
+/// guest's `hvc0_poll_loop` blocks on `/dev/hvc0`, recognises the byte
+/// directly, and triggers SysRq-D — no SHM control slot involved.
+pub fn request_dump(virtio_con: &Arc<PiMutex<VirtioConsole>>) {
     virtio_con.lock().queue_input(&[SIGNAL_VC_DUMP]);
 }
 
 /// Push a graceful-shutdown request to the guest by sending the
 /// `SIGNAL_VC_SHUTDOWN` byte through the virtio-console RX queue.
-/// The guest's `shm_poll_loop` recognises the byte directly and
+/// The guest's `hvc0_poll_loop` recognises the byte directly and
 /// drives the graceful-shutdown teardown — no SHM signal slot
 /// involved.
 pub fn request_shutdown(virtio_con: &Arc<PiMutex<VirtioConsole>>) {
@@ -168,24 +181,13 @@ pub fn request_shutdown(virtio_con: &Arc<PiMutex<VirtioConsole>>) {
 /// Notify the guest that the host's `bpf-map-write` thread finished
 /// applying every queued `bpf_map_write`. Pushes
 /// `SIGNAL_BPF_WRITE_DONE` through the virtio-console RX queue; the
-/// guest's `shm_poll_loop` recognises the byte and sets the
+/// guest's `hvc0_poll_loop` recognises the byte and sets the
 /// `bpf_map_write_done` latch so a scenario blocked on
 /// [`crate::scenario::Ctx::wait_for_map_write`] resumes. Replaces the
 /// legacy SHM signal-slot rendezvous (host writes slot 0, guest blocks
 /// on slot 0) with a single wake byte.
 pub fn request_bpf_map_write_done(virtio_con: &Arc<PiMutex<VirtioConsole>>) {
     virtio_con.lock().queue_input(&[SIGNAL_BPF_WRITE_DONE]);
-}
-
-/// Read the host-side view of an in-flight snapshot request. Returns
-/// the request id the guest most recently published in
-/// [`shm_ring::SNAPSHOT_REQUEST_ID_OFFSET`], 0 when no request is
-/// pending.
-///
-/// The freeze coordinator polls this slot from its doorbell-event
-/// dispatch path; non-zero means there is work to do.
-pub fn snapshot_request_id(mem: &crate::monitor::reader::GuestMem, shm_base: u64) -> u32 {
-    mem.read_u32(shm_base, shm_ring::SNAPSHOT_REQUEST_ID_OFFSET)
 }
 
 #[cfg(test)]
@@ -291,5 +293,95 @@ mod tests {
         let mut dev = VirtioConsole::new();
         let r = drain_bulk(&mut dev);
         assert!(r.entries.is_empty());
+    }
+
+    /// Hostile-input guard: a header announcing
+    /// `length > MAX_BULK_FRAME_PAYLOAD` is rejected before any
+    /// per-frame allocation. The walk stops at the bogus header —
+    /// any trailing bytes are unparseable because the bogus length
+    /// cannot be trusted to advance the cursor past the claimed
+    /// payload.
+    #[test]
+    fn parse_rejects_oversized_announced_length() {
+        use zerocopy::IntoBytes;
+        let bad = ShmMessage {
+            msg_type: MSG_TYPE_STIMULUS,
+            length: u32::MAX,
+            crc32: 0,
+            _pad: 0,
+        };
+        let r = parse_tlv_stream(bad.as_bytes());
+        assert!(
+            r.entries.is_empty(),
+            "header announcing u32::MAX must be rejected without producing entries"
+        );
+
+        // Boundary: `length == MAX_BULK_FRAME_PAYLOAD + 1` must
+        // also be rejected. The cap check uses strict
+        // greater-than, so a frame at exactly the cap is allowed
+        // (covered by `parse_accepts_at_cap_payload`).
+        let just_over = ShmMessage {
+            msg_type: MSG_TYPE_STIMULUS,
+            length: MAX_BULK_FRAME_PAYLOAD + 1,
+            crc32: 0,
+            _pad: 0,
+        };
+        // Construct a buffer that DOES contain enough bytes to
+        // satisfy the announced length, so the cap check, not the
+        // truncation check, is the rejection path under test.
+        let mut buf = Vec::with_capacity(FRAME_HEADER_SIZE + just_over.length as usize);
+        buf.extend_from_slice(just_over.as_bytes());
+        buf.resize(FRAME_HEADER_SIZE + just_over.length as usize, 0xAA);
+        let r2 = parse_tlv_stream(&buf);
+        assert!(
+            r2.entries.is_empty(),
+            "header announcing cap + 1 must be rejected by the per-frame cap check"
+        );
+    }
+
+    /// Boundary: a frame with `length == MAX_BULK_FRAME_PAYLOAD`
+    /// must be accepted. The cap check uses strict greater-than
+    /// so a payload that exactly hits the cap is legitimate.
+    #[test]
+    fn parse_accepts_at_cap_payload() {
+        let max_payload = vec![0x55u8; MAX_BULK_FRAME_PAYLOAD as usize];
+        let bytes = frame_bytes(MSG_TYPE_STIMULUS, &max_payload);
+        let r = parse_tlv_stream(&bytes);
+        assert_eq!(
+            r.entries.len(),
+            1,
+            "frame with length == cap must be accepted"
+        );
+        assert_eq!(r.entries[0].payload.len(), MAX_BULK_FRAME_PAYLOAD as usize);
+        assert!(r.entries[0].crc_ok);
+    }
+
+    /// A valid frame followed by an oversized header: the walk
+    /// returns the valid frame and stops at the oversized header.
+    /// Pins that the cap check breaks the walk cleanly without
+    /// dropping already-parsed entries.
+    #[test]
+    fn parse_returns_valid_frame_then_stops_at_oversized() {
+        use zerocopy::IntoBytes;
+        let mut combined = Vec::new();
+        combined.extend_from_slice(&frame_bytes(MSG_TYPE_EXIT, b"valid"));
+        let bad = ShmMessage {
+            msg_type: MSG_TYPE_STIMULUS,
+            length: u32::MAX,
+            crc32: 0,
+            _pad: 0,
+        };
+        combined.extend_from_slice(bad.as_bytes());
+        // Trailing bytes — a hostile guest can pad whatever it
+        // likes after the bogus header.
+        combined.extend_from_slice(b"residue");
+        let r = parse_tlv_stream(&combined);
+        assert_eq!(
+            r.entries.len(),
+            1,
+            "valid frame must be returned even though the next header is bogus"
+        );
+        assert_eq!(r.entries[0].payload, b"valid");
+        assert!(r.entries[0].crc_ok);
     }
 }

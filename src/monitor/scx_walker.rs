@@ -86,6 +86,20 @@ const MAX_RHT_NODES: u32 = 8192;
 /// protect freeze-path latency.
 const MAX_RHT_BUCKETS: u32 = 65_536;
 
+/// Maximum nodes any single rhashtable bucket chain visits before
+/// bailing. A healthy rhashtable holds ~1 element per bucket on
+/// average; a pathological chain of 1024 entries in one bucket is
+/// orders of magnitude beyond legitimate use and almost certainly
+/// indicates a corrupted `next` chain or torn read. Bounded
+/// independently of [`MAX_RHT_NODES`] so a single runaway bucket
+/// cannot starve the walk's per-bucket budget on the way to the
+/// global cap. The condition `chain_visited < PER_BUCKET_CHAIN_CAP`
+/// admits exactly 1024 body executions: chain_visited starts at 0
+/// and increments inside the loop body, so the comparison reads
+/// 0,1,...,1023 across the 1024 iterations and exits on the next
+/// check (1024 < 1024 is false).
+const PER_BUCKET_CHAIN_CAP: u32 = 1024;
+
 /// Snapshot of one CPU's `struct rq.scx` state at freeze time.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -619,11 +633,27 @@ pub fn walk_scx_tasks_global(
 /// tasks queued on a DSQ are staged for dispatch, not yet runnable
 /// in the rq->scx sense).
 ///
-/// `rq_kvas` and `rq_pas` index by CPU id (parallel arrays, same
-/// shape `walk_rq_scx` consumes). Empty arrays mean "no CPUs walked
-/// successfully"; the caller's freeze-path retry guard normally
-/// rejects an empty `per_cpu_offsets` array before reaching this
-/// pass.
+/// `rq_kvas`, `rq_pas`, and `per_cpu_offsets` index by CPU id
+/// (parallel arrays, same shape `walk_rq_scx` consumes). The walker
+/// skips BSS-zero-tail CPUs by checking the per-CPU offset directly
+/// (`per_cpu_offsets[cpu] == 0 && cpu > 0`) — those entries fall out
+/// of un-written `__per_cpu_offset[]` slots past `nr_cpu_ids` and
+/// would otherwise surface a phantom DSQ row at the bare `runqueues`
+/// symbol KVA. Comparing the resolved `rq_kva` against `rq_kvas[0]`
+/// would miss the alias on x86_64 SMP: `setup_per_cpu_areas`
+/// (`arch/x86/kernel/setup_percpu.c`) writes
+/// `__per_cpu_offset[cpu] = delta + pcpu_unit_offsets[cpu]` with
+/// `delta = pcpu_base_addr - __per_cpu_start` non-zero, so CPU 0's
+/// `rq_kva` is `runqueues + delta` while a BSS-zero-tail CPU's is
+/// `runqueues + 0` — the two differ and `rq_kva == rq_kvas[0]` would
+/// let the phantom row through. Mirrors the canonical `cpu_off == 0
+/// && cpu_index > 0` guard
+/// [`super::bpf_map::read_percpu_array_value`] applies for percpu
+/// reads, expressed against the same `__per_cpu_offset[]` array.
+///
+/// Empty arrays mean "no CPUs walked successfully"; the caller's
+/// freeze-path retry guard normally rejects empty inputs before
+/// reaching this pass.
 ///
 /// `None` return when any required offset sub-group is missing
 /// (`rq`, `scx_rq`, `dsq`, `dsq_lnode`, `task`, `see` — the same
@@ -634,6 +664,7 @@ pub fn walk_local_dsqs(
     kernel: &GuestKernel<'_>,
     rq_kvas: &[u64],
     rq_pas: &[u64],
+    per_cpu_offsets: &[u64],
     offsets: &ScxWalkerOffsets,
 ) -> Option<(Vec<DsqState>, Vec<TaskWalkerEntry>)> {
     let Some(rq_offs) = offsets.rq.as_ref() else {
@@ -686,6 +717,35 @@ pub fn walk_local_dsqs(
     let mut entries: Vec<TaskWalkerEntry> = Vec::new();
 
     for (cpu, (&rq_kva, &rq_pa)) in rq_kvas.iter().zip(rq_pas.iter()).enumerate() {
+        // BSS-zero-tail guard: kernel `setup_per_cpu_areas`
+        // only writes `__per_cpu_offset[cpu]` for CPUs in
+        // `for_each_possible_cpu`, leaving slots beyond
+        // `nr_cpu_ids` at the BSS-initialized 0. The caller
+        // builds rq_kvas via `runqueues + per_cpu_offset[cpu]`,
+        // so a BSS-zero-tail entry produces an rq_kva of
+        // `runqueues + 0` instead of CPU 0's
+        // `runqueues + __per_cpu_offset[0]`. The two are NOT
+        // equal on x86_64 SMP because
+        // `__per_cpu_offset[0] = pcpu_base_addr - __per_cpu_start`
+        // is non-zero (`arch/x86/kernel/setup_percpu.c`); a
+        // resolved-rq_kva comparison would let the phantom
+        // BSS-zero entry through. Check the per-CPU offset
+        // directly instead — `cpu_off == 0 && cpu > 0` is the
+        // canonical guard
+        // [`super::bpf_map::read_percpu_array_value`] uses for
+        // percpu reads and the matching guard at the per-CPU
+        // bypass DSQ pass below. A `per_cpu_offsets` slice
+        // shorter than `rq_kvas` (length-mismatched caller)
+        // is treated conservatively: an absent offset for
+        // `cpu > 0` skips the slot, since the walker can't
+        // distinguish a real CPU from a BSS-zero tail without
+        // the offset.
+        let cpu_off = per_cpu_offsets.get(cpu).copied();
+        match cpu_off {
+            Some(off) if off == 0 && cpu > 0 => continue,
+            None if cpu > 0 => continue,
+            _ => {}
+        }
         let local_dsq_off = rq_offs.scx + scx_rq_offs.local_dsq;
         let dsq_kva = rq_kva.wrapping_add(local_dsq_off as u64);
         let dsq_pa = rq_pa.wrapping_add(local_dsq_off as u64);
@@ -694,7 +754,7 @@ pub fn walk_local_dsqs(
             walk,
             dsq_kva,
             dsq_pa,
-            format!("local cpu {cpu}"),
+            || format!("local cpu {cpu}"),
             dsq_offs,
             dsq_lnode_offs,
             task_offs,
@@ -801,7 +861,7 @@ pub fn walk_dsqs(
                     walk,
                     dsq_kva,
                     dsq_pa,
-                    format!("bypass cpu {cpu}"),
+                    || format!("bypass cpu {cpu}"),
                     dsq_offs,
                     dsq_lnode_offs,
                     task_offs,
@@ -856,7 +916,7 @@ pub fn walk_dsqs(
                     walk,
                     dsq_kva,
                     dsq_pa,
-                    format!("global node {node}"),
+                    || format!("global node {node}"),
                     dsq_offs,
                     dsq_lnode_offs,
                     task_offs,
@@ -877,7 +937,22 @@ pub fn walk_dsqs(
         // dsq_hash is embedded in scx_sched (not a pointer); rht_kva
         // here is a KVA we can translate directly. The walker reads
         // it via the rht sub-group offsets.
-        let user_dsqs = walk_user_dsq_hash(mem, walk, rht_kva, rht_offs, dsq_offs);
+        let (user_dsqs, user_dsqs_truncated) =
+            walk_user_dsq_hash(mem, walk, rht_kva, rht_offs, dsq_offs);
+        if user_dsqs_truncated {
+            // Surface the cap-hit so an operator parsing the
+            // failure dump trace sees that the user-DSQ list is
+            // partial. Without this log the dump silently
+            // omits the tail of the dsq_hash bucket table or
+            // the tail of one bucket's chain.
+            tracing::warn!(
+                visited = user_dsqs.len(),
+                cap_buckets = MAX_RHT_BUCKETS,
+                cap_nodes = MAX_RHT_NODES,
+                "walk_user_dsq_hash: truncated — bucket-table or node cap fired; \
+                 dsq_kvas list is incomplete",
+            );
+        }
         for dsq_kva in user_dsqs {
             let Some(dsq_pa) = translate_any_kva(
                 mem,
@@ -894,7 +969,7 @@ pub fn walk_dsqs(
                 walk,
                 dsq_kva,
                 dsq_pa,
-                "user".to_string(),
+                || "user".to_string(),
                 dsq_offs,
                 dsq_lnode_offs,
                 task_offs,
@@ -911,18 +986,41 @@ pub fn walk_dsqs(
 
 /// Walk one `scx_dispatch_q`. Returns the DSQ scalar state plus the
 /// task entries on its `list`.
+///
+/// `origin` is taken as a `FnOnce` closure so the per-call
+/// `format!("local cpu {cpu}")` / `format!("bypass cpu {cpu}")` /
+/// `format!("global node {node}")` heap allocation only fires
+/// after the `dsq_pa == 0` early-out has been cleared. Eagerly
+/// formatting at every caller wasted one short-string allocation
+/// per skipped DSQ on every freeze.
+///
+/// Returns `None` when `dsq_pa == 0`. Reading at PA 0 would
+/// surface the boot-page contents as DSQ scalars (`id`, `nr`,
+/// `seq`) and an all-zero list-head as an apparently-empty queue
+/// — indistinguishable from a real empty DSQ. The early check
+/// rejects that case so the caller does not push a phantom
+/// DsqState row built from PA-0 garbage.
 #[allow(clippy::too_many_arguments)]
 fn walk_one_dsq(
     mem: &GuestMem,
     walk: WalkContext,
     dsq_kva: u64,
     dsq_pa: u64,
-    origin: String,
+    origin: impl FnOnce() -> String,
     dsq_offs: &super::btf_offsets::ScxDispatchQOffsets,
     dsq_lnode_offs: &super::btf_offsets::ScxDsqListNodeOffsets,
     task_offs: &super::btf_offsets::TaskStructCoreOffsets,
     see_offs: &super::btf_offsets::SchedExtEntityOffsets,
 ) -> Option<(DsqState, Vec<TaskWalkerEntry>)> {
+    if dsq_pa == 0 {
+        tracing::debug!(
+            dsq_kva = format_args!("{:#x}", dsq_kva),
+            "walk_one_dsq: dsq_pa == 0 — would alias the boot page; \
+             skipping to avoid surfacing phantom all-zero DSQ state",
+        );
+        return None;
+    }
+    let origin = origin();
     let id = mem.read_u64(dsq_pa, dsq_offs.id);
     let nr = mem.read_u32(dsq_pa, dsq_offs.nr);
     let seq = mem.read_u32(dsq_pa, dsq_offs.seq);
@@ -1062,7 +1160,15 @@ fn walk_list_head_for_dsq_task_kvas(
         let lnode_kva = node_kva.wrapping_sub(dsq_lnode_offs.node as u64);
 
         // Read the lnode's flags to skip iterator-cursor entries.
-        if let Some(lnode_pa) = translate_any_kva(
+        // is_cursor: Some(true) → cursor (skip), Some(false) → real
+        // task entry (push), None → translate failed and we cannot
+        // distinguish. When the cursor flag cannot be read, treat
+        // the entry as a cursor and skip it: pushing it would
+        // record a phantom `task_kva = node_kva - dsq_node_off_in_task`
+        // built from a node whose enclosing sched_ext_entity isn't
+        // mappable, which downstream task enrichment would surface
+        // as bogus pid/comm reads at an arbitrary address.
+        let is_cursor = match translate_any_kva(
             mem,
             walk.cr3_pa,
             walk.page_offset,
@@ -1070,34 +1176,30 @@ fn walk_list_head_for_dsq_task_kvas(
             walk.l5,
             walk.tcr_el1,
         ) {
-            let lnode_flags = mem.read_u32(lnode_pa, dsq_lnode_offs.flags);
-            if lnode_flags & SCX_DSQ_LNODE_ITER_CURSOR != 0 {
-                // Cursor entry — advance without recording.
-                let Some(node_pa) = translate_any_kva(
-                    mem,
-                    walk.cr3_pa,
-                    walk.page_offset,
-                    node_kva,
-                    walk.l5,
-                    walk.tcr_el1,
-                ) else {
-                    return (task_kvas, false);
-                };
-                let next_kva = mem.read_u64(node_pa, 0);
-                if next_kva == 0 {
-                    return (task_kvas, false);
-                }
-                node_kva = next_kva;
-                continue;
+            Some(lnode_pa) => {
+                let lnode_flags = mem.read_u32(lnode_pa, dsq_lnode_offs.flags);
+                Some(lnode_flags & SCX_DSQ_LNODE_ITER_CURSOR != 0)
             }
+            None => None,
+        };
+
+        let skip_entry = match is_cursor {
+            Some(true) => true,  // cursor entry — advance without recording
+            Some(false) => false, // real task entry — push and advance
+            None => true,        // cursor-detection unreliable — skip rather than push bogus
+        };
+
+        if !skip_entry {
+            // Real task entry: container_of from the inner list_head's
+            // node_kva back to task_struct. The full offset within
+            // task_struct is task.scx + see.dsq_list + dsq_lnode.node.
+            let task_kva = node_kva.wrapping_sub(dsq_node_off_in_task as u64);
+            task_kvas.push(task_kva);
         }
 
-        // Real task entry: container_of from the inner list_head's
-        // node_kva back to task_struct. The full offset within
-        // task_struct is task.scx + see.dsq_list + dsq_lnode.node.
-        let task_kva = node_kva.wrapping_sub(dsq_node_off_in_task as u64);
-        task_kvas.push(task_kva);
-
+        // Advance to the next node. The list_head.next pointer
+        // lives at offset 0 of the inner list_head we landed on,
+        // which is `node_kva` itself.
         let Some(node_pa) = translate_any_kva(
             mem,
             walk.cr3_pa,
@@ -1129,13 +1231,23 @@ fn walk_list_head_for_dsq_task_kvas(
 /// Caps:
 /// - bucket count at [`MAX_RHT_BUCKETS`]
 /// - total nodes visited at [`MAX_RHT_NODES`]
+/// - per-bucket chain length at [`PER_BUCKET_CHAIN_CAP`]
+///
+/// Returns `(dsq_kvas, truncated)`. `truncated` is `true` when any
+/// cap fired before the walk could reach the natural end of every
+/// bucket chain — either `bucket_table.size > MAX_RHT_BUCKETS`,
+/// `total_nodes >= MAX_RHT_NODES` mid-walk, or a per-bucket chain
+/// reached its `PER_BUCKET_CHAIN_CAP` cap. Without this signal,
+/// callers cannot distinguish "small DSQ count" from "cap silently
+/// dropped tail entries" — see DsqState.truncated for the same
+/// pattern on per-DSQ task lists.
 fn walk_user_dsq_hash(
     mem: &GuestMem,
     walk: WalkContext,
     rht_kva: u64,
     rht_offs: &super::btf_offsets::RhashtableOffsets,
     dsq_offs: &super::btf_offsets::ScxDispatchQOffsets,
-) -> Vec<u64> {
+) -> (Vec<u64>, bool) {
     let mut dsq_kvas = Vec::new();
 
     let Some(rht_pa) = translate_any_kva(
@@ -1146,12 +1258,12 @@ fn walk_user_dsq_hash(
         walk.l5,
         walk.tcr_el1,
     ) else {
-        return dsq_kvas;
+        return (dsq_kvas, false);
     };
 
     let tbl_kva = mem.read_u64(rht_pa, rht_offs.tbl);
     if tbl_kva == 0 {
-        return dsq_kvas;
+        return (dsq_kvas, false);
     }
     let Some(tbl_pa) = translate_any_kva(
         mem,
@@ -1161,17 +1273,22 @@ fn walk_user_dsq_hash(
         walk.l5,
         walk.tcr_el1,
     ) else {
-        return dsq_kvas;
+        return (dsq_kvas, false);
     };
 
     let size = mem.read_u32(tbl_pa, rht_offs.bucket_table_size);
     let bucket_count = size.min(MAX_RHT_BUCKETS) as u64;
+    // A bucket_table.size larger than the bucket cap means we'll
+    // walk only the first MAX_RHT_BUCKETS buckets and the tail is
+    // silently dropped. Surface that as truncation up front.
+    let mut truncated = size as u64 > bucket_count;
     let buckets_off = rht_offs.bucket_table_buckets;
 
     let mut total_nodes: u32 = 0;
     for i in 0..bucket_count {
         if total_nodes >= MAX_RHT_NODES {
-            return dsq_kvas;
+            // Hit the global node cap — remaining buckets unwalked.
+            return (dsq_kvas, true);
         }
         let entry_off = buckets_off + (i as usize) * 8;
         let raw_ptr = mem.read_u64(tbl_pa, entry_off);
@@ -1186,7 +1303,11 @@ fn walk_user_dsq_hash(
         // `hash_node`; container_of yields the dsq KVA.
         let mut node_kva = head_kva;
         let mut chain_visited: u32 = 0;
-        while node_kva != 0 && total_nodes < MAX_RHT_NODES && chain_visited < 1024 {
+        let mut chain_terminated_naturally = false;
+        while node_kva != 0
+            && total_nodes < MAX_RHT_NODES
+            && chain_visited < PER_BUCKET_CHAIN_CAP
+        {
             chain_visited += 1;
             total_nodes += 1;
             let dsq_kva = node_kva.wrapping_sub(dsq_offs.hash_node as u64);
@@ -1199,6 +1320,9 @@ fn walk_user_dsq_hash(
                 walk.l5,
                 walk.tcr_el1,
             ) else {
+                // Translate failure — chain ended for this bucket
+                // without hitting a cap. Not a truncation signal.
+                chain_terminated_naturally = true;
                 break;
             };
             let next_raw = mem.read_u64(node_pa, rht_offs.rhash_head_next);
@@ -1206,13 +1330,22 @@ fn walk_user_dsq_hash(
             // set encoding the bucket index; treat any LSB-tagged
             // pointer as terminator.
             if next_raw & RHT_PTR_LOCK_BIT != 0 || next_raw == 0 {
+                chain_terminated_naturally = true;
                 break;
             }
             node_kva = next_raw;
         }
+        // The loop exited; if it wasn't via a natural terminator
+        // (LSB-tagged pointer / NULL / translate failure), one of
+        // the two caps fired (chain_visited >= PER_BUCKET_CHAIN_CAP
+        // or total_nodes >= MAX_RHT_NODES) and we silently dropped
+        // the rest of this bucket's chain.
+        if !chain_terminated_naturally {
+            truncated = true;
+        }
     }
 
-    dsq_kvas
+    (dsq_kvas, truncated)
 }
 
 /// Read `(pid, comm)` for a `task_struct *` after a NULL-check and
@@ -1946,7 +2079,7 @@ mod tests {
             rht: None,
         };
 
-        let r = walk_local_dsqs(&kernel, &[], &[], &offsets);
+        let r = walk_local_dsqs(&kernel, &[], &[], &[], &offsets);
         assert!(r.is_none(), "missing offsets must gate to None");
     }
 
@@ -2028,7 +2161,10 @@ mod tests {
             rht: None,
         };
 
-        let (states, entries) = walk_local_dsqs(&kernel, &[rq_kva], &[rq_pa], &offsets)
+        // Single-CPU per_cpu_offsets: cpu 0 has any offset (BSP can
+        // legitimately be 0 — only `cpu_off == 0 && cpu > 0` triggers
+        // the BSS-zero-tail skip).
+        let (states, entries) = walk_local_dsqs(&kernel, &[rq_kva], &[rq_pa], &[0], &offsets)
             .expect("offsets present, should yield Some");
         assert_eq!(states.len(), 1, "one CPU → one DSQ state");
         assert_eq!(states[0].origin, "local cpu 0");
@@ -2316,9 +2452,16 @@ mod tests {
         );
 
         let offsets = dsq_test_offsets();
-        let (states, entries) =
-            walk_local_dsqs(&kernel, &[cpu0_rq, cpu1_rq], &[cpu0_rq, cpu1_rq], &offsets)
-                .expect("offsets present, should yield Some");
+        // Both CPUs onlined: per_cpu_offsets non-zero for cpu>0
+        // (otherwise the BSS-zero-tail guard would skip cpu 1).
+        let (states, entries) = walk_local_dsqs(
+            &kernel,
+            &[cpu0_rq, cpu1_rq],
+            &[cpu0_rq, cpu1_rq],
+            &[0, 0x1000],
+            &offsets,
+        )
+        .expect("offsets present, should yield Some");
 
         assert_eq!(
             states.len(),
@@ -2334,6 +2477,141 @@ mod tests {
         assert_eq!(cpu0.seq, 10);
         // entries vec contains exactly the CPU 0 task.
         assert_eq!(entries.len(), 1);
+    }
+
+    /// BSS-zero-tail guard: `__per_cpu_offset[]` is BSS-zero for
+    /// CPU slots beyond `nr_cpu_ids` because `setup_per_cpu_areas`
+    /// only writes the slots in `for_each_possible_cpu`. The walker
+    /// must check `per_cpu_offsets[cpu] == 0 && cpu > 0` to skip
+    /// those slots; otherwise it surfaces phantom DSQ rows for
+    /// un-onlined CPUs. The phantom rows would land at the bare
+    /// `runqueues` symbol KVA (rq_kva = runqueues + 0), aliasing
+    /// neither CPU 0's KVA (runqueues + delta on x86_64 SMP) nor
+    /// each other in any well-formed way — a resolved-rq_kva
+    /// comparison cannot detect the alias on x86_64 SMP because
+    /// `__per_cpu_offset[0]` is non-zero (`delta = pcpu_base_addr -
+    /// __per_cpu_start`, see `arch/x86/kernel/setup_percpu.c`).
+    #[test]
+    fn walk_local_dsqs_skips_bss_zero_tail_aliases() {
+        // Layout (page_offset = 0; identity translation):
+        //   CPU 0: per_cpu_offset = 0x100; rq_kva = rq_pa = 0x100.
+        //          Empty list head at PA 0x100.
+        //   CPU 1, 2, 3: per_cpu_offset = 0 (BSS-zero tail).
+        //
+        // CPU 0's rq_kva is NOT shared by the BSS-zero entries
+        // (their rq_kva would be `runqueues + 0` = 0, not 0x100),
+        // so the old `rq_kva == rq_kvas[0]` guard would not catch
+        // them — on x86_64 SMP, the legitimate CPU 0 entry is the
+        // ONLY one with rq_kva == runqueues + per_cpu_offset[0].
+        // A correct walker emits one DsqState (CPU 0) using the
+        // `cpu_off == 0 && cpu > 0` check; a regressed walker
+        // emits four (or three, if the old guard caught some
+        // accidental alias). Pinning len() == 1 makes the
+        // regression visible.
+        let mut buf = vec![0u8; 0x1000];
+        let cpu0_rq: u64 = 0x100;
+        // CPU 0 list: head.next = head_kva (empty).
+        buf[cpu0_rq as usize..cpu0_rq as usize + 8].copy_from_slice(&cpu0_rq.to_le_bytes());
+
+        let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
+        let kernel = super::super::guest::GuestKernel::new_for_test(
+            &mem,
+            std::collections::HashMap::new(),
+            0,
+            0,
+            false,
+        );
+
+        let offsets = dsq_test_offsets();
+        // For the BSS-zero tail entries, the caller would actually
+        // pass an rq_kva of `runqueues + 0`; the test mirrors the
+        // production rq_kvas here (every entry equals cpu0_rq) so
+        // a regressed `rq_kva == rq_kvas[0]` walker would still
+        // catch the alias. The new guard ignores rq_kvas entirely
+        // and gates on per_cpu_offsets — so the BSS-zero entries
+        // are skipped for that reason instead.
+        let (states, entries) = walk_local_dsqs(
+            &kernel,
+            &[cpu0_rq, cpu0_rq, cpu0_rq, cpu0_rq],
+            &[cpu0_rq, cpu0_rq, cpu0_rq, cpu0_rq],
+            &[0x100, 0, 0, 0], // CPU 0 onlined; CPUs 1-3 BSS-zero
+            &offsets,
+        )
+        .expect("offsets present, should yield Some");
+        assert_eq!(
+            states.len(),
+            1,
+            "BSS-zero-tail aliases must be skipped; only CPU 0 surfaces"
+        );
+        assert_eq!(states[0].origin, "local cpu 0");
+        assert!(entries.is_empty());
+    }
+
+    /// Regression: x86_64 SMP layout where `__per_cpu_offset[0]` is
+    /// non-zero (the production case — `delta = pcpu_base_addr -
+    /// __per_cpu_start` is positive when the percpu allocator places
+    /// its base outside the static `.data..percpu` region, see
+    /// `setup_per_cpu_areas` in `arch/x86/kernel/setup_percpu.c`).
+    /// CPU 0's `rq_kva = runqueues + delta` differs from a BSS-zero
+    /// tail entry's `rq_kva = runqueues + 0`, so the prior
+    /// `rq_kva == rq_kvas[0]` guard would NOT catch the alias and
+    /// would surface a phantom DSQ row. The new
+    /// `per_cpu_offsets[cpu] == 0 && cpu > 0` guard catches it
+    /// regardless of how the resolved KVAs compare.
+    #[test]
+    fn walk_local_dsqs_skips_bss_zero_tail_with_nonzero_cpu0_offset() {
+        // Layout (page_offset = 0; identity translation):
+        //   runqueues_pa  = 0x300 (a non-zero "runqueues" KVA so a
+        //                          BSS-zero entry's rq_pa is also
+        //                          non-zero — `walk_one_dsq` skips
+        //                          dsq_pa==0, which would otherwise
+        //                          mask a regressed guard).
+        //   per_cpu_offset[0] = 0x100; rq_pa[0] = 0x400 (delta).
+        //   per_cpu_offset[1] = 0;     rq_pa[1] = 0x300 (BSS-zero).
+        // CPU 0's rq_pa (0x400) differs from CPU 1's BSS rq_pa
+        // (0x300); the prior `rq_kva == rq_kvas[0]` guard would
+        // NOT catch the alias because the two PAs are distinct.
+        // The new guard catches it via `cpu_off == 0 && cpu > 0`.
+        let runqueues_pa: u64 = 0x300;
+        let cpu0_rq: u64 = runqueues_pa + 0x100; // 0x400
+        let bss_rq: u64 = runqueues_pa; // 0x300
+        let mut buf = vec![0u8; 0x1000];
+        // Stamp empty-list heads at BOTH addresses so a regressed
+        // walker would surface DsqState rows for both. The post-
+        // guard list walk reads head.next at offset 0; pointing
+        // it at itself terminates the list immediately.
+        buf[cpu0_rq as usize..cpu0_rq as usize + 8].copy_from_slice(&cpu0_rq.to_le_bytes());
+        buf[bss_rq as usize..bss_rq as usize + 8].copy_from_slice(&bss_rq.to_le_bytes());
+
+        let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
+        let kernel = super::super::guest::GuestKernel::new_for_test(
+            &mem,
+            std::collections::HashMap::new(),
+            0,
+            0,
+            false,
+        );
+
+        let offsets = dsq_test_offsets();
+        let (states, _entries) = walk_local_dsqs(
+            &kernel,
+            &[cpu0_rq, bss_rq],
+            &[cpu0_rq, bss_rq],
+            &[0x100, 0], // CPU 0 onlined (delta=0x100); CPU 1 BSS-zero
+            &offsets,
+        )
+        .expect("offsets present, should yield Some");
+        // The new guard skips CPU 1 because per_cpu_offset[1] == 0.
+        // If the walker compared resolved KVAs (`rq_kva == rq_kvas[0]`)
+        // instead, it would see cpu0_rq != bss_rq and emit a phantom
+        // row for CPU 1. Pinning len() == 1 catches that regression.
+        assert_eq!(
+            states.len(),
+            1,
+            "BSS-zero entry must be skipped via cpu_off==0 guard \
+             even when its rq_pa differs from rq_pas[0]"
+        );
+        assert_eq!(states[0].origin, "local cpu 0");
     }
 
     /// REQ 2: read_scx_sched_state with `offsets.sched = None` —
@@ -2483,6 +2761,213 @@ mod tests {
         assert_eq!(
             state.bypass_depth, 0,
             "bypass_depth=None must default to 0, NOT read sched_pa+0"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // walk_user_dsq_hash truncation-cap tests
+    //
+    // walk_user_dsq_hash bounds the walk on three independent caps
+    // (MAX_RHT_BUCKETS, MAX_RHT_NODES, PER_BUCKET_CHAIN_CAP). Each
+    // cap must set the returned `truncated` flag so the failure-dump
+    // consumer can distinguish "small DSQ count" from "cap silently
+    // dropped tail entries."
+    // ---------------------------------------------------------------
+
+    /// Build a minimal `RhashtableOffsets` fixture whose every offset
+    /// is small and consistent: tbl at 0, bucket_table.size at 0,
+    /// bucket_table.buckets at 16, rhash_head.next at 0. Used by the
+    /// three truncation tests below.
+    fn rht_test_offsets() -> super::super::btf_offsets::RhashtableOffsets {
+        super::super::btf_offsets::RhashtableOffsets {
+            tbl: 0,
+            nelems: 8,
+            bucket_table_size: 0,
+            bucket_table_buckets: 16,
+            rhash_head_next: 0,
+        }
+    }
+
+    /// Build a minimal `ScxDispatchQOffsets` with `hash_node = 0` so
+    /// container_of yields the node KVA unchanged. Tests below assert
+    /// truncation flags, not container_of math.
+    fn dsq_test_offsets_for_hash() -> super::super::btf_offsets::ScxDispatchQOffsets {
+        super::super::btf_offsets::ScxDispatchQOffsets {
+            list: 0,
+            nr: 16,
+            seq: 20,
+            id: 24,
+            hash_node: 0,
+        }
+    }
+
+    /// Per-bucket chain cap (`PER_BUCKET_CHAIN_CAP`): a single
+    /// bucket's chain that doesn't terminate naturally must set
+    /// `truncated = true` after exactly `PER_BUCKET_CHAIN_CAP`
+    /// visits. The fixture uses a 2-node cycle so the chain has no
+    /// natural terminator; the walker bails on the per-bucket cap
+    /// and the post-loop check sets truncated.
+    #[test]
+    fn walk_user_dsq_hash_per_bucket_chain_cap_truncates() {
+        // Layout (page_offset = 0; identity translation):
+        //   rht_pa = 0x100  (struct rhashtable; .tbl at offset 0 = 8 bytes)
+        //   tbl_pa = 0x200  (bucket_table; size at off 0, buckets at off 16)
+        //   node_a = 0x300, node_b = 0x308: cycle (next-pointer at off 0 each)
+        //   tbl.size = 1; buckets[0] = node_a (no LSB tag).
+        //
+        // Walker chases node_a → node_b → node_a → ... until
+        // chain_visited reaches PER_BUCKET_CHAIN_CAP. 1024 visits,
+        // cap fires, post-loop sets truncated=true.
+        let mut buf = vec![0u8; 0x1000];
+        let rht_pa: u64 = 0x100;
+        let tbl_kva: u64 = 0x200;
+        let tbl_pa: u64 = 0x200;
+        let node_a: u64 = 0x300;
+        let node_b: u64 = 0x308;
+
+        // rht.tbl = tbl_kva
+        buf[rht_pa as usize..rht_pa as usize + 8].copy_from_slice(&tbl_kva.to_le_bytes());
+        // tbl.size = 1 (one bucket)
+        buf[tbl_pa as usize..tbl_pa as usize + 4].copy_from_slice(&1u32.to_le_bytes());
+        // buckets[0] = node_a
+        buf[(tbl_pa + 16) as usize..(tbl_pa + 16) as usize + 8]
+            .copy_from_slice(&node_a.to_le_bytes());
+        // node_a.next = node_b (LSB clear → not terminator)
+        buf[node_a as usize..node_a as usize + 8].copy_from_slice(&node_b.to_le_bytes());
+        // node_b.next = node_a (close the cycle, LSB clear)
+        buf[node_b as usize..node_b as usize + 8].copy_from_slice(&node_a.to_le_bytes());
+
+        let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
+        let rht_offs = rht_test_offsets();
+        let dsq_offs = dsq_test_offsets_for_hash();
+
+        let (dsq_kvas, truncated) =
+            walk_user_dsq_hash(&mem, WalkContext::default(), rht_pa, &rht_offs, &dsq_offs);
+
+        assert!(
+            truncated,
+            "per-bucket chain cap must set truncated=true on a non-terminating chain",
+        );
+        assert_eq!(
+            dsq_kvas.len(),
+            PER_BUCKET_CHAIN_CAP as usize,
+            "PER_BUCKET_CHAIN_CAP must admit exactly {} chain visits",
+            PER_BUCKET_CHAIN_CAP,
+        );
+    }
+
+    /// Global node cap (`MAX_RHT_NODES`): when the cumulative node
+    /// count across multiple buckets reaches `MAX_RHT_NODES`, the
+    /// walker must set `truncated = true` and stop visiting further
+    /// buckets. This test constructs `MAX_RHT_NODES + 1` buckets each
+    /// with a single-node chain that terminates naturally; the
+    /// per-bucket cap never fires (each chain has 1 entry). Truncation
+    /// fires only via the global cap.
+    #[test]
+    fn walk_user_dsq_hash_global_node_cap_truncates() {
+        // Layout (page_offset = 0; identity translation):
+        //   rht_pa = 0x100         (.tbl at offset 0)
+        //   tbl_pa = 0x1000        (size at 0, buckets at 16)
+        //   shared_node = 0x40000  (next field at offset 0 = 0 → terminator)
+        //   tbl.size = MAX_RHT_NODES + 1 = 8193 buckets, each pointing
+        //   at shared_node.
+        //
+        // Walker enters each bucket, walks 1 node (push, total++),
+        // reads next=0 → break with chain_terminated_naturally=true.
+        // After bucket 8191, total=MAX_RHT_NODES (8192). Entering
+        // bucket 8192, the pre-loop `total_nodes >= MAX_RHT_NODES`
+        // gate returns truncated=true.
+        let bucket_count: u32 = MAX_RHT_NODES + 1;
+        let rht_pa: u64 = 0x100;
+        let tbl_kva: u64 = 0x1000;
+        let tbl_pa: u64 = 0x1000;
+        let buckets_off: u64 = 16;
+        let shared_node: u64 = 0x40000;
+
+        // Buffer must cover: rht (0x100..0x108), tbl (0x1000),
+        // buckets array (0x1010..0x1010 + bucket_count*8 = 0x1010 +
+        // 0x10008 = 0x11018), and shared_node (0x40000..0x40008).
+        let buf_size = (shared_node + 16) as usize;
+        let mut buf = vec![0u8; buf_size];
+
+        // rht.tbl = tbl_kva
+        buf[rht_pa as usize..rht_pa as usize + 8].copy_from_slice(&tbl_kva.to_le_bytes());
+        // tbl.size = bucket_count
+        buf[tbl_pa as usize..tbl_pa as usize + 4]
+            .copy_from_slice(&bucket_count.to_le_bytes());
+        // Stamp every bucket[i] = shared_node
+        for i in 0..bucket_count as u64 {
+            let off = (tbl_pa + buckets_off + i * 8) as usize;
+            buf[off..off + 8].copy_from_slice(&shared_node.to_le_bytes());
+        }
+        // shared_node.next = 0 (already zero from buffer init — explicit
+        // for clarity).
+        buf[shared_node as usize..shared_node as usize + 8].copy_from_slice(&0u64.to_le_bytes());
+
+        let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
+        let rht_offs = rht_test_offsets();
+        let dsq_offs = dsq_test_offsets_for_hash();
+
+        let (dsq_kvas, truncated) =
+            walk_user_dsq_hash(&mem, WalkContext::default(), rht_pa, &rht_offs, &dsq_offs);
+
+        assert!(
+            truncated,
+            "global node cap (MAX_RHT_NODES) must set truncated=true",
+        );
+        // The walker pushes one dsq per bucket up to MAX_RHT_NODES,
+        // then short-circuits — never enters bucket MAX_RHT_NODES.
+        assert_eq!(
+            dsq_kvas.len(),
+            MAX_RHT_NODES as usize,
+            "global cap halts the walk at exactly {} nodes",
+            MAX_RHT_NODES,
+        );
+    }
+
+    /// Bucket-table cap (`MAX_RHT_BUCKETS`): when
+    /// `bucket_table.size > MAX_RHT_BUCKETS`, the walker enumerates
+    /// only the first `MAX_RHT_BUCKETS` entries and sets
+    /// `truncated = true` upfront — the tail of the bucket table is
+    /// silently dropped. The fixture stamps `size = MAX_RHT_BUCKETS +
+    /// 1`; bucket reads past the buffer return 0 (empty bucket) so
+    /// the walker drains all 65536 reads with no chain work.
+    #[test]
+    fn walk_user_dsq_hash_bucket_table_cap_truncates() {
+        // Layout (page_offset = 0; identity translation):
+        //   rht_pa = 0x100   (.tbl at offset 0)
+        //   tbl_pa = 0x200   (size at 0, buckets at 16)
+        //   tbl.size = MAX_RHT_BUCKETS + 1 = 65537.
+        //
+        // The walker computes bucket_count = size.min(MAX_RHT_BUCKETS)
+        // = 65536, then `truncated = size as u64 > bucket_count`
+        // immediately fires. Subsequent bucket reads land outside the
+        // buffer and return 0 (empty bucket); no chains walked.
+        let mut buf = vec![0u8; 0x300];
+        let rht_pa: u64 = 0x100;
+        let tbl_kva: u64 = 0x200;
+        let tbl_pa: u64 = 0x200;
+
+        // rht.tbl = tbl_kva
+        buf[rht_pa as usize..rht_pa as usize + 8].copy_from_slice(&tbl_kva.to_le_bytes());
+        // tbl.size = MAX_RHT_BUCKETS + 1 → upfront truncation
+        let oversize: u32 = MAX_RHT_BUCKETS + 1;
+        buf[tbl_pa as usize..tbl_pa as usize + 4].copy_from_slice(&oversize.to_le_bytes());
+
+        let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
+        let rht_offs = rht_test_offsets();
+        let dsq_offs = dsq_test_offsets_for_hash();
+
+        let (dsq_kvas, truncated) =
+            walk_user_dsq_hash(&mem, WalkContext::default(), rht_pa, &rht_offs, &dsq_offs);
+
+        assert!(
+            truncated,
+            "bucket-table cap (size > MAX_RHT_BUCKETS) must set truncated=true upfront",
+        );
+        assert!(
+            dsq_kvas.is_empty(),
+            "all buckets read as 0 (out-of-buffer) → no DSQ KVAs collected",
         );
     }
 }

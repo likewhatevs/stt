@@ -71,10 +71,12 @@ fn test_local_storage_map_offsets() -> BpfMapOffsets {
 
 /// Build a minimal `BpfMapInfo` for the local-storage walker.
 fn make_storage_map(map_kva: u64, value_size: u32, map_type: u32) -> BpfMapInfo {
+    let (name_bytes, name_len) = super::name_from_str("test_storage");
     BpfMapInfo {
         map_pa: 0,
         map_kva,
-        name: "test_storage".into(),
+        name_bytes,
+        name_len,
         map_type,
         map_flags: 0,
         key_size: 0, // unused — walker emits owner KVA as the "key"
@@ -655,4 +657,107 @@ fn iter_local_storage_value_size_cap_returns_empty() {
         entries.is_empty(),
         "value_size > MAX_VALUE_SIZE must short-circuit"
     );
+}
+
+// -- owner==0 cache --
+//
+// `iter_local_storage_entries` caches `local_storage_kva ->
+// owner_kva` per walk. When the resolved owner is 0 (real null
+// owner field, OR translate_any_kva fails), the walker still
+// inserts 0 into the cache; subsequent selems pointing at the
+// same `local_storage_kva` hit the cached 0 and return it without
+// re-walking. Pin the behaviour so a regression that skipped the
+// `owner_cache.insert` on the 0-resolved path (turning every
+// repeat into a fresh translate) trips here.
+#[test]
+fn iter_local_storage_owner_zero_surfaces_zero_for_shared_entries() {
+    // Build a 2-element chain where both selems share one
+    // `bpf_local_storage` container. The shared container's owner
+    // field is left at zero (the buffer is zero-initialized; we
+    // skip the per-elem owner write so the stored owner is 0).
+    let v1 = vec![0xAAu8, 0xAA, 0, 0];
+    let v2 = vec![0xBBu8, 0xBB, 0, 0];
+    let mut scene = build_storage_scene(
+        1,
+        0,
+        &[vec![
+            (v1.clone(), 0u64, None),
+            (v2.clone(), 0u64, None),
+        ]],
+        4,
+        BPF_MAP_TYPE_TASK_STORAGE,
+    );
+
+    // Repoint elem 1's `elem.local_storage` field at elem 0's ls
+    // KVA so both selems resolve through the same cache key. The
+    // synthetic helper allocates one ls block per elem at
+    // `ls_start + elem_idx * ls_size`; we overwrite elem 1's
+    // pointer to elem 0's ls block. `ls_start = 0x10_0000` is the
+    // base the helper uses (matches `build_storage_scene`); a drift
+    // there would mis-target the shared-cache premise.
+    let ts = test_task_storage_offsets();
+    let ls_start: u64 = 0x10_0000;
+    let shared_ls_kva = scene.page_offset.wrapping_add(ls_start);
+    // Defensive: the ls block is zero-initialised by `vec![0u8; size]`,
+    // so its `owner` field is already 0 — exactly the "owner pointer
+    // resolves to 0" condition the cache should latch onto. Pin it
+    // explicitly so the test's premise survives a future change to
+    // the helper's default fill.
+    let owner_pa = ls_start + ts.ls_owner as u64;
+    scene.buf[owner_pa as usize..owner_pa as usize + 8]
+        .copy_from_slice(&0u64.to_ne_bytes());
+
+    // Elem 1's `elem_local_storage` field lives at
+    // `elem_pas[1] + ts.elem_local_storage`.
+    let elem1_ls_off =
+        scene.elem_pas[1] as usize + ts.elem_local_storage;
+    scene.buf[elem1_ls_off..elem1_ls_off + 8]
+        .copy_from_slice(&shared_ls_kva.to_ne_bytes());
+    // Sanity: elem 0's ls KVA must already point at the shared
+    // block (the scene helper writes
+    // `pa_to_kva(ls_start + 0 * ls_size)`, which equals
+    // `shared_ls_kva` by construction). Read it back to make the
+    // shared-cache premise explicit.
+    let elem0_ls_off =
+        scene.elem_pas[0] as usize + ts.elem_local_storage;
+    let elem0_ls_kva = u64::from_ne_bytes(
+        scene.buf[elem0_ls_off..elem0_ls_off + 8]
+            .try_into()
+            .unwrap(),
+    );
+    assert_eq!(
+        elem0_ls_kva, shared_ls_kva,
+        "test premise: both elems must address the same ls container",
+    );
+
+    // SAFETY: scene.buf is a live local Vec<u8> whose backing
+    // storage outlives the GuestMem use.
+    let mem = unsafe { GuestMem::new(scene.buf.as_ptr() as *mut u8, scene.buf.len() as u64) };
+    let entries = iter_local_storage_entries(
+        &lookup_ctx(&mem, 0, scene.page_offset, &scene.offsets, false),
+        &scene.map,
+    );
+    assert_eq!(
+        entries.len(),
+        2,
+        "both selems must surface; the cache short-circuit must NOT drop the second entry",
+    );
+    // First entry: cold miss, resolves owner=0, caches it.
+    assert_eq!(
+        entries[0].0,
+        0u64.to_le_bytes().to_vec(),
+        "first elem's owner field is 0 → owner_kva_le_bytes is all-zero",
+    );
+    assert_eq!(entries[0].1, v1);
+    // Second entry: cache hit on the same `local_storage_kva`.
+    // Returns the cached 0 without re-walking. Observable shape:
+    // owner_kva_le_bytes is all-zero, value_bytes still surfaces
+    // because the cache only short-circuits owner resolution, not
+    // the per-elem value read.
+    assert_eq!(
+        entries[1].0,
+        0u64.to_le_bytes().to_vec(),
+        "second elem hits the cached 0; owner_kva_le_bytes stays all-zero",
+    );
+    assert_eq!(entries[1].1, v2);
 }

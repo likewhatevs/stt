@@ -358,8 +358,36 @@ pub(crate) fn template_cache_key(fs: Filesystem, capacity_bytes: u64, version_fp
 /// production fallback in [`ensure_template`].
 const NOVERSION_FP: &str = "noversion";
 
+/// Per-process cache for [`mkfs_version_fingerprint`] keyed by
+/// `mkfs_path`. The fingerprint is invariant for a binary whose
+/// `--version` output is deterministic (the production case for
+/// `mkfs.btrfs` / `mkfs.xfs`), so paying the fork+exec cost once per
+/// process is sufficient. Without this cache every `ensure_template`
+/// call — i.e. every VM boot in the parallel test run — re-spawns
+/// the same `--version` command and rehashes the same bytes, adding
+/// a fork+exec + read on the hot path of test startup.
+///
+/// Keyed by [`PathBuf`] (not the resolved canonical path) because
+/// the caller is [`locate_host_mkfs`], which already returns the
+/// canonical path; storing the same canonicalized form here means a
+/// repeat call with the same caller-side path hits without
+/// recanonicalising.
+///
+/// `std::sync::Mutex` is sufficient — contention is bounded to
+/// first-use per binary path (after which every subsequent call is
+/// a `HashMap::get` under the lock), and the critical section never
+/// runs the fork+exec while holding the lock (see
+/// [`mkfs_version_fingerprint`] for the read-then-insert shape).
+fn mkfs_version_fingerprint_cache()
+-> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, String>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, String>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
 /// Compute a 16-hex-char SHA-256 prefix of the `mkfs.<fstype>
-/// --version` output.
+/// --version` output, memoized per process by `mkfs_path`.
 ///
 /// Used by [`template_cache_key`]: the fingerprint participates in
 /// the cache key so an mkfs upgrade rotates the key and forces a
@@ -382,6 +410,24 @@ const NOVERSION_FP: &str = "noversion";
 /// [`locate_host_mkfs`]). Failure paths surface as bail messages
 /// naming the binary path so an operator can rerun by hand.
 ///
+/// # Process-lifetime caching
+///
+/// Results are cached in a per-process map keyed by `mkfs_path`
+/// (see [`mkfs_version_fingerprint_cache`]). The first call for a
+/// given path performs the fork+exec + hash; subsequent calls (in
+/// the same process) return the cached string without spawning the
+/// child. This matters because `ensure_template` runs on every VM
+/// boot — without the cache, parallel-test runs spawn N
+/// `mkfs.<fstype> --version` children for N tests against a binary
+/// that hasn't changed across the run.
+///
+/// The cache is never invalidated. An mkfs upgrade between calls in
+/// the same process would not be observed, but mkfs binaries do not
+/// hot-swap during a test run — and even if one did, the prior
+/// fingerprint still captures the binary that built any cached
+/// template the run already produced, so reusing the prior key is
+/// correct.
+///
 /// # Output stability
 ///
 /// `mkfs.btrfs --version` and `mkfs.xfs --version` write a short
@@ -396,12 +442,24 @@ const NOVERSION_FP: &str = "noversion";
 /// # When the version output is non-deterministic
 ///
 /// A buggy mkfs that emits a timestamp on `--version` would rotate
-/// the fingerprint on every call and defeat caching. This case is
-/// not defended against in code — a fingerprint that changes per
-/// invocation just causes the cache to behave like a no-cache.
-/// Operators who suspect this should run
-/// `<mkfs> --version | sha256sum` twice in a row and compare.
+/// the fingerprint on every call and defeat caching. The
+/// per-process memoization above also masks this — once the first
+/// call lands, every subsequent call returns the cached value
+/// regardless of what `--version` would emit. Operators who suspect
+/// non-determinism should run `<mkfs> --version | sha256sum` twice
+/// in a row and compare.
 fn mkfs_version_fingerprint(mkfs_path: &Path) -> Result<String> {
+    // Hot path: cached. The lock is held only for the map lookup
+    // and (on miss) for the insertion; the fork+exec runs after the
+    // first lookup so concurrent first-use against different paths
+    // does not serialize.
+    if let Some(cached) = mkfs_version_fingerprint_cache()
+        .lock()
+        .expect("mkfs_version_fingerprint cache mutex poisoned")
+        .get(mkfs_path)
+    {
+        return Ok(cached.clone());
+    }
     use sha2::Digest;
     let output = std::process::Command::new(mkfs_path)
         .arg("--version")
@@ -427,7 +485,20 @@ fn mkfs_version_fingerprint(mkfs_path: &Path) -> Result<String> {
     let digest = hasher.finalize();
     // 16 hex chars = 64 bits. Birthday collision around ~2^32
     // distinct versions; vastly more than any host will ever see.
-    Ok(hex::encode(&digest[..8]))
+    let fp = hex::encode(&digest[..8]);
+    // Memoize for the rest of this process. A concurrent first-use
+    // against the same path would compute the fingerprint twice
+    // (the lookup-then-insert is not atomic), but both children
+    // hash the same bytes and produce the same string, so the
+    // map's eventual value is deterministic regardless of which
+    // insertion wins. The redundant fork+exec is bounded by the
+    // number of concurrent first-callers — a one-time cost paid
+    // before the cache is warm.
+    mkfs_version_fingerprint_cache()
+        .lock()
+        .expect("mkfs_version_fingerprint cache mutex poisoned")
+        .insert(mkfs_path.to_path_buf(), fp.clone());
+    Ok(fp)
 }
 
 /// Path to the template image for the given key, relative to the
@@ -503,7 +574,14 @@ pub(crate) fn store_atomic(key: &str, src_path: &Path) -> Result<PathBuf> {
         // A peer published the entry between our lookup and store
         // calls. Discard the new one — both should be byte-identical
         // (same capacity, same fs, same mkfs.btrfs version on the
-        // host).
+        // host). Unlink our now-obsolete staging image before
+        // returning so it does not leak in the cache root: the
+        // success path below moves `src_path` into the staging
+        // directory via rename(2), but on this early return we never
+        // reach that rename and the source file would otherwise sit
+        // in the cache root forever (no other code path GCs an
+        // unattached staging image at this name).
+        let _ = std::fs::remove_file(src_path);
         return Ok(final_dir.join(TEMPLATE_FILENAME));
     }
     // Pre-flight cross-filesystem check. `rename(2)` returns EXDEV
@@ -1239,8 +1317,8 @@ fn build_template_via_vm(
 
 /// Sweep stale staging debris out of the disk-template cache root.
 ///
-/// Two debris shapes accumulate when a template-build peer dies
-/// before its [`store_atomic`] rename completes:
+/// Three debris shapes accumulate when a template-build peer or a
+/// per-test consumer dies before its cleanup arm completes:
 ///
 /// 1. **`template.img.in-flight.<cache_key>.<pid>`** — sparse
 ///    staging images created by [`create_and_size_staging_image`]
@@ -1254,8 +1332,17 @@ fn build_template_via_vm(
 ///    the end of `store_atomic`. A SIGKILL during the
 ///    src→staging_image rename or the staging→final_dir rename
 ///    leaves the populated tmpdir on disk.
+/// 3. **`.per-test-<pid>-<ns>-<rnd>.img`** — per-test FICLONE
+///    backing files created by [`crate::vmm::KtstrVm::init_virtio_blk`]
+///    for the `Filesystem::Btrfs` branch. The setter unlinks the
+///    path immediately after FICLONE (the open `File` keeps the
+///    inode alive for the device's lifetime), but a SIGKILL
+///    between FICLONE and unlink — or an unlink failure surfaced
+///    only as a `tracing::warn!` — leaves the dest path on disk.
+///    Without sweeping, every crashed test accumulates one such
+///    file in the cache root forever.
 ///
-/// Both shapes embed the originating peer's pid in the filename.
+/// All three shapes embed the originating peer's pid in the filename.
 /// The sweep parses that pid and probes liveness via
 /// `kill(pid, None)` (rust-side: [`nix::sys::signal::kill`] with
 /// `Signal::None`). The kernel returns:
@@ -1275,8 +1362,9 @@ fn build_template_via_vm(
 /// cross-process cleanup. The two are independent because their
 /// debris namespaces don't overlap (kernel cache uses `.tmp-`
 /// prefix, disk-template cache uses `.tmp.` infix on the
-/// directories and a `template.img.in-flight.` prefix on the
-/// staging images).
+/// directories, a `template.img.in-flight.` prefix on the
+/// staging images, and a `.per-test-` prefix on per-test
+/// backing files).
 ///
 /// Returns the count of debris entries removed. Errors during
 /// individual `remove_dir_all` / `remove_file` calls are logged
@@ -1286,10 +1374,10 @@ fn build_template_via_vm(
 ///
 /// Refuses to descend into the `.locks/` subdirectory (the only
 /// non-debris namespace inside the cache root); the prefix filter
-/// excludes it via the `template.img.in-flight.` and `*.tmp.*`
-/// pattern match. Published cache entries (`<cache_key>/`) are
-/// left untouched — they have no pid suffix and don't match either
-/// debris shape.
+/// excludes it via the `template.img.in-flight.`, `*.tmp.*`, and
+/// `.per-test-` pattern match. Published cache entries
+/// (`<cache_key>/`) are left untouched — they have no pid suffix
+/// and don't match any debris shape.
 ///
 /// # When to call this
 ///
@@ -1306,7 +1394,8 @@ fn build_template_via_vm(
 /// - The host has hosted long-running ktstr peers that crashed
 ///   without graceful shutdown (SIGKILL, kernel oops, OOM kill,
 ///   panic) and the cache root is accumulating
-///   `template.img.in-flight.*` / `*.tmp.*` entries.
+///   `template.img.in-flight.*` / `*.tmp.*` / `.per-test-*`
+///   entries.
 /// - Disk pressure is rising and an inventory of the cache root
 ///   shows debris files significantly outweigh published entries.
 /// - You're scripting a "clean cache" subcommand that does NOT
@@ -1374,6 +1463,13 @@ pub fn clean_orphaned_tmp_dirs(cache_root: &Path) -> Result<usize> {
         //     image (see [`staging_image_path`]).
         //   - `<cache_key>.tmp.<pid>` — staging directory (see
         //     [`store_atomic`]).
+        //   - `.per-test-<pid>-<ns>-<rnd>.img` — per-test FICLONE
+        //     backing file (see
+        //     [`crate::vmm::KtstrVm::init_virtio_blk`]'s `Btrfs`
+        //     branch). Pid is the FIRST `-`-separated token after
+        //     the `.per-test-` prefix; subsequent tokens encode
+        //     timestamp + randomness for collision-freedom across
+        //     concurrent tests in the same process.
         //
         // Anything else (notably the `.locks/` subdirectory and
         // the published `<cache_key>/` entries) is skipped.
@@ -1383,6 +1479,15 @@ pub fn clean_orphaned_tmp_dirs(cache_root: &Path) -> Result<usize> {
             // `.` token.
             match rest.rsplit_once('.') {
                 Some((_, suffix)) if !suffix.is_empty() => suffix,
+                _ => continue,
+            }
+        } else if let Some(rest) = name.strip_prefix(".per-test-") {
+            // `.per-test-<pid>-<ns>-<rnd>.img` — pid is the FIRST
+            // `-`-separated token after the prefix. `split_once`
+            // (not `rsplit_once`) because the random/timestamp
+            // tokens follow the pid, not precede it.
+            match rest.split_once('-') {
+                Some((pid_token, _)) if !pid_token.is_empty() => pid_token,
                 _ => continue,
             }
         } else if name.contains(".tmp.") {
@@ -1842,6 +1947,42 @@ mod tests {
         assert_eq!(body, b"FIRST");
     }
 
+    /// Early-return cleanup contract: when `store_atomic` discovers
+    /// the cache entry is already published (peer raced us between
+    /// lookup and store), the now-obsolete staging image at
+    /// `src_path` MUST be unlinked before returning. Otherwise the
+    /// staging image leaks in the cache root forever — no other
+    /// code path GCs an unattached staging image at this name (the
+    /// debris sweep targets `template.img.in-flight.<key>.<pid>` and
+    /// `<key>.tmp.<pid>` patterns, not the in-flight name the caller
+    /// chose for `src_path`).
+    #[test]
+    fn store_atomic_unlinks_src_on_idempotent_early_return() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let _guard =
+            crate::test_support::test_helpers::EnvVarGuard::set("KTSTR_CACHE_DIR", tmp.path());
+        let cache_root_path = cache_root().unwrap();
+        std::fs::create_dir_all(&cache_root_path).unwrap();
+        // First publish populates the cache entry.
+        let staged1 = cache_root_path.join("staged1.img");
+        std::fs::write(&staged1, b"FIRST").unwrap();
+        let key = "early-return-key";
+        store_atomic(key, &staged1).unwrap();
+        // Second call must observe the existing entry, return the
+        // already-installed path, AND unlink staged2 so it does not
+        // leak.
+        let staged2 = cache_root_path.join("staged2.img");
+        std::fs::write(&staged2, b"SECOND").unwrap();
+        store_atomic(key, &staged2).unwrap();
+        assert!(
+            !staged2.exists(),
+            "early-return path must unlink the obsolete staging image \
+             at {staged2:?}; without this cleanup the cache root \
+             accumulates orphan staging files across every concurrent \
+             peer that loses the publish race",
+        );
+    }
+
     #[test]
     fn locate_host_binary_actionable_error_when_missing() {
         // Override PATH to a single empty dir so the host binary is
@@ -1965,6 +2106,22 @@ mod tests {
         assert!(
             fp1.chars().all(|c| c.is_ascii_hexdigit()),
             "fingerprint must be hex-only: {fp1}",
+        );
+        // The first call must have populated the per-process cache.
+        // Pin the cache write so a regression that drops the
+        // memoization (and re-execs `--version` on every call)
+        // surfaces here.
+        let cached = mkfs_version_fingerprint_cache()
+            .lock()
+            .expect("cache mutex")
+            .get(&binary_path)
+            .cloned();
+        assert_eq!(
+            cached.as_deref(),
+            Some(fp1.as_str()),
+            "first call must populate the per-process fingerprint cache; \
+             without the cache, ensure_template re-execs `--version` on \
+             every VM boot",
         );
     }
 
@@ -2404,6 +2561,54 @@ mod tests {
         assert!(
             !leaked.exists(),
             "dead-pid staging directory must be removed",
+        );
+    }
+
+    /// `clean_orphaned_tmp_dirs` removes a stale per-test FICLONE
+    /// backing file (`.per-test-<pid>-<ns>-<rnd>.img`) when the
+    /// embedded pid is dead. Pin the third debris shape contract:
+    /// without sweeping these, every crashed test leaks one such
+    /// file in the cache root permanently — the in-process unlink
+    /// at [`crate::vmm::KtstrVm::init_virtio_blk`] is best-effort
+    /// (warn-only on failure) and skipped entirely when SIGKILL
+    /// fires between FICLONE and the unlink.
+    #[test]
+    fn clean_orphaned_tmp_dirs_removes_dead_pid_per_test_image() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let cache_root = tmp.path();
+        let dead_pid = i32::MAX;
+        let leaked = cache_root.join(format!(".per-test-{dead_pid}-deadbeef-cafe.img"));
+        std::fs::write(&leaked, b"FAKE_PER_TEST_IMG").unwrap();
+        let count = clean_orphaned_tmp_dirs(cache_root).expect("sweep must succeed");
+        assert_eq!(count, 1, "exactly one debris entry removed");
+        assert!(
+            !leaked.exists(),
+            "dead-pid per-test backing file must be unlinked",
+        );
+    }
+
+    /// `clean_orphaned_tmp_dirs` PRESERVES a per-test backing file
+    /// owned by the current process — the in-process unlink path
+    /// at [`crate::vmm::KtstrVm::init_virtio_blk`] runs after
+    /// FICLONE returns; if the sweep ran concurrently with a live
+    /// test that just FICLONE'd but hasn't yet unlinked, the
+    /// sweep MUST NOT yank the file out from under the live
+    /// device.
+    #[test]
+    fn clean_orphaned_tmp_dirs_preserves_live_pid_per_test_image() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let cache_root = tmp.path();
+        let live_pid = std::process::id();
+        let live_file = cache_root.join(format!(".per-test-{live_pid}-deadbeef-cafe.img"));
+        std::fs::write(&live_file, b"LIVE_PER_TEST_BACKING").unwrap();
+        let count = clean_orphaned_tmp_dirs(cache_root).expect("sweep must succeed");
+        assert_eq!(
+            count, 0,
+            "live-pid per-test backing must not be removed by sweep",
+        );
+        assert!(
+            live_file.exists(),
+            "live-pid per-test backing must survive the sweep",
         );
     }
 

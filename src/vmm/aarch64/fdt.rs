@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use vm_fdt::{FdtReserveEntry, FdtWriter};
+use vm_fdt::FdtWriter;
 
 use crate::vmm::aarch64::topology::mpidr_to_fdt_reg;
 use crate::vmm::kvm::{
@@ -63,7 +63,6 @@ pub fn create_fdt(
     cmdline: &str,
     initrd_addr: Option<u64>,
     initrd_size: Option<u32>,
-    shm_size: u64,
     hw_cache_level: u32,
     guest_l1_unified: bool,
     numa_layout: &NumaMemoryLayout,
@@ -71,24 +70,7 @@ pub fn create_fdt(
     has_virtio_net: bool,
     has_pmu: bool,
 ) -> Result<Vec<u8>> {
-    // SHM base address (top of guest DRAM minus SHM size).
-    let shm_base = if shm_size > 0 {
-        let mem_size = (memory_mb as u64) << 20;
-        Some(DRAM_START + mem_size - shm_size)
-    } else {
-        None
-    };
-
-    // Reserve the SHM region via /memreserve/ so the kernel adds it to
-    // memblock.reserved (preventing allocation) while the full DRAM range
-    // in the /memory node keeps it in memblock.memory (ensuring /dev/mem
-    // maps it with Normal cacheable attributes, not Device-nGnRnE).
-    let reserves = if let Some(base) = shm_base {
-        vec![FdtReserveEntry::new(base, shm_size).context("SHM reserve entry")?]
-    } else {
-        vec![]
-    };
-    let mut fdt = FdtWriter::new_with_mem_reserv(&reserves).context("create FDT writer")?;
+    let mut fdt = FdtWriter::new_with_mem_reserv(&[]).context("create FDT writer")?;
 
     let root = fdt.begin_node("").context("begin root node")?;
     fdt.property_string("compatible", "linux,dummy-virt")
@@ -106,15 +88,6 @@ pub fn create_fdt(
     // /memory — guest physical RAM. When numa_nodes > 1, one memory
     // node per NUMA node with disjoint address ranges and numa-node-id.
     write_memory(&mut fdt, topo, memory_mb, numa_layout)?;
-
-    // /reserved-memory — SHM region marked reserved (no kernel
-    // allocation) but kept in memblock.memory so /dev/mem maps it
-    // with Normal cacheable attributes. The /memory node(s) above
-    // cover full DRAM including SHM — that is what makes
-    // pfn_is_map_memory() return true for SHM pages.
-    if let Some(base) = shm_base {
-        write_reserved_memory(&mut fdt, base, shm_size)?;
-    }
 
     // /cpus — one node per vCPU with MPIDR from KVM, plus cache
     // topology nodes when the topology has multiple LLCs.
@@ -206,11 +179,10 @@ pub fn create_fdt(
 ///
 /// The FDT is placed in the last `FDT_MAX_SIZE` bytes of the usable
 /// DRAM region. The address must be 8-byte aligned (FDT spec requirement).
-pub fn fdt_address(memory_mb: u32, shm_size: u64) -> u64 {
+pub fn fdt_address(memory_mb: u32) -> u64 {
     let mem_size = (memory_mb as u64) << 20;
     let dram_end = DRAM_START + mem_size;
-    let usable_end = dram_end - shm_size;
-    (usable_end - FDT_MAX_SIZE) & !7
+    (dram_end - FDT_MAX_SIZE) & !7
 }
 
 fn write_chosen(
@@ -262,9 +234,6 @@ fn write_memory(
         fdt.end_node(mem).context("end memory")?;
     } else {
         // Multi-NUMA: one memory node per NumaMemoryLayout region.
-        // The layout covers the full guest memory including SHM.
-        // /reserved-memory prevents kernel allocation from SHM
-        // while keeping it in memblock.memory for cacheable mapping.
         let regions = numa_layout.regions();
         for region in regions {
             let base = region.gpa_start;
@@ -289,38 +258,6 @@ fn write_memory(
         }
     }
 
-    Ok(())
-}
-
-fn write_reserved_memory(fdt: &mut FdtWriter, shm_base: u64, shm_size: u64) -> Result<()> {
-    let rsv = fdt
-        .begin_node("reserved-memory")
-        .context("begin reserved-memory")?;
-    fdt.property_u32("#address-cells", 2)
-        .context("reserved-memory #address-cells")?;
-    fdt.property_u32("#size-cells", 2)
-        .context("reserved-memory #size-cells")?;
-    fdt.property_null("ranges")
-        .context("reserved-memory ranges")?;
-
-    // SHM child node: reserved but NOT no-map. Without no-map the
-    // kernel keeps the region in memblock.memory (linear map) so
-    // /dev/mem maps it with Normal cacheable attributes.
-    let name = format!("shm@{shm_base:x}");
-    let shm = fdt.begin_node(&name).context("begin shm node")?;
-    fdt.property_array_u32(
-        "reg",
-        &[
-            (shm_base >> 32) as u32,
-            shm_base as u32,
-            (shm_size >> 32) as u32,
-            shm_size as u32,
-        ],
-    )
-    .context("shm reg")?;
-    fdt.end_node(shm).context("end shm node")?;
-
-    fdt.end_node(rsv).context("end reserved-memory")?;
     Ok(())
 }
 
@@ -631,7 +568,6 @@ mod tests {
         cmdline: &str,
         initrd_addr: Option<u64>,
         initrd_size: Option<u32>,
-        shm_size: u64,
         hw_cache_level: u32,
         guest_l1_unified: bool,
     ) -> Result<Vec<u8>> {
@@ -643,7 +579,6 @@ mod tests {
             cmdline,
             initrd_addr,
             initrd_size,
-            shm_size,
             hw_cache_level,
             guest_l1_unified,
             &layout,
@@ -664,7 +599,6 @@ mod tests {
             "console=ttyS0",
             None,
             None,
-            0,
             0,
             false,
         );
@@ -692,24 +626,6 @@ mod tests {
     }
 
     #[test]
-    fn create_fdt_with_shm() {
-        let topo = default_topo();
-        let mpidrs = fake_mpidrs(topo.total_cpus());
-        let dtb = test_fdt(
-            &topo,
-            &mpidrs,
-            256,
-            "console=ttyS0",
-            None,
-            None,
-            0x10_0000,
-            0,
-            false,
-        );
-        assert!(dtb.is_ok());
-    }
-
-    #[test]
     fn create_fdt_smp() {
         let topo = Topology {
             llcs: 2,
@@ -727,7 +643,6 @@ mod tests {
             "console=ttyS0",
             None,
             None,
-            0,
             2,
             false,
         );
@@ -752,36 +667,10 @@ mod tests {
             "console=ttyS0",
             None,
             None,
-            0,
             2,
             false,
         );
         assert!(dtb.is_ok(), "FDT creation failed: {:?}", dtb.err());
-    }
-
-    #[test]
-    fn create_fdt_multi_numa_with_shm() {
-        let topo = Topology {
-            llcs: 4,
-            cores_per_llc: 2,
-            threads_per_core: 1,
-            numa_nodes: 2,
-            nodes: None,
-            distances: None,
-        };
-        let mpidrs = fake_mpidrs(topo.total_cpus());
-        let dtb = test_fdt(
-            &topo,
-            &mpidrs,
-            512,
-            "console=ttyS0",
-            None,
-            None,
-            0x10_0000,
-            2,
-            false,
-        );
-        assert!(dtb.is_ok());
     }
 
     #[test]
@@ -802,7 +691,6 @@ mod tests {
             "console=ttyS0",
             None,
             None,
-            0,
             2,
             false,
         );
@@ -811,15 +699,8 @@ mod tests {
 
     #[test]
     fn fdt_address_aligned() {
-        let addr = fdt_address(256, 0);
+        let addr = fdt_address(256);
         assert_eq!(addr % 8, 0, "FDT address must be 8-byte aligned");
-    }
-
-    #[test]
-    fn fdt_address_with_shm() {
-        let addr_no_shm = fdt_address(256, 0);
-        let addr_with_shm = fdt_address(256, 0x10_0000);
-        assert!(addr_with_shm < addr_no_shm);
     }
 
     // -----------------------------------------------------------------------
@@ -951,7 +832,6 @@ mod tests {
             None,
             None,
             0,
-            0,
             false,
         )
         .unwrap();
@@ -1014,7 +894,6 @@ mod tests {
             "console=ttyS0",
             None,
             None,
-            0,
             2,
             false,
         )
@@ -1039,7 +918,6 @@ mod tests {
             "console=ttyS0",
             None,
             None,
-            0,
             2,
             false,
         )
@@ -1065,7 +943,6 @@ mod tests {
             "console=ttyS0",
             None,
             None,
-            0,
             2,
             false,
         )
@@ -1096,7 +973,6 @@ mod tests {
         topo: &Topology,
         props: &[(String, String, Vec<u8>)],
         memory_mb: u32,
-        _shm_size: u64,
     ) {
         let mem_size = (memory_mb as u64) << 20;
         let layout = NumaMemoryLayout::compute(topo, memory_mb, DRAM_START).unwrap();
@@ -1155,7 +1031,6 @@ mod tests {
         };
         let mpidrs = fake_mpidrs(topo.total_cpus());
 
-        // No-SHM case.
         let memory_mb: u32 = 512;
         let dtb = test_fdt(
             &topo,
@@ -1164,28 +1039,11 @@ mod tests {
             "console=ttyS0",
             None,
             None,
-            0,
             2,
             false,
         )
         .unwrap();
-        check_memory_nodes(&topo, &parse_dtb_props(&dtb), memory_mb, 0);
-
-        // F3: with-SHM case — last node absorbs SHM region.
-        let shm_size: u64 = 0x10_0000;
-        let dtb_shm = test_fdt(
-            &topo,
-            &mpidrs,
-            memory_mb,
-            "console=ttyS0",
-            None,
-            None,
-            shm_size,
-            2,
-            false,
-        )
-        .unwrap();
-        check_memory_nodes(&topo, &parse_dtb_props(&dtb_shm), memory_mb, shm_size);
+        check_memory_nodes(&topo, &parse_dtb_props(&dtb), memory_mb);
     }
 
     #[test]
@@ -1206,7 +1064,6 @@ mod tests {
             "console=ttyS0",
             None,
             None,
-            0,
             2,
             false,
         )
@@ -1382,7 +1239,6 @@ mod tests {
             None,
             None,
             0,
-            0,
             false,
         )
         .unwrap();
@@ -1430,7 +1286,6 @@ mod tests {
             "console=ttyS0",
             None,
             None,
-            0,
             0,
             false,
             &layout,
@@ -1506,7 +1361,6 @@ mod tests {
             "console=ttyS0",
             None,
             None,
-            0,
             0,
             false,
         )

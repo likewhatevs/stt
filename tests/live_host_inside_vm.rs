@@ -172,9 +172,9 @@ fn live_host_pipeline_inside_guest_produces_expected_shape(ctx: &Ctx) -> Result<
     // section name.
     let any_scx = maps
         .iter()
-        .any(|m| m.name.contains("scx") || m.name.contains("ktstr"));
+        .any(|m| m.name().contains("scx") || m.name().contains("ktstr"));
     if !any_scx {
-        let names: Vec<&str> = maps.iter().map(|m| m.name.as_str()).collect();
+        let names: Vec<std::borrow::Cow<'_, str>> = maps.iter().map(|m| m.name()).collect();
         return Ok(AssertResult::fail(AssertDetail::new(
             DetailKind::Other,
             format!(

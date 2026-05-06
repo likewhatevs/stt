@@ -17,12 +17,13 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use super::console;
+use super::host_comms::BulkDrainResult;
 use super::kvm;
 use super::pi_mutex::PiMutex;
-use super::shm_ring;
-use super::vcpu::VcpuThread;
+use super::vcpu::{VcpuThread, WatchpointArm};
 use super::virtio_blk::VirtioBlkCounters;
 use super::virtio_net::VirtioNetCounters;
+use super::wire;
 use crate::monitor;
 
 /// Result of a VM execution.
@@ -47,22 +48,24 @@ pub struct VmResult {
     /// verdicts, and SCX event deltas. `None` when the monitor did
     /// not run (host-only tests, early VM failure).
     pub monitor: Option<monitor::MonitorReport>,
-    /// TLV messages drained after VM exit. Merges three streams in
-    /// arrival order: mid-flight bytes the monitor pulled off
-    /// virtio-console port 1 during the run, the final port-1
-    /// `port1_tx_buf` flush, and a post-mortem read of the SHM ring
-    /// (which still carries `MSG_TYPE_CRASH` and any pre-port-open
-    /// fallback writes).
-    pub shm_data: Option<shm_ring::ShmDrainResult>,
-    /// Stimulus events extracted from SHM ring entries.
+    /// TLV messages drained from the guest after VM exit. Merges
+    /// mid-flight bytes the freeze coordinator pulled off
+    /// virtio-console port 1 during the run with the final port-1
+    /// `port1_tx_buf` flush.
+    pub guest_messages: Option<BulkDrainResult>,
+    /// Stimulus events extracted from guest TLV entries.
     #[allow(dead_code)]
-    pub stimulus_events: Vec<shm_ring::StimulusEvent>,
+    pub stimulus_events: Vec<wire::StimulusEvent>,
     /// BPF verifier stats collected from host-side memory reads.
     pub verifier_stats: Vec<monitor::bpf_prog::ProgVerifierStats>,
     /// KVM per-vCPU cumulative stats (requires Linux >= 5.14).
     pub kvm_stats: Option<KvmStatsTotals>,
-    /// Crash message from SHM (MSG_TYPE_CRASH). Reliable delivery via
-    /// memcpy unlike serial which truncates large backtraces.
+    /// Crash message extracted from COM2 output via
+    /// [`crate::test_support::extract_panic_message`]. The guest
+    /// panic hook in `rust_init.rs` writes `PANIC: <info>\n<bt>\n`
+    /// to `/dev/ttyS1` synchronously inside `KVM_RUN`, so the host
+    /// captures the full backtrace in `output` even when the guest
+    /// is wedged. `None` when no `PANIC:`-prefixed line was seen.
     pub crash_message: Option<String>,
     /// Wall-clock time from BSP exit to the moment
     /// [`super::KtstrVm::collect_results`] finishes assembling
@@ -180,7 +183,7 @@ pub struct VmResult {
     /// `.load(Ordering::Relaxed)` per field on the consumer side
     /// observes the final cumulative totals.
     ///
-    /// The counter struct exposes nine `AtomicU64` fields, each
+    /// The counter struct exposes eleven `AtomicU64` fields, each
     /// bumped from `process_tx_loopback`:
     ///
     ///   - `tx_packets` — count of TX chains the device accepted
@@ -198,13 +201,29 @@ pub struct VmResult {
     ///     frames the device could not deliver because the RX queue
     ///     was empty (back-pressure event).
     ///   - `tx_chain_invalid` / `rx_chain_invalid` — chains rejected
-    ///     for malformed shape (short header, wrong direction).
+    ///     for malformed shape (short header, wrong direction,
+    ///     attacker-controlled descriptor address overflow).
+    ///   - `rx_write_failed` — RX chain whose shape was valid but
+    ///     whose guest-memory `write_slice` (header or frame) hit
+    ///     an unmapped GPA. Distinct from `rx_chain_invalid` so an
+    ///     operator can tell "guest violated the RX descriptor-
+    ///     direction rule" from "guest posted a buffer at an
+    ///     unmapped GPA"; the two are mutually exclusive per chain.
     ///   - `tx_add_used_failures` / `rx_add_used_failures` —
     ///     `add_used` failures, indicating the queue's used-ring
     ///     address itself is unmapped or otherwise inaccessible.
-    ///     Distinct from the `*_chain_invalid` counters so an
-    ///     operator can tell "guest sent malformed frame" from
+    ///     Distinct from the `*_chain_invalid` / `rx_write_failed`
+    ///     counters so an operator can tell "guest sent malformed
+    ///     frame" / "guest's posted buffer GPA was unmapped" from
     ///     "queue itself is broken".
+    ///   - `invalid_avail_idx_count` — cumulative count of
+    ///     `Error::InvalidAvailRingIndex` events observed by
+    ///     `process_tx_loopback` (avail.idx more than `queue.size`
+    ///     ahead of `next_avail` — virtio-v1.2 §2.7.13.3 violation
+    ///     by the guest). Per-event counter; the per-queue
+    ///     `queue_poisoned` flag short-circuits subsequent kicks
+    ///     so one guest fault produces exactly one bump regardless
+    ///     of how many notifications follow before reset.
     ///
     /// Counters are cumulative for the device's lifetime — a guest
     /// driver re-bind (writing `STATUS=0`) does NOT zero them.
@@ -264,7 +283,7 @@ impl VmResult {
             output: String::new(),
             stderr: String::new(),
             monitor: None,
-            shm_data: None,
+            guest_messages: None,
             stimulus_events: Vec::new(),
             verifier_stats: Vec::new(),
             kvm_stats: None,
@@ -347,6 +366,14 @@ pub(crate) struct VmRunState {
     pub(crate) ap_threads: Vec<VcpuThread>,
     pub(crate) monitor_handle: Option<JoinHandle<monitor::reader::MonitorLoopResult>>,
     pub(crate) bpf_write_handle: Option<JoinHandle<()>>,
+    /// Freeze coordinator handle, always `None` in the
+    /// production path: [`super::KtstrVm::run_vm`] joins the
+    /// coordinator BEFORE the BSP `VcpuFd` falls out of scope so the
+    /// coordinator's captured BSP `ImmediateExitHandle` cannot
+    /// outlive the kvm_run mmap (UAF prevention). The optional shape
+    /// is preserved so the field stays trivially constructible in
+    /// any future test-only or alternative-orchestration path that
+    /// might not perform the early join.
     pub(crate) freeze_coordinator: Option<JoinHandle<()>>,
     pub(crate) com1: Arc<PiMutex<console::Serial>>,
     pub(crate) com2: Arc<PiMutex<console::Serial>>,
@@ -397,26 +424,13 @@ pub(crate) struct VmRunState {
     /// onto [`VmResult::virtio_net_counters`]. Same Arc-handoff
     /// pattern as `virtio_blk_counters` above.
     pub(crate) virtio_net_counters: Option<Arc<VirtioNetCounters>>,
-    /// Host-side handle to the snapshot doorbell EventFd registered
-    /// with KVM via `KVM_IOEVENTFD` at
-    /// [`kvm::DOORBELL_MMIO_GPA`](super::kvm::DOORBELL_MMIO_GPA).
-    /// Cloning this fd (via `try_clone`) yields an additional
-    /// handle on the same kernel counter — a `write(8 bytes)` on
-    /// any clone signals the freeze coordinator's poll loop, which
-    /// runs `freeze_and_capture(false)` and writes a tagged
-    /// `failure_dump.on_demand_<n>.json` file. Used by host-side
-    /// code that wants to trigger an on-demand capture without an
-    /// in-guest write to the doorbell GPA — e.g. test scaffolding
-    /// running on the host while the guest is still in KVM_RUN.
-    /// `None` only for VMs whose construction predates the
-    /// doorbell wiring; in current code every successful
-    /// `KtstrVm::run_vm` populates it.
-    #[allow(dead_code)]
-    pub(crate) doorbell_evt: Option<vmm_sys_util::eventfd::EventFd>,
     /// Snapshot bridge owning every report captured during the run.
     /// The freeze coordinator clones this bridge into its closure
-    /// state; on every `Op::Snapshot`-driven doorbell event it
-    /// runs `freeze_and_capture(false)` and stores the resulting
+    /// state; on every guest-side
+    /// [`crate::vmm::wire::MSG_TYPE_SNAPSHOT_REQUEST`] frame the
+    /// coordinator's TOKEN_TX handler decoded with kind
+    /// [`crate::vmm::wire::SNAPSHOT_KIND_CAPTURE`], the dispatch runs
+    /// `freeze_and_capture(false)` and stores the resulting
     /// `FailureDumpReport` here keyed by the snapshot name. After
     /// VM exit, [`super::KtstrVm::collect_results`] forwards the
     /// bridge onto [`VmResult::snapshot_bridge`] so the test code
@@ -436,22 +450,38 @@ pub(crate) struct VmRunState {
     /// Virtio-console device shared with vCPU threads. Carries the
     /// port-1 (`/dev/vport0p1`) bulk TLV stream from guest to host;
     /// `collect_results` calls `drain_bulk()` after the run to feed
-    /// `parse_tlv_stream` and produce the `ShmDrainResult` that
-    /// `VmResult.shm_data` exposes to test verdicts.
+    /// `parse_tlv_stream` and produce the `BulkDrainResult` that
+    /// `VmResult.guest_messages` exposes to test verdicts.
     pub(crate) virtio_con: Arc<crate::vmm::PiMutex<crate::vmm::virtio_console::VirtioConsole>>,
     /// Bulk TLV entries the freeze coordinator parsed from
     /// `port1_tx_buf` mid-run. The coord's TOKEN_TX handler reads
     /// the device's accumulated bulk bytes, feeds them through
     /// [`crate::vmm::bulk::HostAssembler`], and stashes every parsed
     /// frame here so [`super::KtstrVm::collect_results`] can merge
-    /// them into `VmResult::shm_data` alongside the post-exit
+    /// them into `VmResult::guest_messages` alongside the post-exit
     /// `drain_bulk` and the post-mortem SHM CRASH-ring drain.
     /// Without this stash every EXIT / TEST / PAYLOAD_METRICS /
     /// RAW_PAYLOAD_OUTPUT / PROFRAW frame consumed by the coord
     /// would vanish — only the leftover bytes that arrived on
     /// `port1_tx_buf` after the coord exited would reach the
     /// verdict, and a typical run would surface no metrics.
-    pub(crate) bulk_messages: Arc<std::sync::Mutex<Vec<crate::vmm::shm_ring::ShmEntry>>>,
+    pub(crate) bulk_messages: Arc<std::sync::Mutex<Vec<crate::vmm::wire::ShmEntry>>>,
+    /// Hardware-watchpoint arming state Arc, forwarded so
+    /// [`super::KtstrVm::collect_results`] can invalidate the
+    /// `kind_host_ptr` and `request_kva` slots after every vCPU
+    /// thread joins but BEFORE `vm` drops.
+    ///
+    /// Without the invalidation, the slots' published values
+    /// continue to address (a) a host pointer into `vm.guest_mem`'s
+    /// mapping that becomes unmapped when `vm` drops and (b) a
+    /// guest KVA whose translation goes through the same mapping.
+    /// The freeze coordinator joins before `vm` drops in
+    /// `run_vm`, and AP threads join inside `collect_results` —
+    /// but defense-in-depth says we zero the slots once every
+    /// reader is gone so any future restructuring (a stray Arc
+    /// clone surviving past teardown, a follow-up that adds a
+    /// new reader path) cannot trip a use-after-free.
+    pub(crate) watchpoint: Arc<WatchpointArm>,
 }
 #[cfg(test)]
 mod tests {
@@ -468,7 +498,7 @@ mod tests {
             output: "hello world".into(),
             stderr: "boot log".into(),
             monitor: None,
-            shm_data: None,
+            guest_messages: None,
             stimulus_events: Vec::new(),
             verifier_stats: Vec::new(),
             kvm_stats: None,
@@ -485,7 +515,7 @@ mod tests {
         assert_eq!(r.output, "hello world");
         assert_eq!(r.stderr, "boot log");
         assert!(r.monitor.is_none());
-        assert!(r.shm_data.is_none());
+        assert!(r.guest_messages.is_none());
         assert!(r.stimulus_events.is_empty());
         assert_eq!(r.cleanup_duration, Some(Duration::from_millis(50)));
         assert!(r.virtio_blk_counters.is_none());
@@ -501,7 +531,7 @@ mod tests {
             output: String::new(),
             stderr: String::new(),
             monitor: None,
-            shm_data: None,
+            guest_messages: None,
             stimulus_events: Vec::new(),
             verifier_stats: Vec::new(),
             kvm_stats: None,
@@ -545,7 +575,7 @@ mod tests {
             output: "test output".into(),
             stderr: String::new(),
             monitor: None,
-            shm_data: None,
+            guest_messages: None,
             stimulus_events: Vec::new(),
             verifier_stats: Vec::new(),
             kvm_stats: None,
@@ -586,7 +616,7 @@ mod tests {
             output: String::new(),
             stderr: "kernel panic".into(),
             monitor: Some(report),
-            shm_data: None,
+            guest_messages: None,
             stimulus_events: Vec::new(),
             verifier_stats: Vec::new(),
             kvm_stats: None,

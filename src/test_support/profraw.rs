@@ -71,8 +71,6 @@
 //!   symbols at once.
 //! - [`pie_load_bias`] computes the ASLR slide for PIE binaries so
 //!   symbol virtual addresses can be rebased to runtime pointers.
-//! - [`parse_shm_params`] extracts the SHM base/size the host injected
-//!   via `/proc/cmdline` (`KTSTR_SHM_BASE` / `KTSTR_SHM_SIZE`).
 //!
 //! `/proc/self/exe` is read via `memmap2::Mmap` rather than
 //! `std::fs::read` so the kernel page cache backs the bytes goblin
@@ -88,29 +86,29 @@ use std::path::{Path, PathBuf};
 
 use crate::vmm;
 
-/// SHM ring message type for profraw data.
+/// Bulk-channel message type for profraw data.
 ///
 /// Derived from the ASCII bytes `b"PRAW"` in big-endian order so the
 /// constant reads as the tag it represents in a hex dump, not as an
 /// opaque 32-bit magic number. Equivalent to `0x50524157`.
 pub(crate) const MSG_TYPE_PROFRAW: u32 = u32::from_be_bytes(*b"PRAW");
 
-/// Flush LLVM coverage profraw to the SHM ring buffer.
+/// Flush LLVM coverage profraw to the host through the bulk channel.
 ///
 /// Resolves `__llvm_profile_get_size_for_buffer` and
 /// `__llvm_profile_write_buffer` from the test binary's `.symtab`,
 /// allocates a heap buffer of the reported size, calls
 /// `__llvm_profile_write_buffer` to serialize the profile counters
-/// into it, and publishes the buffer through the SHM ring for
-/// host-side extraction.
+/// into it, and publishes the buffer through the virtio-console
+/// bulk port for host-side extraction.
 ///
 /// All symbols have hidden visibility in compiler-rt, so we resolve
 /// them via ELF `.symtab` parsing (dlsym cannot find hidden symbols).
 ///
-/// No-op when built without `-C instrument-coverage` or when SHM
-/// parameters are absent from the kernel command line.
+/// No-op when built without `-C instrument-coverage` or when called
+/// from host context.
 pub(crate) fn try_flush_profraw() {
-    if parse_shm_params().is_none() {
+    if !vmm::guest_comms::is_guest() {
         return;
     }
 
@@ -237,12 +235,6 @@ pub(crate) fn pie_load_bias(elf: &goblin::elf::Elf<'_>) -> usize {
         return 0;
     }
     phdr_runtime.wrapping_sub(phdr_file_offset)
-}
-
-/// Parse KTSTR_SHM_BASE and KTSTR_SHM_SIZE from /proc/cmdline.
-pub(crate) fn parse_shm_params() -> Option<(u64, u64)> {
-    let cmdline = std::fs::read_to_string("/proc/cmdline").ok()?;
-    vmm::shm_ring::parse_shm_params_from_str(&cmdline)
 }
 
 static PROFRAW_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -442,81 +434,6 @@ fn redirect_default_profraw_path() {
 mod tests {
     use super::super::test_helpers::{EnvVarGuard, lock_env};
     use super::*;
-    use crate::vmm::shm_ring::parse_shm_params_from_str;
-
-    // -- parse_shm_params (/proc/cmdline) --
-
-    #[test]
-    fn parse_shm_params_absent() {
-        let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
-        if cmdline.contains("KTSTR_SHM_BASE") {
-            skip!(
-                "host /proc/cmdline has KTSTR_SHM_BASE (self-hosted guest?); \
-                 the pure-string branch of parse_shm_params is covered by \
-                 parse_shm_params_from_str_*"
-            );
-        }
-        let result = parse_shm_params();
-        assert!(
-            result.is_none(),
-            "host without KTSTR_SHM_BASE in /proc/cmdline must yield None"
-        );
-    }
-
-    // -- parse_shm_params_from_str --
-
-    #[test]
-    fn parse_shm_params_from_str_lowercase_hex() {
-        let cmdline = "console=ttyS0 KTSTR_SHM_BASE=0xfc000000 KTSTR_SHM_SIZE=0x400000 quiet";
-        let (base, size) = parse_shm_params_from_str(cmdline).unwrap();
-        assert_eq!(base, 0xfc000000);
-        assert_eq!(size, 0x400000);
-    }
-
-    #[test]
-    fn parse_shm_params_from_str_uppercase_hex() {
-        let cmdline = "KTSTR_SHM_BASE=0XFC000000 KTSTR_SHM_SIZE=0X400000";
-        let (base, size) = parse_shm_params_from_str(cmdline).unwrap();
-        assert_eq!(base, 0xFC000000);
-        assert_eq!(size, 0x400000);
-    }
-
-    #[test]
-    fn parse_shm_params_from_str_no_prefix() {
-        let cmdline = "KTSTR_SHM_BASE=fc000000 KTSTR_SHM_SIZE=400000";
-        let (base, size) = parse_shm_params_from_str(cmdline).unwrap();
-        assert_eq!(base, 0xfc000000);
-        assert_eq!(size, 0x400000);
-    }
-
-    #[test]
-    fn parse_shm_params_from_str_missing_base() {
-        let cmdline = "console=ttyS0 KTSTR_SHM_SIZE=0x400000";
-        assert!(parse_shm_params_from_str(cmdline).is_none());
-    }
-
-    #[test]
-    fn parse_shm_params_from_str_missing_size() {
-        let cmdline = "KTSTR_SHM_BASE=0xfc000000 quiet";
-        assert!(parse_shm_params_from_str(cmdline).is_none());
-    }
-
-    #[test]
-    fn parse_shm_params_from_str_missing_both() {
-        let cmdline = "console=ttyS0 quiet";
-        assert!(parse_shm_params_from_str(cmdline).is_none());
-    }
-
-    #[test]
-    fn parse_shm_params_from_str_empty() {
-        assert!(parse_shm_params_from_str("").is_none());
-    }
-
-    #[test]
-    fn parse_shm_params_from_str_invalid_hex() {
-        let cmdline = "KTSTR_SHM_BASE=0xZZZZ KTSTR_SHM_SIZE=0x400000";
-        assert!(parse_shm_params_from_str(cmdline).is_none());
-    }
 
     // -- target_dir --
 
@@ -685,27 +602,6 @@ mod tests {
     fn msg_type_profraw_ascii() {
         let bytes = MSG_TYPE_PROFRAW.to_be_bytes();
         assert_eq!(&bytes, b"PRAW");
-    }
-
-    // -- shm_write full-ring semantics (uses MSG_TYPE_PROFRAW) --
-
-    #[test]
-    fn shm_write_returns_zero_on_full_ring() {
-        use crate::vmm::shm_ring::{HEADER_SIZE, MSG_HEADER_SIZE, shm_init, shm_write};
-
-        // Small ring: header + 32 bytes data.
-        let shm_size = HEADER_SIZE + 32;
-        let mut buf = vec![0u8; shm_size];
-        shm_init(&mut buf, 0, shm_size);
-
-        // Fill the ring: 16-byte header + 16-byte payload = 32 bytes.
-        let payload = vec![0xAA; 16];
-        let written = shm_write(&mut buf, 0, MSG_TYPE_PROFRAW, &payload);
-        assert_eq!(written, MSG_HEADER_SIZE + 16);
-
-        // Ring is full — next write returns 0.
-        let written = shm_write(&mut buf, 0, MSG_TYPE_PROFRAW, b"overflow");
-        assert_eq!(written, 0);
     }
 
     // -- find_symbol_vaddrs --

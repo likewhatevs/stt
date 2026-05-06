@@ -5,13 +5,15 @@
 //! source directory, cache key, and metadata the caller needs to
 //! proceed to configuration and build.
 
+use std::io::Read;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use reqwest::blocking::Client;
+use sha2::{Digest, Sha256};
 
 /// Process-wide [`reqwest::blocking::Client`] lazily initialized on
 /// first access via [`shared_client`]. Keeping a single `Client`
@@ -450,7 +452,252 @@ fn print_download_size(response: &reqwest::blocking::Response, url: &str, cli_la
     }
 }
 
+/// Maximum tolerated stretch of "no body bytes received" before a
+/// streaming download is declared stalled. Catches a TCP connection
+/// that completed handshake (so connect_timeout doesn't fire) but
+/// then silently stops delivering body data — a common CDN failure
+/// mode where keepalive holds the socket open while the upstream
+/// origin is unreachable. The 60s value is generous enough that a
+/// real slow uplink delivering chunks every few seconds never
+/// triggers it, but tight enough that a wedged connection surfaces
+/// before the run's overall test timeout.
+const DOWNLOAD_NO_PROGRESS_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Streaming `Read` adapter for kernel tarball downloads.
+///
+/// Wraps the [`reqwest::blocking::Response`] body to do two things
+/// the bare response cannot:
+///
+/// 1. **Body-progress watchdog.** Tracks `last_progress` (the
+///    instant of the last successful read with `n > 0`) and errors
+///    when more than [`DOWNLOAD_NO_PROGRESS_TIMEOUT`] elapses
+///    between byte-producing reads. Without this, a CDN edge that
+///    keepalives the socket but stops delivering body bytes would
+///    leave the download blocked indefinitely (reqwest's per-read
+///    timeout reset on every empty wakeup, and the connect-phase
+///    timeout already passed during handshake). The check fires
+///    BEFORE the inner `read()` so a stalled inner reader cannot
+///    out-block the watchdog.
+///
+/// 2. **Streaming SHA-256.** Updates a [`Sha256`] hasher with every
+///    byte that flows past, so the caller can verify the finalized
+///    digest against an expected value (parsed out of
+///    `sha256sums.asc`) without a second pass over the data. The
+///    hasher only sees bytes that were actually consumed by the
+///    decoder + tar extractor, which is the same set of bytes that
+///    landed on disk — so a partial download that errored midway
+///    produces a hash over only what we successfully streamed,
+///    preventing false-positive verifications on truncated input.
+///
+/// Sits between [`reqwest::blocking::Response`] and the
+/// decompression layer (`XzDecoder` / `GzDecoder`); both
+/// decompressors expose `into_inner()` so the wrapper can be
+/// recovered after extraction completes (see
+/// [`Self::finalize`]).
+struct DownloadStream<R: Read> {
+    /// Underlying reqwest response body. Owned because `XzDecoder`
+    /// and `GzDecoder` take ownership of their inner reader, so
+    /// the wrapper must hold the response by value rather than by
+    /// reference.
+    inner: R,
+    /// Running SHA-256 hasher updated on every byte-producing read.
+    /// Consumed by [`DownloadStream::finalize`] (which takes `self`
+    /// by value); the call site recovers the wrapper from inside
+    /// the decoder + tar archive chain via `into_inner` before
+    /// finalizing.
+    hasher: Sha256,
+    /// Total body bytes read so far. Surfaced in the watchdog
+    /// error message so an operator triaging "no progress" can see
+    /// how many bytes did arrive before the stall — distinguishing
+    /// "connection dropped after a few bytes" from "connection
+    /// dropped after most of the payload".
+    bytes_total: u64,
+    /// `Instant` of the last successful read with `n > 0`. Set at
+    /// construction (not on first read) so a connection that wins
+    /// the handshake but never delivers any body bytes still
+    /// trips the watchdog after [`DOWNLOAD_NO_PROGRESS_TIMEOUT`]
+    /// rather than waiting for an indeterminate pre-data window.
+    last_progress: Instant,
+    /// Tolerated stretch of zero-progress time. Pinned at
+    /// construction from [`DOWNLOAD_NO_PROGRESS_TIMEOUT`]; held in
+    /// the struct rather than read from the constant on every
+    /// `read()` so a future per-call override (e.g. shorter
+    /// timeouts in tests) lands without touching the watchdog
+    /// logic.
+    no_progress_timeout: Duration,
+}
+
+impl<R: Read> DownloadStream<R> {
+    /// Construct a fresh streaming wrapper around `inner` with the
+    /// production no-progress budget. `last_progress` is set to
+    /// "now" so the watchdog clock starts at construction; the
+    /// downstream decoder may take an indeterminate amount of time
+    /// between construction and the first `read()`, but ANY actual
+    /// progress resets the clock.
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            hasher: Sha256::new(),
+            bytes_total: 0,
+            last_progress: Instant::now(),
+            no_progress_timeout: DOWNLOAD_NO_PROGRESS_TIMEOUT,
+        }
+    }
+
+    /// Consume the wrapper and return `(hex_digest, bytes_total)`.
+    /// Lowercase hex matches the format kernel.org publishes in
+    /// `sha256sums.asc`, so the caller can do a direct
+    /// `eq_ignore_ascii_case` comparison without re-encoding.
+    fn finalize(self) -> (String, u64) {
+        (hex::encode(self.hasher.finalize()), self.bytes_total)
+    }
+}
+
+impl<R: Read> Read for DownloadStream<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        // Watchdog gate: trip BEFORE delegating to the inner reader
+        // so a stalled inner read does not get a fresh chance to
+        // run after the no-progress window has already expired. The
+        // wrapper cannot interrupt a `read()` that is currently
+        // blocked in a syscall — that protection comes from the
+        // per-request timeout configured via
+        // `RequestBuilder::timeout` — but it can refuse to issue
+        // the next call once the cumulative no-progress window
+        // crosses the bound.
+        let elapsed = self.last_progress.elapsed();
+        if elapsed > self.no_progress_timeout {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "download stalled: no body bytes for {}s after {} bytes received",
+                    elapsed.as_secs(),
+                    self.bytes_total,
+                ),
+            ));
+        }
+        match self.inner.read(buf) {
+            Ok(0) => {
+                // EOF: do NOT update last_progress — a 0-byte read
+                // is not progress, and updating here would let a
+                // decoder that polls past EOF reset the watchdog
+                // indefinitely.
+                Ok(0)
+            }
+            Ok(n) => {
+                self.hasher.update(&buf[..n]);
+                self.bytes_total += n as u64;
+                self.last_progress = Instant::now();
+                Ok(n)
+            }
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// Per-request body-stream timeout passed to
+/// [`reqwest::blocking::RequestBuilder::timeout`] for tarball
+/// downloads. The blocking client treats this as a per-`read()`
+/// deadline (reset on every successful read), so it complements the
+/// [`DownloadStream`] watchdog: reqwest's deadline kills a single
+/// stalled syscall, and the watchdog observes the cumulative
+/// no-progress window across multiple reads. Set generously
+/// (5 minutes) because a slow but progressing connection can
+/// legitimately take that long for a single read on a large CDN
+/// chunk; the watchdog provides the tighter 60s no-progress bound.
+const DOWNLOAD_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Fetch the cleartext SHA-256 manifest published alongside stable
+/// kernel tarballs at
+/// `https://cdn.kernel.org/pub/linux/kernel/v{major}.x/sha256sums.asc`.
+///
+/// Returns the file body as a `String` on success. Any error
+/// (transport failure, non-2xx status, non-UTF-8 body) is
+/// propagated; the caller treats failure as "no expected hash
+/// available" and downgrades verification to a warning.
+fn fetch_stable_sha256sums(client: &Client, major: u32) -> Result<String> {
+    let url = format!("https://cdn.kernel.org/pub/linux/kernel/v{major}.x/sha256sums.asc");
+    let response = client
+        .get(&url)
+        .send()
+        .with_context(|| format!("fetch {url}"))?;
+    if !response.status().is_success() {
+        anyhow::bail!("fetch {url}: HTTP {}", response.status());
+    }
+    response
+        .text()
+        .with_context(|| format!("read body of {url}"))
+}
+
+/// Extract the SHA-256 hex digest for `target_filename` from the
+/// cleartext-signed `sha256sums.asc` body.
+///
+/// kernel.org publishes `sha256sums.asc` as a PGP-cleartext-signed
+/// document: a `-----BEGIN PGP SIGNED MESSAGE-----` header, an
+/// optional `Hash:` line, a blank line, the cleartext body
+/// (`<64-hex-chars>  <filename>` per line), then a
+/// `-----BEGIN PGP SIGNATURE-----` block. We only need the
+/// cleartext body — signature verification is a separate concern
+/// (the user-facing instruction is "If no expected hash available,
+/// log warning", not "require signature").
+///
+/// Returns `Some(lowercase_hex)` on first match. Returns `None` if
+/// the target filename does not appear in the manifest (e.g. the
+/// upstream rotated or removed the entry).
+fn parse_sha256_for_file(manifest: &str, target_filename: &str) -> Option<String> {
+    // Strip the PGP signature trailer if present. Everything after
+    // the signature marker is binary noise that never contains
+    // checksum lines.
+    let body = manifest
+        .split_once("-----BEGIN PGP SIGNATURE-----")
+        .map(|(before, _)| before)
+        .unwrap_or(manifest);
+    for line in body.lines() {
+        let line = line.trim();
+        // sha256sum format: `<64-hex-chars><whitespace><filename>`.
+        // Split on whitespace; require exactly two tokens and a
+        // 64-char hex first token.
+        let mut parts = line.split_whitespace();
+        let Some(hash) = parts.next() else { continue };
+        let Some(name) = parts.next() else { continue };
+        if name != target_filename {
+            continue;
+        }
+        if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+            continue;
+        }
+        return Some(hash.to_ascii_lowercase());
+    }
+    None
+}
+
+/// Verify `actual_hex` against `expected_hex` (case-insensitive).
+/// Returns `Ok(())` on match, `Err` with a diagnostic message on
+/// mismatch. Pulled out of the call site so the comparison logic
+/// has one home and the diagnostic carries both digests in lowercase
+/// hex for direct copy-paste reuse.
+fn verify_sha256(actual_hex: &str, expected_hex: &str, url: &str) -> Result<()> {
+    if actual_hex.eq_ignore_ascii_case(expected_hex) {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "sha256 mismatch for {url}: expected {}, got {}",
+            expected_hex.to_ascii_lowercase(),
+            actual_hex.to_ascii_lowercase(),
+        );
+    }
+}
+
 /// Download a stable kernel tarball (.tar.xz) from cdn.kernel.org.
+///
+/// Streams the body through a [`DownloadStream`] watchdog so a
+/// stalled connection (no body bytes for
+/// [`DOWNLOAD_NO_PROGRESS_TIMEOUT`]) surfaces as an error rather
+/// than blocking indefinitely. Computes SHA-256 over the streamed
+/// bytes and verifies against the digest in
+/// `sha256sums.asc` for the matching `linux-{version}.tar.xz`
+/// entry; if the manifest fetch / parse fails (transient outage,
+/// schema drift, missing entry), logs a warning and continues
+/// without verification rather than failing the whole download.
 fn download_stable_tarball(
     client: &Client,
     version: &str,
@@ -458,10 +705,39 @@ fn download_stable_tarball(
     cli_label: &str,
 ) -> Result<PathBuf> {
     let major = major_version(version)?;
-    let url = format!("https://cdn.kernel.org/pub/linux/kernel/v{major}.x/linux-{version}.tar.xz");
+    let tarball_name = format!("linux-{version}.tar.xz");
+    let url = format!("https://cdn.kernel.org/pub/linux/kernel/v{major}.x/{tarball_name}");
+
+    // Best-effort expected-hash lookup: any failure (network,
+    // status, parse, missing entry) downgrades to a warning so the
+    // download still proceeds. The warning surfaces the cause so an
+    // operator triaging "kernel build went weird" can spot that
+    // verification was skipped.
+    let expected_sha256 = match fetch_stable_sha256sums(client, major) {
+        Ok(manifest) => match parse_sha256_for_file(&manifest, &tarball_name) {
+            Some(hex) => Some(hex),
+            None => {
+                tracing::warn!(
+                    tarball = %tarball_name,
+                    "sha256sums.asc fetched but no entry for {tarball_name}; \
+                     download will proceed without checksum verification",
+                );
+                None
+            }
+        },
+        Err(err) => {
+            tracing::warn!(
+                error = %format!("{err:#}"),
+                "failed to fetch sha256sums.asc; download will proceed \
+                 without checksum verification",
+            );
+            None
+        }
+    };
 
     let response = client
         .get(&url)
+        .timeout(DOWNLOAD_REQUEST_READ_TIMEOUT)
         .send()
         .with_context(|| format!("download {url}"))?;
     if !response.status().is_success() {
@@ -474,11 +750,33 @@ fn download_stable_tarball(
     print_download_size(&response, &url, cli_label);
 
     eprintln!("{cli_label}: extracting tarball (xz)");
-    let decoder = xz2::read::XzDecoder::new(response);
+    let stream = DownloadStream::new(response);
+    let decoder = xz2::read::XzDecoder::new(stream);
     let mut archive = tar::Archive::new(decoder);
     archive
         .unpack(dest_dir)
         .with_context(|| "extract tarball")?;
+
+    // Recover the watchdog wrapper from inside the decoder/archive
+    // chain to read the streaming digest. `into_inner` on tar +
+    // xz2 each peel one layer of the chain. Done after a successful
+    // unpack so we don't compute over a partial stream.
+    let stream = archive.into_inner().into_inner();
+    let (actual_hex, bytes_total) = stream.finalize();
+    if let Some(expected) = expected_sha256.as_deref() {
+        verify_sha256(&actual_hex, expected, &url)?;
+        eprintln!(
+            "{cli_label}: sha256 verified ({bytes_total} bytes, hash {actual_hex})"
+        );
+    } else {
+        tracing::warn!(
+            url = %url,
+            bytes = bytes_total,
+            sha256 = %actual_hex,
+            "no expected sha256 available for {url}; computed digest \
+             {actual_hex} over {bytes_total} bytes is unverified",
+        );
+    }
 
     let source_dir = dest_dir.join(format!("linux-{version}"));
     if !source_dir.is_dir() {
@@ -488,6 +786,14 @@ fn download_stable_tarball(
 }
 
 /// Download an RC kernel tarball (.tar.gz) from git.kernel.org.
+///
+/// Streams the body through a [`DownloadStream`] watchdog so a
+/// stalled connection surfaces as an error rather than blocking
+/// indefinitely. RC tarballs are dynamically generated by gitweb
+/// at request time and have no published `sha256sums` manifest, so
+/// this path always logs a warning that the digest is unverified —
+/// it is computed and surfaced for diagnostic value (operators can
+/// pin it manually) but never compared to an authoritative source.
 fn download_rc_tarball(
     client: &Client,
     version: &str,
@@ -498,6 +804,7 @@ fn download_rc_tarball(
 
     let response = client
         .get(&url)
+        .timeout(DOWNLOAD_REQUEST_READ_TIMEOUT)
         .send()
         .with_context(|| format!("download {url}"))?;
     if response.status() == reqwest::StatusCode::NOT_FOUND {
@@ -513,11 +820,29 @@ fn download_rc_tarball(
     print_download_size(&response, &url, cli_label);
 
     eprintln!("{cli_label}: extracting tarball (gzip)");
-    let decoder = flate2::read::GzDecoder::new(response);
+    let stream = DownloadStream::new(response);
+    let decoder = flate2::read::GzDecoder::new(stream);
     let mut archive = tar::Archive::new(decoder);
     archive
         .unpack(dest_dir)
         .with_context(|| "extract tarball")?;
+
+    // Surface the streamed digest as a warning. RC tarballs have
+    // no upstream manifest, so verification is impossible — but
+    // emitting the hash gives an operator a value they can
+    // capture for offline pinning if they want to detect drift on
+    // re-fetch.
+    let stream = archive.into_inner().into_inner();
+    let (actual_hex, bytes_total) = stream.finalize();
+    tracing::warn!(
+        url = %url,
+        bytes = bytes_total,
+        sha256 = %actual_hex,
+        "no expected sha256 available for {url} (RC tarballs are \
+         dynamically generated by git.kernel.org and have no \
+         published manifest); computed digest {actual_hex} over \
+         {bytes_total} bytes is unverified",
+    );
 
     let source_dir = dest_dir.join(format!("linux-{version}"));
     if !source_dir.is_dir() {
@@ -2747,6 +3072,288 @@ mod tests {
              missing #[ignore] attribute would surface here): \n\
              stdout: {stdout}\n\
              stderr: {stderr}",
+        );
+    }
+
+    // -- DownloadStream watchdog + hashing --
+
+    /// `DownloadStream::read` updates the running SHA-256 with every
+    /// byte that flows past, matches a one-shot `Sha256::digest`
+    /// over the same input, and reports the byte count via
+    /// `finalize`. Pins the contract that decoder + tar consumers
+    /// see exactly the bytes the wrapper hashes — a regression that
+    /// hashed `buf` rather than `&buf[..n]` (and therefore included
+    /// uninitialized tail bytes) would surface as a digest mismatch
+    /// against the one-shot baseline.
+    #[test]
+    fn download_stream_finalizes_sha256_over_streamed_bytes() {
+        // Synthetic payload large enough that a default 4 KiB read
+        // buffer cycles through `read` many times — exercises the
+        // hasher.update + last_progress reset on the typical
+        // streaming path.
+        let payload: Vec<u8> = (0..32 * 1024).map(|i| (i % 251) as u8).collect();
+        let mut stream = super::DownloadStream::new(std::io::Cursor::new(payload.clone()));
+        let mut sink: Vec<u8> = Vec::new();
+        std::io::copy(&mut stream, &mut sink).expect("copy must drain Cursor");
+        assert_eq!(
+            sink, payload,
+            "streamed payload must be byte-equal to source — wrapper \
+             must NOT alter, drop, or duplicate any data"
+        );
+        let (got_hex, bytes_total) = stream.finalize();
+        assert_eq!(
+            bytes_total as usize,
+            payload.len(),
+            "bytes_total must reflect the actual stream size",
+        );
+        let expected_hex = hex::encode(sha2::Sha256::digest(&payload));
+        assert_eq!(
+            got_hex, expected_hex,
+            "streaming SHA-256 must match the one-shot digest over \
+             the same bytes",
+        );
+    }
+
+    /// `DownloadStream::read` errors with `ErrorKind::TimedOut` when
+    /// the no-progress window elapses before a byte-producing read.
+    /// Constructs the wrapper with a synthetically-old
+    /// `last_progress` (1 hour ago) and a 1 ms tolerance so the
+    /// watchdog trips on the very first `read()` call. Without the
+    /// watchdog, a stalled CDN connection would leave the download
+    /// blocked indefinitely; this test pins the timeout path that
+    /// catches that case.
+    #[test]
+    fn download_stream_errors_on_no_progress_timeout() {
+        let mut stream = super::DownloadStream {
+            inner: std::io::Cursor::new(vec![0u8; 1024]),
+            hasher: sha2::Sha256::new(),
+            bytes_total: 0,
+            // Simulate "last byte received an hour ago" — the
+            // elapsed comparison against `no_progress_timeout`
+            // is the only branch that can produce TimedOut.
+            last_progress: std::time::Instant::now()
+                - std::time::Duration::from_secs(3600),
+            no_progress_timeout: std::time::Duration::from_millis(1),
+        };
+        let mut buf = [0u8; 16];
+        let err = stream
+            .read(&mut buf)
+            .expect_err("expired no-progress window must surface TimedOut");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::TimedOut,
+            "watchdog error must carry ErrorKind::TimedOut so \
+             upstream `?` chains can route on it: got {:?}",
+            err.kind(),
+        );
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("no body bytes"),
+            "watchdog error message must explain the cause: {msg}",
+        );
+    }
+
+    /// A successful read resets `last_progress`, so the next read
+    /// call's watchdog window is measured from the latest byte
+    /// arrival — not the construction time. Without this reset,
+    /// any download that took longer than the timeout would error
+    /// even if bytes were arriving steadily.
+    #[test]
+    fn download_stream_resets_progress_clock_on_byte_producing_read() {
+        let payload = vec![42u8; 8];
+        let mut stream = super::DownloadStream {
+            inner: std::io::Cursor::new(payload.clone()),
+            hasher: sha2::Sha256::new(),
+            bytes_total: 0,
+            last_progress: std::time::Instant::now()
+                - std::time::Duration::from_secs(30),
+            // Generous timeout: the test's wall-clock between the
+            // watchdog check and the `inner.read()` call cannot
+            // exceed 1s on any sane machine.
+            no_progress_timeout: std::time::Duration::from_secs(60),
+        };
+        let mut buf = [0u8; 16];
+        let n = stream.read(&mut buf).expect("first read must succeed");
+        assert_eq!(n, payload.len());
+        // last_progress must now be very recent — within the last
+        // second or so. A regression that failed to update would
+        // surface here as `elapsed > 30s`.
+        assert!(
+            stream.last_progress.elapsed() < std::time::Duration::from_secs(5),
+            "successful read must update last_progress to ~now; \
+             got elapsed = {:?}",
+            stream.last_progress.elapsed(),
+        );
+    }
+
+    /// EOF (`Ok(0)`) does NOT update `last_progress`. Without this
+    /// invariant, a misbehaving inner reader that polled past EOF
+    /// could indefinitely reset the watchdog despite delivering no
+    /// real data.
+    #[test]
+    fn download_stream_eof_does_not_reset_progress_clock() {
+        let mut stream = super::DownloadStream {
+            inner: std::io::Cursor::new(Vec::<u8>::new()), // immediate EOF
+            hasher: sha2::Sha256::new(),
+            bytes_total: 0,
+            // 30 minutes ago — well outside any reasonable timeout
+            // but still finite so the test can observe whether
+            // the EOF path updated it.
+            last_progress: std::time::Instant::now()
+                - std::time::Duration::from_secs(1800),
+            no_progress_timeout: std::time::Duration::from_secs(7200),
+        };
+        let pre_progress = stream.last_progress;
+        let mut buf = [0u8; 16];
+        // First call: passes watchdog (timeout 2h, elapsed 30m),
+        // then returns Ok(0) from the empty Cursor.
+        let n = stream.read(&mut buf).expect("EOF must return Ok(0)");
+        assert_eq!(n, 0, "empty Cursor must report EOF");
+        assert_eq!(
+            stream.last_progress, pre_progress,
+            "Ok(0) must NOT update last_progress — only byte-\
+             producing reads count as progress",
+        );
+    }
+
+    // -- parse_sha256_for_file --
+
+    /// `parse_sha256_for_file` extracts the digest for the matching
+    /// filename from a kernel.org-style sha256sums.asc body. Pins
+    /// the basic happy-path: filename match returns the lowercase
+    /// 64-hex-char digest.
+    #[test]
+    fn parse_sha256_for_file_extracts_matching_entry() {
+        let manifest = "\
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA256
+
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  linux-6.14.1.tar.xz
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  linux-6.14.2.tar.xz
+cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc  linux-6.14.3.tar.xz
+-----BEGIN PGP SIGNATURE-----
+... signature payload ...
+-----END PGP SIGNATURE-----
+";
+        let got = super::parse_sha256_for_file(manifest, "linux-6.14.2.tar.xz")
+            .expect("matching entry must be found");
+        assert_eq!(
+            got, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "must extract the digest paired with the requested \
+             filename, lowercase",
+        );
+    }
+
+    /// Filename-not-found returns `None` — the caller treats this
+    /// as "no expected hash available" and downgrades to a warning
+    /// per the user-facing instruction.
+    #[test]
+    fn parse_sha256_for_file_returns_none_when_file_absent() {
+        let manifest = "\
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  linux-6.14.1.tar.xz
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  linux-6.14.2.tar.xz
+";
+        let got = super::parse_sha256_for_file(manifest, "linux-9.99.99.tar.xz");
+        assert!(
+            got.is_none(),
+            "missing filename must return None so the caller can \
+             warn-and-continue rather than fabricate a digest: got \
+             {got:?}",
+        );
+    }
+
+    /// Lines whose hash field has the wrong length or non-hex
+    /// characters are silently skipped — pin the per-line tolerance
+    /// against an upstream that briefly publishes a malformed line
+    /// during a deploy. Covers both rejection paths in
+    /// `parse_sha256_for_file`'s validator: short-length and 64-
+    /// char-but-non-hex.
+    #[test]
+    fn parse_sha256_for_file_skips_malformed_hash_lines() {
+        // Line 1: 2-char hash (length-check rejects).
+        // Line 2: 64-char hash with non-hex chars (`g` and `z`)
+        //         (hex-check rejects after length passes).
+        // Line 3: well-formed 64-char hex hash (must parse).
+        let manifest = "\
+zz  linux-6.14.1.tar.xz
+zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzgg  linux-6.14.2.tar.xz
+cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc  linux-6.14.3.tar.xz
+";
+        assert_eq!(
+            super::parse_sha256_for_file(manifest, "linux-6.14.1.tar.xz"),
+            None,
+            "2-char hash must be skipped via the length check",
+        );
+        assert_eq!(
+            super::parse_sha256_for_file(manifest, "linux-6.14.2.tar.xz"),
+            None,
+            "64-char-but-non-hex hash must be skipped via the \
+             ascii-hexdigit check",
+        );
+        assert_eq!(
+            super::parse_sha256_for_file(manifest, "linux-6.14.3.tar.xz")
+                .expect("valid entry must parse"),
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        );
+    }
+
+    /// `parse_sha256_for_file` strips the PGP signature trailer —
+    /// content after `-----BEGIN PGP SIGNATURE-----` is binary
+    /// noise that must NOT be scanned for checksum lines (a chance
+    /// 64-hex-char run inside a signature would otherwise produce
+    /// a false positive).
+    #[test]
+    fn parse_sha256_for_file_ignores_post_signature_content() {
+        // `linux-6.14.99.tar.xz` appears AFTER the signature
+        // marker — must be ignored so the parser can't be tricked
+        // into returning data from the binary blob.
+        let manifest = "\
+-----BEGIN PGP SIGNATURE-----
+ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff  linux-6.14.99.tar.xz
+-----END PGP SIGNATURE-----
+";
+        assert!(
+            super::parse_sha256_for_file(manifest, "linux-6.14.99.tar.xz").is_none(),
+            "lines after the signature marker must be invisible to \
+             the parser",
+        );
+    }
+
+    // -- verify_sha256 --
+
+    /// Matching digests return Ok regardless of case — pins the
+    /// case-insensitive comparison the helper documents.
+    #[test]
+    fn verify_sha256_accepts_case_insensitive_match() {
+        super::verify_sha256(
+            "ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890",
+            "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+            "https://example.invalid/x.tar.xz",
+        )
+        .expect("case-insensitive equal must verify");
+    }
+
+    /// Mismatching digests surface as Err with both digests in the
+    /// message so an operator can compare them by eye without
+    /// digging through logs.
+    #[test]
+    fn verify_sha256_rejects_mismatch_with_both_digests_in_message() {
+        let url = "https://example.invalid/x.tar.xz";
+        let err = super::verify_sha256(
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "1111111111111111111111111111111111111111111111111111111111111111",
+            url,
+        )
+        .expect_err("mismatch must surface as Err");
+        let msg = format!("{err:#}");
+        assert!(msg.contains(url), "error must name the URL: {msg}");
+        assert!(
+            msg.contains("0000000000000000"),
+            "error must include the actual digest: {msg}",
+        );
+        assert!(
+            msg.contains("1111111111111111"),
+            "error must include the expected digest: {msg}",
         );
     }
 

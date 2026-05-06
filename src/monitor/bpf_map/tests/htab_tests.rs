@@ -56,7 +56,8 @@ fn iter_htab_entries_non_hash_map_returns_empty() {
     let map = BpfMapInfo {
         map_pa: 0,
         map_kva: 0,
-        name: "test.bss".into(),
+        name_bytes: super::name_from_str("test.bss").0,
+        name_len: super::name_from_str("test.bss").1,
         map_type: BPF_MAP_TYPE_ARRAY,
         map_flags: 0,
         key_size: 4,
@@ -83,7 +84,8 @@ fn iter_htab_entries_no_htab_offsets_returns_empty() {
     let map = BpfMapInfo {
         map_pa: 0,
         map_kva: 0,
-        name: "test".into(),
+        name_bytes: super::name_from_str("test").0,
+        name_len: super::name_from_str("test").1,
         map_type: BPF_MAP_TYPE_HASH,
         map_flags: 0,
         key_size: 4,
@@ -209,7 +211,8 @@ fn setup_htab_direct(
     let map = BpfMapInfo {
         map_pa: htab_pa,
         map_kva: pa_to_kva(htab_pa),
-        name: "test_hash".into(),
+        name_bytes: super::name_from_str("test_hash").0,
+        name_len: super::name_from_str("test_hash").1,
         map_type: BPF_MAP_TYPE_HASH,
         map_flags: 0,
         key_size,
@@ -376,7 +379,8 @@ fn iter_htab_entries_multi_bucket() {
     let map = BpfMapInfo {
         map_pa: htab_pa,
         map_kva: pa_to_kva(htab_pa),
-        name: "multi_bucket".into(),
+        name_bytes: super::name_from_str("multi_bucket").0,
+        name_len: super::name_from_str("multi_bucket").1,
         map_type: BPF_MAP_TYPE_HASH,
         map_flags: 0,
         key_size,
@@ -499,7 +503,8 @@ fn setup_percpu_array(
     let info = BpfMapInfo {
         map_pa: array_pa,
         map_kva,
-        name: "test_percpu".into(),
+        name_bytes: super::name_from_str("test_percpu").0,
+        name_len: super::name_from_str("test_percpu").1,
         map_type: BPF_MAP_TYPE_PERCPU_ARRAY,
         map_flags: 0,
         key_size: 4,
@@ -865,7 +870,8 @@ fn read_percpu_array_unmapped_bpf_array() {
     let info = BpfMapInfo {
         map_pa: 0,
         map_kva: 0xFFFF_C900_DEAD_0000,
-        name: "test_percpu".into(),
+        name_bytes: super::name_from_str("test_percpu").0,
+        name_len: super::name_from_str("test_percpu").1,
         map_type: BPF_MAP_TYPE_PERCPU_ARRAY,
         map_flags: 0,
         key_size: 4,
@@ -988,7 +994,8 @@ fn read_percpu_array_kva_via_page_table() {
     let info = BpfMapInfo {
         map_pa: array_pa,
         map_kva,
-        name: "vmalloc_percpu".into(),
+        name_bytes: super::name_from_str("vmalloc_percpu").0,
+        name_len: super::name_from_str("vmalloc_percpu").1,
         map_type: BPF_MAP_TYPE_PERCPU_ARRAY,
         map_flags: 0,
         key_size: 4,
@@ -1198,7 +1205,8 @@ fn setup_percpu_htab_direct(
     let map = BpfMapInfo {
         map_pa: htab_pa,
         map_kva: pa_to_kva(htab_pa),
-        name: "test_percpu_hash".into(),
+        name_bytes: super::name_from_str("test_percpu_hash").0,
+        name_len: super::name_from_str("test_percpu_hash").1,
         map_type: BPF_MAP_TYPE_PERCPU_HASH,
         map_flags: 0,
         key_size,

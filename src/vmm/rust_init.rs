@@ -16,7 +16,7 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 use crate::sync::Latch;
 
@@ -69,6 +69,157 @@ fn force_reboot() -> ! {
     }
 }
 
+/// Side channel for the scheduler PID published by [`start_scheduler`]
+/// once `Command::spawn` returns. The guest test-dispatch path
+/// (e.g. [`crate::test_support`] consumers that need the scheduler's
+/// pid for cgroup attach / kill / probe) reads it via [`sched_pid`].
+///
+/// Replaces a previous `std::env::set_var("SCHED_PID", ...)` write.
+/// Mutating glibc's global `__environ` array while another thread is
+/// live (the Phase A probe thread spawned in `start_probe_phase_a`
+/// runs concurrently with `start_scheduler`) is documented UB on
+/// Linux — see
+/// [`crate::test_support::propagate_rust_env_from_cmdline`] for the
+/// mirroring rationale. An atomic side channel is the
+/// data-race-free alternative.
+///
+/// Sentinel: `0` means "no scheduler started". `pid_t` is a signed
+/// integer in glibc; the kernel never returns `0` from `fork(2)` to
+/// the parent, so `0` is a safe "unset" marker for the producer to
+/// initialise with and the consumer to filter on.
+static SCHED_PID: AtomicI32 = AtomicI32::new(0);
+
+/// Read the scheduler PID published by [`start_scheduler`]. Returns
+/// `None` when the scheduler has not been spawned yet (the atomic
+/// reads as `0`, the sentinel for "unset"). `Acquire` synchronises
+/// against the producer's `Release` store so any side effects
+/// `start_scheduler` performed before the publish are visible to the
+/// reader.
+pub(crate) fn sched_pid() -> Option<libc::pid_t> {
+    let v = SCHED_PID.load(Ordering::Acquire);
+    if v == 0 { None } else { Some(v) }
+}
+
+/// RAII guard that flips SIGCHLD to a target disposition on
+/// construction and restores the previous handler on drop. Used by
+/// [`with_sigchld_default`] so a panic inside the closure cannot
+/// leak `SIG_DFL` into the rest of the guest's lifetime — Drop
+/// runs even on unwind.
+///
+/// `libc::signal` returns the previous handler on every call, so
+/// the snapshot we capture in `install` is the authoritative value
+/// to restore in `Drop`. Re-installing the snapshot makes the
+/// guard idempotent across nested calls (an outer guard's restore
+/// observes the inner guard's restore as a no-op rebind to the
+/// same handler).
+struct SigchldDispositionGuard {
+    prev: libc::sighandler_t,
+}
+
+impl SigchldDispositionGuard {
+    /// Install `handler` as the SIGCHLD disposition and capture
+    /// the previous handler for restoration on drop.
+    ///
+    /// SAFETY: signal disposition is a process-wide property. PID
+    /// 1 owns the disposition for the whole guest, so no other
+    /// thread can race the signal install. `libc::signal` is
+    /// async-signal-safe per POSIX.1-2008 TC2.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `libc::signal` returns `SIG_ERR` — the libc
+    /// failure indicator (`!0 as sighandler_t`) for an invalid
+    /// signal number or other install failure. Without the check,
+    /// `SIG_ERR` would be captured into `prev` as if it were a
+    /// valid handler, and Drop would then attempt to install
+    /// `SIG_ERR` (which the kernel rejects with `EINVAL`,
+    /// surfacing as a separate `SIG_ERR` return that the no-check
+    /// Drop also drops on the floor — silently leaking the
+    /// install error). For SIGCHLD the failure path is
+    /// implausible in practice (the signal number is valid and
+    /// `SIG_DFL`/`SIG_IGN` are always-installable handlers), but
+    /// the library invariant is general — `signal(2)` returning
+    /// `SIG_ERR` is a programming error, not a runtime condition,
+    /// so panicking is the right discipline.
+    fn install(handler: libc::sighandler_t) -> Self {
+        let prev = unsafe { libc::signal(libc::SIGCHLD, handler) };
+        assert_ne!(
+            prev,
+            libc::SIG_ERR,
+            "failed to install SIGCHLD handler — libc::signal returned SIG_ERR; \
+             check signum / handler validity",
+        );
+        Self { prev }
+    }
+}
+
+impl Drop for SigchldDispositionGuard {
+    fn drop(&mut self) {
+        // SAFETY: `self.prev` was returned by an earlier
+        // `libc::signal` call on the same signal number, so
+        // re-installing it is the documented restore pattern. The
+        // `Drop` runs on both the normal-return and panic-unwind
+        // paths, so a panic inside the protected closure cannot
+        // leak the temporary disposition into the rest of the
+        // process.
+        unsafe {
+            libc::signal(libc::SIGCHLD, self.prev);
+        }
+    }
+}
+
+/// Run `f` with SIGCHLD temporarily restored to `SIG_DFL` so the
+/// kernel does not auto-reap any child spawned inside the closure.
+/// `Command::status()` calls `waitpid(2)`, which returns `ECHILD`
+/// when SIGCHLD is `SIG_IGN` (the default installed by
+/// [`ktstr_guest_init`] for zombie prevention) — losing the real
+/// exit status. Restoring `SIG_DFL` for the closure's lifetime
+/// re-enables `waitpid` reaping; the post-closure restore puts
+/// the previous disposition back so subsequent guest children
+/// continue to be auto-reaped without leaking zombies.
+///
+/// Mirrors the inline save/restore pattern formerly open-coded at
+/// the [`ktstr_guest_init`] shell `--exec` site (now also routed
+/// through this helper). Both call sites share the same
+/// SIGCHLD-vs-`waitpid` hazard; centralising the helper prevents
+/// drift between the two implementations.
+///
+/// Restore is panic-safe via [`SigchldDispositionGuard`]: a panic
+/// in `f` runs the guard's `Drop`, which re-installs the previous
+/// SIGCHLD handler before unwinding past the helper boundary.
+/// Without the guard, a panicking child-spawn site would leak
+/// `SIG_DFL` into the rest of the guest, breaking PID 1's zombie
+/// reaping for every subsequent fork.
+///
+/// The closure must reap every child it spawns before returning.
+/// Leaving an unreaped child at the boundary where `SIG_IGN` is
+/// restored would orphan the zombie until the next reaper cycle.
+/// `Command::status()` waits synchronously, so the typical caller
+/// satisfies this invariant by construction.
+fn with_sigchld_default<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    let _guard = SigchldDispositionGuard::install(libc::SIG_DFL);
+    f()
+}
+
+/// Whether `/proc/{pid}` exists. Used as a `waitpid`-free liveness
+/// probe: under SIGCHLD `SIG_IGN` the kernel auto-reaps children, so
+/// `waitpid` returns `ECHILD` even when the child exited cleanly.
+/// `/proc/{pid}` removal is signal-disposition-independent — the
+/// directory disappears the moment the kernel finishes
+/// `release_task` for the pid (see kernel/exit.c
+/// `release_task` → `proc_flush_pid`), regardless of whether
+/// `waitpid` ever ran.
+///
+/// Returns `true` when `/proc/{pid}` exists (process alive or
+/// pre-reap), `false` when it does not (process exited and the
+/// kernel has dropped the procfs entry).
+fn proc_pid_alive(pid: u32) -> bool {
+    Path::new(&format!("/proc/{pid}")).exists()
+}
+
 /// Full guest init lifecycle. Called from the ctor when PID 1 is
 /// detected. Mounts filesystems, then either runs the test lifecycle
 /// (scheduler + dispatch + reboot) or drops into an interactive
@@ -76,27 +227,23 @@ fn force_reboot() -> ! {
 pub(crate) fn ktstr_guest_init() -> ! {
     let t0 = std::time::Instant::now();
 
-    // Panic hook: write crash diagnostic to SHM (memcpy, no
-    // virtio backpressure) and ALWAYS to COM2 (the canonical
+    // Panic hook: write crash diagnostic to COM2 (the canonical
     // crash-diagnostic transport, survives a wedged virtio
     // port). The bulk-virtio path is intentionally NOT used here
     // because the kernel virtio_console TX path can block on
     // host backpressure, and blocking inside a panic hook would
     // deadlock the guest before the crash diagnostic reaches the
-    // host. The SHM nonblocking write via
-    // [`crate::vmm::guest_comms::send_crash`] is bounded
-    // by SHM_WRITE_LOCK contention only.
+    // host. COM2 (16550 UART) PIO writes commit synchronously
+    // inside `KVM_RUN` before userspace returns, so the host's
+    // serial capture sees every byte even on a wedged guest.
     std::panic::set_hook(Box::new(|info| {
         let bt = std::backtrace::Backtrace::force_capture();
         let msg = format!("PANIC: {info}\n{bt}\n");
-        // SHM (CRASH-only fallback) — non-blocking memcpy. No-op
-        // if SHM is not yet initialised inside the guest.
-        crate::vmm::guest_comms::send_crash(msg.as_bytes());
-        // COM2 / COM1 serial fallback. Always written even when
-        // the SHM write succeeds because COM2 is the canonical
-        // crash log destination for the host's serial-capture
-        // path; a panic before SHM init reaches the host through
-        // this branch alone.
+        // COM2 / COM1 serial. COM2 is the canonical crash log
+        // destination for the host's serial-capture path; the
+        // host parses the `PANIC:` prefix via
+        // `extract_panic_message` to reconstruct the crash
+        // diagnostic.
         let _ = fs::write(COM2, &msg);
         let _ = fs::write(COM1, &msg);
         let _ = std::io::stdout().flush();
@@ -287,21 +434,18 @@ pub(crate) fn ktstr_guest_init() -> ! {
                     .remove(nix::sys::termios::OutputFlags::OPOST);
                 let _ = tcsetattr(stdout_fd, SetArg::TCSANOW, &termios);
             }
-            // Restore SIGCHLD so waitpid can reap the child and
-            // retrieve the real exit code. The default SIG_IGN on
-            // SIGCHLD (installed earlier in main for zombie prevention)
-            // causes the kernel to auto-reap, making waitpid return
-            // ECHILD and losing the exit status. Safe: single-threaded
-            // PID 1 context, no other children running in exec mode.
-            unsafe {
-                libc::signal(libc::SIGCHLD, libc::SIG_DFL);
-            }
-            let status = Command::new("/bin/busybox")
-                .args(["sh", "-c", &cmd])
-                .status();
-            unsafe {
-                libc::signal(libc::SIGCHLD, libc::SIG_IGN);
-            }
+            // [`with_sigchld_default`] flips SIGCHLD to SIG_DFL
+            // for the closure body so `Command::status()` (which
+            // calls `waitpid(2)`) reaps the child and reports the
+            // real exit code. The `SIG_IGN` disposition installed
+            // earlier in [`ktstr_guest_init`] for zombie
+            // prevention is restored on closure return — and on
+            // panic unwind, via the helper's RAII guard.
+            let status = with_sigchld_default(|| {
+                Command::new("/bin/busybox")
+                    .args(["sh", "-c", &cmd])
+                    .status()
+            });
             let code = match status {
                 Ok(s) => s.code().unwrap_or(1),
                 Err(e) => {
@@ -409,15 +553,15 @@ pub(crate) fn ktstr_guest_init() -> ! {
     let (mut sched_child, sched_log_path) = start_scheduler(probe_drain);
     drop(_s_phase3);
 
-    // Phase 4: SHM polling + trace pipe (background threads).
-    let _s_phase4 = tracing::debug_span!("phase4_shm_trace").entered();
+    // Phase 4: hvc0 polling + trace pipe (background threads).
+    let _s_phase4 = tracing::debug_span!("phase4_vc_poll").entered();
     let (trace_stop, trace_handle) = start_trace_pipe();
-    let shm_stop = start_shm_poll(trace_stop.clone());
+    let vc_poll_stop = start_hvc0_poll(trace_stop.clone());
     drop(_s_phase4);
 
     // Phase 4b: Scheduler death monitor.
     // Spawn a thread that polls /proc/{pid}. If the scheduler exits during
-    // the test, the thread writes MSG_TYPE_SCHED_EXIT to SHM so the host
+    // the test, the thread writes MSG_TYPE_SCHED_EXIT via bulk port so the host
     // can detect early death without waiting for the watchdog.
     //
     // When probes are active, suppress COM2 log dump to avoid
@@ -466,7 +610,7 @@ pub(crate) fn ktstr_guest_init() -> ! {
     exec_shell_script("/sched_disable");
 
     // Stop background threads.
-    if let Some(ref stop) = shm_stop {
+    if let Some(ref stop) = vc_poll_stop {
         stop.store(true, Ordering::Release);
     }
     if let Some(ref stop) = sched_exit_stop {
@@ -621,9 +765,24 @@ fn run_disk_template_mode() -> i32 {
     // production format. The 256 MiB minimum capacity (see
     // VIRTIO_BLK_DEFAULT_CAPACITY_BYTES doc) accommodates DUP.
     tracing::info!(mkfs = MKFS, target = "/dev/vda", "running mkfs.btrfs");
-    let status = Command::new(MKFS)
-        .args(["-f", "--quiet", "/dev/vda"])
-        .status();
+    // SIGCHLD is `SIG_IGN` for the rest of this process (installed by
+    // [`ktstr_guest_init`] for zombie prevention). `Command::status()`
+    // calls `waitpid(2)` internally; under `SIG_IGN` the kernel
+    // auto-reaps the child before `waitpid` runs, so the syscall
+    // returns `ECHILD`, the std-lib maps it to
+    // `Err(io::Error::ECHILD)`, and the original `match status`
+    // branch fell into the `Err(_) => 1` arm — surfacing a fixed `1`
+    // exit code for every successful `mkfs.btrfs` run. The host
+    // would then see "template build failed" for a perfectly
+    // formatted image. Restore `SIG_DFL` for the closure's lifetime
+    // so `waitpid` reaps and reports the real status; the
+    // post-closure restore re-installs `SIG_IGN` for any future
+    // child this process spawns.
+    let status = with_sigchld_default(|| {
+        Command::new(MKFS)
+            .args(["-f", "--quiet", "/dev/vda"])
+            .status()
+    });
     match status {
         Ok(s) => s.code().unwrap_or(1),
         Err(e) => {
@@ -1216,9 +1375,6 @@ enum StartupStatus {
     Died,
     /// Child was still running when the poll window closed.
     Alive,
-    /// `try_wait` returned an error (treated as alive by the caller
-    /// so the test can still proceed).
-    WaitError(std::io::Error),
 }
 
 /// Outcome of [`poll_scx_attached`].
@@ -1404,49 +1560,78 @@ fn poll_scx_attached(
 /// microseconds after the kernel reaps), or when the deadline
 /// elapses with the child still alive.
 ///
-/// Replaces a 50 ms sleep-and-`try_wait` loop. `pidfd_open` has been
-/// available since kernel 5.3 (2019); ktstr targets 6.16+ where it
-/// is unconditionally present. The interval parameter is unused
-/// here because `poll(2)` blocks until the fd becomes readable or
-/// the absolute deadline elapses — there is nothing to "poll
-/// faster" inside the wait. The deadline is enforced via
-/// `Instant::now()` re-checks across loop iterations because
-/// `poll(2)` may return EINTR (e.g. SIGCHLD coalescing); the outer
-/// re-check rebuilds the remaining timeout against the absolute
-/// deadline.
+/// `pidfd_open` has been available since kernel 5.3 (2019); ktstr
+/// targets 6.16+ where it is unconditionally present. The interval
+/// parameter is unused here because `poll(2)` blocks until the fd
+/// becomes readable or the absolute deadline elapses — there is
+/// nothing to "poll faster" inside the wait. The deadline is
+/// enforced via `Instant::now()` re-checks across loop iterations
+/// because `poll(2)` may return EINTR (e.g. SIGCHLD coalescing); the
+/// outer re-check rebuilds the remaining timeout against the
+/// absolute deadline.
+///
+/// Liveness is observed via [`proc_pid_alive`] / pidfd POLLIN, never
+/// `Child::try_wait`. PID 1 has SIGCHLD set to `SIG_IGN` for zombie
+/// prevention (see [`ktstr_guest_init`]), so the kernel auto-reaps
+/// the scheduler child the moment it exits. `try_wait` (which calls
+/// `waitpid(pid, ..., WNOHANG)`) then returns `ECHILD`, which the
+/// previous implementation mapped to `WaitError` and the caller
+/// treated as still-alive — leaving a crashed scheduler undetected.
+/// pidfd POLLIN and `/proc/{pid}` removal are signal-disposition
+/// independent (the pidfd is readable on exit regardless of who
+/// reaps; the procfs entry disappears on `release_task`), so they
+/// observe the real state.
 fn poll_startup(
     child: &mut Child,
-    _interval: std::time::Duration,
+    interval: std::time::Duration,
     timeout: std::time::Duration,
 ) -> StartupStatus {
+    let pid = child.id();
     // SAFETY: `pidfd_open(2)` accepts any process the caller can
     // signal. We just spawned `child`; its pid is owned by this
     // process, so the syscall is safe to issue with no other
     // synchronisation. Failure (rare — e.g. very tight pid reuse,
-    // sandbox restriction) falls back to `try_wait` which is
-    // identical to the original poll behaviour.
+    // sandbox restriction) falls back to a `proc_pid_alive` loop
+    // below.
     let pidfd = unsafe {
-        libc::syscall(libc::SYS_pidfd_open, child.id() as libc::c_int, 0u32) as libc::c_int
+        libc::syscall(libc::SYS_pidfd_open, pid as libc::c_int, 0u32) as libc::c_int
     };
     if pidfd < 0 {
-        // pidfd_open unsupported on this kernel — try_wait once
-        // synchronously and report Alive; subsequent observation
-        // of an instantly-dead scheduler still reaches the host
-        // via the start_sched_exit_monitor pidfd path.
-        return match child.try_wait() {
-            Ok(Some(_)) => StartupStatus::Died,
-            Ok(None) => StartupStatus::Alive,
-            Err(e) => StartupStatus::WaitError(e),
-        };
+        // pidfd_open unsupported on this kernel. `proc_pid_alive`
+        // is the SIG_IGN-safe fallback: the procfs entry vanishes
+        // when the kernel runs `release_task` on the child,
+        // regardless of how SIGCHLD is handled. Sleep-poll at the
+        // caller's `interval` cadence until the deadline elapses;
+        // the upper bound on detection latency is one `interval`.
+        let start = std::time::Instant::now();
+        loop {
+            if !proc_pid_alive(pid) {
+                return StartupStatus::Died;
+            }
+            let now = std::time::Instant::now();
+            if now >= start + timeout {
+                return StartupStatus::Alive;
+            }
+            let remaining = (start + timeout) - now;
+            std::thread::sleep(remaining.min(interval));
+        }
     }
     let start = std::time::Instant::now();
     let result = loop {
         let now = std::time::Instant::now();
         if now >= start + timeout {
-            break match child.try_wait() {
-                Ok(Some(_)) => StartupStatus::Died,
-                Ok(None) => StartupStatus::Alive,
-                Err(e) => StartupStatus::WaitError(e),
+            // Deadline elapsed. pidfd POLLIN never fired across
+            // the entire window, so the kernel hasn't signalled
+            // exit on the pidfd. Re-confirm via /proc to cover
+            // the rare race where the child died between the
+            // last poll and now (poll cadence is bounded by
+            // EINTR-driven loops; a ~microsecond-wide window
+            // exists where the child could have exited
+            // post-poll-pre-now).
+            break if proc_pid_alive(pid) {
+                StartupStatus::Alive
+            } else {
+                StartupStatus::Died
             };
         }
         let remaining_ms = (start + timeout - now).as_millis().min(i32::MAX as u128) as i32;
@@ -1463,11 +1648,12 @@ fn poll_startup(
         // duration.
         let rc = unsafe { libc::poll(&mut pfd, 1, remaining_ms) };
         if rc > 0 && pfd.revents & libc::POLLIN != 0 {
-            break match child.try_wait() {
-                Ok(Some(_)) => StartupStatus::Died,
-                Ok(None) => StartupStatus::Alive,
-                Err(e) => StartupStatus::WaitError(e),
-            };
+            // pidfd POLLIN fires precisely at child exit (kernel
+            // `pidfd_poll` in `fs/pidfs.c` checks `exit_state`,
+            // woken via `do_notify_pidfd` from `exit_notify`).
+            // No `try_wait` follow-up needed — POLLIN itself is
+            // the proof.
+            break StartupStatus::Died;
         }
         // rc == 0 (timeout) or rc < 0 (EINTR/error) re-checks the
         // deadline at the top of the loop. EINTR with remaining
@@ -1563,11 +1749,25 @@ fn start_scheduler(probe_drain: Option<ProbeDrain>) -> (Option<Child>, Option<St
 
     match child {
         Ok(mut child) => {
-            // Set SCHED_PID env var for the test to find.
-            // SAFETY: single-threaded context.
-            unsafe {
-                std::env::set_var("SCHED_PID", child.id().to_string());
-            }
+            // Publish the scheduler PID via the [`SCHED_PID`] atomic
+            // side channel — readers retrieve it through
+            // [`sched_pid`]. The previous implementation called
+            // `std::env::set_var("SCHED_PID", ...)` here, but the
+            // Phase A probe thread spawned earlier in
+            // `ktstr_guest_init` (`start_probe_phase_a`) is alive at
+            // this point, so mutating glibc's global `__environ`
+            // array races with the probe thread's potential
+            // `getenv`/`execve` traffic — documented UB on Linux.
+            // The atomic store is data-race-free and the published
+            // value reaches readers via the same `Acquire`/`Release`
+            // synchronisation the [`sched_pid`] reader uses.
+            //
+            // The `child.id()` value fits in `i32` because Linux pids
+            // are `pid_t` (signed 32-bit on every supported arch).
+            // `kernel.pid_max` is a 22-bit limit by default and the
+            // kernel never returns negative pids from `fork(2)`, so
+            // the cast is exact.
+            SCHED_PID.store(child.id() as i32, Ordering::Release);
 
             match poll_startup(
                 &mut child,
@@ -1626,10 +1826,6 @@ fn start_scheduler(probe_drain: Option<ProbeDrain>) -> (Option<Child>, Option<St
                         drain_probe_pipeline(probe_drain.as_ref());
                         force_reboot();
                     }
-                    (Some(child), Some(log_path.to_string()))
-                }
-                StartupStatus::WaitError(e) => {
-                    eprintln!("ktstr-init: check scheduler status: {e}");
                     (Some(child), Some(log_path.to_string()))
                 }
             }
@@ -1771,11 +1967,11 @@ fn start_trace_pipe() -> (Option<Arc<AtomicBool>>, Option<std::thread::JoinHandl
     }
 }
 
-/// Process-wide latch fired by the guest's `shm_poll_loop` when the
+/// Process-wide latch fired by the guest's `hvc0_poll_loop` when the
 /// host's `bpf-map-write` thread pushes `SIGNAL_BPF_WRITE_DONE` through
 /// virtio-console RX.
 ///
-/// Producer: [`shm_poll_loop`] (this file). Consumer: the scenario
+/// Producer: [`hvc0_poll_loop`] (this file). Consumer: the scenario
 /// executor's [`crate::scenario::Ctx::wait_for_map_write`] gate
 /// (in `scenario::ops`). A test that declares `bpf_map_write` on
 /// its `KtstrTestEntry` flips `wait_for_map_write=true`; the
@@ -1790,7 +1986,7 @@ fn start_trace_pipe() -> (Option<Arc<AtomicBool>>, Option<std::thread::JoinHandl
 static BPF_MAP_WRITE_DONE_LATCH: OnceLock<Arc<Latch>> = OnceLock::new();
 
 /// Lazily materialise and return the shared `bpf_map_write_done`
-/// latch. Both the producer (`shm_poll_loop`) and consumer (scenario
+/// latch. Both the producer (`hvc0_poll_loop`) and consumer (scenario
 /// `wait_for_map_write` gate) reach for this — the first caller
 /// installs the [`Latch`] into [`BPF_MAP_WRITE_DONE_LATCH`], every
 /// subsequent caller observes the same instance.
@@ -1800,101 +1996,52 @@ pub(crate) fn bpf_map_write_done_latch() -> Arc<Latch> {
         .clone()
 }
 
-/// Start the SHM polling loop for dump requests.
-/// Reads KTSTR_SHM_BASE and KTSTR_SHM_SIZE from /proc/cmdline and polls
-/// /dev/mem. Initializes the SHM mmap pointer for `shm_ring` writers.
+/// Start the hvc0 wake-byte poll loop.
+///
+/// Spawns a background thread that polls `/dev/hvc0` for host→guest
+/// wake bytes and dispatches SysRq-D / shutdown / bpf-map-write-done
+/// based on the wake byte. Returns the thread's stop flag so callers
+/// can request termination on teardown.
 ///
 /// `trace_stop` is the trace_pipe reader's stop flag. The graceful
 /// shutdown handler sets it so the reader enters drain mode.
-fn start_shm_poll(trace_stop: Option<Arc<AtomicBool>>) -> Option<Arc<AtomicBool>> {
-    let cmdline = fs::read_to_string("/proc/cmdline").ok()?;
-    let (shm_base, shm_size) = crate::vmm::shm_ring::parse_shm_params_from_str(&cmdline)?;
-
+fn start_hvc0_poll(trace_stop: Option<Arc<AtomicBool>>) -> Option<Arc<AtomicBool>> {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_clone = stop.clone();
 
     std::thread::Builder::new()
-        .name("shm-poll".into())
+        .name("hvc0-poll".into())
         .spawn(move || {
-            shm_poll_loop(shm_base, shm_size, &stop_clone, trace_stop.as_deref());
+            hvc0_poll_loop(&stop_clone, trace_stop.as_deref());
         })
         .ok();
 
     Some(stop)
 }
 
-/// Poll /dev/mem for dump request bytes and `/dev/hvc0` for
-/// host→guest wake bytes.
-///
-/// Maps the full SHM region so the SHM ring writers can use the
-/// cached pointer (`shm_ring::init_shm_ptr`).
+/// Poll `/dev/hvc0` for host→guest wake bytes and dispatch SysRq-D /
+/// shutdown / bpf-map-write-done based on the wake byte alone.
 ///
 /// Wake source: opens `/dev/hvc0` non-blocking (`O_NONBLOCK`) and
 /// `poll()`s the fd with `POLLIN` at a 1000 ms safety timeout. The
 /// host pushes a byte via `VirtioConsole::queue_input` whenever it
-/// requests a dump (`SIGNAL_VC_DUMP` paired with the SHM
-/// `DUMP_REQ_OFFSET` byte), a graceful shutdown
+/// requests a dump (`SIGNAL_VC_DUMP`), a graceful shutdown
 /// (`SIGNAL_VC_SHUTDOWN`), or a `bpf-map-write`-complete notification
 /// (`SIGNAL_BPF_WRITE_DONE`). The poll wakes within microseconds of
 /// the push.
 ///
 /// On any wake the loop:
-///   1. re-reads the SHM `DUMP_REQ_OFFSET` byte; if it equals
-///      `DUMP_REQ_SYSRQ_D`, triggers SysRq-D and clears the byte.
+///   1. scans every drained hvc0 byte for `SIGNAL_VC_DUMP`; on
+///      observing one, triggers SysRq-D via `/proc/sysrq-trigger`.
 ///   2. scans every drained hvc0 byte for `SIGNAL_BPF_WRITE_DONE`;
 ///      on observing one, fires [`bpf_map_write_done_latch`] so the
 ///      scenario's `wait_for_map_write` gate resumes.
 ///   3. scans every drained hvc0 byte for `SIGNAL_VC_SHUTDOWN`; on
 ///      observing one, drives graceful shutdown (set `trace_stop`,
 ///      disable tracing, flush stdio + serial) and breaks.
-///
-/// The 1 s safety timeout bounds teardown observation of the
-/// `stop` flag — sufficient because every wake source pushes a
-/// hvc0 byte and `kill` / teardown cases tolerate sub-second
-/// latency.
-fn shm_poll_loop(shm_base: u64, shm_size: u64, stop: &AtomicBool, trace_stop: Option<&AtomicBool>) {
+fn hvc0_poll_loop(stop: &AtomicBool, trace_stop: Option<&AtomicBool>) {
     use std::os::unix::io::AsRawFd;
 
-    let devmem = match fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/mem")
-    {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("ktstr-init: /dev/mem open failed: {e}");
-            return;
-        }
-    };
-
-    let m = match crate::vmm::shm_ring::mmap_devmem(devmem.as_raw_fd(), shm_base, shm_size) {
-        Some(m) => m,
-        None => {
-            eprintln!(
-                "ktstr-init: /dev/mem mmap failed: base={shm_base:#x} size={shm_size:#x} err={}",
-                std::io::Error::last_os_error(),
-            );
-            return;
-        }
-    };
-
-    let shm_ptr = m.ptr;
-
-    // Cache the SHM mmap pointer for guest-side ring writers.
-    crate::vmm::shm_ring::init_shm_ptr(shm_ptr, shm_size as usize);
-
-    let dump_offset = crate::vmm::shm_ring::DUMP_REQ_OFFSET;
-
-    // Open `/dev/hvc0` for non-blocking reads via `O_NONBLOCK` +
-    // `poll(POLLIN)`. The host pushes one of `SIGNAL_VC_DUMP` /
-    // `SIGNAL_VC_SHUTDOWN` whenever it requests a dump or a
-    // graceful shutdown; the poll wakes within microseconds of
-    // that push. The 1000 ms safety timeout bounds teardown
-    // observation of the `stop` flag. `expect()` panics if the
-    // device is missing — `ktstr.kconfig` mandates
-    // `CONFIG_VIRTIO_CONSOLE=y` so the kernel is required to expose
-    // `/dev/hvc0`; an absent device here would mean a broken kernel
-    // build, not a runtime fallback condition.
     let hvc0 = fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK)
@@ -1903,22 +2050,6 @@ fn shm_poll_loop(shm_base: u64, shm_size: u64, stop: &AtomicBool, trace_stop: Op
     let poll_timeout_ms: PollTimeout = 1000u16.into();
 
     while !stop.load(Ordering::Acquire) {
-        unsafe {
-            let dump_byte = *(shm_ptr.add(dump_offset));
-            if dump_byte == crate::vmm::shm_ring::DUMP_REQ_SYSRQ_D {
-                let _ = fs::write("/proc/sysrq-trigger", "D");
-                *(shm_ptr.add(dump_offset)) = 0;
-            }
-        }
-
-        // Wake source: `poll()` on `/dev/hvc0` with a 1000 ms
-        // safety timeout. The host pushes a byte into virtio-console
-        // RX after every dump, shutdown, or `bpf-map-write`-complete
-        // request; this thread wakes within microseconds of the
-        // push, drains the bytes (so the next iteration's poll
-        // re-arms cleanly), and inspects them for the typed wake
-        // bytes. `SIGNAL_VC_DUMP` and any other byte simply force
-        // the SHM `DUMP_REQ_OFFSET` re-read above.
         let borrowed = unsafe { BorrowedFd::borrow_raw(hvc0.as_raw_fd()) };
         let mut fds = [PollFd::new(borrowed, PollFlags::POLLIN)];
         match poll(&mut fds, poll_timeout_ms) {
@@ -1928,14 +2059,9 @@ fn shm_poll_loop(shm_base: u64, shm_size: u64, stop: &AtomicBool, trace_stop: Op
         let mut buf = [0u8; 16];
         let mut hvc_ref: &fs::File = &hvc0;
         let n = hvc_ref.read(&mut buf).unwrap_or(0);
-        // BPF map-write done notification: the host's
-        // `bpf-map-write` thread finished applying every queued
-        // `bpf_map_write` to the kernel BPF maps. Set the latch so
-        // a scenario blocked on `wait_for_map_write` resumes. Set
-        // BEFORE the shutdown check so a back-to-back DONE+SHUTDOWN
-        // burst (host signalled completion, then triggered teardown
-        // immediately) still releases any waiter before the loop
-        // breaks out for the shutdown branch.
+        if buf[..n].contains(&crate::vmm::virtio_console::SIGNAL_VC_DUMP) {
+            let _ = fs::write("/proc/sysrq-trigger", "D");
+        }
         if buf[..n].contains(&crate::vmm::virtio_console::SIGNAL_BPF_WRITE_DONE) {
             bpf_map_write_done_latch().set();
         }
@@ -1960,11 +2086,6 @@ fn shm_poll_loop(shm_base: u64, shm_size: u64, stop: &AtomicBool, trace_stop: Op
             break;
         }
     }
-
-    // Do NOT munmap here. SHM_PTR (OnceLock) retains the mmap pointer
-    // and write_msg() in the main thread dereferences it after this
-    // function returns (Phase 7: MSG_TYPE_EXIT). The guest reboots
-    // immediately after — the kernel frees all mappings on exit.
 }
 
 /// Monitor the scheduler child process for unexpected exit.
@@ -2311,5 +2432,258 @@ mod tests {
             elapsed < std::time::Duration::from_millis(300),
             "Alive should not overshoot timeout significantly, took {elapsed:?}"
         );
+    }
+
+    /// SIGCHLD signal disposition is process-wide, so the
+    /// `with_sigchld_default_*` and `poll_startup_under_sigign_*`
+    /// regression tests must serialize. Without this lock, two
+    /// concurrent `libc::signal(SIGCHLD, ...)` calls from different
+    /// test threads could leave SIGCHLD in an unexpected state when
+    /// either test inspects or restores it. Poison-recovery via
+    /// `unwrap_or_else(|e| e.into_inner())` matches the pattern at
+    /// `src/vmm/vcpu_panic.rs::HOOK_TEST_LOCK` so a panic in one
+    /// signal-aware test does not poison every other one.
+    static SIGCHLD_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII guard that snapshots the current SIGCHLD disposition on
+    /// construction and restores it on drop. Tests that flip
+    /// `SIGCHLD` to `SIG_IGN` to reproduce the PID-1 environment
+    /// must not bleed that disposition into the rest of the test
+    /// run — the cargo nextest binary runs every test in a single
+    /// process under threads, so a leaked `SIG_IGN` would make
+    /// every subsequent `Child::wait` (in unrelated tests) return
+    /// ECHILD. `signal(2)` returns the previous handler; we restore
+    /// it verbatim via a second `signal` call.
+    struct SigchldGuard {
+        prev: libc::sighandler_t,
+    }
+
+    impl SigchldGuard {
+        fn install(handler: libc::sighandler_t) -> Self {
+            // SAFETY: `libc::signal` accepts any process-wide signal
+            // disposition; the returned value is the previous
+            // handler, captured here for restoration in `Drop`.
+            let prev = unsafe { libc::signal(libc::SIGCHLD, handler) };
+            Self { prev }
+        }
+    }
+
+    impl Drop for SigchldGuard {
+        fn drop(&mut self) {
+            // SAFETY: `self.prev` was returned by an earlier
+            // `libc::signal` call on the same signal number;
+            // re-installing it is the documented restore pattern.
+            unsafe {
+                libc::signal(libc::SIGCHLD, self.prev);
+            }
+        }
+    }
+
+    /// Regression: with SIGCHLD set to `SIG_IGN`, a bare
+    /// `Command::status()` returns `Err(ECHILD)` because the kernel
+    /// auto-reaps the child before `waitpid` can observe it.
+    /// `with_sigchld_default` must restore `SIG_DFL` for the
+    /// closure's lifetime so `waitpid` reaps and reports a real
+    /// status. After the closure returns, `SIG_IGN` must be
+    /// restored.
+    #[test]
+    fn with_sigchld_default_captures_real_exit_status() {
+        let _guard = SIGCHLD_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _restore = SigchldGuard::install(libc::SIG_IGN);
+
+        // Sanity: under SIG_IGN, plain Command::status() returns
+        // Err(ECHILD) — proves the ambient state matches PID 1.
+        let bare = Command::new("/bin/true").status();
+        assert!(
+            bare.is_err(),
+            "under SIG_IGN, Command::status must fail with ECHILD; got {bare:?}",
+        );
+
+        // Helper restores SIG_DFL for the closure body, so the same
+        // Command::status() succeeds and reports exit code 0.
+        let wrapped = with_sigchld_default(|| Command::new("/bin/true").status());
+        let status = wrapped.expect("with_sigchld_default must capture status");
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "/bin/true must exit 0 under helper; got {status:?}",
+        );
+
+        // After the closure returns, SIG_IGN must be back in place
+        // so subsequent guest children continue to be auto-reaped.
+        // SAFETY: signal(SIG_IGN) reads the previous disposition
+        // and re-installs SIG_IGN; we compare the previous value to
+        // SIG_IGN to assert nothing changed it underneath us.
+        let after = unsafe { libc::signal(libc::SIGCHLD, libc::SIG_IGN) };
+        assert_eq!(
+            after,
+            libc::SIG_IGN,
+            "with_sigchld_default must restore SIG_IGN after closure returns",
+        );
+    }
+
+    /// Regression (non-zero exit propagation): the helper
+    /// must surface the child's real non-zero exit code, not the
+    /// previous-implementation `Err(_) => 1` mapping that swallowed
+    /// every status under SIG_IGN.
+    #[test]
+    fn with_sigchld_default_captures_nonzero_exit_status() {
+        let _guard = SIGCHLD_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _restore = SigchldGuard::install(libc::SIG_IGN);
+
+        let wrapped = with_sigchld_default(|| Command::new("/bin/false").status());
+        let status = wrapped.expect("with_sigchld_default must capture status");
+        // /bin/false on every supported Unix exits with code 1.
+        assert_eq!(
+            status.code(),
+            Some(1),
+            "/bin/false must surface non-zero code under helper; got {status:?}",
+        );
+    }
+
+    /// Regression: under `SIGCHLD = SIG_IGN`, a child that
+    /// exits before the poll window closes MUST be observed as
+    /// `Died`. The previous implementation called `Child::try_wait`
+    /// which internally calls `waitpid(pid, ..., WNOHANG)`; under
+    /// SIG_IGN that returns `ECHILD` and the old code mapped it to
+    /// `WaitError`, which the caller in `start_scheduler` then
+    /// treated as alive — leaving a crashed scheduler undetected.
+    /// The fix uses `proc_pid_alive` and pidfd POLLIN, both of
+    /// which are signal-disposition independent.
+    #[test]
+    fn poll_startup_detects_death_under_sigchld_ignore() {
+        let _guard = SIGCHLD_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _restore = SigchldGuard::install(libc::SIG_IGN);
+
+        let mut child = std::process::Command::new("/bin/true")
+            .spawn()
+            .expect("spawn /bin/true");
+        let status = poll_startup(
+            &mut child,
+            std::time::Duration::from_millis(10),
+            std::time::Duration::from_secs(1),
+        );
+        assert!(
+            matches!(status, StartupStatus::Died),
+            "under SIG_IGN, an exited child must be observed as Died (was {status:?})",
+        );
+    }
+
+    /// Regression (Alive arm under SIG_IGN): a child that
+    /// is still running when the timeout elapses must be observed
+    /// as `Alive` even when SIGCHLD is `SIG_IGN`. This guards the
+    /// post-timeout `proc_pid_alive` re-check that replaced the
+    /// old `try_wait` call (which would have returned ECHILD-as-
+    /// `WaitError` and the caller would have reported alive
+    /// anyway, but the new path must not regress that branch).
+    #[test]
+    fn poll_startup_reports_alive_under_sigchld_ignore() {
+        let _guard = SIGCHLD_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _restore = SigchldGuard::install(libc::SIG_IGN);
+
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("5")
+            .spawn()
+            .expect("spawn /bin/sleep");
+        let status = poll_startup(
+            &mut child,
+            std::time::Duration::from_millis(20),
+            std::time::Duration::from_millis(100),
+        );
+        // Reap the still-running child via SIGKILL + waitpid. We
+        // need to drop SIG_IGN before waiting or `child.wait()`
+        // would itself return ECHILD; the SigchldGuard's Drop
+        // restores at the end of the test, so flip to SIG_DFL for
+        // the cleanup. SAFETY: signal disposition is process-wide
+        // but this test holds SIGCHLD_TEST_LOCK, so no other
+        // signal-aware test runs concurrently.
+        let _ = child.kill();
+        unsafe {
+            libc::signal(libc::SIGCHLD, libc::SIG_DFL);
+        }
+        let _ = child.wait();
+        assert!(
+            matches!(status, StartupStatus::Alive),
+            "under SIG_IGN, a running child must be observed as Alive (was {status:?})",
+        );
+    }
+
+    /// Regression: the [`SCHED_PID`] side channel must
+    /// publish the writer's value and `sched_pid()` must return
+    /// `Some(pid)` when set, `None` when the sentinel `0` is in
+    /// place. Since `SCHED_PID` is a process-wide static, the test
+    /// snapshots the current value, exercises both store paths,
+    /// and restores the snapshot — so concurrent tests (and the
+    /// real producer in `start_scheduler` if some other test ever
+    /// drives it) do not see ambient corruption.
+    #[test]
+    fn sched_pid_side_channel_roundtrips() {
+        // Snapshot and restore with `Acquire`/`Release` to mirror
+        // the production load/store ordering. The test must hold
+        // exclusive access to the static for its lifetime; serial
+        // execution under the same process means concurrent
+        // `sched_pid()` readers in other tests would race, so this
+        // test is annotated to acquire `SIGCHLD_TEST_LOCK` even
+        // though it has no signal interaction — the existing lock
+        // is already the chokepoint for "tests that touch
+        // process-wide state" and serializing through it is
+        // cheaper than introducing a second mutex for one test.
+        let _guard = SIGCHLD_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let snapshot = SCHED_PID.load(Ordering::Acquire);
+
+        // Sentinel 0 must read as None.
+        SCHED_PID.store(0, Ordering::Release);
+        assert_eq!(sched_pid(), None, "0 must read as None (sentinel)");
+
+        // Non-zero writer publishes, reader observes.
+        SCHED_PID.store(12345, Ordering::Release);
+        assert_eq!(
+            sched_pid(),
+            Some(12345),
+            "writer must publish via the atomic side channel",
+        );
+
+        // Restore so the test does not leak state into peers.
+        SCHED_PID.store(snapshot, Ordering::Release);
+    }
+
+    /// Regression (no env-var write): the new fix must NOT
+    /// touch `std::env::set_var("SCHED_PID", ...)` because
+    /// mutating glibc's `__environ` while the probe thread is live
+    /// is documented UB. Asserting that the env var is absent
+    /// after a fresh atomic store is a proxy for "no rogue
+    /// env-mutation snuck back in." If a future refactor brings
+    /// `set_var` back, this test fails immediately.
+    #[test]
+    fn sched_pid_does_not_publish_via_env_var() {
+        let _guard = SIGCHLD_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        // Clear any ambient env var — some test harnesses inherit
+        // `SCHED_PID` from a parent shell. SAFETY: holding the
+        // mutex guarantees no concurrent env reader/writer in this
+        // test binary.
+        unsafe { std::env::remove_var("SCHED_PID") };
+
+        let snapshot = SCHED_PID.load(Ordering::Acquire);
+        SCHED_PID.store(99999, Ordering::Release);
+        assert_eq!(sched_pid(), Some(99999));
+        assert!(
+            std::env::var("SCHED_PID").is_err(),
+            "atomic side channel must not publish via env var",
+        );
+        SCHED_PID.store(snapshot, Ordering::Release);
     }
 }

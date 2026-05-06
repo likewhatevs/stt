@@ -416,6 +416,28 @@ pub(crate) fn drain_bracket_impl(
                     // structural-invariant violations the way
                     // InvalidAvailRingIndex is, so a future
                     // legitimate kick may succeed.
+                    //
+                    // Re-arm notifications before bailing. The
+                    // outer-loop's normal exit path calls
+                    // `enable_notification` (Ok(false) arm at the
+                    // bottom of the outer loop); a raw `break 'outer`
+                    // here skips that re-arm and leaves used.flags
+                    // with VRING_USED_F_NO_NOTIFY set (legacy path)
+                    // or a stale avail_event (EVENT_IDX path) from
+                    // the entry-side `disable_notification`. Without
+                    // re-arm the next QUEUE_NOTIFY may not reach the
+                    // device (legacy: the guest's `virtqueue_kick`
+                    // skips the MMIO write when used.flags bit is
+                    // set; EVENT_IDX: the guest checks avail_event
+                    // for the suppression decision), and the queue
+                    // hangs until the hung-task watchdog
+                    // (`kernel.hung_task_timeout_secs`, default
+                    // 120 s — virtio_blk has no `mq_ops->timeout`
+                    // callback). Re-arming is best-effort: if it
+                    // also fails we log and bail anyway.
+                    if let Err(re) = queues[REQ_QUEUE].enable_notification(mem) {
+                        tracing::warn!(%re, "virtio-blk enable_notification failed after iter() error");
+                    }
                     tracing::warn!(%e, "virtio-blk iter() failed");
                     break 'outer;
                 }
@@ -964,16 +986,32 @@ pub(crate) fn drain_bracket_impl(
             let (status_byte, used_len) = if let Some(out) = pre_throttle {
                 out
             } else {
-                // Pass `data_len` already computed above so handlers
-                // don't re-derive it (was a third sum() pass each).
-                // Pass `&mut state.io_buf_scratch` as a reusable
-                // per-segment buffer; handlers `resize(len, 0)` it
-                // per descriptor and the underlying `Vec<u8>`
-                // capacity grows monotonically up to
-                // VIRTIO_BLK_SIZE_MAX, then steady-state is zero
-                // allocation per segment.
+                // Production T_IN / T_OUT now route through the
+                // vectored helpers (`handle_read_vectored_impl` /
+                // `handle_write_vectored_impl`) which coalesce the
+                // chain's data segments into a single
+                // `preadv(2)` / `pwritev(2)` syscall against the
+                // backing file. The legacy per-segment helpers
+                // (`handle_read_impl` / `handle_write_impl` in
+                // `handlers.rs`) remain — the cfg(test) test
+                // wrappers `dev.handle_read` / `dev.handle_write`
+                // continue to call them directly so the existing
+                // chain-level proptest / handler-level test surface
+                // is not perturbed by this change.
+                //
+                // `state.io_buf_scratch` is no longer used on the
+                // production path; the vectored helpers write
+                // directly into guest memory via `mem.get_slices`
+                // host pointers, eliminating the kernel→scratch→
+                // guest two-stage memcpy of the legacy path. The
+                // scratch field stays on `BlkWorkerState` because
+                // it is still consumed by the cfg(test) test
+                // wrappers' calls into `handle_read_impl` /
+                // `handle_write_impl`. `data_len` is passed
+                // already-computed so the helpers don't re-derive
+                // it.
                 match req_type {
-                    VIRTIO_BLK_T_IN => VirtioBlk::handle_read_impl(
+                    VIRTIO_BLK_T_IN => VirtioBlk::handle_read_vectored_impl(
                         backing,
                         cap_bytes,
                         counters,
@@ -981,9 +1019,8 @@ pub(crate) fn drain_bracket_impl(
                         sector,
                         data_segments,
                         data_len,
-                        &mut state.io_buf_scratch,
                     ),
-                    VIRTIO_BLK_T_OUT => VirtioBlk::handle_write_impl(
+                    VIRTIO_BLK_T_OUT => VirtioBlk::handle_write_vectored_impl(
                         backing,
                         cap_bytes,
                         counters,
@@ -991,7 +1028,6 @@ pub(crate) fn drain_bracket_impl(
                         sector,
                         data_segments,
                         data_len,
-                        &mut state.io_buf_scratch,
                     ),
                     VIRTIO_BLK_T_FLUSH => VirtioBlk::handle_flush_impl(backing, counters),
                     VIRTIO_BLK_T_GET_ID => {

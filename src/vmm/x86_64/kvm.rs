@@ -50,19 +50,6 @@ pub(crate) const VIRTIO_BLK_MMIO_BASE: u64 = MMIO_GAP_START + 0x1000;
 /// Each virtio-mmio device occupies `VIRTIO_MMIO_SIZE = 0x1000`.
 pub(crate) const VIRTIO_NET_MMIO_BASE: u64 = MMIO_GAP_START + 0x2000;
 
-/// Snapshot doorbell MMIO GPA. The freeze coordinator registers an
-/// in-kernel ioeventfd at this address via `KVM_IOEVENTFD`; the guest
-/// fires a snapshot capture by `mmap`'ing `/dev/mem` at this GPA and
-/// performing a single 4-byte write. KVM dispatches the write
-/// in-kernel without a userspace exit and signals the eventfd, which
-/// the coordinator polls alongside its other wake sources. See
-/// [`super::super::shm_ring::doorbell_fire`] for the guest-side
-/// helper and `freeze_coord.rs` for the host side.
-///
-/// One page above virtio-net so a future virtio-mmio device addition
-/// at the next page boundary cannot collide with the doorbell GPA.
-pub(crate) const DOORBELL_MMIO_GPA: u64 = MMIO_GAP_START + 0x3000;
-
 /// IRQ for virtio-console (GSI routed through IOAPIC).
 /// Uses IRQ 5 — available with full IRQ chip. With split IRQ chip
 /// (no IOAPIC), MSI would be needed; not supported for now.

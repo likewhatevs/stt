@@ -80,9 +80,22 @@ pub fn custom_cgroup_remove_midrun(ctx: &Ctx) -> Result<AssertResult> {
 pub fn custom_cgroup_rapid_churn(ctx: &Ctx) -> Result<AssertResult> {
     let (handles, _guard) = setup_cgroups(ctx, 2, &dfl_wl(ctx))?;
     let deadline = Instant::now() + ctx.duration;
-    let mut i = 0;
+    let mut i = 0usize;
+    // Cap on the number of distinct ephemeral cgroup names. The
+    // remove path is best-effort (see comment below); without a cap
+    // a long scenario with persistent EBUSY/ENOENT churn would
+    // accumulate one cgroup per iteration in the cgroupfs tree until
+    // the guard's Drop reaps them at scenario teardown. Reusing the
+    // same 100 names via `i % 100` bounds peak resident cgroup count
+    // to at most 100 leaked entries, while still exercising the
+    // rapid create→remove churn the test is designed to drive.
+    // `create_cgroup` is idempotent on a name whose dir already
+    // exists (`if !p.exists()` in `CgroupManager::create_cgroup`), so
+    // a cycle that lapped a still-resident sibling is a no-op
+    // re-create rather than an error.
+    const MAX_EPHEMERAL_NAMES: usize = 100;
     while Instant::now() < deadline {
-        let n = format!("ephemeral_{i}");
+        let n = format!("ephemeral_{}", i % MAX_EPHEMERAL_NAMES);
         ctx.cgroups.create_cgroup(&n)?;
         thread::sleep(Duration::from_millis(100));
         // Best-effort teardown: rapid-churn drives cgroup
@@ -96,7 +109,7 @@ pub fn custom_cgroup_rapid_churn(ctx: &Ctx) -> Result<AssertResult> {
         if let Err(e) = ctx.cgroups.remove_cgroup(&n) {
             tracing::warn!(cgroup = %n, err = %format!("{e:#}"), "rapid churn: remove_cgroup failed; guard Drop will reap on scenario teardown");
         }
-        i += 1;
+        i = i.wrapping_add(1);
     }
     Ok(collect_all(handles, &ctx.assert))
 }

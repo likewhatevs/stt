@@ -928,10 +928,11 @@ pub(super) fn render_map(ctx: &RenderMapCtx<'_>, info: &BpfMapInfo) -> FailureDu
     // per-cgroup); single-allocator schedulers fall through to the
     // unique candidate. See [`select_sdt_alloc_meta`] for the
     // matching rule.
+    let info_name = info.name();
     let sdt_alloc_meta: Option<SdtAllocMeta> =
-        select_sdt_alloc_meta(sdt_alloc_metas, &info.name).cloned();
+        select_sdt_alloc_meta(sdt_alloc_metas, &info_name).cloned();
     let mut out = FailureDumpMap {
-        name: info.name.clone(),
+        name: info_name.into_owned(),
         map_type: info.map_type,
         value_size: info.value_size,
         max_entries: info.max_entries,
@@ -976,7 +977,13 @@ pub(super) fn render_map(ctx: &RenderMapCtx<'_>, info: &BpfMapInfo) -> FailureDu
                     // ASCII dump with non-printable bytes escaped so
                     // operators see the actual literals their
                     // scheduler is using rather than scanning hex.
-                    out.value = Some(if is_str_literal_section(&info.name) {
+                    // Re-use `out.name` (computed once above from
+                    // `info.name()` and stashed into the FailureDumpMap)
+                    // instead of calling `info.name()` a second time.
+                    // `info.name()` allocates whenever the map name
+                    // is non-UTF-8; even on the alloc-free ASCII fast
+                    // path the duplicate `Cow` build is wasted work.
+                    out.value = Some(if is_str_literal_section(&out.name) {
                         RenderedValue::Bytes {
                             hex: ascii_str_dump(&bytes),
                         }

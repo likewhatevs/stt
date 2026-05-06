@@ -178,10 +178,18 @@ impl Verdict {
         self
     }
 
-    /// Mark the verdict as skipped with the supplied reason. Mirrors
-    /// [`AssertResult::skip`] semantics: `passed` stays `true`, the
-    /// skip reason is recorded as a [`DetailKind::Skip`] detail. Use
-    /// when a precondition is missing and the scenario cannot run.
+    /// Mark the verdict as skipped with the supplied reason. Sets
+    /// `skipped = true` and records the reason as a
+    /// [`DetailKind::Skip`] detail. Use when a precondition is
+    /// missing and the scenario cannot run.
+    ///
+    /// `passed` is preserved: a verdict whose earlier claim failed
+    /// (`passed = false`) and then transitions to skip stays
+    /// failed. Once a claim records a real failure, masking it
+    /// with a later skip would lie to gate callers — the prior
+    /// failure is real evidence and must surface. Distinct from
+    /// [`AssertResult::skip`], which is a CONSTRUCTOR producing a
+    /// fresh passing-skipped envelope from no prior state.
     pub fn skip(&mut self, reason: &'static str) -> &mut Self {
         self.result.skipped = true;
         self.result

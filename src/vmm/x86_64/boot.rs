@@ -112,10 +112,6 @@ pub fn write_cmdline(guest_mem: &GuestMemoryMmap, cmdline: &str) -> Result<()> {
 
 /// Write boot parameters (zero page) into guest memory.
 /// Uses the setup_header from the actual bzImage when available.
-///
-/// When `shm_size > 0`, the last high-memory E820 entry is shortened by
-/// `shm_size` bytes so the SHM region at the top of guest physical memory
-/// is an E820 gap (no entry covers it).
 #[allow(clippy::field_reassign_with_default)]
 pub fn write_boot_params(
     guest_mem: &GuestMemoryMmap,
@@ -124,7 +120,6 @@ pub fn write_boot_params(
     initrd_addr: Option<u64>,
     initrd_size: Option<u32>,
     hdr: Option<&linux_loader::loader::bootparam::setup_header>,
-    shm_size: u64,
 ) -> Result<()> {
     use linux_loader::loader::bootparam::{boot_e820_entry, boot_params};
 
@@ -154,11 +149,8 @@ pub fn write_boot_params(
     // E820 memory map — Firecracker pattern:
     // Entry 0: low memory (0 to EBDA)
     // Entry 1+: high memory (1MB to end, split at MMIO gap if needed)
-    //
-    // When shm_size > 0, the SHM region occupies the top of physical memory
-    // and must not appear in E820. The last high-memory entry is reduced.
     let mem_size = (memory_mb as u64) << 20;
-    let usable_size = mem_size - shm_size;
+    let usable_size = mem_size;
 
     let mut e820_idx = 0;
 
@@ -589,7 +581,7 @@ mod tests {
     #[test]
     fn write_boot_params_basic() {
         let mem = test_mem(16);
-        write_boot_params(&mem, "console=ttyS0", 16, None, None, None, 0).unwrap();
+        write_boot_params(&mem, "console=ttyS0", 16, None, None, None).unwrap();
         use linux_loader::loader::bootparam::boot_params;
         let params: boot_params = mem.read_obj(GuestAddress(BOOT_PARAMS_ADDR)).unwrap();
         let header = { params.hdr.header };
@@ -610,7 +602,6 @@ mod tests {
             Some(0x200000),
             Some(4096),
             None,
-            0,
         )
         .unwrap();
         use linux_loader::loader::bootparam::boot_params;
@@ -827,7 +818,7 @@ mod tests {
     #[test]
     fn e820_small_mem_two_entries() {
         let mem = test_mem(512);
-        write_boot_params(&mem, "console=ttyS0", 512, None, None, None, 0).unwrap();
+        write_boot_params(&mem, "console=ttyS0", 512, None, None, None).unwrap();
         use linux_loader::loader::bootparam::boot_params;
         let params: boot_params = mem.read_obj(GuestAddress(BOOT_PARAMS_ADDR)).unwrap();
         let entries = { params.e820_entries };
@@ -846,7 +837,7 @@ mod tests {
     fn e820_large_mem_splits_around_mmio_gap() {
         // 5 GB: memory extends beyond the MMIO gap.
         let mem = test_mem(5120);
-        write_boot_params(&mem, "console=ttyS0", 5120, None, None, None, 0).unwrap();
+        write_boot_params(&mem, "console=ttyS0", 5120, None, None, None).unwrap();
         use linux_loader::loader::bootparam::boot_params;
         let params: boot_params = mem.read_obj(GuestAddress(BOOT_PARAMS_ADDR)).unwrap();
         let entries = { params.e820_entries };
@@ -867,7 +858,7 @@ mod tests {
     fn e820_4gb_no_above_gap_entry() {
         // 4 GB exactly equals MMIO_GAP_END — no memory above the gap.
         let mem = test_mem(4096);
-        write_boot_params(&mem, "console=ttyS0", 4096, None, None, None, 0).unwrap();
+        write_boot_params(&mem, "console=ttyS0", 4096, None, None, None).unwrap();
         use linux_loader::loader::bootparam::boot_params;
         let params: boot_params = mem.read_obj(GuestAddress(BOOT_PARAMS_ADDR)).unwrap();
         let entries = { params.e820_entries };
@@ -879,7 +870,7 @@ mod tests {
     #[test]
     fn e820_exact_3gb_two_entries() {
         let mem = test_mem(3072);
-        write_boot_params(&mem, "console=ttyS0", 3072, None, None, None, 0).unwrap();
+        write_boot_params(&mem, "console=ttyS0", 3072, None, None, None).unwrap();
         use linux_loader::loader::bootparam::boot_params;
         let params: boot_params = mem.read_obj(GuestAddress(BOOT_PARAMS_ADDR)).unwrap();
         let entries = { params.e820_entries };
@@ -988,7 +979,7 @@ mod tests {
     fn e820_at_mmio_boundary() {
         // Memory exactly at MMIO gap start (3 GB) — should produce 2 entries
         let mem = test_mem(3072); // 3 GB
-        let params = write_boot_params(&mem, "console=ttyS0", 3072, None, None, None, 0);
+        let params = write_boot_params(&mem, "console=ttyS0", 3072, None, None, None);
         assert!(params.is_ok());
     }
 
@@ -996,54 +987,8 @@ mod tests {
     fn e820_above_mmio_gap() {
         // Memory above MMIO gap (5 GB) — should produce 3 entries
         let mem = test_mem(5120); // 5 GB
-        let params = write_boot_params(&mem, "console=ttyS0", 5120, None, None, None, 0);
+        let params = write_boot_params(&mem, "console=ttyS0", 5120, None, None, None);
         assert!(params.is_ok());
     }
 
-    // -- SHM region E820 gap tests --
-
-    #[test]
-    fn e820_shm_reduces_high_memory() {
-        let mem = test_mem(512);
-        let shm_size: u64 = 64 * 1024; // 64 KB
-        write_boot_params(&mem, "console=ttyS0", 512, None, None, None, shm_size).unwrap();
-        use linux_loader::loader::bootparam::boot_params;
-        let params: boot_params = mem.read_obj(GuestAddress(BOOT_PARAMS_ADDR)).unwrap();
-        let entries = { params.e820_entries };
-        assert_eq!(entries, 2, "shm: low + high (no MMIO split)");
-        let size1 = { params.e820_table[1].size };
-        // High memory should be total - HIMEM_START - shm_size.
-        assert_eq!(size1, (512 << 20) - HIMEM_START - shm_size);
-    }
-
-    #[test]
-    fn e820_shm_zero_unchanged() {
-        // shm_size=0 should produce identical results to the non-shm case.
-        let mem_a = test_mem(512);
-        let mem_b = test_mem(512);
-        write_boot_params(&mem_a, "console=ttyS0", 512, None, None, None, 0).unwrap();
-        write_boot_params(&mem_b, "console=ttyS0", 512, None, None, None, 0).unwrap();
-        use linux_loader::loader::bootparam::boot_params;
-        let pa: boot_params = mem_a.read_obj(GuestAddress(BOOT_PARAMS_ADDR)).unwrap();
-        let pb: boot_params = mem_b.read_obj(GuestAddress(BOOT_PARAMS_ADDR)).unwrap();
-        assert_eq!(pa.e820_entries, pb.e820_entries);
-        let size_a = { pa.e820_table[1].size };
-        let size_b = { pb.e820_table[1].size };
-        assert_eq!(size_a, size_b);
-    }
-
-    #[test]
-    fn e820_shm_large_mem_reduces_above_gap() {
-        // 5 GB with 1 MB SHM: usable = 5119 MB, well above MMIO_GAP_END.
-        let mem = test_mem(5120);
-        let shm_size: u64 = 1 << 20; // 1 MB
-        write_boot_params(&mem, "console=ttyS0", 5120, None, None, None, shm_size).unwrap();
-        use linux_loader::loader::bootparam::boot_params;
-        let params: boot_params = mem.read_obj(GuestAddress(BOOT_PARAMS_ADDR)).unwrap();
-        let entries = { params.e820_entries };
-        assert_eq!(entries, 3);
-        // The above-gap entry should be reduced by shm_size.
-        let size2 = { params.e820_table[2].size };
-        assert_eq!(size2, (5120u64 << 20) - MMIO_GAP_END - shm_size);
-    }
 }

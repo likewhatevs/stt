@@ -998,10 +998,14 @@ fn build_dispatch_ctx_parts(
     // controllers (a test that requires the absence of a controller
     // would fail) or under-enable them (the test's set_cpuset/set_memory
     // call would fail with bare ENOENT/EACCES at the knob-write site).
-    let sched_pid = std::env::var("SCHED_PID")
-        .ok()
-        .and_then(|s| s.parse::<libc::pid_t>().ok())
-        .filter(|&pid| pid != 0);
+    // Read the scheduler PID from the atomic side channel published by
+    // `vmm::rust_init::start_scheduler`. The previous consumer parsed
+    // `std::env::var("SCHED_PID")`, which is unsound under the live
+    // probe thread spawned by `start_probe_phase_a` — glibc mutates
+    // `__environ` without locks, so a concurrent reader vs. writer
+    // races. `sched_pid()` returns `None` on the `0` sentinel, matching
+    // the `.filter(|&pid| pid != 0)` clause it replaces.
+    let sched_pid = crate::vmm::rust_init::sched_pid();
     // Three-layer merge: default_checks → scheduler.assert → entry.assert.
     let merged_assert = crate::assert::Assert::default_checks()
         .merge(entry.scheduler.assert())
@@ -2662,8 +2666,9 @@ mod tests {
     #[test]
     fn classify_repro_vm_status_crashed_from_crash_message() {
         // crash_message set without a SCHEDULER_DIED sentinel (e.g.
-        // VM-level crash detection from COM1) still routes to the
-        // crashed branch. Positive exit code → non-zero-status clause.
+        // a guest-side panic captured from COM2 by
+        // `extract_panic_message`) still routes to the crashed
+        // branch. Positive exit code → non-zero-status clause.
         let status = classify_repro_vm_status(false, true, "no sentinels here", 134);
         assert_eq!(
             status,

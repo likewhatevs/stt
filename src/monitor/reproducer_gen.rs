@@ -815,8 +815,12 @@ pub fn render_run_file_source(spec: &ReproducerSpec, template_name: &str) -> Str
         s.push_str("\n// Cgroup hints — apply at harness setup:\n");
         for h in &spec.cgroup_hints {
             s.push_str(&format!(
-                "// {} (weight={:?}, mem_max={:?}, cpuset={:?})\n",
-                h.path, h.cpu_weight, h.memory_max_bytes, h.cpuset_cpus
+                "// {} (weight={:?}, mem_max={:?}, cpuset={:?}, cpu_max_quota_us={:?})\n",
+                h.path,
+                h.cpu_weight,
+                h.memory_max_bytes,
+                h.cpuset_cpus,
+                h.cpu_max_quota_us,
             ));
         }
     }
@@ -1833,22 +1837,52 @@ mod tests {
 
     /// Cgroup hints render as comments at the bottom of generated
     /// source (the harness applies them at setup time, not via
-    /// WorkloadConfig builder).
+    /// WorkloadConfig builder). Pins every [`CgroupHint`] field that
+    /// the renderer surfaces — `path`, `cpu_weight`, `memory_max_bytes`,
+    /// `cpuset_cpus`, and `cpu_max_quota_us`. A regression that
+    /// silently drops one of these from the rendered comment surfaces
+    /// here rather than at reproducer-generation time. The fixture
+    /// uses an unlimited (`None`) and a bounded (`Some(75_000)`)
+    /// hint so both `Option` shapes round-trip through the renderer.
     #[test]
     fn render_run_file_source_includes_cgroup_hints_as_comments() {
         let mut cap = DebugCapture::default();
-        cap.fingerprint.cgroup_hints = vec![CgroupHint {
-            path: "/system.slice/foo.service".into(),
-            cpu_weight: Some(200),
-            memory_max_bytes: Some(8 * 1024 * 1024 * 1024),
-            cpuset_cpus: vec![0, 1, 2, 3],
-            cpu_max_quota_us: None,
-        }];
+        cap.fingerprint.cgroup_hints = vec![
+            CgroupHint {
+                path: "/system.slice/foo.service".into(),
+                cpu_weight: Some(200),
+                memory_max_bytes: Some(8 * 1024 * 1024 * 1024),
+                cpuset_cpus: vec![0, 1, 2, 3],
+                cpu_max_quota_us: None,
+            },
+            CgroupHint {
+                path: "/system.slice/bar.service".into(),
+                cpu_weight: Some(100),
+                memory_max_bytes: None,
+                cpuset_cpus: vec![4, 5],
+                cpu_max_quota_us: Some(75_000),
+            },
+        ];
         let spec = generate_spec(&cap);
         let src = render_run_file_source(&spec, "with_cgroup");
         assert!(src.contains("Cgroup hints"));
         assert!(src.contains("/system.slice/foo.service"));
         assert!(src.contains("weight=Some(200)"));
+        // Unlimited (`None`) `cpu_max_quota_us` round-trips as `None`.
+        assert!(
+            src.contains("cpu_max_quota_us=None"),
+            "unlimited cpu_max_quota_us must render as None: {src}",
+        );
+        // Bounded `cpu_max_quota_us` round-trips with the captured
+        // microsecond value.
+        assert!(
+            src.contains("/system.slice/bar.service"),
+            "second cgroup hint must render: {src}",
+        );
+        assert!(
+            src.contains("cpu_max_quota_us=Some(75000)"),
+            "bounded cpu_max_quota_us must render its value: {src}",
+        );
     }
 
     /// End-to-end smoke test: build a fingerprint with one hint of
@@ -1956,6 +1990,11 @@ mod tests {
         assert!(
             src1.contains("/system.slice/foo.service"),
             "cgroup path must appear in the rendered comments: {src1}",
+        );
+        assert!(
+            src1.contains("cpu_max_quota_us=Some(50000)"),
+            "cpu_max_quota_us must render alongside the other cgroup \
+             fields (weight/mem_max/cpuset): {src1}",
         );
 
         // Notes block contains the propagated fingerprint gap +

@@ -9,14 +9,14 @@
 //! definition stays in [`super`].
 
 use anyhow::{Context, Result};
-use kvm_ioctls::{IoEventAddress, NoDatamatch, VcpuExit};
+use kvm_ioctls::VcpuExit;
 use std::os::fd::AsRawFd;
 use std::os::unix::thread::JoinHandleExt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
-use vm_memory::{Bytes, GuestAddress, GuestMemory};
+use vm_memory::{GuestAddress, GuestMemory};
 use vmm_sys_util::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use vmm_sys_util::eventfd::{EFD_NONBLOCK, EventFd};
 use vmm_sys_util::timerfd::TimerFd;
@@ -33,7 +33,8 @@ use super::vcpu::{
     vcpu_signal,
 };
 use super::vmlinux::find_vmlinux;
-use super::{KtstrVm, console, shm_ring, vcpu_panic, virtio_blk, virtio_console, virtio_net};
+use super::host_comms::BulkDrainResult;
+use super::{KtstrVm, console, host_comms, vcpu_panic, virtio_blk, virtio_console, virtio_net, wire};
 
 #[cfg(target_arch = "aarch64")]
 use super::aarch64::kvm;
@@ -98,110 +99,169 @@ enum BspExitReason {
     Timeout,
 }
 
-/// Decoded contents of the SHM snapshot request slot. Read by the
-/// freeze coordinator's doorbell handler each time the doorbell
-/// eventfd fires; identifies which dispatch path (CAPTURE / WATCH /
-/// unknown) the guest requested and carries the correlated
-/// `request_id` the host stamps back into `snapshot_reply_id`.
+/// Decoded contents of a guest-side `MSG_TYPE_SNAPSHOT_REQUEST` TLV
+/// frame consumed from the virtio-console port-1 TX stream by the
+/// coordinator's TOKEN_TX handler. The request id is echoed in the
+/// matching `MSG_TYPE_SNAPSHOT_REPLY` payload so the guest's blocking
+/// reader can pair the reply against its outstanding request; `kind`
+/// selects the CAPTURE / WATCH dispatch path and `tag` carries the
+/// snapshot name (CAPTURE) or symbol path (WATCH).
 struct SnapshotRequest {
     request_id: u32,
     kind: u32,
     tag: String,
 }
 
-/// Read the snapshot request slot from the guest's SHM region.
-/// Returns `Some(SnapshotRequest)` when a populated request is
-/// present (`request_id != 0`); `None` when the SHM region is not
-/// configured, the request_id is zero, or the kind is NONE — that
-/// last case being the "host-side trigger fired the doorbell
-/// without a guest request" path.
-fn read_snapshot_request(
-    mem: Option<&monitor::reader::GuestMem>,
-    shm_base: Option<u64>,
-) -> Option<SnapshotRequest> {
-    let mem = mem?;
-    let shm_base = shm_base?;
-    let request_id = mem.read_u32(shm_base, shm_ring::SNAPSHOT_REQUEST_ID_OFFSET);
-    let kind = mem.read_u32(shm_base, shm_ring::SNAPSHOT_KIND_OFFSET);
-    if request_id == 0 || kind == shm_ring::SHM_SNAPSHOT_KIND_NONE {
+/// Frame a `MSG_TYPE_SNAPSHOT_REPLY` TLV — header (16 bytes) plus
+/// [`crate::vmm::wire::SnapshotReplyPayload`] (72 bytes) — into a
+/// single buffer the coordinator pushes through
+/// [`crate::vmm::virtio_console::VirtioConsole::queue_input_port1`].
+/// The reply is delivered atomically as one TLV: the buffer is
+/// concatenated before the call so a partial push that splits header
+/// and payload across multiple `queue_input_port1` invocations cannot
+/// arise. CRC32 is computed over the payload bytes only — matches
+/// the wire-format contract `parse_tlv_stream` enforces on the
+/// guest's `read_bulk_port_frame`.
+fn frame_snapshot_reply(request_id: u32, status: u32, reason: &str) -> Vec<u8> {
+    use crate::vmm::wire::{
+        FRAME_HEADER_SIZE, MSG_TYPE_SNAPSHOT_REPLY, SNAPSHOT_REASON_MAX, ShmMessage,
+        SnapshotReplyPayload,
+    };
+    use zerocopy::IntoBytes;
+    // Reason buffer: NUL-terminated UTF-8, truncated to the buffer
+    // size. Trailing zeros remain from the array initializer so a
+    // shorter reason terminates cleanly on the guest side.
+    let reason_bytes = reason.as_bytes();
+    let reason_len = reason_bytes.len().min(SNAPSHOT_REASON_MAX);
+    let mut reason_buf = [0u8; SNAPSHOT_REASON_MAX];
+    reason_buf[..reason_len].copy_from_slice(&reason_bytes[..reason_len]);
+    let payload = SnapshotReplyPayload {
+        request_id,
+        status,
+        reason: reason_buf,
+    };
+    let payload_bytes = payload.as_bytes();
+    let header = ShmMessage {
+        msg_type: MSG_TYPE_SNAPSHOT_REPLY,
+        length: payload_bytes.len() as u32,
+        crc32: crc32fast::hash(payload_bytes),
+        _pad: 0,
+    };
+    let mut buf = Vec::with_capacity(FRAME_HEADER_SIZE + payload_bytes.len());
+    buf.extend_from_slice(header.as_bytes());
+    buf.extend_from_slice(payload_bytes);
+    buf
+}
+
+/// Decode a guest-side `MSG_TYPE_SNAPSHOT_REQUEST` TLV payload into
+/// the typed [`SnapshotRequest`]. `payload` must be exactly
+/// `size_of::<SnapshotRequestPayload>()` bytes — the bulk parser
+/// already enforces the per-frame cap, but a malformed guest may
+/// publish a frame whose announced length doesn't match the typed
+/// payload size. Returns `None` for any size or layout mismatch so
+/// the TOKEN_TX handler can drop the frame without touching dispatch.
+fn decode_snapshot_request(payload: &[u8]) -> Option<SnapshotRequest> {
+    use crate::vmm::wire::{SNAPSHOT_KIND_NONE, SNAPSHOT_TAG_MAX, SnapshotRequestPayload};
+    use zerocopy::FromBytes;
+    if payload.len() != std::mem::size_of::<SnapshotRequestPayload>() {
         return None;
     }
-    let mut tag_bytes = [0u8; shm_ring::SHM_SNAPSHOT_TAG_MAX];
-    for (i, b) in tag_bytes.iter_mut().enumerate() {
-        *b = mem.read_u8(shm_base, shm_ring::SNAPSHOT_TAG_OFFSET + i);
+    let req = SnapshotRequestPayload::read_from_bytes(payload).ok()?;
+    if req.request_id == 0 || req.kind == SNAPSHOT_KIND_NONE {
+        return None;
     }
-    let len = tag_bytes
+    let len = req
+        .tag
         .iter()
         .position(|&b| b == 0)
-        .unwrap_or(shm_ring::SHM_SNAPSHOT_TAG_MAX);
-    let tag = String::from_utf8_lossy(&tag_bytes[..len]).to_string();
+        .unwrap_or(SNAPSHOT_TAG_MAX);
+    let tag = String::from_utf8_lossy(&req.tag[..len]).to_string();
     Some(SnapshotRequest {
-        request_id,
-        kind,
+        request_id: req.request_id,
+        kind: req.kind,
         tag,
     })
 }
 
-/// Stamp a reply into the SHM snapshot reply slot. Writes the reason
-/// buffer first (so the guest's Acquire load on `snapshot_reply_id`
-/// observes the reason atomically), then the status, then the
-/// reply_id last — mirroring the guest's publish ordering on the
-/// request side.
-fn write_snapshot_reply(
-    mem: Option<&monitor::reader::GuestMem>,
-    shm_base: Option<u64>,
-    request_id: u32,
-    status: u32,
-    reason: &str,
-) {
-    let Some(mem) = mem else {
-        return;
-    };
-    let Some(shm_base) = shm_base else {
-        return;
-    };
-    // Reason buffer: NUL-terminated UTF-8, truncated to the buffer
-    // size. Pad the trailing bytes with zeros so a stale reason
-    // from a prior request does not bleed through.
-    let reason_bytes = reason.as_bytes();
-    let len = reason_bytes.len().min(shm_ring::SHM_SNAPSHOT_TAG_MAX);
-    if len > 0 {
-        mem.write_bytes(
-            shm_base + shm_ring::SNAPSHOT_REASON_OFFSET as u64,
-            &reason_bytes[..len],
-        );
-    }
-    // Trailing zero pad (always at least one byte after the truncated
-    // text so `from_utf8_lossy` stops cleanly on the guest side).
-    let mut zero = [0u8; shm_ring::SHM_SNAPSHOT_TAG_MAX];
-    zero[..shm_ring::SHM_SNAPSHOT_TAG_MAX - len].copy_from_slice(
-        &[0u8; shm_ring::SHM_SNAPSHOT_TAG_MAX][..shm_ring::SHM_SNAPSHOT_TAG_MAX - len],
-    );
-    if len < shm_ring::SHM_SNAPSHOT_TAG_MAX {
-        mem.write_bytes(
-            shm_base + (shm_ring::SNAPSHOT_REASON_OFFSET + len) as u64,
-            &zero[..shm_ring::SHM_SNAPSHOT_TAG_MAX - len],
-        );
-    }
-    // Status, then reply_id last (publish order).
-    mem.write_u32(shm_base, shm_ring::SNAPSHOT_STATUS_OFFSET, status);
-    std::sync::atomic::fence(Ordering::Release);
-    mem.write_u32(shm_base, shm_ring::SNAPSHOT_REPLY_ID_OFFSET, request_id);
+/// Cached `name -> KVA` map built once at coordinator init from the
+/// vmlinux ELF symbol table. Lets [`arm_user_watchpoint`] look up
+/// `Op::WatchSnapshot` symbols without re-reading and re-parsing
+/// the 50MB+ vmlinux per request.
+struct VmlinuxSymbolCache {
+    symbols: std::collections::HashMap<String, u64>,
 }
 
-/// Resolve a kernel symbol by name from the vmlinux ELF and arm a
-/// user watchpoint slot (slots 1..=3) on it. Returns the slot index
-/// (0..=2 mapping to slots 1..=3) on success, or a host-side
-/// diagnostic on failure.
+impl VmlinuxSymbolCache {
+    /// Read and parse `path` once, extracting every symbol with a
+    /// non-zero `st_value` into the cache. Errors propagate as
+    /// caller-side diagnostics so arming surfaces the same reason
+    /// strings the per-call parse used.
+    fn from_path(path: &std::path::Path) -> std::result::Result<Self, String> {
+        let data = std::fs::read(path)
+            .map_err(|e| format!("read vmlinux at {}: {e}", path.display()))?;
+        let elf = goblin::elf::Elf::parse(&data)
+            .map_err(|e| format!("parse vmlinux ELF: {e}"))?;
+        let mut symbols = std::collections::HashMap::new();
+        for s in elf.syms.iter() {
+            if s.st_value == 0 {
+                continue;
+            }
+            if let Some(name) = elf.strtab.get_at(s.st_name) {
+                symbols.insert(name.to_string(), s.st_value);
+            }
+        }
+        Ok(Self { symbols })
+    }
+
+    fn lookup(&self, symbol: &str) -> Option<u64> {
+        self.symbols.get(symbol).copied()
+    }
+}
+
+/// Resolve a kernel symbol by name from the cached vmlinux symbol
+/// table and arm a user watchpoint slot (slots 1..=3) on it.
+/// Returns the slot index (0..=2 mapping to slots 1..=3) on
+/// success, or a host-side diagnostic on failure.
 ///
 /// The vCPU thread's `self_arm_watchpoint` notices the change on
 /// the next loop iteration (Acquire load on the slot's
 /// `request_kva`) and reprograms `KVM_SET_GUEST_DEBUG` with the
 /// new DR layout.
+/// Arm a user watchpoint slot on `symbol`'s resolved KVA.
+///
+/// On success, the slot's `request_kva` is published with `Release`,
+/// `WatchpointArm::mark_armed()` flips the fast-path gate, and every
+/// vCPU thread (BSP + APs) is kicked out of `KVM_RUN` so its next
+/// loop iteration runs `self_arm_watchpoint` and reprograms
+/// `KVM_SET_GUEST_DEBUG`.
+///
+/// Without the gate flip, the per-vCPU `self_arm_watchpoint` short-
+/// circuits at the `any_armed.load(Relaxed) == 0` check and never
+/// observes the published `request_kva`. Without the kick, vCPU
+/// threads sitting in `KVM_RUN` only re-check the slot on their next
+/// natural exit (HLT, IO, IRQ) — for compute-bound guests that can
+/// be many seconds, missing the very write the user requested to
+/// observe. Mirrors the freeze-rendezvous kick pattern (pass 1: set
+/// every immediate_exit byte; pass 2: deliver SIGRTMIN to every
+/// vCPU TID), differing only in that arming does NOT request a
+/// freeze — vCPUs immediately re-enter `KVM_RUN` after the arm.
+///
+/// `bsp_alive_load` is the same Acquire-bool the freeze_and_capture
+/// closure consults: a `false` reading means the BSP `VcpuFd` is
+/// gone and writing through `bsp_ie_handle` would touch unmapped
+/// memory. The check happens once at the start of the kick pass and
+/// gates BOTH the BSP `ie.set(1)` and the BSP `pthread_kill` so the
+/// pair stays symmetric.
+#[allow(clippy::too_many_arguments)]
 fn arm_user_watchpoint(
     watchpoint: &Arc<super::vcpu::WatchpointArm>,
-    kernel_path: &std::path::Path,
+    symbol_cache: &VmlinuxSymbolCache,
     symbol: &str,
+    ap_pthreads: &[libc::pthread_t],
+    ap_ies: &[Option<ImmediateExitHandle>],
+    bsp_tid: libc::pthread_t,
+    bsp_ie: Option<&ImmediateExitHandle>,
+    bsp_alive_load: bool,
 ) -> std::result::Result<usize, String> {
     // Check cap and find a free slot.
     let mut free_slot: Option<usize> = None;
@@ -218,15 +278,11 @@ fn arm_user_watchpoint(
             watchpoint.user.len()
         ));
     };
-    // Resolve the symbol via vmlinux ELF parse.
-    let data = std::fs::read(kernel_path)
-        .map_err(|e| format!("read vmlinux at {}: {e}", kernel_path.display()))?;
-    let elf = goblin::elf::Elf::parse(&data).map_err(|e| format!("parse vmlinux ELF: {e}"))?;
-    let kva = elf
-        .syms
-        .iter()
-        .find(|s| s.st_value != 0 && elf.strtab.get_at(s.st_name) == Some(symbol))
-        .map(|s| s.st_value)
+    // Resolve the symbol via the cached vmlinux symbol table.
+    // The cache is built once at coord init; per-call lookups are
+    // O(1) HashMap reads instead of 50MB+ file reads + ELF parses.
+    let kva = symbol_cache
+        .lookup(symbol)
         .ok_or_else(|| format!("symbol '{symbol}' not found in vmlinux symtab"))?;
     if kva & 0x3 != 0 {
         return Err(format!(
@@ -250,32 +306,61 @@ fn arm_user_watchpoint(
     watchpoint.user[idx]
         .request_kva
         .store(kva, Ordering::Release);
-    // Pre-emptively kick every vCPU out of KVM_RUN so it reaches
-    // self_arm_watchpoint promptly. The watchpoint's hit_evt is the
-    // cleanest available wake fd; a write here causes any vCPU
-    // currently inside the run loop to (best-effort) re-check the
-    // slot on its next iteration. There is no per-slot kick; the
-    // existing kick mechanism (immediate_exit + SIGRTMIN) is
-    // reserved for the freeze rendezvous.
+    // Flip the fast-path gate so per-vCPU `self_arm_watchpoint` calls
+    // stop short-circuiting on `any_armed == 0`. Idempotent — repeated
+    // calls keep the gate at 1. Must happen AFTER the Release on
+    // `request_kva`: the `mark_armed` store is `Relaxed`, so the
+    // synchronizes-with edge that publishes the new KVA value comes
+    // from `request_kva`'s Release / per-vCPU Acquire pair, not the
+    // gate. Once a vCPU sees `any_armed == 1` it falls through to the
+    // Acquire load on `request_kva` which carries the edge.
+    watchpoint.mark_armed();
+    // Two-pass kick (pass 1: every immediate_exit byte; pass 2:
+    // SIGRTMIN to every vCPU TID), separated by a Release fence so
+    // the immediate_exit writes are observable before any vCPU's
+    // signal handler returns and re-enters KVM_RUN. Mirrors the
+    // freeze rendezvous kick path so a future refactor of either
+    // changes them in lock-step.
+    //
+    // The eventfd write that USED to live here (commented as "the
+    // cleanest available wake fd") was load-bearing-shaped but
+    // semantically a no-op: vCPU threads do not block on `hit_evt`,
+    // so writing to it does NOT wake them out of `KVM_RUN`. The
+    // actual wake mechanism is immediate_exit + SIGRTMIN — the same
+    // pair the freeze rendezvous uses for parking.
+    for ie in ap_ies.iter().flatten() {
+        ie.set(1);
+    }
+    if bsp_alive_load
+        && let Some(ie) = bsp_ie
+    {
+        ie.set(1);
+    }
+    std::sync::atomic::fence(Ordering::Release);
+    for &tid in ap_pthreads {
+        // SAFETY: pthread_kill against a tid whose thread has
+        // already exited returns ESRCH. The AP threads are joined
+        // by `collect_results` AFTER this coordinator joins (see
+        // `run_vm`); during arm_user_watchpoint the coord is alive
+        // and every AP `pthread_t` it captured at spawn is still
+        // valid. ESRCH is harmless here — a kicked-but-already-gone
+        // AP simply means the kick is unnecessary.
+        unsafe {
+            libc::pthread_kill(tid, vcpu_signal());
+        }
+    }
+    if bsp_alive_load {
+        // SAFETY: bsp_alive_load is Acquire-loaded above; while
+        // true the BSP `VcpuFd` and its kvm_run mmap are live. The
+        // BSP TID was captured at coord spawn from the BSP thread's
+        // `pthread_self()` and remains valid until the BSP thread
+        // joins, which `run_vm` only allows AFTER this coordinator
+        // joins.
+        unsafe {
+            libc::pthread_kill(bsp_tid, vcpu_signal());
+        }
+    }
     Ok(idx)
-}
-
-/// Build a tagged sibling path for an on-demand snapshot dump. Given
-/// `failure_dump.json` and counter `0`, returns
-/// `failure_dump.on_demand_0.json`; with no extension, returns
-/// `failure_dump.on_demand_0`. The error-class trigger keeps the
-/// unmodified base path so the two emission paths never alias.
-fn on_demand_tagged_path(base: &std::path::Path, counter: u32) -> std::path::PathBuf {
-    let mut tagged = base.to_path_buf();
-    let raw_stem = base.file_stem().and_then(|s| s.to_str()).unwrap_or("dump");
-    let stem = raw_stem.strip_suffix(".failure-dump").unwrap_or(raw_stem);
-    let ext = base.extension().and_then(|e| e.to_str());
-    let new_name = match ext {
-        Some(ext) => format!("{stem}.on_demand_{counter}.{ext}"),
-        None => format!("{stem}.on_demand_{counter}"),
-    };
-    tagged.set_file_name(new_name);
-    tagged
 }
 
 /// Build a name-tagged sibling path for a CAPTURE-class on-demand
@@ -402,45 +487,19 @@ impl KtstrVm {
                 .context("register serial2 irqfd")?;
         }
 
-        // Snapshot doorbell ioeventfd. The guest fires an on-demand
-        // capture by writing 4 bytes at `kvm::DOORBELL_MMIO_GPA`; KVM
-        // dispatches the write in-kernel and signals this eventfd
-        // without a userspace exit on the vCPU thread. The freeze
-        // coordinator polls a clone of this fd in its main loop and
-        // runs `freeze_and_capture(false)` on each pending event,
-        // independent of the error-class freeze state machine.
-        // `NoDatamatch` so the dispatch fires for any value — the
-        // guest's request_id flows through the SHM ring (host-side
-        // tag channel), not via KVM's datamatch comparator.
-        // `EFD_NONBLOCK` so the coordinator's per-iteration `read()`
-        // returns `WouldBlock` instead of stalling when no doorbell
-        // is pending.
-        let doorbell_evt =
-            EventFd::new(EFD_NONBLOCK).context("create snapshot doorbell EventFd")?;
-        vm.vm_fd
-            .register_ioevent(
-                &doorbell_evt,
-                &IoEventAddress::Mmio(kvm::DOORBELL_MMIO_GPA),
-                NoDatamatch,
-            )
-            .context("register snapshot doorbell ioeventfd")?;
-        // Clone the fd so the coordinator owns its own handle and the
-        // host-side trigger path (e.g. `Op::Snapshot` running on the
-        // host with no in-guest write) can take additional clones.
-        // EventFd::try_clone uses dup(2), so all clones share the
-        // same kernel counter — a write on any fd wakes a read on
-        // any clone.
-        let doorbell_evt_for_coord = doorbell_evt
-            .try_clone()
-            .context("clone snapshot doorbell EventFd for coordinator")?;
         // Serialises on-demand captures against themselves: the
-        // coordinator sets this Acquire-bool while a doorbell capture
-        // runs and clears it on completion, so a flood of doorbell
-        // writes is collapsed into one capture per thaw.
-        // Independent of `freeze_state`, which governs only the
-        // error-class trigger machine — on-demand captures must
-        // service even when `freeze_state == Done` so post-failure
-        // `Op::Snapshot` calls still work.
+        // coordinator sets this Acquire-bool while a TLV-driven
+        // snapshot dispatch runs and clears it on completion, so a
+        // user-watchpoint hit firing during a CAPTURE-class request
+        // does not open a second concurrent capture window. The TX
+        // handler is single-threaded on the freeze coord, so the
+        // gate's primary defence is against the user-watchpoint
+        // dispatcher (which runs in the same iteration body after
+        // pending TLV requests drain). Independent of `freeze_state`,
+        // which governs only the error-class trigger machine —
+        // on-demand captures must service even when
+        // `freeze_state == Done` so post-failure `Op::Snapshot` calls
+        // still work.
         let on_demand_in_flight = Arc::new(AtomicBool::new(false));
 
         // Host-side snapshot bridge. Owned by the freeze coordinator
@@ -528,13 +587,14 @@ impl KtstrVm {
         // path always emits the device's MMIO node on the kernel
         // cmdline (x86_64) / FDT (aarch64), so the kernel's
         // `virtio_mmio` driver probes for the device unconditionally.
-        // The guest's `shm_poll_loop` blocks on `/dev/hvc0` and wakes
+        // The guest's `hvc0_poll_loop` blocks on `/dev/hvc0` and wakes
         // within microseconds when the host pushes a byte. The
         // coordinator and watchdog use this as the host→guest signal
-        // channel: the monitor pushes `SIGNAL_VC_DUMP` paired with
-        // the SHM `DUMP_REQ_OFFSET` byte for SysRq-D dump requests,
-        // and the watchdog pushes `SIGNAL_VC_SHUTDOWN` for graceful
-        // shutdown.
+        // channel: the monitor pushes `SIGNAL_VC_DUMP` for SysRq-D
+        // dump requests (the dispatch is wake-byte-only — no SHM
+        // control byte), the watchdog pushes `SIGNAL_VC_SHUTDOWN` for
+        // graceful shutdown, and the bpf-map-write thread pushes
+        // `SIGNAL_BPF_WRITE_DONE` to release `wait_for_map_write`.
         let mut vc = virtio_console::VirtioConsole::new();
         vc.set_mem((*vm.guest_mem).clone());
         let virtio_con = Arc::new(PiMutex::new(vc));
@@ -751,6 +811,19 @@ impl KtstrVm {
         let bsp_tid = unsafe { libc::pthread_self() };
         let bsp_done = Arc::new(AtomicBool::new(false));
         let bsp_done_for_wd = bsp_done.clone();
+        // BSP-IE-handle liveness gate. The freeze coordinator's
+        // captured `ImmediateExitHandle` for the BSP addresses the
+        // BSP `VcpuFd`'s kvm_run mmap; that mapping disappears the
+        // moment `bsp` (a local in run_vm) falls out of scope. The
+        // primary defense against UAF is the `freeze_coord_handle`
+        // join inside run_vm BEFORE bsp drops, but this flag is a
+        // cheap secondary check the closure consults before any
+        // `bsp_ie_handle.set(1)` call so a future restructure that
+        // moves the join doesn't silently reintroduce the UAF. Set
+        // to `false` by run_vm right before bsp drops; gate every
+        // BSP-side immediate_exit write on `bsp_alive.load(Acquire)`.
+        let bsp_alive = Arc::new(AtomicBool::new(true));
+        let bsp_alive_for_coord = bsp_alive.clone();
         // Wake fd paired with `bsp_done`. Setters (run_vm post-loop,
         // BSP panic hook) flip the AtomicBool AND write `1` to this
         // EventFd so the freeze coordinator's epoll wait returns
@@ -770,7 +843,7 @@ impl KtstrVm {
         // Clone the virtio-console Arc into the watchdog so the
         // soft-deadline path can push `SIGNAL_VC_SHUTDOWN` to
         // `/dev/hvc0` for graceful shutdown. The guest's
-        // `shm_poll_loop` blocks on the device read and recognises
+        // `hvc0_poll_loop` blocks on the device read and recognises
         // the byte directly — no SHM signal slot involved.
         let wd_virtio_con = virtio_con.clone();
 
@@ -877,6 +950,22 @@ impl KtstrVm {
         // completes (their `mmio_write` handlers must have already
         // returned for the vCPU to reach the parked state).
         let freeze_coord_virtio_blk = virtio_blk.clone();
+        // Lock-free `paused` flag handle. The freeze coordinator
+        // polls the worker's parked-state in two paths (the
+        // rendezvous timeout-diagnostic snapshot and the post-thaw
+        // barrier predicate). Both previously read via
+        // `d.lock().is_paused()`, which contends with every
+        // concurrent device operation that holds the device mutex
+        // — `mmio_read`/`mmio_write` from the vCPU thread and any
+        // other freeze-coord call site holding the lock. The
+        // underlying field is already `Arc<AtomicBool>`, so
+        // exposing a clone here lets the rendezvous read it
+        // lock-free. The Acquire/Release ordering on the worker's
+        // `paused` writes provides the same happens-before edges
+        // with the worker's parked-state stores that
+        // `is_paused()` does.
+        let freeze_coord_virtio_blk_paused: Option<Arc<AtomicBool>> =
+            virtio_blk.as_ref().map(|d| d.lock().paused_handle());
         // Clone the virtio-console Arc into the coordinator so it
         // can drain port-1 bulk TLV bytes as the guest writes them
         // (event-driven via the tx_evt eventfd registered into the
@@ -915,6 +1004,28 @@ impl KtstrVm {
         // to "no perf data" without aborting the run.
         let freeze_coord_perf_capture = perf_capture.clone();
         let freeze_coord_vmlinux = find_vmlinux(&self.kernel);
+        // Cached `name -> KVA` map for `Op::WatchSnapshot` arming.
+        // Build once here at run_vm scope so every TLV-driven
+        // WATCH request is an O(1) HashMap lookup instead of a
+        // 50MB+ vmlinux read + ELF parse. None when vmlinux can't
+        // be found or the parse failed — `arm_user_watchpoint`
+        // will report a clean diagnostic on lookup. Hoisted out of
+        // the closure so the spawn-time parse cost is paid once
+        // even when the run ends without any WATCH requests.
+        let freeze_coord_symbol_cache: Option<Arc<VmlinuxSymbolCache>> = freeze_coord_vmlinux
+            .as_deref()
+            .and_then(|p| match VmlinuxSymbolCache::from_path(p) {
+                Ok(c) => Some(Arc::new(c)),
+                Err(e) => {
+                    tracing::warn!(
+                        path = %p.display(),
+                        error = %e,
+                        "freeze-coord: vmlinux symbol cache build failed; \
+                         Op::WatchSnapshot WATCH requests will return errors"
+                    );
+                    None
+                }
+            });
         // Optional file sink for the failure-dump JSON. Cloned out
         // of the builder field so the closure owns a copy and the
         // freeze coord can write the file without touching the env
@@ -970,21 +1081,6 @@ impl KtstrVm {
                 }
             }
         };
-        // SHM base offset within `freeze_coord_mem`. The on-demand
-        // doorbell handler reads the snapshot request slot (request
-        // id, kind, tag) from this base + the snapshot offsets
-        // declared in `shm_ring`; failure dispatch (CAPTURE vs WATCH)
-        // and the reply write target the same slot. `0` when no
-        // SHM region is configured — the doorbell handler then
-        // skips request-driven dispatch and falls back to the
-        // legacy "any doorbell == capture-now without tag"
-        // semantics tagged with a placeholder name.
-        let freeze_coord_shm_base = if self.shm_size > 0 {
-            freeze_coord_mem.as_ref().map(|m| m.size() - self.shm_size)
-        } else {
-            None
-        };
-
         // Extract a fresh ImmediateExitHandle for the freeze coord —
         // the watchdog grabs another one below for its own kick path.
         // Both views address the same kvm_run.immediate_exit byte
@@ -1030,10 +1126,6 @@ impl KtstrVm {
         // into the scx walker (per-node global DSQ pass) and the
         // per-node NUMA event walker. Defaults to 1 on UMA topologies.
         let freeze_coord_num_nodes = self.topology.num_numa_nodes();
-        // On-demand snapshot doorbell — moved into the closure. The
-        // coordinator polls `read()` non-blocking each iteration and
-        // calls `freeze_and_capture(false)` on every pending event.
-        let freeze_coord_doorbell = doorbell_evt_for_coord;
         let freeze_coord_on_demand_in_flight = on_demand_in_flight.clone();
         let freeze_coord_snapshot_bridge = snapshot_bridge.clone();
         // Wake-fd handles for the coord epoll loop. `kill_evt` and
@@ -1385,16 +1477,6 @@ impl KtstrVm {
                     Done,
                 }
                 let mut freeze_state = FreezeState::Idle;
-                // On-demand snapshot counter. Bumped each time the
-                // doorbell handler successfully enters the in-flight
-                // critical section, used to namespace per-doorbell
-                // dump file paths so a scenario with multiple
-                // `Op::Snapshot` calls produces distinct artifacts
-                // instead of overwriting the prior on-demand dump.
-                // Independent of `freeze_state` per the on-demand
-                // protocol — error-class and on-demand captures
-                // never interleave path names.
-                let mut on_demand_counter: u32 = 0;
                 // Cached early snapshot from a midway-trigger freeze.
                 // Held until the late freeze fires; then both early
                 // and late are wrapped into a DualFailureDumpReport
@@ -1493,8 +1575,9 @@ impl KtstrVm {
                 let mut early_scan_iters: u64 = 0;
                 // Cadence policy. The loop blocks in `epoll_wait`
                 // until one of the registered fds fires (kill,
-                // bsp_done, doorbell, watchpoint hit, scanner tick)
-                // OR `POLL_TIMEOUT_MS` elapses. The previous
+                // bsp_done, virtio-console TX, watchpoint hit,
+                // scanner tick) OR `POLL_TIMEOUT_MS` elapses. The
+                // previous
                 // implementation drove this by `thread::sleep(500
                 // µs)` and a `poll_iter % 200 == 0` decimator. The
                 // event-driven design wakes the coordinator within
@@ -1520,17 +1603,21 @@ impl KtstrVm {
                 // events without re-reading fd numbers.
                 const TOKEN_KILL: u64 = 0;
                 const TOKEN_BSP_DONE: u64 = 1;
-                const TOKEN_DOORBELL: u64 = 2;
                 const TOKEN_WATCHPOINT: u64 = 3;
                 const TOKEN_SCANNER: u64 = 4;
                 /// virtio-console tx_evt — wakes whenever the guest
                 /// publishes a TX descriptor chain on EITHER port.
                 /// The coordinator drains port-1 bulk TLV bytes and
                 /// promotes a SCHED_EXIT entry into the run-wide
-                /// `kill` flag. Port-0 (console) TX wakes are
-                /// harmless: the coord drain returns an empty
-                /// buffer and the byte stays in the host stdout
-                /// thread's `drain_output` slot.
+                /// `kill` flag, and intercepts
+                /// [`crate::vmm::wire::MSG_TYPE_SNAPSHOT_REQUEST`]
+                /// frames so the matching dispatch (CAPTURE / WATCH)
+                /// runs in the same iteration body and the reply
+                /// is pushed back to the guest via
+                /// [`crate::vmm::virtio_console::VirtioConsole::queue_input_port1`].
+                /// Port-0 (console) TX wakes are harmless: the coord
+                /// drain returns an empty buffer and the byte stays
+                /// in the host stdout thread's `drain_output` slot.
                 const TOKEN_TX: u64 = 5;
                 let epoll = match Epoll::new() {
                     Ok(e) => e,
@@ -1571,11 +1658,6 @@ impl KtstrVm {
                         "bsp_done_evt",
                     ),
                     (
-                        freeze_coord_doorbell.as_raw_fd(),
-                        TOKEN_DOORBELL,
-                        "doorbell_evt",
-                    ),
-                    (
                         freeze_coord_hit_evt.as_raw_fd(),
                         TOKEN_WATCHPOINT,
                         "watchpoint_hit_evt",
@@ -1596,7 +1678,7 @@ impl KtstrVm {
                         return;
                     }
                 }
-                let mut events_buf = [EpollEvent::default(); 6];
+                let mut events_buf = [EpollEvent::default(); 5];
                 // Accumulator for partially-received TLV bulk frames.
                 // The kernel's virtio_console TX path issues
                 // descriptor chains as the guest writes; a single
@@ -1613,19 +1695,29 @@ impl KtstrVm {
                 // BSP run loop and the watchdog exit promptly
                 // instead of waiting for the watchdog deadline.
                 let mut bulk_assembler = crate::vmm::bulk::HostAssembler::new();
+                // Per-iteration accumulator for guest-side
+                // [`crate::vmm::wire::MSG_TYPE_SNAPSHOT_REQUEST`]
+                // frames the TOKEN_TX handler decoded. Drained later
+                // in the iteration body where `freeze_and_capture` /
+                // `thaw_and_barrier` / `arm_user_watchpoint` are in
+                // scope; the dispatch frames a
+                // `MSG_TYPE_SNAPSHOT_REPLY` TLV and pushes it back
+                // through `queue_input_port1`. CRC-failed frames are
+                // never appended — a torn frame would otherwise let
+                // a hostile guest force a spurious capture, mirroring
+                // the SCHED_EXIT promotion gate.
+                let mut snapshot_requests_pending: Vec<SnapshotRequest> = Vec::new();
                 // First iteration always runs scan-tick work so
                 // boot-race lazy resolution attempts fire
                 // immediately rather than waiting up to 100 ms for
                 // the timerfd's first edge. Subsequent iterations
                 // gate scan-tick on the SCANNER token (or on a
-                // POLL_TIMEOUT-driven wake) — the watchpoint and
-                // doorbell events themselves never set scan_tick,
-                // which is correct: those triggers are fast paths
-                // that should not block the next wake on heavy
-                // bss-PA / scan_ctx work.
+                // POLL_TIMEOUT-driven wake) — the watchpoint event
+                // itself never sets scan_tick, which is correct:
+                // that trigger is a fast path that should not block
+                // the next wake on heavy bss-PA / scan_ctx work.
                 let mut scan_tick: bool;
                 let mut first_iter = true;
-                let mut doorbell_pending_from_epoll = false;
                 'coord: while !freeze_coord_kill.load(Ordering::Acquire) {
                     if freeze_coord_bsp_done.load(Ordering::Acquire) {
                         break 'coord;
@@ -1651,7 +1743,7 @@ impl KtstrVm {
                         // exit the loop, the others either set
                         // scan_tick (SCANNER) or surface state via
                         // the existing latch reads later in the
-                        // body (DOORBELL / WATCHPOINT).
+                        // body (WATCHPOINT).
                         for ev in &events_buf[..event_count] {
                             match ev.data() {
                                 TOKEN_KILL => {
@@ -1682,16 +1774,6 @@ impl KtstrVm {
                                     let _ = scanner_tfd.wait();
                                     scan_tick = true;
                                 }
-                                TOKEN_DOORBELL => {
-                                    // Drain via the same `read()`
-                                    // the doorbell handler below
-                                    // uses. A best-effort drain
-                                    // here lets the handler treat
-                                    // the on-demand path as a flag
-                                    // rather than re-doing the
-                                    // EAGAIN check in two places.
-                                    doorbell_pending_from_epoll = true;
-                                }
                                 TOKEN_WATCHPOINT => {
                                     // Drain the eventfd counter so
                                     // a subsequent epoll_wait
@@ -1721,8 +1803,30 @@ impl KtstrVm {
                                     // EFD_NONBLOCK is benign
                                     // because the buffer state is
                                     // authoritative.
+                                    //
+                                    // Critical-section discipline:
+                                    // `tx_evt.read()` is a syscall
+                                    // and `bulk_assembler.feed()`
+                                    // does TLV parsing (memcpy +
+                                    // CRC + per-frame cap check).
+                                    // Both are kept STRICTLY
+                                    // outside the device mutex so
+                                    // the vCPU thread emitting
+                                    // bytes via virtio-console TX
+                                    // never blocks behind the
+                                    // coord. The explicit
+                                    // `let bytes = { ... };`
+                                    // block bounds the lock to the
+                                    // single `drain_bulk` call —
+                                    // a future refactor that
+                                    // moves work into the block
+                                    // is loud about the regression.
                                     let _ = freeze_coord_tx_evt.read();
-                                    let bytes = freeze_coord_virtio_con.lock().drain_bulk();
+                                    let bytes = {
+                                        let mut g =
+                                            freeze_coord_virtio_con.lock();
+                                        g.drain_bulk()
+                                    };
                                     let drained = bulk_assembler.feed(&bytes);
                                     for msg in &drained.messages {
                                         // Promote a guest-side
@@ -1745,15 +1849,48 @@ impl KtstrVm {
                                             freeze_coord_kill.store(true, Ordering::Release);
                                             let _ = freeze_coord_kill_evt.write(1);
                                         }
+                                        // Decode a guest-side
+                                        // `MSG_TYPE_SNAPSHOT_REQUEST`
+                                        // and stash it for dispatch
+                                        // later in this iteration's
+                                        // body — `freeze_and_capture`
+                                        // / `thaw_and_barrier` /
+                                        // `arm_user_watchpoint` are
+                                        // not in scope here. Only
+                                        // crc_ok frames are decoded:
+                                        // a torn snapshot request
+                                        // would otherwise let a
+                                        // hostile guest force a
+                                        // capture, mirroring the
+                                        // SCHED_EXIT promotion gate
+                                        // above. Malformed payloads
+                                        // (size mismatch, KIND_NONE,
+                                        // request_id == 0) decode to
+                                        // `None` and are dropped.
+                                        if msg.msg_type
+                                            == crate::vmm::wire::MSG_TYPE_SNAPSHOT_REQUEST
+                                            && msg.crc_ok
+                                            && let Some(req) =
+                                                decode_snapshot_request(&msg.payload[..])
+                                        {
+                                            snapshot_requests_pending.push(req);
+                                        }
                                     }
                                     // Stash the parsed messages on
                                     // the shared buffer so
                                     // `collect_results` can merge
                                     // them into the final
-                                    // `ShmDrainResult`. Without
-                                    // this stash, every TLV frame
-                                    // the guest published mid-run
-                                    // (EXIT, TEST, PAYLOAD_METRICS,
+                                    // `BulkDrainResult`. Snapshot
+                                    // request frames are filtered out
+                                    // — they are coordinator-internal
+                                    // control traffic, not test
+                                    // verdict data, and the matching
+                                    // reply is delivered over port-1
+                                    // RX rather than recorded in the
+                                    // verdict drain. Without this
+                                    // stash, every TLV frame the
+                                    // guest published mid-run (EXIT,
+                                    // TEST, PAYLOAD_METRICS,
                                     // RAW_PAYLOAD_OUTPUT, PROFRAW)
                                     // is silently dropped — only
                                     // late-arriving bytes that
@@ -1769,13 +1906,31 @@ impl KtstrVm {
                                         let mut buf = freeze_coord_bulk_messages_for_closure
                                             .lock()
                                             .unwrap_or_else(|e| e.into_inner());
-                                        buf.extend(drained.messages.iter().map(|m| {
-                                            crate::vmm::wire::ShmEntry {
-                                                msg_type: m.msg_type,
-                                                payload: m.payload.clone(),
-                                                crc_ok: m.crc_ok,
-                                            }
-                                        }));
+                                        // `BulkMessage::payload` is
+                                        // `Arc<[u8]>` (cheap clone via
+                                        // refcount); `ShmEntry::payload`
+                                        // is `Vec<u8>`. Convert via
+                                        // `to_vec()` — the per-frame
+                                        // cap (`MAX_BULK_FRAME_PAYLOAD`
+                                        // in `vmm::bulk`) bounds the
+                                        // allocation, so the conversion
+                                        // is one-shot per drained
+                                        // message and not a hot-path
+                                        // concern.
+                                        buf.extend(
+                                            drained
+                                                .messages
+                                                .iter()
+                                                .filter(|m| {
+                                                    m.msg_type
+                                                        != crate::vmm::wire::MSG_TYPE_SNAPSHOT_REQUEST
+                                                })
+                                                .map(|m| crate::vmm::wire::ShmEntry {
+                                                    msg_type: m.msg_type,
+                                                    payload: m.payload.to_vec(),
+                                                    crc_ok: m.crc_ok,
+                                                }),
+                                        );
                                     }
                                 }
                                 _ => {}
@@ -2125,6 +2280,31 @@ impl KtstrVm {
                                     freeze_coord_watchpoint
                                         .request_kva
                                         .store(exit_kind_kva, Ordering::Release);
+                                    // Flip the fast-path gate so
+                                    // every vCPU's
+                                    // `self_arm_watchpoint` stops
+                                    // short-circuiting on
+                                    // `any_armed == 0` and falls
+                                    // through to the per-slot
+                                    // Acquire load on
+                                    // `request_kva`. Idempotent.
+                                    // Must follow the Release on
+                                    // `request_kva` — `mark_armed`
+                                    // is `Relaxed`, so the
+                                    // synchronizes-with edge that
+                                    // publishes the new KVA value
+                                    // comes from the slot's
+                                    // Release/Acquire pair, not the
+                                    // gate. Without this call the
+                                    // gate stays at 0 forever and
+                                    // every vCPU's self-arm
+                                    // returns false at the
+                                    // pre-load short-circuit —
+                                    // i.e. the watchpoint never
+                                    // arms in `KVM_SET_GUEST_DEBUG`
+                                    // and no fire ever reaches
+                                    // `KVM_EXIT_DEBUG`.
+                                    freeze_coord_watchpoint.mark_armed();
                                     watchpoint_published_kva = Some(exit_kind_kva);
                                     tracing::info!(
                                         exit_kind_kva =
@@ -2327,49 +2507,6 @@ impl KtstrVm {
                             false
                         };
                     let err_triggered = watchpoint_hit || bss_triggered;
-                    // On-demand snapshot doorbell. Drained
-                    // unconditionally — even after the late snapshot
-                    // has marked `freeze_state == Done` — so a
-                    // post-failure scenario can still capture
-                    // diagnostic state. The coordinator stays in the
-                    // poll loop until kill / bsp_done; the
-                    // `on_demand_in_flight` Acquire-bool serialises
-                    // doorbell captures against themselves, collapsing
-                    // a flood of writes into one capture per thaw.
-                    // Independent of `freeze_state` per the on-demand
-                    // protocol documented on `SnapshotBridge` and
-                    // captured in `CaptureCallback`'s wire-shape doc.
-                    // Doorbell pending if the epoll dispatch just
-                    // flagged it OR a non-blocking read drains a
-                    // pending counter (the host-side doorbell
-                    // trigger path can clone the EventFd and write
-                    // outside the epoll_wait window — first iter
-                    // and post-Done sleeps both miss epoll). The
-                    // read is non-blocking; WouldBlock indicates no
-                    // pending event, mapping to false. Reset the
-                    // epoll-flag latch each iteration so a transient
-                    // pending state doesn't re-trigger after the
-                    // handler runs.
-                    let doorbell_pending = if doorbell_pending_from_epoll {
-                        // Drain the underlying counter so the
-                        // single edge that triggered the epoll wake
-                        // doesn't re-fire after the handler runs.
-                        let _ = freeze_coord_doorbell.read();
-                        doorbell_pending_from_epoll = false;
-                        true
-                    } else {
-                        match freeze_coord_doorbell.read() {
-                            Ok(_) => true,
-                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
-                            Err(e) => {
-                                tracing::warn!(
-                                    error = %e,
-                                    "freeze-coord: doorbell EventFd read failed"
-                                );
-                                false
-                            }
-                        }
-                    };
                     // Closures capture by reference. Building the
                     // full freeze-rendezvous-dump cycle once and
                     // calling it for either the early or late
@@ -2445,32 +2582,250 @@ impl KtstrVm {
                             } else {
                                 None
                             };
-                            freeze_coord_freeze.store(true, Ordering::Release);
-                            // Force-clear stale parked flags from any
-                            // prior freeze cycle BEFORE pass 2 sends
-                            // SIGRTMIN. Without this, a vCPU that was
-                            // mid-`handle_freeze` exit at the end of
-                            // cycle N (had loaded `freeze=false` and
-                            // was about to run the trailing
-                            // `parked.store(false, Release)`) can
-                            // leave `parked=true` visible to the
-                            // coordinator at the start of cycle N+1,
-                            // and the rendezvous loop's Acquire load
-                            // would race-observe that stale `true`
-                            // and falsely conclude the vCPU has
-                            // parked for the new cycle. Clearing
-                            // before pass 2 is the safe window: pass
-                            // 2 is the trigger that drives the vCPU
-                            // into the next `handle_freeze`, which is
-                            // where the legitimate `parked=true` for
-                            // cycle N+1 originates. Release ordering
-                            // pairs with the vCPU's Acquire load on
-                            // `parked` and the legitimate Release
-                            // store inside `handle_freeze`.
-                            for p in freeze_coord_ap_parked.iter() {
-                                p.store(false, Ordering::Release);
+                            // 'capture labeled block: every exit
+                            // from the freeze→park→dump phases
+                            // (rendezvous timeout, gate-suppressed,
+                            // full dump, partial dump) `break
+                            // 'capture <result>` so all paths
+                            // converge on the labeled block's value
+                            // — which is the closure's return.
+                            // The caller is responsible for invoking
+                            // `thaw_and_barrier` AFTER it has done
+                            // any while-frozen work it needs (the
+                            // late-trigger backstop reads guest
+                            // memory while quiesced, so the thaw
+                            // cannot be unconditional inside the
+                            // closure).
+                            'capture: {
+                            // Defense-in-depth UAF gate. The primary
+                            // defense is the `freeze_coord_handle.join()`
+                            // call in run_vm BEFORE the BSP `VcpuFd`
+                            // falls out of scope; this Acquire load
+                            // is the secondary check that no
+                            // freeze_and_capture body issues a
+                            // `bsp_ie_handle.set(1)` write through a
+                            // stale kvm_run mmap pointer. Re-read
+                            // before the BSP-side ie.set() below.
+                            let bsp_alive_at_start =
+                                bsp_alive_for_coord.load(Ordering::Acquire);
+                            // Drain `parked_evt` BEFORE flipping
+                            // `freeze=true` and BEFORE issuing
+                            // pass-0 (worker pause), pass-1
+                            // (immediate_exit), or pass-2 (SIGRTMIN).
+                            // From this point forward every
+                            // increment to the parked_evt counter
+                            // is unambiguously a park-ack for THIS
+                            // cycle. Draining AFTER the kicks is a
+                            // race: a fast vCPU or worker may park
+                            // and bump the counter between the kick
+                            // and the drain — that ack is then
+                            // absorbed by the drain instead of
+                            // counted toward `parked_count`, and
+                            // the rendezvous waits 30 s for an ack
+                            // that already fired.
+                            //
+                            // EAGAIN under EFD_NONBLOCK (counter
+                            // already 0 from the prior cycle's
+                            // post-thaw barrier drain) is benign.
+                            //
+                            // The Acquire ordering synchronizes-with
+                            // the parker's Release store after its
+                            // drain dance — this rendezvous IS the
+                            // memory barrier that makes the future
+                            // host-side guest-memory reads correct.
+                            // The eventfd write ordering is
+                            // load-bearing: the AtomicBool Release
+                            // happens-before the eventfd write, so
+                            // every counter increment we observe in
+                            // the loop below implies every
+                            // guest-side queue mutation the parker
+                            // performed pre-park is visible to the
+                            // dump.
+                            //
+                            // Also drain `thaw_evt` here. The
+                            // coordinator writes thaw_evt ONCE per
+                            // thaw, and every parked vCPU polls the
+                            // SAME fd in `handle_freeze` without
+                            // draining (the multi-reader fan-out
+                            // wake design pinned at
+                            // `vmm/exit_dispatch.rs::handle_freeze`).
+                            // Without a per-cycle drain by the
+                            // coordinator the counter is monotonic
+                            // — every successive freeze cycle sees
+                            // a level-high thaw_evt left over from
+                            // the previous cycle, which makes
+                            // `handle_freeze`'s poll return
+                            // immediately on every iteration and
+                            // burns CPU spinning on
+                            // `freeze.load(Acquire)` until the
+                            // coordinator clears `freeze`. Draining
+                            // before pass-1 / pass-2 means the next
+                            // poll inside `handle_freeze` blocks on
+                            // an empty counter and wakes only when
+                            // (a) the coordinator's post-rendezvous
+                            // `thaw_evt.write(1)` lands or (b) the
+                            // 100 ms poll backstop fires.
+                            use std::os::fd::AsRawFd;
+                            let _ = freeze_coord_parked_evt.read();
+                            let _ = freeze_coord_thaw_evt.read();
+                            // Snapshot virtio-blk worker liveness
+                            // BEFORE pause(). When the device exists
+                            // but the worker thread is not yet
+                            // spawned (pre-DRIVER_OK) or has been
+                            // joined (post-stop / failed-respawn),
+                            // pause() short-circuits with the
+                            // "no-live-worker" fast path and writes
+                            // no parked_evt ack — counting +1 in
+                            // that case makes the rendezvous wait
+                            // 30 s for a worker that does not
+                            // exist. The pre-pause `paused` flag
+                            // is the cheapest available proxy: the
+                            // worker spawn flips it to false on
+                            // entry to the run loop and the
+                            // post-thaw barrier guarantees a live
+                            // worker has cleared it before this
+                            // cycle starts. `paused == true` at
+                            // cycle entry therefore means "no live
+                            // worker" (the construction sentinel
+                            // or post-stop re-armed sentinel from
+                            // `resume()`). Gate the +1 below on
+                            // `worker_was_running` instead of bare
+                            // `is_some()`.
+                            let worker_was_running = freeze_coord_virtio_blk_paused
+                                .as_ref()
+                                .is_some_and(|p| !p.load(Ordering::Acquire));
+                            // Pre-seed the parked_evt counter for any
+                            // parker whose flag is STILL `true` at
+                            // cycle entry. The post-thaw barrier at
+                            // the end of every prior cycle SHOULD
+                            // have observed every parker clear its
+                            // flag before returning, but the barrier
+                            // can hit its FREEZE_RENDEZVOUS_TIMEOUT
+                            // and break early (logged as
+                            // "post-thaw barrier timed out — a parker
+                            // did not clear within
+                            // FREEZE_RENDEZVOUS_TIMEOUT" further
+                            // below). When that happens the parker is
+                            // still inside `handle_freeze`'s park
+                            // loop with `parked=true`. The next cycle
+                            // sets `freeze=true` and SIGRTMINs every
+                            // vCPU; the kicked vCPU's poll wakes
+                            // (EINTR), re-checks `freeze` (now true),
+                            // and stays in the SAME `handle_freeze`
+                            // invocation — `parked.store(true)` plus
+                            // `parked_evt.write(1)` only run on
+                            // ENTRY to `handle_freeze`
+                            // (exit_dispatch.rs:1051 / :1067), NOT
+                            // per `freeze=true` flip while parked.
+                            // Without pre-seeding, the rendezvous
+                            // countdown latch never receives an ack
+                            // from that parker and waits the full
+                            // 30 s for an event that already happened
+                            // a cycle ago.
+                            //
+                            // Pre-seeding +1 to `parked_evt` per
+                            // still-parked parker compensates: the
+                            // rendezvous loop drains the counter
+                            // and credits each as a park-ack for
+                            // THIS cycle. This is equivalent to the
+                            // historical force-clear of `parked`
+                            // flags but targeted — only fires for
+                            // the timed-out subset, leaving a
+                            // healthy mid-thaw parker (which still
+                            // has its `parked=true` from the prior
+                            // cycle and is about to clear it within
+                            // a few ms) untouched. The worst case
+                            // is a healthy parker that races the
+                            // pre-seed: its own
+                            // `parked_evt.write(1)` on the next
+                            // entry to `handle_freeze` adds another
+                            // count, which is harmless — the
+                            // rendezvous loop only checks
+                            // `parked_count >= expected_parks` and
+                            // overshoot is fine.
+                            //
+                            // The bsp/ap loads here are Acquire to
+                            // synchronise-with the prior cycle's
+                            // post-thaw barrier reads — the post-
+                            // thaw barrier already loaded these
+                            // with Acquire, but a healthy parker may
+                            // have flipped its flag back to false
+                            // between the barrier's last load and
+                            // this point. The seed only fires when
+                            // we still observe `true`, so a healthy
+                            // late-clear is a no-op.
+                            let mut still_parked: u32 = 0;
+                            for ap in freeze_coord_ap_parked.iter() {
+                                if ap.load(Ordering::Acquire) {
+                                    still_parked = still_parked.saturating_add(1);
+                                }
                             }
-                            freeze_coord_bsp_parked.store(false, Ordering::Release);
+                            if bsp_alive_at_start
+                                && freeze_coord_bsp_parked.load(Ordering::Acquire)
+                            {
+                                still_parked = still_parked.saturating_add(1);
+                            }
+                            // virtio-blk worker: only pre-seed when
+                            // the worker was running (otherwise
+                            // pause() short-circuits and we won't
+                            // count +1 anyway). If the worker is
+                            // running AND `paused == true`, the
+                            // worker is mid-park from the prior
+                            // cycle and won't re-write its ack on
+                            // the next pause()-driven epoll wake,
+                            // mirroring the vCPU case. Pause-fd
+                            // writes happen-before `paused.store
+                            // (true)`, which happens-before the
+                            // worker's `parked_evt.write(1)` —
+                            // matching the vCPU sequence in
+                            // `handle_freeze`.
+                            if worker_was_running
+                                && freeze_coord_virtio_blk_paused
+                                    .as_ref()
+                                    .is_some_and(|p| p.load(Ordering::Acquire))
+                            {
+                                still_parked = still_parked.saturating_add(1);
+                            }
+                            if still_parked > 0 {
+                                tracing::warn!(
+                                    still_parked,
+                                    "freeze-coord: detected stale parked=true \
+                                     parker(s) at cycle entry — prior post-thaw \
+                                     barrier likely timed out. Pre-seeding \
+                                     parked_evt to credit them as acks for this \
+                                     cycle so the rendezvous does not wait 30s \
+                                     for events that already fired."
+                                );
+                                if let Err(e) =
+                                    freeze_coord_parked_evt.write(still_parked as u64)
+                                {
+                                    tracing::warn!(
+                                        err = %e,
+                                        still_parked,
+                                        "freeze-coord: parked_evt pre-seed write \
+                                         failed; rendezvous may wait full \
+                                         FREEZE_RENDEZVOUS_TIMEOUT for stale \
+                                         parker(s)"
+                                    );
+                                }
+                            }
+                            freeze_coord_freeze.store(true, Ordering::Release);
+                            // No force-clear of `parked` flags here.
+                            // The post-thaw barrier at the END of
+                            // every prior freeze_and_capture cycle
+                            // (see `// Post-thaw barrier` below)
+                            // is the primary guarantee that every
+                            // vCPU has run its trailing
+                            // `parked.store(false)` before this
+                            // cycle starts. Force-clearing
+                            // mid-cycle would erase the legitimate
+                            // `parked=true` of a vCPU still in cycle
+                            // N's park loop and deadlock the
+                            // rendezvous (vCPU never re-stores
+                            // parked=true; coord waits 30 s). The
+                            // pre-seed above handles the residual
+                            // case where the post-thaw barrier
+                            // itself timed out.
                             // Pass 0: signal every device worker to
                             // pause. virtio-blk has an independent
                             // worker thread that must be parked
@@ -2503,11 +2858,20 @@ impl KtstrVm {
                             // single-byte write_volatile into the
                             // corresponding kvm_run mmap (MAP_SHARED,
                             // lifetime tied to the running VcpuFd
-                            // that owns it).
+                            // that owns it). AP IE writes are safe
+                            // because the AP threads are joined in
+                            // collect_results AFTER the coord joins
+                            // — the coord cannot outlive an AP's
+                            // VcpuFd. The BSP IE write is gated on
+                            // `bsp_alive` because run_vm drops the
+                            // BSP before collect_results runs; see
+                            // the gate's doc above.
                             for ie in freeze_coord_ap_ies.iter().flatten() {
                                 ie.set(1);
                             }
-                            if let Some(ref ie) = freeze_coord_bsp_ie_handle {
+                            if bsp_alive_at_start
+                                && let Some(ref ie) = freeze_coord_bsp_ie_handle
+                            {
                                 ie.set(1);
                             }
                             // Release fence between pass 1 and pass 2
@@ -2519,44 +2883,102 @@ impl KtstrVm {
                             // immediate_exit byte that is supposed to
                             // short-circuit guest entry.
                             std::sync::atomic::fence(Ordering::Release);
-                            // Pass 2: signal every vCPU.
+                            // Pass 2: signal every vCPU. AP signals
+                            // are always safe; the BSP signal is
+                            // gated on the same `bsp_alive` flag the
+                            // ie.set above used — pthread_kill
+                            // against a tid whose thread has already
+                            // exited returns ESRCH and is harmless,
+                            // but the gate keeps the path symmetric
+                            // and avoids spurious ESRCH log noise.
                             for &tid in &freeze_coord_ap_pthreads {
                                 unsafe {
                                     libc::pthread_kill(tid, vcpu_signal());
                                 }
                             }
-                            unsafe {
-                                libc::pthread_kill(freeze_coord_bsp_tid, vcpu_signal());
+                            if bsp_alive_at_start {
+                                unsafe {
+                                    libc::pthread_kill(freeze_coord_bsp_tid, vcpu_signal());
+                                }
                             }
-                            // Wait for N-of-N parked acks. The
-                            // Acquire load synchronizes-with the
-                            // vCPU's Release store after the drain
-                            // dance — this rendezvous IS the memory
-                            // barrier that makes the future host-side
-                            // guest-memory reads correct.
+                            // Wait for N-of-N parked acks via a
+                            // countdown latch over `parked_evt`. The
+                            // counter-mode eventfd accumulates one
+                            // write per parker (every vCPU + the
+                            // virtio-blk worker writes 1 AFTER its
+                            // own Release store on parked/paused).
+                            // Each `read()` drains the accumulated
+                            // count atomically and resets it; the
+                            // closure tallies these drains until the
+                            // total reaches `expected`. Replaces the
+                            // per-iteration O(N) AtomicBool scan with
+                            // an O(1) counter add — the AtomicBool
+                            // flags remain the synchronizes-with
+                            // anchor for the diagnostic timeout-log
+                            // path below, but they are no longer the
+                            // hot-path readiness check.
                             //
-                            // Wake mechanism: every vCPU + the
-                            // virtio-blk worker writes 1 to the
-                            // shared `parked_evt` AFTER its Release
-                            // store on parked/paused. The wait
-                            // here uses `poll(2)` over
-                            // [parked_evt, kill_evt, bsp_done_evt]
-                            // so the loop wakes within microseconds
-                            // of the last parker rather than
-                            // spinning on a 100µs cadence. The
-                            // eventfd write ordering is
-                            // load-bearing: the AtomicBool Release
-                            // happens-before the eventfd write,
-                            // and the coord drains the eventfd
-                            // ONCE per wake then re-checks every
-                            // parked flag. EAGAIN under
-                            // EFD_NONBLOCK on the writer side is
-                            // benign (the AtomicBool is the source
-                            // of truth); EAGAIN on the drain
-                            // (counter == 0) just means a previous
-                            // edge already fired.
-                            use std::os::fd::AsRawFd;
+                            // The pre-pass drain above (before the
+                            // `freeze=true` flip and the kicks)
+                            // ensures every increment we observe
+                            // from here on is a park-ack for THIS
+                            // cycle, not an ack from cycle N-1
+                            // that arrived after the post-thaw
+                            // barrier's drain.
+                            //
+                            // The +1 for virtio-blk is gated on
+                            // `worker_was_running` — when the
+                            // worker thread is not alive, pause()
+                            // is a no-op and writes no parked_evt
+                            // ack, so counting +1 would make the
+                            // rendezvous wait 30 s for an ack that
+                            // never comes.
+                            let mut expected_parks: u64 =
+                                freeze_coord_ap_parked.len() as u64
+                                    + if bsp_alive_at_start { 1 } else { 0 }
+                                    + if worker_was_running { 1 } else { 0 };
                             let deadline = Instant::now() + FREEZE_RENDEZVOUS_TIMEOUT;
+                            // Sub-deadline for the virtio-blk worker
+                            // ack. `device.rs::stop_worker_and_reclaim_state`
+                            // (and any sibling shutdown path) writes
+                            // `paused.store(false, Release)` BEFORE
+                            // signalling stop_fd and joining the
+                            // worker — see lines around device.rs
+                            // 3561 (`self.paused.store(false,
+                            // Ordering::Release)` + `signal_worker_stop`).
+                            // Between that store and the worker
+                            // exiting (with no further `paused=true`
+                            // store on the shutdown path), the
+                            // freeze-coord pre-pause snapshot here
+                            // observes `paused == false` and counts
+                            // `worker_was_running = true → +1` —
+                            // but no live thread will write
+                            // `parked_evt` for this cycle. Without a
+                            // sub-deadline the rendezvous waits the
+                            // full 30 s for an ack the worker
+                            // physically cannot send.
+                            //
+                            // 1 s budget covers a healthy worker's
+                            // `pread`/`pwrite` drain on warm page
+                            // cache (the same envelope
+                            // `DROP_JOIN_TIMEOUT` (1 s) commits to
+                            // for the worker join in
+                            // `device.rs`). If the worker hasn't
+                            // parked within 1 s, it's likely
+                            // mid-shutdown (signal_worker_stop
+                            // pre-clears paused=false). Dropping
+                            // the +1 avoids a 30 s timeout. A
+                            // slow-but-alive worker mid-drain
+                            // could still mutate ring state
+                            // concurrently; this is accepted
+                            // because tmpfs backing bounds drain
+                            // time below the sub-timeout.
+                            const WORKER_PARK_SUB_TIMEOUT: Duration =
+                                Duration::from_secs(1);
+                            let worker_sub_deadline =
+                                Instant::now() + WORKER_PARK_SUB_TIMEOUT;
+                            let mut worker_dropped: bool = false;
+                            let mut parked_count: u64 = 0;
                             let mut all_parked = false;
                             loop {
                                 if freeze_coord_kill.load(Ordering::Acquire)
@@ -2564,36 +2986,126 @@ impl KtstrVm {
                                 {
                                     break;
                                 }
-                                let aps_parked = freeze_coord_ap_parked
-                                    .iter()
-                                    .all(|p| p.load(Ordering::Acquire));
-                                let bsp_p = freeze_coord_bsp_parked.load(Ordering::Acquire);
-                                // Worker pause ack. None-or-paused:
-                                // when no virtio-blk is attached the
-                                // condition is vacuously true. The
-                                // Acquire load synchronizes-with the
-                                // worker's `paused.store(true,
-                                // Release)` so the host's subsequent
-                                // guest-memory reads happen-after
-                                // every queue mutation the worker
-                                // performed pre-pause.
-                                let blk_parked = freeze_coord_virtio_blk
-                                    .as_ref()
-                                    .is_none_or(|d| d.lock().is_paused());
-                                if aps_parked && bsp_p && blk_parked {
+                                if parked_count >= expected_parks {
                                     all_parked = true;
                                     break;
                                 }
+                                // Worker sub-timeout. Only fires
+                                // when the worker was counted in
+                                // `expected_parks` (i.e.
+                                // `worker_was_running` was true at
+                                // pre-pause snapshot) and we have
+                                // not yet decremented for it. The
+                                // condition `parked_count <
+                                // expected_parks` plus the wall-
+                                // clock check (`now >=
+                                // worker_sub_deadline`) localises
+                                // the bookkeeping change to the
+                                // path where the worker really did
+                                // not ack. The Acquire load on
+                                // `paused` synchronises-with any
+                                // worker `Release` it might still
+                                // perform on a slow path; if the
+                                // worker DID park we observe
+                                // `paused == true` and DO NOT
+                                // decrement (the matching ack will
+                                // arrive imminently or has already
+                                // arrived in `parked_count`).
+                                if !worker_dropped
+                                    && worker_was_running
+                                    && Instant::now() >= worker_sub_deadline
+                                    && freeze_coord_virtio_blk_paused
+                                        .as_ref()
+                                        .is_some_and(|p| !p.load(Ordering::Acquire))
+                                {
+                                    // Final paused re-check before
+                                    // decrementing. The condition
+                                    // above sampled paused==false,
+                                    // but a slow-but-alive worker
+                                    // could have transitioned
+                                    // paused=true between that
+                                    // sample and here. Re-loading
+                                    // with Acquire pairs with the
+                                    // worker's Release store on
+                                    // pause(). If the worker DID
+                                    // park, skip the drop and let
+                                    // the next loop iteration
+                                    // observe the matching
+                                    // parked_evt ack — never
+                                    // double-count by both dropping
+                                    // expected_parks and absorbing
+                                    // the eventfd write.
+                                    if freeze_coord_virtio_blk_paused
+                                        .as_ref()
+                                        .is_some_and(|p| p.load(Ordering::Acquire))
+                                    {
+                                        continue;
+                                    }
+                                    tracing::warn!(
+                                        worker_park_sub_timeout_ms =
+                                            WORKER_PARK_SUB_TIMEOUT.as_millis() as u64,
+                                        parked_count,
+                                        expected_parks,
+                                        "freeze-coord: virtio-blk worker did \
+                                         not ack park within sub-timeout AND \
+                                         `paused` is still false — most \
+                                         likely the worker is mid-shutdown \
+                                         (signal_worker_stop already cleared \
+                                         paused=false on its way out), so no \
+                                         live thread will write parked_evt \
+                                         for this cycle. Dropping the +1 \
+                                         from expected_parks so the \
+                                         rendezvous proceeds without waiting \
+                                         the full FREEZE_RENDEZVOUS_TIMEOUT \
+                                         for an ack that physically cannot \
+                                         arrive."
+                                    );
+                                    expected_parks =
+                                        expected_parks.saturating_sub(1);
+                                    worker_dropped = true;
+                                    // Re-check the `all_parked`
+                                    // predicate immediately so a
+                                    // concurrent vCPU ack that just
+                                    // pushed parked_count to the
+                                    // (now lower) expected value is
+                                    // recognised in this iteration
+                                    // rather than after another
+                                    // poll cycle.
+                                    if parked_count >= expected_parks {
+                                        all_parked = true;
+                                        break;
+                                    }
+                                }
                                 let now = Instant::now();
                                 if now > deadline {
+                                    // Diagnostic snapshot of every
+                                    // parker's flag, computed once on
+                                    // timeout for the error log. Hot
+                                    // path no longer reads these
+                                    // bools per iteration.
                                     let ap_states: Vec<bool> = freeze_coord_ap_parked
                                         .iter()
                                         .map(|p| p.load(Ordering::Acquire))
                                         .collect();
+                                    let bsp_p = freeze_coord_bsp_parked.load(Ordering::Acquire);
+                                    // Lock-free read via the
+                                    // pre-acquired `paused_handle()`
+                                    // Arc — avoids taking the device
+                                    // mutex on the timeout-diagnostic
+                                    // path. Acquire ordering pairs
+                                    // with the worker's Release on
+                                    // `paused.store(true)` so the
+                                    // diagnostic sees a coherent
+                                    // worker state.
+                                    let blk_parked = freeze_coord_virtio_blk_paused
+                                        .as_ref()
+                                        .is_none_or(|p| p.load(Ordering::Acquire));
                                     tracing::error!(
                                         ?ap_states,
                                         bsp_parked = bsp_p,
                                         blk_parked,
+                                        parked_count,
+                                        expected_parks,
                                         "freeze-coord: timed out waiting for vCPUs / worker to park. \
                                          If blk_parked=false, the worker is most likely stuck in a \
                                          slow pread/pwrite against the backing file — verify the \
@@ -2629,12 +3141,9 @@ impl KtstrVm {
                                 // array; nfds matches. Every poll
                                 // outcome (ready, timeout, EINTR,
                                 // error) loops back to the
-                                // all-parked predicate at the top —
-                                // there is no per-fd dispatch here
-                                // because the AtomicBool reads
-                                // ARE the dispatch. EINTR from
-                                // SIGRTMIN is harmless: the wait
-                                // simply restarts.
+                                // countdown predicate at the top.
+                                // EINTR from SIGRTMIN is harmless:
+                                // the wait simply restarts.
                                 unsafe {
                                     libc::poll(
                                         pfds.as_mut_ptr(),
@@ -2648,17 +3157,18 @@ impl KtstrVm {
                                 // resets to 0; multiple coalesced
                                 // parker writes are absorbed in one
                                 // drain. EAGAIN (counter already 0)
-                                // is benign — a prior drain or a
-                                // racing reader already absorbed
-                                // the edge. We deliberately do NOT
-                                // drain kill_evt / bsp_done_evt
-                                // here: those are owned by the
-                                // outer epoll loop in the
-                                // coordinator's main body, and
-                                // draining them would suppress the
-                                // edges that wake the outer loop
-                                // on shutdown.
-                                let _ = freeze_coord_parked_evt.read();
+                                // is benign — the poll wake may have
+                                // come from kill_evt or
+                                // bsp_done_evt (those are NOT
+                                // drained here; the outer epoll
+                                // loop owns them). Saturating add
+                                // is defensive — counter mode
+                                // eventfd values cap at 2^64 - 2
+                                // and physically cannot overflow
+                                // a u64 in any realistic VM run.
+                                if let Ok(n) = freeze_coord_parked_evt.read() {
+                                    parked_count = parked_count.saturating_add(n);
+                                }
                             }
                             // Collect per-vCPU register snapshots.
                             // Reads happens-after the rendezvous
@@ -2691,11 +3201,14 @@ impl KtstrVm {
                                 // Rendezvous timed out — at least
                                 // one vCPU never set its parked
                                 // flag, so we cannot safely read
-                                // guest memory.
+                                // guest memory. Break out of the
+                                // 'capture block so the unified
+                                // thaw + post-thaw barrier still
+                                // runs.
                                 tracing::debug!(
                                     "freeze-coord: dump skipped: rendezvous timed out"
                                 );
-                                return None;
+                                break 'capture None;
                             }
                             // Exit-kind gate. The hardware watchpoint
                             // catches every write to
@@ -2824,7 +3337,7 @@ impl KtstrVm {
                                     }
                                 };
                                 if !gate_decision {
-                                    return None;
+                                    break 'capture None;
                                 }
                             }
                             if let Some(ref owned) = owned_accessor
@@ -3087,7 +3600,142 @@ impl KtstrVm {
                                 );
                                 Some((report, capture_start))
                             }
+                        } // end 'capture labeled block (the closure
+                          // returns this block's value; the caller
+                          // is responsible for invoking
+                          // `thaw_and_barrier` AFTER any
+                          // while-frozen work it needs to perform
+                          // — the late-trigger backstop reads
+                          // guest memory while quiesced, so the
+                          // thaw cannot be unconditional inside
+                          // the closure).
                         };
+                    // Unified thaw + post-thaw barrier. Called by
+                    // every site after `freeze_and_capture` returns
+                    // (and after any while-frozen work the site
+                    // needs). Replaces the per-site thaw block that
+                    // previously diverged on which ordering rules
+                    // fired. Resumes the virtio-blk worker FIRST so
+                    // its `paused.load(Acquire)` poll exits before
+                    // the freeze flag clears (worker polls `paused`,
+                    // vCPUs poll `freeze`; resume-then-freeze=false
+                    // means both wake paths land cleanly), then
+                    // clears `freeze` and writes `thaw_evt` so every
+                    // parked vCPU's poll wakes within microseconds.
+                    //
+                    // Post-thaw barrier — wait for every parker to
+                    // clear its flag (vCPUs run their trailing
+                    // `parked.store(false)` in handle_freeze AFTER
+                    // observing freeze=false; the worker clears
+                    // `paused` on resume()). Cycle N+1's
+                    // rendezvous loop assumes all parked flags are
+                    // false at entry; without this barrier a
+                    // still-mid-thaw vCPU's `parked=true` would
+                    // either be cleared by a force-clear and
+                    // deadlock the cycle (legitimate parked=true
+                    // for cycle N+1 never re-stored), OR be
+                    // race-observed as a false positive (vCPU never
+                    // parked for cycle N+1).
+                    //
+                    // No dedicated unparked_evt fd exists
+                    // (handle_freeze does not write any eventfd on
+                    // its trailing `parked.store(false)`); the
+                    // barrier polls the AtomicBools at a 10 ms
+                    // cadence — the same backstop handle_freeze
+                    // uses for its `freeze.load(Acquire)` re-check
+                    // when the thaw_evt poll's level fans across
+                    // multiple parkers. EINTR / partial wakes are
+                    // harmless; the predicate re-evaluates each
+                    // iteration.
+                    //
+                    // Finally drain `parked_evt` so cycle N+1's
+                    // countdown latch starts at 0.
+                    let thaw_and_barrier = || {
+                        if let Some(ref blk) = freeze_coord_virtio_blk {
+                            blk.lock().resume();
+                        }
+                        freeze_coord_freeze.store(false, Ordering::Release);
+                        let _ = freeze_coord_thaw_evt.write(1);
+
+                        let post_thaw_deadline =
+                            Instant::now() + FREEZE_RENDEZVOUS_TIMEOUT;
+                        loop {
+                            if freeze_coord_kill.load(Ordering::Acquire)
+                                || freeze_coord_bsp_done.load(Ordering::Acquire)
+                            {
+                                break;
+                            }
+                            let aps_unparked = freeze_coord_ap_parked
+                                .iter()
+                                .all(|p| !p.load(Ordering::Acquire));
+                            let bsp_unparked = !freeze_coord_bsp_parked
+                                .load(Ordering::Acquire);
+                            // Lock-free read via the pre-acquired
+                            // `paused_handle()` Arc — avoids
+                            // taking the device mutex inside the
+                            // post-thaw barrier hot loop. Acquire
+                            // ordering pairs with the worker's
+                            // Release on `paused.store(false)`
+                            // (resume path) so the predicate sees
+                            // a coherent worker state.
+                            let blk_unpaused = freeze_coord_virtio_blk_paused
+                                .as_ref()
+                                .is_none_or(|p| !p.load(Ordering::Acquire));
+                            if aps_unparked && bsp_unparked && blk_unpaused {
+                                break;
+                            }
+                            let now = Instant::now();
+                            if now > post_thaw_deadline {
+                                let ap_states: Vec<bool> =
+                                    freeze_coord_ap_parked
+                                        .iter()
+                                        .map(|p| p.load(Ordering::Acquire))
+                                        .collect();
+                                tracing::warn!(
+                                    ?ap_states,
+                                    bsp_parked = !bsp_unparked,
+                                    blk_paused = !blk_unpaused,
+                                    "freeze-coord: post-thaw barrier timed out — \
+                                     a parker did not clear within \
+                                     FREEZE_RENDEZVOUS_TIMEOUT; subsequent freeze \
+                                     cycles may see stale parked=true and timeout \
+                                     the rendezvous"
+                                );
+                                break;
+                            }
+                            let remaining_ms = (post_thaw_deadline - now)
+                                .as_millis()
+                                .min(i32::MAX as u128) as i32;
+                            let mut pfds = [
+                                libc::pollfd {
+                                    fd: freeze_coord_kill_evt.as_raw_fd(),
+                                    events: libc::POLLIN,
+                                    revents: 0,
+                                },
+                                libc::pollfd {
+                                    fd: freeze_coord_bsp_done_evt.as_raw_fd(),
+                                    events: libc::POLLIN,
+                                    revents: 0,
+                                },
+                            ];
+                            // SAFETY: pfds is a 2-element pollfd
+                            // array; nfds matches. Bounded 10 ms
+                            // wait is the cadence at which the
+                            // AtomicBool predicate re-runs.
+                            let wait_ms = 10.min(remaining_ms);
+                            unsafe {
+                                libc::poll(
+                                    pfds.as_mut_ptr(),
+                                    pfds.len() as libc::nfds_t,
+                                    wait_ms,
+                                );
+                            }
+                        }
+                        // Drain parked_evt so cycle N+1's countdown
+                        // latch starts at 0. EAGAIN (counter already
+                        // 0) is benign.
+                        let _ = freeze_coord_parked_evt.read();
+                    };
                     // Helper: persist the JSON to the optional file
                     // sink, then log a single info-level summary line
                     // referencing the file path + byte count +
@@ -3140,51 +3788,83 @@ impl KtstrVm {
                             "freeze-coord: dump complete{trunc_part}, {map_count} maps, {tasks_enriched} tasks enriched, {elapsed_ms}ms freeze, {json_bytes} bytes{path_part}"
                         );
                     };
-                    // On-demand snapshot handler. Runs whenever the
-                    // doorbell eventfd had a pending event drained
-                    // above, regardless of `freeze_state`. Serialised
-                    // against itself via `on_demand_in_flight`: a
-                    // pending capture short-circuits a doorbell write
-                    // that arrives mid-rendezvous, so doorbell floods
-                    // collapse to one capture per thaw.
+                    // On-demand snapshot handler. Drains every
+                    // [`crate::vmm::wire::MSG_TYPE_SNAPSHOT_REQUEST`]
+                    // frame the TOKEN_TX handler accumulated this
+                    // iteration, regardless of `freeze_state`. The
+                    // `on_demand_in_flight` AcqRel-bool serialises
+                    // CAPTURE/WATCH against the user-watchpoint
+                    // dispatcher below — a snapshot capture in
+                    // progress here makes the watchpoint loop re-arm
+                    // its `hit` flag for the next iteration instead
+                    // of opening a second concurrent capture window.
                     //
-                    // Reads the snapshot request slot from SHM (kind,
-                    // tag, request_id) and dispatches CAPTURE vs
-                    // WATCH. CAPTURE runs `freeze_and_capture(false)`
-                    // and stores the report on the bridge under the
-                    // tag. WATCH resolves the symbol via the kernel
-                    // ELF, allocates a free user watchpoint slot, publishes
-                    // the resolved KVA + tag into `WatchpointArm`,
-                    // and replies OK so every vCPU's
-                    // `self_arm_watchpoint` picks up the new arm
-                    // before its next KVM_RUN.
-                    if doorbell_pending
-                        && !freeze_coord_on_demand_in_flight
-                            .swap(true, Ordering::AcqRel)
+                    // CAPTURE runs `freeze_and_capture(false)` and
+                    // stores the report on the bridge under the
+                    // tag, then frames a `MSG_TYPE_SNAPSHOT_REPLY`
+                    // TLV (header + 72-byte payload) and pushes it
+                    // through `queue_input_port1` so the guest's
+                    // blocking reader on `/dev/vport0p1` wakes
+                    // within microseconds and observes
+                    // `reply.request_id == request.request_id`.
+                    // WATCH resolves the symbol via the cached
+                    // vmlinux ELF symbol table, allocates a free
+                    // user watchpoint slot, publishes the resolved
+                    // KVA + tag into `WatchpointArm`, kicks every
+                    // vCPU so `self_arm_watchpoint` picks up the
+                    // new arm before the next `KVM_RUN`, and
+                    // replies OK over the same TLV channel. A
+                    // future guest write to the resolved KVA fires
+                    // the corresponding `KVM_EXIT_DEBUG` and the
+                    // user-watchpoint dispatcher (further down the
+                    // iteration) drives the matching capture.
+                    let pending = std::mem::take(&mut snapshot_requests_pending);
+                    for SnapshotRequest {
+                        request_id,
+                        kind,
+                        tag,
+                    } in pending
                     {
-                        let request = read_snapshot_request(
-                            freeze_coord_mem.as_ref(),
-                            freeze_coord_shm_base,
-                        );
-                        match request {
-                            Some(SnapshotRequest {
+                        if freeze_coord_on_demand_in_flight
+                            .swap(true, Ordering::AcqRel)
+                        {
+                            // A user-watchpoint capture is already
+                            // in flight (or a prior iteration
+                            // somehow left the gate set). Reply
+                            // ERR rather than let the guest block
+                            // its full 30 s deadline; the test
+                            // can retry once the in-flight
+                            // capture completes.
+                            let reply = frame_snapshot_reply(
                                 request_id,
-                                kind: shm_ring::SHM_SNAPSHOT_KIND_CAPTURE,
-                                tag,
-                            }) => {
+                                crate::vmm::wire::SNAPSHOT_STATUS_ERR,
+                                "another snapshot capture is in flight; retry",
+                            );
+                            freeze_coord_virtio_con
+                                .lock()
+                                .queue_input_port1(&reply);
+                            tracing::warn!(
+                                request_id,
+                                %tag,
+                                kind,
+                                "freeze-coord: snapshot request rejected (in-flight gate held)"
+                            );
+                            continue;
+                        }
+                        match kind {
+                            crate::vmm::wire::SNAPSHOT_KIND_CAPTURE => {
                                 tracing::info!(
                                     request_id,
                                     %tag,
-                                    "freeze-coord: doorbell CAPTURE request"
+                                    "freeze-coord: TLV CAPTURE request"
                                 );
+                                // CAPTURE has no while-frozen work,
+                                // so thaw immediately after the
+                                // dump returns.
                                 let on_demand = freeze_and_capture(false);
-                                if let Some(ref blk) = freeze_coord_virtio_blk {
-                                    blk.lock().resume();
-                                }
-                                freeze_coord_freeze.store(false, Ordering::Release);
-                                let _ = freeze_coord_thaw_evt.write(1);
+                                thaw_and_barrier();
                                 let mut reply_status =
-                                    shm_ring::SHM_SNAPSHOT_STATUS_OK;
+                                    crate::vmm::wire::SNAPSHOT_STATUS_OK;
                                 let mut reply_reason = String::new();
                                 if let Some((report, capture_start)) = on_demand {
                                     let map_count = report.maps.len();
@@ -3192,22 +3872,21 @@ impl KtstrVm {
                                         report.vcpu_regs.len();
                                     let tasks_enriched =
                                         report.task_enrichments.len();
-                                    // Persist the captured report on
-                                    // the bridge under the
-                                    // guest-supplied tag. The test
-                                    // code drains the bridge after VM
-                                    // exit and walks the reports via
-                                    // the public `Snapshot` accessor.
-                                    freeze_coord_snapshot_bridge
-                                        .store(&tag, report.clone());
-                                    // File mirror for
-                                    // operator inspection AND for
-                                    // the in-guest scenario to read
-                                    // back via `sidecar_dir()` —
-                                    // `{base}.snapshot.{tag}.json`
-                                    // is deterministic from the
-                                    // guest-supplied tag, no
-                                    // counter race.
+                                    // File mirror first via `&report`
+                                    // (no clone). Bridge `store`
+                                    // consumes the report, so any
+                                    // additional reader needs to run
+                                    // BEFORE the move. `to_string`
+                                    // (compact) replaces
+                                    // `to_string_pretty` to halve
+                                    // serialization cost — the JSON
+                                    // is consumed by tests and tools,
+                                    // not by humans, and `jq` /
+                                    // `serde_json::from_str` parse
+                                    // both forms identically. Avoids
+                                    // the prior `report.clone()` deep
+                                    // copy of hundreds-of-KB-scale
+                                    // dump data.
                                     if let Some(ref base_path) =
                                         freeze_coord_dump_path
                                     {
@@ -3217,9 +3896,7 @@ impl KtstrVm {
                                         if let Some(parent) = tagged.parent() {
                                             let _ = std::fs::create_dir_all(parent);
                                         }
-                                        match serde_json::to_string_pretty(
-                                            &report,
-                                        ) {
+                                        match serde_json::to_string(&report) {
                                             Ok(json) => {
                                                 if let Err(e) =
                                                     std::fs::write(&tagged, &json)
@@ -3253,9 +3930,16 @@ impl KtstrVm {
                                         elapsed_ms,
                                         "freeze-coord: snapshot captured and stored on bridge"
                                     );
+                                    // Persist on the bridge LAST —
+                                    // store moves the report. Test
+                                    // code drains the bridge after
+                                    // VM exit and walks the reports
+                                    // via the public `Snapshot`
+                                    // accessor.
+                                    freeze_coord_snapshot_bridge.store(&tag, report);
                                 } else {
                                     reply_status =
-                                        shm_ring::SHM_SNAPSHOT_STATUS_ERR;
+                                        crate::vmm::wire::SNAPSHOT_STATUS_ERR;
                                     reply_reason =
                                         "freeze rendezvous timed out (vCPU stuck \
                                          in KVM_RUN past FREEZE_RENDEZVOUS_TIMEOUT)"
@@ -3266,150 +3950,123 @@ impl KtstrVm {
                                         "freeze-coord: on-demand capture failed (rendezvous timeout)"
                                     );
                                 }
-                                write_snapshot_reply(
-                                    freeze_coord_mem.as_ref(),
-                                    freeze_coord_shm_base,
+                                let reply = frame_snapshot_reply(
                                     request_id,
                                     reply_status,
                                     &reply_reason,
                                 );
+                                freeze_coord_virtio_con
+                                    .lock()
+                                    .queue_input_port1(&reply);
                             }
-                            Some(SnapshotRequest {
-                                request_id,
-                                kind: shm_ring::SHM_SNAPSHOT_KIND_WATCH,
-                                tag,
-                            }) => {
+                            crate::vmm::wire::SNAPSHOT_KIND_WATCH => {
                                 tracing::info!(
                                     request_id,
                                     %tag,
-                                    "freeze-coord: doorbell WATCH request"
+                                    "freeze-coord: TLV WATCH request"
                                 );
-                                let Some(ref vmlinux) = freeze_coord_vmlinux else {
-                                    write_snapshot_reply(
-                                        freeze_coord_mem.as_ref(),
-                                        freeze_coord_shm_base,
-                                        request_id,
-                                        shm_ring::SHM_SNAPSHOT_STATUS_ERR,
-                                        "vmlinux not found in kernel dir",
-                                    );
-                                    on_demand_in_flight.store(false, Ordering::Release);
-                                    continue;
-                                };
-                                let arm_result = arm_user_watchpoint(
-                                    &freeze_coord_watchpoint,
-                                    vmlinux.as_path(),
-                                    &tag,
-                                );
-                                let (status, reason) = match arm_result {
-                                    Ok(slot_idx) => {
-                                        tracing::info!(
-                                            request_id,
-                                            %tag,
-                                            slot_idx,
-                                            "freeze-coord: hardware watchpoint armed"
-                                        );
-                                        (
-                                            shm_ring::SHM_SNAPSHOT_STATUS_OK,
-                                            String::new(),
-                                        )
+                                // Reply path branches on whether the
+                                // cached vmlinux symbol map is available.
+                                // The fall-through (no `continue`) lets
+                                // the user-watchpoint loop and the
+                                // late-trigger handler later in this
+                                // iteration still run, so a WATCH that
+                                // cannot resolve does not stall an
+                                // already-pending err_triggered dump
+                                // for a full poll interval.
+                                let (status, reason) = match freeze_coord_symbol_cache.as_ref() {
+                                    None => (
+                                        crate::vmm::wire::SNAPSHOT_STATUS_ERR,
+                                        "vmlinux symbol cache unavailable \
+                                         (vmlinux not found or parse failed at \
+                                         coord init)"
+                                            .to_string(),
+                                    ),
+                                    Some(symbol_cache) => {
+                                        // BSP-alive gate is consulted
+                                        // once at the kick site; same
+                                        // Acquire-load the freeze
+                                        // closure uses so the BSP IE
+                                        // write and pthread_kill share
+                                        // the snapshot — `run_vm`
+                                        // flips this to false only
+                                        // AFTER joining the coordinator
+                                        // (see `bsp_alive` in run_vm),
+                                        // so a `true` reading here is
+                                        // load-bearing for the BSP
+                                        // kvm_run mmap's liveness.
+                                        let bsp_alive_at_arm =
+                                            bsp_alive_for_coord
+                                                .load(Ordering::Acquire);
+                                        match arm_user_watchpoint(
+                                            &freeze_coord_watchpoint,
+                                            symbol_cache,
+                                            &tag,
+                                            &freeze_coord_ap_pthreads,
+                                            &freeze_coord_ap_ies,
+                                            freeze_coord_bsp_tid,
+                                            freeze_coord_bsp_ie_handle.as_ref(),
+                                            bsp_alive_at_arm,
+                                        ) {
+                                            Ok(slot_idx) => {
+                                                tracing::info!(
+                                                    request_id,
+                                                    %tag,
+                                                    slot_idx,
+                                                    "freeze-coord: hardware watchpoint armed"
+                                                );
+                                                (
+                                                    crate::vmm::wire::SNAPSHOT_STATUS_OK,
+                                                    String::new(),
+                                                )
+                                            }
+                                            Err(reason) => {
+                                                tracing::warn!(
+                                                    request_id,
+                                                    %tag,
+                                                    %reason,
+                                                    "freeze-coord: WATCH register failed"
+                                                );
+                                                (
+                                                    crate::vmm::wire::SNAPSHOT_STATUS_ERR,
+                                                    reason,
+                                                )
+                                            }
+                                        }
                                     }
-                                    Err(reason) => {
-                                        tracing::warn!(
-                                            request_id,
-                                            %tag,
-                                            %reason,
-                                            "freeze-coord: WATCH register failed"
-                                        );
-                                        (
-                                            shm_ring::SHM_SNAPSHOT_STATUS_ERR,
-                                            reason,
-                                        )
-                                    }
                                 };
-                                write_snapshot_reply(
-                                    freeze_coord_mem.as_ref(),
-                                    freeze_coord_shm_base,
+                                let reply = frame_snapshot_reply(
                                     request_id,
                                     status,
                                     &reason,
                                 );
+                                freeze_coord_virtio_con
+                                    .lock()
+                                    .queue_input_port1(&reply);
                             }
-                            Some(SnapshotRequest {
-                                request_id,
-                                kind,
-                                tag,
-                            }) => {
+                            unknown => {
                                 tracing::warn!(
                                     request_id,
                                     %tag,
-                                    kind,
-                                    "freeze-coord: doorbell with unknown kind"
+                                    kind = unknown,
+                                    "freeze-coord: TLV snapshot request with unknown kind"
                                 );
-                                write_snapshot_reply(
-                                    freeze_coord_mem.as_ref(),
-                                    freeze_coord_shm_base,
+                                let reply = frame_snapshot_reply(
                                     request_id,
-                                    shm_ring::SHM_SNAPSHOT_STATUS_ERR,
-                                    &format!("unknown snapshot kind {kind}"),
+                                    crate::vmm::wire::SNAPSHOT_STATUS_ERR,
+                                    &format!("unknown snapshot kind {unknown}"),
                                 );
-                            }
-                            None => {
-                                // Doorbell fired without an SHM
-                                // request slot populated — most
-                                // likely a host-side trigger via
-                                // `doorbell_evt.write(1)` outside
-                                // any guest-driven flow. Fall back
-                                // to the legacy "anonymous capture"
-                                // behaviour, storing under the same
-                                // synthetic tag the file mirror
-                                // uses.
-                                tracing::info!(
-                                    "freeze-coord: doorbell fired without SHM request \
-                                     (host-side trigger?); running anonymous capture"
-                                );
-                                let on_demand = freeze_and_capture(false);
-                                if let Some(ref blk) = freeze_coord_virtio_blk {
-                                    blk.lock().resume();
-                                }
-                                freeze_coord_freeze.store(false, Ordering::Release);
-                                let _ = freeze_coord_thaw_evt.write(1);
-                                if let Some((report, _)) = on_demand {
-                                    let counter = on_demand_counter;
-                                    on_demand_counter =
-                                        on_demand_counter.wrapping_add(1);
-                                    let synth_tag =
-                                        format!("anonymous_{counter}");
-                                    freeze_coord_snapshot_bridge
-                                        .store(&synth_tag, report.clone());
-                                    if let Some(ref base_path) =
-                                        freeze_coord_dump_path
-                                    {
-                                        let tagged = on_demand_tagged_path(
-                                            base_path, counter,
-                                        );
-                                        if let Some(parent) = tagged.parent() {
-                                            let _ = std::fs::create_dir_all(parent);
-                                        }
-                                        if let Ok(json) =
-                                            serde_json::to_string_pretty(&report)
-                                            && let Err(e) =
-                                                std::fs::write(&tagged, &json)
-                                        {
-                                            tracing::warn!(
-                                                path = %tagged.display(),
-                                                error = %e,
-                                                "freeze-coord: anonymous on-demand dump file write failed"
-                                            );
-                                        }
-                                    }
-                                }
+                                freeze_coord_virtio_con
+                                    .lock()
+                                    .queue_input_port1(&reply);
                             }
                         }
                         freeze_coord_on_demand_in_flight
                             .store(false, Ordering::Release);
                     }
-                    // After every doorbell-driven path runs, also
-                    // service any user-watchpoint hits on slots 1..=3.
+                    // After every TLV-driven snapshot dispatch path
+                    // runs, also service any user-watchpoint hits on
+                    // slots 1..=3.
                     // The vCPU's KVM_EXIT_DEBUG handler latches the
                     // matching slot's `hit` flag and writes hit_evt;
                     // the coordinator's epoll fires WATCHPOINT, the
@@ -3432,9 +4089,9 @@ impl KtstrVm {
                             .swap(true, Ordering::AcqRel)
                         {
                             // A capture is already in flight (e.g.
-                            // CAPTURE doorbell handler is running).
-                            // Re-arm the slot's hit flag so the next
-                            // epoll iteration handles it.
+                            // a CAPTURE-class TLV request is still
+                            // running). Re-arm the slot's hit flag
+                            // so the next epoll iteration handles it.
                             freeze_coord_watchpoint.user[slot_idx]
                                 .hit
                                 .store(true, Ordering::Release);
@@ -3445,16 +4102,19 @@ impl KtstrVm {
                             %tag,
                             "freeze-coord: user watchpoint fire; capturing"
                         );
+                        // User watchpoint has no while-frozen work,
+                        // so thaw immediately.
                         let on_demand = freeze_and_capture(false);
-                        if let Some(ref blk) = freeze_coord_virtio_blk {
-                            blk.lock().resume();
-                        }
-                        freeze_coord_freeze.store(false, Ordering::Release);
-                        let _ = freeze_coord_thaw_evt.write(1);
+                        thaw_and_barrier();
                         if let Some((report, capture_start)) = on_demand {
                             let map_count = report.maps.len();
-                            freeze_coord_snapshot_bridge
-                                .store(&tag, report.clone());
+                            // File mirror via `&report` (no clone),
+                            // then move the report into the bridge.
+                            // See the CAPTURE-class TLV handler
+                            // above for the full rationale on the
+                            // serialize-then-store ordering and the
+                            // `to_string` vs `to_string_pretty`
+                            // tradeoff.
                             if let Some(ref base_path) = freeze_coord_dump_path
                             {
                                 let tagged =
@@ -3463,7 +4123,7 @@ impl KtstrVm {
                                     let _ = std::fs::create_dir_all(parent);
                                 }
                                 if let Ok(json) =
-                                    serde_json::to_string_pretty(&report)
+                                    serde_json::to_string(&report)
                                     && let Err(e) = std::fs::write(&tagged, &json)
                                 {
                                     tracing::warn!(
@@ -3484,20 +4144,22 @@ impl KtstrVm {
                                 elapsed_ms,
                                 "freeze-coord: user-watchpoint snapshot captured"
                             );
+                            freeze_coord_snapshot_bridge.store(&tag, report);
                         }
                         freeze_coord_on_demand_in_flight
                             .store(false, Ordering::Release);
                     }
                     // Once the late snapshot has been emitted, the
                     // coordinator's only remaining job is to keep
-                    // the freeze=false invariant clear, drain the
-                    // doorbell, and wait for teardown. Skip the
-                    // error-trigger paths below; the next
-                    // `epoll.wait` at the top of the loop blocks
-                    // until kill / bsp_done / doorbell / scanner
+                    // the freeze=false invariant clear, service
+                    // any pending TLV snapshot requests, and wait
+                    // for teardown. Skip the error-trigger paths
+                    // below; the next `epoll.wait` at the top of
+                    // the loop blocks until kill / bsp_done /
+                    // virtio-console TX / watchpoint / scanner
                     // tick — no separate sleep cadence needed.
-                    // Goes AFTER the doorbell handler so on-demand
-                    // captures still service post-Done.
+                    // Goes AFTER the snapshot-request dispatch so
+                    // on-demand captures still service post-Done.
                     if freeze_state == FreezeState::Done {
                         continue;
                     }
@@ -3574,7 +4236,12 @@ impl KtstrVm {
                             // Early trigger uses runnable_at age as
                             // its precondition; exit_kind has not
                             // necessarily been written yet, so pass
-                            // `false` to skip the gate.
+                            // `false` to skip the gate. Early
+                            // snapshot has no while-frozen work, so
+                            // thaw immediately after the dump
+                            // returns (whether or not it produced a
+                            // report — a stuck rendezvous already
+                            // logged inside the closure).
                             if let Some((report, _capture_start)) =
                                 freeze_and_capture(false)
                             {
@@ -3582,29 +4249,7 @@ impl KtstrVm {
                                 early_threshold_jiffies = half_threshold_jiffies;
                                 early_snapshot = Some(report);
                             }
-                            // Thaw whether or not we got a report:
-                            // the freeze flag was set unconditionally,
-                            // and a stuck rendezvous already logged.
-                            // Resume the worker BEFORE clearing the
-                            // freeze flag: the worker's
-                            // `paused.load(Acquire)` poll is the only
-                            // path out of its `park_timeout(10ms)`
-                            // loop, so a freeze flag clear without a
-                            // resume() leaves the worker parked
-                            // indefinitely. The freeze flag governs
-                            // the vCPU rendezvous, which is
-                            // orthogonal — vCPUs poll `freeze`, the
-                            // worker polls `paused`. Order:
-                            // resume()→freeze.store(false) means
-                            // both wake paths land cleanly.
-                            if let Some(ref blk) = freeze_coord_virtio_blk {
-                                blk.lock().resume();
-                            }
-                            freeze_coord_freeze.store(false, Ordering::Release);
-                            // Wake every parked vCPU. See the
-                            // doorbell-handler thaw_evt write for
-                            // the ordering rationale.
-                            let _ = freeze_coord_thaw_evt.write(1);
+                            thaw_and_barrier();
                             freeze_state = FreezeState::TookEarly;
                         }
                     }
@@ -3771,18 +4416,14 @@ impl KtstrVm {
                             };
                         // Thaw before emission so a slow JSON
                         // serialise doesn't keep vCPUs parked any
-                        // longer than the dump strictly needs.
-                        // Resume worker first — see early-snapshot
-                        // path doc for the freeze-vs-paused
-                        // ordering rationale.
-                        if let Some(ref blk) = freeze_coord_virtio_blk {
-                            blk.lock().resume();
-                        }
-                        freeze_coord_freeze.store(false, Ordering::Release);
-                        // Wake every parked vCPU. See the
-                        // doorbell-handler thaw_evt write for the
-                        // ordering rationale.
-                        let _ = freeze_coord_thaw_evt.write(1);
+                        // longer than the dump strictly needs. The
+                        // backstop above (dual-snapshot only) ran
+                        // while still frozen, so the backstop's
+                        // runnable_at scan saw the same quiesced
+                        // memory the dump captured — thawing here
+                        // is safe because every site that depends
+                        // on quiesced state has completed.
+                        thaw_and_barrier();
                         // Branch on three outcomes:
                         //   Some(...)             → dump, mark Done
                         //   None + watchpoint-only → gate-suppressed
@@ -3813,6 +4454,13 @@ impl KtstrVm {
                                 let vcpu_regs_count = late.vcpu_regs.len();
                                 let tasks_enriched = late.task_enrichments.len();
                                 let truncated_at_us = late.dump_truncated_at_us;
+                                // `to_string` (compact) replaces
+                                // `to_string_pretty` to halve
+                                // serialization cost on the hot
+                                // failure-dump path. JSON consumers
+                                // (sidecar tooling, repro probe) all
+                                // parse via serde_json which
+                                // tolerates either form identically.
                                 let json_result = if freeze_coord_dual_snapshot {
                                     let dual = crate::monitor::dump::DualFailureDumpReport {
                                         schema: crate::monitor::dump::SCHEMA_DUAL
@@ -3823,9 +4471,9 @@ impl KtstrVm {
                                         early_threshold_jiffies,
                                         early_skipped_reason,
                                     };
-                                    serde_json::to_string_pretty(&dual)
+                                    serde_json::to_string(&dual)
                                 } else {
-                                    serde_json::to_string_pretty(&late)
+                                    serde_json::to_string(&late)
                                 };
                                 match json_result {
                                     Ok(json) => emit_json(
@@ -4036,8 +4684,9 @@ impl KtstrVm {
                     }
                     // End of body. Loop back to the `epoll.wait`
                     // at the top, which blocks until any registered
-                    // fd fires (kill, bsp_done, doorbell, watchpoint
-                    // hit, scanner tick) or POLL_TIMEOUT_MS elapses.
+                    // fd fires (kill, bsp_done, virtio-console TX,
+                    // watchpoint hit, scanner tick) or
+                    // POLL_TIMEOUT_MS elapses.
                     // The watchpoint hit and bss-pa edges are
                     // delivered as eventfd writes from the vCPU
                     // thread, so the trigger latency is bounded by
@@ -4047,6 +4696,128 @@ impl KtstrVm {
                     // resolve, runnable_at scan) remains gated on
                     // `scan_tick`, which only fires on the SCANNER
                     // timerfd edge (every 100 ms).
+                }
+                // Final drain of any pending user-watchpoint hits.
+                // The hot-path for-loop at the end of each
+                // coordinator iteration handles slot[i].hit fires
+                // synchronously, but two race windows can leave a
+                // hit `true` past loop exit:
+                //
+                //   1. The "already in flight" branch in the
+                //      hot-path for-loop re-arms the slot's `hit`
+                //      and `break`s when `on_demand_in_flight` is
+                //      true on entry. If kill / bsp_done flips
+                //      before the next iteration runs, the
+                //      re-armed hit is never serviced.
+                //   2. A vCPU's `latch_user_hit` Release that
+                //      raced the loop exit (kill flipped between
+                //      the for-loop terminating and the next
+                //      `epoll.wait`).
+                //
+                // Without this drain the snapshot the test author
+                // requested is silently dropped — `Snapshot::watch`
+                // produces no entry, which a passing test
+                // misinterprets as "the watched address was never
+                // written" instead of "the VMM exited before the
+                // capture pipeline serviced the fire". Store a
+                // "watch-fired-but-coord-exited" placeholder under
+                // the slot's tag so the test's lookup gets a
+                // distinguishable result. Same minimal-report
+                // shape the in-loop "dump prerequisites
+                // unavailable" partial path uses, with a
+                // dedicated reason string so consumers can tell
+                // the two cases apart.
+                for slot_idx in 0..freeze_coord_watchpoint.user.len() {
+                    if !freeze_coord_watchpoint.user[slot_idx]
+                        .hit
+                        .swap(false, Ordering::AcqRel)
+                    {
+                        continue;
+                    }
+                    let tag = freeze_coord_watchpoint.user[slot_idx]
+                        .tag
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone();
+                    tracing::warn!(
+                        slot_idx,
+                        %tag,
+                        "freeze-coord: user-watchpoint fire pending at coord exit; \
+                         storing placeholder report (no capture possible during \
+                         teardown — vCPU rendezvous would race teardown joins)"
+                    );
+                    let placeholder = crate::monitor::dump::FailureDumpReport {
+                        schema: crate::monitor::dump::SCHEMA_SINGLE.to_string(),
+                        maps: Vec::new(),
+                        vcpu_regs: Vec::new(),
+                        sdt_allocations: Vec::new(),
+                        prog_runtime_stats: Vec::new(),
+                        prog_runtime_stats_unavailable: Some(
+                            "coord exited before capture".to_string(),
+                        ),
+                        per_cpu_time: Vec::new(),
+                        task_enrichments: Vec::new(),
+                        task_enrichments_unavailable: Some(
+                            "coord exited before capture".to_string(),
+                        ),
+                        event_counter_timeline: Vec::new(),
+                        rq_scx_states: Vec::new(),
+                        dsq_states: Vec::new(),
+                        scx_sched_state: None,
+                        scx_walker_unavailable: Some(
+                            "coord exited before capture".to_string(),
+                        ),
+                        vcpu_perf_at_freeze: Vec::new(),
+                        per_node_numa: Vec::new(),
+                        per_node_numa_unavailable: Some(
+                            "coord exited before capture".to_string(),
+                        ),
+                        dump_truncated_at_us: None,
+                        probe_counters: None,
+                    };
+                    freeze_coord_snapshot_bridge.store(&tag, placeholder);
+                }
+                // Post-drain advisory: vCPU threads (BSP + APs) are
+                // still alive at this point — they only join inside
+                // `collect_results` after the coord thread closure
+                // returns (see `run_vm` join sequencing: coord first
+                // via `freeze_coord_handle.join()`, AP threads later
+                // via `wait_for_exit` + `handle.join` inside
+                // `collect_results`). Any vCPU that calls
+                // `latch_user_hit` between the drain loop above and
+                // its eventual join will set `hit = true` AND
+                // increment `hit_evt`, but the coordinator's epoll
+                // is already gone — nothing services that hit. The
+                // count of slots whose `request_kva != 0` here is
+                // the upper bound on hits that could still be lost
+                // (each such slot is currently armed in
+                // KVM_SET_GUEST_DEBUG on every vCPU and capable of
+                // firing on the next guest write to its KVA). This
+                // warn surfaces the observability gap so an operator
+                // who finds a missing snapshot in
+                // `Snapshot::watch_results` can tell "VMM lost the
+                // hit during teardown" from "guest never wrote to
+                // the watched KVA". Acquire load is overkill (the
+                // armed slot publication uses Release / vCPU
+                // self-arm uses Acquire) but cheap.
+                let still_armed = freeze_coord_watchpoint
+                    .user
+                    .iter()
+                    .filter(|slot| slot.request_kva.load(Ordering::Acquire) != 0)
+                    .count();
+                if still_armed > 0 {
+                    tracing::warn!(
+                        still_armed,
+                        "freeze-coord: post-drain teardown advisory — {still_armed} \
+                         user-watchpoint slot(s) remain armed on every vCPU at \
+                         coord exit. Hits latched by a vCPU between this drain \
+                         and the eventual vCPU join in collect_results are NOT \
+                         serviced (the coord epoll is already gone). Tests \
+                         observing a missing snapshot in Snapshot::watch_results \
+                         should treat this warn as evidence that the watched \
+                         address WAS written to, just past the host-side \
+                         capture window."
+                    );
                 }
                 // Flush any partial-frame bytes the bulk_assembler
                 // is still buffering back into the device's
@@ -4183,7 +4954,7 @@ impl KtstrVm {
                     }
                     // Soft deadline: request graceful shutdown by
                     // pushing `SIGNAL_VC_SHUTDOWN` into virtio-console
-                    // RX. The guest's `shm_poll_loop` blocks on
+                    // RX. The guest's `hvc0_poll_loop` blocks on
                     // `/dev/hvc0` and recognises the byte directly —
                     // no SHM signal slot needed. The BSP keeps running
                     // so the guest can flush serial and reboot
@@ -4299,7 +5070,7 @@ impl KtstrVm {
         // this value.
         eprintln!(
             "BSP: exited run loop, code={exit_code} timed_out={timed_out} \
-             (run-loop sentinel — final exit code comes from SHM/COM2 in collect_results)"
+             (run-loop sentinel — final exit code comes from bulk port / COM2 in collect_results)"
         );
 
         // Join the watchdog before dropping `bsp`. The watchdog holds an
@@ -4307,12 +5078,31 @@ impl KtstrVm {
         // dropped first, the watchdog may write to unmapped memory.
         let _ = watchdog.join();
 
-        // Make sure freeze is cleared before vCPU teardown so the
-        // freeze coordinator sees `kill || bsp_done` and exits its
-        // loop, and APs don't park-loop after we kick them. The
-        // coordinator joins below (in `collect_results`); the
-        // coordinator's epoll loop wakes on `kill_evt` /
-        // `bsp_done_evt` writes, not on `thread::unpark`.
+        // Join the freeze coordinator BEFORE `bsp` falls out of scope at
+        // the end of this function. The coordinator's captured BSP
+        // `ImmediateExitHandle` addresses bsp's kvm_run mmap; reachable
+        // from multiple paths inside `freeze_and_capture` (TLV-driven
+        // CAPTURE, user watchpoint, late-trigger, even after `bsp_done`
+        // flips). Without this join, any of those paths can write
+        // through a freed kvm_run mapping after bsp drops — a
+        // use-after-free with hostile-input semantics.
+        //
+        // `bsp_done.store(true)` + `bsp_done_evt.write(1)` above
+        // (lines around `BSP: exited run loop`) wake the coordinator's
+        // epoll loop and break it out of the outer loop on the next
+        // iteration, so this join does not deadlock; the watchdog's
+        // own kill/bsp_done writes are also covered.
+        //
+        // Flip `bsp_alive` to `false` AFTER the join completes — at
+        // that point the coordinator thread is gone and the gate is
+        // belt-and-braces for any future restructuring that could
+        // share the BSP IE handle outside this lifecycle.
+        let _ = freeze_coord_handle.join();
+        bsp_alive.store(false, Ordering::Release);
+
+        // Make sure freeze is cleared before vCPU teardown so the APs
+        // don't park-loop after we kick them. The freeze coordinator
+        // has already joined above so it cannot re-set freeze=true.
 
         // Capture the virtio-blk counter Arc before the device's
         // outer `Arc<PiMutex<VirtioBlk>>` falls out of scope. The
@@ -4344,7 +5134,11 @@ impl KtstrVm {
             ap_threads,
             monitor_handle,
             bpf_write_handle,
-            freeze_coordinator: Some(freeze_coord_handle),
+            // Coordinator is already joined above (before `bsp` drops)
+            // to prevent UAF on the BSP `ImmediateExitHandle`.
+            // `collect_results`'s `if let Some(h) = ...` join is a
+            // no-op for the `None` arm.
+            freeze_coordinator: None,
             com1,
             com2,
             kill,
@@ -4354,22 +5148,17 @@ impl KtstrVm {
             cleanup_start,
             virtio_blk_counters,
             virtio_net_counters,
-            // Original doorbell EventFd handle. The coordinator owns
-            // a clone in `freeze_coord_doorbell`; both fds share the
-            // same kernel counter via `dup(2)`, so a write to either
-            // wakes the coordinator's read.
-            doorbell_evt: Some(doorbell_evt),
             // Snapshot bridge owning every report stored by the
-            // freeze coordinator's doorbell handler over the run's
-            // lifetime. Forwarded to `VmResult::snapshot_bridge`
-            // by `collect_results`.
+            // freeze coordinator's TLV-driven snapshot handler
+            // over the run's lifetime. Forwarded to
+            // `VmResult::snapshot_bridge` by `collect_results`.
             snapshot_bridge,
             tcr_el1: tcr_el1_cache,
             // Virtio-console handle threaded into `collect_results`
             // for the post-exit `drain_bulk()` call. Carries any
             // port-1 TLV bytes the guest wrote that the freeze
             // coordinator's tx_evt-driven mid-run drain did not
-            // already consume; the merge into `shm_data` keeps
+            // already consume; the merge into `guest_messages` keeps
             // existing readers (eval.rs, sidecar) working without
             // any per-message-type code change.
             virtio_con,
@@ -4378,6 +5167,10 @@ impl KtstrVm {
             // post-exit drain and the SHM CRASH ring drain so
             // every frame the guest published reaches the verdict.
             bulk_messages: freeze_coord_bulk_messages,
+            // Watchpoint Arc forwarded so `collect_results` can
+            // invalidate `kind_host_ptr` and `request_kva` after
+            // every vCPU thread joins but before `vm` drops.
+            watchpoint,
         })
     }
 
@@ -4633,21 +5426,15 @@ impl KtstrVm {
                 unsafe { monitor::reader::GuestMem::new(host_base, mem_size) }
             }
         };
-        let mem_size = mem.size();
         let num_cpus = self.topology.total_cpus();
         let kill_clone = kill.clone();
         let kill_evt_clone = kill_evt.clone();
-        let dump_trigger =
-            self.monitor_thresholds
-                .filter(|_| self.shm_size > 0)
-                .map(|thresholds| {
-                    let shm_base_pa = mem_size - self.shm_size;
-                    monitor::reader::DumpTrigger {
-                        shm_base_pa,
-                        thresholds,
-                        virtio_con: virtio_con.clone(),
-                    }
-                });
+        let dump_trigger = self.monitor_thresholds.map(|thresholds| {
+            monitor::reader::DumpTrigger {
+                thresholds,
+                virtio_con: virtio_con.clone(),
+            }
+        });
 
         let hz = monitor::guest_kernel_hz(Some(&self.kernel));
         // ms-precision conversion lives in [`duration_to_jiffies`];
@@ -4656,12 +5443,6 @@ impl KtstrVm {
         let preemption_threshold_ns = monitor::vcpu_preemption_threshold_ns(Some(&self.kernel));
         let rt_monitor = self.performance_mode;
         let service_cpu = self.pinning_plan.as_ref().and_then(|p| p.service_cpu);
-        let shm_base_pa = if self.shm_size > 0 {
-            Some(mem_size - self.shm_size)
-        } else {
-            None
-        };
-
         let vmlinux_clone = vmlinux.clone();
 
         let handle = std::thread::Builder::new()
@@ -4700,19 +5481,19 @@ impl KtstrVm {
                 // (16 KB granule) hosts produce the wrong base in
                 // that race window; the post-wait re-derive below
                 // catches up once TCR_EL1 lands.
+                let tcr_el1_value = tcr_el1
+                    .as_ref()
+                    .map(|c| c.load(std::sync::atomic::Ordering::Acquire))
+                    .unwrap_or(0);
                 let start_kernel_map_for_thread =
-                    monitor::symbols::start_kernel_map_for_tcr(
-                        tcr_el1
-                            .as_ref()
-                            .map(|c| c.load(std::sync::atomic::Ordering::Acquire))
-                            .unwrap_or(0),
-                    )
-                    .unwrap_or(monitor::symbols::START_KERNEL_MAP);
+                    monitor::symbols::start_kernel_map_for_tcr(tcr_el1_value)
+                        .unwrap_or(monitor::symbols::START_KERNEL_MAP);
 
-                let page_offset = monitor::symbols::resolve_page_offset(
+                let page_offset = monitor::symbols::resolve_page_offset_with_tcr(
                     &mem,
                     &symbols,
                     start_kernel_map_for_thread,
+                    tcr_el1_value,
                 );
 
                 // __per_cpu_offset is a kernel data symbol: use text mapping.
@@ -4873,7 +5654,6 @@ impl KtstrVm {
                     // `Option<&PerfCountersCapture>` MonitorConfig wants.
                     perf_capture: (*perf_capture).as_ref(),
                     preemption_threshold_ns,
-                    shm_base_pa,
                     prog_stats_ctx: prog_stats_ctx.as_ref(),
                     page_offset,
                     start_kernel_map: start_kernel_map_post_wait,
@@ -4900,7 +5680,7 @@ impl KtstrVm {
     /// 1. Poll `BpfMapAccessorOwned::new` until kernel page tables are up
     /// 2. Poll `find_map` until the scheduler's BPF maps are discoverable
     /// 3. Write each queued value, then push `SIGNAL_BPF_WRITE_DONE`
-    ///    through virtio-console RX so the guest's `shm_poll_loop`
+    ///    through virtio-console RX so the guest's `hvc0_poll_loop`
     ///    sets the `bpf_map_write_done` latch; the scenario's
     ///    `wait_for_map_write` gate (`Ctx::wait_for_map_write=true`)
     ///    blocks on that latch until this thread fires.
@@ -5046,7 +5826,7 @@ impl KtstrVm {
                     };
                     eprintln!(
                         "bpf_map_write: map '{}' found after {} attempts",
-                        map_info.name, attempt,
+                        map_info.name(), attempt,
                     );
                     resolved.push((params.clone(), map_info));
                 }
@@ -5067,7 +5847,7 @@ impl KtstrVm {
                     all_maps.len(),
                     all_maps
                         .iter()
-                        .map(|m| format!("{}(type={})", m.name, m.map_type))
+                        .map(|m| format!("{}(type={})", m.name(), m.map_type))
                         .collect::<Vec<_>>()
                         .join(", "),
                 );
@@ -5078,13 +5858,13 @@ impl KtstrVm {
                     let after = accessor.read_value_u32(map_info, params.offset);
                     eprintln!(
                         "bpf_map_write: map '{}' write={} (value={} offset={} before={:?} after={:?})",
-                        map_info.name, ok, params.value, params.offset, before, after,
+                        map_info.name(), ok, params.value, params.offset, before, after,
                     );
                 }
 
                 // Notify the guest that every queued write landed by
                 // pushing `SIGNAL_BPF_WRITE_DONE` into virtio-console
-                // RX. The guest's `shm_poll_loop` blocks on
+                // RX. The guest's `hvc0_poll_loop` blocks on
                 // `/dev/hvc0`, recognises the byte, and sets the
                 // `bpf_map_write_done` latch. A scenario blocked on
                 // [`crate::scenario::Ctx::wait_for_map_write`] resumes
@@ -5403,20 +6183,59 @@ impl KtstrVm {
             }
             vt.handle.thread().unpark();
         }
-        // Join the freeze coordinator BEFORE the AP join loop. The
-        // coordinator owns ImmediateExitHandles into AP kvm_run mmaps;
-        // joining APs first would drop the VcpuFds (and unmap the
-        // pages) while the coordinator is still alive and could write
-        // to a stale immediate_exit pointer (use-after-free). Setting
-        // run.kill=true and run.freeze=false above guarantees the
-        // coordinator's outer loop and inner park-rendezvous exit on
-        // the next iteration, so this join doesn't deadlock.
+        // The freeze coordinator was joined inside `run_vm` BEFORE
+        // bsp dropped (preventing UAF on the BSP ImmediateExitHandle),
+        // so `run.freeze_coordinator` is always `None` here. The
+        // `Option`-typed field is preserved for backward compatibility
+        // with paths that may construct VmRunState differently in
+        // the future; the conditional join below is a no-op for the
+        // `None` arm.
         if let Some(h) = run.freeze_coordinator {
             let _ = h.join();
         }
         for vt in run.ap_threads {
             vt.wait_for_exit(Duration::from_secs(5));
             let _ = vt.handle.join();
+        }
+
+        // Invalidate the watchpoint slots BEFORE `run.vm` drops at
+        // the end of this function. `kind_host_ptr` addresses a host
+        // u32 inside `vm.guest_mem`'s mmap-backed mapping; once
+        // `vm.guest_mem` drops, that mapping unmaps and dereffing
+        // `kind_host_ptr` would touch unmapped memory.
+        // `request_kva` is the paired guest-side KVA whose
+        // translation goes through the same mapping. By this point
+        // every vCPU thread has joined (the loop above blocked on
+        // each `wait_for_exit` + `handle.join`) and the freeze
+        // coordinator joined back in `run_vm` before `bsp` dropped,
+        // so no live thread reads either field. The defense-in-depth
+        // store here zeroes the slots so a stray future Arc clone
+        // (or a follow-up that adds a new reader after teardown)
+        // sees a sentinel `null_mut` / `0` that
+        // [`super::exit_dispatch::latch_slot0_with_gate`] already
+        // gates on, instead of dangling host memory. `Release`
+        // ordering pairs with the `Acquire` reads inside the latch
+        // path so any future reader sees a coherent view of the
+        // invalidation.
+        run.watchpoint
+            .kind_host_ptr
+            .store(std::ptr::null_mut(), Ordering::Release);
+        run.watchpoint
+            .request_kva
+            .store(0, Ordering::Release);
+        // Mirror the slot-0 invalidation across every user
+        // watchpoint slot (1..=3, `Op::WatchSnapshot` arms). A
+        // future reader that walks `watchpoint.user[..]` sees the
+        // same `request_kva == 0` sentinel as slot 0 — the
+        // resolved KVA is no longer reachable from any slot. `hit`
+        // is also cleared so a stray Acquire load after teardown
+        // observes "no fire pending" instead of a stale latch from
+        // an earlier run that no longer has a captured report.
+        // `Release` pairs with the `Acquire` reads in
+        // `arm_user_watchpoint` and the latch path.
+        for slot in &run.watchpoint.user {
+            slot.request_kva.store(0, Ordering::Release);
+            slot.hit.store(false, Ordering::Release);
         }
 
         let (monitor_report, mid_flight_drain) =
@@ -5440,7 +6259,7 @@ impl KtstrVm {
                     };
                     (Some(report), drain)
                 }
-                None => (None, shm_ring::ShmDrainResult::default()),
+                None => (None, BulkDrainResult::default()),
             };
 
         if let Some(h) = run.bpf_write_handle {
@@ -5452,14 +6271,11 @@ impl KtstrVm {
         // PAYLOAD_METRICS, RAW_PAYLOAD_OUTPUT, etc.) to
         // `/dev/vport0p1`; the host side accumulated them into
         // `port1_tx_buf` and we parse them here through
-        // `parse_tlv_stream` (same TLV format the SHM ring uses, so
-        // the rest of `collect_results` consumes them via the
-        // existing `ShmDrainResult` shape). Port-1 carries no drops
-        // — virtio_console TX backpressure replaces ring-full drops
-        // — so the merged `drops` count comes solely from the
-        // mid-flight + post-mortem SHM CRASH-only ring.
+        // `parse_tlv_stream`. Port-1 uses backpressure rather than
+        // drops — every byte the guest emitted is delivered, in
+        // order.
         let bulk_bytes = run.virtio_con.lock().drain_bulk();
-        let mut bulk_drain = shm_ring::parse_tlv_stream(&bulk_bytes);
+        let mut bulk_drain = host_comms::parse_tlv_stream(&bulk_bytes);
         // Prepend the entries the freeze coordinator already parsed
         // mid-run. The coord's TOKEN_TX handler streams port-1
         // bytes through `HostAssembler` so a SCHED_EXIT can flip
@@ -5481,57 +6297,22 @@ impl KtstrVm {
         bulk_drain.entries = mid_run_bulk;
 
         // Merge mid-flight drain (from monitor thread, port-1 byte
-        // stream) with post-mortem SHM CRASH ring drain. Mid-flight
+        // stream) with the post-exit `drain_bulk()`. Mid-flight
         // entries come first since they were drained during
         // execution.
-        let (shm_data, stimulus_events) = if (self.shm_size as usize) >= shm_ring::HEADER_SIZE {
-            let mem_size = (self.effective_memory_mb(&run.vm.guest_mem) as u64) << 20;
-            let shm_base = DRAM_BASE + mem_size - self.shm_size;
-            let shm_size = self.shm_size as usize;
-            let mut shm_buf = vec![0u8; shm_size];
-            run.vm
-                .guest_mem
-                .read_slice(&mut shm_buf, GuestAddress(shm_base))
-                .context("read SHM region")?;
-            // Post-mortem SHM drain catches the panic-hook
-            // MSG_TYPE_CRASH path (the only writer that still uses
-            // SHM directly via `write_msg_nonblocking` — see
-            // `shm_ring::write_msg` doc) plus any pre-port-open
-            // early-boot fallback writes.
-            let post_mortem = shm_ring::shm_drain(&shm_buf, 0);
-
+        let (guest_messages, stimulus_events) = if !mid_flight_drain.entries.is_empty()
+            || !bulk_drain.entries.is_empty()
+        {
             let mut all_entries = mid_flight_drain.entries;
             all_entries.extend(bulk_drain.entries);
-            all_entries.extend(post_mortem.entries);
-            let drops = mid_flight_drain.drops.max(post_mortem.drops);
-
-            let events: Vec<shm_ring::StimulusEvent> = all_entries
+            let events: Vec<wire::StimulusEvent> = all_entries
                 .iter()
-                .filter(|e| e.msg_type == shm_ring::MSG_TYPE_STIMULUS && e.crc_ok)
-                .filter_map(|e| shm_ring::StimulusEvent::from_payload(&e.payload))
+                .filter(|e| e.msg_type == wire::MSG_TYPE_STIMULUS && e.crc_ok)
+                .filter_map(|e| wire::StimulusEvent::from_payload(&e.payload))
                 .collect();
             (
-                Some(shm_ring::ShmDrainResult {
+                Some(BulkDrainResult {
                     entries: all_entries,
-                    drops,
-                }),
-                events,
-            )
-        } else if !bulk_drain.entries.is_empty() {
-            // SHM region is too small or absent (e.g. tests that
-            // exercise the bulk-port path without provisioning SHM).
-            // Build the result purely from port-1 entries.
-            let mut all_entries = mid_flight_drain.entries;
-            all_entries.extend(bulk_drain.entries);
-            let events: Vec<shm_ring::StimulusEvent> = all_entries
-                .iter()
-                .filter(|e| e.msg_type == shm_ring::MSG_TYPE_STIMULUS && e.crc_ok)
-                .filter_map(|e| shm_ring::StimulusEvent::from_payload(&e.payload))
-                .collect();
-            (
-                Some(shm_ring::ShmDrainResult {
-                    entries: all_entries,
-                    drops: mid_flight_drain.drops,
                 }),
                 events,
             )
@@ -5542,15 +6323,15 @@ impl KtstrVm {
         let app_output = run.com2.lock().output();
         let console_output = run.com1.lock().output();
 
-        // Extract exit code: SHM (primary), COM2 sentinel (fallback).
-        let shm_exit = shm_data.as_ref().and_then(|d| {
+        // Extract exit code: bulk port (primary), COM2 sentinel (fallback).
+        let bulk_exit = guest_messages.as_ref().and_then(|d| {
             d.entries
                 .iter()
                 .rev()
-                .find(|e| e.msg_type == shm_ring::MSG_TYPE_EXIT && e.crc_ok && e.payload.len() == 4)
+                .find(|e| e.msg_type == wire::MSG_TYPE_EXIT && e.crc_ok && e.payload.len() == 4)
                 .map(|e| i32::from_ne_bytes(e.payload[..4].try_into().unwrap()))
         });
-        if let Some(code) = shm_exit {
+        if let Some(code) = bulk_exit {
             exit_code = code;
         } else if let Some(line) = app_output
             .lines()
@@ -5564,13 +6345,13 @@ impl KtstrVm {
             exit_code = code;
         }
 
-        // Extract crash message from SHM (reliable, full backtrace).
-        let crash_message = shm_data.as_ref().and_then(|d| {
-            d.entries
-                .iter()
-                .find(|e| e.msg_type == shm_ring::MSG_TYPE_CRASH && e.crc_ok)
-                .and_then(|e| String::from_utf8(e.payload.clone()).ok())
-        });
+        // Extract crash message from COM2 output. The guest panic
+        // hook in `rust_init.rs` writes `PANIC: <info>\n<bt>\n` to
+        // `/dev/ttyS1`; the host-side parser
+        // [`crate::test_support::extract_panic_message`] strips the
+        // prefix and returns the trimmed remainder.
+        let crash_message =
+            crate::test_support::extract_panic_message(&app_output).map(|s| s.to_string());
 
         // Collect BPF verifier stats from host-side memory reads.
         let verifier_stats = self.collect_verifier_stats(&run.vm, run.tcr_el1.as_ref());
@@ -5594,7 +6375,7 @@ impl KtstrVm {
             output: app_output,
             stderr: console_output,
             monitor: monitor_report,
-            shm_data,
+            guest_messages,
             stimulus_events,
             verifier_stats,
             kvm_stats: None,
@@ -5671,5 +6452,181 @@ impl KtstrVm {
         // dispatches statically.
         use monitor::bpf_prog::BpfProgAccessor;
         accessor.struct_ops_progs()
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tlv_tests {
+    //! Unit coverage for the TLV-based snapshot req/reply wiring.
+    //!
+    //! `decode_snapshot_request` and `frame_snapshot_reply` are
+    //! testable in isolation — every assertion in the freeze
+    //! coordinator's TOKEN_TX dispatch flows through these two
+    //! helpers, so verifying their wire-format contract pins the
+    //! load-bearing behaviour without booting a VM. Chain-level
+    //! integration coverage of `queue_input_port1` lives in
+    //! `virtio_console`'s own test module; here we cover only the
+    //! payload encode / decode boundary.
+    use super::*;
+    use crate::vmm::wire::{
+        FRAME_HEADER_SIZE, MSG_TYPE_SNAPSHOT_REPLY, SNAPSHOT_KIND_CAPTURE,
+        SNAPSHOT_KIND_NONE, SNAPSHOT_KIND_WATCH, SNAPSHOT_REASON_MAX,
+        SNAPSHOT_STATUS_ERR, SNAPSHOT_STATUS_OK, SNAPSHOT_TAG_MAX,
+        ShmMessage, SnapshotReplyPayload, SnapshotRequestPayload,
+    };
+    use zerocopy::{FromBytes, IntoBytes};
+
+    fn make_request_bytes(request_id: u32, kind: u32, tag: &str) -> Vec<u8> {
+        let tag_bytes = tag.as_bytes();
+        let mut tag_buf = [0u8; SNAPSHOT_TAG_MAX];
+        let n = tag_bytes.len().min(SNAPSHOT_TAG_MAX);
+        tag_buf[..n].copy_from_slice(&tag_bytes[..n]);
+        SnapshotRequestPayload {
+            request_id,
+            kind,
+            tag: tag_buf,
+        }
+        .as_bytes()
+        .to_vec()
+    }
+
+    /// Happy-path CAPTURE request decodes to the matching typed
+    /// fields and trims the tag at the first NUL.
+    #[test]
+    fn decode_capture_request_round_trip() {
+        let bytes = make_request_bytes(7, SNAPSHOT_KIND_CAPTURE, "snap_1");
+        let req = decode_snapshot_request(&bytes).expect("valid request decodes");
+        assert_eq!(req.request_id, 7);
+        assert_eq!(req.kind, SNAPSHOT_KIND_CAPTURE);
+        assert_eq!(req.tag, "snap_1");
+    }
+
+    /// WATCH request decodes the same way as CAPTURE — the kind
+    /// dispatch happens at the call site, not inside the decoder.
+    #[test]
+    fn decode_watch_request_round_trip() {
+        let bytes = make_request_bytes(99, SNAPSHOT_KIND_WATCH, "scx_root");
+        let req = decode_snapshot_request(&bytes).expect("valid request decodes");
+        assert_eq!(req.kind, SNAPSHOT_KIND_WATCH);
+        assert_eq!(req.tag, "scx_root");
+    }
+
+    /// Wrong-sized payload (1 byte short of the typed payload) is
+    /// rejected — protects against a malformed guest stamping a
+    /// partial request that would otherwise zerocopy into stack
+    /// garbage.
+    #[test]
+    fn decode_rejects_undersized_payload() {
+        let mut bytes = make_request_bytes(1, SNAPSHOT_KIND_CAPTURE, "x");
+        bytes.pop();
+        assert!(decode_snapshot_request(&bytes).is_none());
+    }
+
+    /// Wrong-sized payload (1 byte longer than typed payload) is
+    /// rejected.
+    #[test]
+    fn decode_rejects_oversized_payload() {
+        let mut bytes = make_request_bytes(1, SNAPSHOT_KIND_CAPTURE, "x");
+        bytes.push(0xAA);
+        assert!(decode_snapshot_request(&bytes).is_none());
+    }
+
+    /// `request_id == 0` is rejected — the wire-format contract
+    /// reserves zero so a zero-initialised reply payload from a
+    /// prior protocol version cannot accidentally match.
+    #[test]
+    fn decode_rejects_zero_request_id() {
+        let bytes = make_request_bytes(0, SNAPSHOT_KIND_CAPTURE, "x");
+        assert!(decode_snapshot_request(&bytes).is_none());
+    }
+
+    /// `kind == NONE` is rejected — the sentinel value must not
+    /// appear on the wire.
+    #[test]
+    fn decode_rejects_kind_none() {
+        let bytes = make_request_bytes(1, SNAPSHOT_KIND_NONE, "x");
+        assert!(decode_snapshot_request(&bytes).is_none());
+    }
+
+    /// Unknown kind values decode to `Some` — the dispatch in the
+    /// freeze coord matches on `kind` and frames an ERR reply for
+    /// anything outside the CAPTURE/WATCH set, so the decoder must
+    /// not pre-filter on kind.
+    #[test]
+    fn decode_accepts_unknown_kind_for_dispatch_handling() {
+        let bytes = make_request_bytes(42, 0xDEAD_BEEF, "tag");
+        let req = decode_snapshot_request(&bytes).expect("decode succeeds");
+        assert_eq!(req.kind, 0xDEAD_BEEF);
+        assert_eq!(req.tag, "tag");
+    }
+
+    /// Tag without an internal NUL fills the whole buffer; the
+    /// decoder takes the full `SNAPSHOT_TAG_MAX` bytes.
+    #[test]
+    fn decode_full_buffer_tag_uses_full_length() {
+        let long = "a".repeat(SNAPSHOT_TAG_MAX);
+        let bytes = make_request_bytes(1, SNAPSHOT_KIND_CAPTURE, &long);
+        let req = decode_snapshot_request(&bytes).expect("decode succeeds");
+        assert_eq!(req.tag.len(), SNAPSHOT_TAG_MAX);
+        assert!(req.tag.chars().all(|c| c == 'a'));
+    }
+
+    /// Reply frame is exactly header + 72-byte payload; CRC32
+    /// over payload bytes matches the wire-format contract
+    /// `parse_tlv_stream` enforces on the guest side.
+    #[test]
+    fn frame_reply_size_and_crc() {
+        let bytes = frame_snapshot_reply(123, SNAPSHOT_STATUS_OK, "");
+        assert_eq!(bytes.len(), FRAME_HEADER_SIZE + std::mem::size_of::<SnapshotReplyPayload>());
+        let header = ShmMessage::read_from_bytes(&bytes[..FRAME_HEADER_SIZE])
+            .expect("header decodes");
+        assert_eq!(header.msg_type, MSG_TYPE_SNAPSHOT_REPLY);
+        assert_eq!(header.length as usize, std::mem::size_of::<SnapshotReplyPayload>());
+        let payload_bytes = &bytes[FRAME_HEADER_SIZE..];
+        assert_eq!(header.crc32, crc32fast::hash(payload_bytes));
+    }
+
+    /// Reply payload round-trips through bytes — the request_id
+    /// echo, the status, and the reason text are preserved
+    /// exactly.
+    #[test]
+    fn frame_reply_payload_round_trip() {
+        let bytes = frame_snapshot_reply(0xCAFE_BABE, SNAPSHOT_STATUS_ERR, "rendezvous timeout");
+        let payload_bytes = &bytes[FRAME_HEADER_SIZE..];
+        let reply = SnapshotReplyPayload::read_from_bytes(payload_bytes)
+            .expect("payload decodes");
+        assert_eq!(reply.request_id, 0xCAFE_BABE);
+        assert_eq!(reply.status, SNAPSHOT_STATUS_ERR);
+        let len = reply
+            .reason
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(SNAPSHOT_REASON_MAX);
+        assert_eq!(&reply.reason[..len], b"rendezvous timeout");
+    }
+
+    /// Reasons longer than `SNAPSHOT_REASON_MAX` are truncated to
+    /// the buffer; the trailing byte may be a partial UTF-8
+    /// sequence but never overflows.
+    #[test]
+    fn frame_reply_truncates_long_reason() {
+        let long = "x".repeat(SNAPSHOT_REASON_MAX + 16);
+        let bytes = frame_snapshot_reply(1, SNAPSHOT_STATUS_ERR, &long);
+        let payload_bytes = &bytes[FRAME_HEADER_SIZE..];
+        let reply = SnapshotReplyPayload::read_from_bytes(payload_bytes)
+            .expect("payload decodes");
+        assert_eq!(reply.reason.len(), SNAPSHOT_REASON_MAX);
+        assert!(reply.reason.iter().all(|&b| b == b'x'));
+    }
+
+    /// Empty reason yields a fully-zeroed reason buffer — the
+    /// guest side renders this as the empty string.
+    #[test]
+    fn frame_reply_empty_reason_zero_pads() {
+        let bytes = frame_snapshot_reply(1, SNAPSHOT_STATUS_OK, "");
+        let payload_bytes = &bytes[FRAME_HEADER_SIZE..];
+        let reply = SnapshotReplyPayload::read_from_bytes(payload_bytes)
+            .expect("payload decodes");
+        assert!(reply.reason.iter().all(|&b| b == 0));
     }
 }

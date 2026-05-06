@@ -117,9 +117,10 @@ fn merge_accumulates_totals() {
 ///     merge order, preserving cardinality;
 ///   - pick the worst value of every higher-is-worse
 ///     `worst_*` field across all merged cgroups;
-///   - pick the lowest-non-zero value of every lower-is-worse
-///     field (`worst_page_locality`,
-///     `worst_iterations_per_worker`);
+///   - pick the lowest-non-zero value of `worst_page_locality`
+///     and `worst_iterations_per_worker` (0.0 is the unreported
+///     sentinel for both fields, matching the accumulator-pass
+///     convention in `AssertResult::pass().merge(real)`);
 ///   - SUM `total_iterations` across all cgroups, not max it.
 ///
 /// Sibling `merge_scenario_stats_worst_wins_and_iterations_sum`
@@ -193,7 +194,9 @@ fn merge_three_cgroups_worst_wins_and_iterations_sum() {
         s.worst_p99_wake_latency_us, 70.0,
         "third cgroup's 70.0us p99 is worst",
     );
-    // Lowest-non-zero across 3 cgroups (lower-is-worse):
+    // Lower-is-worse rollups across 3 cgroups (every value is
+    // strictly positive so the sentinel branch is never taken;
+    // both fields use `fold_lowest_nonzero`):
     assert_eq!(
         s.worst_page_locality, 0.5,
         "second cgroup's 0.5 is the lowest-non-zero — 0 sentinel never wins",
@@ -256,9 +259,12 @@ fn merge_scenario_stats_worst_wins_and_iterations_sum() {
 /// `ScenarioStats::merge` rolls up the new derived-ratio fields
 /// across cgroups with opposite polarities: `worst_wake_latency_tail_ratio`
 /// is higher-is-worse (max), `worst_iterations_per_worker` is
-/// lower-is-worse (min with lowest-non-zero convention matching
-/// `worst_page_locality`). A regression that merged either with
-/// the wrong polarity would surface a regression as an
+/// lower-is-worse (`fold_lowest_nonzero` — 0.0 is the unreported
+/// sentinel matching the accumulator-pass convention; the
+/// `AssertResult::pass().merge(real)` pattern relies on a
+/// positive `other` overriding `self`'s default-zero rather
+/// than being masked by it).  A regression that merged either
+/// with the wrong polarity would surface a regression as an
 /// improvement or vice versa — exactly the kind of sign-flip
 /// that would silently break `stats compare`.
 #[test]
@@ -281,13 +287,15 @@ fn merge_derived_ratios_use_correct_polarities() {
     );
     assert_eq!(
         a.stats.worst_iterations_per_worker, 100.0,
-        "iterations_per_worker uses min — 100.0 is worse than \
-         500.0 (less throughput per worker); got {}",
+        "iterations_per_worker uses lowest-non-zero — 100.0 is \
+         worse than 500.0 (less throughput per worker); got {}",
         a.stats.worst_iterations_per_worker,
     );
 
-    // Lowest-non-zero convention, direction 1: a 0.0 sentinel
-    // on `other` must NOT clobber a real reading on `self`.
+    // Sentinel-zero convention, direction 1: a 0.0 reading on
+    // `other` is the unreported sentinel and MUST NOT clobber
+    // self's positive measurement. `fold_lowest_nonzero` keeps
+    // self=300 when other=0.
     let mut c = AssertResult::pass();
     c.stats.worst_iterations_per_worker = 300.0;
     let mut empty = AssertResult::pass();
@@ -295,19 +303,18 @@ fn merge_derived_ratios_use_correct_polarities() {
     c.merge(empty);
     assert_eq!(
         c.stats.worst_iterations_per_worker, 300.0,
-        "unreported (0.0) cgroup on `other` must not clobber \
-         a real reading on `self` — lowest-non-zero, not \
-         plain-min; got {}",
+        "self=300 must be retained when other=0 (unreported \
+         sentinel) — a plain min would let the sentinel \
+         clobber the real reading; got {}",
         c.stats.worst_iterations_per_worker,
     );
 
-    // Lowest-non-zero convention, direction 2: the symmetric
-    // case where `self` starts at the 0.0 sentinel and a
-    // real reading on `other` must ADOPT. A plain-min would
-    // leave self at 0.0 (since min(0.0, 300.0) = 0.0),
-    // swallowing the real reading. The lowest-non-zero fold
-    // must recognise 0.0 as "unreported" and prefer the
-    // positive `other`.
+    // Sentinel-zero convention, direction 2: the symmetric
+    // case where `self` starts at 0.0 (the accumulator-default
+    // sentinel from `AssertResult::pass()`) and `other`
+    // reports a positive reading. self must adopt other's
+    // measurement; this is the load-bearing case for
+    // `AssertResult::pass().merge(real)`.
     let mut d = AssertResult::pass();
     d.stats.worst_iterations_per_worker = 0.0;
     let mut real = AssertResult::pass();
@@ -315,14 +322,14 @@ fn merge_derived_ratios_use_correct_polarities() {
     d.merge(real);
     assert_eq!(
         d.stats.worst_iterations_per_worker, 300.0,
-        "unreported (0.0) `self` must adopt a real reading \
-         from `other` — otherwise the first-merged cgroup \
-         is silently lost; got {}",
+        "self=0 (accumulator sentinel) must adopt other=300 \
+         — the `AssertResult::pass().merge(real)` pattern \
+         depends on this; got {}",
         d.stats.worst_iterations_per_worker,
     );
 
-    // Both-zero: no real reading on either side stays 0.0
-    // rather than flipping to some sentinel.
+    // Both-zero: no positive reading on either side, the
+    // sentinel-fold keeps the field at 0.0.
     let mut e = AssertResult::pass();
     e.stats.worst_iterations_per_worker = 0.0;
     let mut f = AssertResult::pass();
@@ -330,8 +337,7 @@ fn merge_derived_ratios_use_correct_polarities() {
     e.merge(f);
     assert_eq!(
         e.stats.worst_iterations_per_worker, 0.0,
-        "both-zero must stay zero — no reading on either \
-         side, no fold; got {}",
+        "both-zero must stay zero; got {}",
         e.stats.worst_iterations_per_worker,
     );
 
