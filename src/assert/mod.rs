@@ -634,7 +634,7 @@ pub struct CgroupStats {
     /// `numa_pages_migrated` delta divided by total allocated pages.
     pub cross_node_migration_ratio: f64,
     /// Extensible metrics for the generic comparison pipeline.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default)]
     pub ext_metrics: BTreeMap<String, f64>,
 }
 
@@ -753,7 +753,7 @@ pub struct ScenarioStats {
     pub worst_iterations_per_worker: f64,
     /// Extensible metrics for the generic comparison pipeline.
     /// Populated from per-cgroup ext_metrics (worst value across cgroups).
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default)]
     pub ext_metrics: BTreeMap<String, f64>,
 }
 
