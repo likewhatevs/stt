@@ -75,7 +75,6 @@ fn eevdf_empty_run_exits_under_watchdog(_ctx: &Ctx) -> Result<AssertResult> {
     llcs = 1,
     cores = 2,
     threads = 2,
-    memory_mb = 1024,
     max_gap_ms = 2000,
     max_spread_pct = 80.0
 )]
