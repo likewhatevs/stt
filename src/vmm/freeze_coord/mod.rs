@@ -5665,6 +5665,17 @@ impl KtstrVm {
             Ok(d) => d,
             Err(_) => return Ok(None),
         };
+        // Parse the vmlinux ELF once and share the result between
+        // the BTF sidecar-miss fallback (`load_btf_from_elf`) and
+        // the ELF symbol parser (`KernelSymbols::from_elf`). The
+        // previous structure ran `goblin::elf::Elf::parse(&data)`
+        // twice — once inside `load_btf_from_bytes` on a sidecar
+        // miss and once inside `KernelSymbols::from_vmlinux_bytes` —
+        // each costing hundreds of ms on a debug vmlinux.
+        let elf = match goblin::elf::Elf::parse(&vmlinux_data) {
+            Ok(e) => e,
+            Err(_) => return Ok(None),
+        };
         // Single BTF parse for both `KernelOffsets` and
         // `BpfProgOffsets`. The previous structure parsed BTF twice
         // (KernelOffsets up here, BpfProgOffsets inside the spawned
@@ -5674,14 +5685,16 @@ impl KtstrVm {
         // pushed the monitor thread past the no-scheduler boot
         // window so early samples saw the rq's pre-AP-online state.
         // One parse, two `from_btf` consumers, both share the
-        // resolved offsets.
-        let btf = match monitor::btf_offsets::load_btf_from_bytes(&vmlinux_data, &vmlinux) {
+        // resolved offsets. On a BTF sidecar cache hit the supplied
+        // `elf` is unused; on a miss `load_btf_from_elf` reuses it
+        // instead of running its own `Elf::parse`.
+        let btf = match monitor::btf_offsets::load_btf_from_elf(&elf, &vmlinux_data, &vmlinux) {
             Ok(b) => b,
             Err(_) => return Ok(None),
         };
         let offsets = monitor::btf_offsets::KernelOffsets::from_btf(&btf);
         let prog_offsets = monitor::btf_offsets::BpfProgOffsets::from_btf(&btf).ok();
-        let symbols = monitor::symbols::KernelSymbols::from_vmlinux_bytes(&vmlinux_data);
+        let symbols = monitor::symbols::KernelSymbols::from_elf(&elf);
 
         let (Ok(offsets), Ok(symbols)) = (offsets, symbols) else {
             return Ok(None);
