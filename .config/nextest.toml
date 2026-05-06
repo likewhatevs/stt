@@ -81,13 +81,12 @@ retries = 0
 
 # EEVDF tests: no sched_ext scheduler attached, so VM lifecycle is
 # bounded by the 60s host watchdog at `runtime.rs::KTSTR_VM_TIMEOUT`
-# plus VM setup overhead. The 8-vCPU topology in burst_oversubscription
-# takes ~120s for boot+teardown alone; 90s × 2 = 180s gives margin
-# for workload execution on top. retries=0 because a watchdog
+# plus VM setup overhead. 75s gives a margin above that ceiling so
+# nextest does not race the watchdog. retries=0 because a watchdog
 # timeout is never transient — re-running just burns the same time.
 [[profile.default.overrides]]
 filter = "test(eevdf_)"
-slow-timeout = { period = "90s", terminate-after = 2 }
+slow-timeout = { period = "75s", terminate-after = 2 }
 retries = 0
 
 # Model-loaded tests: real CPU inference on the 2.55 GiB Qwen3 GGUF

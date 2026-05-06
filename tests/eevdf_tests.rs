@@ -41,7 +41,7 @@ fn eevdf_empty_run_exits_under_watchdog(_ctx: &Ctx) -> Result<AssertResult> {
 /// spike when a worker waits for a runqueue slot.
 ///
 /// `max_gap_ms = 2000` is the empirical baseline for the configured
-/// topology (4 cores × 2 SMT threads = 8 logical CPUs, 16 workers, 1ms
+/// topology (2 cores × 2 SMT threads = 4 logical CPUs, 8 workers, 1ms
 /// bursts, 0ms sleep). Healthy EEVDF with this load typically holds
 /// `max_gap_ms` well under 1s; the 2s threshold leaves margin for boot
 /// jitter, page-fault stalls during initial ramp, and per-host
@@ -54,8 +54,8 @@ fn eevdf_empty_run_exits_under_watchdog(_ctx: &Ctx) -> Result<AssertResult> {
 /// (which enables `not_starved=true`, running `assert_not_starved`
 /// with `spread_threshold_pct() = 15%` in release builds — see
 /// `spread_threshold_pct()` and the spread-vs-limit comparison in
-/// `assert_not_starved` in `src/assert.rs`). With 16 workers
-/// oversubscribing 8 CPUs and 1ms bursts, EEVDF spread at sub-slice
+/// `assert_not_starved` in `src/assert.rs`). With 8 workers
+/// oversubscribing 4 CPUs and 1ms bursts, EEVDF spread at sub-slice
 /// granularity routinely exceeds 15% on healthy runs; 80% is wide
 /// enough to absorb that variance while still catching a fully
 /// starved worker, leaving `max_gap_ms` as the primary regression
@@ -73,9 +73,9 @@ fn eevdf_empty_run_exits_under_watchdog(_ctx: &Ctx) -> Result<AssertResult> {
 /// rebuild them.
 #[ktstr_test(
     llcs = 1,
-    cores = 4,
+    cores = 2,
     threads = 2,
-    memory_mb = 2048,
+    memory_mb = 1024,
     max_gap_ms = 2000,
     max_spread_pct = 80.0
 )]
