@@ -555,6 +555,7 @@ pub(crate) fn kernel_build(
     clean: bool,
     cpu_cap: Option<usize>,
     extra_kconfig: Option<PathBuf>,
+    skip_sha256: bool,
 ) -> Result<(), String> {
     // Read the extra-kconfig fragment ONCE up front so a range
     // expansion doesn't re-read the same file per version (and so a
@@ -601,6 +602,7 @@ pub(crate) fn kernel_build(
                     clean,
                     cpu_cap,
                     extra_content.as_deref(),
+                    skip_sha256,
                 ) {
                     eprintln!("cargo ktstr: {ver}: {e}");
                     failures.push((ver.clone(), e));
@@ -639,6 +641,7 @@ pub(crate) fn kernel_build(
                 clean,
                 cpu_cap,
                 extra_content.as_deref(),
+                skip_sha256,
             )
         }
     } else {
@@ -651,6 +654,7 @@ pub(crate) fn kernel_build(
             clean,
             cpu_cap,
             extra_content.as_deref(),
+            skip_sha256,
         )
     }
 }
@@ -679,6 +683,7 @@ fn kernel_build_one(
     clean: bool,
     cpu_cap: Option<usize>,
     extra_kconfig: Option<&str>,
+    skip_sha256: bool,
 ) -> Result<(), String> {
     // Resolve the CLI --cpu-cap flag against KTSTR_CPU_CAP env
     // and the implicit "no cap" default. Conflict with
@@ -739,7 +744,7 @@ fn kernel_build_one(
             return Ok(());
         }
         let sp = cli::Spinner::start("Downloading kernel...");
-        let result = fetch::download_tarball(client, &ver, tmp_dir.path(), "cargo ktstr");
+        let result = fetch::download_tarball(client, &ver, tmp_dir.path(), "cargo ktstr", skip_sha256);
         drop(sp);
         let mut acquired = result.map_err(|e| format!("{e:#}"))?;
         // `download_tarball` builds its `cache_key` using the bare

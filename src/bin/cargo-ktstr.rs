@@ -127,6 +127,7 @@ fn main() {
                 clean,
                 cpu_cap,
                 extra_kconfig,
+                skip_sha256,
             } => kernel::kernel_build(
                 version,
                 source,
@@ -136,6 +137,7 @@ fn main() {
                 clean,
                 cpu_cap,
                 extra_kconfig,
+                skip_sha256,
             ),
             KernelCommand::Clean {
                 keep,

@@ -863,31 +863,11 @@ mod tests {
         }
     }
 
-    /// End-to-end chain test for the bulk 24-byte
-    /// `bpf_prog_stats` read inside
-    /// [`walk_struct_ops_runtime_stats`]. The walker reads `cnt`,
-    /// `nsecs`, and `misses` (three adjacent u64s in the kernel
-    /// `struct bpf_prog_stats`) via one `read_bytes` over the
-    /// `[lo, hi)` span and parses each value from the local
-    /// buffer. This test pins the contract by:
-    ///
-    /// 1. Laying out a synthetic IDR + bpf_prog + bpf_prog_aux
-    ///    + per-CPU stats slot in a flat buffer, using the
-    ///      direct-mapping `kva = page_offset + pa` shortcut so
-    ///      `translate_any_kva` resolves through the direct path
-    ///      without building a page table.
-    /// 2. Writing known u64 values at the three stats offsets.
-    /// 3. Running the walker end-to-end and asserting the parsed
-    ///    `cnt`/`nsecs`/`misses` match the bytes the bulk read
-    ///    consumed.
-    ///
-    /// A regression that swapped two offsets in the parse closure
-    /// (e.g. `parse(stats_nsecs)` returning `cnt`) would surface
-    /// here as a value mismatch, NOT as a silent count-1 sum
-    /// drift that handler-level tests miss.
-    #[test]
-    #[cfg(target_arch = "x86_64")]
-    fn walk_struct_ops_runtime_stats_bulk_24byte_read_parses_three_offsets() {
+    /// Run the bulk-24-byte-read end-to-end chain at a caller-
+    /// supplied `page_offset`. Both the x86_64 and aarch64 wrapper
+    /// tests call this with their respective `PAGE_OFFSET` baselines
+    /// so the bulk-read fast path is exercised on both arches.
+    fn walk_struct_ops_runtime_stats_bulk_chain_at_page_offset(page_offset: u64) {
         use crate::monitor::reader::{GuestMem, WalkContext};
 
         // Layout (all PAs offset by `page_offset` to form KVAs in
@@ -902,7 +882,6 @@ mod tests {
         let total: usize = 0x4000;
         let mut buf = vec![0u8; total];
 
-        let page_offset: u64 = 0xFFFF_8880_0000_0000;
         let pa_to_kva = |pa: u64| -> u64 { page_offset.wrapping_add(pa) };
 
         let idr_pa: u64 = 0x0000;
@@ -1028,6 +1007,32 @@ mod tests {
             stats[0].misses, known_misses,
             "bulk read must parse misses at offsets.stats_misses within the 24-byte window",
         );
+    }
+
+    /// End-to-end chain test for the bulk 24-byte
+    /// `bpf_prog_stats` read on x86_64. The walker reads `cnt`,
+    /// `nsecs`, and `misses` (three adjacent u64s in the kernel
+    /// `struct bpf_prog_stats`) via one `read_bytes` over the
+    /// `[lo, hi)` span and parses each value from the local
+    /// buffer. The aarch64 wrapper below pins the same chain
+    /// against the aarch64 `PAGE_OFFSET` baseline.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn walk_struct_ops_runtime_stats_bulk_24byte_read_parses_three_offsets() {
+        // x86_64 PAGE_OFFSET (4-level paging, non-KASLR baseline).
+        walk_struct_ops_runtime_stats_bulk_chain_at_page_offset(0xFFFF_8880_0000_0000);
+    }
+
+    /// End-to-end chain test for the bulk 24-byte
+    /// `bpf_prog_stats` read on aarch64. Mirrors the x86_64
+    /// wrapper above against the aarch64 direct-mapping
+    /// `PAGE_OFFSET` baseline so the bulk-read fast path is
+    /// pinned on both arches.
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn walk_struct_ops_runtime_stats_bulk_24byte_read_parses_three_offsets() {
+        // aarch64 PAGE_OFFSET baseline (48-bit VA, 4 KiB granule).
+        walk_struct_ops_runtime_stats_bulk_chain_at_page_offset(0xFFFF_0000_0000_0000);
     }
 
     /// Format chain integration: the `ProgRuntimeStats` Display

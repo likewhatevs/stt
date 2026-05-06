@@ -1056,7 +1056,10 @@ mod tests {
         // SAFETY: buf outlives mem.
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
         let result = GuestKernel::new(&mem, &path, 0, 0);
-        let err = result.expect_err("tcr_el1=0 must be rejected on aarch64");
+        let err = match result {
+            Ok(_) => panic!("tcr_el1=0 must be rejected on aarch64"),
+            Err(e) => e,
+        };
         let msg = format!("{err:#}");
         assert!(
             msg.contains("tcr_el1"),

@@ -464,11 +464,18 @@ pub fn download_and_cache_version(
     let tmp_dir = tempfile::TempDir::new()?;
 
     let sp = Spinner::start("Downloading kernel...");
+    // `skip_sha256 = false`: the auto-resolve path (test/coverage
+    // /llvm-cov / shell auto-fetch) never bypasses checksum
+    // verification. The bypass is reachable only via the explicit
+    // `kernel build --skip-sha256` flag — auto-resolution must keep
+    // the strong manifest guarantee since the operator has not
+    // opted into the unverified fallback.
     let acquired = crate::fetch::download_tarball(
         crate::fetch::shared_client(),
         version,
         tmp_dir.path(),
         cli_label,
+        false,
     )?;
     sp.finish("Downloaded");
 

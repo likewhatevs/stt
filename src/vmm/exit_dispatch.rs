@@ -478,7 +478,7 @@ fn mmio_serial_offset(addr: u64, base: u64) -> Option<u8> {
 /// watchpoint trap is "from a lower EL" (LOW), and only EL2's own
 /// debug traps would be CUR (which KVM does not arm).
 #[cfg(target_arch = "aarch64")]
-const ESR_ELx_EC_WATCHPT_LOW: u32 = 0x34;
+const ESR_ELX_EC_WATCHPT_LOW: u32 = 0x34;
 /// `ESR_ELx_EC` decoded value for a software-step exception taken
 /// from a lower exception level. KVM raises this through
 /// `KVM_EXIT_DEBUG` after a `KVM_GUESTDBG_SINGLESTEP`-armed
@@ -490,18 +490,18 @@ const ESR_ELx_EC_WATCHPT_LOW: u32 = 0x34;
 /// can restore the slot's WCR.E=1. Pinned per
 /// `arch/arm64/include/asm/esr.h` `ESR_ELx_EC_SOFTSTP_LOW = 0x32`.
 #[cfg(target_arch = "aarch64")]
-const ESR_ELx_EC_SOFTSTP_LOW: u32 = 0x32;
+const ESR_ELX_EC_SOFTSTP_LOW: u32 = 0x32;
 /// Bit shift of the `ESR_ELx_EC` field within the lower 32 bits of
 /// the ESR_EL2 value KVM hands userspace as
 /// `kvm_debug_exit_arch.hsr`. Pinned per `arch/arm64/include/asm/
 /// esr.h` `ESR_ELx_EC_SHIFT = 26`.
 #[cfg(target_arch = "aarch64")]
-const ESR_ELx_EC_SHIFT: u32 = 26;
+const ESR_ELX_EC_SHIFT: u32 = 26;
 /// Mask applied to `(hsr >> ESR_ELx_EC_SHIFT)` to extract the
 /// 6-bit EC field. Pinned per `ESR_ELx_EC(esr) = (esr & ESR_ELx_
 /// EC_MASK) >> ESR_ELx_EC_SHIFT` in the same kernel header.
 #[cfg(target_arch = "aarch64")]
-const ESR_ELx_EC_MASK: u32 = 0x3F;
+const ESR_ELX_EC_MASK: u32 = 0x3F;
 
 /// Dispatch a `KVM_EXIT_DEBUG` watchpoint trap to the matching slot's
 /// latch. Reads the per-arch identifier (DR6 on x86_64; ESR EC + FAR
@@ -619,8 +619,8 @@ pub(crate) fn dispatch_watchpoint_hit(
         //   `far` = FAR_EL2 (set only when ESR.EC == WATCHPT_LOW)
         // The EC field at bits [31:26] of ESR distinguishes
         // watchpoint exceptions from breakpoints / soft-step / BRK.
-        let ec = (debug_arch.hsr >> ESR_ELx_EC_SHIFT) & ESR_ELx_EC_MASK;
-        if ec == ESR_ELx_EC_SOFTSTP_LOW {
+        let ec = (debug_arch.hsr >> ESR_ELX_EC_SHIFT) & ESR_ELX_EC_MASK;
+        if ec == ESR_ELX_EC_SOFTSTP_LOW {
             // Software-step exception following a watchpoint hit.
             // The kernel sets cpsr.SS in
             // `kvm_handle_guest_debug` to advertise that exactly
@@ -661,7 +661,7 @@ pub(crate) fn dispatch_watchpoint_hit(
             }
             return;
         }
-        if ec != ESR_ELx_EC_WATCHPT_LOW {
+        if ec != ESR_ELX_EC_WATCHPT_LOW {
             tracing::debug!(
                 hsr = debug_arch.hsr,
                 ec,
@@ -1516,13 +1516,120 @@ mod tests {
         assert_eq!(data[0], 0xFF, "unknown port should not modify data");
     }
 
-    // -- classify_exit per-variant coverage (x86_64) --
-    //
-    // These tests construct a synthetic VcpuExit and feed it to
-    // classify_exit, asserting the ExitAction variant returned. None
-    // of them require a real VcpuFd — VcpuExit is a public enum the
-    // kvm-ioctls crate exposes, so the test harness can pin the
-    // dispatch table without a KVM round-trip.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn classify_exit_io_out_i8042_reset_is_shutdown() {
+        // Cross-checks the dispatch_io_out i8042-reset path through
+        // the classify_exit dispatch table — verifies the "true"
+        // return from dispatch_io_out maps to ExitAction::Shutdown.
+        let com1 = PiMutex::new(console::Serial::new(console::COM1_BASE));
+        let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
+        let data = [I8042_CMD_RESET_CPU];
+        let mut exit = VcpuExit::IoOut(I8042_CMD_PORT, &data);
+        let action = classify_exit(&com1, &com2, None, None, None, &mut exit);
+        assert!(
+            matches!(action, Some(ExitAction::Shutdown)),
+            "IoOut(0x64, [0xFE]) — i8042 reset — must classify as Shutdown"
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn classify_exit_io_out_serial_is_continue() {
+        let com1 = PiMutex::new(console::Serial::new(console::COM1_BASE));
+        let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
+        let data = [b'Z'];
+        let mut exit = VcpuExit::IoOut(console::COM1_BASE, &data);
+        let action = classify_exit(&com1, &com2, None, None, None, &mut exit);
+        assert!(
+            matches!(action, Some(ExitAction::Continue)),
+            "IoOut to COM1 must classify as Continue (no reboot)"
+        );
+        // Confirm the byte landed in COM1's output buffer — pins that
+        // the dispatch wired to the right port mutex, not COM2.
+        assert!(com1.lock().output().contains('Z'));
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn classify_exit_io_in_serial_is_continue() {
+        // IoIn on COM1's data port returns a buffered byte if pending,
+        // 0 otherwise. classify_exit must map IoIn → Continue
+        // unconditionally — the run loop never terminates on a port
+        // read.
+        let com1 = PiMutex::new(console::Serial::new(console::COM1_BASE));
+        let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
+        let mut data = [0xFFu8; 1];
+        let mut exit = VcpuExit::IoIn(console::COM1_BASE, &mut data);
+        let action = classify_exit(&com1, &com2, None, None, None, &mut exit);
+        assert!(
+            matches!(action, Some(ExitAction::Continue)),
+            "IoIn to COM1 must classify as Continue"
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn classify_exit_x86_mmio_read_unmapped_returns_0xff() {
+        // x86_64 MMIO read fallback: when a guest MMIO read addresses
+        // a region that is NOT in any of the virtio MMIO windows, the
+        // dispatch fills the data buffer with 0xFF (the canonical
+        // "no device responded" pattern — matches PCI/MMIO DECODE
+        // ERROR behaviour on real hardware). Pinning here so a future
+        // refactor cannot accidentally leave the buffer untouched
+        // (which would surface as the previous KVM_RUN's stale data
+        // appearing in the guest as a phantom value).
+        let com1 = PiMutex::new(console::Serial::new(console::COM1_BASE));
+        let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
+        // Pick an address well below any virtio_*_MMIO_BASE so no
+        // device window matches it. 0x1000 is in the BIOS-EBDA area,
+        // which ktstr does not back with any MMIO device.
+        let mut buf = [0u8; 4];
+        let mut exit = VcpuExit::MmioRead(0x1000, &mut buf);
+        let action = classify_exit(&com1, &com2, None, None, None, &mut exit);
+        assert!(
+            matches!(action, Some(ExitAction::Continue)),
+            "Unmapped MMIO read must classify as Continue (not Fatal)"
+        );
+        assert_eq!(
+            buf,
+            [0xff, 0xff, 0xff, 0xff],
+            "Unmapped MMIO read must fill the data buffer with 0xFF — \
+             leaving stale bytes would surface as phantom guest reads"
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn classify_exit_x86_mmio_write_unmapped_is_continue() {
+        // x86_64 MMIO write fallback: an unmapped write is silently
+        // dropped (no device matches → control falls through). Pin
+        // that the action is Continue so a future change that
+        // accidentally classifies "no virtio match" as Fatal would
+        // break this test.
+        let com1 = PiMutex::new(console::Serial::new(console::COM1_BASE));
+        let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
+        let data = [0xAAu8, 0xBB];
+        let mut exit = VcpuExit::MmioWrite(0x1000, &data);
+        let action = classify_exit(&com1, &com2, None, None, None, &mut exit);
+        assert!(
+            matches!(action, Some(ExitAction::Continue)),
+            "Unmapped MMIO write must classify as Continue"
+        );
+    }
+
+}
+
+/// Arch-neutral classify_exit coverage. `classify_exit` is shared
+/// across x86_64 and aarch64; these tests construct synthetic
+/// `VcpuExit` values that exist on both arches and assert the
+/// dispatch table's behavior. Kept in a separate `cfg(test)` module
+/// (no arch gate) so the same coverage runs on both targets — the
+/// surrounding x86_64-gated `mod tests` carries port-I/O and
+/// I8042-reset tests that ARE arch-specific.
+#[cfg(test)]
+mod tests_arch_neutral {
+    use super::*;
 
     #[test]
     fn classify_exit_hlt_returns_none() {
@@ -1639,108 +1746,6 @@ mod tests {
         assert!(
             matches!(action, Some(ExitAction::Fatal(None))),
             "InternalError must classify as Fatal(None)"
-        );
-    }
-
-    #[test]
-    #[cfg(target_arch = "x86_64")]
-    fn classify_exit_io_out_i8042_reset_is_shutdown() {
-        // Cross-checks the dispatch_io_out i8042-reset path through
-        // the classify_exit dispatch table — verifies the "true"
-        // return from dispatch_io_out maps to ExitAction::Shutdown.
-        let com1 = PiMutex::new(console::Serial::new(console::COM1_BASE));
-        let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
-        let data = [I8042_CMD_RESET_CPU];
-        let mut exit = VcpuExit::IoOut(I8042_CMD_PORT, &data);
-        let action = classify_exit(&com1, &com2, None, None, None, &mut exit);
-        assert!(
-            matches!(action, Some(ExitAction::Shutdown)),
-            "IoOut(0x64, [0xFE]) — i8042 reset — must classify as Shutdown"
-        );
-    }
-
-    #[test]
-    #[cfg(target_arch = "x86_64")]
-    fn classify_exit_io_out_serial_is_continue() {
-        let com1 = PiMutex::new(console::Serial::new(console::COM1_BASE));
-        let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
-        let data = [b'Z'];
-        let mut exit = VcpuExit::IoOut(console::COM1_BASE, &data);
-        let action = classify_exit(&com1, &com2, None, None, None, &mut exit);
-        assert!(
-            matches!(action, Some(ExitAction::Continue)),
-            "IoOut to COM1 must classify as Continue (no reboot)"
-        );
-        // Confirm the byte landed in COM1's output buffer — pins that
-        // the dispatch wired to the right port mutex, not COM2.
-        assert!(com1.lock().output().contains('Z'));
-    }
-
-    #[test]
-    #[cfg(target_arch = "x86_64")]
-    fn classify_exit_io_in_serial_is_continue() {
-        // IoIn on COM1's data port returns a buffered byte if pending,
-        // 0 otherwise. classify_exit must map IoIn → Continue
-        // unconditionally — the run loop never terminates on a port
-        // read.
-        let com1 = PiMutex::new(console::Serial::new(console::COM1_BASE));
-        let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
-        let mut data = [0xFFu8; 1];
-        let mut exit = VcpuExit::IoIn(console::COM1_BASE, &mut data);
-        let action = classify_exit(&com1, &com2, None, None, None, &mut exit);
-        assert!(
-            matches!(action, Some(ExitAction::Continue)),
-            "IoIn to COM1 must classify as Continue"
-        );
-    }
-
-    #[test]
-    #[cfg(target_arch = "x86_64")]
-    fn classify_exit_x86_mmio_read_unmapped_returns_0xff() {
-        // x86_64 MMIO read fallback: when a guest MMIO read addresses
-        // a region that is NOT in any of the virtio MMIO windows, the
-        // dispatch fills the data buffer with 0xFF (the canonical
-        // "no device responded" pattern — matches PCI/MMIO DECODE
-        // ERROR behaviour on real hardware). Pinning here so a future
-        // refactor cannot accidentally leave the buffer untouched
-        // (which would surface as the previous KVM_RUN's stale data
-        // appearing in the guest as a phantom value).
-        let com1 = PiMutex::new(console::Serial::new(console::COM1_BASE));
-        let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
-        // Pick an address well below any virtio_*_MMIO_BASE so no
-        // device window matches it. 0x1000 is in the BIOS-EBDA area,
-        // which ktstr does not back with any MMIO device.
-        let mut buf = [0u8; 4];
-        let mut exit = VcpuExit::MmioRead(0x1000, &mut buf);
-        let action = classify_exit(&com1, &com2, None, None, None, &mut exit);
-        assert!(
-            matches!(action, Some(ExitAction::Continue)),
-            "Unmapped MMIO read must classify as Continue (not Fatal)"
-        );
-        assert_eq!(
-            buf,
-            [0xff, 0xff, 0xff, 0xff],
-            "Unmapped MMIO read must fill the data buffer with 0xFF — \
-             leaving stale bytes would surface as phantom guest reads"
-        );
-    }
-
-    #[test]
-    #[cfg(target_arch = "x86_64")]
-    fn classify_exit_x86_mmio_write_unmapped_is_continue() {
-        // x86_64 MMIO write fallback: an unmapped write is silently
-        // dropped (no device matches → control falls through). Pin
-        // that the action is Continue so a future change that
-        // accidentally classifies "no virtio match" as Fatal would
-        // break this test.
-        let com1 = PiMutex::new(console::Serial::new(console::COM1_BASE));
-        let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
-        let data = [0xAAu8, 0xBB];
-        let mut exit = VcpuExit::MmioWrite(0x1000, &data);
-        let action = classify_exit(&com1, &com2, None, None, None, &mut exit);
-        assert!(
-            matches!(action, Some(ExitAction::Continue)),
-            "Unmapped MMIO write must classify as Continue"
         );
     }
 
@@ -2541,7 +2546,7 @@ mod vcpu_reg_snapshot_tests {
         // Construct a synthetic debug-exit payload pointing at the
         // first byte of slot 2 (DR2 / user[1]).
         let far = 0xffff_ffff_8100_1004u64;
-        let hsr = (super::ESR_ELx_EC_WATCHPT_LOW) << super::ESR_ELx_EC_SHIFT;
+        let hsr = (super::ESR_ELX_EC_WATCHPT_LOW) << super::ESR_ELX_EC_SHIFT;
         let debug_arch = kvm_bindings::kvm_debug_exit_arch {
             hsr,
             hsr_high: 0,
@@ -2625,7 +2630,7 @@ mod vcpu_reg_snapshot_tests {
         ];
         // EC = 0x32 (software step) with single_step_pending = false
         // — must NOT latch and must not flip pending state.
-        let hsr = 0x32u32 << super::ESR_ELx_EC_SHIFT;
+        let hsr = 0x32u32 << super::ESR_ELX_EC_SHIFT;
         let debug_arch = kvm_bindings::kvm_debug_exit_arch {
             hsr,
             hsr_high: 0,
@@ -2674,7 +2679,7 @@ mod vcpu_reg_snapshot_tests {
         use crate::vmm::vcpu::WatchpointArm;
         let watchpoint = WatchpointArm::new().expect("WatchpointArm::new");
         let armed_slots: [u64; 4] = [0, 0xffff_ffff_8100_1000, 0, 0];
-        let hsr = super::ESR_ELx_EC_SOFTSTP_LOW << super::ESR_ELx_EC_SHIFT;
+        let hsr = super::ESR_ELX_EC_SOFTSTP_LOW << super::ESR_ELX_EC_SHIFT;
         let debug_arch = kvm_bindings::kvm_debug_exit_arch {
             hsr,
             hsr_high: 0,
@@ -2731,7 +2736,7 @@ mod vcpu_reg_snapshot_tests {
         let watchpoint = WatchpointArm::new().expect("WatchpointArm::new");
         // host_ptr is null by construction (`AtomicPtr::new(null)`).
         let armed_slots: [u64; 4] = [0xffff_ffff_8100_1000, 0, 0, 0];
-        let hsr = (super::ESR_ELx_EC_WATCHPT_LOW) << super::ESR_ELx_EC_SHIFT;
+        let hsr = (super::ESR_ELX_EC_WATCHPT_LOW) << super::ESR_ELX_EC_SHIFT;
         let debug_arch = kvm_bindings::kvm_debug_exit_arch {
             hsr,
             hsr_high: 0,

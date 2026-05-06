@@ -182,7 +182,12 @@ fn help_kernel_build() {
         // the explanation would leave operators guessing why a
         // fragment line silently disappeared from the final
         // `.config`.
-        .stdout(predicate::str::contains("olddefconfig"));
+        .stdout(predicate::str::contains("olddefconfig"))
+        // `--skip-sha256` is a security-sensitive bypass flag — it
+        // MUST appear in the discoverability surface so an operator
+        // hitting an in-place tarball update at cdn.kernel.org can
+        // find the recovery flag from `--help` alone.
+        .stdout(predicate::str::contains("--skip-sha256"));
 }
 
 /// `kernel build --extra-kconfig <nonexistent>` must surface an

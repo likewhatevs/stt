@@ -1621,6 +1621,226 @@ fn parse_kernel_build_without_extra_kconfig_is_none() {
     );
 }
 
+/// `kernel build VERSION --skip-sha256` round-trips to
+/// `KernelCommand::Build { skip_sha256: true, .. }` so the
+/// dispatch site forwards the boolean through `kernel_build` →
+/// `kernel_build_one` → `fetch::download_tarball` →
+/// `download_stable_tarball`. Pins the clap binding for the
+/// security-sensitive bypass flag — a regression that dropped
+/// the field or flipped the default would surface here.
+#[test]
+fn parse_kernel_build_with_skip_sha256() {
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from([
+        "cargo",
+        "ktstr",
+        "kernel",
+        "build",
+        "6.14.2",
+        "--skip-sha256",
+    ])
+    .unwrap_or_else(|e| panic!("{e}"));
+    let KtstrCommand::Kernel {
+        command:
+            KernelCommand::Build {
+                version,
+                skip_sha256,
+                ..
+            },
+    } = k.command
+    else {
+        panic!("expected KernelCommand::Build");
+    };
+    assert_eq!(version.as_deref(), Some("6.14.2"));
+    assert!(
+        skip_sha256,
+        "--skip-sha256 must round-trip as true; without this the \
+         download path would still verify against sha256sums.asc"
+    );
+}
+
+/// Bare `kernel build VERSION` (no `--skip-sha256`) parses to
+/// `skip_sha256: false`. Pins the safe default — a regression
+/// that flipped the default to true would silently disable
+/// checksum verification on every download.
+#[test]
+fn parse_kernel_build_without_skip_sha256_is_false() {
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from(["cargo", "ktstr", "kernel", "build", "6.14.2"])
+        .unwrap_or_else(|e| panic!("{e}"));
+    let KtstrCommand::Kernel {
+        command: KernelCommand::Build { skip_sha256, .. },
+    } = k.command
+    else {
+        panic!("expected KernelCommand::Build");
+    };
+    assert!(
+        !skip_sha256,
+        "absent --skip-sha256 must produce skip_sha256: false — \
+         the default must keep checksum verification enabled, \
+         got skip_sha256={skip_sha256}"
+    );
+}
+
+/// `--skip-sha256` works alongside `--source` (local source tree
+/// path). Pins that the flag is not mutually exclusive with the
+/// other source-acquire flags — skip-sha256 is documented as a
+/// no-op on --source / --git, but clap must still ACCEPT the
+/// combination so the help-text-promised orthogonality holds at
+/// parse time.
+#[test]
+fn parse_kernel_build_skip_sha256_with_source() {
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from([
+        "cargo",
+        "ktstr",
+        "kernel",
+        "build",
+        "--source",
+        "/tmp/src",
+        "--skip-sha256",
+    ])
+    .unwrap_or_else(|e| panic!("{e}"));
+    let KtstrCommand::Kernel {
+        command:
+            KernelCommand::Build {
+                source,
+                skip_sha256,
+                ..
+            },
+    } = k.command
+    else {
+        panic!("expected KernelCommand::Build");
+    };
+    assert_eq!(source, Some(std::path::PathBuf::from("/tmp/src")));
+    assert!(
+        skip_sha256,
+        "--skip-sha256 must round-trip when combined with --source \
+         (the help text promises the flag is a no-op there, but \
+         clap must still accept the combination)"
+    );
+}
+
+/// Underscore form `--skip_sha256` MUST be rejected by clap. The
+/// canonical name is `--skip-sha256` (kebab-case). A regression
+/// that added an alias for the underscore form (or changed the
+/// arg-name parser to accept either) would turn this negative
+/// pin positive. Mirrors `parse_llvm_cov_underscore_rejected`.
+#[test]
+fn parse_kernel_build_skip_sha256_underscore_rejected() {
+    let rejected = Cargo::try_parse_from([
+        "cargo",
+        "ktstr",
+        "kernel",
+        "build",
+        "6.14.2",
+        "--skip_sha256",
+    ]);
+    assert!(
+        rejected.is_err(),
+        "`--skip_sha256` (underscore) must be rejected — the \
+         canonical name is `--skip-sha256` (kebab-case)",
+    );
+}
+
+/// Range expansion + --skip-sha256 composes at the parse layer.
+/// A range version + the bypass flag both round-trip to their
+/// fields on `KernelCommand::Build`. The dispatch then fans out
+/// per version inside `kernel_build`, threading the same
+/// `skip_sha256` boolean to every `kernel_build_one` call — so
+/// every version in a range observes the same bypass setting.
+/// Pin the parse-level composition.
+#[test]
+fn parse_kernel_build_skip_sha256_range_compose() {
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from([
+        "cargo",
+        "ktstr",
+        "kernel",
+        "build",
+        "6.14.2..6.14.4",
+        "--skip-sha256",
+    ])
+    .unwrap_or_else(|e| panic!("{e}"));
+    let KtstrCommand::Kernel {
+        command:
+            KernelCommand::Build {
+                version,
+                skip_sha256,
+                ..
+            },
+    } = k.command
+    else {
+        panic!("expected KernelCommand::Build");
+    };
+    assert_eq!(version.as_deref(), Some("6.14.2..6.14.4"));
+    assert!(
+        skip_sha256,
+        "--skip-sha256 must round-trip on a range version so every \
+         per-version `kernel_build_one` invocation sees the bypass \
+         flag"
+    );
+}
+
+/// Four-flag orthogonality: --skip-sha256 + --extra-kconfig +
+/// --force + --clean must all coexist on a single `kernel build`
+/// invocation. None pair conflicts. A regression that introduced
+/// a clap `conflicts_with` between any pair (e.g. wrongly tying
+/// --skip-sha256 to --force "for safety") would surface here.
+/// Mirrors `parse_kernel_build_force_clean_and_extra_kconfig_compose`.
+#[test]
+fn parse_kernel_build_skip_sha256_with_extra_kconfig_and_force_clean() {
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from([
+        "cargo",
+        "ktstr",
+        "kernel",
+        "build",
+        "6.14.2",
+        "--skip-sha256",
+        "--extra-kconfig",
+        "/tmp/k",
+        "--force",
+        "--clean",
+    ])
+    .unwrap_or_else(|e| panic!("{e}"));
+    let KtstrCommand::Kernel {
+        command:
+            KernelCommand::Build {
+                force,
+                clean,
+                extra_kconfig,
+                skip_sha256,
+                ..
+            },
+    } = k.command
+    else {
+        panic!("expected KernelCommand::Build");
+    };
+    assert!(
+        force,
+        "--force must round-trip alongside --skip-sha256 + --clean + --extra-kconfig"
+    );
+    assert!(
+        clean,
+        "--clean must round-trip alongside --skip-sha256 + --force + --extra-kconfig"
+    );
+    assert_eq!(
+        extra_kconfig,
+        Some(std::path::PathBuf::from("/tmp/k")),
+        "--extra-kconfig must round-trip alongside --skip-sha256 + --force + --clean"
+    );
+    assert!(
+        skip_sha256,
+        "--skip-sha256 must round-trip alongside --force + --clean + --extra-kconfig"
+    );
+}
+
 /// Range expansion + --extra-kconfig composes at the parse
 /// layer. A range version + an extra-kconfig path both round-
 /// trip to their fields on `KernelCommand::Build`. The dispatch

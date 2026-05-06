@@ -168,6 +168,21 @@ pub enum KernelCommand {
         /// kernels carry user modifications.
         #[arg(long = "extra-kconfig", value_name = "PATH", help = EXTRA_KCONFIG_HELP)]
         extra_kconfig: Option<PathBuf>,
+        /// Skip SHA-256 verification of downloaded stable tarballs.
+        /// Useful when cdn.kernel.org updates a tarball in-place (new
+        /// point release reusing the same URL) and the
+        /// sha256sums.asc manifest is stale or mismatched. Has no
+        /// effect on `--source` (no download), `--git` (no manifest),
+        /// or RC tarballs (git.kernel.org dynamically generates RC
+        /// archives and publishes no upstream manifest, so RC
+        /// downloads always run unverified regardless of this flag).
+        /// Bypassing verification is security-sensitive: a single
+        /// `--skip-sha256: bypassing checksum verification` warning
+        /// fires per affected download so the lost guarantee is
+        /// visible alongside the verification-success line that
+        /// would otherwise appear.
+        #[arg(long)]
+        skip_sha256: bool,
     },
     /// Remove cached kernel images.
     Clean {
@@ -856,6 +871,59 @@ mod tests {
         }
     }
 
+    /// `kernel build --skip-sha256` parses to
+    /// `Build { skip_sha256: true, .. }`. Pins the bypass flag's
+    /// wire path: a regression that dropped the field would surface
+    /// as a parse rejection.
+    #[test]
+    fn kernel_build_parses_skip_sha256() {
+        use clap::Parser as _;
+        #[derive(clap::Parser, Debug)]
+        struct TestCli {
+            #[command(subcommand)]
+            cmd: KernelCommand,
+        }
+        let parsed = TestCli::try_parse_from(["prog", "build", "6.14.2", "--skip-sha256"])
+            .expect("kernel build --skip-sha256 must parse");
+        match parsed.cmd {
+            KernelCommand::Build { skip_sha256, .. } => {
+                assert!(
+                    skip_sha256,
+                    "--skip-sha256 must round-trip as true so the \
+                     downstream download path bypasses sha256sums.asc"
+                );
+            }
+            other => panic!("expected KernelCommand::Build, got {other:?}"),
+        }
+    }
+
+    /// `kernel build` without `--skip-sha256` parses with the safe
+    /// default `skip_sha256: false`. Pins the no-flag path so a
+    /// regression that flipped the default to true (silently
+    /// disabling checksum verification on every download) surfaces
+    /// as a test failure.
+    #[test]
+    fn kernel_build_without_skip_sha256_defaults_to_false() {
+        use clap::Parser as _;
+        #[derive(clap::Parser, Debug)]
+        struct TestCli {
+            #[command(subcommand)]
+            cmd: KernelCommand,
+        }
+        let parsed = TestCli::try_parse_from(["prog", "build", "6.14.2"])
+            .expect("kernel build without --skip-sha256 must parse");
+        match parsed.cmd {
+            KernelCommand::Build { skip_sha256, .. } => {
+                assert!(
+                    !skip_sha256,
+                    "no --skip-sha256 must produce false (verification \
+                     enabled by default); got skip_sha256={skip_sha256}"
+                );
+            }
+            other => panic!("expected KernelCommand::Build, got {other:?}"),
+        }
+    }
+
     /// `KERNEL_LIST_LONG_ABOUT` drives `kernel list --help` and must
     /// expose the `--json` output contract so scripted consumers can
     /// discover the schema from the terminal alone. Pins:
@@ -964,5 +1032,59 @@ mod tests {
             .expect("`list` subcommand must have a long_about set")
             .to_string();
         assert_eq!(long_about, KERNEL_LIST_LONG_ABOUT);
+    }
+
+    /// `kernel build --help` must surface the `--skip-sha256` flag
+    /// with documentation covering the no-op semantics on
+    /// `--source` / `--git` / RC tarballs and the
+    /// security-sensitive bypass-warning contract. Without these
+    /// hints an operator setting the flag would have no way to
+    /// know whether their fetch actually bypassed verification.
+    #[test]
+    fn kernel_build_help_documents_skip_sha256_no_op_semantics() {
+        use clap::CommandFactory as _;
+        #[derive(clap::Parser, Debug)]
+        struct TestCli {
+            #[command(subcommand)]
+            cmd: KernelCommand,
+        }
+        let cmd = TestCli::command();
+        let build = cmd
+            .find_subcommand("build")
+            .expect("clap must register a `build` subcommand on KernelCommand");
+        // Locate the --skip-sha256 arg and read its long help.
+        let arg = build
+            .get_arguments()
+            .find(|a| a.get_long() == Some("skip-sha256"))
+            .expect("kernel build must register --skip-sha256 with clap");
+        let help = arg
+            .get_long_help()
+            .or_else(|| arg.get_help())
+            .map(|s| s.to_string())
+            .expect("--skip-sha256 must carry help text");
+        // Pins the user-facing semantics so a future doc rewrite
+        // cannot drop the no-op clauses or the warning contract.
+        assert!(
+            help.contains("--source"),
+            "--skip-sha256 help must call out the --source no-op so \
+             operators don't expect bypass on local-source builds: {help}"
+        );
+        assert!(
+            help.contains("--git"),
+            "--skip-sha256 help must call out the --git no-op so \
+             operators don't expect bypass on git-source builds: {help}"
+        );
+        assert!(
+            help.contains("RC"),
+            "--skip-sha256 help must call out the RC-tarball no-op \
+             (RC archives have no upstream manifest, so the flag is \
+             a no-op there): {help}"
+        );
+        assert!(
+            help.contains("warning"),
+            "--skip-sha256 help must mention the bypass warning so \
+             ops know the lost guarantee surfaces in the same channel \
+             as verification-success lines: {help}"
+        );
     }
 }

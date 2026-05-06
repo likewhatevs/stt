@@ -465,6 +465,7 @@ fn kernel_build(
     clean: bool,
     cpu_cap: Option<usize>,
     extra_kconfig: Option<PathBuf>,
+    skip_sha256: bool,
 ) -> Result<()> {
     // Read the extra-kconfig fragment ONCE up front so a range
     // expansion doesn't re-read the same file per version (and so
@@ -505,6 +506,7 @@ fn kernel_build(
                     clean,
                     cpu_cap,
                     extra_content.as_deref(),
+                    skip_sha256,
                 ) {
                     eprintln!("ktstr: {ver}: {e:#}");
                     failures.push((ver.clone(), e));
@@ -534,6 +536,7 @@ fn kernel_build(
                 clean,
                 cpu_cap,
                 extra_content.as_deref(),
+                skip_sha256,
             )
         }
     } else {
@@ -546,6 +549,7 @@ fn kernel_build(
             clean,
             cpu_cap,
             extra_content.as_deref(),
+            skip_sha256,
         )
     }
 }
@@ -574,6 +578,7 @@ fn kernel_build_one(
     clean: bool,
     cpu_cap: Option<usize>,
     extra_kconfig: Option<&str>,
+    skip_sha256: bool,
 ) -> Result<()> {
     use ktstr::cache::CacheDir;
     use ktstr::fetch;
@@ -633,7 +638,7 @@ fn kernel_build_one(
             return Ok(());
         }
         let sp = cli::Spinner::start("Downloading kernel...");
-        let result = fetch::download_tarball(client, &ver, tmp_dir.path(), "ktstr");
+        let result = fetch::download_tarball(client, &ver, tmp_dir.path(), "ktstr", skip_sha256);
         drop(sp);
         let mut acquired = result?;
         // `download_tarball` builds its `cache_key` against the bare
@@ -1698,6 +1703,7 @@ fn main() -> Result<()> {
                 clean,
                 cpu_cap,
                 extra_kconfig,
+                skip_sha256,
             } => kernel_build(
                 version,
                 source,
@@ -1707,6 +1713,7 @@ fn main() -> Result<()> {
                 clean,
                 cpu_cap,
                 extra_kconfig,
+                skip_sha256,
             )?,
             KernelCommand::Clean {
                 keep,

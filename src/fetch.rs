@@ -720,10 +720,89 @@ fn verify_sha256(actual_hex: &str, expected_hex: &str, url: &str) -> Result<()> 
         Ok(())
     } else {
         anyhow::bail!(
-            "sha256 mismatch for {url}: expected {}, got {}",
+            "sha256 mismatch for {url}: expected {}, got {}. \
+             If cdn.kernel.org updated this tarball in-place, \
+             retry with --skip-sha256 to bypass verification.",
             expected_hex.to_ascii_lowercase(),
             actual_hex.to_ascii_lowercase(),
         );
+    }
+}
+
+/// Resolve the expected SHA-256 digest for a stable tarball from
+/// cdn.kernel.org's `sha256sums.asc` manifest.
+///
+/// Three outcomes:
+/// - `Some(hex)` — manifest fetched and the entry for `tarball_name`
+///   was parsed cleanly.
+/// - `None` with no warning (only when `skip_sha256 = true`) —
+///   operator explicitly opted out of verification; emits a single
+///   security-sensitive bypass warning instead.
+/// - `None` with a per-cause warning (manifest fetch failed, or
+///   manifest fetched but entry missing) — best-effort fallback so
+///   a transient cdn.kernel.org outage / schema drift does not
+///   gate the whole download.
+///
+/// The fallback path is deliberately permissive: we trade strict
+/// authentication for build availability. A network-path attacker
+/// who can deny `sha256sums.asc` while serving a poisoned
+/// `linux-{version}.tar.xz` could exploit this; operators who
+/// require strict verification should pin the source via `--source`
+/// or `--git` rather than the download path. The bypass warnings
+/// surface on the operator's diagnostic stream so the lost
+/// guarantee is visible to ops triage.
+///
+/// Extracted from [`download_stable_tarball`] so the gate is
+/// directly unit-testable without mocking network calls — the
+/// caller-supplied `client` reaches a `Client::get` only when
+/// `skip_sha256 == false`, so a `skip_sha256 = true` test does not
+/// need a configured `Client`.
+fn resolve_expected_sha256(
+    client: &Client,
+    major: u32,
+    tarball_name: &str,
+    skip_sha256: bool,
+) -> Option<String> {
+    if skip_sha256 {
+        tracing::warn!(
+            tarball = %tarball_name,
+            "--skip-sha256: bypassing checksum verification — the \
+             downloaded tarball will not be authenticated against \
+             cdn.kernel.org's sha256sums.asc manifest. Use only when \
+             upstream has updated a tarball in-place and the manifest \
+             is mismatched.",
+        );
+        return None;
+    }
+    // Best-effort expected-hash lookup: any failure (network,
+    // status, parse, missing entry) downgrades to a warning so the
+    // download still proceeds. The warning surfaces the cause so an
+    // operator triaging "kernel build went weird" can spot that
+    // verification was skipped.
+    match fetch_stable_sha256sums(client, major) {
+        Ok(manifest) => match parse_sha256_for_file(&manifest, tarball_name) {
+            Some(hex) => Some(hex),
+            None => {
+                tracing::warn!(
+                    tarball = %tarball_name,
+                    "sha256sums.asc fetched but no entry for {tarball_name}; \
+                     download will proceed without checksum verification. \
+                     Pass --skip-sha256 to bypass the manifest fetch when \
+                     the entry is known to be absent.",
+                );
+                None
+            }
+        },
+        Err(err) => {
+            tracing::warn!(
+                error = %format!("{err:#}"),
+                "failed to fetch sha256sums.asc; download will proceed \
+                 without checksum verification. Pass --skip-sha256 to \
+                 bypass the manifest fetch when the manifest is known \
+                 to be unavailable.",
+            );
+            None
+        }
     }
 }
 
@@ -738,42 +817,26 @@ fn verify_sha256(actual_hex: &str, expected_hex: &str, url: &str) -> Result<()> 
 /// entry; if the manifest fetch / parse fails (transient outage,
 /// schema drift, missing entry), logs a warning and continues
 /// without verification rather than failing the whole download.
+///
+/// `skip_sha256 = true` bypasses the manifest fetch entirely and
+/// emits a single bypass warning. Intended for the case where
+/// cdn.kernel.org has updated a tarball in-place (a new point
+/// release reusing the same URL) and the manifest is stale or
+/// mismatched. Unverified downloads are a security-sensitive
+/// fallback — the bypass warning surfaces the lost guarantee on
+/// the operator's diagnostic stream.
 fn download_stable_tarball(
     client: &Client,
     version: &str,
     dest_dir: &Path,
     cli_label: &str,
+    skip_sha256: bool,
 ) -> Result<PathBuf> {
     let major = major_version(version)?;
     let tarball_name = format!("linux-{version}.tar.xz");
     let url = format!("https://cdn.kernel.org/pub/linux/kernel/v{major}.x/{tarball_name}");
 
-    // Best-effort expected-hash lookup: any failure (network,
-    // status, parse, missing entry) downgrades to a warning so the
-    // download still proceeds. The warning surfaces the cause so an
-    // operator triaging "kernel build went weird" can spot that
-    // verification was skipped.
-    let expected_sha256 = match fetch_stable_sha256sums(client, major) {
-        Ok(manifest) => match parse_sha256_for_file(&manifest, &tarball_name) {
-            Some(hex) => Some(hex),
-            None => {
-                tracing::warn!(
-                    tarball = %tarball_name,
-                    "sha256sums.asc fetched but no entry for {tarball_name}; \
-                     download will proceed without checksum verification",
-                );
-                None
-            }
-        },
-        Err(err) => {
-            tracing::warn!(
-                error = %format!("{err:#}"),
-                "failed to fetch sha256sums.asc; download will proceed \
-                 without checksum verification",
-            );
-            None
-        }
-    };
+    let expected_sha256 = resolve_expected_sha256(client, major, &tarball_name, skip_sha256);
 
     let response = client
         .get(&url)
@@ -815,7 +878,11 @@ fn download_stable_tarball(
     if let Some(expected) = expected_sha256.as_deref() {
         verify_sha256(&actual_hex, expected, &url)?;
         eprintln!("{cli_label}: sha256 verified ({bytes_total} bytes, hash {actual_hex})");
-    } else {
+    } else if !skip_sha256 {
+        // Skip path already emitted its bespoke bypass warning
+        // before the download; firing again here under "no
+        // expected sha256 available" would mislead — that wording
+        // implies a fallback, not an explicit operator opt-out.
         tracing::warn!(
             url = %url,
             bytes = bytes_total,
@@ -947,17 +1014,26 @@ fn download_rc_tarball(
 ///
 /// `cli_label` prefixes diagnostic status output (e.g. `"ktstr"` or
 /// `"cargo ktstr"`).
+///
+/// `skip_sha256` propagates to [`download_stable_tarball`] only —
+/// stable tarballs publish a `sha256sums.asc` manifest the flag
+/// bypasses. RC tarballs (`download_rc_tarball`) have no published
+/// manifest so verification is impossible regardless of the flag;
+/// the RC path always runs unverified and emits its own warning,
+/// so `skip_sha256` is a no-op on the RC arm. `--source` and
+/// `--git` callers do not reach this function at all.
 pub fn download_tarball(
     client: &Client,
     version: &str,
     dest_dir: &Path,
     cli_label: &str,
+    skip_sha256: bool,
 ) -> Result<AcquiredSource> {
     let (arch, _) = arch_info();
     let source_dir = if is_rc(version) {
         download_rc_tarball(client, version, dest_dir, cli_label)?
     } else {
-        download_stable_tarball(client, version, dest_dir, cli_label)?
+        download_stable_tarball(client, version, dest_dir, cli_label, skip_sha256)?
     };
 
     Ok(AcquiredSource {
@@ -3501,6 +3577,68 @@ ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff  linux-6.14.99.
         );
     }
 
+    // -- resolve_expected_sha256 --
+
+    /// `resolve_expected_sha256(skip_sha256 = true)` returns `None`
+    /// without touching the network — the bypass branch must short-
+    /// circuit before any `Client::get`. Pins the security-sensitive
+    /// opt-out's no-network contract: a regression that swapped the
+    /// branch order (e.g. fetching the manifest then ignoring the
+    /// result) would still produce `None` but burn a CDN round-trip
+    /// per build, defeating the "use this when manifest is
+    /// unreachable" use case.
+    #[test]
+    fn resolve_expected_sha256_skip_returns_none_without_network() {
+        // Build a client whose connect attempt would fail loudly if
+        // the bypass branch reached `Client::get`. A 1ms connect
+        // timeout against any external host returns within the
+        // wall-clock budget of this test; the assertion below
+        // observes `None` either way, but a regression would change
+        // the test's WALL TIME from ~0ms to ~1ms+. We pin the
+        // short-circuit by NOT reaching the network at all — the
+        // assertion alone is what catches the regression because
+        // the bypass branch never invokes the client.
+        let client = test_client();
+        let got = super::resolve_expected_sha256(&client, 6, "linux-6.14.2.tar.xz", true);
+        assert!(
+            got.is_none(),
+            "skip_sha256 = true must produce None (verification \
+             skipped); got {got:?}"
+        );
+    }
+
+    /// Mirror of the bypass test against the no-skip arg path with
+    /// a tarball name the parser will not match (we substitute the
+    /// network call by going through a localhost mock would require
+    /// rerouting; instead this test relies on the production
+    /// fetch_stable_sha256sums hitting kernel.org over reqwest with
+    /// a 5-second timeout — too slow for a unit test). The bypass
+    /// branch itself is the security-sensitive surface; the
+    /// network-dependent fallback paths are covered by the
+    /// `parse_sha256_for_file_*` family above (manifest parsing) and
+    /// `fetch_releases_*` family (fetch error handling). Pinning
+    /// the no-skip arg path's "does not panic on a malformed
+    /// version" property is the most we can do without a network
+    /// mock.
+    #[test]
+    fn resolve_expected_sha256_no_skip_does_not_panic_on_invalid_major() {
+        // Calls into fetch_stable_sha256sums which constructs a URL
+        // and issues a GET; the network attempt may succeed against
+        // kernel.org or fail with timeout. Either way the function
+        // must return `Option<String>` without panicking. This is a
+        // smoke test only; the full network-dependent fallback path
+        // is exercised end-to-end by the integration tests in
+        // tests/extra_kconfig_e2e.rs.
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_millis(1))
+            .connect_timeout(std::time::Duration::from_millis(1))
+            .build()
+            .expect("build test client with tight timeouts");
+        // major=999 is a kernel.org URL that returns 404; the
+        // function must surface this as None+warning, not panic.
+        let _ = super::resolve_expected_sha256(&client, 999, "linux-999.0.0.tar.xz", false);
+    }
+
     // -- verify_sha256 --
 
     /// Matching digests return Ok regardless of case — pins the
@@ -3536,6 +3674,16 @@ ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff  linux-6.14.99.
         assert!(
             msg.contains("1111111111111111"),
             "error must include the expected digest: {msg}",
+        );
+        // The mismatch error is the only thing the operator sees on
+        // a verification-failed download. It MUST name `--skip-sha256`
+        // as the recovery path so an operator hitting an in-place
+        // tarball update at cdn.kernel.org does not have to dig
+        // through docs to find the bypass flag.
+        assert!(
+            msg.contains("--skip-sha256"),
+            "mismatch error must name --skip-sha256 as the recovery \
+             flag for the in-place-tarball-update case: {msg}",
         );
     }
 

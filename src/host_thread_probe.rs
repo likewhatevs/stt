@@ -1795,6 +1795,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn variant_ii_basic() {
         // fs_base=0x10000, image_size=0x100, st_value=0x10, field=8
         // → image_base=0xff00, addr=0xff18.
@@ -1803,6 +1804,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn variant_ii_underflow() {
         // fs_base less than image_size → underflow surface as Err.
         assert!(compute_tls_address_variant_ii(0x100, 0x200, 0, 0).is_err());
@@ -2022,6 +2024,7 @@ mod tests {
     /// + field_offset.  Worked example pins the arithmetic against a
     ///   hand-checked case.
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn variant_ii_worked_example() {
         let fs_base = 0x7f12_3456_7000;
         let aligned = 512;
@@ -2036,6 +2039,7 @@ mod tests {
     /// valid configuration — subtraction lands at zero rather than
     /// underflowing.
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn variant_ii_boundary_tp_equals_image_size() {
         let addr = compute_tls_address_variant_ii(4096, 4096, 0, 0).unwrap();
         assert_eq!(addr, 0);

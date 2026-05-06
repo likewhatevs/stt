@@ -98,7 +98,12 @@ fn help_kernel_build() {
         .stdout(predicate::str::contains("--git"))
         .stdout(predicate::str::contains("--ref"))
         .stdout(predicate::str::contains("--force"))
-        .stdout(predicate::str::contains("--clean"));
+        .stdout(predicate::str::contains("--clean"))
+        // `--skip-sha256` is a security-sensitive bypass flag — it
+        // MUST appear in the discoverability surface so an operator
+        // hitting an in-place tarball update at cdn.kernel.org can
+        // find the recovery flag from `--help` alone.
+        .stdout(predicate::str::contains("--skip-sha256"));
 }
 
 #[test]

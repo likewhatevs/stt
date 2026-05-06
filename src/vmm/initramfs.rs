@@ -2688,7 +2688,9 @@ mod tests {
     fn include_elf_shared_libs_all_present_in_archive() {
         // Use /bin/sh as an include file — its shared libs must all
         // appear in the archive with non-zero sizes.
-        let sh = Path::new("/bin/sh");
+        let sh_path = Path::new("/bin/sh");
+        let sh_resolved = std::fs::canonicalize(sh_path).unwrap_or_else(|_| sh_path.to_path_buf());
+        let sh = sh_resolved.as_path();
         if !sh.exists() || !is_elf(sh) {
             skip!("/bin/sh not available or not ELF");
         }
