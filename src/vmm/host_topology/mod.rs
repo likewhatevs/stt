@@ -74,6 +74,11 @@ pub struct PinningPlan {
     pub(crate) locks: Vec<std::os::fd::OwnedFd>,
 }
 
+/// Process-wide cache for [`HostTopology::cached`]. Only
+/// populated on success — a failed sysfs probe retries on the
+/// next call instead of poisoning the cache.
+static CACHED_HOST_TOPOLOGY: std::sync::OnceLock<HostTopology> = std::sync::OnceLock::new();
+
 impl HostTopology {
     /// Read host topology from sysfs via [`TestTopology::from_system()`](crate::topology::TestTopology::from_system).
     pub fn from_sysfs() -> Result<Self> {
@@ -99,6 +104,19 @@ impl HostTopology {
             cpu_to_node,
             host_node_llcs,
         })
+    }
+
+    /// Return a cached host topology, populating the cache on first
+    /// successful call. Failed reads retry on the next call — the
+    /// cache only stores success so a transient sysfs issue at
+    /// process start doesn't poison every subsequent build().
+    pub fn cached() -> Result<Self> {
+        if let Some(topo) = CACHED_HOST_TOPOLOGY.get() {
+            return Ok(topo.clone());
+        }
+        let topo = Self::from_sysfs()?;
+        let _ = CACHED_HOST_TOPOLOGY.set(topo.clone());
+        Ok(topo)
     }
 
     /// Build a synthetic `HostTopology` from `(cpu_list, node_id)`

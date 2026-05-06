@@ -650,10 +650,12 @@ impl KtstrVmBuilder {
             // concurrent builds or other no-perf peers for the full
             // host, regardless of whether the user set the flag.
             //
-            // `from_sysfs` returning `Err` (non-Linux, sysfs absent)
-            // still forces the no-cap branch; `acquire_llc_plan` is
-            // skipped, no coordination is possible, but the VM still
-            // runs. `KTSTR_BYPASS_LLC_LOCKS=1` bypasses both paths.
+            // `cached` returning `Err` (non-Linux, sysfs absent — the
+            // process-wide cache replays the first sysfs probe's
+            // failure on every call) still forces the no-cap branch;
+            // `acquire_llc_plan` is skipped, no coordination is
+            // possible, but the VM still runs. `KTSTR_BYPASS_LLC_LOCKS=1`
+            // bypasses both paths.
             //
             // The CLI binaries reject `--cpu-cap` + bypass at parse
             // time (see `ktstr::cli::CPU_CAP_HELP` and the Shell/
@@ -678,7 +680,7 @@ impl KtstrVmBuilder {
                     );
                 }
                 (None, Vec::new(), None)
-            } else if let Ok(host_topo) = host_topology::HostTopology::from_sysfs() {
+            } else if let Ok(host_topo) = host_topology::HostTopology::cached() {
                 let test_topo = crate::topology::TestTopology::from_system()?;
                 // Compute the plan and immediately drop the flocks:
                 // we want the plan SHAPE on KtstrVm but not the
@@ -731,7 +733,7 @@ impl KtstrVmBuilder {
             // so the build-to-run setup window holds no flocks.
             // Cache `host_topo` so `run()` can pass it to
             // `acquire_cpu_locks` without re-reading sysfs.
-            cached_host_topo = host_topology::HostTopology::from_sysfs().ok();
+            cached_host_topo = host_topology::HostTopology::cached().ok();
             (None, Vec::new(), None)
         };
 
@@ -810,7 +812,7 @@ impl KtstrVmBuilder {
     fn validate_performance_mode(
         &mut self,
     ) -> Result<(host_topology::PinningPlan, host_topology::HostTopology)> {
-        let host_topo = host_topology::HostTopology::from_sysfs()
+        let host_topo = host_topology::HostTopology::cached()
             .context("performance_mode: read host topology")?;
 
         let t = &self.topology;
