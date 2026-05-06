@@ -1383,12 +1383,12 @@ where
     // attempt to absorb.
     let allowed_vec = host_allowed_cpus();
     if allowed_vec.is_empty() {
-        anyhow::bail!(
-            "acquire_llc_plan: could not determine the calling process's \
-             allowed CPU set (both sched_getaffinity and \
-             /proc/self/status Cpus_allowed_list failed). Cannot plan a \
-             reservation without knowing which CPUs are schedulable."
-        );
+        return Err(ResourceContention {
+            reason: "could not determine allowed CPU set \
+                     (sched_getaffinity and /proc/self/status both failed)"
+                .into(),
+        }
+        .into());
     }
     let allowed: std::collections::BTreeSet<usize> = allowed_vec.iter().copied().collect();
     let allowed_cpus = allowed.len();
@@ -1404,7 +1404,10 @@ where
         // catches future regressions (e.g. someone wires a signed
         // integer into the budget math) instead of silently
         // producing a plan with no locks.
-        anyhow::bail!("acquire_llc_plan: CPU budget resolved to zero");
+        return Err(ResourceContention {
+            reason: "CPU budget resolved to zero".into(),
+        }
+        .into());
     }
 
     // Read /proc/self/mountinfo ONCE per acquire_llc_plan invocation.
@@ -1417,11 +1420,16 @@ where
     // changing under us mid-acquire is a host-reconfiguration event
     // that invalidates every parallel acquirer anyway, not something
     // we need to re-read to observe.
-    let mountinfo = crate::flock::read_mountinfo()?;
+    let mountinfo = crate::flock::read_mountinfo().map_err(|e| ResourceContention {
+        reason: format!("read /proc/self/mountinfo: {e}"),
+    })?;
 
     let mut attempt: u32 = 0;
     loop {
-        let snapshots = discover_llc_snapshots(topo, &allowed, &mountinfo)?;
+        let snapshots =
+            discover_llc_snapshots(topo, &allowed, &mountinfo).map_err(|e| ResourceContention {
+                reason: format!("discover LLC snapshots: {e}"),
+            })?;
         let selected = plan_from_snapshots(&snapshots, target_cpus, topo, &allowed, |from, to| {
             test_topo.numa_distance(from, to)
         });
@@ -1433,15 +1441,18 @@ where
             // llc_groups, etc.). Bail with actionable text rather
             // than looping through retries that cannot change the
             // outcome.
-            anyhow::bail!(
-                "acquire_llc_plan: no host LLC overlaps the process's \
-                 {allowed_cpus}-CPU allowed set — sysfs LLC groups and \
-                 sched_getaffinity disagree. Check for a stale \
-                 /sys/devices/system/cpu view or a cgroup cpuset that \
-                 excludes every LLC."
-            );
+            return Err(ResourceContention {
+                reason: format!(
+                    "no host LLC overlaps the process's \
+                     {allowed_cpus}-CPU allowed set — sysfs LLC groups \
+                     and sched_getaffinity disagree"
+                ),
+            }
+            .into());
         }
-        match acquire_fn(&selected, &snapshots)? {
+        match acquire_fn(&selected, &snapshots).map_err(|e| ResourceContention {
+            reason: format!("acquire LLC locks: {e}"),
+        })? {
             Some(locks) => {
                 // Success — materialize cpus + mems from the selected
                 // indices, intersecting each LLC's CPU list with

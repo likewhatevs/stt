@@ -88,7 +88,7 @@ const EXCEPTIONS: &[(&str, usize)] = &[
     ("monitor/bpf_map/tests.rs", 4013), // queued: split into submodules
     ("vmm/virtio_blk/device.rs", 3826),
     ("workload/spawn/mod.rs", 3752),
-    ("fetch.rs", 3727),                    // queued: split into submodules
+    ("fetch.rs", 3727), // queued: split into submodules
     ("workload/worker/mod.rs", 3635),
     ("bin/cargo_ktstr/parse_tests.rs", 3571),
     ("ctprof/mod.rs", 3568),
@@ -97,9 +97,9 @@ const EXCEPTIONS: &[(&str, usize)] = &[
     ("vmm/exit_dispatch.rs", 3091),
     ("vmm/initramfs.rs", 3074),
     ("monitor/scx_walker.rs", 3055),
-    ("host_context.rs", 3041),             // queued: split into submodules
+    ("host_context.rs", 3041), // queued: split into submodules
     ("test_support/probe.rs", 3026),
-    ("monitor/tests.rs", 3015),            // queued: split into submodules
+    ("monitor/tests.rs", 3015), // queued: split into submodules
 ];
 
 /// Resolve `<repo>/src` from `CARGO_MANIFEST_DIR`. Cargo always

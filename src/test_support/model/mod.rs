@@ -53,16 +53,19 @@
 //!    `KTSTR_MODEL_OFFLINE=1` with an uncached artifact, for a
 //!    placeholder/malformed SHA pin, and for a corrupt GGUF, with
 //!    the result memoized in the process-wide [`MODEL_CACHE`]
-//!    `Mutex<Option<Arc<Result<Mutex<LoadedInference>, String>>>>`
+//!    `Mutex<Option<Arc<Result<LoadedInference, String>>>>`
 //!    via [`memoized_inference`] (concurrent first-call races
 //!    serialize on the outer `Mutex` so at most one load runs
 //!    end-to-end, and a failed load is cached as `Err` so
 //!    subsequent calls fail-closed without repeating the 2.55 GiB
-//!    load; the inner `Mutex` then serializes repeated generation
-//!    passes against the shared `LlamaModel`); tests that mutate
-//!    `KTSTR_MODEL_OFFLINE` or `KTSTR_CACHE_DIR` call [`reset`]
-//!    (cfg(test)-only) before asserting offline-gate trip behavior
-//!    so a previously-memoized `Ok(_)` does not bypass the gate.
+//!    load; concurrent generation passes share `&LoadedInference`
+//!    via the cached `Arc` and run in parallel because every
+//!    `LlamaModel` method `invoke_with_model` calls takes
+//!    `&self` and `LlamaModel` is `Send + Sync`); tests that
+//!    mutate `KTSTR_MODEL_OFFLINE` or `KTSTR_CACHE_DIR` call
+//!    [`reset`] (cfg(test)-only) before asserting offline-gate
+//!    trip behavior so a previously-memoized `Ok(_)` does not
+//!    bypass the gate.
 //! 3. `invoke_with_model` (module-private) builds a fresh
 //!    `LlamaContext` per call — fresh-context-per-call sidesteps the
 //!    self-referential lifetime issue that storing the context on
@@ -271,11 +274,17 @@ fn prompt_excerpt(prompt: &str) -> String {
 /// Process-wide memoized inference state.
 ///
 /// The outer `Mutex` serializes initialization and gates access to the
-/// `Option`; the inner `Arc` lets concurrent callers each hold the
+/// `Option`; the cached `Arc` lets concurrent callers each hold the
 /// shared inference state for the duration of their generation pass
-/// without keeping the outer mutex locked. The double layer of
-/// `Mutex`es (outer over the slot, inner over the model) is
-/// deliberate — see "Lock layering" below.
+/// without keeping the outer mutex locked. There is no inner
+/// per-model lock — `LlamaModel` is `Send + Sync` (see upstream
+/// `unsafe impl Send for LlamaModel` / `unsafe impl Sync for
+/// LlamaModel` at `llama-cpp-2-0.1.145/src/model.rs:177,179`) and
+/// every method `invoke_with_model` calls on the model
+/// (`new_context`, `is_eog_token`, `str_to_token`, `token_to_piece`)
+/// takes `&self`, so concurrent generation passes share the cached
+/// `&LoadedInference` and run in parallel without serialization. See
+/// "Lock layering" below.
 ///
 /// # Serialization guarantee
 ///
@@ -350,17 +359,22 @@ fn prompt_excerpt(prompt: &str) -> String {
 /// `LlmExtract` test in a process pays the load cost once;
 /// subsequent tests reuse the memoized [`MODEL_CACHE`] slot.
 ///
-/// The inner `Mutex<LoadedInference>` is held for the full duration
-/// of a generation pass and serializes concurrent inference calls
-/// against the shared `LlamaModel`. Holding the inner mutex via
-/// the cloned `Arc` (rather than via the outer slot) means a caller
-/// running inference does not block other callers from observing
-/// the slot is already populated. A fresh `LlamaContext` is built
-/// per call from `&LlamaModel` (the model's `new_context` borrows
-/// `&self`) so the per-generation KV state never aliases across
-/// invocations — KV state lives on the `LlamaContext`, which is
-/// constructed and destroyed per call, so no cross-invocation
-/// `clear_kv_cache` step is needed.
+/// **No inner lock for inference passes.** Generation runs against
+/// the cached `&LoadedInference` borrowed from the `Arc` without
+/// any per-model lock: every method `invoke_with_model` invokes on
+/// the model (`new_context`, `is_eog_token`, `str_to_token`,
+/// `token_to_piece`) takes `&self`, and `LlamaModel` is
+/// `Send + Sync` per upstream's `unsafe impl` declarations
+/// (`llama-cpp-2-0.1.145/src/model.rs:177,179`). Concurrent
+/// callers each hold the same `Arc<CachedInference>` and run their
+/// generation passes in parallel — a 2-5 minute inference under
+/// one caller no longer blocks every other caller from starting
+/// theirs. A fresh `LlamaContext` is built per call from
+/// `&LlamaModel` (the model's `new_context` borrows `&self`) so
+/// the per-generation KV state never aliases across invocations —
+/// KV state lives on the `LlamaContext`, which is constructed and
+/// destroyed per call, so no cross-invocation `clear_kv_cache`
+/// step is needed.
 ///
 /// # Test-only reset
 ///
@@ -477,7 +491,7 @@ fn prompt_excerpt(prompt: &str) -> String {
 /// transient subset only — but that requires a structured error
 /// type at the loader boundary which llama-cpp-2 currently does
 /// not surface, so the work is gated on upstream API support.
-type CachedInference = Result<Mutex<LoadedInference>, String>;
+type CachedInference = Result<LoadedInference, String>;
 static MODEL_CACHE: Mutex<Option<Arc<CachedInference>>> = Mutex::new(None);
 
 /// Test-only counter incremented each time [`memoized_inference`]
@@ -2255,7 +2269,7 @@ fn inference_thread_count(available: Option<std::num::NonZero<usize>>) -> i32 {
 /// cached `&LlamaModel`, so each invocation starts with an empty
 /// KV cache. Greedy: `LlamaSampler::greedy()` selects the ArgMax
 /// token — output is a deterministic function of prompt + weights.
-fn invoke_with_model(state: &mut LoadedInference, prompt: &str) -> anyhow::Result<String> {
+fn invoke_with_model(state: &LoadedInference, prompt: &str) -> anyhow::Result<String> {
     use std::num::NonZeroU32;
 
     use llama_cpp_2::context::params::LlamaContextParams;
@@ -2480,12 +2494,15 @@ fn strip_think_block(s: &str) -> String {
 /// outer mutex on the first call.
 ///
 /// Returns `Arc<CachedInference>` so the caller releases the outer
-/// mutex before running inference: the inner `Mutex<LoadedInference>`
-/// is held for the full generation pass and another thread initiating
-/// `extract_via_llm` should be free to observe the populated slot
-/// without waiting on the inference in flight. Cloning the `Arc` is
-/// cheap (one atomic increment); the only synchronization on the
-/// outer mutex is the lock + (slot read or load + store) + unlock.
+/// mutex before running inference: every concurrent caller observes
+/// the populated slot via its own `Arc::clone` and runs its
+/// generation pass against the shared `&LoadedInference` without
+/// any inner lock — `LlamaModel` is `Send + Sync` and every method
+/// `invoke_with_model` calls on it takes `&self`, so concurrent
+/// inferences run in parallel rather than serializing. Cloning the
+/// `Arc` is cheap (one atomic increment); the only synchronization
+/// on the outer mutex is the lock + (slot read or load + store) +
+/// unlock.
 fn memoized_inference() -> Arc<CachedInference> {
     let mut guard = MODEL_CACHE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(arc) = guard.as_ref() {
@@ -2502,9 +2519,7 @@ fn memoized_inference() -> Arc<CachedInference> {
     // outside MODEL_CACHE, so the MODEL_CACHE lock is not a
     // read-side gate.
     MODEL_CACHE_LOAD_COUNT.fetch_add(1, Ordering::Relaxed);
-    let result = load_inference()
-        .map(Mutex::new)
-        .map_err(|e| format!("{e:#}"));
+    let result = load_inference().map_err(|e| format!("{e:#}"));
     let arc = Arc::new(result);
     *guard = Some(Arc::clone(&arc));
     arc
@@ -2624,16 +2639,15 @@ pub(crate) fn extract_via_llm(
     // is memoized as `Err` so subsequent calls return the same
     // reason string without repeating the 2.55 GiB load.
     let cached = memoized_inference();
-    let cache = match cached.as_ref() {
-        Ok(c) => c,
+    let state = match cached.as_ref() {
+        Ok(s) => s,
         Err(msg) => {
             tracing::warn!(%msg, "LlmExtract model load failed (cached)");
             return Err(msg.clone());
         }
     };
-    let mut state = cache.lock().unwrap_or_else(|e| e.into_inner());
 
-    let response = match invoke_with_model(&mut state, &prompt) {
+    let response = match invoke_with_model(state, &prompt) {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(err = %format!("{e:#}"), "LlmExtract inference failed");
