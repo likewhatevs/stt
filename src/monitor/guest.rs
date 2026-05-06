@@ -153,7 +153,11 @@ impl<'a> GuestKernel<'a> {
     pub fn new(mem: &'a GuestMem, vmlinux: &Path, tcr_el1: u64, cr3_pa: u64) -> Result<Self> {
         let data = std::fs::read(vmlinux)
             .with_context(|| format!("read vmlinux: {}", vmlinux.display()))?;
-        let elf = goblin::elf::Elf::parse(&data).context("parse vmlinux ELF")?;
+        Self::from_bytes(mem, &data, tcr_el1, cr3_pa)
+    }
+
+    pub fn from_bytes(mem: &'a GuestMem, data: &[u8], tcr_el1: u64, cr3_pa: u64) -> Result<Self> {
+        let elf = goblin::elf::Elf::parse(data).context("parse vmlinux ELF")?;
 
         // Filter on `st_shndx == SHN_UNDEF` (== 0 per ELF spec)
         // rather than `st_value == 0`. SHN_UNDEF marks linker
@@ -190,8 +194,8 @@ impl<'a> GuestKernel<'a> {
             anyhow::anyhow!("could not derive kernel image base from tcr_el1=0x{tcr_el1:x}")
         })?;
 
-        // Resolve paging state using the same logic as KernelSymbols.
-        let kern_syms = super::symbols::KernelSymbols::from_vmlinux(vmlinux)?;
+        // Resolve paging state reusing the already-read vmlinux bytes.
+        let kern_syms = super::symbols::KernelSymbols::from_elf_bytes(&data)?;
         // `__pgtable_l5_enabled` is set by `__startup_64` BEFORE
         // `phys_base` is randomized (the L5 mode is needed to build
         // the bootstrap page tables themselves), so reading it with

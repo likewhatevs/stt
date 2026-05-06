@@ -102,10 +102,14 @@ pub use sched_domain::{CPU_MAX_IDLE_TYPES, SchedDomainOffsets, SchedDomainStatsO
 /// re-extracted + re-written on the next load.
 pub(crate) fn load_btf_from_path(path: &Path) -> Result<Btf> {
     let data = std::fs::read(path).context("read file")?;
+    load_btf_from_bytes(&data, path)
+}
+
+pub(crate) fn load_btf_from_bytes(data: &[u8], path: &Path) -> Result<Btf> {
     // Raw BTF: first 2 bytes are the 0x9FEB magic. Parse directly;
     // never write a sidecar (would be a byte-for-byte self-copy).
-    if is_raw_btf(&data) {
-        return Btf::from_bytes(&data).map_err(|e| anyhow::anyhow!("{e}"));
+    if is_raw_btf(data) {
+        return Btf::from_bytes(data).map_err(|e| anyhow::anyhow!("{e}"));
     }
 
     // Canonicalize the input path before deriving sidecar artifacts.
@@ -1148,6 +1152,11 @@ impl BpfProgOffsets {
     pub fn from_vmlinux(path: &Path) -> Result<Self> {
         let btf =
             load_btf_from_path(path).with_context(|| format!("btf: open {}", path.display()))?;
+        Self::from_btf(&btf)
+    }
+
+    pub fn from_vmlinux_bytes(data: &[u8], path: &Path) -> Result<Self> {
+        let btf = load_btf_from_bytes(data, path)?;
         Self::from_btf(&btf)
     }
 }

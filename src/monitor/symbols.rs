@@ -289,7 +289,11 @@ impl KernelSymbols {
     pub fn from_vmlinux(path: &Path) -> Result<Self> {
         let data =
             std::fs::read(path).with_context(|| format!("read vmlinux: {}", path.display()))?;
-        let elf = goblin::elf::Elf::parse(&data).context("parse vmlinux ELF")?;
+        Self::from_elf_bytes(&data)
+    }
+
+    pub fn from_elf_bytes(data: &[u8]) -> Result<Self> {
+        let elf = goblin::elf::Elf::parse(data).context("parse vmlinux ELF")?;
 
         // SHN_UNDEF = 0 (ELF spec): undefined symbols (linker
         // placeholders) carry st_shndx == 0 and must be skipped

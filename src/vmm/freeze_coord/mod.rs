@@ -7047,7 +7047,13 @@ impl KtstrVm {
             crate::test_support::extract_panic_message(&app_output).map(|s| s.to_string());
 
         // Collect BPF verifier stats from host-side memory reads.
-        let verifier_stats = self.collect_verifier_stats(&run.vm, run.tcr_el1.as_ref(), &run.cr3);
+        // Skip when no scheduler was loaded — struct_ops programs
+        // only exist when a sched_ext scheduler attached.
+        let verifier_stats = if self.scheduler_binary.is_some() {
+            self.collect_verifier_stats(&run.vm, run.tcr_el1.as_ref(), &run.cr3)
+        } else {
+            Vec::new()
+        };
 
         // Sample cleanup elapsed AFTER every blocking step that runs on
         // the post-BSP-exit critical path so the duration captures the
@@ -7129,14 +7135,21 @@ impl KtstrVm {
             .map(|c| c.load(std::sync::atomic::Ordering::Acquire))
             .unwrap_or(0);
         let cr3_val = cr3.load(std::sync::atomic::Ordering::Acquire);
-        let kernel = match monitor::guest::GuestKernel::new(&mem, &vmlinux, tcr_val, cr3_val) {
-            Ok(k) => k,
+        let vmlinux_data = match std::fs::read(&vmlinux) {
+            Ok(d) => d,
             Err(_) => return Vec::new(),
         };
-        let offsets = match monitor::btf_offsets::BpfProgOffsets::from_vmlinux(&vmlinux) {
-            Ok(o) => o,
-            Err(_) => return Vec::new(),
-        };
+        let kernel =
+            match monitor::guest::GuestKernel::from_bytes(&mem, &vmlinux_data, tcr_val, cr3_val) {
+                Ok(k) => k,
+                Err(_) => return Vec::new(),
+            };
+        let offsets =
+            match monitor::btf_offsets::BpfProgOffsets::from_vmlinux_bytes(&vmlinux_data, &vmlinux)
+            {
+                Ok(o) => o,
+                Err(_) => return Vec::new(),
+            };
         let accessor =
             match monitor::bpf_prog::GuestMemProgAccessor::from_guest_kernel(&kernel, &offsets) {
                 Ok(a) => a,
