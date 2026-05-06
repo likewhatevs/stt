@@ -166,7 +166,21 @@ impl<'a> GuestKernel<'a> {
         cr3_pa: u64,
     ) -> Result<Self> {
         let elf = goblin::elf::Elf::parse(data).context("parse vmlinux ELF")?;
+        Self::from_elf(mem, &elf, tcr_el1, cr3_pa)
+    }
 
+    /// Same as [`Self::from_vmlinux_bytes`] but accepts a pre-parsed
+    /// `goblin::elf::Elf`, avoiding a redundant
+    /// `goblin::elf::Elf::parse(data)` when the caller already holds
+    /// one. The `Elf` borrows from the underlying vmlinux bytes; the
+    /// caller must keep those bytes alive for the duration of this
+    /// call.
+    pub fn from_elf(
+        mem: &'a GuestMem,
+        elf: &goblin::elf::Elf<'_>,
+        tcr_el1: u64,
+        cr3_pa: u64,
+    ) -> Result<Self> {
         // Filter on `st_shndx == SHN_UNDEF` (== 0 per ELF spec)
         // rather than `st_value == 0`. SHN_UNDEF marks linker
         // placeholders and imports — those have no defining section
@@ -202,8 +216,9 @@ impl<'a> GuestKernel<'a> {
             anyhow::anyhow!("could not derive kernel image base from tcr_el1=0x{tcr_el1:x}")
         })?;
 
-        // Resolve paging state reusing the already-read vmlinux bytes.
-        let kern_syms = super::symbols::KernelSymbols::from_vmlinux_bytes(data)?;
+        // Resolve paging state reusing the already-parsed ELF so this
+        // path does not re-run `goblin::elf::Elf::parse(data)`.
+        let kern_syms = super::symbols::KernelSymbols::from_elf(elf)?;
         // `__pgtable_l5_enabled` is set by `__startup_64` BEFORE
         // `phys_base` is randomized (the L5 mode is needed to build
         // the bootstrap page tables themselves), so reading it with

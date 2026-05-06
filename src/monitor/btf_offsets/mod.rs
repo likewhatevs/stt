@@ -109,6 +109,33 @@ pub(crate) fn load_btf_from_path(path: &Path) -> Result<Btf> {
 /// `path` is used only for sidecar caching and diagnostics — the
 /// bytes are not re-read from disk.
 pub(crate) fn load_btf_from_bytes(data: &[u8], path: &Path) -> Result<Btf> {
+    load_btf_from_bytes_inner(data, None, path)
+}
+
+/// Same as [`load_btf_from_bytes`] but accepts a pre-parsed
+/// `goblin::elf::Elf` so the ELF-fallback path does not re-run
+/// `goblin::elf::Elf::parse(data)`. The caller MUST supply an `elf`
+/// produced from the same `data` slice; mismatching `elf`/`data`
+/// would walk a stale section table against fresh bytes.
+///
+/// On the raw-BTF and sidecar-cache hit fast paths, the supplied
+/// `elf` is unused (those paths skip ELF traversal entirely). The
+/// caller should supply `elf` only when it already has one in hand;
+/// callers without one go through [`load_btf_from_bytes`] which will
+/// parse on demand if the fallback fires.
+pub(crate) fn load_btf_from_elf(
+    elf: &goblin::elf::Elf<'_>,
+    data: &[u8],
+    path: &Path,
+) -> Result<Btf> {
+    load_btf_from_bytes_inner(data, Some(elf), path)
+}
+
+fn load_btf_from_bytes_inner(
+    data: &[u8],
+    elf: Option<&goblin::elf::Elf<'_>>,
+    path: &Path,
+) -> Result<Btf> {
     // Raw BTF: first 2 bytes are the 0x9FEB magic. Parse directly;
     // never write a sidecar (would be a byte-for-byte self-copy).
     if is_raw_btf(data) {
@@ -208,17 +235,28 @@ pub(crate) fn load_btf_from_bytes(data: &[u8], path: &Path) -> Result<Btf> {
         );
     }
 
-    // Fallback: parse ELF, extract `.BTF` section bytes.
-    let elf = goblin::elf::Elf::parse(data).map_err(|_| {
-        anyhow::anyhow!(
-            "{}: not recognized as raw BTF (missing 0x9FEB magic) or ELF vmlinux",
-            path.display()
-        )
-    })?;
-    let btf_shdr = elf
+    // Fallback: extract `.BTF` section bytes from the ELF. Reuse the
+    // caller's pre-parsed `Elf` when supplied; otherwise parse here.
+    // The `parsed_elf` local owns the parse output on the
+    // owning-parse branch so the borrow handed to the lookup below
+    // outlives every reference into it.
+    let parsed_elf;
+    let elf_ref = match elf {
+        Some(e) => e,
+        None => {
+            parsed_elf = goblin::elf::Elf::parse(data).map_err(|_| {
+                anyhow::anyhow!(
+                    "{}: not recognized as raw BTF (missing 0x9FEB magic) or ELF vmlinux",
+                    path.display()
+                )
+            })?;
+            &parsed_elf
+        }
+    };
+    let btf_shdr = elf_ref
         .section_headers
         .iter()
-        .find(|shdr| elf.shdr_strtab.get_at(shdr.sh_name) == Some(".BTF"));
+        .find(|shdr| elf_ref.shdr_strtab.get_at(shdr.sh_name) == Some(".BTF"));
     let shdr = match btf_shdr {
         Some(s) => s,
         None => bail!("vmlinux ELF has no .BTF section"),
@@ -1163,6 +1201,17 @@ impl BpfProgOffsets {
     /// diagnostic messages — the bytes are not re-read from disk.
     pub fn from_vmlinux_bytes(data: &[u8], path: &Path) -> Result<Self> {
         let btf = load_btf_from_bytes(data, path)?;
+        Self::from_btf(&btf)
+    }
+
+    /// Same as [`Self::from_vmlinux_bytes`] but accepts a pre-parsed
+    /// `goblin::elf::Elf`. When the BTF sidecar is fresh (the common
+    /// case), the sidecar fast path returns without touching the
+    /// ELF; on a cache miss the supplied `elf` is reused so the
+    /// `.BTF`-section extraction does not re-run
+    /// `goblin::elf::Elf::parse(data)`.
+    pub fn from_elf(elf: &goblin::elf::Elf<'_>, data: &[u8], path: &Path) -> Result<Self> {
+        let btf = load_btf_from_elf(elf, data, path)?;
         Self::from_btf(&btf)
     }
 }

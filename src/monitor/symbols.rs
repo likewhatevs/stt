@@ -296,7 +296,16 @@ impl KernelSymbols {
     /// ELF bytes, avoiding a redundant `std::fs::read`.
     pub fn from_vmlinux_bytes(data: &[u8]) -> Result<Self> {
         let elf = goblin::elf::Elf::parse(data).context("parse vmlinux ELF")?;
+        Self::from_elf(&elf)
+    }
 
+    /// Same as [`Self::from_vmlinux_bytes`] but accepts a pre-parsed
+    /// `goblin::elf::Elf`, avoiding a redundant ELF parse when the
+    /// caller already holds one. The `Elf` borrows from the underlying
+    /// vmlinux bytes; the caller must keep those bytes alive for the
+    /// duration of this call but no longer — the returned
+    /// `KernelSymbols` carries owned `u64` values only.
+    pub fn from_elf(elf: &goblin::elf::Elf) -> Result<Self> {
         // SHN_UNDEF = 0 (ELF spec): undefined symbols (linker
         // placeholders) carry st_shndx == 0 and must be skipped
         // here. We DO NOT filter `st_value != 0` because the cached-

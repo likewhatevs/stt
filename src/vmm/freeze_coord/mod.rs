@@ -7148,13 +7148,29 @@ impl KtstrVm {
             Ok(d) => d,
             Err(_) => return Vec::new(),
         };
+        // Parse the vmlinux ELF once and share the result between
+        // `GuestKernel` (kernel symbols + paging state) and
+        // `BpfProgOffsets` (BTF section extraction on cache miss).
+        // The previous structure parsed the ELF up to three times per
+        // call: once inside `GuestKernel::from_vmlinux_bytes`, once
+        // again via the nested `KernelSymbols::from_vmlinux_bytes`,
+        // and once more via `load_btf_from_bytes` on a sidecar miss.
+        // `goblin::elf::Elf::parse` is hundreds of ms on a debug
+        // vmlinux, so this single parse is the cheap shared base.
+        let elf = match goblin::elf::Elf::parse(&vmlinux_data) {
+            Ok(e) => e,
+            Err(_) => return Vec::new(),
+        };
         let kernel =
-            match monitor::guest::GuestKernel::from_vmlinux_bytes(&mem, &vmlinux_data, tcr_val, cr3_val) {
+            match monitor::guest::GuestKernel::from_elf(&mem, &elf, tcr_val, cr3_val) {
                 Ok(k) => k,
                 Err(_) => return Vec::new(),
             };
+        // BTF sidecar cache hits skip ELF traversal entirely; on a
+        // miss `load_btf_from_elf` reuses the parse above instead of
+        // re-running `goblin::elf::Elf::parse(&vmlinux_data)`.
         let offsets =
-            match monitor::btf_offsets::BpfProgOffsets::from_vmlinux_bytes(&vmlinux_data, &vmlinux)
+            match monitor::btf_offsets::BpfProgOffsets::from_elf(&elf, &vmlinux_data, &vmlinux)
             {
                 Ok(o) => o,
                 Err(_) => return Vec::new(),
