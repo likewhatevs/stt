@@ -436,7 +436,7 @@ pub trait BpfProgAccessor {
 /// reads. PTE-walks a frozen guest's `prog_idr` to enumerate loaded
 /// programs and reads `bpf_prog_stats` per-CPU slots inline.
 pub struct GuestMemProgAccessor<'a> {
-    kernel: &'a super::guest::GuestKernel<'a>,
+    kernel: &'a super::guest::GuestKernel,
     prog_idr_kva: u64,
     /// Borrowed from the caller. Mirrors the
     /// [`super::bpf_map::GuestMemMapAccessor`] pattern:
@@ -453,7 +453,7 @@ impl<'a> GuestMemProgAccessor<'a> {
     /// for its lifetime — build `offsets` once via
     /// [`BpfProgOffsets::from_vmlinux`] and reuse across calls.
     pub fn from_guest_kernel(
-        kernel: &'a super::guest::GuestKernel<'a>,
+        kernel: &'a super::guest::GuestKernel,
         offsets: &'a BpfProgOffsets,
     ) -> anyhow::Result<Self> {
         let prog_idr_kva = kernel
@@ -513,13 +513,13 @@ impl BpfProgAccessor for GuestMemProgAccessor<'_> {
 /// across the run, and borrow [`Self::as_accessor`] for each
 /// read. Owning the offsets here keeps the BTF parse to once per
 /// VM run rather than once per dump.
-pub struct GuestMemProgAccessorOwned<'a> {
-    kernel: super::guest::GuestKernel<'a>,
+pub struct GuestMemProgAccessorOwned {
+    kernel: super::guest::GuestKernel,
     prog_idr_kva: u64,
     offsets: BpfProgOffsets,
 }
 
-impl<'a> GuestMemProgAccessorOwned<'a> {
+impl GuestMemProgAccessorOwned {
     /// One-shot constructor: builds a [`super::guest::GuestKernel`]
     /// from `vmlinux`, parses BTF to resolve the BPF-program-related
     /// struct offsets, and resolves the `prog_idr` symbol KVA. The
@@ -531,7 +531,7 @@ impl<'a> GuestMemProgAccessorOwned<'a> {
     /// `GuestKernel` handshake fails (still-booting guest), or
     /// when `prog_idr` is missing from the symbol table.
     pub fn new(
-        mem: &'a super::reader::GuestMem,
+        mem: std::sync::Arc<super::reader::GuestMem>,
         vmlinux: &std::path::Path,
         tcr_el1: u64,
         cr3_pa: u64,
@@ -577,7 +577,7 @@ impl<'a> GuestMemProgAccessorOwned<'a> {
     /// outside the prog-discovery surface (e.g. resolving
     /// `__per_cpu_offset` for `struct_ops_runtime_stats`).
     #[allow(dead_code)]
-    pub fn guest_kernel(&self) -> &super::guest::GuestKernel<'a> {
+    pub fn guest_kernel(&self) -> &super::guest::GuestKernel {
         &self.kernel
     }
 }

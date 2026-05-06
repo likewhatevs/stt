@@ -258,7 +258,7 @@ pub struct ScxSchedState {
 /// nothing.
 #[allow(dead_code)]
 pub fn walk_rq_scx(
-    kernel: &GuestKernel<'_>,
+    kernel: &GuestKernel,
     cpu: u32,
     rq_kva: u64,
     rq_pa: u64,
@@ -368,7 +368,7 @@ pub fn walk_rq_scx(
 /// failure.
 #[allow(dead_code)]
 pub fn read_scx_sched_state(
-    kernel: &GuestKernel<'_>,
+    kernel: &GuestKernel,
     scx_root_kva: u64,
     offsets: &ScxWalkerOffsets,
 ) -> Option<(u64, ScxSchedState)> {
@@ -523,7 +523,7 @@ const SCX_TASK_CURSOR: u32 = 1 << 31;
 /// chain.
 #[allow(dead_code)]
 pub fn walk_scx_tasks_global(
-    kernel: &GuestKernel<'_>,
+    kernel: &GuestKernel,
     scx_tasks_kva: u64,
     tasks_node_off_in_task: usize,
     tasks_node_off_in_see: usize,
@@ -661,7 +661,7 @@ pub fn walk_scx_tasks_global(
 /// is the same gating condition that blinds every other DSQ pass.
 #[allow(dead_code)]
 pub fn walk_local_dsqs(
-    kernel: &GuestKernel<'_>,
+    kernel: &GuestKernel,
     rq_kvas: &[u64],
     rq_pas: &[u64],
     per_cpu_offsets: &[u64],
@@ -798,7 +798,7 @@ pub fn walk_local_dsqs(
 /// the result without affecting the others.
 #[allow(dead_code)]
 pub fn walk_dsqs(
-    kernel: &GuestKernel<'_>,
+    kernel: &GuestKernel,
     sched_pa: u64,
     per_cpu_offsets: &[u64],
     nr_nodes: u32,
@@ -1931,7 +1931,7 @@ mod tests {
         buf[0..8].copy_from_slice(&0xdead_beef_u64.to_le_bytes());
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
         let kernel = crate::monitor::guest::GuestKernel::new_for_test(
-            &mem,
+            std::sync::Arc::new(mem),
             std::collections::HashMap::new(),
             0,
             0,
@@ -1961,7 +1961,7 @@ mod tests {
         buf[head_pa..head_pa + 8].copy_from_slice(&head_kva.to_le_bytes());
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
         let kernel = crate::monitor::guest::GuestKernel::new_for_test(
-            &mem,
+            std::sync::Arc::new(mem),
             std::collections::HashMap::new(),
             0, // page_offset = 0; kva_to_pa identity
             0,
@@ -2017,7 +2017,7 @@ mod tests {
 
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
         let kernel = crate::monitor::guest::GuestKernel::new_for_test(
-            &mem,
+            std::sync::Arc::new(mem),
             std::collections::HashMap::new(),
             0,
             0,
@@ -2051,7 +2051,7 @@ mod tests {
         let mut buf = vec![0u8; 0x1000];
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
         let kernel = crate::monitor::guest::GuestKernel::new_for_test(
-            &mem,
+            std::sync::Arc::new(mem),
             std::collections::HashMap::new(),
             0,
             0,
@@ -2097,7 +2097,7 @@ mod tests {
         buf[rq_pa as usize..rq_pa as usize + 8].copy_from_slice(&rq_kva.to_le_bytes());
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
         let kernel = crate::monitor::guest::GuestKernel::new_for_test(
-            &mem,
+            std::sync::Arc::new(mem),
             std::collections::HashMap::new(),
             0,
             0,
@@ -2199,7 +2199,7 @@ mod tests {
 
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
         let kernel = crate::monitor::guest::GuestKernel::new_for_test(
-            &mem,
+            std::sync::Arc::new(mem),
             std::collections::HashMap::new(),
             0,
             0,
@@ -2341,7 +2341,7 @@ mod tests {
 
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
         let kernel = super::super::guest::GuestKernel::new_for_test(
-            &mem,
+            std::sync::Arc::new(mem),
             std::collections::HashMap::new(),
             0,
             0,
@@ -2376,7 +2376,7 @@ mod tests {
             .copy_from_slice(&0xdead_beef_dead_beef_u64.to_le_bytes());
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
         let kernel = super::super::guest::GuestKernel::new_for_test(
-            &mem,
+            std::sync::Arc::new(mem),
             std::collections::HashMap::new(),
             0,
             0,
@@ -2457,7 +2457,7 @@ mod tests {
 
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
         let kernel = super::super::guest::GuestKernel::new_for_test(
-            &mem,
+            std::sync::Arc::new(mem),
             std::collections::HashMap::new(),
             PAGE_OFFSET,
             0,
@@ -2527,7 +2527,7 @@ mod tests {
 
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
         let kernel = super::super::guest::GuestKernel::new_for_test(
-            &mem,
+            std::sync::Arc::new(mem),
             std::collections::HashMap::new(),
             0,
             0,
@@ -2598,7 +2598,7 @@ mod tests {
 
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
         let kernel = super::super::guest::GuestKernel::new_for_test(
-            &mem,
+            std::sync::Arc::new(mem),
             std::collections::HashMap::new(),
             0,
             0,
@@ -2668,7 +2668,7 @@ mod tests {
 
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
         let kernel = super::super::guest::GuestKernel::new_for_test(
-            &mem,
+            std::sync::Arc::new(mem),
             std::collections::HashMap::new(),
             0,
             0,
@@ -2712,7 +2712,7 @@ mod tests {
         buf[0..8].copy_from_slice(&0xdead_beef_u64.to_le_bytes());
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
         let kernel = super::super::guest::GuestKernel::new_for_test(
-            &mem,
+            std::sync::Arc::new(mem),
             std::collections::HashMap::new(),
             0,
             0,
@@ -2744,7 +2744,7 @@ mod tests {
 
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
         let kernel = super::super::guest::GuestKernel::new_for_test(
-            &mem,
+            std::sync::Arc::new(mem),
             std::collections::HashMap::new(),
             0,
             0,
@@ -2787,7 +2787,7 @@ mod tests {
 
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
         let kernel = super::super::guest::GuestKernel::new_for_test(
-            &mem,
+            std::sync::Arc::new(mem),
             std::collections::HashMap::new(),
             0,
             0,
@@ -2827,7 +2827,7 @@ mod tests {
 
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
         let kernel = super::super::guest::GuestKernel::new_for_test(
-            &mem,
+            std::sync::Arc::new(mem),
             std::collections::HashMap::new(),
             0,
             0,

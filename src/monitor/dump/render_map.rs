@@ -162,7 +162,7 @@ pub(super) fn build_arena_page_index(
 /// [`ArenaPageIndex`] — all three outlive the per-map render they
 /// parameterize.
 struct AccessorMemReader<'a> {
-    kernel: &'a super::super::guest::GuestKernel<'a>,
+    kernel: &'a super::super::guest::GuestKernel,
     /// Pre-pass snapshot from [`super::dump_state`]. `Some` when an
     /// arena map exists in the report; `is_arena_addr` and
     /// `read_arena` delegate to its

@@ -1233,7 +1233,7 @@ pub trait BpfMapAccessor {
 ///
 /// [`GuestKernel`]: super::guest::GuestKernel
 pub struct GuestMemMapAccessor<'a> {
-    kernel: &'a super::guest::GuestKernel<'a>,
+    kernel: &'a super::guest::GuestKernel,
     map_idr_kva: u64,
     /// Borrowed from the `GuestMemMapAccessorOwned` that produced this
     /// accessor via `as_accessor`, or provided by the caller to
@@ -1339,7 +1339,7 @@ impl<'a> GuestMemMapAccessor<'a> {
     ///
     /// [`GuestKernel`]: super::guest::GuestKernel
     pub fn from_guest_kernel(
-        kernel: &'a super::guest::GuestKernel<'a>,
+        kernel: &'a super::guest::GuestKernel,
         offsets: &'a BpfMapOffsets,
     ) -> anyhow::Result<Self> {
         let map_idr_kva = kernel
@@ -1371,7 +1371,7 @@ impl<'a> GuestMemMapAccessor<'a> {
     /// `find_all_bpf_maps`.
     #[cfg(test)]
     pub(crate) fn new_for_test(
-        kernel: &'a super::guest::GuestKernel<'a>,
+        kernel: &'a super::guest::GuestKernel,
         offsets: &'a BpfMapOffsets,
         map_idr_kva: u64,
     ) -> Self {
@@ -1410,7 +1410,7 @@ impl<'a> GuestMemMapAccessor<'a> {
     /// that need direct access to symbol resolution / page-walk
     /// primitives outside the map-discovery surface (e.g. arena page
     /// enumeration in [`super::arena`], sdt_alloc tree walks).
-    pub fn kernel(&self) -> &'a super::guest::GuestKernel<'a> {
+    pub fn kernel(&self) -> &'a super::guest::GuestKernel {
         self.kernel
     }
 
@@ -1598,8 +1598,8 @@ impl BpfMapAccessor for GuestMemMapAccessor<'_> {
 /// [`as_accessor`](Self::as_accessor) for map operations.
 ///
 /// [`GuestKernel`]: super::guest::GuestKernel
-pub struct GuestMemMapAccessorOwned<'a> {
-    kernel: super::guest::GuestKernel<'a>,
+pub struct GuestMemMapAccessorOwned {
+    kernel: super::guest::GuestKernel,
     map_idr_kva: u64,
     offsets: BpfMapOffsets,
     /// Single-shot `__per_cpu_offset[]` cache keyed on the
@@ -1609,7 +1609,7 @@ pub struct GuestMemMapAccessorOwned<'a> {
 }
 
 #[allow(dead_code)]
-impl<'a> GuestMemMapAccessorOwned<'a> {
+impl GuestMemMapAccessorOwned {
     /// Create from GuestMem and vmlinux path.
     ///
     /// One-shot constructor: builds a [`GuestKernel`] from `vmlinux`,
@@ -1627,7 +1627,7 @@ impl<'a> GuestMemMapAccessorOwned<'a> {
     ///
     /// [`GuestKernel`]: super::guest::GuestKernel
     pub fn new(
-        mem: &'a GuestMem,
+        mem: std::sync::Arc<GuestMem>,
         vmlinux: &std::path::Path,
         tcr_el1: u64,
         cr3_pa: u64,
@@ -1664,7 +1664,7 @@ impl<'a> GuestMemMapAccessorOwned<'a> {
     /// Avoids re-reading + re-parsing vmlinux on every retry in
     /// the freeze coordinator's BPF map write loop.
     pub fn from_elf(
-        mem: &'a GuestMem,
+        mem: std::sync::Arc<GuestMem>,
         elf: &goblin::elf::Elf<'_>,
         data: &[u8],
         vmlinux: &std::path::Path,
@@ -1709,7 +1709,7 @@ impl<'a> GuestMemMapAccessorOwned<'a> {
     /// Access the underlying [`GuestKernel`] for low-level memory reads.
     ///
     /// [`GuestKernel`]: super::guest::GuestKernel
-    pub fn guest_kernel(&self) -> &super::guest::GuestKernel<'a> {
+    pub fn guest_kernel(&self) -> &super::guest::GuestKernel {
         &self.kernel
     }
 

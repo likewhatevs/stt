@@ -478,6 +478,13 @@ pub(crate) struct VmRunState {
     /// falls back to `0`, which produces correct translations on
     /// non-KASLR boots.
     pub(crate) cr3: Arc<std::sync::atomic::AtomicU64>,
+    /// Cached vmlinux bytes for collect_verifier_stats. Avoids
+    /// re-reading from disk (14-28s on cold cache).
+    pub(crate) vmlinux_data: Option<Arc<Vec<u8>>>,
+    /// Pre-built prog accessor from the accessor-init worker.
+    /// When present, `collect_verifier_stats` skips the ~4s
+    /// ELF/BTF parse and uses this directly.
+    pub(crate) prog_accessor: Option<crate::monitor::bpf_prog::GuestMemProgAccessorOwned>,
     /// Virtio-console device shared with vCPU threads. Carries the
     /// port-1 (`/dev/vport0p1`) bulk TLV stream from guest to host;
     /// `collect_results` calls `drain_bulk()` after the run to feed

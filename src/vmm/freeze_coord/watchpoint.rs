@@ -102,7 +102,7 @@ pub(super) fn republish_watchpoint_on_rebind(
     last_sched_kva: u64,
     exit_kind_offset: u32,
     watchpoint: &Arc<WatchpointArm>,
-    kernel: &monitor::guest::GuestKernel<'_>,
+    kernel: &monitor::guest::GuestKernel,
     mem: &monitor::reader::GuestMem,
 ) -> WatchpointPublishResult {
     if sched_kva == last_sched_kva {

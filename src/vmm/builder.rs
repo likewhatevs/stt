@@ -112,6 +112,19 @@ pub struct KtstrVmBuilder {
     /// branches in `init_virtio_blk`. `None` is the production
     /// default.
     template_staging_image: Option<PathBuf>,
+    /// Workload time budget (the test's `duration`), distinct from
+    /// the outer kill `timeout`. When set, the host-side watchdog
+    /// resets its hard deadline to `now + workload_duration` the
+    /// first time the host monitor observes `*scx_root` transition
+    /// from null to non-null in guest memory — i.e. the moment a
+    /// scheduler attaches and the workload's clock should start.
+    /// The reset is bounded above by the original `timeout`-derived
+    /// deadline (the watchdog uses `min(reset, original)`), so a
+    /// late-attaching scheduler cannot extend past the outer kill
+    /// timer. `None` (the default) disables the reset and the
+    /// watchdog uses `timeout` as a single deadline counted from
+    /// VM boot.
+    workload_duration: Option<Duration>,
 }
 
 impl Default for KtstrVmBuilder {
@@ -152,6 +165,7 @@ impl Default for KtstrVmBuilder {
             failure_dump_path: None,
             dual_snapshot: false,
             template_staging_image: None,
+            workload_duration: None,
         }
     }
 }
@@ -281,6 +295,20 @@ impl KtstrVmBuilder {
     /// returned will have `timed_out = true`.
     pub fn timeout(mut self, t: Duration) -> Self {
         self.timeout = t;
+        self
+    }
+
+    /// Workload time budget (the test's `duration`). When set, the
+    /// host-side watchdog resets its hard deadline to
+    /// `now + workload_duration` the first time the monitor
+    /// observes `*scx_root` transition from null to non-null —
+    /// i.e. the moment a scheduler attaches and the workload's
+    /// clock should start. The reset is bounded above by the
+    /// original `timeout`-derived deadline, so a late-attaching
+    /// scheduler cannot extend past the outer kill timer. `None`
+    /// (the default) disables the reset.
+    pub fn workload_duration(mut self, d: Duration) -> Self {
+        self.workload_duration = Some(d);
         self
     }
 
@@ -726,15 +754,19 @@ impl KtstrVmBuilder {
             cached_host_topo = Some(host_topo);
             (Some(plan), node_map, None)
         } else {
-            // Default else: no perf-mode and no no-perf-mode. The
-            // legacy path acquired a per-CPU flock window via
-            // `acquire_cpu_locks` for the VM's lifetime; the
-            // deferred-lock contract pushes that into `KtstrVm::run`
-            // so the build-to-run setup window holds no flocks.
-            // Cache `host_topo` so `run()` can pass it to
-            // `acquire_cpu_locks` without re-reading sysfs.
-            cached_host_topo = host_topology::HostTopology::cached().ok();
-            (None, Vec::new(), None)
+            // Default else: 1:1 vCPU→host CPU pin like perf-mode,
+            // but with LOCK_SH (shared) so multiple VMs can overlap.
+            // Topology-aware: assigns within LLC groups for cache
+            // coherence. No service CPU reservation.
+            if let Ok(host_topo) = host_topology::HostTopology::cached() {
+                let mut plan = host_topo.compute_pinning(&self.topology, false, 0)?;
+                drop(std::mem::take(&mut plan.locks));
+                cached_host_topo = Some(host_topo);
+                (Some(plan), Vec::new(), None)
+            } else {
+                cached_host_topo = None;
+                (None, Vec::new(), None)
+            }
         };
 
         let kernel = self.kernel.context("kernel path required")?;
@@ -801,6 +833,7 @@ impl KtstrVmBuilder {
             failure_dump_path: self.failure_dump_path,
             dual_snapshot: self.dual_snapshot,
             template_staging_image: self.template_staging_image,
+            workload_duration: self.workload_duration,
         })
     }
 

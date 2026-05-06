@@ -21,7 +21,7 @@ use super::{
     ScxEventCounters,
 };
 use std::os::unix::io::AsRawFd;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use vmm_sys_util::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use vmm_sys_util::eventfd::EventFd;
@@ -1810,6 +1810,12 @@ pub(crate) struct RqRefresh {
     /// CPU's offset to compute the per-CPU rq KVA, then reduced
     /// to a PA via [`super::symbols::kva_to_pa`].
     pub runqueues_kva: u64,
+    /// Link-time KVA of `__per_cpu_start`. Subtracted from
+    /// `runqueues_kva` to get the section-relative offset.
+    pub per_cpu_start: u64,
+    /// Virtual KASLR offset. Per-CPU offset computation needs this
+    /// to bridge the link-time and runtime `__per_cpu_start`.
+    pub kaslr_offset: u64,
     /// Number of CPUs (entries to read from `__per_cpu_offset[]`).
     pub num_cpus: u32,
     /// PA of the `page_offset_base` symbol (text-mapped). When
@@ -2031,6 +2037,52 @@ pub(crate) struct MonitorConfig<'a> {
     /// the sample loop remains as defense-in-depth against
     /// pre-boot zeros.
     pub sys_rdy: Option<&'a EventFd>,
+    /// Optional scheduler-attach watchdog reset. When `Some`, the
+    /// loop reads `*scx_root` each iteration via
+    /// [`WatchdogReset::scx_root_pa`] and, on the first 0 →
+    /// non-zero transition, stores `(now - run_start +
+    /// workload_duration).as_nanos()` into the shared atomic so
+    /// the host-side VM watchdog can recompute its hard deadline
+    /// from the moment a scheduler attaches instead of from VM
+    /// boot. The value is encoded as nanoseconds since
+    /// `run_start` (passed to `monitor_loop`) so the watchdog
+    /// can decode it as `run_start + Duration::from_nanos(value)`.
+    /// Storing `0` is reserved as the "no reset requested"
+    /// sentinel — the watchdog ignores zero. The reset is
+    /// bounded above by the watchdog's original
+    /// `timeout`-derived deadline at the consumer side, so a
+    /// late attach cannot extend past the outer kill timer.
+    /// `None` (test path or kernels with no `scx_root` symbol)
+    /// disables attach detection.
+    pub watchdog_reset: Option<WatchdogReset<'a>>,
+}
+
+/// Inputs the monitor needs to push a watchdog-reset deadline when
+/// a scheduler attaches.
+///
+/// All three fields move together — none of them are useful alone —
+/// so they're bundled to keep [`MonitorConfig`] flat. Construction
+/// is owned by [`crate::vmm::freeze_coord`] inside `start_monitor`,
+/// where `scx_root_pa` is the text-mapped PA of the kernel's
+/// `scx_root` global, `workload_duration` flows from
+/// [`crate::vmm::KtstrVm::workload_duration`] (which mirrors the
+/// test entry's `duration`), and `reset_ns` is shared with the
+/// watchdog thread.
+pub(crate) struct WatchdogReset<'a> {
+    /// PA of the `scx_root` global pointer (text mapping). The
+    /// loop reads `mem.read_u64(scx_root_pa, 0)` each iteration
+    /// and detects the 0 → non-zero edge.
+    pub scx_root_pa: u64,
+    /// Workload time budget the watchdog should reset to. Encoded
+    /// as nanoseconds since `run_start` (added to `Instant::now()
+    /// - run_start` at attach time and stored into [`reset_ns`]).
+    pub workload_duration: Duration,
+    /// Shared atomic written once on the first scheduler-attach
+    /// observation. The watchdog thread reads this each tick and,
+    /// when non-zero, uses `run_start +
+    /// Duration::from_nanos(value)` as its hard deadline (capped
+    /// at the original `timeout`-derived deadline).
+    pub reset_ns: &'a AtomicU64,
 }
 
 /// Run the monitor loop, sampling all CPUs at the given interval
@@ -2185,6 +2237,18 @@ pub(crate) fn monitor_loop(
         .unwrap_or_default();
     let shm_entries: Vec<crate::vmm::wire::ShmEntry> = Vec::new();
     let mut watchdog_observation: Option<super::WatchdogObservation> = None;
+    // Once-only latch for the scheduler-attach watchdog reset.
+    // The first time the loop observes `*scx_root != 0` (a
+    // scheduler attached and the runtime `scx_sched` struct is
+    // live in guest memory), encode `(now - run_start +
+    // workload_duration)` as nanoseconds and store it into
+    // `cfg.watchdog_reset.reset_ns` so the watchdog thread can
+    // recompute its hard deadline from the attach moment rather
+    // than VM boot. `false` means "not yet observed"; flipped to
+    // `true` after a successful store so a later transient
+    // null-read or scheduler reload does not stomp the attach
+    // moment with a fresh `Instant::now()`.
+    let mut watchdog_reset_signaled = false;
 
     // Cadence + wake plumbing. `tick_tfd` is a periodic
     // `CLOCK_MONOTONIC` timerfd that fires every `interval` so the
@@ -2409,6 +2473,47 @@ pub(crate) fn monitor_loop(
                 page_offset_resolved = true;
             }
         }
+        // Scheduler-attach watchdog reset. Read `*scx_root` and,
+        // on the first 0 → non-zero transition, store the encoded
+        // attach-moment deadline so the watchdog thread can
+        // recompute its hard deadline from the attach moment
+        // (instead of from VM boot, which wastes the budget on
+        // boot + BPF verifier time). Runs each iteration until
+        // the latch fires; the read itself is cheap (one bounded
+        // [`GuestMem::read_u64`]) and `scx_root_pa` is text-mapped
+        // so the read is valid throughout the run regardless of
+        // the per-iteration `data_valid` gate above. Fires
+        // independently of `watchdog_override`: a kernel without
+        // a resolvable `scx_sched.watchdog_timeout` BTF field
+        // still gets a correct outer kill timer.
+        if !watchdog_reset_signaled
+            && let Some(reset) = cfg.watchdog_reset.as_ref()
+        {
+            let scx_sched_kva = mem.read_u64(reset.scx_root_pa, 0);
+            if scx_sched_kva != 0 {
+                // Encode as ns since `run_start` so the watchdog
+                // thread can decode via `run_start +
+                // Duration::from_nanos(value)`. Saturate to
+                // u64::MAX on overflow rather than wrapping —
+                // the watchdog caps at the original
+                // `hard_deadline` anyway, so a saturated value
+                // just lets the original ceiling win, which is
+                // the correct fallback. `0` is the "no reset
+                // requested" sentinel; ensure a genuine attach
+                // observation never collides with it by clamping
+                // to a minimum of 1 ns (workload_duration is
+                // conventionally >= 1 ms so this branch
+                // effectively never fires, but the sentinel
+                // guarantee is independent of policy).
+                let elapsed = run_start.elapsed();
+                let target_ns = elapsed
+                    .as_nanos()
+                    .saturating_add(reset.workload_duration.as_nanos());
+                let encoded = u64::try_from(target_ns).unwrap_or(u64::MAX).max(1);
+                reset.reset_ns.store(encoded, Ordering::Release);
+                watchdog_reset_signaled = true;
+            }
+        }
         if let Some(wd) = watchdog_override {
             let (write_pa, write_offset, wd_jiffies) = match wd {
                 WatchdogOverride::ScxSched {
@@ -2482,7 +2587,7 @@ pub(crate) fn monitor_loop(
                     fresh.first().copied().unwrap_or(0),
                 );
             }
-            rq_pas_buf = super::symbols::compute_rq_pas(refresh.runqueues_kva, &fresh, page_offset);
+            rq_pas_buf = super::symbols::compute_rq_pas(refresh.runqueues_kva, &fresh, page_offset, refresh.per_cpu_start, refresh.kaslr_offset);
             // `event_pcpu_pas` requires both fresh `__per_cpu_offset[]`
             // AND a non-null `*scx_root` (a scheduler must be
             // attached). Until the scheduler attaches, `scx_sched_kva`
@@ -2737,29 +2842,52 @@ pub(crate) fn monitor_loop(
     // by re-reading the same PAs the early-window diag covered.
     if let Some(refresh) = rq_refresh {
         let fresh = super::symbols::read_per_cpu_offsets(mem, refresh.pco_pa, refresh.num_cpus);
-        let mut pob_bytes = [0u8; 16];
-        let mut pco_bytes = [0u8; 16];
-        let pob_pa: u64 = 0x0279e220;
-        let _ = mem.read_bytes(pob_pa, &mut pob_bytes);
-        let _ = mem.read_bytes(refresh.pco_pa, &mut pco_bytes);
-        eprintln!(
-            "FINAL DIAG iters={} pco0={:#x} pco1={:#x} pob={:02x?} pco={:02x?}",
-            diag_iter,
-            fresh.first().copied().unwrap_or(0),
-            fresh.get(1).copied().unwrap_or(0),
-            pob_bytes,
-            pco_bytes,
-        );
         let valid_samples = samples
             .iter()
             .filter(|s| s.cpus.iter().any(|c| c.rq_clock > 0))
             .count();
+        let pob_pa_live = refresh.page_offset_base_pa.unwrap_or(0);
+        let pob_val = if pob_pa_live != 0 {
+            mem.read_u64(pob_pa_live, 0)
+        } else {
+            0
+        };
         eprintln!(
-            "FINAL: iters={} samples={} valid_samples={}",
-            diag_iter,
-            samples.len(),
-            valid_samples,
+            "FINAL DIAG iters={iters} samples={samples} valid={valid} data_valid={dv} \
+             page_offset={po:#x} phys_base={pb:#x} start_kernel_map={skm:#x} \
+             pco_pa={pco_pa:#x} pob_pa={pob_pa:#x} pob_val={pob_val:#x} \
+             pco0={pco0:#x} pco1={pco1:#x} runqueues_kva={rq:#x} \
+             mem_size={ms:#x} rq_pa0={rq0:#x} kaslr_off={ko:#x}",
+            iters = diag_iter,
+            samples = samples.len(),
+            valid = valid_samples,
+            dv = data_valid,
+            po = page_offset,
+            pb = phys_base,
+            skm = cfg.start_kernel_map,
+            pco_pa = refresh.pco_pa,
+            pob_pa = pob_pa_live,
+            pob_val = pob_val,
+            pco0 = fresh.first().copied().unwrap_or(0),
+            pco1 = fresh.get(1).copied().unwrap_or(0),
+            rq = refresh.runqueues_kva,
+            ms = mem.size(),
+            ko = refresh.kaslr_offset,
+            rq0 = rq_pas_buf.first().copied().unwrap_or(0),
         );
+        if let Some(&rq0_pa) = rq_pas_buf.first() {
+            let raw_clock = mem.read_u64(rq0_pa, offsets.rq_clock);
+            let raw_nr_running = mem.read_u32(rq0_pa, offsets.rq_nr_running);
+            // Sanity: read first 8 bytes at rq0_pa (should be nr_running if offset 0 is correct)
+            let raw_first_8 = mem.read_u64(rq0_pa, 0);
+            // Read pco_pa itself to verify __per_cpu_offset[0] value
+            let pco0_verify = mem.read_u64(refresh.pco_pa, 0);
+            eprintln!(
+                "FINAL DIAG rq0: clock_off={} nr_off={} raw_clock={raw_clock} raw_nr={raw_nr_running} \
+                 raw_first_8={raw_first_8:#x} pco0_verify={pco0_verify:#x} rq0_pa={rq0_pa:#x} pco_pa={:#x}",
+                offsets.rq_clock, offsets.rq_nr_running, refresh.pco_pa,
+            );
+        }
     }
     let shm_result = crate::vmm::host_comms::BulkDrainResult {
         entries: shm_entries,
@@ -2877,6 +3005,7 @@ mod tests {
             phys_base: 0,
             rq_refresh: None,
             sys_rdy: None,
+            watchdog_reset: None,
         }
     }
 

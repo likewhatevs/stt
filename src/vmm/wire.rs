@@ -394,6 +394,17 @@ pub const MSG_TYPE_SCHED_LOG: u32 = 0x5343_4c47; // "SCLG"
 /// `SCHEDULER_NOT_ATTACHED` sentinel strings.
 pub const MSG_TYPE_LIFECYCLE: u32 = 0x4c49_4645; // "LIFE"
 
+/// Guest→host kernel address parameters (payload: 16 bytes LE).
+///
+/// Sent BEFORE `MSG_TYPE_SYS_RDY` so the monitor has `phys_base`
+/// and `page_offset_base` before its first sample iteration.
+/// Payload layout: `[phys_base: u64 LE, page_offset_base: u64 LE]`.
+/// The guest reads these from `/proc/kallsyms` after
+/// `mount_filesystems` — by that point `__startup_64` and
+/// `kernel_randomize_memory` have both run, so the values are
+/// final regardless of KASLR configuration.
+pub const MSG_TYPE_KERN_ADDRS: u32 = 0x4b41_4452; // "KADR"
+
 /// Guest→host shell-exec exit code (payload: 4-byte LE i32).
 ///
 /// Replaces the prior COM2 `KTSTR_EXEC_EXIT=N` sentinel line

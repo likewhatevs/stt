@@ -67,6 +67,9 @@ pub(super) struct BulkDispatchSinks<'a> {
     /// never reach this Vec — [`decode_snapshot_request`] returns
     /// `None` and the entry is dropped without observable side effect.
     pub snapshot_requests_pending: &'a mut Vec<SnapshotRequest>,
+    /// Guest-reported `phys_base + 1`. Stored by the KERN_ADDRS arm
+    /// so the monitor thread can pick it up via Acquire load.
+    pub kern_phys_base: &'a Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Classify and dispatch a single [`BulkMessage`] from the port-1
@@ -176,11 +179,22 @@ pub(super) fn dispatch_bulk_message(
                      pre-sample wait"
                 );
             }
-            // SysRdy is coordinator-internal — do NOT bucket. The
-            // classifier
-            // [`crate::vmm::wire::MsgType::is_coordinator_internal`]
-            // is the single source of truth across this dispatch and
-            // `collect_results`'s post-run drain.
+            // SysRdy is coordinator-internal — do NOT bucket.
+            None
+        }
+        _ if msg.msg_type == crate::vmm::wire::MSG_TYPE_KERN_ADDRS => {
+            // Payload carries phys_base + 1 (biased to avoid
+            // the 0 sentinel). Subtract 1 to recover.
+            if msg.crc_ok && msg.payload.len() >= 8 {
+                let biased = u64::from_le_bytes(
+                    msg.payload[..8].try_into().unwrap_or([0; 8]),
+                );
+                if biased != 0 {
+                    sinks
+                        .kern_phys_base
+                        .store(biased, std::sync::atomic::Ordering::Release);
+                }
+            }
             None
         }
         Some(crate::vmm::wire::MsgType::SnapshotRequest) => {

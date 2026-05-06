@@ -301,7 +301,7 @@ pub struct ArenaSnapshot {
 /// `vm_struct` itself yields an empty snapshot rather than an error,
 /// so a corrupt arena can't break the broader failure dump.
 pub fn snapshot_arena(
-    kernel: &GuestKernel<'_>,
+    kernel: &GuestKernel,
     info: &BpfMapInfo,
     offsets: &BpfArenaOffsets,
 ) -> ArenaSnapshot {

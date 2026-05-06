@@ -242,6 +242,13 @@ pub(crate) struct KernelSymbols {
     /// (CONFIG_64BIT=n on a host that emits only the legacy `jiffies`
     /// alias, or a stripped vmlinux that lost the symbol).
     pub jiffies_64: Option<u64>,
+    /// Link-time KVA of `entry_SYSCALL_64`. Used with MSR_LSTAR
+    /// to compute the virtual KASLR offset on x86_64:
+    /// `kaslr_offset = LSTAR_runtime - entry_SYSCALL_64_link`.
+    /// Link-time KVA of `__per_cpu_start` — the base of the
+    /// `.data..percpu` section. Subtracted from per-CPU symbol KVAs
+    /// to recover section-relative offsets for `compute_rq_pas`.
+    pub per_cpu_start: u64,
     /// `.data..percpu` section-relative offset of the
     /// `kernel_cpustat` per-CPU variable. The per-CPU KVA for CPU
     /// `n` is `kernel_cpustat + __per_cpu_offset[n]`; same percpu-
@@ -358,6 +365,7 @@ impl KernelSymbols {
         let scx_watchdog_timestamp = sym_addr("scx_watchdog_timestamp");
 
         let jiffies_64 = sym_addr("jiffies_64");
+        let per_cpu_start = sym_addr("__per_cpu_start").unwrap_or(0);
 
         // Per-CPU CPU-time / softirq / IRQ / iowait_sleeptime
         // symbols. All three are `.data..percpu` (section-relative
@@ -390,6 +398,7 @@ impl KernelSymbols {
             scx_watchdog_timeout,
             scx_watchdog_timestamp,
             jiffies_64,
+            per_cpu_start,
             kernel_cpustat,
             kstat,
             tick_cpu_sched,
@@ -511,7 +520,11 @@ pub(crate) fn resolve_phys_base(
     // already does this internally for descriptor entries, but the
     // initial CR3 we're handed by KVM SREGS is the raw register
     // value.
-    let cr3_pa_masked = cr3_pa & !0xFFFu64;
+    // Clear PCID bits [11:0] AND PTI user-PGD bit [12]. With
+    // CONFIG_MITIGATION_PAGE_TABLE_ISOLATION, bit 12 selects the
+    // user PGD half (kernel PML4 entries stripped) — walking from
+    // the user PGD for a kernel-half KVA returns None.
+    let cr3_pa_masked = cr3_pa & !0x1FFFu64;
     let pa = mem.translate_kva(cr3_pa_masked, super::Kva(kva), l5, tcr_el1)?;
     Some(mem.read_u64(pa, 0))
 }
@@ -765,10 +778,22 @@ pub(crate) fn compute_rq_pas(
     runqueues_kva: u64,
     per_cpu_offsets: &[u64],
     page_offset: u64,
+    per_cpu_start: u64,
+    kaslr_offset: u64,
 ) -> Vec<u64> {
+    // __per_cpu_offset[cpu] = pcpu_base_addr - __per_cpu_start_RUNTIME.
+    // runqueues section_offset = runqueues_kva - __per_cpu_start_LINK.
+    // __per_cpu_start_RUNTIME = __per_cpu_start_LINK + kaslr_offset.
+    // KVA = section_offset + __per_cpu_offset[cpu] + __per_cpu_start_RUNTIME
+    //     = pcpu_base_addr + section_offset  (KASLR cancels).
+    let section_offset = runqueues_kva.wrapping_sub(per_cpu_start);
+    let runtime_start = per_cpu_start.wrapping_add(kaslr_offset);
     per_cpu_offsets
         .iter()
-        .map(|&offset| kva_to_pa(runqueues_kva.wrapping_add(offset), page_offset))
+        .map(|&offset| {
+            let kva = runtime_start.wrapping_add(section_offset).wrapping_add(offset);
+            kva_to_pa(kva, page_offset)
+        })
         .collect()
 }
 
@@ -813,7 +838,7 @@ mod tests {
         let page_offset = DEFAULT_PAGE_OFFSET;
         let runqueues = page_offset.wrapping_add(0x20_0000);
         let offsets = vec![0, 0x4_0000]; // CPU 0 at base, CPU 1 at +256KB
-        let pas = compute_rq_pas(runqueues, &offsets, page_offset);
+        let pas = compute_rq_pas(runqueues, &offsets, page_offset, 0);
         assert_eq!(pas[0], 0x20_0000);
         assert_eq!(pas[1], 0x24_0000);
     }
@@ -1058,7 +1083,7 @@ mod tests {
     fn compute_rq_pas_empty_offsets() {
         let page_offset = DEFAULT_PAGE_OFFSET;
         let runqueues = page_offset.wrapping_add(0x20_0000);
-        let pas = compute_rq_pas(runqueues, &[], page_offset);
+        let pas = compute_rq_pas(runqueues, &[], page_offset, 0);
         assert!(pas.is_empty());
     }
 
@@ -1066,7 +1091,7 @@ mod tests {
     fn compute_rq_pas_single_cpu() {
         let page_offset = DEFAULT_PAGE_OFFSET;
         let runqueues = page_offset.wrapping_add(0x20_0000);
-        let pas = compute_rq_pas(runqueues, &[0], page_offset);
+        let pas = compute_rq_pas(runqueues, &[0], page_offset, 0);
         assert_eq!(pas.len(), 1);
         assert_eq!(pas[0], 0x20_0000);
     }

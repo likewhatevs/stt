@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
@@ -36,8 +37,15 @@ use super::symbols::{
 ///   per-CPU data, physically contiguous memory.
 /// - **Vmalloc/vmap**: Page table walk via CR3. Used for BPF maps,
 ///   vmalloc'd memory, module text.
-pub struct GuestKernel<'a> {
-    mem: &'a GuestMem,
+pub struct GuestKernel {
+    /// Owning handle to the host-mapped guest DRAM. `Arc` so the
+    /// freeze coordinator's worker thread can build a `GuestKernel`
+    /// off the freeze hot path while the coordinator's own
+    /// short-lived `GuestKernel`s share the same backing memory.
+    /// `GuestMem` is `Send + Sync` (see its impl block); the `Arc`
+    /// adds the `'static`-shape lifetime contract that lets the
+    /// owned accessor types cross thread boundaries.
+    mem: Arc<GuestMem>,
     symbols: HashMap<String, u64>,
     page_offset: u64,
     cr3_pa: u64,
@@ -117,7 +125,7 @@ fn decode_aarch64_params(_tcr_el1: u64) -> Option<Aarch64WalkParams> {
 }
 
 #[allow(dead_code)]
-impl<'a> GuestKernel<'a> {
+impl GuestKernel {
     /// Create from GuestMem and vmlinux path.
     ///
     /// Parses the ELF symbol table and resolves paging configuration
@@ -150,7 +158,7 @@ impl<'a> GuestKernel<'a> {
     /// e.g. Apple Silicon). Callers in retry contexts (the freeze
     /// coordinator's lazy-retry loops) must keep polling until
     /// `tcr_el1` has been populated by the BSP loop.
-    pub fn new(mem: &'a GuestMem, vmlinux: &Path, tcr_el1: u64, cr3_pa: u64) -> Result<Self> {
+    pub fn new(mem: Arc<GuestMem>, vmlinux: &Path, tcr_el1: u64, cr3_pa: u64) -> Result<Self> {
         let data = std::fs::read(vmlinux)
             .with_context(|| format!("read vmlinux: {}", vmlinux.display()))?;
         Self::from_vmlinux_bytes(mem, &data, tcr_el1, cr3_pa)
@@ -160,7 +168,7 @@ impl<'a> GuestKernel<'a> {
     /// avoiding a redundant `std::fs::read` when the caller already
     /// holds the file contents.
     pub fn from_vmlinux_bytes(
-        mem: &'a GuestMem,
+        mem: Arc<GuestMem>,
         data: &[u8],
         tcr_el1: u64,
         cr3_pa: u64,
@@ -176,7 +184,7 @@ impl<'a> GuestKernel<'a> {
     /// caller must keep those bytes alive for the duration of this
     /// call.
     pub fn from_elf(
-        mem: &'a GuestMem,
+        mem: Arc<GuestMem>,
         elf: &goblin::elf::Elf<'_>,
         tcr_el1: u64,
         cr3_pa: u64,
@@ -225,11 +233,15 @@ impl<'a> GuestKernel<'a> {
         // `phys_base = 0` is correct on x86_64 KASLR boots. The bit
         // is reflected in CR4.LA57 by hardware; using the symbol
         // here matches the historical path.
-        let l5_bootstrap = resolve_pgtable_l5(mem, &kern_syms, start_kernel_map, 0);
+        let l5_bootstrap = resolve_pgtable_l5(&mem, &kern_syms, start_kernel_map, 0);
         // CR3 from KVM SREGS carries PCID/PCD/PWT in bits [11:0]; mask
         // to a clean PA before walking. The walker also masks
         // descriptor entries internally but the initial CR3 it
         // receives is what we hand it, so do the mask here.
+        // Clear PCID [11:0]. Bit 12 is NOT cleared: with
+        // mitigations=off the kernel disables PTI at runtime even
+        // when CONFIG_MITIGATION_PAGE_TABLE_ISOLATION=y, so bit 12
+        // is a real PA bit, not the user/kernel PGD selector.
         let walk_cr3 = cr3_pa & !0xFFFu64;
         // Resolve `phys_base` by walking the page tables. The walker
         // returns raw PAs from PTE entries — no `phys_base` is
@@ -240,7 +252,7 @@ impl<'a> GuestKernel<'a> {
         // `0`, which is the non-KASLR / aarch64 value and produces
         // the historical translation behaviour.
         let phys_base =
-            resolve_phys_base(mem, &kern_syms, walk_cr3, l5_bootstrap, tcr_el1).unwrap_or(0);
+            resolve_phys_base(&mem, &kern_syms, walk_cr3, l5_bootstrap, tcr_el1).unwrap_or(0);
 
         // Re-resolve l5 with the live `phys_base` so a future
         // toolchain that sets the L5 flag after `phys_base`
@@ -251,11 +263,11 @@ impl<'a> GuestKernel<'a> {
         let l5 = if phys_base == 0 {
             l5_bootstrap
         } else {
-            resolve_pgtable_l5(mem, &kern_syms, start_kernel_map, phys_base)
+            resolve_pgtable_l5(&mem, &kern_syms, start_kernel_map, phys_base)
         };
 
         let page_offset =
-            resolve_page_offset_with_tcr(mem, &kern_syms, start_kernel_map, tcr_el1, phys_base);
+            resolve_page_offset_with_tcr(&mem, &kern_syms, start_kernel_map, tcr_el1, phys_base);
 
         // Cache the decoded aarch64 walk parameters once. On x86_64
         // the helper's `from_tcr_el1` returns None; the cache stays
@@ -301,7 +313,7 @@ impl<'a> GuestKernel<'a> {
     /// page-table buffer pass their `cr3_pa` instead.
     #[cfg(test)]
     pub(crate) fn new_for_test(
-        mem: &'a GuestMem,
+        mem: Arc<GuestMem>,
         symbols: HashMap<String, u64>,
         page_offset: u64,
         cr3_pa: u64,
@@ -334,7 +346,16 @@ impl<'a> GuestKernel<'a> {
 
     /// Guest physical memory reference.
     pub fn mem(&self) -> &GuestMem {
-        self.mem
+        &self.mem
+    }
+
+    /// Clone the owning Arc handle to guest memory. Lets a caller
+    /// build a sibling [`GuestKernel`] (or any other consumer that
+    /// expects an `Arc<GuestMem>`) that shares the same backing
+    /// mapping without re-resolving the host pointer through
+    /// [`super::reader::GuestMem::from_layout`].
+    pub fn mem_arc(&self) -> Arc<GuestMem> {
+        self.mem.clone()
     }
 
     /// Runtime PAGE_OFFSET (resolved from guest memory).
@@ -706,7 +727,7 @@ mod tests {
         let mut symbols = HashMap::new();
         symbols.insert("test_sym".to_string(), 0xFFFF_FFFF_8000_1000u64);
         let kernel = GuestKernel {
-            mem: &mem,
+            mem: Arc::new(mem),
             symbols,
             page_offset: 0xFFFF_8880_0000_0000,
             cr3_pa: 0,
@@ -736,7 +757,7 @@ mod tests {
         let mut symbols = HashMap::new();
         symbols.insert("my_counter".to_string(), sym_kva);
         let kernel = GuestKernel {
-            mem: &mem,
+            mem: Arc::new(mem),
             symbols,
             page_offset: 0xFFFF_8880_0000_0000,
             cr3_pa: 0,
@@ -762,7 +783,7 @@ mod tests {
         let mut symbols = HashMap::new();
         symbols.insert("my_u64".to_string(), sym_kva);
         let kernel = GuestKernel {
-            mem: &mem,
+            mem: Arc::new(mem),
             symbols,
             page_offset: 0xFFFF_8880_0000_0000,
             cr3_pa: 0,
@@ -791,7 +812,7 @@ mod tests {
         let mut symbols = HashMap::new();
         symbols.insert("my_bytes".to_string(), sym_kva);
         let kernel = GuestKernel {
-            mem: &mem,
+            mem: Arc::new(mem),
             symbols,
             page_offset: 0xFFFF_8880_0000_0000,
             cr3_pa: 0,
@@ -814,7 +835,7 @@ mod tests {
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let kernel = GuestKernel {
-            mem: &mem,
+            mem: Arc::new(mem),
             symbols: HashMap::new(),
             page_offset: 0xFFFF_8880_0000_0000,
             cr3_pa: 0,
@@ -841,7 +862,7 @@ mod tests {
         let mut symbols = HashMap::new();
         symbols.insert("my_var".to_string(), sym_kva);
         let kernel = GuestKernel {
-            mem: &mem,
+            mem: Arc::new(mem),
             symbols,
             page_offset: 0xFFFF_8880_0000_0000,
             cr3_pa: 0,
@@ -871,7 +892,7 @@ mod tests {
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let kernel = GuestKernel {
-            mem: &mem,
+            mem: Arc::new(mem),
             symbols: HashMap::new(),
             page_offset,
             cr3_pa: 0,
@@ -891,9 +912,9 @@ mod tests {
         let buf = [0u8; 64];
         // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
         // whose backing storage outlives the GuestMem use.
-        let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
+        let mem = Arc::new(unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) });
         let kernel = GuestKernel {
-            mem: &mem,
+            mem: mem.clone(),
             symbols: HashMap::new(),
             page_offset: 0x1234,
             cr3_pa: 0x5678,
@@ -906,7 +927,7 @@ mod tests {
         assert_eq!(kernel.page_offset(), 0x1234);
         assert_eq!(kernel.cr3_pa(), 0x5678);
         assert!(kernel.l5());
-        assert!(std::ptr::eq(kernel.mem(), &mem));
+        assert!(std::ptr::eq(kernel.mem(), &*mem));
     }
 
     #[test]
@@ -926,8 +947,8 @@ mod tests {
         let mut buf = vec![0u8; 64 << 20];
         // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
         // whose backing storage outlives the GuestMem use.
-        let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
-        let kernel = match GuestKernel::new(&mem, &path, 0, 0) {
+        let mem = Arc::new(unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) });
+        let kernel = match GuestKernel::new(mem, &path, 0, 0) {
             Ok(k) => k,
             Err(e) => {
                 // init_top_pgt missing in some kernel configs.
@@ -1032,7 +1053,7 @@ mod tests {
         let mem = unsafe { GuestMem::from_regions_for_test(regions) };
 
         let kernel = GuestKernel {
-            mem: &mem,
+            mem: Arc::new(mem),
             symbols: HashMap::new(),
             page_offset: 0xFFFF_8880_0000_0000,
             cr3_pa: pml4_pa,
@@ -1081,8 +1102,8 @@ mod tests {
         }
         let mut buf = vec![0u8; 64 << 20];
         // SAFETY: buf outlives mem.
-        let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
-        let result = GuestKernel::new(&mem, &path, 0, 0);
+        let mem = Arc::new(unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) });
+        let result = GuestKernel::new(mem, &path, 0, 0);
         let err = match result {
             Ok(_) => panic!("tcr_el1=0 must be rejected on aarch64"),
             Err(e) => e,

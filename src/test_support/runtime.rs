@@ -227,6 +227,7 @@ pub(crate) fn build_vm_builder_base(
         .cmdline(cmdline_extra)
         .run_args(guest_args)
         .timeout(vm_timeout_from_entry(entry))
+        .workload_duration(entry.duration)
         .no_perf_mode(no_perf_mode);
 
     if let Some(sched_path) = scheduler {
@@ -702,7 +703,6 @@ mod tests {
         assert_eq!(vm_timeout_from_entry(&entry), Duration::from_secs(46));
     }
 
-    #[test]
     #[test]
     fn vm_timeout_headroom_is_zero() {
         assert_eq!(VM_TIMEOUT_HEADROOM, Duration::ZERO);

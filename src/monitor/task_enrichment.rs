@@ -75,7 +75,7 @@ impl SchedClassRegistry {
     /// Resolve all six class symbols via the GuestKernel's vmlinux
     /// symbol table. Each lookup is independent — a missing symbol
     /// for one class doesn't fail the others.
-    pub fn from_guest_kernel(kernel: &GuestKernel<'_>) -> Self {
+    pub fn from_guest_kernel(kernel: &GuestKernel) -> Self {
         Self {
             fair: kernel.symbol_kva("fair_sched_class"),
             rt: kernel.symbol_kva("rt_sched_class"),
@@ -145,7 +145,7 @@ impl LockSlowpathRegistry {
     /// vmlinux. Each lookup is independent; absent symbols leave the
     /// corresponding slot None and the matcher silently skips that
     /// pattern.
-    pub fn from_guest_kernel(kernel: &GuestKernel<'_>) -> Self {
+    pub fn from_guest_kernel(kernel: &GuestKernel) -> Self {
         Self {
             queued_spin_lock_slowpath: kernel.symbol_kva("queued_spin_lock_slowpath"),
             // `__mutex_lock_slowpath` is the historical name; modern
@@ -299,7 +299,7 @@ pub struct TaskEnrichment {
 /// matcher needs an unwinder we don't have).
 #[allow(dead_code)]
 pub fn walk_task_enrichment(
-    kernel: &GuestKernel<'_>,
+    kernel: &GuestKernel,
     task_kva: u64,
     offsets: &TaskEnrichmentOffsets,
     classes: &SchedClassRegistry,

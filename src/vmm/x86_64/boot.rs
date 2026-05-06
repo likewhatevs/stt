@@ -10,7 +10,7 @@ use crate::vmm::kvm::{
 
 // Page table addresses (identity-mapped, 2MB pages)
 // Firecracker/libkrun/CH all use these same addresses.
-const PML4_START: u64 = 0x9000;
+pub(crate) const PML4_START: u64 = 0x9000;
 const PDPTE_START: u64 = 0xa000;
 const PDE_START: u64 = 0xb000;
 

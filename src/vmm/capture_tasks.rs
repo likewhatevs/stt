@@ -406,7 +406,7 @@ mod tests {
     /// `from_guest_kernel` is called on the registries (which return
     /// every-slot-None on an empty symbol map — see the dedicated
     /// tests below).
-    fn make_kernel<'a>(mem: &'a GuestMem) -> GuestKernel<'a> {
+    fn make_kernel(mem: std::sync::Arc<GuestMem>) -> GuestKernel {
         GuestKernel::new_for_test(mem, HashMap::new(), TEST_PAGE_OFFSET, 0, false)
     }
 
@@ -783,7 +783,7 @@ mod tests {
     fn sched_class_registry_empty_symbols_yields_none_slots() {
         let mut buf = vec![0u8; 0x1000];
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
-        let kernel = make_kernel(&mem);
+        let kernel = make_kernel(std::sync::Arc::new(mem));
         let r = SchedClassRegistry::from_guest_kernel(&kernel);
         assert!(r.fair.is_none());
         assert!(r.rt.is_none());
@@ -801,7 +801,7 @@ mod tests {
     fn lock_slowpath_registry_empty_symbols_yields_none_slots() {
         let mut buf = vec![0u8; 0x1000];
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
-        let kernel = make_kernel(&mem);
+        let kernel = make_kernel(std::sync::Arc::new(mem));
         let r = LockSlowpathRegistry::from_guest_kernel(&kernel);
         assert!(r.queued_spin_lock_slowpath.is_none());
         assert!(r.mutex_lock_slowpath.is_none());
@@ -823,7 +823,7 @@ mod tests {
 
         let mut buf = vec![0u8; 0x1000];
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
-        let kernel = GuestKernel::new_for_test(&mem, symbols, TEST_PAGE_OFFSET, 0, false);
+        let kernel = GuestKernel::new_for_test(std::sync::Arc::new(mem), symbols, TEST_PAGE_OFFSET, 0, false);
         let r = SchedClassRegistry::from_guest_kernel(&kernel);
         assert_eq!(r.fair, Some(fair_kva));
         assert_eq!(r.ext, Some(0xffff_ffff_8000_1300));
@@ -1036,7 +1036,7 @@ mod tests {
             .copy_from_slice(&head_kva.to_le_bytes());
 
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
-        let kernel = make_kernel(&mem);
+        let kernel = make_kernel(std::sync::Arc::new(mem));
 
         let global = crate::monitor::scx_walker::walk_scx_tasks_global(
             &kernel,
@@ -1092,8 +1092,8 @@ mod tests {
         // runnable_list head: head -> n1 -> head (one task)
         buf[head..head + 8].copy_from_slice(&(n1 as u64).to_le_bytes());
         buf[n1..n1 + 8].copy_from_slice(&(head as u64).to_le_bytes());
-        let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
-        let kernel = make_kernel(&mem);
+        let mem = std::sync::Arc::new(unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) });
+        let kernel = make_kernel(std::sync::Arc::clone(&mem));
 
         // Global walk on scx_tasks_kva=0 must return empty.
         let global =
@@ -1105,7 +1105,7 @@ mod tests {
 
         // Runnable_list walk produces n1.
         let runnable_kvas = walk_runnable_list(
-            &mem,
+            &*mem,
             crate::monitor::reader::WalkContext::default(),
             head as u64,
             head as u64,
@@ -1159,7 +1159,7 @@ mod tests {
         buf[cursor_flags_pa..cursor_flags_pa + 4].copy_from_slice(&cursor_flags.to_le_bytes());
 
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
-        let kernel = make_kernel(&mem);
+        let kernel = make_kernel(std::sync::Arc::new(mem));
 
         let global = crate::monitor::scx_walker::walk_scx_tasks_global(
             &kernel,
@@ -1222,7 +1222,7 @@ mod tests {
         buf[t1_node_kva as usize..t1_node_kva as usize + 8]
             .copy_from_slice(&head_kva.to_le_bytes());
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
-        let kernel = make_kernel(&mem);
+        let kernel = make_kernel(std::sync::Arc::new(mem));
 
         let global = crate::monitor::scx_walker::walk_scx_tasks_global(
             &kernel,
@@ -1267,8 +1267,8 @@ mod tests {
         // runnable_list: head -> n1 -> head (one task).
         buf[head..head + 8].copy_from_slice(&(n1 as u64).to_le_bytes());
         buf[n1..n1 + 8].copy_from_slice(&(head as u64).to_le_bytes());
-        let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
-        let kernel = make_kernel(&mem);
+        let mem = std::sync::Arc::new(unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) });
+        let kernel = make_kernel(std::sync::Arc::clone(&mem));
 
         // Global walk on the empty list returns nothing.
         let global = crate::monitor::scx_walker::walk_scx_tasks_global(
@@ -1283,7 +1283,7 @@ mod tests {
         // Runnable_list walk surfaces n1 (task.scx + see.runnable_node = 0
         // here, so task_kva == node_kva).
         let runnable_kvas = walk_runnable_list(
-            &mem,
+            &*mem,
             crate::monitor::reader::WalkContext::default(),
             head as u64,
             head as u64,

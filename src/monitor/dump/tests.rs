@@ -3361,9 +3361,8 @@ fn render_ringbuf_no_offsets_returns_err() {
     let mem = unsafe {
         super::super::reader::GuestMem::new(scene.buf.as_ptr() as *mut u8, scene.buf.len() as u64)
     };
-    let mem_ref: &super::super::reader::GuestMem = unsafe { &*(&mem as *const _) };
     let kernel = super::super::guest::GuestKernel::new_for_test(
-        mem_ref,
+        std::sync::Arc::new(mem),
         std::collections::HashMap::new(),
         scene.page_offset,
         0,
@@ -3390,9 +3389,8 @@ fn render_ringbuf_unmapped_map_kva_returns_err() {
     let mem = unsafe {
         super::super::reader::GuestMem::new(scene.buf.as_ptr() as *mut u8, scene.buf.len() as u64)
     };
-    let mem_ref: &super::super::reader::GuestMem = unsafe { &*(&mem as *const _) };
     let kernel = super::super::guest::GuestKernel::new_for_test(
-        mem_ref,
+        std::sync::Arc::new(mem),
         std::collections::HashMap::new(),
         scene.page_offset,
         0,
@@ -3414,9 +3412,8 @@ fn render_ringbuf_null_rb_returns_err() {
     let mem = unsafe {
         super::super::reader::GuestMem::new(scene.buf.as_ptr() as *mut u8, scene.buf.len() as u64)
     };
-    let mem_ref: &super::super::reader::GuestMem = unsafe { &*(&mem as *const _) };
     let kernel = super::super::guest::GuestKernel::new_for_test(
-        mem_ref,
+        std::sync::Arc::new(mem),
         std::collections::HashMap::new(),
         scene.page_offset,
         0,
@@ -3444,9 +3441,8 @@ fn render_ringbuf_unmapped_rb_returns_err() {
     let mem = unsafe {
         super::super::reader::GuestMem::new(scene.buf.as_ptr() as *mut u8, scene.buf.len() as u64)
     };
-    let mem_ref: &super::super::reader::GuestMem = unsafe { &*(&mem as *const _) };
     let kernel = super::super::guest::GuestKernel::new_for_test(
-        mem_ref,
+        std::sync::Arc::new(mem),
         std::collections::HashMap::new(),
         scene.page_offset,
         0,
@@ -3469,9 +3465,8 @@ fn render_ringbuf_basic_capacity_and_pending() {
     let mem = unsafe {
         super::super::reader::GuestMem::new(scene.buf.as_ptr() as *mut u8, scene.buf.len() as u64)
     };
-    let mem_ref: &super::super::reader::GuestMem = unsafe { &*(&mem as *const _) };
     let kernel = super::super::guest::GuestKernel::new_for_test(
-        mem_ref,
+        std::sync::Arc::new(mem),
         std::collections::HashMap::new(),
         scene.page_offset,
         0,
@@ -3501,9 +3496,8 @@ fn render_ringbuf_wraparound_pending_bytes() {
     let mem = unsafe {
         super::super::reader::GuestMem::new(scene.buf.as_ptr() as *mut u8, scene.buf.len() as u64)
     };
-    let mem_ref: &super::super::reader::GuestMem = unsafe { &*(&mem as *const _) };
     let kernel = super::super::guest::GuestKernel::new_for_test(
-        mem_ref,
+        std::sync::Arc::new(mem),
         std::collections::HashMap::new(),
         scene.page_offset,
         0,
@@ -3530,9 +3524,8 @@ fn render_ringbuf_mask_max_returns_err() {
     let mem = unsafe {
         super::super::reader::GuestMem::new(scene.buf.as_ptr() as *mut u8, scene.buf.len() as u64)
     };
-    let mem_ref: &super::super::reader::GuestMem = unsafe { &*(&mem as *const _) };
     let kernel = super::super::guest::GuestKernel::new_for_test(
-        mem_ref,
+        std::sync::Arc::new(mem),
         std::collections::HashMap::new(),
         scene.page_offset,
         0,
@@ -3666,9 +3659,8 @@ fn render_stack_traces_no_offsets_returns_err() {
     let mem = unsafe {
         super::super::reader::GuestMem::new(scene.buf.as_ptr() as *mut u8, scene.buf.len() as u64)
     };
-    let mem_ref: &super::super::reader::GuestMem = unsafe { &*(&mem as *const _) };
     let kernel = super::super::guest::GuestKernel::new_for_test(
-        mem_ref,
+        std::sync::Arc::new(mem),
         std::collections::HashMap::new(),
         scene.page_offset,
         0,
@@ -3691,9 +3683,8 @@ fn render_stack_traces_unmapped_map_kva_returns_err() {
     let mem = unsafe {
         super::super::reader::GuestMem::new(scene.buf.as_ptr() as *mut u8, scene.buf.len() as u64)
     };
-    let mem_ref: &super::super::reader::GuestMem = unsafe { &*(&mem as *const _) };
     let kernel = super::super::guest::GuestKernel::new_for_test(
-        mem_ref,
+        std::sync::Arc::new(mem),
         std::collections::HashMap::new(),
         scene.page_offset,
         0,
@@ -3714,9 +3705,8 @@ fn render_stack_traces_empty_returns_no_entries() {
     let mem = unsafe {
         super::super::reader::GuestMem::new(scene.buf.as_ptr() as *mut u8, scene.buf.len() as u64)
     };
-    let mem_ref: &super::super::reader::GuestMem = unsafe { &*(&mem as *const _) };
     let kernel = super::super::guest::GuestKernel::new_for_test(
-        mem_ref,
+        std::sync::Arc::new(mem),
         std::collections::HashMap::new(),
         scene.page_offset,
         0,
@@ -3746,9 +3736,8 @@ fn render_stack_traces_populated_pcs() {
     let mem = unsafe {
         super::super::reader::GuestMem::new(scene.buf.as_ptr() as *mut u8, scene.buf.len() as u64)
     };
-    let mem_ref: &super::super::reader::GuestMem = unsafe { &*(&mem as *const _) };
     let kernel = super::super::guest::GuestKernel::new_for_test(
-        mem_ref,
+        std::sync::Arc::new(mem),
         std::collections::HashMap::new(),
         scene.page_offset,
         0,
@@ -3784,9 +3773,8 @@ fn render_stack_traces_build_id_mode_pcs_empty() {
     let mem = unsafe {
         super::super::reader::GuestMem::new(scene.buf.as_ptr() as *mut u8, scene.buf.len() as u64)
     };
-    let mem_ref: &super::super::reader::GuestMem = unsafe { &*(&mem as *const _) };
     let kernel = super::super::guest::GuestKernel::new_for_test(
-        mem_ref,
+        std::sync::Arc::new(mem),
         std::collections::HashMap::new(),
         scene.page_offset,
         0,
@@ -3885,9 +3873,8 @@ fn render_fd_array_populated_indices() {
     let mem = unsafe {
         super::super::reader::GuestMem::new(scene.buf.as_ptr() as *mut u8, scene.buf.len() as u64)
     };
-    let mem_ref: &super::super::reader::GuestMem = unsafe { &*(&mem as *const _) };
     let kernel = super::super::guest::GuestKernel::new_for_test(
-        mem_ref,
+        std::sync::Arc::new(mem),
         std::collections::HashMap::new(),
         scene.page_offset,
         0,
@@ -3919,9 +3906,8 @@ fn render_fd_array_hash_shaped_returns_empty() {
     let mem = unsafe {
         super::super::reader::GuestMem::new(scene.buf.as_ptr() as *mut u8, scene.buf.len() as u64)
     };
-    let mem_ref: &super::super::reader::GuestMem = unsafe { &*(&mem as *const _) };
     let kernel = super::super::guest::GuestKernel::new_for_test(
-        mem_ref,
+        std::sync::Arc::new(mem),
         std::collections::HashMap::new(),
         scene.page_offset,
         0,
@@ -3957,9 +3943,8 @@ fn render_fd_array_max_entries_truncation() {
     let mem = unsafe {
         super::super::reader::GuestMem::new(scene.buf.as_ptr() as *mut u8, scene.buf.len() as u64)
     };
-    let mem_ref: &super::super::reader::GuestMem = unsafe { &*(&mem as *const _) };
     let kernel = super::super::guest::GuestKernel::new_for_test(
-        mem_ref,
+        std::sync::Arc::new(mem),
         std::collections::HashMap::new(),
         scene.page_offset,
         0,
@@ -4001,9 +3986,8 @@ fn render_map_struct_ops_no_offsets_returns_error() {
     // SAFETY: buf is a live local Vec<u8>.
     let mem =
         unsafe { super::super::reader::GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-    let mem_ref: &super::super::reader::GuestMem = unsafe { &*(&mem as *const _) };
     let kernel = super::super::guest::GuestKernel::new_for_test(
-        mem_ref,
+        std::sync::Arc::new(mem),
         std::collections::HashMap::new(),
         page_offset,
         0,
@@ -4064,9 +4048,8 @@ fn render_map_struct_ops_unmapped_value_returns_error() {
     let page_offset = crate::monitor::symbols::DEFAULT_PAGE_OFFSET;
     let mem =
         unsafe { super::super::reader::GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-    let mem_ref: &super::super::reader::GuestMem = unsafe { &*(&mem as *const _) };
     let kernel = super::super::guest::GuestKernel::new_for_test(
-        mem_ref,
+        std::sync::Arc::new(mem),
         std::collections::HashMap::new(),
         page_offset,
         0,
@@ -4151,9 +4134,8 @@ fn render_fd_array_indices_capped_at_max_indices() {
     let mem = unsafe {
         super::super::reader::GuestMem::new(scene.buf.as_ptr() as *mut u8, scene.buf.len() as u64)
     };
-    let mem_ref: &super::super::reader::GuestMem = unsafe { &*(&mem as *const _) };
     let kernel = super::super::guest::GuestKernel::new_for_test(
-        mem_ref,
+        std::sync::Arc::new(mem),
         std::collections::HashMap::new(),
         scene.page_offset,
         0,

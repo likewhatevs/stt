@@ -175,7 +175,7 @@ pub struct CpuTimeCapture<'a> {
 pub struct TaskEnrichmentCapture<'a> {
     /// Borrowed GuestKernel — provides memory access, page-table
     /// translation context, and the vmlinux symbol table.
-    pub kernel: &'a super::guest::GuestKernel<'a>,
+    pub kernel: &'a super::guest::GuestKernel,
     /// BTF-resolved offsets for the task/signal/pid/upid walk.
     pub offsets: &'a super::btf_offsets::TaskEnrichmentOffsets,
     /// Cached sched_class symbol KVAs for class decode + PI-boost
@@ -378,7 +378,7 @@ pub struct EventCounterCapture<'a> {
 pub struct ScxWalkerCapture<'a> {
     /// Borrowed GuestKernel — provides memory access, page-table
     /// translation context, and the vmlinux symbol table.
-    pub kernel: &'a super::guest::GuestKernel<'a>,
+    pub kernel: &'a super::guest::GuestKernel,
     /// BTF-resolved offsets for the scx walker.
     pub offsets: &'a super::btf_offsets::ScxWalkerOffsets,
     /// `scx_root` symbol KVA (resolved via vmlinux ELF symtab).

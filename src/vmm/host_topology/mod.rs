@@ -734,6 +734,7 @@ fn try_acquire_all(
 /// (modulo-by-zero); callers must enforce this upstream — the
 /// `count > total_host_cpus` early-bail in [`acquire_cpu_locks`]
 /// is the production guarantee.
+#[allow(dead_code)]
 fn pid_window_offset(pid: u32, max_start: usize) -> usize {
     use siphasher::sip::SipHasher13;
     use std::hash::Hasher;
@@ -758,11 +759,13 @@ fn pid_window_offset(pid: u32, max_start: usize) -> usize {
 /// `total_host_cpus` bounds the search space. Single non-blocking pass;
 /// callers rely on nextest retry backoff for contention resolution.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct CpuLockResult {
     pub locks: Vec<std::os::fd::OwnedFd>,
     pub cpus: Vec<usize>,
 }
 
+#[allow(dead_code)]
 pub fn acquire_cpu_locks(
     count: usize,
     total_host_cpus: usize,
@@ -1639,6 +1642,7 @@ fn should_warn_cross_node(mems: &std::collections::BTreeSet<usize>) -> bool {
 }
 
 /// Acquire `LOCK_SH` on LLC lock files for the LLCs containing `cpus`.
+#[allow(dead_code)]
 fn acquire_llc_shared_locks(
     topo: &HostTopology,
     cpus: &[usize],
@@ -1665,6 +1669,7 @@ fn acquire_llc_shared_locks(
 
 /// Try to flock CPUs [offset..offset+count) exclusively.
 /// Returns all fds on success, or an error string on any busy CPU.
+#[allow(dead_code)]
 fn try_acquire_cpu_window(
     offset: usize,
     count: usize,

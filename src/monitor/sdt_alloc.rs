@@ -442,7 +442,7 @@ impl std::fmt::Display for SdtAllocatorSnapshot {
 // program BTF, accessor + arena snapshot kern_vm_start, etc.).
 #[allow(clippy::too_many_arguments)]
 pub fn walk_sdt_allocator(
-    kernel: &GuestKernel<'_>,
+    kernel: &GuestKernel,
     kern_vm_start: u64,
     allocator_bytes: &[u8],
     offsets: &SdtAllocOffsets,
@@ -651,7 +651,7 @@ pub fn discover_payload_btf_id(btf: &Btf, payload_size: usize) -> PayloadTypeCho
 /// descent threads through every call so each function takes one
 /// `&mut self` and the actual position arguments.
 struct TreeWalker<'a> {
-    kernel: &'a GuestKernel<'a>,
+    kernel: &'a GuestKernel,
     kern_vm_start: u64,
     offsets: &'a SdtAllocOffsets,
     btf: &'a Btf,

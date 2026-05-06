@@ -297,6 +297,7 @@ pub struct KtstrVm {
     /// the degraded-sysfs no-perf-mode branch, where no LLC
     /// reservation is possible to begin with — `KtstrVm::run`
     /// short-circuits to "no locks" in that case.
+    #[allow(dead_code)]
     pub(crate) host_topo: Option<host_topology::HostTopology>,
     /// Shell commands to run in the guest to enable a kernel-built scheduler.
     pub(crate) sched_enable_cmds: Vec<String>,
@@ -380,6 +381,18 @@ pub struct KtstrVm {
     /// freeze coordinator emits a [`monitor::dump::FailureDumpReport`]
     /// directly, matching the existing single-snapshot behaviour.
     pub(crate) dual_snapshot: bool,
+    /// Workload time budget. When set, the host-side watchdog
+    /// resets its hard deadline to `now + workload_duration` the
+    /// first time the monitor observes `*scx_root` transition from
+    /// null to non-null in guest memory — so boot + BPF verifier
+    /// time do not eat into the workload's budget. Bounded above
+    /// by the original `timeout`-derived deadline (the watchdog
+    /// uses `min(reset, original)`). `None` disables the reset and
+    /// the watchdog uses `timeout` as a single deadline counted
+    /// from VM boot. Populated via
+    /// [`KtstrVmBuilder::workload_duration`].
+    #[allow(dead_code)]
+    pub(crate) workload_duration: Option<Duration>,
 }
 
 struct RunLocks {
@@ -560,18 +573,29 @@ impl KtstrVm {
                 })
             }
         } else {
-            let total_cpus = self.topology.total_cpus() as usize;
-            let host_cpus = self
-                .host_topo
-                .as_ref()
-                .map(|h| h.total_cpus())
-                .unwrap_or(total_cpus);
-            let result =
-                host_topology::acquire_cpu_locks(total_cpus, host_cpus, self.host_topo.as_ref())?;
-            Ok(RunLocks {
-                locks: result.locks,
-                default_cpu_mask: Some(result.cpus),
-            })
+            // Default else: 1:1 pin with LOCK_SH on the plan's LLCs.
+            if let Some(ref plan) = self.pinning_plan {
+                match host_topology::acquire_resource_locks(
+                    plan,
+                    &plan.llc_indices,
+                    host_topology::LlcLockMode::Shared,
+                )? {
+                    host_topology::LockOutcome::Acquired { locks, .. } => Ok(RunLocks {
+                        locks,
+                        default_cpu_mask: None,
+                    }),
+                    host_topology::LockOutcome::Unavailable(reason) => {
+                        Err(anyhow::Error::new(host_topology::ResourceContention {
+                            reason,
+                        }))
+                    }
+                }
+            } else {
+                Ok(RunLocks {
+                    locks: Vec::new(),
+                    default_cpu_mask: None,
+                })
+            }
         }
     }
 

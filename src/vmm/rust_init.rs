@@ -622,15 +622,18 @@ pub(crate) fn ktstr_guest_init() -> ! {
     // safe — the BSS-zero rejection in
     // [`super::super::monitor::reader`]'s sample loop tolerates
     // pre-boot zeros for as long as needed.
+    #[cfg(target_arch = "x86_64")]
+    let kern_phys_base = crate::vmm::guest_comms::read_phys_base_from_iomem()
+        .unwrap_or(0);
     for attempt in 0..100 {
+        #[cfg(target_arch = "x86_64")]
+        crate::vmm::guest_comms::send_kern_addrs(kern_phys_base, 0);
         if crate::vmm::guest_comms::send_sys_rdy() {
             break;
         }
         if attempt == 99 {
             tracing::warn!(
-                "ktstr-init: send_sys_rdy retry budget exhausted (10 s); \
-                 monitor will rely on its 5 s pre-sample timeout + \
-                 data_valid gate"
+                "ktstr-init: send_sys_rdy retry budget exhausted (10 s)"
             );
         }
         std::thread::sleep(std::time::Duration::from_millis(100));

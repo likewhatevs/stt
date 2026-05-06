@@ -60,15 +60,26 @@ use crate::monitor;
 /// happens INSIDE the helper so a fresh value is observed each
 /// iteration — capturing it pre-call would freeze a stale snapshot
 /// the BSP loop hasn't refined yet.
-pub(super) fn try_init_owned_accessor<'a>(
-    mem: &'a monitor::reader::GuestMem,
+///
+/// `data` is the cached vmlinux bytes the coordinator reads once at
+/// run scope; the helper re-parses the ELF on each retry (parsing the
+/// cached bytes is microseconds, the original `std::fs::read` was
+/// 14-28 s on cold disk cache). `vmlinux` is still passed through for
+/// the BTF sidecar cache lookup inside `BpfMapOffsets::from_elf`.
+pub(super) fn try_init_owned_accessor(
+    mem: Arc<monitor::reader::GuestMem>,
+    data: &[u8],
     vmlinux: &std::path::Path,
     tcr_el1: Option<&Arc<AtomicU64>>,
     cr3: &Arc<AtomicU64>,
-) -> anyhow::Result<monitor::bpf_map::GuestMemMapAccessorOwned<'a>> {
+) -> anyhow::Result<monitor::bpf_map::GuestMemMapAccessorOwned> {
     let tcr_val = tcr_el1.map(|c| c.load(Ordering::Acquire)).unwrap_or(0);
     let cr3_val = cr3.load(Ordering::Acquire);
-    monitor::bpf_map::GuestMemMapAccessorOwned::new(mem, vmlinux, tcr_val, cr3_val)
+    let elf = goblin::elf::Elf::parse(data)
+        .map_err(|e| anyhow::anyhow!("parse vmlinux ELF: {e}"))?;
+    monitor::bpf_map::GuestMemMapAccessorOwned::from_elf(
+        mem, &elf, data, vmlinux, tcr_val, cr3_val,
+    )
 }
 
 /// Sibling of [`try_init_owned_accessor`] for the prog-side
@@ -82,12 +93,13 @@ pub(super) fn try_init_owned_accessor<'a>(
 /// Returns `Err` on construction failure so the caller can warn-once
 /// on permanent failure modes (matching the
 /// [`try_init_owned_accessor`] contract).
-pub(super) fn try_init_owned_prog_accessor<'a>(
-    mem: &'a monitor::reader::GuestMem,
+///
+pub(super) fn try_init_owned_prog_accessor(
+    mem: Arc<monitor::reader::GuestMem>,
     vmlinux: &std::path::Path,
     tcr_el1: Option<&Arc<AtomicU64>>,
     cr3: &Arc<AtomicU64>,
-) -> anyhow::Result<monitor::bpf_prog::GuestMemProgAccessorOwned<'a>> {
+) -> anyhow::Result<monitor::bpf_prog::GuestMemProgAccessorOwned> {
     let tcr_val = tcr_el1.map(|c| c.load(Ordering::Acquire)).unwrap_or(0);
     let cr3_val = cr3.load(Ordering::Acquire);
     monitor::bpf_prog::GuestMemProgAccessorOwned::new(mem, vmlinux, tcr_val, cr3_val)

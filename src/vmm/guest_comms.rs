@@ -419,6 +419,59 @@ pub fn send_sys_rdy() -> bool {
     write_msg(MsgType::SysRdy.wire_value(), &[])
 }
 
+/// Send `phys_base` and `page_offset_base` to the host so the
+/// monitor can translate kernel virtual addresses without walking
+/// guest page tables. Called from `ktstr_guest_init` after
+/// `mount_filesystems` and before `send_sys_rdy`.
+/// Payload: `[phys_base + 1 : u64 LE, page_offset_base: u64 LE]`.
+/// The +1 bias avoids the 0 sentinel — the host subtracts 1 to
+/// recover the actual value. This lets `phys_base=0` (no KASLR
+/// physical randomization) be distinguished from "not yet received."
+pub fn send_kern_addrs(phys_base: u64, page_offset_base: u64) -> bool {
+    let mut payload = [0u8; 16];
+    payload[..8].copy_from_slice(&(phys_base.wrapping_add(1)).to_le_bytes());
+    payload[8..].copy_from_slice(&page_offset_base.to_le_bytes());
+    write_msg(super::wire::MSG_TYPE_KERN_ADDRS, &payload)
+}
+
+/// Read `phys_base` from `/proc/kallsyms` by finding the symbol
+/// address, then reading its value via the kernel's own
+/// `/proc/kcore` (which handles KASLR VA→PA translation
+/// internally).
+///
+/// Simpler alternative: just peek the value from the running
+/// kernel via a trivial kernel module or eBPF. But the simplest
+/// path that works today: `/proc/kallsyms` gives the KVA, and
+/// we can read the value through `/proc/kcore` which the kernel
+/// provides as a virtual ELF that maps kernel VAs directly.
+///
+/// Actually, even simpler: use inline asm or a helper to just
+/// read the symbol directly since we're running IN the kernel's
+/// address space as PID 1.
+///
+/// Fallback: parse `/proc/iomem` for "Kernel code" to derive
+/// the physical load address and compute phys_base from that.
+#[cfg(target_arch = "x86_64")]
+pub fn read_phys_base_from_iomem() -> Option<u64> {
+    // /proc/iomem contains lines like:
+    //   01000000-0394afff : Kernel code
+    // The start address is the physical load address of the kernel.
+    // phys_base = physical_load_addr - LOAD_PHYSICAL_ADDR (0x1000000)
+    let iomem = std::fs::read_to_string("/proc/iomem").ok()?;
+    for line in iomem.lines() {
+        let line = line.trim();
+        if line.ends_with(": Kernel code") {
+            let range = line.split(':').next()?.trim();
+            let start = range.split('-').next()?.trim();
+            let phys_load = u64::from_str_radix(start, 16).ok()?;
+            // LOAD_PHYSICAL_ADDR = CONFIG_PHYSICAL_START = 0x1000000
+            // phys_base = phys_load - LOAD_PHYSICAL_ADDR
+            return Some(phys_load.wrapping_sub(0x100_0000));
+        }
+    }
+    None
+}
+
 /// Send a stdout chunk to the host. Payload: opaque UTF-8 bytes.
 ///
 /// Frames with [`MsgType::Stdout`]. Replaces the prior COM2

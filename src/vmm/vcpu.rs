@@ -170,7 +170,7 @@ pub(crate) fn vcpu_signal() -> libc::c_int {
 /// [`vcpu_signal`] because the freeze coordinator is the sole
 /// consumer.
 pub(crate) fn load_probe_bss_offset(
-    kernel: &crate::monitor::guest::GuestKernel<'_>,
+    kernel: &crate::monitor::guest::GuestKernel,
     btf_kva: u64,
     base: &btf_rs::Btf,
     offsets: &crate::monitor::btf_offsets::BpfMapOffsets,

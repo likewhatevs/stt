@@ -74,7 +74,7 @@ pub(crate) fn build(
 /// tries the direct-mapping translation first, then the page-table
 /// walk.
 fn walk_node_data(
-    kernel: &GuestKernel<'_>,
+    kernel: &GuestKernel,
     node_data_kva: u64,
     offsets: &NumaStatsOffsets,
     nr_nodes: u32,
@@ -101,7 +101,7 @@ fn walk_node_data(
 /// Returns `None` when `pgdat_kva` does not resolve to guest memory
 /// — that node's pglist_data was either freed or never installed.
 fn read_per_node_stats(
-    kernel: &GuestKernel<'_>,
+    kernel: &GuestKernel,
     pgdat_kva: u64,
     offsets: &NumaStatsOffsets,
     node: u32,
@@ -243,7 +243,7 @@ mod tests {
         let node_data_kva = layout.node_data_kva;
         let offsets = layout.offsets;
         let mem = make_kernel(&mut layout.buf);
-        let kernel = GuestKernel::new_for_test(&mem, HashMap::new(), DEFAULT_PAGE_OFFSET, 0, false);
+        let kernel = GuestKernel::new_for_test(std::sync::Arc::new(mem), HashMap::new(), DEFAULT_PAGE_OFFSET, 0, false);
 
         let stats = walk_node_data(&kernel, node_data_kva, &offsets, nr_nodes);
         assert_eq!(stats.len(), 2);
@@ -281,7 +281,7 @@ mod tests {
         let node_data_kva = layout.node_data_kva;
         let offsets = layout.offsets;
         let mem = make_kernel(&mut layout.buf);
-        let kernel = GuestKernel::new_for_test(&mem, HashMap::new(), DEFAULT_PAGE_OFFSET, 0, false);
+        let kernel = GuestKernel::new_for_test(std::sync::Arc::new(mem), HashMap::new(), DEFAULT_PAGE_OFFSET, 0, false);
 
         let stats = walk_node_data(&kernel, node_data_kva, &offsets, nr_nodes);
         assert_eq!(stats.len(), 1);
@@ -298,7 +298,7 @@ mod tests {
         // every slot zero — no pgdats installed.
         let mut buf = vec![0u8; 0x1_0000];
         let mem = make_kernel(&mut buf);
-        let kernel = GuestKernel::new_for_test(&mem, HashMap::new(), DEFAULT_PAGE_OFFSET, 0, false);
+        let kernel = GuestKernel::new_for_test(std::sync::Arc::new(mem), HashMap::new(), DEFAULT_PAGE_OFFSET, 0, false);
         let offsets = NumaStatsOffsets {
             pglist_data_node_zones: 0x40,
             zone_vm_numa_event: 0x10,
@@ -316,7 +316,7 @@ mod tests {
     fn zero_nodes_yields_empty_walk() {
         let mut buf = vec![0u8; 0x1_0000];
         let mem = make_kernel(&mut buf);
-        let kernel = GuestKernel::new_for_test(&mem, HashMap::new(), DEFAULT_PAGE_OFFSET, 0, false);
+        let kernel = GuestKernel::new_for_test(std::sync::Arc::new(mem), HashMap::new(), DEFAULT_PAGE_OFFSET, 0, false);
         let offsets = NumaStatsOffsets {
             pglist_data_node_zones: 0x40,
             zone_vm_numa_event: 0x10,
@@ -349,7 +349,7 @@ mod tests {
         // to be explicit since the walker reads them via
         // `read_u64` which is bounds-checked by GuestMem.
         let mem = make_kernel(&mut layout.buf);
-        let kernel = GuestKernel::new_for_test(&mem, HashMap::new(), DEFAULT_PAGE_OFFSET, 0, false);
+        let kernel = GuestKernel::new_for_test(std::sync::Arc::new(mem), HashMap::new(), DEFAULT_PAGE_OFFSET, 0, false);
 
         let stats = walk_node_data(&kernel, node_data_kva, &offsets, nr_nodes_to_walk);
         assert_eq!(
