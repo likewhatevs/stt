@@ -1174,7 +1174,8 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let chain = init_repo_with_chain(tmp.path(), 2);
         let parent = chain[0];
-        let repo = gix::open(tmp.path()).expect("gix::open");
+        let mut repo = gix::open(tmp.path()).expect("gix::open");
+        let _ = repo.committer_or_set_generic_fallback();
         // Create `refs/heads/feature` pointing at the parent
         // commit (chain[0]) so the test can distinguish it from
         // HEAD (chain[1]).
@@ -1204,7 +1205,8 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let chain = init_repo_with_chain(tmp.path(), 2);
         let parent = chain[0];
-        let repo = gix::open(tmp.path()).expect("gix::open");
+        let mut repo = gix::open(tmp.path()).expect("gix::open");
+        let _ = repo.committer_or_set_generic_fallback();
         // Lightweight tag (a ref under `refs/tags/`) pointing at
         // the parent commit. Distinct from an annotated tag
         // (which is its own object kind); rev_parse handles both

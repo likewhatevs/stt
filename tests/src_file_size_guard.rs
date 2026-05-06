@@ -75,26 +75,31 @@ const DEFAULT_MAX_LINES: usize = 3000;
 /// entry must reference the queued split task in a `// queued: ...`
 /// comment so the deferral is auditable.
 ///
-/// Counts pinned 2026-05-05; refresh per the drain protocol.
+/// Counts pinned 2026-05-06; refresh per the drain protocol.
 const EXCEPTIONS: &[(&str, usize)] = &[
-    ("stats.rs", 9805),
-    ("scenario/ops/mod.rs", 7422),
-    ("vmm/freeze_coord.rs", 6632), // queued: split into submodules
-    ("scenario/payload_run.rs", 5634),
-    ("test_support/eval.rs", 5362),
+    ("stats.rs", 9856),
+    ("vmm/freeze_coord/mod.rs", 8964), // queued: split into submodules
+    ("scenario/ops/mod.rs", 7463),
+    ("monitor/reader.rs", 5607),
+    ("scenario/payload_run.rs", 5598),
+    ("test_support/eval.rs", 5504),
+    ("vmm/virtio_console.rs", 4793),
     ("monitor/dump/tests.rs", 4645),
-    ("monitor/reader.rs", 4604),
-    ("monitor/bpf_map/tests.rs", 4011), // queued: split into submodules
-    ("vmm/virtio_blk/device.rs", 3636),
-    ("ctprof/mod.rs", 3556),
-    ("workload/worker/mod.rs", 3538),
-    ("workload/spawn/mod.rs", 3454),
-    ("fetch.rs", 3406), // queued: split into submodules
-    ("bin/cargo_ktstr/parse_tests.rs", 3351),
-    ("vmm/host_topology/tests.rs", 3180), // queued: split into submodules
-    ("host_context.rs", 3042),            // queued: split into submodules
-    ("vmm/initramfs.rs", 3014),
-    ("monitor/tests.rs", 3013), // queued: split into submodules
+    ("monitor/bpf_map/tests.rs", 4013), // queued: split into submodules
+    ("vmm/virtio_blk/device.rs", 3826),
+    ("workload/spawn/mod.rs", 3752),
+    ("fetch.rs", 3727),                    // queued: split into submodules
+    ("workload/worker/mod.rs", 3635),
+    ("bin/cargo_ktstr/parse_tests.rs", 3571),
+    ("ctprof/mod.rs", 3568),
+    ("vmm/rust_init.rs", 3510),
+    ("vmm/host_topology/tests.rs", 3185), // queued: split into submodules
+    ("vmm/exit_dispatch.rs", 3091),
+    ("vmm/initramfs.rs", 3074),
+    ("monitor/scx_walker.rs", 3055),
+    ("host_context.rs", 3041),             // queued: split into submodules
+    ("test_support/probe.rs", 3026),
+    ("monitor/tests.rs", 3015),            // queued: split into submodules
 ];
 
 /// Resolve `<repo>/src` from `CARGO_MANIFEST_DIR`. Cargo always

@@ -478,6 +478,7 @@ pub(crate) fn attempt_auto_repro(
             return None;
         }
     };
+    drop(vm);
 
     // Forward guest stderr (COM1) and COM2 probe lines when verbose.
     if verbose() {
