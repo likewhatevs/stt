@@ -838,6 +838,7 @@ fn download_stable_tarball(
 
     let expected_sha256 = resolve_expected_sha256(client, major, &tarball_name, skip_sha256);
 
+    tracing::info!(%url, "downloading kernel tarball (requires network)");
     let response = client
         .get(&url)
         .timeout(DOWNLOAD_REQUEST_READ_TIMEOUT)
@@ -1068,6 +1069,7 @@ pub(crate) const RELEASES_URL: &str = "https://www.kernel.org/releases.json";
 /// and a localhost URL pointed at a TcpListener-backed mock that
 /// returns canned `releases.json` content.
 pub(crate) fn fetch_releases(client: &Client, url: &str) -> Result<Vec<Release>> {
+    tracing::debug!(%url, "fetching kernel releases (requires network)");
     let response = client
         .get(url)
         .send()
