@@ -16,8 +16,8 @@ use std::time::Duration;
 /// non-blocking + `poll` design in `start_trace_pipe`, the reader
 /// exits within one poll cycle of the stop signal.
 ///
-/// The 60-second host-side watchdog (`KTSTR_VM_TIMEOUT`, compile-time
-/// const at `src/test_support/runtime.rs`) bounds the run; a regression
+/// The host-side VM timeout (`vm_timeout_from_entry` at
+/// `src/test_support/runtime.rs`) bounds the run; a regression
 /// that re-wedges teardown surfaces as a watchdog timeout. The empty
 /// body keeps the test cheap so it can run on every PR. The cleanup
 /// duration is persisted to the sidecar by
