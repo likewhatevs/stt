@@ -3310,7 +3310,10 @@ mod tests {
             event: VIRTIO_CONSOLE_DEVICE_READY,
             value: 1,
         });
-        assert!(dev.device_ready, "device_ready must be set after first message");
+        assert!(
+            dev.device_ready,
+            "device_ready must be set after first message"
+        );
         let after_first = dev.control_out.len();
         assert_eq!(
             after_first, NUM_PORTS as usize,
@@ -3332,7 +3335,10 @@ mod tests {
              unboundedly",
         );
         // device_ready stays true — the repeat does not flip it back.
-        assert!(dev.device_ready, "device_ready must remain set after repeat");
+        assert!(
+            dev.device_ready,
+            "device_ready must remain set after repeat"
+        );
     }
 
     /// PORT_READY repeat for the same port must be ignored — the
@@ -3352,7 +3358,10 @@ mod tests {
             event: VIRTIO_CONSOLE_PORT_READY,
             value: 1,
         });
-        assert!(dev.port_readied[0], "port_readied[0] must be set after first PORT_READY");
+        assert!(
+            dev.port_readied[0],
+            "port_readied[0] must be set after first PORT_READY"
+        );
         let after_first = dev.control_out.len();
         assert_eq!(
             after_first, 3,
@@ -3513,8 +3522,7 @@ mod tests {
         });
         assert!(dev.control_out.is_empty());
         assert_eq!(
-            dev.port_readied,
-            [false; NUM_PORTS as usize],
+            dev.port_readied, [false; NUM_PORTS as usize],
             "unknown-port PORT_READY must not flip any port_readied flag",
         );
     }
@@ -3540,8 +3548,7 @@ mod tests {
         });
         // No panic. `port_opened` stays at the initial all-false.
         assert_eq!(
-            dev.port_opened,
-            [false; NUM_PORTS as usize],
+            dev.port_opened, [false; NUM_PORTS as usize],
             "unknown-port PORT_OPEN must not flip any port_opened flag — \
              the gate prevents out-of-bounds array access on a hostile id",
         );
@@ -3592,13 +3599,11 @@ mod tests {
             "unhandled events must NOT flip device_ready",
         );
         assert_eq!(
-            dev.port_opened,
-            [false; NUM_PORTS as usize],
+            dev.port_opened, [false; NUM_PORTS as usize],
             "unhandled events must NOT flip port_opened",
         );
         assert_eq!(
-            dev.port_readied,
-            [false; NUM_PORTS as usize],
+            dev.port_readied, [false; NUM_PORTS as usize],
             "unhandled events must NOT flip port_readied",
         );
     }
@@ -3840,8 +3845,7 @@ mod tests {
         let mut buf = [0u8; 8];
         dev.mmio_read(VIRTIO_MMIO_VERSION as u64, &mut buf);
         assert_eq!(
-            buf,
-            [0xff; 8],
+            buf, [0xff; 8],
             "8-byte read must fill with 0xff — the device is 4-byte \
              register width per virtio-v1.2 §4.2.2",
         );
@@ -3856,10 +3860,7 @@ mod tests {
         let dev = VirtioConsole::new();
         let mut buf = [0u8; 1];
         dev.mmio_read(VIRTIO_MMIO_VERSION as u64, &mut buf);
-        assert_eq!(
-            buf, [0xff],
-            "1-byte read must fill with 0xff",
-        );
+        assert_eq!(buf, [0xff], "1-byte read must fill with 0xff",);
     }
 
     /// 3-byte mmio_read (one short of the 4-byte register width)
@@ -3873,7 +3874,8 @@ mod tests {
         let mut buf = [0u8; 3];
         dev.mmio_read(VIRTIO_MMIO_VERSION as u64, &mut buf);
         assert_eq!(
-            buf, [0xff, 0xff, 0xff],
+            buf,
+            [0xff, 0xff, 0xff],
             "3-byte read must fill with 0xff — the device is exactly \
              4-byte register width, not 'at least 4'",
         );
@@ -3914,8 +3916,7 @@ mod tests {
         // range (cfg.len() = 12).
         dev.mmio_read(0x100 + 10, &mut buf);
         assert_eq!(
-            buf,
-            [0xff; 4],
+            buf, [0xff; 4],
             "config_read past byte 11 must fill 0xff — the defense \
              prevents a panic from cfg[start..end] when end > 12",
         );
@@ -3971,7 +3972,8 @@ mod tests {
         // 1 <= 12, so in range; returns cfg[0] = 0.
         dev.mmio_read(0x100, &mut buf);
         assert_eq!(
-            buf, [0],
+            buf,
+            [0],
             "1-byte read inside config struct must return actual \
              data, not 0xff fill",
         );
@@ -4019,10 +4021,7 @@ mod tests {
     /// DRIVER_OK with F_MULTIPORT negotiated. Variant of
     /// `wire_console_queue_to_mock` that targets q4 specifically; used
     /// by every drain_port1 test below.
-    fn wire_port1_rxq_to_mock(
-        dev: &mut VirtioConsole,
-        mock: &MockSplitQueue<GuestMemoryMmap>,
-    ) {
+    fn wire_port1_rxq_to_mock(dev: &mut VirtioConsole, mock: &MockSplitQueue<GuestMemoryMmap>) {
         wire_console_queue_to_mock(dev, mock, PORT1_RXQ as u32);
     }
 
@@ -4161,10 +4160,7 @@ mod tests {
         let used_idx: u16 = mem
             .read_obj(mock.used_addr().checked_add(2).unwrap())
             .expect("read used.idx");
-        assert_eq!(
-            used_idx, 0,
-            "DRIVER_OK gate must skip add_used"
-        );
+        assert_eq!(used_idx, 0, "DRIVER_OK gate must skip add_used");
     }
 
     /// F_MULTIPORT runtime gate: even with DRIVER_OK and the queue
@@ -4236,10 +4232,7 @@ mod tests {
         let used_idx: u16 = mem
             .read_obj(mock.used_addr().checked_add(2).unwrap())
             .expect("read used.idx");
-        assert_eq!(
-            used_idx, 0,
-            "F_MULTIPORT gate must skip add_used"
-        );
+        assert_eq!(used_idx, 0, "F_MULTIPORT gate must skip add_used");
     }
 
     /// `port_opened[1]` gate: with DRIVER_OK + F_MULTIPORT but BEFORE
@@ -4290,10 +4283,7 @@ mod tests {
         let used_idx_before: u16 = mem
             .read_obj(mock.used_addr().checked_add(2).unwrap())
             .expect("read used.idx before open");
-        assert_eq!(
-            used_idx_before, 0,
-            "port_opened[1] gate must skip add_used"
-        );
+        assert_eq!(used_idx_before, 0, "port_opened[1] gate must skip add_used");
 
         // Now drive PORT_OPEN(id=1, value=1). The handler at line
         // ~1268 calls drain_port1_pending_rx on the closed→open
@@ -4424,10 +4414,7 @@ mod tests {
         let used_idx: u16 = mem
             .read_obj(mock.used_addr().checked_add(2).unwrap())
             .expect("read used.idx");
-        assert_eq!(
-            used_idx, 1,
-            "happy-path drain must add_used exactly once"
-        );
+        assert_eq!(used_idx, 1, "happy-path drain must add_used exactly once");
         // signal_used set INT_VRING.
         assert_ne!(
             dev.interrupt_status & VIRTIO_MMIO_INT_VRING,
@@ -4620,8 +4607,7 @@ mod tests {
                 0,
             )),
         ];
-        mock.add_desc_chains(&descs, 0)
-            .expect("publish two chains");
+        mock.add_desc_chains(&descs, 0).expect("publish two chains");
         dev.set_mem(mem.clone());
         wire_port1_rxq_to_mock(&mut dev, &mock);
         open_port1(&mut dev);

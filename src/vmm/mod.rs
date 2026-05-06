@@ -1459,12 +1459,7 @@ mod tests {
             "guest never panicked / rebooted within 10 s — the test's \
              premise (panic-before-sys_rdy → kernel reboot → VM exit) \
              is not holding. Stderr tail: {:?}",
-            result
-                .stderr
-                .lines()
-                .rev()
-                .take(5)
-                .collect::<Vec<_>>(),
+            result.stderr.lines().rev().take(5).collect::<Vec<_>>(),
         );
         // Wallclock budget: 8 s. With the monitor's 5 s
         // sys_rdy ceiling, a healthy run should finish well

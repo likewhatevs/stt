@@ -1617,7 +1617,6 @@ mod tests {
             "Unmapped MMIO write must classify as Continue"
         );
     }
-
 }
 
 /// Arch-neutral classify_exit coverage. `classify_exit` is shared

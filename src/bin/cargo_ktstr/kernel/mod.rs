@@ -744,7 +744,8 @@ fn kernel_build_one(
             return Ok(());
         }
         let sp = cli::Spinner::start("Downloading kernel...");
-        let result = fetch::download_tarball(client, &ver, tmp_dir.path(), "cargo ktstr", skip_sha256);
+        let result =
+            fetch::download_tarball(client, &ver, tmp_dir.path(), "cargo ktstr", skip_sha256);
         drop(sp);
         let mut acquired = result.map_err(|e| format!("{e:#}"))?;
         // `download_tarball` builds its `cache_key` using the bare

@@ -348,8 +348,7 @@ unsafe extern "C" fn fatal_signal_handler(
     // are all in the signal-safety(7) AS-safe set. The path
     // strings are static C strings with explicit NUL terminators.
     for path in [c"/dev/ttyS1", c"/dev/ttyS0"] {
-        let fd =
-            unsafe { libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
+        let fd = unsafe { libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
         if fd < 0 {
             continue;
         }
@@ -655,10 +654,7 @@ pub(crate) fn ktstr_guest_init() -> ! {
     // and would route the InitStarted phase into the operator's
     // bulk-port-backed transcript otherwise.
     if !shell_mode_requested() {
-        crate::vmm::guest_comms::send_lifecycle(
-            crate::vmm::wire::LifecyclePhase::InitStarted,
-            "",
-        );
+        crate::vmm::guest_comms::send_lifecycle(crate::vmm::wire::LifecyclePhase::InitStarted, "");
     }
     redirect_stdio_to_bulk_port();
     let t_stdio = t0.elapsed();
@@ -923,10 +919,7 @@ pub(crate) fn ktstr_guest_init() -> ! {
     // Phase 5: Dispatch.
     let _s_phase5 = tracing::debug_span!("phase5_dispatch").entered();
     tracing::debug!("dispatching test");
-    crate::vmm::guest_comms::send_lifecycle(
-        crate::vmm::wire::LifecyclePhase::PayloadStarting,
-        "",
-    );
+    crate::vmm::guest_comms::send_lifecycle(crate::vmm::wire::LifecyclePhase::PayloadStarting, "");
     let code = if let Some(pa) = probe_phase_a {
         // Phase A/B split path: Phase A already attached, dispatch
         // with Phase B for BPF fentry after scheduler is running.
@@ -1104,11 +1097,7 @@ fn redirect_stdio_to_bulk_port() {
         Some((read_end, write_end))
     }
 
-    fn spawn_forwarder(
-        mut read_end: std::fs::File,
-        name: &'static str,
-        sender: fn(&[u8]) -> bool,
-    ) {
+    fn spawn_forwarder(mut read_end: std::fs::File, name: &'static str, sender: fn(&[u8]) -> bool) {
         let _ = std::thread::Builder::new()
             .name(name.into())
             .spawn(move || {
@@ -2396,13 +2385,9 @@ fn start_scheduler(probe_drain: Option<ProbeDrain>) -> (Option<Child>, Option<St
             // existing SCHED_OUTPUT_START/END markers so the host's
             // `parse_sched_output` returns the spawn-failure
             // diagnostic exactly as the prior COM2 path did.
-            crate::vmm::guest_comms::send_sched_log(
-                crate::verifier::SCHED_OUTPUT_START.as_bytes(),
-            );
+            crate::vmm::guest_comms::send_sched_log(crate::verifier::SCHED_OUTPUT_START.as_bytes());
             send_sched_log_text(&format!("failed to spawn: {e}"));
-            crate::vmm::guest_comms::send_sched_log(
-                crate::verifier::SCHED_OUTPUT_END.as_bytes(),
-            );
+            crate::vmm::guest_comms::send_sched_log(crate::verifier::SCHED_OUTPUT_END.as_bytes());
             crate::vmm::guest_comms::send_lifecycle(
                 crate::vmm::wire::LifecyclePhase::SchedulerDied,
                 "",
@@ -2986,7 +2971,9 @@ fn start_sched_exit_monitor(
                     // consulted — the loop re-checks the stop
                     // flag and the proc path each iteration
                     // regardless.
-                    let _ = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, poll_timeout) };
+                    let _ = unsafe {
+                        libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, poll_timeout)
+                    };
                     !Path::new(&proc_path).exists()
                 };
                 if exited {
@@ -3048,11 +3035,7 @@ fn start_sched_exit_monitor(
                     // 8-byte stack slot matching eventfd(2)'s
                     // 8-byte read requirement.
                     let _ = unsafe {
-                        libc::read(
-                            stop_fd,
-                            buf.as_mut_ptr() as *mut libc::c_void,
-                            buf.len(),
-                        )
+                        libc::read(stop_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
                     };
                 }
             }

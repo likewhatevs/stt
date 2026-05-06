@@ -140,10 +140,7 @@ fn resolve_shared_libs_with_extra_interp_hints(
 }
 
 #[tracing::instrument(skip_all, fields(binary = %binary.display(), extra_hints = extra_interp_hints.len()))]
-fn resolve_shared_libs_inner(
-    binary: &Path,
-    extra_interp_hints: &[PathBuf],
-) -> Result<SharedLibs> {
+fn resolve_shared_libs_inner(binary: &Path, extra_interp_hints: &[PathBuf]) -> Result<SharedLibs> {
     // Cache results by canonical path AND extra-hint set — avoids
     // re-resolving the same binary across concurrent initramfs builds
     // (nextest parallelism). Hints are part of the key so a second

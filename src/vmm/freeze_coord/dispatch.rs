@@ -27,8 +27,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use vmm_sys_util::eventfd::EventFd;
 
-use super::state::SnapshotRequest;
 use super::snapshot::decode_snapshot_request;
+use super::state::SnapshotRequest;
 
 /// Aggregate of the coordinator-side sinks the TOKEN_TX dispatch can
 /// touch. Bundling them keeps the [`dispatch_bulk_message`] signature

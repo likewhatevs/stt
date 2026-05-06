@@ -2000,9 +2000,7 @@ pub(super) fn worker_main(
                                 };
                                 let expected = prod_wake_atom.load(Ordering::Relaxed);
                                 let before_block = Instant::now();
-                                unsafe {
-                                    futex_wait(prod_wake_ptr, expected, &FUTEX_WAIT_TIMEOUT)
-                                };
+                                unsafe { futex_wait(prod_wake_ptr, expected, &FUTEX_WAIT_TIMEOUT) };
                                 reservoir_push(
                                     &mut resume_latencies_ns,
                                     &mut wake_sample_count,

@@ -1368,7 +1368,10 @@ impl AssertPlan {
             // as the closest approximation of total migrations
             // observed during the run, then divide once by the
             // cgroup-wide total of allocated pages.
-            let total_pages: u64 = reports.iter().map(|w| w.numa_pages.values().sum::<u64>()).sum();
+            let total_pages: u64 = reports
+                .iter()
+                .map(|w| w.numa_pages.values().sum::<u64>())
+                .sum();
             let migrated_pages: u64 = reports
                 .iter()
                 .map(|w| w.vmstat_numa_pages_migrated)

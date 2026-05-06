@@ -1744,7 +1744,11 @@ fn set_status_failed_accepted_on_top_of_needs_reset() {
     );
     // Kernel-style sequence: read get_status, OR in FAILED, write.
     let current = dev.device_status.load(Ordering::Acquire);
-    write_reg(&mut dev, VIRTIO_MMIO_STATUS, current | VIRTIO_CONFIG_S_FAILED);
+    write_reg(
+        &mut dev,
+        VIRTIO_MMIO_STATUS,
+        current | VIRTIO_CONFIG_S_FAILED,
+    );
     assert_eq!(
         dev.device_status.load(Ordering::Acquire),
         VIRTIO_CONFIG_S_NEEDS_RESET | VIRTIO_CONFIG_S_FAILED,

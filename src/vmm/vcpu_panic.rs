@@ -564,10 +564,7 @@ mod tests {
         install_hook_with_prev_for_test(Box::new(move |_info| {
             // Sample the flag at prev-hook time: our hook ran
             // already, so this load must observe the Release flip.
-            alive_seen_clone.store(
-                alive_for_prev.load(Ordering::Acquire),
-                Ordering::Release,
-            );
+            alive_seen_clone.store(alive_for_prev.load(Ordering::Acquire), Ordering::Release);
         }));
 
         let ctx = VcpuPanicCtx {

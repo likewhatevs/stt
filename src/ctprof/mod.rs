@@ -2205,12 +2205,10 @@ fn capture_thread_at_with_tally(
         // writes can transiently yield `block > sleep` even
         // though every in-tree path eventually settles to
         // `block <= sleep`.
-        voluntary_sleep_ns: MonotonicNs(
-            match (sched.sleep_sum, sched.block_sum) {
-                (Some(sleep), Some(block)) => sleep.saturating_sub(block),
-                _ => 0,
-            },
-        ),
+        voluntary_sleep_ns: MonotonicNs(match (sched.sleep_sum, sched.block_sum) {
+            (Some(sleep), Some(block)) => sleep.saturating_sub(block),
+            _ => 0,
+        }),
         sleep_max: PeakNs(sched.sleep_max.unwrap_or(0)),
         block_sum: MonotonicNs(sched.block_sum.unwrap_or(0)),
         block_max: PeakNs(sched.block_max.unwrap_or(0)),

@@ -148,10 +148,7 @@ pub(super) fn bss_read_state(
 /// resolve to "no observable fire this iteration" so a stale
 /// cached PA after probe unload cannot
 /// synthesise a phantom fire from arbitrary DRAM bytes.
-pub(super) fn compute_err_triggered(
-    watchpoint_hit: bool,
-    bss_state: BssReadState,
-) -> bool {
+pub(super) fn compute_err_triggered(watchpoint_hit: bool, bss_state: BssReadState) -> bool {
     watchpoint_hit || matches!(bss_state, BssReadState::Triggered)
 }
 
@@ -7094,8 +7091,7 @@ impl KtstrVm {
         // Skip when no scheduler is active — struct_ops programs
         // only exist when a sched_ext scheduler attached (either via
         // a userspace binary or kernel-built enable commands).
-        let has_scheduler =
-            self.scheduler_binary.is_some() || !self.sched_enable_cmds.is_empty();
+        let has_scheduler = self.scheduler_binary.is_some() || !self.sched_enable_cmds.is_empty();
         let verifier_stats = if has_scheduler {
             self.collect_verifier_stats(&run.vm, run.tcr_el1.as_ref(), &run.cr3)
         } else {
@@ -7199,17 +7195,15 @@ impl KtstrVm {
             Ok(e) => e,
             Err(_) => return Vec::new(),
         };
-        let kernel =
-            match monitor::guest::GuestKernel::from_elf(&mem, &elf, tcr_val, cr3_val) {
-                Ok(k) => k,
-                Err(_) => return Vec::new(),
-            };
+        let kernel = match monitor::guest::GuestKernel::from_elf(&mem, &elf, tcr_val, cr3_val) {
+            Ok(k) => k,
+            Err(_) => return Vec::new(),
+        };
         // BTF sidecar cache hits skip ELF traversal entirely; on a
         // miss `load_btf_from_elf` reuses the parse above instead of
         // re-running `goblin::elf::Elf::parse(&vmlinux_data)`.
         let offsets =
-            match monitor::btf_offsets::BpfProgOffsets::from_elf(&elf, &vmlinux_data, &vmlinux)
-            {
+            match monitor::btf_offsets::BpfProgOffsets::from_elf(&elf, &vmlinux_data, &vmlinux) {
                 Ok(o) => o,
                 Err(_) => return Vec::new(),
             };
@@ -7639,7 +7633,10 @@ mod crc_defense_tests {
         // its own), then a torn SCHED_EXIT-typed frame.
         let mut buf = Vec::new();
         buf.extend(frame_with_torn_crc(MSG_TYPE_SCHED_EXIT, b"first"));
-        buf.extend(frame_with_crc(crate::vmm::wire::MSG_TYPE_STIMULUS, b"valid"));
+        buf.extend(frame_with_crc(
+            crate::vmm::wire::MSG_TYPE_STIMULUS,
+            b"valid",
+        ));
         buf.extend(frame_with_torn_crc(MSG_TYPE_SCHED_EXIT, b"second"));
         let drained = a.feed(&buf);
         assert_eq!(drained.messages.len(), 3);
@@ -7772,14 +7769,9 @@ mod crc_defense_tests {
     /// any successful promotion). The outer Arc clone lets the
     /// caller read the counter after the gate moved its handle
     /// into the predicate body.
-    fn run_sys_rdy_gate(
-        messages: &[crate::vmm::bulk::BulkMessage],
-    ) -> (u32, bool) {
-        let evt = std::sync::Arc::new(
-            EventFd::new(EFD_NONBLOCK).expect("eventfd construction"),
-        );
-        let mut sys_rdy_evt: Option<std::sync::Arc<EventFd>> =
-            Some(evt.clone());
+    fn run_sys_rdy_gate(messages: &[crate::vmm::bulk::BulkMessage]) -> (u32, bool) {
+        let evt = std::sync::Arc::new(EventFd::new(EFD_NONBLOCK).expect("eventfd construction"));
+        let mut sys_rdy_evt: Option<std::sync::Arc<EventFd>> = Some(evt.clone());
         for msg in messages {
             // Exact predicate copied from the production closure.
             if msg.msg_type == MSG_TYPE_SYS_RDY
@@ -7959,9 +7951,7 @@ mod rendezvous_tests {
     ///         + if worker_was_running { 1 } else { 0 };
     /// ```
     fn compute_expected_parks(ap_count: u64, bsp_alive: bool, worker_was_running: bool) -> u64 {
-        ap_count
-            + if bsp_alive { 1 } else { 0 }
-            + if worker_was_running { 1 } else { 0 }
+        ap_count + if bsp_alive { 1 } else { 0 } + if worker_was_running { 1 } else { 0 }
     }
 
     /// Mirror of the production still-parked pre-seed scan at cycle
@@ -8000,9 +7990,7 @@ mod rendezvous_tests {
         if bsp_alive && bsp_parked.load(Ordering::Acquire) {
             still_parked = still_parked.saturating_add(1);
         }
-        if worker_was_running
-            && worker_paused.is_some_and(|p| p.load(Ordering::Acquire))
-        {
+        if worker_was_running && worker_paused.is_some_and(|p| p.load(Ordering::Acquire)) {
             still_parked = still_parked.saturating_add(1);
         }
         still_parked
@@ -8467,10 +8455,9 @@ mod tx_dispatch_tests {
     use super::*;
     use crate::vmm::bulk::HostAssembler;
     use crate::vmm::wire::{
-        FRAME_HEADER_SIZE, MSG_TYPE_SCHED_EXIT, MSG_TYPE_SNAPSHOT_REPLY,
-        MSG_TYPE_SNAPSHOT_REQUEST, MSG_TYPE_STIMULUS, MSG_TYPE_SYS_RDY, MsgType,
-        SNAPSHOT_KIND_CAPTURE, SNAPSHOT_TAG_MAX, ShmEntry, ShmMessage,
-        SnapshotRequestPayload,
+        FRAME_HEADER_SIZE, MSG_TYPE_SCHED_EXIT, MSG_TYPE_SNAPSHOT_REPLY, MSG_TYPE_SNAPSHOT_REQUEST,
+        MSG_TYPE_STIMULUS, MSG_TYPE_SYS_RDY, MsgType, SNAPSHOT_KIND_CAPTURE, SNAPSHOT_TAG_MAX,
+        ShmEntry, ShmMessage, SnapshotRequestPayload,
     };
     use std::sync::atomic::{AtomicBool, Ordering};
     use vmm_sys_util::eventfd::{EFD_NONBLOCK, EventFd};
@@ -8507,10 +8494,8 @@ mod tx_dispatch_tests {
     fn run_dispatch(messages: &[crate::vmm::bulk::BulkMessage]) -> DispatchOutcome {
         let kill = AtomicBool::new(false);
         let kill_evt = EventFd::new(EFD_NONBLOCK).expect("kill eventfd");
-        let sys_rdy_evt =
-            std::sync::Arc::new(EventFd::new(EFD_NONBLOCK).expect("sys_rdy eventfd"));
-        let mut sys_rdy_handle: Option<std::sync::Arc<EventFd>> =
-            Some(sys_rdy_evt.clone());
+        let sys_rdy_evt = std::sync::Arc::new(EventFd::new(EFD_NONBLOCK).expect("sys_rdy eventfd"));
+        let mut sys_rdy_handle: Option<std::sync::Arc<EventFd>> = Some(sys_rdy_evt.clone());
         let mut snapshot_pending: Vec<SnapshotRequest> = Vec::new();
         let mut bucket: Vec<ShmEntry> = Vec::new();
         let mut unknown_count = 0usize;
@@ -8874,8 +8859,7 @@ mod tx_dispatch_tests {
             "bucket must contain SchedExit + Stimulus — \
              SysRdy + SnapshotRequest filtered as coordinator-internal"
         );
-        let bucketed_tags: Vec<u32> =
-            out.bucket.iter().map(|e| e.msg_type).collect();
+        let bucketed_tags: Vec<u32> = out.bucket.iter().map(|e| e.msg_type).collect();
         assert!(bucketed_tags.contains(&MSG_TYPE_SCHED_EXIT));
         assert!(bucketed_tags.contains(&MSG_TYPE_STIMULUS));
         assert!(!bucketed_tags.contains(&MSG_TYPE_SYS_RDY));

@@ -239,8 +239,8 @@ impl<'a> GuestKernel<'a> {
         // aarch64, walk fails on a still-booting guest) defaults to
         // `0`, which is the non-KASLR / aarch64 value and produces
         // the historical translation behaviour.
-        let phys_base = resolve_phys_base(mem, &kern_syms, walk_cr3, l5_bootstrap, tcr_el1)
-            .unwrap_or(0);
+        let phys_base =
+            resolve_phys_base(mem, &kern_syms, walk_cr3, l5_bootstrap, tcr_el1).unwrap_or(0);
 
         // Re-resolve l5 with the live `phys_base` so a future
         // toolchain that sets the L5 flag after `phys_base`

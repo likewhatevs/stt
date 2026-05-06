@@ -25,8 +25,7 @@ use crate::vmm;
 
 use super::output::{
     classify_init_stage, extract_kernel_version, extract_panic_message, extract_sched_ext_dump,
-    format_console_diagnostics, parse_assert_result_from_drain,
-    sched_log_fingerprint,
+    format_console_diagnostics, parse_assert_result_from_drain, sched_log_fingerprint,
 };
 use super::probe::attempt_auto_repro;
 use super::profraw::write_profraw;
@@ -1439,9 +1438,8 @@ fn run_ktstr_test_inner_impl(
                 }
                 Some(crate::vmm::wire::MsgType::Stimulus) => {
                     if bulk_entry.crc_ok
-                        && let Some(ev) = crate::vmm::wire::StimulusEvent::from_payload(
-                            &bulk_entry.payload,
-                        )
+                        && let Some(ev) =
+                            crate::vmm::wire::StimulusEvent::from_payload(&bulk_entry.payload)
                     {
                         stimulus_events.push(crate::timeline::StimulusEvent {
                             elapsed_ms: ev.elapsed_ms as u64,
@@ -1464,12 +1462,13 @@ fn run_ktstr_test_inner_impl(
                         match bincode::serde::decode_from_slice::<
                             crate::test_support::PayloadMetrics,
                             _,
-                        >(&bulk_entry.payload, bincode::config::standard())
-                        {
+                        >(
+                            &bulk_entry.payload, bincode::config::standard()
+                        ) {
                             Ok((pm, _)) => payload_metrics.push(pm),
-                            Err(e) => eprintln!(
-                                "ktstr_test: decode payload metrics from bulk port: {e}"
-                            ),
+                            Err(e) => {
+                                eprintln!("ktstr_test: decode payload metrics from bulk port: {e}")
+                            }
                         }
                     }
                 }
@@ -1478,8 +1477,9 @@ fn run_ktstr_test_inner_impl(
                         match bincode::serde::decode_from_slice::<
                             crate::test_support::RawPayloadOutput,
                             _,
-                        >(&bulk_entry.payload, bincode::config::standard())
-                        {
+                        >(
+                            &bulk_entry.payload, bincode::config::standard()
+                        ) {
                             Ok((raw, _)) => raw_outputs.push(raw),
                             Err(e) => eprintln!(
                                 "ktstr_test: decode raw payload output from bulk port: {e}"
@@ -1928,15 +1928,13 @@ fn evaluate_vm_result(
     let bulk_sched_log = crate::verifier::concat_sched_log_chunks(result.guest_messages.as_ref());
     let has_sched_output =
         output.contains(SCHED_OUTPUT_START) || bulk_sched_log.contains(SCHED_OUTPUT_START);
-    let console_section = if !has_sched_output
-        || verbose()
-        || entry.scheduler.has_active_scheduling()
-    {
-        let init_stage = classify_init_stage(result.guest_messages.as_ref());
-        format_console_diagnostics(&result.stderr, result.exit_code, init_stage)
-    } else {
-        String::new()
-    };
+    let console_section =
+        if !has_sched_output || verbose() || entry.scheduler.has_active_scheduling() {
+            let init_stage = classify_init_stage(result.guest_messages.as_ref());
+            format_console_diagnostics(&result.stderr, result.exit_code, init_stage)
+        } else {
+            String::new()
+        };
 
     let timeline_section = build_timeline_section();
 
@@ -3515,9 +3513,7 @@ mod tests {
         // failure renderer reads, and the bulk-port migration of
         // SCHED_OUTPUT happens in a sibling task. The assert verdict
         // is the part that moved to bincode-over-bulk-port.
-        let output = format!(
-            "{SCHED_OUTPUT_START}\nscheduler noise line\n{SCHED_OUTPUT_END}",
-        );
+        let output = format!("{SCHED_OUTPUT_START}\nscheduler noise line\n{SCHED_OUTPUT_END}",);
         let entry = sched_entry("__eval_fail_sched_log__");
         let result = make_vm_result_with_assert(&output, "", 0, false, &assert);
         let assertions = crate::assert::Assert::NO_OVERRIDES;
@@ -3548,9 +3544,7 @@ mod tests {
             vec![AssertDetail::new(DetailKind::Stuck, "stuck 3000ms")],
         );
         let error_line = "Error: apply_cell_config BPF program returned error -2";
-        let output = format!(
-            "{SCHED_OUTPUT_START}\nstarting\n{error_line}\n{SCHED_OUTPUT_END}",
-        );
+        let output = format!("{SCHED_OUTPUT_START}\nstarting\n{error_line}\n{SCHED_OUTPUT_END}",);
         let entry = sched_entry("__eval_fingerprint__");
         let result = make_vm_result_with_assert(&output, "", 0, false, &assert);
         let assertions = crate::assert::Assert::NO_OVERRIDES;
@@ -3993,13 +3987,8 @@ mod tests {
             )],
         );
         let entry = sched_entry("__eval_sched_exit_console__");
-        let result = make_vm_result_with_assert(
-            "",
-            "kernel panic\nsched_ext: disabled",
-            1,
-            false,
-            &assert,
-        );
+        let result =
+            make_vm_result_with_assert("", "kernel panic\nsched_ext: disabled", 1, false, &assert);
         let assertions = crate::assert::Assert::NO_OVERRIDES;
         let msg = format!(
             "{}",

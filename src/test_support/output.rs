@@ -373,7 +373,10 @@ mod tests {
         let early = build_assert_result(false, vec![AssertDetail::new(DetailKind::Other, "early")]);
         let late = build_assert_result(true, vec![]);
         let drain = BulkDrainResult {
-            entries: vec![assert_result_tlv_entry(&early), assert_result_tlv_entry(&late)],
+            entries: vec![
+                assert_result_tlv_entry(&early),
+                assert_result_tlv_entry(&late),
+            ],
         };
         let r = parse_assert_result_from_drain(Some(&drain)).unwrap();
         assert!(r.passed, "latest entry must win");

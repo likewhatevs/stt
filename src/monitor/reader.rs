@@ -2103,8 +2103,7 @@ pub(crate) fn monitor_loop(
     // `cfg.event_pcpu_pas` / `prog_stats_ctx.per_cpu_offsets`
     // arguments are used as-is for every sample.
     let mut rq_pas_buf: Vec<u64> = rq_pas.to_vec();
-    let mut event_pcpu_pas_buf: Option<Vec<u64>> =
-        cfg.event_pcpu_pas.map(|s| s.to_vec());
+    let mut event_pcpu_pas_buf: Option<Vec<u64>> = cfg.event_pcpu_pas.map(|s| s.to_vec());
     let mut per_cpu_offsets_buf: Vec<u64> = prog_stats_ctx
         .map(|c| c.per_cpu_offsets.clone())
         .unwrap_or_default();
@@ -2453,11 +2452,7 @@ pub(crate) fn monitor_loop(
             // `page_offset` was already refreshed at the top of this
             // iteration (before the watchdog write). `page_offset_resolved`
             // carries the result into the data_valid latch below.
-            let fresh = super::symbols::read_per_cpu_offsets(
-                mem,
-                refresh.pco_pa,
-                refresh.num_cpus,
-            );
+            let fresh = super::symbols::read_per_cpu_offsets(mem, refresh.pco_pa, refresh.num_cpus);
             // Latch `data_valid` once the guest has populated the
             // percpu offset table AND we've observed (or accepted
             // the absence of) the KASLR base. Both halves are
@@ -2487,24 +2482,14 @@ pub(crate) fn monitor_loop(
                     fresh.first().copied().unwrap_or(0),
                 );
             }
-            rq_pas_buf = super::symbols::compute_rq_pas(
-                refresh.runqueues_kva,
-                &fresh,
-                page_offset,
-            );
+            rq_pas_buf = super::symbols::compute_rq_pas(refresh.runqueues_kva, &fresh, page_offset);
             // `event_pcpu_pas` requires both fresh `__per_cpu_offset[]`
             // AND a non-null `*scx_root` (a scheduler must be
             // attached). Until the scheduler attaches, `scx_sched_kva`
             // is zero and `resolve_event_pcpu_pas` returns `None` —
             // event counters stay absent for that sample.
             event_pcpu_pas_buf = refresh.event.as_ref().and_then(|ev| {
-                resolve_event_pcpu_pas(
-                    mem,
-                    ev.scx_root_pa,
-                    &ev.event_offsets,
-                    &fresh,
-                    page_offset,
-                )
+                resolve_event_pcpu_pas(mem, ev.scx_root_pa, &ev.event_offsets, &fresh, page_offset)
             });
             per_cpu_offsets_buf = fresh;
 
@@ -2751,11 +2736,7 @@ pub(crate) fn monitor_loop(
     // __per_cpu_offset[]" from "writes invisible to host monitor"
     // by re-reading the same PAs the early-window diag covered.
     if let Some(refresh) = rq_refresh {
-        let fresh = super::symbols::read_per_cpu_offsets(
-            mem,
-            refresh.pco_pa,
-            refresh.num_cpus,
-        );
+        let fresh = super::symbols::read_per_cpu_offsets(mem, refresh.pco_pa, refresh.num_cpus);
         let mut pob_bytes = [0u8; 16];
         let mut pco_bytes = [0u8; 16];
         let pob_pa: u64 = 0x0279e220;

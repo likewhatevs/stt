@@ -3131,8 +3131,7 @@ impl WorkloadHandle {
         // ready byte) bounds the wait at the same 5 s the legacy
         // sleep + collect path budgeted for the entire stop_and_collect.
         if !was_started && !self.children.is_empty() {
-            let barrier_deadline =
-                std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let barrier_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             // Pending = (index_into_children, read_fd). We track the
             // index so a `POLLHUP` worker can be removed from
             // pending without disturbing the collect loop's `for
@@ -3144,8 +3143,8 @@ impl WorkloadHandle {
                 .map(|(i, &(_, read_fd, _))| (i, read_fd))
                 .collect();
             while !pending.is_empty() {
-                let remaining = barrier_deadline
-                    .saturating_duration_since(std::time::Instant::now());
+                let remaining =
+                    barrier_deadline.saturating_duration_since(std::time::Instant::now());
                 if remaining.is_zero() {
                     // Barrier deadline expired with workers still
                     // pending. Stop waiting and proceed to signal
@@ -3169,8 +3168,7 @@ impl WorkloadHandle {
                 // matches its length; `ms >= 0` since the
                 // remaining-zero branch above bails first. Return
                 // codes are interpreted below.
-                let ret =
-                    unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, ms) };
+                let ret = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, ms) };
                 if ret < 0 {
                     let err = std::io::Error::last_os_error();
                     if err.kind() == std::io::ErrorKind::Interrupted {
@@ -3226,11 +3224,7 @@ impl WorkloadHandle {
                             // is treated as not-yet-ready; the
                             // next iteration retries.
                             let n = unsafe {
-                                libc::read(
-                                    fd,
-                                    &mut byte as *mut u8 as *mut libc::c_void,
-                                    1,
-                                )
+                                libc::read(fd, &mut byte as *mut u8 as *mut libc::c_void, 1)
                             };
                             // n == 1 → ready byte consumed; drop
                             // from pending.
@@ -3259,9 +3253,7 @@ impl WorkloadHandle {
                             );
                             return false;
                         }
-                        if revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)
-                            != 0
-                        {
+                        if revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
                             // Worker closed the write end without
                             // sending the ready byte (panic during
                             // post-fork init, or kernel-killed

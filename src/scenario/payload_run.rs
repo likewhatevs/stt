@@ -701,11 +701,7 @@ impl PayloadHandle {
         // caches the exit status so the second call inside
         // `wait_and_capture` returns immediately without a syscall.
         if let Err(e) = child.wait() {
-            kill_payload_process_group(
-                &child,
-                self.payload.name,
-                self.payload.uses_parent_pgrp,
-            );
+            kill_payload_process_group(&child, self.payload.name, self.payload.uses_parent_pgrp);
             let _ = child.wait();
             return Err(e).with_context(|| format!("wait payload '{}'", self.payload.name));
         }

@@ -249,9 +249,7 @@ fn extract_not_attached_reason(
         if e.msg_type != MSG_TYPE_LIFECYCLE || !e.crc_ok || e.payload.is_empty() {
             continue;
         }
-        if LifecyclePhase::from_wire(e.payload[0])
-            != Some(LifecyclePhase::SchedulerNotAttached)
-        {
+        if LifecyclePhase::from_wire(e.payload[0]) != Some(LifecyclePhase::SchedulerNotAttached) {
             continue;
         }
         let reason = String::from_utf8_lossy(&e.payload[1..]).trim().to_string();
@@ -2668,10 +2666,7 @@ mod tests {
         // carries no diagnostic value — `None` lets the caller
         // fall through to the generic abnormal-exit branch instead
         // of surfacing an empty reason.
-        let drain = lifecycle_drain(
-            crate::vmm::wire::LifecyclePhase::SchedulerNotAttached,
-            "",
-        );
+        let drain = lifecycle_drain(crate::vmm::wire::LifecyclePhase::SchedulerNotAttached, "");
         assert_eq!(extract_not_attached_reason(Some(&drain)), None);
         let drain_ws = lifecycle_drain(
             crate::vmm::wire::LifecyclePhase::SchedulerNotAttached,

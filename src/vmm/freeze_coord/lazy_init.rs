@@ -134,11 +134,8 @@ pub(super) fn try_init_prog_per_cpu_offsets(
     let tcr_val = tcr_el1.map(|c| c.load(Ordering::Acquire)).unwrap_or(0);
     let start_kernel_map = monitor::symbols::start_kernel_map_for_tcr(tcr_val)
         .unwrap_or(monitor::symbols::START_KERNEL_MAP);
-    let pco_pa = monitor::symbols::text_kva_to_pa_with_base(
-        per_cpu_offset_kva,
-        start_kernel_map,
-        phys_base,
-    );
+    let pco_pa =
+        monitor::symbols::text_kva_to_pa_with_base(per_cpu_offset_kva, start_kernel_map, phys_base);
     let offsets = monitor::symbols::read_per_cpu_offsets(mem, pco_pa, num_cpus);
     // Defer caching until every offset slot is non-zero — a guest
     // still populating per-CPU areas yields zero entries for the

@@ -1160,8 +1160,8 @@ mod tests {
         drop(write_end);
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        let (msg_type, body) = read_bulk_port_frame(&mut read_end, deadline)
-            .expect("exact-size payload must succeed");
+        let (msg_type, body) =
+            read_bulk_port_frame(&mut read_end, deadline).expect("exact-size payload must succeed");
         assert_eq!(msg_type, MSG_TYPE_SNAPSHOT_REPLY);
         assert_eq!(body.len(), std::mem::size_of::<SnapshotReplyPayload>());
     }

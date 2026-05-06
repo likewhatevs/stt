@@ -479,22 +479,16 @@ impl EventCounterSample {
                 out.dispatch_local_dsq_offline = out
                     .dispatch_local_dsq_offline
                     .saturating_add(ev.dispatch_local_dsq_offline);
-                out.dispatch_keep_last = out
-                    .dispatch_keep_last
-                    .saturating_add(ev.dispatch_keep_last);
-                out.enq_skip_exiting = out
-                    .enq_skip_exiting
-                    .saturating_add(ev.enq_skip_exiting);
+                out.dispatch_keep_last =
+                    out.dispatch_keep_last.saturating_add(ev.dispatch_keep_last);
+                out.enq_skip_exiting = out.enq_skip_exiting.saturating_add(ev.enq_skip_exiting);
                 out.enq_skip_migration_disabled = out
                     .enq_skip_migration_disabled
                     .saturating_add(ev.enq_skip_migration_disabled);
                 out.reenq_immed = out.reenq_immed.saturating_add(ev.reenq_immed);
-                out.reenq_local_repeat = out
-                    .reenq_local_repeat
-                    .saturating_add(ev.reenq_local_repeat);
-                out.refill_slice_dfl = out
-                    .refill_slice_dfl
-                    .saturating_add(ev.refill_slice_dfl);
+                out.reenq_local_repeat =
+                    out.reenq_local_repeat.saturating_add(ev.reenq_local_repeat);
+                out.refill_slice_dfl = out.refill_slice_dfl.saturating_add(ev.refill_slice_dfl);
                 out.bypass_duration = out.bypass_duration.saturating_add(ev.bypass_duration);
                 out.bypass_dispatch = out.bypass_dispatch.saturating_add(ev.bypass_dispatch);
                 out.bypass_activate = out.bypass_activate.saturating_add(ev.bypass_activate);

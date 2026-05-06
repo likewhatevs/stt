@@ -644,8 +644,14 @@ mod tests {
         assert_eq!(ramdisk_size, 4096);
         // Sub-4 GB initrd must zero the high halves; otherwise the
         // kernel reconstructs `(ext << 32) | low` and reads garbage.
-        assert_eq!(ext_ramdisk_image, 0, "ext_ramdisk_image should be 0 for sub-4GB addr");
-        assert_eq!(ext_ramdisk_size, 0, "ext_ramdisk_size should be 0 for u32-bounded size");
+        assert_eq!(
+            ext_ramdisk_image, 0,
+            "ext_ramdisk_image should be 0 for sub-4GB addr"
+        );
+        assert_eq!(
+            ext_ramdisk_size, 0,
+            "ext_ramdisk_size should be 0 for u32-bounded size"
+        );
     }
 
     #[test]
@@ -678,8 +684,15 @@ mod tests {
         // ext_ramdisk_image=1 and hdr.ramdisk_image=0.
         let mem = test_mem(16);
         let boundary_addr: u64 = 0x1_0000_0000;
-        write_boot_params(&mem, "console=ttyS0", 16, Some(boundary_addr), Some(4096), None)
-            .unwrap();
+        write_boot_params(
+            &mem,
+            "console=ttyS0",
+            16,
+            Some(boundary_addr),
+            Some(4096),
+            None,
+        )
+        .unwrap();
         use linux_loader::loader::bootparam::boot_params;
         let params: boot_params = mem.read_obj(GuestAddress(BOOT_PARAMS_ADDR)).unwrap();
         let ramdisk_image = { params.hdr.ramdisk_image };

@@ -1048,17 +1048,7 @@ mod tests {
             distances: None,
         };
         let mpidrs = fake_mpidrs(topo.total_cpus());
-        let dtb = test_fdt(
-            &topo,
-            &mpidrs,
-            512,
-            "console=ttyS0",
-            None,
-            None,
-            3,
-            false,
-        )
-        .unwrap();
+        let dtb = test_fdt(&topo, &mpidrs, 512, "console=ttyS0", None, None, 3, false).unwrap();
         let props = parse_dtb_props(&dtb);
 
         // Each CPU must have next-level-cache pointing to its LLC's L2 node.
@@ -1132,17 +1122,7 @@ mod tests {
             distances: None,
         };
         let mpidrs = fake_mpidrs(topo.total_cpus());
-        let dtb = test_fdt(
-            &topo,
-            &mpidrs,
-            256,
-            "console=ttyS0",
-            None,
-            None,
-            3,
-            false,
-        )
-        .unwrap();
+        let dtb = test_fdt(&topo, &mpidrs, 256, "console=ttyS0", None, None, 3, false).unwrap();
         let props = parse_dtb_props(&dtb);
 
         // CPU 0 must NOT have next-level-cache.

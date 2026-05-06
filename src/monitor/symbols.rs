@@ -318,7 +318,9 @@ impl KernelSymbols {
         let sym_addr = |name: &str| -> Option<u64> {
             elf.syms
                 .iter()
-                .find(|s| s.st_shndx as u16 != SHN_UNDEF && elf.strtab.get_at(s.st_name) == Some(name))
+                .find(|s| {
+                    s.st_shndx as u16 != SHN_UNDEF && elf.strtab.get_at(s.st_name) == Some(name)
+                })
                 .map(|s| s.st_value)
         };
 

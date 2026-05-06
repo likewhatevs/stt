@@ -1685,9 +1685,8 @@ pub fn run_probe_skeleton(
                 // poll loop so the userspace reader observes the
                 // post-trigger timestamp instead of a cached
                 // pre-trigger zero.
-                diag.bpf_first_trigger_ns = unsafe {
-                    std::ptr::read_volatile(&bss.ktstr_last_trigger_ts as *const u64)
-                };
+                diag.bpf_first_trigger_ns =
+                    unsafe { std::ptr::read_volatile(&bss.ktstr_last_trigger_ts as *const u64) };
                 diag.bpf_timeline_count = sum_pcpu(PCPU_TIMELINE_COUNT);
                 diag.bpf_timeline_drops = sum_pcpu(PCPU_TIMELINE_DROPS);
             }

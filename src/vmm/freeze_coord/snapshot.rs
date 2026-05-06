@@ -25,8 +25,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use vmm_sys_util::eventfd::EventFd;
 
-use super::state::SnapshotRequest;
 use super::super::vcpu::{ImmediateExitHandle, WatchpointArm, vcpu_signal};
+use super::state::SnapshotRequest;
 
 /// Frame a `MSG_TYPE_SNAPSHOT_REPLY` TLV — header (16 bytes) plus
 /// [`crate::vmm::wire::SnapshotReplyPayload`] (72 bytes) — into a
@@ -320,7 +320,9 @@ pub(super) fn arm_user_watchpoint(
     // the moment of `ie.set()` and cannot be dropped until the next
     // load reads false (the pthread_kill below issues its own fresh
     // load for the same TOCTOU reason).
-    if bsp_alive.load(Ordering::Acquire) && let Some(ie) = bsp_ie {
+    if bsp_alive.load(Ordering::Acquire)
+        && let Some(ie) = bsp_ie
+    {
         ie.set(1);
     }
     std::sync::atomic::fence(Ordering::Release);
@@ -500,10 +502,7 @@ mod snapshot_tagged_path_tests {
     fn preserves_allowed_chars_in_tag() {
         let base = Path::new("/tmp/run/coord.failure-dump.json");
         let out = snapshot_tagged_path(base, "Tag.1_v-2");
-        assert_eq!(
-            out,
-            PathBuf::from("/tmp/run/coord.snapshot.Tag.1_v-2.json")
-        );
+        assert_eq!(out, PathBuf::from("/tmp/run/coord.snapshot.Tag.1_v-2.json"));
     }
 
     /// Path with no extension yields a result with no extension —

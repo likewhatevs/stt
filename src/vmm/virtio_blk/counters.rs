@@ -920,7 +920,11 @@ mod tests {
             0,
             "record_io_error must NOT bump flushes_completed",
         );
-        assert_eq!(c.bytes_read(), 0, "record_io_error must NOT bump bytes_read");
+        assert_eq!(
+            c.bytes_read(),
+            0,
+            "record_io_error must NOT bump bytes_read"
+        );
         assert_eq!(
             c.bytes_written(),
             0,

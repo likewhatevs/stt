@@ -860,8 +860,8 @@ fn download_stable_tarball(
     // alongside `linux-{version}/` — gets caught after extraction
     // but before anything lands in `dest_dir`. The TempDir's Drop
     // sweeps every entry the malicious archive deposited.
-    let staging = tempfile::TempDir::new_in(dest_dir)
-        .with_context(|| "create extraction staging dir")?;
+    let staging =
+        tempfile::TempDir::new_in(dest_dir).with_context(|| "create extraction staging dir")?;
     let stream = DownloadStream::new(response);
     let decoder = xz2::read::XzDecoder::new(stream);
     let mut archive = tar::Archive::new(decoder);
@@ -910,9 +910,7 @@ fn promote_staged_kernel_tree(
 ) -> Result<PathBuf> {
     let expected_name = format!("linux-{version}");
     let mut found_inner = false;
-    for entry in std::fs::read_dir(staging.path())
-        .with_context(|| "read staging dir entries")?
-    {
+    for entry in std::fs::read_dir(staging.path()).with_context(|| "read staging dir entries")? {
         let entry = entry.with_context(|| "iterate staging dir entry")?;
         let name = entry.file_name();
         if name == std::ffi::OsStr::new(&expected_name) {
@@ -929,13 +927,8 @@ fn promote_staged_kernel_tree(
     }
     let inner = staging.path().join(&expected_name);
     let source_dir = dest_dir.join(&expected_name);
-    std::fs::rename(&inner, &source_dir).with_context(|| {
-        format!(
-            "rename {} -> {}",
-            inner.display(),
-            source_dir.display()
-        )
-    })?;
+    std::fs::rename(&inner, &source_dir)
+        .with_context(|| format!("rename {} -> {}", inner.display(), source_dir.display()))?;
     Ok(source_dir)
 }
 
@@ -980,8 +973,8 @@ fn download_rc_tarball(
     // entries past the archive boundary. RC tarballs have no
     // upstream sha256 manifest, so structural verification is the
     // only defence against a hostile gitweb response.
-    let staging = tempfile::TempDir::new_in(dest_dir)
-        .with_context(|| "create extraction staging dir")?;
+    let staging =
+        tempfile::TempDir::new_in(dest_dir).with_context(|| "create extraction staging dir")?;
     let stream = DownloadStream::new(response);
     let decoder = flate2::read::GzDecoder::new(stream);
     let mut archive = tar::Archive::new(decoder);
@@ -1331,17 +1324,19 @@ fn probe_latest_patch(client: &Client, prefix: &str, cli_label: &str) -> Result<
         // outage is not silent.
         let results: Vec<(u32, bool)> = (lo..=hi)
             .into_par_iter()
-            .map(|patch| match probe_patch_exists(client, major, prefix, patch) {
-                Ok(ok) => (patch, ok),
-                Err(e) => {
-                    tracing::warn!(
-                        major, prefix, patch, error = %e,
-                        "probe_latest_patch: HEAD failed; treating patch as \
-                         absent and continuing search",
-                    );
-                    (patch, false)
-                }
-            })
+            .map(
+                |patch| match probe_patch_exists(client, major, prefix, patch) {
+                    Ok(ok) => (patch, ok),
+                    Err(e) => {
+                        tracing::warn!(
+                            major, prefix, patch, error = %e,
+                            "probe_latest_patch: HEAD failed; treating patch as \
+                             absent and continuing search",
+                        );
+                        (patch, false)
+                    }
+                },
+            )
             .collect();
         // rayon preserves input order, so iterating advances `last_good`
         // through increasing patch numbers and stops at the first 404
@@ -1817,8 +1812,7 @@ mod tests {
             b"# fake",
         )
         .unwrap();
-        let source_dir =
-            promote_staged_kernel_tree(&staging, dest.path(), "6.14.2").unwrap();
+        let source_dir = promote_staged_kernel_tree(&staging, dest.path(), "6.14.2").unwrap();
         assert_eq!(source_dir, dest.path().join("linux-6.14.2"));
         assert!(source_dir.is_dir());
         assert!(source_dir.join("Makefile").is_file());
@@ -1832,8 +1826,7 @@ mod tests {
         let staging = tempfile::TempDir::new_in(dest.path()).unwrap();
         std::fs::create_dir(staging.path().join("linux-6.14.2")).unwrap();
         std::fs::write(staging.path().join("evil"), b"backdoor").unwrap();
-        let err = promote_staged_kernel_tree(&staging, dest.path(), "6.14.2")
-            .unwrap_err();
+        let err = promote_staged_kernel_tree(&staging, dest.path(), "6.14.2").unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("unexpected top-level entry"),
@@ -1853,8 +1846,7 @@ mod tests {
         // the helper rejects any name that doesn't match the
         // expected one before checking for absence.
         std::fs::create_dir(staging.path().join("linux-6.14.3")).unwrap();
-        let err = promote_staged_kernel_tree(&staging, dest.path(), "6.14.2")
-            .unwrap_err();
+        let err = promote_staged_kernel_tree(&staging, dest.path(), "6.14.2").unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("unexpected top-level entry"),
@@ -1867,8 +1859,7 @@ mod tests {
     fn promote_staged_bails_on_empty_staging() {
         let dest = tempfile::TempDir::new().unwrap();
         let staging = tempfile::TempDir::new_in(dest.path()).unwrap();
-        let err = promote_staged_kernel_tree(&staging, dest.path(), "6.14.2")
-            .unwrap_err();
+        let err = promote_staged_kernel_tree(&staging, dest.path(), "6.14.2").unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("expected directory linux-6.14.2"),
