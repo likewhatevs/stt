@@ -9,7 +9,7 @@ repository = "https://github.com/likewhatevs/ktstr"
 
 [package]
 name = "ktstr"
-version = "0.4.13"
+version = "0.4.14"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -100,7 +100,7 @@ rayon = "1"
 # link into any shipped binary. The dupe is an artifact of resolver v3
 # keeping build-dep and regular-dep feature graphs separate; unifying
 # would require dropping `polars`, which is not a proportionate fix.
-object = { version = "0.37", default-features = false, features = ["build"] }
+object = { version = "0.39", default-features = false, features = ["build"] }
 walkdir = "2"
 indicatif = "0.18"
 # Table rendering for stats and verifier CLI output. Replaces hand-rolled
