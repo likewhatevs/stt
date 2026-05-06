@@ -305,7 +305,7 @@ impl KernelSymbols {
     /// vmlinux bytes; the caller must keep those bytes alive for the
     /// duration of this call but no longer — the returned
     /// `KernelSymbols` carries owned `u64` values only.
-    pub fn from_elf(elf: &goblin::elf::Elf) -> Result<Self> {
+    pub fn from_elf(elf: &goblin::elf::Elf<'_>) -> Result<Self> {
         // SHN_UNDEF = 0 (ELF spec): undefined symbols (linker
         // placeholders) carry st_shndx == 0 and must be skipped
         // here. We DO NOT filter `st_value != 0` because the cached-

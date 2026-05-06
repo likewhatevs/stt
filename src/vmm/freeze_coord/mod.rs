@@ -897,15 +897,15 @@ impl KtstrVm {
         let freeze_coord_snapshot_bridge = snapshot_bridge.clone();
         // Wake-fd handles for the coord epoll loop. `kill_evt` and
         // `bsp_done_evt` are written by every thread that flips the
-        // matching AtomicBool (vCPU shutdown classifier, BSP panic
-        // hook, AP panic hook, collect_results); the epoll wait
+        // matching AtomicBool (run_vm post-BSP-exit, vCPU shutdown
+        // classifier, BSP panic hook, AP panic hook); the epoll wait
         // fires immediately on either edge instead of polling on a
         // 500 µs sleep cadence. The watchpoint hit_evt clone lets
         // the coord wake on a hardware-watchpoint fire (vCPU thread
         // calls `WatchpointArm::latch_hit`, which writes the
         // eventfd alongside the AtomicBool flip). All three live
-        // for the lifetime of the run — `collect_results` joins
-        // the coord BEFORE the eventfds drop.
+        // for the lifetime of the run — `run_vm` joins the coord
+        // BEFORE the eventfds drop.
         let freeze_coord_kill_evt = kill_evt.clone();
         // aarch64 TCR_EL1 cache populated by the BSP loop. Threaded
         // into `GuestKernel::new` constructions inside the
