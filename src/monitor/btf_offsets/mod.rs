@@ -138,7 +138,7 @@ pub(crate) fn load_btf_from_bytes(data: &[u8], path: &Path) -> Result<Btf> {
     // the sidecar; (b) collapses to "inside cache" and writes the
     // sidecar next to the real file in the cache.
     //
-    // The fs::read above proves the file is reachable; canonicalize
+    // The caller's read proves the file is reachable; canonicalize
     // can still fail under EACCES on a parent component or a race
     // with a disappearing symlink target. Any canonicalize failure
     // suppresses the sidecar entirely — without a canonical path
@@ -209,7 +209,7 @@ pub(crate) fn load_btf_from_bytes(data: &[u8], path: &Path) -> Result<Btf> {
     }
 
     // Fallback: parse ELF, extract `.BTF` section bytes.
-    let elf = goblin::elf::Elf::parse(&data).map_err(|_| {
+    let elf = goblin::elf::Elf::parse(data).map_err(|_| {
         anyhow::anyhow!(
             "{}: not recognized as raw BTF (missing 0x9FEB magic) or ELF vmlinux",
             path.display()

@@ -5136,6 +5136,8 @@ impl KtstrVm {
                             "kill set by AP"
                         };
                         eprintln!("watchdog: {reason}, kicking BSP");
+                        // Propagate kill so handle_freeze's poll loop
+                        // exits and the monitor + bpf-write threads stop.
                         kill_for_watchdog.store(true, Ordering::Release);
                         let _ = kill_evt_for_watchdog.write(1);
                         if let Some(ref ie) = bsp_ie {
@@ -5263,12 +5265,11 @@ impl KtstrVm {
         // `freeze_coord_bsp_done.load(Acquire)` if the eventfd
         // fails to deliver.
         let _ = bsp_done_evt.write(1);
-        // Stop the monitor and bpf-write threads immediately.
+        // Stop the monitor (wakes via kill_evt epoll) and bpf-write
+        // thread (observes kill on next 200ms poll cycle).
         // Previously kill was deferred to collect_results, leaving
         // the monitor sampling at 100ms cadence through the entire
-        // run_vm cleanup window (watchdog join + coord join). On a
-        // 1-vCPU EEVDF test this added ~85s of unnecessary monitor
-        // iterations to the cleanup budget.
+        // run_vm cleanup window (watchdog join + coord join).
         kill.store(true, Ordering::Release);
         let _ = kill_evt.write(1);
         // Sample cleanup start at the earliest moment after BSP exit so

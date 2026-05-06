@@ -25,7 +25,7 @@
 //! Cases (d) probe reload mid-run, (e) BTF parse failure, and (g)
 //! sched detach survival are tracked separately:
 //!   (d) and (g) are scoped under the probe-unload
-//!       invalidation), which is the production fix that lands the
+//!       invalidation, which is the production fix that lands the
 //!       cached_bss_pa reset wiring; this module covers the
 //!       primitive that the fix consumes.
 //!   (e) load_probe_bss_offset BTF parse failure is exercised by the

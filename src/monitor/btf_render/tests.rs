@@ -1189,7 +1189,7 @@ fn mem_reader_custom_nr_cpu_ids_returns_overridden_value() {
 
 /// `render_struct` consults `MemReader::nr_cpu_ids` when
 /// rendering a cpumask-family struct. With max_cpus=8 supplied
-/// by the reader, garbage bits beyond cpu 7 are dropped — the
+/// by the reader, garbage bits beyond cpu 7 are dropped —
 /// the `let max_cpus = mem.map(|m| m.nr_cpu_ids())`
 /// in `render_struct` (btf_render.rs) wires the reader value
 /// through to `try_render_cpumask_bits`. A regression that
