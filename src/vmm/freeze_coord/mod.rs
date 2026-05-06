@@ -5136,6 +5136,8 @@ impl KtstrVm {
                             "kill set by AP"
                         };
                         eprintln!("watchdog: {reason}, kicking BSP");
+                        kill_for_watchdog.store(true, Ordering::Release);
+                        let _ = kill_evt_for_watchdog.write(1);
                         if let Some(ref ie) = bsp_ie {
                             ie.set(1);
                             std::sync::atomic::fence(Ordering::Release);
@@ -5261,6 +5263,14 @@ impl KtstrVm {
         // `freeze_coord_bsp_done.load(Acquire)` if the eventfd
         // fails to deliver.
         let _ = bsp_done_evt.write(1);
+        // Stop the monitor and bpf-write threads immediately.
+        // Previously kill was deferred to collect_results, leaving
+        // the monitor sampling at 100ms cadence through the entire
+        // run_vm cleanup window (watchdog join + coord join). On a
+        // 1-vCPU EEVDF test this added ~85s of unnecessary monitor
+        // iterations to the cleanup budget.
+        kill.store(true, Ordering::Release);
+        let _ = kill_evt.write(1);
         // Sample cleanup start at the earliest moment after BSP exit so
         // every host-side teardown step lands inside the window, in
         // execution order: watchdog join (immediately below), AP joins,
@@ -6785,20 +6795,12 @@ impl KtstrVm {
     pub(super) fn collect_results(&self, start: Instant, run: VmRunState) -> Result<VmResult> {
         let mut exit_code = run.exit_code;
         let timed_out = run.timed_out;
+        // Belt-and-braces: kill + kill_evt are already set by run_vm
+        // immediately after BSP exits (so the monitor and bpf-write
+        // threads stop promptly). Re-assert here in case a future
+        // code path reaches collect_results without the run_vm
+        // early-kill having fired.
         run.kill.store(true, Ordering::Release);
-        // Wake the monitor sampler and the bpf-map-write thread if
-        // either is still blocked in epoll_wait — both register
-        // `kill_evt`'s fd alongside their own wake sources. The
-        // freeze coordinator is NOT alive here: `run_vm` joins it
-        // via `freeze_coord_handle.join()` BEFORE returning the
-        // `VmRunState` (preventing UAF on the BSP's
-        // `ImmediateExitHandle`), so by the time `collect_results`
-        // runs `run.freeze_coordinator` is always `None` and the
-        // conditional join below is a no-op. Eventfd is
-        // level-triggered: the write here makes both registered
-        // waits return on the next epoll cycle, and the kill flag
-        // store above is the source of truth that breaks each
-        // thread's outer loop.
         let _ = run.kill_evt.write(1);
         // Clear freeze before kicking APs so any vCPU still in the
         // park loop observes `freeze=false` next iteration and exits
