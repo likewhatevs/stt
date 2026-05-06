@@ -673,9 +673,9 @@ fn register_parent_dirs(dirs: &mut BTreeSet<String>, guest_path: &str) {
 
 /// `include_files` adds files verbatim to the archive (no strip_debug).
 /// Each entry is `(archive_path, host_path)`. ELF files get shared library
-/// resolution; non-ELF files are copied as-is. Only regular files are
-/// accepted; symlinks (rejected to prevent embedding files outside the
-/// explicit set), FIFOs, device nodes, and sockets are rejected. Archive
+/// resolution; non-ELF files are copied as-is. Symlinks are followed to
+/// their target; the target must be a regular file (FIFOs, device nodes,
+/// and sockets are rejected). Archive
 /// paths must not contain `..` components. Callers expand directories into
 /// individual file entries before calling this function (see
 /// `cli::resolve_include_files`).
@@ -707,26 +707,18 @@ pub fn build_initramfs_base(
                 archive_path
             );
         }
-        // Reject symlinks before any other check. symlink_metadata is
-        // lstat — it returns metadata about the symlink itself rather
-        // than its target. Following symlinks would let an
-        // include_files entry pointing at a sensitive host file
-        // (e.g. /etc/passwd) silently embed that file into the guest
-        // initramfs.
-        let meta = std::fs::symlink_metadata(host_path).with_context(|| {
+        // Follow symlinks: include_files entries are explicitly
+        // specified by the test author, so a symlink to a regular
+        // file is intentional (e.g. package-manager symlinks in
+        // /usr/local/bin). The is_file() check below catches
+        // non-regular targets (directories, FIFOs, devices).
+        let meta = std::fs::metadata(host_path).with_context(|| {
             format!(
-                "lstat include file '{}': {}",
+                "stat include file '{}': {}",
                 archive_path,
                 host_path.display()
             )
         })?;
-        if meta.file_type().is_symlink() {
-            anyhow::bail!(
-                "include_files entry '{}' is a symlink (symlinks are rejected to prevent embedding files outside the explicit set): {}",
-                archive_path,
-                host_path.display()
-            );
-        }
         // Reject non-regular files (FIFOs, device nodes, sockets block or
         // produce garbage).
         if !meta.file_type().is_file() {
