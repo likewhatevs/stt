@@ -23,8 +23,8 @@ const SCX_CLEANUP_SCHED_PAYLOAD: Payload = Payload::from_scheduler(&SCX_CLEANUP_
 /// a `cleanup_budget_ms = 5000` overshoot (caught by
 /// `evaluate_vm_result` against
 /// [`ktstr::vmm::VmResult::cleanup_duration`]) or, in the
-/// catastrophic case, as a host watchdog timeout (60 s,
-/// `KTSTR_VM_TIMEOUT` in `src/test_support/runtime.rs`). The
+/// catastrophic case, as a host VM timeout
+/// (`vm_timeout_from_entry` in `src/test_support/runtime.rs`). The
 /// cleanup duration is also persisted to the sidecar so stats
 /// tooling can flag drift across runs.
 ///
