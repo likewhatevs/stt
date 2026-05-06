@@ -5818,6 +5818,7 @@ impl KtstrVm {
                             },
                             watchdog_observation: None,
                             page_offset: 0,
+                            preemption_threshold_ns,
                         };
                     }
                     let kill_fd = kill_evt_clone.as_raw_fd();
@@ -5854,6 +5855,7 @@ impl KtstrVm {
                             },
                             watchdog_observation: None,
                             page_offset: 0,
+                            preemption_threshold_ns,
                         };
                     }
                 }
@@ -5966,6 +5968,7 @@ impl KtstrVm {
                         },
                         watchdog_observation: None,
                         page_offset: 0,
+                        preemption_threshold_ns,
                     };
                 }
 
@@ -6043,6 +6046,7 @@ impl KtstrVm {
                         },
                         watchdog_observation: None,
                         page_offset: 0,
+                        preemption_threshold_ns,
                     };
                 }
 
@@ -6165,6 +6169,7 @@ impl KtstrVm {
                         },
                         watchdog_observation: None,
                         page_offset: 0,
+                        preemption_threshold_ns,
                     };
                 }
                 // aarch64 TCR_EL1 (granule + T1SZ) for the
@@ -6241,6 +6246,7 @@ impl KtstrVm {
                         },
                         watchdog_observation: None,
                         page_offset: 0,
+                        preemption_threshold_ns,
                     };
                 }
 
@@ -6898,9 +6904,18 @@ impl KtstrVm {
                     drain,
                     watchdog_observation,
                     page_offset,
+                    preemption_threshold_ns,
                 }) => {
-                    let preemption_threshold_ns =
-                        monitor::vcpu_preemption_threshold_ns(Some(&self.kernel));
+                    // `preemption_threshold_ns` was resolved once
+                    // inside `start_monitor` (and threaded through
+                    // `monitor_loop`'s 0-fallback) so the cleanup
+                    // path does NOT re-read the vmlinux to recompute
+                    // CONFIG_HZ. The previous structure called
+                    // `monitor::vcpu_preemption_threshold_ns(Some(
+                    // &self.kernel))` here, which re-read the
+                    // vmlinux ELF every cleanup just to derive the
+                    // same value the monitor thread already had in
+                    // hand.
                     let summary = monitor::MonitorSummary::from_samples_with_threshold(
                         &samples,
                         preemption_threshold_ns,

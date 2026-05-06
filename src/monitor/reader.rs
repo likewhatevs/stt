@@ -1943,6 +1943,14 @@ pub(crate) struct MonitorLoopResult {
     /// (rather than the static `DEFAULT_PAGE_OFFSET` fallback).
     /// 0 means the latch never fired during the run.
     pub(crate) page_offset: u64,
+    /// vCPU preemption threshold (ns) derived once from the guest
+    /// kernel's CONFIG_HZ at monitor-thread start and propagated
+    /// here so the post-run [`super::MonitorReport`] consumer does
+    /// not re-read the vmlinux file to recompute the same value.
+    /// Mirrors [`MonitorConfig::preemption_threshold_ns`] after the
+    /// loop's `0 → super::vcpu_preemption_threshold_ns(None)`
+    /// fallback has resolved a concrete value.
+    pub(crate) preemption_threshold_ns: u64,
 }
 
 /// Configuration for the monitor sampling loop.
@@ -2201,6 +2209,7 @@ pub(crate) fn monitor_loop(
                 },
                 watchdog_observation,
                 page_offset: latched_page_offset,
+                preemption_threshold_ns,
             };
         }
     };
@@ -2214,6 +2223,7 @@ pub(crate) fn monitor_loop(
             },
             watchdog_observation,
             page_offset: latched_page_offset,
+            preemption_threshold_ns,
         };
     }
     let epoll = match Epoll::new() {
@@ -2227,6 +2237,7 @@ pub(crate) fn monitor_loop(
                 },
                 watchdog_observation,
                 page_offset: latched_page_offset,
+                preemption_threshold_ns,
             };
         }
     };
@@ -2245,6 +2256,7 @@ pub(crate) fn monitor_loop(
             },
             watchdog_observation,
             page_offset: latched_page_offset,
+            preemption_threshold_ns,
         };
     }
     if let Err(e) = epoll.ctl(
@@ -2260,6 +2272,7 @@ pub(crate) fn monitor_loop(
             },
             watchdog_observation,
             page_offset: latched_page_offset,
+            preemption_threshold_ns,
         };
     }
     let mut epoll_buf = [EpollEvent::default(); 2];
@@ -2301,6 +2314,7 @@ pub(crate) fn monitor_loop(
                     },
                     watchdog_observation,
                     page_offset: latched_page_offset,
+                    preemption_threshold_ns,
                 };
             }
         };
@@ -2350,6 +2364,7 @@ pub(crate) fn monitor_loop(
                 },
                 watchdog_observation,
                 page_offset: latched_page_offset,
+                preemption_threshold_ns,
             };
         }
     }
@@ -2773,6 +2788,7 @@ pub(crate) fn monitor_loop(
         drain: shm_result,
         watchdog_observation,
         page_offset: latched_page_offset,
+        preemption_threshold_ns,
     }
 }
 
