@@ -105,6 +105,9 @@ pub(crate) fn load_btf_from_path(path: &Path) -> Result<Btf> {
     load_btf_from_bytes(&data, path)
 }
 
+/// Same as [`load_btf_from_path`] but accepts pre-read file bytes.
+/// `path` is used only for sidecar caching and diagnostics — the
+/// bytes are not re-read from disk.
 pub(crate) fn load_btf_from_bytes(data: &[u8], path: &Path) -> Result<Btf> {
     // Raw BTF: first 2 bytes are the 0x9FEB magic. Parse directly;
     // never write a sidecar (would be a byte-for-byte self-copy).
@@ -1150,11 +1153,14 @@ impl BpfProgOffsets {
 
     /// Parse BTF from a vmlinux ELF and resolve BPF program field offsets.
     pub fn from_vmlinux(path: &Path) -> Result<Self> {
-        let btf =
-            load_btf_from_path(path).with_context(|| format!("btf: open {}", path.display()))?;
-        Self::from_btf(&btf)
+        let data =
+            std::fs::read(path).with_context(|| format!("read vmlinux: {}", path.display()))?;
+        Self::from_vmlinux_bytes(&data, path)
     }
 
+    /// Same as [`Self::from_vmlinux`] but accepts pre-read vmlinux
+    /// bytes. `path` is used only for BTF sidecar caching and
+    /// diagnostic messages — the bytes are not re-read from disk.
     pub fn from_vmlinux_bytes(data: &[u8], path: &Path) -> Result<Self> {
         let btf = load_btf_from_bytes(data, path)?;
         Self::from_btf(&btf)

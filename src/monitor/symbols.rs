@@ -289,10 +289,12 @@ impl KernelSymbols {
     pub fn from_vmlinux(path: &Path) -> Result<Self> {
         let data =
             std::fs::read(path).with_context(|| format!("read vmlinux: {}", path.display()))?;
-        Self::from_elf_bytes(&data)
+        Self::from_vmlinux_bytes(&data)
     }
 
-    pub fn from_elf_bytes(data: &[u8]) -> Result<Self> {
+    /// Same as [`Self::from_vmlinux`] but accepts pre-read vmlinux
+    /// ELF bytes, avoiding a redundant `std::fs::read`.
+    pub fn from_vmlinux_bytes(data: &[u8]) -> Result<Self> {
         let elf = goblin::elf::Elf::parse(data).context("parse vmlinux ELF")?;
 
         // SHN_UNDEF = 0 (ELF spec): undefined symbols (linker

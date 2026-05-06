@@ -7140,7 +7140,7 @@ impl KtstrVm {
             Err(_) => return Vec::new(),
         };
         let kernel =
-            match monitor::guest::GuestKernel::from_bytes(&mem, &vmlinux_data, tcr_val, cr3_val) {
+            match monitor::guest::GuestKernel::from_vmlinux_bytes(&mem, &vmlinux_data, tcr_val, cr3_val) {
                 Ok(k) => k,
                 Err(_) => return Vec::new(),
             };
